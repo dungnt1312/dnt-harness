@@ -12,9 +12,8 @@
  * not shell access — a shell command can leave the workspace and nothing
  * here claims otherwise.
  */
-import { spawn, spawnSync, type ChildProcess, type SpawnOptionsWithoutStdio } from 'node:child_process'
-import { existsSync } from 'node:fs'
-import path from 'node:path'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { detectShell } from './detect.ts'
 import type { ToolDefinition, ToolExecution } from '../../harness/tools/types.ts'
 
 const OUTPUT_CAP = 60_000
@@ -32,64 +31,6 @@ export interface BashToolOptions {
   readonly cwd?: string | (() => string)
   /** Explicit executable; overrides detection (e.g. a pinned Git Bash path). */
   readonly executable?: string
-}
-
-interface BashSpawn {
-  readonly executable: string | undefined
-  readonly hint: string
-}
-
-/** Locate a real bash. Checked in order: explicit option, env, known paths. */
-function detectBash(explicit: string | undefined): BashSpawn {
-  // An explicit executable is authoritative: if it is missing, the tool
-  // disables with that fact — silently falling back would run somewhere
-  // the operator did not choose.
-  if (explicit !== undefined && explicit !== '') {
-    return existsSync(explicit)
-      ? { executable: explicit, hint: explicit }
-      : { executable: undefined, hint: `the configured bash '${explicit}' does not exist; fix it or set MINI_DSH_BASH` }
-  }
-  const candidates: string[] = []
-  const fromEnv = process.env['MINI_DSH_BASH']?.trim()
-  if (fromEnv !== undefined && fromEnv !== '') candidates.push(fromEnv)
-  if (process.platform === 'win32') {
-    candidates.push(
-      'C:\\Program Files\\Git\\bin\\bash.exe',
-      'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
-      'C:\\Program Files (x86)\\Git\\bin\\bash.exe',
-      `${process.env['LOCALAPPDATA'] ?? ''}\\Programs\\Git\\bin\\bash.exe`,
-    )
-  } else {
-    candidates.push('/bin/bash', '/usr/bin/bash')
-  }
-  for (const candidate of candidates) {
-    if (candidate !== '' && existsSync(candidate)) return { executable: candidate, hint: candidate }
-  }
-  if (process.platform === 'win32') {
-    // Portable/odd Git installs (Laragon, scoop, ...): resolve bash relative
-    // to the git.exe on PATH. WSL launchers (System32, WindowsApps) are
-    // deliberately skipped — Bash means Git Bash here, not a remote VM.
-    for (const locator of [['where', 'git'], ['where', 'bash']]) {
-      const lookup = spawnSync(locator[0] as string, locator.slice(1) as string[], { encoding: 'utf8' })
-      if (lookup.status !== 0) continue
-      for (const raw of lookup.stdout.split('\n')) {
-        const found = raw.trim()
-        if (found === '' || !existsSync(found)) continue
-        if (/system32|windowsapps/i.test(found)) continue
-        if (locator[1] === 'bash') return { executable: found, hint: found }
-        for (const rel of ['../bin/bash.exe', '../usr/bin/bash.exe']) {
-          const bashPath = path.resolve(found, rel)
-          if (existsSync(bashPath)) return { executable: bashPath, hint: bashPath }
-        }
-      }
-    }
-    return {
-      executable: undefined,
-      hint: 'install Git Bash (https://git-scm.com) or point MINI_DSH_BASH at a bash.exe',
-    }
-  }
-  // Last resort on PATH (POSIX `bash`).
-  return { executable: 'bash', hint: 'bash on PATH' }
 }
 
 /**
@@ -132,7 +73,7 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
   // executions must derive their working directory from `exec.root`.
   const configuredCwd = options.cwd
   const fallbackCwd = typeof configuredCwd === 'function' ? configuredCwd : () => configuredCwd ?? process.cwd()
-  const detection = detectBash(options.executable)
+  const detection = detectShell(options.executable)
   return {
     name: 'Bash',
     description: 'Run one bash command and return its combined stdout/stderr and exit code.',

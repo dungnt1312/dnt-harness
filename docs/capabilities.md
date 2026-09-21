@@ -69,13 +69,16 @@ marker. Argument errors throw inside `execute` and surface as failed
 
 `bashTool(options?)` runs one command per call. **Bash means Bash**:
 
-- **Executable**: resolved at registration — an explicit `executable` option
+- **Executable**: resolved at registration by the shared
+  `capabilities/shell/detect.ts` — an explicit `executable` option
   (authoritative: a missing one disables the tool), `MINI_DSH_BASH`, the
   standard Git install locations, or `where git` / `where bash` fallback
   (skipping the WSL launchers in System32 and WindowsApps). On POSIX,
   `/bin/bash` or `bash` on PATH. When nothing real is found, the tool
   registers but fails with an actionable error — it never silently
-  substitutes another shell.
+  substitutes another shell. The web host's Workbench terminals resolve
+  through the same module, so "which shell is this" has one answer no matter
+  who is asking.
 - **Command**: `<bash> -lc <command>` (login shell, command string).
 - **Output**: stdout and stderr captured together; capture stops shortly past
   the execution's output limit so a firehose command cannot exhaust memory,
