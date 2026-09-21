@@ -1,9 +1,10 @@
-/// <reference lib="dom" />
+﻿/// <reference lib="dom" />
 // page.evaluate and init-script callbacks run in the browser.
 import { expect, test, type Page, type Route } from '@playwright/test'
 import { AxeBuilder } from '@axe-core/playwright'
 import { mkdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { selectWorkbenchView } from './workbench-nav.ts'
 
 const screenshotRoot = fileURLToPath(new URL('../../artifacts/product-ui/chat', import.meta.url))
 const REQUIRED_WIDTHS = [320, 375, 768, 1024, 1440, 1920] as const
@@ -96,6 +97,9 @@ async function fixture(page: Page, options: Options = {}): Promise<{ readonly po
       thinkingLevel: null,
     })
     if (path === '/api/workspaces/w/mode') return json(route, { modes: [{ id: 'chat', name: 'Chat', source: 'bundled' }, { id: 'full-access', name: 'Full access', source: 'bundled' }], selected: 'chat', revision: 1 })
+    // Model selection is per conversation, with a global default behind it.
+    if (path === '/api/model-defaults') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null })
+    if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/model$/.test(path)) return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null, source: 'session' })
     if (path === '/api/workspaces/w/skills') return json(route, [])
     if (path === '/api/workspaces/w/projects/p/files') return json(route, new URL(request.url()).searchParams.get('path') === 'src'
       ? { path: 'src', entries: [{ name: 'step-8.ts', path: 'src/step-8.ts', kind: 'file', size: 120 }] }
@@ -110,9 +114,14 @@ async function fixture(page: Page, options: Options = {}): Promise<{ readonly po
     return json(route, { error: `unexpected fixture request ${method} ${path}` }, 500)
   })
 
-  await page.goto(options.path ?? '/workspaces/w/sessions/s')
+  const target = options.path ?? '/workspaces/w/sessions/s'
+  await page.goto(target)
   await expect(page.locator('[data-composer-input]')).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Workspace model (next request)' })).toBeVisible()
+  // The model picker names its scope: a conversation owns its own selection,
+  // while with none open the same control edits the global default.
+  await expect(page.getByRole('button', {
+    name: target.includes('/sessions/') ? 'Conversation model (next request)' : 'Default model for new conversations',
+  })).toBeVisible()
   expect(unexpected).toEqual([])
   return { posts: () => posts }
 }
@@ -174,7 +183,8 @@ test('empty state centers the composer and sends start a conversation flow', asy
   await fixture(page, { path: '/workspaces/w' })
   await expect(page.getByRole('heading', { name: 'What can I help with?' })).toBeVisible()
   await expect(page.getByRole('button', { name: /Conversation scope/ })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Workspace model (next request)' })).toContainText('fixture-model')
+  // With no conversation open the picker edits the global default instead.
+  await expect(page.getByRole('button', { name: 'Default model for new conversations' })).toContainText('fixture-model')
 })
 
 test('sidebar collapses on desktop and becomes a focus-trapped drawer on mobile', async ({ page }) => {
@@ -200,7 +210,9 @@ test('sidebar collapses on desktop and becomes a focus-trapped drawer on mobile'
   await expect(drawer).toHaveCount(0)
   await expect(opener).toBeFocused()
   await opener.click()
-  await drawer.getByRole('button', { name: 'Plan a refactor', exact: true }).click()
+  // The row's accessible name carries a relative timestamp ("Plan a refactor 3d"),
+  // so anchor the match instead of pinning an exact string that ages.
+  await drawer.getByRole('button', { name: /^Plan a refactor\b/ }).click()
   await expect(drawer).toHaveCount(0)
   await expect(page).toHaveURL('/workspaces/w/sessions/s2')
 })
@@ -235,9 +247,9 @@ test('workbench docks beside the chat, browses project files and opens them as t
   await expect(workbench.getByRole('button', { name: 'step-8.ts', exact: true })).toHaveAttribute('aria-pressed', 'true')
   await expect(workbench.getByRole('region', { name: 'Contents of src/step-8.ts' })).toContainText('"private": true')
 
-  await workbench.getByRole('button', { name: 'Context', exact: true }).click()
+  await selectWorkbenchView(page, 'Context')
   await expect(workbench.getByText('~12000/32000 tok (est)')).toBeVisible()
-  await workbench.getByRole('button', { name: 'Artifacts', exact: true }).click()
+  await selectWorkbenchView(page, 'Artifacts')
   await expect(workbench.getByRole('list', { name: 'Recorded artifacts' })).toBeVisible()
   await workbench.getByRole('button', { name: 'Close src/step-8.ts' }).click()
   await expect(workbench.getByRole('button', { name: 'step-8.ts', exact: true })).toHaveCount(0)

@@ -4,6 +4,7 @@ import { expect, test, type Locator, type Page, type Route } from '@playwright/t
 import { AxeBuilder } from '@axe-core/playwright'
 import { mkdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { openWorkbench, selectWorkbenchView } from './workbench-nav.ts'
 
 const screenshotRoot = fileURLToPath(new URL('../../artifacts/product-ui/chat/matrix', import.meta.url))
 const REQUIRED_WIDTHS = [320, 375, 768, 1024, 1440, 1920] as const
@@ -431,7 +432,8 @@ test('Agents, MCP, and Secrets expose destructive failures and explicit recovery
   const dialog = page.getByRole('dialog', { name: 'Settings' })
   await dialog.getByRole('tab', { name: /Agents/ }).click()
   await dialog.getByRole('button', { name: /fixture-agent/ }).click()
-  await dialog.getByRole('button', { name: 'Delete selected agent' }).click()
+  // The control names its target, matching the Secrets panel's `Delete FIXTURE_SECRET`.
+  await dialog.getByRole('button', { name: 'Delete fixture-agent' }).click()
   await dialog.getByRole('button', { name: 'Delete definition' }).click()
   await expect(dialog).toContainText('agent delete refused')
   expect(state.count('DELETE', '/api/workspaces/w/agents/fixture-agent')).toBe(1)
@@ -527,26 +529,17 @@ test('no tool or delegation renders no activity rows', async ({ page }) => {
   expectNoMutationRequests(state, before)
 })
 
-/** The workbench region, opening it first when it is a closed sheet. */
-async function openWorkbench(page: Page) {
-  const opener = page.getByRole('button', { name: 'Open workbench' })
-  if (await opener.isVisible()) await opener.click()
-  const workbench = page.getByRole('region', { name: 'Workbench' })
-  await expect(workbench).toBeVisible()
-  return workbench
-}
-
 test('Artifacts projects existing event data without any additional API request', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 })
   const state = await fixture(page, 'artifacts')
-  const workbench = await openWorkbench(page)
+  await openWorkbench(page)
   // Files is the default view: the Context manifest is not requested until Context shows.
   await page.waitForTimeout(750)
   expect(state.count('GET', `${SESSION_PATH}/manifest`)).toBe(0)
-  await workbench.getByRole('button', { name: 'Context', exact: true }).click()
+  await selectWorkbenchView(page, 'Context')
   await expect.poll(() => state.count('GET', `${SESSION_PATH}/manifest`)).toBe(1)
   const before = state.requests().length
-  await workbench.getByRole('button', { name: 'Artifacts', exact: true }).click()
+  const workbench = await selectWorkbenchView(page, 'Artifacts')
   const list = workbench.getByRole('list', { name: 'Recorded artifacts' })
   await expect(list).toContainText('File reference')
   await expect(list).toContainText('C:/fixture/project/README.md')
@@ -560,8 +553,11 @@ test('Artifacts projects existing event data without any additional API request'
   await page.waitForTimeout(750)
   expect(state.requests()).toHaveLength(before)
   await page.reload()
-  // The selected view is remembered and reopening on Artifacts does not fetch the manifest.
-  await expect((await openWorkbench(page)).getByRole('button', { name: 'Artifacts', exact: true })).toHaveAttribute('aria-pressed', 'true')
+  // The opened views and the selected one are remembered, and reopening on
+  // Artifacts does not fetch the manifest.
+  const reopened = await openWorkbench(page)
+  await expect(reopened.getByRole('button', { name: 'Artifacts', exact: true })).toHaveAttribute('aria-pressed', 'true')
+  await expect(reopened.getByRole('button', { name: 'Context', exact: true })).toBeVisible()
   await page.waitForTimeout(750)
   expect(state.count('GET', `${SESSION_PATH}/manifest`)).toBe(1)
 })
@@ -569,8 +565,7 @@ test('Artifacts projects existing event data without any additional API request'
 test('Open in workbench reads the current project file, never the recorded output', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 })
   const state = await fixture(page, 'artifacts')
-  const workbench = await openWorkbench(page)
-  await workbench.getByRole('button', { name: 'Artifacts', exact: true }).click()
+  const workbench = await selectWorkbenchView(page, 'Artifacts')
   await workbench.getByRole('button', { name: 'Open in workbench' }).first().click()
   await expect(workbench.getByRole('region', { name: 'Contents of README.md' })).toContainText('export const answer = 42')
   // Dev StrictMode may mount the viewer twice; every read is a GET of the live file.
@@ -583,14 +578,13 @@ test('Context manifest is lazy for the exact view, selection, settled, and open 
   const state = await fixture(page, 'no-work')
   await page.waitForTimeout(750)
   expect(state.count('GET', `${SESSION_PATH}/manifest`)).toBe(0)
-  const workbench = await openWorkbench(page)
-  await workbench.getByRole('button', { name: 'Context', exact: true }).click()
+  await selectWorkbenchView(page, 'Context')
   await expect.poll(() => state.count('GET', `${SESSION_PATH}/manifest`)).toBe(1)
-  await workbench.getByRole('button', { name: 'Artifacts', exact: true }).click()
+  await selectWorkbenchView(page, 'Artifacts')
   const afterContext = state.requests().length
   await page.waitForTimeout(750)
   expect(state.requests()).toHaveLength(afterContext)
-  await workbench.getByRole('button', { name: 'Context', exact: true }).click()
+  await selectWorkbenchView(page, 'Context')
   await expect.poll(() => state.count('GET', `${SESSION_PATH}/manifest`)).toBe(2)
 })
 
@@ -604,7 +598,7 @@ test('manifest stays fail-closed beyond the delay when the active workspace is n
 test('manifest stays fail-closed beyond the delay when the current conversation is null', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 })
   const state = await fixture(page, 'new-conversation-success')
-  await (await openWorkbench(page)).getByRole('button', { name: 'Context', exact: true }).click()
+  await selectWorkbenchView(page, 'Context')
   await page.waitForTimeout(750)
   expect(state.requests().filter(request => request.path.endsWith('/manifest'))).toHaveLength(0)
 })
@@ -612,7 +606,7 @@ test('manifest stays fail-closed beyond the delay when the current conversation 
 test('manifest stays fail-closed beyond the delay while the session is running', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 })
   const state = await fixture(page, 'running-tool')
-  await (await openWorkbench(page)).getByRole('button', { name: 'Context', exact: true }).click()
+  await selectWorkbenchView(page, 'Context')
   await page.waitForTimeout(750)
   expect(state.count('GET', `${SESSION_PATH}/manifest`)).toBe(0)
 })
@@ -622,9 +616,11 @@ for (const width of [320, 375, 768, 1024, 1440]) {
     await page.setViewportSize({ width, height: 800 })
     const state = await fixture(page, 'artifacts')
     const workbench = await openWorkbench(page)
-    const artifacts = workbench.getByRole('button', { name: 'Artifacts', exact: true })
-    await artifacts.focus()
+    // Artifacts is not in the strip until it is opened from the nav picker.
+    await workbench.getByRole('button', { name: 'Open a view' }).focus()
     await page.keyboard.press('Enter')
+    await page.getByRole('menuitem', { name: 'Artifacts', exact: true }).click()
+    const artifacts = workbench.getByRole('button', { name: 'Artifacts', exact: true })
     await expect(artifacts).toHaveAttribute('aria-pressed', 'true')
     const before = state.requests().length
     await page.waitForTimeout(750)
@@ -786,9 +782,13 @@ test('axe gates shell, drawers, Context, Artifacts, approval, and every settings
   await expectAxeClean(page, '[aria-label="Pending approvals"]')
   const workbench = await openWorkbench(page)
   await expectAxeClean(page, '[aria-label="Workbench"]')
-  await workbench.getByRole('button', { name: 'Context', exact: true }).click()
+  await workbench.getByRole('button', { name: 'Open a view' }).click()
+  // The picker fades in; axe reads the mid-animation opacity as low contrast.
+  await page.waitForTimeout(400)
+  await expectAxeClean(page, '[role="menu"][aria-label="Open a view"]')
+  await page.getByRole('menuitem', { name: 'Context', exact: true }).click()
   await expectAxeClean(page, '[aria-label="Workbench"]')
-  await workbench.getByRole('button', { name: 'Artifacts', exact: true }).click()
+  await selectWorkbenchView(page, 'Artifacts')
   await expectAxeClean(page, '[aria-label="Workbench"]')
   await page.keyboard.press('Escape')
 
@@ -853,15 +853,15 @@ test('coarse pointer targets meet the minimum on header, composer, approval, con
 test('captures the deterministic screenshot matrix', async ({ browser }) => {
   test.setTimeout(240_000)
   mkdirSync(screenshotRoot, { recursive: true })
-  const openContext = async (page: Page): Promise<void> => { await (await openWorkbench(page)).getByRole('button', { name: 'Context', exact: true }).click() }
+  const openContext = async (page: Page): Promise<void> => { await selectWorkbenchView(page, 'Context') }
   const states: readonly { readonly name: string; readonly fixture: FixtureState; readonly prepare?: (page: Page) => Promise<void> }[] = [
     { name: 'empty-new-conversation', fixture: 'new-conversation-success' },
     { name: 'populated-transcript-tool', fixture: 'completed-tool' },
     { name: 'running-reconnect-queued-follow-up', fixture: 'reconnect', prepare: async page => { await page.locator('[data-composer-input]').fill('Queued follow-up draft') } },
     { name: 'pending-approval', fixture: 'approval' },
     { name: 'context-tab', fixture: 'no-work', prepare: openContext },
-    { name: 'artifacts-empty', fixture: 'no-work', prepare: async page => { await (await openWorkbench(page)).getByRole('button', { name: 'Artifacts', exact: true }).click() } },
-    { name: 'artifacts-populated', fixture: 'artifacts', prepare: async page => { await (await openWorkbench(page)).getByRole('button', { name: 'Artifacts', exact: true }).click() } },
+    { name: 'artifacts-empty', fixture: 'no-work', prepare: async page => { await selectWorkbenchView(page, 'Artifacts') } },
+    { name: 'artifacts-populated', fixture: 'artifacts', prepare: async page => { await selectWorkbenchView(page, 'Artifacts') } },
     { name: 'settings-dirty', fixture: 'settings', prepare: async page => { await (await settingsTrigger(page)).click(); await (await providerName(page.getByRole('dialog', { name: 'Settings' }))).fill('Dirty provider draft') } },
     { name: 'settings-conflict', fixture: 'settings', prepare: async page => { const dialog = page.getByRole('dialog', { name: 'Settings' }); await (await settingsTrigger(page)).click(); if (await dialog.getByRole('tab', { name: /Skills/ }).isVisible()) await dialog.getByRole('tab', { name: /Skills/ }).click(); else { await page.getByRole('combobox', { name: 'Settings section' }).click(); await page.getByRole('option', { name: 'Skills' }).click() } await dialog.getByRole('button', { name: 'Edit' }).click(); await dialog.getByLabel('SKILL.md content').fill('local conflict draft'); await dialog.getByRole('button', { name: 'Save skill' }).click(); await expect(dialog.getByRole('button', { name: 'Overwrite anyway' })).toBeVisible() } },
   ]
