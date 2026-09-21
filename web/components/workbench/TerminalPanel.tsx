@@ -85,14 +85,22 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
     if (mount === null || workspaceId === null) return undefined
 
     const host = document.createElement('div')
-    host.className = 'absolute inset-0'
+    // The gutter belongs here, not on the mount: an absolutely positioned
+    // child resolves `inset-0` against the mount's padding box, so padding
+    // there would be covered rather than seen. FitAddon reads this element's
+    // content box, so the columns shrink to match instead of overflowing.
+    host.className = 'absolute inset-0 pl-3 pr-2 py-2'
     mount.appendChild(host)
 
     const term = new Terminal({
       cols,
       rows: rows_,
       fontFamily: '"JetBrains Mono", ui-monospace, monospace',
-      fontSize: 13,
+      // A docked panel is narrower than a real terminal window, and a Git Bash
+      // prompt carrying user@host, the path and a branch runs past 90 columns
+      // on its own. 12px buys roughly seven columns over the shell's 13px
+      // without dropping below comfortable reading size.
+      fontSize: 12,
       theme: themeFromTokens(),
       cursorBlink: true,
       scrollback: 5_000,
@@ -393,7 +401,7 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
         <p role="alert" className="m-0 border-b border-line px-3 py-1.5 text-[12px] text-danger">{error}</p>
       ) : null}
 
-      <div className="relative min-h-0 flex-1 overflow-hidden bg-bg p-1" ref={mountRef}>
+      <div className="relative min-h-0 flex-1 overflow-hidden bg-bg" ref={mountRef}>
         {rows.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
             <Icon name="terminal" size={22} className="text-fg-faint" />
