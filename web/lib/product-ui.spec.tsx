@@ -9,14 +9,14 @@ import { ScopeControl } from '../components/layout/ScopeControl.tsx'
 import { PolicyPopover } from '../components/composer/PolicyPopover.tsx'
 import { ToastHost, useToast } from '../components/common/Toast.tsx'
 import { ToolCard, AssistantMessage, DelegationCard, AuditLine, UserBubble } from '../components/chat/MessageParts.tsx'
-import { groupBlocks } from '../components/chat/Transcript.tsx'
+import { groupBlocks, turnFooters } from '../components/chat/Transcript.tsx'
 import { modeLabel, errorSummary } from './copy.ts'
 import { emptyDraft, textDraft } from './composer-draft.ts'
 import { budgetTone, formatTime } from './format.ts'
 import { projectItems } from './project.ts'
 import { setPolicy, compactSession, fetchHooks, saveHooks, renameWorkspace, listProjectFiles, readProjectFile } from './api.ts'
 import { ContextPanel } from '../components/layout/ContextPanel.tsx'
-import { Workbench } from '../components/workbench/Workbench.tsx'
+import { Workbench, type WorkbenchView } from '../components/workbench/Workbench.tsx'
 import { closeFileTab, useWorkbenchFiles } from '../hooks/useWorkbenchFiles.ts'
 import { Sidebar, type SidebarProps } from '../components/layout/Sidebar.tsx'
 import { HooksPanel } from '../components/settings/ManagementPanels.tsx'
@@ -68,9 +68,12 @@ function setInput(element: HTMLInputElement | HTMLTextAreaElement, value: string
   Object.getOwnPropertyDescriptor(proto, 'value')!.set!.call(element, value)
   element.dispatchEvent(new Event('input', { bubbles: true }))
 }
-function WorkbenchProbe({ view, events, project = null }: { readonly view: 'files' | 'context' | 'artifacts'; readonly events: readonly SseEvent[]; readonly project?: { id: string; name: string; path: string } | null }) {
+/** Drives the workbench with real view/tab state so the nav picker is exercised, not stubbed. */
+function WorkbenchProbe({ view, events, project = null }: { readonly view: WorkbenchView; readonly events: readonly SseEvent[]; readonly project?: { id: string; name: string; path: string } | null }) {
   const files = useWorkbenchFiles(project?.id ?? null)
-  return <Workbench workspaceId="w1" project={project} view={view} onView={() => {}} files={files} events={events} expanded={false} onClose={() => {}} context={{ meta: null, stream: 'open', sessionId: 's1', sessionFolder: null, eventCount: events.length }} />
+  const [selected, setSelected] = useState<WorkbenchView>(view)
+  const [views, setViews] = useState<readonly WorkbenchView[]>(['files', view])
+  return <Workbench workspaceId="w1" project={project} view={selected} onView={setSelected} views={views} onViews={setViews} files={files} events={events} expanded={false} onClose={() => {}} context={{ meta: null, stream: 'open', sessionId: 's1', sessionFolder: null, eventCount: events.length }} />
 }
 const composerBase = { onDraft: () => {}, onSend: () => {}, onStop: () => {}, modelValue: 'p/m', modes: [], modeValue: null, onMode: () => {} }
 
@@ -278,12 +281,52 @@ describe('transcript truthfulness', () => {
     kind: 'assistant' as const, content: 'answer', live: false, thinking: [] as string[], thinkingLive: false,
     ...(controls !== undefined ? { controls } : {}),
   })
-  it('reports the controls that served the message before the workspace fallback', async () => {
-    await mount(<AssistantMessage item={assistant({ model: 'deepseek-v3', provider: 'dntproxy' })} modelLabel="workspace-model" />)
+  it('reports the controls that served the answer before the workspace fallback on the turn footer', async () => {
+    await mount(<AssistantMessage item={assistant({ model: 'deepseek-v3', provider: 'dntproxy' })} modelLabel="workspace-model" turn={{ text: 'answer' }} />)
     expect(host.textContent).toContain('deepseek-v3 · dntproxy')
     expect(host.textContent).not.toContain('workspace-model')
-    await mount(<AssistantMessage item={assistant()} modelLabel="workspace-model" />)
+    expect(host.querySelector('button[aria-label="Copy response"]')).not.toBeNull()
+    await mount(<AssistantMessage item={assistant()} modelLabel="workspace-model" turn={{ text: 'answer' }} />)
     expect(host.textContent).toContain('workspace-model')
+  })
+  it('withholds the turn footer until the turn closes; mid-turn answers never show copy', async () => {
+    await mount(<AssistantMessage item={assistant()} modelLabel="workspace-model" />)
+    expect(host.querySelector('button[aria-label="Copy response"]')).toBeNull()
+  })
+  it('places one footer on the last answer of a closed turn carrying the whole turn text', () => {
+    const answer = (content: string, extra?: { turnId?: string; turnOpen?: boolean }) => ({
+      kind: 'assistant' as const, content, live: false, thinking: [] as string[], thinkingLive: false,
+      ...(extra?.turnId !== undefined ? { turnId: extra.turnId } : {}),
+      ...(extra?.turnOpen !== undefined ? { turnOpen: extra.turnOpen } : {}),
+    })
+    const footers = turnFooters([
+      answer('step one', { turnId: 't1', turnOpen: false }),
+      answer('step two', { turnId: 't1', turnOpen: false }),
+      answer('other turn', { turnId: 't2', turnOpen: false }),
+      answer('still running', { turnId: 't3', turnOpen: true }),
+      answer('legacy without a turn'),
+      answer('', { turnId: 't4', turnOpen: false }),
+    ])
+    expect([...footers.keys()]).toEqual([1, 2, 4])
+    expect(footers.get(1)?.text).toBe('step one\n\nstep two')
+    expect(footers.get(2)?.text).toBe('other turn')
+    expect(footers.get(4)?.text).toBe('legacy without a turn')
+  })
+  it('stamps answers with their turn and closes them at turn end', () => {
+    const items = projectItems([
+      { type: 'turn/start', seq: 0, turnId: 't1' },
+      { type: 'assistant/chunk', seq: 1, delta: 'partial ' },
+      { type: 'assistant/message', seq: 2, content: 'first answer' },
+      { type: 'assistant/message', seq: 3, content: 'second answer' },
+    ])
+    expect(items[0]).toMatchObject({ kind: 'assistant', turnId: 't1', turnOpen: true })
+    expect(items[1]).toMatchObject({ kind: 'assistant', turnId: 't1', turnOpen: true })
+    const closed = projectItems([
+      { type: 'turn/start', seq: 0, turnId: 't1' },
+      { type: 'assistant/message', seq: 1, content: 'done' },
+      { type: 'turn/end', seq: 2, reason: 'completed' },
+    ])
+    expect(closed[0]).toMatchObject({ kind: 'assistant', turnId: 't1', turnOpen: false })
   })
   it('renders a recovered tool result as unknown, never failed', async () => {
     await mount(<ToolCard item={{ kind: 'tool', call: { id: 'c', name: 'Bash', args: { command: 'npm install' } }, result: { ok: true, output: 'partial output' }, recovered: true }} />)
@@ -487,6 +530,22 @@ describe('context compaction + budget bar', () => {
   it('renders the exact artifacts empty state', async () => {
     await mount(<ToastHost><WorkbenchProbe view="artifacts" events={[]} /></ToastHost>)
     expect(host.textContent).toContain('No recorded artifacts for this conversation yet.')
+  })
+  it('keeps the workbench nav short: unopened views live in the picker and closing one falls back', async () => {
+    await mount(<ToastHost><WorkbenchProbe view="files" events={[]} /></ToastHost>)
+    const nav = host.querySelector('[role="toolbar"][aria-label="Workbench views"]')!
+    const tabs = () => [...nav.querySelectorAll('button[aria-pressed]')].map((tab) => tab.textContent)
+    expect(tabs()).toEqual(['Files'])
+
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Open a view"]')!.click())
+    await act(async () => bodyButton('Context').click())
+    expect(tabs()).toEqual(['Files', 'Context'])
+    expect(nav.querySelector('button[aria-pressed="true"]')?.textContent).toBe('Context')
+
+    // Closing the selected view must leave a selected tab behind, never a blank body.
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Close Context"]')!.click())
+    expect(tabs()).toEqual(['Files'])
+    expect(nav.querySelector('button[aria-pressed="true"]')?.textContent).toBe('Files')
   })
   it('hooks raw editor keeps an invalid document intact and refuses to apply or save it', async () => {
     ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ version: 1, hooks: {} })

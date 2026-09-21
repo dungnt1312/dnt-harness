@@ -80,8 +80,18 @@ export function UserBubble({ item, workspaceId, onReuse }: {
   )
 }
 
-/** One assistant answer: thinking disclosure, markdown, then a quiet action row. */
-export function AssistantMessage({ item, modelLabel }: { readonly item: Extract<ViewItem, { kind: 'assistant' }>; readonly modelLabel?: string }) {
+/**
+ * One assistant answer: thinking disclosure, markdown. The action row (copy,
+ * serving model, time) belongs to the whole turn, so `Transcript` passes
+ * `turn` only on the last answer of a closed turn — copying every answer
+ * that turn produced.
+ */
+export function AssistantMessage({ item, modelLabel, turn }: {
+  readonly item: Extract<ViewItem, { kind: 'assistant' }>
+  readonly modelLabel?: string
+  /** Present on the last answer of a closed turn; text is the turn's full answer. */
+  readonly turn?: { readonly text: string }
+}) {
   // The label reports what actually served THIS step (recorded controls);
   // the workspace's current model is only the fallback for legacy events.
   const controlsLabel = item.controls !== undefined
@@ -97,9 +107,9 @@ export function AssistantMessage({ item, modelLabel }: { readonly item: Extract<
           {item.live ? <span className="ml-0.5 inline-block size-2.5 translate-y-[-1px] rounded-full bg-fg align-middle animate-dot" aria-hidden="true" /> : null}
         </div>
       ) : null}
-      {!item.live && item.content !== '' ? (
+      {!item.live && turn !== undefined ? (
         <div className={cn('-ml-2 flex items-center gap-1 text-xs text-fg-faint', revealActions)}>
-          <CopyButton text={item.content} label="Copy response" className="size-7" />
+          <CopyButton text={turn.text} label="Copy response" className="size-7" />
           {label !== undefined ? <span className="truncate">{label}</span> : null}
           {item.ts !== undefined ? <span>· {formatTime(item.ts)}</span> : null}
         </div>

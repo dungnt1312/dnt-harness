@@ -9,6 +9,35 @@ type Block = { readonly kind: 'row'; readonly row: Indexed } | { readonly kind: 
 
 const ACTIVITY_KINDS: ReadonlySet<ViewItem['kind']> = new Set(['tool', 'delegation', 'audit'])
 
+/** Copy payload carried by the last answer of a closed turn. */
+export interface TurnFooter { readonly text: string }
+
+/**
+ * One footer per assistant turn: the last answer of a closed turn carries the
+ * copy action for every answer text that turn produced. Answers still inside
+ * an open turn (streaming, tools running) show nothing yet; answers without a
+ * recorded turn (legacy events) each keep their own footer.
+ */
+export function turnFooters(items: readonly ViewItem[]): ReadonlyMap<number, TurnFooter> {
+  const groups = new Map<string, { readonly indexes: number[]; text: string; open: boolean }>()
+  items.forEach((item, index) => {
+    if (item.kind !== 'assistant') return
+    const key = item.turnId ?? `index:${index}`
+    const group = groups.get(key) ?? { indexes: [], text: '', open: false }
+    if (item.content !== '') group.text = group.text === '' ? item.content : `${group.text}\n\n${item.content}`
+    if (item.turnOpen === true) group.open = true
+    group.indexes.push(index)
+    groups.set(key, group)
+  })
+  const footers = new Map<number, TurnFooter>()
+  for (const group of groups.values()) {
+    if (group.open || group.text === '') continue
+    const lastIndex = group.indexes.at(-1)
+    if (lastIndex !== undefined) footers.set(lastIndex, { text: group.text })
+  }
+  return footers
+}
+
 /**
  * Consecutive tool/delegation/audit rows render as one tight block so a busy
  * turn reads as a compact activity log between messages. Terminal markers
@@ -49,14 +78,17 @@ export function Transcript({ items, conversationId, modelLabel, workspaceId, onR
   readonly openPath?: OpenPathResolver
 }) {
   const blocks = useMemo(() => groupBlocks(items), [items])
+  const footers = useMemo(() => turnFooters(items), [items])
   const { scrollRef, contentRef, atBottom, onScroll, scrollToBottom } = useStickToBottom(conversationId)
 
   const render = ({ item, index }: Indexed): ReactNode => {
     switch (item.kind) {
       case 'user':
         return <UserBubble key={`user-${index}`} item={item} workspaceId={workspaceId ?? null} {...(onReuse !== undefined ? { onReuse } : {})} />
-      case 'assistant':
-        return <AssistantMessage key={`assistant-${item.ts ?? index}`} item={item} {...(modelLabel !== undefined ? { modelLabel } : {})} />
+      case 'assistant': {
+        const turn = footers.get(index)
+        return <AssistantMessage key={`assistant-${item.ts ?? index}`} item={item} {...(modelLabel !== undefined ? { modelLabel } : {})} {...(turn !== undefined ? { turn } : {})} />
+      }
       case 'tool':
         return <ToolCard key={item.call.id} item={item} {...(openPath !== undefined ? { openPath } : {})} />
       case 'delegation':

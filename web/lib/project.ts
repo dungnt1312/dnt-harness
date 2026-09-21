@@ -22,6 +22,10 @@ export type ViewItem =
       readonly toolCalls?: readonly ToolCall[]
       /** What actually served this step; the workspace model is only a fallback. */
       controls?: { readonly model?: string; readonly provider?: string }
+      /** Turn this answer belongs to; absent on legacy events. */
+      readonly turnId?: string
+      /** True while the owning turn is still open — the turn footer waits for it to close. */
+      turnOpen?: boolean
     }
   | { readonly kind: 'tool'; readonly call: ToolCall; readonly ts?: number; doneAt?: number; result?: { readonly ok: boolean; readonly output: string }; /** Recovery-synthesized result: the real outcome is unknown. */ recovered?: boolean; /** `mcp__<server>__<tool>` calls carry their server for the chip. */ server?: string }
   | {
@@ -44,6 +48,8 @@ interface AssistantDraft {
   thinkingLive: boolean
   toolCalls?: readonly ToolCall[]
   controls?: { readonly model?: string; readonly provider?: string }
+  turnId?: string
+  turnOpen?: boolean
 }
 
 /** `mcp__<server>__<tool>` (the Claude convention) — undefined for built-ins. */
@@ -69,7 +75,9 @@ const DECISION_LABELS: Readonly<Record<string, string>> = {
  * result flags the row as recovered. `agent/child-spawn` → `agent/
  * child-result` project to one delegation card (a parent turn that ends
  * first marks it interrupted). Hooks surface only when blocking or failing;
- * approval decisions correlate their request by id. Structural events are
+ * approval decisions correlate their request by id. Answers carry their
+ * `turnId` and stay `turnOpen` until the matching `turn/end` so the
+ * transcript can place one footer per turn. Structural events are
  * skipped; non-`completed` turn ends surface as status lines.
  */
 export function projectItems(events: readonly SseEvent[]): ViewItem[] {
@@ -79,9 +87,22 @@ export function projectItems(events: readonly SseEvent[]): ViewItem[] {
   const delegations = new Map<string, Extract<ViewItem, { kind: 'delegation' }>>()
   const approvals = new Map<string, ToolCall>()
   let draft: AssistantDraft | null = null
+  let openTurnId: string | undefined
+  const turnAssistants = new Map<string, Array<Extract<ViewItem, { kind: 'assistant' }>>>()
+
+  /** Register an answer under its open turn so `turn/end` can close it in place. */
+  const trackAssistant = (item: Extract<ViewItem, { kind: 'assistant' }>): void => {
+    if (item.turnId === undefined) return
+    const tracked = turnAssistants.get(item.turnId)
+    if (tracked !== undefined) tracked.push(item)
+    else turnAssistants.set(item.turnId, [item])
+  }
 
   for (const event of events) {
     switch (event.type) {
+      case 'turn/start':
+        if (event.turnId !== undefined && event.turnId !== '') openTurnId = event.turnId
+        break
       case 'user/message': {
         if (event.content === undefined) break
         const pending = event.inputId !== undefined && event.inputId !== '' ? queuedUsers.get(event.inputId) : undefined
@@ -115,8 +136,13 @@ export function projectItems(events: readonly SseEvent[]): ViewItem[] {
       case 'assistant/chunk':
         if (event.delta === undefined) break
         if (draft === null) {
-          draft = { kind: 'assistant', content: '', live: true, thinking: [], thinkingLive: false, ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}) }
+          draft = {
+            kind: 'assistant', content: '', live: true, thinking: [], thinkingLive: false,
+            ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
+            ...(openTurnId !== undefined ? { turnId: openTurnId, turnOpen: true } : {}),
+          }
           items.push(draft)
+          trackAssistant(draft)
         }
         if (event.thinking === true) {
           draft.thinking.push(event.delta)
@@ -142,7 +168,7 @@ export function projectItems(events: readonly SseEvent[]): ViewItem[] {
           if (controls !== undefined) draft.controls = controls
           draft = null
         } else if (content !== '' || event.toolCalls !== undefined) {
-          items.push({
+          const item: Extract<ViewItem, { kind: 'assistant' }> = {
             kind: 'assistant',
             content,
             live: false,
@@ -151,7 +177,10 @@ export function projectItems(events: readonly SseEvent[]): ViewItem[] {
             ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
             ...(event.toolCalls !== undefined ? { toolCalls: event.toolCalls } : {}),
             ...(controls !== undefined ? { controls } : {}),
-          })
+            ...(openTurnId !== undefined ? { turnId: openTurnId, turnOpen: true } : {}),
+          }
+          items.push(item)
+          trackAssistant(item)
         }
         break
       }
@@ -253,6 +282,14 @@ export function projectItems(events: readonly SseEvent[]): ViewItem[] {
         break
       case 'turn/end':
         if (draft !== null) { draft.live = false; draft.thinkingLive = false; draft = null }
+        {
+          const closedId = event.turnId !== undefined && event.turnId !== '' ? event.turnId : openTurnId
+          if (closedId !== undefined) {
+            for (const item of turnAssistants.get(closedId) ?? []) item.turnOpen = false
+            turnAssistants.delete(closedId)
+          }
+          openTurnId = undefined
+        }
         for (const item of delegations.values()) {
           if (item.status === 'running') item.status = 'interrupted'
         }
