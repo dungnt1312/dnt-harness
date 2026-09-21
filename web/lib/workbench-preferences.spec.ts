@@ -40,7 +40,22 @@ describe('workbench preferences', () => {
       leftCollapsed: false,
       rightCollapsed: false,
       inspectorTab: 'files',
+      inspectorViews: ['files'],
+      terminalShell: null,
     })
+  })
+
+  it('keeps the anchor and the selected view in the opened strip', () => {
+    expect(parseWorkbenchPreferences(JSON.stringify({
+      inspectorTab: 'terminal',
+      inspectorViews: ['context', 'context', 'bogus'],
+    })).inspectorViews).toEqual(['files', 'context', 'terminal'])
+
+    // A strip stored without the anchor must not leave the workbench tabless.
+    expect(parseWorkbenchPreferences(JSON.stringify({
+      inspectorTab: 'files',
+      inspectorViews: 'not-an-array',
+    })).inspectorViews).toEqual(['files'])
   })
 
   it('clamps each panel only within its own range', () => {

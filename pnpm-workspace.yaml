@@ -1,2 +1,6 @@
 allowBuilds:
   esbuild: false
+  # node-pty ships a prebuilt binary but needs its install script to run to
+  # place it (and, on Windows, the bundled ConPTY DLL). Skipped builds fail
+  # much later and far less clearly, as a terminal that cannot open.
+  node-pty: true

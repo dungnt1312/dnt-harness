@@ -1138,6 +1138,10 @@ export function App() {
       project={workbenchProject}
       view={inspectorTab}
       onView={(view) => patchPreferences({ inspectorTab: view })}
+      views={preferences.inspectorViews}
+      onViews={(views) => patchPreferences({ inspectorViews: views })}
+      terminalShell={preferences.terminalShell}
+      onTerminalShell={(shellId) => patchPreferences({ terminalShell: shellId })}
       files={workbenchFiles}
       events={events}
       expanded={workbenchExpanded}

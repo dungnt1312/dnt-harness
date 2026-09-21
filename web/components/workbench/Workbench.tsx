@@ -1,6 +1,7 @@
-import type { ReactNode } from 'react'
+﻿import { lazy, Suspense, useMemo, type ReactNode } from 'react'
 import Icon from '../common/Icon.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
+import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import { ArtifactsPanel, type OpenPathResolver } from '../artifacts/ArtifactsPanel.tsx'
 import { ContextPanel, type ContextPanelProps } from '../layout/ContextPanel.tsx'
 import { AgentRunsPanel } from './AgentRunsPanel.tsx'
@@ -10,9 +11,27 @@ import { baseName } from '../../lib/project-paths.ts'
 import { fileStyle } from '../../lib/file-icons.ts'
 import { cn } from '../../lib/cn.ts'
 import type { WorkbenchFiles } from '../../hooks/useWorkbenchFiles.ts'
+import { ANCHOR_VIEW, normalizeInspectorViews, type WorkbenchViewName } from '../../lib/workbench-preferences.ts'
 import type { SseEvent } from '../../lib/types.ts'
 
-export type WorkbenchView = 'files' | 'context' | 'artifacts' | 'agents'
+// One source for the view names: the stored preference and this component
+// must not be able to drift apart.
+export type WorkbenchView = WorkbenchViewName
+
+const VIEW_META: Readonly<Record<WorkbenchView, { readonly icon: 'folder' | 'info' | 'layers' | 'gitBranch' | 'terminal'; readonly label: string }>> = {
+  files: { icon: 'folder', label: 'Files' },
+  context: { icon: 'info', label: 'Context' },
+  artifacts: { icon: 'layers', label: 'Artifacts' },
+  agents: { icon: 'gitBranch', label: 'Agents' },
+  terminal: { icon: 'terminal', label: 'Terminal' },
+}
+
+/** Picker order; the strip itself keeps the order the operator opened views in. */
+const VIEW_ORDER = Object.keys(VIEW_META) as readonly WorkbenchView[]
+
+// xterm is ~250KB: it must not sit in the entry bundle for the readers who
+// never open a terminal.
+const TerminalPanel = lazy(async () => import('./TerminalPanel.tsx'))
 
 export interface WorkbenchProject {
   readonly id: string
@@ -22,26 +41,54 @@ export interface WorkbenchProject {
 
 const tabClass = 'flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-[13px] text-fg-muted transition-colors hover:bg-hover hover:text-fg'
 
-function ViewTab({ active, icon, label, onClick }: { readonly active: boolean; readonly icon: 'folder' | 'info' | 'layers' | 'gitBranch'; readonly label: string; readonly onClick: () => void }) {
+function ViewTab({ view, active, onClick, onClose }: {
+  readonly view: WorkbenchView
+  readonly active: boolean
+  readonly onClick: () => void
+  /** Absent for the anchor view, which cannot be closed. */
+  readonly onClose?: () => void
+}) {
+  const { icon, label } = VIEW_META[view]
+  if (onClose === undefined) {
+    return (
+      <button type="button" aria-pressed={active} onClick={onClick} className={cn(tabClass, active && 'bg-muted text-fg')}>
+        <Icon name={icon} size={15} />
+        {label}
+      </button>
+    )
+  }
   return (
-    <button type="button" aria-pressed={active} onClick={onClick} className={cn(tabClass, active && 'bg-muted text-fg')}>
-      <Icon name={icon} size={15} />
-      {label}
-    </button>
+    <span className={cn('group flex h-8 shrink-0 items-center rounded-lg', active ? 'bg-muted' : 'hover:bg-hover')}>
+      <button type="button" aria-pressed={active} onClick={onClick} className={cn('flex h-full items-center gap-1.5 pl-2.5 pr-1 text-[13px]', active ? 'text-fg' : 'text-fg-muted hover:text-fg')}>
+        <Icon name={icon} size={15} />
+        {label}
+      </button>
+      <button type="button" aria-label={`Close ${label}`} title="Close" onClick={onClose} className="mr-1 flex size-5 items-center justify-center rounded text-fg-faint hover:bg-hover hover:text-fg">
+        <Icon name="close" size={12} />
+      </button>
+    </span>
   )
 }
 
 /**
- * The workbench: fixed Files / Context / Artifacts views plus one closable tab
- * per opened file. Everything here is read-only; file bodies come from the
- * project browsing endpoints and never from tool output.
+ * The workbench: the Files anchor plus whichever of Context / Artifacts /
+ * Agents / Terminal the operator has opened from the picker, and one closable
+ * tab per opened file. Views are opened on demand rather than all shown at
+ * once, because a nav holding every view leaves no room for file tabs.
+ *
+ * File bodies come from the project browsing endpoints rather than tool output.
+ * Terminal is the deliberate interactive exception: a user-driven shell,
+ * separate from the agent loop and from the session log.
  */
-export function Workbench({ workspaceId, project, view, onView, files, context, events, expanded, onToggleExpand, onClose, openPath, sessionId = null, onOpenChild, onOpenAgentSettings }: {
+export function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, expanded, onToggleExpand, onClose, openPath, sessionId = null, onOpenChild, onOpenAgentSettings, terminalShell = null, onTerminalShell }: {
   readonly workspaceId: string | null
   /** The project whose files are browsable; null for chat-only conversations. */
   readonly project: WorkbenchProject | null
   readonly view: WorkbenchView
   readonly onView: (view: WorkbenchView) => void
+  /** Opened view tabs in strip order; normalized here, so a stale list is safe. */
+  readonly views: readonly WorkbenchView[]
+  readonly onViews: (views: readonly WorkbenchView[]) => void
   readonly files: WorkbenchFiles
   readonly context: ContextPanelProps
   readonly events: readonly SseEvent[]
@@ -53,11 +100,31 @@ export function Workbench({ workspaceId, project, view, onView, files, context, 
   readonly sessionId?: string | null
   readonly onOpenChild?: (childSessionId: string) => void
   readonly onOpenAgentSettings?: () => void
+  /** Shell the Terminal view opens by itself; null defers to the host's order. */
+  readonly terminalShell?: string | null
+  readonly onTerminalShell?: (shellId: string | null) => void
 }) {
   const showFile = files.activeFile !== null && project !== null && workspaceId !== null
+  const openViews = useMemo(() => normalizeInspectorViews(views, view), [views, view])
+  const closedViews = VIEW_ORDER.filter((candidate) => !openViews.includes(candidate))
+
   const selectView = (next: WorkbenchView): void => {
     files.showFixedView()
     onView(next)
+  }
+
+  const addView = (next: WorkbenchView): void => {
+    if (!openViews.includes(next)) onViews([...openViews, next])
+    selectView(next)
+  }
+
+  /** Closing the selected tab reveals its right neighbour, else its left one. */
+  const closeView = (target: WorkbenchView): void => {
+    if (target === ANCHOR_VIEW) return
+    const index = openViews.indexOf(target)
+    const remaining = openViews.filter((candidate) => candidate !== target)
+    onViews(remaining)
+    if (view === target) onView(remaining[Math.min(index, remaining.length - 1)] ?? ANCHOR_VIEW)
   }
 
   let body: ReactNode
@@ -75,6 +142,17 @@ export function Workbench({ workspaceId, project, view, onView, files, context, 
         )
   } else if (view === 'context') {
     body = <div className="min-h-0 flex-1 overflow-y-auto p-4"><ContextPanel {...context} /></div>
+  } else if (view === 'terminal') {
+    body = (
+      <Suspense fallback={<div className="flex flex-1 items-center justify-center text-[13px] text-fg-muted">Loading terminal…</div>}>
+        <TerminalPanel
+          workspaceId={workspaceId}
+          projectId={project?.id ?? null}
+          defaultShell={terminalShell ?? null}
+          {...(onTerminalShell !== undefined ? { onDefaultShell: onTerminalShell } : {})}
+        />
+      </Suspense>
+    )
   } else if (view === 'agents') {
     body = (
       <AgentRunsPanel
@@ -92,10 +170,35 @@ export function Workbench({ workspaceId, project, view, onView, files, context, 
     <section aria-label="Workbench" className="flex h-full min-h-0 w-full flex-col bg-bg text-fg">
       <div className="flex h-12 shrink-0 items-center gap-1 border-b border-line pl-2 pr-1.5">
         <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto" role="toolbar" aria-label="Workbench views">
-          <ViewTab active={!showFile && view === 'files'} icon="folder" label="Files" onClick={() => selectView('files')} />
-          <ViewTab active={!showFile && view === 'context'} icon="info" label="Context" onClick={() => selectView('context')} />
-          <ViewTab active={!showFile && view === 'artifacts'} icon="layers" label="Artifacts" onClick={() => selectView('artifacts')} />
-          <ViewTab active={!showFile && view === 'agents'} icon="gitBranch" label="Agents" onClick={() => selectView('agents')} />
+          {openViews.map((openView) => (
+            <ViewTab
+              key={openView}
+              view={openView}
+              active={!showFile && view === openView}
+              onClick={() => selectView(openView)}
+              {...(openView === ANCHOR_VIEW ? {} : { onClose: () => closeView(openView) })}
+            />
+          ))}
+          {closedViews.length > 0 ? (
+            <Menu
+              label="Open a view"
+              triggerClassName="flex size-7 shrink-0 items-center justify-center rounded-lg text-fg-muted transition-colors hover:bg-hover hover:text-fg"
+              trigger={() => <Icon name="plus" size={15} />}
+            >
+              {(close) => closedViews.map((closedView) => (
+                <button
+                  key={closedView}
+                  type="button"
+                  role="menuitem"
+                  className={menuItemClass}
+                  onClick={() => { close(); addView(closedView) }}
+                >
+                  <Icon name={VIEW_META[closedView].icon} size={15} />
+                  {VIEW_META[closedView].label}
+                </button>
+              ))}
+            </Menu>
+          ) : null}
           {files.openFiles.length > 0 ? <span className="mx-1 h-5 w-px shrink-0 bg-line" aria-hidden="true" /> : null}
             {files.openFiles.map((path) => {
               const active = files.activeFile === path

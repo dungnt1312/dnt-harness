@@ -36,6 +36,18 @@ npm test         # vitest run
 npm run typecheck
 ```
 
+The Workbench terminal needs `node-pty`, which places a prebuilt binary (and
+on Windows a bundled ConPTY DLL) from its install script. `pnpm-workspace.yaml`
+already allows that build; with npm 11 or newer the script is blocked by
+default and the terminal then reports itself unavailable, so approve it once:
+
+```sh
+npm install-scripts approve node-pty
+```
+
+Everything else runs normally without it — a missing PTY backend disables the
+terminal and nothing else.
+
 ## Configuration
 
 Both bins load a repo-root `.env` (gitignored) before reading

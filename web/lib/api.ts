@@ -1,5 +1,5 @@
 import type { AttachmentRef } from './composer-draft.ts'
-import type { AgentDefinitionRow, ChildRow, Envelope, HooksConfigRow, McpServerRow, MemoryEntryRow, Meta, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillRow, WorkspaceMeta, WorkspaceRow } from './types.ts'
+import type { AgentDefinitionRow, ChildRow, Envelope, HooksConfigRow, McpServerRow, MemoryEntryRow, Meta, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillRow, TerminalFrame, TerminalListing, TerminalRow, WorkspaceMeta, WorkspaceRow } from './types.ts'
 
 async function json<T>(response: Response): Promise<T> {
   if (!response.ok) {
@@ -719,4 +719,75 @@ export function listAgentDefinitions(workspaceId: string): Promise<AgentDefiniti
 }
 export function deleteAgentDefinition(workspaceId: string, name: string): Promise<{ deleted: boolean }> {
   return fetch('/api/workspaces/' + encodeURIComponent(workspaceId) + '/agents/' + encodeURIComponent(name), { method: 'DELETE' }).then(r => json<{ deleted: boolean }>(r))
+}
+
+// ── Workbench terminals ─────────────────────────────────────────────────────
+// A user-driven shell, not an agent tool: these routes carry no approval and
+// write nothing to the session log. Payloads are base64 because PTY traffic is
+// a byte stream.
+
+export function listTerminals(workspaceId: string): Promise<TerminalListing> {
+  return fetch('/api/workspaces/' + encodeURIComponent(workspaceId) + '/terminals').then(r => json<TerminalListing>(r))
+}
+
+export function createTerminal(workspaceId: string, input: { shellId?: string; projectId?: string; cols: number; rows: number }): Promise<TerminalRow> {
+  return fetch('/api/workspaces/' + encodeURIComponent(workspaceId) + '/terminals', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  }).then(r => json<TerminalRow>(r))
+}
+
+export function killTerminal(workspaceId: string, terminalId: string): Promise<{ killed: boolean }> {
+  return fetch('/api/workspaces/' + encodeURIComponent(workspaceId) + '/terminals/' + encodeURIComponent(terminalId), { method: 'DELETE' }).then(r => json<{ killed: boolean }>(r))
+}
+
+export function writeTerminal(workspaceId: string, terminalId: string, data: string): Promise<unknown> {
+  return fetch('/api/workspaces/' + encodeURIComponent(workspaceId) + '/terminals/' + encodeURIComponent(terminalId) + '/input', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ data: toBase64(data) }),
+  }).then(r => json<unknown>(r))
+}
+
+export function resizeTerminal(workspaceId: string, terminalId: string, cols: number, rows: number): Promise<TerminalRow> {
+  return fetch('/api/workspaces/' + encodeURIComponent(workspaceId) + '/terminals/' + encodeURIComponent(terminalId) + '/resize', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ cols, rows }),
+  }).then(r => json<TerminalRow>(r))
+}
+
+/** One stream per workspace carries every terminal in it (see the server note on connection limits). */
+export function subscribeTerminals(
+  workspaceId: string,
+  onFrame: (frame: TerminalFrame) => void,
+  onState?: (state: StreamState) => void,
+): () => void {
+  const source = new EventSource('/api/workspaces/' + encodeURIComponent(workspaceId) + '/terminals/events')
+  source.onopen = () => onState?.('open')
+  source.onerror = () => {
+    onState?.(source.readyState === EventSource.CONNECTING ? 'reconnecting' : 'connecting')
+  }
+  source.onmessage = (message: MessageEvent<string>) => {
+    onFrame(JSON.parse(message.data) as TerminalFrame)
+  }
+  return () => {
+    source.close()
+  }
+}
+
+/** UTF-8 safe base64 in both directions; btoa/atob alone mangle non-Latin-1 output. */
+export function toBase64(value: string): string {
+  const bytes = new TextEncoder().encode(value)
+  let binary = ''
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary)
+}
+
+export function fromBase64(value: string): string {
+  const binary = atob(value)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
+  return new TextDecoder().decode(bytes)
 }

@@ -53,6 +53,14 @@ import {
   sniffImageMediaType,
   type AttachmentRef,
 } from '../harness/attachments/store.ts'
+import {
+  createTerminalService,
+  TerminalError,
+  type PtySpawner,
+  type TerminalExitReason,
+  type TerminalInfo,
+  type TerminalService,
+} from './terminals.ts'
 import { Kernel } from '../kernel/registry.ts'
 import {
   loadProviderStore,
@@ -174,6 +182,57 @@ export interface WebServerOptions {
   readonly port?: number
   /** Bind address; defaults to `127.0.0.1`. */
   readonly host?: string
+  /**
+   * Extra `Host` header values this server answers to, beyond the loopback
+   * literals and its own bind address.
+   *
+   * Every request is checked against this allowlist because a browser will
+   * happily send requests to a name that resolves to `127.0.0.1` — DNS
+   * rebinding — and treat the response as same-origin. Binding to loopback
+   * does not prevent that; refusing unknown `Host` values does. Set this when
+   * the host legitimately answers to a LAN name or sits behind a proxy.
+   */
+  readonly allowedHosts?: readonly string[]
+  /**
+   * Interactive Workbench terminals. Enabled by default, and served only on a
+   * loopback bind: a terminal reachable from the network is remote code
+   * execution for anyone who can open the page. `spawner` is a test seam.
+   */
+  readonly terminals?: {
+    readonly enabled?: boolean
+    readonly spawner?: PtySpawner
+    /**
+     * Where a terminal opens when no project is named. Defaults to the host
+     * process's own working directory — where `npm run web` was started, which
+     * is what a user expects a terminal to open in. It is deliberately
+     * separate from `root`: that field grants file tools their scope, and a
+     * terminal must not be able to widen it.
+     */
+    readonly defaultCwd?: string
+  }
+}
+
+/**
+ * Terminal stream frames. Deliberately a separate type from {@link WebEnvelope}:
+ * terminal traffic is ephemeral and never enters the durable session log, so it
+ * must not be able to travel the session stream by accident. Payloads are
+ * base64 because PTY output is a byte stream that JSON cannot carry verbatim.
+ */
+export type TerminalEnvelope =
+  | { readonly kind: 'snapshot'; readonly terminals: readonly TerminalSnapshot[] }
+  | { readonly kind: 'created'; readonly terminal: TerminalInfo }
+  | { readonly kind: 'data'; readonly terminalId: string; readonly data: string }
+  | {
+      readonly kind: 'exit'
+      readonly terminalId: string
+      readonly exitCode: number
+      readonly reason: TerminalExitReason
+    }
+
+/** A terminal plus the scrollback a reconnecting client needs to catch up. */
+export interface TerminalSnapshot extends TerminalInfo {
+  /** Base64 of the retained scrollback. */
+  readonly scrollback: string
 }
 
 /** A running web server: its URL plus a graceful shutdown. */
@@ -1380,6 +1439,27 @@ ${decision.injected}`, ...contents]
   const staticDir = options.staticDir
     ?? fileURLToPath(new URL('../../web-dist/', import.meta.url))
 
+  // Terminals are a web-host resource: they touch no kernel service, emit no
+  // durable event, and are constructed here only so shutdown can reach them.
+  const terminals = createTerminalService(
+    options.terminals?.spawner !== undefined ? { spawner: options.terminals.spawner } : {},
+  )
+  const terminalsEnabled = options.terminals?.enabled ?? true
+  // Resolved, not passed through: hosts are commonly started with `--root .`,
+  // and a terminal reporting its cwd as "." tells a client nothing about where
+  // the shell actually opened.
+  const terminalDefaultCwd = path.resolve(options.terminals?.defaultCwd ?? options.root ?? process.cwd())
+  const boundHost = options.host ?? '127.0.0.1'
+  const terminalsLoopback = boundHost === '127.0.0.1' || boundHost === '::1' || boundHost === 'localhost'
+  // The names this server answers to. A `Host` outside this set is refused
+  // before routing, which is what actually stops a rebound DNS name from
+  // reaching these APIs from a page the user merely visited.
+  const allowedHosts: ReadonlySet<string> = new Set(
+    ['127.0.0.1', '::1', 'localhost', boundHost, ...(options.allowedHosts ?? [])].map((value) =>
+      value.trim().toLowerCase(),
+    ),
+  )
+
   const deps: HandlerDeps = {
     kernel,
     sessions,
@@ -1419,6 +1499,11 @@ ${decision.injected}`, ...contents]
     setDefaults: (next) => { defaults = next },
     mutateProviderStore,
     publicSummary: () => list.map(publicProvider),
+    terminals,
+    terminalsEnabled,
+    terminalsLoopback,
+    terminalDefaultCwd,
+    allowedHosts,
   }
   depsRef.current = deps
 
@@ -1467,6 +1552,9 @@ ${decision.injected}`, ...contents]
       // EventSource open indefinitely — so close() would hang on them.
       // Force every connection down first, then wait for the listener.
       server.closeAllConnections()
+      // PTYs are children of this process: leaving them running would orphan
+      // a shell per terminal every time the host restarts.
+      terminals.disposeAll()
       await new Promise<void>((resolve) => server.close(() => resolve()))
       for (const client of mcpClients.values()) await client.disconnect()
       mcpClients.clear()
@@ -1521,11 +1609,42 @@ interface HandlerDeps {
   readonly setDefaults: (next: ModelDefaults) => void
   readonly mutateProviderStore: <T>(derive: (current: { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults }) => { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly result: T } | Promise<{ readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly result: T }>, options?: { readonly clearRuntimeModelOverride?: boolean }) => Promise<T>
   readonly publicSummary: () => readonly PublicProvider[]
+  readonly terminals: TerminalService
+  readonly terminalsEnabled: boolean
+  readonly terminalsLoopback: boolean
+  readonly terminalDefaultCwd: string
+  readonly allowedHosts: ReadonlySet<string>
+}
+
+/** The hostname part of a `Host` header, lowercased, with the port and any IPv6 brackets removed. */
+function requestHostname(raw: string | undefined): string | undefined {
+  const value = raw?.trim().toLowerCase()
+  if (value === undefined || value === '') return undefined
+  if (value.startsWith('[')) {
+    const end = value.indexOf(']')
+    return end === -1 ? undefined : value.slice(1, end)
+  }
+  const colon = value.indexOf(':')
+  return colon === -1 ? value : value.slice(0, colon)
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse, deps: HandlerDeps): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://localhost')
   const { pathname } = url
+
+  // DNS rebinding defence, applied before routing and to static assets too —
+  // the page itself is what would carry an attacker's script. A browser sends
+  // the attacker's name in `Host` even when it resolves to loopback, so
+  // refusing names this server does not answer to is what closes the hole;
+  // binding to 127.0.0.1 never did.
+  const hostname = requestHostname(req.headers.host)
+  if (hostname === undefined || !deps.allowedHosts.has(hostname)) {
+    res.writeHead(403, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({
+      error: `this host does not answer to '${hostname ?? '(no Host header)'}'; reach it by its bind address or set allowedHosts`,
+    }))
+    return
+  }
 
   if (pathname.startsWith('/api/')) {
     await handleApi(req, res, pathname, deps, url.searchParams)
@@ -2832,6 +2951,121 @@ async function handleApi(
       return
     }
 
+    // ── interactive terminals (workbench Terminal) ─────────────
+    // A user-driven shell, not an agent tool: no approval gate, no durable
+    // event, no session ownership. Gated on a loopback bind because the page
+    // that reaches these routes can run anything the host user can.
+    const wsTerminalsMatch = /^\/api\/workspaces\/([^/]+)\/terminals(?:\/(.+))?$/.exec(pathname)
+    if (wsTerminalsMatch !== null) {
+      const wsId = decodeURIComponent(wsTerminalsMatch[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, false)
+      if (!deps.terminalsEnabled) {
+        send(404, { error: 'terminals are disabled on this host' })
+        return
+      }
+      if (!deps.terminalsLoopback) {
+        send(403, {
+          error: 'terminals are served only on a loopback bind; a network-reachable terminal is remote code execution',
+        })
+        return
+      }
+      const rest = wsTerminalsMatch[2]
+      try {
+        // `events` is checked before the id routes: otherwise it reads as a
+        // terminal id and the stream endpoint disappears.
+        if (rest === 'events' && req.method === 'GET') {
+          streamTerminals(req, res, wsId, deps)
+          return
+        }
+        if (rest === undefined) {
+          if (req.method === 'GET') {
+            const probe = await deps.terminals.probe()
+            send(200, {
+              terminals: deps.terminals.list(wsId),
+              shells: deps.terminals.shells(),
+              max: 4,
+              available: probe.available,
+              ...(probe.available ? {} : { unavailable: probe.hint }),
+            })
+            return
+          }
+          if (req.method === 'POST') {
+            requireWorkspace(deps, wsId, true) // archived: no new work
+            const body = await readJson(req)
+            const cwd = await resolveTerminalCwd(wsId, body, deps)
+            if (cwd.ok === false) {
+              send(cwd.status, { error: cwd.error })
+              return
+            }
+            const startCols = terminalDimension(body['cols'])
+            const startRows = terminalDimension(body['rows'])
+            const info = await deps.terminals.create({
+              workspaceId: wsId,
+              cwd: cwd.path,
+              ...(typeof body['shellId'] === 'string' ? { shellId: body['shellId'] as never } : {}),
+              ...(startCols !== undefined ? { cols: startCols } : {}),
+              ...(startRows !== undefined ? { rows: startRows } : {}),
+            })
+            send(201, info)
+            return
+          }
+          send(405, { error: 'method not allowed' })
+          return
+        }
+        const action = /^([^/]+)\/(input|resize)$/.exec(rest)
+        if (action !== null) {
+          const id = decodeURIComponent(action[1] ?? '')
+          if (deps.terminals.get(id)?.workspaceId !== wsId) {
+            send(404, { error: `unknown terminal '${id}'` })
+            return
+          }
+          if (req.method !== 'POST') {
+            send(405, { error: 'method not allowed' })
+            return
+          }
+          const body = await readJson(req)
+          if (action[2] === 'input') {
+            const data = body['data']
+            if (typeof data !== 'string') {
+              send(400, { error: "'data' must be a base64 string" })
+              return
+            }
+            deps.terminals.write(id, Buffer.from(data, 'base64').toString('utf8'))
+            send(202, { accepted: true })
+            return
+          }
+          // `NaN < 1` is false, so a bare range check lets NaN and Infinity
+          // through to node-pty, which throws a plain Error and turns a bad
+          // request into a 500.
+          const cols = terminalDimension(body['cols'])
+          const rows = terminalDimension(body['rows'])
+          if (cols === undefined || rows === undefined) {
+            send(400, { error: "'cols' and 'rows' must be finite numbers between 1 and 1000" })
+            return
+          }
+          deps.terminals.resize(id, cols, rows)
+          send(200, deps.terminals.get(id))
+          return
+        }
+        const id = decodeURIComponent(rest)
+        if (deps.terminals.get(id)?.workspaceId !== wsId) {
+          send(404, { error: `unknown terminal '${id}'` })
+          return
+        }
+        if (req.method === 'DELETE') {
+          deps.terminals.kill(id)
+          send(200, { killed: true })
+          return
+        }
+        send(405, { error: 'method not allowed' })
+      } catch (error) {
+        if (!(error instanceof TerminalError)) throw error
+        const status = error.code === 'unavailable' ? 501 : error.code === 'not-found' ? 404 : 400
+        send(status, { error: error.message })
+      }
+      return
+    }
+
     // ── read-only project browsing (workbench Files) ───────────
     const wsProjectFilesMatch = /^\/api\/workspaces\/([^/]+)\/projects\/([^/]+)\/(files|file|search)$/.exec(pathname)
     if (wsProjectFilesMatch !== null) {
@@ -3728,6 +3962,105 @@ async function readBytes(req: IncomingMessage, maxBytes: number): Promise<Buffer
 /** Write one SSE `data:` frame and flush it. */
 function writeFrame(res: ServerResponse, envelope: WebEnvelope): void {
   res.write(`data: ${JSON.stringify(envelope)}\n\n`)
+}
+
+/** A terminal geometry value, or `undefined` when it is not a usable one. */
+function terminalDimension(raw: unknown): number | undefined {
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return undefined
+  const value = Math.floor(raw)
+  return value >= 1 && value <= 1_000 ? value : undefined
+}
+
+/**
+ * Where a new terminal opens: the named project's folder, or the workspace
+ * root. The user can `cd` elsewhere afterwards — the same honest limit the
+ * Bash tool already carries, since path confinement guards file tools, not
+ * shell access.
+ */
+async function resolveTerminalCwd(
+  workspaceId: WorkspaceId,
+  body: Record<string, unknown>,
+  deps: HandlerDeps,
+): Promise<{ ok: true; path: string } | { ok: false; status: number; error: string }> {
+  let target: string
+  const projectId = body['projectId']
+  if (typeof projectId === 'string' && projectId !== '') {
+    try {
+      target = deps.workspaces.getProject(projectId as ProjectId, workspaceId).path
+    } catch (error) {
+      if (!(error instanceof ScopeError)) throw error
+      return { ok: false, status: 404, error: error.message }
+    }
+  } else {
+    // A workspace owns no path — only its projects do — so an unbound
+    // terminal opens in the host's configured default folder.
+    target = deps.terminalDefaultCwd
+  }
+  try {
+    const stats = await fs.stat(target)
+    if (!stats.isDirectory()) return { ok: false, status: 400, error: `'${target}' is not a directory` }
+  } catch {
+    return { ok: false, status: 400, error: `'${target}' does not exist` }
+  }
+  return { ok: true, path: target }
+}
+
+/**
+ * Stream every terminal in one workspace over a single connection.
+ *
+ * One stream, not one per terminal: browsers cap HTTP/1.1 at about six
+ * connections per origin and the chat stream already holds one, so a
+ * per-terminal stream would starve the REST calls that drive the same page.
+ */
+function streamTerminals(req: IncomingMessage, res: ServerResponse, workspaceId: WorkspaceId, deps: HandlerDeps): void {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  })
+  // The service bounds one 16 ms window, which still permits tens of MB/s of
+  // sustained output. A browser that cannot keep up would otherwise have that
+  // backlog accumulate in this socket's write queue, so the slow consumer is
+  // handled here, where the queue actually lives: past the watermark, output
+  // frames are dropped and the gap is stated once.
+  const WRITE_WATERMARK_BYTES = 4_000_000
+  let dropping = false
+  const frame = (envelope: TerminalEnvelope): void => {
+    const droppable = envelope.kind === 'data'
+    if (droppable && res.writableLength > WRITE_WATERMARK_BYTES) {
+      if (!dropping) {
+        dropping = true
+        res.write(`data: ${JSON.stringify({
+          kind: 'data',
+          terminalId: envelope.terminalId,
+          data: Buffer.from('\r\n[output dropped: reader too slow]\r\n', 'utf8').toString('base64'),
+        } satisfies TerminalEnvelope)}\n\n`)
+      }
+      return
+    }
+    dropping = false
+    res.write(`data: ${JSON.stringify(envelope)}\n\n`)
+  }
+  const encode = (data: string): string => Buffer.from(data, 'utf8').toString('base64')
+
+  frame({
+    kind: 'snapshot',
+    terminals: deps.terminals.list(workspaceId).map((info) => ({
+      ...info,
+      scrollback: encode(deps.terminals.scrollback(info.id)),
+    })),
+  })
+
+  const dispose = deps.terminals.subscribe(workspaceId, (event) => {
+    frame(event.kind === 'data' ? { ...event, data: encode(event.data) } : event)
+  })
+  const heartbeat = setInterval(() => res.write(': ping\n\n'), 25_000)
+  heartbeat.unref?.()
+
+  req.on('close', () => {
+    clearInterval(heartbeat)
+    dispose()
+  })
 }
 
 /**

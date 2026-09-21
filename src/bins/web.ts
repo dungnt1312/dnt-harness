@@ -60,6 +60,10 @@ async function main(): Promise<void> {
     seedDeepseekFromEnv: true,
     ...(yolo ? {} : { policy }),
     defaultMode: yolo ? 'allow' : 'ask',
+    // `--root` picks where an unbound Workbench terminal opens. It is not
+    // passed as `root`: that would widen the file tools' legacy grant, which
+    // is a separate decision from where a user's shell starts.
+    terminals: { defaultCwd: root },
     port,
   })
 

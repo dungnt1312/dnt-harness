@@ -128,6 +128,7 @@ tool root. The families, at a glance:
 | `PUT …/:wid/policy`, `PUT …/:wid/mode`, `GET …/:wid/meta` | the workspace-local live controls (policy, mode) and workspace meta (global defaults, projects, providers) |
 | `…/:wid/projects` (+ `/projects/:pid`) | project binding: working folder, ownership, overlap rejection |
 | `GET …/:wid/projects/:pid/(files\|file\|search)` | read-only project browsing: one directory listing, one file body, and a bounded file-name search for composer mentions |
+| `…/:wid/terminals` (+ `/events` SSE, `/:tid` DELETE, `/:tid/(input\|resize)`) | interactive Workbench terminals: PTY lifecycle, one multiplexed output stream per workspace — see the terminal section |
 | `POST …/:wid/attachments`, `GET …/:wid/attachments/:id` | composer attachments: upload (content-addressed by sha256, verified media type) and serve (immutable, workspace-scoped) |
 | `…/:wid/agents/:name` (GET resolve / DELETE), `POST …/:wid/agents/:name` | agent definitions; POST spawns a bounded child with a task packet |
 | `GET …/:wid/agents/children?root=…`, `GET/DELETE …/:wid/children/:childId` (+ `/cancel`) | child list / wait-result / cancel |
@@ -426,6 +427,91 @@ type WebEnvelope =
   `"thinking": true`; the client renders them in a collapsible thinking panel
   and they never enter model history.
 
+## The `Host` allowlist
+
+Every request — API and static page alike — is refused with `403` unless its
+`Host` header names something this server answers to: the loopback literals,
+its own bind address, and anything in `allowedHosts`.
+
+This is a DNS-rebinding defence. A browser will send requests to any name that
+resolves to `127.0.0.1` and treat the response as same-origin, so binding to
+loopback never kept a visited page out; refusing unknown `Host` values does.
+The page is covered as well as the API, because the page is what would carry
+an attacker's script.
+
+The hole predates the terminal and spans the whole host — `PUT …/policy`
+followed by a message already reached the `Bash` tool — but a terminal turns it
+into a single silent step with no approval prompt, which is why the guard
+landed with this feature rather than after it.
+
+Set `allowedHosts` when the host legitimately answers to a LAN name or sits
+behind a reverse proxy; `127.0.0.1`, `::1` and `localhost` need no entry.
+
+## Workbench terminals
+
+An interactive, PTY-backed shell in the Workbench — full colour, resize,
+`Ctrl+C`, and curses programs. It is **not** an agent capability, and the
+boundaries matter more than the feature:
+
+- **Separate from the agent loop.** `src/web/terminals.ts` touches no
+  `agentScope`, no `session/event`, no approval bridge and no tool registry. It
+  is constructed in `createWebServer()` and is not exported from
+  `src/index.ts`. The agent keeps its captured-output `Bash` tool and its `ask`
+  gate; the two never share a shell.
+- **No approval, by design.** The user types these commands. A per-command
+  question would be theatre, so there is none. What guards the surface instead
+  is the bind address.
+- **Loopback only.** Every terminal route answers `403` when the host is not
+  bound to `127.0.0.1`/`::1`: a network-reachable terminal is remote code
+  execution for anyone who can open the page. Chat is unaffected by that gate.
+  `terminals: { enabled: false }` removes the family entirely (`404`).
+- **Ephemeral.** Terminal traffic never enters the session log — one `cat` of a
+  large file would break snapshot replay. Scrollback lives in a 256 KB
+  in-memory ring per terminal: a page reload replays it and reattaches, a host
+  restart does not.
+- **Bounded.** Four terminals per workspace; output is coalesced into 16 ms
+  frames and a flush past 1 MB is dropped with an
+  `[output truncated: too fast]` marker; a terminal idle for 30 minutes is
+  reaped. `server.close()` kills every PTY, so none outlives the host.
+- **Opening the view opens a shell.** The panel creates one terminal by itself,
+  once per mount, rather than presenting a picker — landing in a chooser is not
+  landing in a terminal. Closing the last terminal is a decision and is never
+  undone automatically.
+- **Default shell** is a browser-local preference (`terminalShell` in
+  `mini-dsh.workbench.v1`), set from the Terminal view's shell menu. Unset, it
+  defers to the host's own order: Git Bash first, PowerShell when Git Bash is
+  absent on Windows. A remembered shell the host no longer offers falls back to
+  that order instead of failing every open.
+- **Shells** come from the shared resolver (`capabilities/shell/detect.ts`) and
+  the client renders only what the host reports — Git Bash, and on Windows
+  PowerShell and cmd. On Windows the PTY is created with `useConptyDll`: the
+  default kill path forks a console-list helper that dies with
+  `AttachConsole failed` once the shell has exited, and both paths were
+  measured to reap a backgrounded grandchild.
+- **cwd** is the conversation's project folder, or the host's `--root`
+  otherwise. As with `Bash`, a shell is not path-confined: the user can `cd`
+  anywhere the OS user can.
+
+Frames are a separate wire type from `WebEnvelope`, so terminal traffic cannot
+travel the session stream by accident. `data` and `scrollback` are base64
+because PTY output is a byte stream:
+
+```ts
+type TerminalEnvelope =
+  | { kind: 'snapshot', terminals: (TerminalInfo & { scrollback: string })[] }
+  | { kind: 'created',  terminal: TerminalInfo }
+  | { kind: 'data',     terminalId: string, data: string }
+  | { kind: 'exit',     terminalId: string, exitCode: number, reason: 'exit' | 'killed' | 'idle' }
+```
+
+One stream carries every terminal in a workspace: browsers cap HTTP/1.1 at
+about six connections per origin and the chat stream already holds one.
+Keystrokes POST to `/input` batched per 16 ms frame rather than per character.
+
+`node-pty` is imported lazily. Without it the routes answer `501` with the
+install hint and the rest of the product is untouched; see the README for the
+one-time npm install-script approval.
+
 ## The approval bridge
 
 Approval questions must reach the *right* human. `attachApproval`'s `askUser`
@@ -486,6 +572,7 @@ graceful close and a second to an immediate exit.
 | `components/chat` | `Transcript`, message/tool/delegation rows, thinking, work status, approvals |
 | `components/composer` | `Composer` with attach/mode/thinking/permission chips, `ModelMenu` beside Send, `@`/`/` completion popover, attachment tray, folder picker |
 | `components/artifacts` | pure existing-event artifact projection and read-only Artifacts panel |
+| `components/workbench` | Files browser/viewer, Agent runs, and the lazily-loaded xterm `TerminalPanel` |
 | `components/settings` | Settings dialog and provider editor; one module per workspace panel (Projects, Skills, Memory, Agents, MCP, Hooks, Secrets) built on the shared `settings-kit` |
 | `components/ui` | Tailwind/CVA primitives with Radix interaction mechanics |
 | `components/common` | icons, copy, confirmation, error, spinner, and toast surfaces |
@@ -506,10 +593,14 @@ existence, content, diffs, MIME type, repository ownership, or rerun capability.
 The layout follows a ChatGPT-style shell: a resizable 280px-default sidebar
 (232–420px) docked at 768px and above (a modal drawer below), one centered chat
 column whose transcript scroller follows the tail only while the reader is at the
-bottom, a composer section in normal flow below it, and a read-only Workbench with
-Files, Context and Artifacts. The Workbench docks at 1280px and becomes a modal
-sheet below that. Sidebar/workbench collapse, dock widths and the selected fixed
-Workbench view are browser-local preferences under `mini-dsh.workbench.v1`;
+bottom, a composer section in normal flow below it, and a Workbench whose views
+are Files, Context, Artifacts, Agents and Terminal. Files is the anchor tab; the
+rest are opened on demand from the nav's `+` picker and closed again from their
+tab, so the strip keeps room for opened file tabs. Files and Artifacts are
+read-only projections; Context is read-only apart from its confirmed Compact,
+Agents delegates and cancels child runs for the open conversation, and Terminal
+is the deliberate interactive exception documented above. The Workbench docks at 1280px and becomes a modal sheet below that. Sidebar/workbench collapse, dock widths, the opened
+Workbench views and the selected one are browser-local preferences under `mini-dsh.workbench.v1`;
 appearance (System/Light/Dark) is stored under
 `mini-dsh.theme`; unsent composer drafts are kept per workspace+session under
 `mini-dsh.drafts.v1` (text only — never `sending` or an error, which describe a

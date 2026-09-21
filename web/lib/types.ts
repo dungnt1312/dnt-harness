@@ -23,6 +23,8 @@ export interface SseEvent {
   readonly ok?: boolean
   readonly output?: string
   readonly reason?: string
+  /** Turn membership (turn/start, user/message, assistant traffic, turn/end). */
+  readonly turnId?: string
   readonly toolCalls?: ToolCall[]
   /** Recorded controls on assistant answers (what served this step). */
   readonly controls?: { readonly model?: string; readonly provider?: string }
@@ -278,3 +280,37 @@ export interface MemoryEntryRow {
   readonly body: string
   readonly hash: string
 }
+
+/** One live terminal, as the host describes it. */
+export interface TerminalRow {
+  readonly id: string
+  readonly workspaceId: string
+  readonly shellId: string
+  readonly label: string
+  readonly cwd: string
+  readonly cols: number
+  readonly rows: number
+  readonly createdAt: number
+}
+
+/** A shell this host can actually launch; the picker never hardcodes a list. */
+export interface ShellRow {
+  readonly id: string
+  readonly label: string
+}
+
+export interface TerminalListing {
+  readonly terminals: readonly TerminalRow[]
+  readonly shells: readonly ShellRow[]
+  readonly max: number
+  readonly available: boolean
+  /** Why no PTY backend resolved, when `available` is false. */
+  readonly unavailable?: string
+}
+
+/** Client mirror of the host's TerminalEnvelope; `data`/`scrollback` are base64. */
+export type TerminalFrame =
+  | { readonly kind: 'snapshot'; readonly terminals: readonly (TerminalRow & { readonly scrollback: string })[] }
+  | { readonly kind: 'created'; readonly terminal: TerminalRow }
+  | { readonly kind: 'data'; readonly terminalId: string; readonly data: string }
+  | { readonly kind: 'exit'; readonly terminalId: string; readonly exitCode: number; readonly reason: 'exit' | 'killed' | 'idle' }
