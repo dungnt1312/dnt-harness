@@ -18,6 +18,8 @@ import { setPolicy, compactSession, fetchHooks, saveHooks, renameWorkspace, list
 import { ContextPanel } from '../components/layout/ContextPanel.tsx'
 import { Workbench, type WorkbenchView } from '../components/workbench/Workbench.tsx'
 import { closeFileTab, useWorkbenchFiles } from '../hooks/useWorkbenchFiles.ts'
+import { useWorkbenchPreferences } from '../hooks/useWorkbenchPreferences.ts'
+import { WORKBENCH_DEFAULTS, WORKBENCH_STORAGE_KEY } from './workbench-preferences.ts'
 import { Sidebar, type SidebarProps } from '../components/layout/Sidebar.tsx'
 import { HooksPanel } from '../components/settings/ManagementPanels.tsx'
 import { SessionList } from '../components/session/SessionList.tsx'
@@ -74,6 +76,21 @@ function WorkbenchProbe({ view, events, project = null }: { readonly view: Workb
   const [selected, setSelected] = useState<WorkbenchView>(view)
   const [views, setViews] = useState<readonly WorkbenchView[]>(['files', view])
   return <Workbench workspaceId="w1" project={project} view={selected} onView={setSelected} views={views} onViews={setViews} files={files} events={events} expanded={false} onClose={() => {}} context={{ meta: null, stream: 'open', sessionId: 's1', sessionFolder: null, eventCount: events.length }} />
+}
+/**
+ * The same wiring the app uses: one persisted preference object drives both the
+ * strip and the selected view, and `patchPreferences` merges a partial patch —
+ * so a close that removes a tab and a select that re-adds the active view
+ * cannot disagree the way two independent setState calls can.
+ */
+function WorkbenchPreferenceProbe({ events }: { readonly events: readonly SseEvent[] }) {
+  const { preferences, patchPreferences } = useWorkbenchPreferences()
+  const files = useWorkbenchFiles(null)
+  return <Workbench workspaceId="w1" project={null} view={preferences.inspectorTab} onView={(view) => patchPreferences({ inspectorTab: view })} views={preferences.inspectorViews} onViews={(views) => patchPreferences({ inspectorViews: views })} files={files} events={events} expanded={false} onClose={() => {}} context={{ meta: null, stream: 'open', sessionId: 's1', sessionFolder: null, eventCount: events.length }} />
+}
+/** Seed the persisted strip the app would have loaded before the probe mounts. */
+function seedWorkbench(inspectorTab: WorkbenchView, inspectorViews: readonly WorkbenchView[]) {
+  window.localStorage.setItem(WORKBENCH_STORAGE_KEY, JSON.stringify({ ...WORKBENCH_DEFAULTS, inspectorTab, inspectorViews }))
 }
 const composerBase = { onDraft: () => {}, onSend: () => {}, onStop: () => {}, modelValue: 'p/m', modes: [], modeValue: null, onMode: () => {} }
 
@@ -158,6 +175,21 @@ describe('transcript grouping', () => {
       { kind: 'status', reason: 'limit' },
     ])
     expect(blocks.map((block) => block.kind === 'activity' ? `activity:${block.rows.length}` : block.row.item.kind)).toEqual(['user', 'activity:3', 'assistant', 'status', 'status'])
+  })
+  it('merges tool rows across invisible tool-only assistant steps into one tight block', () => {
+    const emptyStep = { kind: 'assistant' as const, content: '', live: false, thinking: [] as string[], thinkingLive: false }
+    const blocks = groupBlocks([
+      { kind: 'user', content: 'go' },
+      { kind: 'tool', call: { id: 'a', name: 'Bash', args: {} } },
+      emptyStep,
+      { kind: 'tool', call: { id: 'b', name: 'Read', args: {} } },
+      emptyStep,
+      { kind: 'audit', icon: 'allow', text: 'Allowed · Read' },
+      emptyStep,
+      { kind: 'assistant', content: 'done', live: false, thinking: [], thinkingLive: false },
+      { kind: 'assistant', content: '', live: true, thinking: [], thinkingLive: false },
+    ])
+    expect(blocks.map((block) => block.kind === 'activity' ? `activity:${block.rows.length}` : block.row.item.kind)).toEqual(['user', 'activity:3', 'assistant', 'assistant'])
   })
 })
 
@@ -544,6 +576,23 @@ describe('context compaction + budget bar', () => {
 
     // Closing the selected view must leave a selected tab behind, never a blank body.
     await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Close Context"]')!.click())
+    expect(tabs()).toEqual(['Files'])
+    expect(nav.querySelector('button[aria-pressed="true"]')?.textContent).toBe('Files')
+  })
+  it('a single click on a close button closes the tab, also when it is not the selected one', async () => {
+    seedWorkbench('terminal', ['files', 'context', 'terminal'])
+    await mount(<ToastHost><WorkbenchPreferenceProbe events={[]} /></ToastHost>)
+    const nav = host.querySelector('[role="toolbar"][aria-label="Workbench views"]')!
+    const tabs = () => [...nav.querySelectorAll('button[aria-pressed]')].map((tab) => tab.textContent)
+    expect(tabs()).toEqual(['Files', 'Context', 'Terminal'])
+
+    // Closing a background tab must not touch the selection.
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Close Context"]')!.click())
+    expect(tabs()).toEqual(['Files', 'Terminal'])
+    expect(nav.querySelector('button[aria-pressed="true"]')?.textContent).toBe('Terminal')
+
+    // Closing the selected tab reveals its neighbour in the same click.
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Close Terminal"]')!.click())
     expect(tabs()).toEqual(['Files'])
     expect(nav.querySelector('button[aria-pressed="true"]')?.textContent).toBe('Files')
   })

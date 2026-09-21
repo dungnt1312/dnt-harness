@@ -14,7 +14,9 @@ export interface WorkbenchPreferencesV1 {
   /**
    * View tabs the operator has opened, in strip order. Views are added from
    * the nav's picker rather than all being shown at once, so the strip stays
-   * short; 'files' and the selected view are always part of it.
+   * short; 'files' is always part of it. This list is the record of what is
+   * open, so nothing is folded back into it — see
+   * {@link normalizeInspectorViews}.
    */
   readonly inspectorViews: readonly WorkbenchViewName[]
   /**
@@ -54,13 +56,35 @@ function isInspectorTab(value: unknown): value is WorkbenchViewName {
 }
 
 /**
- * Normalize the opened-view strip. The anchor and the selected view are forced
- * in, so a hand-edited or stale entry can never leave the workbench showing a
- * view with no tab — or no tab at all.
+ * Normalize the opened-view strip. The anchor is forced in, so a hand-edited
+ * or stale entry can never leave the workbench tabless.
+ *
+ * The selected view is deliberately *not* folded in here. Folding it in made
+ * the strip un-closable: closing the selected tab writes the selection and the
+ * strip as two separate patches, and re-adding the selected view put the tab
+ * straight back — the first click looked ignored, and only a second one (by
+ * which time the selection had moved) took effect. The strip is the record of
+ * what is open; the selection is clamped to it instead
+ * ({@link clampInspectorTab}).
  */
-export function normalizeInspectorViews(value: unknown, active: WorkbenchViewName): readonly WorkbenchViewName[] {
-  const stored = Array.isArray(value) ? value.filter(isInspectorTab) : []
-  return [...new Set<WorkbenchViewName>(['files', ...stored, active])]
+export function normalizeInspectorViews(value: unknown, fallbackActive?: unknown): readonly WorkbenchViewName[] {
+  // No recorded strip at all (the field predates this preference): the
+  // selected view is the only evidence of what was open, so it seeds one.
+  // A recorded strip is trusted as-is, including a strip that deliberately
+  // omits the selected view — that is what a completed close looks like.
+  const stored = Array.isArray(value)
+    ? value.filter(isInspectorTab)
+    : (isInspectorTab(fallbackActive) ? [fallbackActive] : [])
+  return [...new Set<WorkbenchViewName>(['files', ...stored])]
+}
+
+/**
+ * The selected view, clamped to a tab that is actually open. A stored
+ * selection whose tab is gone falls back to the anchor rather than reopening
+ * the view the operator just closed.
+ */
+export function clampInspectorTab(active: unknown, views: readonly WorkbenchViewName[]): WorkbenchViewName {
+  return isInspectorTab(active) && views.includes(active) ? active : ANCHOR_VIEW
 }
 
 export function parseWorkbenchPreferences(raw: string | null): WorkbenchPreferencesV1 {
@@ -70,7 +94,8 @@ export function parseWorkbenchPreferences(raw: string | null): WorkbenchPreferen
     const parsed: unknown = JSON.parse(raw)
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return WORKBENCH_DEFAULTS
     const record = parsed as Record<string, unknown>
-    const inspectorTab = isInspectorTab(record.inspectorTab) ? record.inspectorTab : WORKBENCH_DEFAULTS.inspectorTab
+    const inspectorViews = normalizeInspectorViews(record.inspectorViews, record.inspectorTab)
+    const inspectorTab = clampInspectorTab(record.inspectorTab, inspectorViews)
     return {
       leftWidth: typeof record.leftWidth === 'number'
         ? clampPanelWidth('left', record.leftWidth)
@@ -85,7 +110,7 @@ export function parseWorkbenchPreferences(raw: string | null): WorkbenchPreferen
         ? record.rightCollapsed
         : WORKBENCH_DEFAULTS.rightCollapsed,
       inspectorTab,
-      inspectorViews: normalizeInspectorViews(record.inspectorViews, inspectorTab),
+      inspectorViews,
       terminalShell: typeof record.terminalShell === 'string' && record.terminalShell !== ''
         ? record.terminalShell
         : WORKBENCH_DEFAULTS.terminalShell,

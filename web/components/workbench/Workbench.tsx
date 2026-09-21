@@ -11,7 +11,7 @@ import { baseName } from '../../lib/project-paths.ts'
 import { fileStyle } from '../../lib/file-icons.ts'
 import { cn } from '../../lib/cn.ts'
 import type { WorkbenchFiles } from '../../hooks/useWorkbenchFiles.ts'
-import { ANCHOR_VIEW, normalizeInspectorViews, type WorkbenchViewName } from '../../lib/workbench-preferences.ts'
+import { ANCHOR_VIEW, clampInspectorTab, normalizeInspectorViews, type WorkbenchViewName } from '../../lib/workbench-preferences.ts'
 import type { SseEvent } from '../../lib/types.ts'
 
 // One source for the view names: the stored preference and this component
@@ -86,7 +86,11 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
   readonly project: WorkbenchProject | null
   readonly view: WorkbenchView
   readonly onView: (view: WorkbenchView) => void
-  /** Opened view tabs in strip order; normalized here, so a stale list is safe. */
+  /**
+   * Opened view tabs in strip order; normalized here, so a stale list is safe.
+   * The selected view is clamped to this list, never folded back into it: a
+   * close must be able to remove the tab it just closed.
+   */
   readonly views: readonly WorkbenchView[]
   readonly onViews: (views: readonly WorkbenchView[]) => void
   readonly files: WorkbenchFiles
@@ -105,32 +109,40 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
   readonly onTerminalShell?: (shellId: string | null) => void
 }) {
   const showFile = files.activeFile !== null && project !== null && workspaceId !== null
-  const openViews = useMemo(() => normalizeInspectorViews(views, view), [views, view])
+  // One pass: the strip decides, and the selection follows it. Deriving the
+  // active view here (rather than asserting `view` into the strip) is what
+  // makes a single close click work — see closeView below.
+  const openViews = useMemo(() => normalizeInspectorViews(views), [views])
+  const activeView = clampInspectorTab(view, openViews)
   const closedViews = VIEW_ORDER.filter((candidate) => !openViews.includes(candidate))
 
   const selectView = (next: WorkbenchView): void => {
     files.showFixedView()
+    // Selecting a view that is not open yet opens it. Doing it here, in one
+    // click, keeps the strip and the selection from having to be repaired
+    // by whichever patch happens to land second.
+    if (!openViews.includes(next)) onViews([...openViews, next])
     onView(next)
   }
 
-  const addView = (next: WorkbenchView): void => {
-    if (!openViews.includes(next)) onViews([...openViews, next])
-    selectView(next)
-  }
-
-  /** Closing the selected tab reveals its right neighbour, else its left one. */
+  /**
+   * Closing a tab reveals its right neighbour, else its left one. The strip
+   * is written first and the selection only follows it, and both are patches
+   * on one preference object: nothing re-adds the tab being removed, so the
+   * first click is the one that takes effect.
+   */
   const closeView = (target: WorkbenchView): void => {
     if (target === ANCHOR_VIEW) return
     const index = openViews.indexOf(target)
     const remaining = openViews.filter((candidate) => candidate !== target)
     onViews(remaining)
-    if (view === target) onView(remaining[Math.min(index, remaining.length - 1)] ?? ANCHOR_VIEW)
+    if (activeView === target) onView(remaining[Math.min(index, remaining.length - 1)] ?? ANCHOR_VIEW)
   }
 
   let body: ReactNode
   if (showFile) {
     body = <FileViewer key={`${project.id}:${files.activeFile}`} workspaceId={workspaceId} projectId={project.id} projectPath={project.path} path={files.activeFile!} />
-  } else if (view === 'files') {
+  } else if (activeView === 'files') {
     body = project !== null && workspaceId !== null
       ? <FileBrowser key={project.id} workspaceId={workspaceId} project={project} folder={files.folder} activeFile={files.activeFile} onFolder={files.setFolder} onOpenFile={files.openFile} />
       : (
@@ -140,9 +152,9 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
             <p className="m-0 max-w-xs text-[13px] text-fg-muted">Start a conversation in a project to browse its files here. Context and Artifacts remain available.</p>
           </div>
         )
-  } else if (view === 'context') {
+  } else if (activeView === 'context') {
     body = <div className="min-h-0 flex-1 overflow-y-auto p-4"><ContextPanel {...context} /></div>
-  } else if (view === 'terminal') {
+  } else if (activeView === 'terminal') {
     body = (
       <Suspense fallback={<div className="flex flex-1 items-center justify-center text-[13px] text-fg-muted">Loading terminal…</div>}>
         <TerminalPanel
@@ -153,7 +165,7 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
         />
       </Suspense>
     )
-  } else if (view === 'agents') {
+  } else if (activeView === 'agents') {
     body = (
       <AgentRunsPanel
         workspaceId={workspaceId}
@@ -174,7 +186,7 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
             <ViewTab
               key={openView}
               view={openView}
-              active={!showFile && view === openView}
+              active={!showFile && activeView === openView}
               onClick={() => selectView(openView)}
               {...(openView === ANCHOR_VIEW ? {} : { onClose: () => closeView(openView) })}
             />
@@ -191,7 +203,7 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
                   type="button"
                   role="menuitem"
                   className={menuItemClass}
-                  onClick={() => { close(); addView(closedView) }}
+                  onClick={() => { close(); selectView(closedView) }}
                 >
                   <Icon name={VIEW_META[closedView].icon} size={15} />
                   {VIEW_META[closedView].label}

@@ -42,12 +42,19 @@ export function turnFooters(items: readonly ViewItem[]): ReadonlyMap<number, Tur
  * Consecutive tool/delegation/audit rows render as one tight block so a busy
  * turn reads as a compact activity log between messages. Terminal markers
  * that render nothing, and a bare "failed" marker right after a detailed
- * failure card, are dropped so they cannot add empty spacing.
+ * failure card, are dropped so they cannot add empty spacing. An assistant
+ * step that renders nothing either (a tool-only step: no text, no thinking,
+ * not live) is transparent for grouping — without this, every step boundary
+ * would split the activity block and punch a full gap between tool rows.
  */
+const rendersNothing = (item: ViewItem): boolean =>
+  item.kind === 'assistant' && item.content === '' && !item.live && item.thinking.length === 0 && !item.thinkingLive
+
 export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
   const blocks: Block[] = []
   items.forEach((item, index) => {
     if (item.kind === 'status' && item.reason === 'completed') return
+    if (rendersNothing(item)) return
     const previous = items[index - 1]
     if (item.kind === 'status' && item.reason === 'failed' && previous?.kind === 'status' && previous.reason.includes(':')) return
     const last = blocks.at(-1)

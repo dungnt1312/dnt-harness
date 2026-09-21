@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
+  ANCHOR_VIEW,
   WORKBENCH_DEFAULTS,
+  clampInspectorTab,
   clampPanelWidth,
   parseWorkbenchPreferences,
 } from './workbench-preferences.ts'
@@ -18,12 +20,14 @@ describe('workbench preferences', () => {
       leftCollapsed: true,
       rightCollapsed: false,
       inspectorTab: 'artifacts',
+      inspectorViews: ['files', 'artifacts'],
     }))).toMatchObject({
       leftWidth: 420,
       rightWidth: 360,
       leftCollapsed: true,
       rightCollapsed: false,
       inspectorTab: 'artifacts',
+      inspectorViews: ['files', 'artifacts'],
     })
   })
 
@@ -45,17 +49,38 @@ describe('workbench preferences', () => {
     })
   })
 
-  it('keeps the anchor and the selected view in the opened strip', () => {
+  it('keeps the anchor and dedupes the opened strip without folding the selection back in', () => {
+    // A stored strip is the record of what is open: the selected view is
+    // *not* added to it, or closing that tab would re-add it and take two
+    // clicks. Here 'terminal' is selected but deliberately not open.
     expect(parseWorkbenchPreferences(JSON.stringify({
       inspectorTab: 'terminal',
       inspectorViews: ['context', 'context', 'bogus'],
-    })).inspectorViews).toEqual(['files', 'context', 'terminal'])
+    }))).toMatchObject({
+      inspectorViews: ['files', 'context'],
+      inspectorTab: 'files',
+    })
 
     // A strip stored without the anchor must not leave the workbench tabless.
     expect(parseWorkbenchPreferences(JSON.stringify({
       inspectorTab: 'files',
       inspectorViews: 'not-an-array',
     })).inspectorViews).toEqual(['files'])
+  })
+
+  it('seeds the strip from the selection when no strip was ever recorded', () => {
+    // Storage written before inspectorViews existed has only the selection as
+    // evidence of what was open.
+    expect(parseWorkbenchPreferences(JSON.stringify({ inspectorTab: 'terminal' }))).toMatchObject({
+      inspectorViews: ['files', 'terminal'],
+      inspectorTab: 'terminal',
+    })
+  })
+
+  it('clamps the selection to an open tab, falling back to the anchor', () => {
+    expect(clampInspectorTab('terminal', ['files', 'terminal'])).toBe('terminal')
+    expect(clampInspectorTab('terminal', ['files'])).toBe(ANCHOR_VIEW)
+    expect(clampInspectorTab('bogus', ['files'])).toBe(ANCHOR_VIEW)
   })
 
   it('clamps each panel only within its own range', () => {
