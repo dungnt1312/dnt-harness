@@ -29,6 +29,8 @@ import { AgentsService } from '../harness/agent/service.ts'
 import { agentScope } from '../harness/agent/scope.ts'
 import type { Agent } from '../harness/agent/agent.ts'
 import { attachApproval, type ApprovalHandle, type ApprovalMode } from '../harness/approval/policy.ts'
+import { DangerousCommandsStore } from '../harness/guard/store.ts'
+import { attachDangerousCommandGuard } from '../harness/guard/guard.ts'
 import { DEFAULT_LIMITS, type HarnessLimits } from '../harness/limits.ts'
 import { LlmService } from '../harness/llm/service.ts'
 import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
@@ -1351,6 +1353,17 @@ ${decision.injected}`, ...contents]
 
   const pending = new Map<string, PendingApproval>()
 
+  const dangerousStore = new DangerousCommandsStore(resourceHome)
+  const dangerousGuard = attachDangerousCommandGuard(kernel.ctx, {
+    configSource: async (workspaceId?: string) => {
+      const wid = workspaceId
+        ?? (agentScope.getStore()?.workspaceId as string | undefined)
+        ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE) as string
+      const { config } = await dangerousStore.load(wid)
+      return config
+    },
+  })
+
   const approvalHandle: ApprovalHandle = attachApproval(kernel.ctx, {
     // Live permission control, scoped to the executing turn's workspace.
     // Effective = the mode's defaults overlaid by explicit workspace
@@ -1365,6 +1378,7 @@ ${decision.injected}`, ...contents]
     defaultMode: options.defaultMode ?? 'ask',
     expiryMs: limits.approvalExpiryMs,
     forceAsk: (call) => {
+      if (dangerousGuard.getMatch(call)?.action === 'ask') return true
       if (!call.name.startsWith('mcp__')) return false
       const scope = agentScope.getStore()
       if (scope?.workspaceId === undefined) return true
