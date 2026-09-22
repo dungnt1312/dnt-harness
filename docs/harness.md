@@ -13,6 +13,7 @@ src/harness/
 ├── agent/     Turn/step driver: inbox, pre-step admission, turn-stopping
 ├── tools/     Registry + guarded pipeline: pre-execute -> run -> post-execute
 ├── approval/  Policy riding tools/pre-execute: allow | ask | deny
+├── guard/     Dangerous command guard riding tools/rewrite: preset deny/ask on Bash content
 ├── workspace/ Workspace registry, project binding, ownership, writer leases
 ├── modes/     Five bundled + custom file modes (instructions, sources, exposure, permissions)
 ├── context/   Mode-driven builder: budget, trim order, compaction, per-request manifest
@@ -40,7 +41,11 @@ assistant/chunk     a streamed delta (UI fidelity only — never model history)
 assistant/message   the assembled assistant reply (+ optional toolCalls)
 tool/call           the model requested a tool
 tool/result         the tool answered (ok, output); `recovery: true` marks a
-                    synthesized record whose real outcome is unknown
+                    synthesized record whose real outcome is unknown.
+                    MCP results may also carry `outcome`
+                    (success | error | indeterminate | audit_fault) and
+                    `invocationId`. Non-MCP tools omit both. `indeterminate`
+                    is not retried; `audit_fault` blocks further MCP dispatch.
 step/end            closes one model request
 turn/end            closes the turn (reason: completed | rejected | empty |
                     failed | cancelled | interrupted | limit)
@@ -297,7 +302,13 @@ type ApprovalMode = 'allow' | 'ask' | 'deny'
 interface ApprovalOptions {
   policy?: Readonly<Record<string, ApprovalMode>>
   defaultMode?: ApprovalMode            // default 'ask'
-  askUser?: (call: ToolCall) => Promise<boolean>
+  askUser?: (call: ToolCall, lifecycle: ApprovalLifecycle) => Promise<boolean>
+}
+
+interface ApprovalLifecycle {
+  approvalId: string      // the id in the log and the id a bridge answers with
+  done: Promise<void>     // settled without an answer: retire the question
+  expiresAt: number       // epoch ms; transports show the decision window
 }
 ```
 
@@ -305,18 +316,60 @@ interface ApprovalOptions {
 - `deny` → `{ kind: 'deny', reason }`.
 - `ask` → consult `askUser`; **without an answerer the policy fails closed**
   (denies with a reason the model sees). Returning `true` allows, `false` denies.
+- Lookup order: exact tool name, then `mcp__server__*`, then catch-all `*`,
+  then `defaultMode`. An already-aborted `exec.signal` cancels without waiting.
 - The listener is **owned by the calling fiber** — unloading that fiber removes
   the policy, so several scoped policies can coexist.
 
-The typical policy (used by both bins and the web host) allows reads/globs/greps
-and asks on writes/edits/bash. The headless bin prompts on stderr; the web host
-rides `agentScope` to route the question to the right session's SSE stream.
+The web host uses the selected mode's `permissionDefaults` as its single
+permission layer; workspace overrides and policy routes do not exist. Web
+`--yolo` maps every `ask` in that map to `allow`, while preserving every
+explicit `deny`; unnamed tools still use the unchanged `defaultMode` fallback.
+Headless uses its explicit map. Interactive MCP (`requiresUserInteraction`)
+still force-asks.
 
 An approval is bound to the exact call it names: it carries an expiry
 (undecided requests settle as `expired` — never an implicit approval), and a
 stop/cancel or a policy change settles it as `cancelled`/`invalidated` before
 it can be answered. Every settlement is a durable `approval/decision` event,
 and late answers to a settled approval are refused rather than replayed.
+
+That record is written against **the session that asked**, resolved by its own
+id rather than by the ambient agent scope: a settlement also arrives from a
+reevaluation on an HTTP request, where no agent is in flight, and the `allow`
+that let a re-gated call proceed has to appear in the log like any other
+authorization.
+
+## Dangerous command guard (`guard/`)
+
+`attachDangerousCommandGuard(ctx, { configSource })` attaches one
+`tools/rewrite` listener that inspects the `command` argument of every
+`Bash` call before the approval waterfall:
+
+- **Presets** — six curated groups (`fsDestructive`, `gitDestructive`,
+  `systemPriv`, `networkExfil`, `dbDestructive`, `resourceExhaust`), each
+  a list of regexes; per-workspace setting is `deny | ask | off` (defaults:
+  FS/Network/Resource `deny`, Git/System/DB `ask`). `off` skips the group.
+- **Custom rules** — ordered `isRegex` or case-insensitive substring rules,
+  each `deny | ask | allow` with highest priority (an `allow` can exempt a
+  narrow path from a preset `deny`).
+- **Normalization** — trim, collapse whitespace, strip trailing `#` comment
+  outside quotes; matching is case-insensitive. No shell AST, no
+  obfuscation resistance — `eval $(echo ...|base64 -d)` bypasses the guard
+  by design (documented limitation).
+- **Enforcement** — `deny` returns `{kind:'deny', reason}` before any
+  `approval/request`; `ask` stores a `GuardMatch` and forces the approval
+  waterfall via `forceAsk` so a Mode `allow` cannot skip the question,
+  surfacing `Dangerous Commands: matched <preset/rule>` as a red banner
+  on the approval card; `allow`/no-match passes through; a throw
+  fail-closes to `deny`.
+- **Storage** — `<home>/workspaces/<ws>/dangerous-commands.json` with
+  `<home>/dangerous-commands.json` global fallback, hash-checked
+  (`expectedHash` → `409` on conflict), atomic `replaceFileAtomic` writes.
+
+The guard never widens a Mode denial (`toolExposure` or
+`permissionDefaults` deny still wins), and Mode changes re-evaluate
+pending approvals the same way they always have.
 
 ## Live controls, queued input, and limits
 
@@ -372,6 +425,40 @@ writes immutable checkpoints with range/provenance at completed boundaries and
 never mutates the original JSONL. Each request carries a truthful **manifest**
 (mode/model revisions, source hashes, ranges, budget, omission decisions) that
 the UI's inspector renders as-is.
+
+## Delegation (`agents/`, tool in `src/web/agent-delegation.ts`)
+
+One root agent spawns children through the **same** loop and builder — there is
+no second runtime. `ChildExecutor` owns the lifecycle (spawn / list / wait /
+cancel), caps it (3 active, 8 per turn), and enforces one level: a child cannot
+delegate. Each child gets an isolated session, a task packet, and a ceiling of
+mode exposure ∩ definition ∩ spawn grant, where a grant only ever narrows.
+
+The model drives this itself through the built-in **`Agent`** tool, whose
+actions mirror the executor: `spawn` returns a handle immediately, `wait` blocks
+on several children (capped at 120 s, and it honours a root Stop), `list`,
+`cancel`, and `catalog` (roles + `provider:model` ids). The tool is
+deliberately asynchronous: one step runs its tool calls in sequence, so a
+blocking spawn would serialize children and the executor's parallel capacity
+would never be used. A child that is still running when the root's turn closes
+is cancelled, which is why the tool tells the model to wait first.
+
+### Which model a child runs on
+
+Resolution order, applied once at spawn (`resolveChildModel`):
+
+1. the `model` argument of the spawn (the root model's own choice),
+2. the role definition's `model:` frontmatter (set in Settings → Agents),
+3. the parent conversation's effective pair.
+
+The reference is `provider:model` (split on the first colon) or a bare model
+name, which resolves to the parent's provider when that provider offers it,
+otherwise to the single provider that does — an ambiguous name is an error
+naming the candidates, never a silent pick. The pair is validated at spawn and
+then **stamped into the child's own log as a `session/model` event**, so the
+child resolves its model exactly like any other session: the pin survives
+restart, never re-inherits a later global default, and a role may name a model
+hosted by a different provider than its parent.
 
 ## Reading further
 

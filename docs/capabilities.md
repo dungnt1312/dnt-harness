@@ -3,7 +3,7 @@
 Capabilities are just tools registered into `ctx.tools`. This doc covers the
 tool families a model can call: a granted-root filesystem toolset (canonical
 names `Read`, `Write`, `Edit`, `Glob`, `Grep`) and a real-Bash shell tool in
-`src/capabilities/`, plus the harness-registered `Skill`, five memory tools,
+`src/capabilities/`, plus the harness-registered `Skill`, `Agent`, five memory tools,
 and the dynamically discovered `mcp__<server>__<tool>` family. The six
 Claude-style built-ins are the canonical identity: legacy lowercase names
 (`read`, `write`, ...) arriving from a model or an old permission map normalize
@@ -95,7 +95,10 @@ marker. Argument errors throw inside `execute` and surface as failed
   result.
 
 A shell is never path-confined: Bash can reach anything the OS user can. Path
-checks protect the file tools, not the shell.
+checks protect the file tools, not the shell. A `tools/rewrite` guard
+(`src/harness/guard/`) can block or force-ask risky Bash commands by content
+(preset groups + custom rules, workspace-scoped and Mode-independent — see
+`docs/harness.md`); it does not sandbox the OS and does not resist obfuscation.
 
 ## The Skill tool (`src/web/server.ts`, service in `src/harness/skills/`)
 
@@ -115,6 +118,29 @@ classifier and no auto-load:
   acknowledgement.
 - **Content is data, never permissions**: skill text cannot grant capabilities
   or widen the permission policy — the mode's tool exposure stays the ceiling.
+
+## The Agent tool (`src/web/agent-delegation.ts`)
+
+`Agent` delegates a bounded task to a child agent and collects its result. One
+tool, five actions — `spawn` (returns a handle at once), `wait` (blocks on
+several children, capped at 120 s, honours Stop), `list`, `cancel`, `catalog`:
+
+- **Asynchronous on purpose**: a step runs its tool calls in sequence, so
+  `spawn` must return immediately for children to overlap. Up to 3 run at once.
+- **One level**: a child is denied `Agent` before any ceiling or approval is
+  consulted, whatever its definition lists.
+- **Model per child**: the `model` argument (`provider:model`, or a bare name)
+  overrides the role's own `model:`, which overrides the conversation's pair.
+  The live catalog rides in the tool description and in `action: "catalog"`, so
+  the model names an id the host can actually serve. See
+  [the harness notes](harness.md#which-model-a-child-runs-on).
+- **No authority gained**: a child's own calls re-enter the same mode exposure
+  and approval policy, which is why `Agent` is `ask` only in *Ask before
+  changes* and `allow` in Plan, *Edit automatically*, and *Full access*. Chat
+  exposes it nowhere. In Plan a child is read-only by construction — it
+  resolves the same mode.
+- **Grants only narrow**: a `grantTools` entry the role lacks is reported back,
+  never silently dropped.
 
 ## Memory tools (`src/harness/memory/tools.ts`)
 
@@ -144,16 +170,48 @@ Servers from a workspace's `mcp.json` register dynamically as
 - **Workspace isolation**: one connection per (workspace, server); two
   workspaces pointing at the same server name get separate connections, and
   dynamic schemas are workspace-scoped.
-- **Permissions**: default **ask** for every MCP tool; per-tool and wildcard
-  (`mcp__server__*`) policies overlay; host `blockedTools` can never be
-  widened. A tool annotated `requiresUserInteraction` **always asks**,
-  regardless of policy.
+- **Permissions**: the selected mode's `permissionDefaults` are the only
+  permission map. Lookup is exact name, then `mcp__server__*`, then catch-all
+  `*`, then `defaultMode`. `--yolo` maps asks to allows but preserves explicit
+  denies. Host `blockedTools` can never be widened. A tool annotated
+  `requiresUserInteraction` **always asks**, regardless of the selected mode.
 - **`allowedTools` is exposure-only**: it filters which tools appear in
   request schemas — it is never a permission bypass, and every call still goes
   through the same pre-execute waterfall as built-ins.
 - **Watchdogs**: stdio servers run one OS subprocess per (workspace, server)
   under CPU/memory/lifetime watchdogs with process-tree kill — application
-  control, **not an OS sandbox**.
+  control, **not an OS sandbox**. The child environment is the platform
+  baseline plus the server's own env. Hard resource limits are refused
+  unless this host has a tested Windows Job Object or a delegated Linux
+  cgroup v2; this build does not claim that primitive. Stripping unrelated
+  environment variables is also not a sandbox, and it does not protect
+  against code running as the same user.
+- **One dispatch**: a `tools/call` is sent at most once. A lost response is
+  `indeterminate` and is not replayed. The intent is appended to
+  `workspaces/<id>/mcp/executions.jsonl` before the send. Saving a server
+  does not start it; Enable does. PM2 must stay a single fork instance.
+- **Outcomes**: an MCP result may be `success`, `error`, `indeterminate`, or
+  `audit_fault`. `indeterminate` means the call may already have run remotely
+  and is never retried automatically. `audit_fault` means the known outcome
+  could not be durably recorded, so further MCP dispatch stays blocked.
+  Server-supplied names, descriptions, schemas, and annotations are untrusted
+  model context; an annotation never lowers an approval requirement.
+- **Boundaries**: protocol pin, dispatch receipt, rollback floor, and the
+  control-plane route inventory live in
+  `docs/decisions/mcp-production-boundaries.md`. Filesystem encryption and
+  local authentication do not protect against same-user malware or
+  same-origin XSS.
+
+## Mode permission defaults
+
+A workspace mode's raw Markdown frontmatter owns its `toolExposure` ceiling and
+`permissionDefaults` decisions; there is no workspace override layer or
+`policy.json`. In **Settings → Modes**, the catalog displays
+those entries literally — including the `*` fallback and `mcp__server__*`
+patterns — rather than simulating gate resolution. Bundled modes are read-only
+and must be duplicated into the workspace before editing; workspace mode files
+use hash-checked writes. A saved change takes effect when the mode is next
+selected because an active selection retains its cached snapshot.
 
 ## Where they are mounted
 
