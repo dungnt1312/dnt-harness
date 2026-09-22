@@ -2,13 +2,25 @@
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { deleteMcpServer, getMcpServer, importAgentDefinition, importMcpServers, upsertMcpServer } from '../../lib/api.ts'
+import { deleteMcpServer, duplicateModeFile, fetchProviderModels, getMcpServer, getModeFile, HttpError, importAgentDefinition, importMcpServers, listModeFiles, listModes, saveModeFile, setModeEnabled, upsertMcpServer } from '../../lib/api.ts'
+import { emptyModeForm, parseModeForm, permissionKeyError, serializeModeForm } from '../../lib/mode-form.ts'
 import { McpPanel } from './McpPanel.tsx'
 import { AgentsPanel } from './AgentsPanel.tsx'
+import { ModesPanel } from './ModesPanel.tsx'
 import { SettingsModal } from './SettingsModal.tsx'
 
 vi.mock('../../lib/api.ts', () => ({
-  listMcpServers: vi.fn(async () => [{ name: 'fs', transport: 'stdio', enabled: false, status: 'disabled', breakerOpenUntil: null }]),
+  HttpError: class HttpError extends Error {
+    constructor(readonly status: number, body: string) {
+      super(`HTTP ${status}: ${body}`)
+      this.name = 'HttpError'
+    }
+  },
+  fetchProviderModels: vi.fn(async () => ({ ok: true, models: ['auto', 'fresh-1'] })),
+  listMcpServers: vi.fn(async () => [{
+    name: 'fs', transport: 'stdio', enabled: true, status: 'ready', breakerOpenUntil: null,
+    discoveredTools: ['query', 'explode'], allowedTools: ['query'], unmatchedAllowlist: ['missing'],
+  }]),
   getMcpServer: vi.fn(async () => ({ name: 'fs', transport: 'stdio', command: 'npx', args: ['-y', 'fs-mcp'], env: { API_KEY: '${API_KEY}' }, enabled: false, timeoutMs: 5000 })),
   upsertMcpServer: vi.fn(async () => ({ saved: 'fs', enabled: false })),
   deleteMcpServer: vi.fn(async () => ({ deleted: 'fs' })),
@@ -17,6 +29,12 @@ vi.mock('../../lib/api.ts', () => ({
   listAgentDefinitions: vi.fn(async () => []),
   listChildren: vi.fn(async () => []),
   importAgentDefinition: vi.fn(async () => ({ imported: ['reviewer'] })),
+  listModeFiles: vi.fn(async () => []),
+  listModes: vi.fn(async () => ({ modes: [], selected: 'chat', revision: 1 })),
+  getModeFile: vi.fn(async () => ({ id: 'review-only', raw: 'server version', source: 'workspace', hash: 'hash-1' })),
+  saveModeFile: vi.fn(async () => ({ id: 'review-only', name: 'Review only', hash: 'hash-2' })),
+  duplicateModeFile: vi.fn(async () => ({ id: 'plan-custom', name: 'Plan custom' })),
+  setModeEnabled: vi.fn(async () => ({ id: 'review-only', enabled: false })),
 }))
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
@@ -69,6 +87,26 @@ describe('MCP panel', () => {
     expect(upsertMcpServer).toHaveBeenCalledWith('ws', 'fs', expect.objectContaining({
       transport: 'stdio', command: 'node', args: ['-y', 'fs-mcp'], env: { API_KEY: '${API_KEY}' }, timeoutMs: 5000,
     }))
+  })
+
+  it('keeps the form when a save loses a revision race', async () => {
+    vi.mocked(upsertMcpServer).mockRejectedValueOnce(new HttpError(409, '{"error":"mcp.json changed since it was loaded"}'))
+    await act(async () => root.render(<McpPanel workspaceId="ws" />))
+    await settle()
+    await act(async () => button('Edit fs').click())
+    await act(async () => button('Save changes').click())
+    await settle()
+    expect(document.body.textContent).toContain('changed since this form was loaded')
+    expect(input('Command').value).toBe('npx')
+  })
+
+  it('lists each tool the server discovered and marks names the allowlist hides', async () => {
+    await act(async () => root.render(<McpPanel workspaceId="ws" />))
+    await settle()
+    const list = document.querySelector('[aria-label="Tools from fs"]')
+    expect(list?.textContent).toContain('query')
+    expect(list?.textContent).toContain('explode hidden')
+    expect(document.body.textContent).toContain('Allowlist names not on this server: missing')
   })
 
   it('deletes a server only after an inline confirmation', async () => {
@@ -162,6 +200,204 @@ describe('agents panel', () => {
   })
 })
 
+describe('modes panel', () => {
+  beforeEach(() => {
+    vi.mocked(listModeFiles).mockReset()
+    vi.mocked(listModes).mockReset()
+    vi.mocked(getModeFile).mockReset()
+    vi.mocked(saveModeFile).mockReset()
+    vi.mocked(duplicateModeFile).mockReset()
+    vi.mocked(listModeFiles).mockResolvedValue([])
+    vi.mocked(listModes).mockResolvedValue({ modes: [], selected: 'chat', revision: 1 })
+    vi.mocked(getModeFile).mockResolvedValue({ id: 'review-only', raw: 'server version', source: 'workspace', hash: 'hash-1' })
+    vi.mocked(saveModeFile).mockResolvedValue({ id: 'review-only', name: 'Review only', hash: 'hash-2' })
+    vi.mocked(duplicateModeFile).mockResolvedValue({ id: 'plan-custom', name: 'Plan custom' })
+  })
+
+  const bundledMode = {
+    id: 'plan', name: 'Plan', source: 'bundled' as const, enabled: true,
+    toolExposure: ['Read'], permissionDefaults: { Read: 'allow' as const, '*': 'deny' as const, 'mcp__server__*': 'ask' as const },
+  }
+  const workspaceMode = {
+    id: 'review-only', name: 'Review only', source: 'workspace' as const, enabled: true,
+    toolExposure: ['Read'], permissionDefaults: { Read: 'allow' as const, '*': 'deny' as const },
+  }
+
+  it('keeps bundled modes read-only, lists every permission key, and explains selection snapshots', async () => {
+    vi.mocked(listModeFiles).mockResolvedValueOnce([bundledMode, workspaceMode])
+    vi.mocked(listModes).mockResolvedValueOnce({ modes: [], selected: 'review-only', revision: 1 })
+    await act(async () => root.render(<ModesPanel workspaceId="ws" />))
+    await settle()
+    expect(document.body.textContent).toContain('allow: Read · ask: mcp__server__* · deny: *')
+    expect(document.body.textContent).toContain('applies when the mode is next selected')
+    expect(document.body.textContent).toContain('selected')
+    expect(buttons().filter((node) => node.textContent === 'Duplicate')).toHaveLength(1)
+    expect(document.body.textContent).toContain('Read-only')
+    expect(buttons().some((node) => node.textContent === 'Edit' && node.closest('li')?.textContent?.includes('Plan'))).toBe(false)
+    expect(buttons().some((node) => node.getAttribute('aria-label') === 'Delete plan')).toBe(false)
+    expect(buttons().some((node) => node.textContent === 'Duplicate' && node.closest('li')?.textContent?.includes('Review only'))).toBe(false)
+  })
+
+  it('duplicates a bundled mode, refreshes the list, and opens the copy in the form', async () => {
+    vi.mocked(listModeFiles)
+      .mockResolvedValueOnce([bundledMode])
+      .mockResolvedValueOnce([bundledMode, { ...workspaceMode, id: 'plan-custom', name: 'Plan custom' }])
+    vi.mocked(getModeFile).mockResolvedValueOnce({
+      id: 'plan-custom',
+      raw: '---\nname: "Plan custom"\nhistory: "compact"\ntoolExposure: ["Read"]\npermissionDefaults: {"Read": "allow"}\n---\n\nCopied.',
+      source: 'workspace',
+      hash: 'copy-hash',
+    })
+    await act(async () => root.render(<ModesPanel workspaceId="ws" />))
+    await settle()
+    await act(async () => button('Duplicate').click())
+    await act(async () => type(input('New mode id'), 'plan-custom'))
+    await act(async () => buttons().filter((node) => node.textContent === 'Duplicate').at(-1)!.click())
+    expect(duplicateModeFile).toHaveBeenCalledWith('ws', 'plan', 'plan-custom')
+    expect(getModeFile).toHaveBeenCalledWith('ws', 'plan-custom')
+    expect(input('Name').value).toBe('Plan custom')
+    expect(input('Instructions').value).toBe('Copied.')
+  })
+
+  it('loads a workspace mode’s real file into the form before editing', async () => {
+    vi.mocked(listModeFiles).mockResolvedValueOnce([workspaceMode])
+    vi.mocked(getModeFile).mockResolvedValueOnce({
+      id: 'review-only',
+      raw: '---\nname: "Review only"\npermissionDefaults: {"Read": "allow", "*": "deny"}\n---\n\nRead.',
+      source: 'workspace',
+      hash: 'hash-1',
+    })
+    await act(async () => root.render(<ModesPanel workspaceId="ws" />))
+    await settle()
+    await act(async () => button('Edit').click())
+    expect(getModeFile).toHaveBeenCalledWith('ws', 'review-only')
+    expect(input('Name').value).toBe('Review only')
+    expect(input('Instructions').value).toBe('Read.')
+  })
+
+  it('round-trips form edits into the canonical frontmatter on save', async () => {
+    vi.mocked(listModeFiles).mockResolvedValueOnce([workspaceMode])
+    vi.mocked(getModeFile).mockResolvedValueOnce({
+      id: 'review-only',
+      raw: '---\nname: "Review only"\npermissionDefaults: {"Read": "allow"}\n---\n\nRead.',
+      source: 'workspace',
+      hash: 'hash-1',
+    })
+    await act(async () => root.render(<ModesPanel workspaceId="ws" />))
+    await settle()
+    await act(async () => button('Edit').click())
+    await act(async () => type(input('Name'), 'Review stricter'))
+    await act(async () => {
+      const segments = [...document.body.querySelectorAll<HTMLButtonElement>('[role="group"][aria-label="Permission for Write"] button')]
+      segments.find((node) => node.textContent === 'Ask')!.click()
+    })
+    await act(async () => button('Save mode').click())
+    const [, , content, hash] = vi.mocked(saveModeFile).mock.calls[0]!
+    expect(String(content)).toContain('name: "Review stricter"')
+    expect(String(content)).toContain('"Write":"ask"')
+    expect(String(content)).toContain('"Read":"allow"')
+    expect(hash).toBe('hash-1')
+  })
+
+  it('serializes identity, sources, exposure, permissions, and instructions to canonical frontmatter', () => {
+    const form = {
+      ...emptyModeForm(),
+      name: 'Review only',
+      instructions: 'Read.',
+      history: 'compact' as const,
+      skills: 'off' as const,
+      workspaceInstructions: false,
+      memoryPinned: false,
+      memoryRetrieval: false,
+      exposure: ['Read'],
+      permissions: { Read: 'allow' as const, 'mcp__gh__*': 'ask' as const, '*': 'deny' as const },
+    }
+    const raw = serializeModeForm(form)
+    expect(raw).toBe('---\nname: "Review only"\nhistory: compact\nworkspaceInstructions: false\nskills: off\nmemoryPinned: false\nmemoryRetrieval: false\ntoolExposure: ["Read"]\npermissionDefaults: {"Read":"allow","mcp__gh__*":"ask","*":"deny"}\n---\n\nRead.\n')
+    expect(parseModeForm(raw)).toEqual(form)
+  })
+
+  it('rejects a permission key the gate would never consult', () => {
+    expect(permissionKeyError('Read')).toBeNull()
+    expect(permissionKeyError('*')).toBeNull()
+    expect(permissionKeyError('mcp__github__*')).toBeNull()
+    expect(permissionKeyError('mcp__github__create_issue')).toBeNull()
+    expect(permissionKeyError('Memory*')).toContain('would never match')
+    expect(permissionKeyError('mcp__*__read')).toContain('would never match')
+  })
+
+  it('re-reads a raced new mode by its entered id before overwriting', async () => {
+    vi.mocked(saveModeFile)
+      .mockRejectedValueOnce(new Error('HTTP 409: mode already exists'))
+      .mockResolvedValueOnce({ id: 'raced-mode', name: 'Raced mode', hash: 'saved-hash' })
+    vi.mocked(getModeFile).mockResolvedValueOnce({ id: 'raced-mode', raw: 'server mode', source: 'workspace', hash: 'fresh-hash' })
+    await act(async () => root.render(<ModesPanel workspaceId="ws" />))
+    await settle()
+    await act(async () => button('New mode').click())
+    await act(async () => {
+      type(input('Mode id'), 'raced-mode')
+      type(input('Instructions'), 'my new mode')
+    })
+    await act(async () => button('Save mode').click())
+    expect(document.body.textContent).toContain('Overwrite anyway')
+    await act(async () => button('Overwrite anyway').click())
+    expect(getModeFile).toHaveBeenCalledWith('ws', 'raced-mode')
+    expect(String(vi.mocked(saveModeFile).mock.calls[1]![2])).toContain('my new mode')
+    expect(vi.mocked(saveModeFile).mock.calls[1]![3]).toBe('fresh-hash')
+  })
+
+  it('re-reads the hash before an overwrite after a save conflict', async () => {
+    vi.mocked(listModeFiles).mockResolvedValueOnce([workspaceMode])
+    vi.mocked(getModeFile)
+      .mockResolvedValueOnce({ id: 'review-only', raw: '---\nname: "Review only"\n---\n\nopened', source: 'workspace', hash: 'stale-hash' })
+      .mockResolvedValueOnce({ id: 'review-only', raw: '---\nname: "Review only"\n---\n\nfresh server', source: 'workspace', hash: 'fresh-hash' })
+    vi.mocked(saveModeFile)
+      .mockRejectedValueOnce(new Error('HTTP 409: changed'))
+      .mockResolvedValueOnce({ id: 'review-only', name: 'Review only', hash: 'saved-hash' })
+    await act(async () => root.render(<ModesPanel workspaceId="ws" />))
+    await settle()
+    await act(async () => button('Edit').click())
+    await act(async () => type(input('Name'), 'Renamed locally'))
+    await act(async () => button('Save mode').click())
+    expect(document.body.textContent).toContain('Overwrite anyway')
+    await act(async () => button('Overwrite anyway').click())
+    expect(getModeFile).toHaveBeenNthCalledWith(2, 'ws', 'review-only')
+    expect(String(vi.mocked(saveModeFile).mock.calls[1]![2])).toContain('Renamed locally')
+    expect(vi.mocked(saveModeFile).mock.calls[1]![3]).toBe('fresh-hash')
+  })
+
+  it('toggles a mode between picker-visible and hidden via its checkbox, refreshing the app selection', async () => {
+    vi.mocked(listModeFiles)
+      .mockResolvedValueOnce([workspaceMode])
+      .mockResolvedValueOnce([{ ...workspaceMode, enabled: false }])
+    const onChanged = vi.fn(async () => {})
+    await act(async () => root.render(<ModesPanel workspaceId="ws" onChanged={onChanged} />))
+    await settle()
+    const box = (): HTMLInputElement => document.body.querySelector<HTMLInputElement>('input[aria-label="Offer review-only in the composer picker"]')!
+    expect(box().checked).toBe(true)
+    await act(async () => box().click())
+    expect(setModeEnabled).toHaveBeenCalledWith('ws', 'review-only', false)
+    expect(listModeFiles).toHaveBeenCalledTimes(2)
+    expect(onChanged).toHaveBeenCalledTimes(1)
+    expect(document.body.textContent).toContain('hidden from the composer picker')
+    expect(box().checked).toBe(false)
+
+    await act(async () => box().click())
+    expect(setModeEnabled).toHaveBeenLastCalledWith('ws', 'review-only', true)
+    expect(onChanged).toHaveBeenCalledTimes(2)
+  })
+
+  it('surfaces the selected-mode refusal when unchecking a selected mode', async () => {
+    vi.mocked(listModeFiles).mockResolvedValue([workspaceMode])
+    vi.mocked(setModeEnabled).mockRejectedValueOnce(new Error("HTTP 409: mode 'review-only' is selected; select another mode before disabling it"))
+    await act(async () => root.render(<ModesPanel workspaceId="ws" />))
+    await settle()
+    await act(async () => document.body.querySelector<HTMLInputElement>('input[aria-label="Offer review-only in the composer picker"]')!.click())
+    expect(document.body.querySelector('.error-notice')?.textContent ?? document.body.textContent).toContain('select another mode')
+    expect(listModeFiles).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe('settings dialog', () => {
   const providers = [{ id: 'p1', name: 'local', baseUrl: 'http://localhost:8080/v1', enabled: true, keyMasked: '', models: ['auto'], defaultModel: 'auto' }] as const
   const render = async (): Promise<void> => {
@@ -183,8 +419,101 @@ describe('settings dialog', () => {
   it('gives every section tab an icon', async () => {
     await render()
     const tabs = [...document.body.querySelectorAll('[role="tab"]')]
-    expect(tabs).toHaveLength(8)
+    expect(tabs).toHaveLength(10)
     for (const tab of tabs) expect(tab.querySelector('svg')).not.toBeNull()
+  })
+
+  it('states the provider name once, as the editable title, with enablement as state plus a verb', async () => {
+    await render()
+    // The name is the heading: no separate "Name" row repeating it.
+    expect(input('Name').value).toBe('local')
+    expect(document.body.textContent).toContain('Enabled')
+    await act(async () => button('Disable').click())
+    expect(document.body.textContent).toContain('Disabled')
+    expect(button('Enable')).toBeTruthy()
+  })
+
+  it('keeps one status per fact on a model row: no badge repeating the default radio', async () => {
+    await render()
+    const row = [...document.body.querySelectorAll('li')].find((node) => node.textContent?.includes('auto'))!
+    expect(row.textContent).not.toContain('provider default')
+    expect(row.textContent).not.toContain('text')
+    // Context stays, as the one piece of per-model data a row cannot infer.
+    expect(row.textContent).toMatch(/\d+[km]/i)
+    expect(row.querySelector('button[aria-pressed="true"]')).not.toBeNull()
+  })
+
+  it('reveals the model input only when asked, and deletes from the title row', async () => {
+    await render()
+    expect(() => button('Model IDs to add')).toThrow()
+    await act(async () => button('Add model').click())
+    expect(document.body.querySelector('input[aria-label="Model IDs to add"]')).not.toBeNull()
+    await act(async () => button('Delete provider').click())
+    expect(document.body.textContent).toContain('Delete “local”?')
+    expect(button('Delete permanently')).toBeTruthy()
+  })
+
+  it('treats a sync as a proposal: the endpoint list is chosen, not applied', async () => {
+    await render()
+    await act(async () => button('Sync from /models').click())
+    expect(fetchProviderModels).toHaveBeenCalledWith('p1')
+    // The probe wrote nothing; the dialog asks what to keep.
+    expect(document.body.textContent).toContain('2 models offered by this endpoint (1 new)')
+    expect(document.body.textContent).toContain('1 selected')
+    const boxes = [...document.body.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')]
+    expect(boxes.map((box) => box.checked)).toEqual([true, false])
+    await act(async () => boxes[1]!.click())
+    await act(async () => button('Sync 2 models').click())
+    const rows = [...document.body.querySelectorAll('li')].map((node) => node.textContent ?? '')
+    expect(rows.some((text) => text.includes('fresh-1'))).toBe(true)
+    expect(button('Save changes').disabled).toBe(false)
+  })
+
+  it('keeps a model the endpoint does not offer, and drops one that is unchecked', async () => {
+    vi.mocked(fetchProviderModels).mockResolvedValueOnce({ ok: true, models: ['auto'] })
+    await act(async () => root.render(
+      <SettingsModal
+        open
+        workspaceId="ws"
+        providers={[{ id: 'p1', name: 'local', baseUrl: 'http://localhost:8080/v1', enabled: true, keyMasked: '', models: ['auto', 'hand-added'], defaultModel: 'auto' }]}
+        activeProvider="p0"
+        onDismiss={() => {}}
+        onRefresh={async () => {}}
+        onSelectActive={async () => {}}
+      />,
+    ))
+    await act(async () => button('Sync from /models').click())
+    expect(document.body.textContent).toContain('1 model not offered here stays as it is')
+    const box = document.body.querySelector<HTMLInputElement>('input[type="checkbox"]')!
+    await act(async () => box.click()) // uncheck the only offered model
+    await act(async () => button('Sync 0 models').click())
+    const rows = [...document.body.querySelectorAll('li')].map((node) => node.textContent ?? '')
+    expect(rows.some((text) => text.includes('hand-added'))).toBe(true)
+    expect(rows.some((text) => text.includes('auto'))).toBe(false)
+  })
+
+  it('edits one model in a dialog, carrying its overrides through a rename', async () => {
+    await render()
+    await act(async () => button('Edit auto settings').click())
+    expect(input('Model ID').value).toBe('auto')
+    await act(async () => type(input('Model ID'), 'auto-2'))
+    await act(async () => button('Save').click())
+    const rows = [...document.body.querySelectorAll('li')].map((node) => node.textContent ?? '')
+    expect(rows.some((text) => text.includes('auto-2'))).toBe(true)
+    // It was the provider default, so the default follows the new id.
+    expect(document.body.querySelector('button[aria-label="auto-2 is this provider\'s default model"]')).not.toBeNull()
+  })
+
+  it('sets image input as a type checkbox, and can hand it back to the default', async () => {
+    await render()
+    await act(async () => button('Edit auto settings').click())
+    const types = [...document.body.querySelectorAll<HTMLInputElement>('[role="group"][aria-label="Input types"] input')]
+    expect(types.map((box) => `${box.checked}/${box.disabled}`)).toEqual(['true/true', 'false/false'])
+    await act(async () => types[1]!.click())
+    expect(document.body.textContent).toContain('Use the default')
+    await act(async () => button('Save').click())
+    const row = [...document.body.querySelectorAll('li')].find((node) => node.textContent?.includes('auto'))!
+    expect(row.textContent).toContain('Vision')
   })
 
   it('offers the global default and the connection test only for saved configuration', async () => {

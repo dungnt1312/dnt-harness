@@ -63,21 +63,24 @@ describe('runtime provider UI helpers', () => {
     expect(activeModelValue(meta)).toBe('cliproxy1:gpt-5.6-sol')
   })
 
-  it('settings dialog exposes all eight sections as linked tabs and lists providers', () => {
+  it('settings dialog exposes all ten sections as linked tabs and lists providers', () => {
     const html = renderToStaticMarkup(
       <SettingsModal open workspaceId="ws-1" providers={meta.providers} activeProvider="cliproxy1" activeModel="gpt-5.6-sol" onDismiss={() => undefined} onRefresh={async () => undefined} onSelectActive={async () => undefined} />,
     )
     expect(html).toContain('aria-modal="true"')
     expect(html).toContain('aria-label="Settings"')
-    expect((html.match(/role="tab"/g) ?? []).length).toBe(8)
+    expect((html.match(/role="tab"/g) ?? []).length).toBe(10)
     // Radix mounts the active panel only; each tab still owns a controls link.
     expect((html.match(/role="tabpanel"/g) ?? []).length).toBe(1)
-    expect((html.match(/aria-controls=/g) ?? []).length).toBeGreaterThanOrEqual(8)
+    expect((html.match(/aria-controls=/g) ?? []).length).toBeGreaterThanOrEqual(10)
     const tabTags = html.match(/<[a-z]+[^>]*role="tab"[^>]*>/g) ?? []
     expect(tabTags.filter((tag) => tag.includes('aria-selected="true"')).length).toBe(1)
-    for (const label of ['Providers', 'Projects', 'Skills', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets']) expect(html).toContain(label)
+    const labels = [...html.matchAll(/<button(?=[^>]*role="tab")[\s\S]*?<\/button>/g)]
+      .map((match) => match[0].replace(/<[^>]+>/g, ''))
+    expect(labels).toEqual(['Providers', 'Projects', 'Modes', 'Dangerous Commands', 'Skills', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets'])
     expect(html).toContain('cliproxy1')
-    expect(html).toContain('2 models')
+    // The model count belongs to the list it counts, not to the rail row too.
+    expect(html).toContain('Model list')
     expect(html).toContain('Test connection')
   })
 
