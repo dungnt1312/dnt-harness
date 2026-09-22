@@ -1508,6 +1508,7 @@ ${decision.injected}`, ...contents]
     connectWorkspaceMcp,
     cancelMcpConnection,
     ensureMcpServer,
+    dangerousStore,
     providers: () => list,
     defaults: () => defaults,
     setDefaults: (next) => { defaults = next },
@@ -1617,6 +1618,7 @@ interface HandlerDeps {
   readonly connectWorkspaceMcp: (workspaceId: WorkspaceId) => Promise<void>
   readonly cancelMcpConnection: (workspaceId: WorkspaceId, serverName: string) => Promise<void>
   readonly ensureMcpServer: (workspaceId: WorkspaceId, serverName: string) => Promise<McpServerClient>
+  readonly dangerousStore: DangerousCommandsStore
   readonly seedWorkspaceControls: (workspaceId: WorkspaceId, seed?: { provider?: string; model?: string }) => void
   readonly providers: () => readonly ProviderConfig[]
   readonly defaults: () => ModelDefaults
@@ -3201,6 +3203,90 @@ async function handleApi(
         dirs.unshift(...drives.filter((drive) => drive.path.toLowerCase() !== abs.toLowerCase()))
       }
       send(200, { path: abs, parent: up === abs ? null : up, dirs })
+      return
+    }
+
+    // ── dangerous command guard ────────────────────────────────
+    // Workspace-scoped: GET requires workspaceId query, PUT requires
+    // workspaceId in body and an active workspace. Global routes use
+    // /global suffix for the shared default.
+    if (pathname === '/api/guard/dangerous-commands') {
+      if (req.method === 'GET') {
+        const rawId = query.get('workspaceId')
+        if (typeof rawId !== 'string' || rawId.trim() === '') {
+          send(400, { error: "query needs 'workspaceId'" })
+          return
+        }
+        const wid = rawId.trim() as WorkspaceId
+        try {
+          requireWorkspace(deps, wid, false)
+        } catch (error) {
+          fail(error)
+          return
+        }
+        const result = await deps.dangerousStore.load(wid)
+        send(200, result)
+        return
+      }
+      if (req.method === 'PUT') {
+        const body = await readJson(req)
+        const rawId = body['workspaceId']
+        if (typeof rawId !== 'string' || rawId.trim() === '') {
+          send(400, { error: "body needs 'workspaceId'" })
+          return
+        }
+        const wid = rawId.trim() as WorkspaceId
+        try {
+          requireWorkspace(deps, wid, true)
+        } catch (error) {
+          fail(error)
+          return
+        }
+        const config = body['config']
+        if (config === null || typeof config !== 'object' || Array.isArray(config)) {
+          send(400, { error: "body needs 'config' object" })
+          return
+        }
+        const expectedHash = typeof body['expectedHash'] === 'string' ? body['expectedHash'] : undefined
+        try {
+          const result = await deps.dangerousStore.save(wid, config as never, expectedHash)
+          send(200, result)
+        } catch (error) {
+          const msg = String(error instanceof Error ? error.message : error)
+          if (/conflict/i.test(msg)) { send(409, { error: msg }); return }
+          send(400, { error: msg })
+        }
+        return
+      }
+      send(405, { error: 'method not allowed' })
+      return
+    }
+
+    if (pathname === '/api/guard/dangerous-commands/global') {
+      if (req.method === 'GET') {
+        const result = await deps.dangerousStore.loadGlobal()
+        send(200, result)
+        return
+      }
+      if (req.method === 'PUT') {
+        const body = await readJson(req)
+        const config = body['config']
+        if (config === null || typeof config !== 'object' || Array.isArray(config)) {
+          send(400, { error: "body needs 'config' object" })
+          return
+        }
+        const expectedHash = typeof body['expectedHash'] === 'string' ? body['expectedHash'] : undefined
+        try {
+          const result = await deps.dangerousStore.saveGlobal(config as never, expectedHash)
+          send(200, result)
+        } catch (error) {
+          const msg = String(error instanceof Error ? error.message : error)
+          if (/conflict/i.test(msg)) { send(409, { error: msg }); return }
+          send(400, { error: msg })
+        }
+        return
+      }
+      send(405, { error: 'method not allowed' })
       return
     }
 
