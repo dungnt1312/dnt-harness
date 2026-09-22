@@ -118,6 +118,7 @@ declare module 'mini-dsh' {
       readonly sessionId: SessionId
       readonly approvalId: string
       readonly call: ToolCall
+      readonly guardWarning?: string
     }): void
     /**
      * A turn failed (e.g. a rejected API call) on one session; the reason is
@@ -139,7 +140,7 @@ function BUNDLED_DEFAULT() {
 export type WebEnvelope =
   | { readonly kind: 'snapshot'; readonly events: SessionEvent[] }
   | { readonly kind: 'session'; readonly event: SessionEvent }
-  | { readonly kind: 'approval'; readonly approvalId: string; readonly call: ToolCall }
+  | { readonly kind: 'approval'; readonly approvalId: string; readonly call: ToolCall; readonly guardWarning?: string }
   | { readonly kind: 'error'; readonly message: string }
 
 /** Options for {@link createWebServer}. */
@@ -1395,6 +1396,10 @@ ${decision.injected}`, ...contents]
         // One id everywhere: the durable log, the SSE frame, and this map
         // must agree, or log-derived questions POST 404s.
         const approvalId = lifecycle.approvalId
+        const guardMatch = dangerousGuard.getMatch(call)
+        const guardWarning = guardMatch?.action === 'ask'
+          ? `Dangerous Commands: matched ${guardMatch.presetId ?? guardMatch.ruleId ?? 'rule'} — ${guardMatch.reason}`
+          : undefined
         pending.set(approvalId, { sessionId: scope.sessionId, call, resolve })
         // Expiry, stop, or a policy change settles the approval without an
         // answer: retire the question so reconnects never replay it and a
@@ -1402,7 +1407,7 @@ ${decision.injected}`, ...contents]
         void lifecycle.done.then(() => {
           if (pending.delete(approvalId)) resolve(false)
         })
-        kernel.ctx.emit('web/approval', { sessionId: scope.sessionId, approvalId, call })
+        kernel.ctx.emit('web/approval', { sessionId: scope.sessionId, approvalId, call, ...(guardWarning !== undefined ? { guardWarning } : {}) })
       }),
   })
 
@@ -3018,6 +3023,7 @@ async function handleApi(
             const info = await deps.terminals.create({
               workspaceId: wsId,
               cwd: cwd.path,
+              ...(typeof body['projectId'] === 'string' && body['projectId'] !== '' ? { projectId: body['projectId'] as ProjectId } : {}),
               ...(typeof body['shellId'] === 'string' ? { shellId: body['shellId'] as never } : {}),
               ...(startCols !== undefined ? { cols: startCols } : {}),
               ...(startRows !== undefined ? { rows: startRows } : {}),
@@ -4189,7 +4195,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   })
   const disposeApproval = deps.kernel.ctx.on('web/approval', (payload) => {
     if (payload.sessionId === session.id) {
-      writeFrame(res, { kind: 'approval', approvalId: payload.approvalId, call: payload.call })
+      writeFrame(res, { kind: 'approval', approvalId: payload.approvalId, call: payload.call, ...(payload.guardWarning !== undefined ? { guardWarning: payload.guardWarning } : {}) })
     }
   })
   const disposeError = deps.kernel.ctx.on('web/turn-error', (payload) => {

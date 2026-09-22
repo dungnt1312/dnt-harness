@@ -51,9 +51,24 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
         setApprovals((prev) => reconcileApprovals(prev, [event]))
       } else if (envelope.kind === 'error') {
         setError(envelope.message)
+      } else if (envelope.kind === 'approval-settled') {
+        setApprovals((prev) => prev.filter((row) => row.approvalId !== envelope.approvalId))
       } else {
-        setApprovals((prev) => prev.some((row) => row.approvalId === envelope.approvalId)
-          ? prev : [...prev, { approvalId: envelope.approvalId, call: envelope.call }])
+        setApprovals((prev) => {
+          const next = {
+            approvalId: envelope.approvalId,
+            call: envelope.call,
+            ...(envelope.interactive === true ? { interactive: true } : {}),
+            ...(envelope.childSessionId !== undefined ? { childSessionId: envelope.childSessionId } : {}),
+            ...(envelope.definitionName !== undefined ? { definitionName: envelope.definitionName } : {}),
+            ...(envelope.expiresAt !== undefined ? { expiresAt: envelope.expiresAt } : {}),
+            ...(envelope.guardWarning !== undefined ? { guardWarning: envelope.guardWarning } : {}),
+          }
+          if (prev.some((row) => row.approvalId === envelope.approvalId)) {
+            return prev.map((row) => row.approvalId === envelope.approvalId ? { ...row, ...next } : row)
+          }
+          return [...prev, next]
+        })
       }
     }, (state) => { if (!disposed) setStream(state) })
     return () => { disposed = true; dispose() }
