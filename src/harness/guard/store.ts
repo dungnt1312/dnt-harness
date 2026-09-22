@@ -41,8 +41,8 @@ export class DangerousCommandsStore {
     expectedHash?: string,
   ): Promise<{ config: DangerousCommandsConfig; hash: string }> {
     validateConfig(config)
+    await this.checkWorkspaceConflict(workspaceId, expectedHash)
     const file = this.workspaceFile(workspaceId)
-    await this.checkConflict(file, expectedHash)
     const normalized = normalize(config)
     await fs.mkdir(path.dirname(file), { recursive: true })
     await replaceFileAtomic(file, `${JSON.stringify(normalized, null, 2)}\n`)
@@ -54,8 +54,8 @@ export class DangerousCommandsStore {
     expectedHash?: string,
   ): Promise<{ config: DangerousCommandsConfig; hash: string }> {
     validateConfig(config)
+    await this.checkGlobalConflict(expectedHash)
     const file = this.globalFile()
-    await this.checkConflict(file, expectedHash)
     const normalized = normalize(config)
     await fs.mkdir(path.dirname(file), { recursive: true })
     await replaceFileAtomic(file, `${JSON.stringify(normalized, null, 2)}\n`)
@@ -81,31 +81,34 @@ export class DangerousCommandsStore {
     }
   }
 
-  private async checkConflict(file: string, expectedHash?: string): Promise<void> {
+  private async checkWorkspaceConflict(workspaceId: string, expectedHash?: string): Promise<void> {
     if (expectedHash === undefined) return
-    let currentRaw: string | undefined
-    try {
-      currentRaw = await fs.readFile(file, 'utf8')
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        throw new Error(`conflict: file does not exist but expectedHash was provided`)
-      }
-      throw error
-    }
-    // If file exists but is corrupt, we computed fallback; treat corrupt as DEFAULT_CONFIG hash.
-    // For conflict detection, compute hash of current file if valid, else DEFAULT.
-    let currentHash: string
-    try {
-      const parsed = JSON.parse(currentRaw) as unknown
-      const cfg = parseAndCoerce(parsed)
-      validateConfig(cfg)
-      currentHash = hashConfig(cfg)
-    } catch {
-      currentHash = hashConfig(DEFAULT_CONFIG)
-    }
+    const currentHash = await this.effectiveWorkspaceHash(workspaceId)
     if (currentHash !== expectedHash) {
       throw new Error(`conflict: dangerous-commands.json changed externally; expected ${expectedHash} but found ${currentHash}`)
     }
+  }
+
+  private async checkGlobalConflict(expectedHash?: string): Promise<void> {
+    if (expectedHash === undefined) return
+    const currentHash = await this.effectiveGlobalHash()
+    if (currentHash !== expectedHash) {
+      throw new Error(`conflict: dangerous-commands.json changed externally; expected ${expectedHash} but found ${currentHash}`)
+    }
+  }
+
+  private async effectiveWorkspaceHash(workspaceId: string): Promise<string> {
+    const ws = await this.readFile(this.workspaceFile(workspaceId))
+    if (ws !== null) return ws.hash
+    const g = await this.readFile(this.globalFile())
+    if (g !== null) return g.hash
+    return hashConfig(DEFAULT_CONFIG)
+  }
+
+  private async effectiveGlobalHash(): Promise<string> {
+    const g = await this.readFile(this.globalFile())
+    if (g !== null) return g.hash
+    return hashConfig(DEFAULT_CONFIG)
   }
 }
 
