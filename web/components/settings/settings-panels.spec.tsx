@@ -444,7 +444,7 @@ describe('settings dialog', () => {
   it('gives every section tab an icon', async () => {
     await render()
     const tabs = [...document.body.querySelectorAll('[role="tab"]')]
-    expect(tabs).toHaveLength(10)
+    expect(tabs).toHaveLength(9)
     for (const tab of tabs) expect(tab.querySelector('svg')).not.toBeNull()
   })
 

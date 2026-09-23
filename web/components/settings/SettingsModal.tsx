@@ -26,19 +26,29 @@ import {
   modelVision,
 } from '../../lib/model-info.ts'
 import { ModelSettingsDialog, SyncModelsDialog } from './model-dialogs.tsx'
-import { AgentsPanel, HooksPanel, McpPanel, MemoryPanel, ModesPanel, SecretsPanel, SkillsPanel } from './ManagementPanels.tsx'
-import { DangerousCommandsPanel } from './DangerousCommandsPanel.tsx'
+import { AgentsPanel, HooksPanel, McpPanel, MemoryPanel, SecretsPanel, SkillsPanel } from './ManagementPanels.tsx'
+import { PermissionsPanel } from './PermissionsPanel.tsx'
 import { modelOptions } from '../../lib/providers.ts'
 import type { ModelSettings, ProjectRow, ProviderSummary } from '../../lib/types.ts'
 
 /** Settings are grouped per concern; providers keep their own full editor. */
-type SettingsTab = 'providers' | 'projects' | 'modes' | 'dangerous-commands' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'
+type SettingsTab = 'providers' | 'projects' | 'permissions' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'
+
+const LEGACY_TAB_REDIRECT: Readonly<Record<string, SettingsTab>> = {
+  modes: 'permissions',
+  'dangerous-commands': 'permissions',
+}
+
+function normalizeTab(raw: string | undefined): SettingsTab | undefined {
+  if (raw === undefined) return undefined
+  if (raw in LEGACY_TAB_REDIRECT) return LEGACY_TAB_REDIRECT[raw]
+  return raw as SettingsTab
+}
 
 const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonly hint: string; readonly icon: IconName }[] = [
   { id: 'providers', label: 'Providers', hint: 'Model endpoints and keys', icon: 'globe' },
   { id: 'projects', label: 'Projects', hint: 'Folders conversations in this workspace can work in', icon: 'folder' },
-  { id: 'modes', label: 'Modes', hint: 'What a conversation may read, edit, or run', icon: 'shield' },
-  { id: 'dangerous-commands', label: 'Dangerous Commands', hint: 'Guard risky Bash commands before approval', icon: 'alertTriangle' },
+  { id: 'permissions', label: 'Permissions', hint: 'Modes & dangerous command guard', icon: 'shield' },
   { id: 'skills', label: 'Skills', hint: 'SKILL.md instruction packages', icon: 'zap' },
   { id: 'memory', label: 'Memory', hint: 'Notes the model recalls in this workspace', icon: 'lightbulb' },
   { id: 'agents', label: 'Agents', hint: 'Roles a conversation can delegate to; spawn them from the workbench', icon: 'gitBranch' },
@@ -50,7 +60,7 @@ const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonl
 /** Nav groups: global settings first, then the active workspace's. */
 const TAB_GROUPS: readonly { readonly label: string; readonly ids: readonly SettingsTab[] }[] = [
   { label: 'Global', ids: ['providers'] },
-  { label: 'Workspace', ids: ['projects', 'modes', 'dangerous-commands', 'skills', 'memory', 'agents', 'mcp', 'hooks', 'secrets'] },
+  { label: 'Workspace', ids: ['projects', 'permissions', 'skills', 'memory', 'agents', 'mcp', 'hooks', 'secrets'] },
 ]
 
 interface Draft {
@@ -176,7 +186,7 @@ export function SettingsModal({
     if (!open) return
     const first = providers.find((provider) => provider.id === activeProvider) ?? providers[0]
     seeded.current = first !== undefined
-    setTab(initialTab)
+    setTab(normalizeTab(initialTab) ?? 'providers')
     setSelectedId(first?.id ?? null)
     setDraft(first === undefined ? BLANK : draftOf(first))
     setNotice(null)
@@ -201,7 +211,7 @@ export function SettingsModal({
   }, [providers])
 
   // Opening Settings at another tab while it is already open still switches.
-  useEffect(() => { if (open) setTab(initialTab) }, [initialTab])
+  useEffect(() => { if (open) setTab(normalizeTab(initialTab) ?? 'providers') }, [initialTab])
 
   const dirty = useMemo(() => {
     if (selected === undefined) return JSON.stringify(draft) !== JSON.stringify(BLANK)
@@ -495,8 +505,7 @@ export function SettingsModal({
             {tab !== 'providers' ? (
               <>
                 {tab === 'projects' ? <ProjectsPanel workspaceId={workspaceId} projects={projects} onChanged={onProjectsChanged} sessionCounts={sessionCounts} /> : null}
-                {tab === 'modes' ? <ModesPanel workspaceId={workspaceId} onChanged={onRefresh} /> : null}
-                {tab === 'dangerous-commands' ? <DangerousCommandsPanel workspaceId={workspaceId} /> : null}
+                {tab === 'permissions' ? <PermissionsPanel workspaceId={workspaceId} onChanged={onRefresh} /> : null}
                 {tab === 'skills' ? <SkillsPanel workspaceId={workspaceId} /> : null}
                 {tab === 'memory' ? <MemoryPanel workspaceId={workspaceId} /> : null}
                 {tab === 'agents' ? <AgentsPanel workspaceId={workspaceId} modelOptions={roleModelOptions} /> : null}
