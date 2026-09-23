@@ -24,7 +24,7 @@ import {
   type NoticeState,
 } from './settings-kit.tsx'
 import { matchCommand } from '../../../src/harness/guard/matcher.ts'
-import { DEFAULT_CONFIG, PRESET_IDS, PRESET_LABELS } from '../../../src/harness/guard/defaults.ts'
+import { DEFAULT_CONFIG, PRESET_IDS, PRESET_LABELS, PRESET_RULE_TEXTS } from '../../../src/harness/guard/defaults.ts'
 import type { CustomRuleAction, GuardAction } from '../../../src/harness/guard/types.ts'
 
 const PRESET_OPTIONS: readonly { readonly value: GuardAction; readonly label: string }[] = [
@@ -73,6 +73,15 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
   const [draftRegexError, setDraftRegexError] = useScopedState<string | null>(null)
   const [testInput, setTestInput] = useScopedState('')
   const [testResult, setTestResult] = useScopedState<string | null>(null)
+  const [expandedPresets, setExpandedPresets] = useState<ReadonlySet<string>>(() => new Set())
+  const togglePreset = (id: string): void => {
+    setExpandedPresets((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
   const { busy, run } = useActionRunner((text) => setNotice({ kind: 'bad', text }))
 
   const [loading, setLoading] = useState(true)
@@ -282,8 +291,10 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
         <ItemList label="Preset groups">
           {PRESET_IDS.map((id) => {
             const info = PRESET_LABELS[id]
+            const rules = PRESET_RULE_TEXTS[id] ?? []
             const value = (config.presets as Record<string, GuardAction>)[id] ?? 'off'
             const toneClass = value === 'deny' ? 'text-bad' : value === 'ask' ? 'text-warn' : 'text-fg-faint'
+            const expanded = expandedPresets.has(id)
             return (
               <ItemRow
                 key={id}
@@ -291,6 +302,16 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
                   <>
                     <span className={toneClass}>{info.name}</span>
                     <Badge tone={value === 'deny' ? 'amber' : value === 'ask' ? 'amber' : 'gray'}>{value}</Badge>
+                    <button
+                      type="button"
+                      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-xs font-normal text-fg-muted hover:bg-hover hover:text-fg"
+                      onClick={() => togglePreset(id)}
+                      aria-expanded={expanded}
+                      aria-label={`${expanded ? 'Hide' : 'Show'} rules for ${info.name}`}
+                    >
+                      <Icon name="chevron" size={11} className={expanded ? 'rotate-180' : ''} />
+                      {expanded ? 'Hide rules' : `${rules.length} rules`}
+                    </button>
                   </>
                 )}
                 meta={`${info.description} — e.g. ${info.examples}`}
@@ -302,7 +323,18 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
                     onChange={(v) => setPreset(id, v as GuardAction)}
                   />
                 )}
-              />
+              >
+                {expanded ? (
+                  <ul className="m-0 flex list-none flex-col gap-1 rounded-lg bg-muted px-3 py-2">
+                    {rules.map((rule) => (
+                      <li key={rule} className="flex items-start gap-2 text-xs leading-5">
+                        <span className="mt-1.5 size-1 shrink-0 rounded-full bg-fg-faint" aria-hidden />
+                        <code className="min-w-0 break-all font-mono text-fg">{rule}</code>
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+              </ItemRow>
             )
           })}
         </ItemList>

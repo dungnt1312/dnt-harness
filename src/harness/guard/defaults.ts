@@ -8,6 +8,14 @@ export const PRESET_LABELS: Record<PresetId, { name: string; description: string
   dbDestructive: { name: 'DB Destructive', description: 'Database data loss', examples: 'DROP TABLE, TRUNCATE, DELETE w/o WHERE' },
   resourceExhaust: { name: 'Resource Exhaust', description: 'Fork bomb & host DoS', examples: ':(){ :|:& };:, nohup loop' },
 }
+export const PRESET_RULE_TEXTS: Record<PresetId, readonly string[]> = {
+  fsDestructive: ['rm -rf / …  (recursive + force)', 'rm -r …', 'mkfs.*', 'dd if=…', 'shred …', 'chmod …777', '> /dev/sd*', 'mv … /*'],
+  gitDestructive: ['git reset --hard', 'git push --force (incl. --force-with-lease)', 'git clean -f…', 'git branch -D …', 'git stash clear / drop', 'git restore … (without --staged)', 'git checkout -- .'],
+  systemPriv: ['sudo …', 'su …', 'systemctl …', 'reboot', 'shutdown', 'taskkill /F', 'net stop …'],
+  networkExfil: ['curl … | sh/bash', 'wget … | sh/bash', 'nc -l …', 'ssh …', 'scp …', 'Invoke-Expression', 'iex(…)', 'certutil … -urlcache …'],
+  dbDestructive: ['DROP TABLE / DATABASE …', 'TRUNCATE TABLE …', 'DELETE FROM … (no WHERE)'],
+  resourceExhaust: [':(){ :|:& };:  (fork bomb)', 'nohup … while … do …'],
+}
 export const DEFAULT_CONFIG: DangerousCommandsConfig = {
   v: 1,
   presets: { fsDestructive: 'deny', gitDestructive: 'ask', systemPriv: 'ask', networkExfil: 'deny', dbDestructive: 'ask', resourceExhaust: 'deny' },
