@@ -94,7 +94,7 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
       setBaseline(serializeConfig(merged))
       setConflict(false)
       if (result.warning !== undefined) {
-        setNotice({ kind: 'warn', text: result.warning })
+        setNotice({ kind: 'info', text: result.warning })
       } else {
         setNotice(null)
       }
