@@ -9,7 +9,20 @@ const PRESET_SET = new Set<string>(PRESET_IDS as readonly string[])
 const PRESET_ACTIONS = new Set<string>(['deny', 'ask', 'off'])
 const CUSTOM_ACTIONS = new Set<string>(['deny', 'ask', 'allow'])
 
+type ReadResult =
+  | { kind: 'missing' }
+  | { kind: 'valid'; config: DangerousCommandsConfig; hash: string }
+  | { kind: 'corrupt'; warning: string }
+
+export interface GuardLoadResult {
+  readonly config: DangerousCommandsConfig
+  readonly hash: string
+  readonly warning?: string
+}
+
 export class DangerousCommandsStore {
+  private readonly mutationTails = new Map<string, Promise<void>>()
+
   constructor(private readonly home: string) {}
 
   private workspaceFile(workspaceId: string): string {
@@ -20,18 +33,42 @@ export class DangerousCommandsStore {
     return path.join(this.home, 'dangerous-commands.json')
   }
 
-  async load(workspaceId: string): Promise<{ config: DangerousCommandsConfig; hash: string }> {
-    const wsFile = this.workspaceFile(workspaceId)
-    const ws = await this.readFile(wsFile)
-    if (ws !== null) return ws
-    const g = await this.readFile(this.globalFile())
-    if (g !== null) return g
+  private async withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.mutationTails.get(key) ?? Promise.resolve()
+    let release!: () => void
+    const cur = new Promise<void>((r) => { release = r })
+    const tail = prev.then(() => cur)
+    this.mutationTails.set(key, tail)
+    await prev
+    try {
+      return await fn()
+    } finally {
+      release()
+      if (this.mutationTails.get(key) === tail) this.mutationTails.delete(key)
+    }
+  }
+
+  async load(workspaceId: string): Promise<GuardLoadResult> {
+    const wsResult = await this.readFile(this.workspaceFile(workspaceId))
+    if (wsResult.kind === 'valid') return { config: wsResult.config, hash: wsResult.hash }
+    if (wsResult.kind === 'corrupt') {
+      return { config: clone(DEFAULT_CONFIG), hash: hashConfig(DEFAULT_CONFIG), warning: wsResult.warning }
+    }
+    // missing -> try global
+    const gResult = await this.readFile(this.globalFile())
+    if (gResult.kind === 'valid') return { config: gResult.config, hash: gResult.hash }
+    if (gResult.kind === 'corrupt') {
+      return { config: clone(DEFAULT_CONFIG), hash: hashConfig(DEFAULT_CONFIG), warning: gResult.warning }
+    }
     return { config: clone(DEFAULT_CONFIG), hash: hashConfig(DEFAULT_CONFIG) }
   }
 
-  async loadGlobal(): Promise<{ config: DangerousCommandsConfig; hash: string }> {
-    const g = await this.readFile(this.globalFile())
-    if (g !== null) return g
+  async loadGlobal(): Promise<GuardLoadResult> {
+    const gResult = await this.readFile(this.globalFile())
+    if (gResult.kind === 'valid') return { config: gResult.config, hash: gResult.hash }
+    if (gResult.kind === 'corrupt') {
+      return { config: clone(DEFAULT_CONFIG), hash: hashConfig(DEFAULT_CONFIG), warning: gResult.warning }
+    }
     return { config: clone(DEFAULT_CONFIG), hash: hashConfig(DEFAULT_CONFIG) }
   }
 
@@ -41,12 +78,15 @@ export class DangerousCommandsStore {
     expectedHash?: string,
   ): Promise<{ config: DangerousCommandsConfig; hash: string }> {
     validateConfig(config)
-    await this.checkWorkspaceConflict(workspaceId, expectedHash)
-    const file = this.workspaceFile(workspaceId)
-    const normalized = normalize(config)
-    await fs.mkdir(path.dirname(file), { recursive: true })
-    await replaceFileAtomic(file, `${JSON.stringify(normalized, null, 2)}\n`)
-    return { config: normalized, hash: hashConfig(normalized) }
+    const key = `ws:${workspaceId}`
+    return this.withLock(key, async () => {
+      await this.checkWorkspaceConflict(workspaceId, expectedHash)
+      const file = this.workspaceFile(workspaceId)
+      const normalized = normalize(config)
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      await replaceFileAtomic(file, `${JSON.stringify(normalized, null, 2)}\n`)
+      return { config: normalized, hash: hashConfig(normalized) }
+    })
   }
 
   async saveGlobal(
@@ -54,30 +94,38 @@ export class DangerousCommandsStore {
     expectedHash?: string,
   ): Promise<{ config: DangerousCommandsConfig; hash: string }> {
     validateConfig(config)
-    await this.checkGlobalConflict(expectedHash)
-    const file = this.globalFile()
-    const normalized = normalize(config)
-    await fs.mkdir(path.dirname(file), { recursive: true })
-    await replaceFileAtomic(file, `${JSON.stringify(normalized, null, 2)}\n`)
-    return { config: normalized, hash: hashConfig(normalized) }
+    return this.withLock('global', async () => {
+      await this.checkGlobalConflict(expectedHash)
+      const file = this.globalFile()
+      const normalized = normalize(config)
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      await replaceFileAtomic(file, `${JSON.stringify(normalized, null, 2)}\n`)
+      return { config: normalized, hash: hashConfig(normalized) }
+    })
   }
 
-  private async readFile(filePath: string): Promise<{ config: DangerousCommandsConfig; hash: string } | null> {
+  /** Whether a workspace has a materialized file (valid JSON). Missing/corrupt -> false. */
+  async hasWorkspaceFile(workspaceId: string): Promise<boolean> {
+    const result = await this.readFile(this.workspaceFile(workspaceId))
+    return result.kind === 'valid'
+  }
+
+  private async readFile(filePath: string): Promise<ReadResult> {
     let raw: string
     try {
       raw = await fs.readFile(filePath, 'utf8')
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'missing' }
       throw error
     }
     try {
       const parsed = JSON.parse(raw) as unknown
       const config = parseAndCoerce(parsed)
       validateConfig(config)
-      return { config, hash: hashConfig(config) }
-    } catch {
-      // Corrupt JSON or invalid schema falls back to DEFAULT_CONFIG
-      return null
+      return { kind: 'valid', config, hash: hashConfig(config) }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      return { kind: 'corrupt', warning: `dangerous-commands.json is corrupt/invalid (${detail}); using defaults` }
     }
   }
 
@@ -99,15 +147,17 @@ export class DangerousCommandsStore {
 
   private async effectiveWorkspaceHash(workspaceId: string): Promise<string> {
     const ws = await this.readFile(this.workspaceFile(workspaceId))
-    if (ws !== null) return ws.hash
+    if (ws.kind === 'valid') return ws.hash
+    if (ws.kind === 'corrupt') return hashConfig(DEFAULT_CONFIG)
     const g = await this.readFile(this.globalFile())
-    if (g !== null) return g.hash
+    if (g.kind === 'valid') return g.hash
+    if (g.kind === 'corrupt') return hashConfig(DEFAULT_CONFIG)
     return hashConfig(DEFAULT_CONFIG)
   }
 
   private async effectiveGlobalHash(): Promise<string> {
     const g = await this.readFile(this.globalFile())
-    if (g !== null) return g.hash
+    if (g.kind === 'valid') return g.hash
     return hashConfig(DEFAULT_CONFIG)
   }
 }
@@ -133,7 +183,6 @@ function parseAndCoerce(parsed: unknown): DangerousCommandsConfig {
     throw new Error('invalid config: not an object')
   }
   const obj = parsed as Record<string, unknown>
-  // v, presets, customRules passthrough for validation
   return {
     v: obj['v'] as 1,
     presets: obj['presets'] as Record<PresetId, GuardAction>,
@@ -165,13 +214,11 @@ function validateConfig(config: unknown): asserts config is DangerousCommandsCon
   const presetRecord = presets as Record<string, unknown>
   const presetKeys = Object.keys(presetRecord)
 
-  // Check missing keys
   for (const id of PRESET_IDS) {
     if (!(id in presetRecord)) {
       throw new Error(`invalid config: missing preset '${id}'`)
     }
   }
-  // Check unknown keys
   for (const key of presetKeys) {
     if (!PRESET_SET.has(key)) {
       throw new Error(`invalid config: unknown preset '${key}'`)

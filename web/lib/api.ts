@@ -161,8 +161,12 @@ export function syncProvider(id: string): Promise<{ ok: boolean; models: string[
   )
 }
 
-export function testProvider(id: string): Promise<{ ok: boolean; error?: string }> {
-  return apiFetch(`/api/providers/${encodeURIComponent(id)}/test`, { method: 'POST' }).then((r) => json<{ ok: boolean; error?: string }>(r))
+/** Ping one model of a provider. Omit `model` to use the provider's first. */
+export function testProvider(id: string, model?: string): Promise<{ ok: boolean; error?: string }> {
+  return apiFetch(`/api/providers/${encodeURIComponent(id)}/test`, {
+    method: 'POST',
+    ...(model !== undefined ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model }) } : {}),
+  }).then((r) => json<{ ok: boolean; error?: string }>(r))
 }
 
 /** Live connection state of one session's event stream. */
@@ -883,6 +887,7 @@ export interface DangerousCommandsConfig {
 export interface GuardConfigResponse {
   readonly config: DangerousCommandsConfig
   readonly hash: string
+  readonly warning?: string
 }
 
 export function getGuardConfig(workspaceId: string): Promise<GuardConfigResponse> {

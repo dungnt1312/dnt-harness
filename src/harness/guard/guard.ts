@@ -16,16 +16,22 @@ export interface GuardOptions {
 
 export interface GuardHandle {
   getMatch(call: ToolCall): GuardMatch | null
+  clearForWorkspace(workspaceId: string): void
   dispose(): boolean
 }
 
 export function attachDangerousCommandGuard(ctx: Context, options: GuardOptions): GuardHandle {
   const perCall = new WeakMap<ToolCall, GuardMatch>()
   const byId = new Map<string, GuardMatch>()
+  const byIdWorkspace = new Map<string, string>()
 
   function store(call: ToolCall, match: GuardMatch): void {
     perCall.set(call, match)
-    if (call.id) byId.set(call.id, match)
+    if (call.id) {
+      byId.set(call.id, match)
+      const wid = agentScope.getStore()?.workspaceId as string | undefined
+      if (wid !== undefined) byIdWorkspace.set(call.id, wid)
+    }
   }
 
   async function resolveConfig(): Promise<DangerousCommandsConfig> {
@@ -99,6 +105,14 @@ export function attachDangerousCommandGuard(ctx: Context, options: GuardOptions)
       if (direct !== undefined) return direct
       if (call.id && byId.has(call.id)) return byId.get(call.id) ?? null
       return null
+    },
+    clearForWorkspace(workspaceId: string): void {
+      for (const [id, wid] of [...byIdWorkspace.entries()]) {
+        if (wid === workspaceId) {
+          byIdWorkspace.delete(id)
+          byId.delete(id)
+        }
+      }
     },
     dispose,
   }

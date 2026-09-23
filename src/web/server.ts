@@ -1483,6 +1483,7 @@ ${decision.injected}`, ...contents]
     staticDir,
     limits,
     approvalHandle,
+    dangerousGuard,
     workspaces,
     controls,
     controlsFor,
@@ -1589,6 +1590,7 @@ interface HandlerDeps {
   readonly staticDir: string
   readonly limits: HarnessLimits
   readonly approvalHandle: ApprovalHandle
+  readonly dangerousGuard: ReturnType<typeof attachDangerousCommandGuard>
   readonly workspaces: WorkspaceService
   readonly controls: Map<WorkspaceId, WorkspaceControls>
   readonly controlsFor: (workspaceId: WorkspaceId) => WorkspaceControls
@@ -3255,6 +3257,9 @@ async function handleApi(
         const expectedHash = typeof body['expectedHash'] === 'string' ? body['expectedHash'] : undefined
         try {
           const result = await deps.dangerousStore.save(wid, config as never, expectedHash)
+          // Invalidate guard cache so re-evaluation reflects the new config.
+          deps.dangerousGuard.clearForWorkspace(wid)
+          deps.approvalHandle.reevaluate({ workspaceId: wid })
           send(200, result)
         } catch (error) {
           const msg = String(error instanceof Error ? error.message : error)
@@ -3283,6 +3288,13 @@ async function handleApi(
         const expectedHash = typeof body['expectedHash'] === 'string' ? body['expectedHash'] : undefined
         try {
           const result = await deps.dangerousStore.saveGlobal(config as never, expectedHash)
+          for (const ws of deps.workspaces.list({ includeArchived: true })) {
+            const hasFile = await deps.dangerousStore.hasWorkspaceFile(ws.id)
+            if (!hasFile) {
+              deps.dangerousGuard.clearForWorkspace(ws.id)
+              deps.approvalHandle.reevaluate({ workspaceId: ws.id })
+            }
+          }
           send(200, result)
         } catch (error) {
           const msg = String(error instanceof Error ? error.message : error)
@@ -3344,17 +3356,28 @@ async function handleApi(
         return
       }
       // An optional body names the exact model to ping, so the Settings model
-      // list can verify one row. Without it the provider's first model stands in.
+      // list can verify one row. Without it the provider's first model stands
+      // in — and `test` when it advertises none yet, which is how a freshly
+      // added provider checks its endpoint and key before any sync.
       const body = await readJson(req).catch(() => ({})) as Record<string, unknown>
       const requested = body['model']
       if (requested !== undefined && (typeof requested !== 'string' || requested === '')) {
         send(400, { error: "'model' must be a non-empty string" })
         return
       }
-      const model = typeof requested === 'string' ? requested : entry.models[0]
-      if (model === undefined) {
-        send(400, { error: 'no model to test; add a model ID to this provider first' })
-        return
+      let model: string
+      if (typeof requested === 'string') {
+        // Fail loud on an unadvertised id: a silent upstream 404 would read as
+        // "the model is broken" when the id is simply wrong.
+        try {
+          deps.validateProviderModel(entry.id, requested)
+        } catch (error) {
+          send(400, { error: String(error instanceof Error ? error.message : error) })
+          return
+        }
+        model = requested
+      } else {
+        model = entry.models[0] ?? 'test'
       }
       const outcome = await pingCompletions(entry, model)
       send(outcome.ok ? 200 : 502, outcome)
@@ -4001,14 +4024,19 @@ function authHeaders(entry: ProviderConfig): Record<string, string> {
   return entry.apiKey === '' ? {} : { authorization: `Bearer ${entry.apiKey}` }
 }
 
-/** Fire one tiny non-streaming completion; returns an operator-readable verdict. */
-async function pingCompletions(entry: ProviderConfig): Promise<{ ok: true } | { ok: false; error: string }> {
+/**
+ * Fire one tiny non-streaming completion against `model`; returns an
+ * operator-readable verdict. The caller resolves which model to name — this
+ * never guesses one, because a ping that silently used a different model would
+ * report the wrong row as verified.
+ */
+async function pingCompletions(entry: ProviderConfig, model: string): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
     const response = await fetch(`${entry.baseUrl.replace(/\/$/, '')}/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...authHeaders(entry) },
       body: JSON.stringify({
-        model: entry.models[0] ?? 'test',
+        model,
         messages: [{ role: 'user', content: 'ping' }],
         max_tokens: 1,
         stream: false,
