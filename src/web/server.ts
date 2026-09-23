@@ -21,6 +21,7 @@
  * questions — answered by `POST /api/approvals/:id`.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { bearerAllows, ControlPlaneAuthService, isPublicPath, SESSION_COOKIE } from './control-plane-auth.ts'
 import { promises as fs, type Dirent } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
@@ -41,7 +42,6 @@ import type { Session } from '../harness/session/session.ts'
 import { sessionModelOf, type SessionEvent } from '../harness/session/events.ts'
 import { deriveTitle } from '../harness/session/title.ts'
 import { newInputId, type ProjectId, type SessionId, type WorkspaceId } from '../util/brand.ts'
-import { canonicalPolicy } from '../harness/tools/names.ts'
 import { ToolsService } from '../harness/tools/service.ts'
 import { bashTool } from '../capabilities/shell/bash.ts'
 import { fsTools } from '../capabilities/fs/tools.ts'
@@ -74,7 +74,7 @@ import {
   type ModelSettings,
   type ProviderConfig,
 } from './provider-store.ts'
-import { ScopeError, WorkspaceService, type ProjectRecord } from '../harness/workspace/service.ts'
+import { ScopeError, WorkspaceService, type ProjectRecord, type WorkspaceRecord } from '../harness/workspace/service.ts'
 import { ModesService, ModeError, DEFAULT_MODE_ID, BUNDLED_MODES, type ResolvedMode } from '../harness/modes/service.ts'
 import { AgentDefinitionService, AgentDefinitionError } from '../harness/agents/definition-service.ts'
 import {
@@ -88,12 +88,25 @@ import {
   mcpToolName,
   RESERVED_TOOL_NAMES,
   auditHash,
+  authSecretRef,
+  type McpConfig,
   type McpServerConfig,
 } from '../harness/mcp/config.ts'
 import { McpServerClient, McpTransportError, type McpToolDescriptor } from '../harness/mcp/client.ts'
+import { configRevision, upsertServer, withServerEnabled, withoutServer } from '../harness/mcp/config-v2.ts'
+import { clearAuditFault, dispatchToolCall, faultIsOpen } from '../harness/mcp/execution-coordinator.ts'
+import { McpExecutionJournal } from '../harness/mcp/execution-journal.ts'
+import { MutationStore, readFileIfPresent } from '../harness/mcp/mutation-store.ts'
+import { DataHomeLock } from '../harness/mcp/ownership-lock.ts'
+import { ManagedOAuth } from '../harness/mcp/oauth.ts'
+import { OAuthStore } from '../harness/mcp/oauth-store.ts'
+import { containmentCapability } from '../harness/mcp/process-controller.ts'
+import { stageMcpOutcome } from '../harness/mcp/staged-outcome.ts'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { runHook, isBlockingDecision, isFailureDecision } from '../harness/hooks/runner.ts'
 import type { HooksConfig } from '../harness/mcp/config.ts'
-import { ChildExecutor, SpawnError, type TaskPacket } from '../harness/agents/executor.ts'
+import { ChildExecutor, SpawnError, type ChildModel, type TaskPacket } from '../harness/agents/executor.ts'
+import { agentTool, ChildModelError, resolveChildModel } from './agent-delegation.ts'
 import { importClaudeDefinition } from '../harness/agents/compatibility/claude.ts'
 import { SkillsService, SkillError } from '../harness/skills/service.ts'
 import { MemoryService, MemoryError } from '../harness/memory/service.ts'
@@ -119,6 +132,20 @@ declare module 'mini-dsh' {
       readonly approvalId: string
       readonly call: ToolCall
       readonly guardWarning?: string
+      /** Present when the waiting session is a child; root streams relay this. */
+      readonly parentSessionId?: SessionId
+      /** The child's agent definition, so a relayed question names its asker. */
+      readonly definitionName?: string
+      /** MCP (or other) tools annotated as requiring a human each call. */
+      readonly interactive?: boolean
+      /** Epoch ms when this question expires undecided. */
+      readonly expiresAt: number
+    }): void
+    /** A pending question was settled (answer, expiry, stop, or policy). */
+    'web/approval-settled'(payload: {
+      readonly sessionId: SessionId
+      readonly approvalId: string
+      readonly parentSessionId?: SessionId
     }): void
     /**
      * A turn failed (e.g. a rejected API call) on one session; the reason is
@@ -140,7 +167,25 @@ function BUNDLED_DEFAULT() {
 export type WebEnvelope =
   | { readonly kind: 'snapshot'; readonly events: SessionEvent[] }
   | { readonly kind: 'session'; readonly event: SessionEvent }
-  | { readonly kind: 'approval'; readonly approvalId: string; readonly call: ToolCall; readonly guardWarning?: string }
+  | {
+    readonly kind: 'approval'
+    readonly approvalId: string
+    readonly call: ToolCall
+    /** Dangerous-command guard note shown beside the question. */
+    readonly guardWarning?: string
+    /** True when Always-allow cannot skip future asks (interactive MCP). */
+    readonly interactive?: boolean
+    /** Set when this question belongs to a child of the streamed session. */
+    readonly childSessionId?: string
+    /** The child's agent definition name, alongside `childSessionId`. */
+    readonly definitionName?: string
+    /**
+     * Epoch ms when the question expires undecided. Absent on questions
+     * rebuilt from a log snapshot, which carries no deadline.
+     */
+    readonly expiresAt?: number
+  }
+  | { readonly kind: 'approval-settled'; readonly approvalId: string }
   | { readonly kind: 'error'; readonly message: string }
 
 /** Options for {@link createWebServer}. */
@@ -169,10 +214,20 @@ export interface WebServerOptions {
   readonly activeModel?: { readonly provider?: string; readonly model?: string }
   /** Test seam for durable provider-store writes; production uses atomic saveProviderStore. */
   readonly providerStoreWriter?: (file: string, store: import('./provider-store.ts').ProviderStore) => Promise<void>
-  /** Per-tool approval modes (canonical or legacy names); defaults allow reads, ask on writes and bash. */
-  readonly policy?: Readonly<Record<string, ApprovalMode>>
-  /** Mode for tools the policy map does not name; defaults to `ask`. */
+  /** Test seam for exclusive legacy-policy retirement operations. */
+  readonly policyRetirement?: {
+    readonly copyExclusive?: (source: string, target: string) => Promise<void>
+    readonly unlink?: (file: string) => Promise<void>
+    readonly delay?: (ms: number) => Promise<void>
+  }
+  /** Mode for tools the selected mode's map does not name; defaults to `ask`. */
   readonly defaultMode?: ApprovalMode
+  /**
+   * Answer selected-mode prompts as allow while preserving explicit denies.
+   * Host `blockedTools`, mode exposure, child ceilings, and MCP
+   * `requiresUserInteraction` still apply.
+   */
+  readonly yolo?: boolean
   /** Harness limits override (watchdogs, resource caps, and queue bounds). */
   readonly limits?: Partial<HarnessLimits>
   /** Host-level tool deny patterns (supports `*`); cannot be widened by mode/workspace/child/approval. */
@@ -183,8 +238,24 @@ export interface WebServerOptions {
   readonly staticDir?: string
   /** Port to listen on; `0` (default) picks an ephemeral port. */
   readonly port?: number
-  /** Bind address; defaults to `127.0.0.1`. */
+  /**
+   * Bind address; defaults to `127.0.0.1`. A non-loopback address is refused.
+   * This build has no authenticated TLS profile, so `unsafeNetworkBind` does
+   * not open one. Terminals stay loopback-only.
+   */
   readonly host?: string
+  /**
+   * Local control-plane authentication. Production enables it. Tests leave it
+   * off so existing route suites keep their current contract; an explicit
+   * `true` is what the auth suite and the web bin use. Non-loopback stays
+   * refused either way: this build has no authenticated TLS profile.
+   */
+  readonly controlPlaneAuth?: boolean
+  /**
+   * Ignored. Kept so older callers still type-check. A non-loopback bind is
+   * refused because there is no authenticated TLS profile.
+   */
+  readonly unsafeNetworkBind?: boolean
   /**
    * Extra `Host` header values this server answers to, beyond the loopback
    * literals and its own bind address.
@@ -243,6 +314,7 @@ export interface WebServer {
   readonly url: string
   readonly port: number
   readonly kernel: Kernel
+  readonly auth: ControlPlaneAuthService
   close(): Promise<void>
 }
 
@@ -259,17 +331,77 @@ interface SessionEntry {
 
 interface PendingApproval {
   readonly sessionId: SessionId
+  readonly workspaceId: WorkspaceId
+  /** Browser principal that started the turn, when control-plane auth is on. */
+  readonly principalId?: string
   readonly call: ToolCall
+  readonly parentSessionId?: SessionId
+  /** The asking child's agent definition, when this is a child's question. */
+  readonly definitionName?: string
+  readonly interactive: boolean
+  /** Epoch ms from the policy's own timer — the one deadline the UI shows. */
+  readonly expiresAt: number
+  /** Dangerous-command guard note, replayed on every (re)connect. */
+  readonly guardWarning?: string
   resolve(allow: boolean): void
 }
 
-const DEFAULT_POLICY: Readonly<Record<string, ApprovalMode>> = {
-  Read: 'allow',
-  Glob: 'allow',
-  Grep: 'allow',
-  Write: 'ask',
-  Edit: 'ask',
-  Bash: 'ask',
+/**
+ * Effective permission is the selected mode's own map. `--yolo` answers every
+ * question for the operator; it never lifts an explicit deny, which is a
+ * prohibition rather than a prompt.
+ */
+function effectivePolicy(
+  defaults: Readonly<Record<string, ApprovalMode>>,
+  yolo: boolean,
+): Record<string, ApprovalMode> {
+  if (!yolo) return { ...defaults }
+  return Object.fromEntries(
+    Object.entries(defaults).map(([tool, mode]) => [tool, mode === 'deny' ? 'deny' : 'allow']),
+  )
+}
+
+function toolRequiresInteraction(
+  call: ToolCall,
+  workspaceId: WorkspaceId | undefined,
+  descriptors: ReadonlyMap<string, { readonly requiresUserInteraction?: boolean }>,
+): boolean {
+  if (!call.name.startsWith('mcp__')) return false
+  if (workspaceId === undefined) return true
+  return descriptors.get(`${workspaceId}:${call.name}`)?.requiresUserInteraction === true
+}
+
+/**
+ * Mode failures as HTTP: a stale hash is recoverable by re-reading (409), an
+ * unknown id is 404, and everything else is content the caller must fix.
+ */
+function sendModeError(
+  error: unknown,
+  send: (status: number, body: unknown) => void,
+  fail: (error: unknown) => void,
+): void {
+  if (!(error instanceof ModeError)) {
+    fail(error)
+    return
+  }
+  send(error.code === 'not-found' ? 404 : error.code === 'conflict' ? 409 : 400, { error: error.message })
+}
+
+function approvalEnvelope(approvalId: string, waiting: PendingApproval, viewerSessionId: SessionId): Extract<WebEnvelope, { kind: 'approval' }> {
+  return {
+    kind: 'approval',
+    approvalId,
+    call: waiting.call,
+    expiresAt: waiting.expiresAt,
+    ...(waiting.interactive ? { interactive: true } : {}),
+    ...(waiting.guardWarning !== undefined ? { guardWarning: waiting.guardWarning } : {}),
+    ...(waiting.parentSessionId !== undefined && viewerSessionId === waiting.parentSessionId
+      ? {
+        childSessionId: waiting.sessionId,
+        ...(waiting.definitionName !== undefined ? { definitionName: waiting.definitionName } : {}),
+      }
+      : {}),
+  }
 }
 
 const CONTENT_TYPES: Readonly<Record<string, string>> = {
@@ -288,7 +420,6 @@ const CONTENT_TYPES: Readonly<Record<string, string>> = {
 
 /** The live controls, scoped to one workspace. */
 interface WorkspaceControls {
-  policy: Record<string, ApprovalMode>
   /** The selected mode id (G3, third live control). */
   modeId: string
   /** Bumped on every mode change; manifests record it. */
@@ -323,6 +454,20 @@ function publicProvider(entry: ProviderConfig): PublicProvider {
 
 /** Boot the harness on a kernel and expose it over HTTP. */
 export async function createWebServer(options: WebServerOptions): Promise<WebServer> {
+  const boundHost = options.host ?? '127.0.0.1'
+  const loopbackBind = boundHost === '127.0.0.1' || boundHost === '::1' || boundHost === 'localhost'
+  // Refused before anything is constructed: an unauthenticated API on a
+  // network address is tool execution for anyone who can reach the port, and
+  // the `Host` allowlist is a browser defence only — a direct client sends
+  // whatever `Host` it likes.
+  // There is no authenticated TLS profile in this build. Auth on plain HTTP
+  // does not make a network bind safe, so non-loopback stays refused.
+  if (!loopbackBind) {
+    throw new Error(
+      `refusing to bind '${boundHost}': non-loopback requires a separately configured authenticated TLS profile, which this build does not provide. Keep the bind on loopback.`,
+    )
+  }
+
   const kernel = new Kernel()
   if (options.home !== undefined) {
     kernel.ctx.plugin(fileSessions(options.home))
@@ -340,6 +485,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const workspaces = new WorkspaceService(options.home ?? process.cwd())
   if (options.home !== undefined) {
     await workspaces.boot()
+    for (const ws of workspaces.list({ includeArchived: true })) {
+      await retireWorkspacePolicyFile(workspaces.workspaceDir(ws.id), ws, options.policyRetirement)
+    }
   }
   kernel.ctx.provide('workspaces', workspaces)
   const deniedRoots = options.home !== undefined ? [options.home] : undefined
@@ -363,7 +511,29 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   // G5: MCP servers + hooks, workspace-scoped. Each (workspace, enabled
   // server) gets one McpServerClient; tools register as `mcp__server__tool`.
   const mcpStore = new McpConfigStore(resourceHome)
+  const ownerLock = await DataHomeLock.acquire(resourceHome)
+  const mutations = new MutationStore(resourceHome)
+  await mutations.recover()
+  const mcpGeneration = new Map<string, number>()
+  const configWatch = new Map<string, string>()
+  const drifted = new Set<string>()
+  const generationOf = (workspaceId: string): number => mcpGeneration.get(workspaceId) ?? 1
+  const journals = new Map<string, McpExecutionJournal>()
+  const auditFaultFile = path.join(resourceHome, 'mcp-audit-fault.json')
+  const oauthKeyFile = path.join(resourceHome, 'oauth.master.key')
+  let oauthKey: Buffer
+  try {
+    oauthKey = await fs.readFile(oauthKeyFile)
+    if (oauthKey.length !== 32) throw new Error('oauth master key must be 32 bytes')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    oauthKey = randomBytes(32)
+    await fs.writeFile(oauthKeyFile, oauthKey, { mode: 0o600 })
+  }
+  const oauth = new ManagedOAuth(new OAuthStore(path.join(resourceHome, 'oauth'), oauthKey))
+  const sessionPrincipals = new Map<string, string>()
   const mcpClients = new Map<string, McpServerClient>() // `${wsId}:${server}`
+  const mcpClientGeneration = new Map<string, number>()
   /** Singleton connection promises prevent duplicate processes per workspace/server. */
   const mcpConnecting = new Map<string, Promise<McpServerClient>>()
   /** Disable/close cancellation epochs prevent late connection publication. */
@@ -401,17 +571,13 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
 
   const disposers = new Map<string, () => void>()
 
-  /** Live workspace policy/mode state, lazily initialized on first selection. */
+  /** Live workspace mode state, lazily initialized on first selection. */
   const controls = new Map<WorkspaceId, WorkspaceControls>()
   const controlsFor = (workspaceId: WorkspaceId): WorkspaceControls => {
     let state = controls.get(workspaceId)
     if (state === undefined) {
       const bundledDefault = BUNDLED_DEFAULT()
       state = {
-        // Explicit workspace overrides. In home mode the mode's defaults
-        // govern unless the operator configured a policy; memory mode keeps
-        // the legacy default map for unscoped callers.
-        policy: canonicalPolicy(options.policy ?? (options.home !== undefined ? {} : DEFAULT_POLICY)) as Record<string, ApprovalMode>,
         modeId: DEFAULT_MODE_ID,
         modeRevision: 1,
         modeDefinition: { definition: bundledDefault, source: 'bundled' },
@@ -515,18 +681,48 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     readonly source: 'session' | 'global'
   }
 
-  const resolveEffectiveModel = (session: Session, workspaceId: WorkspaceId, childModelOverride?: string): EffectiveSessionModel => {
+  const resolveEffectiveModel = (session: Session, workspaceId: WorkspaceId): EffectiveSessionModel => {
     const preference = sessionModelOf(session.events)
     // A session/model event is a complete ownership boundary. In particular,
     // snapshot null is an explicit blank — it must never re-inherit a later
-    // global choice. Only a legacy log (hasEvent false) live-inherits global defaults.
+    // global choice. Only a legacy log (hasEvent false) live-inherits global
+    // defaults. A delegated child carries its own stamped event, so the pair
+    // it runs on resolves here like any other session's.
     const provider = preference.hasEvent ? preference.provider : defaults.provider
-    const model = childModelOverride ?? (preference.hasEvent ? preference.model : defaults.model
-)    // Explicit null means configured model default, whereas an omitted field
+    const model = preference.hasEvent ? preference.model : defaults.model
+    // Explicit null means configured model default, whereas an omitted field
     // in a session update intentionally retains its previous value.
     const thinkingLevel = preference.hasEvent ? preference.thinkingLevel : defaults.thinkingLevel
     return { provider, model, thinkingLevel, source: preference.hasEvent ? 'session' : 'global' }
   }
+
+  /**
+   * The pair a delegated child runs on: the caller's choice, else the role's
+   * own `model:`, else the parent conversation's selection. Resolved here and
+   * stamped into the child's log at spawn, so the child never re-inherits a
+   * later global default and a role may name a model that lives on a
+   * different provider than its parent.
+   */
+  const childModelFor = (
+    parent: Session,
+    workspaceId: WorkspaceId,
+    requested?: string,
+    definitionModel?: string,
+  ): ChildModel | undefined =>
+    resolveChildModel(requested, definitionModel, {
+      parent: resolveEffectiveModel(parent, workspaceId),
+      providers: usableIds(),
+      modelsOf: (provider) => kernel.ctx.llm.providerModels(provider),
+      // Provider/model validation already reports what is available; it just
+      // has to reach the caller as a 400/tool failure, not a host error.
+      validate: (provider, model) => {
+        try {
+          validateProviderModel(provider, model)
+        } catch (error) {
+          throw new ChildModelError(String(error instanceof Error ? error.message : error))
+        }
+      },
+    })
 
   // ── per-session entries ──────────────────────────────────────
   const sessions = new Map<SessionId, SessionEntry>()
@@ -865,6 +1061,18 @@ ${decision.injected}`, ...contents]
     kernel.ctx.tools.register(tool)
   }
 
+  // G4 delegation for the model itself. Async by design: one step runs its
+  // tool calls in sequence, so a blocking spawn would serialize children and
+  // the executor's parallel capacity would go unused.
+  kernel.ctx.tools.register(agentTool({
+    definitions: agentDefinitions,
+    executor: childExecutor,
+    session: (sessionId) => scopedSession(sessionId),
+    childModelFor,
+    providers: () => usableIds(),
+    modelsOf: (provider) => kernel.ctx.llm.providerModels(provider),
+  }))
+
   /** Cancel/await an in-flight or connected server, then remove descriptors. */
   async function cancelMcpConnection(workspaceId: WorkspaceId, serverName: string): Promise<void> {
     const key = `${workspaceId}:${serverName}`
@@ -881,19 +1089,125 @@ ${decision.injected}`, ...contents]
     }
   }
 
+  async function journalFor(workspaceId: string): Promise<McpExecutionJournal> {
+    const existing = journals.get(workspaceId)
+    if (existing !== undefined) return existing
+    const journal = new McpExecutionJournal(
+      path.join(resourceHome, 'workspaces', workspaceId, 'mcp', 'executions.jsonl'),
+      () => ownerLock.assertHeld(),
+    )
+    await journal.open()
+    await journal.terminalizeUnresolved()
+    journals.set(workspaceId, journal)
+    return journal
+  }
+
+  async function fenceWorkspace(workspaceId: WorkspaceId): Promise<void> {
+    mcpGeneration.set(workspaceId, generationOf(workspaceId) + 1)
+    for (const key of mcpConnecting.keys()) {
+      if (key.startsWith(`${workspaceId}:`)) mcpCancelled.add(key)
+    }
+    for (const [key, client] of [...mcpClients]) {
+      if (!key.startsWith(`${workspaceId}:`)) continue
+      client.retire()
+      await client.disconnect().catch(() => {})
+      mcpClients.delete(key)
+      mcpClientGeneration.delete(key)
+    }
+  }
+
+  async function commitMcpConfig(workspaceId: WorkspaceId, next: McpConfig): Promise<void> {
+    const target = mcpStore.mcpPath(workspaceId)
+    const backup = await readFileIfPresent(target)
+    const id = await mutations.begin({ mutation: 'config', workspaceId, target, backup })
+    await fenceWorkspace(workspaceId)
+    try {
+      await mcpStore.saveMcp(workspaceId, next)
+      await mutations.commit(id)
+      configWatch.set(workspaceId, await fileDigest(workspaceId))
+      drifted.delete(workspaceId)
+    } catch (error) {
+      await mutations.abort(id)
+      throw error
+    }
+  }
+
+  async function fileDigest(workspaceId: string): Promise<string> {
+    try {
+      const raw = await fs.readFile(mcpStore.mcpPath(workspaceId))
+      return createHash('sha256').update(raw).digest('hex')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'missing'
+      throw error
+    }
+  }
+
+  /** An outside edit of mcp.json fences dispatch until Settings accepts the file. */
+  async function observeConfig(workspaceId: string): Promise<void> {
+    const hash = await fileDigest(workspaceId)
+    const previous = configWatch.get(workspaceId)
+    if (previous !== undefined && previous !== hash) {
+      drifted.add(workspaceId)
+      configWatch.set(workspaceId, hash)
+      await fenceWorkspace(workspaceId as WorkspaceId)
+      return
+    }
+    configWatch.set(workspaceId, hash)
+  }
+
+  async function acknowledgeDrift(workspaceId: string): Promise<void> {
+    configWatch.set(workspaceId, await fileDigest(workspaceId))
+    drifted.delete(workspaceId)
+  }
+
+  async function testMcpServer(workspaceId: WorkspaceId, serverName: string): Promise<readonly string[]> {
+    const config = await mcpStore.loadMcp(workspaceId)
+    const serverConfig = config.servers[serverName]
+    if (serverConfig === undefined) throw new McpConfigError('not-found', `no MCP server '${serverName}'`)
+    if (serverConfig.resourceLimits?.enforcement === 'hard') {
+      const report = await containmentCapability()
+      if (report.level !== 'hard') throw new McpTransportError(report.detail)
+    }
+    const secrets = await mcpStore.loadSecrets(workspaceId)
+    const resolvedEnv: Record<string, string> = {}
+    for (const [key, ref] of Object.entries(serverConfig.env ?? {})) {
+      resolvedEnv[key] = resolveSecretRefs(ref, secrets, `connection test env.${key}`)
+    }
+    const resolvedHeaders: Record<string, string> = {}
+    for (const [key, ref] of Object.entries(serverConfig.headers ?? {})) {
+      resolvedHeaders[key] = resolveSecretRefs(ref, secrets, `connection test header.${key}`)
+    }
+    const secretRef = authSecretRef(serverConfig.auth)
+    const bearerToken = secretRef === undefined ? undefined : resolveSecretRefs(secretRef, secrets, 'connection test auth')
+    const client = new McpServerClient(serverName, serverConfig, { env: resolvedEnv, bearerToken, headers: resolvedHeaders }, () => {})
+    try {
+      const tools = await client.listTools()
+      return tools.map((tool) => tool.name)
+    } finally {
+      await client.disconnect()
+    }
+  }
+
   /**
    * Bring one MCP server up and register its tools (effect-disposed via the
    * registry). A secret reference missing from secrets.json surfaces here.
    */
   async function ensureMcpServer(workspaceId: WorkspaceId, serverName: string): Promise<McpServerClient> {
     const key = `${workspaceId}:${serverName}`
+    const currentGeneration = generationOf(workspaceId)
     const existing = mcpClients.get(key)
-    if (existing !== undefined && existing.state !== 'disabled') return existing
+    if (existing !== undefined && mcpClientGeneration.get(key) !== currentGeneration) {
+      existing.retire()
+      void existing.disconnect()
+      mcpClients.delete(key)
+      mcpClientGeneration.delete(key)
+    } else if (existing !== undefined && existing.state !== 'disabled') return existing
     const inFlight = mcpConnecting.get(key)
     if (inFlight !== undefined) return inFlight
     if (mcpHostClosing || mcpCancelled.has(key)) throw new McpTransportError(`MCP server '${serverName}' connection is cancelled`)
     // Publish the promise synchronously before the first await: exactly one
     // process/HTTP session exists per (workspace, server).
+    const generationAtStart = generationOf(workspaceId)
     const connecting = (async (): Promise<McpServerClient> => {
       let client: McpServerClient | undefined
       try {
@@ -911,32 +1225,45 @@ ${decision.injected}`, ...contents]
         for (const [header, ref] of Object.entries(serverConfig.headers ?? {})) {
           resolvedHeaders[header] = resolveSecretRefs(ref, secrets, `mcp.json server '${serverName}' headers.${header}`)
         }
-        const bearerToken = serverConfig.auth === undefined
+        const secretRef = authSecretRef(serverConfig.auth)
+        const storedToken = serverConfig.auth?.type === 'managed_oauth'
+          ? await oauth.accessToken(workspaceId, serverName)
+          : undefined
+        if (serverConfig.auth?.type === 'managed_oauth' && storedToken === undefined) {
+          throw new McpTransportError(`MCP server '${serverName}' requires managed OAuth authorization`)
+        }
+        const bearerToken = storedToken ?? (secretRef === undefined
           ? undefined
-          : resolveSecretRefs(
-              serverConfig.auth.type === 'bearer' ? serverConfig.auth.token : serverConfig.auth.accessToken,
-              secrets,
-              `mcp.json server '${serverName}' ${serverConfig.auth.type} auth`,
-            )
+          : resolveSecretRefs(secretRef, secrets, `mcp.json server '${serverName}' auth`))
         client = new McpServerClient(serverName, serverConfig, { env: resolvedEnv, bearerToken, headers: resolvedHeaders }, (event) => {
           // Redacted diagnostics: category/server only — no server-returned
           // raw error detail or secret-bearing payload.
           if (event.isError) console.warn(`mcp [${serverName}] ${event.kind}: operation failed`)
         })
+        if (mcpCancelled.has(key) || generationAtStart !== generationOf(workspaceId)) {
+          throw new McpTransportError(`MCP server '${serverName}' connection was cancelled before start`)
+        }
+        mcpClients.set(key, client)
+        mcpClientGeneration.set(key, generationAtStart)
         await client.listTools()
         await reconcileMcpTools(workspaceId, serverName, client)
         client.startHealthChecks(async () => {
           await reconcileMcpTools(workspaceId, serverName, client as McpServerClient)
         })
         const latest = await mcpStore.loadMcp(workspaceId)
-        if (mcpHostClosing || mcpCancelled.has(key) || latest.servers[serverName]?.enabled !== true) {
+        if (mcpHostClosing || mcpCancelled.has(key) || generationAtStart !== generationOf(workspaceId) || latest.servers[serverName]?.enabled !== true) {
           await client.disconnect()
           throw new McpTransportError(`MCP server '${serverName}' connection was cancelled before publication`)
         }
         mcpClients.set(key, client)
+        mcpClientGeneration.set(key, generationAtStart)
         return client
       } catch (error) {
         await client?.disconnect().catch(() => {})
+        if (client !== undefined && mcpClients.get(key) === client) {
+          mcpClients.delete(key)
+          mcpClientGeneration.delete(key)
+        }
         throw error
       } finally {
         mcpConnecting.delete(key)
@@ -946,7 +1273,18 @@ ${decision.injected}`, ...contents]
     return connecting
   }
 
-  /** Register `mcp__server__tool` tools through the effect-disposed seam. */
+  
+/**
+ * An omitted or empty allowedTools list exposes every tool the server
+ * discovered. A non-empty list is an exposure filter, not a permission grant.
+ * Names may be the server tool or the public mcp__server__tool name.
+ */
+function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string, fullName: string): boolean {
+  if (allowed === undefined || allowed.length === 0) return true
+  return allowed.includes(toolName) || allowed.includes(fullName)
+}
+
+/** Register `mcp__server__tool` tools through the effect-disposed seam. */
   async function reconcileMcpTools(workspaceId: WorkspaceId, serverName: string, client: McpServerClient): Promise<void> {
     const config = await mcpStore.loadMcp(workspaceId)
     const serverConfig: McpServerConfig | undefined = config.servers[serverName]
@@ -968,10 +1306,10 @@ ${decision.injected}`, ...contents]
       if (RESERVED_TOOL_NAMES.has(fullName) || RESERVED_TOOL_NAMES.has(tool.name)) {
         throw new McpConfigError('reserved-name', `tool name '${fullName}' collides with a reserved built-in identity`)
       }
-      if (allowed !== undefined && !allowed.includes(tool.name) && !allowed.includes(fullName)) continue
-      // Server annotation: interaction always asks; readOnlyHint is display
-      // only and NEVER drives auto-allow.
-      if (tool.requiresUserInteraction === true) controlsFor(workspaceId).policy[fullName] = 'ask'
+      if (!mcpToolExposed(allowed, tool.name, fullName)) continue
+      // Server annotation: interaction always asks via forceAsk; readOnlyHint
+      // is display only and NEVER drives auto-allow. Do not write into the
+      // workspace override map — that would fight Always-allow and persist.
       mcpDescriptors.set(`${workspaceId}:${fullName}`, tool)
       if (mcpRegistered.has(fullName)) continue
       mcpRegistered.add(fullName)
@@ -998,49 +1336,63 @@ ${decision.injected}`, ...contents]
           // Absolute workspace isolation: resolve the client from the
           // CURRENT immutable execution workspace, never the workspace that
           // first registered this public schema.
+          await observeConfig(scope.workspaceId)
+          if (drifted.has(scope.workspaceId)) {
+            throw new Error(`MCP config for this workspace changed outside Settings. Reload it before calling tools.`)
+          }
           const scopedConfig = await mcpStore.loadMcp(scope.workspaceId)
           const scopedServer = scopedConfig.servers[serverName]
           if (scopedServer === undefined || !scopedServer.enabled) {
             throw new Error(`MCP server '${serverName}' is not enabled in this workspace`)
           }
           const allowedHere = scopedServer.allowedTools
-          if (allowedHere !== undefined && !allowedHere.includes(tool.name) && !allowedHere.includes(fullName)) {
+          if (!mcpToolExposed(allowedHere, tool.name, fullName)) {
             throw new Error(`MCP tool '${fullName}' is not exposed in this workspace`)
           }
           const scopedClient = await ensureMcpServer(scope.workspaceId, serverName)
           const timeoutMs = scopedServer.timeoutMs ?? 15_000
           const started = Date.now()
-          const audit = async (resultText: string, isError: boolean): Promise<void> => {
-            const session = depsRef.current?.sessions.get(scope.sessionId)?.session
-            if (session === undefined) return
+          const invocationId = exec.toolCallId && exec.toolCallId !== '' ? exec.toolCallId : randomUUID()
+          const journal = await journalFor(scope.workspaceId)
+          const dispatched = await dispatchToolCall({
+            journal,
+            intent: {
+              invocationId,
+              workspaceId: scope.workspaceId,
+              server: serverName,
+              tool: tool.name,
+              argsHash: auditHash(args),
+              generation: generationOf(scope.workspaceId),
+              epoch: ownerLock.epoch,
+              configRevision: scopedConfig.revision ?? 1,
+              secretRevision: 1,
+            },
+            call: async () => {
+              const result = await scopedClient.callTool(tool.name, args, timeoutMs, exec.signal)
+              const text = JSON.stringify(result.content) ?? ''
+              return { text, isError: result.isError }
+            },
+          }, auditFaultFile)
+          const text = dispatched.output.length > 60_000
+            ? `${dispatched.output.slice(0, 60_000)}\n… [truncated ${dispatched.output.length - 60_000} chars]`
+            : dispatched.output
+          const session = depsRef.current?.sessions.get(scope.sessionId)?.session
+          if (session !== undefined) {
             session.append({
               type: 'mcp/call',
               server: serverName,
               tool: tool.name,
               argsHash: auditHash(args),
-              resultHash: auditHash(resultText),
+              resultHash: auditHash(text),
               durationMs: Date.now() - started,
-              isError,
+              isError: dispatched.outcome !== 'success',
             })
-            await session.durable()
+            await session.durable().catch(() => undefined)
           }
-          let audited = false
-          try {
-            const result = await scopedClient.callTool(tool.name, args, timeoutMs, exec.signal)
-            const text = JSON.stringify(result.content) ?? ''
-            await audit(text, result.isError)
-            audited = true
-            if (result.isError) throw new Error('MCP server returned isError')
-            return text.length > 60_000
-              ? `${text.slice(0, 60_000)}
-… [truncated ${text.length - 60_000} chars]`
-              : text
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error)
-            if (!audited) await audit(message, true).catch(() => {})
-            // Throw through ToolsService so the durable ToolResult has ok=false.
-            throw new Error(`MCP call failed: ${message}`)
+          if (exec.toolCallId !== undefined && exec.toolCallId !== '') {
+            stageMcpOutcome(exec.toolCallId, { outcome: dispatched.outcome, invocationId, ok: dispatched.outcome === 'success' })
           }
+          return text
         },
       })
     }
@@ -1077,6 +1429,7 @@ ${decision.injected}`, ...contents]
     state.modeId = modeId
     state.modeDefinition = resolved
     state.modeRevision += 1
+    kernel.ctx.tools.bumpPolicyRevision()
     return resolved
   }
 
@@ -1111,14 +1464,19 @@ ${decision.injected}`, ...contents]
         const serverName = parts[1] ?? ''
         const toolName = parts.slice(2).join('__')
         const config = await mcpStore.loadMcp(scope.workspaceId)
-        const allowed = config.servers[serverName]?.allowedTools ?? []
+        const allowed = config.servers[serverName]?.allowedTools
         const readSafe = /^(read|get|list|search|query|fetch|inspect|describe)/i.test(toolName)
-        if (!readSafe || (!allowed.includes(payload.call.name) && !allowed.includes(toolName))) {
+        if (!readSafe || !mcpToolExposed(allowed, toolName, payload.call.name)) {
           return { kind: 'deny', reason: `mode 'Plan' does not expose MCP tool '${payload.call.name}' without a read-safe allowlist entry` }
         }
       }
     } else if (!mode.definition.toolExposure.includes(payload.call.name)) {
       return { kind: 'deny', reason: `mode '${mode.definition.name}' does not expose '${payload.call.name}'` }
+    }
+    // G4 one level: delegation is denied to a child before any ceiling or
+    // approval is consulted, whatever its definition happens to list.
+    if (scope.childOf !== undefined && payload.call.name === 'Agent') {
+      return { kind: 'deny', reason: 'one-level delegation: a child agent cannot delegate' }
     }
     // G4 child ceiling: definition ∩ spawn grant narrows the mode's
     // exposure. A child can never gain a tool its definition lacks — even
@@ -1178,8 +1536,8 @@ ${decision.injected}`, ...contents]
   }
 
   // G3 single assembly path: the mode-driven builder replaces the projected
-  // request wholesale. Effective permission = mode defaults overlaid by
-  // explicit workspace policy (host restrictions stay above both).
+  // request wholesale. Effective permission is the selected mode's map; host
+  // restrictions stay above it.
   kernel.ctx.on('agent/context', async (projected, next) => {
     const scope = agentScope.getStore()
     const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
@@ -1187,7 +1545,7 @@ ${decision.injected}`, ...contents]
     const session = await scopedSession(scope?.sessionId)
     const effective = session === undefined
       ? { provider: defaults.provider, model: defaults.model, thinkingLevel: defaults.thinkingLevel, source: 'global' as const }
-      : resolveEffectiveModel(session, workspaceId, scope?.childOf?.modelOverride)
+      : resolveEffectiveModel(session, workspaceId)
     const mode = modeOf(workspaceId)
 
     // Budget from the CURRENT (provider, model) pair: an operator context
@@ -1219,8 +1577,7 @@ ${decision.injected}`, ...contents]
       const toolName = parts.slice(2).join('__')
       const server = workspaceMcpConfig.servers[serverName]
       if (server === undefined || !server.enabled) return false
-      const allowlist = server.allowedTools
-      if (allowlist !== undefined && !allowlist.includes(toolName) && !allowlist.includes(schema.name)) return false
+      if (!mcpToolExposed(server.allowedTools, toolName, schema.name)) return false
       if (mode.definition.id === 'chat') return false
       if (scope?.childOf?.definition === 'explorer') return false
       if (scope?.childOf !== undefined && !scope.childOf.toolCeiling.includes(schema.name)) return false
@@ -1329,8 +1686,8 @@ ${decision.injected}`, ...contents]
     const state = controlsFor(workspaceId)
     const session = await scopedSession(scope?.sessionId)
     const effective = session === undefined
-      ? { provider: defaults.provider, model: scope?.childOf?.modelOverride ?? defaults.model, thinkingLevel: defaults.thinkingLevel }
-      : resolveEffectiveModel(session, workspaceId, scope?.childOf?.modelOverride)
+      ? { provider: defaults.provider, model: defaults.model, thinkingLevel: defaults.thinkingLevel }
+      : resolveEffectiveModel(session, workspaceId)
     const model = effective.model ?? undefined
     const provider = effective.provider ?? undefined
     if (provider !== undefined && model !== undefined) validateProviderModel(provider, model)
@@ -1363,24 +1720,19 @@ ${decision.injected}`, ...contents]
 
   const approvalHandle: ApprovalHandle = attachApproval(kernel.ctx, {
     // Live permission control, scoped to the executing turn's workspace.
-    // Effective = the mode's defaults overlaid by explicit workspace
-    // overrides; host restrictions sit above both and the mode's tool
-    // exposure ceiling is enforced separately at the gate.
+    // The selected mode is the single policy source; host restrictions and the
+    // mode's exposure ceiling are enforced separately at the gate.
     policy: () => {
       const scope = agentScope.getStore()
       const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
       const state = controlsFor(workspaceId)
-      return { ...state.modeDefinition.definition.permissionDefaults, ...state.policy }
+      return effectivePolicy(state.modeDefinition.definition.permissionDefaults, options.yolo === true)
     },
     defaultMode: options.defaultMode ?? 'ask',
     expiryMs: limits.approvalExpiryMs,
-    forceAsk: (call) => {
-      if (dangerousGuard.getMatch(call)?.action === 'ask') return true
-      if (!call.name.startsWith('mcp__')) return false
-      const scope = agentScope.getStore()
-      if (scope?.workspaceId === undefined) return true
-      return mcpDescriptors.get(`${scope.workspaceId}:${call.name}`)?.requiresUserInteraction === true
-    },
+    forceAsk: (call) =>
+      dangerousGuard.getMatch(call)?.action === 'ask' ||
+      toolRequiresInteraction(call, agentScope.getStore()?.workspaceId, mcpDescriptors),
     askUser: (call, lifecycle) =>
       new Promise<boolean>((resolve) => {
         const scope = agentScope.getStore()
@@ -1396,14 +1748,44 @@ ${decision.injected}`, ...contents]
         const guardWarning = guardMatch?.action === 'ask'
           ? `Dangerous Commands: matched ${guardMatch.presetId ?? guardMatch.ruleId ?? 'rule'} — ${guardMatch.reason}`
           : undefined
-        pending.set(approvalId, { sessionId: scope.sessionId, call, resolve })
+        const workspaceId = (scope.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)) as WorkspaceId
+        const interactive = toolRequiresInteraction(call, scope.workspaceId, mcpDescriptors)
+        const parentSessionId = scope.childOf?.parentSessionId
+        const definitionName = scope.childOf?.definition
+        const principalId = sessionPrincipals.get(scope.sessionId)
+        pending.set(approvalId, {
+          sessionId: scope.sessionId,
+          workspaceId,
+          ...(principalId !== undefined ? { principalId } : {}),
+          call,
+          interactive,
+          expiresAt: lifecycle.expiresAt,
+          ...(parentSessionId !== undefined ? { parentSessionId } : {}),
+          ...(definitionName !== undefined ? { definitionName } : {}),
+          ...(guardWarning !== undefined ? { guardWarning } : {}),
+          resolve,
+        })
         // Expiry, stop, or a policy change settles the approval without an
         // answer: retire the question so reconnects never replay it and a
         // late POST /api/approvals gets the truthful 404.
         void lifecycle.done.then(() => {
           if (pending.delete(approvalId)) resolve(false)
+          kernel.ctx.emit('web/approval-settled', {
+            sessionId: scope.sessionId,
+            approvalId,
+            ...(parentSessionId !== undefined ? { parentSessionId } : {}),
+          })
         })
-        kernel.ctx.emit('web/approval', { sessionId: scope.sessionId, approvalId, call, ...(guardWarning !== undefined ? { guardWarning } : {}) })
+        kernel.ctx.emit('web/approval', {
+          sessionId: scope.sessionId,
+          approvalId,
+          call,
+          expiresAt: lifecycle.expiresAt,
+          ...(parentSessionId !== undefined ? { parentSessionId } : {}),
+          ...(definitionName !== undefined ? { definitionName } : {}),
+          ...(interactive ? { interactive: true } : {}),
+          ...(guardWarning !== undefined ? { guardWarning } : {}),
+        })
       }),
   })
 
@@ -1464,8 +1846,6 @@ ${decision.injected}`, ...contents]
   // and a terminal reporting its cwd as "." tells a client nothing about where
   // the shell actually opened.
   const terminalDefaultCwd = path.resolve(options.terminals?.defaultCwd ?? options.root ?? process.cwd())
-  const boundHost = options.host ?? '127.0.0.1'
-  const terminalsLoopback = boundHost === '127.0.0.1' || boundHost === '::1' || boundHost === 'localhost'
   // The names this server answers to. A `Host` outside this set is refused
   // before routing, which is what actually stops a rebound DNS name from
   // reaching these APIs from a page the user merely visited.
@@ -1474,6 +1854,14 @@ ${decision.injected}`, ...contents]
       value.trim().toLowerCase(),
     ),
   )
+
+  const containment = await containmentCapability()
+  const liveStreams: { principalId: string | undefined; close: () => void }[] = []
+  const closeStreamsFor = (principalId: string): void => {
+    for (const stream of [...liveStreams]) {
+      if (stream.principalId === principalId) stream.close()
+    }
+  }
 
   const deps: HandlerDeps = {
     kernel,
@@ -1484,6 +1872,7 @@ ${decision.injected}`, ...contents]
     limits,
     approvalHandle,
     dangerousGuard,
+    yolo: options.yolo === true,
     workspaces,
     controls,
     controlsFor,
@@ -1502,6 +1891,7 @@ ${decision.injected}`, ...contents]
     adoptMode,
     agentDefinitions,
     childExecutor,
+    childModelFor,
     mcpStore,
     mcpClients,
     mcpDescriptors,
@@ -1518,9 +1908,34 @@ ${decision.injected}`, ...contents]
     publicSummary: () => list.map(publicProvider),
     terminals,
     terminalsEnabled,
-    terminalsLoopback,
+    terminalsLoopback: loopbackBind,
     terminalDefaultCwd,
     allowedHosts,
+    auth: new ControlPlaneAuthService({
+      enabled: options.controlPlaneAuth === true,
+      canonicalOrigin: 'http://127.0.0.1',
+    }),
+    commitMcpConfig,
+    sessionPrincipals,
+    oauth,
+    generationOf,
+    fenceWorkspace,
+    closeStreamsFor,
+    liveStreams,
+    containmentDetail: containment.detail,
+    auditFaultFile,
+    observeConfig,
+    acknowledgeDrift,
+    testMcpServer,
+    isDrifted: (workspaceId: string) => drifted.has(workspaceId),
+    repairAudit: async (workspaceId: string) => {
+      const journal = journals.get(workspaceId)
+      if (journal?.faulted === true) {
+        return { ok: false as const, error: 'execution journal is still faulted; repair the file before clearing the audit block' }
+      }
+      await clearAuditFault(auditFaultFile)
+      return { ok: true as const }
+    },
   }
   depsRef.current = deps
 
@@ -1544,6 +1959,7 @@ ${decision.injected}`, ...contents]
     for (const dispose of disposers.values()) dispose()
     disposers.clear()
     await kernel.stop()
+    await ownerLock.release()
     throw new Error('web: unexpected listen address')
   }
 
@@ -1557,10 +1973,14 @@ ${decision.injected}`, ...contents]
     if (recovered > 0) console.log(`web: recovered ${recovered} child relationship(s) from storage`)
   }
 
+  const publicHost = options.host ?? '127.0.0.1'
+  deps.auth.bindOrigin(`http://${publicHost}:${address.port}`)
+
   return {
-    url: `http://${options.host ?? '127.0.0.1'}:${address.port}`,
+    url: `http://${publicHost}:${address.port}`,
     port: address.port,
     kernel,
+    auth: deps.auth,
     close: async () => {
       mcpHostClosing = true
       for (const key of mcpConnecting.keys()) mcpCancelled.add(key)
@@ -1575,6 +1995,7 @@ ${decision.injected}`, ...contents]
       await new Promise<void>((resolve) => server.close(() => resolve()))
       for (const client of mcpClients.values()) await client.disconnect()
       mcpClients.clear()
+      await ownerLock.release()
       for (const dispose of disposers.values()) dispose()
       disposers.clear()
       await kernel.stop()
@@ -1591,6 +2012,7 @@ interface HandlerDeps {
   readonly limits: HarnessLimits
   readonly approvalHandle: ApprovalHandle
   readonly dangerousGuard: ReturnType<typeof attachDangerousCommandGuard>
+  readonly yolo: boolean
   readonly workspaces: WorkspaceService
   readonly controls: Map<WorkspaceId, WorkspaceControls>
   readonly controlsFor: (workspaceId: WorkspaceId) => WorkspaceControls
@@ -1613,6 +2035,13 @@ interface HandlerDeps {
   readonly adoptMode: (workspaceId: WorkspaceId, modeId: string) => Promise<ResolvedMode>
   readonly agentDefinitions: AgentDefinitionService
   readonly childExecutor: ChildExecutor
+  /** Resolves a child's pair: spawn choice > role definition > parent session. */
+  readonly childModelFor: (
+    parent: Session,
+    workspaceId: WorkspaceId,
+    requested?: string,
+    definitionModel?: string,
+  ) => ChildModel | undefined
   readonly mcpStore: McpConfigStore
   readonly mcpClients: Map<string, McpServerClient>
   readonly mcpDescriptors: Map<string, McpToolDescriptor>
@@ -1633,6 +2062,45 @@ interface HandlerDeps {
   readonly terminalsLoopback: boolean
   readonly terminalDefaultCwd: string
   readonly allowedHosts: ReadonlySet<string>
+  readonly auth: ControlPlaneAuthService
+  readonly commitMcpConfig: (workspaceId: WorkspaceId, next: McpConfig) => Promise<void>
+  readonly sessionPrincipals: Map<string, string>
+  readonly oauth: ManagedOAuth
+  readonly generationOf: (workspaceId: string) => number
+  readonly fenceWorkspace: (workspaceId: WorkspaceId) => Promise<void>
+  readonly closeStreamsFor: (principalId: string) => void
+  readonly liveStreams: { principalId: string | undefined; close: () => void }[]
+  readonly containmentDetail: string
+  readonly auditFaultFile: string
+  readonly observeConfig: (workspaceId: string) => Promise<void>
+  readonly acknowledgeDrift: (workspaceId: string) => Promise<void>
+  readonly testMcpServer: (workspaceId: WorkspaceId, serverName: string) => Promise<readonly string[]>
+  readonly isDrifted: (workspaceId: string) => boolean
+  readonly repairAudit: (workspaceId: string) => Promise<{ ok: true } | { ok: false; error: string }>
+}
+
+/**
+ * Cross-site write defence: a foreign page cannot READ our responses, but a
+ * `text/plain` POST is not preflighted, so without this check any site the
+ * user visits can drive the state-changing routes blind. Browsers send
+ * `Origin` on every unsafe method, so an origin whose `host:port` is not
+ * this server's is refused; a missing `Origin` (curl, tests, the CLI) is
+ * left alone, and `null` (opaque origin) is refused.
+ */
+function crossSiteWrite(req: IncomingMessage): boolean {
+  if (req.method === undefined || req.method === 'GET' || req.method === 'HEAD') return false
+  const origin = req.headers.origin
+  if (origin === undefined || origin === '') return false
+  if (origin === 'null') return true
+  try {
+    const presented = new URL(origin)
+    const host = (req.headers.host ?? '').trim().toLowerCase()
+    // `Host` may omit the port when it is the scheme default. Compare both
+    // forms so a canonical origin is not refused for a cosmetic mismatch.
+    return presented.host.toLowerCase() !== host && presented.hostname.toLowerCase() !== host
+  } catch {
+    return true
+  }
 }
 
 /** The hostname part of a `Host` header, lowercased, with the port and any IPv6 brackets removed. */
@@ -1665,6 +2133,44 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: HandlerDe
     return
   }
 
+  if (crossSiteWrite(req)) {
+    res.writeHead(403, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: 'cross-site request refused: this API only accepts writes from its own page' }))
+    return
+  }
+
+  if (pathname === '/api/health' || pathname === '/api/auth/state' || pathname === '/api/auth/pair' || pathname === '/api/auth/logout') {
+    await handleAuth(req, res, pathname, deps)
+    return
+  }
+
+  if ((pathname === '/api/mcp/oauth/callback') && (req.method === 'GET' || req.method === 'POST')) {
+    await handleOAuthDeposit(req, res, deps)
+    return
+  }
+
+  if (pathname.startsWith('/api/') && deps.auth.enabled && !isPublicPath(pathname, req.method ?? 'GET')) {
+    const decision = deps.auth.authenticate(req.headers, req.method ?? 'GET')
+    if (!decision.ok) {
+      res.writeHead(decision.status, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+      res.end(JSON.stringify({ error: decision.reason }))
+      return
+    }
+    if (decision.principal.kind === 'bearer' && !bearerAllows(pathname, decision.principal.scopes)) {
+      res.writeHead(403, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+      res.end(JSON.stringify({ error: 'bearer token does not include this scope' }))
+      return
+    }
+    ;(req as IncomingMessage & { miniDshPrincipalId?: string; miniDshGeneration?: number }).miniDshPrincipalId = decision.principal.id
+    ;(req as IncomingMessage & { miniDshGeneration?: number }).miniDshGeneration = decision.principal.generation
+    const generation = req.headers['last-event-id']
+    if (typeof generation === 'string' && generation.startsWith('gen=') && generation.slice(4) !== String(decision.principal.generation)) {
+      res.writeHead(401, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+      res.end(JSON.stringify({ error: 'session generation was revoked' }))
+      return
+    }
+  }
+
   if (pathname.startsWith('/api/')) {
     await handleApi(req, res, pathname, deps, url.searchParams)
     return
@@ -1675,6 +2181,92 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: HandlerDe
   }
   res.writeHead(405, { 'content-type': 'application/json' })
   res.end(JSON.stringify({ error: 'method not allowed' }))
+}
+
+/**
+ * Pairing and session lifecycle. `/api/auth/pair` is public and accepts only a
+ * JSON body: no cookie is read, no query string is honored, and the response
+ * is not cacheable. A redeemed code sets the session cookie.
+ */
+async function handleOAuthDeposit(req: IncomingMessage, res: ServerResponse, deps: HandlerDeps): Promise<void> {
+  const send = (status: number, body: string): void => {
+    res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
+    res.end(body)
+  }
+  try {
+    let state = ''
+    let code = ''
+    if (req.method === 'GET') {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+      state = url.searchParams.get('state') ?? ''
+      code = url.searchParams.get('code') ?? ''
+    } else {
+      const body = await readJson(req)
+      state = typeof body['state'] === 'string' ? body['state'] : ''
+      code = typeof body['code'] === 'string' ? body['code'] : ''
+    }
+    await deps.oauth.deposit(state, code)
+    send(200, 'Authorization code received. Return to mini-dsh and finish connecting the server.')
+  } catch {
+    send(400, 'Authorization callback was rejected.')
+  }
+}
+
+async function handleAuth(req: IncomingMessage, res: ServerResponse, pathname: string, deps: HandlerDeps): Promise<void> {
+  const send = (status: number, body: unknown, extra?: Record<string, string>): void => {
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store', ...extra })
+    res.end(JSON.stringify(body))
+  }
+  if (pathname === '/api/health' && req.method === 'GET') {
+    send(200, { ok: true })
+    return
+  }
+  if (pathname === '/api/auth/state' && req.method === 'GET') {
+    send(200, { required: deps.auth.enabled, paired: !deps.auth.enabled || !deps.auth.pairingPending })
+    return
+  }
+  if (pathname === '/api/auth/pair' && req.method === 'POST') {
+    if (!deps.auth.enabled) {
+      send(404, { error: 'control-plane authentication is not enabled' })
+      return
+    }
+    if (req.headers.cookie !== undefined || new URL(req.url ?? '/', 'http://localhost').search !== '') {
+      send(400, { error: 'pairing accepts only a JSON body' })
+      return
+    }
+    const body = await readJson(req)
+    const code = body['code']
+    if (typeof code !== 'string' || code === '') {
+      send(400, { error: 'pairing requires a code' })
+      return
+    }
+    const redeemed = deps.auth.redeemPairingCode(code)
+    if (!redeemed.ok) {
+      send(redeemed.status, { error: redeemed.reason })
+      return
+    }
+    send(200, { csrf: redeemed.csrf }, { 'set-cookie': deps.auth.cookieHeader(redeemed.sessionId) })
+    return
+  }
+  if (pathname === '/api/auth/logout' && req.method === 'POST') {
+    const decision = deps.auth.authenticate(req.headers, 'POST')
+    if (!decision.ok) {
+      send(decision.status, { error: decision.reason })
+      return
+    }
+    if (decision.principal.kind === 'browser') deps.auth.revokeBrowserSession(decision.principal.id)
+    else deps.auth.revokeBearer(decision.principal.id)
+    deps.closeStreamsFor(decision.principal.id)
+    for (const [approvalId, waiting] of deps.pending) {
+      if (waiting.principalId === decision.principal.id) {
+        deps.pending.delete(approvalId)
+        waiting.resolve(false)
+      }
+    }
+    send(200, { revoked: true }, { 'set-cookie': `${SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0` })
+    return
+  }
+  send(404, { error: 'no such auth route' })
 }
 
 async function handleApi(
@@ -1711,8 +2303,7 @@ async function handleApi(
             if (entry.agent.busy) running += 1
           }
           for (const waiting of deps.pending.values()) {
-            const owner = deps.sessions.get(waiting.sessionId)
-            if (owner?.workspaceId === ws.id) approvals += 1
+            if (waiting.workspaceId === ws.id) approvals += 1
           }
           return { ...ws, running, approvals, default: deps.workspaces.defaultWorkspace === ws.id }
         })
@@ -1898,12 +2489,12 @@ async function handleApi(
         }
         if (req.method === 'PATCH') {
           const body = await readJson(req)
-          const outcome = await renameSession(entry, body['title'], deps)
+          const outcome = await patchSession(entry, body, deps)
           if (!outcome.ok) {
             send(outcome.status, { error: outcome.error })
             return
           }
-          send(200, { id: entry.session.id, title: outcome.title })
+          send(200, outcome.payload)
           return
         }
         send(405, { error: 'method not allowed' })
@@ -1987,15 +2578,26 @@ async function handleApi(
             definition: resolved.definition,
             packet: task,
           }
+          const model = deps.childModelFor(
+            parent.session,
+            wsId,
+            typeof body['model'] === 'string' ? body['model'] : undefined,
+            resolved.definition.model,
+          )
           const handle = await deps.childExecutor.spawn({
             ...spawnRequest,
             ...(parent.projectId !== undefined ? { projectId: parent.projectId } : {}),
             ...(Array.isArray(body['grantTools']) ? { grantTools: (body['grantTools'] as unknown[]).map(String) } : {}),
+            ...(model !== undefined ? { model } : {}),
           })
           send(202, handle)
         } catch (error) {
           if (error instanceof SpawnError) {
             send(error.code === 'capacity' ? 429 : 404, { error: error.message })
+            return
+          }
+          if (error instanceof ChildModelError) {
+            send(400, { error: error.message })
             return
           }
           if (error instanceof AgentDefinitionError) {
@@ -2057,7 +2659,9 @@ async function handleApi(
         }
         if (!isCancel && req.method === 'GET') {
           const waitRaw = Number(query.get('waitMs') ?? '30000')
-          const handle = await deps.childExecutor.wait(wsId, childId, Number.isFinite(waitRaw) ? Math.min(waitRaw, 120_000) : 30_000)
+          const [handle] = await deps.childExecutor.wait(wsId, [childId], {
+            timeoutMs: Number.isFinite(waitRaw) ? Math.min(waitRaw, 120_000) : 30_000,
+          })
           if (handle === undefined) {
             send(404, { error: 'no such child' })
             return
@@ -2128,6 +2732,50 @@ async function handleApi(
     }
 
     // ── G5 MCP/hook management routes ────────────────────────
+    const oauthMatch = /^\/api\/workspaces\/([^/]+)\/mcp\/([^/]+)\/oauth\/(begin|complete|revoke)$/.exec(pathname)
+    if (oauthMatch !== null && req.method === 'POST') {
+      const wsId = decodeURIComponent(oauthMatch[1] ?? '') as WorkspaceId
+      const serverName = decodeURIComponent(oauthMatch[2] ?? '')
+      const action = oauthMatch[3]
+      requireWorkspace(deps, wsId, true)
+      const principalId = (req as IncomingMessage & { miniDshPrincipalId?: string }).miniDshPrincipalId ?? 'local'
+      const body = await readJson(req)
+      try {
+        if (action === 'begin') {
+          const scopes = Array.isArray(body['scopes']) ? body['scopes'].filter((item): item is string => typeof item === 'string') : []
+          const started = await deps.oauth.begin({
+            workspaceId: wsId,
+            server: serverName,
+            principalId,
+            resource: String(body['resource'] ?? ''),
+            authorizationEndpoint: String(body['authorizationEndpoint'] ?? ''),
+            tokenEndpoint: String(body['tokenEndpoint'] ?? ''),
+            clientId: String(body['clientId'] ?? ''),
+            redirectUri: String(body['redirectUri'] ?? ''),
+            scopes,
+          })
+          send(200, { authorizationUrl: started.authorizationUrl })
+          return
+        }
+        if (action === 'complete') {
+          await deps.oauth.complete({
+            state: String(body['state'] ?? ''),
+            principalId,
+            workspaceId: wsId,
+            server: serverName,
+          })
+          send(200, { connected: true })
+          return
+        }
+        await deps.fenceWorkspace(wsId)
+        const revoked = await deps.oauth.revoke(wsId, serverName, typeof body['revocationEndpoint'] === 'string' ? body['revocationEndpoint'] : undefined)
+        send(200, revoked)
+      } catch (error) {
+        send(400, { error: error instanceof Error ? error.message : String(error) })
+      }
+      return
+    }
+
     const wsMcpImportMatch = /^\/api\/workspaces\/([^/]+)\/mcp\/import$/.exec(pathname)
     if (wsMcpImportMatch !== null && req.method === 'POST') {
       const wsId = decodeURIComponent(wsMcpImportMatch[1] ?? '') as WorkspaceId
@@ -2144,11 +2792,11 @@ async function handleApi(
           ? importCodexMcp(content, typeof body['sourceVersion'] === 'string' ? body['sourceVersion'] : '')
           : importClaudeMcp(content)
         const existing = await deps.mcpStore.loadMcp(wsId)
-        const merged = parseMcpConfig(JSON.stringify({
-          version: 1,
-          servers: { ...JSON.parse(JSON.stringify(existing.servers)), ...JSON.parse(JSON.stringify(imported.servers)) },
-        }))
-        await deps.mcpStore.saveMcp(wsId, merged)
+        let merged = existing
+        for (const [name, server] of Object.entries(imported.servers)) {
+          merged = upsertServer(merged, name, { ...server, enabled: false })
+        }
+        await deps.commitMcpConfig(wsId, merged)
         send(201, {
           imported: Object.keys(imported.servers),
           enabled: [],
@@ -2165,7 +2813,27 @@ async function handleApi(
       return
     }
 
-    const wsMcpMatch = /^\/api\/workspaces\/([^/]+)\/mcp(?:\/([^/]+)(?:\/(enable|disable|reconnect))?)?$/.exec(pathname)
+    const mcpOps = /^\/api\/workspaces\/([^/]+)\/mcp\/(audit-repair|acknowledge-drift)$/.exec(pathname)
+    if (mcpOps !== null && req.method === 'POST') {
+      const wsId = decodeURIComponent(mcpOps[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, true)
+      const op = mcpOps[2]
+      if (op === 'acknowledge-drift') {
+        await deps.acknowledgeDrift(wsId)
+        const config = await deps.mcpStore.loadMcp(wsId)
+        send(200, { stale: false, revision: configRevision(config) })
+        return
+      }
+      const repaired = await deps.repairAudit(wsId)
+      if (!repaired.ok) {
+        send(409, { error: repaired.error })
+        return
+      }
+      send(200, { cleared: true })
+      return
+    }
+
+    const wsMcpMatch = /^\/api\/workspaces\/([^/]+)\/mcp(?:\/([^/]+)(?:\/(enable|disable|reconnect|test))?)?$/.exec(pathname)
     if (wsMcpMatch !== null) {
       const wsId = decodeURIComponent(wsMcpMatch[1] ?? '') as WorkspaceId
       requireWorkspace(deps, wsId, false)
@@ -2173,16 +2841,29 @@ async function handleApi(
       const action = wsMcpMatch[3]
       try {
         if (req.method === 'GET' && serverName === undefined) {
+          await deps.observeConfig(wsId)
           const config = await deps.mcpStore.loadMcp(wsId)
+          const revision = configRevision(config)
+          const auditFault = await faultIsOpen(deps.auditFaultFile)
           const rows = []
           for (const server of Object.values(config.servers)) {
             const client = deps.mcpClients.get(`${wsId}:${server.name}`)
+            const discovered = (client?.cachedTools() ?? []).map((tool) => tool.name)
+            const unmatchedAllowlist = (server.allowedTools ?? []).filter((name) => !name.includes('*') && !discovered.includes(name))
             rows.push({
               name: server.name,
               transport: server.transport,
               enabled: server.enabled,
               status: !server.enabled ? 'disabled' : client?.state ?? 'connecting',
               breakerOpenUntil: client !== undefined && client.breakerOpenUntil > Date.now() ? client.breakerOpenUntil : null,
+              containment: deps.containmentDetail,
+              generation: deps.generationOf(wsId),
+              auditFault,
+              revision,
+              stale: deps.isDrifted(wsId),
+              discoveredTools: discovered,
+              ...(server.allowedTools !== undefined ? { allowedTools: server.allowedTools } : {}),
+              unmatchedAllowlist,
             })
           }
           send(200, rows)
@@ -2206,11 +2887,9 @@ async function handleApi(
             send(404, { error: `no MCP server '${serverName}'` })
             return
           }
-          const { [serverName]: _removed, ...servers } = JSON.parse(JSON.stringify(config.servers)) as Record<string, unknown>
-          void _removed
           // Stop the process and drop its tool schemas before the config forgets it.
           await deps.cancelMcpConnection(wsId, serverName)
-          await deps.mcpStore.saveMcp(wsId, parseMcpConfig(JSON.stringify({ version: 1, servers })))
+          await deps.commitMcpConfig(wsId, withoutServer(config, serverName))
           send(200, { deleted: serverName })
           return
         }
@@ -2219,20 +2898,20 @@ async function handleApi(
           requireWorkspace(deps, wsId, true)
           const body = await readJson(req)
           const config = await deps.mcpStore.loadMcp(wsId)
+          const expected = body['expectedRevision']
+          if (typeof expected === 'string' && expected !== configRevision(config)) {
+            send(409, { error: 'mcp.json changed since it was loaded; reload before saving', revision: configRevision(config) })
+            return
+          }
+          const { expectedRevision: _expected, ...serverBody } = body
+          void _expected
           const name = typeof body['name'] === 'string' && body['name'] !== '' ? body['name'] : serverName
-          // Strict validate the merged shape before saving (parse errors surface).
-          const merged = parseMcpConfig(JSON.stringify({
-            version: 1,
-            servers: {
-              ...JSON.parse(JSON.stringify(config.servers)),
-              [name]: { ...JSON.parse(JSON.stringify(body)) },
-            },
-          }))
-          await deps.mcpStore.saveMcp(wsId, merged)
-          send(201, { saved: name, enabled: (body['enabled'] as boolean | undefined) ?? true })
+          const merged = upsertServer(config, name, serverBody)
+          await deps.commitMcpConfig(wsId, merged)
+          send(201, { saved: name, enabled: merged.servers[name]?.enabled === true, activated: false })
           return
         }
-        if (req.method === 'POST' && serverName !== undefined && (action === 'enable' || action === 'disable' || action === 'reconnect')) {
+        if (req.method === 'POST' && serverName !== undefined && (action === 'enable' || action === 'disable' || action === 'reconnect' || action === 'test')) {
           requireWorkspace(deps, wsId, true)
           const config = await deps.mcpStore.loadMcp(wsId)
           const serverConfig = config.servers[serverName]
@@ -2240,27 +2919,32 @@ async function handleApi(
             send(404, { error: `no MCP server '${serverName}'` })
             return
           }
+          if (action === 'test') {
+            const tools = await deps.testMcpServer(wsId, serverName)
+            const stored = await deps.mcpStore.loadMcp(wsId)
+            send(200, {
+              tested: true,
+              published: false,
+              enabled: stored.servers[serverName]?.enabled === true,
+              tools,
+            })
+            return
+          }
           if (action === 'disable') {
-            const next = parseMcpConfig(JSON.stringify({
-              version: 1,
-              servers: {
-                ...JSON.parse(JSON.stringify(config.servers)),
-                [serverName]: { ...JSON.parse(JSON.stringify(serverConfig)), enabled: false },
-              },
-            }))
-            await deps.mcpStore.saveMcp(wsId, next)
+            await deps.commitMcpConfig(wsId, withServerEnabled(config, serverName, false))
             await deps.cancelMcpConnection(wsId, serverName)
             send(200, { status: 'disabled' })
             return
           }
-          const enabledNext = parseMcpConfig(JSON.stringify({
-            version: 1,
-            servers: {
-              ...JSON.parse(JSON.stringify(config.servers)),
-              [serverName]: { ...JSON.parse(JSON.stringify(serverConfig)), enabled: true },
-            },
-          }))
-          await deps.mcpStore.saveMcp(wsId, enabledNext)
+          if (serverConfig.resourceLimits?.enforcement === 'hard') {
+            const report = await containmentCapability()
+            if (report.level !== 'hard') {
+              send(409, { error: report.detail })
+              return
+            }
+          }
+          const enabledNext = withServerEnabled(config, serverName, true)
+          await deps.commitMcpConfig(wsId, enabledNext)
           if (action === 'reconnect') await deps.cancelMcpConnection(wsId, serverName)
           deps.mcpCancelled.delete(`${wsId}:${serverName}`)
           // Fresh/singleton connect; ensureMcpServer lists + reconciles tools.
@@ -2318,6 +3002,7 @@ async function handleApi(
         }
         const secrets = await deps.mcpStore.loadSecrets(wsId)
         secrets[key] = body['value']
+        await deps.fenceWorkspace(wsId)
         await deps.mcpStore.saveSecrets(wsId, secrets)
         // Rotation reconnects AFFECTED enabled servers before responding.
         const config = await deps.mcpStore.loadMcp(wsId)
@@ -2327,7 +3012,7 @@ async function handleApi(
           const values = [
             ...Object.values(server.env ?? {}),
             ...Object.values(server.headers ?? {}),
-            ...(server.auth === undefined ? [] : [server.auth.type === 'bearer' ? server.auth.token : server.auth.accessToken]),
+            ...(authSecretRef(server.auth) !== undefined ? [authSecretRef(server.auth) as string] : []),
           ]
           return values.includes(ref)
         })
@@ -2347,6 +3032,7 @@ async function handleApi(
       if (req.method === 'DELETE' && key !== undefined) {
         const secrets = await deps.mcpStore.loadSecrets(wsId)
         delete secrets[key]
+        await deps.fenceWorkspace(wsId)
         await deps.mcpStore.saveSecrets(wsId, secrets)
         send(200, { deleted: key })
         return
@@ -2417,12 +3103,12 @@ async function handleApi(
         }
         if (req.method === 'PATCH') {
           const body = await readJson(req)
-          const outcome = await renameSession(entry, body['title'], deps)
+          const outcome = await patchSession(entry, body, deps)
           if (!outcome.ok) {
             send(outcome.status, { error: outcome.error })
             return
           }
-          send(200, { id: entry.session.id, title: outcome.title })
+          send(200, outcome.payload)
           return
         }
         send(405, { error: 'method not allowed' })
@@ -2543,17 +3229,6 @@ async function handleApi(
       send(200, { thinkingLevel: deps.defaults().thinkingLevel })
       return
     }
-    if (pathname === '/api/policy' && req.method === 'PUT') {
-      const wsId = implicitWorkspace(deps)
-      const outcome = await putPolicy(wsId, req, deps)
-      if (!outcome.ok) {
-        send(outcome.status, { error: outcome.error })
-        return
-      }
-      send(200, { policy: deps.controlsFor(wsId).policy })
-      return
-    }
-
     // ── workspace-scoped controls ────────────────────────────
     const wsModelMatch = /^\/api\/workspaces\/([^/]+)\/model$/.exec(pathname)
     if (wsModelMatch !== null && req.method === 'PUT') {
@@ -2582,19 +3257,6 @@ async function handleApi(
       return
     }
 
-    const wsPolicyMatch = /^\/api\/workspaces\/([^/]+)\/policy$/.exec(pathname)
-    if (wsPolicyMatch !== null && req.method === 'PUT') {
-      const wsId = decodeURIComponent(wsPolicyMatch[1] ?? '') as WorkspaceId
-      requireWorkspace(deps, wsId, true)
-      const outcome = await putPolicy(wsId, req, deps)
-      if (!outcome.ok) {
-        send(outcome.status, { error: outcome.error })
-        return
-      }
-      send(200, { policy: deps.controlsFor(wsId).policy })
-      return
-    }
-
     const wsMetaMatch = /^\/api\/workspaces\/([^/]+)\/meta$/.exec(pathname)
     if (wsMetaMatch !== null && req.method === 'GET') {
       const wsId = decodeURIComponent(wsMetaMatch[1] ?? '') as WorkspaceId
@@ -2611,18 +3273,26 @@ async function handleApi(
       if (req.method === 'GET') {
         const rows = await deps.modes.list(wsId)
         const state = deps.controlsFor(wsId)
+        // The picker lists enabled modes only; the authoring catalog below is
+        // where a mode is disabled and re-enabled.
+        const disabled = new Set(await deps.modes.disabledIds(wsId))
         send(200, {
-          modes: rows.map((row) => ({ id: row.definition.id, name: row.definition.name, source: row.source })),
+          modes: rows.filter((row) => !disabled.has(row.definition.id)).map((row) => ({ id: row.definition.id, name: row.definition.name, source: row.source })),
           selected: state.modeId,
           revision: state.modeRevision,
         })
         return
       }
       if (req.method === 'PUT') {
+        requireWorkspace(deps, wsId, true)
         const body = await readJson(req)
         const modeId = body['modeId']
         if (typeof modeId !== 'string' || modeId.trim() === '') {
           send(400, { error: "body needs a non-empty string 'modeId'" })
+          return
+        }
+        if ((await deps.modes.disabledIds(wsId)).includes(modeId.trim())) {
+          send(400, { error: `mode '${modeId.trim()}' is disabled in this workspace; enable it before selecting it` })
           return
         }
         try {
@@ -2633,7 +3303,7 @@ async function handleApi(
           // to THIS workspace: newly unexposed calls cancel truthfully,
           // newly allowed asks proceed through the serialized final gate,
           // still-ask calls remain pending; other workspaces are untouched.
-          const effective = { ...resolved.definition.permissionDefaults, ...deps.controlsFor(wsId).policy }
+          const effective = effectivePolicy(resolved.definition.permissionDefaults, deps.yolo)
           deps.approvalHandle.reevaluate({ workspaceId: wsId, toolExposure: resolved.definition.toolExposure, policy: effective })
           send(200, { modeId: resolved.definition.id, name: resolved.definition.name, revision: deps.controlsFor(wsId).modeRevision })
         } catch (error) {
@@ -2642,6 +3312,111 @@ async function handleApi(
             return
           }
           fail(error)
+        }
+        return
+      }
+      send(405, { error: 'method not allowed' })
+      return
+    }
+
+    // ── Mode authoring (the selection control above is a separate concern) ──
+    const wsModeEnabled = /^\/api\/workspaces\/([^/]+)\/modes\/([^/]+)\/enabled$/.exec(pathname)
+    if (wsModeEnabled !== null && req.method === 'PUT') {
+      const wsId = decodeURIComponent(wsModeEnabled[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, true)
+      const modeId = decodeURIComponent(wsModeEnabled[2] ?? '')
+      const body = await readJson(req)
+      if (typeof body['enabled'] !== 'boolean') {
+        send(400, { error: "body needs a boolean 'enabled'" })
+        return
+      }
+      if (!body['enabled'] && deps.controlsFor(wsId).modeId === modeId) {
+        send(409, { error: `mode '${modeId}' is selected; select another mode before disabling it` })
+        return
+      }
+      try {
+        await deps.modes.setEnabled(wsId, modeId, body['enabled'])
+        send(200, { id: modeId, enabled: body['enabled'] })
+      } catch (error) {
+        sendModeError(error, send, fail)
+      }
+      return
+    }
+
+    const wsModeDuplicate = /^\/api\/workspaces\/([^/]+)\/modes\/([^/]+)\/duplicate$/.exec(pathname)
+    if (wsModeDuplicate !== null && req.method === 'POST') {
+      const wsId = decodeURIComponent(wsModeDuplicate[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, true)
+      const sourceId = decodeURIComponent(wsModeDuplicate[2] ?? '')
+      const body = await readJson(req)
+      const newId = body['newId']
+      if (typeof newId !== 'string' || newId.trim() === '') {
+        send(400, { error: "body needs a non-empty string 'newId'" })
+        return
+      }
+      try {
+        // The service owns the id rules and the bundled-id refusal; repeating
+        // them here would be a second place for them to drift.
+        const copy = await deps.modes.duplicate(wsId, sourceId, newId.trim())
+        send(200, { id: copy.definition.id, name: copy.definition.name, source: copy.source, hash: copy.hash })
+      } catch (error) {
+        sendModeError(error, send, fail)
+      }
+      return
+    }
+
+    const wsModesMatch = /^\/api\/workspaces\/([^/]+)\/modes(?:\/([^/]+))?$/.exec(pathname)
+    if (wsModesMatch !== null) {
+      const wsId = decodeURIComponent(wsModesMatch[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, false)
+      const modeId = wsModesMatch[2] !== undefined ? decodeURIComponent(wsModesMatch[2]) : undefined
+      if (req.method === 'GET' && modeId === undefined) {
+        const rows = await deps.modes.list(wsId)
+        const disabled = new Set(await deps.modes.disabledIds(wsId))
+        // Permissions and exposure travel with the catalog: the settings list
+        // states what each mode grants without a read per row. `enabled`
+        // marks what the composer picker offers.
+        send(200, rows.map((row) => ({
+          id: row.definition.id,
+          name: row.definition.name,
+          source: row.source,
+          enabled: !disabled.has(row.definition.id),
+          toolExposure: row.definition.toolExposure,
+          permissionDefaults: row.definition.permissionDefaults,
+        })))
+        return
+      }
+      if (req.method === 'GET' && modeId !== undefined) {
+        try {
+          send(200, await deps.modes.load(wsId, modeId))
+        } catch (error) {
+          sendModeError(error, send, fail)
+        }
+        return
+      }
+      if (req.method === 'PUT' && modeId !== undefined) {
+        requireWorkspace(deps, wsId, true)
+        const body = await readJson(req)
+        const content = body['content']
+        if (typeof content !== 'string' || content.trim() === '') {
+          send(400, { error: "body needs a non-empty string 'content' (raw mode Markdown)" })
+          return
+        }
+        try {
+          const saved = await deps.modes.save(wsId, modeId, content, typeof body['expectedHash'] === 'string' ? body['expectedHash'] : undefined)
+          send(200, { id: saved.definition.id, name: saved.definition.name, hash: saved.hash })
+        } catch (error) {
+          sendModeError(error, send, fail)
+        }
+        return
+      }
+      if (req.method === 'DELETE' && modeId !== undefined) {
+        requireWorkspace(deps, wsId, true)
+        try {
+          await deps.modes.delete(wsId, modeId)
+          send(200, { deleted: true })
+        } catch (error) {
+          sendModeError(error, send, fail)
         }
         return
       }
@@ -3384,6 +4159,21 @@ async function handleApi(
       return
     }
 
+    // Probe only: what the endpoint offers, with nothing written. The browser
+    // merges the answer into its draft and saves through the ordinary PATCH,
+    // so a sync the operator has not confirmed cannot change stored models.
+    const providerModelsMatch = /^\/api\/providers\/([^/]+)\/models$/.exec(pathname)
+    if (req.method === 'GET' && providerModelsMatch !== null) {
+      const entry = deps.providers().find((candidate) => candidate.id === decodeURIComponent(providerModelsMatch[1] ?? ''))
+      if (entry === undefined) {
+        send(404, { ok: false, error: 'no such provider' })
+        return
+      }
+      const outcome = await fetchEndpointModels(entry)
+      send(outcome.ok ? 200 : outcome.status, outcome.ok ? { ok: true, models: outcome.models } : { ok: false, error: outcome.error })
+      return
+    }
+
     const syncMatch = /^\/api\/providers\/([^/]+)\/sync$/.exec(pathname)
     if (req.method === 'POST' && syncMatch !== null) {
       const id = decodeURIComponent(syncMatch[1] ?? '')
@@ -3391,10 +4181,9 @@ async function handleApi(
         const outcome = await deps.mutateProviderStore<{ ok: true; models: string[] } | { ok: false; status: number; error: string }>(async ({ providers, defaults }) => {
           const entry = providers.find((candidate) => candidate.id === id)
           if (entry === undefined) return { providers, defaults, result: { ok: false as const, status: 404, error: 'no such provider' } }
-          const response = await fetch(`${entry.baseUrl.replace(/\/$/, '')}/models`, { headers: authHeaders(entry), signal: AbortSignal.timeout(10_000) })
-          if (!response.ok) return { providers, defaults, result: { ok: false as const, status: 502, error: `HTTP ${response.status}` } }
-          const models = extractModelIds(await response.json())
-          if (models.length === 0) return { providers, defaults, result: { ok: false as const, status: 502, error: 'model list came back empty' } }
+          const probe = await fetchEndpointModels(entry)
+          if (!probe.ok) return { providers, defaults, result: { ok: false as const, status: probe.status, error: probe.error } }
+          const models = probe.models
           return {
             providers: providers.map((candidate) => candidate.id === id ? { ...candidate, models } : candidate),
             defaults,
@@ -3409,11 +4198,23 @@ async function handleApi(
       return
     }
 
-    // ── approvals (transport-global: ids are unguessable capabilities) ──
+    // Approvals bind to the authenticated principal. The UUID alone is not a bearer.
     const approvalMatch = /^\/api\/approvals\/([^/]+)$/.exec(pathname)
     if (req.method === 'POST' && approvalMatch !== null) {
       const approvalId = approvalMatch[1] ?? ''
       const waiting = deps.pending.get(approvalId)
+      if (deps.auth.enabled) {
+        const decision = deps.auth.authenticate(req.headers, 'POST')
+        if (!decision.ok || decision.principal.kind !== 'browser') {
+          send(401, { error: 'approval answers require the browser session that owns the workspace' })
+          return
+        }
+        const owner = waiting?.principalId
+        if (owner !== undefined && owner !== decision.principal.id) {
+          send(403, { error: 'approval belongs to a different principal' })
+          return
+        }
+      }
       if (waiting === undefined) {
         // Unknown ids include expired, invalidated, and already-settled
         // approvals: a stale decision can never execute a tool.
@@ -3470,6 +4271,31 @@ function requireWorkspace(deps: HandlerDeps, workspaceId: WorkspaceId, active: b
   if (workspaceId === MEMORY_WORKSPACE && deps.deniedRoots === undefined) return
   if (active) deps.workspaces.requireActive(workspaceId)
   else deps.workspaces.get(workspaceId)
+}
+
+/**
+ * One PATCH surface for the conversation's own metadata: `pinned` when the
+ * body carries it, the title otherwise. Pins, like renames, are canonical
+ * events — a rebuild from `events.jsonl` alone reproduces them.
+ */
+async function patchSession(
+  entry: SessionEntry,
+  body: Record<string, unknown>,
+  deps: HandlerDeps,
+): Promise<{ ok: false; status: number; error: string } | { ok: true; payload: Record<string, unknown> }> {
+  if ('pinned' in body) {
+    if (typeof body['pinned'] !== 'boolean') return { ok: false, status: 400, error: 'pinned must be a boolean' }
+    entry.session.append({ type: 'session/pinned', pinned: body['pinned'] })
+    try {
+      await entry.session.durable()
+    } catch (error) {
+      return { ok: false, status: 500, error: `pin could not be recorded: ${String(error instanceof Error ? error.message : error)}` }
+    }
+    await deps.kernel.ctx.sessions.flushSummary(entry.session).catch(() => {})
+    return { ok: true, payload: { id: entry.session.id, pinned: entry.session.pinned } }
+  }
+  const outcome = await renameSession(entry, body['title'], deps)
+  return outcome.ok ? { ok: true, payload: { id: entry.session.id, title: outcome.title } } : outcome
 }
 
 async function renameSession(
@@ -3560,6 +4386,8 @@ async function acceptMessage(
       return { ok: false, status: 400, error: error.message }
     }
   }
+  const principalId = (req as IncomingMessage & { miniDshPrincipalId?: string }).miniDshPrincipalId
+  if (principalId !== undefined) deps.sessionPrincipals.set(entry.session.id, principalId)
   if (deps.unavailableSessions.has(entry.session.id)) {
     return { ok: false, status: 503, error: 'session unavailable after durable storage failure; restart the host to reload canonical history' }
   }
@@ -3786,36 +4614,6 @@ async function putThinking(
   }
 }
 
-async function putPolicy(
-  workspaceId: WorkspaceId,
-  req: IncomingMessage,
-  deps: HandlerDeps,
-): Promise<{ ok: false; status: number; error: string } | { ok: true }> {
-  const body = await readJson(req)
-  const raw = body['policy'] ?? body
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
-    return { ok: false, status: 400, error: "body needs a 'policy' object of tool → 'allow'|'ask'|'deny'" }
-  }
-  const modes = Object.values(raw as Record<string, unknown>)
-  if (!modes.every((mode) => mode === 'allow' || mode === 'ask' || mode === 'deny')) {
-    return { ok: false, status: 400, error: 'policy values must be allow, ask, or deny' }
-  }
-  const state = deps.controlsFor(workspaceId)
-  state.policy = canonicalPolicy(raw as Record<string, string>) as Record<string, ApprovalMode>
-  deps.kernel.ctx.tools.bumpPolicyRevision()
-  // A permission change gates tools that have not started and settles
-  // pending approvals the new policy denies (newly allowed asks proceed
-  // through the final gate); scoped to THIS workspace; running tools are
-  // not killed. The snapshot is explicit — no ambient scope at HTTP time.
-  const mode = state.modeDefinition.definition
-  deps.approvalHandle.reevaluate({
-    workspaceId,
-    policy: { ...mode.permissionDefaults, ...state.policy },
-    toolExposure: mode.toolExposure,
-  })
-  return { ok: true }
-}
-
 // ── workspace helpers ──────────────────────────────────────────
 
 function listSessions(workspaceId: WorkspaceId, deps: HandlerDeps): Record<string, unknown>[] {
@@ -3837,6 +4635,8 @@ function listSessions(workspaceId: WorkspaceId, deps: HandlerDeps): Record<strin
       eventCount: summary.eventCount,
       folder: entry !== undefined ? (deps.legacyFolders.get(summary.id) ?? null) : null,
       projectId: entry?.projectId ?? summary.projectId ?? null,
+      // A loaded session's own log is fresher than its projected summary.
+      pinned: entry?.session.pinned ?? summary.pinned ?? false,
       status: entry?.agent.status ?? 'idle',
       activity: entry?.agent.activity ?? null,
       pendingInputs: entry !== undefined ? deps.kernel.ctx.sessions.pendingInputs(entry.session).length : 0,
@@ -3882,7 +4682,8 @@ function workspaceMeta(workspaceId: WorkspaceId, deps: HandlerDeps, folder?: str
     models,
     /** Global thinking override; null = the model's configured default. */
     thinkingLevel: defaults.thinkingLevel,
-    policy: { ...state.modeDefinition.definition.permissionDefaults, ...state.policy },
+    permissionDefaults: state.modeDefinition.definition.permissionDefaults,
+    ...(deps.yolo ? { yolo: true } : {}),
     mode: { id: state.modeDefinition.definition.id, name: state.modeDefinition.definition.name, revision: state.modeRevision },
     projects,
     providers: deps.providers().map(publicProvider),
@@ -4022,6 +4823,27 @@ function sanitizeModelSettings(raw: unknown): Record<string, ModelSettings> | un
  */
 function authHeaders(entry: ProviderConfig): Record<string, string> {
   return entry.apiKey === '' ? {} : { authorization: `Bearer ${entry.apiKey}` }
+}
+
+/**
+ * Ask one endpoint what it offers. Shared by the read-only probe and by the
+ * persisting sync so both report the same list and the same failures.
+ */
+async function fetchEndpointModels(
+  entry: ProviderConfig,
+): Promise<{ ok: true; models: string[] } | { ok: false; status: number; error: string }> {
+  try {
+    const response = await fetch(`${entry.baseUrl.replace(/\/$/, '')}/models`, {
+      headers: authHeaders(entry),
+      signal: AbortSignal.timeout(10_000),
+    })
+    if (!response.ok) return { ok: false, status: 502, error: `HTTP ${response.status}` }
+    const models = extractModelIds(await response.json())
+    if (models.length === 0) return { ok: false, status: 502, error: 'model list came back empty' }
+    return { ok: true, models }
+  } catch (error) {
+    return { ok: false, status: 502, error: String(error instanceof Error ? error.message : error) }
+  }
 }
 
 /**
@@ -4170,6 +4992,12 @@ async function resolveTerminalCwd(
  * per-terminal stream would starve the REST calls that drive the same page.
  */
 function streamTerminals(req: IncomingMessage, res: ServerResponse, workspaceId: WorkspaceId, deps: HandlerDeps): void {
+  const streamGeneration = (req as IncomingMessage & { miniDshGeneration?: number }).miniDshGeneration ?? deps.auth.currentGeneration()
+  if (deps.auth.enabled && deps.auth.currentGeneration() !== streamGeneration) {
+    res.writeHead(401, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    res.end(JSON.stringify({ error: 'session generation was revoked' }))
+    return
+  }
   res.writeHead(200, {
     'content-type': 'text/event-stream',
     'cache-control': 'no-cache',
@@ -4211,8 +5039,26 @@ function streamTerminals(req: IncomingMessage, res: ServerResponse, workspaceId:
   const dispose = deps.terminals.subscribe(workspaceId, (event) => {
     frame(event.kind === 'data' ? { ...event, data: encode(event.data) } : event)
   })
-  const heartbeat = setInterval(() => res.write(': ping\n\n'), 25_000)
+  const heartbeat = setInterval(() => {
+    if (deps.auth.enabled && deps.auth.currentGeneration() !== streamGeneration) {
+      clearInterval(heartbeat)
+      dispose()
+      res.end()
+      return
+    }
+    res.write(': ping\n\n')
+  }, 25_000)
   heartbeat.unref?.()
+  const principalId = (req as IncomingMessage & { miniDshPrincipalId?: string }).miniDshPrincipalId
+  let closed = false
+  const close = (): void => {
+    if (closed) return
+    closed = true
+    clearInterval(heartbeat)
+    dispose()
+    res.end()
+  }
+  deps.liveStreams.push({ principalId, close })
 
   req.on('close', () => {
     clearInterval(heartbeat)
@@ -4227,6 +5073,16 @@ function streamTerminals(req: IncomingMessage, res: ServerResponse, workspaceId:
  * disposed on close so a dropped tab never leaks registrations.
  */
 function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionEntry, deps: HandlerDeps): void {
+  const streamGeneration = (req as IncomingMessage & { miniDshGeneration?: number }).miniDshGeneration ?? deps.auth.currentGeneration()
+  // A reconnect that authenticated under an older generation must not receive
+  // the snapshot. Logout increments the generation before this handler runs
+  // only when the cookie was already rejected; this covers a generation that
+  // moved between authenticate() and the first write.
+  if (deps.auth.enabled && deps.auth.currentGeneration() !== streamGeneration) {
+    res.writeHead(401, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    res.end(JSON.stringify({ error: 'session generation was revoked' }))
+    return
+  }
   res.writeHead(200, {
     'content-type': 'text/event-stream',
     'cache-control': 'no-cache',
@@ -4236,8 +5092,8 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
 
   writeFrame(res, { kind: 'snapshot', events: [...session.events] })
   for (const [approvalId, waiting] of deps.pending) {
-    if (waiting.sessionId === session.id) {
-      writeFrame(res, { kind: 'approval', approvalId, call: waiting.call })
+    if (waiting.sessionId === session.id || waiting.parentSessionId === session.id) {
+      writeFrame(res, approvalEnvelope(approvalId, waiting, session.id))
     }
   }
 
@@ -4245,19 +5101,62 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     if (emitter.id === session.id) writeFrame(res, { kind: 'session', event })
   })
   const disposeApproval = deps.kernel.ctx.on('web/approval', (payload) => {
-    if (payload.sessionId === session.id) {
-      writeFrame(res, { kind: 'approval', approvalId: payload.approvalId, call: payload.call, ...(payload.guardWarning !== undefined ? { guardWarning: payload.guardWarning } : {}) })
+    if (payload.sessionId === session.id || payload.parentSessionId === session.id) {
+      const waiting = deps.pending.get(payload.approvalId)
+      if (waiting !== undefined) {
+        writeFrame(res, approvalEnvelope(payload.approvalId, waiting, session.id))
+        return
+      }
+      writeFrame(res, {
+        kind: 'approval',
+        approvalId: payload.approvalId,
+        call: payload.call,
+        expiresAt: payload.expiresAt,
+        ...(payload.interactive === true ? { interactive: true } : {}),
+        ...(payload.guardWarning !== undefined ? { guardWarning: payload.guardWarning } : {}),
+        ...(payload.parentSessionId === session.id
+          ? {
+            childSessionId: payload.sessionId,
+            ...(payload.definitionName !== undefined ? { definitionName: payload.definitionName } : {}),
+          }
+          : {}),
+      })
+    }
+  })
+  const disposeApprovalSettled = deps.kernel.ctx.on('web/approval-settled', (payload) => {
+    if (payload.sessionId === session.id || payload.parentSessionId === session.id) {
+      writeFrame(res, { kind: 'approval-settled', approvalId: payload.approvalId })
     }
   })
   const disposeError = deps.kernel.ctx.on('web/turn-error', (payload) => {
     if (payload.sessionId === session.id) writeFrame(res, { kind: 'error', message: payload.message })
   })
-  const heartbeat = setInterval(() => {
+  const principalId = (req as IncomingMessage & { miniDshPrincipalId?: string }).miniDshPrincipalId
+  let closed = false
+  let heartbeat: ReturnType<typeof setInterval> | undefined
+  const close = (): void => {
+    if (closed) return
+    closed = true
+    if (heartbeat !== undefined) clearInterval(heartbeat)
+    disposeSession()
+    disposeApproval()
+    disposeApprovalSettled()
+    disposeError()
+    res.end()
+  }
+  deps.liveStreams.push({ principalId, close })
+
+  heartbeat = setInterval(() => {
+    if (deps.auth.enabled && deps.auth.currentGeneration() !== streamGeneration) {
+      close()
+      return
+    }
     // A deleted session must end its streams: no more frames can ever come.
     if (entry.closed === true) {
       clearInterval(heartbeat)
       disposeSession()
       disposeApproval()
+      disposeApprovalSettled()
       disposeError()
       writeFrame(res, { kind: 'error', message: 'session deleted' })
       res.end()
@@ -4270,6 +5169,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     clearInterval(heartbeat)
     disposeSession()
     disposeApproval()
+    disposeApprovalSettled()
     disposeError()
   })
 }
@@ -4301,6 +5201,76 @@ async function serveStatic(res: ServerResponse, pathname: string, staticDir: str
     } catch {
       res.writeHead(404, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ error: 'client not built; run npm run build:web' }))
+    }
+  }
+}
+
+/** Retire a valid legacy override without ever interpreting it as active policy. */
+async function retireWorkspacePolicyFile(
+  workspaceDir: string,
+  workspace: Pick<WorkspaceRecord, 'id' | 'name'>,
+  seam: WebServerOptions['policyRetirement'] = {},
+): Promise<void> {
+  const source = path.join(workspaceDir, 'policy.json')
+  let raw: string
+  try {
+    raw = await fs.readFile(source, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    console.warn(`web: could not inspect retired policy for workspace '${workspace.id}' (${workspace.name}): ${String(error instanceof Error ? error.message : error)}`)
+    return
+  }
+
+  let entries: Record<string, ApprovalMode> | undefined
+  let empty = false
+  try {
+    const parsed = JSON.parse(raw) as { v?: unknown; policy?: unknown }
+    const candidate = parsed.policy
+    if (parsed.v === 1 && candidate !== null && typeof candidate === 'object' && !Array.isArray(candidate)) {
+      const values = Object.values(candidate as Record<string, unknown>)
+      if (values.length === 0) empty = true
+      else if (values.every((value) => value === 'allow' || value === 'ask' || value === 'deny')) {
+        entries = candidate as Record<string, ApprovalMode>
+      }
+    }
+  } catch {
+    // Warning below identifies the retained malformed file.
+  }
+  if (entries === undefined) {
+    if (empty) console.warn(`web: workspace '${workspace.id}' (${workspace.name}) retained empty policy.json; it does not apply`)
+    else if (raw.trim() !== '') console.warn(`web: workspace '${workspace.id}' (${workspace.name}) retained malformed policy.json; it does not apply`)
+    return
+  }
+
+  const migrated = path.join(workspaceDir, 'policy.json.migrated')
+  const copyExclusive = seam.copyExclusive ?? ((from: string, to: string) => fs.copyFile(from, to, fs.constants.COPYFILE_EXCL))
+  const unlink = seam.unlink ?? fs.unlink
+  const delay = seam.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  for (let attempt = 0; ; attempt++) {
+    try {
+      // COPYFILE_EXCL is atomic no-replace on both Windows and POSIX. The
+      // source remains until this succeeds, so a target collision cannot lose
+      // either file and a failed copy is always recoverable on the next boot.
+      await copyExclusive(source, migrated)
+      try {
+        await unlink(source)
+      } catch (error) {
+        console.warn(`web: workspace '${workspace.id}' (${workspace.name}) copied retired policy but could not remove policy.json; both files were preserved: ${String(error instanceof Error ? error.message : error)}`)
+        return
+      }
+      console.warn(`web: workspace '${workspace.id}' (${workspace.name}) retired policy overrides that no longer apply: ${JSON.stringify(entries)}`)
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'EEXIST') {
+        console.warn(`web: workspace '${workspace.id}' (${workspace.name}) retains policy.json because policy.json.migrated already exists`)
+        return
+      }
+      if (attempt >= 4 || (code !== 'EPERM' && code !== 'EBUSY')) {
+        console.warn(`web: could not retire policy for workspace '${workspace.id}' (${workspace.name}): ${String(error instanceof Error ? error.message : error)}`)
+        return
+      }
+      await delay(100 * (attempt + 1))
     }
   }
 }
