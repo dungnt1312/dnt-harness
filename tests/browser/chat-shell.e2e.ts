@@ -28,7 +28,7 @@ function longConversation(): readonly unknown[] {
   }
   push({ type: 'turn/start' })
   push({ type: 'user/message', content: 'Delegate a repository map.' })
-  push({ type: 'agent/child-spawn', childSessionId: 'child', definition: 'explorer', objective: 'Map the repository modules' })
+  push({ type: 'agent/child-spawn', childSessionId: 'child', definition: 'explorer', brief: 'Map the repository modules' })
   push({ type: 'agent/child-result', childSessionId: 'child', status: 'completed' })
   push({ type: 'assistant/message', content: 'The explorer finished mapping the repository.' })
   push({ type: 'turn/end', reason: 'completed' })
@@ -106,7 +106,7 @@ async function fixture(page: Page, options: Options = {}): Promise<{ readonly po
       : { path: '', entries: [{ name: 'src', path: 'src', kind: 'dir' }, { name: 'package.json', path: 'package.json', kind: 'file', size: 480 }] })
     if (path === '/api/workspaces/w/projects/p/file') return json(route, { path: new URL(request.url()).searchParams.get('path'), size: 120, binary: false, truncated: false, content: '{\n  "name": "fixture",\n  "private": true\n}\n' })
     if (path.endsWith('/manifest')) return json(route, { modeId: 'chat', modeRevision: 1, budget: { availableTokens: 32000, usedTokens: 12000, estimated: true }, history: { setting: 'all', includedTurns: 9, omittedTurns: 0 }, sources: { skills: [], memory: [], toolNames: ['Read', 'Bash'], toolSchemas: 2 }, omissions: [] })
-    if (path === '/api/workspaces/w/agents/children/child') return json(route, { childSessionId: 'child', definitionName: 'explorer', status: 'completed', result: { summary: 'Mapped 12 modules.', fileReferences: ['src/index.ts'] } })
+    if (path === '/api/workspaces/w/agents/children/child') return json(route, { childSessionId: 'child', definitionName: 'explorer', status: 'completed', result: { report: 'Mapped 12 modules.', filesTouched: ['src/index.ts'] } })
     if (path === '/api/workspaces/w/sessions/s/messages' && method === 'POST') return json(route, { inputId: 'accepted', queued: false })
     if (path === '/api/approvals/approval-1' && method === 'POST') return json(route, { answered: true })
     // Fail loudly instead of leaving the request hanging.

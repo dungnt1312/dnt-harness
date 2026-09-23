@@ -14,10 +14,41 @@
  */
 import type { SessionId, WorkspaceId, ProjectId } from '../util/brand.ts'
 import type { Session } from '../harness/session/session.ts'
+import type { SessionEvent } from '../harness/session/events.ts'
 import { agentScope } from '../harness/agent/scope.ts'
-import type { AgentDefinitionService } from '../harness/agents/definition-service.ts'
-import type { ChildExecutor, ChildModel, TaskPacket } from '../harness/agents/executor.ts'
+import { bundledDefinition, BUNDLED_AGENT_ROLES, type AgentDefinitionService } from '../harness/agents/definition-service.ts'
+import { MAX_ACTIVE_PER_ROOT, type ChildExecutor, type ChildModel, type TaskPacket } from '../harness/agents/executor.ts'
 import type { ToolDefinition } from '../harness/tools/types.ts'
+
+/** Most parent-conversation text an `inherit: 'brief'` child receives. */
+export const MAX_INHERITED_CHARS = 12_000
+
+/**
+ * The bounded parent projection behind `inherit: 'brief'`: recent user and
+ * assistant MESSAGES only — never tool calls, tool results, assistant
+ * messages that accompany tool use, or a compaction summary. Newest content
+ * is kept up to `maxChars`, then returned in chronological order. Pure, so
+ * both spawn surfaces call it synchronously at the moment of spawn.
+ */
+export function projectInheritedMessages(events: readonly SessionEvent[], maxChars = MAX_INHERITED_CHARS): string {
+  const kept: string[] = []
+  let used = 0
+  for (let i = events.length - 1; i >= 0 && used < maxChars; i--) {
+    const event = events[i]
+    let line: string | undefined
+    if (event?.type === 'user/message' && event.content.trim() !== '') line = `User: ${event.content.trim()}`
+    else if (event?.type === 'assistant/message' && (event.toolCalls === undefined || event.toolCalls.length === 0) && event.content.trim() !== '') {
+      line = `Assistant: ${event.content.trim()}`
+    }
+    if (line === undefined) continue
+    const room = maxChars - used
+    // The oldest message that straddles the cap keeps its newest tail.
+    const text = line.length > room ? line.slice(line.length - room) : line
+    kept.push(text)
+    used += text.length + (kept.length > 1 ? 2 : 0)
+  }
+  return kept.reverse().join('\n\n').slice(-maxChars)
+}
 
 /** A parent conversation's effective selection, as the host resolves it. */
 export interface ParentModel {
@@ -144,28 +175,35 @@ export interface DelegationDeps {
  * choose a different workspace, session, or parent.
  */
 export function agentTool(deps: DelegationDeps): ToolDefinition {
-  // The description must be assembled synchronously, so the role listing is
-  // cached and refreshed in the background. It starts with the bundled roles,
-  // which are static, so the description is never empty.
-  let roles: readonly { readonly name: string; readonly description: string }[] = [
-    { name: 'explorer', description: 'read-only investigation' },
-    { name: 'worker', description: 'bounded task with file tools' },
-  ]
-  let rolesFor: string | undefined
-  let refreshedAt = 0
+  // The description must be assembled synchronously, so role listings are
+  // cached per workspace and refreshed in the background. Every workspace
+  // starts from the bundled roles, which are static, so the description is
+  // never empty — and one workspace's custom roles never leak into another's.
+  const BUNDLED_ROLES = BUNDLED_AGENT_ROLES.map((name) => {
+    const definition = bundledDefinition(name)
+    return { name: definition.name, description: definition.description }
+  })
+  const roleCache = new Map<WorkspaceId, { roles: readonly { readonly name: string; readonly description: string }[]; refreshedAt: number }>()
 
-  const refreshRoles = (workspaceId: WorkspaceId): void => {
-    if (rolesFor === workspaceId && Date.now() - refreshedAt < ROLE_CACHE_MS) return
-    rolesFor = workspaceId
-    refreshedAt = Date.now()
+  const rolesFor = (workspaceId: WorkspaceId): readonly { readonly name: string; readonly description: string }[] => {
+    const now = Date.now()
+    // Lazy TTL eviction keeps the long-lived closure bounded.
+    for (const [id, entry] of roleCache) {
+      if (id !== workspaceId && now - entry.refreshedAt >= ROLE_CACHE_MS) roleCache.delete(id)
+    }
+    const cached = roleCache.get(workspaceId)
+    if (cached !== undefined && now - cached.refreshedAt < ROLE_CACHE_MS) return cached.roles
+    const entry = { roles: cached?.roles ?? BUNDLED_ROLES, refreshedAt: now }
+    roleCache.set(workspaceId, entry)
     void deps.definitions.list(workspaceId)
-      .then((rows) => { roles = rows.map((row) => ({ name: row.definition.name, description: row.definition.description })) })
+      .then((rows) => { entry.roles = rows.map((row) => ({ name: row.definition.name, description: row.definition.description })) })
       .catch(() => { /* keep the previous listing; `catalog` reports the truth */ })
+    return entry.roles
   }
 
   const describe = (): string => {
     const scope = agentScope.getStore()
-    if (scope?.workspaceId !== undefined) refreshRoles(scope.workspaceId)
+    const roles = scope?.workspaceId !== undefined ? rolesFor(scope.workspaceId) : BUNDLED_ROLES
     const models = availableModels({ providers: deps.providers(), modelsOf: deps.modelsOf })
     const total = deps.providers().reduce((sum, provider) => sum + deps.modelsOf(provider).length, 0)
     return [
@@ -173,6 +211,9 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
       'spawn returns immediately, so several children run at the same time; wait blocks until they settle.',
       'One level only: a child can never delegate further.',
       'Wait for the children before you finish your turn — children still running when the turn closes are cancelled.',
+      'Delegate when the work is separable and its result compresses — a search across many files, a review, a verification run. Do not delegate what you can do in two tool calls, and do not delegate work whose context you would have to retype.',
+      'Write the prompt as you would brief a colleague who cannot see this conversation: name the files and the facts it needs, and say what the answer must contain. The child\'s final message is all you get back.',
+      'Writers: your turn holds the project lease once it writes, but spawning a write-capable child hands that lease off and the child then locks per call — nothing locks its whole run, and your next write can take the lease back. Do not fan out writers or keep writing while one runs; parallel fan-out belongs to read-only roles.',
       `Roles: ${roles.map((role) => `${role.name} (${role.description})`).join('; ') || 'none'}.`,
       `Models as provider:model — ${models.join(', ') || 'none'}${total > models.length ? `, +${total - models.length} more, use action:"catalog"` : ''}.`,
       'Omit model to inherit this conversation\'s model; grantTools only narrows the role, never widens it.',
@@ -196,7 +237,7 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
 
       switch (action) {
         case 'spawn': return spawn(deps, args, scope.sessionId, workspaceId, scope.projectId, parent)
-        case 'list': return JSON.stringify({ children: deps.executor.childrenOfRoot(scope.sessionId, workspaceId) })
+        case 'list': return JSON.stringify({ children: await deps.executor.childrenOfRoot(scope.sessionId, workspaceId) })
         case 'wait': return wait(deps, args, scope.sessionId, workspaceId)
         case 'cancel': return cancel(deps, args, workspaceId)
         case 'catalog': return catalog(deps, workspaceId)
@@ -212,10 +253,12 @@ const PARAMETERS: ToolDefinition['parameters'] = {
   properties: {
     action: { type: 'string', description: 'spawn | wait | list | cancel | catalog (default spawn)' },
     definition: { type: 'string', description: 'spawn: the role name, from the catalog' },
-    objective: { type: 'string', description: 'spawn: what the child must accomplish' },
+    prompt: { type: 'string', description: 'spawn: the brief, in prose — what to do, the files and facts it needs, and what the answer must contain' },
+    requiredResult: { type: 'string', description: 'spawn: the shape of the answer you need back' },
+    inherit: { type: 'string', description: `spawn: "none" (default) or "brief" — also hand the child up to ${MAX_INHERITED_CHARS} chars of this conversation's recent messages (no tool output); costs context, so prefer naming what it needs in the prompt` },
+    objective: { type: 'string', description: 'spawn: alternative structured form — what the child must accomplish (use prompt instead)' },
     constraints: { type: 'array', items: { type: 'string' }, description: 'spawn: limits the child must respect' },
     references: { type: 'array', items: { type: 'string' }, description: 'spawn: files or facts the child should start from' },
-    requiredResult: { type: 'string', description: 'spawn: the shape of the answer you need back' },
     grantTools: { type: 'array', items: { type: 'string' }, description: 'spawn: narrows the role\'s tools; never widens them' },
     model: { type: 'string', description: 'spawn: provider:model (or a bare model name); omit to inherit this conversation\'s' },
     childIds: { type: 'array', items: { type: 'string' }, description: 'wait/cancel: child session ids; wait defaults to every running child' },
@@ -232,23 +275,30 @@ async function spawn(
   projectId: ProjectId | undefined,
   parent: Session,
 ): Promise<string> {
-  const objective = typeof args['objective'] === 'string' ? args['objective'].trim() : ''
-  if (objective === '') throw new Error("'objective' must be a non-empty string")
+  // Shape only: whether the brief is usable is the executor's single call
+  // (SpawnError 'packet'), shared with the HTTP route.
   const name = typeof args['definition'] === 'string' ? args['definition'].trim() : ''
   if (name === '') throw new Error("'definition' must name a role; use action:\"catalog\" to list them")
+  const inherit = args['inherit'] ?? 'none'
+  if (inherit !== 'none' && inherit !== 'brief') throw new Error("'inherit' must be \"none\" or \"brief\"")
+  // Captured synchronously before any await: a message the parent appends
+  // while the role and model resolve can never leak into the snapshot.
+  const inheritedContext = inherit === 'brief' ? projectInheritedMessages(parent.events) : undefined
 
   const resolved = await deps.definitions.resolve(workspaceId, name).catch(async (error: unknown) => {
     const rows = await deps.definitions.list(workspaceId).catch(() => [])
     throw new Error(`${String(error instanceof Error ? error.message : error)}; available roles: ${rows.map((row) => row.definition.name).join(', ') || 'none'}`)
   })
   const packet: TaskPacket = {
-    objective,
+    ...(typeof args['prompt'] === 'string' ? { prompt: args['prompt'] } : {}),
+    ...(typeof args['objective'] === 'string' ? { objective: args['objective'] } : {}),
     constraints: stringList(args['constraints']),
     references: stringList(args['references']),
     requiredResult: typeof args['requiredResult'] === 'string' && args['requiredResult'].trim() !== ''
       ? args['requiredResult'].trim()
       : 'bounded summary with file references',
   }
+  const both = (packet.prompt?.trim() ?? '') !== '' && (packet.objective?.trim() ?? '') !== ''
   const grantTools = Array.isArray(args['grantTools']) ? stringList(args['grantTools']) : undefined
   const model = deps.childModelFor(
     parent,
@@ -266,18 +316,25 @@ async function spawn(
     packet,
     ...(grantTools !== undefined ? { grantTools } : {}),
     ...(model !== undefined ? { model } : {}),
+    ...(inheritedContext !== undefined ? { inherit: 'brief' as const, inheritedContext } : {}),
   })
   // A grant that asked for something the role lacks is reported, never
   // silently dropped: the model would otherwise plan around a missing tool.
   const dropped = grantTools?.filter((tool) => !resolved.definition.tools.includes(tool)) ?? []
-  const active = deps.executor.childrenOfRoot(parentSessionId, workspaceId).filter((child) => child.status === 'running').length
+  const notes = [
+    ...(dropped.length > 0 ? [`role '${handle.definitionName}' does not expose ${dropped.join(', ')}`] : []),
+    ...(both ? ["both 'prompt' and 'objective' were given; the prompt is the brief"] : []),
+  ]
   return JSON.stringify({
     childSessionId: handle.childSessionId,
     definition: handle.definitionName,
     ...(handle.model !== undefined ? { model: handle.model } : {}),
     status: handle.status,
-    active: `${active}/3`,
-    ...(dropped.length > 0 ? { droppedGrants: dropped, note: `role '${handle.definitionName}' does not expose ${dropped.join(', ')}` } : {}),
+    // Active children of THIS conversation; the host-wide ceiling is not shown.
+    active: `${deps.executor.activeOfRoot(parentSessionId)}/${MAX_ACTIVE_PER_ROOT}`,
+    ...(inheritedContext !== undefined ? { inheritedChars: inheritedContext.length } : {}),
+    ...(dropped.length > 0 ? { droppedGrants: dropped } : {}),
+    ...(notes.length > 0 ? { note: notes.join('; ') } : {}),
     next: 'call Agent with action:"wait" before finishing this turn',
   })
 }
@@ -291,9 +348,7 @@ async function wait(
   const requested = stringList(args['childIds'])
   const ids = requested.length > 0
     ? requested
-    : deps.executor.childrenOfRoot(parentSessionId, workspaceId)
-        .filter((child) => child.status === 'running')
-        .map((child) => child.childSessionId as string)
+    : deps.executor.runningChildrenOfRoot(parentSessionId).map((id) => id as string)
   if (ids.length === 0) return JSON.stringify({ children: [], note: 'no children are running for this conversation' })
 
   const raw = Number(args['timeoutMs'])

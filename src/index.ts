@@ -186,9 +186,15 @@ export {
 export {
   ChildExecutor,
   SpawnError,
+  normalizeBrief,
+  MAX_ACTIVE_PER_ROOT,
+  MAX_ACTIVE_GLOBAL,
+  MAX_CHILDREN_PER_TURN,
+  MAX_REPORT_CHARS,
   type TaskPacket,
   type SpawnRequest,
   type ChildHandle,
+  type ChildResult,
   type ChildStatus,
 } from './harness/agents/executor.ts'
 export {

@@ -139,6 +139,22 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
             </Row>
             <Row term="history">{manifest.history.setting}: {manifest.history.includedTurns} turns{manifest.history.omittedTurns > 0 ? ` (${manifest.history.omittedTurns} omitted)` : ''}</Row>
             <Row term="tools">{manifest.sources.toolNames !== undefined && manifest.sources.toolNames.length > 0 ? manifest.sources.toolNames.join(', ') : String(manifest.sources.toolSchemas)}</Row>
+            {manifest.sources.child !== undefined ? (
+              <Row term="role">
+                <span title={`instructions sha256 ${manifest.sources.child.instructionsHash}`}>
+                  {manifest.sources.child.definition} · {manifest.sources.child.instructionsHash.slice(0, 12)}
+                </span>
+              </Row>
+            ) : null}
+            {manifest.sources.parentContext !== undefined ? (
+              <Row term="parent context">
+                <span title={`sha256 ${manifest.sources.parentContext.hash}`}>
+                  {manifest.sources.parentContext.chars.toLocaleString()} chars · {manifest.sources.parentContext.hash.slice(0, 12)}
+                </span>
+              </Row>
+            ) : manifest.omissions.some((omission) => omission.startsWith('parent-context:')) ? (
+              <Row term="parent context">{manifest.omissions.find((omission) => omission.startsWith('parent-context:'))?.slice('parent-context: '.length)}</Row>
+            ) : null}
             {manifest.sources.skills.length > 0 ? <Row term="skills">{settingsLink('skills', manifest.sources.skills)}</Row> : null}
             {manifest.sources.memory.length > 0 ? <Row term="memory">{settingsLink('memory', manifest.sources.memory)}</Row> : null}
             {manifest.omissions.length > 0 ? <Row term="omitted"><span title={manifest.omissions.join('\n')}>{manifest.omissions.length} sources omitted</span></Row> : null}

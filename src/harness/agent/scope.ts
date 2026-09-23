@@ -27,9 +27,21 @@ export interface AgentScope {
     readonly parentSessionId: SessionId
     readonly parentTurnId: string
     readonly definition: string
+    /**
+     * The definition body as resolved AT SPAWN — pinned for the child's life,
+     * so editing the role file mid-run never changes a running child. It
+     * becomes the child's system instructions; it grants nothing (the
+     * ceiling below is the enforcement).
+     */
+    readonly instructions: string
     /** Hard ceiling: definition ∩ spawn grant (MCP always explicit). */
     readonly toolCeiling: readonly string[]
     readonly skills?: readonly string[]
+    /**
+     * Bounded parent-conversation projection, captured at spawn when the
+     * caller asked for `inherit: 'brief'`. Runtime-only: never persisted.
+     */
+    readonly inheritedContext?: string
   }
 }
 

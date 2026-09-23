@@ -444,7 +444,8 @@ const DELEGATION_STATE: Readonly<Record<Extract<ViewItem, { kind: 'delegation' }
 
 /**
  * One delegation from the durable spawn → result pair. The settled result
- * payload (summary, file references, error) is fetched when expanded.
+ * payload (the child's final report, files touched, error) is fetched when
+ * expanded.
  */
 export function DelegationCard({ item, workspaceId, onOpen }: {
   readonly item: Extract<ViewItem, { kind: 'delegation' }>
@@ -452,10 +453,15 @@ export function DelegationCard({ item, workspaceId, onOpen }: {
   readonly onOpen?: (childSessionId: string) => void
 }) {
   return (
-    <ActivityRow state={DELEGATION_STATE[item.status]} title={`Delegated to ${item.definition !== '' ? item.definition : 'agent'}`} detail={item.objective}>
+    <ActivityRow state={DELEGATION_STATE[item.status]} title={`Delegated to ${item.definition !== '' ? item.definition : 'agent'}`} detail={item.brief}>
       <DelegationDetail item={item} {...(workspaceId !== undefined ? { workspaceId } : {})} {...(onOpen !== undefined ? { onOpen } : {})} />
     </ActivityRow>
   )
+}
+
+/** Shown whenever a child's report hit the host cap; the full text is in its log. */
+export function TruncatedNote() {
+  return <p className="m-0 text-xs text-warn">Report truncated — open the child conversation for the full text.</p>
 }
 
 function DelegationDetail({ item, workspaceId, onOpen }: {
@@ -483,11 +489,12 @@ function DelegationDetail({ item, workspaceId, onOpen }: {
 
   return (
     <>
-      <Section label="Objective"><p className="m-0 whitespace-pre-wrap break-words">{item.objective !== '' ? item.objective : '—'}</p></Section>
+      <Section label="Brief"><p className="m-0 whitespace-pre-wrap break-words">{item.brief !== '' ? item.brief : '—'}</p></Section>
       {settled ? (
-        <Section label={`Result (${item.status})`} {...(detail?.result !== undefined ? { copy: detail.result.summary } : {})}>
+        <Section label={`Result (${item.status})`} {...(detail?.result !== undefined ? { copy: detail.result.report } : {})}>
+          {detail?.result?.truncated === true ? <TruncatedNote /> : null}
           {detail?.result !== undefined
-            ? <p className="m-0 whitespace-pre-wrap break-words">{detail.result.summary}</p>
+            ? <p className="m-0 whitespace-pre-wrap break-words">{detail.result.report}</p>
             : detail?.error !== undefined
               ? <p className="m-0 text-bad">{detail.error}</p>
               : failed
@@ -498,9 +505,10 @@ function DelegationDetail({ item, workspaceId, onOpen }: {
                   </p>
                 )
                 : <p className="m-0 text-fg-muted">Result payload unavailable for this child session.</p>}
-          {detail?.result !== undefined && detail.result.fileReferences.length > 0 ? (
-            <div className="flex flex-wrap gap-1">
-              {detail.result.fileReferences.map((file) => <code key={file} className="rounded-md bg-muted px-1.5 py-0.5 text-xs">{file}</code>)}
+          {detail?.result !== undefined && detail.result.filesTouched.length > 0 ? (
+            <div className="flex flex-wrap items-center gap-1">
+              <span className="text-xs text-fg-faint">Files touched:</span>
+              {detail.result.filesTouched.map((file) => <code key={file} className="rounded-md bg-muted px-1.5 py-0.5 text-xs">{file}</code>)}
             </div>
           ) : null}
         </Section>

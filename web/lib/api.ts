@@ -556,6 +556,10 @@ export interface ContextManifestView {
     readonly memory: readonly string[]
     readonly toolNames: readonly string[]
     readonly toolSchemas: number
+    /** Present when the request ran as a child role. */
+    readonly child?: { readonly definition: string; readonly instructionsHash: string }
+    /** Inherited parent context the request carried (absent when dropped). */
+    readonly parentContext?: { readonly hash: string; readonly chars: number }
   }
   readonly omissions: readonly string[]
 }
@@ -650,11 +654,16 @@ export function fetchAgentDefinition(workspaceId: string, name: string): Promise
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/agents/${encodeURIComponent(name)}`).then((r) => json<AgentDefinitionRow>(r))
 }
 
+/**
+ * A child's brief: prose `prompt` (primary) or the structured four-field
+ * form. The host requires one of `prompt`/`objective` to be non-empty.
+ */
 export interface SpawnTaskInput {
-  readonly objective: string
-  readonly constraints: readonly string[]
-  readonly references: readonly string[]
-  readonly requiredResult: string
+  readonly prompt?: string
+  readonly objective?: string
+  readonly constraints?: readonly string[]
+  readonly references?: readonly string[]
+  readonly requiredResult?: string
 }
 
 export function spawnChild(
@@ -665,6 +674,8 @@ export function spawnChild(
   grantTools?: readonly string[],
   /** `provider:model`; omitted inherits the conversation's own pair. */
   model?: string,
+  /** `'brief'` hands the child a bounded slice of the conversation; default off. */
+  inherit?: 'none' | 'brief',
 ): Promise<ChildRow> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/agents/${encodeURIComponent(name)}`, {
     method: 'POST',
@@ -674,6 +685,7 @@ export function spawnChild(
       task,
       ...(grantTools !== undefined && grantTools.length > 0 ? { grantTools } : {}),
       ...(model !== undefined && model !== '' ? { model } : {}),
+      ...(inherit === 'brief' ? { inherit } : {}),
     }),
   }).then((r) => json<ChildRow>(r))
 }
@@ -698,7 +710,8 @@ export function cancelChild(workspaceId: string, childSessionId: string): Promis
 
 export interface ImportAgentInput {
   readonly content: string
-  readonly dialect: 'claude' | 'codex'
+  /** `mini-dsh` saves a native document verbatim (strict native parse). */
+  readonly dialect: 'claude' | 'codex' | 'mini-dsh'
   readonly sourceVersion?: string
 }
 

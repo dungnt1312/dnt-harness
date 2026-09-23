@@ -61,9 +61,23 @@ export type SessionEvent =
   | ({ readonly type: 'session/pinned'; readonly pinned: boolean } & SessionEventStamp)
   | ({ readonly type: 'session/project'; readonly projectId: string | null } & SessionEventStamp)
   | ({ readonly type: 'session/model'; readonly provider?: string | null; readonly model?: string | null; readonly thinkingLevel?: string | null } & SessionEventStamp)
-  | ({ readonly type: 'session/child-meta'; readonly parentSessionId: string; readonly parentTurnId: string; readonly definition: string; readonly objective: string } & SessionEventStamp)
-  | ({ readonly type: 'agent/child-spawn'; readonly childSessionId: string; readonly parentTurnId: string; readonly definition: string; readonly objective: string } & SessionEventStamp)
-  | ({ readonly type: 'agent/child-result'; readonly childSessionId: string; readonly parentTurnId: string; readonly status: string } & SessionEventStamp)
+  // Child records: writers emit `brief`; `objective` is the legacy field older
+  // logs carry, so readers take `brief ?? objective`. The inherit audit fields
+  // record how much parent context a child received — never the text itself.
+  | ({
+      readonly type: 'session/child-meta'
+      readonly parentSessionId: string
+      readonly parentTurnId: string
+      readonly definition: string
+      readonly brief?: string
+      readonly objective?: string
+      readonly projectId?: string
+      readonly inherit?: 'none' | 'brief'
+      readonly inheritedHash?: string
+      readonly inheritedChars?: number
+    } & SessionEventStamp)
+  | ({ readonly type: 'agent/child-spawn'; readonly childSessionId: string; readonly parentTurnId: string; readonly definition: string; readonly brief?: string; readonly objective?: string } & SessionEventStamp)
+  | ({ readonly type: 'agent/child-result'; readonly childSessionId: string; readonly parentTurnId: string; readonly status: string; readonly error?: string } & SessionEventStamp)
   | ({ readonly type: 'mcp/call'; readonly server: string; readonly tool: string; readonly argsHash: string; readonly resultHash: string; readonly durationMs: number; readonly isError: boolean } & SessionEventStamp)
   | ({ readonly type: 'hook/run'; readonly event: string; readonly matcher: string; readonly exitCode: number | null; readonly durationMs: number; readonly decision: string } & SessionEventStamp)
 

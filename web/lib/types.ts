@@ -55,6 +55,8 @@ export interface SseEvent {
   readonly parentSessionId?: string
   readonly parentTurnId?: string
   readonly definition?: string
+  /** The child's brief; `objective` is the legacy name older logs carry. */
+  readonly brief?: string
   readonly objective?: string
   readonly status?: string
   /** Hook audit trail. */
@@ -259,6 +261,8 @@ export interface AgentDefinitionRow {
     readonly skills?: readonly string[]
     readonly model?: string
     readonly maxTurns?: number
+    /** mini-dsh native: `false` refuses inherited parent context. */
+    readonly inheritable?: boolean
   }
   readonly source: 'bundled' | 'workspace'
   readonly hash?: string
@@ -273,7 +277,15 @@ export interface ChildRow {
   readonly model?: string
   readonly startedAt: number
   readonly endedAt?: number
-  readonly result?: { readonly summary: string; readonly fileReferences: readonly string[] }
+  /** A completed child's final message — its whole deliverable. */
+  readonly result?: {
+    readonly report: string
+    /** Files it read or wrote (Read/Write/Edit); found paths live in `report`. */
+    readonly filesTouched: readonly string[]
+    /** The report was cut at the host's cap; the marker is in the text. */
+    readonly truncated?: boolean
+  }
+  /** Why there is no result; names the child's full-log session. */
   readonly error?: string
   /** Parked on an approval the user has not answered. */
   readonly awaitingApproval?: boolean

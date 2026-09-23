@@ -10,7 +10,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
 
-export const BUNDLED_AGENT_ROLES = ['explorer', 'worker'] as const
+export const BUNDLED_AGENT_ROLES = ['explorer', 'worker', 'reviewer', 'verifier'] as const
 
 export interface AgentDefinition {
   /** Stable lookup name (file name without .md). */
@@ -28,6 +28,11 @@ export interface AgentDefinition {
   readonly model?: string
   /** Deprecated compatibility metadata. Retained when importing old definitions, but never enforced. */
   readonly maxTurns?: number
+  /**
+   * mini-dsh native: `false` refuses `inherit: 'brief'` spawns (the role never
+   * sees the delegating conversation). Absent means allowed.
+   */
+  readonly inheritable?: boolean
 }
 
 export interface ResolvedAgentDefinition {
@@ -47,9 +52,9 @@ export class AgentDefinitionError extends Error {
   }
 }
 
-/** Frontmatter keys a definition may carry (Claude-compatible subset). */
+/** Frontmatter keys a definition may carry (Claude-compatible subset plus mini-dsh `inheritable`). */
 const KNOWN_KEYS = new Set([
-  'name', 'description', 'tools', 'disallowedTools', 'skills', 'model', 'maxTurns',
+  'name', 'description', 'tools', 'disallowedTools', 'skills', 'model', 'maxTurns', 'inheritable',
 ])
 
 /**
@@ -111,6 +116,12 @@ export function parseAgentDefinition(name: string, raw: string): AgentDefinition
     else invalid.push(`'maxTurns' must be a positive integer, got ${JSON.stringify(frontmatter.maxTurns)}`)
   }
 
+  let inheritable: boolean | undefined
+  if (frontmatter.inheritable !== undefined) {
+    if (typeof frontmatter.inheritable === 'boolean') inheritable = frontmatter.inheritable
+    else invalid.push("'inheritable' must be true or false")
+  }
+
   if (body === '') invalid.push('instructions body must not be empty')
   if (invalid.length > 0) {
     throw new AgentDefinitionError('invalid', `agent definition '${name}' is invalid: ${invalid.join('; ')}`)
@@ -124,29 +135,69 @@ export function parseAgentDefinition(name: string, raw: string): AgentDefinition
     ...(skills !== undefined ? { skills } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(maxTurns !== undefined ? { maxTurns } : {}),
+    ...(inheritable !== undefined ? { inheritable } : {}),
   }
 }
 
-/** Bundled role definitions (read-only; copied for customization). */
+const READ_ONLY_DISALLOWED = ['Write', 'Edit', 'Bash', 'Skill', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget']
+
+/**
+ * Bundled role definitions (read-only; copied for customization). Each
+ * description is a SELECTION rule — the sentence the delegating model reads —
+ * and each body states the exact shape of the final report, because a
+ * child's final message is its whole deliverable.
+ */
 export function bundledDefinition(name: string): AgentDefinition {
   if (name === 'explorer') {
     return {
       name: 'explorer',
-      description: 'Read-only explorer: investigates the project with Read/Glob/Grep and reports findings.',
-      instructions:
-        'You are a read-only explorer. Investigate with read tools only and report concise findings with file references. You cannot write, edit, or run commands.',
+      description: 'Finds and explains things in the project. Use it when you need to locate code or understand how something works and will act on the answer yourself.',
+      instructions: [
+        'You investigate the project and report what you found. You cannot change anything.',
+        'Search broadly first (Glob, Grep), then read only what answers the brief. Prefer evidence over guesses; say so when something could not be found.',
+        'Your final message answers the brief directly, then lists the evidence: one line per finding as `path:line` — what is there and why it matters.',
+      ].join(' '),
       tools: ['Read', 'Glob', 'Grep'],
-      disallowedTools: ['Write', 'Edit', 'Bash', 'Skill', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget'],
+      disallowedTools: READ_ONLY_DISALLOWED,
     }
   }
   if (name === 'worker') {
     return {
       name: 'worker',
-      description: 'Bounded worker: executes one concrete task with file tools, constrained by the effective mode/permissions.',
-      instructions:
-        'You are a focused worker. Complete exactly the assigned task, verify your changes, and report what you did with file references. Stay within the granted tools.',
+      description: 'Makes one concrete, already-decided change to files. Use it when you know exactly what to edit and want it done without spending your own context on it.',
+      instructions: [
+        'You make exactly the change the brief describes — nothing beyond it. Read the files before editing them and re-read what you wrote to check it.',
+        'If the brief is ambiguous or the change turns out to be wrong, stop and say so instead of improvising.',
+        'Your final message lists every file you changed as `path` — what changed, followed by anything you could not do and why.',
+      ].join(' '),
       tools: ['Read', 'Glob', 'Grep', 'Write', 'Edit'],
       disallowedTools: ['Bash'],
+    }
+  }
+  if (name === 'reviewer') {
+    return {
+      name: 'reviewer',
+      description: 'Finds defects in existing code. Use it after you or a worker changed something, when you want a second read rather than more edits.',
+      instructions: [
+        'You review code and report defects. You cannot change anything.',
+        'Read the files named in your brief plus whatever they depend on. Look for incorrect behaviour first, then missing error handling, then contract breaks — not style.',
+        'Your final message is a list. Each entry: `path:line` — the defect in one sentence — the concrete input or state that triggers it. Say "no defects found" if that is the truth; do not pad the list.',
+      ].join(' '),
+      tools: ['Read', 'Glob', 'Grep'],
+      disallowedTools: READ_ONLY_DISALLOWED,
+    }
+  }
+  if (name === 'verifier') {
+    return {
+      name: 'verifier',
+      description: 'Runs a command and judges its outcome. Use it when you need tests, a typecheck, or a build run and want a verdict back instead of the raw output.',
+      instructions: [
+        'You run the commands the brief names (tests, typecheck, build) and judge the outcome. You cannot edit files.',
+        'Run each command once; rerun only to confirm a flaky result. Read the code a failure points at when that explains it.',
+        'Your final message starts with PASS or FAIL, then one line per command: the command — its exit code — the failing cases, each with `path:line` and the assertion or error text.',
+      ].join(' '),
+      tools: ['Read', 'Glob', 'Grep', 'Bash'],
+      disallowedTools: ['Write', 'Edit', 'Skill', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget'],
     }
   }
   throw new AgentDefinitionError('not-found', `no bundled agent role '${name}'`)
@@ -197,7 +248,13 @@ export class AgentDefinitionService {
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith('.md')) continue
       const name = entry.name.slice(0, -3)
-      if ((BUNDLED_AGENT_ROLES as readonly string[]).includes(name)) continue
+      if ((BUNDLED_AGENT_ROLES as readonly string[]).includes(name)) {
+        // A workspace file named like a bundled role (e.g. one written before
+        // that role was bundled) never runs — the bundled role wins. Say so
+        // instead of hiding it; `delete` removes such a file.
+        console.warn(`agents: workspace definition '${name}' in ${workspaceId} is shadowed by the bundled role; rename it to keep it`)
+        continue
+      }
       try {
         rows.push(await this.resolve(workspaceId, name))
       } catch {
@@ -241,7 +298,9 @@ export class AgentDefinitionService {
 
   async delete(workspaceId: string, name: string): Promise<void> {
     if ((BUNDLED_AGENT_ROLES as readonly string[]).includes(name)) {
-      throw new AgentDefinitionError('duplicate', 'bundled roles cannot be deleted')
+      // The bundled role itself cannot go; a shadowed workspace file can.
+      const shadowed = await fs.stat(this.filePath(workspaceId, name)).then(() => true, () => false)
+      if (!shadowed) throw new AgentDefinitionError('duplicate', 'bundled roles cannot be deleted')
     }
     await fs.rm(this.filePath(workspaceId, name), { force: true })
   }

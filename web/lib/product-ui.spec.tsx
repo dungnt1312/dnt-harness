@@ -209,7 +209,7 @@ describe('transcript grouping', () => {
       { kind: 'tool', call: { id: 'd', name: 'Read', args: {} } },
       { kind: 'assistant', content: '', live: false, thinking: ['weighing options'], thinkingLive: false },
       { kind: 'tool', call: { id: 'e', name: 'Read', args: {} } },
-      { kind: 'delegation', childSessionId: 'child', definition: 'explorer', objective: 'look', status: 'completed' },
+      { kind: 'delegation', childSessionId: 'child', definition: 'explorer', brief: 'look', status: 'completed' },
     ])
     expect(blocks.map((block) => block.kind === 'activity' ? `activity:${block.rows.length}` : block.row.item.kind))
       .toEqual(['user', 'activity:2', 'tool', 'activity:1', 'assistant', 'activity:1', 'delegation'])
@@ -504,18 +504,18 @@ describe('transcript truthfulness', () => {
   })
   it('shows the delegation timeline and opens the child conversation', async () => {
     const onOpen = vi.fn()
-    await mount(<DelegationCard item={{ kind: 'delegation', childSessionId: 'child-1', definition: 'explorer', objective: 'Map auth modules', status: 'completed' }} workspaceId={null} onOpen={onOpen} />)
+    await mount(<DelegationCard item={{ kind: 'delegation', childSessionId: 'child-1', definition: 'explorer', brief: 'Map auth modules', status: 'completed' }} workspaceId={null} onOpen={onOpen} />)
     const head = host.querySelector('button')!
     expect(head.textContent).toContain('Delegated to explorer')
     expect(head.textContent).toContain('Map auth modules')
     expect(head.textContent).toContain('Succeeded')
     await act(async () => head.click())
-    expect(host.textContent).toContain('Objective')
+    expect(host.textContent).toContain('Brief')
     await act(async () => button('Open conversation').click())
     expect(onOpen).toHaveBeenCalledWith('child-1')
   })
   it('keeps a running delegation silent about its result until settled', async () => {
-    await mount(<DelegationCard item={{ kind: 'delegation', childSessionId: 'child-2', definition: 'coder', objective: 'Fix', status: 'running' }} workspaceId={null} onOpen={() => {}} />)
+    await mount(<DelegationCard item={{ kind: 'delegation', childSessionId: 'child-2', definition: 'coder', brief: 'Fix', status: 'running' }} workspaceId={null} onOpen={() => {}} />)
     expect(host.textContent).toContain('Running')
     await act(async () => host.querySelector('button')!.click())
     expect(host.textContent).not.toContain('Result (')
@@ -558,11 +558,18 @@ describe('projection of delegation, hook and approval events', () => {
       { type: 'agent/child-result', seq: 5, childSessionId: 'ch1', status: 'completed' },
     ])
     const delegations = items.filter(item => item.kind === 'delegation')
-    expect(delegations[0]).toMatchObject({ childSessionId: 'ch1', status: 'completed' })
-    expect(delegations[1]).toMatchObject({ childSessionId: 'ch2', status: 'interrupted' })
+    // Legacy logs carry `objective`; it still projects as the brief.
+    expect(delegations[0]).toMatchObject({ childSessionId: 'ch1', status: 'completed', brief: 'Map' })
+    expect(delegations[1]).toMatchObject({ childSessionId: 'ch2', status: 'interrupted', brief: 'Fix' })
     const audits = items.filter(item => item.kind === 'audit')
     expect(audits).toHaveLength(1)
     expect(audits[0]).toMatchObject({ icon: 'block' })
+  })
+  it('projects the durable brief a current spawn record carries', () => {
+    const items = projectItems([
+      { type: 'agent/child-spawn', seq: 0, childSessionId: 'ch3', definition: 'reviewer', brief: 'Review the auth changes' },
+    ])
+    expect(items.find(item => item.kind === 'delegation')).toMatchObject({ childSessionId: 'ch3', brief: 'Review the auth changes' })
   })
   it('correlates an approval decision with its request into one quiet line', () => {
     const items = projectItems([
@@ -607,6 +614,20 @@ describe('context compaction + budget bar', () => {
     await act(async () => bodyButton('Compact').click())
     expect(compactSession).toHaveBeenCalledWith('w1', 's1')
     expect(document.body.textContent).not.toContain('Compact this conversation?')
+  })
+  it('shows a child request’s role and inherited parent context, or why it was dropped', async () => {
+    const hash = 'c'.repeat(64)
+    const child = { ...manifest, sources: { ...manifest.sources, child: { definition: 'explorer', instructionsHash: hash }, parentContext: { hash, chars: 1234 } } }
+    await mount(<ToastHost><ContextPanel meta={null} stream="open" sessionId="s1" sessionFolder={null} eventCount={0} manifest={child} workspaceId="w1" running={false} /></ToastHost>)
+    expect(host.textContent).toContain(`explorer · ${hash.slice(0, 12)}`)
+    expect(host.textContent).toContain('1,234 chars')
+    const dropped = { ...manifest, sources: { ...manifest.sources, child: { definition: 'explorer', instructionsHash: hash } }, omissions: ['parent-context: dropped for budget (1234 chars)'] }
+    await mount(<ToastHost><ContextPanel meta={null} stream="open" sessionId="s1" sessionFolder={null} eventCount={0} manifest={dropped} workspaceId="w1" running={false} /></ToastHost>)
+    expect(host.textContent).toContain('dropped for budget (1234 chars)')
+    // A root manifest shows neither row.
+    await mount(<ToastHost><ContextPanel meta={null} stream="open" sessionId="s1" sessionFolder={null} eventCount={0} manifest={manifest} workspaceId="w1" running={false} /></ToastHost>)
+    expect(host.textContent).not.toContain('parent context')
+    expect(host.textContent).not.toContain('role')
   })
   it('disables compaction while a turn runs', async () => {
     await mount(<ToastHost><ContextPanel meta={null} stream="open" sessionId="s1" sessionFolder={null} eventCount={0} manifest={manifest} workspaceId="w1" running /></ToastHost>)

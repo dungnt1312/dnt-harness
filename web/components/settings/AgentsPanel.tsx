@@ -7,6 +7,7 @@ import { Field } from '../ui/Field.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Segmented } from '../ui/Segmented.tsx'
 import { Select } from '../ui/Select.tsx'
+import { Switch } from '../ui/Switch.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
 import {
   deleteAgentDefinition,
@@ -35,8 +36,12 @@ const IMPORT_PLACEHOLDER = '---\ndescription: "reviews code"\ntools: ["Read", "G
 
 const linesToArray = (raw: string): string[] => raw.split('\n').map((line) => line.trim()).filter((line) => line !== '')
 
-/** A Claude-dialect definition document built from the create form. */
-export function definitionDocument(draft: { readonly name: string; readonly description: string; readonly tools: string; readonly disallowedTools: string; readonly instructions: string; readonly model: string }): string {
+/**
+ * A native mini-dsh definition document built from the create form. It is
+ * also a valid Claude-subset document except for `inheritable`, which is a
+ * mini-dsh key and is written only when a role refuses inherited context.
+ */
+export function definitionDocument(draft: { readonly name: string; readonly description: string; readonly tools: string; readonly disallowedTools: string; readonly instructions: string; readonly model: string; readonly inheritable?: boolean }): string {
   const list = (raw: string): string => JSON.stringify(linesToArray(raw))
   return [
     '---',
@@ -47,6 +52,8 @@ export function definitionDocument(draft: { readonly name: string; readonly desc
     // Omitted entirely when blank: no key means the child inherits the
     // conversation's model, which is not the same as pinning one.
     ...(draft.model.trim() !== '' ? [`model: ${JSON.stringify(draft.model.trim())}`] : []),
+    // Absent means allowed; only a refusal is worth recording.
+    ...(draft.inheritable === false ? ['inheritable: false'] : []),
     '---',
     '',
     draft.instructions.trim(),
@@ -81,6 +88,7 @@ function AgentsPanelContent({ workspaceId, modelOptions }: AgentsPanelProps) {
   const [createDisallowed, setCreateDisallowed] = useScopedState('')
   const [createInstructions, setCreateInstructions] = useScopedState('')
   const [createModel, setCreateModel] = useScopedState('')
+  const [createInheritable, setCreateInheritable] = useScopedState(true)
   const [importName, setImportName] = useScopedState('')
   const [importContent, setImportContent] = useScopedState('')
   const [importDialect, setImportDialect] = useScopedState<'claude' | 'codex'>('claude')
@@ -118,11 +126,19 @@ function AgentsPanelContent({ workspaceId, modelOptions }: AgentsPanelProps) {
   const createDefinition = (): Promise<void> => run('create', async () => {
     if (createInvalid !== null) { setNotice({ kind: 'bad', text: createInvalid }); return }
     const name = createName.trim()
-    // The create form is the supported Claude subset, so it goes through the
-    // same import path — one validation and provenance rule, not two.
+    // The form writes a native document, saved verbatim after the strict
+    // native parse — so mini-dsh keys like `inheritable` round-trip.
     await importAgentDefinition(workspaceId, name, {
-      content: definitionDocument({ name, description: createDescription, tools: createTools, disallowedTools: createDisallowed, instructions: createInstructions, model: createModel }),
-      dialect: 'claude',
+      content: definitionDocument({
+        name,
+        description: createDescription,
+        tools: createTools,
+        disallowedTools: createDisallowed,
+        instructions: createInstructions,
+        model: createModel,
+        inheritable: createInheritable,
+      }),
+      dialect: 'mini-dsh',
     })
     await refreshDefinitions()
     setSelected(name)
@@ -131,8 +147,22 @@ function AgentsPanelContent({ workspaceId, modelOptions }: AgentsPanelProps) {
     setCreateTools('')
     setCreateDisallowed('')
     setCreateInstructions('')
+    setCreateInheritable(true)
     setNotice({ kind: 'ok', text: `Created ${name}.` })
   })
+
+  /** Prefill the create form from a role — the path to customize a bundled one. */
+  const copyToCustomize = (row: AgentDefinitionRow): void => {
+    const definition = row.definition
+    setCreateName(`${definition.name}-custom`)
+    setCreateDescription(definition.description)
+    setCreateTools(definition.tools.join('\n'))
+    setCreateDisallowed(definition.disallowedTools.join('\n'))
+    setCreateInstructions(definition.instructions)
+    setCreateModel(definition.model ?? '')
+    setCreateInheritable(definition.inheritable !== false)
+    setNotice({ kind: 'info', text: `Copied ${definition.name} into "Create a role" below — rename it and adjust.` })
+  }
 
   const codexNeedsVersion = importDialect === 'codex' && importVersion.trim() === ''
   const importDefinition = (): Promise<void> => run('import', async () => {
@@ -200,6 +230,8 @@ function AgentsPanelContent({ workspaceId, modelOptions }: AgentsPanelProps) {
             <dd className="m-0 min-w-0 break-words">{current.definition.tools.length > 0 ? current.definition.tools.join(', ') : 'All allowed tools'}</dd>
             <dt className="m-0 text-fg-faint">Model</dt>
             <dd className="m-0 min-w-0 break-words">{current.definition.model ?? 'Inherits the conversation'}</dd>
+            <dt className="m-0 text-fg-faint">Parent context</dt>
+            <dd className="m-0 min-w-0 break-words">{current.definition.inheritable === false ? 'Refused — spawns never inherit the conversation' : 'Allowed when a spawn asks for it'}</dd>
             {current.definition.disallowedTools.length > 0 ? (
               <>
                 <dt className="m-0 text-fg-faint">Always denied</dt>
@@ -207,6 +239,11 @@ function AgentsPanelContent({ workspaceId, modelOptions }: AgentsPanelProps) {
               </>
             ) : null}
           </dl>
+          <div>
+            <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => copyToCustomize(current)}>
+              <Icon name="copy" size={13} />Copy to customize
+            </Button>
+          </div>
           <Disclosure summary="Definition JSON">
             <pre className="m-0 max-h-72 overflow-auto rounded-lg bg-muted p-3 font-mono text-xs">{JSON.stringify(current.definition, null, 2)}</pre>
           </Disclosure>
@@ -227,7 +264,7 @@ function AgentsPanelContent({ workspaceId, modelOptions }: AgentsPanelProps) {
         <Disclosure summary="Create a role">
           <div className="grid gap-4 md:grid-cols-2">
             <Field label="Role name" hint="Letters, numbers, underscores, or hyphens.">
-              <TextInput mono value={createName} placeholder="reviewer" onChange={(e) => setCreateName(e.target.value)} />
+              <TextInput mono value={createName} placeholder="security-reviewer" onChange={(e) => setCreateName(e.target.value)} />
             </Field>
             <Field label="Description" hint="What this role is for.">
               <TextInput value={createDescription} placeholder="Reviews changes for correctness" onChange={(e) => setCreateDescription(e.target.value)} />
@@ -249,6 +286,14 @@ function AgentsPanelContent({ workspaceId, modelOptions }: AgentsPanelProps) {
                 onChange={setCreateModel}
               />
             </Field>
+            <div className="md:col-span-2">
+              <Switch
+                label="Accept inherited context"
+                hint="Off refuses spawns that ask to pass this conversation's recent messages to the child."
+                checked={createInheritable}
+                onChange={setCreateInheritable}
+              />
+            </div>
             <div className="md:col-span-2">
               <Field label="Instructions" hint="The system instructions the child agent receives.">
                 <CodeArea rows={5} value={createInstructions} placeholder="Review carefully and report file references." onChange={(e) => setCreateInstructions(e.target.value)} />

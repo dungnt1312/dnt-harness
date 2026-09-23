@@ -47,7 +47,8 @@ export type ViewItem =
       readonly kind: 'delegation'
       readonly childSessionId: string
       readonly definition: string
-      readonly objective: string
+      /** The child's brief (legacy logs: its objective). */
+      readonly brief: string
       readonly ts?: number
       status: 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
     }
@@ -257,7 +258,7 @@ export function projectItems(events: readonly SseEvent[]): ViewItem[] {
           kind: 'delegation',
           childSessionId: event.childSessionId,
           definition: event.definition ?? '',
-          objective: event.objective ?? '',
+          brief: event.brief ?? event.objective ?? '',
           ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
           status: 'running',
         }
@@ -273,7 +274,7 @@ export function projectItems(events: readonly SseEvent[]): ViewItem[] {
             kind: 'delegation',
             childSessionId: event.childSessionId,
             definition: event.definition ?? '',
-            objective: event.objective ?? '',
+            brief: event.brief ?? event.objective ?? '',
             ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
             status: 'running',
           }

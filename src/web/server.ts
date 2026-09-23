@@ -106,7 +106,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { runHook, isBlockingDecision, isFailureDecision } from '../harness/hooks/runner.ts'
 import type { HooksConfig } from '../harness/mcp/config.ts'
 import { ChildExecutor, SpawnError, type ChildModel, type TaskPacket } from '../harness/agents/executor.ts'
-import { agentTool, ChildModelError, resolveChildModel } from './agent-delegation.ts'
+import { agentTool, ChildModelError, projectInheritedMessages, resolveChildModel } from './agent-delegation.ts'
 import { importClaudeDefinition } from '../harness/agents/compatibility/claude.ts'
 import { SkillsService, SkillError } from '../harness/skills/service.ts'
 import { MemoryService, MemoryError } from '../harness/memory/service.ts'
@@ -834,7 +834,11 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const skillSnapshots = new Map<SessionId, Map<string, ActiveSkill>>()
   kernel.ctx.on('agent/turn-settled', async () => {
     const settled = agentScope.getStore()?.sessionId
-    if (settled !== undefined) skillSnapshots.delete(settled)
+    if (settled !== undefined) {
+      skillSnapshots.delete(settled)
+      // A root turn's per-turn spawn budget ends with the turn.
+      childExecutor.releaseTurns(settled)
+    }
   })
 
   // Automatic compaction (G3): when enabled, a completed boundary whose
@@ -1571,6 +1575,9 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     // Explorer none; other children require explicit spawn grant).
     const workspaceMcpConfig = await mcpStore.loadMcp(workspaceId)
     let exposed = projected.tools?.filter((schema) => {
+      // A child sees only its ceiling, and never the delegation tool: the
+      // schemas it carries are exactly what its capability line advertises.
+      if (scope?.childOf !== undefined && (schema.name === 'Agent' || !scope.childOf.toolCeiling.includes(schema.name))) return false
       if (!schema.name.startsWith('mcp__')) return mode.definition.toolExposure.includes(schema.name)
       const parts = schema.name.split('__')
       const serverName = parts[1] ?? ''
@@ -1662,6 +1669,10 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
       budget,
       ...(compaction !== undefined ? { compaction } : {}),
       ...(loadedAttachments !== undefined ? { attachments: loadedAttachments } : {}),
+      ...(scope?.childOf !== undefined
+        ? { child: { definition: scope.childOf.definition, instructions: scope.childOf.instructions } }
+        : {}),
+      ...(scope?.childOf?.inheritedContext !== undefined ? { inheritedContext: scope.childOf.inheritedContext } : {}),
     })
     if (scope !== undefined) lastManifests.set(scope.sessionId, assembled.manifest)
     // Replace wholesale: when the mode exposes nothing, tools must LEAVE the
@@ -2480,9 +2491,13 @@ async function handleApi(
             send(500, { error: `SessionEnd hook/audit failed; session kept: ${String(error instanceof Error ? error.message : error)}` })
             return
           }
+          // Children spawned over HTTP can outlive an idle root: stop them
+          // first, so none keeps running against a deleted conversation.
+          await deps.childExecutor.cancelAllOfRoot(entry.session.id)
           deps.sessions.delete(entry.session.id)
           deps.kernel.ctx.agents.forget(entry.session.id)
           await deps.kernel.ctx.sessions.delete(entry.session.id)
+          forgetSessionState(entry.session.id, deps)
           entry.closed = true
           send(200, { deleted: true })
           return
@@ -2551,9 +2566,12 @@ async function handleApi(
           send(400, { error: "body needs a 'task' object" })
           return
         }
+        // Shape only: whether the brief is usable is decided once, by the
+        // executor (SpawnError 'packet' → 400).
         const packet = packetBody as Record<string, unknown>
-        if (typeof packet['objective'] !== 'string' || packet['objective'].trim() === '') {
-          send(400, { error: 'task.objective must be a non-empty string' })
+        const inherit = body['inherit'] ?? 'none'
+        if (inherit !== 'none' && inherit !== 'brief') {
+          send(400, { error: "'inherit' must be 'none' or 'brief'" })
           return
         }
         const rootId = typeof body['rootSessionId'] === 'string' ? body['rootSessionId'] : ''
@@ -2562,14 +2580,21 @@ async function handleApi(
           send(404, { error: 'no such root session' })
           return
         }
+        // Captured synchronously right after the parent resolves, before any
+        // await: a parent message appended later can never leak in.
+        const inheritedContext = inherit === 'brief' ? projectInheritedMessages(parent.session.events) : undefined
         try {
           const resolved = await deps.agentDefinitions.resolve(wsId, name)
           const parentTurn = [...parent.session.events].reverse().find((event) => event.type === 'turn/start')
           const task: TaskPacket = {
-            objective: packet['objective'],
-            constraints: Array.isArray(packet['constraints']) ? (packet['constraints'] as unknown[]).map(String) : [],
-            references: Array.isArray(packet['references']) ? (packet['references'] as unknown[]).map(String) : [],
-            requiredResult: typeof packet['requiredResult'] === 'string' ? packet['requiredResult'] : 'bounded summary with file references',
+            ...(typeof packet['prompt'] === 'string' ? { prompt: packet['prompt'] } : {}),
+            ...(typeof packet['objective'] === 'string' ? { objective: packet['objective'] } : {}),
+            // Same normalization as the Agent tool: blank entries dropped.
+            constraints: Array.isArray(packet['constraints']) ? (packet['constraints'] as unknown[]).map(String).filter((entry) => entry.trim() !== '') : [],
+            references: Array.isArray(packet['references']) ? (packet['references'] as unknown[]).map(String).filter((entry) => entry.trim() !== '') : [],
+            requiredResult: typeof packet['requiredResult'] === 'string' && packet['requiredResult'].trim() !== ''
+              ? packet['requiredResult'].trim()
+              : 'bounded summary with file references',
           }
           const spawnRequest = {
             workspaceId: wsId,
@@ -2577,6 +2602,7 @@ async function handleApi(
             parentTurnId: parentTurn !== undefined && parentTurn.type === 'turn/start' ? String(parentTurn.turnId) : 'ad-hoc',
             definition: resolved.definition,
             packet: task,
+            ...(inheritedContext !== undefined ? { inherit: 'brief' as const, inheritedContext } : {}),
           }
           const model = deps.childModelFor(
             parent.session,
@@ -2590,10 +2616,16 @@ async function handleApi(
             ...(Array.isArray(body['grantTools']) ? { grantTools: (body['grantTools'] as unknown[]).map(String) } : {}),
             ...(model !== undefined ? { model } : {}),
           })
-          send(202, handle)
+          send(202, {
+            ...handle,
+            ...(inheritedContext !== undefined ? { inheritedChars: inheritedContext.length } : {}),
+            ...(typeof task.prompt === 'string' && task.prompt.trim() !== '' && typeof task.objective === 'string' && task.objective.trim() !== ''
+              ? { note: "both 'prompt' and 'objective' were given; the prompt is the brief" }
+              : {}),
+          })
         } catch (error) {
           if (error instanceof SpawnError) {
-            send(error.code === 'capacity' ? 429 : 404, { error: error.message })
+            send(error.code === 'capacity' ? 429 : error.code === 'packet' || error.code === 'inherit' ? 400 : 404, { error: error.message })
             return
           }
           if (error instanceof ChildModelError) {
@@ -2615,7 +2647,7 @@ async function handleApi(
           send(404, { error: 'no such root session' })
           return
         }
-        send(200, deps.childExecutor.childrenOfRoot(parent.session.id, wsId))
+        send(200, await deps.childExecutor.childrenOfRoot(parent.session.id, wsId))
         return
       }
       if (req.method === 'GET') {
@@ -2695,6 +2727,15 @@ async function handleApi(
       }
       try {
         const dialect = typeof body['dialect'] === 'string' ? body['dialect'] : 'claude'
+        if (dialect === 'mini-dsh') {
+          // A native document (the Settings create/copy form): saved verbatim
+          // after the strict native parse, so mini-dsh-only keys such as
+          // `inheritable` survive the round-trip.
+          const saved = await deps.agentDefinitions.save(wsId, targetName, content)
+          const keys = Object.keys(saved.definition).filter((key) => key !== 'instructions' && key !== 'name')
+          send(201, { definition: saved, imported: keys, warnings: [], active: true })
+          return
+        }
         const result =
           dialect === 'codex'
             ? await import('../harness/agents/compatibility/claude.ts').then((mod) =>
@@ -3093,9 +3134,11 @@ async function handleApi(
             send(409, { error: 'session is running; stop it before deleting' })
             return
           }
+          await deps.childExecutor.cancelAllOfRoot(entry.session.id)
           deps.sessions.delete(entry.session.id)
           deps.kernel.ctx.agents.forget(entry.session.id)
           await deps.kernel.ctx.sessions.delete(entry.session.id)
+          forgetSessionState(entry.session.id, deps)
           entry.closed = true
           deps.legacyFolders.delete(entry.session.id)
           send(200, { deleted: true })
@@ -4257,6 +4300,7 @@ function serializeDefinition(definition: import('../harness/agents/definition-se
     ...(definition.skills !== undefined ? [`skills: ${JSON.stringify(definition.skills)}`] : []),
     ...(definition.model !== undefined ? [`model: ${JSON.stringify(definition.model)}`] : []),
     ...(definition.maxTurns !== undefined ? [`maxTurns: ${definition.maxTurns}`] : []),
+    ...(definition.inheritable !== undefined ? [`inheritable: ${definition.inheritable}`] : []),
   ]
   return `---\n${fm.join('\n')}\n---\n\n${definition.instructions.trim()}\n`
 }
@@ -4363,6 +4407,12 @@ async function acceptMessage(
   req: IncomingMessage,
   deps: HandlerDeps,
 ): Promise<{ ok: false; status: number; error: string } | { ok: true; status: number; body: Record<string, unknown> }> {
+  // A child session is driven by the ChildExecutor only. Accepting input here
+  // would run it as a plain root Agent — no role prompt, no tool ceiling, no
+  // one-level guard — so the durable child record refuses it outright.
+  if (entry.session.events.some((event) => event.type === 'session/child-meta')) {
+    return { ok: false, status: 409, error: 'this is a child agent session; it is executor-managed and cannot receive messages or be resumed directly' }
+  }
   const body = await readJson(req)
   const content = body['content']
   if (typeof content !== 'string') {
@@ -4691,6 +4741,12 @@ function workspaceMeta(workspaceId: WorkspaceId, deps: HandlerDeps, folder?: str
   }
 }
 
+/** A deleted session leaves no per-session index behind (manifest, child indexes). */
+function forgetSessionState(sessionId: SessionId, deps: HandlerDeps): void {
+  deps.lastManifests.delete(sessionId)
+  for (const childId of deps.childExecutor.forgetRoot(sessionId)) deps.lastManifests.delete(childId)
+}
+
 /**
  * Resolve a session entry with an ownership check: the session must belong
  * to the addressed workspace. Unknown ids and foreign-workspace ids both
@@ -4715,7 +4771,10 @@ async function findSession(rawId: string, workspaceId: WorkspaceId, deps: Handle
     workspaceId,
     projectId,
   }
-  deps.sessions.set(id, entry)
+  // A child session is executor-managed: it is viewable here, but it never
+  // joins the root registry — registration would let the writer lease treat a
+  // running child as a root turn and hold the project lease for its whole run.
+  if (!session.events.some((event) => event.type === 'session/child-meta')) deps.sessions.set(id, entry)
   return entry
 }
 

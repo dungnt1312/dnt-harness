@@ -8,6 +8,9 @@
 import { AgentDefinitionError, type AgentDefinition } from '../definition-service.ts'
 
 /** Fields the Claude sub-agent frontmatter may carry (documented subset). */
+// mini-dsh's native `inheritable` is deliberately absent: it is not a Claude
+// key, so a Claude file carrying it reports it under `ignored` and no Claude
+// import ever produces it.
 const CLAUDE_SUPPORTED_KEYS = new Set(['name', 'description', 'tools', 'disallowedTools', 'skills', 'model', 'maxTurns'])
 
 /**

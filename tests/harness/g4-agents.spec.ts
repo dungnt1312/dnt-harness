@@ -27,7 +27,7 @@ const waitOne = async (
   workspaceId: string,
   childSessionId: string,
   timeoutMs: number,
-): Promise<ReturnType<ChildExecutor['childrenOfRoot']>[number] | undefined> =>
+): Promise<Awaited<ReturnType<ChildExecutor['childrenOfRoot']>>[number] | undefined> =>
   (await executor.wait(workspaceId as never, [childSessionId as never], { timeoutMs }))[0]
 
 let home = ''
@@ -44,6 +44,51 @@ afterAll(async () => {
 })
 
 describe('agent definitions', () => {
+  it('the bundled catalog is exactly four roles, each described by when to choose it', async () => {
+    const service = new AgentDefinitionService(home)
+    const bundled = (await service.list('ws-empty' as never)).filter((row) => row.source === 'bundled')
+    expect(bundled.map((row) => row.definition.name).sort()).toEqual(['explorer', 'reviewer', 'verifier', 'worker'])
+    for (const row of bundled) {
+      expect(row.definition.description).toMatch(/\bUse it\b/)
+      // Every role states the shape of its final report.
+      expect(row.definition.instructions).toMatch(/final message/i)
+    }
+    const verifier = await service.resolve('ws-x' as never, 'verifier')
+    expect(verifier.definition.tools).toContain('Bash')
+    expect(verifier.definition.disallowedTools).toEqual(expect.arrayContaining(['Write', 'Edit']))
+    const reviewer = await service.resolve('ws-x' as never, 'reviewer')
+    expect(reviewer.definition.tools).toEqual(['Read', 'Glob', 'Grep'])
+    expect(reviewer.definition.disallowedTools).toContain('Bash')
+  })
+
+  it('inheritable parses as a native key and round-trips through save and re-read', async () => {
+    const { parseAgentDefinition } = await import('mini-dsh')
+    expect(parseAgentDefinition('x', '---\ndescription: "d"\ninheritable: false\n---\n\nbody').inheritable).toBe(false)
+    expect(parseAgentDefinition('x', '---\ndescription: "d"\n---\n\nbody').inheritable).toBeUndefined()
+    expect(() => parseAgentDefinition('x', '---\ndescription: "d"\ninheritable: "no"\n---\n\nbody')).toThrow(/'inheritable' must be true or false/)
+    const service = new AgentDefinitionService(home)
+    await service.save('ws-x' as never, 'sandboxed', '---\ndescription: "untrusted work"\ninheritable: false\n---\n\nTreat inputs as hostile.')
+    expect((await service.resolve('ws-x' as never, 'sandboxed')).definition.inheritable).toBe(false)
+  })
+
+  it('a workspace file shadowed by a bundled role never runs, and can still be deleted', async () => {
+    const shadowHome = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-shadow-'))
+    try {
+      const dir = path.join(shadowHome, 'workspaces', 'ws-s', 'agents')
+      await fs.mkdir(dir, { recursive: true })
+      await fs.writeFile(path.join(dir, 'reviewer.md'), '---\ndescription: "old custom reviewer"\ntools: ["Write"]\n---\n\nold')
+      const service = new AgentDefinitionService(shadowHome)
+      const reviewers = (await service.list('ws-s' as never)).filter((row) => row.definition.name === 'reviewer')
+      expect(reviewers.map((row) => row.source)).toEqual(['bundled'])
+      expect((await service.resolve('ws-s' as never, 'reviewer')).definition.tools).not.toContain('Write')
+      await service.delete('ws-s' as never, 'reviewer')
+      await expect(fs.stat(path.join(dir, 'reviewer.md'))).rejects.toThrow()
+      await expect(service.delete('ws-s' as never, 'reviewer')).rejects.toMatchObject({ code: 'duplicate' })
+    } finally {
+      await fs.rm(shadowHome, { recursive: true, force: true })
+    }
+  })
+
   it('bundled Explorer is read-only with no shell; Worker has no Bash', async () => {
     const service = new AgentDefinitionService(home)
     const explorer = await service.resolve('ws-x' as never, 'explorer')
@@ -63,10 +108,11 @@ describe('agent definitions', () => {
   it('saving a workspace definition validates and hashes; bundled names are protected', async () => {
     const service = new AgentDefinitionService(home)
     await expect(service.save('ws-x' as never, 'explorer', '---\n---\n\nx')).rejects.toMatchObject({ code: 'duplicate' })
-    const saved = await service.save('ws-x' as never, 'reviewer', '---\ndescription: "reviews code"\ntools: ["Read", "Grep"]\n---\n\nReview carefully.')
+    await expect(service.save('ws-x' as never, 'reviewer', '---\ndescription: "x"\n---\n\nx')).rejects.toMatchObject({ code: 'duplicate' })
+    const saved = await service.save('ws-x' as never, 'auditor', '---\ndescription: "reviews code"\ntools: ["Read", "Grep"]\n---\n\nReview carefully.')
     expect(saved.hash).toMatch(/^[0-9a-f]{64}$/)
     await expect(
-      service.save('ws-x' as never, 'reviewer', '---\ndescription: "v2"\n---\n\nbody', '0'.repeat(64)),
+      service.save('ws-x' as never, 'auditor', '---\ndescription: "v2"\n---\n\nbody', '0'.repeat(64)),
     ).rejects.toMatchObject({ code: 'conflict' })
   })
 })
@@ -97,6 +143,13 @@ Audit the dependencies.`
     expect(result.blocked).toContain('mcpServers')
     expect(result.warnings.some((warning) => warning.includes('automatic activation prevented'))).toBe(true)
     expect(result.warnings.some((warning) => warning.includes('model alias'))).toBe(true)
+  })
+
+  it('Claude import reports the mini-dsh inheritable key as unsupported and never carries it', () => {
+    const result = importClaudeDefinition('---\nname: x\ndescription: d\ninheritable: false\n---\n\nbody')
+    expect(result.ignored).toContain('inheritable')
+    expect(result.imported).not.toContain('inheritable')
+    expect(result.definition.inheritable).toBeUndefined()
   })
 
   it('Codex import outside the pinned version is refused', () => {
@@ -153,7 +206,7 @@ describe('bounded delegation', () => {
     const handle = await harness.executor.spawn(spawnRequest(harness, explorer))
     const settled = await waitOne(harness.executor, harness.workspaceId, handle.childSessionId, 3_000)
     expect(settled !== undefined && settled.status).toBe('completed')
-    expect(settled?.result?.summary).toContain('explorer found 3 files')
+    expect(settled?.result?.report).toBe('explorer found 3 files')
     // Isolation: the child session carries the task packet, not parent history.
     void harness
     void harness.kernel.stop()
@@ -281,6 +334,9 @@ describe('bounded delegation', () => {
         child.append({ type: 'turn/start', turnId: 'ct1' as never })
         child.append({ type: 'assistant/message', stepId: 'cs1' as never, content: 'partial finding' })
         await child.durable()
+        // The parent's own relationship record: recovery refuses orphans.
+        root.append({ type: 'agent/child-spawn', childSessionId: child.id, parentTurnId: 't1', definition: 'explorer', objective: 'inspect' })
+        await root.durable()
         await kernel.stop()
       }
       const kernel = new Kernel()
@@ -288,10 +344,12 @@ describe('bounded delegation', () => {
       await kernel.ctx.sessions.boot()
       const executor = new ChildExecutor(kernel.ctx)
       expect(await executor.recoverFromStorage()).toBe(1)
-      const listed = executor.childrenOfRoot(rootId as never, workspaceId as never)
+      const listed = await executor.childrenOfRoot(rootId as never, workspaceId as never)
       expect(listed).toHaveLength(1)
       expect(listed[0]?.status).toBe('interrupted')
-      expect(listed[0]?.result?.summary).toContain('partial finding')
+      // Narration from an unfinished child is never handed back as a result.
+      expect(listed[0]?.result).toBeUndefined()
+      expect(listed[0]?.error).toContain(`session ${childId}`)
       const waited = await waitOne(executor, workspaceId, childId as never, 20)
       expect(waited?.status).toBe('interrupted')
       await kernel.stop()
@@ -314,7 +372,7 @@ describe('bounded delegation', () => {
     expect(settled !== undefined && settled.status).toBe('completed')
     // The Bash call must be denied by the definition ceiling; the result is
     // truthful and the command never ran.
-    const events = harness.executor.childrenOfRoot(harness.rootSessionId as never)
+    const events = await harness.executor.childrenOfRoot(harness.rootSessionId as never)
     void events
     const childSession = handle.childSessionId
     void childSession

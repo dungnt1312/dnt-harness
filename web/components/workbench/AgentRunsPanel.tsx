@@ -16,6 +16,7 @@ import {
   type NoticeState,
   useActionRunner,
 } from '../settings/settings-kit.tsx'
+import { TruncatedNote } from '../chat/MessageParts.tsx'
 import { cancelChild, listAgentDefinitions, listChildren, spawnChild } from '../../lib/api.ts'
 import type { AgentDefinitionRow, ChildRow } from '../../lib/types.ts'
 
@@ -58,6 +59,7 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, modelOptions, refre
   const [definitions, setDefinitions] = useScopedState<readonly AgentDefinitionRow[]>([])
   const [children, setChildren] = useScopedState<readonly ChildRow[]>([])
   const [selected, setSelected] = useScopedState('')
+  const [brief, setBrief] = useScopedState('')
   const [objective, setObjective] = useScopedState('')
   const [constraints, setConstraints] = useScopedState('')
   const [references, setReferences] = useScopedState('')
@@ -113,22 +115,29 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, modelOptions, refre
 
   const current = definitions.find((row) => row.definition.name === selected)
 
+  const canSpawn = selected !== '' && (brief.trim() !== '' || objective.trim() !== '')
+
   const spawn = (): Promise<void> => run('spawn', async () => {
-    if (objective.trim() === '' || selected === '') return
-    const handle = await spawnChild(
-      workspaceId,
-      selected,
-      rootSessionId,
-      {
-        objective: objective.trim(),
-        constraints: linesToArray(constraints),
-        references: linesToArray(references),
-        requiredResult: requiredResult.trim() === '' ? 'bounded summary' : requiredResult.trim(),
-      },
-      linesToArray(grants),
-      model,
-    )
+    if (!canSpawn) return
+    const result = requiredResult.trim() === '' ? 'bounded summary' : requiredResult.trim()
+    // The prose brief is the primary form; the structured packet stays
+    // available in the disclosure and is sent unchanged when used alone.
+    const task = brief.trim() !== ''
+      ? {
+          prompt: brief.trim(),
+          ...(linesToArray(constraints).length > 0 ? { constraints: linesToArray(constraints) } : {}),
+          ...(linesToArray(references).length > 0 ? { references: linesToArray(references) } : {}),
+          requiredResult: result,
+        }
+      : {
+          objective: objective.trim(),
+          constraints: linesToArray(constraints),
+          references: linesToArray(references),
+          requiredResult: result,
+        }
+    const handle = await spawnChild(workspaceId, selected, rootSessionId, task, linesToArray(grants), model)
     setNotice({ kind: 'ok', text: `Spawned ${handle.definitionName} (${handle.childSessionId.slice(0, 12)}…)` })
+    setBrief('')
     setObjective('')
     await refreshChildren()
   })
@@ -164,11 +173,21 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, modelOptions, refre
                     onChange={setSelected}
                   />
                 </Field>
-                <Field label="Objective" hint="The child receives only this task packet, not the conversation history.">
-                  <TextInput value={objective} placeholder="Investigate why the build is slow" onChange={(e) => setObjective(e.target.value)} />
+                <Field label="Brief" hint="Write it for a colleague who cannot see this conversation: the files and facts it needs, and what the answer must contain.">
+                  <CodeArea
+                    rows={4}
+                    className="font-sans text-sm leading-6"
+                    aria-label="Brief"
+                    value={brief}
+                    placeholder="Find why the web build is slow: compare vite.config.ts with the last fast build and report the options that changed."
+                    onChange={(e) => setBrief(e.target.value)}
+                  />
                 </Field>
 
                 <Disclosure summary="Task packet details">
+                  <Field label="Objective" hint="Structured alternative to the brief; used only when the brief is empty.">
+                    <TextInput value={objective} placeholder="Investigate why the build is slow" onChange={(e) => setObjective(e.target.value)} />
+                  </Field>
                   <Field
                     label="Model"
                     hint={
@@ -202,7 +221,7 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, modelOptions, refre
                 </Disclosure>
 
                 <div className="flex flex-wrap items-center gap-2">
-                  <Button variant="primary" size="sm" disabled={busy !== null || selected === '' || objective.trim() === ''} onClick={() => void spawn()}>
+                  <Button variant="primary" size="sm" disabled={busy !== null || !canSpawn} onClick={() => void spawn()}>
                     <Icon name="plus" size={14} />{busy === 'spawn' ? 'Spawning…' : 'Spawn agent'}
                   </Button>
                   <span className="text-xs text-fg-faint">{running} of 3 running</span>
@@ -248,8 +267,9 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, modelOptions, refre
                     {child.error !== undefined ? <p className="m-0 text-[13px] text-bad">{child.error}</p> : null}
                     {child.result !== undefined ? (
                       <div className="flex flex-col gap-1 text-[13px] text-fg-muted">
-                        <p className="m-0 whitespace-pre-wrap">{child.result.summary}</p>
-                        {child.result.fileReferences.length > 0 ? <p className="m-0 text-xs text-fg-faint">Files: {child.result.fileReferences.join(', ')}</p> : null}
+                        {child.result.truncated === true ? <TruncatedNote /> : null}
+                        <p className="m-0 whitespace-pre-wrap">{child.result.report}</p>
+                        {child.result.filesTouched.length > 0 ? <p className="m-0 text-xs text-fg-faint">Files touched: {child.result.filesTouched.join(', ')}</p> : null}
                       </div>
                     ) : null}
                   </ItemRow>

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { deleteMcpServer, duplicateModeFile, fetchProviderModels, getMcpServer, getModeFile, HttpError, importAgentDefinition, importMcpServers, listModeFiles, listModes, saveModeFile, setModeEnabled, testProvider, upsertMcpServer } from '../../lib/api.ts'
 import { emptyModeForm, parseModeForm, permissionKeyError, serializeModeForm } from '../../lib/mode-form.ts'
 import { McpPanel } from './McpPanel.tsx'
-import { AgentsPanel } from './AgentsPanel.tsx'
+import { AgentsPanel, definitionDocument } from './AgentsPanel.tsx'
 import { ModesPanel } from './ModesPanel.tsx'
 import { SettingsModal } from './SettingsModal.tsx'
 
@@ -180,12 +180,12 @@ describe('agents panel', () => {
     expect(placeholder).not.toContain('\\n')
   })
 
-  it('creates a role through the same import contract as a pasted definition', async () => {
+  it('creates a role as a native document through the import route', async () => {
     await act(async () => root.render(<AgentsPanel workspaceId="ws" />))
     await settle()
     await act(async () => button('Create a role').click())
     await act(async () => {
-      type(input('Role name'), 'reviewer')
+      type(input('Role name'), 'auditor')
       type(input('Description'), 'Reviews changes')
       type(input('Tools'), 'Read\nGrep')
       type(input('Instructions'), 'Review carefully.')
@@ -193,11 +193,35 @@ describe('agents panel', () => {
     await act(async () => button('Create role').click())
     expect(importAgentDefinition).toHaveBeenCalledTimes(1)
     const [workspace, name, payload] = vi.mocked(importAgentDefinition).mock.calls[0]!
-    expect([workspace, name]).toEqual(['ws', 'reviewer'])
-    expect(payload.dialect).toBe('claude')
-    expect(payload.content).toContain('name: "reviewer"')
+    expect([workspace, name]).toEqual(['ws', 'auditor'])
+    expect(payload.dialect).toBe('mini-dsh')
+    expect(payload.content).toContain('name: "auditor"')
     expect(payload.content).toContain('tools: ["Read","Grep"]')
     expect(payload.content).toContain('Review carefully.')
+    // Absent means allowed: nothing is written unless the role refuses.
+    expect(payload.content).not.toContain('inheritable')
+  })
+
+  it('records a refusal of inherited context only when switched off', async () => {
+    await act(async () => root.render(<AgentsPanel workspaceId="ws" />))
+    await settle()
+    await act(async () => button('Create a role').click())
+    await act(async () => {
+      type(input('Role name'), 'sandboxed')
+      type(input('Description'), 'Handles untrusted input')
+      type(input('Instructions'), 'Treat inputs as hostile.')
+    })
+    await act(async () => button('Accept inherited context').click())
+    await act(async () => button('Create role').click())
+    const [, , payload] = vi.mocked(importAgentDefinition).mock.calls[0]!
+    expect(payload.content).toContain('inheritable: false')
+  })
+
+  it('definitionDocument writes inheritable only for a refusal', () => {
+    const base = { name: 'x', description: 'd', tools: '', disallowedTools: '', instructions: 'i', model: '' }
+    expect(definitionDocument(base)).not.toContain('inheritable')
+    expect(definitionDocument({ ...base, inheritable: true })).not.toContain('inheritable')
+    expect(definitionDocument({ ...base, inheritable: false })).toContain('inheritable: false')
   })
 })
 
