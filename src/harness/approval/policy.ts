@@ -74,8 +74,25 @@ export interface ApprovalOptions {
   readonly askUser?: (call: ToolCall, lifecycle: ApprovalLifecycle) => Promise<boolean>
   /** Undecided approvals expire after this long; defaults to the harness limit. */
   readonly expiryMs?: number
-  /** Hard interaction annotation: true forces ask even if policy exact/wildcard says allow. */
-  readonly forceAsk?: (call: ToolCall) => boolean
+  /**
+   * Hard interaction annotation: true forces ask even if policy exact/wildcard
+   * says allow. `scope` is the call's own session/workspace — at first
+   * evaluation the executing scope, on re-evaluation the pending entry's
+   * stamped scope — so a control change with no agent in flight never
+   * answers for a different workspace.
+   */
+  readonly forceAsk?: (call: ToolCall, scope: ApprovalScope) => boolean
+  /**
+   * Extra facts recorded on the durable `approval/request` (e.g. why the
+   * call needs approval), so a replayed question carries them too.
+   */
+  readonly requestDetails?: (call: ToolCall) => Record<string, unknown> | undefined
+}
+
+/** The session/workspace an approval belongs to. */
+export interface ApprovalScope {
+  readonly sessionId: SessionId | undefined
+  readonly workspaceId: string | undefined
 }
 
 /** Minimal structural slice of the sessions service the policy records into. */
@@ -203,7 +220,9 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
     const call = canonicalCall(payload.call)
     const policy = readPolicy(options.policy)
     const baseMode = modeFor(policy, call.name, defaultMode)
-    const mode = baseMode === 'allow' && options.forceAsk?.(call) === true ? 'ask' : baseMode
+    const executing = agentScope.getStore()
+    const callScope: ApprovalScope = { sessionId: executing?.sessionId, workspaceId: executing?.workspaceId }
+    const mode = baseMode === 'allow' && options.forceAsk?.(call, callScope) === true ? 'ask' : baseMode
     if (mode === 'allow') return next()
     if (mode === 'deny') {
       return { kind: 'deny', reason: `policy denies '${call.name}'` }
@@ -219,7 +238,7 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
     // Unguessable capability id: the answer route is transport-global.
     const approvalId = `approval-${randomUUID()}`
     if (record !== undefined) {
-      record.session.append({ type: 'approval/request', approvalId, call })
+      record.session.append({ ...(options.requestDetails?.(call) ?? {}), type: 'approval/request', approvalId, call })
       try {
         await record.session.durable()
       } catch (error) {
@@ -286,7 +305,8 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
           continue
         }
         const baseMode = modeFor(policy, entry.call.name, defaultMode)
-        const mode = baseMode === 'allow' && options.forceAsk?.(entry.call) === true ? 'ask' : baseMode
+        const entryScope: ApprovalScope = { sessionId: entry.sessionId, workspaceId: entry.workspaceId }
+        const mode = baseMode === 'allow' && options.forceAsk?.(entry.call, entryScope) === true ? 'ask' : baseMode
         if (mode === 'deny') {
           void settle(entry, 'deny', `policy now denies '${entry.call.name}'`)
           continue

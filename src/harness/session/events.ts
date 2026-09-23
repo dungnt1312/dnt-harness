@@ -54,13 +54,27 @@ export type SessionEvent =
   | ({ readonly type: 'step/end'; readonly turnId: TurnId; readonly stepId: StepId } & SessionEventStamp)
   | ({ readonly type: 'turn/end'; readonly turnId: TurnId; readonly reason: TurnEndReason } & SessionEventStamp)
   | ({ readonly type: 'turn/error'; readonly turnId: TurnId; readonly kind: TurnErrorKind; readonly message: string } & SessionEventStamp)
-  | ({ readonly type: 'approval/request'; readonly approvalId: string; readonly call: ToolCall } & SessionEventStamp)
+  | ({
+      readonly type: 'approval/request'
+      readonly approvalId: string
+      readonly call: ToolCall
+      /** Set when the call targets a path outside every granted folder. */
+      readonly scopeWarning?: string
+      /** The folder a session-scoped answer would grant (already validated). */
+      readonly proposedGrant?: string
+      /** The access that folder would get (the call's own read or write). */
+      readonly proposedAccess?: 'read' | 'write'
+    } & SessionEventStamp)
   | ({ readonly type: 'approval/decision'; readonly approvalId: string; readonly decision: ApprovalDecision; readonly reason?: string } & SessionEventStamp)
   | ({ readonly type: 'input/queued'; readonly inputId: string; readonly clientRequestId?: string; readonly content: string; readonly attachments?: readonly AttachmentRef[] } & SessionEventStamp)
   | ({ readonly type: 'session/title'; readonly title: string | null } & SessionEventStamp)
   | ({ readonly type: 'session/pinned'; readonly pinned: boolean } & SessionEventStamp)
   | ({ readonly type: 'session/project'; readonly projectId: string | null } & SessionEventStamp)
   | ({ readonly type: 'session/model'; readonly provider?: string | null; readonly model?: string | null; readonly thinkingLevel?: string | null } & SessionEventStamp)
+  // Session-scoped folder grants for the file tools: a full replacement list,
+  // last wins. `revision` increments per change so concurrent editors can
+  // detect a stale view; `approvalId` names the approval that added a folder.
+  | ({ readonly type: 'session/grants'; readonly revision: number; readonly roots: readonly SessionGrant[]; readonly approvalId?: string } & SessionEventStamp)
   // Child records: writers emit `brief`; `objective` is the legacy field older
   // logs carry, so readers take `brief ?? objective`. The inherit audit fields
   // record how much parent context a child received — never the text itself.
@@ -199,6 +213,28 @@ export function deriveSessionModel(events: readonly SessionEvent[]): SessionMode
 /** Alias kept for the name used in the plan. */
 export const sessionModelOf = deriveSessionModel
 
+/** One folder a session grants to its file tools. */
+export interface SessionGrant {
+  /** Absolute folder (realpath at grant time). */
+  readonly path: string
+  readonly access: 'read' | 'write'
+}
+
+/** The session's current folder grants and their revision (0 = never set). */
+export interface SessionGrants {
+  readonly revision: number
+  readonly roots: readonly SessionGrant[]
+}
+
+/** Project the last `session/grants` event; the log is the only store. */
+export function sessionGrantsOf(events: readonly SessionEvent[]): SessionGrants {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]
+    if (event?.type === 'session/grants') return { revision: event.revision, roots: event.roots }
+  }
+  return { revision: 0, roots: [] }
+}
+
 export function deriveMessages(events: readonly SessionEvent[], attachments?: AttachmentLookup): ModelMessage[] {
   const messages: ModelMessage[] = []
   for (const event of events) {
@@ -230,6 +266,7 @@ export function deriveMessages(events: readonly SessionEvent[], attachments?: At
       case 'session/pinned':
       case 'session/project':
       case 'session/model':
+      case 'session/grants':
       case 'session/child-meta':
       case 'agent/child-spawn':
       case 'agent/child-result':

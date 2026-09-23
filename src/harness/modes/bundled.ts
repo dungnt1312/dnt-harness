@@ -72,6 +72,9 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
       Skill: 'allow', Agent: 'allow',
       MemorySearch: 'allow', MemoryRead: 'allow', MemoryCreate: 'allow', MemoryUpdate: 'allow', MemoryForget: 'allow',
     },
+    // Paths outside the granted folders run without an extra approval here;
+    // unsafe paths are still refused by the host.
+    outOfGrant: 'allow',
   },
 ]
 

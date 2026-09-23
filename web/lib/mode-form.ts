@@ -22,6 +22,11 @@ export interface ModeForm {
   /** Hard ceiling of exposed tools (canonical names). */
   readonly exposure: readonly string[]
   readonly permissions: Readonly<Record<string, PolicyMode>>
+  /**
+   * `allow`: file tools may use paths outside the granted folders without an
+   * extra approval. Absent means the default (`ask`) and is not written.
+   */
+  readonly outOfGrant?: 'allow' | 'ask'
 }
 
 export const emptyModeForm = (): ModeForm => ({
@@ -46,6 +51,7 @@ type LooseFrontmatter = {
   memoryRetrieval?: unknown
   toolExposure?: unknown
   permissionDefaults?: unknown
+  outOfGrant?: unknown
 }
 
 /**
@@ -74,6 +80,7 @@ export function parseModeForm(raw: string): ModeForm {
     }
     form.permissions = permissions
   }
+  if (frontmatter.outOfGrant === 'allow' || frontmatter.outOfGrant === 'ask') form.outOfGrant = frontmatter.outOfGrant
   return form
 }
 
@@ -105,6 +112,7 @@ export function serializeModeForm(form: ModeForm): string {
     `memoryRetrieval: ${form.memoryRetrieval}`,
     `toolExposure: ${JSON.stringify(form.exposure)}`,
     `permissionDefaults: ${JSON.stringify(form.permissions)}`,
+    ...(form.outOfGrant !== undefined ? [`outOfGrant: ${form.outOfGrant}`] : []),
   ]
   return `---\n${fm.join('\n')}\n---\n\n${form.instructions.trim()}\n`
 }

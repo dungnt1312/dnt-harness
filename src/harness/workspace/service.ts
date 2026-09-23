@@ -2,10 +2,10 @@ import { promises as fs, type Dirent, type Stats } from 'node:fs'
 import path from 'node:path'
 import { newProjectId, newWorkspaceId, type ProjectId, type SessionId, type WorkspaceId } from '../../util/brand.ts'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
-import { ScopeError, type AppRecord, type ProjectRecord, type WorkspaceRecord } from './types.ts'
+import { ScopeError, type AdditionalDirectory, type AppRecord, type ProjectRecord, type WorkspaceRecord } from './types.ts'
 
 export { ScopeError }
-export type { AppRecord, ProjectRecord, WorkspaceRecord }
+export type { AdditionalDirectory, AppRecord, ProjectRecord, WorkspaceRecord }
 
 /** Rebuildable per-workspace summary for pickers and badges. */
 export interface WorkspaceSummary {
@@ -431,6 +431,25 @@ export class WorkspaceService {
     return updated
   }
 
+  /**
+   * Replace the extra folders this project grants its sessions. The host
+   * validates folders before calling (it owns the app-storage and home
+   * rules); this only checks that project references stay in the workspace.
+   */
+  async setAdditionalDirectories(id: ProjectId, workspaceId: WorkspaceId, directories: readonly AdditionalDirectory[]): Promise<ProjectRecord> {
+    const record = this.getProject(id, workspaceId)
+    for (const entry of directories) {
+      if (entry.kind !== 'project') continue
+      if (entry.projectId === id) throw new ScopeError('root-invalid', 'a project cannot grant itself')
+      this.getProject(entry.projectId, workspaceId)
+    }
+    const { additionalDirectories: _previous, ...rest } = record
+    const updated: ProjectRecord = directories.length > 0 ? { ...rest, additionalDirectories: [...directories] } : rest
+    this.projects.set(id, updated)
+    await writeJson(this.projectPath(record.workspaceId, id), updated)
+    return updated
+  }
+
   /** Rename is display metadata only; ids and folders stay stable. */
   async renameProject(id: ProjectId, workspaceId: WorkspaceId, name: string): Promise<ProjectRecord> {
     const record = this.getProject(id, workspaceId)
@@ -457,12 +476,18 @@ export class WorkspaceService {
    */
   private readonly leases = new Map<string, SessionId>()
 
+  /**
+   * Leases are hierarchical: a folder is busy when another session holds it,
+   * any folder inside it, or any folder containing it — a write into a
+   * granted subfolder of another project must contend with that project.
+   */
   async acquireRoot(root: string, sessionId: SessionId): Promise<void> {
     const key = await fs.realpath(root).catch(() => path.resolve(root))
     const normalized = process.platform === 'win32' ? key.toLowerCase() : key
-    const holder = this.leases.get(normalized)
-    if (holder !== undefined && holder !== sessionId) {
-      throw new ScopeError('project-active', 'another session is executing on this project folder')
+    for (const [held, holder] of this.leases) {
+      if (holder !== sessionId && this.rootsOverlap(held, normalized)) {
+        throw new ScopeError('project-active', 'another session is executing on this project folder')
+      }
     }
     this.leases.set(normalized, sessionId)
   }

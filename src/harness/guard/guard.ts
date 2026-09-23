@@ -84,7 +84,7 @@ export function attachDangerousCommandGuard(ctx: Context, options: GuardOptions)
         if (action === 'ask') {
           store(payload.call, match)
           options.onMatch?.(match, payload.call)
-          const decision = await next({ call: payload.call })
+          const decision = await next({ call: payload.call, exec: payload.exec })
           if (decision.kind === 'allow' && decision.call !== payload.call) {
             store(decision.call, match)
           }

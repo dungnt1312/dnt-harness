@@ -1,7 +1,7 @@
 ---
 title: "Claude style subagents"
 description: "Make a child agent an actual agent: its own system prompt, a free-form brief, and a defined deliverable — then four roles and per-conversation caps."
-status: done
+status: completed
 priority: P1
 effort: ""
 tags: [multi-agent, g4, context, delegation]
@@ -237,6 +237,45 @@ Deviations: the Settings create form now saves via a native `dialect:
 "mini-dsh"` import (so `inheritable` round-trips) and gained "Copy to
 customize"; a workspace file named like a new bundled role is warned about and
 deletable rather than migrated.
+
+### Outcome (2026-09-23, follow-up session)
+
+Post-acceptance review found the lifecycle contract leakier than the suites
+proved, and the user chose to repair it (then to reconcile ambiguous
+durability against canonical storage). Landed on top of the committed phases,
+all test-first in `tests/harness/g4-subagent-contract.spec.ts` plus new
+`tests/web/agent-inheritance.spec.ts` / `agent-tool-ownership.spec.ts`:
+
+- A child is `completed` only when its newest terminal turn record says
+  `completed`; failed/cancelled/interrupted turns report honestly with no
+  result.
+- Direct `wait`/`cancel`/listing and the Agent tool enforce parent
+  workspace/project/caller-root ownership; the Agent tool can no longer touch
+  a sibling conversation's child.
+- `agent/child-result` persists only after the child log flushed; an append
+  whose durable acknowledgement is rejected (poisoned or not) is settled by
+  reading canonical storage (`SessionsService.readCanonicalEvents`, which
+  first drains the loaded writer's queue) — a committed record is kept, a
+  provably absent spawn is rolled back with its reservation, and anything
+  unreadable stays an explicit runtime-only `uncertain` that holds capacity
+  and survives restart unchanged.
+- `ChildExecutor.reconcile` (single-flight per child, ownership-checked
+  before joining) repairs `uncertain` children exactly once; exposed via the
+  Agent tool `reconcile` action, a workspace-scoped parent-owned
+  `POST /api/workspaces/:wid/sessions/:parent/children/:child/reconcile`
+  (legacy implicit-workspace route kept), and a Workbench "Retry settlement"
+  button.
+- Inherited-context truncation keeps a speaker-labelled `[truncated]`
+  fragment at the 12 000-char cap.
+
+Gates re-verified directly on the current tree: `npm test` 111/111 files,
+`npm run typecheck` 0, `npm run build:web` 0 (known chunk-size warning only).
+The checkbox stays open solely for the pm2 half: the tree also carries the
+unrelated in-flight cross-project-file-scope work
+(`plans/260923-1439-cross-project-file-scope/`), so restarting `mini-dsh` now
+would deploy that WIP; restart and live-verify after it lands. Known unrelated
+flake: `tests/capabilities/bash.spec.ts` orphan-marker (Windows Git Bash
+process-tree race, documented 2026-09-18) — passes isolated and in this run.
 
 ## Risks
 

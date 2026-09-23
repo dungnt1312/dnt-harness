@@ -186,6 +186,7 @@ export const RichInput = forwardRef<RichInputHandle, RichInputProps>(function Ri
     // Serialization owns only editor segments. The surrounding draft's tray is
     // carried through unchanged so normal typing cannot erase attachments.
     const serialized = serializeEditor(element)
+    element.dataset['editorEmpty'] = element.childNodes.length === 0 || (element.childNodes.length === 1 && element.firstChild instanceof HTMLBRElement) ? 'true' : 'false'
     const next: RichDraft = { segments: serialized.segments, attachments: draft.attachments }
     emitted.current = next
     onChange(next)
@@ -207,6 +208,7 @@ export const RichInput = forwardRef<RichInputHandle, RichInputProps>(function Ri
       }
       element.append(chipElement(segment, document))
     }
+    element.dataset['editorEmpty'] = next.segments.length === 0 ? 'true' : 'false'
     emitted.current = next
     revision.current += 1
   }
@@ -412,6 +414,7 @@ export const RichInput = forwardRef<RichInputHandle, RichInputProps>(function Ri
     <div
       ref={host}
       data-composer-input
+      data-editor-empty="true"
       role="combobox"
       contentEditable={!disabled}
       suppressContentEditableWarning

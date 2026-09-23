@@ -85,20 +85,24 @@ concept, and the web host is the composition that wires them together:
 | `hooks/` | The command hook runner behind the tool-gate waterfalls |
 
 Every isolation guarantee in these subsystems is **application-level**:
-workspace ownership, filesystem containment, MCP subprocess watchdogs, and
-writer leases are all enforced inside the app. There is no OS sandbox — shell
-and trusted code run with host privileges — and the docs and UI say so rather
-than claiming otherwise.
+workspace ownership, filesystem containment (including granted extra
+folders), MCP subprocess watchdogs, and writer leases are all enforced inside
+the app. There is no OS sandbox — shell and trusted code run with host
+privileges — and the docs and UI say so rather than claiming otherwise.
 
 ## Layer 2 — capabilities
 
 Capabilities are just tools registered into `ctx.tools`:
 
 - **`fsTools()`** — the canonical `Read`, `Write`, `Edit`, `Glob`, `Grep` tools.
-  Paths resolve against the workspace root granted per execution
-  (`tools.setRootResolver`), with symlink/junction containment and denied roots
-  for application-internal storage. Containment is application-level, not an
-  OS sandbox.
+  Paths resolve against the grant resolved per execution
+  (`tools.setRootResolver`): the project folder plus any additional granted
+  folders (project `additionalDirectories`, session `session/grants`, a
+  child's spawn snapshot), each read-only or read-write, with per-folder
+  symlink/junction containment, refusal of network/device paths, and denied
+  roots for application-internal storage. Paths outside every granted folder
+  become an approval in the web host. Containment is application-level, not
+  an OS sandbox.
 - **`bashTool(options)`** — one real Bash command per call (Git Bash's
   `bash.exe` on Windows, `/bin/bash` elsewhere, `MINI_DSH_BASH` to override),
   with a timeout, stop-cancellation, and process-tree cleanup. Bash means

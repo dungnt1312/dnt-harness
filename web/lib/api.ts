@@ -1,5 +1,5 @@
 import type { AttachmentRef } from './composer-draft.ts'
-import type { AgentDefinitionRow, ChildRow, Envelope, HooksConfigRow, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillRow, TerminalFrame, TerminalListing, TerminalRow, WorkspaceMeta, WorkspaceRow } from './types.ts'
+import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, Envelope, FolderGrant, HooksConfigRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillRow, TerminalFrame, TerminalListing, TerminalRow, WorkspaceMeta, WorkspaceRow } from './types.ts'
 
 const CSRF_HEADER = 'x-mini-dsh-csrf'
 let csrfToken: string | undefined
@@ -91,11 +91,15 @@ export function sendMessage(sessionId: string, content: string, clientRequestId?
   }).then((r) => json<{ inputId: string; queued: boolean; duplicate?: boolean }>(r))
 }
 
-export function answerApproval(approvalId: string, allow: boolean): Promise<void> {
+/**
+ * Answer one approval. `scope: 'session'` (out-of-grant questions only) also
+ * grants the question's proposed folder to the conversation once allowed.
+ */
+export function answerApproval(approvalId: string, allow: boolean, scope: 'once' | 'session' = 'once'): Promise<void> {
   return apiFetch(`/api/approvals/${encodeURIComponent(approvalId)}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ allow }),
+    body: JSON.stringify({ allow, ...(scope === 'session' ? { scope } : {}) }),
   }).then((r) => json<{ answered: boolean }>(r)).then(() => undefined)
 }
 
@@ -536,12 +540,31 @@ export function setModeEnabled(workspaceId: string, modeId: string, enabled: boo
   }).then((r) => json<{ readonly id: string; readonly enabled: boolean }>(r))
 }
 
+export interface ContextBreakdownView {
+  readonly systemPrompt: number
+  readonly systemTools: number
+  readonly mcpTools: number
+  readonly metaContext: number
+  readonly skills: number
+  readonly messages: number
+}
+
+export interface ContextUsageView {
+  readonly last: { readonly inputTokens: number; readonly cachedInputTokens?: number; readonly outputTokens?: number }
+  readonly cacheableInputTokens: number
+  readonly cachedInputTokens: number
+}
+
 export interface ContextManifestView {
   readonly modeId: string
   readonly modeRevision: number
   readonly model?: string
   readonly provider?: string
-  readonly budget: { readonly availableTokens: number; readonly usedTokens: number; readonly estimated: boolean }
+  readonly budget: { readonly availableTokens: number; readonly usedTokens: number; readonly contextLimitTokens?: number; readonly estimated: boolean }
+  /** Estimated tokens per source of the last request; sums to `usedTokens`. */
+  readonly breakdown?: ContextBreakdownView
+  /** Provider-reported usage, when the provider streams it. */
+  readonly usage?: ContextUsageView
   readonly history: {
     readonly setting: string
     readonly includedTurns: number
@@ -708,6 +731,13 @@ export function cancelChild(workspaceId: string, childSessionId: string): Promis
   )
 }
 
+/** Re-read one retained child lifecycle against canonical parent storage. */
+export function reconcileChild(workspaceId: string, rootSessionId: string, childSessionId: string): Promise<ChildRow | null> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(rootSessionId)}/children/${encodeURIComponent(childSessionId)}/reconcile`, { method: 'POST' })
+    .then((r) => json<ChildRow | { readonly reconciled: true; readonly child: null }>(r))
+    .then((body) => 'childSessionId' in body ? body : null)
+}
+
 export interface ImportAgentInput {
   readonly content: string
   /** `mini-dsh` saves a native document verbatim (strict native parse). */
@@ -813,6 +843,25 @@ export function setProjectPath(workspaceId: string, projectId: string, path: str
   return apiFetch('/api/workspaces/' + encodeURIComponent(workspaceId) + '/projects/' + encodeURIComponent(projectId), {
     method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path }),
   }).then(r => json<ProjectRow>(r))
+}
+/** Replace the extra folders a project grants its conversations (validated server-side). */
+export function setProjectFolders(workspaceId: string, projectId: string, additionalDirectories: readonly AdditionalDirectory[]): Promise<ProjectRow> {
+  return apiFetch('/api/workspaces/' + encodeURIComponent(workspaceId) + '/projects/' + encodeURIComponent(projectId), {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ additionalDirectories }),
+  }).then(r => json<ProjectRow>(r))
+}
+function sessionGrantsUrl(workspaceId: string, sessionId: string): string {
+  return '/api/workspaces/' + encodeURIComponent(workspaceId) + '/sessions/' + encodeURIComponent(sessionId) + '/grants'
+}
+/** A conversation's own folder grants plus the effective (project + session) view. */
+export function getSessionGrants(workspaceId: string, sessionId: string): Promise<SessionGrantsView> {
+  return apiFetch(sessionGrantsUrl(workspaceId, sessionId)).then(r => json<SessionGrantsView>(r))
+}
+/** Replace a conversation's folder grants; 409 when `expectedRevision` is stale. */
+export function setSessionGrants(workspaceId: string, sessionId: string, expectedRevision: number, roots: readonly FolderGrant[]): Promise<SessionGrantsView> {
+  return apiFetch(sessionGrantsUrl(workspaceId, sessionId), {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ expectedRevision, roots }),
+  }).then(r => json<SessionGrantsView>(r))
 }
 export function removeProject(workspaceId: string, projectId: string): Promise<{ deleted: boolean }> {
   return apiFetch('/api/workspaces/' + encodeURIComponent(workspaceId) + '/projects/' + encodeURIComponent(projectId), { method: 'DELETE' }).then(r => json<{ deleted: boolean }>(r))

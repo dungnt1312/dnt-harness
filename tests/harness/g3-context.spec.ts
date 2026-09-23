@@ -348,3 +348,29 @@ describe('child assembly', () => {
     expect(assembled.manifest.omissions.some((omission) => omission.startsWith('history:'))).toBe(false)
   })
 })
+
+describe('manifest breakdown', () => {
+  it('splits the used estimate by source and the parts add up to it', () => {
+    const assembled = buildContext(base({
+      mode: mode('full-access'),
+      schemas: [
+        { name: 'Read', description: 'read a file', parameters: { type: 'object', properties: { path: { type: 'string' } } } },
+        { name: 'mcp__docs__search', description: 'search docs', parameters: { type: 'object', properties: { q: { type: 'string' } } } },
+      ],
+      activeSkills: [{ name: 'skill-a', instructions: 'S'.repeat(400), hash: 'a'.repeat(64) }],
+      pinnedMemory: [{ id: 'fact', title: 'Fact', body: 'M'.repeat(200), hash: 'f'.repeat(64) }],
+      workspaceInstructions: 'W'.repeat(200),
+    }))
+    const { breakdown, budget } = assembled.manifest
+    expect(budget.contextLimitTokens).toBe(DEFAULT_BUDGET.contextLimitTokens)
+    expect(breakdown.systemTools).toBeGreaterThan(0)
+    expect(breakdown.mcpTools).toBeGreaterThan(0)
+    expect(breakdown.skills).toBeGreaterThanOrEqual(100)
+    // Workspace instructions and memory are meta context, not the system prompt.
+    expect(breakdown.metaContext).toBeGreaterThanOrEqual(100)
+    expect(breakdown.messages).toBeGreaterThan(0)
+    const sum = breakdown.systemPrompt + breakdown.systemTools + breakdown.mcpTools + breakdown.metaContext + breakdown.skills + breakdown.messages
+    // Rounding happens per text, so the split may differ from the total by a token or two.
+    expect(Math.abs(sum - budget.usedTokens)).toBeLessThanOrEqual(2)
+  })
+})

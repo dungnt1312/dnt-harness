@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import type { SseEvent } from '../../lib/types.ts'
 import type { FileFocus } from '../../lib/tool-facts.ts'
 import { projectArtifacts, type ArtifactItem } from './artifact-projector.ts'
@@ -41,7 +42,7 @@ function ArtifactRow({ item, openPath }: { readonly item: ArtifactItem; readonly
  * snapshot from the tool call.
  */
 export function ArtifactsPanel({ events, openPath }: { readonly events: readonly SseEvent[]; readonly openPath?: OpenPathResolver }) {
-  const items = projectArtifacts(events)
+  const items = useMemo(() => projectArtifacts(events), [events])
   if (items.length === 0) return <p className="m-0 py-6 text-center text-sm text-fg-faint">No recorded artifacts for this conversation yet.</p>
   return <ul aria-label="Recorded artifacts" className="m-0 flex list-none flex-col gap-2 p-0">{items.map((item) => <ArtifactRow key={item.id} item={item} {...(openPath !== undefined ? { openPath } : {})} />)}</ul>
 }

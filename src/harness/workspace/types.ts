@@ -22,8 +22,22 @@ export interface ProjectRecord {
   path: string
   /** Sidebar position; lower sorts first. Absent on records never reordered. */
   order?: number
+  /**
+   * Folders beyond `path` that file tools in this project's sessions may use.
+   * Absent on records that never granted any.
+   */
+  additionalDirectories?: readonly AdditionalDirectory[]
   readonly createdAt: number
 }
+
+/**
+ * One extra folder a project grants its sessions: another project of the
+ * same workspace (followed by id, so retargeting it moves the grant) or an
+ * absolute folder.
+ */
+export type AdditionalDirectory =
+  | { readonly kind: 'project'; readonly projectId: ProjectId; readonly access: 'read' | 'write' }
+  | { readonly kind: 'path'; readonly path: string; readonly access: 'read' | 'write' }
 
 /** Schema-versioned `app.json`. */
 export interface AppRecord {

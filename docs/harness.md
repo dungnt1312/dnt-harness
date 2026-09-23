@@ -49,7 +49,8 @@ tool/result         the tool answered (ok, output); `recovery: true` marks a
 step/end            closes one model request
 turn/end            closes the turn (reason: completed | rejected | empty |
                     failed | cancelled | interrupted | limit)
-approval/request    a pending approval question, recorded durably
+approval/request    a pending approval question, recorded durably (out-of-grant
+                    questions also carry `scopeWarning` and `proposedGrant`)
 approval/decision   its settlement: allow | deny | expired | cancelled | invalidated
 input/queued        a pending input waiting for the current turn to close
 session/title       derived or custom session title
@@ -57,6 +58,9 @@ session/project     session project binding
 session/model       the session's model preference (provider/model/thinkingLevel;
                     an omitted field keeps the previous value, null is an
                     explicit clear)
+session/grants      the session's extra file-tool folders (full list, last
+                    wins, `revision` per change; `approvalId` when an approval
+                    granted one)
 session/child-meta  child-session provenance (parent turn, definition, brief, inherit audit)
 agent/child-spawn   durable spawn intent + brief, written before a child agent starts
 agent/child-result  a child agent's settled status (+ its failure, when failed)
@@ -111,7 +115,11 @@ session.fork(boundarySeq?)      // child session with copied history, seq rebase
 Registers the `sessions` service. `create(workspaceId?)` opens a session
 scoped to a workspace; `get`/`delete`/listing resolve ownership the same way,
 and a missing summary is rebuilt from the log rather than treated as data
-loss. `fork(source, boundarySeq?)` is unchanged.
+loss. `fork(source, boundarySeq?)` is unchanged. `readCanonicalEvents(id)`
+reads the persisted log without consulting — or recovering — a loaded
+`Session`, the seam for reconciling a poisoned in-memory session against the
+store; `undefined` means no durable store behind the id, while I/O and schema
+errors propagate.
 
 ### Durable storage (`storage/`)
 
@@ -286,6 +294,13 @@ tools/post-execute (waterfall)  transform the result the model sees
 → ToolResult
 ```
 
+Grants: `setRootResolver` yields `{ root, additionalRoots?, deniedRoots? }`
+per call. After authorization settles, `setApprovedPathResolver(call, allowed)`
+supplies the out-of-grant paths an approval authorized for exactly that call,
+and right before the tool body runs the grant is resolved again and
+intersected with the one the call started with — a folder revoked while the
+call waited for approval no longer authorizes it.
+
 An unknown tool, a **denied** call, or a **throwing** tool body all become a
 failed `ToolResult` the model can see — never an exception into the loop. The
 durable `tool/call` and `tool/result` events belong to the agent loop; this
@@ -327,6 +342,12 @@ permission layer; workspace overrides and policy routes do not exist. Web
 explicit `deny`; unnamed tools still use the unchanged `defaultMode` fallback.
 Headless uses its explicit map. Interactive MCP (`requiresUserInteraction`)
 still force-asks.
+
+`forceAsk(call, scope)` receives the call's own session/workspace — the
+executing scope at first evaluation, the pending entry's stamped scope on
+re-evaluation — so a settings change with no agent in flight never answers
+for another workspace. `requestDetails(call)` adds facts (such as the
+out-of-grant warning) to the durable `approval/request`.
 
 An approval is bound to the exact call it names: it carries an expiry
 (undecided requests settle as `expired` — never an implicit approval), and a
@@ -370,6 +391,32 @@ authorization.
 The guard never widens a Mode denial (`toolExposure` or
 `permissionDefaults` deny still wins), and Mode changes re-evaluate
 pending approvals the same way they always have.
+
+## Path-scope guard (`src/web/path-scope-guard.ts`)
+
+The web host appends one more `tools/rewrite` listener — after every
+prepended one (PreToolUse hooks, the dangerous-command guard), so it sees the
+final call — that classifies each `Read/Write/Edit/Glob/Grep` path against the
+run's grants without touching the filesystem (see `docs/capabilities.md`):
+
+- network/device paths, app storage, and writes into a read-only granted
+  folder are denied before any `approval/request`;
+- a path outside every granted folder is recorded with the workspace and the
+  mode's exemption computed **at classification time**, then forces an
+  approval via `forceAsk` (even when the tool itself is `allow`) — unless the
+  executing mode has `outOfGrant: allow` (bundled Full access; duplicates
+  inherit it) or the host runs `--yolo`;
+- the card shows `Outside granted folders: <path> (read|write)`; a root
+  session's card may also offer `Allow <folder> for this session` when that
+  folder passes grant validation. Children answer `once` only.
+- only an **allow** settlement authorizes the path, once; a session-scoped
+  answer appends `session/grants` right before the call runs, and a failure
+  to record it fails the call.
+
+Writes into another folder take that folder's writer lease **after** the
+approval gate (a pending or denied question never holds it); lease keys are
+the outermost project folder containing the target, and leases are
+hierarchical, so nested folders contend.
 
 ## Live controls, queued input, and limits
 
@@ -430,8 +477,8 @@ the UI's inspector renders as-is.
 
 One root agent spawns children through the **same** loop and builder — there is
 no second runtime. `ChildExecutor` owns the lifecycle (spawn / list / wait /
-cancel), caps it (3 active per conversation, 12 on the host, 8 spawn attempts
-per root turn), and enforces one level: a child cannot delegate. Each child
+cancel / reconcile), caps it (3 active per conversation, 12 on the host, 8 spawn
+attempts per root turn), and enforces one level: a child cannot delegate. Each child
 gets an isolated session, a brief, and a ceiling of mode exposure ∩ definition
 ∩ spawn grant, where a grant only ever narrows.
 
@@ -442,11 +489,48 @@ requested workspace and project (`'ownership'`) and not itself a child
 inside. It writes the child's `session/child-meta`, then the parent's
 `agent/child-spawn` — the commit point. A failure before it deletes the new
 child session and rolls every reservation back; after it, the child settles as
-a durable failed child. Settling releases active capacity; the per-turn
-attempt stays charged until the root turn's `agent/turn-settled`. A child
+a durable failed child — unless the append's own durability cannot be
+established, which leaves it `uncertain` (below). Settling releases active
+capacity; the per-turn attempt stays charged until the root turn's
+`agent/turn-settled`. A child
 session is driven by the executor only: the message routes answer 409 for any
 session carrying `session/child-meta`, so a child can never be resumed as a
 plain root Agent.
+
+**Uncertain children.** A rejected append is not proof of absence: the record
+may have reached storage before the parent `Session` poisoned. When the
+parent's `agent/child-spawn` or `agent/child-result` append fails and
+`readCanonicalEvents` cannot establish whether it landed, the child's status
+becomes `uncertain` — asserting neither terminal failure nor rollback. No
+durable record ever carries the status. A spawn-`uncertain` child is never
+launched; a result-`uncertain` child loses its advertised result but keeps its
+log. Either way the entry is retained and keeps holding an active slot until
+settlement proves a durable parent result, a proven-absent spawn is cleaned up
+(below), or the root is deleted. When canonical storage can be read, a
+rejected append resolves by itself: the record that landed is committed, the
+one that did not is missing.
+
+**Uncertainty survives a restart.** A reconstructed child's status is the
+parent's durable terminal record. A child whose own log holds a terminal turn
+but whose parent carries no `agent/child-result` therefore reads `uncertain`
+after a restart too: a terminal child turn proves only that the child stopped,
+never that the parent accepted its result, and manufacturing a terminal status
+from it would be unstable. Only a child with no terminal turn (or an
+interrupted one) reports `interrupted`.
+
+**Settlement (`reconcile`).** One repair path covers a retained live entry and
+a restart-reconstructed one, and the terminal decision always comes from the
+canonical parent log: a durable `agent/child-result` wins outright; otherwise
+a canonical child terminal turn is the evidence for appending exactly one
+parent result record, and the child settles only once that record is
+canonically committed. The append goes through a usable parent writer — a
+poisoned loaded parent is never reused, so an entry can remain `uncertain`
+until a restart replaces the writer — and concurrent callers share one
+settlement instead of writing competing records. A failed append is never
+retried through a poisoned session; entries without canonical proof stay
+uncertain. One cleanup exists: a live spawn-`uncertain` child that never
+launched is deleted, and its reservation released exactly once, when canonical
+storage proves the parent's spawn record absent.
 
 **Bounded memory.** The executor's map holds active children only. Once a
 child's terminal record is durable its entry is evicted; `list`/`wait`/
@@ -479,7 +563,9 @@ child.
 The model drives this itself through the built-in **`Agent`** tool, whose
 actions mirror the executor: `spawn` returns a handle immediately, `wait` blocks
 on several children (capped at 120 s, and it honours a root Stop), `list`,
-`cancel`, and `catalog` (roles + `provider:model` ids). The tool is
+`cancel`, `reconcile` (canonical settlement for `uncertain` children — a
+retained live entry or a restart-reconstructed one), and `catalog` (roles +
+`provider:model` ids). The tool is
 deliberately asynchronous: one step runs its tool calls in sequence, so a
 blocking spawn would serialize children and the executor's parallel capacity
 would never be used. A child that is still running when the root's turn closes

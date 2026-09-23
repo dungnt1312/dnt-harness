@@ -110,6 +110,36 @@ describe('G4 HTTP surface', () => {
     await server.close()
   }, 20_000)
 
+  it('reconciles only a child owned by the addressed non-default workspace parent session', async () => {
+    const stall: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() { await new Promise(() => {}); yield { type: 'delta', delta: 'never' } },
+    }
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-reconcile-http-'))
+    const server = await createWebServer({ home, providers: [stall], configFile: path.join(home, 'p.json') })
+    servers.push(server)
+    const base = server.url
+    const workspace = await (await post(base, '/api/workspaces', { name: 'Non-default reconcile workspace' })).json() as { id: string }
+    const parent = await (await post(base, `/api/workspaces/${workspace.id}/sessions`)).json() as { id: string }
+    const otherParent = await (await post(base, `/api/workspaces/${workspace.id}/sessions`)).json() as { id: string }
+    const spawned = await post(base, `/api/workspaces/${workspace.id}/agents/worker`, {
+      rootSessionId: parent.id, task: { objective: 'wait', requiredResult: 'summary' },
+    })
+    const child = await spawned.json() as { childSessionId: string; status: string }
+    expect(child.status).toBe('running')
+
+    const foreign = await post(base, `/api/workspaces/${workspace.id}/sessions/${otherParent.id}/children/${child.childSessionId}/reconcile`)
+    expect(foreign.status).toBe(404)
+    const owned = await post(base, `/api/workspaces/${workspace.id}/sessions/${parent.id}/children/${child.childSessionId}/reconcile`)
+    expect(owned.status).toBe(200)
+    expect((await owned.json()) as { childSessionId: string }).toMatchObject({ childSessionId: child.childSessionId })
+    // Legacy default-workspace clients retain their original route.
+    const legacy = await post(base, `/api/sessions/${parent.id}/children/${child.childSessionId}/reconcile`)
+    expect(legacy.status).toBe(404)
+    await post(base, `/api/workspaces/${workspace.id}/sessions/${parent.id}/stop`)
+    await server.close()
+  }, 20_000)
+
   it('the child definition ceiling denies Bash for an Explorer even in Full access', async () => {
     // Full access exposes Bash at the MODE level; the Explorer definition
     // ceiling must still deny it — the trust boundary under test.

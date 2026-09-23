@@ -129,18 +129,21 @@
 
 /* Component-level rules that utilities cannot express. */
 @layer components {
-  /* The composer input is a contenteditable, so its placeholder is drawn
-     rather than provided by the platform. `:empty` alone is not enough: an
-     editor the browser has seeded with a <br> still reads as empty to a user.
-     Floated with no size so it takes no inline space: the caret stays at the
-     start of the line instead of after the placeholder text. */
-  .composer-input:empty::before,
-  .composer-input:has(> br:only-child)::before {
+  .composer-input {
+    position: relative;
+  }
+  /* A lone <br> can remain alongside pasted text, so CSS child selectors
+     cannot determine whether this contenteditable is empty. */
+  .composer-input[data-editor-empty="true"]::before {
     content: attr(data-placeholder);
-    float: left;
-    width: 0;
-    height: 0;
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    padding: 14px 20px;
     white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
     color: var(--fg-faint);
     pointer-events: none;
   }

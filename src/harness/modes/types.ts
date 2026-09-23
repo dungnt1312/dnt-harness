@@ -1,10 +1,11 @@
 import type { ApprovalMode } from '../approval/policy.ts'
 
 /**
- * A mode has exactly four fields: instructions, context sources, tool
- * exposure, and permission defaults. Defaults and hard restrictions are
- * distinct: permission defaults are defaults the workspace/host policy
- * still constrains; tool exposure is a hard ceiling no override can widen.
+ * A mode carries instructions, context sources, tool exposure, permission
+ * defaults, and the out-of-grant rule for file tools. Defaults and hard
+ * restrictions are distinct: permission defaults are defaults the
+ * workspace/host policy still constrains; tool exposure is a hard ceiling no
+ * override can widen.
  */
 export interface ModeDefinition {
   /** Stable id; bundled ids are fixed, custom ids are file-derived. */
@@ -23,6 +24,14 @@ export interface ModeDefinition {
    * wildcard, or the catch-all `*`.
    */
   readonly permissionDefaults: Readonly<Record<string, ApprovalMode>>
+  /**
+   * What a file-tool call targeting a path outside every granted folder
+   * needs: `ask` (default) forces an approval even when the tool itself is
+   * allowed; `allow` lets it run under the tool's own permission. Unsafe
+   * paths (network/device paths, app storage, link escapes) are refused
+   * either way.
+   */
+  readonly outOfGrant?: 'allow' | 'ask'
 }
 
 /** Context sources a mode enables. Disabled loaders contribute nothing. */
@@ -50,6 +59,7 @@ export interface ModeFrontmatter {
   readonly toolExposure?: readonly string[]
   /** Keys: a canonical known tool, `mcp__<server>__<tool>`, `mcp__<server>__*`, or `*`. */
   readonly permissionDefaults?: Readonly<Record<string, string>>
+  readonly outOfGrant?: string
 }
 
 /** A validated, ready-to-use mode with its provenance. */

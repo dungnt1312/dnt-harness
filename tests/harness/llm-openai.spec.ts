@@ -12,14 +12,14 @@ interface CapturedRequest {
 }
 
 /** Stub global fetch with an SSE chat-completions responder. */
-function stubFetch(): CapturedRequest[] {
+function stubFetch(chunks: readonly string[] = ['{"choices":[{"delta":{"content":"ok"}}]}']): CapturedRequest[] {
   const captured: CapturedRequest[] = []
   const fake = vi.fn(async (input: string | URL, init?: { body?: string }) => {
     captured.push({ url: String(input), body: JSON.parse(init?.body ?? '{}') as Record<string, unknown> })
     const encoder = new TextEncoder()
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
-        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'))
+        for (const chunk of chunks) controller.enqueue(encoder.encode(`data: ${chunk}\n\n`))
         controller.enqueue(encoder.encode('data: [DONE]\n\n'))
         controller.close()
       },
@@ -109,6 +109,27 @@ describe('openai completions adapter: thinking + wire shape', () => {
       { type: 'text', text: 'what is this?' },
       { type: 'image_url', image_url: { url: 'data:image/png;base64,QUJD' } },
     ])
+  })
+
+  it('asks for streamed usage and yields the final chunk usage with its cached share', async () => {
+    const captured = stubFetch([
+      '{"choices":[{"delta":{"content":"ok"}}]}',
+      '{"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":30,"prompt_tokens_details":{"cached_tokens":1000}}}',
+    ])
+    const events = []
+    for await (const event of provider().stream({ messages: [{ role: 'user', content: 'hi' }] })) events.push(event)
+    expect(captured[0]?.body['stream_options']).toEqual({ include_usage: true })
+    expect(events).toContainEqual({ type: 'usage', usage: { inputTokens: 1200, cachedInputTokens: 1000, outputTokens: 30 } })
+  })
+
+  it('reads the DeepSeek cache field and skips null usage on content chunks', async () => {
+    stubFetch([
+      '{"choices":[{"delta":{"content":"ok"}}],"usage":null}',
+      '{"choices":[],"usage":{"prompt_tokens":50,"prompt_cache_hit_tokens":20}}',
+    ])
+    const usage = []
+    for await (const event of provider().stream({ messages: [{ role: 'user', content: 'hi' }] })) if (event.type === 'usage') usage.push(event.usage)
+    expect(usage).toEqual([{ inputTokens: 50, cachedInputTokens: 20 }])
   })
 
   it('flattens a tool answer that arrives as parts, since the protocol wants text', async () => {

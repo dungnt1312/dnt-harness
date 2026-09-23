@@ -259,6 +259,26 @@ export class SessionsService extends Service {
   }
 
   /**
+   * Read the canonical event log without consulting a loaded Session. This is
+   * intentionally distinct from `load()`: callers reconciling a poisoned
+   * in-memory Session need the persisted record, not its speculative log or
+   * recovery side effects. `undefined` means this service has no durable store
+   * for the session; I/O/schema errors remain observable to the caller.
+   */
+  async readCanonicalEvents(id: SessionId): Promise<readonly SessionEvent[] | undefined> {
+    if (!this.has(id)) return undefined
+    // A loaded session may still have queued writes in flight. Canonical
+    // means "after the writer drained": wait for that prefix (a failed
+    // append is fine — the store read below decides what landed) so the
+    // answer can never race the pending queue.
+    await this.loaded.get(id)?.drain().catch(() => {})
+    const store = this.storeFor(this.ownership.get(id))
+    if (store === undefined) return undefined
+    const { events } = await store.read(id)
+    return events
+  }
+
+  /**
    * The workspace owning a session, when known. Direct-ID access from a
    * foreign workspace fails closed against this.
    */

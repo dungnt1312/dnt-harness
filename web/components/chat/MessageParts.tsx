@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState, type ReactNode } from 'react'
+import { memo, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 import Icon from '../common/Icon.tsx'
 import CopyButton from '../common/CopyButton.tsx'
 import { Spinner } from '../common/Spinner.tsx'
@@ -25,7 +25,7 @@ const isImageAttachment = (ref: AttachmentRef): boolean => ref.mediaType.startsW
 /** Hover-revealed on fine pointers, always visible on touch and keyboard focus. */
 const revealActions = 'opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 [@media(pointer:coarse)]:opacity-100'
 
-export function UserBubble({ item, workspaceId, onReuse }: {
+export const UserBubble = memo(function UserBubble({ item, workspaceId, onReuse }: {
   readonly item: Extract<ViewItem, { kind: 'user' }>
   /** Needed to fetch attachment bytes; without it they show as file chips. */
   readonly workspaceId?: string | null
@@ -85,7 +85,7 @@ export function UserBubble({ item, workspaceId, onReuse }: {
       </div>
     </div>
   )
-}
+})
 
 /**
  * One assistant answer: thinking disclosure, markdown. The action row (copy,
@@ -93,12 +93,29 @@ export function UserBubble({ item, workspaceId, onReuse }: {
  * `turn` only on the last answer of a closed turn — copying every answer
  * that turn produced.
  */
-export function AssistantMessage({ item, modelLabel, turn }: {
+function useLiveContent(content: string, live: boolean): string {
+  const [displayed, setDisplayed] = useState(content)
+  const latest = useRef(content)
+  latest.current = content
+  const timer = useRef<number | null>(null)
+  useEffect(() => {
+    if (!live || displayed === content || timer.current !== null) return
+    timer.current = window.setTimeout(() => {
+      timer.current = null
+      setDisplayed(latest.current)
+    }, 100)
+  }, [content, displayed, live])
+  useEffect(() => () => { if (timer.current !== null) window.clearTimeout(timer.current) }, [])
+  return live ? displayed : content
+}
+
+export const AssistantMessage = memo(function AssistantMessage({ item, modelLabel, turn }: {
   readonly item: Extract<ViewItem, { kind: 'assistant' }>
   readonly modelLabel?: string
   /** Present on the last answer of a closed turn; text is the turn's full answer. */
   readonly turn?: { readonly text: string }
 }) {
+  const visibleContent = useLiveContent(item.content, item.live)
   // The label reports what actually served THIS step (recorded controls);
   // the workspace's current model is only the fallback for legacy events.
   const controlsLabel = item.controls !== undefined
@@ -110,7 +127,7 @@ export function AssistantMessage({ item, modelLabel, turn }: {
       {item.thinking.length > 0 || item.thinkingLive ? <ThinkingPanel thinking={item.thinking} live={item.live && item.thinkingLive} /> : null}
       {item.content !== '' ? (
         <div className="text-fg">
-          <Markdown content={item.content} />
+          <Markdown content={visibleContent} />
           {item.live ? <span className="ml-0.5 inline-block size-2.5 translate-y-[-1px] rounded-full bg-fg align-middle animate-dot" aria-hidden="true" /> : null}
         </div>
       ) : null}
@@ -125,7 +142,7 @@ export function AssistantMessage({ item, modelLabel, turn }: {
       ) : null}
     </div>
   )
-}
+}, (previous, next) => previous.item === next.item && previous.modelLabel === next.modelLabel && previous.turn?.text === next.turn?.text)
 
 function fmtDuration(ms: number): string {
   if (Number.isNaN(ms)) return ''
@@ -381,7 +398,7 @@ function ToolArguments({ call }: { readonly call: ToolCall }) {
 }
 
 /** A tool invocation: one quiet line that expands to exact arguments and recorded output. */
-export function ToolCard({ item, openPath }: { readonly item: Extract<ViewItem, { kind: 'tool' }>; readonly openPath?: OpenPathResolver }) {
+export const ToolCard = memo(function ToolCard({ item, openPath }: { readonly item: Extract<ViewItem, { kind: 'tool' }>; readonly openPath?: OpenPathResolver }) {
   const { call, result, ts, doneAt, server, recovered, outcome, invocationId } = item
   const facts = toolFacts(call, result)
   const open = facts.path !== undefined ? openPath?.(facts.path, facts.focus) ?? null : null
@@ -432,7 +449,7 @@ export function ToolCard({ item, openPath }: { readonly item: Extract<ViewItem, 
         : <p className="m-0 text-[13px] text-fg-muted">Running…</p>}
     </ActivityRow>
   )
-}
+})
 
 const DELEGATION_STATE: Readonly<Record<Extract<ViewItem, { kind: 'delegation' }>['status'], RowState>> = {
   running: 'running',
@@ -447,7 +464,7 @@ const DELEGATION_STATE: Readonly<Record<Extract<ViewItem, { kind: 'delegation' }
  * payload (the child's final report, files touched, error) is fetched when
  * expanded.
  */
-export function DelegationCard({ item, workspaceId, onOpen }: {
+export const DelegationCard = memo(function DelegationCard({ item, workspaceId, onOpen }: {
   readonly item: Extract<ViewItem, { kind: 'delegation' }>
   readonly workspaceId?: string | null
   readonly onOpen?: (childSessionId: string) => void
@@ -457,7 +474,7 @@ export function DelegationCard({ item, workspaceId, onOpen }: {
       <DelegationDetail item={item} {...(workspaceId !== undefined ? { workspaceId } : {})} {...(onOpen !== undefined ? { onOpen } : {})} />
     </ActivityRow>
   )
-}
+})
 
 /** Shown whenever a child's report hit the host cap; the full text is in its log. */
 export function TruncatedNote() {
@@ -531,7 +548,7 @@ const AUDIT_ICONS = {
 } as const
 
 /** A quiet audit line — hooks that blocked or failed, and correlated approval decisions. */
-export function AuditLine({ item }: { readonly item: Extract<ViewItem, { kind: 'audit' }> }) {
+export const AuditLine = memo(function AuditLine({ item }: { readonly item: Extract<ViewItem, { kind: 'audit' }> }) {
   const glyph = AUDIT_ICONS[item.icon]
   return (
     <div className="flex min-w-0 items-center gap-2 text-xs text-fg-muted" role="note">
@@ -540,7 +557,7 @@ export function AuditLine({ item }: { readonly item: Extract<ViewItem, { kind: '
       {item.durationMs !== undefined ? <span className="font-mono text-fg-faint">{fmtDuration(item.durationMs)}</span> : null}
     </div>
   )
-}
+})
 
 const REASONS: Readonly<Record<string, string>> = {
   interrupted: 'Interrupted · inspect results before continuing',

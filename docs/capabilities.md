@@ -17,37 +17,60 @@ src/capabilities/
 
 ## Filesystem tools (`capabilities/fs/tools.ts`)
 
-`fsTools()` returns the five tools. The workspace root is granted **per
-execution** through `tools.setRootResolver(() => ({ root, deniedRoots }))` —
-the web host resolves the calling session's own folder (falling back to the
-server default) through the ambient agent scope, so a folder switch applies
-without re-registering anything. Root-aware tools fail closed when no grant
-exists; they never derive authority from a UI-global folder.
+`fsTools()` returns the five tools. The grant is resolved **per execution**
+through `tools.setRootResolver(() => ({ root, additionalRoots, deniedRoots }))`
+— the web host resolves the calling session's bound project folder (the
+primary root) plus its extra granted folders through the ambient agent scope,
+so grant changes apply without re-registering anything. Root-aware tools fail
+closed when no grant exists; they never derive authority from a UI-global
+folder.
 
-### Root containment
+### Granted folders
 
-Every path resolves through `resolveGrantedPath(root, target, deniedRoots)`:
+A run may use the **primary root** (the project folder, read-write) and any
+**additional roots**, each `read` or `write` (`src/capabilities/fs/grants.ts`):
 
-- lexical escapes of the root are rejected;
-- the existing portion of the path (including the creation path — the parent
-  a new file would land in) is realpath-checked, so symlinks and Windows
-  junctions pointing outside the root are rejected;
-- paths inside `deniedRoots` — application-internal storage such as the
-  session data dir — are refused even when they sit under the workspace.
+- **Project grants** — `additionalDirectories` in `project.json`: another
+  project of the same workspace (followed by id, so retargeting it moves the
+  grant) or any absolute folder. Every session of the project gets them.
+- **Session grants** — the durable `session/grants` event (full list, last
+  wins, with a `revision`). Added from the composer or by answering an
+  out-of-grant approval "for this session".
+- **Child agents** receive a snapshot of the parent's effective grant at
+  spawn and never gain more.
+
+Every grant source goes through one validator (`src/web/folder-grants.ts`):
+absolute existing directories only; never a drive root, the home folder
+itself, a network/device path, anything overlapping app storage or the user
+skills folder, or anything overlapping the project's own folder (so a
+relative path can never bypass a read-only grant).
+
+The model is told the granted folders in its system block; Glob/Grep print
+paths relative to the project folder inside it and absolute paths elsewhere,
+so their output feeds straight back into Read.
+
+### Containment
+
+Every target resolves against the primary first, then matches the **longest**
+granted root that lexically contains it (`classifyTarget` — purely lexical,
+no filesystem access):
+
+- network (UNC) and device paths (`\\host\share`, `\\?\`, `\\.\pipe\…`) and
+  Windows reserved names (`NUL`, `CON`, …) are refused before any syscall —
+  even a `stat` on a UNC path authenticates to the remote host;
+- paths inside `deniedRoots` (application-internal storage) are refused;
+- a write into a read-only granted folder is refused;
+- inside a granted folder, the existing portion of the path (including the
+  creation path) is realpath-checked against **that** folder, so symlinks and
+  junctions pointing outside it are refused — never turned into a question;
+- a path **outside every granted folder** throws `OutOfGrantError`. In the web
+  host this becomes an approval (see `docs/harness.md`); only an allowed
+  answer authorizes exactly that path for that one call, and a link along an
+  approved path is refused rather than followed.
 
 This is application-level containment, **not an OS sandbox** and not a
-guarantee against hostile external filesystem races.
-
-```ts
-export function resolveWithin(root: string, target: string): string {
-  const absRoot = path.resolve(root)
-  const abs = path.resolve(absRoot, target)
-  if (abs !== absRoot && !abs.startsWith(`${absRoot}${path.sep}`)) {
-    throw new Error(`path '${target}' escapes the workspace root`)
-  }
-  return abs
-}
-```
+guarantee against hostile external filesystem races. Headless runs have a
+single root: out-of-grant paths fail there.
 
 Escaping is a **tool failure**, not a silent redirect.
 
@@ -58,8 +81,8 @@ Escaping is a **tool failure**, not a silent redirect.
 | `read` | read a text file, return its content | capped at 1 MB |
 | `write` | create or overwrite a file, creating parent directories | — |
 | `edit` | replace the **first** occurrence of `old` with `new` | fails if `old` not found |
-| `glob` | list workspace files matching a `*` / `**` pattern | 100 matches max |
-| `grep` | regex search across workspace files, `path:line: text` | 250 matches max |
+| `glob` | list files matching a `*` / `**` pattern, optionally under `path` | 100 matches max |
+| `grep` | regex search, optionally under `path`, `path:line: text` | 250 matches max |
 
 Tool outputs are truncated to a 60 KB output cap with a `… [truncated N chars]`
 marker. Argument errors throw inside `execute` and surface as failed
@@ -94,8 +117,9 @@ marker. Argument errors throw inside `execute` and surface as failed
   grace, so a straggler grandchild holding the stdio pipes cannot stall the
   result.
 
-A shell is never path-confined: Bash can reach anything the OS user can. Path
-checks protect the file tools, not the shell. A `tools/rewrite` guard
+A shell is never path-confined: Bash can reach anything the OS user can, and
+granted folders do not change that. Path checks protect the file tools, not
+the shell. A `tools/rewrite` guard
 (`src/harness/guard/`) can block or force-ask risky Bash commands by content
 (preset groups + custom rules, workspace-scoped and Mode-independent — see
 `docs/harness.md`); it does not sandbox the OS and does not resist obfuscation.
@@ -122,8 +146,9 @@ classifier and no auto-load:
 ## The Agent tool (`src/web/agent-delegation.ts`)
 
 `Agent` delegates a bounded task to a child agent and collects its result. One
-tool, five actions — `spawn` (returns a handle at once), `wait` (blocks on
-several children, capped at 120 s, honours Stop), `list`, `cancel`, `catalog`:
+tool, six actions — `spawn` (returns a handle at once), `wait` (blocks on
+several children, capped at 120 s, honours Stop), `list`, `cancel`, `reconcile`,
+`catalog`:
 
 - **A prose brief**: `prompt` is the primary argument — written for a colleague
   who cannot see the conversation — plus `requiredResult`. The structured
@@ -141,6 +166,23 @@ several children, capped at 120 s, honours Stop), `list`, `cancel`, `catalog`:
   plus `filesTouched` — the `Read`/`Write`/`Edit` paths, not Glob/Grep scopes.
   A cancelled, failed or interrupted child, or one that never wrote a final
   message, has no result and an `error` naming its session — the full log.
+- **`uncertain` is retained, not failed**: when the parent's lifecycle append is
+  rejected and canonical storage cannot be read to prove whether it landed, the
+  child reports `uncertain` — asserting neither failure nor rollback. A
+  spawn-`uncertain` child never launches; a result-`uncertain` child loses its
+  advertised result but keeps its log. Either way the child is retained and
+  keeps holding its capacity slot until settlement proves a durable parent
+  result — or proves the spawn never landed and cleans it up. The status is
+  stable across a restart: a child whose own log holds a terminal turn but
+  whose parent carries no durable result still reads `uncertain`, never an
+  invented terminal outcome. `reconcile`
+  (`childIds` required, this conversation's children only) settles against
+  canonical storage: a durable parent result wins outright; otherwise a
+  canonical child terminal turn feeds one parent result record written through
+  a usable parent writer, and the child settles only once that record is
+  committed. Without that proof it stays uncertain, and a failed append is
+  never retried through a poisoned session. The lifecycle lives in
+  [the harness notes](harness.md#delegation-agents-tool-in-srcwebagent-delegationts).
 - **Inherited context is opt-in**: `inherit: "brief"` also hands the child up
   to 12 000 chars of this conversation's recent user/assistant *messages* —
   never tool calls, tool output or a compaction summary — captured at spawn,

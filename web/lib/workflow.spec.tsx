@@ -39,6 +39,17 @@ describe('production conversation workflows', () => {
     expect(html).toContain('unknown')
     expect(html).not.toContain('<button')
   })
+  it('does not repeat an old recovery warning in a later interrupted turn', () => {
+    const html = renderToStaticMarkup(<TaskStatus events={[
+      { type: 'turn/start', seq: 0, turnId: 'old' },
+      { type: 'tool/result', seq: 1, recovery: true },
+      { type: 'turn/end', seq: 2, turnId: 'old', reason: 'interrupted' },
+      { type: 'turn/start', seq: 3, turnId: 'new' },
+      { type: 'turn/end', seq: 4, turnId: 'new', reason: 'interrupted' },
+    ]} pending={0} sending={false} connected={true} />)
+    expect(html).toContain('Interrupted')
+    expect(html).not.toContain('A recovered tool outcome may be unknown')
+  })
   it('resolved approval history is not rendered as a failed request', async () => {
     const { StatusLine } = await import('../components/chat/MessageParts.tsx')
     const html = renderToStaticMarkup(<StatusLine reason="Permission decision · a1: allow" />)

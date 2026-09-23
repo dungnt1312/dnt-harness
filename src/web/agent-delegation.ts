@@ -18,7 +18,7 @@ import type { SessionEvent } from '../harness/session/events.ts'
 import { agentScope } from '../harness/agent/scope.ts'
 import { bundledDefinition, BUNDLED_AGENT_ROLES, type AgentDefinitionService } from '../harness/agents/definition-service.ts'
 import { MAX_ACTIVE_PER_ROOT, type ChildExecutor, type ChildModel, type TaskPacket } from '../harness/agents/executor.ts'
-import type { ToolDefinition } from '../harness/tools/types.ts'
+import type { GrantedRoot, ToolDefinition } from '../harness/tools/types.ts'
 
 /** Most parent-conversation text an `inherit: 'brief'` child receives. */
 export const MAX_INHERITED_CHARS = 12_000
@@ -41,13 +41,26 @@ export function projectInheritedMessages(events: readonly SessionEvent[], maxCha
       line = `Assistant: ${event.content.trim()}`
     }
     if (line === undefined) continue
-    const room = maxChars - used
-    // The oldest message that straddles the cap keeps its newest tail.
-    const text = line.length > room ? line.slice(line.length - room) : line
+    const separatorChars = kept.length > 0 ? 2 : 0
+    const room = maxChars - used - separatorChars
+    const text = truncateInheritedLine(line, room)
+    // There is not enough space to retain the source label and truncation
+    // marker, so omit this and every older message rather than returning a
+    // misleading unlabelled fragment.
+    if (text === undefined) break
     kept.push(text)
-    used += text.length + (kept.length > 1 ? 2 : 0)
+    used += separatorChars + text.length
   }
-  return kept.reverse().join('\n\n').slice(-maxChars)
+  return kept.reverse().join('\n\n')
+}
+
+/** Retain a recognisable source label when a message crosses the context cap. */
+function truncateInheritedLine(line: string, maxChars: number): string | undefined {
+  if (line.length <= maxChars) return line
+  const labelEnd = line.indexOf(': ')
+  const marker = `${line.slice(0, labelEnd)}: [truncated] `
+  if (labelEnd < 0 || marker.length > maxChars) return undefined
+  return marker + line.slice(-(maxChars - marker.length))
 }
 
 /** A parent conversation's effective selection, as the host resolves it. */
@@ -155,7 +168,7 @@ const ROLE_CACHE_MS = 5_000
 
 export interface DelegationDeps {
   readonly definitions: AgentDefinitionService
-  readonly executor: ChildExecutor
+  readonly executor: Pick<ChildExecutor, 'spawn' | 'childrenOfRoot' | 'wait' | 'cancel' | 'reconcile' | 'activeOfRoot' | 'runningChildrenOfRoot'>
   /** The executing session, root or child. */
   readonly session: (sessionId: SessionId) => Promise<Session | undefined>
   readonly childModelFor: (
@@ -167,6 +180,8 @@ export interface DelegationDeps {
   /** Usable provider ids and their advertised models, for the live catalog. */
   readonly providers: () => readonly string[]
   readonly modelsOf: (provider: string) => readonly string[]
+  /** The parent's effective additional folders, snapshotted into the child at spawn. */
+  readonly grantsOf?: (parentSessionId: SessionId) => readonly GrantedRoot[]
 }
 
 /**
@@ -239,10 +254,11 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
         case 'spawn': return spawn(deps, args, scope.sessionId, workspaceId, scope.projectId, parent)
         case 'list': return JSON.stringify({ children: await deps.executor.childrenOfRoot(scope.sessionId, workspaceId) })
         case 'wait': return wait(deps, args, scope.sessionId, workspaceId)
-        case 'cancel': return cancel(deps, args, workspaceId)
+        case 'cancel': return cancel(deps, args, scope.sessionId, workspaceId)
+        case 'reconcile': return reconcile(deps, args, scope.sessionId, workspaceId)
         case 'catalog': return catalog(deps, workspaceId)
         default:
-          throw new Error(`unknown action '${action}'; use spawn, wait, list, cancel or catalog`)
+          throw new Error(`unknown action '${action}'; use spawn, wait, cancel, reconcile or catalog`)
       }
     },
   }
@@ -251,7 +267,7 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
 const PARAMETERS: ToolDefinition['parameters'] = {
   type: 'object',
   properties: {
-    action: { type: 'string', description: 'spawn | wait | list | cancel | catalog (default spawn)' },
+    action: { type: 'string', description: 'spawn | wait | list | cancel | reconcile | catalog (default spawn)' },
     definition: { type: 'string', description: 'spawn: the role name, from the catalog' },
     prompt: { type: 'string', description: 'spawn: the brief, in prose — what to do, the files and facts it needs, and what the answer must contain' },
     requiredResult: { type: 'string', description: 'spawn: the shape of the answer you need back' },
@@ -317,6 +333,7 @@ async function spawn(
     ...(grantTools !== undefined ? { grantTools } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(inheritedContext !== undefined ? { inherit: 'brief' as const, inheritedContext } : {}),
+    ...(deps.grantsOf !== undefined ? { grants: deps.grantsOf(parentSessionId) } : {}),
   })
   // A grant that asked for something the role lacks is reported, never
   // silently dropped: the model would otherwise plan around a missing tool.
@@ -347,13 +364,13 @@ async function wait(
 ): Promise<string> {
   const requested = stringList(args['childIds'])
   const ids = requested.length > 0
-    ? requested
-    : deps.executor.runningChildrenOfRoot(parentSessionId).map((id) => id as string)
+    ? await ownedChildIds(deps, requested, parentSessionId)
+    : deps.executor.runningChildrenOfRoot(parentSessionId)
   if (ids.length === 0) return JSON.stringify({ children: [], note: 'no children are running for this conversation' })
 
   const raw = Number(args['timeoutMs'])
   const timeoutMs = Number.isFinite(raw) && raw > 0 ? Math.min(raw, MAX_WAIT_MS) : DEFAULT_WAIT_MS
-  const handles = await deps.executor.wait(workspaceId, ids as SessionId[], { timeoutMs })
+  const handles = await deps.executor.wait(workspaceId, ids, { timeoutMs })
   const running = handles.filter((child) => child.status === 'running')
   return JSON.stringify({
     children: handles,
@@ -367,15 +384,55 @@ async function wait(
   })
 }
 
-async function cancel(deps: DelegationDeps, args: Record<string, unknown>, workspaceId: WorkspaceId): Promise<string> {
-  const ids = stringList(args['childIds'])
-  if (ids.length === 0) throw new Error("'childIds' must name at least one child to cancel")
+async function reconcile(
+  deps: DelegationDeps,
+  args: Record<string, unknown>,
+  parentSessionId: SessionId,
+  workspaceId: WorkspaceId,
+): Promise<string> {
+  const requested = stringList(args['childIds'])
+  if (requested.length === 0) throw new Error("'childIds' must name at least one child to reconcile")
   const handles = []
-  for (const id of ids) {
-    const handle = await deps.executor.cancel(workspaceId, id as SessionId)
+  for (const id of await ownedChildIds(deps, requested, parentSessionId)) {
+    const handle = await deps.executor.reconcile(workspaceId, id)
     if (handle !== undefined) handles.push(handle)
   }
   return JSON.stringify({ children: handles })
+}
+
+async function cancel(
+  deps: DelegationDeps,
+  args: Record<string, unknown>,
+  parentSessionId: SessionId,
+  workspaceId: WorkspaceId,
+): Promise<string> {
+  const requested = stringList(args['childIds'])
+  if (requested.length === 0) throw new Error("'childIds' must name at least one child to cancel")
+  const handles = []
+  for (const id of await ownedChildIds(deps, requested, parentSessionId)) {
+    const handle = await deps.executor.cancel(workspaceId, id)
+    if (handle !== undefined) handles.push(handle)
+  }
+  return JSON.stringify({ children: handles })
+}
+
+/** Explicit lifecycle ids must belong to the calling root, not merely its workspace. */
+async function ownedChildIds(deps: DelegationDeps, ids: readonly string[], parentSessionId: SessionId): Promise<SessionId[]> {
+  const owned: SessionId[] = []
+  for (const id of ids) {
+    const child = await deps.session(id as SessionId)
+    if (childParentSessionId(child) === parentSessionId) owned.push(id as SessionId)
+  }
+  return owned
+}
+
+function childParentSessionId(session: Session | undefined): SessionId | undefined {
+  if (session === undefined) return undefined
+  for (let index = session.events.length - 1; index >= 0; index--) {
+    const event = session.events[index]
+    if (event?.type === 'session/child-meta') return event.parentSessionId as SessionId
+  }
+  return undefined
 }
 
 async function catalog(deps: DelegationDeps, workspaceId: WorkspaceId): Promise<string> {

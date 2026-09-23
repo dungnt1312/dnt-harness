@@ -17,7 +17,7 @@ import {
   useActionRunner,
 } from '../settings/settings-kit.tsx'
 import { TruncatedNote } from '../chat/MessageParts.tsx'
-import { cancelChild, listAgentDefinitions, listChildren, spawnChild } from '../../lib/api.ts'
+import { cancelChild, listAgentDefinitions, listChildren, reconcileChild, spawnChild } from '../../lib/api.ts'
 import type { AgentDefinitionRow, ChildRow } from '../../lib/types.ts'
 
 const CHILD_TONE: Readonly<Record<ChildRow['status'], 'green' | 'blue' | 'amber' | 'gray'>> = {
@@ -26,6 +26,7 @@ const CHILD_TONE: Readonly<Record<ChildRow['status'], 'green' | 'blue' | 'amber'
   failed: 'amber',
   cancelled: 'gray',
   interrupted: 'amber',
+  uncertain: 'amber',
 }
 
 const DEFAULT_RESULT = 'bounded summary with file references'
@@ -147,6 +148,15 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, modelOptions, refre
     finally { await refreshChildren() }
   })
 
+  const reconcile = (child: ChildRow): Promise<void> => run(`reconcile:${child.childSessionId}`, async () => {
+    try {
+      const settled = await reconcileChild(workspaceId, rootSessionId, child.childSessionId)
+      setNotice({ kind: 'ok', text: settled === null ? 'Removed the uncommitted child spawn.' : `Reconciled ${settled.definitionName}.` })
+    } finally {
+      await refreshChildren()
+    }
+  })
+
   const running = children.filter((child) => child.status === 'running').length
 
   return (
@@ -245,6 +255,7 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, modelOptions, refre
                         <span>{child.definitionName}</span>
                         <Badge tone={CHILD_TONE[child.status]}>{child.status}</Badge>
                         {child.awaitingApproval === true ? <Badge tone="amber">awaiting approval</Badge> : null}
+                        {child.status === 'uncertain' ? <Badge tone="amber">reconciling</Badge> : null}
                       </>
                     }
                     meta={
@@ -259,6 +270,11 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, modelOptions, refre
                         {child.status === 'running' ? (
                           <Button variant="outline-danger" size="sm" disabled={busy !== null} onClick={() => void cancel(child)}>
                             {busy === `cancel:${child.childSessionId}` ? 'Cancelling…' : 'Cancel'}
+                          </Button>
+                        ) : null}
+                        {child.status === 'uncertain' ? (
+                          <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void reconcile(child)}>
+                            <Icon name="refresh" size={13} />{busy === `reconcile:${child.childSessionId}` ? 'Settling…' : 'Retry settlement'}
                           </Button>
                         ) : null}
                       </>

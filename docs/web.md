@@ -41,7 +41,8 @@ UI from it at any time.
 - Composer is a contenteditable with inline chips: `@` lists files from the conversation's project (bounded search that never follows symlinks or walks hidden/`node_modules` trees) and inserts a mention chip rendered where the caret was; `/` at the start inserts a skill invocation phrase as plain text; `+` attaches a project file (reference chip) or an uploaded file (stored blob chip), and pasted/dropped images become attachment chips. Neither completion nor attachment grants a permission, reads a file, or pins a skill by itself. Both menus stay shut without a source, are driven from the contenteditable (a combobox with `aria-activedescendant`), and Escape closes them until the query changes. Removing a chip removes exactly that segment; ArrowUp on an empty composer brings back the newest own message; unsent drafts (text plus chips) survive a reload.
 - Composer context shows the fixed project path or an explicit no-project warning with a new-conversation CTA. “Chat-only” describes absence of a project, not an automatic switch to Chat mode or a promise to disable every tool. Model and thinking controls belong to the conversation and apply at its next request (the no-conversation pickers write the global default for future sessions); the selected mode governs permissions at the next request/tool gate. Mode and server restrictions still apply.
 - The composer footer is grouped by what each control decides, not by control type: attach and mode sit on the left, while the model and its thinking level — whose available levels come from that model — sit together on the right next to Send. The footer answers to the composer's own width (a container query, because the column is far narrower than the viewport with the sidebar open): one row when controls fit, otherwise two deliberate rows rather than a ragged wrap. When the row is tight the model name truncates and nothing else does, and it never truncates to nothing.
-- Approval review exposes tool name, target, full escaped JSON arguments, call ID, conversation project and the window the request cancels itself in. **Allow once** and **Deny** answer only that pending request. It does not widen host `blockedTools`, mode exposure, or project root. Interactive MCP tools keep asking. Child-agent questions relay onto the parent conversation, labelled with the child's agent name and id. Buttons lock while submitting; failed submissions remain visible. Durable decisions remain in transcript history, including expiry/invalidation.
+- Approval review exposes tool name, target, full escaped JSON arguments, call ID, conversation project and the window the request cancels itself in. **Allow once** and **Deny** answer only that pending request. It does not widen host `blockedTools`, mode exposure, or project root. A file path outside the granted folders shows `Outside granted folders: …`; on a root conversation the card may also offer **Allow `<folder>` for this session**, naming exactly the folder it grants.
+- The composer's folder chip (`+N`) lists the extra folders the conversation's file tools can use — from project settings (Settings → Projects → **Extra folders**, read-only or read & write, other projects or any folder) and the conversation's own, which it can add or remove. Shell commands are not confined by these folders. Interactive MCP tools keep asking. Child-agent questions relay onto the parent conversation, labelled with the child's agent name and id. Buttons lock while submitting; failed submissions remain visible. Durable decisions remain in transcript history, including expiry/invalidation.
 - The selected mode is the workspace's permission truth. Its `permissionDefaults` decide each tool; `--yolo` is stated on the trigger and maps asks to allows, but never lifts an explicit deny.
 - Failed, cancelled, limited and interrupted work offers inspection-first recovery guidance. Unknown recovered tool results are explicitly called out. There is no automatic retry or replay control: inspect actual effects, then submit new instructions limited to remaining work.
 - The Providers pane states each fact once. The provider name is its editable title (rename in place) with enablement as a state pill plus the opposite verb, and delete lives on that title row; the rail carries the name, the `default` marker and the enabled dot. A model row is one pill — id, `Vision` when it accepts images, its context window — with the provider-default radio and the global-default, edit and remove actions beside it. Per-model overrides open in **Edit model settings**, committed or abandoned as one decision: id (renaming carries its overrides), context window, input types — text is shown locked because every model takes it, image is a checkbox whose state is the effective one, with a link back to the catalog default once it is overridden — and thinking default. **Sync from /models** probes the endpoint and opens a selection: checked models are kept, unchecking one removes it, models the endpoint does not offer are left alone, and nothing is stored until Save.
@@ -127,18 +128,19 @@ tool root. The families, at a glance:
 | `GET/POST /api/workspaces`, `PATCH/DELETE /api/workspaces/:wid` | workspace list (with running/approval badges), create, rename, archive/restore, delete (empty only) |
 | `…/:wid/sessions`, `…/:wid/sessions/:id` (+ `/events` SSE, `/messages`, `/stop`) | session lifecycle, streaming, queued messages, stop. `/messages` answers 409 for a child agent session: children are executor-managed and cannot be resumed directly |
 | `GET/PUT …/:wid/sessions/:id/model` | the conversation's own model controls (model, provider, thinking level) — see the per-conversation model section |
+| `GET/PUT …/:wid/sessions/:id/grants` | the conversation's extra file-tool folders: `GET` returns `{ revision, roots, effective }` (effective = project + session grants merged); `PUT { expectedRevision, roots: [{ path, access }] }` replaces the list — browser principal only, `409` on a stale revision or a conversation without a project, `400` for a folder the grant validator refuses (see `docs/capabilities.md`) |
 | `…/:wid/sessions/:id/manifest`, `…/compact` | per-request context manifest; manual compaction into an immutable checkpoint |
 | `GET/PUT /api/model-defaults` | the **global** default provider/model/thinking level, shared by every workspace: the pair new sessions snapshot at creation, the draft pickers' target, and the live fallback for legacy conversations without a snapshot |
 | `PUT …/:wid/model`, `PUT …/:wid/thinking` | compatibility proxies: they verify workspace ownership, then mutate the **global** default above; new clients use `/api/model-defaults` |
 | `PUT …/:wid/mode`, `GET …/:wid/meta` | workspace-local mode control. The selected mode is the sole permission source. The `GET …/mode` catalog lists **enabled modes only** (a disabled mode refused for selection answers `400`); `GET …/meta` returns the selected mode's `permissionDefaults`, `mode`, and `yolo` when enabled; it does not return a policy or effective-policy overlay. |
 | `GET …/:wid/modes`, `GET/PUT/DELETE …/:wid/modes/:mid`, `POST …/:wid/modes/:mid/duplicate`, `PUT …/:wid/modes/:mid/enabled` | mode **authoring**, separate from the selection control above. The catalog carries each mode's `enabled` flag, `toolExposure`, and `permissionDefaults`; the single-mode read returns raw Markdown plus a hash, and `PUT` takes `{ content, expectedHash? }` (required when replacing an existing file). Bundled modes are read-only (`400`), a stale or missing update hash is `409`, and invalid content is rejected before anything is written. `PUT …/enabled` takes `{ enabled: boolean }`: it shows or hides a mode in this workspace's picker — bundled modes may be hidden too, disabling the currently selected mode is `409` (select another first), the disabled set persists beside the mode files, and saving a mode always re-enables it. Editing a selected mode applies only when it is **re-selected**: the live selection retains its cached snapshot. Deleting that selected file also leaves its cached snapshot active, but its deleted id cannot be selected again; select another mode instead. |
-| `…/:wid/projects` (+ `/projects/:pid`) | project binding: working folder, ownership, overlap rejection |
+| `…/:wid/projects` (+ `/projects/:pid`) | project binding: working folder, ownership, overlap rejection. `PATCH` also takes `additionalDirectories: [{ kind: "path", path, access } \| { kind: "project", projectId, access }]` (browser principal only, every folder validated); retargeting is `409` while any turn — this project's or another's through a grant — holds a write lease inside it |
 | `GET …/:wid/projects/:pid/(files\|file\|search)` | read-only project browsing: one directory listing, one file body, and a bounded file-name search for composer mentions |
 | `…/:wid/terminals` (+ `/events` SSE, `/:tid` DELETE, `/:tid/(input\|resize)`) | interactive Workbench terminals: PTY lifecycle, one multiplexed output stream per workspace — see the terminal section |
 | `POST …/:wid/attachments`, `GET …/:wid/attachments/:id` | composer attachments: upload (content-addressed by sha256, verified media type) and serve (immutable, workspace-scoped) |
 | `…/:wid/agents/:name` (GET resolve / DELETE), `POST …/:wid/agents/:name` | agent definitions; POST spawns a bounded child from `task: { prompt, requiredResult }` or the four-field `task: { objective, constraints, references, requiredResult }`, optionally `inherit: "brief"`, `model` (`provider:model`) and `grantTools`. 202 with the handle (+ `inheritedChars`, `note`); an empty brief, a bad `inherit`, or a role that refuses inheritance is 400; capacity (per conversation or host) is 429 |
 | `POST …/:wid/agents/:name/import` | save a definition: `dialect: "claude"` / `"codex"` import with provenance, or `"mini-dsh"` to save a native document verbatim (keeps `inheritable`) |
-| `GET …/:wid/agents/children?root=…`, `GET/DELETE …/:wid/children/:childId` (+ `/cancel`) | child list / wait-result / cancel |
+| `GET …/:wid/agents/children?root=…`, `GET/DELETE …/:wid/children/:childId` (+ `/cancel`), `POST …/:wid/sessions/:parentSessionId/children/:childSessionId/reconcile` | child list / wait-result / cancel / settlement; statuses may include `uncertain`, which is stable across restarts until settled — repair runs through the Agent tool, the Workbench's Retry settlement, or the reconcile route (below); the legacy `POST /api/sessions/...` reconcile address is retained |
 | `…/:wid/mcp` (+ `/:server` GET/POST/DELETE, `/:server/(enable\|disable\|reconnect)`, `/mcp/import`) | MCP server lifecycle, stored config for editing, deletion, and imports with provenance |
 | `…/:wid/hooks`, `…/:wid/secrets(/:key)` | hook bindings; encrypted secret management (masked responses) |
 
@@ -424,17 +426,43 @@ stream events and closes the turn durably with `turn/end: { reason: "stopped" }`
 
 Returns `202 { stopped: true }`; a no-op while idle. `404` on an unknown session.
 
+### `POST …/:wid/sessions/:parentSessionId/children/:childSessionId/reconcile`
+
+Explicit settlement for a child retained after a durable lifecycle
+acknowledgement was lost. The workspace id scopes the lookup and the parent id
+remains part of the address, so the route can only reconcile a child of that
+parent: an unknown parent, or a child of another parent in the same workspace,
+answers `404`. Settlement is canonical — a durable parent result wins outright;
+otherwise a canonical child terminal turn feeds one `agent/child-result`
+record written through a usable parent writer, so a child whose live writer is
+poisoned may stay `uncertain` until a restart replaces it. `200` with the
+settled handle, or `200 { reconciled: true, child: null }` when a
+never-launched spawn was proven absent and removed. The child's capacity slot
+is held until one of those outcomes (or root deletion).
+
+The legacy address `POST /api/sessions/:parentSessionId/children/:childId/reconcile`
+is retained with the same contract and answers, but resolves the parent
+through the implicit workspace like every other legacy route. The Workbench's
+Retry settlement POSTs the workspace-scoped address.
+
 ### `POST /api/approvals/:id`
 
 Answer a pending approval question.
 
 ```json
 // body
-{ "allow": true }
+{ "allow": true, "scope": "once" }
 ```
 
+`scope` defaults to `"once"`. `"session"` is accepted only with `allow: true`
+on a root conversation's out-of-grant question that carries a
+`proposedGrant`: once the call is finally allowed, that folder is appended to
+the conversation's `session/grants` (with the call's read/write access) right
+before the call runs. Anything else is `400`.
+
 `200 { answered: true }`, or `404` if the approval was already answered
-(answered approvals are removed from the pending map).
+(answered approvals are removed from the pending map). Approval envelopes may
+carry `scopeWarning` and `proposedGrant` beside `guardWarning`.
 
 ## The SSE stream
 
@@ -683,7 +711,13 @@ Its primary field is a prose **Brief**; the structured objective, constraints,
 references and required result stay in *Task packet details*. A child card (and
 the chat delegation detail) shows the child's final report, a visible
 truncation note when the report hit the host cap, the files it touched, or the
-error naming its session log. It offers no inherited-context control — and Terminal
+error naming its session log. In the Agents view an `uncertain` child renders
+as a retained, non-terminal run with a `reconciling` marker and a
+**Retry settlement** button that POSTs the workspace-scoped, parent-owned
+reconcile route (it passes the open workspace's id) — the same canonical
+settlement the model's `Agent` reconcile action runs; the chat
+delegation card projects durable events and never shows `uncertain`.
+It offers no inherited-context control — and Terminal
 is the deliberate interactive exception documented above. The Workbench docks at 1280px and becomes a modal sheet below that. Sidebar/workbench collapse, dock widths, the opened
 Workbench views and the selected one are browser-local preferences under `mini-dsh.workbench.v1`;
 appearance (System/Light/Dark) is stored under

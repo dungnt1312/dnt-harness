@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import type { ViewItem } from '../../lib/project.ts'
 
 interface MinimapEntry {
@@ -9,14 +9,16 @@ interface MinimapEntry {
 }
 
 interface PositionedEntry extends MinimapEntry {
-  readonly position: number
+  readonly top: number
+  readonly bottom: number
 }
 
 interface ViewportMetrics {
-  readonly center: number
+  readonly top: number
+  readonly bottom: number
 }
 
-const EMPTY_VIEWPORT: ViewportMetrics = { center: 0 }
+const EMPTY_VIEWPORT: ViewportMetrics = { top: 0, bottom: 0 }
 
 const cleanPreviewText = (text: string): string => text
   .replace(/```[\s\S]*?```/g, (block) => block.replace(/```[^\n]*\n?/g, ' '))
@@ -55,24 +57,40 @@ export function minimapEntries(items: readonly ViewItem[]): readonly MinimapEntr
 
 const clamp = (value: number, min: number, max: number): number => Math.min(max, Math.max(min, value))
 
+export function activeMinimapIndex(entries: readonly Pick<PositionedEntry, 'index' | 'top' | 'bottom'>[], viewportTop: number, viewportBottom: number): number | null {
+  const visible = entries.find((entry) => entry.bottom > viewportTop && entry.top < viewportBottom)
+  if (visible !== undefined) return visible.index
+  return [...entries].reverse().find((entry) => entry.bottom <= viewportTop)?.index ?? entries[0]?.index ?? null
+}
+
+export function minimapScrollTarget(rowTop: number, viewportHeight: number, scrollHeight: number): number {
+  return clamp(rowTop - 16, 0, Math.max(0, scrollHeight - viewportHeight))
+}
+
 export function ConversationMinimap({ items, scrollRef, contentRef }: {
   readonly items: readonly ViewItem[]
   readonly scrollRef: RefObject<HTMLDivElement | null>
   readonly contentRef: RefObject<HTMLDivElement | null>
 }) {
-  const entries = useMemo(() => minimapEntries(items), [items])
-  const railRef = useRef<HTMLDivElement | null>(null)
+  const lastUsers = useRef<{ users: readonly { readonly index: number; readonly item: Extract<ViewItem, { kind: 'user' }> }[]; entries: readonly MinimapEntry[] }>({ users: [], entries: [] })
+  const entries = useMemo(() => {
+    const users = items.flatMap((item, index) => item.kind === 'user' ? [{ index, item }] : [])
+    const previous = lastUsers.current
+    if (users.length === previous.users.length && users.every((user, index) => user.index === previous.users[index]?.index && user.item === previous.users[index]?.item)) return previous.entries
+    const next = { users, entries: minimapEntries(items) }
+    lastUsers.current = next
+    return next.entries
+  }, [items])
   const [positioned, setPositioned] = useState<readonly PositionedEntry[]>([])
   const [viewport, setViewport] = useState<ViewportMetrics>(EMPTY_VIEWPORT)
   const [hovered, setHovered] = useState<number | null>(null)
-  const [dragging, setDragging] = useState(false)
 
   const measureViewport = useCallback(() => {
     const scroll = scrollRef.current
     if (scroll === null) return
-    const height = Math.max(1, scroll.scrollHeight)
-    const center = clamp((scroll.scrollTop + scroll.clientHeight / 2) / height, 0, 1)
-    setViewport({ center })
+    const top = scroll.scrollTop
+    const bottom = top + scroll.clientHeight
+    setViewport((previous) => previous.top === top && previous.bottom === bottom ? previous : { top, bottom })
   }, [scrollRef])
 
   const measure = useCallback(() => {
@@ -80,15 +98,17 @@ export function ConversationMinimap({ items, scrollRef, contentRef }: {
     const content = contentRef.current
     if (scroll === null || content === null) return
     const scrollRect = scroll.getBoundingClientRect()
-    const scrollHeight = Math.max(1, scroll.scrollHeight)
     const next = entries.flatMap<PositionedEntry>((entry) => {
       const row = content.querySelector<HTMLElement>(`[data-minimap-index="${entry.index}"]`)
       if (row === null) return []
       const rowRect = row.getBoundingClientRect()
-      const offset = scroll.scrollTop + rowRect.top - scrollRect.top + rowRect.height / 2
-      return [{ ...entry, position: clamp(offset / scrollHeight, 0, 1) }]
+      const top = scroll.scrollTop + rowRect.top - scrollRect.top
+      return [{ ...entry, top, bottom: top + rowRect.height }]
     })
-    setPositioned(next)
+    setPositioned((previous) => previous.length === next.length && next.every((entry, index) => {
+      const old = previous[index]
+      return old?.index === entry.index && old.title === entry.title && old.detail === entry.detail && old.width === entry.width && old.top === entry.top && old.bottom === entry.bottom
+    }) ? previous : next)
     measureViewport()
   }, [contentRef, entries, measureViewport, scrollRef])
 
@@ -97,49 +117,37 @@ export function ConversationMinimap({ items, scrollRef, contentRef }: {
     const content = contentRef.current
     if (scroll === null || content === null) return
     let frame = 0
-    const scheduleMeasure = (): void => {
-      cancelAnimationFrame(frame)
-      frame = requestAnimationFrame(measure)
+    let lastMeasurement = -Infinity
+    let pending = 0
+    const runMeasure = (): void => {
+      frame = 0
+      pending = 0
+      lastMeasurement = performance.now()
+      measure()
     }
-    const scheduleViewport = (): void => {
-      cancelAnimationFrame(frame)
-      frame = requestAnimationFrame(measureViewport)
+    const scheduleMeasure = (): void => {
+      if (frame !== 0 || pending !== 0) return
+      const wait = Math.max(0, 150 - (performance.now() - lastMeasurement))
+      if (wait === 0) frame = requestAnimationFrame(runMeasure)
+      else pending = window.setTimeout(() => { pending = 0; frame = requestAnimationFrame(runMeasure) }, wait)
     }
     const resize = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(scheduleMeasure)
     resize?.observe(scroll)
     resize?.observe(content)
-    scroll.addEventListener('scroll', scheduleViewport, { passive: true })
+    scroll.addEventListener('scroll', measureViewport, { passive: true })
     window.addEventListener('resize', scheduleMeasure)
     // Measure synchronously once: a throttled rAF (background webview) must
     // not leave the rail unrendered after the transcript is ready.
     measure()
+    lastMeasurement = performance.now()
     return () => {
+      window.clearTimeout(pending)
       cancelAnimationFrame(frame)
       resize?.disconnect()
-      scroll.removeEventListener('scroll', scheduleViewport)
+      scroll.removeEventListener('scroll', measureViewport)
       window.removeEventListener('resize', scheduleMeasure)
     }
   }, [contentRef, measure, measureViewport, scrollRef])
-
-  const scrollToRatio = useCallback((clientY: number) => {
-    const rail = railRef.current
-    const scroll = scrollRef.current
-    if (rail === null || scroll === null) return
-    const rect = rail.getBoundingClientRect()
-    const ratio = clamp((clientY - rect.top) / Math.max(1, rect.height), 0, 1)
-    scroll.scrollTo({ top: ratio * Math.max(0, scroll.scrollHeight - scroll.clientHeight), behavior: 'auto' })
-  }, [scrollRef])
-
-  const onPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if ((event.target as HTMLElement).closest('button') !== null) return
-    event.currentTarget.setPointerCapture(event.pointerId)
-    setDragging(true)
-    scrollToRatio(event.clientY)
-  }, [scrollToRatio])
-
-  const onPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (dragging) scrollToRatio(event.clientY)
-  }, [dragging, scrollToRatio])
 
   const scrollToEntry = useCallback((entry: PositionedEntry) => {
     const scroll = scrollRef.current
@@ -148,52 +156,50 @@ export function ConversationMinimap({ items, scrollRef, contentRef }: {
     if (scroll === null || row == null) return
     const scrollRect = scroll.getBoundingClientRect()
     const rowRect = row.getBoundingClientRect()
-    const target = scroll.scrollTop + rowRect.top - scrollRect.top - Math.max(16, (scroll.clientHeight - rowRect.height) / 3)
-    scroll.scrollTo({ top: clamp(target, 0, Math.max(0, scroll.scrollHeight - scroll.clientHeight)), behavior: 'smooth' })
-  }, [contentRef, scrollRef])
+    const rowTop = scroll.scrollTop + rowRect.top - scrollRect.top
+    const target = minimapScrollTarget(rowTop, scroll.clientHeight, scroll.scrollHeight)
+    scroll.scrollTo({ top: target, behavior: 'auto' })
+    measureViewport()
+  }, [contentRef, measureViewport, scrollRef])
 
-  const positionedActive = useMemo(() => positioned.reduce<PositionedEntry | null>((nearest, entry) => nearest === null || Math.abs(entry.position - viewport.center) < Math.abs(nearest.position - viewport.center) ? entry : nearest, null), [positioned, viewport.center])
+  const activeIndex = useMemo(() => activeMinimapIndex(positioned, viewport.top, viewport.bottom), [positioned, viewport.top, viewport.bottom])
   const hoveredEntry = positioned.find((entry) => entry.index === hovered) ?? null
   if (positioned.length < 2) return null
 
   return (
-    <div className="conversation-minimap pointer-events-none absolute inset-y-0 right-3 z-20 hidden items-center md:flex" aria-label="Conversation minimap">
-      <div className="pointer-events-none absolute inset-y-6 right-3 w-px rounded-full bg-line" aria-hidden="true" />
+    <div className="conversation-minimap pointer-events-none absolute right-3 top-1/2 z-20 hidden -translate-y-1/2 md:flex" aria-label="Conversation minimap">
       <div
-        ref={railRef}
         role="navigation"
         aria-label="Jump through conversation"
-        className="pointer-events-auto relative h-full max-h-[60vh] w-6 touch-none select-none py-6"
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={() => setDragging(false)}
-        onPointerCancel={() => setDragging(false)}
-        onPointerLeave={() => { if (!dragging) setHovered(null) }}
+        className="pointer-events-auto relative flex w-8 flex-col"
+        onPointerLeave={() => setHovered(null)}
       >
         {positioned.map((entry) => {
-          const active = positionedActive?.index === entry.index
+          const active = activeIndex === entry.index
           return (
             <button
               key={entry.index}
               type="button"
               aria-label={`Jump to: ${entry.title}`}
               aria-current={active ? 'true' : undefined}
-              className={`absolute right-0 flex h-[3px] -translate-y-1/2 items-center justify-end rounded-full outline-none focus-visible:ring-1 focus-visible:ring-link ${active ? 'bg-fg opacity-90' : 'bg-fg-faint/50 opacity-80 hover:bg-fg hover:opacity-90'}`}
-              style={{ top: `${entry.position * 100}%`, width: active ? 16 : entry.width }}
-              onPointerDown={(event) => event.stopPropagation()}
+              className="group flex h-3 w-full shrink-0 items-center justify-end outline-none focus-visible:ring-1 focus-visible:ring-link"
               onMouseEnter={() => setHovered(entry.index)}
               onFocus={() => setHovered(entry.index)}
-              onMouseLeave={() => setHovered(null)}
               onBlur={() => setHovered(null)}
               onClick={() => scrollToEntry(entry)}
-            />
+            >
+              <span
+                aria-hidden="true"
+                className={`h-[3px] rounded-full ${active ? 'bg-fg opacity-90' : 'bg-fg-faint/50 opacity-80 group-hover:bg-fg group-hover:opacity-90'}`}
+                style={{ width: active ? 16 : entry.width }}
+              />
+            </button>
           )
         })}
         {hoveredEntry !== null ? (
           <div
             role="tooltip"
-            className="pointer-events-none absolute right-8 w-72 -translate-y-1/2 overflow-hidden rounded-xl border border-line bg-surface px-3 py-2.5 text-left shadow-pop"
-            style={{ top: `${clamp(hoveredEntry.position * 100, 8, 92)}%` }}
+            className="pointer-events-none absolute right-8 top-1/2 w-72 -translate-y-1/2 overflow-hidden rounded-xl border border-line bg-surface px-3 py-2.5 text-left shadow-pop"
           >
             <strong className="block truncate text-sm font-medium text-fg">{hoveredEntry.title}</strong>
             {hoveredEntry.detail !== '' ? <span className="mt-1 line-clamp-2 block text-xs leading-5 text-fg-muted">{hoveredEntry.detail}</span> : null}

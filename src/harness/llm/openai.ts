@@ -1,6 +1,6 @@
 import { applyThinkingOverride } from './model-catalog.ts'
 import { messageText } from './types.ts'
-import type { LlmProvider, ModelMessage, ModelRequest, StreamEvent, StreamOptions } from './types.ts'
+import type { LlmProvider, ModelMessage, ModelRequest, StreamEvent, StreamOptions, TokenUsage } from './types.ts'
 
 interface StreamChoice {
   delta?: {
@@ -124,6 +124,9 @@ export class OpenAiCompletionsProvider implements LlmProvider {
         ? { tools: request.tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })) }
         : {}),
       stream: true,
+      // The final chunk then carries `usage` (real prompt/cached counts),
+      // which the context meter shows instead of a chars/4 estimate.
+      stream_options: { include_usage: true },
     }
     applyThinkingOverride(body, model, request.thinkingLevel)
     const response = await fetch(`${this.options.baseUrl}/chat/completions`, {
@@ -163,7 +166,9 @@ export class OpenAiCompletionsProvider implements LlmProvider {
           yield* finishCalls(this.name, calls)
           return
         }
-        const parsed = JSON.parse(data) as { choices?: StreamChoice[] }
+        const parsed = JSON.parse(data) as { choices?: StreamChoice[]; usage?: WireUsage | null }
+        const usage = parseUsage(parsed.usage)
+        if (usage !== undefined) yield { type: 'usage', usage }
         const delta = parsed.choices?.[0]?.delta
         const content = delta?.content
         // Reasoning-capable models emit thinking separately from content:
@@ -185,6 +190,27 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       }
     }
     yield* finishCalls(this.name, calls)
+  }
+}
+
+/** The `usage` object of a completions chunk; cache fields vary by server. */
+interface WireUsage {
+  prompt_tokens?: number
+  completion_tokens?: number
+  /** OpenAI and most compatible gateways. */
+  prompt_tokens_details?: { cached_tokens?: number } | null
+  /** DeepSeek's spelling of the cached share. */
+  prompt_cache_hit_tokens?: number
+}
+
+/** Validate a chunk's usage at the wire boundary; absent or malformed → undefined. */
+function parseUsage(usage: WireUsage | null | undefined): TokenUsage | undefined {
+  if (usage === null || usage === undefined || typeof usage.prompt_tokens !== 'number') return undefined
+  const cached = usage.prompt_tokens_details?.cached_tokens ?? usage.prompt_cache_hit_tokens
+  return {
+    inputTokens: usage.prompt_tokens,
+    ...(typeof cached === 'number' ? { cachedInputTokens: cached } : {}),
+    ...(typeof usage.completion_tokens === 'number' ? { outputTokens: usage.completion_tokens } : {}),
   }
 }
 

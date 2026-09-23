@@ -216,7 +216,7 @@ export {
 } from './harness/workspace/service.ts'
 
 // ── Harness: tool pipeline ───────────────────────────────────────────────
-export type { PreExecuteDecision, ToolDefinition, ToolExecution, ToolResult } from './harness/tools/types.ts'
+export type { ApprovedPath, GrantedRoot, PathIntent, PreExecuteDecision, ToolDefinition, ToolExecution, ToolResult } from './harness/tools/types.ts'
 export { ToolsService, type RootResolver } from './harness/tools/service.ts'
 export {
   CANONICAL_TOOLS,
@@ -232,6 +232,7 @@ export { attachApproval } from './harness/approval/policy.ts'
 
 // ── Capabilities: filesystem + shell ─────────────────────────────────────
 export { fsTools, resolveGrantedPath, resolveWithin } from './capabilities/fs/tools.ts'
+export { classifyTarget, OutOfGrantError, resolveInGrants, targetPaths, type PathClass, type TargetPath } from './capabilities/fs/grants.ts'
 export { bashTool, type BashToolOptions } from './capabilities/shell/bash.ts'
 
 // ── MCP + hooks (G5) ───────────────────────────────────────────────────

@@ -117,6 +117,7 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
   const openViews = useMemo(() => normalizeInspectorViews(views), [views])
   const activeView = clampInspectorTab(view, openViews)
   const closedViews = VIEW_ORDER.filter((candidate) => !openViews.includes(candidate))
+  const childEventCount = useMemo(() => events.filter((event) => event.type === 'agent/child-spawn' || event.type === 'agent/child-result').length, [events])
 
   const selectView = (next: WorkbenchView): void => {
     files.showFixedView()
@@ -176,7 +177,7 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
         {...(modelOptions !== undefined ? { modelOptions } : {})}
         // Delegation lands in the root's own log, whether the user or the
         // model started it, so the panel refreshes off that traffic.
-        refreshSignal={events.filter((event) => event.type === 'agent/child-spawn' || event.type === 'agent/child-result').length}
+        refreshSignal={childEventCount}
         {...(onOpenChild !== undefined ? { onOpenChild } : {})}
         {...(onOpenAgentSettings !== undefined ? { onOpenSettings: onOpenAgentSettings } : {})}
       />

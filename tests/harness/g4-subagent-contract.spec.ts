@@ -174,6 +174,28 @@ describe('result contract', () => {
     await harness.kernel.stop()
   }, 15_000)
 
+  it('treats a resolving run with a failed terminal turn as failed, never as a result', async () => {
+    const harness = await boot(['unused'])
+    const agents = harness.kernel.ctx.get('agents') as { create: (session: { append(event: unknown): unknown }) => unknown }
+    const original = agents.create
+    agents.create = (session) => ({
+      send: () => {},
+      stop: () => {},
+      async run() {
+        session.append({ type: 'turn/start', turnId: 'failed-turn' })
+        session.append({ type: 'assistant/message', stepId: 'failed-step', content: 'do not return this', toolCalls: [] })
+        session.append({ type: 'turn/end', turnId: 'failed-turn', reason: 'failed' })
+      },
+    })
+    const handle = await harness.executor.spawn(request(harness, explorer))
+    agents.create = original
+    const settled = await settle(harness, handle.childSessionId)
+    expect(settled).toMatchObject({ status: 'failed' })
+    expect(settled?.result).toBeUndefined()
+    expect(settled?.error).toContain('terminal turn ended failed')
+    await harness.kernel.stop()
+  }, 15_000)
+
   it('a settled child stays queryable after its in-memory entry is evicted, and across a restart', async () => {
     const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-evict-'))
     try {
@@ -210,21 +232,65 @@ describe('lifecycle boundary', () => {
     await harness.kernel.stop()
   }, 15_000)
 
-  it('a failure before the parent relationship is durable leaves no child session and no leaked capacity', async () => {
+  it('retains a child when canonical storage proves a rejected parent durable wrapper committed its spawn', async () => {
     const harness = await boot([{ toolCalls: [{ name: 'Read', args: {} }] }], { blocking: true })
     const root = harness.kernel.ctx.sessions.get(harness.rootSessionId as never) as unknown as { durable(): Promise<void> }
-    const durable = root.durable.bind(root)
-    const before = harness.kernel.ctx.sessions.summaries().length
     root.durable = async () => { throw new Error('disk full') }
-    await expect(harness.executor.spawn(request(harness, explorer))).rejects.toThrow('disk full')
-    expect(harness.kernel.ctx.sessions.summaries().length).toBe(before)
-    root.durable = durable
-    // Capacity was rolled back: the conversation still gets all three slots.
-    for (let i = 0; i < 3; i++) await harness.executor.spawn(request(harness, explorer))
-    await expect(harness.executor.spawn(request(harness, explorer))).rejects.toMatchObject({ code: 'capacity' })
+    const handle = await harness.executor.spawn(request(harness, explorer))
+    expect(handle.status).toBe('running')
+    expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(1)
     await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)
     await harness.kernel.stop()
   }, 20_000)
+
+  it('removes a never-launched uncertain spawn after a transient canonical read failure then canonical absence', async () => {
+    const harness = await boot(['done'])
+    const sessions = harness.kernel.ctx.sessions as unknown as {
+      storeFor(workspaceId: string): { append(id: string, event: { type: string }): Promise<void> }
+      readCanonicalEvents(id: string): Promise<readonly unknown[] | undefined>
+      has(id: string): boolean
+    }
+    const store = sessions.storeFor(harness.workspaceId)
+    const append = store.append.bind(store)
+    store.append = async (id, event) => {
+      if (id === harness.rootSessionId && event.type === 'agent/child-spawn') {
+        throw new Error('spawn write acknowledgement lost before persistence')
+      }
+      await append(id, event)
+    }
+    const readCanonicalEvents = sessions.readCanonicalEvents.bind(sessions)
+    sessions.readCanonicalEvents = async () => { throw new Error('canonical storage temporarily unavailable') }
+
+    const handle = await harness.executor.spawn(request(harness, explorer))
+    expect(handle.status).toBe('uncertain')
+    expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(1)
+
+    sessions.readCanonicalEvents = readCanonicalEvents
+    expect(await harness.executor.reconcile(harness.workspaceId as never, handle.childSessionId)).toBeUndefined()
+    expect(sessions.has(handle.childSessionId)).toBe(false)
+    expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(0)
+    expect(await harness.executor.childrenOfRoot(harness.rootSessionId as never, harness.workspaceId as never)).toEqual([])
+    // A second operator retry cannot release the already removed reservation.
+    expect(await harness.executor.reconcile(harness.workspaceId as never, handle.childSessionId)).toBeUndefined()
+    expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(0)
+    await harness.kernel.stop()
+  }, 15_000)
+
+  it('canonically accepts a committed spawn when a non-poisoned durable wrapper rejects after success', async () => {
+    const harness = await boot(['done'])
+    const root = harness.kernel.ctx.sessions.get(harness.rootSessionId as never) as unknown as { durable(): Promise<void> }
+    const durable = root.durable.bind(root)
+    root.durable = async () => {
+      await durable()
+      throw new Error('post-success wrapper rejection')
+    }
+
+    const handle = await harness.executor.spawn(request(harness, explorer))
+    expect(handle.status).toBe('running')
+    expect(await settle(harness, handle.childSessionId)).toMatchObject({ status: 'completed', result: { report: 'done' } })
+    expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(0)
+    await harness.kernel.stop()
+  }, 15_000)
 
   it('a launch failure after the relationship is durable settles a queryable failed child', async () => {
     const harness = await boot(['done'])
@@ -239,6 +305,302 @@ describe('lifecycle boundary', () => {
     const listed = await harness.executor.childrenOfRoot(harness.rootSessionId as never)
     expect(listed.find((child) => child.childSessionId === handle.childSessionId)).toMatchObject({ status: 'failed' })
     expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(0)
+    await harness.kernel.stop()
+  }, 15_000)
+
+  it('reconciles a poisoned parent against canonical storage when the persisted spawn append rejects, including after restart', async () => {
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-spawn-append-reject-'))
+    try {
+      const harness = await boot(['done'], { dir })
+      const root = harness.kernel.ctx.sessions.get(harness.rootSessionId as never)
+      const store = harness.kernel.ctx.sessions.storeFor(harness.workspaceId as never) as {
+        append(id: string, event: { type: string }): Promise<void>
+      }
+      const append = store.append.bind(store)
+      let rejectAfterPersist = true
+      store.append = async (id, event) => {
+        await append(id, event)
+        if (id === harness.rootSessionId && event.type === 'agent/child-spawn' && rejectAfterPersist) {
+          rejectAfterPersist = false
+          throw new Error('spawn append acknowledgement lost')
+        }
+      }
+
+      const handle = await harness.executor.spawn(request(harness, explorer))
+      expect(root.poisoned).toBe(true)
+      expect(handle.status).toBe('running')
+      expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(1)
+      expect(await harness.executor.childrenOfRoot(harness.rootSessionId as never, harness.workspaceId as never))
+        .toMatchObject([{ childSessionId: handle.childSessionId, status: 'running' }])
+      // The child log can complete, but a poisoned parent without a durable
+      // result must remain uncertain rather than inventing a failed outcome.
+      expect(await settle(harness, handle.childSessionId)).toMatchObject({ status: 'uncertain' })
+      expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(1)
+      await harness.kernel.stop()
+
+      const restarted = new Kernel()
+      restarted.ctx.plugin(fileSessions(dir))
+      await restarted.ctx.sessions.boot()
+      const executor = new ChildExecutor(restarted.ctx)
+      expect(await executor.recoverFromStorage()).toBe(1)
+      // A child terminal turn is not a durable parent result. Restart must
+      // preserve uncertainty rather than manufacture a completed deliverable.
+      expect(await executor.childrenOfRoot(harness.rootSessionId as never, harness.workspaceId as never))
+        .toMatchObject([{ childSessionId: handle.childSessionId, status: 'uncertain' }])
+      // Retry is a canonical settlement: concurrent callers repair exactly one
+      // parent terminal record and every caller observes that result.
+      const settled = await Promise.all([
+        executor.reconcile(harness.workspaceId as never, handle.childSessionId),
+        executor.reconcile(harness.workspaceId as never, handle.childSessionId),
+      ])
+      expect(settled).toEqual([
+        expect.objectContaining({ status: 'completed', result: { report: 'done', filesTouched: [] } }),
+        expect.objectContaining({ status: 'completed', result: { report: 'done', filesTouched: [] } }),
+      ])
+      const parentEvents = restarted.ctx.sessions.get(harness.rootSessionId as never).events
+      expect(parentEvents.filter((event) => event.type === 'agent/child-result' && event.childSessionId === handle.childSessionId)).toHaveLength(1)
+      await restarted.stop()
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  }, 20_000)
+
+  it('releases capacity when a poisoned parent has canonically persisted the result append, including after restart', async () => {
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-result-append-reject-'))
+    try {
+      const harness = await boot(['done'], { dir })
+      const root = harness.kernel.ctx.sessions.get(harness.rootSessionId as never)
+      const handle = await harness.executor.spawn(request(harness, explorer))
+      const store = harness.kernel.ctx.sessions.storeFor(harness.workspaceId as never) as {
+        append(id: string, event: { type: string }): Promise<void>
+      }
+      const append = store.append.bind(store)
+      let rejectAfterPersist = true
+      store.append = async (id, event) => {
+        await append(id, event)
+        if (id === harness.rootSessionId && event.type === 'agent/child-result' && rejectAfterPersist) {
+          rejectAfterPersist = false
+          throw new Error('result append acknowledgement lost')
+        }
+      }
+
+      expect(await settle(harness, handle.childSessionId)).toMatchObject({ status: 'completed', result: { report: 'done' } })
+      expect(root.poisoned).toBe(true)
+      expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(0)
+      await harness.kernel.stop()
+
+      const restarted = new Kernel()
+      restarted.ctx.plugin(fileSessions(dir))
+      await restarted.ctx.sessions.boot()
+      const executor = new ChildExecutor(restarted.ctx)
+      expect(await executor.recoverFromStorage()).toBe(1)
+      expect(await executor.childrenOfRoot(harness.rootSessionId as never, harness.workspaceId as never))
+        .toMatchObject([{ childSessionId: handle.childSessionId, status: 'completed', result: { report: 'done' } }])
+      await restarted.stop()
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  }, 20_000)
+
+  it('reconciles a poisoned parent result in-process and releases capacity only after the canonical result is proven', async () => {
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-result-reconcile-'))
+    try {
+      const harness = await boot(['done'], { dir })
+      const handle = await harness.executor.spawn(request(harness, explorer))
+      const root = harness.kernel.ctx.sessions.get(harness.rootSessionId as never) as unknown as { durable(): Promise<void> }
+      const originalDurable = root.durable.bind(root)
+      root.durable = async () => { throw new Error('parent is poisoned') }
+      const sessions = harness.kernel.ctx.sessions as unknown as {
+        readCanonicalEvents(id: string): Promise<readonly unknown[] | undefined>
+      }
+      const readCanonicalEvents = sessions.readCanonicalEvents.bind(sessions)
+      sessions.readCanonicalEvents = async () => { throw new Error('canonical read unavailable') }
+
+      const settled = await settle(harness, handle.childSessionId)
+      expect(settled?.status).toBe('uncertain')
+      expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(1)
+
+      sessions.readCanonicalEvents = readCanonicalEvents
+      root.durable = originalDurable
+
+      expect(await harness.executor.reconcile(harness.workspaceId as never, handle.childSessionId)).toMatchObject({ status: 'completed', result: { report: 'done' } })
+      expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(0)
+      await harness.kernel.stop()
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  }, 20_000)
+
+  it('does not share an owning reconciliation promise with a foreign workspace caller', async () => {
+    const harness = await boot(['done'])
+    const handle = await harness.executor.spawn(request(harness, explorer))
+    const root = harness.kernel.ctx.sessions.get(harness.rootSessionId as never) as unknown as { durable(): Promise<void> }
+    const durable = root.durable.bind(root)
+    root.durable = async () => { throw new Error('parent is poisoned') }
+    const sessions = harness.kernel.ctx.sessions as unknown as {
+      readCanonicalEvents(id: string): Promise<readonly unknown[] | undefined>
+    }
+    const canonical = sessions.readCanonicalEvents.bind(sessions)
+    sessions.readCanonicalEvents = async () => { throw new Error('canonical read unavailable') }
+    expect(await settle(harness, handle.childSessionId)).toMatchObject({ status: 'uncertain' })
+
+    root.durable = durable
+    let releaseRead: () => void = () => {}
+    const readReleased = new Promise<void>((resolve) => { releaseRead = resolve })
+    let readStarted: () => void = () => {}
+    const readStartedPromise = new Promise<void>((resolve) => { readStarted = resolve })
+    sessions.readCanonicalEvents = async (id) => {
+      if (id === harness.rootSessionId) {
+        readStarted()
+        await readReleased
+      }
+      return canonical(id)
+    }
+    const owning = harness.executor.reconcile(harness.workspaceId as never, handle.childSessionId)
+    await readStartedPromise
+
+    // Authorization must occur before joining the per-child single-flight task.
+    await expect(harness.executor.reconcile('ws-foreign' as never, handle.childSessionId)).resolves.toBeUndefined()
+    releaseRead()
+    expect(await owning).toMatchObject({ status: 'completed', result: { report: 'done' } })
+    await harness.kernel.stop()
+  }, 15_000)
+
+  it('does not reconcile a retained child while its runner is finishing', async () => {
+    const harness = await boot(['unused'])
+    const agents = harness.kernel.ctx.get('agents') as { create: (session: { append(event: unknown): unknown }) => unknown }
+    let releaseRun: () => void = () => {}
+    const runReleased = new Promise<void>((resolve) => { releaseRun = resolve })
+    let releaseAfterTerminal: () => void = () => {}
+    const afterTerminalReleased = new Promise<void>((resolve) => { releaseAfterTerminal = resolve })
+    let terminalWritten: () => void = () => {}
+    const terminalReady = new Promise<void>((resolve) => { terminalWritten = resolve })
+    agents.create = (session) => ({
+      send: () => {},
+      stop: () => {},
+      async run() {
+        await runReleased
+        session.append({ type: 'turn/start', turnId: 'completed-turn' })
+        session.append({ type: 'assistant/message', stepId: 'completed-step', content: 'completed report', toolCalls: [] })
+        session.append({ type: 'turn/end', turnId: 'completed-turn', reason: 'completed' })
+        terminalWritten()
+        await afterTerminalReleased
+      },
+    })
+    const handle = await harness.executor.spawn(request(harness, explorer))
+    releaseRun()
+    await terminalReady
+
+    // The child has a terminal event but `run()` is still in progress.
+    // Reconciliation must neither append a result nor release capacity.
+    expect(await harness.executor.reconcile(harness.workspaceId as never, handle.childSessionId)).toMatchObject({ status: 'running' })
+    expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(1)
+
+    releaseAfterTerminal()
+    const settled = await settle(harness, handle.childSessionId)
+    expect(settled?.status).toBe('completed')
+    const parentEvents = harness.kernel.ctx.sessions.get(harness.rootSessionId as never).events
+    expect(parentEvents.filter((event) => event.type === 'agent/child-result' && event.childSessionId === handle.childSessionId)).toHaveLength(1)
+    await harness.kernel.stop()
+  }, 15_000)
+
+  it('never durably completes a parent when its completed child log cannot flush', async () => {
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-child-flush-'))
+    try {
+      const harness = await boot(['unused'], { dir })
+      const agents = harness.kernel.ctx.get('agents') as { create: (session: { append(event: unknown): unknown }) => unknown }
+      let releaseRun: () => void = () => {}
+      const runReleased = new Promise<void>((resolve) => { releaseRun = resolve })
+      agents.create = (session) => ({
+        send: () => {},
+        stop: () => {},
+        async run() {
+          await runReleased
+          session.append({ type: 'turn/start', turnId: 'completed-turn' })
+          session.append({ type: 'assistant/message', stepId: 'completed-step', content: 'completed report', toolCalls: [] })
+          session.append({ type: 'turn/end', turnId: 'completed-turn', reason: 'completed' })
+        },
+      })
+      const handle = await harness.executor.spawn(request(harness, explorer))
+      const child = harness.kernel.ctx.sessions.get(handle.childSessionId as never) as unknown as { durable(): Promise<void> }
+      const durable = child.durable.bind(child)
+      child.durable = async () => { throw new Error('child disk full') }
+      releaseRun()
+
+      // A failed child-log barrier gives no durable terminal fact. Retain it as
+      // repairable uncertainty and keep its slot rather than inventing failure.
+      expect(await settle(harness, handle.childSessionId)).toMatchObject({ status: 'uncertain' })
+      expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(1)
+      expect(harness.kernel.ctx.sessions.get(harness.rootSessionId as never).events
+        .some((event) => event.type === 'agent/child-result' && event.childSessionId === handle.childSessionId)).toBe(false)
+
+      // Once the canonical child terminal turn is readable, repair settles the
+      // parent exactly once and releases the retained reservation exactly once.
+      child.durable = durable
+      expect(await harness.executor.reconcile(harness.workspaceId as never, handle.childSessionId))
+        .toMatchObject({ status: 'completed', result: { report: 'completed report' } })
+      expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(0)
+      expect(await harness.executor.reconcile(harness.workspaceId as never, handle.childSessionId))
+        .toMatchObject({ status: 'completed' })
+      expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(0)
+      expect(harness.kernel.ctx.sessions.get(harness.rootSessionId as never).events
+        .filter((event) => event.type === 'agent/child-result' && event.childSessionId === handle.childSessionId)).toHaveLength(1)
+      await harness.kernel.stop()
+
+      const restarted = new Kernel()
+      restarted.ctx.plugin(fileSessions(dir))
+      await restarted.ctx.sessions.boot()
+      const executor = new ChildExecutor(restarted.ctx)
+      expect(await executor.recoverFromStorage()).toBe(1)
+      expect(await executor.reconcile(harness.workspaceId as never, handle.childSessionId))
+        .toMatchObject({ status: 'completed', result: { report: 'completed report' } })
+      await restarted.stop()
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  }, 20_000)
+
+  it('releases capacity when a non-poisoned durable wrapper rejects after its terminal result was canonically committed', async () => {
+    const harness = await boot([{ toolCalls: [{ name: 'Read', args: {} }] }], { blocking: true })
+    const first = await harness.executor.spawn(request(harness, explorer))
+    const second = await harness.executor.spawn(request(harness, explorer))
+    const third = await harness.executor.spawn(request(harness, explorer))
+    const root = harness.kernel.ctx.sessions.get(harness.rootSessionId as never) as unknown as { durable(): Promise<void> }
+    const durable = root.durable.bind(root)
+    root.durable = async () => { await durable(); throw new Error('post-success terminal rejection') }
+    expect(await harness.executor.cancel(harness.workspaceId as never, third.childSessionId)).toMatchObject({ status: 'cancelled' })
+    expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(2)
+    root.durable = durable
+    await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)
+    await Promise.all([settle(harness, first.childSessionId), settle(harness, second.childSessionId)])
+    await harness.kernel.stop()
+  }, 20_000)
+
+  it('releases retained reservations exactly once when root deletion succeeds before forgetRoot', async () => {
+    const harness = await boot([{ toolCalls: [{ name: 'Read', args: {} }] }], { blocking: true })
+    const children = await Promise.all([0, 1, 2].map(() => harness.executor.spawn(request(harness, explorer))))
+    const root = harness.kernel.ctx.sessions.get(harness.rootSessionId as never) as unknown as { durable(): Promise<void> }
+    const durable = root.durable.bind(root)
+    root.durable = async () => { await durable(); throw new Error('post-success terminal rejection') }
+    await harness.executor.cancel(harness.workspaceId as never, children[2]!.childSessionId)
+    expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(2)
+    expect(harness.executor.forgetRoot(harness.rootSessionId as never)).toEqual([])
+    root.durable = durable
+
+    await harness.kernel.ctx.sessions.delete(harness.rootSessionId as never)
+    expect(harness.executor.forgetRoot(harness.rootSessionId as never).sort()).toEqual(children.map((child) => child.childSessionId).sort())
+    expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(0)
+    expect(harness.executor.forgetRoot(harness.rootSessionId as never)).toEqual([])
+    await harness.kernel.stop()
+  }, 20_000)
+
+  it('does not list an active child after its root is deleted', async () => {
+    const harness = await boot([{ toolCalls: [{ name: 'Read', args: {} }] }], { blocking: true })
+    await harness.executor.spawn(request(harness, explorer))
+    await harness.kernel.ctx.sessions.delete(harness.rootSessionId as never)
+    expect(await harness.executor.childrenOfRoot(harness.rootSessionId as never)).toEqual([])
+    expect(await harness.executor.childrenOfRoot(harness.rootSessionId as never, harness.workspaceId as never)).toEqual([])
+    await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)
     await harness.kernel.stop()
   }, 15_000)
 
@@ -306,6 +668,29 @@ describe('lifecycle boundary', () => {
     } finally {
       await fs.rm(dir, { recursive: true, force: true })
     }
+  }, 15_000)
+
+  it('direct wait refuses a committed child whose parent was deleted', async () => {
+    const harness = await boot(['done'])
+    const handle = await harness.executor.spawn(request(harness, explorer))
+    await settle(harness, handle.childSessionId)
+    await harness.kernel.ctx.sessions.delete(harness.rootSessionId as never)
+    expect(await harness.executor.wait(harness.workspaceId as never, [handle.childSessionId as never], { timeoutMs: 10 })).toEqual([])
+    await harness.kernel.stop()
+  }, 15_000)
+
+  it('direct wait refuses a committed child whose parent project no longer matches', async () => {
+    const harness = await boot(['done'])
+    const projectId = 'project-a'
+    const root = harness.kernel.ctx.sessions.get(harness.rootSessionId as never)
+    root.append({ type: 'session/project', projectId })
+    await root.durable()
+    const handle = await harness.executor.spawn(request(harness, explorer, { projectId: projectId as never }))
+    await settle(harness, handle.childSessionId)
+    root.append({ type: 'session/project', projectId: 'project-b' })
+    await root.durable()
+    expect(await harness.executor.wait(harness.workspaceId as never, [handle.childSessionId as never], { timeoutMs: 10 })).toEqual([])
+    await harness.kernel.stop()
   }, 15_000)
 })
 
@@ -460,6 +845,7 @@ describe('the Agent tool', () => {
         childrenOfRoot: async () => [],
         wait: async () => [],
         cancel: async () => undefined,
+        reconcile: async (_workspaceId: string, _childSessionId: string) => undefined,
       },
     }
   }
@@ -497,6 +883,13 @@ describe('the Agent tool', () => {
     expect(spawned[0]).toMatchObject({ inherit: 'brief', inheritedContext: 'User: look at plan-7.md' })
     expect(JSON.parse(String(raw))).toMatchObject({ inheritedChars: 'User: look at plan-7.md'.length })
     await expect(run('ws-tool', () => tool.execute({ action: 'spawn', definition: 'explorer', prompt: 'x', inherit: 'all' }, {} as never))).rejects.toThrow(/'inherit'/)
+  })
+
+  it('reconciles only child ids owned by the calling root through the Agent tool', async () => {
+    const { executor } = fakeExecutor()
+    const tool = agentTool(deps(new AgentDefinitionService(home), executor))
+    const raw = await run('ws-tool', () => tool.execute({ action: 'reconcile', childIds: ['root-child', 'foreign-child'] }, {} as never))
+    expect(JSON.parse(String(raw))).toEqual({ children: [] })
   })
 
   it('describes the delegation trade-off and the writer boundary honestly', () => {

@@ -10,7 +10,7 @@ import { ModeMenu } from '../components/composer/ComposerControls.tsx'
 import { ToastHost, useToast } from '../components/common/Toast.tsx'
 import { ToolCard, ActivityBlock, AssistantMessage, DelegationCard, AuditLine, StatusLine, UserBubble, summarizeActivity } from '../components/chat/MessageParts.tsx'
 import { groupBlocks, turnFooters } from '../components/chat/Transcript.tsx'
-import { minimapEntries, minimapPreview } from '../components/chat/ConversationMinimap.tsx'
+import { activeMinimapIndex, minimapEntries, minimapPreview, minimapScrollTarget } from '../components/chat/ConversationMinimap.tsx'
 import { modeLabel, errorSummary } from './copy.ts'
 import { emptyDraft, textDraft } from './composer-draft.ts'
 import { budgetTone, formatTime } from './format.ts'
@@ -163,6 +163,25 @@ describe('mounted production controls', () => {
 })
 
 describe('conversation minimap', () => {
+  it('activates the upper user message when two are visible in the viewport', () => {
+    const rows = [{ index: 0, top: 120, bottom: 170 }, { index: 1, top: 440, bottom: 530 }]
+    expect(activeMinimapIndex(rows, 0, 500)).toBe(0)
+    expect(activeMinimapIndex(rows, 150, 500)).toBe(0)
+    expect(activeMinimapIndex(rows, 170, 500)).toBe(1)
+  })
+
+  it('keeps the most recent preceding message active when none are visible', () => {
+    const rows = [{ index: 0, top: 100, bottom: 150 }, { index: 1, top: 700, bottom: 750 }]
+    expect(activeMinimapIndex(rows, 200, 300)).toBe(0)
+    expect(activeMinimapIndex(rows, 0, 50)).toBe(0)
+    expect(activeMinimapIndex(rows, 800, 900)).toBe(1)
+  })
+
+  it('scrolls the clicked message to the top of the reading area', () => {
+    expect(minimapScrollTarget(6000, 600, 12000)).toBe(5984)
+    expect(minimapScrollTarget(6000, 600, 6200)).toBe(5600)
+  })
+
   it('maps only user messages, not assistant activity or system lines', () => {
     const entries = minimapEntries([
       { kind: 'user', content: 'Chốt gửi theo đề xuất, sau đó test với environment staging.' },

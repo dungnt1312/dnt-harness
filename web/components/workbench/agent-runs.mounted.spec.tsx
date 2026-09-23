@@ -48,6 +48,44 @@ describe('agent runs panel, mounted', () => {
     await act(async () => root.unmount())
   })
 
+  it('shows an uncertain child as reconciling instead of treating it as terminal', async () => {
+    stubApi([
+      { childSessionId: 'child-uncertain000000', status: 'uncertain', definitionName: 'explorer', startedAt: 1, error: 'canonical reconciliation is pending' },
+    ])
+    const host = document.createElement('div'); document.body.append(host)
+    const root = createRoot(host)
+    await act(async () => root.render(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />))
+    expect(host.textContent).toContain('uncertain')
+    expect(host.textContent).toContain('reconciling')
+    expect(host.textContent).not.toContain('Cancel')
+    await act(async () => root.unmount())
+  })
+
+  it('offers Retry settlement for an uncertain child and refreshes its row', async () => {
+    const calls: string[] = []
+    let reads = 0
+    vi.stubGlobal('fetch', vi.fn((url: string, init?: { method?: string }) => {
+      calls.push(`${init?.method ?? 'GET'} ${url}`)
+      const body = url.includes('/agents/children')
+        ? reads++ === 0
+          ? [{ childSessionId: 'child-uncertain000000', status: 'uncertain', definitionName: 'explorer', startedAt: 1 }]
+          : [{ childSessionId: 'child-uncertain000000', status: 'completed', definitionName: 'explorer', startedAt: 1, result: { report: 'settled', filesTouched: [] } }]
+        : init?.method === 'POST'
+          ? { childSessionId: 'child-uncertain000000', status: 'completed', definitionName: 'explorer', startedAt: 1 }
+          : [role]
+      return Promise.resolve({ ok: true, json: async () => body })
+    }))
+    const host = document.createElement('div'); document.body.append(host)
+    const root = createRoot(host)
+    await act(async () => root.render(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />))
+    const retry = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Retry settlement'))
+    expect(retry).toBeDefined()
+    await act(async () => retry?.click())
+    expect(calls).toContain('POST /api/workspaces/ws-1/sessions/root/children/child-uncertain000000/reconcile')
+    expect(host.textContent).toContain('settled')
+    await act(async () => root.unmount())
+  })
+
   it('shows a child’s final report, a visible truncation, and an honest no-result error', async () => {
     stubApi([
       { childSessionId: 'child-aaaaaaaaaaaaaa', status: 'completed', definitionName: 'explorer', startedAt: 1, result: { report: 'Answer: the router.\n… [truncated 42 chars]', filesTouched: ['src/a.ts'], truncated: true } },

@@ -74,20 +74,29 @@ const DECISION_LABELS: Readonly<Record<string, string>> = {
   invalidated: 'Invalidated · no decision recorded',
 }
 
-/**
- * Project render items from the durable log. Streaming chunks accumulate
- * into the in-flight assistant item (mutated as chunks arrive); thinking
- * chunks fill `thinking` without touching `content`. `assistant/message`
- * finalizes the item and records the controls that served it. Each
- * `tool/result` answers the call its `callId` names; a `recovery: true`
- * result flags the row as recovered. `agent/child-spawn` → `agent/
- * child-result` project to one delegation card (a parent turn that ends
- * first marks it interrupted). Hooks surface only when blocking or failing;
- * approval decisions correlate their request by id. Answers carry their
- * `turnId` and stay `turnOpen` until the matching `turn/end` so the
- * transcript can place one footer per turn. Structural events are
- * skipped; non-`completed` turn ends surface as status lines.
- */
+function sameValue(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true
+  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false
+  if (Array.isArray(left) !== Array.isArray(right)) return false
+  const a = left as Record<string, unknown>
+  const b = right as Record<string, unknown>
+  const keys = Object.keys(a)
+  return keys.length === Object.keys(b).length && keys.every((key) => Object.hasOwn(b, key) && sameValue(a[key], b[key]))
+}
+
+/** Preserve row identity across log projections without sharing mutable drafts. */
+export function shareProjectedItems(previous: readonly ViewItem[], next: ViewItem[]): readonly ViewItem[] {
+  let unchanged = previous.length === next.length
+  const shared = next.map((item, index) => {
+    const old = previous[index]
+    if (old !== undefined && sameValue(old, item)) return old
+    unchanged = false
+    return item
+  })
+  return unchanged ? previous : shared
+}
+
+/** Project durable events into messages, tool rows, delegations, and status. */
 export function projectItems(events: readonly SseEvent[]): ViewItem[] {
   const items: ViewItem[] = []
   const toolItems = new Map<string, Extract<ViewItem, { kind: 'tool' }>>()

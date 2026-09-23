@@ -190,6 +190,53 @@ export class ModesService {
     })
   }
 
+  // ── Workspace selected mode (durable) ───────────────────────────────
+  // The workspace's live selection is persisted so a server restart restores
+  // the same mode (e.g. Full access) instead of falling back to the default.
+  // Missing/invalid selections fall back to DEFAULT_MODE_ID.
+
+  private selectedPath(workspaceId: string): string {
+    return path.join(this.dir(workspaceId), '.selected.json')
+  }
+
+  /** The persisted selected mode for this workspace, if any. */
+  async selectedId(workspaceId: string): Promise<string | undefined> {
+    let raw: string
+    try {
+      raw = await fs.readFile(this.selectedPath(workspaceId), 'utf8')
+    } catch {
+      return undefined
+    }
+    try {
+      const parsed = JSON.parse(raw) as { selected?: unknown; modeId?: unknown }
+      const candidate = parsed.selected ?? parsed.modeId
+      if (typeof candidate !== 'string' || candidate.trim() === '') return undefined
+      const id = candidate.trim()
+      // Must still resolve (bundled always does; custom may have been deleted
+      // or become invalid). An unresolvable id is treated as absent so the
+      // caller can fall back to the default without surfacing a hard error.
+      try {
+        await this.resolve(workspaceId, id)
+      } catch {
+        return undefined
+      }
+      if ((await this.disabledIds(workspaceId)).includes(id)) return undefined
+      return id
+    } catch {
+      return undefined
+    }
+  }
+
+  /** Persist the workspace's selected mode. */
+  async setSelected(workspaceId: string, id: string): Promise<void> {
+    await this.resolve(workspaceId, id) // validate before persisting
+    await this.withMutationLock(workspaceId, '.selected', async () => {
+      const file = this.selectedPath(workspaceId)
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      await replaceFileAtomic(file, `${JSON.stringify({ selected: id }, null, 2)}\n`)
+    })
+  }
+
   // ── Workspace enablement ──────────────────────────────────────────────────
   // A per-workspace disabled set, persisted beside the mode files it governs.
   // Absent ids (a deleted file, a mode that returns) are ignored wherever the
@@ -238,7 +285,7 @@ export class ModesService {
 /** The exact frontmatter keys a mode file may carry. */
 const KNOWN_FRONTMATTER_KEYS = new Set([
   'name', 'description', 'history', 'workspaceInstructions', 'skills',
-  'memoryPinned', 'memoryRetrieval', 'toolExposure', 'permissionDefaults',
+  'memoryPinned', 'memoryRetrieval', 'toolExposure', 'permissionDefaults', 'outOfGrant',
 ])
 
 /**
@@ -342,6 +389,12 @@ export function parseModeFile(id: string, raw: string): ModeDefinition {
     }
   }
 
+  let outOfGrant: 'allow' | 'ask' | undefined
+  if (frontmatter.outOfGrant !== undefined) {
+    if (frontmatter.outOfGrant === 'allow' || frontmatter.outOfGrant === 'ask') outOfGrant = frontmatter.outOfGrant
+    else invalid.push(`'outOfGrant' must be allow|ask, got ${JSON.stringify(frontmatter.outOfGrant)}`)
+  }
+
   if (invalid.length > 0) {
     throw new ModeError('invalid', `mode '${id}' is invalid: ${invalid.join('; ')}`)
   }
@@ -352,6 +405,7 @@ export function parseModeFile(id: string, raw: string): ModeDefinition {
     sources,
     toolExposure,
     permissionDefaults,
+    ...(outOfGrant !== undefined ? { outOfGrant } : {}),
   }
 }
 
@@ -379,7 +433,8 @@ export function serializeModeFile(definition: ModeDefinition): string {
     `workspaceInstructions: ${definition.sources.workspaceInstructions}`, `skills: ${definition.sources.skills}`,
     `memoryPinned: ${definition.sources.memoryPinned}`, `memoryRetrieval: ${definition.sources.memoryRetrieval}`,
     `toolExposure: ${JSON.stringify(definition.toolExposure)}`,
-    `permissionDefaults: ${JSON.stringify(definition.permissionDefaults)}`]
+    `permissionDefaults: ${JSON.stringify(definition.permissionDefaults)}`,
+    ...(definition.outOfGrant !== undefined ? [`outOfGrant: ${definition.outOfGrant}`] : [])]
   return `---\n${fm.join('\n')}\n---\n\n${definition.instructions.trim()}\n`
 }
 

@@ -90,7 +90,7 @@ const pastedTextFile = (text: string, date = new Date()): File => {
  * be put back inline; ArrowUp on an empty draft recalls the last message.
  */
 export function Composer({
-  workspaceId = null, modelControl, connected, sending = false, running,
+  workspaceId = null, modelControl, contextControl, connected, sending = false, running,
   draft, onDraft, onSend, onStop,
   modelValue, thinkingValue = null, modelSettings, onThinking, thinkingMenuLabel, thinkingDisabled = false,
   controlsUnavailable = false, controlsUnavailableMessage, onRetryControls,
@@ -100,6 +100,8 @@ export function Composer({
   readonly workspaceId?: string | null
   /** Model picker, owned by the app; shown beside Send. */
   readonly modelControl?: ReactNode
+  /** Context-window meter, owned by the app; shown before the model picker. */
+  readonly contextControl?: ReactNode
   readonly sending?: boolean
   readonly connected: boolean
   readonly running: boolean
@@ -504,6 +506,7 @@ export function Composer({
             thinking level is the model's own control — its levels come from
             that model's capability, so the two belong side by side. */}
         <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5">
+          {contextControl}
           {modelControl}
           {modelId !== null && onThinking !== undefined ? (
             <ThinkingMenu

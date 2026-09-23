@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { HoldScrollProvider, useStickToBottom } from '../../hooks/useStickToBottom.ts'
 import type { ViewItem } from '../../lib/project.ts'
 import type { OpenPathResolver } from '../artifacts/ArtifactsPanel.tsx'
@@ -96,8 +96,11 @@ export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
  * The conversation column: projected log items in one centered reading
  * column. The scroller spans the full pane so the wheel works anywhere; it
  * follows new output only while the reader is at the bottom.
+ *
+ * Memoized: the app re-renders on every composer keystroke, and a long
+ * transcript must not re-render with it while its own props are unchanged.
  */
-export function Transcript({ items, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, onOpenSettings, openPath }: {
+export const Transcript = memo(function Transcript({ items, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, onOpenSettings, openPath }: {
   readonly items: readonly ViewItem[]
   readonly conversationId: string | null
   readonly modelLabel?: string
@@ -187,4 +190,4 @@ export function Transcript({ items, conversationId, modelLabel, workspaceId, onR
       </div>
     </HoldScrollProvider>
   )
-}
+})

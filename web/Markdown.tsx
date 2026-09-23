@@ -1,5 +1,5 @@
-import { useState, type ComponentProps } from 'react'
-import ReactMarkdown from 'react-markdown'
+import { memo, useMemo, useState, type ComponentProps } from 'react'
+import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import Icon from './components/common/Icon.tsx'
 import { highlight } from './lib/highlight.ts'
@@ -7,7 +7,7 @@ import { highlight } from './lib/highlight.ts'
 /** Fenced code block with a language chip and a copy button. */
 function CodeBlock({ lang, code }: { readonly lang: string; readonly code: string }) {
   const [copied, setCopied] = useState(false)
-  const html = highlight(code, lang)
+  const html = useMemo(() => highlight(code, lang), [code, lang])
   return (
     <div className="codeblock">
       <div className="codeblock-head">
@@ -31,35 +31,41 @@ function CodeBlock({ lang, code }: { readonly lang: string; readonly code: strin
   )
 }
 
+// Module-level so every render hands react-markdown the same plugin list and
+// component types: fresh closures would remount each rendered element.
+const REMARK_PLUGINS = [remarkGfm]
+const COMPONENTS: Components = {
+  pre: (props: ComponentProps<'pre'>) => <>{props.children}</>,
+  code: (props: ComponentProps<'code'>) => {
+    const { className, children } = props
+    const text = String(children ?? '').replace(/\n$/, '')
+    if (text.includes('\n')) {
+      const lang = /language-([\w-]+)/.exec(className ?? '')?.[1] ?? ''
+      return <CodeBlock lang={lang} code={text} />
+    }
+    return <code className="md-inline">{children}</code>
+  },
+  a: (props: ComponentProps<'a'>) => (
+    <a {...props} target="_blank" rel="noreferrer" />
+  ),
+}
+
 /**
  * Markdown rendering for assistant messages: GFM tables/lists/links plus
  * fenced code blocks with syntax highlighting. Fenced blocks (with a
  * language class) and any multi-line code render as {@link CodeBlock};
  * everything else is an inline chip.
+ *
+ * Memoized on `content`: parsing and highlighting a long conversation is the
+ * costliest render in the app, and unrelated state (composer keystrokes, a
+ * streaming reply) must not redo it for messages that did not change.
  */
-export function Markdown({ content }: { readonly content: string }) {
+export const Markdown = memo(function Markdown({ content }: { readonly content: string }) {
   return (
     <div className="md">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          pre: (props: ComponentProps<'pre'>) => <>{props.children}</>,
-          code: (props: ComponentProps<'code'>) => {
-            const { className, children } = props
-            const text = String(children ?? '').replace(/\n$/, '')
-            if (text.includes('\n')) {
-              const lang = /language-([\w-]+)/.exec(className ?? '')?.[1] ?? ''
-              return <CodeBlock lang={lang} code={text} />
-            }
-            return <code className="md-inline">{children}</code>
-          },
-          a: (props: ComponentProps<'a'>) => (
-            <a {...props} target="_blank" rel="noreferrer" />
-          ),
-        }}
-      >
+      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={COMPONENTS}>
         {content}
       </ReactMarkdown>
     </div>
   )
-}
+})

@@ -24,6 +24,23 @@ export interface ToolResult {
   readonly invocationId?: string
 }
 
+/** What a file tool intends to do with a path. */
+export type PathIntent = 'read' | 'write'
+
+/** A folder granted to file tools beside the primary root. */
+export interface GrantedRoot {
+  /** Absolute folder path (realpath at grant time). */
+  readonly path: string
+  readonly access: PathIntent
+}
+
+/** One out-of-grant path an approval allowed for a single call. */
+export interface ApprovedPath {
+  /** Absolute lexical path exactly as shown to the approver. */
+  readonly path: string
+  readonly intent: PathIntent
+}
+
 /**
  * The execution context the pipeline grants to one tool run: the explicitly
  * granted workspace root, the run's cancellation signal, and the identities
@@ -33,6 +50,18 @@ export interface ToolResult {
 export interface ToolExecution {
   /** The granted workspace root (already resolved for this session). */
   readonly root: string
+  /**
+   * Further folders granted beside the primary root (other projects or
+   * user-chosen folders), each read-only or read-write. Relative paths still
+   * resolve against `root`; absolute paths may land in any granted folder.
+   */
+  readonly additionalRoots?: readonly GrantedRoot[]
+  /**
+   * Exact paths outside every granted folder that an approval allowed for
+   * THIS call only. Set by the pipeline after the approval decision, never by
+   * a rewrite listener.
+   */
+  readonly approvedPaths?: readonly ApprovedPath[]
   /** Additional absolute paths tools must refuse (e.g. app-internal storage). */
   readonly deniedRoots?: readonly string[]
   /** Fires when the owning turn is stopping; cancellable tools honor it. An already-aborted signal never fires its listener — check `aborted` up front. */

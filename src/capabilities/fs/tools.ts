@@ -1,10 +1,12 @@
 /**
  * Filesystem capability consumers: the `Read`/`Write`/`Edit`/`Glob`/`Grep`
- * tools, confined to an explicitly granted root directory. Paths resolve
- * against `root` and must stay inside it — lexically and through real
- * symlinks/junctions — and paths inside `deniedRoots` (application-internal
- * storage) are refused even when they sit under the workspace. Escaping is
- * a tool failure, not a silent redirect.
+ * tools, confined to explicitly granted folders — the primary root plus any
+ * additional granted roots (see `grants.ts`). Relative paths resolve against
+ * the primary root; every path must stay inside a granted folder — lexically
+ * and through real symlinks/junctions — with write access where it writes,
+ * and paths inside `deniedRoots` (application-internal storage) are refused
+ * even when they sit under a granted folder. Escaping is a tool failure, not
+ * a silent redirect.
  *
  * These checks are application-level containment, not an OS sandbox and not
  * a guarantee against hostile external filesystem races.
@@ -12,7 +14,10 @@
 import { createHash } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
-import type { ToolDefinition, ToolExecution } from '../../harness/tools/types.ts'
+import type { PathIntent, ToolDefinition, ToolExecution } from '../../harness/tools/types.ts'
+import { displayPath, resolveInGrants, within } from './grants.ts'
+
+export { resolveGrantedPath, resolveWithin } from './grants.ts'
 
 const OUTPUT_CAP = 60_000
 const GLOB_CAP = 100
@@ -24,88 +29,8 @@ function limitOf(exec: ToolExecution): number {
   return exec.outputLimit ?? OUTPUT_CAP
 }
 
-/** Case-normalizing containment check (Windows paths vary in case). Uses
- * `path.relative`, so drive roots (`C:\`) and UNC roots behave correctly. */
-function within(parent: string, child: string): boolean {
-  const p = process.platform === 'win32' ? parent.toLowerCase() : parent
-  const c = process.platform === 'win32' ? child.toLowerCase() : child
-  const rel = path.relative(p, c)
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel))
-}
-
-/** Resolve `target` inside `root`, rejecting lexical escapes. */
-export function resolveWithin(root: string, target: string): string {
-  const absRoot = path.resolve(root)
-  const abs = path.resolve(absRoot, target)
-  if (!within(absRoot, abs)) {
-    throw new Error(`path '${target}' escapes the workspace root`)
-  }
-  return abs
-}
-
-async function realpathSafe(p: string): Promise<string> {
-  try {
-    return await fs.realpath(p)
-  } catch {
-    return p
-  }
-}
-
-/** The deepest ancestor of `abs` that exists (abs itself when it exists). */
-async function deepestExisting(abs: string): Promise<string> {
-  let probe = abs
-  for (;;) {
-    try {
-      await fs.stat(probe)
-      return probe
-    } catch {
-      const parent = path.dirname(probe)
-      if (parent === probe) return probe
-      probe = parent
-    }
-  }
-}
-
-/**
- * Resolve a granted path: lexical containment, then a realpath check that
- * follows symlinks/junctions in the existing portion of the path (including
- * the creation path — the parent a new file would land in), then refusal of
- * anything inside `deniedRoots` (application-internal storage).
- */
-export async function resolveGrantedPath(
-  root: string,
-  target: string,
-  deniedRoots?: readonly string[],
-): Promise<string> {
-  const abs = resolveWithin(root, target)
-  const existing = await deepestExisting(abs)
-  const realExisting = await realpathSafe(existing)
-  const rootReal = await realpathSafe(root)
-  const realTarget = existing === abs ? realExisting : path.join(realExisting, path.relative(existing, abs))
-  if (!within(rootReal, realTarget) || !within(root, abs)) {
-    throw new Error(`path '${target}' escapes the workspace root`)
-  }
-  if (deniedRoots !== undefined) {
-    for (const denied of deniedRoots) {
-      const deniedReal = await realpathSafe(denied)
-      if (within(denied, abs) || within(deniedReal, realTarget)) {
-        throw new Error(`path '${target}' is inside application-internal storage and is not accessible to tools`)
-      }
-    }
-  }
-  return abs
-}
-
-function execRoots(exec: ToolExecution): { root: string; deniedRoots?: readonly string[] } {
-  return {
-    root: exec.root,
-    ...(exec.deniedRoots !== undefined ? { deniedRoots: exec.deniedRoots } : {}),
-  }
-}
-
-function granted(exec: ToolExecution, target: string): Promise<string> {
-  const { root, deniedRoots } = execRoots(exec)
-  return resolveGrantedPath(root, target, deniedRoots)
+function granted(exec: ToolExecution, target: string, intent: PathIntent): Promise<string> {
+  return resolveInGrants(exec, target, intent)
 }
 
 /** Truncate a tool output to its cap, keeping the head and a marker. */
@@ -217,19 +142,19 @@ export function readTool(): ToolDefinition {
   return {
     name: 'Read',
     description:
-      'Read a text file inside the workspace and return its content. Optional `offset` (1-based line) and `limit` (line count) read a window. Large reads are truncated and marked.',
+      'Read a text file inside the workspace or a granted folder and return its content. Optional `offset` (1-based line) and `limit` (line count) read a window. Large reads are truncated and marked.',
     requiresRoot: true,
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'file path relative to the workspace root' },
+        path: { type: 'string', description: 'file path relative to the workspace root, or absolute inside a granted folder' },
         offset: { type: 'number', description: '1-based line number to start from' },
         limit: { type: 'number', description: 'maximum number of lines to return' },
       },
       required: ['path'],
     },
     async execute(args, exec) {
-      const abs = await granted(exec, argString(args, 'path'))
+      const abs = await granted(exec, argString(args, 'path'), 'read')
       let content: string
       try {
         content = await fs.readFile(abs, 'utf8')
@@ -257,12 +182,12 @@ export function writeTool(): ToolDefinition {
   return {
     name: 'Write',
     description:
-      'Create or overwrite a text file inside the workspace. Pass `expectedSha256` from your last read to refuse overwriting a file that changed externally; the result distinguishes creation from overwrite.',
+      'Create or overwrite a text file inside the workspace or a read-write granted folder. Pass `expectedSha256` from your last read to refuse overwriting a file that changed externally; the result distinguishes creation from overwrite.',
     requiresRoot: true,
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'file path relative to the workspace root' },
+        path: { type: 'string', description: 'file path relative to the workspace root, or absolute inside a granted folder' },
         content: { type: 'string', description: 'full file content to write' },
         expectedSha256: { type: 'string', description: 'sha256 of the file as last observed; a mismatch is a conflict' },
       },
@@ -270,7 +195,7 @@ export function writeTool(): ToolDefinition {
     },
     async execute(args, exec) {
       const rel = argString(args, 'path')
-      const abs = await granted(exec, rel)
+      const abs = await granted(exec, rel, 'write')
       const content = argString(args, 'content')
       let existed = false
       try {
@@ -293,12 +218,12 @@ export function editTool(): ToolDefinition {
   return {
     name: 'Edit',
     description:
-      'Replace one exact occurrence of `old` with `new` in a workspace file. Fails on missing or ambiguous (multi-match) occurrences; pass `expectedSha256` to refuse editing a file that changed externally.',
+      'Replace one exact occurrence of `old` with `new` in a file inside the workspace or a read-write granted folder. Fails on missing or ambiguous (multi-match) occurrences; pass `expectedSha256` to refuse editing a file that changed externally.',
     requiresRoot: true,
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'file path relative to the workspace root' },
+        path: { type: 'string', description: 'file path relative to the workspace root, or absolute inside a granted folder' },
         old: { type: 'string', description: 'exact text to replace (must match exactly once)' },
         new: { type: 'string', description: 'replacement text' },
         expectedSha256: { type: 'string', description: 'sha256 of the file as last observed; a mismatch is a conflict' },
@@ -307,7 +232,7 @@ export function editTool(): ToolDefinition {
     },
     async execute(args, exec) {
       const rel = argString(args, 'path')
-      const abs = await granted(exec, rel)
+      const abs = await granted(exec, rel, 'write')
       const old = argString(args, 'old')
       const replacement = argString(args, 'new')
       let content: string
@@ -332,26 +257,33 @@ export function editTool(): ToolDefinition {
   }
 }
 
+/** The search base for Glob/Grep: the optional `path` argument, else the primary root. */
+function searchBase(args: Record<string, unknown>, exec: ToolExecution): Promise<string> {
+  return args['path'] === undefined ? Promise.resolve(path.resolve(exec.root)) : granted(exec, argString(args, 'path'), 'read')
+}
+
 /** The `Glob` tool: match relative paths against a `*`/`**` pattern. */
 export function globTool(): ToolDefinition {
   return {
     name: 'Glob',
-    description: 'List workspace files matching a glob pattern (`*` within a segment, `**` across segments).',
+    description:
+      'List files matching a glob pattern (`*` within a segment, `**` across segments). Paths inside the workspace are shown relative to it; paths in other granted folders are absolute.',
     requiresRoot: true,
     parameters: {
       type: 'object',
-      properties: { pattern: { type: 'string', description: 'glob pattern relative to the workspace root' } },
+      properties: {
+        pattern: { type: 'string', description: 'glob pattern relative to the search directory' },
+        path: { type: 'string', description: 'optional directory to search within (default: the workspace root); may be absolute inside a granted folder' },
+      },
       required: ['pattern'],
     },
     async execute(args, exec) {
-      const { root, deniedRoots } = execRoots(exec)
-      const absRoot = path.resolve(root)
-      const pattern = argString(args, 'pattern')
-      const regex = globToRegExp(pattern)
-      const files = (await walk(absRoot, deniedRoots, exec.signal))
-        .map((full) => path.relative(absRoot, full).split(path.sep).join('/'))
-        .filter((rel) => regex.test(rel))
+      const base = await searchBase(args, exec)
+      const regex = globToRegExp(argString(args, 'pattern'))
+      const files = (await walk(base, exec.deniedRoots, exec.signal))
+        .filter((full) => regex.test(path.relative(base, full).split(path.sep).join('/')))
         .slice(0, GLOB_CAP)
+        .map((full) => displayPath(exec.root, full))
       return files.length === 0 ? 'no matches' : cap(files.join('\n'), OUTPUT_CAP)
     },
   }
@@ -361,24 +293,23 @@ export function globTool(): ToolDefinition {
 export function grepTool(): ToolDefinition {
   return {
     name: 'Grep',
-    description: 'Search workspace files with a regular expression; returns `path:line: text` matches.',
+    description:
+      'Search files with a regular expression; returns `path:line: text` matches. Paths inside the workspace are shown relative to it; paths in other granted folders are absolute.',
     requiresRoot: true,
     parameters: {
       type: 'object',
       properties: {
         pattern: { type: 'string', description: 'regular expression to search for' },
-        path: { type: 'string', description: 'optional subdirectory to search within' },
+        path: { type: 'string', description: 'optional directory to search within; may be absolute inside a granted folder' },
       },
       required: ['pattern'],
     },
     async execute(args, exec) {
       const regex = new RegExp(argString(args, 'pattern'))
-      const { root, deniedRoots } = execRoots(exec)
-      const absRoot = path.resolve(root)
-      const base = args['path'] === undefined ? absRoot : await granted(exec, argString(args, 'path'))
+      const base = await searchBase(args, exec)
       const lines: string[] = []
-      for (const full of await walk(base, deniedRoots, exec.signal)) {
-        const rel = path.relative(absRoot, full).split(path.sep).join('/')
+      for (const full of await walk(base, exec.deniedRoots, exec.signal)) {
+        const rel = displayPath(exec.root, full)
         let content: string
         try {
           content = await fs.readFile(full, 'utf8')

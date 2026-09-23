@@ -11,13 +11,15 @@ const ARGS_DISPLAY_LIMIT = 4000
 /**
  * Pending tool approvals, oldest first, above the composer. Allow once / Deny
  * answer only that request (locked while submitting); standing permission is
- * authored in Settings → Modes, never from a pending ask.
+ * authored in Settings → Modes, never from a pending ask. The one exception
+ * is a file path outside the granted folders: the conversation (never a
+ * child) may be granted exactly the folder the card names.
  */
 export function ApprovalBar({
   approvals, onAnswer, scope = 'No project attached',
 }: {
   readonly approvals: readonly PendingApproval[]
-  readonly onAnswer: (approvalId: string, allow: boolean) => void | Promise<void>
+  readonly onAnswer: (approvalId: string, allow: boolean, scope?: 'once' | 'session') => void | Promise<void>
   readonly scope?: string
 }) {
   const locks = useRef(new Set<string>())
@@ -39,12 +41,12 @@ export function ApprovalBar({
     return () => { window.clearInterval(id) }
   }, [counting])
 
-  const answer = async (id: string, allow: boolean): Promise<void> => {
+  const answer = async (id: string, allow: boolean, answerScope: 'once' | 'session' = 'once'): Promise<void> => {
     if (locks.current.has(id)) return
     locks.current.add(id)
     setSubmitting([...locks.current])
     setErrors((all) => ({ ...all, [id]: '' }))
-    try { await Promise.resolve(onAnswer(id, allow)) }
+    try { await Promise.resolve(answerScope === 'session' ? onAnswer(id, allow, 'session') : onAnswer(id, allow)) }
     catch (cause) { setErrors((all) => ({ ...all, [id]: String(cause) })) }
     finally { locks.current.delete(id); setSubmitting([...locks.current]) }
   }
@@ -59,10 +61,11 @@ export function ApprovalBar({
       <div role="status" aria-live="polite" className="px-1 text-xs font-medium text-fg-muted">
         {approvals.length === 1 ? '1 request' : `${approvals.length} requests`} awaiting a decision
       </div>
-      {visible.map(({ approvalId, call, interactive, childSessionId, definitionName, expiresAt, guardWarning }) => {
+      {visible.map(({ approvalId, call, interactive, childSessionId, definitionName, expiresAt, guardWarning, scopeWarning, proposedGrant, proposedAccess }) => {
         const raw = JSON.stringify(call.args, null, 2)
         const truncated = raw.length > ARGS_DISPLAY_LIMIT
         const submittingRow = submitting.includes(approvalId)
+        const sessionGrant = childSessionId === undefined ? proposedGrant : undefined
         // The same reading the transcript gives a call: a Read's window and a
         // command's verb belong in the decision, not only in the payload.
         const target = toolFacts(call).fullTarget
@@ -92,6 +95,11 @@ export function ApprovalBar({
                     <Icon name="alertTriangle" size={12} className="mr-1 inline" />{guardWarning}
                   </p>
                 ) : null}
+                {scopeWarning !== undefined ? (
+                  <p className="m-0 break-all rounded-lg bg-warn-soft px-2 py-1.5 text-xs font-medium text-warn">
+                    <Icon name="alertTriangle" size={12} className="mr-1 inline" />{scopeWarning}
+                  </p>
+                ) : null}
               </div>
             </div>
             <details className="text-xs text-fg-muted">
@@ -101,11 +109,17 @@ export function ApprovalBar({
             </details>
             <p className="m-0 text-xs text-fg-faint">
               Allow once and Deny apply to this request only, not the project or future requests. Standing permission is set by the workspace&apos;s mode in Settings → Modes.
+              {sessionGrant !== undefined ? <>{' '}Allowing the folder for this session lets this conversation use it without asking again.</> : null}
               {' '}Arguments may target systems outside the project; server policy still applies.
             </p>
             {errors[approvalId] ? <ErrorNotice raw={errors[approvalId]!} announce={false} /> : null}
             <div className="flex flex-wrap items-center justify-end gap-2">
               <Button variant="outline" size="sm" disabled={submittingRow} onClick={() => void answer(approvalId, false)}>Deny</Button>
+              {sessionGrant !== undefined ? (
+                <Button variant="outline" size="sm" disabled={submittingRow} title={sessionGrant} onClick={() => void answer(approvalId, true, 'session')}>
+                  <span className="max-w-[18rem] truncate">Allow {proposedAccess === 'write' ? 'read & write' : 'read'} in <code>{sessionGrant}</code> for this session</span>
+                </Button>
+              ) : null}
               <Button variant="primary" size="sm" disabled={submittingRow} onClick={() => void answer(approvalId, true)}>{submittingRow ? 'Submitting decision…' : 'Allow once'}</Button>
             </div>
           </article>

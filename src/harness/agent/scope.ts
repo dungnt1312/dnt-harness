@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import type { ProjectId, SessionId, WorkspaceId } from '../../util/brand.ts'
+import type { GrantedRoot } from '../tools/types.ts'
 
 /**
  * The ambient agent scope: while `Agent.run()` drives a turn, pipeline
@@ -36,6 +37,12 @@ export interface AgentScope {
     readonly instructions: string
     /** Hard ceiling: definition ∩ spawn grant (MCP always explicit). */
     readonly toolCeiling: readonly string[]
+    /**
+     * The parent's additional file-tool folders, snapshotted AT SPAWN. Like
+     * the tool ceiling, a child's grants never expand after spawn: folders
+     * the parent gains later stay invisible to a running child.
+     */
+    readonly grants?: readonly GrantedRoot[]
     readonly skills?: readonly string[]
     /**
      * Bounded parent-conversation projection, captured at spawn when the

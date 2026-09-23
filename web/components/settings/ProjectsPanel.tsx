@@ -5,13 +5,14 @@ import type { ProjectRow } from '../../lib/types.ts'
 import Icon from '../common/Icon.tsx'
 import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import { FolderPickerModal } from '../composer/FolderPickerModal.tsx'
+import { ProjectFoldersEditor } from './ProjectFoldersEditor.tsx'
 import { Button } from '../ui/Button.tsx'
 import { Field } from '../ui/Field.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
 import { EmptyState, InlineConfirm, ItemList, ItemRow, Notice, PanelBody, PanelIntro, Section } from './settings-kit.tsx'
 
-type RowMode = { readonly id: string; readonly kind: 'rename' | 'path' | 'remove' }
+type RowMode = { readonly id: string; readonly kind: 'rename' | 'path' | 'remove' | 'folders' }
 
 /** Which input the folder picker fills: the register form or a row's new path. */
 type PickerTarget = 'register' | 'path' | null
@@ -100,11 +101,17 @@ function ProjectsPanelContent({ workspaceId, projects, onChanged, sessionCounts 
                 <ItemRow
                   key={project.id}
                   title={<><Icon name="folder" size={14} className="text-fg-faint" /><span className="break-all">{project.name}</span><span className="text-xs font-normal text-fg-faint">{count} {count === 1 ? 'conversation' : 'conversations'}</span></>}
-                  meta={<code className="font-mono">{project.path}</code>}
+                  meta={<>
+                    <code className="font-mono">{project.path}</code>
+                    {(project.additionalDirectories?.length ?? 0) > 0 ? (
+                      <span className="ml-2 text-xs text-fg-faint">+{project.additionalDirectories!.length} extra {project.additionalDirectories!.length === 1 ? 'folder' : 'folders'}</span>
+                    ) : null}
+                  </>}
                   actions={active === null ? (
                     <>
                       <Button variant="ghost" size="sm" disabled={busy} onClick={() => startMode(project, 'rename')}>Rename</Button>
                       <Button variant="ghost" size="sm" disabled={busy} onClick={() => startMode(project, 'path')}>Change folder</Button>
+                      <Button variant="ghost" size="sm" disabled={busy} onClick={() => startMode(project, 'folders')}>Extra folders</Button>
                       <Button variant="ghost" size="sm" className="text-bad" disabled={busy} onClick={() => startMode(project, 'remove')}>Remove project</Button>
                     </>
                   ) : undefined}
@@ -132,6 +139,15 @@ function ProjectsPanelContent({ workspaceId, projects, onChanged, sessionCounts 
                       <Button type="submit" variant="primary" size="sm" disabled={busy || editValue.trim() === ''}>{active === 'rename' ? 'Save name' : 'Save path'}</Button>
                       <Button variant="ghost" size="sm" disabled={busy} onClick={() => setMode(null)}>Cancel</Button>
                     </form>
+                  ) : null}
+                  {active === 'folders' && workspaceId !== null ? (
+                    <ProjectFoldersEditor
+                      workspaceId={workspaceId}
+                      project={project}
+                      projects={projects}
+                      onSaved={async () => { await onChanged(); if (alive.current) setMode(null) }}
+                      onCancel={() => setMode(null)}
+                    />
                   ) : null}
                   {active === 'remove' ? (
                     <InlineConfirm

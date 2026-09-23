@@ -85,6 +85,37 @@ function paste(text: string, files: readonly File[] = []): void {
 
 const settle = async (): Promise<void> => { await act(async () => { await new Promise((resolve) => setTimeout(resolve, 200)) }) }
 
+describe('composer placeholder', () => {
+  it('hides after pasting into an editor with a lone br element and visible text', () => {
+    render()
+    const element = input()
+    expect(element.dataset['editorEmpty']).toBe('true')
+    act(() => {
+      const anchor = document.createTextNode('')
+      element.append(anchor, document.createElement('br'))
+      const range = document.createRange()
+      range.setStart(anchor, 0)
+      range.collapse(true)
+      document.getSelection()?.removeAllRanges()
+      document.getSelection()?.addRange(range)
+      paste('campaign925Byod')
+    })
+    expect(current.segments).toEqual([{ kind: 'text', text: 'campaign925Byod\n' }])
+    expect(element.dataset['editorEmpty']).toBe('false')
+  })
+
+  it('shows again after text is removed, including a browser-inserted br', () => {
+    render()
+    type('hello')
+    expect(input().dataset['editorEmpty']).toBe('false')
+    act(() => {
+      input().replaceChildren(document.createElement('br'))
+      input().dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    expect(input().dataset['editorEmpty']).toBe('true')
+  })
+})
+
 // jsdom ships no CSS.escape, which every browser has; the completion popover
 // uses it to find its active option by a React useId (":r1:"-style) id.
 if (typeof globalThis.CSS?.escape !== 'function') {

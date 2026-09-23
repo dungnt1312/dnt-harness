@@ -27,7 +27,11 @@ import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AgentsService } from '../harness/agent/service.ts'
-import { agentScope } from '../harness/agent/scope.ts'
+import { agentScope, type AgentScope } from '../harness/agent/scope.ts'
+import type { GrantedRoot, PreExecuteDecision, ToolExecution } from '../harness/tools/types.ts'
+import { classifyTarget, samePath, targetPaths, within } from '../capabilities/fs/grants.ts'
+import { mergeGrants, parseAccess, projectGrants, validateGrantFolder, type GrantPolicy } from './folder-grants.ts'
+import { approvedPathOf, attachPathScopeGuard, type PathScopeGuard, type PathScopeMatch } from './path-scope-guard.ts'
 import type { Agent } from '../harness/agent/agent.ts'
 import { attachApproval, type ApprovalHandle, type ApprovalMode } from '../harness/approval/policy.ts'
 import { DangerousCommandsStore } from '../harness/guard/store.ts'
@@ -36,10 +40,10 @@ import { DEFAULT_LIMITS, type HarnessLimits } from '../harness/limits.ts'
 import { LlmService } from '../harness/llm/service.ts'
 import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
 import { isThinkingLevel, resolveContextLimit } from '../harness/llm/model-catalog.ts'
-import type { LlmProvider, ToolCall } from '../harness/llm/types.ts'
+import type { LlmProvider, TokenUsage, ToolCall } from '../harness/llm/types.ts'
 import { fileSessions, SessionsService } from '../harness/session/service.ts'
 import type { Session } from '../harness/session/session.ts'
-import { sessionModelOf, type SessionEvent } from '../harness/session/events.ts'
+import { sessionGrantsOf, sessionModelOf, type SessionEvent, type SessionGrant, type SessionGrants } from '../harness/session/events.ts'
 import { deriveTitle } from '../harness/session/title.ts'
 import { newInputId, type ProjectId, type SessionId, type WorkspaceId } from '../util/brand.ts'
 import { ToolsService } from '../harness/tools/service.ts'
@@ -74,7 +78,7 @@ import {
   type ModelSettings,
   type ProviderConfig,
 } from './provider-store.ts'
-import { ScopeError, WorkspaceService, type ProjectRecord, type WorkspaceRecord } from '../harness/workspace/service.ts'
+import { ScopeError, WorkspaceService, type AdditionalDirectory, type ProjectRecord, type WorkspaceRecord } from '../harness/workspace/service.ts'
 import { ModesService, ModeError, DEFAULT_MODE_ID, BUNDLED_MODES, type ResolvedMode } from '../harness/modes/service.ts'
 import { AgentDefinitionService, AgentDefinitionError } from '../harness/agents/definition-service.ts'
 import {
@@ -132,6 +136,9 @@ declare module 'mini-dsh' {
       readonly approvalId: string
       readonly call: ToolCall
       readonly guardWarning?: string
+      readonly scopeWarning?: string
+      readonly proposedGrant?: string
+      readonly proposedAccess?: 'read' | 'write'
       /** Present when the waiting session is a child; root streams relay this. */
       readonly parentSessionId?: SessionId
       /** The child's agent definition, so a relayed question names its asker. */
@@ -173,6 +180,12 @@ export type WebEnvelope =
     readonly call: ToolCall
     /** Dangerous-command guard note shown beside the question. */
     readonly guardWarning?: string
+    /** Set when the call targets a path outside every granted folder. */
+    readonly scopeWarning?: string
+    /** The folder "allow for this session" would grant (root sessions only). */
+    readonly proposedGrant?: string
+    /** The access that folder would get: the call's own read or write. */
+    readonly proposedAccess?: 'read' | 'write'
     /** True when Always-allow cannot skip future asks (interactive MCP). */
     readonly interactive?: boolean
     /** Set when this question belongs to a child of the streamed session. */
@@ -343,6 +356,11 @@ interface PendingApproval {
   readonly expiresAt: number
   /** Dangerous-command guard note, replayed on every (re)connect. */
   readonly guardWarning?: string
+  /** Out-of-grant note, replayed on every (re)connect. */
+  readonly scopeWarning?: string
+  /** Folder a session-scoped answer grants; absent when not offered. */
+  readonly proposedGrant?: string
+  readonly proposedAccess?: 'read' | 'write'
   resolve(allow: boolean): void
 }
 
@@ -395,6 +413,9 @@ function approvalEnvelope(approvalId: string, waiting: PendingApproval, viewerSe
     expiresAt: waiting.expiresAt,
     ...(waiting.interactive ? { interactive: true } : {}),
     ...(waiting.guardWarning !== undefined ? { guardWarning: waiting.guardWarning } : {}),
+    ...(waiting.scopeWarning !== undefined ? { scopeWarning: waiting.scopeWarning } : {}),
+    ...(waiting.proposedGrant !== undefined ? { proposedGrant: waiting.proposedGrant } : {}),
+    ...(waiting.proposedAccess !== undefined ? { proposedAccess: waiting.proposedAccess } : {}),
     ...(waiting.parentSessionId !== undefined && viewerSessionId === waiting.parentSessionId
       ? {
         childSessionId: waiting.sessionId,
@@ -672,6 +693,27 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   }
   seedWorkspaceControls(options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE, options.activeModel)
 
+  // Restore each workspace's durable selected mode so a restart keeps the
+  // operator's choice (e.g. Full access) instead of snapping back to the
+  // bundled default. Invalid/missing/disabled selections fall back silently.
+  if (options.home !== undefined) {
+    for (const ws of workspaces.list({ includeArchived: true })) {
+      try {
+        const persisted = await modes.selectedId(ws.id)
+        if (persisted !== undefined) {
+          const resolved = await modes.resolve(ws.id, persisted)
+          const state = controlsFor(ws.id)
+          state.modeId = persisted
+          state.modeDefinition = resolved
+          // Keep the initial revision at 1 so the first live switch still
+          // bumps to 2; the persisted identity is what matters, not the count.
+        }
+      } catch {
+        // Best-effort: a corrupt selection file never blocks boot.
+      }
+    }
+  }
+
 
   interface EffectiveSessionModel {
     readonly provider: string | null | undefined
@@ -734,16 +776,77 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const legacyFolders = new Map<SessionId, string | undefined>()
   const legacyFolderDefault = { current: options.root }
 
+  // Extra file-tool folders: the project's `additionalDirectories` plus the
+  // session's own `session/grants`. Children use the snapshot taken at spawn.
+  const grantPolicy: GrantPolicy = {
+    protectedRoots: [...(deniedRoots ?? []), ...(options.userSkillsDir !== undefined ? [options.userSkillsDir] : [])],
+  }
+  const grantCache = new WeakMap<readonly SessionEvent[], { length: number; grants: SessionGrants }>()
+  const sessionGrants = (session: Session): SessionGrants => {
+    const cached = grantCache.get(session.events)
+    if (cached !== undefined && cached.length === session.events.length) return cached.grants
+    const grants = sessionGrantsOf(session.events)
+    grantCache.set(session.events, { length: session.events.length, grants })
+    return grants
+  }
+  const effectiveGrants = (sessionId: SessionId, projectId: ProjectId | undefined, workspaceId: WorkspaceId | undefined): GrantedRoot[] => {
+    if (projectId === undefined) return []
+    let project: ProjectRecord
+    try {
+      project = workspaces.getProject(projectId, workspaceId)
+    } catch {
+      return []
+    }
+    const lookup = (id: ProjectId): ProjectRecord | undefined => {
+      try {
+        return workspaces.getProject(id, project.workspaceId)
+      } catch {
+        return undefined
+      }
+    }
+    const session = sessions.get(sessionId)?.session
+    return mergeGrants(projectGrants(project, lookup), session !== undefined ? sessionGrants(session).roots : [])
+  }
+  const scopeGrants = (scope: AgentScope): GrantedRoot[] =>
+    scope.childOf !== undefined ? [...(scope.childOf.grants ?? [])] : effectiveGrants(scope.sessionId, scope.projectId, scope.workspaceId)
+  // Every change to one session's grants runs through one queue, so a
+  // composer edit and an approval's "allow for session" never overwrite
+  // each other: each derives its list from the durable current value.
+  const grantQueues = new Map<SessionId, Promise<unknown>>()
+  const mutateSessionGrants = (
+    session: Session,
+    derive: (current: SessionGrants) => readonly SessionGrant[] | Promise<readonly SessionGrant[]>,
+    approvalId?: string,
+  ): Promise<SessionGrants> => {
+    const previous = grantQueues.get(session.id) ?? Promise.resolve()
+    const run = previous.catch(() => {}).then(async () => {
+      const current = sessionGrants(session)
+      const roots = await derive(current)
+      const next: SessionGrants = { revision: current.revision + 1, roots: [...roots] }
+      session.append({ type: 'session/grants', revision: next.revision, roots: next.roots, ...(approvalId !== undefined ? { approvalId } : {}) })
+      await session.durable()
+      return next
+    })
+    grantQueues.set(session.id, run)
+    void run.finally(() => {
+      if (grantQueues.get(session.id) === run) grantQueues.delete(session.id)
+    }).catch(() => {})
+    return run
+  }
+
   // The file-tool grant resolves per execution from the ambient scope: the
-  // bound project's folder — or, in memory mode, the server root. A
-  // workspace-mode session without a project has NO filesystem grant.
+  // bound project's folder plus its granted folders — or, in memory mode,
+  // the server root. A workspace-mode session without a project has NO
+  // filesystem grant.
   kernel.ctx.tools.setRootResolver(() => {
     const scope = agentScope.getStore()
     if (scope?.projectId !== undefined) {
       try {
         const project = workspaces.getProject(scope.projectId, scope.workspaceId)
+        const additionalRoots = scopeGrants(scope)
         return {
           root: project.path,
+          ...(additionalRoots.length > 0 ? { additionalRoots } : {}),
           ...(deniedRoots !== undefined ? { deniedRoots } : {}),
         }
       } catch {
@@ -773,14 +876,14 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   // writes elsewhere are outside its reach (documented, not claimed away).
   const WRITE_CAPABLE = new Set(['Write', 'Edit', 'Bash'])
   const heldLeases = new Map<SessionId, Set<string>>() // sessionId -> roots
-  kernel.ctx.on('tools/pre-execute', async (payload, next) => {
-    if (!WRITE_CAPABLE.has(payload.call.name) || payload.exec.root === '') return next()
+  /** Acquire `root` for this call (held to turn end inside a live turn). */
+  const withLease = async (root: string, next: () => Promise<PreExecuteDecision>): Promise<PreExecuteDecision> => {
     const sessionId = agentScope.getStore()?.sessionId
     if (sessionId === undefined) return next()
     const perTurn = heldLeases.get(sessionId as SessionId)
-    if (perTurn?.has(payload.exec.root) === true) return next() // already held for this turn
+    if (perTurn?.has(root) === true) return next() // already held for this turn
     try {
-      await workspaces.acquireRoot(payload.exec.root, sessionId)
+      await workspaces.acquireRoot(root, sessionId)
     } catch (error) {
       if (error instanceof ScopeError) {
         return { kind: 'deny', reason: `project busy: ${error.message}` }
@@ -792,16 +895,53 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       // Inside a live turn: hold the lease until the turn settles.
       const sid = sessionId as SessionId
       const held = heldLeases.get(sid) ?? new Set<string>()
-      held.add(payload.exec.root)
+      held.add(root)
       heldLeases.set(sid, held)
       return next()
     }
     try {
       return await next()
     } finally {
-      await workspaces.releaseRoot(payload.exec.root, sessionId)
+      await workspaces.releaseRoot(root, sessionId)
     }
+  }
+  /**
+   * Where a Write/Edit lands relative to the primary root: `undefined` when
+   * it writes inside the primary (the primary lease covers it), else the
+   * lease key for the folder it writes into — the outermost registered
+   * project folder containing the target (so it contends with that
+   * project's own sessions), else its granted folder, else (approved
+   * out-of-grant) the target's parent folder.
+   */
+  const foreignLeaseKey = (call: ToolCall, exec: ToolExecution): string | undefined => {
+    const target = targetPaths(call)[0]
+    if (target === undefined || target.intent !== 'write') return undefined
+    const classified = classifyTarget(exec, target.target, 'write')
+    if (classified.kind === 'in-grant' && samePath(classified.root.path, exec.root)) return undefined
+    if (classified.kind !== 'in-grant' && classified.kind !== 'out-of-grant') return undefined
+    let outermost: string | undefined
+    for (const workspace of workspaces.list({ includeArchived: true })) {
+      for (const project of workspaces.listProjects(workspace.id)) {
+        if (within(project.path, classified.abs) && (outermost === undefined || within(project.path, outermost))) outermost = project.path
+      }
+    }
+    return outermost ?? (classified.kind === 'in-grant' ? classified.root.path : path.dirname(classified.abs))
+  }
+  kernel.ctx.on('tools/pre-execute', async (payload, next) => {
+    if (!WRITE_CAPABLE.has(payload.call.name) || payload.exec.root === '') return next()
+    // Writes into another folder lease that folder AFTER approval (below).
+    if (foreignLeaseKey(payload.call, payload.exec) !== undefined) return next()
+    return withLease(payload.exec.root, () => next())
   })
+  /** True when any live turn holds a write lease inside `folder`. */
+  const leaseHeldInside = (folder: string): boolean => {
+    for (const roots of heldLeases.values()) {
+      for (const root of roots) {
+        if (within(folder, root)) return true
+      }
+    }
+    return false
+  }
   kernel.ctx.on('agent/turn-settled', async (state) => {
     void state
     // The event fires inside the agent scope: release exactly the settling
@@ -1075,6 +1215,10 @@ ${decision.injected}`, ...contents]
     childModelFor,
     providers: () => usableIds(),
     modelsOf: (provider) => kernel.ctx.llm.providerModels(provider),
+    grantsOf: (parentSessionId) => {
+      const entry = sessions.get(parentSessionId)
+      return entry === undefined ? [] : effectiveGrants(parentSessionId, entry.projectId, entry.workspaceId)
+    },
   }))
 
   /** Cancel/await an in-flight or connected server, then remove descriptors. */
@@ -1434,6 +1578,14 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     state.modeDefinition = resolved
     state.modeRevision += 1
     kernel.ctx.tools.bumpPolicyRevision()
+    // Durable selection: the next boot restores this workspace to the same
+    // mode instead of falling back to the default. Best-effort — a disk
+    // failure does not roll back the live adoption.
+    try {
+      await modes.setSelected(workspaceId, modeId)
+    } catch (error) {
+      console.warn(`web: could not persist selected mode '${modeId}' for workspace '${workspaceId}': ${String(error instanceof Error ? error.message : error)}`)
+    }
     return resolved
   }
 
@@ -1497,6 +1649,24 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
 
   /** Last request's manifest per session — the inspector renders this. */
   const lastManifests = new Map<SessionId, ContextManifest>()
+  /** Provider-reported token usage per session (last request + running cache totals). */
+  const sessionUsage = new Map<SessionId, SessionUsage>()
+
+  // Tap every scoped completion for its `usage` event: the context meter
+  // shows the provider's real prompt size and cache hits, not only the
+  // builder's chars/4 estimate. Events pass through untouched.
+  kernel.ctx.on('llm/stream', (request, next) => {
+    const sessionId = agentScope.getStore()?.sessionId
+    const upstream = next(request)
+    if (sessionId === undefined) return upstream
+    return (async function* tap() {
+      for await (const event of upstream) {
+        if (event.type === 'usage') recordUsage(sessionUsage, sessionId, event.usage)
+        yield event
+      }
+    })()
+  }, true)
+
   /** Late-bound deps reference: listeners fire only after boot completes. */
   const depsRef: { current: HandlerDeps | undefined } = { current: undefined }
 
@@ -1656,7 +1826,19 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
       ? await attachments.load(workspaceId, referenced, { textLimit: limits.attachmentTextLimit })
       : undefined
 
+    // The same grant the tool pipeline resolves, so the model is told exactly
+    // the folders its file tools can reach.
+    const fileScope = scope !== undefined ? agentScope.run(scope, () => kernel.ctx.tools.currentGrant()) : undefined
     const assembled = buildContext({
+      ...(fileScope !== undefined
+        ? {
+          fileScope: {
+            primary: fileScope.root,
+            additional: fileScope.additionalRoots ?? [],
+            outsideAsks: options.yolo !== true && mode.definition.outOfGrant !== 'allow',
+          },
+        }
+        : {}),
       events,
       mode,
       modeRevision: state.modeRevision,
@@ -1729,6 +1911,45 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     },
   })
 
+  // Out-of-grant file paths: classified last in the rewrite chain (after
+  // hooks), forced to an approval unless the executing mode allows them.
+  const pathScope = attachPathScopeGuard(kernel.ctx, {
+    exempt: () => {
+      if (options.yolo === true) return true
+      const workspaceId = agentScope.getStore()?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
+      return controlsFor(workspaceId).modeDefinition.definition.outOfGrant === 'allow'
+    },
+    proposeGrant: async (folder) => {
+      const scope = agentScope.getStore()
+      if (scope?.projectId === undefined) return undefined
+      try {
+        return await validateGrantFolder(folder, workspaces.getProject(scope.projectId, scope.workspaceId).path, grantPolicy)
+      } catch {
+        return undefined
+      }
+    },
+  })
+  const scopeWarningOf = (match: PathScopeMatch): string =>
+    `Outside granted folders: ${match.path} (${match.intent === 'write' ? 'write' : 'read'})`
+  // After authorization settles: drop the match; on allow, authorize exactly
+  // that path for this call, and grant the folder to the session first when
+  // the approver chose "allow for this session".
+  kernel.ctx.tools.setApprovedPathResolver(async (call, allowed) => {
+    const scope = agentScope.getStore()
+    const match = pathScope.take(scope?.sessionId, call, allowed)
+    if (match === undefined) return undefined
+    if (match.grantForSession === true && match.proposedGrant !== undefined && scope !== undefined && scope.childOf === undefined) {
+      const session = sessions.get(scope.sessionId)?.session
+      if (session === undefined) throw new Error('the session grant could not be recorded: session not loaded')
+      const folder = match.proposedGrant
+      await mutateSessionGrants(session, (current) => mergeGrants(current.roots, [{ path: folder, access: match.intent }]), match.approvalId)
+        .catch((error: unknown) => {
+          throw new Error(`the session grant could not be recorded: ${String(error instanceof Error ? error.message : error)}`)
+        })
+    }
+    return [approvedPathOf(match)]
+  })
+
   const approvalHandle: ApprovalHandle = attachApproval(kernel.ctx, {
     // Live permission control, scoped to the executing turn's workspace.
     // The selected mode is the single policy source; host restrictions and the
@@ -1741,9 +1962,22 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     },
     defaultMode: options.defaultMode ?? 'ask',
     expiryMs: limits.approvalExpiryMs,
-    forceAsk: (call) =>
-      dangerousGuard.getMatch(call)?.action === 'ask' ||
-      toolRequiresInteraction(call, agentScope.getStore()?.workspaceId, mcpDescriptors),
+    // The scope is the call's own (stamped on re-evaluation), never whatever
+    // happens to be ambient when a settings change re-checks pending asks.
+    forceAsk: (call, scope) => {
+      const outside = pathScope.get(scope.sessionId, call)
+      return (outside !== undefined && !outside.exempt) ||
+        dangerousGuard.getMatch(call)?.action === 'ask' ||
+        toolRequiresInteraction(call, scope.workspaceId as WorkspaceId | undefined, mcpDescriptors)
+    },
+    requestDetails: (call) => {
+      const outside = pathScope.get(agentScope.getStore()?.sessionId, call)
+      if (outside === undefined || outside.exempt) return undefined
+      return {
+        scopeWarning: scopeWarningOf(outside),
+        ...(outside.proposedGrant !== undefined ? { proposedGrant: outside.proposedGrant, proposedAccess: outside.intent } : {}),
+      }
+    },
     askUser: (call, lifecycle) =>
       new Promise<boolean>((resolve) => {
         const scope = agentScope.getStore()
@@ -1764,6 +1998,10 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
         const parentSessionId = scope.childOf?.parentSessionId
         const definitionName = scope.childOf?.definition
         const principalId = sessionPrincipals.get(scope.sessionId)
+        const outside = pathScope.get(scope.sessionId, call)
+        const scopeWarning = outside !== undefined && !outside.exempt ? scopeWarningOf(outside) : undefined
+        const proposedGrant = scopeWarning !== undefined ? outside?.proposedGrant : undefined
+        const proposedAccess = proposedGrant !== undefined ? outside?.intent : undefined
         pending.set(approvalId, {
           sessionId: scope.sessionId,
           workspaceId,
@@ -1774,6 +2012,9 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
           ...(parentSessionId !== undefined ? { parentSessionId } : {}),
           ...(definitionName !== undefined ? { definitionName } : {}),
           ...(guardWarning !== undefined ? { guardWarning } : {}),
+          ...(scopeWarning !== undefined ? { scopeWarning } : {}),
+          ...(proposedGrant !== undefined ? { proposedGrant } : {}),
+          ...(proposedAccess !== undefined ? { proposedAccess } : {}),
           resolve,
         })
         // Expiry, stop, or a policy change settles the approval without an
@@ -1796,8 +2037,20 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
           ...(definitionName !== undefined ? { definitionName } : {}),
           ...(interactive ? { interactive: true } : {}),
           ...(guardWarning !== undefined ? { guardWarning } : {}),
+          ...(scopeWarning !== undefined ? { scopeWarning } : {}),
+          ...(proposedGrant !== undefined ? { proposedGrant } : {}),
+          ...(proposedAccess !== undefined ? { proposedAccess } : {}),
         })
       }),
+  })
+
+  // Registered after the approval policy: a write into another folder takes
+  // that folder's lease only once it is authorized, so a pending or denied
+  // question never blocks another project.
+  kernel.ctx.on('tools/pre-execute', async (payload, next) => {
+    if (payload.exec.root === '') return next()
+    const key = foreignLeaseKey(payload.call, payload.exec)
+    return key === undefined ? next() : withLease(key, () => next())
   })
 
   /**
@@ -1890,6 +2143,9 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     resolveEffectiveModel,
     validateProviderModel,
     deniedRoots,
+    grants: { policy: grantPolicy, effective: effectiveGrants, session: sessionGrants, mutate: mutateSessionGrants },
+    pathScope,
+    leaseHeldInside,
     legacyFolders,
     legacyFolderDefault,
     seedWorkspaceControls,
@@ -1899,6 +2155,7 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     attachments,
     checkpoints,
     lastManifests,
+    sessionUsage,
     adoptMode,
     agentDefinitions,
     childExecutor,
@@ -2035,6 +2292,21 @@ interface HandlerDeps {
   }
   readonly validateProviderModel: (providerId: string, model?: string) => { provider: string; model: string | undefined }
   readonly deniedRoots: readonly string[] | undefined
+  /** Pending out-of-grant matches, for session-scoped approval answers. */
+  readonly pathScope: PathScopeGuard
+  /** True while any turn holds a write lease inside `folder`. */
+  readonly leaseHeldInside: (folder: string) => boolean
+  /** Extra file-tool folders: effective view, validation policy, serialized session edits. */
+  readonly grants: {
+    readonly policy: GrantPolicy
+    readonly effective: (sessionId: SessionId, projectId: ProjectId | undefined, workspaceId: WorkspaceId | undefined) => GrantedRoot[]
+    readonly session: (session: Session) => SessionGrants
+    readonly mutate: (
+      session: Session,
+      derive: (current: SessionGrants) => readonly SessionGrant[] | Promise<readonly SessionGrant[]>,
+      approvalId?: string,
+    ) => Promise<SessionGrants>
+  }
   readonly legacyFolders: Map<SessionId, string | undefined>
   readonly legacyFolderDefault: { current: string | undefined }
   readonly modes: ModesService
@@ -2043,6 +2315,7 @@ interface HandlerDeps {
   readonly attachments: AttachmentStore
   readonly checkpoints: CheckpointStore
   readonly lastManifests: Map<SessionId, ContextManifest>
+  readonly sessionUsage: Map<SessionId, SessionUsage>
   readonly adoptMode: (workspaceId: WorkspaceId, modeId: string) => Promise<ResolvedMode>
   readonly agentDefinitions: AgentDefinitionService
   readonly childExecutor: ChildExecutor
@@ -2450,6 +2723,67 @@ async function handleApi(
       return
     }
 
+    // Session folder grants: the composer's "+ folders". Browser-only when
+    // auth is on — a grant is a standing pre-approval, so it is held to the
+    // same principal rule as answering an approval.
+    const wsSessionGrantsMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)\/grants$/.exec(pathname)
+    if (wsSessionGrantsMatch !== null) {
+      const wsId = decodeURIComponent(wsSessionGrantsMatch[1] ?? '') as WorkspaceId
+      const entry = await findSession(decodeURIComponent(wsSessionGrantsMatch[2] ?? ''), wsId, deps)
+      if (entry === undefined) {
+        send(404, { error: 'no such session' })
+        return
+      }
+      if (req.method === 'GET') {
+        send(200, { ...deps.grants.session(entry.session), effective: deps.grants.effective(entry.session.id, entry.projectId, wsId) })
+        return
+      }
+      if (req.method !== 'PUT') {
+        send(405, { error: 'method not allowed' })
+        return
+      }
+      if (!browserPrincipal(req, deps, 'PUT')) {
+        send(401, { error: 'folder grants can only be changed from the browser session that owns the workspace' })
+        return
+      }
+      try {
+        requireWorkspace(deps, wsId, true)
+        const body = await readJson(req)
+        if (typeof body['expectedRevision'] !== 'number' || !Array.isArray(body['roots'])) {
+          send(400, { error: 'body needs expectedRevision (number) and roots (array)' })
+          return
+        }
+        if (entry.projectId === undefined) {
+          send(409, { error: 'bind a project to this conversation before granting extra folders' })
+          return
+        }
+        if (entry.session.events.some((event) => event.type === 'session/child-meta')) {
+          send(409, { error: "a child agent's folders are fixed at spawn; change the parent conversation's folders instead" })
+          return
+        }
+        const primary = deps.workspaces.getProject(entry.projectId, wsId).path
+        const requested = body['roots'] as unknown[]
+        const expected = body['expectedRevision']
+        const next = await deps.grants.mutate(entry.session, async (current) => {
+          if (current.revision !== expected) throw new StaleGrantsError(current.revision)
+          const roots: SessionGrant[] = []
+          for (const raw of requested) {
+            const item = (raw ?? {}) as Record<string, unknown>
+            roots.push({ path: await validateGrantFolder(item['path'], primary, deps.grants.policy), access: parseAccess(item['access']) })
+          }
+          return mergeGrants(roots)
+        })
+        send(200, { ...next, effective: deps.grants.effective(entry.session.id, entry.projectId, wsId) })
+      } catch (error) {
+        if (error instanceof StaleGrantsError) {
+          send(409, { error: 'folder grants changed since they were loaded; reload and retry', revision: error.revision })
+          return
+        }
+        fail(error)
+      }
+      return
+    }
+
     const wsSessionMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)(?:\/(events|messages|stop))?$/.exec(pathname)
     if (wsSessionMatch !== null) {
       const wsId = decodeURIComponent(wsSessionMatch[1] ?? '') as WorkspaceId
@@ -2615,6 +2949,7 @@ async function handleApi(
             ...(parent.projectId !== undefined ? { projectId: parent.projectId } : {}),
             ...(Array.isArray(body['grantTools']) ? { grantTools: (body['grantTools'] as unknown[]).map(String) } : {}),
             ...(model !== undefined ? { model } : {}),
+            grants: deps.grants.effective(parent.session.id, parent.projectId, wsId),
           })
           send(202, {
             ...handle,
@@ -2669,6 +3004,33 @@ async function handleApi(
         return
       }
       send(405, { error: 'method not allowed' })
+      return
+    }
+
+    // Explicit workspace-scoped settlement. The parent id remains part of
+    // the address so a workspace sibling cannot reconcile another root's child.
+    const wsChildReconcileMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)\/children\/([^/]+)\/reconcile$/.exec(pathname)
+    if (wsChildReconcileMatch !== null) {
+      if (req.method !== 'POST') { send(405, { error: 'method not allowed' }); return }
+      const wsId = decodeURIComponent(wsChildReconcileMatch[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, false)
+      const parent = await findSession(decodeURIComponent(wsChildReconcileMatch[2] ?? ''), wsId, deps)
+      if (parent === undefined) {
+        send(404, { error: 'no such parent session' })
+        return
+      }
+      const childId = decodeURIComponent(wsChildReconcileMatch[3] ?? '') as SessionId
+      const owned = await deps.childExecutor.childrenOfRoot(parent.session.id, wsId)
+      if (!owned.some((child) => child.childSessionId === childId)) {
+        send(404, { error: 'no such child' })
+        return
+      }
+      const handle = await deps.childExecutor.reconcile(wsId, childId)
+      if (handle === undefined) {
+        send(200, { reconciled: true, child: null })
+        return
+      }
+      send(200, handle)
       return
     }
 
@@ -3117,6 +3479,35 @@ async function handleApi(
         return
       }
       send(405, { error: 'method not allowed' })
+      return
+    }
+
+    // Explicit settlement for a child retained after a durable lifecycle
+    // acknowledgement was lost. The parent id is part of the address, so the
+    // operation cannot reconcile an otherwise workspace-owned sibling child.
+    const legacyChildReconcileMatch = /^\/api\/sessions\/([^/]+)\/children\/([^/]+)\/reconcile$/.exec(pathname)
+    if (legacyChildReconcileMatch !== null) {
+      if (req.method !== 'POST') { send(405, { error: 'method not allowed' }); return }
+      const workspaceId = implicitWorkspace(deps)
+      const parent = await findSession(decodeURIComponent(legacyChildReconcileMatch[1] ?? ''), workspaceId, deps)
+      if (parent === undefined) {
+        send(404, { error: 'no such parent session' })
+        return
+      }
+      const childId = decodeURIComponent(legacyChildReconcileMatch[2] ?? '') as SessionId
+      const owned = await deps.childExecutor.childrenOfRoot(parent.session.id, workspaceId)
+      if (!owned.some((child) => child.childSessionId === childId)) {
+        send(404, { error: 'no such child' })
+        return
+      }
+      const handle = await deps.childExecutor.reconcile(workspaceId, childId)
+      if (handle === undefined) {
+        // A canonical absent spawn is successfully cleaned up, but has no
+        // surviving child handle to return.
+        send(200, { reconciled: true, child: null })
+        return
+      }
+      send(200, handle)
       return
     }
 
@@ -3661,7 +4052,8 @@ async function handleApi(
         res.end()
         return
       }
-      send(200, manifest)
+      const usage = deps.sessionUsage.get(entry.session.id)
+      send(200, usage !== undefined ? { ...manifest, usage } : manifest)
       return
     }
 
@@ -3949,18 +4341,53 @@ async function handleApi(
         requireWorkspace(deps, wsId, true) // archived: no project mutations
         const body = await readJson(req)
         let updated: ProjectRecord = deps.workspaces.getProject(pid, wsId)
+        // Folder grants are authorized and validated BEFORE anything changes,
+        // so a refused grant never leaves a half-applied rename or retarget.
+        // They are checked against the folder the project will have.
+        let directories: AdditionalDirectory[] | undefined
+        if (body['additionalDirectories'] !== undefined) {
+          if (!browserPrincipal(req, deps, 'PATCH')) {
+            send(401, { error: 'folder grants can only be changed from the browser session that owns the workspace' })
+            return
+          }
+          if (!Array.isArray(body['additionalDirectories'])) {
+            send(400, { error: 'additionalDirectories must be an array' })
+            return
+          }
+          const primary = typeof body['path'] === 'string' ? await fs.realpath(path.resolve(body['path'])).catch(() => path.resolve(String(body['path']))) : updated.path
+          directories = []
+          for (const raw of body['additionalDirectories'] as unknown[]) {
+            const item = (raw ?? {}) as Record<string, unknown>
+            const access = parseAccess(item['access'])
+            if (item['kind'] === 'project') {
+              const referenced = deps.workspaces.getProject(String(item['projectId'] ?? '') as ProjectId, wsId)
+              await validateGrantFolder(referenced.path, primary, deps.grants.policy)
+              directories.push({ kind: 'project', projectId: referenced.id, access })
+            } else {
+              directories.push({ kind: 'path', path: await validateGrantFolder(item['path'], primary, deps.grants.policy), access })
+            }
+          }
+        }
         if (typeof body['name'] === 'string' && body['name'].trim() !== '') {
           updated = await deps.workspaces.renameProject(pid, wsId, body['name'])
         }
         if (typeof body['path'] === 'string') {
-          // Retargeting requires idle execution on the project.
+          // Retargeting requires idle execution on the project — including
+          // other projects' turns writing into it through a folder grant.
           for (const entry of deps.sessions.values()) {
             if (entry.projectId === pid && entry.agent.busy) {
               send(409, { error: 'project has running sessions; stop them before changing the folder' })
               return
             }
           }
+          if (deps.leaseHeldInside(updated.path)) {
+            send(409, { error: 'another conversation is writing into this project; stop it before changing the folder' })
+            return
+          }
           updated = await deps.workspaces.setProjectPath(pid, wsId, body['path'])
+        }
+        if (directories !== undefined) {
+          updated = await deps.workspaces.setAdditionalDirectories(pid, wsId, directories)
         }
         send(200, updated)
         return
@@ -4270,12 +4697,31 @@ async function handleApi(
         send(400, { error: 'body needs a boolean allow' })
         return
       }
+      const answerScope = body['scope'] ?? 'once'
+      if (answerScope !== 'once' && answerScope !== 'session') {
+        send(400, { error: "scope must be 'once' or 'session'" })
+        return
+      }
+      // Only a root session's out-of-grant question with a grantable folder
+      // can be answered for the session; children keep their spawn snapshot.
+      const outside = answerScope === 'session' ? deps.pathScope.get(waiting.sessionId, waiting.call) : undefined
+      if (answerScope === 'session' && (!allow || waiting.proposedGrant === undefined || waiting.parentSessionId !== undefined || outside === undefined)) {
+        send(400, { error: 'this question cannot be answered for the whole session' })
+        return
+      }
       // Deleting must win the entry: a false return means expiry, stop, or a
       // policy change settled it while the body was being read — the answer
       // is late and the 404 is the truthful response.
       if (!deps.pending.delete(approvalId)) {
         send(404, { error: 'no such approval' })
         return
+      }
+      // Only the answer that won the entry may widen the session. The grant
+      // itself is recorded only if the call is finally allowed, right before
+      // it runs.
+      if (outside !== undefined) {
+        outside.grantForSession = true
+        outside.approvalId = approvalId
       }
       waiting.resolve(allow)
       send(200, { answered: true })
@@ -4286,6 +4732,24 @@ async function handleApi(
   } catch (error) {
     fail(error)
   }
+}
+
+/** A session-grant edit based on an out-of-date revision. */
+class StaleGrantsError extends Error {
+  constructor(readonly revision: number) {
+    super('stale folder grants')
+  }
+}
+
+/**
+ * True when the request comes from the browser principal (or auth is off).
+ * Grants are standing pre-approvals, so they follow the approval rule: no
+ * bearer (CLI/headless) client may widen a session's filesystem reach.
+ */
+function browserPrincipal(req: IncomingMessage, deps: HandlerDeps, method: string): boolean {
+  if (!deps.auth.enabled) return true
+  const decision = deps.auth.authenticate(req.headers, method)
+  return decision.ok && decision.principal.kind === 'browser'
 }
 
 // ── session operation helpers ──────────────────────────────────
@@ -4744,7 +5208,33 @@ function workspaceMeta(workspaceId: WorkspaceId, deps: HandlerDeps, folder?: str
 /** A deleted session leaves no per-session index behind (manifest, child indexes). */
 function forgetSessionState(sessionId: SessionId, deps: HandlerDeps): void {
   deps.lastManifests.delete(sessionId)
-  for (const childId of deps.childExecutor.forgetRoot(sessionId)) deps.lastManifests.delete(childId)
+  deps.sessionUsage.delete(sessionId)
+  for (const childId of deps.childExecutor.forgetRoot(sessionId)) {
+    deps.lastManifests.delete(childId)
+    deps.sessionUsage.delete(childId)
+  }
+}
+
+/** Token usage the provider reported for one session since this host started. */
+interface SessionUsage {
+  /** The newest request's usage: its prompt size is the live context fill. */
+  readonly last: TokenUsage
+  /** Prompt tokens summed over requests that reported a cached share. */
+  readonly cacheableInputTokens: number
+  readonly cachedInputTokens: number
+}
+
+/** Fold one completion's usage into the session's running totals. */
+function recordUsage(store: Map<SessionId, SessionUsage>, sessionId: SessionId, usage: TokenUsage): void {
+  const previous = store.get(sessionId)
+  // Only requests whose provider reports a cached share count toward the
+  // hit rate; a server that never reports caching must not read as 0%.
+  const reported = usage.cachedInputTokens !== undefined
+  store.set(sessionId, {
+    last: usage,
+    cacheableInputTokens: (previous?.cacheableInputTokens ?? 0) + (reported ? usage.inputTokens : 0),
+    cachedInputTokens: (previous?.cachedInputTokens ?? 0) + (usage.cachedInputTokens ?? 0),
+  })
 }
 
 /**
@@ -5173,6 +5663,9 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
         expiresAt: payload.expiresAt,
         ...(payload.interactive === true ? { interactive: true } : {}),
         ...(payload.guardWarning !== undefined ? { guardWarning: payload.guardWarning } : {}),
+        ...(payload.scopeWarning !== undefined ? { scopeWarning: payload.scopeWarning } : {}),
+        ...(payload.proposedGrant !== undefined ? { proposedGrant: payload.proposedGrant } : {}),
+        ...(payload.proposedAccess !== undefined ? { proposedAccess: payload.proposedAccess } : {}),
         ...(payload.parentSessionId === session.id
           ? {
             childSessionId: payload.sessionId,

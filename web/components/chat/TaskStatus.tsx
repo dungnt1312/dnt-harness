@@ -1,3 +1,4 @@
+import { useMemo } from 'react'
 import Icon from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { taskPhase, type TaskPhase } from '../../lib/project.ts'
@@ -10,8 +11,15 @@ const LABELS: Record<TaskPhase, string> = { idle: 'Ready', preparing: 'Preparing
  * are reported separately: a dropped stream never implies work stopped.
  */
 export function TaskStatus({ events, pending, sending, connected }: { readonly events: readonly SseEvent[]; readonly pending: number; readonly sending: boolean; readonly connected: boolean }) {
-  const phase = taskPhase(events, pending, sending)
-  const recovered = events.some((event) => event.recovery === true)
+  const phase = useMemo(() => taskPhase(events, pending, sending), [events, pending, sending])
+  const recovered = useMemo(() => {
+    let found = false
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i]?.type === 'turn/start') break
+      if (events[i]?.recovery === true) found = true
+    }
+    return found
+  }, [events])
   // Failed and rejected turns render as one card inside the transcript itself.
   const showPhase = !(phase === 'idle' || phase === 'completed' || phase === 'failed' || phase === 'rejected')
   if (!showPhase && connected) return null

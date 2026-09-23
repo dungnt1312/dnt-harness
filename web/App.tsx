@@ -1,9 +1,9 @@
 import { errorSummary, modeLabel } from './lib/copy.ts'
-import { Generation, composerKey, emptyComposer, acceptedDraft, validConversationScope, type ComposerState } from './lib/interaction.ts'
-import { persistDrafts, readDrafts } from './lib/composer-drafts.ts'
+import { Generation, composerKey, emptyComposer, acceptedDraft, validConversationScope } from './lib/interaction.ts'
+import { ComposerStore, useComposerSlice } from './lib/composer-store.ts'
 import { draftAttachments, draftIsEmpty, draftText, messageDraft, textDraft, type AttachmentRef, type RichDraft } from './lib/composer-draft.ts'
 import { parseRoute, routePath, sessionRoute, workspaceRoute, type AppRoute } from './lib/route.ts'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
 import {
   answerApproval,
   createProject,
@@ -33,7 +33,9 @@ import {
 } from './lib/api.ts'
 import { PairingGate } from './components/auth/PairingGate.tsx'
 import { decodeModelChoice, activeModelValue, modelOptions } from './lib/providers.ts'
-import { isTurnRunning, projectItems } from './lib/project.ts'
+import { isTurnRunning, projectItems, shareProjectedItems, type ViewItem } from './lib/project.ts'
+import { sameListing } from './lib/listing-equality.ts'
+import { manifestRefreshKey } from './lib/manifest-refresh.ts'
 import type { FileFocus } from './lib/tool-facts.ts'
 import { useSessionStream } from './hooks/useSessionStream.ts'
 import { useApprovalNotify } from './hooks/useApprovalNotify.ts'
@@ -47,6 +49,7 @@ import { Spinner } from './components/common/Spinner.tsx'
 import { Button } from './components/ui/Button.tsx'
 import { Sheet } from './components/ui/Sheet.tsx'
 import { Sidebar } from './components/layout/Sidebar.tsx'
+import { DocumentTitle } from './components/layout/DocumentTitle.tsx'
 import { ChatHeader } from './components/layout/ChatHeader.tsx'
 import { ScopeControl } from './components/layout/ScopeControl.tsx'
 import { composerChipClass } from './components/composer/composer-chip.ts'
@@ -55,12 +58,14 @@ import { useWorkbenchFiles } from './hooks/useWorkbenchFiles.ts'
 import { usePanelResize } from './hooks/usePanelResize.ts'
 import { toProjectRelative } from './lib/project-paths.ts'
 import { PANEL_LIMITS } from './lib/workbench-preferences.ts'
-import { SettingsModal } from './components/settings/SettingsModal.tsx'
+import { LazySettings } from './components/settings/LazySettings.tsx'
 import { TaskStatus } from './components/chat/TaskStatus.tsx'
 import { Transcript } from './components/chat/Transcript.tsx'
 import { ApprovalBar } from './components/chat/ApprovalBar.tsx'
 import { Composer } from './components/composer/Composer.tsx'
 import { ModelMenu } from './components/composer/ModelMenu.tsx'
+import { ContextMeter } from './components/composer/ContextMeter.tsx'
+import { SessionFoldersChip } from './components/composer/SessionFoldersChip.tsx'
 import { FolderPickerModal } from './components/composer/FolderPickerModal.tsx'
 import ConfirmDialog from './components/common/ConfirmDialog.tsx'
 import type { ContextManifestView } from './lib/api.ts'
@@ -76,7 +81,17 @@ function focusComposer(): void {
   requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('[data-composer-input]')?.focus())
 }
 
-export const sessionModelKey = (workspaceId: string, sessionId: string): string => `${workspaceId}:${sessionId}`
+/** The composer bound to one scope's draft in the store: typing re-renders only this. */
+function ScopedComposer({ store, scope, ...props }: Omit<ComponentProps<typeof Composer>, 'draft' | 'onDraft'> & {
+  readonly store: ComposerStore
+  readonly scope: string
+}) {
+  const draft = useComposerSlice(store, scope, (state) => state.draft)
+  const onDraft = useCallback((next: RichDraft) => store.setDraft(scope, next), [store, scope])
+  return <Composer {...props} draft={draft} onDraft={onDraft} />
+}
+
+export const sessionModelKey =(workspaceId: string, sessionId: string): string => `${workspaceId}:${sessionId}`
 
 export type SessionModelLoadState =
   | { readonly status: 'loading' }
@@ -245,6 +260,7 @@ export function App() {
   }
   const [newWorkspaceName, setNewWorkspaceName] = useState('')
   const activeWorkspace = workspaces.find((row) => row.id === activeWs) ?? null
+  const documentTitle = <DocumentTitle name={activeWorkspace?.name} />
 
   // Draft scope: validate against registered projects; '' in storage = chat only.
   const changeDraftProject = useCallback((projectId: string | null) => {
@@ -271,23 +287,21 @@ export function App() {
 
   const [current, setCurrent] = useState<string | null>(null)
   const [filter, setFilter] = useState('')
-  // Unsent drafts survive a reload; `sending`/`error` describe a request that
-  // is gone, so only the text comes back.
-  const [composers, setComposersState] = useState<Record<string, ComposerState>>(() =>
-    Object.fromEntries(Object.entries(readDrafts()).map(([scope, stored]) => [scope, { ...emptyComposer, draft: stored }])))
-  const composersRef = useRef(composers)
-  composersRef.current = composers
-  const setComposers = useCallback((update: (all: Record<string, ComposerState>) => Record<string, ComposerState>) => {
-    const next = update(composersRef.current)
-    composersRef.current = next
-    setComposersState(next)
-    persistDrafts(Object.fromEntries(Object.entries(next).map(([scope, state]) => [scope, state.draft])))
-  }, [])
+  // Drafts live outside React state: the app reads only `sending`/`error`, so
+  // a keystroke re-renders the composer and nothing else.
+  const [composers] = useState(() => new ComposerStore())
+  useEffect(() => {
+    window.addEventListener('pagehide', composers.flush)
+    return () => { window.removeEventListener('pagehide', composers.flush); composers.flush() }
+  }, [composers])
+  const setComposers = composers.set
+  const updateComposer = composers.update
   const key = composerKey(activeWs, current)
-  const composer = composers[key] ?? emptyComposer
-  const { draft, sending, error: sendError } = composer
-  const updateComposer = (scope: string, update: (state: ComposerState) => ComposerState) => setComposers((all) => ({ ...all, [scope]: update(all[scope] ?? emptyComposer) }))
-  const setDraft = (draft: RichDraft) => updateComposer(key, (state) => ({ ...state, draft, revision: state.revision + 1 }))
+  const sending = useComposerSlice(composers, key, (state) => state.sending)
+  const sendError = useComposerSlice(composers, key, (state) => state.error)
+  const setDraft = useCallback((draft: RichDraft) => composers.setDraft(key, draft), [composers, key])
+  // Stable for the memoized transcript, which must not re-render per keystroke.
+  const reuseInDraft = useCallback((text: string) => { setDraft(messageDraft(text)); focusComposer() }, [setDraft])
   const [meta, setMeta] = useState<WorkspaceMeta | null>(null)
   const [modelDefaultsState, setModelDefaultsState] = useState<ModelDefaultsLoadState>({ status: 'loading' })
   const [pendingModelDefaultsMutations, setPendingModelDefaultsMutations] = useState(0)
@@ -318,7 +332,7 @@ export function App() {
   const [workbenchExpanded, setWorkbenchExpanded] = useState(false)
   const inspectorTab = preferences.inspectorTab
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [settingsSection, setSettingsSection] = useState<'providers' | 'projects' | 'modes' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'>('providers')
+  const [settingsSection, setSettingsSection] = useState<'providers' | 'projects' | 'permissions' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'>('providers')
   const [pendingDelete, setPendingDelete] = useState<SessionListing | null>(null)
   const [manifest, setManifest] = useState<ContextManifestView | null>(null)
   const [compactNonce, setCompactNonce] = useState(0)
@@ -382,8 +396,14 @@ export function App() {
   const validatedCurrent = listedWorkspace === activeWs && (sessions.some((session) => session.id === current) || (current !== null && createdHere.current.has(current))) ? current : null
   const { events, approvals, stream, error: streamError, dismissApproval } = useSessionStream(activeWs, validatedCurrent)
   const notify = useApprovalNotify(approvals, activeWorkspace?.name)
-  const projectedItems = useMemo(() => projectItems(events), [events])
+  const previousItems = useRef<readonly ViewItem[]>([])
+  const projectedItems = useMemo(() => {
+    const next = shareProjectedItems(previousItems.current, projectItems(events))
+    previousItems.current = next
+    return next
+  }, [events])
   const running = useMemo(() => isTurnRunning(events), [events])
+  const manifestKey = useMemo(() => manifestRefreshKey(events, compactNonce), [events, compactNonce])
   const currentSession = useMemo(() => sessions.find((session) => session.id === current) ?? null, [sessions, current])
   const currentSessionModelState = current !== null && activeWs !== null ? sessionModelStates.get(sessionModelKey(activeWs, current)) : undefined
   const currentSessionModel = currentSessionModelState?.status === 'ready' ? currentSessionModelState.model : undefined
@@ -474,9 +494,9 @@ export function App() {
     try {
       const [listing, projectRows] = await Promise.all([listSessionsIn(activeWs), listProjects(activeWs)])
       if (workspaceRef.current !== activeWs || !navigation.current.matches(nav) || !lists.current.matches(request)) return
-      setSessions(listing)
+      setSessions((previous) => sameListing(previous, listing) ? previous : listing)
       setListedWorkspace(activeWs)
-      setProjects(projectRows)
+      setProjects((previous) => sameListing(previous, projectRows) ? previous : projectRows)
       for (const row of listing) createdHere.current.delete(row.id)
     } catch (cause) {
       toast.notify(String(cause))
@@ -504,7 +524,7 @@ export function App() {
   const refreshWorkspaces = useCallback(async () => {
     try {
       const rows = await listWorkspaces()
-      setWorkspaces(rows)
+      setWorkspaces((previous) => sameListing(previous, rows) ? previous : rows)
       return rows
     } catch (cause) {
       toast.notify(String(cause))
@@ -695,10 +715,15 @@ export function App() {
     return () => { cancelled = true }
   }, [activeWs])
 
-  // Inspector: refresh the last request's manifest when the conversation settles.
+  // A different conversation never shows the previous one's context.
   useEffect(() => {
     setManifest(null)
-    if (!workbenchOpen || inspectorTab !== 'context' || workbenchFiles.activeFile !== null || activeWs === null || current === null || running) return
+  }, [activeWs, current])
+
+  // Composer context meter + inspector: refresh the last request's manifest
+  // when the conversation settles. The previous value stays up during a run.
+  useEffect(() => {
+    if (activeWs === null || current === null || running) return
     let cancelled = false
     const timer = setTimeout(() => {
       void fetchManifest(activeWs, current).then(
@@ -714,7 +739,7 @@ export function App() {
       cancelled = true
       clearTimeout(timer)
     }
-  }, [workbenchOpen, inspectorTab, workbenchFiles.activeFile, activeWs, current, running, events.length, compactNonce])
+  }, [activeWs, current, running, manifestKey])
 
   useEffect(() => {
     if (streamError === null) return
@@ -738,6 +763,9 @@ export function App() {
   }, [activeWs, navigate, sidebarDocked])
 
   const send = useCallback(async () => {
+    // Read at call time: the app does not re-render for draft edits.
+    const composer = composers.get()[key] ?? emptyComposer
+    const { draft } = composer
     if (sendingRef.current.has(key) || draftIsEmpty(draft) || modelValue === null || activeWs === null) return
     if (current === null && modelDefaultsCoordinator.current.isPending()) return
     if (current !== null && sessionModelQueue.current.isPending(sessionModelKey(activeWs, current))) return
@@ -792,7 +820,7 @@ export function App() {
       sendingRef.current.delete(sourceKey)
       updateComposer(targetKey, (state) => ({ ...state, sending: false }))
     }
-  }, [current, draft, composer, key, modelValue, activeWs, effectiveDraftProject, navigate, projects, refreshList, refreshWorkspaces])
+  }, [current, composers, key, modelValue, activeWs, effectiveDraftProject, navigate, projects, refreshList, refreshWorkspaces])
 
   const stop = useCallback(async () => {
     if (current === null || activeWs === null) return
@@ -827,9 +855,9 @@ export function App() {
     }
   }, [projectedItems, current, activeWs, running, modelValue, key, refreshList, toast])
 
-  const answer = useCallback(async (approvalId: string, allow: boolean) => {
+  const answer = useCallback(async (approvalId: string, allow: boolean, scope: 'once' | 'session' = 'once') => {
     try {
-      await answerApproval(approvalId, allow)
+      await answerApproval(approvalId, allow, scope)
       dismissApproval(approvalId)
       void refreshWorkspaces()
     } catch (cause) {
@@ -1001,10 +1029,12 @@ export function App() {
   ])
 
 
-  const openSettings = (section: typeof settingsSection = 'providers'): void => {
+  const openSettings = useCallback((section: typeof settingsSection = 'providers'): void => {
     setSettingsSection(section)
     setSettingsOpen(true)
-  }
+  }, [])
+  const openProviderSettings = useCallback(() => openSettings(), [openSettings])
+  const retryLastTurn = useCallback(() => void retryLast(), [retryLast])
 
   const sidebar = (
     <Sidebar
@@ -1113,15 +1143,29 @@ export function App() {
     return lastUser !== undefined && lastUser.kind === 'user' ? lastUser.content : null
   }, [projectedItems])
 
+  // The latest folder-grant revision on the stream: an approval that granted
+  // a folder refreshes the chip without reopening it.
+  const grantsRevision = useMemo(
+    () => events.reduce((latest, event) => (event.type === 'session/grants' ? Math.max(latest, event.revision ?? 0) : latest), 0),
+    [events],
+  )
+  const contextControl = current !== null ? (
+    <>
+      {activeWs !== null && currentProject !== null ? <SessionFoldersChip workspaceId={activeWs} sessionId={current} revision={grantsRevision} /> : null}
+      <ContextMeter manifest={manifest} />
+    </>
+  ) : null
+
   const composerNode = (
-    <Composer
+    <ScopedComposer
+      store={composers}
+      scope={key}
       modelControl={modelControl}
+      {...(contextControl !== null ? { contextControl } : {})}
       workspaceId={activeWs}
       sending={sending}
       connected={stream === 'open' || current === null}
       running={running}
-      draft={draft}
-      onDraft={setDraft}
       onSend={() => void send()}
       onStop={() => void stop()}
       modelValue={modelValue}
@@ -1199,6 +1243,7 @@ export function App() {
   if (authReady === false) {
     return (
       <div className="flex h-dvh items-center bg-bg text-fg">
+        {documentTitle}
         <PairingGate onPaired={() => setAuthReady(true)} />
       </div>
     )
@@ -1206,6 +1251,7 @@ export function App() {
 
   return (
     <>
+      {documentTitle}
       <div className="flex h-dvh overflow-hidden bg-bg text-fg">
         {sidebarDocked && sidebarOpen ? (
           <>
@@ -1283,10 +1329,10 @@ export function App() {
                   items={projectedItems}
                   {...(effectiveModel !== null && effectiveModel !== '' ? { modelLabel: effectiveModel } : {})}
                   workspaceId={activeWs}
-                  onReuse={(text) => { setDraft(messageDraft(text)); focusComposer() }}
+                  onReuse={reuseInDraft}
                   onOpenChild={openSession}
-                  onRetry={() => void retryLast()}
-                  onOpenSettings={() => openSettings()}
+                  onRetry={retryLastTurn}
+                  onOpenSettings={openProviderSettings}
                   openPath={openRecordedPath}
                 />
               )}
@@ -1325,7 +1371,7 @@ export function App() {
           {workbench}
         </Sheet>
       ) : null}
-      <SettingsModal
+      <LazySettings
         initialTab={settingsSection}
         workspaceName={activeWorkspace?.name}
         projects={projects}

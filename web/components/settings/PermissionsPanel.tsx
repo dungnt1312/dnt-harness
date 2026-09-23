@@ -26,7 +26,7 @@ export function PermissionsPanel(props: { readonly workspaceId: string | null; r
         </Tabs.List>
 
         <Tabs.Content value="modes" className="min-w-0 outline-none">
-          <ModesPanel workspaceId={props.workspaceId} onChanged={props.onChanged} />
+          <ModesPanel workspaceId={props.workspaceId} {...(props.onChanged !== undefined ? { onChanged: props.onChanged } : {})} />
         </Tabs.Content>
         <Tabs.Content value="guard" className="min-w-0 outline-none">
           <DangerousCommandsPanel workspaceId={props.workspaceId} />

@@ -20,7 +20,8 @@ import type { SessionId, WorkspaceId, ProjectId } from '../../util/brand.ts'
 import type { Agent } from '../agent/agent.ts'
 import { agentScope, type AgentScope } from '../agent/scope.ts'
 import type { AgentDefinition } from './definition-service.ts'
-import type { SessionEvent } from '../session/events.ts'
+import type { SessionEvent, TurnEndReason } from '../session/events.ts'
+import type { GrantedRoot } from '../tools/types.ts'
 
 /**
  * What a child is asked to do. `prompt` is the brief in prose — the primary
@@ -81,9 +82,16 @@ export interface SpawnRequest {
    * when `inherit` is `'brief'` (possibly empty when nothing was eligible).
    */
   readonly inheritedContext?: string | undefined
+  /** The parent's additional file-tool folders at spawn; the child never gains more. */
+  readonly grants?: readonly GrantedRoot[] | undefined
 }
 
-export type ChildStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
+/**
+ * `uncertain` means an append acknowledgement failed and canonical storage
+ * could not be read to establish whether the parent lifecycle record landed.
+ * It deliberately does not assert either a terminal failure or a rollback.
+ */
+export type ChildStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'uncertain'
 
 /** A completed child's deliverable. */
 export interface ChildResult {
@@ -141,6 +149,8 @@ export class SpawnError extends Error {
 interface StoredSession {
   readonly id: SessionId
   readonly events: readonly SessionEvent[]
+  /** Actual Session storage failures poison the instance permanently. */
+  readonly poisoned?: boolean
   append(event: unknown): unknown
   durable(): Promise<void>
 }
@@ -148,6 +158,8 @@ interface StoredSession {
 interface SessionsLike {
   create(workspaceId?: WorkspaceId): StoredSession
   load(id: SessionId): Promise<StoredSession>
+  /** Canonical persisted events, bypassing any poisoned loaded Session. */
+  readCanonicalEvents?(id: SessionId): Promise<readonly SessionEvent[] | undefined>
   has(id: SessionId): boolean
   workspaceOf(id: SessionId): WorkspaceId | undefined
   summaries(): readonly { readonly id: SessionId }[]
@@ -160,11 +172,13 @@ interface InternalChild {
   readonly workspaceId: WorkspaceId
   readonly parentSessionId: SessionId
   readonly parentTurnId: string
+  /** The project binding captured at the durable spawn boundary. */
+  readonly projectId?: ProjectId
   readonly definitionName: string
   readonly model?: ChildModel
   agent?: Agent
   /** The child's durable log (live for an active child). */
-  readonly events: readonly SessionEvent[]
+  events: readonly SessionEvent[]
   status: ChildStatus
   readonly startedAt: number
   endedAt?: number
@@ -200,6 +214,8 @@ export class ChildExecutor {
    * rebuild from the durable logs.
    */
   private readonly settledHandles = new Map<SessionId, SettledEntry>()
+  /** One canonical settlement writer per child; concurrent retries share it. */
+  private readonly settlements = new Map<SessionId, Promise<ChildHandle | undefined>>()
   private readonly spawnedPerTurn = new Map<string, number>()
   /** Active reservations include spawns that have not launched yet. */
   private reservedGlobal = 0
@@ -258,6 +274,9 @@ export class ChildExecutor {
     for (const child of this.active.values()) {
       if (child.parentSessionId !== parentSessionId) continue
       if (workspaceId !== undefined && child.workspaceId !== workspaceId) continue
+      // Active entries are not durable handles yet, but still require the
+      // parent ownership boundary: a deleted or rebound root owns no listing.
+      if (!await this.ownsChild(workspaceId ?? child.workspaceId, child)) continue
       seen.add(child.childSessionId)
       handles.push(this.withResult(child))
     }
@@ -364,6 +383,7 @@ export class ChildExecutor {
         workspaceId: request.workspaceId,
         parentSessionId: root,
         parentTurnId: request.parentTurnId,
+        ...(request.projectId !== undefined ? { projectId: request.projectId } : {}),
         definitionName: request.definition.name,
         ...(request.model !== undefined ? { model: request.model } : {}),
         events: session.events,
@@ -402,12 +422,25 @@ export class ChildExecutor {
           : {}),
       })
       await session.durable()
-      parent.append({
-        type: 'agent/child-spawn', childSessionId: session.id,
-        parentTurnId: request.parentTurnId, definition: request.definition.name,
+      const spawnRecord = {
+        type: 'agent/child-spawn' as const,
+        childSessionId: session.id,
+        parentTurnId: request.parentTurnId,
+        definition: request.definition.name,
         brief,
-      })
-      await parent.durable()
+      }
+      parent.append(spawnRecord)
+      const outcome = await reconcileParentAppend(sessions, parent, (event) => sameChildSpawn(event, spawnRecord))
+      if (outcome === 'missing') throw new Error('parent did not persist the child spawn record')
+      if (outcome === 'uncertain') {
+        // Do not launch unparented work, delete a possibly committed child, or
+        // call it failed. It remains retained until canonical storage can be
+        // reconciled (or its root is deleted).
+        child.status = 'uncertain'
+        child.failure = 'the parent spawn record may have persisted, but canonical storage could not be read'
+        child.finished = true
+        child.settle()
+      }
     } catch (error) {
       // Before the commit point: nothing may survive this attempt. (Recovery
       // also refuses any leftover the delete cannot remove: without the
@@ -430,8 +463,9 @@ export class ChildExecutor {
     }
     const childSession = session
 
-    // ── committed: the child exists; any failure from here settles it ──
+    // ── committed or explicitly uncertain: preserve the child either way ──
     this.indexChild(root, childSession.id)
+    if (child.status === 'uncertain') return this.withResult(child)
 
     try {
       // Ceiling = (grant ? definition ∩ grant : definition) − disallowed.
@@ -464,6 +498,7 @@ export class ChildExecutor {
           toolCeiling,
           ...(request.definition.skills !== undefined ? { skills: request.definition.skills } : {}),
           ...(request.inheritedContext !== undefined ? { inheritedContext: request.inheritedContext } : {}),
+          ...(request.grants !== undefined && request.grants.length > 0 ? { grants: request.grants } : {}),
         },
       }
       const agent = agents.create(childSession, identity)
@@ -485,9 +520,20 @@ export class ChildExecutor {
           if (child.status === 'running') {
             agent.send(renderPacket(request.packet, brief))
             await agent.run()
+            // Cancellation is sticky even if its runner resolves only after
+            // appending the cancelled turn record.
+            if (child.status === 'running') {
+              const terminal = terminalTurnReason(child.events)
+              if (terminal === 'completed') child.status = 'completed'
+              else {
+                child.status = 'failed'
+                child.failure = terminal === undefined
+                  ? 'the child run returned without a terminal turn record'
+                  : `the child terminal turn ended ${terminal}`
+              }
+            }
           }
           // Cancellation is sticky: a stopped child is never relabeled.
-          if (child.status === 'running') child.status = 'completed'
         } catch (error) {
           if (child.status === 'running') {
             child.status = 'failed'
@@ -570,6 +616,130 @@ export class ChildExecutor {
     return this.withResult(child)
   }
 
+  /**
+   * Reconcile one retained lifecycle entry against canonical storage. This is a
+   * bounded, workspace- and parent-ownership-checked repair operation: it
+   * never retries an append through a poisoned Session. A canonical parent
+   * result wins; otherwise a canonical child terminal turn proves that no
+   * process can still hold this reservation. Entries with no such proof stay
+   * uncertain and continue holding capacity.
+   */
+  async reconcile(workspaceId: WorkspaceId, childSessionId: SessionId): Promise<ChildHandle | undefined> {
+    // Verify authorization before joining an id-keyed repair. Otherwise a
+    // foreign caller racing the owner could receive the owner's result from
+    // `settlements` without ever crossing the workspace/parent boundary.
+    const live = this.active.get(childSessionId)
+    const candidate = live ?? await this.reconstruct(childSessionId, workspaceId)
+    if (candidate === undefined || !await this.ownsChild(workspaceId, candidate)) return undefined
+
+    const inFlight = this.settlements.get(childSessionId)
+    if (inFlight !== undefined) return inFlight
+    const task = this.reconcileOne(workspaceId, childSessionId)
+    this.settlements.set(childSessionId, task)
+    try {
+      return await task
+    } finally {
+      if (this.settlements.get(childSessionId) === task) this.settlements.delete(childSessionId)
+    }
+  }
+
+  /**
+   * The one repair path for a retained live child and a restart-reconstructed
+   * child. It reads canonical records before selecting a terminal status, then
+   * appends exactly one parent result through a usable single writer. A poisoned
+   * loaded parent is never reused; a fresh session after restart is the fence.
+   */
+  private async reconcileOne(workspaceId: WorkspaceId, childSessionId: SessionId): Promise<ChildHandle | undefined> {
+    const sessions = this.sessions()
+    if (sessions?.readCanonicalEvents === undefined) return undefined
+    const live = this.active.get(childSessionId)
+    // A live runner owns its terminal transition. Reconciliation is only for
+    // retained, already-finished uncertain entries; otherwise it could observe
+    // the child's terminal turn between `run()` and `finish()`, append the
+    // parent result itself, and race finish's capacity release.
+    if (live !== undefined && (!live.finished || live.status !== 'uncertain')) return this.withResult(live)
+    const child = live ?? await this.reconstruct(childSessionId, workspaceId)
+    if (child === undefined || !await this.ownsChild(workspaceId, child)) return undefined
+    let parentEvents: readonly SessionEvent[] | undefined
+    let childEvents: readonly SessionEvent[] | undefined
+    try {
+      parentEvents = await sessions.readCanonicalEvents(child.parentSessionId)
+      childEvents = await sessions.readCanonicalEvents(child.childSessionId)
+    } catch {
+      return this.withResult(child)
+    }
+    if (parentEvents === undefined || childEvents === undefined) return this.withResult(child)
+    if (!spawnCommitted(parentEvents, childSessionId)) {
+      // A retained spawn never launched any work. Once canonical storage proves
+      // its parent record absent, it is safe to undo the pre-launch allocation.
+      // Do this only for the live retained entry: a restart cannot establish
+      // that an historical child was never launched.
+      if (live !== undefined && live.agent === undefined && live.status === 'uncertain') {
+        try {
+          await sessions.delete(childSessionId)
+        } catch {
+          return this.withResult(child)
+        }
+        this.active.delete(childSessionId)
+        this.settledHandles.delete(childSessionId)
+        const ids = this.childIdsByRoot.get(child.parentSessionId)
+        ids?.delete(childSessionId)
+        if (ids?.size === 0) this.childIdsByRoot.delete(child.parentSessionId)
+        // Removing the active entry before releasing makes a repeated reconcile
+        // a no-op, so this reservation is released exactly once.
+        this.releaseActive(child.parentSessionId)
+        child.settle()
+        ;(this.ctx.get('agents') as { forget?(id: SessionId): void } | undefined)?.forget?.(childSessionId)
+        return undefined
+      }
+      return this.withResult(child)
+    }
+    let result = latestChildResult(parentEvents, childSessionId)
+    if (result === undefined || !isTerminalStatus(result.status)) {
+      const terminal = terminalTurnReason(childEvents)
+      if (terminal === undefined) return this.withResult(child)
+      const status: Exclude<ChildStatus, 'running' | 'uncertain' | 'interrupted'> = terminal === 'completed'
+        ? 'completed'
+        : terminal === 'cancelled' ? 'cancelled' : 'failed'
+      const error = status === 'completed' ? undefined : `the child terminal turn ended ${terminal}`
+      const record = {
+        type: 'agent/child-result' as const,
+        childSessionId,
+        parentTurnId: child.parentTurnId,
+        status,
+        ...(error !== undefined ? { error } : {}),
+      }
+      try {
+        const parent = await sessions.load(child.parentSessionId)
+        // Never append via an instance whose writer has already been poisoned.
+        if (parent.poisoned === true) return this.withResult(child)
+        parent.append(record)
+        const outcome = await reconcileParentAppend(sessions, parent, (event) => sameChildResult(event, record))
+        if (outcome !== 'committed') return this.withResult(child)
+      } catch {
+        return this.withResult(child)
+      }
+      try {
+        parentEvents = await sessions.readCanonicalEvents(child.parentSessionId)
+      } catch {
+        return this.withResult(child)
+      }
+      result = parentEvents === undefined ? undefined : latestChildResult(parentEvents, childSessionId)
+      if (result === undefined || !isTerminalStatus(result.status)) return this.withResult(child)
+    }
+    child.status = result.status
+    if (result.error !== undefined) child.failure = result.error
+    else delete child.failure
+    child.events = childEvents
+    child.endedAt ??= result.timestamp
+    child.resultComputed = false
+    delete child.result
+    delete child.error
+    if (live !== undefined) this.finalizeCanonical(child)
+    else this.remember({ handle: this.withResult(child), workspaceId: child.workspaceId, parentSessionId: child.parentSessionId })
+    return this.withResult(child)
+  }
+
   /** Root Stop: cancel every running child of one root and await settlement. */
   async cancelAllOfRoot(parentSessionId: SessionId): Promise<number> {
     const running = [...this.active.values()].filter(
@@ -623,9 +793,25 @@ export class ChildExecutor {
    * child ids it indexed, so the host can drop their per-session state too.
    */
   forgetRoot(parentSessionId: SessionId): SessionId[] {
+    // This hook is valid only after `sessions.delete()` succeeded. A failed
+    // deletion leaves the root able to recover its terminal failure, so its
+    // reservations must remain held.
+    if (this.sessions()?.has(parentSessionId) !== false) return []
     this.releaseTurns(parentSessionId)
     const ids = [...(this.childIdsByRoot.get(parentSessionId) ?? [])]
     this.childIdsByRoot.delete(parentSessionId)
+    for (const child of [...this.active.values()]) {
+      if (child.parentSessionId !== parentSessionId) continue
+      this.active.delete(child.childSessionId)
+      // Deletion follows successful root removal, so a retained terminal
+      // failure can no longer be recovered through that root. Every entry
+      // still in `active` holds exactly one reservation; removing it first
+      // makes repeated cleanup a no-op.
+      child.finished = true
+      child.settle()
+      this.releaseActive(parentSessionId)
+      ;(this.ctx.get('agents') as { forget?(id: SessionId): void } | undefined)?.forget?.(child.childSessionId)
+    }
     for (const id of ids) this.settledHandles.delete(id)
     return ids
   }
@@ -676,53 +862,98 @@ export class ChildExecutor {
    */
   private async finish(child: InternalChild): Promise<void> {
     if (child.finished) return
-    child.finished = true
     child.endedAt ??= Date.now()
     if (child.status === 'running') child.status = 'failed'
     if (child.status === 'failed' && child.failure === undefined) child.failure = 'the child run failed'
-    this.releaseActive(child.parentSessionId)
-    let durable = false
+    let parent: StoredSession | undefined
     try {
       const sessions = this.sessions()
-      if (sessions !== undefined) {
-        const parent = await sessions.load(child.parentSessionId)
-        parent.append({
-          type: 'agent/child-result',
-          childSessionId: child.childSessionId,
-          parentTurnId: child.parentTurnId,
-          status: child.status,
-          ...(child.failure !== undefined ? { error: child.failure } : {}),
-        })
-        await parent.durable()
-        await (await sessions.load(child.childSessionId)).durable()
-        durable = true
+      if (sessions === undefined) throw new Error('no sessions service mounted')
+      // Flush the child before making its terminal status visible from the
+      // parent. Otherwise a failed child flush can leave a durable completed
+      // parent record that contradicts the child's recoverable log.
+      await (await sessions.load(child.childSessionId)).durable()
+      parent = await sessions.load(child.parentSessionId)
+      const resultRecord = {
+        type: 'agent/child-result' as const,
+        childSessionId: child.childSessionId,
+        parentTurnId: child.parentTurnId,
+        status: child.status,
+        ...(child.failure !== undefined ? { error: child.failure } : {}),
       }
-    } catch {
-      // The entry stays in memory: its status is not durable anywhere else.
+      parent.append(resultRecord)
+      const outcome = await reconcileParentAppend(sessions, parent, (event) => sameChildResult(event, resultRecord))
+      if (outcome === 'missing') throw new Error('parent did not persist the child result record')
+      if (outcome === 'uncertain') {
+        // The selected terminal state is not contradicted, but it cannot be
+        // advertised as durable. Keep its reservation and child log intact.
+        child.status = 'uncertain'
+        child.failure = 'the parent result record may have persisted, but canonical storage could not be read'
+        delete child.result
+        delete child.error
+        child.resultComputed = false
+        child.finished = true
+        child.settle()
+        return
+      }
+    } catch (error) {
+      // No failed durability barrier establishes a parent terminal record. This
+      // includes the child-log flush: it may contain a terminal turn in memory,
+      // but until canonical reads prove it, neither a failed result nor capacity
+      // release is safe. `reconcile()` owns the later canonical repair.
+      child.status = 'uncertain'
+      child.failure = parent?.poisoned === true
+        ? `the parent result record is not durably known: ${errorText(error)}`
+        : `terminal persistence is not durably known: ${errorText(error)}`
+      delete child.result
+      delete child.error
+      child.resultComputed = false
+      child.finished = true
+      child.settle()
+      return
     }
+    child.finished = true
+    this.finalizeCanonical(child)
+  }
+
+  /** Release an active reservation only after a terminal canonical fact exists. */
+  private finalizeCanonical(child: InternalChild): void {
+    this.releaseActive(child.parentSessionId)
     const handle = this.withResult(child)
     child.settle()
-    if (durable) {
-      this.remember({ handle, workspaceId: child.workspaceId, parentSessionId: child.parentSessionId })
-      this.active.delete(child.childSessionId)
-      // The finished agent is not needed again; its session log is canonical.
-      ;(this.ctx.get('agents') as { forget?(id: SessionId): void } | undefined)?.forget?.(child.childSessionId)
-    }
+    this.remember({ handle, workspaceId: child.workspaceId, parentSessionId: child.parentSessionId })
+    this.active.delete(child.childSessionId)
+    // The finished agent is not needed again; its session log is canonical.
+    ;(this.ctx.get('agents') as { forget?(id: SessionId): void } | undefined)?.forget?.(child.childSessionId)
   }
 
   /** An active child, or a settled one from the cache or the durable logs. */
   private async lookup(workspaceId: WorkspaceId, childSessionId: SessionId): Promise<InternalChild | SettledEntry | undefined> {
     const live = this.active.get(childSessionId)
-    if (live !== undefined) return live.workspaceId === workspaceId ? live : undefined
-    return this.settledHandle(childSessionId, workspaceId)
+    if (live !== undefined) return await this.ownsChild(workspaceId, live) ? live : undefined
+    const settled = await this.settledHandle(childSessionId, workspaceId)
+    if (settled === undefined) return undefined
+    const child = await this.reconstruct(childSessionId, workspaceId)
+    return child !== undefined && await this.ownsChild(workspaceId, child) ? settled : undefined
+  }
+
+  /** Validate direct lifecycle access with the same parent boundaries as recovery. */
+  private async ownsChild(workspaceId: WorkspaceId, child: Pick<InternalChild, 'workspaceId' | 'parentSessionId' | 'projectId'>): Promise<boolean> {
+    if (child.workspaceId !== workspaceId) return false
+    const sessions = this.sessions()
+    if (sessions === undefined || !sessions.has(child.parentSessionId)) return false
+    const parent = await sessions.load(child.parentSessionId).catch(() => undefined)
+    return parent !== undefined &&
+      sessions.workspaceOf(parent.id) === child.workspaceId &&
+      boundProject(parent.events) === child.projectId
   }
 
   /**
    * Rebuild a settled child from its own log and its parent's records — the
    * single path for evicted entries and for restarts. A child the parent
    * never recorded (the spawn missed its commit point) is not a child. The
-   * status is the parent's terminal record; without one, only a log whose
-   * last turn completed reads `completed` — anything else is `interrupted`.
+   * status is the parent's terminal record; without one, a terminal child
+   * turn is `uncertain` and an incomplete child is `interrupted`.
    */
   private async reconstruct(
     childSessionId: SessionId,
@@ -746,11 +977,15 @@ export class ChildExecutor {
     for (const event of recordsOf) {
       if (event.type === 'agent/child-result' && event.childSessionId === childSessionId) record = event
     }
-    const latestTurnEnd = [...loaded.events].reverse().find((event) => event.type === 'turn/end')
-    const ranToCompletion = countOpenTurns(loaded.events) === 0 && latestTurnEnd?.type === 'turn/end' && latestTurnEnd.reason === 'completed'
+    // A terminal child turn proves only that the child stopped. It never proves
+    // the parent accepted its result, so a completed child without a parent
+    // result stays uncertain across process boundaries until settlement repairs
+    // it. An open/incomplete child remains the existing interrupted recovery
+    // fact: no terminal candidate exists to settle.
+    const terminal = terminalTurnReason(loaded.events)
     const status: ChildStatus = record !== undefined && isTerminalStatus(record.status)
       ? record.status
-      : ranToCompletion ? 'completed' : 'interrupted'
+      : terminal === undefined || terminal === 'interrupted' ? 'interrupted' : 'uncertain'
     // The child's model lives in its own log, so a reconstructed card reports
     // the pair it actually ran on rather than today's default.
     const stamped = [...loaded.events].reverse().find((event) => event.type === 'session/model')
@@ -763,6 +998,7 @@ export class ChildExecutor {
       workspaceId: owner,
       parentSessionId: parentId,
       parentTurnId: meta.parentTurnId,
+      ...(meta.projectId !== undefined ? { projectId: meta.projectId as ProjectId } : {}),
       definitionName: meta.definition,
       ...(model !== undefined ? { model } : {}),
       events: loaded.events,
@@ -867,8 +1103,80 @@ function boundProject(events: readonly SessionEvent[]): ProjectId | undefined {
   return undefined
 }
 
-function isTerminalStatus(status: string): status is Exclude<ChildStatus, 'running'> {
+function isTerminalStatus(status: string): status is Exclude<ChildStatus, 'running' | 'uncertain'> {
   return status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'interrupted'
+}
+
+/** The last durable terminal result for one child; parent log is authoritative. */
+function latestChildResult(
+  events: readonly SessionEvent[],
+  childSessionId: SessionId,
+): Extract<SessionEvent, { type: 'agent/child-result' }> | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]
+    if (event?.type === 'agent/child-result' && event.childSessionId === childSessionId) return event
+  }
+  return undefined
+}
+
+type ParentAppendOutcome = 'committed' | 'missing' | 'uncertain'
+
+/**
+ * A durable acknowledgement is not proof of absence when it rejects: the
+ * write might have reached storage before the Session became poisoned. After a
+ * rejection, only the store's canonical parent log decides the lifecycle
+ * record. We never retry the append through a poisoned Session.
+ */
+async function reconcileParentAppend(
+  sessions: SessionsLike,
+  parent: StoredSession,
+  matches: (event: SessionEvent) => boolean,
+): Promise<ParentAppendOutcome> {
+  try {
+    await parent.durable()
+    return 'committed'
+  } catch (error) {
+    // Wrapper and store failures can both occur after the append reached disk;
+    // canonical storage is the only authority when it can be read. Without a
+    // durable reader, retain the historical non-poisoned failure behavior.
+    if (sessions.readCanonicalEvents === undefined) {
+      if (parent.poisoned !== true) throw error
+      return 'uncertain'
+    }
+    try {
+      const canonical = await sessions.readCanonicalEvents(parent.id)
+      if (canonical === undefined) return parent.poisoned === true ? 'uncertain' : (() => { throw error })()
+      return canonical.some(matches) ? 'committed' : 'missing'
+    } catch (canonicalError) {
+      // The deliberate original-error rethrow above must remain observable.
+      if (canonicalError === error) throw error
+      return 'uncertain'
+    }
+  }
+}
+
+/** Exact identity for the one spawn append this executor issued. */
+function sameChildSpawn(
+  event: SessionEvent,
+  expected: { readonly childSessionId: SessionId; readonly parentTurnId: string; readonly definition: string; readonly brief: string },
+): boolean {
+  return event.type === 'agent/child-spawn' &&
+    event.childSessionId === expected.childSessionId &&
+    event.parentTurnId === expected.parentTurnId &&
+    event.definition === expected.definition &&
+    event.brief === expected.brief
+}
+
+/** Exact identity for the one terminal-result append this executor issued. */
+function sameChildResult(
+  event: SessionEvent,
+  expected: { readonly childSessionId: SessionId; readonly parentTurnId: string; readonly status: ChildStatus; readonly error?: string },
+): boolean {
+  return event.type === 'agent/child-result' &&
+    event.childSessionId === expected.childSessionId &&
+    event.parentTurnId === expected.parentTurnId &&
+    event.status === expected.status &&
+    event.error === expected.error
 }
 
 function errorText(error: unknown): string {
@@ -896,6 +1204,16 @@ function countOpenTurns(events: readonly SessionEvent[]): number {
     else if (event.type === 'turn/end') open = Math.max(0, open - 1)
   }
   return open
+}
+
+/** The terminal reason of the child's newest turn, if it closed one. */
+function terminalTurnReason(events: readonly SessionEvent[]): TurnEndReason | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]
+    if (event?.type === 'turn/end') return event.reason
+    if (event?.type === 'turn/start') return undefined
+  }
+  return undefined
 }
 
 /**

@@ -4,6 +4,7 @@ import type { AttachmentLookup } from '../attachments/store.ts'
 import { userMessageContent, type SessionEvent } from '../session/events.ts'
 import type { Session } from '../session/session.ts'
 import type { ResolvedMode } from '../modes/types.ts'
+import type { GrantedRoot } from '../tools/types.ts'
 import { estimateTokens, estimateContentTokens, schemaCost, budgetFor, ContextBudgetError, type BudgetConfig } from './budget.ts'
 
 export { ContextBudgetError }
@@ -59,6 +60,29 @@ export interface BuildContextInput {
   }
   /** Bounded parent-conversation projection, when the child inherited one. */
   readonly inheritedContext?: string
+  /**
+   * The folders file tools may use this request: the project folder plus
+   * any granted folders. Listed in the system block so the model knows the
+   * absolute paths it can address; enforcement stays in the tool pipeline.
+   */
+  readonly fileScope?: {
+    readonly primary: string
+    readonly additional: readonly GrantedRoot[]
+    /** False when the mode lets out-of-grant paths run without an extra approval. */
+    readonly outsideAsks: boolean
+  }
+}
+
+const FILE_TOOLS = new Set(['Read', 'Write', 'Edit', 'Glob', 'Grep'])
+
+/** The system line describing which folders file tools may use. */
+function fileScopeText(scope: NonNullable<BuildContextInput['fileScope']>): string {
+  const lines = [`Project folder (relative paths resolve here, read-write): ${scope.primary}`]
+  for (const root of scope.additional) {
+    lines.push(`Granted folder (${root.access === 'write' ? 'read-write' : 'read-only'}, use absolute paths): ${root.path}`)
+  }
+  if (scope.outsideAsks) lines.push('File tool access outside these folders requires the user\'s approval.')
+  return lines.join('\n')
 }
 
 /** The truthful record of what one request actually contained. */
@@ -71,9 +95,13 @@ export interface ContextManifest {
   readonly budget: {
     readonly availableTokens: number
     readonly usedTokens: number
+    /** The model's whole context window, before reserve and margin. */
+    readonly contextLimitTokens: number
     /** Token counts are estimates (chars/4) unless limits are verified. */
     readonly estimated: boolean
   }
+  /** Where `usedTokens` went, per source, measured on the final request. */
+  readonly breakdown: ContextBreakdown
   readonly history: {
     readonly setting: 'none' | 'recent' | 'compact'
     readonly includedTurns: number
@@ -96,6 +124,21 @@ export interface ContextManifest {
     readonly parentContext?: { readonly hash: string; readonly chars: number }
   }
   readonly omissions: readonly string[]
+}
+
+/** Estimated tokens per request source; the fields sum to `usedTokens`. */
+export interface ContextBreakdown {
+  /** Base and mode (or child role) instructions. */
+  readonly systemPrompt: number
+  /** Built-in tool schemas. */
+  readonly systemTools: number
+  /** `mcp__*` tool schemas. */
+  readonly mcpTools: number
+  /** Workspace/project instructions, pinned memory, inherited parent context. */
+  readonly metaContext: number
+  readonly skills: number
+  /** Conversation history, including a compaction summary. */
+  readonly messages: number
 }
 
 export interface AssembledContext {
@@ -188,6 +231,12 @@ export function buildContext(input: BuildContextInput): AssembledContext {
       systemParts.push(`Role — ${child.definition}:\n${child.instructions.trim()}`)
     }
   }
+  if (input.fileScope !== undefined && input.fileScope.primary !== '' && schemas.some((schema) => FILE_TOOLS.has(schema.name))) {
+    systemParts.push(fileScopeText(input.fileScope))
+  }
+  // The instruction prose alone, before lower-trust workspace text joins the
+  // block — the breakdown reports the two separately.
+  const promptText = systemParts.join('\n\n')
   const workspaceInstructions =
     mode.definition.sources.workspaceInstructions === true ? input.workspaceInstructions?.trim() : undefined
   if (workspaceInstructions !== undefined && workspaceInstructions !== '') {
@@ -312,6 +361,21 @@ export function buildContext(input: BuildContextInput): AssembledContext {
     throw new ContextBudgetError(used, available)
   }
 
+  // Split the surviving cost by source, from the same measured texts, so
+  // the parts add up to `used`.
+  const sumTokens = (list: readonly ModelMessage[]): number => list.reduce((total, message) => total + estimateContentTokens(message.content), 0)
+  const systemPrompt = estimateTokens(promptText)
+  const mcpSchemas = schemas.filter((schema) => schema.name.startsWith('mcp__'))
+  const mcpTools = mcpSchemas.length > 0 ? schemaCost(mcpSchemas) : 0
+  const breakdown: ContextBreakdown = {
+    systemPrompt,
+    systemTools: Math.max(schemaCost(schemas) - mcpTools, 0),
+    mcpTools,
+    metaContext: Math.max(estimateTokens(systemText) - systemPrompt, 0) + sumTokens(memoryMessages) + (inheritedMessage !== undefined ? estimateContentTokens(inheritedMessage.content) : 0),
+    skills: sumTokens(skillMessages),
+    messages: sumTokens(lowerTrustMessages) + historyCost(historyStart),
+  }
+
   // ── assemble messages (reuses the EXACT measured texts) ────
   const messages: ModelMessage[] = [{ role: 'system', content: systemText }, ...lowerTrustMessages]
   if (inheritedMessage !== undefined) messages.push(inheritedMessage)
@@ -340,8 +404,10 @@ export function buildContext(input: BuildContextInput): AssembledContext {
     budget: {
       availableTokens: available,
       usedTokens: used,
+      contextLimitTokens: input.budget.contextLimitTokens,
       estimated: input.budget.verified !== true,
     },
+    breakdown,
     history: {
       setting: mode.definition.sources.history,
       // Recomputed AFTER budget trimming from the final message window, so

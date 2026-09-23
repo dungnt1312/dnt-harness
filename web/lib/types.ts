@@ -47,6 +47,13 @@ export interface SseEvent {
   /** Approval traffic. */
   readonly approvalId?: string
   readonly decision?: string
+  /** Out-of-grant approval facts recorded on `approval/request`. */
+  readonly scopeWarning?: string
+  readonly proposedGrant?: string
+  readonly proposedAccess?: 'read' | 'write'
+  /** `session/grants`: the session's folder grants (full list) and revision. */
+  readonly revision?: number
+  readonly roots?: readonly FolderGrant[]
   readonly kind?: string
   readonly message?: string
   readonly title?: string | null
@@ -86,6 +93,9 @@ export type Envelope =
     /** Absent on questions rebuilt from a log snapshot: no deadline is known. */
     readonly expiresAt?: number
     readonly guardWarning?: string
+    readonly scopeWarning?: string
+    readonly proposedGrant?: string
+    readonly proposedAccess?: 'read' | 'write'
   }
   | { readonly kind: 'approval-settled'; readonly approvalId: string }
   | { readonly kind: 'error'; readonly message: string }
@@ -174,6 +184,31 @@ export interface PendingApproval {
   readonly expiresAt?: number
   /** Dangerous Commands guard warning for ask-blocked Bash commands. */
   readonly guardWarning?: string
+  /** Set when a file tool targets a path outside every granted folder. */
+  readonly scopeWarning?: string
+  /** The folder "allow for this session" grants; absent when not offered. */
+  readonly proposedGrant?: string
+  /** The access that folder gets: the call's own read or write. */
+  readonly proposedAccess?: 'read' | 'write'
+}
+
+/** One extra folder file tools may use, read-only or read-write. */
+export interface FolderGrant {
+  readonly path: string
+  readonly access: 'read' | 'write'
+}
+
+/** One extra folder a project grants its conversations. */
+export type AdditionalDirectory =
+  | { readonly kind: 'project'; readonly projectId: string; readonly access: 'read' | 'write' }
+  | { readonly kind: 'path'; readonly path: string; readonly access: 'read' | 'write' }
+
+/** A conversation's own folder grants plus the effective merged view. */
+export interface SessionGrantsView {
+  readonly revision: number
+  readonly roots: readonly FolderGrant[]
+  /** Project grants and session grants merged — what file tools can use. */
+  readonly effective: readonly FolderGrant[]
 }
 
 /** One permission policy decision, mirroring the server's ApprovalMode. */
@@ -218,6 +253,8 @@ export interface ProjectRow {
   readonly path: string
   /** Sidebar position; absent until the first drag-to-reorder. */
   readonly order?: number
+  /** Extra folders this project's conversations may use. */
+  readonly additionalDirectories?: readonly AdditionalDirectory[]
   readonly createdAt: number
 }
 
@@ -271,7 +308,8 @@ export interface AgentDefinitionRow {
 /** One child agent card: runtime status is separate from model claims. */
 export interface ChildRow {
   readonly childSessionId: string
-  readonly status: 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
+  /** `uncertain` is retained while the host reconciles its canonical lifecycle log. */
+  readonly status: 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'uncertain'
   readonly definitionName: string
   /** The child's effective `provider:model`. */
   readonly model?: string

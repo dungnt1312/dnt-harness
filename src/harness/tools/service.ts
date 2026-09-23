@@ -2,7 +2,7 @@ import { Service, type Context } from '../../kernel/index.ts'
 import type { ToolCall, ToolSchema } from '../llm/types.ts'
 import { canonicalCall } from './names.ts'
 import { takeMcpOutcome } from '../mcp/staged-outcome.ts'
-import type { PreExecuteDecision, PreparedToolCall, ToolDefinition, ToolExecution, ToolResult } from './types.ts'
+import type { ApprovedPath, GrantedRoot, PreExecuteDecision, PreparedToolCall, ToolDefinition, ToolExecution, ToolResult } from './types.ts'
 
 declare module 'mini-dsh' {
   interface Context {
@@ -11,7 +11,11 @@ declare module 'mini-dsh' {
 }
 
 /** Resolves the workspace grant for the tool run in flight, if any. */
-export type RootResolver = () => { root: string; deniedRoots?: readonly string[] } | undefined
+export type RootResolver = () => {
+  root: string
+  additionalRoots?: readonly GrantedRoot[]
+  deniedRoots?: readonly string[]
+} | undefined
 
 /**
  * The scoped tool registry and guarded execution pipeline. Tools register
@@ -25,9 +29,33 @@ export type RootResolver = () => { root: string; deniedRoots?: readonly string[]
  * the boundary, so legacy lowercase callers hit the same registry entry,
  * the same permission rules, and never a duplicate.
  */
+/**
+ * Consulted once per call after authorization settles (allowed or not):
+ * returns the out-of-grant paths an approval authorized for exactly this
+ * call. Side effect: when allowed, it may also persist the session grant the
+ * approver asked for; a failure there fails the call closed.
+ */
+export type ApprovedPathResolver = (call: ToolCall, allowed: boolean) => Promise<readonly ApprovedPath[] | undefined>
+
+/**
+ * Narrow the build-time grant to what is STILL granted right before the
+ * tool runs: a folder revoked while the call waited for approval no longer
+ * authorizes it, and access never widens mid-call.
+ */
+function stillGranted(before: readonly GrantedRoot[] | undefined, now: readonly GrantedRoot[] | undefined): GrantedRoot[] {
+  const result: GrantedRoot[] = []
+  for (const root of before ?? []) {
+    const current = now?.find((candidate) => candidate.path === root.path)
+    if (current === undefined) continue
+    result.push({ path: root.path, access: root.access === 'write' && current.access === 'write' ? 'write' : 'read' })
+  }
+  return result
+}
+
 export class ToolsService extends Service {
   private tools = new Map<string, ToolDefinition>()
   private rootResolver: RootResolver | undefined
+  private approvedPathResolver: ApprovedPathResolver | undefined
   private policyRevisionValue = 0
 
   constructor(ctx: Context) {
@@ -40,6 +68,16 @@ export class ToolsService extends Service {
    */
   setRootResolver(resolver: RootResolver): void {
     this.rootResolver = resolver
+  }
+
+  /** Install the host's approved-path resolver (out-of-grant approvals). */
+  setApprovedPathResolver(resolver: ApprovedPathResolver): void {
+    this.approvedPathResolver = resolver
+  }
+
+  /** The workspace grant the resolver yields for the current scope, if any. */
+  currentGrant(): ReturnType<RootResolver> {
+    return this.rootResolver?.()
   }
 
   /** Bump when the effective permission policy changes; recorded per call. */
@@ -122,22 +160,39 @@ export class ToolsService extends Service {
     )
     if (rewrite.kind === 'deny') {
       const deniedCall = canonicalCall(rewrite.call ?? canonical)
+      await this.approvedPathResolver?.(deniedCall, false).catch(() => undefined)
       return {
         call: deniedCall,
         execute: () => this.postExecute(deniedCall, exec, { ok: false, output: `denied: ${rewrite.reason}` }),
       }
     }
     const rewritten = canonicalCall(rewrite.call)
-    const decision: PreExecuteDecision = await this.ctx.waterfall(
-      'tools/pre-execute',
-      { call: rewritten, exec },
-      (replacement) => Promise.resolve(
-        replacement === undefined
-          ? { kind: 'allow', call: rewritten }
-          : { kind: 'allow', call: canonicalCall(replacement.call) },
-      ),
-    )
+    let decision: PreExecuteDecision
+    try {
+      decision = await this.ctx.waterfall(
+        'tools/pre-execute',
+        { call: rewritten, exec },
+        (replacement) => Promise.resolve(
+          replacement === undefined
+            ? { kind: 'allow', call: rewritten }
+            : { kind: 'allow', call: canonicalCall(replacement.call) },
+        ),
+      )
+    } catch (error) {
+      // Nothing was authorized: let the host drop any pending per-call state.
+      await this.approvedPathResolver?.(rewritten, false).catch(() => undefined)
+      throw error
+    }
     const preparedCall = canonicalCall(decision.kind === 'allow' ? decision.call : (decision.call ?? rewritten))
+    let approvedPaths: readonly ApprovedPath[] | undefined
+    try {
+      approvedPaths = await this.approvedPathResolver?.(preparedCall, decision.kind === 'allow')
+    } catch (error) {
+      return {
+        call: preparedCall,
+        execute: () => this.postExecute(preparedCall, exec, { ok: false, output: `denied: ${String(error instanceof Error ? error.message : error)}` }),
+      }
+    }
     if (decision.kind === 'deny') {
       return {
         call: preparedCall,
@@ -157,8 +212,10 @@ export class ToolsService extends Service {
       call: preparedCall,
       execute: async () => {
         let output: string
+        let runExec: ToolExecution
         try {
-          output = await tool.execute(preparedCall.args, exec)
+          runExec = this.executionAtRun(exec, approvedPaths)
+          output = await tool.execute(preparedCall.args, runExec)
         } catch (error) {
           return this.postExecute(preparedCall, exec, { ok: false, output: `error: ${String(error)}` })
         }
@@ -182,6 +239,30 @@ export class ToolsService extends Service {
   }
 
   /**
+   * The execution context at the moment the tool body starts: the grant is
+   * re-resolved and intersected with the build-time grant (approval waits can
+   * be long; a revoked folder must stop authorizing), and the approved
+   * out-of-grant paths for this call are attached. A changed primary root
+   * fails the call instead of running somewhere the approver did not see.
+   */
+  private executionAtRun(exec: ToolExecution, approvedPaths: readonly ApprovedPath[] | undefined): ToolExecution {
+    const { additionalRoots: _before, approvedPaths: _unused, ...base } = exec
+    let additionalRoots = exec.additionalRoots
+    if (exec.root !== '' && this.rootResolver !== undefined) {
+      const now = this.rootResolver()
+      if (now === undefined || now.root !== exec.root) {
+        throw new Error('the workspace folder changed while this call was waiting; retry the call')
+      }
+      additionalRoots = stillGranted(exec.additionalRoots, now.additionalRoots)
+    }
+    return {
+      ...base,
+      ...(additionalRoots !== undefined && additionalRoots.length > 0 ? { additionalRoots } : {}),
+      ...(approvedPaths !== undefined && approvedPaths.length > 0 ? { approvedPaths } : {}),
+    }
+  }
+
+  /**
    * Assemble the execution context. The root may be empty here — the
    * requiresRoot fail-closed check runs after the permission gate, so a
    * policy denial always outranks a missing (or present) grant.
@@ -191,6 +272,7 @@ export class ToolsService extends Service {
     const limits = this.ctx.get('limits') as { toolOutputLimit?: number } | undefined
     return {
       root: grant?.root ?? '',
+      ...(grant?.additionalRoots !== undefined && grant.additionalRoots.length > 0 ? { additionalRoots: grant.additionalRoots } : {}),
       ...(grant?.deniedRoots !== undefined ? { deniedRoots: grant.deniedRoots } : {}),
       ...(signal !== undefined ? { signal } : {}),
       ...(limits?.toolOutputLimit !== undefined ? { outputLimit: limits.toolOutputLimit } : {}),

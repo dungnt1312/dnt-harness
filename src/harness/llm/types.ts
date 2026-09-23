@@ -91,6 +91,16 @@ export interface ModelRequest {
 export type StreamEvent =
   | { readonly type: 'delta'; readonly delta: string; readonly thinking?: true }
   | { readonly type: 'toolCalls'; readonly calls: readonly ToolCall[] }
+  | { readonly type: 'usage'; readonly usage: TokenUsage }
+
+/** Provider-reported token accounting for one completion (not an estimate). */
+export interface TokenUsage {
+  /** Prompt tokens the provider billed, cached ones included. */
+  readonly inputTokens: number
+  /** The part of `inputTokens` served from the provider's prompt cache. */
+  readonly cachedInputTokens?: number
+  readonly outputTokens?: number
+}
 
 /**
  * A model provider: consumes a request, yields stream events — content

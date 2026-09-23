@@ -376,9 +376,11 @@ export class Agent {
               delta: event.delta,
               ...(event.thinking === true ? { thinking: true } : {}),
             })
-          } else {
+          } else if (event.type === 'toolCalls') {
             calls = event.calls
           }
+          // `usage` events are accounting for observers (the host taps them
+          // on `llm/stream`); they carry nothing the loop acts on.
         }
       } finally {
         if (watchdog !== undefined) clearTimeout(watchdog)
