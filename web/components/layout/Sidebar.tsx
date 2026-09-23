@@ -1,5 +1,5 @@
 import * as Popover from '@radix-ui/react-popover'
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Icon from '../common/Icon.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Kbd } from '../ui/Kbd.tsx'
@@ -38,8 +38,6 @@ function orderedSessions(sessions: readonly SessionListing[], sort: SessionSort,
   return sorted
 }
 
-const rowClass = 'flex min-h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-sm text-fg hover:bg-hover disabled:pointer-events-none disabled:opacity-40'
-
 export interface SidebarProps {
   readonly sessions: readonly SessionListing[]
   readonly projects: readonly ProjectRow[]
@@ -60,6 +58,7 @@ export interface SidebarProps {
   readonly onReorderProjects?: (orderedIds: readonly string[]) => void
   readonly onRename: (id: string, title: string) => void
   readonly onDeleteRequest: (session: SessionListing) => void
+  readonly onTogglePinned?: (id: string, pinned: boolean) => void
   readonly onOpenSettings: () => void
   readonly notifyEnabled: boolean
   readonly notifyBlocked: boolean
@@ -80,13 +79,19 @@ export function Sidebar(props: SidebarProps) {
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [sort, setSort] = useState<SessionSort>('recent')
   const [runningOnly, setRunningOnly] = useState(false)
+  // Search is an action, not furniture: the field appears when asked for and
+  // stays only while it holds a query.
+  const [searchOpen, setSearchOpen] = useState(false)
+  const showSearch = searchOpen || filter !== ''
   const active = workspaces.find((row) => row.id === activeWorkspaceId) ?? null
   const archived = active?.archived === true
   const approvals = active?.approvals ?? 0
   const listed = orderedSessions(sessions, sort, runningOnly, current, running)
   const sortAdjusted = runningOnly || sort !== 'recent'
 
-  useHotkeys([{ key: 'k', mod: true, onPress: () => searchRef.current?.focus() }])
+  useHotkeys([{ key: 'k', mod: true, onPress: () => setSearchOpen(true) }])
+  // Focus follows the field into existence, so Ctrl+K types straight into it.
+  useEffect(() => { if (showSearch) searchRef.current?.focus() }, [showSearch])
 
   return (
     <nav aria-label="Conversations and projects" className="flex h-full min-h-0 w-full flex-col bg-sidebar text-fg">
@@ -95,44 +100,45 @@ export function Sidebar(props: SidebarProps) {
         <IconButton label="Close sidebar" size="md" onClick={onClose}><Icon name="panelLeft" size={18} /></IconButton>
       </div>
 
-      <div className="flex shrink-0 flex-col gap-px px-2">
-        <button type="button" className={rowClass} onClick={onNew} disabled={archived} title={archived ? 'Workspace is archived' : undefined}>
-          <Icon name="squarePen" size={17} />
-          <span className="flex-1">New conversation</span>
-          <Kbd>Ctrl N</Kbd>
+      <div className="flex shrink-0 flex-col px-2">
+        {/* One raised primary action, then a caption row that owns search and
+            filter as icons: neither deserves a permanent row of its own. */}
+        <button
+          type="button"
+          className="flex min-h-10 w-full items-center justify-center gap-2 rounded-xl bg-muted text-sm font-medium text-fg transition-colors hover:bg-hover disabled:pointer-events-none disabled:opacity-40"
+          onClick={onNew}
+          disabled={archived}
+          title={archived ? 'Workspace is archived' : 'New conversation (Ctrl N)'}
+        >
+          <Icon name="squarePen" size={16} className="shrink-0" />
+          New conversation
         </button>
-        <label className={cn(rowClass, 'cursor-text focus-within:bg-hover')}>
-          <Icon name="search" size={17} />
-          <input
-            ref={searchRef}
-            value={filter}
-            aria-label="Search conversations"
-            placeholder="Search conversations"
-            onChange={(event) => onFilter(event.target.value)}
-            className="h-9 min-w-0 flex-1 bg-transparent outline-none placeholder:text-fg"
-          />
-          {filter !== '' ? (
-            <button type="button" aria-label="Clear search" className="text-fg-faint hover:text-fg" onClick={() => onFilter('')}><Icon name="close" size={14} /></button>
-          ) : <Kbd>Ctrl K</Kbd>}
-        </label>
-        {archived ? (
-          <p className="m-0 mt-1 flex items-start gap-2 rounded-lg bg-warn-soft px-2.5 py-2 text-xs text-warn" role="note">
-            <Icon name="archive" size={14} className="mt-px" />
-            <span>
-              Workspace archived. Restore it from{' '}
-              <button type="button" className="underline underline-offset-2" onClick={() => setWorkspaceOpen(true)}>the workspace switcher</button>.
-            </span>
-          </p>
-        ) : null}
-        <div className="mt-1 flex h-8 shrink-0 items-center justify-between px-2">
-          <span className="px-2.5 text-xs font-medium text-fg-faint">Conversations</span>
+        <div className="mt-2 flex items-center gap-0.5 pl-2.5">
+          <span className="flex-1 truncate text-xs font-medium text-fg-faint">Conversations</span>
+          <IconButton
+            label="Search conversations and folders (Ctrl K)"
+            aria-expanded={showSearch}
+            className={showSearch ? 'text-fg' : ''}
+            onClick={() => { if (showSearch) { onFilter(''); setSearchOpen(false) } else setSearchOpen(true) }}
+          >
+            <Icon name="search" size={15} />
+          </IconButton>
           <Menu
             label="Sort and filter conversations"
             side="bottom"
             align="end"
             panelClassName="w-60"
-            triggerClassName={cn('flex size-8 items-center justify-center rounded-lg hover:bg-hover', sortAdjusted ? 'text-fg' : 'text-fg-muted hover:text-fg')}
-            trigger={() => <Icon name="funnel" size={15} />}
+            triggerClassName={cn(
+              'relative flex size-9 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-hover',
+              sortAdjusted ? 'text-fg' : 'text-fg-muted hover:text-fg',
+            )}
+            trigger={() => (
+              <>
+                <Icon name="funnel" size={15} />
+                {/* Not colour alone: the menu itself names what is adjusted. */}
+                {sortAdjusted ? <span className="absolute right-1.5 top-1.5 size-1.5 rounded-full bg-primary" aria-label="Sort or filter adjusted" /> : null}
+              </>
+            )}
           >
             {(close) => (
               <>
@@ -156,9 +162,37 @@ export function Sidebar(props: SidebarProps) {
             )}
           </Menu>
         </div>
+        {showSearch ? (
+          <label className="mt-1 flex min-h-9 cursor-text items-center gap-2 rounded-lg bg-muted px-2.5 text-sm text-fg transition-colors focus-within:bg-hover">
+            <Icon name="search" size={15} className="shrink-0 text-fg-muted" />
+            <input
+              ref={searchRef}
+              value={filter}
+              aria-label="Search conversations and folders"
+              placeholder="Conversation or folder name"
+              onChange={(event) => onFilter(event.target.value)}
+              onKeyDown={(event) => { if (event.key === 'Escape') { onFilter(''); setSearchOpen(false) } }}
+              className="h-9 min-w-0 flex-1 bg-transparent outline-none placeholder:text-fg-faint"
+            />
+            {filter !== '' ? (
+              <button type="button" aria-label="Clear search" className="shrink-0 text-fg-faint hover:text-fg" onClick={() => { onFilter(''); searchRef.current?.focus() }}>
+                <Icon name="close" size={14} />
+              </button>
+            ) : <Kbd>Esc</Kbd>}
+          </label>
+        ) : null}
+        {archived ? (
+          <p className="m-0 mt-1 flex items-start gap-2 rounded-lg bg-warn-soft px-2.5 py-2 text-xs text-warn" role="note">
+            <Icon name="archive" size={14} className="mt-px" />
+            <span>
+              Workspace archived. Restore it from{' '}
+              <button type="button" className="underline underline-offset-2" onClick={() => setWorkspaceOpen(true)}>the workspace switcher</button>.
+            </span>
+          </p>
+        ) : null}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3 pt-1">
+      <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3 pt-2">
         <SessionList
           sessions={listed}
           projects={projects}
@@ -170,6 +204,7 @@ export function Sidebar(props: SidebarProps) {
           onSelect={onSelect}
           onRename={onRename}
           onDeleteRequest={onDeleteRequest}
+          {...(props.onTogglePinned !== undefined ? { onTogglePinned: props.onTogglePinned } : {})}
           onNewInProject={onNewInProject}
           {...(props.onReorderProjects !== undefined ? { onReorder: props.onReorderProjects } : {})}
         />

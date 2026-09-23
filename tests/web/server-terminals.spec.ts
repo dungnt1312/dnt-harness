@@ -225,6 +225,42 @@ describe('terminal HTTP surface', () => {
     }
   })
 
+  it('opens a project terminal in that project folder and remembers which project', async () => {
+    const baseUrl = await start()
+    const wid = await workspaceId(baseUrl)
+    const folder = path.join(root, 'proj')
+    await fs.mkdir(folder)
+    const project = (await (
+      await fetch(`${baseUrl}/api/workspaces/${wid}/projects`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'Proj', path: folder }),
+      })
+    ).json()) as { id: string }
+
+    const created = await fetch(`${baseUrl}/api/workspaces/${wid}/terminals`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ projectId: project.id }),
+    })
+    expect(created.status).toBe(201)
+    const info = (await created.json()) as { projectId?: string; cwd: string }
+    expect(info.projectId).toBe(project.id)
+    // Windows reports the 8.3 form of the temp dir, so compare the real path.
+    const real = await fs.realpath(folder)
+    expect(info.cwd).toBe(real)
+    expect(spawned[0]?.options.cwd).toBe(real)
+
+    // An unknown project is a 404, not a shell opened somewhere else.
+    const missing = await fetch(`${baseUrl}/api/workspaces/${wid}/terminals`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ projectId: 'project-missing' }),
+    })
+    expect(missing.status).toBe(404)
+    expect(spawned).toHaveLength(1)
+  })
+
   it('refuses to exceed the per-workspace cap', async () => {
     const baseUrl = await start()
     const wid = await workspaceId(baseUrl)
@@ -345,17 +381,10 @@ describe('terminal HTTP surface', () => {
     expect((await fetch(`${baseUrl}/api/workspaces/${wid}/terminals`)).status).toBe(404)
   })
 
-  it('refuses to serve terminals on a non-loopback bind', async () => {
-    const baseUrl = await start({ host: '0.0.0.0' })
-    // The URL the server reports is the bind address; reach it over loopback.
-    const port = new URL(baseUrl).port
-    const wid = await workspaceId(`http://127.0.0.1:${port}`)
-    const response = await fetch(`http://127.0.0.1:${port}/api/workspaces/${wid}/terminals`)
-    expect(response.status).toBe(403)
-    expect(((await response.json()) as { error: string }).error).toMatch(/loopback/)
-
-    // Chat still works: the gate is scoped to terminals, not the host.
-    expect((await fetch(`http://127.0.0.1:${port}/api/workspaces`)).status).toBe(200)
+  it('refuses a non-loopback bind before listening', async () => {
+    // No authenticated TLS profile exists, so acknowledging the risk does not
+    // open the port. Terminals never become reachable on a network bind.
+    await expect(start({ host: '0.0.0.0', unsafeNetworkBind: true })).rejects.toThrow(/authenticated TLS profile/)
   })
 
   it('answers 501 when no PTY backend is available', async () => {

@@ -294,8 +294,9 @@ export class WorkspaceService {
 
   /**
    * Bind a project to a workspace with an external working folder. The
-   * folder must exist and must not overlap any other project's folder —
-   * shared or nested roots are refused by default, across workspaces.
+   * folder must exist and must not overlap any other project's folder
+   * within the same workspace. The same physical folder may be bound in
+   * multiple workspaces (profiles) — overlap is only enforced intra-workspace.
    */
   async createProject(workspaceId: WorkspaceId, name: string, rawPath: string): Promise<ProjectRecord> {
     const workspace = this.get(workspaceId)
@@ -314,6 +315,7 @@ export class WorkspaceService {
     }
     const canonical = await fs.realpath(abs)
     for (const existing of this.projects.values()) {
+      if (existing.workspaceId !== workspaceId) continue
       const other = await fs.realpath(existing.path).catch(() => existing.path)
       if (this.rootsOverlap(canonical, other)) {
         throw new ScopeError(
@@ -417,6 +419,7 @@ export class WorkspaceService {
     const canonical = await fs.realpath(abs)
     for (const existing of this.projects.values()) {
       if (existing.id === id) continue
+      if (existing.workspaceId !== workspaceId) continue
       const other = await fs.realpath(existing.path).catch(() => existing.path)
       if (this.rootsOverlap(canonical, other)) {
         throw new ScopeError('root-overlap', `project folder overlaps '${existing.name}'`)

@@ -7,13 +7,12 @@ export { OpenAiCompletionsProvider, type OpenAiCompletionsOptions } from './open
 import { OpenAiCompletionsProvider } from './openai.ts'
 
 export class DeepSeekProvider extends OpenAiCompletionsProvider {
-  constructor(apiKey: string, baseUrl = 'https://api.deepseek.com', defaultModel = 'deepseek-chat') {
+  constructor(apiKey: string, baseUrl = 'https://api.deepseek.com') {
     super({
       name: 'deepseek',
       apiKey,
       baseUrl,
       models: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v4-flash', 'deepseek-v4-pro'],
-      defaultModel,
     })
   }
 }

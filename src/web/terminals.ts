@@ -18,7 +18,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { shellCatalog, type ShellId, type ShellOption } from '../capabilities/shell/detect.ts'
-import type { WorkspaceId } from '../util/brand.ts'
+import type { ProjectId, WorkspaceId } from '../util/brand.ts'
 
 /** Live terminals allowed per workspace. */
 const MAX_PER_WORKSPACE = 4
@@ -40,6 +40,12 @@ export type TerminalExitReason = 'exit' | 'killed' | 'idle'
 export interface TerminalInfo {
   readonly id: string
   readonly workspaceId: WorkspaceId
+  /**
+   * The project whose folder this shell was opened in. Absent for a terminal
+   * opened with no project, which starts in the host's default folder. The
+   * shell may `cd` afterwards; this records where it belongs, not where it is.
+   */
+  readonly projectId?: ProjectId
   readonly shellId: ShellId
   readonly label: string
   readonly cwd: string
@@ -104,6 +110,8 @@ export class TerminalError extends Error {
 export interface CreateTerminalInput {
   readonly workspaceId: WorkspaceId
   readonly cwd: string
+  /** Set when the shell belongs to a project; omitted for the host default folder. */
+  readonly projectId?: ProjectId
   readonly shellId?: ShellId
   readonly cols?: number
   readonly rows?: number
@@ -344,6 +352,7 @@ export function createTerminalService(options: TerminalServiceOptions = {}): Ter
       const info: TerminalInfo = {
         id: `terminal-${randomUUID()}`,
         workspaceId: input.workspaceId,
+        ...(input.projectId !== undefined ? { projectId: input.projectId } : {}),
         shellId: shell.id,
         label: shell.label,
         cwd: input.cwd,

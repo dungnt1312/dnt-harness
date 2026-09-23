@@ -28,6 +28,35 @@ async function post(base: string, pathname: string, body?: unknown): Promise<Res
   })
 }
 
+/** The first tool result in a session's snapshot matching `needle`. */
+async function toolResultMatching(base: string, wsId: string, sessionId: string, needle: RegExp): Promise<string> {
+  const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${sessionId}/events`)
+  const reader = (response.body as ReadableStream).getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  const deadline = Date.now() + 5_000
+  try {
+    while (Date.now() < deadline) {
+      const chunk = await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), deadline - Date.now())),
+      ])
+      if (chunk.done) break
+      buffer += decoder.decode(chunk.value, { stream: true })
+      const boundary = buffer.indexOf('\n\n')
+      if (boundary < 0) continue
+      const dataLine = buffer.slice(0, boundary).split('\n').find((line) => line.startsWith('data: '))
+      if (dataLine === undefined) continue
+      const envelope = JSON.parse(dataLine.slice('data: '.length)) as { kind: string; events?: { type: string; output?: string }[] }
+      if (envelope.kind !== 'snapshot') continue
+      return (envelope.events ?? []).find((event) => event.type === 'tool/result' && needle.test(event.output ?? ''))?.output ?? ''
+    }
+  } finally {
+    reader.cancel().catch(() => {})
+  }
+  return ''
+}
+
 describe('G4 HTTP surface', () => {
   it('spawns a child from a root session, lists children, and root Stop cancels them', async () => {
     // The child provider stalls forever so children are provably RUNNING
@@ -189,6 +218,266 @@ describe('G4 HTTP surface', () => {
     expect(grandchild.status).toBe(404)
     expect(((await grandchild.json()) as { error: string }).error).toMatch(/one-level|child/)
     await post(base, `/api/workspaces/${wsId}/sessions/${rootSession.id}/stop`)
+    await server.close()
+  }, 20_000)
+
+  it('a child runs on the resolved pair: spawn choice > role model > parent session', async () => {
+    // Two providers so the cross-provider case is real: the model the caller
+    // names does not exist on the parent's provider at all.
+    const stall = async function* (): AsyncGenerator<{ type: 'delta'; delta: string }> {
+      await new Promise(() => {})
+      yield { type: 'delta', delta: 'never' }
+    }
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-model-'))
+    const server = await createWebServer({
+      home,
+      providers: [
+        { name: 'house', models: ['house-small', 'house-large'], stream: stall } as LlmProvider,
+        { name: 'far', models: ['gpt-luna'], stream: stall } as LlmProvider,
+      ],
+      configFile: path.join(home, 'p.json'),
+    })
+    servers.push(server)
+    const base = server.url
+    const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
+    const rootSession = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+
+    // The conversation pins its own pair; a child must inherit THAT, not the
+    // global default (the defect this resolution order fixes).
+    expect((await fetch(`${base}/api/workspaces/${wsId}/sessions/${rootSession.id}/model`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'house', model: 'house-large' }),
+    })).status).toBe(200)
+
+    const inherited = await post(base, `/api/workspaces/${wsId}/agents/explorer`, {
+      rootSessionId: rootSession.id,
+      task: { objective: 'inherit the conversation model' },
+    })
+    expect(inherited.status).toBe(202)
+    expect(((await inherited.json()) as { model?: string }).model).toBe('house:house-large')
+
+    // An explicit choice on another provider wins, provider included.
+    const chosen = await post(base, `/api/workspaces/${wsId}/agents/explorer`, {
+      rootSessionId: rootSession.id,
+      task: { objective: 'research a b c' },
+      model: 'far:gpt-luna',
+    })
+    expect(chosen.status).toBe(202)
+    expect(((await chosen.json()) as { model?: string }).model).toBe('far:gpt-luna')
+
+    // A bare name resolves to the one provider that offers it.
+    const bare = await post(base, `/api/workspaces/${wsId}/agents/explorer`, {
+      rootSessionId: rootSession.id,
+      task: { objective: 'bare name' },
+      model: 'gpt-luna',
+    })
+    expect(bare.status).toBe(202)
+    expect(((await bare.json()) as { model?: string }).model).toBe('far:gpt-luna')
+
+    await post(base, `/api/workspaces/${wsId}/sessions/${rootSession.id}/stop`)
+
+    // An unknown model is a 400 that names what exists, not a host error and
+    // not a child that dies at its first request.
+    const unknown = await post(base, `/api/workspaces/${wsId}/agents/explorer`, {
+      rootSessionId: rootSession.id,
+      task: { objective: 'bad model' },
+      model: 'no-such-model',
+    })
+    expect(unknown.status).toBe(400)
+    expect(((await unknown.json()) as { error: string }).error).toMatch(/unknown model 'no-such-model'/)
+    await server.close()
+  }, 20_000)
+
+  it('the model delegates for itself: two children run at once on the model it named', async () => {
+    // Children answer on their own provider and overlap deliberately, so the
+    // peak counter proves real concurrency rather than a fast sequence.
+    let active = 0
+    let peak = 0
+    const far: LlmProvider = {
+      name: 'far', models: ['gpt-luna'],
+      async *stream() {
+        active += 1
+        peak = Math.max(peak, active)
+        await new Promise((resolve) => setTimeout(resolve, 200))
+        active -= 1
+        yield { type: 'delta', delta: 'child inspected src/index.ts' }
+      },
+    }
+    let step = 0
+    const house: LlmProvider = {
+      name: 'house', models: ['house-1'],
+      async *stream() {
+        step += 1
+        if (step === 1) {
+          yield {
+            type: 'toolCalls',
+            calls: [
+              { id: 'a1', name: 'Agent', args: { action: 'spawn', definition: 'explorer', objective: 'research a', model: 'far:gpt-luna' } },
+              { id: 'a2', name: 'Agent', args: { action: 'spawn', definition: 'explorer', objective: 'research b', model: 'far:gpt-luna' } },
+            ],
+          }
+          return
+        }
+        if (step === 2) {
+          yield { type: 'toolCalls', calls: [{ id: 'a3', name: 'Agent', args: { action: 'wait', timeoutMs: 5000 } }] }
+          return
+        }
+        yield { type: 'delta', delta: 'both children reported back' }
+      },
+    }
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-tool-'))
+    const server = await createWebServer({ home, providers: [house, far], configFile: path.join(home, 'p.json') })
+    servers.push(server)
+    const base = server.url
+    const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
+    expect((await fetch(`${base}/api/workspaces/${wsId}/mode`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ modeId: 'full-access' }),
+    })).status).toBe(200)
+
+    const rootSession = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    await fetch(`${base}/api/workspaces/${wsId}/sessions/${rootSession.id}/model`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'house', model: 'house-1' }),
+    })
+    await post(base, `/api/workspaces/${wsId}/sessions/${rootSession.id}/messages`, { content: 'research a and b' })
+
+    const deadline = Date.now() + 15_000
+    let children: { status: string; model?: string }[] = []
+    while (Date.now() < deadline) {
+      children = await (await fetch(`${base}/api/workspaces/${wsId}/agents/children?root=${rootSession.id}`)).json() as typeof children
+      if (children.length === 2 && children.every((child) => child.status === 'completed')) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    expect(children.map((child) => child.status)).toEqual(['completed', 'completed'])
+    // The model's own choice, provider included — not the conversation's pair.
+    expect(children.map((child) => child.model)).toEqual(['far:gpt-luna', 'far:gpt-luna'])
+    expect(peak).toBe(2)
+
+    // The root saw both digests through one wait call.
+    const waited = await toolResultMatching(base, wsId, rootSession.id, /child inspected/)
+    expect(waited).toContain('child inspected src/index.ts')
+    expect(step).toBe(3)
+    await server.close()
+  }, 30_000)
+
+  it('a child is denied Agent even when its definition lists it', async () => {
+    let childRequests = 0
+    const scripted: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() {
+        childRequests += 1
+        if (childRequests === 1) {
+          yield { type: 'toolCalls', calls: [{ id: 'd1', name: 'Agent', args: { action: 'spawn', definition: 'explorer', objective: 'grandchild' } }] }
+          return
+        }
+        yield { type: 'delta', delta: 'delegation was denied; stopping' }
+      },
+    }
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-nodeleg-'))
+    const server = await createWebServer({ home, providers: [scripted], configFile: path.join(home, 'p.json') })
+    servers.push(server)
+    const base = server.url
+    const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
+    expect((await fetch(`${base}/api/workspaces/${wsId}/mode`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ modeId: 'full-access' }),
+    })).status).toBe(200)
+
+    // A definition that asks for Agent explicitly — the ceiling alone would
+    // let this through, so the gate's one-level deny is what is under test.
+    expect((await post(base, `/api/workspaces/${wsId}/agents/delegator/import`, {
+      content: `---\nname: delegator\ndescription: tries to delegate\ntools: ["Agent", "Read"]\n---\n\nTry to delegate.`,
+    })).status).toBe(201)
+
+    const rootSession = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    const spawned = await post(base, `/api/workspaces/${wsId}/agents/delegator`, {
+      rootSessionId: rootSession.id,
+      task: { objective: 'delegate further' },
+      grantTools: ['Agent', 'Read'],
+    })
+    expect(spawned.status).toBe(202)
+    const handle = (await spawned.json()) as { childSessionId: string }
+    const settled = await (await fetch(`${base}/api/workspaces/${wsId}/children/${handle.childSessionId}?waitMs=8000`)).json() as { status: string }
+    expect(settled.status).toBe('completed')
+
+    const denial = await toolResultMatching(base, wsId, handle.childSessionId, /one-level delegation/)
+    expect(denial).toMatch(/one-level delegation: a child agent cannot delegate/)
+    // No grandchild exists: the root still owns exactly one child.
+    const children = await (await fetch(`${base}/api/workspaces/${wsId}/agents/children?root=${rootSession.id}`)).json() as unknown[]
+    expect(children.length).toBe(1)
+    await server.close()
+  }, 20_000)
+
+  it('child approvals relay onto the root SSE stream and the workspace badge', async () => {
+    let step = 0
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() {
+        step += 1
+        if (step === 1) {
+          yield { type: 'toolCalls', calls: [{ id: 'w1', name: 'Write', args: { path: 'x.txt', content: 'x' } }] }
+          return
+        }
+        yield { type: 'delta', delta: 'done' }
+      },
+    }
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-appr-'))
+    const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json') })
+    servers.push(server)
+    const base = server.url
+    const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
+    const rootSession = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    const spawned = await post(base, `/api/workspaces/${wsId}/agents/worker`, {
+      rootSessionId: rootSession.id,
+      task: { objective: 'write a file', constraints: [], requiredResult: 'summary' },
+    })
+    expect(spawned.status).toBe(202)
+    const handle = (await spawned.json()) as { childSessionId: string }
+
+    const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${rootSession.id}/events`)
+    const reader = (response.body as ReadableStream).getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    const deadline = Date.now() + 8_000
+    let found: { approvalId: string; childSessionId?: string } | undefined
+    try {
+      while (Date.now() < deadline && found === undefined) {
+        const chunk = await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), deadline - Date.now())),
+        ])
+        if (chunk.done) break
+        buffer += decoder.decode(chunk.value, { stream: true })
+        let boundary = buffer.indexOf('\n\n')
+        while (boundary >= 0) {
+          const frame = buffer.slice(0, boundary)
+          buffer = buffer.slice(boundary + 2)
+          boundary = buffer.indexOf('\n\n')
+          const dataLine = frame.split('\n').find((line) => line.startsWith('data: '))
+          if (dataLine === undefined) continue
+          const envelope = JSON.parse(dataLine.slice('data: '.length)) as {
+            kind: string
+            approvalId?: string
+            childSessionId?: string
+          }
+          if (envelope.kind === 'approval' && envelope.approvalId !== undefined) {
+            found = {
+              approvalId: envelope.approvalId,
+              ...(envelope.childSessionId !== undefined ? { childSessionId: envelope.childSessionId } : {}),
+            }
+            break
+          }
+        }
+      }
+    } finally {
+      reader.cancel().catch(() => {})
+    }
+    expect(found?.childSessionId).toBe(handle.childSessionId)
+    const rows = (await (await fetch(`${base}/api/workspaces`)).json()) as { id: string; approvals?: number }[]
+    expect(rows.find((row) => row.id === wsId)?.approvals).toBeGreaterThan(0)
+    expect((await post(base, `/api/approvals/${found?.approvalId ?? ''}`, { allow: true })).status).toBe(200)
     await server.close()
   }, 20_000)
 

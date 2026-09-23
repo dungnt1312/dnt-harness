@@ -130,7 +130,7 @@ describe('stdio MCP 2025-06-18 fixture', () => {
     expect(serverError.isError).toBe(true)
     const start = Date.now()
     await expect(mcp.callTool('hang', {}, 150)).rejects.toThrow(/timed out/)
-    expect(Date.now() - start).toBeLessThan(4_000) // 3 retries + backoff, bounded
+    expect(Date.now() - start).toBeLessThan(1_500)
     await mcp.disconnect()
   }, 15_000)
 })
@@ -188,7 +188,7 @@ describe('Streamable HTTP transport fixture', () => {
     for (let i = 0; i < 30 && reconnected === 0; i++) await new Promise((resolve) => setTimeout(resolve, 25))
     expect(reconnected).toBe(1)
     expect(mcp.available).toBe(true)
-    expect(calls).toBeGreaterThanOrEqual(15)
+    expect(calls).toBe(5)
     await mcp.disconnect()
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }, 30_000)

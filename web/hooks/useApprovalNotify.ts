@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { toolTarget } from '../lib/format.ts'
+import { listWorkspaces } from '../lib/api.ts'
+import { toolFacts } from '../lib/tool-facts.ts'
 import type { PendingApproval } from '../lib/types.ts'
 
 const STORAGE_KEY = 'notify-approvals'
@@ -35,8 +36,8 @@ export function useApprovalNotify(approvals: readonly PendingApproval[], workspa
     for (const approval of approvals) {
       if (notified.current.has(approval.approvalId)) continue
       notified.current.add(approval.approvalId)
-      const target = toolTarget(approval.call.args)
-      const body = `${approval.call.name}${target !== '' ? ` · ${target}` : ''} (workspace "${workspaceRef.current ?? 'current'}")`
+      const facts = toolFacts(approval.call)
+      const body = `${facts.name}${facts.fullTarget !== '' ? ` · ${facts.fullTarget}` : ''} (workspace "${workspaceRef.current ?? 'current'}")`
       try {
         const notification = new Notification('mini-dsh — approval needed', { body })
         notification.onclick = () => { window.focus(); notification.close() }
@@ -45,7 +46,39 @@ export function useApprovalNotify(approvals: readonly PendingApproval[], workspa
         // best-effort by contract.
       }
     }
+    // Bounded to what is still pending: a long session would otherwise
+    // remember every id it ever notified about.
+    const live = new Set(approvals.map((row) => row.approvalId))
+    for (const id of notified.current) if (!live.has(id)) notified.current.delete(id)
   }, [approvals, enabled])
+
+  useEffect(() => {
+    if (!enabled || !notifySupported() || Notification.permission !== 'granted') return
+    let primed = false
+    let lastOther = 0
+    const tick = async (): Promise<void> => {
+      if (typeof document === 'undefined' || !document.hidden) return
+      try {
+        const rows = await listWorkspaces()
+        const total = rows.reduce((sum, row) => sum + (row.approvals ?? 0), 0)
+        const other = Math.max(0, total - approvals.length)
+        if (primed && other > lastOther) {
+          const body = other === 1
+            ? 'Another conversation is waiting for an approval.'
+            : `${other} approvals are waiting in other conversations.`
+          try {
+            const notification = new Notification('mini-dsh — approval needed', { body })
+            notification.onclick = () => { window.focus(); notification.close() }
+          } catch { /* best-effort */ }
+        }
+        primed = true
+        lastOther = other
+      } catch { /* listing is best-effort while hidden */ }
+    }
+    const id = window.setInterval(() => { void tick() }, 8_000)
+    void tick()
+    return () => { window.clearInterval(id) }
+  }, [approvals.length, enabled])
 
   const toggle = useCallback(() => {
     if (!notifySupported()) { setBlocked(true); return }

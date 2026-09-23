@@ -18,7 +18,6 @@ export interface ProviderConfig {
   readonly baseUrl: string
   readonly apiKey: string
   readonly models: readonly string[]
-  readonly defaultModel?: string | undefined
   readonly enabled: boolean
   readonly modelSettings?: Readonly<Record<string, ModelSettings>>
 }
@@ -38,13 +37,18 @@ export interface ProviderStore {
 
 const blankDefaults = (): ModelDefaults => ({ provider: null, model: null, thinkingLevel: null })
 
-/** Select the stable preferred usable pair, favoring defaultModel over models[0]. */
+/**
+ * Select the first usable pair, in declared order: the first enabled provider
+ * that advertises a model, using that provider's first advertised model.
+ *
+ * Model choice is never stored per provider. A provider's `models[0]` is
+ * simply the first id it advertises, so callers that need a user-chosen model
+ * must supply one explicitly rather than relying on this fallback.
+ */
 export function preferredDefaults(providers: readonly ProviderConfig[], thinkingLevel: string | null = null): ModelDefaults {
   for (const provider of providers) {
     if (!provider.enabled) continue
-    const model = provider.defaultModel !== undefined && provider.models.includes(provider.defaultModel)
-      ? provider.defaultModel
-      : provider.models[0]
+    const model = provider.models[0]
     if (model !== undefined) return { provider: provider.id, model, thinkingLevel }
   }
   return blankDefaults()
@@ -73,14 +77,10 @@ export function loadProviders(file: string): ProviderConfig[] {
   return [...loadProviderStore(file).providers]
 }
 
-/** Parse legacy arrays or versioned envelopes, dropping malformed providers. */
+/** Parse the versioned envelope, dropping malformed providers. */
 export function parseProviderStore(raw: string): ProviderStore {
   try {
     const parsed: unknown = JSON.parse(raw)
-    if (Array.isArray(parsed)) {
-      const providers = parseProviderEntries(parsed)
-      return { version: 2, defaults: preferredDefaults(providers), providers }
-    }
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return { version: 2, defaults: blankDefaults(), providers: [] }
     }
@@ -124,7 +124,6 @@ function parseProviderEntries(entries: readonly unknown[]): ProviderConfig[] {
     const id = candidate['id']; const name = candidate['name']; const baseUrl = candidate['baseUrl']; const apiKey = candidate['apiKey']
     if (typeof id !== 'string' || id === '' || typeof name !== 'string' || name === '' || typeof baseUrl !== 'string' || baseUrl === '' || typeof apiKey !== 'string') continue
     const models = Array.isArray(candidate['models']) ? candidate['models'].filter((model): model is string => typeof model === 'string') : []
-    const defaultModel = typeof candidate['defaultModel'] === 'string' ? candidate['defaultModel'] : undefined
     const modelSettings: Record<string, ModelSettings> = {}
     if (candidate['contextLimits'] !== null && typeof candidate['contextLimits'] === 'object' && !Array.isArray(candidate['contextLimits'])) {
       for (const [model, tokens] of Object.entries(candidate['contextLimits'] as Record<string, unknown>)) {
@@ -143,7 +142,7 @@ function parseProviderEntries(entries: readonly unknown[]): ProviderConfig[] {
         if (Object.keys(value).length > 0) modelSettings[model] = { ...modelSettings[model], ...value }
       }
     }
-    out.push({ id, name, baseUrl, apiKey, models, ...(defaultModel !== undefined ? { defaultModel } : {}), enabled: candidate['enabled'] !== false, ...(Object.keys(modelSettings).length > 0 ? { modelSettings } : {}) })
+    out.push({ id, name, baseUrl, apiKey, models, enabled: candidate['enabled'] !== false, ...(Object.keys(modelSettings).length > 0 ? { modelSettings } : {}) })
   }
   return out
 }

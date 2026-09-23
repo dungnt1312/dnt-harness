@@ -4,6 +4,7 @@ import { resolveLimits, type HarnessLimits } from '../limits.ts'
 import type { AttachmentRef } from '../attachments/store.ts'
 import type { ModelRequest, ToolCall, ToolSchema } from '../llm/types.ts'
 import { canonicalCall } from '../tools/names.ts'
+import type { ToolResult } from '../tools/types.ts'
 import type { Session } from '../session/session.ts'
 import { agentScope, type AgentScope } from './scope.ts'
 import type { AgentStatus, InboxItem, PreStepDecision } from './types.ts'
@@ -13,9 +14,9 @@ interface ToolRuntime {
   schemas(): ToolSchema[]
   prepare?(call: ToolCall, options?: { signal?: AbortSignal }): Promise<{
     call: ToolCall
-    execute(): Promise<{ ok: boolean; output: string }>
+    execute(): Promise<ToolResult>
   }>
-  execute(call: ToolCall, options?: { signal?: AbortSignal }): Promise<{ ok: boolean; output: string }>
+  execute(call: ToolCall, options?: { signal?: AbortSignal }): Promise<ToolResult>
   /** The live permission-policy revision (a value or an accessor). */
   policyRevision?: number | (() => number)
 }
@@ -444,13 +445,21 @@ export class Agent {
       // Durable FINAL intent before side effects.
       await this.flushOrHalt()
       this.activity = 'tool'
-      let result: { ok: boolean; output: string }
+      let result: ToolResult
       try {
         result = await prepared.execute()
       } finally {
         this.activity = null
       }
-      this.session.append({ type: 'tool/result', stepId, callId: prepared.call.id, ok: result.ok, output: result.output })
+      this.session.append({
+        type: 'tool/result',
+        stepId,
+        callId: prepared.call.id,
+        ok: result.ok,
+        output: result.output,
+        ...(result.outcome !== undefined ? { outcome: result.outcome } : {}),
+        ...(result.invocationId !== undefined ? { invocationId: result.invocationId } : {}),
+      })
       await this.flushOrHalt()
     }
 

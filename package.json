@@ -15,8 +15,11 @@
     "chat": "tsx src/bins/headless.ts",
     "chat:mock": "tsx src/bins/headless.ts --mock",
     "web": "tsx src/bins/web.ts",
+    "pair": "tsx src/bins/pair.ts",
+    "migrate:mcp": "tsx src/bins/migrate-mcp.ts",
     "build:web": "vite build",
     "test:browser": "playwright test",
+    "test:browser:mcp": "vitest run tests/web/mcp-production-stack.spec.ts",
     "test:live-ui": "node scripts/live-ui-smoke.mjs"
   },
   "dependencies": {

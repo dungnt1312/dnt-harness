@@ -1,6 +1,6 @@
-/**
+﻿/**
  * G4: agent definitions (bundled Explorer/Worker, strict parsing, imports)
- * and bounded one-level delegation — capacity, ceiling enforcement,
+ * and bounded one-level delegation â€” capacity, ceiling enforcement,
  * isolation, root Stop cleanup.
  */
 import { promises as fs } from 'node:fs'
@@ -20,6 +20,15 @@ import {
   type SpawnRequest,
 } from 'mini-dsh'
 import { FakeScriptedLlm } from '../support/fake-llm.ts'
+
+/** wait() is batch-shaped; these cases follow exactly one child. */
+const waitOne = async (
+  executor: ChildExecutor,
+  workspaceId: string,
+  childSessionId: string,
+  timeoutMs: number,
+): Promise<ReturnType<ChildExecutor['childrenOfRoot']>[number] | undefined> =>
+  (await executor.wait(workspaceId as never, [childSessionId as never], { timeoutMs }))[0]
 
 let home = ''
 let proj = ''
@@ -142,13 +151,43 @@ describe('bounded delegation', () => {
     const definitions = new AgentDefinitionService(home)
     const explorer = (await definitions.resolve(harness.workspaceId as never, 'explorer')).definition
     const handle = await harness.executor.spawn(spawnRequest(harness, explorer))
-    const settled = await harness.executor.wait(harness.workspaceId as never, handle.childSessionId, 3_000)
+    const settled = await waitOne(harness.executor, harness.workspaceId, handle.childSessionId, 3_000)
     expect(settled !== undefined && settled.status).toBe('completed')
     expect(settled?.result?.summary).toContain('explorer found 3 files')
     // Isolation: the child session carries the task packet, not parent history.
     void harness
     void harness.kernel.stop()
   }, 15_000)
+
+  it('wait follows several children at once and returns the moment a stop aborts it', async () => {
+    const { AgentDefinitionService } = await import('mini-dsh')
+    const harness = await bootChildHarness(['done'])
+    const explorer = (await new AgentDefinitionService(home).resolve(harness.workspaceId as never, 'explorer')).definition
+    const first = await harness.executor.spawn(spawnRequest(harness, explorer))
+    const second = await harness.executor.spawn(spawnRequest(harness, explorer))
+    const both = await harness.executor.wait(
+      harness.workspaceId as never,
+      [first.childSessionId, second.childSessionId],
+      { timeoutMs: 5_000 },
+    )
+    expect(both.map((child) => child.status)).toEqual(['completed', 'completed'])
+
+    // An already-aborted signal returns at once instead of sitting out the
+    // timeout — a root Stop must not wait on a settled-forever child.
+    const aborted = new AbortController()
+    aborted.abort()
+    const started = Date.now()
+    const raced = await harness.executor.wait(
+      harness.workspaceId as never,
+      [first.childSessionId],
+      { timeoutMs: 60_000, signal: aborted.signal },
+    )
+    expect(Date.now() - started).toBeLessThan(1_000)
+    expect(raced.length).toBe(1)
+    // Unknown or foreign ids drop out rather than inventing a handle.
+    expect(await harness.executor.wait(harness.workspaceId as never, ['nope' as never], { timeoutMs: 10 })).toEqual([])
+    void harness.kernel.stop()
+  }, 20_000)
 
   it('capacity: more than the active limit reports capacity reached (429 semantics, no queue)', async () => {
     const harness = await bootChildHarness([{ toolCalls: [{ name: 'Read', args: {} }] }])
@@ -175,7 +214,7 @@ describe('bounded delegation', () => {
     // Cancel all: root Stop cleanup (awaited settlement confirmed).
     expect(await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)).toBe(3)
     for (const handle of handles) {
-      const settled = await harness.executor.wait(harness.workspaceId as never, handle.childSessionId, 3_000)
+      const settled = await waitOne(harness.executor, harness.workspaceId, handle.childSessionId, 3_000)
       expect(settled !== undefined && settled.status).toBe('cancelled')
     }
     void harness.kernel.stop()
@@ -214,7 +253,7 @@ describe('bounded delegation', () => {
     })
     harness.kernel.ctx.llm.use('handoff-spy')
     const handle = await harness.executor.spawn(spawnRequest(harness, worker, { grantTools: ['Write'] }))
-    const settled = await harness.executor.wait(harness.workspaceId as never, handle.childSessionId, 3_000)
+    const settled = await waitOne(harness.executor, harness.workspaceId, handle.childSessionId, 3_000)
     expect(settled?.status).toBe('completed')
     expect(releasedAt).toBeGreaterThan(0)
     expect(modelStartedAt).toBeGreaterThanOrEqual(releasedAt)
@@ -253,7 +292,7 @@ describe('bounded delegation', () => {
       expect(listed).toHaveLength(1)
       expect(listed[0]?.status).toBe('interrupted')
       expect(listed[0]?.result?.summary).toContain('partial finding')
-      const waited = await executor.wait(workspaceId as never, childId as never, 20)
+      const waited = await waitOne(executor, workspaceId, childId as never, 20)
       expect(waited?.status).toBe('interrupted')
       await kernel.stop()
     } finally {
@@ -261,7 +300,7 @@ describe('bounded delegation', () => {
     }
   }, 15_000)
 
-  it('the child ceiling denies tools outside definition ∩ grant even in Full access', async () => {
+  it('the child ceiling denies tools outside definition âˆ© grant even in Full access', async () => {
     const harness = await bootChildHarness([
       { toolCalls: [{ name: 'Bash', args: { command: 'echo hacked' } }] },
       'done',
@@ -271,7 +310,7 @@ describe('bounded delegation', () => {
     const handle = await harness.executor.spawn(
       spawnRequest(harness, explorer, { grantTools: ['Write'] }),
     )
-    const settled = await harness.executor.wait(harness.workspaceId as never, handle.childSessionId, 3_000)
+    const settled = await waitOne(harness.executor, harness.workspaceId, handle.childSessionId, 3_000)
     expect(settled !== undefined && settled.status).toBe('completed')
     // The Bash call must be denied by the definition ceiling; the result is
     // truthful and the command never ran.

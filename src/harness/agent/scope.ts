@@ -18,6 +18,10 @@ export interface AgentScope {
    * G4: present when this run is a CHILD agent. The definition's tool
    * ceiling rides here — the exposure gate enforces definition ∩ grant on
    * every child tool start. A child can never spawn children.
+   *
+   * The child's model is NOT here: it is stamped into the child's own log as
+   * a `session/model` event at spawn, so the ordinary session resolution
+   * carries the complete provider/model pair.
    */
   readonly childOf?: {
     readonly parentSessionId: SessionId
@@ -25,7 +29,6 @@ export interface AgentScope {
     readonly definition: string
     /** Hard ceiling: definition ∩ spawn grant (MCP always explicit). */
     readonly toolCeiling: readonly string[]
-    readonly modelOverride?: string
     readonly skills?: readonly string[]
   }
 }

@@ -156,7 +156,6 @@ describe('G5 web MCP + hooks', () => {
     await post(base, `/api/workspaces/${wsId}/mcp/fixture`, { transport: 'stdio', command: process.execPath, args: [mcpFixture], enabled: true, allowedTools: ['interactive'] })
     await post(base, `/api/workspaces/${wsId}/mcp/fixture/enable`)
     await fetch(`${base}/api/workspaces/${wsId}/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: 'full-access' }) })
-    await fetch(`${base}/api/workspaces/${wsId}/policy`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ policy: { 'mcp__fixture__*': 'allow', 'mcp__fixture__interactive': 'allow' } }) })
     const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
     const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${session.id}/events`)
     const reader = (response.body as ReadableStream).getReader()
@@ -226,11 +225,34 @@ describe('G5 web MCP + hooks', () => {
     const { home, base, wsId } = await boot(provider)
     const initFile = path.join(home, 'init-pids.txt')
     await post(base, `/api/workspaces/${wsId}/mcp/fixture`, { transport: 'stdio', command: process.execPath, args: [mcpFixture], env: { INIT_FILE: initFile }, enabled: true })
+    expect((await post(base, `/api/workspaces/${wsId}/mcp/fixture/enable`)).status).toBe(200)
     const sessions = await Promise.all(Array.from({ length: 5 }, async () => (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }))
     await Promise.all(sessions.map((session) => post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'go' })))
     await new Promise((resolve) => setTimeout(resolve, 500))
     const pids = (await fs.readFile(initFile, 'utf8')).trim().split(/\s+/).filter(Boolean)
     expect(new Set(pids).size).toBe(1)
+  }, 20_000)
+
+  it('treats an empty allowedTools list as every discovered tool', async () => {
+    const requests: string[][] = []
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream(request) {
+        requests.push(request.tools?.map((tool) => tool.name) ?? [])
+        yield { type: 'delta', delta: 'x' }
+      },
+    }
+    const { base, wsId } = await boot(provider)
+    const saved = await post(base, `/api/workspaces/${wsId}/mcp/fixture`, {
+      transport: 'stdio', command: process.execPath, args: [mcpFixture], enabled: true, allowedTools: [],
+    })
+    expect(saved.status).toBe(201)
+    expect((await post(base, `/api/workspaces/${wsId}/mcp/fixture/enable`)).status).toBe(200)
+    const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'hi' })
+    for (let i = 0; i < 50 && requests.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(requests[0]).toContain('mcp__fixture__query')
+    expect(requests[0]).toContain('mcp__fixture__interactive')
   }, 20_000)
 
   it('MCP schema and execution are isolated per workspace even with the same public name', async () => {
@@ -291,11 +313,8 @@ describe('G5 web MCP + hooks', () => {
     await new Promise((resolve) => setTimeout(resolve, 250))
     expect(requests[0]).not.toContain('mcp__fixture__query')
 
-    // Full access + explicit allow still cannot bypass host blockedTools.
+    // Full access still cannot bypass host blockedTools.
     await fetch(`${base}/api/workspaces/${wsId}/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: 'full-access' }) })
-    await fetch(`${base}/api/workspaces/${wsId}/policy`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ policy: { 'mcp__fixture__query': 'allow' } }) })
-    const result = await (await fetch(`${base}/api/workspaces/${wsId}/meta`)).json() as { policy: Record<string, string> }
-    expect(result.policy['mcp__fixture__query']).toBe('allow') // workspace says allow…
     const second = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
     await post(base, `/api/workspaces/${wsId}/sessions/${second.id}/messages`, { content: 'call blocked mcp' })
     let events: Record<string, unknown>[] = []
@@ -329,11 +348,10 @@ describe('G5 web MCP + hooks', () => {
         PreToolUse: [{ matcher: 'Edit', type: 'command', command: process.execPath, args: [hookFixture, 'rewrite'], timeoutMs: 2_000, onFailure: 'deny' }],
       } }),
     })
-    // Plan exposes Edit? Use full access, then explicit allow so approval
-    // doesn't mask the rewrite seam. No project means the root gate later
-    // fails closed, but the recorded intent is still the rewritten call.
+    // Full access allows Edit, so approval does not mask the rewrite seam. No
+    // project means the root gate later fails closed, but the recorded intent
+    // is still the rewritten call.
     await fetch(`${base}/api/workspaces/${wsId}/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: 'full-access' }) })
-    await fetch(`${base}/api/workspaces/${wsId}/policy`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ policy: { Edit: 'allow' } }) })
     const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
     await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'edit' })
     let events: Record<string, unknown>[] = []

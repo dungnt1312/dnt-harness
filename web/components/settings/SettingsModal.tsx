@@ -11,6 +11,7 @@ import { Field } from '../ui/Field.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Modal } from '../ui/Modal.tsx'
 import { Select } from '../ui/Select.tsx'
+import { Spinner } from '../common/Spinner.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
 import {
   createProvider,
@@ -34,7 +35,7 @@ import type { ModelSettings, ProjectRow, ProviderSummary } from '../../lib/types
 type SettingsTab = 'providers' | 'projects' | 'modes' | 'dangerous-commands' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'
 
 const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonly hint: string; readonly icon: IconName }[] = [
-  { id: 'providers', label: 'Providers', hint: 'Model endpoints, keys, and the default model for new conversations', icon: 'globe' },
+  { id: 'providers', label: 'Providers', hint: 'Model endpoints and keys', icon: 'globe' },
   { id: 'projects', label: 'Projects', hint: 'Folders conversations in this workspace can work in', icon: 'folder' },
   { id: 'modes', label: 'Modes', hint: 'What a conversation may read, edit, or run', icon: 'shield' },
   { id: 'dangerous-commands', label: 'Dangerous Commands', hint: 'Guard risky Bash commands before approval', icon: 'alertTriangle' },
@@ -58,14 +59,13 @@ interface Draft {
   readonly apiKey: string
   readonly enabled: boolean
   readonly models: readonly string[]
-  readonly defaultModel: string
   /** Working copy of the per-model overrides (context window, vision, thinking). */
   readonly modelSettings: Record<string, ModelSettings>
 }
 
-type Busy = 'save' | 'sync' | 'test' | 'delete' | 'activate' | null
+type Busy = 'save' | 'sync' | 'test' | 'delete' | null
 
-const BLANK: Draft = { name: '', baseUrl: '', apiKey: '', enabled: true, models: [], defaultModel: '', modelSettings: {} }
+const BLANK: Draft = { name: '', baseUrl: '', apiKey: '', enabled: true, models: [], modelSettings: {} }
 
 function draftOf(provider: ProviderSummary): Draft {
   return {
@@ -74,7 +74,6 @@ function draftOf(provider: ProviderSummary): Draft {
     apiKey: '',
     enabled: provider.enabled,
     models: provider.models,
-    defaultModel: provider.defaultModel ?? provider.models[0] ?? '',
     modelSettings: Object.fromEntries(Object.entries(provider.modelSettings ?? {}).map(([model, settings]) => [model, { ...settings }])),
   }
 }
@@ -117,7 +116,6 @@ export function SettingsModal({
   activeModel,
   onDismiss,
   onRefresh,
-  onSelectActive,
   workspaceId,
   initialTab = 'providers', workspaceName, projects = [], onProjectsChanged = async () => {}, sessionCounts = {},
 }: {
@@ -133,7 +131,6 @@ export function SettingsModal({
   readonly activeModel?: string
   readonly onDismiss: () => void
   readonly onRefresh: () => Promise<void>
-  readonly onSelectActive: (provider: string, model: string) => Promise<void>
 }) {
   const [pendingLeave, setPendingLeave] = useState<(() => void) | null>(null)
   const [tab, setTab] = useState<SettingsTab>('providers')
@@ -156,6 +153,13 @@ export function SettingsModal({
   const [editingModel, setEditingModel] = useState<string | null>(null)
   /** What the endpoint offered, awaiting the operator's selection. */
   const [syncOffer, setSyncOffer] = useState<readonly string[] | null>(null)
+  /**
+   * Per-model connection verdict, shown on the row it belongs to. Keyed by
+   * model so testing one row never rewrites another's result, and cleared
+   * whenever the draft changes because a verdict describes the saved
+   * configuration rather than edits still in flight.
+   */
+  const [modelTests, setModelTests] = useState<Record<string, { readonly status: 'testing' | 'ok' | 'bad'; readonly error?: string }>>({})
   const nameRef = useRef<HTMLInputElement | null>(null)
   const modelDraftRef = useRef<HTMLInputElement | null>(null)
   const nameFieldId = useId()
@@ -207,7 +211,6 @@ export function SettingsModal({
       draft.baseUrl !== base.baseUrl ||
       draft.apiKey !== '' ||
       draft.enabled !== base.enabled ||
-      draft.defaultModel !== base.defaultModel ||
       !sameList(draft.models, base.models) ||
       JSON.stringify(pruneSettings(draft.models, draft.modelSettings)) !== JSON.stringify(pruneSettings(base.models, base.modelSettings))
     )
@@ -224,12 +227,16 @@ export function SettingsModal({
     setModelDraft('')
     setAddingModel(false)
     setNotice(null)
+    setModelTests({})
   }
   if (!open) return null
 
   const patch = (next: Partial<Draft>): void => {
     setDraft((current) => ({ ...current, ...next }))
     setNotice(null)
+    // A verdict describes the configuration that was on disk when it ran, so
+    // any edit invalidates every row rather than leaving a stale "OK" behind.
+    setModelTests({})
   }
 
   const select = (provider: ProviderSummary): void => {
@@ -242,6 +249,7 @@ export function SettingsModal({
     setAddingModel(false)
     setEditingModel(null)
     setSyncOffer(null)
+    setModelTests({})
   }
 
   const beginNew = (): void => {
@@ -254,6 +262,7 @@ export function SettingsModal({
     setAddingModel(false)
     setEditingModel(null)
     setSyncOffer(null)
+    setModelTests({})
     nameRef.current?.focus()
   }
 
@@ -287,7 +296,6 @@ export function SettingsModal({
         baseUrl,
         enabled: draft.enabled,
         models: draft.models,
-        ...(draft.defaultModel !== '' ? { defaultModel: draft.defaultModel } : {}),
         // Always sent (even empty): the patch REPLACES the whole map, so an
         // empty object is how cleared overrides reach the server.
         modelSettings: pruneSettings(draft.models, draft.modelSettings),
@@ -321,13 +329,10 @@ export function SettingsModal({
       setSyncOffer(result.models)
     })
 
-  /** Apply the sync selection to the draft, keeping a valid provider default. */
+  /** Apply the sync selection to the draft. */
   const applySync = (models: readonly string[]): void => {
     setSyncOffer(null)
-    patch({
-      models,
-      defaultModel: models.includes(draft.defaultModel) ? draft.defaultModel : (models[0] ?? ''),
-    })
+    patch({ models })
   }
 
   /** Commit one model's dialog: an id change moves its overrides with it. */
@@ -337,11 +342,7 @@ export function SettingsModal({
     delete modelSettings[previous]
     if (Object.keys(settings).length > 0) modelSettings[id] = settings
     setEditingModel(null)
-    patch({
-      models,
-      modelSettings,
-      defaultModel: draft.defaultModel === previous ? id : draft.defaultModel,
-    })
+    patch({ models, modelSettings })
   }
 
   const test = (): Promise<void> =>
@@ -367,28 +368,46 @@ export function SettingsModal({
     })
 
   /**
-   * Why a model cannot become the global default yet, or null when it can.
-   * The server only accepts saved models of enabled providers.
+   * Why one model cannot be tested yet, or null when it can. A ping uses the
+   * SAVED provider entry, so unsaved edits — a new id, a changed key or URL —
+   * are not what would run; the operator must save them first.
    */
-  const globalDefaultBlocker = (model: string): string | null =>
+  const modelTestBlocker = (model: string): string | null =>
     selected === undefined ? 'Add the provider first.'
       : !selected.enabled ? 'Enable and save this provider first.'
         : !selected.models.includes(model) ? 'Save this model to the provider first.'
           : dirty ? 'Save or discard your changes first.'
-            : null
+            : busy !== null ? 'Another action is running.'
+              : null
 
-  const useForChat = (model: string): Promise<void> =>
-    run('activate', async () => {
-      if (selected === undefined || globalDefaultBlocker(model) !== null) return
-      await onSelectActive(selected.id, model)
-      setNotice({ kind: 'ok', text: `Global default is now ${selected.name} / ${model}.` })
-    })
+  const testModel = async (model: string): Promise<void> => {
+    if (selectedId === null || modelTestBlocker(model) !== null) return
+    setBusy('test')
+    setModelTests((all) => ({ ...all, [model]: { status: 'testing' } }))
+    // The verdict belongs to the row, so a refusal is caught here rather than
+    // escaping to the panel-level notice: a failed ping would otherwise read
+    // as the whole provider being broken and leave this row spinning forever.
+    try {
+      const result = await testProvider(selectedId, model)
+      setModelTests((all) => ({
+        ...all,
+        [model]: result.ok ? { status: 'ok' } : { status: 'bad', error: result.error ?? 'Connection failed.' },
+      }))
+    } catch (cause) {
+      setModelTests((all) => ({
+        ...all,
+        [model]: { status: 'bad', error: cause instanceof Error ? cause.message : String(cause) },
+      }))
+    } finally {
+      setBusy(null)
+    }
+  }
 
   const addModels = (): void => {
     const parsed = parseModels(modelDraft)
     if (parsed.length === 0) return
     const merged = [...new Set([...draft.models, ...parsed])]
-    patch({ models: merged, defaultModel: draft.defaultModel === '' ? (parsed[0] ?? '') : draft.defaultModel })
+    patch({ models: merged })
     setModelDraft('')
   }
 
@@ -397,7 +416,7 @@ export function SettingsModal({
     const { [name]: _dropped, ...modelSettings } = draft.modelSettings
     void _dropped
     if (editingModel === name) setEditingModel(null)
-    patch({ models, modelSettings, defaultModel: draft.defaultModel === name ? (models[0] ?? '') : draft.defaultModel })
+    patch({ models, modelSettings })
   }
 
   const activeTab = TABS.find((entry) => entry.id === tab)
@@ -502,7 +521,7 @@ export function SettingsModal({
                           className={`flex min-h-9 w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left hover:bg-hover ${isSelected ? 'bg-hover' : ''}`}
                         >
                           <span className="truncate text-sm">{provider.name}</span>
-                          {provider.id === activeProvider ? <Badge title="Provides the default model for new conversations">default</Badge> : null}
+                          {provider.id === activeProvider ? <Badge title="Currently used for new conversations">in use</Badge> : null}
                           <span className={`ml-auto size-2 shrink-0 rounded-full ${provider.enabled ? 'bg-ok' : 'bg-line-strong'}`} aria-hidden="true" />
                           <span className="sr-only">{provider.enabled ? 'Enabled' : 'Disabled'}</span>
                         </button>
@@ -589,28 +608,21 @@ export function SettingsModal({
                     ) : (
                       <ul className="m-0 flex list-none flex-col gap-1.5 p-0">
                         {draft.models.map((model) => {
-                          const isDefault = model === draft.defaultModel
                           const isLive = selected?.id === activeProvider && model === activeModel
                           const settings = draft.modelSettings[model]
                           const context = modelContext(model, settings)
+                          const verdict = modelTests[model]
+                          const blocker = modelTestBlocker(model)
+                          const canTest = blocker === null && verdict?.status !== 'testing'
                           return (
                             <li key={model} className="flex flex-col">
                               {/* One pill per model, metadata right-aligned inside it and
                                   actions outside: 40 rows of an endpoint's catalog stay
                                   scannable by id instead of by chip soup. */}
                               <div className="flex min-w-0 items-center gap-1">
-                                <button
-                                  type="button"
-                                  aria-pressed={isDefault}
-                                  aria-label={isDefault ? `${model} is this provider's default model` : `Make ${model} this provider's default model`}
-                                  title={isDefault ? "This provider's default model" : "Make this the provider's default model"}
-                                  onClick={() => patch({ defaultModel: model })}
-                                  className={`flex size-7 shrink-0 items-center justify-center rounded-md hover:bg-hover ${isDefault ? 'text-fg' : 'text-fg-faint'}`}
-                                >
-                                  <Icon name={isDefault ? 'circleDot' : 'circle'} size={15} />
-                                </button>
                                 <span className="flex min-w-0 flex-1 items-center gap-2 rounded-lg border border-line bg-surface px-3 py-2">
                                   <code className="min-w-0 flex-1 break-all font-mono text-[13px]">{model}</code>
+                                  {isLive ? <Badge tone="green" title="Used for new conversations">in use</Badge> : null}
                                   {modelVision(model, settings) === true ? <Badge tone="blue">Vision</Badge> : null}
                                   <Badge
                                     tone={context.overridden ? 'blue' : 'gray'}
@@ -622,27 +634,24 @@ export function SettingsModal({
                                   </Badge>
                                 </span>
                                 <span className="flex shrink-0 items-center gap-0.5">
-                                  {isLive ? (
-                                    <span className="flex size-8 items-center justify-center text-ok" title="Global default: used for new conversations">
-                                      <Icon name="pin" size={15} />
-                                      <span className="sr-only">Global default</span>
-                                    </span>
-                                  ) : (
-                                    <IconButton
-                                      label="Set as global default"
-                                      disabled={busy !== null || globalDefaultBlocker(model) !== null}
-                                      title={globalDefaultBlocker(model) ?? 'Use this model for new conversations'}
-                                      onClick={() => void useForChat(model)}
-                                    >
-                                      <Icon name="pin" size={15} />
-                                    </IconButton>
-                                  )}
+                                  <IconButton
+                                    label={verdict?.status === 'testing' ? `Testing ${model}` : `Test model ${model}`}
+                                    disabled={!canTest}
+                                    onClick={() => void testModel(model)}
+                                  >
+                                    {verdict?.status === 'testing' ? <Spinner size={14} /> : <Icon name="zap" size={15} />}
+                                  </IconButton>
                                   <IconButton label={`Edit ${model} settings`} onClick={() => setEditingModel(model)}>
                                     <Icon name="sliders" size={15} />
                                   </IconButton>
                                   <IconButton label={`Remove model ${model}`} onClick={() => dropModel(model)}><Icon name="trash" size={15} /></IconButton>
                                 </span>
                               </div>
+                              {verdict?.status === 'ok' ? (
+                                <p className="m-0 mt-1 flex items-center gap-1.5 pl-1 text-[12px] text-ok" role="status"><Icon name="check" size={13} />Model replied.</p>
+                              ) : verdict?.status === 'bad' ? (
+                                <div className="mt-1"><ErrorNotice raw={verdict.error ?? 'Connection failed.'} /></div>
+                              ) : null}
                             </li>
                           )
                         })}
@@ -650,7 +659,7 @@ export function SettingsModal({
                     )}
 
                     {addingModel || modelDraft !== '' ? (
-                      <div className="ml-8 flex gap-2">
+                      <div className="flex gap-2">
                         <TextInput
                           ref={modelDraftRef}
                           mono

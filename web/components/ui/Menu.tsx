@@ -21,7 +21,8 @@ export function Menu({ label, trigger, triggerClassName, panelClassName, panelRo
   return (
     <Popover.Root open={open} onOpenChange={setOpen}>
       <Popover.Trigger asChild>
-        <button type="button" disabled={disabled} className={triggerClassName} aria-label={label} aria-haspopup={panelRole}>
+        {/* `title` mirrors the label so an icon-only chip still names itself on hover. */}
+        <button type="button" disabled={disabled} className={triggerClassName} title={label} aria-label={label} aria-haspopup={panelRole}>
           {trigger(open)}
         </button>
       </Popover.Trigger>

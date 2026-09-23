@@ -49,7 +49,7 @@ Flags for `src/bins/headless.ts`:
 | Flag | Meaning |
 |---|---|
 | `--mock` | force the scripted mock provider |
-| `--yolo` | allow every tool call (no approval prompts) |
+| `--yolo` | allow unnamed tools / skip mode ask defaults (host blocks, exposure, and interactive MCP still apply) |
 | `--root DIR` | workspace root for the filesystem tools |
 | `--message TEXT` | one-shot mode instead of the REPL |
 
@@ -127,6 +127,10 @@ export function apply(ctx: Context): void {
   })
 }
 ```
+
+## MCP production migration
+
+`npx tsx src/bins/migrate-mcp.ts --data-dir <home> --workspace <id>` prints a dry run and does not spawn a server or open a network connection. Add `--apply` to write a checksummed backup and a v2 document. Omitted `enabled` is quarantined off. A legacy `oauth` block becomes an external token, not a managed session. The web bin refuses to start when `mcp-compatibility.json` asks for a newer safety kernel than this binary has. Protocol pin, outcomes, and the route inventory are in `docs/decisions/mcp-production-boundaries.md`.
 
 ### Composing from a YAML file
 

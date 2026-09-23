@@ -6,11 +6,11 @@ import { AttachmentTray } from './AttachmentTray.tsx'
 import { CompletionPopover } from './CompletionPopover.tsx'
 import { AttachMenu, ControlsStatus, ModeMenu } from './ComposerControls.tsx'
 import { ComposerNotices, type ComposerNotice } from './ComposerNotices.tsx'
-import { PolicyPopover } from './PolicyPopover.tsx'
 import { RichInput, type CaretBookmark, type RichInputHandle } from './RichInput.tsx'
 import { ThinkingMenu } from './ThinkingMenu.tsx'
 import { SAFE_MODEL_VISIBLE_BYTES, utf8Bytes } from './paste-classification.ts'
 import { useUploadQueue } from './useUploadQueue.ts'
+import { cn } from '../../lib/cn.ts'
 import { decodeModelChoice } from '../../lib/providers.ts'
 import {
   completionAt,
@@ -76,9 +76,9 @@ const pastedTextFile = (text: string, date = new Date()): File => {
 
 /**
  * Message composer: notices, the attachment tray and a rich input over a
- * control row — attach, mode, thinking and permissions on the left; the
- * model picker, Stop and Send/Queue on the right. The conversation's folder
- * lives in the chat header, not here.
+ * control row — attach, mode and thinking on the left; the model picker, Stop
+ * and Send/Queue on the right. The conversation's folder lives in the chat
+ * header, not here.
  *
  * Enter sends and Shift+Enter breaks a line; Ctrl/Cmd+Enter always sends.
  * While a turn runs, sending queues a follow-up. The input is disabled only by
@@ -90,16 +90,14 @@ const pastedTextFile = (text: string, date = new Date()): File => {
  * be put back inline; ArrowUp on an empty draft recalls the last message.
  */
 export function Composer({
-  policy, workspaceId = null, onPolicySaved, modelControl, connected, sending = false, running,
+  workspaceId = null, modelControl, connected, sending = false, running,
   draft, onDraft, onSend, onStop,
   modelValue, thinkingValue = null, modelSettings, onThinking, thinkingMenuLabel, thinkingDisabled = false,
   controlsUnavailable = false, controlsUnavailableMessage, onRetryControls,
   modes, modeValue, onMode,
   onSearchFiles, onUploadFiles, skills, onRecallLast, autoFocus = false,
 }: {
-  readonly policy?: Record<string, string> | undefined
   readonly workspaceId?: string | null
-  readonly onPolicySaved?: () => void
   /** Model picker, owned by the app; shown beside Send. */
   readonly modelControl?: ReactNode
   readonly sending?: boolean
@@ -422,7 +420,7 @@ export function Composer({
   const describedBy = [missingModel ? modelHintId : null, showBlocked ? hintId : null].filter((id) => id !== null).join(' ')
 
   const placeholder = missingModel
-    ? 'Configure a provider in Settings first…'
+    ? 'Draft now — configure a provider in Settings to send…'
     : running
       ? 'Queue a follow-up…'
       : !connected
@@ -432,7 +430,9 @@ export function Composer({
 
   return (
     <form
-      className="relative flex flex-col rounded-[28px] border border-line bg-composer shadow-composer transition-colors focus-within:border-line-strong dark:border-transparent dark:focus-within:border-line-strong"
+      // A container, so the footer answers to the composer's own width: the
+      // column is far narrower than the viewport whenever the sidebar is open.
+      className="@container relative flex flex-col rounded-[28px] border border-line bg-composer shadow-composer transition-colors focus-within:border-line-strong dark:border-transparent dark:focus-within:border-line-strong"
       aria-busy={uploading || undefined}
       onSubmit={(event) => { event.preventDefault(); submit() }}
     >
@@ -466,7 +466,9 @@ export function Composer({
         draft={draft}
         autoFocus={autoFocus}
         placeholder={placeholder}
-        disabled={missingModel}
+        // Never locked by product state: a draft can be written (and kept)
+        // while a provider is still being configured. Send is the only gate.
+        disabled={false}
         ariaLabel="Message"
         expanded={open}
         {...(open ? { listId } : {})}
@@ -480,12 +482,15 @@ export function Composer({
         // An oversized paste stays inline; the draft itself raises the notice.
         onPasteError={() => {}}
       />
-      <div className="flex items-center gap-1 px-2.5 pb-2.5">
-        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-0.5">
+      {/* One row once the composer itself is wide enough for six controls,
+          two deliberate rows below that. The left cluster keeps its natural
+          width and the right one absorbs the squeeze, so a long model name
+          truncates instead of dropping every chip onto a line of its own. */}
+      <div className="flex flex-col gap-1.5 px-2.5 pb-2.5 @min-[30rem]:flex-row @min-[30rem]:items-center @min-[30rem]:gap-1">
+        <div className="flex min-w-0 flex-none items-center gap-0.5">
           {onUploadFiles !== undefined || onSearchFiles !== undefined ? (
             <AttachMenu
               uploading={uploading}
-              disabled={missingModel}
               onUpload={onUploadFiles !== undefined ? () => fileInput.current?.click() : undefined}
               onMention={onSearchFiles !== undefined ? mentionFile : undefined}
             />
@@ -494,6 +499,12 @@ export function Composer({
           {controlsUnavailable && controlsUnavailableMessage !== undefined ? (
             <ControlsStatus message={controlsUnavailableMessage} onRetry={onRetryControls} />
           ) : null}
+        </div>
+        {/* The run cluster sits next to Send: the model answers, and the
+            thinking level is the model's own control — its levels come from
+            that model's capability, so the two belong side by side. */}
+        <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5">
+          {modelControl}
           {modelId !== null && onThinking !== undefined ? (
             <ThinkingMenu
               model={modelId}
@@ -504,14 +515,6 @@ export function Composer({
               onSelect={onThinking}
             />
           ) : null}
-          <PolicyPopover
-            {...(policy !== undefined ? { policy } : {})}
-            workspaceId={workspaceId}
-            {...(onPolicySaved !== undefined ? { onSaved: onPolicySaved } : {})}
-          />
-        </div>
-        <div className="flex min-w-0 shrink-0 items-center gap-1.5">
-          {modelControl}
           {onUploadFiles !== undefined ? (
             <input
               ref={fileInput}
@@ -534,20 +537,26 @@ export function Composer({
               aria-label="Stop work"
               title="Stop"
               onClick={onStop}
-              className="flex size-9 items-center justify-center rounded-full border border-line-strong text-fg hover:bg-hover"
+              className="flex size-9 shrink-0 items-center justify-center rounded-full border border-line-strong text-fg hover:bg-hover"
             >
               <Icon name="square" size={16} />
             </button>
           ) : null}
           {!running || !empty ? (
+            // While a turn runs the same button queues instead of sending, so
+            // it says so: an identical arrow would read as "sent now".
             <button
               type="submit"
               aria-label={running ? 'Queue message' : 'Send'}
               title={running ? 'Queue — runs after the current turn (Enter)' : 'Send (Enter) · Shift+Enter for a new line'}
               disabled={!eligible || sending}
-              className="flex size-9 items-center justify-center rounded-full bg-primary text-primary-fg transition-opacity hover:opacity-85 disabled:opacity-30"
+              className={cn(
+                'flex min-h-9 shrink-0 items-center justify-center gap-1.5 rounded-full bg-primary text-primary-fg transition-opacity hover:opacity-85 disabled:opacity-30',
+                running ? 'px-3' : 'size-9',
+              )}
             >
-              {sending ? <Spinner size={14} className="border-primary-fg/40 border-t-primary-fg" /> : <Icon name="arrowUp" size={18} strokeWidth={2.2} />}
+              {sending ? <Spinner size={14} className="border-primary-fg/40 border-t-primary-fg" /> : <Icon name={running ? 'clock' : 'arrowUp'} size={running ? 15 : 18} strokeWidth={2.2} />}
+              {running ? <span className="text-[13px] font-medium">Queue</span> : null}
             </button>
           ) : null}
         </div>

@@ -1,6 +1,6 @@
 # The web host
 
-The web host exposes the harness over HTTP. `createWebServer()` boots a fresh
+The web host exposes the harness over HTTP. When `controlPlaneAuth` is on, privileged routes answer 401 until a single-use pairing code is redeemed; cookie mutations also need the CSRF header and the canonical Origin. It is off by default — the listener is loopback-only, so a local run already reaches no further than this machine's user; `--auth` turns it on for a port shared beyond that user. `createWebServer()` boots a fresh
 kernel, mounts the harness services, registers the provider and tools, attaches
 an approval policy whose answerer routes questions over SSE, and serves the
 built React client.
@@ -39,10 +39,13 @@ UI from it at any time.
 - The sidebar footer owns workspace selection; the sidebar also groups project history and search. History filters only affect navigation, never a session's immutable execution project.
 - The Context sheet starts closed at every viewport size. Context manifests load only while it is open. The main pane shows durable task lifecycle and separately explains event-stream connection loss. Queued/being-submitted inputs show preparing; open turns show running or waiting approval; terminal reasons remain visible. Partial assistant chunks stop appearing live at turn end.
 - Composer is a contenteditable with inline chips: `@` lists files from the conversation's project (bounded search that never follows symlinks or walks hidden/`node_modules` trees) and inserts a mention chip rendered where the caret was; `/` at the start inserts a skill invocation phrase as plain text; `+` attaches a project file (reference chip) or an uploaded file (stored blob chip), and pasted/dropped images become attachment chips. Neither completion nor attachment grants a permission, reads a file, or pins a skill by itself. Both menus stay shut without a source, are driven from the contenteditable (a combobox with `aria-activedescendant`), and Escape closes them until the query changes. Removing a chip removes exactly that segment; ArrowUp on an empty composer brings back the newest own message; unsent drafts (text plus chips) survive a reload.
-- Composer context shows the fixed project path or an explicit no-project warning with a new-conversation CTA. “Chat-only” describes absence of a project, not an automatic switch to Chat mode or a promise to disable every tool. Model and thinking controls belong to the conversation and apply at its next request (the no-conversation pickers write the global default for future sessions); mode and policy remain workspace-scoped and apply at the next request/tool gate. Expand scope details to inspect the reported policy; mode and server restrictions still apply.
-- Approval review exposes tool name, target, full escaped JSON arguments, call ID and conversation project. **Allow once** and **Deny** answer only that pending request, not a remembered grant. Buttons lock while submitting; failed submissions remain visible. Durable decisions remain in transcript history, including expiry/invalidation. No UI option widens backend permission scope.
+- Composer context shows the fixed project path or an explicit no-project warning with a new-conversation CTA. “Chat-only” describes absence of a project, not an automatic switch to Chat mode or a promise to disable every tool. Model and thinking controls belong to the conversation and apply at its next request (the no-conversation pickers write the global default for future sessions); the selected mode governs permissions at the next request/tool gate. Mode and server restrictions still apply.
+- The composer footer is grouped by what each control decides, not by control type: attach and mode sit on the left, while the model and its thinking level — whose available levels come from that model — sit together on the right next to Send. The footer answers to the composer's own width (a container query, because the column is far narrower than the viewport with the sidebar open): one row when controls fit, otherwise two deliberate rows rather than a ragged wrap. When the row is tight the model name truncates and nothing else does, and it never truncates to nothing.
+- Approval review exposes tool name, target, full escaped JSON arguments, call ID, conversation project and the window the request cancels itself in. **Allow once** and **Deny** answer only that pending request. It does not widen host `blockedTools`, mode exposure, or project root. Interactive MCP tools keep asking. Child-agent questions relay onto the parent conversation, labelled with the child's agent name and id. Buttons lock while submitting; failed submissions remain visible. Durable decisions remain in transcript history, including expiry/invalidation.
+- The selected mode is the workspace's permission truth. Its `permissionDefaults` decide each tool; `--yolo` is stated on the trigger and maps asks to allows, but never lifts an explicit deny.
 - Failed, cancelled, limited and interrupted work offers inspection-first recovery guidance. Unknown recovered tool results are explicitly called out. There is no automatic retry or replay control: inspect actual effects, then submit new instructions limited to remaining work.
-- Settings distinguish global provider storage plus the global default model from workspace services. Agent definitions are workspace-scoped; child listings are current-session-scoped. Saving configuration is not evidence of connectivity; provider connection checks use saved configuration rather than unsaved drafts.
+- The Providers pane states each fact once. The provider name is its editable title (rename in place) with enablement as a state pill plus the opposite verb, and delete lives on that title row; the rail carries the name, the `default` marker and the enabled dot. A model row is one pill — id, `Vision` when it accepts images, its context window — with the provider-default radio and the global-default, edit and remove actions beside it. Per-model overrides open in **Edit model settings**, committed or abandoned as one decision: id (renaming carries its overrides), context window, input types — text is shown locked because every model takes it, image is a checkbox whose state is the effective one, with a link back to the catalog default once it is overridden — and thinking default. **Sync from /models** probes the endpoint and opens a selection: checked models are kept, unchecking one removes it, models the endpoint does not offer are left alone, and nothing is stored until Save.
+- Settings distinguish global provider storage plus the global default model from workspace services. **Modes** sits after Projects in the Workspace group: its structured editor loads a workspace file into a form (name, instructions, context sources, tool exposure, per-key permissions), saves existing files with `expectedHash`, and offers Reload or an overwrite that first reloads the fresh hash after a conflict. Its catalog puts bundled read-only modes first (Duplicate only), then workspace modes (Edit/Delete); every row can be disabled, which hides the mode from the composer picker until re-enabled. It plainly lists each `permissionDefaults` key including `*` and MCP patterns. A saved mode change applies only when the mode is next selected; deleting the selected file likewise leaves the workspace's active cached snapshot active until another mode is selected. Agent definitions are workspace-scoped; child listings are current-session-scoped. Saving configuration is not evidence of connectivity; provider connection checks use saved configuration rather than unsaved drafts.
 - Automated workflow regressions cover scope validation, creation markup, durable lifecycle, stopped partial chunks, recovery guidance and approval arguments/decision rendering. Fixture-backed Chromium interactions, mobile layout, keyboard focus and all settings sections pass. Real-backend end-to-end workflows, native zoom and screen-reader acceptance remain separate gates.
 
 ## Starting it
@@ -58,7 +61,8 @@ The web bin (`src/bins/web.ts`) accepts:
 |---|---|---|
 | `--port N` | HTTP port | `3082` |
 | `--root DIR` | default workspace root | `process.cwd()` |
-| `--yolo` | allow every tool call (no approval questions) | off |
+| `--yolo` | map selected-mode `ask` permissions to `allow`, while preserving explicit `deny` (host `blockedTools`, exposure, child ceilings, and interactive MCP still apply) | off |
+| `--auth` | require control-plane pairing; the startup line then prints a single-use code (`MINI_DSH_AUTH=1` does the same, `--no-auth` overrides it) | off |
 
 The server always boots even with no provider configured, so the Settings panel
 can add one. `DEEPSEEK_API_KEY` seeds a `deepseek` entry on first boot; a blank
@@ -83,16 +87,17 @@ model selection:
     "baseUrl": "https://api.deepseek.com",
     "apiKey": "sk-…",
     "models": ["deepseek-chat", "deepseek-reasoner"],
-    "defaultModel": "deepseek-chat",
     "enabled": true
   }]
 }
 ```
 
-A legacy bare-array file migrates transparently on load (first enabled
-provider, preferring its `defaultModel`, then its first model); secrets and
-per-model settings are preserved. All provider/default mutations run through
-one serialized, persist-before-publish transaction.
+Only the versioned envelope is accepted; any other shape loads as an empty
+store, and a stale `defaultModel` field on a provider entry is ignored rather
+than honored. Model choice is never stored per provider — a provider's
+`models[0]` is just the first id it advertises, used only as a last-resort
+fallback. All provider/default mutations run through one serialized,
+persist-before-publish transaction.
 
 Every endpoint speaks the standard `POST {baseUrl}/chat/completions` SSE wire
 format (tool-call fragment accumulation, `reasoning_content` → thinking
@@ -125,12 +130,13 @@ tool root. The families, at a glance:
 | `…/:wid/sessions/:id/manifest`, `…/compact` | per-request context manifest; manual compaction into an immutable checkpoint |
 | `GET/PUT /api/model-defaults` | the **global** default provider/model/thinking level, shared by every workspace: the pair new sessions snapshot at creation, the draft pickers' target, and the live fallback for legacy conversations without a snapshot |
 | `PUT …/:wid/model`, `PUT …/:wid/thinking` | compatibility proxies: they verify workspace ownership, then mutate the **global** default above; new clients use `/api/model-defaults` |
-| `PUT …/:wid/policy`, `PUT …/:wid/mode`, `GET …/:wid/meta` | the workspace-local live controls (policy, mode) and workspace meta (global defaults, projects, providers) |
+| `PUT …/:wid/mode`, `GET …/:wid/meta` | workspace-local mode control. The selected mode is the sole permission source. The `GET …/mode` catalog lists **enabled modes only** (a disabled mode refused for selection answers `400`); `GET …/meta` returns the selected mode's `permissionDefaults`, `mode`, and `yolo` when enabled; it does not return a policy or effective-policy overlay. |
+| `GET …/:wid/modes`, `GET/PUT/DELETE …/:wid/modes/:mid`, `POST …/:wid/modes/:mid/duplicate`, `PUT …/:wid/modes/:mid/enabled` | mode **authoring**, separate from the selection control above. The catalog carries each mode's `enabled` flag, `toolExposure`, and `permissionDefaults`; the single-mode read returns raw Markdown plus a hash, and `PUT` takes `{ content, expectedHash? }` (required when replacing an existing file). Bundled modes are read-only (`400`), a stale or missing update hash is `409`, and invalid content is rejected before anything is written. `PUT …/enabled` takes `{ enabled: boolean }`: it shows or hides a mode in this workspace's picker — bundled modes may be hidden too, disabling the currently selected mode is `409` (select another first), the disabled set persists beside the mode files, and saving a mode always re-enables it. Editing a selected mode applies only when it is **re-selected**: the live selection retains its cached snapshot. Deleting that selected file also leaves its cached snapshot active, but its deleted id cannot be selected again; select another mode instead. |
 | `…/:wid/projects` (+ `/projects/:pid`) | project binding: working folder, ownership, overlap rejection |
 | `GET …/:wid/projects/:pid/(files\|file\|search)` | read-only project browsing: one directory listing, one file body, and a bounded file-name search for composer mentions |
 | `…/:wid/terminals` (+ `/events` SSE, `/:tid` DELETE, `/:tid/(input\|resize)`) | interactive Workbench terminals: PTY lifecycle, one multiplexed output stream per workspace — see the terminal section |
 | `POST …/:wid/attachments`, `GET …/:wid/attachments/:id` | composer attachments: upload (content-addressed by sha256, verified media type) and serve (immutable, workspace-scoped) |
-| `…/:wid/agents/:name` (GET resolve / DELETE), `POST …/:wid/agents/:name` | agent definitions; POST spawns a bounded child with a task packet |
+| `…/:wid/agents/:name` (GET resolve / DELETE), `POST …/:wid/agents/:name` | agent definitions; POST spawns a bounded child with a task packet, optionally `model` (`provider:model`) and `grantTools` |
 | `GET …/:wid/agents/children?root=…`, `GET/DELETE …/:wid/children/:childId` (+ `/cancel`) | child list / wait-result / cancel |
 | `…/:wid/mcp` (+ `/:server` GET/POST/DELETE, `/:server/(enable\|disable\|reconnect)`, `/mcp/import`) | MCP server lifecycle, stored config for editing, deletion, and imports with provenance |
 | `…/:wid/hooks`, `…/:wid/secrets(/:key)` | hook bindings; encrypted secret management (masked responses) |
@@ -198,7 +204,7 @@ variable — no re-registration, and the change applies to the next tool call.
 
 ### `GET /api/providers`
 
-List configured providers with masked keys: `[{ id, name, baseUrl, enabled, keyMasked, models, defaultModel?, modelSettings? }]`.
+List configured providers with masked keys: `[{ id, name, baseUrl, enabled, keyMasked, models, modelSettings? }]`.
 `modelSettings` carries per-model operator overrides —
 `{ [model]: { contextTokens?, vision?, thinkingLevel? } }` — as edited in the
 Settings provider panel (legacy `contextLimits` files migrate into it on load).
@@ -212,7 +218,7 @@ is then omitted entirely rather than sent as an empty `Bearer`). `201 { id, … 
 
 ### `PATCH /api/providers/:id`
 
-Update fields: `{ name?, baseUrl?, apiKey?, enabled?, models?, defaultModel?, modelSettings? }`.
+Update fields: `{ name?, baseUrl?, apiKey?, enabled?, models?, modelSettings? }`.
 Omitting `apiKey` keeps the stored secret. A present `modelSettings` **replaces
 the whole map** (an empty object clears every override). `404` on an unknown id.
 
@@ -223,12 +229,29 @@ active pair to the first remaining usable one. `404` on an unknown id.
 
 ### `POST /api/providers/:id/test`
 
-Fire one buffered completion ping. `200 { ok: true }` or `502 { ok: false, error }`.
+Fire one buffered completion ping. Body `{ model? }` names the exact model to
+ping — this is how the Settings model list verifies one row — and an
+unadvertised id is `400` rather than a misleading upstream `404`. Without a
+body the provider's first advertised model stands in, falling back to `test`
+when it advertises none yet, so a freshly added provider can check its endpoint
+and key before any sync. `200 { ok: true }` or `502 { ok: false, error }`.
+
+### `GET /api/providers/:id/models`
+
+Ask the endpoint what it offers and **store nothing** (accepts OpenAI
+`{ data: [{ id }] }` and bare arrays). `200 { ok: true, models }`, `404` for an
+unknown provider, `502` when the endpoint fails or answers an empty list.
+
+This is what the browser's **Sync from /models** uses: the answer is a proposal
+the operator selects from, and the selection saves through the ordinary
+`PATCH /api/providers/:id` with everything else on the form. A list nobody
+confirmed can never replace the stored models.
 
 ### `POST /api/providers/:id/sync`
 
-`GET {baseUrl}/models` and store the result as the provider's model list
-(accepts OpenAI `{ data: [{ id }] }` and bare arrays). `200 { ok: true, models }`.
+`GET {baseUrl}/models` and store the whole result as the provider's model list,
+in one request. `200 { ok: true, models }`. Kept for REST clients that want the
+unattended behavior; the browser uses the probe above instead.
 
 ### Model catalog, context budget, and thinking level
 
@@ -313,8 +336,17 @@ serialized provider-store transaction and is published only after the disk
 commit succeeds, so a failed write leaves providers, defaults, and runtime
 registrations untouched. Provider create/patch/delete/sync repair the
 default in the same transaction: a deleted/disabled provider or a removed
-model falls back to the next enabled provider's `defaultModel`, then its
-first model; with no usable provider the default is explicitly blank.
+model falls back to the next enabled provider's first advertised model; with
+no usable provider the default is explicitly blank.
+
+The global pair doubles as the "model last chosen" pointer: adopting a
+provider/model in any conversation — or setting it explicitly — repoints the
+global default to that pair, so the next conversation opens on the model the
+operator was just using and never re-picks for them. A thinking-only edit does
+not repoint it, because a thinking level is conversation-scoped rather than a
+global preference. Selecting a provider in `PUT /api/model` (or a workspace
+model route) requires an explicit `model`: an inferred model would silently
+run and bill something the operator never named.
 
 `GET …/:wid/meta` returns the same global pair to every workspace, so the
 client's no-conversation pickers target `/api/model-defaults` directly.
@@ -414,7 +446,9 @@ Streams `text/event-stream` frames. Each frame is a `data:` line holding one
 type WebEnvelope =
   | { kind: 'snapshot', events: SessionEvent[] }     // full log replay on connect
   | { kind: 'session',  event: SessionEvent }         // one live durable event
-  | { kind: 'approval', approvalId: string, call: ToolCall }  // a pending question
+  | { kind: 'approval', approvalId: string, call: ToolCall, expiresAt?: number,
+      interactive?: boolean, childSessionId?: string, definitionName?: string }
+  | { kind: 'approval-settled', approvalId: string }
 ```
 
 - After the initial snapshot, live events are relayed until the client
@@ -426,6 +460,30 @@ type WebEnvelope =
 - Thinking-capable models stream `assistant/chunk` frames marked
   `"thinking": true`; the client renders them in a collapsible thinking panel
   and they never enter model history.
+- An `approval` frame carries `expiresAt` from the policy's own timer, so the
+  question shows the window it must be decided inside instead of a card that
+  silently disappears. A question rebuilt from a log snapshot has no deadline
+  and shows none. `definitionName` accompanies `childSessionId` so a relayed
+  question names the agent that asked, not just its id.
+
+## The perimeter: loopback, and optional control-plane auth
+
+With `controlPlaneAuth` off, these routes carry no login. What stands between
+them and the outside is the bind address, the `Host` allowlist, and the
+cross-site write guard below. Anyone who can reach the port can send a message
+that executes tools, so the port is the boundary: keep it on loopback.
+
+With `controlPlaneAuth` on (`--auth`), privileged REST and SSE answer `401`
+until a browser redeems the single-use pairing code, or a CLI presents a scoped
+bearer. Cookie mutations also need the CSRF header and the canonical Origin.
+That still does not protect against same-user malware or same-origin XSS, and
+it is not an authenticated TLS profile.
+
+A non-loopback `host` is **refused before anything is constructed**. This build
+has no authenticated TLS profile, so `unsafeNetworkBind` does not open a
+network bind. To reach the app from another machine, keep the server on
+loopback and put an authenticated reverse proxy in front (add the proxy's name
+to `allowedHosts`); terminals stay `403` on any non-loopback bind either way.
 
 ## The `Host` allowlist
 
@@ -439,13 +497,25 @@ loopback never kept a visited page out; refusing unknown `Host` values does.
 The page is covered as well as the API, because the page is what would carry
 an attacker's script.
 
-The hole predates the terminal and spans the whole host — `PUT …/policy`
-followed by a message already reached the `Bash` tool — but a terminal turns it
-into a single silent step with no approval prompt, which is why the guard
-landed with this feature rather than after it.
+The hole predates the terminal and spans the whole host — a cross-site mode
+selection followed by a message could reach the `Bash` tool — but a terminal
+turns it into a single silent step with no approval prompt, which is why the
+guard landed with this feature rather than after it.
 
 Set `allowedHosts` when the host legitimately answers to a LAN name or sits
 behind a reverse proxy; `127.0.0.1`, `::1` and `localhost` need no entry.
+
+## The cross-site write guard
+
+The `Host` allowlist stops a rebound name, but not an ordinary cross-site
+write: a `text/plain` POST is a *simple request*, so it is never preflighted,
+and a page the user merely visited does not need to read the response to change
+state here. So every method other than `GET`/`HEAD` is refused with `403` when
+it carries an `Origin` whose `host:port` is not this server's (an opaque
+`null` origin included).
+
+A request with **no** `Origin` is left alone: that is curl, the tests, and any
+non-browser client, none of which a foreign page can impersonate.
 
 ## Workbench terminals
 
@@ -469,7 +539,13 @@ boundaries matter more than the feature:
   large file would break snapshot replay. Scrollback lives in a 256 KB
   in-memory ring per terminal: a page reload replays it and reattaches, a host
   restart does not.
-- **Bounded.** Four terminals per workspace; output is coalesced into 16 ms
+- **Per project.** A terminal records the project it was opened for and starts
+  in that project's folder (the host's `--root` when no project is open). The
+  panel shows only the open project's shells and opens one for a project that
+  has none; switching projects never surfaces another project's shell. The
+  shell can still `cd` afterwards — the binding says where it belongs.
+- **Bounded.** Four terminals per workspace, whichever project they belong to;
+  output is coalesced into 16 ms
   frames and a flush past 1 MB is dropped with an
   `[output truncated: too fast]` marker; a terminal idle for 30 minutes is
   reaped. `server.close()` kills every PTY, so none outlives the host.
@@ -519,19 +595,20 @@ reads the **ambient agent scope** (`agentScope`, an `AsyncLocalStorage`) that
 `Agent.run()` populates while a turn is in flight:
 
 ```ts
-askUser: (call) => new Promise<boolean>((resolve) => {
+askUser: (call, lifecycle) => new Promise<boolean>((resolve) => {
   const scope = agentScope.getStore()
   if (scope === undefined) { resolve(false); return }   // fail closed
-  const approvalId = `approval-${randomUUID()}`          // unguessable capability
-  pending.set(approvalId, { sessionId: scope.sessionId, call, resolve })
-  kernel.ctx.emit('web/approval', { sessionId: scope.sessionId, approvalId, call })
+  pending.set(lifecycle.approvalId, { sessionId: scope.sessionId, workspaceId, call, resolve })
+  kernel.ctx.emit('web/approval', { sessionId: scope.sessionId, parentSessionId, approvalId: lifecycle.approvalId, call })
 })
 ```
 
-Each session's SSE stream filters `web/approval` by its own id, so **concurrent
-sessions share one policy listener without cross-talk**. The default policy
-allows `Read`/`Glob`/`Grep` and asks on `Write`/`Edit`/`Bash` (canonical
-identities); `--yolo` makes the default mode `allow`.
+Each session's SSE stream filters `web/approval` by its own id **or** as the
+parent of a child that is waiting, so **concurrent sessions share one policy
+listener without cross-talk** and a child ask is answerable on the root
+conversation. The selected mode's permission defaults are the sole policy
+layer. `--yolo` changes asks to allows but preserves explicit denies; interactive
+MCP still asks.
 
 ## Static serving
 
@@ -598,7 +675,10 @@ are Files, Context, Artifacts, Agents and Terminal. Files is the anchor tab; the
 rest are opened on demand from the nav's `+` picker and closed again from their
 tab, so the strip keeps room for opened file tabs. Files and Artifacts are
 read-only projections; Context is read-only apart from its confirmed Compact,
-Agents delegates and cancels child runs for the open conversation, and Terminal
+Agents delegates and cancels child runs for the open conversation — including
+the ones the model spawns for itself through the `Agent` tool, with each child's
+`provider:model` on its card and a picker that overrides the role's own model —
+and Terminal
 is the deliberate interactive exception documented above. The Workbench docks at 1280px and becomes a modal sheet below that. Sidebar/workbench collapse, dock widths, the opened
 Workbench views and the selected one are browser-local preferences under `mini-dsh.workbench.v1`;
 appearance (System/Light/Dark) is stored under

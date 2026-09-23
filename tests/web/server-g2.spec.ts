@@ -237,16 +237,64 @@ describe('workspace HTTP surface', () => {
     expect(metaWork.model).toBe('scripted')
     expect(metaLife.model).toBe('scripted')
 
-    // Policy is scoped too.
-    const policy = await fetch(`${base}/api/workspaces/${work.id}/policy`, {
+    // Mode selection is scoped too: distinct selected defaults do not leak.
+    expect((await fetch(`${base}/api/workspaces/${work.id}/mode`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ modeId: 'full-access' }),
+    })).status).toBe(200)
+    const workMeta = (await (await fetch(`${base}/api/workspaces/${work.id}/meta`)).json()) as { permissionDefaults: Record<string, string> }
+    const lifeMeta = (await (await fetch(`${base}/api/workspaces/${life.id}/meta`)).json()) as { permissionDefaults: Record<string, string> }
+    expect(workMeta.permissionDefaults.Write).toBe('allow')
+    expect(lifeMeta.permissionDefaults.Write).toBe('ask')
+
+    // The retired override endpoint is not a fallback route.
+    expect((await fetch(`${base}/api/workspaces/${work.id}/policy`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ policy: { Write: 'deny' } }),
-    })
-    expect(policy.status).toBe(200)
-    const meta = (await (await fetch(`${base}/api/workspaces/${life.id}/meta`)).json()) as { policy: Record<string, string> }
-    expect(meta.policy.Write).not.toBe('deny')
+    })).status).toBe(404)
   })
+
+  it('selected modes isolate actual tool gates: Full access executes while Ask before changes waits', async () => {
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-mode-gate-'))
+    const workRoot = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-mode-work-'))
+    const lifeRoot = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-mode-life-'))
+    const provider: LlmProvider = {
+      name: 'writer', models: ['writer'],
+      async *stream(request) {
+        if (!request.messages.some((message) => message.role === 'tool')) {
+          yield { type: 'toolCalls', calls: [{ id: `write-${Math.random()}`, name: 'Write', args: { path: 'mode.txt', content: 'mode scoped' } }] }
+          return
+        }
+        yield { type: 'delta', delta: 'done' }
+      },
+    }
+    const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json') })
+    try {
+      const base = server.url
+      const work = (await (await post(base, '/api/workspaces', { name: 'Work' })).json()) as { id: string }
+      const life = (await (await post(base, '/api/workspaces', { name: 'Life' })).json()) as { id: string }
+      const workProject = (await (await post(base, `/api/workspaces/${work.id}/projects`, { name: 'Work', path: workRoot })).json()) as { id: string }
+      const lifeProject = (await (await post(base, `/api/workspaces/${life.id}/projects`, { name: 'Life', path: lifeRoot })).json()) as { id: string }
+      expect((await fetch(`${base}/api/workspaces/${work.id}/mode`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: 'full-access' }),
+      })).status).toBe(200)
+      const workSession = (await (await post(base, `/api/workspaces/${work.id}/sessions`, { projectId: workProject.id })).json()) as { id: string }
+      const lifeSession = (await (await post(base, `/api/workspaces/${life.id}/sessions`, { projectId: lifeProject.id })).json()) as { id: string }
+      const lifeEvents = await fetch(`${base}/api/workspaces/${life.id}/sessions/${lifeSession.id}/events`)
+      void post(base, `/api/workspaces/${work.id}/sessions/${workSession.id}/messages`, { content: 'write' }).catch(() => {})
+      void post(base, `/api/workspaces/${life.id}/sessions/${lifeSession.id}/messages`, { content: 'write' }).catch(() => {})
+      await expect(waitForFile(path.join(workRoot, 'mode.txt'))).resolves.toBe('mode scoped')
+      await waitForApproval(lifeEvents)
+      await expect(fs.readFile(path.join(lifeRoot, 'mode.txt'), 'utf8')).rejects.toThrow()
+    } finally {
+      await server.close()
+      await fs.rm(home, { recursive: true, force: true })
+      await fs.rm(workRoot, { recursive: true, force: true })
+      await fs.rm(lifeRoot, { recursive: true, force: true })
+    }
+  }, 15_000)
 
   it('archiving refuses running workspaces; deletion refuses populated ones', async () => {
     const server = await start()
@@ -277,6 +325,44 @@ describe('workspace HTTP surface', () => {
 interface ToolResultView {
   ok: boolean
   output: string
+}
+
+async function waitForFile(file: string): Promise<string> {
+  const deadline = Date.now() + 6_000
+  while (Date.now() < deadline) {
+    const content = await fs.readFile(file, 'utf8').catch(() => undefined)
+    if (content !== undefined) return content
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  throw new Error(`file was not written: ${file}`)
+}
+
+async function waitForApproval(response: Response): Promise<void> {
+  const reader = (response.body as ReadableStream).getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  const deadline = Date.now() + 6_000
+  try {
+    while (Date.now() < deadline) {
+      const chunk = await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), deadline - Date.now())),
+      ])
+      if (chunk.done) break
+      buffer += decoder.decode(chunk.value, { stream: true })
+      let boundary = buffer.indexOf('\n\n')
+      while (boundary >= 0) {
+        const frame = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + 2)
+        boundary = buffer.indexOf('\n\n')
+        const data = frame.split('\n').find((line) => line.startsWith('data: '))
+        if (data !== undefined && (JSON.parse(data.slice('data: '.length)) as { kind?: string }).kind === 'approval') return
+      }
+    }
+  } finally {
+    reader.cancel().catch(() => {})
+  }
+  throw new Error('no approval observed')
 }
 
 /** Read one session's SSE until the first tool/result arrives (snapshot included). */
@@ -412,10 +498,10 @@ describe('G2 review hardening', () => {
       expect((await post(base, `/api/workspaces/${made.id}/sessions`)).status).toBe(404)
       const stale = (await (await fetch(`${base}/api/workspaces/${made.id}/sessions`)).json()) as { id: string }[]
       expect((await post(base, `/api/workspaces/${made.id}/sessions/${stale[0]!.id}/messages`, { content: 'wake up' })).status).toBe(404)
-      expect((await fetch(`${base}/api/workspaces/${made.id}/policy`, {
+      expect((await fetch(`${base}/api/workspaces/${made.id}/mode`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ policy: { Write: 'deny' } }),
+        body: JSON.stringify({ modeId: 'full-access' }),
       })).status).toBe(404)
       expect((await fetch(`${base}/api/workspaces/${made.id}/sessions/${stale[0]!.id}`, {
         method: 'PATCH',

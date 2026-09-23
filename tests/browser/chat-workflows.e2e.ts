@@ -43,7 +43,7 @@ function fixtureEvents(state: FixtureState): readonly unknown[] {
     { type: 'tool/result', seq: 1, callId: 'tool', ok: true, output: 'partial output', recovery: true },
   ]
   if (state === 'artifacts') return [
-    { type: 'tool/call', seq: 0, call: { id: 'file', name: 'Read', args: { path: 'C:/fixture/project/README.md' } } },
+    { type: 'tool/call', seq: 0, call: { id: 'file', name: 'Read', args: { path: 'C:/fixture/project/README.md', offset: 30, limit: 6 } } },
     { type: 'tool/result', seq: 1, callId: 'file', ok: true, output: '# fixture' },
     { type: 'tool/call', seq: 2, call: { id: 'command', name: 'Bash', args: { command: 'npm test' } } },
     { type: 'tool/result', seq: 3, callId: 'command', ok: false, output: 'test failure' },
@@ -65,8 +65,8 @@ function fixtureEvents(state: FixtureState): readonly unknown[] {
 async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
   const records: RequestRecord[] = []
   let createdConversation = false
-  let provider = { id: 'fixture-provider', name: 'Fixture provider', baseUrl: 'http://fixture.invalid', enabled: true, keyMasked: '***', models: ['fixture-model'], defaultModel: 'fixture-model', modelSettings: {} }
-  const replacementProvider = { id: 'replacement-provider', name: 'Replacement provider', baseUrl: 'http://replacement.invalid', enabled: true, keyMasked: '', models: ['replacement-model'], defaultModel: 'replacement-model', modelSettings: {} }
+  let provider = { id: 'fixture-provider', name: 'Fixture provider', baseUrl: 'http://fixture.invalid', enabled: true, keyMasked: '***', models: ['fixture-model'], modelSettings: {} }
+  const replacementProvider = { id: 'replacement-provider', name: 'Replacement provider', baseUrl: 'http://replacement.invalid', enabled: true, keyMasked: '', models: ['replacement-model'], modelSettings: {} }
   let providerDeleted = false
   let skillPutCount = 0
   let memoryPatchCount = 0
@@ -116,6 +116,7 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
     records.push({ method, path, body })
 
     if (path === '/api/workspaces' && method === 'GET') return json(route, state === 'no-workspace' ? [] : [{ id: 'w', name: 'Fixture workspace', default: true, archived: false, createdAt: 0 }])
+    if (path === '/api/auth/state' && method === 'GET') return json(route, { required: false, paired: true })
     if (path === '/api/workspaces/w/projects' && method === 'GET') return json(route, [{ id: 'p', name: 'Fixture project', workspaceId: 'w', path: 'C:/fixture/project', createdAt: 0 }])
     if (path === '/api/workspaces/w/sessions' && method === 'GET') return json(route, state === 'new-conversation' || state === 'new-conversation-success'
       ? (createdConversation ? [{ id: 'created', workspaceId: 'w', title: 'Created conversation', projectId: 'p', folder: null, eventCount: 0, createdAt: 0, updatedAt: 0, status: 'idle' }] : [])
@@ -131,7 +132,7 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
       providers: [...(providerDeleted ? [] : [provider]), replacementProvider],
       models: ['fixture-model'],
       projects: [{ id: 'p', name: 'Fixture project', path: 'C:/fixture/project' }],
-      policy: { Bash: 'ask' },
+      permissionDefaults: { Bash: 'ask' },
       thinkingLevel: null,
     })
     if (path === '/api/workspaces/w/mode' && method === 'GET') return json(route, { modes: [{ id: 'chat', name: 'Chat', source: 'bundled' }], selected: 'chat', revision: 1 })
@@ -141,7 +142,8 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
     if (path === '/api/workspaces/w/projects/p/files' && method === 'GET') return json(route, url.searchParams.get('path') === 'src'
       ? { path: 'src', entries: [{ name: 'index.ts', path: 'src/index.ts', kind: 'file', size: 26 }] }
       : { path: '', entries: [{ name: 'src', path: 'src', kind: 'dir' }, { name: 'README.md', path: 'README.md', kind: 'file', size: 9 }] })
-    if (path === '/api/workspaces/w/projects/p/file' && method === 'GET') return json(route, { path: url.searchParams.get('path'), size: 26, binary: false, truncated: false, content: 'export const answer = 42\n' })
+    // Long enough that opening it at a recorded window has somewhere to scroll.
+    if (path === '/api/workspaces/w/projects/p/file' && method === 'GET') return json(route, { path: url.searchParams.get('path'), size: 26, binary: false, truncated: false, content: `export const answer = 42\n${Array.from({ length: 84 }, (_, index) => `line ${index + 2}`).join('\n')}\n` })
     if (path.endsWith('/manifest') && method === 'GET') return json(route, { modeId: 'chat', modeRevision: 1, budget: { availableTokens: 32000, usedTokens: 0, estimated: false }, history: { setting: 'all', includedTurns: 0, omittedTurns: 0 }, sources: { skills: [], memory: [], toolNames: [], toolSchemas: 0 }, omissions: [] })
     if (path === `${SESSION_PATH}/messages` && method === 'POST') return json(route, { inputId: 'queued-1', queued: state === 'running-tool' || state === 'reconnect' })
     if (path === '/api/workspaces/w/sessions/created/messages' && method === 'POST') return state === 'new-conversation-success'
@@ -149,11 +151,12 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
       : json(route, { error: 'fixture send refused' }, 503)
     if (path === `${SESSION_PATH}/stop` && method === 'POST') return json(route, { stopped: true })
     if (path === '/api/approvals/approval-1' && method === 'POST') return json(route, { answered: true })
-    if (path === '/api/workspaces/w/policy' && method === 'PUT') return json(route, { policy: body })
     if (state === 'settings') {
       if (path === '/api/providers/fixture-provider' && method === 'PATCH') { provider = { ...provider, ...(body as object) }; return json(route, provider) }
       if (path === '/api/providers/fixture-provider' && method === 'DELETE') { providerDeleted = true; return json(route, { deleted: true }) }
       if (path === '/api/providers/fixture-provider/test' && method === 'POST') return json(route, { ok: true })
+      // The probe answers without storing anything, as the server does.
+      if (path === '/api/providers/fixture-provider/models' && method === 'GET') return json(route, { ok: true, models: ['fixture-model', 'fixture-next'] })
       // Sync persists the fetched list, as the server does.
       if (path === '/api/providers/fixture-provider/sync' && method === 'POST') { provider = { ...provider, models: ['fixture-model', 'fixture-next'] }; return json(route, { ok: true, models: provider.models }) }
       if (path === '/api/workspaces/w/model' && method === 'PUT') return json(route, { model: (body as { model?: string }).model })
@@ -207,7 +210,8 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
 /** Settings lives in the sidebar footer; on narrow screens the sidebar is a drawer. */
 /** The provider editor fills in once providers load; edit it only after that. */
 async function providerName(dialog: Locator): Promise<Locator> {
-  const name = dialog.getByLabel('Name')
+  // Exact: the rename affordance beside the title also carries "name".
+  const name = dialog.getByLabel('Name', { exact: true })
   await expect(name).toHaveValue('Fixture provider')
   return name
 }
@@ -288,7 +292,7 @@ for (const width of [375, 1024]) {
     } else await dialog.getByRole('tab', { name: /Projects/ }).click()
     await expect(page.getByRole('dialog', { name: 'Discard unsaved provider changes?' })).toBeVisible()
     await page.getByRole('button', { name: 'Cancel' }).click()
-    await expect(dialog.getByLabel('Name')).toHaveValue('Dirty provider')
+    await expect(dialog.getByLabel('Name', { exact: true })).toHaveValue('Dirty provider')
   })
 }
 
@@ -308,6 +312,7 @@ test('provider replacement, close, and pending model text all require discard co
 
   await trigger.click()
   const reopened = page.getByRole('dialog', { name: 'Settings' })
+  await reopened.getByRole('button', { name: 'Add model' }).click()
   await reopened.getByPlaceholder('gpt-5.6-sol, gpt-5.6-terra').fill('pending-model')
   await reopened.getByRole('option', { name: /Replacement provider/ }).click()
   await expect(page.getByRole('dialog', { name: 'Discard unsaved provider changes?' })).toBeVisible()
@@ -352,27 +357,43 @@ test('provider dirty draft survives sections, confirms discard, and omits a blan
   expect(patch.name).toBe('Fixture provider edited')
 })
 
-test('provider test, sync, activate, and delete use exact existing requests', async ({ page }) => {
+test('provider test, sync, per-model test, and delete use exact existing requests', async ({ page }) => {
   const state = await fixture(page, 'settings')
   await (await settingsTrigger(page)).click()
   const dialog = page.getByRole('dialog', { name: 'Settings' })
+  // The editor fills in once providers load; the footer controls stay disabled
+  // until then, so wait for the selected entry before touching any of them.
+  await expect(dialog.getByLabel('Name', { exact: true })).toHaveValue('Fixture provider')
   await dialog.getByRole('button', { name: 'Test connection' }).click()
+  // Sync proposes; the operator picks and saves. Nothing is stored before that.
   await dialog.getByRole('button', { name: 'Sync from /models' }).click()
+  const sync = page.getByRole('dialog', { name: /^Sync models/ })
+  await sync.getByRole('checkbox').nth(1).check()
+  await sync.getByRole('button', { name: 'Sync 2 models' }).click()
   await expect(dialog.getByText('fixture-next')).toBeVisible()
-  await dialog.getByRole('button', { name: 'Set as global default' }).first().click()
-  await expect.poll(() => state.count('PUT', '/api/model-defaults')).toBe(1)
+  await dialog.getByRole('button', { name: 'Save changes' }).click()
+  await expect.poll(() => state.count('PATCH', '/api/providers/fixture-provider')).toBe(1)
+  // Each row pings its own model, naming it in the body.
+  await dialog.getByRole('button', { name: 'Test model fixture-next' }).click()
+  await expect(dialog.getByText('Model replied.')).toBeVisible()
+  await expect.poll(() => state.count('POST', '/api/providers/fixture-provider/test')).toBe(2)
   await dialog.getByRole('button', { name: 'Delete provider' }).click()
-  await dialog.getByRole('button', { name: 'Delete permanently' }).click()
+  // The provider delete confirms in its own dialog, outside the settings one.
+  await page.getByRole('button', { name: 'Delete permanently' }).click()
   await expect.poll(() => state.count('DELETE', '/api/providers/fixture-provider')).toBe(1)
   for (const expected of [
-    ['POST', '/api/providers/fixture-provider/test'],
-    ['POST', '/api/providers/fixture-provider/sync'],
-    ['PUT', '/api/model-defaults'],
+    ['GET', '/api/providers/fixture-provider/models'],
+    ['PATCH', '/api/providers/fixture-provider'],
     ['DELETE', '/api/providers/fixture-provider'],
   ] as const) expect(state.count(expected[0], expected[1])).toBe(1)
-  // fixture-model is already the global default, so the first offer is the synced model.
-  expect(state.requests().find(request => request.method === 'PUT' && request.path === '/api/model-defaults')?.body).toMatchObject({ provider: 'fixture-provider', model: 'fixture-next' })
-  expect(state.requests().filter(request => ['/api/providers/fixture-provider/test', '/api/providers/fixture-provider/sync', '/api/providers/fixture-provider'].includes(request.path) && request.method !== 'PATCH').every(request => request.body === null)).toBe(true)
+  // The persisting sync route is never what the browser uses.
+  expect(state.count('POST', '/api/providers/fixture-provider/sync')).toBe(0)
+  // Every row-level ping names its model; only the provider-level footer test
+  // sends an empty body (it falls back to the first model server-side).
+  const tests = state.requests().filter(request => request.method === 'POST' && request.path === '/api/providers/fixture-provider/test')
+  expect(tests.some(request => request.body === null)).toBe(true)
+  expect(tests.some(request => (request.body as { model?: string } | null)?.model === 'fixture-next')).toBe(true)
+  expect(state.requests().filter(request => ['/api/providers/fixture-provider/models', '/api/providers/fixture-provider'].includes(request.path) && request.method !== 'PATCH').every(request => request.body === null)).toBe(true)
 })
 
 test('project bound and running 409 remains visible after confirmed removal', async ({ page }) => {
@@ -496,10 +517,14 @@ test('a completed tool row expands to recorded output without requests', async (
   const before = state.requests().filter((request) => request.method !== 'GET').length
   const row = transcriptOf(page).getByRole('button', { name: /Bash/ })
   await expect(row).toContainText('Succeeded')
+  // The command and what came back are on the row itself, before any click.
+  await expect(row).toContainText('npm test')
+  await expect(row).toContainText('recorded output')
   await row.click()
   await expect(transcriptOf(page).locator('pre').last()).toContainText('recorded output')
   await row.click()
-  await expect(transcriptOf(page).getByText('recorded output')).toHaveCount(0)
+  await expect(row).toHaveAttribute('aria-expanded', 'false')
+  await expect(transcriptOf(page).locator('pre')).toHaveCount(0)
   expectNoMutationRequests(state, before)
 })
 
@@ -570,6 +595,21 @@ test('Open in workbench reads the current project file, never the recorded outpu
   await expect(workbench.getByRole('region', { name: 'Contents of README.md' })).toContainText('export const answer = 42')
   // Dev StrictMode may mount the viewer twice; every read is a GET of the live file.
   expect(state.count('GET', '/api/workspaces/w/projects/p/file')).toBeGreaterThan(0)
+  expect(state.requests().filter((request) => request.method !== 'GET')).toHaveLength(0)
+})
+
+test('a tool row states its window and opens the workbench at the lines it read', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 })
+  const state = await fixture(page, 'artifacts')
+  // The window is on the row: nothing about it needs a click to be read.
+  const row = transcriptOf(page).getByRole('button', { name: /README\.md:30-35/ })
+  await expect(row).toHaveAttribute('aria-expanded', 'false')
+  await row.click()
+  await transcriptOf(page).getByRole('button', { name: /Open .* in workbench/ }).click()
+  const contents = page.getByRole('region', { name: 'Contents of README.md' })
+  await expect(contents).toContainText('export const answer = 42')
+  // The viewer lands on the recorded window rather than the top of the file.
+  await expect.poll(async () => contents.evaluate((element) => element.scrollTop)).toBeGreaterThan(0)
   expect(state.requests().filter((request) => request.method !== 'GET')).toHaveLength(0)
 })
 
@@ -756,15 +796,15 @@ test('nested Escape closes a menu inside the navigation drawer before the drawer
   await expect(drawer).toHaveCount(0)
 })
 
-test('Escape closes the composer permission popover and returns focus to its trigger', async ({ page }) => {
+test('Escape closes the composer mode menu and returns focus to its trigger', async ({ page }) => {
   await page.setViewportSize({ width: 1024, height: 800 })
   await fixture(page, 'no-work')
-  const trigger = page.getByRole('button', { name: 'Workspace controls and permissions' })
+  const trigger = page.getByRole('button', { name: 'Workspace mode (next tool gate and request)' })
   await trigger.click()
-  const policy = page.getByRole('dialog', { name: 'Workspace controls and permissions' })
-  await expect(policy).toBeVisible()
+  const menu = page.getByRole('menu', { name: 'Workspace mode (next tool gate and request)' })
+  await expect(menu).toBeVisible()
   await page.keyboard.press('Escape')
-  await expect(policy).toHaveCount(0)
+  await expect(menu).toHaveCount(0)
   await expect(trigger).toBeFocused()
 })
 

@@ -88,10 +88,3 @@ export function updateDraftSegments(draft: RichDraft, segments: readonly DraftSe
 export function draftIsEmpty(draft: RichDraft): boolean {
   return draftText(draft).trim() === '' && draftAttachments(draft).length === 0
 }
-
-/** Human-readable size for an attachment chip. */
-export function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-}

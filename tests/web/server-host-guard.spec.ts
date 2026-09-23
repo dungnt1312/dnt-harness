@@ -70,6 +70,44 @@ async function withHost(
   })
 }
 
+/**
+ * POST with an explicit `Origin`, the way a foreign page's simple request
+ * would arrive. Raw `node:http` again: this proves the header reached the
+ * handler instead of trusting a client library not to strip it.
+ */
+async function postFrom(
+  baseUrl: string,
+  pathname: string,
+  origin: string | null,
+): Promise<{ status: number; body: string }> {
+  const { request } = await import('node:http')
+  const url = new URL(baseUrl)
+  return new Promise((resolve, reject) => {
+    const client = request(
+      {
+        host: url.hostname,
+        port: url.port,
+        path: pathname,
+        method: 'POST',
+        headers: {
+          // text/plain is what dodges the CORS preflight, so it is what an
+          // attacker would send.
+          'content-type': 'text/plain',
+          ...(origin === null ? {} : { origin }),
+        },
+      },
+      (response) => {
+        let body = ''
+        response.setEncoding('utf8')
+        response.on('data', (chunk: string) => { body += chunk })
+        response.on('end', () => resolve({ status: response.statusCode ?? 0, body }))
+      },
+    )
+    client.on('error', reject)
+    client.end(JSON.stringify({ name: 'from-a-foreign-page' }))
+  })
+}
+
 describe('host allowlist', () => {
   it('serves the loopback names it is bound to', async () => {
     const baseUrl = await start()
@@ -104,5 +142,40 @@ describe('host allowlist', () => {
     // handler sees it, so the refusal is a 400 rather than this guard's 403.
     // What matters is that it is refused, not which layer refuses it.
     expect((await withHost(baseUrl, '/api/workspaces', null)).status).toBe(400)
+  })
+})
+
+/**
+ * The `Host` allowlist stops a rebound name, but not a plain cross-site POST:
+ * `text/plain` is a simple request, so it is never preflighted and the
+ * attacker's page does not need to read the response to change state.
+ */
+describe('cross-site write guard', () => {
+  it('refuses an unsafe method from a foreign origin', async () => {
+    const baseUrl = await start()
+    const refused = await postFrom(baseUrl, '/api/workspaces', 'https://evil.example')
+    expect(refused.status).toBe(403)
+    expect(refused.body).toMatch(/cross-site/)
+    // Nothing was created: the guard runs before routing.
+    const rows = await fetch(`${baseUrl}/api/workspaces`).then((r) => r.json()) as { name: string }[]
+    expect(rows.some((row) => row.name === 'from-a-foreign-page')).toBe(false)
+  })
+
+  it('refuses an opaque origin', async () => {
+    const baseUrl = await start()
+    expect((await postFrom(baseUrl, '/api/workspaces', 'null')).status).toBe(403)
+  })
+
+  it('accepts the app’s own page, and clients that send no Origin at all', async () => {
+    const baseUrl = await start()
+    expect((await postFrom(baseUrl, '/api/workspaces', baseUrl)).status).toBe(201)
+    expect((await postFrom(baseUrl, '/api/workspaces', null)).status).toBe(201)
+  })
+})
+
+describe('network bind', () => {
+  it('refuses a non-loopback bind because there is no authenticated TLS profile', async () => {
+    await expect(start({ host: '0.0.0.0' })).rejects.toThrow(/authenticated TLS profile/)
+    await expect(start({ host: '0.0.0.0', unsafeNetworkBind: true })).rejects.toThrow(/authenticated TLS profile/)
   })
 })

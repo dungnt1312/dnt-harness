@@ -33,7 +33,24 @@ export type SessionEvent =
   | ({ readonly type: 'assistant/chunk'; readonly stepId: StepId; readonly delta: string; readonly thinking?: boolean } & SessionEventStamp)
   | ({ readonly type: 'assistant/message'; readonly stepId: StepId; readonly content: string; readonly toolCalls?: readonly ToolCall[]; readonly controls?: RequestControls } & SessionEventStamp)
   | ({ readonly type: 'tool/call'; readonly stepId: StepId; readonly call: ToolCall; readonly policyRevision?: number } & SessionEventStamp)
-  | ({ readonly type: 'tool/result'; readonly stepId: StepId; readonly callId: string; readonly ok: boolean; readonly output: string; /** Set on synthesized recovery records: the real outcome is unknown. */ readonly recovery?: true } & SessionEventStamp)
+  | ({
+      readonly type: 'tool/result'
+      readonly stepId: StepId
+      readonly callId: string
+      readonly ok: boolean
+      readonly output: string
+      /** Set on synthesized recovery records: the real outcome is unknown. */
+      readonly recovery?: true
+      /**
+       * MCP-only structured outcome. Omitted for every non-MCP tool and for
+       * legacy logs. `indeterminate` is not a failure and is never retried
+       * automatically; `audit_fault` means the known outcome could not be
+       * durably recorded and further MCP dispatch is blocked.
+       */
+      readonly outcome?: 'success' | 'error' | 'indeterminate' | 'audit_fault'
+      /** MCP invocation id. A repeat is a new invocation, never a reused id. */
+      readonly invocationId?: string
+    } & SessionEventStamp)
   | ({ readonly type: 'step/end'; readonly turnId: TurnId; readonly stepId: StepId } & SessionEventStamp)
   | ({ readonly type: 'turn/end'; readonly turnId: TurnId; readonly reason: TurnEndReason } & SessionEventStamp)
   | ({ readonly type: 'turn/error'; readonly turnId: TurnId; readonly kind: TurnErrorKind; readonly message: string } & SessionEventStamp)
@@ -41,6 +58,7 @@ export type SessionEvent =
   | ({ readonly type: 'approval/decision'; readonly approvalId: string; readonly decision: ApprovalDecision; readonly reason?: string } & SessionEventStamp)
   | ({ readonly type: 'input/queued'; readonly inputId: string; readonly clientRequestId?: string; readonly content: string; readonly attachments?: readonly AttachmentRef[] } & SessionEventStamp)
   | ({ readonly type: 'session/title'; readonly title: string | null } & SessionEventStamp)
+  | ({ readonly type: 'session/pinned'; readonly pinned: boolean } & SessionEventStamp)
   | ({ readonly type: 'session/project'; readonly projectId: string | null } & SessionEventStamp)
   | ({ readonly type: 'session/model'; readonly provider?: string | null; readonly model?: string | null; readonly thinkingLevel?: string | null } & SessionEventStamp)
   | ({ readonly type: 'session/child-meta'; readonly parentSessionId: string; readonly parentTurnId: string; readonly definition: string; readonly objective: string } & SessionEventStamp)
@@ -195,6 +213,7 @@ export function deriveMessages(events: readonly SessionEvent[], attachments?: At
       case 'approval/decision':
       case 'input/queued':
       case 'session/title':
+      case 'session/pinned':
       case 'session/project':
       case 'session/model':
       case 'session/child-meta':

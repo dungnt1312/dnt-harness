@@ -26,9 +26,11 @@ interface RowProps {
   readonly onSelect: () => void
   readonly onRename: (id: string, title: string) => void
   readonly onDeleteRequest: (session: SessionListing) => void
+  /** Absent when pinning is unavailable; the row then offers no pin action. */
+  readonly onTogglePinned?: (id: string, pinned: boolean) => void
 }
 
-function SessionRow({ session, active, liveRunning, onSelect, onRename, onDeleteRequest }: RowProps) {
+function SessionRow({ session, active, liveRunning, onSelect, onRename, onDeleteRequest, onTogglePinned }: RowProps) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(session.title)
   const status = session.status ?? 'idle'
@@ -61,8 +63,9 @@ function SessionRow({ session, active, liveRunning, onSelect, onRename, onDelete
         type="button"
         onClick={onSelect}
         aria-current={active ? 'page' : undefined}
-        className="flex min-h-9 min-w-0 flex-1 items-center gap-2 py-1.5 pl-2.5 pr-9 text-left text-sm"
+        className="flex min-h-9 min-w-0 flex-1 items-center gap-2 py-1.5 pl-2.5 pr-2 text-left text-sm"
       >
+        {session.pinned === true ? <Icon name="pin" size={13} className="shrink-0 text-fg-faint" aria-label="Pinned" /> : null}
         <span className="min-w-0 flex-1 truncate font-medium">{session.title || 'New conversation'}</span>
         {queued > 0 ? <span className="shrink-0 text-[11px] text-fg-faint">{queued} queued</span> : null}
         {isRunning ? (
@@ -72,10 +75,15 @@ function SessionRow({ session, active, liveRunning, onSelect, onRename, onDelete
           </span>
         ) : cancelling ? <span className="shrink-0 text-[11px] text-fg-faint">stopping…</span> : null}
         {session.updatedAt !== undefined ? (
-          <span className="shrink-0 text-[11px] tabular-nums text-fg-faint" title={new Date(session.updatedAt).toLocaleString()}>{formatAge(session.updatedAt)}</span>
+          <span
+            className="shrink-0 text-[11px] tabular-nums text-fg-faint transition-opacity group-hover:opacity-0 group-focus-within:opacity-0 group-has-[[data-state=open]]:opacity-0 [@media(pointer:coarse)]:opacity-0"
+            title={new Date(session.updatedAt).toLocaleString()}
+          >
+            {formatAge(session.updatedAt)}
+          </span>
         ) : null}
       </button>
-      <span className={cn('absolute right-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100 [@media(pointer:coarse)]:opacity-100', active && 'opacity-100')}>
+      <span className="absolute right-1 flex opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100 [@media(pointer:coarse)]:opacity-100">
         <Menu
           label={`Options for ${session.title || 'conversation'}`}
           align="start"
@@ -84,6 +92,12 @@ function SessionRow({ session, active, liveRunning, onSelect, onRename, onDelete
         >
           {(close) => (
             <>
+              {onTogglePinned !== undefined ? (
+                <button type="button" role="menuitemcheckbox" aria-checked={session.pinned === true} className={menuItemClass} onClick={() => { close(); onTogglePinned(session.id, session.pinned !== true) }}>
+                  <Icon name="pin" size={15} className="text-fg-muted" />
+                  <span className="flex-1">{session.pinned === true ? 'Unpin' : 'Pin'}</span>
+                </button>
+              ) : null}
               <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); setDraft(session.title); setEditing(true) }}>
                 <Icon name="pencil" size={15} className="text-fg-muted" />Rename
               </button>
@@ -110,6 +124,8 @@ function dayBucket(ts: number | undefined): 'today' | 'yesterday' | 'earlier' | 
 
 const BUCKET_LABELS: Readonly<Record<'today' | 'yesterday' | 'earlier', string>> = { today: 'Today', yesterday: 'Yesterday', earlier: 'Earlier' }
 const BUCKET_ORDER = ['today', 'yesterday', 'earlier', 'none'] as const
+/** Collapse-record key for the unfiled-chats folder; session ids never look like this. */
+const CHATS_KEY = 'loose-chats'
 
 function bucketed(sessions: readonly SessionListing[]): readonly (readonly [typeof BUCKET_ORDER[number], readonly SessionListing[]])[] {
   const buckets = new Map<typeof BUCKET_ORDER[number], SessionListing[]>()
@@ -121,10 +137,10 @@ function bucketed(sessions: readonly SessionListing[]): readonly (readonly [type
 }
 
 function GroupHead({ children }: { readonly children: ReactNode }) {
-  return <div className="px-2.5 pb-1 pt-4 text-xs font-medium text-fg-faint">{children}</div>
+  return <div className="px-2.5 pb-1 pt-3 text-xs font-medium text-fg-faint">{children}</div>
 }
 
-export function SessionList({ sessions, projects, current, filter, liveRunning, onSelect, onRename, onDeleteRequest, onNewInProject, sort = 'recent', emptyLabel, onReorder }: {
+export function SessionList({ sessions, projects, current, filter, liveRunning, onSelect, onRename, onDeleteRequest, onTogglePinned, onNewInProject, sort = 'recent', emptyLabel, onReorder }: {
   readonly sessions: readonly SessionListing[]
   readonly projects: readonly ProjectRow[]
   readonly current: string | null
@@ -133,6 +149,7 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
   readonly onSelect: (id: string) => void
   readonly onRename: (id: string, title: string) => void
   readonly onDeleteRequest: (session: SessionListing) => void
+  readonly onTogglePinned?: (id: string, pinned: boolean) => void
   readonly onNewInProject?: (projectId: string) => void
   /** Ordering already applied upstream; non-recent orders flatten the day buckets. */
   readonly sort?: SessionSort
@@ -149,7 +166,13 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
   const [dragId, setDragId] = useState<string | null>(null)
   const [over, setOver] = useState<{ readonly id: string; readonly position: 'before' | 'after' } | null>(null)
   const query = filter.trim().toLowerCase()
-  const shown = sessions.filter((session) => query === '' || session.title.toLowerCase().includes(query))
+  // A folder is searchable too: typing part of a project name keeps that
+  // project's conversations, so "dnt" finds the dntbrowser folder and its work.
+  const projectNames = new Map(projects.map((project) => [project.id, project.name.toLowerCase()]))
+  const matches = (session: SessionListing): boolean => query === ''
+    || session.title.toLowerCase().includes(query)
+    || (session.projectId != null && (projectNames.get(session.projectId) ?? '').includes(query))
+  const shown = sessions.filter(matches)
 
   const rows = (list: readonly SessionListing[]): ReactNode => (
     <ul className="m-0 flex list-none flex-col gap-px p-0">
@@ -162,6 +185,7 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
             onSelect={() => onSelect(session.id)}
             onRename={onRename}
             onDeleteRequest={onDeleteRequest}
+            {...(onTogglePinned !== undefined ? { onTogglePinned } : {})}
           />
         </li>
       ))}
@@ -177,9 +201,15 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
   if (shown.length === 0) {
     return <p className="m-0 px-2.5 py-4 text-sm text-fg-faint">{emptyLabel ?? (query === '' ? 'No conversations yet' : 'No matching conversations')}</p>
   }
-  if (projects.length === 0) return <div className="flex flex-col">{timeline(shown)}</div>
+  // Pinned conversations lead the whole list, whatever folder or day they
+  // belong to — that is what pinning them was for.
+  const pinned = shown.filter((session) => session.pinned === true)
+  const rest = pinned.length > 0 ? shown.filter((session) => session.pinned !== true) : shown
+  const pinnedBlock = pinned.length > 0 ? <div><GroupHead>Pinned</GroupHead>{rows(pinned)}</div> : null
 
-  const loose = shown.filter((session) => session.projectId === undefined || session.projectId === null)
+  if (projects.length === 0) return <div className="flex flex-col">{pinnedBlock}{timeline(rest)}</div>
+
+  const loose = rest.filter((session) => session.projectId === undefined || session.projectId === null)
   const orderIds = projects.map((project) => project.id)
   /** Drop commits once, at the last hovered edge. */
   const commitDrag = () => {
@@ -221,13 +251,14 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
   })
   return (
     <div className="flex flex-col">
+      {pinnedBlock}
       {projects.map((project) => {
-        const projectSessions = shown.filter((session) => session.projectId === project.id)
+        const projectSessions = rest.filter((session) => session.projectId === project.id)
         if (projectSessions.length === 0) return null
         const runningCount = projectSessions.filter((session) => (session.status ?? 'idle') === 'running' || (session.id === current && liveRunning)).length
         const isCollapsed = collapsed[project.id] === true
         return (
-          <Collapsible.Root key={project.id} open={!isCollapsed} onOpenChange={(open) => setCollapsed((prev) => ({ ...prev, [project.id]: !open }))} className="mt-3 first:mt-1">
+          <Collapsible.Root key={project.id} open={!isCollapsed} onOpenChange={(open) => setCollapsed((prev) => ({ ...prev, [project.id]: !open }))} className="mt-1.5 first:mt-1">
             <div {...(onReorder !== undefined ? dragHandlers(project) : {})} className={cn('group relative flex items-center rounded-lg hover:bg-hover', dragId === project.id && 'opacity-40')}>
               {over?.id === project.id && dragId !== null && dragId !== project.id ? (
                 <span
@@ -236,7 +267,7 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
                 />
               ) : null}
               <Collapsible.Trigger className="flex min-h-9 min-w-0 flex-1 items-center gap-2 px-2.5 text-left text-sm font-medium">
-                <Icon name="folder" size={15} className="shrink-0 text-fg-muted" />
+                <Icon name={isCollapsed ? 'folder' : 'folderOpen'} size={15} className="shrink-0 text-fg-muted" />
                 <span className="min-w-0 flex-1 truncate">{project.name}</span>
                 {runningCount > 0 ? <span className="flex items-center gap-1 text-[11px] font-normal text-fg-faint"><Spinner size={10} />{runningCount}<span className="sr-only">running</span></span> : null}
               </Collapsible.Trigger>
@@ -246,15 +277,18 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
                 </IconButton>
               ) : null}
             </div>
-            <Collapsible.Content className="mt-0.5 ml-3 border-l border-line pl-1.5">{rows(projectSessions)}</Collapsible.Content>
+            <Collapsible.Content className="mt-0.5 ml-3 pl-1.5">{rows(projectSessions)}</Collapsible.Content>
           </Collapsible.Root>
         )
       })}
       {loose.length > 0 ? (
-        <div className="mt-2">
-          <GroupHead>Chats</GroupHead>
-          {timeline(loose)}
-        </div>
+        <Collapsible.Root open={!collapsed[CHATS_KEY]} onOpenChange={(open) => setCollapsed((prev) => ({ ...prev, [CHATS_KEY]: !open }))} className="mt-1.5 first:mt-1">
+          <Collapsible.Trigger className="flex min-h-9 w-full min-w-0 items-center gap-2 rounded-lg px-2.5 text-left text-sm font-medium hover:bg-hover">
+            <Icon name={collapsed[CHATS_KEY] ? 'folder' : 'folderOpen'} size={15} className="shrink-0 text-fg-muted" />
+            <span className="min-w-0 flex-1 truncate">Chats</span>
+          </Collapsible.Trigger>
+          <Collapsible.Content className="mt-0.5 ml-3 pl-1.5">{timeline(loose)}</Collapsible.Content>
+        </Collapsible.Root>
       ) : null}
     </div>
   )

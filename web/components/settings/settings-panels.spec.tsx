@@ -2,7 +2,7 @@
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { deleteMcpServer, duplicateModeFile, fetchProviderModels, getMcpServer, getModeFile, HttpError, importAgentDefinition, importMcpServers, listModeFiles, listModes, saveModeFile, setModeEnabled, upsertMcpServer } from '../../lib/api.ts'
+import { deleteMcpServer, duplicateModeFile, fetchProviderModels, getMcpServer, getModeFile, HttpError, importAgentDefinition, importMcpServers, listModeFiles, listModes, saveModeFile, setModeEnabled, testProvider, upsertMcpServer } from '../../lib/api.ts'
 import { emptyModeForm, parseModeForm, permissionKeyError, serializeModeForm } from '../../lib/mode-form.ts'
 import { McpPanel } from './McpPanel.tsx'
 import { AgentsPanel } from './AgentsPanel.tsx'
@@ -17,6 +17,7 @@ vi.mock('../../lib/api.ts', () => ({
     }
   },
   fetchProviderModels: vi.fn(async () => ({ ok: true, models: ['auto', 'fresh-1'] })),
+  testProvider: vi.fn(async () => ({ ok: true })),
   listMcpServers: vi.fn(async () => [{
     name: 'fs', transport: 'stdio', enabled: true, status: 'ready', breakerOpenUntil: null,
     discoveredTools: ['query', 'explode'], allowedTools: ['query'], unmatchedAllowlist: ['missing'],
@@ -399,16 +400,16 @@ describe('modes panel', () => {
 })
 
 describe('settings dialog', () => {
-  const providers = [{ id: 'p1', name: 'local', baseUrl: 'http://localhost:8080/v1', enabled: true, keyMasked: '', models: ['auto'], defaultModel: 'auto' }] as const
+  const providers = [{ id: 'p1', name: 'local', baseUrl: 'http://localhost:8080/v1', enabled: true, keyMasked: '', models: ['auto'] }] as const
   const render = async (): Promise<void> => {
     await act(async () => root.render(
-      <SettingsModal open workspaceId="ws" providers={providers} activeProvider="p0" onDismiss={() => {}} onRefresh={async () => {}} onSelectActive={async () => {}} />,
+      <SettingsModal open workspaceId="ws" providers={providers} activeProvider="p0" onDismiss={() => {}} onRefresh={async () => {}} />,
     ))
   }
 
   it('shows the real provider when the list arrives after Settings opened', async () => {
     await act(async () => root.render(
-      <SettingsModal open workspaceId="ws" providers={[]} activeProvider="p1" onDismiss={() => {}} onRefresh={async () => {}} onSelectActive={async () => {}} />,
+      <SettingsModal open workspaceId="ws" providers={[]} activeProvider="p1" onDismiss={() => {}} onRefresh={async () => {}} />,
     ))
     expect(input('Name').value).toBe('')
     await render()
@@ -433,14 +434,16 @@ describe('settings dialog', () => {
     expect(button('Enable')).toBeTruthy()
   })
 
-  it('keeps one status per fact on a model row: no badge repeating the default radio', async () => {
+  it('keeps one status per fact on a model row, with no per-provider default control', async () => {
     await render()
     const row = [...document.body.querySelectorAll('li')].find((node) => node.textContent?.includes('auto'))!
     expect(row.textContent).not.toContain('provider default')
     expect(row.textContent).not.toContain('text')
     // Context stays, as the one piece of per-model data a row cannot infer.
     expect(row.textContent).toMatch(/\d+[km]/i)
-    expect(row.querySelector('button[aria-pressed="true"]')).not.toBeNull()
+    // Model choice is never per provider: no radio, no aria-pressed toggle.
+    expect(row.querySelector('button[aria-pressed]')).toBeNull()
+    expect(row.querySelector('button[aria-label*="default model"]')).toBeNull()
   })
 
   it('reveals the model input only when asked, and deletes from the title row', async () => {
@@ -475,11 +478,11 @@ describe('settings dialog', () => {
       <SettingsModal
         open
         workspaceId="ws"
-        providers={[{ id: 'p1', name: 'local', baseUrl: 'http://localhost:8080/v1', enabled: true, keyMasked: '', models: ['auto', 'hand-added'], defaultModel: 'auto' }]}
+        providers={[{ id: 'p1', name: 'local', baseUrl: 'http://localhost:8080/v1', enabled: true, keyMasked: '', models: ['auto', 'hand-added'] }]}
         activeProvider="p0"
         onDismiss={() => {}}
         onRefresh={async () => {}}
-        onSelectActive={async () => {}}
+       
       />,
     ))
     await act(async () => button('Sync from /models').click())
@@ -500,8 +503,9 @@ describe('settings dialog', () => {
     await act(async () => button('Save').click())
     const rows = [...document.body.querySelectorAll('li')].map((node) => node.textContent ?? '')
     expect(rows.some((text) => text.includes('auto-2'))).toBe(true)
-    // It was the provider default, so the default follows the new id.
-    expect(document.body.querySelector('button[aria-label="auto-2 is this provider\'s default model"]')).not.toBeNull()
+    // The rename leaves no per-provider default control behind.
+    expect(document.body.querySelector('button[aria-pressed]')).toBeNull()
+    expect(button('Save changes').disabled).toBe(false)
   })
 
   it('sets image input as a type checkbox, and can hand it back to the default', async () => {
@@ -516,13 +520,30 @@ describe('settings dialog', () => {
     expect(row.textContent).toContain('Vision')
   })
 
-  it('offers the global default and the connection test only for saved configuration', async () => {
+  it('offers the connection test only for saved configuration', async () => {
     await render()
-    expect(button('Set as global default').disabled).toBe(false)
     expect(button('Test connection').disabled).toBe(false)
     await act(async () => type(input('Name'), 'local edited'))
-    expect(button('Set as global default').disabled).toBe(true)
-    expect(button('Set as global default').title).toBe('Save or discard your changes first.')
     expect(button('Test connection').disabled).toBe(true)
+  })
+
+  it('tests one model from its row and reports the verdict there', async () => {
+    await render()
+    expect(button('Test model auto')).not.toBeNull()
+
+    await act(async () => button('Test model auto').click())
+    expect(vi.mocked(testProvider)).toHaveBeenCalledWith('p1', 'auto')
+    expect(document.body.textContent).toContain('Model replied.')
+
+    // A refusal arrives as a rejected request (the API throws on !ok), and must
+    // still land on the row instead of escaping to the panel-level notice.
+    vi.mocked(testProvider).mockRejectedValueOnce(new Error('HTTP 502: {"ok":false,"error":"no such model"}'))
+    await act(async () => button('Test model auto').click())
+    expect(document.body.textContent).not.toContain('Model replied.')
+    expect(document.body.querySelector('.error-notice')?.textContent).toContain('no such model')
+
+    await act(async () => type(input('Name'), 'local edited'))
+    expect(document.body.querySelector('.error-notice')).toBeNull()
+    expect(button('Test model auto').disabled).toBe(true)
   })
 })

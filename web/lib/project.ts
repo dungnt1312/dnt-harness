@@ -1,5 +1,6 @@
 import type { AttachmentRef, SseEvent, ToolCall } from './types.ts'
 import { toolTarget } from './format.ts'
+import { mcpServerOf } from './tool-facts.ts'
 
 /** View items projected from the durable log — the UI's deriveMessages(). */
 export type ViewItem =
@@ -27,7 +28,21 @@ export type ViewItem =
       /** True while the owning turn is still open — the turn footer waits for it to close. */
       turnOpen?: boolean
     }
-  | { readonly kind: 'tool'; readonly call: ToolCall; readonly ts?: number; doneAt?: number; result?: { readonly ok: boolean; readonly output: string }; /** Recovery-synthesized result: the real outcome is unknown. */ recovered?: boolean; /** `mcp__<server>__<tool>` calls carry their server for the chip. */ server?: string }
+  | {
+      readonly kind: 'tool'
+      readonly call: ToolCall
+      readonly ts?: number
+      doneAt?: number
+      result?: { readonly ok: boolean; readonly output: string }
+      /** Recovery-synthesized result: the real outcome is unknown. */
+      recovered?: boolean
+      /** `mcp__<server>__<tool>` calls carry their server for the chip. */
+      server?: string
+      /** MCP structured outcome. Absent for non-MCP tools. */
+      outcome?: 'success' | 'error' | 'indeterminate' | 'audit_fault'
+      /** MCP invocation id, when the result carried one. */
+      invocationId?: string
+    }
   | {
       readonly kind: 'delegation'
       readonly childSessionId: string
@@ -50,14 +65,6 @@ interface AssistantDraft {
   controls?: { readonly model?: string; readonly provider?: string }
   turnId?: string
   turnOpen?: boolean
-}
-
-/** `mcp__<server>__<tool>` (the Claude convention) — undefined for built-ins. */
-function mcpServerOf(name: string): string | undefined {
-  if (!name.startsWith('mcp__')) return undefined
-  const rest = name.slice('mcp__'.length)
-  const boundary = rest.indexOf('__')
-  return boundary > 0 ? rest.slice(0, boundary) : undefined
 }
 
 const DECISION_LABELS: Readonly<Record<string, string>> = {
@@ -203,6 +210,8 @@ export function projectItems(events: readonly SseEvent[]): ViewItem[] {
           item.result = { ok: event.ok === true, output: event.output ?? '' }
           if (event.timestamp !== undefined) item.doneAt = event.timestamp
           if (event.recovery === true) item.recovered = true
+          if (event.outcome !== undefined) item.outcome = event.outcome
+          if (event.invocationId !== undefined) item.invocationId = event.invocationId
         }
         break
       }

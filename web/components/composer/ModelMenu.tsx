@@ -46,7 +46,10 @@ export function ModelMenu({ menuLabel, disabled = false, modelLabel, modelValue,
       side="top"
       align="end"
       panelClassName="w-[min(560px,calc(100vw-24px))] p-0"
-      triggerClassName={composerChipClass}
+      // The one chip that gives way when the row is tight — but never to
+      // nothing: a model chip with no name tells the reader less than a
+      // truncated one.
+      triggerClassName={`${composerChipClass} min-w-[5.5rem]`}
       trigger={(open) => (
         <>
           <span className="truncate" title={providerName !== null ? `${providerName} / ${modelName}` : modelName}>{modelName}</span>

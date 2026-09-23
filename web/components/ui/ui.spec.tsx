@@ -65,7 +65,7 @@ describe('runtime provider UI helpers', () => {
 
   it('settings dialog exposes all ten sections as linked tabs and lists providers', () => {
     const html = renderToStaticMarkup(
-      <SettingsModal open workspaceId="ws-1" providers={meta.providers} activeProvider="cliproxy1" activeModel="gpt-5.6-sol" onDismiss={() => undefined} onRefresh={async () => undefined} onSelectActive={async () => undefined} />,
+      <SettingsModal open workspaceId="ws-1" providers={meta.providers} activeProvider="cliproxy1" activeModel="gpt-5.6-sol" onDismiss={() => undefined} onRefresh={async () => undefined} />,
     )
     expect(html).toContain('aria-modal="true"')
     expect(html).toContain('aria-label="Settings"')
@@ -86,7 +86,7 @@ describe('runtime provider UI helpers', () => {
 
   it('settings dialog never renders a raw key field value', () => {
     const html = renderToStaticMarkup(
-      <SettingsModal open workspaceId="ws-1" providers={meta.providers} activeProvider="cliproxy1" onDismiss={() => undefined} onRefresh={async () => undefined} onSelectActive={async () => undefined} />,
+      <SettingsModal open workspaceId="ws-1" providers={meta.providers} activeProvider="cliproxy1" onDismiss={() => undefined} onRefresh={async () => undefined} />,
     )
     expect(html).toContain('type="password"')
     expect(html).not.toMatch(/value="sk-/)

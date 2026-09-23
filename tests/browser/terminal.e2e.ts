@@ -80,7 +80,7 @@ async function fixture(page: Page, options: { readonly shells?: readonly { id: s
       workspace: { id: 'w', name: 'Fixture workspace', archived: false },
       provider: 'fixture-provider',
       model: 'fixture-model',
-      providers: [{ id: 'fixture-provider', name: 'Fixture provider', baseUrl: 'http://fixture.invalid', enabled: true, keyMasked: '***', models: ['fixture-model'], defaultModel: 'fixture-model', modelSettings: {} }],
+      providers: [{ id: 'fixture-provider', name: 'Fixture provider', baseUrl: 'http://fixture.invalid', enabled: true, keyMasked: '***', models: ['fixture-model'], modelSettings: {} }],
       models: ['fixture-model'],
       policy: { Bash: 'ask' },
       thinkingLevel: null,

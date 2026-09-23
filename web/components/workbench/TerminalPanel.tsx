@@ -47,6 +47,12 @@ interface Attached {
   pendingInput: string
   inputTimer: ReturnType<typeof setTimeout> | undefined
   resizeTimer: ReturnType<typeof setTimeout> | undefined
+  /**
+   * Whether `onData` may reach the PTY. False while replaying scrollback:
+   * xterm parses writes asynchronously and answers device queries it finds,
+   * and those answers must not be typed into the live shell.
+   */
+  acceptInput: boolean
 }
 
 /**
@@ -65,6 +71,9 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
   readonly onDefaultShell?: (shellId: string | null) => void
 }) {
   const [rows, setRows] = useState<readonly TerminalRow[]>([])
+  // The view shows one project's shells. A terminal with no project only
+  // appears while no project is open.
+  const visibleRows = rows.filter((row) => (row.projectId ?? null) === projectId)
   const [shells, setShells] = useState<readonly ShellRow[]>([])
   const [max, setMax] = useState(4)
   const [unavailable, setUnavailable] = useState<string | null>(null)
@@ -109,9 +118,16 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
     term.loadAddon(fit)
     term.open(host)
 
-    const record: Attached = { term, fit, host, pendingInput: '', inputTimer: undefined, resizeTimer: undefined }
+    const record: Attached = { term, fit, host, pendingInput: '', inputTimer: undefined, resizeTimer: undefined, acceptInput: true }
 
+    // `onData` fires for keystrokes AND for replies xterm synthesizes while
+    // parsing output (Primary DA `ESC[?1;2c` is the one Git Bash provokes with
+    // `CSI c` at startup and again on every resize). A reload replays
+    // scrollback into a fresh instance, so that reply would be written back
+    // into a shell whose line discipline is already echoing — which is the
+    // stray `1;2c` on the prompt. Replies are not input; only keystrokes are.
     term.onData((chunk) => {
+      if (!record.acceptInput) return
       record.pendingInput += chunk
       if (record.inputTimer !== undefined) return
       record.inputTimer = setTimeout(() => {
@@ -175,17 +191,38 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
         }
         setRows(frame.terminals.map(({ scrollback: _scrollback, ...info }) => info))
         for (const entry of frame.terminals) {
+          // Another project's shell stays alive on the host but is not drawn
+          // here; attaching it would show its prompt in this project's view.
+          if ((entry.projectId ?? null) !== projectId) continue
           const record = attach(entry.id, entry.cols, entry.rows)
           if (record === undefined) continue
+          // Writes are parsed on a later turn, and a replayed `CSI c` (Git
+          // Bash sends one at startup and on resize) makes xterm answer
+          // `ESC[?1;2c` through onData. Hold input across that turn so the
+          // answer is not written into the shell as `1;2c`.
+          record.acceptInput = false
+          if (record.inputTimer !== undefined) {
+            clearTimeout(record.inputTimer)
+            record.inputTimer = undefined
+            record.pendingInput = ''
+          }
           record.term.reset()
-          record.term.write(fromBase64(entry.scrollback))
+          record.term.write(fromBase64(entry.scrollback), () => {
+            record.acceptInput = true
+          })
         }
-        setActiveId((current) => (current !== null && present.has(current) ? current : frame.terminals[0]?.id ?? null))
+        setActiveId((current) => {
+          const mine = frame.terminals.filter((entry) => (entry.projectId ?? null) === projectId)
+          return current !== null && mine.some((entry) => entry.id === current) ? current : mine[0]?.id ?? null
+        })
         setReady(true)
         return
       }
       if (frame.kind === 'created') {
         setRows((current) => current.some((row) => row.id === frame.terminal.id) ? current : [...current, frame.terminal])
+        // The stream is per workspace, so a shell opened for another project
+        // arrives here too. Remember it, but do not surface it in this view.
+        if ((frame.terminal.projectId ?? null) !== projectId) return
         attach(frame.terminal.id, frame.terminal.cols, frame.terminal.rows)
         setActiveId(frame.terminal.id)
         return
@@ -206,7 +243,7 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
       unsubscribe()
       for (const id of [...instances.keys()]) detach(id)
     }
-  }, [workspaceId, attach, detach])
+  }, [workspaceId, projectId, attach, detach])
 
   const open = useCallback(async (shellId?: string): Promise<void> => {
     if (workspaceId === null) return
@@ -237,10 +274,10 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
   // once per mount, an empty workspace gets one terminal on the preferred
   // shell. Closing the last one is a decision, so it is never undone here.
   useEffect(() => {
-    if (!ready || autoOpened.current || unavailable !== null || rows.length > 0) return
+    if (!ready || autoOpened.current || unavailable !== null || visibleRows.length > 0) return
     autoOpened.current = true
     void open(preferredShell)
-  }, [ready, unavailable, rows.length, preferredShell, open])
+  }, [ready, unavailable, visibleRows.length, preferredShell, open])
 
   // Only the selected terminal is visible, and it refits whenever it becomes
   // so: xterm cannot measure a hidden element, so fitting on mount alone
@@ -304,12 +341,13 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
     )
   }
 
+  // The cap is the workspace's, so shells open in other projects count.
   const atCap = rows.length >= max
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex h-9 shrink-0 items-center gap-0.5 border-b border-line px-1.5" role="toolbar" aria-label="Terminals">
-        {rows.map((row) => (
+        {visibleRows.map((row) => (
           <span
             key={row.id}
             className={cn('group flex h-7 shrink-0 items-center rounded-md', row.id === activeId ? 'bg-muted' : 'hover:bg-hover')}
@@ -402,7 +440,7 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
       ) : null}
 
       <div className="relative min-h-0 flex-1 overflow-hidden bg-bg" ref={mountRef}>
-        {rows.length === 0 ? (
+        {visibleRows.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
             <Icon name="terminal" size={22} className="text-fg-faint" />
             <p className="m-0 text-sm font-medium">No terminal open</p>

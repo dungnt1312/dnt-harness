@@ -36,8 +36,8 @@ Inline styles are limited to runtime values (spinner size, context budget percen
 ## Composition
 
 - `App.tsx` keeps routing, server-backed state, navigation generations and send/stop/approval/retry logic, and composes `Sidebar`, `ChatHeader` (with the folder `ScopeControl`), `Transcript`, `TaskStatus`, `ApprovalBar`, `Composer` (with `ModelMenu`), `Workbench`, `SettingsModal`, `FolderPickerModal` and `ConfirmDialog`.
-- `Transcript` renders `groupBlocks(items)`: consecutive tool/delegation/audit rows share one activity block; `completed` markers and a bare `failed` after a detailed failure card are dropped.
-- `Composer` owns the textarea and the scope, mode, thinking (`ThinkingMenu`) and permission (`PolicyPopover`) chips (`composer-chip.ts`). The model picker lives in the header.
+- `Transcript` renders `groupBlocks(items)`: consecutive lookup tool and audit rows share one activity block, while write tools (`STANDALONE_TOOLS`), delegations and reasoning-only steps stay their own block; `completed` markers and a bare `failed` after a detailed failure card are dropped. `ActivityBlock` collapses a block of four rows or more behind `summarizeActivity`, opening while it runs, while a row failed or ended unknown, or when the reader says so. Block spacing is per neighbour (`isQuiet`), not one flat column gap.
+- `Composer` owns the textarea and the scope, mode (`ModeMenu`, with a read-only summary of what the mode permits) and thinking (`ThinkingMenu`) chips (`composer-chip.ts`). The model picker lives in the header. Permission lives in the mode, authored in Settings → Modes — the composer has no permission chip.
 - Settings keeps its request contracts: provider draft seeding, dirty-leave confirmation, blank stored-key omission, activation, test/sync/delete; Skills/Memory 409 require explicit Reload or Overwrite; Hooks raw JSON is validated whole and kept verbatim when invalid.
 
 ## Do-not list

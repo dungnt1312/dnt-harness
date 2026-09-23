@@ -73,9 +73,8 @@ export function ControlsStatus({ message, onRetry }: { readonly message: string;
  * The `+` menu: upload from this device, or mention a project file. Mention
  * reuses the `@` flow so there is one file-search surface, not two.
  */
-export function AttachMenu({ uploading, disabled, onUpload, onMention }: {
+export function AttachMenu({ uploading, onUpload, onMention }: {
   readonly uploading: boolean
-  readonly disabled: boolean
   readonly onUpload?: (() => void) | undefined
   readonly onMention?: (() => void) | undefined
 }) {
@@ -84,7 +83,6 @@ export function AttachMenu({ uploading, disabled, onUpload, onMention }: {
       label="Attach a file"
       side="top"
       align="start"
-      disabled={disabled}
       triggerClassName="flex size-8 shrink-0 items-center justify-center rounded-full text-fg-muted transition-colors hover:bg-hover hover:text-fg disabled:pointer-events-none disabled:opacity-40 [@media(pointer:coarse)]:size-11"
       trigger={() => (uploading ? <Spinner size={14} /> : <Icon name="plus" size={18} />)}
     >

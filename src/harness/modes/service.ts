@@ -19,6 +19,8 @@ export type { ModeDefinition, ModeFrontmatter, ModeSources, ResolvedMode }
  */
 export class ModesService {
   private readonly home: string
+  /** Tails of per-file mutation queues; unrelated modes proceed independently. */
+  private readonly mutationTails = new Map<string, Promise<void>>()
 
   constructor(home: string) {
     this.home = home
@@ -28,8 +30,36 @@ export class ModesService {
     return path.join(this.home, 'workspaces', workspaceId, 'modes')
   }
 
+  /**
+   * Mode ids are filenames, never paths. Validate before bundled lookup or any
+   * filesystem operation so decoded URL separators cannot escape `modes/`.
+   */
+  private assertModeId(id: string): void {
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) {
+      throw new ModeError('invalid', `mode id '${id}' must be kebab-case`)
+    }
+  }
+
   private filePath(workspaceId: string, id: string): string {
+    this.assertModeId(id)
     return path.join(this.dir(workspaceId), `${id}.md`)
+  }
+
+  /** Serialize mutations only for one workspace-mode pair. */
+  private async withMutationLock<T>(workspaceId: string, id: string, operation: () => Promise<T>): Promise<T> {
+    const key = `${workspaceId}\u0000${id}`
+    const previous = this.mutationTails.get(key) ?? Promise.resolve()
+    let release!: () => void
+    const current = new Promise<void>((resolve) => { release = resolve })
+    const tail = previous.then(() => current)
+    this.mutationTails.set(key, tail)
+    await previous
+    try {
+      return await operation()
+    } finally {
+      release()
+      if (this.mutationTails.get(key) === tail) this.mutationTails.delete(key)
+    }
   }
 
   /** Bundled + workspace modes (custom overrides never shadow bundled ids). */
@@ -61,6 +91,7 @@ export class ModesService {
    * file. Unknown and invalid ids both fail loud.
    */
   async resolve(workspaceId: string, id: string): Promise<ResolvedMode> {
+    this.assertModeId(id)
     const bundled = BUNDLED_MODES.find((mode) => mode.id === id)
     if (bundled !== undefined) return { definition: bundled, source: 'bundled' }
     let raw: string
@@ -74,50 +105,133 @@ export class ModesService {
   }
 
   /**
+   * One mode's raw Markdown, for an editor. `resolve` returns the parsed
+   * definition, which is not something a file editor can round-trip. A
+   * bundled id yields the canonical serialization — exactly what Duplicate
+   * would write — with no hash, because there is no file to conflict with.
+   */
+  async load(workspaceId: string, id: string): Promise<{ id: string; raw: string; source: 'bundled' | 'workspace'; hash?: string }> {
+    this.assertModeId(id)
+    const bundled = BUNDLED_MODES.find((mode) => mode.id === id)
+    if (bundled !== undefined) return { id, raw: serializeModeFile(bundled), source: 'bundled' }
+    let raw: string
+    try {
+      raw = await fs.readFile(this.filePath(workspaceId, id), 'utf8')
+    } catch {
+      throw new ModeError('not-found', `no mode '${id}'`)
+    }
+    parseModeFile(id, raw) // never hand back content that would not load
+    return { id, raw, source: 'workspace', hash: sha256(raw) }
+  }
+
+  /**
    * Create or replace a workspace mode file. Content is the raw Markdown
    * (frontmatter + instructions body); it is validated BEFORE the write
    * lands, and `expectedHash` conflicts surface instead of clobbering
    * external edits.
    */
   async save(workspaceId: string, id: string, raw: string, expectedHash?: string): Promise<ResolvedMode> {
+    this.assertModeId(id)
     if (BUNDLED_MODES.some((mode) => mode.id === id)) {
       throw new ModeError('duplicate', `'${id}' is a bundled mode; duplicate it to customize`)
     }
-    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) {
-      throw new ModeError('invalid', `mode id '${id}' must be kebab-case`)
-    }
-    parseModeFile(id, raw) // validate before writing anything
-    const file = this.filePath(workspaceId, id)
-    await fs.mkdir(path.dirname(file), { recursive: true })
-    let current: string | undefined
-    try {
-      current = await fs.readFile(file, 'utf8')
-    } catch {
-      current = undefined
-    }
-    if (current !== undefined && expectedHash !== undefined && sha256(current) !== expectedHash) {
-      throw new ModeError('invalid', `conflict: '${id}' changed externally; re-read before saving`)
-    }
-    // Atomic replacement (temp + sync + rename): a crash mid-write never
-    // leaves a half-valid mode file behind. The hash recheck narrows —
-    // though it cannot eliminate — the external-editor race; the remaining
-    // platform TOCTOU is a documented limit, not a guarantee.
-    await replaceFileAtomic(file, raw)
-    return { definition: parseModeFile(id, raw), source: 'workspace', hash: sha256(raw) }
+    const definition = parseModeFile(id, raw) // validate before writing anything
+    return this.withMutationLock(workspaceId, id, async () => {
+      const file = this.filePath(workspaceId, id)
+      let current: string | undefined
+      try {
+        current = await fs.readFile(file, 'utf8')
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+      if (current === undefined ? expectedHash !== undefined : expectedHash === undefined || sha256(current) !== expectedHash) {
+        throw new ModeError('conflict', `conflict: '${id}' changed externally; re-read before saving`)
+      }
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      // Atomic replacement (temp + sync + rename): a crash mid-write never
+      // leaves a half-valid mode file behind. This in-process lock makes the
+      // check/write sequence coherent with concurrent API saves and deletes.
+      await replaceFileAtomic(file, raw)
+      // A saved mode is an enabled mode: a recreated id must not inherit the
+      // old entry's hidden state.
+      await this.withMutationLock(workspaceId, '.disabled', async () => {
+        const disabled = new Set(await this.disabledIds(workspaceId))
+        if (!disabled.delete(id)) return
+        const stateFile = this.disabledPath(workspaceId)
+        await replaceFileAtomic(stateFile, `${JSON.stringify({ disabled: [...disabled] }, null, 2)}\n`)
+      })
+      return { definition, source: 'workspace', hash: sha256(raw) }
+    })
   }
 
   /** Duplicate a bundled (or any) mode into the workspace for customization. */
   async duplicate(workspaceId: string, sourceId: string, newId: string): Promise<ResolvedMode> {
+    this.assertModeId(sourceId)
+    this.assertModeId(newId)
     const source = await this.resolve(workspaceId, sourceId)
     const raw = serializeModeFile({ ...source.definition, id: newId })
     return this.save(workspaceId, newId, raw)
   }
 
   async delete(workspaceId: string, id: string): Promise<void> {
+    this.assertModeId(id)
     if (BUNDLED_MODES.some((mode) => mode.id === id)) {
       throw new ModeError('duplicate', 'bundled modes cannot be deleted')
     }
-    await fs.rm(this.filePath(workspaceId, id), { force: true })
+    await this.withMutationLock(workspaceId, id, async () => {
+      try {
+        await fs.rm(this.filePath(workspaceId, id))
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          throw new ModeError('not-found', `no mode '${id}'`)
+        }
+        throw error
+      }
+    })
+  }
+
+  // ── Workspace enablement ──────────────────────────────────────────────────
+  // A per-workspace disabled set, persisted beside the mode files it governs.
+  // Absent ids (a deleted file, a mode that returns) are ignored wherever the
+  // set is consulted, and saving a mode clears its entry, so a recreated id
+  // starts enabled.
+
+  private disabledPath(workspaceId: string): string {
+    return path.join(this.dir(workspaceId), '.disabled.json')
+  }
+
+  /** Ids this workspace has hidden from its mode picker. Absent file → none. */
+  async disabledIds(workspaceId: string): Promise<readonly string[]> {
+    let raw: string
+    try {
+      raw = await fs.readFile(this.disabledPath(workspaceId), 'utf8')
+    } catch {
+      return []
+    }
+    try {
+      const parsed = JSON.parse(raw) as { disabled?: unknown }
+      if (!Array.isArray(parsed.disabled)) return []
+      return parsed.disabled.filter((id): id is string => typeof id === 'string')
+    } catch {
+      return []
+    }
+  }
+
+  /**
+   * Show or hide one mode in this workspace's picker. Bundled modes may be
+   * hidden too; the mode must exist, and the selected-mode refusal lives at
+   * the route, which knows the live controls.
+   */
+  async setEnabled(workspaceId: string, id: string, enabled: boolean): Promise<void> {
+    await this.resolve(workspaceId, id) // not-found / invalid surfaces here
+    await this.withMutationLock(workspaceId, '.disabled', async () => {
+      const current = new Set(await this.disabledIds(workspaceId))
+      if (enabled) current.delete(id)
+      else current.add(id)
+      const file = this.disabledPath(workspaceId)
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      await replaceFileAtomic(file, `${JSON.stringify({ disabled: [...current] }, null, 2)}\n`)
+    })
   }
 }
 
@@ -126,6 +240,22 @@ const KNOWN_FRONTMATTER_KEYS = new Set([
   'name', 'description', 'history', 'workspaceInstructions', 'skills',
   'memoryPinned', 'memoryRetrieval', 'toolExposure', 'permissionDefaults',
 ])
+
+/**
+ * The permission keys the approval gate can actually match: an exact known
+ * tool, an exact MCP tool, an `mcp__<server>__*` wildcard, or the catch-all
+ * `*`. Anything else — `mcp__*__read`, `Ba*h`, a legacy lowercase `bash` —
+ * would be stored and then silently never apply, so it is rejected at the
+ * boundary instead. Mirrors the resolution order in `approval/policy.ts`.
+ */
+function isPermissionKey(tool: string): boolean {
+  if (tool === '*' || KNOWN_MODE_TOOLS.includes(tool)) return true
+  const parts = tool.split('__')
+  return parts.length === 3
+    && parts[0] === 'mcp'
+    && /^[A-Za-z0-9_-]+$/.test(parts[1] ?? '')
+    && (parts[2] === '*' || (parts[2] !== '' && !parts[2]?.includes('*')))
+}
 
 /**
  * Parse and validate one mode file STRICTLY: unknown keys, invalid enum
@@ -201,8 +331,8 @@ export function parseModeFile(id: string, raw: string): ModeDefinition {
       invalid.push("'permissionDefaults' must be an object of tool → allow|ask|deny")
     } else {
       for (const [tool, mode] of Object.entries(frontmatter.permissionDefaults as Record<string, unknown>)) {
-        if (!KNOWN_MODE_TOOLS.includes(tool)) {
-          invalid.push(`'permissionDefaults' names unknown tool '${tool}'`)
+        if (!isPermissionKey(tool)) {
+          invalid.push(`'permissionDefaults' key '${tool}' would never match; use a known tool (${KNOWN_MODE_TOOLS.join(', ')}), 'mcp__<server>__<tool>', 'mcp__<server>__*', or '*'`)
         } else if (mode === 'allow' || mode === 'ask' || mode === 'deny') {
           permissionDefaults[tool] = mode
         } else {

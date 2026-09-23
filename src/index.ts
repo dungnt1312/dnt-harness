@@ -246,6 +246,30 @@ export {
   type HookBinding,
 } from './harness/mcp/config.ts'
 export {
+  MCP_ACCEPTED_PROTOCOL_VERSION,
+  PROTOCOL_VERSION_TABLE,
+  DEPLOYMENT_BOUNDARY,
+  MCP_METADATA_DESCRIPTION_MAX,
+  MCP_METADATA_NAME_MAX,
+  acceptProtocolVersion,
+  receiptForTransportFailure,
+  boundToolMetadata,
+  annotationMayReduceApproval,
+  type McpDiagnostic,
+  type DispatchReceipt,
+  type DispatchNotSentReason,
+  type DispatchMaybeSentReason,
+  type UntrustedToolMetadata,
+} from './harness/mcp/boundaries.ts'
+export {
+  ROUTE_INVENTORY,
+  privilegedRoutes,
+  type RouteInventoryEntry,
+  type RouteAuth,
+  type RouteCredential,
+  type RouteOwner,
+} from './harness/mcp/route-inventory.ts'
+export {
   McpServerClient,
   McpTransportError,
   MCP_PROTOCOL_VERSION,
@@ -253,6 +277,18 @@ export {
   type McpCallResult,
   type TransportState,
 } from './harness/mcp/client.ts'
+export { McpDispatchError } from './harness/mcp/boundaries.ts'
+export { DataHomeLock, OwnershipError } from './harness/mcp/ownership-lock.ts'
+export { MutationStore } from './harness/mcp/mutation-store.ts'
+export { McpExecutionJournal } from './harness/mcp/execution-journal.ts'
+export { dispatchToolCall, AuditFaultBlock, faultIsOpen, clearAuditFault } from './harness/mcp/execution-coordinator.ts'
+export { applyMigration, dryRunMigration, assertBinaryCanOpen, THIS_BINARY, planMigration } from './harness/mcp/migration.ts'
+export { minimalStdioEnv, containmentCapability, assertHardContainmentAvailable } from './harness/mcp/process-controller.ts'
+export { assertOutboundUrl, OutboundPolicyError } from './harness/mcp/outbound-policy.ts'
+export { SseParser } from './harness/mcp/sse-parser.ts'
+export { ManagedOAuth } from './harness/mcp/oauth.ts'
+export { OAuthStore } from './harness/mcp/oauth-store.ts'
+export { bearerAllows } from './web/control-plane-auth.ts'
 export {
   runHook,
   isBlockingDecision,
@@ -261,6 +297,8 @@ export {
 } from './harness/hooks/runner.ts'
 
 // ── Web host ──────────────────────────────────────────────────────────────
+export { ControlPlaneAuthService, isPublicPath, SESSION_COOKIE } from './web/control-plane-auth.ts'
+export { checkCanonicalOrigin, csrfTokensMatch, CSRF_HEADER } from './web/csrf.ts'
 export {
   createWebServer,
   extractModelIds,

@@ -24,6 +24,14 @@ export function formatDuration(start?: number, end?: number): string {
   return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1_000)}s`
 }
 
+/** Time left before a deadline: `4:32`, `0:07`, or `now` once it is reached. */
+export function formatCountdown(expiresAt: number, now = Date.now()): string {
+  const remaining = expiresAt - now
+  if (remaining <= 0) return 'now'
+  const seconds = Math.ceil(remaining / 1_000)
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
+}
+
 /** Short one-line summary of tool arguments: `{ path: 'src/x.ts', … }`. */
 export function argsSummary(args: Record<string, unknown>): string {
   const entries = Object.entries(args)
@@ -55,6 +63,37 @@ export function toolTarget(args: Record<string, unknown>): string {
     if (typeof value === 'string' && value !== '') return value
   }
   return ''
+}
+
+/**
+ * A path narrow enough for one activity row: it keeps its last segments,
+ * because deep paths share a prefix and differ at the end. The full value
+ * stays in the row's title. Only paths may be shortened this way — splitting
+ * a shell command on `/` would drop the verb and keep an argument.
+ */
+export function shortPath(target: string, segments = 2): string {
+  const parts = target.split(/[\\/]/).filter((part) => part !== '')
+  if (parts.length <= segments) return target
+  return `…/${parts.slice(-segments).join('/')}`
+}
+
+/**
+ * A command or pattern narrow enough for one activity row: newlines collapse
+ * to spaces and the middle is elided, because the verb at the front and the
+ * argument at the end are both what the row is read for.
+ */
+export function shortCommand(command: string, max = 64): string {
+  const flat = command.replace(/\s+/g, ' ').trim()
+  if (flat.length <= max) return flat
+  const head = Math.ceil((max - 1) * 0.65)
+  return `${flat.slice(0, head).trimEnd()}…${flat.slice(flat.length - (max - 1 - head)).trimStart()}`
+}
+
+/** Human-readable size for an attachment chip or a recorded payload. */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
 /** Budget fill tone by usage ratio: state color thresholds (≥80 warn, ≥95 bad). */

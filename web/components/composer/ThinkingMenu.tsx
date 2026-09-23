@@ -43,7 +43,9 @@ export function ThinkingMenu({ menuLabel = 'Default thinking level for new conve
       label={menuLabel}
       disabled={disabled}
       side="top"
-      triggerClassName={composerChipClass}
+      // Never the chip that gives: the level is two words at most, while the
+      // model name beside it is what should truncate when the row is tight.
+      triggerClassName={`${composerChipClass} shrink-0`}
       trigger={() => (
         <>
           <Icon name="lightbulb" size={15} />

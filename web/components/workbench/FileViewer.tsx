@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import Icon from '../common/Icon.tsx'
 import CopyButton from '../common/CopyButton.tsx'
 import { ErrorNotice } from '../common/ErrorNotice.tsx'
@@ -6,6 +6,7 @@ import { Spinner } from '../common/Spinner.tsx'
 import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { readProjectFile, type ProjectFileView } from '../../lib/api.ts'
+import type { ViewerFocus } from '../../hooks/useWorkbenchFiles.ts'
 import { fileStyle } from '../../lib/file-icons.ts'
 import { cn } from '../../lib/cn.ts'
 import { escapeHtml, highlight, languageOfFile } from '../../lib/highlight.ts'
@@ -14,16 +15,23 @@ import { escapeHtml, highlight, languageOfFile } from '../../lib/highlight.ts'
 const HIGHLIGHT_LIMIT = 200_000
 
 /** Read-only file view: path bar, language, copy, and line-numbered highlighted content. */
-export function FileViewer({ workspaceId, projectId, projectPath, path }: {
+export function FileViewer({ workspaceId, projectId, projectPath, path, focus = null }: {
   readonly workspaceId: string
   readonly projectId: string
   readonly projectPath: string
   readonly path: string
+  /** The window the caller opened this file at; null lands at the top. */
+  readonly focus?: ViewerFocus | null
 }) {
   const [file, setFile] = useState<ProjectFileView | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const generation = useRef(0)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const numbersRef = useRef<HTMLPreElement>(null)
+  // Measured, never assumed: the gutter shares the content's line grid, and a
+  // reader's root font size may not be the one this was designed at.
+  const [metrics, setMetrics] = useState<{ lineHeight: number; offset: number } | null>(null)
 
   const load = useCallback(async () => {
     const request = ++generation.current
@@ -47,6 +55,34 @@ export function FileViewer({ workspaceId, projectId, projectPath, path }: {
     return file.content.length > HIGHLIGHT_LIMIT ? escapeHtml(file.content) : highlight(file.content, language)
   }, [file, language])
   const lineCount = file === null || file.binary ? 0 : file.content.replace(/\n$/, '').split('\n').length
+
+  useLayoutEffect(() => {
+    const numbers = numbersRef.current
+    if (numbers === null || lineCount === 0) return
+    const style = getComputedStyle(numbers)
+    const top = Number.parseFloat(style.paddingTop)
+    const bottom = Number.parseFloat(style.paddingBottom)
+    if (!Number.isFinite(top) || !Number.isFinite(bottom)) return
+    const height = (numbers.clientHeight - top - bottom) / lineCount
+    if (!Number.isFinite(height) || height <= 0) return
+    setMetrics({ lineHeight: height, offset: top })
+  }, [lineCount, html])
+
+  // Landing on the lines a tool read, rather than the top of a 2000-line file.
+  useEffect(() => {
+    const container = scrollRef.current
+    if (focus === null || container === null || metrics === null || lineCount === 0) return
+    const target = Math.min(Math.max(focus.line, 1), lineCount)
+    const top = metrics.offset + (target - 1) * metrics.lineHeight
+    container.scrollTop = Math.max(0, top - container.clientHeight / 3)
+  }, [focus?.line, focus?.seq, metrics, lineCount])
+
+  const band = focus !== null && metrics !== null && lineCount > 0
+    ? {
+        top: metrics.offset + (Math.min(Math.max(focus.line, 1), lineCount) - 1) * metrics.lineHeight,
+        height: Math.min(Math.max(focus.lines ?? 1, 1), Math.max(lineCount - focus.line + 1, 1)) * metrics.lineHeight,
+      }
+    : null
   const icon = fileStyle(path)
   const separator = projectPath.includes('\\') ? '\\' : '/'
   const fullPath = `${projectPath.replace(/[\\/]+$/, '')}${separator}${path.split('/').join(separator)}`
@@ -74,13 +110,16 @@ export function FileViewer({ workspaceId, projectId, projectPath, path }: {
           {file.binary ? (
             <p className="m-0 p-4 text-sm text-fg-muted">Binary file ({file.size.toLocaleString()} bytes) — not shown.</p>
           ) : (
-            <div className="min-h-0 flex-1 overflow-auto" role="region" aria-label={`Contents of ${path}`} tabIndex={0}>
+            <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto" role="region" aria-label={`Contents of ${path}`} tabIndex={0}>
               {file.truncated ? <p className="m-0 border-b border-line bg-warn-soft px-3 py-1.5 text-xs text-warn">File is larger than 1 MB; only the beginning is shown.</p> : null}
-              <div className="flex min-w-max font-mono text-[12.5px] leading-5">
-                <pre aria-hidden="true" className="m-0 select-none py-2 pl-3 pr-4 text-right text-fg-faint">
+              <div className="relative flex min-w-max font-mono text-[12.5px] leading-5">
+                {/* The lines the caller opened this file for. Both columns are
+                    positioned, so the band stays behind their text. */}
+                {band !== null ? <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 bg-warn-soft" style={{ top: band.top, height: band.height }} /> : null}
+                <pre ref={numbersRef} aria-hidden="true" className="relative m-0 select-none py-2 pl-3 pr-4 text-right text-fg-faint">
                   {Array.from({ length: lineCount }, (_, index) => index + 1).join('\n')}
                 </pre>
-                <pre className="m-0 py-2 pr-6"><code dangerouslySetInnerHTML={{ __html: html }} /></pre>
+                <pre className="relative m-0 py-2 pr-6"><code dangerouslySetInnerHTML={{ __html: html }} /></pre>
               </div>
             </div>
           )}

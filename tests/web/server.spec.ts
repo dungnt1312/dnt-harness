@@ -158,6 +158,15 @@ describe('web server', () => {
     })
     expect(unknown.status).toBe(400)
 
+    // A provider switch must name the model: inferring one would silently run
+    // and bill a model the operator never picked.
+    const omitted = await fetch(`${baseUrl}/api/model`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'recorder' }),
+    })
+    expect(omitted.status).toBe(400)
+
     const { id } = (await (await post('/api/sessions')).json()) as { id: string }
     const sse = new SseReader(await fetch(`${baseUrl}/api/sessions/${id}/events`))
     void post(`/api/sessions/${id}/messages`, { content: 'go' })
@@ -364,6 +373,29 @@ describe('web server', () => {
     expect(bad.status).toBe(400)
   })
 
+  it('pinning a session is recorded on the session itself and reported by the listing', async () => {
+    await start(['hello there'])
+    const { id } = (await (await post('/api/sessions')).json()) as { id: string }
+    const listed = async (): Promise<boolean | undefined> => {
+      const rows = (await (await fetch(`${baseUrl}/api/sessions`)).json()) as Array<{ id: string; pinned?: boolean }>
+      return rows.find((row) => row.id === id)?.pinned
+    }
+    expect(await listed()).toBe(false)
+
+    const pinned = await patch(`/api/sessions/${id}`, { pinned: true })
+    expect(pinned.status).toBe(200)
+    expect(await pinned.json()).toMatchObject({ id, pinned: true })
+    expect(await listed()).toBe(true)
+
+    // A pin carries no title, and must not reset the one the session has.
+    await patch(`/api/sessions/${id}`, { title: 'kept through pinning' })
+    await patch(`/api/sessions/${id}`, { pinned: false })
+    const rows = (await (await fetch(`${baseUrl}/api/sessions`)).json()) as Array<{ id: string; title: string; pinned?: boolean }>
+    expect(rows.find((row) => row.id === id)).toMatchObject({ title: 'kept through pinning', pinned: false })
+
+    expect((await patch(`/api/sessions/${id}`, { pinned: 'yes' })).status).toBe(400)
+  })
+
   it('deleting a session removes it and closes its SSE stream', async () => {
     await start(['x'])
     const { id } = (await (await post('/api/sessions')).json()) as { id: string }
@@ -472,6 +504,15 @@ describe('provider registry', () => {
       })
       expect(bad.status).toBe(400)
 
+      // The probe answers with the endpoint's list and stores nothing: the
+      // browser offers the operator a choice before anything is replaced.
+      const probed = await fetch(`${base}/api/providers/clip-proxy-one/models`)
+      expect(probed.status).toBe(200)
+      expect((await probed.json() as { models: string[] }).models).toEqual(['gpt-5.6-sol', 'gpt-5.6-terra'])
+      const untouched = JSON.parse(await fs.readFile(config, 'utf8')) as { providers?: { models: string[] }[] }
+      expect(untouched.providers?.[0]?.models).toEqual([])
+      expect((await fetch(`${base}/api/providers/nope/models`)).status).toBe(404)
+
       // Sync pulls the fake /models list and persists into the config file.
       const synced = await fetch(`${base}/api/providers/clip-proxy-one/sync`, { method: 'POST' })
       expect(synced.status).toBe(200)
@@ -485,6 +526,23 @@ describe('provider registry', () => {
       expect(tested.status).toBe(200)
       const ping = fake.seenRequests.find((request) => request.url.endsWith('/chat/completions'))
       expect(ping !== undefined && ping.body['stream']).toBe(false)
+
+      // Per-model test names the row's model on the wire; an unadvertised id
+      // fails at the boundary instead of surfacing a confusing upstream 404.
+      const perModel = await fetch(`${base}/api/providers/clip-proxy-one/test`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-5.6-terra' }),
+      })
+      expect(perModel.status).toBe(200)
+      const pings = fake.seenRequests.filter((request) => request.url.endsWith('/chat/completions'))
+      expect(pings.at(-1)?.body['model']).toBe('gpt-5.6-terra')
+      const bogus = await fetch(`${base}/api/providers/clip-proxy-one/test`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'not-offered' }),
+      })
+      expect(bogus.status).toBe(400)
 
       // Switching active pair rides the same PUT as before.
       const switched = await fetch(`${base}/api/model`, {
@@ -524,6 +582,57 @@ describe('provider registry', () => {
       expect(deleted.status).toBe(200)
       const again = await fetch(`${base}/api/providers/clip-proxy-one`, { method: 'DELETE' })
       expect(again.status).toBe(404)
+    } finally {
+      await s?.close()
+      await fake.stop()
+    }
+  })
+
+  it('tests one named model, rejecting an id the provider does not advertise', async () => {
+    const fake = new FakeOpenAiServer()
+    const fakeBase = await fake.start()
+    const config = path.join(root, 'providers-model-test.json')
+    let s: WebServer | undefined
+    try {
+      await fs.writeFile(config, JSON.stringify({
+        version: 2,
+        defaults: { provider: 'gateway', model: 'gpt-5.6-sol', thinkingLevel: null },
+        providers: [{ id: 'gateway', name: 'gateway', baseUrl: `${fakeBase}/v1`, apiKey: '', models: ['gpt-5.6-sol', 'gpt-5.6-terra'], enabled: true }],
+      }), 'utf8')
+      s = await createWebServer({ root, configFile: config })
+      const base = s.url
+
+      // The named model is exactly what reaches the wire.
+      const named = await fetch(`${base}/api/providers/gateway/test`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'gpt-5.6-terra' }),
+      })
+      expect(named.status).toBe(200)
+      expect(fake.seenRequests.filter((request) => request.url.endsWith('/chat/completions')).at(-1)?.body['model']).toBe('gpt-5.6-terra')
+
+      // An id the provider does not advertise fails before any upstream call.
+      const before = fake.seenRequests.length
+      const bogus = await fetch(`${base}/api/providers/gateway/test`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'not-offered' }),
+      })
+      expect(bogus.status).toBe(400)
+      expect(fake.seenRequests.length).toBe(before)
+
+      // A malformed body is a client error, never a silent first-model ping.
+      const malformed = await fetch(`${base}/api/providers/gateway/test`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: '' }),
+      })
+      expect(malformed.status).toBe(400)
+
+      // No body keeps the footer control working on the first advertised model.
+      const footer = await fetch(`${base}/api/providers/gateway/test`, { method: 'POST' })
+      expect(footer.status).toBe(200)
+      expect(fake.seenRequests.filter((request) => request.url.endsWith('/chat/completions')).at(-1)?.body['model']).toBe('gpt-5.6-sol')
     } finally {
       await s?.close()
       await fake.stop()
@@ -618,15 +727,18 @@ describe('provider registry', () => {
     try {
       // A localhost gateway that authenticates by nothing at all: the entry is
       // stored with an empty key and must still register and be selectable.
-      await fs.writeFile(config, JSON.stringify([{
-        id: 'local-gw',
-        name: 'local-gw',
-        baseUrl: `${fakeBase}/v1`,
-        apiKey: '',
-        models: ['auto', 'auto-thinking'],
-        defaultModel: 'auto',
-        enabled: true,
-      }]), 'utf8')
+      await fs.writeFile(config, JSON.stringify({
+        version: 2,
+        defaults: { provider: 'local-gw', model: 'auto', thinkingLevel: null },
+        providers: [{
+          id: 'local-gw',
+          name: 'local-gw',
+          baseUrl: `${fakeBase}/v1`,
+          apiKey: '',
+          models: ['auto', 'auto-thinking'],
+          enabled: true,
+        }],
+      }), 'utf8')
 
       s = await createWebServer({ root, configFile: config, defaultMode: 'allow' })
       const base = s.url
@@ -747,9 +859,6 @@ describe('per-session folders', () => {
     await fs.mkdir(dirA, { recursive: true })
     await fs.mkdir(dirB, { recursive: true })
 
-    const allowAll = {
-      read: 'allow', glob: 'allow', grep: 'allow', write: 'allow', edit: 'allow', bash: 'allow',
-    } as const
     // Each tool step is followed by a terminal text answer: Agent asks the
     // provider again after every tool result, so two entries would otherwise
     // clamp at B and make session A write twice.
@@ -759,10 +868,7 @@ describe('per-session folders', () => {
       { toolCalls: [{ name: 'write', args: { path: 'mark.txt', content: 'from-B' } }] },
       'B completed',
     ]
-    await start(steps, undefined, {
-      policy: allowAll,
-      defaultMode: 'allow',
-    })
+    await start(steps, undefined, { defaultMode: 'allow', yolo: true })
 
     const madeA = (await (await post('/api/sessions', { folder: dirA })).json()) as { id: string; folder: string }
     expect(madeA.folder).toBe(path.resolve(dirA))

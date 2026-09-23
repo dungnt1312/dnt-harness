@@ -6,7 +6,7 @@ import { Button } from '../ui/Button.tsx'
 import { Field } from '../ui/Field.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Segmented } from '../ui/Segmented.tsx'
-import { Switch } from '../ui/Switch.tsx'
+
 import { TextInput } from '../ui/TextInput.tsx'
 import { deleteMcpServer, getMcpServer, importMcpServers, listMcpServers, setMcpServerAction, upsertMcpServer } from '../../lib/api.ts'
 import type { McpServerRow } from '../../lib/types.ts'
@@ -110,8 +110,8 @@ function formError(form: ServerForm): string | null {
  * headers, imported extras) are kept; fields of the other transport are dropped.
  */
 function configOf(form: ServerForm, stored: Record<string, unknown>): Record<string, unknown> {
-  const { command: _command, args: _args, url: _url, auth, resourceLimits: _limits, ...rest } = stored
-  void _command; void _args; void _url; void _limits
+  const { command: _command, args: _args, url: _url, auth, resourceLimits: _limits, allowedTools: _allowed, ...rest } = stored
+  void _command; void _args; void _url; void _limits; void _allowed
   const memoryMb = parsePositiveInt(form.memoryMb)
   const cpuPercent = parsePositiveInt(form.cpuPercent)
   const storedAuth = asRecord(auth)
@@ -121,9 +121,8 @@ function configOf(form: ServerForm, stored: Record<string, unknown>): Record<str
   return {
     ...rest,
     transport: form.transport,
-    enabled: form.enabled,
     timeoutMs: parsePositiveInt(form.timeoutMs) ?? DEFAULT_TIMEOUT_MS,
-    allowedTools: linesToArray(form.allowedTools),
+    ...(linesToArray(form.allowedTools).length > 0 ? { allowedTools: linesToArray(form.allowedTools) } : {}),
     ...(form.transport === 'stdio'
       ? { command: form.command.trim(), args: linesToArray(form.args) }
       : { url: form.url.trim(), ...(nextAuth !== undefined ? { auth: nextAuth } : {}) }),
@@ -131,6 +130,45 @@ function configOf(form: ServerForm, stored: Record<string, unknown>): Record<str
       ? { resourceLimits: { ...(memoryMb !== null ? { memoryMb } : {}), ...(cpuPercent !== null ? { cpuPercent } : {}) } }
       : {}),
   }
+}
+
+function toolExposed(allowed: readonly string[] | undefined, server: string, name: string): boolean {
+  if (allowed === undefined || allowed.length === 0) return true
+  return allowed.includes(name) || allowed.includes(`mcp__${server}__${name}`)
+}
+
+/** Names the live server listed, and whether the saved allowlist exposes each one. */
+function DiscoveredTools({ row }: { readonly row: McpServerRow }) {
+  const tools = row.discoveredTools ?? []
+  if (tools.length === 0 && (row.unmatchedAllowlist === undefined || row.unmatchedAllowlist.length === 0)) return null
+  const allowed = row.allowedTools
+  const restricted = allowed !== undefined && allowed.length > 0
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <p className="m-0 text-xs text-fg-faint">
+        {tools.length === 0
+          ? 'No tools listed yet. Enable or test the connection.'
+          : restricted
+            ? `${tools.length} tools from the server. Only the allowlist is exposed to the agent.`
+            : `${tools.length} tools from the server. A blank allowlist exposes all of them.`}
+      </p>
+      {tools.length > 0 ? (
+        <ul aria-label={`Tools from ${row.name}`} className="m-0 flex list-none flex-wrap gap-1 p-0">
+          {tools.map((name) => {
+            const exposed = toolExposed(allowed, row.name, name)
+            return (
+              <li key={name}>
+                <Badge tone={exposed ? 'blue' : 'amber'} className="font-mono">{exposed ? name : `${name} hidden`}</Badge>
+              </li>
+            )
+          })}
+        </ul>
+      ) : null}
+      {row.unmatchedAllowlist !== undefined && row.unmatchedAllowlist.length > 0 ? (
+        <p className="m-0 text-xs text-warn">Allowlist names not on this server: {row.unmatchedAllowlist.join(', ')}</p>
+      ) : null}
+    </div>
+  )
 }
 
 /** MCP server management: status, enable/disable/reconnect, edit, delete, import. */
@@ -147,6 +185,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
   /** The editor is opened deliberately, so the list is what the tab opens on. */
   const [editorOpen, setEditorOpen] = useScopedState(false)
   const [confirmDelete, setConfirmDelete] = useScopedState<string | null>(null)
+  const [confirmEnable, setConfirmEnable] = useScopedState<string | null>(null)
   const [importDialect, setImportDialect] = useScopedState<'claude' | 'codex'>('claude')
   const [importVersion, setImportVersion] = useScopedState('')
   const [importContent, setImportContent] = useScopedState('')
@@ -166,10 +205,15 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
 
   const patch = (next: Partial<ServerForm>): void => { setForm((current) => ({ ...current, ...next })) }
 
-  const act = (server: string, action: 'enable' | 'disable' | 'reconnect'): Promise<void> => run(`${action}:${server}`, async () => {
+  const act = (server: string, action: 'enable' | 'disable' | 'reconnect' | 'test'): Promise<void> => run(`${action}:${server}`, async () => {
     try {
       const result = await setMcpServerAction(workspaceId, server, action)
-      setNotice({ kind: 'ok', text: `${server}: ${result.status}` })
+      setNotice({
+        kind: 'ok',
+        text: result.tested === true
+          ? `${server}: connection test saw ${(result.tools ?? []).length} tools and left the server unpublished`
+          : `${server}: ${result.status ?? 'updated'}`,
+      })
     } finally {
       await refresh()
     }
@@ -210,8 +254,21 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
   const save = (): Promise<void> => run('save', async () => {
     if (invalid !== null) { setNotice({ kind: 'bad', text: invalid }); return }
     const name = form.name.trim()
-    await upsertMcpServer(workspaceId, name, configOf(form, editing?.stored ?? {}))
-    setNotice({ kind: 'ok', text: editing !== null ? `Saved changes to ${name}.` : `Added ${name}${form.enabled ? '' : ' (disabled — enable it from the list)'}.` })
+    const revision = rows.find((row) => row.name === name)?.revision
+    try {
+      await upsertMcpServer(workspaceId, name, {
+        ...configOf(form, editing?.stored ?? {}),
+        ...(revision !== undefined ? { expectedRevision: revision } : {}),
+      })
+    } catch (cause) {
+      if (cause instanceof Error && cause.name === 'HttpError' && 'status' in cause && cause.status === 409) {
+        await refresh()
+        setNotice({ kind: 'bad', text: `${name} changed since this form was loaded. The list was reloaded and this save was kept. Save again to apply it on top of the current revision.` })
+        return
+      }
+      throw cause
+    }
+    setNotice({ kind: 'ok', text: `Saved ${name}. Saving does not start a process — use Enable on the list. This is not a sandbox.` })
     resetForm()
     await refresh()
   })
@@ -245,7 +302,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
     <PanelBody>
       <div className="flex flex-col gap-2">
         <PanelIntro>
-          MCP tools default to ask. requiresUserInteraction always requires approval and cannot become allow. allowedTools filters exposure; it does not grant permission.
+          MCP tools default to ask. requiresUserInteraction always requires approval and cannot become allow. allowedTools filters exposure; it does not grant permission. Saving a server does not start it. A stdio server runs as you; the watchdog is not a sandbox. An indeterminate result may already have run and is not retried.
         </PanelIntro>
         <IsolationSummary />
       </div>
@@ -272,22 +329,38 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
                     <Badge>{row.transport}</Badge>
                     <Badge tone={STATUS_TONE[row.status]}>{row.status}</Badge>
                     {row.breakerOpenUntil !== null ? <Badge tone="amber">breaker open</Badge> : null}
+                    {row.auditFault === true ? <Badge tone="amber">audit fault</Badge> : null}
+                    {row.stale === true ? <Badge tone="amber">stale file</Badge> : null}
                   </>
                 }
-                meta={STATUS_META[row.status]}
+                meta={[
+                  STATUS_META[row.status],
+                  row.containment,
+                  row.generation !== undefined ? `generation ${row.generation}` : undefined,
+                ].filter((line): line is string => line !== undefined && line !== '').join(' · ') || undefined}
                 actions={
                   <>
                     {row.enabled ? (
                       <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void act(row.name, 'disable')}>{busy === `disable:${row.name}` ? 'Disabling…' : 'Disable'}</Button>
                     ) : (
-                      <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void act(row.name, 'enable')}>{busy === `enable:${row.name}` ? 'Enabling…' : 'Enable'}</Button>
+                      <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => setConfirmEnable(row.name)}>{busy === `enable:${row.name}` ? 'Enabling…' : 'Enable'}</Button>
                     )}
+                    <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void act(row.name, 'test')}>{busy === `test:${row.name}` ? 'Testing…' : 'Test connection'}</Button>
                     <IconButton label={`Reconnect ${row.name}`} disabled={busy !== null} onClick={() => void act(row.name, 'reconnect')}><Icon name="refresh" size={14} /></IconButton>
                     <IconButton label={`Edit ${row.name}`} disabled={busy !== null} onClick={() => void beginEdit(row.name)}><Icon name="pencil" size={14} /></IconButton>
                     <IconButton label={`Delete ${row.name}`} disabled={busy !== null} onClick={() => setConfirmDelete(row.name)}><Icon name="trash" size={14} /></IconButton>
                   </>
                 }
               >
+                {confirmEnable === row.name ? (
+                  <InlineConfirm
+                    message={`Start ${row.name}? It runs as you, with network and file access. This is not a sandbox. Saving did not start it.`}
+                    confirmLabel="Start server"
+                    busy={busy === `enable:${row.name}`}
+                    onConfirm={() => { setConfirmEnable(null); void act(row.name, 'enable') }}
+                    onCancel={() => setConfirmEnable(null)}
+                  />
+                ) : null}
                 {confirmDelete === row.name ? (
                   <InlineConfirm
                     message={`Delete ${row.name}? Its process stops and its tools disappear from new requests.`}
@@ -297,6 +370,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
                     onCancel={() => setConfirmDelete(null)}
                   />
                 ) : null}
+                <DiscoveredTools row={row} />
               </ItemRow>
             ))}
           </ItemList>
@@ -345,14 +419,12 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
                 </Field>
               </>
             )}
-            <div className="rounded-xl border border-line px-3.5 py-2.5 md:col-span-2">
-              <Switch checked={form.enabled} label="Enabled" hint="A disabled server is saved without starting a subprocess." onChange={(enabled) => patch({ enabled })} />
-            </div>
+            <p className="text-sm text-muted md:col-span-2">Saving does not start the process. Use Enable on the server list. The server runs with your user account; that is not a sandbox.</p>
           </div>
 
           {/* Exposure and resource caps: rarely changed, so they start folded. */}
           <Disclosure summary="Advanced · tool exposure and resource limits" defaultOpen={advancedInUse}>
-            <Field label="Allowed tools" hint="One tool per line. Leave blank to expose all server tools.">
+            <Field label="Allowed tools" hint="Leave blank to expose every tool the server lists. One name per line restricts exposure; it does not grant permission.">
               <CodeArea rows={3} value={form.allowedTools} onChange={(e) => patch({ allowedTools: e.target.value })} />
             </Field>
             <div className="grid gap-4 md:grid-cols-3">

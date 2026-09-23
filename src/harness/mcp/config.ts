@@ -29,17 +29,21 @@ export interface McpServerConfig {
   readonly auth?:
     | { readonly type: 'bearer'; readonly token: string }
     | { readonly type: 'oauth'; readonly provider: string; readonly accessToken: string }
+    | { readonly type: 'external_token'; readonly provider: string; readonly accessToken: string }
+    | { readonly type: 'managed_oauth'; readonly provider: string; readonly resource: string; readonly clientId: string; readonly scopes?: readonly string[] }
   readonly enabled: boolean
   readonly timeoutMs?: number
   /** Subprocess resource watchdogs (stdio): hard kill on breach. */
-  readonly resourceLimits?: { readonly memoryMb?: number; readonly cpuPercent?: number; readonly maxLifetimeMs?: number }
+  readonly resourceLimits?: { readonly memoryMb?: number; readonly cpuPercent?: number; readonly maxLifetimeMs?: number; readonly enforcement?: 'hard' | 'best_effort' }
   /** Exposure filter: only these tools register (never a permission bypass). */
   readonly allowedTools?: readonly string[]
   readonly provenance?: { readonly importedFrom?: 'claude' | 'codex'; readonly importedAt?: number }
 }
 
 export interface McpConfig {
-  readonly version: 1
+  readonly version: 1 | 2
+  readonly revision?: number
+  readonly contentHash?: string
   readonly servers: Readonly<Record<string, McpServerConfig>>
 }
 
@@ -85,6 +89,21 @@ export function validateServerName(name: string): void {
   if (!SERVER_NAME_RE.test(name)) {
     throw new McpConfigError('bad-name', `server name '${name}' must match ${SERVER_NAME_RE.source}`)
   }
+}
+
+/** v1 stays on {@link parseMcpConfig}. v2 is the migrated envelope. */
+export async function readMcpDocument(raw: string): Promise<McpConfig> {
+  let version: unknown
+  try {
+    version = (JSON.parse(raw) as { version?: unknown }).version
+  } catch (error) {
+    throw new McpConfigError('invalid', `mcp.json is not valid JSON: ${String(error)}`)
+  }
+  if (version === 2) {
+    const { parseV2McpConfig } = await import('./config-v2.ts')
+    return parseV2McpConfig(raw)
+  }
+  return parseMcpConfig(raw)
 }
 
 /** Strict `mcp.json` parse: invalid content is an error, never partial. */
@@ -152,7 +171,11 @@ export function parseMcpConfig(raw: string): McpConfig {
       const limits = server['resourceLimits']
       if (limits === null || typeof limits !== 'object' || Array.isArray(limits)) throw new McpConfigError('invalid', `server '${name}': resourceLimits must be an object`)
       for (const [key, value] of Object.entries(limits as Record<string, unknown>)) {
-        if (!['memoryMb', 'cpuPercent', 'maxLifetimeMs'].includes(key)) throw new McpConfigError('invalid', `server '${name}': unknown resource limit '${key}'`)
+        if (!['memoryMb', 'cpuPercent', 'maxLifetimeMs', 'enforcement'].includes(key)) throw new McpConfigError('invalid', `server '${name}': unknown resource limit '${key}'`)
+        if (key === 'enforcement') {
+          if (value !== 'hard' && value !== 'best_effort') throw new McpConfigError('invalid', `server '${name}': enforcement must be hard|best_effort`)
+          continue
+        }
         if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) throw new McpConfigError('invalid', `server '${name}': resource limit '${key}' must be positive`)
       }
     }
@@ -212,9 +235,9 @@ function parseAuth(serverName: string, value: unknown): NonNullable<McpServerCon
     }
     return { type: 'bearer', token: auth['token'] }
   }
-  if (auth['type'] === 'oauth') {
+  if (auth['type'] === 'oauth' || auth['type'] === 'external_token') {
     for (const key of Object.keys(auth)) {
-      if (!['type', 'provider', 'accessToken'].includes(key)) throw new McpConfigError('invalid', `server '${serverName}': unknown oauth auth key '${key}'`)
+      if (!['type', 'provider', 'accessToken'].includes(key)) throw new McpConfigError('invalid', `server '${serverName}': unknown ${auth['type']} auth key '${key}'`)
     }
     if (typeof auth['provider'] !== 'string' || auth['provider'] === '') {
       throw new McpConfigError('invalid', `server '${serverName}': oauth.provider must be a non-empty string`)
@@ -222,9 +245,39 @@ function parseAuth(serverName: string, value: unknown): NonNullable<McpServerCon
     if (typeof auth['accessToken'] !== 'string' || !/^\$\{[A-Za-z0-9_]+\}$/.test(auth['accessToken'])) {
       throw new McpConfigError('invalid', `server '${serverName}': oauth.accessToken must reference an encrypted secret`)
     }
-    return { type: 'oauth', provider: auth['provider'], accessToken: auth['accessToken'] }
+    return auth['type'] === 'external_token'
+      ? { type: 'external_token', provider: auth['provider'], accessToken: auth['accessToken'] }
+      : { type: 'oauth', provider: auth['provider'], accessToken: auth['accessToken'] }
   }
-  throw new McpConfigError('invalid', `server '${serverName}': auth.type must be bearer|oauth`)
+  if (auth['type'] === 'managed_oauth') {
+    for (const key of Object.keys(auth)) {
+      if (!['type', 'provider', 'resource', 'clientId', 'scopes'].includes(key)) {
+        throw new McpConfigError('invalid', `server '${serverName}': unknown managed_oauth auth key '${key}'`)
+      }
+    }
+    if (typeof auth['provider'] !== 'string' || auth['provider'] === '') throw new McpConfigError('invalid', `server '${serverName}': managed_oauth.provider is required`)
+    if (typeof auth['resource'] !== 'string' || !/^https?:\/\//.test(auth['resource'])) throw new McpConfigError('invalid', `server '${serverName}': managed_oauth.resource must be an absolute URL`)
+    if (typeof auth['clientId'] !== 'string' || auth['clientId'] === '') throw new McpConfigError('invalid', `server '${serverName}': managed_oauth.clientId is required`)
+    if (auth['scopes'] !== undefined && (!Array.isArray(auth['scopes']) || !(auth['scopes'] as unknown[]).every((item) => typeof item === 'string'))) {
+      throw new McpConfigError('invalid', `server '${serverName}': managed_oauth.scopes must be an array of strings`)
+    }
+    return {
+      type: 'managed_oauth',
+      provider: auth['provider'],
+      resource: auth['resource'],
+      clientId: auth['clientId'],
+      ...(Array.isArray(auth['scopes']) ? { scopes: auth['scopes'] as string[] } : {}),
+    }
+  }
+  throw new McpConfigError('invalid', `server '${serverName}': auth.type must be bearer|oauth|external_token|managed_oauth`)
+}
+
+/** Secret reference carried in config, if any. Managed OAuth tokens are not stored here. */
+export function authSecretRef(auth: McpServerConfig['auth']): string | undefined {
+  if (auth === undefined) return undefined
+  if (auth.type === 'bearer') return auth.token
+  if (auth.type === 'oauth' || auth.type === 'external_token') return auth.accessToken
+  return undefined
 }
 
 function sanitizeStringRecord(value: unknown): Record<string, string> {
@@ -393,11 +446,11 @@ export class McpConfigStore {
     return path.join(this.workspaceDir(workspaceId), 'secrets.json')
   }
 
-  /** Load + validate mcp.json; a missing file is an empty config. */
+  /** Load + validate mcp.json; only a missing file is an empty config. */
   async loadMcp(workspaceId: string): Promise<McpConfig> {
-    const raw = await fs.readFile(this.mcpPath(workspaceId), 'utf8').catch(() => undefined)
+    const raw = await readOptionalText(this.mcpPath(workspaceId))
     if (raw === undefined) return { version: 1, servers: {} }
-    return parseMcpConfig(raw)
+    return readMcpDocument(raw)
   }
 
   async saveMcp(workspaceId: string, config: McpConfig): Promise<void> {
@@ -406,7 +459,7 @@ export class McpConfigStore {
   }
 
   async loadHooks(workspaceId: string): Promise<HooksConfig> {
-    const raw = await fs.readFile(this.hooksPath(workspaceId), 'utf8').catch(() => undefined)
+    const raw = await readOptionalText(this.hooksPath(workspaceId))
     if (raw === undefined) return { version: 1, hooks: {} }
     return parseHooksConfig(raw)
   }
@@ -424,7 +477,7 @@ export class McpConfigStore {
    * hardening seam. Plain values never enter mcp.json or exports.
    */
   async loadSecrets(workspaceId: string): Promise<Record<string, string>> {
-    const raw = await fs.readFile(this.secretsPath(workspaceId), 'utf8').catch(() => undefined)
+    const raw = await readOptionalText(this.secretsPath(workspaceId))
     if (raw === undefined) return {}
     let envelope: { v?: unknown; iv?: unknown; tag?: unknown; ciphertext?: unknown }
     try {
@@ -531,9 +584,30 @@ export class McpConfigStore {
     const output = `${result.stdout}
 ${result.stderr}`
     // Inheritance must be removed; broad well-known groups must not appear.
-    if (/BUILTIN\Users|Everyone|Authenticated Users/i.test(output)) {
+    if (/BUILTIN\\Users|BUILTIN\\Administrators|Everyone|Authenticated Users|NT AUTHORITY\\SYSTEM/i.test(output)) {
       throw new McpConfigError('invalid', 'secrets.master.key ACL is not user-scoped')
     }
+  }
+}
+
+/**
+ * Read a config file that is allowed to be absent. `ENOENT` is the only
+ * missing signal; permission errors, directories, and every other failure
+ * stay failures so a locked or replaced file cannot look like "no config".
+ */
+async function readOptionalText(file: string): Promise<string | undefined> {
+  try {
+    return await fs.readFile(file, 'utf8')
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') return undefined
+    if (code === 'EISDIR') {
+      throw new McpConfigError('invalid', `expected a file but found a directory at '${file}'`)
+    }
+    if (code === 'EACCES' || code === 'EPERM') {
+      throw new McpConfigError('invalid', `cannot read '${file}': permission denied`)
+    }
+    throw new McpConfigError('invalid', `cannot read '${file}': ${code ?? 'unknown error'}`)
   }
 }
 

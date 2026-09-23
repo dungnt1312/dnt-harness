@@ -6,6 +6,7 @@ import { Button } from '../ui/Button.tsx'
 import { Field } from '../ui/Field.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Segmented } from '../ui/Segmented.tsx'
+import { Select } from '../ui/Select.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
 import {
   deleteAgentDefinition,
@@ -35,7 +36,7 @@ const IMPORT_PLACEHOLDER = '---\ndescription: "reviews code"\ntools: ["Read", "G
 const linesToArray = (raw: string): string[] => raw.split('\n').map((line) => line.trim()).filter((line) => line !== '')
 
 /** A Claude-dialect definition document built from the create form. */
-function definitionDocument(draft: { readonly name: string; readonly description: string; readonly tools: string; readonly disallowedTools: string; readonly instructions: string }): string {
+export function definitionDocument(draft: { readonly name: string; readonly description: string; readonly tools: string; readonly disallowedTools: string; readonly instructions: string; readonly model: string }): string {
   const list = (raw: string): string => JSON.stringify(linesToArray(raw))
   return [
     '---',
@@ -43,6 +44,9 @@ function definitionDocument(draft: { readonly name: string; readonly description
     `description: ${JSON.stringify(draft.description.trim())}`,
     `tools: ${list(draft.tools)}`,
     `disallowedTools: ${list(draft.disallowedTools)}`,
+    // Omitted entirely when blank: no key means the child inherits the
+    // conversation's model, which is not the same as pinning one.
+    ...(draft.model.trim() !== '' ? [`model: ${JSON.stringify(draft.model.trim())}`] : []),
     '---',
     '',
     draft.instructions.trim(),
@@ -55,12 +59,18 @@ function definitionDocument(draft: { readonly name: string; readonly description
  * child and following its result is runtime work and lives in the workbench
  * Agents view, where a conversation is actually selected.
  */
-export function AgentsPanel(props: { readonly workspaceId: string | null }) {
+export interface AgentsPanelProps {
+  readonly workspaceId: string | null
+  /** `provider:model` rows a role may pin; the same list the composer offers. */
+  readonly modelOptions?: readonly { readonly value: string; readonly label: string }[]
+}
+
+export function AgentsPanel(props: AgentsPanelProps) {
   // Scope changes remount before paint: no A data or drafts can be acted on in B.
   return <AgentsPanelContent key={props.workspaceId} {...props} />
 }
 
-function AgentsPanelContent({ workspaceId }: { readonly workspaceId: string | null }) {
+function AgentsPanelContent({ workspaceId, modelOptions }: AgentsPanelProps) {
   const [definitions, setDefinitions] = useScopedState<readonly AgentDefinitionRow[]>([])
   const [selected, setSelected] = useScopedState<string>('explorer')
   const [notice, setNotice] = useScopedState<NoticeState>(null)
@@ -70,6 +80,7 @@ function AgentsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
   const [createTools, setCreateTools] = useScopedState('')
   const [createDisallowed, setCreateDisallowed] = useScopedState('')
   const [createInstructions, setCreateInstructions] = useScopedState('')
+  const [createModel, setCreateModel] = useScopedState('')
   const [importName, setImportName] = useScopedState('')
   const [importContent, setImportContent] = useScopedState('')
   const [importDialect, setImportDialect] = useScopedState<'claude' | 'codex'>('claude')
@@ -110,7 +121,7 @@ function AgentsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
     // The create form is the supported Claude subset, so it goes through the
     // same import path — one validation and provenance rule, not two.
     await importAgentDefinition(workspaceId, name, {
-      content: definitionDocument({ name, description: createDescription, tools: createTools, disallowedTools: createDisallowed, instructions: createInstructions }),
+      content: definitionDocument({ name, description: createDescription, tools: createTools, disallowedTools: createDisallowed, instructions: createInstructions, model: createModel }),
       dialect: 'claude',
     })
     await refreshDefinitions()
@@ -187,6 +198,8 @@ function AgentsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
           <dl className="m-0 grid gap-x-4 gap-y-2 text-[13px] sm:grid-cols-[8rem_minmax(0,1fr)]">
             <dt className="m-0 text-fg-faint">Tools</dt>
             <dd className="m-0 min-w-0 break-words">{current.definition.tools.length > 0 ? current.definition.tools.join(', ') : 'All allowed tools'}</dd>
+            <dt className="m-0 text-fg-faint">Model</dt>
+            <dd className="m-0 min-w-0 break-words">{current.definition.model ?? 'Inherits the conversation'}</dd>
             {current.definition.disallowedTools.length > 0 ? (
               <>
                 <dt className="m-0 text-fg-faint">Always denied</dt>
@@ -224,6 +237,17 @@ function AgentsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
             </Field>
             <Field label="Always denied" hint="One tool per line. Denied here even when the workspace allows it.">
               <CodeArea rows={3} value={createDisallowed} placeholder={'Bash\nWrite'} onChange={(e) => setCreateDisallowed(e.target.value)} />
+            </Field>
+            <Field label="Model" hint="Which model children of this role run on. Leave on inherit to follow the conversation.">
+              <Select
+                label="Role model"
+                value={createModel}
+                options={[
+                  { value: '', label: 'Inherit from the conversation' },
+                  ...(modelOptions ?? []).map((option) => ({ value: option.value, label: option.label })),
+                ]}
+                onChange={setCreateModel}
+              />
             </Field>
             <div className="md:col-span-2">
               <Field label="Instructions" hint="The system instructions the child agent receives.">

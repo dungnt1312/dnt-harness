@@ -23,6 +23,17 @@ export interface TaskPacket {
   readonly requiredResult: string
 }
 
+/**
+ * The model a child runs on. The host resolves the pair (spawn request >
+ * definition > parent session) and hands it over complete: the executor
+ * never looks providers up itself.
+ */
+export interface ChildModel {
+  readonly provider: string
+  readonly model: string
+  readonly thinkingLevel?: string | null
+}
+
 export interface SpawnRequest {
   readonly workspaceId: WorkspaceId
   readonly projectId?: ProjectId | undefined
@@ -36,6 +47,8 @@ export interface SpawnRequest {
    * Omitted grants leave the definition's tools in force.
    */
   readonly grantTools?: readonly string[] | undefined
+  /** Stamped into the child's own log; omitted leaves the host's defaults. */
+  readonly model?: ChildModel | undefined
 }
 
 export type ChildStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
@@ -45,11 +58,15 @@ export interface ChildHandle {
   readonly childSessionId: SessionId
   readonly status: ChildStatus
   readonly definitionName: string
+  /** The child's effective `provider:model`, when one was stamped. */
+  readonly model?: string
   readonly startedAt: number
   readonly endedAt?: number
   /** Bounded digest extracted from the child log (summary + file refs). */
   readonly result?: { readonly summary: string; readonly fileReferences: readonly string[] }
   readonly error?: string
+  /** A running child parked on an approval nobody has answered yet. */
+  readonly awaitingApproval?: boolean
 }
 
 const MAX_ACTIVE_CHILDREN = 3
@@ -73,6 +90,7 @@ interface InternalChild {
   readonly parentTurnId: string
   readonly definition: AgentDefinition
   grantTools: readonly string[]
+  readonly model?: ChildModel
   readonly agent?: Agent
   /** Durable events (always present; recovered children may have no live agent). */
   readonly events: readonly SessionEvent[]
@@ -122,6 +140,15 @@ export class ChildExecutor {
       const latestTurnEnd = [...loaded.events].reverse().find((event) => event.type === 'turn/end') as
         | { reason?: string }
         | undefined
+      // The child's model lives in its own log, so a recovered card reports
+      // the pair it actually ran on rather than today's default.
+      const stamped = [...loaded.events].reverse().find((event) => event.type === 'session/model') as
+        | { provider?: string | null; model?: string | null; thinkingLevel?: string | null }
+        | undefined
+      const model: ChildModel | undefined =
+        typeof stamped?.provider === 'string' && typeof stamped.model === 'string'
+          ? { provider: stamped.provider, model: stamped.model, ...(stamped.thinkingLevel !== undefined ? { thinkingLevel: stamped.thinkingLevel } : {}) }
+          : undefined
       const openTurn = countOpenTurns(loaded.events) > 0
       const interrupted = openTurn || latestTurnEnd?.reason === 'interrupted'
       const child: InternalChild = {
@@ -131,6 +158,7 @@ export class ChildExecutor {
         parentTurnId: meta.parentTurnId,
         definition: { name: meta.definition, description: '', instructions: '', tools: [], disallowedTools: [] },
         grantTools: [],
+        ...(model !== undefined ? { model } : {}),
         events: loaded.events as unknown as readonly SessionEvent[],
         status: interrupted ? 'interrupted' : 'completed',
         startedAt: 0,
@@ -194,6 +222,18 @@ export class ChildExecutor {
         | undefined
       if (sessions === undefined) throw new SpawnError('depth', 'no sessions service mounted')
       const session = sessions.create(request.workspaceId)
+      // The model is a session-level ownership boundary, exactly as it is for
+      // a user's own pick: stamping it in the child's log pins the pair for
+      // the child's whole life, survives restart, and stops a child from
+      // silently re-inheriting a later global default.
+      if (request.model !== undefined) {
+        session.append({
+          type: 'session/model',
+          provider: request.model.provider,
+          model: request.model.model,
+          ...(request.model.thinkingLevel !== undefined ? { thinkingLevel: request.model.thinkingLevel } : {}),
+        })
+      }
       // Durable spawn intent + parentage in the child's canonical log, with
       // a REAL barrier: an unrecorded child never starts executing.
       session.append({
@@ -244,7 +284,6 @@ export class ChildExecutor {
           parentTurnId: request.parentTurnId,
           definition: request.definition.name,
           toolCeiling,
-          ...(request.definition.model !== undefined ? { modelOverride: request.definition.model } : {}),
           ...(request.definition.skills !== undefined ? { skills: request.definition.skills } : {}),
         },
       }
@@ -263,6 +302,7 @@ export class ChildExecutor {
         parentTurnId: request.parentTurnId,
         definition: request.definition,
         grantTools: toolCeiling,
+        ...(request.model !== undefined ? { model: request.model } : {}),
         agent,
         events: agent.session.events,
         status: 'running',
@@ -330,17 +370,45 @@ export class ChildExecutor {
   }
 
   /**
-   * Event-driven wait: races the child's settlement promise against the
-   * timeout. A timeout reports still-running and does not cancel.
-   * Workspace-scoped: a foreign child id is a 404-shaped miss.
+   * Event-driven wait over one or more children: settles when every named
+   * child has settled, the timeout fires, or the caller's signal aborts —
+   * whichever comes first. A timeout (or an abort) reports whatever is true
+   * then and never cancels. Workspace-scoped: foreign or unknown ids are
+   * dropped, so an empty result is the 404-shaped miss.
    */
-  async wait(workspaceId: WorkspaceId, childSessionId: SessionId, timeoutMs = 30_000): Promise<ChildHandle | undefined> {
-    const child = this.children.get(childSessionId)
-    if (child === undefined || child.workspaceId !== workspaceId) return undefined
-    const timeout = new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), timeoutMs))
-    const outcome = await Promise.race([child.settled.then(() => 'settled' as const), timeout])
-    void outcome
-    return this.withResult(child)
+  async wait(
+    workspaceId: WorkspaceId,
+    childSessionIds: readonly SessionId[],
+    options: { readonly timeoutMs?: number; readonly signal?: AbortSignal } = {},
+  ): Promise<ChildHandle[]> {
+    const targets = childSessionIds
+      .map((id) => this.children.get(id))
+      .filter((child): child is InternalChild => child !== undefined && child.workspaceId === workspaceId)
+    if (targets.length === 0) return []
+
+    const settled = Promise.all(targets.map((child) => child.settled))
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, options.timeoutMs ?? 30_000)
+      timer.unref?.()
+    })
+    // An already-aborted signal never fires its listener, so the check comes
+    // first: a root Stop returns immediately instead of sitting out the timeout.
+    const signal = options.signal
+    let onAbort: (() => void) | undefined
+    const aborted = new Promise<void>((resolve) => {
+      if (signal === undefined) return
+      if (signal.aborted) { resolve(); return }
+      onAbort = (): void => { resolve() }
+      signal.addEventListener('abort', onAbort, { once: true })
+    })
+    try {
+      await Promise.race<unknown>([settled, deadline, aborted])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      if (onAbort !== undefined) signal?.removeEventListener('abort', onAbort)
+    }
+    return targets.map((child) => this.withResult(child))
   }
 
   /** Cancel one child and AWAIT its actual settlement; siblings keep running. */
@@ -423,12 +491,23 @@ export class ChildExecutor {
       childSessionId: child.childSessionId,
       status: child.status,
       definitionName: child.definition.name,
+      ...(child.model !== undefined ? { model: `${child.model.provider}:${child.model.model}` } : {}),
       startedAt: child.startedAt,
       ...(child.endedAt !== undefined ? { endedAt: child.endedAt } : {}),
       ...(child.result !== undefined ? { result: child.result } : {}),
       ...(child.failure !== undefined ? { error: child.failure } : {}),
+      ...(child.status === 'running' && awaitsApproval(child.events) ? { awaitingApproval: true } : {}),
     }
   }
+}
+
+/** An approval request with no decision yet: the child is parked on a human. */
+function awaitsApproval(events: readonly SessionEvent[]): boolean {
+  const decided = new Set<string>()
+  for (const event of events) {
+    if (event.type === 'approval/decision') decided.add(event.approvalId)
+  }
+  return events.some((event) => event.type === 'approval/request' && !decided.has(event.approvalId))
 }
 
 /** Open turns (turn/start without turn/end) in a stored event list. */

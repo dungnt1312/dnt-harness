@@ -14,6 +14,9 @@ module.exports = {
       script: 'node_modules/tsx/dist/cli.mjs',
       args: 'src/bins/web.ts --port 3082 --root .',
       interpreter: 'node',
+      exec_mode: 'fork',
+      instances: 1,
+      kill_timeout: 15_000,
       max_memory_restart: '300M',
       autorestart: true,
       env: {

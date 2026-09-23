@@ -1,7 +1,8 @@
 import Icon from '../common/Icon.tsx'
 import { attachmentUrl } from '../../lib/api.ts'
 import { fileIcon } from '../../lib/file-icons.ts'
-import { formatBytes, type AttachmentRef } from '../../lib/composer-draft.ts'
+import { formatBytes } from '../../lib/format.ts'
+import type { AttachmentRef } from '../../lib/composer-draft.ts'
 
 export function AttachmentTray({ attachments, workspaceId, onRemove, onInsertText, canInsertText }: {
   readonly attachments: readonly AttachmentRef[]

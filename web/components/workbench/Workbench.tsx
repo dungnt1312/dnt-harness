@@ -80,7 +80,7 @@ function ViewTab({ view, active, onClick, onClose }: {
  * Terminal is the deliberate interactive exception: a user-driven shell,
  * separate from the agent loop and from the session log.
  */
-export function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, expanded, onToggleExpand, onClose, openPath, sessionId = null, onOpenChild, onOpenAgentSettings, terminalShell = null, onTerminalShell }: {
+export function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, expanded, onToggleExpand, onClose, openPath, sessionId = null, modelOptions, onOpenChild, onOpenAgentSettings, terminalShell = null, onTerminalShell }: {
   readonly workspaceId: string | null
   /** The project whose files are browsable; null for chat-only conversations. */
   readonly project: WorkbenchProject | null
@@ -102,6 +102,8 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
   readonly openPath?: OpenPathResolver
   /** Root conversation the Agents view delegates from; null when none is open. */
   readonly sessionId?: string | null
+  /** `provider:model` rows the Agents view offers for a child. */
+  readonly modelOptions?: readonly { readonly value: string; readonly label: string }[]
   readonly onOpenChild?: (childSessionId: string) => void
   readonly onOpenAgentSettings?: () => void
   /** Shell the Terminal view opens by itself; null defers to the host's order. */
@@ -141,7 +143,7 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
 
   let body: ReactNode
   if (showFile) {
-    body = <FileViewer key={`${project.id}:${files.activeFile}`} workspaceId={workspaceId} projectId={project.id} projectPath={project.path} path={files.activeFile!} />
+    body = <FileViewer key={`${project.id}:${files.activeFile}`} workspaceId={workspaceId} projectId={project.id} projectPath={project.path} path={files.activeFile!} focus={files.focus} />
   } else if (activeView === 'files') {
     body = project !== null && workspaceId !== null
       ? <FileBrowser key={project.id} workspaceId={workspaceId} project={project} folder={files.folder} activeFile={files.activeFile} onFolder={files.setFolder} onOpenFile={files.openFile} />
@@ -158,6 +160,7 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
     body = (
       <Suspense fallback={<div className="flex flex-1 items-center justify-center text-[13px] text-fg-muted">Loading terminal…</div>}>
         <TerminalPanel
+          key={project?.id ?? 'workspace'}
           workspaceId={workspaceId}
           projectId={project?.id ?? null}
           defaultShell={terminalShell ?? null}
@@ -170,6 +173,10 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
       <AgentRunsPanel
         workspaceId={workspaceId}
         rootSessionId={sessionId}
+        {...(modelOptions !== undefined ? { modelOptions } : {})}
+        // Delegation lands in the root's own log, whether the user or the
+        // model started it, so the panel refreshes off that traffic.
+        refreshSignal={events.filter((event) => event.type === 'agent/child-spawn' || event.type === 'agent/child-result').length}
         {...(onOpenChild !== undefined ? { onOpenChild } : {})}
         {...(onOpenAgentSettings !== undefined ? { onOpenSettings: onOpenAgentSettings } : {})}
       />

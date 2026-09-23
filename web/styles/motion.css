@@ -18,6 +18,10 @@
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--line-strong); border: 3px solid transparent; border-radius: 999px; background-clip: content-box; }
 
+/* Minimap sits beside the native scrollbar — never hide the scrollbar. */
+.conversation-minimap button { min-width: 0 !important; min-height: 0 !important; }
+.chat-scroll { scrollbar-gutter: stable; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;

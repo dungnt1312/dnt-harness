@@ -6,7 +6,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { BUNDLED_MODES, DEFAULT_MODE_ID, ModesService, ModeError } from 'mini-dsh'
+import { BUNDLED_MODES, DEFAULT_MODE_ID, ModesService, ModeError, parseModeFile, serializeModeFile } from 'mini-dsh'
 
 let home = ''
 
@@ -95,6 +95,30 @@ describe('custom modes', () => {
     await expect(modes.resolve(WS, 'no-such-mode')).rejects.toMatchObject({ code: 'not-found' })
   })
 
+  it('permission keys cover every rung the approval gate resolves and canonical serialization is stable', () => {
+    const definition = parseModeFile('wide-perms', `---\nname: "Wide"\npermissionDefaults: {"Read": "allow", "mcp__github__create_issue": "ask", "mcp__github__*": "allow", "*": "deny"}\n---\n\nbody`)
+    expect(definition.permissionDefaults).toEqual({
+      Read: 'allow',
+      mcp__github__create_issue: 'ask',
+      'mcp__github__*': 'allow',
+      '*': 'deny',
+    })
+
+    const serialized = serializeModeFile(definition)
+    expect(serializeModeFile(parseModeFile('wide-perms', serialized))).toBe(serialized)
+  })
+
+  it('rejects permission keys the gate could never match with accepted shapes', () => {
+    for (const key of [
+      'mcp__*__read', 'Ba*h', 'bash',
+      'mcp__foo bar__read', 'mcp__a____read', 'mcp__a____*',
+      'mcp____read', 'mcp__github__',
+    ]) {
+      expect(() => parseModeFile('bad-perms', `---\npermissionDefaults: {${JSON.stringify(key)}: "allow"}\n---\n\nbody`))
+        .toThrow(/known tool.*mcp__<server>__<tool>.*mcp__<server>__\*.*'\*'/)
+    }
+  })
+
   it('bundled modes cannot be overwritten or deleted; duplicate creates a copy', async () => {
     const modes = new ModesService(home)
     await expect(modes.save(WS, 'chat', '---\n---\nhacked')).rejects.toMatchObject({ code: 'duplicate' })
@@ -104,8 +128,10 @@ describe('custom modes', () => {
     expect(copy.definition.name).toBe('Plan')
     expect(copy.definition.id).toBe('plan-custom')
     expect(copy.source).toBe('workspace')
-    // Customizing the copy does not touch the bundled original.
-    await modes.save(WS, 'plan-custom', `---\nname: "My Plan"\n---\n\ncustom body`)
+    // Customizing the copy does not touch the bundled original; a read
+    // supplies the optimistic-concurrency hash required for replacement.
+    const editable = await modes.load(WS, 'plan-custom')
+    await modes.save(WS, 'plan-custom', `---\nname: "My Plan"\n---\n\ncustom body`, editable.hash)
     expect((await modes.resolve(WS, 'plan')).definition.instructions).not.toBe('custom body')
   })
 
@@ -115,8 +141,26 @@ describe('custom modes', () => {
     // External edit happens behind our back.
     const file = path.join(home, 'workspaces', WS as string, 'modes', 'conflict-mode.md')
     await fs.writeFile(file, '---\nname: "V2"\n---\n\nv2 body', 'utf8')
-    await expect(modes.save(WS, 'conflict-mode', '---\nname: "V3"\n---\n\nv3', '0000')).rejects.toMatchObject({ code: 'invalid' })
+    await expect(modes.save(WS, 'conflict-mode', '---\nname: "V3"\n---\n\nv3', '0000')).rejects.toMatchObject({ code: 'conflict' })
     expect(await fs.readFile(file, 'utf8')).toContain('v2 body')
+  })
+
+  it('load returns editable content: real bytes for a file, canonical form for bundled', async () => {
+    const modes = new ModesService(home)
+    const raw = '---\nname: "Loadable"\n---\n\nbody text'
+    await modes.save(WS, 'loadable', raw)
+    const loaded = await modes.load(WS, 'loadable')
+    expect(loaded).toMatchObject({ id: 'loadable', raw, source: 'workspace' })
+    expect(loaded.hash).toMatch(/^[0-9a-f]{64}$/)
+
+    // Bundled: what Duplicate would write, and no hash to conflict against.
+    const bundled = await modes.load(WS, 'plan')
+    expect(bundled.source).toBe('bundled')
+    expect(bundled.hash).toBeUndefined()
+    expect(parseModeFile('plan', bundled.raw).permissionDefaults)
+      .toEqual(BUNDLED_MODES.find((mode) => mode.id === 'plan')?.permissionDefaults)
+
+    await expect(modes.load(WS, 'nope')).rejects.toMatchObject({ code: 'not-found' })
   })
 
   it('selecting a deleted custom mode falls back at resolution (host contract)', async () => {

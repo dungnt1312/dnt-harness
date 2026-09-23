@@ -26,6 +26,9 @@ function nonEmptyString(value: unknown): string | undefined {
 
 function resultState(result: SseEvent | undefined): ArtifactState {
   if (result === undefined) return 'pending'
+  // A possible remote effect and a known outcome whose evidence failed to
+  // persist are both unknown to the operator — never a clean failure.
+  if (result.outcome === 'indeterminate' || result.outcome === 'audit_fault') return 'unknown'
   if (result.recovery === true) return 'unknown'
   if (result.ok === true) return 'succeeded'
   if (result.ok === false) return 'failed'

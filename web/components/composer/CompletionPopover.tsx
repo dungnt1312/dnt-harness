@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import Icon from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { fileStyle } from '../../lib/file-icons.ts'
@@ -21,8 +22,16 @@ export function CompletionPopover({ id, kind, items, activeIndex, loading, note,
   readonly onPick: (item: CompletionItem) => void
   readonly onActivate: (index: number) => void
 }) {
+  const listRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const active = listRef.current?.querySelector<HTMLElement>(`#${CSS.escape(`${id}-option-${activeIndex}`)}`)
+    active?.scrollIntoView({ block: 'nearest' })
+  }, [id, activeIndex, items.length])
+
   return (
     <div
+      ref={listRef}
       id={id}
       role="listbox"
       aria-label={kind === 'file' ? 'Project files' : 'Workspace skills'}

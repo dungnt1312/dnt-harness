@@ -1,8 +1,13 @@
 import type { SseEvent } from '../../lib/types.ts'
+import type { FileFocus } from '../../lib/tool-facts.ts'
 import { projectArtifacts, type ArtifactItem } from './artifact-projector.ts'
 
-/** Returns an opener when a recorded path resolves inside the project, else null. */
-export type OpenPathResolver = (reference: string) => (() => void) | null
+/**
+ * Returns an opener when a recorded path resolves inside the project, else
+ * null. `focus` is the window the call named, so the viewer can land on the
+ * lines the call actually read instead of the top of the file.
+ */
+export type OpenPathResolver = (reference: string, focus?: FileFocus) => (() => void) | null
 
 const RECOVERED_NOTE = 'Outcome unknown — the host restarted before this result was recorded.'
 

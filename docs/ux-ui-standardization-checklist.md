@@ -17,7 +17,7 @@
 | **1 — Tokens** | ✅ Xong | Thêm `--sidebar-w/env-w/min/max`, tách `--color-ink-faint` khỏi muted, xóa toàn bộ `#fff/rgba()` literal ngoài `@theme`, thêm shadow tokens (`--shadow-pop/modal/env/drawer/dock/toast/jump/chip`, `--scrim-modal`) |
 | **2 — Layout/shell** | ✅ Xong | Breakpoint right dock 1360→1280 align `WorkbenchShell`, xóa legacy `.nav-open/.sidebar` fixed CSS, gutter `--content-gutter: calc(clamp(16,4vw,24)px*2)` cho transcript/composer/approvals/task/send, InspectorPanel bỏ `env-panel-hosted`, TopBar thêm `aria-label` + `sr-only` stream text |
 | **3 — Primitives** | ✅ Xong | Button/IconButton/send hover `#fff`→`var(--text-dim)`, danger `#200a08`→`var(--text-inverse)`, toast `#f2b9b5/#a8dcc4`→semantic `--bad-tint/--ok-tint`, composer focus `rgba(255,255,255,.3)`→`--accent-border`, coarse 44px cho session/ws-row/tool-head/topbar |
-| **4 — Composer/controls** | ✅ Xong | ModelMenu `panelWidth 470`+PolicyPopover `340` bỏ inline→CSS `min()` responsive, ApprovalBar pluralize, ThinkingMenu/verdict labels xem P5 |
+| **4 — Composer/controls** | ✅ Xong | ModelMenu `panelWidth 470`+PolicyPopover `340` bỏ inline→CSS `min()` responsive (PolicyPopover đã xóa — xem ghi chú dưới), ApprovalBar pluralize, ThinkingMenu/verdict labels xem P5 |
 | **5 — Transcript/chat** | ✅ Xong | `chat-scroll` `tabIndex=0 role=region aria-label`, user-actions `focus-within`+coarse 44px, verdict icon `aria-hidden={false}+aria-label` (Succeeded/Failed/Recovered), ThinkingPanel `aria-controls`+`role=region`+`aria-live`, TaskStatus `role=status aria-live` trên container, WorkbenchSurface token fix + gutter + aria-label unique |
 | **6 — Settings/mgmt** | ✅ Xong | `manage-card-grid` `minmax(min(210px,100%),1fr)` hết overflow 320, provider rail `role=listbox`+`option`+`aria-selected`. **Ghi chú:** SettingsModal full-height là spec chủ động trong `design-system.md` → giữ nguyên |
 | **7 — A11y** | ✅ Xong | Axe (`wcag2a,wcag2aa,wcag21aa`) chạy ngoài sandbox: 0 violation trên shell/drawers/Context/Artifacts/approvals/8 Settings sections. Target-size, reduced-motion, focus-trap đều pass qua Playwright |
@@ -82,7 +82,9 @@
 
 ---
 
-## Phase 4 — Composer & Controls (Composer, ModelMenu, ThinkingMenu, PolicyPopover, ApprovalBar, FolderPicker)
+## Phase 4 — Composer & Controls (Composer, ModelMenu, ThinkingMenu, PolicyPopover†, ApprovalBar, FolderPicker)
+
+> † PolicyPopover đã bị xóa (2026-09-22, "modes as the single source of permission"): composer không còn permission chip; permission thuộc về mode, authored ở Settings → Modes. Các mục 4.7 giữ lại như biên bản lịch sử.
 
 - [x] **4.1** Composer pill: `width calc(100% - 48px)` → clamp responsive, `max-width var(--content-w)`, `border var(--border-strong)` `radius var(--r-composer)`, `shadow 0 4px 16px`, focus `var(--accent-border)` (không `rgba(255,255,255,0.3)`).
 - [x] **4.2** Textarea autosize: `min-height 52px` `max 160px`, `line-height 1.6`, placeholder `var(--text-faint)` nhưng khi `modelValue===null` không `disabled` mà `aria-disabled` + banner "Configure provider" + `aria-describedby`.

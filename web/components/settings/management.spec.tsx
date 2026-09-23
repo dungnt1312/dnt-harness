@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest'
+﻿import { describe, expect, it } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { AgentsPanel, HooksPanel, McpPanel, MemoryPanel, SecretsPanel, SkillsPanel, validateHooksConfig } from './ManagementPanels.tsx'
 import { AgentRunsPanel } from '../workbench/AgentRunsPanel.tsx'
+import { definitionDocument } from './AgentsPanel.tsx'
 import { SettingsModal } from './SettingsModal.tsx'
 
 const providers = [
@@ -11,7 +12,7 @@ const providers = [
 describe('settings management tabs', () => {
   it('renders every management section as a tab', () => {
     const html = renderToStaticMarkup(
-      <SettingsModal open workspaceId="ws-1" providers={providers} activeProvider="p1" onDismiss={() => {}} onRefresh={async () => {}} onSelectActive={async () => {}} />,
+      <SettingsModal open workspaceId="ws-1" providers={providers} activeProvider="p1" onDismiss={() => {}} onRefresh={async () => {}} />,
     )
     for (const label of ['Providers', 'Agents', 'MCP', 'Hooks', 'Secrets']) {
       expect(html).toContain(label)
@@ -20,7 +21,7 @@ describe('settings management tabs', () => {
 
   it('provider editor still works alongside the tabs', () => {
     const html = renderToStaticMarkup(
-      <SettingsModal open workspaceId="ws-1" providers={providers} activeProvider="p1" onDismiss={() => {}} onRefresh={async () => {}} onSelectActive={async () => {}} />,
+      <SettingsModal open workspaceId="ws-1" providers={providers} activeProvider="p1" onDismiss={() => {}} onRefresh={async () => {}} />,
     )
     expect(html).toContain('Base URL')
     expect(html).toContain('Sync from /models')
@@ -52,6 +53,13 @@ describe('agent runs panel', () => {
     const html = renderToStaticMarkup(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />)
     expect(html).toContain('Delegate a task')
     expect(html).toContain('Children')
+  })
+
+  it('a role pins its model as provider:model, and blank means inherit', () => {
+    const document = definitionDocument({ name: 'researcher', description: 'digs', tools: 'Read', disallowedTools: '', instructions: 'Dig.', model: 'far:gpt-luna' })
+    expect(document).toContain('model: "far:gpt-luna"')
+    const inheriting = definitionDocument({ name: 'researcher', description: 'digs', tools: 'Read', disallowedTools: '', instructions: 'Dig.', model: '' })
+    expect(inheriting).not.toContain('model:')
   })
 })
 
@@ -125,7 +133,7 @@ describe('hooks + secrets panels', () => {
 describe('skills + memory tabs', () => {
   it('renders the new tabs in the grouped nav and honest empty states', () => {
     const html = renderToStaticMarkup(
-      <SettingsModal open workspaceId="ws-1" providers={providers} activeProvider="p1" onDismiss={() => {}} onRefresh={async () => {}} onSelectActive={async () => {}} />,
+      <SettingsModal open workspaceId="ws-1" providers={providers} activeProvider="p1" onDismiss={() => {}} onRefresh={async () => {}} />,
     )
     for (const label of ['Global', 'Workspace', 'Skills', 'Memory']) {
       expect(html).toContain(label)

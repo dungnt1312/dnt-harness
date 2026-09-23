@@ -20,18 +20,21 @@ import {
   listSkills,
   listWorkspaces,
   renameSessionIn,
+  setSessionPinnedIn,
   searchProjectFiles,
   sendMessageIn,
   uploadAttachment,
   stopSessionIn,
   setMode,
   listModes,
-  setPolicy,
   setSessionModel,
   setModelDefaults,
+  fetchAuthState,
 } from './lib/api.ts'
+import { PairingGate } from './components/auth/PairingGate.tsx'
 import { decodeModelChoice, activeModelValue, modelOptions } from './lib/providers.ts'
 import { isTurnRunning, projectItems } from './lib/project.ts'
+import type { FileFocus } from './lib/tool-facts.ts'
 import { useSessionStream } from './hooks/useSessionStream.ts'
 import { useApprovalNotify } from './hooks/useApprovalNotify.ts'
 import { useWorkbenchPreferences } from './hooks/useWorkbenchPreferences.ts'
@@ -207,6 +210,7 @@ export class ModelDefaultsCoordinator {
  * server-side), and the model selector writes the ACTIVE workspace's control.
  */
 export function App() {
+  const [authReady, setAuthReady] = useState<boolean | null>(null)
   const toast = useToast()
   const theme = useTheme()
   const initialRoute = useRef<AppRoute | null>(parseRoute(window.location.pathname))
@@ -314,7 +318,7 @@ export function App() {
   const [workbenchExpanded, setWorkbenchExpanded] = useState(false)
   const inspectorTab = preferences.inspectorTab
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [settingsSection, setSettingsSection] = useState<'providers' | 'projects' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'>('providers')
+  const [settingsSection, setSettingsSection] = useState<'providers' | 'projects' | 'modes' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'>('providers')
   const [pendingDelete, setPendingDelete] = useState<SessionListing | null>(null)
   const [manifest, setManifest] = useState<ContextManifestView | null>(null)
   const [compactNonce, setCompactNonce] = useState(0)
@@ -412,12 +416,12 @@ export function App() {
   const workbenchProject = current !== null ? currentProject : projects.find((project) => project.id === effectiveDraftProject) ?? null
   const workbenchFiles = useWorkbenchFiles(activeWs !== null && workbenchProject !== null ? `${activeWs}:${workbenchProject.id}` : null)
   const openWorkbenchFile = workbenchFiles.openFile
-  const openRecordedPath = useCallback((reference: string): (() => void) | null => {
+  const openRecordedPath = useCallback((reference: string, focus?: FileFocus): (() => void) | null => {
     if (workbenchProject === null) return null
     const relative = toProjectRelative(workbenchProject.path, reference)
     if (relative === null) return null
     return () => {
-      openWorkbenchFile(relative)
+      openWorkbenchFile(relative, focus)
       onWorkbenchOpenChange(true)
     }
   }, [workbenchProject, openWorkbenchFile, onWorkbenchOpenChange])
@@ -823,14 +827,6 @@ export function App() {
     }
   }, [toast, dismissApproval])
 
-  /** Persist `{tool: allow}` for the approval's Always-allow action. */
-  const alwaysAllow = useCallback(async (tool: string) => {
-    if (activeWs === null) throw new Error('no workspace context for a policy change')
-    await setPolicy(activeWs, { ...(meta?.policy ?? {}), [tool]: 'allow' })
-    await refreshMeta()
-    toast.notify(`${tool} will now run without asking in this workspace. Revert it in the permission popover.`, 'ok')
-  }, [activeWs, meta, refreshMeta, toast])
-
   const rename = useCallback(async (id: string, title: string) => {
     if (activeWs === null) return
     const nav = navigation.current.current()
@@ -843,6 +839,29 @@ export function App() {
       toast.notify(String(cause))
     }
   }, [activeWs, refreshList, toast])
+
+  const togglePinned = useCallback(async (id: string, pinned: boolean) => {
+    if (activeWs === null) return
+    const nav = navigation.current.current()
+    try {
+      await setSessionPinnedIn(activeWs, id, pinned)
+      if (!navigation.current.matches(nav)) return
+      await refreshList()
+      toast.notify(pinned ? 'Conversation pinned' : 'Conversation unpinned', 'ok')
+    } catch (cause) {
+      toast.notify(String(cause))
+    }
+  }, [activeWs, refreshList, toast])
+
+  /** Clipboard failures are reported: a silent copy would be a lie. */
+  const copySessionId = useCallback(async (id: string) => {
+    try {
+      await navigator.clipboard.writeText(id)
+      toast.notify('Session ID copied', 'ok')
+    } catch {
+      toast.notify(`Could not copy. Session ID: ${id}`)
+    }
+  }, [toast])
 
   const confirmDelete = useCallback(async () => {
     if (pendingDelete === null || activeWs === null) return
@@ -998,6 +1017,7 @@ export function App() {
       {...(workspaces.some((workspace) => workspace.id === activeWs && workspace.archived) ? {} : { onReorderProjects: reorderProjectFolders })}
       onRename={(id, title) => void rename(id, title)}
       onDeleteRequest={setPendingDelete}
+      onTogglePinned={(id, pinned) => void togglePinned(id, pinned)}
       onOpenSettings={() => openSettings()}
       notifyEnabled={notify.enabled}
       notifyBlocked={notify.blocked}
@@ -1086,9 +1106,7 @@ export function App() {
   const composerNode = (
     <Composer
       modelControl={modelControl}
-      policy={meta?.policy}
       workspaceId={activeWs}
-      onPolicySaved={() => void refreshMeta()}
       sending={sending}
       connected={stream === 'open' || current === null}
       running={running}
@@ -1149,15 +1167,33 @@ export function App() {
       onClose={() => onWorkbenchOpenChange(false)}
       openPath={openRecordedPath}
       sessionId={current}
+      modelOptions={availableModelOptions}
       onOpenChild={openSession}
       onOpenAgentSettings={() => openSettings('agents')}
       context={{ meta, ...(modelDefaults !== null ? { globalDefaults: modelDefaults } : {}), ...(currentSessionModel !== undefined ? { sessionModel: currentSessionModel } : {}), ...(current !== null && currentSessionModelState?.status === 'loading' ? { sessionControlsStatus: 'loading' as const } : {}), ...(current !== null && currentSessionModelState?.status === 'error' ? { sessionControlsStatus: 'unavailable' as const } : {}), stream, sessionId: current, sessionFolder: currentProject?.path ?? null, eventCount: events.length, manifest, workspaceId: activeWs, running, modeLabel: envModeLabel, onCompacted: () => setCompactNonce((nonce) => nonce + 1), onOpenSettingsTab: (tab) => openSettings(tab) }}
     />
   )
 
+  useEffect(() => {
+    let cancelled = false
+    void fetchAuthState().then(
+      (state) => { if (!cancelled) setAuthReady(!(state.required && !state.paired)) },
+      () => { if (!cancelled) setAuthReady(true) },
+    )
+    return () => { cancelled = true }
+  }, [])
+
   const suggestions = draftProjectName !== undefined
     ? [`Explain ${draftProjectName}`, 'Find TODOs and likely bugs', `Plan a change in ${draftProjectName}`]
     : ['Explain how to register a project and get started', 'Help me plan a feature']
+  if (authReady === false) {
+    return (
+      <div className="flex h-dvh items-center bg-bg text-fg">
+        <PairingGate onPaired={() => setAuthReady(true)} />
+      </div>
+    )
+  }
+
   return (
     <>
       <div className="flex h-dvh overflow-hidden bg-bg text-fg">
@@ -1188,9 +1224,14 @@ export function App() {
               />
             }
             title={currentSession?.title}
+            pinned={currentSession?.pinned === true}
             onOpenSidebar={() => onLeftOpenChange(true)}
             onNew={beginConversation}
             onToggleWorkbench={() => onWorkbenchOpenChange(!workbenchOpen)}
+            {...(current !== null ? {
+              onTogglePinned: () => void togglePinned(current, currentSession?.pinned !== true),
+              onCopyId: () => void copySessionId(current),
+            } : {})}
           />
 
           {current === null ? (
@@ -1242,7 +1283,7 @@ export function App() {
               <section aria-label="Conversation composer" className="shrink-0 px-3 pb-3 sm:px-6 sm:pb-4">
                 <div className="mx-auto flex w-full max-w-3xl flex-col gap-2">
                   <TaskStatus events={events} pending={approvals.length} sending={sending} connected={stream !== 'reconnecting'} />
-                  <ApprovalBar key={key} approvals={approvals} scope={currentProject?.path ?? 'No project attached'} onAnswer={answer} {...(activeWorkspace !== null ? { workspaceName: activeWorkspace.name } : {})} onAlwaysAllow={alwaysAllow} />
+                  <ApprovalBar key={key} approvals={approvals} scope={currentProject?.path ?? 'No project attached'} onAnswer={answer} />
                   {sendErrorNotice}
                   {composerNode}
                 </div>
@@ -1288,13 +1329,6 @@ export function App() {
         onDismiss={() => setSettingsOpen(false)}
         onRefresh={async () => {
           await Promise.all([refreshMeta(), refreshModelDefaults()])
-        }}
-        onSelectActive={async (provider, model) => {
-          await modelDefaultsCoordinator.current.enqueue((defaults) => setModelDefaults({
-            provider,
-            model,
-            thinkingLevel: defaults?.thinkingLevel ?? null,
-          }))
         }}
       />
       <ConfirmDialog

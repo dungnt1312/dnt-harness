@@ -112,8 +112,10 @@ anything.
 ## Layer 3 — web host
 
 `createWebServer()` boots a fresh kernel, mounts the harness services, registers
-the provider and tools, attaches an approval policy whose `askUser` answerer
-routes questions over SSE, and exposes everything over HTTP:
+the provider and tools, and attaches an approval listener whose policy is solely
+the selected mode's `permissionDefaults`; its `askUser` answerer routes questions
+over SSE. `--yolo` maps asks to allows but preserves explicit denies. The host
+exposes everything over HTTP:
 
 - **REST** for meta, model/folder switching, session listing/creation, message
   sending, and approval answering.

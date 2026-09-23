@@ -2,14 +2,20 @@
  * MCP client (G5): JSON-RPC over stdio subprocess (primary) or Streamable
  * HTTP. Lifecycle pins MCP spec `2025-06-18`: initialize → tools/list →
  * tools/call → notifications/cancelled. Production hardening: per-call
- * timeout, retry 3× with backoff BEFORE output, circuit breaker (5 fails →
- * 5 min disabled → auto-reconnect with jitter), 30s health checks, verified
- * subprocess cleanup on disconnect.
+ * timeout, one tools/call dispatch (no automatic replay), circuit breaker
+ * (5 fails → 5 min disabled → auto-reconnect with jitter), 30s health
+ * checks, verified subprocess cleanup on disconnect.
  */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { cpus } from 'node:os'
+import { McpDispatchError, receiptForTransportFailure, boundToolMetadata } from './boundaries.ts'
 import type { McpServerConfig } from './config.ts'
+import { MCP_LIMITS } from './limits.ts'
+import { assertOutboundUrl, operatorHeaders } from './outbound-policy.ts'
+import { assertHardContainmentAvailable, minimalStdioEnv, resolveCanonicalExecutable } from './process-controller.ts'
+import { assertInitializeResult, assertCursor, assertSessionId } from './protocol.ts'
+import { SseParser } from './sse-parser.ts'
 
 export const MCP_PROTOCOL_VERSION = '2025-06-18'
 
@@ -81,6 +87,8 @@ function readProcessSample(pid: number): ProcessSample | undefined {
 /** stdio: one subprocess per (workspace, server), newline-delimited JSON-RPC. */
 class StdioTransport implements Transport {
   private child: ChildProcess | undefined
+  /** Set by stop() even when spawn has not assigned `child` yet. */
+  private stopped = false
   private nextId = 1
   private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>()
   private buffer = ''
@@ -98,13 +106,29 @@ class StdioTransport implements Transport {
   async start(): Promise<void> {
     const command = this.config.command
     if (command === undefined) throw new McpTransportError('stdio transport requires a command')
-    const child = spawn(command, this.config.args ?? [], {
-      env: { ...process.env, ...this.resolvedEnv },
+    if (this.stopped) throw new McpTransportError('transport stopped before spawn')
+    if (this.config.resourceLimits?.enforcement === 'hard') await assertHardContainmentAvailable()
+    if (this.stopped) throw new McpTransportError('transport stopped before spawn')
+    const canonical = await resolveCanonicalExecutable(command)
+    if (this.stopped) throw new McpTransportError('transport stopped before spawn')
+    const child = spawn(canonical.path, this.config.args ?? [], {
+      env: minimalStdioEnv(this.resolvedEnv),
       stdio: ['pipe', 'pipe', 'pipe'],
+      shell: false,
+      windowsHide: true,
     })
     this.child = child
+    if (this.stopped) {
+      killOwnedProcessTree(child)
+      this.child = undefined
+      throw new McpTransportError('transport stopped before spawn')
+    }
     this.startResourceWatchdog(child)
     child.stdout?.on('data', (chunk: Buffer) => {
+      if (Buffer.byteLength(this.buffer) + chunk.length > MCP_LIMITS.maxFrameBytes) {
+        this.failPending(new McpTransportError('stdio frame exceeded the byte limit'))
+        return
+      }
       this.buffer += chunk.toString('utf8')
       let newline = this.buffer.indexOf('\n')
       while (newline >= 0) {
@@ -133,14 +157,22 @@ class StdioTransport implements Transport {
       }
       this.pending.clear()
     })
-    // MCP initialize handshake.
-    await this.request('initialize', {
+    // MCP initialize handshake. A bad version never receives notifications/initialized.
+    const initialized = await this.request('initialize', {
       protocolVersion: MCP_PROTOCOL_VERSION,
       capabilities: {},
       clientInfo: { name: 'mini-dsh', version: '0.1.0' },
     }, 10_000)
+    assertInitializeResult(initialized)
     await this.notify('notifications/initialized', {})
     this.state = 'ready'
+  }
+
+  private failPending(error: Error): void {
+    this.state = 'failed'
+    for (const pending of this.pending.values()) pending.reject(error)
+    this.pending.clear()
+    void this.child?.kill()
   }
 
   private handleLine(line: string): void {
@@ -173,20 +205,27 @@ class StdioTransport implements Transport {
       this.pending.set(id, { resolve, reject })
     })
     this.child?.stdin?.write(`${message}\n`)
-    // Timeout + abort race the response.
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const onAbort = (): void => {
+      this.child?.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: id, reason: 'client abort' } })}\n`)
+      rejectPending(new McpTransportError(`${method} cancelled`))
+    }
+    const rejectPending = (error: Error): void => {
+      const waiting = this.pending.get(id)
+      if (waiting === undefined) return
+      this.pending.delete(id)
+      waiting.reject(error)
+    }
     const timeout = new Promise<never>((_, reject) => {
-      const timer = setTimeout(() => reject(new McpTransportError(`${method} timed out after ${timeoutMs}ms`)), timeoutMs)
+      timer = setTimeout(() => reject(new McpTransportError(`${method} timed out after ${timeoutMs}ms`)), timeoutMs)
       timer.unref?.()
-      signal?.addEventListener('abort', () => {
-        // MCP cancellation notification: best effort, no response expected.
-        this.child?.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: id, reason: 'client abort' } })}
-`)
-        reject(new McpTransportError(`${method} cancelled`))
-      }, { once: true })
+      signal?.addEventListener('abort', onAbort, { once: true })
     })
     try {
       return await Promise.race([promise, timeout])
     } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
       this.pending.delete(id)
     }
   }
@@ -234,6 +273,7 @@ class StdioTransport implements Transport {
   }
 
   async stop(): Promise<void> {
+    this.stopped = true
     if (this.resourceTimer !== undefined) clearInterval(this.resourceTimer)
     if (this.lifetimeTimer !== undefined) clearTimeout(this.lifetimeTimer)
     // Verified cleanup: close stdin, kill the tree, wait for exit. Windows
@@ -266,6 +306,8 @@ class StdioTransport implements Transport {
 class HttpTransport implements Transport {
   private sessionId: string | undefined
   private nextId = 1
+  private stopped = false
+  private readonly abort = new AbortController()
   state: TransportState = 'connecting'
 
   constructor(
@@ -275,11 +317,14 @@ class HttpTransport implements Transport {
   ) {}
 
   async start(): Promise<void> {
-    await this.request('initialize', {
+    if (this.stopped) throw new McpTransportError('transport stopped before spawn')
+    const initialized = await this.request('initialize', {
       protocolVersion: MCP_PROTOCOL_VERSION,
       capabilities: {},
       clientInfo: { name: 'mini-dsh', version: '0.1.0' },
     }, 10_000)
+    if (this.stopped) throw new McpTransportError('transport stopped before spawn')
+    assertInitializeResult(initialized)
     await this.notify('notifications/initialized', {})
     this.state = 'ready'
   }
@@ -308,21 +353,29 @@ class HttpTransport implements Transport {
 
   private async post(body: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal): Promise<Response> {
     if (this.config.url === undefined) throw new McpTransportError('http transport requires a url')
-    const response = await fetch(this.config.url, {
+    const target = assertOutboundUrl(this.config.url, { allowLoopbackHttp: true })
+    const response = await fetch(target, {
       method: 'POST',
+      redirect: 'manual',
       headers: {
+        ...operatorHeaders(this.config.headers),
         'content-type': 'application/json',
         accept: 'application/json, text/event-stream',
-        origin: new URL(this.config.url).origin,
-        ...(this.config.headers ?? {}),
+        origin: target.origin,
         ...(this.bearerToken !== undefined ? { authorization: `Bearer ${this.bearerToken}` } : {}),
         ...(this.sessionId !== undefined ? { 'mcp-session-id': this.sessionId } : {}),
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal !== undefined ? [signal] : [])]),
+      signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), this.abort.signal, ...(signal !== undefined ? [signal] : [])]),
     })
+    if (response.status >= 300 && response.status < 400) {
+      throw new McpDispatchError('HTTP redirect was not followed', receiptForTransportFailure(true, 'redirect_followed'))
+    }
     const sessionHeader = response.headers.get('mcp-session-id')
-    if (sessionHeader !== null) this.sessionId = sessionHeader
+    if (sessionHeader !== null) {
+      assertSessionId(sessionHeader)
+      this.sessionId = sessionHeader
+    }
     if (!response.ok) throw new McpTransportError(`HTTP ${response.status}`)
     return response
   }
@@ -332,38 +385,38 @@ class HttpTransport implements Transport {
     if (response.body === null) throw new McpTransportError('SSE response has no body')
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
-    let buffer = ''
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      let boundary = buffer.indexOf('\n\n')
-      while (boundary >= 0) {
-        const frame = buffer.slice(0, boundary)
-        buffer = buffer.slice(boundary + 2)
-        boundary = buffer.indexOf('\n\n')
-        const data = frame.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n')
-        if (data === '') continue
-        let parsed: { id?: unknown; method?: unknown; result?: unknown; error?: unknown }
-        try { parsed = JSON.parse(data) as typeof parsed } catch { continue }
-        if (typeof parsed.method === 'string') {
-          this.onNotification?.(parsed.method)
-          continue
+    const parser = new SseParser()
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        const events = parser.push(decoder.decode(value, { stream: true }))
+        for (const event of events) {
+          let parsed: { id?: unknown; method?: unknown; result?: unknown; error?: unknown }
+          try { parsed = JSON.parse(event.data) as typeof parsed } catch { continue }
+          if (typeof parsed.method === 'string') {
+            this.onNotification?.(parsed.method)
+            continue
+          }
+          if (parsed.id !== requestId) continue
+          if (parsed.error !== undefined) throw new McpTransportError('MCP JSON-RPC request failed')
+          return parsed.result
         }
-        if (parsed.id !== requestId) continue
-        await reader.cancel().catch(() => {})
-        if (parsed.error !== undefined) throw new McpTransportError('MCP JSON-RPC request failed')
-        return parsed.result
       }
+    } finally {
+      reader.releaseLock()
     }
     throw new McpTransportError('SSE response carried no matching JSON-RPC result')
   }
 
   async stop(): Promise<void> {
+    this.stopped = true
+    this.abort.abort()
     // Terminate the server-side Streamable HTTP session when one exists.
     if (this.config.url !== undefined && this.sessionId !== undefined) {
-      await fetch(this.config.url, {
+      await fetch(assertOutboundUrl(this.config.url, { allowLoopbackHttp: true }), {
         method: 'DELETE',
+        redirect: 'manual',
         headers: {
           origin: new URL(this.config.url).origin,
           'mcp-session-id': this.sessionId,
@@ -376,7 +429,7 @@ class HttpTransport implements Transport {
 }
 
 
-function descriptorsFromList(raw: unknown): readonly McpToolDescriptor[] {
+function descriptorsFromList(raw: unknown, serverName: string): readonly McpToolDescriptor[] {
   const result = raw as { tools?: { name: string; description?: string; inputSchema?: unknown; annotations?: { readOnlyHint?: boolean; requiresUserInteraction?: boolean } }[] } | undefined
   const seen = new Set<string>()
   const descriptors: McpToolDescriptor[] = []
@@ -385,10 +438,18 @@ function descriptorsFromList(raw: unknown): readonly McpToolDescriptor[] {
       throw new McpTransportError(`MCP tools/list contains duplicate or empty tool name`)
     }
     seen.add(tool.name)
-    descriptors.push({
+    const bounded = boundToolMetadata({
+      server: serverName,
       name: tool.name,
       ...(tool.description !== undefined ? { description: tool.description } : {}),
       inputSchema: tool.inputSchema ?? { type: 'object', properties: {} },
+      ...(tool.annotations !== undefined ? { annotations: tool.annotations } : {}),
+    })
+    if (bounded === undefined) throw new McpTransportError('MCP tools/list contains an unusable tool name')
+    descriptors.push({
+      name: bounded.name,
+      ...(bounded.description !== '' ? { description: bounded.description } : {}),
+      inputSchema: bounded.inputSchema,
       ...(tool.annotations?.readOnlyHint === true ? { readOnlyHint: true } : {}),
       ...(tool.annotations?.requiresUserInteraction === true ? { requiresUserInteraction: true } : {}),
     })
@@ -433,11 +494,17 @@ export class McpServerClient {
     }
     await this.ensureConnected()
     const pages: McpToolDescriptor[] = []
+    const seenCursors = new Set<string>()
     let cursor: string | undefined
+    let page = 0
     do {
+      page += 1
+      assertCursor(cursor, seenCursors, page)
+      if (cursor !== undefined && cursor !== '') seenCursors.add(cursor)
       const raw = await this.withRetry(async () =>
         this.transport?.request('tools/list', cursor !== undefined ? { cursor } : {}, this.config.timeoutMs ?? 15_000))
-      pages.push(...descriptorsFromList(raw))
+      pages.push(...descriptorsFromList(raw, this.serverName))
+      if (pages.length > MCP_LIMITS.maxTools) throw new McpTransportError('tools/list exceeded the tool cap')
       cursor = (raw as { nextCursor?: unknown } | undefined)?.nextCursor as string | undefined
     } while (cursor !== undefined && cursor !== '')
     this.toolsCache = pages
@@ -449,35 +516,55 @@ export class McpServerClient {
     return this.toolsCache
   }
 
-  /** One tools/call with the retry window (3× backoff before any output). */
+  /**
+   * One tools/call. A transport failure after the write is attempted is
+   * `possibly_dispatched` and is not sent again.
+   */
   async callTool(tool: string, args: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal): Promise<McpCallResult> {
-    if (Date.now() < this.breakerUntil) {
-      throw new McpTransportError(`server '${this.serverName}' is disabled by the circuit breaker`)
-    }
     const started = Date.now()
-    let lastError: Error | undefined
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        await this.ensureConnected()
-        const raw = await this.transport?.request('tools/call', { name: tool, arguments: args }, timeoutMs, signal)
-        this.recordSuccess()
-        const result = (raw ?? {}) as { isError?: boolean; content?: unknown }
-        this.onAudit({ kind: 'call', detail: `${this.serverName}.${tool}`, durationMs: Date.now() - started, isError: result.isError === true })
-        return { isError: result.isError === true, content: result.content ?? null }
-      } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error))
-        // Retry only before meaningful output: transport-level failures
-        // here have produced no tool output, so backoff and retry.
-        if (signal?.aborted === true) break
-        await new Promise((resolve) => setTimeout(resolve, 200 * 2 ** attempt))
+    let sent = false
+    try {
+      if (Date.now() < this.breakerUntil) {
+        throw new McpDispatchError(
+          `server '${this.serverName}' is disabled by the circuit breaker`,
+          receiptForTransportFailure(false, 'not_connected'),
+        )
       }
+      await this.ensureConnected()
+      if (this.retired) {
+        throw new McpDispatchError('runtime generation was fenced', receiptForTransportFailure(false, 'not_connected'))
+      }
+      sent = true
+      const raw = await this.transport?.request('tools/call', { name: tool, arguments: args }, timeoutMs, signal)
+      this.recordSuccess()
+      const result = (raw ?? {}) as { isError?: boolean; content?: unknown }
+      this.onAudit({ kind: 'call', detail: `${this.serverName}.${tool}`, durationMs: Date.now() - started, isError: result.isError === true })
+      return { isError: result.isError === true, content: result.content ?? null }
+    } catch (error) {
+      const dispatch = error instanceof McpDispatchError
+        ? error
+        : new McpDispatchError(
+          error instanceof Error ? error.message : String(error),
+          receiptForTransportFailure(sent, sent ? (signal?.aborted === true ? 'cancelled_after_send' : 'response_lost') : 'not_connected'),
+        )
+      this.recordFailure(dispatch)
+      throw dispatch
     }
-    this.recordFailure(lastError ?? new Error('call failed'))
-    throw lastError ?? new McpTransportError('tools/call failed')
+  }
+
+  /**
+   * The generation that built this client is dead. Further connects throw
+   * instead of spawning another process from the old config.
+   */
+  private retired = false
+
+  retire(): void {
+    this.retired = true
   }
 
   /** Disconnect with verified subprocess cleanup. */
   async disconnect(): Promise<void> {
+    this.retired = true
     if (this.healthTimer !== undefined) {
       clearInterval(this.healthTimer)
       this.healthTimer = undefined
@@ -502,7 +589,7 @@ export class McpServerClient {
         try {
           await this.ensureConnected()
           const raw = await this.transport?.request('tools/list', {}, 5_000)
-          this.toolsCache = descriptorsFromList(raw)
+          this.toolsCache = descriptorsFromList(raw, this.serverName)
           this.recordSuccess()
         } catch {
           this.recordFailure(new McpTransportError('health check failed'), onReconnected)
@@ -529,7 +616,7 @@ export class McpServerClient {
           const transport = this.transport as Transport | undefined
           if (transport === undefined) throw new McpTransportError('reconnect produced no transport')
           const raw = await transport.request('tools/list', {}, 5_000)
-          this.toolsCache = descriptorsFromList(raw)
+          this.toolsCache = descriptorsFromList(raw, this.serverName)
           this.recordSuccess()
           await onReconnected()
           this.onAudit({ kind: 'reconnect', detail: this.serverName, durationMs: 0, isError: false })
@@ -544,6 +631,9 @@ export class McpServerClient {
   }
 
   private async ensureConnected(halfOpen = false): Promise<void> {
+    if (this.retired) {
+      throw new McpDispatchError('runtime generation was fenced', receiptForTransportFailure(false, 'not_connected'))
+    }
     if (this.breakerState === 'open') {
       if (!halfOpen && Date.now() < this.breakerUntil) {
         throw new McpTransportError(`server '${this.serverName}' is disabled by the circuit breaker`)
@@ -574,7 +664,7 @@ export class McpServerClient {
   private async refreshToolsFromNotification(): Promise<void> {
     try {
       const raw = await this.transport?.request('tools/list', {}, this.config.timeoutMs ?? 15_000)
-      this.toolsCache = descriptorsFromList(raw)
+      this.toolsCache = descriptorsFromList(raw, this.serverName)
       await this.onReconnected?.()
       this.onAudit({ kind: 'reconnect', detail: `${this.serverName}: tools/list_changed`, durationMs: 0, isError: false })
     } catch {

@@ -24,6 +24,17 @@ describe('projectArtifacts', () => {
     }])
   })
 
+  it('marks indeterminate and audit_fault results unknown, never a clean failure', () => {
+    expect(projectArtifacts([
+      { type: 'tool/call', seq: 1, call: { id: 'mcp-1', name: 'mcp__srv__write', args: { path: 'C:/repo/a.txt' } } },
+      { type: 'tool/result', seq: 2, callId: 'mcp-1', ok: false, output: 'may have run', outcome: 'indeterminate', invocationId: 'inv-1' },
+    ])[0]).toMatchObject({ id: 'mcp-1', state: 'unknown' })
+    expect(projectArtifacts([
+      { type: 'tool/call', seq: 1, call: { id: 'mcp-2', name: 'mcp__srv__write', args: { path: 'C:/repo/b.txt' } } },
+      { type: 'tool/result', seq: 2, callId: 'mcp-2', ok: false, output: 'evidence missing', outcome: 'audit_fault' },
+    ])[0]).toMatchObject({ id: 'mcp-2', state: 'unknown' })
+  })
+
   it('marks a recovered successful result unknown', () => {
     expect(projectArtifacts([
       { type: 'tool/call', seq: 1, call: { id: 'read-1', name: 'Read', args: { file_path: 'C:/repo/a.ts' } } },

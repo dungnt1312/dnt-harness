@@ -1,8 +1,9 @@
-import { useMemo, type ReactNode } from 'react'
-import { useStickToBottom } from '../../hooks/useStickToBottom.ts'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { HoldScrollProvider, useStickToBottom } from '../../hooks/useStickToBottom.ts'
 import type { ViewItem } from '../../lib/project.ts'
 import type { OpenPathResolver } from '../artifacts/ArtifactsPanel.tsx'
-import { AssistantMessage, AuditLine, DelegationCard, JumpToBottom, StatusLine, ToolCard, UserBubble } from './MessageParts.tsx'
+import { ActivityBlock, AssistantMessage, AuditLine, DelegationCard, JumpToBottom, StatusLine, ToolCard, UserBubble } from './MessageParts.tsx'
+import { ConversationMinimap } from './ConversationMinimap.tsx'
 
 interface Indexed { readonly item: ViewItem; readonly index: number }
 type Block = { readonly kind: 'row'; readonly row: Indexed } | { readonly kind: 'activity'; readonly rows: readonly Indexed[] }
@@ -24,9 +25,14 @@ export function turnFooters(items: readonly ViewItem[]): ReadonlyMap<number, Tur
     if (item.kind !== 'assistant') return
     const key = item.turnId ?? `index:${index}`
     const group = groups.get(key) ?? { indexes: [], text: '', open: false }
-    if (item.content !== '') group.text = group.text === '' ? item.content : `${group.text}\n\n${item.content}`
+    // Only answers that said something can carry the footer: a trailing
+    // thinking-only step is activity, and belongs nowhere near the answer's
+    // action row.
+    if (item.content !== '') {
+      group.text = group.text === '' ? item.content : `${group.text}\n\n${item.content}`
+      group.indexes.push(index)
+    }
     if (item.turnOpen === true) group.open = true
-    group.indexes.push(index)
     groups.set(key, group)
   })
   const footers = new Map<number, TurnFooter>()
@@ -50,6 +56,24 @@ export function turnFooters(items: readonly ViewItem[]): ReadonlyMap<number, Tur
 const rendersNothing = (item: ViewItem): boolean =>
   item.kind === 'assistant' && item.content === '' && !item.live && item.thinking.length === 0 && !item.thinkingLive
 
+/**
+ * Work that must stay legible on its own line, never folded into a run's
+ * summary: anything that changed the workspace, and handing work to an agent.
+ * Reading twenty files is one step; editing one file is not.
+ */
+const STANDALONE_TOOLS: ReadonlySet<string> = new Set(['write', 'edit', 'multiedit', 'notebookedit', 'patch', 'applypatch', 'agent'])
+
+const standsAlone = (item: ViewItem): boolean =>
+  item.kind === 'delegation' || (item.kind === 'tool' && STANDALONE_TOOLS.has(item.call.name.toLowerCase()))
+
+/** Rows that read as activity rather than as a message, for grouping and spacing. */
+const isActivity = (item: ViewItem): boolean => ACTIVITY_KINDS.has(item.kind)
+
+/** A block the reader skims past: it sits close to its neighbour, not a message apart. */
+const isQuiet = (block: Block): boolean => block.kind === 'activity'
+  || isActivity(block.row.item)
+  || (block.row.item.kind === 'assistant' && block.row.item.content === '')
+
 export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
   const blocks: Block[] = []
   items.forEach((item, index) => {
@@ -58,7 +82,7 @@ export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
     const previous = items[index - 1]
     if (item.kind === 'status' && item.reason === 'failed' && previous?.kind === 'status' && previous.reason.includes(':')) return
     const last = blocks.at(-1)
-    if (ACTIVITY_KINDS.has(item.kind)) {
+    if (isActivity(item) && !standsAlone(item)) {
       if (last?.kind === 'activity') blocks[blocks.length - 1] = { kind: 'activity', rows: [...last.rows, { item, index }] }
       else blocks.push({ kind: 'activity', rows: [{ item, index }] })
       return
@@ -86,7 +110,24 @@ export function Transcript({ items, conversationId, modelLabel, workspaceId, onR
 }) {
   const blocks = useMemo(() => groupBlocks(items), [items])
   const footers = useMemo(() => turnFooters(items), [items])
-  const { scrollRef, contentRef, atBottom, onScroll, scrollToBottom } = useStickToBottom(conversationId)
+  const { scrollRef, contentRef, atBottom, onScroll, scrollToBottom, holdPosition } = useStickToBottom(conversationId)
+
+  // Rows that arrived while the reader was away from the tail. Streaming into
+  // an existing answer does not count — only rows nobody has seen yet.
+  const [seen, setSeen] = useState(items.length)
+  const seenRef = useRef(seen)
+  seenRef.current = seen
+  useEffect(() => {
+    if (atBottom && seenRef.current !== items.length) setSeen(items.length)
+  }, [atBottom, items.length])
+  const unseen = Math.max(0, items.length - seen)
+
+  /**
+   * An answer already reserves a (hover-revealed) action row underneath, so it
+   * does not also need a full message gap: the reserved row is the gap. A user
+   * bubble keeps its actions beside it and reserves nothing.
+   */
+  const carriesActions = (block: Block): boolean => block.kind === 'row' && footers.has(block.row.index)
 
   const render = ({ item, index }: Indexed): ReactNode => {
     switch (item.kind) {
@@ -94,7 +135,7 @@ export function Transcript({ items, conversationId, modelLabel, workspaceId, onR
         return <UserBubble key={`user-${index}`} item={item} workspaceId={workspaceId ?? null} {...(onReuse !== undefined ? { onReuse } : {})} />
       case 'assistant': {
         const turn = footers.get(index)
-        return <AssistantMessage key={`assistant-${item.ts ?? index}`} item={item} {...(modelLabel !== undefined ? { modelLabel } : {})} {...(turn !== undefined ? { turn } : {})} />
+        return <AssistantMessage key={`assistant-${index}`} item={item} {...(modelLabel !== undefined ? { modelLabel } : {})} {...(turn !== undefined ? { turn } : {})} />
       }
       case 'tool':
         return <ToolCard key={item.call.id} item={item} {...(openPath !== undefined ? { openPath } : {})} />
@@ -110,24 +151,40 @@ export function Transcript({ items, conversationId, modelLabel, workspaceId, onR
   }
 
   return (
-    <div className="relative min-h-0 flex-1">
-      <div
-        ref={scrollRef}
-        onScroll={onScroll}
-        tabIndex={0}
-        role="region"
-        aria-label="Conversation transcript"
-        className="absolute inset-0 overflow-y-auto overflow-x-hidden outline-none"
-      >
-        <div ref={contentRef} className="px-3 pb-8 pt-4 sm:px-6">
-          <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-1">
-          {blocks.map((block) => block.kind === 'activity'
-            ? <div key={`activity-${block.rows[0]?.index ?? 0}`} className="flex flex-col gap-0.5">{block.rows.map(render)}</div>
-            : render(block.row))}
+    <HoldScrollProvider value={holdPosition}>
+      <div className="relative min-h-0 flex-1">
+        <div
+          ref={scrollRef}
+          onScroll={onScroll}
+          tabIndex={0}
+          role="region"
+          aria-label="Conversation transcript"
+          className="chat-scroll absolute inset-0 overflow-y-auto overflow-x-hidden outline-none"
+        >
+          <div ref={contentRef} className="px-3 pb-8 pt-4 sm:px-6">
+            {/* Spacing is per neighbour, not one flat gap: activity sits close
+                to what it belongs to, and a message whose reserved action row
+                already adds height does not add a full gap on top of it. */}
+            <div className="mx-auto flex w-full max-w-3xl flex-col px-1">
+              {blocks.map((block, position) => {
+                const spacing = 'mt-1.5'
+                const row = block.kind === 'row' ? block.row : null
+                const isUserRow = row?.item.kind === 'user'
+                if (block.kind === 'activity') {
+                  return (
+                    <div key={`activity-${block.rows[0]?.index ?? 0}`} className={spacing}>
+                      <ActivityBlock items={block.rows.map((row) => row.item)}>{block.rows.map(render)}</ActivityBlock>
+                    </div>
+                  )
+                }
+                return <div key={`row-${block.row.index}`} {...(isUserRow ? { 'data-minimap-index': block.row.index } : {})} className={spacing}>{render(block.row)}</div>
+              })}
+            </div>
           </div>
         </div>
+        <ConversationMinimap items={items} scrollRef={scrollRef} contentRef={contentRef} />
+        {!atBottom ? <JumpToBottom unseen={unseen} onClick={scrollToBottom} /> : null}
       </div>
-      {!atBottom ? <JumpToBottom onClick={scrollToBottom} /> : null}
-    </div>
+    </HoldScrollProvider>
   )
 }

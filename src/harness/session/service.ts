@@ -425,31 +425,16 @@ export class SessionsService extends Service {
       const { events } = await store.read(id)
       const first = events[0]
       const last = events[events.length - 1]
-      let title: string | null = null
-      let projectId: string | null = null
-      for (let i = events.length - 1; i >= 0; i--) {
-        const event = events[i]
-        if (event?.type === 'session/title') {
-          title = event.title
-          break
-        }
-      }
-      for (let i = events.length - 1; i >= 0; i--) {
-        const event = events[i]
-        if (event?.type === 'session/project') {
-          projectId = event.projectId
-          break
-        }
-      }
       const summary: SessionSummary = {
         id,
         createdAt: first?.timestamp ?? 0,
         updatedAt: last?.timestamp ?? 0,
         eventCount: events.length,
         lastSeq: last?.seq ?? 0,
-        title,
+        title: lastRecorded(events, (event) => (event.type === 'session/title' ? event.title : undefined), null),
         derivedTitle: deriveTitle(events),
-        projectId,
+        projectId: lastRecorded(events, (event) => (event.type === 'session/project' ? event.projectId : undefined), null),
+        pinned: lastRecorded(events, (event) => (event.type === 'session/pinned' ? event.pinned : undefined), false),
       }
       await store.writeSummary(id, summary)
       return summary
@@ -529,31 +514,30 @@ export class SessionsService extends Service {
     const events = session.events.slice(0, lastSeq)
     const first = events[0]
     const last = events[events.length - 1]
-    let title: string | null = null
-    let projectId: string | null = null
-    for (let i = events.length - 1; i >= 0; i--) {
-      const event = events[i]
-      if (event?.type === 'session/title') {
-        title = event.title
-        break
-      }
-    }
-    for (let i = events.length - 1; i >= 0; i--) {
-      const event = events[i]
-      if (event?.type === 'session/project') {
-        projectId = event.projectId
-        break
-      }
-    }
     return {
       id: session.id,
       createdAt: first?.timestamp ?? this.now(),
       updatedAt: last?.timestamp ?? this.now(),
       eventCount: events.length,
       lastSeq: last?.seq ?? 0,
-      title,
+      title: lastRecorded(events, (event) => (event.type === 'session/title' ? event.title : undefined), null),
       derivedTitle: deriveTitle(events),
-      projectId,
+      projectId: lastRecorded(events, (event) => (event.type === 'session/project' ? event.projectId : undefined), null),
+      pinned: lastRecorded(events, (event) => (event.type === 'session/pinned' ? event.pinned : undefined), false),
     }
   }
+}
+
+/**
+ * The last value a log recorded for one projected field, or `fallback` when it
+ * never recorded one. `undefined` from `pick` means "this event says nothing
+ * about the field", so a recorded `null` still wins over the fallback.
+ */
+function lastRecorded<T>(events: readonly SessionEvent[], pick: (event: SessionEvent) => T | undefined, fallback: T): T {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]
+    const value = event === undefined ? undefined : pick(event)
+    if (value !== undefined) return value
+  }
+  return fallback
 }

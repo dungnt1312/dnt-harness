@@ -1,6 +1,7 @@
 import { Service, type Context } from '../../kernel/index.ts'
 import type { ToolCall, ToolSchema } from '../llm/types.ts'
 import { canonicalCall } from './names.ts'
+import { takeMcpOutcome } from '../mcp/staged-outcome.ts'
 import type { PreExecuteDecision, PreparedToolCall, ToolDefinition, ToolExecution, ToolResult } from './types.ts'
 
 declare module 'mini-dsh' {
@@ -160,6 +161,15 @@ export class ToolsService extends Service {
           output = await tool.execute(preparedCall.args, exec)
         } catch (error) {
           return this.postExecute(preparedCall, exec, { ok: false, output: `error: ${String(error)}` })
+        }
+        const staged = exec.toolCallId !== undefined && exec.toolCallId !== '' ? takeMcpOutcome(exec.toolCallId) : undefined
+        if (staged !== undefined) {
+          return this.postExecute(preparedCall, exec, {
+            ok: staged.ok,
+            output,
+            outcome: staged.outcome,
+            invocationId: staged.invocationId,
+          })
         }
         return this.postExecute(preparedCall, exec, { ok: true, output })
       },

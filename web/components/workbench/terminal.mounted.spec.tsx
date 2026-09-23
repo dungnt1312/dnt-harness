@@ -30,9 +30,16 @@ class MockTerminal {
   }
   loadAddon(): void {}
   open(): void {}
-  write(chunk: string): void {
+  write(chunk: string, callback?: () => void): void {
     this.writes.push(chunk)
     written.push(chunk)
+    // xterm parses a write on a later turn and only then invokes the callback.
+    // Replies synthesized during that parse (the `1;2c` bug) arrive through
+    // onData before the callback, so the mock preserves that ordering.
+    queueMicrotask(() => {
+      if (chunk.includes('[c')) this.data?.('[?1;2c')
+      callback?.()
+    })
   }
   onData(listener: (chunk: string) => void): void {
     this.data = listener
@@ -251,6 +258,31 @@ describe('terminal panel', () => {
     expect(host.textContent).toContain('Git Bash')
   })
 
+  it('does not type the device-attributes reply from a replayed query into the shell', async () => {
+    await mount()
+    // Git Bash's startup (and every resize) contains `CSI c`. Replaying it must
+    // not send xterm's `ESC[?1;2c` answer back to the PTY — the shell echoes
+    // that as the stray `1;2c` on the prompt.
+    const scrollback = 'MINGW64 /work\r\n\u001b[c$ '
+    await act(async () => push({
+      kind: 'snapshot',
+      terminals: [{ ...row('terminal-1'), scrollback: Buffer.from(scrollback, 'utf8').toString('base64') }],
+    } as Frame))
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(api.writeTerminal).not.toHaveBeenCalled()
+
+    // Keystrokes after the replay still go through.
+    const term = MockTerminal.instances[0]
+    act(() => term?.data?.('ls\r'))
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30))
+    })
+    expect(api.writeTerminal).toHaveBeenCalledWith('ws', 'terminal-1', 'ls\r')
+  })
+
   it('replays a reconnect snapshot into a cleared terminal instead of doubling it', async () => {
     await mount()
     const snapshot = {
@@ -346,6 +378,37 @@ describe('terminal panel', () => {
     api.createTerminal.mockClear()
     await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="New terminal"]')!.click())
     expect(api.createTerminal).toHaveBeenCalledWith('ws', expect.objectContaining({ projectId: 'project-7', shellId: 'bash' }))
+  })
+
+  it('shows only the open project terminals and opens one of its own', async () => {
+    await mount({ projectId: 'project-7' })
+    await act(async () => push({
+      kind: 'snapshot',
+      terminals: [
+        { ...row('terminal-1'), projectId: 'project-7', scrollback: Buffer.from('mine', 'utf8').toString('base64') },
+        { ...row('terminal-2', 'PowerShell', 'powershell'), projectId: 'project-9', scrollback: Buffer.from('theirs', 'utf8').toString('base64') },
+      ],
+    } as Frame))
+
+    // The other project's shell is alive on the host but not in this view,
+    // and it must not be drawn or replayed here.
+    expect(host.textContent).toContain('Git Bash')
+    expect(host.textContent).not.toContain('PowerShell')
+    expect(written).toContain('mine')
+    expect(written).not.toContain('theirs')
+    expect(MockTerminal.instances).toHaveLength(1)
+    // This project already has a shell, so none is opened for it.
+    expect(api.createTerminal).not.toHaveBeenCalled()
+  })
+
+  it('opens a shell for a project whose folder has none yet, even while another project has one', async () => {
+    await mount({ projectId: 'project-7' })
+    await act(async () => push({
+      kind: 'snapshot',
+      terminals: [{ ...row('terminal-2'), projectId: 'project-9', scrollback: '' }],
+    } as Frame))
+
+    expect(api.createTerminal).toHaveBeenCalledWith('ws', expect.objectContaining({ projectId: 'project-7' }))
   })
 
   it('disables opening another terminal at the cap', async () => {

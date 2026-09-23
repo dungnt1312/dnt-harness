@@ -198,6 +198,119 @@ describe('approval lifecycle', () => {
     void kernel.stop()
   })
 
+  it('the catch-all * applies after exact and mcp__server__* lookups', async () => {
+    const { kernel, session } = boot({ '*': 'deny' })
+    kernel.ctx.tools.register(echoTool)
+    let result: { ok: boolean; output: string } | undefined
+    await agentScope.run({ sessionId: session.id }, async () => {
+      result = await kernel.ctx.tools.execute(call('Echo'))
+    })
+    expect(result?.ok).toBe(false)
+    expect(result?.output).toMatch(/policy denies 'Echo'/)
+    void kernel.stop()
+  })
+
+  it('mcp__server__* wins over the catch-all *', async () => {
+    const mcpTool: ToolDefinition = {
+      name: 'mcp__fixture__query',
+      description: 'mcp query',
+      parameters: { type: 'object', properties: {}, required: [] },
+      async execute() { return 'ok' },
+    }
+    const { kernel, session } = boot({ '*': 'deny', 'mcp__fixture__*': 'allow' })
+    kernel.ctx.tools.register(mcpTool)
+    let result: { ok: boolean; output: string } | undefined
+    await agentScope.run({ sessionId: session.id }, async () => {
+      result = await kernel.ctx.tools.execute({ id: 'm1', name: 'mcp__fixture__query', args: {} })
+    })
+    expect(result).toEqual({ ok: true, output: 'ok' })
+    void kernel.stop()
+  })
+
+  it('an already-aborted signal cancels before waiting for a human', async () => {
+    const started = Date.now()
+    const controller = new AbortController()
+    controller.abort()
+    const { kernel, session } = boot({ Echo: 'ask' }, () => new Promise<boolean>(() => {}))
+    kernel.ctx.tools.register(echoTool)
+    let result: { ok: boolean; output: string } | undefined
+    await agentScope.run({ sessionId: session.id }, async () => {
+      result = await kernel.ctx.tools.execute(call('Echo'), { signal: controller.signal })
+    })
+    expect(result?.ok).toBe(false)
+    expect(result?.output).toMatch(/cancelled/)
+    expect(Date.now() - started).toBeLessThan(1000)
+    void kernel.stop()
+  })
+
+  it('a live policy change to allow settles a pending ask without a human answer', async () => {
+    let current: Record<string, ApprovalMode> = { Echo: 'ask' }
+    const { kernel, session, handle } = boot(() => current, () => new Promise<boolean>(() => {}))
+    kernel.ctx.tools.register(echoTool)
+    const resultPromise = agentScope.run({ sessionId: session.id }, () =>
+      kernel.ctx.tools.execute(call('Echo')),
+    )
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    current = { Echo: 'allow' }
+    // Deliberately outside agentScope: an Always-allow arrives on an HTTP
+    // request with no agent in flight, and the decision still has to be
+    // recorded against the session that asked.
+    handle.reevaluate({})
+    const result = (await resultPromise) as { ok: boolean; output: string }
+    expect(result).toEqual({ ok: true, output: 'echo: hi' })
+    await session.durable()
+    const decision = session.events.find((e) => e.type === 'approval/decision')
+    expect(decision?.type === 'approval/decision' && decision.decision).toBe('allow')
+    const request = session.events.find((e) => e.type === 'approval/request')
+    expect(decision?.type === 'approval/decision' && decision.approvalId)
+      .toBe(request?.type === 'approval/request' ? request.approvalId : undefined)
+    void kernel.stop()
+  })
+
+  it('a policy change to deny records its decision too', async () => {
+    let current: Record<string, ApprovalMode> = { Echo: 'ask' }
+    const { kernel, session, handle } = boot(() => current, () => new Promise<boolean>(() => {}))
+    kernel.ctx.tools.register(echoTool)
+    const resultPromise = agentScope.run({ sessionId: session.id }, () =>
+      kernel.ctx.tools.execute(call('Echo')),
+    )
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    current = { Echo: 'deny' }
+    handle.reevaluate({})
+    await resultPromise
+    await session.durable()
+    const decision = session.events.find((e) => e.type === 'approval/decision')
+    expect(decision?.type === 'approval/decision' && decision.decision).toBe('deny')
+    void kernel.stop()
+  })
+
+  it('the answerer receives the expiry deadline for the question it must ask', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(SessionsService)
+    kernel.ctx.plugin(LlmService)
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.plugin(AgentsService)
+    const session = kernel.ctx.sessions.create()
+    kernel.ctx.tools.register(echoTool)
+    const before = Date.now()
+    let deadline = 0
+    attachApproval(kernel.ctx, {
+      policy: { Echo: 'ask' },
+      expiryMs: 60_000,
+      askUser: (_call, lifecycle) => {
+        deadline = lifecycle.expiresAt
+        return Promise.resolve(true)
+      },
+    })
+    await agentScope.run({ sessionId: session.id }, async () => {
+      await kernel.ctx.tools.execute(call('Echo'))
+    })
+    // A transport has to show the window it is asking inside, so the
+    // deadline comes from the policy's own timer, not a second estimate.
+    expect(deadline).toBeGreaterThanOrEqual(before + 60_000)
+    void kernel.stop()
+  })
+
   it('legacy lowercase permission keys normalize to canonical built-in tools', async () => {
     const { kernel, session } = boot({ glob: 'deny' })
     kernel.ctx.tools.register({

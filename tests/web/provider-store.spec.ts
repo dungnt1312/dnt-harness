@@ -6,6 +6,11 @@ import { loadProviderStore, loadProviders, maskKey, parseProviderStore, parsePro
 
 let dir = ''
 
+/** Wrap entries in the only accepted on-disk shape. */
+function envelope(providers: readonly unknown[]): string {
+  return JSON.stringify({ version: 2, defaults: { provider: null, model: null, thinkingLevel: null }, providers })
+}
+
 beforeAll(async () => {
   dir = await mkdtemp(path.join(tmpdir(), 'mini-dsh-providers-'))
 })
@@ -25,7 +30,7 @@ describe('provider store', () => {
   it('round-trips through save + load', async () => {
     const file = path.join(dir, 'providers.json')
     await saveProviders(file, [
-      { id: 'deepseek', name: 'DeepSeek', baseUrl: 'https://api.deepseek.com', apiKey: 'sk-1', models: ['deepseek-chat'], defaultModel: 'deepseek-chat', enabled: true },
+      { id: 'deepseek', name: 'DeepSeek', baseUrl: 'https://api.deepseek.com', apiKey: 'sk-1', models: ['deepseek-chat'], enabled: true },
       { id: 'proxy', name: 'cliproxy1', baseUrl: 'http://10.0.0.1:8000/v1', apiKey: '', models: [], enabled: false },
     ])
     const loaded = loadProviders(file)
@@ -37,15 +42,20 @@ describe('provider store', () => {
   })
 
 
-  it('migrates a legacy array with defaultModel precedence and preserves provider fields', () => {
-    const store = parseProviderStore(JSON.stringify([{
+  it('drops a legacy bare array rather than migrating it', () => {
+    expect(parseProviderStore(JSON.stringify([{
       id: 'alpha', name: 'Alpha', baseUrl: 'http://x/v1', apiKey: 'secret',
-      models: ['first', 'preferred'], defaultModel: 'preferred', enabled: true,
-      modelSettings: { preferred: { contextTokens: 99_999 } },
-    }]))
-    expect(store).toMatchObject({ version: 2, defaults: { provider: 'alpha', model: 'preferred', thinkingLevel: null } })
-    expect(store.providers[0]?.apiKey).toBe('secret')
-    expect(store.providers[0]?.modelSettings).toEqual({ preferred: { contextTokens: 99_999 } })
+      models: ['first', 'preferred'], enabled: true,
+    }]))).toEqual({ version: 2, defaults: { provider: null, model: null, thinkingLevel: null }, providers: [] })
+  })
+
+  it('ignores a stored defaultModel field: model choice is never per provider', () => {
+    const store = parseProviderStore(JSON.stringify({
+      version: 2,
+      defaults: { provider: null, model: null, thinkingLevel: null },
+      providers: [{ id: 'a', name: 'A', baseUrl: 'http://x/v1', apiKey: '', models: ['first', 'second'], defaultModel: 'second', enabled: true }],
+    }))
+    expect(store.providers[0]).toEqual({ id: 'a', name: 'A', baseUrl: 'http://x/v1', apiKey: '', models: ['first', 'second'], enabled: true })
   })
 
   it('round-trips a versioned envelope including explicit global defaults', async () => {
@@ -53,15 +63,16 @@ describe('provider store', () => {
     await saveProviderStore(file, {
       version: 2,
       defaults: { provider: 'beta', model: 'b2', thinkingLevel: 'high' },
-      providers: [{ id: 'beta', name: 'Beta', baseUrl: 'http://x/v1', apiKey: '', models: ['b1', 'b2'], defaultModel: 'b2', enabled: true }],
+      providers: [{ id: 'beta', name: 'Beta', baseUrl: 'http://x/v1', apiKey: '', models: ['b1', 'b2'], enabled: true }],
     })
     expect(loadProviderStore(file)).toMatchObject({ defaults: { provider: 'beta', model: 'b2', thinkingLevel: 'high' } })
     expect((await readFile(file, 'utf8')).trimStart()).toMatch(/^\{/)
   })
 
   it('uses null defaults when no enabled provider has a model', () => {
-    expect(parseProviderStore(JSON.stringify([])).defaults).toEqual({ provider: null, model: null, thinkingLevel: null })
-    expect(parseProviderStore(JSON.stringify([{ id: 'a', name: 'A', baseUrl: 'http://x', apiKey: '', models: [], enabled: true }])).defaults)
+    expect(parseProviderStore(JSON.stringify({ version: 2, defaults: { provider: null, model: null, thinkingLevel: null }, providers: [] })).defaults)
+      .toEqual({ provider: null, model: null, thinkingLevel: null })
+    expect(parseProviderStore(envelope([{ id: 'a', name: 'A', baseUrl: 'http://x', apiKey: '', models: [], enabled: true }])).defaults)
       .toEqual({ provider: null, model: null, thinkingLevel: null })
   })
 
@@ -77,22 +88,20 @@ describe('provider store', () => {
     expect(maskKey('')).toBe('')
   })
 
-  it('seed helper inside plan: DEEPSEEK config matches expected shape', () => {
-    // shape contract used by server seeding in T3
-    const seeded = parseProviders(JSON.stringify([{
+  it('seeds the first advertised model as the fallback pair', () => {
+    const seeded = parseProviders(envelope([{
       id: 'deepseek',
       name: 'deepseek',
       baseUrl: process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com',
       apiKey: 'env-key',
       models: ['deepseek-chat', 'deepseek-reasoner'],
-      defaultModel: 'deepseek-chat',
       enabled: true,
     }]))
-    expect(seeded[0]?.defaultModel).toBe('deepseek-chat')
+    expect(seeded[0]?.models[0]).toBe('deepseek-chat')
   })
 
   it('parses per-model settings and drops junk fields', () => {
-    const loaded = parseProviders(JSON.stringify([{
+    const loaded = parseProviders(envelope([{
       id: 'p', name: 'P', baseUrl: 'http://x/v1', apiKey: '',
       models: ['a'],
       modelSettings: {
@@ -104,7 +113,7 @@ describe('provider store', () => {
   })
 
   it('legacy contextLimits migrate into modelSettings.contextTokens', () => {
-    const loaded = parseProviders(JSON.stringify([{
+    const loaded = parseProviders(envelope([{
       id: 'p', name: 'P', baseUrl: 'http://x/v1', apiKey: '',
       models: ['a', 'b'],
       contextLimits: { a: 128_000, b: 0 },

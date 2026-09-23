@@ -87,9 +87,8 @@ export interface OpenAiCompletionsOptions {
   readonly apiKey: string
   /** Base URL without `/chat/completions`; e.g. `https://api.deepseek.com`. */
   readonly baseUrl: string
-  /** Model names offered to selectors; first is the default. */
+  /** Model names offered to selectors; the first is the fallback model. */
   readonly models?: readonly string[]
-  readonly defaultModel?: string
 }
 
 /**
@@ -104,19 +103,20 @@ export interface OpenAiCompletionsOptions {
 export class OpenAiCompletionsProvider implements LlmProvider {
   readonly name: string
   readonly models: readonly string[]
-  private readonly defaultModel: string
+  /** Used only when a request names no model; never an operator preference. */
+  private readonly fallbackModel: string
 
   constructor(private readonly options: OpenAiCompletionsOptions) {
     this.name = options.name
     this.models = options.models ?? []
-    this.defaultModel = options.defaultModel ?? options.models?.[0] ?? 'default'
+    this.fallbackModel = options.models?.[0] ?? 'default'
   }
 
   async *stream(request: ModelRequest, options?: StreamOptions): AsyncIterable<StreamEvent> {
     // The body is assembled as an object first so the documented per-model
     // thinking override can patch it; unsupported (model, level) pairs
     // leave it untouched rather than risking an undocumented field.
-    const model = request.model ?? this.defaultModel
+    const model = request.model ?? this.fallbackModel
     const body: Record<string, unknown> = {
       model,
       messages: toWireMessages(request.messages),

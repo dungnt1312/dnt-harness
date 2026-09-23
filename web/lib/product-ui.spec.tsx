@@ -6,15 +6,16 @@ import CopyButton from '../components/common/CopyButton.tsx'
 import { ApprovalBar } from '../components/chat/ApprovalBar.tsx'
 import { Composer } from '../components/composer/Composer.tsx'
 import { ScopeControl } from '../components/layout/ScopeControl.tsx'
-import { PolicyPopover } from '../components/composer/PolicyPopover.tsx'
+import { ModeMenu } from '../components/composer/ComposerControls.tsx'
 import { ToastHost, useToast } from '../components/common/Toast.tsx'
-import { ToolCard, AssistantMessage, DelegationCard, AuditLine, UserBubble } from '../components/chat/MessageParts.tsx'
+import { ToolCard, ActivityBlock, AssistantMessage, DelegationCard, AuditLine, StatusLine, UserBubble, summarizeActivity } from '../components/chat/MessageParts.tsx'
 import { groupBlocks, turnFooters } from '../components/chat/Transcript.tsx'
+import { minimapEntries, minimapPreview } from '../components/chat/ConversationMinimap.tsx'
 import { modeLabel, errorSummary } from './copy.ts'
 import { emptyDraft, textDraft } from './composer-draft.ts'
 import { budgetTone, formatTime } from './format.ts'
 import { projectItems } from './project.ts'
-import { setPolicy, compactSession, fetchHooks, saveHooks, renameWorkspace, listProjectFiles, readProjectFile } from './api.ts'
+import { compactSession, fetchHooks, saveHooks, renameWorkspace, listProjectFiles, readProjectFile } from './api.ts'
 import { ContextPanel } from '../components/layout/ContextPanel.tsx'
 import { Workbench, type WorkbenchView } from '../components/workbench/Workbench.tsx'
 import { closeFileTab, useWorkbenchFiles } from '../hooks/useWorkbenchFiles.ts'
@@ -27,9 +28,9 @@ import { WorkspacePopover } from '../components/layout/WorkspacePopover.tsx'
 import { ErrorBoundary } from '../components/common/ErrorBoundary.tsx'
 import { useApprovalNotify } from '../hooks/useApprovalNotify.ts'
 import type { SseEvent } from './types.ts'
+import type { ViewItem } from './project.ts'
 
 vi.mock('./api.ts', () => ({
-  setPolicy: vi.fn(async () => ({ policy: {} })),
   renameWorkspace: vi.fn(async () => ({ id: 'w1', name: 'Renamed', archived: false, createdAt: 0 })),
   setWorkspaceArchived: vi.fn(async () => ({ id: 'w1', name: 'W', archived: true, createdAt: 0 })),
   deleteWorkspace: vi.fn(async () => ({ deleted: true })),
@@ -161,6 +162,29 @@ describe('mounted production controls', () => {
   })
 })
 
+describe('conversation minimap', () => {
+  it('maps only user messages, not assistant activity or system lines', () => {
+    const entries = minimapEntries([
+      { kind: 'user', content: 'Chốt gửi theo đề xuất, sau đó test với environment staging.' },
+      { kind: 'assistant', content: 'Đã chốt và triển khai luồng IEM theo mô hình hybrid.', live: false, thinking: [], thinkingLive: false },
+      { kind: 'tool', call: { id: 'a', name: 'Read', args: {} } },
+      { kind: 'user', content: 'Tiếp tục theo dõi log trên staging.' },
+      { kind: 'status', reason: 'failed' },
+      { kind: 'audit', icon: 'allow', text: 'Allowed · Bash' },
+    ])
+    expect(entries.map((entry) => entry.index)).toEqual([0, 3])
+    expect(entries[0]?.title).toContain('Chốt gửi theo đề xuất')
+    expect(entries.every((entry) => entry.width >= 8 && entry.width <= 20)).toBe(true)
+  })
+
+  it('removes markdown noise and separates a compact tooltip title and detail', () => {
+    const preview = minimapPreview('## Phần đã triển khai\n\nĐã thêm **Redis checkpoint** và scheduler để chạy an toàn trên staging trước khi cutover chính thức.')
+    expect(preview.title).not.toMatch(/[#*]/)
+    expect(preview.title).toContain('Phần đã triển khai')
+    expect(preview.detail).toContain('staging')
+  })
+})
+
 describe('transcript grouping', () => {
   it('packs consecutive activity rows into one block and drops empty markers', () => {
     const blocks = groupBlocks([
@@ -175,6 +199,20 @@ describe('transcript grouping', () => {
       { kind: 'status', reason: 'limit' },
     ])
     expect(blocks.map((block) => block.kind === 'activity' ? `activity:${block.rows.length}` : block.row.item.kind)).toEqual(['user', 'activity:3', 'assistant', 'status', 'status'])
+  })
+  it('keeps edits, delegations and reasoning out of a run: only lookups group', () => {
+    const blocks = groupBlocks([
+      { kind: 'user', content: 'go' },
+      { kind: 'tool', call: { id: 'a', name: 'Grep', args: {} } },
+      { kind: 'tool', call: { id: 'b', name: 'Read', args: {} } },
+      { kind: 'tool', call: { id: 'c', name: 'Edit', args: {} } },
+      { kind: 'tool', call: { id: 'd', name: 'Read', args: {} } },
+      { kind: 'assistant', content: '', live: false, thinking: ['weighing options'], thinkingLive: false },
+      { kind: 'tool', call: { id: 'e', name: 'Read', args: {} } },
+      { kind: 'delegation', childSessionId: 'child', definition: 'explorer', objective: 'look', status: 'completed' },
+    ])
+    expect(blocks.map((block) => block.kind === 'activity' ? `activity:${block.rows.length}` : block.row.item.kind))
+      .toEqual(['user', 'activity:2', 'tool', 'activity:1', 'assistant', 'activity:1', 'delegation'])
   })
   it('merges tool rows across invisible tool-only assistant steps into one tight block', () => {
     const emptyStep = { kind: 'assistant' as const, content: '', live: false, thinking: [] as string[], thinkingLive: false }
@@ -193,6 +231,132 @@ describe('transcript grouping', () => {
   })
 })
 
+describe('activity block summary', () => {
+  const toolRow = (id: string, name: string, ok = true): Extract<ViewItem, { kind: 'tool' }> => ({
+    kind: 'tool', call: { id, name, args: { path: `app/Services/Deep/Nested/${id}.php` } }, result: { ok, output: 'x' }, ts: 0, doneAt: 5,
+  })
+  it('collapses a settled run into one summary line and expands on demand', async () => {
+    const rows = ['a', 'b', 'c', 'd'].map((id) => toolRow(id, id === 'd' ? 'Grep' : 'Read'))
+    await mount(<ActivityBlock items={rows}>{rows.map((row) => <ToolCard key={row.call.id} item={row} />)}</ActivityBlock>)
+    const header = host.querySelector('button')!
+    expect(header.textContent).toContain('4 steps')
+    expect(header.textContent).toContain('Read (3)')
+    expect(header.textContent).toContain('Grep')
+    expect(header.getAttribute('aria-expanded')).toBe('false')
+    // Collapsed means collapsed: the rows themselves are not in the document.
+    expect(host.querySelectorAll('button').length).toBe(1)
+    await act(async () => header.click())
+    expect(host.querySelector('button')?.getAttribute('aria-expanded')).toBe('true')
+    expect(host.querySelectorAll('button').length).toBe(5)
+  })
+  it('keeps a run open, and says how many rows need attention, when one failed', async () => {
+    const rows = [toolRow('a', 'Read'), toolRow('b', 'Read'), toolRow('c', 'Bash', false), toolRow('d', 'Read')]
+    await mount(<ActivityBlock items={rows}>{rows.map((row) => <ToolCard key={row.call.id} item={row} />)}</ActivityBlock>)
+    const header = host.querySelector('button')!
+    expect(header.getAttribute('aria-expanded')).toBe('true')
+    expect(header.textContent).toContain('1 to inspect')
+  })
+  it('leaves a short run alone — no summary to hide three rows behind', async () => {
+    const rows = [toolRow('a', 'Read'), toolRow('b', 'Read'), toolRow('c', 'Read')]
+    await mount(<ActivityBlock items={rows}>{rows.map((row) => <ToolCard key={row.call.id} item={row} />)}</ActivityBlock>)
+    expect(host.textContent).not.toContain('3 steps')
+    expect(host.querySelectorAll('button').length).toBe(3)
+  })
+  it('counts calls as steps, ignores reasoning rows, and nests the open run behind a guide', async () => {
+    const rows = [toolRow('a', 'Read'), toolRow('b', 'Read'), toolRow('c', 'Grep'), toolRow('d', 'Grep')]
+    const items = [...rows, { kind: 'assistant' as const, content: '', live: false, thinking: ['why'], thinkingLive: false }]
+    await mount(<ActivityBlock items={items}>{rows.map((row) => <ToolCard key={row.call.id} item={row} />)}</ActivityBlock>)
+    const header = host.querySelector('button')!
+    expect(header.textContent).toContain('4 steps')
+    await act(async () => header.click())
+    const body = document.getElementById(header.getAttribute('aria-controls')!)!
+    expect(body.className).toContain('border-l')
+    expect(body.className).toContain('pl-3')
+  })
+  it('summarizes a running run as running, whatever settled before it', () => {
+    const summary = summarizeActivity([
+      toolRow('a', 'Read', false),
+      { kind: 'tool', call: { id: 'b', name: 'Bash', args: {} } },
+    ])
+    expect(summary.state).toBe('running')
+    expect(summary.live).toBe(true)
+    expect(summary.problems).toBe(1)
+  })
+  it('shortens a deep path to its tail and keeps the exact target on hover', async () => {
+    await mount(<ToolCard item={toolRow('a', 'Read')} />)
+    const detail = host.querySelector('span[title]')!
+    expect(detail.textContent).toBe('…/Nested/a.php')
+    expect(detail.getAttribute('title')).toBe('app/Services/Deep/Nested/a.php')
+  })
+})
+
+describe('tool row facts', () => {
+  const row = (name: string, args: Record<string, unknown>, result?: { ok: boolean; output: string }): Extract<ViewItem, { kind: 'tool' }> => ({
+    kind: 'tool', call: { id: 'c1', name, args }, ts: 0, doneAt: 12, ...(result !== undefined ? { result } : {}),
+  })
+  it('says which lines were read and how many came back, with the row still closed', async () => {
+    await mount(<ToolCard item={row('Read', { path: 'src/harness/tools/service.ts', offset: 100, limit: 61 }, { ok: true, output: 'a\nb\nc' })} />)
+    const head = host.querySelector('button')!
+    expect(head.getAttribute('aria-expanded')).toBe('false')
+    expect(head.textContent).toContain('…/tools/service.ts:100-160')
+    expect(head.textContent).toContain('3 lines')
+  })
+  it('puts a failure on the row instead of behind a click', async () => {
+    await mount(<ToolCard item={row('Read', { path: 'docs/missing.md' }, { ok: false, output: 'no such file: docs/missing.md\ncheck the path' })} />)
+    const digest = [...host.querySelectorAll('span')].find((span) => span.textContent === 'no such file: docs/missing.md')!
+    expect(digest).not.toBeUndefined()
+    expect(digest.className).toContain('text-bad')
+  })
+  it('reports a non-zero exit as bad while the recorded outcome stays what the log says', async () => {
+    await mount(<ToolCard item={row('Bash', { command: 'npm test -- tools' }, { ok: true, output: '1 failing\n[exit code: 1]' })} />)
+    const head = host.querySelector('button')!
+    expect(head.textContent).toContain('npm test -- tools')
+    expect(head.textContent).toContain('Succeeded')
+    expect([...host.querySelectorAll('span')].find((span) => span.textContent === 'exit 1')?.className).toContain('text-bad')
+  })
+  it('opens an edit as replaced/replacement text while copy keeps the exact payload', async () => {
+    await mount(<ToolCard item={row('Edit', { path: 'web/lib/format.ts', old: 'const a = 1', new: 'const a = 2' }, { ok: true, output: 'edited web/lib/format.ts' })} />)
+    expect(host.querySelector('button')!.textContent).toContain('-1 +1 lines')
+    await act(async () => host.querySelector('button')!.click())
+    const blocks = [...host.querySelectorAll('pre')].map((pre) => pre.textContent)
+    expect(blocks).toContain('const a = 1')
+    expect(blocks).toContain('const a = 2')
+    // The JSON block holds the short arguments; its copy holds all of them.
+    expect(blocks[0]).toContain('"path": "web/lib/format.ts"')
+    expect(blocks[0]).not.toContain('const a = 1')
+    expect(host.querySelector('button[aria-label="Copy Arguments · c1"]')).not.toBeNull()
+    expect(host.textContent).toContain('Output · 1 line')
+  })
+  it('hands the workbench the window the call read, not just the file', async () => {
+    const openPath = vi.fn(() => () => {})
+    await mount(<ToolCard item={row('Read', { path: 'src/index.ts', offset: 20, limit: 5 }, { ok: true, output: 'x' })} openPath={openPath} />)
+    expect(openPath).toHaveBeenCalledWith('src/index.ts', { line: 20, lines: 5 })
+  })
+  it('names an MCP tool without the prefix its server chip already carries', async () => {
+    await mount(<ToolCard item={{ ...row('mcp__linear__create_issue', { title: 'Fix the row' }, { ok: true, output: 'created ENG-42' }), server: 'linear' }} />)
+    const head = host.querySelector('button')!
+    expect(head.textContent).toContain('create_issue')
+    expect(head.textContent).not.toContain('mcp__')
+    expect(head.textContent).toContain('created ENG-42')
+  })
+})
+
+describe('failed request card', () => {
+  it('states the failure once, humanizes it, and keeps the raw response one click away', async () => {
+    const retry = vi.fn()
+    await mount(<StatusLine reason="provider: Failed to fetch" onRetry={retry} />)
+    const card = host.querySelector('[role="alert"]')!
+    expect(card.textContent).toContain('Request failed.')
+    expect(card.textContent).toContain(errorSummary('provider: Failed to fetch'))
+    expect(card.textContent).toContain('Nothing was executed, so retrying is safe.')
+    // The raw reason stays available, but not spread across the transcript.
+    expect(card.querySelector('details')?.hasAttribute('open')).toBe(false)
+    expect(card.querySelector('pre')?.textContent).toBe('provider: Failed to fetch')
+    await act(async () => button('Retry').click())
+    expect(retry).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe('presentation ownership', () => {
   it('maps only bundled mode labels and preserves custom names even for a familiar ID', () => {
     expect(modeLabel({ id: 'plan', name: 'Kế hoạch', source: 'bundled' })).toBe('Plan')
@@ -208,81 +372,45 @@ describe('presentation ownership', () => {
   })
 })
 
-describe('permission policy popover', () => {
-  const trigger = () => host.querySelector<HTMLButtonElement>('button[aria-haspopup="dialog"]')!
-  const segment = (group: string, label: string) => [...document.body.querySelectorAll<HTMLButtonElement>(`[role="group"][aria-label="${group}"] button`)].find(b => b.textContent === label)!
-  it('stages changes, marks the trigger dirty, and saves the whole workspace policy', async () => {
-    const saved = vi.fn()
-    await mount(<ToastHost><PolicyPopover policy={{ bash: 'ask' }} workspaceId="w1" onSaved={saved} /></ToastHost>)
-    expect(trigger().textContent).not.toContain('Unsaved changes')
+describe('mode menu', () => {
+  const trigger = () => host.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]')!
+  it('lists only the modes — a picker, nothing else', async () => {
+    const modes = [{ value: 'chat', label: 'Chat' }, { value: 'ask', label: 'Ask before changes' }]
+    await mount(<ModeMenu modes={modes} value="ask" onChange={() => {}} />)
     await act(async () => trigger().click())
-    await act(async () => segment('Default permission for every tool', 'Allow').click())
-    expect(trigger().textContent).toContain('Unsaved changes')
-    const save = bodyButton('Save')
-    expect(save.disabled).toBe(false)
-    await act(async () => save.click())
-    expect(setPolicy).toHaveBeenCalledWith('w1', { '*': 'allow', bash: 'ask' })
-    expect(saved).toHaveBeenCalledTimes(1)
-  })
-  it('keeps staged policy changes after closing and reopening the popover', async () => {
-    await mount(<ToastHost><PolicyPopover policy={{ bash: 'ask' }} workspaceId="w1" /></ToastHost>)
-    await act(async () => trigger().click())
-    await act(async () => segment('Default permission for every tool', 'Allow').click())
-    await act(async () => document.body.querySelector<HTMLElement>('[role="dialog"]')?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
-    await act(async () => trigger().click())
-    expect(segment('Default permission for every tool', 'Allow').getAttribute('aria-pressed')).toBe('true')
-    expect(trigger().textContent).toContain('Unsaved changes')
-  })
-  it('keeps the dialog-bound editor honest: Reset restores the saved policy', async () => {
-    await mount(<ToastHost><PolicyPopover policy={{ bash: 'ask' }} workspaceId="w1" /></ToastHost>)
-    await act(async () => trigger().click())
-    await act(async () => segment('Permission for bash', 'Deny').click())
-    await act(async () => bodyButton('Reset').click())
-    expect(trigger().textContent).not.toContain('Unsaved changes')
-    expect(setPolicy).not.toHaveBeenCalled()
+    const panel = document.body.querySelector<HTMLElement>('[role="menu"]')!
+    expect(panel.textContent).toContain('Chat')
+    expect(panel.textContent).toContain('Ask before changes')
+    const items = [...panel.querySelectorAll('[role="menuitemradio"]')]
+    expect(items).toHaveLength(2)
+    await act(async () => (items[0] as HTMLButtonElement).click())
   })
 })
 
-describe('always-allow approval flow', () => {
-  it('persists the policy change and answers the approval on confirm', async () => {
-    const always = vi.fn(async () => undefined)
-    const answer = vi.fn(async () => undefined)
-    await mount(<ApprovalBar approvals={[{ approvalId: 'a', call: { id: 'c', name: 'bash', args: { command: 'ls' } } }]} onAnswer={answer} workspaceName="Acme" onAlwaysAllow={always} />)
-    await act(async () => button('Always allow bash…').click())
-    expect(document.body.textContent).toContain('Always allow "bash" in Acme?')
-    await act(async () => bodyButton('Allow always').click())
-    expect(always).toHaveBeenCalledWith('bash')
-    expect(answer).toHaveBeenCalledWith('a', true)
-    expect(document.body.textContent).not.toContain('Always allow "bash" in Acme?')
-  })
-  it('locks persistent allow confirmation synchronously against double submission', async () => {
-    let resolve!: () => void
-    const always = vi.fn(() => new Promise<void>((done) => { resolve = done }))
-    const answer = vi.fn(async () => undefined)
-    await mount(<ApprovalBar approvals={[{ approvalId: 'a', call: { id: 'c', name: 'bash', args: {} } }]} onAnswer={answer} onAlwaysAllow={always} />)
-    await act(async () => button('Always allow bash…').click())
-    const confirm = bodyButton('Allow always')
-    await act(async () => { confirm.click(); confirm.click() })
-    expect(always).toHaveBeenCalledTimes(1)
-    expect(answer).not.toHaveBeenCalled()
-    await act(async () => resolve())
-    expect(answer).toHaveBeenCalledTimes(1)
-    expect(answer).toHaveBeenCalledWith('a', true)
-  })
-  it('keeps the confirm open with the error when the policy write fails', async () => {
-    const always = vi.fn(async () => { throw new Error('policy 409 refused') })
-    const answer = vi.fn(async () => undefined)
-    await mount(<ApprovalBar approvals={[{ approvalId: 'a', call: { id: 'c', name: 'bash', args: {} } }]} onAnswer={answer} onAlwaysAllow={always} />)
-    await act(async () => button('Always allow bash…').click())
-    await act(async () => bodyButton('Allow always').click())
-    expect(document.body.querySelector('.error-notice')?.textContent).toContain('policy 409 refused')
-    expect(document.body.textContent).toContain('Always allow "bash"')
-    expect(answer).not.toHaveBeenCalled()
-  })
-  it('hides Always allow without a workspace context (existing two-action contract)', async () => {
+describe('approval card actions', () => {
+  it('offers exactly Allow once and Deny; standing permission lives in Settings → Modes', async () => {
     await mount(<ApprovalBar approvals={[{ approvalId: 'a', call: { id: 'c', name: 'bash', args: {} } }]} onAnswer={vi.fn()} />)
     expect(button('Allow once')).not.toBeNull()
+    expect(button('Deny')).not.toBeNull()
     expect(host.textContent).not.toContain('Always allow')
+    expect(host.textContent).toContain('Settings → Modes')
+  })
+  it('keeps the every-time note for interactive tools', async () => {
+    await mount(<ApprovalBar approvals={[{ approvalId: 'a', call: { id: 'c', name: 'mcp__s__prompt', args: {} }, interactive: true }]} onAnswer={vi.fn()} />)
+    expect(button('Allow once')).not.toBeNull()
+    expect(host.textContent).not.toContain('Always allow')
+    expect(host.textContent).toContain('requires a decision every time')
+  })
+  it('shows the decision window and names the child agent that asked', async () => {
+    const expiresAt = Date.now() + 90_000
+    await mount(<ApprovalBar approvals={[{ approvalId: 'a', call: { id: 'c', name: 'Bash', args: {} }, expiresAt, childSessionId: 'session-abcdefgh1234', definitionName: 'explorer' }]} onAnswer={vi.fn()} />)
+    expect(host.textContent).toMatch(/Cancels itself in 1:3\d/)
+    expect(host.textContent).toContain('Asked by child agent')
+    expect(host.textContent).toContain('explorer')
+  })
+  it('says a passed deadline cancelled the request instead of letting the card go quiet', async () => {
+    await mount(<ApprovalBar approvals={[{ approvalId: 'a', call: { id: 'c', name: 'Bash', args: {} }, expiresAt: Date.now() - 1_000 }]} onAnswer={vi.fn()} />)
+    expect(host.textContent).toContain('Expired')
   })
 })
 
@@ -681,6 +809,25 @@ describe('sidebar sections + live rows + workspace management', () => {
     await act(async () => button('Acme').click())
     expect(host.textContent).toContain('Auth refactor')
   })
+  it('searches folder names too, keeping that folder and its conversations', async () => {
+    const other = { id: 'p2', name: 'dntbrowser', workspaceId: 'w1', path: 'C:/dnt', createdAt: 2 }
+    const list = [...sessions, { id: 's4', title: 'Unrelated title', projectId: 'p2', status: 'idle' as const, pendingInputs: 0, ...base }]
+    await mount(<SessionList sessions={list} projects={[project, other]} current={null} filter="dnt" liveRunning={false} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} onNewInProject={() => {}} />)
+    expect(host.textContent).toContain('dntbrowser')
+    expect(host.textContent).toContain('Unrelated title')
+    expect(host.textContent).not.toContain('Auth refactor')
+  })
+  it('lifts pinned conversations above every folder and offers unpinning on the row', async () => {
+    const list = [...sessions, { id: 's9', title: 'Kept handy', projectId: 'p1', pinned: true, status: 'idle' as const, pendingInputs: 0, ...base }]
+    const togglePinned = vi.fn()
+    await mount(<SessionList sessions={list} projects={[project]} current={null} filter="" liveRunning={false} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} onTogglePinned={togglePinned} onNewInProject={() => {}} />)
+    const text = host.textContent ?? ''
+    expect(text.indexOf('Pinned')).toBeLessThan(text.indexOf('Acme'))
+    expect(text.indexOf('Kept handy')).toBeLessThan(text.indexOf('Acme'))
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Options for Kept handy"]')!.click())
+    await act(async () => bodyButton('Unpin').click())
+    expect(togglePinned).toHaveBeenCalledWith('s9', false)
+  })
   it('sorts conversations alphabetically from the sidebar sort menu', async () => {
     const base = { updatedAt: Date.now(), eventCount: 3, folder: null }
     const list = [
@@ -695,6 +842,19 @@ describe('sidebar sections + live rows + workspace management', () => {
     expect(text.indexOf('Alpha spec')).toBeGreaterThanOrEqual(0)
     expect(text.indexOf('Alpha spec')).toBeLessThan(text.indexOf('Beta build'))
     expect(text.indexOf('Beta build')).toBeLessThan(text.indexOf('Gamma notes'))
+  })
+  it('opens the search field on demand and closes it again, clearing the query', async () => {
+    const onFilter = vi.fn()
+    const props = sidebarProps([{ id: 'w1', name: 'Acme', archived: false, createdAt: 1 }], 'w1')
+    await mount(<ToastHost><Sidebar {...props} onFilter={onFilter} /></ToastHost>)
+    const search = () => host.querySelector<HTMLButtonElement>('button[aria-label="Search conversations and folders (Ctrl K)"]')!
+    expect(host.querySelector('input[aria-label="Search conversations and folders"]')).toBeNull()
+    await act(async () => search().click())
+    expect(host.querySelector('input[aria-label="Search conversations and folders"]')).not.toBeNull()
+    expect(search().getAttribute('aria-expanded')).toBe('true')
+    await act(async () => search().click())
+    expect(host.querySelector('input[aria-label="Search conversations and folders"]')).toBeNull()
+    expect(onFilter).toHaveBeenCalledWith('')
   })
   it('filters to running conversations and notes when none remain', async () => {
     const base = { updatedAt: Date.now(), eventCount: 3, folder: null }
@@ -925,11 +1085,13 @@ describe('mounted clipboard recovery', () => {
 describe('workbench files', () => {
   const project = { id: 'p1', name: 'Acme', path: 'C:/acme' }
   it('closing the front tab reveals its neighbour, then the fixed view', () => {
-    const state = { folder: '', openFiles: ['a.ts', 'b.ts', 'c.ts'], activeFile: 'b.ts' }
+    const state = { folder: '', openFiles: ['a.ts', 'b.ts', 'c.ts'], activeFile: 'b.ts', focus: null }
     expect(closeFileTab(state, 'b.ts')).toMatchObject({ openFiles: ['a.ts', 'c.ts'], activeFile: 'c.ts' })
     expect(closeFileTab({ ...state, activeFile: 'c.ts' }, 'c.ts')).toMatchObject({ activeFile: 'b.ts' })
     expect(closeFileTab({ ...state, activeFile: 'a.ts' }, 'c.ts')).toMatchObject({ activeFile: 'a.ts' })
-    expect(closeFileTab({ folder: '', openFiles: ['a.ts'], activeFile: 'a.ts' }, 'a.ts')).toMatchObject({ openFiles: [], activeFile: null })
+    expect(closeFileTab({ folder: '', openFiles: ['a.ts'], activeFile: 'a.ts', focus: null }, 'a.ts')).toMatchObject({ openFiles: [], activeFile: null })
+    // A closed tab takes its window with it; the revealed file lands at its top.
+    expect(closeFileTab({ ...state, focus: { line: 40, seq: 1 } }, 'b.ts')).toMatchObject({ focus: null })
   })
   it('browses folders, opens a file as a tab with escaped highlighted content, and closes it', async () => {
     await mount(<ToastHost><WorkbenchProbe view="files" events={[]} project={project} /></ToastHost>)

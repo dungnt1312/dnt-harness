@@ -180,6 +180,15 @@ export class Session {
     return undefined
   }
 
+  /** Whether the reader pinned this conversation; the last record wins. */
+  get pinned(): boolean {
+    for (let i = this.log.length - 1; i >= 0; i--) {
+      const event = this.log[i]
+      if (event?.type === 'session/pinned') return event.pinned
+    }
+    return false
+  }
+
   /** Project model history from this log; see {@link deriveMessages}. */
   deriveMessages(): ModelMessage[] {
     return deriveMessages(this.log)

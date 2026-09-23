@@ -3,6 +3,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { HttpError } from '../../lib/api.ts'
+import type { DangerousCommandsConfig } from '../../lib/api.ts'
 import { DangerousCommandsPanel } from './DangerousCommandsPanel.tsx'
 
 const DEFAULT_CFG = {
@@ -12,14 +13,14 @@ const DEFAULT_CFG = {
 }
 
 const mockGet = vi.fn(async () => ({ config: { ...DEFAULT_CFG, presets: { ...DEFAULT_CFG.presets }, customRules: [] }, hash: 'hash-1' }))
-const mockPut = vi.fn(async () => ({ config: { ...DEFAULT_CFG, presets: { ...DEFAULT_CFG.presets }, customRules: [] }, hash: 'hash-2' }))
+const mockPut = vi.fn(async (_workspaceId: string, _config: DangerousCommandsConfig, _expectedHash?: string) => ({ config: { ...DEFAULT_CFG, presets: { ...DEFAULT_CFG.presets }, customRules: [] }, hash: 'hash-2' }))
 
 vi.mock('../../lib/api.ts', async () => {
   const actual = await vi.importActual<typeof import('../../lib/api.ts')>('../../lib/api.ts')
   return {
     ...actual,
-    getGuardConfig: (...args: unknown[]) => mockGet(...args),
-    putGuardConfig: (...args: unknown[]) => mockPut(...args),
+    getGuardConfig: async (..._args: []) => mockGet(),
+    putGuardConfig: async (workspaceId: string, config: DangerousCommandsConfig, expectedHash?: string) => mockPut(workspaceId, config, expectedHash),
     getGlobalGuardConfig: vi.fn(async () => ({ config: DEFAULT_CFG, hash: 'h' })),
     putGlobalGuardConfig: vi.fn(async () => ({ config: DEFAULT_CFG, hash: 'h2' })),
   }

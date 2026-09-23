@@ -39,6 +39,8 @@ export interface SessionSummary {
   readonly derivedTitle?: string | null
   /** The last recorded project binding; null is an explicit unbind. Absent v1 summaries rebuild. */
   readonly projectId?: string | null
+  /** The last recorded pin state. Absent in summaries written before pinning; those rebuild. */
+  readonly pinned?: boolean
 }
 
 /** Storage seam behind `SessionsService`; file-backed in production. */

@@ -38,22 +38,23 @@ const linesToArray = (raw: string): string[] => raw.split('\n').map((line) => li
  * Settings — where no conversation is selected and every control is disabled.
  * Roles themselves are still defined in Settings → Agents.
  */
-export function AgentRunsPanel(props: {
+export interface AgentRunsPanelProps {
   readonly workspaceId: string | null
   readonly rootSessionId: string | null
+  /** `provider:model` rows, the same list the composer offers. */
+  readonly modelOptions?: readonly { readonly value: string; readonly label: string }[]
+  /** Bumped when the conversation itself delegates, so its children appear at once. */
+  readonly refreshSignal?: number
   readonly onOpenChild?: (childSessionId: string) => void
   readonly onOpenSettings?: () => void
-}) {
+}
+
+export function AgentRunsPanel(props: AgentRunsPanelProps) {
   // Scope changes remount before paint: no conversation A draft can reach B.
   return <AgentRunsPanelContent key={JSON.stringify([props.workspaceId, props.rootSessionId])} {...props} />
 }
 
-function AgentRunsPanelContent({ workspaceId, rootSessionId, onOpenChild, onOpenSettings }: {
-  readonly workspaceId: string | null
-  readonly rootSessionId: string | null
-  readonly onOpenChild?: (childSessionId: string) => void
-  readonly onOpenSettings?: () => void
-}) {
+function AgentRunsPanelContent({ workspaceId, rootSessionId, modelOptions, refreshSignal, onOpenChild, onOpenSettings }: AgentRunsPanelProps) {
   const [definitions, setDefinitions] = useScopedState<readonly AgentDefinitionRow[]>([])
   const [children, setChildren] = useScopedState<readonly ChildRow[]>([])
   const [selected, setSelected] = useScopedState('')
@@ -62,6 +63,7 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, onOpenChild, onOpen
   const [references, setReferences] = useScopedState('')
   const [requiredResult, setRequiredResult] = useScopedState(DEFAULT_RESULT)
   const [grants, setGrants] = useScopedState('')
+  const [model, setModel] = useScopedState('')
   const [notice, setNotice] = useScopedState<NoticeState>(null)
   const { busy, run } = useActionRunner((text) => setNotice({ kind: 'bad', text }))
 
@@ -83,7 +85,10 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, onOpenChild, onOpen
   }, [workspaceId])
 
   useEffect(() => { void refreshDefinitions() }, [refreshDefinitions])
-  useEffect(() => { void refreshChildren() }, [refreshChildren])
+  // The signal is part of the dependency list on purpose: a child the model
+  // spawned itself must show up without waiting for the polling effect,
+  // which only starts once a running child is already in view.
+  useEffect(() => { void refreshChildren() }, [refreshChildren, refreshSignal])
 
   // Poll only while a child runs; polling stops by itself when none do.
   useEffect(() => {
@@ -121,6 +126,7 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, onOpenChild, onOpen
         requiredResult: requiredResult.trim() === '' ? 'bounded summary' : requiredResult.trim(),
       },
       linesToArray(grants),
+      model,
     )
     setNotice({ kind: 'ok', text: `Spawned ${handle.definitionName} (${handle.childSessionId.slice(0, 12)}…)` })
     setObjective('')
@@ -163,6 +169,24 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, onOpenChild, onOpen
                 </Field>
 
                 <Disclosure summary="Task packet details">
+                  <Field
+                    label="Model"
+                    hint={
+                      current?.definition.model !== undefined
+                        ? `This role asks for ${current.definition.model}; a choice here overrides it.`
+                        : 'The child inherits this conversation’s model unless you pick another.'
+                    }
+                  >
+                    <Select
+                      label="Child model"
+                      value={model}
+                      options={[
+                        { value: '', label: current?.definition.model ?? 'Inherit from this conversation' },
+                        ...(modelOptions ?? []).map((option) => ({ value: option.value, label: option.label })),
+                      ]}
+                      onChange={setModel}
+                    />
+                  </Field>
                   <Field label="Constraints" hint="One constraint per line.">
                     <CodeArea rows={2} value={constraints} onChange={(e) => setConstraints(e.target.value)} />
                   </Field>
@@ -197,8 +221,19 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, onOpenChild, onOpen
                 {children.map((child) => (
                   <ItemRow
                     key={child.childSessionId}
-                    title={<><span>{child.definitionName}</span><Badge tone={CHILD_TONE[child.status]}>{child.status}</Badge></>}
-                    meta={<code className="font-mono">{child.childSessionId.slice(0, 14)}…</code>}
+                    title={
+                      <>
+                        <span>{child.definitionName}</span>
+                        <Badge tone={CHILD_TONE[child.status]}>{child.status}</Badge>
+                        {child.awaitingApproval === true ? <Badge tone="amber">awaiting approval</Badge> : null}
+                      </>
+                    }
+                    meta={
+                      <>
+                        <code className="font-mono">{child.childSessionId.slice(0, 14)}…</code>
+                        {child.model !== undefined ? <span className="text-fg-faint"> · {child.model}</span> : null}
+                      </>
+                    }
                     actions={
                       <>
                         {onOpenChild !== undefined ? <Button variant="ghost" size="sm" onClick={() => onOpenChild(child.childSessionId)}>Open<Icon name="chevronRight" size={13} /></Button> : null}

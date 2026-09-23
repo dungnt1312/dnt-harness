@@ -217,7 +217,9 @@ describe('workspace session model controls', () => {
     const restarted = await createWebServer({ home, providers: [provider('alpha', ['a1', 'a2'], seen)], configFile: path.join(home, 'providers.json') })
     servers.push(restarted)
     expect(await (await fetch(`${restarted.url}/api/workspaces/${workspaceId}/sessions/${id}/model`)).json()).toEqual({ provider: 'alpha', model: 'a2', thinkingLevel: null, source: 'session' })
-    expect(await (await fetch(`${restarted.url}/api/workspaces/${workspaceId}/sessions/${legacy.id}/model`)).json()).toEqual({ provider: 'alpha', model: 'a1', thinkingLevel: null, source: 'global' })
+    // A legacy log holds no preference, so it reads the global default — which
+    // now follows the model last chosen, i.e. the a2 this conversation adopted.
+    expect(await (await fetch(`${restarted.url}/api/workspaces/${workspaceId}/sessions/${legacy.id}/model`)).json()).toEqual({ provider: 'alpha', model: 'a2', thinkingLevel: null, source: 'global' })
   })
 })
 
@@ -242,12 +244,37 @@ describe('global durable model defaults', () => {
     expect(await (await fetch(`${restarted.url}/api/model-defaults`)).json()).toEqual({ provider: 'beta', model: 'b1', thinkingLevel: 'high' })
   })
 
+  it('opens the next conversation on the model last chosen in any conversation', async () => {
+    const seen: { model?: string; provider?: string; thinkingLevel?: string }[] = []
+    const { base } = await start([provider('alpha', ['a1', 'a2'], seen)])
+    const workspaceId = await firstWorkspace(base)
+    await put(base, `/api/workspaces/${workspaceId}/model`, { provider: 'alpha', model: 'a1' })
+
+    const first = (await (await post(base, `/api/workspaces/${workspaceId}/sessions`)).json()) as { id: string }
+    expect(await (await fetch(`${base}/api/workspaces/${workspaceId}/sessions/${first.id}/model`)).json())
+      .toMatchObject({ provider: 'alpha', model: 'a1' })
+
+    // Adopting a model inside a conversation repoints the global pointer, so
+    // the operator never re-picks for the next one.
+    await put(base, `/api/workspaces/${workspaceId}/sessions/${first.id}/model`, { model: 'a2' })
+    expect(await (await fetch(`${base}/api/model-defaults`)).json()).toMatchObject({ provider: 'alpha', model: 'a2' })
+    const second = (await (await post(base, `/api/workspaces/${workspaceId}/sessions`)).json()) as { id: string }
+    expect(await (await fetch(`${base}/api/workspaces/${workspaceId}/sessions/${second.id}/model`)).json())
+      .toMatchObject({ provider: 'alpha', model: 'a2', source: 'session' })
+
+    // A thinking-only edit is conversation-scoped: it must not move the model.
+    await put(base, `/api/workspaces/${workspaceId}/sessions/${second.id}/model`, { thinkingLevel: 'high' })
+    expect(await (await fetch(`${base}/api/model-defaults`)).json()).toMatchObject({ provider: 'alpha', model: 'a2' })
+    expect(await (await fetch(`${base}/api/workspaces/${workspaceId}/sessions/${first.id}/model`)).json())
+      .toMatchObject({ provider: 'alpha', model: 'a2' })
+  })
+
   it('validates complete global pairs and repairs defaults after provider mutations without rewriting snapshots', async () => {
     const { base } = await start([])
     const workspaceId = await firstWorkspace(base)
-    await post(base, '/api/providers', { name: 'Alpha', baseUrl: 'http://127.0.0.1:9/v1', apiKey: '', models: ['a1', 'a2'], defaultModel: 'a2' })
+    await post(base, '/api/providers', { name: 'Alpha', baseUrl: 'http://127.0.0.1:9/v1', apiKey: '', models: ['a1', 'a2'] })
     await post(base, '/api/providers', { name: 'Beta', baseUrl: 'http://127.0.0.1:9/v1', apiKey: '', models: ['b1'] })
-    expect(await (await fetch(`${base}/api/model-defaults`)).json()).toMatchObject({ provider: 'alpha', model: 'a2' })
+    expect(await (await fetch(`${base}/api/model-defaults`)).json()).toMatchObject({ provider: 'alpha', model: 'a1' })
     expect((await put(base, '/api/model-defaults', { provider: 'alpha' })).status).toBe(400)
     expect((await put(base, '/api/model-defaults', { provider: null, model: 'a1' })).status).toBe(400)
     expect((await put(base, '/api/model-defaults', { provider: 'alpha', model: 'a2' })).status).toBe(200)

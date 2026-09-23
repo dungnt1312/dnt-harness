@@ -1,10 +1,27 @@
 import type { SessionId } from '../../util/brand.ts'
 import type { ToolCall, ToolSchema } from '../llm/types.ts'
 
+/**
+ * Structured MCP tool outcome. Non-MCP tools omit it.
+ *
+ * - `success` / `error`: the remote effect is known (a tool-level `isError` is
+ *   still `error`, not a transport failure).
+ * - `indeterminate`: the request may have executed remotely. No automatic
+ *   retry; a later attempt is a new invocation with a fresh approval.
+ * - `audit_fault`: the remote outcome is known but its terminal execution
+ *   evidence could not be persisted. Further MCP dispatch stays blocked until
+ *   that evidence is repaired. This is not a normal failure.
+ */
+export type ToolOutcome = 'success' | 'error' | 'indeterminate' | 'audit_fault'
+
 /** What one tool run answers: success text, or a failure the model must see. */
 export interface ToolResult {
   readonly ok: boolean
   readonly output: string
+  /** Set only for MCP calls. Absent means a non-MCP tool result. */
+  readonly outcome?: ToolOutcome
+  /** Stable id of this invocation. A manual repeat after `indeterminate` gets a new one. */
+  readonly invocationId?: string
 }
 
 /**

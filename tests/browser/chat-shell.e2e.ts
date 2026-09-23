@@ -91,7 +91,7 @@ async function fixture(page: Page, options: Options = {}): Promise<{ readonly po
       workspace: { id: 'w', name: 'Fixture workspace', archived: false },
       provider: 'fixture-provider',
       model: 'fixture-model',
-      providers: [{ id: 'fixture-provider', name: 'Fixture provider', baseUrl: 'http://fixture.invalid', enabled: true, keyMasked: '***', models: ['fixture-model', 'fixture-large'], defaultModel: 'fixture-model', modelSettings: {} }],
+      providers: [{ id: 'fixture-provider', name: 'Fixture provider', baseUrl: 'http://fixture.invalid', enabled: true, keyMasked: '***', models: ['fixture-model', 'fixture-large'], modelSettings: {} }],
       models: ['fixture-model', 'fixture-large'],
       policy: { Bash: 'ask' },
       thinkingLevel: null,

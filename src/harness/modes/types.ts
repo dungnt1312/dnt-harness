@@ -17,7 +17,11 @@ export interface ModeDefinition {
   readonly sources: ModeSources
   /** The hard ceiling of exposed tools (canonical names). */
   readonly toolExposure: readonly string[]
-  /** Permission defaults per tool; the workspace policy still constrains. */
+  /**
+   * Permission per tool, keyed the way the approval gate resolves a call: a
+   * known tool name, an exact `mcp__<server>__<tool>`, an `mcp__<server>__*`
+   * wildcard, or the catch-all `*`.
+   */
   readonly permissionDefaults: Readonly<Record<string, ApprovalMode>>
 }
 
@@ -44,6 +48,7 @@ export interface ModeFrontmatter {
   readonly memoryPinned?: boolean
   readonly memoryRetrieval?: boolean
   readonly toolExposure?: readonly string[]
+  /** Keys: a canonical known tool, `mcp__<server>__<tool>`, `mcp__<server>__*`, or `*`. */
   readonly permissionDefaults?: Readonly<Record<string, string>>
 }
 
@@ -58,7 +63,7 @@ export interface ResolvedMode {
 
 export class ModeError extends Error {
   constructor(
-    readonly code: 'not-found' | 'invalid' | 'duplicate',
+    readonly code: 'not-found' | 'invalid' | 'duplicate' | 'conflict',
     message: string,
   ) {
     super(message)
