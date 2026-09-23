@@ -57,9 +57,9 @@ session/project     session project binding
 session/model       the session's model preference (provider/model/thinkingLevel;
                     an omitted field keeps the previous value, null is an
                     explicit clear)
-session/child-meta  child-session provenance (parent turn, definition, objective)
-agent/child-spawn   durable spawn intent, written before a child agent starts
-agent/child-result  a child agent's settled status
+session/child-meta  child-session provenance (parent turn, definition, brief, inherit audit)
+agent/child-spawn   durable spawn intent + brief, written before a child agent starts
+agent/child-result  a child agent's settled status (+ its failure, when failed)
 mcp/call            one MCP tool call (hashed args/results, duration, error flag)
 hook/run            one hook execution (event, matcher, exit code, decision)
 ```
@@ -430,9 +430,51 @@ the UI's inspector renders as-is.
 
 One root agent spawns children through the **same** loop and builder — there is
 no second runtime. `ChildExecutor` owns the lifecycle (spawn / list / wait /
-cancel), caps it (3 active, 8 per turn), and enforces one level: a child cannot
-delegate. Each child gets an isolated session, a task packet, and a ceiling of
-mode exposure ∩ definition ∩ spawn grant, where a grant only ever narrows.
+cancel), caps it (3 active per conversation, 12 on the host, 8 spawn attempts
+per root turn), and enforces one level: a child cannot delegate. Each child
+gets an isolated session, a brief, and a ceiling of mode exposure ∩ definition
+∩ spawn grant, where a grant only ever narrows.
+
+**Lifecycle boundary.** `spawn` checks, in order: the brief and inherit fields
+(`SpawnError('packet' | 'inherit')`), that the parent is a root owned by the
+requested workspace and project (`'ownership'`) and not itself a child
+(`'depth'`), then reserves capacity in one synchronous block with no `await`
+inside. It writes the child's `session/child-meta`, then the parent's
+`agent/child-spawn` — the commit point. A failure before it deletes the new
+child session and rolls every reservation back; after it, the child settles as
+a durable failed child. Settling releases active capacity; the per-turn
+attempt stays charged until the root turn's `agent/turn-settled`. A child
+session is driven by the executor only: the message routes answer 409 for any
+session carrying `session/child-meta`, so a child can never be resumed as a
+plain root Agent.
+
+**Bounded memory.** The executor's map holds active children only. Once a
+child's terminal record is durable its entry is evicted; `list`/`wait`/
+`cancel` rebuild a settled handle from the child's log and the parent's
+`agent/child-result` — the same path a restart uses. Recovery indexes children
+by id, skips (and logs) any whose parent is missing or owned elsewhere, and
+reports unfinished ones as `interrupted`. Deleting a root drops its indexes and
+cached manifests.
+
+**The child's prompt.** `buildContext` takes an optional `child` input
+(from `AgentScope.childOf`, pinned at spawn): the system block becomes a
+subagent preamble (the final message is the whole deliverable; nobody reads
+intermediate work; no delegation), a capability line derived from the request's
+own schemas, and the role's instructions — in place of `BASE_SYSTEM` and the
+mode prose. The server exposes a child only its ceiling, never `Agent`, so the
+line cannot advertise a tool it lacks. The manifest records the role and its
+instructions' hash. With `inherit: 'brief'` the child also receives a
+messages-only projection of the parent conversation as a wrapped
+`parent-context` message, droppable under budget (after skills, before
+memory and history) with a manifest omission; only its hash and size are
+durable.
+
+**The result.** A completed child's `result.report` is its last non-empty
+assistant message that carried no tool calls, cut at `MAX_REPORT_CHARS`
+(16 000) with a marker and `truncated`; `filesTouched` lists `Read`/`Write`/
+`Edit` paths. Any other outcome — or a completed child with no such message —
+has no result and an `error` naming its session. The derivation runs once per
+child.
 
 The model drives this itself through the built-in **`Agent`** tool, whose
 actions mirror the executor: `spawn` returns a handle immediately, `wait` blocks
@@ -441,7 +483,13 @@ on several children (capped at 120 s, and it honours a root Stop), `list`,
 deliberately asynchronous: one step runs its tool calls in sequence, so a
 blocking spawn would serialize children and the executor's parallel capacity
 would never be used. A child that is still running when the root's turn closes
-is cancelled, which is why the tool tells the model to wait first.
+is cancelled, which is why the tool tells the model to wait first. The tool
+description also carries the delegation guidance (delegate separable work
+whose result compresses; not what two tool calls would do) and the writer
+boundary: a root turn holds the project lease from its first write until it
+settles, spawning a write-capable child hands the lease off, the child then
+locks per call with no whole-run lease, and the root may reacquire — so do not
+fan out writers. Role listings for the description are cached per workspace.
 
 ### Which model a child runs on
 
@@ -472,3 +520,6 @@ hosted by a different provider than its parent.
 - Modes/context and workspace isolation: `tests/harness/modes.spec.ts`,
   `tests/harness/g3-context.spec.ts`, `tests/harness/g3-compaction.spec.ts`,
   `tests/harness/workspace-isolation.spec.ts`.
+- Delegation: `tests/harness/g4-agents.spec.ts`,
+  `tests/harness/g4-subagent-contract.spec.ts`, and over HTTP
+  `tests/web/server-g4.spec.ts`, `tests/web/server-subagents.spec.ts`.

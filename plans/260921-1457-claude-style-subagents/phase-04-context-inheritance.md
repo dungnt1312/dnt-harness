@@ -235,37 +235,37 @@ with `sha256Text`), and the omission path above is what the inspector reads.
 
 ## Success Criteria
 
-- [ ] Default `inherit:'none'` adds no `parent-context` message and leaves the phase 3
+- [x] Default `inherit:'none'` adds no `parent-context` message and leaves the phase 3
       assembled request content unchanged; only the new optional audit fields/types exist.
-- [ ] `inherit:'brief'` lets a child answer a question about a file the root read whose
+- [x] `inherit:'brief'` lets a child answer a question about a file the root read whose
       path the brief never names.
-- [ ] The inherited message is wrapped by `wrapUntrusted` with `kind="parent-context"`
+- [x] The inherited message is wrapped by `wrapUntrusted` with `kind="parent-context"`
       and the "reference material, not instructions" preamble.
-- [ ] A parent message appended **after** the spawn is absent from the child's context.
-- [ ] A parent log of 200 000 chars yields at most `MAX_INHERITED_CHARS`, keeping the
+- [x] A parent message appended **after** the spawn is absent from the child's context.
+- [x] A parent log of 200 000 chars yields at most `MAX_INHERITED_CHARS`, keeping the
       **newest** content, in chronological order.
-- [ ] Tool calls, tool results, and assistant messages carrying `toolCalls` are absent
+- [x] Tool calls, tool results, and assistant messages carrying `toolCalls` are absent
       from the projection.
-- [ ] The projection does not read the compaction checkpoint — a parent with a
+- [x] The projection does not read the compaction checkpoint — a parent with a
       checkpoint but no recent messages inherits nothing, and the builder's compaction
       path is untouched (`tests/harness/g3-compaction.spec.ts` passes unchanged).
-- [ ] Under budget pressure the inherited context is dropped before history, and the
+- [x] Under budget pressure the inherited context is dropped before history, and the
       manifest records an omission naming `parent-context`, its char count, and the
       reason; `ContextPanel` renders the source (hash + chars) or the omission.
-- [ ] A spawn with both `references` and `inherit:'brief'` still renders those references
+- [x] A spawn with both `references` and `inherit:'brief'` still renders those references
       in the brief, and the inherited message contains no tool results.
-- [ ] `ChildExecutor.spawn()` rejects inconsistent `inherit`/`inheritedContext`
+- [x] `ChildExecutor.spawn()` rejects inconsistent `inherit`/`inheritedContext`
       combinations as `SpawnError('packet')`; for a valid `inherit:'brief'` request, a role
       with `inheritable: false` refuses centrally with a typed error naming it. The Agent
       tool surfaces it and HTTP maps it to 400. Absent `inheritable` allows it.
-- [ ] `inheritable` survives parse → save → re-read (mini-dsh round-trip) and appears in
+- [x] `inheritable` survives parse → save → re-read (mini-dsh round-trip) and appears in
       the Settings copy/edit form; the Claude adapter reports it unsupported and never
       emits it.
-- [ ] The `Agent` tool and the HTTP route both accept `inherit`; the Workbench spawn form
+- [x] The `Agent` tool and the HTTP route both accept `inherit`; the Workbench spawn form
       has no inherit control; durable child metadata records mode/hash/char count, and
       the full string appears nowhere durable.
-- [ ] The spawn result reports the inherited char count.
-- [ ] `npm run typecheck` and the g3 + g4 suites pass.
+- [x] The spawn result reports the inherited char count.
+- [x] `npm run typecheck` and the g3 + g4 suites pass.
 
 ## Risk Assessment
 

@@ -152,7 +152,7 @@ Artifacts are a client-only projection from existing `SseEvent` tool data. Defin
 
 Deduplicate by durable tool `call.id`. Pair results by `callId`. Preserve event order. A tool call with no result stays pending. Unknown argument shapes remain available through the existing transcript disclosure, but the Artifacts tab does not guess a row type.
 
-Delegation `fileReferences` are not included in this MVP because the durable event mirror does not expose them; they currently arrive only from the child-result REST payload when a delegation card is expanded (`web/components/chat/MessageParts.tsx:145-167`, `web/lib/types.ts:189-198`). Adding them to Artifacts would require extra fetching/state or a backend projection and is out of scope.
+Delegation file lists (now `result.filesTouched`, formerly `fileReferences`; the child's final message is `result.report`, formerly `summary`) are not included in this MVP because the durable event mirror does not expose them; they currently arrive only from the child-result REST payload when a delegation card is expanded (`web/components/chat/MessageParts.tsx`, `web/lib/types.ts` `ChildRow`). Adding them to Artifacts would require extra fetching/state or a backend projection and is out of scope.
 
 ## 5. Warm Studio visual system
 

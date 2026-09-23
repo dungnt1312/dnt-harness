@@ -175,22 +175,22 @@ so logs written before this phase keep projecting.
 
 ## Success Criteria
 
-- [ ] `Agent({action:'spawn', definition:'explorer', prompt:'…'})` spawns and the child's
+- [x] `Agent({action:'spawn', definition:'explorer', prompt:'…'})` spawns and the child's
       first user message is that prose plus the required-result section.
-- [ ] A spawn with neither `prompt` nor `objective` fails with a `SpawnError('packet')`
+- [x] A spawn with neither `prompt` nor `objective` fails with a `SpawnError('packet')`
       whose message names both fields; the tool and an HTTP POST both surface it
       (the route as 400).
-- [ ] A spawn with both uses `prompt` and says so in the result `note`.
-- [ ] All 13 existing `task: { objective… }` HTTP calls in `tests/web/server-g4.spec.ts`
+- [x] A spawn with both uses `prompt` and says so in the result `note`.
+- [x] All 13 existing `task: { objective… }` HTTP calls in `tests/web/server-g4.spec.ts`
       and the one in `tests/web/server-session-model.spec.ts` pass without edits.
-- [ ] A packet with empty `constraints` and `references` renders no `## Constraints`
+- [x] A packet with empty `constraints` and `references` renders no `## Constraints`
       heading and no `- (none)` line.
-- [ ] The HTTP route accepts `task: { prompt, requiredResult }` and returns 202.
-- [ ] New durable child logs carry `brief`; a log written before this phase (only
+- [x] The HTTP route accepts `task: { prompt, requiredResult }` and returns 202.
+- [x] New durable child logs carry `brief`; a log written before this phase (only
       `objective`) still projects and renders in the delegation detail.
-- [ ] The panel's spawn form submits a prose brief without filling Objective, and still
+- [x] The panel's spawn form submits a prose brief without filling Objective, and still
       submits the four-field packet from the disclosure.
-- [ ] `npm run typecheck` and the g4 harness + web suites pass.
+- [x] `npm run typecheck` and the g4 harness + web suites pass.
 
 ## Risk Assessment
 

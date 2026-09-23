@@ -125,8 +125,40 @@ classifier and no auto-load:
 tool, five actions — `spawn` (returns a handle at once), `wait` (blocks on
 several children, capped at 120 s, honours Stop), `list`, `cancel`, `catalog`:
 
+- **A prose brief**: `prompt` is the primary argument — written for a colleague
+  who cannot see the conversation — plus `requiredResult`. The structured
+  `objective`/`constraints`/`references` form stays accepted; with both, the
+  prompt wins and the result says so. An empty brief is a typed `packet` error.
+- **The child is its role**: the role's instructions are the child's *system*
+  prompt (pinned at spawn), after a subagent preamble — its final message is the
+  whole deliverable, nobody sees its intermediate work, it cannot delegate — and
+  a capability line naming exactly the tools its request carries. The mode's
+  role prose is not sent to a child. Prompt text grants nothing: the exposure
+  gate, host policy and approval stay the enforcement.
+- **The result is the child's answer**: a completed child returns its last
+  assistant message that carried no tool calls as `result.report` (cut at
+  16 000 chars with a `… [truncated N chars]` marker and `truncated: true`),
+  plus `filesTouched` — the `Read`/`Write`/`Edit` paths, not Glob/Grep scopes.
+  A cancelled, failed or interrupted child, or one that never wrote a final
+  message, has no result and an `error` naming its session — the full log.
+- **Inherited context is opt-in**: `inherit: "brief"` also hands the child up
+  to 12 000 chars of this conversation's recent user/assistant *messages* —
+  never tool calls, tool output or a compaction summary — captured at spawn,
+  wrapped as lower-trust `parent-context` data, and dropped (with a manifest
+  omission) under budget pressure before history is. Only its hash and size are
+  stored; the spawn result reports the size. A role with `inheritable: false`
+  refuses it. `references` are unaffected and still ride in the brief.
 - **Asynchronous on purpose**: a step runs its tool calls in sequence, so
-  `spawn` must return immediately for children to overlap. Up to 3 run at once.
+  `spawn` must return immediately for children to overlap. A conversation holds
+  up to 3 active children (reported as `active: n/3`); the host caps all
+  conversations at 12, and each root turn at 8 spawn attempts. A capacity
+  refusal names which limit was hit.
+- **Writers do not serialize**: a root turn holds the project lease from its
+  first write until it settles. Spawning a write-capable child hands that lease
+  off; the child then locks per call, nothing locks its whole run, and the
+  root's next write can take the lease back. The tool therefore tells the model
+  not to fan out writers or keep writing while one runs — parallel fan-out
+  belongs to read-only roles.
 - **One level**: a child is denied `Agent` before any ceiling or approval is
   consulted, whatever its definition lists.
 - **Model per child**: the `model` argument (`provider:model`, or a bare name)
@@ -141,6 +173,12 @@ several children, capped at 120 s, honours Stop), `list`, `cancel`, `catalog`:
   resolves the same mode.
 - **Grants only narrow**: a `grantTools` entry the role lacks is reported back,
   never silently dropped.
+- **Four bundled roles**, each described by when to pick it and each stating
+  the shape of its final report: `explorer` (find and explain; read-only),
+  `worker` (one decided edit; file tools, no shell), `reviewer` (find defects;
+  read-only) and `verifier` (run tests/typecheck/build and judge; `Bash`, no
+  file edits). `catalog` also lists the workspace's valid custom roles; copy a
+  bundled role in Settings → Agents to customize it.
 
 ## Memory tools (`src/harness/memory/tools.ts`)
 

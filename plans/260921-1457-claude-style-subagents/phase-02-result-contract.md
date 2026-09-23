@@ -180,27 +180,27 @@ consumers:
 
 ## Success Criteria
 
-- [ ] A child emitting messages `"checking A"`, `"checking B"`, `"Answer: X"` reports
+- [x] A child emitting messages `"checking A"`, `"checking B"`, `"Answer: X"` reports
       exactly `"Answer: X"`.
-- [ ] An `assistant/message` that also carries `toolCalls` is skipped when selecting the
+- [x] An `assistant/message` that also carries `toolCalls` is skipped when selecting the
       report; the last tool-free message wins.
-- [ ] A child whose messages total 50 000 chars returns `MAX_REPORT_CHARS` of its
+- [x] A child whose messages total 50 000 chars returns `MAX_REPORT_CHARS` of its
       **final** message with `truncated: true` and a visible marker — not the first
       4 000 chars of its first message. The Workbench card and the chat delegation
       detail both show the truncation.
-- [ ] A cancelled child has no `result` and an `error` naming its session id; the same
+- [x] A cancelled child has no `result` and an `error` naming its session id; the same
       holds for `failed` and `interrupted`.
-- [ ] A completed child with no qualifying terminal message has no `result` and an
+- [x] A completed child with no qualifying terminal message has no `result` and an
       `error` naming its session id; the child's log is scanned exactly once (sentinel
       observable through repeated `wait`/`list` calls returning stable handles).
-- [ ] `filesTouched` for a child that ran `Read{path:'a.ts'}`, `Glob{pattern:'**/*.ts'}`,
+- [x] `filesTouched` for a child that ran `Read{path:'a.ts'}`, `Glob{pattern:'**/*.ts'}`,
       `Grep{pattern:'x'}` contains `a.ts` and nothing invented — no Glob or Grep paths.
-- [ ] `filesTouched` for a `worker` that wrote two files contains both.
-- [ ] A settled child's digest is computed once whether or not a result exists
+- [x] `filesTouched` for a `worker` that wrote two files contains both.
+- [x] A settled child's digest is computed once whether or not a result exists
       (sentinel, not the old `result === undefined` guard).
-- [ ] The Workbench child card and the chat delegation detail show the report; no
+- [x] The Workbench child card and the chat delegation detail show the report; no
       `undefined` after the rename.
-- [ ] `npm run typecheck`, `npx vitest tests/harness/g4-agents.spec.ts
+- [x] `npm run typecheck`, `npx vitest tests/harness/g4-agents.spec.ts
       tests/web/server-g4.spec.ts`, the panel spec, and the browser fixture route
       (`chat-shell.e2e.ts`) pass.
 

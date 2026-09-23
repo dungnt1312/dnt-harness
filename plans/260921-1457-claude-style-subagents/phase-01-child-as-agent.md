@@ -185,26 +185,26 @@ call (`server.ts:1457-1469`) already reads `agentScope.getStore()` into `scope`.
 
 ## Success Criteria
 
-- [ ] A child's assembled system prompt contains its definition's instructions.
-- [ ] A child's assembled system prompt contains the "final message is the deliverable"
+- [x] A child's assembled system prompt contains its definition's instructions.
+- [x] A child's assembled system prompt contains the "final message is the deliverable"
       rule and the no-delegation statement.
-- [ ] A child in **Plan** mode is **not** told "the plan itself is the deliverable"; a
+- [x] A child in **Plan** mode is **not** told "the plan itself is the deliverable"; a
       child in **Full access** is **not** told "shell commands run with host privileges".
-- [ ] The capability line names exactly the tools in the request's schemas — verified for
+- [x] The capability line names exactly the tools in the request's schemas — verified for
       an `explorer` (3 names) and a `worker` with a narrowing `grantTools` — and the
       child's schema list excludes `Agent`, MCP tools, and anything outside the ceiling
       even when the mode exposes them.
-- [ ] A root's assembled prompt is unchanged: an existing `g3-context` snapshot-style
+- [x] A root's assembled prompt is unchanged: an existing `g3-context` snapshot-style
       assertion still passes untouched.
-- [ ] A definition whose body instructs the child to call `Bash` is still denied `Bash`
+- [x] A definition whose body instructs the child to call `Bash` is still denied `Bash`
       by the gate when its ceiling excludes it.
-- [ ] `renderPacket` output contains no `<definition` substring.
-- [ ] The manifest reports the definition name and instructions hash for a child request,
+- [x] `renderPacket` output contains no `<definition` substring.
+- [x] The manifest reports the definition name and instructions hash for a child request,
       `ContextManifestView` accepts it, and `ContextPanel` renders it without changing root
       manifest behavior.
-- [ ] Editing a workspace definition file while a child runs does not change that child's
+- [x] Editing a workspace definition file while a child runs does not change that child's
       system prompt.
-- [ ] `npm run typecheck` and `npx vitest tests/harness/g3-context.spec.ts
+- [x] `npm run typecheck` and `npx vitest tests/harness/g3-context.spec.ts
       tests/harness/g4-agents.spec.ts` pass.
 
 ## Risk Assessment

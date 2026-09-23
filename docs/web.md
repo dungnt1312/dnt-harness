@@ -125,7 +125,7 @@ tool root. The families, at a glance:
 | Route family | Purpose |
 |---|---|
 | `GET/POST /api/workspaces`, `PATCH/DELETE /api/workspaces/:wid` | workspace list (with running/approval badges), create, rename, archive/restore, delete (empty only) |
-| `…/:wid/sessions`, `…/:wid/sessions/:id` (+ `/events` SSE, `/messages`, `/stop`) | session lifecycle, streaming, queued messages, stop |
+| `…/:wid/sessions`, `…/:wid/sessions/:id` (+ `/events` SSE, `/messages`, `/stop`) | session lifecycle, streaming, queued messages, stop. `/messages` answers 409 for a child agent session: children are executor-managed and cannot be resumed directly |
 | `GET/PUT …/:wid/sessions/:id/model` | the conversation's own model controls (model, provider, thinking level) — see the per-conversation model section |
 | `…/:wid/sessions/:id/manifest`, `…/compact` | per-request context manifest; manual compaction into an immutable checkpoint |
 | `GET/PUT /api/model-defaults` | the **global** default provider/model/thinking level, shared by every workspace: the pair new sessions snapshot at creation, the draft pickers' target, and the live fallback for legacy conversations without a snapshot |
@@ -136,7 +136,8 @@ tool root. The families, at a glance:
 | `GET …/:wid/projects/:pid/(files\|file\|search)` | read-only project browsing: one directory listing, one file body, and a bounded file-name search for composer mentions |
 | `…/:wid/terminals` (+ `/events` SSE, `/:tid` DELETE, `/:tid/(input\|resize)`) | interactive Workbench terminals: PTY lifecycle, one multiplexed output stream per workspace — see the terminal section |
 | `POST …/:wid/attachments`, `GET …/:wid/attachments/:id` | composer attachments: upload (content-addressed by sha256, verified media type) and serve (immutable, workspace-scoped) |
-| `…/:wid/agents/:name` (GET resolve / DELETE), `POST …/:wid/agents/:name` | agent definitions; POST spawns a bounded child with a task packet, optionally `model` (`provider:model`) and `grantTools` |
+| `…/:wid/agents/:name` (GET resolve / DELETE), `POST …/:wid/agents/:name` | agent definitions; POST spawns a bounded child from `task: { prompt, requiredResult }` or the four-field `task: { objective, constraints, references, requiredResult }`, optionally `inherit: "brief"`, `model` (`provider:model`) and `grantTools`. 202 with the handle (+ `inheritedChars`, `note`); an empty brief, a bad `inherit`, or a role that refuses inheritance is 400; capacity (per conversation or host) is 429 |
+| `POST …/:wid/agents/:name/import` | save a definition: `dialect: "claude"` / `"codex"` import with provenance, or `"mini-dsh"` to save a native document verbatim (keeps `inheritable`) |
 | `GET …/:wid/agents/children?root=…`, `GET/DELETE …/:wid/children/:childId` (+ `/cancel`) | child list / wait-result / cancel |
 | `…/:wid/mcp` (+ `/:server` GET/POST/DELETE, `/:server/(enable\|disable\|reconnect)`, `/mcp/import`) | MCP server lifecycle, stored config for editing, deletion, and imports with provenance |
 | `…/:wid/hooks`, `…/:wid/secrets(/:key)` | hook bindings; encrypted secret management (masked responses) |
@@ -677,8 +678,12 @@ tab, so the strip keeps room for opened file tabs. Files and Artifacts are
 read-only projections; Context is read-only apart from its confirmed Compact,
 Agents delegates and cancels child runs for the open conversation — including
 the ones the model spawns for itself through the `Agent` tool, with each child's
-`provider:model` on its card and a picker that overrides the role's own model —
-and Terminal
+`provider:model` on its card and a picker that overrides the role's own model.
+Its primary field is a prose **Brief**; the structured objective, constraints,
+references and required result stay in *Task packet details*. A child card (and
+the chat delegation detail) shows the child's final report, a visible
+truncation note when the report hit the host cap, the files it touched, or the
+error naming its session log. It offers no inherited-context control — and Terminal
 is the deliberate interactive exception documented above. The Workbench docks at 1280px and becomes a modal sheet below that. Sidebar/workbench collapse, dock widths, the opened
 Workbench views and the selected one are browser-local preferences under `mini-dsh.workbench.v1`;
 appearance (System/Light/Dark) is stored under

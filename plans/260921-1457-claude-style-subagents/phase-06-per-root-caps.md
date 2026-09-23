@@ -111,24 +111,24 @@ the rollback and the phase 0 terminal-turn hook write to it.
 
 ## Success Criteria
 
-- [ ] One root may hold 3 active children; the 4th fails naming the per-conversation limit.
-- [ ] Two roots each hold 3 active children at the same time without interfering.
-- [ ] The global ceiling refuses with a message that says the host is busy, distinct from
+- [x] One root may hold 3 active children; the 4th fails naming the per-conversation limit.
+- [x] Two roots each hold 3 active children at the same time without interfering.
+- [x] The global ceiling refuses with a message that says the host is busy, distinct from
       the per-root message; both surface as `SpawnError('capacity')` and HTTP 429.
-- [ ] Successful spawn/wait/list results show only the per-root `active n/3` figure; no
+- [x] Successful spawn/wait/list results show only the per-root `active n/3` figure; no
       global count appears in success payloads, the tool result, or the child card.
-- [ ] A spawn that fails **before the parent relationship commit** rolls back both active
+- [x] A spawn that fails **before the parent relationship commit** rolls back both active
       counters and the per-turn attempt. A failure after that commit settles a durable
       failed child, releases active capacity, and keeps the per-turn attempt charged until
       the terminal-turn cleanup hook, matching phase 0.
-- [ ] A settled child releases its active slot but **not** its per-turn slot; the
+- [x] A settled child releases its active slot but **not** its per-turn slot; the
       per-turn budget is exhausted by attempts, not by completions.
-- [ ] The per-root map has no entry for a root with no active children, and per-turn
+- [x] The per-root map has no entry for a root with no active children, and per-turn
       keys are cleared at the terminal-turn hook — both asserted through public
       spawn/wait/list behavior with no production test accessor.
-- [ ] `MAX_CHILDREN_PER_TURN = 8` still enforced.
-- [ ] No usage field, `step/usage` event, or token figure is added.
-- [ ] `npm run typecheck` and the g4 harness + web suites pass.
+- [x] `MAX_CHILDREN_PER_TURN = 8` still enforced.
+- [x] No usage field, `step/usage` event, or token figure is added.
+- [x] `npm run typecheck` and the g4 harness + web suites pass.
 
 ## Risk Assessment
 

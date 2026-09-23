@@ -163,26 +163,26 @@ static bundled fallback stays as the initial value for every workspace.
 
 ## Success Criteria
 
-- [ ] `action:'catalog'` returns the four bundled roles with descriptions that state
+- [x] `action:'catalog'` returns the four bundled roles with descriptions that state
       *when to choose them*, with no description defined by its tool list, **plus** valid
       workspace custom roles; bundled names stay capped at four.
-- [ ] The tool description carries the delegation-guidance line and distinguishes the
+- [x] The tool description carries the delegation-guidance line and distinguishes the
       root turn-held lease, the child per-call fallback after handoff, and the absence of
       a whole-child-run lock — no false serialization or one-at-a-time claim anywhere.
-- [ ] `verifier` can call `Bash`; `reviewer` and `explorer` are denied it by the ceiling.
-- [ ] A `reviewer` spawned with `grantTools:['Write']` reports `droppedGrants:['Write']`.
-- [ ] Each bundled role's instructions specify the shape of its final report.
-- [ ] `agent-delegation.ts`'s static fallback role list matches the bundled roles.
-- [ ] The role description cache is keyed by `WorkspaceId`: alternating two workspaces
+- [x] `verifier` can call `Bash`; `reviewer` and `explorer` are denied it by the ceiling.
+- [x] A `reviewer` spawned with `grantTools:['Write']` reports `droppedGrants:['Write']`.
+- [x] Each bundled role's instructions specify the shape of its final report.
+- [x] `agent-delegation.ts`'s static fallback role list matches the bundled roles.
+- [x] The role description cache is keyed by `WorkspaceId`: alternating two workspaces
       within the TTL serves each workspace its own custom role descriptions, and expired
       workspace entries are evicted lazily so the cache remains bounded.
-- [ ] The Settings agents panel lists four bundled roles and each can be copied to
+- [x] The Settings agents panel lists four bundled roles and each can be copied to
       customize.
-- [ ] Two `reviewer` children fan out concurrently; a writer-child test demonstrates the
+- [x] Two `reviewer` children fan out concurrently; a writer-child test demonstrates the
       actual boundary: root lease handoff completes before the child's first write,
       child calls have no whole-run lease, and a later root write can reacquire/contend —
       exactly as documented.
-- [ ] `npm run typecheck`, the g4 suites and `management.spec.tsx` pass.
+- [x] `npm run typecheck`, the g4 suites and `management.spec.tsx` pass.
 
 ## Risk Assessment
 

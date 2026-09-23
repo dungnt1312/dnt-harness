@@ -96,16 +96,16 @@ Delete `spawnedPerTurn` entries from the root terminal-turn hook (the `agent/tur
 
 ## Success Criteria
 
-- [ ] Direct POST/message execution against a child session is rejected before a normal Agent is created.
-- [ ] `ChildExecutor.spawn()` rejects a parent whose workspace or project differs from the request before creating child state.
-- [ ] A failure before the parent relationship becomes durable leaves no child session on disk.
-- [ ] A failure after the parent relationship becomes durable produces a queryable failed child with an explicit error.
-- [ ] A settled child remains visible through list/wait and both UI surfaces after its active-map entry is evicted.
-- [ ] Recovery does not register a child whose parent is missing or belongs to a different workspace/project.
-- [ ] Capacity check-and-reserve remains synchronous after asynchronous preflight.
-- [ ] Per-turn/root indexes and last-manifest entries are cleared at their lifecycle boundary.
-- [ ] Existing approval relay, model pinning, child result recovery, and one-level delegation tests remain green.
-- [ ] `npm run typecheck` and the targeted G4 harness/web suites pass.
+- [x] Direct POST/message execution against a child session is rejected before a normal Agent is created.
+- [x] `ChildExecutor.spawn()` rejects a parent whose workspace or project differs from the request before creating child state.
+- [x] A failure before the parent relationship becomes durable leaves no child session on disk.
+- [x] A failure after the parent relationship becomes durable produces a queryable failed child with an explicit error.
+- [x] A settled child remains visible through list/wait and both UI surfaces after its active-map entry is evicted.
+- [x] Recovery does not register a child whose parent is missing or belongs to a different workspace/project.
+- [x] Capacity check-and-reserve remains synchronous after asynchronous preflight.
+- [x] Per-turn/root indexes and last-manifest entries are cleared at their lifecycle boundary.
+- [x] Existing approval relay, model pinning, child result recovery, and one-level delegation tests remain green.
+- [x] `npm run typecheck` and the targeted G4 harness/web suites pass.
 
 ## Risk Assessment
 

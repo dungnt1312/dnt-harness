@@ -1,7 +1,7 @@
 ---
 title: "Claude style subagents"
 description: "Make a child agent an actual agent: its own system prompt, a free-form brief, and a defined deliverable — then four roles and per-conversation caps."
-status: pending
+status: done
 priority: P1
 effort: ""
 tags: [multi-agent, g4, context, delegation]
@@ -136,13 +136,13 @@ followed the status review, plus the eight questions answered in Validation Sess
 
 | # | Phase | Status | Depends |
 |---|-------|--------|---------|
-| 0 | [Harden the child lifecycle boundary](./phase-00-lifecycle-hardening.md) | Pending | — |
-| 1 | [The child is a real agent](./phase-01-child-as-agent.md) | Pending | 0 |
-| 2 | [The result contract](./phase-02-result-contract.md) | Pending | 0, 1 |
-| 3 | [A free-form brief](./phase-03-free-form-brief.md) | Pending | 0, 1 |
-| 4 | [Context inheritance](./phase-04-context-inheritance.md) | Pending | 0, 1, 3 |
-| 5 | [A real role library](./phase-05-role-library.md) | Pending | 0, 1, 2 |
-| 6 | [Per-root caps](./phase-06-per-root-caps.md) | Pending | 0 |
+| 0 | [Harden the child lifecycle boundary](./phase-00-lifecycle-hardening.md) | Done | — |
+| 1 | [The child is a real agent](./phase-01-child-as-agent.md) | Done | 0 |
+| 2 | [The result contract](./phase-02-result-contract.md) | Done | 0, 1 |
+| 3 | [A free-form brief](./phase-03-free-form-brief.md) | Done | 0, 1 |
+| 4 | [Context inheritance](./phase-04-context-inheritance.md) | Done | 0, 1, 3 |
+| 5 | [A real role library](./phase-05-role-library.md) | Done | 0, 1, 2 |
+| 6 | [Per-root caps](./phase-06-per-root-caps.md) | Done | 0 |
 
 Order: ship 0–3 together before any other phase — phase 0 is the prerequisite the
 prompt, brief, and result contracts stand on. Then 5, then 4. Phase 6 depends only on
@@ -186,41 +186,57 @@ phase 0; do it when two conversations delegating at once matters. Each phase mus
 
 ## Success Criteria
 
-- [ ] A direct message/run request against a session carrying `session/child-meta` is
+- [x] A direct message/run request against a session carrying `session/child-meta` is
       rejected before a normal Agent is created; a foreign-workspace/project spawn is
       rejected before child state exists; a post-relationship launch failure settles a
       durable failed child instead of orphaning a session (details in phase 0).
-- [ ] A child's request system prompt contains its definition's instructions and the
+- [x] A child's request system prompt contains its definition's instructions and the
       deliverable rule, and does **not** contain the mode's role prose.
-- [ ] An `explorer` spawned in Plan mode is not told the deliverable is a plan.
-- [ ] A child that narrates for 10 messages returns its **last** message as the report,
+- [x] An `explorer` spawned in Plan mode is not told the deliverable is a plan.
+- [x] A child that narrates for 10 messages returns its **last** message as the report,
       and a message that also carried tool calls is never taken as the deliverable.
-- [ ] A child that produced no terminal message reports that honestly — whether it is
+- [x] A child that produced no terminal message reports that honestly — whether it is
       completed, cancelled, failed, or interrupted, it has no `result` and an explicit
       error naming its session log; the result-or-error derivation is memoized.
-- [ ] `filesTouched` lists only `Read`/`Write`/`Edit` file paths; Glob and Grep
+- [x] `filesTouched` lists only `Read`/`Write`/`Edit` file paths; Glob and Grep
       directory scopes are omitted, and truncation shows an explicit marker and flag in
       the Workbench and in chat.
-- [ ] The root briefs a child with `prompt` in prose; the four-field form still works;
+- [x] The root briefs a child with `prompt` in prose; the four-field form still works;
       the durable events carry `brief` and legacy `objective` logs still read back.
-- [ ] The Workbench spawn form submits a prose brief without an objective, and still
+- [x] The Workbench spawn form submits a prose brief without an objective, and still
       submits the four-field packet.
-- [ ] `inherit: 'brief'` lets a child answer a question about a file the root read and
+- [x] `inherit: 'brief'` lets a child answer a question about a file the root read and
       the brief never named. The projection is built from parent messages only — no
       tool results, no checkpoint summary. Named `references` still appear in the brief
       when both are set. The `Agent` tool and the HTTP route accept `inherit`; the
       Workbench gains no control in this plan.
-- [ ] Bundled roles are exactly `explorer`, `worker`, `reviewer`, and `verifier`, their
+- [x] Bundled roles are exactly `explorer`, `worker`, `reviewer`, and `verifier`, their
       descriptions distinguish them by when to choose them, and `action: 'catalog'`
       additionally lists valid workspace custom roles.
-- [ ] The delegation guidance states the asymmetric lease boundary honestly — root turns
+- [x] The delegation guidance states the asymmetric lease boundary honestly — root turns
       hold a lease, child calls use fallback per-call locking after handoff, and no lease
       serializes the child's whole run — and says not to fan out writers or keep the root
       writing concurrently.
-- [ ] Two conversations delegating at the same time do not steal each other's capacity.
-- [ ] This plan does not add token or currency accounting.
+- [x] Two conversations delegating at the same time do not steal each other's capacity.
+- [x] This plan does not add token or currency accounting.
 - [ ] `npm test`, `npm run typecheck`, `npm run build:web` exit 0; pm2 `mini-dsh`
       restarted and verified live.
+
+### Outcome (2026-09-23)
+
+Cooked phases 0–6 in one pass. `npm run typecheck` 0 errors; `npm run build:web`
+ok; pm2 `mini-dsh` restarted and verified live (bundled roles = explorer,
+worker, reviewer, verifier; 7 legacy child relationships recovered). The
+`npm test` criterion stays unchecked: 931 pass, 10 fail — the same 10
+(`workspace-isolation` ×1, `session-model` ×3, `composer.mounted` ×6) fail on the
+pre-change baseline and belong to the auth/MCP work. Playwright `chat-shell`
+fails at setup on a missing `GET /api/auth/state` fixture route (same origin).
+Review and dispositions:
+`plans/reports/code-reviewer-260923-1027-claude-style-subagents.md`.
+Deviations: the Settings create form now saves via a native `dialect:
+"mini-dsh"` import (so `inheritable` round-trips) and gained "Copy to
+customize"; a workspace file named like a new bundled role is warned about and
+deletable rather than migrated.
 
 ## Risks
 
