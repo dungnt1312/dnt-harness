@@ -539,11 +539,21 @@ export function App() {
       }
       return
     }
+    const sessionId = route?.kind === 'session' ? route.sessionId : null
+    // Re-applying the route already in force (StrictMode's doubled mount
+    // effect, a popstate to the same place) must not bump the navigation
+    // token: that would discard the workspace load already in flight, and
+    // with `activeWs` unchanged nothing would ever reload it.
+    if (workspaceRef.current === workspace.id && currentRef.current === sessionId) {
+      navigate(route?.kind === 'session' ? route : workspaceRoute(workspace.id), mode)
+      return
+    }
     navigation.current.next()
     workspaceRef.current = workspace.id
+    currentRef.current = sessionId
     setPendingDelete(null)
     setActiveWs(workspace.id)
-    setCurrent(route?.kind === 'session' ? route.sessionId : null)
+    setCurrent(sessionId)
     navigate(route?.kind === 'session' ? route : workspaceRoute(workspace.id), mode)
   }, [navigate])
 
