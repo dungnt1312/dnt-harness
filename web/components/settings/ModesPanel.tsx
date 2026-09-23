@@ -72,6 +72,9 @@ function ModesPanelContent({ workspaceId, onChanged }: { readonly workspaceId: s
   const [selected, setSelected] = useScopedState<string | null>(null)
   const [notice, setNotice] = useScopedState<NoticeState>(null)
   const [editing, setEditing] = useScopedState<EditingMode | null>(null)
+  const [viewing, setViewing] = useScopedState<ModeForm | null>(null)
+  const [viewingId, setViewingId] = useScopedState<string | null>(null)
+  const [viewingSource, setViewingSource] = useScopedState<'bundled' | 'workspace' | null>(null)
   const [draft, setDraft] = useScopedState<ModeForm>(emptyModeForm)
   const [newId, setNewId] = useScopedState('')
   const [conflict, setConflict] = useScopedState<string | null>(null)
@@ -104,13 +107,32 @@ function ModesPanelContent({ workspaceId, onChanged }: { readonly workspaceId: s
 
   const openEditor = (row: ModeCatalogRow): Promise<void> => run(`open:${row.id}`, async () => {
     setNotice(null)
+    setViewing(null)
+    setViewingId(null)
+    setViewingSource(null)
     await loadEditor(row.id)
   })
+
+  const openView = (row: ModeCatalogRow): Promise<void> => run(`view:${row.id}`, async () => {
+    setNotice(null)
+    setEditing(null)
+    setConflict(null)
+    const loaded = await getModeFile(workspaceId, row.id)
+    const form = parseModeForm(loaded.raw)
+    setViewing(form)
+    setViewingId(row.id)
+    setViewingSource(row.source)
+  })
+
+  const closeView = (): void => { setViewing(null); setViewingId(null); setViewingSource(null) }
 
   const beginNew = (): void => {
     const form = emptyModeForm()
     setDraft(form)
     setEditing({ id: '', isNew: true, hash: null, baseline: serializeModeForm(form) })
+    setViewing(null)
+    setViewingId(null)
+    setViewingSource(null)
     setNewId('')
     setConflict(null)
     setNotice(null)
@@ -205,7 +227,14 @@ function ModesPanelContent({ workspaceId, onChanged }: { readonly workspaceId: s
       </PanelIntro>
       {notice !== null ? <Notice kind={notice.kind} text={notice.text} /> : null}
 
-      {editing === null ? (
+      {viewing !== null ? (
+        <Section
+          title={`${viewingSource === 'bundled' ? 'Bundled' : 'Workspace'} · ${viewingId}`}
+          actions={<Button variant="ghost" size="sm" onClick={closeView}><Icon name="chevronRight" size={13} className="rotate-180" />Back to list</Button>}
+        >
+          <ModeView draft={viewing} onEdit={viewingSource === 'workspace' ? () => { const id = viewingId!; const row = rows.find((r) => r.id === id); closeView(); if (row) void openEditor(row) } : undefined} />
+        </Section>
+      ) : editing === null ? (
         <Section
           title="Modes"
           count={rows.length}
@@ -217,16 +246,29 @@ function ModesPanelContent({ workspaceId, onChanged }: { readonly workspaceId: s
                 <ItemRow
                   key={row.id}
                   title={(
+                    <button
+                      type="button"
+                      className="break-all text-left hover:text-link hover:underline"
+                      onClick={() => void openView(row)}
+                      title={`View ${row.name}`}
+                    >
+                      {row.name}
+                    </button>
+                  )}
+                  meta={(
                     <>
-                      <span className={row.enabled === false ? 'break-all text-fg-faint' : 'break-all'}>{row.name}</span>
-                      <Badge tone={row.source === 'workspace' ? 'blue' : 'gray'}>{row.source}</Badge>
-                      {row.id === selected ? <Badge tone="green">selected</Badge> : null}
+                      <span className="inline-flex items-center gap-1">
+                        <Badge tone={row.source === 'workspace' ? 'blue' : 'gray'}>{row.source}</Badge>
+                        {row.id === selected ? <Badge tone="green">selected</Badge> : null}
+                        {row.enabled === false ? <Badge tone="gray">hidden</Badge> : null}
+                      </span>
+                      <span className="block truncate">{permissionSummary(row.permissionDefaults)}</span>
                     </>
                   )}
-                  meta={permissionSummary(row.permissionDefaults)}
                   actions={row.source === 'workspace' ? (
                     <>
                       {pickerCheckbox(row)}
+                      <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void openView(row)}><Icon name="eye" size={13} />View</Button>
                       <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void openEditor(row)}>{busy === `open:${row.id}` ? 'Opening…' : 'Edit'}</Button>
                       <IconButton label={`Delete ${row.id}`} disabled={busy !== null} onClick={() => setDeleteId(row.id)}><Icon name="trash" size={14} /></IconButton>
                     </>
@@ -234,6 +276,7 @@ function ModesPanelContent({ workspaceId, onChanged }: { readonly workspaceId: s
                     <>
                       <Badge tone="gray">Read-only</Badge>
                       {pickerCheckbox(row)}
+                      <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void openView(row)}><Icon name="eye" size={13} />View</Button>
                       <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => { setNotice(null); setCopying({ from: row.id, to: `${row.id}-custom` }) }}>Duplicate</Button>
                     </>
                   )}
@@ -318,6 +361,78 @@ function PermissionRow({ label, code, value, disabled, onSet, onRemove }: {
 }
 
 /** The structured editor: identity, instructions, context sources, exposure, permissions. */
+function ModeView({ draft, onEdit }: { readonly draft: ModeForm; readonly onEdit?: (() => void) | undefined }) {
+  const historyLabel: Record<string, string> = { none: 'None', recent: 'Recent', compact: 'Compact' }
+  const permissionEntries = Object.entries(draft.permissions)
+  const customKeys = permissionEntries.filter(([k]) => k !== '*' && !KNOWN_MODE_TOOLS.includes(k)).map(([k]) => k).sort((a, b) => a.localeCompare(b))
+  return (
+    <div className="flex flex-col gap-5">
+      <div className="flex flex-col gap-1">
+        <span className="text-[13px] font-semibold text-fg">{draft.name || 'Untitled mode'}</span>
+        {draft.instructions.trim() !== '' ? (
+          <pre className="m-0 whitespace-pre-wrap break-words rounded-lg bg-muted px-3 py-2.5 font-mono text-[12.5px] leading-5 text-fg">{draft.instructions}</pre>
+        ) : (
+          <p className="m-0 text-xs text-fg-faint">No instructions.</p>
+        )}
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <span className="text-[13px] font-medium text-fg">Context sources</span>
+        <div className="grid grid-cols-2 gap-2 text-[13px] sm:grid-cols-3">
+          <span>History <Badge tone="gray">{historyLabel[draft.history] ?? draft.history}</Badge></span>
+          <span>Skills <Badge tone="gray">{draft.skills}</Badge></span>
+          <span>Workspace instructions <Badge tone={draft.workspaceInstructions ? 'green' : 'gray'}>{draft.workspaceInstructions ? 'On' : 'Off'}</Badge></span>
+          <span>Pinned memory <Badge tone={draft.memoryPinned ? 'green' : 'gray'}>{draft.memoryPinned ? 'On' : 'Off'}</Badge></span>
+          <span>Memory retrieval <Badge tone={draft.memoryRetrieval ? 'green' : 'gray'}>{draft.memoryRetrieval ? 'On' : 'Off'}</Badge></span>
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <span className="text-[13px] font-medium text-fg">Tool exposure</span>
+        <div className="flex flex-wrap gap-1.5">
+          {KNOWN_MODE_TOOLS.map((tool) => (
+            <Badge key={tool} tone={draft.exposure.includes(tool) ? 'blue' : 'gray'}>{tool}</Badge>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <span className="text-[13px] font-medium text-fg">Permissions</span>
+        {permissionEntries.length === 0 ? (
+          <p className="m-0 text-xs text-fg-faint">No permission entries — every tool falls to host default.</p>
+        ) : (
+          <div className="flex flex-col gap-1.5">
+            {permissionEntries.some(([k]) => k === '*') ? (
+              <div className="flex items-center justify-between gap-2 rounded-lg border border-line px-3 py-2 text-[13px]">
+                <code>Everything else (*)</code>
+                <Badge tone={draft.permissions['*'] === 'allow' ? 'green' : draft.permissions['*'] === 'ask' ? 'amber' : 'gray'}>{draft.permissions['*']}</Badge>
+              </div>
+            ) : null}
+            {KNOWN_MODE_TOOLS.filter((t) => draft.permissions[t] !== undefined).map((tool) => (
+              <div key={tool} className="flex items-center justify-between gap-2 rounded-lg border border-line px-3 py-2 text-[13px]">
+                <code>{tool}</code>
+                <Badge tone={draft.permissions[tool] === 'allow' ? 'green' : draft.permissions[tool] === 'ask' ? 'amber' : 'gray'}>{draft.permissions[tool]}</Badge>
+              </div>
+            ))}
+            {customKeys.map((key) => (
+              <div key={key} className="flex items-center justify-between gap-2 rounded-lg border border-line px-3 py-2 text-[13px]">
+                <code className="truncate">{key}</code>
+                <Badge tone={draft.permissions[key] === 'allow' ? 'green' : draft.permissions[key] === 'ask' ? 'amber' : 'gray'}>{draft.permissions[key]}</Badge>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {onEdit !== undefined ? (
+        <Button variant="primary" size="sm" onClick={onEdit}><Icon name="pencil" size={13} />Edit mode</Button>
+      ) : (
+        <p className="m-0 text-xs text-fg-faint">Bundled modes are read-only. Duplicate to customize.</p>
+      )}
+    </div>
+  )
+}
+
 function ModeEditor({ draft, onDraft, disabled, isNew, newId, onNewId }: {
   readonly draft: ModeForm
   readonly onDraft: (next: ModeForm) => void
