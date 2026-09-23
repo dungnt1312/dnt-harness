@@ -108,18 +108,21 @@ describe('workspace lifecycle', () => {
 })
 
 describe('project binding', () => {
-  it('rejects overlapping and nested project roots across workspaces', async () => {
+  it('rejects overlapping and nested project roots within a workspace, but lets another workspace bind the same folder', async () => {
     const { ws } = await workspaces()
     await ws.boot()
     const a = await ws.create('WorkA')
     const b = await ws.create('WorkB')
 
     await ws.createProject(a.id, 'alpha', dirA)
-    // The same folder in another workspace:
-    await expect(ws.createProject(b.id, 'copy', dirA)).rejects.toMatchObject({ code: 'root-overlap' })
-    // A nested folder is inside the first root: refused too.
-    await expect(ws.createProject(b.id, 'nested', nested)).rejects.toMatchObject({ code: 'root-overlap' })
-    // A disjoint folder binds fine.
+    // Inside one workspace, the same or a nested folder would make two
+    // projects claim the same files: refused.
+    await expect(ws.createProject(a.id, 'copy', dirA)).rejects.toMatchObject({ code: 'root-overlap' })
+    await expect(ws.createProject(a.id, 'nested', nested)).rejects.toMatchObject({ code: 'root-overlap' })
+    // Another workspace may bind the same folder (one repo, several
+    // workspaces); concurrent writers are still serialized by the root lease.
+    const copy = await ws.createProject(b.id, 'copy', dirA)
+    expect(copy.workspaceId).toBe(b.id)
     const beta = await ws.createProject(b.id, 'beta', dirB)
     expect(beta.workspaceId).toBe(b.id)
   })

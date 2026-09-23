@@ -462,9 +462,14 @@ test('Agents, MCP, and Secrets expose destructive failures and explicit recovery
   await expect.poll(() => state.count('DELETE', '/api/workspaces/w/agents/fixture-agent')).toBe(2)
 
   await dialog.getByRole('tab', { name: /MCP/ }).click()
+  // Enabling starts a process as the user, so it asks first; the ask alone
+  // sends nothing.
   await dialog.getByRole('button', { name: 'Enable' }).click()
+  expect(state.count('POST', '/api/workspaces/w/mcp/fixture-mcp/enable')).toBe(0)
+  await dialog.getByRole('button', { name: 'Start server' }).click()
   await expect(dialog).toContainText('MCP enable refused')
   await dialog.getByRole('button', { name: 'Enable' }).click()
+  await dialog.getByRole('button', { name: 'Start server' }).click()
   await expect.poll(() => state.count('POST', '/api/workspaces/w/mcp/fixture-mcp/enable')).toBe(2)
 
   await dialog.getByRole('tab', { name: /Secrets/ }).click()

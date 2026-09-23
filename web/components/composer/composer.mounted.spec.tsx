@@ -85,6 +85,19 @@ function paste(text: string, files: readonly File[] = []): void {
 
 const settle = async (): Promise<void> => { await act(async () => { await new Promise((resolve) => setTimeout(resolve, 200)) }) }
 
+// jsdom ships no CSS.escape, which every browser has; the completion popover
+// uses it to find its active option by a React useId (":r1:"-style) id.
+if (typeof globalThis.CSS?.escape !== 'function') {
+  const escape = (value: string): string =>
+    value.replace(/^(\d)/, '\\3$1 ').replace(/[^a-zA-Z0-9_ -￿-]/g, (char) => `\\${char}`)
+  ;(globalThis as { CSS?: unknown }).CSS = { ...(globalThis.CSS ?? {}), escape }
+}
+// jsdom does no layout, so it has no scrollIntoView either; the popover only
+// uses it to keep the active option visible.
+if (typeof Element !== 'undefined' && typeof Element.prototype.scrollIntoView !== 'function') {
+  Element.prototype.scrollIntoView = function scrollIntoView(): void {}
+}
+
 beforeEach(() => {
   ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
   host = document.createElement('div')

@@ -98,6 +98,8 @@ async function fixture(page: Page, options: Options = {}): Promise<{ readonly po
     })
     if (path === '/api/workspaces/w/mode') return json(route, { modes: [{ id: 'chat', name: 'Chat', source: 'bundled' }, { id: 'full-access', name: 'Full access', source: 'bundled' }], selected: 'chat', revision: 1 })
     // Model selection is per conversation, with a global default behind it.
+    // Control-plane auth off: the shell loads without a pairing step.
+    if (path === '/api/auth/state' && method === 'GET') return json(route, { required: false, paired: true })
     if (path === '/api/model-defaults') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/model$/.test(path)) return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null, source: 'session' })
     if (path === '/api/workspaces/w/skills') return json(route, [])
@@ -116,12 +118,15 @@ async function fixture(page: Page, options: Options = {}): Promise<{ readonly po
 
   const target = options.path ?? '/workspaces/w/sessions/s'
   await page.goto(target)
-  await expect(page.locator('[data-composer-input]')).toBeVisible()
+  // Readiness only: the webServer is Vite's dev server, whose first page load
+  // compiles modules on demand and can outlast the default 5 s expect.
+  const ready = { timeout: 20_000 }
+  await expect(page.locator('[data-composer-input]')).toBeVisible(ready)
   // The model picker names its scope: a conversation owns its own selection,
   // while with none open the same control edits the global default.
   await expect(page.getByRole('button', {
     name: target.includes('/sessions/') ? 'Conversation model (next request)' : 'Default model for new conversations',
-  })).toBeVisible()
+  })).toBeVisible(ready)
   expect(unexpected).toEqual([])
   return { posts: () => posts }
 }

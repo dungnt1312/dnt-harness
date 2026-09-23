@@ -1,13 +1,19 @@
 import { describe, expect, it, vi } from 'vitest'
 import { getModelDefaults, getSessionModel, setModelDefaults, setSessionModel } from './api.ts'
 
+/** Every call goes through apiFetch: same-origin credentials, a Headers bag. */
+type Call = [string, RequestInit]
+const callOf = (mock: ReturnType<typeof vi.fn>, index: number): Call => mock.mock.calls[index] as unknown as Call
+
 describe('session model API', () => {
   it('gets an encoded workspace/session model route', async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ provider: 'p', model: 'm', thinkingLevel: null, source: 'session' })))
     vi.stubGlobal('fetch', fetchMock)
     try {
       await expect(getSessionModel('workspace / 1', 'session / 1')).resolves.toEqual({ provider: 'p', model: 'm', thinkingLevel: null, source: 'session' })
-      expect(fetchMock).toHaveBeenCalledWith('/api/workspaces/workspace%20%2F%201/sessions/session%20%2F%201/model')
+      const [url, init] = callOf(fetchMock, 0)
+      expect(url).toBe('/api/workspaces/workspace%20%2F%201/sessions/session%20%2F%201/model')
+      expect(init.credentials).toBe('same-origin')
     } finally {
       vi.unstubAllGlobals()
     }
@@ -20,10 +26,12 @@ describe('session model API', () => {
     try {
       await expect(getModelDefaults()).resolves.toEqual(defaults)
       await expect(setModelDefaults(defaults)).resolves.toEqual(defaults)
-      expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/model-defaults')
-      expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/model-defaults', expect.objectContaining({
-        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(defaults),
-      }))
+      expect(callOf(fetchMock, 0)[0]).toBe('/api/model-defaults')
+      const [url, init] = callOf(fetchMock, 1)
+      expect(url).toBe('/api/model-defaults')
+      expect(init.method).toBe('PUT')
+      expect(new Headers(init.headers).get('content-type')).toBe('application/json')
+      expect(init.body).toBe(JSON.stringify(defaults))
     } finally {
       vi.unstubAllGlobals()
     }
@@ -34,11 +42,11 @@ describe('session model API', () => {
     vi.stubGlobal('fetch', fetchMock)
     try {
       await setSessionModel('w', 's', { provider: null, thinkingLevel: null })
-      expect(fetchMock).toHaveBeenCalledWith('/api/workspaces/w/sessions/s/model', expect.objectContaining({
-        method: 'PUT',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ provider: null, thinkingLevel: null }),
-      }))
+      const [url, init] = callOf(fetchMock, 0)
+      expect(url).toBe('/api/workspaces/w/sessions/s/model')
+      expect(init.method).toBe('PUT')
+      expect(new Headers(init.headers).get('content-type')).toBe('application/json')
+      expect(init.body).toBe(JSON.stringify({ provider: null, thinkingLevel: null }))
     } finally {
       vi.unstubAllGlobals()
     }

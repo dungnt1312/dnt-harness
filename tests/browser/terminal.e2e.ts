@@ -20,6 +20,9 @@ const TERMINAL = {
   workspaceId: 'w',
   shellId: 'bash',
   label: 'Git Bash',
+  // Terminals are per project; the fixture session is bound to project `p`,
+  // and a shell from another project is kept off this view.
+  projectId: 'p',
   cwd: 'C:/fixture/project',
   cols: 80,
   rows: 24,
@@ -87,6 +90,8 @@ async function fixture(page: Page, options: { readonly shells?: readonly { id: s
     })
     if (path === '/api/workspaces/w/mode') return json(route, { modes: [{ id: 'chat', name: 'Chat', source: 'bundled' }], selected: 'chat', revision: 1 })
     if (path === '/api/workspaces/w/skills') return json(route, [])
+    // Control-plane auth off: the shell loads without a pairing step.
+    if (path === '/api/auth/state' && method === 'GET') return json(route, { required: false, paired: true })
     if (path === '/api/model-defaults') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null })
     if (path === '/api/workspaces/w/sessions/s/model') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null, source: 'session' })
     if (path === '/api/workspaces/w/projects/p/files') return json(route, { path: '', entries: [] })
@@ -110,7 +115,8 @@ async function fixture(page: Page, options: { readonly shells?: readonly { id: s
   })
 
   await page.goto('/workspaces/w/sessions/s')
-  await expect(page.locator('[data-composer-input]')).toBeVisible()
+  // Readiness only: Vite's dev server compiles on the first load.
+  await expect(page.locator('[data-composer-input]')).toBeVisible({ timeout: 20_000 })
   expect(unexpected).toEqual([])
 
   await selectWorkbenchView(page, 'Terminal')
