@@ -50,6 +50,11 @@ export interface ApprovalLifecycle {
    */
   readonly approvalId: string
   readonly done: Promise<void>
+  /**
+   * Epoch ms at which this question expires undecided. Bridges surface it so
+   * a human can see the decision window instead of watching a card vanish.
+   */
+  readonly expiresAt: number
 }
 
 /** Options for attaching an approval policy. */
@@ -87,7 +92,7 @@ interface PendingEntry {
   readonly mode: ApprovalMode
   /** Immutable execution scope — a control change in another workspace must never touch this entry. */
   readonly workspaceId: string | undefined
-  readonly sessionId: string | undefined
+  readonly sessionId: SessionId | undefined
   /** Settles the answerer-side lifecycle (retire the transport question). */
   done(): void
   resolve(entry: Settlement): void
@@ -98,16 +103,21 @@ function readPolicy(source: PolicySource | undefined): Record<string, ApprovalMo
   return canonicalPolicy(raw) as Record<string, ApprovalMode>
 }
 
-/** Exact policy, then `mcp__server__*`; all MCP tools default to ask. */
+/**
+ * Exact name, then `mcp__server__*`, then the catch-all `*`, then
+ * `defaultMode`. MCP is not a special default: `--yolo` (`defaultMode:
+ * 'allow'`) and a workspace `*` both apply to it. `forceAsk` still
+ * overrides this for tools annotated as requiring interaction.
+ */
 function modeFor(policy: Readonly<Record<string, ApprovalMode>>, tool: string, defaultMode: ApprovalMode): ApprovalMode {
   const exact = policy[tool]
   if (exact !== undefined) return exact
   if (tool.startsWith('mcp__')) {
     const parts = tool.split('__')
     const wildcard = parts.length >= 3 ? policy[`mcp__${parts[1]}__*`] : undefined
-    return wildcard ?? 'ask'
+    if (wildcard !== undefined) return wildcard
   }
-  return defaultMode
+  return policy['*'] ?? defaultMode
 }
 
 /**
@@ -134,10 +144,24 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
   const recorder = (): { session: RecordingSession; sessionId: SessionId; workspaceId: string | undefined } | undefined => {
     const scope = agentScope.getStore()
     if (scope === undefined) return undefined
+    const session = recordingSession(scope.sessionId)
+    if (session === undefined) return undefined
+    return { session, sessionId: scope.sessionId, workspaceId: scope.workspaceId }
+  }
+
+  /**
+   * The session that records one entry's decision, resolved by ITS OWN id
+   * rather than by ambient scope. A settlement also arrives from a policy
+   * change or a mode switch — an HTTP request with no agent in flight — and
+   * a decision the log never saw is an authorization the audit cannot
+   * explain, including the Always-allow that let the call proceed.
+   */
+  function recordingSession(sessionId: SessionId | undefined): RecordingSession | undefined {
+    if (sessionId === undefined) return undefined
     const sessions = ctx.get('sessions') as { get(id: SessionId): RecordingSession } | undefined
     if (sessions === undefined) return undefined
     try {
-      return { session: sessions.get(scope.sessionId), sessionId: scope.sessionId, workspaceId: scope.workspaceId }
+      return sessions.get(sessionId)
     } catch {
       return undefined
     }
@@ -152,16 +176,16 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
   const settle = async (entry: PendingEntry, decision: 'allow' | 'deny' | 'expired' | 'cancelled', reason?: string): Promise<void> => {
     if (!pending.delete(entry.approvalId)) return
     entry.done()
-    const record = recorder()
-    if (record !== undefined) {
-      record.session.append({
-        type: 'approval/decision',
-        approvalId: entry.approvalId,
-        decision,
-        ...(reason !== undefined ? { reason } : {}),
-      })
+    const session = recordingSession(entry.sessionId)
+    if (session !== undefined) {
       try {
-        await record.session.durable()
+        session.append({
+          type: 'approval/decision',
+          approvalId: entry.approvalId,
+          decision,
+          ...(reason !== undefined ? { reason } : {}),
+        })
+        await session.durable()
       } catch (error) {
         if (decision === 'allow') {
           entry.resolve({
@@ -178,10 +202,14 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
   ctx.on('tools/pre-execute', async (payload: { call: ToolCall; exec: ToolExecution }, next: (replacement?: { call: ToolCall }) => Promise<PreExecuteDecision>): Promise<PreExecuteDecision> => {
     const call = canonicalCall(payload.call)
     const policy = readPolicy(options.policy)
-    const mode = options.forceAsk?.(call) === true ? 'ask' : modeFor(policy, call.name, defaultMode)
+    const baseMode = modeFor(policy, call.name, defaultMode)
+    const mode = baseMode === 'allow' && options.forceAsk?.(call) === true ? 'ask' : baseMode
     if (mode === 'allow') return next()
     if (mode === 'deny') {
       return { kind: 'deny', reason: `policy denies '${call.name}'` }
+    }
+    if (payload.exec.signal?.aborted === true) {
+      return { kind: 'deny', reason: `cancelled: stop requested while awaiting approval for '${call.name}'` }
     }
     if (options.askUser === undefined) {
       return { kind: 'deny', reason: `approval required for '${call.name}' but no askUser answerer is configured` }
@@ -215,6 +243,7 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
         resolve,
       }
       pending.set(approvalId, pendingEntry)
+      const expiresAt = Date.now() + expiryMs
       const timer = setTimeout(() => {
         void settle(pendingEntry, 'expired', `approval for '${call.name}' expired undecided`)
       }, expiryMs)
@@ -223,7 +252,8 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
         void settle(pendingEntry, 'cancelled', `cancelled: stop requested while awaiting approval for '${call.name}'`)
       }
       payload.exec.signal?.addEventListener('abort', onAbort, { once: true })
-      void options.askUser?.(call, { approvalId, done }).then((allowed) => {
+      if (payload.exec.signal?.aborted === true) onAbort()
+      void options.askUser?.(call, { approvalId, done, expiresAt }).then((allowed) => {
         payload.exec.signal?.removeEventListener('abort', onAbort)
         clearTimeout(timer)
         // Re-read the live policy: an approval cannot override a deny that
@@ -255,7 +285,8 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
           void settle(entry, 'cancelled', `mode change: '${entry.call.name}' is no longer exposed`)
           continue
         }
-        const mode = options.forceAsk?.(entry.call) === true ? 'ask' : modeFor(policy, entry.call.name, defaultMode)
+        const baseMode = modeFor(policy, entry.call.name, defaultMode)
+        const mode = baseMode === 'allow' && options.forceAsk?.(entry.call) === true ? 'ask' : baseMode
         if (mode === 'deny') {
           void settle(entry, 'deny', `policy now denies '${entry.call.name}'`)
           continue

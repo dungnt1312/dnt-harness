@@ -191,11 +191,13 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
         if (prev === null) return prev
         return {
           ...prev,
-          customRules: prev.customRules.map((r) =>
-            r.id === editing.id
-              ? { ...r, pattern, isRegex: draftIsRegex, action: draftAction, ...(draftDesc.trim() !== '' ? { description: draftDesc.trim() } : { description: undefined }) } as CustomRule
-              : r,
-          ),
+          customRules: (prev.customRules.map((r) => {
+              if (r.id !== editing.id) return r
+              const { description: _old, ...base } = r
+              return draftDesc.trim() === ''
+                ? { ...base, pattern, isRegex: draftIsRegex, action: draftAction }
+                : { ...base, pattern, isRegex: draftIsRegex, action: draftAction, description: draftDesc.trim() }
+            }) as unknown as readonly CustomRule[]),
         }
       })
     }

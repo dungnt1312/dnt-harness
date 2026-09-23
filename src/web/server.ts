@@ -305,7 +305,6 @@ export interface PublicProvider {
   readonly enabled: boolean
   readonly keyMasked: string
   readonly models: readonly string[]
-  readonly defaultModel?: string | undefined
   /** Per-model operator overrides (context window, vision, thinking default). */
   readonly modelSettings?: Readonly<Record<string, ModelSettings>>
 }
@@ -318,7 +317,6 @@ function publicProvider(entry: ProviderConfig): PublicProvider {
     enabled: entry.enabled,
     keyMasked: maskKey(entry.apiKey),
     models: [...entry.models],
-    ...(entry.defaultModel !== undefined ? { defaultModel: entry.defaultModel } : {}),
     ...(entry.modelSettings !== undefined ? { modelSettings: entry.modelSettings } : {}),
   }
 }
@@ -393,7 +391,6 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         baseUrl: process.env['DEEPSEEK_BASE_URL']?.trim() || 'https://api.deepseek.com',
         apiKey: key,
         models: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v4-flash', 'deepseek-v4-pro'],
-        defaultModel: 'deepseek-chat',
         enabled: true,
       }]
       durableDefaults = repairDefaults(durableDefaults, list)
@@ -430,7 +427,6 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       apiKey: entry.apiKey,
       baseUrl: entry.baseUrl,
       ...(entry.models.length > 0 ? { models: entry.models } : {}),
-      ...(entry.defaultModel !== undefined ? { defaultModel: entry.defaultModel } : {}),
     })
 
   const injectionNames = (): readonly string[] =>
@@ -1794,7 +1790,10 @@ async function handleApi(
         const session = deps.kernel.ctx.sessions.create(wsId)
         const defaults = deps.defaults()
         // Snapshot global defaults so later changes apply to future sessions
-        // only. Explicit null thinking preserves "use model default".
+        // only. The global pair tracks the model actually in use (a
+        // conversation model change repoints it), so a new conversation opens
+        // on what the operator was last chatting with. Explicit null thinking
+        // preserves "use model default".
         session.append({
           type: 'session/model',
           provider: defaults.provider,
@@ -3344,7 +3343,20 @@ async function handleApi(
         send(404, { error: 'no such provider' })
         return
       }
-      const outcome = await pingCompletions(entry)
+      // An optional body names the exact model to ping, so the Settings model
+      // list can verify one row. Without it the provider's first model stands in.
+      const body = await readJson(req).catch(() => ({})) as Record<string, unknown>
+      const requested = body['model']
+      if (requested !== undefined && (typeof requested !== 'string' || requested === '')) {
+        send(400, { error: "'model' must be a non-empty string" })
+        return
+      }
+      const model = typeof requested === 'string' ? requested : entry.models[0]
+      if (model === undefined) {
+        send(400, { error: 'no model to test; add a model ID to this provider first' })
+        return
+      }
+      const outcome = await pingCompletions(entry, model)
       send(outcome.ok ? 200 : 502, outcome)
       return
     }
@@ -3361,9 +3373,7 @@ async function handleApi(
           const models = extractModelIds(await response.json())
           if (models.length === 0) return { providers, defaults, result: { ok: false as const, status: 502, error: 'model list came back empty' } }
           return {
-            providers: providers.map((candidate) => candidate.id === id
-              ? { ...candidate, models, ...(candidate.defaultModel === undefined ? { defaultModel: models[0]! } : {}) }
-              : candidate),
+            providers: providers.map((candidate) => candidate.id === id ? { ...candidate, models } : candidate),
             defaults,
             result: { ok: true as const, models },
           }
@@ -3650,6 +3660,24 @@ async function putSessionModel(
     deps.unavailableSessions.add(entry.session.id)
     return { ok: false, status: 500, error: `session model could not be persisted; session is unavailable until restart: ${String(error instanceof Error ? error.message : error)}` }
   }
+  // The global default is the "model last chosen" pointer: repoint it whenever
+  // a conversation adopts a model, so the NEXT conversation opens on it without
+  // the operator re-picking. Only an explicit pair does this — a thinking-only
+  // edit is conversation-scoped and must never repoint the global model. This
+  // is a convenience pointer, so a failed write must not fail the model switch
+  // that already committed durably to this session.
+  if ((provider !== undefined || model !== undefined) && hasProvider && hasModel) {
+    const steady = deps.defaults()
+    if (steady.provider !== resultingProvider || steady.model !== resultingModel) {
+      await deps.mutateProviderStore(({ providers, defaults }) => ({
+        providers,
+        defaults: { provider: resultingProvider, model: resultingModel, thinkingLevel: defaults.thinkingLevel },
+        result: undefined,
+      }), { clearRuntimeModelOverride: true }).catch((error: unknown) => {
+        console.error(`web: global default could not follow session ${entry.session.id}: ${String(error instanceof Error ? error.message : error)}`)
+      })
+    }
+  }
   return { ok: true }
 }
 
@@ -3667,12 +3695,10 @@ async function putModel(
   const current = deps.defaults()
   const provider = rawProvider ?? current.provider
   if (provider === null || provider === undefined || provider === '') return { ok: false, status: 400, error: 'no provider configured yet' }
-  let model = rawModel === '' ? undefined : rawModel
-  if (model === undefined) {
-    const configured = deps.providers().find((entry) => entry.id === provider)
-    model = current.provider === provider ? current.model ?? undefined : configured?.defaultModel ?? configured?.models[0]
-  }
-  if (model === undefined || model === '') return { ok: false, status: 400, error: 'no model configured yet' }
+  // The model is never inferred from the provider: an operator switching
+  // providers must name the model, so a stale guess can never be billed or run.
+  if (rawModel === undefined || rawModel === '') return { ok: false, status: 400, error: "body needs a non-empty string 'model'" }
+  const model = rawModel
   try {
     deps.validateProviderModel(provider, model)
   } catch (error) {
@@ -3898,10 +3924,8 @@ async function createProvider(
   const entry = await deps.mutateProviderStore(({ providers, defaults }) => {
     const base = slugify(name); let id = base; let bump = 2
     while (providers.some((candidate) => candidate.id === id)) id = `${base}-${bump++}`
-    const requestedDefault = typeof body['defaultModel'] === 'string' && models.includes(body['defaultModel']) ? body['defaultModel'] : undefined
     const created: ProviderConfig = {
-      id, name, baseUrl: baseUrl.replace(/\/$/, ''), apiKey, models,
-      ...(requestedDefault !== undefined ? { defaultModel: requestedDefault } : models.length > 0 ? { defaultModel: models[0] } : {}), enabled: true,
+      id, name, baseUrl: baseUrl.replace(/\/$/, ''), apiKey, models, enabled: true,
       ...((): { modelSettings?: Record<string, ModelSettings> } => {
         const sanitized = sanitizeModelSettings(body['modelSettings'] ?? body['contextLimits'])
         return sanitized !== undefined ? { modelSettings: sanitized } : {}
@@ -3932,7 +3956,6 @@ async function patchProvider(
     if (typeof body['apiKey'] === 'string') entry = { ...entry, apiKey: body['apiKey'].trim() }
     if (typeof body['enabled'] === 'boolean') entry = { ...entry, enabled: body['enabled'] }
     if (models !== undefined) entry = { ...entry, models }
-    if (typeof body['defaultModel'] === 'string' && body['defaultModel'] !== '') entry = { ...entry, defaultModel: body['defaultModel'] }
     if (isRecord(body['modelSettings']) || isRecord(body['contextLimits'])) {
       const sanitized = sanitizeModelSettings(body['modelSettings'] ?? body['contextLimits'])
       if (sanitized !== undefined) entry = { ...entry, modelSettings: sanitized }
@@ -3985,7 +4008,7 @@ async function pingCompletions(entry: ProviderConfig): Promise<{ ok: true } | { 
       method: 'POST',
       headers: { 'content-type': 'application/json', ...authHeaders(entry) },
       body: JSON.stringify({
-        model: entry.defaultModel ?? entry.models[0] ?? 'test',
+        model: entry.models[0] ?? 'test',
         messages: [{ role: 'user', content: 'ping' }],
         max_tokens: 1,
         stream: false,

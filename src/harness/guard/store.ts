@@ -151,6 +151,13 @@ function validateConfig(config: unknown): asserts config is DangerousCommandsCon
     throw new Error(`invalid config: v must be 1, got ${String(obj['v'])}`)
   }
 
+  const allowedTopKeys = new Set(['v', 'presets', 'customRules'])
+  for (const key of Object.keys(obj)) {
+    if (!allowedTopKeys.has(key)) {
+      throw new Error(`invalid config: unknown top-level key '${key}'`)
+    }
+  }
+
   const presets = obj['presets']
   if (presets === null || typeof presets !== 'object' || Array.isArray(presets)) {
     throw new Error('invalid config: presets must be an object')
@@ -182,10 +189,29 @@ function validateConfig(config: unknown): asserts config is DangerousCommandsCon
   if (customRules.length > 100) {
     throw new Error('invalid config: customRules exceeds 100 entries')
   }
+  const seenIds = new Set<string>()
   for (let i = 0; i < customRules.length; i++) {
     const rule = customRules[i] as Record<string, unknown>
     if (rule === null || typeof rule !== 'object' || Array.isArray(rule)) {
       throw new Error(`invalid config: customRules[${i}] must be an object`)
+    }
+    const allowedRuleKeys = new Set(['id', 'pattern', 'isRegex', 'action', 'description'])
+    for (const key of Object.keys(rule)) {
+      if (!allowedRuleKeys.has(key)) {
+        throw new Error(`invalid config: customRules[${i}] has unknown key '${key}'`)
+      }
+    }
+    const id = rule['id']
+    if (typeof id !== 'string' || id.trim() === '') {
+      throw new Error(`invalid config: customRules[${i}].id must be a non-empty string`)
+    }
+    if (seenIds.has(id)) {
+      throw new Error(`invalid config: customRules[${i}] duplicate id '${id}'`)
+    }
+    seenIds.add(id)
+    const desc = rule['description']
+    if (desc !== undefined && typeof desc !== 'string') {
+      throw new Error(`invalid config: customRules[${i}].description must be a string`)
     }
     const action = rule['action']
     if (typeof action !== 'string' || !CUSTOM_ACTIONS.has(action)) {

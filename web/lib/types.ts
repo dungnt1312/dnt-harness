@@ -129,7 +129,6 @@ export interface ProviderSummary {
   readonly enabled: boolean
   readonly keyMasked: string
   readonly models: readonly string[]
-  readonly defaultModel?: string
   /** Per-model operator overrides (context window, vision, thinking default). */
   readonly modelSettings?: Readonly<Record<string, ModelSettings>>
 }
@@ -142,7 +141,6 @@ export interface ProviderInput {
   readonly apiKey?: string
   readonly enabled?: boolean
   readonly models?: readonly string[]
-  readonly defaultModel?: string
   /** Replaces the whole per-model settings map when present. */
   readonly modelSettings?: Readonly<Record<string, ModelSettings>>
 }
