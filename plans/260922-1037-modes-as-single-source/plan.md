@@ -1,8 +1,29 @@
 # Modes as the single source of permission
 
-Status: **proposed** — awaiting approval to execute
+Status: **completed** (verified 2026-09-24; see Delivery)
 Branch: `feat/workbench-terminal` (38 files dirty; see Risks)
 Created: 2026-09-22
+
+## Delivery (verified 2026-09-24)
+
+Shipped on `main` through `a932b97` and the Settings follow-ups `c8b91db` /
+`51d1f94`. Checked against the acceptance criteria on the current tree:
+
+1. Modes authoring lives in Settings — now a nested subtab of **Permissions**
+   (`c8b91db` merged Modes and Dangerous Commands there), with view-on-click
+   detail (`51d1f94`). This is the only deviation from "a Modes tab".
+2. `PolicyPopover.tsx` is gone; the composer carries the mode menu only.
+3. `web/components/chat/ApprovalBar.tsx` offers exactly Allow once / Deny.
+4. `effectivePolicy` (`src/web/server.ts`) reads only the selected mode's
+   `permissionDefaults`; `PUT /api/workspaces/:id/policy` and `PUT /api/policy`
+   are 404 (`tests/web/server-g3.spec.ts`). A non-empty `policy.json` is
+   renamed to `policy.json.migrated` once, with collision/malformed/empty
+   cases preserved and logged, as decided under Migration.
+5. `--yolo` maps `ask → allow` and keeps `deny`.
+6. `permissionDefaults` keys accept `mcp__<server>__<tool>`,
+   `mcp__<server>__*`, and `*` (`src/harness/modes/service.ts`).
+7. `npm test`, `npm run typecheck`, `npm run build:web`, and
+   `npm run test:browser` (69/69) are green.
 
 ## Outcome
 
