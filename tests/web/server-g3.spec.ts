@@ -94,9 +94,8 @@ describe('live mode control', () => {
 
     const { id } = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
     await post(base, `/api/workspaces/${wsId}/sessions/${id}/messages`, { content: 'hello' })
-    await new Promise((resolve) => setTimeout(resolve, 250))
+    await expect.poll(() => requests.length, { timeout: 5_000 }).toBe(1)
 
-    expect(requests).toHaveLength(1)
     expect(requests[0]?.tools).toBeUndefined()
     // Unknown modes are refused; the selector validates.
     expect((await fetch(`${base}/api/workspaces/${wsId}/mode`, {

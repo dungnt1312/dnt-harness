@@ -289,8 +289,12 @@ a server; stdin errors now fail the transport instead of escaping
 delegation test (asserting the root's third step before it ran) now polls.
 Agent-tool coverage added: `list` shows only the caller root's children,
 `reconcile` ignores a sibling root's child, and the inheritance projection
-drops tool traffic and unlabelled fragments. Still flaky under full-suite
-load only: the documented `bash.spec.ts` orphan-marker race.
+drops tool traffic and unlabelled fragments. The `bash.spec.ts` orphan-marker
+"flake" was a real Windows orphan (2/12 escapes under CPU load): a process
+forked while `taskkill /T` killed its parent is unreachable by any later
+tree walk. The Bash tool now tags each call's environment and sweeps MSYS
+processes by that tag after the kill (0/20 escapes; full suite clean on
+10 of 11 consecutive runs).
 
 ## Risks
 
