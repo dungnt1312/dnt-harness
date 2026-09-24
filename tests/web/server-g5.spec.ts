@@ -166,6 +166,45 @@ describe('G5 web MCP + hooks', () => {
     reader.cancel().catch(() => {})
   }, 20_000)
 
+  it('a repeated call is a new invocation with its own approval; the first grant is not reused', async () => {
+    let step = 0
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() {
+        step += 1
+        // The same action twice, as a model (or a user asking again) repeats it.
+        if (step === 1) { yield { type: 'toolCalls', calls: [{ id: 'first', name: 'mcp__fixture__interactive', args: {} }] }; return }
+        // Same call id on purpose: some providers restart their numbering, and
+        // an approved repeat must still be sent rather than answered from the
+        // earlier record.
+        if (step === 2) { yield { type: 'toolCalls', calls: [{ id: 'first', name: 'mcp__fixture__interactive', args: {} }] }; return }
+        yield { type: 'delta', delta: 'done' }
+      },
+    }
+    const { base, wsId, home } = await boot(provider)
+    const effects = path.join(home, 'side-effects.log')
+    await post(base, `/api/workspaces/${wsId}/mcp/fixture`, { transport: 'stdio', command: process.execPath, args: [mcpFixture], env: { SIDE_EFFECT_FILE: effects }, enabled: true, allowedTools: ['interactive'] })
+    await post(base, `/api/workspaces/${wsId}/mcp/fixture/enable`)
+    const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${session.id}/events`)
+    const reader = (response.body as ReadableStream).getReader()
+    void post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'interactive twice' })
+    const firstApproval = await waitApproval(reader)
+    await post(base, `/api/approvals/${firstApproval}`, { allow: true })
+    const secondApproval = await waitApproval(reader)
+    expect(secondApproval).not.toBe(firstApproval)
+    await post(base, `/api/approvals/${secondApproval}`, { allow: true })
+    for (let i = 0; i < 50 && step < 3; i++) await new Promise((resolve) => setTimeout(resolve, 100))
+    reader.cancel().catch(() => {})
+
+    // Two approvals, two dispatches, two remote effects — each its own invocation.
+    const journal = (await fs.readFile(path.join(home, 'workspaces', wsId, 'mcp', 'executions.jsonl'), 'utf8')).trim().split('\n')
+      .map((line) => JSON.parse(line) as { kind: string; invocationId: string })
+    const intents = journal.filter((record) => record.kind === 'dispatch_intent').map((record) => record.invocationId)
+    expect(new Set(intents).size).toBe(2)
+    expect((await fs.readFile(effects, 'utf8')).trim().split('\n')).toEqual(['interactive', 'interactive'])
+  }, 20_000)
+
   it('disable and host close cancel delayed in-flight MCP initialization (no late descriptors/process)', async () => {
     const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'x' } } }
     // Disable race.

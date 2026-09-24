@@ -1538,7 +1538,12 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
           const scopedClient = await ensureMcpServer(scope.workspaceId, serverName)
           const timeoutMs = scopedServer.timeoutMs ?? 15_000
           const started = Date.now()
-          const invocationId = exec.toolCallId && exec.toolCallId !== '' ? exec.toolCallId : randomUUID()
+          // Minted per execution, never taken from the model's call id: a
+          // provider may reuse call ids across turns or sessions, and a reused
+          // id would answer a freshly approved call from an old record without
+          // sending it. The pipeline executes each admitted call once, and
+          // recovery never re-executes, so there is nothing to de-duplicate.
+          const invocationId = `mcp-${randomUUID()}`
           const journal = await journalFor(scope.workspaceId)
           const dispatched = await dispatchToolCall({
             journal,
@@ -2236,9 +2241,16 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     testMcpServer,
     isDrifted: (workspaceId: string) => drifted.has(workspaceId),
     repairAudit: async (workspaceId: string) => {
-      const journal = journals.get(workspaceId)
-      if (journal?.faulted === true) {
-        return { ok: false as const, error: 'execution journal is still faulted; repair the file before clearing the audit block' }
+      // A faulted journal is reopened from disk: a transient fault (a full
+      // disk, a permission since fixed) recovers once the file validates,
+      // while a genuinely corrupt file still fails its checks and stays blocked.
+      if (journals.get(workspaceId)?.faulted === true) {
+        journals.delete(workspaceId)
+        try {
+          await journalFor(workspaceId)
+        } catch (error) {
+          return { ok: false as const, error: `execution journal is still faulted (${error instanceof Error ? error.message : String(error)}); repair the file before clearing the audit block` }
+        }
       }
       await clearAuditFault(auditFaultFile)
       return { ok: true as const }
