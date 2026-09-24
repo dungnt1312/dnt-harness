@@ -13,6 +13,8 @@ import type { IncomingMessage } from 'node:http'
 import { CSRF_HEADER, checkCanonicalOrigin, csrfTokensMatch } from './csrf.ts'
 
 export const SESSION_COOKIE = 'mini-dsh-session'
+/** Expires the browser's session cookie (logout, or a stale session found on load). */
+export const CLEARED_SESSION_COOKIE = `${SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`
 export const PAIRING_BODY_FIELD = 'code'
 
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000
@@ -66,6 +68,7 @@ export class ControlPlaneAuthService {
   private readonly sessions = new Map<string, BrowserSession>()
   private readonly bearers = new Map<string, BearerCredential>()
   private pairing: PairingChallenge | undefined
+  private operatorVerifier: Buffer | undefined
   private pairingFailures = 0
   private pairingLockedUntil = 0
   private generation = 1
@@ -104,6 +107,23 @@ export class ControlPlaneAuthService {
     const expiresAt = this.now() + PAIRING_TTL_MS
     this.pairing = { verifier: this.mac(code), expiresAt, consumed: false }
     return { code, expiresAt }
+  }
+
+  /**
+   * Arm the operator channel: whoever can read the data home's operator file
+   * (the same OS user that runs the host) may mint a fresh pairing code. That
+   * is the recovery path when the startup code expired or a browser was lost.
+   */
+  armOperatorKey(): string {
+    const key = randomBytes(32).toString('base64url')
+    this.operatorVerifier = this.mac(key)
+    return key
+  }
+
+  /** Constant-time check of a presented operator key. */
+  operatorKeyMatches(presented: string): boolean {
+    const verifier = this.operatorVerifier
+    return verifier !== undefined && presented !== '' && safeEqual(this.mac(presented), verifier)
   }
 
   /** True when a pairing code is waiting. The code itself is not returned. */
@@ -281,6 +301,11 @@ function bearerToken(header: string | string[] | undefined): string | undefined 
 function headerOne(header: string | string[] | undefined): string | undefined {
   if (Array.isArray(header)) return undefined
   return header
+}
+
+/** The session cookie's value from a raw `Cookie` header, valid or not. */
+export function readSessionCookie(header: string | undefined): string | undefined {
+  return readCookie(header, SESSION_COOKIE)
 }
 
 function readCookie(header: string | undefined, name: string): string | undefined {

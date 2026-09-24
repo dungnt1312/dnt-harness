@@ -30,6 +30,7 @@ import {
   setSessionModel,
   setModelDefaults,
   fetchAuthState,
+  setUnauthorizedHandler,
 } from './lib/api.ts'
 import { PairingGate } from './components/auth/PairingGate.tsx'
 import { decodeModelChoice, activeModelValue, modelOptions } from './lib/providers.ts'
@@ -223,9 +224,40 @@ export class ModelDefaultsCoordinator {
  * model state of its own. The active workspace is tab/navigation state:
  * switching it never touches a running Turn (execution scope is fixed
  * server-side), and the model selector writes the ACTIVE workspace's control.
+ *
+ * The shell mounts only once this browser is paired (or pairing is off), so
+ * every load it starts runs with a live session. A session refused mid-use
+ * unmounts it back to the gate; pairing again mounts it fresh.
  */
 export function App() {
   const [authReady, setAuthReady] = useState<boolean | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    void fetchAuthState().then(
+      (state) => { if (!cancelled) setAuthReady(!(state.required && !state.paired)) },
+      () => { if (!cancelled) setAuthReady(true) },
+    )
+    setUnauthorizedHandler(() => setAuthReady(false))
+    return () => {
+      cancelled = true
+      setUnauthorizedHandler(undefined)
+    }
+  }, [])
+
+  if (authReady === null) return <div className="h-dvh bg-bg" aria-busy="true" />
+  if (!authReady) {
+    return (
+      <div className="flex h-dvh items-center bg-bg text-fg">
+        <DocumentTitle name={undefined} />
+        <PairingGate onPaired={() => setAuthReady(true)} />
+      </div>
+    )
+  }
+  return <AppShell />
+}
+
+function AppShell() {
   const toast = useToast()
   const theme = useTheme()
   const initialRoute = useRef<AppRoute | null>(parseRoute(window.location.pathname))
@@ -1228,26 +1260,9 @@ export function App() {
     />
   )
 
-  useEffect(() => {
-    let cancelled = false
-    void fetchAuthState().then(
-      (state) => { if (!cancelled) setAuthReady(!(state.required && !state.paired)) },
-      () => { if (!cancelled) setAuthReady(true) },
-    )
-    return () => { cancelled = true }
-  }, [])
-
   const suggestions = draftProjectName !== undefined
     ? [`Explain ${draftProjectName}`, 'Find TODOs and likely bugs', `Plan a change in ${draftProjectName}`]
     : ['Explain how to register a project and get started', 'Help me plan a feature']
-  if (authReady === false) {
-    return (
-      <div className="flex h-dvh items-center bg-bg text-fg">
-        {documentTitle}
-        <PairingGate onPaired={() => setAuthReady(true)} />
-      </div>
-    )
-  }
 
   return (
     <>

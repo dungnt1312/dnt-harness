@@ -9,20 +9,39 @@ export function setCsrfToken(token: string | undefined): void {
   csrfToken = token
 }
 
-/** Whether this server expects a paired browser. A disabled control plane reports ready. */
-export function fetchAuthState(): Promise<{ required: boolean; paired: boolean }> {
-  return apiFetch('/api/auth/state').then((response) => json(response))
+/**
+ * Whether this browser is paired. A paired session also returns its CSRF
+ * token, so a reloaded page can mutate again. A disabled control plane
+ * reports ready.
+ */
+export async function fetchAuthState(): Promise<{ required: boolean; paired: boolean }> {
+  const state = await apiFetch('/api/auth/state').then((response) => json<{ required: boolean; paired: boolean; csrf?: string }>(response))
+  if (state.csrf !== undefined) setCsrfToken(state.csrf)
+  return { required: state.required, paired: state.paired }
+}
+
+let onUnauthorized: (() => void) | undefined
+
+/** Called whenever a request is refused for lack of a live session (expired, revoked, restarted host). */
+export function setUnauthorizedHandler(handler: (() => void) | undefined): void {
+  onUnauthorized = handler
 }
 
 /**
  * The only REST entry point. Credentials stay same-origin; unsafe methods
- * carry the CSRF header. A 401 means the browser still needs to pair.
+ * carry the CSRF header. A 401 means the browser needs to pair again, so the
+ * app is told to show the pairing gate instead of a bare HTTP error.
  */
-export function apiFetch(input: string, init: RequestInit = {}): Promise<Response> {
+export async function apiFetch(input: string, init: RequestInit = {}): Promise<Response> {
   const method = (init.method ?? 'GET').toUpperCase()
   const headers = new Headers(init.headers)
   if (method !== 'GET' && method !== 'HEAD' && csrfToken !== undefined) headers.set(CSRF_HEADER, csrfToken)
-  return fetch(input, { ...init, headers, credentials: 'same-origin' })
+  const response = await fetch(input, { ...init, headers, credentials: 'same-origin' })
+  if (response.status === 401 && !input.startsWith('/api/auth/')) {
+    csrfToken = undefined
+    onUnauthorized?.()
+  }
+  return response
 }
 
 export class HttpError extends Error {

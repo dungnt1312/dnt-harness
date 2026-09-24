@@ -509,6 +509,20 @@ bearer. Cookie mutations also need the CSRF header and the canonical Origin.
 That still does not protect against same-user malware or same-origin XSS, and
 it is not an authenticated TLS profile.
 
+Pairing is per browser. `GET /api/auth/state` reports whether *this* browser's
+session is live and, when it is, returns its CSRF token so a reloaded page can
+mutate again. A refused session (expired, revoked, or lost to a host restart —
+sessions are in memory) returns the page to the pairing gate, and the refusal
+clears the dead cookie so the browser can pair again.
+
+The startup line prints one code that expires in five minutes. For another
+code — a second browser, an expired code, or a lost session — run
+`npm run pair` (add `-- --data-dir <dir>` when the host uses one). It reads
+`<data-dir>/auth/operator.json`, which the running host publishes with its URL
+and a random key and removes on shutdown, and asks the host to mint a fresh
+code. Anyone who can read that file is the host's OS user, which is the trust
+boundary above; agent file tools cannot read the data home.
+
 A non-loopback `host` is **refused before anything is constructed**. This build
 has no authenticated TLS profile, so `unsafeNetworkBind` does not open a
 network bind. To reach the app from another machine, keep the server on

@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createWebServer, type WebServer } from 'mini-dsh'
+import { OPERATOR_HEADER, readOperatorChannel } from '../../src/web/operator-channel.ts'
 
 let server: WebServer | undefined
 let home = ''
@@ -65,6 +66,7 @@ describe('control-plane authentication', () => {
 
     const health = await raw(live.url, 'GET', '/api/health')
     expect(health.status).toBe(200)
+    expect(JSON.parse(health.body)).toEqual({ ok: true })
 
     const code = live.auth.issuePairingCode().code
     const paired = await raw(live.url, 'POST', '/api/auth/pair', {
@@ -110,6 +112,61 @@ describe('control-plane authentication', () => {
     expect(created.status).toBe(201)
   })
 
+  it('reports pairing per browser, restores CSRF after a reload, and clears a stale cookie', async () => {
+    const live = await start()
+    const before = await raw(live.url, 'GET', '/api/auth/state')
+    expect(JSON.parse(before.body)).toEqual({ required: true, paired: false })
+
+    const code = live.auth.issuePairingCode().code
+    const paired = await raw(live.url, 'POST', '/api/auth/pair', {
+      'content-type': 'application/json',
+      origin: live.auth.canonicalOrigin,
+    }, JSON.stringify({ code }))
+    const sessionCookie = String(paired.headers['set-cookie']).split(';')[0] ?? ''
+    const csrf = (JSON.parse(paired.body) as { csrf: string }).csrf
+
+    // A reloaded page recovers its CSRF token from the session it still holds.
+    const reloaded = await raw(live.url, 'GET', '/api/auth/state', { cookie: sessionCookie })
+    expect(JSON.parse(reloaded.body)).toEqual({ required: true, paired: true, csrf })
+
+    // Another browser is not paired just because someone else redeemed a code.
+    const other = await raw(live.url, 'GET', '/api/auth/state')
+    expect(JSON.parse(other.body)).toEqual({ required: true, paired: false })
+
+    // An expired or revoked session cookie is cleared, so the browser can pair again.
+    const stale = await raw(live.url, 'GET', '/api/auth/state', { cookie: 'mini-dsh-session=expired-session' })
+    expect(JSON.parse(stale.body)).toEqual({ required: true, paired: false })
+    expect(String(stale.headers['set-cookie'])).toContain('Max-Age=0')
+
+    // So is one refused mid-use by any privileged route.
+    live.auth.logoutAll()
+    const refused = await raw(live.url, 'GET', '/api/workspaces', { cookie: sessionCookie })
+    expect(refused.status).toBe(401)
+    expect(String(refused.headers['set-cookie'])).toContain('Max-Age=0')
+  })
+
+  it('lets the operator who can read the data home mint a fresh pairing code, and nobody else', async () => {
+    const live = await start()
+    const channel = await readOperatorChannel(home)
+    expect(channel.url).toBe(live.url)
+
+    const anonymous = await raw(live.url, 'POST', '/api/auth/pairing-code')
+    expect(anonymous.status).toBe(403)
+    const wrong = await raw(live.url, 'POST', '/api/auth/pairing-code', { [OPERATOR_HEADER]: 'not-the-key' })
+    expect(wrong.status).toBe(403)
+
+    const minted = await raw(live.url, 'POST', '/api/auth/pairing-code', { [OPERATOR_HEADER]: channel.key })
+    expect(minted.status).toBe(200)
+    const { code } = JSON.parse(minted.body) as { code: string }
+    const paired = await raw(live.url, 'POST', '/api/auth/pair', { 'content-type': 'application/json' }, JSON.stringify({ code }))
+    expect(paired.status).toBe(200)
+
+    // The channel is retired with the host, so a stale file never outlives it.
+    await live.close()
+    server = undefined
+    await expect(readOperatorChannel(home)).rejects.toThrow()
+  })
+
   it('rejects a bearer mixed with a cookie and fences the old generation after logout', async () => {
     const live = await start()
     const code = live.auth.issuePairingCode().code
@@ -141,6 +198,28 @@ describe('control-plane authentication', () => {
       'last-event-id': 'gen=1',
     })
     expect(stale.status).toBe(401)
+  })
+
+  it('ships no test bootstrap: no runtime switch in src/ can mint a session or skip auth', async () => {
+    // Tests mint codes through the in-process handle; operators through stdout
+    // or the operator channel. An env/test flag would be a production bypass.
+    const root = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')), '..', '..', 'src')
+    const offenders: string[] = []
+    let scanned = 0
+    const walk = async (dir: string): Promise<void> => {
+      for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name)
+        if (entry.isDirectory()) await walk(full)
+        else if (entry.name.endsWith('.ts')) {
+          scanned += 1
+          const text = await fs.readFile(full, 'utf8')
+          if (/\bVITEST\b|PLAYWRIGHT|NODE_ENV|MINI_DSH_TEST|testBootstrap/.test(text)) offenders.push(path.relative(root, full))
+        }
+      }
+    }
+    await walk(root)
+    expect(scanned).toBeGreaterThan(50)
+    expect(offenders).toEqual([])
   })
 
   it('refuses a non-loopback bind because there is no authenticated TLS profile', async () => {

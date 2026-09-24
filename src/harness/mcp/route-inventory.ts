@@ -8,7 +8,7 @@
  */
 
 export type RouteAuth = 'public' | 'authenticated'
-export type RouteCredential = 'none' | 'cookie+csrf' | 'scoped-bearer'
+export type RouteCredential = 'none' | 'cookie+csrf' | 'scoped-bearer' | 'operator-key'
 export type RouteOwner = 'phase-2-control-plane' | 'existing-host-guard' | 'static'
 
 export interface RouteInventoryEntry {
@@ -17,7 +17,7 @@ export interface RouteInventoryEntry {
   readonly pattern: string
   readonly auth: RouteAuth
   readonly credential: RouteCredential
-  readonly denial: 401 | 403 | 409 | null
+  readonly denial: 400 | 401 | 403 | 409 | null
   readonly owner: RouteOwner
   readonly clients: readonly ('browser' | 'cli' | 'headless' | 'pm2' | 'test')[]
   readonly notes: string
@@ -54,6 +54,12 @@ export const ROUTE_INVENTORY: readonly RouteInventoryEntry[] = [
   { id: 'attachments', methods: ['GET', 'POST'], pattern: '/api/workspaces/:id/attachments', auth: 'authenticated', credential: 'cookie+csrf', denial: 401, owner: 'phase-2-control-plane', clients: ['browser'], notes: 'Upload bytes.' },
   { id: 'legacy-sessions', methods: ['GET', 'POST', 'DELETE', 'PATCH'], pattern: '/api/sessions', auth: 'authenticated', credential: 'scoped-bearer', denial: 401, owner: 'phase-2-control-plane', clients: ['cli', 'headless', 'test'], notes: 'Memory-mode routes. Bearer is the non-browser credential.' },
   { id: 'meta', methods: ['GET'], pattern: '/api/meta', auth: 'public', credential: 'none', denial: null, owner: 'existing-host-guard', clients: ['browser', 'cli'], notes: 'Non-sensitive host metadata. Host allow-list still applies.' },
+  { id: 'health', methods: ['GET'], pattern: '/api/health', auth: 'public', credential: 'none', denial: null, owner: 'phase-2-control-plane', clients: ['browser', 'pm2', 'test'], notes: 'Liveness only: `{ ok: true }`.' },
+  { id: 'auth-state', methods: ['GET'], pattern: '/api/auth/state', auth: 'public', credential: 'none', denial: null, owner: 'phase-2-control-plane', clients: ['browser'], notes: 'This browser\'s pairing state; a live session also gets its CSRF token back, a dead cookie is cleared.' },
+  { id: 'auth-pair', methods: ['POST'], pattern: '/api/auth/pair', auth: 'public', credential: 'none', denial: 401, owner: 'phase-2-control-plane', clients: ['browser', 'test'], notes: 'Redeems a single-use code for a browser session. Refuses any cookie or query string.' },
+  { id: 'auth-pairing-code', methods: ['POST'], pattern: '/api/auth/pairing-code', auth: 'public', credential: 'operator-key', denial: 403, owner: 'phase-2-control-plane', clients: ['cli', 'test'], notes: 'Operator recovery (`npm run pair`): mints a code for whoever can read the data home\'s operator file.' },
+  { id: 'auth-logout', methods: ['POST'], pattern: '/api/auth/logout', auth: 'authenticated', credential: 'cookie+csrf', denial: 401, owner: 'phase-2-control-plane', clients: ['browser', 'cli'], notes: 'Revokes the caller\'s session or bearer and closes its streams.' },
+  { id: 'mcp-oauth-callback', methods: ['GET', 'POST'], pattern: '/api/mcp/oauth/callback', auth: 'public', credential: 'none', denial: 400, owner: 'phase-2-control-plane', clients: ['browser'], notes: 'Deposits an authorization code only; completion needs the initiating session.' },
 ]
 
 /** Privileged entries phase 2 must authenticate. A missing id is a contract break. */

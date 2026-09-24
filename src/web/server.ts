@@ -21,7 +21,8 @@
  * questions — answered by `POST /api/approvals/:id`.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import { bearerAllows, ControlPlaneAuthService, isPublicPath, SESSION_COOKIE } from './control-plane-auth.ts'
+import { bearerAllows, CLEARED_SESSION_COOKIE, ControlPlaneAuthService, isPublicPath, readSessionCookie } from './control-plane-auth.ts'
+import { OPERATOR_HEADER, publishOperatorChannel } from './operator-channel.ts'
 import { promises as fs, type Dirent } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
@@ -2243,6 +2244,9 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
 
   const publicHost = options.host ?? '127.0.0.1'
   deps.auth.bindOrigin(`http://${publicHost}:${address.port}`)
+  const retireOperatorChannel = deps.auth.enabled && options.home !== undefined
+    ? await publishOperatorChannel(options.home, { url: `http://${publicHost}:${address.port}`, key: deps.auth.armOperatorKey() })
+    : undefined
 
   return {
     url: `http://${publicHost}:${address.port}`,
@@ -2251,6 +2255,7 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     auth: deps.auth,
     close: async () => {
       mcpHostClosing = true
+      await retireOperatorChannel?.()
       for (const key of mcpConnecting.keys()) mcpCancelled.add(key)
       await Promise.allSettled([...mcpConnecting.values()])
       // SSE connections never drain on their own — a browser holds its
@@ -2423,7 +2428,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: HandlerDe
     return
   }
 
-  if (pathname === '/api/health' || pathname === '/api/auth/state' || pathname === '/api/auth/pair' || pathname === '/api/auth/logout') {
+  if (pathname === '/api/health' || pathname === '/api/auth/state' || pathname === '/api/auth/pair' || pathname === '/api/auth/pairing-code' || pathname === '/api/auth/logout') {
     await handleAuth(req, res, pathname, deps)
     return
   }
@@ -2436,7 +2441,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: HandlerDe
   if (pathname.startsWith('/api/') && deps.auth.enabled && !isPublicPath(pathname, req.method ?? 'GET')) {
     const decision = deps.auth.authenticate(req.headers, req.method ?? 'GET')
     if (!decision.ok) {
-      res.writeHead(decision.status, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+      // A dead session's cookie is cleared with the refusal: pairing refuses
+      // any request that still carries one, so leaving it would lock the
+      // browser out of pairing again.
+      const clear = decision.status === 401 && readSessionCookie(req.headers.cookie) !== undefined
+      res.writeHead(decision.status, { 'content-type': 'application/json', 'cache-control': 'no-store', ...(clear ? { 'set-cookie': CLEARED_SESSION_COOKIE } : {}) })
       res.end(JSON.stringify({ error: decision.reason }))
       return
     }
@@ -2506,7 +2515,20 @@ async function handleAuth(req: IncomingMessage, res: ServerResponse, pathname: s
     return
   }
   if (pathname === '/api/auth/state' && req.method === 'GET') {
-    send(200, { required: deps.auth.enabled, paired: !deps.auth.enabled || !deps.auth.pairingPending })
+    if (!deps.auth.enabled) {
+      send(200, { required: false, paired: true })
+      return
+    }
+    // Per browser: only this request's own session counts. A valid session
+    // hands back its CSRF token so a reloaded page can mutate again; a stale
+    // cookie is cleared, because pairing refuses any request carrying one.
+    const decision = deps.auth.authenticate(req.headers, 'GET')
+    if (decision.ok && decision.principal.kind === 'browser') {
+      send(200, { required: true, paired: true, ...(decision.csrf !== undefined ? { csrf: decision.csrf } : {}) })
+      return
+    }
+    const staleCookie = readSessionCookie(req.headers.cookie) !== undefined
+    send(200, { required: true, paired: false }, staleCookie ? { 'set-cookie': CLEARED_SESSION_COOKIE } : undefined)
     return
   }
   if (pathname === '/api/auth/pair' && req.method === 'POST') {
@@ -2532,6 +2554,18 @@ async function handleAuth(req: IncomingMessage, res: ServerResponse, pathname: s
     send(200, { csrf: redeemed.csrf }, { 'set-cookie': deps.auth.cookieHeader(redeemed.sessionId) })
     return
   }
+  if (pathname === '/api/auth/pairing-code' && req.method === 'POST') {
+    // Operator recovery: minting a code needs the key from the data home's
+    // operator file, never a browser session or a bearer.
+    const presented = req.headers[OPERATOR_HEADER]
+    if (!deps.auth.enabled || typeof presented !== 'string' || !deps.auth.operatorKeyMatches(presented)) {
+      send(403, { error: 'operator key rejected' })
+      return
+    }
+    const issued = deps.auth.issuePairingCode()
+    send(200, { code: issued.code, expiresAt: issued.expiresAt })
+    return
+  }
   if (pathname === '/api/auth/logout' && req.method === 'POST') {
     const decision = deps.auth.authenticate(req.headers, 'POST')
     if (!decision.ok) {
@@ -2547,7 +2581,7 @@ async function handleAuth(req: IncomingMessage, res: ServerResponse, pathname: s
         waiting.resolve(false)
       }
     }
-    send(200, { revoked: true }, { 'set-cookie': `${SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0` })
+    send(200, { revoked: true }, { 'set-cookie': CLEARED_SESSION_COOKIE })
     return
   }
   send(404, { error: 'no such auth route' })
