@@ -8,7 +8,7 @@
  */
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
-import { applyMigration, dryRunMigration } from '../harness/mcp/migration.ts'
+import { applyMigration, dryRunMigration, recoverMigrations } from '../harness/mcp/migration.ts'
 
 function arg(name: string): string | undefined {
   const index = process.argv.indexOf(name)
@@ -23,9 +23,17 @@ async function main(): Promise<void> {
     process.exitCode = 2
     return
   }
+  const apply = process.argv.includes('--apply')
+  // A previous run that died mid-way is settled first, so this run starts
+  // from the restored file rather than a half-migrated one.
+  if (apply) {
+    for (const settled of await recoverMigrations(dataDir)) {
+      process.stderr.write(`interrupted migration ${settled.backup}: ${settled.outcome}\n`)
+    }
+  }
   const file = path.join(dataDir, 'workspaces', workspace, 'mcp.json')
   const raw = await fs.readFile(file, 'utf8')
-  if (!process.argv.includes('--apply')) {
+  if (!apply) {
     const report = dryRunMigration(raw)
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`)
     return
