@@ -44,15 +44,25 @@ export function SessionFoldersChip({ workspaceId, sessionId, revision }: {
   }, [workspaceId, sessionId])
   useEffect(() => { void load() }, [load, revision])
 
-  const replace = async (roots: readonly FolderGrant[]): Promise<void> => {
+  /**
+   * Apply one edit, expressed against the CURRENT list. If an approval changed
+   * the list first (409), the edit is re-applied once to the fresh list, so
+   * neither the user's edit nor the approval's folder is lost.
+   */
+  const update = async (edit: (own: readonly FolderGrant[]) => readonly FolderGrant[]): Promise<void> => {
     if (view === null) return
     setBusy(true); setError(null)
     try {
-      setView(await setSessionGrants(workspaceId, sessionId, view.revision, roots))
+      try {
+        setView(await setSessionGrants(workspaceId, sessionId, view.revision, edit(view.roots)))
+      } catch (cause) {
+        if (!(cause instanceof HttpError && cause.status === 409)) throw cause
+        const fresh = await getSessionGrants(workspaceId, sessionId)
+        setView(await setSessionGrants(workspaceId, sessionId, fresh.revision, edit(fresh.roots)))
+      }
     } catch (cause) {
-      // Someone else (an approval) changed the list first: reload, keep the error.
-      if (cause instanceof HttpError && cause.status === 409) await load()
       setError(String(cause))
+      await load()
     } finally {
       setBusy(false)
     }
@@ -100,7 +110,7 @@ export function SessionFoldersChip({ workspaceId, sessionId, revision }: {
                     <Icon name="folder" size={13} className="shrink-0 text-fg-faint" />
                     <code className="min-w-0 flex-1 break-all font-mono" title={root.path}>{root.path}</code>
                     <span className="shrink-0 text-fg-faint">{root.access === 'write' ? 'read & write' : 'read only'}</span>
-                    <IconButton label={`Remove ${root.path}`} disabled={busy} onClick={() => void replace(own.filter((other) => other !== root))}>
+                    <IconButton label={`Remove ${root.path}`} disabled={busy} onClick={() => void update((current) => current.filter((other) => !sameFolder(other.path, root.path)))}>
                       <Icon name="close" size={13} />
                     </IconButton>
                   </li>
@@ -119,7 +129,10 @@ export function SessionFoldersChip({ workspaceId, sessionId, revision }: {
       <FolderPickerModal
         open={picking}
         onDismiss={() => setPicking(false)}
-        onConfirm={(picked) => { setPicking(false); void replace([...own, { path: picked, access }]) }}
+        onConfirm={(picked) => {
+          setPicking(false)
+          void update((current) => [...current.filter((other) => !sameFolder(other.path, picked)), { path: picked, access }])
+        }}
       />
     </>
   )

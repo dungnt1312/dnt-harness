@@ -122,6 +122,20 @@ describe('session folders chip', () => {
     expect(setSessionGrants).toHaveBeenCalledWith('w', 's', 2, [])
   })
 
+  it('re-applies a removal once to the fresh list when an approval changed it first', async () => {
+    const { HttpError } = await vi.importActual<typeof import('../../lib/api.ts')>('../../lib/api.ts')
+    vi.mocked(setSessionGrants).mockRejectedValueOnce(new HttpError(409, 'stale'))
+    // The fresh list carries a folder an approval added meanwhile.
+    vi.mocked(getSessionGrants)
+      .mockResolvedValueOnce({ revision: 2, roots: [{ path: 'D:/mine', access: 'write' }], effective: [{ path: 'D:/mine', access: 'write' }] })
+      .mockResolvedValueOnce({ revision: 3, roots: [{ path: 'D:/mine', access: 'write' }, { path: 'D:/approved', access: 'read' }], effective: [] })
+    await mount(<SessionFoldersChip workspaceId="w" sessionId="s" revision={0} />)
+    const trigger = host.querySelector('button[aria-label="Extra folders (1)"]') as HTMLButtonElement
+    await act(async () => { trigger.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })); trigger.click() })
+    await act(async () => button('Remove D:/mine').click())
+    expect(setSessionGrants).toHaveBeenLastCalledWith('w', 's', 3, [{ path: 'D:/approved', access: 'read' }])
+  })
+
   it('reloads when the stream reports a new grants revision', async () => {
     await mount(<SessionFoldersChip workspaceId="w" sessionId="s" revision={0} />)
     await act(async () => root!.render(<SessionFoldersChip workspaceId="w" sessionId="s" revision={1} />))

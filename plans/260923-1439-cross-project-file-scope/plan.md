@@ -86,7 +86,9 @@ Code review (7/10, no critical) — fixed: Win32 trailing dot/space and link/sho
 
 Follow-up (2026-09-24): added tests for bearer-principal rejection (`tests/web/folder-grants-auth.spec.ts`), retargeted project-grant follow and post-spawn parent grant invisibility (`tests/web/folder-grants.spec.ts`), read-only calls never leasing (`tests/web/cross-root-lease.spec.ts`). Real-backend browser walk-through (13 checks: approval card, session answer, chip, Settings extra folders) passed; it showed the session button truncating the folder name, fixed by keeping the path's end visible (`shortFolder`).
 
-Known gaps (not blocking): composer chip does not auto-retry once on 409 (reloads instead). Headless keeps a single root.
+The composer chip re-applies an edit once to the fresh list on 409, so an approval's folder added meanwhile is kept.
+
+By design (non-goal): headless keeps a single root; Bash is not confined by grants.
 
 ## Red Team Review
 
