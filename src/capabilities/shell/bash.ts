@@ -7,12 +7,14 @@
  *
  * One command, captured output, wall-clock timeout, cancellation via the
  * run's abort signal, and verified cleanup: the whole process tree dies
- * (process-group kill on POSIX, `taskkill /T` on Windows), and spawn errors
+ * (process-group kill on POSIX; `taskkill /T` plus an environment-tag sweep
+ * for orphaned MSYS forks on Windows), and spawn errors
  * settle the call instead of hanging it. Path checks confine file tools,
  * not shell access — a shell command can leave the workspace and nothing
  * here claims otherwise.
  */
 import { spawn, type ChildProcess } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { detectShell } from './detect.ts'
 import type { ToolDefinition, ToolExecution } from '../../harness/tools/types.ts'
 
@@ -33,12 +35,37 @@ export interface BashToolOptions {
   readonly executable?: string
 }
 
+/** Environment marker every process of one Bash call inherits (Windows only). */
+export const TREE_TAG_ENV = 'MINI_DSH_BASH_TREE'
+
+/**
+ * An MSYS script that SIGKILLs every process whose environment carries the
+ * tag. It sweeps for a fixed window rather than stopping at the first empty
+ * pass: under load, a shell the launcher was still creating when taskkill
+ * ran can appear later. Builtins only inside a pass — a fork per process
+ * would make each pass seconds long on Windows. The sweeper is spawned
+ * without the tag, so it never matches itself.
+ */
+export function sweepByTag(treeTag: string): string {
+  const entry = `${TREE_TAG_ENV}=${treeTag}`
+  return [
+    'for pass in 1 2 3 4 5 6 7 8 9 10 11 12; do',
+    '  for d in /proc/[0-9]*; do',
+    '    while IFS= read -r -d "" e; do',
+    `      if [ "$e" = '${entry}' ]; then kill -9 "\${d#/proc/}" 2>/dev/null; break; fi`,
+    '    done < "$d/environ" 2>/dev/null',
+    '  done',
+    '  sleep 0.25',
+    'done',
+  ].join('\n')
+}
+
 /**
  * Kill a spawned process tree. Best effort — the caller verifies through
  * the exit/close events, and the tool settles on `exit` after a kill so a
  * straggler grandchild holding the stdio pipes cannot stall the result.
  */
-function killTree(child: ChildProcess): void {
+function killTree(child: ChildProcess, shell: string, treeTag: string): void {
   if (child.pid === undefined) {
     child.kill('SIGKILL')
     return
@@ -51,6 +78,10 @@ function killTree(child: ChildProcess): void {
     killer.on('error', () => {
       child.kill('SIGKILL')
     })
+    // A process forked while the walk killed its parent is orphaned, so no
+    // later tree walk reaches it. It still carries the tree tag in its
+    // environment: sweep MSYS processes by that tag until none remain.
+    spawn(shell, ['-c', sweepByTag(treeTag)], { stdio: 'ignore', windowsHide: true }).on('error', () => {})
     setTimeout(() => {
       spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' }).on('error', () => {})
       child.kill('SIGKILL')
@@ -102,9 +133,10 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
         let killed = false
         let timer: ReturnType<typeof setTimeout> | undefined
         let graceTimer: ReturnType<typeof setTimeout> | undefined
+        const treeTag = randomUUID()
         const onAbort = (): void => {
           killed = true
-          killTree(child)
+          killTree(child, detection.executable as string, treeTag)
         }
         const finish = (output: string): void => {
           if (settled) return
@@ -143,6 +175,7 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
             // requiresRoot tool. The fallback retains direct-call compatibility.
             cwd: exec.root !== '' ? exec.root : fallbackCwd(),
             detached: true,
+            ...(process.platform === 'win32' ? { env: { ...process.env, [TREE_TAG_ENV]: treeTag } } : {}),
           })
         } catch (error) {
           finish(`error: bash spawn failed (${String(error)}); verify the shell at '${detection.hint}'`)
@@ -165,7 +198,7 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
 
         timer = setTimeout(() => {
           killed = true
-          killTree(child)
+          killTree(child, detection.executable as string, treeTag)
         }, kill)
         timer.unref?.()
 
