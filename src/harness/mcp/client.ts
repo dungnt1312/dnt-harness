@@ -340,14 +340,25 @@ class HttpTransport implements Transport {
       void this.notify('notifications/cancelled', { requestId: id, reason: 'client abort' }).catch(() => {})
     }
     signal?.addEventListener('abort', onAbort, { once: true })
-    const response = await this.post({ jsonrpc: '2.0', id, method, ...(params !== undefined ? { params } : {}) }, timeoutMs, signal)
-    signal?.removeEventListener('abort', onAbort)
-    const contentType = response.headers.get('content-type') ?? ''
-    if (contentType.includes('text/event-stream')) return this.readSseResult(response, id)
-    const body = (await response.json()) as { id?: unknown; result?: unknown; error?: unknown }
-    if (body.id !== id) throw new McpTransportError(`MCP response id mismatch: expected ${id}`)
-    if (body.error !== undefined) throw new McpTransportError('MCP JSON-RPC request failed')
-    return body.result
+    // Removed on every path: a failed request must not leave its listener on
+    // a signal that outlives it (a turn's signal spans many calls).
+    try {
+      const response = await this.post({ jsonrpc: '2.0', id, method, ...(params !== undefined ? { params } : {}) }, timeoutMs, signal)
+      const contentType = response.headers.get('content-type') ?? ''
+      if (contentType.includes('text/event-stream')) return await this.readSseResult(response, id)
+      let body: { id?: unknown; result?: unknown; error?: unknown }
+      try {
+        body = JSON.parse(await readBoundedText(response, MCP_LIMITS.maxFrameBytes)) as typeof body
+      } catch (error) {
+        if (error instanceof McpTransportError) throw error
+        throw new McpTransportError('MCP response is not valid JSON')
+      }
+      if (body.id !== id) throw new McpTransportError(`MCP response id mismatch: expected ${id}`)
+      if (body.error !== undefined) throw new McpTransportError('MCP JSON-RPC request failed')
+      return body.result
+    } finally {
+      signal?.removeEventListener('abort', onAbort)
+    }
   }
 
   async notify(method: string, params: unknown): Promise<void> {
@@ -434,6 +445,33 @@ class HttpTransport implements Transport {
 }
 
 
+/**
+ * Read a response body up to `maxBytes` of DECODED bytes. The runtime
+ * decompresses gzip/deflate/br transparently, so counting after decoding is
+ * what bounds a small compressed body that inflates to gigabytes.
+ */
+async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
+  if (response.body === null) return ''
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined)
+        throw new McpTransportError(`MCP response exceeds the ${maxBytes}-byte decoded limit`)
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
 function descriptorsFromList(raw: unknown, serverName: string): readonly McpToolDescriptor[] {
   const result = raw as { tools?: { name: string; description?: string; inputSchema?: unknown; annotations?: { readOnlyHint?: boolean; requiresUserInteraction?: boolean } }[] } | undefined
   const seen = new Set<string>()
@@ -498,7 +536,21 @@ export class McpServerClient {
       throw new McpTransportError(`server '${this.serverName}' is disabled by the circuit breaker`)
     }
     await this.ensureConnected()
+    const tools = await this.withRetry(() => this.fetchAllTools(this.config.timeoutMs ?? 15_000))
+    this.toolsCache = tools
+    return tools
+  }
+
+  /**
+   * The one discovery walk — initial list, health check, breaker recovery,
+   * and `tools/list_changed` all use it, so each sees every page under the
+   * same cursor and tool caps rather than a first page only.
+   */
+  private async fetchAllTools(timeoutMs: number): Promise<readonly McpToolDescriptor[]> {
+    const transport = this.transport
+    if (transport === undefined) throw new McpTransportError('tools/list needs a connected transport')
     const pages: McpToolDescriptor[] = []
+    const names = new Set<string>()
     const seenCursors = new Set<string>()
     let cursor: string | undefined
     let page = 0
@@ -506,15 +558,16 @@ export class McpServerClient {
       page += 1
       assertCursor(cursor, seenCursors, page)
       if (cursor !== undefined && cursor !== '') seenCursors.add(cursor)
-      const raw = await this.withRetry(async () =>
-        this.transport?.request('tools/list', cursor !== undefined ? { cursor } : {}, this.config.timeoutMs ?? 15_000))
-      pages.push(...descriptorsFromList(raw, this.serverName))
+      const raw = await transport.request('tools/list', cursor !== undefined ? { cursor } : {}, timeoutMs)
+      for (const descriptor of descriptorsFromList(raw, this.serverName)) {
+        if (names.has(descriptor.name)) throw new McpTransportError(`tools/list repeats '${descriptor.name}' across pages`)
+        names.add(descriptor.name)
+        pages.push(descriptor)
+      }
       if (pages.length > MCP_LIMITS.maxTools) throw new McpTransportError('tools/list exceeded the tool cap')
       cursor = (raw as { nextCursor?: unknown } | undefined)?.nextCursor as string | undefined
     } while (cursor !== undefined && cursor !== '')
-    this.toolsCache = pages
-    const tools = pages
-    return tools
+    return pages
   }
 
   cachedTools(): readonly McpToolDescriptor[] {
@@ -538,6 +591,10 @@ export class McpServerClient {
       await this.ensureConnected()
       if (this.retired) {
         throw new McpDispatchError('runtime generation was fenced', receiptForTransportFailure(false, 'not_connected'))
+      }
+      // A turn already stopping sends nothing; this is provably not dispatched.
+      if (signal?.aborted === true) {
+        throw new McpDispatchError('cancelled before the call was sent', receiptForTransportFailure(false, 'cancelled_before_send'))
       }
       sent = true
       const raw = await this.transport?.request('tools/call', { name: tool, arguments: args }, timeoutMs, signal)
@@ -593,8 +650,7 @@ export class McpServerClient {
       void (async () => {
         try {
           await this.ensureConnected()
-          const raw = await this.transport?.request('tools/list', {}, 5_000)
-          this.toolsCache = descriptorsFromList(raw, this.serverName)
+          this.toolsCache = await this.fetchAllTools(5_000)
           this.recordSuccess()
         } catch {
           this.recordFailure(new McpTransportError('health check failed'), onReconnected)
@@ -618,10 +674,7 @@ export class McpServerClient {
           await this.transport?.stop().catch(() => {})
           this.transport = undefined
           await this.ensureConnected(true)
-          const transport = this.transport as Transport | undefined
-          if (transport === undefined) throw new McpTransportError('reconnect produced no transport')
-          const raw = await transport.request('tools/list', {}, 5_000)
-          this.toolsCache = descriptorsFromList(raw, this.serverName)
+          this.toolsCache = await this.fetchAllTools(5_000)
           this.recordSuccess()
           await onReconnected()
           this.onAudit({ kind: 'reconnect', detail: this.serverName, durationMs: 0, isError: false })
@@ -647,13 +700,23 @@ export class McpServerClient {
       this.breakerState = 'half-open'
     }
     if (this.transport !== undefined && this.state === 'ready') return
+    // Single flight: concurrent callers share one connect. Two unshared
+    // connects would each build a transport, and the one overwritten would
+    // leak its process or session.
+    if (this.connecting === undefined) {
+      this.connecting = this.connect().finally(() => { this.connecting = undefined })
+    }
+    await this.connecting
+  }
+
+  private connecting: Promise<void> | undefined
+
+  private async connect(): Promise<void> {
     this.state = 'connecting'
     const onNotification = (method: string): void => {
-      if (method === 'notifications/tools/list_changed') {
-        void this.refreshToolsFromNotification()
-      }
+      if (method === 'notifications/tools/list_changed') this.refreshToolsFromNotification()
     }
-    this.transport =
+    const transport =
       this.config.transport === 'stdio'
         ? new StdioTransport(this.config, this.resolved.env ?? {}, onNotification)
         : new HttpTransport({
@@ -662,19 +725,44 @@ export class McpServerClient {
               ? { headers: this.resolved.headers ?? this.config.headers }
               : {}),
           }, this.resolved.bearerToken, onNotification)
-    await this.transport.start()
-    this.state = this.transport.state
+    this.transport = transport
+    this.transportsStarted += 1
+    await transport.start()
+    this.state = transport.state
   }
 
-  private async refreshToolsFromNotification(): Promise<void> {
-    try {
-      const raw = await this.transport?.request('tools/list', {}, this.config.timeoutMs ?? 15_000)
-      this.toolsCache = descriptorsFromList(raw, this.serverName)
-      await this.onReconnected?.()
-      this.onAudit({ kind: 'reconnect', detail: `${this.serverName}: tools/list_changed`, durationMs: 0, isError: false })
-    } catch {
-      this.recordFailure(new McpTransportError('tools/list_changed refresh failed'))
+  /** Transports this client has built; a reconnect storm must not grow it past one per connect. */
+  transportsStarted = 0
+
+  private refreshing: Promise<void> | undefined
+  private refreshAgain = false
+  /** Refreshes actually run, for observing notification coalescing. */
+  toolRefreshes = 0
+
+  /**
+   * A `tools/list_changed` storm collapses to one refresh in flight plus one
+   * follow-up: notifications that arrive during a refresh only ask for
+   * another pass, which then sees everything they announced.
+   */
+  private refreshToolsFromNotification(): void {
+    if (this.refreshing !== undefined) {
+      this.refreshAgain = true
+      return
     }
+    this.refreshing = (async () => {
+      do {
+        this.refreshAgain = false
+        this.toolRefreshes += 1
+        try {
+          this.toolsCache = await this.fetchAllTools(this.config.timeoutMs ?? 15_000)
+          await this.onReconnected?.()
+          this.onAudit({ kind: 'reconnect', detail: `${this.serverName}: tools/list_changed`, durationMs: 0, isError: false })
+        } catch {
+          this.recordFailure(new McpTransportError('tools/list_changed refresh failed'))
+          return
+        }
+      } while (this.refreshAgain && !this.retired)
+    })().finally(() => { this.refreshing = undefined })
   }
 
   private async withRetry<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
