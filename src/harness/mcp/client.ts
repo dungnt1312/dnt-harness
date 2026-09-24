@@ -139,6 +139,11 @@ class StdioTransport implements Transport {
         this.handleLine(line)
       }
     })
+    // A write after the server died (e.g. the watchdog killed it) emits EPIPE
+    // on stdin; unhandled, that event would crash the host process.
+    child.stdin?.on('error', (error: Error) => {
+      this.failPending(new McpTransportError(`stdin write failed: ${error.message}`))
+    })
     child.stderr?.on('data', (chunk: Buffer) => {
       // stderr = server logs; surfaced via diagnostics, never parsed.
       void chunk
