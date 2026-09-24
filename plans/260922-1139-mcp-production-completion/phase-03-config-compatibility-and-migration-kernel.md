@@ -1,7 +1,7 @@
 ---
 phase: 3
 title: "Config Compatibility and Migration Kernel"
-status: in-progress
+status: done
 priority: P1
 effort: "4-6 days"
 dependencies: [1, 2]
@@ -76,11 +76,11 @@ Config/secret/revocation changes use a mutation intent/commit pointer so multi-f
 - [x] Omitted-enabled legacy entries are quarantined and cannot auto-start.
 - [x] Legacy token references are accurately classified as external tokens.
 - [x] Migration dry-run performs no network/process/token/runtime mutation.
-- [ ] Backup/migration is idempotent, non-overwriting, restrictive, checksum-verified, and crash-recoverable. Checksummed backup is tested. Crash recovery of a torn migration is not.
+- [x] Backup/migration is idempotent, non-overwriting, restrictive, checksum-verified, and crash-recoverable. `tests/harness/mcp-migration.spec.ts` kills the run after every durable step; `recoverMigrations` (run at host start and by `migrate-mcp --apply`) restores the verified v1 bytes or marks an untouched run abandoned, twice-safe, and refuses a backup that fails its checksum. The marker now lands before the target changes, and the target is replaced atomically. Backup directories are unique (`mkdir` without `recursive`, random suffix). ACL preservation beyond `0o600`/`0o700` modes is not claimed on Windows.
 - [x] Unsafe older binaries refuse migrated data before opening MCP runtimes.
 - [x] Exactly one data-home owner can write/reconcile; lock loss fences dispatch.
-- [ ] Multi-file desired-state mutation has durable intent/commit recovery. MutationStore exists. A crash-window test for config plus secrets together is still open.
-- [ ] Concurrent config/secret mutations cannot silently overwrite one another. Config saves return 409 on a stale revision. Secret CAS is not covered by the same test.
+- [x] Multi-file desired-state mutation has durable intent/commit recovery. Secrets now go through `MutationStore` like config; `tests/web/mcp-desired-state.spec.ts` leaves both intents open and proves restart restores both, keeps a committed sibling, and is idempotent.
+- [x] Concurrent config/secret mutations cannot silently overwrite one another. Every config and secret write runs load → transform → save inside one per-workspace queue (`updateMcpConfig`/`updateMcpSecrets`), with the revision check inside the turn. Before this, 10 concurrent secret PUTs returned 9×500 and lost keys, an interleaved delete/disable/save dropped a server, and two saves on one stale revision both returned 201.
 - [x] Direct external edits cause drift/fencing and require authenticated import.
 
 ## Risk Assessment

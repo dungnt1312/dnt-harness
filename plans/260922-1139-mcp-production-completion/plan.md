@@ -110,7 +110,7 @@ type ToolOutcome = "success" | "error" | "indeterminate" | "audit_fault";
 |---|---|---|---|---|
 | 1 | [Threat Model and Compatibility Baseline](./phase-01-start.md) | P1 | None | Done |
 | 2 | [Local Control-Plane Authentication](./phase-02-local-control-plane-authentication.md) | P1 | 1 | Done |
-| 3 | [Config Compatibility and Migration Kernel](./phase-03-config-compatibility-and-migration-kernel.md) | P1 | 1, 2 | In progress |
+| 3 | [Config Compatibility and Migration Kernel](./phase-03-config-compatibility-and-migration-kernel.md) | P1 | 1, 2 | Done |
 | 4 | [Safe Tool Calls and Audit Integrity](./phase-04-safe-tool-calls-and-audit-integrity.md) | P1 | 1, 3 | In progress |
 | 5 | [Protocol and Transport Hardening](./phase-05-protocol-and-transport-hardening.md) | P1 | 1, 4 | In progress |
 | 6 | [Process Ownership and Resource Policy](./phase-06-process-ownership-and-resource-policy.md) | P1 | 3, 5 | In progress |
