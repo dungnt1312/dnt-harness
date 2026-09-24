@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: completed
 branch: feat/warm-studio-workbench
 spec: docs/superpowers/specs/2026-09-15-warm-studio-workbench-redesign-design.md
 superPlan: docs/superpowers/plans/2026-09-15-warm-studio-workbench-redesign.md
@@ -33,7 +33,7 @@ Rebuild `web/` as the approved Warm Studio workbench (top bar + left nav + cente
 | 4 | Fixed Composer dock + Approval safety | done | 3 |
 | 5 | Right panel — Context + Artifacts (pure projector) | done (pre-existing; see note) | 4 |
 | 6 | Settings — Radix/Tailwind migration with dirty/conflict parity | done (pre-existing; see note) | 5 |
-| 7 | Cleanup, docs, full matrix + self-review | pending | 6 |
+| 7 | Cleanup, docs, full matrix + self-review | done (2026-09-24; see Outcome) | 6 |
 
 Each phase must `typecheck` and keep its targeted suite green before the next starts.
 
@@ -83,6 +83,19 @@ Kept the `manage-*` semantic-class pattern as-is rather than rewriting it, for t
 the Phase 5 deviation: it is working, token-correct, pre-existing scope the spec predates, and a
 literal component-by-component Tailwind rewrite is a reasonable follow-up if the user wants strict
 "Tailwind utilities directly on every element" conformance rather than the semantic-class layer.
+
+## Outcome (2026-09-24)
+
+Phase 7 closed on the current `main`. `web/styles/` holds exactly `app.css`,
+`markdown.css`, `motion.css`. `npm run test:browser` 69/69 (axe, overflow,
+keyboard, touch-target and the 6-width screenshot matrix included);
+`npm test`, `npm run typecheck`, `npm run build:web` exit 0. The browser
+suite had drifted behind later work and was realigned, not weakened: fixtures
+now answer the per-conversation `GET …/grants` route, the settings-conflict
+matrix state picks tabs vs the mobile section select by viewport width
+instead of racing the dialog's first paint, and the manifest assertions
+follow the composer context meter (read once per settled conversation, not
+lazily per workbench view). The Phase 5/6 deviations above stand as accepted.
 
 ## Acceptance
 - Warm Studio palette (warm neutrals + terracotta) with verified contrast; no copied reference chrome.

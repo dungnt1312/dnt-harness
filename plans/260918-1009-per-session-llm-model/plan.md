@@ -1,7 +1,7 @@
 ---
 title: "Per-session LLM model"
 description: "Mỗi session có model riêng inside cùng workspace; đổi ở A không ảnh hưởng B"
-status: in-progress
+status: completed
 priority: P1
 effort: "1d"
 tags: [harness, web, llm]

@@ -1,5 +1,5 @@
 ---
-status: planned
+status: completed
 branch: feat/workbench-terminal
 ---
 
