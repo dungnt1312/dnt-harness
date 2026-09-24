@@ -1,7 +1,7 @@
 ---
 phase: 4
 title: "Safe Tool Calls and Audit Integrity"
-status: in-progress
+status: done
 priority: P1
 effort: "5-7 days"
 dependencies: [1, 3]
@@ -80,13 +80,13 @@ Same-user tamper resistance is out of scope; call this crash-durable evidence, n
 
 ## Success Criteria
 
-- [ ] Lost-response fixture observes one mini-dsh dispatch and one fixture side effect; claim is explicitly host no-replay, not universal exactly-once. The journal test observes one dispatch. It does not observe one remote fixture side effect.
+- [x] Lost-response fixture observes one mini-dsh dispatch and one fixture side effect; claim is explicitly host no-replay, not universal exactly-once. A real stdio fixture records each `tools/call` in `SIDE_EFFECT_FILE` before replying; `hang` never replies. `tests/harness/mcp-execution-journal.spec.ts` sees one send and one remote effect across a same-process repeat and a reopened journal.
 - [x] Every ambiguous post-dispatch failure returns `indeterminate` and is never automatically repeated.
-- [ ] Every possible dispatch has a synced intent under the current ownership epoch. Intent is synced before send. The test does not bind that write to a live ownership epoch.
+- [x] Every possible dispatch has a synced intent under the current ownership epoch. With a real `DataHomeLock`, a host whose data home was taken over (new epoch) writes no intent and sends nothing; every intent on disk carries the epoch live when written.
 - [x] Restart recovery is idempotent and never sends unresolved calls.
 - [x] Known remote outcome plus terminal persistence failure is `audit_fault` and blocks new dispatch.
-- [ ] Journal corruption/disk-full/permission faults fail closed with an operator recovery path. Corrupt middle records fail closed. ENOSPC and permission faults are not separately tested.
-- [ ] Manual repeat gets new invocation ID and fresh current approval. A repeat of the same invocation id is not sent. A fresh-approval manual repeat is not covered here.
+- [x] Journal corruption/disk-full/permission faults fail closed with an operator recovery path. A real permission fault (read-only journal) refuses the intent and every later call without sending; a refused terminal record is an `audit_fault` that blocks the next dispatch. Recovery: `POST …/mcp/audit-repair` now reopens a faulted journal from disk — a transient fault (full disk, permission since fixed) recovers once the file validates, a corrupt one stays blocked. ENOSPC shares the same write-failure path; it is not produced on a real full disk.
+- [x] Manual repeat gets new invocation ID and fresh current approval. `tests/web/server-g5.spec.ts` repeats an approved call — reusing the model's call id — and sees two approvals, two intents, two remote effects. Before this, `invocationId` was the model's call id, so a provider that reuses ids got a freshly approved call answered from the old record and never sent. It is now minted per execution.
 - [x] Existing gate ordering and non-MCP tool behavior remain unchanged.
 - [x] Journal contains no plaintext credentials/protected payloads and docs do not claim same-user tamper resistance.
 
