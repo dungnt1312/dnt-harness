@@ -35,6 +35,11 @@ rl.on('line', async (line) => {
   }
   if (msg.method === 'tools/call') {
     const name = msg.params?.name
+    // The remote side effect, recorded before any reply leaves (or does not).
+    if (process.env.SIDE_EFFECT_FILE) {
+      const { appendFileSync } = await import('node:fs')
+      appendFileSync(process.env.SIDE_EFFECT_FILE, `${name}\n`, 'utf8')
+    }
     if (name === 'query') send(msg.id, { content: [{ type: 'text', text: `result:${msg.params?.arguments?.q ?? ''}` }], isError: false })
     else if (name === 'interactive') send(msg.id, { content: [{ type: 'text', text: 'interactive ok' }], isError: false })
     else if (name === 'explode') send(msg.id, { content: [{ type: 'text', text: 'fixture error' }], isError: true })
