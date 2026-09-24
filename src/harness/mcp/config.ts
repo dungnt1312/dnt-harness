@@ -7,7 +7,7 @@
  */
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
 import { promises as fs } from 'node:fs'
-import { spawnSync } from 'node:child_process'
+import { execFile, spawnSync } from 'node:child_process'
 import path from 'node:path'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
 
@@ -38,6 +38,12 @@ export interface McpServerConfig {
   /** Exposure filter: only these tools register (never a permission bypass). */
   readonly allowedTools?: readonly string[]
   readonly provenance?: { readonly importedFrom?: 'claude' | 'codex'; readonly importedAt?: number }
+  /**
+   * stdio: the canonical file the operator authorized when enabling. Set only
+   * by activation, never by a save; a spawn whose command now resolves to a
+   * different path or different bytes is refused until enabled again.
+   */
+  readonly executable?: { readonly path: string; readonly sha256: string }
 }
 
 export interface McpConfig {
@@ -194,8 +200,16 @@ export function parseMcpConfig(raw: string): McpConfig {
       }
     }
     for (const key of Object.keys(server)) {
-      if (!['name', 'transport', 'command', 'args', 'env', 'url', 'headers', 'auth', 'enabled', 'timeoutMs', 'resourceLimits', 'allowedTools', 'provenance'].includes(key)) {
+      if (!['name', 'transport', 'command', 'args', 'env', 'url', 'headers', 'auth', 'enabled', 'timeoutMs', 'resourceLimits', 'allowedTools', 'provenance', 'executable'].includes(key)) {
         throw new McpConfigError('invalid', `server '${name}': unknown key '${key}'`)
+      }
+    }
+    const executable = server['executable']
+    if (executable !== undefined) {
+      const pin = executable as Record<string, unknown> | null
+      if (pin === null || typeof pin !== 'object' || typeof pin['path'] !== 'string' || pin['path'] === '' ||
+        typeof pin['sha256'] !== 'string' || !/^[a-f0-9]{64}$/.test(pin['sha256']) || Object.keys(pin).some((key) => key !== 'path' && key !== 'sha256')) {
+        throw new McpConfigError('invalid', `server '${name}': executable must be { path, sha256 }`)
       }
     }
     servers[name] = {
@@ -216,6 +230,7 @@ export function parseMcpConfig(raw: string): McpConfig {
       ...(server['provenance'] !== undefined && server['provenance'] !== null
         ? { provenance: server['provenance'] as NonNullable<McpServerConfig['provenance']> }
         : {}),
+      ...(executable !== undefined ? { executable: executable as NonNullable<McpServerConfig['executable']> } : {}),
     }
   }
   return { version: 1, servers }
@@ -561,33 +576,78 @@ export class McpConfigStore {
       await fs.chmod(file, 0o600)
       return
     }
-    const identity = process.env['USERDOMAIN'] && process.env['USERNAME']
-      ? `${process.env['USERDOMAIN']}\\${process.env['USERNAME']}`
-      : process.env['USERNAME']
-    if (identity === undefined || identity === '') {
-      throw new McpConfigError('invalid', 'cannot determine Windows identity for secret master-key ACL')
-    }
-    const result = spawnSync('icacls', [file, '/inheritance:r', '/grant:r', `${identity}:F`], { encoding: 'utf8' })
+    // Granted by SID: account names are localized and differ for AzureAD
+    // and domain users, a SID is not.
+    const acl = await readWindowsAcl(file)
+    const result = spawnSync('icacls', [file, '/inheritance:r', '/grant:r', `*${acl.currentUser}:F`], { encoding: 'utf8', windowsHide: true })
     if (result.status !== 0) {
       throw new McpConfigError('invalid', `cannot protect secrets.master.key with a user-scoped Windows ACL`)
     }
+    this.verifiedKey = undefined
   }
 
+  /** `ctime` of the key when its protection was last verified; a change re-verifies. */
+  private verifiedKey: string | undefined
+
+  /**
+   * An allowlist, not a denylist: the key may be reachable only by the
+   * current OS user. POSIX: owned by this uid, no group/other bits. Windows:
+   * inheritance removed and every allow entry is the current user's SID —
+   * any other principal (another user, SYSTEM, Administrators, a localized
+   * group name) is refused.
+   */
   private async verifyMasterKeyProtection(file: string): Promise<void> {
+    const stat = await fs.stat(file)
+    const fingerprint = `${stat.ctimeMs}:${stat.mtimeMs}:${stat.size}`
+    if (this.verifiedKey === fingerprint) return
     if (process.platform !== 'win32') {
-      const stat = await fs.stat(file)
       if ((stat.mode & 0o077) !== 0) throw new McpConfigError('invalid', 'secrets.master.key permissions are broader than 0600')
-      return
+      if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+        throw new McpConfigError('invalid', 'secrets.master.key is owned by another user')
+      }
+    } else {
+      const acl = await readWindowsAcl(file)
+      if (!acl.protectedFromInheritance) throw new McpConfigError('invalid', 'secrets.master.key still inherits its folder\'s ACL')
+      const others = acl.allow.filter((sid) => sid !== acl.currentUser)
+      if (others.length > 0 || !acl.allow.includes(acl.currentUser)) {
+        throw new McpConfigError('invalid', `secrets.master.key ACL is not user-scoped (also grants ${others.join(', ')}); restore it with: icacls "${file}" /inheritance:r /grant:r *${acl.currentUser}:F`)
+      }
     }
-    const result = spawnSync('icacls', [file], { encoding: 'utf8' })
-    if (result.status !== 0) throw new McpConfigError('invalid', 'cannot verify Windows ACL on secrets.master.key')
-    const output = `${result.stdout}
-${result.stderr}`
-    // Inheritance must be removed; broad well-known groups must not appear.
-    if (/BUILTIN\\Users|BUILTIN\\Administrators|Everyone|Authenticated Users|NT AUTHORITY\\SYSTEM/i.test(output)) {
-      throw new McpConfigError('invalid', 'secrets.master.key ACL is not user-scoped')
-    }
+    this.verifiedKey = fingerprint
   }
+}
+
+interface WindowsAcl {
+  readonly currentUser: string
+  readonly protectedFromInheritance: boolean
+  /** SIDs of every Allow entry. */
+  readonly allow: readonly string[]
+}
+
+/** The file's ACL as SIDs, plus the current user's SID. The path travels in the environment, never in the script. */
+async function readWindowsAcl(file: string): Promise<WindowsAcl> {
+  const script = [
+    '$acl = Get-Acl -LiteralPath $env:MINI_DSH_ACL_TARGET',
+    '"ME|" + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
+    '"PROTECTED|" + $acl.AreAccessRulesProtected',
+    'foreach ($rule in $acl.Access) { "ACE|" + $rule.AccessControlType + "|" + $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }',
+  ].join('; ')
+  const stdout = await new Promise<string>((resolve, reject) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      encoding: 'utf8', timeout: 15_000, windowsHide: true, env: { ...process.env, MINI_DSH_ACL_TARGET: file },
+    }, (error, out) => (error === null ? resolve(out) : reject(new McpConfigError('invalid', 'cannot verify Windows ACL on secrets.master.key'))))
+  })
+  let currentUser = ''
+  let protectedFromInheritance = false
+  const allow: string[] = []
+  for (const line of stdout.split(/\r?\n/)) {
+    const [kind, first, second] = line.trim().split('|')
+    if (kind === 'ME' && first !== undefined) currentUser = first
+    else if (kind === 'PROTECTED') protectedFromInheritance = first === 'True'
+    else if (kind === 'ACE' && first === 'Allow' && second !== undefined) allow.push(second)
+  }
+  if (!/^S-1-/.test(currentUser)) throw new McpConfigError('invalid', 'cannot determine the current Windows user SID')
+  return { currentUser, protectedFromInheritance, allow }
 }
 
 /**

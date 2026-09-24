@@ -98,7 +98,7 @@ import {
   type McpServerConfig,
 } from '../harness/mcp/config.ts'
 import { McpServerClient, McpTransportError, type McpToolDescriptor } from '../harness/mcp/client.ts'
-import { configRevision, upsertServer, withServerEnabled, withoutServer } from '../harness/mcp/config-v2.ts'
+import { configRevision, upsertServer, withServerActivated, withServerEnabled, withoutServer } from '../harness/mcp/config-v2.ts'
 import { clearAuditFault, dispatchToolCall, faultIsOpen } from '../harness/mcp/execution-coordinator.ts'
 import { McpExecutionJournal } from '../harness/mcp/execution-journal.ts'
 import { MutationStore, readFileIfPresent } from '../harness/mcp/mutation-store.ts'
@@ -106,7 +106,7 @@ import { recoverMigrations } from '../harness/mcp/migration.ts'
 import { DataHomeLock } from '../harness/mcp/ownership-lock.ts'
 import { ManagedOAuth } from '../harness/mcp/oauth.ts'
 import { OAuthStore } from '../harness/mcp/oauth-store.ts'
-import { containmentCapability } from '../harness/mcp/process-controller.ts'
+import { containmentCapability, resolveCanonicalExecutable } from '../harness/mcp/process-controller.ts'
 import { stageMcpOutcome } from '../harness/mcp/staged-outcome.ts'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { runHook, isBlockingDecision, isFailureDecision } from '../harness/hooks/runner.ts'
@@ -3361,6 +3361,7 @@ async function handleApi(
               stale: deps.isDrifted(wsId),
               discoveredTools: discovered,
               ...(server.allowedTools !== undefined ? { allowedTools: server.allowedTools } : {}),
+              ...(server.executable !== undefined ? { executablePath: server.executable.path } : {}),
               unmatchedAllowlist,
             })
           }
@@ -3451,7 +3452,19 @@ async function handleApi(
               return
             }
           }
-          await deps.updateMcpConfig(wsId, (current) => withServerEnabled(current, serverName, true))
+          if (action === 'enable') {
+            // Activation authorizes the canonical file the command resolves to
+            // right now; later spawns refuse any other path or bytes.
+            const executable = serverConfig.transport === 'stdio' && serverConfig.command !== undefined
+              ? await resolveCanonicalExecutable(serverConfig.command).catch((error: unknown) => {
+                throw new McpConfigError('invalid', `cannot enable '${serverName}': ${error instanceof Error ? error.message : String(error)}`)
+              })
+              : undefined
+            await deps.updateMcpConfig(wsId, (current) => withServerActivated(current, serverName, executable))
+          } else {
+            // Reconnect never re-authorizes: a changed executable stays refused.
+            await deps.updateMcpConfig(wsId, (current) => withServerEnabled(current, serverName, true))
+          }
           if (action === 'reconnect') await deps.cancelMcpConnection(wsId, serverName)
           deps.mcpCancelled.delete(`${wsId}:${serverName}`)
           // Fresh/singleton connect; ensureMcpServer lists + reconciles tools.

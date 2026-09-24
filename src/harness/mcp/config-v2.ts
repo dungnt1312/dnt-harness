@@ -59,14 +59,17 @@ export function parseV2McpConfig(raw: string): McpConfig {
  */
 export function upsertServer(config: McpConfig, name: string, body: Record<string, unknown>): McpConfig {
   const previous = config.servers[name]
-  const { enabled: _ignored, ...rest } = body
+  // A save never changes activation: `enabled` and the authorized executable
+  // pin come from the stored server, whatever the body says.
+  const { enabled: _ignored, executable: _pin, ...rest } = body
   void _ignored
+  void _pin
   const parsed = parseMcpConfig(JSON.stringify({ version: 1, servers: { [name]: { ...rest, name } } }))
   const server = parsed.servers[name]
   if (server === undefined) throw new McpConfigError('invalid', `server '${name}' failed validation`)
   const servers = {
     ...config.servers,
-    [name]: { ...server, enabled: previous?.enabled === true },
+    [name]: { ...server, enabled: previous?.enabled === true, ...(previous?.executable !== undefined ? { executable: previous.executable } : {}) },
   }
   return {
     ...config,
@@ -82,6 +85,20 @@ export function withServerEnabled(config: McpConfig, name: string, enabled: bool
   return {
     ...config,
     ...(config.version === 2 ? { revision: (config.revision ?? 1) + 1, contentHash: hashServers(servers) } : {}),
+    servers,
+  }
+}
+
+/** Explicit activation: enable, and for stdio pin the canonical file the operator just authorized. */
+export function withServerActivated(config: McpConfig, name: string, executable: { readonly path: string; readonly sha256: string } | undefined): McpConfig {
+  const enabled = withServerEnabled(config, name, true)
+  if (executable === undefined) return enabled
+  const current = enabled.servers[name]
+  if (current === undefined) throw new McpConfigError('not-found', `no MCP server '${name}'`)
+  const servers = { ...enabled.servers, [name]: { ...current, executable: { path: executable.path, sha256: executable.sha256 } } }
+  return {
+    ...enabled,
+    ...(enabled.version === 2 ? { contentHash: hashServers(servers) } : {}),
     servers,
   }
 }

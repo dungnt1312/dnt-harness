@@ -31,6 +31,14 @@ rl.on('line', async (line) => {
         for (;;) Math.sqrt(Math.random())
       })
     }
+    // A short CPU burst, then idle: the watchdog must not treat it as sustained.
+    const burstMs = Number(process.env.BURN_FOR_MS ?? 0)
+    if (burstMs > 0) {
+      setImmediate(() => {
+        const until = Date.now() + burstMs
+        while (Date.now() < until) Math.sqrt(Math.random())
+      })
+    }
     return
   }
   if (msg.method === 'tools/call') {
@@ -44,6 +52,7 @@ rl.on('line', async (line) => {
     else if (name === 'interactive') send(msg.id, { content: [{ type: 'text', text: 'interactive ok' }], isError: false })
     else if (name === 'explode') send(msg.id, { content: [{ type: 'text', text: 'fixture error' }], isError: true })
     else if (name === 'hang') { /* deliberately no reply */ }
+    else if (name === 'env') send(msg.id, { content: [{ type: 'text', text: JSON.stringify(Object.keys(process.env)) }], isError: false })
     else fail(msg.id, -32601, `unknown tool ${name}`)
   }
 })

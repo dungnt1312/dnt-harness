@@ -205,6 +205,45 @@ describe('G5 web MCP + hooks', () => {
     expect((await fs.readFile(effects, 'utf8')).trim().split('\n')).toEqual(['interactive', 'interactive'])
   }, 20_000)
 
+  it('enabling authorizes the canonical executable; a changed file is refused until enabled again', async () => {
+    const provider: LlmProvider = { name: 'idle', models: ['idle'], async *stream() { yield { type: 'delta', delta: 'ok' } } }
+    const { base, wsId, home } = await boot(provider)
+    const binary = path.join(home, `node-copy${path.extname(process.execPath)}`)
+    await fs.copyFile(process.execPath, binary)
+    const route = `/api/workspaces/${wsId}/mcp/pinned`
+    expect((await post(base, route, { transport: 'stdio', command: binary, args: [mcpFixture], enabled: false })).status).toBe(201)
+    expect((await post(base, `${route}/enable`)).status).toBe(200)
+    const pinned = (await (await fetch(`${base}${route}`)).json()) as { executable?: { path: string; sha256: string } }
+    expect(pinned.executable?.path).toBe(await fs.realpath(binary))
+    expect(pinned.executable?.sha256).toMatch(/^[a-f0-9]{64}$/)
+
+    // A save cannot forge or move the authorization.
+    expect((await post(base, route, { transport: 'stdio', command: binary, args: [mcpFixture], executable: { path: 'C:/elsewhere.exe', sha256: 'a'.repeat(64) } })).status).toBe(201)
+    expect(((await (await fetch(`${base}${route}`)).json()) as typeof pinned).executable).toEqual(pinned.executable)
+
+    // The file changes after it was authorized: a reconnect refuses to run it.
+    await post(base, `${route}/disable`)
+    // Windows keeps a running image locked; wait for the stopped process to release it.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await fs.appendFile(binary, Buffer.from([0]))
+        break
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EBUSY' || attempt >= 50) throw error
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      }
+    }
+    const refused = await post(base, `${route}/reconnect`)
+    expect(refused.status).toBe(502)
+    expect(((await refused.json()) as { error: string }).error).toMatch(/executable_changed/)
+
+    // Enabling again is the explicit act that authorizes the new bytes.
+    await post(base, `${route}/enable`)
+    const repinned = (await (await fetch(`${base}${route}`)).json()) as typeof pinned
+    expect(repinned.executable?.sha256).not.toBe(pinned.executable?.sha256)
+    await post(base, `${route}/disable`)
+  }, 30_000)
+
   it('disable and host close cancel delayed in-flight MCP initialization (no late descriptors/process)', async () => {
     const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'x' } } }
     // Disable race.

@@ -108,8 +108,12 @@ describe('stdio MCP 2025-06-18 fixture', () => {
       resourceLimits: { cpuPercent: 5, maxLifetimeMs: 10_000 },
     }, { env: { BURN_AFTER_LIST: '1' } }, () => {})
     await burner.listTools()
-    await new Promise((resolve) => setTimeout(resolve, 2_500))
+    // Sustained load is three consecutive over-limit samples (~3 s), then one kill.
+    // Each Windows sample is a PowerShell probe, so allow for slow samples.
+    await expect.poll(() => burner.watchdogKills, { timeout: 25_000, intervals: [250] }).toBe(1)
     await expect(burner.callTool('query', { q: 'x' }, 500)).rejects.toThrow()
+    await new Promise((resolve) => setTimeout(resolve, 1_500))
+    expect(burner.watchdogKills).toBe(1)
     await burner.disconnect()
 
     const idle = new McpServerClient('idle', {
@@ -121,7 +125,69 @@ describe('stdio MCP 2025-06-18 fixture', () => {
     const result = await idle.callTool('query', { q: 'still-alive' }, 1_000)
     expect(JSON.stringify(result.content)).toContain('still-alive')
     await idle.disconnect()
+  }, 45_000)
+
+  it('a short CPU burst is not sustained load: the watchdog leaves the server alive', async () => {
+    const bursty = new McpServerClient('bursty', {
+      name: 'bursty', transport: 'stdio', command: process.execPath, args: [fixture], env: { BURN_FOR_MS: '1200' }, enabled: true,
+      resourceLimits: { cpuPercent: 5, maxLifetimeMs: 20_000 },
+    }, { env: { BURN_FOR_MS: '1200' } }, () => {})
+    try {
+      await bursty.listTools()
+      await new Promise((resolve) => setTimeout(resolve, 5_000))
+      expect(bursty.watchdogKills).toBe(0)
+      const result = await bursty.callTool('query', { q: 'after-burst' }, 2_000)
+      expect(JSON.stringify(result.content)).toContain('after-burst')
+    } finally {
+      await bursty.disconnect()
+    }
   }, 30_000)
+
+  it('a stdio server sees only platform basics and its explicit env, never unrelated host secrets', async () => {
+    process.env['AMBIENT_SECRET_PROBE'] = 'must-not-leak'
+    const probe = new McpServerClient('probe', {
+      name: 'probe', transport: 'stdio', command: process.execPath, args: [fixture], env: { EXPLICIT_FOR_SERVER: 'yes' }, enabled: true,
+    }, { env: { EXPLICIT_FOR_SERVER: 'yes' } }, () => {})
+    try {
+      const result = await probe.callTool('env', {}, 5_000)
+      const keys = JSON.parse((result.content as { text: string }[])[0]!.text) as string[]
+      expect(keys).toContain('EXPLICIT_FOR_SERVER')
+      expect(keys).not.toContain('AMBIENT_SECRET_PROBE')
+      expect(keys.some((key) => /api_key|token|secret/i.test(key) && key !== 'EXPLICIT_FOR_SERVER')).toBe(false)
+    } finally {
+      delete process.env['AMBIENT_SECRET_PROBE']
+      await probe.disconnect()
+    }
+  }, 15_000)
+
+  it('the secrets master key must be reachable by this user only; any other principal is refused', async () => {
+    const { spawnSync } = await import('node:child_process')
+    const { promises: fsp } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const pathModule = await import('node:path')
+    const home = await fsp.mkdtemp(pathModule.join(tmpdir(), 'mini-dsh-master-key-'))
+    try {
+      await new McpConfigStore(home).saveSecrets('ws', { API_KEY: 'value' })
+      expect(await new McpConfigStore(home).loadSecrets('ws')).toEqual({ API_KEY: 'value' })
+      const key = pathModule.join(home, 'secrets.master.key')
+      if (process.platform === 'win32') {
+        // LOCAL SERVICE by SID: a principal no denylist of group names would
+        // mention, and independent of the display language.
+        expect(spawnSync('icacls', [key, '/grant', '*S-1-5-19:R'], { windowsHide: true }).status).toBe(0)
+      } else {
+        await fsp.chmod(key, 0o640)
+      }
+      await expect(new McpConfigStore(home).loadSecrets('ws')).rejects.toThrow(/not user-scoped|broader than 0600/)
+      if (process.platform === 'win32') {
+        expect(spawnSync('icacls', [key, '/remove:g', '*S-1-5-19'], { windowsHide: true }).status).toBe(0)
+      } else {
+        await fsp.chmod(key, 0o600)
+      }
+      expect(await new McpConfigStore(home).loadSecrets('ws')).toEqual({ API_KEY: 'value' })
+    } finally {
+      await fsp.rm(home, { recursive: true, force: true })
+    }
+  }, 60_000)
 
   it('isError stays truthful; timeout settles rather than hanging', async () => {
     const mcp = client(300)

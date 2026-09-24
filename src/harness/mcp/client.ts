@@ -6,7 +6,7 @@
  * (5 fails → 5 min disabled → auto-reconnect with jitter), 30s health
  * checks, verified subprocess cleanup on disconnect.
  */
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { execFile, spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { cpus } from 'node:os'
 import { McpDispatchError, receiptForTransportFailure, boundToolMetadata } from './boundaries.ts'
@@ -60,16 +60,23 @@ function killOwnedProcessTree(child: ChildProcess): void {
   }
 }
 
+/** Watchdog sampling period. */
+const WATCHDOG_INTERVAL_MS = 1_000
+/** Consecutive over-limit CPU samples that make a breach sustained (~3 s). */
+const WATCHDOG_CPU_BREACHES = 3
+
 /** Sample cumulative process CPU seconds + memory; caller computes deltas. */
-function readProcessSample(pid: number): ProcessSample | undefined {
+async function readProcessSample(pid: number): Promise<ProcessSample | undefined> {
   if (process.platform === 'win32') {
-    const result = spawnSync('powershell.exe', [
-      '-NoProfile', '-NonInteractive', '-Command',
-      `(Get-Process -Id ${pid} | Select-Object @{n='m';e={$_.WorkingSet64/1MB}},@{n='c';e={$_.CPU}} | ConvertTo-Json -Compress)`,
-    ], { encoding: 'utf8', timeout: 3_000 })
-    if (result.status !== 0) return undefined
+    const stdout = await new Promise<string | undefined>((resolve) => {
+      execFile('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-Command',
+        `(Get-Process -Id ${pid} | Select-Object @{n='m';e={$_.WorkingSet64/1MB}},@{n='c';e={$_.CPU}} | ConvertTo-Json -Compress)`,
+      ], { encoding: 'utf8', timeout: 5_000, windowsHide: true }, (error, out) => resolve(error === null ? out : undefined))
+    })
+    if (stdout === undefined) return undefined
     try {
-      const parsed = JSON.parse(result.stdout.trim()) as { m?: number; c?: number }
+      const parsed = JSON.parse(stdout.trim()) as { m?: number; c?: number }
       return { memoryMb: parsed.m ?? 0, cpuSeconds: parsed.c ?? 0 }
     } catch { return undefined }
   }
@@ -110,6 +117,13 @@ class StdioTransport implements Transport {
     if (this.config.resourceLimits?.enforcement === 'hard') await assertHardContainmentAvailable()
     if (this.stopped) throw new McpTransportError('transport stopped before spawn')
     const canonical = await resolveCanonicalExecutable(command)
+    const pin = this.config.executable
+    if (pin !== undefined && (canonical.path !== pin.path || canonical.sha256 !== pin.sha256)) {
+      // The file the operator authorized is not the file that would run now:
+      // an edited command, a PATH change, or replaced bytes. Enabling again
+      // is what authorizes the new file.
+      throw new McpTransportError(`executable_changed: '${command}' now resolves to ${canonical.path === pin.path ? 'different bytes at the authorized path' : canonical.path}; enable the server again to trust it`)
+    }
     if (this.stopped) throw new McpTransportError('transport stopped before spawn')
     const child = spawn(canonical.path, this.config.args ?? [], {
       env: minimalStdioEnv(this.resolvedEnv),
@@ -235,6 +249,9 @@ class StdioTransport implements Transport {
     }
   }
 
+  /** Watchdog kills of this process: at most one, however long the breach lasts. */
+  watchdogKills = 0
+
   private startResourceWatchdog(child: ChildProcess): void {
     const limits = this.config.resourceLimits
     if (limits === undefined || child.pid === undefined) return
@@ -243,32 +260,47 @@ class StdioTransport implements Transport {
       this.lifetimeTimer.unref?.()
     }
     if (limits.memoryMb === undefined && limits.cpuPercent === undefined) return
-    const initial = readProcessSample(child.pid)
-    if (initial !== undefined) this.previousSample = { at: Date.now(), cpuSeconds: initial.cpuSeconds }
-    else if (limits.cpuPercent !== undefined || limits.memoryMb !== undefined) {
+    const pid = child.pid
+    // One kill per breach, however many samples keep reporting it.
+    const act = (): void => {
+      if (this.watchdogKills > 0) return
+      this.watchdogKills += 1
       killOwnedProcessTree(child)
-      return
     }
-    this.resourceTimer = setInterval(() => {
-      if (child.pid === undefined) return
-      const sample = readProcessSample(child.pid)
-      if (sample === undefined) {
-        // A configured hard limit we cannot monitor must fail closed.
-        killOwnedProcessTree(child)
-        return
-      }
-      if (limits.memoryMb !== undefined && sample.memoryMb > limits.memoryMb) killOwnedProcessTree(child)
-      if (limits.cpuPercent !== undefined) {
-        const now = Date.now()
-        const previous = this.previousSample
-        this.previousSample = { at: now, cpuSeconds: sample.cpuSeconds }
-        if (previous !== undefined) {
-          const wallSeconds = Math.max((now - previous.at) / 1_000, 0.001)
-          const cpuPercent = ((sample.cpuSeconds - previous.cpuSeconds) / wallSeconds / Math.max(cpus().length, 1)) * 100
-          if (cpuPercent > limits.cpuPercent) killOwnedProcessTree(child)
+    let cpuBreaches = 0
+    let sampling = false
+    const sampleOnce = async (): Promise<void> => {
+      // Sampling is asynchronous so a slow probe (PowerShell on Windows)
+      // never blocks the host's event loop; overlapping ticks are skipped.
+      if (sampling || this.watchdogKills > 0) return
+      sampling = true
+      try {
+        const sample = await readProcessSample(pid)
+        if (sample === undefined) {
+          // A configured limit this host cannot monitor fails closed.
+          act()
+          return
         }
+        if (limits.memoryMb !== undefined && sample.memoryMb > limits.memoryMb) act()
+        if (limits.cpuPercent !== undefined) {
+          const now = Date.now()
+          const previous = this.previousSample
+          this.previousSample = { at: now, cpuSeconds: sample.cpuSeconds }
+          if (previous !== undefined) {
+            const wallSeconds = Math.max((now - previous.at) / 1_000, 0.001)
+            const cpuPercent = ((sample.cpuSeconds - previous.cpuSeconds) / wallSeconds / Math.max(cpus().length, 1)) * 100
+            // A short burst is not a breach: only CPU over the limit for
+            // WATCHDOG_CPU_BREACHES consecutive samples is sustained load.
+            cpuBreaches = cpuPercent > limits.cpuPercent ? cpuBreaches + 1 : 0
+            if (cpuBreaches >= WATCHDOG_CPU_BREACHES) act()
+          }
+        }
+      } finally {
+        sampling = false
       }
-    }, 1_000)
+    }
+    void sampleOnce()
+    this.resourceTimer = setInterval(() => { void sampleOnce() }, WATCHDOG_INTERVAL_MS)
     this.resourceTimer.unref?.()
   }
 
@@ -733,6 +765,11 @@ export class McpServerClient {
 
   /** Transports this client has built; a reconnect storm must not grow it past one per connect. */
   transportsStarted = 0
+
+  /** Resource-watchdog kills of the current stdio process (0 or 1). */
+  get watchdogKills(): number {
+    return this.transport instanceof StdioTransport ? this.transport.watchdogKills : 0
+  }
 
   private refreshing: Promise<void> | undefined
   private refreshAgain = false
