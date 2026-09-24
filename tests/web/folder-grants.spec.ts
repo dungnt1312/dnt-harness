@@ -19,6 +19,11 @@ let otherRoot = ''
 let server: WebServer | undefined
 
 const requests: ModelRequest[] = []
+/** Held by a test to pause a child agent's first request (resolved by default). */
+let childGate: Promise<void> = Promise.resolve()
+
+const systemText = (request: ModelRequest): string =>
+  request.messages.filter((message) => message.role === 'system').map((message) => String(message.content)).join('\n')
 
 /** Writes into the shared folder once per turn, then answers. */
 const writer: LlmProvider = {
@@ -26,6 +31,12 @@ const writer: LlmProvider = {
   models: ['writer'],
   async *stream(request) {
     requests.push(request)
+    // A child lists the project on its first request, so it makes a second one.
+    if (systemText(request).includes('subagent') && !request.messages.some((message) => message.role === 'tool')) {
+      await childGate
+      yield { type: 'toolCalls', calls: [{ id: `g-${Math.random()}`, name: 'Glob', args: { pattern: '*' } }] }
+      return
+    }
     const lastUser = [...request.messages].reverse().find((message) => message.role === 'user')
     const text = typeof lastUser?.content === 'string' ? lastUser.content : ''
     if (text.startsWith('write ') && !request.messages.some((message) => message.role === 'tool')) {
@@ -66,6 +77,7 @@ async function start(): Promise<WebServer> {
 
 beforeEach(async () => {
   requests.length = 0
+  childGate = Promise.resolve()
   const base = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-grants-')))
   home = path.join(base, 'home')
   primary = path.join(base, 'primary')
@@ -176,6 +188,40 @@ describe('folder grants', () => {
     const spawned = (await (await send('POST', `${base}/api/workspaces/${wsId}/agents/explorer`, { rootSessionId: sessionId, task: { prompt: 'Look around.' } })).json()) as { childSessionId: string }
     const put = await send('PUT', `${base}/api/workspaces/${wsId}/sessions/${spawned.childSessionId}/grants`, { expectedRevision: 0, roots: [{ path: shared, access: 'write' }] })
     expect([404, 409]).toContain(put.status)
+  }, 20_000)
+
+  it('a grant naming another project follows that project when it moves', async () => {
+    const { url: base } = await start()
+    const { wsId, projectId, otherId, sessionId } = await setup(base)
+    await send('PATCH', `${base}/api/workspaces/${wsId}/projects/${projectId}`, { additionalDirectories: [{ kind: 'project', projectId: otherId, access: 'read' }] })
+    const grantsUrl = `${base}/api/workspaces/${wsId}/sessions/${sessionId}/grants`
+    expect((await json(await fetch(grantsUrl))).effective).toEqual([{ path: otherRoot, access: 'read' }])
+
+    const moved = path.join(path.dirname(otherRoot), 'other-moved')
+    await fs.mkdir(moved)
+    expect((await send('PATCH', `${base}/api/workspaces/${wsId}/projects/${otherId}`, { path: moved })).status).toBe(200)
+    expect((await json(await fetch(grantsUrl))).effective).toEqual([{ path: moved, access: 'read' }])
+  })
+
+  it('a folder the parent gains after spawn stays invisible to a running child', async () => {
+    const { url: base } = await start()
+    const { wsId, sessionId } = await setup(base)
+    let release: () => void = () => {}
+    childGate = new Promise<void>((resolve) => { release = resolve })
+    const grantsUrl = `${base}/api/workspaces/${wsId}/sessions/${sessionId}/grants`
+    await send('PUT', grantsUrl, { expectedRevision: 0, roots: [{ path: docs, access: 'read' }] })
+    expect((await send('POST', `${base}/api/workspaces/${wsId}/agents/explorer`, { rootSessionId: sessionId, task: { prompt: 'Look around.' } })).status).toBe(202)
+    await waitFor(() => requests.find((request) => systemText(request).includes('subagent')), 'first child request')
+
+    // The parent gains a folder while the child is mid-run.
+    await send('PUT', grantsUrl, { expectedRevision: 1, roots: [{ path: docs, access: 'read' }, { path: shared, access: 'write' }] })
+    release()
+    const second = await waitFor(
+      () => requests.find((request) => systemText(request).includes('subagent') && request.messages.some((message) => message.role === 'tool')),
+      'second child request',
+    )
+    expect(systemText(second)).toContain(`Granted folder (read-only, use absolute paths): ${docs}`)
+    expect(systemText(second)).not.toContain(shared)
   }, 20_000)
 
   it('a child agent receives the parent session grants at spawn', async () => {

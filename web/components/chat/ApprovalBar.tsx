@@ -9,6 +9,17 @@ import type { PendingApproval } from '../../lib/types.ts'
 const ARGS_DISPLAY_LIMIT = 4000
 
 /**
+ * A long folder keeps its END visible (`…\parent\folder`): a start-truncated
+ * label would hide exactly the part that says which folder is granted.
+ */
+export function shortFolder(folder: string, keep = 2): string {
+  const parts = folder.split(/[\\/]/).filter((part) => part !== '')
+  if (parts.length <= keep + 1) return folder
+  const separator = folder.includes('\\') ? '\\' : '/'
+  return `…${separator}${parts.slice(-keep).join(separator)}`
+}
+
+/**
  * Pending tool approvals, oldest first, above the composer. Allow once / Deny
  * answer only that request (locked while submitting); standing permission is
  * authored in Settings → Modes, never from a pending ask. The one exception
@@ -117,7 +128,7 @@ export function ApprovalBar({
               <Button variant="outline" size="sm" disabled={submittingRow} onClick={() => void answer(approvalId, false)}>Deny</Button>
               {sessionGrant !== undefined ? (
                 <Button variant="outline" size="sm" disabled={submittingRow} title={sessionGrant} onClick={() => void answer(approvalId, true, 'session')}>
-                  <span className="max-w-[18rem] truncate">Allow {proposedAccess === 'write' ? 'read & write' : 'read'} in <code>{sessionGrant}</code> for this session</span>
+                  <span className="max-w-[20rem] truncate">Allow {proposedAccess === 'write' ? 'read & write' : 'read'} in <code>{shortFolder(sessionGrant)}</code> for this session</span>
                 </Button>
               ) : null}
               <Button variant="primary" size="sm" disabled={submittingRow} onClick={() => void answer(approvalId, true)}>{submittingRow ? 'Submitting decision…' : 'Allow once'}</Button>

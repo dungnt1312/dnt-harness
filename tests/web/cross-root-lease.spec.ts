@@ -30,9 +30,12 @@ const writer: LlmProvider = {
     const lastUser = [...request.messages].reverse().find((message) => message.role === 'user')
     const text = typeof lastUser?.content === 'string' ? lastUser.content : ''
     const answered = request.messages.slice(request.messages.lastIndexOf(lastUser!)).some((message) => message.role === 'tool')
-    const command = /write (\S+)/.exec(text)
+    const command = /(write|read) (\S+)/.exec(text)
     if (!answered && command !== null) {
-      yield { type: 'toolCalls', calls: [{ id: `w-${Math.random().toString(36).slice(2)}`, name: 'Write', args: { path: command[1], content: 'x' } }] }
+      const id = `w-${Math.random().toString(36).slice(2)}`
+      yield command[1] === 'read'
+        ? { type: 'toolCalls', calls: [{ id, name: 'Read', args: { path: command[2] } }] }
+        : { type: 'toolCalls', calls: [{ id, name: 'Write', args: { path: command[2], content: 'x' } }] }
       return
     }
     if (text.includes(' hold')) await gate
@@ -110,6 +113,18 @@ describe('cross-root writer leases', () => {
     expect(result.ok).toBe(false)
     expect(result.output).toMatch(/project busy/)
     await expect(fs.readFile(path.join(rootY, 'from-x.txt'), 'utf8')).rejects.toThrow()
+  }, 20_000)
+
+  it('reads through a grant never take a lease, so a busy project stays readable', async () => {
+    const { url, wsId, sessionX, sessionY } = await setup('edit-automatically')
+    await send('PUT', `${url}/api/workspaces/${wsId}/sessions/${sessionX}/grants`, { expectedRevision: 0, roots: [{ path: rootY, access: 'read' }] })
+    await send('POST', `${url}/api/workspaces/${wsId}/sessions/${sessionY}/messages`, { content: `write ${path.join(rootY, 'own.txt')} hold` })
+    await waitFor(() => fs.readFile(path.join(rootY, 'own.txt'), 'utf8').catch(() => undefined), "Y's write")
+
+    await send('POST', `${url}/api/workspaces/${wsId}/sessions/${sessionX}/messages`, { content: `read ${path.join(rootY, 'own.txt')}` })
+    const result = await waitFor(async () => (await toolResults(`${url}/api/workspaces/${wsId}/sessions/${sessionX}/events`))[0], "X's read")
+    expect(result.ok).toBe(true)
+    expect(result.output).not.toMatch(/project busy/)
   }, 20_000)
 
   it('a pending out-of-grant write question does not hold the other project\'s lease', async () => {

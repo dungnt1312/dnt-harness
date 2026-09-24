@@ -70,6 +70,14 @@ describe('approval card for out-of-grant paths', () => {
     expect(answer).toHaveBeenLastCalledWith('a', true)
   })
 
+  it('keeps the end of a long folder visible on the session button', async () => {
+    const long = 'C:\\Users\\someone\\AppData\\Local\\Temp\\run-1\\outside'
+    await mount(<ApprovalBar approvals={[{ ...row, proposedGrant: long }]} onAnswer={vi.fn()} />)
+    const session = button(/for this session/)
+    expect(session.textContent).toContain('…\\run-1\\outside')
+    expect(session.getAttribute('title')).toBe(long)
+  })
+
   it('never offers a session answer to a child agent\'s question', async () => {
     await mount(<ApprovalBar approvals={[{ ...row, childSessionId: 'child-1' }]} onAnswer={vi.fn()} />)
     expect(host.textContent).not.toMatch(/for this session/)

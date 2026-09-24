@@ -84,7 +84,9 @@ Deviations from phase files (behavior as planned; locations differ):
 
 Code review (7/10, no critical) — fixed: Win32 trailing dot/space and link/short-name writes into a nested read-only folder (segment refusal + on-disk re-classification); PUT grants on a child session → 409; session answer flag set only by the answer that wins; PATCH project validates grants before any change; memory mode keeps its hard boundary; approval id recorded on `session/grants`; card names read vs read & write; context line omits the approval sentence when the mode allows out-of-grant; pre-execute throw evicts the match; mode form round-trips explicit `ask`.
 
-Known gaps (not blocking): no automated test for bearer-principal rejection (auth off in specs), retargeted project-grant follow, post-spawn parent grant invisibility, read-only calls never leasing. Composer chip does not auto-retry once on 409 (reloads instead). Headless keeps a single root.
+Follow-up (2026-09-24): added tests for bearer-principal rejection (`tests/web/folder-grants-auth.spec.ts`), retargeted project-grant follow and post-spawn parent grant invisibility (`tests/web/folder-grants.spec.ts`), read-only calls never leasing (`tests/web/cross-root-lease.spec.ts`). Real-backend browser walk-through (13 checks: approval card, session answer, chip, Settings extra folders) passed; it showed the session button truncating the folder name, fixed by keeping the path's end visible (`shortFolder`).
+
+Known gaps (not blocking): composer chip does not auto-retry once on 409 (reloads instead). Headless keeps a single root.
 
 ## Red Team Review
 
