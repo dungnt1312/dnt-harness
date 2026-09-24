@@ -78,14 +78,14 @@ Do not describe app-level process controls as a sandbox. A stdio server still ru
 ## Success Criteria
 
 - [x] Saving/importing cannot start a process; activation is explicit and authenticated.
-- [ ] Fixture cannot read unrelated ambient secrets. minimalStdioEnv drops unknown variables. A live child reading the parent environment is not in this suite.
-- [ ] Spawn uses the confirmed canonical executable and refuses identity change. resolveCanonicalExecutable refuses relative paths and hashes the file. A race that swaps the file after the hash is not tested.
+- [x] Fixture cannot read unrelated ambient secrets. A live stdio child lists its own environment (`env` fixture tool): it sees its explicit `env` and platform basics, never a variable set only in the host (`tests/harness/g5-mcp.spec.ts`).
+- [x] Spawn uses the confirmed canonical executable and refuses identity change. Enable now pins `executable: { path, sha256 }` of the canonical file; every spawn re-resolves and refuses a different path or bytes (`executable_changed`) until enabled again. Saves cannot forge or move the pin; reconnect never re-authorizes (`tests/web/server-g5.spec.ts`). Before this the hash was computed and never compared. Residual: a swap in the instant between the final hash and `spawn` is not closed (no exec-by-handle in Node).
 - [ ] Windows hard-containment claims pass Job Object escape/resource/kill-on-close tests. No Job Object helper is packaged, so hard containment is refused instead of claimed.
 - [ ] Linux hard-limit claims pass cgroup v2 tests; unavailable hosts reject hard limits. Hard limits are refused. A cgroup v2 test is not claimed.
 - [x] Unsupported platforms are labeled best-effort and do not overclaim daemonized-descendant/resource guarantees.
-- [ ] Watchdog semantics are quantified and produce no false kill on short bursts and one action on sustained breach. Not measured.
-- [ ] PM2 single-fork shutdown/restart leaves no contained descendants and prevents overlapping owners. Overlapping owners are refused by the data-home lock. A PM2 restart drill is not in this suite.
-- [ ] Master-key verification rejects unexpected principals/permissions. Not implemented as a SID/ACE check.
+- [x] Watchdog semantics are quantified and produce no false kill on short bursts and one action on sustained breach. CPU breach = 3 consecutive 1 s samples over the limit; a 1.2 s burst survives, sustained load gets exactly one kill (`watchdogKills`). Sampling is now asynchronous: on Windows it used `spawnSync('powershell')` every second, blocking the host's event loop per watched server.
+- [ ] PM2 single-fork shutdown/restart leaves no contained descendants and prevents overlapping owners. Overlapping owners are refused by the data-home lock. A PM2 restart drill is not in this suite. A drill against a throwaway pm2 app was attempted on 2026-09-24 and abandoned: the shared host was at ~95% CPU / ~90% RAM, so its timing would prove nothing and it risked the other apps. Run it on a quiet host.
+- [x] Master-key verification rejects unexpected principals/permissions. Windows: SID allowlist — inheritance removed and every Allow ACE is the current user's SID (read via `Get-Acl`, cached by ctime); POSIX: no group/other bits and owned by this uid. The previous English-name denylist let `LOCAL SERVICE` (and any localized group) through; the test grants it by SID and is refused, then restored.
 - [x] Documentation repeatedly states app-level isolation, not sandboxing.
 
 ## Risk Assessment
