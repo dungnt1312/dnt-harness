@@ -219,7 +219,7 @@ phase 0; do it when two conversations delegating at once matters. Each phase mus
       writing concurrently.
 - [x] Two conversations delegating at the same time do not steal each other's capacity.
 - [x] This plan does not add token or currency accounting.
-- [ ] `npm test`, `npm run typecheck`, `npm run build:web` exit 0; pm2 `mini-dsh`
+- [x] `npm test`, `npm run typecheck`, `npm run build:web` exit 0; pm2 `mini-dsh`
       restarted and verified live.
 
 ### Outcome (2026-09-23)
@@ -276,6 +276,21 @@ unrelated in-flight cross-project-file-scope work
 would deploy that WIP; restart and live-verify after it lands. Known unrelated
 flake: `tests/capabilities/bash.spec.ts` orphan-marker (Windows Git Bash
 process-tree race, documented 2026-09-18) — passes isolated and in this run.
+
+### Outcome (2026-09-24, closing gate)
+
+The cross-project-file-scope work landed, so the last gate closed. `npm test`
+113/113 files, 1056/1056 tests on repeated full runs; `npm run typecheck` 0;
+`npm run build:web` 0; pm2 `mini-dsh` restarted and verified live (bundled
+catalog = explorer, worker, reviewer, verifier). The gate first exited 1 on
+an unhandled stdin `EPIPE` from the MCP stdio client after the watchdog killed
+a server; stdin errors now fail the transport instead of escaping
+(`src/harness/mcp/client.ts`). A load-dependent race in the `server-g4`
+delegation test (asserting the root's third step before it ran) now polls.
+Agent-tool coverage added: `list` shows only the caller root's children,
+`reconcile` ignores a sibling root's child, and the inheritance projection
+drops tool traffic and unlabelled fragments. Still flaky under full-suite
+load only: the documented `bash.spec.ts` orphan-marker race.
 
 ## Risks
 
@@ -495,7 +510,7 @@ real plan defects, all propagated into the phase files in this pass:
       behaviorally-tested cleanup, and typed/429 capacity failure reporting.
 - [x] Update plan goals, success criteria, risks, and constraints for foundation
       hardening and the corrected result/inheritance/writer semantics.
-- [ ] Implementation: every phase's Success Criteria stay unchecked until cooked.
+- [x] Implementation: every phase's Success Criteria stay unchecked until cooked.
 
 #### Impact on Phases
 - Phase 0: added as prerequisite (already carried its Validation Session 1 marker);

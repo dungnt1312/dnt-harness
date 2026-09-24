@@ -118,4 +118,35 @@ describe('Agent tool child ownership', () => {
       await harness.kernel.stop()
     }
   }, 15_000)
+
+  it('lists only the caller root children and does not reconcile a sibling root child', async () => {
+    const harness = await boot()
+    try {
+      const packet = { prompt: 'Read the blocked file.', requiredResult: 'status' }
+      const ownChild = await harness.executor.spawn({
+        workspaceId: harness.workspaceId as never,
+        parentSessionId: harness.callerRootId as never,
+        parentTurnId: 'caller-turn',
+        definition: bundledDefinition('explorer'),
+        packet,
+      })
+      const siblingChild = await harness.executor.spawn({
+        workspaceId: harness.workspaceId as never,
+        parentSessionId: harness.siblingRootId as never,
+        parentTurnId: 'sibling-turn',
+        definition: bundledDefinition('explorer'),
+        packet,
+      })
+
+      const listed = (await executeAsCaller(harness, { action: 'list' })) as { children: Array<{ childSessionId: string }> }
+      expect(listed.children.map((child) => child.childSessionId)).toEqual([ownChild.childSessionId])
+
+      const reconciled = await executeAsCaller(harness, { action: 'reconcile', childIds: [siblingChild.childSessionId] })
+      expect(reconciled).toEqual({ children: [] })
+    } finally {
+      await harness.executor.cancelAllOfRoot(harness.callerRootId as never)
+      await harness.executor.cancelAllOfRoot(harness.siblingRootId as never)
+      await harness.kernel.stop()
+    }
+  }, 15_000)
 })

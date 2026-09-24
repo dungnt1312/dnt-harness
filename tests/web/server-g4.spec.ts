@@ -388,7 +388,8 @@ describe('G4 HTTP surface', () => {
     // The root saw both digests through one wait call.
     const waited = await toolResultMatching(base, wsId, rootSession.id, /child inspected/)
     expect(waited).toContain('child inspected src/index.ts')
-    expect(step).toBe(3)
+    // The wait result is durable before the root takes its next step.
+    await expect.poll(() => step, { timeout: 5_000 }).toBe(3)
     await server.close()
   }, 30_000)
 
