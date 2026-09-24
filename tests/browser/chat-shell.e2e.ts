@@ -102,6 +102,8 @@ async function fixture(page: Page, options: Options = {}): Promise<{ readonly po
     if (path === '/api/auth/state' && method === 'GET') return json(route, { required: false, paired: true })
     if (path === '/api/model-defaults') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/model$/.test(path)) return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null, source: 'session' })
+    // No extra folder grants: file tools stay within the bound project.
+    if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/grants$/.test(path) && method === 'GET') return json(route, { revision: 0, roots: [], effective: [] })
     if (path === '/api/workspaces/w/skills') return json(route, [])
     if (path === '/api/workspaces/w/projects/p/files') return json(route, new URL(request.url()).searchParams.get('path') === 'src'
       ? { path: 'src', entries: [{ name: 'step-8.ts', path: 'src/step-8.ts', kind: 'file', size: 120 }] }

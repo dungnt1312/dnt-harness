@@ -94,6 +94,8 @@ async function fixture(page: Page, options: { readonly shells?: readonly { id: s
     if (path === '/api/auth/state' && method === 'GET') return json(route, { required: false, paired: true })
     if (path === '/api/model-defaults') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null })
     if (path === '/api/workspaces/w/sessions/s/model') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null, source: 'session' })
+    // No extra folder grants: file tools stay within the bound project.
+    if (path === '/api/workspaces/w/sessions/s/grants' && method === 'GET') return json(route, { revision: 0, roots: [], effective: [] })
     if (path === '/api/workspaces/w/projects/p/files') return json(route, { path: '', entries: [] })
     if (path.endsWith('/manifest')) return json(route, { modeId: 'chat', modeRevision: 1, budget: { availableTokens: 32000, usedTokens: 0, estimated: true }, history: { setting: 'all', includedTurns: 0, omittedTurns: 0 }, sources: { skills: [], memory: [], toolNames: [], toolSchemas: 0 }, omissions: [] })
 

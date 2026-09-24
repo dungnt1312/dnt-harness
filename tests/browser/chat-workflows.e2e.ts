@@ -139,6 +139,8 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
     if (path === '/api/model-defaults' && method === 'GET') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null })
     if (path === '/api/model-defaults' && method === 'PUT') return json(route, { thinkingLevel: null, ...(body as object) })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/model$/.test(path) && method === 'GET') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null, source: 'global' })
+    // No extra folder grants: file tools stay within the bound project.
+    if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/grants$/.test(path) && method === 'GET') return json(route, { revision: 0, roots: [], effective: [] })
     if (path === '/api/workspaces/w/projects/p/files' && method === 'GET') return json(route, url.searchParams.get('path') === 'src'
       ? { path: 'src', entries: [{ name: 'index.ts', path: 'src/index.ts', kind: 'file', size: 26 }] }
       : { path: '', entries: [{ name: 'src', path: 'src', kind: 'dir' }, { name: 'README.md', path: 'README.md', kind: 'file', size: 9 }] })
@@ -563,11 +565,10 @@ test('Artifacts projects existing event data without any additional API request'
   await page.setViewportSize({ width: 1440, height: 900 })
   const state = await fixture(page, 'artifacts')
   await openWorkbench(page)
-  // Files is the default view: the Context manifest is not requested until Context shows.
-  await page.waitForTimeout(750)
-  expect(state.count('GET', `${SESSION_PATH}/manifest`)).toBe(0)
-  await selectWorkbenchView(page, 'Context')
+  // The composer's context meter reads the manifest once the conversation
+  // settles, whichever workbench view is showing.
   await expect.poll(() => state.count('GET', `${SESSION_PATH}/manifest`)).toBe(1)
+  await selectWorkbenchView(page, 'Context')
   const before = state.requests().length
   const workbench = await selectWorkbenchView(page, 'Artifacts')
   const list = workbench.getByRole('list', { name: 'Recorded artifacts' })
@@ -583,13 +584,14 @@ test('Artifacts projects existing event data without any additional API request'
   await page.waitForTimeout(750)
   expect(state.requests()).toHaveLength(before)
   await page.reload()
-  // The opened views and the selected one are remembered, and reopening on
-  // Artifacts does not fetch the manifest.
+  // The opened views and the selected one are remembered; the new page load
+  // reads the manifest once more for the meter, never once per view.
   const reopened = await openWorkbench(page)
   await expect(reopened.getByRole('button', { name: 'Artifacts', exact: true })).toHaveAttribute('aria-pressed', 'true')
   await expect(reopened.getByRole('button', { name: 'Context', exact: true })).toBeVisible()
+  await expect.poll(() => state.count('GET', `${SESSION_PATH}/manifest`)).toBe(2)
   await page.waitForTimeout(750)
-  expect(state.count('GET', `${SESSION_PATH}/manifest`)).toBe(1)
+  expect(state.count('GET', `${SESSION_PATH}/manifest`)).toBe(2)
 })
 
 test('Open in workbench reads the current project file, never the recorded output', async ({ page }) => {
@@ -618,19 +620,18 @@ test('a tool row states its window and opens the workbench at the lines it read'
   expect(state.requests().filter((request) => request.method !== 'GET')).toHaveLength(0)
 })
 
-test('Context manifest is lazy for the exact view, selection, settled, and open conditions', async ({ page }) => {
+test('Context manifest is read once per settled conversation, not once per workbench view', async ({ page }) => {
   await page.setViewportSize({ width: 1024, height: 900 })
   const state = await fixture(page, 'no-work')
-  await page.waitForTimeout(750)
-  expect(state.count('GET', `${SESSION_PATH}/manifest`)).toBe(0)
-  await selectWorkbenchView(page, 'Context')
   await expect.poll(() => state.count('GET', `${SESSION_PATH}/manifest`)).toBe(1)
-  await selectWorkbenchView(page, 'Artifacts')
-  const afterContext = state.requests().length
-  await page.waitForTimeout(750)
-  expect(state.requests()).toHaveLength(afterContext)
   await selectWorkbenchView(page, 'Context')
-  await expect.poll(() => state.count('GET', `${SESSION_PATH}/manifest`)).toBe(2)
+  await selectWorkbenchView(page, 'Artifacts')
+  const afterViews = state.requests().length
+  await page.waitForTimeout(750)
+  expect(state.requests()).toHaveLength(afterViews)
+  await selectWorkbenchView(page, 'Context')
+  await page.waitForTimeout(750)
+  expect(state.count('GET', `${SESSION_PATH}/manifest`)).toBe(1)
 })
 
 test('manifest stays fail-closed beyond the delay when the active workspace is null', async ({ page }) => {
@@ -908,7 +909,7 @@ test('captures the deterministic screenshot matrix', async ({ browser }) => {
     { name: 'artifacts-empty', fixture: 'no-work', prepare: async page => { await selectWorkbenchView(page, 'Artifacts') } },
     { name: 'artifacts-populated', fixture: 'artifacts', prepare: async page => { await selectWorkbenchView(page, 'Artifacts') } },
     { name: 'settings-dirty', fixture: 'settings', prepare: async page => { await (await settingsTrigger(page)).click(); await (await providerName(page.getByRole('dialog', { name: 'Settings' }))).fill('Dirty provider draft') } },
-    { name: 'settings-conflict', fixture: 'settings', prepare: async page => { const dialog = page.getByRole('dialog', { name: 'Settings' }); await (await settingsTrigger(page)).click(); if (await dialog.getByRole('tab', { name: /Skills/ }).isVisible()) await dialog.getByRole('tab', { name: /Skills/ }).click(); else { await page.getByRole('combobox', { name: 'Settings section' }).click(); await page.getByRole('option', { name: 'Skills' }).click() } await dialog.getByRole('button', { name: 'Edit' }).click(); await dialog.getByLabel('SKILL.md content').fill('local conflict draft'); await dialog.getByRole('button', { name: 'Save skill' }).click(); await expect(dialog.getByRole('button', { name: 'Overwrite anyway' })).toBeVisible() } },
+    { name: 'settings-conflict', fixture: 'settings', prepare: async page => { const dialog = page.getByRole('dialog', { name: 'Settings' }); await (await settingsTrigger(page)).click(); await expect(dialog).toBeVisible(); if ((page.viewportSize()?.width ?? 0) > 600) await dialog.getByRole('tab', { name: /Skills/ }).click(); else { await page.getByRole('combobox', { name: 'Settings section' }).click(); await page.getByRole('option', { name: 'Skills' }).click() } await dialog.getByRole('button', { name: 'Edit' }).click(); await dialog.getByLabel('SKILL.md content').fill('local conflict draft'); await dialog.getByRole('button', { name: 'Save skill' }).click(); await expect(dialog.getByRole('button', { name: 'Overwrite anyway' })).toBeVisible() } },
   ]
   for (const width of REQUIRED_WIDTHS) {
     for (const state of states) {
