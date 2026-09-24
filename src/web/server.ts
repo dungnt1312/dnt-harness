@@ -102,6 +102,7 @@ import { configRevision, upsertServer, withServerEnabled, withoutServer } from '
 import { clearAuditFault, dispatchToolCall, faultIsOpen } from '../harness/mcp/execution-coordinator.ts'
 import { McpExecutionJournal } from '../harness/mcp/execution-journal.ts'
 import { MutationStore, readFileIfPresent } from '../harness/mcp/mutation-store.ts'
+import { recoverMigrations } from '../harness/mcp/migration.ts'
 import { DataHomeLock } from '../harness/mcp/ownership-lock.ts'
 import { ManagedOAuth } from '../harness/mcp/oauth.ts'
 import { OAuthStore } from '../harness/mcp/oauth-store.ts'
@@ -536,6 +537,11 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const ownerLock = await DataHomeLock.acquire(resourceHome)
   const mutations = new MutationStore(resourceHome)
   await mutations.recover()
+  // An interrupted `migrate-mcp` run is rolled back to its verified backup
+  // before any config is read.
+  for (const settled of await recoverMigrations(resourceHome)) {
+    console.warn(`web: MCP migration ${settled.backup} was interrupted; ${settled.outcome === 'rolled_back' ? 'restored its backup' : 'it had not changed anything'}`)
+  }
   const mcpGeneration = new Map<string, number>()
   const configWatch = new Map<string, string>()
   const drifted = new Set<string>()
@@ -1265,20 +1271,51 @@ ${decision.injected}`, ...contents]
     }
   }
 
-  async function commitMcpConfig(workspaceId: WorkspaceId, next: McpConfig): Promise<void> {
-    const target = mcpStore.mcpPath(workspaceId)
+  /**
+   * One queue per workspace for every desired-state write (config and
+   * secrets). Each write loads, transforms, and saves inside its turn, so two
+   * requests never both read the old file and the later save erase the other.
+   */
+  const mcpMutationQueue = new Map<WorkspaceId, Promise<void>>()
+  function serializeMcpMutation<T>(workspaceId: WorkspaceId, run: () => Promise<T>): Promise<T> {
+    const previous = mcpMutationQueue.get(workspaceId) ?? Promise.resolve()
+    const next = previous.then(run, run)
+    mcpMutationQueue.set(workspaceId, next.then(() => undefined, () => undefined))
+    return next
+  }
+
+  /** Durable intent → fence → atomic save → commit, for one desired-state file. */
+  async function writeDesiredState(workspaceId: WorkspaceId, mutation: 'config' | 'secrets', target: string, save: () => Promise<void>): Promise<void> {
     const backup = await readFileIfPresent(target)
-    const id = await mutations.begin({ mutation: 'config', workspaceId, target, backup })
+    const id = await mutations.begin({ mutation, workspaceId, target, backup })
     await fenceWorkspace(workspaceId)
     try {
-      await mcpStore.saveMcp(workspaceId, next)
+      await save()
       await mutations.commit(id)
-      configWatch.set(workspaceId, await fileDigest(workspaceId))
-      drifted.delete(workspaceId)
     } catch (error) {
       await mutations.abort(id)
       throw error
     }
+  }
+
+  /** Apply `transform` to the CURRENT config; it may throw to refuse (stale revision, missing server). */
+  function updateMcpConfig(workspaceId: WorkspaceId, transform: (current: McpConfig) => McpConfig): Promise<McpConfig> {
+    return serializeMcpMutation(workspaceId, async () => {
+      const next = transform(await mcpStore.loadMcp(workspaceId))
+      await writeDesiredState(workspaceId, 'config', mcpStore.mcpPath(workspaceId), () => mcpStore.saveMcp(workspaceId, next))
+      configWatch.set(workspaceId, await fileDigest(workspaceId))
+      drifted.delete(workspaceId)
+      return next
+    })
+  }
+
+  /** Apply `transform` to the CURRENT secrets map (in place). */
+  function updateMcpSecrets(workspaceId: WorkspaceId, transform: (secrets: Record<string, string>) => void): Promise<void> {
+    return serializeMcpMutation(workspaceId, async () => {
+      const secrets = await mcpStore.loadSecrets(workspaceId)
+      transform(secrets)
+      await writeDesiredState(workspaceId, 'secrets', mcpStore.secretsPath(workspaceId), () => mcpStore.saveSecrets(workspaceId, secrets))
+    })
   }
 
   async function fileDigest(workspaceId: string): Promise<string> {
@@ -2184,7 +2221,8 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
       enabled: options.controlPlaneAuth === true,
       canonicalOrigin: 'http://127.0.0.1',
     }),
-    commitMcpConfig,
+    updateMcpConfig,
+    updateMcpSecrets,
     sessionPrincipals,
     oauth,
     generationOf,
@@ -2276,6 +2314,14 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
   }
 }
 
+/** A config save whose `expectedRevision` no longer matches the file it would replace. */
+class McpRevisionConflict extends Error {
+  constructor() {
+    super('mcp.json changed since it was loaded')
+    this.name = 'McpRevisionConflict'
+  }
+}
+
 interface HandlerDeps {
   readonly kernel: Kernel
   readonly sessions: Map<SessionId, SessionEntry>
@@ -2352,7 +2398,9 @@ interface HandlerDeps {
   readonly terminalDefaultCwd: string
   readonly allowedHosts: ReadonlySet<string>
   readonly auth: ControlPlaneAuthService
-  readonly commitMcpConfig: (workspaceId: WorkspaceId, next: McpConfig) => Promise<void>
+  /** Serialized per workspace; `transform` sees the current config and may throw to refuse. */
+  readonly updateMcpConfig: (workspaceId: WorkspaceId, transform: (current: McpConfig) => McpConfig) => Promise<McpConfig>
+  readonly updateMcpSecrets: (workspaceId: WorkspaceId, transform: (secrets: Record<string, string>) => void) => Promise<void>
   readonly sessionPrincipals: Map<string, string>
   readonly oauth: ManagedOAuth
   readonly generationOf: (workspaceId: string) => number
@@ -3228,12 +3276,13 @@ async function handleApi(
         const imported = dialect === 'codex'
           ? importCodexMcp(content, typeof body['sourceVersion'] === 'string' ? body['sourceVersion'] : '')
           : importClaudeMcp(content)
-        const existing = await deps.mcpStore.loadMcp(wsId)
-        let merged = existing
-        for (const [name, server] of Object.entries(imported.servers)) {
-          merged = upsertServer(merged, name, { ...server, enabled: false })
-        }
-        await deps.commitMcpConfig(wsId, merged)
+        await deps.updateMcpConfig(wsId, (existing) => {
+          let merged = existing
+          for (const [name, server] of Object.entries(imported.servers)) {
+            merged = upsertServer(merged, name, { ...server, enabled: false })
+          }
+          return merged
+        })
         send(201, {
           imported: Object.keys(imported.servers),
           enabled: [],
@@ -3326,7 +3375,7 @@ async function handleApi(
           }
           // Stop the process and drop its tool schemas before the config forgets it.
           await deps.cancelMcpConnection(wsId, serverName)
-          await deps.commitMcpConfig(wsId, withoutServer(config, serverName))
+          await deps.updateMcpConfig(wsId, (current) => withoutServer(current, serverName))
           send(200, { deleted: serverName })
           return
         }
@@ -3334,17 +3383,27 @@ async function handleApi(
           // Register/update a server (config + provenance, no auto-spawn).
           requireWorkspace(deps, wsId, true)
           const body = await readJson(req)
-          const config = await deps.mcpStore.loadMcp(wsId)
           const expected = body['expectedRevision']
-          if (typeof expected === 'string' && expected !== configRevision(config)) {
-            send(409, { error: 'mcp.json changed since it was loaded; reload before saving', revision: configRevision(config) })
-            return
-          }
           const { expectedRevision: _expected, ...serverBody } = body
           void _expected
           const name = typeof body['name'] === 'string' && body['name'] !== '' ? body['name'] : serverName
-          const merged = upsertServer(config, name, serverBody)
-          await deps.commitMcpConfig(wsId, merged)
+          // The revision check runs inside the workspace's write turn, against
+          // the file as it is when this save applies — not as it was on read.
+          let conflict: string | undefined
+          const merged = await deps.updateMcpConfig(wsId, (current) => {
+            if (typeof expected === 'string' && expected !== configRevision(current)) {
+              conflict = configRevision(current)
+              throw new McpRevisionConflict()
+            }
+            return upsertServer(current, name, serverBody)
+          }).catch((error: unknown) => {
+            if (error instanceof McpRevisionConflict) return undefined
+            throw error
+          })
+          if (merged === undefined) {
+            send(409, { error: 'mcp.json changed since it was loaded; reload before saving', revision: conflict })
+            return
+          }
           send(201, { saved: name, enabled: merged.servers[name]?.enabled === true, activated: false })
           return
         }
@@ -3368,7 +3427,7 @@ async function handleApi(
             return
           }
           if (action === 'disable') {
-            await deps.commitMcpConfig(wsId, withServerEnabled(config, serverName, false))
+            await deps.updateMcpConfig(wsId, (current) => withServerEnabled(current, serverName, false))
             await deps.cancelMcpConnection(wsId, serverName)
             send(200, { status: 'disabled' })
             return
@@ -3380,8 +3439,7 @@ async function handleApi(
               return
             }
           }
-          const enabledNext = withServerEnabled(config, serverName, true)
-          await deps.commitMcpConfig(wsId, enabledNext)
+          await deps.updateMcpConfig(wsId, (current) => withServerEnabled(current, serverName, true))
           if (action === 'reconnect') await deps.cancelMcpConnection(wsId, serverName)
           deps.mcpCancelled.delete(`${wsId}:${serverName}`)
           // Fresh/singleton connect; ensureMcpServer lists + reconciles tools.
@@ -3437,10 +3495,8 @@ async function handleApi(
           send(400, { error: "body needs a string 'value'" })
           return
         }
-        const secrets = await deps.mcpStore.loadSecrets(wsId)
-        secrets[key] = body['value']
-        await deps.fenceWorkspace(wsId)
-        await deps.mcpStore.saveSecrets(wsId, secrets)
+        const value = body['value']
+        await deps.updateMcpSecrets(wsId, (secrets) => { secrets[key] = value })
         // Rotation reconnects AFFECTED enabled servers before responding.
         const config = await deps.mcpStore.loadMcp(wsId)
         const ref = `\${${key}}`
@@ -3467,10 +3523,7 @@ async function handleApi(
         return
       }
       if (req.method === 'DELETE' && key !== undefined) {
-        const secrets = await deps.mcpStore.loadSecrets(wsId)
-        delete secrets[key]
-        await deps.fenceWorkspace(wsId)
-        await deps.mcpStore.saveSecrets(wsId, secrets)
+        await deps.updateMcpSecrets(wsId, (secrets) => { delete secrets[key] })
         send(200, { deleted: key })
         return
       }
