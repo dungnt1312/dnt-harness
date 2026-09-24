@@ -1,7 +1,7 @@
 ---
 phase: 2
 title: "Local Control-Plane Authentication"
-status: in-progress
+status: done
 priority: P1
 effort: "6-9 days"
 dependencies: [1]
@@ -73,10 +73,32 @@ SSE streams bind principal/session generation/workspace; revocation increments g
 - [x] Browser mutations require valid CSRF plus canonical Origin; bearer clients are separately authenticated.
 - [x] Logout/revocation closes live streams; reconnect/Last-Event-ID cannot cross session generation or principal.
 - [x] Approval UUID alone cannot view or approve a call.
-- [ ] All web REST callers use `apiFetch()` and auth failures are actionable. REST goes through `apiFetch()`; a static ban on direct `fetch()` and the browser e2e are still open.
-- [ ] Existing terminal/session/agent/hooks/provider flows work for paired users and fail closed otherwise. Unauthenticated routes fail closed; the paired-user browser pass is still open.
-- [ ] Test bootstrap cannot exist in production profile.
+- [x] All web REST callers use `apiFetch()` and auth failures are actionable. `web/lib/api-seam.spec.ts` fails on any direct `fetch`/`EventSource`/XHR outside `web/lib/api.ts`; a 401 returns the page to the pairing gate (`setUnauthorizedHandler`), and the shell mounts only once paired so no load runs unauthenticated.
+- [x] Existing terminal/session/agent/hooks/provider flows work for paired users and fail closed otherwise. `tests/browser/control-plane-auth.e2e.ts` drives the built client against a real auth-on host: pair, a CSRF mode switch, Settings sections, reload, revoke, re-pair. Terminal PTYs are covered by the route tests, not this pass.
+- [x] Test bootstrap cannot exist in production profile. None exists: tests mint codes through the in-process handle; a static test fails on any env/test switch in `src/`.
 - [x] Non-loopback startup remains blocked absent an authenticated TLS profile.
+
+## Delivery notes (2026-09-24)
+
+Closing the open criteria surfaced four real session-lifecycle defects, all
+fixed test-first in `tests/web/control-plane-auth.spec.ts`:
+
+1. `/api/auth/state` answered for the server, not the browser: once any code
+   was consumed (or before one was issued) every browser was told `paired`.
+   It now authenticates the request's own cookie.
+2. A reload lost the in-memory CSRF token, so every mutation after a reload
+   was 403. A live session now gets its token back from `/api/auth/state`.
+3. A dead session cookie locked the browser out of pairing, because pairing
+   refuses any request with a cookie. Refusals and the state probe now clear it.
+4. There was no recovery once the startup code expired (`src/bins/pair.ts`
+   was a stub). The host now publishes an operator channel in
+   `<data>/auth/operator.json`; `npm run pair` mints a fresh code with it.
+
+Open question for the owner, not changed here: this phase's requirement lists
+only liveness, pairing, and the OAuth deposit as public, but
+`docs/decisions/mcp-production-boundaries.md` and the route inventory keep
+`GET /api/meta` public as "non-sensitive host metadata". It returns provider
+names/base URLs, models, and the default folder path.
 
 ## Risk Assessment
 
