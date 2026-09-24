@@ -317,6 +317,31 @@ export function supportsReasoningControl(modelId: string | null | undefined): bo
   )
 }
 
+/**
+ * The thinking level a request for THIS model may actually carry: the
+ * requested level when the model documents it, else `undefined` — no
+ * override is sent and the model's own default stands.
+ *
+ * A chosen level is a preference, not a capability. Switching to a model
+ * that does not document it must never keep carrying the old level as if
+ * the new model supported it: the adapter would silently send nothing
+ * while the UI kept claiming the old level. Resolving here keeps the
+ * control, the chip, and the wire body saying the same thing.
+ */
+export function expressibleThinkingLevel(
+  modelId: string | null | undefined,
+  level: string | null | undefined,
+): ThinkingLevel | undefined {
+  if (level === undefined || level === null || level === '') return undefined
+  if (!isThinkingLevel(level)) return undefined
+  const capability = getReasoningCapability(modelId)
+  if (capability === null || capability.transportSupported !== true || capability.alwaysOn === true) return undefined
+  // `off` is only real where the provider documents a disable request;
+  // everywhere else the documented level list is the whole vocabulary.
+  if (level === 'off') return capability.canDisable ? 'off' : undefined
+  return capability.levels.includes(level) ? level : undefined
+}
+
 // ── context limits ────────────────────────────────────────────────
 
 /** Fallback when no override, catalog entry, or known-family rule applies. */

@@ -39,4 +39,30 @@ describe('session control labels', () => {
     act(() => root.render(<ThinkingMenu menuLabel="Default thinking level for new conversations" model="o3" value={null} onSelect={() => {}} />))
     expect(host.querySelector('button')?.getAttribute('aria-label')).toBe('Default thinking level for new conversations')
   })
+
+  it('shows the selected model’s own level, not a saved level it cannot express', () => {
+    const chip = (): string | null | undefined => host.querySelector('button')?.textContent
+    // Max is documented on gpt-5.6, so the saved override is what the chip shows.
+    act(() => root.render(<ThinkingMenu model="gpt-5.6" value="max" onSelect={() => {}} />))
+    expect(chip()).toContain('Max')
+    // glm-5.1 documents no explicit level: the saved Max cannot ride the next
+    // request, so the chip must stop claiming it.
+    act(() => root.render(<ThinkingMenu model="glm-5.1" value="max" onSelect={() => {}} />))
+    expect(chip()).not.toContain('Max')
+    expect(chip()).toContain('Off')
+  })
+
+  it('says a saved level is ignored rather than showing it as the chosen row', () => {
+    act(() => root.render(<ThinkingMenu model="glm-5.1" value="max" onSelect={() => {}} />))
+    act(() => (host.querySelector('button') as HTMLButtonElement).click())
+    const rows = Array.from(document.querySelectorAll('[role="menuitemradio"]'))
+    // Max is not a row this model offers, so it cannot be the marked one.
+    expect(rows.map((row) => row.textContent)).toEqual([
+      expect.stringContaining('Model default'),
+      'Off',
+    ])
+    expect(rows[0]?.textContent).toContain('Saved Max is not available on this model')
+    expect(rows.filter((row) => row.getAttribute('aria-checked') === 'true')).toHaveLength(1)
+    expect(rows[0]?.getAttribute('aria-checked')).toBe('true')
+  })
 })

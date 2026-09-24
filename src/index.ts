@@ -103,6 +103,7 @@ export {
   applyThinkingOverride,
   bareModelId,
   defaultThinkingLevel,
+  expressibleThinkingLevel,
   formatContextLimit,
   getModelInfo,
   getReasoningCapability,

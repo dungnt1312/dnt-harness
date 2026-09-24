@@ -1006,6 +1006,42 @@ describe('sidebar sections + live rows + workspace management', () => {
   })
 })
 
+describe('per-folder show more', () => {
+  const project = { id: 'pf', name: 'Long folder', workspaceId: 'w1', path: 'C:/long', createdAt: 1 }
+  const now = Date.now()
+  const many = Array.from({ length: 7 }, (_, index) => ({
+    id: `m${index + 1}`,
+    title: `Topic ${index + 1}`,
+    projectId: 'pf',
+    status: 'idle' as const,
+    pendingInputs: 0,
+    updatedAt: now - index * 60_000,
+    eventCount: 3,
+    folder: null,
+  }))
+  const props = { sessions: many, projects: [project], filter: '', liveRunning: false, onSelect: () => {}, onRename: () => {}, onDeleteRequest: () => {} }
+  it('keeps a long folder to five rows and reveals the rest on demand', async () => {
+    await mount(<SessionList {...props} current={null} />)
+    expect(host.textContent).toContain('Topic 5')
+    expect(host.textContent).not.toContain('Topic 6')
+    await act(async () => button('Show more').click())
+    expect(host.textContent).toContain('Topic 6')
+    expect(host.textContent).toContain('Topic 7')
+    await act(async () => button('Show less').click())
+    expect(host.textContent).not.toContain('Topic 6')
+    expect(host.textContent).toContain('Topic 5')
+  })
+  it('never hides search matches behind the toggle', async () => {
+    await mount(<SessionList {...props} current={null} filter="Topic" />)
+    expect(host.textContent).toContain('Topic 7')
+    expect(host.textContent).not.toContain('Show more')
+  })
+  it('shows the open conversation even when it sits past the cut', async () => {
+    await mount(<SessionList {...props} current="m6" />)
+    expect(host.textContent).toContain('Topic 6')
+  })
+})
+
 describe('global feedback', () => {
   function Boom(): null {
     throw new Error('render exploded')

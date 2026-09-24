@@ -87,10 +87,14 @@ per-session model preference from the log, last `session/model` event wins.
 An omitted field carries the preceding value forward; `null` survives as an
 explicit session-owned blank for `provider`/`model` (so sending is rejected),
 while `thinkingLevel: null` means the selected model's configured default.
-Neither kind of null re-inherits global controls. The returned `hasEvent`
-flag separates a **legacy log** (no `session/model` event — the caller alone
-falls back to the global default) from a session that owns a preference,
-even an all-null one. `deriveMessages` ignores these
+Neither kind of null re-inherits global controls. A saved level is a
+**preference, not a capability**: `expressibleThinkingLevel` keeps it only
+for a model whose catalog entry documents it, so switching to a model that
+does not offer it drops the override (the model's own default governs) while
+the saved value stays in the log and applies again on a model that does.
+The returned `hasEvent` flag separates a **legacy log** (no `session/model`
+event — the caller alone falls back to the global default) from a session
+that owns a preference, even an all-null one. `deriveMessages` ignores these
 events; the preference is durable exactly like `session/title` and replays
 across restarts.
 

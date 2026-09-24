@@ -126,6 +126,8 @@ const BUCKET_LABELS: Readonly<Record<'today' | 'yesterday' | 'earlier', string>>
 const BUCKET_ORDER = ['today', 'yesterday', 'earlier', 'none'] as const
 /** Collapse-record key for the unfiled-chats folder; session ids never look like this. */
 const CHATS_KEY = 'loose-chats'
+/** Rows shown per folder before "Show more" takes over; matches the sidebar reference. */
+const FOLDER_PREVIEW_COUNT = 5
 
 function bucketed(sessions: readonly SessionListing[]): readonly (readonly [typeof BUCKET_ORDER[number], readonly SessionListing[]])[] {
   const buckets = new Map<typeof BUCKET_ORDER[number], SessionListing[]>()
@@ -160,6 +162,9 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
 }) {
   // UI-local collapse state, honored for every group including the open one.
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
+  // Per-folder "Show more" state; a folder holding the open conversation and
+  // an active search always render in full instead.
+  const [expandedFolders, setExpandedFolders] = useState<Record<string, boolean>>({})
   // Drag-to-reorder: the hovered target edge shows an insertion line; rows
   // never move mid-drag because relocating the dragged node cancels native
   // browser drag-and-drop.
@@ -257,6 +262,12 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
         if (projectSessions.length === 0) return null
         const runningCount = projectSessions.filter((session) => (session.status ?? 'idle') === 'running' || (session.id === current && liveRunning)).length
         const isCollapsed = collapsed[project.id] === true
+        // The open conversation must never hide behind the cut, and neither
+        // must search results, so those two render expanded without a toggle.
+        const holdsCurrent = projectSessions.some((session) => session.id === current)
+        const expanded = holdsCurrent || query !== '' || expandedFolders[project.id] === true
+        const visible = expanded ? projectSessions : projectSessions.slice(0, FOLDER_PREVIEW_COUNT)
+        const showToggle = projectSessions.length > FOLDER_PREVIEW_COUNT && !holdsCurrent && query === ''
         return (
           <Collapsible.Root key={project.id} open={!isCollapsed} onOpenChange={(open) => setCollapsed((prev) => ({ ...prev, [project.id]: !open }))} className="mt-1.5 first:mt-1">
             <div {...(onReorder !== undefined ? dragHandlers(project) : {})} className={cn('group relative flex items-center rounded-lg hover:bg-hover', dragId === project.id && 'opacity-40')}>
@@ -277,7 +288,18 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
                 </IconButton>
               ) : null}
             </div>
-            <Collapsible.Content className="mt-0.5 ml-3 pl-1.5">{rows(projectSessions)}</Collapsible.Content>
+            <Collapsible.Content className="mt-0.5 ml-3 pl-1.5">
+              {rows(visible)}
+              {showToggle ? (
+                <button
+                  type="button"
+                  onClick={() => setExpandedFolders((prev) => ({ ...prev, [project.id]: !(prev[project.id] === true) }))}
+                  className="mt-0.5 rounded-lg px-2.5 py-1 text-xs text-fg-faint hover:bg-hover hover:text-fg"
+                >
+                  {expandedFolders[project.id] === true ? 'Show less' : 'Show more'}
+                </button>
+              ) : null}
+            </Collapsible.Content>
           </Collapsible.Root>
         )
       })}

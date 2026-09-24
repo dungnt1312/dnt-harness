@@ -1,13 +1,15 @@
 import Icon from '../common/Icon.tsx'
 import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import { composerChipClass } from './composer-chip.ts'
-import { THINKING_LABELS, defaultThinkingLevel, effectiveThinking, getReasoningCapability } from '../../lib/model-info.ts'
+import { THINKING_LABELS, effectiveThinking, getReasoningCapability } from '../../lib/model-info.ts'
 import type { ModelSettings } from '../../lib/types.ts'
 
 /**
  * Live thinking-level control. Rows: `Model default` (clears the override)
  * plus the levels the model documents — `Off` only when the provider can
- * really disable thinking. The chip shows the level the next request carries.
+ * really disable thinking. The chip shows the level the next request carries,
+ * which is also the row marked chosen: a saved level this model does not
+ * document is reported as ignored rather than shown as if it applied.
  */
 export function ThinkingMenu({ menuLabel = 'Default thinking level for new conversations', disabled = false, model, value, settings, onSelect }: {
   /** Accessible control label identifies conversation scope or global default. */
@@ -31,12 +33,22 @@ export function ThinkingMenu({ menuLabel = 'Default thinking level for new conve
     )
   }
 
-  const rows: readonly { readonly level: string | null; readonly label: string }[] = [
-    { level: null, label: 'Model default' },
+  const ignored = effective.ignoredOverride
+  const rows: readonly { readonly level: string | null; readonly label: string; readonly note?: string }[] = [
+    {
+      level: null,
+      label: 'Model default',
+      // The saved level is kept in the log but cannot ride this model's
+      // request, so the row that governs says so instead of the panel
+      // showing Max as if it applied.
+      ...(ignored !== undefined
+        ? { note: `Saved ${THINKING_LABELS[ignored]} is not available on this model; it returns on one that offers it.` }
+        : {}),
+    },
     ...(capability.canDisable ? [{ level: 'off', label: 'Off' }] : []),
     ...capability.levels.map((level) => ({ level: level as string, label: THINKING_LABELS[level] })),
   ]
-  const shown = effective.fromOverride ? THINKING_LABELS[effective.level] : THINKING_LABELS[defaultThinkingLevel(capability)]
+  const shown = THINKING_LABELS[effective.level]
 
   return (
     <Menu
@@ -58,7 +70,7 @@ export function ThinkingMenu({ menuLabel = 'Default thinking level for new conve
         <>
           <div className="px-2.5 pb-1 pt-1.5 text-xs font-medium text-fg-faint">Thinking</div>
           {rows.map((row) => {
-            const active = row.level === null ? value === null : value === row.level
+            const active = row.level === null ? !effective.fromOverride : effective.fromOverride && row.level === effective.level
             return (
               <button
                 key={row.level ?? 'default'}
@@ -68,8 +80,15 @@ export function ThinkingMenu({ menuLabel = 'Default thinking level for new conve
                 className={menuItemClass}
                 onClick={() => { onSelect(row.level); close() }}
               >
-                <span className="flex-1">{row.label}</span>
-                {active ? <Icon name="check" size={15} /> : null}
+                {row.note === undefined ? (
+                  <span className="flex-1">{row.label}</span>
+                ) : (
+                  <span className="flex min-w-0 flex-1 flex-col">
+                    <span>{row.label}</span>
+                    <span className="text-xs leading-5 text-fg-faint">{row.note}</span>
+                  </span>
+                )}
+                {active ? <Icon name="check" size={15} className="shrink-0" /> : null}
               </button>
             )
           })}
