@@ -1,7 +1,7 @@
 ---
 title: "Product UI standardization"
 description: "Repository-verified plan to turn the raw MVP into a coherent English workbench without changing harness safety contracts."
-status: in-progress
+status: superseded
 priority: P1
 effort: 15d
 branch: main
@@ -12,6 +12,25 @@ blocks: []
 ---
 
 # Product UI standardization
+
+## Superseded (2026-09-24)
+
+Not cooked phase by phase. Its execution record
+(`docs/ux-ui-standardization-checklist.md`, 68/68, now marked historical) was
+overtaken by `plans/260917-1608-chatgpt-style-ui-rebuild/` and
+`plans/260918-1007-warm-studio-workbench/`, both completed. The outcomes this
+plan owned are verified on the current tree rather than claimed from here:
+
+- English migration: `web/index.html` is `lang="en"`; no Vietnamese string
+  remains in non-test `web/` sources.
+- Browser acceptance: `npm run test:browser` 71/71 — axe (WCAG 2.1 AA), no
+  horizontal overflow at 320/375/768/1024/1440/1920, keyboard and focus-trap
+  paths, 44 px touch targets, light/dark, and the screenshot matrix.
+- Safety semantics (approvals, lifecycle, settings dirty/conflict) are held by
+  the chat-workflows and settings suites.
+
+The representative-mockup gate (phase 2) was never run and is not claimed.
+The MCP plan already owns MCP-specific UI evidence in its phases 9–10.
 
 ## Decision
 
