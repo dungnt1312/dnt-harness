@@ -1,7 +1,7 @@
 ---
 phase: 5
 title: "Protocol and Transport Hardening"
-status: in-progress
+status: done
 priority: P1
 effort: "6-8 days"
 dependencies: [1, 4]
@@ -67,13 +67,13 @@ Make stdio and Streamable HTTP strict, bounded, cancellable, and compatible with
 ## Success Criteria
 
 - [x] Unsupported versions fail as `unsupported_protocol_version` before initialized notification.
-- [ ] Application-controlled decoded buffers never exceed documented hard limits. SSE byte cap exists. A decompression-bomb test does not.
-- [ ] Every discovery path yields the same complete bounded tool set. Cursor loops and the page cap are rejected. Two discovery paths are not compared.
-- [ ] CRLF/fragmented SSE and notification storm tests pass. CRLF frames pass. A notification storm test does not.
-- [ ] Redirects cannot leak credentials/session IDs or cause hidden call replay. The policy rejects userinfo and requires callers to re-check hops. A redirect replay fixture is still open.
+- [x] Application-controlled decoded buffers never exceed documented hard limits. JSON responses are read through a decoded-byte counter (`readBoundedText`, `maxFrameBytes`); a ~20 MB gzip bomb in a few KB is refused mid-stream. Before this `response.json()` inflated and buffered all of it.
+- [x] Every discovery path yields the same complete bounded tool set. One `fetchAllTools()` walk (cursor loop, page and tool caps, cross-page duplicates) now serves initial list, health check, breaker recovery, and `tools/list_changed`. Before this the last three fetched page one only, so a health check silently dropped later pages.
+- [x] CRLF/fragmented SSE and notification storm tests pass. 200 `list_changed` notifications cost at most one refresh plus one coalesced follow-up (`tests/harness/mcp-transport-limits.spec.ts`); before, each one started its own refresh.
+- [x] Redirects cannot leak credentials/session IDs or cause hidden call replay. A 307 on `tools/call` is `possibly_dispatched/redirect_followed`, the call is POSTed once, and the redirect target (which would have received the bearer) is never contacted.
 - [x] Shared outbound policy blocks prohibited address/redirect/proxy cases.
-- [ ] Successful/failed/aborted calls leave no retained timer/listener/reader/pending entry. Not measured.
-- [ ] Concurrent reconnect triggers one transport generation. Not measured.
+- [x] Successful/failed/aborted calls leave no retained timer/listener/reader/pending entry. Measured for the abort listener on a long-lived turn signal (`getEventListeners` = 0 after success, HTTP 500, and a dead server); the HTTP path leaked it on every failure before. A turn already stopping now sends nothing (`not_dispatched/cancelled_before_send`) instead of being reported possibly dispatched. Readers release in `finally`; stdio pending entries and per-request timers are cleared in `finally` (by inspection, not a counter).
+- [x] Concurrent reconnect triggers one transport generation. `ensureConnected` is single-flight: ten concurrent first calls build one transport and spawn one process. Before, each built its own; the overwritten ones leaked and the calls timed out.
 - [x] Server metadata cannot alter approval/policy semantics.
 - [x] Targeted tests and typecheck pass.
 
