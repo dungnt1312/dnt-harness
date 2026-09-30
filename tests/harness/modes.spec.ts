@@ -1,5 +1,5 @@
 /**
- * G3 modes: bundled five, custom file parsing/validation, hash pinning,
+ * G3 modes: bundled four, custom file parsing/validation, hash pinning,
  * duplication, and the read-only bundled guarantee.
  */
 import { promises as fs } from 'node:fs'
@@ -21,26 +21,39 @@ afterAll(async () => {
 const WS = 'ws-modes' as never
 
 describe('bundled modes', () => {
-  it('exactly five bundled modes exist and replace the generic Agent preset', () => {
+  it('exactly four bundled modes exist and replace the generic Agent preset', () => {
     expect(BUNDLED_MODES.map((mode) => mode.id)).toEqual([
-      'chat', 'ask-before-changes', 'edit-automatically', 'plan', 'full-access',
+      'ask-before-changes', 'edit-automatically', 'plan', 'full-access',
     ])
-    expect(BUNDLED_MODES).toHaveLength(5)
+    expect(BUNDLED_MODES).toHaveLength(4)
   })
 
-  it('Chat exposes no tools and disables every context loader', async () => {
+  it('a custom mode can expose no tools and disable every context loader', async () => {
     const modes = new ModesService(home)
-    const chat = await modes.resolve(WS, 'chat')
-    expect(chat.definition.toolExposure).toEqual([])
-    expect(chat.definition.sources.workspaceInstructions).toBe(false)
-    expect(chat.definition.sources.skills).toBe('off')
-    expect(chat.definition.sources.memoryPinned).toBe(false)
-    expect(chat.definition.sources.memoryRetrieval).toBe(false)
+    await modes.save(WS, 'silent', [
+      '---',
+      'name: Silent',
+      'toolExposure: []',
+      'workspaceInstructions: false',
+      'skills: off',
+      'memoryPinned: false',
+      'memoryRetrieval: false',
+      '---',
+      '',
+      'You are a conversational assistant with no tools and no workspace context.',
+    ].join('\n'))
+    const silent = await modes.resolve(WS, 'silent')
+    expect(silent.source).toBe('workspace')
+    expect(silent.definition.toolExposure).toEqual([])
+    expect(silent.definition.sources.workspaceInstructions).toBe(false)
+    expect(silent.definition.sources.skills).toBe('off')
+    expect(silent.definition.sources.memoryPinned).toBe(false)
+    expect(silent.definition.sources.memoryRetrieval).toBe(false)
   })
 
   it('every mode has exactly the four fields with distinct defaults vs exposure', async () => {
     const modes = new ModesService(home)
-    for (const id of ['chat', 'ask-before-changes', 'edit-automatically', 'plan', 'full-access']) {
+    for (const id of ['ask-before-changes', 'edit-automatically', 'plan', 'full-access']) {
       const mode = await modes.resolve(WS, id)
       expect(mode.definition.instructions.length).toBeGreaterThan(0)
       expect(mode.definition.sources.history).toBeTruthy()
@@ -121,8 +134,8 @@ describe('custom modes', () => {
 
   it('bundled modes cannot be overwritten or deleted; duplicate creates a copy', async () => {
     const modes = new ModesService(home)
-    await expect(modes.save(WS, 'chat', '---\n---\nhacked')).rejects.toMatchObject({ code: 'duplicate' })
-    await expect(modes.delete(WS, 'chat')).rejects.toMatchObject({ code: 'duplicate' })
+    await expect(modes.save(WS, 'full-access', '---\n---\nhacked')).rejects.toMatchObject({ code: 'duplicate' })
+    await expect(modes.delete(WS, 'full-access')).rejects.toMatchObject({ code: 'duplicate' })
 
     const copy = await modes.duplicate(WS, 'plan', 'plan-custom')
     expect(copy.definition.name).toBe('Plan')

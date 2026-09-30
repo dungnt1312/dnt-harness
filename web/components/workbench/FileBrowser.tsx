@@ -1,116 +1,146 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Icon from '../common/Icon.tsx'
 import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
-import { listProjectFiles, type ProjectListing } from '../../lib/api.ts'
-import { fileStyle, type FileIconStyle } from '../../lib/file-icons.ts'
+import { listProjectFiles, type ProjectEntry, type ProjectListing } from '../../lib/api.ts'
+import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
 import { cn } from '../../lib/cn.ts'
 
-function formatSize(bytes: number | undefined): string {
-  if (bytes === undefined) return ''
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+interface FolderNode {
+  readonly status: 'loading' | 'ready' | 'error'
+  readonly listing: ProjectListing | null
+  readonly error: string | null
 }
 
-/** One folder level of a project: breadcrumb, folders first, files open as tabs. */
-export function FileBrowser({ workspaceId, project, folder, activeFile, onFolder, onOpenFile }: {
+/** A collapsible project tree. Folders load one level at a time; files open as tabs. */
+export function FileBrowser({ workspaceId, project, activeFile, onOpenFile }: {
   readonly workspaceId: string
   readonly project: { readonly id: string; readonly name: string; readonly path: string }
-  readonly folder: string
   readonly activeFile: string | null
-  readonly onFolder: (folder: string) => void
   readonly onOpenFile: (path: string) => void
 }) {
-  const [listing, setListing] = useState<ProjectListing | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const generation = useRef(0)
+  const [nodes, setNodes] = useState<Readonly<Record<string, FolderNode>>>({})
+  const [open, setOpen] = useState<ReadonlySet<string>>(() => new Set())
+  const generation = useRef(new Map<string, number>())
 
-  const load = useCallback(async () => {
-    const request = ++generation.current
-    setLoading(true)
-    setError(null)
+  const load = useCallback(async (folder: string) => {
+    const request = (generation.current.get(folder) ?? 0) + 1
+    generation.current.set(folder, request)
+    setNodes((current) => ({ ...current, [folder]: { status: 'loading', listing: current[folder]?.listing ?? null, error: null } }))
     try {
-      const next = await listProjectFiles(workspaceId, project.id, folder)
-      if (generation.current === request) setListing(next)
+      const listing = await listProjectFiles(workspaceId, project.id, folder)
+      if (generation.current.get(folder) !== request) return
+      setNodes((current) => ({ ...current, [folder]: { status: 'ready', listing, error: null } }))
     } catch (cause) {
-      if (generation.current === request) setError(String(cause))
-    } finally {
-      if (generation.current === request) setLoading(false)
+      if (generation.current.get(folder) !== request) return
+      setNodes((current) => ({ ...current, [folder]: { status: 'error', listing: current[folder]?.listing ?? null, error: String(cause) } }))
     }
-  }, [workspaceId, project.id, folder])
+  }, [workspaceId, project.id])
 
-  useEffect(() => { void load() }, [load])
+  useEffect(() => { void load('') }, [load])
 
-  const segments = folder === '' ? [] : folder.split('/')
-  const parent = segments.slice(0, -1).join('/')
+  const toggle = (folder: string): void => {
+    setOpen((current) => {
+      const next = new Set(current)
+      if (next.has(folder)) next.delete(folder)
+      else next.add(folder)
+      return next
+    })
+    if (nodes[folder] === undefined) void load(folder)
+  }
+
+  const root = nodes['']
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex h-10 shrink-0 items-center gap-1 border-b border-line px-3 text-[13px]">
-        <nav aria-label="Folder path" className="flex min-w-0 flex-1 items-center overflow-hidden whitespace-nowrap">
-          <button type="button" className="shrink-0 truncate rounded px-1 text-fg-muted hover:text-fg" title={project.path} onClick={() => onFolder('')}>
-            {project.path}
-          </button>
-          {segments.map((segment, index) => (
-            <Fragment key={`${index}-${segment}`}>
-              <span className="px-0.5 text-fg-faint" aria-hidden="true">/</span>
-              <button
-                type="button"
-                className={cn('truncate rounded px-1 hover:text-fg', index === segments.length - 1 ? 'font-medium text-fg' : 'text-fg-muted')}
-                aria-current={index === segments.length - 1 ? 'location' : undefined}
-                onClick={() => onFolder(segments.slice(0, index + 1).join('/'))}
-              >
-                {segment}
-              </button>
-            </Fragment>
-          ))}
-        </nav>
-        <IconButton label="Refresh files" onClick={() => void load()}><Icon name="refresh" size={15} /></IconButton>
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line px-2.5 text-[13px]">
+        <Icon name="folder" size={14} className="shrink-0 text-fg-muted" />
+        <span className="min-w-0 flex-1 truncate font-medium" title={project.path}>{project.name}</span>
+        <IconButton label="Refresh files" onClick={() => void load('')}><Icon name="refresh" size={14} /></IconButton>
       </div>
-
-      <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
-        {error !== null ? (
+      <div className="min-h-0 flex-1 overflow-auto py-1">
+        {root?.status === 'error' && root.listing === null ? (
           <div className="flex flex-col items-start gap-2 p-2">
-            <ErrorNotice raw={error} />
-            <Button size="sm" variant="outline" onClick={() => void load()}>Retry</Button>
+            <ErrorNotice raw={root.error ?? ''} />
+            <Button size="sm" variant="outline" onClick={() => void load('')}>Retry</Button>
           </div>
-        ) : loading && listing === null ? (
-          <div className="flex items-center gap-2 p-3 text-sm text-fg-muted" role="status"><Spinner size={13} />Loading files…</div>
+        ) : root === undefined || (root.status === 'loading' && root.listing === null) ? (
+          <div className="flex items-center gap-2 px-2.5 py-2 text-sm text-fg-muted" role="status"><Spinner size={13} />Loading files…</div>
         ) : (
-          <ul aria-label="Project files" className="m-0 flex list-none flex-col p-0">
-            {folder !== '' ? (
-              <li>
-                <button type="button" className="flex min-h-8 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-sm text-fg-muted hover:bg-hover hover:text-fg" onClick={() => onFolder(parent)}>
-                  <Icon name="arrowUp" size={15} />
-                  <span>Parent folder</span>
-                </button>
-              </li>
-            ) : null}
-            {listing?.entries.map((entry) => {
-              const icon: FileIconStyle = entry.kind === 'dir' ? { name: 'folder', className: 'text-fg-muted' } : fileStyle(entry.name)
-              return (
-                <li key={entry.path}>
-                  <button
-                    type="button"
-                    title={entry.path}
-                    onClick={() => entry.kind === 'dir' ? onFolder(entry.path) : onOpenFile(entry.path)}
-                    className={cn('flex min-h-8 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-sm hover:bg-hover', entry.path === activeFile && 'bg-hover')}
-                  >
-                    <Icon name={icon.name} size={15} className={icon.className} />
-                    <span className="min-w-0 flex-1 truncate">{entry.name}</span>
-                    {entry.kind === 'file' ? <span className="shrink-0 text-xs text-fg-faint">{formatSize(entry.size)}</span> : <Icon name="chevronRight" size={14} className="shrink-0 text-fg-faint" />}
-                  </button>
-                </li>
-              )
-            })}
-            {listing !== null && listing.entries.length === 0 ? <li className="px-2.5 py-3 text-sm text-fg-faint">This folder is empty.</li> : null}
-          </ul>
+          <FolderRows
+            entries={root.listing?.entries ?? []}
+            depth={0}
+            nodes={nodes}
+            open={open}
+            activeFile={activeFile}
+            onToggle={toggle}
+            onOpenFile={onOpenFile}
+            onRetry={load}
+          />
         )}
       </div>
     </div>
+  )
+}
+
+function FolderRows({ entries, depth, nodes, open, activeFile, onToggle, onOpenFile, onRetry }: {
+  readonly entries: readonly ProjectEntry[]
+  readonly depth: number
+  readonly nodes: Readonly<Record<string, FolderNode>>
+  readonly open: ReadonlySet<string>
+  readonly activeFile: string | null
+  readonly onToggle: (folder: string) => void
+  readonly onOpenFile: (path: string) => void
+  readonly onRetry: (folder: string) => void
+}) {
+  if (entries.length === 0) return <p className="m-0 px-2.5 py-2 text-[13px] text-fg-faint" style={{ paddingLeft: 10 + depth * 14 }}>Empty folder</p>
+  return (
+    <ul aria-label={depth === 0 ? 'Project files' : undefined} className="m-0 flex list-none flex-col p-0">
+      {entries.map((entry) => {
+        const expanded = entry.kind === 'dir' && open.has(entry.path)
+        const node = nodes[entry.path]
+        return (
+          <li key={entry.path}>
+            <button
+              type="button"
+              title={entry.path}
+              aria-expanded={entry.kind === 'dir' ? expanded : undefined}
+              onClick={() => entry.kind === 'dir' ? onToggle(entry.path) : onOpenFile(entry.path)}
+              style={{ paddingLeft: 6 + depth * 14 }}
+              className={cn('flex min-h-7 w-full items-center gap-1.5 rounded-md pr-2 text-left text-[13px] hover:bg-hover', entry.path === activeFile && 'bg-hover text-fg')}
+            >
+              {entry.kind === 'dir'
+                ? <Icon name="chevronRight" size={12} className={cn('shrink-0 text-fg-faint transition-transform', expanded && 'rotate-90')} />
+                : <span aria-hidden="true" className="w-3 shrink-0" />}
+              <FileTypeIcon path={entry.name} kind={entry.kind === 'dir' ? 'folder' : 'file'} open={expanded} size={16} />
+              <span className="min-w-0 flex-1 truncate">{entry.name}</span>
+            </button>
+            {expanded ? (
+              node?.status === 'error' && node.listing === null ? (
+                <div className="flex items-center gap-2 py-1 pr-2" style={{ paddingLeft: 24 + depth * 14 }}>
+                  <span className="text-xs text-bad">Could not load</span>
+                  <Button size="sm" variant="outline" onClick={() => onRetry(entry.path)}>Retry</Button>
+                </div>
+              ) : node === undefined || (node.status === 'loading' && node.listing === null) ? (
+                <div className="flex items-center gap-2 py-1 text-xs text-fg-muted" style={{ paddingLeft: 24 + depth * 14 }} role="status"><Spinner size={12} />Loading…</div>
+              ) : (
+                <FolderRows
+                  entries={node.listing?.entries ?? []}
+                  depth={depth + 1}
+                  nodes={nodes}
+                  open={open}
+                  activeFile={activeFile}
+                  onToggle={onToggle}
+                  onOpenFile={onOpenFile}
+                  onRetry={onRetry}
+                />
+              )
+            ) : null}
+          </li>
+        )
+      })}
+    </ul>
   )
 }

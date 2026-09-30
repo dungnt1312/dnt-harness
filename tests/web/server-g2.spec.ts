@@ -126,9 +126,9 @@ describe('workspace HTTP surface', () => {
     const created = (await (await post(base, `/api/workspaces/${wsId}/projects`, { name: 'Alpha', path: projA })).json()) as { id: string }
     expect(created.id).toBeTruthy()
 
-    // Overlap rejection over HTTP, including nested folders.
-    const overlap = await post(base, `/api/workspaces/${wsId}/projects`, { name: 'Nested', path: path.join(projA, 'deep') })
-    expect(overlap.status).toBe(400)
+    // Nested/overlapping folders are allowed — binding is the user's call.
+    const nested = await post(base, `/api/workspaces/${wsId}/projects`, { name: 'Nested', path: path.join(projA, 'deep') })
+    expect(nested.status).toBe(201)
 
     // A session bound to the project reads inside it.
     const withProject = (await (await post(base, `/api/workspaces/${wsId}/sessions`, { projectId: created.id })).json()) as { id: string }

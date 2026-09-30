@@ -64,17 +64,17 @@ describe('fs tools', () => {
 
   it('Edit replaces the single occurrence and fails loud when absent', async () => {
     await tool('Write').execute({ path: 'notes.md', content: 'alpha beta gamma\n' }, exec())
-    await tool('Edit').execute({ path: 'notes.md', old: 'beta', new: 'BETA' }, exec())
+    await tool('Edit').execute({ path: 'notes.md', old: 'beta', new: 'BETA', expectedSha256: shaOf('alpha beta gamma\n') }, exec())
 
     const updated = await tool('Read').execute({ path: 'notes.md' }, exec())
     expect(updated).toBe('alpha BETA gamma\n')
 
-    await expect(tool('Edit').execute({ path: 'notes.md', old: 'missing', new: 'x' }, exec())).rejects.toThrow(/not found/)
+    await expect(tool('Edit').execute({ path: 'notes.md', old: 'missing', new: 'x', expectedSha256: shaOf('alpha BETA gamma\n') }, exec())).rejects.toThrow(/not found/)
   })
 
   it('Edit rejects ambiguous matches instead of replacing the first', async () => {
     await tool('Write').execute({ path: 'dup.txt', content: 'same same\n' }, exec())
-    await expect(tool('Edit').execute({ path: 'dup.txt', old: 'same', new: 'x' }, exec())).rejects.toThrow(/ambiguous/)
+    await expect(tool('Edit').execute({ path: 'dup.txt', old: 'same', new: 'x', expectedSha256: shaOf('same same\n') }, exec())).rejects.toThrow(/ambiguous/)
     expect(await fs.readFile(path.join(root, 'dup.txt'), 'utf8')).toBe('same same\n')
   })
 
@@ -116,6 +116,55 @@ describe('fs tools', () => {
 
     const none = await tool('Grep').execute({ pattern: 'no-such-token-anywhere' }, exec())
     expect(none).toBe('no matches')
+  })
+
+  it('Glob skips default-ignored folders, and still searches them on demand', async () => {
+    await tool('Write').execute({ path: 'node_modules/pkg/index.js', content: 'x' }, exec())
+    await tool('Write').execute({ path: 'dist/bundle.js', content: 'x' }, exec())
+    await tool('Write').execute({ path: '.git/hooks/pre-commit', content: 'x' }, exec())
+    await tool('Write').execute({ path: 'src/keep.ts', content: 'x' }, exec())
+
+    expect(await tool('Glob').execute({ pattern: '**/*.js' }, exec())).toBe('no matches')
+
+    const tree = await tool('Glob').execute({ pattern: '**/*' }, exec())
+    expect(tree).toContain('src/keep.ts')
+    expect(tree).not.toContain('node_modules')
+    expect(tree).not.toContain('dist/')
+    expect(tree).not.toContain('.git/')
+
+    const flagged = await tool('Glob').execute({ pattern: '**/*.js', includeIgnored: true }, exec())
+    expect(flagged.split('\n').sort()).toEqual(['dist/bundle.js', 'node_modules/pkg/index.js'])
+
+    // A pattern naming an ignored folder explicitly searches inside it.
+    const named = await tool('Glob').execute({ pattern: '**/node_modules/**/*.js' }, exec())
+    expect(named).toContain('node_modules/pkg/index.js')
+
+    // So does pointing the search itself at the folder.
+    const targeted = await tool('Glob').execute({ pattern: 'pkg/*.js', path: 'node_modules' }, exec())
+    expect(targeted).toBe('node_modules/pkg/index.js')
+
+    await expect(tool('Glob').execute({ pattern: '*', includeIgnored: 'yes' }, exec())).rejects.toThrow(/boolean/)
+  })
+
+  it('Grep skips default-ignored folders unless includeIgnored or a targeted path', async () => {
+    await tool('Write').execute({ path: 'node_modules/pkg/hint.js', content: 'const needle = 7\n' }, exec())
+
+    expect(await tool('Grep').execute({ pattern: 'needle' }, exec())).toBe('no matches')
+
+    const flagged = await tool('Grep').execute({ pattern: 'needle', includeIgnored: true }, exec())
+    expect(flagged).toContain('node_modules/pkg/hint.js:1')
+
+    const targeted = await tool('Grep').execute({ pattern: 'needle', path: 'node_modules' }, exec())
+    expect(targeted).toContain('node_modules/pkg/hint.js:1')
+  })
+
+  it('Glob marks truncation beyond the result cap', async () => {
+    for (let i = 0; i < 105; i++) {
+      await tool('Write').execute({ path: `bulk/file-${String(i).padStart(3, '0')}.txt`, content: 'x' }, exec())
+    }
+    const lines = (await tool('Glob').execute({ pattern: 'bulk/*.txt' }, exec())).split('\n')
+    expect(lines).toHaveLength(101)
+    expect(lines[100]).toMatch(/\[\+5 more/)
   })
 
   it('lexical escapes of the root are rejected', async () => {

@@ -363,6 +363,30 @@ describe('sessions service over files', () => {
     void kernel.stop()
   })
 
+  it('recovery pairs legacy repeated call ids within their own step and turn', async () => {
+    const id = 'session-legacy-repeated-call' as SessionId
+    const raw =
+      line(1, { type: 'turn/start', turnId: 't1' }) +
+      line(2, { type: 'step/start', turnId: 't1', stepId: 's1' }) +
+      line(3, { type: 'tool/call', stepId: 's1', call: { id: 'c1', name: 'Read', args: { path: 'a' } } }) +
+      line(4, { type: 'tool/result', stepId: 's1', callId: 'c1', ok: true, output: 'old answer' }) +
+      line(5, { type: 'step/end', turnId: 't1', stepId: 's1' }) +
+      line(6, { type: 'turn/end', turnId: 't1', reason: 'completed' }) +
+      line(7, { type: 'turn/start', turnId: 't2' }) +
+      line(8, { type: 'step/start', turnId: 't2', stepId: 's2' }) +
+      line(9, { type: 'tool/call', stepId: 's2', call: { id: 'c1', name: 'Read', args: { path: 'b' } } })
+    await fs.mkdir(path.dirname(logPath(id)), { recursive: true })
+    await fs.writeFile(logPath(id), raw, 'utf8')
+
+    const { kernel, sessions } = await service(dataDir)
+    await sessions.boot()
+    const session = await sessions.load(id)
+    const recovered = session.events.filter((event) => event.type === 'tool/result' && event.recovery === true)
+    expect(recovered).toHaveLength(1)
+    expect(recovered[0]).toMatchObject({ stepId: 's2', callId: 'c1', ok: false })
+    await kernel.stop()
+  })
+
   it('queued inputs stay pending across a restart and are never auto-executed', async () => {
     const id = 'session-queue' as SessionId
     const raw =

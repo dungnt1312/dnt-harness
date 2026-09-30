@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import Icon from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
-import { fileStyle } from '../../lib/file-icons.ts'
+import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
 import { cn } from '../../lib/cn.ts'
 import type { CompletionItem, CompletionKind } from '../../lib/composer-completion.ts'
 
@@ -34,33 +34,44 @@ export function CompletionPopover({ id, kind, items, activeIndex, loading, note,
       ref={listRef}
       id={id}
       role="listbox"
-      aria-label={kind === 'file' ? 'Project files' : 'Workspace skills'}
+      aria-label={kind === 'file' ? 'Project files' : 'Commands and skills'}
       className="absolute bottom-full left-0 right-0 z-30 mb-2 max-h-72 overflow-y-auto rounded-2xl border border-line bg-surface p-1.5 shadow-pop animate-fade-up"
     >
       {items.map((item, index) => {
-        const icon = kind === 'file' ? fileStyle(item.label) : null
+        // Built-in commands open the list unheadered; the catalog reads under
+        // its own caption, exactly once, before its first row.
+        const isCommand = item.id.startsWith('command:')
+        const header = !isCommand && index === items.findIndex((entry) => !entry.id.startsWith('command:')) ? (
+          <div className="px-2.5 pb-0.5 pt-1.5 text-[11px] font-medium uppercase tracking-wider text-fg-faint">Skills</div>
+        ) : null
         return (
-          <button
-            key={item.id}
-            id={`${id}-option-${index}`}
-            type="button"
-            role="option"
-            aria-selected={index === activeIndex}
-            // Picking must not blur the textarea, or the caret would be lost.
-            onMouseDown={(event) => event.preventDefault()}
-            onMouseEnter={() => onActivate(index)}
-            onClick={() => onPick(item)}
-            className={cn(
-              'flex w-full min-h-9 items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-sm text-fg outline-none',
-              index === activeIndex && 'bg-hover',
-            )}
-          >
-            <Icon name={icon === null ? 'zap' : icon.name} size={15} className={cn('shrink-0', icon === null ? 'text-fg-muted' : icon.className)} />
-            <span className="flex min-w-0 flex-1 flex-col">
-              <span className="truncate">{item.label}</span>
-              {item.detail !== undefined && item.detail !== '' ? <span className="truncate text-xs text-fg-faint">{item.detail}</span> : null}
-            </span>
-          </button>
+          <div key={item.id}>
+            {header}
+            <button
+              id={`${id}-option-${index}`}
+              type="button"
+              role="option"
+              aria-selected={index === activeIndex}
+              // Picking must not blur the textarea, or the caret would be lost.
+              onMouseDown={(event) => event.preventDefault()}
+              onMouseEnter={() => onActivate(index)}
+              onClick={() => onPick(item)}
+              className={cn(
+                'flex w-full min-h-9 items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-sm text-fg outline-none',
+                index === activeIndex && 'bg-hover',
+              )}
+            >
+              {kind === 'file'
+                ? <FileTypeIcon path={item.label} size={16} />
+                : isCommand
+                  ? null
+                  : <Icon name="dollarSign" size={15} className="shrink-0 text-fg-muted" />}
+              <span className="flex min-w-0 flex-1 flex-col">
+                <span className="truncate">{item.label}</span>
+                {item.detail !== undefined && item.detail !== '' ? <span className="truncate text-xs text-fg-faint">{item.detail}</span> : null}
+              </span>
+            </button>
+          </div>
         )
       })}
       {note !== null ? (

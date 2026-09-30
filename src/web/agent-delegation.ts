@@ -228,7 +228,7 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
       'Wait for the children before you finish your turn — children still running when the turn closes are cancelled.',
       'Delegate when the work is separable and its result compresses — a search across many files, a review, a verification run. Do not delegate what you can do in two tool calls, and do not delegate work whose context you would have to retype.',
       'Write the prompt as you would brief a colleague who cannot see this conversation: name the files and the facts it needs, and say what the answer must contain. The child\'s final message is all you get back.',
-      'Writers: your turn holds the project lease once it writes, but spawning a write-capable child hands that lease off and the child then locks per call — nothing locks its whole run, and your next write can take the lease back. Do not fan out writers or keep writing while one runs; parallel fan-out belongs to read-only roles.',
+      'Children share the project filesystem with their root. Coordinate edits to the same files and re-read before writing; unrelated conversations never own or block this project.',
       `Roles: ${roles.map((role) => `${role.name} (${role.description})`).join('; ') || 'none'}.`,
       `Models as provider:model — ${models.join(', ') || 'none'}${total > models.length ? `, +${total - models.length} more, use action:"catalog"` : ''}.`,
       'Omit model to inherit this conversation\'s model; grantTools only narrows the role, never widens it.',
@@ -322,12 +322,13 @@ async function spawn(
     typeof args['model'] === 'string' ? args['model'] : undefined,
     resolved.definition.model,
   )
-  const lastTurn = [...parent.events].reverse().find((event) => event.type === 'turn/start')
+  const turnId = agentScope.getStore()?.turnId
+  if (turnId === undefined) throw new Error('Agent spawn requires the calling root\'s active Turn')
   const handle = await deps.executor.spawn({
     workspaceId,
     ...(projectId !== undefined ? { projectId } : {}),
     parentSessionId,
-    parentTurnId: lastTurn !== undefined && lastTurn.type === 'turn/start' ? String(lastTurn.turnId) : 'ad-hoc',
+    parentTurnId: turnId,
     definition: resolved.definition,
     packet,
     ...(grantTools !== undefined ? { grantTools } : {}),

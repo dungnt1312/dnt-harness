@@ -203,4 +203,34 @@ describe('guard pipeline', () => {
     expect(result?.output).toMatch(/Dangerous Commands/)
     await kernel.stop()
   })
+
+  it('an ask match never leaks to another execution reusing the model call id', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(SessionsService)
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.plugin(AgentsService)
+    const session = kernel.ctx.sessions.create()
+    kernel.ctx.tools.register(bashTool)
+
+    const guard = attachDangerousCommandGuard(kernel.ctx, { configSource: () => DEFAULT_CONFIG })
+    const asked: string[] = []
+    attachApproval(kernel.ctx, {
+      policy: { Bash: 'allow' },
+      forceAsk: (call, scope) => guard.getMatch(call, scope.executionId)?.action === 'ask',
+      askUser: async (call) => {
+        asked.push(String(call.args['command']))
+        return true
+      },
+    })
+
+    await agentScope.run({ sessionId: session.id }, async () => {
+      // Both calls carry model call id 'c1' — as two roots easily would.
+      await (await kernel.ctx.tools.prepare(bashCall('git reset --hard HEAD~1', 'c1'))).execute()
+      const innocent = await (await kernel.ctx.tools.prepare(bashCall('echo harmless', 'c1'))).execute()
+      expect(innocent.output).toBe('ran: echo harmless')
+    })
+    // Only the dangerous command asked; the innocent one inherited nothing.
+    expect(asked).toEqual(['git reset --hard HEAD~1'])
+    await kernel.stop()
+  })
 })

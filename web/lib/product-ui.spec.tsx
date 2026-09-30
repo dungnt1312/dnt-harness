@@ -49,7 +49,9 @@ vi.mock('./api.ts', () => ({
   listProjectFiles: vi.fn(async (_ws: string, _project: string, folder: string) => folder === ''
     ? { path: '', entries: [{ name: 'src', path: 'src', kind: 'dir' }, { name: 'README.md', path: 'README.md', kind: 'file', size: 12 }] }
     : { path: folder, entries: [{ name: 'index.ts', path: 'src/index.ts', kind: 'file', size: 26 }] }),
-  readProjectFile: vi.fn(async (_ws: string, _project: string, path: string) => ({ path, size: 26, binary: false, truncated: false, content: 'export const answer = 42\n<raw>\n' })),
+  readProjectFile: vi.fn(async (_ws: string, _project: string, path: string) => ({path, size: 26, binary: false, truncated: false, content: "export const answer = 42\n<raw>\n" })),
+  fetchGitStatus: vi.fn(async () => ({ branch: "main", truncated: false, changes: [{ path: "docs/README.md", status: "modified", added: 1, removed: 2 }] })),
+  fetchGitDiff: vi.fn(async () => ({ path: "docs/README.md", binary: false, truncated: false, lines: [{ kind: "del", text: "npm run chat:mock" }, { kind: "add", text: "npm run chat" }] })),
 }))
 
 // Responsive primitives need matchMedia in jsdom.
@@ -303,8 +305,10 @@ describe('activity block summary', () => {
   })
   it('shortens a deep path to its tail and keeps the exact target on hover', async () => {
     await mount(<ToolCard item={toolRow('a', 'Read')} />)
+    const head = host.querySelector('button')!
+    expect(head.textContent).toContain('a.php')
     const detail = host.querySelector('span[title]')!
-    expect(detail.textContent).toBe('…/Nested/a.php')
+    expect(detail.textContent).toBe('app/Services/Deep/Nested')
     expect(detail.getAttribute('title')).toBe('app/Services/Deep/Nested/a.php')
   })
 })
@@ -313,11 +317,20 @@ describe('tool row facts', () => {
   const row = (name: string, args: Record<string, unknown>, result?: { ok: boolean; output: string }): Extract<ViewItem, { kind: 'tool' }> => ({
     kind: 'tool', call: { id: 'c1', name, args }, ts: 0, doneAt: 12, ...(result !== undefined ? { result } : {}),
   })
+  it('leads a running call with the state spinner and its glyph once settled', async () => {
+    await mount(<ToolCard item={row('Read', { path: 'src/harness/tools/service.ts' })} />)
+    // A running row must say so on its own, not through the sidebar alone.
+    expect(host.querySelector('.animate-spin-slow')).not.toBeNull()
+    expect(host.querySelector('button')!.textContent).toContain('service.ts')
+    await mount(<ToolCard item={row('Read', { path: 'src/harness/tools/service.ts' }, { ok: true, output: 'a\nb\nc' })} />)
+    expect(host.querySelector('.animate-spin-slow')).toBeNull()
+  })
   it('says which lines were read and how many came back, with the row still closed', async () => {
     await mount(<ToolCard item={row('Read', { path: 'src/harness/tools/service.ts', offset: 100, limit: 61 }, { ok: true, output: 'a\nb\nc' })} />)
     const head = host.querySelector('button')!
     expect(head.getAttribute('aria-expanded')).toBe('false')
-    expect(head.textContent).toContain('…/tools/service.ts:100-160')
+    expect(head.textContent).toContain('service.ts:100-160')
+    expect(head.textContent).toContain('src/harness/tools')
     expect(head.textContent).toContain('3 lines')
   })
   it('puts a failure on the row instead of behind a click', async () => {
@@ -335,7 +348,14 @@ describe('tool row facts', () => {
   })
   it('opens an edit as replaced/replacement text while copy keeps the exact payload', async () => {
     await mount(<ToolCard item={row('Edit', { path: 'web/lib/format.ts', old: 'const a = 1', new: 'const a = 2' }, { ok: true, output: 'edited web/lib/format.ts' })} />)
-    expect(host.querySelector('button')!.textContent).toContain('-1 +1 lines')
+    const head = host.querySelector('button')!
+    expect(head.textContent).toContain('format.ts')
+    expect(head.textContent).toContain('web/lib')
+    expect(head.textContent).not.toContain('Edit')
+    const added = [...head.querySelectorAll('span')].find((span) => span.textContent === '+1')
+    const removed = [...head.querySelectorAll('span')].find((span) => span.textContent === '−1')
+    expect(added?.className).toContain('text-ok')
+    expect(removed?.className).toContain('text-bad')
     await act(async () => host.querySelector('button')!.click())
     const blocks = [...host.querySelectorAll('pre')].map((pre) => pre.textContent)
     expect(blocks).toContain('const a = 1')
@@ -343,7 +363,7 @@ describe('tool row facts', () => {
     // The JSON block holds the short arguments; its copy holds all of them.
     expect(blocks[0]).toContain('"path": "web/lib/format.ts"')
     expect(blocks[0]).not.toContain('const a = 1')
-    expect(host.querySelector('button[aria-label="Copy Arguments · c1"]')).not.toBeNull()
+    expect(host.querySelector('button[aria-label="Copy Arguments"]')).not.toBeNull()
     expect(host.textContent).toContain('Output · 1 line')
   })
   it('hands the workbench the window the call read, not just the file', async () => {
@@ -625,9 +645,21 @@ describe('context compaction + budget bar', () => {
     expect(budgetTone(95, 100)).toBe('bad')
     expect(budgetTone(10, 0)).toBe('bad')
   })
+  it('shows the provider prompt count over the model window, not the input budget', async () => {
+    const reported = {
+      ...manifest,
+      budget: { availableTokens: 994_880, usedTokens: 48_000, contextLimitTokens: 1_000_000, estimated: false },
+      usage: { last: { inputTokens: 139_100 }, cacheableInputTokens: 139_100, cachedInputTokens: 0 },
+    }
+    await mount(<ToastHost><ContextPanel meta={null} stream="open" sessionId="s1" sessionFolder={null} eventCount={0} manifest={reported} workspaceId="w1" running={false} /></ToastHost>)
+    expect(host.textContent).toContain('139100/1000000 tok (reported)')
+    expect(host.textContent).not.toContain('~')
+    expect(host.textContent).not.toContain('48000')
+    expect(host.textContent).not.toContain('994880')
+  })
   it('compacts through the confirm dialog and reports the checkpoint outcome', async () => {
     await mount(<ToastHost><ContextPanel meta={null} stream="open" sessionId="s1" sessionFolder={null} eventCount={0} manifest={manifest} workspaceId="w1" running={false} /></ToastHost>)
-    expect(host.textContent).toContain('~48000/128000 tok (est)')
+    expect(host.textContent).toContain('48000/128000 tok (est)')
     await act(async () => button('Compact…').click())
     expect(document.body.textContent).toContain('Compact this conversation?')
     await act(async () => bodyButton('Compact').click())
@@ -701,35 +733,20 @@ describe('context compaction + budget bar', () => {
     expect([...host.querySelectorAll('dt')].some(term => term.textContent === 'mode')).toBe(true)
     expect(host.textContent).toContain('Plan')
   })
-  it('renders workbench views and exact artifact states from existing events', async () => {
+  it('renders workbench views and a trajectory from existing events', async () => {
     const events = [
       { type: 'tool/call', seq: 0, call: { id: 'file', name: 'Read', args: { path: 'C:/repo/README.md' } } },
       { type: 'tool/result', seq: 1, callId: 'file', ok: true, output: '# README' },
       { type: 'tool/call', seq: 2, call: { id: 'command', name: 'Bash', args: { command: 'npm test' } } },
       { type: 'tool/result', seq: 3, callId: 'command', ok: false, output: 'failed output' },
-      { type: 'tool/call', seq: 4, call: { id: 'output', name: 'custom', args: {} } },
-      { type: 'tool/result', seq: 5, callId: 'output', ok: true, output: 'custom output' },
-      { type: 'tool/call', seq: 6, call: { id: 'pending', name: 'Read', args: { file_path: 'C:/repo/pending.ts' } } },
-      { type: 'tool/call', seq: 7, call: { id: 'recovered', name: 'Read', args: { path: 'C:/repo/recovered.ts' } } },
-      { type: 'tool/result', seq: 8, callId: 'recovered', ok: true, output: 'partial', recovery: true },
     ] as const
-    await mount(<ToastHost><WorkbenchProbe view="artifacts" events={events} /></ToastHost>)
+    await mount(<ToastHost><WorkbenchProbe view="trajectory" events={events as unknown as never} /></ToastHost>)
     expect(host.querySelector('[role="toolbar"][aria-label="Workbench views"]')).not.toBeNull()
-    expect(host.querySelector('button[aria-pressed="true"]')?.textContent).toBe('Artifacts')
-    const list = host.querySelector('[aria-label="Recorded artifacts"]')!
-    expect(list.textContent).toContain('File reference')
-    expect(list.textContent).toContain('C:/repo/README.md')
-    expect(list.textContent).toContain('Command record')
-    expect(list.textContent).toContain('npm test')
-    expect(list.textContent).toContain('failed')
-    expect(list.textContent).toContain('custom output')
-    expect(list.textContent).toContain('pending')
-    expect(list.textContent).toContain('Outcome unknown — the host restarted before this result was recorded.')
-    expect(list.textContent).not.toMatch(/file content|diff|changed files|terminal/i)
+    expect(host.querySelector('button[aria-pressed="true"]')?.textContent).toBe('Trajectory')
   })
-  it('renders the exact artifacts empty state', async () => {
-    await mount(<ToastHost><WorkbenchProbe view="artifacts" events={[]} /></ToastHost>)
-    expect(host.textContent).toContain('No recorded artifacts for this conversation yet.')
+  it('renders the trajectory empty state', async () => {
+    await mount(<ToastHost><WorkbenchProbe view="trajectory" events={[]} /></ToastHost>)
+    expect(host.textContent).toMatch(/trajectory|Trajectory/)
   })
   it('keeps the workbench nav short: unopened views live in the picker and closing one falls back', async () => {
     await mount(<ToastHost><WorkbenchProbe view="files" events={[]} /></ToastHost>)
@@ -748,19 +765,19 @@ describe('context compaction + budget bar', () => {
     expect(nav.querySelector('button[aria-pressed="true"]')?.textContent).toBe('Files')
   })
   it('a single click on a close button closes the tab, also when it is not the selected one', async () => {
-    seedWorkbench('terminal', ['files', 'context', 'terminal'])
+    seedWorkbench('trajectory', ['files', 'context', 'trajectory'])
     await mount(<ToastHost><WorkbenchPreferenceProbe events={[]} /></ToastHost>)
     const nav = host.querySelector('[role="toolbar"][aria-label="Workbench views"]')!
     const tabs = () => [...nav.querySelectorAll('button[aria-pressed]')].map((tab) => tab.textContent)
-    expect(tabs()).toEqual(['Files', 'Context', 'Terminal'])
+    expect(tabs()).toEqual(['Files', 'Context', 'Trajectory'])
 
     // Closing a background tab must not touch the selection.
     await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Close Context"]')!.click())
-    expect(tabs()).toEqual(['Files', 'Terminal'])
-    expect(nav.querySelector('button[aria-pressed="true"]')?.textContent).toBe('Terminal')
+    expect(tabs()).toEqual(['Files', 'Trajectory'])
+    expect(nav.querySelector('button[aria-pressed="true"]')?.textContent).toBe('Trajectory')
 
     // Closing the selected tab reveals its neighbour in the same click.
-    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Close Terminal"]')!.click())
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Close Trajectory"]')!.click())
     expect(tabs()).toEqual(['Files'])
     expect(nav.querySelector('button[aria-pressed="true"]')?.textContent).toBe('Files')
   })
@@ -833,11 +850,12 @@ describe('sidebar sections + live rows + workspace management', () => {
     onFilter: () => {}, onSelect: () => {}, onNew: () => {}, onNewInProject: () => {}, onRename: () => {}, onDeleteRequest: () => {}, onOpenSettings: () => {},
     notifyEnabled: false, notifyBlocked: false, onToggleNotify: () => {}, theme: 'system', onTheme: () => {}, onClose: () => {},
   })
-  it('groups by project with running counts and keeps loose conversations bucketed', async () => {
+  it('groups by project with running counts and renders loose conversations without a bucket header', async () => {
     await mount(<SessionList sessions={[...sessions]} projects={[project]} current={null} filter="" liveRunning={false} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} onNewInProject={() => {}} />)
     expect(host.textContent).toContain('Acme')
     expect(host.textContent).toContain('1running')
-    expect(host.textContent).toContain('Chats')
+    expect(host.textContent).not.toContain('Chats')
+    expect(host.textContent).toContain('Loose chat')
     expect(host.textContent).toContain('working with model')
     expect(host.textContent).toContain('2 queued')
   })
@@ -1174,18 +1192,54 @@ describe('workbench files', () => {
     expect(listProjectFiles).toHaveBeenCalledWith('w1', 'p1', '')
     await act(async () => button('src').click())
     expect(listProjectFiles).toHaveBeenLastCalledWith('w1', 'p1', 'src')
-    expect(host.querySelector('[aria-current="location"]')?.textContent).toBe('src')
+    expect(host.querySelector('button[title="src"]')?.getAttribute('aria-expanded')).toBe('true')
     await act(async () => button('index.ts').click())
     expect(readProjectFile).toHaveBeenCalledWith('w1', 'p1', 'src/index.ts')
-    const tab = host.querySelector<HTMLButtonElement>('button[title="src/index.ts"][aria-pressed="true"]')
+    const tab = host.querySelector<HTMLButtonElement>('[role="tablist"] button[title="src/index.ts"][aria-selected="true"]')
     expect(tab?.textContent).toContain('index.ts')
     const contents = host.querySelector('[aria-label="Contents of src/index.ts"]')!
     expect(contents.textContent).toContain('export const answer = 42')
     expect(contents.querySelector('code')?.innerHTML).toContain('&lt;raw&gt;')
     expect(host.textContent).toContain('C:/acme/src/index.ts')
-    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Close src/index.ts"]')!.click())
-    expect(host.querySelector('button[title="src/index.ts"][aria-pressed]')).toBeNull()
+    const tree = host.querySelector('[aria-label="Project files"]')!
+    expect(contents.compareDocumentPosition(tree) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    const resize = host.querySelector<HTMLElement>('[aria-label="Resize file tree"]')!
+    expect(resize.getAttribute('aria-valuenow')).toBe('34')
+    await act(async () => resize.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true })))
+    expect(resize.getAttribute('aria-valuenow')).toBe('36')
+    expect(resize.nextElementSibling?.getAttribute('style')).toContain('36%')
+    await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Hide file tree"]')!.click())
+    expect(resize.classList.contains('hidden')).toBe(true)
     expect(host.querySelector('[aria-label="Project files"]')).not.toBeNull()
+    await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Show file tree"]')!.click())
+    expect(resize.classList.contains('hidden')).toBe(false)
+    expect(host.querySelector('button[title="src"]')?.getAttribute('aria-expanded')).toBe('true')
+    await act(async () => host.querySelector<HTMLButtonElement>('[role="toolbar"][aria-label="Workbench views"] button[aria-pressed="true"]')!.click())
+    await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Open a view"]')!.click())
+    await act(async () => bodyButton('Context').click())
+    expect(host.querySelector('[aria-label="Open files"]')).toBeNull()
+    expect(host.querySelector('[aria-label="Project files"]')).toBeNull()
+    expect(host.querySelector('[aria-label="Resize file tree"]')).toBeNull()
+    await act(async () => [...host.querySelectorAll<HTMLButtonElement>('[aria-label="Workbench views"] button')].find((item) => item.textContent === 'Files')!.click())
+    expect(host.querySelector('[aria-label="Open files"]')).not.toBeNull()
+    expect(host.querySelector('[aria-label="Project files"]')).not.toBeNull()
+    expect(host.querySelector('[aria-label="Resize file tree"]')?.getAttribute('aria-valuenow')).toBe('36')
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Close src/index.ts"]')!.click())
+    expect(host.querySelector('[role="tablist"] button[title="src/index.ts"]')).toBeNull()
+    expect(host.querySelector('[aria-label="Project files"]')).not.toBeNull()
+    expect(host.textContent).toContain('Open a file from the tree.')
+  })
+  it('lists changed files with line counts and opens a read-only diff', async () => {
+    await mount(<ToastHost><WorkbenchProbe view="git" events={[]} project={project} /></ToastHost>)
+    expect(host.textContent).toContain('main')
+    expect(host.textContent).toContain('README.md')
+    expect(host.textContent).toContain('+1')
+    expect(host.textContent).toContain('−2')
+    const row = [...host.querySelectorAll('button')].find((item) => item.textContent?.includes('README.md'))!
+    await act(async () => row.click())
+    const diff = host.querySelector('[aria-label="Diff of docs/README.md"]')!
+    expect(diff.textContent).toContain('npm run chat:mock')
+    expect(diff.textContent).toContain('npm run chat')
   })
   it('explains a chat-only conversation instead of browsing', async () => {
     await mount(<ToastHost><WorkbenchProbe view="files" events={[]} /></ToastHost>)

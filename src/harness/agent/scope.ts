@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import type { ProjectId, SessionId, WorkspaceId } from '../../util/brand.ts'
+import type { ProjectId, SessionId, TurnId, WorkspaceId } from '../../util/brand.ts'
 import type { GrantedRoot } from '../tools/types.ts'
 
 /**
@@ -13,6 +13,10 @@ import type { GrantedRoot } from '../tools/types.ts'
  */
 export interface AgentScope {
   readonly sessionId: SessionId
+  /** Root execution domain owning this run; equals sessionId for a root. */
+  readonly rootSessionId?: SessionId
+  /** Present only while a concrete Turn is executing. */
+  readonly turnId?: TurnId
   readonly workspaceId?: WorkspaceId
   readonly projectId?: ProjectId
   /**

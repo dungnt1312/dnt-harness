@@ -1,4 +1,4 @@
-import type { AttachmentRef, SseEvent, ToolCall } from './types.ts'
+import type { AttachmentRef, ContextManifestView, SseEvent, ToolCall } from './types.ts'
 import { toolTarget } from './format.ts'
 import { mcpServerOf } from './tool-facts.ts'
 
@@ -54,6 +54,28 @@ export type ViewItem =
     }
   | { readonly kind: 'audit'; readonly ts?: number; readonly icon: 'block' | 'fail' | 'allow' | 'deny' | 'expired'; readonly text: string; readonly durationMs?: number }
   | { readonly kind: 'status'; readonly reason: string }
+  | {
+      readonly kind: 'compaction'
+      readonly ts?: number
+      /** running: start without end yet; completed/failed: end recorded; interrupted: dangling start the log moved past. */
+      status: 'running' | 'completed' | 'failed' | 'interrupted'
+      trigger?: 'manual' | 'automatic'
+      model?: string
+      coversSeq?: number
+      summaryChars?: number
+      durationMs?: number
+      /** The stored summary, carried by a successful compaction/end. */
+      summary?: string
+      error?: string
+    }
+  | {
+      readonly kind: 'context'
+      readonly ts?: number
+      /** What the turn's latest model request carried (updated in place per request). */
+      manifest: ContextManifestView
+      /** Requests this turn has made so far; the item is one per turn, not per request. */
+      requests?: number
+    }
 
 interface AssistantDraft {
   kind: 'assistant'
@@ -106,6 +128,10 @@ export function projectItems(events: readonly SseEvent[]): ViewItem[] {
   let draft: AssistantDraft | null = null
   let openTurnId: string | undefined
   const turnAssistants = new Map<string, Array<Extract<ViewItem, { kind: 'assistant' }>>>()
+  /** One context marker per turn: the latest request's manifest, updated in place. */
+  const turnContexts = new Map<string, Extract<ViewItem, { kind: 'context' }>>()
+  /** The compaction awaiting its end event; null while none is open. */
+  let openCompaction: Extract<ViewItem, { kind: 'compaction' }> | null = null
 
   /** Register an answer under its open turn so `turn/end` can close it in place. */
   const trackAssistant = (item: Extract<ViewItem, { kind: 'assistant' }>): void => {
@@ -116,6 +142,12 @@ export function projectItems(events: readonly SseEvent[]): ViewItem[] {
   }
 
   for (const event of events) {
+    // A log that moves on without the open compaction's end means the
+    // compaction never finished (crash mid-summarizer); the interrupted
+    // label stays honest until a real end corrects it in place.
+    if (openCompaction !== null && openCompaction.status === 'running' && event.type !== 'compaction/end') {
+      openCompaction.status = 'interrupted'
+    }
     switch (event.type) {
       case 'turn/start':
         if (event.turnId !== undefined && event.turnId !== '') openTurnId = event.turnId
@@ -294,6 +326,67 @@ export function projectItems(events: readonly SseEvent[]): ViewItem[] {
         if (status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'interrupted') item.status = status
         break
       }
+      case 'context/manifest': {
+        if (event.manifest === undefined) break
+        // A tool loop makes one request per step: folding into the turn's
+        // single marker keeps the transcript quiet while the collapsed line
+        // and the expanded manifest always describe the LATEST request.
+        const key = openTurnId ?? 'turnless'
+        const existing = turnContexts.get(key)
+        if (existing !== undefined) {
+          existing.manifest = event.manifest
+          existing.requests = (existing.requests ?? 1) + 1
+          break
+        }
+        const item: Extract<ViewItem, { kind: 'context' }> = {
+          kind: 'context',
+          ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
+          manifest: event.manifest,
+          requests: 1,
+        }
+        turnContexts.set(key, item)
+        items.push(item)
+        break
+      }
+      case 'compaction/start': {
+        const item: Extract<ViewItem, { kind: 'compaction' }> = {
+          kind: 'compaction',
+          ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
+          status: 'running',
+          ...(event.trigger !== undefined ? { trigger: event.trigger } : {}),
+          ...(event.model !== undefined ? { model: event.model } : {}),
+        }
+        openCompaction = item
+        items.push(item)
+        break
+      }
+      case 'compaction/end': {
+        const patch = (item: Extract<ViewItem, { kind: 'compaction' }>): void => {
+          item.status = event.error !== undefined ? 'failed' : 'completed'
+          if (event.trigger !== undefined) item.trigger = event.trigger
+          if (event.model !== undefined) item.model = event.model
+          if (event.coversSeq !== undefined) item.coversSeq = event.coversSeq
+          if (event.summaryChars !== undefined) item.summaryChars = event.summaryChars
+          if (event.durationMs !== undefined) item.durationMs = event.durationMs
+          if (event.summary !== undefined) item.summary = event.summary
+          if (event.error !== undefined) item.error = event.error
+        }
+        if (openCompaction !== null) {
+          patch(openCompaction)
+          openCompaction = null
+          break
+        }
+        // An end without a surviving start (truncated replay): still the
+        // durable outcome, just rendered without a live phase.
+        const item: Extract<ViewItem, { kind: 'compaction' }> = {
+          kind: 'compaction',
+          ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
+          status: 'running',
+        }
+        patch(item)
+        items.push(item)
+        break
+      }
       case 'turn/error':
         if (event.message !== undefined) {
           items.push({ kind: 'status', reason: `${event.kind ?? 'error'}: ${event.message}` })
@@ -306,6 +399,7 @@ export function projectItems(events: readonly SseEvent[]): ViewItem[] {
           if (closedId !== undefined) {
             for (const item of turnAssistants.get(closedId) ?? []) item.turnOpen = false
             turnAssistants.delete(closedId)
+            turnContexts.delete(closedId)
           }
           openTurnId = undefined
         }

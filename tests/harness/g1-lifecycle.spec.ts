@@ -120,7 +120,7 @@ describe('stop semantics', () => {
     kernel.ctx.plugin(SessionsService)
     kernel.ctx.plugin(LlmService)
     kernel.ctx.plugin(AgentsService)
-    kernel.ctx.provide('limits', { streamInactivityMs: 30_000 })
+    kernel.ctx.provide('limits', { streamFirstEventMs: 30_000 })
     kernel.ctx.llm.register({
       name: 'silent',
       // Ignores the abort signal entirely — the loop's own race must win.
@@ -151,12 +151,65 @@ describe('stop semantics', () => {
     kernel.ctx.plugin(SessionsService)
     kernel.ctx.plugin(LlmService)
     kernel.ctx.plugin(AgentsService)
-    kernel.ctx.provide('limits', { streamInactivityMs: 80 })
+    kernel.ctx.provide('limits', { streamFirstEventMs: 80 })
     kernel.ctx.llm.register({
       name: 'silent',
       async *stream(): AsyncIterable<StreamEvent> {
         await new Promise(() => {})
         yield { type: 'delta', delta: 'never' }
+      },
+    })
+    const session = kernel.ctx.sessions.create()
+    const agent = kernel.ctx.agents.create(session)
+    agent.send('hello?')
+    await agent.run()
+
+    const error = session.events.find((e) => e.type === 'turn/error')
+    expect(error?.type === 'turn/error' && error.kind).toBe('provider')
+    const end = session.events.findLast((e) => e.type === 'turn/end')
+    expect(end?.type === 'turn/end' && end.reason).toBe('failed')
+    void kernel.stop()
+  }, 5_000)
+
+  it('thinking-length silence before the first event survives when it fits the first-event window', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(SessionsService)
+    kernel.ctx.plugin(LlmService)
+    kernel.ctx.plugin(AgentsService)
+    // The pre-output silence (150ms) exceeds the between-events window but
+    // fits the first-event window — the real shape of an extended-thinking
+    // turn whose gateway swallows the reasoning deltas.
+    kernel.ctx.provide('limits', { streamFirstEventMs: 1_000, streamInactivityMs: 50 })
+    kernel.ctx.llm.register({
+      name: 'thinking',
+      async *stream(): AsyncIterable<StreamEvent> {
+        await new Promise((resolve) => setTimeout(resolve, 150))
+        yield { type: 'delta', delta: 'thought it through' }
+      },
+    })
+    const session = kernel.ctx.sessions.create()
+    const agent = kernel.ctx.agents.create(session)
+    agent.send('hello?')
+    await agent.run()
+
+    expect(session.events.some((e) => e.type === 'turn/error')).toBe(false)
+    const end = session.events.findLast((e) => e.type === 'turn/end')
+    expect(end?.type === 'turn/end' && end.reason).toBe('completed')
+    expect(session.events.some((e) => e.type === 'assistant/message' && e.content.includes('thought it through'))).toBe(true)
+    void kernel.stop()
+  }, 5_000)
+
+  it('a stall after output started still fails the turn as a provider error', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(SessionsService)
+    kernel.ctx.plugin(LlmService)
+    kernel.ctx.plugin(AgentsService)
+    kernel.ctx.provide('limits', { streamFirstEventMs: 60_000, streamInactivityMs: 80 })
+    kernel.ctx.llm.register({
+      name: 'stall-after-first',
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: 'delta', delta: 'started' }
+        await new Promise(() => {})
       },
     })
     const session = kernel.ctx.sessions.create()

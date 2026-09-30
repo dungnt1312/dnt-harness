@@ -8,7 +8,7 @@
  * here infers an outcome the log did not record, and a call without a result
  * carries no digest at all.
  */
-import { formatBytes, shortCommand, shortPath, toolTarget } from './format.ts'
+import { formatBytes, pathBasename, shortCommand, shortPath, toolTarget } from './format.ts'
 import type { ToolCall } from './types.ts'
 
 /** The recorded outcome a digest is read from. */
@@ -40,6 +40,13 @@ export interface ToolFacts {
   readonly digest?: string
   /** The digest reports a failure — an error excerpt or a non-zero exit. */
   readonly digestFailed?: boolean
+  /**
+   * A file call reads as the reference row: the file name is the title and
+   * its directory sits beside it. Absent for commands, patterns and MCP calls.
+   */
+  readonly file?: { readonly name: string; readonly directory: string }
+  /** Lines an Edit replaced, counted from the recorded arguments. */
+  readonly lines?: { readonly added: number; readonly removed: number }
 }
 
 /** `mcp__<server>__<tool>` (the Claude convention) — undefined for built-ins. */
@@ -129,11 +136,43 @@ function writeDigest(output: string): string {
 }
 
 /** `Edit` reports its own size: the replacement is in the arguments, exactly. */
-function editDigest(args: Record<string, unknown>): string | undefined {
+function editLines(args: Record<string, unknown>): { added: number; removed: number } | undefined {
   const removed = str(args, 'old')
   const added = str(args, 'new')
   if (removed === undefined && added === undefined) return undefined
-  return `-${countLines(removed ?? '')} +${countLines(added ?? '')} lines`
+  return { added: countLines(added ?? ''), removed: countLines(removed ?? '') }
+}
+
+/** A directory longer than this elides its head: past it the row cannot show it whole anyway. */
+const DIRECTORY_MAX = 48
+
+/**
+ * A long directory elides its head, not its tail — the segments nearest the
+ * file are the ones a row is scanned for, and CSS truncation would cut the
+ * tail first. Short directories pass through untouched.
+ */
+function shortDirectory(directory: string): string {
+  if (directory.length <= DIRECTORY_MAX) return directory
+  const separator = directory.includes('\\') ? '\\' : '/'
+  const parts = directory.split(/[\\/]/).filter((part) => part !== '')
+  let kept = parts.slice(-1).join(separator)
+  for (let index = parts.length - 2; index >= 0; index -= 1) {
+    const candidate = `${parts[index]}${separator}${kept}`
+    if (`…${separator}${candidate}`.length > DIRECTORY_MAX) break
+    kept = candidate
+  }
+  return `…${separator}${kept}`
+}
+
+/**
+ * The file a row leads with. `Read` may append a line window to the name;
+ * the directory is everything before the last segment, head-elided when it
+ * runs long (the tooltip keeps the whole path).
+ */
+function fileParts(path: string, window = ''): { name: string; directory: string } {
+  const name = pathBasename(path)
+  const directory = shortDirectory(path.slice(0, path.length - name.length).replace(/[\/]+$/, ''))
+  return { name: `${name}${window}`, directory }
 }
 
 function globDigest(output: string): string {
@@ -197,6 +236,8 @@ export function toolFacts(call: ToolCall, result?: ToolResultView): ToolFacts {
   let focus: FileFocus | undefined
   let digest: string | undefined
   let digestFailed = failed
+  let file: { name: string; directory: string } | undefined
+  let lines: { added: number; removed: number } | undefined
 
   switch (builtin) {
     case 'read': {
@@ -204,6 +245,7 @@ export function toolFacts(call: ToolCall, result?: ToolResultView): ToolFacts {
       focus = window.focus
       fullTarget = `${path ?? ''}${window.label}`
       target = `${path !== undefined ? shortPath(path) : ''}${window.label}`
+      if (path !== undefined) file = fileParts(path, window.label)
       digest = result === undefined ? undefined : failed ? excerpt(result.output) : readDigest(result.output)
       break
     }
@@ -211,11 +253,13 @@ export function toolFacts(call: ToolCall, result?: ToolResultView): ToolFacts {
     case 'edit': {
       fullTarget = path ?? ''
       target = path !== undefined ? shortPath(path) : ''
+      if (path !== undefined) file = fileParts(path)
+      if (builtin === 'edit') lines = editLines(args)
       digest = result === undefined
         ? undefined
         : failed
           ? excerpt(result.output)
-          : builtin === 'write' ? writeDigest(result.output) : editDigest(args) ?? genericDigest(result.output)
+          : builtin === 'write' ? writeDigest(result.output) : undefined
       break
     }
     case 'glob': {
@@ -262,5 +306,7 @@ export function toolFacts(call: ToolCall, result?: ToolResultView): ToolFacts {
     ...(path !== undefined ? { path } : {}),
     ...(focus !== undefined ? { focus } : {}),
     ...(digest !== undefined && digest !== '' ? { digest, digestFailed } : {}),
+    ...(file !== undefined ? { file } : {}),
+    ...(lines !== undefined ? { lines } : {}),
   }
 }

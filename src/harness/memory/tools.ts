@@ -28,6 +28,12 @@ function memArgs(args: Record<string, unknown>, key: string): string {
   return value.trim()
 }
 
+function memoryHash(args: Record<string, unknown>): string {
+  const hash = memArgs(args, 'expectedHash')
+  if (!/^[a-f0-9]{64}$/i.test(hash)) throw new Error("argument 'expectedHash' must be a SHA-256 hash from MemoryRead")
+  return hash.toLowerCase()
+}
+
 export function memoryTools(memory: MemoryService): ToolDefinition[] {
   return [
     {
@@ -56,7 +62,7 @@ export function memoryTools(memory: MemoryService): ToolDefinition[] {
       },
       async execute(args) {
         const entry = await memory.read(scopeOf(), memArgs(args, 'id'))
-        return `# ${entry.title}\n${entry.body}\n\n[updated ${new Date(entry.updatedAt).toISOString()}]`
+        return `# ${entry.title}\n${entry.body}\n\n[updated ${new Date(entry.updatedAt).toISOString()}]\n[sha256 ${entry.hash}]`
       },
     },
     {
@@ -80,7 +86,7 @@ export function memoryTools(memory: MemoryService): ToolDefinition[] {
           body: memArgs(args, 'body'),
           ...(args['pinned'] === true ? { pinned: true } : {}),
         })
-        return `created memory '${entry.id}' (hash ${entry.hash.slice(0, 12)})`
+        return `created memory '${entry.id}' (sha256 ${entry.hash})`
       },
     },
     {
@@ -101,12 +107,12 @@ export function memoryTools(memory: MemoryService): ToolDefinition[] {
       async execute(args) {
         const entry = await memory.update(scopeOf(), {
           id: memArgs(args, 'id'),
-          expectedHash: memArgs(args, 'expectedHash'),
+          expectedHash: memoryHash(args),
           ...(typeof args['title'] === 'string' ? { title: args['title'] } : {}),
           ...(typeof args['body'] === 'string' ? { body: args['body'] } : {}),
           ...(args['pinned'] === true ? { pinned: true } : args['pinned'] === false ? { pinned: false } : {}),
         })
-        return `updated memory '${entry.id}' (hash ${entry.hash.slice(0, 12)})`
+        return `updated memory '${entry.id}' (sha256 ${entry.hash})`
       },
     },
     {

@@ -102,7 +102,12 @@ describe('agent loop with tools', () => {
       'turn/end',
     ])
 
+    const toolCall = session.events.find((event) => event.type === 'tool/call')
     const toolResult = session.events.find((event) => event.type === 'tool/result')
+    expect(toolCall?.type === 'tool/call' && toolCall.executionId).toMatch(/^exec-/)
+    expect(toolResult?.type === 'tool/result' && toolResult.executionId).toBe(
+      toolCall?.type === 'tool/call' ? toolCall.executionId : undefined,
+    )
     expect(toolResult?.type === 'tool/result' && toolResult.ok).toBe(true)
     expect(toolResult?.type === 'tool/result' && toolResult.output).toBe('the sky is blue')
 

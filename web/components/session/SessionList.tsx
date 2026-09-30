@@ -124,8 +124,6 @@ function dayBucket(ts: number | undefined): 'today' | 'yesterday' | 'earlier' | 
 
 const BUCKET_LABELS: Readonly<Record<'today' | 'yesterday' | 'earlier', string>> = { today: 'Today', yesterday: 'Yesterday', earlier: 'Earlier' }
 const BUCKET_ORDER = ['today', 'yesterday', 'earlier', 'none'] as const
-/** Collapse-record key for the unfiled-chats folder; session ids never look like this. */
-const CHATS_KEY = 'loose-chats'
 /** Rows shown per folder before "Show more" takes over; matches the sidebar reference. */
 const FOLDER_PREVIEW_COUNT = 5
 
@@ -303,15 +301,9 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
           </Collapsible.Root>
         )
       })}
-      {loose.length > 0 ? (
-        <Collapsible.Root open={!collapsed[CHATS_KEY]} onOpenChange={(open) => setCollapsed((prev) => ({ ...prev, [CHATS_KEY]: !open }))} className="mt-1.5 first:mt-1">
-          <Collapsible.Trigger className="flex min-h-9 w-full min-w-0 items-center gap-2 rounded-lg px-2.5 text-left text-sm font-medium hover:bg-hover">
-            <Icon name={collapsed[CHATS_KEY] ? 'folder' : 'folderOpen'} size={15} className="shrink-0 text-fg-muted" />
-            <span className="min-w-0 flex-1 truncate">Chats</span>
-          </Collapsible.Trigger>
-          <Collapsible.Content className="mt-0.5 ml-3 pl-1.5">{timeline(loose)}</Collapsible.Content>
-        </Collapsible.Root>
-      ) : null}
+      {/* Unfiled conversations render under their day buckets like every
+          other headerless group — there is no Chats folder. */}
+      {loose.length > 0 ? timeline(loose) : null}
     </div>
   )
 }

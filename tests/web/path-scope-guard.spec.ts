@@ -33,8 +33,8 @@ function boot(): { kernel: Kernel; guard: ReturnType<typeof attachPathScopeGuard
   for (const tool of fsTools()) kernel.ctx.tools.register(tool)
   kernel.ctx.tools.setRootResolver(() => ({ root }))
   const guard = attachPathScopeGuard(kernel.ctx, { exempt: () => false, proposeGrant: async () => undefined })
-  kernel.ctx.tools.setApprovedPathResolver(async (call, allowed) => {
-    const match = guard.take(undefined, call, allowed)
+  kernel.ctx.tools.setApprovedPathResolver(async (call, allowed, exec) => {
+    const match = guard.take(exec?.executionId, call, allowed)
     return match === undefined ? undefined : [{ path: match.path, intent: match.intent }]
   })
   return { kernel, guard }
@@ -55,7 +55,7 @@ describe('path-scope guard', () => {
     }, true)
     let matched: unknown
     kernel.ctx.on('tools/pre-execute', async (payload, next) => {
-      matched = guard.get(undefined, payload.call)
+      matched = guard.get(payload.exec.executionId, payload.call)
       return next()
     })
     const prepared = await kernel.ctx.tools.prepare(read('in.txt'))
@@ -63,7 +63,7 @@ describe('path-scope guard', () => {
     expect(matched).toMatchObject({ path: path.join(outside, 'x.txt'), intent: 'read' })
     // No approval layer here: the allowed call reads the approved path once.
     expect((await prepared.execute()).output).toBe('outside')
-    expect(guard.get(undefined, prepared.call)).toBeUndefined()
+    expect(guard.get(prepared.executionId, prepared.call)).toBeUndefined()
   })
 
   it('refuses unsafe targets before authorization and drops matches on deny', async () => {
@@ -72,9 +72,37 @@ describe('path-scope guard', () => {
     expect(unc.output).toMatch(/denied: .*network \(UNC\) and device paths/)
 
     kernel.ctx.on('tools/pre-execute', async () => ({ kind: 'deny', reason: 'test policy' }))
-    const call = read(path.join(outside, 'x.txt'))
-    const denied = await (await kernel.ctx.tools.prepare(call)).execute()
-    expect(denied.output).toBe('denied: test policy')
-    expect(guard.get(undefined, call)).toBeUndefined()
+    const denied = await kernel.ctx.tools.prepare(read(path.join(outside, 'x.txt')))
+    expect((await denied.execute()).output).toBe('denied: test policy')
+    expect(guard.get(denied.executionId, denied.call)).toBeUndefined()
+  })
+
+  it('executions sharing a model call id keep separate matches', async () => {
+    const { kernel, guard } = boot()
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const parked: string[] = []
+    kernel.ctx.on('tools/pre-execute', async (payload, next) => {
+      // Park both calls mid-authorization so both matches coexist.
+      parked.push(payload.exec.executionId ?? '')
+      if (parked.length === 2) release()
+      await gate
+      return next()
+    })
+    // Same model call id 'call-1', different target args.
+    const other = path.join(outside, 'y.txt')
+    await fs.writeFile(other, 'other', 'utf8')
+    const first = kernel.ctx.tools.prepare(read(path.join(outside, 'x.txt')))
+    const second = kernel.ctx.tools.prepare(read(other))
+    await gate
+    const [idA, idB] = parked
+    expect(idA).not.toBe(idB)
+    expect(guard.get(idA, read(path.join(outside, 'x.txt')))?.path).toBe(path.join(outside, 'x.txt'))
+    expect(guard.get(idB, read(other))?.path).toBe(other)
+    // A foreign execution id never resolves another execution's match.
+    expect(guard.get(idA, read(other))).toBeUndefined()
+    const [a, b] = await Promise.all([first, second])
+    expect((await a.execute()).output).toBe('outside')
+    expect((await b.execute()).output).toBe('other')
   })
 })

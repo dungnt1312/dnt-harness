@@ -223,14 +223,15 @@ describe('out-of-grant approvals', () => {
 
   it('Full access and its duplicates run out-of-grant paths without a question', async () => {
     const f = await fixture()
-    expect((await send('PUT', `${f.url}/api/workspaces/${f.wsId}/mode`, { modeId: 'full-access' })).status).toBe(200)
+    const sessionMode = `${f.url}/api/workspaces/${f.wsId}/sessions/${f.sessionId}/mode`
+    expect((await send('PUT', sessionMode, { modeId: 'full-access' })).status).toBe(200)
     let mark = f.stream.frames.length
     await f.say(`read ${path.join(outside, 'a.txt')}`)
     expect((await f.toolResult(mark)).event?.output).toContain('secret a')
     expect(f.stream.frames.slice(mark).some((frame) => frame.kind === 'approval')).toBe(false)
 
     expect((await send('POST', `${f.url}/api/workspaces/${f.wsId}/modes/full-access/duplicate`, { newId: 'full-copy' })).status).toBeLessThan(300)
-    expect((await send('PUT', `${f.url}/api/workspaces/${f.wsId}/mode`, { modeId: 'full-copy' })).status).toBe(200)
+    expect((await send('PUT', sessionMode, { modeId: 'full-copy' })).status).toBe(200)
     mark = f.stream.frames.length
     await f.say(`read ${path.join(outside, 'b.txt')}`)
     expect((await f.toolResult(mark)).event?.output).toContain('secret b')

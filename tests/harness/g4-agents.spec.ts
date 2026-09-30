@@ -242,7 +242,7 @@ describe('bounded delegation', () => {
     void harness.kernel.stop()
   }, 20_000)
 
-  it('capacity: more than the active limit reports capacity reached (429 semantics, no queue)', async () => {
+  it('capacity: the seventh active child of one root reports capacity reached', async () => {
     const harness = await bootChildHarness([{ toolCalls: [{ name: 'Read', args: {} }] }])
     const { AgentDefinitionService } = await import('mini-dsh')
     const worker = (await new AgentDefinitionService(home).resolve(harness.workspaceId as never, 'worker')).definition
@@ -258,14 +258,14 @@ describe('bounded delegation', () => {
         return 'read'
       },
     })
-    // Spawn three children (the active limit); the fourth must 429.
+    // Spawn six children (the per-root active limit); the seventh is refused.
     const handles = []
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 6; i++) {
       handles.push(await harness.executor.spawn(spawnRequest(harness, worker)))
     }
     await expect(harness.executor.spawn(spawnRequest(harness, worker))).rejects.toMatchObject({ code: 'capacity' })
     // Cancel all: root Stop cleanup (awaited settlement confirmed).
-    expect(await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)).toBe(3)
+    expect(await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)).toBe(6)
     for (const handle of handles) {
       const settled = await waitOne(harness.executor, harness.workspaceId, handle.childSessionId, 3_000)
       expect(settled !== undefined && settled.status).toBe('cancelled')
@@ -273,43 +273,39 @@ describe('bounded delegation', () => {
     void harness.kernel.stop()
   }, 20_000)
 
-  it('four simultaneous spawns reserve active capacity atomically: exactly three succeed', async () => {
-    const harness = await bootChildHarness([new Promise(() => {}) as never])
+  it('simultaneous spawns reserve per-root capacity atomically: the seventh is refused', async () => {
+    const harness = await bootChildHarness([{ toolCalls: [{ name: 'Read', args: {} }] }])
     const worker = (await new AgentDefinitionService(home).resolve(harness.workspaceId as never, 'worker')).definition
-    const results = await Promise.allSettled([
-      harness.executor.spawn(spawnRequest(harness, worker)),
-      harness.executor.spawn(spawnRequest(harness, worker)),
-      harness.executor.spawn(spawnRequest(harness, worker)),
-      harness.executor.spawn(spawnRequest(harness, worker)),
-    ])
-    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(3)
+    // A gate tool that never finishes keeps every child active, so the
+    // per-root reservation — not child completion — is what is measured.
+    harness.kernel.ctx.tools.register({
+      name: 'Read', description: 'gate', requiresRoot: false,
+      parameters: { type: 'object', properties: {}, required: [] },
+      async execute(_args, exec) {
+        await new Promise<string>((resolve) => {
+          if (exec.signal?.aborted === true) resolve('x')
+          else exec.signal?.addEventListener('abort', () => resolve('x'), { once: true })
+        })
+        return 'read'
+      },
+    })
+    const results = await Promise.allSettled(Array.from({ length: 7 }, () => harness.executor.spawn(spawnRequest(harness, worker))))
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(6)
     expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1)
     await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)
     await harness.kernel.stop()
   }, 20_000)
 
-  it('write-capable child waits for the awaited writer handoff before starting', async () => {
+  it('a write-capable child runs without waiting on any project-wide writer handoff', async () => {
     const harness = await bootChildHarness(['done'])
     const worker = (await new AgentDefinitionService(home).resolve(harness.workspaceId as never, 'worker')).definition
-    let releasedAt = 0
-    harness.kernel.ctx.on('agent/child-writer-handoff', async () => {
-      await new Promise((resolve) => setTimeout(resolve, 150))
-      releasedAt = Date.now()
-    })
-    let modelStartedAt = 0
-    harness.kernel.ctx.llm.register({
-      name: 'handoff-spy',
-      async *stream() {
-        modelStartedAt = Date.now()
-        yield { type: 'delta', delta: 'done' }
-      },
-    })
-    harness.kernel.ctx.llm.use('handoff-spy')
+    let handoffEvents = 0
+    harness.kernel.ctx.on('agent/child-writer-handoff', async () => { handoffEvents += 1 })
     const handle = await harness.executor.spawn(spawnRequest(harness, worker, { grantTools: ['Write'] }))
     const settled = await waitOne(harness.executor, harness.workspaceId, handle.childSessionId, 3_000)
     expect(settled?.status).toBe('completed')
-    expect(releasedAt).toBeGreaterThan(0)
-    expect(modelStartedAt).toBeGreaterThanOrEqual(releasedAt)
+    // The retired event is never emitted: no turn-wide project lease exists.
+    expect(handoffEvents).toBe(0)
     await harness.kernel.stop()
   }, 15_000)
 

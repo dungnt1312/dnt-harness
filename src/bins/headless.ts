@@ -6,11 +6,12 @@
  *
  * History persists under `--data-dir` (default `<cwd>/.mini-dsh/data`),
  * so a later run with the same data dir can resume where this one left
- * off. This runner has no Settings UI, therefore it requires
- * `DEEPSEEK_API_KEY`. Approval: `--yolo` allows every call; otherwise
- * reads/globs are allowed and write/edit/bash prompt on stderr before
- * running. Approval questions and decisions are recorded in the session
- * log like any other durable fact.
+ * off. A `DEEPSEEK_API_KEY` registers the DeepSeek provider; without one
+ * the REPL still starts and a model call fails when no provider is
+ * registered. Approval: `--yolo` allows every call; otherwise reads/globs
+ * are allowed and write/edit/bash prompt on stderr before running.
+ * Approval questions and decisions are recorded in the session log like
+ * any other durable fact.
  *
  * Usage:
  *   tsx src/bins/headless.ts --message "hello"
@@ -112,11 +113,6 @@ async function askUser(call: { name: string; args: Record<string, unknown> }): P
 async function main(): Promise<void> {
   const { yolo, root, dataDir, message } = parseArgs(process.argv.slice(2))
   const apiKey = readApiKey()
-  if (apiKey === undefined) {
-    process.stderr.write('headless requires DEEPSEEK_API_KEY; use the web UI Settings panel to configure custom OpenAI-completions providers.\n')
-    process.exitCode = 1
-    return
-  }
 
   const kernel = new Kernel()
   kernel.ctx.plugin(fileSessions(dataDir))
@@ -143,7 +139,11 @@ async function main(): Promise<void> {
   }
   kernel.ctx.tools.register(bashTool({ timeoutMs: DEFAULT_LIMITS.toolTimeoutMs }))
   kernel.ctx.tools.setRootResolver(() => ({ root, deniedRoots: [dataDir] }))
-  kernel.ctx.llm.register(new DeepSeekProvider(apiKey, process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com'))
+  if (apiKey !== undefined) {
+    kernel.ctx.llm.register(new DeepSeekProvider(apiKey, process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com'))
+  } else {
+    process.stderr.write('no DEEPSEEK_API_KEY; model calls fail until a provider is registered.\n')
+  }
 
   const session: Session = kernel.ctx.sessions.create(workspaces.defaultWorkspace)
   kernel.ctx.on('session/event', (emitter, event) => {

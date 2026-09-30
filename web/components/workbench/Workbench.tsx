@@ -1,14 +1,17 @@
-﻿import { lazy, Suspense, useMemo, type ReactNode } from 'react'
+﻿import { lazy, Suspense, useMemo, useState, type ReactNode } from 'react'
 import Icon from '../common/Icon.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Menu, menuItemClass } from '../ui/Menu.tsx'
-import { ArtifactsPanel, type OpenPathResolver } from '../artifacts/ArtifactsPanel.tsx'
+import type { OpenPathResolver } from '../../lib/project-paths.ts'
 import { ContextPanel, type ContextPanelProps } from '../layout/ContextPanel.tsx'
 import { AgentRunsPanel } from './AgentRunsPanel.tsx'
-import { FileBrowser } from './FileBrowser.tsx'
-import { FileViewer } from './FileViewer.tsx'
+import { TrajectoryPanel } from './TrajectoryPanel.tsx'
+import { FilesWorkspace } from './FilesWorkspace.tsx'
+import { GitPanel } from './GitPanel.tsx'
+
+const TerminalPanel = lazy(async () => import('./TerminalPanel.tsx'))
 import { baseName } from '../../lib/project-paths.ts'
-import { fileStyle } from '../../lib/file-icons.ts'
+import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
 import { cn } from '../../lib/cn.ts'
 import type { WorkbenchFiles } from '../../hooks/useWorkbenchFiles.ts'
 import { ANCHOR_VIEW, clampInspectorTab, normalizeInspectorViews, type WorkbenchViewName } from '../../lib/workbench-preferences.ts'
@@ -18,20 +21,17 @@ import type { SseEvent } from '../../lib/types.ts'
 // must not be able to drift apart.
 export type WorkbenchView = WorkbenchViewName
 
-const VIEW_META: Readonly<Record<WorkbenchView, { readonly icon: 'folder' | 'info' | 'layers' | 'gitBranch' | 'terminal'; readonly label: string }>> = {
+const VIEW_META: Readonly<Record<WorkbenchView, { readonly icon: 'folder' | 'info' | 'gitBranch' | 'clock' | 'terminal'; readonly label: string }>> = {
   files: { icon: 'folder', label: 'Files' },
+  git: { icon: 'gitBranch', label: 'Git' },
   context: { icon: 'info', label: 'Context' },
-  artifacts: { icon: 'layers', label: 'Artifacts' },
-  agents: { icon: 'gitBranch', label: 'Agents' },
+  agents: { icon: 'gitBranch', label: 'Subagents' },
+  trajectory: { icon: 'clock', label: 'Trajectory' },
   terminal: { icon: 'terminal', label: 'Terminal' },
 }
 
 /** Picker order; the strip itself keeps the order the operator opened views in. */
 const VIEW_ORDER = Object.keys(VIEW_META) as readonly WorkbenchView[]
-
-// xterm is ~250KB: it must not sit in the entry bundle for the readers who
-// never open a terminal.
-const TerminalPanel = lazy(async () => import('./TerminalPanel.tsx'))
 
 export interface WorkbenchProject {
   readonly id: string
@@ -71,16 +71,16 @@ function ViewTab({ view, active, onClick, onClose }: {
 }
 
 /**
- * The workbench: the Files anchor plus whichever of Context / Artifacts /
- * Agents / Terminal the operator has opened from the picker, and one closable
- * tab per opened file. Views are opened on demand rather than all shown at
- * once, because a nav holding every view leaves no room for file tabs.
+ * The workbench: the Files anchor plus whichever of Context / Trajectory /
+ * Subagents the operator has opened from the picker, and one closable tab per
+ * opened file. Views are opened on demand rather than all shown at once,
+ * because a nav holding every view leaves no room for file tabs.
  *
  * File bodies come from the project browsing endpoints rather than tool output.
- * Terminal is the deliberate interactive exception: a user-driven shell,
- * separate from the agent loop and from the session log.
+ * Terminal is a view tab like the others (Ctrl+` opens it). The chat column
+ * has a separate footer terminal; this panel does not own that one.
  */
-export function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, expanded, onToggleExpand, onClose, openPath, sessionId = null, modelOptions, onOpenChild, onOpenAgentSettings, terminalShell = null, onTerminalShell }: {
+export function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, expanded, onToggleExpand, onClose, openPath, sessionId = null, onOpenChild, terminalShell = null, onTerminalShell }: {
   readonly workspaceId: string | null
   /** The project whose files are browsable; null for chat-only conversations. */
   readonly project: WorkbenchProject | null
@@ -102,25 +102,35 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
   readonly openPath?: OpenPathResolver
   /** Root conversation the Agents view delegates from; null when none is open. */
   readonly sessionId?: string | null
-  /** `provider:model` rows the Agents view offers for a child. */
-  readonly modelOptions?: readonly { readonly value: string; readonly label: string }[]
   readonly onOpenChild?: (childSessionId: string) => void
-  readonly onOpenAgentSettings?: () => void
-  /** Shell the Terminal view opens by itself; null defers to the host's order. */
+  /** Shell the Terminal tab opens without being asked. */
   readonly terminalShell?: string | null
   readonly onTerminalShell?: (shellId: string | null) => void
 }) {
-  const showFile = files.activeFile !== null && project !== null && workspaceId !== null
+  const [treeVisible, setTreeVisible] = useState(true)
+  const [treeFraction, setTreeFraction] = useState(0.34)
   // One pass: the strip decides, and the selection follows it. Deriving the
   // active view here (rather than asserting `view` into the strip) is what
   // makes a single close click work — see closeView below.
   const openViews = useMemo(() => normalizeInspectorViews(views), [views])
   const activeView = clampInspectorTab(view, openViews)
   const closedViews = VIEW_ORDER.filter((candidate) => !openViews.includes(candidate))
-  const childEventCount = useMemo(() => events.filter((event) => event.type === 'agent/child-spawn' || event.type === 'agent/child-result').length, [events])
+  // Delegation lands in the root's own log, whether the user or the model
+  // started it: the Subagents view refreshes off that traffic and reads each
+  // child's brief from it.
+  const delegation = useMemo(() => {
+    let count = 0
+    const briefs = new Map<string, string>()
+    for (const event of events) {
+      if (event.type !== 'agent/child-spawn' && event.type !== 'agent/child-result') continue
+      count += 1
+      const brief = event.brief ?? event.objective
+      if (event.type === 'agent/child-spawn' && event.childSessionId !== undefined && brief !== undefined) briefs.set(event.childSessionId, brief)
+    }
+    return { count, briefs }
+  }, [events])
 
   const selectView = (next: WorkbenchView): void => {
-    files.showFixedView()
     // Selecting a view that is not open yet opens it. Doing it here, in one
     // click, keeps the strip and the selection from having to be repaired
     // by whichever patch happens to land second.
@@ -142,21 +152,41 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
     if (activeView === target) onView(remaining[Math.min(index, remaining.length - 1)] ?? ANCHOR_VIEW)
   }
 
-  let body: ReactNode
-  if (showFile) {
-    body = <FileViewer key={`${project.id}:${files.activeFile}`} workspaceId={workspaceId} projectId={project.id} projectPath={project.path} path={files.activeFile!} focus={files.focus} />
-  } else if (activeView === 'files') {
-    body = project !== null && workspaceId !== null
-      ? <FileBrowser key={project.id} workspaceId={workspaceId} project={project} folder={files.folder} activeFile={files.activeFile} onFolder={files.setFolder} onOpenFile={files.openFile} />
-      : (
-          <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
-            <Icon name="folder" size={22} className="text-fg-faint" />
-            <p className="m-0 text-sm font-medium">No project folder for this conversation</p>
-            <p className="m-0 max-w-xs text-[13px] text-fg-muted">Start a conversation in a project to browse its files here. Context and Artifacts remain available.</p>
-          </div>
-        )
+  let body: ReactNode = null
+  if (activeView === 'files') {
+    body = project !== null && workspaceId !== null ? (
+      <FilesWorkspace key={project.id} workspaceId={workspaceId} project={project} files={files} treeVisible={treeVisible} treeFraction={treeFraction} onTreeFraction={setTreeFraction} />
+    ) : (
+      <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
+        <Icon name="folder" size={22} className="text-fg-faint" />
+        <p className="m-0 text-sm font-medium">No project folder for this conversation</p>
+        <p className="m-0 max-w-xs text-[13px] text-fg-muted">Start a conversation in a project to browse its files here. Context and Trajectory remain available.</p>
+      </div>
+    )
   } else if (activeView === 'context') {
     body = <div className="min-h-0 flex-1 overflow-y-auto p-4"><ContextPanel {...context} /></div>
+  } else if (activeView === 'trajectory') {
+    body = <TrajectoryPanel events={events} {...(openPath !== undefined ? { openPath } : {})} />
+  } else if (activeView === 'git') {
+    body = project !== null && workspaceId !== null
+      ? <GitPanel key={project.id} workspaceId={workspaceId} project={project} />
+      : (
+        <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
+          <Icon name="gitBranch" size={22} className="text-fg-faint" />
+          <p className="m-0 text-sm font-medium">No project folder for this conversation</p>
+          <p className="m-0 max-w-xs text-[13px] text-fg-muted">Start a conversation in a project to see its git changes here.</p>
+        </div>
+      )
+  } else if (activeView === 'agents') {
+    body = (
+      <AgentRunsPanel
+        workspaceId={workspaceId}
+        rootSessionId={sessionId}
+        briefs={delegation.briefs}
+        refreshSignal={delegation.count}
+        {...(onOpenChild !== undefined ? { onOpenChild } : {})}
+      />
+    )
   } else if (activeView === 'terminal') {
     body = (
       <Suspense fallback={<div className="flex flex-1 items-center justify-center text-[13px] text-fg-muted">Loading terminal…</div>}>
@@ -164,26 +194,11 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
           key={project?.id ?? 'workspace'}
           workspaceId={workspaceId}
           projectId={project?.id ?? null}
-          defaultShell={terminalShell ?? null}
-          {...(onTerminalShell !== undefined ? { onDefaultShell: onTerminalShell } : {})}
+          defaultShell={terminalShell}
+          onDefaultShell={onTerminalShell ?? (() => undefined)}
         />
       </Suspense>
     )
-  } else if (activeView === 'agents') {
-    body = (
-      <AgentRunsPanel
-        workspaceId={workspaceId}
-        rootSessionId={sessionId}
-        {...(modelOptions !== undefined ? { modelOptions } : {})}
-        // Delegation lands in the root's own log, whether the user or the
-        // model started it, so the panel refreshes off that traffic.
-        refreshSignal={childEventCount}
-        {...(onOpenChild !== undefined ? { onOpenChild } : {})}
-        {...(onOpenAgentSettings !== undefined ? { onOpenSettings: onOpenAgentSettings } : {})}
-      />
-    )
-  } else {
-    body = <div className="min-h-0 flex-1 overflow-y-auto p-4"><ArtifactsPanel events={events} {...(openPath !== undefined ? { openPath } : {})} /></div>
   }
 
   return (
@@ -194,7 +209,7 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
             <ViewTab
               key={openView}
               view={openView}
-              active={!showFile && activeView === openView}
+              active={activeView === openView}
               onClick={() => selectView(openView)}
               {...(openView === ANCHOR_VIEW ? {} : { onClose: () => closeView(openView) })}
             />
@@ -219,23 +234,12 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
               ))}
             </Menu>
           ) : null}
-          {files.openFiles.length > 0 ? <span className="mx-1 h-5 w-px shrink-0 bg-line" aria-hidden="true" /> : null}
-            {files.openFiles.map((path) => {
-              const active = files.activeFile === path
-              const icon = fileStyle(path)
-              return (
-                <span key={path} className={cn('group flex h-8 shrink-0 items-center rounded-lg', active ? 'bg-muted' : 'hover:bg-hover')}>
-                  <button type="button" aria-pressed={active} title={path} onClick={() => files.openFile(path)} className={cn('flex h-full items-center gap-1.5 pl-2.5 pr-1 text-[13px]', active ? 'text-fg' : 'text-fg-muted hover:text-fg')}>
-                    <Icon name={icon.name} size={14} className={icon.className} />
-                  <span className="max-w-[10rem] truncate">{baseName(path)}</span>
-                </button>
-                <button type="button" aria-label={`Close ${path}`} title="Close" onClick={() => files.closeFile(path)} className="mr-1 flex size-5 items-center justify-center rounded text-fg-faint hover:bg-hover hover:text-fg">
-                  <Icon name="close" size={12} />
-                </button>
-              </span>
-            )
-          })}
         </div>
+        {activeView === 'files' && project !== null ? (
+          <IconButton label={treeVisible ? 'Hide file tree' : 'Show file tree'} aria-pressed={treeVisible} onClick={() => setTreeVisible((visible) => !visible)}>
+            <Icon name="folder" size={16} />
+          </IconButton>
+        ) : null}
         {onToggleExpand !== undefined ? (
           <IconButton label={expanded ? 'Exit full width' : 'Expand workbench'} onClick={onToggleExpand}>
             <Icon name={expanded ? 'minimize' : 'maximize'} size={16} />
@@ -243,6 +247,25 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
         ) : null}
         <IconButton label="Hide workbench" onClick={onClose}><Icon name="close" size={17} /></IconButton>
       </div>
+      {activeView === 'files' && files.openFiles.length > 0 ? (
+        <div className="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-line bg-bg" role="tablist" aria-label="Open files">
+          {files.openFiles.map((path) => {
+            const active = files.activeFile === path
+            return (
+              <span key={path} className={cn('group relative flex h-full shrink-0 items-center border-r border-line', active ? 'bg-bg' : 'bg-muted/40 hover:bg-hover')}>
+                <button type="button" role="tab" aria-selected={active} title={path} onClick={() => files.openFile(path)} className={cn('flex h-full items-center gap-1.5 pl-3 pr-1 text-[13px]', active ? 'text-fg' : 'text-fg-muted hover:text-fg')}>
+                  <FileTypeIcon path={path} size={14} />
+                  <span className="max-w-[12rem] truncate">{baseName(path)}</span>
+                </button>
+                <button type="button" aria-label={`Close ${path}`} title="Close" onClick={() => files.closeFile(path)} className={cn('mr-1 flex size-5 items-center justify-center rounded text-fg-faint hover:bg-hover hover:text-fg', active ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100')}>
+                  <Icon name="close" size={12} />
+                </button>
+                {active ? <span aria-hidden="true" className="absolute inset-x-0 bottom-0 h-0.5 bg-link" /> : null}
+              </span>
+            )
+          })}
+        </div>
+      ) : null}
       <div className="flex min-h-0 flex-1 flex-col">{body}</div>
     </section>
   )

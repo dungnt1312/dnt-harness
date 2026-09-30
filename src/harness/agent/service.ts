@@ -39,7 +39,7 @@ export class AgentsService extends Service {
     const target = session ?? this.ctx.sessions.create(identity.workspaceId)
     const existing = this.bySession.get(target.id)
     if (existing !== undefined) return existing
-    const agent = new Agent(this.ctx, target, { ...identity, sessionId: target.id })
+    const agent = new Agent(this.ctx, target, { ...identity, sessionId: target.id, rootSessionId: target.id })
     this.bySession.set(target.id, agent)
     return agent
   }

@@ -17,6 +17,8 @@ let server: WebServer
 let wsId = ''
 let projectId = ''
 let searchProjectId = ''
+let gitRoot = ''
+let gitProjectId = ''
 
 const idle: LlmProvider = {
   name: 'idle',
@@ -61,11 +63,25 @@ beforeAll(async () => {
   }
   projectId = await register('Files', project)
   searchProjectId = await register('Search', searchRoot)
+
+  const { execFileSync } = await import('node:child_process')
+  gitRoot = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-files-git-'))
+  const run = (...args: string[]) => execFileSync('git', args, { cwd: gitRoot })
+  run('init', '-q')
+  run('config', 'user.email', 'test@mini-dsh')
+  run('config', 'user.name', 'mini-dsh')
+  await fs.writeFile(path.join(gitRoot, 'README.md'), 'old\n', 'utf8')
+  run('add', '.')
+  run('commit', '-qm', 'init')
+  await fs.writeFile(path.join(gitRoot, 'README.md'), 'new\n', 'utf8')
+  await fs.mkdir(path.join(gitRoot, 'src'))
+  await fs.writeFile(path.join(gitRoot, 'src', 'new.ts'), 'export const created = true\n', 'utf8')
+  gitProjectId = await register('Git', gitRoot)
 })
 
 afterAll(async () => {
   await server?.close().catch(() => {})
-  for (const dir of [project, searchRoot, outside, home]) await fs.rm(dir, { recursive: true, force: true })
+  for (const dir of [project, searchRoot, outside, home, gitRoot]) await fs.rm(dir, { recursive: true, force: true })
 })
 
 const files = (query: string) => fetch(`${server.url}/api/workspaces/${wsId}/projects/${projectId}/files?path=${encodeURIComponent(query)}`)
@@ -116,6 +132,45 @@ describe('project file browsing', () => {
   it('fails closed for unknown projects and rejects writes', async () => {
     expect((await fetch(`${server.url}/api/workspaces/${wsId}/projects/nope/files`)).status).toBe(404)
     expect((await fetch(`${server.url}/api/workspaces/${wsId}/projects/${projectId}/file?path=README.md`, { method: 'PUT', body: 'x' })).status).toBe(405)
+  })
+})
+
+describe('project git (read-only)', () => {
+  it('reports the branch and a changed file with its line counts', async () => {
+    const response = await fetch(`${server.url}/api/workspaces/${wsId}/projects/${gitProjectId}/git`)
+    expect(response.status).toBe(200)
+    const report = (await response.json()) as { branch: string | null; truncated: boolean; changes: { path: string; status: string; added?: number; removed?: number }[] }
+    expect(report.branch).not.toBeNull()
+    expect(report.truncated).toBe(false)
+    const readme = report.changes.find((change) => change.path === 'README.md')
+    expect(readme).toMatchObject({ status: 'modified', added: 1, removed: 1 })
+    const created = report.changes.find((change) => change.path === 'src/new.ts')
+    expect(created?.status).toBe('untracked')
+  })
+
+  it('returns a unified diff for one root-relative path', async () => {
+    const response = await fetch(`${server.url}/api/workspaces/${wsId}/projects/${gitProjectId}/git?path=${encodeURIComponent('README.md')}`)
+    expect(response.status).toBe(200)
+    const diff = (await response.json()) as { path: string; binary: boolean; lines: { kind: string; text: string }[] }
+    expect(diff.path).toBe('README.md')
+    expect(diff.binary).toBe(false)
+    expect(diff.lines.some((line) => line.kind === 'del' && line.text === 'old')).toBe(true)
+    expect(diff.lines.some((line) => line.kind === 'add' && line.text === 'new')).toBe(true)
+  })
+
+  it('shows an untracked file as added lines', async () => {
+    const diff = (await (await fetch(`${server.url}/api/workspaces/${wsId}/projects/${gitProjectId}/git?path=${encodeURIComponent('src/new.ts')}`)).json()) as { lines: { kind: string; text: string }[] }
+    expect(diff.lines.some((line) => line.kind === 'add' && line.text === 'export const created = true')).toBe(true)
+  })
+
+  it('refuses a path that leaves the project and rejects writes', async () => {
+    expect((await fetch(`${server.url}/api/workspaces/${wsId}/projects/${gitProjectId}/git?path=../secret`)).status).toBe(400)
+    expect((await fetch(`${server.url}/api/workspaces/${wsId}/projects/${gitProjectId}/git`, { method: 'POST' })).status).toBe(405)
+  })
+
+  it('answers an empty status for a folder that is not a repository', async () => {
+    const report = (await (await fetch(`${server.url}/api/workspaces/${wsId}/projects/${projectId}/git`)).json()) as { branch: string | null; changes: unknown[] }
+    expect(report).toEqual({ branch: null, changes: [], truncated: false })
   })
 })
 

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import type { ModelMessage, ToolSchema } from '../llm/types.ts'
+import type { ModelMessage, ToolSchema, ContentPart } from '../llm/types.ts'
 import type { AttachmentLookup } from '../attachments/store.ts'
 import { userMessageContent, type SessionEvent } from '../session/events.ts'
 import type { Session } from '../session/session.ts'
@@ -41,10 +41,26 @@ export interface BuildContextInput {
   /** Workspace/project instructions when the mode enables them. */
   readonly workspaceInstructions?: string
   readonly activeSkills: readonly ActiveSkill[]
+  /**
+   * The workspace skill catalog as compact discovery rows (name +
+   * description). Rendered whenever the mode enables skills, so the model
+   * can choose to load a skill the user never named; bodies stay on-demand
+   * via the Skill tool. The caller supplies it only when the Skill tool is
+   * exposed in this request, so the block never advertises a dead load path.
+   */
+  readonly skillCatalog?: readonly { readonly name: string; readonly description: string }[]
   readonly pinnedMemory: readonly MemorySnippet[]
   readonly budget: ResolvedBudget
-  /** Latest compaction checkpoint, when the history setting is `compact`. */
+  /**
+   * Latest compaction checkpoint, when the history setting is `compact`.
+   */
   readonly compaction?: { readonly summary: string; readonly coversSeq: number }
+  /**
+   * Completed turns kept in context after the compaction checkpoint (the
+   * fresh tail). Defaults to {@link DEFAULT_COMPACTION_TAIL_TURNS}; 0 keeps
+   * only the open turn.
+   */
+  readonly compactionTailTurns?: number
   /**
    * Attachment bytes the host already read, by id. Whatever is missing is
    * reported to the model as unavailable rather than dropped.
@@ -58,6 +74,18 @@ export interface BuildContextInput {
     readonly definition: string
     readonly instructions: string
   }
+  /**
+   * Workspace-authored replacement for the base system prompt (root
+   * conversations). Blank/undefined falls back to {@link DEFAULT_BASE_SYSTEM};
+   * the mode's instructions and every other block are unaffected.
+   */
+  readonly baseSystemOverride?: string
+  /**
+   * Workspace-authored replacement for the subagent preamble. Blank/undefined
+   * falls back to {@link DEFAULT_CHILD_SYSTEM}; the child role's own pinned
+   * instructions are unaffected.
+   */
+  readonly childSystemOverride?: string
   /** Bounded parent-conversation projection, when the child inherited one. */
   readonly inheritedContext?: string
   /**
@@ -115,6 +143,8 @@ export interface ContextManifest {
     /** sha256 of the workspace/project instruction text, when included. */
     readonly instructionsHash?: string
     readonly skills: readonly string[]
+    /** Discovery rows this request carried (names + block hash); absent when dropped or off. */
+    readonly skillCatalog?: { readonly names: readonly string[]; readonly hash: string }
     readonly memory: readonly string[]
     readonly toolNames: readonly string[]
     readonly toolSchemas: number
@@ -124,6 +154,18 @@ export interface ContextManifest {
     readonly parentContext?: { readonly hash: string; readonly chars: number }
   }
   readonly omissions: readonly string[]
+  /**
+   * The fetchable raw blocks this request carried (system, compaction, parent
+   * context, skills, memory). `hash` keys the durable body store: sha256 of
+   * the exact model-visible text — NOT a source-file pinning hash, so a body
+   * fetch always returns what this request actually contained.
+   */
+  readonly sections: readonly {
+    readonly kind: ContextSection['kind']
+    readonly name?: string
+    readonly hash: string
+    readonly chars: number
+  }[]
 }
 
 /** Estimated tokens per request source; the fields sum to `usedTokens`. */
@@ -145,6 +187,23 @@ export interface AssembledContext {
   readonly messages: readonly ModelMessage[]
   readonly tools?: readonly ToolSchema[]
   readonly manifest: ContextManifest
+  /**
+   * The model-visible blocks that are NOT conversation history — the system
+   * block plus every wrapped lower-trust source that survived budget
+   * trimming. `hash` is sha256 of the exact text the request carried, so the
+   * trajectory can fetch and display the raw content later.
+   */
+  readonly sections: readonly ContextSection[]
+}
+
+/** One fetchable raw-context block of the assembled request. */
+export interface ContextSection {
+  readonly kind: 'system' | 'compaction' | 'parent-context' | 'skill' | 'skill-catalog' | 'memory'
+  /** Skill name or memory id, when the section belongs to a named source. */
+  readonly name?: string
+  readonly hash: string
+  readonly chars: number
+  readonly content: string
 }
 
 const LOWER_TRUST_PREAMBLE =
@@ -169,10 +228,11 @@ ${safe}
 </untrusted>`
 }
 
-const BASE_SYSTEM = 'You are mini-dsh, a local coding assistant. Answer helpfully and precisely.'
+/** The default base prompt for root conversations; a workspace may replace it. */
+export const DEFAULT_BASE_SYSTEM = 'You are mini-dsh, a local coding assistant. Answer helpfully and precisely.'
 
 /** The subagent preamble: what a child is and what it owes back. */
-const CHILD_SYSTEM = [
+export const DEFAULT_CHILD_SYSTEM = [
   'You are a subagent inside mini-dsh, working for another agent — not for a human.',
   'Your FINAL message is the entire deliverable: it is the only thing your caller receives.',
   'Nobody reads your intermediate messages or your tool output, so restate in your final message anything that matters, including the file paths you found.',
@@ -186,13 +246,19 @@ interface DatedMessage {
   readonly seq: number
 }
 
+/** A trimmed workspace override, or the default when it is blank/absent. */
+function resolveSystemOverride(override: string | undefined, fallback: string): string {
+  const trimmed = override?.trim()
+  return trimmed !== undefined && trimmed !== '' ? trimmed : fallback
+}
+
 /**
  * The one mode-driven context builder. Every model request assembles here —
  * there is no second path. Disabled sources contribute nothing (their
  * loaders are skipped entirely, and the manifest records the omission).
  *
- * Trim order when over budget: skills first, then a child's inherited
- * parent context, then memory, then oldest
+ * Trim order when over budget: the skill catalog, then skills, then a
+ * child's inherited parent context, then memory, then oldest
  * completed history turns (whole turns only, so tool-call/result pairs
  * never split and the open turn is never touched). If the request still
  * cannot fit, it fails loudly instead of truncating silently.
@@ -211,7 +277,7 @@ export function buildContext(input: BuildContextInput): AssembledContext {
   const systemParts: string[] = []
   const child = input.child
   if (child === undefined) {
-    systemParts.push(BASE_SYSTEM)
+    systemParts.push(resolveSystemOverride(input.baseSystemOverride, DEFAULT_BASE_SYSTEM))
     if (mode.definition.instructions.trim() !== '') {
       systemParts.push(`Mode — ${mode.definition.name}:\n${mode.definition.instructions.trim()}`)
     }
@@ -221,7 +287,7 @@ export function buildContext(input: BuildContextInput): AssembledContext {
     // denies). The capability line is derived from the schemas this request
     // actually carries, so it can never advertise a tool the child lacks;
     // the exposure gate, host policy and approval remain the enforcement.
-    systemParts.push(CHILD_SYSTEM)
+    systemParts.push(resolveSystemOverride(input.childSystemOverride, DEFAULT_CHILD_SYSTEM))
     systemParts.push(
       schemas.length > 0
         ? `You may call: ${schemas.map((schema) => schema.name).join(', ')} (each still subject to host policy and approval).`
@@ -260,7 +326,10 @@ export function buildContext(input: BuildContextInput): AssembledContext {
   }
 
   // ── history window per setting ─────────────────────────────
-  const window = historyWindow(input.events, mode.definition.sources.history)
+  const window = historyWindow(input.events, mode.definition.sources.history, input.compaction, input.compactionTailTurns)
+  if (window.tailDroppedThroughSeq !== undefined) {
+    omissions.push(`history: compaction tail dropped older completed turn(s) through seq ${window.tailDroppedThroughSeq}`)
+  }
   const dated = deriveDatedMessages(input.events, window.startSeq, input.attachments)
   const totalTurns = countTurns(input.events)
 
@@ -269,6 +338,11 @@ export function buildContext(input: BuildContextInput): AssembledContext {
   if (mode.definition.sources.skills === 'off' && skills.length > 0) {
     omissions.push(`skills: disabled by mode (${skills.map((skill) => skill.name).join(', ')})`)
     skills = []
+  }
+  let skillCatalog = input.skillCatalog
+  if (mode.definition.sources.skills === 'off' && skillCatalog !== undefined && skillCatalog.length > 0) {
+    omissions.push(`skill-catalog: disabled by mode (${skillCatalog.length} skills)`)
+    skillCatalog = undefined
   }
   let memory = [...input.pinnedMemory]
   if (mode.definition.sources.memoryPinned === false && memory.length > 0) {
@@ -300,6 +374,19 @@ export function buildContext(input: BuildContextInput): AssembledContext {
     role: 'system' as const,
     content: wrapUntrusted('skill', `name="${skill.name}" hash="${skill.hash}"`, skill.instructions),
   }))
+  // The discovery block: names + descriptions only, so the model knows what
+  // exists to load. Fixed template around user-editable rows → lower-trust.
+  const catalogText = skillCatalog !== undefined && skillCatalog.length > 0
+    ? wrapUntrusted(
+        'skill-catalog',
+        `skills="${skillCatalog.length}"`,
+        [
+          'Available skills (name — description). When the user\'s task matches one, load it with the Skill tool before proceeding:',
+          ...skillCatalog.map((skill) => `- ${skill.name}: ${skill.description}`),
+        ].join('\n'),
+      )
+    : undefined
+  let catalogMessage = catalogText === undefined ? undefined : { role: 'system' as const, content: catalogText }
   const memoryMessages = memory.map((entry) => ({
     role: 'system' as const,
     content: wrapUntrusted('memory', `id="${entry.id}" hash="${entry.hash}"`, entry.body),
@@ -309,6 +396,7 @@ export function buildContext(input: BuildContextInput): AssembledContext {
     for (const message of [...skillMessages, ...memoryMessages, ...lowerTrustMessages]) {
       total += estimateContentTokens(message.content)
     }
+    if (catalogMessage !== undefined) total += estimateContentTokens(catalogMessage.content)
     if (inheritedMessage !== undefined) total += estimateContentTokens(inheritedMessage.content)
     return total
   }
@@ -325,6 +413,13 @@ export function buildContext(input: BuildContextInput): AssembledContext {
 
   let historyStart = 0
   let used = fixedCost() + historyCost(historyStart)
+  if (used > available && catalogMessage !== undefined) {
+    // Discovery goes before loaded skills: the catalog serves future choices,
+    // an active skill's body is already in use by this request.
+    omissions.push('skill-catalog: dropped for budget')
+    catalogMessage = undefined
+    used = fixedCost() + historyCost(historyStart)
+  }
   if (used > available && skills.length > 0) {
     omissions.push(`skills: dropped for budget`)
     skills = []
@@ -372,13 +467,14 @@ export function buildContext(input: BuildContextInput): AssembledContext {
     systemTools: Math.max(schemaCost(schemas) - mcpTools, 0),
     mcpTools,
     metaContext: Math.max(estimateTokens(systemText) - systemPrompt, 0) + sumTokens(memoryMessages) + (inheritedMessage !== undefined ? estimateContentTokens(inheritedMessage.content) : 0),
-    skills: sumTokens(skillMessages),
+    skills: sumTokens(skillMessages) + (catalogMessage !== undefined ? estimateContentTokens(catalogMessage.content) : 0),
     messages: sumTokens(lowerTrustMessages) + historyCost(historyStart),
   }
 
   // ── assemble messages (reuses the EXACT measured texts) ────
   const messages: ModelMessage[] = [{ role: 'system', content: systemText }, ...lowerTrustMessages]
   if (inheritedMessage !== undefined) messages.push(inheritedMessage)
+  if (catalogMessage !== undefined) messages.push(catalogMessage)
   for (let i = 0; i < skills.length; i++) {
     const built = skillMessages[i]
     if (built !== undefined) messages.push(built)
@@ -395,7 +491,7 @@ export function buildContext(input: BuildContextInput): AssembledContext {
   // trimming (budget drops advance historyStart).
   const effectiveStartSeq = historyStart > 0 ? (dated[historyStart]?.seq ?? (input.events[input.events.length - 1]?.seq ?? 0) + 1) : window.startSeq
   const finalIncludedTurns = countTurnsFrom(input.events, effectiveStartSeq)
-  const manifest: ContextManifest = {
+  const manifest: Omit<ContextManifest, 'sections'> = {
     modeId: mode.definition.id,
     modeRevision: input.modeRevision,
     ...(mode.hash !== undefined ? { modeHash: mode.hash } : {}),
@@ -427,6 +523,9 @@ export function buildContext(input: BuildContextInput): AssembledContext {
         ? { instructionsHash: sha256Text(workspaceInstructions) }
         : {}),
       skills: skills.map((skill) => `${skill.name}@${skill.hash}`),
+      ...(catalogMessage !== undefined && skillCatalog !== undefined
+        ? { skillCatalog: { names: skillCatalog.map((skill) => skill.name), hash: sha256Text(catalogMessage.content) } }
+        : {}),
       memory: memory.map((entry) => `${entry.id}@${entry.hash}`),
       toolNames: schemas.map((schema) => schema.name),
       toolSchemas: schemas.length,
@@ -440,10 +539,34 @@ export function buildContext(input: BuildContextInput): AssembledContext {
     omissions,
   }
 
+  // ── sections: the fetchable non-history blocks (exact measured texts) ──
+  const asText = (content: string | readonly ContentPart[]): string => (typeof content === 'string' ? content : JSON.stringify(content))
+  const sections: ContextSection[] = []
+  const pushSection = (kind: ContextSection['kind'], name: string | undefined, content: string | readonly ContentPart[]): void => {
+    const text = asText(content)
+    sections.push({ kind, ...(name !== undefined ? { name } : {}), hash: sha256Text(text), chars: text.length, content: text })
+  }
+  pushSection('system', undefined, systemText)
+  for (const message of lowerTrustMessages) pushSection('compaction', undefined, message.content)
+  if (inheritedMessage !== undefined) pushSection('parent-context', undefined, inheritedMessage.content)
+  if (catalogMessage !== undefined) pushSection('skill-catalog', undefined, catalogMessage.content)
+  for (let i = 0; i < skills.length; i++) {
+    const built = skillMessages[i]
+    if (built !== undefined) pushSection('skill', skills[i]?.name, built.content)
+  }
+  for (let i = 0; i < memory.length; i++) {
+    const built = memoryMessages[i]
+    if (built !== undefined) pushSection('memory', memory[i]?.id, built.content)
+  }
+
   return {
     messages,
     ...(schemas.length > 0 ? { tools: schemas } : {}),
-    manifest,
+    manifest: {
+      ...manifest,
+      sections: sections.map(({ kind, name, hash, chars }) => ({ kind, ...(name !== undefined ? { name } : {}), hash, chars })),
+    },
+    sections,
   }
 }
 
@@ -453,20 +576,73 @@ interface HistoryWindow {
   /** Seq of the still-open turn (undefined when none is open). */
   readonly openTurnStartSeq: number | undefined
   readonly omittedTurns: number
+  /** Set when the compaction tail dropped older completed turns: the exclusive seq through which they left context. */
+  readonly tailDroppedThroughSeq?: number
 }
 
+/** Completed turns kept in context after the newest compaction checkpoint. */
+const DEFAULT_COMPACTION_TAIL_TURNS = 4
+
 /** The window of log events a history setting includes. */
-function historyWindow(events: readonly SessionEvent[], setting: 'none' | 'recent' | 'compact'): HistoryWindow {
+function historyWindow(
+  events: readonly SessionEvent[],
+  setting: 'none' | 'recent' | 'compact',
+  compaction?: { readonly coversSeq: number },
+  tailTurns: number = DEFAULT_COMPACTION_TAIL_TURNS,
+): HistoryWindow {
   const total = countTurns(events)
-  if (setting === 'recent') return { startSeq: 1, openTurnStartSeq: lastOpenTurnStart(events), omittedTurns: 0 }
-  // `none` and `compact` keep only the CURRENT (open) turn's events; a
-  // compact checkpoint's summary rides separately as system context.
+  const lastSeq = events[events.length - 1]?.seq ?? 0
   const open = lastOpenTurnStart(events)
-  if (open === undefined) {
-    // No open turn: the request carries only system/skill/memory content.
-    return { startSeq: (events[events.length - 1]?.seq ?? 0) + 1, openTurnStartSeq: undefined, omittedTurns: total }
+  if (setting === 'recent') return { startSeq: 1, openTurnStartSeq: open, omittedTurns: 0 }
+  if (setting === 'none' || open === undefined) {
+    // `none` keeps only the CURRENT (open) turn's events; a compact request
+    // with no open turn carries no history either (no step runs there).
+    if (open === undefined) return { startSeq: lastSeq + 1, openTurnStartSeq: undefined, omittedTurns: total }
+    return { startSeq: open, openTurnStartSeq: open, omittedTurns: total - 1 }
   }
-  return { startSeq: open, openTurnStartSeq: open, omittedTurns: total - 1 }
+  // `compact`: a checkpoint AUTHORIZES replacing raw history with its
+  // summary — events through `coversSeq` ride in the summary, never as raw
+  // messages. Without a checkpoint nothing authorized a drop, so the window
+  // is the full log (the budget trimmer still bounds the request, loudly).
+  // The tail after the checkpoint keeps the last `tailTurns` completed turns
+  // so fresh context survives the summary boundary; older post-checkpoint
+  // turns fall out as recorded omissions until the next compaction covers
+  // them.
+  const covered = compaction?.coversSeq ?? 0
+  if (covered <= 0) return { startSeq: 1, openTurnStartSeq: open, omittedTurns: 0 }
+  const starts = completedTurnStarts(events, covered)
+  const tail = tailTurns > 0 ? Math.floor(tailTurns) : 0
+  let startSeq = covered + 1
+  let tailDroppedThroughSeq: number | undefined
+  if (starts.length > tail) {
+    startSeq = tail === 0 ? open : starts[starts.length - tail]!
+    tailDroppedThroughSeq = startSeq - 1
+  }
+  if (startSeq > open) startSeq = open // defensive: the open turn is never dropped
+  return {
+    startSeq,
+    openTurnStartSeq: open,
+    omittedTurns: total - 1,
+    ...(tailDroppedThroughSeq !== undefined ? { tailDroppedThroughSeq } : {}),
+  }
+}
+
+/** Start seqs of completed turns that begin after `afterSeq`. */
+function completedTurnStarts(events: readonly SessionEvent[], afterSeq: number): number[] {
+  const starts: number[] = []
+  let openTurnId: string | undefined
+  let pendingStart: number | undefined
+  for (const event of events) {
+    if (event.type === 'turn/start') {
+      openTurnId = event.turnId
+      pendingStart = event.seq
+    } else if (event.type === 'turn/end' && event.turnId === openTurnId) {
+      if (pendingStart !== undefined && pendingStart > afterSeq) starts.push(pendingStart)
+      openTurnId = undefined
+      pendingStart = undefined
+    }
+  }
+  return starts
 }
 
 function countTurns(events: readonly SessionEvent[]): number {

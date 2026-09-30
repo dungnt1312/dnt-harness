@@ -294,9 +294,9 @@ export class WorkspaceService {
 
   /**
    * Bind a project to a workspace with an external working folder. The
-   * folder must exist and must not overlap any other project's folder
-   * within the same workspace. The same physical folder may be bound in
-   * multiple workspaces (profiles) — overlap is only enforced intra-workspace.
+   * folder must exist. Overlapping or nested folders between projects are
+   * allowed — the same physical folder may be bound any number of times,
+   * in the same workspace or across workspaces (profiles).
    */
   async createProject(workspaceId: WorkspaceId, name: string, rawPath: string): Promise<ProjectRecord> {
     const workspace = this.get(workspaceId)
@@ -314,16 +314,6 @@ export class WorkspaceService {
       throw new ScopeError('root-invalid', `'${rawPath}' is not a directory`)
     }
     const canonical = await fs.realpath(abs)
-    for (const existing of this.projects.values()) {
-      if (existing.workspaceId !== workspaceId) continue
-      const other = await fs.realpath(existing.path).catch(() => existing.path)
-      if (this.rootsOverlap(canonical, other)) {
-        throw new ScopeError(
-          'root-overlap',
-          `project folder overlaps '${existing.name}' in workspace '${this.workspaces.get(existing.workspaceId)?.name ?? existing.workspaceId}'`,
-        )
-      }
-    }
     const id = newProjectId()
     const record: ProjectRecord = {
       v: 1,
@@ -337,18 +327,6 @@ export class WorkspaceService {
     this.projects.set(id, record)
     await writeJson(this.projectPath(workspaceId, id), record)
     return record
-  }
-
-  /** Canonical mutual-containment check: equal or nested in either direction. */
-  private rootsOverlap(a: string, b: string): boolean {
-    return this.containsRoot(a, b) || this.containsRoot(b, a)
-  }
-
-  private containsRoot(parent: string, child: string): boolean {
-    const np = process.platform === 'win32' ? parent.toLowerCase() : parent
-    const nc = process.platform === 'win32' ? child.toLowerCase() : child
-    const rel = path.relative(np, nc)
-    return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel))
   }
 
   listProjects(workspaceId: WorkspaceId): ProjectRecord[] {
@@ -417,14 +395,6 @@ export class WorkspaceService {
       throw new ScopeError('root-invalid', `'${rawPath}' is not a directory`)
     }
     const canonical = await fs.realpath(abs)
-    for (const existing of this.projects.values()) {
-      if (existing.id === id) continue
-      if (existing.workspaceId !== workspaceId) continue
-      const other = await fs.realpath(existing.path).catch(() => existing.path)
-      if (this.rootsOverlap(canonical, other)) {
-        throw new ScopeError('root-overlap', `project folder overlaps '${existing.name}'`)
-      }
-    }
     const updated: ProjectRecord = { ...record, path: canonical }
     this.projects.set(id, updated)
     await writeJson(this.projectPath(record.workspaceId, id), updated)
@@ -466,6 +436,18 @@ export class WorkspaceService {
     const record = this.getProject(id, workspaceId)
     await fs.rm(path.join(this.projectsDir(record.workspaceId), id), { recursive: true, force: true })
     this.projects.delete(id)
+  }
+
+  /** Canonical mutual-containment check: equal or nested in either direction. */
+  private rootsOverlap(a: string, b: string): boolean {
+    return this.containsRoot(a, b) || this.containsRoot(b, a)
+  }
+
+  private containsRoot(parent: string, child: string): boolean {
+    const np = process.platform === 'win32' ? parent.toLowerCase() : parent
+    const nc = process.platform === 'win32' ? child.toLowerCase() : child
+    const rel = path.relative(np, nc)
+    return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel))
   }
 
   /**

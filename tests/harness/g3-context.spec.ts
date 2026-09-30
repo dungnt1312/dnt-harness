@@ -1,11 +1,11 @@
 /**
  * G3 context builder: single assembly path, disabled loaders contribute
  * nothing, history settings (`none` keeps the current Turn's loop), budget
- * trim order (skills → memory → oldest completed turns), loud failure, and
- * the truthful manifest.
+ * trim order (catalog → skills → memory → oldest completed turns), loud
+ * failure, and the truthful manifest.
  */
 import { describe, expect, it } from 'vitest'
-import { buildContext, ContextBudgetError, DEFAULT_BUDGET, messageText, type ActiveSkill, type MemorySnippet } from 'mini-dsh'
+import { buildContext, ContextBudgetError, DEFAULT_BUDGET, messageText, type ActiveSkill, type MemorySnippet, type ModeDefinition } from 'mini-dsh'
 import { BUNDLED_MODES, DEFAULT_MODE_ID } from 'mini-dsh'
 import type { SessionEvent } from 'mini-dsh'
 
@@ -16,6 +16,16 @@ function mode(id: string) {
   if (found === undefined) throw new Error(`no bundled mode '${id}'`)
   return { definition: found, source: 'bundled' as const }
 }
+
+/** A workspace-authored conversation mode: no tools, no optional sources. */
+const ZERO_MODE: ModeDefinition = {
+  id: 'zero', name: 'Zero',
+  instructions: 'You are a conversational assistant with no tools.',
+  sources: { history: 'recent', workspaceInstructions: false, skills: 'off', memoryPinned: false, memoryRetrieval: false },
+  toolExposure: [],
+  permissionDefaults: {},
+}
+const zeroMode = () => ({ definition: ZERO_MODE, source: 'workspace' as const })
 
 type EventRow = { type: string; [key: string]: unknown }
 
@@ -48,9 +58,9 @@ function base(overrides: Partial<Parameters<typeof buildContext>[0]> = {}): Para
 }
 
 describe('mode-driven assembly', () => {
-  it('Chat assembles no tools and no optional sources even when inputs exist', () => {
+  it('a zero-exposure mode assembles no tools and no optional sources even when inputs exist', () => {
     const assembled = buildContext(base({
-      mode: mode('chat'),
+      mode: zeroMode(),
       schemas: [{ name: 'Read', description: 'x', parameters: { type: 'object', properties: {} } }],
       activeSkills: [{ name: 'skill-a', instructions: 'skill text', hash: 'a'.repeat(64) }],
       pinnedMemory: [{ id: 'fact', title: 'Fact', body: 'memory text', hash: 'f'.repeat(64) }],
@@ -77,6 +87,52 @@ describe('mode-driven assembly', () => {
     // Lower-trust content is wrapped as data, not bare instructions.
     expect(text).toContain('DATA provided for reference')
     expect(enabled.manifest.sources.skills).toEqual([`skill-a@${'a'.repeat(64)}`])
+  })
+
+  it('the skill catalog rides as discovery rows so the model can choose to load', () => {
+    const assembled = buildContext(base({
+      schemas: [{ name: 'Skill', description: 'x', parameters: { type: 'object', properties: {} } }],
+      skillCatalog: [
+        { name: 'deploy-run', description: 'Ship the current build' },
+        { name: 'repo-audit', description: 'Audit the tree' },
+      ],
+    }))
+    const text = assembled.messages.map((message) => message.content).join('\n')
+    expect(text).toContain('Available skills')
+    expect(text).toContain('- deploy-run: Ship the current build')
+    expect(text).toContain('- repo-audit: Audit the tree')
+    expect(text).toContain('DATA provided for reference')
+    expect(assembled.manifest.sources.skillCatalog?.names).toEqual(['deploy-run', 'repo-audit'])
+    expect(assembled.manifest.sections.some((section) => section.kind === 'skill-catalog')).toBe(true)
+    expect(assembled.manifest.breakdown.skills).toBeGreaterThan(0)
+  })
+
+  it('the catalog is omitted when the mode disables skills and never when not supplied', () => {
+    const off = buildContext(base({
+      mode: zeroMode(),
+      skillCatalog: [{ name: 'deploy-run', description: 'Ship the current build' }],
+    }))
+    expect(off.messages.map((message) => message.content).join('\n')).not.toContain('deploy-run')
+    expect(off.manifest.omissions.some((line) => line.startsWith('skill-catalog:'))).toBe(true)
+    expect(off.manifest.sources.skillCatalog).toBeUndefined()
+
+    const absent = buildContext(base())
+    expect(absent.messages.map((message) => message.content).join('\n')).not.toContain('Available skills')
+    expect(absent.manifest.omissions.some((line) => line.startsWith('skill-catalog:'))).toBe(false)
+  })
+
+  it('budget trims the catalog before loaded skills — discovery yields to in-use content', () => {
+    const skillBody = 'x'.repeat(8_400)
+    const assembled = buildContext(base({
+      activeSkills: [{ name: 'big', instructions: skillBody, hash: 'b'.repeat(64) }],
+      skillCatalog: [{ name: 'listed', description: 'y'.repeat(2_800) }],
+      budget: { ...DEFAULT_BUDGET, contextLimitTokens: 3_400, outputReserveTokens: 512, marginTokens: 256 },
+    }))
+    expect(assembled.manifest.omissions.some((line) => line.startsWith('skill-catalog:'))).toBe(true)
+    expect(assembled.manifest.omissions.some((line) => line.startsWith('skills:'))).toBe(false)
+    expect(assembled.messages.map((message) => message.content).join('\n')).toContain(skillBody)
+    expect(assembled.manifest.sources.skillCatalog).toBeUndefined()
+    expect(assembled.manifest.budget.usedTokens).toBeLessThanOrEqual(assembled.manifest.budget.availableTokens)
   })
 
   it('history none keeps the current turn (tool loop intact) and drops previous turns', () => {
@@ -275,6 +331,40 @@ describe('skills + memory units', () => {
     expect((await noUser.list(ws)).map((entry) => entry.name)).toEqual(['shared'])
     await fs.rm(root, { recursive: true, force: true })
   })
+
+  it('hidden skills leave discovery (listVisible) but stay loadable by name', async () => {
+    const { SkillsService } = await import('mini-dsh')
+    const { promises: fs } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const path = await import('node:path')
+    const root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-skill-hidden-'))
+    const skills = new SkillsService(root, path.join(root, 'bundled'), path.join(root, 'user'))
+    const ws = 'ws-h' as never
+    await skills.save(ws, 'mine', '---\nname: mine\ndescription: "workspace"\n---\n\nbody')
+    await fs.mkdir(path.join(root, 'user', 'theirs'), { recursive: true })
+    await fs.writeFile(path.join(root, 'user', 'theirs', 'SKILL.md'), '---\nname: theirs\ndescription: "user layer"\n---\n\nbody', 'utf8')
+
+    // Hide across layers — the sidecar is user-layer skills' only curation.
+    await skills.setHidden(ws, 'theirs', true)
+    expect((await skills.hiddenNames(ws))).toEqual(['theirs'])
+    const visible = (await skills.listVisible(ws)).map((entry) => entry.name)
+    expect(visible).toContain('mine')
+    expect(visible).not.toContain('theirs')
+    expect((await skills.list(ws)).map((entry) => entry.name)).toContain('theirs')
+
+    // Demand-only: an explicit load by name still works for a hidden skill.
+    expect((await skills.load(ws, 'theirs')).instructions).toBe('body')
+
+    // A tombstone for an absent skill is allowed and ignored on discovery.
+    await skills.setHidden(ws, 'not-yet', true)
+    expect((await skills.listVisible(ws)).map((entry) => entry.name)).toEqual(['mine'])
+
+    // Unhide restores discovery; malformed names are refused.
+    await skills.setHidden(ws, 'theirs', false)
+    expect((await skills.listVisible(ws)).map((entry) => entry.name)).toEqual(['mine', 'theirs'])
+    await expect(skills.setHidden(ws, 'Bad_Name', true)).rejects.toMatchObject({ code: 'not-found' })
+    await fs.rm(root, { recursive: true, force: true })
+  })
 })
 
 describe('child assembly', () => {
@@ -302,7 +392,7 @@ describe('child assembly', () => {
   it('the capability line names exactly the schemas the request carries, or says there are none', () => {
     const narrowed = buildContext(base({ mode: mode('full-access'), schemas: READ_TOOLS.slice(0, 1), child: { definition: 'worker', instructions: 'W' } }))
     expect(systemOf(narrowed)).toContain('You may call: Read (each still subject')
-    const none = buildContext(base({ mode: mode('chat'), schemas: READ_TOOLS, child: CHILD }))
+    const none = buildContext(base({ mode: zeroMode(), schemas: READ_TOOLS, child: CHILD }))
     expect(systemOf(none)).toContain('You have no tools in this request.')
   })
 
@@ -372,5 +462,45 @@ describe('manifest breakdown', () => {
     const sum = breakdown.systemPrompt + breakdown.systemTools + breakdown.mcpTools + breakdown.metaContext + breakdown.skills + breakdown.messages
     // Rounding happens per text, so the split may differ from the total by a token or two.
     expect(Math.abs(sum - budget.usedTokens)).toBeLessThanOrEqual(2)
+  })
+})
+
+describe('system prompt overrides', () => {
+  const systemOf = (assembled: ReturnType<typeof buildContext>): string => messageText(assembled.messages[0]!.content)
+
+  it('a non-blank base override replaces the default prose wholesale', () => {
+    const overridden = buildContext(base({ baseSystemOverride: 'CUSTOM BASE: obey the workspace house style.' }))
+    const system = systemOf(overridden)
+    expect(system.startsWith('CUSTOM BASE: obey the workspace house style.')).toBe(true)
+    expect(system).not.toContain('You are mini-dsh, a local coding assistant')
+    expect(overridden.sections[0]?.content).toContain('CUSTOM BASE')
+  })
+
+  it('a blank or absent override falls back to the default', () => {
+    for (const override of [undefined, '', '   \n\t ']) {
+      const assembled = buildContext(base({ ...(override !== undefined ? { baseSystemOverride: override } : {}) }))
+      expect(systemOf(assembled)).toContain('You are mini-dsh, a local coding assistant')
+    }
+  })
+
+  it('a child override replaces the preamble but keeps the capability line and role body', () => {
+    const assembled = buildContext(base({
+      schemas: [{ name: 'Read', description: 'read', parameters: { type: 'object', properties: {} } }],
+      child: { definition: 'explorer', instructions: 'ROLEBODY' },
+      childSystemOverride: 'CUSTOM CHILD: you work for a delegating agent.',
+    }))
+    const system = systemOf(assembled)
+    expect(system.startsWith('CUSTOM CHILD: you work for a delegating agent.')).toBe(true)
+    expect(system).not.toContain('You are a subagent inside mini-dsh')
+    expect(system).toContain('You may call: Read (each still subject')
+    expect(system).toContain('Role — explorer:\nROLEBODY')
+  })
+
+  it('the child path ignores the base override and the root path ignores the child override', () => {
+    const child = buildContext(base({ child: { definition: 'w', instructions: 'W' }, baseSystemOverride: 'ROOT ONLY' }))
+    expect(systemOf(child)).not.toContain('ROOT ONLY')
+    expect(systemOf(child)).toContain('You are a subagent inside mini-dsh')
+    const root = buildContext(base({ childSystemOverride: 'CHILD ONLY' }))
+    expect(systemOf(root)).not.toContain('CHILD ONLY')
   })
 })

@@ -28,11 +28,12 @@ import {
 import { ModelSettingsDialog, SyncModelsDialog } from './model-dialogs.tsx'
 import { AgentsPanel, HooksPanel, McpPanel, MemoryPanel, SecretsPanel, SkillsPanel } from './ManagementPanels.tsx'
 import { PermissionsPanel } from './PermissionsPanel.tsx'
+import { SystemPromptsPanel } from './SystemPromptsPanel.tsx'
 import { modelOptions } from '../../lib/providers.ts'
 import type { ModelSettings, ProjectRow, ProviderSummary } from '../../lib/types.ts'
 
 /** Settings are grouped per concern; providers keep their own full editor. */
-type SettingsTab = 'providers' | 'projects' | 'permissions' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'
+type SettingsTab = 'providers' | 'projects' | 'permissions' | 'prompts' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'
 
 const LEGACY_TAB_REDIRECT: Readonly<Record<string, SettingsTab>> = {
   modes: 'permissions',
@@ -49,9 +50,10 @@ const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonl
   { id: 'providers', label: 'Providers', hint: 'Model endpoints and keys', icon: 'globe' },
   { id: 'projects', label: 'Projects', hint: 'Folders conversations in this workspace can work in', icon: 'folder' },
   { id: 'permissions', label: 'Permissions', hint: 'Modes & dangerous command guard', icon: 'shield' },
+  { id: 'prompts', label: 'System Prompts', hint: 'Replace the fixed base & subagent prompts for this workspace', icon: 'fileText' },
   { id: 'skills', label: 'Skills', hint: 'SKILL.md instruction packages', icon: 'zap' },
   { id: 'memory', label: 'Memory', hint: 'Notes the model recalls in this workspace', icon: 'lightbulb' },
-  { id: 'agents', label: 'Agents', hint: 'Roles a conversation can delegate to; spawn them from the workbench', icon: 'gitBranch' },
+  { id: 'agents', label: 'Agents', hint: 'Roles a conversation can delegate to', icon: 'gitBranch' },
   { id: 'mcp', label: 'MCP', hint: 'Tool servers over stdio or HTTP', icon: 'terminal' },
   { id: 'hooks', label: 'Hooks', hint: 'Commands that run around tool calls and sessions', icon: 'wrench' },
   { id: 'secrets', label: 'Secrets', hint: 'Encrypted credentials for MCP servers', icon: 'key' },
@@ -60,7 +62,7 @@ const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonl
 /** Nav groups: global settings first, then the active workspace's. */
 const TAB_GROUPS: readonly { readonly label: string; readonly ids: readonly SettingsTab[] }[] = [
   { label: 'Global', ids: ['providers'] },
-  { label: 'Workspace', ids: ['projects', 'permissions', 'skills', 'memory', 'agents', 'mcp', 'hooks', 'secrets'] },
+  { label: 'Workspace', ids: ['projects', 'permissions', 'prompts', 'skills', 'memory', 'agents', 'mcp', 'hooks', 'secrets'] },
 ]
 
 interface Draft {
@@ -506,6 +508,7 @@ export function SettingsModal({
               <>
                 {tab === 'projects' ? <ProjectsPanel workspaceId={workspaceId} projects={projects} onChanged={onProjectsChanged} sessionCounts={sessionCounts} /> : null}
                 {tab === 'permissions' ? <PermissionsPanel workspaceId={workspaceId} onChanged={onRefresh} /> : null}
+                {tab === 'prompts' ? <SystemPromptsPanel workspaceId={workspaceId} /> : null}
                 {tab === 'skills' ? <SkillsPanel workspaceId={workspaceId} /> : null}
                 {tab === 'memory' ? <MemoryPanel workspaceId={workspaceId} /> : null}
                 {tab === 'agents' ? <AgentsPanel workspaceId={workspaceId} modelOptions={roleModelOptions} /> : null}

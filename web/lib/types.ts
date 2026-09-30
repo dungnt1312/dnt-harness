@@ -25,6 +25,8 @@ export interface SseEvent {
   readonly reason?: string
   /** Turn membership (turn/start, user/message, assistant traffic, turn/end). */
   readonly turnId?: string
+  /** Step membership (step/start, step/end). */
+  readonly stepId?: string
   readonly toolCalls?: ToolCall[]
   /** Recorded controls on assistant answers (what served this step). */
   readonly controls?: { readonly model?: string; readonly provider?: string }
@@ -77,6 +79,83 @@ export interface SseEvent {
   readonly argsHash?: string
   readonly resultHash?: string
   readonly isError?: boolean
+  /** `context/manifest`: the assembled request's manifest, one per turn. */
+  readonly manifest?: ContextManifestView
+  /** `context/body`: one raw context block keyed by its content sha256. */
+  readonly hash?: string
+  readonly chars?: number
+  readonly body?: string
+  /** Compaction lifecycle (compaction/start, compaction/end). */
+  readonly trigger?: 'manual' | 'automatic'
+  readonly model?: string
+  readonly coversSeq?: number
+  readonly summaryChars?: number
+  /** The stored summary itself; present on a successful compaction/end. */
+  readonly summary?: string
+  /** Set on a failed compaction/end. */
+  readonly error?: string
+}
+
+/** Estimated tokens per request source; the fields sum to `usedTokens`. */
+export interface ContextBreakdownView {
+  readonly systemPrompt: number
+  readonly systemTools: number
+  readonly mcpTools: number
+  readonly metaContext: number
+  readonly skills: number
+  readonly messages: number
+}
+
+export interface ContextUsageView {
+  /**
+   * Prompt count of the request this manifest describes. Absent when that
+   * request has not reported usage yet; cache totals below may still be present.
+   */
+  readonly last?: { readonly inputTokens: number; readonly cachedInputTokens?: number; readonly outputTokens?: number }
+  readonly cacheableInputTokens: number
+  readonly cachedInputTokens: number
+}
+
+/** What one assembled model request carried; the server's ContextManifest. */
+export interface ContextManifestView {
+  readonly modeId: string
+  readonly modeRevision: number
+  readonly model?: string
+  readonly provider?: string
+  readonly budget: { readonly availableTokens: number; readonly usedTokens: number; readonly contextLimitTokens?: number; readonly estimated: boolean }
+  /** Estimated tokens per source of the last request; sums to `usedTokens`. */
+  readonly breakdown?: ContextBreakdownView
+  /** Provider-reported usage, when the provider streams it. */
+  readonly usage?: ContextUsageView
+  readonly history: {
+    readonly setting: string
+    readonly includedTurns: number
+    readonly omittedTurns: number
+    readonly includedSeqRange?: readonly [number, number]
+    readonly omittedSeqRange?: readonly [number, number]
+    readonly checkpointHash?: string
+  }
+  readonly sources: {
+    readonly instructionsHash?: string
+    readonly skills: readonly string[]
+    /** Discovery rows the request carried; absent when dropped or skills off. */
+    readonly skillCatalog?: { readonly names: readonly string[]; readonly hash: string }
+    readonly memory: readonly string[]
+    readonly toolNames: readonly string[]
+    readonly toolSchemas: number
+    /** Present when the request ran as a child role. */
+    readonly child?: { readonly definition: string; readonly instructionsHash: string }
+    /** Inherited parent context the request carried (absent when dropped). */
+    readonly parentContext?: { readonly hash: string; readonly chars: number }
+  }
+  readonly omissions: readonly string[]
+  /** Fetchable raw blocks of this request; hash keys the body store. */
+  readonly sections?: readonly {
+    readonly kind: 'system' | 'compaction' | 'parent-context' | 'skill' | 'skill-catalog' | 'memory'
+    readonly name?: string
+    readonly hash: string
+    readonly chars: number
+  }[]
 }
 
 /** One frame on the events stream. */
@@ -309,7 +388,7 @@ export interface AgentDefinitionRow {
 export interface ChildRow {
   readonly childSessionId: string
   /** `uncertain` is retained while the host reconciles its canonical lifecycle log. */
-  readonly status: 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'uncertain'
+  readonly status: 'queued' | 'dispatching' | 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'uncertain'
   readonly definitionName: string
   /** The child's effective `provider:model`. */
   readonly model?: string
@@ -386,6 +465,8 @@ export interface SkillRow {
   readonly source: 'workspace' | 'user' | 'bundled'
   /** sha256 of the raw SKILL.md — the optimistic-concurrency token. */
   readonly hash: string
+  /** Present when this workspace hides the skill from discovery surfaces. */
+  readonly hidden?: boolean
 }
 
 /** One memory entry; `hash` is the expectedHash token for updates. */

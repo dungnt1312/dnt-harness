@@ -3,7 +3,16 @@
  * item does to the draft, and how the two menus rank their items.
  */
 import { describe, expect, it } from 'vitest'
-import { completionAt, moveActive, rankSkills, skillCompletionItem } from './composer-completion.ts'
+import {
+  builtinCommandIn,
+  builtinCompletionItem,
+  completionAt,
+  draftIsOnlyCommand,
+  moveActive,
+  rankSkills,
+  skillCompletionItem,
+} from './composer-completion.ts'
+import { emptyDraft, textDraft, type RichDraft } from './composer-draft.ts'
 
 describe('completionAt', () => {
   it('detects a file mention at a word boundary and after whitespace', () => {
@@ -47,6 +56,41 @@ describe('skillCompletionItem', () => {
       label: 'review',
       detail: 'Check a diff',
     })
+  })
+})
+
+describe('built-in commands', () => {
+  it('the compact item carries the command chip and its own id space', () => {
+    expect(builtinCompletionItem({ name: 'compact', description: 'Summarize older turns' })).toEqual({
+      id: 'command:compact',
+      insert: '/compact',
+      segment: { kind: 'command', name: 'compact' },
+      label: '/compact',
+      detail: 'Summarize older turns',
+    })
+  })
+
+  it('builtinCommandIn matches only built-in command chips', () => {
+    const draft = (segments: RichDraft['segments']): RichDraft => ({ segments, attachments: [] })
+    expect(builtinCommandIn(draft([{ kind: 'command', name: 'compact' }]))).toBe('compact')
+    expect(builtinCommandIn(draft([{ kind: 'text', text: 'hi ' }, { kind: 'command', name: 'compact' }]))).toBe('compact')
+    expect(builtinCommandIn(draft([{ kind: 'command', name: 'review' }]))).toBeNull()
+    expect(builtinCommandIn(textDraft('/compact typed as text'))).toBeNull()
+    expect(builtinCommandIn(emptyDraft)).toBeNull()
+  })
+
+  it('draftIsOnlyCommand accepts the bare command and refuses mixed drafts', () => {
+    const commandOnly: RichDraft = { segments: [{ kind: 'command', name: 'compact' }], attachments: [] }
+    const withWhitespace: RichDraft = { segments: [{ kind: 'command', name: 'compact' }, { kind: 'text', text: '  ' }], attachments: [] }
+    const withText: RichDraft = { segments: [{ kind: 'command', name: 'compact' }, { kind: 'text', text: ' focus on tests' }], attachments: [] }
+    const withChip: RichDraft = { segments: [{ kind: 'command', name: 'compact' }, { kind: 'command', name: 'review' }], attachments: [] }
+    const withFile: RichDraft = { segments: [{ kind: 'command', name: 'compact' }], attachments: [{ id: 'a'.repeat(64), name: 'a.png', mediaType: 'image/png', bytes: 1 }] }
+
+    expect(draftIsOnlyCommand(commandOnly, 'compact')).toBe(true)
+    expect(draftIsOnlyCommand(withWhitespace, 'compact')).toBe(true)
+    expect(draftIsOnlyCommand(withText, 'compact')).toBe(false)
+    expect(draftIsOnlyCommand(withChip, 'compact')).toBe(false)
+    expect(draftIsOnlyCommand(withFile, 'compact')).toBe(false)
   })
 })
 

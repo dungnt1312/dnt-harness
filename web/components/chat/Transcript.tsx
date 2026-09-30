@@ -1,8 +1,8 @@
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { HoldScrollProvider, useStickToBottom } from '../../hooks/useStickToBottom.ts'
 import type { ViewItem } from '../../lib/project.ts'
-import type { OpenPathResolver } from '../artifacts/ArtifactsPanel.tsx'
-import { ActivityBlock, AssistantMessage, AuditLine, DelegationCard, JumpToBottom, StatusLine, ToolCard, UserBubble } from './MessageParts.tsx'
+import type { OpenPathResolver } from '../../lib/project-paths.ts'
+import { ActivityBlock, AssistantMessage, AuditLine, CompactionMarker, ContextMarker, DelegationCard, JumpToBottom, StatusLine, ToolCard, UserBubble } from './MessageParts.tsx'
 import { ConversationMinimap } from './ConversationMinimap.tsx'
 
 interface Indexed { readonly item: ViewItem; readonly index: number }
@@ -143,9 +143,13 @@ export const Transcript = memo(function Transcript({ items, conversationId, mode
       case 'tool':
         return <ToolCard key={item.call.id} item={item} {...(openPath !== undefined ? { openPath } : {})} />
       case 'delegation':
-        return <DelegationCard key={item.childSessionId} item={item} {...(workspaceId !== undefined ? { workspaceId } : {})} {...(onOpenChild !== undefined ? { onOpen: onOpenChild } : {})} />
+        return <DelegationCard key={item.childSessionId} item={item} {...(workspaceId !== undefined ? { workspaceId } : {})} rootSessionId={conversationId} {...(onOpenChild !== undefined ? { onOpen: onOpenChild } : {})} />
       case 'audit':
         return <AuditLine key={`audit-${index}`} item={item} />
+      case 'context':
+        return <ContextMarker key={`context-${index}`} item={item} workspaceId={workspaceId ?? null} sessionId={conversationId} />
+      case 'compaction':
+        return <CompactionMarker key={`compaction-${index}`} item={item} />
       case 'status':
         return <StatusLine key={`status-${index}`} reason={item.reason} {...(onRetry !== undefined ? { onRetry } : {})} {...(onOpenSettings !== undefined ? { onOpenSettings } : {})} />
       default:

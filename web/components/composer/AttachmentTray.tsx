@@ -1,6 +1,6 @@
 import Icon from '../common/Icon.tsx'
 import { attachmentUrl } from '../../lib/api.ts'
-import { fileIcon } from '../../lib/file-icons.ts'
+import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
 import { formatBytes } from '../../lib/format.ts'
 import type { AttachmentRef } from '../../lib/composer-draft.ts'
 
@@ -22,7 +22,7 @@ export function AttachmentTray({ attachments, workspaceId, onRemove, onInsertTex
           const image = attachment.mediaType.startsWith('image/') && workspaceId !== null
           return (
             <li key={attachment.id} className="group flex min-w-0 max-w-full items-center gap-2 rounded-xl border border-line bg-hover p-1.5 text-[13px]">
-              {image ? <img className="size-12 shrink-0 rounded-lg object-cover" src={attachmentUrl(workspaceId, attachment.id)} alt={`Image attachment: ${attachment.name}`} /> : <Icon name={fileIcon(attachment.name)} size={20} className="shrink-0 text-fg-muted" aria-hidden="true" />}
+              {image ? <img className="size-12 shrink-0 rounded-lg object-cover" src={attachmentUrl(workspaceId, attachment.id)} alt={`Image attachment: ${attachment.name}`} /> : <FileTypeIcon path={attachment.name} size={20} />}
               <span className="min-w-0"><span className="block truncate">{attachment.name}</span><span className="block text-xs text-fg-faint">{formatBytes(attachment.bytes)}</span></span>
               {onInsertText !== undefined && canInsertText?.(attachment) === true ? <button type="button" className="shrink-0 rounded px-1 text-link hover:underline focus-visible:outline focus-visible:outline-2" onClick={() => onInsertText(attachment)}>Insert back</button> : null}
               <button type="button" className="shrink-0 rounded p-1 text-fg-faint hover:text-fg focus-visible:outline focus-visible:outline-2" aria-label={`Remove ${attachment.name}`} onClick={() => onRemove(attachment)}><Icon name="close" size={14} /></button>

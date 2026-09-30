@@ -185,8 +185,8 @@ function AgentsPanelContent({ workspaceId, modelOptions }: AgentsPanelProps) {
   return (
     <PanelBody>
       <PanelIntro>
-        A role narrows a child agent's tools; it never grants more than the workspace allows. Delegate to a role and
-        follow its result from the Agents view of the workbench, beside the conversation it belongs to.
+        A role narrows a child agent's tools; it never grants more than the workspace allows. A conversation delegates
+        to a role through its Agent tool; follow the runs from the Subagents view of the workbench.
       </PanelIntro>
 
       <Section title="Roles" count={definitions.length}>

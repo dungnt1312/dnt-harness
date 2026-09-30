@@ -22,10 +22,12 @@ import { agentScope } from '../harness/agent/scope.ts'
 import type { ToolCall } from '../harness/llm/types.ts'
 import type { ApprovedPath, PathIntent, PreExecuteDecision, ToolExecution } from '../harness/tools/types.ts'
 import { classifyTarget, targetPaths } from '../capabilities/fs/grants.ts'
+import { currentToolExecution } from '../harness/tools/execution-scope.ts'
 
 /** One out-of-grant path a pending call targets. */
 export interface PathScopeMatch {
   readonly sessionId: string | undefined
+  readonly executionId: string
   readonly workspaceId: string | undefined
   /** Absolute lexical path, exactly as the approver sees it. */
   readonly path: string
@@ -51,18 +53,18 @@ export interface PathScopeOptions {
 
 export interface PathScopeGuard {
   /** The pending out-of-grant match for this call, if any. */
-  get(sessionId: string | undefined, call: ToolCall): PathScopeMatch | undefined
+  get(executionId: string | undefined, call: ToolCall): PathScopeMatch | undefined
   /**
    * Called once per call after authorization settles. Drops the match and,
    * when allowed, returns the single path it authorizes.
    */
-  take(sessionId: string | undefined, call: ToolCall, allowed: boolean): PathScopeMatch | undefined
+  take(executionId: string | undefined, call: ToolCall, allowed: boolean): PathScopeMatch | undefined
 }
 
 const SEARCH_TOOLS = new Set(['Glob', 'Grep'])
 
-function keyOf(sessionId: string | undefined, call: ToolCall): string {
-  return `${sessionId ?? ''}\u0000${call.id}`
+function keyOf(executionId: string | undefined, call: ToolCall): string {
+  return `${executionId ?? ''}\u0000${call.name}\u0000${call.id}\u0000${JSON.stringify(call.args)}`
 }
 
 function argsKeyOf(call: ToolCall): string {
@@ -88,7 +90,8 @@ export function attachPathScopeGuard(ctx: Context, options: PathScopeOptions): P
     if (scope !== undefined && scope.projectId === undefined) return next()
     // A rewrite listener may forward only the call; the grant is then
     // resolved again rather than guessed.
-    const grant = payload.exec ?? ctx.tools.currentGrant()
+    const exec = currentToolExecution(payload.exec)
+    const grant = exec ?? ctx.tools.currentGrant()
     if (grant === undefined || grant.root === '') return next()
     let outside: { path: string; intent: PathIntent } | undefined
     for (const target of targets) {
@@ -112,8 +115,15 @@ export function attachPathScopeGuard(ctx: Context, options: PathScopeOptions): P
     // Children never get a session option: their grants are a spawn snapshot.
     const folder = SEARCH_TOOLS.has(payload.call.name) ? outside.path : path.dirname(outside.path)
     const proposedGrant = scope?.childOf === undefined ? await options.proposeGrant(folder) : undefined
-    matches.set(keyOf(scope?.sessionId, payload.call), {
+    const executionId = exec?.executionId
+    if (executionId === undefined) {
+      // No host execution identity: nothing durable can authorize this call,
+      // and a bare call-id key would leak across roots. Fail closed.
+      return { kind: 'deny', reason: 'path approval requires a host execution identity' }
+    }
+    matches.set(keyOf(executionId, payload.call), {
       sessionId: scope?.sessionId,
+      executionId,
       workspaceId: scope?.workspaceId,
       path: outside.path,
       intent: outside.intent,
@@ -121,18 +131,18 @@ export function attachPathScopeGuard(ctx: Context, options: PathScopeOptions): P
       ...(proposedGrant !== undefined ? { proposedGrant } : {}),
       argsKey: argsKeyOf(payload.call),
     })
-    return next({ call: payload.call, ...(payload.exec !== undefined ? { exec: payload.exec } : {}) })
+    return next({ call: payload.call, ...(exec !== undefined ? { exec } : {}) })
   })
 
-  const get = (sessionId: string | undefined, call: ToolCall): PathScopeMatch | undefined => {
-    const match = matches.get(keyOf(sessionId, call))
+  const get = (executionId: string | undefined, call: ToolCall): PathScopeMatch | undefined => {
+    const match = matches.get(keyOf(executionId, call))
     return match !== undefined && match.argsKey === argsKeyOf(call) ? match : undefined
   }
 
   return {
     get,
-    take(sessionId, call, allowed) {
-      const key = keyOf(sessionId, call)
+    take(executionId, call, allowed) {
+      const key = keyOf(executionId, call)
       const match = matches.get(key)
       matches.delete(key)
       if (!allowed || match === undefined || match.argsKey !== argsKeyOf(call)) return undefined

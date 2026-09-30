@@ -126,16 +126,18 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
         return `error: bash is not available on this system; ${detection.hint}`
       }
       const requested = args['timeoutMs']
-      const kill = typeof requested === 'number' ? Math.min(requested, timeoutMs) : timeoutMs
+      const kill = typeof requested === 'number' && Number.isFinite(requested) && requested > 0
+        ? Math.min(requested, timeoutMs)
+        : timeoutMs
 
       return await new Promise<string>((resolve) => {
         let settled = false
-        let killed = false
+        let termination: 'timeout' | 'stop' | undefined
         let timer: ReturnType<typeof setTimeout> | undefined
         let graceTimer: ReturnType<typeof setTimeout> | undefined
         const treeTag = randomUUID()
         const onAbort = (): void => {
-          killed = true
+          termination = 'stop'
           killTree(child, detection.executable as string, treeTag)
         }
         const finish = (output: string): void => {
@@ -147,13 +149,20 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
           resolve(output)
         }
         const report = (code: number | null): string => {
-          const suffix = killed && exec.signal?.aborted === true
-            ? `\n[terminated by stop]`
-            : killed
-              ? `\n[terminated: timeout or stop]`
+          // A forced tree kill reports platform-specific pseudo exit codes
+          // (for example 2304 under Windows/MSYS). The category is the stable
+          // contract; ordinary process exits still expose their real code.
+          const suffix = termination === 'stop'
+            ? `
+[terminated by stop; killed]`
+            : termination === 'timeout'
+              ? `
+[terminated by timeout; killed]`
               : code === null
-                ? `\n[terminated, no exit code]`
-                : `\n[exit code: ${code}]`
+                ? `
+[terminated, no exit code]`
+                : `
+[exit code: ${code}]`
           const limit = exec.outputLimit ?? OUTPUT_CAP
           const dropped = captureCapped ? '\n… [output truncated during capture]' : ''
           const body = output.length > limit
@@ -197,7 +206,7 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
         exec.signal?.addEventListener('abort', onAbort, { once: true })
 
         timer = setTimeout(() => {
-          killed = true
+          termination = 'timeout'
           killTree(child, detection.executable as string, treeTag)
         }, kill)
         timer.unref?.()
@@ -214,7 +223,7 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
         // a straggler grandchild can hold the stdio pipes past the death of
         // the shell, and the call must not wait on it.
         child.on('exit', (code: number | null) => {
-          if (!killed) return
+          if (termination === undefined) return
           graceTimer = setTimeout(() => finish(report(code)), 400)
           graceTimer.unref?.()
         })

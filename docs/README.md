@@ -18,6 +18,8 @@ This documentation is organized so each layer can be read independently:
 | [capabilities.md](capabilities.md) | The built-in tools: filesystem and bash |
 | [web.md](web.md) | The web host: REST + SSE API and the React client |
 | [guides.md](guides.md) | Getting started, configuration, CLI, plugin authoring, testing |
+| [decisions/plugin-platform.md](decisions/plugin-platform.md) | Plugin platform spec: composition loading, route seam, SDK surface policy (proposed) |
+| [decisions/mcp-production-boundaries.md](decisions/mcp-production-boundaries.md) | MCP protocol pin, outcomes, receipts, deployment boundary |
 
 ## Quick reference
 
@@ -26,8 +28,7 @@ npm install        # install dependencies
 npm test           # run the vitest suite
 npm run typecheck  # typecheck server (tsconfig.json) + web (tsconfig.web.json)
 
-npm run chat       # headless REPL (DeepSeek when DEEPSEEK_API_KEY is set)
-npm run chat:mock  # headless REPL with the scripted mock provider
+npm run chat       # headless REPL (DeepSeek only when DEEPSEEK_API_KEY is set)
 
 npm run build:web  # build the React client into web-dist/
 npm run web        # serve the web UI (default port 3082)
@@ -54,7 +55,7 @@ src/
 │   ├── tools/          Tool registry + guarded pre-execute → run → post-execute
 │   ├── approval/       Policy riding tools/pre-execute: allow | ask | deny
 │   ├── workspace/      Workspace registry, project binding, ownership
-│   ├── modes/          Five bundled + custom file modes
+│   ├── modes/          Four bundled + custom file modes
 │   ├── context/        Mode-driven builder: budget, compaction, manifest
 │   ├── skills/         Workspace skills + on-demand Skill tool
 │   ├── memory/         Workspace/project Markdown memory + five tools

@@ -110,7 +110,7 @@ describe('stdio MCP 2025-06-18 fixture', () => {
     await burner.listTools()
     // Sustained load is three consecutive over-limit samples (~3 s), then one kill.
     // Each Windows sample is a PowerShell probe, so allow for slow samples.
-    await expect.poll(() => burner.watchdogKills, { timeout: 25_000, intervals: [250] }).toBe(1)
+    await expect.poll(() => burner.watchdogKills, { timeout: 25_000, interval: 250 }).toBe(1)
     await expect(burner.callTool('query', { q: 'x' }, 500)).rejects.toThrow()
     await new Promise((resolve) => setTimeout(resolve, 1_500))
     expect(burner.watchdogKills).toBe(1)

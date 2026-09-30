@@ -2,7 +2,8 @@
 import { afterEach, expect, it } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
-import { ContextMeter, contextFill, formatTokens } from './ContextMeter.tsx'
+import { contextFill } from '../../lib/format.ts'
+import { ContextMeter, formatTokens } from './ContextMeter.tsx'
 import type { ContextManifestView } from '../../lib/api.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
@@ -52,21 +53,24 @@ it('prefers the provider-reported prompt size over the estimate', () => {
   expect(reported.cacheHitRate).toBeCloseTo(0.99)
 })
 
-it('shows fill, per-source shares and cache hit rate', async () => {
-  const panel = await openMeter({ ...MANIFEST, usage: { last: { inputTokens: 139_100 }, cacheableInputTokens: 100, cachedInputTokens: 99 } })
-  expect(panel.textContent).toContain('139.1K/1M (13.9%)')
-  expect(panel.textContent).toContain('Messages65.0%')
-  expect(panel.textContent).toContain('MCP tools14.0%')
+it('shows token counts per source, not percentages', async () => {
+  const panel = await openMeter({ ...MANIFEST, usage: { last: { inputTokens: 139_100 }, cacheableInputTokens: 400_000, cachedInputTokens: 396_000 } })
+  expect(panel.textContent).toContain('139.1K / 1M')
+  expect(panel.textContent).toContain('Messages65K')
+  expect(panel.textContent).toContain('Skills2K')
+  expect(panel.textContent).toContain('MCP tools14K')
+  expect(panel.textContent).toContain('Estimated tokens (chars/4)')
   expect(panel.textContent).toContain('Average cache hit rate99%')
 })
 
 it('marks an estimate and says when no request has run yet', async () => {
   const estimated = await openMeter(MANIFEST)
-  expect(estimated.textContent).toContain('~100K/1M (10.0%)')
+  expect(estimated.textContent).toContain('100K / 1M')
+  expect(estimated.textContent).not.toContain('~')
   expect(estimated.textContent).toContain('Average cache hit rate—')
   await act(async () => root!.unmount())
   root = undefined
   host.remove()
   const empty = await openMeter(null)
-  expect(empty.textContent).toContain('No request yet')
+  expect(empty.textContent).toContain('No recorded request context for this conversation.')
 })

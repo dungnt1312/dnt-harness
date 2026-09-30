@@ -87,7 +87,10 @@ export function serializeEditor(root: HTMLElement): RichDraft {
   const walk = (node: Node, depth: number): void => {
     for (const child of Array.from(node.childNodes)) {
       if (child.nodeType === Node.TEXT_NODE) {
-        segments.push({ kind: 'text', text: child.textContent ?? '' })
+        // An empty text node carries nothing (it only appears after a splice
+        // that deletes a range); keeping it would be a junk draft segment.
+        const text = child.textContent ?? ''
+        if (text !== '') segments.push({ kind: 'text', text })
         continue
       }
       if (!(child instanceof HTMLElement)) continue

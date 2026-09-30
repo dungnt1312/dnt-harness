@@ -5,134 +5,107 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { AgentRunsPanel } from './AgentRunsPanel.tsx'
 ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
 
-const role = { source: 'workspace', definition: { name: 'explorer', description: 'reads', tools: ['Read'], disallowedTools: [] } }
-
-/** Serve the panel's two reads; `children` is what the lifecycle returns. */
+/** Serve the children read; record every request. */
 function stubApi(children: unknown[]): { calls: string[] } {
   const calls: string[] = []
-  vi.stubGlobal('fetch', vi.fn((url: string) => {
-    calls.push(url)
-    return Promise.resolve({ ok: true, json: async () => (url.includes('/agents/children') ? children : [role]) })
+  vi.stubGlobal('fetch', vi.fn((url: string, init?: { method?: string }) => {
+    calls.push(`${init?.method ?? 'GET'} ${url}`)
+    return Promise.resolve({ ok: true, json: async () => children })
   }))
   return { calls }
 }
 
+async function mount(element: React.ReactElement): Promise<{ host: HTMLDivElement; unmount: () => Promise<void> }> {
+  const host = document.createElement('div'); document.body.append(host)
+  const root = createRoot(host)
+  await act(async () => root.render(element))
+  return { host, unmount: async () => { await act(async () => root.unmount()); host.remove() } }
+}
+
+const section = (host: HTMLElement, name: string): HTMLElement => host.querySelector(`section[aria-label="${name}"]`)!
+
 afterEach(() => { vi.unstubAllGlobals() })
 
-describe('agent runs panel, mounted', () => {
-  it('offers the conversation’s model list for a child, defaulting to inherit', async () => {
+describe('subagents panel', () => {
+  it('splits running from ended, newest ended first, titled by the brief', async () => {
+    stubApi([
+      { childSessionId: 'old', status: 'completed', definitionName: 'explorer', startedAt: 1, endedAt: 2, result: { report: '## Verified findings\n1. first', filesTouched: [] } },
+      { childSessionId: 'run', status: 'running', definitionName: 'reviewer', model: 'far:gpt-luna', startedAt: 5 },
+      { childSessionId: 'new', status: 'failed', definitionName: 'explorer', startedAt: 3, endedAt: 4, error: 'the child did not complete (failed); its full log is session new' },
+    ])
+    const briefs = new Map([['old', 'Audit session state leakage\nlong details'], ['run', 'Explore delegation terminal']])
+    const { host, unmount } = await mount(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" briefs={briefs} />)
+
+    const running = section(host, 'Active subagents')
+    expect(running.textContent).toContain('Active · 1/6')
+    expect(running.textContent).toContain('Explore delegation terminal')
+    expect(running.textContent).toContain('reviewer · far:gpt-luna')
+
+    const ended = section(host, 'Ended subagents')
+    expect(ended.textContent).toContain('Ended · 2')
+    const titles = [...ended.querySelectorAll('li')].map((item) => item.textContent ?? '')
+    // Newest ended first; a child with no brief falls back to its role.
+    expect(titles[0]).toContain('explorer')
+    expect(titles[0]).toContain('Failed')
+    expect(titles[0]).toContain('the child did not complete')
+    // Only the brief's first line is the title, and the report's first line is the preview.
+    expect(titles[1]).toContain('Audit session state leakage')
+    expect(titles[1]).not.toContain('long details')
+    expect(titles[1]).toContain('Verified findings')
+    expect(titles[1]).not.toContain('##')
+    await unmount()
+  })
+
+  it('shows empty states for both groups', async () => {
     stubApi([])
-    const host = document.createElement('div'); document.body.append(host)
-    const root = createRoot(host)
-    await act(async () => root.render(
-      <AgentRunsPanel workspaceId="ws-1" rootSessionId="root" modelOptions={[{ value: 'far:gpt-luna', label: 'far / gpt-luna' }]} />,
-    ))
-    // The picker lives in the packet details, which the disclosure mounts
-    // only once it is open.
-    const details = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Task packet details'))
-    await act(async () => { details?.click() })
-    expect(host.textContent).toContain('Inherit from this conversation')
-    expect(host.textContent).toContain('inherits this conversation’s model unless you pick another')
-    await act(async () => root.unmount())
+    const { host, unmount } = await mount(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />)
+    expect(host.textContent).toContain('No active subagents')
+    expect(host.textContent).toContain('No ended subagents')
+    // No delegation form: the model delegates, roles live in Settings.
+    expect(host.querySelector('textarea')).toBeNull()
+    expect(host.textContent).not.toContain('Spawn')
+    await unmount()
   })
 
-  it('shows each child’s model and flags one parked on an approval', async () => {
-    stubApi([
-      { childSessionId: 'child-1234567890abcd', status: 'running', definitionName: 'explorer', model: 'far:gpt-luna', startedAt: 1, awaitingApproval: true },
-    ])
-    const host = document.createElement('div'); document.body.append(host)
-    const root = createRoot(host)
-    await act(async () => root.render(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />))
-    expect(host.textContent).toContain('far:gpt-luna')
-    expect(host.textContent).toContain('awaiting approval')
-    await act(async () => root.unmount())
+  it('opens the child conversation from its row', async () => {
+    stubApi([{ childSessionId: 'child-1', status: 'completed', definitionName: 'explorer', startedAt: 1, endedAt: 2, result: { report: 'done', filesTouched: [] } }])
+    const opened: string[] = []
+    const { host, unmount } = await mount(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" onOpenChild={(id) => opened.push(id)} />)
+    await act(async () => section(host, 'Ended subagents').querySelector('button')!.click())
+    expect(opened).toEqual(['child-1'])
+    await unmount()
   })
 
-  it('shows an uncertain child as reconciling instead of treating it as terminal', async () => {
-    stubApi([
-      { childSessionId: 'child-uncertain000000', status: 'uncertain', definitionName: 'explorer', startedAt: 1, error: 'canonical reconciliation is pending' },
-    ])
-    const host = document.createElement('div'); document.body.append(host)
-    const root = createRoot(host)
-    await act(async () => root.render(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />))
-    expect(host.textContent).toContain('uncertain')
-    expect(host.textContent).toContain('reconciling')
-    expect(host.textContent).not.toContain('Cancel')
-    await act(async () => root.unmount())
+  it('flags a child parked on an approval and lets it be stopped', async () => {
+    const { calls } = stubApi([{ childSessionId: 'child-2', status: 'running', definitionName: 'explorer', startedAt: 1, awaitingApproval: true }])
+    const { host, unmount } = await mount(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />)
+    expect(host.textContent).toContain('Waiting for your approval')
+    const stop = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Stop')!
+    await act(async () => stop.click())
+    expect(calls).toContain('POST /api/workspaces/ws-1/sessions/root/children/child-2/cancel')
+    await unmount()
   })
 
-  it('offers Retry settlement for an uncertain child and refreshes its row', async () => {
+  it('keeps an uncertain child with the running ones and offers Retry settlement', async () => {
     const calls: string[] = []
     let reads = 0
     vi.stubGlobal('fetch', vi.fn((url: string, init?: { method?: string }) => {
       calls.push(`${init?.method ?? 'GET'} ${url}`)
-      const body = url.includes('/agents/children')
-        ? reads++ === 0
-          ? [{ childSessionId: 'child-uncertain000000', status: 'uncertain', definitionName: 'explorer', startedAt: 1 }]
-          : [{ childSessionId: 'child-uncertain000000', status: 'completed', definitionName: 'explorer', startedAt: 1, result: { report: 'settled', filesTouched: [] } }]
-        : init?.method === 'POST'
-          ? { childSessionId: 'child-uncertain000000', status: 'completed', definitionName: 'explorer', startedAt: 1 }
-          : [role]
+      const body = init?.method === 'POST'
+        ? { childSessionId: 'child-u', status: 'completed', definitionName: 'explorer', startedAt: 1 }
+        : reads++ === 0
+          ? [{ childSessionId: 'child-u', status: 'uncertain', definitionName: 'explorer', startedAt: 1, error: 'canonical reconciliation is pending' }]
+          : [{ childSessionId: 'child-u', status: 'completed', definitionName: 'explorer', startedAt: 1, endedAt: 2, result: { report: 'settled', filesTouched: [] } }]
       return Promise.resolve({ ok: true, json: async () => body })
     }))
-    const host = document.createElement('div'); document.body.append(host)
-    const root = createRoot(host)
-    await act(async () => root.render(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />))
-    const retry = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Retry settlement'))
-    expect(retry).toBeDefined()
-    await act(async () => retry?.click())
-    expect(calls).toContain('POST /api/workspaces/ws-1/sessions/root/children/child-uncertain000000/reconcile')
-    expect(host.textContent).toContain('settled')
-    await act(async () => root.unmount())
-  })
-
-  it('shows a child’s final report, a visible truncation, and an honest no-result error', async () => {
-    stubApi([
-      { childSessionId: 'child-aaaaaaaaaaaaaa', status: 'completed', definitionName: 'explorer', startedAt: 1, result: { report: 'Answer: the router.\n… [truncated 42 chars]', filesTouched: ['src/a.ts'], truncated: true } },
-      { childSessionId: 'child-bbbbbbbbbbbbbb', status: 'cancelled', definitionName: 'explorer', startedAt: 2, error: 'the child did not complete (cancelled); its full log is session child-bbbbbbbbbbbbbb' },
-    ])
-    const host = document.createElement('div'); document.body.append(host)
-    const root = createRoot(host)
-    await act(async () => root.render(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />))
-    expect(host.textContent).toContain('Answer: the router.')
-    expect(host.textContent).toContain('Report truncated')
-    expect(host.textContent).toContain('Files touched: src/a.ts')
-    expect(host.textContent).toContain('its full log is session child-bbbbbbbbbbbbbb')
-    expect(host.textContent).not.toContain('undefined')
-    await act(async () => root.unmount())
-  })
-
-  it('spawns from a prose brief, and still sends the structured packet on its own', async () => {
-    const posts: Record<string, unknown>[] = []
-    vi.stubGlobal('fetch', vi.fn((url: string, init?: { method?: string; body?: string }) => {
-      if (init?.method === 'POST') posts.push(JSON.parse(init.body ?? '{}') as Record<string, unknown>)
-      const body = url.includes('/agents/children') ? [] : init?.method === 'POST' ? { childSessionId: 'child-new-000000000', definitionName: 'explorer', status: 'running', startedAt: 0 } : [role]
-      return Promise.resolve({ ok: true, status: 202, json: async () => body })
-    }))
-    const host = document.createElement('div'); document.body.append(host)
-    const root = createRoot(host)
-    await act(async () => root.render(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />))
-    const spawnButton = (): HTMLButtonElement => [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Spawn agent'))!
-    const setValue = (element: HTMLInputElement | HTMLTextAreaElement, value: string): void => {
-      const proto = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype
-      Object.getOwnPropertyDescriptor(proto, 'value')!.set!.call(element, value)
-      element.dispatchEvent(new Event('input', { bubbles: true }))
-    }
-    expect(spawnButton().disabled).toBe(true)
-
-    await act(async () => setValue(host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Brief"]')!, 'Find the slow build step in vite.config.ts.'))
-    expect(spawnButton().disabled).toBe(false)
-    await act(async () => spawnButton().click())
-    expect(posts[0]?.['task']).toEqual({ prompt: 'Find the slow build step in vite.config.ts.', requiredResult: 'bounded summary with file references' })
-    expect(posts[0]).not.toHaveProperty('inherit')
-
-    const details = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Task packet details'))
-    await act(async () => { details?.click() })
-    const objective = [...host.querySelectorAll<HTMLInputElement>('input')].find((input) => input.placeholder === 'Investigate why the build is slow')!
-    await act(async () => setValue(objective, 'Investigate the build'))
-    await act(async () => spawnButton().click())
-    expect(posts[1]?.['task']).toEqual({ objective: 'Investigate the build', constraints: [], references: [], requiredResult: 'bounded summary with file references' })
-    await act(async () => root.unmount())
+    const { host, unmount } = await mount(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />)
+    expect(section(host, 'Active subagents').textContent).toContain('Reconciling')
+    expect([...host.querySelectorAll('button')].some((button) => button.textContent === 'Stop')).toBe(false)
+    const retry = [...host.querySelectorAll('button')].find((button) => button.textContent === 'Retry settlement')!
+    await act(async () => retry.click())
+    expect(calls).toContain('POST /api/workspaces/ws-1/sessions/root/children/child-u/reconcile')
+    expect(section(host, 'Ended subagents').textContent).toContain('settled')
+    await unmount()
   })
 
   it('refetches children when the conversation itself delegates', async () => {

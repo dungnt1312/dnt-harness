@@ -19,15 +19,15 @@ describe('workbench preferences', () => {
       rightWidth: -1,
       leftCollapsed: true,
       rightCollapsed: false,
-      inspectorTab: 'artifacts',
-      inspectorViews: ['files', 'artifacts'],
+      inspectorTab: 'trajectory',
+      inspectorViews: ['files', 'trajectory'],
     }))).toMatchObject({
       leftWidth: 420,
       rightWidth: 360,
       leftCollapsed: true,
       rightCollapsed: false,
-      inspectorTab: 'artifacts',
-      inspectorViews: ['files', 'artifacts'],
+      inspectorTab: 'trajectory',
+      inspectorViews: ['files', 'trajectory'],
     })
   })
 
@@ -46,15 +46,17 @@ describe('workbench preferences', () => {
       inspectorTab: 'files',
       inspectorViews: ['files'],
       terminalShell: null,
+      terminalOpen: false,
+      terminalHeight: 280,
     })
   })
 
   it('keeps the anchor and dedupes the opened strip without folding the selection back in', () => {
     // A stored strip is the record of what is open: the selected view is
     // *not* added to it, or closing that tab would re-add it and take two
-    // clicks. Here 'terminal' is selected but deliberately not open.
+    // clicks. Here 'trajectory' is selected but deliberately not open.
     expect(parseWorkbenchPreferences(JSON.stringify({
-      inspectorTab: 'terminal',
+      inspectorTab: 'bogus',
       inspectorViews: ['context', 'context', 'bogus'],
     }))).toMatchObject({
       inspectorViews: ['files', 'context'],
@@ -71,6 +73,11 @@ describe('workbench preferences', () => {
   it('seeds the strip from the selection when no strip was ever recorded', () => {
     // Storage written before inspectorViews existed has only the selection as
     // evidence of what was open.
+    expect(parseWorkbenchPreferences(JSON.stringify({ inspectorTab: 'trajectory' }))).toMatchObject({
+      inspectorViews: ['files', 'trajectory'],
+      inspectorTab: 'trajectory',
+    })
+    // Terminal is a workbench tab again, so a stored selection seeds the strip.
     expect(parseWorkbenchPreferences(JSON.stringify({ inspectorTab: 'terminal' }))).toMatchObject({
       inspectorViews: ['files', 'terminal'],
       inspectorTab: 'terminal',
@@ -78,8 +85,9 @@ describe('workbench preferences', () => {
   })
 
   it('clamps the selection to an open tab, falling back to the anchor', () => {
+    expect(clampInspectorTab('trajectory', ['files', 'trajectory'])).toBe('trajectory')
+    expect(clampInspectorTab('trajectory', ['files'])).toBe(ANCHOR_VIEW)
     expect(clampInspectorTab('terminal', ['files', 'terminal'])).toBe('terminal')
-    expect(clampInspectorTab('terminal', ['files'])).toBe(ANCHOR_VIEW)
     expect(clampInspectorTab('bogus', ['files'])).toBe(ANCHOR_VIEW)
   })
 
@@ -89,5 +97,7 @@ describe('workbench preferences', () => {
     expect(clampPanelWidth('right', 359)).toBe(360)
     expect(clampPanelWidth('right', 1101)).toBe(1100)
     expect(clampPanelWidth('right', Number.NaN)).toBe(560)
+    expect(clampPanelWidth('terminal', 50)).toBe(120)
+    expect(clampPanelWidth('terminal', 2000)).toBe(900)
   })
 })

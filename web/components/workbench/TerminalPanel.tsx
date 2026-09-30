@@ -63,12 +63,17 @@ interface Attached {
  * disposing one would throw away scrollback and cursor state that the server
  * has no obligation to resend.
  */
-export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultShell }: {
+export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultShell, onHide }: {
   readonly workspaceId: string | null
   readonly projectId: string | null
   /** Preferred shell id; `null` defers to the host's own order. */
   readonly defaultShell?: string | null
   readonly onDefaultShell?: (shellId: string | null) => void
+  /**
+   * Hides the whole panel without killing shells. The chat footer uses it;
+   * the workbench tab does not, because closing that tab is the tab's own X.
+   */
+  readonly onHide?: () => void
 }) {
   const [rows, setRows] = useState<readonly TerminalRow[]>([])
   // The view shows one project's shells. A terminal with no project only
@@ -432,6 +437,20 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
               </>
             )}
           </Menu>
+        ) : null}
+        {onHide !== undefined ? (
+          <>
+            <span className="flex-1" />
+            <button
+              type="button"
+              aria-label="Close terminal (Ctrl+`)"
+              title="Close terminal (Ctrl+`)"
+              onClick={onHide}
+              className={NEW_TERMINAL_CLASS}
+            >
+              <Icon name="close" size={14} />
+            </button>
+          </>
         ) : null}
       </div>
 

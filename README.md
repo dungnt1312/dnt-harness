@@ -50,10 +50,11 @@ terminal and nothing else.
 
 ## Configuration
 
-Both bins load a repo-root `.env` (gitignored) before reading
-`DEEPSEEK_API_KEY`; variables already in the process environment win over
-file entries. Optional: `DEEPSEEK_BASE_URL` (defaults to the public API).
-Never commit the key.
+Both bins load a repo-root `.env` (gitignored); variables already in the
+process environment win over file entries. `DEEPSEEK_API_KEY` is optional:
+when set, headless registers DeepSeek and the web host seeds a `deepseek`
+entry on an empty provider config. Neither bin refuses to start without it.
+Optional: `DEEPSEEK_BASE_URL` (defaults to the public API). Never commit the key.
 
 ```sh
 echo 'DEEPSEEK_API_KEY=sk-...' > .env
@@ -62,16 +63,15 @@ echo 'DEEPSEEK_API_KEY=sk-...' > .env
 ## Chat
 
 ```sh
-npm run chat           # REPL; uses DeepSeek when the key is configured
-npm run chat:mock      # REPL with the scripted mock provider
-npx tsx src/bins/headless.ts --mock --message "hello"   # one-shot
+npm run chat           # REPL; registers DeepSeek only when the key is set
+npx tsx src/bins/headless.ts --message "hello"   # one-shot
 ```
 
 ## Web
 
 ```sh
 npm run build:web      # build the React client into web-dist/
-npm run web            # serve it at http://127.0.0.1:3082 (--mock, --yolo, --root, --port)
+npm run web            # serve it at http://127.0.0.1:3082 (--yolo, --root, --port)
 ```
 
 The toolbar switches the active model (`PUT /api/model`, offered names come

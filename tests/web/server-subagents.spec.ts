@@ -79,7 +79,7 @@ describe('subagent contract over HTTP', () => {
     const spawned = await post(base, `/api/workspaces/${wsId}/agents/explorer`, { rootSessionId: root.id, task: { prompt: 'Look around.' } })
     expect(spawned.status).toBe(202)
     const child = (await spawned.json()) as { childSessionId: string }
-    await fetch(`${base}/api/workspaces/${wsId}/children/${child.childSessionId}?waitMs=5000`)
+    await fetch(`${base}/api/workspaces/${wsId}/sessions/${root.id}/children/${child.childSessionId}?waitMs=5000`)
 
     const direct = await post(base, `/api/workspaces/${wsId}/sessions/${child.childSessionId}/messages`, { content: 'keep going' })
     expect(direct.status).toBe(409)
@@ -111,7 +111,7 @@ describe('subagent contract over HTTP', () => {
     expect(started).toBe(true)
     expect((await fetch(`${base}/api/workspaces/${wsId}/sessions/${root.id}`, { method: 'DELETE' })).status).toBe(200)
     expect(aborted).toBe(1)
-    const child = await (await fetch(`${base}/api/workspaces/${wsId}/children/${spawned.childSessionId}?waitMs=10`)).json() as { status?: string }
+    const child = await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${root.id}/children/${spawned.childSessionId}?waitMs=10`)).json() as { status?: string }
     // The parent is gone, so the child is no longer a child of anything.
     expect(child.status === undefined || child.status === 'cancelled').toBe(true)
   }, 20_000)
@@ -122,10 +122,11 @@ describe('subagent contract over HTTP', () => {
     const root = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
     const route = `/api/workspaces/${wsId}/agents/explorer`
 
-    const prose = await post(base, route, { rootSessionId: root.id, task: { prompt: 'Map the modules.', requiredResult: 'a list' } })
+    const prose = await post(base, route, { rootSessionId: root.id, task: { prompt: 'Map the modules.', requiredResult: 'a list' }, keepOpen: true })
     expect(prose.status).toBe(202)
+    const turnId = ((await prose.json()) as { parentTurnId: string }).parentTurnId
 
-    const both = await post(base, route, { rootSessionId: root.id, task: { prompt: 'Use this.', objective: 'Not this.' } })
+    const both = await post(base, route, { rootSessionId: root.id, parentTurnId: turnId, keepOpen: true, task: { prompt: 'Use this.', objective: 'Not this.' } })
     expect(both.status).toBe(202)
     expect(((await both.json()) as { note?: string }).note).toMatch(/the prompt is the brief/)
 
@@ -134,7 +135,7 @@ describe('subagent contract over HTTP', () => {
     expect(((await empty.json()) as { error: string }).error).toMatch(/'prompt'.*'objective'/)
 
     expect((await post(base, route, { rootSessionId: root.id, task: { prompt: 'x' }, inherit: 'everything' })).status).toBe(400)
-    const inherited = await post(base, route, { rootSessionId: root.id, task: { prompt: 'Continue the thread.' }, inherit: 'brief' })
+    const inherited = await post(base, route, { rootSessionId: root.id, parentTurnId: turnId, task: { prompt: 'Continue the thread.' }, inherit: 'brief' })
     expect(inherited.status).toBe(202)
     expect(typeof ((await inherited.json()) as { inheritedChars?: number }).inheritedChars).toBe('number')
 
@@ -173,7 +174,7 @@ describe('subagent contract over HTTP', () => {
     const root = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
     const spawned = await post(base, `/api/workspaces/${wsId}/agents/explorer`, { rootSessionId: root.id, task: { prompt: 'Where is the entry point?' } })
     const child = (await spawned.json()) as { childSessionId: string }
-    const settled = await (await fetch(`${base}/api/workspaces/${wsId}/children/${child.childSessionId}?waitMs=8000`)).json() as { status: string; result?: { report: string } }
+    const settled = await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${root.id}/children/${child.childSessionId}?waitMs=8000`)).json() as { status: string; result?: { report: string } }
     expect(settled.status).toBe('completed')
     expect(settled.result?.report).toBe('Found it in src/index.ts:1.')
 
@@ -228,7 +229,7 @@ describe('subagent contract over HTTP', () => {
     })
     const child = (await spawned.json()) as { childSessionId: string; inheritedChars: number }
     expect(child.inheritedChars).toBeGreaterThan(0)
-    const settled = await (await fetch(`${base}/api/workspaces/${wsId}/children/${child.childSessionId}?waitMs=8000`)).json() as { result?: { report: string } }
+    const settled = await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${root.id}/children/${child.childSessionId}?waitMs=8000`)).json() as { result?: { report: string } }
     expect(settled.result?.report).toBe('The config lives in vite.config.ts.')
     expect(childMessages).toContain('kind="parent-context"')
     expect(childMessages).toContain('the build config is vite.config.ts')

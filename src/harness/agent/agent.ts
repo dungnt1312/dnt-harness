@@ -1,5 +1,5 @@
 import type { Context } from '../../kernel/index.ts'
-import { newStepId, newTurnId, type InputId, type StepId, type TurnId } from '../../util/brand.ts'
+import { newExecutionId, newStepId, newTurnId, type ExecutionId, type InputId, type StepId, type TurnId } from '../../util/brand.ts'
 import { resolveLimits, type HarnessLimits } from '../limits.ts'
 import type { AttachmentRef } from '../attachments/store.ts'
 import type { ModelRequest, ToolCall, ToolSchema } from '../llm/types.ts'
@@ -12,7 +12,7 @@ import type { AgentStatus, InboxItem, PreStepDecision } from './types.ts'
 /** The tools surface the loop consumes; optional, structurally typed. */
 interface ToolRuntime {
   schemas(): ToolSchema[]
-  prepare?(call: ToolCall, options?: { signal?: AbortSignal }): Promise<{
+  prepare?(call: ToolCall, options?: { signal?: AbortSignal; executionId?: ExecutionId }): Promise<{
     call: ToolCall
     execute(): Promise<ToolResult>
   }>
@@ -74,9 +74,13 @@ export class Agent {
   constructor(
     private readonly ctx: Context,
     readonly session: Session,
-    identity: AgentScope = { sessionId: session.id },
+    identity: AgentScope = { sessionId: session.id, rootSessionId: session.id },
   ) {
-    this.identity = identity.sessionId === session.id ? identity : { ...identity, sessionId: session.id }
+    this.identity = {
+      ...identity,
+      sessionId: session.id,
+      rootSessionId: identity.rootSessionId ?? session.id,
+    }
   }
 
   /** Whether a run is in flight; the web UI's Stop button reads this. */
@@ -197,9 +201,10 @@ export class Agent {
    */
   private async turn(): Promise<'completed' | 'cancelled' | 'failed' | 'rejected' | 'empty'> {
     const turnId = newTurnId()
-    this.session.append({ type: 'turn/start', turnId })
-    const controller = this.abortController
-    try {
+    return agentScope.run({ ...this.identity, turnId }, async () => {
+      this.session.append({ type: 'turn/start', turnId })
+      const controller = this.abortController
+      try {
       const claimed = this.inbox.splice(0, this.inbox.length)
       const contents = claimed.map((item) => item.content)
       const decision = await this.ctx.waterfall(
@@ -266,9 +271,10 @@ export class Agent {
         }
       }
       // Even a poisoned session must release per-Turn holders.
-      await this.ctx.parallel('agent/turn-settled', { turnId, reason: 'failed' }).catch(() => {})
-      return 'failed'
-    }
+        await this.ctx.parallel('agent/turn-settled', { turnId, reason: 'failed' }).catch(() => {})
+        return 'failed'
+      }
+    })
   }
 
   /** Append and durably flush a turn end, then release per-Turn holders. */
@@ -346,15 +352,19 @@ export class Agent {
       // races the abort signal: a provider that never yields (no data, hung
       // socket) is still stopped by the watchdog instead of blocking forever.
       const iterator = stream[Symbol.asyncIterator]()
-      // The inactivity watchdog aborts silent streams; bump() resets it on
-      // every event.
+      // Two silence windows. Before the first event a provider may legitimately
+      // think for minutes (extended thinking whose reasoning deltas the gateway
+      // never forwards), so that window is generous; once output has started,
+      // silence is a stalled stream and dies fast. bump() re-arms on every event.
+      let sawFirstEvent = false
       let watchdog: ReturnType<typeof setTimeout> | undefined
       const bump = (): void => {
         if (watchdog !== undefined) clearTimeout(watchdog)
+        const silenceWindow = sawFirstEvent ? this.limits().streamInactivityMs : this.limits().streamFirstEventMs
         watchdog = setTimeout(() => {
           this.abortCause = 'inactivity'
           controller?.abort()
-        }, this.limits().streamInactivityMs)
+        }, silenceWindow)
         watchdog.unref?.()
       }
       try {
@@ -365,6 +375,7 @@ export class Agent {
           if (result.done === true) break
           const event = result.value
           assertLive()
+          sawFirstEvent = true
           bump()
           if (event.type === 'delta') {
             // Thinking deltas are logged for UI fidelity but never join the
@@ -408,16 +419,19 @@ export class Agent {
     for (let i = 0; i < calls.length; i++) {
       const call = calls[i]
       if (call === undefined) continue
+      const executionId = newExecutionId()
       // Stop between batch calls: the rest never started, and the log says
       // exactly that instead of leaving declared calls unanswered.
       if (signal?.aborted === true) {
         for (let j = i; j < calls.length; j++) {
           const skipped = calls[j]
           if (skipped === undefined) continue
-          this.session.append({ type: 'tool/call', stepId, call: skipped })
+          const skippedExecutionId = newExecutionId()
+          this.session.append({ type: 'tool/call', stepId, executionId: skippedExecutionId, call: skipped })
           this.session.append({
             type: 'tool/result',
             stepId,
+            executionId: skippedExecutionId,
             callId: skipped.id,
             ok: false,
             output: 'cancelled: stop requested before this call started',
@@ -430,7 +444,7 @@ export class Agent {
       // to those exact final args. Only then record the durable intent; the
       // returned execute() is the side-effect boundary.
       const prepared = tools?.prepare !== undefined
-        ? await tools.prepare(call, signal !== undefined ? { signal } : {})
+        ? await tools.prepare(call, { ...(signal !== undefined ? { signal } : {}), executionId })
         : {
             call,
             execute: async () => tools !== undefined
@@ -441,6 +455,7 @@ export class Agent {
       this.session.append({
         type: 'tool/call',
         stepId,
+        executionId,
         call: prepared.call,
         ...(revision !== undefined ? { policyRevision: revision } : {}),
       })
@@ -456,6 +471,7 @@ export class Agent {
       this.session.append({
         type: 'tool/result',
         stepId,
+        executionId,
         callId: prepared.call.id,
         ok: result.ok,
         output: result.output,

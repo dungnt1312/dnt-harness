@@ -4,6 +4,7 @@ import type { ToolCall } from '../llm/types.ts'
 import { matchCommand } from './matcher.ts'
 import type { DangerousCommandsConfig, GuardMatch } from './types.ts'
 import type { PreExecuteDecision, ToolExecution } from '../tools/types.ts'
+import { currentToolExecution } from '../tools/execution-scope.ts'
 
 export type GuardConfigSource =
   | (() => DangerousCommandsConfig | Promise<DangerousCommandsConfig>)
@@ -15,22 +16,23 @@ export interface GuardOptions {
 }
 
 export interface GuardHandle {
-  getMatch(call: ToolCall): GuardMatch | null
+  getMatch(call: ToolCall, executionId?: string): GuardMatch | null
   clearForWorkspace(workspaceId: string): void
   dispose(): boolean
 }
 
 export function attachDangerousCommandGuard(ctx: Context, options: GuardOptions): GuardHandle {
   const perCall = new WeakMap<ToolCall, GuardMatch>()
-  const byId = new Map<string, GuardMatch>()
-  const byIdWorkspace = new Map<string, string>()
+  const byExecution = new Map<string, GuardMatch>()
+  const executionWorkspace = new Map<string, string>()
 
-  function store(call: ToolCall, match: GuardMatch): void {
+  function store(call: ToolCall, match: GuardMatch, payloadExec?: ToolExecution): void {
     perCall.set(call, match)
-    if (call.id) {
-      byId.set(call.id, match)
+    const executionId = currentToolExecution(payloadExec)?.executionId
+    if (executionId !== undefined) {
+      byExecution.set(executionId, match)
       const wid = agentScope.getStore()?.workspaceId as string | undefined
-      if (wid !== undefined) byIdWorkspace.set(call.id, wid)
+      if (wid !== undefined) executionWorkspace.set(executionId, wid)
     }
   }
 
@@ -82,11 +84,11 @@ export function attachDangerousCommandGuard(ctx: Context, options: GuardOptions)
         }
 
         if (action === 'ask') {
-          store(payload.call, match)
+          store(payload.call, match, payload.exec)
           options.onMatch?.(match, payload.call)
           const decision = await next({ call: payload.call, exec: payload.exec })
           if (decision.kind === 'allow' && decision.call !== payload.call) {
-            store(decision.call, match)
+            store(decision.call, match, payload.exec)
           }
           return decision
         }
@@ -100,17 +102,17 @@ export function attachDangerousCommandGuard(ctx: Context, options: GuardOptions)
   )
 
   return {
-    getMatch(call: ToolCall): GuardMatch | null {
+    getMatch(call: ToolCall, executionId?: string): GuardMatch | null {
       const direct = perCall.get(call)
       if (direct !== undefined) return direct
-      if (call.id && byId.has(call.id)) return byId.get(call.id) ?? null
+      if (executionId !== undefined) return byExecution.get(executionId) ?? null
       return null
     },
     clearForWorkspace(workspaceId: string): void {
-      for (const [id, wid] of [...byIdWorkspace.entries()]) {
+      for (const [executionId, wid] of [...executionWorkspace.entries()]) {
         if (wid === workspaceId) {
-          byIdWorkspace.delete(id)
-          byId.delete(id)
+          executionWorkspace.delete(executionId)
+          byExecution.delete(executionId)
         }
       }
     },

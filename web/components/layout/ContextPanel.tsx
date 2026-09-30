@@ -3,7 +3,7 @@ import ConfirmDialog from '../common/ConfirmDialog.tsx'
 import { useToast } from '../common/Toast.tsx'
 import { Button } from '../ui/Button.tsx'
 import { compactSession, type ContextManifestView, type StreamState } from '../../lib/api.ts'
-import { budgetTone } from '../../lib/format.ts'
+import { budgetTone, contextFill } from '../../lib/format.ts'
 import { cn } from '../../lib/cn.ts'
 import type { Meta, SessionModel, WorkspaceMeta } from '../../lib/types.ts'
 
@@ -88,9 +88,9 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
   }
 
   const canCompact = workspaceId !== null && workspaceId !== undefined && sessionId !== null
-  const budget = manifest?.budget
-  const tone = budget !== undefined ? budgetTone(budget.usedTokens, budget.availableTokens) : 'ok'
-  const percent = budget === undefined ? 0 : Math.min(100, Math.round((budget.usedTokens / Math.max(1, budget.availableTokens)) * 100))
+  const fill = manifest !== undefined && manifest !== null ? contextFill(manifest) : undefined
+  const tone = fill !== undefined ? budgetTone(fill.used, fill.limit) : 'ok'
+  const percent = fill === undefined ? 0 : Math.round(fill.ratio * 100)
   const settingsLink = (tab: 'skills' | 'memory', names: readonly string[]): ReactNode => onOpenSettingsTab !== undefined
     ? <button type="button" className="text-left text-link hover:underline" onClick={() => onOpenSettingsTab(tab)}>{names.join(', ')}</button>
     : names.join(', ')
@@ -127,13 +127,15 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
         {manifest !== undefined && manifest !== null ? (
           <>
             <Row term="mode">{manifest.modeId} · rev {manifest.modeRevision}</Row>
-            <Row term="budget">
-              {budget !== undefined ? (
+            <Row term="window">
+              {fill !== undefined ? (
                 <span className="flex flex-col gap-1.5">
                   <span className="h-1.5 overflow-hidden rounded-full bg-muted" role="presentation">
                     <span className={cn('block h-full rounded-full', TONE_BAR[tone])} style={{ width: `${percent}%` }} />
                   </span>
-                  <span>~{budget.usedTokens}/{budget.availableTokens} tok {budget.estimated ? '(est)' : '(verified)'}</span>
+                  <span title={fill.estimated ? 'Estimated (chars/4); the provider did not report usage. Denominator is the model context window.' : 'Prompt tokens reported by the provider, over the model context window.'}>
+                    {fill.used}/{fill.limit} tok {fill.estimated ? '(est)' : '(reported)'}
+                  </span>
                 </span>
               ) : '—'}
             </Row>
@@ -156,6 +158,13 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
               <Row term="parent context">{manifest.omissions.find((omission) => omission.startsWith('parent-context:'))?.slice('parent-context: '.length)}</Row>
             ) : null}
             {manifest.sources.skills.length > 0 ? <Row term="skills">{settingsLink('skills', manifest.sources.skills)}</Row> : null}
+            {manifest.sources.skillCatalog !== undefined ? (
+              <Row term="skill catalog">
+                <span title={`catalog sha256 ${manifest.sources.skillCatalog.hash} · ${manifest.sources.skillCatalog.names.join(', ')}`}>
+                  {manifest.sources.skillCatalog.names.length} listed for discovery
+                </span>
+              </Row>
+            ) : null}
             {manifest.sources.memory.length > 0 ? <Row term="memory">{settingsLink('memory', manifest.sources.memory)}</Row> : null}
             {manifest.omissions.length > 0 ? <Row term="omitted"><span title={manifest.omissions.join('\n')}>{manifest.omissions.length} sources omitted</span></Row> : null}
           </>

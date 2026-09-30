@@ -160,7 +160,8 @@ describe('folder grants', () => {
   it('file tools write into a granted folder and the model is told the granted folders', async () => {
     const { url: base } = await start()
     const { wsId, sessionId } = await setup(base)
-    expect((await send('PUT', `${base}/api/workspaces/${wsId}/mode`, { modeId: 'full-access' })).status).toBe(200)
+    // A conversation owns its mode: select it on the session itself.
+    expect((await send('PUT', `${base}/api/workspaces/${wsId}/sessions/${sessionId}/mode`, { modeId: 'full-access' })).status).toBe(200)
     await send('PUT', `${base}/api/workspaces/${wsId}/sessions/${sessionId}/grants`, { expectedRevision: 0, roots: [{ path: shared, access: 'write' }] })
     const target = path.join(shared, 'from-agent.txt')
     await send('POST', `${base}/api/workspaces/${wsId}/sessions/${sessionId}/messages`, { content: `write ${target}` })

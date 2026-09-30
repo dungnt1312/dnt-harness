@@ -1,6 +1,6 @@
 import { Menu } from '../ui/Menu.tsx'
 import { cn } from '../../lib/cn.ts'
-import { budgetTone } from '../../lib/format.ts'
+import { budgetTone, contextFill } from '../../lib/format.ts'
 import type { ContextBreakdownView, ContextManifestView } from '../../lib/api.ts'
 
 /** Breakdown rows in the order they render, each a deeper-to-lighter shade. */
@@ -19,28 +19,6 @@ export function formatTokens(tokens: number): string {
   if (tokens < 1_000) return String(Math.round(tokens))
   if (tokens < 1_000_000) return `${trim(tokens / 1_000)}K`
   return `${trim(tokens / 1_000_000)}M`
-}
-
-/** One decimal, so small shares never collapse to a misleading `0%`. */
-function formatPercent(ratio: number): string {
-  return `${(Math.max(0, ratio) * 100).toFixed(1)}%`
-}
-
-/** The fill figures the meter shows, derived from the last request. */
-export function contextFill(manifest: ContextManifestView) {
-  const limit = manifest.budget.contextLimitTokens ?? manifest.budget.availableTokens
-  // The provider's own prompt count is the truth when it reports one; the
-  // builder's chars/4 figure is the fallback and is labeled as an estimate.
-  const reported = manifest.usage?.last.inputTokens
-  const used = reported ?? manifest.budget.usedTokens
-  const cacheable = manifest.usage?.cacheableInputTokens ?? 0
-  return {
-    used,
-    limit,
-    ratio: limit > 0 ? Math.min(used / limit, 1) : 0,
-    estimated: reported === undefined,
-    cacheHitRate: cacheable > 0 ? (manifest.usage?.cachedInputTokens ?? 0) / cacheable : undefined,
-  }
 }
 
 const TONE_STROKE = { ok: 'stroke-link', warn: 'stroke-warn', bad: 'stroke-bad' } as const
@@ -70,14 +48,14 @@ function Ring({ ratio, tone }: { readonly ratio: number; readonly tone: keyof ty
 
 /**
  * Composer context meter: a ring showing how full the model's context window
- * was on the last request, opening a breakdown by source and the session's
- * prompt-cache hit rate. Before the first request it says so, not 0%.
+ * was on the last request, opening a token count per source. Counts are
+ * tokens, never percentages. Before the first request it says so.
  */
 export function ContextMeter({ manifest }: { readonly manifest: ContextManifestView | null }) {
   const fill = manifest !== null ? contextFill(manifest) : null
   const tone = fill !== null ? budgetTone(fill.used, fill.limit) : 'ok'
   const summary = fill !== null
-    ? `${fill.estimated ? '~' : ''}${formatTokens(fill.used)}/${formatTokens(fill.limit)} (${formatPercent(fill.ratio)})`
+    ? `${formatTokens(fill.used)} / ${formatTokens(fill.limit)}`
     : null
   const breakdown = manifest?.breakdown
   const breakdownTotal = breakdown !== undefined ? CATEGORIES.reduce((total, category) => total + breakdown[category.key], 0) : 0
@@ -104,7 +82,7 @@ export function ContextMeter({ manifest }: { readonly manifest: ContextManifestV
           </div>
 
           {fill === null ? (
-            <p className="text-fg-muted">No request yet in this conversation.</p>
+            <p className="text-fg-muted">No recorded request context for this conversation.</p>
           ) : (
             <>
               {/* The filled share of the window, split by source in proportion. */}
@@ -121,12 +99,13 @@ export function ContextMeter({ manifest }: { readonly manifest: ContextManifestV
               {breakdown !== undefined && breakdownTotal > 0 ? (
                 <ul className="flex flex-col gap-2">
                   {CATEGORIES.map((category) => (
-                    <li key={category.key} className="flex items-center gap-2.5" title={`~${formatTokens(breakdown[category.key])} tokens`}>
+                    <li key={category.key} className="flex items-center gap-2.5" title={`${breakdown[category.key].toLocaleString()} tokens, estimated (chars/4)`}>
                       <span className={cn('size-2 shrink-0 rounded-full', category.shade)} aria-hidden="true" />
                       <span className="flex-1 text-fg-muted">{category.label}</span>
-                      <span className="font-mono text-xs">{formatPercent(breakdown[category.key] / breakdownTotal)}</span>
+                      <span className="font-mono text-xs">{formatTokens(breakdown[category.key])}</span>
                     </li>
                   ))}
+                  <li className="text-xs text-fg-faint">Estimated tokens (chars/4). The total above is the provider count when it reported one.</li>
                 </ul>
               ) : null}
 

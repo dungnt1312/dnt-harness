@@ -17,7 +17,7 @@ UI text uses bundled Instrument Sans at 13–14px; assistant prose is 15px with 
 - **Empty state**: greeting, the composer and suggestions are centered vertically; the composer's scope chip picks the project for the first message.
 - **Transcript**: one scroll container spanning the whole column. Opening a conversation lands at the latest row; new output follows only while the reader is within 80px of the bottom; otherwise a round "Jump to latest" button appears. Nothing is pinned over the transcript.
 - **Composer section**: normal document flow below the transcript (never `position: fixed`), stacking the work status line, approval cards, send error and the composer.
-- **Workbench (right)**: read-only Files, Context and Artifacts views plus transient file tabs. It docks at **≥1280px** (360–1100px, resizable, collapsible and expandable) and becomes a modal sheet below that. The selected fixed view and dock width are remembered. A file opened from a recorded call scrolls to the lines that call read and marks them; the body is still the live project file, never the tool's output.
+- **Workbench (right)**: read-only Files, Git, Context and Trajectory views, a Subagents view that follows the conversation's children, and transient file tabs. Git lists the project's changed files with added and removed line counts and opens a read-only diff; it never stages or commits. Trajectory is Duration, Turns and Calls over the same durable log, with no request of its own; its Duration timeline is one equal slot per step in order, not a clock. It docks at **≥1280px** (360–1100px, resizable, collapsible and expandable) and becomes a modal sheet below that. The selected fixed view and dock width are remembered. A file opened from a recorded call scrolls to the lines that call read and marks them; the body is still the live project file, never the tool's output.
 - **Settings**: centered dialog (full screen below 640px) with grouped Global/Workspace tabs on the left, or a section select on narrow screens.
 - Required widths **320, 375, 768, 1024, 1440, 1920px** have no document-level horizontal overflow.
 
@@ -29,7 +29,7 @@ Connection loss is shown separately from durable running state. Reconnecting nev
 
 Approvals appear above the composer, oldest first. **Allow once** and **Deny** apply to one request and keep synchronous duplicate-submit protection; standing permission is the workspace's mode, authored in Settings → Modes.
 
-Context is read-only except for confirmed manual compaction. Its manifest request runs only while the sheet is open, Context is selected, a valid conversation is selected, and the turn is settled. Artifacts is a client-only projection of existing tool calls/results; paths are not proof of existence or content. Its exact empty state is **“No recorded artifacts for this conversation yet.”**
+Context is read-only except for confirmed manual compaction. Its manifest request runs only while the sheet is open, Context is selected, a valid conversation is selected, and the turn is settled. Trajectory is a client-only projection of existing events; its exact empty state is **“No recorded activity for this conversation yet.”** Subagents lists Running and Ended children only; it has no delegation form.
 
 ## Accessibility
 

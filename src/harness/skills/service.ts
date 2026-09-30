@@ -43,6 +43,7 @@ export class SkillsService {
   private readonly home: string
   private readonly bundledDir: string | undefined
   private readonly userDir: string | undefined
+  private readonly mutationTails = new Map<string, Promise<unknown>>()
 
   constructor(home: string, bundledDir?: string, userDir?: string) {
     this.home = home
@@ -148,6 +149,76 @@ export class SkillsService {
 
   async delete(workspaceId: string, name: string): Promise<void> {
     await fs.rm(path.join(this.dir(workspaceId), name), { recursive: true, force: true })
+  }
+
+  // ── Workspace catalog visibility ──────────────────────────────────────────
+  // A per-workspace hidden set, persisted beside the skill folders it governs.
+  // Hidden skills leave the discovery surfaces (the injected catalog block and
+  // the Skill tool's catalog action) but an explicit `Skill load` by name
+  // still works — demand-only, not disabled. The set may name skills that do
+  // not exist (yet, or on another layer); absent names are ignored everywhere
+  // the set is consulted. It exists because user/bundled layers are read-only:
+  // the sidecar is the only per-workspace curation those skills admit.
+
+  private hiddenPath(workspaceId: string): string {
+    return path.join(this.dir(workspaceId), '.hidden.json')
+  }
+
+  /** Names this workspace has hidden from its skill catalog. Absent file → none. */
+  async hiddenNames(workspaceId: string): Promise<readonly string[]> {
+    let raw: string
+    try {
+      raw = await fs.readFile(this.hiddenPath(workspaceId), 'utf8')
+    } catch {
+      return []
+    }
+    try {
+      const parsed = JSON.parse(raw) as { hidden?: unknown }
+      if (!Array.isArray(parsed.hidden)) return []
+      return parsed.hidden.filter((name): name is string => typeof name === 'string')
+    } catch {
+      return []
+    }
+  }
+
+  /** The catalog rows a request may DISCOVER: everything not hidden. */
+  async listVisible(workspaceId: string): Promise<SkillEntry[]> {
+    const hidden = new Set(await this.hiddenNames(workspaceId))
+    if (hidden.size === 0) return this.list(workspaceId)
+    return (await this.list(workspaceId)).filter((entry) => !hidden.has(entry.name))
+  }
+
+  /**
+   * Hide or unhide one skill in this workspace's catalog. The name must be
+   * well-formed but need not exist: pre-hiding (or keeping a tombstone for)
+   * an absent skill is harmless.
+   */
+  async setHidden(workspaceId: string, name: string, hidden: boolean): Promise<void> {
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) {
+      throw new SkillError('not-found', `no skill '${name}'`)
+    }
+    await this.withMutationLock(workspaceId, '.hidden', async () => {
+      const current = new Set(await this.hiddenNames(workspaceId))
+      if (hidden) current.add(name)
+      else current.delete(name)
+      const file = this.hiddenPath(workspaceId)
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      await replaceFileAtomic(file, `${JSON.stringify({ hidden: [...current] }, null, 2)}\n`)
+    })
+  }
+
+  /** Serializes sidecar mutations per workspace (the modes-service pattern). */
+  private withMutationLock<T>(workspaceId: string, id: string, operation: () => Promise<T>): Promise<T> {
+    const key = `${workspaceId}\u0000${id}`
+    const previous = this.mutationTails.get(key) ?? Promise.resolve()
+    let release!: () => void
+    const current = new Promise<void>((resolve) => { release = resolve })
+    const tail = previous.then(() => current)
+    this.mutationTails.set(key, tail)
+    return previous.then(() => operation().finally(() => {
+      release()
+      if (this.mutationTails.get(key) === tail) this.mutationTails.delete(key)
+    }))
   }
 }
 

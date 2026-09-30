@@ -1,7 +1,11 @@
 import { Service, type Context } from '../../kernel/index.ts'
+import { newExecutionId, type ExecutionId } from '../../util/brand.ts'
 import type { ToolCall, ToolSchema } from '../llm/types.ts'
 import { canonicalCall } from './names.ts'
 import { takeMcpOutcome } from '../mcp/staged-outcome.ts'
+import { toolExecutionScope } from './execution-scope.ts'
+import { agentScope } from '../agent/scope.ts'
+import { FileObservations } from '../../capabilities/fs/observation.ts'
 import type { ApprovedPath, GrantedRoot, PreExecuteDecision, PreparedToolCall, ToolDefinition, ToolExecution, ToolResult } from './types.ts'
 
 declare module 'mini-dsh' {
@@ -35,7 +39,7 @@ export type RootResolver = () => {
  * call. Side effect: when allowed, it may also persist the session grant the
  * approver asked for; a failure there fails the call closed.
  */
-export type ApprovedPathResolver = (call: ToolCall, allowed: boolean) => Promise<readonly ApprovedPath[] | undefined>
+export type ApprovedPathResolver = (call: ToolCall, allowed: boolean, exec?: ToolExecution) => Promise<readonly ApprovedPath[] | undefined>
 
 /**
  * Narrow the build-time grant to what is STILL granted right before the
@@ -57,6 +61,8 @@ export class ToolsService extends Service {
   private rootResolver: RootResolver | undefined
   private approvedPathResolver: ApprovedPathResolver | undefined
   private policyRevisionValue = 0
+  /** Host-owned observations: one per service, so a test host never shares state. */
+  private readonly fileObservations = new FileObservations()
 
   constructor(ctx: Context) {
     super(ctx, 'tools')
@@ -139,13 +145,19 @@ export class ToolsService extends Service {
    * execute(). A denial is returned as a prepared no-side-effect result,
    * also carrying the exact rewritten call for a truthful log.
    */
-  async prepare(call: ToolCall, options: { signal?: AbortSignal } = {}): Promise<PreparedToolCall> {
+  async prepare(call: ToolCall, options: { signal?: AbortSignal; executionId?: ExecutionId } = {}): Promise<PreparedToolCall> {
+    const executionId = options.executionId ?? newExecutionId()
     const canonical = canonicalCall(call)
     const tool = this.tools.get(canonical.name)
     if (tool === undefined) {
-      return { call: canonical, execute: async () => ({ ok: false, output: `unknown tool '${canonical.name}' (registered: ${[...this.tools.keys()].join(', ') || 'none'})` }) }
+      return { call: canonical, executionId, execute: async () => ({ ok: false, output: `unknown tool '${canonical.name}' (registered: ${[...this.tools.keys()].join(', ') || 'none'})` }) }
     }
-    const exec = this.buildExecution(canonical, options.signal)
+    const exec = this.buildExecution(canonical, options.signal, executionId)
+    return toolExecutionScope.run(exec, () => this.gate(tool, canonical, exec, executionId))
+  }
+
+  /** The authorization chain for one call, run inside its execution scope. */
+  private async gate(tool: ToolDefinition, canonical: ToolCall, exec: ToolExecution, executionId: ExecutionId): Promise<PreparedToolCall> {
     // Phase 1: rewrite/block hooks. Phase 2 below re-enters the ENTIRE
     // authorization chain with the rewritten call (host/mode/child/policy/
     // approval), while hooks themselves do not recurse.
@@ -160,9 +172,10 @@ export class ToolsService extends Service {
     )
     if (rewrite.kind === 'deny') {
       const deniedCall = canonicalCall(rewrite.call ?? canonical)
-      await this.approvedPathResolver?.(deniedCall, false).catch(() => undefined)
+      await this.approvedPathResolver?.(deniedCall, false, exec).catch(() => undefined)
       return {
         call: deniedCall,
+        executionId,
         execute: () => this.postExecute(deniedCall, exec, { ok: false, output: `denied: ${rewrite.reason}` }),
       }
     }
@@ -180,28 +193,31 @@ export class ToolsService extends Service {
       )
     } catch (error) {
       // Nothing was authorized: let the host drop any pending per-call state.
-      await this.approvedPathResolver?.(rewritten, false).catch(() => undefined)
+      await this.approvedPathResolver?.(rewritten, false, exec).catch(() => undefined)
       throw error
     }
     const preparedCall = canonicalCall(decision.kind === 'allow' ? decision.call : (decision.call ?? rewritten))
     let approvedPaths: readonly ApprovedPath[] | undefined
     try {
-      approvedPaths = await this.approvedPathResolver?.(preparedCall, decision.kind === 'allow')
+      approvedPaths = await this.approvedPathResolver?.(preparedCall, decision.kind === 'allow', exec)
     } catch (error) {
       return {
         call: preparedCall,
+        executionId,
         execute: () => this.postExecute(preparedCall, exec, { ok: false, output: `denied: ${String(error instanceof Error ? error.message : error)}` }),
       }
     }
     if (decision.kind === 'deny') {
       return {
         call: preparedCall,
+        executionId,
         execute: () => this.postExecute(preparedCall, exec, { ok: false, output: `denied: ${decision.reason}` }),
       }
     }
     if ((tool.requiresRoot ?? false) && exec.root === '') {
       return {
         call: preparedCall,
+        executionId,
         execute: () => this.postExecute(preparedCall, exec, {
           ok: false,
           output: `no workspace root is granted for '${preparedCall.name}'; grant one before running root-aware tools`,
@@ -210,7 +226,19 @@ export class ToolsService extends Service {
     }
     return {
       call: preparedCall,
+      executionId,
       execute: async () => {
+        // Authority may have narrowed while the call waited (approval, a
+        // stale batch): re-check it right before the side effect.
+        let refused: unknown
+        try {
+          refused = await toolExecutionScope.run(exec, () => this.ctx.serial('tools/final-gate', { call: preparedCall, exec }))
+        } catch (error) {
+          refused = `final authority check failed: ${String(error instanceof Error ? error.message : error)}`
+        }
+        if (typeof refused === 'string' && refused !== '') {
+          return this.postExecute(preparedCall, exec, { ok: false, output: `denied: ${refused}` })
+        }
         let output: string
         let runExec: ToolExecution
         try {
@@ -219,7 +247,7 @@ export class ToolsService extends Service {
         } catch (error) {
           return this.postExecute(preparedCall, exec, { ok: false, output: `error: ${String(error)}` })
         }
-        const staged = exec.toolCallId !== undefined && exec.toolCallId !== '' ? takeMcpOutcome(exec.toolCallId) : undefined
+        const staged = exec.executionId !== undefined ? takeMcpOutcome(exec.executionId) : undefined
         if (staged !== undefined) {
           return this.postExecute(preparedCall, exec, {
             ok: staged.ok,
@@ -267,15 +295,18 @@ export class ToolsService extends Service {
    * requiresRoot fail-closed check runs after the permission gate, so a
    * policy denial always outranks a missing (or present) grant.
    */
-  private buildExecution(call: ToolCall, signal: AbortSignal | undefined): ToolExecution {
+  private buildExecution(call: ToolCall, signal: AbortSignal | undefined, executionId?: ExecutionId): ToolExecution {
     const grant = this.rootResolver?.()
     const limits = this.ctx.get('limits') as { toolOutputLimit?: number } | undefined
+    const scope = agentScope.getStore()
     return {
       root: grant?.root ?? '',
+      ...(scope?.sessionId !== undefined ? { sessionId: scope.sessionId, observations: this.fileObservations } : {}),
       ...(grant?.additionalRoots !== undefined && grant.additionalRoots.length > 0 ? { additionalRoots: grant.additionalRoots } : {}),
       ...(grant?.deniedRoots !== undefined ? { deniedRoots: grant.deniedRoots } : {}),
       ...(signal !== undefined ? { signal } : {}),
       ...(limits?.toolOutputLimit !== undefined ? { outputLimit: limits.toolOutputLimit } : {}),
+      ...(executionId !== undefined ? { executionId } : {}),
       ...(call.id !== '' ? { toolCallId: call.id } : {}),
     }
   }

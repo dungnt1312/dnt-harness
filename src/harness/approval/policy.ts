@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { Context } from '../../kernel/index.ts'
-import type { SessionId, } from '../../util/brand.ts'
+import type { ExecutionId, SessionId, TurnId } from '../../util/brand.ts'
 import { agentScope } from '../agent/scope.ts'
 import type { ToolCall } from '../llm/types.ts'
 import { canonicalCall, canonicalPolicy } from '../tools/names.ts'
@@ -16,6 +16,8 @@ export type PolicySource = Readonly<Record<string, ApprovalMode>> | (() => Reado
 export interface Reevaluation {
   /** Only entries stamped with this execution workspace are touched. */
   readonly workspaceId?: string
+  /** Only entries owned by this root execution domain (the root and its children). */
+  readonly rootSessionId?: string
   /** The effective policy snapshot for THIS workspace (host computed). */
   readonly policy?: Readonly<Record<string, ApprovalMode>>
   /** The mode's hard exposure ceiling for THIS workspace. */
@@ -49,6 +51,8 @@ export interface ApprovalLifecycle {
    * second, bridge-local id would make log-derived questions unanswerable.
    */
   readonly approvalId: string
+  /** The host execution identity this approval authorizes, when known. */
+  readonly executionId: ExecutionId | undefined
   readonly done: Promise<void>
   /**
    * Epoch ms at which this question expires undecided. Bridges surface it so
@@ -86,12 +90,15 @@ export interface ApprovalOptions {
    * Extra facts recorded on the durable `approval/request` (e.g. why the
    * call needs approval), so a replayed question carries them too.
    */
-  readonly requestDetails?: (call: ToolCall) => Record<string, unknown> | undefined
+  readonly requestDetails?: (call: ToolCall, scope?: ApprovalScope) => Record<string, unknown> | undefined
 }
 
 /** The session/workspace an approval belongs to. */
 export interface ApprovalScope {
   readonly sessionId: SessionId | undefined
+  readonly rootSessionId: SessionId | undefined
+  readonly turnId: TurnId | undefined
+  readonly executionId: ExecutionId | undefined
   readonly workspaceId: string | undefined
 }
 
@@ -110,6 +117,9 @@ interface PendingEntry {
   /** Immutable execution scope — a control change in another workspace must never touch this entry. */
   readonly workspaceId: string | undefined
   readonly sessionId: SessionId | undefined
+  readonly rootSessionId: SessionId | undefined
+  readonly turnId: TurnId | undefined
+  readonly executionId: ExecutionId | undefined
   /** Settles the answerer-side lifecycle (retire the transport question). */
   done(): void
   resolve(entry: Settlement): void
@@ -199,6 +209,7 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
         session.append({
           type: 'approval/decision',
           approvalId: entry.approvalId,
+          ...(entry.executionId !== undefined ? { executionId: entry.executionId } : {}),
           decision,
           ...(reason !== undefined ? { reason } : {}),
         })
@@ -221,7 +232,13 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
     const policy = readPolicy(options.policy)
     const baseMode = modeFor(policy, call.name, defaultMode)
     const executing = agentScope.getStore()
-    const callScope: ApprovalScope = { sessionId: executing?.sessionId, workspaceId: executing?.workspaceId }
+    const callScope: ApprovalScope = {
+      sessionId: executing?.sessionId,
+      rootSessionId: executing?.rootSessionId,
+      turnId: executing?.turnId,
+      executionId: payload.exec.executionId,
+      workspaceId: executing?.workspaceId,
+    }
     const mode = baseMode === 'allow' && options.forceAsk?.(call, callScope) === true ? 'ask' : baseMode
     if (mode === 'allow') return next()
     if (mode === 'deny') {
@@ -238,7 +255,15 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
     // Unguessable capability id: the answer route is transport-global.
     const approvalId = `approval-${randomUUID()}`
     if (record !== undefined) {
-      record.session.append({ ...(options.requestDetails?.(call) ?? {}), type: 'approval/request', approvalId, call })
+      record.session.append({
+        ...(options.requestDetails?.(call, callScope) ?? {}),
+        type: 'approval/request',
+        approvalId,
+        call,
+        ...(callScope.rootSessionId !== undefined ? { rootSessionId: callScope.rootSessionId } : {}),
+        ...(callScope.turnId !== undefined ? { turnId: callScope.turnId } : {}),
+        ...(callScope.executionId !== undefined ? { executionId: callScope.executionId } : {}),
+      })
       try {
         await record.session.durable()
       } catch (error) {
@@ -258,6 +283,9 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
         mode,
         workspaceId: record?.workspaceId,
         sessionId: record?.sessionId,
+        rootSessionId: callScope.rootSessionId,
+        turnId: callScope.turnId,
+        executionId: callScope.executionId,
         done: doneResolve as () => void,
         resolve,
       }
@@ -272,7 +300,7 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
       }
       payload.exec.signal?.addEventListener('abort', onAbort, { once: true })
       if (payload.exec.signal?.aborted === true) onAbort()
-      void options.askUser?.(call, { approvalId, done, expiresAt }).then((allowed) => {
+      void options.askUser?.(call, { approvalId, executionId: callScope.executionId, done, expiresAt }).then((allowed) => {
         payload.exec.signal?.removeEventListener('abort', onAbort)
         clearTimeout(timer)
         // Re-read the live policy: an approval cannot override a deny that
@@ -300,12 +328,19 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
       for (const entry of [...pending.values()]) {
         // Immutable scope: a control change addresses its own workspace only.
         if (scope.workspaceId !== undefined && entry.workspaceId !== scope.workspaceId) continue
+        if (scope.rootSessionId !== undefined && (entry.rootSessionId ?? entry.sessionId) !== scope.rootSessionId) continue
         if (scope.toolExposure !== undefined && !scope.toolExposure.includes(entry.call.name)) {
           void settle(entry, 'cancelled', `mode change: '${entry.call.name}' is no longer exposed`)
           continue
         }
         const baseMode = modeFor(policy, entry.call.name, defaultMode)
-        const entryScope: ApprovalScope = { sessionId: entry.sessionId, workspaceId: entry.workspaceId }
+        const entryScope: ApprovalScope = {
+          sessionId: entry.sessionId,
+          rootSessionId: entry.rootSessionId,
+          turnId: entry.turnId,
+          executionId: entry.executionId,
+          workspaceId: entry.workspaceId,
+        }
         const mode = baseMode === 'allow' && options.forceAsk?.(entry.call, entryScope) === true ? 'ask' : baseMode
         if (mode === 'deny') {
           void settle(entry, 'deny', `policy now denies '${entry.call.name}'`)

@@ -1,41 +1,51 @@
 import { describe, expect, it } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
-import Icon from '../components/common/Icon.tsx'
-import { fileIcon, fileStyle } from './file-icons.ts'
+import { FileTypeIcon } from '../components/common/FileTypeIcon.tsx'
+import { fileStyle, folderIconName, folderStyle, materialIconName } from './file-icons.ts'
 
-describe('fileIcon', () => {
-  it('maps extensions and special names to type icons', () => {
-    expect(fileIcon('main.ts')).toBe('fileCode')
-    expect(fileIcon('src/app/App.tsx')).toBe('fileCode')
-    expect(fileIcon('package.json')).toBe('fileJson')
-    expect(fileIcon('config/app.yaml')).toBe('fileCog')
-    expect(fileIcon('.env.local')).toBe('fileCog')
-    expect(fileIcon('assets/logo.svg')).toBe('fileImage')
-    expect(fileIcon('demo.mp4')).toBe('fileVideo')
-    expect(fileIcon('data/table.csv')).toBe('fileSpreadsheet')
-    expect(fileIcon('backup.tar.gz')).toBe('fileArchive')
-    expect(fileIcon('notes.md')).toBe('fileText')
-    expect(fileIcon('Dockerfile')).toBe('fileCode')
-    expect(fileIcon('.gitignore')).toBe('gitBranch')
+describe('material file icons', () => {
+  it('maps extensions and special names to material assets', () => {
+    expect(materialIconName('main.ts')).toBe('typescript')
+    expect(materialIconName('src/app/App.tsx')).toBe('react_ts')
+    expect(materialIconName('widget.jsx')).toBe('react')
+    expect(materialIconName('package.json')).toBe('json')
+    expect(materialIconName('config/app.yaml')).toBe('yaml')
+    expect(materialIconName('.env.local')).toBe('settings')
+    expect(materialIconName('assets/logo.svg')).toBe('svg')
+    expect(materialIconName('demo.mp4')).toBe('video')
+    expect(materialIconName('data/table.csv')).toBe('table')
+    expect(materialIconName('backup.tar.gz')).toBe('zip')
+    expect(materialIconName('notes.md')).toBe('markdown')
+    expect(materialIconName('Dockerfile')).toBe('docker')
+    expect(materialIconName('.gitignore')).toBe('git')
+    expect(materialIconName('vitest.config.ts')).toBe('vitest')
+    expect(materialIconName('tsconfig.json')).toBe('tsconfig')
   })
 
-  it('tints icons by type from the semantic palette', () => {
-    expect(fileStyle('main.ts').className).toBe('text-link')
-    expect(fileStyle('package.json').className).toBe('text-warn')
-    expect(fileStyle('backup.zip').className).toBe('text-warn')
-    expect(fileStyle('.env')).toMatchObject({ name: 'fileCog', className: 'text-fg-muted' })
-    expect(fileStyle('assets/logo.svg').className).toBe('text-ok')
-    expect(fileStyle('data/table.csv').className).toBe('text-ok')
-    expect(fileStyle('demo.mp4').className).toBe('text-bad')
-    expect(fileStyle('.gitignore').className).toBe('text-fg-muted')
-    expect(fileStyle('notes.md').className).toBe('text-fg-faint')
+  it('falls back to the document icon when nothing matches', () => {
+    expect(materialIconName('no-extension')).toBe('document')
+    expect(materialIconName('')).toBe('document')
   })
 
-  it('renders every file-type icon with real path content', () => {
-    const names = ['fileCode', 'fileJson', 'fileCog', 'fileImage', 'fileAudio', 'fileVideo', 'fileArchive', 'fileSpreadsheet'] as const
-    for (const name of names) {
-      const html = renderToStaticMarkup(<Icon name={name} size={14} />)
-      expect(html, name).toContain('<path')
-    }
+  it('points every file at its svg and keeps the asset name', () => {
+    expect(fileStyle('main.ts')).toEqual({ name: 'typescript', src: '/material-icons/typescript.svg' })
+    expect(fileStyle('notes.md').src).toBe('/material-icons/markdown.svg')
+  })
+
+  it('themes folders by name and switches to the open variant', () => {
+    expect(folderIconName('src')).toBe('folder-src')
+    expect(folderIconName('src', true)).toBe('folder-src-open')
+    expect(folderIconName('node_modules')).toBe('folder-node')
+    expect(folderIconName('tests')).toBe('folder-test')
+    expect(folderIconName('misc')).toBe('folder')
+    expect(folderStyle('src/components', true)).toEqual({ name: 'folder-components-open', src: '/material-icons/folder-components-open.svg' })
+  })
+
+  it('renders a file and a folder as images with a fallback-ready src', () => {
+    const file = renderToStaticMarkup(<FileTypeIcon path="main.ts" size={16} />)
+    expect(file).toContain('src="/material-icons/typescript.svg"')
+    expect(file).toContain('width="16"')
+    const folder = renderToStaticMarkup(<FileTypeIcon path="src" kind="folder" open size={16} />)
+    expect(folder).toContain('src="/material-icons/folder-src-open.svg"')
   })
 })

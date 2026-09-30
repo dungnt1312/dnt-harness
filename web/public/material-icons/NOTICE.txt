@@ -1,0 +1,4 @@
+Material Icon Theme icons, from the vscode-material-icon-theme set
+(https://github.com/material-extensions/vscode-material-icon-theme), which is
+MIT licensed. Copied from dntspace-app/public/material-icons, where they were
+ported from zai-org/ZCode (Apache-2.0).

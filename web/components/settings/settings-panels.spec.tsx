@@ -2,11 +2,12 @@
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { deleteMcpServer, duplicateModeFile, fetchProviderModels, getMcpServer, getModeFile, HttpError, importAgentDefinition, importMcpServers, listModeFiles, listModes, saveModeFile, setModeEnabled, testProvider, upsertMcpServer } from '../../lib/api.ts'
+import { deleteMcpServer, duplicateModeFile, fetchProviderModels, getMcpServer, getModeFile, getSystemPrompts, HttpError, importAgentDefinition, importMcpServers, listModeFiles, listModes, putSystemPrompts, saveModeFile, setModeEnabled, testProvider, upsertMcpServer } from '../../lib/api.ts'
 import { emptyModeForm, parseModeForm, permissionKeyError, serializeModeForm } from '../../lib/mode-form.ts'
 import { McpPanel } from './McpPanel.tsx'
 import { AgentsPanel, definitionDocument } from './AgentsPanel.tsx'
 import { ModesPanel } from './ModesPanel.tsx'
+import { SystemPromptsPanel } from './SystemPromptsPanel.tsx'
 import { SettingsModal } from './SettingsModal.tsx'
 
 vi.mock('../../lib/api.ts', () => ({
@@ -31,11 +32,23 @@ vi.mock('../../lib/api.ts', () => ({
   listChildren: vi.fn(async () => []),
   importAgentDefinition: vi.fn(async () => ({ imported: ['reviewer'] })),
   listModeFiles: vi.fn(async () => []),
-  listModes: vi.fn(async () => ({ modes: [], selected: 'chat', revision: 1 })),
+  listModes: vi.fn(async () => ({ modes: [], selected: 'ask-before-changes', revision: 1 })),
   getModeFile: vi.fn(async () => ({ id: 'review-only', raw: 'server version', source: 'workspace', hash: 'hash-1' })),
   saveModeFile: vi.fn(async () => ({ id: 'review-only', name: 'Review only', hash: 'hash-2' })),
   duplicateModeFile: vi.fn(async () => ({ id: 'plan-custom', name: 'Plan custom' })),
   setModeEnabled: vi.fn(async () => ({ id: 'review-only', enabled: false })),
+  getSystemPrompts: vi.fn(async () => ({
+    base: { text: 'DEFAULT BASE', overridden: false },
+    child: { text: 'DEFAULT CHILD', overridden: false },
+    defaults: { base: 'DEFAULT BASE', child: 'DEFAULT CHILD' },
+    hash: 'h0',
+  })),
+  putSystemPrompts: vi.fn(async (_ws: string, prompts: { readonly base: string; readonly child: string }) => ({
+    base: { text: prompts.base, overridden: prompts.base.trim() !== '' },
+    child: { text: prompts.child, overridden: prompts.child.trim() !== '' },
+    defaults: { base: 'DEFAULT BASE', child: 'DEFAULT CHILD' },
+    hash: 'h2',
+  })),
 }))
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
@@ -233,7 +246,7 @@ describe('modes panel', () => {
     vi.mocked(saveModeFile).mockReset()
     vi.mocked(duplicateModeFile).mockReset()
     vi.mocked(listModeFiles).mockResolvedValue([])
-    vi.mocked(listModes).mockResolvedValue({ modes: [], selected: 'chat', revision: 1 })
+    vi.mocked(listModes).mockResolvedValue({ modes: [], selected: 'ask-before-changes', revision: 1 })
     vi.mocked(getModeFile).mockResolvedValue({ id: 'review-only', raw: 'server version', source: 'workspace', hash: 'hash-1' })
     vi.mocked(saveModeFile).mockResolvedValue({ id: 'review-only', name: 'Review only', hash: 'hash-2' })
     vi.mocked(duplicateModeFile).mockResolvedValue({ id: 'plan-custom', name: 'Plan custom' })
@@ -444,7 +457,7 @@ describe('settings dialog', () => {
   it('gives every section tab an icon', async () => {
     await render()
     const tabs = [...document.body.querySelectorAll('[role="tab"]')]
-    expect(tabs).toHaveLength(9)
+    expect(tabs).toHaveLength(10)
     for (const tab of tabs) expect(tab.querySelector('svg')).not.toBeNull()
   })
 
@@ -569,5 +582,43 @@ describe('settings dialog', () => {
     await act(async () => type(input('Name'), 'local edited'))
     expect(document.body.querySelector('.error-notice')).toBeNull()
     expect(button('Test model auto').disabled).toBe(true)
+  })
+})
+
+describe('system prompts panel', () => {
+  const textarea = (label: string): HTMLTextAreaElement => {
+    const found = document.body.querySelector<HTMLTextAreaElement>(`textarea[aria-label="${label}"]`)
+    if (found === null) throw new Error(`no textarea "${label}"`)
+    return found
+  }
+
+  it('shows the effective prompts, saves an edit, and resets to the default', async () => {
+    vi.mocked(getSystemPrompts).mockResolvedValue({
+      base: { text: 'HOUSE BASE', overridden: true },
+      child: { text: 'DEFAULT CHILD', overridden: false },
+      defaults: { base: 'DEFAULT BASE', child: 'DEFAULT CHILD' },
+      hash: 'h0',
+    })
+    await act(async () => root.render(<SystemPromptsPanel workspaceId="ws-1" />))
+    await settle()
+    expect(getSystemPrompts).toHaveBeenCalledWith('ws-1')
+    expect(document.body.textContent).toContain('Custom')
+    expect(document.body.textContent).toContain('Default')
+    expect(textarea('Base prompt (conversations)').value).toBe('HOUSE BASE')
+    expect(textarea('Subagent prompt (delegated roles)').value).toBe('DEFAULT CHILD')
+
+    await act(async () => type(textarea('Base prompt (conversations)'), 'NEW BASE'))
+    await act(async () => button('Save').click())
+    await settle()
+    expect(vi.mocked(putSystemPrompts)).toHaveBeenCalledWith('ws-1', { base: 'NEW BASE', child: 'DEFAULT CHILD' }, 'h0')
+    expect(document.body.textContent).toContain('Saved.')
+
+    // Reset refills the editor with the harness default; saving lands it as a
+    // no-override config on the server side (blank means default).
+    await act(async () => button('Reset to default').click())
+    expect(textarea('Base prompt (conversations)').value).toBe('DEFAULT BASE')
+    await act(async () => button('Save').click())
+    await settle()
+    expect(vi.mocked(putSystemPrompts)).toHaveBeenLastCalledWith('ws-1', { base: 'DEFAULT BASE', child: 'DEFAULT CHILD' }, 'h2')
   })
 })

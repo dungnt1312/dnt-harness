@@ -13,7 +13,6 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.web.json",
     "chat": "tsx src/bins/headless.ts",
-    "chat:mock": "tsx src/bins/headless.ts --mock",
     "web": "tsx src/bins/web.ts",
     "pair": "tsx src/bins/pair.ts",
     "migrate:mcp": "tsx src/bins/migrate-mcp.ts",

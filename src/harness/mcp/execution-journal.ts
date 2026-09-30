@@ -56,6 +56,12 @@ export class McpExecutionJournal {
   private seq = 0
   private readonly terminals = new Map<string, { readonly outcome: ToolOutcome; readonly detail: string }>()
   private readonly openIntents = new Set<string>()
+  /** Immutable-intent fingerprint per invocation id, open or terminal. */
+  private readonly intentKeys = new Map<string, string>()
+  /** Ids reserved in this process, including ones whose intent write is still in flight. */
+  private readonly reserved = new Set<string>()
+  /** Terminal records written by this process; only these still carry their full result. */
+  private readonly liveTerminals = new Set<string>()
 
   constructor(
     private readonly filePath: string,
@@ -112,15 +118,54 @@ export class McpExecutionJournal {
     return this.terminals.get(invocationId)
   }
 
+  /** Whether this process wrote the terminal record (so the caller still holds the full result). */
+  terminalWrittenHere(invocationId: string): boolean {
+    return this.liveTerminals.has(invocationId)
+  }
+
+  /**
+   * Claim one invocation id for dispatch. Synchronous: the check and the
+   * claim happen with no await between them, so two concurrent callers can
+   * never both own the same id. `integrity` means the id is already bound to a
+   * different immutable intent; `terminal` / `in-flight` mean an identical
+   * intent already exists and must not be sent again.
+   */
+  reserve(intent: Omit<DispatchIntent, 'kind'>): 'owner' | 'in-flight' | 'terminal' | 'integrity' {
+    const key = intentKey(intent)
+    const known = this.intentKeys.get(intent.invocationId)
+    if (known !== undefined && known !== key) return 'integrity'
+    if (this.terminals.has(intent.invocationId)) return 'terminal'
+    if (this.reserved.has(intent.invocationId) || this.openIntents.has(intent.invocationId)) return 'in-flight'
+    this.reserved.add(intent.invocationId)
+    this.intentKeys.set(intent.invocationId, key)
+    return 'owner'
+  }
+
   async appendIntent(intent: DispatchIntent): Promise<void> {
+    const key = intentKey(intent)
+    const known = this.intentKeys.get(intent.invocationId)
+    if (known !== undefined && known !== key) {
+      throw new JournalError(`execution '${intent.invocationId}' is already bound to a different intent`)
+    }
     await this.append(intent)
+    this.intentKeys.set(intent.invocationId, key)
     this.openIntents.add(intent.invocationId)
   }
 
   async appendTerminal(record: TerminalRecord): Promise<void> {
     await this.append(record)
     this.openIntents.delete(record.invocationId)
+    this.reserved.delete(record.invocationId)
+    this.liveTerminals.add(record.invocationId)
     this.terminals.set(record.invocationId, { outcome: record.outcome, detail: record.detail })
+  }
+
+  /** Drop an in-process claim whose intent was never written (nothing was sent). */
+  release(invocationId: string): void {
+    if (!this.openIntents.has(invocationId) && !this.terminals.has(invocationId)) {
+      this.reserved.delete(invocationId)
+      this.intentKeys.delete(invocationId)
+    }
   }
 
   /** Close unresolved intents as indeterminate. Does not dispatch them. */
@@ -142,7 +187,10 @@ export class McpExecutionJournal {
     const kind = record['kind']
     const invocationId = record['invocationId']
     if (typeof invocationId !== 'string') return
-    if (kind === 'dispatch_intent') this.openIntents.add(invocationId)
+    if (kind === 'dispatch_intent') {
+      this.openIntents.add(invocationId)
+      this.intentKeys.set(invocationId, intentKey(record as unknown as Omit<DispatchIntent, 'kind'>))
+    }
     if (kind === 'terminal') {
       this.openIntents.delete(invocationId)
       const outcome = record['outcome']
@@ -176,6 +224,22 @@ export class McpExecutionJournal {
       throw error
     }
   }
+}
+
+/**
+ * The immutable part of an intent: what would be sent, to whom, under which
+ * configuration. Epoch and generation are host-lifecycle fencing, not intent,
+ * so a legitimate reopen under a new epoch still matches.
+ */
+function intentKey(intent: Omit<DispatchIntent, 'kind'>): string {
+  return stable({
+    workspaceId: intent.workspaceId,
+    server: intent.server,
+    tool: intent.tool,
+    argsHash: intent.argsHash,
+    configRevision: intent.configRevision,
+    secretRevision: intent.secretRevision,
+  })
 }
 
 export function digestText(value: string): string {

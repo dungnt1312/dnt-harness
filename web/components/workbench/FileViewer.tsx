@@ -7,8 +7,7 @@ import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { readProjectFile, type ProjectFileView } from '../../lib/api.ts'
 import type { ViewerFocus } from '../../hooks/useWorkbenchFiles.ts'
-import { fileStyle } from '../../lib/file-icons.ts'
-import { cn } from '../../lib/cn.ts'
+import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
 import { escapeHtml, highlight, languageOfFile } from '../../lib/highlight.ts'
 
 /** Above this size files render as plain escaped text to keep the viewer responsive. */
@@ -83,14 +82,13 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
         height: Math.min(Math.max(focus.lines ?? 1, 1), Math.max(lineCount - focus.line + 1, 1)) * metrics.lineHeight,
       }
     : null
-  const icon = fileStyle(path)
   const separator = projectPath.includes('\\') ? '\\' : '/'
   const fullPath = `${projectPath.replace(/[\\/]+$/, '')}${separator}${path.split('/').join(separator)}`
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3 text-[13px]">
-        <Icon name={icon.name} size={14} className={cn('shrink-0', icon.className)} />
+        <FileTypeIcon path={path} size={16} />
         <span className="min-w-0 flex-1 truncate text-fg-muted" title={fullPath}>{fullPath}</span>
         <IconButton label="Reload file" onClick={() => void load()}><Icon name="refresh" size={15} /></IconButton>
       </div>

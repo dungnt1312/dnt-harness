@@ -54,6 +54,7 @@ function render(props: Partial<React.ComponentProps<typeof Composer>> = {}): voi
 const input = (): HTMLElement => host.querySelector('[data-composer-input]') as HTMLElement
 const options = (): HTMLElement[] => Array.from(host.querySelectorAll('[role="option"]'))
 const chips = (): HTMLElement[] => Array.from(input().querySelectorAll('[data-chip-segment]'))
+const groupHeaders = (): string[] => Array.from(host.querySelectorAll('[role="listbox"] .uppercase')).map((node) => node.textContent ?? '')
 
 /** Type text and leave the caret at its end, the way a browser would. */
 function type(text: string): void {
@@ -208,6 +209,49 @@ describe('skill commands', () => {
     render({ skills })
     type('run /rev')
     expect(options()).toHaveLength(0)
+  })
+})
+
+describe('built-in commands', () => {
+  it('picking /compact executes at once through onCommand — nothing lands in the draft', () => {
+    const onCommand = vi.fn()
+    render({ onCommand })
+    type('/')
+    expect(options().map((option) => option.textContent)).toEqual(['/compactSummarize older turns into a compaction checkpoint'])
+    // No catalog, no caption: the bare command list reads unheadered.
+    expect(groupHeaders()).toEqual([])
+    key('Enter')
+    expect(onCommand).toHaveBeenCalledWith('compact')
+    expect(chips()).toHaveLength(0)
+    expect(current.segments).toEqual([])
+  })
+
+  it('a query narrows commands the way it narrows skills', () => {
+    render({})
+    type('/comp')
+    expect(options().map((option) => option.textContent)).toEqual(['/compactSummarize older turns into a compaction checkpoint'])
+    type('/nope')
+    expect(options()).toHaveLength(0)
+  })
+
+  it('a reserved command shadows a same-named workspace skill', () => {
+    render({ skills: [{ name: 'compact', description: 'A workspace skill impersonating the host' }, { name: 'review', description: 'Check a diff' }] })
+    type('/')
+    const texts = options().map((option) => option.textContent)
+    expect(texts.filter((text) => text.startsWith('/compact'))).toHaveLength(1)
+    expect(texts).not.toContain('compactA workspace skill impersonating the host')
+    expect(texts).toContain('reviewCheck a diff')
+  })
+
+  it('commands rank before skills under a Skills caption; only commands drop the icon', () => {
+    render({ skills: [{ name: 'review', description: 'Check a diff' }] })
+    type('/')
+    expect(options().map((option) => option.textContent)[0]).toBe('/compactSummarize older turns into a compaction checkpoint')
+    // The caption sits between the groups and is not itself an option.
+    expect(groupHeaders()).toEqual(['Skills'])
+    expect(options()).toHaveLength(2)
+    expect(options()[0]?.querySelector('svg')).toBeNull()
+    expect(options()[1]?.querySelector('svg')).not.toBeNull()
   })
 })
 

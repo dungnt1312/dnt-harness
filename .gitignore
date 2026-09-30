@@ -14,6 +14,7 @@ web-dist/
 
 # local tool state
 .zcode/
+.mini-dsh/
 
 # editor/agent backup leftovers (superseded by the .tsx/.css originals)
 *.tsxn

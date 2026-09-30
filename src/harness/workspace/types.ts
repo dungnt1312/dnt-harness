@@ -55,7 +55,6 @@ export class ScopeError extends Error {
       | 'workspace-archived'
       | 'workspace-not-empty'
       | 'project-active'
-      | 'root-overlap'
       | 'root-invalid'
       | 'scope-mismatch'
       | 'last-workspace',

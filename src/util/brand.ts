@@ -13,6 +13,8 @@ export type SessionId = Branded<string, 'SessionId'>
 export type TurnId = Branded<string, 'TurnId'>
 /** Identifies one model request inside a turn. */
 export type StepId = Branded<string, 'StepId'>
+/** Identifies one host-owned tool execution, independent of the model call id. */
+export type ExecutionId = Branded<string, 'ExecutionId'>
 /** Identifies one durably accepted user input, stable across restarts. */
 export type InputId = Branded<string, 'InputId'>
 /** Identifies one workspace environment; stable across renames. */
@@ -45,6 +47,11 @@ export function newTurnId(): TurnId {
 /** Mint a fresh step id; unique across restarts. */
 export function newStepId(): StepId {
   return durableId('step') as StepId
+}
+
+/** Mint a fresh host-owned tool execution id; unique across restarts. */
+export function newExecutionId(): ExecutionId {
+  return durableId('exec') as ExecutionId
 }
 
 /** Mint a fresh pending-input id; unique across restarts. */

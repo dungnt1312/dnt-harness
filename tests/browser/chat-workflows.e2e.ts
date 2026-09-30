@@ -561,7 +561,7 @@ test('no tool or delegation renders no activity rows', async ({ page }) => {
   expectNoMutationRequests(state, before)
 })
 
-test('Artifacts projects existing event data without any additional API request', async ({ page }) => {
+test('Trajectory projects existing event data without any additional API request', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 })
   const state = await fixture(page, 'artifacts')
   await openWorkbench(page)
@@ -570,39 +570,24 @@ test('Artifacts projects existing event data without any additional API request'
   await expect.poll(() => state.count('GET', `${SESSION_PATH}/manifest`)).toBe(1)
   await selectWorkbenchView(page, 'Context')
   const before = state.requests().length
-  const workbench = await selectWorkbenchView(page, 'Artifacts')
-  const list = workbench.getByRole('list', { name: 'Recorded artifacts' })
-  await expect(list).toContainText('File reference')
-  await expect(list).toContainText('C:/fixture/project/README.md')
-  await expect(list).toContainText('Command record')
-  await expect(list).toContainText('npm test')
-  await expect(list).toContainText('failed')
-  await expect(list).toContainText('custom output')
-  await expect(list).toContainText('pending')
-  await expect(list).toContainText('Outcome unknown — the host restarted before this result was recorded.')
-  await expect(list).not.toContainText(/file content|diff|changed files|terminal/i)
+  const workbench = await selectWorkbenchView(page, 'Trajectory')
+  await workbench.getByRole('button', { name: 'Calls', exact: true }).click()
+  const calls = workbench.getByRole('list', { name: 'Calls' })
+  await expect(calls).toContainText('README.md')
+  await expect(calls).toContainText('npm test')
+  await expect(calls).toContainText('Failed')
+  await expect(calls).toContainText('Outcome unknown')
   await page.waitForTimeout(750)
   expect(state.requests()).toHaveLength(before)
   await page.reload()
   // The opened views and the selected one are remembered; the new page load
   // reads the manifest once more for the meter, never once per view.
   const reopened = await openWorkbench(page)
-  await expect(reopened.getByRole('button', { name: 'Artifacts', exact: true })).toHaveAttribute('aria-pressed', 'true')
+  await expect(reopened.getByRole('button', { name: 'Trajectory', exact: true })).toHaveAttribute('aria-pressed', 'true')
   await expect(reopened.getByRole('button', { name: 'Context', exact: true })).toBeVisible()
   await expect.poll(() => state.count('GET', `${SESSION_PATH}/manifest`)).toBe(2)
   await page.waitForTimeout(750)
   expect(state.count('GET', `${SESSION_PATH}/manifest`)).toBe(2)
-})
-
-test('Open in workbench reads the current project file, never the recorded output', async ({ page }) => {
-  await page.setViewportSize({ width: 1440, height: 900 })
-  const state = await fixture(page, 'artifacts')
-  const workbench = await selectWorkbenchView(page, 'Artifacts')
-  await workbench.getByRole('button', { name: 'Open in workbench' }).first().click()
-  await expect(workbench.getByRole('region', { name: 'Contents of README.md' })).toContainText('export const answer = 42')
-  // Dev StrictMode may mount the viewer twice; every read is a GET of the live file.
-  expect(state.count('GET', '/api/workspaces/w/projects/p/file')).toBeGreaterThan(0)
-  expect(state.requests().filter((request) => request.method !== 'GET')).toHaveLength(0)
 })
 
 test('a tool row states its window and opens the workbench at the lines it read', async ({ page }) => {
@@ -625,7 +610,7 @@ test('Context manifest is read once per settled conversation, not once per workb
   const state = await fixture(page, 'no-work')
   await expect.poll(() => state.count('GET', `${SESSION_PATH}/manifest`)).toBe(1)
   await selectWorkbenchView(page, 'Context')
-  await selectWorkbenchView(page, 'Artifacts')
+  await selectWorkbenchView(page, 'Trajectory')
   const afterViews = state.requests().length
   await page.waitForTimeout(750)
   expect(state.requests()).toHaveLength(afterViews)
@@ -662,12 +647,12 @@ for (const width of [320, 375, 768, 1024, 1440]) {
     await page.setViewportSize({ width, height: 800 })
     const state = await fixture(page, 'artifacts')
     const workbench = await openWorkbench(page)
-    // Artifacts is not in the strip until it is opened from the nav picker.
+    // Trajectory is not in the strip until it is opened from the nav picker.
     await workbench.getByRole('button', { name: 'Open a view' }).focus()
     await page.keyboard.press('Enter')
-    await page.getByRole('menuitem', { name: 'Artifacts', exact: true }).click()
-    const artifacts = workbench.getByRole('button', { name: 'Artifacts', exact: true })
-    await expect(artifacts).toHaveAttribute('aria-pressed', 'true')
+    await page.getByRole('menuitem', { name: 'Trajectory', exact: true }).click()
+    const trajectory = workbench.getByRole('button', { name: 'Trajectory', exact: true })
+    await expect(trajectory).toHaveAttribute('aria-pressed', 'true')
     const before = state.requests().length
     await page.waitForTimeout(750)
     expect(state.requests()).toHaveLength(before)
@@ -821,7 +806,7 @@ async function expectAxeClean(page: Page, include?: string): Promise<void> {
   expect(result.violations.map(violation => ({ id: violation.id, nodes: violation.nodes.map(node => node.target) }))).toEqual([])
 }
 
-test('axe gates shell, drawers, Context, Artifacts, approval, and every settings section', async ({ page, browser }) => {
+test('axe gates shell, drawers, Context, Trajectory, approval, and every settings section', async ({ page, browser }) => {
   await page.setViewportSize({ width: 1440, height: 900 })
   await fixture(page, 'approval')
   await expectAxeClean(page)
@@ -834,7 +819,7 @@ test('axe gates shell, drawers, Context, Artifacts, approval, and every settings
   await expectAxeClean(page, '[role="menu"][aria-label="Open a view"]')
   await page.getByRole('menuitem', { name: 'Context', exact: true }).click()
   await expectAxeClean(page, '[aria-label="Workbench"]')
-  await selectWorkbenchView(page, 'Artifacts')
+  await selectWorkbenchView(page, 'Trajectory')
   await expectAxeClean(page, '[aria-label="Workbench"]')
   await page.keyboard.press('Escape')
 
@@ -906,8 +891,8 @@ test('captures the deterministic screenshot matrix', async ({ browser }) => {
     { name: 'running-reconnect-queued-follow-up', fixture: 'reconnect', prepare: async page => { await page.locator('[data-composer-input]').fill('Queued follow-up draft') } },
     { name: 'pending-approval', fixture: 'approval' },
     { name: 'context-tab', fixture: 'no-work', prepare: openContext },
-    { name: 'artifacts-empty', fixture: 'no-work', prepare: async page => { await selectWorkbenchView(page, 'Artifacts') } },
-    { name: 'artifacts-populated', fixture: 'artifacts', prepare: async page => { await selectWorkbenchView(page, 'Artifacts') } },
+    { name: 'trajectory-empty', fixture: 'no-work', prepare: async page => { await selectWorkbenchView(page, 'Trajectory') } },
+    { name: 'trajectory-populated', fixture: 'artifacts', prepare: async page => { await selectWorkbenchView(page, 'Trajectory') } },
     { name: 'settings-dirty', fixture: 'settings', prepare: async page => { await (await settingsTrigger(page)).click(); await (await providerName(page.getByRole('dialog', { name: 'Settings' }))).fill('Dirty provider draft') } },
     { name: 'settings-conflict', fixture: 'settings', prepare: async page => { const dialog = page.getByRole('dialog', { name: 'Settings' }); await (await settingsTrigger(page)).click(); await expect(dialog).toBeVisible(); if ((page.viewportSize()?.width ?? 0) > 600) await dialog.getByRole('tab', { name: /Skills/ }).click(); else { await page.getByRole('combobox', { name: 'Settings section' }).click(); await page.getByRole('option', { name: 'Skills' }).click() } await dialog.getByRole('button', { name: 'Edit' }).click(); await dialog.getByLabel('SKILL.md content').fill('local conflict draft'); await dialog.getByRole('button', { name: 'Save skill' }).click(); await expect(dialog.getByRole('button', { name: 'Overwrite anyway' })).toBeVisible() } },
   ]

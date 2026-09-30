@@ -243,6 +243,10 @@ describe('web server', () => {
       'turn/start',
       'step/start',
       'user/message',
+      // The request's raw system block (recorded once per session), then the
+      // per-request manifest: the trajectory's durable "what it carried".
+      'context/body',
+      'context/manifest',
       'assistant/message',
       'step/end',
       'turn/end',

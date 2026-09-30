@@ -1,5 +1,6 @@
-import type { SessionId } from '../../util/brand.ts'
+import type { ExecutionId, SessionId } from '../../util/brand.ts'
 import type { ToolCall, ToolSchema } from '../llm/types.ts'
+import type { FileObservations } from '../../capabilities/fs/observation.ts'
 
 /**
  * Structured MCP tool outcome. Non-MCP tools omit it.
@@ -69,6 +70,10 @@ export interface ToolExecution {
   /** Model-visible output cap for one tool result (from the harness limits). */
   readonly outputLimit?: number
   readonly sessionId?: SessionId
+  /** Host-owned transient file observations, scoped by session. */
+  readonly observations?: FileObservations
+  /** Host-owned durable identity; the model call id is transcript metadata only. */
+  readonly executionId?: ExecutionId
   readonly toolCallId?: string
 }
 
@@ -114,6 +119,7 @@ export type PreExecuteDecision =
  */
 export interface PreparedToolCall {
   readonly call: ToolCall
+  readonly executionId?: ExecutionId
   execute(): Promise<ToolResult>
 }
 
@@ -141,6 +147,15 @@ declare module 'mini-dsh' {
       payload: { readonly call: ToolCall; readonly exec: ToolExecution },
       next: (replacement?: { readonly call: ToolCall; readonly exec?: ToolExecution }) => Promise<PreExecuteDecision>,
     ): Promise<PreExecuteDecision>
+
+    /**
+     * Final authority check, immediately before the tool body runs and after
+     * any approval wait. Non-interactive: it never asks, never rewrites, and
+     * runs no hooks. A listener returns a denial reason when the executing
+     * root's current mode, policy, or ceiling no longer admits this exact
+     * call; the call then ends truthfully without its side effect.
+     */
+    'tools/final-gate'(payload: { readonly call: ToolCall; readonly exec: ToolExecution }): Promise<string | undefined>
 
     /**
      * Around-middleware after a tool ran (or was denied): listeners may

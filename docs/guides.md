@@ -17,38 +17,40 @@ spawned-CLI smoke test). `npm run typecheck` covers the Node side (`src`,
 
 ## Configuration
 
-Both bins load a repo-root `.env` (gitignored) before reading
-`DEEPSEEK_API_KEY`; variables already in the process environment win over file
-entries. `loadRepoEnv()` looks first at `.env` next to the repo the bin lives
-in (so running from any cwd still finds it), then at the process cwd.
+Both bins load a repo-root `.env` (gitignored). Variables already in the
+process environment win over file entries. `loadRepoEnv()` looks first at
+`.env` next to the repo the bin lives in (so running from any cwd still finds
+it), then at the process cwd.
+
+`DEEPSEEK_API_KEY` is optional. When it is set, headless registers the
+DeepSeek provider and the web host seeds a `deepseek` entry on first boot if
+the provider config is empty. A blank value is treated as absent. Neither bin
+refuses to start without a key, and neither falls back to a mock provider.
 
 ```sh
-echo 'DEEPSEEK_API_KEY=sk-...' > .env   # never commit this file
+echo 'DEEPSEEK_API_KEY=sk-...' > .env   # optional; never commit this file
 ```
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | the API key; empty/whitespace is treated as absent | — |
-| `DEEPSEEK_BASE_URL` | API base URL | `https://api.deepseek.com` |
-
-When no usable key is configured, the bins fall back to the scripted mock
-provider with a warning on stderr.
+| `DEEPSEEK_API_KEY` | optional DeepSeek key; empty/whitespace is treated as absent | — |
+| `DEEPSEEK_BASE_URL` | API base URL when the key is set | `https://api.deepseek.com` |
 
 ## The headless CLI
 
-`npm run chat` runs a REPL that uses DeepSeek when the key is configured and the
-mock otherwise; `npm run chat:mock` forces the mock.
+`npm run chat` runs a REPL. With `DEEPSEEK_API_KEY` it registers DeepSeek;
+without a key it still starts, and a model call fails because no provider is
+registered.
 
 ```sh
-npm run chat                          # interactive REPL; 'exit' / 'quit' quits
-npx tsx src/bins/headless.ts --mock --message "hello"   # one-shot
+npm run chat                                          # interactive REPL; 'exit' / 'quit' quits
+npx tsx src/bins/headless.ts --message "hello"        # one-shot
 ```
 
 Flags for `src/bins/headless.ts`:
 
 | Flag | Meaning |
 |---|---|
-| `--mock` | force the scripted mock provider |
 | `--yolo` | allow unnamed tools / skip mode ask defaults (host blocks, exposure, and interactive MCP still apply) |
 | `--root DIR` | workspace root for the filesystem tools |
 | `--message TEXT` | one-shot mode instead of the REPL |
@@ -201,7 +203,7 @@ npx vitest run tests/kernel   # a subset
 ### Running an integration check end-to-end
 
 ```sh
-npx tsx src/bins/headless.ts --mock --message "hello"
+npx tsx src/bins/headless.ts --message "hello"
 ```
 
 …or the real thing:

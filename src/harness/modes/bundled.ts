@@ -1,27 +1,26 @@
 import type { ModeDefinition } from './types.ts'
 
 /**
- * The five bundled modes. They are read-only: customizing one duplicates it
+ * The four bundled modes. They are read-only: customizing one duplicates it
  * into the workspace under a new id. Full access allows exposed
  * capabilities but never overrides host or workspace restrictions — the
- * shell has no OS sandbox, and the mode's own instructions say so.
+ * shell has no OS sandbox, and the mode's own instructions say so. A
+ * zero-exposure conversation mode is a workspace custom mode away: empty
+ * `toolExposure` plus every source off assembles the same request.
+ *
+ * History reads `compact`: identical to `recent` until a compaction
+ * checkpoint exists (nothing is dropped without a summary covering it),
+ * then the summary replaces only the covered range and the fresh tail
+ * stays. That is what makes manual/auto compaction live for every bundled
+ * mode instead of only custom ones.
  */
 export const BUNDLED_MODES: readonly ModeDefinition[] = [
-  {
-    id: 'chat',
-    name: 'Chat',
-    instructions:
-      'You are a conversational assistant. Answer directly from the conversation; you have no tools and no workspace context in this mode.',
-    sources: { history: 'recent', workspaceInstructions: false, skills: 'off', memoryPinned: false, memoryRetrieval: false },
-    toolExposure: [],
-    permissionDefaults: {},
-  },
   {
     id: 'ask-before-changes',
     name: 'Ask before changes',
     instructions:
       'You are a careful assistant working inside the user’s workspace. Read files freely; before any write, edit, or shell command, ask for approval. Prefer explaining what you are about to change.',
-    sources: { history: 'recent', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
+    sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
     toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'Skill', 'Agent', 'MemorySearch', 'MemoryRead'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow',
@@ -36,7 +35,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     name: 'Edit automatically',
     instructions:
       'You are an assistant that edits files directly inside the user’s workspace. Read and edit files without asking; shell commands and deletions still require approval. Keep edits minimal and verifiable.',
-    sources: { history: 'recent', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
+    sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
     toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'Skill', 'Agent', 'MemorySearch', 'MemoryRead', 'MemoryCreate', 'MemoryUpdate'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow',
@@ -51,7 +50,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     name: 'Plan',
     instructions:
       'You are a planning assistant. Investigate the workspace with read-only tools and deliver a plan as your reply. You cannot write, edit, run shell commands, or write memory — the plan itself is the deliverable.',
-    sources: { history: 'recent', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
+    sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
     // Delegation is exposed here safely: a child resolves the SAME mode, so
     // anything it spawns is read-only too — there is no write path to grant.
     toolExposure: ['Read', 'Glob', 'Grep', 'Skill', 'Agent', 'MemorySearch', 'MemoryRead'],
@@ -65,7 +64,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     name: 'Full access',
     instructions:
       'You are an assistant with full access to the workspace tools. Host and workspace restrictions still apply and cannot be overridden by you. There is no OS sandbox: shell commands run with host privileges, so stay deliberate.',
-    sources: { history: 'recent', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
+    sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
     toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'Skill', 'Agent', 'MemorySearch', 'MemoryRead', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow', Bash: 'allow',

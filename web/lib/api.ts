@@ -1,5 +1,5 @@
 import type { AttachmentRef } from './composer-draft.ts'
-import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, Envelope, FolderGrant, HooksConfigRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillRow, TerminalFrame, TerminalListing, TerminalRow, WorkspaceMeta, WorkspaceRow } from './types.ts'
+import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillRow, TerminalFrame, TerminalListing, TerminalRow, WorkspaceMeta, WorkspaceRow } from './types.ts'
 
 const CSRF_HEADER = 'x-mini-dsh-csrf'
 let csrfToken: string | undefined
@@ -357,6 +357,45 @@ export interface ProjectSearchResult {
   readonly truncated: boolean
 }
 
+export type GitChangeStatus = 'modified' | 'added' | 'deleted' | 'renamed' | 'copied' | 'untracked' | 'conflict'
+
+/** One changed path from a read-only `git status`. */
+export interface GitChange {
+  readonly path: string
+  readonly previousPath?: string
+  readonly status: GitChangeStatus
+  readonly added?: number
+  readonly removed?: number
+}
+
+export interface GitStatusReport {
+  readonly branch: string | null
+  readonly changes: readonly GitChange[]
+  readonly truncated: boolean
+}
+
+export interface GitDiffLine {
+  readonly kind: 'add' | 'del' | 'hunk' | 'meta' | 'context'
+  readonly text: string
+}
+
+export interface GitDiffReport {
+  readonly path: string
+  readonly lines: readonly GitDiffLine[]
+  readonly truncated: boolean
+  readonly binary: boolean
+}
+
+/** Read-only git status for a project. An empty `changes` is a clean tree or no repository. */
+export function fetchGitStatus(workspaceId: string, projectId: string): Promise<GitStatusReport> {
+  return apiFetch(`${projectBase(workspaceId, projectId)}/git`).then((r) => json<GitStatusReport>(r))
+}
+
+/** Read-only unified diff of one root-relative path against HEAD. */
+export function fetchGitDiff(workspaceId: string, projectId: string, path: string): Promise<GitDiffReport> {
+  return apiFetch(`${projectBase(workspaceId, projectId)}/git?path=${encodeURIComponent(path)}`).then((r) => json<GitDiffReport>(r))
+}
+
 /** Bounded file-name search under a project root (composer mentions). */
 export function searchProjectFiles(workspaceId: string, projectId: string, query: string, limit?: number): Promise<ProjectSearchResult> {
   const cap = limit !== undefined ? `&limit=${limit}` : ''
@@ -559,58 +598,21 @@ export function setModeEnabled(workspaceId: string, modeId: string, enabled: boo
   }).then((r) => json<{ readonly id: string; readonly enabled: boolean }>(r))
 }
 
-export interface ContextBreakdownView {
-  readonly systemPrompt: number
-  readonly systemTools: number
-  readonly mcpTools: number
-  readonly metaContext: number
-  readonly skills: number
-  readonly messages: number
-}
-
-export interface ContextUsageView {
-  readonly last: { readonly inputTokens: number; readonly cachedInputTokens?: number; readonly outputTokens?: number }
-  readonly cacheableInputTokens: number
-  readonly cachedInputTokens: number
-}
-
-export interface ContextManifestView {
-  readonly modeId: string
-  readonly modeRevision: number
-  readonly model?: string
-  readonly provider?: string
-  readonly budget: { readonly availableTokens: number; readonly usedTokens: number; readonly contextLimitTokens?: number; readonly estimated: boolean }
-  /** Estimated tokens per source of the last request; sums to `usedTokens`. */
-  readonly breakdown?: ContextBreakdownView
-  /** Provider-reported usage, when the provider streams it. */
-  readonly usage?: ContextUsageView
-  readonly history: {
-    readonly setting: string
-    readonly includedTurns: number
-    readonly omittedTurns: number
-    readonly includedSeqRange?: readonly [number, number]
-    readonly omittedSeqRange?: readonly [number, number]
-    readonly checkpointHash?: string
-  }
-  readonly sources: {
-    readonly instructionsHash?: string
-    readonly skills: readonly string[]
-    readonly memory: readonly string[]
-    readonly toolNames: readonly string[]
-    readonly toolSchemas: number
-    /** Present when the request ran as a child role. */
-    readonly child?: { readonly definition: string; readonly instructionsHash: string }
-    /** Inherited parent context the request carried (absent when dropped). */
-    readonly parentContext?: { readonly hash: string; readonly chars: number }
-  }
-  readonly omissions: readonly string[]
-}
+export type { ContextBreakdownView, ContextManifestView, ContextUsageView } from './types.ts'
 
 /** `null` means the valid no-request-yet state (HTTP 204), not an error. */
 export function fetchManifest(workspaceId: string, sessionId: string): Promise<ContextManifestView | null> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/manifest`).then((r) => {
     if (r.status === 204) return null
     return json<ContextManifestView>(r)
+  })
+}
+
+/** One raw context block by content hash; `null` = never recorded (legacy log). */
+export function fetchContextBody(workspaceId: string, sessionId: string, hash: string): Promise<{ kind: string; name?: string; hash: string; chars: number; body: string } | null> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/context/${encodeURIComponent(hash)}`).then((r) => {
+    if (r.status === 404) return null
+    return json<{ kind: string; name?: string; hash: string; chars: number; body: string }>(r)
   })
 }
 
@@ -647,6 +649,15 @@ export function deleteSkill(workspaceId: string, name: string): Promise<{ readon
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}`, { method: 'DELETE' }).then((r) =>
     json<{ readonly deleted: boolean }>(r),
   )
+}
+
+/** Hide or unhide a skill from this workspace's discovery surfaces. */
+export function setSkillHidden(workspaceId: string, name: string, hidden: boolean): Promise<{ readonly name: string; readonly hidden: boolean }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}/hidden`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ hidden }),
+  }).then((r) => json<{ readonly name: string; readonly hidden: boolean }>(r))
 }
 
 // ── G3 memory ───────────────────────────────────────────────────────────────
@@ -738,14 +749,14 @@ export function listChildren(workspaceId: string, rootSessionId: string): Promis
   )
 }
 
-export function waitChild(workspaceId: string, childSessionId: string, waitMs = 5_000): Promise<ChildRow> {
-  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/children/${encodeURIComponent(childSessionId)}?waitMs=${waitMs}`).then((r) =>
+export function waitChild(workspaceId: string, rootSessionId: string, childSessionId: string, waitMs = 5_000): Promise<ChildRow> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(rootSessionId)}/children/${encodeURIComponent(childSessionId)}?waitMs=${waitMs}`).then((r) =>
     json<ChildRow>(r),
   )
 }
 
-export function cancelChild(workspaceId: string, childSessionId: string): Promise<ChildRow> {
-  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/children/${encodeURIComponent(childSessionId)}/cancel`, { method: 'POST' }).then((r) =>
+export function cancelChild(workspaceId: string, rootSessionId: string, childSessionId: string): Promise<ChildRow> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(rootSessionId)}/children/${encodeURIComponent(childSessionId)}/cancel`, { method: 'POST' }).then((r) =>
     json<ChildRow>(r),
   )
 }
@@ -993,6 +1004,38 @@ export function putGlobalGuardConfig(config: DangerousCommandsConfig, expectedHa
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ config, ...(expectedHash !== undefined ? { expectedHash } : {}) }),
   }).then((r) => json<GuardConfigResponse>(r))
+}
+
+// ── System prompt overrides (Settings → System Prompts) ──────────────────
+
+export interface PromptOverrideView {
+  /** The effective text: the override when set, the harness default otherwise. */
+  readonly text: string
+  readonly overridden: boolean
+}
+export interface SystemPromptsResponse {
+  readonly base: PromptOverrideView
+  readonly child: PromptOverrideView
+  readonly defaults: { readonly base: string; readonly child: string }
+  readonly hash: string
+  readonly warning?: string
+}
+
+export function getSystemPrompts(workspaceId: string): Promise<SystemPromptsResponse> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/system-prompts`).then((r) => json<SystemPromptsResponse>(r))
+}
+
+/** Blank string clears the override (back to the default). */
+export function putSystemPrompts(
+  workspaceId: string,
+  prompts: { readonly base: string; readonly child: string },
+  expectedHash?: string,
+): Promise<SystemPromptsResponse> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/system-prompts`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...prompts, ...(expectedHash !== undefined ? { expectedHash } : {}) }),
+  }).then((r) => json<SystemPromptsResponse>(r))
 }
 
 /** UTF-8 safe base64 in both directions; btoa/atob alone mangle non-Latin-1 output. */

@@ -132,11 +132,12 @@ const REASONING_MODELS: Readonly<Record<string, ReasoningCapability>> = {
   'gemini-2.5-flash': { levels: GEMINI_STANDARD, canDisable: false, transportSupported: true },
   'gemini-2.5-flash-lite': { levels: GEMINI_STANDARD, canDisable: false, transportSupported: true },
 
-  // Anthropic adaptive thinking requires a Messages API adapter; gateway
-  // aliases routed through OpenAI-compat endpoints still carry budget_tokens.
-  'claude-fable-5': { levels: EFFORT_5, canDisable: false },
-  'claude-opus-5': { levels: EFFORT_5, canDisable: true },
-  'claude-sonnet-5': { levels: EFFORT_5, canDisable: true },
+  // The completions adapter sends these as Anthropic extended-thinking
+  // fields (`thinking.budget_tokens`), the same body `applyThinkingOverride`
+  // already writes for any Claude id. Fable cannot disable thinking.
+  'claude-fable-5': { levels: EFFORT_5, canDisable: false, transportSupported: true },
+  'claude-opus-5': { levels: EFFORT_5, canDisable: true, transportSupported: true },
+  'claude-sonnet-5': { levels: EFFORT_5, canDisable: true, transportSupported: true },
 
   // kiro-claude-* variants route through an OpenAI-compatible gateway that
   // forwards Anthropic extended_thinking fields.
@@ -234,7 +235,8 @@ const REASONING_MODEL_PATTERNS: readonly ModelPattern<ReasoningCapability>[] = [
   { pattern: /^grok-4\.5(?:[-:].*)?$/, value: REASONING_MODELS['grok-4.5']! },
   { pattern: /^gemini-2\.5-(?:pro|flash|flash-lite)(?:[-:].*)?$/, value: REASONING_MODELS['gemini-2.5-flash']! },
   { pattern: /^gemini-3\.6-flash(?:[-:].*)?$/, value: REASONING_MODELS['gemini-3.6-flash']! },
-  { pattern: /^claude-(?:fable-5|opus-5|sonnet-5)(?:[-:].*)?$/, value: REASONING_MODELS['claude-sonnet-5']! },
+  { pattern: /^claude-fable-5(?:[-:].*)?$/, value: REASONING_MODELS['claude-fable-5']! },
+  { pattern: /^claude-(?:opus-5|sonnet-5)(?:[-:].*)?$/, value: REASONING_MODELS['claude-sonnet-5']! },
   { pattern: /^kiro-claude-(?:opus|sonnet|haiku)(?:[-:].*)?$/, value: REASONING_MODELS['kiro-claude-sonnet']! },
   { pattern: /^glm-5\.2(?:[-:].*)?$/, value: REASONING_MODELS['glm-5.2']! },
   { pattern: /^glm-5\.1(?:[-:].*)?$/, value: REASONING_MODELS['glm-5.1']! },

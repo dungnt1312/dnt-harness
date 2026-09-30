@@ -20,8 +20,8 @@ let release: () => void = () => {}
 let gate = new Promise<void>((resolve) => { release = resolve })
 
 /**
- * `write <path>` writes once; with ` hold` the turn then stays busy (holding
- * its lease) until the test releases the gate.
+ * `write <path>` writes once; with ` hold` the turn then stays busy without
+ * owning the project folder until the test releases the gate.
  */
 const writer: LlmProvider = {
   name: 'writer',
@@ -99,23 +99,23 @@ async function setup(mode: string): Promise<{ url: string; wsId: string; session
   return { url, wsId, sessionX, sessionY }
 }
 
-describe('cross-root writer leases', () => {
-  it('a granted write into another project contends with that project\'s running turn', async () => {
+describe('cross-root file independence', () => {
+  it('a granted write into another project proceeds while that project has a running turn', async () => {
     const { url, wsId, sessionX, sessionY } = await setup('edit-automatically')
     await send('PUT', `${url}/api/workspaces/${wsId}/sessions/${sessionX}/grants`, { expectedRevision: 0, roots: [{ path: rootY, access: 'write' }] })
-    // Y's own turn writes into Y and stays busy, holding Y's lease.
+    // Y's own turn writes into Y and stays busy; it cannot own the folder.
     await send('POST', `${url}/api/workspaces/${wsId}/sessions/${sessionY}/messages`, { content: `write ${path.join(rootY, 'own.txt')} hold` })
     await waitFor(() => fs.readFile(path.join(rootY, 'own.txt'), 'utf8').catch(() => undefined), "Y's write")
 
     await send('POST', `${url}/api/workspaces/${wsId}/sessions/${sessionX}/messages`, { content: `write ${path.join(rootY, 'from-x.txt')}` })
     const eventsX = `${url}/api/workspaces/${wsId}/sessions/${sessionX}/events`
     const result = await waitFor(async () => (await toolResults(eventsX))[0], "X's tool result")
-    expect(result.ok).toBe(false)
-    expect(result.output).toMatch(/project busy/)
-    await expect(fs.readFile(path.join(rootY, 'from-x.txt'), 'utf8')).rejects.toThrow()
+    expect(result.ok).toBe(true)
+    expect(result.output).not.toMatch(/project busy/)
+    expect(await fs.readFile(path.join(rootY, 'from-x.txt'), 'utf8')).toBe('x')
   }, 20_000)
 
-  it('reads through a grant never take a lease, so a busy project stays readable', async () => {
+  it('reads through a grant while another root is running', async () => {
     const { url, wsId, sessionX, sessionY } = await setup('edit-automatically')
     await send('PUT', `${url}/api/workspaces/${wsId}/sessions/${sessionX}/grants`, { expectedRevision: 0, roots: [{ path: rootY, access: 'read' }] })
     await send('POST', `${url}/api/workspaces/${wsId}/sessions/${sessionY}/messages`, { content: `write ${path.join(rootY, 'own.txt')} hold` })
@@ -127,7 +127,7 @@ describe('cross-root writer leases', () => {
     expect(result.output).not.toMatch(/project busy/)
   }, 20_000)
 
-  it('a pending out-of-grant write question does not hold the other project\'s lease', async () => {
+  it('a pending out-of-grant write question never blocks another root', async () => {
     const { url, wsId, sessionX, sessionY } = await setup('edit-automatically')
     // No grant: X's write into Y waits for an out-of-grant approval.
     await send('POST', `${url}/api/workspaces/${wsId}/sessions/${sessionX}/messages`, { content: `write ${path.join(rootY, 'from-x.txt')}` })
@@ -137,7 +137,7 @@ describe('cross-root writer leases', () => {
     expect(await waitFor(() => fs.readFile(path.join(rootY, 'own.txt'), 'utf8').catch(() => undefined), "Y's write")).toBe('x')
   }, 20_000)
 
-  it('leases are hierarchical: a folder contends with folders inside or around it', async () => {
+  it('the deprecated WorkspaceService lease API still has its legacy hierarchy (not used by ordinary tools)', async () => {
     const service = new WorkspaceService(home)
     await service.acquireRoot(rootY, 'a' as SessionId)
     const nested = path.join(rootY, 'sub')

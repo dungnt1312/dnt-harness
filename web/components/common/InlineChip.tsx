@@ -1,4 +1,4 @@
-import { chipLabel, chipTitle, type ChipSegment } from '../../lib/inline-chips.ts'
+import { chipLabel, chipTitle, isBuiltinCommand, type ChipSegment } from '../../lib/inline-chips.ts'
 import { cn } from '../../lib/cn.ts'
 
 /**
@@ -34,7 +34,8 @@ export const CHIP_ICON_SIZE = 13
 
 /** Accessible name shared by both renderers. */
 export function chipAriaLabel(segment: ChipSegment): string {
-  return segment.kind === 'command' ? `Skill command ${segment.name}` : `File mention ${segment.path}`
+  if (segment.kind === 'mention') return `File mention ${segment.path}`
+  return isBuiltinCommand(segment.name) ? `Command ${segment.name}` : `Skill command ${segment.name}`
 }
 
 /** A read-only chip for rendered messages. */

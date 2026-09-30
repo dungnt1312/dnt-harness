@@ -20,6 +20,9 @@ interface ViewportMetrics {
 
 const EMPTY_VIEWPORT: ViewportMetrics = { top: 0, bottom: 0 }
 
+const RAIL_MARK_PITCH = 12
+const RAIL_VERTICAL_INSET = 16
+
 const cleanPreviewText = (text: string): string => text
   .replace(/```[\s\S]*?```/g, (block) => block.replace(/```[^\n]*\n?/g, ' '))
   .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
@@ -57,6 +60,15 @@ export function minimapEntries(items: readonly ViewItem[]): readonly MinimapEntr
 
 const clamp = (value: number, min: number, max: number): number => Math.min(max, Math.max(min, value))
 
+// The rail must never outgrow the visible transcript: when one 12px slot per
+// user message would overflow it, every slot compresses proportionally so the
+// cluster stays centered and fully visible. Buttons keep tiling without gaps,
+// so hover and click resolution survive the compression.
+export function minimapPitch(count: number, available: number | null): number {
+  if (available === null || available <= 0 || count <= 0) return RAIL_MARK_PITCH
+  return count * RAIL_MARK_PITCH > available ? available / count : RAIL_MARK_PITCH
+}
+
 export function activeMinimapIndex(entries: readonly Pick<PositionedEntry, 'index' | 'top' | 'bottom'>[], viewportTop: number, viewportBottom: number): number | null {
   const visible = entries.find((entry) => entry.bottom > viewportTop && entry.top < viewportBottom)
   if (visible !== undefined) return visible.index
@@ -84,6 +96,7 @@ export function ConversationMinimap({ items, scrollRef, contentRef }: {
   const [positioned, setPositioned] = useState<readonly PositionedEntry[]>([])
   const [viewport, setViewport] = useState<ViewportMetrics>(EMPTY_VIEWPORT)
   const [hovered, setHovered] = useState<number | null>(null)
+  const [railCapacity, setRailCapacity] = useState<number | null>(null)
 
   const measureViewport = useCallback(() => {
     const scroll = scrollRef.current
@@ -105,6 +118,9 @@ export function ConversationMinimap({ items, scrollRef, contentRef }: {
       const top = scroll.scrollTop + rowRect.top - scrollRect.top
       return [{ ...entry, top, bottom: top + rowRect.height }]
     })
+    const available = scroll.clientHeight - RAIL_VERTICAL_INSET * 2
+    const nextCapacity = available > 0 ? available : null
+    setRailCapacity((previous) => previous === nextCapacity ? previous : nextCapacity)
     setPositioned((previous) => previous.length === next.length && next.every((entry, index) => {
       const old = previous[index]
       return old?.index === entry.index && old.title === entry.title && old.detail === entry.detail && old.width === entry.width && old.top === entry.top && old.bottom === entry.bottom
@@ -164,6 +180,8 @@ export function ConversationMinimap({ items, scrollRef, contentRef }: {
 
   const activeIndex = useMemo(() => activeMinimapIndex(positioned, viewport.top, viewport.bottom), [positioned, viewport.top, viewport.bottom])
   const hoveredEntry = positioned.find((entry) => entry.index === hovered) ?? null
+  const pitch = minimapPitch(positioned.length, railCapacity)
+  const compressed = pitch !== RAIL_MARK_PITCH
   if (positioned.length < 2) return null
 
   return (
@@ -183,6 +201,7 @@ export function ConversationMinimap({ items, scrollRef, contentRef }: {
               aria-label={`Jump to: ${entry.title}`}
               aria-current={active ? 'true' : undefined}
               className="group flex h-3 w-full shrink-0 items-center justify-end outline-none focus-visible:ring-1 focus-visible:ring-link"
+              {...(compressed ? { style: { height: pitch } } : {})}
               onMouseEnter={() => setHovered(entry.index)}
               onFocus={() => setHovered(entry.index)}
               onBlur={() => setHovered(null)}
@@ -191,7 +210,7 @@ export function ConversationMinimap({ items, scrollRef, contentRef }: {
               <span
                 aria-hidden="true"
                 className={`h-[3px] rounded-full ${active ? 'bg-fg opacity-90' : 'bg-fg-faint/50 opacity-80 group-hover:bg-fg group-hover:opacity-90'}`}
-                style={{ width: active ? 16 : entry.width }}
+                style={{ width: active ? 16 : entry.width, ...(pitch < 5 ? { height: 2 } : {}) }}
               />
             </button>
           )

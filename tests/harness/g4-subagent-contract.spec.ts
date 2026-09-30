@@ -604,7 +604,7 @@ describe('lifecycle boundary', () => {
     await harness.kernel.stop()
   }, 15_000)
 
-  it('a child inside its spawn window lists as running, never as settled', async () => {
+  it('a child inside its spawn window lists as queued, never as settled', async () => {
     const harness = await boot([{ toolCalls: [{ name: 'Read', args: {} }] }], { blocking: true })
     const root = harness.kernel.ctx.sessions.get(harness.rootSessionId as never) as unknown as { durable(): Promise<void> }
     const durable = root.durable.bind(root)
@@ -614,7 +614,7 @@ describe('lifecycle boundary', () => {
     const pending = harness.executor.spawn(request(harness, explorer))
     await new Promise((resolve) => setTimeout(resolve, 20))
     const listed = await harness.executor.childrenOfRoot(harness.rootSessionId as never)
-    expect(listed.map((child) => child.status)).toEqual(['running'])
+    expect(listed.map((child) => child.status)).toEqual(['queued'])
     root.durable = durable
     open()
     await pending
@@ -712,10 +712,10 @@ describe('capacity', () => {
     const harness = await boot([{ toolCalls: [{ name: 'Read', args: {} }] }], { blocking: true })
     const other = harness.kernel.ctx.sessions.create(harness.workspaceId as never).id as unknown as string
     const [mine, theirs] = await Promise.all([
-      Promise.allSettled([0, 1, 2, 3].map(() => harness.executor.spawn(request(harness, explorer)))),
-      Promise.allSettled([0, 1, 2].map(() => harness.executor.spawn(request(harness, explorer, { parentSessionId: other as never })))),
+      Promise.allSettled([0, 1, 2, 3, 4, 5, 6].map(() => harness.executor.spawn(request(harness, explorer)))),
+      Promise.allSettled([0, 1, 2, 3, 4, 5].map(() => harness.executor.spawn(request(harness, explorer, { parentSessionId: other as never })))),
     ])
-    expect(mine.filter((result) => result.status === 'fulfilled')).toHaveLength(3)
+    expect(mine.filter((result) => result.status === 'fulfilled')).toHaveLength(6)
     const refused = mine.filter((result): result is PromiseRejectedResult => result.status === 'rejected')
     expect(refused).toHaveLength(1)
     expect(refused[0]?.reason).toMatchObject({ code: 'capacity', message: expect.stringMatching(/for this conversation/) })
@@ -725,19 +725,18 @@ describe('capacity', () => {
     await harness.kernel.stop()
   }, 20_000)
 
-  it('conversations do not steal each other\'s slots; the host ceiling names itself', async () => {
+  it('root slots are independent; host dispatch capacity queues rather than denying another root', async () => {
     const harness = await boot([{ toolCalls: [{ name: 'Read', args: {} }] }], { blocking: true })
-    const roots = [harness.rootSessionId, ...[1, 2, 3, 4].map(() => harness.kernel.ctx.sessions.create(harness.workspaceId as never).id as unknown as string)]
-    for (const rootId of roots.slice(0, 4)) {
-      for (let i = 0; i < 3; i++) await harness.executor.spawn(request(harness, explorer, { parentSessionId: rootId as never }))
-      expect(harness.executor.activeOfRoot(rootId as never)).toBe(3)
+    const roots = [harness.rootSessionId, ...[1, 2, 3].map(() => harness.kernel.ctx.sessions.create(harness.workspaceId as never).id as unknown as string)]
+    for (const rootId of roots) {
+      for (let i = 0; i < 6; i++) await harness.executor.spawn(request(harness, explorer, { parentSessionId: rootId as never }))
+      expect(harness.executor.activeOfRoot(rootId as never)).toBe(6)
     }
     await expect(harness.executor.spawn(request(harness, explorer, { parentSessionId: roots[0] as never }))).rejects.toThrow(/for this conversation/)
-    await expect(harness.executor.spawn(request(harness, explorer, { parentSessionId: roots[4] as never }))).rejects.toMatchObject({
-      code: 'capacity',
-      message: expect.stringMatching(/12 active children on this host/),
-    })
-    for (const rootId of roots.slice(0, 4)) {
+    const all = await Promise.all(roots.map((rootId) => harness.executor.childrenOfRoot(rootId as never)))
+    expect(all.flat()).toHaveLength(24)
+    expect(all.flat().filter((child) => child.status === 'queued').length).toBeGreaterThan(0)
+    for (const rootId of roots) {
       await harness.executor.cancelAllOfRoot(rootId as never)
       expect(harness.executor.activeOfRoot(rootId as never)).toBe(0)
     }
@@ -861,7 +860,7 @@ describe('the Agent tool', () => {
     }
   }
 
-  const run = <T>(workspaceId: string, fn: () => T): T => agentScope.run({ sessionId: 'root' as never, workspaceId: workspaceId as never }, fn)
+  const run = <T>(workspaceId: string, fn: () => T): T => agentScope.run({ sessionId: 'root' as never, rootSessionId: 'root' as never, turnId: 'turn-active' as never, workspaceId: workspaceId as never }, fn)
 
   it('spawns from a prose prompt, reports dropped grants and the per-conversation count', async () => {
     const { executor, spawned } = fakeExecutor()
@@ -869,7 +868,7 @@ describe('the Agent tool', () => {
     const raw = await run('ws-tool', () => tool.execute({ action: 'spawn', definition: 'reviewer', prompt: 'Review src/a.ts', objective: 'old form', grantTools: ['Read', 'Write'] }, {} as never))
     const result = JSON.parse(String(raw)) as Record<string, unknown>
     expect(spawned[0]?.packet.prompt).toBe('Review src/a.ts')
-    expect(result['active']).toBe('1/3')
+    expect(result['active']).toBe('1/6')
     expect(result['droppedGrants']).toEqual(['Write'])
     expect(String(result['note'])).toContain("the prompt is the brief")
     expect(result['inheritedChars']).toBeUndefined()
@@ -897,8 +896,8 @@ describe('the Agent tool', () => {
     const tool = agentTool(deps(new AgentDefinitionService(home), executor))
     const description = run('ws-tool', () => tool.schema?.()?.description ?? '')
     expect(description).toContain('Delegate when the work is separable')
-    expect(description).toContain('nothing locks its whole run')
-    expect(description).toContain('Do not fan out writers')
+    expect(description).toContain('share the project filesystem')
+    expect(description).toContain('re-read before writing')
     expect(description).not.toMatch(/one at a time|serializ/i)
     for (const role of ['explorer', 'worker', 'reviewer', 'verifier']) expect(description).toContain(`${role} (`)
   })

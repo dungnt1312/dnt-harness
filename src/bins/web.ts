@@ -1,9 +1,10 @@
 /**
  * The web bin: boots the harness behind an HTTP server and prints the URL.
- * A `DEEPSEEK_API_KEY` seeds a real DeepSeek provider on first boot; without
- * it the server still starts so the browser Settings panel can add any
- * OpenAI-completions compatible provider. Sessions persist under
- * `--data-dir` (default `<homedir>/.mini-dsh/data`) and reopen on restart.
+ * When `DEEPSEEK_API_KEY` is set and the provider config is empty, first
+ * boot seeds a DeepSeek entry. Without a key the server still starts so
+ * the browser Settings panel can add any OpenAI-completions compatible
+ * provider. Sessions persist under `--data-dir` (default
+ * `<homedir>/.mini-dsh/data`) and reopen on restart.
  * Serve the built client first:
  *
  *   npm run build:web
@@ -73,11 +74,6 @@ async function main(): Promise<void> {
   if (auth) {
     const pairing = server.auth.issuePairingCode()
     process.stdout.write(`pairing code (single use, expires in 5 minutes): ${pairing.code}\n`)
-  }
-  if (process.env['DEEPSEEK_API_KEY']?.trim() === '') {
-    process.stderr.write('DEEPSEEK_API_KEY is blank; configure a provider in the web Settings panel.\n')
-  } else if (process.env['DEEPSEEK_API_KEY'] === undefined) {
-    process.stderr.write('no provider seeded; open Settings to add an OpenAI-completions compatible provider.\n')
   }
 
   let shuttingDown = false

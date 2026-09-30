@@ -8,8 +8,8 @@
  * pasted mid-sentence never opens the menu.
  */
 
-import type { DraftSegment } from './composer-draft.ts'
-import { messageText } from './inline-chips.ts'
+import type { DraftSegment, RichDraft } from './composer-draft.ts'
+import { BUILTIN_COMMANDS, isBuiltinCommand, messageText } from './inline-chips.ts'
 
 export type CompletionKind = 'file' | 'skill'
 
@@ -44,6 +44,43 @@ export function skillCompletionItem(skill: { readonly name: string; readonly des
     label: skill.name,
     ...(skill.description !== undefined ? { detail: skill.description } : {}),
   }
+}
+
+/** A built-in command becomes the same command chip shape, under its own id space. */
+export function builtinCompletionItem(command: { readonly name: string; readonly description: string }): CompletionItem {
+  const segment: DraftSegment = { kind: 'command', name: command.name }
+  return {
+    id: `command:${command.name}`,
+    insert: `/${command.name}`,
+    segment,
+    label: `/${command.name}`,
+    detail: command.description,
+  }
+}
+
+/**
+ * The built-in command a draft carries, if any — matched by command chip,
+ * not by text. `null` means the draft sends as a normal message.
+ */
+export function builtinCommandIn(draft: RichDraft): string | null {
+  for (const segment of draft.segments) {
+    if (segment.kind === 'command' && isBuiltinCommand(segment.name)) return segment.name
+  }
+  return null
+}
+
+/**
+ * Whether the draft is exactly the named command: no attachments, no other
+ * chips, and no text beyond whitespace. Built-in commands run on their own —
+ * a mixed draft is refused rather than silently ignoring the extra content.
+ */
+export function draftIsOnlyCommand(draft: RichDraft, name: string): boolean {
+  if (draft.attachments.length > 0) return false
+  return draft.segments.every((segment) =>
+    segment.kind === 'command'
+      ? segment.name === name
+      : segment.kind === 'text' && segment.text.trim() === '',
+  )
 }
 
 /** A mention query stops at whitespace; the trigger needs a word boundary. */

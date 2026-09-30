@@ -56,12 +56,19 @@ describe('bash tool', () => {
     expect(output).toContain('[exit code: 3]')
   })
 
+  it('uses the configured default when timeoutMs is zero or negative', async () => {
+    const tool = bashTool({ timeoutMs: 2_000 })
+    await expect(tool.execute({ command: 'echo zero', timeoutMs: 0 }, exec)).resolves.toContain('zero')
+    await expect(tool.execute({ command: 'echo negative', timeoutMs: -1 }, exec)).resolves.toContain('negative')
+  })
+
   it('kills a command that exceeds the timeout and settles quickly', async () => {
     const start = Date.now()
     const output = await bashTool({ timeoutMs: 300 }).execute({ command: 'sleep 5; echo never' }, exec)
     const elapsed = Date.now() - start
     expect(elapsed).toBeLessThan(3_000)
     expect(output).not.toContain('never')
+    expect(output).toContain('[terminated by timeout; killed]')
   }, 10_000)
 
   it('the shell stays usable after a timeout kill (no stuck pipes or orphans)', async () => {
@@ -79,7 +86,7 @@ describe('bash tool', () => {
       { ...exec, signal: controller.signal },
     )
     expect(Date.now() - start).toBeLessThan(3_000)
-    expect(output).toContain('[terminated by stop]')
+    expect(output).toContain('[terminated by stop; killed]')
     expect(output).not.toContain('never')
   }, 10_000)
 

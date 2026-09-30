@@ -1,7 +1,9 @@
 import { assertNever } from '../../kernel/index.ts'
-import type { StepId, TurnId } from '../../util/brand.ts'
+import type { ExecutionId, StepId, TurnId } from '../../util/brand.ts'
 import { isImageMediaType, type AttachmentLookup, type AttachmentRef } from '../attachments/store.ts'
+import type { ContextManifest } from '../context/builder.ts'
 import type { ContentPart, ModelMessage, ToolCall } from '../llm/types.ts'
+import type { ModeDefinition } from '../modes/types.ts'
 
 /** Fields the session itself stamps onto every appended event. */
 interface SessionEventStamp {
@@ -27,15 +29,17 @@ export interface RequestControls {
  * and every switch over it, ending in `assertNever`.
  */
 export type SessionEvent =
-  | ({ readonly type: 'turn/start'; readonly turnId: TurnId } & SessionEventStamp)
+  | ({ readonly type: 'turn/start'; readonly turnId: TurnId; readonly kind?: 'conversation' | 'delegation' } & SessionEventStamp)
+  | ({ readonly type: 'turn/closing'; readonly turnId: TurnId } & SessionEventStamp)
   | ({ readonly type: 'user/message'; readonly turnId: TurnId; readonly content: string; readonly inputId?: string; readonly attachments?: readonly AttachmentRef[] } & SessionEventStamp)
   | ({ readonly type: 'step/start'; readonly turnId: TurnId; readonly stepId: StepId } & SessionEventStamp)
   | ({ readonly type: 'assistant/chunk'; readonly stepId: StepId; readonly delta: string; readonly thinking?: boolean } & SessionEventStamp)
   | ({ readonly type: 'assistant/message'; readonly stepId: StepId; readonly content: string; readonly toolCalls?: readonly ToolCall[]; readonly controls?: RequestControls } & SessionEventStamp)
-  | ({ readonly type: 'tool/call'; readonly stepId: StepId; readonly call: ToolCall; readonly policyRevision?: number } & SessionEventStamp)
+  | ({ readonly type: 'tool/call'; readonly stepId: StepId; readonly executionId?: ExecutionId; readonly call: ToolCall; readonly policyRevision?: number } & SessionEventStamp)
   | ({
       readonly type: 'tool/result'
       readonly stepId: StepId
+      readonly executionId?: ExecutionId
       readonly callId: string
       readonly ok: boolean
       readonly output: string
@@ -58,6 +62,9 @@ export type SessionEvent =
       readonly type: 'approval/request'
       readonly approvalId: string
       readonly call: ToolCall
+      readonly rootSessionId?: string
+      readonly turnId?: TurnId
+      readonly executionId?: ExecutionId
       /** Set when the call targets a path outside every granted folder. */
       readonly scopeWarning?: string
       /** The folder a session-scoped answer would grant (already validated). */
@@ -65,12 +72,17 @@ export type SessionEvent =
       /** The access that folder would get (the call's own read or write). */
       readonly proposedAccess?: 'read' | 'write'
     } & SessionEventStamp)
-  | ({ readonly type: 'approval/decision'; readonly approvalId: string; readonly decision: ApprovalDecision; readonly reason?: string } & SessionEventStamp)
+  | ({ readonly type: 'approval/decision'; readonly approvalId: string; readonly executionId?: ExecutionId; readonly decision: ApprovalDecision; readonly reason?: string } & SessionEventStamp)
   | ({ readonly type: 'input/queued'; readonly inputId: string; readonly clientRequestId?: string; readonly content: string; readonly attachments?: readonly AttachmentRef[] } & SessionEventStamp)
   | ({ readonly type: 'session/title'; readonly title: string | null } & SessionEventStamp)
   | ({ readonly type: 'session/pinned'; readonly pinned: boolean } & SessionEventStamp)
   | ({ readonly type: 'session/project'; readonly projectId: string | null } & SessionEventStamp)
   | ({ readonly type: 'session/model'; readonly provider?: string | null; readonly model?: string | null; readonly thinkingLevel?: string | null } & SessionEventStamp)
+  // The root's own live mode: a normalized snapshot, so a restart never
+  // depends on the mode file still existing or holding the same content.
+  // Last wins; `revision` increases per selection. Children resolve their
+  // root's latest record — they never carry one of their own.
+  | ({ readonly type: 'session/mode'; readonly modeId: string; readonly revision: number; readonly snapshot: ModeDefinition; readonly source: 'bundled' | 'workspace'; readonly hash: string } & SessionEventStamp)
   // Session-scoped folder grants for the file tools: a full replacement list,
   // last wins. `revision` increments per change so concurrent editors can
   // detect a stale view; `approvalId` names the approval that added a folder.
@@ -94,6 +106,36 @@ export type SessionEvent =
   | ({ readonly type: 'agent/child-result'; readonly childSessionId: string; readonly parentTurnId: string; readonly status: string; readonly error?: string } & SessionEventStamp)
   | ({ readonly type: 'mcp/call'; readonly server: string; readonly tool: string; readonly argsHash: string; readonly resultHash: string; readonly durationMs: number; readonly isError: boolean } & SessionEventStamp)
   | ({ readonly type: 'hook/run'; readonly event: string; readonly matcher: string; readonly exitCode: number | null; readonly durationMs: number; readonly decision: string } & SessionEventStamp)
+  // Observability, not model content: the context manifest of the request this
+  // step is about to send, recorded between `step/start` and the step's
+  // answer. The trajectory reads it as "what this request carried"; model
+  // projection ignores it.
+  | ({ readonly type: 'context/manifest'; readonly turnId: TurnId; readonly manifest: ContextManifest } & SessionEventStamp)
+  // The raw text of one assembled context block (system, compaction, parent
+  // context, skill, skill catalog, memory), keyed by the sha256 of the exact
+  // model-visible text. Recorded once per distinct hash per session — a body
+  // the request already carried is never re-recorded. The `body` field name
+  // (not `content`/`output`) keeps it out of the compaction size projection.
+  | ({ readonly type: 'context/body'; readonly hash: string; readonly kind: 'system' | 'compaction' | 'parent-context' | 'skill' | 'skill-catalog' | 'memory'; readonly name?: string; readonly chars: number; readonly body: string } & SessionEventStamp)
+  // Compaction lifecycle, log-only (DeepSeek-Harness-style): `start` opens the
+  // transaction before the summarizer runs; `end` closes it after the
+  // checkpoint is durable — with the summary body for immediate UI review, or
+  // `error` for a failed attempt. A dangling start (crash mid-compaction)
+  // stays visible as an unfinished transaction; there is never an end that
+  // claims success without a checkpoint on disk. Model projection ignores both.
+  | ({ readonly type: 'compaction/start'; readonly trigger: 'manual' | 'automatic'; readonly model?: string } & SessionEventStamp)
+  | ({
+      readonly type: 'compaction/end'
+      readonly trigger: 'manual' | 'automatic'
+      readonly model?: string
+      readonly coversSeq: number
+      readonly summaryChars: number
+      readonly durationMs: number
+      /** The full summary exactly as stored in the checkpoint; absent on failure. */
+      readonly summary?: string
+      /** Set on a failed attempt; no checkpoint was written. */
+      readonly error?: string
+    } & SessionEventStamp)
 
 /** Why a turn closed. */
 export type TurnEndReason =
@@ -235,6 +277,15 @@ export function sessionGrantsOf(events: readonly SessionEvent[]): SessionGrants 
   return { revision: 0, roots: [] }
 }
 
+/** The root's latest durable mode snapshot, or undefined for a legacy log. */
+export function sessionModeOf(events: readonly SessionEvent[]): Extract<SessionEvent, { type: 'session/mode' }> | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]
+    if (event?.type === 'session/mode') return event
+  }
+  return undefined
+}
+
 export function deriveMessages(events: readonly SessionEvent[], attachments?: AttachmentLookup): ModelMessage[] {
   const messages: ModelMessage[] = []
   for (const event of events) {
@@ -253,6 +304,7 @@ export function deriveMessages(events: readonly SessionEvent[], attachments?: At
         messages.push({ role: 'tool', content: event.output, toolCallId: event.callId })
         break
       case 'turn/start':
+      case 'turn/closing':
       case 'step/start':
       case 'assistant/chunk':
       case 'tool/call':
@@ -266,12 +318,17 @@ export function deriveMessages(events: readonly SessionEvent[], attachments?: At
       case 'session/pinned':
       case 'session/project':
       case 'session/model':
+      case 'session/mode':
       case 'session/grants':
       case 'session/child-meta':
       case 'agent/child-spawn':
       case 'agent/child-result':
       case 'mcp/call':
       case 'hook/run':
+      case 'context/manifest':
+      case 'context/body':
+      case 'compaction/start':
+      case 'compaction/end':
         break
       default:
         assertNever(event)

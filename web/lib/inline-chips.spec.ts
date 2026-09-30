@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { chipLabel, chipWireText, messageText, parseMessageText } from './inline-chips.ts'
+import { BUILTIN_COMMANDS, chipLabel, chipTitle, chipWireText, isBuiltinCommand, messageText, parseMessageText } from './inline-chips.ts'
 
 describe('chip wire text', () => {
   it('writes mentions as @path, quoting only when the path needs it', () => {
@@ -12,6 +12,14 @@ describe('chip wire text', () => {
   it('labels a file by base name and a skill as /name', () => {
     expect(chipLabel({ kind: 'mention', path: 'web/lib/api.ts' })).toBe('api.ts')
     expect(chipLabel({ kind: 'command', name: 'ak-plan' })).toBe('/ak-plan')
+  })
+
+  it('titles built-in commands apart from workspace skills', () => {
+    expect(chipTitle({ kind: 'command', name: 'ak-plan' })).toBe('Skill: ak-plan')
+    expect(chipTitle({ kind: 'command', name: 'compact' })).toBe('Command: compact')
+    expect(isBuiltinCommand('compact')).toBe(true)
+    expect(isBuiltinCommand('ak-plan')).toBe(false)
+    expect(BUILTIN_COMMANDS.map((command) => command.name)).toContain('compact')
   })
 })
 

@@ -26,6 +26,20 @@ async function post(base: string, pathname: string, body?: unknown): Promise<Res
   })
 }
 
+/** A workspace-authored conversation mode with zero exposure: no tools, no optional sources. */
+const ZERO_MODE_CONTENT = [
+  '---', 'name: Zero', 'toolExposure: []', 'workspaceInstructions: false',
+  'skills: off', 'memoryPinned: false', 'memoryRetrieval: false', '---', '', 'No tools.',
+].join('\n')
+
+function putZeroMode(base: string, wsId: string): Promise<Response> {
+  return fetch(`${base}/api/workspaces/${wsId}/modes/zero`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ content: ZERO_MODE_CONTENT }),
+  })
+}
+
 async function boot(provider: LlmProvider, extra?: Partial<Parameters<typeof createWebServer>[0]>) {
   const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g5-web-'))
   const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'providers.json'), ...extra })
@@ -256,9 +270,10 @@ describe('G5 web MCP + hooks', () => {
       const disabled = await post(base, `/api/workspaces/${wsId}/mcp/fixture/disable`)
       expect(disabled.status).toBe(200)
       await enabling.catch(() => undefined)
-      await new Promise((resolve) => setTimeout(resolve, 900))
-      const rows = (await (await fetch(`${base}/api/workspaces/${wsId}/mcp`)).json()) as { name: string; status: string }[]
-      expect(rows.find((row) => row.name === 'fixture')?.status).toBe('disabled')
+      await expect.poll(async () => {
+        const rows = (await (await fetch(`${base}/api/workspaces/${wsId}/mcp`)).json()) as { name: string; status: string }[]
+        return rows.find((row) => row.name === 'fixture')?.status
+      }, { timeout: 5_000, interval: 100 }).toBe('disabled')
       const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
       const requests: string[][] = []
       void requests
@@ -363,7 +378,7 @@ describe('G5 web MCP + hooks', () => {
     expect(seen.life?.[0]).not.toContain('mcp__fixture__query')
   }, 20_000)
 
-  it('Chat sends no MCP schemas; host blockedTools cannot be widened', async () => {
+  it('a zero-exposure mode sends no MCP schemas; host blockedTools cannot be widened', async () => {
     const requests: string[][] = []
     let requestNo = 0
     const provider: LlmProvider = {
@@ -383,8 +398,9 @@ describe('G5 web MCP + hooks', () => {
       transport: 'stdio', command: process.execPath, args: [mcpFixture], enabled: true, allowedTools: ['query'],
     })
     await post(base, `/api/workspaces/${wsId}/mcp/fixture/enable`)
+    expect((await putZeroMode(base, wsId)).status).toBe(200)
     await fetch(`${base}/api/workspaces/${wsId}/mode`, {
-      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: 'chat' }),
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: 'zero' }),
     })
     const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
     await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'hi' })

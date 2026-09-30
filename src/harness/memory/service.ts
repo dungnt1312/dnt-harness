@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
+import { replaceFileAtomic } from '../storage/events-jsonl.ts'
 import type { ProjectId, WorkspaceId } from '../../util/brand.ts'
 
 export interface MemoryEntry {
@@ -152,15 +153,16 @@ export class MemoryService {
     if (current.hash !== input.expectedHash) {
       throw new MemoryError('conflict', `memory entry '${input.id}' changed externally; re-read before updating`)
     }
+    const title = input.title ?? current.title
+    const body = input.body ?? current.body
+    if (title.trim() === '' || body.trim() === '') {
+      // Validate before publication: a rejected update must leave the last
+      // valid entry intact, just like create does.
+      throw new MemoryError('invalid', 'memory entries need a non-empty title and body')
+    }
     const now = Date.now()
-    const raw = serializeMemory(
-      input.title ?? current.title,
-      input.body ?? current.body,
-      input.pinned ?? current.pinned,
-      current.createdAt,
-      now,
-    )
-    await fs.writeFile(this.filePath(scope.workspaceId, scope.projectId, input.id), raw, 'utf8')
+    const raw = serializeMemory(title, body, input.pinned ?? current.pinned, current.createdAt, now)
+    await replaceFileAtomic(this.filePath(scope.workspaceId, scope.projectId, input.id), raw)
     return this.read(scope, input.id)
   }
 

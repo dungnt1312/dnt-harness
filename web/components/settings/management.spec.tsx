@@ -38,21 +38,22 @@ describe('agent panel', () => {
     expect(html).toContain('Create a role')
     // Spawning belongs to the conversation, not to Settings: the tab points
     // at the workbench instead of rendering controls nothing can act on.
-    expect(html).toContain('Agents view of the workbench')
+    expect(html).toContain('Subagents view of the workbench')
     expect(html).not.toContain('Spawn')
   })
 })
 
 describe('agent runs panel', () => {
-  it('explains the missing conversation instead of disabling a whole form', () => {
+  it('explains the missing conversation', () => {
     expect(renderToStaticMarkup(<AgentRunsPanel workspaceId="ws-1" rootSessionId={null} />)).toContain('No conversation selected')
-    expect(renderToStaticMarkup(<AgentRunsPanel workspaceId={null} rootSessionId={null} />)).toContain('Choose a workspace first')
+    expect(renderToStaticMarkup(<AgentRunsPanel workspaceId={null} rootSessionId={null} />)).toContain('No conversation selected')
   })
 
-  it('offers delegation once a conversation is open', () => {
+  it('follows runs once a conversation is open, with no delegation form', () => {
     const html = renderToStaticMarkup(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />)
-    expect(html).toContain('Delegate a task')
-    expect(html).toContain('Children')
+    expect(html).toContain('Active · 0/6')
+    expect(html).toContain('Ended · 0')
+    expect(html).not.toContain('Spawn')
   })
 
   it('a role pins its model as provider:model, and blank means inherit', () => {

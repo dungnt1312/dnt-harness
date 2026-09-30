@@ -13,6 +13,7 @@ import { useUploadQueue } from './useUploadQueue.ts'
 import { cn } from '../../lib/cn.ts'
 import { decodeModelChoice } from '../../lib/providers.ts'
 import {
+  builtinCompletionItem,
   completionAt,
   moveActive,
   rankSkills,
@@ -20,6 +21,7 @@ import {
   type CompletionItem,
   type CompletionRequest,
 } from '../../lib/composer-completion.ts'
+import { BUILTIN_COMMANDS, isBuiltinCommand } from '../../lib/inline-chips.ts'
 import {
   appendAttachments,
   draftIsEmpty,
@@ -91,7 +93,7 @@ const pastedTextFile = (text: string, date = new Date()): File => {
  */
 export function Composer({
   workspaceId = null, modelControl, contextControl, connected, sending = false, running,
-  draft, onDraft, onSend, onStop,
+  draft, onDraft, onSend, onStop, onCommand,
   modelValue, thinkingValue = null, modelSettings, onThinking, thinkingMenuLabel, thinkingDisabled = false,
   controlsUnavailable = false, controlsUnavailableMessage, onRetryControls,
   modes, modeValue, onMode,
@@ -109,6 +111,8 @@ export function Composer({
   readonly onDraft: (draft: RichDraft) => void
   readonly onSend: () => void
   readonly onStop: () => void
+  /** A built-in command was picked: the host executes it at once; nothing lands in the draft. */
+  readonly onCommand?: (name: string) => void
   readonly modelValue: string | null
   /** Workspace thinking override; null = the model's configured default. */
   readonly thinkingValue?: string | null
@@ -206,8 +210,10 @@ export function Composer({
 
   // ── Completion (`@` files, `/` skills) ─────────────────────────────────
 
-  // A menu with no source stays shut: `@` needs a project, `/` needs skills.
-  const available = request === null ? false : request.kind === 'file' ? onSearchFiles !== undefined : (skills ?? []).length > 0
+  // A menu with no source stays shut: `@` needs a project. `/` opens for the
+  // workspace skill catalog AND for the built-in commands, which are always
+  // there — `/compact` must not depend on the workspace having skills.
+  const available = request === null ? false : request.kind === 'file' ? onSearchFiles !== undefined : true
   const open = request !== null && available && dismissed !== signature(request)
   const fileSearch = open && request?.kind === 'file' ? onSearchFiles : undefined
   const fileQuery = request?.kind === 'file' ? request.query : null
@@ -229,7 +235,16 @@ export function Composer({
 
   useEffect(() => {
     if (!open || request?.kind !== 'skill') return
-    setItems(rankSkills(skills ?? [], request.query, MAX_SUGGESTIONS).map(skillCompletionItem))
+    // Built-in commands first, then the catalog. A skill whose name is a
+    // reserved command is shadowed: the namespace belongs to the host, so
+    // `/compact` can never silently degrade into a skill mention.
+    const skillItems = rankSkills(
+      (skills ?? []).filter((skill) => !isBuiltinCommand(skill.name)),
+      request.query,
+      MAX_SUGGESTIONS,
+    ).map(skillCompletionItem)
+    const commands = rankSkills(BUILTIN_COMMANDS, request.query, MAX_SUGGESTIONS).map(builtinCompletionItem)
+    setItems([...commands, ...skillItems].slice(0, MAX_SUGGESTIONS))
     setActive(0)
     setSearching(false)
   }, [open, request?.kind, request?.query, skills])
@@ -248,11 +263,21 @@ export function Composer({
 
   const pick = (item: CompletionItem): void => {
     if (request === null) return
-    const segment: DraftSegment = item.segment ?? { kind: 'text', text: `${item.insert} ` }
-    editor.current?.replaceAtCaret(request.start, request.end, segment)
     setRequest(null)
     setItems([])
     setSearching(false)
+    // Built-in commands execute the moment they are picked: a host action has
+    // no business sitting in the draft waiting for a second send. The typed
+    // trigger text is deleted, then only the editor focus stays ours to
+    // return.
+    if (item.id.startsWith('command:')) {
+      editor.current?.replaceAtCaret(request.start, request.end, { kind: 'text', text: '' })
+      editor.current?.focus()
+      onCommand?.(item.segment?.kind === 'command' ? item.segment.name : item.label.replace(/^\//, ''))
+      return
+    }
+    const segment: DraftSegment = item.segment ?? { kind: 'text', text: `${item.insert} ` }
+    editor.current?.replaceAtCaret(request.start, request.end, segment)
   }
 
   const mentionFile = (): void => {

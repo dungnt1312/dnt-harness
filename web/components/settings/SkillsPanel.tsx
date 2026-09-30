@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from 'react'
+import { useCallback, useEffect, type ReactNode } from 'react'
 import { useScopedState } from '../../hooks/useScopedState.ts'
 import Icon from '../common/Icon.tsx'
 import { Badge } from '../ui/Badge.tsx'
@@ -6,7 +6,7 @@ import { Button } from '../ui/Button.tsx'
 import { Field } from '../ui/Field.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
-import { deleteSkill, getSkill, listSkills, saveSkill } from '../../lib/api.ts'
+import { deleteSkill, getSkill, listSkills, saveSkill, setSkillHidden } from '../../lib/api.ts'
 import type { SkillRow } from '../../lib/types.ts'
 import {
   CodeArea,
@@ -119,11 +119,38 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
     await refresh()
   })
 
+  const toggleCatalog = (row: SkillRow): Promise<void> => run(`catalog:${row.name}`, async () => {
+    const next = !(row.hidden ?? false)
+    await setSkillHidden(workspaceId, row.name, next)
+    setNotice({
+      kind: 'ok',
+      text: next
+        ? `${row.name} is hidden from discovery; the model loads it only when the user names it.`
+        : `${row.name} is back in the skill catalog.`,
+    })
+    await refresh()
+  })
+
+  /** The catalog checkbox: checked means the model discovers this skill. */
+  const catalogCheckbox = (row: SkillRow): ReactNode => (
+    <label className="flex cursor-pointer items-center gap-1.5 text-[13px] text-fg-muted" title="List in the model's skill catalog">
+      <input
+        type="checkbox"
+        className="size-3.5 accent-primary"
+        aria-label={`Offer ${row.name} in the skill catalog`}
+        checked={!(row.hidden ?? false)}
+        disabled={busy !== null}
+        onChange={() => void toggleCatalog(row)}
+      />
+      In catalog
+    </label>
+  )
+
   const cannotSave = name === '' || content.trim() === '' || nameInvalid || nameTaken || unchanged
 
   return (
     <PanelBody>
-      <PanelIntro>Skills are SKILL.md instruction packages the model can load by name. User (~/.claude/skills) and bundled rows are read-only; workspace rows are yours and win on a name clash.</PanelIntro>
+      <PanelIntro>Skills are SKILL.md instruction packages the model can load by name. User (~/.claude/skills) and bundled rows are read-only; workspace rows are yours and win on a name clash. Untick “In catalog” to hide a skill from discovery — the model loads it only when the user names it.</PanelIntro>
       {notice !== null ? <Notice kind={notice.kind} text={notice.text} /> : null}
 
       {editing === null ? (
@@ -139,12 +166,17 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
                   key={row.name}
                   title={<><span className="break-all">{row.name}</span><Badge tone={row.source === 'workspace' ? 'blue' : 'gray'}>{row.source}</Badge></>}
                   meta={row.description !== '' ? row.description : row.title !== row.name ? row.title : undefined}
-                  actions={row.source === 'workspace' ? (
+                  actions={(
                     <>
-                      <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void openEditor(row)}>{busy === `open:${row.name}` ? 'Opening…' : 'Edit'}</Button>
-                      <IconButton label={`Delete ${row.name}`} disabled={busy !== null} onClick={() => setDeleteName(row.name)}><Icon name="trash" size={14} /></IconButton>
+                      {catalogCheckbox(row)}
+                      {row.source === 'workspace' ? (
+                        <>
+                          <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void openEditor(row)}>{busy === `open:${row.name}` ? 'Opening…' : 'Edit'}</Button>
+                          <IconButton label={`Delete ${row.name}`} disabled={busy !== null} onClick={() => setDeleteName(row.name)}><Icon name="trash" size={14} /></IconButton>
+                        </>
+                      ) : <span className="px-2 text-xs text-fg-faint">Read-only</span>}
                     </>
-                  ) : <span className="px-2 text-xs text-fg-faint">Read-only</span>}
+                  )}
                 >
                   {deleteName === row.name ? (
                     <InlineConfirm

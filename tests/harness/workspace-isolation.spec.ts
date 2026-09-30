@@ -1,7 +1,7 @@
 /**
  * G2 workspace isolation at the service boundary: workspace CRUD with the
- * file-first layout, idempotent migration, project binding with overlap
- * rejection, ownership fail-closed semantics, archive/delete guards, and
+ * file-first layout, idempotent migration, project binding (overlaps
+ * allowed), ownership fail-closed semantics, archive/delete guards, and
  * the app-local writer lease.
  */
 import { promises as fs } from 'node:fs'
@@ -108,21 +108,23 @@ describe('workspace lifecycle', () => {
 })
 
 describe('project binding', () => {
-  it('rejects overlapping and nested project roots within a workspace, but lets another workspace bind the same folder', async () => {
+  it('allows overlapping, nested and repeated project roots, within and across workspaces', async () => {
     const { ws } = await workspaces()
     await ws.boot()
     const a = await ws.create('WorkA')
     const b = await ws.create('WorkB')
 
     await ws.createProject(a.id, 'alpha', dirA)
-    // Inside one workspace, the same or a nested folder would make two
-    // projects claim the same files: refused.
-    await expect(ws.createProject(a.id, 'copy', dirA)).rejects.toMatchObject({ code: 'root-overlap' })
-    await expect(ws.createProject(a.id, 'nested', nested)).rejects.toMatchObject({ code: 'root-overlap' })
-    // Another workspace may bind the same folder (one repo, several
-    // workspaces); concurrent writers are still serialized by the root lease.
-    const copy = await ws.createProject(b.id, 'copy', dirA)
-    expect(copy.workspaceId).toBe(b.id)
+    // The same or a nested folder may be bound again — overlap is the
+    // user's call, and concurrent writers are serialized by the root lease.
+    const copy = await ws.createProject(a.id, 'copy', dirA)
+    expect(copy.workspaceId).toBe(a.id)
+    const nestedProject = await ws.createProject(a.id, 'nested', nested)
+    expect(nestedProject.workspaceId).toBe(a.id)
+    // Another workspace may bind the same folder too (one repo, several
+    // workspaces).
+    const elsewhere = await ws.createProject(b.id, 'copy', dirA)
+    expect(elsewhere.workspaceId).toBe(b.id)
     const beta = await ws.createProject(b.id, 'beta', dirB)
     expect(beta.workspaceId).toBe(b.id)
   })

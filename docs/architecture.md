@@ -77,7 +77,7 @@ concept, and the web host is the composition that wires them together:
 |---|---|
 | `storage/` | The file-first session store: `events.jsonl` is canonical, `summary.json` is a rebuildable index, with durability barriers and torn-tail quarantine |
 | `workspace/` | The workspace registry: workspaces, project binding, ownership checks at the service boundary, per-root writer leases |
-| `modes/` + `context/` | Five bundled + custom file modes; the single mode-driven context builder with budget, trim order, compaction, and a per-request manifest |
+| `modes/` + `context/` | Four bundled + custom file modes; the single mode-driven context builder with budget, trim order, compaction, and a per-request manifest |
 | `skills/` | Workspace skill files and the on-demand, mode-gated `Skill` tool |
 | `memory/` | Workspace/project-scoped Markdown memory and its five tools |
 | `agents/` | Agent definitions, bounded one-level delegation, and the Claude-first/Codex compatibility adapters |

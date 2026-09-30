@@ -387,18 +387,41 @@ export class SessionsService extends Service {
    */
   private async recover(session: Session): Promise<void> {
     const openTurns = new Set<string>()
-    const answered = new Set<string>()
+    const unansweredByExecution = new Map<string, Extract<SessionEvent, { type: 'tool/call' }>>()
+    const unansweredLegacy = new Map<string, Extract<SessionEvent, { type: 'tool/call' }>[]>()
     const decided = new Set<string>()
+    let currentTurn: string | undefined
+    const legacyKey = (turnId: string | undefined, stepId: string, callId: string): string =>
+      `${turnId ?? ''}\u0000${stepId}\u0000${callId}`
     for (const event of session.events) {
       switch (event.type) {
         case 'turn/start':
+          currentTurn = event.turnId
           openTurns.add(event.turnId)
           break
         case 'turn/end':
           openTurns.delete(event.turnId)
+          if (currentTurn === event.turnId) currentTurn = undefined
+          break
+        case 'tool/call':
+          if (event.executionId !== undefined) {
+            unansweredByExecution.set(event.executionId, event)
+          } else {
+            const key = legacyKey(currentTurn, event.stepId, event.call.id)
+            const queued = unansweredLegacy.get(key) ?? []
+            queued.push(event)
+            unansweredLegacy.set(key, queued)
+          }
           break
         case 'tool/result':
-          answered.add(event.callId)
+          if (event.executionId !== undefined) {
+            unansweredByExecution.delete(event.executionId)
+          } else {
+            const key = legacyKey(currentTurn, event.stepId, event.callId)
+            const queued = unansweredLegacy.get(key)
+            queued?.shift()
+            if (queued?.length === 0) unansweredLegacy.delete(key)
+          }
           break
         case 'approval/decision':
           decided.add(event.approvalId)
@@ -408,11 +431,15 @@ export class SessionsService extends Service {
       }
     }
 
-    for (const event of session.events) {
-      if (event.type !== 'tool/call' || answered.has(event.call.id)) continue
+    const unanswered = [
+      ...unansweredByExecution.values(),
+      ...[...unansweredLegacy.values()].flat(),
+    ]
+    for (const event of unanswered) {
       session.append({
         type: 'tool/result',
         stepId: event.stepId,
+        ...(event.executionId !== undefined ? { executionId: event.executionId } : {}),
         callId: event.call.id,
         ok: false,
         output: `recovery: outcome unknown — the host was interrupted after this call was recorded; inspect actual state before retrying`,

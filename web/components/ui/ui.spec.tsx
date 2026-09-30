@@ -69,15 +69,15 @@ describe('runtime provider UI helpers', () => {
     )
     expect(html).toContain('aria-modal="true"')
     expect(html).toContain('aria-label="Settings"')
-    expect((html.match(/role="tab"/g) ?? []).length).toBe(9)
+    expect((html.match(/role="tab"/g) ?? []).length).toBe(10)
     // Radix mounts the active panel only; each tab still owns a controls link.
     expect((html.match(/role="tabpanel"/g) ?? []).length).toBe(1)
-    expect((html.match(/aria-controls=/g) ?? []).length).toBeGreaterThanOrEqual(9)
+    expect((html.match(/aria-controls=/g) ?? []).length).toBeGreaterThanOrEqual(10)
     const tabTags = html.match(/<[a-z]+[^>]*role="tab"[^>]*>/g) ?? []
     expect(tabTags.filter((tag) => tag.includes('aria-selected="true"')).length).toBe(1)
     const labels = [...html.matchAll(/<button(?=[^>]*role="tab")[\s\S]*?<\/button>/g)]
       .map((match) => match[0].replace(/<[^>]+>/g, ''))
-    expect(labels).toEqual(['Providers', 'Projects', 'Permissions', 'Skills', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets'])
+    expect(labels).toEqual(['Providers', 'Projects', 'Permissions', 'System Prompts', 'Skills', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets'])
     expect(html).toContain('cliproxy1')
     // The model count belongs to the list it counts, not to the rail row too.
     expect(html).toContain('Model list')
@@ -182,11 +182,14 @@ describe('primitives', () => {
 
 describe('chat surfaces', () => {
   it('ToolCard shows the tool, its target and running state while pending', () => {
-    const html = renderToStaticMarkup(<ToolCard item={{ kind: 'tool', call: { id: 't1', name: 'read', args: { path: 'src/x.ts', limit: 5 } } }} />)
-    expect(html).toContain('read')
-    expect(html).toContain('src/x.ts')
-    expect(html).toContain('Running')
-    expect(html).toContain('aria-expanded="false"')
+    const pending = renderToStaticMarkup(<ToolCard item={{ kind: 'tool', call: { id: 't1', name: 'read', args: { path: 'src/x.ts', limit: 5 } } }} />)
+    // While pending the state spinner leads; the file's own glyph waits for the outcome.
+    expect(pending).toContain('animate-spin-slow')
+    expect(pending).toContain('Running')
+    expect(pending).toContain('src/x.ts')
+    expect(pending).toContain('aria-expanded="false"')
+    const settled = renderToStaticMarkup(<ToolCard item={{ kind: 'tool', call: { id: 't1', name: 'read', args: { path: 'src/x.ts', limit: 5 } }, result: { ok: true, output: 'x' } }} />)
+    expect(settled).toContain('/material-icons/typescript.svg')
   })
 
   it('ApprovalBar shows one card per pending call', () => {

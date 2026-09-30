@@ -28,6 +28,19 @@ export function isSkillName(name: string): boolean {
   return SKILL_NAME.test(name)
 }
 
+/**
+ * Built-in composer commands: host actions a workspace skill cannot be,
+ * reserved across every catalog. The `/` menu lists them before skills and a
+ * skill whose name collides is shadowed — the namespace belongs to the host.
+ */
+export const BUILTIN_COMMANDS: readonly { readonly name: string; readonly description: string }[] = [
+  { name: 'compact', description: 'Summarize older turns into a compaction checkpoint' },
+]
+
+export function isBuiltinCommand(name: string): boolean {
+  return BUILTIN_COMMANDS.some((command) => command.name === name)
+}
+
 /** The model-visible text of one chip. */
 export function chipWireText(segment: ChipSegment): string {
   if (segment.kind === 'command') return `Use the ${segment.name} skill:`
@@ -43,7 +56,8 @@ export function chipLabel(segment: ChipSegment): string {
 
 /** Hover text naming exactly what the chip carries. */
 export function chipTitle(segment: ChipSegment): string {
-  return segment.kind === 'command' ? `Skill: ${segment.name}` : `Project file: ${segment.path}`
+  if (segment.kind !== 'command') return `Project file: ${segment.path}`
+  return isBuiltinCommand(segment.name) ? `Command: ${segment.name}` : `Skill: ${segment.name}`
 }
 
 /** Serialize editor segments into the message the model reads. */

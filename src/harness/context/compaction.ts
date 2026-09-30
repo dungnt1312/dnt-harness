@@ -70,9 +70,40 @@ export class CheckpointStore {
 export type Summarizer = (input: { readonly text: string; readonly model?: string }) => Promise<string>
 
 /**
+ * The instruction block an LLM-backed summarizer prepends to the covered
+ * conversation. Structured sections (Claude-Code-style): the summary REPLACES
+ * the covered history entirely, so every heading exists because losing that
+ * category is what breaks continuation.
+ */
+export const COMPACT_SUMMARY_PROMPT = [
+  'You are compacting an earlier portion of a coding-assistant conversation.',
+  'The summary you write will REPLACE the covered conversation entirely in a fresh context window: anything you omit is forgotten, so be complete and concrete.',
+  '',
+  'Summarize the conversation inside <conversation> under these headings, keeping the headings:',
+  '',
+  'Primary Request and Intent — what the user asked for, with their key constraints and preferences, in their words where it matters.',
+  'Key Decisions and Context — decisions made, requirements agreed, project constraints, and user corrections.',
+  'Work Done — what was actually done: tool calls run, files created or changed (exact paths), commands executed, and their outcomes.',
+  'Errors and Fixes — problems hit and how each was resolved; unresolved problems go under Current State.',
+  'Current State — where things stand at the end of the covered conversation.',
+  'Next Steps — outstanding work and the explicit next actions, if any.',
+  '',
+  'Rules:',
+  '- Preserve exact file paths, commands, identifiers, error messages, and numbers.',
+  '- Be dense: no filler, no praise, no restating these instructions.',
+  '- Write in the same language as the conversation.',
+  '- Output ONLY the summary text, nothing else.',
+].join('\n')
+
+/**
  * Compact one session through `summarizer` at a COMPLETED exchange
  * boundary. Refuses while a turn is open — compaction never runs mid-Turn.
- * The summary has no side effects and never promotes into memory.
+ * The attempt is durably visible: `compaction/start` opens the transaction
+ * before the summarizer runs, and `compaction/end` closes it — carrying the
+ * stored summary, or `error` when the attempt failed. A crash between the
+ * two leaves the dangling start honest; no end ever claims success without
+ * a checkpoint on disk. The summary has no side effects and never promotes
+ * into memory.
  */
 export async function compactSession(
   session: Session,
@@ -95,21 +126,53 @@ export async function compactSession(
     throw new Error('compaction requires a completed exchange boundary (no open turn)')
   }
 
-  const text = projectForSummary(events, lastEnd)
-  const trimmed = options.maxChars !== undefined && text.length > options.maxChars ? text.slice(0, options.maxChars) : text
-  const summary = await summarizer({ text: trimmed, ...(options.model !== undefined ? { model: options.model } : {}) })
-  const checkpoint: CompactionCheckpoint = {
-    v: 1,
-    coversSeq: lastEnd,
-    summary,
-    provenance: {
-      ...(options.model !== undefined ? { model: options.model } : {}),
-      createdAt: Date.now(),
+  const startedAt = Date.now()
+  session.append({
+    type: 'compaction/start',
+    trigger: options.trigger,
+    ...(options.model !== undefined ? { model: options.model } : {}),
+  })
+  await session.durable()
+  try {
+    const text = projectForSummary(events, lastEnd)
+    const trimmed = options.maxChars !== undefined && text.length > options.maxChars ? text.slice(0, options.maxChars) : text
+    const summary = await summarizer({ text: trimmed, ...(options.model !== undefined ? { model: options.model } : {}) })
+    const checkpoint: CompactionCheckpoint = {
+      v: 1,
+      coversSeq: lastEnd,
+      summary,
+      provenance: {
+        ...(options.model !== undefined ? { model: options.model } : {}),
+        createdAt: Date.now(),
+        trigger: options.trigger,
+      },
+    }
+    await checkpoints.save(session.id, checkpoint)
+    session.append({
+      type: 'compaction/end',
       trigger: options.trigger,
-    },
+      ...(options.model !== undefined ? { model: options.model } : {}),
+      coversSeq: checkpoint.coversSeq,
+      summaryChars: summary.length,
+      durationMs: Date.now() - startedAt,
+      summary,
+    })
+    await session.durable()
+    return checkpoint
+  } catch (cause) {
+    // The failed attempt stays in the log: the reason outlives the console.
+    session.append({
+      type: 'compaction/end',
+      trigger: options.trigger,
+      ...(options.model !== undefined ? { model: options.model } : {}),
+      coversSeq: lastEnd,
+      summaryChars: 0,
+      durationMs: Date.now() - startedAt,
+      error: String(cause instanceof Error ? cause.message : cause),
+    })
+    await session.durable().catch(() => {})
+    throw cause
   }
-  await checkpoints.save(session.id, checkpoint)
-  return checkpoint
 }
 
 /** Model-visible projection (same shape deriveMessages covers) as flat text. */

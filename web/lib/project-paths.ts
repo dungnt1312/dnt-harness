@@ -1,3 +1,12 @@
+import type { FileFocus } from './tool-facts.ts'
+
+/**
+ * Returns an opener when a recorded path resolves inside the project, else
+ * null. `focus` is the window the call named, so the viewer can land on the
+ * lines the call actually read instead of the top of the file.
+ */
+export type OpenPathResolver = (reference: string, focus?: FileFocus) => (() => void) | null
+
 /**
  * Map a path recorded in a tool call to a project-relative workbench path.
  * Absolute paths must sit inside the project root (case-insensitive on

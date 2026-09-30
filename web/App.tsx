@@ -19,6 +19,7 @@ import {
   listSessionsIn,
   listSkills,
   listWorkspaces,
+  compactSession,
   renameSessionIn,
   setSessionPinnedIn,
   searchProjectFiles,
@@ -55,6 +56,7 @@ import { ChatHeader } from './components/layout/ChatHeader.tsx'
 import { ScopeControl } from './components/layout/ScopeControl.tsx'
 import { composerChipClass } from './components/composer/composer-chip.ts'
 import { Workbench } from './components/workbench/Workbench.tsx'
+import { TerminalDock } from './components/workbench/TerminalDock.tsx'
 import { useWorkbenchFiles } from './hooks/useWorkbenchFiles.ts'
 import { usePanelResize } from './hooks/usePanelResize.ts'
 import { toProjectRelative } from './lib/project-paths.ts'
@@ -70,7 +72,7 @@ import { SessionFoldersChip } from './components/composer/SessionFoldersChip.tsx
 import { FolderPickerModal } from './components/composer/FolderPickerModal.tsx'
 import ConfirmDialog from './components/common/ConfirmDialog.tsx'
 import type { ContextManifestView } from './lib/api.ts'
-import type { CompletionItem } from './lib/composer-completion.ts'
+import { builtinCommandIn, draftIsOnlyCommand, type CompletionItem } from './lib/composer-completion.ts'
 import type { ModelDefaults, ProjectRow, SessionListing, SessionModel, SkillRow, WorkspaceMeta, WorkspaceRow } from './lib/types.ts'
 
 /** The sidebar docks beside the conversation at this width; below it is a drawer. */
@@ -373,6 +375,8 @@ function AppShell() {
   const currentRef = useRef(current)
   currentRef.current = current
   const sendingRef = useRef(new Set<string>())
+  /** Conversations with a compaction in flight; one at a time each. */
+  const compactingRef = useRef(new Set<string>())
   /**
    * Sessions created by this tab whose listing has not caught up yet. The
    * membership guards must not treat a just-created conversation as invalid:
@@ -420,6 +424,14 @@ function AppShell() {
     max: PANEL_LIMITS.right.max,
     defaultWidth: PANEL_LIMITS.right.default,
     onChange: (rightWidth) => patchPreferences({ rightWidth }),
+  })
+  const terminalResize = usePanelResize({
+    width: preferences.terminalHeight,
+    min: PANEL_LIMITS.terminal.min,
+    max: PANEL_LIMITS.terminal.max,
+    defaultWidth: PANEL_LIMITS.terminal.default,
+    side: 'bottom',
+    onChange: (terminalHeight) => patchPreferences({ terminalHeight }),
   })
 
   // A route-selected session becomes streamable only after the current
@@ -474,9 +486,10 @@ function AppShell() {
     if (relative === null) return null
     return () => {
       openWorkbenchFile(relative, focus)
+      patchPreferences({ inspectorTab: 'files' })
       onWorkbenchOpenChange(true)
     }
-  }, [workbenchProject, openWorkbenchFile, onWorkbenchOpenChange])
+  }, [workbenchProject, openWorkbenchFile, patchPreferences, onWorkbenchOpenChange])
   const draftProjectName = useMemo(
     () => projects.find((project) => project.id === effectiveDraftProject)?.name,
     [projects, effectiveDraftProject],
@@ -747,26 +760,28 @@ function AppShell() {
     return () => { cancelled = true }
   }, [activeWs])
 
-  // A different conversation never shows the previous one's context.
-  useEffect(() => {
-    setManifest(null)
-  }, [activeWs, current])
-
-  // Composer context meter + inspector: refresh the last request's manifest
-  // when the conversation settles. The previous value stays up during a run.
+  // Session whose manifest is currently on screen. A change means the user
+  // switched conversations, which fetches at once; the same session refreshes
+  // on a short delay after a turn settles.
+  const manifestSession = useRef<string | null>(null)
+  // Composer context meter + inspector. The previous figures stay up until
+  // the selected conversation's manifest arrives, so the meter never flashes
+  // empty. An in-flight turn keeps what it last showed.
   useEffect(() => {
     if (activeWs === null || current === null || running) return
+    const switched = manifestSession.current !== `${activeWs}:${current}`
+    manifestSession.current = `${activeWs}:${current}`
     let cancelled = false
     const timer = setTimeout(() => {
       void fetchManifest(activeWs, current).then(
         (view) => {
-          if (!cancelled) setManifest(view)
+          if (!cancelled && currentRef.current === current && workspaceRef.current === activeWs) setManifest(view)
         },
         () => {
-          if (!cancelled) setManifest(null)
+          if (!cancelled && currentRef.current === current && workspaceRef.current === activeWs) setManifest(null)
         },
       )
-    }, 600)
+    }, switched ? 0 : 600)
     return () => {
       cancelled = true
       clearTimeout(timer)
@@ -794,10 +809,50 @@ function AppShell() {
     if (!sidebarDocked) setSidebarOpen(false)
   }, [activeWs, navigate, sidebarDocked])
 
+  /** Runs a built-in composer command through the host: the model is never involved. */
+  const runBuiltinCommand = useCallback(async (name: string): Promise<void> => {
+    if (name !== 'compact') return
+    if (activeWs === null || current === null) {
+      toast.notify('/compact runs on an open conversation — send the first message first.')
+      return
+    }
+    // One compaction per conversation at a time: a second pick while the
+    // summarizer is running would only race the boundary check.
+    if (compactingRef.current.has(current)) return
+    compactingRef.current.add(current)
+    try {
+      const result = await compactSession(activeWs, current)
+      toast.notify(`Compacted — ${result.summaryChars} chars summarized through seq ${result.coversSeq}.`, 'ok')
+    } catch (cause) {
+      toast.notify(String(cause))
+    } finally {
+      compactingRef.current.delete(current)
+    }
+  }, [activeWs, current, toast])
+
   const send = useCallback(async () => {
     // Read at call time: the app does not re-render for draft edits.
     const composer = composers.get()[key] ?? emptyComposer
     const { draft } = composer
+    // Fallback for a built-in chip that reached the draft anyway (restored
+    // drafts, reuse): the chip never reaches the wire, and a mixed draft is
+    // refused rather than half-sent. The live path executes on pick.
+    const builtin = builtinCommandIn(draft)
+    if (builtin !== null) {
+      if (!draftIsOnlyCommand(draft, builtin)) {
+        toast.notify(`/${builtin} runs on its own — clear the rest of the draft first.`)
+        return
+      }
+      if (sendingRef.current.has(key)) return
+      sendingRef.current.add(key)
+      try {
+        await runBuiltinCommand(builtin)
+        updateComposer(key, (state) => acceptedDraft(state, composer.revision))
+      } finally {
+        sendingRef.current.delete(key)
+      }
+      return
+    }
     if (sendingRef.current.has(key) || draftIsEmpty(draft) || modelValue === null || activeWs === null) return
     if (current === null && modelDefaultsCoordinator.current.isPending()) return
     if (current !== null && sessionModelQueue.current.isPending(sessionModelKey(activeWs, current))) return
@@ -852,7 +907,7 @@ function AppShell() {
       sendingRef.current.delete(sourceKey)
       updateComposer(targetKey, (state) => ({ ...state, sending: false }))
     }
-  }, [current, composers, key, modelValue, activeWs, effectiveDraftProject, navigate, projects, refreshList, refreshWorkspaces])
+  }, [current, composers, key, modelValue, activeWs, effectiveDraftProject, navigate, projects, refreshList, refreshWorkspaces, toast, runBuiltinCommand])
 
   const stop = useCallback(async () => {
     if (current === null || activeWs === null) return
@@ -1054,10 +1109,18 @@ function AppShell() {
     }
   }, [newWorkspaceName, refreshWorkspaces, switchWorkspace, toast])
 
+  const toggleTerminal = useCallback(() => {
+    // Ctrl+` belongs to the chat footer. The workbench has its own Terminal
+    // tab, opened from the view picker rather than this shortcut.
+    patchPreferences({ terminalOpen: !preferences.terminalOpen })
+  }, [preferences.terminalOpen, patchPreferences])
+
   useHotkeys([
     { key: 'n', mod: true, onPress: beginConversation },
     { key: 'k', mod: true, onPress: () => onLeftOpenChange(true) },
     { key: ',', mod: true, onPress: () => setSettingsOpen(true) },
+    // Editors open the terminal with Ctrl+`. It must work from the composer.
+    { key: '`', mod: true, allowInEditable: true, onPress: toggleTerminal },
   ])
 
 
@@ -1199,6 +1262,7 @@ function AppShell() {
       connected={stream === 'open' || current === null}
       running={running}
       onSend={() => void send()}
+      onCommand={(name) => void runBuiltinCommand(name)}
       onStop={() => void stop()}
       modelValue={modelValue}
       controlsUnavailable={sessionControlsUnavailable || defaultControlsUnavailable || sessionControlsPending || defaultControlsPending}
@@ -1244,8 +1308,6 @@ function AppShell() {
       onView={(view) => patchPreferences({ inspectorTab: view })}
       views={preferences.inspectorViews}
       onViews={(views) => patchPreferences({ inspectorViews: views })}
-      terminalShell={preferences.terminalShell}
-      onTerminalShell={(shellId) => patchPreferences({ terminalShell: shellId })}
       files={workbenchFiles}
       events={events}
       expanded={workbenchExpanded}
@@ -1253,10 +1315,23 @@ function AppShell() {
       onClose={() => onWorkbenchOpenChange(false)}
       openPath={openRecordedPath}
       sessionId={current}
-      modelOptions={availableModelOptions}
       onOpenChild={openSession}
-      onOpenAgentSettings={() => openSettings('agents')}
+      terminalShell={preferences.terminalShell}
+      onTerminalShell={(shellId) => patchPreferences({ terminalShell: shellId })}
       context={{ meta, ...(modelDefaults !== null ? { globalDefaults: modelDefaults } : {}), ...(currentSessionModel !== undefined ? { sessionModel: currentSessionModel } : {}), ...(current !== null && currentSessionModelState?.status === 'loading' ? { sessionControlsStatus: 'loading' as const } : {}), ...(current !== null && currentSessionModelState?.status === 'error' ? { sessionControlsStatus: 'unavailable' as const } : {}), stream, sessionId: current, sessionFolder: currentProject?.path ?? null, eventCount: events.length, manifest, workspaceId: activeWs, running, modeLabel: envModeLabel, onCompacted: () => setCompactNonce((nonce) => nonce + 1), onOpenSettingsTab: (tab) => openSettings(tab) }}
+    />
+  )
+
+  const terminalDock = (
+    <TerminalDock
+      workspaceId={activeWs}
+      projectId={workbenchProject?.id ?? null}
+      height={preferences.terminalHeight}
+      resizeHandle={terminalResize}
+      open={preferences.terminalOpen}
+      onOpenChange={(terminalOpen) => patchPreferences({ terminalOpen })}
+      defaultShell={preferences.terminalShell}
+      onDefaultShell={(shellId) => patchPreferences({ terminalShell: shellId })}
     />
   )
 
@@ -1361,6 +1436,7 @@ function AppShell() {
               </section>
             </>
           )}
+          {terminalDock}
         </main>
 
         {workbenchDocked && workbenchOpen ? (

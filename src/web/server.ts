@@ -29,8 +29,8 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AgentsService } from '../harness/agent/service.ts'
 import { agentScope, type AgentScope } from '../harness/agent/scope.ts'
-import type { GrantedRoot, PreExecuteDecision, ToolExecution } from '../harness/tools/types.ts'
-import { classifyTarget, samePath, targetPaths, within } from '../capabilities/fs/grants.ts'
+import type { GrantedRoot } from '../harness/tools/types.ts'
+import { within } from '../capabilities/fs/grants.ts'
 import { mergeGrants, parseAccess, projectGrants, validateGrantFolder, type GrantPolicy } from './folder-grants.ts'
 import { approvedPathOf, attachPathScopeGuard, type PathScopeGuard, type PathScopeMatch } from './path-scope-guard.ts'
 import type { Agent } from '../harness/agent/agent.ts'
@@ -44,13 +44,14 @@ import { isThinkingLevel, resolveContextLimit } from '../harness/llm/model-catal
 import type { LlmProvider, TokenUsage, ToolCall } from '../harness/llm/types.ts'
 import { fileSessions, SessionsService } from '../harness/session/service.ts'
 import type { Session } from '../harness/session/session.ts'
-import { sessionGrantsOf, sessionModelOf, type SessionEvent, type SessionGrant, type SessionGrants } from '../harness/session/events.ts'
+import { sessionGrantsOf, sessionModeOf, sessionModelOf, type SessionEvent, type SessionGrant, type SessionGrants } from '../harness/session/events.ts'
 import { deriveTitle } from '../harness/session/title.ts'
 import { newInputId, type ProjectId, type SessionId, type WorkspaceId } from '../util/brand.ts'
 import { ToolsService } from '../harness/tools/service.ts'
 import { bashTool } from '../capabilities/shell/bash.ts'
 import { fsTools } from '../capabilities/fs/tools.ts'
 import { listProjectEntries, readProjectFile, searchProjectFiles, ProjectFileError } from './project-files.ts'
+import { gitDiff, gitStatus, ProjectGitError } from './project-git.ts'
 import {
   AttachmentError,
   AttachmentStore,
@@ -81,6 +82,7 @@ import {
 } from './provider-store.ts'
 import { ScopeError, WorkspaceService, type AdditionalDirectory, type ProjectRecord, type WorkspaceRecord } from '../harness/workspace/service.ts'
 import { ModesService, ModeError, DEFAULT_MODE_ID, BUNDLED_MODES, type ResolvedMode } from '../harness/modes/service.ts'
+import { migrateRootModes } from '../harness/modes/root-migration.ts'
 import { AgentDefinitionService, AgentDefinitionError } from '../harness/agents/definition-service.ts'
 import {
   McpConfigStore,
@@ -111,24 +113,20 @@ import { stageMcpOutcome } from '../harness/mcp/staged-outcome.ts'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { runHook, isBlockingDecision, isFailureDecision } from '../harness/hooks/runner.ts'
 import type { HooksConfig } from '../harness/mcp/config.ts'
-import { ChildExecutor, SpawnError, type ChildModel, type TaskPacket } from '../harness/agents/executor.ts'
+import { ChildExecutor, SpawnError, normalizeBrief, type ChildModel, type TaskPacket } from '../harness/agents/executor.ts'
 import { agentTool, ChildModelError, projectInheritedMessages, resolveChildModel } from './agent-delegation.ts'
 import { importClaudeDefinition } from '../harness/agents/compatibility/claude.ts'
 import { SkillsService, SkillError } from '../harness/skills/service.ts'
 import { MemoryService, MemoryError } from '../harness/memory/service.ts'
 import { memoryTools } from '../harness/memory/tools.ts'
-import { buildContext, type ContextManifest, type ActiveSkill, type MemorySnippet } from '../harness/context/builder.ts'
+import { buildContext, DEFAULT_BASE_SYSTEM, DEFAULT_CHILD_SYSTEM, type ContextManifest, type ActiveSkill, type MemorySnippet } from '../harness/context/builder.ts'
+import { SystemPromptsStore, type SystemPromptsSnapshot } from '../harness/prompts/store.ts'
 import { CheckpointStore } from '../harness/context/compaction.ts'
+import { createCompactionSummarizer } from './llm-summarizer.ts'
 import { DEFAULT_BUDGET, type ResolvedBudget } from '../harness/context/budget.ts'
 
 declare module 'mini-dsh' {
   interface Events {
-    /**
-     * G4 writer handoff: a write-capable child is starting, so the root
-     * session's held project leases release at this safe boundary (the
-     * root's next write call re-acquires only after the child settles).
-     */
-    'agent/child-writer-handoff'(payload: { readonly rootSessionId: SessionId; readonly childSessionId: SessionId }): Promise<void>
     /**
      * A tool call is waiting for a human answer on one session; emitted by
      * the web approval bridge and consumed by that session's SSE stream.
@@ -346,6 +344,8 @@ interface SessionEntry {
 
 interface PendingApproval {
   readonly sessionId: SessionId
+  /** Host execution identity: per-call state keys never use the model call id. */
+  readonly executionId?: string
   readonly workspaceId: WorkspaceId
   /** Browser principal that started the turn, when control-plane auth is on. */
   readonly principalId?: string
@@ -521,6 +521,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const skills = new SkillsService(resourceHome, undefined, options.userSkillsDir)
   const memory = new MemoryService(resourceHome)
   const checkpoints = new CheckpointStore(path.join(resourceHome, 'workspaces'))
+  // Workspace-authored system prompt replacements (Settings → System Prompts).
+  const systemPrompts = new SystemPromptsStore(resourceHome)
   kernel.ctx.provide('modes', modes)
   kernel.ctx.provide('skills', skills)
   kernel.ctx.provide('memory', memory)
@@ -746,6 +748,18 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   }
 
   /**
+   * The pair host-side maintenance calls run on (compaction summaries): the
+   * session's effective selection, resolved like any request's. Undefined
+   * when nothing resolves — compaction then falls back to the bounded
+   * extractive summarizer instead of refusing to compact.
+   */
+  const summarizerModelOf = (session: Session): { readonly providerName: string; readonly model: string } | undefined => {
+    const effective = resolveEffectiveModel(session, workspaces.defaultWorkspace)
+    if (effective.provider === null || effective.provider === undefined || effective.model === null || effective.model === undefined) return undefined
+    return { providerName: effective.provider, model: effective.model }
+  }
+
+  /**
    * The pair a delegated child runs on: the caller's choice, else the role's
    * own `model:`, else the parent conversation's selection. Resolved here and
    * stamped into the child's log at spawn, so the child never re-inherits a
@@ -874,106 +888,11 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   }
   kernel.ctx.tools.register(bashTool({ timeoutMs: limits.toolTimeoutMs }))
 
-  // Writer coordination (G2): one write-capable TURN per project folder.
-  // The first write-capable gate acquires the root; it is HELD until the
-  // turn settles (`agent/turn-settled` fires on every terminalization), so
-  // two turns cannot interleave writes between tool calls. Direct
-  // executions outside a running agent keep the per-call shape.
-  // Application-local only — external editors and unrestricted shell
-  // writes elsewhere are outside its reach (documented, not claimed away).
-  const WRITE_CAPABLE = new Set(['Write', 'Edit', 'Bash'])
-  const heldLeases = new Map<SessionId, Set<string>>() // sessionId -> roots
-  /** Acquire `root` for this call (held to turn end inside a live turn). */
-  const withLease = async (root: string, next: () => Promise<PreExecuteDecision>): Promise<PreExecuteDecision> => {
-    const sessionId = agentScope.getStore()?.sessionId
-    if (sessionId === undefined) return next()
-    const perTurn = heldLeases.get(sessionId as SessionId)
-    if (perTurn?.has(root) === true) return next() // already held for this turn
-    try {
-      await workspaces.acquireRoot(root, sessionId)
-    } catch (error) {
-      if (error instanceof ScopeError) {
-        return { kind: 'deny', reason: `project busy: ${error.message}` }
-      }
-      throw error
-    }
-    const entry = sessions.get(sessionId as SessionId)
-    if (entry !== undefined && entry.agent.busy) {
-      // Inside a live turn: hold the lease until the turn settles.
-      const sid = sessionId as SessionId
-      const held = heldLeases.get(sid) ?? new Set<string>()
-      held.add(root)
-      heldLeases.set(sid, held)
-      return next()
-    }
-    try {
-      return await next()
-    } finally {
-      await workspaces.releaseRoot(root, sessionId)
-    }
-  }
-  /**
-   * Where a Write/Edit lands relative to the primary root: `undefined` when
-   * it writes inside the primary (the primary lease covers it), else the
-   * lease key for the folder it writes into — the outermost registered
-   * project folder containing the target (so it contends with that
-   * project's own sessions), else its granted folder, else (approved
-   * out-of-grant) the target's parent folder.
-   */
-  const foreignLeaseKey = (call: ToolCall, exec: ToolExecution): string | undefined => {
-    const target = targetPaths(call)[0]
-    if (target === undefined || target.intent !== 'write') return undefined
-    const classified = classifyTarget(exec, target.target, 'write')
-    if (classified.kind === 'in-grant' && samePath(classified.root.path, exec.root)) return undefined
-    if (classified.kind !== 'in-grant' && classified.kind !== 'out-of-grant') return undefined
-    let outermost: string | undefined
-    for (const workspace of workspaces.list({ includeArchived: true })) {
-      for (const project of workspaces.listProjects(workspace.id)) {
-        if (within(project.path, classified.abs) && (outermost === undefined || within(project.path, outermost))) outermost = project.path
-      }
-    }
-    return outermost ?? (classified.kind === 'in-grant' ? classified.root.path : path.dirname(classified.abs))
-  }
-  kernel.ctx.on('tools/pre-execute', async (payload, next) => {
-    if (!WRITE_CAPABLE.has(payload.call.name) || payload.exec.root === '') return next()
-    // Writes into another folder lease that folder AFTER approval (below).
-    if (foreignLeaseKey(payload.call, payload.exec) !== undefined) return next()
-    return withLease(payload.exec.root, () => next())
-  })
-  /** True when any live turn holds a write lease inside `folder`. */
-  const leaseHeldInside = (folder: string): boolean => {
-    for (const roots of heldLeases.values()) {
-      for (const root of roots) {
-        if (within(folder, root)) return true
-      }
-    }
-    return false
-  }
-  kernel.ctx.on('agent/turn-settled', async (state) => {
-    void state
-    // The event fires inside the agent scope: release exactly the settling
-    // session's leases.
-    const sessionId = agentScope.getStore()?.sessionId
-    if (sessionId === undefined) return
-    const roots = heldLeases.get(sessionId)
-    if (roots === undefined) return
-    for (const root of roots) {
-      await workspaces.releaseRoot(root, sessionId)
-    }
-    heldLeases.delete(sessionId)
-  })
-
-  // G4 writer handoff: when a write-capable child spawns, the root's held
-  // leases release at this safe boundary so the child cannot deadlock on a
-  // lease its parent still holds while waiting for it.
-  kernel.ctx.on('agent/child-writer-handoff', async (payload) => {
-    const roots = heldLeases.get(payload.rootSessionId)
-    if (roots === undefined) return
-    for (const root of roots) {
-      await workspaces.releaseRoot(root, payload.rootSessionId)
-    }
-    heldLeases.delete(payload.rootSessionId)
-  })
+  // Root sessions share project files, not a writer lease. Native Write/Edit
+  // validate observed file state under a short canonical-path lock; Bash and
+  // external processes remain shared-state operations without isolation.
+  const leaseHeldInside = (folder: string): boolean =>
+    [...sessions.values()].some((entry) => entry.agent.busy && entry.projectId !== undefined && within(folder, workspaces.getProject(entry.projectId, entry.workspaceId).path))
 
   // Turn-local skill snapshots: the FIRST load in a turn pins content and
   // hash for the whole turn — external edits apply to FUTURE loads, never
@@ -988,28 +907,57 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     }
   })
 
-  // Automatic compaction (G3): when enabled, a completed boundary whose
-  // projected log exceeds the threshold compacts once. Failures surface
-  // (console) and never loop — the next boundary may try again.
+  /**
+   * Runs PreCompact hooks for a compaction attempt, appending durable
+   * hook/run events. Shared by the manual route and the automatic trigger —
+   * hooks gate both. Returns the blocking reason when a hook denies
+   * compaction, or undefined when compaction may proceed.
+   */
+  const runPreCompactHooks = async (session: Session, workspaceId: WorkspaceId): Promise<string | undefined> => {
+    const hooks = await mcpStore.loadHooks(workspaceId)
+    for (const binding of hooks.hooks['PreCompact'] ?? []) {
+      const decision = await runHook(binding, { hook_event: 'PreCompact', sessionId: session.id, workspaceId })
+      session.append({ type: 'hook/run', event: 'PreCompact', matcher: binding.matcher, exitCode: decision.exitCode, durationMs: decision.durationMs, decision: isBlockingDecision(decision) ? 'block' : isFailureDecision(decision) ? `failure:${binding.onFailure}` : 'allow' })
+      await session.durable()
+      if (isBlockingDecision(decision) || (isFailureDecision(decision) && binding.onFailure === 'deny')) {
+        return `PreCompact hook blocked compaction: ${binding.command}`
+      }
+    }
+    return undefined
+  }
+
+  // Automatic compaction (G3): when enabled, a completed boundary whose last
+  // request's context pressure reaches the threshold compacts once. Pressure
+  // reads the session's newest context manifest — the same token budget the
+  // inspector shows — not a character projection. Failures surface (console)
+  // and never loop; the next boundary may try again.
   kernel.ctx.on('agent/turn-settled', async () => {
-    if (limits.automaticCompactionChars <= 0) return
+    if (limits.automaticCompactionPressure <= 0) return
     const scope = agentScope.getStore()
     if (scope?.sessionId === undefined || scope.workspaceId === undefined) return
+    const entry = sessions.get(scope.sessionId)
+    if (entry === undefined) return
     try {
-      const entry = depsRef.current?.sessions.get(scope.sessionId)
-      if (entry === undefined) return
-      const projected = entry.session.events.reduce((total, event) => {
-        const text = (event as { content?: string; output?: string }).content ?? (event as { output?: string }).output ?? ''
-        return total + text.length
-      }, 0)
-      if (projected < limits.automaticCompactionChars) return
+      const manifest = lastManifests.get(scope.sessionId)
+      if (manifest === undefined) return
+      const { usedTokens, availableTokens } = manifest.budget
+      if (availableTokens <= 0 || usedTokens / availableTokens < limits.automaticCompactionPressure) return
+      const lastSeq = entry.session.events[entry.session.events.length - 1]?.seq ?? 0
       const latest = await checkpoints.latest(scope.sessionId).catch(() => undefined)
-      if (latest !== undefined && latest.coversSeq >= (entry.session.events[entry.session.events.length - 1]?.seq ?? 0)) return
+      if (latest !== undefined && latest.coversSeq >= lastSeq) return
+      const blocked = await runPreCompactHooks(entry.session, scope.workspaceId)
+      if (blocked !== undefined) {
+        console.error(`web: automatic compaction skipped for ${scope.sessionId}: ${blocked}`)
+        return
+      }
+      const pair = summarizerModelOf(entry.session)
       const { compactSession } = await import('../harness/context/compaction.ts')
-      await compactSession(entry.session, checkpoints, async ({ text }) => {
-        const lines = text.split('\n').filter((line) => line.trim() !== '')
-        return lines.slice(0, 120).join('\n')
-      }, (() => { const model = deps.defaults().model; return model !== null ? { trigger: 'automatic' as const, model } : { trigger: 'automatic' as const } })())
+      await compactSession(
+        entry.session,
+        checkpoints,
+        createCompactionSummarizer((request) => kernel.ctx.llm.stream(request), pair),
+        pair !== undefined ? { trigger: 'automatic', model: pair.model } : { trigger: 'automatic' },
+      )
     } catch (error) {
       // Surfaced, bounded: no retry loop.
       console.error(`web: automatic compaction failed for ${scope.sessionId}: ${String(error instanceof Error ? error.message : error)}`)
@@ -1064,7 +1012,10 @@ ${decision.injected}`, ...contents]
   // `turn/end: completed` never hides active work.
   kernel.ctx.on('agent/turn-stopping', async (state) => {
     const scope = agentScope.getStore()
-    if (scope?.sessionId === undefined) return
+    if (scope?.sessionId === undefined || scope.childOf !== undefined) return
+    // Close admission durably before enumerating children: a concurrent HTTP
+    // spawn cannot slip in after cleanup has taken its snapshot.
+    await depsRef.current?.childExecutor.closeTurn(scope.sessionId, state.turnId)
     const cancelled = await depsRef.current?.childExecutor.resolveForRootCompletion(
       scope.sessionId,
       state.turnId,
@@ -1173,27 +1124,53 @@ ${decision.injected}`, ...contents]
     return result
   })
 
-  // The Skill tool: on-demand loading only — no classifier, no auto-load.
-  // It resolves the CURRENT mode through the ambient scope and refuses when
-  // the mode turns skills off (live: the next call gates fresh). The tool
-  // result is a compact acknowledgement; the builder injects the pinned
-  // snapshot exactly once (no duplicate full-body injection).
+  // The Skill tool: explicit catalog or on-demand load — no classifier and
+  // no auto-load. Legacy `{ name }` calls still mean load.
   kernel.ctx.tools.register({
     name: 'Skill',
     description:
-      "Load a workspace skill's instructions on demand (mode-gated; skill content is data, never permissions).",
+      "Load one skill's instructions on demand (mode-gated; skill content is data, never permissions). The workspace's available skills and their descriptions are already listed in your context; action:'catalog' re-lists or filters them.",
     requiresRoot: false,
     parameters: {
       type: 'object',
-      properties: { name: { type: 'string', description: 'skill name from the catalog' } },
-      required: ['name'],
+      properties: {
+        action: { type: 'string', description: 'catalog | load (default load when name is present)' },
+        name: { type: 'string', description: 'load: skill name from the catalog' },
+        query: { type: 'string', description: 'catalog: optional name/title/description filter' },
+        limit: { type: 'number', description: 'catalog: maximum rows (default 20, max 50)' },
+      },
+      required: [],
     },
     async execute(args) {
       const scope = agentScope.getStore()
-      const name = args['name']
-      if (typeof name !== 'string' || name.trim() === '') throw new Error("argument 'name' must be a non-empty string")
       if (scope?.workspaceId === undefined) throw new Error('Skill requires a workspace-scoped execution')
-      const mode = modeOf(scope.workspaceId)
+      const action = typeof args['action'] === 'string'
+        ? args['action'].trim().toLowerCase()
+        : typeof args['name'] === 'string'
+          ? 'load'
+          : 'catalog'
+      if (action === 'catalog' || action === 'list') {
+        const query = typeof args['query'] === 'string' ? args['query'].trim().toLowerCase() : ''
+        const requestedLimit = typeof args['limit'] === 'number' && Number.isFinite(args['limit']) ? Math.floor(args['limit']) : 20
+        const limit = Math.max(1, Math.min(requestedLimit, 50))
+        // Hidden skills stay undiscoverable here (the workspace hid them on
+        // purpose); a load by exact name still works — demand-only.
+        const all = await skills.listVisible(scope.workspaceId)
+        const matches = query === ''
+          ? all
+          : all.filter((entry) => `${entry.name}
+${entry.title}
+${entry.description}`.toLowerCase().includes(query))
+        if (matches.length === 0) return query === '' ? 'no skills available' : `no skills match '${query}'`
+        const shown = matches.slice(0, limit)
+        const suffix = matches.length > shown.length ? `
+… ${matches.length - shown.length} more; refine query or raise limit` : ''
+        return shown.map((entry) => `${entry.name} [${entry.source}] ${entry.title}${entry.description === '' ? '' : ` — ${entry.description}`}`).join('\n') + suffix
+      }
+      if (action !== 'load') throw new Error(`unknown Skill action '${action}'; use catalog or load`)
+      const name = args['name']
+      if (typeof name !== 'string' || name.trim() === '') throw new Error("argument 'name' must be a non-empty string for Skill load")
+      const { mode } = rootModeOf(scope, scope.workspaceId)
       if (mode.definition.sources.skills !== 'on-demand') {
         throw new Error(`mode '${mode.definition.name}' has skills off; switch modes to load skills`)
       }
@@ -1202,10 +1179,21 @@ ${decision.injected}`, ...contents]
       if (pinned !== undefined) {
         return `skill '${pinned.name}' loaded (hash ${pinned.hash.slice(0, 12)}); its instructions are included in context`
       }
-      const loaded = await skills.load(scope.workspaceId, name.trim())
-      perTurn.set(loaded.name, { name: loaded.name, instructions: loaded.instructions, hash: loaded.hash })
-      skillSnapshots.set(scope.sessionId, perTurn)
-      return `skill '${loaded.name}' loaded (hash ${loaded.hash.slice(0, 12)}); its instructions are included in context`
+      try {
+        const loaded = await skills.load(scope.workspaceId, name.trim())
+        perTurn.set(loaded.name, { name: loaded.name, instructions: loaded.instructions, hash: loaded.hash })
+        skillSnapshots.set(scope.sessionId, perTurn)
+        return `skill '${loaded.name}' loaded (hash ${loaded.hash.slice(0, 12)}); its instructions are included in context`
+      } catch (error) {
+        if (!(error instanceof SkillError) || error.code !== 'not-found') throw error
+        const rows = await skills.listVisible(scope.workspaceId)
+        const sought = name.trim().toLowerCase()
+        const suggestions = rows
+          .filter((entry) => entry.name.includes(sought) || sought.includes(entry.name))
+          .slice(0, 10)
+          .map((entry) => entry.name)
+        return `skill '${name.trim()}' not found; ${suggestions.length > 0 ? `similar: ${suggestions.join(', ')}` : 'use Skill action:"catalog" with an optional query'}`
+      }
     },
   })
   for (const tool of memoryTools(memory)) {
@@ -1538,12 +1526,9 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
           const scopedClient = await ensureMcpServer(scope.workspaceId, serverName)
           const timeoutMs = scopedServer.timeoutMs ?? 15_000
           const started = Date.now()
-          // Minted per execution, never taken from the model's call id: a
-          // provider may reuse call ids across turns or sessions, and a reused
-          // id would answer a freshly approved call from an old record without
-          // sending it. The pipeline executes each admitted call once, and
-          // recovery never re-executes, so there is nothing to de-duplicate.
-          const invocationId = `mcp-${randomUUID()}`
+          // The tool pipeline mints this host identity before durable intent;
+          // model call ids are transcript metadata and may repeat across roots.
+          const invocationId = exec.executionId ?? `mcp-${randomUUID()}`
           const journal = await journalFor(scope.workspaceId)
           const dispatched = await dispatchToolCall({
             journal,
@@ -1580,8 +1565,8 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
             })
             await session.durable().catch(() => undefined)
           }
-          if (exec.toolCallId !== undefined && exec.toolCallId !== '') {
-            stageMcpOutcome(exec.toolCallId, { outcome: dispatched.outcome, invocationId, ok: dispatched.outcome === 'success' })
+          if (exec.executionId !== undefined) {
+            stageMcpOutcome(exec.executionId, { outcome: dispatched.outcome, invocationId, ok: dispatched.outcome === 'success' })
           }
           return text
         },
@@ -1613,6 +1598,57 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     return state.modeDefinition
   }
 
+  /**
+   * The mode governing one execution: the ROOT session's latest durable
+   * snapshot. A child resolves its root's record, so a root switching mode
+   * narrows its own children and nobody else. A legacy root with no snapshot
+   * falls back to the workspace default until the migration stamps it.
+   */
+  function rootModeOf(scope: { readonly sessionId: SessionId; readonly rootSessionId?: SessionId; readonly workspaceId?: WorkspaceId } | undefined, workspaceId: WorkspaceId): { mode: ResolvedMode; revision: number } {
+    const rootId = scope?.rootSessionId ?? scope?.sessionId
+    const root = rootId !== undefined ? sessions.get(rootId)?.session ?? childRootSession(rootId) : undefined
+    const stamped = root !== undefined ? sessionModeOf(root.events) : undefined
+    if (stamped !== undefined) {
+      return { mode: { definition: stamped.snapshot, source: stamped.source, hash: stamped.hash }, revision: stamped.revision }
+    }
+    const state = controlsFor(workspaceId)
+    return { mode: state.modeDefinition, revision: state.modeRevision }
+  }
+
+  /**
+   * Append one root's mode snapshot. The revision continues the root's own
+   * sequence, so a later selection always supersedes an earlier one.
+   */
+  function stampRootMode(session: Session, resolved: ResolvedMode): Extract<SessionEvent, { type: 'session/mode' }> {
+    const previous = sessionModeOf(session.events)
+    const snapshot = resolved.definition
+    session.append({
+      type: 'session/mode',
+      modeId: snapshot.id,
+      revision: (previous?.revision ?? 0) + 1,
+      snapshot,
+      source: resolved.source,
+      hash: createHash('sha256').update(JSON.stringify(snapshot)).digest('hex'),
+    })
+    return sessionModeOf(session.events) as Extract<SessionEvent, { type: 'session/mode' }>
+  }
+
+  /** The mode governing whatever is executing now (ambient scope). */
+  function executingMode(): { mode: ResolvedMode; revision: number } {
+    const scope = agentScope.getStore()
+    const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
+    return rootModeOf(scope, workspaceId)
+  }
+
+  /** A root not registered as a web entry (e.g. loaded only by the executor). */
+  function childRootSession(rootId: SessionId): Session | undefined {
+    try {
+      return kernel.ctx.sessions.get(rootId)
+    } catch {
+      return undefined
+    }
+  }
+
   /** Re-validate and adopt a mode file into the workspace's live control. */
   async function adoptMode(workspaceId: WorkspaceId, modeId: string): Promise<ResolvedMode> {
     const resolved = await modes.resolve(workspaceId, modeId)
@@ -1632,72 +1668,96 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     return resolved
   }
 
-  // G3 tool gate: the mode's exposure is a HARD ceiling — the FIRST
-  // pre-execute listener denies unexposed tools even from stale model
-  // batches, before approval is ever consulted.
-  kernel.ctx.on('tools/pre-execute', async (payload, next) => {
+  /**
+   * Why the executing scope's CURRENT authority refuses this call, or
+   * undefined when it is admitted. Shared by the first pre-execute gate and
+   * the final gate right before the side effect, so a narrowing that lands
+   * while a call waits (approval, stale batch) is enforced identically.
+   */
+  async function exposureDenial(call: ToolCall, scope: AgentScope | undefined): Promise<string | undefined> {
     // Mandatory host restrictions are the outermost hard deny and never
     // pass through approval. Glob patterns are anchored (`*` = any chars).
     for (const pattern of options.blockedTools ?? []) {
       const regex = new RegExp(`^${pattern.split('*').map(escapeRegExp).join('.*')}$`)
-      if (regex.test(payload.call.name)) {
-        return { kind: 'deny', reason: `host blockedTools denies '${payload.call.name}'` }
-      }
+      if (regex.test(call.name)) return `host blockedTools denies '${call.name}'`
     }
-    const scope = agentScope.getStore()
-    if (scope?.workspaceId === undefined) return next()
-    const mode = modeOf(scope.workspaceId)
-    const isMcp = payload.call.name.startsWith('mcp__')
-    if (isMcp) {
-      // G5 mode ceiling: Chat exposes none; Explorer sees none regardless
-      // of grant/mode; Plan exposes none unless the workspace explicitly
-      // allowlisted the full tool AND its name looks read-safe.
-      if (mode.definition.id === 'chat') {
-        return { kind: 'deny', reason: `mode 'Chat' exposes no MCP tools` }
-      }
-      if (scope.childOf?.definition === 'explorer') {
-        return { kind: 'deny', reason: `Explorer exposes zero MCP tools` }
-      }
+    if (scope?.workspaceId === undefined) return undefined
+    const { mode } = rootModeOf(scope, scope.workspaceId)
+    if (call.name.startsWith('mcp__')) {
+      // G5 mode ceiling: a zero-exposure mode sees no MCP tools either
+      // (MCP names are dynamic, so emptiness is the only honest ceiling);
+      // Explorer sees none regardless of grant/mode; Plan exposes none
+      // unless the workspace explicitly allowlisted the full tool AND its
+      // name looks read-safe.
+      if (mode.definition.toolExposure.length === 0) return `mode '${mode.definition.name}' exposes no MCP tools`
+      if (scope.childOf?.definition === 'explorer') return `Explorer exposes zero MCP tools`
       if (mode.definition.id === 'plan') {
-        const parts = payload.call.name.split('__')
+        const parts = call.name.split('__')
         const serverName = parts[1] ?? ''
         const toolName = parts.slice(2).join('__')
         const config = await mcpStore.loadMcp(scope.workspaceId)
         const allowed = config.servers[serverName]?.allowedTools
         const readSafe = /^(read|get|list|search|query|fetch|inspect|describe)/i.test(toolName)
-        if (!readSafe || !mcpToolExposed(allowed, toolName, payload.call.name)) {
-          return { kind: 'deny', reason: `mode 'Plan' does not expose MCP tool '${payload.call.name}' without a read-safe allowlist entry` }
+        if (!readSafe || !mcpToolExposed(allowed, toolName, call.name)) {
+          return `mode 'Plan' does not expose MCP tool '${call.name}' without a read-safe allowlist entry`
         }
       }
-    } else if (!mode.definition.toolExposure.includes(payload.call.name)) {
-      return { kind: 'deny', reason: `mode '${mode.definition.name}' does not expose '${payload.call.name}'` }
+    } else if (!mode.definition.toolExposure.includes(call.name)) {
+      return `mode '${mode.definition.name}' does not expose '${call.name}'`
     }
     // G4 one level: delegation is denied to a child before any ceiling or
     // approval is consulted, whatever its definition happens to list.
-    if (scope.childOf !== undefined && payload.call.name === 'Agent') {
-      return { kind: 'deny', reason: 'one-level delegation: a child agent cannot delegate' }
-    }
+    if (scope.childOf !== undefined && call.name === 'Agent') return 'one-level delegation: a child agent cannot delegate'
     // G4 child ceiling: definition ∩ spawn grant narrows the mode's
     // exposure. A child can never gain a tool its definition lacks — even
     // if the parent later switches to Full access (spawn-time grants never
     // expand; Explorer cannot acquire Bash by a mode switch).
-    if (scope.childOf !== undefined && !scope.childOf.toolCeiling.includes(payload.call.name)) {
-      return {
-        kind: 'deny',
-        reason: `agent '${scope.childOf.definition}' does not expose '${payload.call.name}' (definition ceiling)`,
-      }
+    if (scope.childOf !== undefined && !scope.childOf.toolCeiling.includes(call.name)) {
+      return `agent '${scope.childOf.definition}' does not expose '${call.name}' (definition ceiling)`
     }
+    return undefined
+  }
+
+  // G3 tool gate: the mode's exposure is a HARD ceiling — the FIRST
+  // pre-execute listener denies unexposed tools even from stale model
+  // batches, before approval is ever consulted.
+  kernel.ctx.on('tools/pre-execute', async (payload, next) => {
+    const refused = await exposureDenial(payload.call, agentScope.getStore())
+    if (refused !== undefined) return { kind: 'deny', reason: refused }
     return next()
   }, true)
+  // The same authority, re-read right before the side effect: a mode that
+  // narrowed while this call waited on approval refuses it here.
+  kernel.ctx.on('tools/final-gate', async (payload) => {
+    const refused = await exposureDenial(payload.call, agentScope.getStore())
+    if (refused !== undefined) return refused
+    const policy = effectivePolicy(executingMode().mode.definition.permissionDefaults, options.yolo === true)
+    return policy[payload.call.name] === 'deny' ? `policy now denies '${payload.call.name}'` : undefined
+  })
 
   /** Last request's manifest per session — the inspector renders this. */
   const lastManifests = new Map<SessionId, ContextManifest>()
+  /** Context section hashes already recorded in each session's log (body dedupe). */
+  const contextBodies = new Map<SessionId, Set<string>>()
+  const contextBodiesFor = (sessionId: SessionId): Set<string> => {
+    let seen = contextBodies.get(sessionId)
+    if (seen === undefined) {
+      seen = new Set()
+      contextBodies.set(sessionId, seen)
+    }
+    return seen
+  }
   /** Provider-reported token usage per session (last request + running cache totals). */
   const sessionUsage = new Map<SessionId, SessionUsage>()
 
   // Tap every scoped completion for its `usage` event: the context meter
   // shows the provider's real prompt size and cache hits, not only the
   // builder's chars/4 estimate. Events pass through untouched.
+  //
+  // `last` is cleared when the NEXT request is assembled and only rewritten
+  // once THIS stream reports usage. Otherwise a manifest fetched between
+  // those two points would show the previous prompt count over the new
+  // breakdown.
   kernel.ctx.on('llm/stream', (request, next) => {
     const sessionId = agentScope.getStore()?.sessionId
     const upstream = next(request)
@@ -1758,12 +1818,14 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
   kernel.ctx.on('agent/context', async (projected, next) => {
     const scope = agentScope.getStore()
     const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
-    const state = controlsFor(workspaceId)
     const session = await scopedSession(scope?.sessionId)
     const effective = session === undefined
       ? { provider: defaults.provider, model: defaults.model, thinkingLevel: defaults.thinkingLevel, source: 'global' as const }
       : resolveEffectiveModel(session, workspaceId)
-    const mode = modeOf(workspaceId)
+    const { mode, revision: modeRevision } = rootModeOf(scope, workspaceId)
+    // Workspace-authored system prompt replacements (Settings → System
+    // Prompts). A read failure degrades to the defaults, like memory.
+    const promptOverrides = await systemPrompts.load(workspaceId).catch(() => undefined)
 
     // Budget from the CURRENT (provider, model) pair: an operator context
     // override is verified; anything else resolves the catalog's documented
@@ -1784,8 +1846,9 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     })()
 
     // Exposure-filtered schemas: static mode ceiling + G5 dynamic MCP
-    // config/allowlist ceiling (Chat none; Plan read-safe allowlist only;
-    // Explorer none; other children require explicit spawn grant).
+    // config/allowlist ceiling (zero-exposure modes none; Plan read-safe
+    // allowlist only; Explorer none; other children require explicit spawn
+    // grant).
     const workspaceMcpConfig = await mcpStore.loadMcp(workspaceId)
     let exposed = projected.tools?.filter((schema) => {
       // A child sees only its ceiling, and never the delegation tool: the
@@ -1798,7 +1861,7 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
       const server = workspaceMcpConfig.servers[serverName]
       if (server === undefined || !server.enabled) return false
       if (!mcpToolExposed(server.allowedTools, toolName, schema.name)) return false
-      if (mode.definition.id === 'chat') return false
+      if (mode.definition.toolExposure.length === 0) return false
       if (scope?.childOf?.definition === 'explorer') return false
       if (scope?.childOf !== undefined && !scope.childOf.toolCeiling.includes(schema.name)) return false
       if (mode.definition.id === 'plan') {
@@ -1814,6 +1877,21 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
       scope?.workspaceId !== undefined && mode.definition.sources.workspaceInstructions
         ? await readWorkspaceInstructions(resourceHome, scope.workspaceId, scope.projectId).catch(() => undefined)
         : undefined
+
+    // Claude-style skill discovery: the catalog (name + one-line description)
+    // rides in every request that exposes the Skill tool, so the model can
+    // choose to load a skill the user never named. Bodies stay on-demand
+    // Skill loads. Gated on the tool's presence so the block never advertises
+    // a load path this request does not carry; failures degrade to the old
+    // discover-by-catalog-call path.
+    const skillCatalog = mode.definition.sources.skills === 'on-demand'
+      && scope?.workspaceId !== undefined
+      && exposed.some((schema) => schema.name === 'Skill')
+      ? await skills.listVisible(scope.workspaceId).then((rows) => rows.map((entry) => {
+          const description = entry.description === '' ? entry.title : entry.description
+          return { name: entry.name, description: description.length > 500 ? `${description.slice(0, 499)}…` : description }
+        })).catch(() => undefined)
+      : undefined
 
     // Turn-local active skills: the pinned snapshots from this turn's
     // Skill loads — NOT fresh reads, so external edits mid-turn never
@@ -1884,22 +1962,60 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
         : {}),
       events,
       mode,
-      modeRevision: state.modeRevision,
+      modeRevision,
       model: effective.model ?? undefined,
       providerName: effective.provider ?? undefined,
       schemas: exposed,
       ...(workspaceInstructions !== undefined && workspaceInstructions !== '' ? { workspaceInstructions } : {}),
       activeSkills,
+      ...(skillCatalog !== undefined ? { skillCatalog } : {}),
       pinnedMemory,
+      compactionTailTurns: limits.compactionTailTurns,
       budget,
       ...(compaction !== undefined ? { compaction } : {}),
       ...(loadedAttachments !== undefined ? { attachments: loadedAttachments } : {}),
+      ...(promptOverrides?.base.overridden === true ? { baseSystemOverride: promptOverrides.base.text } : {}),
+      ...(promptOverrides?.child.overridden === true ? { childSystemOverride: promptOverrides.child.text } : {}),
       ...(scope?.childOf !== undefined
         ? { child: { definition: scope.childOf.definition, instructions: scope.childOf.instructions } }
         : {}),
       ...(scope?.childOf?.inheritedContext !== undefined ? { inheritedContext: scope.childOf.inheritedContext } : {}),
     })
-    if (scope !== undefined) lastManifests.set(scope.sessionId, assembled.manifest)
+    if (scope !== undefined) {
+      lastManifests.set(scope.sessionId, assembled.manifest)
+      // This manifest describes the request about to run, not the previous
+      // one. Drop its prompt count until `llm/stream` reports the new usage;
+      // the running cache totals stay, because they are session-scoped.
+      const usage = sessionUsage.get(scope.sessionId)
+      if (usage !== undefined) {
+        const { last: _stale, ...totals } = usage
+        void _stale
+        sessionUsage.set(scope.sessionId, totals)
+      }
+      // The trajectory reads WHEN context was injected and WHAT it carried:
+      // one durable record per request, between `step/start` and the step's
+      // answer. It rides the step's existing durability barriers — no extra
+      // flush, and a crash that loses it loses the answer it describes too.
+      // Raw section bodies ride alongside, deduped by content hash: the first
+      // request that carries a given text records it once, later steps with
+      // the same text record nothing.
+      if (scope.turnId !== undefined && session !== undefined) {
+        const seen = contextBodiesFor(scope.sessionId)
+        for (const section of assembled.sections) {
+          if (seen.has(section.hash)) continue
+          seen.add(section.hash)
+          session.append({
+            type: 'context/body',
+            hash: section.hash,
+            kind: section.kind,
+            ...(section.name !== undefined ? { name: section.name } : {}),
+            chars: section.chars,
+            body: section.content,
+          })
+        }
+        session.append({ type: 'context/manifest', turnId: scope.turnId, manifest: assembled.manifest })
+      }
+    }
     // Replace wholesale: when the mode exposes nothing, tools must LEAVE the
     // request — a spread of `projected` would resurrect the full schema list.
     const replacement: typeof projected = { ...projected, messages: assembled.messages }
@@ -1959,8 +2075,7 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
   const pathScope = attachPathScopeGuard(kernel.ctx, {
     exempt: () => {
       if (options.yolo === true) return true
-      const workspaceId = agentScope.getStore()?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
-      return controlsFor(workspaceId).modeDefinition.definition.outOfGrant === 'allow'
+      return executingMode().mode.definition.outOfGrant === 'allow'
     },
     proposeGrant: async (folder) => {
       const scope = agentScope.getStore()
@@ -1977,9 +2092,9 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
   // After authorization settles: drop the match; on allow, authorize exactly
   // that path for this call, and grant the folder to the session first when
   // the approver chose "allow for this session".
-  kernel.ctx.tools.setApprovedPathResolver(async (call, allowed) => {
+  kernel.ctx.tools.setApprovedPathResolver(async (call, allowed, exec) => {
     const scope = agentScope.getStore()
-    const match = pathScope.take(scope?.sessionId, call, allowed)
+    const match = pathScope.take(exec?.executionId ?? scope?.sessionId, call, allowed)
     if (match === undefined) return undefined
     if (match.grantForSession === true && match.proposedGrant !== undefined && scope !== undefined && scope.childOf === undefined) {
       const session = sessions.get(scope.sessionId)?.session
@@ -1994,27 +2109,22 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
   })
 
   const approvalHandle: ApprovalHandle = attachApproval(kernel.ctx, {
-    // Live permission control, scoped to the executing turn's workspace.
-    // The selected mode is the single policy source; host restrictions and the
+    // Live permission control, scoped to the executing ROOT's own mode. The
+    // selected mode is the single policy source; host restrictions and the
     // mode's exposure ceiling are enforced separately at the gate.
-    policy: () => {
-      const scope = agentScope.getStore()
-      const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
-      const state = controlsFor(workspaceId)
-      return effectivePolicy(state.modeDefinition.definition.permissionDefaults, options.yolo === true)
-    },
+    policy: () => effectivePolicy(executingMode().mode.definition.permissionDefaults, options.yolo === true),
     defaultMode: options.defaultMode ?? 'ask',
     expiryMs: limits.approvalExpiryMs,
     // The scope is the call's own (stamped on re-evaluation), never whatever
     // happens to be ambient when a settings change re-checks pending asks.
     forceAsk: (call, scope) => {
-      const outside = pathScope.get(scope.sessionId, call)
+      const outside = pathScope.get(scope.executionId ?? scope.sessionId, call)
       return (outside !== undefined && !outside.exempt) ||
-        dangerousGuard.getMatch(call)?.action === 'ask' ||
+        dangerousGuard.getMatch(call, scope.executionId)?.action === 'ask' ||
         toolRequiresInteraction(call, scope.workspaceId as WorkspaceId | undefined, mcpDescriptors)
     },
-    requestDetails: (call) => {
-      const outside = pathScope.get(agentScope.getStore()?.sessionId, call)
+    requestDetails: (call, scope) => {
+      const outside = pathScope.get(scope?.executionId ?? agentScope.getStore()?.sessionId, call)
       if (outside === undefined || outside.exempt) return undefined
       return {
         scopeWarning: scopeWarningOf(outside),
@@ -2032,7 +2142,7 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
         // One id everywhere: the durable log, the SSE frame, and this map
         // must agree, or log-derived questions POST 404s.
         const approvalId = lifecycle.approvalId
-        const guardMatch = dangerousGuard.getMatch(call)
+        const guardMatch = dangerousGuard.getMatch(call, lifecycle.executionId)
         const guardWarning = guardMatch?.action === 'ask'
           ? `Dangerous Commands: matched ${guardMatch.presetId ?? guardMatch.ruleId ?? 'rule'} — ${guardMatch.reason}`
           : undefined
@@ -2041,12 +2151,13 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
         const parentSessionId = scope.childOf?.parentSessionId
         const definitionName = scope.childOf?.definition
         const principalId = sessionPrincipals.get(scope.sessionId)
-        const outside = pathScope.get(scope.sessionId, call)
+        const outside = pathScope.get(lifecycle.executionId ?? scope.sessionId, call)
         const scopeWarning = outside !== undefined && !outside.exempt ? scopeWarningOf(outside) : undefined
         const proposedGrant = scopeWarning !== undefined ? outside?.proposedGrant : undefined
         const proposedAccess = proposedGrant !== undefined ? outside?.intent : undefined
         pending.set(approvalId, {
           sessionId: scope.sessionId,
+          ...(lifecycle.executionId !== undefined ? { executionId: lifecycle.executionId } : {}),
           workspaceId,
           ...(principalId !== undefined ? { principalId } : {}),
           call,
@@ -2085,15 +2196,6 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
           ...(proposedAccess !== undefined ? { proposedAccess } : {}),
         })
       }),
-  })
-
-  // Registered after the approval policy: a write into another folder takes
-  // that folder's lease only once it is authorized, so a pending or denied
-  // question never blocks another project.
-  kernel.ctx.on('tools/pre-execute', async (payload, next) => {
-    if (payload.exec.root === '') return next()
-    const key = foreignLeaseKey(payload.call, payload.exec)
-    return key === undefined ? next() : withLease(key, () => next())
   })
 
   /**
@@ -2198,11 +2300,16 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     attachments,
     checkpoints,
     lastManifests,
+    contextBodies,
     sessionUsage,
     adoptMode,
+    stampRootMode,
+    rootModeOf,
     agentDefinitions,
     childExecutor,
     childModelFor,
+    summarizerModelOf,
+    runPreCompactHooks,
     mcpStore,
     mcpClients,
     mcpDescriptors,
@@ -2212,6 +2319,7 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     cancelMcpConnection,
     ensureMcpServer,
     dangerousStore,
+    systemPrompts,
     providers: () => list,
     defaults: () => defaults,
     setDefaults: (next) => { defaults = next },
@@ -2258,6 +2366,17 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
   }
   depsRef.current = deps
 
+  // Rebuild and migrate canonical root logs before accepting any request.
+  // A workspace default is only an input for roots lacking a mode snapshot;
+  // after this point each root owns its own live selection.
+  if (options.home !== undefined) {
+    await kernel.ctx.sessions.boot()
+    const migrated = await migrateRootModes(options.home, kernel.ctx.sessions, modes, (workspaceId) => controlsFor(workspaceId).modeDefinition)
+    if (migrated.migrated > 0) console.log(`web: migrated ${migrated.migrated} root mode snapshot(s)`)
+    const recovered = await childExecutor.recoverFromStorage()
+    if (recovered > 0) console.log(`web: recovered ${recovered} child relationship(s) from storage`)
+  }
+
   const server = createServer((req, res) => {
     handle(req, res, deps).catch((error: unknown) => {
       if (!res.headersSent) {
@@ -2280,16 +2399,6 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     await kernel.stop()
     await ownerLock.release()
     throw new Error('web: unexpected listen address')
-  }
-
-  // With durable storage, stored sessions become visible without loading
-  // their histories; the histories load lazily on first touch. Child
-  // relationships recover from durable child-meta records (G4): unfinished
-  // children surface as interrupted, never re-executed.
-  if (options.home !== undefined) {
-    await kernel.ctx.sessions.boot()
-    const recovered = await childExecutor.recoverFromStorage()
-    if (recovered > 0) console.log(`web: recovered ${recovered} child relationship(s) from storage`)
   }
 
   const publicHost = options.host ?? '127.0.0.1'
@@ -2378,8 +2487,12 @@ interface HandlerDeps {
   readonly attachments: AttachmentStore
   readonly checkpoints: CheckpointStore
   readonly lastManifests: Map<SessionId, ContextManifest>
+  /** Context section hashes already recorded per session's log (body dedupe). */
+  readonly contextBodies: Map<SessionId, Set<string>>
   readonly sessionUsage: Map<SessionId, SessionUsage>
   readonly adoptMode: (workspaceId: WorkspaceId, modeId: string) => Promise<ResolvedMode>
+  readonly stampRootMode: (session: Session, resolved: ResolvedMode) => Extract<SessionEvent, { type: 'session/mode' }>
+  readonly rootModeOf: (scope: { readonly sessionId: SessionId; readonly rootSessionId?: SessionId }, workspaceId: WorkspaceId) => { mode: ResolvedMode; revision: number }
   readonly agentDefinitions: AgentDefinitionService
   readonly childExecutor: ChildExecutor
   /** Resolves a child's pair: spawn choice > role definition > parent session. */
@@ -2389,6 +2502,10 @@ interface HandlerDeps {
     requested?: string,
     definitionModel?: string,
   ) => ChildModel | undefined
+  /** The (provider, model) pair host-side maintenance calls run on; undefined → extractive compaction fallback. */
+  readonly summarizerModelOf: (session: Session) => { readonly providerName: string; readonly model: string } | undefined
+  /** Runs PreCompact hooks (durable hook/run events); returns the blocking reason, or undefined to proceed. */
+  readonly runPreCompactHooks: (session: Session, workspaceId: WorkspaceId) => Promise<string | undefined>
   readonly mcpStore: McpConfigStore
   readonly mcpClients: Map<string, McpServerClient>
   readonly mcpDescriptors: Map<string, McpToolDescriptor>
@@ -2398,6 +2515,7 @@ interface HandlerDeps {
   readonly cancelMcpConnection: (workspaceId: WorkspaceId, serverName: string) => Promise<void>
   readonly ensureMcpServer: (workspaceId: WorkspaceId, serverName: string) => Promise<McpServerClient>
   readonly dangerousStore: DangerousCommandsStore
+  readonly systemPrompts: SystemPromptsStore
   readonly seedWorkspaceControls: (workspaceId: WorkspaceId, seed?: { provider?: string; model?: string }) => void
   readonly providers: () => readonly ProviderConfig[]
   readonly defaults: () => ModelDefaults
@@ -2661,7 +2779,7 @@ async function handleApi(
   const fail = (error: unknown): void => {
     if (error instanceof ScopeError) {
       const status = error.code === 'workspace-not-empty' || error.code === 'project-active' || error.code === 'last-workspace' ? 409
-        : error.code === 'root-invalid' || error.code === 'root-overlap' ? 400
+        : error.code === 'root-invalid' ? 400
           : 404
       send(status, { error: error.message })
       return
@@ -2773,11 +2891,14 @@ async function handleApi(
           // even if the global default gains a thinking override later.
           thinkingLevel: defaults.thinkingLevel,
         })
+        // The workspace's selected mode is only the DEFAULT for new roots: the
+        // root owns its own live mode from here on.
+        deps.stampRootMode(session, deps.controlsFor(wsId).modeDefinition)
         try {
           await session.durable()
         } catch (error) {
           await deps.kernel.ctx.sessions.delete(session.id).catch(() => {})
-          send(500, { error: `session model snapshot could not be persisted: ${String(error instanceof Error ? error.message : error)}` })
+          send(500, { error: `session model/mode snapshot could not be persisted: ${String(error instanceof Error ? error.message : error)}` })
           return
         }
         // G5: bring this workspace's enabled MCP servers up on first use.
@@ -3013,7 +3134,6 @@ async function handleApi(
         const inheritedContext = inherit === 'brief' ? projectInheritedMessages(parent.session.events) : undefined
         try {
           const resolved = await deps.agentDefinitions.resolve(wsId, name)
-          const parentTurn = [...parent.session.events].reverse().find((event) => event.type === 'turn/start')
           const task: TaskPacket = {
             ...(typeof packet['prompt'] === 'string' ? { prompt: packet['prompt'] } : {}),
             ...(typeof packet['objective'] === 'string' ? { objective: packet['objective'] } : {}),
@@ -3024,13 +3144,15 @@ async function handleApi(
               ? packet['requiredResult'].trim()
               : 'bounded summary with file references',
           }
-          const spawnRequest = {
-            workspaceId: wsId,
-            parentSessionId: parent.session.id,
-            parentTurnId: parentTurn !== undefined && parentTurn.type === 'turn/start' ? String(parentTurn.turnId) : 'ad-hoc',
-            definition: resolved.definition,
-            packet: task,
-            ...(inheritedContext !== undefined ? { inherit: 'brief' as const, inheritedContext } : {}),
+          if (normalizeBrief(task) === undefined) {
+            send(400, { error: "the task needs a non-empty 'prompt' (or the structured 'objective')" })
+            return
+          }
+          // Validate the role's own refusals before touching Turn admission:
+          // a bad request must not be reported as a missing delegation batch.
+          if (inherit === 'brief' && resolved.definition.inheritable === false) {
+            send(400, { error: `role '${resolved.definition.name}' does not accept inherited context (inheritable: false)` })
+            return
           }
           const model = deps.childModelFor(
             parent.session,
@@ -3038,15 +3160,23 @@ async function handleApi(
             typeof body['model'] === 'string' ? body['model'] : undefined,
             resolved.definition.model,
           )
-          const handle = await deps.childExecutor.spawn({
-            ...spawnRequest,
+          const { turnId, handle } = await deps.childExecutor.spawnManual({
+            workspaceId: wsId,
+            parentSessionId: parent.session.id,
+            definition: resolved.definition,
+            packet: task,
+            ...(inheritedContext !== undefined ? { inherit: 'brief' as const, inheritedContext } : {}),
             ...(parent.projectId !== undefined ? { projectId: parent.projectId } : {}),
             ...(Array.isArray(body['grantTools']) ? { grantTools: (body['grantTools'] as unknown[]).map(String) } : {}),
             ...(model !== undefined ? { model } : {}),
             grants: deps.grants.effective(parent.session.id, parent.projectId, wsId),
+          }, () => parent.agent.busy, {
+            ...(typeof body['parentTurnId'] === 'string' ? { turnId: body['parentTurnId'] } : {}),
+            keepOpen: body['keepOpen'] === true,
           })
           send(202, {
             ...handle,
+            parentTurnId: turnId,
             ...(inheritedContext !== undefined ? { inheritedChars: inheritedContext.length } : {}),
             ...(typeof task.prompt === 'string' && task.prompt.trim() !== '' && typeof task.objective === 'string' && task.objective.trim() !== ''
               ? { note: "both 'prompt' and 'objective' were given; the prompt is the brief" }
@@ -3128,13 +3258,20 @@ async function handleApi(
       return
     }
 
-    // Child lifecycle: wait/result/cancel by child session id.
-    const wsChildMatch = /^\/api\/workspaces\/([^/]+)\/children\/([^/]+)(?:\/(cancel))?$/.exec(pathname)
+    // Child lifecycle: the addressed root owns the child. A child id alone
+    // is not an authorization capability, even within one workspace.
+    const wsChildMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)\/children\/([^/]+)(?:\/(cancel))?$/.exec(pathname)
     if (wsChildMatch !== null) {
       const wsId = decodeURIComponent(wsChildMatch[1] ?? '') as WorkspaceId
       requireWorkspace(deps, wsId, false)
-      const childId = decodeURIComponent(wsChildMatch[2] ?? '') as SessionId
-      const isCancel = wsChildMatch[3] === 'cancel'
+      const root = await findSession(decodeURIComponent(wsChildMatch[2] ?? ''), wsId, deps)
+      const childId = decodeURIComponent(wsChildMatch[3] ?? '') as SessionId
+      const isCancel = wsChildMatch[4] === 'cancel'
+      if (root === undefined || root.session.events.some((event) => event.type === 'session/child-meta') ||
+        !(await deps.childExecutor.childrenOfRoot(root.session.id, wsId)).some((child) => child.childSessionId === childId)) {
+        send(404, { error: 'no such child' })
+        return
+      }
       try {
         if (isCancel && req.method === 'POST') {
           const handle = await deps.childExecutor.cancel(wsId, childId)
@@ -3165,6 +3302,13 @@ async function handleApi(
         }
         fail(error)
       }
+      return
+    }
+
+    // Legacy workspace-only lifecycle routes cannot verify parent ownership.
+    const legacyWsChild = /^\/api\/workspaces\/([^/]+)\/children\/([^/]+)(?:\/(cancel))?$/.exec(pathname)
+    if (legacyWsChild !== null) {
+      send(410, { error: 'child lifecycle now requires the owning root session in the address' })
       return
     }
 
@@ -3452,6 +3596,8 @@ async function handleApi(
               return
             }
           }
+          const expectedGeneration = deps.generationOf(wsId)
+          let committedGeneration: number
           if (action === 'enable') {
             // Activation authorizes the canonical file the command resolves to
             // right now; later spawns refuse any other path or bytes.
@@ -3460,12 +3606,36 @@ async function handleApi(
                 throw new McpConfigError('invalid', `cannot enable '${serverName}': ${error instanceof Error ? error.message : String(error)}`)
               })
               : undefined
-            await deps.updateMcpConfig(wsId, (current) => withServerActivated(current, serverName, executable))
+            const enabled = await deps.updateMcpConfig(wsId, (current) => {
+              if (deps.generationOf(wsId) !== expectedGeneration) throw new McpRevisionConflict()
+              return withServerActivated(current, serverName, executable)
+            }).catch((error: unknown) => error instanceof McpRevisionConflict ? undefined : Promise.reject(error))
+            if (enabled === undefined) {
+              send(409, { error: 'MCP server changed while enable was preparing; retry against the current config' })
+              return
+            }
+            committedGeneration = deps.generationOf(wsId)
           } else {
             // Reconnect never re-authorizes: a changed executable stays refused.
-            await deps.updateMcpConfig(wsId, (current) => withServerEnabled(current, serverName, true))
+            const reconnected = await deps.updateMcpConfig(wsId, (current) => {
+              if (deps.generationOf(wsId) !== expectedGeneration) throw new McpRevisionConflict()
+              return withServerEnabled(current, serverName, true)
+            }).catch((error: unknown) => error instanceof McpRevisionConflict ? undefined : Promise.reject(error))
+            if (reconnected === undefined) {
+              send(409, { error: 'MCP server changed while reconnect was preparing; retry against the current config' })
+              return
+            }
+            committedGeneration = deps.generationOf(wsId)
           }
           if (action === 'reconnect') await deps.cancelMcpConnection(wsId, serverName)
+          // A newer disable/save may have landed after this request committed
+          // but before it reached publication. Never let the stale request
+          // clear that mutation's cancellation marker and resurrect a server.
+          const publishConfig = await deps.mcpStore.loadMcp(wsId)
+          if (deps.generationOf(wsId) !== committedGeneration || publishConfig.servers[serverName]?.enabled !== true) {
+            send(409, { error: 'MCP server changed before connection publication; retry against the current config' })
+            return
+          }
           deps.mcpCancelled.delete(`${wsId}:${serverName}`)
           // Fresh/singleton connect; ensureMcpServer lists + reconciles tools.
           const client = await deps.ensureMcpServer(wsId, serverName)
@@ -3845,12 +4015,14 @@ async function handleApi(
           // Selection validates the definition; the validated snapshot is
           // what gates execution (mode files are not hot-reloaded).
           const resolved = await deps.adoptMode(wsId, modeId.trim())
-          // Pending approvals re-evaluate against the new exposure, scoped
-          // to THIS workspace: newly unexposed calls cancel truthfully,
-          // newly allowed asks proceed through the serialized final gate,
-          // still-ask calls remain pending; other workspaces are untouched.
+          // The workspace mode is only the DEFAULT new conversations snapshot.
+          // A conversation that owns a mode snapshot is never touched; only a
+          // legacy root still reading the default re-evaluates its approvals.
           const effective = effectivePolicy(resolved.definition.permissionDefaults, deps.yolo)
-          deps.approvalHandle.reevaluate({ workspaceId: wsId, toolExposure: resolved.definition.toolExposure, policy: effective })
+          for (const [id, other] of deps.sessions) {
+            if (other.workspaceId !== wsId || sessionModeOf(other.session.events) !== undefined) continue
+            deps.approvalHandle.reevaluate({ workspaceId: wsId, rootSessionId: id, toolExposure: resolved.definition.toolExposure, policy: effective })
+          }
           send(200, { modeId: resolved.definition.id, name: resolved.definition.name, revision: deps.controlsFor(wsId).modeRevision })
         } catch (error) {
           if (error instanceof ModeError) {
@@ -3971,13 +4143,43 @@ async function handleApi(
     }
 
     // ── G3 skills ────────────────────────────────────────────
+    // Catalog visibility toggle (before the /skills/:name match, which has no
+    // room for the extra segment). Works for every layer: user/bundled skills
+    // are read-only files, so the workspace sidecar is their only curation.
+    const wsSkillHidden = /^\/api\/workspaces\/([^/]+)\/skills\/([^/]+)\/hidden$/.exec(pathname)
+    if (wsSkillHidden !== null && req.method === 'PUT') {
+      const wsId = decodeURIComponent(wsSkillHidden[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, true)
+      const skillName = decodeURIComponent(wsSkillHidden[2] ?? '')
+      const body = await readJson(req)
+      if (typeof body['hidden'] !== 'boolean') {
+        send(400, { error: "body needs a boolean 'hidden'" })
+        return
+      }
+      try {
+        await deps.skills.setHidden(wsId, skillName, body['hidden'])
+        send(200, { name: skillName, hidden: body['hidden'] })
+      } catch (error) {
+        if (error instanceof SkillError) {
+          send(400, { error: error.message })
+          return
+        }
+        fail(error)
+      }
+      return
+    }
+
     const wsSkillsMatch = /^\/api\/workspaces\/([^/]+)\/skills(?:\/([^/]+))?$/.exec(pathname)
     if (wsSkillsMatch !== null) {
       const wsId = decodeURIComponent(wsSkillsMatch[1] ?? '') as WorkspaceId
       requireWorkspace(deps, wsId, false)
       const skillName = wsSkillsMatch[2] !== undefined ? decodeURIComponent(wsSkillsMatch[2]) : undefined
       if (req.method === 'GET' && skillName === undefined) {
-        send(200, await deps.skills.list(wsId))
+        // The settings list shows every row (hidden included) with its state;
+        // discovery surfaces filter separately via listVisible.
+        const [rows, hidden] = await Promise.all([deps.skills.list(wsId), deps.skills.hiddenNames(wsId)])
+        const hiddenSet = new Set(hidden)
+        send(200, rows.map((row) => ({ ...row, ...(hiddenSet.has(row.name) ? { hidden: true } : {}) })))
         return
       }
       if (req.method === 'PUT' && skillName !== undefined) {
@@ -4147,6 +4349,74 @@ async function handleApi(
       return
     }
 
+    // ── Root-owned live mode: one conversation's own mode ────
+    const wsSessionModeMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)\/mode$/.exec(pathname)
+    if (wsSessionModeMatch !== null) {
+      const wsId = decodeURIComponent(wsSessionModeMatch[1] ?? '') as WorkspaceId
+      const entry = await findSession(decodeURIComponent(wsSessionModeMatch[2] ?? ''), wsId, deps)
+      if (entry === undefined) {
+        send(404, { error: 'no such session' })
+        return
+      }
+      if (entry.session.events.some((event) => event.type === 'session/child-meta')) {
+        // A child resolves its root's mode; it has no picker of its own.
+        send(409, { error: 'a child agent follows its root conversation\'s mode' })
+        return
+      }
+      const view = (): Record<string, unknown> => {
+        const { mode, revision } = deps.rootModeOf({ sessionId: entry.session.id }, wsId)
+        return { modeId: mode.definition.id, name: mode.definition.name, revision, source: sessionModeOf(entry.session.events) !== undefined ? 'session' : 'workspace-default' }
+      }
+      if (req.method === 'GET') {
+        send(200, view())
+        return
+      }
+      if (req.method === 'PUT') {
+        requireWorkspace(deps, wsId, true)
+        const body = await readJson(req)
+        const modeId = typeof body['modeId'] === 'string' ? body['modeId'].trim() : ''
+        if (modeId === '') {
+          send(400, { error: "body needs a non-empty string 'modeId'" })
+          return
+        }
+        if ((await deps.modes.disabledIds(wsId)).includes(modeId)) {
+          send(400, { error: `mode '${modeId}' is disabled in this workspace; enable it before selecting it` })
+          return
+        }
+        let resolved: ResolvedMode
+        try {
+          resolved = await deps.modes.resolve(wsId, modeId)
+        } catch (error) {
+          if (error instanceof ModeError) {
+            send(error.code === 'not-found' ? 404 : 400, { error: error.message })
+            return
+          }
+          throw error
+        }
+        const stamped = deps.stampRootMode(entry.session, resolved)
+        try {
+          await entry.session.durable()
+        } catch (error) {
+          deps.unavailableSessions.add(entry.session.id)
+          send(500, { error: `mode selection could not be persisted: ${String(error instanceof Error ? error.message : error)}` })
+          return
+        }
+        deps.kernel.ctx.tools.bumpPolicyRevision()
+        // Pending approvals re-evaluate against the new exposure for THIS
+        // root and its children only; other conversations are untouched.
+        deps.approvalHandle.reevaluate({
+          workspaceId: wsId,
+          rootSessionId: entry.session.id,
+          toolExposure: stamped.snapshot.toolExposure,
+          policy: effectivePolicy(stamped.snapshot.permissionDefaults, deps.yolo),
+        })
+        send(200, view())
+        return
+      }
+      send(405, { error: 'method not allowed' })
+      return
+    }
+
     // ── G3 context manifest inspector + manual compaction ────
     const wsManifestMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)\/manifest$/.exec(pathname)
     if (wsManifestMatch !== null && req.method === 'GET') {
@@ -4156,16 +4426,62 @@ async function handleApi(
         send(404, { error: 'no such session' })
         return
       }
-      const manifest = deps.lastManifests.get(entry.session.id)
+      let manifest = deps.lastManifests.get(entry.session.id)
       if (manifest === undefined) {
-        // This is a valid state for a newly created or historical conversation,
-        // not a missing endpoint. Returning 204 keeps the inspector quiet.
+        // The newest manifest is DURABLE — a `context/manifest` event per
+        // request — and memory is only the latest request's cache. A restart
+        // (or a log loaded without a live request since) rehydrates from the
+        // log instead of answering as if no request ever ran.
+        const events = entry.session.events
+        for (let index = events.length - 1; index >= 0; index--) {
+          const event = events[index]
+          if (event?.type === 'context/manifest') {
+            manifest = event.manifest
+            deps.lastManifests.set(entry.session.id, manifest)
+            break
+          }
+        }
+      }
+      if (manifest === undefined) {
+        // No live cache and no durable manifest event (a new conversation, or
+        // a log from before manifests existed). 204 keeps the inspector quiet.
         res.writeHead(204)
         res.end()
         return
       }
       const usage = deps.sessionUsage.get(entry.session.id)
-      send(200, usage !== undefined ? { ...manifest, usage } : manifest)
+      // No `last` yet means this manifest's request has not reported usage.
+      // Omit it rather than reuse the previous request's prompt count; the
+      // cache totals still belong to the session.
+      const reported = usage?.last !== undefined
+        ? usage
+        : usage !== undefined
+          ? { cacheableInputTokens: usage.cacheableInputTokens, cachedInputTokens: usage.cachedInputTokens }
+          : undefined
+      send(200, reported !== undefined ? { ...manifest, usage: reported } : manifest)
+      return
+    }
+
+    // One raw context block by hash: the trajectory's marker fetches the exact
+    // text a past request carried. The newest record wins (a re-recorded hash
+    // would be identical by construction); 404 is the honest legacy answer.
+    const wsContextBodyMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)\/context\/([0-9a-f]{64})$/.exec(pathname)
+    if (wsContextBodyMatch !== null && req.method === 'GET') {
+      const wsId = decodeURIComponent(wsContextBodyMatch[1] ?? '') as WorkspaceId
+      const entry = await findSession(decodeURIComponent(wsContextBodyMatch[2] ?? ''), wsId, deps)
+      if (entry === undefined) {
+        send(404, { error: 'no such session' })
+        return
+      }
+      const hash = wsContextBodyMatch[3] ?? ''
+      const record = [...entry.session.events].reverse().find(
+        (event): event is Extract<SessionEvent, { type: 'context/body' }> => event.type === 'context/body' && event.hash === hash,
+      )
+      if (record === undefined) {
+        send(404, { error: 'no context body recorded for this hash (older than body recording, or content changed since)' })
+        return
+      }
+      send(200, { hash: record.hash, kind: record.kind, ...(record.name !== undefined ? { name: record.name } : {}), chars: record.chars, body: record.body })
       return
     }
 
@@ -4178,26 +4494,19 @@ async function handleApi(
         return
       }
       try {
-        const hooks = await deps.mcpStore.loadHooks(wsId)
-        for (const binding of hooks.hooks['PreCompact'] ?? []) {
-          const decision = await runHook(binding, { hook_event: 'PreCompact', sessionId: entry.session.id, workspaceId: wsId })
-          entry.session.append({ type: 'hook/run', event: 'PreCompact', matcher: binding.matcher, exitCode: decision.exitCode, durationMs: decision.durationMs, decision: isBlockingDecision(decision) ? 'block' : isFailureDecision(decision) ? `failure:${binding.onFailure}` : 'allow' })
-          await entry.session.durable()
-          if (isBlockingDecision(decision) || (isFailureDecision(decision) && binding.onFailure === 'deny')) {
-            send(409, { error: `PreCompact hook blocked compaction: ${binding.command}` })
-            return
-          }
+        const blocked = await deps.runPreCompactHooks(entry.session, wsId)
+        if (blocked !== undefined) {
+          send(409, { error: blocked })
+          return
         }
+        const pair = deps.summarizerModelOf(entry.session)
         const { compactSession } = await import('../harness/context/compaction.ts')
-        const checkpoint = await compactSession(entry.session, deps.checkpoints, async ({ text }) => {
-          // Bounded extractive summarizer: the host-side default keeps the
-          // first lines of every exchange (no model call, no side effects).
-          const lines = text.split('\n').filter((line) => line.trim() !== '')
-          return lines.slice(0, 120).join('\n')
-        }, (() => {
-          const model = deps.defaults().model
-          return model !== null ? { trigger: 'manual' as const, model } : { trigger: 'manual' as const }
-        })())
+        const checkpoint = await compactSession(
+          entry.session,
+          deps.checkpoints,
+          createCompactionSummarizer((request) => deps.kernel.ctx.llm.stream(request), pair),
+          pair !== undefined ? { trigger: 'manual', model: pair.model } : { trigger: 'manual' },
+        )
         send(200, { coversSeq: checkpoint.coversSeq, summaryChars: checkpoint.summary.length })
       } catch (error) {
         send(409, { error: String(error instanceof Error ? error.message : error) })
@@ -4412,7 +4721,8 @@ async function handleApi(
     }
 
     // ── read-only project browsing (workbench Files) ───────────
-    const wsProjectFilesMatch = /^\/api\/workspaces\/([^/]+)\/projects\/([^/]+)\/(files|file|search)$/.exec(pathname)
+    // Git is read-only status and diff for the workbench Git view.
+    const wsProjectFilesMatch = /^\/api\/workspaces\/([^/]+)\/projects\/([^/]+)\/(files|file|search|git)$/.exec(pathname)
     if (wsProjectFilesMatch !== null) {
       const wsId = decodeURIComponent(wsProjectFilesMatch[1] ?? '') as WorkspaceId
       requireWorkspace(deps, wsId, false)
@@ -4424,6 +4734,12 @@ async function handleApi(
       try {
         const target = query.get('path') ?? ''
         const kind = wsProjectFilesMatch[3]
+        if (kind === 'git') {
+          send(200, target === ''
+            ? await gitStatus(project.path, deps.deniedRoots)
+            : await gitDiff(project.path, target, deps.deniedRoots))
+          return
+        }
         if (kind === 'search') {
           const rawLimit = Number.parseInt(query.get('limit') ?? '', 10)
           send(200, await searchProjectFiles(
@@ -4438,7 +4754,7 @@ async function handleApi(
           ? await listProjectEntries(project.path, target, deps.deniedRoots)
           : await readProjectFile(project.path, target, deps.deniedRoots))
       } catch (error) {
-        if (!(error instanceof ProjectFileError)) throw error
+        if (!(error instanceof ProjectFileError) && !(error instanceof ProjectGitError)) throw error
         send(400, { error: error.message })
       }
       return
@@ -4567,6 +4883,66 @@ async function handleApi(
         dirs.unshift(...drives.filter((drive) => drive.path.toLowerCase() !== abs.toLowerCase()))
       }
       send(200, { path: abs, parent: up === abs ? null : up, dirs })
+      return
+    }
+
+    // ── system prompt overrides (Settings → System Prompts) ───
+    // Per-workspace replacements for the fixed harness prompts. GET works on
+    // any known workspace; PUT requires an active one and compare-and-swaps
+    // on the config hash.
+    const wsSystemPromptsMatch = /^\/api\/workspaces\/([^/]+)\/system-prompts$/.exec(pathname)
+    if (wsSystemPromptsMatch !== null) {
+      const wsId = decodeURIComponent(wsSystemPromptsMatch[1] ?? '') as WorkspaceId
+      const snapshotBody = (snapshot: SystemPromptsSnapshot) => ({
+        base: snapshot.base,
+        child: snapshot.child,
+        defaults: { base: DEFAULT_BASE_SYSTEM, child: DEFAULT_CHILD_SYSTEM },
+        hash: snapshot.hash,
+        ...(snapshot.warning !== undefined ? { warning: snapshot.warning } : {}),
+      })
+      if (req.method === 'GET') {
+        try {
+          requireWorkspace(deps, wsId, false)
+        } catch (error) {
+          fail(error)
+          return
+        }
+        send(200, snapshotBody(await deps.systemPrompts.load(wsId)))
+        return
+      }
+      if (req.method === 'PUT') {
+        const body = await readJson(req)
+        for (const key of ['base', 'child'] as const) {
+          if (body[key] !== undefined && typeof body[key] !== 'string') {
+            send(400, { error: `body '${key}' must be a string` })
+            return
+          }
+        }
+        const expectedHash = typeof body['expectedHash'] === 'string' ? body['expectedHash'] : undefined
+        try {
+          requireWorkspace(deps, wsId, true)
+        } catch (error) {
+          fail(error)
+          return
+        }
+        try {
+          const snapshot = await deps.systemPrompts.save(
+            wsId,
+            {
+              ...(typeof body['base'] === 'string' ? { base: body['base'] } : {}),
+              ...(typeof body['child'] === 'string' ? { child: body['child'] } : {}),
+            },
+            expectedHash,
+          )
+          send(200, snapshotBody(snapshot))
+        } catch (error) {
+          const msg = String(error instanceof Error ? error.message : error)
+          if (/^conflict:/.test(msg)) { send(409, { error: msg }); return }
+          send(400, { error: msg })
+        }
+        return
+      }
+      send(405, { error: 'method not allowed' })
       return
     }
 
@@ -4816,7 +5192,7 @@ async function handleApi(
       }
       // Only a root session's out-of-grant question with a grantable folder
       // can be answered for the session; children keep their spawn snapshot.
-      const outside = answerScope === 'session' ? deps.pathScope.get(waiting.sessionId, waiting.call) : undefined
+      const outside = answerScope === 'session' ? deps.pathScope.get(waiting.executionId ?? waiting.sessionId, waiting.call) : undefined
       if (answerScope === 'session' && (!allow || waiting.proposedGrant === undefined || waiting.parentSessionId !== undefined || outside === undefined)) {
         send(400, { error: 'this question cannot be answered for the whole session' })
         return
@@ -5320,17 +5696,23 @@ function workspaceMeta(workspaceId: WorkspaceId, deps: HandlerDeps, folder?: str
 /** A deleted session leaves no per-session index behind (manifest, child indexes). */
 function forgetSessionState(sessionId: SessionId, deps: HandlerDeps): void {
   deps.lastManifests.delete(sessionId)
+  deps.contextBodies.delete(sessionId)
   deps.sessionUsage.delete(sessionId)
   for (const childId of deps.childExecutor.forgetRoot(sessionId)) {
     deps.lastManifests.delete(childId)
+    deps.contextBodies.delete(childId)
     deps.sessionUsage.delete(childId)
   }
 }
 
 /** Token usage the provider reported for one session since this host started. */
 interface SessionUsage {
-  /** The newest request's usage: its prompt size is the live context fill. */
-  readonly last: TokenUsage
+  /**
+   * The newest COMPLETED request's usage. Absent between assembling the next
+   * request and that request reporting its own prompt count, so a manifest
+   * is never paired with an older prompt size.
+   */
+  readonly last?: TokenUsage
   /** Prompt tokens summed over requests that reported a cached share. */
   readonly cacheableInputTokens: number
   readonly cachedInputTokens: number

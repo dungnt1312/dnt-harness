@@ -1,5 +1,9 @@
-/** The fixed workbench views. Files is the anchor and is always open. */
-export type WorkbenchViewName = 'files' | 'context' | 'artifacts' | 'agents' | 'terminal'
+/**
+ * The fixed workbench views. Files is the anchor and is always open. Terminal
+ * is one of them: a closable tab beside Files, Git, and the rest. The chat
+ * column has its own terminal, a footer that stays hidden until Ctrl+`.
+ */
+export type WorkbenchViewName = 'files' | 'context' | 'trajectory' | 'agents' | 'git' | 'terminal'
 
 /** The view that can never be closed, so the workbench is never tabless. */
 export const ANCHOR_VIEW: WorkbenchViewName = 'files'
@@ -26,6 +30,10 @@ export interface WorkbenchPreferencesV1 {
    * remembered shell that is no longer installed cannot strand the view.
    */
   readonly terminalShell: string | null
+  /** Whether the terminal footer under the chat is shown. Ctrl+` toggles it. */
+  readonly terminalOpen: boolean
+  /** Height of the terminal dock in CSS pixels. */
+  readonly terminalHeight: number
 }
 
 export const WORKBENCH_STORAGE_KEY = 'mini-dsh.workbench.v1'
@@ -38,21 +46,24 @@ export const WORKBENCH_DEFAULTS: WorkbenchPreferencesV1 = {
   inspectorTab: 'files',
   inspectorViews: ['files'],
   terminalShell: null,
+  terminalOpen: false,
+  terminalHeight: 280,
 }
 
 export const PANEL_LIMITS = {
   left: { min: 232, max: 420, default: 280 },
   right: { min: 360, max: 1100, default: 560 },
+  terminal: { min: 120, max: 900, default: 280 },
 } as const
 
-export function clampPanelWidth(side: 'left' | 'right', value: number): number {
+export function clampPanelWidth(side: 'left' | 'right' | 'terminal', value: number): number {
   const limits = PANEL_LIMITS[side]
   if (!Number.isFinite(value)) return limits.default
   return Math.min(limits.max, Math.max(limits.min, value))
 }
 
 function isInspectorTab(value: unknown): value is WorkbenchViewName {
-  return value === 'files' || value === 'context' || value === 'artifacts' || value === 'agents' || value === 'terminal'
+  return value === 'files' || value === 'context' || value === 'trajectory' || value === 'agents' || value === 'git' || value === 'terminal'
 }
 
 /**
@@ -114,6 +125,12 @@ export function parseWorkbenchPreferences(raw: string | null): WorkbenchPreferen
       terminalShell: typeof record.terminalShell === 'string' && record.terminalShell !== ''
         ? record.terminalShell
         : WORKBENCH_DEFAULTS.terminalShell,
+      terminalOpen: typeof record.terminalOpen === 'boolean'
+        ? record.terminalOpen
+        : WORKBENCH_DEFAULTS.terminalOpen,
+      terminalHeight: typeof record.terminalHeight === 'number'
+        ? clampPanelWidth('terminal', record.terminalHeight)
+        : WORKBENCH_DEFAULTS.terminalHeight,
     }
   } catch {
     return WORKBENCH_DEFAULTS

@@ -34,17 +34,38 @@ export class AuditFaultBlock extends Error {
 
 export async function dispatchToolCall(input: DispatchInput, auditFaultFile: string): Promise<DispatchOutput> {
   if (await faultIsOpen(auditFaultFile)) throw new AuditFaultBlock()
-  const existing = input.journal.hasTerminal(input.intent.invocationId)
-  if (existing !== undefined) {
+  const invocationId = input.intent.invocationId
+  const claim = input.journal.reserve(input.intent)
+  if (claim === 'integrity') {
     return {
-      outcome: existing.outcome,
-      output: existing.detail,
-      invocationId: input.intent.invocationId,
+      outcome: 'error',
+      output: `MCP call was not sent: integrity error — execution '${invocationId}' is already bound to a different intent`,
+      invocationId,
+    }
+  }
+  if (claim === 'in-flight') {
+    return {
+      outcome: 'indeterminate',
+      output: `MCP call was not sent again: execution '${invocationId}' is already in flight`,
+      invocationId,
+    }
+  }
+  if (claim === 'terminal') {
+    const existing = input.journal.hasTerminal(invocationId)
+    const outcome = existing?.outcome ?? 'indeterminate'
+    return {
+      outcome,
+      // The journal keeps only a bounded audit detail, never the full remote
+      // result: report the durable outcome instead of passing that detail off
+      // as the answer.
+      output: `MCP call was not sent again: execution '${invocationId}' already ended ${outcome}; result unavailable after restart`,
+      invocationId,
     }
   }
   try {
     await input.journal.appendIntent({ kind: 'dispatch_intent', ...input.intent })
   } catch (error) {
+    input.journal.release(invocationId)
     return {
       outcome: 'error',
       output: `MCP call was not sent: ${error instanceof Error ? error.message : String(error)}`,

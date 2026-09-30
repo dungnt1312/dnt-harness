@@ -30,8 +30,8 @@ export {
 } from './kernel/loader.ts'
 
 // ── Util ──────────────────────────────────────────────────────────────────
-export type { Branded, SessionId, StepId, TurnId, InputId, WorkspaceId, ProjectId } from './util/brand.ts'
-export { newSessionId, newStepId, newTurnId, newInputId, newWorkspaceId, newProjectId } from './util/brand.ts'
+export type { Branded, SessionId, StepId, TurnId, ExecutionId, InputId, WorkspaceId, ProjectId } from './util/brand.ts'
+export { newSessionId, newStepId, newTurnId, newExecutionId, newInputId, newWorkspaceId, newProjectId } from './util/brand.ts'
 
 // ── Harness: limits ──────────────────────────────────────────────────────
 export { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from './harness/limits.ts'
@@ -146,6 +146,8 @@ export {
 // ── Harness: context builder + budget + compaction (G3) ────────────────
 export {
   buildContext,
+  DEFAULT_BASE_SYSTEM,
+  DEFAULT_CHILD_SYSTEM,
   ContextBudgetError,
   type ActiveSkill,
   type AssembledContext,

@@ -82,14 +82,16 @@ describe('G4 HTTP surface', () => {
     })
     expect(spawned.status).toBe(202)
     const handle = (await spawned.json()) as { childSessionId: string; status: string }
-    expect(handle.status).toBe('running')
+    expect(['queued', 'dispatching', 'running']).toContain(handle.status)
 
     // Children listed under the root.
     const children = (await (await fetch(`${base}/api/workspaces/${wsId}/agents/children?root=${rootSession.id}`)).json()) as { status: string }[]
     expect(children.length).toBe(1)
 
-    // Cancel via the lifecycle route.
-    const cancelled = await post(base, `/api/workspaces/${wsId}/children/${handle.childSessionId}/cancel`)
+    // Lifecycle routes must name the owning root; a sibling cannot cancel.
+    const sibling = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    expect((await post(base, `/api/workspaces/${wsId}/sessions/${sibling.id}/children/${handle.childSessionId}/cancel`)).status).toBe(404)
+    const cancelled = await post(base, `/api/workspaces/${wsId}/sessions/${rootSession.id}/children/${handle.childSessionId}/cancel`)
     expect(cancelled.status).toBe(200)
     expect(((await cancelled.json()) as { status: string }).status).toBe('cancelled')
 
@@ -126,7 +128,7 @@ describe('G4 HTTP surface', () => {
       rootSessionId: parent.id, task: { objective: 'wait', requiredResult: 'summary' },
     })
     const child = await spawned.json() as { childSessionId: string; status: string }
-    expect(child.status).toBe('running')
+    expect(['queued', 'dispatching', 'running']).toContain(child.status)
 
     const foreign = await post(base, `/api/workspaces/${workspace.id}/sessions/${otherParent.id}/children/${child.childSessionId}/reconcile`)
     expect(foreign.status).toBe(404)
@@ -176,7 +178,7 @@ describe('G4 HTTP surface', () => {
     const handle = (await spawned.json()) as { childSessionId: string }
 
     // Wait for the child turn to settle, then read the durable log.
-    const settled = await (await fetch(`${base}/api/workspaces/${wsId}/children/${handle.childSessionId}?waitMs=8000`)).json() as { status: string }
+    const settled = await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${rootSession.id}/children/${handle.childSessionId}?waitMs=8000`)).json() as { status: string }
     expect(settled.status).toBe('completed')
 
     const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${handle.childSessionId}/events`)
@@ -283,13 +285,18 @@ describe('G4 HTTP surface', () => {
     const inherited = await post(base, `/api/workspaces/${wsId}/agents/explorer`, {
       rootSessionId: rootSession.id,
       task: { objective: 'inherit the conversation model' },
+      keepOpen: true,
     })
     expect(inherited.status).toBe(202)
-    expect(((await inherited.json()) as { model?: string }).model).toBe('house:house-large')
+    const inheritedHandle = (await inherited.json()) as { model?: string; parentTurnId: string }
+    expect(inheritedHandle.model).toBe('house:house-large')
+    const parentTurnId = inheritedHandle.parentTurnId
 
     // An explicit choice on another provider wins, provider included.
     const chosen = await post(base, `/api/workspaces/${wsId}/agents/explorer`, {
       rootSessionId: rootSession.id,
+      parentTurnId,
+      keepOpen: true,
       task: { objective: 'research a b c' },
       model: 'far:gpt-luna',
     })
@@ -299,6 +306,7 @@ describe('G4 HTTP surface', () => {
     // A bare name resolves to the one provider that offers it.
     const bare = await post(base, `/api/workspaces/${wsId}/agents/explorer`, {
       rootSessionId: rootSession.id,
+      parentTurnId,
       task: { objective: 'bare name' },
       model: 'gpt-luna',
     })
@@ -430,7 +438,7 @@ describe('G4 HTTP surface', () => {
     })
     expect(spawned.status).toBe(202)
     const handle = (await spawned.json()) as { childSessionId: string }
-    const settled = await (await fetch(`${base}/api/workspaces/${wsId}/children/${handle.childSessionId}?waitMs=8000`)).json() as { status: string }
+    const settled = await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${rootSession.id}/children/${handle.childSessionId}?waitMs=8000`)).json() as { status: string }
     expect(settled.status).toBe('completed')
 
     const denial = await toolResultMatching(base, wsId, handle.childSessionId, /one-level delegation/)

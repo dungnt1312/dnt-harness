@@ -1,10 +1,13 @@
 /**
- * CLI smoke: headless has no Settings surface, so it must fail with an
- * actionable message rather than silently switching to a scripted mock.
+ * CLI smoke: without a key the process still boots. A model call then fails
+ * because no provider is registered — it must not pretend a mock answered.
  */
 import { spawn } from 'node:child_process'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 
 const binPath = fileURLToPath(new URL('../../src/bins/headless.ts', import.meta.url))
 
@@ -30,12 +33,20 @@ function runCli(args: string[]): Promise<{ code: number | null; stdout: string; 
 }
 
 describe('headless CLI', () => {
-  it('fails clearly instead of falling back to a mock provider', async () => {
-    const { code, stdout, stderr } = await runCli(['--message', 'hello'])
+  let dataDir: string | undefined
 
-    expect(code).toBe(1)
-    expect(stdout).toBe('')
-    expect(stderr).toContain('headless requires DEEPSEEK_API_KEY')
+  afterEach(async () => {
+    if (dataDir !== undefined) await rm(dataDir, { recursive: true, force: true })
+  })
+
+  it('starts without DEEPSEEK_API_KEY and does not fall back to a mock provider', async () => {
+    dataDir = await mkdtemp(path.join(tmpdir(), 'mini-dsh-headless-'))
+    const { code, stdout, stderr } = await runCli(['--data-dir', dataDir, '--message', 'hello'])
+
+    expect(code).toBe(0)
+    expect(stderr).toContain('no DEEPSEEK_API_KEY')
     expect(stderr).not.toContain('mock provider')
+    expect(stdout).toContain('no provider registered')
+    expect(stdout).not.toContain('mock')
   }, 30_000)
 })

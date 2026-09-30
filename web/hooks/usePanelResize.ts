@@ -4,30 +4,35 @@ const KEY_STEP = 16
 const KEY_STEP_LARGE = 64
 
 /**
- * Pointer + keyboard resizing for a panel docked on either edge. The `side`
- * decides which drag/arrow direction widens it. The caller owns clamping and
- * persistence through `onChange`.
+ * Pointer + keyboard resizing for a panel docked on any edge but the top. The
+ * `side` decides which drag/arrow direction grows it; for `bottom` the size is
+ * a height and dragging up grows it. The caller owns clamping and persistence
+ * through `onChange`.
  */
 export function usePanelResize({ width, min, max, defaultWidth, side = 'right', onChange }: {
+  /** The current size: a width, or a height for `side: 'bottom'`. */
   readonly width: number
   readonly min: number
   readonly max: number
   readonly defaultWidth: number
-  readonly side?: 'left' | 'right'
+  readonly side?: 'left' | 'right' | 'bottom'
   readonly onChange: (width: number) => void
 }) {
+  const vertical = side === 'bottom'
   const drag = useRef<{ readonly startX: number; readonly startWidth: number; readonly userSelect: string } | null>(null)
   const clamp = useCallback((value: number) => Math.min(max, Math.max(min, Math.round(value))), [min, max])
 
   const onPointerDown = (event: PointerEvent<HTMLDivElement>): void => {
     if (event.button !== 0) return
     event.currentTarget.setPointerCapture(event.pointerId)
-    drag.current = { startX: event.clientX, startWidth: width, userSelect: document.body.style.userSelect }
+    drag.current = { startX: vertical ? event.clientY : event.clientX, startWidth: width, userSelect: document.body.style.userSelect }
     document.body.style.userSelect = 'none'
   }
   const onPointerMove = (event: PointerEvent<HTMLDivElement>): void => {
     if (drag.current === null) return
-    const delta = side === 'left' ? event.clientX - drag.current.startX : drag.current.startX - event.clientX
+    const delta = vertical
+      ? drag.current.startX - event.clientY
+      : side === 'left' ? event.clientX - drag.current.startX : drag.current.startX - event.clientX
     onChange(clamp(drag.current.startWidth + delta))
   }
   const end = (event: PointerEvent<HTMLDivElement>): void => {
@@ -38,7 +43,13 @@ export function usePanelResize({ width, min, max, defaultWidth, side = 'right', 
   }
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
     const step = event.shiftKey ? KEY_STEP_LARGE : KEY_STEP
-    const next = event.key === 'ArrowLeft' ? width + (side === 'left' ? -step : step)
+    const next = vertical
+      ? event.key === 'ArrowUp' ? width + step
+        : event.key === 'ArrowDown' ? width - step
+          : event.key === 'Home' ? max
+            : event.key === 'End' ? min
+              : null
+      : event.key === 'ArrowLeft' ? width + (side === 'left' ? -step : step)
       : event.key === 'ArrowRight' ? width + (side === 'left' ? step : -step)
         : event.key === 'Home' ? (side === 'left' ? min : max)
           : event.key === 'End' ? (side === 'left' ? max : min)
@@ -51,7 +62,8 @@ export function usePanelResize({ width, min, max, defaultWidth, side = 'right', 
   return {
     role: 'separator' as const,
     tabIndex: 0,
-    'aria-orientation': 'vertical' as const,
+    // A separator's orientation is the line's, not the drag's.
+    'aria-orientation': (vertical ? 'horizontal' : 'vertical') as 'horizontal' | 'vertical',
     'aria-valuemin': min,
     'aria-valuemax': max,
     'aria-valuenow': width,

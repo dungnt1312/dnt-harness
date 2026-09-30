@@ -5,6 +5,7 @@
  * manifest endpoint.
  */
 import { promises as fs } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -36,6 +37,20 @@ async function post(base: string, pathname: string, body?: unknown): Promise<Res
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  })
+}
+
+/** A workspace-authored conversation mode with zero exposure: no tools, no optional sources. */
+const ZERO_MODE_CONTENT = [
+  '---', 'name: Zero', 'toolExposure: []', 'workspaceInstructions: false',
+  'skills: off', 'memoryPinned: false', 'memoryRetrieval: false', '---', '', 'No tools.',
+].join('\n')
+
+function putZeroMode(base: string, wsId: string): Promise<Response> {
+  return fetch(`${base}/api/workspaces/${wsId}/modes/zero`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ content: ZERO_MODE_CONTENT }),
   })
 }
 
@@ -86,10 +101,11 @@ describe('live mode control', () => {
     const server = await start([spy])
     const base = server.url
     const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
+    expect((await putZeroMode(base, wsId)).status).toBe(200)
     expect((await fetch(`${base}/api/workspaces/${wsId}/mode`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ modeId: 'chat' }),
+      body: JSON.stringify({ modeId: 'zero' }),
     })).status).toBe(200)
 
     const { id } = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
@@ -150,7 +166,9 @@ describe('live mode control', () => {
       if (events.some((event) => event.type === 'tool/call' && (event as { call?: { id?: string } }).call?.id === 'c1')) break
       await new Promise((resolve) => setTimeout(resolve, 100))
     }
-    expect((await fetch(`${base}/api/workspaces/${wsId}/mode`, {
+    // The running conversation's OWN mode flips (a workspace selection would
+    // only seed new conversations).
+    expect((await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/mode`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ modeId: 'plan' }),
@@ -398,10 +416,11 @@ describe('live mode control', () => {
     }])
     const base = server.url
     const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
+    expect((await putZeroMode(base, wsId)).status).toBe(200)
     await fetch(`${base}/api/workspaces/${wsId}/mode`, {
       method: 'PUT',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ modeId: 'chat' }),
+      body: JSON.stringify({ modeId: 'zero' }),
     })
     const { id } = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
     await post(base, `/api/workspaces/${wsId}/sessions/${id}/messages`, { content: 'hello' })
@@ -414,11 +433,47 @@ describe('live mode control', () => {
       omissions: string[]
       budget: { estimated: boolean }
     }
-    expect(manifest.modeId).toBe('chat')
+    expect(manifest.modeId).toBe('zero')
     expect(manifest.sources.toolSchemas).toBe(0)
     expect(manifest.omissions.some((line) => line.includes('tool-schemas'))).toBe(true)
     expect(manifest.budget.estimated).toBe(true)
-    expect(manifest.modeRevision).toBeGreaterThanOrEqual(2)
+    // The conversation snapshotted the workspace default at creation: its
+    // own mode revision starts at 1 and advances with its own selections.
+    expect(manifest.modeRevision).toBe(1)
+  })
+
+  it('a restart rehydrates the newest manifest from the durable log', async () => {
+    // The in-memory map is a cache of the latest request; the manifest event
+    // in the log is the durable fact. A fresh boot on the same home must
+    // serve it, or every pre-restart conversation shows an empty meter.
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-manifest-'))
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() { yield { type: 'delta', delta: 'hi' } },
+    }
+    const first = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json') })
+    const wsId = (await (await fetch(`${first.url}/api/workspaces`)).json() as { id: string }[])[0]!.id
+    const { id } = (await (await post(first.url, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    await post(first.url, `/api/workspaces/${wsId}/sessions/${id}/messages`, { content: 'hello' })
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    const before = (await (await fetch(`${first.url}/api/workspaces/${wsId}/sessions/${id}/manifest`)).json()) as {
+      modeId: string
+      budget: { usedTokens: number }
+    }
+    expect(before.budget.usedTokens).toBeGreaterThan(0)
+    await first.close()
+
+    const second = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json') })
+    try {
+      const after = await fetch(`${second.url}/api/workspaces/${wsId}/sessions/${id}/manifest`)
+      expect(after.status).toBe(200)
+      const manifest = (await after.json()) as { modeId: string; budget: { usedTokens: number } }
+      expect(manifest.modeId).toBe(before.modeId)
+      expect(manifest.budget.usedTokens).toBe(before.budget.usedTokens)
+    } finally {
+      await second.close().catch(() => {})
+      await fs.rm(home, { recursive: true, force: true })
+    }
   })
 
   it('workspace meta exposes the selected mode; policy defaults come from the mode', async () => {
@@ -716,6 +771,85 @@ describe('live mode control', () => {
     }
   })
 
+  it('Skill exposes a catalog action and reports missing names as a normal result', async () => {
+    let step = 0
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() {
+        step += 1
+        if (step === 1) {
+          yield { type: 'toolCalls', calls: [{ id: 'skill-catalog', name: 'Skill', args: { action: 'catalog' } }] }
+          return
+        }
+        if (step === 2) {
+          yield { type: 'toolCalls', calls: [{ id: 'skill-missing', name: 'Skill', args: { action: 'load', name: 'missing-skill' } }] }
+          return
+        }
+        yield { type: 'delta', delta: 'done' }
+      },
+    }
+    const server = await start([provider])
+    const base = server.url
+    const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
+    const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'skills' })
+
+    await expect.poll(async () => {
+      const events = await readAllEvents(base, wsId, session.id)
+      return events.filter((event) => event.type === 'tool/result').length
+    }, { timeout: 6_000 }).toBe(2)
+    const results = (await readAllEvents(base, wsId, session.id))
+      .filter((event) => event.type === 'tool/result') as { ok?: boolean; output?: string }[]
+    expect(results[0]).toMatchObject({ ok: true, output: 'no skills available' })
+    expect(results[1]?.ok).toBe(true)
+    expect(results[1]?.output).toContain("skill 'missing-skill' not found; use Skill action:\"catalog\" with an optional query")
+  })
+
+  it('hiding a skill removes it from discovery but an explicit load still works', async () => {
+    let step = 0
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() {
+        step += 1
+        if (step === 1) {
+          yield { type: 'toolCalls', calls: [{ id: 'skill-catalog', name: 'Skill', args: { action: 'catalog' } }] }
+          return
+        }
+        if (step === 2) {
+          yield { type: 'toolCalls', calls: [{ id: 'skill-hidden-load', name: 'Skill', args: { action: 'load', name: 'quiet-skill' } }] }
+          return
+        }
+        yield { type: 'delta', delta: 'done' }
+      },
+    }
+    const server = await start([provider])
+    const base = server.url
+    const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
+    const skill = (name: string) => `---\nname: ${name}\ndescription: "${name} body"\n---\n\nsteps`
+    await fetch(`${base}/api/workspaces/${wsId}/skills/loud-skill`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: skill('loud-skill') }) })
+    await fetch(`${base}/api/workspaces/${wsId}/skills/quiet-skill`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: skill('quiet-skill') }) })
+    const hidden = await fetch(`${base}/api/workspaces/${wsId}/skills/quiet-skill/hidden`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hidden: true }) })
+    expect(hidden.status).toBe(200)
+
+    const rows = (await (await fetch(`${base}/api/workspaces/${wsId}/skills`)).json()) as { name: string; hidden?: boolean }[]
+    expect(rows.find((row) => row.name === 'quiet-skill')).toMatchObject({ hidden: true })
+    expect(rows.find((row) => row.name === 'loud-skill')?.hidden ?? false).toBe(false)
+
+    const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'skills' })
+    await expect.poll(async () => {
+      const events = await readAllEvents(base, wsId, session.id)
+      return events.filter((event) => event.type === 'tool/result').length
+    }, { timeout: 6_000 }).toBe(2)
+    const results = (await readAllEvents(base, wsId, session.id))
+      .filter((event) => event.type === 'tool/result') as { ok?: boolean; output?: string }[]
+    expect(results[0]?.output).toContain('loud-skill')
+    expect(results[0]?.output).not.toContain('quiet-skill')
+    // Demand-only: the hidden skill still loads when named exactly.
+    expect(results[1]).toMatchObject({ ok: true })
+    expect(results[1]?.output).toContain("skill 'quiet-skill' loaded")
+  })
+
   it('--yolo skips mode ask defaults so Write runs without an approval question', async () => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-yolo-'))
     const proj = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-yolo-proj-'))
@@ -814,6 +948,91 @@ async function waitForToolCall(base: string, wsId: string, sessionId: string): P
   }
   throw new Error('no tool/call observed')
 }
+
+describe('context manifest records', () => {
+  it('each request records a durable context/manifest between step/start and its answer', async () => {
+    let calls = 0
+    const scripted: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() {
+        calls += 1
+        if (calls === 1) {
+          yield { type: 'toolCalls', calls: [{ id: 'c1', name: 'Glob', args: { pattern: '*' } }] }
+          return
+        }
+        yield { type: 'delta', delta: 'answer' }
+      },
+    }
+    const server = await start([scripted])
+    const base = server.url
+    const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
+    // A bound project exposes the file tools in the default mode.
+    const projDir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-ctx-'))
+    const project = (await (await post(base, `/api/workspaces/${wsId}/projects`, { name: 'P', path: projDir })).json()) as { id: string }
+    const { id } = (await (await post(base, `/api/workspaces/${wsId}/sessions`, { projectId: project.id })).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${id}/messages`, { content: 'list files' })
+    for (let i = 0; i < 60; i++) {
+      const listing = (await (await fetch(`${base}/api/workspaces/${wsId}/sessions`)).json()) as { id: string; status: string }[]
+      if (listing.find((row) => row.id === id)?.status === 'idle') break
+      await new Promise((resolve) => setTimeout(resolve, 250))
+    }
+
+    const events = await readAllEvents(base, wsId, id)
+    const manifestAt = events.map((event, index) => (event.type === 'context/manifest' ? index : -1)).filter((index) => index >= 0)
+    expect(manifestAt).toHaveLength(2)
+    const firstStep = events.findIndex((event) => event.type === 'step/start')
+    const firstAnswer = events.findIndex((event) => event.type === 'assistant/message')
+    const answer = events.findIndex((event) => event.type === 'assistant/message' && (event as { content?: string }).content === 'answer')
+    const secondStep = events.findIndex((event, index) => index > firstAnswer && event.type === 'step/start')
+    expect(firstStep).toBeGreaterThan(0)
+    expect(manifestAt[0]).toBeGreaterThan(firstStep)
+    expect(manifestAt[0]).toBeLessThan(firstAnswer)
+    expect(secondStep).toBeGreaterThan(firstAnswer)
+    expect(manifestAt[1]).toBeGreaterThan(secondStep)
+    expect(manifestAt[1]).toBeLessThan(answer)
+    for (const index of manifestAt) {
+      expect((events[index] as { turnId?: string }).turnId).toBeTypeOf('string')
+    }
+
+    // The record is the request's own manifest, refreshed per step: the
+    // second request carries the first step's answer and tool result.
+    const first = (events[manifestAt[0]!] as unknown as { manifest: { modeId: string; budget: { usedTokens: number }; sources: { toolNames: readonly string[] } } }).manifest
+    const second = (events[manifestAt[1]!] as unknown as { manifest: { budget: { usedTokens: number }; sources: { toolNames: readonly string[] } } }).manifest
+    expect(first.modeId).toBeTypeOf('string')
+    expect(first.budget.usedTokens).toBeGreaterThan(0)
+    expect(first.sources.toolNames).toContain('Glob')
+    expect(second.budget.usedTokens).toBeGreaterThan(first.budget.usedTokens)
+
+    // Durable: the canonical log holds the records, not just memory.
+    const home = serverHomes.get(server)!
+    const raw = await fs.readFile(path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl'), 'utf8')
+    expect(raw).toContain('context/manifest')
+    expect(raw).toContain('context/body')
+
+    // Raw section bodies: both steps carried the identical system text, so it
+    // is recorded exactly once, keyed by its own content hash.
+    const bodies = events.filter((event) => event.type === 'context/body') as { hash?: string; kind?: string; body?: string; chars?: number }[]
+    expect(bodies).toHaveLength(1)
+    expect(bodies[0]?.kind).toBe('system')
+    expect(bodies[0]?.body).toContain('You are mini-dsh')
+    expect(bodies[0]?.chars).toBe(bodies[0]?.body?.length)
+    expect(createHash('sha256').update(bodies[0]?.body ?? '', 'utf8').digest('hex')).toBe(bodies[0]?.hash)
+    const manifestSections = (events[manifestAt[0]!] as unknown as { manifest: { sections: { kind: string; hash: string; chars: number }[] } }).manifest.sections
+    expect(manifestSections.map((section) => section.hash)).toContain(bodies[0]?.hash)
+
+    // The raw block fetches back by hash; unknown hashes fail honestly.
+    const bodyResponse = await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/context/${bodies[0]?.hash}`)
+    expect(bodyResponse.status).toBe(200)
+    const bodyPayload = await bodyResponse.json() as { kind?: string; body?: string }
+    expect(bodyPayload.kind).toBe('system')
+    expect(bodyPayload.body).toContain('You are mini-dsh')
+    expect((await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/context/${'0'.repeat(64)}`)).status).toBe(404)
+
+    // The inspector route still serves the last request's manifest.
+    const live = await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/manifest`)).json() as { modeId?: string }
+    expect(live.modeId).toBe(first.modeId)
+  }, 30_000)
+})
 
 async function waitForToolResult(base: string, wsId: string, sessionId: string): Promise<{ ok: boolean; output: string }> {
   const deadline = Date.now() + 6_000

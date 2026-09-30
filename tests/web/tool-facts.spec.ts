@@ -51,11 +51,35 @@ describe('Write and Edit facts', () => {
   })
   it('sizes an edit from the exact replacement it recorded', () => {
     const facts = toolFacts(call('Edit', { path: 'web/lib/format.ts', old: 'a\nb\nc', new: 'a\nb\nc\nd\ne\nf\ng' }), ok('edited web/lib/format.ts'))
-    expect(facts.digest).toBe('-3 +7 lines')
+    expect(facts.digest).toBeUndefined()
+    expect(facts.lines).toEqual({ removed: 3, added: 7 })
     expect(facts.path).toBe('web/lib/format.ts')
   })
   it('keeps the path as the target even when the model sent the text first', () => {
     expect(toolFacts(call('Edit', { old: 'long old text', new: 'new', path: 'a.ts' })).fullTarget).toBe('a.ts')
+  })
+})
+
+describe('file row directory', () => {
+  it('keeps a short directory whole', () => {
+    const facts = toolFacts(call('Read', { path: 'src/harness/tools/service.ts' }), ok('one line'))
+    expect(facts.file?.directory).toBe('src/harness/tools')
+  })
+  it('elides a long directory from the head, keeping the segments nearest the file', () => {
+    const path = 'C:\\Users\\DungNguyen\\workspace\\ZCode\\packages\\services\\src\\runtime-tools\\agentProxyEnv.ts'
+    const facts = toolFacts(call('Read', { path }), ok('one line'))
+    const directory = facts.file?.directory ?? ''
+    expect(directory.startsWith('…\\')).toBe(true)
+    expect(directory.endsWith('src\\runtime-tools')).toBe(true)
+    expect(directory.length).toBeLessThan(path.length)
+    // The row tooltip and the workbench opener still carry the whole path.
+    expect(facts.fullTarget).toBe(path)
+  })
+  it('elides a long POSIX directory with its own separator', () => {
+    const facts = toolFacts(call('Edit', { path: '/srv/jenkins/workspaces/feature-branch-a/source/generated/overrides/bundle.ts' }), ok('x'))
+    const directory = facts.file?.directory ?? ''
+    expect(directory.startsWith('…/')).toBe(true)
+    expect(directory.endsWith('generated/overrides')).toBe(true)
   })
 })
 

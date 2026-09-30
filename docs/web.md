@@ -39,7 +39,7 @@ UI from it at any time.
 - The sidebar footer owns workspace selection; the sidebar also groups project history and search. History filters only affect navigation, never a session's immutable execution project.
 - The Context sheet starts closed at every viewport size. Context manifests load only while it is open. The main pane shows durable task lifecycle and separately explains event-stream connection loss. Queued/being-submitted inputs show preparing; open turns show running or waiting approval; terminal reasons remain visible. Partial assistant chunks stop appearing live at turn end.
 - Composer is a contenteditable with inline chips: `@` lists files from the conversation's project (bounded search that never follows symlinks or walks hidden/`node_modules` trees) and inserts a mention chip rendered where the caret was; `/` at the start inserts a skill invocation phrase as plain text; `+` attaches a project file (reference chip) or an uploaded file (stored blob chip), and pasted/dropped images become attachment chips. Neither completion nor attachment grants a permission, reads a file, or pins a skill by itself. Both menus stay shut without a source, are driven from the contenteditable (a combobox with `aria-activedescendant`), and Escape closes them until the query changes. Removing a chip removes exactly that segment; ArrowUp on an empty composer brings back the newest own message; unsent drafts (text plus chips) survive a reload.
-- Composer context shows the fixed project path or an explicit no-project warning with a new-conversation CTA. “Chat-only” describes absence of a project, not an automatic switch to Chat mode or a promise to disable every tool. Model and thinking controls belong to the conversation and apply at its next request (the no-conversation pickers write the global default for future sessions); the selected mode governs permissions at the next request/tool gate. Mode and server restrictions still apply.
+- Composer context shows the fixed project path or an explicit no-project warning with a new-conversation CTA. “Chat-only” describes absence of a project, not a mode switch or a promise to disable every tool. Model and thinking controls belong to the conversation and apply at its next request (the no-conversation pickers write the global default for future sessions); the selected mode governs permissions at the next request/tool gate. Mode and server restrictions still apply.
 - The thinking chip names the level the next request really carries, and changing the model re-resolves it: a saved level the newly selected model does not document is dropped from the request (that model's own default governs) and the chip reports it as ignored rather than showing a level the wire will never carry. The saved value stays in the conversation's log and applies again on a model that offers it.
 - The composer footer is grouped by what each control decides, not by control type: attach and mode sit on the left, while the model and its thinking level — whose available levels come from that model — sit together on the right next to Send. The footer answers to the composer's own width (a container query, because the column is far narrower than the viewport with the sidebar open): one row when controls fit, otherwise two deliberate rows rather than a ragged wrap. When the row is tight the model name truncates and nothing else does, and it never truncates to nothing.
 - Approval review exposes tool name, target, full escaped JSON arguments, call ID, conversation project and the window the request cancels itself in. **Allow once** and **Deny** answer only that pending request. It does not widen host `blockedTools`, mode exposure, or project root. A file path outside the granted folders shows `Outside granted folders: …`; on a root conversation the card may also offer **Allow `<folder>` for this session**, naming exactly the folder it grants.
@@ -67,10 +67,10 @@ The web bin (`src/bins/web.ts`) accepts:
 | `--auth` | require control-plane pairing; the startup line then prints a single-use code (`MINI_DSH_AUTH=1` does the same, `--no-auth` overrides it) | off |
 
 The server always boots even with no provider configured, so the Settings panel
-can add one. `DEEPSEEK_API_KEY` seeds a `deepseek` entry on first boot; a blank
-or absent key prints a hint pointing at the Settings UI. The scripted mock
-provider is gone — without a usable provider, chat requests answer `400` until
-one is configured.
+can add one. A non-blank `DEEPSEEK_API_KEY` seeds a `deepseek` entry on first
+boot when the provider config is empty; a blank or absent key does not. The
+scripted mock provider is gone — without a usable provider, chat requests
+answer `400` until one is configured.
 
 ## Provider configuration
 
@@ -130,13 +130,14 @@ tool root. The families, at a glance:
 | `…/:wid/sessions`, `…/:wid/sessions/:id` (+ `/events` SSE, `/messages`, `/stop`) | session lifecycle, streaming, queued messages, stop. `/messages` answers 409 for a child agent session: children are executor-managed and cannot be resumed directly |
 | `GET/PUT …/:wid/sessions/:id/model` | the conversation's own model controls (model, provider, thinking level) — see the per-conversation model section |
 | `GET/PUT …/:wid/sessions/:id/grants` | the conversation's extra file-tool folders: `GET` returns `{ revision, roots, effective }` (effective = project + session grants merged); `PUT { expectedRevision, roots: [{ path, access }] }` replaces the list — browser principal only, `409` on a stale revision or a conversation without a project, `400` for a folder the grant validator refuses (see `docs/capabilities.md`) |
-| `…/:wid/sessions/:id/manifest`, `…/compact` | per-request context manifest; manual compaction into an immutable checkpoint |
+| `…/:wid/sessions/:id/manifest`, `…/compact` | per-request context manifest; compaction into an immutable checkpoint — manual via the route, automatic when the context-pressure limit is set. PreCompact hooks gate both |
 | `GET/PUT /api/model-defaults` | the **global** default provider/model/thinking level, shared by every workspace: the pair new sessions snapshot at creation, the draft pickers' target, and the live fallback for legacy conversations without a snapshot |
 | `PUT …/:wid/model`, `PUT …/:wid/thinking` | compatibility proxies: they verify workspace ownership, then mutate the **global** default above; new clients use `/api/model-defaults` |
 | `PUT …/:wid/mode`, `GET …/:wid/meta` | workspace-local mode control. The selected mode is the sole permission source. The `GET …/mode` catalog lists **enabled modes only** (a disabled mode refused for selection answers `400`); `GET …/meta` returns the selected mode's `permissionDefaults`, `mode`, and `yolo` when enabled; it does not return a policy or effective-policy overlay. |
 | `GET …/:wid/modes`, `GET/PUT/DELETE …/:wid/modes/:mid`, `POST …/:wid/modes/:mid/duplicate`, `PUT …/:wid/modes/:mid/enabled` | mode **authoring**, separate from the selection control above. The catalog carries each mode's `enabled` flag, `toolExposure`, and `permissionDefaults`; the single-mode read returns raw Markdown plus a hash, and `PUT` takes `{ content, expectedHash? }` (required when replacing an existing file). Bundled modes are read-only (`400`), a stale or missing update hash is `409`, and invalid content is rejected before anything is written. `PUT …/enabled` takes `{ enabled: boolean }`: it shows or hides a mode in this workspace's picker — bundled modes may be hidden too, disabling the currently selected mode is `409` (select another first), the disabled set persists beside the mode files, and saving a mode always re-enables it. Editing a selected mode applies only when it is **re-selected**: the live selection retains its cached snapshot. Deleting that selected file also leaves its cached snapshot active, but its deleted id cannot be selected again; select another mode instead. |
 | `…/:wid/projects` (+ `/projects/:pid`) | project binding: working folder, ownership, overlap rejection. `PATCH` also takes `additionalDirectories: [{ kind: "path", path, access } \| { kind: "project", projectId, access }]` (browser principal only, every folder validated); retargeting is `409` while any turn — this project's or another's through a grant — holds a write lease inside it |
 | `GET …/:wid/projects/:pid/(files\|file\|search)` | read-only project browsing: one directory listing, one file body, and a bounded file-name search for composer mentions |
+| `GET …/:wid/projects/:pid/git(?path=)` | read-only git: status (branch, changed paths, added/removed counts) with no `path`, or one file's unified diff against HEAD. Not a repository answers an empty status; traversal is refused. Nothing is staged or written |
 | `…/:wid/terminals` (+ `/events` SSE, `/:tid` DELETE, `/:tid/(input\|resize)`) | interactive Workbench terminals: PTY lifecycle, one multiplexed output stream per workspace — see the terminal section |
 | `POST …/:wid/attachments`, `GET …/:wid/attachments/:id` | composer attachments: upload (content-addressed by sha256, verified media type) and serve (immutable, workspace-scoped) |
 | `…/:wid/agents/:name` (GET resolve / DELETE), `POST …/:wid/agents/:name` | agent definitions; POST spawns a bounded child from `task: { prompt, requiredResult }` or the four-field `task: { objective, constraints, references, requiredResult }`, optionally `inherit: "brief"`, `model` (`provider:model`) and `grantTools`. 202 with the handle (+ `inheritedChars`, `note`); an empty brief, a bad `inherit`, or a role that refuses inheritance is 400; capacity (per conversation or host) is 429 |
@@ -563,8 +564,11 @@ non-browser client, none of which a foreign page can impersonate.
 
 ## Workbench terminals
 
-An interactive, PTY-backed shell in the Workbench — full colour, resize,
-`Ctrl+C`, and curses programs. It is **not** an agent capability, and the
+An interactive, PTY-backed shell — full colour, resize, `Ctrl+C`, and curses
+programs. The workbench shows it as a closable **Terminal** tab beside Files
+and Git. The chat column has a second one in its footer, which takes no space
+until `Ctrl+\`` opens it and the same shortcut (or the footer's close button)
+hides it again. It is **not** an agent capability, and the
 boundaries matter more than the feature:
 
 - **Separate from the agent loop.** `src/web/terminals.ts` touches no
@@ -692,8 +696,7 @@ graceful close and a second to an immediate exit.
 | `components/session` | project-grouped and time-bucketed conversation list |
 | `components/chat` | `Transcript`, message/tool/delegation rows, thinking, work status, approvals |
 | `components/composer` | `Composer` with attach/mode/thinking/permission chips, `ModelMenu` beside Send, `@`/`/` completion popover, attachment tray, folder picker |
-| `components/artifacts` | pure existing-event artifact projection and read-only Artifacts panel |
-| `components/workbench` | Files browser/viewer, Agent runs, and the lazily-loaded xterm `TerminalPanel` |
+| `components/workbench` | Files browser/viewer, Git (read-only status and diff), Trajectory (`projectTrajectory`, step slots), Subagents, and the lazily-loaded xterm `TerminalPanel` |
 | `components/settings` | Settings dialog and provider editor; one module per workspace panel (Projects, Skills, Memory, Agents, MCP, Hooks, Secrets) built on the shared `settings-kit` |
 | `components/ui` | Tailwind/CVA primitives with Radix interaction mechanics |
 | `components/common` | icons, copy, confirmation, error, spinner, and toast surfaces |
@@ -706,33 +709,36 @@ graceful close and a second to an immediate exit.
 | `styles/motion.css` | keyframes, scrollbar styling, and reduced-motion behavior |
 
 `projectItems(events)` remains the transcript contract and is computed once per
-event-array revision. `projectArtifacts(events)` is a separate pure projection over
-existing tool calls/results. It shows only exact path/resource references, command
-records, and recorded tool output; it never fetches file details or claims file
-existence, content, diffs, MIME type, repository ownership, or rerun capability.
+event-array revision. `projectTrajectory(events)` is a separate pure projection of
+the same log into turns, model requests and tool calls; it fetches nothing and never
+invents a timestamp or an outcome the log did not record. Its Duration view is a
+sequence, not a clock: each step (a turn's input, a model request, the batch of tool
+calls that request made) gets one equal slot in order, because wall time is mostly
+idle gaps between turns and would crush every step into a sliver. Parallel calls
+share their batch's slot. Selecting a slot shows what the log recorded for it; a
+tool call in that detail expands to its exact arguments and output, the same row
+the chat renders.
 
 The layout follows a ChatGPT-style shell: a resizable 280px-default sidebar
 (232–420px) docked at 768px and above (a modal drawer below), one centered chat
 column whose transcript scroller follows the tail only while the reader is at the
 bottom, a composer section in normal flow below it, and a Workbench whose views
-are Files, Context, Artifacts, Agents and Terminal. Files is the anchor tab; the
+are Files, Git, Context, Trajectory, Subagents and Terminal. Files is the anchor tab; the
 rest are opened on demand from the nav's `+` picker and closed again from their
-tab, so the strip keeps room for opened file tabs. Files and Artifacts are
-read-only projections; Context is read-only apart from its confirmed Compact,
-Agents delegates and cancels child runs for the open conversation — including
-the ones the model spawns for itself through the `Agent` tool, with each child's
-`provider:model` on its card and a picker that overrides the role's own model.
-Its primary field is a prose **Brief**; the structured objective, constraints,
-references and required result stay in *Task packet details*. A child card (and
-the chat delegation detail) shows the child's final report, a visible
-truncation note when the report hit the host cap, the files it touched, or the
-error naming its session log. In the Agents view an `uncertain` child renders
-as a retained, non-terminal run with a `reconciling` marker and a
-**Retry settlement** button that POSTs the workspace-scoped, parent-owned
-reconcile route (it passes the open workspace's id) — the same canonical
-settlement the model's `Agent` reconcile action runs; the chat
-delegation card projects durable events and never shows `uncertain`.
-It offers no inherited-context control — and Terminal
+tab, so the strip keeps room for opened file tabs. A stored strip that still names
+the retired Artifacts view drops it on load. Files, Git and Trajectory are read-only
+projections; Git asks the host for `git status` and one file's diff and never stages, commits, or discards; Context is read-only apart from its confirmed Compact. Subagents only
+follows the open conversation's children — delegating is the model's job through
+its `Agent` tool, and roles live in Settings → Agents. It groups them into
+**Running** and **Ended** (newest first); a row is titled by the first line of the
+child's brief from the root's log (its role when the log has none), previews the
+first line of its report or error, names its role and `provider:model`, and opens
+the child's own conversation, which is its full history. A running child can be
+stopped from its row and flags one parked on an approval. An `uncertain` child
+stays with the running ones as **Reconciling** with a **Retry settlement** button
+that POSTs the workspace-scoped, parent-owned reconcile route — the same canonical
+settlement the model's `Agent` reconcile action runs; the chat delegation card
+projects durable events and never shows `uncertain`. Terminal
 is the deliberate interactive exception documented above. The Workbench docks at 1280px and becomes a modal sheet below that. Sidebar/workbench collapse, dock widths, the opened
 Workbench views and the selected one are browser-local preferences under `mini-dsh.workbench.v1`;
 appearance (System/Light/Dark) is stored under
@@ -743,7 +749,7 @@ request that no longer exists). None of these are server settings. See
 
 Context manifest loading is lazy and uses the existing endpoint only while the
 sheet is open, Context is selected, a valid conversation exists, and the turn is
-settled. Artifacts causes no request. Reconnect presentation remains separate from
+settled. Trajectory causes no request. Reconnect presentation remains separate from
 durable running truth: drafts stay editable, Stop remains available, and the client
 does not automatically resend or replay.
 

@@ -15,7 +15,7 @@ src/harness/
 ├── approval/  Policy riding tools/pre-execute: allow | ask | deny
 ├── guard/     Dangerous command guard riding tools/rewrite: preset deny/ask on Bash content
 ├── workspace/ Workspace registry, project binding, ownership, writer leases
-├── modes/     Five bundled + custom file modes (instructions, sources, exposure, permissions)
+├── modes/     Four bundled + custom file modes (instructions, sources, exposure, permissions)
 ├── context/   Mode-driven builder: budget, trim order, compaction, per-request manifest
 ├── skills/    Workspace skill files + on-demand, mode-gated loading
 ├── memory/    Workspace/project Markdown memory + five tools
@@ -450,8 +450,11 @@ Turns have no wall-clock deadline or model-step budget: the loop continues until
 the model returns no tool calls or the user explicitly stops it. Operational
 watchdogs and resource caps remain centralized in `limits.ts`:
 `streamInactivityMs`, `toolTimeoutMs`, `approvalExpiryMs`, `toolOutputLimit`,
-`maxPendingInputs`, `automaticCompactionChars` (auto-compaction trigger at a
-completed boundary; 0 disables), plus composer-attachment limits
+`maxPendingInputs`, `automaticCompactionPressure` (usedTokens/availableTokens
+ratio from the session's newest context manifest that triggers automatic
+compaction at a completed boundary; 0 disables), `compactionTailTurns`
+(completed turns kept in context after the newest compaction checkpoint,
+default 4), plus composer-attachment limits
 `maxAttachmentBytes`, `maxAttachmentsPerMessage`, and `attachmentTextLimit`
 (model-visible cap for inlined text attachments; images travel as `ContentPart`
 image parts with a flat `IMAGE_TOKEN_ESTIMATE` so multi-image turns do not
@@ -463,7 +466,9 @@ Every model request is assembled by one context builder
 (`src/harness/context/builder.ts`) from the active mode's definition
 (`src/harness/modes/`): system + mode instructions, workspace/project
 instructions, history per the mode's history setting (`none`/`recent`/
-`compact` — `none` still keeps the current turn's tool loop), active skills,
+`compact` — `none` still keeps the current turn's tool loop; `compact` reads
+a compaction checkpoint when one exists and equals `recent` when none does —
+nothing is dropped without a summary covering it), active skills,
 pinned/retrieved memory, tool results and the schemas the mode's exposure
 ceiling allows. The budget is `context window − output reserve − safety
 margin` — the window is the operator's per-model override when set
@@ -473,7 +478,22 @@ margin` — the window is the operator's per-model override when set
 order or fails loud, and
 disabled loaders contribute nothing. Compaction (`context/compaction.ts`)
 writes immutable checkpoints with range/provenance at completed boundaries and
-never mutates the original JSONL. Each request carries a truthful **manifest**
+never mutates the original JSONL. A checkpoint replaces only the covered range:
+the covered events ride in the summary (a lower-trust wrapped block), the last
+`compactionTailTurns` completed turns after it stay raw so fresh context
+survives the boundary, and older post-checkpoint turns drop as recorded
+omissions until the next compaction covers them. The host summarizer is the
+session's effective (provider, model) pair with a structured-section prompt
+(`COMPACT_SUMMARY_PROMPT`); with no pair it degrades to the bounded extractive
+fallback. Automatic compaction triggers on context pressure —
+`usedTokens/availableTokens` from the newest manifest at a settled boundary —
+and PreCompact hooks gate both the manual route and the automatic trigger.
+Every attempt is durably visible through two log-only events:
+`compaction/start` opens the transaction before the summarizer runs, and
+`compaction/end` closes it with the stored summary (or `error` on failure) —
+a crash leaves the dangling start honest, and the transcript renders the
+lifecycle live (Compacting… → Compacted, summary expandable) from the SSE
+stream without any new endpoint. Each request carries a truthful **manifest**
 (mode/model revisions, source hashes, ranges, budget, omission decisions) that
 the UI's inspector renders as-is.
 

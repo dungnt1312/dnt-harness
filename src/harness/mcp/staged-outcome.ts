@@ -3,6 +3,7 @@
  * still returns a string so non-MCP tools and direct callers stay unchanged.
  * The pipeline attaches the staged outcome to the durable tool result.
  */
+import type { ExecutionId } from '../../util/brand.ts'
 import type { ToolOutcome } from '../tools/types.ts'
 
 interface Staged {
@@ -11,14 +12,14 @@ interface Staged {
   readonly ok: boolean
 }
 
-const staged = new Map<string, Staged>()
+const staged = new Map<ExecutionId, Staged>()
 
-export function stageMcpOutcome(invocationId: string, value: Staged): void {
-  staged.set(invocationId, value)
+export function stageMcpOutcome(executionId: ExecutionId, value: Staged): void {
+  staged.set(executionId, value)
 }
 
-export function takeMcpOutcome(invocationId: string): Staged | undefined {
-  const value = staged.get(invocationId)
-  if (value !== undefined) staged.delete(invocationId)
+export function takeMcpOutcome(executionId: ExecutionId): Staged | undefined {
+  const value = staged.get(executionId)
+  if (value !== undefined) staged.delete(executionId)
   return value
 }
