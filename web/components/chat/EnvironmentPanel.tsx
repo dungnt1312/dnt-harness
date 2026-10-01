@@ -10,6 +10,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import Icon from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { cn } from '../../lib/cn.ts'
+import { fetchGitStatus, listSessionProcesses, stopSessionProcess } from '../../lib/api.ts'
 import { processRows, subagentRows, type ProcessRow } from '../../lib/processes-view.ts'
 import type { SseEvent } from '../../lib/types.ts'
 
@@ -86,17 +87,15 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
     let disposed = false
     const load = async (): Promise<void> => {
       try {
-        const res = await fetch(`/api/workspaces/${workspaceId}/projects/${project.id}/git`)
-        if (!res.ok) return
-        const report = (await res.json()) as { branch?: string | null; changes?: readonly { added?: number; removed?: number }[]; ahead?: number; behind?: number }
+        const report = await fetchGitStatus(workspaceId, project.id)
         if (disposed) return
         let added = 0
         let removed = 0
-        for (const change of report.changes ?? []) {
+        for (const change of report.changes) {
           added += change.added ?? 0
           removed += change.removed ?? 0
         }
-        setGit({ branch: report.branch ?? null, added, removed, ahead: report.ahead ?? 0, behind: report.behind ?? 0 })
+        setGit({ branch: report.branch, added, removed, ahead: report.ahead ?? 0, behind: report.behind ?? 0 })
       } catch {
         // Offline stays on the last known line; the panel never blocks chat.
       }
@@ -109,9 +108,7 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
   const reconcile = useCallback(async (): Promise<void> => {
     if (workspaceId === null || sessionId === null) return
     try {
-      const res = await fetch(`/api/workspaces/${workspaceId}/sessions/${sessionId}/processes`)
-      if (!res.ok) return
-      const snapshot = (await res.json()) as readonly { id: string; status: string }[]
+      const snapshot = await listSessionProcesses(workspaceId, sessionId)
       setLiveRunning(snapshot.filter((row) => row.status === 'running').map((row) => row.id))
     } catch {
       // Same policy as the git line: last known state, never a blocker.
@@ -125,7 +122,7 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
       if (workspaceId === null || sessionId === null) return
       setStopping((prev) => [...prev, id])
       try {
-        await fetch(`/api/workspaces/${workspaceId}/sessions/${sessionId}/processes/${id}/stop`, { method: 'POST' })
+        await stopSessionProcess(workspaceId, sessionId, id)
       } catch {
         // The exit event (or reconcile) carries the truth; the click is done.
       } finally {

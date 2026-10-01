@@ -391,6 +391,28 @@ export function fetchGitStatus(workspaceId: string, projectId: string): Promise<
   return apiFetch(`${projectBase(workspaceId, projectId)}/git`).then((r) => json<GitStatusReport>(r))
 }
 
+/** One background-process row from the host registry. */
+export interface SessionProcessSnapshot {
+  readonly id: string
+  readonly command: string
+  readonly cwd: string
+  readonly status: 'running' | 'exited' | 'killed' | 'failed' | 'interrupted'
+  readonly startedAt: number
+  readonly exitCode: number | null
+  readonly durationMs: number
+  readonly truncated: boolean
+}
+
+/** Live registry snapshot for one session — reconciliation, not hydration. */
+export function listSessionProcesses(workspaceId: string, sessionId: string): Promise<readonly SessionProcessSnapshot[]> {
+  return apiFetch(`/api/workspaces/${workspaceId}/sessions/${sessionId}/processes`).then((r) => json<readonly SessionProcessSnapshot[]>(r))
+}
+
+/** Operator stop of one background process; 409 when it already ended. */
+export function stopSessionProcess(workspaceId: string, sessionId: string, processId: string): Promise<{ stopped: boolean; processId: string }> {
+  return apiFetch(`/api/workspaces/${workspaceId}/sessions/${sessionId}/processes/${processId}/stop`, { method: 'POST' }).then((r) => json<{ stopped: boolean; processId: string }>(r))
+}
+
 /** Read-only unified diff of one root-relative path against HEAD. */
 export function fetchGitDiff(workspaceId: string, projectId: string, path: string): Promise<GitDiffReport> {
   return apiFetch(`${projectBase(workspaceId, projectId)}/git?path=${encodeURIComponent(path)}`).then((r) => json<GitDiffReport>(r))

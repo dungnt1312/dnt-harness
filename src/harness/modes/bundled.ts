@@ -85,6 +85,6 @@ export const DEFAULT_MODE_ID = 'ask-before-changes'
 
 /** The full exposure ceiling any mode can grant (skills/memory included). */
 export const KNOWN_MODE_TOOLS: readonly string[] = [
-  'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'Skill', 'Agent',
+  'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent',
   'MemorySearch', 'MemoryRead', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget',
 ]

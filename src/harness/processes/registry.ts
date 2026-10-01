@@ -63,8 +63,9 @@ export interface RegistryLimits {
 
 const DEFAULT_LIMITS: RegistryLimits = { perSession: 8, host: 24, ringChars: 64_000 }
 
-/** Kill-to-close grace: a straggler grandchild can outlive the tree walk. */
-const KILL_SETTLE_MS = 5_000
+/** Kill-to-close grace: a straggler grandchild can outlive the tree walk, and
+ * a loaded host (parallel test workers) delays taskkill noticeably. */
+const KILL_SETTLE_MS = 10_000
 
 export class ProcessRegistry {
   private readonly byId = new Map<string, ProcessRecord>()
