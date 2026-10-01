@@ -16,6 +16,7 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { detectShell } from './detect.ts'
+import type { ProcessRegistry } from '../../harness/processes/registry.ts'
 import type { ToolDefinition, ToolExecution } from '../../harness/tools/types.ts'
 
 const OUTPUT_CAP = 60_000
@@ -33,6 +34,8 @@ export interface BashToolOptions {
   readonly cwd?: string | (() => string)
   /** Explicit executable; overrides detection (e.g. a pinned Git Bash path). */
   readonly executable?: string
+  /** Background-mode owner: registers run_in_background children. */
+  readonly processes?: ProcessRegistry
 }
 
 /** Environment marker every process of one Bash call inherits (Windows only). */
@@ -115,6 +118,7 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
       properties: {
         command: { type: 'string', description: 'the bash command line to run' },
         timeoutMs: { type: 'number', description: `kill after this many milliseconds (default 30000, max ${timeoutMs})` },
+        run_in_background: { type: 'boolean', description: 'run the command in the background and return a process id immediately; read output with BashOutput, kill with KillShell. timeoutMs is ignored in background mode' },
       },
       required: ['command'],
     },
@@ -125,6 +129,46 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
       }
       if (detection.executable === undefined) {
         return `error: bash is not available on this system; ${detection.hint}`
+      }
+      const background = args['run_in_background'] === true
+      if (background) {
+        // Background registration: same spawn (tree tag, granted root), but
+        // the call returns immediately with a process id. No timeout timer
+        // and no abort wiring here — the process must survive the turn.
+        if (options.processes === undefined) {
+          return 'error: background processes are not available on this host'
+        }
+        if (exec.sessionId === undefined) {
+          return 'error: background mode requires a session; it cannot run as a direct compatibility call'
+        }
+        if (exec.signal?.aborted === true) {
+          return 'cancelled: stop requested before this command started'
+        }
+        const cwd = exec.root !== '' ? exec.root : fallbackCwd()
+        const treeTag = randomUUID()
+        let child: ChildProcess
+        try {
+          child = spawn(detection.executable, ['-lc', command], {
+            cwd,
+            detached: true,
+            ...(process.platform === 'win32' ? { env: { ...process.env, [TREE_TAG_ENV]: treeTag } } : {}),
+          })
+        } catch (error) {
+          return `error: bash spawn failed (${String(error)}); verify the shell at '${detection.hint}'`
+        }
+        const admitted = options.processes.tryRegister({
+          sessionId: exec.sessionId,
+          command,
+          cwd,
+          child,
+          executable: detection.executable,
+          treeTag,
+        })
+        if (!admitted.ok) {
+          killTree(child, detection.executable, treeTag)
+          return `error: ${admitted.error}`
+        }
+        return `background process started: id=${admitted.record.id}; read output with BashOutput; kill with KillShell`
       }
       const requested = args['timeoutMs']
       const kill = typeof requested === 'number' && Number.isFinite(requested) && requested > 0
