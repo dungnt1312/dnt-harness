@@ -21,10 +21,13 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     instructions:
       'You are a careful assistant working inside the user’s workspace. Read files freely; before any write, edit, or shell command, ask for approval. Prefer explaining what you are about to change.',
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
-    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'Skill', 'Agent', 'MemorySearch', 'MemoryRead'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'MemorySearch', 'MemoryRead'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow',
       Write: 'ask', Edit: 'ask', Bash: 'ask',
+      // Background-process control only touches processes the agent itself
+      // spawned, so it stays allowed even where Bash asks.
+      BashOutput: 'allow', KillShell: 'allow',
       // Delegation asks here for the same reason a write does: this mode's
       // premise is that the user sees consequential work before it starts.
       Skill: 'allow', Agent: 'ask', MemorySearch: 'allow', MemoryRead: 'allow',
@@ -36,12 +39,12 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     instructions:
       'You are an assistant that edits files directly inside the user’s workspace. Read and edit files without asking; shell commands and deletions still require approval. Keep edits minimal and verifiable.',
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
-    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'Skill', 'Agent', 'MemorySearch', 'MemoryRead', 'MemoryCreate', 'MemoryUpdate'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'MemorySearch', 'MemoryRead', 'MemoryCreate', 'MemoryUpdate'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow',
       // A child's own calls re-enter this same policy, so delegating cannot
       // widen what the conversation may already do.
-      Bash: 'ask', Skill: 'allow', Agent: 'allow',
+      Bash: 'ask', BashOutput: 'allow', KillShell: 'allow', Skill: 'allow', Agent: 'allow',
       MemorySearch: 'allow', MemoryRead: 'allow', MemoryCreate: 'ask', MemoryUpdate: 'ask',
     },
   },
@@ -65,9 +68,10 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     instructions:
       'You are an assistant with full access to the workspace tools. Host and workspace restrictions still apply and cannot be overridden by you. There is no OS sandbox: shell commands run with host privileges, so stay deliberate.',
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
-    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'Skill', 'Agent', 'MemorySearch', 'MemoryRead', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'MemorySearch', 'MemoryRead', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow', Bash: 'allow',
+      BashOutput: 'allow', KillShell: 'allow',
       Skill: 'allow', Agent: 'allow',
       MemorySearch: 'allow', MemoryRead: 'allow', MemoryCreate: 'allow', MemoryUpdate: 'allow', MemoryForget: 'allow',
     },
