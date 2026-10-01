@@ -46,7 +46,7 @@ import { fileSessions, SessionsService } from '../harness/session/service.ts'
 import type { Session } from '../harness/session/session.ts'
 import { sessionGrantsOf, sessionModeOf, sessionModelOf, type SessionEvent, type SessionGrant, type SessionGrants } from '../harness/session/events.ts'
 import { deriveTitle } from '../harness/session/title.ts'
-import { newInputId, type ProjectId, type SessionId, type WorkspaceId } from '../util/brand.ts'
+import { newInputId, type ProjectId, type SessionId, type TurnId, type WorkspaceId } from '../util/brand.ts'
 import { ToolsService } from '../harness/tools/service.ts'
 import { bashTool } from '../capabilities/shell/bash.ts'
 import { bashOutputTool, killShellTool } from '../capabilities/shell/background-tools.ts'
@@ -889,9 +889,17 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   for (const tool of fsTools()) {
     kernel.ctx.tools.register(tool)
   }
-  // Background-process registry: host-owned, per session. Event bridge and
-  // routes live further down; tools close over the same instance.
-  const processes = new ProcessRegistry({})
+  // Background-process registry: host-owned, per session. The bridge appends
+  // durable process/* events to the OWNING session's log — a session deleted
+  // mid-flight simply has no reader left, and dispose emits nothing anyway.
+  const processes = new ProcessRegistry({
+    onStart: (record) => {
+      sessions.get(record.sessionId)?.session.append({ type: 'process/start', processId: record.id, command: record.command, cwd: record.cwd, ...(record.turnId !== undefined ? { turnId: record.turnId as TurnId } : {}) })
+    },
+    onExit: (record) => {
+      sessions.get(record.sessionId)?.session.append({ type: 'process/exit', processId: record.id, exitCode: record.exitCode, termination: record.status as 'exited' | 'killed' | 'failed' | 'interrupted', durationMs: (record.endedAt ?? record.startedAt) - record.startedAt })
+    },
+  })
   kernel.ctx.tools.register(bashTool({ timeoutMs: limits.toolTimeoutMs, processes }))
   kernel.ctx.tools.register(bashOutputTool({ processes }))
   kernel.ctx.tools.register(killShellTool({ processes }))
@@ -2285,6 +2293,8 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
   const deps: HandlerDeps = {
     kernel,
     sessions,
+    processes,
+    processReconciled: new Set<SessionId>(),
     unavailableSessions,
     pending,
     staticDir,
@@ -2456,6 +2466,10 @@ class McpRevisionConflict extends Error {
 interface HandlerDeps {
   readonly kernel: Kernel
   readonly sessions: Map<SessionId, SessionEntry>
+  /** Host-owned background-process registry (see the bridge near tool registration). */
+  readonly processes: ProcessRegistry
+  /** Sessions whose event log was already scanned for restart-interrupted processes. */
+  readonly processReconciled: Set<SessionId>
   readonly unavailableSessions: Set<SessionId>
   readonly pending: Map<string, PendingApproval>
   readonly staticDir: string
@@ -3009,6 +3023,47 @@ async function handleApi(
       return
     }
 
+    // ── background processes of one session ────────────────────
+    const wsProcessesMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)\/processes(?:\/([^/]+)\/stop)?$/.exec(pathname)
+    if (wsProcessesMatch !== null) {
+      const wsId = decodeURIComponent(wsProcessesMatch[1] ?? '') as WorkspaceId
+      const processId = wsProcessesMatch[3] !== undefined ? decodeURIComponent(wsProcessesMatch[3] ?? '') : undefined
+      const entry = await findSession(decodeURIComponent(wsProcessesMatch[2] ?? ''), wsId, deps)
+      if (entry === undefined) {
+        send(404, { error: 'no such session' })
+        return
+      }
+      if (deps.unavailableSessions.has(entry.session.id)) {
+        send(503, { error: 'session unavailable after durable storage failure; restart the host to reload canonical history' })
+        return
+      }
+      if (processId === undefined) {
+        // Live reconciliation for the panel: event-derived state is the
+        // source of truth; this snapshot corrects stale SSE-gap state.
+        if (req.method === 'GET') {
+          send(200, deps.processes.snapshot(entry.session.id))
+          return
+        }
+        send(405, { error: 'method not allowed' })
+        return
+      }
+      if (req.method === 'POST') {
+        const outcome = await deps.processes.kill(entry.session.id, processId)
+        if (outcome.outcome === 'not-found') {
+          send(404, { error: `no such process '${processId}'` })
+          return
+        }
+        if (outcome.outcome === 'already-ended') {
+          send(409, { error: `process '${processId}' already ended`, status: outcome.status })
+          return
+        }
+        send(200, { stopped: true, processId })
+        return
+      }
+      send(405, { error: 'method not allowed' })
+      return
+    }
+
     const wsSessionMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)(?:\/(events|messages|stop))?$/.exec(pathname)
     if (wsSessionMatch !== null) {
       const wsId = decodeURIComponent(wsSessionMatch[1] ?? '') as WorkspaceId
@@ -3052,6 +3107,9 @@ async function handleApi(
           }
           // Children spawned over HTTP can outlive an idle root: stop them
           // first, so none keeps running against a deleted conversation.
+          // Background processes die the same way — silently, because the
+          // session's log (their only reader) is being deleted.
+          await deps.processes.dispose(entry.session.id)
           await deps.childExecutor.cancelAllOfRoot(entry.session.id)
           deps.sessions.delete(entry.session.id)
           deps.kernel.ctx.agents.forget(entry.session.id)
@@ -6129,6 +6187,29 @@ function streamTerminals(req: IncomingMessage, res: ServerResponse, workspaceId:
  * restores actionable state) until the client disconnects. Listeners are
  * disposed on close so a dropped tab never leaks registrations.
  */
+/**
+ * Close `process/start` events left open by a server restart. Sessions load
+ * lazily, so this runs on the FIRST read of each session after boot, before
+ * any client can see its events: an open id the live registry does not own
+ * gets one synthetic durable `process/exit { interrupted }`. Orphaned OS
+ * processes are not re-adopted; KillShell/BashOutput on the id answer
+ * unknown truthfully.
+ */
+function reconcileInterruptedProcesses(entry: SessionEntry, deps: HandlerDeps): void {
+  const { session } = entry
+  if (deps.processReconciled.has(session.id)) return
+  deps.processReconciled.add(session.id)
+  const closed = new Set<string>()
+  for (const event of session.events) {
+    if (event.type === 'process/exit') closed.add(event.processId)
+  }
+  for (const event of session.events) {
+    if (event.type !== 'process/start') continue
+    if (closed.has(event.processId) || deps.processes.isRunning(session.id, event.processId)) continue
+    session.append({ type: 'process/exit', processId: event.processId, exitCode: null, termination: 'interrupted', durationMs: 0 })
+  }
+}
+
 function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionEntry, deps: HandlerDeps): void {
   const streamGeneration = (req as IncomingMessage & { miniDshGeneration?: number }).miniDshGeneration ?? deps.auth.currentGeneration()
   // A reconnect that authenticated under an older generation must not receive
@@ -6146,6 +6227,11 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     connection: 'keep-alive',
   })
   const { session } = entry
+
+  // First read of this session since boot: close process/start events a
+  // restart left open before any client can see them (orphaned OS processes
+  // are not re-adopted — KillShell/BashOutput answer unknown truthfully).
+  reconcileInterruptedProcesses(entry, deps)
 
   const rawCursor = req.headers['last-event-id']
   const cursor = typeof rawCursor === 'string' && /^\d+$/.test(rawCursor) ? Number(rawCursor) : NaN
