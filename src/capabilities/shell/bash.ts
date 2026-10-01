@@ -64,8 +64,9 @@ export function sweepByTag(treeTag: string): string {
  * Kill a spawned process tree. Best effort — the caller verifies through
  * the exit/close events, and the tool settles on `exit` after a kill so a
  * straggler grandchild holding the stdio pipes cannot stall the result.
+ * Exported for the background-process registry, which owns long-lived trees.
  */
-function killTree(child: ChildProcess, shell: string, treeTag: string): void {
+export function killTree(child: ChildProcess, shell: string, treeTag: string): void {
   if (child.pid === undefined) {
     child.kill('SIGKILL')
     return
