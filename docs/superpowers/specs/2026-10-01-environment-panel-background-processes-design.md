@@ -48,7 +48,9 @@ Components and their single purposes:
 
 - **ProcessRegistry** (`src/harness/processes/registry.ts`): owns background children
   per session. One clear interface: register (spawn), output (read ring), kill,
-  snapshot, dispose-on-session-delete. No UI or web knowledge.
+  snapshot, dispose-on-session-delete. It exposes lifecycle callbacks (`onStart`,
+  `onExit`) and knows nothing about the web, SSE, or the session log — the host in
+  `server.ts` bridges those callbacks to durable session-event appends.
 - **Bash tool (background branch)** (`src/capabilities/shell/bash.ts`): spawns and
   hands ownership to the registry; returns immediately. Reuses the existing tree tag
   and `killTree` machinery.
@@ -65,12 +67,15 @@ Components and their single purposes:
 - Host-owned `Map<sessionId, Map<processId, ProcessRecord>>` where a record holds the
   child process, tree tag, ring buffer, status, command, cwd, startedAt, turnId.
 - `processId` format: `proc_<uuid>`.
-- **Cap: 8 running processes per session.** Beyond that the Bash call fails with an
-  actionable error (kill or wait); no queueing.
+- **Cap: 8 running processes per session**, plus a **host-global cap of 24 running
+  background processes** across all sessions (child-agent sessions multiply: root +
+  6 subagents × 8 would otherwise allow 56). Either cap hit fails the Bash call with
+  an actionable error (kill or wait); no queueing.
 - Ring buffer: 64KB per process; capture stops at the cap with a truncation marker
   (same philosophy as the Bash tool's capture cap).
 - Processes **outlive the turn**: stopping a turn never kills background processes.
-  Deleting a session kills all of its running processes (registry dispose).
+  Deleting a session kills all of its running processes (registry dispose) and emits
+  nothing — the session's log is being deleted, so exit events would have no reader.
 - Kill reuses the existing `killTree` + MSYS tag sweep from `bash.ts` (taskkill /T /F
   on Windows, process-group kill on POSIX) — no new kill semantics are invented.
 
@@ -95,10 +100,12 @@ Components and their single purposes:
 - `KillShell(processId)` — tree-kills the process and confirms. Always allowed
   without approval (the agent kills only what it spawned). Unknown id → an error
   listing currently known ids.
-- Both are plain `ToolDefinition`s created with a registry handle closure, registered
-  next to `bashTool` in `src/web/server.ts` and `src/bins/headless.ts`.
-- The registry handle reaches tools via `ToolExecution.processes?` — the same
-  host-owned-service pattern as `ToolExecution.observations`.
+- Neither sets `requiresRoot` — they read an in-memory buffer and kill a process the
+  agent itself spawned; no granted workspace root is involved.
+- Both are plain `ToolDefinition`s created with a registry-handle **closure** (the
+  same options pattern `bashTool` uses) and scope lookups by `exec.sessionId` — the
+  field `ToolExecution` already carries. No `ToolExecution` extension is needed.
+  Registered next to `bashTool` in `src/web/server.ts` and `src/bins/headless.ts`.
 
 ### Durability and restart semantics
 
@@ -111,18 +118,25 @@ Components and their single purposes:
   - `failed` — the child errored after registration (e.g. stdio error event).
   - `interrupted` — log replay found the process `running` at server shutdown.
 - They are written to the session log like every other event, so log replay after a
-  restart shows finished processes in the panel with no extra machinery.
-- A process that was `running` at server shutdown is marked `interrupted` during
-  replay. **Orphans are not re-adopted**: detached children may survive the server
-  (platform-dependent) but the registry no longer owns them; `BashOutput`/`KillShell`
-  on such ids return truthful unknown-id errors. This limitation is documented in
-  `docs/harness.md`.
+  restart shows finished processes in the panel with no extra machinery. The
+  registry itself stays free of session-log knowledge: it fires `onStart`/`onExit`
+  callbacks and the host in `server.ts` appends the durable events.
+- **Restart**: at boot, the host scans each session log for `process/start` events
+  without a closing `process/exit` and appends one synthetic durable
+  `process/exit { termination: 'interrupted', exitCode: null }` per open id. The log
+  stays truthful and the UI needs no boot-time awareness. **Orphans are not
+  re-adopted**: detached children may survive the server (platform-dependent) but
+  the registry no longer owns them; `BashOutput`/`KillShell` on such ids return
+  truthful unknown-id errors. This limitation is documented in `docs/harness.md`.
 
 ## Web API
 
 - `GET /api/sessions/:sid/processes` — registry snapshot
-  (`{ id, command, cwd, status, startedAt, exitCode?, termination?, durationMs? }[]`)
-  for hydrating the panel mounted mid-turn or after restart.
+  (`{ id, command, cwd, status, startedAt, exitCode?, termination?, durationMs? }[]`).
+  This is **live reconciliation, not hydration**: the panel derives its list from
+  session events (which already rehydrate from the manifest after restart); the GET
+  exists to correct state that went stale while SSE was disconnected (e.g. a process
+  that exited mid-gap).
 - `POST /api/sessions/:sid/processes/:procId/stop` — operator-initiated kill from the
   panel; `200` with the new status, `404` unknown id, `409` process already exited.
 - Both follow the existing session-route auth scope. No new SSE channel: process
@@ -169,10 +183,11 @@ Components and their single purposes:
 
 ## Testing
 
-- **vitest backend**: registry unit tests (register/exit/kill, cap of 8, dispose on
-  session delete); Bash background mode (id returned, `BashOutput` sees partial then
-  final output, `KillShell` kills the tree, spawn failure cleans up); routes
-  (snapshot, stop, 404, session scope); replay marks shutdown-interrupted processes.
+- **vitest backend**: registry unit tests (register/exit/kill, per-session cap 8 and
+  host-global cap 24, dispose on session delete); Bash background mode (id returned,
+  `BashOutput` sees partial then final output, `KillShell` kills the tree, spawn
+  failure cleans up); routes (snapshot, stop, 404, 409, session scope); boot scan
+  appends synthetic `interrupted` exits for un-closed `process/start` events.
 - **vitest web**: chips render per state; auto-expand exactly once per scope with
   sticky user collapse; git row invokes the workbench-open callback; Stop posts the
   right route; subagent rows derive from events.
