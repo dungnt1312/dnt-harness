@@ -49,6 +49,8 @@ import { deriveTitle } from '../harness/session/title.ts'
 import { newInputId, type ProjectId, type SessionId, type WorkspaceId } from '../util/brand.ts'
 import { ToolsService } from '../harness/tools/service.ts'
 import { bashTool } from '../capabilities/shell/bash.ts'
+import { bashOutputTool, killShellTool } from '../capabilities/shell/background-tools.ts'
+import { ProcessRegistry } from '../harness/processes/registry.ts'
 import { fsTools } from '../capabilities/fs/tools.ts'
 import { listProjectEntries, readProjectFile, searchProjectFiles, ProjectFileError } from './project-files.ts'
 import { gitDiff, gitStatus, ProjectGitError } from './project-git.ts'
@@ -173,6 +175,7 @@ function BUNDLED_DEFAULT() {
 /** One frame on the SSE stream: log snapshot, live session event, a pending approval question, or a turn failure. */
 export type WebEnvelope =
   | { readonly kind: 'snapshot'; readonly events: SessionEvent[] }
+  | { readonly kind: 'resume'; readonly events: SessionEvent[] }
   | { readonly kind: 'session'; readonly event: SessionEvent }
   | {
     readonly kind: 'approval'
@@ -886,7 +889,12 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   for (const tool of fsTools()) {
     kernel.ctx.tools.register(tool)
   }
-  kernel.ctx.tools.register(bashTool({ timeoutMs: limits.toolTimeoutMs }))
+  // Background-process registry: host-owned, per session. Event bridge and
+  // routes live further down; tools close over the same instance.
+  const processes = new ProcessRegistry({})
+  kernel.ctx.tools.register(bashTool({ timeoutMs: limits.toolTimeoutMs, processes }))
+  kernel.ctx.tools.register(bashOutputTool({ processes }))
+  kernel.ctx.tools.register(killShellTool({ processes }))
 
   // Root sessions share project files, not a writer lease. Native Write/Edit
   // validate observed file state under a short canonical-path lock; Bash and
@@ -902,8 +910,10 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     const settled = agentScope.getStore()?.sessionId
     if (settled !== undefined) {
       skillSnapshots.delete(settled)
-      // A root turn's per-turn spawn budget ends with the turn.
-      childExecutor.releaseTurns(settled)
+      // A root turn's per-turn spawn budget ends with the turn. The await
+      // serializes with spawn admission so a committing spawn cannot
+      // re-create the key this cleanup drops.
+      await childExecutor.releaseTurns(settled)
     }
   })
 
@@ -3046,7 +3056,7 @@ async function handleApi(
           deps.sessions.delete(entry.session.id)
           deps.kernel.ctx.agents.forget(entry.session.id)
           await deps.kernel.ctx.sessions.delete(entry.session.id)
-          forgetSessionState(entry.session.id, deps)
+          await forgetSessionState(entry.session.id, deps)
           entry.closed = true
           send(200, { deleted: true })
           return
@@ -3811,7 +3821,7 @@ async function handleApi(
           deps.sessions.delete(entry.session.id)
           deps.kernel.ctx.agents.forget(entry.session.id)
           await deps.kernel.ctx.sessions.delete(entry.session.id)
-          forgetSessionState(entry.session.id, deps)
+          await forgetSessionState(entry.session.id, deps)
           entry.closed = true
           deps.legacyFolders.delete(entry.session.id)
           send(200, { deleted: true })
@@ -5694,11 +5704,11 @@ function workspaceMeta(workspaceId: WorkspaceId, deps: HandlerDeps, folder?: str
 }
 
 /** A deleted session leaves no per-session index behind (manifest, child indexes). */
-function forgetSessionState(sessionId: SessionId, deps: HandlerDeps): void {
+async function forgetSessionState(sessionId: SessionId, deps: HandlerDeps): Promise<void> {
   deps.lastManifests.delete(sessionId)
   deps.contextBodies.delete(sessionId)
   deps.sessionUsage.delete(sessionId)
-  for (const childId of deps.childExecutor.forgetRoot(sessionId)) {
+  for (const childId of await deps.childExecutor.forgetRoot(sessionId)) {
     deps.lastManifests.delete(childId)
     deps.contextBodies.delete(childId)
     deps.sessionUsage.delete(childId)
@@ -5982,8 +5992,8 @@ async function readBytes(req: IncomingMessage, maxBytes: number): Promise<Buffer
 }
 
 /** Write one SSE `data:` frame and flush it. */
-function writeFrame(res: ServerResponse, envelope: WebEnvelope): void {
-  res.write(`data: ${JSON.stringify(envelope)}\n\n`)
+function writeFrame(res: ServerResponse, envelope: WebEnvelope, sequence?: number): void {
+  res.write(`${sequence !== undefined ? `id: ${sequence}\n` : ''}data: ${JSON.stringify(envelope)}\n\n`)
 }
 
 /** A terminal geometry value, or `undefined` when it is not a usable one. */
@@ -6082,31 +6092,35 @@ function streamTerminals(req: IncomingMessage, res: ServerResponse, workspaceId:
   const dispose = deps.terminals.subscribe(workspaceId, (event) => {
     frame(event.kind === 'data' ? { ...event, data: encode(event.data) } : event)
   })
-  const heartbeat = setInterval(() => {
+  const principalId = (req as IncomingMessage & { miniDshPrincipalId?: string }).miniDshPrincipalId
+  let closed = false
+  let heartbeat: ReturnType<typeof setInterval> | undefined
+  let streamRecord: { principalId: string | undefined; close: () => void } | undefined
+  const settle = (endResponse: boolean): void => {
+    if (closed) return
+    closed = true
+    if (heartbeat !== undefined) clearInterval(heartbeat)
+    dispose()
+    if (streamRecord !== undefined) {
+      const index = deps.liveStreams.indexOf(streamRecord)
+      if (index !== -1) deps.liveStreams.splice(index, 1)
+    }
+    if (endResponse && !res.writableEnded) res.end()
+  }
+  const close = (): void => settle(true)
+  streamRecord = { principalId, close }
+  deps.liveStreams.push(streamRecord)
+
+  heartbeat = setInterval(() => {
     if (deps.auth.enabled && deps.auth.currentGeneration() !== streamGeneration) {
-      clearInterval(heartbeat)
-      dispose()
-      res.end()
+      close()
       return
     }
     res.write(': ping\n\n')
   }, 25_000)
   heartbeat.unref?.()
-  const principalId = (req as IncomingMessage & { miniDshPrincipalId?: string }).miniDshPrincipalId
-  let closed = false
-  const close = (): void => {
-    if (closed) return
-    closed = true
-    clearInterval(heartbeat)
-    dispose()
-    res.end()
-  }
-  deps.liveStreams.push({ principalId, close })
 
-  req.on('close', () => {
-    clearInterval(heartbeat)
-    dispose()
-  })
+  req.once('close', () => settle(false))
 }
 
 /**
@@ -6133,7 +6147,13 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   })
   const { session } = entry
 
-  writeFrame(res, { kind: 'snapshot', events: [...session.events] })
+  const rawCursor = req.headers['last-event-id']
+  const cursor = typeof rawCursor === 'string' && /^\d+$/.test(rawCursor) ? Number(rawCursor) : NaN
+  const latest = session.events.at(-1)?.seq ?? 0
+  const earliest = session.events[0]?.seq ?? 1
+  const resumable = Number.isSafeInteger(cursor) && cursor >= earliest - 1 && cursor <= latest
+  const replay = resumable ? session.events.filter((event) => event.seq > cursor) : [...session.events]
+  writeFrame(res, { kind: resumable ? 'resume' : 'snapshot', events: replay }, latest)
   for (const [approvalId, waiting] of deps.pending) {
     if (waiting.sessionId === session.id || waiting.parentSessionId === session.id) {
       writeFrame(res, approvalEnvelope(approvalId, waiting, session.id))
@@ -6141,7 +6161,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   }
 
   const disposeSession = deps.kernel.ctx.on('session/event', (emitter, event) => {
-    if (emitter.id === session.id) writeFrame(res, { kind: 'session', event })
+    if (emitter.id === session.id) writeFrame(res, { kind: 'session', event }, event.seq)
   })
   const disposeApproval = deps.kernel.ctx.on('web/approval', (payload) => {
     if (payload.sessionId === session.id || payload.parentSessionId === session.id) {
@@ -6180,7 +6200,8 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   const principalId = (req as IncomingMessage & { miniDshPrincipalId?: string }).miniDshPrincipalId
   let closed = false
   let heartbeat: ReturnType<typeof setInterval> | undefined
-  const close = (): void => {
+  let streamRecord: { principalId: string | undefined; close: () => void } | undefined
+  const settle = (endResponse: boolean): void => {
     if (closed) return
     closed = true
     if (heartbeat !== undefined) clearInterval(heartbeat)
@@ -6188,9 +6209,15 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     disposeApproval()
     disposeApprovalSettled()
     disposeError()
-    res.end()
+    if (streamRecord !== undefined) {
+      const index = deps.liveStreams.indexOf(streamRecord)
+      if (index !== -1) deps.liveStreams.splice(index, 1)
+    }
+    if (endResponse && !res.writableEnded) res.end()
   }
-  deps.liveStreams.push({ principalId, close })
+  const close = (): void => settle(true)
+  streamRecord = { principalId, close }
+  deps.liveStreams.push(streamRecord)
 
   heartbeat = setInterval(() => {
     if (deps.auth.enabled && deps.auth.currentGeneration() !== streamGeneration) {
@@ -6199,25 +6226,14 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     }
     // A deleted session must end its streams: no more frames can ever come.
     if (entry.closed === true) {
-      clearInterval(heartbeat)
-      disposeSession()
-      disposeApproval()
-      disposeApprovalSettled()
-      disposeError()
       writeFrame(res, { kind: 'error', message: 'session deleted' })
-      res.end()
+      close()
       return
     }
     res.write(': ping\n\n')
   }, 2_000)
 
-  req.on('close', () => {
-    clearInterval(heartbeat)
-    disposeSession()
-    disposeApproval()
-    disposeApprovalSettled()
-    disposeError()
-  })
+  req.once('close', () => settle(false))
 }
 
 /** Serve the built client: `/` (and unknown paths) fall back to index.html for the router. */

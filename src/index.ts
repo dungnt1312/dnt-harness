@@ -81,7 +81,7 @@ export type {
   ToolCall,
   ToolSchema,
 } from './harness/llm/types.ts'
-export { messageText } from './harness/llm/types.ts'
+export { messageText, ProviderError } from './harness/llm/types.ts'
 export {
   AttachmentError,
   AttachmentStore,
@@ -237,6 +237,8 @@ export { attachApproval } from './harness/approval/policy.ts'
 export { fsTools, resolveGrantedPath, resolveWithin } from './capabilities/fs/tools.ts'
 export { classifyTarget, OutOfGrantError, resolveInGrants, targetPaths, type PathClass, type TargetPath } from './capabilities/fs/grants.ts'
 export { bashTool, type BashToolOptions } from './capabilities/shell/bash.ts'
+export { bashOutputTool, killShellTool } from './capabilities/shell/background-tools.ts'
+export { ProcessRegistry, type ProcessRecord, type ProcessSnapshot, type ProcessStatus, type ProcessTermination } from './harness/processes/registry.ts'
 
 // ── MCP + hooks (G5) ───────────────────────────────────────────────────
 export {

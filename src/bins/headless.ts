@@ -28,6 +28,8 @@ import {
   ToolsService,
   attachApproval,
   bashTool,
+  bashOutputTool,
+  killShellTool,
   fileSessions,
   fsTools,
   newInputId,
@@ -39,6 +41,7 @@ import {
   type SessionsService,
 } from '../index.ts'
 import { DEFAULT_LIMITS } from '../harness/limits.ts'
+import { ProcessRegistry } from '../harness/processes/registry.ts'
 
 loadRepoEnv()
 
@@ -137,7 +140,10 @@ async function main(): Promise<void> {
   for (const tool of fsTools()) {
     kernel.ctx.tools.register(tool)
   }
-  kernel.ctx.tools.register(bashTool({ timeoutMs: DEFAULT_LIMITS.toolTimeoutMs }))
+  const processes = new ProcessRegistry({})
+  kernel.ctx.tools.register(bashTool({ timeoutMs: DEFAULT_LIMITS.toolTimeoutMs, processes }))
+  kernel.ctx.tools.register(bashOutputTool({ processes }))
+  kernel.ctx.tools.register(killShellTool({ processes }))
   kernel.ctx.tools.setRootResolver(() => ({ root, deniedRoots: [dataDir] }))
   if (apiKey !== undefined) {
     kernel.ctx.llm.register(new DeepSeekProvider(apiKey, process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com'))
