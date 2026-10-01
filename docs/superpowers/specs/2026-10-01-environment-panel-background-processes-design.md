@@ -121,10 +121,13 @@ Components and their single purposes:
   restart shows finished processes in the panel with no extra machinery. The
   registry itself stays free of session-log knowledge: it fires `onStart`/`onExit`
   callbacks and the host in `server.ts` appends the durable events.
-- **Restart**: at boot, the host scans each session log for `process/start` events
-  without a closing `process/exit` and appends one synthetic durable
-  `process/exit { termination: 'interrupted', exitCode: null }` per open id. The log
-  stays truthful and the UI needs no boot-time awareness. **Orphans are not
+- **Restart**: on the FIRST read of each session after boot (sessions load
+  lazily; a boot-time sweep would force-load every log), the host scans that
+  session's events for `process/start` without a closing `process/exit` and
+  appends one synthetic durable `process/exit { termination: 'interrupted',
+  exitCode: null }` per open id — before any client can see the events, so the
+  observable behavior is identical to a boot-time sweep. The log stays truthful
+  and the UI needs no boot-time awareness. **Orphans are not
   re-adopted**: detached children may survive the server (platform-dependent) but
   the registry no longer owns them; `BashOutput`/`KillShell` on such ids return
   truthful unknown-id errors. This limitation is documented in `docs/harness.md`.

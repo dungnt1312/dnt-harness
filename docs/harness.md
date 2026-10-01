@@ -310,6 +310,40 @@ failed `ToolResult` the model can see — never an exception into the loop. The
 durable `tool/call` and `tool/result` events belong to the agent loop; this
 method only decides and executes.
 
+## Background processes (`processes/`, background branch of the Bash tool)
+
+`Bash { run_in_background: true }` spawns exactly like a foreground call (tree
+tag, granted root, full approval waterfall — background is not a bypass) but
+returns immediately with a process id; `timeoutMs` is ignored and the process
+ignores the turn's abort signal, so it survives the turn. The host-owned
+`ProcessRegistry` (`src/harness/processes/registry.ts`) keeps the child per
+session, a 64 KB head-capped output ring, and kills through the shell
+capability's `killTree` (process-group kill on POSIX; `taskkill /T` plus an
+MSYS environment-tag sweep on Windows).
+
+- Caps: **8 running per session**, **24 host-global**; beyond either, the call
+  fails with an actionable error. No queueing.
+- The model reads output and status with `BashOutput(processId)` and kills with
+  `KillShell(processId)`; both are always allowed (they only touch processes
+  the agent itself spawned) and need no granted root. Lookups are scoped by the
+  executing session — a foreign session's id is unknown.
+- Lifecycle lands on the session log as durable `process/start` /
+  `process/exit` events; `termination` is one of `exited` (own exit),
+  `killed` (KillShell or operator stop), `failed` (child error), or
+  `interrupted` (see restart semantics below). The web Environment panel
+  renders from these events.
+- REST: `GET /api/workspaces/:ws/sessions/:sid/processes` (live reconciliation
+  for state an SSE gap missed) and `POST …/processes/:id/stop` (200 killed,
+  404 unknown, 409 already ended).
+
+**Restart semantics:** sessions load lazily, so on the FIRST read of a session
+after boot the host closes any `process/start` that has no `process/exit` with
+one synthetic durable `process/exit { interrupted }`. Orphaned OS processes are
+NOT re-adopted — they may survive the host (platform-dependent), but the
+registry no longer owns them; `BashOutput`/`KillShell` on such ids answer
+unknown truthfully. Deleting a session kills its running processes silently
+(the log — their only reader — is being deleted; no exit events are written).
+
 ## Approval (`approval/policy.ts`)
 
 `attachApproval(ctx, options)` attaches one `tools/pre-execute` listener with a
@@ -530,6 +564,7 @@ durable record ever carries the status. A spawn-`uncertain` child is never
 launched; a result-`uncertain` child loses its advertised result but keeps its
 log. Either way the entry is retained and keeps holding an active slot until
 settlement proves a durable parent result, a proven-absent spawn is cleaned up
+(below), a committed spawn that never launched settles as `interrupted`
 (below), or the root is deleted. When canonical storage can be read, a
 rejected append resolves by itself: the record that landed is committed, the
 one that did not is missing.
@@ -552,9 +587,12 @@ poisoned loaded parent is never reused, so an entry can remain `uncertain`
 until a restart replaces the writer — and concurrent callers share one
 settlement instead of writing competing records. A failed append is never
 retried through a poisoned session; entries without canonical proof stay
-uncertain. One cleanup exists: a live spawn-`uncertain` child that never
-launched is deleted, and its reservation released exactly once, when canonical
-storage proves the parent's spawn record absent.
+uncertain. Two cleanups cover a live spawn-`uncertain` child that never
+launched: when canonical storage proves the parent's spawn record absent, the
+child is deleted and its reservation released exactly once; when the record
+canonically persisted but no terminal child turn exists, the entry settles as
+`interrupted` — the status a restart reconstructs from the same logs —
+releasing its slot without touching the root's durable log.
 
 **Bounded memory.** The executor's map holds active children only. Once a
 child's terminal record is durable its entry is evicted; `list`/`wait`/
