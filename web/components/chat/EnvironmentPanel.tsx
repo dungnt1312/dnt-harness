@@ -11,7 +11,7 @@ import Icon from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { cn } from '../../lib/cn.ts'
 import { fetchGitStatus, listSessionProcesses, stopSessionProcess } from '../../lib/api.ts'
-import { processRows, subagentRows, type ProcessRow } from '../../lib/processes-view.ts'
+import { processRows, subagentRows, type ProcessRow, type SubagentRow } from '../../lib/processes-view.ts'
 import type { SseEvent } from '../../lib/types.ts'
 
 interface GitLine {
@@ -33,19 +33,45 @@ interface Props {
 
 const TERMINAL_CLASS: Record<string, string | undefined> = { killed: 'text-bad', failed: 'text-bad', interrupted: 'text-bad' }
 
-function formatDuration(ms: number): string {
-  if (ms < 1_000) return '0s'
+/** `1m 40s`-style wall-clock label for working/process durations. */
+export function formatDuration(ms: number): string {
+  if (ms < 0) ms = 0
   const seconds = Math.floor(ms / 1_000)
   if (seconds < 60) return `${seconds}s`
   const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}m${seconds % 60 > 0 ? ` ${seconds % 60}s` : ''}`
-  return `${Math.floor(minutes / 60)}h${minutes % 60 > 0 ? ` ${minutes % 60}m` : ''}`
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`
+  const hours = Math.floor(minutes / 60)
+  return `${hours}h ${minutes % 60}m`
+}
+
+/** Signed colored diff counts: `+2,173 −628`, zero parts omitted. */
+function DiffCounts({ added, removed }: { readonly added: number; readonly removed: number }) {
+  if (added === 0 && removed === 0) return <span className="text-[12px] text-fg-faint">clean</span>
+  return (
+    <span className="shrink-0 text-[12px]">
+      {added > 0 ? <span className="text-ok">+{added.toLocaleString()}</span> : null}
+      {added > 0 && removed > 0 ? ' ' : ''}
+      {removed > 0 ? <span className="text-bad">−{removed.toLocaleString()}</span> : null}
+    </span>
+  )
+}
+
+/** Upstream sync arrows; a zero direction never renders (no `↓0` noise). */
+function SyncArrows({ ahead, behind }: { readonly ahead: number; readonly behind: number }) {
+  if (ahead <= 0 && behind <= 0) return null
+  return (
+    <span className="shrink-0 text-[12px] text-fg-faint">
+      {ahead > 0 ? <span title={`${ahead} ahead of upstream`}>↑{ahead}</span> : null}
+      {ahead > 0 && behind > 0 ? ' ' : ''}
+      {behind > 0 ? <span title={`${behind} behind upstream`}>↓{behind}</span> : null}
+    </span>
+  )
 }
 
 export function EnvironmentPanel({ workspaceId, sessionId, project, events, connected, onOpenView }: Props) {
-  // Panel state is scoped to the conversation: switching resets both the
-  // collapse and the one-shot auto-open.
-  const [state, setState] = useState<{ scope: string | null; expanded: boolean; autoOpened: boolean }>({ scope: sessionId, expanded: false, autoOpened: false })
+  // Panel state is scoped to the conversation: switching resets the collapse,
+  // the one-shot auto-open, and the per-section disclosure.
+  const [state, setState] = useState<{ scope: string | null; expanded: boolean; autoOpened: boolean; processesOpen: boolean; subagentsOpen: boolean }>({ scope: sessionId, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true })
   const [git, setGit] = useState<GitLine | null>(null)
   const [liveRunning, setLiveRunning] = useState<readonly string[]>([])
   const [stopping, setStopping] = useState<readonly string[]>([])
@@ -62,8 +88,20 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
   const runningAgents = useMemo(() => agents.filter((row) => row.running), [agents])
   const hasLive = running.length > 0 || runningAgents.length > 0
 
+  // The turn currently open in this conversation, if any — the header's
+  // `Working · <elapsed>` indicator, same semantics as the TaskStatus line.
+  const workingSince = useMemo(() => {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]
+      if (event.type === 'turn/end') return null
+      if (event.type === 'turn/start') return event.timestamp ?? null
+    }
+    return null
+  }, [events])
+  const ticking = running.length > 0 || workingSince !== null
+
   const scope = sessionId ?? null
-  if (state.scope !== scope) setState({ scope, expanded: false, autoOpened: false })
+  if (state.scope !== scope) setState({ scope, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true })
 
   // The one-shot auto-open: the first live process or subagent for this
   // conversation expands the panel; a user collapse never reopens it.
@@ -72,12 +110,12 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
     setState((prev) => (prev.scope === scope && !prev.autoOpened ? { ...prev, expanded: true, autoOpened: true } : prev))
   }, [hasLive, scope, state.scope, state.autoOpened, state.expanded])
 
-  // Live durations for running processes only.
+  // Live durations: working elapsed and running process ages.
   useEffect(() => {
-    if (running.length === 0) return
+    if (!ticking) return
     const id = window.setInterval(() => setNow(Date.now()), 1_000)
     return () => window.clearInterval(id)
-  }, [running.length])
+  }, [ticking])
 
   const turnEndCount = useMemo(() => events.filter((event) => event.type === 'turn/end').length, [events])
 
@@ -136,109 +174,140 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
 
   const expanded = state.expanded
   const collapseLabel = expanded ? 'Collapse environment' : 'Expand environment'
-  const gitLabel = git === null ? (project?.name ?? '') : `${git.branch ?? project?.name ?? ''}`
-  const syncs = git !== null && (git.ahead > 0 || git.behind > 0)
+  const workingLabel = workingSince !== null ? formatDuration(now - workingSince) : null
 
   return (
-    <div className="shrink-0 px-3 pt-2 sm:px-6" data-environment-panel>
-      <div className="mx-auto flex w-full max-w-3xl flex-col gap-1.5 rounded-xl border border-line bg-surface px-3 py-2">
+    <aside
+      data-environment-panel
+      aria-label="Environment"
+      className={cn(
+        // Fixed top-right overlay of the chat column (dntspace arrangement),
+        // below the 56px ChatHeader so the header controls stay clickable:
+        // the transcript scrolls underneath; the card never pushes content.
+        'absolute right-4 top-[60px] z-20 rounded-xl border border-line bg-surface shadow-lg',
+        expanded
+          ? 'flex max-h-[calc(100dvh-140px)] w-[320px] flex-col overflow-y-auto px-3.5 py-2'
+          : 'inline-flex max-w-[min(480px,calc(100%-2rem))] items-center px-3 py-1.5',
+      )}
+    >
         <button
           type="button"
           aria-label={collapseLabel}
           aria-expanded={expanded}
           onClick={() => setState((prev) => ({ ...prev, expanded: !prev.expanded }))}
-          className="flex min-h-7 w-full items-center gap-2 text-left text-[13px] text-fg-muted transition-colors hover:text-fg"
+          className="flex min-h-7 w-full items-center gap-2 text-left transition-colors"
         >
-          <Icon name="info" size={14} className="shrink-0 text-fg-faint" />
-          <span className="font-medium">Environment</span>
+          <span className="shrink-0 text-[13px] font-medium text-fg">Environment</span>
+          {workingLabel !== null ? (
+            <span className="flex shrink-0 items-center gap-1.5 text-[12px] text-fg-muted" role="status">
+              <Spinner size={11} />
+              <span>Working · {workingLabel}</span>
+            </span>
+          ) : null}
           {!expanded ? (
             <span className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
-              {project !== null ? (
-                <span className="truncate">
-                  <span className="text-fg">{gitLabel}</span>
-                  {git !== null && git.added + git.removed > 0 ? (
+              {project !== null && git !== null ? (
+                <span className="truncate text-[12px]">
+                  <span className="text-fg-muted">{git.branch ?? project.name}</span>
+                  {git.added + git.removed > 0 ? (
                     <>
-                      <span className="text-ok"> +{git.added}</span>
-                      <span className="text-bad"> −{git.removed}</span>
+                      {' '}
+                      <span className="text-ok">+{git.added.toLocaleString()}</span>{' '}
+                      <span className="text-bad">−{git.removed.toLocaleString()}</span>
                     </>
                   ) : null}
-                  {syncs ? (
-                    <span className="text-fg-faint">
-                      {' '}
-                      ↑{git.ahead} ↓{git.behind}
-                    </span>
-                  ) : null}
+                  <SyncArrows ahead={git.ahead} behind={git.behind} />
                 </span>
+              ) : project !== null ? (
+                <span className="truncate text-[12px] text-fg-muted">{git?.branch ?? project.name}</span>
               ) : null}
               {running.length > 0 ? (
-                <span className={cn('shrink-0 rounded-md bg-warn-soft px-1.5 py-0.5 text-[11px] font-medium text-warn')}>
+                <span className="flex shrink-0 items-center gap-1 rounded-md bg-warn-soft px-1.5 py-0.5 text-[11px] font-medium text-warn">
+                  <Icon name="terminal" size={10} />
                   {running.length} process{running.length === 1 ? '' : 'es'}
                 </span>
               ) : null}
               {runningAgents.length > 0 ? (
-                <span className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-medium text-fg-muted">
+                <span className="flex shrink-0 items-center gap-1 rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-medium text-fg-muted">
+                  <Icon name="gitBranch" size={10} />
                   {runningAgents.length} subagent{runningAgents.length === 1 ? '' : 's'}
                 </span>
               ) : null}
             </span>
           ) : null}
-          <Icon name="close" size={12} className={cn('ml-auto shrink-0 text-fg-faint transition-transform', expanded ? '' : 'rotate-180')} />
+          <Icon name="chevron" size={14} className={cn('icon-chevron ml-auto shrink-0 text-fg-faint transition-transform', expanded ? 'rotate-180' : '')} />
         </button>
 
         {expanded ? (
-          <div className="flex flex-col gap-1.5">
+          <div className="mt-1.5 flex flex-col gap-1.5 border-t border-line pt-1.5">
             {project !== null ? (
               <section aria-label="Git">
                 <button
                   type="button"
                   aria-label="Open git panel"
                   onClick={() => onOpenView('git')}
-                  className="flex w-full items-center gap-2 rounded-lg px-1.5 py-1 text-left text-[13px] transition-colors hover:bg-hover"
+                  className="flex w-full items-center gap-2 rounded-lg px-1.5 py-1.5 text-left text-[13px] transition-colors hover:bg-hover"
                 >
                   <Icon name="gitBranch" size={14} className="shrink-0 text-fg-faint" />
                   <span className="min-w-0 flex-1 truncate font-medium text-fg" title={git?.branch ?? project.path}>{git?.branch ?? project.name}</span>
-                  {syncs ? <span className="shrink-0 text-fg-faint">↑{git.ahead} ↓{git.behind}</span> : null}
-                  {git !== null && git.added + git.removed > 0 ? (
-                    <span className="shrink-0 text-[12px]">
-                      <span className="text-ok">+{git.added}</span> <span className="text-bad">−{git.removed}</span>
-                    </span>
-                  ) : (
-                    <span className="shrink-0 text-[12px] text-fg-faint">clean</span>
-                  )}
+                  <SyncArrows ahead={git?.ahead ?? 0} behind={git?.behind ?? 0} />
+                  {git !== null ? <DiffCounts added={git.added} removed={git.removed} /> : <span className="text-[12px] text-fg-faint">…</span>}
                 </button>
               </section>
             ) : null}
 
             {rows.length > 0 ? (
-              <section aria-label="Processes" className="flex flex-col gap-0.5">
-                {rows.map((row) => (
-                  <ProcessLine key={row.id} row={row} now={now} pending={stopping.includes(row.id)} onStop={() => void stop(row.id)} />
-                ))}
+              <section aria-label="Background processes" className="flex flex-col">
+                <button
+                  type="button"
+                  aria-expanded={state.processesOpen}
+                  onClick={() => setState((prev) => ({ ...prev, processesOpen: !prev.processesOpen }))}
+                  className="flex w-full items-center gap-2 rounded-lg px-1.5 py-1.5 text-left text-[13px] transition-colors hover:bg-hover"
+                >
+                  <Icon name="terminal" size={14} className="shrink-0 text-fg-faint" />
+                  <span className="font-medium text-fg-muted">Background processes</span>
+                  <span className={cn('ml-auto text-[12px]', running.length > 0 ? 'text-warn' : 'text-fg-faint')}>
+                    {running.length > 0 ? `${running.length} running` : `${rows.length} ended`}
+                  </span>
+                  <Icon name="chevron" size={13} className={cn('shrink-0 text-fg-faint transition-transform', state.processesOpen ? '' : 'rotate-180')} />
+                </button>
+                {state.processesOpen ? (
+                  <div className="flex flex-col gap-0.5 pb-1">
+                    {rows.map((row) => (
+                      <ProcessLine key={row.id} row={row} now={now} pending={stopping.includes(row.id)} onStop={() => void stop(row.id)} />
+                    ))}
+                  </div>
+                ) : null}
               </section>
             ) : null}
 
             {agents.length > 0 ? (
-              <section aria-label="Subagents" className="flex flex-col gap-0.5">
-                {agents.map((row) => (
-                  <button
-                    key={row.childSessionId}
-                    type="button"
-                    onClick={() => onOpenView('agents')}
-                    className="flex w-full items-center gap-2 rounded-lg px-1.5 py-1 text-left text-[13px] transition-colors hover:bg-hover"
-                  >
-                    {row.running ? <Spinner size={11} /> : <span className="inline-block size-[11px] shrink-0" aria-hidden />}
-                    <span className="min-w-0 flex-1 truncate text-fg" title={row.definition}>{row.definition}</span>
-                    <span className={cn('shrink-0 text-[12px]', row.running ? 'text-warn' : (TERMINAL_CLASS[row.status ?? ''] ?? 'text-fg-faint'))}>
-                      {row.running ? 'running' : (row.status ?? '')}
-                    </span>
-                  </button>
-                ))}
+              <section aria-label="Subagents" className="flex flex-col">
+                <button
+                  type="button"
+                  aria-expanded={state.subagentsOpen}
+                  onClick={() => setState((prev) => ({ ...prev, subagentsOpen: !prev.subagentsOpen }))}
+                  className="flex w-full items-center gap-2 rounded-lg px-1.5 py-1.5 text-left text-[13px] transition-colors hover:bg-hover"
+                >
+                  <Icon name="gitBranch" size={14} className="shrink-0 text-fg-faint" />
+                  <span className="font-medium text-fg-muted">Subagents</span>
+                  <span className={cn('ml-auto text-[12px]', runningAgents.length > 0 ? 'text-warn' : 'text-fg-faint')}>
+                    {runningAgents.length > 0 ? `${runningAgents.length} running` : `${agents.length}`}
+                  </span>
+                  <Icon name="chevron" size={13} className={cn('shrink-0 text-fg-faint transition-transform', state.subagentsOpen ? '' : 'rotate-180')} />
+                </button>
+                {state.subagentsOpen ? (
+                  <div className="flex flex-col gap-0.5 pb-1">
+                    {agents.map((row) => (
+                      <SubagentLine key={row.childSessionId} row={row} onOpen={() => onOpenView('agents')} />
+                    ))}
+                  </div>
+                ) : null}
               </section>
             ) : null}
           </div>
         ) : null}
-      </div>
-    </div>
+    </aside>
   )
 }
 
@@ -247,11 +316,10 @@ function ProcessLine({ row, now, pending, onStop }: { readonly row: ProcessRow; 
   const duration = runningRow ? now - row.startedAt : row.durationMs
   const statusLabel = runningRow ? 'running' : row.exitCode !== null ? `${row.status} (${row.exitCode})` : row.status
   return (
-    <div className="flex items-center gap-2 rounded-lg px-1.5 py-1 text-[13px]">
+    <div className="flex items-center gap-2 rounded-lg py-1 pl-2.5 pr-1.5 text-[13px]">
       {runningRow ? <Spinner size={11} /> : <span className="inline-block size-[11px] shrink-0" aria-hidden />}
-      <Icon name="terminal" size={13} className="shrink-0 text-fg-faint" />
       <span className="min-w-0 flex-1 truncate text-fg" title={row.command}>{row.command}</span>
-      <span className={cn('shrink-0 text-[12px] text-fg-faint')} title={statusLabel}>{formatDuration(duration)}</span>
+      <span className="shrink-0 text-[12px] text-fg-faint" title={statusLabel}>{formatDuration(duration)}</span>
       <span className={cn('shrink-0 text-[12px]', runningRow ? 'text-warn' : (TERMINAL_CLASS[row.status] ?? 'text-fg-faint'))}>{statusLabel}</span>
       {runningRow ? (
         <button
@@ -262,9 +330,25 @@ function ProcessLine({ row, now, pending, onStop }: { readonly row: ProcessRow; 
           onClick={onStop}
           className="flex size-5 shrink-0 items-center justify-center rounded text-fg-faint transition-colors hover:bg-hover hover:text-fg disabled:opacity-50"
         >
-          <Icon name="square" size={11} />
+          <Icon name="square" size={10} />
         </button>
       ) : null}
     </div>
+  )
+}
+
+function SubagentLine({ row, onOpen }: { readonly row: SubagentRow; readonly onOpen: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="flex w-full items-center gap-2 rounded-lg py-1 pl-2.5 pr-1.5 text-left text-[13px] transition-colors hover:bg-hover"
+    >
+      {row.running ? <Spinner size={11} /> : <span className="inline-block size-[11px] shrink-0" aria-hidden />}
+      <span className="min-w-0 flex-1 truncate text-fg" title={row.definition}>{row.definition}</span>
+      <span className={cn('shrink-0 text-[12px]', row.running ? 'text-warn' : (TERMINAL_CLASS[row.status ?? ''] ?? 'text-fg-faint'))}>
+        {row.running ? 'running' : (row.status ?? '')}
+      </span>
+    </button>
   )
 }

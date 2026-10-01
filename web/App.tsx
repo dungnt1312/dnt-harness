@@ -375,6 +375,9 @@ function AppShell() {
   // Docked, the workbench remembers whether it was open; as a sheet it starts closed.
   const [workbenchOpen, setWorkbenchOpen] = useState(() => workbenchDocked && !preferences.rightCollapsed)
   const [workbenchExpanded, setWorkbenchExpanded] = useState(false)
+  // The Git view narrowed to one turn's recorded files (a card's Review all).
+  // Session-scoped state, not a preference: the review is a moment's focus.
+  const [gitPathFilter, setGitPathFilter] = useState<readonly string[] | null>(null)
   const inspectorTab = preferences.inspectorTab
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsSection, setSettingsSection] = useState<'providers' | 'projects' | 'permissions' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'>('providers')
@@ -495,11 +498,14 @@ function AppShell() {
       onWorkbenchOpenChange(true)
     }
   }, [workbenchProject, openWorkbenchFile, patchPreferences, onWorkbenchOpenChange])
-  /** The per-turn change card's Review all: the project's Git view. */
-  const reviewTurnChanges = useCallback(() => {
+  /** The per-turn change card's Review all: the Git view narrowed to that turn's recorded files. */
+  const reviewTurnChanges = useCallback((paths: readonly string[]) => {
+    setGitPathFilter(paths)
     patchPreferences({ inspectorTab: 'git' })
     onWorkbenchOpenChange(true)
   }, [patchPreferences, onWorkbenchOpenChange])
+  /** Show all: the Git view without the turn's narrowing. */
+  const clearGitPathFilter = useCallback(() => setGitPathFilter(null), [])
   /** Environment panel rows open the matching workbench view. */
   const openEnvironmentView = useCallback((view: 'git' | 'agents') => {
     patchPreferences({ inspectorTab: view })
@@ -1337,6 +1343,8 @@ function AppShell() {
       onOpenChild={openSession}
       terminalShell={preferences.terminalShell}
       onTerminalShell={(shellId) => patchPreferences({ terminalShell: shellId })}
+      gitPathFilter={gitPathFilter}
+      onClearGitFilter={clearGitPathFilter}
       context={{ meta, ...(modelDefaults !== null ? { globalDefaults: modelDefaults } : {}), ...(currentSessionModel !== undefined ? { sessionModel: currentSessionModel } : {}), ...(current !== null && currentSessionModelState?.status === 'loading' ? { sessionControlsStatus: 'loading' as const } : {}), ...(current !== null && currentSessionModelState?.status === 'error' ? { sessionControlsStatus: 'unavailable' as const } : {}), stream, sessionId: current, sessionFolder: currentProject?.path ?? null, eventCount: events.length, manifest, workspaceId: activeWs, running, modeLabel: envModeLabel, onCompacted: () => setCompactNonce((nonce) => nonce + 1), onOpenSettingsTab: (tab) => openSettings(tab) }}
     />
   )
@@ -1376,8 +1384,9 @@ function AppShell() {
         ) : null}
         {!sidebarDocked ? <Sheet open={sidebarOpen} onOpenChange={setSidebarOpen} side="left" label="Conversation navigation">{sidebar}</Sheet> : null}
 
-        {/* Full-width workbench hides (but keeps mounted) the chat so drafts and scroll survive. */}
-        <main className={`min-w-0 flex-1 flex-col ${workbenchDocked && workbenchOpen && workbenchExpanded ? 'hidden' : 'flex'}`}>
+        {/* Full-width workbench hides (but keeps mounted) the chat so drafts and scroll survive.
+            Relative: the Environment panel anchors its fixed top-right overlay here. */}
+        <main className={`relative min-w-0 flex-1 flex-col ${workbenchDocked && workbenchOpen && workbenchExpanded ? 'hidden' : 'flex'}`}>
           <ChatHeader
             sidebarVisible={sidebarDocked && sidebarOpen}
             stream={stream}

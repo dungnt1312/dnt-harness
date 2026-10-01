@@ -372,6 +372,10 @@ export interface GitStatusReport {
   readonly branch: string | null
   readonly changes: readonly GitChange[]
   readonly truncated: boolean
+  /** Commits ahead of the upstream, when the branch tracks one. */
+  readonly ahead?: number
+  /** Commits behind the upstream, when the branch tracks one. */
+  readonly behind?: number
 }
 
 export interface GitDiffLine {

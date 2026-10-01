@@ -19,3 +19,4 @@ web-dist/
 # editor/agent backup leftovers (superseded by the .tsx/.css originals)
 *.tsxn
 *.cssn
+shots/

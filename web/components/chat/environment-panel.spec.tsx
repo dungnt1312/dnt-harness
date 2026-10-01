@@ -14,6 +14,7 @@ afterEach(async () => {
   host?.remove()
   root = undefined
   vi.unstubAllGlobals()
+  vi.useRealTimers()
 })
 
 const ev = (type: string, fields: Record<string, unknown>): SseEvent => ({ type, seq: 0, ...fields }) as SseEvent
@@ -45,15 +46,43 @@ async function render(props: Base): Promise<void> {
 const startEvents = [ev('process/start', { processId: 'p1', command: 'dev', cwd: 'x' })]
 
 it('renders collapsed git chips when nothing is live', async () => {
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ branch: 'main', changes: [{ path: 'a.ts', status: 'modified', added: 5, removed: 2 }], truncated: false }), { status: 200 })))
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ branch: 'main', changes: [{ path: 'a.ts', status: 'modified', added: 2173, removed: 628 }], truncated: false, ahead: 70, behind: 0 }), { status: 200 })))
   await render({ ...base, events: [] })
-  // Collapsed with no live process/subagent: only the git chip carries data.
   expect(host.textContent).toContain('main')
-  expect(host.textContent).toContain('+5')
-  expect(host.textContent).toContain('−2')
+  expect(host.textContent).toContain('+2,173')
+  expect(host.textContent).toContain('−628')
+  expect(host.textContent).toContain('↑70')
+  // Zero counts never render (↓0 noise).
+  expect(host.textContent).not.toContain('↓0')
+  // Collapse affordance is a chevron, never a close glyph.
+  expect(host.querySelector('button[aria-label="Expand environment"] .icon-chevron') ?? host.querySelector('button[aria-label="Expand environment"] svg[class*="rotate"]')).not.toBeNull()
 })
 
-it('auto-expands once per session scope and a user collapse sticks', async () => {
+it('auto-expands into headed sections with counts', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
+  await render({ ...base, events: [...startEvents, ev('agent/child-spawn', { childSessionId: 'c1', definition: 'researcher' })] })
+  // Section headings in the dntspace arrangement: icon + title + live count.
+  expect(host.querySelector('section[aria-label="Background processes"]')?.textContent).toContain('Background processes')
+  expect(host.querySelector('section[aria-label="Background processes"]')?.textContent).toContain('1 running')
+  expect(host.querySelector('section[aria-label="Subagents"]')?.textContent).toContain('Subagents')
+  expect(host.querySelector('section[aria-label="Subagents"]')?.textContent).toContain('1 running')
+  expect(host.textContent).toContain('dev')
+})
+
+it('header shows a working indicator while a turn is open', async () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-10-01T12:00:00Z'))
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
+  const t = Date.now()
+  await render({ ...base, events: [ev('turn/start', { turnId: 't1', timestamp: t - 100_000 })] })
+  expect(host.textContent).toContain('Working')
+  expect(host.textContent).toContain('1m 40s')
+  // A closed turn clears it.
+  await act(async () => root!.render(<EnvironmentPanel {...base} events={[ev('turn/start', { turnId: 't1', timestamp: t - 100_000 }), ev('turn/end', { turnId: 't1', timestamp: t })]} />))
+  expect(host.textContent).not.toContain('Working')
+})
+
+it('auto-expand fires once per session scope and a user collapse sticks', async () => {
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
   await render({ ...base, events: startEvents })
   expect(host.textContent).toContain('dev')
