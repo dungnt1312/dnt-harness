@@ -31,6 +31,21 @@ export interface GitStatusReport {
   readonly changes: readonly GitChange[]
   /** True when the walk stopped at {@link MAX_CHANGES}; the list is then partial. */
   readonly truncated: boolean
+  /** Commits ahead of the upstream, when the branch tracks one. */
+  readonly ahead?: number
+  /** Commits behind the upstream, when the branch tracks one. */
+  readonly behind?: number
+}
+
+/** Ahead/behind from a `git status -b` header; absent when there is no upstream. */
+export function parseAheadBehind(header: string): { ahead?: number; behind?: number } {
+  const match = /\[ahead (\d+)(?:, behind (\d+))?\]|\[behind (\d+)\]/.exec(header)
+  if (match === null) return {}
+  const result: { ahead?: number; behind?: number } = {}
+  if (match[1] !== undefined) result.ahead = Number(match[1])
+  if (match[2] !== undefined) result.behind = Number(match[2])
+  if (match[3] !== undefined) result.behind = Number(match[3])
+  return result
 }
 
 /** One line of a rendered diff. `text` excludes the leading marker. */
@@ -166,6 +181,7 @@ export async function gitStatus(root: string, deniedRoots?: readonly string[]): 
   return {
     branch,
     truncated,
+    ...parseAheadBehind(header),
     changes: changes.map((change) => {
       const count = counted.get(change.path)
       return count === undefined ? change : { ...change, ...count }
