@@ -94,6 +94,11 @@ export interface SseEvent {
   readonly summary?: string
   /** Set on a failed compaction/end. */
   readonly error?: string
+  /** Background-process lifecycle (process/start, process/exit). */
+  readonly processId?: string
+  readonly command?: string
+  readonly cwd?: string
+  readonly termination?: string
 }
 
 /** Estimated tokens per request source; the fields sum to `usedTokens`. */
@@ -161,6 +166,7 @@ export interface ContextManifestView {
 /** One frame on the events stream. */
 export type Envelope =
   | { readonly kind: 'snapshot'; readonly events: SseEvent[] }
+  | { readonly kind: 'resume'; readonly events: SseEvent[] }
   | { readonly kind: 'session'; readonly event: SseEvent }
   | {
     readonly kind: 'approval'

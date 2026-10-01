@@ -74,6 +74,7 @@ export type SessionEvent =
     } & SessionEventStamp)
   | ({ readonly type: 'approval/decision'; readonly approvalId: string; readonly executionId?: ExecutionId; readonly decision: ApprovalDecision; readonly reason?: string } & SessionEventStamp)
   | ({ readonly type: 'input/queued'; readonly inputId: string; readonly clientRequestId?: string; readonly content: string; readonly attachments?: readonly AttachmentRef[] } & SessionEventStamp)
+  | ({ readonly type: 'input/settled'; readonly inputId: string; readonly outcome: 'admitted' | 'rejected' | 'empty' } & SessionEventStamp)
   | ({ readonly type: 'session/title'; readonly title: string | null } & SessionEventStamp)
   | ({ readonly type: 'session/pinned'; readonly pinned: boolean } & SessionEventStamp)
   | ({ readonly type: 'session/project'; readonly projectId: string | null } & SessionEventStamp)
@@ -136,6 +137,11 @@ export type SessionEvent =
       /** Set on a failed attempt; no checkpoint was written. */
       readonly error?: string
     } & SessionEventStamp)
+  // Background-process lifecycle, log-only (model projection ignores it):
+  // a `Bash run_in_background` registration and its settled outcome. Pairs
+  // are per process id; `interrupted` closes ids a restart left open.
+  | ({ readonly type: 'process/start'; readonly processId: string; readonly command: string; readonly cwd: string; readonly turnId?: TurnId } & SessionEventStamp)
+  | ({ readonly type: 'process/exit'; readonly processId: string; readonly exitCode: number | null; readonly termination: 'exited' | 'killed' | 'failed' | 'interrupted'; readonly durationMs: number } & SessionEventStamp)
 
 /** Why a turn closed. */
 export type TurnEndReason =
@@ -151,7 +157,7 @@ export type TurnEndReason =
   | 'limit'
 
 /** Durable classification of why a turn failed. */
-export type TurnErrorKind = 'provider' | 'storage' | 'limit' | 'internal'
+export type TurnErrorKind = 'provider' | 'storage' | 'limit' | 'internal' | 'rejected'
 
 /** How an approval request was settled. */
 export type ApprovalDecision = 'allow' | 'deny' | 'expired' | 'cancelled' | 'invalidated'
@@ -287,6 +293,16 @@ export function sessionModeOf(events: readonly SessionEvent[]): Extract<SessionE
 }
 
 export function deriveMessages(events: readonly SessionEvent[], attachments?: AttachmentLookup): ModelMessage[] {
+  // Authorization hooks may rewrite a requested tool call. The durable
+  // tool/call is the effective identity that actually crossed the side-effect
+  // boundary, so model history must project it instead of stale provider args.
+  const effectiveCalls = new Map<string, ToolCall[]>()
+  for (const event of events) {
+    if (event.type !== 'tool/call') continue
+    const calls = effectiveCalls.get(event.stepId) ?? []
+    calls.push(event.call)
+    effectiveCalls.set(event.stepId, calls)
+  }
   const messages: ModelMessage[] = []
   for (const event of events) {
     switch (event.type) {
@@ -297,7 +313,11 @@ export function deriveMessages(events: readonly SessionEvent[], attachments?: At
         messages.push(
           event.toolCalls === undefined
             ? { role: 'assistant', content: event.content }
-            : { role: 'assistant', content: event.content, toolCalls: event.toolCalls },
+            : {
+                role: 'assistant',
+                content: event.content,
+                toolCalls: event.toolCalls.map((call, index) => effectiveCalls.get(event.stepId)?.[index] ?? call),
+              },
         )
         break
       case 'tool/result':
@@ -314,6 +334,7 @@ export function deriveMessages(events: readonly SessionEvent[], attachments?: At
       case 'approval/request':
       case 'approval/decision':
       case 'input/queued':
+      case 'input/settled':
       case 'session/title':
       case 'session/pinned':
       case 'session/project':
@@ -329,6 +350,8 @@ export function deriveMessages(events: readonly SessionEvent[], attachments?: At
       case 'context/body':
       case 'compaction/start':
       case 'compaction/end':
+      case 'process/start':
+      case 'process/exit':
         break
       default:
         assertNever(event)
