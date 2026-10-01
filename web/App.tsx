@@ -35,7 +35,7 @@ import {
 } from './lib/api.ts'
 import { PairingGate } from './components/auth/PairingGate.tsx'
 import { decodeModelChoice, activeModelValue, modelOptions } from './lib/providers.ts'
-import { isTurnRunning, projectItems, shareProjectedItems, type ViewItem } from './lib/project.ts'
+import { isTurnRunning } from './lib/project.ts'
 import { sameListing } from './lib/listing-equality.ts'
 import { manifestRefreshKey } from './lib/manifest-refresh.ts'
 import type { FileFocus } from './lib/tool-facts.ts'
@@ -63,6 +63,7 @@ import { toProjectRelative } from './lib/project-paths.ts'
 import { PANEL_LIMITS } from './lib/workbench-preferences.ts'
 import { LazySettings } from './components/settings/LazySettings.tsx'
 import { TaskStatus } from './components/chat/TaskStatus.tsx'
+import { EnvironmentPanel } from './components/chat/EnvironmentPanel.tsx'
 import { Transcript } from './components/chat/Transcript.tsx'
 import { ApprovalBar } from './components/chat/ApprovalBar.tsx'
 import { Composer } from './components/composer/Composer.tsx'
@@ -274,6 +275,16 @@ function AppShell() {
   // created by the first sent message. The scope choice persists per
   // workspace in localStorage ('' = chat only).
   const [draftProject, setDraftProjectState] = useState<string | null>(null)
+  // Sidebar folder state lives here so closing the sidebar — which unmounts
+  // it — never forgets which folders were collapsed or expanded past five rows.
+  const [folderCollapsed, setFolderCollapsed] = useState<Record<string, boolean>>({})
+  const [folderExpanded, setFolderExpanded] = useState<Record<string, boolean>>({})
+  const toggleFolderCollapsed = useCallback((projectId: string, collapsed: boolean) => {
+    setFolderCollapsed((prev) => ({ ...prev, [projectId]: collapsed }))
+  }, [])
+  const expandFolder = useCallback((projectId: string, expanded: boolean) => {
+    setFolderExpanded((prev) => ({ ...prev, [projectId]: expanded }))
+  }, [])
   function beginConversation(): void {
     // Invalidate an in-flight first-session creation before showing a new draft.
     navigation.current.next()
@@ -438,14 +449,8 @@ function AppShell() {
   // workspace listing has confirmed membership. This prevents foreign or stale
   // deep links from ever opening an SSE connection.
   const validatedCurrent = listedWorkspace === activeWs && (sessions.some((session) => session.id === current) || (current !== null && createdHere.current.has(current))) ? current : null
-  const { events, approvals, stream, error: streamError, dismissApproval } = useSessionStream(activeWs, validatedCurrent)
+  const { events, items: projectedItems, approvals, stream, error: streamError, dismissApproval } = useSessionStream(activeWs, validatedCurrent)
   const notify = useApprovalNotify(approvals, activeWorkspace?.name)
-  const previousItems = useRef<readonly ViewItem[]>([])
-  const projectedItems = useMemo(() => {
-    const next = shareProjectedItems(previousItems.current, projectItems(events))
-    previousItems.current = next
-    return next
-  }, [events])
   const running = useMemo(() => isTurnRunning(events), [events])
   const manifestKey = useMemo(() => manifestRefreshKey(events, compactNonce), [events, compactNonce])
   const currentSession = useMemo(() => sessions.find((session) => session.id === current) ?? null, [sessions, current])
@@ -490,6 +495,16 @@ function AppShell() {
       onWorkbenchOpenChange(true)
     }
   }, [workbenchProject, openWorkbenchFile, patchPreferences, onWorkbenchOpenChange])
+  /** The per-turn change card's Review all: the project's Git view. */
+  const reviewTurnChanges = useCallback(() => {
+    patchPreferences({ inspectorTab: 'git' })
+    onWorkbenchOpenChange(true)
+  }, [patchPreferences, onWorkbenchOpenChange])
+  /** Environment panel rows open the matching workbench view. */
+  const openEnvironmentView = useCallback((view: 'git' | 'agents') => {
+    patchPreferences({ inspectorTab: view })
+    onWorkbenchOpenChange(true)
+  }, [patchPreferences, onWorkbenchOpenChange])
   const draftProjectName = useMemo(
     () => projects.find((project) => project.id === effectiveDraftProject)?.name,
     [projects, effectiveDraftProject],
@@ -1153,6 +1168,10 @@ function AppShell() {
       onRename={(id, title) => void rename(id, title)}
       onDeleteRequest={setPendingDelete}
       onTogglePinned={(id, pinned) => void togglePinned(id, pinned)}
+      collapsedFolders={folderCollapsed}
+      onToggleFolderCollapsed={toggleFolderCollapsed}
+      expandedFolders={folderExpanded}
+      onExpandFolder={expandFolder}
       onOpenSettings={() => openSettings()}
       notifyEnabled={notify.enabled}
       notifyBlocked={notify.blocked}
@@ -1408,6 +1427,14 @@ function AppShell() {
             </div>
           ) : (
             <>
+              <EnvironmentPanel
+                workspaceId={activeWs}
+                sessionId={current}
+                project={currentProject}
+                events={events}
+                connected={stream !== 'reconnecting'}
+                onOpenView={openEnvironmentView}
+              />
               {events.length === 0 ? (
                 <div className="flex flex-1 items-center justify-center gap-2 text-sm text-fg-muted" role="status" aria-live="polite">
                   <Spinner size={14} />Loading conversation…
@@ -1417,8 +1444,11 @@ function AppShell() {
                   key={current}
                   conversationId={current}
                   items={projectedItems}
+                  events={events}
                   {...(effectiveModel !== null && effectiveModel !== '' ? { modelLabel: effectiveModel } : {})}
                   workspaceId={activeWs}
+                  project={currentProject}
+                  onReviewChanges={reviewTurnChanges}
                   onReuse={reuseInDraft}
                   onOpenChild={openSession}
                   onRetry={retryLastTurn}
