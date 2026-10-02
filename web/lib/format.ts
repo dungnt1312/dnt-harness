@@ -32,12 +32,24 @@ export function formatAge(ts: number | undefined, now = Date.now()): string {
   return `${Math.floor(diff / 604_800_000)}w`
 }
 
+/**
+ * One elapsed span: `850ms`, `4.2s`, `2m 0s`. Seconds are rounded once, before
+ * they are split into minutes, so 119.6s reads `2m 0s` and never `1m 60s`.
+ * A negative span (clock skew between host and browser) reads as zero.
+ */
+export function formatElapsed(ms: number): string {
+  if (Number.isNaN(ms)) return ''
+  const span = Math.max(0, ms)
+  if (span < 1_000) return `${Math.round(span)}ms`
+  // Below this a one-decimal seconds value cannot round up to `60.0s`.
+  if (span < 59_950) return `${(span / 1_000).toFixed(1)}s`
+  const total = Math.round(span / 1_000)
+  return `${Math.floor(total / 60)}m ${total % 60}s`
+}
+
 export function formatDuration(start?: number, end?: number): string {
   if (start === undefined || end === undefined) return ''
-  const ms = end - start
-  if (ms < 1_000) return `${ms}ms`
-  if (ms < 60_000) return `${(ms / 1_000).toFixed(1)}s`
-  return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1_000)}s`
+  return formatElapsed(end - start)
 }
 
 /** Time left before a deadline: `4:32`, `0:07`, or `now` once it is reached. */

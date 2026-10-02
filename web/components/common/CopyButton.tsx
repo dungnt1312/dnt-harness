@@ -3,7 +3,13 @@ import Icon from './Icon.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 
 /** Clipboard failures leave the source available for manual selection. */
-export default function CopyButton({ text, label, className }: { readonly text: string; readonly label?: string; readonly className?: string }) {
+export default function CopyButton({ text, getText, label, className }: {
+  readonly text?: string
+  /** Lazily assemble large payloads only when the reader actually copies. */
+  readonly getText?: () => string
+  readonly label?: string
+  readonly className?: string
+}) {
   const [copied, setCopied] = useState(false)
   const [failed, setFailed] = useState(false)
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -11,7 +17,7 @@ export default function CopyButton({ text, label, className }: { readonly text: 
   const copy = async (): Promise<void> => {
     setFailed(false)
     try {
-      await navigator.clipboard.writeText(text)
+      await navigator.clipboard.writeText(getText?.() ?? text ?? '')
       setCopied(true)
       if (timer.current !== null) clearTimeout(timer.current)
       timer.current = setTimeout(() => setCopied(false), 1_200)

@@ -4,6 +4,7 @@ import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import { Button } from '../ui/Button.tsx'
 import { formatCountdown } from '../../lib/format.ts'
 import { toolFacts } from '../../lib/tool-facts.ts'
+import { ToolArguments, hasProseArgs } from './ToolArguments.tsx'
 import type { PendingApproval } from '../../lib/types.ts'
 
 const ARGS_DISPLAY_LIMIT = 4000
@@ -73,8 +74,6 @@ export function ApprovalBar({
         {approvals.length === 1 ? '1 request' : `${approvals.length} requests`} awaiting a decision
       </div>
       {visible.map(({ approvalId, call, interactive, childSessionId, definitionName, expiresAt, guardWarning, scopeWarning, proposedGrant, proposedAccess }) => {
-        const raw = JSON.stringify(call.args, null, 2)
-        const truncated = raw.length > ARGS_DISPLAY_LIMIT
         const submittingRow = submitting.includes(approvalId)
         const sessionGrant = childSessionId === undefined ? proposedGrant : undefined
         // The same reading the transcript gives a call: a Read's window and a
@@ -113,10 +112,14 @@ export function ApprovalBar({
                 ) : null}
               </div>
             </div>
-            <details className="text-xs text-fg-muted">
+            {/* A multi-line command or a file's new content cannot be judged from
+                the one-line target above, so those requests open already showing
+                it — the decision is made on the text, not on its first line. */}
+            <details className="text-xs text-fg-muted" open={hasProseArgs(call.args)}>
               <summary>Exact arguments · {call.id}</summary>
-              <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-muted p-2.5 text-fg">{truncated ? `${raw.slice(0, ARGS_DISPLAY_LIMIT)}\n…` : raw}</pre>
-              {truncated ? <p className="m-0 mt-1">Arguments truncated for display. The pending request on the server still carries the full payload.</p> : null}
+              <div className="mt-2 flex flex-col gap-2">
+                <ToolArguments call={call} limit={ARGS_DISPLAY_LIMIT} />
+              </div>
             </details>
             <p className="m-0 text-xs text-fg-faint">
               Allow once and Deny apply to this request only, not the project or future requests. Standing permission is set by the workspace&apos;s mode in Settings → Modes.

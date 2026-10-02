@@ -44,9 +44,9 @@ function shaOf(content: string): string {
 describe('fs tools', () => {
   it('Write creates parent directories and Read returns the content', async () => {
     const result = await tool('Write').execute({ path: 'src/app.ts', content: 'export const x = 1\n' }, exec())
-    expect(result).toBe('created src/app.ts')
+    expect(result).toBe('created src/app.ts (1 lines)')
     const content = await tool('Read').execute({ path: 'src/app.ts' }, exec())
-    expect(content).toBe('export const x = 1\n')
+    expect(content).toBe('1\texport const x = 1')
   })
 
   it('Write distinguishes overwrite from creation and honors a fresh expectedSha256', async () => {
@@ -67,7 +67,7 @@ describe('fs tools', () => {
     await tool('Edit').execute({ path: 'notes.md', old: 'beta', new: 'BETA', expectedSha256: shaOf('alpha beta gamma\n') }, exec())
 
     const updated = await tool('Read').execute({ path: 'notes.md' }, exec())
-    expect(updated).toBe('alpha BETA gamma\n')
+    expect(updated).toBe('1\talpha BETA gamma')
 
     await expect(tool('Edit').execute({ path: 'notes.md', old: 'missing', new: 'x', expectedSha256: shaOf('alpha BETA gamma\n') }, exec())).rejects.toThrow(/not found/)
   })
@@ -92,7 +92,7 @@ describe('fs tools', () => {
   it('Read supports a 1-based line window and reports missing files clearly', async () => {
     await tool('Write').execute({ path: 'lines.txt', content: 'one\ntwo\nthree\nfour\n' }, exec())
     const window = await tool('Read').execute({ path: 'lines.txt', offset: 2, limit: 2 }, exec())
-    expect(window).toBe('two\nthree')
+    expect(window).toBe('2\ttwo\n3\tthree\n… [showing lines 2-3 of 4; continue with offset 4]')
 
     await expect(tool('Read').execute({ path: 'nope.ts' }, exec())).rejects.toThrow(/no such file/)
   })
@@ -116,6 +116,38 @@ describe('fs tools', () => {
 
     const none = await tool('Grep').execute({ pattern: 'no-such-token-anywhere' }, exec())
     expect(none).toBe('no matches')
+  })
+
+  it('Grep stops a catastrophically backtracking pattern instead of freezing the host', async () => {
+    await fs.mkdir(path.join(root, 'redos'), { recursive: true })
+    await fs.writeFile(path.join(root, 'redos', 'evil.txt'), `${'a'.repeat(40)}!\n`, 'utf8')
+    let ticks = 0
+    const ticker = setInterval(() => { ticks += 1 }, 50)
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 500)
+    try {
+      await expect(tool('Grep').execute({ pattern: '^(a+)+$', path: 'redos' }, exec({ signal: controller.signal }))).rejects.toThrow(/cancelled/)
+    } finally {
+      clearInterval(ticker)
+    }
+    // The event loop kept running while the worker backtracked.
+    expect(ticks).toBeGreaterThan(3)
+  }, 15_000)
+
+  it('Grep rejects an invalid pattern and does not search binary files', async () => {
+    await expect(tool('Grep').execute({ pattern: '(' }, exec())).rejects.toThrow(/Invalid regular expression/)
+    await fs.mkdir(path.join(root, 'bin'), { recursive: true })
+    await fs.writeFile(path.join(root, 'bin', 'blob.dat'), Buffer.from([0x62, 0x69, 0x6e, 0x6e, 0x65, 0x65, 0x64, 0x6c, 0x65, 0x00, 0x01]))
+    expect(await tool('Grep').execute({ pattern: 'binneedle', path: 'bin' }, exec())).toBe('no matches')
+  })
+
+  it('Read refuses a file over the size limit before loading it', async () => {
+    const big = path.join(root, 'huge.log')
+    const handle = await fs.open(big, 'w')
+    await handle.truncate(33 * 1024 * 1024)
+    await handle.close()
+    await expect(tool('Read').execute({ path: 'huge.log' }, exec())).rejects.toThrow(/MiB file-tool limit/)
+    await fs.rm(big)
   })
 
   it('Glob skips default-ignored folders, and still searches them on demand', async () => {
@@ -196,6 +228,6 @@ describe('fs tools', () => {
     await expect(tool('Write').execute({ path: '.internal/events.jsonl', content: 'x' }, guarded)).rejects.toThrow(/application-internal storage/)
     await expect(tool('Grep').execute({ pattern: 'secret' }, guarded)).resolves.toBe('no matches')
     // Outside the denied root everything still works.
-    await expect(tool('Read').execute({ path: 'src/app.ts' }, guarded)).resolves.toBe('v2\n')
+    await expect(tool('Read').execute({ path: 'src/app.ts' }, guarded)).resolves.toBe('1\tv2')
   })
 })

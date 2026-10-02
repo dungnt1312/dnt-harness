@@ -24,7 +24,7 @@ describe('optimistic native file mutations', () => {
   it('a ranged read observes the whole file; a sibling change makes overwrite conflict', async () => {
     const { root, invoke, a, b } = await setup()
     await fs.writeFile(path.join(root, 'note.txt'), 'one\ntwo\nthree\n')
-    expect(await invoke('Read', { path: 'note.txt', offset: 2, limit: 1 }, a)).toBe('two')
+    expect(await invoke('Read', { path: 'note.txt', offset: 2, limit: 1 }, a)).toBe('2\ttwo\n… [showing lines 2-2 of 3; continue with offset 3]')
     await invoke('Read', { path: 'note.txt' }, b)
     await invoke('Write', { path: 'note.txt', content: 'from b' }, b)
     await expect(invoke('Write', { path: 'note.txt', content: 'from a' }, a)).rejects.toThrow(/conflict.*re-read/i)

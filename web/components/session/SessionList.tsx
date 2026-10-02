@@ -65,15 +65,16 @@ function SessionRow({ session, active, liveRunning, onSelect, onRename, onDelete
         aria-current={active ? 'page' : undefined}
         className="flex min-h-9 min-w-0 flex-1 items-center gap-2 py-1.5 pl-2.5 pr-2 text-left text-sm"
       >
-        {session.pinned === true ? <Icon name="pin" size={13} className="shrink-0 text-fg-faint" aria-label="Pinned" /> : null}
-        <span className="min-w-0 flex-1 truncate font-medium">{session.title || 'New conversation'}</span>
-        {queued > 0 ? <span className="shrink-0 text-[11px] text-fg-faint">{queued} queued</span> : null}
         {isRunning ? (
           <span className="flex shrink-0 items-center" title={`Working with ${session.activity === 'tool' ? 'tool' : 'model'}`}>
             <Spinner size={11} />
             <span className="sr-only">working with {session.activity === 'tool' ? 'tool' : 'model'}</span>
           </span>
-        ) : cancelling ? <span className="shrink-0 text-[11px] text-fg-faint">stopping…</span> : null}
+        ) : null}
+        {session.pinned === true ? <Icon name="pin" size={13} className="shrink-0 text-fg-faint" aria-label="Pinned" /> : null}
+        <span className="min-w-0 flex-1 truncate font-medium">{session.title || 'New conversation'}</span>
+        {queued > 0 ? <span className="shrink-0 text-[11px] text-fg-faint">{queued} queued</span> : null}
+        {cancelling ? <span className="shrink-0 text-[11px] text-fg-faint">stopping…</span> : null}
         {session.updatedAt !== undefined ? (
           <span
             className="shrink-0 text-[11px] tabular-nums text-fg-faint transition-opacity group-hover:opacity-0 group-focus-within:opacity-0 group-has-[[data-state=open]]:opacity-0 [@media(pointer:coarse)]:opacity-0"
@@ -140,7 +141,7 @@ function GroupHead({ children }: { readonly children: ReactNode }) {
   return <div className="px-2.5 pb-1 pt-3 text-xs font-medium text-fg-faint">{children}</div>
 }
 
-export function SessionList({ sessions, projects, current, filter, liveRunning, onSelect, onRename, onDeleteRequest, onTogglePinned, onNewInProject, sort = 'recent', emptyLabel, onReorder }: {
+export function SessionList({ sessions, projects, current, filter, liveRunning, onSelect, onRename, onDeleteRequest, onTogglePinned, onNewInProject, sort = 'recent', emptyLabel, onReorder, collapsedFolders, onToggleFolderCollapsed, expandedFolders, onExpandFolder, terminalProjects }: {
   readonly sessions: readonly SessionListing[]
   readonly projects: readonly ProjectRow[]
   readonly current: string | null
@@ -157,12 +158,33 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
   readonly emptyLabel?: string
   /** Persists a dragged folder order; drag is disabled when absent. */
   readonly onReorder?: (orderedIds: readonly string[]) => void
+  /** Controlled folder-collapse map; absent falls back to UI-local state. */
+  readonly collapsedFolders?: Readonly<Record<string, boolean>>
+  /** Reports folder collapse changes when controlled from the app shell. */
+  readonly onToggleFolderCollapsed?: (projectId: string, collapsed: boolean) => void
+  /** Controlled per-folder "Show more" map; absent falls back to UI-local state. */
+  readonly expandedFolders?: Readonly<Record<string, boolean>>
+  /** Reports "Show more/less" changes when controlled from the app shell. */
+  readonly onExpandFolder?: (projectId: string, expanded: boolean) => void
+  /** Project ids with a live terminal shell in this workspace. */
+  readonly terminalProjects?: ReadonlySet<string>
 }) {
-  // UI-local collapse state, honored for every group including the open one.
-  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
-  // Per-folder "Show more" state; a folder holding the open conversation and
-  // an active search always render in full instead.
-  const [expandedFolders, setExpandedFolders] = useState<Record<string, boolean>>({})
+  // Folder collapse and per-folder "Show more" are controlled from the app
+  // shell when wired up — so they survive the sidebar unmounting on close —
+  // and fall back to UI-local state otherwise. Collapse is honored for every
+  // group including the open one.
+  const [localCollapsed, setLocalCollapsed] = useState<Record<string, boolean>>({})
+  const [localExpanded, setLocalExpanded] = useState<Record<string, boolean>>({})
+  const collapsedState = collapsedFolders ?? localCollapsed
+  const expandedState = expandedFolders ?? localExpanded
+  const setFolderCollapsed = (projectId: string, value: boolean): void => {
+    if (onToggleFolderCollapsed !== undefined) onToggleFolderCollapsed(projectId, value)
+    else setLocalCollapsed((prev) => ({ ...prev, [projectId]: value }))
+  }
+  const setFolderExpanded = (projectId: string, value: boolean): void => {
+    if (onExpandFolder !== undefined) onExpandFolder(projectId, value)
+    else setLocalExpanded((prev) => ({ ...prev, [projectId]: value }))
+  }
   // Drag-to-reorder: the hovered target edge shows an insertion line; rows
   // never move mid-drag because relocating the dragged node cancels native
   // browser drag-and-drop.
@@ -175,7 +197,11 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
   const matches = (session: SessionListing): boolean => query === ''
     || session.title.toLowerCase().includes(query)
     || (session.projectId != null && (projectNames.get(session.projectId) ?? '').includes(query))
-  const shown = sessions.filter(matches)
+  // Subagent conversations never appear here — nearly every session spawns
+  // some, and a toggle row each turned the sidebar into noise. They stay
+  // reachable from their parent's own view (trajectory, delegation cards);
+  // the listing still carries them for the header breadcrumb and send gate.
+  const shown = sessions.filter((session) => session.parentSessionId == null).filter(matches)
 
   const rows = (list: readonly SessionListing[]): ReactNode => (
     <ul className="m-0 flex list-none flex-col gap-px p-0">
@@ -258,16 +284,28 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
       {projects.map((project) => {
         const projectSessions = rest.filter((session) => session.projectId === project.id)
         if (projectSessions.length === 0) return null
-        const runningCount = projectSessions.filter((session) => (session.status ?? 'idle') === 'running' || (session.id === current && liveRunning)).length
-        const isCollapsed = collapsed[project.id] === true
-        // The open conversation must never hide behind the cut, and neither
-        // must search results, so those two render expanded without a toggle.
-        const holdsCurrent = projectSessions.some((session) => session.id === current)
-        const expanded = holdsCurrent || query !== '' || expandedFolders[project.id] === true
-        const visible = expanded ? projectSessions : projectSessions.slice(0, FOLDER_PREVIEW_COUNT)
-        const showToggle = projectSessions.length > FOLDER_PREVIEW_COUNT && !holdsCurrent && query === ''
+        // A folder with a live shell or a conversation running a background
+        // process carries a terminal marker: work there keeps going even when
+        // no row is selected, and the icon stays on the folder — the folder is
+        // what owns terminals (they bind to the project, not the session).
+        // Pinned rows are checked too: they left `rest` but still belong here.
+        const folderActive = (terminalProjects?.has(project.id) ?? false)
+          || shown.some((session) => session.projectId === project.id && (session.runningProcesses ?? 0) > 0)
+        const isCollapsed = collapsedState[project.id] === true
+        // The open conversation must never hide behind the cut, and search
+        // results are never hidden either; both graft onto the preview rather
+        // than force the folder open, so an explicit "Show more" stays sticky.
+        const expanded = expandedState[project.id] === true || query !== ''
+        const cut = expanded ? projectSessions.length : FOLDER_PREVIEW_COUNT
+        const currentAt = projectSessions.findIndex((session) => session.id === current)
+        // Grafting appends rather than swaps so nothing already on screen
+        // vanishes when the open conversation sits past the cut.
+        const visible = currentAt >= cut
+          ? [...projectSessions.slice(0, cut), projectSessions[currentAt]!]
+          : projectSessions.slice(0, cut)
+        const showToggle = projectSessions.length > FOLDER_PREVIEW_COUNT && query === ''
         return (
-          <Collapsible.Root key={project.id} open={!isCollapsed} onOpenChange={(open) => setCollapsed((prev) => ({ ...prev, [project.id]: !open }))} className="mt-1.5 first:mt-1">
+          <Collapsible.Root key={project.id} open={!isCollapsed} onOpenChange={(open) => setFolderCollapsed(project.id, !open)} className="mt-1.5 first:mt-1">
             <div {...(onReorder !== undefined ? dragHandlers(project) : {})} className={cn('group relative flex items-center rounded-lg hover:bg-hover', dragId === project.id && 'opacity-40')}>
               {over?.id === project.id && dragId !== null && dragId !== project.id ? (
                 <span
@@ -278,7 +316,12 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
               <Collapsible.Trigger className="flex min-h-9 min-w-0 flex-1 items-center gap-2 px-2.5 text-left text-sm font-medium">
                 <Icon name={isCollapsed ? 'folder' : 'folderOpen'} size={15} className="shrink-0 text-fg-muted" />
                 <span className="min-w-0 flex-1 truncate">{project.name}</span>
-                {runningCount > 0 ? <span className="flex items-center gap-1 text-[11px] font-normal text-fg-faint"><Spinner size={10} />{runningCount}<span className="sr-only">running</span></span> : null}
+                {folderActive ? (
+                  <span title="Terminal or background process active in this folder" className="shrink-0 text-fg-muted">
+                    <Icon name="terminal" size={13} />
+                    <span className="sr-only">Terminal or background process active</span>
+                  </span>
+                ) : null}
               </Collapsible.Trigger>
               {onNewInProject !== undefined ? (
                 <IconButton label={`New conversation in ${project.name}`} className="mr-0.5 size-7 opacity-0 group-hover:opacity-100 focus:opacity-100 [@media(pointer:coarse)]:opacity-100" onClick={() => onNewInProject(project.id)}>
@@ -291,10 +334,11 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
               {showToggle ? (
                 <button
                   type="button"
-                  onClick={() => setExpandedFolders((prev) => ({ ...prev, [project.id]: !(prev[project.id] === true) }))}
+                  aria-expanded={expanded}
+                  onClick={() => setFolderExpanded(project.id, !expanded)}
                   className="mt-0.5 rounded-lg px-2.5 py-1 text-xs text-fg-faint hover:bg-hover hover:text-fg"
                 >
-                  {expandedFolders[project.id] === true ? 'Show less' : 'Show more'}
+                  {expanded ? 'Show less' : 'Show more'}
                 </button>
               ) : null}
             </Collapsible.Content>

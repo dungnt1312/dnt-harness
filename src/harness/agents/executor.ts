@@ -356,6 +356,22 @@ export class ChildExecutor {
       }
       this.indexChild(parentId, summary.id)
       recovered += 1
+      // A crash between the committed spawn and the child's settlement leaves
+      // the parent's log result-less forever, and every projection reads that
+      // as a child still running. Where the child's own log holds nothing but
+      // the interrupted recovery fact — an interrupted terminal turn, or no
+      // turn at all — the guarded repair backfills that verdict into the
+      // parent. A terminal completed/cancelled/failed child turn stays
+      // untouched: it proves the child stopped, never that the parent
+      // accepted its result, so that contract remains `uncertain`.
+      if (parent !== undefined && sessions.readCanonicalEvents !== undefined) {
+        const prior = latestChildResult(parent.events, summary.id)
+        const terminal = terminalTurnReason(loaded.events)
+        if ((prior === undefined || !isTerminalStatus(prior.status)) && (terminal === undefined || terminal === 'interrupted')) {
+          const workspace = sessions.workspaceOf(summary.id)
+          if (workspace !== undefined) await this.reconcile(workspace, summary.id)
+        }
+      }
     }
     return recovered
   }
@@ -484,7 +500,7 @@ export class ChildExecutor {
       // The canonical log is authoritative; recovery marks an open Turn
       // interrupted instead of claiming completion whose append failed.
     } finally {
-      this.releaseTurns(parent.id)
+      await this.releaseTurns(parent.id)
     }
   }
 
@@ -862,12 +878,39 @@ export class ChildExecutor {
     }
     let result = latestChildResult(parentEvents, childSessionId)
     if (result === undefined || !isTerminalStatus(result.status)) {
-      const terminal = terminalTurnReason(childEvents)
-      if (terminal === undefined) return this.withResult(child)
-      const status: Exclude<ChildStatus, 'running' | 'uncertain' | 'interrupted'> = terminal === 'completed'
+      // A child no live runner owns can never come back: with no terminal turn
+      // anywhere, the restart view reads `interrupted`, so the repair settles
+      // to that same verdict instead of leaving the parent's spawn result-less
+      // forever — every projection reads a result-less spawn as still running.
+      const terminal = terminalTurnReason(childEvents) ?? (live === undefined ? 'interrupted' : undefined)
+      if (terminal === undefined) {
+        // A committed spawn that never launched can never settle by itself:
+        // no runner owns it and the unreliable parent writer behind the
+        // uncertainty is never retried. The restart view of the same logs is
+        // `interrupted`, so the live repair settles identically and releases
+        // the reservation instead of holding it until the root is deleted.
+        if (live !== undefined && live.agent === undefined) {
+          live.status = 'interrupted'
+          live.failure = 'the spawn commit could not be confirmed before launch; the child never ran'
+          live.resultComputed = false
+          delete live.result
+          delete live.error
+          this.finalizeCanonical(live)
+          return this.withResult(live)
+        }
+        return this.withResult(child)
+      }
+      // An `interrupted` record carries no error: the recovery fact is the
+      // outcome, and reconstruct must render the same text whether it reads
+      // the record or the bare log.
+      const status: Exclude<ChildStatus, 'running' | 'uncertain'> = terminal === 'completed'
         ? 'completed'
-        : terminal === 'cancelled' ? 'cancelled' : 'failed'
-      const error = status === 'completed' ? undefined : `the child terminal turn ended ${terminal}`
+        : terminal === 'cancelled'
+        ? 'cancelled'
+        : terminal === 'interrupted' ? 'interrupted' : 'failed'
+      const error = status === 'completed' || status === 'interrupted'
+        ? undefined
+        : `the child terminal turn ended ${terminal}`
       const record = {
         type: 'agent/child-result' as const,
         childSessionId,
@@ -937,25 +980,30 @@ export class ChildExecutor {
 
   /**
    * A root turn reached its terminal lifecycle hook: its per-turn spawn
-   * budgets are spent history and are dropped.
+   * budgets are spent history and are dropped. This runs through the SAME
+   * admission writer as spawn: a spawn still committing for the finished
+   * turn completes first, so its key cannot be dropped and then re-created
+   * by the commit — a leak only forgetRoot would remove.
    */
-  releaseTurns(parentSessionId: SessionId): void {
-    const prefix = `${parentSessionId}:`
-    for (const key of [...this.spawnedPerTurn.keys()]) {
-      if (key.startsWith(prefix)) this.spawnedPerTurn.delete(key)
-    }
+  async releaseTurns(parentSessionId: SessionId): Promise<void> {
+    await this.withAdmission(parentSessionId, async () => {
+      const prefix = `${parentSessionId}:`
+      for (const key of [...this.spawnedPerTurn.keys()]) {
+        if (key.startsWith(prefix)) this.spawnedPerTurn.delete(key)
+      }
+    })
   }
 
   /**
    * A root session was deleted: drop every index it still owns. Returns the
    * child ids it indexed, so the host can drop their per-session state too.
    */
-  forgetRoot(parentSessionId: SessionId): SessionId[] {
+  async forgetRoot(parentSessionId: SessionId): Promise<SessionId[]> {
     // This hook is valid only after `sessions.delete()` succeeded. A failed
     // deletion leaves the root able to recover its terminal failure, so its
     // reservations must remain held.
     if (this.sessions()?.has(parentSessionId) !== false) return []
-    this.releaseTurns(parentSessionId)
+    await this.releaseTurns(parentSessionId)
     const ids = [...(this.childIdsByRoot.get(parentSessionId) ?? [])]
     this.childIdsByRoot.delete(parentSessionId)
     for (const child of [...this.active.values()]) {
@@ -1351,16 +1399,6 @@ function awaitsApproval(events: readonly SessionEvent[]): boolean {
     if (event.type === 'approval/decision') decided.add(event.approvalId)
   }
   return events.some((event) => event.type === 'approval/request' && !decided.has(event.approvalId))
-}
-
-/** Open turns (turn/start without turn/end) in a stored event list. */
-function countOpenTurns(events: readonly SessionEvent[]): number {
-  let open = 0
-  for (const event of events) {
-    if (event.type === 'turn/start') open += 1
-    else if (event.type === 'turn/end') open = Math.max(0, open - 1)
-  }
-  return open
 }
 
 /** The terminal reason of the child's newest turn, if it closed one. */

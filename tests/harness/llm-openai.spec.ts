@@ -4,7 +4,7 @@
  * the tools key disappears entirely when a mode exposes no tools.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { OpenAiCompletionsProvider } from 'mini-dsh'
+import { OpenAiCompletionsProvider, ProviderError } from 'mini-dsh'
 
 interface CapturedRequest {
   url: string
@@ -139,5 +139,114 @@ describe('openai completions adapter: thinking + wire shape', () => {
     })
     const messages = captured[0]?.body['messages'] as { content: unknown }[]
     expect(messages[0]?.content).toBe('done')
+  })
+})
+
+describe('openai completions adapter: failure surfacing', () => {
+  it('a mid-stream gateway error chunk rejects with the gateway message', async () => {
+    // One API-style relays answer 200, stream a little, then fail upstream:
+    // the error arrives as a JSON body chunk, not an HTTP status.
+    stubFetch([
+      '{"choices":[{"delta":{"content":"par"}}]}',
+      '{"error":{"message":"no available channel for this model","code":503}}',
+    ])
+    await expect(run({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(/no available channel/)
+  })
+
+  it('a string-form gateway error chunk is surfaced too', async () => {
+    stubFetch(['{"error":"upstream connect error"}'])
+    await expect(run({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(/upstream connect error/)
+  })
+
+  it('a stream that closes without any model output is an error, not silence', async () => {
+    stubFetch([])
+    await expect(run({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(/without any model output/)
+  })
+
+  it('a malformed SSE data chunk is a provider error, not a raw SyntaxError', async () => {
+    stubFetch(['{not json}'])
+    await expect(run({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(ProviderError)
+  })
+
+  it('gateway failures are ProviderError instances the turn loop classifies', async () => {
+    stubFetch(['{"error":{"message":"boom"}}'])
+    await expect(run({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(ProviderError)
+  })
+})
+
+describe('openai completions adapter: retry before the stream starts', () => {
+  function sse(text: string): Response {
+    return new Response(`data: {"choices":[{"delta":{"content":"${text}"}}]}\n\ndata: [DONE]\n\n`, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  }
+
+  function scripted(responses: (() => Response | Promise<Response>)[]): ReturnType<typeof vi.fn> {
+    let call = 0
+    const fake = vi.fn(async () => {
+      const next = responses[Math.min(call, responses.length - 1)]
+      call += 1
+      return next!()
+    })
+    vi.stubGlobal('fetch', fake)
+    return fake
+  }
+
+  function fast(maxRetries?: number): OpenAiCompletionsProvider {
+    return new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', retryBaseMs: 1, ...(maxRetries !== undefined ? { maxRetries } : {}) })
+  }
+
+  async function collect(p: OpenAiCompletionsProvider, signal?: AbortSignal): Promise<string> {
+    let text = ''
+    for await (const event of p.stream({ messages: [{ role: 'user', content: 'hi' }] }, signal !== undefined ? { signal } : undefined)) {
+      if (event.type === 'delta') text += event.delta
+    }
+    return text
+  }
+
+  it('retries 429 and 503, honouring retry-after, then streams once', async () => {
+    const fake = scripted([
+      () => new Response('slow down', { status: 429, headers: { 'retry-after': '0' } }),
+      () => new Response('busy', { status: 503 }),
+      () => sse('ok'),
+    ])
+    expect(await collect(fast())).toBe('ok')
+    expect(fake).toHaveBeenCalledTimes(3)
+  })
+
+  it('retries a connection failure', async () => {
+    const fake = scripted([
+      () => { throw new TypeError('fetch failed') },
+      () => sse('back'),
+    ])
+    expect(await collect(fast())).toBe('back')
+    expect(fake).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not retry a client error', async () => {
+    const fake = scripted([() => new Response('bad key', { status: 401 })])
+    await expect(collect(fast())).rejects.toThrow(/HTTP 401: bad key/)
+    expect(fake).toHaveBeenCalledTimes(1)
+  })
+
+  it('gives up after maxRetries and reports the attempts', async () => {
+    const fake = scripted([() => new Response('down', { status: 502 })])
+    await expect(collect(fast(2))).rejects.toThrow(/HTTP 502: down \(after 3 attempts\)/)
+    expect(fake).toHaveBeenCalledTimes(3)
+  })
+
+  it('a stop during backoff ends the wait at once', async () => {
+    const fake = scripted([() => new Response('later', { status: 429, headers: { 'retry-after': '20' } })])
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(new Error('stopped')), 50)
+    const started = Date.now()
+    await expect(collect(fast(), controller.signal)).rejects.toThrow(/stopped/)
+    expect(Date.now() - started).toBeLessThan(5_000)
+    expect(fake).toHaveBeenCalledTimes(1)
+  })
+
+  it('caps an oversized error body', async () => {
+    scripted([() => new Response('x'.repeat(50_000), { status: 400 })])
+    const error = await collect(fast()).catch((caught: unknown) => caught as Error)
+    expect((error as Error).message.length).toBeLessThan(5_000)
+    expect((error as Error).message).toContain('[truncated]')
   })
 })

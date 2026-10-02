@@ -1,16 +1,24 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import type { ToolExecution } from '../../harness/tools/types.ts'
+import { hashBytes } from './text-document.ts'
 
 const tails = new Map<string, Promise<void>>()
 
+/**
+ * What each session has seen of each file: the sha256 of the stored bytes at
+ * its last Read/Write/Edit. A mutation is allowed only while the file still
+ * hashes to that value, so an external change (another session, Bash, a
+ * formatter, the user) is never clobbered blindly.
+ */
 export class FileObservations {
   private readonly observed = new Map<string, Map<string, string>>()
 
-  record(sessionId: string, file: string, content: string): void {
+  /** Record the stored-bytes hash a session has observed. */
+  record(sessionId: string, file: string, hash: string): void {
     const records = this.observed.get(sessionId) ?? new Map<string, string>()
-    records.set(keyOf(file), digest(content))
+    records.set(keyOf(file), hash)
     this.observed.set(sessionId, records)
   }
 
@@ -23,8 +31,9 @@ export class FileObservations {
   }
 }
 
+/** sha256 of text stored as UTF-8 (explicit-hash callers and tests). */
 export function digest(content: string): string {
-  return createHash('sha256').update(content, 'utf8').digest('hex')
+  return hashBytes(Buffer.from(content, 'utf8'))
 }
 
 const keyOf = (file: string): string => process.platform === 'win32' ? file.toLowerCase() : file
@@ -39,17 +48,21 @@ export async function canonical(file: string): Promise<string> {
   }
 }
 
-export function observe(exec: ToolExecution, file: string, content: string): void {
-  if (exec.sessionId !== undefined) exec.observations?.record(exec.sessionId, file, content)
+export function observe(exec: ToolExecution, file: string, hash: string): void {
+  if (exec.sessionId !== undefined) exec.observations?.record(exec.sessionId, file, hash)
 }
 
 /**
  * What the executing session knows about the target file.
- * - `check`: refuse unless the bytes still hash to `hash`.
+ * - `check`: refuse unless the stored bytes still hash to `hash`.
  * - `skip`: no session scope (a direct caller outside any agent run) and no
  *   explicit hash — nothing to compare against, so compatibility is kept.
  * - `missing`: a session IS executing but never observed this file: the
  *   overwrite would be blind, so it is refused.
+ *
+ * A child agent also sees its parent's observation of a file (read-only):
+ * the hash check still applies, so it only helps while the bytes are
+ * exactly what the parent saw.
  */
 export type ObservationRequirement =
   | { readonly kind: 'check'; readonly hash: string }
@@ -62,8 +75,13 @@ export function requirementFor(exec: ToolExecution, file: string, explicit: unkn
     return { kind: 'check', hash: explicit.toLowerCase() }
   }
   if (exec.sessionId === undefined) return { kind: 'skip' }
-  const hash = exec.observations?.expected(exec.sessionId, file)
-  return hash === undefined ? { kind: 'missing' } : { kind: 'check', hash }
+  const own = exec.observations?.expected(exec.sessionId, file)
+  if (own !== undefined) return { kind: 'check', hash: own }
+  for (const ancestor of exec.observationParents ?? []) {
+    const inherited = exec.observations?.expected(ancestor, file)
+    if (inherited !== undefined) return { kind: 'check', hash: inherited }
+  }
+  return { kind: 'missing' }
 }
 
 export async function withFileLock<T>(file: string, signal: AbortSignal | undefined, action: () => Promise<T>): Promise<T> {
@@ -82,14 +100,18 @@ export async function withFileLock<T>(file: string, signal: AbortSignal | undefi
   }
 }
 
-/** Publish `content` atomically, leaving the previous file untouched on failure. */
-export async function replaceFile(file: string, content: string): Promise<void> {
+/**
+ * Publish `content` atomically, leaving the previous file untouched on
+ * failure. An existing file's permission bits carry over to the new inode.
+ */
+export async function replaceFile(file: string, content: string | Uint8Array): Promise<void> {
   const directory = path.dirname(file)
   const temporary = path.join(directory, `.${path.basename(file)}.tmp-${randomUUID()}`)
   try {
-    const handle = await fs.open(temporary, 'wx')
+    const mode = await fs.stat(file).then((stat) => stat.mode & 0o7777, () => undefined)
+    const handle = await fs.open(temporary, 'wx', mode)
     try {
-      await handle.writeFile(content, 'utf8')
+      await handle.writeFile(content)
       await handle.sync()
     } finally {
       await handle.close()

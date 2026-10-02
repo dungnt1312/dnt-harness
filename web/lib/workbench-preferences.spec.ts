@@ -2,12 +2,16 @@ import { describe, expect, it } from 'vitest'
 import {
   ANCHOR_VIEW,
   WORKBENCH_DEFAULTS,
+  WORKBENCH_TABS_DEFAULTS,
   clampInspectorTab,
   clampPanelWidth,
+  normalizeWorkbenchTabs,
+  parseWorkbenchLegacyTabs,
   parseWorkbenchPreferences,
+  parseWorkbenchTabs,
 } from './workbench-preferences.ts'
 
-describe('workbench preferences', () => {
+describe('workbench preferences (global panel state)', () => {
   it('uses defaults for absent or malformed storage', () => {
     expect(parseWorkbenchPreferences(null)).toEqual(WORKBENCH_DEFAULTS)
     expect(parseWorkbenchPreferences('{broken')).toEqual(WORKBENCH_DEFAULTS)
@@ -19,15 +23,11 @@ describe('workbench preferences', () => {
       rightWidth: -1,
       leftCollapsed: true,
       rightCollapsed: false,
-      inspectorTab: 'trajectory',
-      inspectorViews: ['files', 'trajectory'],
     }))).toMatchObject({
       leftWidth: 420,
       rightWidth: 360,
       leftCollapsed: true,
       rightCollapsed: false,
-      inspectorTab: 'trajectory',
-      inspectorViews: ['files', 'trajectory'],
     })
   })
 
@@ -37,58 +37,20 @@ describe('workbench preferences', () => {
       rightWidth: 400,
       leftCollapsed: 'no',
       rightCollapsed: null,
-      inspectorTab: 'invalid',
     }))).toEqual({
       leftWidth: 300,
       rightWidth: 400,
       leftCollapsed: false,
       rightCollapsed: false,
-      inspectorTab: 'files',
-      inspectorViews: ['files'],
       terminalShell: null,
       terminalOpen: false,
       terminalHeight: 280,
     })
   })
 
-  it('keeps the anchor and dedupes the opened strip without folding the selection back in', () => {
-    // A stored strip is the record of what is open: the selected view is
-    // *not* added to it, or closing that tab would re-add it and take two
-    // clicks. Here 'trajectory' is selected but deliberately not open.
-    expect(parseWorkbenchPreferences(JSON.stringify({
-      inspectorTab: 'bogus',
-      inspectorViews: ['context', 'context', 'bogus'],
-    }))).toMatchObject({
-      inspectorViews: ['files', 'context'],
-      inspectorTab: 'files',
-    })
-
-    // A strip stored without the anchor must not leave the workbench tabless.
-    expect(parseWorkbenchPreferences(JSON.stringify({
-      inspectorTab: 'files',
-      inspectorViews: 'not-an-array',
-    })).inspectorViews).toEqual(['files'])
-  })
-
-  it('seeds the strip from the selection when no strip was ever recorded', () => {
-    // Storage written before inspectorViews existed has only the selection as
-    // evidence of what was open.
-    expect(parseWorkbenchPreferences(JSON.stringify({ inspectorTab: 'trajectory' }))).toMatchObject({
-      inspectorViews: ['files', 'trajectory'],
-      inspectorTab: 'trajectory',
-    })
-    // Terminal is a workbench tab again, so a stored selection seeds the strip.
-    expect(parseWorkbenchPreferences(JSON.stringify({ inspectorTab: 'terminal' }))).toMatchObject({
-      inspectorViews: ['files', 'terminal'],
-      inspectorTab: 'terminal',
-    })
-  })
-
-  it('clamps the selection to an open tab, falling back to the anchor', () => {
-    expect(clampInspectorTab('trajectory', ['files', 'trajectory'])).toBe('trajectory')
-    expect(clampInspectorTab('trajectory', ['files'])).toBe(ANCHOR_VIEW)
-    expect(clampInspectorTab('terminal', ['files', 'terminal'])).toBe('terminal')
-    expect(clampInspectorTab('bogus', ['files'])).toBe(ANCHOR_VIEW)
+  it('ignores the legacy tab fields that moved to per-session records', () => {
+    expect(parseWorkbenchPreferences(JSON.stringify({ inspectorTab: 'trajectory', inspectorViews: ['files', 'trajectory'] })))
+      .toEqual(WORKBENCH_DEFAULTS)
   })
 
   it('clamps each panel only within its own range', () => {
@@ -99,5 +61,61 @@ describe('workbench preferences', () => {
     expect(clampPanelWidth('right', Number.NaN)).toBe(560)
     expect(clampPanelWidth('terminal', 50)).toBe(120)
     expect(clampPanelWidth('terminal', 2000)).toBe(900)
+  })
+})
+
+describe('per-session workbench tabs', () => {
+  it('keeps the anchor and dedupes the opened strip without folding the selection back in', () => {
+    // A stored strip is the record of what is open: the selected view is
+    // *not* added to it, or closing that tab would re-add it and take two
+    // clicks. Here 'trajectory' is selected but deliberately not open.
+    expect(normalizeWorkbenchTabs('bogus', ['context', 'context', 'bogus'])).toEqual({
+      inspectorViews: ['files', 'context'],
+      inspectorTab: 'files',
+    })
+    // A strip stored without the anchor must not leave the workbench tabless.
+    expect(normalizeWorkbenchTabs('files', 'not-an-array')).toEqual({
+      inspectorViews: ['files'],
+      inspectorTab: 'files',
+    })
+  })
+
+  it('clamps the selection to an open tab, falling back to the anchor', () => {
+    expect(clampInspectorTab('trajectory', ['files', 'trajectory'])).toBe('trajectory')
+    expect(clampInspectorTab('trajectory', ['files'])).toBe(ANCHOR_VIEW)
+    expect(clampInspectorTab('terminal', ['files', 'terminal'])).toBe('terminal')
+    expect(clampInspectorTab('bogus', ['files'])).toBe(ANCHOR_VIEW)
+  })
+
+  it('parses one record entry per conversation, dropping malformed entries', () => {
+    const record = parseWorkbenchTabs(JSON.stringify({
+      'w1:s1': { inspectorTab: 'trajectory', inspectorViews: ['files', 'trajectory'] },
+      'w1:s2': { inspectorTab: 'files' },
+      'w1:bad': null,
+      'w1:bad2': 'nope',
+    }))
+    expect(record['w1:s1']).toEqual({ inspectorTab: 'trajectory', inspectorViews: ['files', 'trajectory'] })
+    // A conversation remembered as closed-to-Files stays distinct from one
+    // never recorded: an entry is evidence, its absence is not.
+    expect(record['w1:s2']).toEqual({ inspectorTab: 'files', inspectorViews: ['files'] })
+    expect(record['w1:bad']).toBeUndefined()
+    expect(record['w1:bad2']).toBeUndefined()
+  })
+
+  it('uses an empty record for absent or malformed storage', () => {
+    expect(parseWorkbenchTabs(null)).toEqual({})
+    expect(parseWorkbenchTabs('{broken')).toEqual({})
+    expect(parseWorkbenchTabs(JSON.stringify(['w1:s1']))).toEqual({})
+  })
+
+  it('seeds from the legacy global tab fields for the upgrade path', () => {
+    expect(parseWorkbenchLegacyTabs(JSON.stringify({ inspectorTab: 'trajectory', inspectorViews: ['files', 'trajectory'] })))
+      .toEqual({ inspectorTab: 'trajectory', inspectorViews: ['files', 'trajectory'] })
+    // Storage written before inspectorViews existed has only the selection as
+    // evidence of what was open.
+    expect(parseWorkbenchLegacyTabs(JSON.stringify({ inspectorTab: 'trajectory' })))
+      .toEqual({ inspectorTab: 'trajectory', inspectorViews: ['files', 'trajectory'] })
+    expect(parseWorkbenchLegacyTabs(null)).toEqual(WORKBENCH_TABS_DEFAULTS)
+    expect(parseWorkbenchLegacyTabs('{broken')).toEqual(WORKBENCH_TABS_DEFAULTS)
   })
 })

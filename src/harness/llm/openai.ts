@@ -1,5 +1,5 @@
 import { applyThinkingOverride } from './model-catalog.ts'
-import { messageText } from './types.ts'
+import { messageText, ProviderError } from './types.ts'
 import type { LlmProvider, ModelMessage, ModelRequest, StreamEvent, StreamOptions, TokenUsage } from './types.ts'
 
 interface StreamChoice {
@@ -89,6 +89,60 @@ export interface OpenAiCompletionsOptions {
   readonly baseUrl: string
   /** Model names offered to selectors; the first is the fallback model. */
   readonly models?: readonly string[]
+  /** Extra attempts for 408/409/425/429/5xx or a connection failure before streaming starts (default 3). */
+  readonly maxRetries?: number
+  /** First backoff delay; doubles per attempt with jitter (default 1000ms). */
+  readonly retryBaseMs?: number
+}
+
+const DEFAULT_MAX_RETRIES = 3
+const DEFAULT_RETRY_BASE_MS = 1_000
+/** A single wait never exceeds this, whatever `retry-after` asks for. */
+const MAX_RETRY_DELAY_MS = 30_000
+/** Error bodies are diagnostics: keep enough to explain, never an unbounded read. */
+const MAX_ERROR_BODY_CHARS = 4_000
+const RETRYABLE_STATUS: ReadonlySet<number> = new Set([408, 409, 425, 429, 500, 502, 503, 504, 529])
+
+function backoffMs(attempt: number, base: number): number {
+  const exponential = base * 2 ** (attempt - 1)
+  return Math.min(MAX_RETRY_DELAY_MS, exponential / 2 + Math.random() * (exponential / 2))
+}
+
+/** `retry-after` as seconds or an HTTP date; undefined when absent or unusable. */
+function retryAfterMs(header: string | null): number | undefined {
+  if (header === null || header.trim() === '') return undefined
+  const seconds = Number(header)
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000
+  const date = Date.parse(header)
+  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now())
+}
+
+async function boundedText(response: Response): Promise<string> {
+  try {
+    const text = await response.text()
+    return text.length > MAX_ERROR_BODY_CHARS ? `${text.slice(0, MAX_ERROR_BODY_CHARS)}… [truncated]` : text
+  } catch {
+    return '(unreadable body)'
+  }
+}
+
+/** Wait, but wake with the abort reason as soon as the run is stopped. */
+function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted === true) {
+      reject(signal.reason instanceof Error ? signal.reason : new Error('aborted'))
+      return
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    const onAbort = (): void => {
+      clearTimeout(timer)
+      reject(signal?.reason instanceof Error ? signal.reason : new Error('aborted'))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 /**
@@ -129,28 +183,53 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       stream_options: { include_usage: true },
     }
     applyThinkingOverride(body, model, request.thinkingLevel)
-    const response = await fetch(`${this.options.baseUrl}/chat/completions`, {
-      method: 'POST',
-      ...(options?.signal !== undefined ? { signal: options.signal } : {}),
-      headers: {
-        'content-type': 'application/json',
-        // Local gateways often accept no credential at all; sending an empty
-        // Bearer makes some of them reject the call outright.
-        ...(this.options.apiKey === '' ? {} : { authorization: `Bearer ${this.options.apiKey}` }),
-      },
-      body: JSON.stringify(body),
-    })
-    if (!response.ok) {
-      throw new Error(`${this.name}: HTTP ${response.status}: ${await response.text()}`)
+    const payload = JSON.stringify(body)
+    const signal = options?.signal
+    const maxAttempts = 1 + Math.max(0, this.options.maxRetries ?? DEFAULT_MAX_RETRIES)
+    let response: Response
+    // Retry only before the stream starts: nothing has been yielded, so a
+    // second request cannot duplicate output. Rate limits and transient
+    // gateway/server failures are retried with backoff; everything else
+    // (auth, bad request, a mid-stream failure) surfaces at once.
+    for (let attempt = 1; ; attempt++) {
+      let wait: number | undefined
+      try {
+        response = await fetch(`${this.options.baseUrl}/chat/completions`, {
+          method: 'POST',
+          ...(signal !== undefined ? { signal } : {}),
+          headers: {
+            'content-type': 'application/json',
+            // Local gateways often accept no credential at all; sending an empty
+            // Bearer makes some of them reject the call outright.
+            ...(this.options.apiKey === '' ? {} : { authorization: `Bearer ${this.options.apiKey}` }),
+          },
+          body: payload,
+        })
+      } catch (error) {
+        // A connection-level failure (reset, DNS, refused) is transient; a stop is not.
+        if (signal?.aborted === true || attempt >= maxAttempts) throw error
+        await sleep(backoffMs(attempt, this.options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS), signal)
+        continue
+      }
+      if (response.ok) break
+      const detail = await boundedText(response)
+      if (!RETRYABLE_STATUS.has(response.status) || attempt >= maxAttempts) {
+        throw new ProviderError(`${this.name}: HTTP ${response.status}: ${detail}${attempt > 1 ? ` (after ${attempt} attempts)` : ''}`)
+      }
+      wait = retryAfterMs(response.headers.get('retry-after'))
+      await sleep(Math.min(MAX_RETRY_DELAY_MS, wait ?? backoffMs(attempt, this.options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS)), signal)
     }
     if (response.body === null) {
-      throw new Error(`${this.name}: empty response body`)
+      throw new ProviderError(`${this.name}: empty response body`)
     }
 
     const calls: AccumulatedCall[] = []
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
+    // Gateways that fail upstream mid-stream answer 200 and then close
+    // cleanly; without this flag that reads as a successful empty turn.
+    let sawModelOutput = false
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
@@ -164,9 +243,20 @@ export class OpenAiCompletionsProvider implements LlmProvider {
         const data = line.slice(5).trim()
         if (data === '[DONE]') {
           yield* finishCalls(this.name, calls)
+          if (!sawModelOutput) throw new ProviderError(`${this.name}: stream ended without any model output`)
           return
         }
-        const parsed = JSON.parse(data) as { choices?: StreamChoice[]; usage?: WireUsage | null }
+        let parsed: { choices?: StreamChoice[]; usage?: WireUsage | null; error?: unknown }
+        try {
+          parsed = JSON.parse(data) as { choices?: StreamChoice[]; usage?: WireUsage | null; error?: unknown }
+        } catch (error) {
+          throw new ProviderError(`${this.name}: malformed stream chunk '${data}': ${String(error instanceof Error ? error.message : error)}`)
+        }
+        // One API-style relays report upstream failures as an error object in
+        // a 200 stream; that payload is the only diagnosis the user ever sees.
+        if (parsed.error !== undefined) {
+          throw new ProviderError(`${this.name}: gateway error: ${gatewayErrorText(parsed.error)}`)
+        }
         const usage = parseUsage(parsed.usage)
         if (usage !== undefined) yield { type: 'usage', usage }
         const delta = parsed.choices?.[0]?.delta
@@ -174,10 +264,17 @@ export class OpenAiCompletionsProvider implements LlmProvider {
         // Reasoning-capable models emit thinking separately from content:
         // the thinking text never joins the answered content and is marked
         // for the UI as a `thinking` delta.
-        if (typeof content === 'string' && content !== '') yield { type: 'delta', delta: content }
+        if (typeof content === 'string' && content !== '') {
+          sawModelOutput = true
+          yield { type: 'delta', delta: content }
+        }
         const thinking = delta?.reasoning_content
-        if (typeof thinking === 'string' && thinking !== '') yield { type: 'delta', delta: thinking, thinking: true }
+        if (typeof thinking === 'string' && thinking !== '') {
+          sawModelOutput = true
+          yield { type: 'delta', delta: thinking, thinking: true }
+        }
         if (delta?.tool_calls !== undefined) {
+          sawModelOutput = true
           for (const fragment of delta.tool_calls) {
             const index = fragment.index ?? 0
             const slot = calls[index] ?? { id: '', name: '', argsString: '' }
@@ -190,7 +287,18 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       }
     }
     yield* finishCalls(this.name, calls)
+    if (!sawModelOutput) throw new ProviderError(`${this.name}: stream ended without any model output`)
   }
+}
+
+/** A relay's error payload: OpenAI object shape, bare string, or anything else. */
+function gatewayErrorText(error: unknown): string {
+  if (typeof error === 'string') return error
+  if (error !== null && typeof error === 'object' && 'message' in error) {
+    const message = (error as { message?: unknown }).message
+    if (typeof message === 'string' && message !== '') return message
+  }
+  return JSON.stringify(error)
 }
 
 /** The `usage` object of a completions chunk; cache fields vary by server. */
@@ -237,6 +345,6 @@ function parseArgs(name: string, argsString: string): Record<string, unknown> {
     }
     return parsed as Record<string, unknown>
   } catch (error) {
-    throw new Error(`${name}: invalid tool arguments JSON '${argsString}': ${String(error)}`)
+    throw new ProviderError(`${name}: invalid tool arguments JSON '${argsString}': ${String(error instanceof Error ? error.message : error)}`)
   }
 }

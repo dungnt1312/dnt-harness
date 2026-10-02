@@ -183,13 +183,16 @@ describe('primitives', () => {
 describe('chat surfaces', () => {
   it('ToolCard shows the tool, its target and running state while pending', () => {
     const pending = renderToStaticMarkup(<ToolCard item={{ kind: 'tool', call: { id: 't1', name: 'read', args: { path: 'src/x.ts', limit: 5 } } }} />)
-    // While pending the state spinner leads; the file's own glyph waits for the outcome.
-    expect(pending).toContain('animate-spin-slow')
-    expect(pending).toContain('Running')
-    expect(pending).toContain('src/x.ts')
-    expect(pending).toContain('aria-expanded="false"')
+    // While pending the kind says so in its -ing form, shimmering; there is no spinner.
+    expect(pending).toContain('Reading')
+    expect(pending).toContain('text-shimmer')
+    expect(pending).not.toContain('animate-spin-slow')
+    expect(pending).toContain('x.ts')
+    // The file keeps its own type icon in every state.
+    expect(pending).toContain('/material-icons/typescript.svg')
     const settled = renderToStaticMarkup(<ToolCard item={{ kind: 'tool', call: { id: 't1', name: 'read', args: { path: 'src/x.ts', limit: 5 } }, result: { ok: true, output: 'x' } }} />)
-    expect(settled).toContain('/material-icons/typescript.svg')
+    expect(settled).toContain('>Read<')
+    expect(settled).not.toContain('text-shimmer')
   })
 
   it('ApprovalBar shows one card per pending call', () => {

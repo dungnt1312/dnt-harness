@@ -62,7 +62,7 @@ describe('path-scope guard', () => {
     expect(seen).toBeDefined()
     expect(matched).toMatchObject({ path: path.join(outside, 'x.txt'), intent: 'read' })
     // No approval layer here: the allowed call reads the approved path once.
-    expect((await prepared.execute()).output).toBe('outside')
+    expect((await prepared.execute()).output).toBe('1\toutside')
     expect(guard.get(prepared.executionId, prepared.call)).toBeUndefined()
   })
 
@@ -102,7 +102,7 @@ describe('path-scope guard', () => {
     // A foreign execution id never resolves another execution's match.
     expect(guard.get(idA, read(other))).toBeUndefined()
     const [a, b] = await Promise.all([first, second])
-    expect((await a.execute()).output).toBe('outside')
-    expect((await b.execute()).output).toBe('other')
+    expect((await a.execute()).output).toBe('1\toutside')
+    expect((await b.execute()).output).toBe('1\tother')
   })
 })

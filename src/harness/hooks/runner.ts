@@ -7,7 +7,11 @@
  * structurally impossible from here (plain child process, no harness access).
  */
 import { spawn } from 'node:child_process'
+import { scrubbedChildEnv } from '../child-env.ts'
 import type { HookBinding } from '../mcp/config.ts'
+
+/** Hook output past this many characters per stream is discarded. */
+const HOOK_OUTPUT_CAP = 256 * 1024
 
 export interface HookDecision {
   readonly exitCode: number | null
@@ -74,7 +78,7 @@ export function runHook(binding: HookBinding, payload: Record<string, unknown>, 
     }
     let child
     try {
-      child = spawn(file, args, { stdio: ['pipe', 'pipe', 'pipe'] })
+      child = spawn(file, args, { stdio: ['pipe', 'pipe', 'pipe'], env: scrubbedChildEnv(), windowsHide: true })
     } catch {
       // Spawn failures are non-blocking failures (exit 1 semantics); the
       // caller applies onFailure.
@@ -87,10 +91,10 @@ export function runHook(binding: HookBinding, payload: Record<string, unknown>, 
     }, timeoutMs)
     timer.unref?.()
     child.stdout?.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8')
+      if (stdout.length < HOOK_OUTPUT_CAP) stdout += chunk.toString('utf8').slice(0, HOOK_OUTPUT_CAP - stdout.length)
     })
     child.stderr?.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf8')
+      if (stderr.length < HOOK_OUTPUT_CAP) stderr += chunk.toString('utf8').slice(0, HOOK_OUTPUT_CAP - stderr.length)
     })
     child.on('error', (error: Error) => {
       stderr += `hook error: ${error.message}`

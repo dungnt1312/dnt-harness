@@ -179,6 +179,7 @@ export class SessionsService extends Service {
           summary === undefined ||
           summary.projectId === undefined ||
           summary.derivedTitle === undefined ||
+          summary.parentSessionId === undefined ||
           (tail !== undefined && summary.lastSeq !== tail)
         ) {
           // Deleting derived state must never hide a canonical session:
@@ -374,6 +375,8 @@ export class SessionsService extends Service {
         })
       } else if (event.type === 'user/message' && event.inputId !== undefined) {
         consumed.add(event.inputId)
+      } else if (event.type === 'input/settled') {
+        consumed.add(event.inputId)
       }
     }
     return queued.filter((item) => !consumed.has(item.inputId))
@@ -480,8 +483,9 @@ export class SessionsService extends Service {
         lastSeq: last?.seq ?? 0,
         title: lastRecorded(events, (event) => (event.type === 'session/title' ? event.title : undefined), null),
         derivedTitle: deriveTitle(events),
-        projectId: lastRecorded(events, (event) => (event.type === 'session/project' ? event.projectId : undefined), null),
+        projectId: lastRecorded(events, projectOf, null),
         pinned: lastRecorded(events, (event) => (event.type === 'session/pinned' ? event.pinned : undefined), false),
+        parentSessionId: lastRecorded(events, parentOf, null),
       }
       await store.writeSummary(id, summary)
       return summary
@@ -569,8 +573,9 @@ export class SessionsService extends Service {
       lastSeq: last?.seq ?? 0,
       title: lastRecorded(events, (event) => (event.type === 'session/title' ? event.title : undefined), null),
       derivedTitle: deriveTitle(events),
-      projectId: lastRecorded(events, (event) => (event.type === 'session/project' ? event.projectId : undefined), null),
+      projectId: lastRecorded(events, projectOf, null),
       pinned: lastRecorded(events, (event) => (event.type === 'session/pinned' ? event.pinned : undefined), false),
+      parentSessionId: lastRecorded(events, parentOf, null),
     }
   }
 }
@@ -587,4 +592,17 @@ function lastRecorded<T>(events: readonly SessionEvent[], pick: (event: SessionE
     if (value !== undefined) return value
   }
   return fallback
+}
+
+/** Project binding: an explicit `session/project` wins; a subagent inherits its spawn record's binding. */
+function projectOf(event: SessionEvent): string | null | undefined {
+  if (event.type === 'session/project') return event.projectId
+  if (event.type === 'session/child-meta') return event.projectId ?? undefined
+  return undefined
+}
+
+/** Subagent parentage, recorded once in the child's own log at spawn. */
+function parentOf(event: SessionEvent): string | null | undefined {
+  if (event.type === 'session/child-meta') return event.parentSessionId
+  return undefined
 }

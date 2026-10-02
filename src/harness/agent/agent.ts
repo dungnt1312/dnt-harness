@@ -2,7 +2,7 @@ import type { Context } from '../../kernel/index.ts'
 import { newExecutionId, newStepId, newTurnId, type ExecutionId, type InputId, type StepId, type TurnId } from '../../util/brand.ts'
 import { resolveLimits, type HarnessLimits } from '../limits.ts'
 import type { AttachmentRef } from '../attachments/store.ts'
-import type { ModelRequest, ToolCall, ToolSchema } from '../llm/types.ts'
+import { ProviderError, type ModelRequest, type ToolCall, type ToolSchema } from '../llm/types.ts'
 import { canonicalCall } from '../tools/names.ts'
 import type { ToolResult } from '../tools/types.ts'
 import type { Session } from '../session/session.ts'
@@ -65,8 +65,16 @@ export class Agent {
   activity: 'model' | 'tool' | null = null
 
   private inbox: InboxItem[] = []
+  /** Accepted inputs removed from the inbox but not yet durably settled. */
+  private readonly claimedInputIds = new Set<InputId>()
   private abortController: AbortController | null = null
   private abortCause: AbortCause = 'stop'
+  /**
+   * Set by {@link steer}: the in-flight run stops like a user stop, but the
+   * inbox runs right after instead of staying queued. Consumed when the
+   * stopped run settles.
+   */
+  private steerRequested = false
 
 /** The fixed workspace/project identity carried into every execution. */
   readonly identity: AgentScope
@@ -100,6 +108,7 @@ export class Agent {
    * restored inputs wait for the next user-triggered run, never auto-run.
    */
   enqueueAccepted(item: { content: string; inputId: InputId; attachments?: readonly AttachmentRef[] }): void {
+    if (this.claimedInputIds.has(item.inputId)) return
     if (this.inbox.some((existing) => existing.kind === 'user' && existing.inputId === item.inputId)) return
     this.inbox.push({
       kind: 'user',
@@ -107,6 +116,25 @@ export class Agent {
       inputId: item.inputId,
       ...(item.attachments !== undefined && item.attachments.length > 0 ? { attachments: item.attachments } : {}),
     })
+  }
+
+  /**
+   * Adopt every durably pending input, in log (acceptance) order. Accepted
+   * inputs already waiting in the inbox are re-ordered to match the log, so
+   * one that a failed turn handed back cannot end up behind newer input.
+   * Injected context and claimed inputs are untouched.
+   */
+  adoptPending(pending: readonly { content: string; inputId: InputId; attachments?: readonly AttachmentRef[] }[]): void {
+    const pendingIds = new Set(pending.map((item) => item.inputId))
+    // Accepted inputs the log no longer lists as pending stay where they are.
+    const kept = this.inbox.filter((item) => item.kind !== 'user' || item.inputId === undefined || !pendingIds.has(item.inputId))
+    this.inbox = kept
+    for (const item of pending) this.enqueueAccepted(item)
+  }
+
+  /** Whether a running turn has claimed this input (pre-step or later): it is no longer waiting. */
+  isClaimed(inputId: InputId): boolean {
+    return this.claimedInputIds.has(inputId)
   }
 
   /** User inputs waiting in the inbox (queue-depth reads for status UIs). */
@@ -122,7 +150,30 @@ export class Agent {
    * auto-advances it. A no-op while idle.
    */
   stop(): void {
-    this.abortCause = 'stop'
+    // The latest intent wins: a Stop after a Steer cancels the steer, so the
+    // queue stays queued exactly as a plain Stop promises.
+    this.steerRequested = false
+    this.abortRun()
+  }
+
+  /**
+   * Steer: stop the in-flight turn, then run the queued input in one new
+   * turn, oldest first. The interrupted turn closes as `steered`; steering a
+   * stop already in progress upgrades it. A no-op while idle — the caller
+   * starts the run itself. Not durable: after a restart the input is plain
+   * pending input again and never auto-runs.
+   */
+  steer(): void {
+    if (this.status === 'idle') return
+    this.steerRequested = true
+    this.abortRun()
+  }
+
+  /** The shared abort of stop and steer. */
+  private abortRun(): void {
+    // An inactivity abort already fired keeps its truthful cause; a user
+    // stop arriving afterwards must not relabel that provider failure.
+    if (this.abortController?.signal.aborted !== true) this.abortCause = 'stop'
     if (this.status === 'running') this.status = 'cancelling'
     this.abortController?.abort()
   }
@@ -146,6 +197,7 @@ export class Agent {
     this.abortCause = 'stop'
     this.abortController = new AbortController()
     let stopped = false
+    let steered = false
     try {
       // The scope lets pipeline listeners (approval routing, tool grants,
       // workspace-scoped controls) attribute work to this agent's session
@@ -155,6 +207,13 @@ export class Agent {
         // inbox until one arrives and is claimed alongside it. A stop ends
         // the run: queued input must not auto-advance.
         while (!stopped && this.inbox.some((item) => item.kind === 'user')) {
+          // A stop or steer that lands between turns must not open another
+          // one on the aborted controller: that turn would log the input and
+          // cancel it unanswered. Leave it queued; a steer re-runs below.
+          if (this.abortController?.signal.aborted === true) {
+            stopped = true
+            break
+          }
           try {
             const closed = await this.turn()
             if (closed !== 'completed' && closed !== 'rejected' && closed !== 'empty') stopped = true
@@ -165,9 +224,24 @@ export class Agent {
         }
       })
     } finally {
+      // A stop that raced a turn finishing on its own still counts as a stop:
+      // input queued meanwhile stays queued (only a steer runs it).
+      if (this.abortController?.signal.aborted === true && this.abortCause === 'stop') stopped = true
+      // Consumed exactly once per run, even when the run throws.
+      steered = this.steerRequested
+      this.steerRequested = false
       this.status = 'idle'
       this.activity = null
       this.abortController = null
+    }
+    // Input enqueued in the microtask gap between the loop's final check and
+    // `status = 'idle'` would strand: its enqueuer saw `busy`, the loop had
+    // already exited, and nobody calls run() again. This synchronous recheck
+    // (same tick as the idle flip) drains it; a stopped run still does not —
+    // unless the stop was a steer, whose whole point is to run the queue now.
+    // A poisoned session cannot record a new turn, so a steer cannot either.
+    if ((!stopped || (steered && !this.session.poisoned)) && this.inbox.some((item) => item.kind === 'user')) {
+      await this.run()
     }
   }
 
@@ -199,13 +273,16 @@ export class Agent {
    * reason so `run()` knows which outcomes end the run (a stop leaves queued
    * input queued).
    */
-  private async turn(): Promise<'completed' | 'cancelled' | 'failed' | 'rejected' | 'empty'> {
+  private async turn(): Promise<'completed' | 'cancelled' | 'steered' | 'failed' | 'rejected' | 'empty'> {
     const turnId = newTurnId()
     return agentScope.run({ ...this.identity, turnId }, async () => {
       this.session.append({ type: 'turn/start', turnId })
       const controller = this.abortController
-      try {
       const claimed = this.inbox.splice(0, this.inbox.length)
+      try {
+      for (const item of claimed) {
+        if (item.kind === 'user' && item.inputId !== undefined) this.claimedInputIds.add(item.inputId)
+      }
       const contents = claimed.map((item) => item.content)
       const decision = await this.ctx.waterfall(
         'agent/pre-step',
@@ -217,11 +294,25 @@ export class Agent {
           } satisfies PreStepDecision),
       )
 
+      // A stop or steer that landed while pre-step ran (hooks, MCP connect):
+      // nothing has reached the model or the log as admitted yet. Hand the
+      // claimed input back, oldest first, instead of logging it and then
+      // cancelling it unanswered — a steer re-runs it, a stop leaves it queued.
+      if (controller?.signal.aborted === true && this.abortCause === 'stop') {
+        this.inbox.unshift(...claimed)
+        const reason = this.stopReason()
+        await this.recordTurnEnd(turnId, reason)
+        return reason
+      }
+
       if (decision.kind === 'reject') {
+        this.settleClaimedInputs(claimed, 'rejected')
+        this.session.append({ type: 'turn/error', turnId, kind: 'rejected', message: decision.reason ?? 'rejected by pre-step policy' })
         await this.recordTurnEnd(turnId, 'rejected')
         return 'rejected'
       }
       if (decision.contents.length === 0) {
+        this.settleClaimedInputs(claimed, 'empty')
         await this.recordTurnEnd(turnId, 'empty')
         return 'empty'
       }
@@ -234,10 +325,12 @@ export class Agent {
           step = await this.step(turnId, spent === 1 ? decision.contents : [], spent === 1 ? claimed : [])
         } catch (error) {
           // A user stop is a durable result, not a failure: close the turn
-          // with the `cancelled` reason and end the run.
+          // with the `cancelled` (or `steered`) reason and end the run.
           if (error instanceof StopRequested) {
-            await this.recordTurnEnd(turnId, 'cancelled')
-            return 'cancelled'
+            await this.closeOpenStep(turnId)
+            const reason = this.stopReason()
+            await this.recordTurnEnd(turnId, reason)
+            return reason
           }
           throw error
         }
@@ -246,6 +339,11 @@ export class Agent {
       }
 
       await this.ctx.serial('agent/turn-stopping', { turnId, lastStep })
+      if (controller?.signal.aborted === true) {
+        const reason = this.stopReason()
+        await this.recordTurnEnd(turnId, reason)
+        return reason
+      }
       await this.recordTurnEnd(turnId, 'completed')
       return 'completed'
     } catch (error) {
@@ -257,7 +355,9 @@ export class Agent {
           ? { kind: 'storage' as const, message: error.message, reason: 'failed' as const }
           : aborted && this.abortCause === 'inactivity'
             ? { kind: 'provider' as const, message: 'provider stream stayed inactive past the limit', reason: 'failed' as const }
-            : { kind: 'internal' as const, message: String(error instanceof Error ? error.message : error), reason: 'failed' as const }
+            : error instanceof ProviderError
+              ? { kind: 'provider' as const, message: error.message, reason: 'failed' as const }
+              : { kind: 'internal' as const, message: String(error instanceof Error ? error.message : error), reason: 'failed' as const }
         try {
           this.session.append({ type: 'turn/error', turnId, kind, message })
           await this.session.durable()
@@ -273,12 +373,39 @@ export class Agent {
       // Even a poisoned session must release per-Turn holders.
         await this.ctx.parallel('agent/turn-settled', { turnId, reason: 'failed' }).catch(() => {})
         return 'failed'
+      } finally {
+        for (const item of claimed) {
+          if (item.kind === 'user' && item.inputId !== undefined) this.claimedInputIds.delete(item.inputId)
+        }
       }
     })
   }
 
+  /** Close the newest open step when cancellation interrupts it. */
+  private async closeOpenStep(turnId: TurnId): Promise<void> {
+    for (let i = this.session.events.length - 1; i >= 0; i--) {
+      const event = this.session.events[i]
+      if (event?.type === 'step/end') return
+      if (event?.type === 'step/start' && event.turnId === turnId) {
+        this.session.append({ type: 'step/end', turnId, stepId: event.stepId })
+        await this.flushOrHalt()
+        return
+      }
+      if (event?.type === 'turn/start' && event.turnId === turnId) return
+    }
+  }
+
+  /** Mark accepted inputs terminal even when policy admits no user message. */
+  private settleClaimedInputs(claimed: readonly InboxItem[], outcome: 'rejected' | 'empty'): void {
+    for (const item of claimed) {
+      if (item.kind === 'user' && item.inputId !== undefined) {
+        this.session.append({ type: 'input/settled', inputId: item.inputId, outcome })
+      }
+    }
+  }
+
   /** Append and durably flush a turn end, then release per-Turn holders. */
-  private async recordTurnEnd(turnId: TurnId, reason: 'completed' | 'rejected' | 'empty' | 'cancelled' | 'failed'): Promise<void> {
+  private async recordTurnEnd(turnId: TurnId, reason: 'completed' | 'rejected' | 'empty' | 'cancelled' | 'steered' | 'failed'): Promise<void> {
     this.session.append({ type: 'turn/end', turnId, reason })
     try {
       await this.session.durable()
@@ -286,7 +413,9 @@ export class Agent {
       throw new StorageFailed(cause)
     }
     // Terminalization is durable: per-Turn resources (writer leases) go.
-    await this.ctx.parallel('agent/turn-settled', { turnId, reason })
+    // Observer failures are contained by parallel dispatch and can never
+    // rewrite an already-durable terminal outcome.
+    await this.ctx.parallel('agent/turn-settled', { turnId, reason }).catch(() => {})
   }
 
   /**
@@ -307,15 +436,27 @@ export class Agent {
 
     const stepId = newStepId()
     this.session.append({ type: 'step/start', turnId, stepId })
-    for (let i = 0; i < contents.length; i++) {
-      const item = claimed[i]
+    const metadataByContentIndex = matchClaimedContents(contents, claimed)
+    for (let index = 0; index < contents.length; index++) {
+      const content = contents[index] ?? ''
+      // Middleware may insert/reorder content. Metadata follows only the exact
+      // original item it belongs to; inserted context never steals an input id
+      // or attachment merely because it occupies the same array position.
+      const item = metadataByContentIndex.get(index)
       this.session.append({
         type: 'user/message',
         turnId,
-        content: contents[i] ?? '',
+        content,
         ...(item?.inputId !== undefined ? { inputId: item.inputId } : {}),
         ...(item?.attachments !== undefined && item.attachments.length > 0 ? { attachments: item.attachments } : {}),
       })
+    }
+    // Admission settles every accepted input even when middleware replaces its
+    // text wholesale and therefore no user/message can safely carry its id.
+    for (const item of claimed) {
+      if (item.kind === 'user' && item.inputId !== undefined) {
+        this.session.append({ type: 'input/settled', inputId: item.inputId, outcome: 'admitted' })
+      }
     }
     // Durable input: acknowledged before anything asks the model for more.
     await this.flushOrHalt()
@@ -402,6 +543,12 @@ export class Agent {
     } finally {
       this.activity = null
     }
+    // A stop racing with normal stream completion still owns the terminal
+    // outcome and must not allow tool preparation to begin.
+    assertLive()
+    if (full === '' && calls.length === 0) {
+      throw new ProviderError('provider returned an empty response')
+    }
     // Canonical identity in the durable log: legacy lowercase names from a
     // model normalize once, here, so permission rules and results match.
     calls = calls.map((call) => canonicalCall(call))
@@ -443,14 +590,29 @@ export class Agent {
       // Prepare every gate FIRST: hooks may rewrite args and approvals bind
       // to those exact final args. Only then record the durable intent; the
       // returned execute() is the side-effect boundary.
-      const prepared = tools?.prepare !== undefined
-        ? await tools.prepare(call, { ...(signal !== undefined ? { signal } : {}), executionId })
-        : {
-            call,
-            execute: async () => tools !== undefined
-              ? tools.execute(call, signal !== undefined ? { signal } : {})
-              : { ok: false, output: `unknown tool '${call.name}' (no tools service mounted)` },
-          }
+      let prepared: { call: ToolCall; execute(): Promise<ToolResult> }
+      try {
+        prepared = tools?.prepare !== undefined
+          ? await tools.prepare(call, { ...(signal !== undefined ? { signal } : {}), executionId })
+          : {
+              call,
+              execute: async () => tools !== undefined
+                ? tools.execute(call, signal !== undefined ? { signal } : {})
+                : { ok: false, output: `unknown tool '${call.name}' (no tools service mounted)` },
+            }
+      } catch (error) {
+        this.session.append({ type: 'tool/call', stepId, executionId, call })
+        this.session.append({
+          type: 'tool/result',
+          stepId,
+          executionId,
+          callId: call.id,
+          ok: false,
+          output: `error: tool preparation failed: ${String(error instanceof Error ? error.message : error)}`,
+        })
+        await this.flushOrHalt()
+        continue
+      }
       const revision = revisionOf(tools)
       this.session.append({
         type: 'tool/call',
@@ -465,6 +627,8 @@ export class Agent {
       let result: ToolResult
       try {
         result = await prepared.execute()
+      } catch (error) {
+        result = { ok: false, output: `error: tool pipeline failed: ${String(error instanceof Error ? error.message : error)}` }
       } finally {
         this.activity = null
       }
@@ -495,6 +659,11 @@ export class Agent {
     }
   }
 
+  /** The truthful close of a user-aborted turn: a steer, or a plain stop. */
+  private stopReason(): 'cancelled' | 'steered' {
+    return this.steerRequested ? 'steered' : 'cancelled'
+  }
+
   /** The abort error matching the recorded cause. */
   private abortError(): Error {
     return this.abortCause === 'stop' ? new StopRequested() : new Error(`agent: ${this.abortCause}`)
@@ -504,6 +673,27 @@ export class Agent {
     const shared = (this.ctx.get('limits') ?? {}) as Partial<HarnessLimits>
     return resolveLimits(shared)
   }
+}
+
+/**
+ * Match original inbox items to rewritten contents without letting an inserted
+ * duplicate steal metadata. Unique content can move freely; duplicate content
+ * is matched from the end, preserving the common prepend/append rewrite case.
+ */
+function matchClaimedContents(contents: readonly string[], claimed: readonly InboxItem[]): Map<number, InboxItem> {
+  const matched = new Map<number, InboxItem>()
+  const used = new Set<number>()
+  for (let claimedIndex = claimed.length - 1; claimedIndex >= 0; claimedIndex--) {
+    const item = claimed[claimedIndex]
+    if (item === undefined) continue
+    for (let contentIndex = contents.length - 1; contentIndex >= 0; contentIndex--) {
+      if (used.has(contentIndex) || contents[contentIndex] !== item.content) continue
+      used.add(contentIndex)
+      matched.set(contentIndex, item)
+      break
+    }
+  }
+  return matched
 }
 
 function safeProviderName(ctx: Context): string | undefined {

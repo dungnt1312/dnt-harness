@@ -9,10 +9,34 @@ export class Generation {
 }
 
 export const composerKey = (workspace: string | null, session: string | null) => JSON.stringify([workspace, session])
-export interface ComposerState { draft: RichDraft; revision: number; sending: boolean; error: string | null }
+export interface ComposerState {
+  draft: RichDraft
+  revision: number
+  sending: boolean
+  error: string | null
+  /**
+   * The clientRequestId of an unconfirmed submit of exactly `revision`. Resending
+   * the unchanged draft reuses it, so a request the server already accepted
+   * (its reply lost) dedups instead of running twice. Any edit invalidates it.
+   */
+  pendingRequest?: { readonly id: string; readonly revision: number }
+}
 export const emptyComposer: ComposerState = { draft: emptyDraft, revision: 0, sending: false, error: null }
 export function acceptedDraft(state: ComposerState, revision: number): ComposerState {
-  return { ...state, draft: state.revision === revision ? emptyDraft : state.draft, sending: false }
+  // Accepted: the id is spent. An edited draft keeps its text but a fresh id.
+  const { pendingRequest: _spent, ...rest } = state
+  return { ...rest, draft: state.revision === revision ? emptyDraft : state.draft, sending: false }
+}
+
+/**
+ * The request id for submitting `state` now: reused only for the very same
+ * unchanged draft. The id names the message, not how it is delivered — a
+ * failed Queue resent as a Steer keeps it (no second copy of the message);
+ * the caller honors the steer itself when the server answers "duplicate".
+ */
+export function requestIdFor(state: ComposerState, fresh: () => string): string {
+  const pending = state.pendingRequest
+  return pending !== undefined && pending.revision === state.revision ? pending.id : fresh()
 }
 
 /** A draft scope is valid when it is chat-only (null) or a registered project. */

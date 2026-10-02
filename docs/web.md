@@ -127,7 +127,7 @@ tool root. The families, at a glance:
 | Route family | Purpose |
 |---|---|
 | `GET/POST /api/workspaces`, `PATCH/DELETE /api/workspaces/:wid` | workspace list (with running/approval badges), create, rename, archive/restore, delete (empty only) |
-| `…/:wid/sessions`, `…/:wid/sessions/:id` (+ `/events` SSE, `/messages`, `/stop`) | session lifecycle, streaming, queued messages, stop. `/messages` answers 409 for a child agent session: children are executor-managed and cannot be resumed directly |
+| `…/:wid/sessions`, `…/:wid/sessions/:id` (+ `/events` SSE, `/messages`, `/stop`, `/steer`) | session lifecycle, streaming, queued messages, stop, steer. `/messages` answers 409 for a child agent session: children are executor-managed and cannot be resumed directly. See "Queue, stop, and steer" below |
 | `GET/PUT …/:wid/sessions/:id/model` | the conversation's own model controls (model, provider, thinking level) — see the per-conversation model section |
 | `GET/PUT …/:wid/sessions/:id/grants` | the conversation's extra file-tool folders: `GET` returns `{ revision, roots, effective }` (effective = project + session grants merged); `PUT { expectedRevision, roots: [{ path, access }] }` replaces the list — browser principal only, `409` on a stale revision or a conversation without a project, `400` for a folder the grant validator refuses (see `docs/capabilities.md`) |
 | `…/:wid/sessions/:id/manifest`, `…/compact` | per-request context manifest; compaction into an immutable checkpoint — manual via the route, automatic when the context-pressure limit is set. PreCompact hooks gate both |
@@ -380,6 +380,39 @@ default. Tools resolve their root through the **ambient agent scope**, so two
 sessions can work in different folders concurrently without cross-talk.
 `200 { folder }` / `{ folder: null }` on reset.
 
+### Queue, stop, and steer
+
+Three ways to act on a running conversation. All acceptance is durable
+(`input/queued`) before anything is stopped or run.
+
+| Action | Route | Running turn | Queued input |
+|---|---|---|---|
+| **Queue** (Enter) | `POST …/messages { content }` | finishes normally | the next turn claims all of it |
+| **Stop** | `POST …/stop` | closes `turn/end: cancelled` | stays queued — never auto-runs, including input sent while the stop settles |
+| **Steer** (Ctrl/⌘+Enter, Steer button) | `POST …/messages { content, delivery: "steer" }` | closes `turn/end: steered` | old queue + the new message run in one new turn, oldest first |
+| **Send now** (on a queued bubble) | `POST …/steer` | closes `turn/end: steered` | the whole queue runs in one new turn |
+
+- `delivery` defaults to `"queue"`; anything else answers `400`. The reply is
+  `202 { inputId, queued, delivery }` (`queued` is true only for a queue-delivery
+  that waits behind a running turn). A steered input is recorded with
+  `delivery: "steer"` on its `input/queued` event.
+- Steer stops like Stop does — the provider stream, cancellable tools, pending
+  approvals, and child agents — and only then runs the queue. A tool that cannot
+  be cancelled delays it until it returns.
+- Checks run before anything stops: a duplicate `clientRequestId` returns
+  `200 { duplicate: true }` and does **not** stop the turn again; `429`
+  (pending-input bound), `400`, `503`, and a failed durable write leave the
+  running turn untouched.
+- `POST …/steer` with nothing pending is `200 { steered: false, pending: 0 }` —
+  never a hidden Stop. Otherwise `202 { steered: true, pending }`. Idle, it simply
+  runs the queue.
+- Not durable as an intent: if the host restarts before the steered turn
+  starts, recovery closes the open turn as `interrupted` and the input is plain
+  pending input again (it does not auto-run).
+- Each accepted input ends with `input/settled { outcome: admitted | rejected |
+  empty }`. A pre-step rejection (hooks, MCP configuration) settles it as
+  `rejected` without a `user/message`; the UI shows the bubble as "Not sent".
+
 ### Legacy: `POST /api/sessions/:id/messages`
 
 Queue a user message and fire the agent loop.
@@ -423,8 +456,8 @@ Rename a session with a custom title; an empty title resets to the derived one
 ### Legacy: `POST /api/sessions/:id/stop`
 
 Ask the in-flight turn to stop. The agent's chunk loop notices the abort between
-stream events and closes the turn durably with `turn/end: { reason: "stopped" }`
-— a result, not a failure.
+stream events and closes the turn durably with `turn/end: { reason: "cancelled" }`
+— a result, not a failure. Queued input stays queued (see "Queue, stop, and steer").
 
 Returns `202 { stopped: true }`; a no-op while idle. `404` on an unknown session.
 
@@ -704,12 +737,25 @@ graceful close and a second to an immediate exit.
 | `lib/api.ts` | REST calls plus `EventSource` subscription |
 | `lib/types.ts` | client mirror of existing wire shapes |
 | `lib/project.ts` | durable `projectItems()` and turn-state derivation |
+| `lib/turn-changes.ts` | per-turn `Write`/`Edit` outcomes projected from the log (the TurnChangesCard's data) |
+| `lib/turn-git.ts` | overlay of the project's read-only git status onto one turn's files |
 | `styles/app.css` | light/dark tokens, Tailwind theme mapping, base rules, management-panel hooks |
 | `styles/markdown.css` | Markdown and highlight.js selectors |
 | `styles/motion.css` | keyframes, scrollbar styling, and reduced-motion behavior |
 
 `projectItems(events)` remains the transcript contract and is computed once per
-event-array revision. `projectTrajectory(events)` is a separate pure projection of
+event-array revision. `turnChanges(events)` is a companion projection for the
+per-turn change card: it attributes each `Write`/`Edit` call to the turn open
+at its position in the replay (tool traffic carries only a `stepId`), counts
+success only when a result recorded it, and keeps failed, refused, and
+recovered outcomes visible as `uncertain` rather than silent. The collapsed
+card reads the log alone (line counts from the recorded arguments, exact to
+the turn); expanding it loads the project's read-only git status once — those
++X −Y numbers are the files' *current* whole-worktree diff, shared across
+turns, and the card says so instead of implying per-turn attribution. Bash
+effects and child writes are never claimed: the log does not record what a
+command touched, and a child's mutations live in the child's own log.
+`projectTrajectory(events)` is a separate pure projection of
 the same log into turns, model requests and tool calls; it fetches nothing and never
 invents a timestamp or an outcome the log did not record. Its Duration view is a
 sequence, not a clock: each step (a turn's input, a model request, the batch of tool
@@ -739,9 +785,15 @@ stays with the running ones as **Reconciling** with a **Retry settlement** butto
 that POSTs the workspace-scoped, parent-owned reconcile route — the same canonical
 settlement the model's `Agent` reconcile action runs; the chat delegation card
 projects durable events and never shows `uncertain`. Terminal
-is the deliberate interactive exception documented above. The Workbench docks at 1280px and becomes a modal sheet below that. Sidebar/workbench collapse, dock widths, the opened
-Workbench views and the selected one are browser-local preferences under `mini-dsh.workbench.v1`;
-appearance (System/Light/Dark) is stored under
+is the deliberate interactive exception documented above. The Workbench docks at 1280px and becomes a modal sheet below that. Sidebar/workbench collapse and dock
+widths are browser-local preferences under `mini-dsh.workbench.v1`; the opened
+Workbench views and the selected one are remembered **per conversation** under
+`mini-dsh.workbench.tabs.v1`, keyed `<workspaceId>:<sessionId>` (or `draft`
+before the first message) — a subagent conversation shares its root's record,
+so a child and its parent read as one workbench. One conversation's tabs never
+leak into another; conversations without a record start from the tab fields of
+the old global key until they gain one (the upgrade seed fades as records are
+written); appearance (System/Light/Dark) is stored under
 `mini-dsh.theme`; unsent composer drafts are kept per workspace+session under
 `mini-dsh.drafts.v1` (text only — never `sending` or an error, which describe a
 request that no longer exists). None of these are server settings. See

@@ -1,5 +1,5 @@
 import { errorSummary, modeLabel } from './lib/copy.ts'
-import { Generation, composerKey, emptyComposer, acceptedDraft, validConversationScope } from './lib/interaction.ts'
+import { Generation, composerKey, emptyComposer, acceptedDraft, requestIdFor, validConversationScope } from './lib/interaction.ts'
 import { ComposerStore, useComposerSlice } from './lib/composer-store.ts'
 import { draftAttachments, draftIsEmpty, draftText, messageDraft, textDraft, type AttachmentRef, type RichDraft } from './lib/composer-draft.ts'
 import { parseRoute, routePath, sessionRoute, workspaceRoute, type AppRoute } from './lib/route.ts'
@@ -18,12 +18,15 @@ import {
   reorderProjects,
   listSessionsIn,
   listSkills,
+  listTerminals,
   listWorkspaces,
   compactSession,
   renameSessionIn,
   setSessionPinnedIn,
   searchProjectFiles,
   sendMessageIn,
+  steerSessionIn,
+  type Delivery,
   uploadAttachment,
   stopSessionIn,
   setMode,
@@ -35,13 +38,14 @@ import {
 } from './lib/api.ts'
 import { PairingGate } from './components/auth/PairingGate.tsx'
 import { decodeModelChoice, activeModelValue, modelOptions } from './lib/providers.ts'
-import { isTurnRunning } from './lib/project.ts'
+import { isTurnRunning, type RetryTarget } from './lib/project.ts'
 import { sameListing } from './lib/listing-equality.ts'
 import { manifestRefreshKey } from './lib/manifest-refresh.ts'
 import type { FileFocus } from './lib/tool-facts.ts'
 import { useSessionStream } from './hooks/useSessionStream.ts'
 import { useApprovalNotify } from './hooks/useApprovalNotify.ts'
 import { useWorkbenchPreferences } from './hooks/useWorkbenchPreferences.ts'
+import { useWorkbenchTabs } from './hooks/useWorkbenchTabs.ts'
 import { useHotkeys } from './hooks/useHotkeys.ts'
 import { useMediaQuery } from './hooks/useMediaQuery.ts'
 import { useTheme } from './hooks/useTheme.ts'
@@ -96,6 +100,19 @@ function ScopedComposer({ store, scope, ...props }: Omit<ComponentProps<typeof C
 }
 
 export const sessionModelKey =(workspaceId: string, sessionId: string): string => `${workspaceId}:${sessionId}`
+
+/**
+ * The conversation whose delegation the Subagents view lists: the open
+ * conversation itself, or its parent while a subagent is open. Only this view
+ * follows the root — a child spawns no children of its own (one-level
+ * delegation), so its own list would always be empty. Every other surface —
+ * Trajectory, Process, the Environment panel — stays bound to the viewed
+ * conversation, whose activity it actually describes.
+ */
+export function subagentsRootSession(currentSession: { readonly id: string; readonly parentSessionId?: string | null } | null): string | null {
+  if (currentSession === null) return null
+  return currentSession.parentSessionId ?? currentSession.id
+}
 
 export type SessionModelLoadState =
   | { readonly status: 'loading' }
@@ -269,6 +286,10 @@ function AppShell() {
   const [activeWs, setActiveWs] = useState<string | null>(null)
   const [sessions, setSessions] = useState<readonly SessionListing[]>([])
   const [listedWorkspace, setListedWorkspace] = useState<string | null>(null)
+  // Project ids with a live terminal shell, polled with the listings. The
+  // sidebar folder shows a terminal marker from this, not from session state:
+  // a user shell belongs to the folder, not to one conversation.
+  const [terminalProjects, setTerminalProjects] = useState<ReadonlySet<string>>(new Set())
   const [projects, setProjects] = useState<readonly ProjectRow[]>([])
   // No-modal new-chat flow (spec: App shell): New conversation clears the
   // canvas; the composer's scope chip picks the project; the session is
@@ -378,7 +399,6 @@ function AppShell() {
   // The Git view narrowed to one turn's recorded files (a card's Review all).
   // Session-scoped state, not a preference: the review is a moment's focus.
   const [gitPathFilter, setGitPathFilter] = useState<readonly string[] | null>(null)
-  const inspectorTab = preferences.inspectorTab
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsSection, setSettingsSection] = useState<'providers' | 'projects' | 'permissions' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'>('providers')
   const [pendingDelete, setPendingDelete] = useState<SessionListing | null>(null)
@@ -389,6 +409,8 @@ function AppShell() {
   const currentRef = useRef(current)
   currentRef.current = current
   const sendingRef = useRef(new Set<string>())
+  /** Request ids of an unconfirmed Retry, per failed turn: a repeated click dedups. */
+  const retryIds = useRef(new Map<string, string[]>())
   /** Conversations with a compaction in flight; one at a time each. */
   const compactingRef = useRef(new Set<string>())
   /**
@@ -457,6 +479,28 @@ function AppShell() {
   const running = useMemo(() => isTurnRunning(events), [events])
   const manifestKey = useMemo(() => manifestRefreshKey(events, compactNonce), [events, compactNonce])
   const currentSession = useMemo(() => sessions.find((session) => session.id === current) ?? null, [sessions, current])
+  // A subagent conversation reads as parent → sub in the header trail.
+  const currentParentSession = useMemo(
+    () => (currentSession?.parentSessionId != null ? sessions.find((session) => session.id === currentSession.parentSessionId) ?? null : null),
+    [sessions, currentSession],
+  )
+  // The Subagents view lists the root conversation's delegation
+  // (subagentsRootSession). While a child is open, a second stream keeps the
+  // parent's log alive for that view's briefs and refresh signal; it idles
+  // whenever the viewed conversation is the root itself. The parent of a
+  // listed child is listed too (delegation is one-level and in-workspace), so
+  // no extra route guard is needed.
+  const subagentsRootId = subagentsRootSession(currentSession)
+  const subagentsRootIsViewed = subagentsRootId === null || subagentsRootId === current
+  const subagentsRootStream = useSessionStream(activeWs, subagentsRootIsViewed ? null : subagentsRootId)
+  const agentEvents = subagentsRootIsViewed ? events : subagentsRootStream.events
+  // Tab strip + selected view are per conversation, and a subagent conversation
+  // shares its root's record: the key is `<ws>:<root session>` (or `draft`),
+  // so one conversation's open tabs never leak into another while a child and
+  // its parent read as one workbench.
+  const workbenchTabsKey = activeWs !== null ? `${activeWs}:${subagentsRootId ?? 'draft'}` : null
+  const { tabs: sessionTabs, patchTabs: patchSessionTabs } = useWorkbenchTabs(workbenchTabsKey)
+  const inspectorTab = sessionTabs.inspectorTab
   const currentSessionModelState = current !== null && activeWs !== null ? sessionModelStates.get(sessionModelKey(activeWs, current)) : undefined
   const currentSessionModel = currentSessionModelState?.status === 'ready' ? currentSessionModelState.model : undefined
   // A loaded conversation owns its values exactly, including deliberate nulls.
@@ -494,21 +538,21 @@ function AppShell() {
     if (relative === null) return null
     return () => {
       openWorkbenchFile(relative, focus)
-      patchPreferences({ inspectorTab: 'files' })
+      patchSessionTabs({ inspectorTab: 'files' })
       onWorkbenchOpenChange(true)
     }
-  }, [workbenchProject, openWorkbenchFile, patchPreferences, onWorkbenchOpenChange])
+  }, [workbenchProject, openWorkbenchFile, patchSessionTabs, onWorkbenchOpenChange])
   /**
    * Open a fixed workbench view programmatically: the tab must join the
    * strip in the same patch, or the clamp folds the selection back to Files.
    */
   const openWorkbenchView = useCallback((view: WorkbenchViewName) => {
-    patchPreferences({
+    patchSessionTabs({
       inspectorTab: view,
-      inspectorViews: preferences.inspectorViews.includes(view) ? preferences.inspectorViews : [...preferences.inspectorViews, view],
+      inspectorViews: sessionTabs.inspectorViews.includes(view) ? sessionTabs.inspectorViews : [...sessionTabs.inspectorViews, view],
     })
     onWorkbenchOpenChange(true)
-  }, [patchPreferences, preferences.inspectorViews, onWorkbenchOpenChange])
+  }, [patchSessionTabs, sessionTabs.inspectorViews, onWorkbenchOpenChange])
   /** The background process the Environment panel focused, if any. */
   const [processFocus, setProcessFocus] = useState<string | null>(null)
   /** The per-turn change card's Review all: the Git view narrowed to that turn's recorded files. */
@@ -584,6 +628,28 @@ function AppShell() {
       toast.notify(String(cause))
     }
   }, [activeWs, toast])
+
+  // Terminal presence refreshes with the same visible-tab rhythm as the
+  // listings. A failure only means no marker — it never surfaces as a toast.
+  const refreshTerminalProjects = useCallback(async () => {
+    if (activeWs === null || workspaceRef.current !== activeWs) return
+    try {
+      const listing = await listTerminals(activeWs)
+      if (workspaceRef.current !== activeWs) return
+      setTerminalProjects((previous) => {
+        const next = new Set(listing.terminals.map((row) => row.projectId).filter((id): id is string => id != null))
+        if (previous.size === next.size && [...next].every((id) => previous.has(id))) return previous
+        return next
+      })
+    } catch {
+      // Terminals disabled or the stream unreachable: the folder marker hides.
+    }
+  }, [activeWs])
+
+  useEffect(() => {
+    setTerminalProjects(new Set())
+    void refreshTerminalProjects()
+  }, [activeWs, refreshTerminalProjects])
 
   /** Drag-to-reorder sidebar folders: apply at once, then let the server confirm. */
   const reorderProjectFolders = useCallback(async (orderedIds: readonly string[]) => {
@@ -704,6 +770,7 @@ function AppShell() {
       if (document.visibilityState !== 'visible') return
       void refreshList()
       void refreshWorkspaces()
+      void refreshTerminalProjects()
     }
     const timer = window.setInterval(tick, 10_000)
     window.addEventListener('focus', tick)
@@ -713,7 +780,7 @@ function AppShell() {
       window.removeEventListener('focus', tick)
       document.removeEventListener('visibilitychange', tick)
     }
-  }, [refreshList, refreshWorkspaces])
+  }, [refreshList, refreshWorkspaces, refreshTerminalProjects])
 
   // Switching the active workspace re-scopes listings and controls. It does
   // NOT close a running Turn server-side; only this browser's selected stream changes.
@@ -867,7 +934,7 @@ function AppShell() {
     }
   }, [activeWs, current, toast])
 
-  const send = useCallback(async () => {
+  const send = useCallback(async (delivery: Delivery = 'queue') => {
     // Read at call time: the app does not re-render for draft edits.
     const composer = composers.get()[key] ?? emptyComposer
     const { draft } = composer
@@ -897,8 +964,11 @@ function AppShell() {
     const workspaceId = activeWs
     const sourceKey = key
     sendingRef.current.add(sourceKey)
-    updateComposer(sourceKey, (state) => ({ ...state, sending: true, error: null }))
     const revision = composer.revision
+    // Same unchanged draft after a failed submit → same id, so a request the
+    // server accepted before its reply was lost dedups instead of re-running.
+    const requestId = requestIdFor(composer, () => globalThis.crypto.randomUUID())
+    updateComposer(sourceKey, (state) => ({ ...state, sending: true, error: null, pendingRequest: { id: requestId, revision } }))
     const nav = navigation.current.current()
     const content = draftText(draft)
     const attachments = draftAttachments(draft)
@@ -929,8 +999,13 @@ function AppShell() {
         void refreshList()
       }
       try {
-        // Clear only the submitted draft after durable acceptance.
-        await sendMessageIn(workspaceId, sessionId, content, globalThis.crypto.randomUUID(), attachments)
+        // Clear only the submitted draft after durable acceptance (a duplicate
+        // reply is acceptance too: the first request already landed).
+        const accepted = await sendMessageIn(workspaceId, sessionId, content, requestId, attachments, delivery)
+        // The message already landed (a lost reply, resent) — maybe as a plain
+        // queue. A duplicate never stops anything server-side, so the steer
+        // the user just asked for is applied explicitly.
+        if (accepted.duplicate === true && delivery === 'steer') await steerSessionIn(workspaceId, sessionId)
         updateComposer(targetKey, (state) => acceptedDraft(state, revision))
       } catch (cause) {
         updateComposer(targetKey, (state) => ({ ...state, error: String(cause) }))
@@ -956,19 +1031,28 @@ function AppShell() {
     }
   }, [current, activeWs, toast])
 
-  // Re-send the newest user message verbatim after a failed request. Safe by
-  // construction: the failure card is only reachable when the request never
-  // completed, so no tool side effects can be duplicated.
-  const retryLast = useCallback(async () => {
+  // Re-send a failed turn's own inputs (oldest first), never "the newest user
+  // message": the projection records exactly what that turn claimed. Whether
+  // tools already ran is the status line's to confirm before calling this.
+  const retryTurn = useCallback(async (target: RetryTarget) => {
     if (sendingRef.current.has(key) || current === null || activeWs === null || running || modelValue === null) return
     if (sessionModelQueue.current.isPending(sessionModelKey(activeWs, current))) return
-    const lastUser = [...projectedItems].reverse().find((item) => item.kind === 'user' && item.queued !== true)
-    if (lastUser === undefined || (lastUser.kind !== 'user')) return
+    if (target.inputs.length === 0) return
     sendingRef.current.add(key)
     updateComposer(key, (state) => ({ ...state, sending: true, error: null }))
     const nav = navigation.current.current()
+    // One id set per failed turn, kept until it is accepted: clicking Retry
+    // again after a lost reply dedups server-side instead of running twice.
+    const retryKey = `${current}\u0000${target.key}`
+    const ids = retryIds.current.get(retryKey) ?? target.inputs.map(() => globalThis.crypto.randomUUID())
+    retryIds.current.set(retryKey, ids)
     try {
-      await sendMessageIn(activeWs, current, lastUser.content, globalThis.crypto.randomUUID())
+      // Sequential, so acceptance order is the original order: the first
+      // input starts a turn, the rest queue behind it and run right after.
+      for (const [index, input] of target.inputs.entries()) {
+        await sendMessageIn(activeWs, current, input.content, ids[index], input.attachments)
+      }
+      retryIds.current.delete(retryKey)
       if (navigation.current.matches(nav)) void refreshList()
       void refreshWorkspaces()
     } catch (cause) {
@@ -977,7 +1061,19 @@ function AppShell() {
       sendingRef.current.delete(key)
       updateComposer(key, (state) => ({ ...state, sending: false }))
     }
-  }, [projectedItems, current, activeWs, running, modelValue, key, refreshList, toast])
+  }, [current, activeWs, running, modelValue, key, refreshList, toast])
+
+  // "Send now" on queued input: steer without a new message — stop the running
+  // turn (if any) and run every queued input now, in submission order.
+  const sendNow = useCallback(async () => {
+    if (current === null || activeWs === null) return
+    try {
+      await steerSessionIn(activeWs, current)
+      void refreshWorkspaces()
+    } catch (cause) {
+      toast.notify(String(cause))
+    }
+  }, [current, activeWs, toast])
 
   const answer = useCallback(async (approvalId: string, allow: boolean, scope: 'once' | 'session' = 'once') => {
     try {
@@ -1165,8 +1261,10 @@ function AppShell() {
     setSettingsSection(section)
     setSettingsOpen(true)
   }, [])
-  const openProviderSettings = useCallback(() => openSettings(), [openSettings])
-  const retryLastTurn = useCallback(() => void retryLast(), [retryLast])
+
+  // Stable identities: the memoized transcript must not re-render per keystroke.
+  const retryFailedTurn = useCallback((target: RetryTarget) => void retryTurn(target), [retryTurn])
+  const sendQueuedNow = useCallback(() => void sendNow(), [sendNow])
 
   const sidebar = (
     <Sidebar
@@ -1194,6 +1292,7 @@ function AppShell() {
       onToggleFolderCollapsed={toggleFolderCollapsed}
       expandedFolders={folderExpanded}
       onExpandFolder={expandFolder}
+      terminalProjects={terminalProjects}
       onOpenSettings={() => openSettings()}
       notifyEnabled={notify.enabled}
       notifyBlocked={notify.blocked}
@@ -1302,9 +1401,12 @@ function AppShell() {
       sending={sending}
       connected={stream === 'open' || current === null}
       running={running}
-      onSend={() => void send()}
+      onSend={(delivery) => void send(delivery)}
       onCommand={(name) => void runBuiltinCommand(name)}
       onStop={() => void stop()}
+      {...(currentParentSession !== null
+        ? { sendBlocked: 'This subagent conversation is driven by its parent and cannot receive messages directly. Open the parent to reply.' }
+        : {})}
       modelValue={modelValue}
       controlsUnavailable={sessionControlsUnavailable || defaultControlsUnavailable || sessionControlsPending || defaultControlsPending}
       {...(sessionControlsUnavailable || defaultControlsUnavailable || sessionControlsPending || defaultControlsPending ? { controlsUnavailableMessage: sessionControlsMessage } : {})}
@@ -1346,16 +1448,18 @@ function AppShell() {
       workspaceId={activeWs}
       project={workbenchProject}
       view={inspectorTab}
-      onView={(view) => patchPreferences({ inspectorTab: view })}
-      views={preferences.inspectorViews}
-      onViews={(views) => patchPreferences({ inspectorViews: views })}
+      onView={(view) => patchSessionTabs({ inspectorTab: view })}
+      views={sessionTabs.inspectorViews}
+      onViews={(views) => patchSessionTabs({ inspectorViews: views })}
       files={workbenchFiles}
       events={events}
+      agentEvents={agentEvents}
       expanded={workbenchExpanded}
       {...(workbenchDocked ? { onToggleExpand: () => setWorkbenchExpanded((expanded) => !expanded) } : {})}
       onClose={() => onWorkbenchOpenChange(false)}
       openPath={openRecordedPath}
       sessionId={current}
+      agentsSessionId={subagentsRootId ?? current}
       onOpenChild={openSession}
       processFocus={processFocus}
       terminalShell={preferences.terminalShell}
@@ -1415,6 +1519,7 @@ function AppShell() {
               />
             }
             title={currentSession?.title}
+            {...(currentParentSession !== null ? { parent: { title: currentParentSession.title || 'New conversation', onSelect: () => openSession(currentParentSession.id) } } : {})}
             pinned={currentSession?.pinned === true}
             onOpenSidebar={() => onLeftOpenChange(true)}
             onNew={beginConversation}
@@ -1479,8 +1584,9 @@ function AppShell() {
                   onOpenProcess={openEnvironmentProcess}
                   onReuse={reuseInDraft}
                   onOpenChild={openSession}
-                  onRetry={retryLastTurn}
-                  onOpenSettings={openProviderSettings}
+                  onRetry={retryFailedTurn}
+                  onSendNow={sendQueuedNow}
+                  running={running}
                   openPath={openRecordedPath}
                 />
               )}

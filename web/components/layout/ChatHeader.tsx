@@ -22,12 +22,14 @@ const chipClass = 'flex h-9 min-w-0 max-w-[16rem] items-center gap-1.5 rounded-l
  * what can be done to the conversation itself, connection state and the
  * workbench toggle.
  */
-export function ChatHeader({ sidebarVisible, stream, workbenchOpen, scopeControl, title, pinned = false, onOpenSidebar, onNew, onToggleWorkbench, onTogglePinned, onCopyId }: {
+export function ChatHeader({ sidebarVisible, stream, workbenchOpen, scopeControl, title, parent, pinned = false, onOpenSidebar, onNew, onToggleWorkbench, onTogglePinned, onCopyId }: {
   readonly sidebarVisible: boolean
   readonly stream: StreamState
   readonly workbenchOpen: boolean
   readonly scopeControl: ReactNode
   readonly title?: string | undefined
+  /** Set when the open conversation is a subagent: the title becomes breadcrumb parent → sub. */
+  readonly parent?: { readonly title: string; readonly onSelect: () => void }
   readonly pinned?: boolean
   readonly onOpenSidebar: () => void
   readonly onNew: () => void
@@ -48,12 +50,28 @@ export function ChatHeader({ sidebarVisible, stream, workbenchOpen, scopeControl
       ) : null}
       <div className="flex min-w-0 items-center">{scopeControl}</div>
       {/* From `sm` up: below that the scope chip and the icon controls already
-          fill the row, and the sidebar names the conversation. */}
+          fill the row, and the sidebar names the conversation. A subagent
+          conversation reads as a trail: parent, then the sub itself. */}
       {title !== undefined && title !== '' ? (
-        <span className={cn(chipClass, 'hidden sm:flex')} title={title}>
-          {pinned ? <Icon name="pin" size={14} className="shrink-0 text-fg-faint" /> : null}
-          <span className="truncate">{title}</span>
-        </span>
+        parent !== undefined ? (
+          <span className="hidden h-9 min-w-0 max-w-[30rem] items-center gap-1 rounded-lg px-1.5 text-sm sm:flex" title={title}>
+            <button
+              type="button"
+              onClick={parent.onSelect}
+              title={`Open ${parent.title}`}
+              className="min-w-0 max-w-[14rem] truncate rounded-md px-1 py-1 text-fg-muted hover:bg-hover hover:text-fg"
+            >
+              {parent.title}
+            </button>
+            <Icon name="chevronRight" size={13} className="shrink-0 text-fg-faint" aria-label="in" />
+            <span className="min-w-0 flex-1 truncate rounded-md px-1 py-1 text-fg">{title}</span>
+          </span>
+        ) : (
+          <span className={cn(chipClass, 'hidden sm:flex')} title={title}>
+            {pinned ? <Icon name="pin" size={14} className="shrink-0 text-fg-faint" /> : null}
+            <span className="truncate">{title}</span>
+          </span>
+        )
       ) : null}
       {actions ? (
         <Menu

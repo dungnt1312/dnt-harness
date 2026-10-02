@@ -56,6 +56,12 @@ export interface SidebarProps {
   readonly onNew: () => void
   readonly onNewInProject: (projectId: string) => void
   readonly onReorderProjects?: (orderedIds: readonly string[]) => void
+  readonly collapsedFolders?: Readonly<Record<string, boolean>>
+  readonly onToggleFolderCollapsed?: (projectId: string, collapsed: boolean) => void
+  readonly expandedFolders?: Readonly<Record<string, boolean>>
+  readonly onExpandFolder?: (projectId: string, expanded: boolean) => void
+  /** Project ids with a live terminal shell; the folder header marks them. */
+  readonly terminalProjects?: ReadonlySet<string>
   readonly onRename: (id: string, title: string) => void
   readonly onDeleteRequest: (session: SessionListing) => void
   readonly onTogglePinned?: (id: string, pinned: boolean) => void
@@ -204,6 +210,11 @@ export function Sidebar(props: SidebarProps) {
           onSelect={onSelect}
           onRename={onRename}
           onDeleteRequest={onDeleteRequest}
+          {...(props.collapsedFolders !== undefined ? { collapsedFolders: props.collapsedFolders } : {})}
+          {...(props.onToggleFolderCollapsed !== undefined ? { onToggleFolderCollapsed: props.onToggleFolderCollapsed } : {})}
+          {...(props.expandedFolders !== undefined ? { expandedFolders: props.expandedFolders } : {})}
+          {...(props.onExpandFolder !== undefined ? { onExpandFolder: props.onExpandFolder } : {})}
+          {...(props.terminalProjects !== undefined ? { terminalProjects: props.terminalProjects } : {})}
           {...(props.onTogglePinned !== undefined ? { onTogglePinned: props.onTogglePinned } : {})}
           onNewInProject={onNewInProject}
           {...(props.onReorderProjects !== undefined ? { onReorder: props.onReorderProjects } : {})}

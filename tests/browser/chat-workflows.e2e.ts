@@ -528,7 +528,7 @@ test('a completed tool row expands to recorded output without requests', async (
   await expect(row).toContainText('npm test')
   await expect(row).toContainText('recorded output')
   await row.click()
-  await expect(transcriptOf(page).locator('pre').last()).toContainText('recorded output')
+  await expect(transcriptOf(page).locator('pre[aria-label="Tool output"]')).toContainText('recorded output')
   await row.click()
   await expect(row).toHaveAttribute('aria-expanded', 'false')
   await expect(transcriptOf(page).locator('pre')).toHaveCount(0)

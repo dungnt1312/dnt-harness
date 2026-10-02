@@ -73,7 +73,7 @@ export type SessionEvent =
       readonly proposedAccess?: 'read' | 'write'
     } & SessionEventStamp)
   | ({ readonly type: 'approval/decision'; readonly approvalId: string; readonly executionId?: ExecutionId; readonly decision: ApprovalDecision; readonly reason?: string } & SessionEventStamp)
-  | ({ readonly type: 'input/queued'; readonly inputId: string; readonly clientRequestId?: string; readonly content: string; readonly attachments?: readonly AttachmentRef[] } & SessionEventStamp)
+  | ({ readonly type: 'input/queued'; readonly inputId: string; readonly clientRequestId?: string; readonly content: string; readonly attachments?: readonly AttachmentRef[]; readonly delivery?: 'steer' } & SessionEventStamp)
   | ({ readonly type: 'input/settled'; readonly inputId: string; readonly outcome: 'admitted' | 'rejected' | 'empty' } & SessionEventStamp)
   | ({ readonly type: 'session/title'; readonly title: string | null } & SessionEventStamp)
   | ({ readonly type: 'session/pinned'; readonly pinned: boolean } & SessionEventStamp)
@@ -151,6 +151,8 @@ export type TurnEndReason =
   | 'failed'
   /** The user stopped the run; queued input stays queued. */
   | 'cancelled'
+  /** The user steered: the run stopped and the queued input runs next. */
+  | 'steered'
   /** The host restarted (or crashed) with the turn still open. */
   | 'interrupted'
   /** Legacy terminal reason retained so existing durable session logs remain readable. */

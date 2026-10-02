@@ -4,6 +4,19 @@
  * the stream events a provider yields.
  */
 
+/**
+ * A provider-side failure: transport, wire format, or model output the
+ * harness cannot act on. Adapters throw it at their wire boundary so the
+ * turn loop records the turn as `turn/error` kind `provider` instead of a
+ * generic internal failure — or worse, a silently completed empty turn.
+ */
+export class ProviderError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ProviderError'
+  }
+}
+
 /** One model-invoked tool call: `id` correlates the request with its result. */
 export interface ToolCall {
   readonly id: string

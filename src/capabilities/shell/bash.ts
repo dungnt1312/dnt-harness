@@ -16,6 +16,7 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { detectShell } from './detect.ts'
+import { scrubbedChildEnv } from '../../harness/child-env.ts'
 import type { ProcessRegistry } from '../../harness/processes/registry.ts'
 import type { ToolDefinition, ToolExecution } from '../../harness/tools/types.ts'
 
@@ -151,7 +152,7 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
           child = spawn(detection.executable, ['-lc', command], {
             cwd,
             detached: true,
-            ...(process.platform === 'win32' ? { env: { ...process.env, [TREE_TAG_ENV]: treeTag } } : {}),
+            env: scrubbedChildEnv(process.platform === 'win32' ? { [TREE_TAG_ENV]: treeTag } : {}),
           })
         } catch (error) {
           return `error: bash spawn failed (${String(error)}); verify the shell at '${detection.hint}'`
@@ -229,7 +230,7 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
             // requiresRoot tool. The fallback retains direct-call compatibility.
             cwd: exec.root !== '' ? exec.root : fallbackCwd(),
             detached: true,
-            ...(process.platform === 'win32' ? { env: { ...process.env, [TREE_TAG_ENV]: treeTag } } : {}),
+            env: scrubbedChildEnv(process.platform === 'win32' ? { [TREE_TAG_ENV]: treeTag } : {}),
           })
         } catch (error) {
           finish(`error: bash spawn failed (${String(error)}); verify the shell at '${detection.hint}'`)

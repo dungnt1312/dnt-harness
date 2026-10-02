@@ -41,6 +41,12 @@ export interface SessionSummary {
   readonly projectId?: string | null
   /** The last recorded pin state. Absent in summaries written before pinning; those rebuild. */
   readonly pinned?: boolean
+  /**
+   * Set when the log carries `session/child-meta`: this session is a subagent
+   * of that parent. Null for user-owned conversations. Absent in summaries
+   * written before subagent listing; those rebuild.
+   */
+  readonly parentSessionId?: string | null
 }
 
 /** Storage seam behind `SessionsService`; file-backed in production. */
@@ -111,7 +117,27 @@ export class FileSessionStore implements SessionStore {
     const next = previous.then(() => this.writeRecord(id, line))
     void next.catch(() => {})
     this.writers.set(id, next)
+    // A settled, healthy chain carries nothing; drop it so the map does not
+    // grow with every session written. A failed chain stays (poisoned).
+    void next.then(() => { if (this.writers.get(id) === next) this.writers.delete(id) }, () => {})
     await next
+  }
+
+  /**
+   * Run `fn` with the session's log to itself: it waits for queued appends
+   * and later appends wait for it. Reads and repairs must not interleave
+   * with an append — a read that saw a half-written line would "repair"
+   * (truncate) a record that is about to be acknowledged as durable.
+   * A failure before this point keeps poisoning later appends.
+   */
+  private exclusive<T>(id: SessionId, fn: () => Promise<T>): Promise<T> {
+    const previous = this.writers.get(id) ?? Promise.resolve()
+    const result = previous.catch(() => {}).then(fn)
+    const chain = previous.then(() => result.then(() => {}, () => {}))
+    void chain.catch(() => {})
+    this.writers.set(id, chain)
+    void chain.then(() => { if (this.writers.get(id) === chain) this.writers.delete(id) }, () => {})
+    return result
   }
 
   async flush(id: SessionId): Promise<void> {
@@ -125,25 +151,27 @@ export class FileSessionStore implements SessionStore {
 
   async read(id: SessionId): Promise<{ events: SessionEvent[]; truncatedTail: boolean }> {
     this.assertSafeId(id)
-    // Reads, repairs, replacements, and removals join the writer chain: a
+    // Reads, repairs, replacements, and removals hold the writer chain: a
     // torn-tail repair or handle close must never race an in-flight append.
-    await this.writers.get(id)?.catch(() => {})
-    await this.closeHandle(id)
-    try {
-      return await readEventLog(this.eventsPath(id))
-    } catch (error) {
-      if (error instanceof SessionLogError) throw error
-      throw new SessionLogError('io', `cannot read session '${id}': ${String(error)}`)
-    }
+    return this.exclusive(id, async () => {
+      await this.closeHandle(id)
+      try {
+        return await readEventLog(this.eventsPath(id))
+      } catch (error) {
+        if (error instanceof SessionLogError) throw error
+        throw new SessionLogError('io', `cannot read session '${id}': ${String(error)}`)
+      }
+    })
   }
 
   async replace(id: SessionId, events: readonly SessionEvent[]): Promise<void> {
     this.assertSafeId(id)
-    await this.writers.get(id)?.catch(() => {})
-    await this.closeHandle(id)
-    await fs.mkdir(this.sessionDir(id), { recursive: true })
-    const body = events.map((event) => encodeEventLine(event)).join('')
-    await replaceFileAtomic(this.eventsPath(id), body)
+    await this.exclusive(id, async () => {
+      await this.closeHandle(id)
+      await fs.mkdir(this.sessionDir(id), { recursive: true })
+      const body = events.map((event) => encodeEventLine(event)).join('')
+      await replaceFileAtomic(this.eventsPath(id), body)
+    })
   }
 
   async writeSummary(id: SessionId, summary: SessionSummary): Promise<void> {
@@ -167,7 +195,9 @@ export class FileSessionStore implements SessionStore {
         !Number.isInteger(parsed['lastSeq']) ||
         (parsed['title'] !== null && typeof parsed['title'] !== 'string') ||
         (parsed['derivedTitle'] !== undefined && parsed['derivedTitle'] !== null && typeof parsed['derivedTitle'] !== 'string') ||
-        (parsed['projectId'] !== undefined && parsed['projectId'] !== null && typeof parsed['projectId'] !== 'string')
+        (parsed['projectId'] !== undefined && parsed['projectId'] !== null && typeof parsed['projectId'] !== 'string') ||
+        (parsed['pinned'] !== undefined && typeof parsed['pinned'] !== 'boolean') ||
+        (parsed['parentSessionId'] !== undefined && parsed['parentSessionId'] !== null && typeof parsed['parentSessionId'] !== 'string')
       ) return undefined
       return {
         id,
@@ -186,6 +216,11 @@ export class FileSessionStore implements SessionStore {
         ...(parsed['projectId'] !== undefined
           ? { projectId: parsed['projectId'] as string | null }
           : {}),
+        ...(parsed['pinned'] !== undefined ? { pinned: parsed['pinned'] as boolean } : {}),
+        // Absent means the summary predates subagent listing; boot rebuilds it.
+        ...(parsed['parentSessionId'] !== undefined
+          ? { parentSessionId: parsed['parentSessionId'] as string | null }
+          : {}),
       }
     } catch {
       return undefined
@@ -199,7 +234,10 @@ export class FileSessionStore implements SessionStore {
    */
   async readLastSeq(id: SessionId): Promise<number> {
     this.assertSafeId(id)
-    await this.writers.get(id)?.catch(() => {})
+    return this.exclusive(id, () => this.readLastSeqNow(id))
+  }
+
+  private async readLastSeqNow(id: SessionId): Promise<number> {
     await this.closeHandle(id)
     try {
       const handle = await fs.open(this.eventsPath(id), 'r')
@@ -240,9 +278,10 @@ export class FileSessionStore implements SessionStore {
 
   async remove(id: SessionId): Promise<void> {
     this.assertSafeId(id)
-    await this.writers.get(id)?.catch(() => {})
-    await this.closeHandle(id)
-    await fs.rm(this.sessionDir(id), { recursive: true, force: true })
+    await this.exclusive(id, async () => {
+      await this.closeHandle(id)
+      await fs.rm(this.sessionDir(id), { recursive: true, force: true })
+    })
   }
 
   async close(): Promise<void> {

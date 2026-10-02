@@ -82,7 +82,7 @@ function ViewTab({ view, active, onClick, onClose }: {
  * Terminal is a view tab like the others (Ctrl+` opens it). The chat column
  * has a separate footer terminal; this panel does not own that one.
  */
-export function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, expanded, onToggleExpand, onClose, openPath, sessionId = null, onOpenChild, terminalShell = null, onTerminalShell, gitPathFilter = null, onClearGitFilter, processFocus = null }: {
+export function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, terminalShell = null, onTerminalShell, gitPathFilter = null, onClearGitFilter, processFocus = null }: {
   readonly workspaceId: string | null
   /** The project whose files are browsable; null for chat-only conversations. */
   readonly project: WorkbenchProject | null
@@ -102,9 +102,21 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
   readonly onToggleExpand?: () => void
   readonly onClose: () => void
   readonly openPath?: OpenPathResolver
-  /** Root conversation the Agents view delegates from; null when none is open. */
+  /** The conversation open in the chat column; the Process view's scope. */
   readonly sessionId?: string | null
+  /**
+   * The conversation whose delegation the Subagents view lists — the root
+   * while a subagent is open (a child has no children of its own); falls back
+   * to `sessionId`.
+   */
+  readonly agentsSessionId?: string | null
   readonly onOpenChild?: (childSessionId: string) => void
+  /**
+   * The delegation source conversation's log, when it is not the viewed one
+   * (a second stream keeps the root's log alive while a child is open). The
+   * Subagents view derives row briefs and its refresh signal from it.
+   */
+  readonly agentEvents?: readonly SseEvent[]
   /** Shell the Terminal tab opens without being asked. */
   readonly terminalShell?: string | null
   readonly onTerminalShell?: (shellId: string | null) => void
@@ -128,18 +140,19 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
   const closedViews = VIEW_ORDER.filter((candidate) => !openViews.includes(candidate))
   // Delegation lands in the root's own log, whether the user or the model
   // started it: the Subagents view refreshes off that traffic and reads each
-  // child's brief from it.
+  // child's brief from it. While a child is open that log is the parent's,
+  // streamed separately from the viewed conversation's own events.
   const delegation = useMemo(() => {
     let count = 0
     const briefs = new Map<string, string>()
-    for (const event of events) {
+    for (const event of agentEvents ?? events) {
       if (event.type !== 'agent/child-spawn' && event.type !== 'agent/child-result') continue
       count += 1
       const brief = event.brief ?? event.objective
       if (event.type === 'agent/child-spawn' && event.childSessionId !== undefined && brief !== undefined) briefs.set(event.childSessionId, brief)
     }
     return { count, briefs }
-  }, [events])
+  }, [agentEvents, events])
 
   const selectView = (next: WorkbenchView): void => {
     // Selecting a view that is not open yet opens it. Doing it here, in one
@@ -192,7 +205,7 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
     body = (
       <AgentRunsPanel
         workspaceId={workspaceId}
-        rootSessionId={sessionId}
+        rootSessionId={agentsSessionId ?? sessionId}
         briefs={delegation.briefs}
         refreshSignal={delegation.count}
         {...(onOpenChild !== undefined ? { onOpenChild } : {})}

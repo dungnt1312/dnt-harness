@@ -109,7 +109,7 @@ describe('agent loop with tools', () => {
       toolCall?.type === 'tool/call' ? toolCall.executionId : undefined,
     )
     expect(toolResult?.type === 'tool/result' && toolResult.ok).toBe(true)
-    expect(toolResult?.type === 'tool/result' && toolResult.output).toBe('the sky is blue')
+    expect(toolResult?.type === 'tool/result' && toolResult.output).toBe('1\tthe sky is blue')
 
     const chunks = session.events.filter((event) => event.type === 'assistant/chunk')
     const assembled = chunks.map((event) => (event.type === 'assistant/chunk' ? event.delta : '')).join('')
@@ -135,7 +135,7 @@ describe('agent loop with tools', () => {
         content: '',
         toolCalls: [{ id: 'call-1-0', name: 'Read', args: { path: 'fact.txt' } }],
       },
-      { role: 'tool', content: 'pi is 3.14', toolCallId: 'call-1-0' },
+      { role: 'tool', content: '1\tpi is 3.14', toolCallId: 'call-1-0' },
       { role: 'assistant', content: 'done' },
     ])
     void kernel.stop()
@@ -160,9 +160,49 @@ describe('agent loop with tools', () => {
     expect(names.filter((name) => name.toLowerCase() === name)).toEqual([])
 
     const followUp = requests[1]?.messages
-    expect(followUp?.at(-1)).toEqual({ role: 'tool', content: 'x', toolCallId: 'call-1-0' })
+    expect(followUp?.at(-1)).toEqual({ role: 'tool', content: '1\tx', toolCallId: 'call-1-0' })
     void kernel.stop()
     void session
+  })
+
+  it('projects rewritten tool arguments into the follow-up model request', async () => {
+    await fs.writeFile(path.join(root, 'rewritten.txt'), 'rewritten value', 'utf8')
+    const { kernel, agent, requests } = bootHarness([
+      { toolCalls: [{ name: 'Read', args: { path: 'original.txt' } }] },
+      'done',
+    ])
+    kernel.ctx.llm.use('recorder')
+    kernel.ctx.on('tools/rewrite', async ({ call }, next) => next({
+      call: { ...call, id: 'rewritten-call-id', args: { path: 'rewritten.txt' } },
+    }))
+
+    agent.send('read it')
+    await agent.run()
+
+    const assistant = requests[1]?.messages.find((message) => message.role === 'assistant')
+    expect(assistant?.role === 'assistant' && assistant.toolCalls?.[0]).toEqual({
+      id: 'rewritten-call-id',
+      name: 'Read',
+      args: { path: 'rewritten.txt' },
+    })
+    void kernel.stop()
+  })
+
+  it('tool preparation failures become results and the turn can continue', async () => {
+    const { kernel, session, agent } = bootHarness([
+      { toolCalls: [{ name: 'Glob', args: { pattern: '*' } }] },
+      'handled failure',
+    ])
+    kernel.ctx.on('tools/pre-execute', async () => { throw new Error('gate exploded') })
+
+    agent.send('go')
+    await agent.run()
+
+    const result = session.events.find((event) => event.type === 'tool/result')
+    expect(result?.type === 'tool/result' && result.ok).toBe(false)
+    expect(result?.type === 'tool/result' && result.output).toContain('tool preparation failed: gate exploded')
+    expect(session.events.findLast((event) => event.type === 'turn/end')).toMatchObject({ type: 'turn/end', reason: 'completed' })
+    void kernel.stop()
   })
 
   it('a denied tool still owes the model its (failed) result and another step', async () => {
@@ -230,7 +270,7 @@ describe('agent loop with tools', () => {
     expect(requests[0]?.messages).toEqual(deriveMessages(events.slice(0, firstUser + 1)))
     expect(requests[1]?.messages).toEqual(deriveMessages(events.slice(0, firstStepEnd + 1)))
     expect(requests[1]?.messages.filter((message) => message.role === 'tool')).toEqual([
-      { role: 'tool', content: 'answer=42', toolCallId: 'call-1-0' },
+      { role: 'tool', content: '1\tanswer=42', toolCallId: 'call-1-0' },
     ])
     void kernel.stop()
   })

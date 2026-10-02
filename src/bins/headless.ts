@@ -39,6 +39,8 @@ import {
   type Session,
   type SessionEvent,
   type SessionsService,
+  DataHomeLock,
+  OwnershipError,
 } from '../index.ts'
 import { DEFAULT_LIMITS } from '../harness/limits.ts'
 import { ProcessRegistry } from '../harness/processes/registry.ts'
@@ -117,6 +119,19 @@ async function askUser(call: { name: string; args: Record<string, unknown> }): P
 async function main(): Promise<void> {
   const { yolo, root, dataDir, message } = parseArgs(process.argv.slice(2))
   const apiKey = readApiKey()
+  // One writer per data home: a web host (or another CLI) on the same
+  // directory would append independent sequence numbers to shared logs.
+  let ownerLock: DataHomeLock
+  try {
+    ownerLock = await DataHomeLock.acquire(dataDir)
+  } catch (error) {
+    if (error instanceof OwnershipError) {
+      process.stderr.write(`mini-dsh: ${error.message}; another mini-dsh process owns '${dataDir}'. Stop it or pass --data-dir.\n`)
+      process.exitCode = 1
+      return
+    }
+    throw error
+  }
 
   const kernel = new Kernel()
   kernel.ctx.plugin(fileSessions(dataDir))
@@ -188,7 +203,11 @@ async function main(): Promise<void> {
     }
   } finally {
     await kernel.stop()
+    await ownerLock.release()
   }
 }
 
-void main()
+main().catch((error: unknown) => {
+  process.stderr.write(`mini-dsh: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`)
+  process.exitCode = 1
+})

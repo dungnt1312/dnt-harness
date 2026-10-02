@@ -1,6 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { HoldScrollProvider, useStickToBottom } from '../../hooks/useStickToBottom.ts'
-import type { ViewItem } from '../../lib/project.ts'
+import type { RetryTarget, ViewItem } from '../../lib/project.ts'
 import { turnChanges, type TurnChanges } from '../../lib/turn-changes.ts'
 import type { SseEvent } from '../../lib/types.ts'
 import type { OpenPathResolver } from '../../lib/project-paths.ts'
@@ -107,7 +107,7 @@ export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
  * Memoized: the app re-renders on every composer keystroke, and a long
  * transcript must not re-render with it while its own props are unchanged.
  */
-export const Transcript = memo(function Transcript({ items, events, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, onOpenSettings, openPath, project, onReviewChanges, onOpenProcess }: {
+export const Transcript = memo(function Transcript({ items, events, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, onSendNow, running = false, openPath, project, onReviewChanges, onOpenProcess }: {
   readonly items: readonly ViewItem[]
   /** The raw log behind `items`; per-turn changes project from it. */
   readonly events?: readonly SseEvent[]
@@ -116,8 +116,12 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   readonly workspaceId?: string | null
   readonly onReuse?: (text: string) => void
   readonly onOpenChild?: (childSessionId: string) => void
-  readonly onRetry?: () => void
-  readonly onOpenSettings?: () => void
+  /** Resends one failed turn's own inputs. */
+  readonly onRetry?: (target: RetryTarget) => void
+  /** Steer the queue: stop the running turn and run queued input now. */
+  readonly onSendNow?: () => void
+  /** A turn is open (steered bubbles are still stopping it). */
+  readonly running?: boolean
   readonly openPath?: OpenPathResolver
   /** The conversation's project, for the per-turn change card's git chips. */
   readonly project?: WorkbenchProject | null
@@ -180,7 +184,16 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   const render = ({ item, index }: Indexed): ReactNode => {
     switch (item.kind) {
       case 'user':
-        return <UserBubble key={`user-${index}`} item={item} workspaceId={workspaceId ?? null} {...(onReuse !== undefined ? { onReuse } : {})} />
+        return (
+          <UserBubble
+            key={`user-${index}`}
+            item={item}
+            workspaceId={workspaceId ?? null}
+            running={running}
+            {...(onReuse !== undefined ? { onReuse } : {})}
+            {...(onSendNow !== undefined ? { onSendNow } : {})}
+          />
+        )
       case 'assistant': {
         const turn = footers.get(index)
         // The card rides the same anchor row as the footer: the last answer
@@ -225,7 +238,18 @@ export const Transcript = memo(function Transcript({ items, events, conversation
       case 'compaction':
         return <CompactionMarker key={`compaction-${index}`} item={item} />
       case 'status':
-        return <StatusLine key={`status-${index}`} reason={item.reason} {...(onRetry !== undefined ? { onRetry } : {})} {...(onOpenSettings !== undefined ? { onOpenSettings } : {})} />
+        {
+          // Retry exists only where the log names what to resend: the failed
+          // turn's own inputs. Older lines never retry a newer message.
+          const target = item.retry
+          return (
+            <StatusLine
+              key={`status-${index}`}
+              reason={item.reason}
+              {...(onRetry !== undefined && target !== undefined ? { onRetry: () => onRetry(target), toolsRan: target.toolsRan } : {})}
+            />
+          )
+        }
       default:
         return null
     }
@@ -244,9 +268,9 @@ export const Transcript = memo(function Transcript({ items, events, conversation
           className="chat-scroll absolute inset-0 overflow-y-auto overflow-x-hidden outline-none"
         >
           <div ref={contentRef} className="px-3 pb-8 pt-4 sm:px-6">
-            {/* Spacing is per neighbour, not one flat gap: activity sits close
-                to what it belongs to, and a message whose reserved action row
-                already adds height does not add a full gap on top of it. */}
+            {/* Spacing is per neighbour, not one flat gap: activity sits as its
+                own beat (a full gap above and below), and a message whose
+                reserved action row already adds height does not add one on top. */}
             <div className="mx-auto flex w-full max-w-3xl flex-col px-1">
               {visibleStart > 0 ? (
                 <button
@@ -258,9 +282,9 @@ export const Transcript = memo(function Transcript({ items, events, conversation
                 </button>
               ) : null}
               {visibleBlocks.map((block) => {
-                // Activity lines are bare text now, not padded rows: they need a
-                // real gap from what is around them instead of a hairline.
-                const spacing = block.kind === 'activity' ? 'my-2' : 'mt-1.5'
+                // Activity is its own beat: a full gap above and below, like the
+                // 16px between any two work items in a turn.
+                const spacing = block.kind === 'activity' ? 'my-4' : 'mt-1.5'
                 const row = block.kind === 'row' ? block.row : null
                 const isUserRow = row?.item.kind === 'user'
                 if (block.kind === 'activity') {

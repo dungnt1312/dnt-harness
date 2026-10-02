@@ -155,11 +155,11 @@ test('clicking a step shows what the log recorded for it', async ({ page }) => {
   await expect(grep).toHaveAttribute('aria-expanded', 'false')
   await grep.click()
   await expect(grep).toHaveAttribute('aria-expanded', 'true')
-  const body = calls.getByRole('region')
+  const body = calls.getByRole('group').filter({ has: page.locator('pre') })
   await expect(body).toContainText('"pattern": "createProject"')
   await expect(body).toContainText('no such dir')
   await grep.click()
-  await expect(calls.getByRole('region')).toHaveCount(0)
+  await expect(calls.getByRole('group').filter({ has: page.locator('pre') })).toHaveCount(0)
 
   await timeline.getByRole('button', { name: 'Turn 1, request 2' }).click()
   await expect(steps.locator('[aria-current="step"]')).toContainText('All done.')

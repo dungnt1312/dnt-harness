@@ -10,7 +10,9 @@ import {
   Kernel,
   LlmService,
   messageText,
+  ProviderError,
   SessionsService,
+  ToolsService,
   type Agent,
   type LlmProvider,
   type ModelRequest,
@@ -141,10 +143,313 @@ describe('agent loop', () => {
     await agent.run()
 
     expect(modelCalls).toBe(0)
-    expect(session.events.map((event) => event.type)).toEqual(['turn/start', 'turn/end'])
+    expect(session.events.map((event) => event.type)).toEqual(['turn/start', 'turn/error', 'turn/end'])
+    expect(session.events.find((event) => event.type === 'turn/error')).toMatchObject({
+      type: 'turn/error',
+      kind: 'rejected',
+      message: 'policy',
+    })
     const last = session.events[session.events.length - 1]
     expect(last?.type === 'turn/end' && last.reason).toBe('rejected')
     void kernel.stop()
+  })
+
+  it('a model stream that yields nothing fails the turn durably instead of completing silently', async () => {
+    const { kernel, session, agent, llm } = harness(['unused'])
+    llm.register({
+      name: 'silent',
+      async *stream() {
+        // A gateway that accepts the request and closes the stream cleanly:
+        // zero deltas, zero tool calls.
+      },
+    })
+    llm.use('silent')
+
+    agent.send('hello')
+    await agent.run()
+
+    expect(session.events.find((event) => event.type === 'turn/error')).toMatchObject({
+      type: 'turn/error',
+      kind: 'provider',
+    })
+    expect(
+      session.events.find((event) => event.type === 'turn/error')?.type === 'turn/error'
+        && session.events.find((event) => event.type === 'turn/error')?.message,
+    ).toMatch(/empty response/)
+    const last = session.events[session.events.length - 1]
+    expect(last?.type === 'turn/end' && last.reason).toBe('failed')
+    void kernel.stop()
+  })
+
+  it('a thinking-only stream with no answer fails the turn as a provider error', async () => {
+    const { kernel, session, agent, llm } = harness(['unused'])
+    llm.register({
+      name: 'reasoner',
+      async *stream() {
+        yield { type: 'delta', delta: 'thinking hard', thinking: true }
+      },
+    })
+    llm.use('reasoner')
+
+    agent.send('hello')
+    await agent.run()
+
+    expect(session.events.find((event) => event.type === 'turn/error')).toMatchObject({
+      type: 'turn/error',
+      kind: 'provider',
+    })
+    const last = session.events[session.events.length - 1]
+    expect(last?.type === 'turn/end' && last.reason).toBe('failed')
+    void kernel.stop()
+  })
+
+  it('provider-surfaced failures are recorded as kind provider, not internal', async () => {
+    const { kernel, session, agent, llm } = harness(['unused'])
+    llm.register({
+      name: 'relay',
+      async *stream() {
+        throw new ProviderError('relay: HTTP 502: upstream unavailable')
+      },
+    })
+    llm.use('relay')
+
+    agent.send('hello')
+    await agent.run()
+
+    expect(session.events.find((event) => event.type === 'turn/error')).toMatchObject({
+      type: 'turn/error',
+      kind: 'provider',
+      message: 'relay: HTTP 502: upstream unavailable',
+    })
+    void kernel.stop()
+  })
+
+  it('a tool abort that loses the stop race still closes the turn as cancelled', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(SessionsService)
+    kernel.ctx.plugin(LlmService)
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.plugin(AgentsService)
+    const session = kernel.ctx.sessions.create()
+    const agent = kernel.ctx.agents.create(session)
+
+    let toolStarted = false
+    kernel.ctx.tools.register({
+      name: 'Hang',
+      description: 'waits for abort, then rejects like a killed child process',
+      parameters: { type: 'object', properties: {}, required: [] },
+      execute: (_args, exec) =>
+        new Promise((_resolve, reject) => {
+          toolStarted = true
+          exec.signal?.addEventListener('abort', () => reject(new Error('This operation was aborted')))
+        }),
+    })
+
+    const scripted: LlmProvider = {
+      name: 'scripted',
+      models: ['scripted'],
+      async *stream() {
+        yield { type: 'toolCalls', calls: [{ id: 'c1', name: 'Hang', args: {} }] }
+      },
+    }
+    kernel.ctx.llm.register(scripted)
+
+    agent.send('go')
+    const running = agent.run()
+    while (!toolStarted) await new Promise((resolve) => setTimeout(resolve, 1))
+    agent.stop()
+    await running
+
+    expect(session.events.some((event) => event.type === 'turn/error')).toBe(false)
+    const last = session.events[session.events.length - 1]
+    expect(last?.type === 'turn/end' && last.reason).toBe('cancelled')
+    void kernel.stop()
+  })
+
+  describe('steer and stop', () => {
+    /** A provider that answers `first` only after `release()`, then `second` immediately. */
+    function gatedHarness() {
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => { release = resolve })
+      let calls = 0
+      let started!: () => void
+      const firstStarted = new Promise<void>((resolve) => { started = resolve })
+      const provider: LlmProvider = {
+        name: 'gated',
+        models: ['gated'],
+        async *stream(_request, options) {
+          calls += 1
+          if (calls === 1) {
+            started()
+            // Hang until released or aborted, like a slow model.
+            await new Promise<void>((resolve, reject) => {
+              void gate.then(resolve)
+              options?.signal?.addEventListener('abort', () => reject(new Error('aborted')))
+            })
+            yield { type: 'delta', delta: 'first' }
+            return
+          }
+          yield { type: 'delta', delta: `reply ${calls}` }
+        },
+      }
+      const h = harness([], provider)
+      return { ...h, release, firstStarted, calls: () => calls }
+    }
+    const accept = (agent: Agent, session: Session, content: string): void => {
+      const inputId = `in-${content}` as never
+      session.append({ type: 'input/queued', inputId, content })
+      agent.enqueueAccepted({ content, inputId })
+    }
+    const turnEnds = (session: Session): string[] =>
+      session.events.flatMap((event) => event.type === 'turn/end' ? [event.reason] : [])
+    const userTexts = (session: Session): string[] =>
+      session.events.flatMap((event) => event.type === 'user/message' ? [event.content] : [])
+
+    it('steer stops the running turn as steered and runs old + new queue in one turn, in order', async () => {
+      const { kernel, session, agent, firstStarted } = gatedHarness()
+      accept(agent, session, 'one')
+      const run = agent.run()
+      await firstStarted
+      accept(agent, session, 'queued-before')
+      accept(agent, session, 'steered')
+      agent.steer()
+      await run
+
+      expect(turnEnds(session)).toEqual(['steered', 'completed'])
+      expect(userTexts(session)).toEqual(['one', 'queued-before', 'steered'])
+      // Both follow-ups were claimed by the same, second turn.
+      const second = session.events.filter((event) => event.type === 'turn/start')[1]
+      const inSecond = session.events.filter((event) => event.type === 'user/message' && second?.type === 'turn/start' && event.turnId === second.turnId)
+      expect(inSecond).toHaveLength(2)
+      expect(agent.busy).toBe(false)
+      void kernel.stop()
+    })
+
+    it('a plain stop leaves input queued after it unrun (fix B) — only steer runs it', async () => {
+      const { kernel, session, agent, firstStarted } = gatedHarness()
+      accept(agent, session, 'one')
+      const run = agent.run()
+      await firstStarted
+      agent.stop()
+      // Sent while the stop is still settling: it stays queued.
+      accept(agent, session, 'after-stop')
+      await run
+
+      expect(turnEnds(session)).toEqual(['cancelled'])
+      expect(userTexts(session)).toEqual(['one'])
+      expect(agent.pendingCount).toBe(1)
+      void kernel.stop()
+    })
+
+    it('steer upgrades a stop already in progress', async () => {
+      const { kernel, session, agent, firstStarted } = gatedHarness()
+      accept(agent, session, 'one')
+      const run = agent.run()
+      await firstStarted
+      agent.stop()
+      accept(agent, session, 'steered')
+      agent.steer()
+      await run
+
+      expect(turnEnds(session)).toEqual(['steered', 'completed'])
+      expect(userTexts(session)).toEqual(['one', 'steered'])
+      void kernel.stop()
+    })
+
+    it('a Stop after a Steer wins: the queue stays queued', async () => {
+      const { kernel, session, agent, firstStarted } = gatedHarness()
+      accept(agent, session, 'one')
+      const run = agent.run()
+      await firstStarted
+      accept(agent, session, 'steered')
+      agent.steer()
+      agent.stop()
+      await run
+
+      expect(turnEnds(session)).toEqual(['cancelled'])
+      expect(userTexts(session)).toEqual(['one'])
+      expect(agent.pendingCount).toBe(1)
+      void kernel.stop()
+    })
+
+    it('a steer during pre-step hands the claimed input back instead of cancelling it unanswered', async () => {
+      const { kernel, session, agent } = harness(['answer'])
+      let releasePreStep!: () => void
+      const preStepGate = new Promise<void>((resolve) => { releasePreStep = resolve })
+      let entered!: () => void
+      const inPreStep = new Promise<void>((resolve) => { entered = resolve })
+      let gated = true
+      kernel.ctx.on('agent/pre-step', async (_claim, next) => {
+        if (gated) {
+          gated = false
+          entered()
+          await preStepGate
+        }
+        return next()
+      })
+      accept(agent, session, 'A')
+      const run = agent.run()
+      await inPreStep
+      accept(agent, session, 'B')
+      agent.steer()
+      releasePreStep()
+      await run
+
+      expect(turnEnds(session)).toEqual(['steered', 'completed'])
+      // The steered turn logged nothing for A: no user/message, no step.
+      const steeredEnd = session.events.findIndex((event) => event.type === 'turn/end')
+      const steeredTurn = session.events.slice(0, steeredEnd)
+      expect(steeredTurn.some((event) => event.type === 'user/message' || event.type === 'step/start')).toBe(false)
+      // A runs, answered, together with B in the completed turn.
+      const answered = session.events.slice(steeredEnd + 1)
+      expect(answered.flatMap((event) => event.type === 'user/message' ? [event.content] : [])).toEqual(['A', 'B'])
+      expect(session.events.filter((event) => event.type === 'input/settled' && event.inputId === 'in-A')).toHaveLength(1)
+      void kernel.stop()
+    })
+
+    it('adoptPending restores log order when a handed-back input sits behind newer input', async () => {
+      const { kernel, session, agent } = harness(['batched'])
+      // Inbox already holds C; the log says B (older) and C are pending.
+      accept(agent, session, 'C')
+      agent.adoptPending([
+        { content: 'B', inputId: 'in-B' as never },
+        { content: 'C', inputId: 'in-C' as never },
+      ])
+      await agent.run()
+      expect(userTexts(session)).toEqual(['B', 'C'])
+      void kernel.stop()
+    })
+
+    it('steer while idle is a no-op: nothing stops, nothing auto-runs', async () => {
+      const { kernel, session, agent } = harness(['unused'])
+      accept(agent, session, 'waiting')
+      agent.steer()
+      await Promise.resolve()
+
+      expect(session.events.some((event) => event.type === 'turn/start')).toBe(false)
+      expect(agent.busy).toBe(false)
+      void kernel.stop()
+    })
+
+    it('a stop between turns does not open the next turn on an aborted controller', async () => {
+      const { kernel, session, agent } = harness(['a', 'b'])
+      // Stop from inside the first turn's settle hook: the turn already
+      // completed, the queued input must not open a turn that dies unanswered.
+      let stopped = false
+      kernel.ctx.on('agent/turn-settled', async () => {
+        if (stopped) return
+        stopped = true
+        accept(agent, session, 'next')
+        agent.stop()
+      })
+      agent.send('first')
+      await agent.run()
+
+      expect(turnEnds(session)).toEqual(['completed'])
+      expect(userTexts(session)).toEqual(['first'])
+      expect(agent.pendingCount).toBe(1)
+      void kernel.stop()
+    })
   })
 
   it('a pre-step rewrite to empty closes the turn without spending a step', async () => {
@@ -160,6 +465,50 @@ describe('agent loop', () => {
     expect(session.events.map((event) => event.type)).toEqual(['turn/start', 'turn/end'])
     const last = session.events[session.events.length - 1]
     expect(last?.type === 'turn/end' && last.reason).toBe('empty')
+    void kernel.stop()
+  })
+
+  it('pre-step insertion preserves accepted input identity and attachments on the original content', async () => {
+    const { kernel, session, agent } = harness(['ok'])
+    const attachment = { id: 'a'.repeat(64), name: 'note.txt', mediaType: 'text/plain', bytes: 4 } as const
+    kernel.ctx.on('agent/pre-step', async (claim, next) => next({ contents: ['injected context', ...claim.contents] }))
+
+    agent.enqueueAccepted({ content: 'original', inputId: 'input-original' as never, attachments: [attachment] })
+    await agent.run()
+
+    const messages = session.events.filter((event) => event.type === 'user/message')
+    expect(messages).toHaveLength(2)
+    expect(messages[0]).toMatchObject({ type: 'user/message', content: 'injected context' })
+    expect(messages[0]?.type === 'user/message' && messages[0].inputId).toBeUndefined()
+    expect(messages[1]).toMatchObject({ type: 'user/message', content: 'original', inputId: 'input-original', attachments: [attachment] })
+    void kernel.stop()
+  })
+
+  it('an inserted duplicate string does not steal accepted input metadata', async () => {
+    const { kernel, session, agent } = harness(['ok'])
+    kernel.ctx.on('agent/pre-step', async (claim, next) => next({ contents: [claim.contents[0] ?? '', ...claim.contents] }))
+
+    agent.enqueueAccepted({ content: 'same', inputId: 'input-same' as never })
+    await agent.run()
+
+    const messages = session.events.filter((event) => event.type === 'user/message')
+    expect(messages).toHaveLength(2)
+    expect(messages[0]?.type === 'user/message' && messages[0].inputId).toBeUndefined()
+    expect(messages[1]).toMatchObject({ type: 'user/message', content: 'same', inputId: 'input-same' })
+    void kernel.stop()
+  })
+
+  it('a rejected accepted input is durably settled and is not pending again', async () => {
+    const { kernel, session, agent } = harness(['unused'])
+    session.append({ type: 'input/queued', inputId: 'input-rejected', content: 'blocked' })
+    await session.durable()
+    agent.enqueueAccepted({ content: 'blocked', inputId: 'input-rejected' as never })
+    kernel.ctx.on('agent/pre-step', async () => ({ kind: 'reject', reason: 'policy' }))
+
+    await agent.run()
+
+    expect(kernel.ctx.sessions.pendingInputs(session)).toEqual([])
+    expect(session.events.some((event) => event.type === 'input/settled' && event.outcome === 'rejected')).toBe(true)
     void kernel.stop()
   })
 

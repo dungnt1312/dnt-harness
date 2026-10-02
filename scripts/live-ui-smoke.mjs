@@ -42,7 +42,7 @@ page.on('response', (response) => {
 try {
   const started = Date.now()
   await page.goto(`${base}/workspaces/${encodeURIComponent(workspace.id)}/sessions/${encodeURIComponent(session.id)}`, { waitUntil: 'domcontentloaded' })
-  await waitFor(async () => (await page.locator('.transcript, .empty').count()) > 0)
+  await waitFor(async () => (await page.locator('.transcript, .empty, .chat-scroll').count()) > 0)
   const elapsed = Date.now() - started
   if (elapsed > 2_000) fail(`Deep-link view took ${elapsed}ms; expected < 2000ms`)
 

@@ -91,6 +91,28 @@ export function gitExecutable(): string | undefined {
 
 let gitCache: string | undefined
 
+/**
+ * A project is not trusted code, but git reads the repository's own
+ * `.git/config` and `.gitattributes`. Several keys there run commands on
+ * read-only queries (`core.fsmonitor` on status, `diff.external` and
+ * `diff.<driver>.textconv` on diff), which would turn opening the Git view
+ * of a cloned repo into code execution. Override or disable each one.
+ */
+const SAFE_CONFIG: readonly string[] = [
+  '-c', 'core.quotepath=false',
+  '-c', 'core.fsmonitor=false',
+  '-c', 'core.hooksPath=/dev/null',
+  '-c', 'core.pager=cat',
+  '-c', 'diff.external=',
+  '-c', 'protocol.allow=never',
+]
+
+/** `diff` must also refuse external drivers and textconv filters named by attributes. */
+function hardenSubcommand(args: readonly string[]): string[] {
+  if (args[0] !== 'diff') return [...args]
+  return ['diff', '--no-ext-diff', '--no-textconv', ...args.slice(1)]
+}
+
 /** One finished git query. `code` is git's own exit code, never a launch failure. */
 interface GitResult {
   readonly stdout: Buffer
@@ -107,7 +129,7 @@ function git(cwd: string, args: readonly string[]): Promise<GitResult> {
   const executable = gitExecutable()
   if (executable === undefined) return Promise.reject(new ProjectGitError('git is not installed on this host'))
   return new Promise((resolve, reject) => {
-    execFile(executable, ['-c', 'core.quotepath=false', ...args], {
+    execFile(executable, [...SAFE_CONFIG, ...hardenSubcommand(args)], {
       cwd,
       timeout: GIT_TIMEOUT_MS,
       maxBuffer: MAX_DIFF_BYTES + 64 * 1024,

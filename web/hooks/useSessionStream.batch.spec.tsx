@@ -13,8 +13,10 @@ vi.mock('../lib/api.ts', () => ({ subscribeEventsIn: (_workspace: string, _sessi
 let root: Root | undefined
 let renders: number[] = []
 let approvals: string[] = []
+let projected: readonly import('../lib/project.ts').ViewItem[] = []
 function Probe() {
-  const { events, approvals: pending } = useSessionStream('w', 's')
+  const { events, items, approvals: pending } = useSessionStream('w', 's')
+  projected = items
   renders.push(events.length)
   approvals = pending.map((row) => row.approvalId)
   return <span>{events.map((event) => event.seq).join(',')}</span>
@@ -30,6 +32,23 @@ async function mount() {
 afterEach(async () => { if (root) await act(async () => root!.unmount()); root = undefined; receive = undefined; renders = []; approvals = []; dispose.mockClear(); document.body.replaceChildren(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
 describe('session stream frame batching', () => {
+  it('resumes buffered live projection without replaying or duplicating old rows', async () => {
+    const frames: FrameRequestCallback[] = []
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { frames.push(callback); return frames.length })
+    vi.stubGlobal('cancelAnimationFrame', vi.fn())
+    await mount()
+    await act(async () => receive?.({ kind: 'snapshot', events: [{ seq: 1, type: 'user/message', content: 'hello' }] }))
+    const user = projected[0]
+    await act(async () => {
+      receive?.({ kind: 'session', event: { seq: 2, type: 'assistant/chunk', delta: 'one' } })
+      receive?.({ kind: 'resume', events: [{ seq: 2, type: 'assistant/chunk', delta: 'one' }, { seq: 3, type: 'assistant/chunk', delta: ' two' }] })
+    })
+    await act(async () => frames.shift()?.(0))
+    expect(projected[0]).toBe(user)
+    expect(projected[1]).toMatchObject({ content: 'one two' })
+    await act(async () => receive?.({ kind: 'resume', events: [] }))
+    expect(projected).toHaveLength(2)
+  })
   it('commits a burst once per frame in event order, without duplicated sequence numbers', async () => {
     const frames: FrameRequestCallback[] = []
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { frames.push(callback); return frames.length })

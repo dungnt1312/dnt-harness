@@ -19,9 +19,10 @@ import { compactSession, fetchHooks, saveHooks, renameWorkspace, listProjectFile
 import { ContextPanel } from '../components/layout/ContextPanel.tsx'
 import { Workbench, type WorkbenchView } from '../components/workbench/Workbench.tsx'
 import { closeFileTab, useWorkbenchFiles } from '../hooks/useWorkbenchFiles.ts'
-import { useWorkbenchPreferences } from '../hooks/useWorkbenchPreferences.ts'
-import { WORKBENCH_DEFAULTS, WORKBENCH_STORAGE_KEY } from './workbench-preferences.ts'
+import { useWorkbenchTabs } from '../hooks/useWorkbenchTabs.ts'
+import { WORKBENCH_TABS_STORAGE_KEY } from './workbench-preferences.ts'
 import { Sidebar, type SidebarProps } from '../components/layout/Sidebar.tsx'
+import { ChatHeader } from '../components/layout/ChatHeader.tsx'
 import { HooksPanel } from '../components/settings/ManagementPanels.tsx'
 import { SessionList } from '../components/session/SessionList.tsx'
 import { WorkspacePopover } from '../components/layout/WorkspacePopover.tsx'
@@ -81,19 +82,21 @@ function WorkbenchProbe({ view, events, project = null }: { readonly view: Workb
   return <Workbench workspaceId="w1" project={project} view={selected} onView={setSelected} views={views} onViews={setViews} files={files} events={events} expanded={false} onClose={() => {}} context={{ meta: null, stream: 'open', sessionId: 's1', sessionFolder: null, eventCount: events.length }} />
 }
 /**
- * The same wiring the app uses: one persisted preference object drives both the
- * strip and the selected view, and `patchPreferences` merges a partial patch —
+ * The same wiring the app uses: one per-session record drives both the
+ * strip and the selected view, and `patchTabs` merges a partial patch —
  * so a close that removes a tab and a select that re-adds the active view
  * cannot disagree the way two independent setState calls can.
  */
 function WorkbenchPreferenceProbe({ events }: { readonly events: readonly SseEvent[] }) {
-  const { preferences, patchPreferences } = useWorkbenchPreferences()
+  const { tabs, patchTabs } = useWorkbenchTabs('w1:s1')
   const files = useWorkbenchFiles(null)
-  return <Workbench workspaceId="w1" project={null} view={preferences.inspectorTab} onView={(view) => patchPreferences({ inspectorTab: view })} views={preferences.inspectorViews} onViews={(views) => patchPreferences({ inspectorViews: views })} files={files} events={events} expanded={false} onClose={() => {}} context={{ meta: null, stream: 'open', sessionId: 's1', sessionFolder: null, eventCount: events.length }} />
+  return <Workbench workspaceId="w1" project={null} view={tabs.inspectorTab} onView={(view) => patchTabs({ inspectorTab: view })} views={tabs.inspectorViews} onViews={(views) => patchTabs({ inspectorViews: views })} files={files} events={events} expanded={false} onClose={() => {}} context={{ meta: null, stream: 'open', sessionId: 's1', sessionFolder: null, eventCount: events.length }} />
 }
-/** Seed the persisted strip the app would have loaded before the probe mounts. */
+/** Seed the persisted per-session strip the app would have loaded before the probe mounts. */
 function seedWorkbench(inspectorTab: WorkbenchView, inspectorViews: readonly WorkbenchView[]) {
-  window.localStorage.setItem(WORKBENCH_STORAGE_KEY, JSON.stringify({ ...WORKBENCH_DEFAULTS, inspectorTab, inspectorViews }))
+  window.localStorage.setItem(WORKBENCH_TABS_STORAGE_KEY, JSON.stringify({
+    'w1:s1': { inspectorTab, inspectorViews },
+  }))
 }
 const composerBase = { onDraft: () => {}, onSend: () => {}, onStop: () => {}, modelValue: 'p/m', modes: [], modeValue: null, onMode: () => {} }
 
@@ -139,6 +142,24 @@ describe('mounted production controls', () => {
     expect(send).toHaveBeenCalledTimes(1)
     expect(host.querySelector('button[aria-label="Send"]')).toBeNull()
   })
+  it('while running, Enter queues; Ctrl/Cmd+Enter and the Steer button steer', async () => {
+    const send = vi.fn()
+    await mount(<ToastHost><Composer {...composerBase} connected running draft={textDraft('do this instead')} onSend={send} /></ToastHost>)
+    const input = host.querySelector<HTMLElement>('[data-composer-input]')!
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true })))
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', metaKey: true, bubbles: true })))
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label^="Steer"]')!.click())
+    expect(send.mock.calls.map((call) => call[0])).toEqual(['queue', 'steer', 'steer', 'steer'])
+  })
+  it('idle, Ctrl+Enter is a plain send and no Steer button is shown', async () => {
+    const send = vi.fn()
+    await mount(<ToastHost><Composer {...composerBase} connected running={false} draft={textDraft('hello')} onSend={send} /></ToastHost>)
+    expect(host.querySelector('button[aria-label^="Steer"]')).toBeNull()
+    const input = host.querySelector<HTMLElement>('[data-composer-input]')!
+    await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true })))
+    expect(send).toHaveBeenCalledWith('queue')
+  })
   it('while running with an empty draft only Stop is offered', async () => {
     await mount(<ToastHost><Composer {...composerBase} connected running draft={emptyDraft} /></ToastHost>)
     expect(host.querySelector('button[aria-label="Stop work"]')).not.toBeNull()
@@ -160,7 +181,8 @@ describe('mounted production controls', () => {
     await act(async () => host.querySelector('button')!.click())
     expect(host.querySelector('button')?.getAttribute('aria-expanded')).toBe('true')
     expect(host.textContent).toContain('lỗi từ công cụ <raw>')
-    expect(host.querySelector('pre')?.textContent).toContain('C:/Dự án')
+    await act(async () => button('View call details').click())
+    expect(host.querySelector('pre[aria-label="Arguments"]')?.textContent).toContain('C:/Dự án')
   })
 })
 
@@ -254,45 +276,48 @@ describe('transcript grouping', () => {
 
 describe('activity block summary', () => {
   const toolRow = (id: string, name: string, ok = true): Extract<ViewItem, { kind: 'tool' }> => ({
-    kind: 'tool', call: { id, name, args: { path: `app/Services/Deep/Nested/${id}.php` } }, result: { ok, output: 'x' }, ts: 0, doneAt: 5,
+    kind: 'tool', call: { id, name, args: name === 'Grep' ? { pattern: id } : name === 'Bash' ? { command: `echo ${id}` } : { path: `app/Services/Deep/Nested/${id}.php` } }, result: { ok, output: 'x' }, ts: 0, doneAt: 5,
   })
+  const toggles = () => host.querySelectorAll('button[aria-expanded]')
   it('collapses a settled run into one summary line and expands on demand', async () => {
     const rows = ['a', 'b', 'c', 'd'].map((id) => toolRow(id, id === 'd' ? 'Grep' : 'Read'))
     await mount(<ActivityBlock items={rows}>{rows.map((row) => <ToolCard key={row.call.id} item={row} />)}</ActivityBlock>)
     const header = host.querySelector('button')!
-    expect(header.textContent).toContain('4 steps')
-    expect(header.textContent).toContain('Read (3)')
-    expect(header.textContent).toContain('Grep')
+    expect(header.textContent).toContain('Explore')
+    expect(header.textContent).toContain('3 files, 1 search')
     expect(header.getAttribute('aria-expanded')).toBe('false')
     // Collapsed means collapsed: the rows themselves are not in the document.
     expect(host.querySelectorAll('button').length).toBe(1)
     await act(async () => header.click())
     expect(host.querySelector('button')?.getAttribute('aria-expanded')).toBe('true')
-    expect(host.querySelectorAll('button').length).toBe(5)
+    // The header and the one row that opens; the clean reads are lines, not toggles.
+    expect(toggles().length).toBe(2)
+    expect(host.textContent).toContain('c.php')
   })
   it('keeps a run open, and says how many rows need attention, when one failed', async () => {
     const rows = [toolRow('a', 'Read'), toolRow('b', 'Read'), toolRow('c', 'Bash', false), toolRow('d', 'Read')]
     await mount(<ActivityBlock items={rows}>{rows.map((row) => <ToolCard key={row.call.id} item={row} />)}</ActivityBlock>)
     const header = host.querySelector('button')!
     expect(header.getAttribute('aria-expanded')).toBe('true')
-    expect(header.textContent).toContain('1 to inspect')
+    expect(header.textContent).toContain('1 failed')
   })
   it('leaves a short run alone — no summary to hide three rows behind', async () => {
     const rows = [toolRow('a', 'Read'), toolRow('b', 'Read'), toolRow('c', 'Read')]
     await mount(<ActivityBlock items={rows}>{rows.map((row) => <ToolCard key={row.call.id} item={row} />)}</ActivityBlock>)
-    expect(host.textContent).not.toContain('3 steps')
-    expect(host.querySelectorAll('button').length).toBe(3)
+    expect(host.textContent).not.toContain('Explore')
+    expect(host.textContent).toContain('a.php')
+    expect(host.textContent).toContain('c.php')
   })
-  it('counts calls as steps, ignores reasoning rows, and nests the open run behind a guide', async () => {
+  it('counts calls, ignores reasoning rows, and nests the open run behind a rail', async () => {
     const rows = [toolRow('a', 'Read'), toolRow('b', 'Read'), toolRow('c', 'Grep'), toolRow('d', 'Grep')]
     const items = [...rows, { kind: 'assistant' as const, content: '', live: false, thinking: ['why'], thinkingLive: false }]
     await mount(<ActivityBlock items={items}>{rows.map((row) => <ToolCard key={row.call.id} item={row} />)}</ActivityBlock>)
     const header = host.querySelector('button')!
-    expect(header.textContent).toContain('4 steps')
+    expect(header.textContent).toContain('2 files, 2 searches')
     await act(async () => header.click())
     const body = document.getElementById(header.getAttribute('aria-controls')!)!
     expect(body.className).toContain('border-l')
-    expect(body.className).toContain('pl-3')
+    expect(body.className).toContain('pl-3.5')
   })
   it('summarizes a running run as running, whatever settled before it', () => {
     const summary = summarizeActivity([
@@ -302,14 +327,14 @@ describe('activity block summary', () => {
     expect(summary.state).toBe('running')
     expect(summary.live).toBe(true)
     expect(summary.problems).toBe(1)
+    expect(summary.kind).toBe('Working')
   })
-  it('shortens a deep path to its tail and keeps the exact target on hover', async () => {
+  it('keeps the folder quiet beside the file and the exact target on hover', async () => {
     await mount(<ToolCard item={toolRow('a', 'Read')} />)
-    const head = host.querySelector('button')!
-    expect(head.textContent).toContain('a.php')
-    const detail = host.querySelector('span[title]')!
-    expect(detail.textContent).toBe('app/Services/Deep/Nested')
-    expect(detail.getAttribute('title')).toBe('app/Services/Deep/Nested/a.php')
+    const line = host.firstElementChild as HTMLElement
+    expect(line.textContent).toContain('a.php')
+    expect(line.textContent).toContain('app/Services/Deep/Nested')
+    expect(line.getAttribute('title')).toBe('app/Services/Deep/Nested/a.php')
   })
 })
 
@@ -317,82 +342,115 @@ describe('tool row facts', () => {
   const row = (name: string, args: Record<string, unknown>, result?: { ok: boolean; output: string }): Extract<ViewItem, { kind: 'tool' }> => ({
     kind: 'tool', call: { id: 'c1', name, args }, ts: 0, doneAt: 12, ...(result !== undefined ? { result } : {}),
   })
-  it('leads a running call with the state spinner and its glyph once settled', async () => {
+  const line = () => (host.querySelector('button[aria-expanded]') ?? host.firstElementChild!) as HTMLElement
+  it('says a running call is running in its own words, and stops once it settles', async () => {
     await mount(<ToolCard item={row('Read', { path: 'src/harness/tools/service.ts' })} />)
     // A running row must say so on its own, not through the sidebar alone.
-    expect(host.querySelector('.animate-spin-slow')).not.toBeNull()
-    expect(host.querySelector('button')!.textContent).toContain('service.ts')
+    expect(line().textContent).toContain('Reading')
+    expect(line().querySelector('.text-shimmer')).not.toBeNull()
+    expect(line().textContent).toContain('service.ts')
     await mount(<ToolCard item={row('Read', { path: 'src/harness/tools/service.ts' }, { ok: true, output: 'a\nb\nc' })} />)
-    expect(host.querySelector('.animate-spin-slow')).toBeNull()
+    expect(line().querySelector('.text-shimmer')).toBeNull()
+    expect(line().textContent).toMatch(/^Read/)
   })
-  it('says which lines were read and how many came back, with the row still closed', async () => {
+  it('names the lines a read covered, with nothing to click open', async () => {
     await mount(<ToolCard item={row('Read', { path: 'src/harness/tools/service.ts', offset: 100, limit: 61 }, { ok: true, output: 'a\nb\nc' })} />)
-    const head = host.querySelector('button')!
-    expect(head.getAttribute('aria-expanded')).toBe('false')
-    expect(head.textContent).toContain('service.ts:100-160')
-    expect(head.textContent).toContain('src/harness/tools')
-    expect(head.textContent).toContain('3 lines')
+    expect(host.querySelector('button[aria-expanded]')).toBeNull()
+    expect(line().textContent).toContain('service.ts:100-160')
+    expect(line().textContent).toContain('src/harness/tools')
   })
-  it('puts a failure on the row instead of behind a click', async () => {
+  it('puts a failure on the row instead of behind a click, its reason on hover', async () => {
     await mount(<ToolCard item={row('Read', { path: 'docs/missing.md' }, { ok: false, output: 'no such file: docs/missing.md\ncheck the path' })} />)
-    const digest = [...host.querySelectorAll('span')].find((span) => span.textContent === 'no such file: docs/missing.md')!
-    expect(digest).not.toBeUndefined()
-    expect(digest.className).toContain('text-bad')
+    const status = [...line().querySelectorAll('span')].find((span) => span.textContent === 'Failed')!
+    expect(status.className).toContain('text-bad')
+    expect(status.getAttribute('title')).toBe('no such file: docs/missing.md')
   })
   it('reports a non-zero exit as bad while the recorded outcome stays what the log says', async () => {
     await mount(<ToolCard item={row('Bash', { command: 'npm test -- tools' }, { ok: true, output: '1 failing\n[exit code: 1]' })} />)
-    const head = host.querySelector('button')!
-    expect(head.textContent).toContain('npm test -- tools')
-    expect(head.textContent).toContain('Succeeded')
-    expect([...host.querySelectorAll('span')].find((span) => span.textContent === 'exit 1')?.className).toContain('text-bad')
+    expect(line().textContent).toContain('npm test -- tools')
+    expect(line().textContent).not.toContain('Failed')
+    expect([...line().querySelectorAll('span')].find((span) => span.textContent === 'Exit 1')?.className).toContain('text-bad')
   })
-  it('opens an edit as replaced/replacement text while copy keeps the exact payload', async () => {
+  it('opens an edit as a diff while copy keeps the exact replacement', async () => {
     await mount(<ToolCard item={row('Edit', { path: 'web/lib/format.ts', old: 'const a = 1', new: 'const a = 2' }, { ok: true, output: 'edited web/lib/format.ts' })} />)
-    const head = host.querySelector('button')!
-    expect(head.textContent).toContain('format.ts')
-    expect(head.textContent).toContain('web/lib')
-    expect(head.textContent).not.toContain('Edit')
-    const added = [...head.querySelectorAll('span')].find((span) => span.textContent === '+1')
-    const removed = [...head.querySelectorAll('span')].find((span) => span.textContent === '−1')
+    expect(line().textContent).toContain('format.ts')
+    expect(line().textContent).toContain('web/lib')
+    // The row leads with what was done, in words, then the file it was done to.
+    expect(line().textContent).toMatch(/^Edited.*format\.ts/)
+    const added = [...line().querySelectorAll('span')].find((span) => span.textContent === '+1')
+    const removed = [...line().querySelectorAll('span')].find((span) => span.textContent === '−1')
     expect(added?.className).toContain('text-ok')
     expect(removed?.className).toContain('text-bad')
-    await act(async () => host.querySelector('button')!.click())
-    const blocks = [...host.querySelectorAll('pre')].map((pre) => pre.textContent)
-    expect(blocks).toContain('const a = 1')
-    expect(blocks).toContain('const a = 2')
-    // The JSON block holds the short arguments; its copy holds all of them.
-    expect(blocks[0]).toContain('"path": "web/lib/format.ts"')
-    expect(blocks[0]).not.toContain('const a = 1')
-    expect(host.querySelector('button[aria-label="Copy Arguments"]')).not.toBeNull()
-    expect(host.textContent).toContain('Output · 1 line')
+    await act(async () => line().click())
+    const diff = host.querySelector('[role="region"][aria-label="Diff of web/lib/format.ts"]')!
+    expect(diff.textContent).toContain('const a = 1')
+    expect(diff.textContent).toContain('const a = 2')
   })
   it('hands the workbench the window the call read, not just the file', async () => {
     const openPath = vi.fn(() => () => {})
     await mount(<ToolCard item={row('Read', { path: 'src/index.ts', offset: 20, limit: 5 }, { ok: true, output: 'x' })} openPath={openPath} />)
     expect(openPath).toHaveBeenCalledWith('src/index.ts', { line: 20, lines: 5 })
   })
-  it('names an MCP tool without the prefix its server chip already carries', async () => {
+  it('names an MCP tool by its server and its own name, never the prefix', async () => {
     await mount(<ToolCard item={{ ...row('mcp__linear__create_issue', { title: 'Fix the row' }, { ok: true, output: 'created ENG-42' }), server: 'linear' }} />)
-    const head = host.querySelector('button')!
-    expect(head.textContent).toContain('create_issue')
-    expect(head.textContent).not.toContain('mcp__')
-    expect(head.textContent).toContain('created ENG-42')
+    expect(line().textContent).toContain('linear')
+    expect(line().textContent).toContain('create_issue')
+    expect(line().textContent).not.toContain('mcp__')
+    await act(async () => line().click())
+    expect(host.querySelector('pre[aria-label="Tool output"]')?.textContent).toBe('created ENG-42')
   })
 })
 
-describe('failed request card', () => {
-  it('states the failure once, humanizes it, and keeps the raw response one click away', async () => {
+describe('failed request line', () => {
+  it('stays one quiet line: the raw reason, a retry, nothing else', async () => {
     const retry = vi.fn()
     await mount(<StatusLine reason="provider: Failed to fetch" onRetry={retry} />)
-    const card = host.querySelector('[role="alert"]')!
-    expect(card.textContent).toContain('Request failed.')
-    expect(card.textContent).toContain(errorSummary('provider: Failed to fetch'))
-    expect(card.textContent).toContain('Nothing was executed, so retrying is safe.')
-    // The raw reason stays available, but not spread across the transcript.
-    expect(card.querySelector('details')?.hasAttribute('open')).toBe(false)
-    expect(card.querySelector('pre')?.textContent).toBe('provider: Failed to fetch')
+    const alert = host.querySelector('[role="alert"]')!
+    expect(alert.textContent).toContain('provider: Failed to fetch')
+    expect(alert.textContent).not.toContain('Request failed.')
+    expect(alert.querySelector('details')).toBeNull()
     await act(async () => button('Retry').click())
     expect(retry).toHaveBeenCalledTimes(1)
+  })
+  it('asks before retrying a turn whose tools already ran', async () => {
+    const retry = vi.fn()
+    await mount(<StatusLine reason="provider: boom" onRetry={retry} toolsRan />)
+    expect(button('Retry').title).toContain('may repeat')
+    await act(async () => button('Retry').click())
+    expect(retry).not.toHaveBeenCalled()
+    // The dialog renders through a portal, outside the mounted host.
+    const confirm = [...document.querySelectorAll('button')].find((b) => b.textContent === 'Retry anyway')
+    expect(confirm).toBeDefined()
+    await act(async () => confirm!.click())
+    expect(retry).toHaveBeenCalledTimes(1)
+  })
+  it('a steered turn reads as redirected, not as a failure', async () => {
+    await mount(<StatusLine reason="steered" />)
+    expect(host.textContent).toContain('Redirected')
+    expect(host.querySelector('[role="alert"]')).toBeNull()
+  })
+})
+
+describe('queued input bubble', () => {
+  it('a queued message offers Send now; a steered one says it is stopping the turn', async () => {
+    const sendNow = vi.fn()
+    await mount(<UserBubble item={{ kind: 'user', content: 'Later', queued: true, inputId: 'i' }} onSendNow={sendNow} running />)
+    await act(async () => button('Send now').click())
+    expect(sendNow).toHaveBeenCalledTimes(1)
+    await mount(<UserBubble item={{ kind: 'user', content: 'Now', queued: true, inputId: 's', steer: true }} onSendNow={sendNow} running />)
+    expect(host.textContent).toContain('Steering')
+    expect([...host.querySelectorAll('button')].some((b) => b.textContent === 'Send now')).toBe(false)
+  })
+  it('a steer stranded by a restart is plain queued input with Send now', async () => {
+    await mount(<UserBubble item={{ kind: 'user', content: 'Now', queued: true, inputId: 's', steer: true }} onSendNow={vi.fn()} running={false} />)
+    expect(host.textContent).not.toContain('Steering')
+    expect(button('Send now')).toBeDefined()
+  })
+  it('a rejected input reads Not sent and can be reused', async () => {
+    const reuse = vi.fn()
+    await mount(<UserBubble item={{ kind: 'user', content: 'Blocked', queued: false, notSent: 'rejected' }} onReuse={reuse} />)
+    expect(host.textContent).toContain('Not sent')
+    expect(host.textContent).not.toContain('Queued')
   })
 })
 
@@ -529,9 +587,8 @@ describe('transcript truthfulness', () => {
   })
   it('renders a recovered tool result as unknown, never failed', async () => {
     await mount(<ToolCard item={{ kind: 'tool', call: { id: 'c', name: 'Bash', args: { command: 'npm install' } }, result: { ok: true, output: 'partial output' }, recovered: true }} />)
-    expect(host.textContent).toContain('Outcome unknown')
+    expect(host.textContent).toContain('Unknown')
     expect(host.textContent).not.toContain('Failed')
-    expect(host.textContent).toContain('recovered')
     await act(async () => host.querySelector('button')!.click())
     const note = host.querySelector('[role="note"]')
     expect(note?.textContent).toContain('Outcome unknown — the host restarted')
@@ -539,15 +596,16 @@ describe('transcript truthfulness', () => {
   })
   it('carries the MCP server chip parsed from the mcp__server__tool call name', async () => {
     await mount(<ToolCard item={{ kind: 'tool', call: { id: 'c', name: 'mcp__docs__search', args: { q: 'x' } }, result: { ok: true, output: 'hit' }, server: 'docs' }} />)
-    expect([...host.querySelectorAll('span')].some(chip => chip.textContent === 'docs')).toBe(true)
+    expect([...host.querySelectorAll('span')].some(span => span.textContent === 'docs')).toBe(true)
   })
   it('shows the delegation timeline and opens the child conversation', async () => {
     const onOpen = vi.fn()
     await mount(<DelegationCard item={{ kind: 'delegation', childSessionId: 'child-1', definition: 'explorer', brief: 'Map auth modules', status: 'completed' }} workspaceId={null} onOpen={onOpen} />)
     const head = host.querySelector('button')!
-    expect(head.textContent).toContain('Delegated to explorer')
+    expect(head.textContent).toMatch(/^Delegated.*explorer/)
     expect(head.textContent).toContain('Map auth modules')
-    expect(head.textContent).toContain('Succeeded')
+    // A clean finish adds nothing to the row.
+    expect(head.textContent).not.toMatch(/Failed|Stopped|Interrupted/)
     await act(async () => head.click())
     expect(host.textContent).toContain('Brief')
     await act(async () => button('Open conversation').click())
@@ -555,7 +613,7 @@ describe('transcript truthfulness', () => {
   })
   it('keeps a running delegation silent about its result until settled', async () => {
     await mount(<DelegationCard item={{ kind: 'delegation', childSessionId: 'child-2', definition: 'coder', brief: 'Fix', status: 'running' }} workspaceId={null} onOpen={() => {}} />)
-    expect(host.textContent).toContain('Running')
+    expect(host.querySelector('.text-shimmer')?.textContent).toBe('Delegating')
     await act(async () => host.querySelector('button')!.click())
     expect(host.textContent).not.toContain('Result (')
   })
@@ -850,14 +908,23 @@ describe('sidebar sections + live rows + workspace management', () => {
     onFilter: () => {}, onSelect: () => {}, onNew: () => {}, onNewInProject: () => {}, onRename: () => {}, onDeleteRequest: () => {}, onOpenSettings: () => {},
     notifyEnabled: false, notifyBlocked: false, onToggleNotify: () => {}, theme: 'system', onTheme: () => {}, onClose: () => {},
   })
-  it('groups by project with running counts and renders loose conversations without a bucket header', async () => {
+  it('groups by project and renders loose conversations without a bucket header', async () => {
     await mount(<SessionList sessions={[...sessions]} projects={[project]} current={null} filter="" liveRunning={false} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} onNewInProject={() => {}} />)
     expect(host.textContent).toContain('Acme')
-    expect(host.textContent).toContain('1running')
+    // The folder header stays clean: running state lives on the session row's
+    // leading spinner, not as a count badge on the folder.
+    expect(host.textContent).not.toContain('running')
     expect(host.textContent).not.toContain('Chats')
     expect(host.textContent).toContain('Loose chat')
     expect(host.textContent).toContain('working with model')
     expect(host.textContent).toContain('2 queued')
+  })
+  it('leads a working conversation row with its spinner, ahead of the title', async () => {
+    await mount(<SessionList sessions={[...sessions]} projects={[project]} current={null} filter="" liveRunning={false} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} onNewInProject={() => {}} />)
+    const row = [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('Auth refactor'))!
+    const text = row.textContent ?? ''
+    expect(text.indexOf('working with model')).toBeGreaterThan(-1)
+    expect(text.indexOf('working with model')).toBeLessThan(text.indexOf('Auth refactor'))
   })
   it('collapses any project group on toggle, including the one holding the open conversation', async () => {
     await mount(<SessionList sessions={[...sessions]} projects={[project]} current="s1" filter="" liveRunning={false} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} onNewInProject={() => {}} />)
@@ -875,6 +942,19 @@ describe('sidebar sections + live rows + workspace management', () => {
     expect(host.textContent).toContain('Unrelated title')
     expect(host.textContent).not.toContain('Auth refactor')
   })
+  it('marks a folder with a terminal icon while a shell is open in it', async () => {
+    await mount(<SessionList sessions={[...sessions]} projects={[project]} current={null} filter="" liveRunning={false} terminalProjects={new Set(['p1'])} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} />)
+    expect(host.querySelector('span[title="Terminal or background process active in this folder"]')).not.toBeNull()
+  })
+  it('marks a folder whose conversation runs a background process even without a shell', async () => {
+    const processing = { id: 's5', title: 'Long build', projectId: 'p1', status: 'idle' as const, pendingInputs: 0, runningProcesses: 1, ...base }
+    await mount(<SessionList sessions={[processing]} projects={[project]} current={null} filter="" liveRunning={false} terminalProjects={new Set<string>()} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} />)
+    expect(host.querySelector('span[title="Terminal or background process active in this folder"]')).not.toBeNull()
+  })
+  it('leaves a quiet folder unmarked when no shell and no background process', async () => {
+    await mount(<SessionList sessions={[...sessions]} projects={[project]} current={null} filter="" liveRunning={false} terminalProjects={new Set<string>()} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} />)
+    expect(host.querySelector('span[title="Terminal or background process active in this folder"]')).toBeNull()
+  })
   it('lifts pinned conversations above every folder and offers unpinning on the row', async () => {
     const list = [...sessions, { id: 's9', title: 'Kept handy', projectId: 'p1', pinned: true, status: 'idle' as const, pendingInputs: 0, ...base }]
     const togglePinned = vi.fn()
@@ -885,6 +965,38 @@ describe('sidebar sections + live rows + workspace management', () => {
     await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Options for Kept handy"]')!.click())
     await act(async () => bodyButton('Unpin').click())
     expect(togglePinned).toHaveBeenCalledWith('s9', false)
+  })
+  it('hides subagent conversations from the sidebar entirely, expanded or searched', async () => {
+    const onSelect = vi.fn()
+    const list = [...sessions, { id: 'c1', title: 'Explore repo', projectId: 'p1', status: 'running' as const, parentSessionId: 's1', pendingInputs: 0, ...base }]
+    await mount(<SessionList sessions={list} projects={[project]} current="c1" filter="" liveRunning={false} onSelect={onSelect} onRename={() => {}} onDeleteRequest={() => {}} />)
+    // No toggle row, no child row, and the open child adds nothing either —
+    // subagents are reached from their parent's own view instead.
+    expect(host.textContent).not.toContain('Subagents')
+    expect(host.textContent).not.toContain('Explore repo')
+    await mount(<SessionList sessions={list} projects={[project]} current={null} filter="explore" liveRunning={false} onSelect={onSelect} onRename={() => {}} onDeleteRequest={() => {}} />)
+    expect(host.textContent).not.toContain('Explore repo')
+  })
+  it('reads a subagent conversation as a parent → sub breadcrumb trail in the header', async () => {
+    const onSelect = vi.fn()
+    await mount(
+      <ChatHeader
+        sidebarVisible
+        stream="open"
+        workbenchOpen={false}
+        scopeControl={<span>scope</span>}
+        title="Explore repo"
+        parent={{ title: 'Auth refactor', onSelect }}
+        onOpenSidebar={() => {}}
+        onNew={() => {}}
+        onToggleWorkbench={() => {}}
+      />,
+    )
+    const parentButton = [...host.querySelectorAll('button')].find((b) => b.textContent === 'Auth refactor')!
+    expect(parentButton).toBeTruthy()
+    expect(host.textContent).toContain('Explore repo')
+    await act(async () => parentButton.click())
+    expect(onSelect).toHaveBeenCalledTimes(1)
   })
   it('sorts conversations alphabetically from the sidebar sort menu', async () => {
     const base = { updatedAt: Date.now(), eventCount: 3, folder: null }
@@ -1042,9 +1154,11 @@ describe('per-folder show more', () => {
     await mount(<SessionList {...props} current={null} />)
     expect(host.textContent).toContain('Topic 5')
     expect(host.textContent).not.toContain('Topic 6')
+    expect(button('Show more').getAttribute('aria-expanded')).toBe('false')
     await act(async () => button('Show more').click())
     expect(host.textContent).toContain('Topic 6')
     expect(host.textContent).toContain('Topic 7')
+    expect(button('Show less').getAttribute('aria-expanded')).toBe('true')
     await act(async () => button('Show less').click())
     expect(host.textContent).not.toContain('Topic 6')
     expect(host.textContent).toContain('Topic 5')
@@ -1054,9 +1168,36 @@ describe('per-folder show more', () => {
     expect(host.textContent).toContain('Topic 7')
     expect(host.textContent).not.toContain('Show more')
   })
-  it('shows the open conversation even when it sits past the cut', async () => {
+  it('shows the open conversation past the cut without spilling the rest of the folder', async () => {
     await mount(<SessionList {...props} current="m6" />)
     expect(host.textContent).toContain('Topic 6')
+    // Grafted onto the preview, not a forced full expansion.
+    expect(host.textContent).not.toContain('Topic 7')
+    expect(button('Show more')).toBeTruthy()
+  })
+  it('keeps an explicit expansion sticky when the selection moves on', async () => {
+    await mount(<SessionList {...props} current={null} />)
+    await act(async () => button('Show more').click())
+    await act(async () => root!.render(<SessionList {...props} current="m2" />))
+    expect(host.textContent).toContain('Topic 7')
+  })
+  it('keeps an explicit expansion after a search comes and goes', async () => {
+    await mount(<SessionList {...props} current={null} />)
+    await act(async () => button('Show more').click())
+    await act(async () => root!.render(<SessionList {...props} current={null} filter="Topic 7" />))
+    expect(host.textContent).toContain('Topic 7')
+    await act(async () => root!.render(<SessionList {...props} current={null} filter="" />))
+    expect(host.textContent).toContain('Topic 7')
+  })
+  it('reports expansion upward so the app shell keeps it across remounts', async () => {
+    const onExpandFolder = vi.fn()
+    await mount(<SessionList {...props} current={null} expandedFolders={{}} onExpandFolder={onExpandFolder} />)
+    await act(async () => button('Show more').click())
+    expect(onExpandFolder).toHaveBeenCalledWith('pf', true)
+    // Simulates the shell remounting the sidebar with its persisted map.
+    await mount(<SessionList {...props} current={null} expandedFolders={{ pf: true }} />)
+    expect(host.textContent).toContain('Topic 7')
+    expect(button('Show less')).toBeTruthy()
   })
 })
 
@@ -1250,11 +1391,10 @@ describe('workbench files', () => {
     const opened = vi.fn()
     const item = { kind: 'tool' as const, call: { id: 'c', name: 'Read', args: { path: 'C:/acme/src/index.ts' } }, result: { ok: true, output: 'x' } }
     await mount(<ToolCard item={item} openPath={() => opened} />)
-    await act(async () => host.querySelector('button')!.click())
-    await act(async () => button('in workbench').click())
+    await act(async () => (host.querySelector('button[title="Open C:/acme/src/index.ts in workbench"]') as HTMLButtonElement).click())
     expect(opened).toHaveBeenCalledTimes(1)
     await mount(<ToolCard item={item} openPath={() => null} />)
-    await act(async () => host.querySelector('button')!.click())
-    expect(host.textContent).not.toContain('in workbench')
+    expect(host.querySelector('button')).toBeNull()
+    expect(host.textContent).toContain('index.ts')
   })
 })

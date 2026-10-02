@@ -117,7 +117,7 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
       fontSize: 12,
       theme: themeFromTokens(),
       cursorBlink: true,
-      scrollback: 5_000,
+      scrollback: 2_000,
     })
     const fit = new FitAddon()
     term.loadAddon(fit)

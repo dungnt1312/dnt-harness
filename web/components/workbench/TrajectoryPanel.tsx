@@ -24,6 +24,7 @@ const OUTCOME_LABEL: Readonly<Record<TurnOutcome, string>> = {
   completed: 'Completed',
   failed: 'Failed',
   cancelled: 'Cancelled',
+  steered: 'Redirected',
   interrupted: 'Interrupted',
   rejected: 'Rejected',
   empty: 'Empty',

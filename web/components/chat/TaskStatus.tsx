@@ -5,7 +5,7 @@ import { taskPhase, type TaskPhase } from '../../lib/project.ts'
 import type { SseEvent } from '../../lib/types.ts'
 import { todosFromEvents } from '../../lib/todos-view.ts'
 
-const LABELS: Record<TaskPhase, string> = { idle: 'Ready', preparing: 'Preparing · submitting or queued', running: 'Working', waiting: 'Approval required', completed: 'Completed', failed: 'Failed', interrupted: 'Interrupted', cancelled: 'Stopped', rejected: 'Request rejected', empty: 'Ended without a response', limit: 'Turn limit reached' }
+const LABELS: Record<TaskPhase, string> = { idle: 'Ready', preparing: 'Preparing · submitting or queued', held: 'Stopped · queued messages are waiting', running: 'Working', waiting: 'Approval required', completed: 'Completed', failed: 'Failed', interrupted: 'Interrupted', cancelled: 'Stopped', steered: 'Redirected', rejected: 'Request rejected', empty: 'Ended without a response', limit: 'Turn limit reached' }
 
 /**
  * Slim lifecycle line above the composer. Durable phase and connection loss
@@ -33,7 +33,7 @@ export function TaskStatus({ events, pending, sending, connected }: { readonly e
         <div className="flex flex-wrap items-center gap-2">
           {busy ? <Spinner size={12} /> : <Icon name={phase === 'waiting' ? 'shield' : 'info'} size={14} className={phase === 'waiting' ? 'text-warn' : undefined} />}
           <strong className={busy ? 'font-medium text-shimmer' : 'font-medium text-fg'}>{phaseLabel}</strong>
-          {phase === 'preparing' ? <span>Queued input does not run automatically after a restart.</span> : null}
+          {phase === 'held' ? <span>They do not run on their own after a stop or restart — use Send now on a queued message.</span> : null}
         </div>
       ) : null}
       {!connected ? (

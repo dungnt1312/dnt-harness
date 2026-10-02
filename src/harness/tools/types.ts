@@ -72,6 +72,11 @@ export interface ToolExecution {
   readonly sessionId?: SessionId
   /** Host-owned transient file observations, scoped by session. */
   readonly observations?: FileObservations
+  /**
+   * Sessions whose file observations this run may consult read-only (a
+   * child agent's parent). The content-hash check still applies.
+   */
+  readonly observationParents?: readonly SessionId[]
   /** Host-owned durable identity; the model call id is transcript metadata only. */
   readonly executionId?: ExecutionId
   readonly toolCallId?: string

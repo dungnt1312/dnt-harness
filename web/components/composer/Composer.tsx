@@ -92,7 +92,7 @@ const pastedTextFile = (text: string, date = new Date()): File => {
  * be put back inline; ArrowUp on an empty draft recalls the last message.
  */
 export function Composer({
-  workspaceId = null, modelControl, contextControl, connected, sending = false, running,
+  workspaceId = null, modelControl, contextControl, connected, sending = false, running, sendBlocked,
   draft, onDraft, onSend, onStop, onCommand,
   modelValue, thinkingValue = null, modelSettings, onThinking, thinkingMenuLabel, thinkingDisabled = false,
   controlsUnavailable = false, controlsUnavailableMessage, onRetryControls,
@@ -107,9 +107,16 @@ export function Composer({
   readonly sending?: boolean
   readonly connected: boolean
   readonly running: boolean
+  /**
+   * A hard host-level block: this conversation cannot accept messages at all
+   * (a subagent is executor-managed). Send is disabled and the reason is
+   * always shown, not just after a blocked attempt.
+   */
+  readonly sendBlocked?: string
   readonly draft: RichDraft
   readonly onDraft: (draft: RichDraft) => void
-  readonly onSend: () => void
+  /** `steer` stops the running turn and runs the queue now (Ctrl/Cmd+Enter while running). */
+  readonly onSend: (delivery?: 'queue' | 'steer') => void
   readonly onStop: () => void
   /** A built-in command was picked: the host executes it at once; nothing lands in the draft. */
   readonly onCommand?: (name: string) => void
@@ -170,7 +177,8 @@ export function Composer({
   const empty = draftIsEmpty(draft)
   const oversized = useMemo(() => utf8Bytes(draftText(draft)) > SAFE_MODEL_VISIBLE_BYTES, [draft])
   const uploading = uploads.pending > 0
-  const eligible = !empty && connected && !missingModel && !controlsUnavailable && !uploading && !oversized
+  const sendBlockedReason = sendBlocked ?? null
+  const eligible = !empty && connected && !missingModel && !controlsUnavailable && !uploading && !oversized && sendBlockedReason === null
 
   // A draft we did not emit replaced ours (sent, recalled, switched
   // conversation): in-flight uploads and paste offers belong to the old one.
@@ -370,11 +378,12 @@ export function Composer({
         ? 'Cannot send until files finish uploading.'
         : null
 
-  const submit = (): void => {
+  const submit = (delivery: 'queue' | 'steer' = 'queue'): void => {
     if (sending) return
     if (!eligible) { setBlockedAttempt(true); return }
     setBlockedAttempt(false)
-    onSend()
+    // Steer only means something while a turn runs; idle, it is a plain send.
+    onSend(running ? delivery : 'queue')
   }
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
@@ -415,7 +424,8 @@ export function Composer({
 
     if (event.key === 'Enter' && (!event.shiftKey || event.ctrlKey || event.metaKey)) {
       event.preventDefault()
-      submit()
+      // Enter queues; Ctrl/Cmd+Enter steers (stop + run now) while running.
+      submit(event.ctrlKey || event.metaKey ? 'steer' : 'queue')
     }
   }
 
@@ -423,6 +433,9 @@ export function Composer({
 
   const showBlocked = blockedAttempt && blockedReason !== null
   const notices: ComposerNotice[] = []
+  // The hard block explains itself up front: a disabled button with no
+  // visible reason reads as a broken composer.
+  if (sendBlockedReason !== null) notices.push({ key: 'send-blocked', tone: 'info', text: sendBlockedReason })
   if (missingModel) notices.push({ key: 'model', id: modelHintId, tone: 'warn', text: 'Configure a provider in Settings to send messages.' })
   if (oversized) notices.push({ key: 'oversized', tone: 'bad', text: OVERSIZED_MESSAGE })
   if (blockedAttempt && blockedReason !== null) notices.push({ key: 'blocked', id: hintId, tone: 'warn', text: blockedReason, onDismiss: () => setBlockedAttempt(false) })
@@ -446,13 +459,15 @@ export function Composer({
   }
   const describedBy = [missingModel ? modelHintId : null, showBlocked ? hintId : null].filter((id) => id !== null).join(' ')
 
-  const placeholder = missingModel
-    ? 'Draft now — configure a provider in Settings to send…'
-    : running
-      ? 'Queue a follow-up…'
-      : !connected
-        ? 'Reconnecting — your draft is kept…'
-        : 'Ask anything'
+  const placeholder = sendBlockedReason !== null
+    ? 'Read-only — this conversation cannot receive messages'
+    : missingModel
+      ? 'Draft now — configure a provider in Settings to send…'
+      : running
+        ? 'Queue a follow-up…'
+        : !connected
+          ? 'Reconnecting — your draft is kept…'
+          : 'Ask anything'
   const modelId = modelValue !== null ? decodeModelChoice(modelValue)?.model ?? null : null
 
   return (
@@ -568,6 +583,21 @@ export function Composer({
               className="flex size-9 shrink-0 items-center justify-center rounded-full border border-line-strong text-fg hover:bg-hover"
             >
               <Icon name="square" size={16} />
+            </button>
+          ) : null}
+          {running && !empty ? (
+            // Steer: stop the running turn, then run the queue with this
+            // message last. Outlined so Queue stays the default action.
+            <button
+              type="button"
+              aria-label="Steer — stop the current turn and send now"
+              title="Steer — stop the current turn and send now (Ctrl/⌘+Enter)"
+              disabled={!eligible || sending}
+              onClick={() => submit('steer')}
+              className="flex min-h-9 shrink-0 items-center justify-center gap-1.5 rounded-full border border-line-strong px-3 text-fg hover:bg-hover disabled:opacity-30"
+            >
+              <Icon name="zap" size={15} strokeWidth={2.2} />
+              <span className="text-[13px] font-medium">Steer</span>
             </button>
           ) : null}
           {!running || !empty ? (

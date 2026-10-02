@@ -199,7 +199,7 @@ describe('web server', () => {
     const envelopes = await sse.until((envelope) => envelope.kind === 'session' && envelope.event.type === 'turn/end')
     const result = envelopes.find((e) => e.kind === 'session' && e.event.type === 'tool/result')
     expect(result?.kind === 'session' && result.event.type === 'tool/result' && result.event.ok).toBe(true)
-    expect(result?.kind === 'session' && result.event.type === 'tool/result' && result.event.output).toBe('content in the new folder')
+    expect(result?.kind === 'session' && result.event.type === 'tool/result' && result.event.output).toBe('1\tcontent in the new folder')
 
     const meta = (await (await fetch(`${baseUrl}/api/meta`)).json()) as { folder: string }
     expect(meta.folder).toBe(other)
@@ -243,6 +243,7 @@ describe('web server', () => {
       'turn/start',
       'step/start',
       'user/message',
+      'input/settled',
       // The request's raw system block (recorded once per session), then the
       // per-request manifest: the trajectory's durable "what it carried".
       'context/body',
@@ -977,6 +978,12 @@ describe('static PWA files', () => {
       const shell = await fetch(`${baseUrl}/some/client/route`)
       expect(shell.headers.get('content-type')).toContain('text/html')
       expect(shell.headers.get('cache-control')).toBe('no-cache')
+      // No foreign page may frame the UI (clickjacking an approval or the terminal).
+      expect(shell.headers.get('x-frame-options')).toBe('DENY')
+      expect(shell.headers.get('content-security-policy')).toBe("frame-ancestors 'none'")
+      const api = await fetch(`${baseUrl}/api/health`)
+      expect(api.headers.get('x-frame-options')).toBe('DENY')
+      expect(api.headers.get('x-content-type-options')).toBe('nosniff')
     } finally {
       await fs.rm(staticDir, { recursive: true, force: true })
     }

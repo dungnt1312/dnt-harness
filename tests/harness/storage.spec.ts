@@ -87,6 +87,53 @@ describe('file session store', () => {
     expect(onDisk).toBe(good)
   })
 
+  it('repairs to the exact good prefix when the torn final line ends with a newline', async () => {
+    const id = 'session-torn-nl' as SessionId
+    const good = line(1, { type: 'turn/start', turnId: 't1' })
+    await fs.mkdir(path.dirname(logPath(id)), { recursive: true })
+    await fs.writeFile(logPath(id), `${good}{"v":1,"seq":2,"ty\n`, 'utf8')
+
+    const store = new FileSessionStore({ dir: dataDir, workspaceId: 'ws-crafted' as never })
+    const read = await store.read(id)
+    expect(read.events.map((e) => e.seq)).toEqual([1])
+    expect(read.truncatedTail).toBe(true)
+    expect(await fs.readFile(logPath(id), 'utf8')).toBe(good)
+  })
+
+  it('terminates a complete final record missing its newline so the next append stays separate', async () => {
+    const id = 'session-no-nl' as SessionId
+    const first = line(1, { type: 'turn/start', turnId: 't1' })
+    await fs.mkdir(path.dirname(logPath(id)), { recursive: true })
+    await fs.writeFile(logPath(id), first.trimEnd(), 'utf8')
+
+    const store = new FileSessionStore({ dir: dataDir, workspaceId: 'ws-crafted' as never })
+    expect((await store.read(id)).events.map((e) => e.seq)).toEqual([1])
+    const second = JSON.parse(line(2, { type: 'user/message', turnId: 't1', content: 'x' })) as SessionEvent
+    await store.append(id, second)
+    await store.flush(id)
+    const fresh = new FileSessionStore({ dir: dataDir, workspaceId: 'ws-crafted' as never })
+    const read = await fresh.read(id)
+    expect(read.events.map((e) => e.seq)).toEqual([1, 2])
+    expect(read.truncatedTail).toBe(false)
+  })
+
+  it('a read queued behind appends never interleaves with them', async () => {
+    const store = new FileSessionStore({ dir: dataDir })
+    await store.init()
+    const id = 'session-read-race' as SessionId
+    const event = (seq: number): SessionEvent =>
+      ({ v: 1, seq, timestamp: 1_700_000_000_000 + seq, type: 'user/message', turnId: 't1', content: 'y'.repeat(20_000) }) as unknown as SessionEvent
+    const writes: Promise<void>[] = []
+    const reads: Promise<{ events: SessionEvent[]; truncatedTail: boolean }>[] = []
+    for (let seq = 1; seq <= 20; seq++) {
+      writes.push(store.append(id, event(seq)))
+      if (seq % 4 === 0) reads.push(store.read(id))
+    }
+    await Promise.all(writes)
+    for (const read of await Promise.all(reads)) expect(read.truncatedTail).toBe(false)
+    expect((await store.read(id)).events.map((e) => e.seq)).toEqual(Array.from({ length: 20 }, (_, i) => i + 1))
+  })
+
   it('middle corruption blocks continuation with a line-numbered error', async () => {
     const id = 'session-corrupt' as SessionId
     const raw = line(1, { type: 'turn/start', turnId: 't1' }) + 'not json at all\n' + line(3, { type: 'turn/end', turnId: 't1', reason: 'completed' })
@@ -281,6 +328,43 @@ describe('sessions service over files', () => {
     await restarted.kernel.stop()
   })
 
+  it('projects subagent parentage and the spawn-time project binding from child-meta', async () => {
+    const { kernel, sessions, dir } = await service()
+    await sessions.boot()
+    const child = sessions.create('ws-summary-child' as never)
+    child.append({ type: 'session/child-meta', parentSessionId: 'root-summary-1', parentTurnId: 't1', definition: 'explore', projectId: 'project-child' })
+    child.append({ type: 'assistant/message', stepId: 's1' as never, content: 'done' })
+    await child.durable()
+    await sessions.flushSummary(child)
+    await kernel.stop()
+
+    const restarted = await service(dir)
+    await restarted.sessions.boot()
+    const summary = restarted.sessions.summary(child.id)
+    expect(summary?.parentSessionId).toBe('root-summary-1')
+    expect(summary?.projectId).toBe('project-child')
+    expect(() => restarted.sessions.get(child.id)).toThrow(/no session/)
+
+    // A summary written before subagent listing joined the projection
+    // rebuilds from the canonical log instead of reporting an unparented row.
+    const store = new FileSessionStore({ dir, workspaceId: 'ws-summary-child' as never })
+    await store.writeSummary(child.id, {
+      id: child.id,
+      createdAt: summary!.createdAt,
+      updatedAt: summary!.updatedAt,
+      eventCount: 2,
+      lastSeq: 2,
+      title: null,
+    })
+    await restarted.kernel.stop()
+
+    const third = await service(dir)
+    await third.sessions.boot()
+    expect(third.sessions.summary(child.id)?.parentSessionId).toBe('root-summary-1')
+    expect(third.sessions.summary(child.id)?.projectId).toBe('project-child')
+    await third.kernel.stop()
+  })
+
   it('boot lists stored sessions; load runs lazily and preserves history', async () => {
     const { kernel, sessions, dir: shared } = await service()
     await sessions.boot()
@@ -440,7 +524,7 @@ describe('sessions service over files', () => {
       },
       replace: async () => {},
       writeSummary: vi.fn(async () => {}),
-      readSummary: async () => ({ id, createdAt: 1, updatedAt: 1, eventCount: 0, lastSeq: 0, title: null, derivedTitle: null, projectId: null }),
+      readSummary: async () => ({ id, createdAt: 1, updatedAt: 1, eventCount: 0, lastSeq: 0, title: null, derivedTitle: null, projectId: null, parentSessionId: null }),
       list: async () => [id],
       remove,
     }

@@ -151,7 +151,10 @@ describe('result contract', () => {
   }, 20_000)
 
   it('a completed child without a final report says so, stably, and names its log', async () => {
-    const harness = await boot([{ content: '', toolCalls: [{ name: 'Read', args: { path: 'a.ts' } }] }, ''])
+    // The final reply is whitespace-only, not a truly empty stream: an empty
+    // stream is now a provider error (a failed turn), while whitespace
+    // completes the turn yet still digests to no report.
+    const harness = await boot([{ content: '', toolCalls: [{ name: 'Read', args: { path: 'a.ts' } }] }, ' '])
     const handle = await harness.executor.spawn(request(harness, explorer))
     const settled = await settle(harness, handle.childSessionId)
     expect(settled?.status).toBe('completed')
@@ -275,6 +278,57 @@ describe('lifecycle boundary', () => {
     expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(0)
     await harness.kernel.stop()
   }, 15_000)
+
+  it('settles a never-launched uncertain spawn whose parent record canonically persisted, releasing its slot', async () => {
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-spawn-uncertain-committed-'))
+    try {
+    const harness = await boot(['done'], { dir })
+    const sessions = harness.kernel.ctx.sessions as unknown as {
+      storeFor(workspaceId: string): { append(id: string, event: { type: string }): Promise<void> }
+      readCanonicalEvents(id: string): Promise<readonly unknown[] | undefined>
+    }
+    const store = sessions.storeFor(harness.workspaceId)
+    const append = store.append.bind(store)
+    store.append = async (id, event) => {
+      // The record reaches disk, then the acknowledgement rejects: the spawn
+      // is committed canonically, but the executor must assume uncertainty.
+      await append(id, event)
+      if (id === harness.rootSessionId && event.type === 'agent/child-spawn') {
+        throw new Error('spawn append acknowledgement lost after persistence')
+      }
+    }
+    const readCanonicalEvents = sessions.readCanonicalEvents.bind(sessions)
+    sessions.readCanonicalEvents = async () => { throw new Error('canonical storage temporarily unavailable') }
+
+    const handle = await harness.executor.spawn(request(harness, explorer))
+    expect(handle.status).toBe('uncertain')
+    expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(1)
+
+    sessions.readCanonicalEvents = readCanonicalEvents
+    const settled = await harness.executor.reconcile(harness.workspaceId as never, handle.childSessionId)
+    expect(settled).toMatchObject({ status: 'interrupted' })
+    expect(settled?.error).toContain('never ran')
+    // The repair matches what a restart reconstructs from the same logs, and
+    // the reservation is free again without touching the root's durable log.
+    expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(0)
+    expect(await harness.executor.reconcile(harness.workspaceId as never, handle.childSessionId))
+      .toMatchObject({ status: 'interrupted' })
+    await harness.kernel.stop()
+
+    // The restart view of the same logs agrees with the live repair: the
+    // committed-but-never-launched child is interrupted, not uncertain.
+    const restarted = new Kernel()
+    restarted.ctx.plugin(fileSessions(dir))
+    await restarted.ctx.sessions.boot()
+    const executor = new ChildExecutor(restarted.ctx)
+    expect(await executor.recoverFromStorage()).toBe(1)
+    expect(await executor.childrenOfRoot(harness.rootSessionId as never, harness.workspaceId as never))
+      .toMatchObject([{ childSessionId: handle.childSessionId, status: 'interrupted' }])
+    await restarted.stop()
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  }, 20_000)
 
   it('canonically accepts a committed spawn when a non-poisoned durable wrapper rejects after success', async () => {
     const harness = await boot(['done'])
@@ -584,13 +638,13 @@ describe('lifecycle boundary', () => {
     root.durable = async () => { await durable(); throw new Error('post-success terminal rejection') }
     await harness.executor.cancel(harness.workspaceId as never, children[2]!.childSessionId)
     expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(2)
-    expect(harness.executor.forgetRoot(harness.rootSessionId as never)).toEqual([])
+    expect(await harness.executor.forgetRoot(harness.rootSessionId as never)).toEqual([])
     root.durable = durable
 
     await harness.kernel.ctx.sessions.delete(harness.rootSessionId as never)
-    expect(harness.executor.forgetRoot(harness.rootSessionId as never).sort()).toEqual(children.map((child) => child.childSessionId).sort())
+    expect((await harness.executor.forgetRoot(harness.rootSessionId as never)).sort()).toEqual(children.map((child) => child.childSessionId).sort())
     expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(0)
-    expect(harness.executor.forgetRoot(harness.rootSessionId as never)).toEqual([])
+    expect(await harness.executor.forgetRoot(harness.rootSessionId as never)).toEqual([])
     await harness.kernel.stop()
   }, 20_000)
 
@@ -651,6 +705,67 @@ describe('lifecycle boundary', () => {
     }
   }, 15_000)
 
+  it('backfills the parent result of a crash-orphaned child from its interrupted recovery fact', async () => {
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-crash-orphan-'))
+    try {
+      // Build the durable shape a crash leaves behind: committed spawns on
+      // the parent, no child-result, and children that never settled — one
+      // with an open turn (the next load stamps it `interrupted`) and one
+      // that never started a turn at all.
+      const kernel = new Kernel()
+      kernel.ctx.plugin(fileSessions(dir))
+      const ws = new WorkspaceService(dir)
+      await ws.boot()
+      await kernel.ctx.sessions.boot()
+      const workspaceId = ws.defaultWorkspace
+      const root = kernel.ctx.sessions.create(workspaceId)
+      const crashed = kernel.ctx.sessions.create(workspaceId)
+      crashed.append({ type: 'session/child-meta', parentSessionId: root.id, parentTurnId: 't', definition: 'explorer', brief: 'mid-run' })
+      crashed.append({ type: 'turn/start', turnId: 'turn-crash' as never })
+      crashed.append({ type: 'assistant/message', stepId: 's1' as never, content: 'streaming when the host died', toolCalls: [] })
+      await crashed.durable()
+      const neverRan = kernel.ctx.sessions.create(workspaceId)
+      neverRan.append({ type: 'session/child-meta', parentSessionId: root.id, parentTurnId: 't', definition: 'explorer', brief: 'queued when the host died' })
+      await neverRan.durable()
+      for (const child of [crashed, neverRan]) {
+        root.append({ type: 'agent/child-spawn', childSessionId: child.id, parentTurnId: 't', definition: 'explorer', brief: 'x' })
+      }
+      await root.durable()
+      await kernel.stop()
+
+      // Restart: recovery stamps the open turn, and the spawn is healed with
+      // a terminal parent record — before this repair, the result-less spawn
+      // projected as a subagent still running, forever.
+      const restarted = new Kernel()
+      restarted.ctx.plugin(fileSessions(dir))
+      await restarted.ctx.sessions.boot()
+      const executor = new ChildExecutor(restarted.ctx)
+      expect(await executor.recoverFromStorage()).toBe(2)
+      const results = restarted.ctx.sessions.get(root.id).events
+        .filter((event) => event.type === 'agent/child-result')
+      expect(results).toHaveLength(2)
+      for (const id of [crashed.id, neverRan.id]) {
+        const record = results.find((event) => event.childSessionId === id)
+        expect(record).toMatchObject({ status: 'interrupted', parentTurnId: 't' })
+        expect(record?.error).toBeUndefined()
+      }
+      // The listing agrees with what the panels show, and the rendered error
+      // matches the bare-log reconstruction text (no invented failure story).
+      const listed = await executor.childrenOfRoot(root.id, workspaceId)
+      expect(listed.find((child) => child.childSessionId === crashed.id))
+        .toMatchObject({ status: 'interrupted', error: `the child did not complete (interrupted); its full log is session ${crashed.id}` })
+      expect(listed.find((child) => child.childSessionId === neverRan.id))
+        .toMatchObject({ status: 'interrupted' })
+      // Idempotent: a second recovery sweep appends nothing.
+      expect(await executor.recoverFromStorage()).toBe(2)
+      expect(restarted.ctx.sessions.get(root.id).events
+        .filter((event) => event.type === 'agent/child-result')).toHaveLength(2)
+      await restarted.stop()
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  }, 20_000)
+
   it('recovery skips a child whose parent session is missing', async () => {
     const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-orphan-'))
     try {
@@ -702,7 +817,7 @@ describe('capacity', () => {
       await settle(harness, handle.childSessionId)
     }
     await expect(harness.executor.spawn(request(harness, explorer))).rejects.toThrow(/8 children per turn/)
-    harness.executor.releaseTurns(harness.rootSessionId as never)
+    await harness.executor.releaseTurns(harness.rootSessionId as never)
     const fresh = await harness.executor.spawn(request(harness, explorer))
     await settle(harness, fresh.childSessionId)
     await harness.kernel.stop()

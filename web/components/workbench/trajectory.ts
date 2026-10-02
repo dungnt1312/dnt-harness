@@ -6,13 +6,13 @@
  * did not stamp is never invented — a span with no end simply has no duration.
  */
 import { toolFacts } from '../../lib/tool-facts.ts'
-import type { SseEvent, ToolCall } from '../../lib/types.ts'
+import { isMcpOutcome, type SseEvent, type ToolCall } from '../../lib/types.ts'
 
 /** How a recorded call ended, in the same terms the transcript uses. */
 export type CallState = 'running' | 'ok' | 'failed' | 'unknown'
 
 /** Why a turn's bar closed. An open turn has no reason yet. */
-export type TurnOutcome = 'open' | 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'rejected' | 'empty' | 'limit'
+export type TurnOutcome = 'open' | 'completed' | 'failed' | 'cancelled' | 'steered' | 'interrupted' | 'rejected' | 'empty' | 'limit'
 
 export interface TrajectorySegment {
   /** Model time, from the request's start to the assembled answer. */
@@ -92,7 +92,7 @@ export interface Trajectory {
   readonly extent: { readonly start: number; readonly end: number } | null
 }
 
-const KNOWN_REASONS: ReadonlySet<string> = new Set(['completed', 'failed', 'cancelled', 'interrupted', 'rejected', 'empty', 'limit'])
+const KNOWN_REASONS: ReadonlySet<string> = new Set(['completed', 'failed', 'cancelled', 'steered', 'interrupted', 'rejected', 'empty', 'limit'])
 
 function outcomeOf(reason: string | undefined): TurnOutcome {
   if (reason !== undefined && KNOWN_REASONS.has(reason)) return reason as TurnOutcome
@@ -251,7 +251,7 @@ export function projectTrajectory(events: readonly SseEvent[]): Trajectory {
             ok: event.ok === true,
             output: event.output ?? '',
             ...(event.recovery === true ? { recovery: true as const } : {}),
-            ...(event.outcome !== undefined ? { outcome: event.outcome } : {}),
+            ...(isMcpOutcome(event.outcome) ? { outcome: event.outcome } : {}),
             ...(event.invocationId !== undefined ? { invocationId: event.invocationId } : {}),
           },
         })

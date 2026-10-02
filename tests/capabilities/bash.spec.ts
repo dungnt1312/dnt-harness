@@ -30,7 +30,7 @@ describe('bash tool', () => {
       const execution = { ...exec, root }
       const read = fsTools().find((tool) => tool.name === 'Read')
       expect(read).toBeDefined()
-      await expect(read!.execute({ path: 'marker.txt' }, execution)).resolves.toBe('project root')
+      await expect(read!.execute({ path: 'marker.txt' }, execution)).resolves.toBe('1\tproject root')
       const output = await bashTool({ cwd: fallback }).execute({ command: 'cat marker.txt' }, execution)
       expect(output).toContain('project root')
       expect(output).not.toContain('fallback root')

@@ -60,17 +60,21 @@ it('the collapsed line names the size and the per-request facts', async () => {
 it('expanding reveals the manifest: window, mode, history, sources, omissions', async () => {
   const view = await openMarker(item, true)
   expect(view.querySelector('button')!.getAttribute('aria-expanded')).toBe('true')
-  expect(view.textContent).toContain('18.4k/1M tok (est)')
-  expect(view.textContent).toContain('default · rev 2 · gpt-x')
+  expect(view.textContent).toContain('18.4k/1M tok')
+  expect(view.textContent).toContain('est')
+  expect(view.textContent).toContain('default')
+  expect(view.textContent).toContain('rev 2')
+  expect(view.textContent).toContain('gpt-x')
   expect(view.textContent).toContain('recent: 1 included, 0 omitted')
   expect(view.textContent).toContain('seq 1–9')
-  expect(view.textContent).toContain('Read, Glob, Grep (6 schemas)')
+  expect(view.textContent).toContain('Read')
+  expect(view.textContent).toContain('6 schemas')
   expect(view.textContent).toContain('alpha@aaaaaaaaaaaa')
   expect(view.textContent).toContain('mem-1@bbbbbbbbbbbb')
-  expect(view.textContent).toContain('omitted: memory: dropped for budget')
+  expect(view.textContent).toContain('memory: dropped for budget')
 })
 
-it('a clean request shows no omission line and no per-source extras', async () => {
+it('a clean request shows no omission line and no pinned source chips', async () => {
   const clean: ContextManifestView = {
     ...MANIFEST,
     sources: { ...MANIFEST.sources, skills: [], memory: [] },
@@ -78,8 +82,8 @@ it('a clean request shows no omission line and no per-source extras', async () =
   }
   const view = await openMarker({ ...item, manifest: clean } as Extract<ViewItem, { kind: 'context' }>, true)
   expect(view.textContent).not.toContain('omitted:')
-  expect(view.textContent).not.toContain('Skills')
-  expect(view.textContent).not.toContain('Memory')
+  expect(view.textContent).not.toContain('alpha@aaaaaaaaaaaa')
+  expect(view.textContent).not.toContain('mem-1@bbbbbbbbbbbb')
 })
 
 it('a multi-request turn says how many requests it folded', async () => {

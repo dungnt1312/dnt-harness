@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Tool card mockup (proposal)</title>
+<script type="module">
+  import '@fontsource/instrument-sans/400.css'
+  import '@fontsource/instrument-sans/500.css'
+  import '@fontsource/instrument-sans/600.css'
+  import '@fontsource/jetbrains-mono/400.css'
+  if (new URLSearchParams(location.search).get('theme') === 'dark') document.documentElement.dataset.theme = 'dark'
+</script>
+<style>
+  /* Same tokens as web/styles/app.css */
+  :root { --bg:#fff; --muted:#f4f4f4; --hover:#ececec; --line:#e5e5e5; --line-strong:#d0d0d0; --fg:#0d0d0d; --fg-muted:#565656; --fg-faint:#666; --link:#1d63d8; --ok:#047857; --ok-soft:#ecfdf5; --warn:#a15c07; --warn-soft:#fff7e6; --bad:#c9252c; --bad-soft:#fdf0f0; }
+  :root[data-theme="dark"] { --bg:#212121; --muted:#303030; --hover:#3a3a3a; --line:#3a3a3a; --line-strong:#525252; --fg:#ececec; --fg-muted:#b8b8b8; --fg-faint:#a8a8a8; --link:#7cb4ff; --ok:#4ade9a; --ok-soft:rgb(74 222 154/12%); --warn:#f5b84a; --warn-soft:rgb(245 184 74/12%); --bad:#ff7b7b; --bad-soft:rgb(255 123 123/12%); }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 'Instrument Sans', system-ui, sans-serif; }
+  main { max-width:768px; margin:0 auto; padding:16px; }
+  h2 { font-size:12px; font-weight:500; letter-spacing:.04em; text-transform:uppercase; color:var(--fg-faint); margin:24px 0 8px; }
+  .mono { font-family:'JetBrains Mono', ui-monospace, monospace; font-size:12.5px; }
+
+  /* ---- Row: status | verb | object ........ result · meta  › ---- */
+  .row { display:grid; grid-template-columns:16px 56px minmax(0,1fr) auto 12px; align-items:center; column-gap:8px;
+         min-height:28px; margin:0 -6px; padding:2px 6px; border-radius:6px; font-size:13px; color:var(--fg-muted); cursor:pointer; }
+  .row:hover { background:var(--muted); }
+  .st { width:16px; height:16px; display:grid; place-items:center; font-size:12px; line-height:1; }
+  .st.ok { color:var(--fg-faint); }
+  .st.bad { color:var(--bad); font-weight:600; }
+  .st.warn { color:var(--warn); }
+  .st.skip { color:var(--fg-faint); }
+  .spin { width:11px; height:11px; border:1.5px solid var(--line-strong); border-top-color:var(--fg-muted); border-radius:50%; animation:spin 1s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg) } }
+  .verb { color:var(--fg-faint); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .obj { min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--fg); }
+  .obj .q { color:var(--fg-faint); }
+  .res { white-space:nowrap; color:var(--fg-faint); text-align:right; max-width:280px; overflow:hidden; text-overflow:ellipsis; }
+  .res.bad { color:var(--bad); }
+  .res.warn { color:var(--warn); }
+  .res .add { color:var(--ok); } .res .del { color:var(--bad); }
+  .res .meta { color:var(--fg-faint); opacity:.8; }
+  .chev { color:var(--fg-faint); opacity:.6; font-size:11px; transition:transform .15s; }
+  .row.open .chev { transform:rotate(90deg); }
+
+  /* ---- Run summary ---- */
+  .run { font-size:13px; }
+  .run .kids { margin:2px 0 2px 7px; padding-left:15px; border-left:1px solid var(--line); }
+
+  /* ---- Opened body: one frame, content first, tools-specific ---- */
+  .body { margin:4px 0 8px 24px; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .bar { display:flex; align-items:center; gap:12px; padding:4px 10px; font-size:12px; color:var(--fg-faint); border-bottom:1px solid var(--line); }
+  .bar .sp { flex:1; }
+  .bar a { color:var(--fg-muted); text-decoration:none; } .bar a:hover { color:var(--fg); }
+  .bar .note { color:var(--warn); }
+  pre { margin:0; padding:8px 12px; max-height:240px; overflow:auto; white-space:pre-wrap; word-break:break-word; font-family:'JetBrains Mono', monospace; font-size:12px; line-height:1.6; }
+  .ln { color:var(--fg-faint); user-select:none; display:inline-block; width:3.5ch; text-align:right; margin-right:1.5ch; }
+  .cmd { color:var(--fg-muted); }
+  .cmd::before { content:'$ '; color:var(--fg-faint); }
+  .d-del { background:var(--bad-soft); display:block; } .d-add { background:var(--ok-soft); display:block; }
+  .d-del::before { content:'− '; color:var(--bad); } .d-add::before { content:'+ '; color:var(--ok); }
+  .file { color:var(--fg); font-weight:500; display:block; margin-top:4px; }
+  .file:first-child { margin-top:0; }
+  .exit-bad { color:var(--bad); }
+  .running { color:var(--fg-faint); }
+  .warnbar { padding:6px 12px; font-size:12.5px; background:var(--warn-soft); color:var(--warn); border-bottom:1px solid var(--line); }
+  .raw { padding:6px 12px; font-size:12px; color:var(--fg-faint); border-top:1px solid var(--line); }
+
+  @media (max-width: 480px) {
+    .row { grid-template-columns:16px 54px minmax(0,1fr) auto 10px; column-gap:6px; }
+    .res { max-width:130px; }
+    .res .meta { display:none; }
+    .body { margin-left:0; }
+  }
+</style>
+</head>
+<body>
+<main>
+
+<h2>Closed rows — one shape for every tool</h2>
+<div data-shot="rows">
+  <div class="row"><span class="st"><span class="spin"></span></span><span class="verb">Read</span><span class="obj">service.ts <span class="q">L100–160</span></span><span class="res">3s</span><span class="chev">›</span></div>
+  <div class="row"><span class="st ok">✓</span><span class="verb">Read</span><span class="obj">service.ts <span class="q">L100–160</span></span><span class="res">61 lines</span><span class="chev">›</span></div>
+  <div class="row"><span class="st bad">✕</span><span class="verb">Read</span><span class="obj">missing.md</span><span class="res bad">no such file</span><span class="chev">›</span></div>
+  <div class="row"><span class="st ok">✓</span><span class="verb">Write</span><span class="obj">new-helper.ts</span><span class="res">created</span><span class="chev">›</span></div>
+  <div class="row"><span class="st ok">✓</span><span class="verb">Edit</span><span class="obj">format.ts</span><span class="res mono"><span class="add">+1</span> <span class="del">−1</span></span><span class="chev">›</span></div>
+  <div class="row"><span class="st skip">⊘</span><span class="verb">Edit</span><span class="obj">format.ts</span><span class="res">you declined</span><span class="chev">›</span></div>
+  <div class="row"><span class="st ok">✓</span><span class="verb">Find</span><span class="obj"><span class="mono">**/*.ts</span> <span class="q">in src</span></span><span class="res">3 files</span><span class="chev">›</span></div>
+  <div class="row"><span class="st ok">✓</span><span class="verb">Search</span><span class="obj"><span class="mono">createProject</span> <span class="q">in src</span></span><span class="res">3 matches in 2 files</span><span class="chev">›</span></div>
+  <div class="row"><span class="st ok">✓</span><span class="verb">Search</span><span class="obj"><span class="mono">zzz</span></span><span class="res">no matches</span><span class="chev">›</span></div>
+  <div class="row"><span class="st ok">✓</span><span class="verb">Run</span><span class="obj mono">npm test -- tools</span><span class="res">exit 0 <span class="meta">· 1.2s</span></span><span class="chev">›</span></div>
+  <div class="row"><span class="st bad">✕</span><span class="verb">Run</span><span class="obj mono">npm test -- tools</span><span class="res bad">exit 1 <span class="meta">· 1.2s</span></span><span class="chev">›</span></div>
+  <div class="row"><span class="st skip">⊘</span><span class="verb">Run</span><span class="obj mono">deploy prod</span><span class="res">blocked by guard</span><span class="chev">›</span></div>
+  <div class="row"><span class="st"><span class="spin"></span></span><span class="verb">Run</span><span class="obj mono">npm run build</span><span class="res">41s</span><span class="chev">›</span></div>
+  <div class="row"><span class="st ok">✓</span><span class="verb">Skill</span><span class="obj">ak-brainstorm</span><span class="res">loaded</span><span class="chev">›</span></div>
+  <div class="row"><span class="st ok">✓</span><span class="verb">Agent</span><span class="obj">explorer <span class="q">· spawn</span></span><span class="res">running</span><span class="chev">›</span></div>
+  <div class="row"><span class="st ok">✓</span><span class="verb">Memory</span><span class="obj">deploy notes</span><span class="res">2 entries</span><span class="chev">›</span></div>
+  <div class="row"><span class="st ok">✓</span><span class="verb">linear</span><span class="obj">create_issue <span class="q">Fix the row</span></span><span class="res">created ENG-42</span><span class="chev">›</span></div>
+  <div class="row"><span class="st warn">⚠</span><span class="verb">Run</span><span class="obj mono">npm install</span><span class="res warn">unknown — restarted</span><span class="chev">›</span></div>
+  <div class="row"><span class="st warn">⚠</span><span class="verb">linear</span><span class="obj">create_issue <span class="q">Fix the row</span></span><span class="res warn">may have run</span><span class="chev">›</span></div>
+  <div class="row"><span class="st"><span class="spin"></span></span><span class="verb">Agent</span><span class="obj">explorer <span class="q">Find where tool cards are rendered and report the file list.</span></span><span class="res">running</span><span class="chev">›</span></div>
+</div>
+
+<h2>Runs of 4+ steps — a sentence, not a tool tally</h2>
+<div data-shot="runs" class="run">
+  <div class="row"><span class="st ok">✓</span><span class="verb">5 steps</span><span class="obj">Read 1 file, found files, searched once, ran 1 command, edited format.ts</span><span class="res">1.4s</span><span class="chev">›</span></div>
+  <div class="row"><span class="st skip">⊘</span><span class="verb">4 steps</span><span class="obj">Read 1 file, searched once, ran 1 command</span><span class="res">1 blocked</span><span class="chev">›</span></div>
+  <div class="row open"><span class="st bad">✕</span><span class="verb">4 steps</span><span class="obj">Read 2 files, searched once, ran 1 command</span><span class="res bad">2 failed</span><span class="chev">›</span></div>
+  <div class="kids">
+    <div class="row"><span class="st ok">✓</span><span class="verb">Read</span><span class="obj">service.ts <span class="q">L100–160</span></span><span class="res">61 lines</span><span class="chev">›</span></div>
+    <div class="row"><span class="st bad">✕</span><span class="verb">Read</span><span class="obj">missing.md</span><span class="res bad">no such file</span><span class="chev">›</span></div>
+    <div class="row"><span class="st ok">✓</span><span class="verb">Search</span><span class="obj"><span class="mono">createProject</span> <span class="q">in src</span></span><span class="res">3 matches in 2 files</span><span class="chev">›</span></div>
+    <div class="row"><span class="st bad">✕</span><span class="verb">Run</span><span class="obj mono">npm test -- tools</span><span class="res bad">exit 1 <span class="meta">· 1.2s</span></span><span class="chev">›</span></div>
+  </div>
+</div>
+
+<h2>Opened — each tool shows its content, raw arguments one click away</h2>
+<div data-shot="open">
+  <div class="row open"><span class="st bad">✕</span><span class="verb">Run</span><span class="obj mono">npm test -- tools</span><span class="res bad">exit 1 <span class="meta">· 1.2s</span></span><span class="chev">›</span></div>
+  <div class="body">
+    <pre><span class="cmd">npm test -- tools</span>
+1 failing
+  AssertionError: expected 2 to be 3
+<span class="exit-bad">exit 1</span></pre>
+    <div class="raw">Copy · Raw arguments</div>
+  </div>
+
+  <div class="row open"><span class="st ok">✓</span><span class="verb">Edit</span><span class="obj">format.ts</span><span class="res mono"><span class="add">+1</span> <span class="del">−1</span></span><span class="chev">›</span></div>
+  <div class="body">
+    <div class="bar"><span>web/lib/format.ts</span><span class="sp"></span><a href="#">Open</a><a href="#">Copy</a></div>
+    <pre><span class="d-del">const a = 1</span><span class="d-add">const a = 2</span></pre>
+  </div>
+
+  <div class="row open"><span class="st ok">✓</span><span class="verb">Read</span><span class="obj">service.ts <span class="q">L100–160</span></span><span class="res">61 lines</span><span class="chev">›</span></div>
+  <div class="body">
+    <div class="bar"><span>src/harness/tools/service.ts</span><span class="sp"></span><a href="#">Open</a><a href="#">Copy</a></div>
+    <pre><span class="ln">100</span>import { formatBytes, shortPath } from './format.ts'
+<span class="ln">101</span>  const line101 = compute(1)
+<span class="ln">102</span>  const line102 = compute(2)
+<span class="ln">103</span>  const line103 = compute(3)
+<span class="ln">104</span>  …</pre>
+  </div>
+
+  <div class="row open"><span class="st ok">✓</span><span class="verb">Search</span><span class="obj"><span class="mono">createProject</span> <span class="q">in src</span></span><span class="res">3 matches in 2 files</span><span class="chev">›</span></div>
+  <div class="body">
+    <pre><span class="file">src/web/server.ts</span><span class="ln">412</span>const createProject = async (input) =&gt; {
+<span class="ln">980</span>  await createProject(body)
+<span class="file">src/harness/workspace/projects.ts</span><span class="ln">88</span>export function createProject(root: string) {</pre>
+  </div>
+
+  <div class="row open"><span class="st"><span class="spin"></span></span><span class="verb">Run</span><span class="obj mono">npm run build</span><span class="res">41s</span><span class="chev">›</span></div>
+  <div class="body">
+    <pre><span class="cmd">npm run build</span>
+<span class="running">Running…</span></pre>
+  </div>
+
+  <div class="row open"><span class="st warn">⚠</span><span class="verb">Run</span><span class="obj mono">npm install</span><span class="res warn">unknown — restarted</span><span class="chev">›</span></div>
+  <div class="body">
+    <div class="warnbar">The host restarted before this result was recorded. Check the actual state before retrying.</div>
+    <pre><span class="cmd">npm install</span>
+partial output</pre>
+  </div>
+</div>
+
+</main>
+</body>
+</html>

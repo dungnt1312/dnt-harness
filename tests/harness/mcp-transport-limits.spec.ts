@@ -188,4 +188,23 @@ describe('connect lifecycle', () => {
       await fs.rm(home, { recursive: true, force: true })
     }
   }, 20_000)
+
+  it('a server that never answers initialize is killed, not abandoned', async () => {
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-silent-'))
+    try {
+      const pidFile = path.join(home, 'pid')
+      // Records its pid, then stays alive without ever speaking JSON-RPC.
+      const silent = `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000)`
+      const client = new McpServerClient('silent', { name: 'silent', transport: 'stdio', command: process.execPath, args: ['-e', silent], enabled: true } as never, {}, () => {})
+      clients.push(client)
+      await expect(client.listTools()).rejects.toThrow()
+      const pid = Number(await fs.readFile(pidFile, 'utf8'))
+      const alive = (): boolean => { try { process.kill(pid, 0); return true } catch { return false } }
+      const deadline = Date.now() + 5_000
+      while (alive() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(alive()).toBe(false)
+    } finally {
+      await fs.rm(home, { recursive: true, force: true })
+    }
+  }, 30_000)
 })

@@ -34,6 +34,17 @@ it('does not highlight an unchanged assistant row during an unrelated parent upd
   expect(highlight).toHaveBeenCalledTimes(calls)
 })
 
+
+it('does not syntax-highlight an in-progress streamed answer', async () => {
+  host = document.createElement('div')
+  document.body.append(host)
+  root = createRoot(host)
+  const answer: Extract<ViewItem, { kind: 'assistant' }> = { kind: 'assistant', content: '```ts\nconst live = true\n```', live: true, thinking: [], thinkingLive: false }
+  await act(async () => root!.render(<AssistantMessage item={answer} />))
+  expect(host.textContent).toContain('const live = true')
+  expect(highlight).not.toHaveBeenCalled()
+})
+
 it('does not parse an unchanged transcript row during an unrelated parent update', async () => {
   const reuse = vi.fn()
   host = document.createElement('div')

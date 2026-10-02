@@ -13,6 +13,7 @@ import {
   type GitStatusReport,
 } from '../../lib/api.ts'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
+import { DiffLines, LineCount, diffRowsFromUnified } from '../common/DiffLines.tsx'
 import { cn } from '../../lib/cn.ts'
 import type { WorkbenchProject } from './Workbench.tsx'
 
@@ -35,10 +36,17 @@ const STATUS_MARK: Readonly<Record<GitChangeStatus, string>> = {
  * Read-only source control for the conversation's project: the changed files
  * with their added and removed line counts, and the diff of the one that is
  * open. It never stages, commits, or discards.
+ *
+ * `pathFilter` narrows the list to the files one turn's Write/Edit calls
+ * recorded (project-relative, from the TurnChangesCard's Review all). The
+ * rows are still git's own status rows — the filter only hides the rest,
+ * and the header says so. `onShowAll` clears it.
  */
-export function GitPanel({ workspaceId, project }: {
+export function GitPanel({ workspaceId, project, pathFilter, onShowAll }: {
   readonly workspaceId: string
   readonly project: WorkbenchProject
+  readonly pathFilter?: readonly string[]
+  readonly onShowAll?: () => void
 }) {
   const [report, setReport] = useState<GitStatusReport | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -65,7 +73,9 @@ export function GitPanel({ workspaceId, project }: {
 
   useEffect(() => { void load() }, [load])
 
-  const changes = report?.changes ?? []
+  const all = report?.changes ?? []
+  const filtered = pathFilter !== undefined && pathFilter.length > 0 ? all.filter((change) => pathFilter.includes(change.path)) : all
+  const changes = filtered
   const totals = changes.reduce((sum, change) => ({
     added: sum.added + (change.added ?? 0),
     removed: sum.removed + (change.removed ?? 0),
@@ -73,6 +83,21 @@ export function GitPanel({ workspaceId, project }: {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      {pathFilter !== undefined && pathFilter.length > 0 ? (
+        <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line bg-muted/40 px-2.5 text-[12px]">
+          <Icon name="squarePen" size={13} className="shrink-0 text-fg-muted" />
+          <span className="min-w-0 flex-1 truncate text-fg-muted">Showing the files this turn's writes recorded</span>
+          {onShowAll !== undefined ? (
+            <button
+              type="button"
+              onClick={onShowAll}
+              className="shrink-0 rounded px-1.5 py-0.5 text-[12px] text-link underline-offset-2 hover:bg-hover hover:underline"
+            >
+              Show all
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line px-2.5 text-[13px]">
         <Icon name="gitBranch" size={14} className="shrink-0 text-fg-muted" />
         <span className="min-w-0 flex-1 truncate font-medium" title={report?.branch ?? project.path}>{report?.branch ?? project.name}</span>
@@ -97,7 +122,13 @@ export function GitPanel({ workspaceId, project }: {
           <div className="flex flex-col items-center justify-center gap-2 p-6 text-center">
             <Icon name="check" size={20} className="text-fg-faint" />
             <p className="m-0 text-sm font-medium">No changes</p>
-            <p className="m-0 max-w-xs text-[13px] text-fg-muted">{report?.branch === null ? 'This folder is not a git repository.' : 'The working tree matches HEAD.'}</p>
+            <p className="m-0 max-w-xs text-[13px] text-fg-muted">
+              {report?.branch === null
+                ? 'This folder is not a git repository.'
+                : pathFilter !== undefined && pathFilter.length > 0
+                  ? 'None of the files this turn wrote differ from HEAD right now — later turns may have changed them back. Show all for the whole project.'
+                  : 'The working tree matches HEAD.'}
+            </p>
           </div>
         ) : (
           <ul aria-label="Changed files" className="m-0 flex list-none flex-col p-1">
@@ -139,10 +170,7 @@ function ChangeRow({ change, open, onToggle }: {
         <span className={cn(change.status === 'deleted' && 'line-through')}>{name}</span>
         {directory !== '' ? <span className="ml-1.5 text-fg-faint">{directory}</span> : null}
       </span>
-      <span className="flex shrink-0 items-center gap-1.5 font-mono text-xs">
-        {change.added !== undefined && change.added > 0 ? <span className="text-ok">+{change.added}</span> : null}
-        {change.removed !== undefined && change.removed > 0 ? <span className="text-bad">−{change.removed}</span> : null}
-      </span>
+      <LineCount {...(change.added !== undefined ? { added: change.added } : {})} {...(change.removed !== undefined ? { removed: change.removed } : {})} />
     </button>
   )
 }
@@ -187,31 +215,12 @@ function DiffView({ workspaceId, projectId, path }: {
   if (diff === null) return <div className="flex items-center gap-2 py-1.5 pl-7 text-xs text-fg-muted" role="status"><Spinner size={12} />Loading diff…</div>
   if (diff.binary) return <p className="m-0 py-1.5 pl-7 pr-2 text-xs text-fg-muted">Binary file — diff not shown.</p>
   if (diff.lines.length === 0) return <p className="m-0 py-1.5 pl-7 pr-2 text-xs text-fg-muted">No textual diff.</p>
+  // The file header rows repeat the name the change row already shows and the
+  // hunk header is noise; row numbers are read from the hunk instead.
   return (
     <div className="overflow-x-auto border-y border-line bg-muted/40" role="region" aria-label={`Diff of ${path}`} tabIndex={0}>
       {diff.truncated ? <p className="m-0 border-b border-line bg-warn-soft px-3 py-1 text-xs text-warn">Diff is larger than 1 MB; only the beginning is shown.</p> : null}
-      <pre className="m-0 px-3 py-1.5 font-mono text-[12px] leading-5">
-        {diff.lines.map((line, index) => (
-          <div key={index} className={cn('whitespace-pre', lineClass(line.kind))}>
-            <span aria-hidden="true" className="mr-2 inline-block w-3 select-none text-fg-faint">{marker(line.kind)}</span>
-            {line.text === '' ? ' ' : line.text}
-          </div>
-        ))}
-      </pre>
+      <DiffLines rows={diffRowsFromUnified(diff.lines)} />
     </div>
   )
-}
-
-function marker(kind: GitDiffReport['lines'][number]['kind']): string {
-  if (kind === 'add') return '+'
-  if (kind === 'del') return '−'
-  return ''
-}
-
-function lineClass(kind: GitDiffReport['lines'][number]['kind']): string {
-  if (kind === 'add') return 'bg-ok-soft text-ok'
-  if (kind === 'del') return 'bg-bad-soft text-bad'
-  if (kind === 'hunk') return 'text-link'
-  if (kind === 'meta') return 'text-fg-faint'
-  return 'text-fg'
 }

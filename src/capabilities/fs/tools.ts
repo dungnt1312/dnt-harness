@@ -11,12 +11,25 @@
  * These checks are application-level containment, not an OS sandbox and not
  * a guarantee against hostile external filesystem races.
  */
-import { createHash } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import type { PathIntent, ToolDefinition, ToolExecution } from '../../harness/tools/types.ts'
 import { displayPath, resolveInGrants, within } from './grants.ts'
-import { canonical, digest, observe, replaceFile, requirementFor, withFileLock } from './observation.ts'
+import { canonical, observe, replaceFile, requirementFor, withFileLock } from './observation.ts'
+import { findEditMatch, foldEol, formatLines, type MatchStrategy } from './edit-match.ts'
+import { GrepTimeoutError, runGrep } from './grep-worker.ts'
+import {
+  BinaryFileError,
+  decodeDocument,
+  documentLines,
+  encodeForWrite,
+  encodeRaw,
+  hashBytes,
+  lineOf,
+  spliceDocument,
+  type Splice,
+  type TextDocument,
+} from './text-document.ts'
 
 export { resolveGrantedPath, resolveWithin } from './grants.ts'
 
@@ -24,6 +37,16 @@ const OUTPUT_CAP = 60_000
 const GLOB_CAP = 100
 const GREP_CAP = 250
 const WALK_BUDGET = 20_000
+/** Grep does not search files larger than this. */
+const GREP_MAX_FILE_BYTES = 16 * 1024 * 1024
+/** Wall-clock budget for one Grep (the worker is terminated past it). */
+const GREP_TIMEOUT_MS = 20_000
+/**
+ * Read/Write/Edit load whole files (the observation hash covers every byte),
+ * so a multi-gigabyte log would exhaust the host's memory. Larger files are
+ * refused with a pointer to a streaming alternative.
+ */
+const MAX_FILE_BYTES = 32 * 1024 * 1024
 
 /**
  * Generated/dependency folders the search walk skips by default: VCS
@@ -162,72 +185,123 @@ function searchIgnore(args: Record<string, unknown>, pattern?: string): Readonly
   return DEFAULT_IGNORED_SET
 }
 
-function sha256(content: string): string {
-  return createHash('sha256').update(content, 'utf8').digest('hex')
+/** True only when the boolean argument is present and true. */
+function optionalBoolean(args: Record<string, unknown>, key: string): boolean {
+  return argBoolean(args, key) === true
 }
 
-/**
- * Verify the caller's previously observed state still matches. `expectedSha256`
- * arrives from the model's last read; a mismatch means the file changed
- * externally and the mutation refuses instead of clobbering.
- */
-async function assertObservedState(abs: string, expectedSha256: unknown): Promise<void> {
-  if (expectedSha256 === undefined) return
-  if (typeof expectedSha256 !== 'string') {
-    throw new Error("argument 'expectedSha256' must be a string when provided")
-  }
-  let current: string
+const READ_DEFAULT_LINES = 2_000
+const READ_MAX_LINE = 2_000
+const EDIT_SNIPPET_CONTEXT = 2
+const EDIT_SNIPPET_MAX = 24
+
+/** Read the stored bytes, or undefined when the file does not exist. */
+async function readBytes(abs: string, rel: string): Promise<Buffer | undefined> {
   try {
-    current = await fs.readFile(abs, 'utf8')
-  } catch {
-    // The caller observed content that is now gone: that IS a change.
-    throw new Error('conflict: the file was deleted after it was observed; re-read before writing')
-  }
-  const actual = sha256(current)
-  if (actual !== expectedSha256.toLowerCase()) {
-    throw new Error(
-      `conflict: the file changed since it was observed (expected sha256 ${expectedSha256.slice(0, 12)}…, actual ${actual.slice(0, 12)}…); re-read before writing`,
-    )
+    const { size } = await fs.stat(abs)
+    if (size > MAX_FILE_BYTES) {
+      throw new Error(`${rel} is ${(size / (1024 * 1024)).toFixed(1)} MiB, over the ${MAX_FILE_BYTES / (1024 * 1024)} MiB file-tool limit; inspect it with Bash (head, tail, sed -n) or Grep instead`)
+    }
+    return await fs.readFile(abs)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') return undefined
+    if (code === 'EISDIR') throw new Error(`${rel} is a directory, not a file`)
+    throw error
   }
 }
 
-/** The `Read` tool: file content (optionally a 1-based line window), size-capped. */
+/** Refuse a mutation the executing session has not earned (never read, or changed since). */
+function assertObserved(exec: ToolExecution, target: string, rel: string, currentHash: string, explicit: unknown, verb: string): void {
+  const requirement = requirementFor(exec, target, explicit)
+  if (requirement.kind === 'missing') {
+    throw new Error(`conflict: ${rel} was never read by this conversation; Read it before ${verb} it`)
+  }
+  if (requirement.kind === 'check' && currentHash !== requirement.hash) {
+    throw new Error(`conflict: ${rel} changed on disk since this conversation last read it (another session, a command, or the user); re-read it, then retry`)
+  }
+}
+
+function positiveInteger(args: Record<string, unknown>, key: string): number | undefined {
+  const value = args[key]
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`argument '${key}' must be a number`)
+  return Math.max(Math.floor(value), key === 'offset' ? 1 : 0)
+}
+
+function countLines(text: string): number {
+  return documentLines(text.replace(/\r\n/g, '\n')).length
+}
+
+/** Create a file that must not exist yet: two racing creators cannot clobber each other. */
+async function createExclusive(file: string, bytes: Uint8Array): Promise<void> {
+  const handle = await fs.open(file, 'wx')
+  try {
+    await handle.writeFile(bytes)
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
+
+/** The `Read` tool: a numbered line window of a text file. */
 export function readTool(): ToolDefinition {
   return {
     name: 'Read',
-    description:
-      'Read a text file inside the workspace or a granted folder and return its content. The executing conversation records the observed bytes for a later guarded Write/Edit. Optional `offset` (1-based line) and `limit` (line count) read a window. Large reads are truncated and marked.',
+    description: [
+      'Read a text file inside the workspace or a granted folder.',
+      "Output lines are \"<line number><TAB><text>\"; the number and tab are NOT part of the file, so never copy them into Edit's `old`.",
+      `Returns up to ${READ_DEFAULT_LINES} lines from \`offset\` (1-based); a footer says when more lines remain and which offset continues.`,
+      "Line endings are shown as plain newlines whatever the file uses; edits keep the file's own line endings.",
+      'Reading records the file for a later Write/Edit by this conversation.',
+    ].join(' '),
     requiresRoot: true,
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'file path relative to the workspace root, or absolute inside a granted folder' },
-        offset: { type: 'number', description: '1-based line number to start from' },
-        limit: { type: 'number', description: 'maximum number of lines to return' },
+        offset: { type: 'number', description: '1-based line number to start from (default 1)' },
+        limit: { type: 'number', description: `maximum number of lines to return (default ${READ_DEFAULT_LINES})` },
       },
       required: ['path'],
     },
     async execute(args, exec) {
-      const abs = await granted(exec, argString(args, 'path'), 'read')
-      let content: string
-      try {
-        content = await fs.readFile(abs, 'utf8')
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code
-        if (code === 'ENOENT') throw new Error(`no such file: ${argString(args, 'path')}`)
-        if (code === 'EISDIR') throw new Error(`${argString(args, 'path')} is a directory, not a file`)
-        throw error
+      const rel = argString(args, 'path')
+      const abs = await granted(exec, rel, 'read')
+      const bytes = await readBytes(abs, rel)
+      if (bytes === undefined) throw new Error(`no such file: ${rel}`)
+      const doc = decodeDocument(bytes, rel)
+      observe(exec, await canonical(abs), doc.hash)
+
+      const lines = documentLines(doc.text)
+      if (lines.length === 0) return `(${rel} is empty)`
+      const offset = positiveInteger(args, 'offset') ?? 1
+      const limit = positiveInteger(args, 'limit') ?? READ_DEFAULT_LINES
+      if (offset > lines.length) throw new Error(`${rel} has ${lines.length} lines; offset ${offset} is past the end`)
+
+      const budget = limitOf(exec)
+      const start = offset - 1
+      const wantedEnd = Math.min(lines.length, start + limit)
+      const width = String(wantedEnd).length
+      const out: string[] = []
+      let used = 0
+      let end = start
+      for (let index = start; index < wantedEnd; index++) {
+        let line = lines[index] ?? ''
+        // A single line never exceeds the per-line cap nor the whole output budget.
+        const lineCap = Math.max(1, Math.min(READ_MAX_LINE, budget - width - 64))
+        if (line.length > lineCap) line = `${line.slice(0, lineCap)}… [line truncated, ${line.length} chars]`
+        const rendered = `${String(index + 1).padStart(width, ' ')}\t${line}`
+        if (out.length > 0 && used + rendered.length + 1 > budget) break
+        out.push(rendered)
+        used += rendered.length + 1
+        end = index + 1
       }
-      observe(exec, await canonical(abs), content)
-      const offset = typeof args['offset'] === 'number' ? Math.floor(args['offset']) : undefined
-      const limit = typeof args['limit'] === 'number' ? Math.floor(args['limit']) : undefined
-      if (offset !== undefined || limit !== undefined) {
-        const lines = content.split('\n')
-        const start = Math.max((offset ?? 1) - 1, 0)
-        const end = limit !== undefined ? start + Math.max(limit, 0) : lines.length
-        content = lines.slice(start, end).join('\n')
+      if (end < lines.length) {
+        out.push(`… [showing lines ${offset}-${end} of ${lines.length}; continue with offset ${end + 1}]`)
       }
-      return cap(content, limitOf(exec))
+      if (!doc.writable) out.push('… [this file is not valid UTF-8; it can be read but not edited]')
+      return out.join('\n')
     },
   }
 }
@@ -237,105 +311,143 @@ export function writeTool(): ToolDefinition {
   return {
     name: 'Write',
     description:
-      'Create or overwrite a text file inside the workspace or a read-write granted folder. Existing files must first be Read by this conversation; the observed bytes are checked automatically. Direct callers may pass `expectedSha256` explicitly. The result distinguishes creation from overwrite.',
+      'Create a file, or replace an existing file completely, inside the workspace or a read-write granted folder. Overwriting requires that this conversation Read the file first and that it has not changed since; prefer Edit for partial changes. An existing file keeps its encoding, BOM, and line-ending style.',
     requiresRoot: true,
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'file path relative to the workspace root, or absolute inside a granted folder' },
-        content: { type: 'string', description: 'full file content to write' },
-        expectedSha256: { type: 'string', description: 'sha256 of the file as last observed; a mismatch is a conflict' },
+        content: { type: 'string', description: 'the complete new file content' },
       },
       required: ['path', 'content'],
     },
     async execute(args, exec) {
       const rel = argString(args, 'path')
-      const abs = await granted(exec, rel, 'write')
       const content = argString(args, 'content')
+      const abs = await granted(exec, rel, 'write')
       await fs.mkdir(path.dirname(abs), { recursive: true })
       const target = await canonical(abs)
       return withFileLock(target, exec.signal, async () => {
         // Revalidate containment after waiting: an alias/junction changed
         // while this call was queued must not redirect the mutation.
         const now = await granted(exec, rel, 'write')
-        const currentTarget = await canonical(now)
-        if (currentTarget !== target) throw new Error(`conflict: ${rel} changed path after observation; re-read before writing`)
-        let current: string | undefined
-        try {
-          current = await fs.readFile(now, 'utf8')
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-        }
+        if (await canonical(now) !== target) throw new Error(`conflict: ${rel} changed path after observation; Read it again before writing`)
+        const current = await readBytes(now, rel)
         if (current === undefined) {
-          // Exclusive creation: two roots racing to create cannot clobber.
-          const handle = await fs.open(now, 'wx')
-          try { await handle.writeFile(content, 'utf8'); await handle.sync() }
-          finally { await handle.close() }
-          observe(exec, target, content)
-          return `created ${rel}`
+          const bytes = encodeForWrite(content, undefined)
+          await createExclusive(now, bytes)
+          observe(exec, target, hashBytes(bytes))
+          return `created ${rel} (${countLines(content)} lines)`
         }
-        const requirement = requirementFor(exec, target, args['expectedSha256'])
-        if (requirement.kind === 'missing') throw new Error(`conflict: ${rel} was never read by this conversation; read it before overwriting`)
-        if (requirement.kind === 'check' && digest(current) !== requirement.hash) {
-          throw new Error(`conflict: ${rel} changed after it was observed; re-read before writing`)
+        assertObserved(exec, target, rel, hashBytes(current), args['expectedSha256'], 'overwriting')
+        let existing: TextDocument | undefined
+        try {
+          existing = decodeDocument(current, rel)
+        } catch (error) {
+          if (!(error instanceof BinaryFileError)) throw error
         }
-        await replaceFile(now, content)
-        observe(exec, target, content)
-        return `overwrote ${rel} (${Buffer.byteLength(content, 'utf8')} bytes written)`
+        const bytes = encodeForWrite(content, existing)
+        await replaceFile(now, bytes)
+        observe(exec, target, hashBytes(bytes))
+        return `overwrote ${rel} (${bytes.length} bytes written)`
       })
     },
   }
 }
 
-/** The `Edit` tool: exact text replacement, rejecting missing and ambiguous matches. */
+/** The `Edit` tool: replace one exact (or conservatively normalized) occurrence. */
 export function editTool(): ToolDefinition {
   return {
     name: 'Edit',
-    description:
-      'Replace one exact occurrence of `old` with `new` in a file inside the workspace or a read-write granted folder. Existing files must first be Read by this conversation; the observed bytes are checked automatically. Direct callers may pass `expectedSha256` explicitly. Fails on missing or ambiguous matches.',
+    description: [
+      'Replace text in a file inside the workspace or a read-write granted folder. This conversation must have Read the file, and it must not have changed since.',
+      '`old` must appear exactly once (copy it from Read output WITHOUT the line-number prefix, keeping indentation); add surrounding lines to make it unique, or set `replaceAll` to change every occurrence.',
+      'Line endings are handled automatically. When `old` is not found, the error shows the closest current lines.',
+      'An empty `old` creates a new file (or fills an empty one) with `new`.',
+    ].join(' '),
     requiresRoot: true,
     parameters: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'file path relative to the workspace root, or absolute inside a granted folder' },
-        old: { type: 'string', description: 'exact text to replace (must match exactly once)' },
-        new: { type: 'string', description: 'replacement text' },
-        expectedSha256: { type: 'string', description: 'sha256 of the file as last observed; a mismatch is a conflict' },
+        old: { type: 'string', description: 'the exact text to replace; must match exactly one location unless replaceAll is true' },
+        new: { type: 'string', description: 'the replacement text (must differ from old)' },
+        replaceAll: { type: 'boolean', description: 'replace every occurrence of old (default false)' },
       },
       required: ['path', 'old', 'new'],
     },
     async execute(args, exec) {
       const rel = argString(args, 'path')
+      const old = foldEol(argString(args, 'old'))
+      const replacement = foldEol(argString(args, 'new'))
+      const replaceAll = optionalBoolean(args, 'replaceAll')
+      if (old === replacement) throw new Error('no change: old and new are identical')
       const abs = await granted(exec, rel, 'write')
-      const old = argString(args, 'old')
-      const replacement = argString(args, 'new')
+      if (old === '') await fs.mkdir(path.dirname(abs), { recursive: true })
       const target = await canonical(abs)
       return withFileLock(target, exec.signal, async () => {
         const now = await granted(exec, rel, 'write')
-        if (await canonical(now) !== target) throw new Error(`conflict: ${rel} changed path after observation; re-read before writing`)
-        let content: string
-        try {
-          content = await fs.readFile(now, 'utf8')
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error(`no such file: ${rel}`)
-          throw error
+        if (await canonical(now) !== target) throw new Error(`conflict: ${rel} changed path after observation; Read it again before editing`)
+        const current = await readBytes(now, rel)
+        if (current === undefined) {
+          if (old !== '') throw new Error(`no such file: ${rel} (to create it, use Write or an Edit with an empty old)`)
+          const bytes = encodeForWrite(replacement, undefined)
+          await createExclusive(now, bytes)
+          observe(exec, target, hashBytes(bytes))
+          return `created ${rel} (${countLines(replacement)} lines)`
         }
-        const requirement = requirementFor(exec, target, args['expectedSha256'])
-        if (requirement.kind === 'missing') throw new Error(`conflict: ${rel} was never read by this conversation; read it before editing`)
-        if (requirement.kind === 'check' && digest(content) !== requirement.hash) {
-          throw new Error(`conflict: ${rel} changed after it was observed; re-read before writing`)
+        const doc = decodeDocument(current, rel)
+        assertObserved(exec, target, rel, doc.hash, args['expectedSha256'], 'editing')
+        if (!doc.writable) throw new Error(`${rel} is not valid UTF-8; refusing to edit it`)
+
+        let splices: readonly Splice[]
+        let strategy: MatchStrategy = 'exact'
+        if (old === '') {
+          if (doc.text.trim() !== '') throw new Error(`old must not be empty: ${rel} already has content`)
+          splices = [{ start: 0, end: doc.text.length, text: replacement }]
+        } else {
+          const match = findEditMatch(doc.text, old, replacement, replaceAll)
+          if (match.kind === 'not-found') {
+            const hint = match.hint !== undefined ? `\nClosest lines in the current file:\n${match.hint}` : ''
+            throw new Error(`old text not found in ${rel}. Copy it from the current file exactly (without line-number prefixes), or Read the region again.${hint}`)
+          }
+          if (match.kind === 'ambiguous') {
+            throw new Error(`ambiguous edit: old matches ${match.lines.length} places in ${rel} (lines ${match.lines.slice(0, 10).join(', ')}); include more surrounding lines to make it unique, or set replaceAll to true`)
+          }
+          splices = match.splices
+          strategy = match.strategy
         }
-        const first = content.indexOf(old)
-        if (first < 0) throw new Error(`'${old.slice(0, 80)}' not found in ${rel}`)
-        const second = content.indexOf(old, first + 1)
-        if (second >= 0) throw new Error(`ambiguous edit: '${old.slice(0, 80)}' occurs more than once in ${rel}; include more surrounding context`)
-        const updated = content.slice(0, first) + replacement + content.slice(first + old.length)
-        await replaceFile(now, updated)
-        observe(exec, target, updated)
-        return `edited ${rel}`
+
+        const bytes = encodeRaw(spliceDocument(doc, splices), doc)
+        await replaceFile(now, bytes)
+        observe(exec, target, hashBytes(bytes))
+        const note = strategy === 'exact' ? '' : ` (matched after normalizing ${STRATEGY_NOTE[strategy]})`
+        if (splices.length > 1) return `edited ${rel}: replaced ${splices.length} occurrences${note}`
+        return `edited ${rel}${note}\n${editSnippet(doc.text, splices[0])}`
       })
     },
   }
+}
+
+const STRATEGY_NOTE: Readonly<Record<MatchStrategy, string>> = {
+  'exact': 'nothing',
+  'line-numbers-stripped': 'pasted line-number prefixes',
+  'trailing-whitespace': 'trailing whitespace',
+  'indentation': 'indentation; the replacement was re-indented to match',
+  'quotes': 'typographic quotes',
+}
+
+/** The edited region as it now reads, numbered like Read, so no re-read is needed. */
+function editSnippet(before: string, splice: Splice | undefined): string {
+  if (splice === undefined) return ''
+  const after = before.slice(0, splice.start) + splice.text + before.slice(splice.end)
+  const lines = documentLines(after)
+  if (lines.length === 0) return '(the file is now empty)'
+  const first = Math.min(lineOf(after, splice.start), lines.length)
+  const last = Math.min(lines.length, Math.max(first, lineOf(after, splice.start + Math.max(splice.text.length - 1, 0))))
+  const from = Math.max(1, first - EDIT_SNIPPET_CONTEXT)
+  const to = Math.min(lines.length, last + EDIT_SNIPPET_CONTEXT, from + EDIT_SNIPPET_MAX - 1)
+  return formatLines(lines.slice(from - 1, to), from)
 }
 
 /** The search base for Glob/Grep: the optional `path` argument, else the primary root. */
@@ -367,7 +479,7 @@ export function globTool(): ToolDefinition {
         .filter((full) => regex.test(path.relative(base, full).split(path.sep).join('/')))
       const files = matches.slice(0, GLOB_CAP).map((full) => displayPath(exec.root, full))
       if (matches.length > GLOB_CAP) files.push(`… [+${matches.length - GLOB_CAP} more matches]`)
-      return files.length === 0 ? 'no matches' : cap(files.join('\n'), OUTPUT_CAP)
+      return files.length === 0 ? 'no matches' : cap(files.join('\n'), limitOf(exec))
     },
   }
 }
@@ -389,29 +501,32 @@ export function grepTool(): ToolDefinition {
       required: ['pattern'],
     },
     async execute(args, exec) {
-      const regex = new RegExp(argString(args, 'pattern'))
+      const pattern = argString(args, 'pattern')
+      // Validate here so a bad pattern fails as before, not inside the worker.
+      void new RegExp(pattern)
       const base = await searchBase(args, exec)
-      const lines: string[] = []
-      for (const full of await walk(base, exec.deniedRoots, exec.signal, undefined, searchIgnore(args))) {
-        const rel = displayPath(exec.root, full)
-        let content: string
-        try {
-          content = await fs.readFile(full, 'utf8')
-        } catch {
-          continue
+      const files = await walk(base, exec.deniedRoots, exec.signal, undefined, searchIgnore(args))
+      let run
+      try {
+        run = await runGrep(pattern, files.map((full) => ({ full })), {
+          maxHits: GREP_CAP,
+          maxFileBytes: GREP_MAX_FILE_BYTES,
+          timeoutMs: GREP_TIMEOUT_MS,
+          ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
+        })
+      } catch (error) {
+        if (error instanceof GrepTimeoutError) {
+          throw new Error(`Grep ${error.message}; the pattern may backtrack catastrophically (e.g. nested quantifiers) or the search is too wide — simplify the pattern or narrow 'path'`)
         }
-        const split = content.split('\n')
-        for (let i = 0; i < split.length; i++) {
-          if (regex.test(split[i] ?? '')) {
-            lines.push(`${rel}:${i + 1}: ${split[i]}`)
-            if (lines.length >= GREP_CAP) {
-              lines.push('… [more matches truncated]')
-              return cap(lines.join('\n'), OUTPUT_CAP)
-            }
-          }
-        }
+        throw error
       }
-      return lines.length === 0 ? 'no matches' : cap(lines.join('\n'), OUTPUT_CAP)
+      const lines = run.hits.map((hit) => {
+        const text = hit.text.length > READ_MAX_LINE ? `${hit.text.slice(0, READ_MAX_LINE)}… [line truncated]` : hit.text
+        return `${displayPath(exec.root, files[hit.file] as string)}:${hit.line}: ${text}`
+      })
+      if (run.truncated) lines.push('… [more matches truncated]')
+      if (run.skippedLarge > 0) lines.push(`… [${run.skippedLarge} file(s) over ${GREP_MAX_FILE_BYTES / (1024 * 1024)} MiB not searched]`)
+      return lines.length === 0 ? 'no matches' : cap(lines.join('\n'), limitOf(exec))
     },
   }
 }

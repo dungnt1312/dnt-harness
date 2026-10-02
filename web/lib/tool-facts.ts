@@ -49,6 +49,15 @@ export interface ToolFacts {
   readonly lines?: { readonly added: number; readonly removed: number }
 }
 
+/**
+ * A call that was refused — by policy, a hook, or the reader's own Deny — and
+ * never ran. The pipeline records it as `ok: false` with `denied: <reason>`;
+ * it is a decision, not a fault, so it is not reported as a failure.
+ */
+export function isDenied(result?: ToolResultView): boolean {
+  return result !== undefined && !result.ok && result.output.startsWith('denied:')
+}
+
 /** `mcp__<server>__<tool>` (the Claude convention) — undefined for built-ins. */
 export function mcpServerOf(name: string): string | undefined {
   if (!name.startsWith('mcp__')) return undefined
@@ -175,29 +184,46 @@ function fileParts(path: string, window = ''): { name: string; directory: string
   return { name: `${name}${window}`, directory }
 }
 
+/** The note `Glob` appends once it has listed its cap: `… [+523 more matches]`. */
+const GLOB_MORE = /\n… \[\+(\d+) more matches\]\s*$/
+/** A note a list tool writes about itself (`… [more matches truncated]`), not a match. */
+const NOTE_LINE = /^… \[/
+
 function globDigest(output: string): string {
   if (output.startsWith('no matches')) return 'no matches'
-  return plural(listLines(output).length, 'file')
+  const body = output.replace(TRUNCATION, '')
+  const more = GLOB_MORE.exec(body)
+  const shown = listLines(body.replace(GLOB_MORE, '')).length
+  // The note is a count, not a file: it is never listed, and the total it
+  // reports is what the reader wants to know.
+  if (more?.[1] !== undefined) return `${shown} of ${shown + Number(more[1])} files`
+  return `${plural(shown, 'file')}${TRUNCATION.test(output) ? ' · truncated' : ''}`
 }
 
 function grepDigest(output: string): string {
   if (output.startsWith('no matches')) return 'no matches'
   const lines = listLines(output)
+  const hits = lines.filter((line) => !NOTE_LINE.test(line))
   const files = new Set<string>()
-  for (const line of lines) {
+  for (const line of hits) {
     const match = /^(.*?):\d+: /.exec(line)
     if (match?.[1] !== undefined) files.add(match[1])
   }
-  const matches = plural(lines.length, 'match', 'matches')
-  return files.size > 1 ? `${matches} · ${plural(files.size, 'file')}` : matches
+  const truncated = hits.length < lines.length || TRUNCATION.test(output)
+  const matches = plural(hits.length, 'match', 'matches')
+  const where = files.size > 1 ? ` · ${plural(files.size, 'file')}` : ''
+  return `${matches}${where}${truncated ? ' · truncated' : ''}`
 }
+
+/** What `Bash` writes when it cut its own output. */
+const BASH_CUT = /\n… \[(?:truncated \d+ chars|output truncated during capture)\]/
 
 /** `Bash` always settles as a recorded result; the exit code is the outcome. */
 function bashDigest(output: string): { digest: string; failed: boolean } {
   const exit = /\[exit code: (-?\d+)\]\s*$/.exec(output)
   if (exit?.[1] !== undefined) {
     const code = Number(exit[1])
-    return { digest: `exit ${code}`, failed: code !== 0 }
+    return { digest: `exit ${code}${BASH_CUT.test(output) ? ' · truncated' : ''}`, failed: code !== 0 }
   }
   if (/\[terminated[^\]]*\]\s*$/.test(output)) return { digest: 'terminated', failed: true }
   if (output.startsWith('cancelled:')) return { digest: 'cancelled', failed: true }
@@ -212,6 +238,59 @@ function readWindow(offset?: number, limit?: number): { label: string; focus?: F
   if (limit === undefined) return { label: `:${start}+`, focus: { line: start } }
   const span = Math.max(limit, 1)
   return { label: `:${start}-${start + span - 1}`, focus: { line: start, lines: span } }
+}
+
+function parseJson(output: string): unknown {
+  try { return JSON.parse(output) } catch { return undefined }
+}
+
+/** `spawn · explorer`, `wait`: what an `Agent` call asked for. */
+function agentTarget(args: Record<string, unknown>): string {
+  const action = str(args, 'action') ?? 'spawn'
+  const role = action === 'spawn' ? str(args, 'definition') : undefined
+  return role !== undefined ? `${action} · ${role}` : action
+}
+
+/**
+ * `Agent` answers in JSON. The row says what that JSON means — a status, a
+ * count per child state — instead of echoing it.
+ */
+function agentDigest(action: string, output: string): string {
+  const data = parseJson(output)
+  if (typeof data !== 'object' || data === null) return genericDigest(output)
+  const record = data as Record<string, unknown>
+  if (action === 'spawn') {
+    const status = record['status']
+    return typeof status === 'string' ? status : 'started'
+  }
+  const roles = record['roles']
+  if (action === 'catalog' && Array.isArray(roles)) return plural(roles.length, 'role')
+  const children = record['children']
+  if (!Array.isArray(children)) return genericDigest(output)
+  if (children.length === 0) return 'no children'
+  const counts = new Map<string, number>()
+  for (const child of children) {
+    const status = typeof child === 'object' && child !== null ? (child as Record<string, unknown>)['status'] : undefined
+    const key = typeof status === 'string' ? status : 'unknown'
+    counts.set(key, (counts.get(key) ?? 0) + 1)
+  }
+  return [...counts].map(([status, count]) => `${count} ${status}`).join(' · ')
+}
+
+/** The memory tools write their own one-line receipts; the row reads them. */
+function memoryDigest(builtin: string, output: string): string {
+  switch (builtin) {
+    case 'memorysearch':
+      return output.startsWith('no memory matches') ? 'no matches' : plural(countLines(output), 'entry', 'entries')
+    case 'memoryread': {
+      const title = /^# (.+)$/m.exec(output)?.[1]
+      return title !== undefined ? excerpt(title, 40) : genericDigest(output)
+    }
+    case 'memorycreate': return output.startsWith('created memory') ? 'created' : genericDigest(output)
+    case 'memoryupdate': return output.startsWith('updated memory') ? 'updated' : genericDigest(output)
+    case 'memoryforget': return output.startsWith('forgot ') ? 'forgot' : genericDigest(output)
+    default: return genericDigest(output)
+  }
 }
 
 /** A value that looks like a path shortens as one; anything else is a phrase. */
@@ -229,13 +308,16 @@ export function toolFacts(call: ToolCall, result?: ToolResultView): ToolFacts {
   const builtin = mcpServerOf(call.name) === undefined ? call.name.toLowerCase() : ''
   const name = toolDisplayName(call.name)
   const failed = result !== undefined && !result.ok
+  // A refusal still shows its reason on the row, but it is not a fault: the
+  // digest keeps the quiet color instead of the failure one.
+  const denied = isDenied(result)
 
   let fullTarget = ''
   let target = ''
   let path = argPath(args)
   let focus: FileFocus | undefined
   let digest: string | undefined
-  let digestFailed = failed
+  let digestFailed = failed && !denied
   let file: { name: string; directory: string } | undefined
   let lines: { added: number; removed: number } | undefined
 
@@ -263,9 +345,29 @@ export function toolFacts(call: ToolCall, result?: ToolResultView): ToolFacts {
       break
     }
     case 'glob': {
-      fullTarget = str(args, 'pattern') ?? ''
-      target = shortCommand(fullTarget)
+      const pattern = str(args, 'pattern') ?? ''
+      const scope = str(args, 'path')
+      fullTarget = scope !== undefined ? `${pattern} in ${scope}` : pattern
+      target = scope !== undefined ? `${shortCommand(pattern, 40)} in ${shortPath(scope)}` : shortCommand(pattern)
+      // Like Grep, a Glob's `path` scopes the search; it is not a file to open.
+      path = undefined
       digest = result === undefined ? undefined : failed ? excerpt(result.output) : globDigest(result.output)
+      break
+    }
+    case 'agent': {
+      fullTarget = agentTarget(args)
+      target = shortCommand(fullTarget)
+      digest = result === undefined ? undefined : failed ? excerpt(result.output) : agentDigest(str(args, 'action') ?? 'spawn', result.output)
+      break
+    }
+    case 'memorysearch':
+    case 'memoryread':
+    case 'memorycreate':
+    case 'memoryupdate':
+    case 'memoryforget': {
+      fullTarget = str(args, 'id') ?? str(args, 'query') ?? ''
+      target = shortenTarget(fullTarget)
+      digest = result === undefined ? undefined : failed ? excerpt(result.output) : memoryDigest(builtin, result.output)
       break
     }
     case 'grep': {

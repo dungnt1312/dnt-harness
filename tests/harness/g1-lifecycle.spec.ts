@@ -115,6 +115,30 @@ describe('stop semantics', () => {
     void h.kernel.stop()
   })
 
+  it('stop while turn-stopping is pending records cancelled, not completed', async () => {
+    const h = boot(['done'])
+    let release!: () => void
+    const hold = new Promise<void>((resolve) => { release = resolve })
+    let reached!: () => void
+    const entered = new Promise<void>((resolve) => { reached = resolve })
+    h.kernel.ctx.on('agent/turn-stopping', async () => {
+      reached()
+      await hold
+    })
+
+    h.agent.send('go')
+    const running = h.agent.run()
+    await entered
+    h.agent.stop()
+    release()
+    await running
+
+    const ends = h.session.events.filter((event) => event.type === 'turn/end')
+    expect(ends).toHaveLength(1)
+    expect(ends[0]).toMatchObject({ type: 'turn/end', reason: 'cancelled' })
+    void h.kernel.stop()
+  })
+
   it('a provider that never sends data can be stopped', async () => {
     const kernel = new Kernel()
     kernel.ctx.plugin(SessionsService)
@@ -461,6 +485,25 @@ describe('turn settlement', () => {
     h.agent.send('go')
     await h.agent.run()
     expect(count).toBe(1)
+    void h.kernel.stop()
+  })
+
+  it('a settlement observer failure cannot rewrite a durable completed outcome', async () => {
+    const h = boot(['reply'])
+    let count = 0
+    h.kernel.ctx.on('agent/turn-settled', async () => {
+      count += 1
+      throw new Error('observer failed')
+    })
+
+    h.agent.send('go')
+    await h.agent.run()
+
+    expect(count).toBe(1)
+    expect(h.session.events.filter((event) => event.type === 'turn/end')).toEqual([
+      expect.objectContaining({ type: 'turn/end', reason: 'completed' }),
+    ])
+    expect(h.session.events.some((event) => event.type === 'turn/error')).toBe(false)
     void h.kernel.stop()
   })
 

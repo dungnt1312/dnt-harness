@@ -135,7 +135,7 @@ describe('workspace HTTP surface', () => {
     void post(base, `/api/workspaces/${wsId}/sessions/${withProject.id}/messages`, { content: 'read marker' })
     const boundOk = await readFirstToolResult(base, wsId, withProject.id)
     expect(boundOk.ok).toBe(true)
-    expect(boundOk.output).toBe('from project A')
+    expect(boundOk.output).toBe('1\tfrom project A')
 
     // A session WITHOUT a project has no filesystem grant at all.
     const plain = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }

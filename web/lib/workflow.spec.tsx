@@ -19,12 +19,97 @@ describe('production conversation workflows', () => {
     expect(taskPhase([queued, { type: 'turn/start', seq: 1 }, { type: 'user/message', seq: 2, inputId: 'i1' }, { type: 'turn/end', seq: 3, reason: 'completed' }])).toBe('completed')
     expect(taskPhase([], 0, true)).toBe('preparing')
   })
+  it('queue left behind by a stop or restart is held — a resting state, not "preparing"', () => {
+    const run = (reason: string): SseEvent[] => [
+      { type: 'turn/start', seq: 0 },
+      { type: 'input/queued', seq: 1, inputId: 'q' },
+      { type: 'turn/end', seq: 2, reason },
+    ]
+    expect(taskPhase(run('cancelled'))).toBe('held')
+    expect(taskPhase(run('interrupted'))).toBe('held')
+    // A steered turn hands the queue to the next turn: that is preparing.
+    expect(taskPhase(run('steered'))).toBe('preparing')
+  })
   it('shows waiting only for a running turn, not stale approvals after end', () => {
     expect(taskPhase(events('turn/start'), 1)).toBe('waiting')
     expect(taskPhase(events('turn/start'), 0)).toBe('running')
     expect(taskPhase([{ type: 'turn/end', seq: 0, reason: 'completed' }], 1)).toBe('completed')
   })
-  it.each(['completed', 'failed', 'interrupted', 'cancelled', 'limit', 'empty', 'rejected'] as const)('preserves durable terminal reason %s', (reason) => {
+  it('a rejected or empty input ends "preparing" and shows Not sent, not a stuck queued bubble (fix A)', () => {
+    const log: SseEvent[] = [
+      { type: 'input/queued', seq: 0, inputId: 'i1', content: 'Run it' },
+      { type: 'turn/start', seq: 1, turnId: 't1' },
+      { type: 'input/settled', seq: 2, inputId: 'i1', outcome: 'rejected' },
+      { type: 'turn/error', seq: 3, turnId: 't1', kind: 'rejected', message: 'hook failed' },
+      { type: 'turn/end', seq: 4, turnId: 't1', reason: 'rejected' },
+    ]
+    expect(taskPhase(log)).toBe('rejected')
+    const items = projectItems(log)
+    expect(items[0]).toMatchObject({ kind: 'user', content: 'Run it', queued: false, notSent: 'rejected' })
+    // A policy rejection is deterministic: no Retry (Reuse puts the text back).
+    expect(items.some((item) => item.kind === 'status' && item.retry !== undefined)).toBe(false)
+  })
+  it('Retry resends what the user typed, not a hook rewrite whose user/message has no id', () => {
+    const items = projectItems([
+      { type: 'input/queued', seq: 0, inputId: 'i1', content: 'Typed by me' },
+      { type: 'turn/start', seq: 1, turnId: 't1' },
+      { type: 'user/message', seq: 2, turnId: 't1', content: 'Hook-provided context…\nTyped by me (rewritten)' },
+      { type: 'input/settled', seq: 3, inputId: 'i1', outcome: 'admitted' },
+      { type: 'turn/error', seq: 4, turnId: 't1', kind: 'provider', message: 'boom' },
+      { type: 'turn/end', seq: 5, turnId: 't1', reason: 'failed' },
+    ])
+    expect(items.find((item) => item.kind === 'status' && item.retry !== undefined)).toMatchObject({
+      retry: { key: 'seq-4', inputs: [{ content: 'Typed by me' }], toolsRan: false },
+    })
+  })
+  it('an admitted settle does not mark the bubble Not sent', () => {
+    const items = projectItems([
+      { type: 'input/queued', seq: 0, inputId: 'i1', content: 'Hi' },
+      { type: 'turn/start', seq: 1, turnId: 't1' },
+      { type: 'user/message', seq: 2, turnId: 't1', inputId: 'i1', content: 'Hi' },
+      { type: 'input/settled', seq: 3, inputId: 'i1', outcome: 'admitted' },
+    ])
+    expect(items).toHaveLength(1)
+    expect(items[0]).toMatchObject({ kind: 'user', queued: false })
+    expect(items[0]).not.toHaveProperty('notSent')
+  })
+  it('Retry targets the failed turn, not the newest message, and knows when tools ran (fix D)', () => {
+    const items = projectItems([
+      { type: 'input/queued', seq: 0, inputId: 'a', content: 'First' },
+      { type: 'turn/start', seq: 1, turnId: 't1' },
+      { type: 'user/message', seq: 2, turnId: 't1', inputId: 'a', content: 'First' },
+      { type: 'tool/call', seq: 3, call: { id: 'c1', name: 'Write', args: {} } },
+      { type: 'tool/result', seq: 4, callId: 'c1', ok: true, output: 'ok' },
+      { type: 'turn/error', seq: 5, turnId: 't1', kind: 'provider', message: 'boom' },
+      { type: 'turn/end', seq: 6, turnId: 't1', reason: 'failed' },
+      { type: 'input/queued', seq: 7, inputId: 'b', content: 'Second' },
+      { type: 'turn/start', seq: 8, turnId: 't2' },
+      { type: 'user/message', seq: 9, turnId: 't2', inputId: 'b', content: 'Second' },
+      { type: 'turn/error', seq: 10, turnId: 't2', kind: 'provider', message: 'boom again' },
+      { type: 'turn/end', seq: 11, turnId: 't2', reason: 'failed' },
+    ])
+    const retries = items.flatMap((item) => item.kind === 'status' && item.retry !== undefined ? [item.retry] : [])
+    expect(retries).toEqual([
+      { key: 'seq-5', inputs: [{ content: 'First' }], toolsRan: true },
+      { key: 'seq-10', inputs: [{ content: 'Second' }], toolsRan: false },
+    ])
+  })
+  it('a steered input is marked until its turn claims it; the steered turn reads Redirected', () => {
+    const log: SseEvent[] = [
+      { type: 'turn/start', seq: 0, turnId: 't1' },
+      { type: 'input/queued', seq: 1, inputId: 's', content: 'Do this instead', delivery: 'steer' },
+    ]
+    expect(projectItems(log)[0]).toMatchObject({ kind: 'user', queued: true, steer: true, inputId: 's' })
+    const done = projectItems([...log,
+      { type: 'turn/end', seq: 2, turnId: 't1', reason: 'steered' },
+      { type: 'turn/start', seq: 3, turnId: 't2' },
+      { type: 'user/message', seq: 4, turnId: 't2', inputId: 's', content: 'Do this instead' },
+    ])
+    expect(done[0]).toMatchObject({ kind: 'user', queued: false })
+    expect(done[0]).not.toHaveProperty('steer')
+    expect(taskPhase([{ type: 'turn/start', seq: 0 }, { type: 'turn/end', seq: 1, reason: 'steered' }])).toBe('steered')
+  })
+  it.each(['completed', 'failed', 'interrupted', 'cancelled', 'steered', 'limit', 'empty', 'rejected'] as const)('preserves durable terminal reason %s', (reason) => {
     expect(taskPhase([{ type: 'turn/start', seq: 0 }, { type: 'turn/end', seq: 1, reason }])).toBe(reason)
   })
   it('ends incomplete streamed output on interruption and retains approval decisions', () => {

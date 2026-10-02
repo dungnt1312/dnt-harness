@@ -95,4 +95,7 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'))
 }
 
-void main()
+main().catch((error: unknown) => {
+  process.stderr.write(`mini-dsh web: failed to start: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`)
+  process.exit(1)
+})

@@ -24,7 +24,7 @@ it('does not starve the displayed answer during uninterrupted streaming', async 
   expect(host.textContent).toContain('first 4')
 })
 
-it('limits live markdown reparsing to 100 ms while displaying the final answer immediately', async () => {
+it('limits live text updates to 100 ms while displaying the final markdown answer immediately', async () => {
   vi.useFakeTimers()
   host = document.createElement('div')
   document.body.append(host)

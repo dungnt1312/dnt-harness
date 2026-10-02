@@ -60,7 +60,12 @@ describe('KillShell', () => {
     const registry = new ProcessRegistry({})
     const killTool = killShellTool({ processes: registry })
     const id = await startBackground(registry, 'true')
-    await new Promise((resolve) => setTimeout(resolve, 1_200))
+    // Poll instead of a fixed sleep: a login shell can take seconds to exit on a loaded Windows host.
+    const deadline = Date.now() + 10_000
+    while (registry.isRunning('s1' as never, id) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    expect(registry.isRunning('s1' as never, id)).toBe(false)
     const ended = await killTool.execute({ processId: id }, exec('s1'))
     expect(ended).toContain('already ended')
     const unknown = await killTool.execute({ processId: 'proc_missing' }, exec('s1'))

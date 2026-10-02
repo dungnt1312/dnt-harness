@@ -1,8 +1,26 @@
 import { describe, expect, it } from 'vitest'
-import { Generation, composerKey, emptyComposer, acceptedDraft, popupPosition, tabDestination } from './interaction.ts'
+import { Generation, composerKey, emptyComposer, acceptedDraft, popupPosition, requestIdFor, tabDestination } from './interaction.ts'
 import { emptyDraft, textDraft, type AttachmentRef } from './composer-draft.ts'
 
 const ATTACHMENT: AttachmentRef = { id: 'a'.repeat(64), name: 'image.png', mediaType: 'image/png', bytes: 1 }
+
+describe('submit request ids (transport-retry dedup)', () => {
+  let n = 0
+  const fresh = (): string => `id-${++n}`
+  it('resending the unchanged draft after a failure reuses the id', () => {
+    const failed = { ...emptyComposer, draft: textDraft('hi'), revision: 3, error: 'HTTP 502', pendingRequest: { id: 'r1', revision: 3 } }
+    expect(requestIdFor(failed, fresh)).toBe('r1')
+  })
+  it('any edit after the failed submit gets a fresh id', () => {
+    const edited = { ...emptyComposer, draft: textDraft('hi!'), revision: 4, pendingRequest: { id: 'r1', revision: 3 } }
+    expect(requestIdFor(edited, fresh)).not.toBe('r1')
+  })
+  it('acceptance spends the id', () => {
+    const accepted = acceptedDraft({ ...emptyComposer, draft: textDraft('hi'), revision: 3, pendingRequest: { id: 'r1', revision: 3 } }, 3)
+    expect(accepted.pendingRequest).toBeUndefined()
+    expect(requestIdFor(accepted, fresh)).not.toBe('r1')
+  })
+})
 
 describe('navigation completion guards', () => {
   it('rejects a delayed create/delete after A → B → A', async () => {

@@ -27,6 +27,15 @@
   --color-bad-fg: var(--bad-fg);
   --color-scrim: var(--scrim);
   --color-composer: var(--composer);
+  --color-tool-read: var(--tool-read);
+  --color-tool-edit: var(--tool-edit);
+  --color-tool-search: var(--tool-search);
+  --color-tool-run: var(--tool-run);
+  --color-tool-agent: var(--tool-agent);
+  --color-tool-ext: var(--tool-ext);
+  --color-term-bg: var(--term-bg);
+  --color-term-fg: var(--term-fg);
+  --color-term-dim: var(--term-dim);
   --shadow-pop: var(--shadow-pop);
   --shadow-composer: var(--shadow-composer);
   --font-sans: "Instrument Sans", ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
@@ -66,6 +75,18 @@
   --hl-title: #6f42c1;
   --hl-builtin: #953800;
   --hl-attr: #0550ae;
+  /* Tool kinds: each family of activity has one hue, used for its icon only.
+     All clear 3:1 against --bg, so an icon reads without depending on text. */
+  --tool-read: #1d63d8;
+  --tool-edit: #047857;
+  --tool-search: #7c3aed;
+  --tool-run: #a15c07;
+  --tool-agent: #be185d;
+  --tool-ext: #0e7490;
+  /* The terminal panel: a dark well in both themes, so command output reads as a terminal. */
+  --term-bg: #1e1e1e;
+  --term-fg: #d6d6d6;
+  --term-dim: #8f8f8f;
 }
 
 :root[data-theme="dark"] {
@@ -101,6 +122,15 @@
   --hl-title: #61aeee;
   --hl-builtin: #e6c07b;
   --hl-attr: #d19a66;
+  --tool-read: #7cb4ff;
+  --tool-edit: #4ade9a;
+  --tool-search: #c4a1ff;
+  --tool-run: #f5b84a;
+  --tool-agent: #f38fc0;
+  --tool-ext: #5fd4d4;
+  --term-bg: #181818;
+  --term-fg: #d6d6d6;
+  --term-dim: #8f8f8f;
 }
 
 @layer base {

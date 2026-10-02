@@ -95,6 +95,8 @@ export async function readEventLog(filePath: string): Promise<EventLogRead> {
 
   const events: SessionEvent[] = []
   let truncatedTail = false
+  // Character offset where the current line starts in `raw`.
+  let lineStart = 0
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] as string
     const lineNumber = i + 1
@@ -107,11 +109,13 @@ export async function readEventLog(filePath: string): Promise<EventLogRead> {
         throw new SessionLogError('corruption', `corrupt record at line ${lineNumber} of '${filePath}'`, filePath, lineNumber)
       }
       // Torn final write: quarantine the raw bytes, then repair the file to
-      // the good prefix so later appends start from a clean tail.
-      await quarantineTail(filePath, raw, line)
+      // the good prefix (everything before this line) so later appends start
+      // from a clean tail.
+      await quarantineTail(filePath, raw.slice(0, lineStart), raw.slice(lineStart))
       truncatedTail = true
       break
     }
+    lineStart += line.length + 1
     const event = validateRecord(parsed, filePath, lineNumber)
     if (event.seq !== events.length + 1) {
       throw new SessionLogError(
@@ -123,12 +127,32 @@ export async function readEventLog(filePath: string): Promise<EventLogRead> {
     }
     events.push(event)
   }
+  // A crash between writing a complete record and its newline leaves a valid
+  // but unterminated final line. The next append would glue onto it and the
+  // following load would discard both as one torn line: terminate it now.
+  if (!truncatedTail && raw.length > 0 && !raw.endsWith('\n')) {
+    await terminateLastLine(filePath)
+  }
   return { events, truncatedTail }
 }
 
+async function terminateLastLine(filePath: string): Promise<void> {
+  try {
+    const handle = await fs.open(filePath, 'a')
+    try {
+      await handle.write('\n', null, 'utf8')
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+  } catch (error) {
+    throw new SessionLogError('io', `cannot terminate the final record of '${filePath}': ${String(error)}`, filePath)
+  }
+}
+
 /** Preserve the torn tail verbatim, then truncate the log to the good prefix. */
-async function quarantineTail(filePath: string, raw: string, tornLine: string): Promise<void> {
-  const goodBytes = Buffer.byteLength(raw.slice(0, raw.length - tornLine.length), 'utf8')
+async function quarantineTail(filePath: string, goodPrefix: string, tornLine: string): Promise<void> {
+  const goodBytes = Buffer.byteLength(goodPrefix, 'utf8')
   const quarantine = `${filePath}.partial-${Date.now().toString(36)}`
   try {
     await fs.writeFile(quarantine, tornLine, 'utf8')

@@ -137,6 +137,143 @@ describe('input acceptance over REST', () => {
     }
   })
 
+  describe('steer', () => {
+    /** First request hangs until aborted; every later one answers at once. */
+    function steerableProvider(): LlmProvider {
+      let calls = 0
+      return {
+        name: 'hang',
+        models: ['hang'],
+        async *stream(_request, options) {
+          calls += 1
+          if (calls === 1) {
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener('abort', () => reject(new Error('aborted')))
+            })
+          }
+          yield { type: 'delta', delta: `reply ${calls}` }
+        },
+      }
+    }
+    type LogEvent = { type: string; reason?: string; content?: string; delivery?: string }
+    const ws = (id: string, action: string): string => `/api/workspaces/default/sessions/${id}/${action}`
+    async function events(base: string, id: string): Promise<LogEvent[]> {
+      const response = await fetch(`${base}${ws(id, 'events')}`)
+      const reader = (response.body as ReadableStream<Uint8Array>).getReader()
+      let buffer = ''
+      try {
+        while (!buffer.includes('\n\n')) {
+          const { value, done } = await reader.read()
+          if (done) break
+          buffer += new TextDecoder().decode(value)
+        }
+      } finally {
+        await reader.cancel()
+      }
+      const line = buffer.split('\n').find((row) => row.startsWith('data: '))
+      return (JSON.parse(line!.slice('data: '.length)) as { events: LogEvent[] }).events
+    }
+    async function settle(base: string, id: string, until: (log: LogEvent[]) => boolean): Promise<LogEvent[]> {
+      for (let i = 0; i < 60; i++) {
+        const log = await events(base, id)
+        if (until(log)) return log
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      return events(base, id)
+    }
+    const ends = (log: LogEvent[]): string[] => log.flatMap((e) => e.type === 'turn/end' ? [e.reason ?? ''] : [])
+    const users = (log: LogEvent[]): string[] => log.flatMap((e) => e.type === 'user/message' ? [e.content ?? ''] : [])
+    const stepping = (log: LogEvent[]): boolean => log.some((e) => e.type === 'step/start')
+
+    it('delivery:steer stops the running turn and runs the old queue plus the new message', async () => {
+      const server = await createWebServer({ root, providers: [steerableProvider()] })
+      try {
+        const { id } = (await (await post(server.url, '/api/sessions')).json()) as { id: string }
+        await post(server.url, ws(id, 'messages'), { content: 'first' })
+        await settle(server.url, id, stepping)
+        expect((await post(server.url, ws(id, 'messages'), { content: 'queued' })).status).toBe(202)
+        const steered = await post(server.url, ws(id, 'messages'), { content: 'instead', delivery: 'steer' })
+        expect(steered.status).toBe(202)
+        expect(await steered.json()).toMatchObject({ queued: false, delivery: 'steer' })
+
+        const log = await settle(server.url, id, (l) => ends(l).length >= 2)
+        expect(ends(log)).toEqual(['steered', 'completed'])
+        expect(users(log)).toEqual(['first', 'queued', 'instead'])
+        expect(log.find((e) => e.type === 'input/queued' && e.content === 'instead')?.delivery).toBe('steer')
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('a duplicate steer never stops the turn the first request started', async () => {
+      const server = await createWebServer({ root, providers: [hangProvider()] })
+      try {
+        const { id } = (await (await post(server.url, '/api/sessions')).json()) as { id: string }
+        await post(server.url, ws(id, 'messages'), { content: 'go', clientRequestId: 'r1' })
+        await settle(server.url, id, stepping)
+        const dup = await post(server.url, ws(id, 'messages'), { content: 'go', clientRequestId: 'r1', delivery: 'steer' })
+        expect(dup.status).toBe(200)
+        expect(await dup.json()).toMatchObject({ duplicate: true })
+        await new Promise((resolve) => setTimeout(resolve, 120))
+        expect(ends(await events(server.url, id))).toEqual([])
+        await post(server.url, ws(id, 'stop'))
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('a refused steer (429) leaves the running turn alone', async () => {
+      const server = await createWebServer({ root, providers: [hangProvider()], limits: { maxPendingInputs: 1 } })
+      try {
+        const { id } = (await (await post(server.url, '/api/sessions')).json()) as { id: string }
+        await post(server.url, ws(id, 'messages'), { content: 'go' })
+        await settle(server.url, id, stepping)
+        expect((await post(server.url, ws(id, 'messages'), { content: 'fills the queue' })).status).toBe(202)
+        expect((await post(server.url, ws(id, 'messages'), { content: 'too many', delivery: 'steer' })).status).toBe(429)
+        await new Promise((resolve) => setTimeout(resolve, 120))
+        expect(ends(await events(server.url, id))).toEqual([])
+        await post(server.url, ws(id, 'stop'))
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('an unknown delivery is a 400', async () => {
+      const server = await createWebServer({ root, providers: [hangProvider()] })
+      try {
+        const { id } = (await (await post(server.url, '/api/sessions')).json()) as { id: string }
+        expect((await post(server.url, ws(id, 'messages'), { content: 'x', delivery: 'now' })).status).toBe(400)
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('POST /steer runs input a stop left queued; with nothing pending it stops nothing', async () => {
+      const server = await createWebServer({ root, providers: [steerableProvider()] })
+      try {
+        const { id } = (await (await post(server.url, '/api/sessions')).json()) as { id: string }
+        await post(server.url, ws(id, 'messages'), { content: 'first' })
+        await settle(server.url, id, stepping)
+        // Empty queue: Send now must not act as a hidden Stop.
+        expect(await (await post(server.url, ws(id, 'steer'))).json()).toEqual({ steered: false, pending: 0 })
+        await post(server.url, ws(id, 'messages'), { content: 'left behind' })
+        await post(server.url, ws(id, 'stop'))
+        let log = await settle(server.url, id, (l) => ends(l).length >= 1)
+        expect(ends(log)).toEqual(['cancelled'])
+        expect(users(log)).toEqual(['first'])
+
+        const now = await post(server.url, ws(id, 'steer'))
+        expect(now.status).toBe(202)
+        expect(await now.json()).toEqual({ steered: true, pending: 1 })
+        log = await settle(server.url, id, (l) => ends(l).length >= 2)
+        expect(ends(log)).toEqual(['cancelled', 'completed'])
+        expect(users(log)).toEqual(['first', 'left behind'])
+      } finally {
+        await server.close()
+      }
+    })
+  })
+
   it('deleting a running session is refused; deleting a stopped one works', async () => {
     const server = await createWebServer({ root, providers: [hangProvider()] })
     try {

@@ -302,6 +302,7 @@ export class ToolsService extends Service {
     return {
       root: grant?.root ?? '',
       ...(scope?.sessionId !== undefined ? { sessionId: scope.sessionId, observations: this.fileObservations } : {}),
+      ...(scope?.sessionId !== undefined && scope.childOf !== undefined ? { observationParents: [scope.childOf.parentSessionId] } : {}),
       ...(grant?.additionalRoots !== undefined && grant.additionalRoots.length > 0 ? { additionalRoots: grant.additionalRoots } : {}),
       ...(grant?.deniedRoots !== undefined ? { deniedRoots: grant.deniedRoots } : {}),
       ...(signal !== undefined ? { signal } : {}),

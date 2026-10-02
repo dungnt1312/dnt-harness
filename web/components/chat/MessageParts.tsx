@@ -3,8 +3,8 @@ import Icon, { type IconName } from '../common/Icon.tsx'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
 import { DiffLines, LineCount, diffRowsFromEdit, diffRowsFromWrite, type DiffRow } from '../common/DiffLines.tsx'
 import CopyButton from '../common/CopyButton.tsx'
+import ConfirmDialog from '../common/ConfirmDialog.tsx'
 import { Spinner } from '../common/Spinner.tsx'
-import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Markdown } from '../../Markdown.tsx'
 import { ThinkingPanel } from './ThinkingPanel.tsx'
@@ -12,14 +12,13 @@ import { useHoldScroll } from '../../hooks/useStickToBottom.ts'
 import { budgetTone, contextFill, formatBytes, formatElapsed, formatTime, formatTokenCount } from '../../lib/format.ts'
 import { isDenied, mcpServerOf, toolFacts, type ToolFacts } from '../../lib/tool-facts.ts'
 import { Section, ToolArguments, preClass } from './ToolArguments.tsx'
-import { errorSummary } from '../../lib/copy.ts'
 import { attachmentUrl, fetchContextBody, waitChild } from '../../lib/api.ts'
 import { cn } from '../../lib/cn.ts'
 import type { AttachmentRef } from '../../lib/composer-draft.ts'
 import { parseMessageText } from '../../lib/inline-chips.ts'
 import { InlineChip } from '../common/InlineChip.tsx'
 import { ImageLightbox } from './ImageLightbox.tsx'
-import type { ChildRow, ToolCall } from '../../lib/types.ts'
+import type { ChildRow, ContextManifestView, ToolCall } from '../../lib/types.ts'
 import type { ViewItem } from '../../lib/project.ts'
 import type { OpenPathResolver } from '../../lib/project-paths.ts'
 import type { TurnChanges } from '../../lib/turn-changes.ts'
@@ -51,13 +50,21 @@ const isImageAttachment = (ref: AttachmentRef): boolean => ref.mediaType.startsW
 /** Hover-revealed on fine pointers, always visible on touch and keyboard focus. */
 const revealActions = 'opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 [@media(pointer:coarse)]:opacity-100'
 
-export const UserBubble = memo(function UserBubble({ item, workspaceId, onReuse }: {
+export const UserBubble = memo(function UserBubble({ item, workspaceId, onReuse, onSendNow, running = false }: {
   readonly item: Extract<ViewItem, { kind: 'user' }>
   /** Needed to fetch attachment bytes; without it they show as file chips. */
   readonly workspaceId?: string | null
   readonly onReuse?: (text: string) => void
+  /** Steer: stop the running turn (if any) and run every queued input now. */
+  readonly onSendNow?: () => void
+  /** A turn is open: a steered input is still stopping it, not stranded. */
+  readonly running?: boolean
 }) {
   const queued = item.queued === true
+  // A steer only "steers" while a turn is open; one stranded by a restart is
+  // plain queued input again and gets Send now like any other.
+  const steering = queued && item.steer === true && running
+  const notSent = item.notSent
   const attachments = item.attachments ?? []
   const [preview, setPreview] = useState<AttachmentRef | null>(null)
   // Images sit above the bubble as bare thumbnails — nested inside the grey
@@ -95,6 +102,18 @@ export const UserBubble = memo(function UserBubble({ item, workspaceId, onReuse 
         // Actions sit beside the bubble, not under it: the bubble never spans the
         // column, so the room they need is already there.
         <div className="flex w-full items-end justify-end gap-1">
+          {queued && !steering && onSendNow !== undefined ? (
+            // Always visible: a queued message after a stop does nothing until
+            // someone runs it, so the way to run it must not hide on hover.
+            <button
+              type="button"
+              onClick={onSendNow}
+              title="Stop the current turn and run the queued messages now"
+              className="mb-0.5 shrink-0 rounded-full border border-line-strong px-2.5 py-1 text-xs font-medium text-fg hover:bg-hover"
+            >
+              Send now
+            </button>
+          ) : null}
           {!queued && onReuse !== undefined ? (
             <div className={cn('flex shrink-0 items-center gap-0.5 pb-0.5', revealActions)}>
               <CopyButton text={item.content} label="Copy message" className="size-7" />
@@ -106,10 +125,20 @@ export const UserBubble = memo(function UserBubble({ item, workspaceId, onReuse 
           <div
             className={cn(
               'max-w-[85%] rounded-3xl px-4 py-2.5 text-[15px] leading-relaxed sm:max-w-[70%]',
-              queued ? 'border border-dashed border-line-strong text-fg-muted' : 'bg-muted',
+              queued || notSent !== undefined ? 'border border-dashed border-line-strong text-fg-muted' : 'bg-muted',
             )}
           >
-            {queued ? <span className="mb-0.5 block text-[11px] font-medium uppercase tracking-wide text-fg-faint">Queued</span> : null}
+            {queued ? (
+              <span className="mb-0.5 block text-[11px] font-medium uppercase tracking-wide text-fg-faint">
+                {steering ? 'Steering · stopping current turn…' : 'Queued'}
+              </span>
+            ) : null}
+            {notSent !== undefined ? (
+              <span className="mb-0.5 flex items-center gap-1 text-[11px] font-medium uppercase tracking-wide text-bad">
+                <Icon name="alertTriangle" size={11} />
+                {notSent === 'rejected' ? 'Not sent · rejected' : 'Not sent'}
+              </span>
+            ) : null}
             {files.length > 0 ? (
               <ul className="m-0 mb-1.5 flex list-none flex-wrap gap-1.5 p-0">
                 {files.map((ref) => (
@@ -248,7 +277,7 @@ const InGroupContext = createContext(false)
  * background. Only the chevron reveals on hover. A settled success adds
  * nothing to the line; only an outcome worth a look gets a status word.
  */
-const rowClass = 'inline-flex max-w-full items-center gap-2 self-start text-left text-[13px] leading-5 text-fg-faint'
+const rowClass = 'inline-flex max-w-full items-center gap-2 self-start text-left text-sm leading-5 text-fg-faint'
 
 /** Built-in tools only. An MCP tool called `read` is not the built-in and does not borrow its icon. */
 const TOOL_ICON: Readonly<Record<string, IconName>> = {
@@ -368,7 +397,7 @@ function RowLine({ spec, state, showIcon }: { readonly spec: RowSpec; readonly s
   const hasSummary = spec.primary !== undefined || spec.secondary !== undefined || spec.diff !== undefined || spec.status !== undefined
   return (
     <>
-      {showIcon ? <Icon name={spec.icon} size={14} className={cn('shrink-0', ICON_TONE[spec.icon] ?? 'text-fg-faint')} /> : null}
+      {showIcon ? <Icon name={spec.icon} size={16} className={cn('shrink-0', ICON_TONE[spec.icon] ?? 'text-fg-faint')} /> : null}
       <span className={cn('shrink-0 whitespace-nowrap font-medium', running ? 'text-shimmer' : 'text-fg-muted')}>{spec.kind}</span>
       {/* A kind that stays a noun while it runs still has to say so aloud. */}
       {running && !spec.kind.endsWith('ing') ? <span className="sr-only">, running</span> : null}
@@ -586,7 +615,7 @@ export function ActivityBlock({ items, children }: { readonly items: readonly Vi
   // row (and anything it fetched) with it. A deliberate fold still wins.
   const pin = useCallback(() => { setUserPreference((current) => current ?? true) }, [])
 
-  if (items.length < COLLAPSE_MIN_ROWS) return <div className="flex flex-col gap-2">{children}</div>
+  if (items.length < COLLAPSE_MIN_ROWS) return <div className="flex flex-col gap-4">{children}</div>
   const unknown = summary.problems > 0 && summary.state === 'unknown'
   return (
     <div className="flex flex-col">
@@ -709,7 +738,10 @@ function toolRowSpec(item: Extract<ViewItem, { kind: 'tool' }>, state: RowState,
   if (builtin === 'glob' || builtin === 'grep') {
     const pattern = typeof call.args['pattern'] === 'string' ? call.args['pattern'] : ''
     const scope = typeof call.args['path'] === 'string' && call.args['path'] !== '' ? `in ${call.args['path']}` : undefined
-    return { ...base, icon: 'search', kind: kind!, primary: pattern, primaryMono: true, ...(scope !== undefined ? { secondary: scope } : {}) }
+    // The kind is the family (Search); what it searched for keeps its own verb,
+    // the way ZCode's `Find {query}` reads: `Search · Find foo in src`.
+    const query = pattern === '' ? 'Find' : `Find ${pattern}`
+    return { ...base, icon: 'search', kind: kind!, separator: true, primary: query, primaryMono: true, ...(scope !== undefined ? { secondary: scope } : {}) }
   }
   if (builtin === 'bash') {
     return { ...base, icon: 'terminal', kind: kind!, primary: facts.target, primaryMono: true }
@@ -1095,10 +1127,77 @@ function shortSource(source: string): string {
 
 function ContextDetailRow({ label, children }: { readonly label: string; readonly children: ReactNode }) {
   return (
-    <div className="flex gap-2 text-xs">
-      <span className="w-20 shrink-0 text-fg-faint">{label}</span>
-      <span className="min-w-0 flex-1 break-words text-fg-muted">{children}</span>
+    <div className="flex flex-col gap-1 sm:flex-row sm:gap-3 text-xs">
+      <span className="shrink-0 text-[10px] font-semibold uppercase tracking-widest text-fg-faint sm:w-20 sm:pt-0.5">{label}</span>
+      <span className="min-w-0 flex-1 break-words leading-5 text-fg-muted">{children}</span>
     </div>
+  )
+}
+
+function BreakdownList({ breakdown }: { readonly breakdown: NonNullable<ContextManifestView['breakdown']> }) {
+  const total = breakdown.systemPrompt + breakdown.systemTools + breakdown.mcpTools + breakdown.metaContext + breakdown.skills + breakdown.messages
+  const rows = [
+    { key: 'history', label: 'History', value: breakdown.messages },
+    { key: 'tools', label: 'Tools', value: breakdown.systemTools },
+    { key: 'system', label: 'System', value: breakdown.systemPrompt },
+    { key: 'skills', label: 'Skills', value: breakdown.skills },
+    { key: 'meta', label: 'Meta', value: breakdown.metaContext },
+    { key: 'mcp', label: 'MCP', value: breakdown.mcpTools },
+  ].filter((row) => row.value > 0)
+  const shown = rows.length > 0 ? rows : [{ key: 'empty', label: 'Empty', value: 0 }]
+  return (
+    <span className="flex min-w-0 flex-col gap-1.5" title="Estimated tokens per source; they sum to the request total.">
+      <span className="flex h-1.5 w-full max-w-64 overflow-hidden rounded-full bg-muted" role="presentation" aria-hidden="true">
+        {shown.map((row) => (
+          <span key={row.key} className="block h-full bg-fg-faint first:bg-fg last:opacity-70" style={{ width: `${total > 0 ? Math.max((row.value / total) * 100, row.value > 0 ? 4 : 0) : 0}%` }} />
+        ))}
+      </span>
+      <span className="flex flex-wrap gap-x-2 gap-y-1">
+        {shown.map((row) => (
+          <span key={row.key} className="inline-flex items-center gap-1 rounded-md bg-muted px-1.5 py-0.5 font-mono text-[11px]">
+            <span className="text-fg-faint">{row.label}</span>
+            <span className="font-semibold text-fg-muted">{formatTokenCount(row.value)}</span>
+          </span>
+        ))}
+      </span>
+    </span>
+  )
+}
+
+function ToolChips({ names, schemas, label }: { readonly names: readonly string[]; readonly schemas: number; readonly label: string }) {
+  if (names.length === 0) return <span className="text-fg-faint">none ({schemas} schemas)</span>
+  const visible = names.slice(0, 6)
+  const extra = names.length - visible.length
+  return (
+    <span className="flex min-w-0 flex-wrap items-center gap-1" title={names.join(', ')}>
+      {visible.map((name) => (
+        <code key={name} className="rounded-md border border-line bg-muted/60 px-1.5 py-px font-mono text-[11px] text-fg-muted">{name}</code>
+      ))}
+      {extra > 0 ? <span className="font-mono text-[11px] text-fg-faint">+{extra} more</span> : null}
+      <span className="sr-only">{label}</span>
+      <span className="font-mono text-[11px] text-fg-faint">· {schemas} schemas</span>
+    </span>
+  )
+}
+
+function CopyAction({ text }: { readonly text: string }) {
+  const [copied, setCopied] = useState(false)
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        void navigator.clipboard?.writeText(text).then(
+          () => setCopied(true),
+          () => setCopied(false),
+        )
+        setTimeout(() => setCopied(false), 1_200)
+      }}
+      title="Copy block text"
+      aria-label="Copy block text"
+      className="absolute right-1.5 top-1.5 rounded-md border border-line bg-surface px-1.5 py-1 font-mono text-[10px] text-fg-faint transition-colors hover:text-fg"
+    >
+      {copied ? 'copied' : 'copy'}
+    </button>
   )
 }
 
@@ -1234,79 +1333,121 @@ export const ContextMarker = memo(function ContextMarker({ item, workspaceId, se
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
-        title={item.ts !== undefined ? formatTime(item.ts) : undefined}
-        className="flex min-w-0 items-center gap-2 py-0.5 text-left text-xs text-fg-muted transition-colors hover:text-fg"
+        title={`${formatTokenCount(fill.used)}${fill.estimated ? ' estimated' : ' reported'} of ${formatTokenCount(fill.limit)} context used${item.ts !== undefined ? ` · ${formatTime(item.ts)}` : ''}`}
+        className="group flex min-w-0 items-center gap-2 rounded-lg px-1.5 py-1 text-left text-xs text-fg-muted transition-colors hover:bg-hover hover:text-fg"
       >
         <Icon name="layers" size={13} className="shrink-0 text-fg-faint" />
-        <span className="shrink-0">Context</span>
-        {collapsedFacts.map((fact) => <span key={fact} className="min-w-0 font-mono text-fg-faint">{fact}</span>)}
-        {omissions.length > 0 ? <span className="shrink-0 text-warn">{omissions.length} omitted</span> : null}
+        <span className="shrink-0 font-medium text-fg-muted group-hover:text-fg">Context</span>
+        <span className="h-1 w-16 shrink-0 overflow-hidden rounded-full bg-muted max-sm:hidden" role="presentation" aria-hidden="true">
+          <span
+            className={cn('block h-full rounded-full', tone === 'ok' ? 'bg-fg-faint' : tone === 'warn' ? 'bg-warn' : 'bg-bad')}
+            style={{ width: `${Math.max(percent, 3)}%` }}
+          />
+        </span>
+        {collapsedFacts.map((fact, index) => (
+          <span
+            key={fact}
+            className={cn(
+              'shrink-0 truncate font-mono',
+              index === 0 ? 'font-semibold text-fg-muted' : 'text-fg-faint',
+              index > 2 && 'max-sm:hidden',
+            )}
+          >
+            {fact}
+          </span>
+        ))}
+        {omissions.length > 0 ? <span className="shrink-0 rounded-full bg-warn/15 px-1.5 py-px font-mono text-[10px] font-semibold text-warn">{omissions.length} omitted</span> : null}
         <Icon name="chevron" size={12} className={cn('ml-auto shrink-0 text-fg-faint transition-transform', open ? 'rotate-180' : '')} />
       </button>
       {open ? (
-        <div className="mt-1.5 flex flex-col gap-1.5 rounded-xl border border-line bg-surface px-3 py-2.5">
+        <div className="mt-1.5 flex flex-col gap-3 rounded-xl border border-line bg-surface px-3.5 py-3 shadow-sm">
           {(item.requests ?? 1) > 1 ? (
-            <ContextDetailRow label="Requests">{item.requests} this turn — this is the latest</ContextDetailRow>
+            <p className="m-0 rounded-lg bg-muted px-2.5 py-1.5 text-xs text-fg-muted">
+              {item.requests} this turn — this is the latest
+            </p>
           ) : null}
           <ContextDetailRow label="Window">
-            <span className="flex min-w-0 items-center gap-2">
-              <span className="h-1.5 w-24 shrink-0 overflow-hidden rounded-full bg-muted" role="presentation">
+            <span className="flex min-w-0 flex-col gap-1.5">
+              <span className="flex min-w-0 flex-wrap items-baseline gap-x-2">
+                <span className="font-mono text-[13px] font-semibold text-fg">{formatTokenCount(fill.used)}/{formatTokenCount(fill.limit)} tok</span>
+                <span className={cn(
+                  'rounded-full px-1.5 py-px font-mono text-[10px] font-semibold',
+                  fill.estimated ? 'bg-muted text-fg-faint' : 'bg-ok-soft text-ok',
+                )} title={fill.estimated ? 'Estimated (chars/4); the provider did not report usage' : 'Prompt tokens reported by the provider'}>
+                  {fill.estimated ? 'est' : 'reported'}
+                </span>
+                <span className={cn(
+                  'font-mono text-[11px] font-semibold',
+                  tone === 'ok' ? 'text-fg-faint' : tone === 'warn' ? 'text-warn' : 'text-bad',
+                )}>{percent}%</span>
+              </span>
+              <span className="h-2 w-full overflow-hidden rounded-full bg-muted" role="presentation">
                 <span
-                  className={cn('block h-full rounded-full', tone === 'ok' ? 'bg-fg' : tone === 'warn' ? 'bg-warn' : 'bg-bad')}
+                  className={cn('block h-full rounded-full transition-[width]', tone === 'ok' ? 'bg-fg' : tone === 'warn' ? 'bg-warn' : 'bg-bad')}
                   style={{ width: `${percent}%` }}
                 />
               </span>
-              <span className="font-mono">{formatTokenCount(fill.used)}/{formatTokenCount(fill.limit)} tok ({fill.estimated ? 'est' : 'reported'}) · {percent}%</span>
             </span>
           </ContextDetailRow>
           <ContextDetailRow label="Mode">
-            {manifest.modeId} · rev {manifest.modeRevision}
-            {role !== undefined ? ` · role ${role}` : ''}
-            {manifest.model !== undefined ? ` · ${manifest.model}` : ''}
+            <span className="inline-flex min-w-0 flex-wrap items-center gap-1.5">
+              <code className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-[11px] text-fg">{manifest.modeId}</code>
+              <span className="text-fg-faint">·</span>
+              <span className="font-mono text-[11px]">rev {manifest.modeRevision}</span>
+              {role !== undefined ? (<><span className="text-fg-faint">·</span><span className="rounded-md border border-line px-1.5 py-px text-[11px]">role {role}</span></>) : ''}
+              {manifest.model !== undefined ? (<><span className="text-fg-faint">·</span><span className="truncate font-mono text-[11px]" title={manifest.model}>{manifest.model}</span></>) : ''}
+            </span>
           </ContextDetailRow>
           {breakdown !== undefined ? (
             <ContextDetailRow label="Sources">
-              <span className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono" title="Estimated tokens per source; they sum to the request total.">
-                <span>system {formatTokenCount(breakdown.systemPrompt)}</span>
-                <span>tools {formatTokenCount(breakdown.systemTools)}</span>
-                <span>mcp {formatTokenCount(breakdown.mcpTools)}</span>
-                <span>meta {formatTokenCount(breakdown.metaContext)}</span>
-                <span>skills {formatTokenCount(breakdown.skills)}</span>
-                <span>history {formatTokenCount(breakdown.messages)}</span>
-              </span>
+              <BreakdownList breakdown={breakdown} />
             </ContextDetailRow>
           ) : null}
           <ContextDetailRow label="History">
-            {history.setting}: {history.includedTurns} included, {history.omittedTurns} omitted
-            {history.includedSeqRange !== undefined ? ` · seq ${history.includedSeqRange[0]}–${history.includedSeqRange[1]}` : ''}
-            {history.checkpointHash !== undefined ? ` · checkpoint ${history.checkpointHash.slice(0, 12)}` : ''}
+            <span>
+              <span className="font-medium text-fg-muted">{history.setting}</span>
+              <span>: {history.includedTurns} included, {history.omittedTurns} omitted</span>
+              {history.includedSeqRange !== undefined ? <span className="font-mono text-[11px]"> · seq {history.includedSeqRange[0]}–{history.includedSeqRange[1]}</span> : ''}
+              {history.checkpointHash !== undefined ? <span className="font-mono text-[11px] text-fg-faint" title={`checkpoint ${history.checkpointHash}`}> · checkpoint {history.checkpointHash.slice(0, 12)}</span> : ''}
+            </span>
           </ContextDetailRow>
           <ContextDetailRow label="Tools">
-            <span title={toolNames.join(', ')}>{toolLabel} ({sources.toolSchemas} schemas)</span>
+            <ToolChips names={toolNames} schemas={sources.toolSchemas} label={toolLabel} />
           </ContextDetailRow>
           {sections !== undefined && sections.length > 0 ? (
-            <div className="flex flex-col gap-1 border-t border-line pt-1.5">
+            <div className="flex flex-col gap-1 border-t border-line pt-2">
+              <span className="text-[10px] font-semibold uppercase tracking-widest text-fg-faint">Blocks · {sections.length}</span>
               {sections.map((section) => {
                 const isOpen = openHash === section.hash
                 const state = bodies[section.hash]
+                const kindIcon = section.kind === 'system' ? 'sliders' : section.kind === 'memory' ? 'pin' : section.kind === 'skill' ? 'zap' : section.kind === 'compaction' ? 'archive' : 'fileText'
                 return (
                   <div key={section.hash} className="flex flex-col gap-1">
                     <button
                       type="button"
                       onClick={() => toggleBody(section.hash)}
                       aria-expanded={isOpen}
-                      title={`Read the raw ${sectionLabel(section)} this request carried`}
-                      className="flex min-w-0 items-center gap-2 text-left text-xs text-fg-muted transition-colors hover:text-fg"
+                      title={`Read the raw ${sectionLabel(section)} this request carried · sha256 ${section.hash}`}
+                      className={cn(
+                        'flex min-w-0 items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-xs text-fg-muted transition-colors hover:border-line hover:bg-muted/60 hover:text-fg',
+                        isOpen && 'border-line bg-muted/60 text-fg',
+                      )}
                     >
-                      <Icon name="eye" size={12} className="shrink-0 text-fg-faint" />
-                      <span className="shrink-0">{sectionLabel(section)}</span>
-                      <span className="min-w-0 font-mono text-fg-faint">{section.chars.toLocaleString()} chars</span>
-                      <span className="min-w-0 font-mono text-fg-faint">{section.hash.slice(0, 12)}</span>
+                      <Icon name={kindIcon} size={13} className="shrink-0 text-fg-faint" />
+                      <span className="min-w-0 flex-1 truncate font-medium">{sectionLabel(section)}</span>
+                      <span className="shrink-0 font-mono text-[11px] text-fg-faint">{section.chars.toLocaleString()} chars</span>
+                      <span className="shrink-0 font-mono text-[11px] text-fg-faint/70 max-sm:hidden" title={`sha256 ${section.hash}`}>{section.hash.slice(0, 8)}</span>
+                      <Icon name="chevron" size={12} className={cn('shrink-0 text-fg-faint transition-transform', isOpen && 'rotate-180')} />
                     </button>
-                    {isOpen && state?.state === 'ok' ? <pre className={cn(preClass, 'max-h-80 text-[11px]')}>{state.body}</pre> : null}
-                    {isOpen && state?.state === 'loading' ? <span className="text-xs text-fg-faint">Loading…</span> : null}
+                    {isOpen && state?.state === 'ok' ? (
+                      <div className="relative">
+                        <pre className={cn(preClass, 'max-h-80 pr-10 text-[11px]')}>{state.body}</pre>
+                        <CopyAction text={state.body} />
+                      </div>
+                    ) : null}
+                    {isOpen && state?.state === 'loading' ? <span className="flex items-center gap-1.5 px-2 text-xs text-fg-faint"><Spinner size={12} /> Loading block…</span> : null}
                     {isOpen && state?.state === 'missing' ? (
-                      <span className="text-xs text-warn">Not recorded — this block predates body recording, or its content changed since.</span>
+                      <span className="px-2 text-xs text-warn">Not recorded — this block predates body recording, or its content changed since.</span>
                     ) : null}
                   </div>
                 )
@@ -1339,8 +1480,13 @@ export const ContextMarker = memo(function ContextMarker({ item, workspaceId, se
             </>
           )}
           {omissions.length > 0 ? (
-            <div className="flex flex-col gap-0.5 border-t border-line pt-1.5 text-xs text-warn">
-              {omissions.map((omission) => <span key={omission} className="break-words">omitted: {omission}</span>)}
+            <div className="flex flex-col gap-1 border-t border-line pt-2">
+              {omissions.map((omission) => (
+                <span key={omission} className="flex min-w-0 items-start gap-1.5 break-words text-xs text-warn">
+                  <Icon name="alertTriangle" size={12} className="mt-0.5 shrink-0" />
+                  <span><span className="font-semibold">omitted:</span> {omission.replace(/^omitted:\s*/, '')}</span>
+                </span>
+              ))}
             </div>
           ) : null}
         </div>
@@ -1352,6 +1498,7 @@ export const ContextMarker = memo(function ContextMarker({ item, workspaceId, se
 const REASONS: Readonly<Record<string, string>> = {
   interrupted: 'Interrupted · inspect results before continuing',
   cancelled: 'Stopped by you',
+  steered: 'Redirected · your new message runs next',
   limit: 'Limit reached',
   stopped: 'Stopped by you',
   rejected: 'Rejected',
@@ -1359,29 +1506,43 @@ const REASONS: Readonly<Record<string, string>> = {
   failed: 'Failed',
 }
 
-export function StatusLine({ reason, onRetry, onOpenSettings }: { readonly reason: string; readonly onRetry?: () => void; readonly onOpenSettings?: () => void }) {
+export function StatusLine({ reason, onRetry, toolsRan = false }: {
+  readonly reason: string
+  readonly onRetry?: () => void
+  /** Tools already ran in the failed turn: Retry asks first, since it could repeat them. */
+  readonly toolsRan?: boolean
+}) {
+  const [confirming, setConfirming] = useState(false)
   if (!reason.startsWith('Permission decision') && reason.includes(':')) {
     // Quiet by design: a failed request is a line to act on, not a red slab —
     // repeated attempts stack, and three of these must still read as a
-    // transcript. The icon carries the state; the raw response stays one
-    // click away.
+    // transcript. The raw reason is the message, truncated; the full text
+    // rides on hover, and retry safety rides on the button.
     return (
-      <div className="flex gap-2.5 rounded-xl border border-line bg-surface px-3 py-2.5" role="alert">
-        <Icon name="alertTriangle" size={15} className="mt-0.5 shrink-0 text-bad" />
-        <div className="flex min-w-0 flex-1 flex-col gap-1.5">
-          <p className="m-0 text-[13px]">
-            <strong className="font-semibold">Request failed.</strong> <span className="text-fg-muted">{errorSummary(reason)}</span>
-          </p>
-          <p className="m-0 text-xs text-fg-faint">Nothing was executed, so retrying is safe.</p>
-          <div className="flex flex-wrap items-center gap-1.5">
-            {onRetry !== undefined ? <Button variant="outline" size="sm" onClick={onRetry}><Icon name="refresh" size={14} />Retry</Button> : null}
-            {onOpenSettings !== undefined ? <Button variant="ghost" size="sm" onClick={onOpenSettings}>Open settings</Button> : null}
-          </div>
-          <details className="min-w-0 text-xs text-fg-faint">
-            <summary className="min-h-7 leading-7 hover:text-fg-muted">Original response</summary>
-            <pre className={cn(preClass, 'mt-1 max-h-48')}>{reason}</pre>
-          </details>
-        </div>
+      <div className="flex items-center gap-2 text-xs text-fg-muted" role="alert">
+        <span className="h-px w-6 bg-line" aria-hidden="true" />
+        <Icon name="alertTriangle" size={13} className="shrink-0 text-bad" />
+        <span className="min-w-0 truncate" title={reason}>{reason}</span>
+        {onRetry !== undefined ? (
+          <button
+            type="button"
+            onClick={toolsRan ? () => setConfirming(true) : onRetry}
+            title={toolsRan ? 'Tools already ran in this turn; retrying may repeat them' : 'Nothing was executed, so retrying is safe'}
+            className="shrink-0 rounded-md px-1.5 py-0.5 font-medium text-fg-muted hover:bg-muted hover:text-fg"
+          >
+            Retry
+          </button>
+        ) : null}
+        {onRetry !== undefined && toolsRan ? (
+          <ConfirmDialog
+            open={confirming}
+            title="Retry this request?"
+            confirmLabel="Retry anyway"
+            body={<p className="m-0">Tools already ran in this turn before it failed. Retrying sends the same message again, and the model may repeat those tool calls — including writes, commands, or external requests. Inspect their results first.</p>}
+            onConfirm={() => { setConfirming(false); onRetry() }}
+            onDismiss={() => setConfirming(false)}
+          />
+        ) : null}
       </div>
     )
   }

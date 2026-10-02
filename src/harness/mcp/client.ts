@@ -6,7 +6,7 @@
  * (5 fails → 5 min disabled → auto-reconnect with jitter), 30s health
  * checks, verified subprocess cleanup on disconnect.
  */
-import { execFile, spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { cpus } from 'node:os'
 import { McpDispatchError, receiptForTransportFailure, boundToolMetadata } from './boundaries.ts'
@@ -52,10 +52,18 @@ interface Transport {
 
 interface ProcessSample { readonly memoryMb: number; readonly cpuSeconds: number }
 
+/**
+ * Kill the server and every helper it started. POSIX children are spawned
+ * as process-group leaders (`detached`), so the negative pid reaches the
+ * whole group; Windows walks the tree with `taskkill /T`, asynchronously so
+ * the event loop never blocks on it.
+ */
 function killOwnedProcessTree(child: ChildProcess): void {
   if (child.pid === undefined) return
-  if (process.platform === 'win32') spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
-  else {
+  if (process.platform === 'win32') {
+    spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+      .on('error', () => { child.kill() })
+  } else {
     try { process.kill(-child.pid, 'SIGKILL') } catch { child.kill('SIGKILL') }
   }
 }
@@ -130,6 +138,9 @@ class StdioTransport implements Transport {
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: false,
       windowsHide: true,
+      // Own process group on POSIX so stop() can kill the server's helpers too.
+      // (On Windows `detached` would open a new console; taskkill /T covers it.)
+      detached: process.platform !== 'win32',
     })
     this.child = child
     if (this.stopped) {
@@ -191,7 +202,7 @@ class StdioTransport implements Transport {
     this.state = 'failed'
     for (const pending of this.pending.values()) pending.reject(error)
     this.pending.clear()
-    void this.child?.kill()
+    if (this.child !== undefined) killOwnedProcessTree(this.child)
   }
 
   private handleLine(line: string): void {
@@ -322,15 +333,15 @@ class StdioTransport implements Transport {
     await new Promise<void>((resolve) => {
       const done = (): void => resolve()
       child.once('close', done)
+      if (child.exitCode !== null || child.signalCode !== null) {
+        done()
+        return
+      }
       try {
         child.stdin?.end()
-        if (process.platform === 'win32' && child.pid !== undefined) {
-          // One OS process per (workspace, server), but MCP servers may spawn
-          // helpers. taskkill /T ensures Stop/restart leaves no orphans.
-          spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
-        } else {
-          child.kill('SIGKILL')
-        }
+        // One OS process per (workspace, server), but MCP servers may spawn
+        // helpers: kill the whole tree so Stop/restart leaves no orphans.
+        killOwnedProcessTree(child)
       } catch {
         done()
       }
@@ -757,9 +768,21 @@ export class McpServerClient {
               ? { headers: this.resolved.headers ?? this.config.headers }
               : {}),
           }, this.resolved.bearerToken, onNotification)
+    // A failed or dead transport is replaced, never abandoned: its process
+    // (and watchdog timers) would otherwise outlive the reference to it.
+    const previous = this.transport
     this.transport = transport
+    if (previous !== undefined) await previous.stop().catch(() => {})
     this.transportsStarted += 1
-    await transport.start()
+    try {
+      await transport.start()
+    } catch (error) {
+      // Handshake timeout, frame overrun, bad version: tear the child down now.
+      await transport.stop().catch(() => {})
+      if (this.transport === transport) this.transport = undefined
+      this.state = 'failed'
+      throw error
+    }
     this.state = transport.state
   }
 
@@ -836,7 +859,7 @@ export class McpServerClient {
     this.state = 'failed'
     this.consecutiveFailures = 0
     this.onAudit({ kind: 'breaker', detail: `${this.serverName} breaker open`, durationMs: 0, isError: true })
-    void this.transport?.stop()
+    void this.transport?.stop().catch(() => {})
     this.transport = undefined
     const recover = onReconnected ?? this.onReconnected
     if (recover !== undefined) this.scheduleRecovery(recover)

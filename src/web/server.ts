@@ -2637,6 +2637,13 @@ async function skillLayers(
 async function handle(req: IncomingMessage, res: ServerResponse, deps: HandlerDeps): Promise<void> {  const url = new URL(req.url ?? '/', 'http://localhost')
   const { pathname } = url
 
+  // Clickjacking defence: no other page may frame this UI (approvals and the
+  // terminal are one click away). The client itself never uses frames.
+  res.setHeader('x-frame-options', 'DENY')
+  res.setHeader('content-security-policy', "frame-ancestors 'none'")
+  res.setHeader('x-content-type-options', 'nosniff')
+  res.setHeader('referrer-policy', 'no-referrer')
+
   // DNS rebinding defence, applied before routing and to static assets too —
   // the page itself is what would carry an attacker's script. A browser sends
   // the attacker's name in `Host` even when it resolves to loopback, so
