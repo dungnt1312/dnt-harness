@@ -500,6 +500,13 @@ export interface SkillRuleRow {
   readonly enabled: boolean
 }
 
+/** One file inside a skill folder (SKILL.md plus resource files). */
+export interface SkillFileRow {
+  /** `/`-separated path relative to the skill folder. */
+  readonly path: string
+  readonly bytes: number
+}
+
 /** One memory entry; `hash` is the expectedHash token for updates. */
 export interface MemoryEntryRow {
   readonly id: string

@@ -2,7 +2,7 @@
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { deleteSkill, getSkill, getSkillSources, listProjects, listSkills, putSkillSources, saveSkill, setSkillHidden } from '../../lib/api.ts'
+import { deleteSkill, getSkill, getSkillFile, getSkillFiles, getSkillSources, listProjects, listSkills, putSkillSources, saveSkill, setSkillHidden } from '../../lib/api.ts'
 import { SkillsPanel } from './SkillsPanel.tsx'
 
 vi.mock('../../lib/api.ts', () => ({
@@ -14,9 +14,11 @@ vi.mock('../../lib/api.ts', () => ({
   getSkillSources: vi.fn(),
   putSkillSources: vi.fn(),
   listProjects: vi.fn(),
+  getSkillFiles: vi.fn(),
+  getSkillFile: vi.fn(),
 }))
 
-const mocked = vi.mocked({ listSkills, getSkill, saveSkill, deleteSkill, setSkillHidden, getSkillSources, putSkillSources, listProjects })
+const mocked = vi.mocked({ listSkills, getSkill, saveSkill, deleteSkill, setSkillHidden, getSkillSources, putSkillSources, listProjects, getSkillFiles, getSkillFile })
 
 const row = (name: string, source: 'project' | 'workspace' | 'user', extra: Record<string, unknown> = {}) =>
   ({ name, title: name, description: `${name} does things`, source, hash: `hash-${name}`, ...extra })
@@ -37,6 +39,8 @@ beforeEach(() => {
   mocked.listProjects.mockResolvedValue([{ id: 'p1', name: 'Alpha' }, { id: 'p2', name: 'Beta' }] as never)
   mocked.getSkill.mockResolvedValue({ ...row('ws-skill', 'workspace'), instructions: '---\nname: ws-skill\ndescription: x\n---\n\nBODY TEXT' })
   mocked.setSkillHidden.mockResolvedValue({ name: 'ws-skill', hidden: true })
+  mocked.getSkillFiles.mockResolvedValue({ files: [{ path: 'SKILL.md', bytes: 40 }, { path: 'scripts/run.sh', bytes: 7 }] })
+  mocked.getSkillFile.mockResolvedValue({ path: 'scripts/run.sh', content: 'echo hi', bytes: 7 })
 })
 
 let host: HTMLDivElement | null = null
@@ -100,6 +104,23 @@ describe('SkillsPanel skills tab', () => {
     await settle()
     const area = document.body.querySelector<HTMLTextAreaElement>('textarea')!
     expect(area.value).toContain('BODY TEXT')
+  })
+
+  it('expands a skill into its file tree and opens a resource file in the detail pane', async () => {
+    await renderPanel()
+    await act(async () => button('Toggle ws-skill').click())
+    await settle()
+    expect(document.body.textContent).toContain('scripts/run.sh')
+    await act(async () => button('scripts/run.sh').click())
+    await settle()
+    expect(document.body.textContent).toContain('echo hi')
+    expect(mocked.getSkillFile).toHaveBeenCalledWith('ws-1', 'ws-skill', 'scripts/run.sh', undefined)
+  })
+
+  it('keeps rows compact — the description rides the title tooltip, not the row', async () => {
+    await renderPanel()
+    expect(button('ws-skill').title).toContain('ws-skill does things')
+    expect(document.body.textContent).not.toContain('ws-skill does things')
   })
 
   it('project rows show a read-only notice and no editor', async () => {

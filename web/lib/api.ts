@@ -1,5 +1,5 @@
 import type { AttachmentRef } from './composer-draft.ts'
-import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, WorkspaceMeta, WorkspaceRow } from './types.ts'
+import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillFileRow, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, WorkspaceMeta, WorkspaceRow } from './types.ts'
 
 const CSRF_HEADER = 'x-mini-dsh-csrf'
 let csrfToken: string | undefined
@@ -687,6 +687,20 @@ export function getSkill(workspaceId: string, name: string, projectId?: string):
 /** The workspace's skill source rules (defaults materialized). */
 export function getSkillSources(workspaceId: string): Promise<{ readonly rules: readonly SkillRuleRow[] }> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills/sources`).then((r) => json<{ readonly rules: readonly SkillRuleRow[] }>(r))
+}
+
+/** Files inside one skill's owning layer folder (recursive, SKILL.md first). */
+export function getSkillFiles(workspaceId: string, name: string, projectId?: string): Promise<{ readonly files: readonly SkillFileRow[] }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}/files${projectId !== undefined ? `?projectId=${encodeURIComponent(projectId)}` : ''}`).then((r) =>
+    json<{ readonly files: readonly SkillFileRow[] }>(r),
+  )
+}
+
+/** One file's utf8 content from the skill's folder (containment-checked). */
+export function getSkillFile(workspaceId: string, name: string, filePath: string, projectId?: string): Promise<SkillFileRow & { readonly content: string }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}/file?path=${encodeURIComponent(filePath)}${projectId !== undefined ? `&projectId=${encodeURIComponent(projectId)}` : ''}`).then((r) =>
+    json<SkillFileRow & { readonly content: string }>(r),
+  )
 }
 
 /** Replace the skill source rules (validated server-side, last-write-wins). */

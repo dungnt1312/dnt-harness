@@ -7,8 +7,8 @@ import { Button } from '../ui/Button.tsx'
 import { Field } from '../ui/Field.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
-import { deleteSkill, getSkill, getSkillSources, listProjects, listSkills, putSkillSources, saveSkill, setSkillHidden } from '../../lib/api.ts'
-import type { ProjectRow, SkillRow, SkillRuleRow } from '../../lib/types.ts'
+import { deleteSkill, getSkill, getSkillFile, getSkillFiles, getSkillSources, listProjects, listSkills, putSkillSources, saveSkill, setSkillHidden } from '../../lib/api.ts'
+import type { ProjectRow, SkillFileRow, SkillRow, SkillRuleRow } from '../../lib/types.ts'
 import {
   CodeArea,
   EmptyState,
@@ -60,8 +60,11 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
   const [projects, setProjects] = useScopedState<readonly ProjectRow[]>([])
   const [baseRows, setBaseRows] = useScopedState<readonly SkillRow[]>([])
   const [projectRows, setProjectRows] = useScopedState<readonly ProjectSkillRows[]>([])
-  const [selected, setSelected] = useScopedState<{ readonly name: string; readonly source: SkillRow['source']; readonly projectId?: string } | null>(null)
+  const [selected, setSelected] = useScopedState<{ readonly name: string; readonly source: SkillRow['source']; readonly projectId?: string; readonly file: string } | null>(null)
   const [detail, setDetail] = useScopedState<SkillRow & { readonly instructions: string } | null>(null)
+  const [fileDetail, setFileDetail] = useScopedState<{ readonly path: string; readonly content: string } | null>(null)
+  const [expanded, setExpanded] = useScopedState<ReadonlySet<string>>(new Set<string>())
+  const [filesByKey, setFilesByKey] = useScopedState<Readonly<Record<string, readonly SkillFileRow[]>>>({})
   const [editing, setEditing] = useScopedState<{ readonly name: string; readonly isNew: boolean; readonly hash: string | null; readonly loaded: string } | null>(null)
   const [newName, setNewName] = useScopedState('')
   const [content, setContent] = useScopedState('')
@@ -147,10 +150,48 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
     setNotice(null)
     setConflict(false)
     const projectId = projectIdOf(row)
-    setSelected({ name: row.name, source: row.source, ...(projectId !== undefined ? { projectId } : {}) })
+    setSelected({ name: row.name, source: row.source, ...(projectId !== undefined ? { projectId } : {}), file: 'SKILL.md' })
+    setFileDetail(null)
     setDetail(await getSkill(workspaceId, row.name, projectId))
     setEditing(null)
   })
+
+  /** Expand a skill folder and lazily fetch its file listing. */
+  const toggleSkill = (row: SkillRow, key: string): void => {
+    const next = new Set(expanded)
+    if (next.has(key)) {
+      next.delete(key)
+      setExpanded(next)
+      return
+    }
+    next.add(key)
+    setExpanded(next)
+    if (filesByKey[key] !== undefined) return
+    const projectId = projectIdOf(row)
+    void getSkillFiles(workspaceId, row.name, projectId)
+      .then((res) => setFilesByKey({ ...filesByKey, [key]: res.files }))
+      .catch(() => setFilesByKey({ ...filesByKey, [key]: [{ path: 'SKILL.md', bytes: 0 }] }))
+  }
+
+  const fileIconName = (filePath: string): 'fileText' | 'fileCode' | 'fileJson' => {
+    const lower = filePath.toLowerCase()
+    if (lower.endsWith('.json') || lower.endsWith('.jsonc')) return 'fileJson'
+    if (/\.(sh|bash|py|js|jsx|ts|tsx|mjs|cjs|rs|go|rb|ps1|cmd|bat)$/.test(lower)) return 'fileCode'
+    return 'fileText'
+  }
+
+  /** Open one file of the tree in the detail pane (SKILL.md keeps its flow). */
+  const openFile = (row: SkillRow, filePath: string): Promise<void> => {
+    if (filePath === 'SKILL.md') return openDetail(row)
+    const projectId = projectIdOf(row)
+    return run(`file:${row.name}:${filePath}`, async () => {
+      setNotice(null)
+      setSelected({ name: row.name, source: row.source, ...(projectId !== undefined ? { projectId } : {}), file: filePath })
+      setEditing(null)
+      setDetail(null)
+      setFileDetail(await getSkillFile(workspaceId, row.name, filePath, projectId))
+    })
+  }
 
   const beginNew = (): void => {
     setSelected(null)
@@ -257,7 +298,20 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
         </Section>
       )
     }
-    if (selected === null || detail === null) return <EmptyState>Select a skill to preview it.</EmptyState>
+    if (selected === null) return <EmptyState>Select a skill to preview it.</EmptyState>
+    if (selected.file !== 'SKILL.md' && fileDetail !== null) {
+      return (
+        <Section title={`${selected.name} — ${fileDetail.path}`}>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge tone={badgeTone(selected.source)}>{selected.source}</Badge>
+            <span className="min-w-0 break-all font-mono text-xs text-fg-faint">{fileDetail.path}</span>
+          </div>
+          <Notice kind="info" text="Preview only — edit the file with an external editor; changes load fresh on the next read." />
+          <pre className="max-h-[50vh] overflow-auto rounded-lg border border-border-subtle bg-bg-inset p-3 font-mono text-xs whitespace-pre-wrap">{fileDetail.content}</pre>
+        </Section>
+      )
+    }
+    if (detail === null) return <EmptyState>Select a skill to preview it.</EmptyState>
     const readOnly = selected.source !== 'workspace'
     return (
       <Section title={detail.title === detail.name ? detail.name : `${detail.name} — ${detail.title}`}>
@@ -366,32 +420,56 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
                       <span className="ml-auto">{group.rows.length}</span>
                     </p>
                     {group.rows.map((row) => {
+                      const key = `${group.key}:${row.name}`
+                      const isOpen = expanded.has(key)
+                      const files = filesByKey[key]
                       const shadowedIn = group.source !== 'project' ? shadowingProjects(row.name) : []
+                      const description = row.description !== '' ? row.description : row.title !== row.name ? row.title : ''
                       return (
-                        <ItemRow
-                          key={`${group.key}:${row.name}`}
-                          title={(
-                            <>
-                              <button
-                                type="button"
-                                className={`break-all text-left ${selected?.name === row.name && selected.source === row.source ? 'text-fg' : 'text-fg-muted hover:text-fg'} ${(row.hidden ?? false) ? 'opacity-60' : ''}`}
-                                onClick={() => void openDetail(row)}
+                        <div key={key}>
+                          <div className="flex items-center gap-0.5">
+                            <IconButton label={`Toggle ${row.name}`} disabled={busy !== null} onClick={() => toggleSkill(row, key)}>
+                              <Icon name="chevron" size={12} className={isOpen ? '' : '-rotate-90'} />
+                            </IconButton>
+                            <button
+                              type="button"
+                              title={description !== '' ? `${row.name} — ${description}` : row.name}
+                              className={`flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1 py-0.5 text-left text-[13px] ${selected?.name === row.name && selected.source === row.source ? 'text-fg' : 'text-fg-muted hover:text-fg'}`}
+                              onClick={() => { toggleSkill(row, key); void openDetail(row) }}
+                            >
+                              <Icon name="folder" size={13} className="shrink-0" />
+                              <span className={`truncate ${(row.hidden ?? false) ? 'opacity-60' : ''}`}>{row.name}</span>
+                            </button>
+                            {(row.hidden ?? false) ? <Icon name="eyeOff" size={12} className="shrink-0 text-fg-faint" /> : null}
+                            {shadowedIn.length > 0 ? (
+                              <Badge
+                                tone="amber"
+                                title={`Also defined in ${shadowedIn.join(', ')} — that copy wins for those projects' sessions (first match in the rule list).`}
                               >
-                                {row.name}
-                              </button>
-                              {(row.hidden ?? false) ? <Icon name="eyeOff" size={12} className="text-fg-faint" /> : null}
-                              {shadowedIn.length > 0 ? (
-                                <Badge
-                                  tone="amber"
-                                  title={`Also defined in ${shadowedIn.join(', ')} — that copy wins for those projects' sessions (first match in the rule list).`}
+                                shadowed
+                              </Badge>
+                            ) : null}
+                          </div>
+                          {isOpen ? (
+                            <div className="ml-6 space-y-0.5 border-l border-border-subtle pl-2">
+                              {files === undefined ? (
+                                <p className="px-1 py-0.5 text-xs text-fg-faint">Loading files…</p>
+                              ) : files.length === 0 ? (
+                                <p className="px-1 py-0.5 text-xs text-fg-faint">No files.</p>
+                              ) : files.map((file) => (
+                                <button
+                                  key={file.path}
+                                  type="button"
+                                  className={`flex w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-left text-xs ${selected?.name === row.name && selected.file === file.path ? 'text-fg' : 'text-fg-muted hover:text-fg'}`}
+                                  onClick={() => void openFile(row, file.path)}
                                 >
-                                  shadowed
-                                </Badge>
-                              ) : null}
-                            </>
-                          )}
-                          meta={row.description !== '' ? row.description : undefined}
-                        />
+                                  <Icon name={fileIconName(file.path)} size={12} className="shrink-0 text-fg-faint" />
+                                  <span className="truncate">{file.path}</span>
+                                </button>
+                              ))}
+                            </div>
+                          ) : null}
+                        </div>
                       )
                     })}
                   </div>
