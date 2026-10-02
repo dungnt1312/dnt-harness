@@ -24,7 +24,7 @@ const row = (name: string, source: 'project' | 'workspace' | 'user', extra: Reco
 beforeEach(() => {
   mocked.listSkills.mockImplementation(async (_ws: string, projectId?: string) =>
     projectId === undefined
-      ? [row('ws-skill', 'workspace'), row('user-skill', 'user')]
+      ? [row('ws-skill', 'workspace'), row('user-skill', 'user', { ruleId: 'user' })]
       : projectId === 'p1'
         ? [row('proj-claude', 'project', { ruleId: 'project-claude' })]
         : [])
@@ -73,12 +73,22 @@ const renderPanel = async (): Promise<void> => {
 }
 
 describe('SkillsPanel skills tab', () => {
-  it('groups rows by project rule then workspace then user, with project names in headers', async () => {
+  it('groups rows by project rule then rule-keyed base layers, with project names in headers', async () => {
     await renderPanel()
     expect(document.body.textContent).toContain('proj-claude')
     expect(document.body.textContent).toContain('.claude/skills · Alpha')
-    expect(document.body.textContent).toContain('Workspace')
-    expect(document.body.textContent).toContain('User (~/.claude/skills)')
+    expect(document.body.textContent).toContain('Workspace skills')
+    // Base groups are labeled by the ACTUAL absolute rule path, not a hardcoded title.
+    expect(document.body.textContent).toContain('~/.claude/skills')
+  })
+
+  it('marks a base row shadowed when a project defines the same name', async () => {
+    mocked.listSkills.mockImplementation(async (_ws: string, projectId?: string) =>
+      projectId === 'p1'
+        ? [row('ws-skill', 'project', { ruleId: 'project-claude' })]
+        : [row('ws-skill', 'workspace')])
+    await renderPanel()
+    expect(document.body.textContent).toContain('shadowed')
   })
 
   it('opens the detail pane with rendered preview and edit only for workspace rows', async () => {

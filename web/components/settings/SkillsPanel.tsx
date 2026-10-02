@@ -93,7 +93,9 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
 
   const projectName = (projectId: string): string => projects.find((project) => project.id === projectId)?.name ?? projectId
 
-  /** Project x rule groups first, then the default layers; empty groups drop. */
+  /** Project x rule groups first, then base layers keyed by their ACTUAL rules
+   *  (path as label — a renamed or added absolute rule must not keep a stale
+   *  hardcoded "User (~/.claude/skills)" title); empty groups drop. */
   const groups: readonly SkillGroup[] = (() => {
     const out: SkillGroup[] = []
     for (const entry of projectRows) {
@@ -102,15 +104,31 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
         if (rows.length > 0) out.push({ key: `${entry.projectId}:${rule.id}`, label: `${rule.path} · ${projectName(entry.projectId)}`, source: 'project', rows })
       }
     }
-    const baseGroup = (source: SkillRow['source'], label: string): SkillGroup | undefined => {
-      const rows = baseRows.filter((row) => row.source === source)
-      return rows.length > 0 ? { key: source, label, source, rows } : undefined
+    for (const rule of rules) {
+      if (rule.kind === 'project') continue
+      const rows = baseRows.filter((row) => rule.kind === 'workspace'
+        ? (row.source === 'workspace' && row.ruleId === undefined)
+        : row.ruleId === rule.id)
+      if (rows.length > 0) {
+        out.push({
+          key: `base:${rule.id}`,
+          label: rule.kind === 'workspace' ? 'Workspace skills' : rule.path ?? rule.id,
+          source: rule.kind === 'workspace' ? 'workspace' : 'user',
+          rows,
+        })
+      }
     }
-    for (const group of [baseGroup('workspace', 'Workspace'), baseGroup('user', 'User (~/.claude/skills)'), baseGroup('bundled', 'Bundled')]) {
-      if (group !== undefined) out.push(group)
-    }
-    return out.filter((group) => group !== undefined)
+    const bundled = baseRows.filter((row) => row.source === 'bundled')
+    if (bundled.length > 0) out.push({ key: 'base:bundled', label: 'Bundled', source: 'bundled', rows: bundled })
+    return out
   })()
+
+  /** Base rows shadowed for some project's sessions: that project's copy wins
+   *  there (first-hit-wins), so the base row must not read as universally live. */
+  const shadowingProjects = (name: string): readonly string[] =>
+    projectRows
+      .filter((entry) => entry.rows.some((row) => row.name === name))
+      .map((entry) => projectName(entry.projectId))
 
   const visibleGroups = groups
     .map((group) => ({
@@ -200,7 +218,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
     setNotice({
       kind: 'ok',
       text: next
-        ? `${row.name} is hidden from discovery; the model loads it only when the user names it.`
+        ? `${row.name} is hidden from discovery by name across every layer; Skill load by exact name still works.`
         : `${row.name} is back in the skill catalog.`,
     })
     await refresh()
@@ -268,7 +286,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
         {!readOnly ? (
           <div className="flex flex-wrap items-center gap-2">
             <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => openEditorFromDetail(detail)}>
-              <Icon name="chevronRight" size={13} className="rotate-90" />Edit raw
+              <Icon name="pencil" size={13} />Edit raw
             </Button>
             {deleteName === detail.name ? (
               <InlineConfirm
@@ -315,13 +333,20 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
           <Section
             title="Skills"
             count={totalVisible}
-            actions={<Button variant="outline" size="sm" disabled={busy !== null} onClick={beginNew}><Icon name="plus" size={13} />New skill</Button>}
+            actions={(
+              <>
+                <IconButton label="Refresh skills" disabled={busy !== null} onClick={() => void refresh()}><Icon name="refresh" size={14} /></IconButton>
+                <Button variant="outline" size="sm" disabled={busy !== null} onClick={beginNew}><Icon name="plus" size={13} />New skill</Button>
+              </>
+            )}
           >
-            <div className="flex flex-wrap gap-2">
-              <TextInput value={search} placeholder="Search skills" onChange={(e) => setSearch(e.target.value)} />
+            <div className="flex gap-2">
+              <div className="min-w-0 flex-1">
+                <TextInput value={search} placeholder="Search skills" onChange={(e) => setSearch(e.target.value)} />
+              </div>
               <select
                 aria-label="Filter by layer"
-                className="rounded-md border border-border-subtle bg-bg-surface px-2 py-1.5 text-[13px]"
+                className="shrink-0 rounded-md border border-border-subtle bg-bg-surface px-2 py-1.5 text-[13px]"
                 value={sourceFilter}
                 onChange={(e) => setSourceFilter(e.target.value as 'all' | SkillRow['source'])}
               >
@@ -340,24 +365,35 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
                       <Icon name="folder" size={12} />{group.label}
                       <span className="ml-auto">{group.rows.length}</span>
                     </p>
-                    {group.rows.map((row) => (
-                      <ItemRow
-                        key={`${group.key}:${row.name}`}
-                        title={(
-                          <>
-                            <button
-                              type="button"
-                              className={`break-all text-left ${selected?.name === row.name && selected.source === row.source ? 'text-fg' : 'text-fg-muted hover:text-fg'}`}
-                              onClick={() => void openDetail(row)}
-                            >
-                              {row.name}
-                            </button>
-                            {(row.hidden ?? false) ? <Icon name="eyeOff" size={12} className="text-fg-faint" /> : null}
-                          </>
-                        )}
-                        meta={row.description !== '' ? row.description : undefined}
-                      />
-                    ))}
+                    {group.rows.map((row) => {
+                      const shadowedIn = group.source !== 'project' ? shadowingProjects(row.name) : []
+                      return (
+                        <ItemRow
+                          key={`${group.key}:${row.name}`}
+                          title={(
+                            <>
+                              <button
+                                type="button"
+                                className={`break-all text-left ${selected?.name === row.name && selected.source === row.source ? 'text-fg' : 'text-fg-muted hover:text-fg'} ${(row.hidden ?? false) ? 'opacity-60' : ''}`}
+                                onClick={() => void openDetail(row)}
+                              >
+                                {row.name}
+                              </button>
+                              {(row.hidden ?? false) ? <Icon name="eyeOff" size={12} className="text-fg-faint" /> : null}
+                              {shadowedIn.length > 0 ? (
+                                <Badge
+                                  tone="amber"
+                                  title={`Also defined in ${shadowedIn.join(', ')} — that copy wins for those projects' sessions (first match in the rule list).`}
+                                >
+                                  shadowed
+                                </Badge>
+                              ) : null}
+                            </>
+                          )}
+                          meta={row.description !== '' ? row.description : undefined}
+                        />
+                      )
+                    })}
                   </div>
                 ))}
               </ItemList>
@@ -372,7 +408,6 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
             rules={rules}
             onSaved={(saved) => { setRules(saved.rules); void refresh() }}
             setNotice={setNotice}
-            busy={busy !== null}
           />
         </Section>
       )}
@@ -386,11 +421,10 @@ function FoldersEditor(props: {
   readonly rules: readonly SkillRuleRow[]
   readonly onSaved: (saved: { readonly rules: readonly SkillRuleRow[] }) => void
   readonly setNotice: (notice: NoticeState) => void
-  readonly busy: boolean
 }): ReactNode {
   const [newKind, setNewKind] = useScopedState<'project' | 'absolute'>('project')
   const [newPath, setNewPath] = useScopedState('')
-  const { run } = useActionRunner((text) => props.setNotice({ kind: 'bad', text }))
+  const { busy, run } = useActionRunner((text) => props.setNotice({ kind: 'bad', text }))
 
   const persist = (next: readonly SkillRuleRow[]): Promise<void> => run('sources', async () => {
     try {
@@ -439,19 +473,19 @@ function FoldersEditor(props: {
                     className="size-3.5 accent-primary"
                     aria-label={`Enable ${rowLabel(rule)}`}
                     checked={rule.enabled}
-                    disabled={props.busy}
+                    disabled={busy !== null}
                     onChange={() => void persist(props.rules.map((candidate) => (candidate.id === rule.id ? { ...candidate, enabled: !candidate.enabled } : candidate)))}
                   />
                   Enabled
                 </label>
-                <IconButton label={`Move ${rowLabel(rule)} up`} disabled={props.busy || index === 0} onClick={() => move(index, -1)}>
-                  <Icon name="chevron" size={13} className="-rotate-90" />
+                <IconButton label={`Move ${rowLabel(rule)} up`} disabled={busy !== null || index === 0} onClick={() => move(index, -1)}>
+                  <Icon name="chevron" size={13} className="rotate-180" />
                 </IconButton>
-                <IconButton label={`Move ${rowLabel(rule)} down`} disabled={props.busy || index === props.rules.length - 1} onClick={() => move(index, 1)}>
-                  <Icon name="chevron" size={13} className="rotate-90" />
+                <IconButton label={`Move ${rowLabel(rule)} down`} disabled={busy !== null || index === props.rules.length - 1} onClick={() => move(index, 1)}>
+                  <Icon name="chevron" size={13} />
                 </IconButton>
                 {rule.kind !== 'workspace' ? (
-                  <IconButton label={`Remove ${rowLabel(rule)}`} disabled={props.busy} onClick={() => void persist(props.rules.filter((candidate) => candidate.id !== rule.id))}>
+                  <IconButton label={`Remove ${rowLabel(rule)}`} disabled={busy !== null} onClick={() => void persist(props.rules.filter((candidate) => candidate.id !== rule.id))}>
                     <Icon name="trash" size={14} />
                   </IconButton>
                 ) : null}
@@ -478,7 +512,7 @@ function FoldersEditor(props: {
         <Button
           variant="outline"
           size="sm"
-          disabled={props.busy || newPath.trim() === ''}
+          disabled={busy !== null || newPath.trim() === ''}
           onClick={() => {
             const path = newPath.trim()
             if (path === '') return
@@ -489,7 +523,7 @@ function FoldersEditor(props: {
           <Icon name="plus" size={13} />Add rule
         </Button>
       </div>
-      <p className="text-xs text-fg-faint">List order is precedence — the first folder holding a skill name wins. Absolute folders are protected from file-tool grants.</p>
+      <p className="text-xs text-fg-faint">New rules join at the end — the lowest precedence; raise one with the up arrow. List order is precedence: the first folder holding a skill name wins. Absolute folders are protected from file-tool grants.</p>
     </div>
   )
 }
