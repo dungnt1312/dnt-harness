@@ -12,6 +12,7 @@ import { Spinner } from '../common/Spinner.tsx'
 import { cn } from '../../lib/cn.ts'
 import { fetchGitStatus, listSessionProcesses, stopSessionProcess } from '../../lib/api.ts'
 import { processRows, subagentRows, type ProcessRow, type SubagentRow } from '../../lib/processes-view.ts'
+import { todosFromEvents } from '../../lib/todos-view.ts'
 import type { SseEvent } from '../../lib/types.ts'
 
 interface GitLine {
@@ -73,7 +74,7 @@ function SyncArrows({ ahead, behind }: { readonly ahead: number; readonly behind
 export function EnvironmentPanel({ workspaceId, sessionId, project, events, connected, onOpenView, onOpenProcess }: Props) {
   // Panel state is scoped to the conversation: switching resets the collapse,
   // the one-shot auto-open, and the per-section disclosure.
-  const [state, setState] = useState<{ scope: string | null; expanded: boolean; autoOpened: boolean; processesOpen: boolean; subagentsOpen: boolean; endedOpen: boolean; dismissed: ReadonlySet<string> }>({ scope: sessionId, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, endedOpen: false, dismissed: new Set() })
+  const [state, setState] = useState<{ scope: string | null; expanded: boolean; autoOpened: boolean; processesOpen: boolean; subagentsOpen: boolean; tasksOpen: boolean; endedOpen: boolean; dismissed: ReadonlySet<string> }>({ scope: sessionId, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, tasksOpen: true, endedOpen: false, dismissed: new Set() })
   const [git, setGit] = useState<GitLine | null>(null)
   const [liveRunning, setLiveRunning] = useState<readonly string[]>([])
   const [stopping, setStopping] = useState<readonly string[]>([])
@@ -92,6 +93,9 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
   const ended = useMemo(() => rows.filter((row) => row.status !== 'running' && !state.dismissed.has(row.id)), [rows, state.dismissed])
   const runningAgents = useMemo(() => agents.filter((row) => row.running), [agents])
   const hasLive = running.length > 0 || runningAgents.length > 0
+  const todo = useMemo(() => todosFromEvents(events), [events])
+  const todoDone = useMemo(() => todo.todos.filter((item) => item.status === 'completed').length, [todo])
+  const todoAllDone = todo.todos.length > 0 && todoDone === todo.todos.length
 
   // The turn currently open in this conversation, if any — the header's
   // `Working · <elapsed>` indicator, same semantics as the TaskStatus line.
@@ -106,7 +110,7 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
   const ticking = running.length > 0 || workingSince !== null
 
   const scope = sessionId ?? null
-  if (state.scope !== scope) setState({ scope, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, endedOpen: false, dismissed: new Set() })
+  if (state.scope !== scope) setState({ scope, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, tasksOpen: true, endedOpen: false, dismissed: new Set() })
 
   // The one-shot auto-open: the first live process or subagent for this
   // conversation expands the panel; a user collapse never reopens it.
@@ -240,6 +244,12 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
                   {runningAgents.length}
                 </span>
               ) : null}
+              {!todoAllDone && todo.todos.length > 0 ? (
+                <span data-todo-chip className="flex shrink-0 items-center gap-0.5 rounded bg-muted px-1 py-px text-[10px] font-medium leading-[14px] text-fg-muted" title={`${todoDone}/${todo.todos.length} tasks completed`}>
+                  <Icon name="check" size={9} />
+                  {todoDone}/{todo.todos.length}
+                </span>
+              ) : null}
             </span>
           ) : null}
           <Icon name="chevron" size={13} className={cn('icon-chevron ml-auto shrink-0 rounded-full p-0.5 text-fg-faint transition-transform hover:bg-hover hover:text-fg', expanded ? 'rotate-180' : '')} />
@@ -342,6 +352,42 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
                   <div className="flex flex-col gap-0.5 pb-1">
                     {agents.map((row) => (
                       <SubagentLine key={row.childSessionId} row={row} onOpen={() => onOpenView('agents')} />
+                    ))}
+                  </div>
+                ) : null}
+              </section>
+            ) : null}
+
+            {todo.todos.length > 0 ? (
+              <section aria-label="Tasks" className="flex flex-col">
+                <button
+                  type="button"
+                  aria-expanded={state.tasksOpen}
+                  onClick={() => setState((prev) => ({ ...prev, tasksOpen: !prev.tasksOpen }))}
+                  className="flex w-full items-center gap-2 rounded-lg px-1.5 py-1.5 text-left text-[13px] transition-colors hover:bg-hover"
+                >
+                  <Icon name="check" size={14} className="shrink-0 text-fg-faint" />
+                  <span className="min-w-0 flex-1 truncate font-medium text-fg-muted">Tasks</span>
+                  <span className={cn('shrink-0 whitespace-nowrap text-[12px]', todoAllDone ? 'text-ok' : 'text-fg-faint')}>
+                    {todoAllDone ? 'Done' : `${todoDone}/${todo.todos.length}`}
+                  </span>
+                  <Icon name="chevron" size={13} className={cn('shrink-0 text-fg-faint transition-transform', state.tasksOpen ? '' : 'rotate-180')} />
+                </button>
+                {state.tasksOpen ? (
+                  <div className="flex flex-col gap-0.5 pb-1">
+                    {todo.todos.map((item, index) => (
+                      <div key={index} className="flex items-center gap-2 rounded-lg py-1 pl-2.5 pr-1.5 text-[13px]">
+                        {item.status === 'in_progress' ? (
+                          <Spinner size={11} />
+                        ) : item.status === 'completed' ? (
+                          <Icon name="check" size={11} className="shrink-0 text-ok" />
+                        ) : (
+                          <span className="inline-block size-[11px] shrink-0 rounded-full border border-line" aria-hidden />
+                        )}
+                        <span className={cn('min-w-0 flex-1 truncate', item.status === 'completed' ? 'text-fg-faint' : 'text-fg')} title={item.status === 'in_progress' ? item.activeForm : item.content}>
+                          {item.content}
+                        </span>
+                      </div>
                     ))}
                   </div>
                 ) : null}

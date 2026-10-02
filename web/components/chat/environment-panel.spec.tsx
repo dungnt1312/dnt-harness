@@ -171,3 +171,53 @@ it('renders nothing without a session', async () => {
   await render({ ...base, sessionId: null, project: null, events: [] })
   expect(host.textContent).toBe('')
 })
+
+const todoEvents = [
+  ev('tool/call', { call: { id: 'c1', name: 'TodoWrite', args: { todos: [
+    { content: 'Research', status: 'completed', activeForm: 'Researching' },
+    { content: 'Implement', status: 'in_progress', activeForm: 'Implementing' },
+    { content: 'Test', status: 'pending', activeForm: 'Testing' },
+  ] } } }),
+  ev('tool/result', { callId: 'c1', ok: true, output: 'Todo list updated: 3 tasks (1 completed, 1 in progress, 1 pending)' }),
+]
+
+it('shows the Tasks section with counter and item rows', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
+  await render({ ...base, events: todoEvents })
+  // The section is the expanded detail (the chip is the collapsed glance):
+  // tasks never auto-open the panel, so expand explicitly.
+  const expand = host.querySelector<HTMLButtonElement>('button[aria-label="Expand environment"]')
+  expect(expand).not.toBeNull()
+  await act(async () => expand!.click())
+  const section = host.querySelector('section[aria-label="Tasks"]')
+  expect(section).not.toBeNull()
+  expect(section?.textContent).toContain('1/3')
+  expect(section?.textContent).toContain('Research')
+  expect(section?.textContent).toContain('Implement')
+  expect(section?.textContent).toContain('Test')
+})
+
+it('stays collapsed for tasks and shows the capsule chip instead', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
+  await render({ ...base, events: todoEvents })
+  // No auto-open: the collapse button is still the collapsed one.
+  expect(host.querySelector('button[aria-label="Expand environment"]')).not.toBeNull()
+  expect(host.querySelector('[data-todo-chip]')?.textContent).toContain('1/3')
+})
+
+it('omits the Tasks section and chip when there is no list or after clearing', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
+  await render({ ...base, events: [] })
+  expect(host.querySelector('section[aria-label="Tasks"]')).toBeNull()
+  expect(host.querySelector('[data-todo-chip]')).toBeNull()
+
+  const cleared = [
+    ev('tool/call', { call: { id: 'c1', name: 'TodoWrite', args: { todos: [{ content: 'A', status: 'completed', activeForm: 'Doing a' }] } } }),
+    ev('tool/result', { callId: 'c1', ok: true, output: 'Todo list updated: 1 task (1 completed)' }),
+    ev('tool/call', { call: { id: 'c2', name: 'TodoWrite', args: { todos: [] } } }),
+    ev('tool/result', { callId: 'c2', ok: true, output: 'Todo list cleared' }),
+  ]
+  await render({ ...base, events: cleared })
+  expect(host.querySelector('section[aria-label="Tasks"]')).toBeNull()
+  expect(host.querySelector('[data-todo-chip]')).toBeNull()
+})
