@@ -121,6 +121,7 @@ import { importClaudeDefinition } from '../harness/agents/compatibility/claude.t
 import { SkillsService, SkillError } from '../harness/skills/service.ts'
 import { MemoryService, MemoryError } from '../harness/memory/service.ts'
 import { memoryTools } from '../harness/memory/tools.ts'
+import { todoWriteTool } from '../harness/tools/todo.ts'
 import { buildContext, DEFAULT_BASE_SYSTEM, DEFAULT_CHILD_SYSTEM, type ContextManifest, type ActiveSkill, type MemorySnippet } from '../harness/context/builder.ts'
 import { SystemPromptsStore, type SystemPromptsSnapshot } from '../harness/prompts/store.ts'
 import { CheckpointStore } from '../harness/context/compaction.ts'
@@ -1217,6 +1218,8 @@ ${entry.description}`.toLowerCase().includes(query))
   for (const tool of memoryTools(memory)) {
     kernel.ctx.tools.register(tool)
   }
+  // Claude-style session task list: full-replacement tool, state IS the log.
+  kernel.ctx.tools.register(todoWriteTool())
 
   // G4 delegation for the model itself. Async by design: one step runs its
   // tool calls in sequence, so a blocking spawn would serialize children and

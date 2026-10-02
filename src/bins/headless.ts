@@ -42,6 +42,7 @@ import {
 } from '../index.ts'
 import { DEFAULT_LIMITS } from '../harness/limits.ts'
 import { ProcessRegistry } from '../harness/processes/registry.ts'
+import { todoWriteTool } from '../harness/tools/todo.ts'
 
 loadRepoEnv()
 
@@ -144,6 +145,7 @@ async function main(): Promise<void> {
   kernel.ctx.tools.register(bashTool({ timeoutMs: DEFAULT_LIMITS.toolTimeoutMs, processes }))
   kernel.ctx.tools.register(bashOutputTool({ processes }))
   kernel.ctx.tools.register(killShellTool({ processes }))
+  kernel.ctx.tools.register(todoWriteTool())
   kernel.ctx.tools.setRootResolver(() => ({ root, deniedRoots: [dataDir] }))
   if (apiKey !== undefined) {
     kernel.ctx.llm.register(new DeepSeekProvider(apiKey, process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com'))
