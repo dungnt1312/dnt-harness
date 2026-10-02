@@ -43,7 +43,7 @@ interface ProjectSkillRows {
 }
 
 /**
- * Skills settings, two tabs: "Skills" is a layer-grouped catalog (project ×
+ * Skills settings, two tabs: "Skills" is a layer-grouped catalog (project x
  * rule groups, then workspace/user/bundled) with a detail pane — preview for
  * every layer, raw editing and delete only for workspace rows; "Source
  * folders" is the rule editor ({@link FoldersEditor}). Grouping scans ALL
@@ -93,7 +93,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
 
   const projectName = (projectId: string): string => projects.find((project) => project.id === projectId)?.name ?? projectId
 
-  /** Project × rule groups first, then the default layers; empty groups drop. */
+  /** Project x rule groups first, then the default layers; empty groups drop. */
   const groups: readonly SkillGroup[] = (() => {
     const out: SkillGroup[] = []
     for (const entry of projectRows) {
