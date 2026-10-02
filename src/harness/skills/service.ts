@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
-import { SkillError, type SkillSource } from './layers.ts'
+import { SkillError, defaultSkillRules, validateSkillRules, type SkillLayer, type SkillRule, type SkillSource } from './layers.ts'
 
 export { SkillError } from './layers.ts'
 export type { SkillSource } from './layers.ts'
@@ -13,6 +13,8 @@ export interface SkillEntry {
   readonly title: string
   readonly description: string
   readonly source: SkillSource
+  /** The source rule a project/user layer resolved from; absent on default layers. */
+  readonly ruleId?: string
   /** sha256 of the raw SKILL.md. */
   readonly hash: string
 }
@@ -46,27 +48,72 @@ export class SkillsService {
     return path.join(this.home, 'workspaces', workspaceId, 'skills')
   }
 
-  /** Configured layers, highest precedence first. */
-  private layers(workspaceId: string): Array<readonly [string, SkillSource]> {
-    const layers: Array<readonly [string, SkillSource]> = [[this.dir(workspaceId), 'workspace']]
-    if (this.userDir !== undefined) layers.push([this.userDir, 'user'])
-    if (this.bundledDir !== undefined) layers.push([this.bundledDir, 'bundled'])
+  /** The workspace layer's folder, for callers that resolve rule layers. */
+  workspaceSkillsDir(workspaceId: string): string {
+    return this.dir(workspaceId)
+  }
+
+  /** Default layers when no rules apply: workspace > user > bundled. */
+  private defaultLayers(workspaceId: string): SkillLayer[] {
+    const layers: SkillLayer[] = [{ base: this.dir(workspaceId), source: 'workspace' }]
+    if (this.userDir !== undefined) layers.push({ base: this.userDir, source: 'user' })
+    if (this.bundledDir !== undefined) layers.push({ base: this.bundledDir, source: 'bundled' })
     return layers
+  }
+
+  // ── Source rules (sources.json beside .hidden.json) ─────────────────────
+  // The ordered rule list decides which folders the catalog scans and in what
+  // precedence; see layers.ts for the pure model. Missing or corrupt file
+  // degrades to the defaults, like the hidden sidecar degrades to empty.
+
+  private sourcesPath(workspaceId: string): string {
+    return path.join(this.dir(workspaceId), 'sources.json')
+  }
+
+  /** The effective rule list; a missing or corrupt file degrades to the defaults. */
+  async sources(workspaceId: string): Promise<SkillRule[]> {
+    let raw: string
+    try {
+      raw = await fs.readFile(this.sourcesPath(workspaceId), 'utf8')
+    } catch {
+      return defaultSkillRules(this.userDir)
+    }
+    try {
+      return validateSkillRules(JSON.parse(raw) as unknown)
+    } catch {
+      return defaultSkillRules(this.userDir)
+    }
+  }
+
+  /** Replace the rule list; validated, atomic; returns what was stored. */
+  async setSources(workspaceId: string, raw: unknown): Promise<SkillRule[]> {
+    const rules = validateSkillRules(raw)
+    await this.withMutationLock(workspaceId, 'sources', async () => {
+      const file = this.sourcesPath(workspaceId)
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      await replaceFileAtomic(file, `${JSON.stringify({ rules }, null, 2)}\n`)
+    })
+    return rules
   }
 
   /** Catalog: one row per name, the highest-precedence layer wins. */
   async list(workspaceId: string): Promise<SkillEntry[]> {
+    return this.listIn(this.defaultLayers(workspaceId))
+  }
+
+  /** Layer-aware catalog scan; the first layer carrying a name wins. */
+  async listIn(layers: readonly SkillLayer[]): Promise<SkillEntry[]> {
     const rows = new Map<string, SkillEntry>()
-    for (const [base, source] of this.layers(workspaceId)) {
+    for (const layer of layers) {
       let entries
       try {
-        entries = await fs.readdir(base, { withFileTypes: true })
+        entries = await fs.readdir(layer.base, { withFileTypes: true })
       } catch {
         continue
       }
       for (const entry of entries) {
         if (!entry.isDirectory()) continue
-        const raw = await fs.readFile(path.join(base, entry.name, 'SKILL.md'), 'utf8').catch(() => undefined)
+        const raw = await fs.readFile(path.join(layer.base, entry.name, 'SKILL.md'), 'utf8').catch(() => undefined)
         if (raw === undefined) continue
         const parsed = parseSkill(raw)
         if (parsed === undefined) continue // invalid skills are surfaced on load, not served
@@ -75,7 +122,8 @@ export class SkillsService {
             name: entry.name,
             title: parsed.title ?? entry.name,
             description: parsed.description ?? '',
-            source,
+            source: layer.source,
+            ...(layer.ruleId !== undefined ? { ruleId: layer.ruleId } : {}),
             hash: sha256(raw),
           })
         }
@@ -86,11 +134,16 @@ export class SkillsService {
 
   /** Load one skill's instructions; validates the file before returning. */
   async load(workspaceId: string, name: string): Promise<LoadedSkill> {
+    return this.loadIn(this.defaultLayers(workspaceId), name)
+  }
+
+  /** Layer-aware load; the first layer holding the name wins. */
+  async loadIn(layers: readonly SkillLayer[], name: string): Promise<LoadedSkill> {
     if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) {
       throw new SkillError('not-found', `no skill '${name}'`)
     }
-    for (const [base, source] of this.layers(workspaceId)) {
-      const raw = await fs.readFile(path.join(base, name, 'SKILL.md'), 'utf8').catch(() => undefined)
+    for (const layer of layers) {
+      const raw = await fs.readFile(path.join(layer.base, name, 'SKILL.md'), 'utf8').catch(() => undefined)
       if (raw === undefined) continue
       const parsed = parseSkill(raw)
       if (parsed === undefined) {
@@ -100,7 +153,8 @@ export class SkillsService {
         name,
         title: parsed.title ?? name,
         description: parsed.description ?? '',
-        source,
+        source: layer.source,
+        ...(layer.ruleId !== undefined ? { ruleId: layer.ruleId } : {}),
         hash: sha256(raw),
         instructions: parsed.body,
       }
@@ -174,9 +228,14 @@ export class SkillsService {
 
   /** The catalog rows a request may DISCOVER: everything not hidden. */
   async listVisible(workspaceId: string): Promise<SkillEntry[]> {
+    return this.listVisibleIn(workspaceId, this.defaultLayers(workspaceId))
+  }
+
+  /** Discovery rows for explicit rule-resolved layers; hidden still filters. */
+  async listVisibleIn(workspaceId: string, layers: readonly SkillLayer[]): Promise<SkillEntry[]> {
     const hidden = new Set(await this.hiddenNames(workspaceId))
-    if (hidden.size === 0) return this.list(workspaceId)
-    return (await this.list(workspaceId)).filter((entry) => !hidden.has(entry.name))
+    const rows = await this.listIn(layers)
+    return hidden.size === 0 ? rows : rows.filter((entry) => !hidden.has(entry.name))
   }
 
   /**

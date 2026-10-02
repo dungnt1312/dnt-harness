@@ -299,6 +299,49 @@ describe('skills + memory units', () => {
     await fs.rm(home, { recursive: true, force: true })
   })
 
+  it('sources round-trip, fall back to defaults, and drive layer-aware scans', async () => {
+    const { SkillsService, resolveSkillLayers } = await import('mini-dsh')
+    const { promises: fs } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const path = await import('node:path')
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-skill-rules-'))
+    const skills = new SkillsService(home, undefined, 'C:/Users/x/.claude/skills')
+    const ws = 'wsrules' as never
+    const defaults = await skills.sources(ws)
+    expect(defaults.map((rule) => rule.id)).toEqual(['project-claude', 'project-agents', 'workspace', 'user'])
+
+    const proj = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-skill-proj-'))
+    await fs.mkdir(path.join(proj, '.claude', 'skills', 'dup'), { recursive: true })
+    await fs.writeFile(path.join(proj, '.claude', 'skills', 'dup', 'SKILL.md'), '---\nname: dup\ndescription: claude wins\n---\n\nCLAUDE', 'utf8')
+    await fs.mkdir(path.join(proj, '.agents', 'skills', 'dup'), { recursive: true })
+    await fs.writeFile(path.join(proj, '.agents', 'skills', 'dup', 'SKILL.md'), '---\nname: dup\ndescription: agents\n---\n\nAGENTS', 'utf8')
+    await fs.mkdir(path.join(proj, '.agents', 'skills', 'only-agents'), { recursive: true })
+    await fs.writeFile(path.join(proj, '.agents', 'skills', 'only-agents', 'SKILL.md'), '---\nname: only-agents\ndescription: x\n---\n\nA', 'utf8')
+
+    const layers = resolveSkillLayers(defaults, { workspaceDir: skills.workspaceSkillsDir(ws), projectPath: proj })
+    const rows = await skills.listIn(layers)
+    expect(rows.find((row) => row.name === 'dup')).toMatchObject({ source: 'project', ruleId: 'project-claude' })
+    expect(rows.find((row) => row.name === 'only-agents')).toMatchObject({ source: 'project', ruleId: 'project-agents' })
+    const loaded = await skills.loadIn(layers, 'dup')
+    expect(loaded.instructions).toContain('CLAUDE')
+
+    // Hidden still applies per workspace regardless of layers.
+    await skills.setHidden(ws, 'dup', true)
+    expect((await skills.listVisibleIn(ws, layers)).some((row) => row.name === 'dup')).toBe(false)
+
+    // Round-trip persists; a corrupt file falls back to the defaults.
+    const saved = await skills.setSources(ws, { rules: [{ id: 'claude', kind: 'project', path: '.claude/skills', enabled: true }] })
+    expect(saved).toHaveLength(1)
+    expect((await skills.sources(ws)).map((rule) => rule.id)).toEqual(['claude'])
+    await fs.writeFile(path.join(home, 'workspaces', ws as string, 'skills', 'sources.json'), '{broken', 'utf8')
+    expect((await skills.sources(ws)).map((rule) => rule.id)).toEqual(['project-claude', 'project-agents', 'workspace', 'user'])
+
+    // The legacy workspace-only signatures still work (default layers).
+    expect(await skills.list(ws)).toEqual([])
+    await fs.rm(home, { recursive: true, force: true })
+    await fs.rm(proj, { recursive: true, force: true })
+  })
+
   it('skill layers resolve workspace > user > bundled by name', async () => {
     const { SkillsService } = await import('mini-dsh')
     const { promises: fs } = await import('node:fs')
