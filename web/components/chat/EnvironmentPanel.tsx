@@ -270,8 +270,8 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
                   className="flex w-full items-center gap-2 rounded-lg px-1.5 py-1.5 text-left text-[13px] transition-colors hover:bg-hover"
                 >
                   <Icon name="terminal" size={14} className="shrink-0 text-fg-faint" />
-                  <span className="font-medium text-fg-muted">Background processes</span>
-                  <span className={cn('ml-auto text-[12px]', running.length > 0 ? 'text-warn' : 'text-fg-faint')}>
+                  <span className="min-w-0 flex-1 truncate font-medium text-fg-muted">Background processes</span>
+                  <span className={cn('shrink-0 whitespace-nowrap text-[12px]', running.length > 0 ? 'text-warn' : 'text-fg-faint')}>
                     {running.length > 0 ? `${running.length} running${ended.length > 0 ? ` · ${running.length + ended.length} total` : ''}` : `${ended.length} ended`}
                   </span>
                   <Icon name="chevron" size={13} className={cn('shrink-0 text-fg-faint transition-transform', state.processesOpen ? '' : 'rotate-180')} />
@@ -330,8 +330,8 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
                   className="flex w-full items-center gap-2 rounded-lg px-1.5 py-1.5 text-left text-[13px] transition-colors hover:bg-hover"
                 >
                   <Icon name="gitBranch" size={14} className="shrink-0 text-fg-faint" />
-                  <span className="font-medium text-fg-muted">Subagents</span>
-                  <span className={cn('ml-auto text-[12px]', runningAgents.length > 0 ? 'text-warn' : 'text-fg-faint')}>
+                  <span className="min-w-0 flex-1 truncate font-medium text-fg-muted">Subagents</span>
+                  <span className={cn('shrink-0 whitespace-nowrap text-[12px]', runningAgents.length > 0 ? 'text-warn' : 'text-fg-faint')}>
                     {runningAgents.length > 0 ? `${runningAgents.length} running` : `${agents.length}`}
                   </span>
                   <Icon name="chevron" size={13} className={cn('shrink-0 text-fg-faint transition-transform', state.subagentsOpen ? '' : 'rotate-180')} />
