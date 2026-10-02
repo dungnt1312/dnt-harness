@@ -291,6 +291,21 @@ export function toolFacts(call: ToolCall, result?: ToolResultView): ToolFacts {
       }
       break
     }
+    case 'todowrite': {
+      const todos = Array.isArray(args['todos']) ? (args['todos'] as unknown[]) : []
+      fullTarget = `${todos.length} ${todos.length === 1 ? 'task' : 'tasks'}`
+      target = fullTarget
+      path = undefined
+      if (result !== undefined) {
+        if (failed) digest = excerpt(result.output)
+        else {
+          const completed = todos.filter((entry) => (entry as Record<string, unknown> | null)?.['status'] === 'completed').length
+          const inProgress = todos.filter((entry) => (entry as Record<string, unknown> | null)?.['status'] === 'in_progress').length
+          digest = `${completed} done${inProgress > 0 ? ` · ${inProgress} in progress` : ''}`
+        }
+      }
+      break
+    }
     default: {
       fullTarget = toolTarget(args)
       target = shortenTarget(fullTarget)

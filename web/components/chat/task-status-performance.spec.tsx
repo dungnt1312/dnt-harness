@@ -24,3 +24,18 @@ it('does not rescan unchanged events when only connection status changes', async
   await act(async () => root!.render(<TaskStatus events={events} pending={0} sending={false} connected={false} />))
   expect(taskPhase).toHaveBeenCalledTimes(1)
 })
+it('reads Working · <activeForm> while a todo item is in progress', async () => {
+  host = document.createElement('div')
+  document.body.append(host)
+  root = createRoot(host)
+  const todoEvents: SseEvent[] = [
+    { type: 'turn/start', seq: 1, turnId: 't1' },
+    { type: 'tool/call', seq: 2, call: { id: 'c1', name: 'TodoWrite', args: { todos: [{ content: 'Run tests', status: 'in_progress', activeForm: 'Running tests' }] } } },
+    { type: 'tool/result', seq: 3, callId: 'c1', ok: true, output: 'Todo list updated: 1 task (1 in progress)' },
+  ]
+  await act(async () => root!.render(<TaskStatus events={todoEvents} pending={0} sending={false} connected />))
+  expect(host.textContent).toContain('Working · Running tests')
+  // Without a successful TodoWrite naming an in-progress item the line is the bare phase label.
+  await act(async () => root!.render(<TaskStatus events={events} pending={0} sending={false} connected />))
+  expect(host.querySelector('strong')!.textContent).toBe('Working')
+})

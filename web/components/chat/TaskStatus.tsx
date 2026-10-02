@@ -3,6 +3,7 @@ import Icon from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { taskPhase, type TaskPhase } from '../../lib/project.ts'
 import type { SseEvent } from '../../lib/types.ts'
+import { todosFromEvents } from '../../lib/todos-view.ts'
 
 const LABELS: Record<TaskPhase, string> = { idle: 'Ready', preparing: 'Preparing · submitting or queued', running: 'Working', waiting: 'Approval required', completed: 'Completed', failed: 'Failed', interrupted: 'Interrupted', cancelled: 'Stopped', rejected: 'Request rejected', empty: 'Ended without a response', limit: 'Turn limit reached' }
 
@@ -12,6 +13,7 @@ const LABELS: Record<TaskPhase, string> = { idle: 'Ready', preparing: 'Preparing
  */
 export function TaskStatus({ events, pending, sending, connected }: { readonly events: readonly SseEvent[]; readonly pending: number; readonly sending: boolean; readonly connected: boolean }) {
   const phase = useMemo(() => taskPhase(events, pending, sending), [events, pending, sending])
+  const todo = useMemo(() => todosFromEvents(events), [events])
   const recovered = useMemo(() => {
     let found = false
     for (let i = events.length - 1; i >= 0; i--) {
@@ -24,12 +26,13 @@ export function TaskStatus({ events, pending, sending, connected }: { readonly e
   const showPhase = !(phase === 'idle' || phase === 'completed' || phase === 'failed' || phase === 'rejected')
   if (!showPhase && connected) return null
   const busy = phase === 'running' || phase === 'preparing'
+  const phaseLabel = phase === 'running' && todo.active !== undefined ? `Working · ${todo.active.activeForm}` : LABELS[phase]
   return (
     <section aria-label="Work status" role="status" aria-live="polite" className="flex flex-col gap-1 px-1 text-[13px] text-fg-muted">
       {showPhase ? (
         <div className="flex flex-wrap items-center gap-2">
           {busy ? <Spinner size={12} /> : <Icon name={phase === 'waiting' ? 'shield' : 'info'} size={14} className={phase === 'waiting' ? 'text-warn' : undefined} />}
-          <strong className={busy ? 'font-medium text-shimmer' : 'font-medium text-fg'}>{LABELS[phase]}</strong>
+          <strong className={busy ? 'font-medium text-shimmer' : 'font-medium text-fg'}>{phaseLabel}</strong>
           {phase === 'preparing' ? <span>Queued input does not run automatically after a restart.</span> : null}
         </div>
       ) : null}
