@@ -171,7 +171,8 @@ export {
 } from './harness/context/compaction.ts'
 
 // ── Harness: skills (G3) ────────────────────────────────────────────────
-export { SkillsService, SkillError, parseSkill, type SkillEntry, type SkillSource, type LoadedSkill } from './harness/skills/service.ts'
+export { SkillsService, parseSkill, type SkillEntry, type LoadedSkill } from './harness/skills/service.ts'
+export { SkillError, defaultSkillRules, projectRuleBase, absoluteRuleBase, validateSkillRules, resolveSkillLayers, protectedRootsForRules, MAX_SKILL_RULES, type SkillRule, type SkillLayer, type SkillSource } from './harness/skills/layers.ts'
 
 // ── Harness: memory (G3) ────────────────────────────────────────────────
 export { MemoryService, MemoryError, memoryTools, type MemoryEntry } from './harness/memory/index.ts'

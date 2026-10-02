@@ -2,9 +2,10 @@ import { createHash } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
+import { SkillError, type SkillSource } from './layers.ts'
 
-/** Catalog layer a skill resolved from; only `workspace` is writable. */
-export type SkillSource = 'workspace' | 'user' | 'bundled'
+export { SkillError } from './layers.ts'
+export type { SkillSource } from './layers.ts'
 
 export interface SkillEntry {
   /** Directory/lookup name (kebab-case). */
@@ -18,16 +19,6 @@ export interface SkillEntry {
 
 export interface LoadedSkill extends SkillEntry {
   readonly instructions: string
-}
-
-export class SkillError extends Error {
-  constructor(
-    readonly code: 'not-found' | 'invalid' | 'conflict',
-    message: string,
-  ) {
-    super(message)
-    this.name = 'SkillError'
-  }
 }
 
 /**
