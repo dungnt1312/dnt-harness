@@ -4259,6 +4259,57 @@ async function handleApi(
     }
 
     // ── G3 skills ────────────────────────────────────────────
+    // Skill file tree: list + read the files inside one skill's owning layer
+    // folder (before the /skills/:name match, which is single-segment anyway).
+    const wsSkillFiles = /^\/api\/workspaces\/([^/]+)\/skills\/([^/]+)\/files$/.exec(pathname)
+    if (wsSkillFiles !== null && req.method === 'GET') {
+      const wsId = decodeURIComponent(wsSkillFiles[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, false)
+      const skillName = decodeURIComponent(wsSkillFiles[2] ?? '')
+      const rawProject = query.get('projectId')
+      let layers: SkillLayer[]
+      try {
+        layers = await skillLayers(deps.skills, deps.workspaces, wsId, rawProject !== null && rawProject !== '' ? (rawProject as ProjectId) : undefined)
+      } catch {
+        send(400, { error: 'unknown projectId' })
+        return
+      }
+      try {
+        send(200, { files: await deps.skills.filesIn(layers, skillName) })
+      } catch (error) {
+        if (error instanceof SkillError) {
+          send(error.code === 'not-found' ? 404 : 400, { error: error.message })
+          return
+        }
+        fail(error)
+      }
+      return
+    }
+    const wsSkillFile = /^\/api\/workspaces\/([^/]+)\/skills\/([^/]+)\/file$/.exec(pathname)
+    if (wsSkillFile !== null && req.method === 'GET') {
+      const wsId = decodeURIComponent(wsSkillFile[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, false)
+      const skillName = decodeURIComponent(wsSkillFile[2] ?? '')
+      const filePath = query.get('path') ?? ''
+      const rawProject = query.get('projectId')
+      let layers: SkillLayer[]
+      try {
+        layers = await skillLayers(deps.skills, deps.workspaces, wsId, rawProject !== null && rawProject !== '' ? (rawProject as ProjectId) : undefined)
+      } catch {
+        send(400, { error: 'unknown projectId' })
+        return
+      }
+      try {
+        send(200, await deps.skills.readFileIn(layers, skillName, filePath))
+      } catch (error) {
+        if (error instanceof SkillError) {
+          send(error.code === 'not-found' ? 404 : 400, { error: error.message })
+          return
+        }
+        fail(error)
+      }
+      return
+    }
     // Skill source rules (before /skills/:name, which has no room for the
     // extra segment). PUT also refreshes the grant-protected roots so the
     // absolute rule folders are never grantable to file tools.

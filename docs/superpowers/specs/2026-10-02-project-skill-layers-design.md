@@ -189,8 +189,12 @@ Panel redesign (dntspace structure, adapted):
 - Drag-and-drop reorder (↑/↓ buttons only).
 - Drag-and-drop or file-picker import of skills from a folder into the workspace
   layer (the dntspace "import" affordance — deferred).
-- Resource-file tree under a skill (SKILL.md rows only until a load API for
-  resource files exists).
+- Resource-file tree under a skill: INITIALLY deferred, pulled into scope the
+  same day — the catalog is a FILE TREE (layer group > skill folder > the
+  skill's files, descriptions as tooltips), backed by `GET /skills/:name/files`
+  (list, owning layer) and `GET /skills/:name/file?path=` (utf8 read,
+  containment-checked, 512 KB cap, binary refused). Files are view-only; only
+  SKILL.md in the workspace layer stays editable.
 - Editing project/absolute-layer skills through the UI (read-only by design).
 - A warning when `save` writes a name shadowed by a higher layer (deferred; source
   tags make the situation inspectable).

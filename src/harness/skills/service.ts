@@ -162,6 +162,58 @@ export class SkillsService {
     throw new SkillError('not-found', `no skill '${name}'`)
   }
 
+  // ── Skill file tree ──────────────────────────────────────────────────────
+  // Settings renders each skill as a folder; these reads power it. The OWNING
+  // layer is the first layer holding <base>/<name>/SKILL.md — the same
+  // first-hit rule the catalog row used, so the tree shows what that row is.
+
+  private async owningSkillDir(layers: readonly SkillLayer[], name: string): Promise<string> {
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) throw new SkillError('not-found', `no skill '${name}'`)
+    for (const layer of layers) {
+      const dir = path.join(layer.base, name)
+      const stat = await fs.stat(path.join(dir, 'SKILL.md')).catch(() => undefined)
+      if (stat !== undefined && stat.isFile()) return dir
+    }
+    throw new SkillError('not-found', `no skill '${name}'`)
+  }
+
+  /** Every file inside one skill's folder (recursive, `/`-separated, SKILL.md first). */
+  async filesIn(layers: readonly SkillLayer[], name: string): Promise<Array<{ readonly path: string; readonly bytes: number }>> {
+    const dir = await this.owningSkillDir(layers, name)
+    const files: Array<{ path: string; bytes: number }> = []
+    const walk = async (current: string, rel: string): Promise<void> => {
+      if (files.length > 200) return
+      for (const item of await fs.readdir(current, { withFileTypes: true })) {
+        const childRel = rel === '' ? item.name : `${rel}/${item.name}`
+        if (item.isDirectory()) await walk(path.join(current, item.name), childRel)
+        else if (item.isFile()) {
+          const stat = await fs.stat(path.join(current, item.name)).catch(() => undefined)
+          files.push({ path: childRel, bytes: stat?.size ?? 0 })
+        }
+      }
+    }
+    await walk(dir, '')
+    files.sort((a, b) => (a.path === 'SKILL.md' ? -1 : b.path === 'SKILL.md' ? 1 : a.path.localeCompare(b.path)))
+    return files
+  }
+
+  /** One file's utf8 content from the skill's folder; contained and capped. */
+  async readFileIn(layers: readonly SkillLayer[], name: string, rel: string): Promise<{ readonly path: string; readonly content: string; readonly bytes: number }> {
+    const dir = await this.owningSkillDir(layers, name)
+    if (rel === '' || rel.includes('\\') || rel.includes('\0')) throw new SkillError('invalid', 'bad file path')
+    const normalized = path.posix.normalize(rel)
+    if (normalized.startsWith('..') || path.posix.isAbsolute(normalized) || /^[a-zA-Z]:/.test(normalized)) {
+      throw new SkillError('invalid', 'file path escapes the skill folder')
+    }
+    const target = path.resolve(dir, normalized)
+    if (!target.startsWith(path.resolve(dir) + path.sep)) throw new SkillError('invalid', 'file path escapes the skill folder')
+    const raw = await fs.readFile(target, 'utf8').catch(() => undefined)
+    if (raw === undefined) throw new SkillError('not-found', `no file '${normalized}' in skill '${name}'`)
+    if (raw.length > 512 * 1024) throw new SkillError('invalid', 'file too large to preview (over 512 KB)')
+    if (raw.includes('\0')) throw new SkillError('invalid', 'binary file — preview is text-only')
+    return { path: normalized, content: raw, bytes: Buffer.byteLength(raw, 'utf8') }
+  }
+
   /**
    * Create or replace a workspace skill. Content is the raw SKILL.md;
    * validated before write, and `expectedHash` conflicts surface instead

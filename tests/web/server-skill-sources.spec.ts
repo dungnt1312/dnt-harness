@@ -92,8 +92,30 @@ describe('skill sources routes', () => {
     expect((await fetch(`${base}/api/workspaces/${wsId}/skills?projectId=nope`)).status).toBe(400)
   })
 
-  it('an escaping stored rule reads as nothing (containment re-checked at read time)', async () => {
-    const { base, home } = await start()
+  it('lists and reads files inside a skill folder on its owning layer', async () => {
+    const { base } = await start()
+    const wsId = await firstWorkspace(base)
+    const proj = await fs.mkdtemp(path.join(root, 'tree-'))
+    const skillDir = path.join(proj, '.claude', 'skills', 'tree-skill')
+    await fs.mkdir(path.join(skillDir, 'scripts'), { recursive: true })
+    await fs.writeFile(path.join(skillDir, 'SKILL.md'), '---\nname: tree-skill\ndescription: x\n---\n\nBODY', 'utf8')
+    await fs.writeFile(path.join(skillDir, 'scripts', 'run.sh'), 'echo hi', 'utf8')
+    const project = (await (await post(base, `/api/workspaces/${wsId}/projects`, { name: 'Tree', path: proj })).json()) as { id: string }
+
+    const files = (await (await fetch(`${base}/api/workspaces/${wsId}/skills/tree-skill/files?projectId=${project.id}`)).json()) as { files: { path: string }[] }
+    expect(files.files.map((file) => file.path)).toEqual(['SKILL.md', 'scripts/run.sh'])
+
+    const read = (await (await fetch(`${base}/api/workspaces/${wsId}/skills/tree-skill/file?projectId=${project.id}&path=${encodeURIComponent('scripts/run.sh')}`)).json()) as { path: string; content: string }
+    expect(read.content).toBe('echo hi')
+
+    const escape = await fetch(`${base}/api/workspaces/${wsId}/skills/tree-skill/file?projectId=${project.id}&path=${encodeURIComponent('../outside.txt')}`)
+    expect(escape.status).toBe(400)
+    const missing = await fetch(`${base}/api/workspaces/${wsId}/skills/tree-skill/file?projectId=${project.id}&path=nope.txt`)
+    expect(missing.status).toBe(404)
+    expect((await fetch(`${base}/api/workspaces/${wsId}/skills/no-such/files?projectId=${project.id}`)).status).toBe(404)
+  })
+
+  it('an escaping stored rule reads as nothing (containment re-checked at read time)', async () => {    const { base, home } = await start()
     const wsId = await firstWorkspace(base)
     const proj = await fs.mkdtemp(path.join(root, 'escape-'))
     const project = (await (await post(base, `/api/workspaces/${wsId}/projects`, { name: 'Escape', path: proj })).json()) as { id: string }

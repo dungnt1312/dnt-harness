@@ -338,6 +338,20 @@ describe('skills + memory units', () => {
 
     // The legacy workspace-only signatures still work (default layers).
     expect(await skills.list(ws)).toEqual([])
+
+    // File tree: list + read files inside a skill's OWNING layer folder.
+    await fs.mkdir(path.join(proj, '.claude', 'skills', 'dup', 'scripts'), { recursive: true })
+    await fs.writeFile(path.join(proj, '.claude', 'skills', 'dup', 'scripts', 'run.sh'), 'echo hi', 'utf8')
+    const files = await skills.filesIn(layers, 'dup')
+    expect(files.map((file) => file.path)).toEqual(['SKILL.md', 'scripts/run.sh'])
+    const read = await skills.readFileIn(layers, 'dup', 'scripts/run.sh')
+    expect(read.content).toBe('echo hi')
+    // First-hit layer wins: the .claude copy owns the listing even though the
+    // .agents copy of the same name also exists.
+    await expect(skills.readFileIn(layers, 'dup', '../outside')).rejects.toMatchObject({ code: 'invalid' })
+    await expect(skills.readFileIn(layers, 'dup', 'nope.txt')).rejects.toMatchObject({ code: 'not-found' })
+    await expect(skills.filesIn(layers, 'missing-skill')).rejects.toMatchObject({ code: 'not-found' })
+
     await fs.rm(home, { recursive: true, force: true })
     await fs.rm(proj, { recursive: true, force: true })
   })
