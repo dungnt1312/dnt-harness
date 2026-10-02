@@ -92,7 +92,7 @@ const pastedTextFile = (text: string, date = new Date()): File => {
  * be put back inline; ArrowUp on an empty draft recalls the last message.
  */
 export function Composer({
-  workspaceId = null, modelControl, contextControl, connected, sending = false, running, sendBlocked,
+  workspaceId = null, modelControl, contextControl, connected, sending = false, running,
   draft, onDraft, onSend, onStop, onCommand,
   modelValue, thinkingValue = null, modelSettings, onThinking, thinkingMenuLabel, thinkingDisabled = false,
   controlsUnavailable = false, controlsUnavailableMessage, onRetryControls,
@@ -107,12 +107,6 @@ export function Composer({
   readonly sending?: boolean
   readonly connected: boolean
   readonly running: boolean
-  /**
-   * A hard host-level block: this conversation cannot accept messages at all
-   * (a subagent is executor-managed). Send is disabled and the reason is
-   * always shown, not just after a blocked attempt.
-   */
-  readonly sendBlocked?: string
   readonly draft: RichDraft
   readonly onDraft: (draft: RichDraft) => void
   /** `steer` stops the running turn and runs the queue now (Ctrl/Cmd+Enter while running). */
@@ -177,8 +171,7 @@ export function Composer({
   const empty = draftIsEmpty(draft)
   const oversized = useMemo(() => utf8Bytes(draftText(draft)) > SAFE_MODEL_VISIBLE_BYTES, [draft])
   const uploading = uploads.pending > 0
-  const sendBlockedReason = sendBlocked ?? null
-  const eligible = !empty && connected && !missingModel && !controlsUnavailable && !uploading && !oversized && sendBlockedReason === null
+  const eligible = !empty && connected && !missingModel && !controlsUnavailable && !uploading && !oversized
 
   // A draft we did not emit replaced ours (sent, recalled, switched
   // conversation): in-flight uploads and paste offers belong to the old one.
@@ -433,9 +426,6 @@ export function Composer({
 
   const showBlocked = blockedAttempt && blockedReason !== null
   const notices: ComposerNotice[] = []
-  // The hard block explains itself up front: a disabled button with no
-  // visible reason reads as a broken composer.
-  if (sendBlockedReason !== null) notices.push({ key: 'send-blocked', tone: 'info', text: sendBlockedReason })
   if (missingModel) notices.push({ key: 'model', id: modelHintId, tone: 'warn', text: 'Configure a provider in Settings to send messages.' })
   if (oversized) notices.push({ key: 'oversized', tone: 'bad', text: OVERSIZED_MESSAGE })
   if (blockedAttempt && blockedReason !== null) notices.push({ key: 'blocked', id: hintId, tone: 'warn', text: blockedReason, onDismiss: () => setBlockedAttempt(false) })
@@ -459,15 +449,13 @@ export function Composer({
   }
   const describedBy = [missingModel ? modelHintId : null, showBlocked ? hintId : null].filter((id) => id !== null).join(' ')
 
-  const placeholder = sendBlockedReason !== null
-    ? 'Read-only — this conversation cannot receive messages'
-    : missingModel
-      ? 'Draft now — configure a provider in Settings to send…'
-      : running
-        ? 'Queue a follow-up…'
-        : !connected
-          ? 'Reconnecting — your draft is kept…'
-          : 'Ask anything'
+  const placeholder = missingModel
+    ? 'Draft now — configure a provider in Settings to send…'
+    : running
+      ? 'Queue a follow-up…'
+      : !connected
+        ? 'Reconnecting — your draft is kept…'
+        : 'Ask anything'
   const modelId = modelValue !== null ? decodeModelChoice(modelValue)?.model ?? null : null
 
   return (

@@ -672,20 +672,4 @@ describe('recall', () => {
   })
 })
 
-describe('hard send block (executor-managed subagents)', () => {
-  const reason = 'Subagents are driven by their parent conversation — it cannot receive messages directly. Open the parent to reply.'
 
-  it('disables Send and shows the reason up front, before any attempt', () => {
-    render({ sendBlocked: reason })
-    expect(host.querySelector('[aria-label="Send"]')).toHaveProperty('disabled', true)
-    expect(host.textContent).toContain(reason)
-  })
-
-  it('keeps Enter from sending no matter what was typed', () => {
-    const onSend = vi.fn()
-    render({ sendBlocked: reason, onSend })
-    type('hi')
-    key('Enter')
-    expect(onSend).not.toHaveBeenCalled()
-  })
-})
