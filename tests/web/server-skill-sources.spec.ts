@@ -6,7 +6,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type WebServer } from 'mini-dsh'
 
 let root = ''
 const servers: WebServer[] = []
@@ -111,4 +111,72 @@ describe('skill sources routes', () => {
     const rows = (await (await fetch(`${base}/api/workspaces/${wsId}/skills?projectId=${project.id}`)).json()) as { name: string; source: string }[]
     expect(rows.every((row) => row.source !== 'project')).toBe(true)
   })
+
+/** Read the session's current snapshot (first SSE frame), then cancel the stream. */
+async function readAllEvents(base: string, wsId: string, sessionId: string): Promise<Array<{ type: string; ok?: boolean; output?: string }>> {
+  const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${sessionId}/events`)
+  const reader = (response.body as ReadableStream).getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  const deadline = Date.now() + 6_000
+  try {
+    while (Date.now() < deadline) {
+      const remaining = deadline - Date.now()
+      const chunk = await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), remaining)),
+      ])
+      if (chunk.done) break
+      buffer += decoder.decode(chunk.value, { stream: true })
+      const boundary = buffer.indexOf('\n\n')
+      if (boundary >= 0) {
+        const frame = buffer.slice(0, boundary)
+        const dataLine = frame.split('\n').find((line) => line.startsWith('data: '))
+        if (dataLine !== undefined) {
+          const envelope = JSON.parse(dataLine.slice('data: '.length)) as { kind: string; events?: { type: string; ok?: boolean; output?: string }[] }
+          return envelope.kind === 'snapshot' ? (envelope.events ?? []) : []
+        }
+      }
+    }
+  } finally {
+    reader.cancel().catch(() => {})
+  }
+  return []
+}
+
+describe('Skill tool with project layers', () => {
+  it('catalog and load resolve project-layer skills for a bound session', async () => {
+    let step = 0
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() {
+        step += 1
+        if (step === 1) yield { type: 'toolCalls' as const, calls: [{ id: 'c1', name: 'Skill', args: { action: 'catalog' } }] }
+        else if (step === 2) yield { type: 'toolCalls' as const, calls: [{ id: 'l1', name: 'Skill', args: { action: 'load', name: 'proj-skill' } }] }
+        else yield { type: 'delta' as const, delta: 'done' }
+      },
+    }
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-skill-tool-home-'))
+    const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json'), userSkillsDir: path.join(home, 'user-skills') })
+    servers.push(server)
+    const base = server.url
+    const wsId = await firstWorkspace(base)
+    const proj = await fs.mkdtemp(path.join(root, 'tool-proj-'))
+    await fs.mkdir(path.join(proj, '.claude', 'skills', 'proj-skill'), { recursive: true })
+    await fs.writeFile(path.join(proj, '.claude', 'skills', 'proj-skill', 'SKILL.md'), '---\nname: proj-skill\ndescription: from the project\n---\n\nPROJECT STEPS', 'utf8')
+    const project = (await (await post(base, `/api/workspaces/${wsId}/projects`, { name: 'Tooled', path: proj })).json()) as { id: string }
+    const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`, { projectId: project.id })).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'skills' })
+
+    await expect.poll(async () => {
+      const events = await readAllEvents(base, wsId, session.id)
+      return events.filter((event) => event.type === 'tool/result').length
+    }, { timeout: 6_000 }).toBe(2)
+    const results = (await readAllEvents(base, wsId, session.id)).filter((event) => event.type === 'tool/result')
+    expect(results[0]?.output).toContain('proj-skill [project]')
+    expect(results[1]).toMatchObject({ ok: true })
+    expect(results[1]?.output).toContain("skill 'proj-skill' loaded")
+  })
 })
+})
+

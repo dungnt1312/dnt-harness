@@ -1174,8 +1174,9 @@ ${decision.injected}`, ...contents]
         const requestedLimit = typeof args['limit'] === 'number' && Number.isFinite(args['limit']) ? Math.floor(args['limit']) : 20
         const limit = Math.max(1, Math.min(requestedLimit, 50))
         // Hidden skills stay undiscoverable here (the workspace hid them on
-        // purpose); a load by exact name still works — demand-only.
-        const all = await skills.listVisible(scope.workspaceId)
+        // purpose); a load by exact name still works — demand-only. Layers
+        // follow the workspace's rules plus the bound project's folders.
+        const all = await skillLayers(skills, workspaces, scope.workspaceId, scope.projectId).then((layers) => skills.listVisibleIn(scope.workspaceId, layers))
         const matches = query === ''
           ? all
           : all.filter((entry) => `${entry.name}
@@ -1200,13 +1201,14 @@ ${entry.description}`.toLowerCase().includes(query))
         return `skill '${pinned.name}' loaded (hash ${pinned.hash.slice(0, 12)}); its instructions are included in context`
       }
       try {
-        const loaded = await skills.load(scope.workspaceId, name.trim())
+        const layers = await skillLayers(skills, workspaces, scope.workspaceId, scope.projectId)
+        const loaded = await skills.loadIn(layers, name.trim())
         perTurn.set(loaded.name, { name: loaded.name, instructions: loaded.instructions, hash: loaded.hash })
         skillSnapshots.set(scope.sessionId, perTurn)
         return `skill '${loaded.name}' loaded (hash ${loaded.hash.slice(0, 12)}); its instructions are included in context`
       } catch (error) {
         if (!(error instanceof SkillError) || error.code !== 'not-found') throw error
-        const rows = await skills.listVisible(scope.workspaceId)
+        const rows = await skillLayers(skills, workspaces, scope.workspaceId, scope.projectId).then((layers) => skills.listVisibleIn(scope.workspaceId, layers))
         const sought = name.trim().toLowerCase()
         const suggestions = rows
           .filter((entry) => entry.name.includes(sought) || sought.includes(entry.name))
@@ -1909,10 +1911,13 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     const skillCatalog = mode.definition.sources.skills === 'on-demand'
       && scope?.workspaceId !== undefined
       && exposed.some((schema) => schema.name === 'Skill')
-      ? await skills.listVisible(scope.workspaceId).then((rows) => rows.map((entry) => {
-          const description = entry.description === '' ? entry.title : entry.description
-          return { name: entry.name, description: description.length > 500 ? `${description.slice(0, 499)}…` : description }
-        })).catch(() => undefined)
+      ? await skillLayers(skills, workspaces, scope.workspaceId, scope.projectId)
+          .then((layers) => skills.listVisibleIn(scope.workspaceId as WorkspaceId, layers))
+          .then((rows) => rows.map((entry) => {
+            const description = entry.description === '' ? entry.title : entry.description
+            return { name: entry.name, description: description.length > 500 ? `${description.slice(0, 499)}…` : description }
+          }))
+          .catch(() => undefined)
       : undefined
 
     // Turn-local active skills: the pinned snapshots from this turn's
