@@ -29,6 +29,11 @@ companion file, memory is project-scoped.
    error). Default order realizes project > workspace > user; between `.claude/skills`
    and `.agents/skills` of the same project, the earlier list entry wins. Bundled
    stays implicit last and is not a rule.
+5. **Settings UI**: rebuild the Skills panel in the dntspace two-tab/two-pane
+   structure — a "Skills" tab (layer-grouped catalog tree + detail pane with
+   preview/edit) and a "Source folders" tab (the rule editor). The catalog tree
+   scans ALL projects of the workspace (one group per project × rule, project name
+   in the group header) rather than requiring a project selector.
 
 ## Architecture
 
@@ -95,6 +100,8 @@ project resolves project rules to nothing — behavior identical to today.
 
 ### Settings UI and REST
 
+REST:
+
 - `GET /api/workspaces/:wsId/skills/sources` returns `{ rules }` with defaults
   materialized (so the panel shows the effective list); `PUT` with the full rule
   list validates and writes atomically. Last-write-wins, like modes/MCP config —
@@ -102,12 +109,35 @@ project resolves project rules to nothing — behavior identical to today.
 - PUT validation: ≤ 20 rules; exactly zero or one `workspace` rule (its `path` and
   `kind` are forced server-side); `project` rules require a safe relative path;
   `absolute` rules require an absolute path; ids unique; unknown kinds rejected.
-- `SkillsPanel` gains a "Source folders" section: one row per rule — kind badge,
-  path, enabled checkbox (native accent-primary, the existing row-toggle idiom),
-  ↑/↓ reorder buttons (no drag-reorder), remove button (absent on the workspace
-  row), and an "Add rule" affordance (kind picker + path input). The panel's
-  catalog table stays workspace-wide (Settings has no project context); project
-  skills are visible in-session via the catalog block and the Skill tool.
+- `GET /api/workspaces/:wsId/skills` and `GET .../skills/:name` gain an optional
+  `projectId` query parameter: layers resolve with that project's rules and rows
+  carry their `source`. Without the parameter behavior is unchanged. The hidden
+  toggle route is unchanged (workspace-keyed tombstones already target any layer).
+
+Panel redesign (dntspace structure, adapted):
+
+- **Two tabs**: "Skills" (the catalog) and "Source folders" (the rule editor).
+- **Skills tab, left pane**: `SKILLS` header with refresh and `+` (create a
+  workspace-layer skill, opening the detail pane in edit mode); a search input and
+  a layer filter dropdown (All / Project / Workspace / User / Bundled, with
+  counts); a catalog tree grouped by layer — one group per project × rule with the
+  project name in the header (the panel scans ALL workspace projects, no project
+  selector), then `Workspace`, `User (~/.claude/skills)`, and `Bundled` (only when
+  the host configures bundled). Hidden rows render dimmed with an eye-off marker.
+- **Skills tab, right pane (detail)**: title + source badge; the "In catalog"
+  switch (the existing hidden toggle — works for any layer since tombstones are
+  workspace-level); the `/SKILL.md` path line; preview (rendered markdown, the
+  existing renderer) and edit (raw SKILL.md) toggles. Editing is enabled only for
+  workspace rows — other layers show a read-only notice pointing at external
+  editors. Workspace rows get a delete affordance (route exists). Reuse the
+  existing load/save-with-hash editor logic; the flat panel it replaces is removed.
+- **Source folders tab**: one row per rule — kind badge, path, enabled checkbox
+  (native accent-primary, the existing row-toggle idiom), ↑/↓ reorder buttons (no
+  drag-reorder), remove button (absent on the workspace row), and an "Add rule"
+  affordance (kind picker + path input).
+- The two-pane layout stacks when the settings modal is narrow. Skills render as
+  single SKILL.md rows — no resource-file tree under a skill (no load API for
+  resource files yet).
 
 ### Security
 
@@ -146,14 +176,21 @@ project resolves project rules to nothing — behavior identical to today.
   `.agents/skills` (precedence between the two via list order); `Skill catalog`
   and `Skill load` resolving project layers; unbound session ignores project rules;
   containment check rejects an escaping stored rule at read time.
-- **Web**: SkillsPanel spec — renders rules with defaults, toggle, add/remove,
-  reorder buttons move the row and persist via PUT, workspace row locked.
+- **Web**: SkillsPanel spec — the two tabs render; catalog tree groups by project ×
+  rule then Workspace/User/Bundled with counts; search and layer filter narrow the
+  tree; detail pane previews rendered markdown and edits raw with hash CAS; hidden
+  switch toggles and dims the row; read-only notice on non-workspace layers; delete
+  on workspace rows; reorder buttons move the rule row and persist via PUT;
+  add/remove rule round-trips; validation errors surface inline.
 
 ## Non-goals (v1)
 
 - Per-project rule overrides (one list per workspace only).
 - Drag-and-drop reorder (↑/↓ buttons only).
-- Project catalog preview inside the Settings panel (in-session surfaces cover it).
+- Drag-and-drop or file-picker import of skills from a folder into the workspace
+  layer (the dntspace "import" affordance — deferred).
+- Resource-file tree under a skill (SKILL.md rows only until a load API for
+  resource files exists).
 - Editing project/absolute-layer skills through the UI (read-only by design).
 - A warning when `save` writes a name shadowed by a higher layer (deferred; source
   tags make the situation inspectable).
