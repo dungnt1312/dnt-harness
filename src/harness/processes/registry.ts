@@ -192,18 +192,29 @@ export class ProcessRegistry {
     const rows: ProcessSnapshot[] = []
     for (const record of this.byId.values()) {
       if (record.sessionId !== sessionId) continue
-      rows.push({
-        id: record.id,
-        command: record.command,
-        cwd: record.cwd,
-        status: record.status,
-        startedAt: record.startedAt,
-        exitCode: record.exitCode,
-        durationMs: (record.endedAt ?? Date.now()) - record.startedAt,
-        truncated: record.outputTruncated,
-      })
+      rows.push(this.snapshotOf(record))
     }
     return rows
+  }
+
+  /** One process with its captured output; undefined for a foreign or unknown id. */
+  detail(sessionId: SessionId, processId: string): (ProcessSnapshot & { readonly output: string; readonly outputTruncated: boolean }) | undefined {
+    const record = this.byId.get(processId)
+    if (record === undefined || record.sessionId !== sessionId) return undefined
+    return { ...this.snapshotOf(record), output: record.output, outputTruncated: record.outputTruncated }
+  }
+
+  private snapshotOf(record: ProcessRecord): ProcessSnapshot {
+    return {
+      id: record.id,
+      command: record.command,
+      cwd: record.cwd,
+      status: record.status,
+      startedAt: record.startedAt,
+      exitCode: record.exitCode,
+      durationMs: (record.endedAt ?? Date.now()) - record.startedAt,
+      truncated: record.outputTruncated,
+    }
   }
 
   /** Kill every running process of the session. Emits nothing (the session's log is going away). */

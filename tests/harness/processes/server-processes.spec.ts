@@ -160,6 +160,24 @@ describe('background process routes', () => {
     }
   }, 30_000)
 
+  it('GET detail returns one process with its captured output; unknown id is 404', async () => {
+    const { ws, sessionId, sse } = await runBackgroundTurn()
+    try {
+      const rows = (await (await fetch(`${baseUrl}/api/workspaces/${ws}/sessions/${sessionId}/processes`)).json()) as { id: string; status: string }[]
+      const detail = await fetch(`${baseUrl}/api/workspaces/${ws}/sessions/${sessionId}/processes/${rows[0]?.id}`)
+      expect(detail.status).toBe(200)
+      const body = (await detail.json()) as { id: string; status: string; command: string; output: string; outputTruncated: boolean }
+      expect(body.id).toBe(rows[0]?.id)
+      expect(body.status).toBe('running')
+      expect(body.command).toContain('sleep')
+      expect(typeof body.output).toBe('string')
+      expect(body.outputTruncated).toBe(false)
+      expect((await fetch(`${baseUrl}/api/workspaces/${ws}/sessions/${sessionId}/processes/proc_missing`)).status).toBe(404)
+    } finally {
+      sse.dispose()
+    }
+  }, 30_000)
+
   it('deleting a session succeeds while a background process runs (silent dispose)', async () => {
     const { ws, sessionId, sse } = await runBackgroundTurn()
     try {

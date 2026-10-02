@@ -3024,10 +3024,11 @@ async function handleApi(
     }
 
     // ── background processes of one session ────────────────────
-    const wsProcessesMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)\/processes(?:\/([^/]+)\/stop)?$/.exec(pathname)
+    const wsProcessesMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)\/processes(?:\/([^/]+)(?:\/(stop))?)?$/.exec(pathname)
     if (wsProcessesMatch !== null) {
       const wsId = decodeURIComponent(wsProcessesMatch[1] ?? '') as WorkspaceId
       const processId = wsProcessesMatch[3] !== undefined ? decodeURIComponent(wsProcessesMatch[3] ?? '') : undefined
+      const action = wsProcessesMatch[4]
       const entry = await findSession(decodeURIComponent(wsProcessesMatch[2] ?? ''), wsId, deps)
       if (entry === undefined) {
         send(404, { error: 'no such session' })
@@ -3047,7 +3048,8 @@ async function handleApi(
         send(405, { error: 'method not allowed' })
         return
       }
-      if (req.method === 'POST') {
+      if (action === 'stop') {
+        if (req.method !== 'POST') { send(405, { error: 'method not allowed' }); return }
         const outcome = await deps.processes.kill(entry.session.id, processId)
         if (outcome.outcome === 'not-found') {
           send(404, { error: `no such process '${processId}'` })
@@ -3058,6 +3060,16 @@ async function handleApi(
           return
         }
         send(200, { stopped: true, processId })
+        return
+      }
+      // One process with its captured output, for the workbench detail view.
+      if (req.method === 'GET') {
+        const detail = deps.processes.detail(entry.session.id, processId)
+        if (detail === undefined) {
+          send(404, { error: `no such process '${processId}'` })
+          return
+        }
+        send(200, detail)
         return
       }
       send(405, { error: 'method not allowed' })
