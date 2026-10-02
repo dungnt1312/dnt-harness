@@ -26,7 +26,7 @@ interface ParsedTodo {
 function parseTodos(args: Record<string, unknown>): readonly ParsedTodo[] {
   const raw = args['todos']
   if (!Array.isArray(raw)) {
-    throw new Error('argument todos must be an array of { content, status, activeForm } items')
+    throw new Error("argument 'todos' must be an array of { content, status, activeForm } items")
   }
   if (raw.length > MAX_TODO_ITEMS) {
     throw new Error(`'todos' is limited to ${MAX_TODO_ITEMS} items; split the work into smaller lists`)

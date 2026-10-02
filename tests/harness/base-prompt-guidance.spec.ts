@@ -6,5 +6,6 @@ describe('default base prompt', () => {
     expect(DEFAULT_BASE_SYSTEM).toContain('TodoWrite')
     expect(DEFAULT_BASE_SYSTEM).toContain('in_progress')
     expect(DEFAULT_BASE_SYSTEM).toContain('completed immediately')
+    expect(DEFAULT_BASE_SYSTEM).toContain('keep exactly one task in_progress at a time')
   })
 })

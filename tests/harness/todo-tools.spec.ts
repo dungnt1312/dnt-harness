@@ -44,8 +44,8 @@ describe('TodoWrite tool', () => {
   })
 
   it('rejects a non-array todos argument', async () => {
-    await expect(run({ todos: 'nope' })).rejects.toThrow(/todos must be an array/)
-    await expect(run({})).rejects.toThrow(/todos must be an array/)
+    await expect(run({ todos: 'nope' })).rejects.toThrow(/'todos' must be an array/)
+    await expect(run({})).rejects.toThrow(/'todos' must be an array/)
   })
 
   it('rejects malformed items with one actionable message', async () => {
@@ -53,6 +53,12 @@ describe('TodoWrite tool', () => {
     await expect(run({ todos: [item({ status: 'done' })] })).rejects.toThrow(/pending, in_progress, or completed/)
     await expect(run({ todos: [item({ content: ' ' })] })).rejects.toThrow(/'content' and 'activeForm'/)
     await expect(run({ todos: [item({ activeForm: '' })] })).rejects.toThrow(/'content' and 'activeForm'/)
+  })
+
+  it('accepts exactly 100 items', async () => {
+    const todos = Array.from({ length: 100 }, () => item())
+    const receipt = await run({ todos })
+    expect(receipt).toBe('Todo list updated: 100 tasks (100 pending)')
   })
 
   it('rejects more than 100 items', async () => {
