@@ -141,3 +141,61 @@ describe('SkillsPanel skills tab', () => {
     expect(document.body.querySelector('textarea')).not.toBeNull()
   })
 })
+
+describe('SkillsPanel source folders tab', () => {
+  beforeEach(() => {
+    mocked.putSkillSources.mockReset()
+    mocked.putSkillSources.mockResolvedValue({ rules: [] })
+  })
+
+  const openFolders = async (): Promise<void> => {
+    await renderPanel()
+    await act(async () => button('Source folders').click())
+    await settle()
+  }
+
+  it('renders rule rows with kind badges and a locked workspace row', async () => {
+    await openFolders()
+    expect(document.body.textContent).toContain('.claude/skills')
+    expect(document.body.textContent).toContain('.agents/skills')
+    expect(document.body.textContent).toContain('Workspace skills')
+    expect(buttons().some((node) => (node.getAttribute('aria-label') ?? '').startsWith('Remove Workspace skills'))).toBe(false)
+  })
+
+  it('toggling a rule persists immediately via putSkillSources', async () => {
+    await openFolders()
+    const box = document.body.querySelector<HTMLInputElement>('input[aria-label="Enable .agents/skills"]')!
+    await act(async () => box.click())
+    await settle()
+    expect(mocked.putSkillSources).toHaveBeenCalledTimes(1)
+    const rules = mocked.putSkillSources.mock.calls[0]?.[1] as readonly { id: string; enabled: boolean }[]
+    expect(rules.find((rule) => rule.id === 'project-agents')?.enabled).toBe(false)
+  })
+
+  it('reorder buttons move a rule up and persist the swapped order', async () => {
+    await openFolders()
+    await act(async () => button('Move .agents/skills up').click())
+    await settle()
+    const rules = mocked.putSkillSources.mock.calls[0]?.[1] as readonly { id: string }[]
+    expect(rules.map((rule) => rule.id)).toEqual(['project-agents', 'project-claude', 'workspace', 'user'])
+  })
+
+  it('remove deletes a rule and add appends a new one', async () => {
+    await openFolders()
+    await act(async () => button('Remove .agents/skills').click())
+    await settle()
+    let rules = mocked.putSkillSources.mock.calls[0]?.[1] as readonly { id: string }[]
+    expect(rules.some((rule) => rule.id === 'project-agents')).toBe(false)
+    const kind = document.body.querySelector<HTMLSelectElement>('select[aria-label="New rule kind"]')!
+    await act(async () => {
+      kind.value = 'absolute'
+      kind.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+    const pathInput = document.body.querySelector<HTMLInputElement>('input[aria-label="New rule path"]')!
+    await act(async () => type(pathInput, 'D:/shared-skills'))
+    await act(async () => button('Add rule').click())
+    await settle()
+    rules = mocked.putSkillSources.mock.calls[1]?.[1] as readonly { id: string }[]
+    expect(rules[rules.length - 1]).toMatchObject({ kind: 'absolute', path: 'D:/shared-skills', enabled: true })
+  })
+})

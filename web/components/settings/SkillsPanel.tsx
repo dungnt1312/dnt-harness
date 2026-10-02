@@ -380,13 +380,116 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
   )
 }
 
-/** Placeholder — replaced by the next task with the full rule editor. */
-function FoldersEditor(_props: {
+/** The ordered rule list; every mutation persists immediately (last-write-wins). */
+function FoldersEditor(props: {
   readonly workspaceId: string
   readonly rules: readonly SkillRuleRow[]
   readonly onSaved: (saved: { readonly rules: readonly SkillRuleRow[] }) => void
   readonly setNotice: (notice: NoticeState) => void
   readonly busy: boolean
 }): ReactNode {
-  return <EmptyState>Rule editor lands in the next task.</EmptyState>
+  const [newKind, setNewKind] = useScopedState<'project' | 'absolute'>('project')
+  const [newPath, setNewPath] = useScopedState('')
+  const { run } = useActionRunner((text) => props.setNotice({ kind: 'bad', text }))
+
+  const persist = (next: readonly SkillRuleRow[]): Promise<void> => run('sources', async () => {
+    try {
+      props.onSaved(await putSkillSources(props.workspaceId, next))
+      props.setNotice({ kind: 'ok', text: 'Source folders saved.' })
+    } catch (cause) {
+      props.setNotice({ kind: 'bad', text: cause instanceof Error ? cause.message : String(cause) })
+    }
+  })
+
+  const kindLabel = (kind: SkillRuleRow['kind']): string => (kind === 'project' ? 'Project' : kind === 'absolute' ? 'Absolute' : 'Workspace')
+  const rowLabel = (rule: SkillRuleRow): string => (rule.kind === 'workspace' ? 'Workspace skills' : rule.path ?? rule.id)
+  const rowHint = (rule: SkillRuleRow): string =>
+    rule.kind === 'workspace'
+      ? "The workspace's own skill folder — path is fixed."
+      : rule.kind === 'project'
+        ? "Relative to the bound project's folder."
+        : 'Absolute folder on this host.'
+
+  const move = (index: number, delta: -1 | 1): void => {
+    const next = [...props.rules]
+    const [row] = next.splice(index, 1)
+    if (row === undefined) return
+    next.splice(index + delta, 0, row)
+    void persist(next)
+  }
+
+  return (
+    <div className="space-y-2">
+      <ItemList label="Source folders">
+        {props.rules.map((rule, index) => (
+          <ItemRow
+            key={rule.id}
+            title={(
+              <>
+                <Badge tone={rule.kind === 'project' ? 'green' : rule.kind === 'absolute' ? 'gray' : 'blue'}>{kindLabel(rule.kind)}</Badge>
+                <span className="break-all font-mono text-[13px]">{rowLabel(rule)}</span>
+              </>
+            )}
+            meta={rowHint(rule)}
+            actions={(
+              <>
+                <label className="flex cursor-pointer items-center gap-1.5 text-[13px] text-fg-muted">
+                  <input
+                    type="checkbox"
+                    className="size-3.5 accent-primary"
+                    aria-label={`Enable ${rowLabel(rule)}`}
+                    checked={rule.enabled}
+                    disabled={props.busy}
+                    onChange={() => void persist(props.rules.map((candidate) => (candidate.id === rule.id ? { ...candidate, enabled: !candidate.enabled } : candidate)))}
+                  />
+                  Enabled
+                </label>
+                <IconButton label={`Move ${rowLabel(rule)} up`} disabled={props.busy || index === 0} onClick={() => move(index, -1)}>
+                  <Icon name="chevron" size={13} className="-rotate-90" />
+                </IconButton>
+                <IconButton label={`Move ${rowLabel(rule)} down`} disabled={props.busy || index === props.rules.length - 1} onClick={() => move(index, 1)}>
+                  <Icon name="chevron" size={13} className="rotate-90" />
+                </IconButton>
+                {rule.kind !== 'workspace' ? (
+                  <IconButton label={`Remove ${rowLabel(rule)}`} disabled={props.busy} onClick={() => void persist(props.rules.filter((candidate) => candidate.id !== rule.id))}>
+                    <Icon name="trash" size={14} />
+                  </IconButton>
+                ) : null}
+              </>
+            )}
+          />
+        ))}
+      </ItemList>
+      <div className="flex flex-wrap items-end gap-2">
+        <Field label="Kind">
+          <select
+            aria-label="New rule kind"
+            className="rounded-md border border-border-subtle bg-bg-surface px-2 py-1.5 text-[13px]"
+            value={newKind}
+            onChange={(e) => setNewKind(e.target.value as 'project' | 'absolute')}
+          >
+            <option value="project">Project folder</option>
+            <option value="absolute">Absolute path</option>
+          </select>
+        </Field>
+        <Field label={newKind === 'project' ? 'Relative folder (e.g. .claude/skills)' : 'Absolute folder (e.g. D:/shared-skills)'}>
+          <TextInput mono aria-label="New rule path" value={newPath} placeholder={newKind === 'project' ? '.team/skills' : 'D:/shared-skills'} onChange={(e) => setNewPath(e.target.value)} />
+        </Field>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={props.busy || newPath.trim() === ''}
+          onClick={() => {
+            const path = newPath.trim()
+            if (path === '') return
+            void persist([...props.rules, { id: `rule-${Math.random().toString(36).slice(2, 8)}`, kind: newKind, path, enabled: true }])
+            setNewPath('')
+          }}
+        >
+          <Icon name="plus" size={13} />Add rule
+        </Button>
+      </div>
+      <p className="text-xs text-fg-faint">List order is precedence — the first folder holding a skill name wins. Absolute folders are protected from file-tool grants.</p>
+    </div>
+  )
 }
