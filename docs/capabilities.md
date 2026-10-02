@@ -239,6 +239,29 @@ Scope comes from the ambient agent scope (workspace, optional project); a
 child agent sees only what its definition grants. Conflicting or invalid files
 surface as tool failures — they are never silently merged.
 
+## The TodoWrite tool (`src/harness/tools/todo.ts`)
+
+One stateless, root-free tool that maintains the session's task list,
+Claude-Code-style:
+
+- **Full replacement**: every call carries the COMPLETE list
+  (`todos: [{ content, status, activeForm }]`, statuses `pending |
+  in_progress | completed`); an empty array clears the list. Cap 100 items;
+  invalid shape throws into a failed `ToolResult` the model corrects.
+- **State IS the durable log**: the last successful `tool/call` named
+  `TodoWrite` (paired with an `ok` `tool/result`) holds the current list. No
+  registry, no extra event kinds, and a restart rehydrates the list from the
+  log snapshot for free. The web derives it in `web/lib/todos-view.ts`.
+- **Per session**: a subagent child has its own list; it never appears in the
+  root's UI. Behavioral rules (exactly one `in_progress`, mark completed
+  immediately, blocked → add an unblock task) live in the tool description
+  and the default base prompt as guidance — the tool validates shape only.
+- **UI**: the EnvironmentPanel's Tasks section + collapsed-capsule chip, a
+  quiet transcript row (`N tasks`, `x done · y in progress`), and
+  `Working · <activeForm>` on the TaskStatus line. Compaction may summarize
+  older calls away, so the model can lose sight of an old list — accepted
+  for v1 (context re-injection is a follow-up).
+
 ## MCP tools (`src/harness/mcp/`)
 
 Servers from a workspace's `mcp.json` register dynamically as
@@ -302,7 +325,8 @@ selected because an active selection retains its cached snapshot.
   reading the ambient agent scope — a session bound to a project gets that
   project's folder; a workspace-mode session with no project has **no
   filesystem grant**; memory-mode sessions keep the legacy per-session/default
-  folder grants. `Skill` and the memory tools register with the harness; MCP
+  folder grants. `Skill`, the memory tools, and `TodoWrite` register with
+  the harness; MCP
   tools register per workspace as its servers connect.
 
 ## Reading further
@@ -311,3 +335,6 @@ selected because an active selection retains its cached snapshot.
 - Bash tool tests: `tests/capabilities/bash.spec.ts`.
 - Skill/memory/MCP tool behavior: `tests/harness/g3-context.spec.ts`,
   `tests/harness/g4-agents.spec.ts`, `tests/harness/g5-mcp.spec.ts`.
+- TodoWrite tool + mode exposure: `tests/harness/todo-tools.spec.ts`,
+  `tests/harness/todo-mode-exposure.spec.ts`; web derivation and UI:
+  `web/lib/todos-view.spec.ts`, `web/components/chat/environment-panel.spec.tsx`.
