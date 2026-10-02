@@ -119,6 +119,7 @@ import { ChildExecutor, SpawnError, normalizeBrief, type ChildModel, type TaskPa
 import { agentTool, ChildModelError, projectInheritedMessages, resolveChildModel } from './agent-delegation.ts'
 import { importClaudeDefinition } from '../harness/agents/compatibility/claude.ts'
 import { SkillsService, SkillError } from '../harness/skills/service.ts'
+import { protectedRootsForRules, resolveSkillLayers, type SkillLayer } from '../harness/skills/layers.ts'
 import { MemoryService, MemoryError } from '../harness/memory/service.ts'
 import { memoryTools } from '../harness/memory/tools.ts'
 import { todoWriteTool } from '../harness/tools/todo.ts'
@@ -2319,6 +2320,7 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     seedWorkspaceControls,
     modes,
     skills,
+    ...(options.userSkillsDir !== undefined ? { userSkillsDir: options.userSkillsDir } : {}),
     memory,
     attachments,
     checkpoints,
@@ -2510,6 +2512,8 @@ interface HandlerDeps {
   readonly legacyFolderDefault: { current: string | undefined }
   readonly modes: ModesService
   readonly skills: SkillsService
+  /** Read-only user skill layer (`~/.claude/skills`), for protected-root refresh. */
+  readonly userSkillsDir?: string
   readonly memory: MemoryService
   readonly attachments: AttachmentStore
   readonly checkpoints: CheckpointStore
@@ -2609,8 +2613,22 @@ function requestHostname(raw: string | undefined): string | undefined {
   return colon === -1 ? value : value.slice(0, colon)
 }
 
-async function handle(req: IncomingMessage, res: ServerResponse, deps: HandlerDeps): Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://localhost')
+/** Ordered skill layers for a scope: workspace rules + the bound project's folder.
+ *  Module-level so both the agent/context handler and the API routes resolve the
+ *  same way; throws when the projectId is not a project of the workspace. */
+async function skillLayers(
+  skills: SkillsService,
+  workspaces: WorkspaceService,
+  workspaceId: WorkspaceId,
+  projectId: ProjectId | undefined,
+): Promise<SkillLayer[]> {
+  const rules = await skills.sources(workspaceId)
+  let projectPath: string | undefined
+  if (projectId !== undefined) projectPath = workspaces.getProject(projectId, workspaceId).path
+  return resolveSkillLayers(rules, { workspaceDir: skills.workspaceSkillsDir(workspaceId), ...(projectPath !== undefined ? { projectPath } : {}) })
+}
+
+async function handle(req: IncomingMessage, res: ServerResponse, deps: HandlerDeps): Promise<void> {  const url = new URL(req.url ?? '/', 'http://localhost')
   const { pathname } = url
 
   // DNS rebinding defence, applied before routing and to static assets too —
@@ -3079,7 +3097,7 @@ async function handleApi(
       return
     }
 
-    const wsSessionMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)(?:\/(events|messages|stop))?$/.exec(pathname)
+    const wsSessionMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)(?:\/(events|messages|stop|steer))?$/.exec(pathname)
     if (wsSessionMatch !== null) {
       const wsId = decodeURIComponent(wsSessionMatch[1] ?? '') as WorkspaceId
       const action = wsSessionMatch[3]
@@ -3157,6 +3175,15 @@ async function handleApi(
         entry.agent.stop()
         const cleaned = await deps.childExecutor.cancelAllOfRoot(entry.session.id)
         send(202, { stopped: true, ...(cleaned > 0 ? { childrenCancelled: cleaned } : {}) })
+        return
+      }
+      if (action === 'steer' && req.method === 'POST') {
+        const outcome = await steerSession(entry, deps)
+        if (!outcome.ok) {
+          send(outcome.status, { error: outcome.error })
+          return
+        }
+        send(outcome.status, outcome.body)
         return
       }
       if (action === 'messages' && req.method === 'POST') {
@@ -4226,6 +4253,40 @@ async function handleApi(
     }
 
     // ── G3 skills ────────────────────────────────────────────
+    // Skill source rules (before /skills/:name, which has no room for the
+    // extra segment). PUT also refreshes the grant-protected roots so the
+    // absolute rule folders are never grantable to file tools.
+    const wsSkillSources = /^\/api\/workspaces\/([^/]+)\/skills\/sources$/.exec(pathname)
+    if (wsSkillSources !== null && (req.method === 'GET' || req.method === 'PUT')) {
+      const wsId = decodeURIComponent(wsSkillSources[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, req.method === 'PUT')
+      if (req.method === 'GET') {
+        send(200, { rules: await deps.skills.sources(wsId) })
+        return
+      }
+      const body = await readJson(req)
+      try {
+        const rules = await deps.skills.setSources(wsId, body)
+        // Absolute rule folders join the protected roots immediately: grant
+        // validation reads this array, so rules take effect on the next grant.
+        deps.grants.policy.protectedRoots.splice(
+          0,
+          deps.grants.policy.protectedRoots.length,
+          ...(deps.deniedRoots ?? []),
+          ...protectedRootsForRules(rules),
+          ...(deps.userSkillsDir !== undefined ? [deps.userSkillsDir] : []),
+        )
+        send(200, { rules })
+      } catch (error) {
+        if (error instanceof SkillError) {
+          send(400, { error: error.message })
+          return
+        }
+        fail(error)
+      }
+      return
+    }
+
     // Catalog visibility toggle (before the /skills/:name match, which has no
     // room for the extra segment). Works for every layer: user/bundled skills
     // are read-only files, so the workspace sidecar is their only curation.
@@ -4259,8 +4320,17 @@ async function handleApi(
       const skillName = wsSkillsMatch[2] !== undefined ? decodeURIComponent(wsSkillsMatch[2]) : undefined
       if (req.method === 'GET' && skillName === undefined) {
         // The settings list shows every row (hidden included) with its state;
-        // discovery surfaces filter separately via listVisible.
-        const [rows, hidden] = await Promise.all([deps.skills.list(wsId), deps.skills.hiddenNames(wsId)])
+        // discovery surfaces filter separately via listVisible. A projectId
+        // query adds that project's rule layers (unknown id → 400).
+        const rawProject = query.get('projectId')
+        let layers: SkillLayer[]
+        try {
+          layers = await skillLayers(deps.skills, deps.workspaces, wsId, rawProject !== null && rawProject !== '' ? (rawProject as ProjectId) : undefined)
+        } catch {
+          send(400, { error: 'unknown projectId' })
+          return
+        }
+        const [rows, hidden] = await Promise.all([deps.skills.listIn(layers), deps.skills.hiddenNames(wsId)])
         const hiddenSet = new Set(hidden)
         send(200, rows.map((row) => ({ ...row, ...(hiddenSet.has(row.name) ? { hidden: true } : {}) })))
         return
@@ -4293,10 +4363,19 @@ async function handleApi(
       }
       if (req.method === 'GET' && skillName !== undefined) {
         // One skill's raw instructions + hash: the settings editor loads
-        // real content so saves are never blind overwrites.
+        // real content so saves are never blind overwrites. projectId
+        // selects the project's rule layers for project-layer rows.
+        const rawProject = query.get('projectId')
+        let layers: SkillLayer[]
         try {
-          const loaded = await deps.skills.load(wsId, skillName)
-          send(200, { name: loaded.name, title: loaded.title, description: loaded.description, source: loaded.source, hash: loaded.hash, instructions: loaded.instructions })
+          layers = await skillLayers(deps.skills, deps.workspaces, wsId, rawProject !== null && rawProject !== '' ? (rawProject as ProjectId) : undefined)
+        } catch {
+          send(400, { error: 'unknown projectId' })
+          return
+        }
+        try {
+          const loaded = await deps.skills.loadIn(layers, skillName)
+          send(200, { name: loaded.name, title: loaded.title, description: loaded.description, source: loaded.source, ruleId: loaded.ruleId, hash: loaded.hash, instructions: loaded.instructions })
         } catch (error) {
           if (error instanceof SkillError) {
             send(error.code === 'not-found' ? 404 : 400, { error: error.message })
@@ -5453,6 +5532,13 @@ async function acceptMessage(
   if (typeof content !== 'string') {
     return { ok: false, status: 400, error: 'body needs a string content' }
   }
+  // `steer` stops the running turn and runs the queue now; `queue` (the
+  // default, and every legacy client) waits for the turn to finish.
+  const rawDelivery = body['delivery']
+  if (rawDelivery !== undefined && rawDelivery !== 'queue' && rawDelivery !== 'steer') {
+    return { ok: false, status: 400, error: "'delivery' must be 'queue' or 'steer'" }
+  }
+  const delivery: 'queue' | 'steer' = rawDelivery === 'steer' ? 'steer' : 'queue'
   const parsedAttachments = parseAttachments(body['attachments'], deps.limits.maxAttachmentsPerMessage)
   if (!parsedAttachments.ok) return parsedAttachments
   const refs = parsedAttachments.refs
@@ -5497,23 +5583,22 @@ async function acceptMessage(
     const prior = entry.session.events.find(
       (event) => event.type === 'input/queued' && event.clientRequestId === clientRequestId,
     )
+    // A duplicate never stops anything: a double click or a transport retry
+    // must not cancel the turn the first request already started.
     if (prior?.type === 'input/queued') {
       return { ok: true, status: 200, body: { inputId: prior.inputId, duplicate: true } }
     }
   }
 
-  // Re-adopt anything accepted but never consumed (a stop left it queued,
-  // or a previous run failed): accepted input is never lost.
+  // Bound check before anything is adopted or stopped: a refused message
+  // leaves the agent and the running turn exactly as they were.
   const stillPending = deps.kernel.ctx.sessions.pendingInputs(entry.session)
-  for (const item of stillPending) {
-    entry.agent.enqueueAccepted(item)
-  }
-
   if (stillPending.length >= deps.limits.maxPendingInputs) {
     return { ok: false, status: 429, error: `too many queued inputs (limit ${deps.limits.maxPendingInputs})` }
   }
 
-  // Durable acceptance before the driver sees the input.
+  // Durable acceptance before the driver sees the input, and before a steer
+  // stops anything: a write failure leaves the running turn untouched.
   const inputId = newInputId()
   entry.session.append({
     type: 'input/queued',
@@ -5521,6 +5606,7 @@ async function acceptMessage(
     ...(clientRequestId !== undefined ? { clientRequestId } : {}),
     content,
     ...(refs.length > 0 ? { attachments: refs } : {}),
+    ...(delivery === 'steer' ? { delivery: 'steer' as const } : {}),
   })
   try {
     await entry.session.durable()
@@ -5528,9 +5614,63 @@ async function acceptMessage(
     return { ok: false, status: 500, error: `input could not be durably accepted: ${String(error instanceof Error ? error.message : error)}` }
   }
 
-  const wasBusy = entry.agent.busy
+  // Re-adopt anything accepted but never consumed (a stop left it queued,
+  // or a previous run failed) in log order, then the new input last:
+  // accepted input is never lost and runs in submission order.
+  entry.agent.adoptPending(stillPending)
   entry.agent.enqueueAccepted({ content, inputId, ...(refs.length > 0 ? { attachments: refs } : {}) })
-  if (!wasBusy) {
+  const wasBusy = entry.agent.busy
+  await dispatchInbox(entry, deps, delivery)
+  return { ok: true, status: 202, body: { inputId, queued: wasBusy && delivery === 'queue', delivery } }
+}
+
+/**
+ * Steer without a new message ("Send now" on queued input): stop the running
+ * turn and run every pending input now. While idle it simply runs the queue.
+ * Nothing pending is a no-op, never a stop — steering an empty queue would
+ * be a plain Stop under another name.
+ */
+async function steerSession(
+  entry: SessionEntry,
+  deps: HandlerDeps,
+): Promise<{ ok: false; status: number; error: string } | { ok: true; status: number; body: Record<string, unknown> }> {
+  if (entry.session.events.some((event) => event.type === 'session/child-meta')) {
+    return { ok: false, status: 409, error: 'this is a child agent session; it is executor-managed and cannot be steered directly' }
+  }
+  requireWorkspace(deps, entry.workspaceId, true)
+  if (deps.unavailableSessions.has(entry.session.id)) {
+    return { ok: false, status: 503, error: 'session unavailable after durable storage failure; restart the host to reload canonical history' }
+  }
+  // Input a running turn already claimed (still in pre-step, not yet logged)
+  // is not waiting: steering "for" it would cancel the turn that is about to
+  // answer it. Only input nobody has claimed counts.
+  const pending = deps.kernel.ctx.sessions.pendingInputs(entry.session)
+  const waiting = pending.filter((item) => !entry.agent.isClaimed(item.inputId))
+  if (waiting.length === 0) {
+    return { ok: true, status: 200, body: { steered: false, pending: 0 } }
+  }
+  const effectiveModel = deps.resolveEffectiveModel(entry.session, entry.workspaceId)
+  if (effectiveModel.model === undefined || effectiveModel.model === null || effectiveModel.provider === undefined || effectiveModel.provider === null) {
+    return { ok: false, status: 400, error: 'no provider/model configured for this session; manage providers in settings' }
+  }
+  try {
+    deps.validateProviderModel(effectiveModel.provider, effectiveModel.model)
+  } catch (error) {
+    return { ok: false, status: 400, error: `configured session provider/model is unavailable: ${String(error instanceof Error ? error.message : error)}` }
+  }
+  entry.agent.adoptPending(pending)
+  await dispatchInbox(entry, deps, 'steer')
+  return { ok: true, status: 202, body: { steered: true, pending: waiting.length } }
+}
+
+/**
+ * Hand the inbox to the driver. Idle: start a run. Busy + queue: the running
+ * turn picks it up when it finishes (or it waits, after a stop). Busy +
+ * steer: stop the turn — children included, like Stop — and let the agent
+ * re-run the inbox once the stopped run settles.
+ */
+async function dispatchInbox(entry: SessionEntry, deps: HandlerDeps, delivery: 'queue' | 'steer'): Promise<void> {
+  if (!entry.agent.busy) {
     // Fire-and-forget: the reply (and any failure, which closes the turn
     // durably) reaches the client through the SSE stream.
     void entry.agent.run().catch((error: unknown) => {
@@ -5538,8 +5678,12 @@ async function acceptMessage(
       console.error(`web: agent run failed for ${entry.session.id}: ${message}`)
       deps.kernel.ctx.emit('web/turn-error', { sessionId: entry.session.id, message })
     })
+    return
   }
-  return { ok: true, status: 202, body: { inputId, queued: wasBusy } }
+  if (delivery === 'steer') {
+    entry.agent.steer()
+    await deps.childExecutor.cancelAllOfRoot(entry.session.id)
+  }
 }
 
 async function putSessionModel(
@@ -5704,7 +5848,15 @@ async function putThinking(
 function listSessions(workspaceId: WorkspaceId, deps: HandlerDeps): Record<string, unknown>[] {
   const fallbackWs = defaultWorkspaceId(deps)
   const rows: Record<string, unknown>[] = []
-  for (const summary of deps.kernel.ctx.sessions.summaries()) {
+  const summaries = deps.kernel.ctx.sessions.summaries()
+  // Child sessions never join the root registry (executor-managed), so their
+  // live driver state comes from the executor's own active index.
+  const runningChildren = new Set<string>()
+  for (const summary of summaries) {
+    if (summary.parentSessionId == null) continue
+    for (const id of deps.childExecutor.runningChildrenOfRoot(summary.parentSessionId as SessionId)) runningChildren.add(id)
+  }
+  for (const summary of summaries) {
     const owner = deps.kernel.ctx.sessions.workspaceOf(summary.id)
     // Unowned (fixed-store test) sessions report under the fallback.
     if (owner !== undefined ? owner !== workspaceId : workspaceId !== fallbackWs) continue
@@ -5722,9 +5874,15 @@ function listSessions(workspaceId: WorkspaceId, deps: HandlerDeps): Record<strin
       projectId: entry?.projectId ?? summary.projectId ?? null,
       // A loaded session's own log is fresher than its projected summary.
       pinned: entry?.session.pinned ?? summary.pinned ?? false,
-      status: entry?.agent.status ?? 'idle',
+      // Subagent conversations: the UI nests them under this parent instead
+      // of listing them beside it.
+      parentSessionId: summary.parentSessionId ?? null,
+      status: entry?.agent.status ?? (runningChildren.has(summary.id) ? 'running' : 'idle'),
       activity: entry?.agent.activity ?? null,
       pendingInputs: entry !== undefined ? deps.kernel.ctx.sessions.pendingInputs(entry.session).length : 0,
+      // Background Bash processes outlive their turn; the sidebar folder uses
+      // the count to show a terminal marker while anything is still running.
+      runningProcesses: deps.processes.runningCount(summary.id),
     })
   }
   return rows

@@ -20,7 +20,8 @@ import type { ProjectId } from '../util/brand.ts'
 
 /** Folders a grant must neither contain nor sit inside (app storage, user skills). */
 export interface GrantPolicy {
-  readonly protectedRoots: readonly string[]
+  /** Mutable: the skills-sources PUT refreshes protected roots at runtime. */
+  readonly protectedRoots: string[]
   /** Override for tests; defaults to the OS home directory. */
   readonly home?: string
 }

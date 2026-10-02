@@ -45,7 +45,7 @@ export function defaultSkillRules(userSkillsDir: string | undefined): SkillRule[
     { id: 'project-claude', kind: 'project', path: '.claude/skills', enabled: true },
     { id: 'project-agents', kind: 'project', path: '.agents/skills', enabled: true },
     { id: 'workspace', kind: 'workspace', enabled: true },
-    ...(userSkillsDir !== undefined ? [{ id: 'user', kind: 'absolute', path: userSkillsDir, enabled: true }] : []),
+    ...(userSkillsDir !== undefined ? [{ id: 'user', kind: 'absolute', path: userSkillsDir, enabled: true } satisfies SkillRule] : []),
   ]
 }
 
