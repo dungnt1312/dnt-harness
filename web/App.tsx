@@ -60,7 +60,7 @@ import { TerminalDock } from './components/workbench/TerminalDock.tsx'
 import { useWorkbenchFiles } from './hooks/useWorkbenchFiles.ts'
 import { usePanelResize } from './hooks/usePanelResize.ts'
 import { toProjectRelative } from './lib/project-paths.ts'
-import { PANEL_LIMITS } from './lib/workbench-preferences.ts'
+import { PANEL_LIMITS, type WorkbenchViewName } from './lib/workbench-preferences.ts'
 import { LazySettings } from './components/settings/LazySettings.tsx'
 import { TaskStatus } from './components/chat/TaskStatus.tsx'
 import { EnvironmentPanel } from './components/chat/EnvironmentPanel.tsx'
@@ -498,19 +498,35 @@ function AppShell() {
       onWorkbenchOpenChange(true)
     }
   }, [workbenchProject, openWorkbenchFile, patchPreferences, onWorkbenchOpenChange])
+  /**
+   * Open a fixed workbench view programmatically: the tab must join the
+   * strip in the same patch, or the clamp folds the selection back to Files.
+   */
+  const openWorkbenchView = useCallback((view: WorkbenchViewName) => {
+    patchPreferences({
+      inspectorTab: view,
+      inspectorViews: preferences.inspectorViews.includes(view) ? preferences.inspectorViews : [...preferences.inspectorViews, view],
+    })
+    onWorkbenchOpenChange(true)
+  }, [patchPreferences, preferences.inspectorViews, onWorkbenchOpenChange])
+  /** The background process the Environment panel focused, if any. */
+  const [processFocus, setProcessFocus] = useState<string | null>(null)
   /** The per-turn change card's Review all: the Git view narrowed to that turn's recorded files. */
   const reviewTurnChanges = useCallback((paths: readonly string[]) => {
     setGitPathFilter(paths)
-    patchPreferences({ inspectorTab: 'git' })
-    onWorkbenchOpenChange(true)
-  }, [patchPreferences, onWorkbenchOpenChange])
+    openWorkbenchView('git')
+  }, [openWorkbenchView])
   /** Show all: the Git view without the turn's narrowing. */
   const clearGitPathFilter = useCallback(() => setGitPathFilter(null), [])
   /** Environment panel rows open the matching workbench view. */
   const openEnvironmentView = useCallback((view: 'git' | 'agents') => {
-    patchPreferences({ inspectorTab: view })
-    onWorkbenchOpenChange(true)
-  }, [patchPreferences, onWorkbenchOpenChange])
+    openWorkbenchView(view)
+  }, [openWorkbenchView])
+  /** A process row (or tool-row chip): the workbench Process view, focused. */
+  const openEnvironmentProcess = useCallback((processId: string) => {
+    setProcessFocus(processId)
+    openWorkbenchView('process')
+  }, [openWorkbenchView])
   const draftProjectName = useMemo(
     () => projects.find((project) => project.id === effectiveDraftProject)?.name,
     [projects, effectiveDraftProject],
@@ -1341,6 +1357,7 @@ function AppShell() {
       openPath={openRecordedPath}
       sessionId={current}
       onOpenChild={openSession}
+      processFocus={processFocus}
       terminalShell={preferences.terminalShell}
       onTerminalShell={(shellId) => patchPreferences({ terminalShell: shellId })}
       gitPathFilter={gitPathFilter}
@@ -1443,6 +1460,7 @@ function AppShell() {
                 events={events}
                 connected={stream !== 'reconnecting'}
                 onOpenView={openEnvironmentView}
+                onOpenProcess={openEnvironmentProcess}
               />
               {events.length === 0 ? (
                 <div className="flex flex-1 items-center justify-center gap-2 text-sm text-fg-muted" role="status" aria-live="polite">
@@ -1458,6 +1476,7 @@ function AppShell() {
                   workspaceId={activeWs}
                   project={currentProject}
                   onReviewChanges={reviewTurnChanges}
+                  onOpenProcess={openEnvironmentProcess}
                   onReuse={reuseInDraft}
                   onOpenChild={openSession}
                   onRetry={retryLastTurn}

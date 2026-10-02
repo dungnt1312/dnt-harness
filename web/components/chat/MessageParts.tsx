@@ -1,6 +1,7 @@
-import { memo, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
+import { createContext, memo, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 import Icon, { type IconName } from '../common/Icon.tsx'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
+import { DiffLines, LineCount, diffRowsFromEdit, diffRowsFromWrite, type DiffRow } from '../common/DiffLines.tsx'
 import CopyButton from '../common/CopyButton.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { Button } from '../ui/Button.tsx'
@@ -8,8 +9,9 @@ import { IconButton } from '../ui/IconButton.tsx'
 import { Markdown } from '../../Markdown.tsx'
 import { ThinkingPanel } from './ThinkingPanel.tsx'
 import { useHoldScroll } from '../../hooks/useStickToBottom.ts'
-import { budgetTone, contextFill, formatBytes, formatTime, formatTokenCount } from '../../lib/format.ts'
-import { toolDisplayName, toolFacts, type ToolFacts } from '../../lib/tool-facts.ts'
+import { budgetTone, contextFill, formatBytes, formatElapsed, formatTime, formatTokenCount } from '../../lib/format.ts'
+import { isDenied, mcpServerOf, toolFacts, type ToolFacts } from '../../lib/tool-facts.ts'
+import { Section, ToolArguments, preClass } from './ToolArguments.tsx'
 import { errorSummary } from '../../lib/copy.ts'
 import { attachmentUrl, fetchContextBody, waitChild } from '../../lib/api.ts'
 import { cn } from '../../lib/cn.ts'
@@ -20,6 +22,28 @@ import { ImageLightbox } from './ImageLightbox.tsx'
 import type { ChildRow, ToolCall } from '../../lib/types.ts'
 import type { ViewItem } from '../../lib/project.ts'
 import type { OpenPathResolver } from '../../lib/project-paths.ts'
+import type { TurnChanges } from '../../lib/turn-changes.ts'
+import type { WorkbenchProject } from '../workbench/Workbench.tsx'
+import type { ProcessRow } from '../../lib/processes-view.ts'
+import { TurnChangesCard } from './TurnChangesCard.tsx'
+
+/**
+ * Live background-process state plus the way to its workbench detail view,
+ * provided by the Transcript from the session's durable process events. A
+ * background Bash call reads it to show what its process is doing now.
+ */
+export interface ProcessLink {
+  readonly statuses: ReadonlyMap<string, ProcessRow>
+  readonly open: (processId: string) => void
+}
+
+export const ProcessLinkContext = createContext<ProcessLink | null>(null)
+
+/** The `proc_…` id a background Bash result reports, if this is one. */
+export function backgroundProcessId(call: ToolCall, result: { readonly output: string } | undefined): string | undefined {
+  if (call.args['run_in_background'] !== true) return undefined
+  return result === undefined ? undefined : /id=(proc_[0-9a-f-]+)/.exec(result.output)?.[1]
+}
 
 /** Images render inline; anything else is named rather than previewed. */
 const isImageAttachment = (ref: AttachmentRef): boolean => ref.mediaType.startsWith('image/')
@@ -138,11 +162,17 @@ function useLiveContent(content: string, live: boolean): string {
   return live ? displayed : content
 }
 
-export const AssistantMessage = memo(function AssistantMessage({ item, modelLabel, turn }: {
+export const AssistantMessage = memo(function AssistantMessage({ item, modelLabel, turn, changes, changesProject, changesWorkspaceId, changesOpenPath, changesReviewAll }: {
   readonly item: Extract<ViewItem, { kind: 'assistant' }>
   readonly modelLabel?: string
   /** Present on the last answer of a closed turn; text is the turn's full answer. */
-  readonly turn?: { readonly text: string }
+  readonly turn?: { readonly parts?: readonly string[]; readonly text: string }
+  /** Files this turn's Write/Edit calls landed; present on the same anchor answer. */
+  readonly changes?: TurnChanges
+  readonly changesProject?: WorkbenchProject | null
+  readonly changesWorkspaceId?: string | null
+  readonly changesOpenPath?: OpenPathResolver
+  readonly changesReviewAll?: () => void
 }) {
   const visibleContent = useLiveContent(item.content, item.live)
   // The label reports what actually served THIS step (recorded controls);
@@ -156,136 +186,263 @@ export const AssistantMessage = memo(function AssistantMessage({ item, modelLabe
       {item.thinking.length > 0 || item.thinkingLive ? <ThinkingPanel thinking={item.thinking} live={item.live && item.thinkingLive} /> : null}
       {item.content !== '' ? (
         <div className="text-fg">
-          <Markdown content={visibleContent} />
+          {item.live
+            ? <p className="m-0 whitespace-pre-wrap break-words">{visibleContent}</p>
+            : <Markdown content={visibleContent} />}
           {item.live ? <span className="ml-0.5 inline-block size-2.5 translate-y-[-1px] rounded-full bg-fg align-middle animate-dot" aria-hidden="true" /> : null}
         </div>
       ) : null}
       {!item.live && turn !== undefined ? (
-        // Reserved, not hover-inserted (a hover must not shift the transcript),
-        // so the row stays short: it is height every answer pays for.
-        <div className={cn('-ml-2 -mb-0.5 flex h-6 items-center gap-1 text-[11px] text-fg-faint', revealActions)}>
-          <CopyButton text={turn.text} label="Copy response" className="size-6" />
-          {label !== undefined ? <span className="truncate">{label}</span> : null}
-          {item.ts !== undefined ? <span>· {formatTime(item.ts)}</span> : null}
-        </div>
+        <>
+          {/* Reserved, not hover-inserted (a hover must not shift the transcript),
+              so the row stays short: it is height every answer pays for. */}
+          <div className={cn('-ml-2 -mb-0.5 flex h-6 items-center gap-1 text-[11px] text-fg-faint', revealActions)}>
+            <CopyButton getText={() => turn.parts?.join('\n\n') ?? turn.text ?? ''} label="Copy response" className="size-6" />
+            {label !== undefined ? <span className="truncate">{label}</span> : null}
+            {item.ts !== undefined ? <span>· {formatTime(item.ts)}</span> : null}
+          </div>
+          {changes !== undefined ? (
+            <TurnChangesCard
+              turnId={item.turnId ?? ''}
+              changes={changes}
+              project={changesProject ?? null}
+              workspaceId={changesWorkspaceId ?? null}
+              {...(changesOpenPath !== undefined ? { onOpenPath: changesOpenPath } : {})}
+              {...(changesReviewAll !== undefined ? { onReviewAll: changesReviewAll } : {})}
+            />
+          ) : null}
+        </>
       ) : null}
     </div>
   )
-}, (previous, next) => previous.item === next.item && previous.modelLabel === next.modelLabel && previous.turn?.text === next.turn?.text)
+}, (previous, next) => {
+  if (previous.item !== next.item || previous.modelLabel !== next.modelLabel) return false
+  const previousParts = previous.turn?.parts
+  const nextParts = next.turn?.parts
+  if (previousParts !== undefined || nextParts !== undefined) {
+    return previousParts?.length === nextParts?.length
+      && previousParts?.every((part, index) => part === nextParts?.[index]) === true
+  }
+  if (previous.turn?.text !== next.turn?.text) return false
+  if (previous.changes !== next.changes) return false
+  if (previous.changesReviewAll !== next.changesReviewAll) return false
+  if (previous.changesOpenPath !== next.changesOpenPath) return false
+  if (previous.changesWorkspaceId !== next.changesWorkspaceId) return false
+  if (previous.changesProject?.id !== next.changesProject?.id
+    || previous.changesProject?.path !== next.changesProject?.path) return false
+  return true
+})
 
-function fmtDuration(ms: number): string {
-  if (Number.isNaN(ms)) return ''
-  if (ms < 1_000) return `${ms}ms`
-  if (ms < 60_000) return `${(ms / 1_000).toFixed(1)}s`
-  return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1_000)}s`
-}
-
-type RowState = 'running' | 'ok' | 'failed' | 'unknown' | 'cancelled'
-
-const STATE_TEXT: Readonly<Record<RowState, string>> = {
-  running: 'Running',
-  ok: 'Succeeded',
-  failed: 'Failed',
-  unknown: 'Outcome unknown',
-  cancelled: 'Cancelled',
-}
-
-/** Status glyph with a text alternative — state is never conveyed by color alone. */
-function StateGlyph({ state }: { readonly state: RowState }) {
-  return (
-    <span className="flex size-3.5 shrink-0 items-center justify-center">
-      {state === 'running' ? <Spinner size={12} /> : null}
-      {state === 'ok' ? <Icon name="check" size={13} className="text-fg-faint" /> : null}
-      {state === 'failed' ? <Icon name="close" size={13} className="text-bad" /> : null}
-      {state === 'unknown' ? <Icon name="alertTriangle" size={13} className="text-warn" /> : null}
-      {state === 'cancelled' ? <Icon name="circle" size={12} className="text-fg-faint" /> : null}
-      <span className="sr-only">{STATE_TEXT[state]}</span>
-    </span>
-  )
-}
+type RowState = 'running' | 'ok' | 'failed' | 'unknown' | 'cancelled' | 'denied'
 
 /**
- * The one row geometry every activity line shares, summary header included.
- * Quieter than body text: regular weight, faint color, a light hover. A
- * settled success should not read louder than the answer around it.
+ * An opened row tells its run to stay open: a run that collapses when the
+ * last step settles would unmount the very row someone is reading.
  */
-const rowButtonClass = '-mx-1.5 flex min-h-7 max-w-[calc(100%+0.75rem)] items-center gap-1.5 rounded-md px-1.5 py-0.5 text-left text-[13px] leading-5 text-fg-faint transition-colors hover:bg-muted/60 hover:text-fg-muted'
+const PinRunContext = createContext<() => void>(() => {})
+/** Inside a group the rail already says what the rows are, so their icons give way. */
+const InGroupContext = createContext(false)
 
+/**
+ * Activity rows are a line of text, not a card: no box, no fill, no hover
+ * background. Only the chevron reveals on hover. A settled success adds
+ * nothing to the line; only an outcome worth a look gets a status word.
+ */
+const rowClass = 'inline-flex max-w-full items-center gap-2 self-start text-left text-[13px] leading-5 text-fg-faint'
+
+/** Built-in tools only. An MCP tool called `read` is not the built-in and does not borrow its icon. */
 const TOOL_ICON: Readonly<Record<string, IconName>> = {
   read: 'eye',
-  write: 'fileText',
+  write: 'squarePen',
   edit: 'pencil',
   glob: 'search',
   grep: 'search',
   bash: 'terminal',
+  skill: 'zap',
+  agent: 'gitBranch',
+  memorysearch: 'lightbulb',
+  memoryread: 'lightbulb',
+  memorycreate: 'lightbulb',
+  memoryupdate: 'lightbulb',
+  memoryforget: 'lightbulb',
 }
 
-/** The glyph a tool row leads with. File tools use the file's own icon. */
-function ToolGlyph({ facts }: { readonly facts: ToolFacts }) {
-  if (facts.path !== undefined) return <FileTypeIcon path={facts.path} size={15} />
-  return <Icon name={TOOL_ICON[facts.name.toLowerCase()] ?? 'wrench'} size={14} className="shrink-0 text-fg-muted" />
+/**
+ * One hue per family of work, on the icon only — the words stay neutral, so
+ * colour helps a scan without competing with the text. Reading is blue,
+ * changing green, searching violet, running amber, delegating pink, external
+ * tools teal. Groups take their family's hue; a mixed run stays neutral.
+ */
+const ICON_TONE: Readonly<Partial<Record<IconName, string>>> = {
+  eye: 'text-tool-read',
+  squarePen: 'text-tool-edit',
+  pencil: 'text-tool-edit',
+  search: 'text-tool-search',
+  terminal: 'text-tool-run',
+  gitBranch: 'text-tool-agent',
+  zap: 'text-tool-agent',
+  lightbulb: 'text-tool-search',
+  globe: 'text-tool-ext',
+  wrench: 'text-tool-ext',
 }
 
-/** Added and removed lines, green then red, the way a diff stat reads. */
-function LineStat({ added, removed }: { readonly added: number; readonly removed: number }) {
-  if (added === 0 && removed === 0) return null
+/** The word a row leads with: running, landed, and anything else. */
+const KIND: Readonly<Record<string, { readonly running: string; readonly done: string; readonly otherwise: string }>> = {
+  read: { running: 'Reading', done: 'Read', otherwise: 'Read' },
+  write: { running: 'Writing', done: 'Wrote', otherwise: 'Write' },
+  edit: { running: 'Editing', done: 'Edited', otherwise: 'Edit' },
+  glob: { running: 'Finding', done: 'Find', otherwise: 'Find' },
+  grep: { running: 'Searching', done: 'Search', otherwise: 'Search' },
+  bash: { running: 'Running', done: 'Terminal', otherwise: 'Terminal' },
+  skill: { running: 'Loading skill', done: 'Skill', otherwise: 'Skill' },
+  agent: { running: 'Agent', done: 'Agent', otherwise: 'Agent' },
+}
+
+const MEMORY_VERB: Readonly<Record<string, string>> = {
+  memorysearch: 'Search',
+  memoryread: 'Read',
+  memorycreate: 'Create',
+  memoryupdate: 'Update',
+  memoryforget: 'Forget',
+}
+
+type StatusTone = 'bad' | 'warn' | 'quiet'
+interface RowStatus {
+  readonly text: string
+  readonly tone: StatusTone
+  /** The reason, on hover; the opened row shows it in full. */
+  readonly detail?: string
+}
+
+/** Everything one row line draws, decided once per call. */
+interface RowSpec {
+  readonly icon: IconName
+  readonly kind: string
+  /** A qualifier beside the kind: an MCP server, an agent role. */
+  readonly kindDetail?: string
+  /** A `·` between the kind and what follows, when the kind is a noun. */
+  readonly separator?: boolean
+  readonly primary?: ReactNode
+  /** Commands and patterns are code; names and sentences are not. */
+  readonly primaryMono?: boolean
+  /** Quiet context — a directory, a search scope. First to go when space runs out. */
+  readonly secondary?: string
+  /** The untruncated target, on hover. */
+  readonly title?: string
+  readonly diff?: { readonly added: number; readonly removed: number }
+  readonly status?: RowStatus
+}
+
+const STATUS_TONE: Readonly<Record<StatusTone, string>> = {
+  bad: 'text-bad',
+  warn: 'text-warn',
+  quiet: 'text-fg-faint',
+}
+
+/**
+ * A file, named the way the Git panel names a changed one: its type icon, then
+ * its name at full strength. The folder beside it is the row's quiet context.
+ */
+function FileChip({ path, name, onOpen }: { readonly path: string; readonly name: string; readonly onOpen?: () => void }) {
+  const body = (
+    <>
+      <FileTypeIcon path={path} size={16} />
+      <span className="min-w-0 truncate">{name}</span>
+    </>
+  )
+  if (onOpen === undefined) return <span className="inline-flex min-w-0 items-center gap-1.5 text-fg">{body}</span>
   return (
-    <span className="flex shrink-0 items-center gap-1.5 font-mono text-[12px]">
-      {added > 0 ? <span className="text-ok">+{added}</span> : null}
-      {removed > 0 ? <span className="text-bad">−{removed}</span> : null}
-    </span>
+    <button type="button" onClick={onOpen} title={`Open ${path} in workbench`} className="inline-flex min-w-0 items-center gap-1.5 rounded-sm text-fg hover:underline">
+      {body}
+    </button>
   )
 }
 
-/** Compact disclosure row shared by tool calls and delegations. */
-function ActivityRow({ state, glyph, title, detail, detailMono = true, fullDetail, digest, digestFailed, trailing, children }: {
+/**
+ * The line itself: icon, kind, then what it acted on and how it ended. The
+ * colours follow the Git panel's row — the thing acted on at full strength,
+ * its context faint — with the kind one step quieter than the target.
+ */
+function RowLine({ spec, state, showIcon }: { readonly spec: RowSpec; readonly state: RowState; readonly showIcon: boolean }) {
+  const running = state === 'running'
+  const hasSummary = spec.primary !== undefined || spec.secondary !== undefined || spec.diff !== undefined || spec.status !== undefined
+  return (
+    <>
+      {showIcon ? <Icon name={spec.icon} size={14} className={cn('shrink-0', ICON_TONE[spec.icon] ?? 'text-fg-faint')} /> : null}
+      <span className={cn('shrink-0 whitespace-nowrap font-medium', running ? 'text-shimmer' : 'text-fg-muted')}>{spec.kind}</span>
+      {/* A kind that stays a noun while it runs still has to say so aloud. */}
+      {running && !spec.kind.endsWith('ing') ? <span className="sr-only">, running</span> : null}
+      {spec.kindDetail !== undefined && spec.kindDetail !== '' ? <span className="shrink-0 whitespace-nowrap text-fg">{spec.kindDetail}</span> : null}
+      {hasSummary ? (
+        <span className="flex min-w-0 items-center gap-1.5">
+          {spec.separator === true && spec.primary !== undefined ? <span aria-hidden="true" className="shrink-0 text-fg-faint">·</span> : null}
+          {spec.primary !== undefined ? (
+            <span className={cn('flex min-w-0 items-center truncate text-fg', spec.primaryMono === true && 'font-mono text-[12px]')}>{spec.primary}</span>
+          ) : null}
+          {spec.secondary !== undefined && spec.secondary !== '' ? (
+            // Context gives way before the target does, and leaves a narrow screen entirely.
+            <span className="hidden min-w-0 truncate text-fg-faint [flex-shrink:4] sm:block">{spec.secondary}</span>
+          ) : null}
+          {spec.diff !== undefined ? <LineCount added={spec.diff.added} removed={spec.diff.removed} /> : null}
+          {spec.status !== undefined ? (
+            <span
+              className={cn('shrink-0 whitespace-nowrap underline decoration-dotted underline-offset-2', STATUS_TONE[spec.status.tone])}
+              {...(spec.status.detail !== undefined ? { title: spec.status.detail } : {})}
+            >
+              {spec.status.text}
+            </span>
+          ) : null}
+        </span>
+      ) : null}
+    </>
+  )
+}
+
+/** One activity line, opening to what the call recorded when there is something to show. */
+function ActivityRow({ spec, state, expandable = true, children }: {
+  readonly spec: RowSpec
   readonly state: RowState
-  /** What the call is, drawn before its name. The status glyph stays for screen readers. */
-  readonly glyph?: ReactNode
-  readonly title: ReactNode
-  readonly detail?: string
-  /** A command or pattern is monospace; a directory path is not. */
-  readonly detailMono?: boolean
-  /** What the shortened detail stands for; shown on hover. */
-  readonly fullDetail?: string
-  /** One phrase for what came back — the reason a settled row needs no click. */
-  readonly digest?: string
-  readonly digestFailed?: boolean
-  readonly trailing?: ReactNode
-  readonly children: ReactNode
+  readonly expandable?: boolean
+  readonly children?: ReactNode
 }) {
   const [expanded, setExpanded] = useState(false)
   const holdScroll = useHoldScroll()
+  const pinRun = useContext(PinRunContext)
+  const inGroup = useContext(InGroupContext)
   const bodyId = useId()
+  const buttonId = useId()
+  const line = <RowLine spec={spec} state={state} showIcon={!inGroup} />
+  if (!expandable) {
+    return <div className={rowClass} {...(spec.title !== undefined ? { title: spec.title } : {})}>{line}</div>
+  }
   return (
-    <div className="min-w-0">
+    <div className="flex min-w-0 flex-col">
       <button
         type="button"
+        id={buttonId}
         // Opening a row must not scroll it away: growth the reader asked for
         // releases the tail instead of following it.
-        onClick={() => { if (!expanded) holdScroll(); setExpanded((prev) => !prev) }}
+        onClick={() => {
+          if (!expanded) { holdScroll(); pinRun() }
+          setExpanded((prev) => !prev)
+        }}
         aria-expanded={expanded}
         aria-controls={bodyId}
-        className={rowButtonClass}
+        className={cn(rowClass, 'group/row cursor-pointer rounded-sm')}
+        {...(spec.title !== undefined ? { title: spec.title } : {})}
       >
-        {glyph ?? <StateGlyph state={state} />}
-        {glyph !== undefined ? <span className="sr-only">{STATE_TEXT[state]}</span> : null}
-        {/* The name keeps its width up to half the row, then truncates: a long
-            MCP name must not push the outcome off the row, and a long target
-            must not squeeze the name down to "Re…". */}
-        <span className="max-w-[45%] shrink-0 truncate text-fg-muted">{title}</span>
-        {/* Target and digest both stay on the row at every width — what the
-            call touched and what came back are the reason the row exists.
-            What gets dropped on a narrow screen is the chips and the duration. */}
-        {detail !== undefined && detail !== '' ? <span className={cn('min-w-0 flex-1 truncate text-[12px] text-fg-faint', detailMono && 'font-mono')} title={fullDetail ?? detail}>{detail}</span> : null}
-        {digest !== undefined && digest !== '' ? (
-          <span className={cn('min-w-0 max-w-[45%] shrink-0 truncate text-[12px]', digestFailed === true ? 'text-bad' : 'text-fg-faint')} title={digest}>{digest}</span>
-        ) : null}
-        {trailing}
-        <Icon name="chevronRight" size={12} className={cn('shrink-0 text-fg-faint/70 transition-transform', expanded && 'rotate-90')} />
+        {line}
+        <Icon
+          name="chevronRight"
+          size={14}
+          className={cn(
+            'shrink-0 text-fg-faint opacity-0 transition duration-200 group-hover/row:opacity-100 group-focus-visible/row:opacity-100 [@media(pointer:coarse)]:opacity-100',
+            expanded && 'rotate-90 opacity-100',
+          )}
+        />
       </button>
       {expanded ? (
-        <div id={bodyId} role="region" className="mt-1 flex flex-col gap-2 rounded-xl border border-line p-3 text-sm animate-fade-up">
+        <div id={bodyId} role="group" aria-labelledby={buttonId} className="flex min-w-0 flex-col gap-2 pt-2 animate-fade-up">
           {children}
         </div>
       ) : null}
@@ -296,7 +453,41 @@ function ActivityRow({ state, glyph, title, detail, detailMono = true, fullDetai
 /** Runs shorter than this stay open: a summary would hide more than it saves. */
 const COLLAPSE_MIN_ROWS = 4
 /** Running outranks a settled failure: while work continues, that is the state. */
-const STATE_RANK: Readonly<Record<RowState, number>> = { running: 5, failed: 4, unknown: 3, cancelled: 1, ok: 0 }
+const STATE_RANK: Readonly<Record<RowState, number>> = { running: 5, failed: 4, unknown: 3, cancelled: 1, denied: 1, ok: 0 }
+
+type Bucket = 'search' | 'file' | 'command' | 'change' | 'agent' | 'tool'
+const BUCKET_WORDS: Readonly<Record<Bucket, readonly [string, string]>> = {
+  file: ['file', 'files'],
+  search: ['search', 'searches'],
+  command: ['command', 'commands'],
+  change: ['edit', 'edits'],
+  agent: ['agent', 'agents'],
+  tool: ['tool', 'tools'],
+}
+const BUCKET_ORDER: readonly Bucket[] = ['file', 'search', 'command', 'change', 'agent', 'tool']
+
+function bucketOf(item: ViewItem): Bucket | null {
+  if (item.kind === 'delegation') return 'agent'
+  if (item.kind !== 'tool') return null
+  if (mcpServerOf(item.call.name) !== undefined) return 'tool'
+  switch (item.call.name.toLowerCase()) {
+    case 'read': return 'file'
+    case 'glob':
+    case 'grep': return 'search'
+    case 'bash': return 'command'
+    case 'edit':
+    case 'write': return 'change'
+    case 'agent': return 'agent'
+    default: return 'tool'
+  }
+}
+
+const GROUP_KIND: Readonly<Record<'explore' | 'terminal' | 'changes' | 'mixed', { readonly icon: IconName; readonly done: string; readonly running: string }>> = {
+  explore: { icon: 'search', done: 'Explore', running: 'Exploring' },
+  terminal: { icon: 'terminal', done: 'Terminal', running: 'Running' },
+  changes: { icon: 'pencil', done: 'Changes', running: 'Editing' },
+  mixed: { icon: 'layers', done: 'Activity', running: 'Working' },
+}
 
 interface ActivitySummary {
   readonly state: RowState
@@ -305,43 +496,84 @@ interface ActivitySummary {
   readonly steps: number
   /** Rows that failed or ended unknown — a collapsed run must still admit them. */
   readonly problems: number
-  readonly breakdown: string
-  readonly duration: string
+  /** Rows refused or cancelled: not faults, but a collapsed run must not hide that a step never ran. */
+  readonly skipped: number
+  readonly icon: IconName
+  /** `Explore`, `Terminal`, `Changes`, or `Activity` for a mixed run. */
+  readonly kind: string
+  /** `2 searches, 3 files`: what the run did, counted. */
+  readonly text: string
+  /** Lines the run's landed edits added and removed. */
+  readonly diff: { readonly added: number; readonly removed: number }
 }
 
-/** One line for a whole run: worst outcome, what ran, how long it took. */
+/** One line for a whole run: what kind of work it was, counted, and how it ended. */
 export function summarizeActivity(items: readonly ViewItem[]): ActivitySummary {
-  const counts = new Map<string, number>()
+  const counts = new Map<Bucket, number>()
+  const changedPaths = new Set<string>()
   let state: RowState = 'ok'
   let steps = 0
   let problems = 0
-  let elapsed = 0
-  const tally = (name: string): void => { counts.set(name, (counts.get(name) ?? 0) + 1) }
+  let skipped = 0
+  let added = 0
+  let removed = 0
   for (const item of items) {
-    if (item.kind === 'tool' || item.kind === 'delegation') steps += 1
-    const rowState = item.kind === 'tool' ? toolState(item) : item.kind === 'delegation' ? DELEGATION_STATE[item.status] : null
-    if (rowState !== null) {
-      if (STATE_RANK[rowState] > STATE_RANK[state]) state = rowState
-      if (rowState === 'failed' || rowState === 'unknown') problems += 1
+    const bucket = bucketOf(item)
+    if (bucket === null) continue
+    steps += 1
+    counts.set(bucket, (counts.get(bucket) ?? 0) + 1)
+    const rowState = item.kind === 'tool' ? toolState(item) : item.kind === 'delegation' ? DELEGATION_STATE[item.status] : 'ok'
+    if (STATE_RANK[rowState] > STATE_RANK[state]) state = rowState
+    if (rowState === 'failed' || rowState === 'unknown') problems += 1
+    if (rowState === 'denied' || rowState === 'cancelled') skipped += 1
+    if (item.kind !== 'tool') continue
+    const facts = toolFacts(item.call, item.result)
+    // `Bash` settles as a recorded success even when the command exited
+    // non-zero or was killed: the row says so, so a collapsed run has to
+    // count it too instead of reading as all clear.
+    if (rowState === 'ok' && item.result !== undefined && facts.digestFailed === true) {
+      problems += 1
+      if (STATE_RANK.failed > STATE_RANK[state]) state = 'failed'
     }
-    if (item.kind === 'tool') {
-      tally(toolDisplayName(item.call.name))
-      if (item.ts !== undefined && item.doneAt !== undefined) elapsed += item.doneAt - item.ts
+    if (bucket === 'change' && facts.path !== undefined) changedPaths.add(facts.path)
+    if (bucket === 'change' && rowState === 'ok') {
+      const lines = changeLines(item)
+      added += lines.added
+      removed += lines.removed
     }
-    if (item.kind === 'delegation') tally('Delegated')
   }
-  const breakdown = [...counts.entries()]
-    .sort((left, right) => right[1] - left[1])
-    .map(([name, count]) => (count > 1 ? `${name} (${count})` : name))
-    .join(' · ')
-  return { state, live: state === 'running', steps, problems, breakdown, duration: elapsed > 0 ? fmtDuration(elapsed) : '' }
+  const only = (bucket: Bucket): boolean => counts.size === 1 && counts.has(bucket)
+  const group = counts.size > 0 && [...counts.keys()].every((bucket) => bucket === 'file' || bucket === 'search')
+    ? GROUP_KIND.explore
+    : only('command') ? GROUP_KIND.terminal : only('change') ? GROUP_KIND.changes : GROUP_KIND.mixed
+  const parts = BUCKET_ORDER
+    .filter((bucket) => (counts.get(bucket) ?? 0) > 0)
+    .map((bucket) => {
+      // A Changes run counts files, not calls: three edits to one file is one file changed.
+      const count = bucket === 'change' && group === GROUP_KIND.changes ? changedPaths.size || (counts.get(bucket) ?? 0) : counts.get(bucket) ?? 0
+      const [one, many] = bucket === 'change' && group === GROUP_KIND.changes ? ['file', 'files'] : BUCKET_WORDS[bucket]
+      return `${count} ${count === 1 ? one : many}`
+    })
+  const live = state === 'running'
+  return {
+    state,
+    live,
+    steps,
+    problems,
+    skipped,
+    icon: group.icon,
+    kind: live ? group.running : group.done,
+    text: parts.length > 0 ? parts.join(', ') : `${items.length} ${items.length === 1 ? 'step' : 'steps'}`,
+    diff: { added, removed },
+  }
 }
 
 /**
  * A run of tool calls, delegations and audit lines. Four rows or more collapse
- * into one summary line once the work settles, so a turn that read twenty
- * files reads as one step instead of twenty. It stays open while anything is
- * still running or ended badly, and a reader's own toggle wins either way.
+ * into one summary line once the work settles — `Explore · 2 searches, 3 files`
+ * — so a turn that read twenty files reads as one step instead of twenty. It
+ * stays open while anything is still running or ended badly, and a reader's
+ * own toggle wins either way.
  */
 export function ActivityBlock({ items, children }: { readonly items: readonly ViewItem[]; readonly children: ReactNode }) {
   const [userPreference, setUserPreference] = useState<boolean | null>(null)
@@ -349,180 +581,383 @@ export function ActivityBlock({ items, children }: { readonly items: readonly Vi
   const bodyId = useId()
   const summary = useMemo(() => summarizeActivity(items), [items])
   const open = userPreference ?? (summary.live || summary.problems > 0)
+  // Opening a row inside the run is a decision to keep reading it. Without
+  // this the run would fold shut when its last step settled and take the open
+  // row (and anything it fetched) with it. A deliberate fold still wins.
+  const pin = useCallback(() => { setUserPreference((current) => current ?? true) }, [])
 
-  if (items.length < COLLAPSE_MIN_ROWS) return <div className="flex flex-col gap-0.5">{children}</div>
+  if (items.length < COLLAPSE_MIN_ROWS) return <div className="flex flex-col gap-2">{children}</div>
+  const unknown = summary.problems > 0 && summary.state === 'unknown'
   return (
-    <div className="flex flex-col gap-0.5">
+    <div className="flex flex-col">
       <button
         type="button"
         onClick={() => { if (!open) holdScroll(); setUserPreference(!open) }}
         aria-expanded={open}
         aria-controls={bodyId}
-        className={rowButtonClass}
+        className={cn(rowClass, 'group/row cursor-pointer rounded-sm')}
       >
-        <StateGlyph state={summary.state} />
-        <span className="shrink-0 text-fg-muted">{summary.steps > 0 ? summary.steps : items.length} steps</span>
-        <span className="min-w-0 truncate text-[12px] text-fg-faint" title={summary.breakdown}>{summary.breakdown}</span>
-        {summary.problems > 0 ? (
-          <span className="shrink-0 rounded-md bg-bad-soft px-1.5 text-xs text-bad">{summary.problems} to inspect</span>
-        ) : null}
-        {summary.duration !== '' ? <span className="shrink-0 font-mono text-xs text-fg-faint">{summary.duration}</span> : null}
-        <Icon name="chevronRight" size={12} className={cn('shrink-0 text-fg-faint/70 transition-transform', open && 'rotate-90')} />
+        <RowLine
+          state={summary.live ? 'running' : 'ok'}
+          showIcon
+          spec={{
+            icon: summary.icon,
+            kind: summary.kind,
+            separator: true,
+            primary: summary.text,
+            diff: summary.diff,
+            ...(summary.problems > 0
+              ? { status: { text: unknown ? `${summary.problems} unknown` : `${summary.problems} failed`, tone: unknown ? 'warn' : 'bad' } }
+              : summary.skipped > 0 ? { status: { text: `${summary.skipped} not run`, tone: 'quiet' } } : {}),
+          }}
+        />
+        <Icon
+          name="chevronRight"
+          size={14}
+          className={cn(
+            'shrink-0 text-fg-faint opacity-0 transition duration-200 group-hover/row:opacity-100 group-focus-visible/row:opacity-100 [@media(pointer:coarse)]:opacity-100',
+            open && 'rotate-90 opacity-100',
+          )}
+        />
       </button>
-      {/* Indented behind a guide line: an opened run must read as the header's
-          contents, not as loose rows that happen to follow it. The padding
-          clears the rows' own negative margin. */}
-      {open ? <div id={bodyId} className="ml-2 flex flex-col gap-0.5 border-l border-line pl-3">{children}</div> : null}
+      {/* Behind a rail: an opened run reads as the header's contents, not as
+          loose rows that happen to follow it. The rail already names them, so
+          the rows drop their icons. */}
+      {open ? (
+        <PinRunContext.Provider value={pin}>
+          <InGroupContext.Provider value>
+            <div id={bodyId} className="ml-2 mt-2 flex flex-col gap-2 border-l border-line pl-3.5">{children}</div>
+          </InGroupContext.Provider>
+        </PinRunContext.Provider>
+      ) : null}
     </div>
   )
 }
-
-/** `copy` offers the section's exact text — arguments and tool output are what a reader reaches for. */
-function Section({ label, copy, children }: { readonly label: string; readonly copy?: string; readonly children: ReactNode }) {
-  return (
-    <div className="flex min-w-0 flex-col gap-1">
-      <span className="flex min-h-7 items-center gap-1 text-xs font-medium text-fg-faint">
-        <span className="min-w-0 truncate">{label}</span>
-        {copy !== undefined && copy !== '' ? <CopyButton text={copy} label={`Copy ${label}`} className="size-7" /> : null}
-      </span>
-      {children}
-    </div>
-  )
-}
-
-const preClass = 'm-0 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-muted px-3 py-2 font-mono text-xs leading-relaxed text-fg'
 
 /** A recorded call's outcome: unfinished, recovered/ambiguous, or what the result says. */
 function toolState(item: Extract<ViewItem, { kind: 'tool' }>): RowState {
   if (item.result === undefined) return 'running'
   if (item.recovered === true || item.outcome === 'indeterminate' || item.outcome === 'audit_fault') return 'unknown'
+  // A refusal is the policy or the reader speaking, not a tool that broke.
+  if (isDenied(item.result)) return 'denied'
   return item.result.ok ? 'ok' : 'failed'
 }
 
-/** How much output there is to scroll, said before the reader starts scrolling. */
-function outputLabel(output: string): string {
-  if (output === '') return 'Output'
-  const lines = output.replace(/\n$/, '').split('\n').length
-  return `Output · ${lines} ${lines === 1 ? 'line' : 'lines'}`
+function countLines(text: string): number {
+  if (text === '') return 0
+  return text.replace(/\n$/, '').split('\n').length
 }
 
-/**
- * Argument fields that carry code or prose rather than an identifier. They
- * get their own block: inside a JSON dump their newlines are `\n` escapes,
- * which is exactly the content a reader opened the row to read.
- */
-const PROSE_ARGS: Readonly<Record<string, string>> = {
-  old: 'Replaced',
-  new: 'With',
-  content: 'Content',
-  command: 'Command',
+/** Lines an Edit replaced or a Write wrote, read from the call's own arguments. */
+function changeLines(item: Extract<ViewItem, { kind: 'tool' }>): { added: number; removed: number } {
+  const args = item.call.args
+  const text = (key: string): string => (typeof args[key] === 'string' ? args[key] as string : '')
+  if (item.call.name.toLowerCase() === 'write') return { added: countLines(text('content')), removed: 0 }
+  return { added: countLines(text('new')), removed: countLines(text('old')) }
 }
 
-/** The replaced/replacement pair reads as a change when each side is tinted. */
-const PROSE_TINT: Readonly<Record<string, string>> = {
-  old: 'bg-bad-soft',
-  new: 'bg-ok-soft',
+/** `[exit code: 1]` → `Exit 1`; `terminated` → `Terminated`. */
+function capitalize(text: string): string {
+  return text === '' ? text : `${text[0]!.toUpperCase()}${text.slice(1)}`
 }
 
-/**
- * Fields that are file content whatever their length. A short command or
- * pattern stays in the JSON block instead: the row already shows it, and a
- * block of its own would only say it twice.
- */
-const ALWAYS_PROSE: ReadonlySet<string> = new Set(['old', 'new', 'content'])
-
-/** A string argument long enough that a JSON dump would hide it. */
-function isProse(key: string, value: unknown): value is string {
-  if (typeof value !== 'string') return false
-  return ALWAYS_PROSE.has(key) || value.includes('\n') || value.length > 120
+/** The status word a row ends with — absent for a clean success and while running. */
+function rowStatus(item: Extract<ViewItem, { kind: 'tool' }>, state: RowState, facts: ToolFacts): RowStatus | undefined {
+  const output = item.result?.output ?? ''
+  switch (state) {
+    case 'running': return undefined
+    case 'failed': return { text: 'Failed', tone: 'bad', detail: facts.digest ?? output }
+    case 'denied': return { text: 'Denied', tone: 'quiet', detail: output.replace(/^denied:\s*/, '') }
+    case 'cancelled': return { text: 'Stopped', tone: 'quiet' }
+    case 'unknown':
+      if (item.outcome === 'indeterminate') return { text: 'Indeterminate', tone: 'warn', detail: 'This call may have run remotely. It is not retried automatically.' }
+      if (item.outcome === 'audit_fault') return { text: 'Audit fault', tone: 'warn', detail: 'The outcome is known but its evidence was not durably recorded.' }
+      return { text: 'Unknown', tone: 'warn', detail: 'The host restarted before this result was recorded.' }
+    case 'ok':
+      // A command that ran and exited badly: the call succeeded, the work did not.
+      return facts.digestFailed === true && facts.digest !== undefined ? { text: capitalize(facts.digest), tone: 'bad', detail: excerptTail(output) } : undefined
+  }
 }
 
-/**
- * Exact arguments, in a readable order: the short ones as one JSON block
- * (whose copy carries the complete payload), then each prose field on its
- * own so it can be read and copied as the text it is.
- */
-function ToolArguments({ call }: { readonly call: ToolCall }) {
-  const complete = JSON.stringify(call.args, null, 2)
-  const entries = Object.entries(call.args)
-  const prose = entries.filter(([key, value]) => isProse(key, value)) as [string, string][]
-  const rest = Object.fromEntries(entries.filter(([key, value]) => !isProse(key, value)))
+/** The end of an output, where a command's error usually is. */
+function excerptTail(output: string, max = 400): string {
+  const trimmed = output.trimEnd()
+  return trimmed.length <= max ? trimmed : `…${trimmed.slice(trimmed.length - max)}`
+}
+
+/** What one tool row draws. */
+function toolRowSpec(item: Extract<ViewItem, { kind: 'tool' }>, state: RowState, facts: ToolFacts, onOpenFile?: () => void): RowSpec {
+  const { call, server } = item
+  const builtin = mcpServerOf(call.name) === undefined ? call.name.toLowerCase() : ''
+  const kindWords = KIND[builtin]
+  const kind = kindWords === undefined ? undefined : state === 'running' ? kindWords.running : state === 'ok' ? kindWords.done : kindWords.otherwise
+  const status = rowStatus(item, state, facts)
+  const base = { ...(status !== undefined ? { status } : {}), ...(facts.fullTarget !== '' ? { title: facts.fullTarget } : {}) }
+
+  if ((builtin === 'read' || builtin === 'write' || builtin === 'edit') && facts.file !== undefined && facts.path !== undefined) {
+    // Only a change known to have landed has a size worth stating.
+    const lines = builtin !== 'read' && state === 'ok' ? changeLines(item) : undefined
+    return {
+      ...base,
+      icon: TOOL_ICON[builtin]!,
+      kind: kind!,
+      primary: <FileChip path={facts.path} name={facts.file.name} {...(onOpenFile !== undefined ? { onOpen: onOpenFile } : {})} />,
+      ...(facts.file.directory !== '' ? { secondary: facts.file.directory } : {}),
+      ...(lines !== undefined ? { diff: lines } : {}),
+    }
+  }
+  if (builtin === 'glob' || builtin === 'grep') {
+    const pattern = typeof call.args['pattern'] === 'string' ? call.args['pattern'] : ''
+    const scope = typeof call.args['path'] === 'string' && call.args['path'] !== '' ? `in ${call.args['path']}` : undefined
+    return { ...base, icon: 'search', kind: kind!, primary: pattern, primaryMono: true, ...(scope !== undefined ? { secondary: scope } : {}) }
+  }
+  if (builtin === 'bash') {
+    return { ...base, icon: 'terminal', kind: kind!, primary: facts.target, primaryMono: true }
+  }
+  if (builtin === 'agent') {
+    const action = typeof call.args['action'] === 'string' ? call.args['action'] : 'spawn'
+    const role = typeof call.args['definition'] === 'string' ? call.args['definition'] : undefined
+    return { ...base, icon: 'gitBranch', kind: kind!, ...(role !== undefined ? { kindDetail: role } : {}), separator: true, primary: action }
+  }
+  if (MEMORY_VERB[builtin] !== undefined) {
+    return { ...base, icon: 'lightbulb', kind: 'Memory', separator: true, primary: `${MEMORY_VERB[builtin]} ${facts.target}`.trim() }
+  }
+  if (builtin === 'skill') {
+    return { ...base, icon: 'zap', kind: kind!, primary: facts.target }
+  }
+  if (server !== undefined || mcpServerOf(call.name) !== undefined) {
+    return {
+      ...base,
+      icon: 'globe',
+      kind: 'MCP',
+      kindDetail: server ?? mcpServerOf(call.name) ?? '',
+      separator: true,
+      primary: facts.name,
+      ...(facts.target !== '' ? { secondary: facts.target } : {}),
+    }
+  }
+  return { ...base, icon: 'wrench', kind: facts.name, ...(facts.target !== '' ? { primary: facts.target, primaryMono: true } : {}) }
+}
+
+/** Warnings a reader must see before trusting anything below them. */
+function OutcomeNotes({ item }: { readonly item: Extract<ViewItem, { kind: 'tool' }> }) {
+  const note = (text: string) => (
+    <p className="m-0 flex items-start gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn" role="note">
+      <Icon name="alertTriangle" size={14} className="mt-0.5 shrink-0" />
+      <span>{text}</span>
+    </p>
+  )
   return (
     <>
-      <Section label="Arguments" copy={complete}>
-        <pre className={preClass}>{JSON.stringify(rest, null, 2)}</pre>
-      </Section>
-      {prose.map(([key, value]) => (
-        <Section key={key} label={PROSE_ARGS[key] ?? key} copy={value}>
-          <pre className={cn(preClass, PROSE_TINT[key])}>{value}</pre>
-        </Section>
-      ))}
+      {item.recovered === true && item.result !== undefined ? note('Outcome unknown — the host restarted before this result was recorded. Check the actual state before retrying.') : null}
+      {item.outcome === 'indeterminate' ? note(`Indeterminate — this call may have run remotely. It is not retried automatically${item.invocationId !== undefined ? ` (${item.invocationId})` : ''}.`) : null}
+      {item.outcome === 'audit_fault' ? note('Audit fault — the outcome is known but its evidence was not durably recorded. Further MCP calls stay blocked until that evidence is repaired.') : null}
     </>
   )
 }
 
-/** A tool invocation: one quiet line that expands to exact arguments and recorded output. */
+/**
+ * Every opened tool body sits in the Git panel's diff frame: a rule above and
+ * below, a faint fill, square corners. One frame, so a command, a change and a
+ * result read as the same kind of thing.
+ */
+const panelClass = 'min-w-0 border-y border-line bg-muted/40'
+const panelText = 'm-0 px-3 py-1.5 font-mono text-[12px] leading-5'
+
+/** The trailer `Bash` appends to every result: the exit, or how it was stopped. */
+const BASH_TRAILER = /\n?\[(exit code: -?\d+|terminated[^\]]*)\]\s*$/
+
+/** A command's output without its trailer, and the trailer as a short footer. */
+function splitTerminalOutput(output: string): { body: string; footer?: { text: string; bad: boolean } } {
+  const match = BASH_TRAILER.exec(output)
+  if (match === null) return { body: output.replace(/\s+$/, '') }
+  const trailer = match[1]!
+  const exit = /^exit code: (-?\d+)$/.exec(trailer)
+  const body = output.slice(0, match.index).replace(/\s+$/, '')
+  if (exit !== null) {
+    // A clean exit is the expected case; the row already said nothing went wrong.
+    return Number(exit[1]) === 0 ? { body } : { body, footer: { text: `exit ${exit[1]}`, bad: true } }
+  }
+  return { body, footer: { text: trailer.replace(/;.*$/, ''), bad: true } }
+}
+
+/**
+ * A command the way a terminal shows it: a dark well in both themes, the
+ * prompt and command on top — clamped to three lines, since the row already
+ * names it — then what came back. A clean `exit 0` is not repeated; any other
+ * ending gets one short footer.
+ */
+function TerminalPanel({ command, output, running }: { readonly command: string; readonly output?: string; readonly running: boolean }) {
+  const [commandOpen, setCommandOpen] = useState(false)
+  const long = command.length > 240 || command.split('\n').length > 3
+  const split = output !== undefined ? splitTerminalOutput(output) : undefined
+  return (
+    <div className="relative min-w-0 overflow-hidden rounded-lg bg-term-bg font-mono text-[12px] leading-5 text-term-fg">
+      <div className="border-b border-white/10 px-3 py-2 pr-10">
+        <pre aria-label="Command" className={cn('m-0 whitespace-pre-wrap break-words', long && !commandOpen && 'line-clamp-3')}>
+          <span aria-hidden="true" className="select-none text-term-dim">$ </span><span>{command}</span>
+        </pre>
+        {long ? (
+          <button type="button" onClick={() => setCommandOpen((value) => !value)} className="mt-1 font-sans text-[11px] text-term-dim hover:text-term-fg">
+            {commandOpen ? 'Show less' : 'Show full command'}
+          </button>
+        ) : null}
+      </div>
+      <CopyButton text={command} label="Copy command" className="absolute right-1 top-1 size-7 text-term-dim hover:bg-white/10 hover:text-term-fg" />
+      {split !== undefined ? (
+        <>
+          {split.body === ''
+            ? <p className="m-0 px-3 py-2 font-sans text-term-dim">No output.</p>
+            : <pre tabIndex={0} aria-label="Tool output" className="m-0 max-h-60 overflow-auto whitespace-pre-wrap break-words px-3 py-2 text-term-fg">{split.body}</pre>}
+          {split.footer !== undefined ? (
+            <p className={cn('m-0 border-t border-white/10 px-3 py-1', split.footer.bad ? 'text-[#ff8a8a]' : 'text-term-dim')}>{split.footer.text}</p>
+          ) : null}
+        </>
+      ) : running ? <p className="m-0 px-3 py-2 font-sans text-term-dim">Running…</p> : null}
+    </div>
+  )
+}
+
+/**
+ * An edit or a write as the Git panel shows a change: the same frame, the
+ * same numbered gutters, the same tints. The row above already names the file
+ * and opens it, so the frame carries nothing but the lines.
+ */
+function ChangePanel({ rows, path }: { readonly rows: readonly DiffRow[]; readonly path: string }) {
+  if (rows.length === 0) return <p className="m-0 text-xs text-fg-muted">No textual change.</p>
+  return (
+    <div className={cn(panelClass, 'max-h-72 overflow-auto')} role="region" aria-label={`Diff of ${path}`} tabIndex={0}>
+      <DiffLines rows={rows} />
+    </div>
+  )
+}
+
+/** What came back, in the same frame — or the error, in the diff's red. */
+function ResultPanel({ output, tone }: { readonly output: string; readonly tone: 'plain' | 'bad' | 'quiet' }) {
+  return (
+    <div className={cn(panelClass, 'relative', tone === 'bad' && 'bg-bad-soft')}>
+      <pre
+        tabIndex={0}
+        aria-label="Tool output"
+        className={cn(panelText, 'max-h-72 overflow-auto whitespace-pre-wrap break-words pr-10', tone === 'bad' ? 'text-bad' : tone === 'quiet' ? 'text-fg-muted' : 'text-fg')}
+      >
+        {output === '' ? 'No output.' : output}
+      </pre>
+      {output !== '' ? <CopyButton text={output} label="Copy output" className="absolute right-1 top-0.5 size-7" /> : null}
+    </div>
+  )
+}
+
+/**
+ * A Bash call. A background one (`run_in_background`) settles immediately
+ * while its process keeps running, so the row carries a live Background chip
+ * from the session's process events and a jump to the workbench's Process
+ * view — without these the row reads exactly like a command that finished.
+ */
+function BashCard({ item, spec, state, command }: {
+  readonly item: Extract<ViewItem, { kind: 'tool' }>
+  readonly spec: RowSpec
+  readonly state: RowState
+  readonly command: string
+}) {
+  const link = useContext(ProcessLinkContext)
+  const processId = backgroundProcessId(item.call, item.result)
+  const row = processId !== undefined ? link?.statuses.get(processId) : undefined
+  let backgroundStatus: RowStatus | undefined
+  if (processId !== undefined) {
+    backgroundStatus = row === undefined
+      ? { text: 'Background', tone: 'quiet', detail: 'The command returned a process id; the work keeps running past this turn.' }
+      : row.status === 'running'
+        ? { text: 'Background · running', tone: 'warn', detail: 'Still running. Open it in the workbench to watch its output.' }
+        : { text: `Background · ${row.status}`, tone: TERMINAL_TONE[row.status] ?? 'quiet' }
+  }
+  const specWithBackground = backgroundStatus === undefined ? spec : { ...spec, status: backgroundStatus }
+  return (
+    <ActivityRow spec={specWithBackground} state={state}>
+      <OutcomeNotes item={item} />
+      <TerminalPanel command={command} {...(item.result !== undefined ? { output: item.result.output } : {})} running={state === 'running'} />
+      {processId !== undefined && link !== null ? (
+        <button
+          type="button"
+          onClick={() => link.open(processId)}
+          className="inline-flex items-center gap-1 self-start rounded-sm text-[12px] text-fg-muted transition-colors hover:text-fg"
+        >
+          <Icon name="terminal" size={12} />
+          View process in workbench
+        </button>
+      ) : null}
+    </ActivityRow>
+  )
+}
+
+const TERMINAL_TONE: Readonly<Record<string, RowStatus['tone']>> = { killed: 'bad', failed: 'bad', interrupted: 'bad', exited: 'quiet' }
+
+/** The exact arguments, one click away instead of in the way. */
+function CallDetails({ call }: { readonly call: ToolCall }) {
+  const [open, setOpen] = useState(false)
+  const id = useId()
+  return (
+    <div className="flex min-w-0 flex-col gap-2">
+      <button type="button" aria-expanded={open} aria-controls={id} onClick={() => setOpen((value) => !value)} className="inline-flex items-center gap-1 self-start rounded-sm text-[12px] text-fg-faint hover:text-fg-muted">
+        <Icon name="chevronRight" size={12} className={cn('transition-transform', open && 'rotate-90')} />
+        View call details
+      </button>
+      {open ? <div id={id} className="flex min-w-0 flex-col gap-2"><ToolArguments call={call} /></div> : null}
+    </div>
+  )
+}
+
+/**
+ * A tool invocation: one line of text that names what it did and, only when
+ * it is worth a look, how it ended. Opening it shows what the tool produced in
+ * the shape that tool's output has — a terminal, a diff, a result.
+ */
 export const ToolCard = memo(function ToolCard({ item, openPath }: { readonly item: Extract<ViewItem, { kind: 'tool' }>; readonly openPath?: OpenPathResolver }) {
-  const { call, result, ts, doneAt, server, recovered, outcome, invocationId } = item
+  const { call, result } = item
   const facts = toolFacts(call, result)
   const open = facts.path !== undefined ? openPath?.(facts.path, facts.focus) ?? null : null
   const state = toolState(item)
-  const duration = result !== undefined && ts !== undefined && doneAt !== undefined ? fmtDuration(doneAt - ts) : ''
-  // Below `sm` the chips and the duration give up their room: the target and
-  // the digest are what the row is read for.
-  const chipClass = 'hidden shrink-0 rounded-md px-1.5 text-[11px] sm:block'
-  // A file call leads with its own name, the way a diff row does: the tool
-  // is the glyph, the directory is the quiet detail, and a line count sits
-  // at the right edge. Everything else keeps the tool name as its title.
-  const file = facts.file
-  const stat = facts.lines !== undefined && facts.digestFailed !== true
-    ? <LineStat added={facts.lines.added} removed={facts.lines.removed} />
-    : null
+  const builtin = mcpServerOf(call.name) === undefined ? call.name.toLowerCase() : ''
+  const arg = (key: string): string => (typeof call.args[key] === 'string' ? call.args[key] as string : '')
+
+  // A read that landed is opened in the workbench, not in the transcript: its
+  // file is the link. Anything that did not land opens to say why.
+  if (builtin === 'read' && facts.file !== undefined) {
+    const settledClean = state === 'ok'
+    const spec = toolRowSpec(item, state, facts, settledClean && open !== null ? open : undefined)
+    if (settledClean || state === 'running') return <ActivityRow spec={spec} state={state} expandable={false} />
+    return (
+      <ActivityRow spec={spec} state={state}>
+        <OutcomeNotes item={item} />
+        {result !== undefined ? <ResultPanel output={result.output} tone={state === 'failed' ? 'bad' : state === 'denied' ? 'quiet' : 'plain'} /> : null}
+      </ActivityRow>
+    )
+  }
+
+  const spec = toolRowSpec(item, state, facts)
+  if (builtin === 'bash') {
+    return <BashCard item={item} spec={spec} state={state} command={arg('command')} />
+  }
+  if ((builtin === 'edit' || builtin === 'write') && facts.path !== undefined) {
+    // A refused or failed change never landed: what to show is why, not lines
+    // that are not in the file.
+    const landed = state === 'ok' || state === 'running' || state === 'unknown'
+    const rows = builtin === 'edit' ? diffRowsFromEdit(arg('old'), arg('new'), result?.output) : diffRowsFromWrite(arg('content'))
+    return (
+      <ActivityRow spec={spec} state={state}>
+        <OutcomeNotes item={item} />
+        {landed ? <ChangePanel rows={rows} path={facts.fullTarget} /> : null}
+        {!landed && result !== undefined ? <ResultPanel output={result.output} tone={state === 'failed' ? 'bad' : 'quiet'} /> : null}
+      </ActivityRow>
+    )
+  }
   return (
-    <ActivityRow
-      state={state}
-      // While the call runs the state spinner leads — a running row must say
-      // so on its own; the tool's glyph returns once the outcome exists.
-      {...(state === 'running' ? {} : { glyph: <ToolGlyph facts={facts} /> })}
-      title={file !== undefined ? file.name : facts.name}
-      detail={file !== undefined ? file.directory : facts.target}
-      detailMono={file === undefined}
-      fullDetail={facts.fullTarget}
-      {...(facts.digest !== undefined ? { digest: facts.digest, digestFailed: facts.digestFailed === true } : {})}
-      trailing={(
-        <>
-          {server !== undefined ? <span className={cn(chipClass, 'bg-muted text-fg-muted')}>{server}</span> : null}
-          {recovered === true ? <span className={cn(chipClass, 'bg-warn-soft text-warn')}>recovered</span> : null}
-          {outcome === 'indeterminate' ? <span className={cn(chipClass, 'bg-warn-soft text-warn')}>indeterminate</span> : null}
-          {outcome === 'audit_fault' ? <span className={cn(chipClass, 'bg-warn-soft text-warn')}>audit fault</span> : null}
-          {stat}
-          {stat === null && duration !== '' ? <span className="hidden shrink-0 font-mono text-[12px] text-fg-faint sm:block">{duration}</span> : null}
-        </>
-      )}
-    >
-      <ToolArguments call={call} />
-      {open !== null ? <button type="button" className="self-start text-[13px] text-link hover:underline" onClick={open}>Open {facts.fullTarget} in workbench</button> : null}
-      {recovered === true && result !== undefined ? (
-        <p className="m-0 flex items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn" role="note">
-          <Icon name="alertTriangle" size={14} />
-          Outcome unknown — the host restarted before this result was recorded.
-        </p>
-      ) : null}
-      {outcome === 'indeterminate' ? (
-        <p className="m-0 flex items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn" role="note">
-          <Icon name="alertTriangle" size={14} />
-          Indeterminate — this call may have run remotely. It is not retried automatically{invocationId !== undefined ? ` (${invocationId})` : ''}.
-        </p>
-      ) : null}
-      {outcome === 'audit_fault' ? (
-        <p className="m-0 flex items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn" role="note">
-          <Icon name="alertTriangle" size={14} />
-          Audit fault — the outcome is known but its evidence was not durably recorded. Further MCP calls stay blocked until that evidence is repaired.
-        </p>
-      ) : null}
+    <ActivityRow spec={spec} state={state}>
+      <OutcomeNotes item={item} />
       {result !== undefined
-        ? <Section label={outputLabel(result.output)} copy={result.output}><pre className={preClass}>{result.output || '(empty)'}</pre></Section>
-        : <p className="m-0 text-[13px] text-fg-muted">Running…</p>}
+        ? <ResultPanel output={result.output} tone={state === 'failed' ? 'bad' : state === 'denied' ? 'quiet' : 'plain'} />
+        : <p className="m-0 text-[12px] text-shimmer">Running…</p>}
+      <CallDetails call={call} />
     </ActivityRow>
   )
 })
@@ -533,6 +968,12 @@ const DELEGATION_STATE: Readonly<Record<Extract<ViewItem, { kind: 'delegation' }
   failed: 'failed',
   interrupted: 'unknown',
   cancelled: 'cancelled',
+}
+
+const DELEGATION_STATUS: Readonly<Partial<Record<Extract<ViewItem, { kind: 'delegation' }>['status'], RowStatus>>> = {
+  failed: { text: 'Failed', tone: 'bad' },
+  interrupted: { text: 'Interrupted', tone: 'warn', detail: 'The host stopped before this child finished.' },
+  cancelled: { text: 'Stopped', tone: 'quiet' },
 }
 
 /**
@@ -546,8 +987,17 @@ export const DelegationCard = memo(function DelegationCard({ item, workspaceId, 
   readonly rootSessionId?: string | null
   readonly onOpen?: (childSessionId: string) => void
 }) {
+  const status = DELEGATION_STATUS[item.status]
+  const spec: RowSpec = {
+    icon: 'gitBranch',
+    kind: item.status === 'running' ? 'Delegating' : 'Delegated',
+    kindDetail: item.definition !== '' ? item.definition : 'agent',
+    separator: true,
+    ...(item.brief !== '' ? { primary: item.brief, title: item.brief } : {}),
+    ...(status !== undefined ? { status } : {}),
+  }
   return (
-    <ActivityRow state={DELEGATION_STATE[item.status]} title={`Delegated to ${item.definition !== '' ? item.definition : 'agent'}`} detail={item.brief}>
+    <ActivityRow spec={spec} state={DELEGATION_STATE[item.status]}>
       <DelegationDetail item={item} {...(workspaceId !== undefined ? { workspaceId } : {})} {...(rootSessionId !== undefined ? { rootSessionId } : {})} {...(onOpen !== undefined ? { onOpen } : {})} />
     </ActivityRow>
   )
@@ -632,7 +1082,7 @@ export const AuditLine = memo(function AuditLine({ item }: { readonly item: Extr
     <div className="flex min-w-0 items-center gap-2 text-xs text-fg-muted" role="note">
       <Icon name={glyph.icon} size={13} className={glyph.className} />
       <span className="min-w-0 break-words">{item.text}</span>
-      {item.durationMs !== undefined ? <span className="font-mono text-fg-faint">{fmtDuration(item.durationMs)}</span> : null}
+      {item.durationMs !== undefined ? <span className="font-mono text-fg-faint">{formatElapsed(item.durationMs)}</span> : null}
     </div>
   )
 })

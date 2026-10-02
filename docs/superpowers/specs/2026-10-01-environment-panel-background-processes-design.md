@@ -201,7 +201,18 @@ Components and their single purposes:
 
 ## Out of scope (explicit follow-ups)
 
-- Workbench process-detail view (output tail per process in the dock).
 - Plan/task section (needs a plan tool), session-media section (needs media folders).
 - Re-adopting orphaned processes after restart.
 - Per-process output persistence beyond the process's lifetime.
+
+## Amendment (2026-10-02, user-pulled follow-ups)
+
+- **Workbench Process view** (was listed as a follow-up): a `process` fixed
+  view renders one process's live output, polled from `GET …/processes/:id`
+  every 2s while running; panel rows and the transcript's background Bash
+  rows open it; unknown ids (restart orphans) render a truthful not-running
+  state.
+- **Background indication on the transcript's Bash rows**: a `run_in_background`
+  Bash call carries a `Background · <status>` chip fed by the session's
+  process events (context-provided), plus a jump to the Process view — the
+  row otherwise settles in under a second and reads like a finished command.

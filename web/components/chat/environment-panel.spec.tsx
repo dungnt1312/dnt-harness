@@ -19,6 +19,7 @@ afterEach(async () => {
 
 const ev = (type: string, fields: Record<string, unknown>): SseEvent => ({ type, seq: 0, ...fields }) as SseEvent
 const onOpenView = vi.fn()
+const onOpenProcess = vi.fn()
 interface Base {
   readonly workspaceId: string | null
   readonly sessionId: string | null
@@ -26,6 +27,7 @@ interface Base {
   readonly events: readonly SseEvent[]
   readonly connected: boolean
   readonly onOpenView: (view: 'git' | 'agents') => void
+  readonly onOpenProcess: (processId: string) => void
 }
 const base: Base = {
   workspaceId: 'ws',
@@ -34,6 +36,7 @@ const base: Base = {
   events: [],
   connected: true,
   onOpenView,
+  onOpenProcess,
 }
 
 async function render(props: Base): Promise<void> {
@@ -113,6 +116,17 @@ it('stop button posts to the process stop route', async () => {
   expect(stop).not.toBeNull()
   await act(async () => stop!.click())
   expect(fetchMock).toHaveBeenCalledWith('/api/workspaces/ws/sessions/s1/processes/p1/stop', expect.objectContaining({ method: 'POST' }))
+  // The click on the row itself never triggers a stop — separate targets.
+  expect(onOpenProcess).not.toHaveBeenCalled()
+})
+
+it('a process row click opens its workbench detail', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
+  await render({ ...base, events: startEvents })
+  const row = host.querySelector<HTMLButtonElement>('button[title="Open dev in the workbench"]')
+  expect(row).not.toBeNull()
+  await act(async () => row!.click())
+  expect(onOpenProcess).toHaveBeenCalledWith('p1')
 })
 
 it('git row click opens the git workbench view', async () => {

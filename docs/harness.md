@@ -333,8 +333,9 @@ MSYS environment-tag sweep on Windows).
   `interrupted` (see restart semantics below). The web Environment panel
   renders from these events.
 - REST: `GET /api/workspaces/:ws/sessions/:sid/processes` (live reconciliation
-  for state an SSE gap missed) and `POST …/processes/:id/stop` (200 killed,
-  404 unknown, 409 already ended).
+  for state an SSE gap missed), `GET …/processes/:id` (one process plus its
+  captured output — the workbench Process view), and
+  `POST …/processes/:id/stop` (200 killed, 404 unknown, 409 already ended).
 
 **Restart semantics:** sessions load lazily, so on the FIRST read of a session
 after boot the host closes any `process/start` that has no `process/exit` with

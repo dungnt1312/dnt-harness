@@ -29,6 +29,8 @@ interface Props {
   readonly events: readonly SseEvent[]
   readonly connected: boolean
   readonly onOpenView: (view: 'git' | 'agents') => void
+  /** A process row click: open its live detail in the workbench. */
+  readonly onOpenProcess: (processId: string) => void
 }
 
 const TERMINAL_CLASS: Record<string, string | undefined> = { killed: 'text-bad', failed: 'text-bad', interrupted: 'text-bad' }
@@ -68,7 +70,7 @@ function SyncArrows({ ahead, behind }: { readonly ahead: number; readonly behind
   )
 }
 
-export function EnvironmentPanel({ workspaceId, sessionId, project, events, connected, onOpenView }: Props) {
+export function EnvironmentPanel({ workspaceId, sessionId, project, events, connected, onOpenView, onOpenProcess }: Props) {
   // Panel state is scoped to the conversation: switching resets the collapse,
   // the one-shot auto-open, and the per-section disclosure.
   const [state, setState] = useState<{ scope: string | null; expanded: boolean; autoOpened: boolean; processesOpen: boolean; subagentsOpen: boolean }>({ scope: sessionId, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true })
@@ -274,7 +276,7 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
                 {state.processesOpen ? (
                   <div className="flex flex-col gap-0.5 pb-1">
                     {rows.map((row) => (
-                      <ProcessLine key={row.id} row={row} now={now} pending={stopping.includes(row.id)} onStop={() => void stop(row.id)} />
+                      <ProcessLine key={row.id} row={row} now={now} pending={stopping.includes(row.id)} onOpen={() => onOpenProcess(row.id)} onStop={() => void stop(row.id)} />
                     ))}
                   </div>
                 ) : null}
@@ -311,16 +313,23 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
   )
 }
 
-function ProcessLine({ row, now, pending, onStop }: { readonly row: ProcessRow; readonly now: number; readonly pending: boolean; readonly onStop: () => void }) {
+function ProcessLine({ row, now, pending, onOpen, onStop }: { readonly row: ProcessRow; readonly now: number; readonly pending: boolean; readonly onOpen: () => void; readonly onStop: () => void }) {
   const runningRow = row.status === 'running'
   const duration = runningRow ? now - row.startedAt : row.durationMs
   const statusLabel = runningRow ? 'running' : row.exitCode !== null ? `${row.status} (${row.exitCode})` : row.status
   return (
     <div className="flex items-center gap-2 rounded-lg py-1 pl-2.5 pr-1.5 text-[13px]">
-      {runningRow ? <Spinner size={11} /> : <span className="inline-block size-[11px] shrink-0" aria-hidden />}
-      <span className="min-w-0 flex-1 truncate text-fg" title={row.command}>{row.command}</span>
-      <span className="shrink-0 text-[12px] text-fg-faint" title={statusLabel}>{formatDuration(duration)}</span>
-      <span className={cn('shrink-0 text-[12px]', runningRow ? 'text-warn' : (TERMINAL_CLASS[row.status] ?? 'text-fg-faint'))}>{statusLabel}</span>
+      <button
+        type="button"
+        onClick={onOpen}
+        title={`Open ${row.command} in the workbench`}
+        className="flex min-w-0 flex-1 items-center gap-2 rounded-sm text-left"
+      >
+        {runningRow ? <Spinner size={11} /> : <span className="inline-block size-[11px] shrink-0" aria-hidden />}
+        <span className="min-w-0 flex-1 truncate text-fg">{row.command}</span>
+        <span className="shrink-0 text-[12px] text-fg-faint">{formatDuration(duration)}</span>
+        <span className={cn('shrink-0 text-[12px]', runningRow ? 'text-warn' : (TERMINAL_CLASS[row.status] ?? 'text-fg-faint'))}>{statusLabel}</span>
+      </button>
       {runningRow ? (
         <button
           type="button"

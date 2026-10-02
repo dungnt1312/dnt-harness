@@ -8,6 +8,7 @@ import { AgentRunsPanel } from './AgentRunsPanel.tsx'
 import { TrajectoryPanel } from './TrajectoryPanel.tsx'
 import { FilesWorkspace } from './FilesWorkspace.tsx'
 import { GitPanel } from './GitPanel.tsx'
+import { ProcessPanel } from './ProcessPanel.tsx'
 
 const TerminalPanel = lazy(async () => import('./TerminalPanel.tsx'))
 import { baseName } from '../../lib/project-paths.ts'
@@ -28,6 +29,7 @@ const VIEW_META: Readonly<Record<WorkbenchView, { readonly icon: 'folder' | 'inf
   agents: { icon: 'gitBranch', label: 'Subagents' },
   trajectory: { icon: 'clock', label: 'Trajectory' },
   terminal: { icon: 'terminal', label: 'Terminal' },
+  process: { icon: 'terminal', label: 'Process' },
 }
 
 /** Picker order; the strip itself keeps the order the operator opened views in. */
@@ -80,7 +82,7 @@ function ViewTab({ view, active, onClick, onClose }: {
  * Terminal is a view tab like the others (Ctrl+` opens it). The chat column
  * has a separate footer terminal; this panel does not own that one.
  */
-export function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, expanded, onToggleExpand, onClose, openPath, sessionId = null, onOpenChild, terminalShell = null, onTerminalShell }: {
+export function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, expanded, onToggleExpand, onClose, openPath, sessionId = null, onOpenChild, terminalShell = null, onTerminalShell, gitPathFilter = null, onClearGitFilter, processFocus = null }: {
   readonly workspaceId: string | null
   /** The project whose files are browsable; null for chat-only conversations. */
   readonly project: WorkbenchProject | null
@@ -106,6 +108,15 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
   /** Shell the Terminal tab opens without being asked. */
   readonly terminalShell?: string | null
   readonly onTerminalShell?: (shellId: string | null) => void
+  /** The background process the Environment panel focused, if any. */
+  readonly processFocus?: string | null
+  /**
+   * Project-relative paths the Git view narrows to while reviewing one turn's
+   * recorded writes; null shows every change. Set by a card's Review all.
+   */
+  readonly gitPathFilter?: readonly string[] | null
+  /** Clears the turn filter (the banner's Show all). */
+  readonly onClearGitFilter?: () => void
 }) {
   const [treeVisible, setTreeVisible] = useState(true)
   const [treeFraction, setTreeFraction] = useState(0.34)
@@ -169,7 +180,7 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
     body = <TrajectoryPanel events={events} {...(openPath !== undefined ? { openPath } : {})} />
   } else if (activeView === 'git') {
     body = project !== null && workspaceId !== null
-      ? <GitPanel key={project.id} workspaceId={workspaceId} project={project} />
+      ? <GitPanel key={project.id} workspaceId={workspaceId} project={project} {...(gitPathFilter !== null && gitPathFilter.length > 0 ? { pathFilter: gitPathFilter } : {})} {...(onClearGitFilter !== undefined ? { onShowAll: onClearGitFilter } : {})} />
       : (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
           <Icon name="gitBranch" size={22} className="text-fg-faint" />
@@ -199,6 +210,16 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
         />
       </Suspense>
     )
+  } else if (activeView === 'process') {
+    body = sessionId !== null && workspaceId !== null
+      ? <ProcessPanel workspaceId={workspaceId} sessionId={sessionId} processId={processFocus ?? null} />
+      : (
+        <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
+          <Icon name="terminal" size={22} className="text-fg-faint" />
+          <p className="m-0 text-sm font-medium">No conversation open</p>
+          <p className="m-0 max-w-xs text-[13px] text-fg-muted">Background processes belong to a conversation; open one to see them here.</p>
+        </div>
+      )
   }
 
   return (

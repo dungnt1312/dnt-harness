@@ -412,6 +412,17 @@ export function listSessionProcesses(workspaceId: string, sessionId: string): Pr
   return apiFetch(`/api/workspaces/${workspaceId}/sessions/${sessionId}/processes`).then((r) => json<readonly SessionProcessSnapshot[]>(r))
 }
 
+/** One process plus its captured output, for the workbench detail view. */
+export interface SessionProcessDetail extends SessionProcessSnapshot {
+  readonly output: string
+  readonly outputTruncated: boolean
+}
+
+/** Detail of one background process; 404 once the host no longer knows it. */
+export function getSessionProcess(workspaceId: string, sessionId: string, processId: string): Promise<SessionProcessDetail> {
+  return apiFetch(`/api/workspaces/${workspaceId}/sessions/${sessionId}/processes/${processId}`).then((r) => json<SessionProcessDetail>(r))
+}
+
 /** Operator stop of one background process; 409 when it already ended. */
 export function stopSessionProcess(workspaceId: string, sessionId: string, processId: string): Promise<{ stopped: boolean; processId: string }> {
   return apiFetch(`/api/workspaces/${workspaceId}/sessions/${sessionId}/processes/${processId}/stop`, { method: 'POST' }).then((r) => json<{ stopped: boolean; processId: string }>(r))

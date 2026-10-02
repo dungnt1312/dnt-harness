@@ -3,7 +3,7 @@
  * is one of them: a closable tab beside Files, Git, and the rest. The chat
  * column has its own terminal, a footer that stays hidden until Ctrl+`.
  */
-export type WorkbenchViewName = 'files' | 'context' | 'trajectory' | 'agents' | 'git' | 'terminal'
+export type WorkbenchViewName = 'files' | 'context' | 'trajectory' | 'agents' | 'git' | 'terminal' | 'process'
 
 /** The view that can never be closed, so the workbench is never tabless. */
 export const ANCHOR_VIEW: WorkbenchViewName = 'files'
@@ -63,7 +63,7 @@ export function clampPanelWidth(side: 'left' | 'right' | 'terminal', value: numb
 }
 
 function isInspectorTab(value: unknown): value is WorkbenchViewName {
-  return value === 'files' || value === 'context' || value === 'trajectory' || value === 'agents' || value === 'git' || value === 'terminal'
+  return value === 'files' || value === 'context' || value === 'trajectory' || value === 'agents' || value === 'git' || value === 'terminal' || value === 'process'
 }
 
 /**

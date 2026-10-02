@@ -1,17 +1,24 @@
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { HoldScrollProvider, useStickToBottom } from '../../hooks/useStickToBottom.ts'
 import type { ViewItem } from '../../lib/project.ts'
+import { turnChanges, type TurnChanges } from '../../lib/turn-changes.ts'
+import type { SseEvent } from '../../lib/types.ts'
 import type { OpenPathResolver } from '../../lib/project-paths.ts'
-import { ActivityBlock, AssistantMessage, AuditLine, CompactionMarker, ContextMarker, DelegationCard, JumpToBottom, StatusLine, ToolCard, UserBubble } from './MessageParts.tsx'
+import { toProjectRelative } from '../../lib/project-paths.ts'
+import { processRows, type ProcessRow } from '../../lib/processes-view.ts'
+import { ActivityBlock, AssistantMessage, AuditLine, CompactionMarker, ContextMarker, DelegationCard, JumpToBottom, ProcessLinkContext, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
+import { TurnChangesCard } from './TurnChangesCard.tsx'
+import type { WorkbenchProject } from '../workbench/Workbench.tsx'
 import { ConversationMinimap } from './ConversationMinimap.tsx'
 
 interface Indexed { readonly item: ViewItem; readonly index: number }
 type Block = { readonly kind: 'row'; readonly row: Indexed } | { readonly kind: 'activity'; readonly rows: readonly Indexed[] }
 
 const ACTIVITY_KINDS: ReadonlySet<ViewItem['kind']> = new Set(['tool', 'delegation', 'audit'])
+const TRANSCRIPT_WINDOW = 300
 
 /** Copy payload carried by the last answer of a closed turn. */
-export interface TurnFooter { readonly text: string }
+export interface TurnFooter { readonly parts: readonly string[]; readonly text: string }
 
 /**
  * One footer per assistant turn: the last answer of a closed turn carries the
@@ -20,16 +27,16 @@ export interface TurnFooter { readonly text: string }
  * recorded turn (legacy events) each keep their own footer.
  */
 export function turnFooters(items: readonly ViewItem[]): ReadonlyMap<number, TurnFooter> {
-  const groups = new Map<string, { readonly indexes: number[]; text: string; open: boolean }>()
+  const groups = new Map<string, { readonly indexes: number[]; readonly parts: string[]; open: boolean }>()
   items.forEach((item, index) => {
     if (item.kind !== 'assistant') return
     const key = item.turnId ?? `index:${index}`
-    const group = groups.get(key) ?? { indexes: [], text: '', open: false }
+    const group = groups.get(key) ?? { indexes: [], parts: [], open: false }
     // Only answers that said something can carry the footer: a trailing
     // thinking-only step is activity, and belongs nowhere near the answer's
     // action row.
     if (item.content !== '') {
-      group.text = group.text === '' ? item.content : `${group.text}\n\n${item.content}`
+      group.parts.push(item.content)
       group.indexes.push(index)
     }
     if (item.turnOpen === true) group.open = true
@@ -37,9 +44,9 @@ export function turnFooters(items: readonly ViewItem[]): ReadonlyMap<number, Tur
   })
   const footers = new Map<number, TurnFooter>()
   for (const group of groups.values()) {
-    if (group.open || group.text === '') continue
+    if (group.open || group.parts.length === 0) continue
     const lastIndex = group.indexes.at(-1)
-    if (lastIndex !== undefined) footers.set(lastIndex, { text: group.text })
+    if (lastIndex !== undefined) footers.set(lastIndex, { parts: group.parts, get text() { return group.parts.join('\n\n') } })
   }
   return footers
 }
@@ -83,7 +90,7 @@ export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
     if (item.kind === 'status' && item.reason === 'failed' && previous?.kind === 'status' && previous.reason.includes(':')) return
     const last = blocks.at(-1)
     if (isActivity(item) && !standsAlone(item)) {
-      if (last?.kind === 'activity') blocks[blocks.length - 1] = { kind: 'activity', rows: [...last.rows, { item, index }] }
+      if (last?.kind === 'activity') (last.rows as Indexed[]).push({ item, index })
       else blocks.push({ kind: 'activity', rows: [{ item, index }] })
       return
     }
@@ -100,8 +107,10 @@ export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
  * Memoized: the app re-renders on every composer keystroke, and a long
  * transcript must not re-render with it while its own props are unchanged.
  */
-export const Transcript = memo(function Transcript({ items, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, onOpenSettings, openPath }: {
+export const Transcript = memo(function Transcript({ items, events, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, onOpenSettings, openPath, project, onReviewChanges, onOpenProcess }: {
   readonly items: readonly ViewItem[]
+  /** The raw log behind `items`; per-turn changes project from it. */
+  readonly events?: readonly SseEvent[]
   readonly conversationId: string | null
   readonly modelLabel?: string
   readonly workspaceId?: string | null
@@ -110,9 +119,45 @@ export const Transcript = memo(function Transcript({ items, conversationId, mode
   readonly onRetry?: () => void
   readonly onOpenSettings?: () => void
   readonly openPath?: OpenPathResolver
+  /** The conversation's project, for the per-turn change card's git chips. */
+  readonly project?: WorkbenchProject | null
+  /** Reviews one turn: the Git view narrowed to the turn's recorded files. */
+  readonly onReviewChanges?: (paths: readonly string[]) => void
+  /** Opens a background process's live detail in the workbench. */
+  readonly onOpenProcess?: (processId: string) => void
 }) {
   const blocks = useMemo(() => groupBlocks(items), [items])
+  // Keep browser DOM/layout memory bounded for long conversations. Older
+  // blocks remain in the lightweight projection and can be mounted on demand.
+  const [visibleLimit, setVisibleLimit] = useState(TRANSCRIPT_WINDOW)
+  const visibleStart = Math.max(0, blocks.length - visibleLimit)
+  const visibleBlocks = blocks.slice(visibleStart)
   const footers = useMemo(() => turnFooters(items), [items])
+  // Files each closed turn's Write/Edit calls landed, projected once per
+  // event revision from the raw log (tool traffic carries only a stepId —
+  // the projection attributes positionally, like the transcript itself).
+  const turnChangeMap = useMemo(() => turnChanges(events ?? []), [events])
+  // Live background-process state for the tool rows, keyed off the process
+  // events only so unrelated log traffic does not rebuild the map (and
+  // re-render every memoized card) with it.
+  const processEventCount = useMemo(
+    () => (events ?? []).reduce((count, event) => count + (event.type === 'process/start' || event.type === 'process/exit' ? 1 : 0), 0),
+    [events],
+  )
+  const processStatuses = useMemo(
+    () => new Map<string, ProcessRow>(processRows(events ?? []).map((row) => [row.id, row])),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- rebuilt only when process traffic changes
+    [processEventCount],
+  )
+  const processLink = useMemo<ProcessLink | null>(
+    () => onOpenProcess === undefined ? null : { statuses: processStatuses, open: onOpenProcess },
+    [onOpenProcess, processStatuses],
+  )
+  const turnChangeFooter = (turnId?: string): TurnChanges | undefined => {
+    if (turnId === undefined) return undefined
+    const changes = turnChangeMap.get(turnId)
+    return changes !== undefined && (changes.files.length > 0 || changes.uncertain.length > 0) ? changes : undefined
+  }
   const { scrollRef, contentRef, atBottom, onScroll, scrollToBottom, holdPosition } = useStickToBottom(conversationId)
 
   // Rows that arrived while the reader was away from the tail. Streaming into
@@ -138,7 +183,36 @@ export const Transcript = memo(function Transcript({ items, conversationId, mode
         return <UserBubble key={`user-${index}`} item={item} workspaceId={workspaceId ?? null} {...(onReuse !== undefined ? { onReuse } : {})} />
       case 'assistant': {
         const turn = footers.get(index)
-        return <AssistantMessage key={`assistant-${index}`} item={item} {...(modelLabel !== undefined ? { modelLabel } : {})} {...(turn !== undefined ? { turn } : {})} />
+        // The card rides the same anchor row as the footer: the last answer
+        // of a CLOSED turn. An open turn's card would render mid-work and
+        // then never leave.
+        const changes = turn !== undefined ? turnChangeFooter(item.turnId) : undefined
+        // Review all narrows the Git view to exactly this turn's files, in
+        // the project-relative form git status reports. Paths that resolve
+        // outside the project are dropped: git cannot see them anyway, and
+        // the card's own list still shows them.
+        const review = changes !== undefined && onReviewChanges !== undefined && project != null
+          ? () => {
+              const root = project.path
+              const paths = changes.files
+                .map((file) => toProjectRelative(root, file.path))
+                .filter((path): path is string => path !== null)
+              onReviewChanges(paths)
+            }
+          : undefined
+        return (
+          <AssistantMessage
+            key={`assistant-${index}`}
+            item={item}
+            {...(modelLabel !== undefined ? { modelLabel } : {})}
+            {...(turn !== undefined ? { turn } : {})}
+            {...(changes !== undefined ? { changes } : {})}
+            {...(changes !== undefined && project !== undefined ? { changesProject: project } : {})}
+            {...(changes !== undefined ? { changesWorkspaceId: workspaceId ?? null } : {})}
+            {...(changes !== undefined && openPath !== undefined ? { changesOpenPath: openPath } : {})}
+            {...(review !== undefined ? { changesReviewAll: review } : {})}
+          />
+        )
       }
       case 'tool':
         return <ToolCard key={item.call.id} item={item} {...(openPath !== undefined ? { openPath } : {})} />
@@ -159,6 +233,7 @@ export const Transcript = memo(function Transcript({ items, conversationId, mode
 
   return (
     <HoldScrollProvider value={holdPosition}>
+      <ProcessLinkContext.Provider value={processLink}>
       <div className="relative min-h-0 flex-1">
         <div
           ref={scrollRef}
@@ -173,8 +248,19 @@ export const Transcript = memo(function Transcript({ items, conversationId, mode
                 to what it belongs to, and a message whose reserved action row
                 already adds height does not add a full gap on top of it. */}
             <div className="mx-auto flex w-full max-w-3xl flex-col px-1">
-              {blocks.map((block, position) => {
-                const spacing = 'mt-1.5'
+              {visibleStart > 0 ? (
+                <button
+                  type="button"
+                  className="mx-auto mb-3 rounded-lg border border-line px-3 py-1.5 text-xs text-fg-muted hover:bg-hover hover:text-fg"
+                  onClick={() => { holdPosition(); setVisibleLimit((current) => current + TRANSCRIPT_WINDOW) }}
+                >
+                  Load {Math.min(TRANSCRIPT_WINDOW, visibleStart)} earlier items
+                </button>
+              ) : null}
+              {visibleBlocks.map((block) => {
+                // Activity lines are bare text now, not padded rows: they need a
+                // real gap from what is around them instead of a hairline.
+                const spacing = block.kind === 'activity' ? 'my-2' : 'mt-1.5'
                 const row = block.kind === 'row' ? block.row : null
                 const isUserRow = row?.item.kind === 'user'
                 if (block.kind === 'activity') {
@@ -192,6 +278,7 @@ export const Transcript = memo(function Transcript({ items, conversationId, mode
         <ConversationMinimap items={items} scrollRef={scrollRef} contentRef={contentRef} />
         {!atBottom ? <JumpToBottom unseen={unseen} onClick={scrollToBottom} /> : null}
       </div>
+      </ProcessLinkContext.Provider>
     </HoldScrollProvider>
   )
 })
