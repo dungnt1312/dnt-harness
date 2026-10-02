@@ -4,7 +4,7 @@
  * the tools key disappears entirely when a mode exposes no tools.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { OpenAiCompletionsProvider, ProviderError } from 'mini-dsh'
+import { OpenAiCompletionsProvider, ProviderError } from 'dnt-harness'
 
 interface CapturedRequest {
   url: string

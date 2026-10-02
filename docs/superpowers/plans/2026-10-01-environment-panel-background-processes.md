@@ -1445,7 +1445,7 @@ Run: `npm test` → all green except the two known unrelated Windows flakes (esc
 
 - [ ] **Step 4: Build + deploy**
 
-Run: `npm run build:web`, then restart the exact PM2 process (`pm2 ls` → identify `mini-dsh` by name AND script path; `pm2 restart <id>`; never `dsh-web`). Verify port 3082 answers.
+Run: `npm run build:web`, then restart the exact PM2 process (`pm2 ls` → identify `dnt-harness` by name AND script path; `pm2 restart <id>`; never `dsh-web`). Verify port 3082 answers.
 
 - [ ] **Step 5: Live verify (per the live tool-row recipe)**
 

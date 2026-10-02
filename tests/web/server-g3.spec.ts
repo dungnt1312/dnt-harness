@@ -9,14 +9,14 @@ import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
 
 let root = ''
 const servers: WebServer[] = []
 const serverHomes = new WeakMap<WebServer, string>()
 
 beforeAll(async () => {
-  root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-web-'))
+  root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-web-'))
 })
 
 afterAll(async () => {
@@ -25,7 +25,7 @@ afterAll(async () => {
 })
 
 async function start(providers: readonly LlmProvider[]): Promise<WebServer> {
-  const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-home-'))
+  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-home-'))
   const server = await createWebServer({ home, providers, configFile: path.join(home, 'p.json') })
   servers.push(server)
   serverHomes.set(server, home)
@@ -141,7 +141,7 @@ describe('live mode control', () => {
     const base = server.url
     const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
     // A bound project grants the file tools (G2: no project, no grant).
-    const projDir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-proj-'))
+    const projDir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-proj-'))
     const project = (await (await post(base, `/api/workspaces/${wsId}/projects`, { name: 'P', path: projDir })).json()) as { id: string }
 
     const { id } = (await (await post(base, `/api/workspaces/${wsId}/sessions`, { projectId: project.id })).json()) as { id: string }
@@ -240,7 +240,7 @@ describe('live mode control', () => {
   })
 
   it('enables and disables modes: the picker hides disabled ones until re-enabled', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-mode-enabled-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-mode-enabled-'))
     const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'hi' } } }
     let server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json') })
     let base = server.url
@@ -446,7 +446,7 @@ describe('live mode control', () => {
     // The in-memory map is a cache of the latest request; the manifest event
     // in the log is the durable fact. A fresh boot on the same home must
     // serve it, or every pre-restart conversation shows an empty meter.
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-manifest-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-manifest-'))
     const provider: LlmProvider = {
       name: 'scripted', models: ['scripted'],
       async *stream() { yield { type: 'delta', delta: 'hi' } },
@@ -519,7 +519,7 @@ describe('live mode control', () => {
   })
 
   it('retires non-empty workspace policy files without honoring their overrides', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-policy-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-policy-'))
     const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'hi' } } }
     let server: WebServer | undefined
     try {
@@ -602,7 +602,7 @@ describe('live mode control', () => {
   })
 
   it('preserves both files when an exclusive retirement copy races a new migration target', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-policy-race-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-policy-race-'))
     const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'hi' } } }
     let server: WebServer | undefined
     try {
@@ -645,7 +645,7 @@ describe('live mode control', () => {
   })
 
   it('stops after five transient exclusive-copy failures without losing the source', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-policy-exhaust-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-policy-exhaust-'))
     const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'hi' } } }
     let server: WebServer | undefined
     try {
@@ -690,8 +690,8 @@ describe('live mode control', () => {
   })
 
   it('--yolo preserves a custom mode deny rather than asking or allowing it', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-yolo-deny-'))
-    const proj = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-yolo-deny-proj-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-yolo-deny-'))
+    const proj = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-yolo-deny-proj-'))
     const provider: LlmProvider = {
       name: 'scripted', models: ['scripted'],
       async *stream() { yield { type: 'toolCalls', calls: [{ id: 'b1', name: 'Bash', args: { command: 'printf bad' } }] } },
@@ -721,8 +721,8 @@ describe('live mode control', () => {
   })
 
   it('keeps omitted selected-mode keys on defaultMode under yolo', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-yolo-fallback-'))
-    const projectRoot = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-yolo-fallback-proj-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-yolo-fallback-'))
+    const projectRoot = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-yolo-fallback-proj-'))
     const provider: LlmProvider = {
       name: 'scripted', models: ['scripted'],
       async *stream() { yield { type: 'toolCalls', calls: [{ id: 'omitted-read', name: 'Read', args: { path: 'missing.txt' } }] } },
@@ -752,7 +752,7 @@ describe('live mode control', () => {
   })
 
   it('keeps omitted selected-mode keys on default ask under yolo', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-yolo-ask-fallback-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-yolo-ask-fallback-'))
     const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'toolCalls', calls: [{ id: 'omitted', name: 'Read', args: { path: 'missing.txt' } }] } } }
     const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json'), yolo: true })
     try {
@@ -851,8 +851,8 @@ describe('live mode control', () => {
   })
 
   it('--yolo skips mode ask defaults so Write runs without an approval question', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-yolo-'))
-    const proj = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-yolo-proj-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-yolo-'))
+    const proj = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-yolo-proj-'))
     let step = 0
     const provider: LlmProvider = {
       name: 'scripted', models: ['scripted'],
@@ -967,7 +967,7 @@ describe('context manifest records', () => {
     const base = server.url
     const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
     // A bound project exposes the file tools in the default mode.
-    const projDir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-ctx-'))
+    const projDir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-ctx-'))
     const project = (await (await post(base, `/api/workspaces/${wsId}/projects`, { name: 'P', path: projDir })).json()) as { id: string }
     const { id } = (await (await post(base, `/api/workspaces/${wsId}/sessions`, { projectId: project.id })).json()) as { id: string }
     await post(base, `/api/workspaces/${wsId}/sessions/${id}/messages`, { content: 'list files' })
@@ -1014,7 +1014,7 @@ describe('context manifest records', () => {
     const bodies = events.filter((event) => event.type === 'context/body') as { hash?: string; kind?: string; body?: string; chars?: number }[]
     expect(bodies).toHaveLength(1)
     expect(bodies[0]?.kind).toBe('system')
-    expect(bodies[0]?.body).toContain('You are mini-dsh')
+    expect(bodies[0]?.body).toContain('You are dnt-harness')
     expect(bodies[0]?.chars).toBe(bodies[0]?.body?.length)
     expect(createHash('sha256').update(bodies[0]?.body ?? '', 'utf8').digest('hex')).toBe(bodies[0]?.hash)
     const manifestSections = (events[manifestAt[0]!] as unknown as { manifest: { sections: { kind: string; hash: string; chars: number }[] } }).manifest.sections
@@ -1025,7 +1025,7 @@ describe('context manifest records', () => {
     expect(bodyResponse.status).toBe(200)
     const bodyPayload = await bodyResponse.json() as { kind?: string; body?: string }
     expect(bodyPayload.kind).toBe('system')
-    expect(bodyPayload.body).toContain('You are mini-dsh')
+    expect(bodyPayload.body).toContain('You are dnt-harness')
     expect((await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/context/${'0'.repeat(64)}`)).status).toBe(404)
 
     // The inspector route still serves the last request's manifest.

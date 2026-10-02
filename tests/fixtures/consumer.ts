@@ -1,7 +1,7 @@
-import type { Context } from 'mini-dsh'
+import type { Context } from 'dnt-harness'
 import type { GreeterService } from './greeter.ts'
 
-declare module 'mini-dsh' {
+declare module 'dnt-harness' {
   interface Context {
     greeter: GreeterService
   }

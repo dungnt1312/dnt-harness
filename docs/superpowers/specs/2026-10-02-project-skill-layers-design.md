@@ -2,7 +2,7 @@
 
 Date: 2026-10-02
 Status: Approved (brainstorming session, design approved by user)
-Reference: Claude Code project skills (`.claude/skills`), agents skill-folder convention (`.agents/skills`); mini-dsh skills service `src/harness/skills/service.ts`
+Reference: Claude Code project skills (`.claude/skills`), agents skill-folder convention (`.agents/skills`); dnt-harness skills service `src/harness/skills/service.ts`
 
 ## Problem
 

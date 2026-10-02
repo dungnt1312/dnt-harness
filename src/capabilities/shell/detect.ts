@@ -42,10 +42,10 @@ export function detectShell(explicit?: string): ShellDetection {
   if (explicit !== undefined && explicit !== '') {
     return existsSync(explicit)
       ? { executable: explicit, hint: explicit }
-      : { executable: undefined, hint: `the configured bash '${explicit}' does not exist; fix it or set MINI_DSH_BASH` }
+      : { executable: undefined, hint: `the configured bash '${explicit}' does not exist; fix it or set DNT_HARNESS_BASH` }
   }
   const candidates: string[] = []
-  const fromEnv = process.env['MINI_DSH_BASH']?.trim()
+  const fromEnv = process.env['DNT_HARNESS_BASH']?.trim()
   if (fromEnv !== undefined && fromEnv !== '') candidates.push(fromEnv)
   if (process.platform === 'win32') {
     candidates.push(
@@ -80,7 +80,7 @@ export function detectShell(explicit?: string): ShellDetection {
     }
     return {
       executable: undefined,
-      hint: 'install Git Bash (https://git-scm.com) or point MINI_DSH_BASH at a bash.exe',
+      hint: 'install Git Bash (https://git-scm.com) or point DNT_HARNESS_BASH at a bash.exe',
     }
   }
   // Last resort on PATH (POSIX `bash`).

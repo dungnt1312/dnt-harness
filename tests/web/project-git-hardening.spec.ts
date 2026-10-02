@@ -17,7 +17,7 @@ function git(...args: string[]): void {
 }
 
 beforeAll(async () => {
-  repo = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-git-hostile-'))
+  repo = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-git-hostile-'))
   git('init', '-q')
   await fs.writeFile(path.join(repo, 'f.txt'), 'a\n')
   git('add', '.')

@@ -1,4 +1,4 @@
-# mini-dsh web UI rewrite — design
+# dnt-harness web UI rewrite — design
 
 Date: 2026-08-26 · Status: approved
 

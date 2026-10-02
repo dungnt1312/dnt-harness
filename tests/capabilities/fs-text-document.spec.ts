@@ -9,7 +9,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { fsTools, type ToolExecution } from 'mini-dsh'
+import { fsTools, type ToolExecution } from 'dnt-harness'
 import { FileObservations } from '../../src/capabilities/fs/observation.ts'
 import { decodeDocument, spliceDocument, BinaryFileError } from '../../src/capabilities/fs/text-document.ts'
 import { findEditMatch } from '../../src/capabilities/fs/edit-match.ts'
@@ -19,7 +19,7 @@ const roots: string[] = []
 afterEach(async () => { for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true }) })
 
 async function setup() {
-  const root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-text-doc-'))
+  const root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-text-doc-'))
   roots.push(root)
   const tools = new Map(fsTools().map((tool) => [tool.name, tool]))
   const invoke = (name: string, args: Record<string, unknown>, exec: ToolExecution) => tools.get(name)!.execute(args, exec)

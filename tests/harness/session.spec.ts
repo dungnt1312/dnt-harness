@@ -3,7 +3,7 @@
  * history projection, and fork boundaries.
  */
 import { describe, expect, it, vi } from 'vitest'
-import { Kernel, SessionsService } from 'mini-dsh'
+import { Kernel, SessionsService } from 'dnt-harness'
 
 /** Boot a kernel with the session service mounted. */
 function boot(): Kernel {

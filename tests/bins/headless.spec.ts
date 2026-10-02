@@ -40,7 +40,7 @@ describe('headless CLI', () => {
   })
 
   it('starts without DEEPSEEK_API_KEY and does not fall back to a mock provider', async () => {
-    dataDir = await mkdtemp(path.join(tmpdir(), 'mini-dsh-headless-'))
+    dataDir = await mkdtemp(path.join(tmpdir(), 'dnt-harness-headless-'))
     const { code, stdout, stderr } = await runCli(['--data-dir', dataDir, '--message', 'hello'])
 
     expect(code).toBe(0)

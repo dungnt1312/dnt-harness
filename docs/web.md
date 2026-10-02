@@ -64,7 +64,7 @@ The web bin (`src/bins/web.ts`) accepts:
 | `--port N` | HTTP port | `3082` |
 | `--root DIR` | default workspace root | `process.cwd()` |
 | `--yolo` | map selected-mode `ask` permissions to `allow`, while preserving explicit `deny` (host `blockedTools`, exposure, child ceilings, and interactive MCP still apply) | off |
-| `--auth` | require control-plane pairing; the startup line then prints a single-use code (`MINI_DSH_AUTH=1` does the same, `--no-auth` overrides it) | off |
+| `--auth` | require control-plane pairing; the startup line then prints a single-use code (`DNT_HARNESS_AUTH=1` does the same, `--no-auth` overrides it) | off |
 
 The server always boots even with no provider configured, so the Settings panel
 can add one. A non-blank `DEEPSEEK_API_KEY` seeds a `deepseek` entry on first
@@ -74,7 +74,7 @@ answer `400` until one is configured.
 
 ## Provider configuration
 
-Providers are stored as plain JSON in `~/.mini-dsh/providers.json`
+Providers are stored as plain JSON in `~/.dnt-harness/providers.json`
 (override with the `configFile` option). The file is a **versioned
 envelope** holding the global provider list *and* the global default
 model selection:
@@ -141,7 +141,7 @@ tool root. The families, at a glance:
 | `…/:wid/terminals` (+ `/events` SSE, `/:tid` DELETE, `/:tid/(input\|resize)`) | interactive Workbench terminals: PTY lifecycle, one multiplexed output stream per workspace — see the terminal section |
 | `POST …/:wid/attachments`, `GET …/:wid/attachments/:id` | composer attachments: upload (content-addressed by sha256, verified media type) and serve (immutable, workspace-scoped) |
 | `…/:wid/agents/:name` (GET resolve / DELETE), `POST …/:wid/agents/:name` | agent definitions; POST spawns a bounded child from `task: { prompt, requiredResult }` or the four-field `task: { objective, constraints, references, requiredResult }`, optionally `inherit: "brief"`, `model` (`provider:model`) and `grantTools`. 202 with the handle (+ `inheritedChars`, `note`); an empty brief, a bad `inherit`, or a role that refuses inheritance is 400; capacity (per conversation or host) is 429 |
-| `POST …/:wid/agents/:name/import` | save a definition: `dialect: "claude"` / `"codex"` import with provenance, or `"mini-dsh"` to save a native document verbatim (keeps `inheritable`) |
+| `POST …/:wid/agents/:name/import` | save a definition: `dialect: "claude"` / `"codex"` import with provenance, or `"dnt-harness"` to save a native document verbatim (keeps `inheritable`) |
 | `GET …/:wid/agents/children?root=…`, `GET/DELETE …/:wid/children/:childId` (+ `/cancel`), `POST …/:wid/sessions/:parentSessionId/children/:childSessionId/reconcile` | child list / wait-result / cancel / settlement; statuses may include `uncertain`, which is stable across restarts until settled — repair runs through the Agent tool, the Workbench's Retry settlement, or the reconcile route (below); the legacy `POST /api/sessions/...` reconcile address is retained |
 | `…/:wid/mcp` (+ `/:server` GET/POST/DELETE, `/:server/(enable\|disable\|reconnect)`, `/mcp/import`) | MCP server lifecycle, stored config for editing, deletion, and imports with provenance |
 | `…/:wid/hooks`, `…/:wid/secrets(/:key)` | hook bindings; encrypted secret management (masked responses) |
@@ -635,7 +635,7 @@ boundaries matter more than the feature:
   landing in a terminal. Closing the last terminal is a decision and is never
   undone automatically.
 - **Default shell** is a browser-local preference (`terminalShell` in
-  `mini-dsh.workbench.v1`), set from the Terminal view's shell menu. Unset, it
+  `dnt-harness.workbench.v1`), set from the Terminal view's shell menu. Unset, it
   defers to the host's own order: Git Bash first, PowerShell when Git Bash is
   absent on Windows. A remembered shell the host no longer offers falls back to
   that order instead of failing every open.
@@ -786,16 +786,16 @@ that POSTs the workspace-scoped, parent-owned reconcile route — the same canon
 settlement the model's `Agent` reconcile action runs; the chat delegation card
 projects durable events and never shows `uncertain`. Terminal
 is the deliberate interactive exception documented above. The Workbench docks at 1280px and becomes a modal sheet below that. Sidebar/workbench collapse and dock
-widths are browser-local preferences under `mini-dsh.workbench.v1`; the opened
+widths are browser-local preferences under `dnt-harness.workbench.v1`; the opened
 Workbench views and the selected one are remembered **per conversation** under
-`mini-dsh.workbench.tabs.v1`, keyed `<workspaceId>:<sessionId>` (or `draft`
+`dnt-harness.workbench.tabs.v1`, keyed `<workspaceId>:<sessionId>` (or `draft`
 before the first message) — a subagent conversation shares its root's record,
 so a child and its parent read as one workbench. One conversation's tabs never
 leak into another; conversations without a record start from the tab fields of
 the old global key until they gain one (the upgrade seed fades as records are
 written); appearance (System/Light/Dark) is stored under
-`mini-dsh.theme`; unsent composer drafts are kept per workspace+session under
-`mini-dsh.drafts.v1` (text only — never `sending` or an error, which describe a
+`dnt-harness.theme`; unsent composer drafts are kept per workspace+session under
+`dnt-harness.drafts.v1` (text only — never `sending` or an error, which describe a
 request that no longer exists). None of these are server settings. See
 [design guidelines](design-guidelines.md) and [design system](design-system.md).
 

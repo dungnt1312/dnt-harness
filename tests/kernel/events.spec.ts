@@ -1,12 +1,12 @@
 /**
- * Cordis tutorial chapter 4 — Events, reproduced on the mini-dsh kernel:
+ * Cordis tutorial chapter 4 — Events, reproduced on the dnt-harness kernel:
  * typed events through declaration merging, the dispatch-mode contracts, and
  * the waterfall transform/veto walkthrough verbatim from the tutorial.
  */
 import { describe, expect, it } from 'vitest'
-import { Kernel, Service, type Context } from 'mini-dsh'
+import { Kernel, Service, type Context } from 'dnt-harness'
 
-declare module 'mini-dsh' {
+declare module 'dnt-harness' {
   interface Events {
     'stats/report'(name: string, count: number): void
     'demo/transform'(input: string, next: (replacement?: string) => Promise<string>): Promise<string>

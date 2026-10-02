@@ -128,7 +128,7 @@ export interface PreparedToolCall {
   execute(): Promise<ToolResult>
 }
 
-declare module 'mini-dsh' {
+declare module 'dnt-harness' {
   interface Events {
     /**
      * Input-rewrite phase BEFORE authorization (G5 hooks). Listeners may

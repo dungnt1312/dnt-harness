@@ -14,7 +14,7 @@
     "noEmit": true,
     "skipLibCheck": true,
     "paths": {
-      "mini-dsh": ["./src/index.ts"]
+      "dnt-harness": ["./src/index.ts"]
     }
   },
   "include": ["src", "tests"]

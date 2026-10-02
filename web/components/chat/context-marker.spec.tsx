@@ -111,7 +111,7 @@ it('expanding lists the raw blocks and clicking one fetches its exact text', asy
   const fetchMock = vi.fn().mockResolvedValue({
     ok: true,
     status: 200,
-    json: async () => ({ kind: 'system', hash: SYSTEM_HASH, chars: 44, body: 'You are mini-dsh, a local coding assistant.' }),
+    json: async () => ({ kind: 'system', hash: SYSTEM_HASH, chars: 44, body: 'You are dnt-harness, a local coding assistant.' }),
   })
   vi.stubGlobal('fetch', fetchMock)
   try {
@@ -123,7 +123,7 @@ it('expanding lists the raw blocks and clicking one fetches its exact text', asy
     // The body fetch resolves through several microtask hops; a macrotask
     // lets the whole chain settle before asserting.
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
-    expect(view.querySelector('pre')?.textContent).toContain('You are mini-dsh, a local coding assistant.')
+    expect(view.querySelector('pre')?.textContent).toContain('You are dnt-harness, a local coding assistant.')
     const calledUrl = String(fetchMock.mock.calls[0]?.[0] ?? '')
     expect(calledUrl).toContain(`/context/${SYSTEM_HASH}`)
   } finally {

@@ -4,7 +4,7 @@ Status: design approved by user on 2026-09-09. Implementation not started by thi
 
 ## Outcome
 
-Extend mini-dsh's existing harness, without adopting dntspace architecture, so every execution has an identity, enforced permissions, bounded lifetime, durable history and truthful outcomes. Users can stop execution and reopen history after restart. G1 supplies the execution foundation for later workspace environments, context/skills, bounded multi-agent and trusted plugins.
+Extend dnt-harness's existing harness, without adopting dntspace architecture, so every execution has an identity, enforced permissions, bounded lifetime, durable history and truthful outcomes. Users can stop execution and reopen history after restart. G1 supplies the execution foundation for later workspace environments, context/skills, bounded multi-agent and trusted plugins.
 
 ## Constraints and non-goals
 

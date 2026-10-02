@@ -1,5 +1,5 @@
 import { afterEach, expect, it } from 'vitest'
-import { createWebServer, type WebServer } from 'mini-dsh'
+import { createWebServer, type WebServer } from 'dnt-harness'
 import { FakeScriptedLlm } from './fake-llm.ts'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
@@ -13,7 +13,7 @@ afterEach(async () => {
 })
 
 it('emits an SSE id and replays only events after a valid Last-Event-ID', async () => {
-  root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-resume-'))
+  root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-resume-'))
   server = await createWebServer({ root, configFile: path.join(root, 'providers.json'), providers: [new FakeScriptedLlm(['done'])] })
   const created = await fetch(`${server.url}/api/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
   const session = await created.json() as { id: string }

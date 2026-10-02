@@ -30,7 +30,7 @@ composer, and scope warning + session-allow in the approval card.
 3. SessionFoldersChip + composer integration.
 4. Approval card warning + session button (POST `scope: 'session'`).
 5. Specs: add/remove project folder PATCH; chip add PUT with revision + renders grant from stream; approval card shows exact folder, session button posts scope, no session button for child/invalid proposal.
-6. `npm run build:web` + `pm2 restart mini-dsh`, verify live.
+6. `npm run build:web` + `pm2 restart dnt-harness`, verify live.
 
 ## Success Criteria
 - [x] Specs green; live check: add folder → agent (told via context) reads file there without approval; out-of-grant → card shows warning, session allow works; reload keeps the card.

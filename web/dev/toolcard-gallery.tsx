@@ -45,7 +45,7 @@ const EDIT_RECEIPT = [
 ].join('\n')
 
 /** The long one-liner from the screenshot that made the terminal panel unreadable. */
-const LONG_COMMAND = String.raw`cd C:/Users/DungNguyen/workspace/mini-dsh && curl -s -o /dev/null -w "vite %{http_code}\n" --max-time 3 http://127.0.0.1:4176/dev/toolcard-gallery.html; rm -f /tmp/m4.log; (nohup sh -c 'node scripts/measure-toolcards.mjs http://127.0.0.1:4176 > /tmp/m4.log 2>&1; echo "exit $?" >> /tmp/m4.log' >/dev/null 2>&1 &); for i in $(seq 1 26); do grep -q "^exit" /tmp/m4.log && break; sleep 1; done`
+const LONG_COMMAND = String.raw`cd C:/Users/DungNguyen/workspace/dnt-harness && curl -s -o /dev/null -w "vite %{http_code}\n" --max-time 3 http://127.0.0.1:4176/dev/toolcard-gallery.html; rm -f /tmp/m4.log; (nohup sh -c 'node scripts/measure-toolcards.mjs http://127.0.0.1:4176 > /tmp/m4.log 2>&1; echo "exit $?" >> /tmp/m4.log' >/dev/null 2>&1 &); for i in $(seq 1 26); do grep -q "^exit" /tmp/m4.log && break; sleep 1; done`
 const LONG_OUTPUT = ['vite 200', "  name: 'Error'", 'exit 1', '', '[exit code: 0]'].join('\n')
 
 const rows: Array<{ label: string; item: ToolItem }> = [

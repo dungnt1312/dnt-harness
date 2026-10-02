@@ -80,7 +80,7 @@ Same-user tamper resistance is out of scope; call this crash-durable evidence, n
 
 ## Success Criteria
 
-- [x] Lost-response fixture observes one mini-dsh dispatch and one fixture side effect; claim is explicitly host no-replay, not universal exactly-once. A real stdio fixture records each `tools/call` in `SIDE_EFFECT_FILE` before replying; `hang` never replies. `tests/harness/mcp-execution-journal.spec.ts` sees one send and one remote effect across a same-process repeat and a reopened journal.
+- [x] Lost-response fixture observes one dnt-harness dispatch and one fixture side effect; claim is explicitly host no-replay, not universal exactly-once. A real stdio fixture records each `tools/call` in `SIDE_EFFECT_FILE` before replying; `hang` never replies. `tests/harness/mcp-execution-journal.spec.ts` sees one send and one remote effect across a same-process repeat and a reopened journal.
 - [x] Every ambiguous post-dispatch failure returns `indeterminate` and is never automatically repeated.
 - [x] Every possible dispatch has a synced intent under the current ownership epoch. With a real `DataHomeLock`, a host whose data home was taken over (new epoch) writes no intent and sends nothing; every intent on disk carries the epoch live when written.
 - [x] Restart recovery is idempotent and never sends unresolved calls.

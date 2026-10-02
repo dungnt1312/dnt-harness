@@ -1,6 +1,6 @@
 ---
 title: "MCP Production Completion"
-description: "Safety-first completion of mini-dsh MCP tools: authenticated local control plane, versioned config migration, no-replay execution evidence, hardened transports and subprocesses, desired-state reconciliation, managed OAuth, operational UI, conformance, and production rollout."
+description: "Safety-first completion of dnt-harness MCP tools: authenticated local control plane, versioned config migration, no-replay execution evidence, hardened transports and subprocesses, desired-state reconciliation, managed OAuth, operational UI, conformance, and production rollout."
 status: in-progress
 priority: P1
 effort: "51-77 engineering days plus cross-platform soak and canary"
@@ -18,7 +18,7 @@ Complete the existing G5 MCP tools implementation without replacing its working 
 
 The safety kernel has four non-negotiable properties:
 
-1. mini-dsh performs at most one automatic application-level `tools/call` dispatch per invocation;
+1. dnt-harness performs at most one automatic application-level `tools/call` dispatch per invocation;
 2. failures after a conservative possible-dispatch boundary become `indeterminate`, never an automatic replay;
 3. a synced execution intent exists before transport dispatch, under the one proven data-home owner and its fencing epoch;
 4. config/credential mutations fence old runtime generations before acknowledging that no new dispatch can use them.
@@ -50,7 +50,7 @@ Each optional capability requires its own approved plan because request directio
 
 ## Supported Deployment Contract
 
-- Production data home has exactly one active mini-dsh host process.
+- Production data home has exactly one active dnt-harness host process.
 - PM2 uses one `fork` instance; cluster/multi-worker mode against one data home is rejected.
 - A durable workspace/data-home ownership lock with fencing epoch prevents concurrent writers and runtime owners; lock loss fences dispatch.
 - Windows is a required release platform. Linux is a required release platform for protocol and process gates. macOS may run best-effort lifecycle cleanup but receives no hard tree-wide CPU/memory claim until a tested containment primitive exists.
@@ -142,7 +142,7 @@ Phase 10 creates explicit Windows and Linux CI/runner jobs. Hermetic runs pass b
 
 ## Production Success Criteria
 
-- [ ] mini-dsh issues at most one automatic application-level `tools/call` dispatch per invocation; redirects, re-auth, reconnect, and recovery never hide a second dispatch.
+- [ ] dnt-harness issues at most one automatic application-level `tools/call` dispatch per invocation; redirects, re-auth, reconnect, and recovery never hide a second dispatch.
 - [ ] Any ambiguous post-dispatch failure is `indeterminate`; a repeat is a fresh invocation with current approval.
 - [ ] Every possible dispatch has a synced intent record, one proven writer, and idempotent crash recovery.
 - [ ] Unauthenticated REST/SSE/upgrade requests fail by default; logout/revocation fences streams and approvals.

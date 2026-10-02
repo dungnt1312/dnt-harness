@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-22
 **Status:** Approved
-**Author:** mini-dsh team
+**Author:** dnt-harness team
 **Scope:** Harness + Web Settings — single spec (one subsystem, one file boundary)
 
 ---

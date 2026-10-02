@@ -12,7 +12,7 @@ source: "reference screenshot plus current dirty working tree"
 
 The latest source is functionally much stronger than the visual result: durable lifecycle, guarded creation, immutable project binding, approval detail, and full management capabilities exist. The UI still reads as an accumulated engineering console because ownership is duplicated, copy is bilingual, geometry is undersized, technical surfaces compete with prose, and settings repeat card/form patterns without one information architecture.
 
-The supplied screenshot is useful for hierarchy: stable app bar, narrow navigation, centered work, optional context rail, compact disclosures, and high information density. It is not a feature specification. mini-dsh must not fabricate Git, terminal, marketplace, upload, repository branch, tab, or agent-monitoring chrome.
+The supplied screenshot is useful for hierarchy: stable app bar, narrow navigation, centered work, optional context rail, compact disclosures, and high information density. It is not a feature specification. dnt-harness must not fabricate Git, terminal, marketplace, upload, repository branch, tab, or agent-monitoring chrome.
 
 ## Observed surface flaws
 

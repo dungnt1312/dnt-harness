@@ -8,7 +8,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
 
 let root = ''
 let projA = ''
@@ -16,9 +16,9 @@ let projB = ''
 const servers: WebServer[] = []
 
 beforeAll(async () => {
-  root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-web-'))
-  projA = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-pa-'))
-  projB = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-pb-'))
+  root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-web-'))
+  projA = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-pa-'))
+  projB = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-pb-'))
 })
 
 afterAll(async () => {
@@ -42,7 +42,7 @@ const scripted: LlmProvider = {
 }
 
 async function start(): Promise<WebServer> {
-  const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-home-'))
+  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-home-'))
   const server = await createWebServer({
     home,
     providers: [scripted],
@@ -195,7 +195,7 @@ describe('workspace HTTP surface', () => {
   })
 
   it('lists a bound durable session with its project immediately after restart without loading history', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-restart-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-restart-'))
     let first: WebServer | undefined
     let restarted: WebServer | undefined
     try {
@@ -257,9 +257,9 @@ describe('workspace HTTP surface', () => {
   })
 
   it('selected modes isolate actual tool gates: Full access executes while Ask before changes waits', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-mode-gate-'))
-    const workRoot = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-mode-work-'))
-    const lifeRoot = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-mode-life-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-mode-gate-'))
+    const workRoot = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-mode-work-'))
+    const lifeRoot = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-mode-life-'))
     const provider: LlmProvider = {
       name: 'writer', models: ['writer'],
       async *stream(request) {
@@ -421,7 +421,7 @@ describe('G2 review hardening', () => {
       name: 'beta', models: ['b1'],
       async *stream(request) { seen.push({ provider: 'beta', model: request.model ?? '' }); yield { type: 'delta', delta: 'b' } },
     }
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-prov-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-prov-'))
     const server = await createWebServer({ home, providers: [alpha, beta], configFile: path.join(home, 'p.json') })
     try {
       const base = server.url

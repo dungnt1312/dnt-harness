@@ -80,9 +80,9 @@ never bookkeep removals.
 ### A service plugin (provides a named capability)
 
 ```ts
-import { Service, type Context } from 'mini-dsh'
+import { Service, type Context } from 'dnt-harness'
 
-declare module 'mini-dsh' {
+declare module 'dnt-harness' {
   interface Context {
     greeter: GreeterService
   }
@@ -105,7 +105,7 @@ export function apply(ctx: Context): void {
 ### A consumer (depends on a service)
 
 ```ts
-import type { Context } from 'mini-dsh'
+import type { Context } from 'dnt-harness'
 
 export const name = 'consumer-fixture'
 export const inject = ['greeter']   // stays 'pending' until 'greeter' exists
@@ -146,7 +146,7 @@ export function apply(ctx: Context): void {
 ```
 
 ```ts
-import { Kernel, bootFromFile } from 'mini-dsh'
+import { Kernel, bootFromFile } from 'dnt-harness'
 
 const kernel = new Kernel()
 await bootFromFile(kernel, 'cordis.yml')
@@ -159,14 +159,14 @@ skips the row (patch layers flip this instead of deleting rows).
 ### Public API surface
 
 Everything is re-exported from the package entry (`src/index.ts`), and the
-`mini-dsh` import specifier is aliased in `vitest.config.ts` (and via `paths` in
+`dnt-harness` import specifier is aliased in `vitest.config.ts` (and via `paths` in
 `tsconfig.json`) for tests. Types extend through declaration merging on
 `Events` and `Context`.
 
 ## Testing
 
 The suite runs under Vitest in a Node environment (`tests/**/*.spec.ts`), with
-the `mini-dsh` alias pointing at `src/index.ts`. There are no fake timers —
+the `dnt-harness` alias pointing at `src/index.ts`. There are no fake timers —
 deterministic effect-teardown tests rely on real microtask ordering.
 
 ```

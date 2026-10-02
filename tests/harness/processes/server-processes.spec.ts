@@ -8,7 +8,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebEnvelope, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type WebEnvelope, type WebServer } from 'dnt-harness'
 import { FakeScriptedLlm } from '../../web/fake-llm.ts'
 
 let root = ''
@@ -17,7 +17,7 @@ let baseUrl = ''
 let startCount = 0
 
 beforeAll(async () => {
-  root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-proc-'))
+  root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-proc-'))
 })
 
 afterAll(async () => {
@@ -92,7 +92,7 @@ async function bootProjectSession(): Promise<{ ws: string; sessionId: string; pr
   const listed = (await (await fetch(`${baseUrl}/api/workspaces`)).json()) as { id: string }[]
   const existing = listed[0]?.id
   const ws = existing ?? ((await (await post('/api/workspaces', { name: 'proc-test' })).json()) as { id: string }).id
-  const projectPath = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-proc-p-'))
+  const projectPath = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-proc-p-'))
   const project = (await (await post(`/api/workspaces/${ws}/projects`, { path: projectPath })).json()) as { id: string }
   const session = (await (await post(`/api/workspaces/${ws}/sessions`, { projectId: project.id })).json()) as { id: string }
   return { ws, sessionId: session.id, projectPath }

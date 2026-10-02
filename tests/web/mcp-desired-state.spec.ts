@@ -7,7 +7,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createWebServer, McpConfigStore, type WebServer } from 'mini-dsh'
+import { createWebServer, McpConfigStore, type WebServer } from 'dnt-harness'
 import { MutationStore } from '../../src/harness/mcp/mutation-store.ts'
 
 let server: WebServer | undefined
@@ -21,7 +21,7 @@ afterEach(async () => {
 })
 
 async function boot(): Promise<{ base: string; wsId: string }> {
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-desired-state-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-desired-state-'))
   server = await createWebServer({ home, configFile: path.join(home, 'providers.json') })
   const base = server.url
   const wsId = ((await (await fetch(`${base}/api/workspaces`)).json()) as { id: string }[])[0]!.id
@@ -87,7 +87,7 @@ describe('MCP desired-state writes', () => {
 
 describe('desired-state crash recovery', () => {
   it('restores config and secrets together when a crash leaves both intents open', async () => {
-    home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-desired-crash-'))
+    home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-desired-crash-'))
     const store = new McpConfigStore(home)
     const configFile = store.mcpPath('ws')
     const secretsFile = store.secretsPath('ws')
@@ -111,7 +111,7 @@ describe('desired-state crash recovery', () => {
   })
 
   it('keeps a committed write and rolls back only the one left open', async () => {
-    home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-desired-crash-'))
+    home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-desired-crash-'))
     const configFile = path.join(home, 'workspaces', 'ws', 'mcp.json')
     const secretsFile = path.join(home, 'workspaces', 'ws', 'secrets.json')
     await fs.mkdir(path.dirname(configFile), { recursive: true })

@@ -4,7 +4,7 @@
  */
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { Kernel, bootFromFile, parseConfig } from 'mini-dsh'
+import { Kernel, bootFromFile, parseConfig } from 'dnt-harness'
 
 const fixturesUrl = new URL('../fixtures/', import.meta.url)
 

@@ -4,11 +4,11 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { ManagedOAuth, OAuthStore } from 'mini-dsh'
+import { ManagedOAuth, OAuthStore } from 'dnt-harness'
 
 describe('managed oauth profile', () => {
   it('deposits a code without creating a session and fences on local revoke', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-oauth-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-oauth-'))
     const store = new OAuthStore(home, randomBytes(32))
     let exchanged = 0
     const server = createServer(async (req, res) => {

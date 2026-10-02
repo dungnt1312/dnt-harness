@@ -9,7 +9,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
 
 const homes: string[] = []
 const servers: WebServer[] = []
@@ -25,7 +25,7 @@ afterAll(async () => {
 })
 
 async function start(providers: readonly LlmProvider[] = []): Promise<{ server: WebServer; base: string }> {
-  const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-models-'))
+  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-models-'))
   const server = await createWebServer({ home, providers, configFile: path.join(home, 'p.json') })
   servers.push(server)
   return { server, base: server.url }

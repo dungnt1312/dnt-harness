@@ -18,7 +18,7 @@ import {
   type GrantedRoot,
   type ToolDefinition,
   type ToolExecution,
-} from 'mini-dsh'
+} from 'dnt-harness'
 
 let base = ''
 let primary = ''
@@ -28,7 +28,7 @@ let outside = ''
 let tools: Map<string, ToolDefinition>
 
 beforeAll(async () => {
-  base = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-multiroot-')))
+  base = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-multiroot-')))
   primary = path.join(base, 'primary')
   shared = path.join(base, 'shared')
   docs = path.join(base, 'docs')

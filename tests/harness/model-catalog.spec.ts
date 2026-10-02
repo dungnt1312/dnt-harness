@@ -15,7 +15,7 @@ import {
   knownModelLimit,
   resolveContextLimit,
   supportsReasoningControl,
-} from 'mini-dsh'
+} from 'dnt-harness'
 
 describe('model catalog metadata', () => {
   it('exact IDs return verified capabilities', () => {

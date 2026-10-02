@@ -9,7 +9,9 @@
  */
 const VERSION = '__PWA_VERSION__'
 const PRECACHE = /** @type {string[]} */ (__PWA_PRECACHE__)
-const CACHE_PREFIX = 'mini-dsh-'
+const CACHE_PREFIX = 'dnt-harness-'
+/** Caches written before the rename from mini-dsh; dropped on activation. */
+const LEGACY_CACHE_PREFIX = 'mini-dsh-'
 const CACHE = `${CACHE_PREFIX}${VERSION}`
 
 self.addEventListener('install', (event) => {
@@ -25,7 +27,7 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches
       .keys()
-      .then((keys) => Promise.all(keys.filter((key) => key.startsWith(CACHE_PREFIX) && key !== CACHE).map((key) => caches.delete(key))))
+      .then((keys) => Promise.all(keys.filter((key) => (key.startsWith(CACHE_PREFIX) && key !== CACHE) || key.startsWith(LEGACY_CACHE_PREFIX)).map((key) => caches.delete(key))))
       .then(() => self.clients.claim()),
   )
 })

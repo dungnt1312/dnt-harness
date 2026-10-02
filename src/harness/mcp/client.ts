@@ -191,7 +191,7 @@ class StdioTransport implements Transport {
     const initialized = await this.request('initialize', {
       protocolVersion: MCP_PROTOCOL_VERSION,
       capabilities: {},
-      clientInfo: { name: 'mini-dsh', version: '0.1.0' },
+      clientInfo: { name: 'dnt-harness', version: '0.1.0' },
     }, 10_000)
     assertInitializeResult(initialized)
     await this.notify('notifications/initialized', {})
@@ -369,7 +369,7 @@ class HttpTransport implements Transport {
     const initialized = await this.request('initialize', {
       protocolVersion: MCP_PROTOCOL_VERSION,
       capabilities: {},
-      clientInfo: { name: 'mini-dsh', version: '0.1.0' },
+      clientInfo: { name: 'dnt-harness', version: '0.1.0' },
     }, 10_000)
     if (this.stopped) throw new McpTransportError('transport stopped before spawn')
     assertInitializeResult(initialized)

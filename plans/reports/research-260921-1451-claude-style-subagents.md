@@ -18,7 +18,7 @@ still the wrong direction and asks for multi-agent "like Claude". What is actual
 
 ## The answer
 
-**A child in mini-dsh is not a different agent. It is the same agent with fewer tools.**
+**A child in dnt-harness is not a different agent. It is the same agent with fewer tools.**
 
 Everything that makes a Claude Code subagent a *subagent* — its own system prompt, a
 free-form brief, and a defined deliverable — is missing. What was built instead is a
@@ -45,7 +45,7 @@ preload (`server.ts:1298`). **Never for the prompt.**
 So a child's system prompt is byte-identical in shape to a root's:
 
 ```
-You are mini-dsh, a local coding assistant. Answer helpfully and precisely.
+You are dnt-harness, a local coding assistant. Answer helpfully and precisely.
 
 Mode — <mode name>: <mode instructions>
 
@@ -79,7 +79,7 @@ This is not a theoretical mis-framing; it is what the request contains today.
 
 ### 3. The child is never told what its deliverable is
 
-`BASE_SYSTEM` (`builder.ts:115`) is "You are mini-dsh, a local coding assistant. Answer
+`BASE_SYSTEM` (`builder.ts:115`) is "You are dnt-harness, a local coding assistant. Answer
 helpfully and precisely." Nothing anywhere tells a child that:
 
 - it is a subagent working for another agent, not for a human;
@@ -87,7 +87,7 @@ helpfully and precisely." Nothing anywhere tells a child that:
 - the user never sees its intermediate work, so anything that matters must be restated;
 - it cannot delegate (it will discover this as a tool denial if it tries).
 
-Claude Code states all four in its subagent framing. mini-dsh states none.
+Claude Code states all four in its subagent framing. dnt-harness states none.
 
 ### 4. The result digest keeps the narration and throws away the conclusion
 
@@ -162,7 +162,7 @@ planning assistant. It does.
 
 ## What "like Claude" actually means, ranked by what it buys
 
-| # | Claude Code | mini-dsh today | Cost |
+| # | Claude Code | dnt-harness today | Cost |
 |---|---|---|---|
 | 1 | definition body **is** the child's system prompt | body is user-message text; system prompt identical to the root's | small |
 | 2 | child is told its final message is the whole deliverable | told nothing | small |

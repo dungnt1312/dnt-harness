@@ -49,7 +49,7 @@ import {
   resolveSkillLayers,
   validateSkillRules,
   SkillError,
-} from 'mini-dsh'
+} from 'dnt-harness'
 
 describe('defaultSkillRules', () => {
   it('orders .claude, .agents, workspace, user and omits the user row without a dir', () => {
@@ -155,7 +155,7 @@ assert `absoluteRuleBase('~') === homedir()` (the implementation returns `homedi
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `npx vitest run tests/harness/skill-layers.spec.ts`
-Expected: FAIL — cannot import from `mini-dsh` (module missing).
+Expected: FAIL — cannot import from `dnt-harness` (module missing).
 
 - [ ] **Step 3: Implement `src/harness/skills/layers.ts`**
 
@@ -352,14 +352,14 @@ In `tests/harness/g3-context.spec.ts`, inside the existing `describe('skills + m
 
 ```ts
 it('sources round-trip, fall back to defaults, and drive layer-aware scans', async () => {
-  const { SkillsService } = await import('mini-dsh')
-  const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-skill-rules-'))
+  const { SkillsService } = await import('dnt-harness')
+  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-skill-rules-'))
   const skills = new SkillsService(home, undefined, 'C:/Users/x/.claude/skills')
   const ws = 'wsrules' as ProjectId
   const defaults = await skills.sources(ws)
   expect(defaults.map((rule) => rule.id)).toEqual(['project-claude', 'project-agents', 'workspace', 'user'])
 
-  const proj = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-skill-proj-'))
+  const proj = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-skill-proj-'))
   await fs.mkdir(path.join(proj, '.claude', 'skills', 'dup'), { recursive: true })
   await fs.writeFile(path.join(proj, '.claude', 'skills', 'dup', 'SKILL.md'), '---\nname: dup\ndescription: claude wins\n---\n\nCLAUDE', 'utf8')
   await fs.mkdir(path.join(proj, '.agents', 'skills', 'dup'), { recursive: true })
@@ -390,7 +390,7 @@ it('sources round-trip, fall back to defaults, and drive layer-aware scans', asy
 })
 ```
 
-Add `resolveSkillLayers` to the existing `mini-dsh` import at the top of the block
+Add `resolveSkillLayers` to the existing `dnt-harness` import at the top of the block
 (the file already imports `SkillsService` dynamically; import the resolver the same way
 or add a top-level static import — match the file's existing import style).
 
@@ -626,13 +626,13 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type WebServer } from 'mini-dsh'
+import { createWebServer, type WebServer } from 'dnt-harness'
 
 let root = ''
 const servers: WebServer[] = []
 
 beforeAll(async () => {
-  root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-skill-src-'))
+  root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-skill-src-'))
 })
 
 afterAll(async () => {
@@ -641,7 +641,7 @@ afterAll(async () => {
 })
 
 async function start(): Promise<{ server: WebServer; base: string }> {
-  const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-skill-src-home-'))
+  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-skill-src-home-'))
   const server = await createWebServer({ home, configFile: path.join(home, 'p.json') })
   servers.push(server)
   return { server, base: server.url }
@@ -878,7 +878,7 @@ git commit -m "feat(web): skill source rules routes with project-scoped catalog 
 Append to `tests/web/server-skill-sources.spec.ts`:
 
 ```ts
-import type { LlmProvider } from 'mini-dsh'
+import type { LlmProvider } from 'dnt-harness'
 
 /** Read every event of a session (SSE snapshot consumed to the end). */
 async function readAllEvents(base: string, wsId: string, sessionId: string): Promise<Array<{ type: string; ok?: boolean; output?: string }>> {
@@ -905,7 +905,7 @@ describe('Skill tool with project layers', () => {
         else yield { type: 'delta', delta: 'done' }
       },
     }
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-skill-tool-home-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-skill-tool-home-'))
     const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json') })
     servers.push(server)
     const base = server.url
@@ -1760,7 +1760,7 @@ Expected: PASS; known unrelated failures (escaped Laragon Git Bash descendants, 
 
 - [ ] **Step 3: Build + deploy PM2**
 
-Run: `npm run build:web && pm2 restart mini-dsh --update-env && sleep 2 && curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3082`
+Run: `npm run build:web && pm2 restart dnt-harness --update-env && sleep 2 && curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3082`
 Expected: build succeeds; `200`.
 
 - [ ] **Step 4: Live verify on :3082**

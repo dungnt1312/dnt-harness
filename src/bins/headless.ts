@@ -4,7 +4,7 @@
  * and bash capability tools, binds one agent to one durable session, and
  * streams replies and tool traffic to stdout.
  *
- * History persists under `--data-dir` (default `<cwd>/.mini-dsh/data`),
+ * History persists under `--data-dir` (default `<cwd>/.dnt-harness/data`),
  * so a later run with the same data dir can resume where this one left
  * off. A `DEEPSEEK_API_KEY` registers the DeepSeek provider; without one
  * the REPL still starts and a model call fails when no provider is
@@ -19,7 +19,7 @@
  */
 import { createInterface } from 'node:readline/promises'
 import path from 'node:path'
-import { loadRepoEnv, readApiKey } from './env.ts'
+import { loadRepoEnv, readApiKey, resolveAppHome } from './env.ts'
 import {
   AgentsService,
   DeepSeekProvider,
@@ -58,7 +58,7 @@ interface CliOptions {
 function parseArgs(argv: readonly string[]): CliOptions {
   let yolo = false
   let root = process.cwd()
-  let dataDir = path.join(process.cwd(), '.mini-dsh', 'data')
+  let dataDir = path.join(resolveAppHome(process.cwd()), 'data')
   let message: string | undefined
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
@@ -126,7 +126,7 @@ async function main(): Promise<void> {
     ownerLock = await DataHomeLock.acquire(dataDir)
   } catch (error) {
     if (error instanceof OwnershipError) {
-      process.stderr.write(`mini-dsh: ${error.message}; another mini-dsh process owns '${dataDir}'. Stop it or pass --data-dir.\n`)
+      process.stderr.write(`dnt-harness: ${error.message}; another dnt-harness process owns '${dataDir}'. Stop it or pass --data-dir.\n`)
       process.exitCode = 1
       return
     }
@@ -208,6 +208,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((error: unknown) => {
-  process.stderr.write(`mini-dsh: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`)
+  process.stderr.write(`dnt-harness: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`)
   process.exitCode = 1
 })

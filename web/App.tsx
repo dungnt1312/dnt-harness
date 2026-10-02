@@ -332,13 +332,13 @@ function AppShell() {
   const changeDraftProject = useCallback((projectId: string | null) => {
     setDraftProjectState(projectId)
     try {
-      if (activeWs !== null) window.localStorage.setItem(`mini-dsh.scope.${activeWs}`, projectId ?? '')
+      if (activeWs !== null) window.localStorage.setItem(`dnt-harness.scope.${activeWs}`, projectId ?? '')
     } catch { /* storage may be unavailable */ }
   }, [activeWs])
   useEffect(() => {
     if (activeWs === null) return
     let stored: string | null = null
-    try { stored = window.localStorage.getItem(`mini-dsh.scope.${activeWs}`) } catch { /* storage may be unavailable */ }
+    try { stored = window.localStorage.getItem(`dnt-harness.scope.${activeWs}`) } catch { /* storage may be unavailable */ }
     setDraftProjectState(stored !== null && stored !== '' ? stored : null)
   }, [activeWs])
   const effectiveDraftProject = projects.some((project) => project.id === draftProject) ? draftProject : null
@@ -1391,7 +1391,9 @@ function AppShell() {
     </>
   ) : null
 
-  const composerNode = (
+  // A subagent conversation is executor-managed — the parent drives it — so
+  // there is nothing to type into: the whole composer stays hidden.
+  const composerNode = currentParentSession !== null ? null : (
     <ScopedComposer
       store={composers}
       scope={key}
@@ -1404,9 +1406,6 @@ function AppShell() {
       onSend={(delivery) => void send(delivery)}
       onCommand={(name) => void runBuiltinCommand(name)}
       onStop={() => void stop()}
-      {...(currentParentSession !== null
-        ? { sendBlocked: 'This subagent conversation is driven by its parent and cannot receive messages directly. Open the parent to reply.' }
-        : {})}
       modelValue={modelValue}
       controlsUnavailable={sessionControlsUnavailable || defaultControlsUnavailable || sessionControlsPending || defaultControlsPending}
       {...(sessionControlsUnavailable || defaultControlsUnavailable || sessionControlsPending || defaultControlsPending ? { controlsUnavailableMessage: sessionControlsMessage } : {})}

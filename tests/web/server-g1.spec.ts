@@ -7,12 +7,12 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebEnvelope, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type WebEnvelope, type WebServer } from 'dnt-harness'
 
 let root = ''
 
 beforeAll(async () => {
-  root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g1-web-'))
+  root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g1-web-'))
 })
 
 afterAll(async () => {

@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { McpConfigStore, MIGRATION_STEPS, applyMigration, assertBinaryCanOpen, dryRunMigration, planMigration, recoverMigrations, THIS_BINARY } from 'mini-dsh'
+import { McpConfigStore, MIGRATION_STEPS, applyMigration, assertBinaryCanOpen, dryRunMigration, planMigration, recoverMigrations, THIS_BINARY } from 'dnt-harness'
 
 describe('mcp config migration', () => {
   it('quarantines omitted enabled and classifies legacy oauth as an external token', async () => {
@@ -20,7 +20,7 @@ describe('mcp config migration', () => {
     expect(plan.config.servers.implied?.enabled).toBe(false)
     expect(plan.config.servers.old?.auth?.type).toBe('external_token')
 
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-migrate-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-migrate-'))
     try {
       const dir = path.join(home, 'workspaces', 'ws')
       await fs.mkdir(dir, { recursive: true })
@@ -47,7 +47,7 @@ describe('interrupted migration recovery', () => {
   // Every durable boundary before commit; the host "dies" right after each.
   for (const crashAfter of MIGRATION_STEPS.filter((step) => step !== 'migration_committed')) {
     it(`a crash after '${crashAfter}' recovers to a readable config and never leaves an old binary able to open v2`, async () => {
-      const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-migrate-crash-'))
+      const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-migrate-crash-'))
       try {
         const target = path.join(home, 'workspaces', 'ws', 'mcp.json')
         await fs.mkdir(path.dirname(target), { recursive: true })
@@ -78,7 +78,7 @@ describe('interrupted migration recovery', () => {
   }
 
   it('refuses to restore a backup whose checksum no longer matches', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-migrate-tamper-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-migrate-tamper-'))
     try {
       const target = path.join(home, 'workspaces', 'ws', 'mcp.json')
       await fs.mkdir(path.dirname(target), { recursive: true })
@@ -98,7 +98,7 @@ describe('interrupted migration recovery', () => {
   it('keeps a checksummed backup and a dry-run that does not write', async () => {
     const v2 = JSON.stringify({ version: 2, revision: 1, servers: { kept: { transport: 'stdio', command: 'node', enabled: false } } })
     const v1 = JSON.stringify({ version: 1, servers: { kept: { transport: 'stdio', command: 'node', enabled: false } } })
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-migrate-v2-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-migrate-v2-'))
     try {
       // Already v2: nothing to migrate, so nothing is written or backed up.
       const first = await applyMigration(home, 'ws', v2)

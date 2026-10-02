@@ -1,13 +1,13 @@
 /**
- * Cordis tutorial chapter 3 — Services, reproduced on the mini-dsh kernel:
+ * Cordis tutorial chapter 3 — Services, reproduced on the dnt-harness kernel:
  * a plugin provides a named capability, consumers depend on it through
  * `inject`, load order is irrelevant, missing providers pend silently, and
  * dependents restart when a required service disappears and returns.
  */
 import { describe, expect, it, vi } from 'vitest'
-import { Kernel, Service, type Context } from 'mini-dsh'
+import { Kernel, Service, type Context } from 'dnt-harness'
 
-declare module 'mini-dsh' {
+declare module 'dnt-harness' {
   interface Context {
     greeter: GreeterService
   }

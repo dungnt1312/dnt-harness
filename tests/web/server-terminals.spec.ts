@@ -9,7 +9,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createWebServer, type WebServer } from 'mini-dsh'
+import { createWebServer, type WebServer } from 'dnt-harness'
 import {
   TerminalError,
   type PtyHandle,
@@ -64,7 +64,7 @@ const fakeSpawner: PtySpawner = {
 
 async function start(extra: Partial<Parameters<typeof createWebServer>[0]> = {}): Promise<string> {
   spawned.length = 0
-  root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-terminals-'))
+  root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-terminals-'))
   // `defaultCwd` is only known once the temp root exists, so terminal options
   // are merged rather than replaced by a caller's override.
   const { terminals: terminalOverride, ...rest } = extra

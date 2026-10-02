@@ -2,14 +2,14 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type WebServer } from 'mini-dsh'
+import { createWebServer, type WebServer } from 'dnt-harness'
 import { DEFAULT_CONFIG } from '../../src/harness/guard/defaults.ts'
 
 let home = ''
 const servers: WebServer[] = []
 
 beforeAll(async () => {
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-guard-web-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-guard-web-'))
 })
 
 afterAll(async () => {
@@ -18,7 +18,7 @@ afterAll(async () => {
 })
 
 async function start(): Promise<WebServer> {
-  const h = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-guard-home-'))
+  const h = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-guard-home-'))
   const server = await createWebServer({ home: h, providers: [], configFile: path.join(h, 'providers.json') })
   servers.push(server)
   return server

@@ -13,7 +13,7 @@ afterEach(async () => {
   host?.remove()
   root = undefined
   host = undefined
-  document.title = 'mini-dsh'
+  document.title = 'dnt-harness'
 })
 
 it('tracks the opened profile and its renamed title, falling back while none is selected', async () => {
@@ -25,7 +25,7 @@ it('tracks the opened profile and its renamed title, falling back while none is 
   }
 
   await render(undefined)
-  expect(document.title).toBe('mini-dsh')
+  expect(document.title).toBe('dnt-harness')
   await render('Personal')
   expect(document.title).toBe('Personal')
   await render('Work')
@@ -33,5 +33,5 @@ it('tracks the opened profile and its renamed title, falling back while none is 
   await render('Renamed Work')
   expect(document.title).toBe('Renamed Work')
   await render(undefined)
-  expect(document.title).toBe('mini-dsh')
+  expect(document.title).toBe('dnt-harness')
 })

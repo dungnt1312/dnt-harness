@@ -55,7 +55,7 @@ async function fixture(page: Page, options: Options = {}): Promise<{ readonly po
   const json = (route: Route, value: unknown, status = 200) => route.fulfill({ status, json: value })
 
   await page.addInitScript(({ snapshot, theme }) => {
-    if (theme !== undefined) window.localStorage.setItem('mini-dsh.theme', theme)
+    if (theme !== undefined) window.localStorage.setItem('dnt-harness.theme', theme)
     class FixtureEventSource {
       readyState = 0
       onopen: ((event: Event) => void) | null = null
@@ -325,7 +325,7 @@ test('appearance menu switches between light and dark themes and persists', asyn
   await page.getByRole('button', { name: 'Preferences' }).click()
   await page.getByRole('menuitemradio', { name: 'Dark' }).click()
   await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
-  await expect.poll(() => page.evaluate(() => localStorage.getItem('mini-dsh.theme'))).toBe('dark')
+  await expect.poll(() => page.evaluate(() => localStorage.getItem('dnt-harness.theme'))).toBe('dark')
   await expect.poll(() => page.evaluate(() => getComputedStyle(document.body).backgroundColor)).toBe('rgb(33, 33, 33)')
 })
 

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Turn the mini-dsh web client into a complete product-grade UX/UI (editor-dark Zed style) with stop/delete/rename/thinking support on the backend, keeping the stateless render-from-event-stream architecture.
+**Goal:** Turn the dnt-harness web client into a complete product-grade UX/UI (editor-dark Zed style) with stop/delete/rename/thinking support on the backend, keeping the stateless render-from-event-stream architecture.
 
 **Architecture:** Backend first (event vocabulary + stop + REST changes, all covered by existing/new tests), then a full client rewrite under `web/` (components/hooks/lib split), then polish (highlight.js, toasts, hotkeys, mobile drawer), then verify + docs.
 
@@ -63,7 +63,7 @@
 
 **Files:**
 - Modify: `web/types.ts`, `web/lib/project.ts` (from `web/project.ts`)
-- Test: `npm run typecheck` + `npx vitest run` (server tests import mini-dsh types only)
+- Test: `npm run typecheck` + `npx vitest run` (server tests import dnt-harness types only)
 
 - [ ] Step 1: `SseEvent` — `thinking?: boolean` on chunk-shaped events; `SessionListing` unchanged.
 - [ ] Step 2: `project.ts` — ViewItem assistant gains `thinkingLines: string[]` + `thinkingLive: boolean`; tool item `doneAt?: number`; export `isTurnRunning(events)` (open turn/start without turn/end).

@@ -16,7 +16,7 @@ let home = ''
 let store: AttachmentStore
 
 beforeAll(async () => {
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-attachments-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-attachments-'))
   store = new AttachmentStore(home, { maxBytes: 1024 })
 })
 

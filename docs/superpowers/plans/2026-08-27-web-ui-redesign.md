@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Rebuild the mini-dsh React client into the approved 3-zone workspace shell (TopBar / grouped Sidebar / Chat + control-center Composer / Environment panel) on a reusable `web/components/ui/` primitive kit, Sharp preset, with zero backend changes.
+**Goal:** Rebuild the dnt-harness React client into the approved 3-zone workspace shell (TopBar / grouped Sidebar / Chat + control-center Composer / Environment panel) on a reusable `web/components/ui/` primitive kit, Sharp preset, with zero backend changes.
 
 **Architecture:** Bottom-up migration that keeps the app green at every commit: tokens first, then primitives (unused), then the shell swap, then the chat surface restyle, then cleanup. The client stays stateless — transcript still renders from `projectItems(events)`; only presentational code changes.
 
@@ -79,7 +79,7 @@ Legacy variable names (`--bg`, `--bg-elevated`, …) are **kept but re-valued**,
 
 ```css
 /* ────────────────────────────────────────────────────────────────
-   mini-dsh web — "Sharp" workspace theme (VS Code spirit)
+   dnt-harness web — "Sharp" workspace theme (VS Code spirit)
    Three surface levels, hairline borders, restrained accent.
    ──────────────────────────────────────────────────────────────── */
 
@@ -667,7 +667,7 @@ import { Select } from './Select.tsx'
 
 describe('chip / text-input / select structure', () => {
   it('Chip is a span unless interactive; caret adds nothing when static', () => {
-    const html = renderToStaticMarkup(<Chip>mini-dsh</Chip>)
+    const html = renderToStaticMarkup(<Chip>dnt-harness</Chip>)
     expect(html).toContain('<span')
     expect(html).not.toContain('<button')
     const btn = renderToStaticMarkup(
@@ -1111,7 +1111,7 @@ import { pathBasename, toolTarget } from '../../web/lib/format.ts'
 
 describe('pathBasename', () => {
   it('returns the last segment for win/unix paths', () => {
-    expect(pathBasename('C:\\workspace\\mini-dsh')).toBe('mini-dsh')
+    expect(pathBasename('C:\\workspace\\dnt-harness')).toBe('dnt-harness')
     expect(pathBasename('/home/dev/project')).toBe('project')
     expect(pathBasename('plain')).toBe('plain')
     expect(pathBasename('')).toBe('')

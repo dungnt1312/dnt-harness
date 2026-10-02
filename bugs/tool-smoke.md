@@ -139,8 +139,8 @@ Tool descriptions say Read/Write stay inside the workspace or a granted folder.
 ### Actual
 
 - `Read` of `C:\Windows\win.ini` returned the host file body.
-- A sequential test created `../mini-dsh-outside-smoke.txt`; `Read` returned `outside`.
-- `Write ../mini-dsh-outside-write.txt` returned `created ../mini-dsh-outside-write.txt`. The file was created beside the workspace.
+- A sequential test created `../dnt-harness-outside-smoke.txt`; `Read` returned `outside`.
+- `Write ../dnt-harness-outside-write.txt` returned `created ../dnt-harness-outside-write.txt`. The file was created beside the workspace.
 - These locations were not explicitly granted in this session.
 
 ### Correction from the first pass

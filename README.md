@@ -1,4 +1,4 @@
-# mini-dsh
+# dnt-harness
 
 A miniature TypeScript replica of the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) architecture, built for learning: the same plugin-runtime ideas — everything is a plugin, typed events with five dispatch modes, reversible effects, dependency-driven lifecycle — reimplemented from scratch on a kernel small enough to read in an afternoon.
 
@@ -21,7 +21,7 @@ Full docs live in [`docs/`](docs/README.md):
 - **Phase 2 (done)** — agent core: durable session log (event sourcing, `deriveMessages()`, fork), LLM streaming seam (`agent/request` + `llm/stream` waterfalls, mock + DeepSeek SSE providers), and the turn/step driver (inbox with `send`/`inject`, `agent/pre-step`, `agent/turn-stopping`). Headless CLI chats multi-turn.
 - **Phase 3 (done)** — tool pipeline: `ToolsService` with the guarded `tools/pre-execute` → execute → `tools/post-execute` path, approval policy (allow/ask/deny riding pre-execute), and the canonical built-in tools `Read`/`Write`/`Edit`/`Glob`/`Grep`/`Bash` (legacy lowercase names normalize at the boundary). The loop spends another step while tools owe the model their results, with no turn deadline or step budget — the model decides when the turn ends, unless the user stops it. Verified end-to-end against the real DeepSeek API.
 - **Phase 4 (done)** — web UI: `createWebServer` (REST + SSE) with the React client (`web/`, built by Vite). The client renders purely from the session event stream — snapshot replay plus live `session/event` frames — and approval questions ride the same stream, answered over `POST /api/approvals/:id`; routing to the right session goes through the ambient agent scope (`AsyncLocalStorage`), so concurrent sessions share one policy listener without cross-talk. A failed step closes its turn durably (`turn/end: failed`). The UI is product-grade: collapsible thinking panel, expandable tool cards, session rename/delete/search, a stop button (`turn/end: stopped`), syntax-highlighted code blocks, toasts, and a mobile drawer. 105 tests cover kernel, harness, capabilities, and the web API.
-- **Phase 5 — G1 reliable harness (done)**: file-first durable storage (`events.jsonl` canonical + rebuildable `summary.json`), restart recovery (interrupted turns, unknown-outcome records, invalidated approvals), durable input queue with `clientRequestId` dedup, stop/cancellation propagation with truthful `cancelled` turns, provider-inactivity watchdogs, expiry-bound approvals recorded as durable events, and the six built-in tools with granted-root containment, observed-state conflict detection, and a real-Bash adapter (Git Bash on Windows, actionable disable when absent). Session data lives under `--data-dir` (default `~/.mini-dsh/data` for the web host). Tool containment is application-level — not an OS sandbox, and Bash is not path-confined.
+- **Phase 5 — G1 reliable harness (done)**: file-first durable storage (`events.jsonl` canonical + rebuildable `summary.json`), restart recovery (interrupted turns, unknown-outcome records, invalidated approvals), durable input queue with `clientRequestId` dedup, stop/cancellation propagation with truthful `cancelled` turns, provider-inactivity watchdogs, expiry-bound approvals recorded as durable events, and the six built-in tools with granted-root containment, observed-state conflict detection, and a real-Bash adapter (Git Bash on Windows, actionable disable when absent). Session data lives under `--data-dir` (default `~/.dnt-harness/data` for the web host). Tool containment is application-level — not an OS sandbox, and Bash is not path-confined.
 - **Phase 6 — G2 workspaces & isolation (done)**: Work/Life-style environments with strict ownership at the service boundary — sessions are born into one workspace (routes under `/api/workspaces/:wid/...`; foreign ids are 404, never a leak), project binding (`project.json`) drives the file-tool grant so a session without a project has no filesystem access, overlapping/nested project roots are rejected across workspaces, and one app-local writer lease serializes write-capable executions per project folder. Permission remains workspace-scoped, while provider configuration and the default model/thinking selection are **global** (durable, shared by every workspace): each new session snapshots that global default and then resolves its controls independently at each model request. Session `provider: null, model: null` is an explicit non-sendable blank, while `thinkingLevel: null` selects the model default; only legacy sessions with no `session/model` event inherit the live global default. The web client gets a workspace switcher with activity/approval badges and project binding for new sessions. Isolation is application-level only — shell and trusted code run with host privileges, and this is stated in the UI/docs rather than claimed away.
 - **Phase 7 — G3 modes, context, skills, memory (done)**: five bundled modes (Chat, Ask before changes, Edit automatically, Plan, Full access) plus workspace-owned custom Markdown modes; the third live control (mode) gates tool exposure as a hard ceiling at the next tool start and reassembles context at the next request, with pending approvals re-evaluated (newly unexposed calls cancel). One mode-driven context builder assembles every request with a truthful per-request manifest (mode/model revisions, source hashes, budget, omissions); budget = window − output reserve − margin with explicit trim order (skills → memory → oldest completed turns) and loud failure. `history: none/recent/compact`, manual compaction at completed boundaries into immutable checkpoints. Skills (on-demand `Skill` tool, hash-pinned, Turn-local) and memory (Markdown entries, five scoped tools, keyword search, conflict detection) live per workspace.
 - **Phase 8 — G4 agents & compatibility (done)**: workspace-owned agent definitions (`agents/*.md`, bundled read-only Explorer/Worker, copy-to-customize, strict validation + hashes), one-level delegation through the SAME G1 loop and G3 builder (task packets, isolated child sessions, 3 active / 8 spawned per turn, unbounded child turns), child tool ceiling = mode exposure ∩ definition ∩ spawn grant enforced at every gate (no escalation via mode switches), internal spawn/list/wait/cancel lifecycle over HTTP, root Stop cancels descendants, durable spawn intent in child logs, Claude sub-agent import (supported subset + blocking-field reports, never executes imports) and a version-pinned Codex adapter that reports unsupported semantics.
@@ -59,6 +59,15 @@ Optional: `DEEPSEEK_BASE_URL` (defaults to the public API). Never commit the key
 ```sh
 echo 'DEEPSEEK_API_KEY=sk-...' > .env
 ```
+
+### Renamed from mini-dsh
+
+The project was called **mini-dsh**. Existing installs keep working without changes:
+
+- **Data home**: `~/.dnt-harness/` is used once it exists; until then the old `~/.mini-dsh/` (sessions, `providers.json`, secrets) is used as-is. To adopt the new name, stop the server and rename the folder: `mv ~/.mini-dsh ~/.dnt-harness`.
+- **Environment**: every `MINI_DSH_*` variable is still honoured as its `DNT_HARNESS_*` equivalent (`DNT_HARNESS_AUTH`, `DNT_HARNESS_BASH`, `DNT_HARNESS_CHILD_PASS_ENV`, …); an explicitly set new name wins.
+- **Browser state**: drafts, theme and workbench tabs stored under `mini-dsh.*` are copied to `dnt-harness.*` on first load.
+- **PM2**: the process is now `dnt-harness` — `pm2 delete mini-dsh && pm2 start ecosystem.config.cjs`.
 
 ## Chat
 
@@ -105,14 +114,14 @@ src/kernel/
 
 ### Concepts (mapped to DeepSeek Harness)
 
-| mini-dsh | DeepSeek Harness / Cordis |
+| dnt-harness | DeepSeek Harness / Cordis |
 |---|---|
 | `Kernel` | Cordis app + Loader assembly |
 | `Context` proxy over `ServiceStore` | `Context` + `ReflectService` |
 | `Fiber` (`pending → loading → active → unloading → disposed`, `failed`) | `Fiber` state machine |
 | `ctx.effect(() => disposer)` | `ctx.effect()` — registrations are effects |
 | `inject: string[]` + pending wake | service dependencies, not load order |
-| `declare module 'mini-dsh'` merging on `Events`/`Context` | declaration merging on Cordis interfaces |
+| `declare module 'dnt-harness'` merging on `Events`/`Context` | declaration merging on Cordis interfaces |
 | `bootFromFile(kernel, 'cordis.yml')` | profile/bundle composition (simplified) |
 
 ### Dispatch modes

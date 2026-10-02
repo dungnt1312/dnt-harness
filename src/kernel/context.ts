@@ -150,7 +150,7 @@ export class Context {
  * Service properties, merged by plugins through declaration merging:
  *
  * ```ts
- * declare module 'mini-dsh' {
+ * declare module 'dnt-harness' {
  *   interface Context {
  *     greeter: GreeterService
  *   }

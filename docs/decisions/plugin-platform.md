@@ -5,7 +5,7 @@ Scope: the in-process plugin platform. It freezes the loading path, the namespac
 
 ## Two tiers of extension
 
-mini-dsh already has two out-of-process extension tiers, both in production shape and unchanged by this spec:
+dnt-harness already has two out-of-process extension tiers, both in production shape and unchanged by this spec:
 
 - **MCP servers** are external tool plugins: their tools enter the same registry, the same guarded pipeline, and the same approval gates as built-ins (`docs/decisions/mcp-production-boundaries.md`).
 - **Hooks** are external lifecycle scripts with blocking decisions (`src/harness/hooks/runner.ts`).

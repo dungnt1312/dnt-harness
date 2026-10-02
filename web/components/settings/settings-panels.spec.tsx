@@ -207,7 +207,7 @@ describe('agents panel', () => {
     expect(importAgentDefinition).toHaveBeenCalledTimes(1)
     const [workspace, name, payload] = vi.mocked(importAgentDefinition).mock.calls[0]!
     expect([workspace, name]).toEqual(['ws', 'auditor'])
-    expect(payload.dialect).toBe('mini-dsh')
+    expect(payload.dialect).toBe('dnt-harness')
     expect(payload.content).toContain('name: "auditor"')
     expect(payload.content).toContain('tools: ["Read","Grep"]')
     expect(payload.content).toContain('Review carefully.')

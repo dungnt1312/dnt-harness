@@ -88,7 +88,7 @@ Each phase must typecheck and keep its targeted suite green before the next star
 ## Outcome notes (2026-09-21)
 
 - Delivered as planned. `npm test` 708/708, `npm run typecheck`, `npm run build:web`,
-  `npm run test:browser` 68/68 all green; pm2 `mini-dsh` restarted and verified live:
+  `npm run test:browser` 68/68 all green; pm2 `dnt-harness` restarted and verified live:
   a child spawned with `model: "viber:claude-sonnet-5"` reported exactly that pair and
   kept it through cancellation, on a host whose default provider is a different one.
 - **Behaviour changes a maintainer could mistake for regressions.** A child now
@@ -131,5 +131,5 @@ Each phase must typecheck and keep its targeted suite green before the next star
 - A child calling `Agent` is denied; Chat exposes no `Agent`; a child in Plan cannot write.
 - Stop during `wait` returns immediately and cancels the children.
 - The Workbench panel shows children the model spawned, with their model, without a reload.
-- `npm test`, `npm run typecheck`, `npm run build:web` exit 0; pm2 `mini-dsh` restarted and
+- `npm test`, `npm run typecheck`, `npm run build:web` exit 0; pm2 `dnt-harness` restarted and
   verified live.

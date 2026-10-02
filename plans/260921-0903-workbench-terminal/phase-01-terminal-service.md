@@ -6,7 +6,7 @@ spawn, stream, resize, cap and reap PTY sessions.
 ## Context
 
 `src/capabilities/shell/bash.ts:43` holds a private `detectBash()` that resolves Git Bash
-on Windows (explicit option → `MINI_DSH_BASH` → known install paths → `where git`
+on Windows (explicit option → `DNT_HARNESS_BASH` → known install paths → `where git`
 fallback, deliberately skipping WSL launchers). The terminal needs the same resolution
 plus two more shells. Duplicating it would let the agent's shell and the user's shell
 drift apart on exactly the machines where detection is hardest.

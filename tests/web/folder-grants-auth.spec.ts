@@ -9,7 +9,7 @@ import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createWebServer, type WebServer } from 'mini-dsh'
+import { createWebServer, type WebServer } from 'dnt-harness'
 
 let server: WebServer | undefined
 let base = ''
@@ -45,7 +45,7 @@ function raw(url: string, method: string, pathname: string, headers: Record<stri
 
 describe('folder grants under control-plane auth', () => {
   it('only the paired browser can change session or project folder grants', async () => {
-    base = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-grants-auth-')))
+    base = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-grants-auth-')))
     const home = path.join(base, 'home')
     const primary = path.join(base, 'primary')
     const shared = path.join(base, 'shared')
@@ -57,7 +57,7 @@ describe('folder grants under control-plane auth', () => {
     const browser = {
       cookie: String(paired.headers['set-cookie']).split(';')[0] ?? '',
       origin: live.auth.canonicalOrigin,
-      'x-mini-dsh-csrf': (JSON.parse(paired.body) as { csrf: string }).csrf,
+      'x-dnt-harness-csrf': (JSON.parse(paired.body) as { csrf: string }).csrf,
     }
     const bearer = { authorization: `Bearer ${live.auth.issueBearer(['sessions']).token}` }
 

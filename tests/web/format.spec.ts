@@ -3,7 +3,7 @@ import { pathBasename, shortCommand, shortPath, toolTarget } from '../../web/lib
 
 describe('pathBasename', () => {
   it('returns the last segment for win/unix paths', () => {
-    expect(pathBasename('C:\\workspace\\mini-dsh')).toBe('mini-dsh')
+    expect(pathBasename('C:\\workspace\\dnt-harness')).toBe('dnt-harness')
     expect(pathBasename('/home/dev/project')).toBe('project')
     expect(pathBasename('plain')).toBe('plain')
     expect(pathBasename('')).toBe('')

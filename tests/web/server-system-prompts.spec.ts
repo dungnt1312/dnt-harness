@@ -9,14 +9,14 @@ import { tmpdir } from 'node:os'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, DEFAULT_BASE_SYSTEM, DEFAULT_CHILD_SYSTEM, type LlmProvider, type WebServer } from 'mini-dsh'
+import { createWebServer, DEFAULT_BASE_SYSTEM, DEFAULT_CHILD_SYSTEM, type LlmProvider, type WebServer } from 'dnt-harness'
 
 let root = ''
 const servers: WebServer[] = []
 const serverHomes = new WeakMap<WebServer, string>()
 
 beforeAll(async () => {
-  root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-prompts-web-'))
+  root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-prompts-web-'))
 })
 
 afterAll(async () => {
@@ -25,7 +25,7 @@ afterAll(async () => {
 })
 
 async function start(providers: readonly LlmProvider[]): Promise<WebServer> {
-  const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-prompts-home-'))
+  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-prompts-home-'))
   const server = await createWebServer({ home, providers, configFile: path.join(home, 'p.json') })
   servers.push(server)
   serverHomes.set(server, home)

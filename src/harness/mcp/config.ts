@@ -627,14 +627,14 @@ interface WindowsAcl {
 /** The file's ACL as SIDs, plus the current user's SID. The path travels in the environment, never in the script. */
 async function readWindowsAcl(file: string): Promise<WindowsAcl> {
   const script = [
-    '$acl = Get-Acl -LiteralPath $env:MINI_DSH_ACL_TARGET',
+    '$acl = Get-Acl -LiteralPath $env:DNT_HARNESS_ACL_TARGET',
     '"ME|" + [Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
     '"PROTECTED|" + $acl.AreAccessRulesProtected',
     'foreach ($rule in $acl.Access) { "ACE|" + $rule.AccessControlType + "|" + $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }',
   ].join('; ')
   const stdout = await new Promise<string>((resolve, reject) => {
     execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-      encoding: 'utf8', timeout: 15_000, windowsHide: true, env: { ...process.env, MINI_DSH_ACL_TARGET: file },
+      encoding: 'utf8', timeout: 15_000, windowsHide: true, env: { ...process.env, DNT_HARNESS_ACL_TARGET: file },
     }, (error, out) => (error === null ? resolve(out) : reject(new McpConfigError('invalid', 'cannot verify Windows ACL on secrets.master.key'))))
   })
   let currentUser = ''

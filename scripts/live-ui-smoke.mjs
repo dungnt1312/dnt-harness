@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
- * Read-only UI smoke test against a running mini-dsh host.
+ * Read-only UI smoke test against a running dnt-harness host.
  * It never sends a model message or changes workspace/session settings.
  *
  * Usage: npm run test:live-ui
- * Optional: MINI_DSH_LIVE_URL=http://127.0.0.1:3082 npm run test:live-ui
+ * Optional: DNT_HARNESS_LIVE_URL=http://127.0.0.1:3082 npm run test:live-ui
  */
 import { chromium } from 'playwright'
 
-const base = (process.env.MINI_DSH_LIVE_URL ?? 'http://127.0.0.1:3082').replace(/\/$/, '')
+const base = (process.env.DNT_HARNESS_LIVE_URL ?? 'http://127.0.0.1:3082').replace(/\/$/, '')
 const fail = (message) => { throw new Error(message) }
 const waitFor = async (predicate, timeout = 5_000, step = 50) => {
   const deadline = Date.now() + timeout

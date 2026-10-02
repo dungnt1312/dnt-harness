@@ -6,13 +6,13 @@ Reference: dntspace-app `src/components/chat/EnvironmentPanel.tsx`
 
 ## Problem
 
-mini-dsh's workbench dock (Git, Subagents, Trajectory, Files, Context, Terminal) is
+dnt-harness's workbench dock (Git, Subagents, Trajectory, Files, Context, Terminal) is
 opened on demand — nothing in the chat column gives an always-visible glance of the
 session's environment. dntspace-app solves this with a pinned Environment panel
 (git summary, tasks, background processes, subagents, session media) that collapses
-to summary chips. mini-dsh adopts that concept for what its harness actually has.
+to summary chips. dnt-harness adopts that concept for what its harness actually has.
 
-Additionally, mini-dsh's Bash tool is synchronous only: a long-running command blocks
+Additionally, dnt-harness's Bash tool is synchronous only: a long-running command blocks
 the whole turn and there is no way to watch or kill it afterwards. The panel needs
 real background processes to be truthful, so the backend ships in the same effort.
 
@@ -21,7 +21,7 @@ real background processes to be truthful, so the backend ships in the same effor
 1. **Concept**: env summary panel in the dntspace style — NOT an environment-variable editor.
 2. **Placement**: pinned inside the chat column, above the transcript. Not a workbench tab.
 3. **Sections v1**: Git, Subagents, Background processes. (dntspace's Tasks and Session
-   media have no mini-dsh data source — no plan tool, no media folders.)
+   media have no dnt-harness data source — no plan tool, no media folders.)
 4. **Background source**: real agent-run background commands — Bash gains
    `run_in_background`, a host-owned ProcessRegistry tracks children, and two new
    Claude-first tools (`BashOutput`, `KillShell`) let the model read output and kill.

@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterAll, describe, expect, it } from 'vitest'
-import { createWebServer, messageText, type LlmProvider, type WebServer } from 'mini-dsh'
+import { createWebServer, messageText, type LlmProvider, type WebServer } from 'dnt-harness'
 
 const mcpFixture = fileURLToPath(new URL('../fixtures/mcp-stdio-server.mjs', import.meta.url))
 const hookFixture = fileURLToPath(new URL('../fixtures/hook-command.mjs', import.meta.url))
@@ -41,7 +41,7 @@ function putZeroMode(base: string, wsId: string): Promise<Response> {
 }
 
 async function boot(provider: LlmProvider, extra?: Partial<Parameters<typeof createWebServer>[0]>) {
-  const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g5-web-'))
+  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g5-web-'))
   const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'providers.json'), ...extra })
   servers.push(server)
   const wsId = ((await (await fetch(`${server.url}/api/workspaces`)).json()) as { id: string }[])[0]!.id

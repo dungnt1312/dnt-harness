@@ -6,7 +6,7 @@ Reference: Claude Code `TodoWrite` tool description and [todo tracking docs](htt
 
 ## Problem
 
-mini-dsh has no way for the model to maintain a visible task list while working
+dnt-harness has no way for the model to maintain a visible task list while working
 through multi-step requests. Claude Code keeps a written todo list the user can
 watch update in real time; the model uses it to plan complex work and stay on
 track. The EnvironmentPanel spec (2026-10-01) listed "plan/task section" as an

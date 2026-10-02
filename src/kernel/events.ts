@@ -6,7 +6,7 @@
  * against the package entry, then dispatch and listen fully typed:
  *
  * ```ts
- * declare module 'mini-dsh' {
+ * declare module 'dnt-harness' {
  *   interface Events {
  *     'stats/report'(name: string, count: number): void
  *   }

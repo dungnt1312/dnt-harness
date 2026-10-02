@@ -7,10 +7,10 @@
  *
  * Removed:
  *  - names a bin registered as harness-owned (keys loaded from the repo `.env`);
- *  - `MINI_DSH_*` host configuration;
+ *  - `DNT_HARNESS_*` host configuration;
  *  - names that look like credentials (`*_API_KEY`, `*_TOKEN`, `*_SECRET`, …).
  *
- * `MINI_DSH_CHILD_PASS_ENV=NAME1,NAME2` lets an operator pass named variables
+ * `DNT_HARNESS_CHILD_PASS_ENV=NAME1,NAME2` lets an operator pass named variables
  * through on purpose (e.g. `GH_TOKEN` for the `gh` CLI).
  */
 
@@ -24,7 +24,7 @@ export function markHarnessSecretEnv(names: Iterable<string>): void {
 }
 
 function passList(env: NodeJS.ProcessEnv): Set<string> {
-  const raw = env['MINI_DSH_CHILD_PASS_ENV'] ?? ''
+  const raw = env['DNT_HARNESS_CHILD_PASS_ENV'] ?? env['MINI_DSH_CHILD_PASS_ENV'] ?? ''
   return new Set(raw.split(',').map((name) => name.trim().toUpperCase()).filter((name) => name !== ''))
 }
 
@@ -33,7 +33,8 @@ export function isWithheldEnv(name: string, pass: ReadonlySet<string> = new Set(
   const upper = name.toUpperCase()
   if (pass.has(upper)) return false
   if (harnessOwned.has(upper)) return true
-  if (upper.startsWith('MINI_DSH_')) return true
+  // Host configuration, under the current and the pre-rename prefix.
+  if (upper.startsWith('DNT_HARNESS_') || upper.startsWith('MINI_DSH_')) return true
   return SECRET_NAME.test(upper)
 }
 

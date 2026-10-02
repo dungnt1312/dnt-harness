@@ -8,7 +8,7 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 
-export const OPERATOR_HEADER = 'x-mini-dsh-operator'
+export const OPERATOR_HEADER = 'x-dnt-harness-operator'
 
 export interface OperatorChannel {
   readonly url: string

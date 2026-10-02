@@ -50,7 +50,7 @@ Rollback means deploy a known-safe compatibility build or disable new features w
 ## Implementation Steps
 
 1. Apply the default canary contract: one explicitly selected non-critical workspace, 24 hours, at least 100 safe fixture/approved read-only calls, Phase 10 performance thresholds, zero auth bypass/replay/stale-generation dispatch/audit fault/config loss/contained-process leak, and a 30-second new-dispatch fence objective. Require the explicitly recorded `MCP_RELEASE_APPROVER` from the retained Phase 10 release manifest; do not infer authority from Git author configuration.
-2. Preflight exact mini-dsh PM2 process, one-owner topology, disk space, ACLs, backup path, config/provider data locations, safe binary/schema floor, and current build/source mtime.
+2. Preflight exact dnt-harness PM2 process, one-owner topology, disk space, ACLs, backup path, config/provider data locations, safe binary/schema floor, and current build/source mtime.
 3. Run protected dry-run and review every workspace/server action. Confirm no process/network/OAuth/token/runtime mutation occurred.
 4. Create/verify unique protected backup and migration journal, then migrate ambiguous entries disabled/quarantined and legacy OAuth as external token.
 5. Start new host, pair/authenticate, reconcile selected canary workspaces, and verify journal/status/process ownership/auth/OAuth/no-replay/secret fence/restart/shutdown.

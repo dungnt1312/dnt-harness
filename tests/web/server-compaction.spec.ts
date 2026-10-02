@@ -10,7 +10,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
 import type { ModelRequest, StreamEvent } from '../../src/harness/llm/types.ts'
 import type { HarnessLimits } from '../../src/harness/limits.ts'
 
@@ -47,7 +47,7 @@ afterAll(async () => {
 })
 
 async function start(provider: LlmProvider, limits?: Partial<HarnessLimits>): Promise<{ server: WebServer; home: string; base: string; wsId: string }> {
-  const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-compact-web-'))
+  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-compact-web-'))
   const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json'), ...(limits !== undefined ? { limits } : {}) })
   servers.push(server)
   homes.set(server, home)

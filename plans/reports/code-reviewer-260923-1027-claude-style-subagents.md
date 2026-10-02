@@ -21,7 +21,7 @@ Reviewer: code-reviewer subagent (read-only; no shell). Verdict: DONE_WITH_CONCE
 | L8 | Recovery project check only with `projectId` | Accepted: children written by this build always carry it when bound. |
 | L9 | Child agents never forgotten | Fixed: `finish()` forgets the child agent once its record is durable. |
 
-Verification after fixes: `npm run typecheck` 0 errors; `npx vitest run` 931 pass / 10 fail — the 10 (workspace-isolation ×1, session-model ×3, composer ×6) fail identically on the pre-change baseline. `npm run build:web` ok; pm2 `mini-dsh` restarted, online, bundled roles live = explorer, worker, reviewer, verifier.
+Verification after fixes: `npm run typecheck` 0 errors; `npx vitest run` 931 pass / 10 fail — the 10 (workspace-isolation ×1, session-model ×3, composer ×6) fail identically on the pre-change baseline. `npm run build:web` ok; pm2 `dnt-harness` restarted, online, bundled roles live = explorer, worker, reviewer, verifier.
 
 Unresolved:
 - 10 pre-existing unit failures and Playwright `chat-shell` setup failure (`GET /api/auth/state` missing from the fixture) belong to the auth/MCP work, not this plan.

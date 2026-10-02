@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { MemoryService } from 'mini-dsh'
+import { MemoryService } from 'dnt-harness'
 import { agentScope } from '../../src/harness/agent/scope.ts'
 import { memoryTools } from '../../src/harness/memory/tools.ts'
 import type { ProjectId, SessionId, WorkspaceId } from '../../src/util/brand.ts'
@@ -10,7 +10,7 @@ import type { ProjectId, SessionId, WorkspaceId } from '../../src/util/brand.ts'
 const homes: string[] = []
 
 async function setup(): Promise<{ home: string; memory: MemoryService }> {
-  const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-memory-tools-'))
+  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-memory-tools-'))
   homes.push(home)
   return { home, memory: new MemoryService(home) }
 }

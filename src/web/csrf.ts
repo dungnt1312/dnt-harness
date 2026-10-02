@@ -7,7 +7,7 @@
  */
 import { timingSafeEqual } from 'node:crypto'
 
-export const CSRF_HEADER = 'x-mini-dsh-csrf'
+export const CSRF_HEADER = 'x-dnt-harness-csrf'
 
 /** Compare two CSRF tokens without leaking a prefix match through timing. */
 export function csrfTokensMatch(presented: string, expected: string): boolean {

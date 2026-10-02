@@ -1,5 +1,5 @@
 ---
-title: "G1-G5 mini-dsh base"
+title: "G1-G5 dnt-harness base"
 description: "Implementation plan for the five approved design goals: reliable harness with built-in tools, workspace isolation, modes/context/skills/memory, bounded multi-agent with compatibility, and MCP + hooks production."
 status: done
 priority: P1
@@ -8,11 +8,11 @@ tags: [g1, g2, g3, g4, g5, harness, workspace, modes, agents, mcp, hooks]
 created: 2026-09-09
 ---
 
-# G1-G5 mini-dsh base
+# G1-G5 dnt-harness base
 
 ## Overview
 
-Implement the five approved design goals (G1–G5) for mini-dsh, transforming it from a single-session chat harness into a multi-workspace, mode-driven, multi-agent base with MCP integration and hooks. Each phase builds on the previous. All design decisions are locked in the approved specs under `docs/superpowers/specs/2026-09-09-g*.md`.
+Implement the five approved design goals (G1–G5) for dnt-harness, transforming it from a single-session chat harness into a multi-workspace, mode-driven, multi-agent base with MCP integration and hooks. Each phase builds on the previous. All design decisions are locked in the approved specs under `docs/superpowers/specs/2026-09-09-g*.md`.
 
 ## Goals
 
@@ -138,7 +138,7 @@ Harness
 **Trigger:** final sync-back after G1–G5 implementation.
 
 - **Delivered:** phases 1–5. File-first storage (`events.jsonl` canonical, `summary.json` rebuildable, durability barriers, torn-tail quarantine), restart recovery, three live controls (model/permission/mode), workspace isolation with project binding and writer leases, five bundled + custom modes with one context builder (budget, compaction, per-request manifest), on-demand Skill tool, five memory tools over workspace Markdown, bounded one-level delegation with Claude/Codex compatibility adapters, MCP stdio + Streamable HTTP with encrypted secrets, health/retry/circuit breaker, command hooks (PreToolUse/PostToolUse/UserPromptSubmit/SessionStart/End/PreCompact) and hashed audit events. App-level isolation only — no OS sandbox claim.
-- **Verification:** vitest 286/286 green (33 files); `tsc -p tsconfig.json` and `tsc -p tsconfig.web.json` clean; `vite build` passes. One flaky failure observed once in `tests/web/server-g3.spec.ts` (mode-gated write containment); it did not reproduce on two full reruns. Deployed via pm2: process `mini-dsh` restarted, online.
+- **Verification:** vitest 286/286 green (33 files); `tsc -p tsconfig.json` and `tsc -p tsconfig.web.json` clean; `vite build` passes. One flaky failure observed once in `tests/web/server-g3.spec.ts` (mode-gated write containment); it did not reproduce on two full reruns. Deployed via pm2: process `dnt-harness` restarted, online.
 - **Review:** multiple code-reviewer rounds; all P0/P1 blockers resolved.
 - **Deferred (explicit, tracked as unchecked items in phase files):**
   - G4: compatibility fixtures from pinned upstream samples — inline shape tests only; the spec's acknowledged evidence gate stays open.

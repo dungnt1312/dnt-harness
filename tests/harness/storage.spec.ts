@@ -16,12 +16,12 @@ import {
   fileSessions,
   type SessionEvent,
   type SessionId,
-} from 'mini-dsh'
+} from 'dnt-harness'
 
 let dataDir = ''
 
 beforeAll(async () => {
-  dataDir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-storage-'))
+  dataDir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-storage-'))
 })
 
 afterAll(async () => {
@@ -43,7 +43,7 @@ function logPath(id: string): string {
  * stay exact), or an explicit dir when the test crafted logs there.
  */
 async function service(explicitDir?: string): Promise<{ kernel: Kernel; sessions: SessionsService; dir: string }> {
-  const dir = explicitDir ?? (await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-storage-svc-')))
+  const dir = explicitDir ?? (await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-storage-svc-')))
   const kernel = new Kernel()
   kernel.ctx.plugin(fileSessions(dir))
   return { kernel, sessions: kernel.ctx.sessions, dir }
@@ -174,7 +174,7 @@ describe('file session store', () => {
   })
 
   it('a title derived from the first user message survives a restart without any rename', async () => {
-    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-title-restart-'))
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-title-restart-'))
     let sessionId = ''
     {
       const { kernel, sessions } = await service(dir)

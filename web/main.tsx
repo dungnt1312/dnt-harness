@@ -11,9 +11,13 @@ import { ToastHost } from './components/common/Toast.tsx'
 import { ErrorBoundary } from './components/common/ErrorBoundary.tsx'
 import { TooltipProvider } from './components/ui/TooltipProvider.tsx'
 import { registerServiceWorker } from './pwa/register-service-worker.ts'
+import { migrateLegacyStorage } from './lib/legacy-storage.ts'
 import './styles/app.css'
 import './styles/markdown.css'
 import './styles/motion.css'
+
+// Pre-rename `mini-dsh.*` browser state moves to `dnt-harness.*` before first read.
+try { migrateLegacyStorage(window.localStorage) } catch { /* storage may be unavailable */ }
 
 registerServiceWorker()
 

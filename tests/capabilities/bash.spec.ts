@@ -7,7 +7,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { bashTool, fsTools, Kernel, ToolsService, type ToolExecution } from 'mini-dsh'
+import { bashTool, fsTools, Kernel, ToolsService, type ToolExecution } from 'dnt-harness'
 import { sweepByTag, TREE_TAG_ENV } from '../../src/capabilities/shell/bash.ts'
 import { detectShell } from '../../src/capabilities/shell/detect.ts'
 
@@ -22,8 +22,8 @@ describe('bash tool', () => {
   })
 
   it('uses the execution root over a configured cwd, matching filesystem tools', async () => {
-    const root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-bash-root-'))
-    const fallback = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-bash-fallback-'))
+    const root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-bash-root-'))
+    const fallback = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-bash-fallback-'))
     try {
       await fs.writeFile(path.join(root, 'marker.txt'), 'project root', 'utf8')
       await fs.writeFile(path.join(fallback, 'marker.txt'), 'fallback root', 'utf8')
@@ -104,7 +104,7 @@ describe('bash tool', () => {
   it('an explicitly missing executable disables the tool with an actionable error', async () => {
     const output = await bashTool({ executable: 'Z:\\nowhere\\bash.exe' }).execute({ command: 'echo hi' }, exec)
     expect(output).toContain('bash is not available')
-    expect(output).toContain('MINI_DSH_BASH')
+    expect(output).toContain('DNT_HARNESS_BASH')
   })
 
   it('a non-string command argument fails loud', async () => {
@@ -117,7 +117,7 @@ describe('bash tool', () => {
     const fs = await import('node:fs/promises')
     const path = await import('node:path')
     const { tmpdir } = await import('node:os')
-    const root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-orphan-marker-'))
+    const root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-orphan-marker-'))
     const output = await bashTool({ timeoutMs: 300 }).execute(
       { command: '( sleep 2 && touch escaped-marker.txt ) & wait' },
       { ...exec, root },

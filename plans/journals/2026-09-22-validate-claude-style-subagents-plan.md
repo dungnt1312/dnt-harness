@@ -12,7 +12,7 @@ Validated `plans/260921-1457-claude-style-subagents/` against the current uncomm
 
 ## Decisions
 
-Eight user decisions were recorded in `plan.md`: terminal tool-free reports only; durable `brief` with legacy `objective` reads; messages-only inheritance; Agent tool + HTTP inheritance with audit metadata; direct child messages blocked; lifecycle hardening added as phase 0; writer guidance follows the current asymmetric root-turn/child-call lease boundary; and `inheritable` round-trips through native mini-dsh definitions but not the Claude adapter.
+Eight user decisions were recorded in `plan.md`: terminal tool-free reports only; durable `brief` with legacy `objective` reads; messages-only inheritance; Agent tool + HTTP inheritance with audit metadata; direct child messages blocked; lifecycle hardening added as phase 0; writer guidance follows the current asymmetric root-turn/child-call lease boundary; and `inheritable` round-trips through native dnt-harness definitions but not the Claude adapter.
 
 ## Plan changes
 
@@ -26,6 +26,6 @@ The whole-plan sweep reread all 8 plan files, checked 9 decision deltas, reconci
 
 Start implementation in a fresh context with:
 
-`/ak:cook C:/Users/DungNguyen/workspace/mini-dsh/plans/260921-1457-claude-style-subagents/plan.md`
+`/ak:cook C:/Users/DungNguyen/workspace/dnt-harness/plans/260921-1457-claude-style-subagents/plan.md`
 
 > Historical work record — not durable authority. Prefer docs/specs/ADRs for current decisions.

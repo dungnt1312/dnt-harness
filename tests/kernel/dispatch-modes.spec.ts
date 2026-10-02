@@ -3,7 +3,7 @@
  * concurrency, serial/bail first-wins, disposer and once semantics.
  */
 import { describe, expect, it } from 'vitest'
-import { EventBus } from 'mini-dsh'
+import { EventBus } from 'dnt-harness'
 
 describe('EventBus dispatch modes', () => {
   it('emit runs listeners in registration order and ignores return values', () => {

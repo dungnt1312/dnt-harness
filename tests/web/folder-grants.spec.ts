@@ -9,7 +9,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type ModelRequest, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type ModelRequest, type WebServer } from 'dnt-harness'
 
 let home = ''
 let primary = ''
@@ -78,7 +78,7 @@ async function start(): Promise<WebServer> {
 beforeEach(async () => {
   requests.length = 0
   childGate = Promise.resolve()
-  const base = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-grants-')))
+  const base = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-grants-')))
   home = path.join(base, 'home')
   primary = path.join(base, 'primary')
   shared = path.join(base, 'shared')

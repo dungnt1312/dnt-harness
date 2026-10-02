@@ -9,14 +9,14 @@
  * path when the startup code expired or a browser lost its session. The code
  * is printed once and is never passed on a command line or in a URL.
  */
-import { homedir } from 'node:os'
 import path from 'node:path'
+import { resolveAppHome } from '../harness/app-home.ts'
 import { OPERATOR_HEADER, readOperatorChannel } from '../web/operator-channel.ts'
 
 function dataDirFrom(argv: readonly string[]): string {
   const index = argv.indexOf('--data-dir')
   const explicit = index >= 0 ? argv[index + 1] : undefined
-  return explicit ?? path.join(homedir(), '.mini-dsh', 'data')
+  return explicit ?? path.join(resolveAppHome(), 'data')
 }
 
 async function main(): Promise<void> {

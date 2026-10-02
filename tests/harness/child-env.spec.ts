@@ -11,7 +11,7 @@ describe('scrubbedChildEnv', () => {
     AWS_SECRET_ACCESS_KEY: 'aws',
     AWS_SECRET: 'aws2',
     DB_PASSWORD: 'pw',
-    MINI_DSH_AUTH: '1',
+    DNT_HARNESS_AUTH: '1',
     TOKENIZERS_PARALLELISM: 'false',
     KEYBOARD: 'us',
   }
@@ -22,7 +22,7 @@ describe('scrubbedChildEnv', () => {
   })
 
   it('honours the explicit pass-through list and extra entries', () => {
-    const env = scrubbedChildEnv({ TAG: 'x' }, { ...source, MINI_DSH_CHILD_PASS_ENV: 'github_token' })
+    const env = scrubbedChildEnv({ TAG: 'x' }, { ...source, DNT_HARNESS_CHILD_PASS_ENV: 'github_token' })
     expect(env['GITHUB_TOKEN']).toBe('ghp')
     expect(env['TAG']).toBe('x')
     expect(env['DEEPSEEK_API_KEY']).toBeUndefined()

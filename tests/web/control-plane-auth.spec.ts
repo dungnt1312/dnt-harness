@@ -8,7 +8,7 @@ import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createWebServer, type WebServer } from 'mini-dsh'
+import { createWebServer, type WebServer } from 'dnt-harness'
 import { OPERATOR_HEADER, readOperatorChannel } from '../../src/web/operator-channel.ts'
 
 let server: WebServer | undefined
@@ -22,7 +22,7 @@ afterEach(async () => {
 })
 
 async function start(): Promise<WebServer> {
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-auth-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-auth-'))
   server = await createWebServer({
     home,
     configFile: path.join(home, 'providers.json'),
@@ -91,7 +91,7 @@ describe('control-plane authentication', () => {
     const missingOrigin = await raw(live.url, 'POST', '/api/workspaces', {
       cookie: sessionCookie,
       'content-type': 'application/json',
-      'x-mini-dsh-csrf': csrf,
+      'x-dnt-harness-csrf': csrf,
     }, JSON.stringify({ name: 'x' }))
     expect(missingOrigin.status).toBe(403)
 
@@ -99,7 +99,7 @@ describe('control-plane authentication', () => {
       cookie: sessionCookie,
       origin: 'http://evil.example',
       'content-type': 'application/json',
-      'x-mini-dsh-csrf': csrf,
+      'x-dnt-harness-csrf': csrf,
     }, JSON.stringify({ name: 'x' }))
     expect(foreign.status).toBe(403)
 
@@ -107,7 +107,7 @@ describe('control-plane authentication', () => {
       cookie: sessionCookie,
       origin: live.auth.canonicalOrigin,
       'content-type': 'application/json',
-      'x-mini-dsh-csrf': csrf,
+      'x-dnt-harness-csrf': csrf,
     }, JSON.stringify({ name: 'Work' }))
     expect(created.status).toBe(201)
   })
@@ -134,7 +134,7 @@ describe('control-plane authentication', () => {
     expect(JSON.parse(other.body)).toEqual({ required: true, paired: false })
 
     // An expired or revoked session cookie is cleared, so the browser can pair again.
-    const stale = await raw(live.url, 'GET', '/api/auth/state', { cookie: 'mini-dsh-session=expired-session' })
+    const stale = await raw(live.url, 'GET', '/api/auth/state', { cookie: 'dnt-harness-session=expired-session' })
     expect(JSON.parse(stale.body)).toEqual({ required: true, paired: false })
     expect(String(stale.headers['set-cookie'])).toContain('Max-Age=0')
 
@@ -189,7 +189,7 @@ describe('control-plane authentication', () => {
     const loggedOut = await raw(live.url, 'POST', '/api/auth/logout', {
       cookie: sessionCookie,
       origin: live.auth.canonicalOrigin,
-      'x-mini-dsh-csrf': csrf,
+      'x-dnt-harness-csrf': csrf,
     })
     expect(loggedOut.status).toBe(200)
 
@@ -213,7 +213,7 @@ describe('control-plane authentication', () => {
         else if (entry.name.endsWith('.ts')) {
           scanned += 1
           const text = await fs.readFile(full, 'utf8')
-          if (/\bVITEST\b|PLAYWRIGHT|NODE_ENV|MINI_DSH_TEST|testBootstrap/.test(text)) offenders.push(path.relative(root, full))
+          if (/\bVITEST\b|PLAYWRIGHT|NODE_ENV|DNT_HARNESS_TEST|testBootstrap/.test(text)) offenders.push(path.relative(root, full))
         }
       }
     }
@@ -223,7 +223,7 @@ describe('control-plane authentication', () => {
   })
 
   it('refuses a non-loopback bind because there is no authenticated TLS profile', async () => {
-    home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-auth-'))
+    home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-auth-'))
     await expect(createWebServer({
       home,
       configFile: path.join(home, 'providers.json'),
@@ -244,14 +244,14 @@ describe('control-plane authentication', () => {
       cookie: sessionCookie,
       origin: live.auth.canonicalOrigin,
       'content-type': 'application/json',
-      'x-mini-dsh-csrf': (JSON.parse(paired.body) as { csrf: string }).csrf,
+      'x-dnt-harness-csrf': (JSON.parse(paired.body) as { csrf: string }).csrf,
     }, JSON.stringify({ name: 'Work' }))
     const wsId = (JSON.parse(created.body) as { id: string }).id
     const session = await raw(live.url, 'POST', `/api/workspaces/${wsId}/sessions`, {
       cookie: sessionCookie,
       origin: live.auth.canonicalOrigin,
       'content-type': 'application/json',
-      'x-mini-dsh-csrf': (JSON.parse(paired.body) as { csrf: string }).csrf,
+      'x-dnt-harness-csrf': (JSON.parse(paired.body) as { csrf: string }).csrf,
     }, '{}')
     expect(session.status).toBe(201)
     const sessionId = (JSON.parse(session.body) as { id: string }).id

@@ -6,13 +6,13 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
 
 let root = ''
 const servers: WebServer[] = []
 
 beforeAll(async () => {
-  root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-web-'))
+  root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-web-'))
 })
 
 afterAll(async () => {
@@ -69,7 +69,7 @@ describe('G4 HTTP surface', () => {
         yield { type: 'delta', delta: 'never' }
       },
     }
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-home-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-home-'))
     const server = await createWebServer({ home, providers: [gate], configFile: path.join(home, 'p.json') })
     servers.push(server)
     const base = server.url
@@ -117,7 +117,7 @@ describe('G4 HTTP surface', () => {
       name: 'scripted', models: ['scripted'],
       async *stream() { await new Promise(() => {}); yield { type: 'delta', delta: 'never' } },
     }
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-reconcile-http-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-reconcile-http-'))
     const server = await createWebServer({ home, providers: [stall], configFile: path.join(home, 'p.json') })
     servers.push(server)
     const base = server.url
@@ -158,7 +158,7 @@ describe('G4 HTTP surface', () => {
         yield { type: 'delta', delta: 'Bash was denied; stopping without retrying.' }
       },
     }
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-ceil-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-ceil-'))
     const server = await createWebServer({ home, providers: [bash], configFile: path.join(home, 'p.json') })
     servers.push(server)
     const base = server.url
@@ -228,7 +228,7 @@ describe('G4 HTTP surface', () => {
       name: 'scripted', models: ['scripted'],
       async *stream() { await new Promise(() => {}); yield { type: 'delta', delta: 'never' } },
     }
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-depth-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-depth-'))
     const server = await createWebServer({ home, providers: [stall], configFile: path.join(home, 'p.json') })
     servers.push(server)
     const base = server.url
@@ -260,7 +260,7 @@ describe('G4 HTTP surface', () => {
       await new Promise(() => {})
       yield { type: 'delta', delta: 'never' }
     }
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-model-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-model-'))
     const server = await createWebServer({
       home,
       providers: [
@@ -364,7 +364,7 @@ describe('G4 HTTP surface', () => {
         yield { type: 'delta', delta: 'both children reported back' }
       },
     }
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-tool-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-tool-'))
     const server = await createWebServer({ home, providers: [house, far], configFile: path.join(home, 'p.json') })
     servers.push(server)
     const base = server.url
@@ -414,7 +414,7 @@ describe('G4 HTTP surface', () => {
         yield { type: 'delta', delta: 'delegation was denied; stopping' }
       },
     }
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-nodeleg-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-nodeleg-'))
     const server = await createWebServer({ home, providers: [scripted], configFile: path.join(home, 'p.json') })
     servers.push(server)
     const base = server.url
@@ -462,7 +462,7 @@ describe('G4 HTTP surface', () => {
         yield { type: 'delta', delta: 'done' }
       },
     }
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-appr-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-appr-'))
     const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json') })
     servers.push(server)
     const base = server.url
@@ -521,7 +521,7 @@ describe('G4 HTTP surface', () => {
   }, 20_000)
 
   it('Claude import over HTTP reports blocked fields and prevents activation', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-imp-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-imp-'))
     const server = await createWebServer({
       home,
       providers: [{ name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'x' } } }],

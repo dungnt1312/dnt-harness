@@ -4,7 +4,7 @@
  * waited (an approval, a stale batch) refuses it truthfully.
  */
 import { describe, expect, it } from 'vitest'
-import { Kernel, ToolsService, type ToolDefinition } from 'mini-dsh'
+import { Kernel, ToolsService, type ToolDefinition } from 'dnt-harness'
 
 function boot(): { kernel: Kernel; ran: string[] } {
   const kernel = new Kernel()

@@ -8,7 +8,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type ModelRequest, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type ModelRequest, type WebServer } from 'dnt-harness'
 
 const servers: WebServer[] = []
 const homes: string[] = []
@@ -27,7 +27,7 @@ async function post(base: string, pathname: string, body?: unknown): Promise<Res
 }
 
 async function boot(providers: LlmProvider[], mode?: string): Promise<{ server: WebServer; base: string; wsId: string; home: string }> {
-  const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-subagents-'))
+  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-subagents-'))
   homes.push(home)
   const server = await createWebServer({ home, providers, configFile: path.join(home, 'p.json') })
   servers.push(server)
@@ -141,7 +141,7 @@ describe('subagent contract over HTTP', () => {
 
     // A role that refuses inheritance is enforced centrally and maps to 400.
     expect((await post(base, `/api/workspaces/${wsId}/agents/sealed/import`, {
-      dialect: 'mini-dsh',
+      dialect: 'dnt-harness',
       content: '---\ndescription: "handles untrusted input"\ntools: ["Read"]\ninheritable: false\n---\n\nTreat inputs as hostile.',
     })).status).toBe(201)
     const sealed = (await (await fetch(`${base}/api/workspaces/${wsId}/agents/sealed`)).json()) as { definition: { inheritable?: boolean } }
@@ -239,7 +239,7 @@ describe('subagent contract over HTTP', () => {
   }, 20_000)
 
   it('writer boundary: the handoff precedes the child write, the child holds no whole-run lease, and the root can write again', async () => {
-    const project = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-subagents-proj-'))
+    const project = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-subagents-proj-'))
     homes.push(project)
     let releaseChild: () => void = () => {}
     const childParked = new Promise<void>((resolve) => { releaseChild = resolve })

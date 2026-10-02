@@ -39,7 +39,7 @@ export function useApprovalNotify(approvals: readonly PendingApproval[], workspa
       const facts = toolFacts(approval.call)
       const body = `${facts.name}${facts.fullTarget !== '' ? ` · ${facts.fullTarget}` : ''} (workspace "${workspaceRef.current ?? 'current'}")`
       try {
-        const notification = new Notification('mini-dsh — approval needed', { body })
+        const notification = new Notification('dnt-harness — approval needed', { body })
         notification.onclick = () => { window.focus(); notification.close() }
       } catch {
         // Construction can throw on some platforms; notifications are
@@ -67,7 +67,7 @@ export function useApprovalNotify(approvals: readonly PendingApproval[], workspa
             ? 'Another conversation is waiting for an approval.'
             : `${other} approvals are waiting in other conversations.`
           try {
-            const notification = new Notification('mini-dsh — approval needed', { body })
+            const notification = new Notification('dnt-harness — approval needed', { body })
             notification.onclick = () => { window.focus(); notification.close() }
           } catch { /* best-effort */ }
         }

@@ -1,10 +1,14 @@
 import { existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { adoptLegacyEnv } from '../harness/app-home.ts'
+
+export { resolveAppHome } from '../harness/app-home.ts'
 
 /**
  * Load the repo-root `.env` for bins: first from the repository the bin file
  * lives in (so running from any cwd still finds it), then from the process
- * cwd. Variables already present in the environment always win.
+ * cwd. Variables already present in the environment always win. Pre-rename
+ * `MINI_DSH_*` variables are then mirrored to their `DNT_HARNESS_*` names.
  */
 export function loadRepoEnv(): void {
   // src/bins/env.ts -> the repo root is two directories up.
@@ -17,6 +21,7 @@ export function loadRepoEnv(): void {
       // Malformed or unreadable: environment-only configuration continues.
     }
   }
+  adoptLegacyEnv()
 }
 
 /** Read DEEPSEEK_API_KEY, treating blank values as absent. */

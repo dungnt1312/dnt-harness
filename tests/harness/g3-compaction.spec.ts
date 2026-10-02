@@ -16,14 +16,14 @@ import {
   fileSessions,
   messageText,
   WorkspaceService,
-} from 'mini-dsh'
-import type { ModeDefinition, SessionEvent, SessionId, StepId, TurnId } from 'mini-dsh'
+} from 'dnt-harness'
+import type { ModeDefinition, SessionEvent, SessionId, StepId, TurnId } from 'dnt-harness'
 
 let home = ''
 let checkpoints: CheckpointStore
 
 beforeAll(async () => {
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-compact-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-compact-'))
   checkpoints = new CheckpointStore(path.join(home, 'workspaces'))
 })
 
@@ -129,7 +129,7 @@ describe('compaction', () => {
     expect(typeof end.durationMs).toBe('number')
 
     // The lifecycle never reaches the model: the projection ignores it.
-    const { deriveMessages } = await import('mini-dsh')
+    const { deriveMessages } = await import('dnt-harness')
     expect(deriveMessages(session.events)).toHaveLength(2) // user + assistant only
 
     // A failed attempt records the reason and leaves no new checkpoint.

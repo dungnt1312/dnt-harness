@@ -102,7 +102,7 @@ export function Sidebar(props: SidebarProps) {
   return (
     <nav aria-label="Conversations and projects" className="flex h-full min-h-0 w-full flex-col bg-sidebar text-fg">
       <div className="flex h-14 shrink-0 items-center justify-between px-3">
-        <span className="px-1.5 text-[15px] font-semibold tracking-tight">mini-dsh</span>
+        <span className="px-1.5 text-[15px] font-semibold tracking-tight">dnt-harness</span>
         <IconButton label="Close sidebar" size="md" onClick={onClose}><Icon name="panelLeft" size={18} /></IconButton>
       </div>
 

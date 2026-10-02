@@ -24,7 +24,7 @@ green, and the running instance serves the change.
    otherwise read as a regression.
 3. Full gates: `npm test`, `npm run typecheck`, `npm run build:web`,
    `npm run test:browser`.
-4. Rebuild and restart pm2 (`pm2 restart mini-dsh`), then verify live: spawn a child from
+4. Rebuild and restart pm2 (`pm2 restart dnt-harness`), then verify live: spawn a child from
    a real conversation with an explicit model and confirm the child card shows that model.
 
 ## Validation

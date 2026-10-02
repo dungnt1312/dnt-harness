@@ -10,7 +10,7 @@ assertions updated in 7 existing specs. Baseline from
 
 ## Evidence
 
-Session logs (`~/.mini-dsh/data`, 165 sessions): Edit failed 246 / 1018 (24%),
+Session logs (`~/.dnt-harness/data`, 165 sessions): Edit failed 246 / 1018 (24%),
 Write 11 / 107, Read 25 / 3236. 173 Edit failures were "not found":
 
 - 116 matched the last Read once `\n` → `\r\n` (CRLF file, LF `old`).

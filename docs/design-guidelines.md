@@ -2,18 +2,18 @@
 
 ## Product contract
 
-mini-dsh is an English developer chat client, not a terminal, file editor, diff viewer, or repository dashboard. Product-owned navigation, controls, errors, ARIA labels, lifecycle labels, and built-in copy are English. User and assistant text, names, identifiers, paths, commands, imported content, custom modes, and raw diagnostics stay verbatim. APIs keep the term `session`; the UI calls the durable thread a **Conversation**.
+dnt-harness is an English developer chat client, not a terminal, file editor, diff viewer, or repository dashboard. Product-owned navigation, controls, errors, ARIA labels, lifecycle labels, and built-in copy are English. User and assistant text, names, identifiers, paths, commands, imported content, custom modes, and raw diagnostics stay verbatim. APIs keep the term `session`; the UI calls the durable thread a **Conversation**.
 
 ## Visual direction
 
-The client follows a ChatGPT-style layout with a neutral palette in **light and dark** themes. Appearance is **System** by default and can be forced to Light or Dark from the sidebar Preferences menu (browser-local key `mini-dsh.theme`; a pre-paint script in `index.html` avoids a theme flash). Primary actions use the foreground color (black on light, near-white on dark); semantic ok/warn/bad colors are reserved for state. No gradients, glossy effects, copied branding, terminal chrome or decorative statistics.
+The client follows a ChatGPT-style layout with a neutral palette in **light and dark** themes. Appearance is **System** by default and can be forced to Light or Dark from the sidebar Preferences menu (browser-local key `dnt-harness.theme`; a pre-paint script in `index.html` avoids a theme flash). Primary actions use the foreground color (black on light, near-white on dark); semantic ok/warn/bad colors are reserved for state. No gradients, glossy effects, copied branding, terminal chrome or decorative statistics.
 
 UI text uses bundled Instrument Sans at 13–14px; assistant prose is 15px with a ~1.7 line height. JetBrains Mono is used for code, paths, IDs, commands and durations.
 
 ## Layout
 
-- **Sidebar (left, 280px default; 232–420px)**: brand + collapse, New conversation, conversation search, project-grouped history, and a footer with the workspace switcher, Preferences (appearance + approval notifications) and Settings. It docks at **≥768px**, supports pointer/keyboard resizing, and persists collapse + width in `mini-dsh.workbench.v1`; below that it is a modal drawer.
-- **Workbench (right, 560px default; 360–1100px)**: dock widths and collapse persist in `mini-dsh.workbench.v1`; the opened view tabs and the selected one are remembered **per conversation** under `mini-dsh.workbench.tabs.v1` (key `<workspaceId>:<sessionId>`, or `draft` before the first message).
+- **Sidebar (left, 280px default; 232–420px)**: brand + collapse, New conversation, conversation search, project-grouped history, and a footer with the workspace switcher, Preferences (appearance + approval notifications) and Settings. It docks at **≥768px**, supports pointer/keyboard resizing, and persists collapse + width in `dnt-harness.workbench.v1`; below that it is a modal drawer.
+- **Workbench (right, 560px default; 360–1100px)**: dock widths and collapse persist in `dnt-harness.workbench.v1`; the opened view tabs and the selected one are remembered **per conversation** under `dnt-harness.workbench.tabs.v1` (key `<workspaceId>:<sessionId>`, or `draft` before the first message).
 - **Main column**: a header (sidebar/new-chat buttons when the sidebar is hidden, model picker, connection state, Workbench toggle), the transcript, and the composer section. The reading column is `max-w-3xl` (768px) and the composer shares its width.
 - **Empty state**: greeting, the composer and suggestions are centered vertically; the composer's scope chip picks the project for the first message.
 - **Transcript**: one scroll container spanning the whole column. Opening a conversation lands at the latest row; new output follows only while the reader is within 80px of the bottom; otherwise a round "Jump to latest" button appears. Nothing is pinned over the transcript.

@@ -398,7 +398,7 @@ export interface AgentDefinitionRow {
     readonly skills?: readonly string[]
     readonly model?: string
     readonly maxTurns?: number
-    /** mini-dsh native: `false` refuses inherited parent context. */
+    /** dnt-harness native: `false` refuses inherited parent context. */
     readonly inheritable?: boolean
   }
   readonly source: 'bundled' | 'workspace'

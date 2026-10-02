@@ -10,12 +10,12 @@
     <link rel="manifest" href="/manifest.webmanifest" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-title" content="mini-dsh" />
-    <title>mini-dsh</title>
+    <meta name="apple-mobile-web-app-title" content="dnt-harness" />
+    <title>dnt-harness</title>
     <script>
       // Resolve the theme before first paint so dark users never see a white flash.
       try {
-        var pref = localStorage.getItem('mini-dsh.theme')
+        var pref = localStorage.getItem('dnt-harness.theme') || localStorage.getItem('mini-dsh.theme')
         var dark = pref === 'dark' || (pref !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches)
         document.documentElement.dataset.theme = dark ? 'dark' : 'light'
       } catch (e) {

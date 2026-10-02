@@ -26,7 +26,7 @@ export interface WorkbenchPreferencesV1 {
   readonly terminalHeight: number
 }
 
-export const WORKBENCH_STORAGE_KEY = 'mini-dsh.workbench.v1'
+export const WORKBENCH_STORAGE_KEY = 'dnt-harness.workbench.v1'
 
 export const WORKBENCH_DEFAULTS: WorkbenchPreferencesV1 = {
   leftWidth: 280,
@@ -64,7 +64,7 @@ export const WORKBENCH_TABS_DEFAULTS: WorkbenchSessionTabs = {
   inspectorViews: [ANCHOR_VIEW],
 }
 
-export const WORKBENCH_TABS_STORAGE_KEY = 'mini-dsh.workbench.tabs.v1'
+export const WORKBENCH_TABS_STORAGE_KEY = 'dnt-harness.workbench.tabs.v1'
 
 /** Opened tab strips keyed by `<workspaceId>:<sessionId>`, plus `draft`. */
 export type WorkbenchTabsRecord = Record<string, WorkbenchSessionTabs>

@@ -7,7 +7,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
 
 let project = ''
 let searchRoot = ''
@@ -29,9 +29,9 @@ const idle: LlmProvider = {
 }
 
 beforeAll(async () => {
-  project = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-files-project-'))
-  outside = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-files-outside-'))
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-files-home-'))
+  project = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-files-project-'))
+  outside = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-files-outside-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-files-home-'))
   await fs.mkdir(path.join(project, 'src', 'nested'), { recursive: true })
   await fs.writeFile(path.join(project, 'README.md'), '# Title\n', 'utf8')
   await fs.writeFile(path.join(project, 'src', 'index.ts'), 'export const answer = 42\n', 'utf8')
@@ -41,7 +41,7 @@ beforeAll(async () => {
 
   // A second root keeps the walk fixtures (hidden, vendored, nested) out of the
   // listing assertions above.
-  searchRoot = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-files-search-'))
+  searchRoot = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-files-search-'))
   await fs.mkdir(path.join(searchRoot, 'web', 'components'), { recursive: true })
   await fs.mkdir(path.join(searchRoot, 'node_modules', 'pkg'), { recursive: true })
   await fs.mkdir(path.join(searchRoot, '.git'), { recursive: true })
@@ -65,11 +65,11 @@ beforeAll(async () => {
   searchProjectId = await register('Search', searchRoot)
 
   const { execFileSync } = await import('node:child_process')
-  gitRoot = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-files-git-'))
+  gitRoot = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-files-git-'))
   const run = (...args: string[]) => execFileSync('git', args, { cwd: gitRoot })
   run('init', '-q')
-  run('config', 'user.email', 'test@mini-dsh')
-  run('config', 'user.name', 'mini-dsh')
+  run('config', 'user.email', 'test@dnt-harness')
+  run('config', 'user.name', 'dnt-harness')
   await fs.writeFile(path.join(gitRoot, 'README.md'), 'old\n', 'utf8')
   run('add', '.')
   run('commit', '-qm', 'init')

@@ -8,8 +8,8 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { Kernel, SessionsService, fileSessions, WorkspaceService, ScopeError } from 'mini-dsh'
-import type { ProjectId, SessionId, WorkspaceId } from 'mini-dsh'
+import { Kernel, SessionsService, fileSessions, WorkspaceService, ScopeError } from 'dnt-harness'
+import type { ProjectId, SessionId, WorkspaceId } from 'dnt-harness'
 
 let home = ''
 let dirA = ''
@@ -17,9 +17,9 @@ let dirB = ''
 let nested = ''
 
 beforeAll(async () => {
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-'))
-  dirA = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-a-'))
-  dirB = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-b-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-'))
+  dirA = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-a-'))
+  dirB = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-b-'))
   nested = path.join(dirA, 'nested')
   await fs.mkdir(nested, { recursive: true })
 })
@@ -32,7 +32,7 @@ afterAll(async () => {
 
 /** A fresh data home per call: tests must not share registry state. */
 async function workspaces(): Promise<{ ws: WorkspaceService; home: string }> {
-  const h = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-ws-'))
+  const h = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-ws-'))
   return { ws: new WorkspaceService(h), home: h }
 }
 
@@ -84,7 +84,7 @@ describe('workspace lifecycle', () => {
   })
 
   it('migrates a legacy flat sessions tree into Default idempotently', async () => {
-    const legacyHome = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-legacy-'))
+    const legacyHome = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-legacy-'))
     try {
       const legacySessions = path.join(legacyHome, 'sessions', 'session-legacy1')
       await fs.mkdir(legacySessions, { recursive: true })
@@ -146,7 +146,7 @@ describe('project binding', () => {
     const { ws, home } = await workspaces()
     await ws.boot()
     const target = await ws.create('Ordered')
-    const extra = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-extra-'))
+    const extra = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-extra-'))
     try {
       const p1 = await ws.createProject(target.id, 'one', dirA)
       const p2 = await ws.createProject(target.id, 'two', dirB)
@@ -210,7 +210,7 @@ describe('session scoping', () => {
   })
 
   it('boot adopts sessions from every workspace directory with ownership', async () => {
-    const isolated = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g2-scope-'))
+    const isolated = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-scope-'))
     try {
       const w = new WorkspaceService(isolated)
       await w.boot()

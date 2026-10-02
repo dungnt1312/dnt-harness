@@ -25,7 +25,7 @@ The durable session `session-mu0u80ifpaldt1` exposed three related production de
 - `npm run typecheck`: passed.
 - `npm run build:web`: passed; assets are root-relative for deep routes.
 - `git diff --check`: passed, aside from existing line-ending warnings.
-- Restarted pm2 process `mini-dsh`; status online.
+- Restarted pm2 process `dnt-harness`; status online.
 - Live deep route returned HTTP 200.
 - Live session listing restored `projectId: project-mu0r2u0g8q0bdk`.
 - Live summary repaired to `eventCount: 1874`, `lastSeq: 1874`, and the correct project binding.

@@ -22,7 +22,7 @@ import {
   type Session,
   type ToolCall,
   type ToolDefinition,
-} from 'mini-dsh'
+} from 'dnt-harness'
 
 const echoTool: ToolDefinition = {
   name: 'Echo',
@@ -37,7 +37,7 @@ function call(name: string): ToolCall {
   return { id: 'call-1', name, args: { message: 'hi' } }
 }
 
-const rootTmp = path.join(tmpdir(), 'mini-dsh-approval-files')
+const rootTmp = path.join(tmpdir(), 'dnt-harness-approval-files')
 
 function boot(policy: PolicySource, askUser?: (c: ToolCall) => Promise<boolean>): {
   kernel: Kernel

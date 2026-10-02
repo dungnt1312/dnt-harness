@@ -12,7 +12,7 @@ const SHELL_FILE = /\.(js|css)$/
  */
 export function pwaServiceWorker(): Plugin {
   return {
-    name: 'mini-dsh-pwa-service-worker',
+    name: 'dnt-harness-pwa-service-worker',
     apply: 'build',
     generateBundle(_options, bundle) {
       const template = readFileSync(new URL('./service-worker.js', import.meta.url), 'utf8')

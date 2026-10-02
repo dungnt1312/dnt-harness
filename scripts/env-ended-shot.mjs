@@ -14,7 +14,7 @@ const json = async (res) => await res.json()
 
 const workspaces = await json(await fetch(`${BASE}/api/workspaces`))
 const ws = workspaces.find((row) => row.default) ?? workspaces[0]
-const folder = await mkdtemp(path.join(tmpdir(), 'mini-dsh-ended-'))
+const folder = await mkdtemp(path.join(tmpdir(), 'dnt-harness-ended-'))
 const project = await json(await post(`/api/workspaces/${ws.id}/projects`, { path: folder }))
 const session = await json(await post(`/api/workspaces/${ws.id}/sessions`, { projectId: project.id }))
 console.log('SESSION', session.id)

@@ -3,13 +3,13 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
 
 const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'ok' } } }
 let home = ''
 const servers: WebServer[] = []
 
-beforeEach(async () => { home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-root-mode-migrate-')) })
+beforeEach(async () => { home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-root-mode-migrate-')) })
 afterEach(async () => {
   for (const server of servers.splice(0)) await server.close().catch(() => {})
   await fs.rm(home, { recursive: true, force: true })

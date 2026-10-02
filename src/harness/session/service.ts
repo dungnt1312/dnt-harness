@@ -18,7 +18,7 @@ import {
 } from '../storage/file-session-store.ts'
 import { ScopeError } from '../workspace/types.ts'
 
-declare module 'mini-dsh' {
+declare module 'dnt-harness' {
   interface Context {
     sessions: SessionsService
   }

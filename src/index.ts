@@ -1,5 +1,5 @@
 /**
- * mini-dsh: a miniature TypeScript replica of the DeepSeek Harness
+ * dnt-harness: a miniature TypeScript replica of the DeepSeek Harness
  * architecture — a Cordis-shaped plugin kernel plus an agent core (durable
  * session log, LLM streaming seam, turn/step driver).
  */

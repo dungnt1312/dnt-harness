@@ -3,7 +3,7 @@ import type { ProjectId, SessionId, WorkspaceId } from '../../util/brand.ts'
 import type { Session } from '../session/session.ts'
 import { Agent } from './agent.ts'
 
-declare module 'mini-dsh' {
+declare module 'dnt-harness' {
   interface Context {
     agents: AgentsService
   }

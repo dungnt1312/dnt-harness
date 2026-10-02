@@ -16,7 +16,7 @@ Make docs match the new scope model and run the full gate.
 - State headless = single root, out-of-grant hard-fails.
 - Historical specs (G2) are not edited; the decision lives in architecture docs.
 - Tool descriptions (`Read/Write/Edit/Glob/Grep`) mention absolute paths into granted folders.
-- Full gate: `npm test`, typecheck, lint, `npm run build:web`, `pm2 restart mini-dsh`, live check.
+- Full gate: `npm test`, typecheck, lint, `npm run build:web`, `pm2 restart dnt-harness`, live check.
 
 ## Related Code Files
 - Modify: `docs/architecture.md`, `docs/capabilities.md`, `docs/web.md`, `docs/harness.md` (modes section, if it owns mode fields), `src/capabilities/fs/tools.ts` (descriptions)

@@ -11,7 +11,7 @@ import {
   protectedRootsForRules,
   resolveSkillLayers,
   validateSkillRules,
-} from 'mini-dsh'
+} from 'dnt-harness'
 
 describe('defaultSkillRules', () => {
   it('orders .claude, .agents, workspace, user and omits the user row without a dir', () => {

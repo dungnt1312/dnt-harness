@@ -13,7 +13,7 @@ import {
   type ModelRequest,
   type WebEnvelope,
   type WebServer,
-} from 'mini-dsh'
+} from 'dnt-harness'
 import { FakeOpenAiServer, FakeScriptedLlm } from './fake-llm.ts'
 
 let root = ''
@@ -22,7 +22,7 @@ let baseUrl = ''
 let startCount = 0
 
 beforeAll(async () => {
-  root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-web-'))
+  root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-web-'))
 })
 
 afterAll(async () => {
@@ -176,7 +176,7 @@ describe('web server', () => {
 
   it('switching the folder re-scopes the filesystem tools', async () => {
     await start([{ toolCalls: [{ name: 'read', args: { path: 'note.txt' } }] }, 'read it'])
-    const other = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-web-other-'))
+    const other = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-web-other-'))
     await fs.writeFile(path.join(other, 'note.txt'), 'content in the new folder', 'utf8')
 
     const bad = await fetch(`${baseUrl}/api/folder`, {
@@ -915,7 +915,7 @@ describe('per-session folders', () => {
 describe('folder picker directory browsing', () => {
   it('lists only child directories, sorted, with the parent; files and missing paths fail closed', async () => {
     await start([])
-    const outer = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-dirs-'))
+    const outer = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-dirs-'))
     try {
       await fs.mkdir(path.join(outer, 'beta'))
       await fs.mkdir(path.join(outer, 'Alpha'))
@@ -955,18 +955,18 @@ describe('folder picker directory browsing', () => {
 
 describe('static PWA files', () => {
   it('serves the manifest, icons, and a revalidating service worker and shell', async () => {
-    const staticDir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-static-'))
+    const staticDir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-static-'))
     try {
       await fs.mkdir(path.join(staticDir, 'icons'))
       await fs.writeFile(path.join(staticDir, 'index.html'), '<!doctype html>')
       await fs.writeFile(path.join(staticDir, 'sw.js'), 'self.addEventListener("fetch", () => {})')
-      await fs.writeFile(path.join(staticDir, 'manifest.webmanifest'), '{"name":"mini-dsh"}')
+      await fs.writeFile(path.join(staticDir, 'manifest.webmanifest'), '{"name":"dnt-harness"}')
       await fs.writeFile(path.join(staticDir, 'icons', 'icon-192.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]))
       await start([], undefined, { staticDir })
 
       const manifest = await fetch(`${baseUrl}/manifest.webmanifest`)
       expect(manifest.headers.get('content-type')).toContain('application/manifest+json')
-      expect(await manifest.json()).toEqual({ name: 'mini-dsh' })
+      expect(await manifest.json()).toEqual({ name: 'dnt-harness' })
 
       const icon = await fetch(`${baseUrl}/icons/icon-192.png`)
       expect(icon.headers.get('content-type')).toBe('image/png')

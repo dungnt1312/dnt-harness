@@ -7,7 +7,7 @@
 
 ## 1. Objective
 
-Redesign mini-dsh as a warm, focused coding workbench with the approved arrangement:
+Redesign dnt-harness as a warm, focused coding workbench with the approved arrangement:
 
 1. global top bar;
 2. left navigation containing projects and conversations;
@@ -16,7 +16,7 @@ Redesign mini-dsh as a warm, focused coding workbench with the approved arrangem
 5. right panel with **Context** and **Artifacts** tabs;
 6. composer fixed to the bottom of the conversation region.
 
-The reference image governs information hierarchy and workspace arrangement only. The shipped visual language is **Warm Studio**: warm neutral surfaces, restrained terracotta accent, calm editorial density, and original mini-dsh component construction. It must not copy the reference's branding, colors, decoration, unsupported panes, or product-specific chrome.
+The reference image governs information hierarchy and workspace arrangement only. The shipped visual language is **Warm Studio**: warm neutral surfaces, restrained terracotta accent, calm editorial density, and original dnt-harness component construction. It must not copy the reference's branding, colors, decoration, unsupported panes, or product-specific chrome.
 
 ## 2. Verified baseline
 
@@ -52,7 +52,7 @@ The reference image governs information hierarchy and workspace arrangement only
 The top bar spans the viewport and remains the only workspace switch/manage owner. It contains:
 
 - left navigation toggle;
-- mini-dsh wordmark;
+- dnt-harness wordmark;
 - workspace switcher and existing workspace status/approval indicators;
 - right-panel toggle;
 - settings entry.
@@ -243,7 +243,7 @@ interface WorkbenchPreferencesV1 {
 
 Rules:
 
-- storage key: `mini-dsh.workbench.v1`;
+- storage key: `dnt-harness.workbench.v1`;
 - validate every parsed field and clamp widths;
 - malformed/unavailable storage falls back silently to defaults;
 - preferences are browser-local, not workspace/session data;
@@ -341,7 +341,7 @@ No big-bang stylesheet deletion. During migration, old CSS may coexist only for 
 
 - No persisted domain data migration.
 - No REST/SSE compatibility change.
-- Existing local keys (`mini-dsh.scope.<workspace>`, approval notification preference) remain unchanged (`web/App.tsx:91-103`, `web/hooks/useApprovalNotify.ts:8-67`).
+- Existing local keys (`dnt-harness.scope.<workspace>`, approval notification preference) remain unchanged (`web/App.tsx:91-103`, `web/hooks/useApprovalNotify.ts:8-67`).
 - New workbench preference key is additive and disposable; old clients ignore it.
 - Rollback is phase-local: restore the prior presentation components/styles and remove the additive preference reader. Server state, logs, routes, drafts, settings records, and approvals remain valid.
 - Dependency rollback occurs only after no converted file imports Tailwind/Radix/CVA helpers.

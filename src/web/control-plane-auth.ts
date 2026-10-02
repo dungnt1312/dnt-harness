@@ -12,7 +12,7 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage } from 'node:http'
 import { CSRF_HEADER, checkCanonicalOrigin, csrfTokensMatch } from './csrf.ts'
 
-export const SESSION_COOKIE = 'mini-dsh-session'
+export const SESSION_COOKIE = 'dnt-harness-session'
 /** Expires the browser's session cookie (logout, or a stale session found on load). */
 export const CLEARED_SESSION_COOKIE = `${SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`
 export const PAIRING_BODY_FIELD = 'code'

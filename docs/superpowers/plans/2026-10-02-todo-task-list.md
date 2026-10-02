@@ -822,14 +822,14 @@ Expected: FAIL — no `TodoWrite` in the constant.
 In `src/harness/context/builder.ts` replace:
 
 ```ts
-export const DEFAULT_BASE_SYSTEM = 'You are mini-dsh, a local coding assistant. Answer helpfully and precisely.'
+export const DEFAULT_BASE_SYSTEM = 'You are dnt-harness, a local coding assistant. Answer helpfully and precisely.'
 ```
 
 with:
 
 ```ts
 export const DEFAULT_BASE_SYSTEM = [
-  'You are mini-dsh, a local coding assistant. Answer helpfully and precisely.',
+  'You are dnt-harness, a local coding assistant. Answer helpfully and precisely.',
   'For complex multi-step work (three or more distinct steps), maintain a task list with the TodoWrite tool: keep exactly one task in_progress at a time, mark tasks completed immediately when they finish, and if work is blocked add a task naming what must be resolved first.',
 ].join(' ')
 ```
@@ -867,7 +867,7 @@ Expected: no errors; `web-dist/` rebuilt.
 `server.ts` changed, so the PM2 process MUST restart (web build alone is not enough):
 
 ```bash
-pm2 restart mini-dsh
+pm2 restart dnt-harness
 ```
 
 Then, per the live-verify recipe (project-scoped scratch session on :3082 — a legacy `/api/sessions` folder route grants no Bash root):
@@ -891,7 +891,7 @@ git add docs/capabilities.md
 git commit -m "docs: TodoWrite task list contract"
 ```
 
-- Update the memory file `mini-dsh-todo-task-list-design.md` to "shipped" status with the commit range.
+- Update the memory file `dnt-harness-todo-task-list-design.md` to "shipped" status with the commit range.
 
 ---
 

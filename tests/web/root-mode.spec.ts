@@ -8,7 +8,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type ModelRequest, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type ModelRequest, type WebServer } from 'dnt-harness'
 
 const servers: WebServer[] = []
 const homes: string[] = []
@@ -19,7 +19,7 @@ afterAll(async () => {
 })
 
 async function start(provider: LlmProvider, home?: string): Promise<{ server: WebServer; home: string; wsId: string }> {
-  const dir = home ?? await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-root-mode-'))
+  const dir = home ?? await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-root-mode-'))
   if (home === undefined) homes.push(dir)
   const server = await createWebServer({ home: dir, providers: [provider], configFile: path.join(dir, 'p.json') })
   servers.push(server)

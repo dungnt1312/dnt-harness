@@ -18,7 +18,7 @@ import {
   CODEX_PINNED_VERSION,
   WorkspaceService,
   type SpawnRequest,
-} from 'mini-dsh'
+} from 'dnt-harness'
 import { FakeScriptedLlm } from '../support/fake-llm.ts'
 
 /** wait() is batch-shaped; these cases follow exactly one child. */
@@ -34,8 +34,8 @@ let home = ''
 let proj = ''
 
 beforeAll(async () => {
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-'))
-  proj = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-proj-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-'))
+  proj = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-proj-'))
 })
 
 afterAll(async () => {
@@ -62,7 +62,7 @@ describe('agent definitions', () => {
   })
 
   it('inheritable parses as a native key and round-trips through save and re-read', async () => {
-    const { parseAgentDefinition } = await import('mini-dsh')
+    const { parseAgentDefinition } = await import('dnt-harness')
     expect(parseAgentDefinition('x', '---\ndescription: "d"\ninheritable: false\n---\n\nbody').inheritable).toBe(false)
     expect(parseAgentDefinition('x', '---\ndescription: "d"\n---\n\nbody').inheritable).toBeUndefined()
     expect(() => parseAgentDefinition('x', '---\ndescription: "d"\ninheritable: "no"\n---\n\nbody')).toThrow(/'inheritable' must be true or false/)
@@ -72,7 +72,7 @@ describe('agent definitions', () => {
   })
 
   it('a workspace file shadowed by a bundled role never runs, and can still be deleted', async () => {
-    const shadowHome = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-shadow-'))
+    const shadowHome = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-shadow-'))
     try {
       const dir = path.join(shadowHome, 'workspaces', 'ws-s', 'agents')
       await fs.mkdir(dir, { recursive: true })
@@ -100,7 +100,7 @@ describe('agent definitions', () => {
   })
 
   it('strict parsing rejects unknown keys and missing descriptions', async () => {
-    const { parseAgentDefinition } = await import('mini-dsh')
+    const { parseAgentDefinition } = await import('dnt-harness')
     expect(() => parseAgentDefinition('bad', '---\nbanana: 1\ndescription: "x"\n---\n\nbody')).toThrow(/unknown frontmatter key/)
     expect(() => parseAgentDefinition('bad2', '---\n---\n\nbody')).toThrow(/'description' is required/)
   })
@@ -145,7 +145,7 @@ Audit the dependencies.`
     expect(result.warnings.some((warning) => warning.includes('model alias'))).toBe(true)
   })
 
-  it('Claude import reports the mini-dsh inheritable key as unsupported and never carries it', () => {
+  it('Claude import reports the dnt-harness inheritable key as unsupported and never carries it', () => {
     const result = importClaudeDefinition('---\nname: x\ndescription: d\ninheritable: false\n---\n\nbody')
     expect(result.ignored).toContain('inheritable')
     expect(result.imported).not.toContain('inheritable')
@@ -177,16 +177,16 @@ describe('bounded delegation', () => {
     await ws.boot()
     await sessions.boot()
     const workspaceId = ws.defaultWorkspace
-    kernel.ctx.plugin((await import('mini-dsh')).LlmService)
-    kernel.ctx.plugin((await import('mini-dsh')).ToolsService)
-    kernel.ctx.plugin((await import('mini-dsh')).AgentsService)
+    kernel.ctx.plugin((await import('dnt-harness')).LlmService)
+    kernel.ctx.plugin((await import('dnt-harness')).ToolsService)
+    kernel.ctx.plugin((await import('dnt-harness')).AgentsService)
     kernel.ctx.llm.register(new FakeScriptedLlm(script as never))
     const root = sessions.create(workspaceId)
     const executor = new ChildExecutor(kernel.ctx)
     return { kernel, executor, workspaceId: workspaceId as unknown as string, rootSessionId: root.id as unknown as string }
   }
 
-  function spawnRequest(harness: Harness, definition: import('mini-dsh').AgentDefinition, overrides: Partial<SpawnRequest> = {}): SpawnRequest {
+  function spawnRequest(harness: Harness, definition: import('dnt-harness').AgentDefinition, overrides: Partial<SpawnRequest> = {}): SpawnRequest {
     return {
       workspaceId: harness.workspaceId as never,
       projectId: undefined,
@@ -199,7 +199,7 @@ describe('bounded delegation', () => {
   }
 
   it('a child runs the task packet in an ISOLATED session and returns a bounded result', async () => {
-    const { AgentDefinitionService } = await import('mini-dsh')
+    const { AgentDefinitionService } = await import('dnt-harness')
     const harness = await bootChildHarness(['explorer found 3 files'])
     const definitions = new AgentDefinitionService(home)
     const explorer = (await definitions.resolve(harness.workspaceId as never, 'explorer')).definition
@@ -213,7 +213,7 @@ describe('bounded delegation', () => {
   }, 15_000)
 
   it('wait follows several children at once and returns the moment a stop aborts it', async () => {
-    const { AgentDefinitionService } = await import('mini-dsh')
+    const { AgentDefinitionService } = await import('dnt-harness')
     const harness = await bootChildHarness(['done'])
     const explorer = (await new AgentDefinitionService(home).resolve(harness.workspaceId as never, 'explorer')).definition
     const first = await harness.executor.spawn(spawnRequest(harness, explorer))
@@ -244,7 +244,7 @@ describe('bounded delegation', () => {
 
   it('capacity: the seventh active child of one root reports capacity reached', async () => {
     const harness = await bootChildHarness([{ toolCalls: [{ name: 'Read', args: {} }] }])
-    const { AgentDefinitionService } = await import('mini-dsh')
+    const { AgentDefinitionService } = await import('dnt-harness')
     const worker = (await new AgentDefinitionService(home).resolve(harness.workspaceId as never, 'worker')).definition
     // A gate tool that never finishes keeps children active.
     harness.kernel.ctx.tools.register({
@@ -310,7 +310,7 @@ describe('bounded delegation', () => {
   }, 15_000)
 
   it('recovered child relationships list/result without a live Agent and never replay', async () => {
-    const isolated = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-recover-'))
+    const isolated = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-recover-'))
     try {
       let rootId = ''
       let childId = ''
@@ -359,7 +359,7 @@ describe('bounded delegation', () => {
       { toolCalls: [{ name: 'Bash', args: { command: 'echo hacked' } }] },
       'done',
     ])
-    const { AgentDefinitionService } = await import('mini-dsh')
+    const { AgentDefinitionService } = await import('dnt-harness')
     const explorer = (await new AgentDefinitionService(home).resolve(harness.workspaceId as never, 'explorer')).definition
     const handle = await harness.executor.spawn(
       spawnRequest(harness, explorer, { grantTools: ['Write'] }),

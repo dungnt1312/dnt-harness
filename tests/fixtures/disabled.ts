@@ -1,4 +1,4 @@
-import type { Context } from 'mini-dsh'
+import type { Context } from 'dnt-harness'
 
 export const name = 'disabled-fixture'
 

@@ -8,7 +8,7 @@ import { agentScope } from '../agent/scope.ts'
 import { FileObservations } from '../../capabilities/fs/observation.ts'
 import type { ApprovedPath, GrantedRoot, PreExecuteDecision, PreparedToolCall, ToolDefinition, ToolExecution, ToolResult } from './types.ts'
 
-declare module 'mini-dsh' {
+declare module 'dnt-harness' {
   interface Context {
     tools: ToolsService
   }

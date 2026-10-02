@@ -7,14 +7,14 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { McpExecutionJournal, dispatchToolCall } from 'mini-dsh'
+import { McpExecutionJournal, dispatchToolCall } from 'dnt-harness'
 
 let home = ''
 let file = ''
 let fault = ''
 
 beforeEach(async () => {
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-reservation-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-reservation-'))
   file = path.join(home, 'executions.jsonl')
   fault = path.join(home, 'audit-fault.json')
 })

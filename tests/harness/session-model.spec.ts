@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { FileSessionStore, Kernel, SessionsService, fileSessions } from 'mini-dsh'
+import { FileSessionStore, Kernel, SessionsService, fileSessions } from 'dnt-harness'
 import { deriveSessionModel, sessionModelOf } from '../../src/harness/session/events.ts'
 import { Session } from '../../src/harness/session/session.ts'
 
@@ -19,7 +19,7 @@ afterEach(async () => {
 })
 
 async function temporaryDirectory(): Promise<string> {
-  const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-session-model-'))
+  const dir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-session-model-'))
   temporaryDirectories.push(dir)
   return dir
 }

@@ -16,7 +16,7 @@ let server: WebServer | undefined
 let home = ''
 
 test.beforeEach(async () => {
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-auth-e2e-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-auth-e2e-'))
   server = await createWebServer({ home, configFile: path.join(home, 'providers.json'), controlPlaneAuth: true })
 })
 

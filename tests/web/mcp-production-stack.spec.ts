@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createWebServer, type WebServer } from 'mini-dsh'
+import { createWebServer, type WebServer } from 'dnt-harness'
 
 let server: WebServer | undefined
 let home = ''
@@ -37,13 +37,13 @@ function raw(base: string, method: string, pathname: string, headers: Record<str
 
 describe('mcp production stack', () => {
   it('refuses a second host on the same data home', async () => {
-    home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-stack-'))
+    home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-stack-'))
     server = await createWebServer({ home, configFile: path.join(home, 'providers.json') })
     await expect(createWebServer({ home, configFile: path.join(home, 'providers.json') })).rejects.toThrow(/live owner/)
   })
 
   it('keeps a saved server disabled until enable, then serves one stdio call', async () => {
-    home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-stack-'))
+    home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-stack-'))
     const countFile = path.join(home, 'calls.txt')
     server = await createWebServer({ home, configFile: path.join(home, 'providers.json'), controlPlaneAuth: true })
     const denied = await raw(server.url, 'GET', '/api/workspaces')
@@ -53,7 +53,7 @@ describe('mcp production stack', () => {
     expect(paired.status).toBe(200)
     const cookie = String(paired.headers['set-cookie']).split(';')[0] ?? ''
     const csrf = (JSON.parse(paired.body) as { csrf: string }).csrf
-    const headers = { cookie, origin: server.auth.canonicalOrigin, 'content-type': 'application/json', 'x-mini-dsh-csrf': csrf }
+    const headers = { cookie, origin: server.auth.canonicalOrigin, 'content-type': 'application/json', 'x-dnt-harness-csrf': csrf }
     const created = await raw(server.url, 'POST', '/api/workspaces', headers, JSON.stringify({ name: 'Work' }))
     expect(created.status).toBe(201)
     const wsId = (JSON.parse(created.body) as { id: string }).id

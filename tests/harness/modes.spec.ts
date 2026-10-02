@@ -6,12 +6,12 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { BUNDLED_MODES, DEFAULT_MODE_ID, ModesService, ModeError, parseModeFile, serializeModeFile } from 'mini-dsh'
+import { BUNDLED_MODES, DEFAULT_MODE_ID, ModesService, ModeError, parseModeFile, serializeModeFile } from 'dnt-harness'
 
 let home = ''
 
 beforeAll(async () => {
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g3-modes-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-modes-'))
 })
 
 afterAll(async () => {

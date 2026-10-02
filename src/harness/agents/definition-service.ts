@@ -29,7 +29,7 @@ export interface AgentDefinition {
   /** Deprecated compatibility metadata. Retained when importing old definitions, but never enforced. */
   readonly maxTurns?: number
   /**
-   * mini-dsh native: `false` refuses `inherit: 'brief'` spawns (the role never
+   * dnt-harness native: `false` refuses `inherit: 'brief'` spawns (the role never
    * sees the delegating conversation). Absent means allowed.
    */
   readonly inheritable?: boolean
@@ -52,7 +52,7 @@ export class AgentDefinitionError extends Error {
   }
 }
 
-/** Frontmatter keys a definition may carry (Claude-compatible subset plus mini-dsh `inheritable`). */
+/** Frontmatter keys a definition may carry (Claude-compatible subset plus dnt-harness `inheritable`). */
 const KNOWN_KEYS = new Set([
   'name', 'description', 'tools', 'disallowedTools', 'skills', 'model', 'maxTurns', 'inheritable',
 ])

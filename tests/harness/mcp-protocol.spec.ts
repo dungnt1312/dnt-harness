@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { OutboundPolicyError, SseParser, assertOutboundUrl } from 'mini-dsh'
+import { OutboundPolicyError, SseParser, assertOutboundUrl } from 'dnt-harness'
 import { acceptProtocolVersion } from '../../src/harness/mcp/boundaries.ts'
 import { assertInitializeResult } from '../../src/harness/mcp/protocol.ts'
 

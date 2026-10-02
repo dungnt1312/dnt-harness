@@ -4,7 +4,7 @@ import type { ModelMessage } from '../llm/types.ts'
 import type { SessionStore } from '../storage/file-session-store.ts'
 import { deriveMessages, type SessionAppendedEvent, type SessionEvent } from './events.ts'
 
-declare module 'mini-dsh' {
+declare module 'dnt-harness' {
   interface Events {
     /**
      * An event was appended to a session log (memory) — the live stream for

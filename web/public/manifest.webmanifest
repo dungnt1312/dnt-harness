@@ -1,7 +1,7 @@
 {
-  "name": "mini-dsh",
-  "short_name": "mini-dsh",
-  "description": "Local agent workbench for mini-dsh.",
+  "name": "dnt-harness",
+  "short_name": "dnt-harness",
+  "description": "Local agent workbench for dnt-harness.",
   "id": "/",
   "start_url": "/",
   "scope": "/",

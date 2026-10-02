@@ -1,7 +1,7 @@
 /** G5 command hook fixture contract: block/rewrite/inject/flag/failure/timeout. */
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { isBlockingDecision, isFailureDecision, parseHooksConfig, runHook } from 'mini-dsh'
+import { isBlockingDecision, isFailureDecision, parseHooksConfig, runHook } from 'dnt-harness'
 
 const fixture = fileURLToPath(new URL('../fixtures/hook-command.mjs', import.meta.url))
 const binding = (mode: string, onFailure: 'allow' | 'deny' = 'deny') => ({

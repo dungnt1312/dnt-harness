@@ -1,7 +1,7 @@
 import { Service, type Context } from '../../kernel/index.ts'
 import type { LlmProvider, ModelRequest, StreamEvent, StreamOptions } from './types.ts'
 
-declare module 'mini-dsh' {
+declare module 'dnt-harness' {
   interface Context {
     llm: LlmService
   }

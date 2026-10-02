@@ -6,7 +6,7 @@
 import { emptyDraft, normalizeDraft, textDraft, type AttachmentRef, type DraftSegment, type RichDraft } from './composer-draft.ts'
 import { isSkillName, parseMessageText } from './inline-chips.ts'
 
-export const DRAFTS_STORAGE_KEY = 'mini-dsh.drafts.v1'
+export const DRAFTS_STORAGE_KEY = 'dnt-harness.drafts.v1'
 /** Newest drafts kept; older conversations drop out rather than grow forever. */
 export const MAX_STORED_DRAFTS = 20
 /** Per-draft text ceiling; a pasted novel is truncated instead of blocking storage. */

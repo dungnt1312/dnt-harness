@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Rebuild the existing mini-dsh web client as the approved Warm Studio coding workbench while preserving every current route, REST/SSE contract, event projection, draft/queue/stop flow, approval guard, and settings safety behavior.
+**Goal:** Rebuild the existing dnt-harness web client as the approved Warm Studio coding workbench while preserving every current route, REST/SSE contract, event projection, draft/queue/stop flow, approval guard, and settings safety behavior.
 
 **Architecture:** Execute a serial vertical-slice migration: establish Tailwind/Radix/CVA foundations, migrate the responsive shell, then transcript/workbench, composer/approvals, Context/Artifacts, settings, and finally remove obsolete CSS. `App.tsx` remains the server-state and routing orchestrator; new hooks/components own only presentation state, panel geometry, and read-only projections from the existing durable event array.
 
@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Work only in `C:\Users\DungNguyen\workspace\mini-dsh`.
+- Work only in `C:\Users\DungNguyen\workspace\dnt-harness`.
 - The worktree is already very dirty with user changes. Before each task run `git status --short` and `git diff -- <task-owned paths>`; never reset, stash, clean, delete, overwrite, or mass-format unrelated changes.
 - Do not commit. This plan intentionally contains no commit steps.
 - Product-owned copy remains English. Preserve user/assistant text, names, identifiers, paths, commands, imported content, custom mode names, and raw diagnostics verbatim.
@@ -236,7 +236,7 @@ Expected: FAIL because the module/exports do not exist.
 Use constants:
 
 ```ts
-export const WORKBENCH_STORAGE_KEY = 'mini-dsh.workbench.v1'
+export const WORKBENCH_STORAGE_KEY = 'dnt-harness.workbench.v1'
 export const WORKBENCH_DEFAULTS = {
   leftWidth: 280,
   rightWidth: 336,
@@ -1018,7 +1018,7 @@ Expected:
 
 1. No domain persistence migration: event logs, workspaces, projects, sessions, provider records, modes, policies, skills, memory, agents, MCP, hooks, and secrets remain untouched.
 2. No REST/SSE change: current API helpers continue to send the same routes/bodies (`web/lib/api.ts:173-373`, `web/lib/api.ts:375-597`).
-3. Existing local keys remain valid. The only addition is `mini-dsh.workbench.v1`; malformed or absent values fall back safely.
+3. Existing local keys remain valid. The only addition is `dnt-harness.workbench.v1`; malformed or absent values fall back safely.
 4. `projectItems` remains the transcript contract. New projectors consume its output or the same events without replacing it.
 5. Vertical slices retain legacy CSS only for not-yet-migrated components; cleanup occurs after caller/selector proof.
 6. Rollback any phase by restoring that phase's presentation files and leaving server/domain state untouched.

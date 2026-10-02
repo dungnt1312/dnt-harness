@@ -17,7 +17,7 @@ import {
   type LlmProvider,
   type ModelRequest,
   type Session,
-} from 'mini-dsh'
+} from 'dnt-harness'
 import { FakeScriptedLlm } from '../support/fake-llm.ts'
 
 interface Harness {

@@ -18,7 +18,7 @@ lifecycle, capacity caps, project-lease integration, per-child model pinning, to
 and restart recovery. Most of that plumbing works, but validation found lifecycle-boundary
 defects that phase 0 fixes before this plan builds the **agent** contract on top.
 
-A child in mini-dsh today runs with the root's own system prompt, receives a rigid
+A child in dnt-harness today runs with the root's own system prompt, receives a rigid
 four-field form, is told nothing about what it is or what it owes back, and hands the
 parent a front-truncated concatenation of its own narration. Delegation therefore costs
 3× the tokens and returns less than reading the files inline would.
@@ -219,13 +219,13 @@ phase 0; do it when two conversations delegating at once matters. Each phase mus
       writing concurrently.
 - [x] Two conversations delegating at the same time do not steal each other's capacity.
 - [x] This plan does not add token or currency accounting.
-- [x] `npm test`, `npm run typecheck`, `npm run build:web` exit 0; pm2 `mini-dsh`
+- [x] `npm test`, `npm run typecheck`, `npm run build:web` exit 0; pm2 `dnt-harness`
       restarted and verified live.
 
 ### Outcome (2026-09-23)
 
 Cooked phases 0–6 in one pass. `npm run typecheck` 0 errors; `npm run build:web`
-ok; pm2 `mini-dsh` restarted and verified live (bundled roles = explorer,
+ok; pm2 `dnt-harness` restarted and verified live (bundled roles = explorer,
 worker, reviewer, verifier; 7 legacy child relationships recovered). The
 `npm test` criterion stays unchecked: 931 pass, 10 fail — the same 10
 (`workspace-isolation` ×1, `session-model` ×3, `composer.mounted` ×6) fail on the
@@ -234,7 +234,7 @@ fails at setup on a missing `GET /api/auth/state` fixture route (same origin).
 Review and dispositions:
 `plans/reports/code-reviewer-260923-1027-claude-style-subagents.md`.
 Deviations: the Settings create form now saves via a native `dialect:
-"mini-dsh"` import (so `inheritable` round-trips) and gained "Copy to
+"dnt-harness"` import (so `inheritable` round-trips) and gained "Copy to
 customize"; a workspace file named like a new bundled role is warned about and
 deletable rather than migrated.
 
@@ -272,7 +272,7 @@ Gates re-verified directly on the current tree: `npm test` 111/111 files,
 `npm run typecheck` 0, `npm run build:web` 0 (known chunk-size warning only).
 The checkbox stays open solely for the pm2 half: the tree also carries the
 unrelated in-flight cross-project-file-scope work
-(`plans/260923-1439-cross-project-file-scope/`), so restarting `mini-dsh` now
+(`plans/260923-1439-cross-project-file-scope/`), so restarting `dnt-harness` now
 would deploy that WIP; restart and live-verify after it lands. Known unrelated
 flake: `tests/capabilities/bash.spec.ts` orphan-marker (Windows Git Bash
 process-tree race, documented 2026-09-18) — passes isolated and in this run.
@@ -281,7 +281,7 @@ process-tree race, documented 2026-09-18) — passes isolated and in this run.
 
 The cross-project-file-scope work landed, so the last gate closed. `npm test`
 113/113 files, 1056/1056 tests on repeated full runs; `npm run typecheck` 0;
-`npm run build:web` 0; pm2 `mini-dsh` restarted and verified live (bundled
+`npm run build:web` 0; pm2 `dnt-harness` restarted and verified live (bundled
 catalog = explorer, worker, reviewer, verifier). The gate first exited 1 on
 an unhandled stdin `EPIPE` from the MCP stdio client after the watchdog killed
 a server; stdin errors now fail the transport instead of escaping
@@ -467,10 +467,10 @@ real plan defects, all propagated into the phase files in this pass:
    - **Rationale:** the plan must state enforcement that exists, not promise whole-run
      serialization.
 8. **[Scope]** `inheritable` nên tham gia contract definition ở mức nào?
-   - Options: Full mini-dsh round-trip — parser, save/serialize API, web types, Settings
+   - Options: Full dnt-harness round-trip — parser, save/serialize API, web types, Settings
      copy/edit và fixtures; Claude compatibility không quảng bá field không chuẩn
      (Recommended) | Parser-only key | Drop role refusal
-   - **Answer:** Full mini-dsh round-trip.
+   - **Answer:** Full dnt-harness round-trip.
    - **Rationale:** parser-only support would silently lose the field on round-trip, while
      emitting it as Claude-compatible would misstate interoperability.
 
@@ -488,7 +488,7 @@ real plan defects, all propagated into the phase files in this pass:
 - Writer guard: registered root turns hold leases, child calls use fallback per-call locks
   after handoff, and no child-run serialization is claimed; child turn-level leasing,
   queueing, and worktrees stay future work.
-- `inheritable`: full mini-dsh round-trip, absent means allowed, never emitted through
+- `inheritable`: full dnt-harness round-trip, absent means allowed, never emitted through
   the Claude adapter.
 - Dependencies: 1←0; 2←0,1; 3←0,1; 4←0,1,3; 5←0,1,2; 6←0; ship 0–3 together.
 

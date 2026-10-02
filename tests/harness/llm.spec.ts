@@ -10,7 +10,7 @@ import {
   type LlmProvider,
   type ModelRequest,
   type StreamEvent,
-} from 'mini-dsh'
+} from 'dnt-harness'
 import { FakeScriptedLlm } from '../support/fake-llm.ts'
 
 function requestOf(...contents: string[]): ModelRequest {

@@ -12,7 +12,7 @@ import {
   WorkspaceService,
   bundledDefinition,
   fileSessions,
-} from 'mini-dsh'
+} from 'dnt-harness'
 import { agentScope } from '../../src/harness/agent/scope.ts'
 import { agentTool, type DelegationDeps } from '../../src/web/agent-delegation.ts'
 import { FakeScriptedLlm } from '../support/fake-llm.ts'
@@ -33,7 +33,7 @@ afterEach(async () => {
 })
 
 async function boot(): Promise<Harness> {
-  const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-agent-tool-ownership-'))
+  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-agent-tool-ownership-'))
   homes.push(home)
   const kernel = new Kernel()
   kernel.ctx.plugin(fileSessions(home))

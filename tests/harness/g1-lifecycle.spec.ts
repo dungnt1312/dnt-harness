@@ -20,7 +20,7 @@ import {
   type ToolCall,
   type ToolDefinition,
   type ToolExecution,
-} from 'mini-dsh'
+} from 'dnt-harness'
 import { FakeScriptedLlm } from '../support/fake-llm.ts'
 
 interface Harness {

@@ -37,9 +37,9 @@ const IMPORT_PLACEHOLDER = '---\ndescription: "reviews code"\ntools: ["Read", "G
 const linesToArray = (raw: string): string[] => raw.split('\n').map((line) => line.trim()).filter((line) => line !== '')
 
 /**
- * A native mini-dsh definition document built from the create form. It is
+ * A native dnt-harness definition document built from the create form. It is
  * also a valid Claude-subset document except for `inheritable`, which is a
- * mini-dsh key and is written only when a role refuses inherited context.
+ * dnt-harness key and is written only when a role refuses inherited context.
  */
 export function definitionDocument(draft: { readonly name: string; readonly description: string; readonly tools: string; readonly disallowedTools: string; readonly instructions: string; readonly model: string; readonly inheritable?: boolean }): string {
   const list = (raw: string): string => JSON.stringify(linesToArray(raw))
@@ -127,7 +127,7 @@ function AgentsPanelContent({ workspaceId, modelOptions }: AgentsPanelProps) {
     if (createInvalid !== null) { setNotice({ kind: 'bad', text: createInvalid }); return }
     const name = createName.trim()
     // The form writes a native document, saved verbatim after the strict
-    // native parse — so mini-dsh keys like `inheritable` round-trip.
+    // native parse — so dnt-harness keys like `inheritable` round-trip.
     await importAgentDefinition(workspaceId, name, {
       content: definitionDocument({
         name,
@@ -138,7 +138,7 @@ function AgentsPanelContent({ workspaceId, modelOptions }: AgentsPanelProps) {
         model: createModel,
         inheritable: createInheritable,
       }),
-      dialect: 'mini-dsh',
+      dialect: 'dnt-harness',
     })
     await refreshDefinitions()
     setSelected(name)

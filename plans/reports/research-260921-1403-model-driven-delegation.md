@@ -133,7 +133,7 @@ Two independent mechanisms, both in play:
    order, not completion order**. This is why a *blocking* `Task`/`Agent` tool still
    fans out there — three Agent calls in one message run at the same time.
 
-### What that means for mini-dsh
+### What that means for dnt-harness
 
 - Mechanism 2 is precisely what `agent.ts:405-455` lacks (constraint 2). Copying it
   would give parallel delegation **and** parallel `Read`/`Grep`/`Glob` — but it touches

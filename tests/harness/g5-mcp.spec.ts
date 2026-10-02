@@ -21,13 +21,13 @@ import {
   importClaudeMcp,
   importCodexMcp,
   resolveSecretRefs,
-} from 'mini-dsh'
+} from 'dnt-harness'
 
 let home = ''
 const fixture = fileURLToPath(new URL('../fixtures/mcp-stdio-server.mjs', import.meta.url))
 
 beforeAll(async () => {
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g5-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g5-'))
 })
 
 afterAll(async () => {
@@ -165,7 +165,7 @@ describe('stdio MCP 2025-06-18 fixture', () => {
     const { promises: fsp } = await import('node:fs')
     const { tmpdir } = await import('node:os')
     const pathModule = await import('node:path')
-    const home = await fsp.mkdtemp(pathModule.join(tmpdir(), 'mini-dsh-master-key-'))
+    const home = await fsp.mkdtemp(pathModule.join(tmpdir(), 'dnt-harness-master-key-'))
     try {
       await new McpConfigStore(home).saveSecrets('ws', { API_KEY: 'value' })
       expect(await new McpConfigStore(home).loadSecrets('ws')).toEqual({ API_KEY: 'value' })

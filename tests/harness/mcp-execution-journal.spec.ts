@@ -3,14 +3,14 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { fileURLToPath } from 'node:url'
-import { AuditFaultBlock, McpDispatchError, McpExecutionJournal, McpServerClient, clearAuditFault, dispatchToolCall, faultIsOpen, receiptForTransportFailure } from 'mini-dsh'
+import { AuditFaultBlock, McpDispatchError, McpExecutionJournal, McpServerClient, clearAuditFault, dispatchToolCall, faultIsOpen, receiptForTransportFailure } from 'dnt-harness'
 import { DataHomeLock } from '../../src/harness/mcp/ownership-lock.ts'
 
 const stdioFixture = fileURLToPath(new URL('../fixtures/mcp-stdio-server.mjs', import.meta.url))
 
 describe('mcp execution journal', () => {
   it('records one intent and does not dispatch an unresolved invocation again', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-journal-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-journal-'))
     const file = path.join(home, 'executions.jsonl')
     const fault = path.join(home, 'audit-fault.json')
     try {
@@ -47,7 +47,7 @@ describe('mcp execution journal', () => {
   })
 
   it('blocks later dispatch when the known outcome cannot be stored', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-fault-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-fault-'))
     const fault = path.join(home, 'audit-fault.json')
     const file = path.join(home, 'executions.jsonl')
     try {
@@ -81,7 +81,7 @@ describe('mcp execution journal', () => {
 
 describe('lost response against a real MCP process', () => {
   it('one dispatch, one remote side effect, and no resend — in process or after a restart', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-lost-response-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-lost-response-'))
     const file = path.join(home, 'executions.jsonl')
     const fault = path.join(home, 'audit-fault.json')
     const effects = path.join(home, 'side-effects.log')
@@ -120,7 +120,7 @@ describe('lost response against a real MCP process', () => {
 
 describe('journal faults fail closed', () => {
   it('a journal the host cannot write refuses to send, and a repaired file sends again', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-journal-perm-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-journal-perm-'))
     const file = path.join(home, 'executions.jsonl')
     const fault = path.join(home, 'audit-fault.json')
     try {
@@ -151,7 +151,7 @@ describe('journal faults fail closed', () => {
   })
 
   it('a terminal record the host cannot write is an audit fault that blocks the next dispatch', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-journal-perm-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-journal-perm-'))
     const file = path.join(home, 'executions.jsonl')
     const fault = path.join(home, 'audit-fault.json')
     try {
@@ -178,7 +178,7 @@ describe('journal faults fail closed', () => {
   })
 
   it('an intent is only written under the live ownership epoch; a fenced host sends nothing', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-journal-epoch-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-journal-epoch-'))
     const file = path.join(home, 'executions.jsonl')
     const fault = path.join(home, 'audit-fault.json')
     try {
@@ -224,7 +224,7 @@ function intent(invocationId: string) {
 }
 
   it('fails closed on a corrupt middle record and does not send the call', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-corrupt-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-corrupt-'))
     const file = path.join(home, 'executions.jsonl')
     const fault = path.join(home, 'audit-fault.json')
     try {
@@ -249,7 +249,7 @@ function intent(invocationId: string) {
   })
 
   it('closes an unresolved intent on restart without sending it', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-restart-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-restart-'))
     const file = path.join(home, 'executions.jsonl')
     try {
       const journal = new McpExecutionJournal(file)

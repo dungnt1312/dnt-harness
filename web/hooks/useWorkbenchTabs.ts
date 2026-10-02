@@ -50,7 +50,7 @@ function limitTabs(record: WorkbenchTabsRecord): WorkbenchTabsRecord {
 
 /**
  * The workbench tab strip and the selected view, remembered per conversation
- * under `mini-dsh.workbench.tabs.v1`: the key is `<workspaceId>:<sessionId>`,
+ * under `dnt-harness.workbench.tabs.v1`: the key is `<workspaceId>:<sessionId>`,
  * or `draft` before the first message, and one conversation's open tabs never
  * leak into another. A null key (no workspace yet) reads as defaults and drops
  * patches. Widths, collapse and the terminal stay one global preference — see

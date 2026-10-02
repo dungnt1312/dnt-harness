@@ -17,15 +17,15 @@ import {
   boundToolMetadata,
   privilegedRoutes,
   receiptForTransportFailure,
-} from 'mini-dsh'
-import { deriveMessages, newStepId, type SessionEvent } from 'mini-dsh'
+} from 'dnt-harness'
+import { deriveMessages, newStepId, type SessionEvent } from 'dnt-harness'
 import { projectItems } from '../../web/lib/project.ts'
 import type { SseEvent } from '../../web/lib/types.ts'
 
 let home = ''
 
 beforeAll(async () => {
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-mcp-bounds-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-mcp-bounds-'))
 })
 
 afterAll(async () => {

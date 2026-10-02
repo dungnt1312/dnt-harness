@@ -9,15 +9,15 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { Kernel, ToolsService, fsTools, type ToolCall } from 'mini-dsh'
+import { Kernel, ToolsService, fsTools, type ToolCall } from 'dnt-harness'
 import { attachPathScopeGuard } from '../../src/web/path-scope-guard.ts'
 
 let root = ''
 let outside = ''
 
 beforeAll(async () => {
-  root = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-scope-guard-')))
-  outside = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-scope-guard-out-')))
+  root = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-scope-guard-')))
+  outside = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-scope-guard-out-')))
   await fs.writeFile(path.join(outside, 'x.txt'), 'outside', 'utf8')
   await fs.writeFile(path.join(root, 'in.txt'), 'inside', 'utf8')
 })

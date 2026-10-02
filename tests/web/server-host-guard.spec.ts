@@ -12,7 +12,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createWebServer, type WebServer } from 'mini-dsh'
+import { createWebServer, type WebServer } from 'dnt-harness'
 
 let server: WebServer | undefined
 let home = ''
@@ -25,7 +25,7 @@ afterEach(async () => {
 })
 
 async function start(extra: Partial<Parameters<typeof createWebServer>[0]> = {}): Promise<string> {
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-host-guard-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-host-guard-'))
   server = await createWebServer({
     home,
     configFile: path.join(home, 'providers.json'),

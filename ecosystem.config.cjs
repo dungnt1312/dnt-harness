@@ -1,5 +1,5 @@
 /**
- * pm2 ecosystem for the mini-dsh web host.
+ * pm2 ecosystem for the dnt-harness web host.
  *
  *   pm2 start ecosystem.config.cjs
  *
@@ -9,7 +9,7 @@
 module.exports = {
   apps: [
     {
-      name: 'mini-dsh',
+      name: 'dnt-harness',
       cwd: __dirname,
       script: 'node_modules/tsx/dist/cli.mjs',
       args: 'src/bins/web.ts --port 3082 --root .',

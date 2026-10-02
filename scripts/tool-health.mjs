@@ -4,7 +4,7 @@
  *
  *   node scripts/tool-health.mjs [--data <dir>] [--since <ISO date>] [--tools Read,Write,Edit]
  *
- * Scans every `events.jsonl` under the data dir (default ~/.mini-dsh/data),
+ * Scans every `events.jsonl` under the data dir (default ~/.dnt-harness/data),
  * pairs `tool/call` with `tool/result`, and buckets failures by message.
  */
 import { promises as fs } from 'node:fs'
@@ -16,7 +16,7 @@ const option = (name) => {
   const index = argv.indexOf(`--${name}`)
   return index === -1 ? undefined : argv[index + 1]
 }
-const dataDir = option('data') ?? path.join(os.homedir(), '.mini-dsh', 'data')
+const dataDir = option('data') ?? path.join(os.homedir(), '.dnt-harness', 'data')
 const since = option('since') !== undefined ? Date.parse(option('since')) : 0
 const toolFilter = new Set((option('tools') ?? 'Read,Write,Edit').split(','))
 

@@ -1,18 +1,18 @@
 ---
-title: G1-G5 mini-dsh base implemented
+title: G1-G5 dnt-harness base implemented
 date: 2026-09-11
 summary: "Full G1-G5 base: file-first storage, workspace isolation, modes/context/skills/memory, bounded multi-agent, MCP + hooks, Settings UI; 286 tests green, pm2 restarted"
 ---
 
-# G1-G5 mini-dsh base implemented
+# G1-G5 dnt-harness base implemented
 
 ## What happened
 
-Implemented the full approved G1–G5 base for mini-dsh from the validated plan at
-`plans/260909-1550-g1-g5-mini-dsh-base/`, phase by phase with a code-review gate
+Implemented the full approved G1–G5 base for dnt-harness from the validated plan at
+`plans/260909-1550-g1-g5-dnt-harness-base/`, phase by phase with a code-review gate
 after each. Final state: 286 vitest tests green, both TypeScript configs clean
 (`tsconfig.json`, `tsconfig.web.json`), `npm run build:web` green, and the pm2
-process `mini-dsh` (port 3082) restarted so the running host serves the new code.
+process `dnt-harness` (port 3082) restarted so the running host serves the new code.
 
 Delivered per goal:
 
@@ -31,7 +31,7 @@ Delivered per goal:
   next gate + next context), centralized limits, and the six canonical tools
   Read/Write/Edit/Glob/Grep/Bash with granted-root containment (realpath/junction,
   creation paths), `expectedSha256` conflict detection, ambiguous-Edit rejection,
-  and a real-Bash adapter (Git Bash on Windows, `MINI_DSH_BASH`, `where git`
+  and a real-Bash adapter (Git Bash on Windows, `DNT_HARNESS_BASH`, `where git`
   fallback, WSL stubs skipped, actionable disable when absent) with verified
   process-tree cleanup.
 - **G2 — workspaces and isolation.** `WorkspaceService` (CRUD, idempotent legacy

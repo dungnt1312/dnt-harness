@@ -22,7 +22,7 @@ import {
   normalizeBrief,
   type AgentDefinition,
   type SpawnRequest,
-} from 'mini-dsh'
+} from 'dnt-harness'
 import { agentScope } from '../../src/harness/agent/scope.ts'
 import { agentTool, projectInheritedMessages, type DelegationDeps } from '../../src/web/agent-delegation.ts'
 import { FakeScriptedLlm, type ScriptStep } from '../support/fake-llm.ts'
@@ -30,7 +30,7 @@ import { FakeScriptedLlm, type ScriptStep } from '../support/fake-llm.ts'
 let home = ''
 
 beforeAll(async () => {
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-contract-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-contract-'))
 })
 
 afterAll(async () => {
@@ -200,7 +200,7 @@ describe('result contract', () => {
   }, 15_000)
 
   it('a settled child stays queryable after its in-memory entry is evicted, and across a restart', async () => {
-    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-evict-'))
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-evict-'))
     try {
       const harness = await boot(['the answer'], { dir })
       const handle = await harness.executor.spawn(request(harness, explorer))
@@ -280,7 +280,7 @@ describe('lifecycle boundary', () => {
   }, 15_000)
 
   it('settles a never-launched uncertain spawn whose parent record canonically persisted, releasing its slot', async () => {
-    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-spawn-uncertain-committed-'))
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-spawn-uncertain-committed-'))
     try {
     const harness = await boot(['done'], { dir })
     const sessions = harness.kernel.ctx.sessions as unknown as {
@@ -363,7 +363,7 @@ describe('lifecycle boundary', () => {
   }, 15_000)
 
   it('reconciles a poisoned parent against canonical storage when the persisted spawn append rejects, including after restart', async () => {
-    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-spawn-append-reject-'))
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-spawn-append-reject-'))
     try {
       const harness = await boot(['done'], { dir })
       const root = harness.kernel.ctx.sessions.get(harness.rootSessionId as never)
@@ -420,7 +420,7 @@ describe('lifecycle boundary', () => {
   }, 20_000)
 
   it('releases capacity when a poisoned parent has canonically persisted the result append, including after restart', async () => {
-    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-result-append-reject-'))
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-result-append-reject-'))
     try {
       const harness = await boot(['done'], { dir })
       const root = harness.kernel.ctx.sessions.get(harness.rootSessionId as never)
@@ -457,7 +457,7 @@ describe('lifecycle boundary', () => {
   }, 20_000)
 
   it('reconciles a poisoned parent result in-process and releases capacity only after the canonical result is proven', async () => {
-    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-result-reconcile-'))
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-result-reconcile-'))
     try {
       const harness = await boot(['done'], { dir })
       const handle = await harness.executor.spawn(request(harness, explorer))
@@ -559,7 +559,7 @@ describe('lifecycle boundary', () => {
   }, 15_000)
 
   it('never durably completes a parent when its completed child log cannot flush', async () => {
-    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-child-flush-'))
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-child-flush-'))
     try {
       const harness = await boot(['unused'], { dir })
       const agents = harness.kernel.ctx.get('agents') as { create: (session: { append(event: unknown): unknown }) => unknown }
@@ -677,7 +677,7 @@ describe('lifecycle boundary', () => {
   }, 15_000)
 
   it('a session the parent never recorded is not a child; an unrecorded run without a completed turn is interrupted', async () => {
-    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-commit-'))
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-commit-'))
     try {
       const kernel = new Kernel()
       kernel.ctx.plugin(fileSessions(dir))
@@ -706,7 +706,7 @@ describe('lifecycle boundary', () => {
   }, 15_000)
 
   it('backfills the parent result of a crash-orphaned child from its interrupted recovery fact', async () => {
-    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-crash-orphan-'))
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-crash-orphan-'))
     try {
       // Build the durable shape a crash leaves behind: committed spawns on
       // the parent, no child-result, and children that never settled — one
@@ -767,7 +767,7 @@ describe('lifecycle boundary', () => {
   }, 20_000)
 
   it('recovery skips a child whose parent session is missing', async () => {
-    const dir = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-orphan-'))
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-orphan-'))
     try {
       const kernel = new Kernel()
       kernel.ctx.plugin(fileSessions(dir))
@@ -1018,7 +1018,7 @@ describe('the Agent tool', () => {
   })
 
   it('caches role listings per workspace, so custom roles never leak across workspaces', async () => {
-    const roleHome = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-g4-roles-'))
+    const roleHome = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-roles-'))
     try {
       const definitions = new AgentDefinitionService(roleHome)
       await definitions.save('ws-a', 'alpha-role', '---\ndescription: "alpha only"\n---\n\nA.')

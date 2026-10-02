@@ -1,7 +1,7 @@
 import type { AttachmentRef } from './composer-draft.ts'
 import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillFileRow, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, WorkspaceMeta, WorkspaceRow } from './types.ts'
 
-const CSRF_HEADER = 'x-mini-dsh-csrf'
+const CSRF_HEADER = 'x-dnt-harness-csrf'
 let csrfToken: string | undefined
 
 /** Remember the CSRF token returned by pairing. Cookie mutations send it back. */
@@ -846,8 +846,8 @@ export function reconcileChild(workspaceId: string, rootSessionId: string, child
 
 export interface ImportAgentInput {
   readonly content: string
-  /** `mini-dsh` saves a native document verbatim (strict native parse). */
-  readonly dialect: 'claude' | 'codex' | 'mini-dsh'
+  /** `dnt-harness` saves a native document verbatim (strict native parse). */
+  readonly dialect: 'claude' | 'codex' | 'dnt-harness'
   readonly sourceVersion?: string
 }
 

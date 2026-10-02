@@ -1,6 +1,6 @@
 # Architecture
 
-mini-dsh is built as a series of layers, each depending only on the ones below
+dnt-harness is built as a series of layers, each depending only on the ones below
 it. Nothing reaches upward: the kernel does not know about sessions or tools,
 the harness does not know about HTTP, and the web host is just another plugin
 composition that consumes the harness through the context.
@@ -104,7 +104,7 @@ Capabilities are just tools registered into `ctx.tools`:
   become an approval in the web host. Containment is application-level, not
   an OS sandbox.
 - **`bashTool(options)`** — one real Bash command per call (Git Bash's
-  `bash.exe` on Windows, `/bin/bash` elsewhere, `MINI_DSH_BASH` to override),
+  `bash.exe` on Windows, `/bin/bash` elsewhere, `DNT_HARNESS_BASH` to override),
   with a timeout, stop-cancellation, and process-tree cleanup. Bash means
   Bash: an unsupported environment disables the tool with an actionable error,
   and a shell is never path-confined.
@@ -140,7 +140,7 @@ package entry. Producers dispatch them, and consumers listen — both fully
 typed:
 
 ```ts
-declare module 'mini-dsh' {
+declare module 'dnt-harness' {
   interface Events {
     'session/event'(session: Session, event: SessionEvent): void
   }

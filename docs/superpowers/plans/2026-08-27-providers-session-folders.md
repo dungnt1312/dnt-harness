@@ -42,7 +42,7 @@ saveProviders(file, list): Promise<void>      // mkdir -p cha, atomic-ish write
 maskKey(key): string                          // '••••' + 4 ký tự cuối
 ```
 
-Vị trí file mặc định: `<homedir>/.mini-dsh/providers.json` (gitignore ngoài repo tự nhiên). `WebServerOptions.configFile` ghi đè — vitest dùng tmpdir.
+Vị trí file mặc định: `<homedir>/.dnt-harness/providers.json` (gitignore ngoài repo tự nhiên). `WebServerOptions.configFile` ghi đè — vitest dùng tmpdir.
 
 Seed lần đầu: nếu file chưa tồn tại mà `DEEPSEEK_API_KEY` có giá trị → tạo entry `deepseek` (baseUrl mặc định api.deepseek.com, models cứng như cũ) rồi save.
 

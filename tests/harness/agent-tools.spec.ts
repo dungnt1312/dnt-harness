@@ -20,13 +20,13 @@ import {
   type LlmProvider,
   type ModelRequest,
   type Session,
-} from 'mini-dsh'
+} from 'dnt-harness'
 import { FakeScriptedLlm } from '../support/fake-llm.ts'
 
 let root = ''
 
 beforeAll(async () => {
-  root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-agent-tools-'))
+  root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-agent-tools-'))
 })
 
 afterAll(async () => {

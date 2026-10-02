@@ -26,7 +26,7 @@ async function main(): Promise<void> {
   const apiKey = readApiKey()
   if (apiKey === undefined) throw new Error('missing DEEPSEEK_API_KEY')
 
-  const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-explore-'))
+  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-explore-'))
   const kernel = new Kernel()
   kernel.ctx.plugin(fileSessions(home))
   kernel.ctx.plugin(LlmService)

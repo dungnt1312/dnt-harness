@@ -16,7 +16,7 @@ Before any plan work, the baseline was broken: `npm run typecheck` reported 37 e
 - **Prompt**: `buildContext` takes `child`; subagent preamble + capability line from the request's own schemas + pinned role instructions replace BASE/mode prose. Children see only their ceiling, never `Agent`.
 - **Result**: last tool-free assistant message, 16k cap with marker + flag, `filesTouched` from Read/Write/Edit; honest errors naming the log otherwise.
 - **Brief**: `prompt` primary, durable `brief` (legacy `objective` reads), `SpawnError('packet')` → 400; Workbench brief textarea.
-- **Inheritance**: messages-only projection captured at spawn, wrapped `parent-context`, droppable before memory/history, hash + size durable only; `inheritable` native key with a `mini-dsh` import dialect and Settings switch + copy-to-customize.
+- **Inheritance**: messages-only projection captured at spawn, wrapped `parent-context`, droppable before memory/history, hash + size durable only; `inheritable` native key with a `dnt-harness` import dialect and Settings switch + copy-to-customize.
 - **Roles/caps**: explorer, worker, reviewer, verifier with selection-rule descriptions; per-workspace role cache; honest writer-lease guidance; 3 per conversation / 12 host / 8 attempts per turn.
 
 ## Verification

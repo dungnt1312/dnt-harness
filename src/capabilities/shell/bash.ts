@@ -1,7 +1,7 @@
 /**
  * Shell capability consumer: the `Bash` tool. Bash means Bash — an explicit
  * adapter resolves the actual executable (Git Bash's `bash.exe` on Windows,
- * `/bin/bash` elsewhere, or `MINI_DSH_BASH`); when none exists the tool
+ * `/bin/bash` elsewhere, or `DNT_HARNESS_BASH`); when none exists the tool
  * disables itself with an actionable error instead of silently substituting
  * another shell.
  *
@@ -40,7 +40,7 @@ export interface BashToolOptions {
 }
 
 /** Environment marker every process of one Bash call inherits (Windows only). */
-export const TREE_TAG_ENV = 'MINI_DSH_BASH_TREE'
+export const TREE_TAG_ENV = 'DNT_HARNESS_BASH_TREE'
 
 /**
  * An MSYS script that SIGKILLs every process whose environment carries the

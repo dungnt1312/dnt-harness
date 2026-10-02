@@ -1,4 +1,4 @@
-import { Service, type Context } from 'mini-dsh'
+import { Service, type Context } from 'dnt-harness'
 
 export class GreeterService extends Service {
   constructor(ctx: Context) {

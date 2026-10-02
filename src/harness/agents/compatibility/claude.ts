@@ -8,7 +8,7 @@
 import { AgentDefinitionError, type AgentDefinition } from '../definition-service.ts'
 
 /** Fields the Claude sub-agent frontmatter may carry (documented subset). */
-// mini-dsh's native `inheritable` is deliberately absent: it is not a Claude
+// dnt-harness's native `inheritable` is deliberately absent: it is not a Claude
 // key, so a Claude file carrying it reports it under `ignored` and no Claude
 // import ever produces it.
 const CLAUDE_SUPPORTED_KEYS = new Set(['name', 'description', 'tools', 'disallowedTools', 'skills', 'model', 'maxTurns'])
@@ -155,7 +155,7 @@ export function importCodexDefinition(toml: string, sourceVersion?: string): Cod
     pinnedVersion: CODEX_PINNED_VERSION,
     unsupported,
     warnings: [
-      'Codex exec_command/write_stdin process continuation and apply_patch freeform grammar are NOT mapped; the definition runs on mini-dsh native tools',
+      'Codex exec_command/write_stdin process continuation and apply_patch freeform grammar are NOT mapped; the definition runs on dnt-harness native tools',
       'messaging/resume/fork/worktree semantics are unsupported and reported, not faked',
     ],
   }

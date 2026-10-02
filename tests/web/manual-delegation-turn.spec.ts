@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
 
 let server: WebServer | undefined
 let home = ''
@@ -30,7 +30,7 @@ async function events(base: string, wsId: string, sid: string): Promise<{ type: 
 
 describe('manual delegation Turn', () => {
   it('a named batch joins one real Turn and closes after both children settle', async () => {
-    home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-manual-turn-'))
+    home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-manual-turn-'))
     let release: () => void = () => {}
     const gate = new Promise<void>((resolve) => { release = resolve })
     const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { await gate; yield { type: 'delta', delta: 'done' } } }

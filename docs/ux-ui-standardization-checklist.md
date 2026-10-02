@@ -1,4 +1,4 @@
-# Checklist Chuẩn hóa UX/UI — mini-dsh (Làm lại từ đầu)
+# Checklist Chuẩn hóa UX/UI — dnt-harness (Làm lại từ đầu)
 
 
 > **Historical execution record (stale):** checklist này mô tả một implementation trước đây (`TopBar`, `InspectorPanel`, `WorkbenchShell`) và không còn là source of truth cho code hiện tại. Dùng `docs/design-guidelines.md`, `docs/design-system.md`, `docs/web.md` và test hiện hành để review/verify; không suy ra trạng thái pass hiện tại từ các dấu ✅ bên dưới.

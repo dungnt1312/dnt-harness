@@ -28,6 +28,7 @@ import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AgentsService } from '../harness/agent/service.ts'
+import { resolveAppHome } from '../harness/app-home.ts'
 import { agentScope, type AgentScope } from '../harness/agent/scope.ts'
 import type { GrantedRoot } from '../harness/tools/types.ts'
 import { within } from '../capabilities/fs/grants.ts'
@@ -129,7 +130,7 @@ import { CheckpointStore } from '../harness/context/compaction.ts'
 import { createCompactionSummarizer } from './llm-summarizer.ts'
 import { DEFAULT_BUDGET, type ResolvedBudget } from '../harness/context/budget.ts'
 
-declare module 'mini-dsh' {
+declare module 'dnt-harness' {
   interface Events {
     /**
      * A tool call is waiting for a human answer on one session; emitted by
@@ -224,7 +225,7 @@ export interface WebServerOptions {
    * used by bins for env-configured entries and by tests for scripts).
    */
   readonly providers?: readonly LlmProvider[]
-  /** Provider config file; defaults to `<homedir>/.mini-dsh/providers.json`. */
+  /** Provider config file; defaults to `<homedir>/.dnt-harness/providers.json` (or the pre-rename `.mini-dsh`). */
   readonly configFile?: string
   /** Create a `deepseek` entry from `DEEPSEEK_API_KEY` when the config has none. */
   readonly seedDeepseekFromEnv?: boolean
@@ -521,7 +522,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const deniedRoots = options.home !== undefined ? [options.home] : undefined
   // G3 resource services: workspace-owned modes/skills/memory. Memory-mode
   // hosts bind them to a fresh temp home so tests stay hermetic.
-  const resourceHome = options.home ?? (await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-resources-')))
+  const resourceHome = options.home ?? (await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-resources-')))
   const modes = new ModesService(resourceHome)
   const skills = new SkillsService(resourceHome, undefined, options.userSkillsDir)
   const memory = new MemoryService(resourceHome)
@@ -581,7 +582,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   kernel.ctx.provide('mcp-store', mcpStore)
 
   // ── provider registry ────────────────────────────────────────
-  const configFile = options.configFile ?? path.join(homedir(), '.mini-dsh', 'providers.json')
+  const configFile = options.configFile ?? path.join(resolveAppHome(), 'providers.json')
   const storedProviders = loadProviderStore(configFile)
   let list: ProviderConfig[] = [...storedProviders.providers]
   let durableDefaults: ModelDefaults = storedProviders.defaults
@@ -2690,8 +2691,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: HandlerDe
       res.end(JSON.stringify({ error: 'bearer token does not include this scope' }))
       return
     }
-    ;(req as IncomingMessage & { miniDshPrincipalId?: string; miniDshGeneration?: number }).miniDshPrincipalId = decision.principal.id
-    ;(req as IncomingMessage & { miniDshGeneration?: number }).miniDshGeneration = decision.principal.generation
+    ;(req as IncomingMessage & { dntHarnessPrincipalId?: string; dntHarnessGeneration?: number }).dntHarnessPrincipalId = decision.principal.id
+    ;(req as IncomingMessage & { dntHarnessGeneration?: number }).dntHarnessGeneration = decision.principal.generation
     const generation = req.headers['last-event-id']
     if (typeof generation === 'string' && generation.startsWith('gen=') && generation.slice(4) !== String(decision.principal.generation)) {
       res.writeHead(401, { 'content-type': 'application/json', 'cache-control': 'no-store' })
@@ -2735,7 +2736,7 @@ async function handleOAuthDeposit(req: IncomingMessage, res: ServerResponse, dep
       code = typeof body['code'] === 'string' ? body['code'] : ''
     }
     await deps.oauth.deposit(state, code)
-    send(200, 'Authorization code received. Return to mini-dsh and finish connecting the server.')
+    send(200, 'Authorization code received. Return to dnt-harness and finish connecting the server.')
   } catch {
     send(400, 'Authorization callback was rejected.')
   }
@@ -3450,9 +3451,10 @@ async function handleApi(
       }
       try {
         const dialect = typeof body['dialect'] === 'string' ? body['dialect'] : 'claude'
-        if (dialect === 'mini-dsh') {
+        // `mini-dsh` is the pre-rename name of the native dialect; older clients still send it.
+        if (dialect === 'dnt-harness' || dialect === 'mini-dsh') {
           // A native document (the Settings create/copy form): saved verbatim
-          // after the strict native parse, so mini-dsh-only keys such as
+          // after the strict native parse, so dnt-harness-only keys such as
           // `inheritable` survive the round-trip.
           const saved = await deps.agentDefinitions.save(wsId, targetName, content)
           const keys = Object.keys(saved.definition).filter((key) => key !== 'instructions' && key !== 'name')
@@ -3502,7 +3504,7 @@ async function handleApi(
       const serverName = decodeURIComponent(oauthMatch[2] ?? '')
       const action = oauthMatch[3]
       requireWorkspace(deps, wsId, true)
-      const principalId = (req as IncomingMessage & { miniDshPrincipalId?: string }).miniDshPrincipalId ?? 'local'
+      const principalId = (req as IncomingMessage & { dntHarnessPrincipalId?: string }).dntHarnessPrincipalId ?? 'local'
       const body = await readJson(req)
       try {
         if (action === 'begin') {
@@ -5621,7 +5623,7 @@ async function acceptMessage(
       return { ok: false, status: 400, error: error.message }
     }
   }
-  const principalId = (req as IncomingMessage & { miniDshPrincipalId?: string }).miniDshPrincipalId
+  const principalId = (req as IncomingMessage & { dntHarnessPrincipalId?: string }).dntHarnessPrincipalId
   if (principalId !== undefined) deps.sessionPrincipals.set(entry.session.id, principalId)
   if (deps.unavailableSessions.has(entry.session.id)) {
     return { ok: false, status: 503, error: 'session unavailable after durable storage failure; restart the host to reload canonical history' }
@@ -6340,7 +6342,7 @@ async function resolveTerminalCwd(
  * per-terminal stream would starve the REST calls that drive the same page.
  */
 function streamTerminals(req: IncomingMessage, res: ServerResponse, workspaceId: WorkspaceId, deps: HandlerDeps): void {
-  const streamGeneration = (req as IncomingMessage & { miniDshGeneration?: number }).miniDshGeneration ?? deps.auth.currentGeneration()
+  const streamGeneration = (req as IncomingMessage & { dntHarnessGeneration?: number }).dntHarnessGeneration ?? deps.auth.currentGeneration()
   if (deps.auth.enabled && deps.auth.currentGeneration() !== streamGeneration) {
     res.writeHead(401, { 'content-type': 'application/json', 'cache-control': 'no-store' })
     res.end(JSON.stringify({ error: 'session generation was revoked' }))
@@ -6387,7 +6389,7 @@ function streamTerminals(req: IncomingMessage, res: ServerResponse, workspaceId:
   const dispose = deps.terminals.subscribe(workspaceId, (event) => {
     frame(event.kind === 'data' ? { ...event, data: encode(event.data) } : event)
   })
-  const principalId = (req as IncomingMessage & { miniDshPrincipalId?: string }).miniDshPrincipalId
+  const principalId = (req as IncomingMessage & { dntHarnessPrincipalId?: string }).dntHarnessPrincipalId
   let closed = false
   let heartbeat: ReturnType<typeof setInterval> | undefined
   let streamRecord: { principalId: string | undefined; close: () => void } | undefined
@@ -6448,7 +6450,7 @@ function reconcileInterruptedProcesses(entry: SessionEntry, deps: HandlerDeps): 
 }
 
 function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionEntry, deps: HandlerDeps): void {
-  const streamGeneration = (req as IncomingMessage & { miniDshGeneration?: number }).miniDshGeneration ?? deps.auth.currentGeneration()
+  const streamGeneration = (req as IncomingMessage & { dntHarnessGeneration?: number }).dntHarnessGeneration ?? deps.auth.currentGeneration()
   // A reconnect that authenticated under an older generation must not receive
   // the snapshot. Logout increments the generation before this handler runs
   // only when the cookie was already rejected; this covers a generation that
@@ -6520,7 +6522,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   const disposeError = deps.kernel.ctx.on('web/turn-error', (payload) => {
     if (payload.sessionId === session.id) writeFrame(res, { kind: 'error', message: payload.message })
   })
-  const principalId = (req as IncomingMessage & { miniDshPrincipalId?: string }).miniDshPrincipalId
+  const principalId = (req as IncomingMessage & { dntHarnessPrincipalId?: string }).dntHarnessPrincipalId
   let closed = false
   let heartbeat: ReturnType<typeof setInterval> | undefined
   let streamRecord: { principalId: string | undefined; close: () => void } | undefined

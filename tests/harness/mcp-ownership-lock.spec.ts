@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { DataHomeLock, OwnershipError } from 'mini-dsh'
+import { DataHomeLock, OwnershipError } from 'dnt-harness'
 
 let home = ''
 
@@ -13,7 +13,7 @@ afterEach(async () => {
 
 describe('data-home ownership lock', () => {
   it('refuses a second live owner and fences the epoch after the holder is gone', async () => {
-    home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-lock-'))
+    home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-lock-'))
     let now = 1_000
     const alive = new Set<number>([process.pid])
     const first = await DataHomeLock.acquire(home, { leaseMs: 100, now: () => now, isAlive: (pid) => alive.has(pid) })

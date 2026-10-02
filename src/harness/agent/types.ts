@@ -24,7 +24,7 @@ export type PreStepDecision =
   | { readonly kind: 'enter'; readonly contents: readonly string[] }
   | { readonly kind: 'reject'; readonly reason?: string }
 
-declare module 'mini-dsh' {
+declare module 'dnt-harness' {
   interface Events {
     /**
      * Around-middleware deciding what one step admits: listeners rewrite the

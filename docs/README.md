@@ -1,6 +1,6 @@
-# mini-dsh — Documentation
+# dnt-harness — Documentation
 
-**mini-dsh** is a miniature TypeScript replica of the
+**dnt-harness** is a miniature TypeScript replica of the
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) architecture,
 built for learning. It reimplements the same plugin-runtime ideas — everything is
 a plugin, typed events with five dispatch modes, reversible effects,
@@ -84,7 +84,7 @@ tests/                  Vitest suite + composition fixtures
 
 The reference architecture lives in the DeepSeek Harness repository
 (`docs/architecture.md`, `docs/cordis-primer.md`, `docs/cordis-tutorial/`).
-mini-dsh rebuilds those ideas *without importing them*; the test suite
+dnt-harness rebuilds those ideas *without importing them*; the test suite
 reproduces the Cordis tutorial chapters against this kernel. The three core
 invariants, carried over verbatim from upstream, are:
 

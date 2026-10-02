@@ -8,7 +8,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { createWebServer, WorkspaceService, type LlmProvider, type WebServer } from 'mini-dsh'
+import { createWebServer, WorkspaceService, type LlmProvider, type WebServer } from 'dnt-harness'
 import type { SessionId } from '../../src/util/brand.ts'
 
 let base = ''
@@ -73,7 +73,7 @@ async function waitFor<T>(probe: () => Promise<T | undefined>, what: string): Pr
 
 beforeEach(async () => {
   gate = new Promise<void>((resolve) => { release = resolve })
-  base = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-lease-')))
+  base = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-lease-')))
   home = path.join(base, 'home')
   rootX = path.join(base, 'x')
   rootY = path.join(base, 'y')

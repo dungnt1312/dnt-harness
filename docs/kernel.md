@@ -61,7 +61,7 @@ Plugins declare event signatures through TypeScript declaration merging, then
 dispatch and listen fully typed:
 
 ```ts
-declare module 'mini-dsh' {
+declare module 'dnt-harness' {
   interface Events {
     'stats/report'(name: string, count: number): void
   }
@@ -158,7 +158,7 @@ properties resolve against the service store** — so `ctx.tools` reads the
 typed through declaration merging:
 
 ```ts
-declare module 'mini-dsh' {
+declare module 'dnt-harness' {
   interface Context {
     greeter: GreeterService
   }

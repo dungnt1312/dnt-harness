@@ -11,14 +11,14 @@ Reviewed concrete plan (self-review; delegation unavailable):
 4. Composer exposes fixed project context, real workspace model/mode scope and policy details. Rootless sessions offer new project conversation CTA without claiming all tools are disabled.
 5. Approval cards show exact JSON arguments, target, project scope and one-request permission semantics. Lock submission, expose failures, retain durable resolved decisions in history.
 6. Settings explicitly distinguish global provider storage, workspace activation/runtime management and session child inspection, saved state versus connection checks.
-7. Shared responsive long-content/focus styling; regressions for lifecycle, creation validation, scope and approvals. Run full tests/typecheck/build/diff check, restart only mini-dsh, verify HTTP. Controller handles independent review and real browser acceptance.
+7. Shared responsive long-content/focus styling; regressions for lifecycle, creation validation, scope and approvals. Run full tests/typecheck/build/diff check, restart only dnt-harness, verify HTTP. Controller handles independent review and real browser acceptance.
 
 Implementation status: steps 1–7 implemented and self-reviewed; browser/independent controller acceptance remains pending.
 
 Final evidence: backend/frontend typecheck passed. Full suite passed 36 files / 313 tests with `npm test -- --maxWorkers=1` (77.12s), including 15 new workflow regressions. An earlier parallel run passed 312 tests before the last added regression; later parallel validation exposed the existing Bash process-tree timeout test leaving escaped-marker.txt. A repeat was contaminated by that marker; removed only the generated marker and ran all tests with one worker, without modifying backend code or assertions. This process-kill intermittency remains a separate backend investigation.
-Production build passed: 345 modules, 1.81s; JS chunk 505.69 kB triggers Vite's 500 kB advisory. diff --check passed (CRLF conversion warnings only). Restarted only mini-dsh id 11, restart count 7 → 8, online; dsh-web stayed online at restart count 0. Root, built JS/CSS and /api/workspaces returned HTTP 200 on port 3082.
+Production build passed: 345 modules, 1.81s; JS chunk 505.69 kB triggers Vite's 500 kB advisory. diff --check passed (CRLF conversion warnings only). Restarted only dnt-harness id 11, restart count 7 → 8, online; dsh-web stayed online at restart count 0. Root, built JS/CSS and /api/workspaces returned HTTP 200 on port 3082.
 Configuration observation: read-only post-deploy API reports the sole Default workspace using kiro-go / auto, not the request's expected cliproxy / gpt5.5. No provider/model config was changed by this implementation or verification; controller should reconcile this mismatch rather than silently overwrite live configuration.
-Controller handoff: independently inspect new-dialog cancel/create/double-click/navigation races, approval submitting/expiry flows, keyboard focus restoration, project-filtered history and responsive long arguments at 390/768/1440 widths. No browser or delegated review was available here. Full sequential test log is outside the repository at C:/Users/DungNguyen/workspace/mini-dsh-test-final.log.
+Controller handoff: independently inspect new-dialog cancel/create/double-click/navigation races, approval submitting/expiry flows, keyboard focus restoration, project-filtered history and responsive long arguments at 390/768/1440 widths. No browser or delegated review was available here. Full sequential test log is outside the repository at C:/Users/DungNguyen/workspace/dnt-harness-test-final.log.
 
 Acceptance: no silent rootless creation; history filters do not change execution scope; lifecycle is event-grounded; permission buttons never grant broader scope; interrupted/failed outcomes have safe guidance; existing tests stay green and build is served on 3082.
 Review result: approved for implementation; no server contract change needed. Creation uses existing createSessionIn; decisions use existing boolean answerApproval; model/mode remain workspace controls. Browser/delegation limitation explicitly retained.
@@ -41,10 +41,10 @@ Self-reviewed against acceptance and existing contracts; independent specialist 
 - [x] Apply shared typography across shell/chat/settings/management; expose transcript identities and expanded arguments.
 - [x] Run tests/typecheck/build, self-review touched call sites and update docs/web.md.
 - [ ] Independent specialist review and full desktop/mobile/settings browser acceptance: blocked by this subagent tool surface (no delegation tool; browser reports `Browser is not available in subagent`).
-- [x] Build then explicitly restart only pm2 mini-dsh; HTTP root, workspace API and built JS/CSS respond 200.
+- [x] Build then explicitly restart only pm2 dnt-harness; HTTP root, workspace API and built JS/CSS respond 200.
 
 ## Verification evidence
-Full suite: 34 files / 290 tests passed (30.89s), including four new approval projection tests. Typecheck passed for backend/frontend. Production build passed (341 modules). git diff --check passed with only existing line-ending conversion warnings. Service mini-dsh id 11 online; dsh-web untouched. No data changes, commits, pushes or resets.
+Full suite: 34 files / 290 tests passed (30.89s), including four new approval projection tests. Typecheck passed for backend/frontend. Production build passed (341 modules). git diff --check passed with only existing line-ending conversion warnings. Service dnt-harness id 11 online; dsh-web untouched. No data changes, commits, pushes or resets.
 
 ## Handoff limits
 Browser screenshots and interactive behavior are not verified here. Specialist review/testing delegation was not available. The review blockers below are implemented with helper/markup regressions; end-to-end delayed requests, focus interactions and popup layout still require controller browser acceptance. Do not claim complete acceptance until these are inspected in the controller browser.
@@ -61,6 +61,6 @@ Keep SSE wire formats unchanged. Reconcile approvals from durable request/decisi
 - [x] Drawer focus boundaries subscribe to media-query changes and yield Escape to popups/dialogs.
 - [x] Eight production-helper regressions plus expanded settings accessibility markup assertions. No jsdom/happy-dom/react-test-renderer is installed; no browser used and no DOM interaction acceptance claimed.
 - [x] Final full suite: 35 files, 298 tests passed, 35.28s; backend/frontend typecheck passed; production build 343 modules, 1.65s; diff --check passed (existing CRLF warnings only).
-- [x] Restarted only mini-dsh (pm2 id 11, restart count 6 → 7, online). dsh-web remained online with restart count 0. HTTP root/workspace API returned 200.
+- [x] Restarted only dnt-harness (pm2 id 11, restart count 6 → 7, online). dsh-web remained online with restart count 0. HTTP root/workspace API returned 200.
 
 One intermediate test run passed 298 assertions but exited nonzero due to an unhandled EPIPE in the existing MCP CPU-watchdog test (src/harness/mcp/client.ts:175). The final rerun passed without unhandled errors; that backend intermittent issue was not modified in this frontend pass. Existing dirty changes preserved; no commits/reset/push. Independent delegation unavailable; browser acceptance remains unchecked above.

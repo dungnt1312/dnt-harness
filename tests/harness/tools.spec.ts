@@ -11,7 +11,7 @@ import {
   type ApprovalOptions,
   type ToolCall,
   type ToolDefinition,
-} from 'mini-dsh'
+} from 'dnt-harness'
 
 function call(name: string, args: Record<string, unknown> = {}): ToolCall {
   return { id: 'call-1', name, args }

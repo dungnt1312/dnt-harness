@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
 
 const servers: WebServer[] = []
 const homes: string[] = []
@@ -13,7 +13,7 @@ afterEach(async () => {
 })
 
 async function start(providers: readonly LlmProvider[]): Promise<{ server: WebServer; base: string; home: string }> {
-  const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-session-model-'))
+  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-session-model-'))
   homes.push(home)
   const server = await createWebServer({ home, providers, configFile: path.join(home, 'providers.json') })
   servers.push(server)
@@ -287,7 +287,7 @@ describe('global durable model defaults', () => {
 
 describe('provider/default transaction boundary', () => {
   it('serializes concurrent provider/default/thinking mutations without losing committed fields', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-provider-transaction-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-provider-transaction-'))
     homes.push(home)
     const server = await createWebServer({ home, configFile: path.join(home, 'providers.json') })
     servers.push(server)
@@ -313,7 +313,7 @@ describe('provider/default transaction boundary', () => {
   })
 
   it('does not publish provider/default or registration changes when durable commit fails', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-provider-failure-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-provider-failure-'))
     homes.push(home)
     let failWrites = false
     const writer = async (file: string, store: import('../../src/web/provider-store.ts').ProviderStore): Promise<void> => {
@@ -337,7 +337,7 @@ describe('provider/default transaction boundary', () => {
   })
 
   it('uses activeModel as a validated process-local startup override without overwriting disk defaults', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-active-model-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-active-model-'))
     homes.push(home)
     const file = path.join(home, 'providers.json')
     const alpha = provider('alpha', ['a1'], [])
@@ -354,7 +354,7 @@ describe('provider/default transaction boundary', () => {
 
 describe('runtime override durability and patch serialization', () => {
   it('keeps activeModel pair process-local when thinking persists, then restores durable pair after restart', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-active-thinking-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-active-thinking-'))
     homes.push(home)
     const file = path.join(home, 'providers.json')
     const alpha = provider('alpha', ['a1'], [])
@@ -371,7 +371,7 @@ describe('runtime override durability and patch serialization', () => {
   })
 
   it('merges delayed concurrent patches in transaction acceptance order and returns committed projections', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-patch-race-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-patch-race-'))
     homes.push(home)
     const writer = async (file: string, store: import('../../src/web/provider-store.ts').ProviderStore): Promise<void> => {
       if (store.providers.some((entry) => entry.name === 'Renamed')) {
@@ -403,7 +403,7 @@ describe('runtime override invalidation after provider commits', () => {
 
   for (const scenario of mutationCases) {
     it(`clears activeModel override after ${scenario.name}; existing session remains snapshot-isolated`, async () => {
-      const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-runtime-invalidation-'))
+      const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-runtime-invalidation-'))
       homes.push(home)
       const file = path.join(home, 'providers.json')
       const server = await createWebServer({ home, providers: [], configFile: file })
@@ -424,7 +424,7 @@ describe('runtime override invalidation after provider commits', () => {
   }
 
   it('clears activeModel override after sync removes its model', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-runtime-sync-invalidation-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-runtime-sync-invalidation-'))
     homes.push(home)
     const { createServer } = await import('node:http')
     const endpoint = await new Promise<{ server: import('node:http').Server; baseUrl: string }>((resolve) => {

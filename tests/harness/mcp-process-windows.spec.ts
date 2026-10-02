@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { assertHardContainmentAvailable, containmentCapability, minimalStdioEnv } from 'mini-dsh'
+import { assertHardContainmentAvailable, containmentCapability, minimalStdioEnv } from 'dnt-harness'
 
 describe('stdio process policy', () => {
   it('drops ambient secrets and does not claim a hard sandbox', async () => {

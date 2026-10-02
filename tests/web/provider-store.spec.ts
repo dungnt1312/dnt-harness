@@ -12,7 +12,7 @@ function envelope(providers: readonly unknown[]): string {
 }
 
 beforeAll(async () => {
-  dir = await mkdtemp(path.join(tmpdir(), 'mini-dsh-providers-'))
+  dir = await mkdtemp(path.join(tmpdir(), 'dnt-harness-providers-'))
 })
 
 afterAll(async () => {

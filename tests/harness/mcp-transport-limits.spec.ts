@@ -13,7 +13,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gzipSync } from 'node:zlib'
 import { afterEach, describe, expect, it } from 'vitest'
-import { McpDispatchError, McpServerClient } from 'mini-dsh'
+import { McpDispatchError, McpServerClient } from 'dnt-harness'
 
 const stdioFixture = fileURLToPath(new URL('../fixtures/mcp-stdio-server.mjs', import.meta.url))
 const servers: Server[] = []
@@ -172,7 +172,7 @@ describe('Streamable HTTP limits', () => {
 
 describe('connect lifecycle', () => {
   it('concurrent first calls share one connect: one transport, one process', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-connect-storm-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-connect-storm-'))
     try {
       const spawned = path.join(home, 'spawned.log')
       const env = { INIT_FILE: spawned, INIT_DELAY_MS: '150' }
@@ -190,7 +190,7 @@ describe('connect lifecycle', () => {
   }, 20_000)
 
   it('a server that never answers initialize is killed, not abandoned', async () => {
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-silent-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-silent-'))
     try {
       const pidFile = path.join(home, 'pid')
       // Records its pid, then stays alive without ever speaking JSON-RPC.

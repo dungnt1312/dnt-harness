@@ -4,20 +4,23 @@
  * boot seeds a DeepSeek entry. Without a key the server still starts so
  * the browser Settings panel can add any OpenAI-completions compatible
  * provider. Sessions persist under `--data-dir` (default
- * `<homedir>/.mini-dsh/data`) and reopen on restart.
+ * `<homedir>/.dnt-harness/data`) and reopen on restart.
  * Serve the built client first:
  *
  *   npm run build:web
  *   npm run web [-- --port 3082 --root . --yolo --auth]
  *
  * The listener is loopback-only, so control-plane pairing stays off unless
- * `--auth` (or `MINI_DSH_AUTH=1`) asks for it.
+ * `--auth` (or `DNT_HARNESS_AUTH=1`) asks for it.
  */
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { assertSchemaFloor } from '../harness/mcp/migration.ts'
 import { createWebServer } from '../web/server.ts'
-import { loadRepoEnv } from './env.ts'
+import { loadRepoEnv, resolveAppHome } from './env.ts'
+
+// `~/.dnt-harness`, or the pre-rename `~/.mini-dsh` while only that exists.
+const appHome = resolveAppHome()
 
 // A repo-root .env supplies DEEPSEEK_API_KEY when the process environment
 // does not carry it. Real environment variables win over file entries.
@@ -34,12 +37,12 @@ interface CliOptions {
 function parseArgs(argv: readonly string[]): CliOptions {
   let port = 3082
   let root = process.cwd()
-  let dataDir = path.join(homedir(), '.mini-dsh', 'data')
+  let dataDir = path.join(appHome, 'data')
   let yolo = false
   // The bin binds loopback only, so a local run is already limited to this
   // machine's user: pairing is opt-in. Turn it on whenever the port is shared
   // beyond that user, e.g. behind a proxy or a forwarded tunnel.
-  let auth = process.env['MINI_DSH_AUTH'] === '1'
+  let auth = process.env['DNT_HARNESS_AUTH'] === '1'
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (arg === '--port') port = Number(argv[i + 1] ?? port) || port
@@ -58,6 +61,8 @@ async function main(): Promise<void> {
 
   const server = await createWebServer({
     home: dataDir,
+    // Providers live next to the data dir's parent home (see resolveAppHome).
+    configFile: path.join(appHome, 'providers.json'),
     // Claude Code user skills are a read-only layer under workspace skills.
     userSkillsDir: path.join(homedir(), '.claude', 'skills'),
     seedDeepseekFromEnv: true,
@@ -70,7 +75,7 @@ async function main(): Promise<void> {
     controlPlaneAuth: auth,
   })
 
-  process.stdout.write(`mini-dsh web: ${server.url}\n`)
+  process.stdout.write(`dnt-harness web: ${server.url}\n`)
   if (auth) {
     const pairing = server.auth.issuePairingCode()
     process.stdout.write(`pairing code (single use, expires in 5 minutes): ${pairing.code}\n`)
@@ -96,6 +101,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((error: unknown) => {
-  process.stderr.write(`mini-dsh web: failed to start: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`)
+  process.stderr.write(`dnt-harness web: failed to start: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`)
   process.exit(1)
 })

@@ -4,7 +4,7 @@ import { defineConfig } from 'vitest/config'
 export default defineConfig({
   resolve: {
     alias: {
-      'mini-dsh': fileURLToPath(new URL('./src/index.ts', import.meta.url)),
+      'dnt-harness': fileURLToPath(new URL('./src/index.ts', import.meta.url)),
     },
   },
   // Root tsconfig.json has no "jsx" setting, so esbuild would default to the

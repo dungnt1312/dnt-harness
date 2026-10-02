@@ -94,7 +94,7 @@ marker. Argument errors throw inside `execute` and surface as failed
 
 - **Executable**: resolved at registration by the shared
   `capabilities/shell/detect.ts` — an explicit `executable` option
-  (authoritative: a missing one disables the tool), `MINI_DSH_BASH`, the
+  (authoritative: a missing one disables the tool), `DNT_HARNESS_BASH`, the
   standard Git install locations, or `where git` / `where bash` fallback
   (skipping the WSL launchers in System32 and WindowsApps). On POSIX,
   `/bin/bash` or `bash` on PATH. When nothing real is found, the tool

@@ -6,13 +6,13 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
 
 let root = ''
 const servers: WebServer[] = []
 
 beforeAll(async () => {
-  root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-skill-src-'))
+  root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-skill-src-'))
 })
 
 afterAll(async () => {
@@ -21,7 +21,7 @@ afterAll(async () => {
 })
 
 async function start(): Promise<{ base: string; home: string }> {
-  const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-skill-src-home-'))
+  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-skill-src-home-'))
   const server = await createWebServer({ home, configFile: path.join(home, 'p.json'), userSkillsDir: path.join(home, 'user-skills') })
   servers.push(server)
   return { base: server.url, home }
@@ -178,7 +178,7 @@ describe('Skill tool with project layers', () => {
         else yield { type: 'delta' as const, delta: 'done' }
       },
     }
-    const home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-skill-tool-home-'))
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-skill-tool-home-'))
     const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json'), userSkillsDir: path.join(home, 'user-skills') })
     servers.push(server)
     const base = server.url

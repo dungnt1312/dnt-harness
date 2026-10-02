@@ -10,15 +10,15 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { fsTools, type ToolDefinition, type ToolExecution } from 'mini-dsh'
+import { fsTools, type ToolDefinition, type ToolExecution } from 'dnt-harness'
 
 let root = ''
 let outside = ''
 let tools: Map<string, ToolDefinition>
 
 beforeAll(async () => {
-  root = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-fs-'))
-  outside = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-fs-out-'))
+  root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-fs-'))
+  outside = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-fs-out-'))
   tools = new Map(fsTools().map((tool) => [tool.name, tool]))
 })
 

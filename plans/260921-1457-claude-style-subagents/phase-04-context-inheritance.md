@@ -17,7 +17,7 @@ opt-in projection of recent parent **messages**. A root that wants a child to op
 specific files still names them. Claude Code's `fork` inherits the whole conversation;
 this phase adds the bounded version of that idea.
 
-<!-- Updated: Validation Session 1 - messages-only source (no CheckpointStore), synchronous capture right after parent resolution, inherit on Agent tool + HTTP only, runtime-only string with durable audit metadata, inheritable full mini-dsh round-trip excluded from the Claude adapter, manifest inspector consumers named -->
+<!-- Updated: Validation Session 1 - messages-only source (no CheckpointStore), synchronous capture right after parent resolution, inherit on Agent tool + HTTP only, runtime-only string with durable audit metadata, inheritable full dnt-harness round-trip excluded from the Claude adapter, manifest inspector consumers named -->
 
 ## Requirements
 
@@ -67,11 +67,11 @@ Non-functional:
   `inherit: 'brief'` a spawn error naming the role. A read-only `explorer` fanned out over
   a repo does not need the conversation, and a role designed for untrusted work should be
   able to say no. Absent `inheritable` means allowed.
-- **`inheritable` is a mini-dsh native key.** It round-trips through the mini-dsh
+- **`inheritable` is a dnt-harness native key.** It round-trips through the dnt-harness
   definition parser, the save/serialize API, web types, and the Settings copy/edit form —
   but the Claude compatibility adapter treats it as unsupported/nonstandard: it is never
   advertised as a Claude frontmatter key and never emitted into a Claude-format file.
-  It is preserved only in mini-dsh native definitions.
+  It is preserved only in dnt-harness native definitions.
 
 ## Architecture
 
@@ -175,7 +175,7 @@ with `sha256Text`), and the omission path above is what the inspector reads.
 - The Claude adapter (`src/harness/agents/compatibility/claude.ts`,
   `CLAUDE_SUPPORTED_KEYS`) does **not** gain the key: importing a Claude file that carries
   `inheritable` reports it as unsupported, and no Claude-format export emits it. It is a
-  mini-dsh native key, preserved in mini-dsh native definitions only.
+  dnt-harness native key, preserved in dnt-harness native definitions only.
 - The `buildContext` call site in `server.ts` passes `inheritedContext` from
   `scope.childOf`.
 
@@ -258,7 +258,7 @@ with `sha256Text`), and the omission path above is what the inspector reads.
       combinations as `SpawnError('packet')`; for a valid `inherit:'brief'` request, a role
       with `inheritable: false` refuses centrally with a typed error naming it. The Agent
       tool surfaces it and HTTP maps it to 400. Absent `inheritable` allows it.
-- [x] `inheritable` survives parse → save → re-read (mini-dsh round-trip) and appears in
+- [x] `inheritable` survives parse → save → re-read (dnt-harness round-trip) and appears in
       the Settings copy/edit form; the Claude adapter reports it unsupported and never
       emits it.
 - [x] The `Agent` tool and the HTTP route both accept `inherit`; the Workbench spawn form

@@ -7,7 +7,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type ModelMessage, type WebServer } from 'mini-dsh'
+import { createWebServer, type LlmProvider, type ModelMessage, type WebServer } from 'dnt-harness'
 
 /** A one-pixel-ish PNG: a real signature is enough for the sniffer. */
 const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('pixels')])
@@ -61,7 +61,7 @@ async function send(content: string, attachments: unknown[]): Promise<Response> 
 }
 
 beforeAll(async () => {
-  home = await fs.mkdtemp(path.join(tmpdir(), 'mini-dsh-attach-web-'))
+  home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-attach-web-'))
   server = await createWebServer({
     home,
     providers: [capturing],

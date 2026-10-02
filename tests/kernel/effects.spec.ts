@@ -1,10 +1,10 @@
 /**
  * Cordis tutorial chapter 2 — Lifecycle and effects, reproduced on the
- * mini-dsh kernel: effects run at load, unwind in reverse on unload, child
+ * dnt-harness kernel: effects run at load, unwind in reverse on unload, child
  * fibers dispose with their parent, and async disposers are awaited.
  */
 import { describe, expect, it } from 'vitest'
-import { Kernel, type Context } from 'mini-dsh'
+import { Kernel, type Context } from 'dnt-harness'
 
 describe('fiber effects (tutorial ch.2)', () => {
   it('runs the effect body at load and its disposer on unload', async () => {
