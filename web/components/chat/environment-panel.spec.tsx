@@ -72,6 +72,32 @@ it('auto-expands into headed sections with counts', async () => {
   expect(host.textContent).toContain('dev')
 })
 
+it('groups ended processes behind a collapsed toggle and clears them', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
+  const events = [
+    ev('process/start', { processId: 'p1', command: 'live-dev', cwd: 'x' }),
+    ev('process/start', { processId: 'p2', command: 'old-build', cwd: 'x' }),
+    ev('process/exit', { processId: 'p2', exitCode: 1, termination: 'killed', durationMs: 5_000 }),
+  ]
+  await render({ ...base, events })
+  const section = () => host.querySelector('section[aria-label="Background processes"]')!.textContent ?? ''
+  // Running stays in view; the ended row is behind the collapsed group.
+  expect(section()).toContain('live-dev')
+  expect(section()).not.toContain('old-build')
+  expect(section()).toContain('Ended · 1')
+  // Expanding the group reveals it.
+  await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Toggle ended processes"]')!.click())
+  expect(section()).toContain('old-build')
+  // Clear drops every ended row; running is untouched.
+  await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Clear ended processes"]')!.click())
+  expect(section()).not.toContain('old-build')
+  expect(section()).not.toContain('Ended · 1')
+  expect(section()).toContain('live-dev')
+  // The dismissal survives a new event for the same id (no resurrection).
+  await act(async () => root!.render(<EnvironmentPanel {...base} events={[...events, ev('process/exit', { processId: 'p2', exitCode: 1, termination: 'killed', durationMs: 5_000 })]} />))
+  expect(section()).not.toContain('old-build')
+})
+
 it('header shows a working indicator while a turn is open', async () => {
   vi.useFakeTimers()
   vi.setSystemTime(new Date('2026-10-01T12:00:00Z'))

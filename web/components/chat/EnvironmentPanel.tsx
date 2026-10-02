@@ -73,7 +73,7 @@ function SyncArrows({ ahead, behind }: { readonly ahead: number; readonly behind
 export function EnvironmentPanel({ workspaceId, sessionId, project, events, connected, onOpenView, onOpenProcess }: Props) {
   // Panel state is scoped to the conversation: switching resets the collapse,
   // the one-shot auto-open, and the per-section disclosure.
-  const [state, setState] = useState<{ scope: string | null; expanded: boolean; autoOpened: boolean; processesOpen: boolean; subagentsOpen: boolean }>({ scope: sessionId, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true })
+  const [state, setState] = useState<{ scope: string | null; expanded: boolean; autoOpened: boolean; processesOpen: boolean; subagentsOpen: boolean; endedOpen: boolean; dismissed: ReadonlySet<string> }>({ scope: sessionId, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, endedOpen: false, dismissed: new Set() })
   const [git, setGit] = useState<GitLine | null>(null)
   const [liveRunning, setLiveRunning] = useState<readonly string[]>([])
   const [stopping, setStopping] = useState<readonly string[]>([])
@@ -87,6 +87,9 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
     [derived, liveRunningIds],
   )
   const running = useMemo(() => rows.filter((row) => row.status === 'running'), [rows])
+  // Ended rows the user has not cleared. Dismissal is per-session view state:
+  // the durable log (and the Process view) keeps the full history.
+  const ended = useMemo(() => rows.filter((row) => row.status !== 'running' && !state.dismissed.has(row.id)), [rows, state.dismissed])
   const runningAgents = useMemo(() => agents.filter((row) => row.running), [agents])
   const hasLive = running.length > 0 || runningAgents.length > 0
 
@@ -103,7 +106,7 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
   const ticking = running.length > 0 || workingSince !== null
 
   const scope = sessionId ?? null
-  if (state.scope !== scope) setState({ scope, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true })
+  if (state.scope !== scope) setState({ scope, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, endedOpen: false, dismissed: new Set() })
 
   // The one-shot auto-open: the first live process or subagent for this
   // conversation expands the panel; a user collapse never reopens it.
@@ -258,7 +261,7 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
               </section>
             ) : null}
 
-            {rows.length > 0 ? (
+            {running.length + ended.length > 0 ? (
               <section aria-label="Background processes" className="flex flex-col">
                 <button
                   type="button"
@@ -269,15 +272,50 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
                   <Icon name="terminal" size={14} className="shrink-0 text-fg-faint" />
                   <span className="font-medium text-fg-muted">Background processes</span>
                   <span className={cn('ml-auto text-[12px]', running.length > 0 ? 'text-warn' : 'text-fg-faint')}>
-                    {running.length > 0 ? `${running.length} running` : `${rows.length} ended`}
+                    {running.length > 0 ? `${running.length} running${ended.length > 0 ? ` · ${running.length + ended.length} total` : ''}` : `${ended.length} ended`}
                   </span>
                   <Icon name="chevron" size={13} className={cn('shrink-0 text-fg-faint transition-transform', state.processesOpen ? '' : 'rotate-180')} />
                 </button>
                 {state.processesOpen ? (
                   <div className="flex flex-col gap-0.5 pb-1">
-                    {rows.map((row) => (
+                    {running.map((row) => (
                       <ProcessLine key={row.id} row={row} now={now} pending={stopping.includes(row.id)} onOpen={() => onOpenProcess(row.id)} onStop={() => void stop(row.id)} />
                     ))}
+                    {ended.length > 0 ? (
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          aria-label="Toggle ended processes"
+                          aria-expanded={state.endedOpen}
+                          onClick={() => setState((prev) => ({ ...prev, endedOpen: !prev.endedOpen }))}
+                          className="flex min-w-0 flex-1 items-center gap-1.5 rounded-sm py-1 text-left text-[12px] text-fg-faint transition-colors hover:text-fg-muted"
+                        >
+                          <Icon name="chevron" size={12} className={cn('shrink-0 transition-transform', state.endedOpen ? 'rotate-180' : '')} />
+                          Ended · {ended.length}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label="Clear ended processes"
+                          title="Clear ended processes"
+                          onClick={() => setState((prev) => {
+                            const dismissed = new Set(prev.dismissed)
+                            for (const row of ended) dismissed.add(row.id)
+                            return { ...prev, dismissed, endedOpen: false }
+                          })}
+                          className="flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 text-[11px] text-fg-faint transition-colors hover:bg-hover hover:text-fg-muted"
+                        >
+                          <Icon name="trash" size={11} />
+                          Clear
+                        </button>
+                      </div>
+                    ) : null}
+                    {state.endedOpen ? (
+                      <div className="flex flex-col gap-0.5">
+                        {ended.map((row) => (
+                          <ProcessLine key={row.id} row={row} now={now} pending={stopping.includes(row.id)} onOpen={() => onOpenProcess(row.id)} onStop={() => void stop(row.id)} />
+                        ))}
+                      </div>
+                    ) : null}
                   </div>
                 ) : null}
               </section>
