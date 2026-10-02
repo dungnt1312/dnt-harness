@@ -1,5 +1,5 @@
 import type { AttachmentRef } from './composer-draft.ts'
-import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillRow, TerminalFrame, TerminalListing, TerminalRow, WorkspaceMeta, WorkspaceRow } from './types.ts'
+import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, WorkspaceMeta, WorkspaceRow } from './types.ts'
 
 const CSRF_HEADER = 'x-mini-dsh-csrf'
 let csrfToken: string | undefined
@@ -552,7 +552,10 @@ export function attachmentUrl(workspaceId: string, id: string): string {
   return `/api/workspaces/${encodeURIComponent(workspaceId)}/attachments/${encodeURIComponent(id)}`
 }
 
-export function sendMessageIn(workspaceId: string, sessionId: string, content: string, clientRequestId?: string, attachments?: readonly AttachmentRef[]): Promise<{ inputId: string; queued: boolean }> {
+/** How a message reaches a running session: wait for the turn, or stop it and run now. */
+export type Delivery = 'queue' | 'steer'
+
+export function sendMessageIn(workspaceId: string, sessionId: string, content: string, clientRequestId?: string, attachments?: readonly AttachmentRef[], delivery: Delivery = 'queue'): Promise<{ inputId: string; queued?: boolean; duplicate?: boolean }> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/messages`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -560,8 +563,16 @@ export function sendMessageIn(workspaceId: string, sessionId: string, content: s
       content,
       ...(clientRequestId !== undefined ? { clientRequestId } : {}),
       ...(attachments !== undefined && attachments.length > 0 ? { attachments } : {}),
+      ...(delivery === 'steer' ? { delivery } : {}),
     }),
-  }).then((r) => json<{ inputId: string; queued: boolean }>(r))
+  }).then((r) => json<{ inputId: string; queued?: boolean; duplicate?: boolean }>(r))
+}
+
+/** "Send now": stop the running turn and run every queued input in one new turn. */
+export function steerSessionIn(workspaceId: string, sessionId: string): Promise<{ steered: boolean; pending: number }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/steer`, {
+    method: 'POST',
+  }).then((r) => json<{ steered: boolean; pending: number }>(r))
 }
 
 // ── G3: modes + manifest ────────────────────────────────────────────────────
@@ -662,15 +673,29 @@ export function compactSession(workspaceId: string, sessionId: string): Promise<
 
 // ── G3 skills ───────────────────────────────────────────────────────────────
 
-export function listSkills(workspaceId: string): Promise<SkillRow[]> {
-  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills`).then((r) => json<SkillRow[]>(r))
+export function listSkills(workspaceId: string, projectId?: string): Promise<SkillRow[]> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills${projectId !== undefined ? `?projectId=${encodeURIComponent(projectId)}` : ''}`).then((r) => json<SkillRow[]>(r))
 }
 
 /** One skill's raw SKILL.md + hash (the settings editor's load). */
-export function getSkill(workspaceId: string, name: string): Promise<SkillRow & { readonly instructions: string }> {
-  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}`).then((r) =>
+export function getSkill(workspaceId: string, name: string, projectId?: string): Promise<SkillRow & { readonly instructions: string }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}${projectId !== undefined ? `?projectId=${encodeURIComponent(projectId)}` : ''}`).then((r) =>
     json<SkillRow & { readonly instructions: string }>(r),
   )
+}
+
+/** The workspace's skill source rules (defaults materialized). */
+export function getSkillSources(workspaceId: string): Promise<{ readonly rules: readonly SkillRuleRow[] }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills/sources`).then((r) => json<{ readonly rules: readonly SkillRuleRow[] }>(r))
+}
+
+/** Replace the skill source rules (validated server-side, last-write-wins). */
+export function putSkillSources(workspaceId: string, rules: readonly SkillRuleRow[]): Promise<{ readonly rules: readonly SkillRuleRow[] }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills/sources`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ rules }),
+  }).then((r) => json<{ readonly rules: readonly SkillRuleRow[] }>(r))
 }
 
 /** Save raw SKILL.md content; pass the row's hash to reject drifted writes. */

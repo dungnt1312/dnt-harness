@@ -9,6 +9,13 @@ export interface ToolCall {
   readonly args: Record<string, unknown>
 }
 
+export type McpOutcome = 'success' | 'error' | 'indeterminate' | 'audit_fault'
+export type InputOutcome = 'admitted' | 'rejected' | 'empty'
+
+const MCP_OUTCOMES: ReadonlySet<string> = new Set<McpOutcome>(['success', 'error', 'indeterminate', 'audit_fault'])
+/** Narrows the shared `outcome` key to a tool-result outcome. */
+export const isMcpOutcome = (value: string | undefined): value is McpOutcome => value !== undefined && MCP_OUTCOMES.has(value)
+
 /** One durable session event; fields are optional per `type`. */
 export interface SseEvent {
   readonly type: string
@@ -33,17 +40,21 @@ export interface SseEvent {
   /** Recovery-synthesized tool results: the real outcome is unknown. */
   readonly recovery?: true
   /**
-   * MCP-only structured outcome. Absent on non-MCP results and legacy logs.
-   * `indeterminate` means the remote effect may have happened and must not be
-   * retried automatically. `audit_fault` means the known outcome could not be
-   * durably recorded and further MCP dispatch is blocked.
+   * `tool/result`: MCP-only structured outcome. Absent on non-MCP results and
+   * legacy logs. `indeterminate` means the remote effect may have happened and
+   * must not be retried automatically. `audit_fault` means the known outcome
+   * could not be durably recorded and further MCP dispatch is blocked.
+   * `input/settled`: whether the accepted input reached the model —
+   * `admitted`, or `rejected`/`empty` (never logged as a user/message).
    */
-  readonly outcome?: 'success' | 'error' | 'indeterminate' | 'audit_fault'
+  readonly outcome?: McpOutcome | InputOutcome
   /** MCP invocation id. A manual repeat is a new invocation. */
   readonly invocationId?: string
   /** Durable input acceptance. */
   readonly inputId?: string
   readonly clientRequestId?: string
+  /** `input/queued`: set when the input was sent with Steer. */
+  readonly delivery?: 'steer'
   /** Files the user attached to this input (references, never bytes). */
   readonly attachments?: readonly AttachmentRef[]
   /** Approval traffic. */
@@ -204,8 +215,12 @@ export interface SessionListing {
   readonly activity?: 'model' | 'tool' | null
   /** Durably queued inputs waiting for a later turn. */
   readonly pendingInputs?: number
+  /** Background Bash processes still running under this conversation. */
+  readonly runningProcesses?: number
   /** Pinned conversations lead the sidebar; recorded in the session's own log. */
   readonly pinned?: boolean
+  /** Set when this row is a subagent: the sidebar nests it under this parent instead of listing it. */
+  readonly parentSessionId?: string | null
 }
 
 /** Per-model operator overrides stored on one provider entry. */
@@ -468,11 +483,21 @@ export interface SkillRow {
   readonly name: string
   readonly title: string
   readonly description: string
-  readonly source: 'workspace' | 'user' | 'bundled'
+  readonly source: 'project' | 'workspace' | 'user' | 'bundled'
+  /** The source rule a project row resolved from (panel grouping). */
+  readonly ruleId?: string
   /** sha256 of the raw SKILL.md — the optimistic-concurrency token. */
   readonly hash: string
   /** Present when this workspace hides the skill from discovery surfaces. */
   readonly hidden?: boolean
+}
+
+/** One configurable skill source folder; list order is precedence order. */
+export interface SkillRuleRow {
+  readonly id: string
+  readonly kind: 'project' | 'workspace' | 'absolute'
+  readonly path?: string
+  readonly enabled: boolean
 }
 
 /** One memory entry; `hash` is the expectedHash token for updates. */
