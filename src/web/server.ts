@@ -1164,6 +1164,7 @@ ${decision.injected}`, ...contents]
     async execute(args) {
       const scope = agentScope.getStore()
       if (scope?.workspaceId === undefined) throw new Error('Skill requires a workspace-scoped execution')
+      const wsId: WorkspaceId = scope.workspaceId
       const action = typeof args['action'] === 'string'
         ? args['action'].trim().toLowerCase()
         : typeof args['name'] === 'string'
@@ -1176,7 +1177,7 @@ ${decision.injected}`, ...contents]
         // Hidden skills stay undiscoverable here (the workspace hid them on
         // purpose); a load by exact name still works — demand-only. Layers
         // follow the workspace's rules plus the bound project's folders.
-        const all = await skillLayers(skills, workspaces, scope.workspaceId, scope.projectId).then((layers) => skills.listVisibleIn(scope.workspaceId, layers))
+        const all = await skillLayers(skills, workspaces, wsId, scope.projectId).then((layers) => skills.listVisibleIn(wsId, layers))
         const matches = query === ''
           ? all
           : all.filter((entry) => `${entry.name}
@@ -1201,14 +1202,14 @@ ${entry.description}`.toLowerCase().includes(query))
         return `skill '${pinned.name}' loaded (hash ${pinned.hash.slice(0, 12)}); its instructions are included in context`
       }
       try {
-        const layers = await skillLayers(skills, workspaces, scope.workspaceId, scope.projectId)
+        const layers = await skillLayers(skills, workspaces, wsId, scope.projectId)
         const loaded = await skills.loadIn(layers, name.trim())
         perTurn.set(loaded.name, { name: loaded.name, instructions: loaded.instructions, hash: loaded.hash })
         skillSnapshots.set(scope.sessionId, perTurn)
         return `skill '${loaded.name}' loaded (hash ${loaded.hash.slice(0, 12)}); its instructions are included in context`
       } catch (error) {
         if (!(error instanceof SkillError) || error.code !== 'not-found') throw error
-        const rows = await skillLayers(skills, workspaces, scope.workspaceId, scope.projectId).then((layers) => skills.listVisibleIn(scope.workspaceId, layers))
+        const rows = await skillLayers(skills, workspaces, wsId, scope.projectId).then((layers) => skills.listVisibleIn(wsId, layers))
         const sought = name.trim().toLowerCase()
         const suggestions = rows
           .filter((entry) => entry.name.includes(sought) || sought.includes(entry.name))
