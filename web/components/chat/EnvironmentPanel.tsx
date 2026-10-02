@@ -189,10 +189,12 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
         // Fixed top-right overlay of the chat column (dntspace arrangement),
         // below the 56px ChatHeader so the header controls stay clickable:
         // the transcript scrolls underneath; the card never pushes content.
-        'absolute right-4 top-[60px] z-20 rounded-xl border border-line bg-surface shadow-lg',
+        // Collapsed is a slim fully-rounded capsule — as little chrome as a
+        // status pill, never a panel competing with the transcript.
+        'absolute right-4 top-[60px] z-20 border border-line bg-surface',
         expanded
-          ? 'flex max-h-[calc(100dvh-140px)] w-[320px] flex-col overflow-y-auto px-3.5 py-2'
-          : 'inline-flex max-w-[min(480px,calc(100%-2rem))] items-center px-3 py-1.5',
+          ? 'flex max-h-[calc(100dvh-140px)] w-[320px] flex-col overflow-y-auto rounded-xl px-3.5 py-2 shadow-lg'
+          : 'inline-flex h-[30px] max-w-[min(480px,calc(100%-2rem))] items-center rounded-full py-0 pl-3 pr-1.5 shadow-sm',
       )}
     >
         <button
@@ -200,19 +202,19 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
           aria-label={collapseLabel}
           aria-expanded={expanded}
           onClick={() => setState((prev) => ({ ...prev, expanded: !prev.expanded }))}
-          className="flex min-h-7 w-full items-center gap-2 text-left transition-colors"
+          className="flex h-full min-h-7 w-full items-center gap-1.5 text-left transition-colors"
         >
-          <span className="shrink-0 text-[13px] font-medium text-fg">Environment</span>
+          <span className="shrink-0 text-[12px] font-medium text-fg">Environment</span>
           {workingLabel !== null ? (
-            <span className="flex shrink-0 items-center gap-1.5 text-[12px] text-fg-muted" role="status">
-              <Spinner size={11} />
-              <span>Working · {workingLabel}</span>
+            <span className="flex shrink-0 items-center gap-1 text-[11px] text-fg-muted" role="status">
+              <Spinner size={10} />
+              <span>Working·{workingLabel}</span>
             </span>
           ) : null}
           {!expanded ? (
             <span className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
               {project !== null && git !== null ? (
-                <span className="truncate text-[12px]">
+                <span className="truncate text-[11px]">
                   <span className="text-fg-muted">{git.branch ?? project.name}</span>
                   {git.added + git.removed > 0 ? (
                     <>
@@ -224,23 +226,23 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
                   <SyncArrows ahead={git.ahead} behind={git.behind} />
                 </span>
               ) : project !== null ? (
-                <span className="truncate text-[12px] text-fg-muted">{git?.branch ?? project.name}</span>
+                <span className="truncate text-[11px] text-fg-muted">{git?.branch ?? project.name}</span>
               ) : null}
               {running.length > 0 ? (
-                <span className="flex shrink-0 items-center gap-1 rounded-md bg-warn-soft px-1.5 py-0.5 text-[11px] font-medium text-warn">
-                  <Icon name="terminal" size={10} />
-                  {running.length} process{running.length === 1 ? '' : 'es'}
+                <span className="flex shrink-0 items-center gap-0.5 rounded bg-warn-soft px-1 py-px text-[10px] font-medium leading-[14px] text-warn" title={`${running.length} background process${running.length === 1 ? '' : 'es'} running`}>
+                  <Icon name="terminal" size={9} />
+                  {running.length}
                 </span>
               ) : null}
               {runningAgents.length > 0 ? (
-                <span className="flex shrink-0 items-center gap-1 rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-medium text-fg-muted">
-                  <Icon name="gitBranch" size={10} />
-                  {runningAgents.length} subagent{runningAgents.length === 1 ? '' : 's'}
+                <span className="flex shrink-0 items-center gap-0.5 rounded bg-muted px-1 py-px text-[10px] font-medium leading-[14px] text-fg-muted" title={`${runningAgents.length} subagent${runningAgents.length === 1 ? '' : 's'} running`}>
+                  <Icon name="gitBranch" size={9} />
+                  {runningAgents.length}
                 </span>
               ) : null}
             </span>
           ) : null}
-          <Icon name="chevron" size={14} className={cn('icon-chevron ml-auto shrink-0 text-fg-faint transition-transform', expanded ? 'rotate-180' : '')} />
+          <Icon name="chevron" size={13} className={cn('icon-chevron ml-auto shrink-0 rounded-full p-0.5 text-fg-faint transition-transform hover:bg-hover hover:text-fg', expanded ? 'rotate-180' : '')} />
         </button>
 
         {expanded ? (
