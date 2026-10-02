@@ -150,9 +150,10 @@ describe('skills + memory tabs', () => {
     expect(html).toContain('New entry')
     expect(html).toContain('No memory entries yet')
   })
-  it('skills list offers a create form with frontmatter guidance', () => {
+  it('skills list offers a create form with layer guidance', () => {
     const html = renderToStaticMarkup(<SkillsPanel workspaceId="ws-1" />)
     expect(html).toContain('New skill')
-    expect(html).toContain('bundled rows are read-only')
+    expect(html).toContain('Source folders')
+    expect(html).toContain('first match wins')
   })
 })
