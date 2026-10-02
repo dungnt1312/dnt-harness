@@ -92,7 +92,9 @@ describe('SkillsPanel skills tab', () => {
         ? [row('ws-skill', 'project', { ruleId: 'project-claude' })]
         : [row('ws-skill', 'workspace')])
     await renderPanel()
-    expect(document.body.textContent).toContain('shadowed')
+    const dot = document.body.querySelector('[aria-label="shadowed"]')
+    expect(dot).not.toBeNull()
+    expect(dot?.getAttribute('title')).toContain('Alpha')
   })
 
   it('opens the detail pane with rendered preview and edit only for workspace rows', async () => {
@@ -181,7 +183,8 @@ describe('SkillsPanel source folders tab', () => {
 
   const openFolders = async (): Promise<void> => {
     await renderPanel()
-    await act(async () => button('Source folders').click())
+    const tab = [...document.body.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find((node) => node.textContent?.startsWith('Source folders'))!
+    await act(async () => tab.click())
     await settle()
   }
 
@@ -217,11 +220,11 @@ describe('SkillsPanel source folders tab', () => {
     await settle()
     let rules = mocked.putSkillSources.mock.calls[0]?.[1] as readonly { id: string }[]
     expect(rules.some((rule) => rule.id === 'project-agents')).toBe(false)
-    const kind = document.body.querySelector<HTMLSelectElement>('select[aria-label="New rule kind"]')!
-    await act(async () => {
-      kind.value = 'absolute'
-      kind.dispatchEvent(new Event('change', { bubbles: true }))
-    })
+    await act(async () => button('New rule kind').click())
+    await settle()
+    const option = [...document.body.querySelectorAll<HTMLElement>('[role="option"]')].find((node) => node.textContent === 'Absolute path')!
+    await act(async () => option.click())
+    await settle()
     const pathInput = document.body.querySelector<HTMLInputElement>('input[aria-label="New rule path"]')!
     await act(async () => type(pathInput, 'D:/shared-skills'))
     await act(async () => button('Add rule').click())

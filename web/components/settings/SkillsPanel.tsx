@@ -6,6 +6,7 @@ import { Badge } from '../ui/Badge.tsx'
 import { Button } from '../ui/Button.tsx'
 import { Field } from '../ui/Field.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
+import { Select } from '../ui/Select.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
 import { deleteSkill, getSkill, getSkillFile, getSkillFiles, getSkillSources, listProjects, listSkills, putSkillSources, saveSkill, setSkillHidden } from '../../lib/api.ts'
 import type { ProjectRow, SkillFileRow, SkillRow, SkillRuleRow } from '../../lib/types.ts'
@@ -27,6 +28,8 @@ import {
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const SKILL_PLACEHOLDER = '---\nname: deploy-notes\ndescription: how deploys work\n---\n\nDeploy runs via pm2…'
 const isConflict = (cause: unknown): boolean => /409/.test(String(cause))
+/** One tree row: fixed height, full-width hover; callers add the indent. */
+const TREE_ROW = 'flex h-7 w-full min-w-0 items-center pr-3 text-left text-[13px] hover:bg-hover'
 type PanelTab = 'skills' | 'folders'
 
 interface SkillGroup {
@@ -65,6 +68,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
   const [fileDetail, setFileDetail] = useScopedState<{ readonly path: string; readonly content: string } | null>(null)
   const [expanded, setExpanded] = useScopedState<ReadonlySet<string>>(new Set<string>())
   const [filesByKey, setFilesByKey] = useScopedState<Readonly<Record<string, readonly SkillFileRow[]>>>({})
+  const [collapsedGroups, setCollapsedGroups] = useScopedState<ReadonlySet<string>>(new Set<string>())
   const [editing, setEditing] = useScopedState<{ readonly name: string; readonly isNew: boolean; readonly hash: string | null; readonly loaded: string } | null>(null)
   const [newName, setNewName] = useScopedState('')
   const [content, setContent] = useScopedState('')
@@ -141,7 +145,14 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
         && (search === '' || `${row.name}\n${row.title}\n${row.description}`.toLowerCase().includes(search.toLowerCase()))),
     }))
     .filter((group) => group.rows.length > 0)
-  const totalVisible = visibleGroups.reduce((sum, group) => sum + group.rows.length, 0)
+  const totalSkills = groups.reduce((sum, group) => sum + group.rows.length, 0)
+
+  const toggleGroup = (key: string): void => {
+    const next = new Set(collapsedGroups)
+    if (next.has(key)) next.delete(key)
+    else next.add(key)
+    setCollapsedGroups(next)
+  }
 
   const projectIdOf = (row: SkillRow): string | undefined =>
     projectRows.find((entry) => entry.rows.includes(row))?.projectId
@@ -267,59 +278,102 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
 
   const badgeTone = (source: SkillRow['source']): 'blue' | 'green' | 'gray' =>
     source === 'workspace' ? 'blue' : source === 'project' ? 'green' : 'gray'
+  const sourceLabel = (source: SkillRow['source']): string =>
+    source === 'project' ? 'Project' : source === 'workspace' ? 'Workspace' : source === 'user' ? 'User' : 'Bundled'
+
+  /** Fixed-height bar at the top of the detail pane: identity + catalog toggle. */
+  const paneHeader = (title: ReactNode, trailing?: ReactNode): ReactNode => (
+    <div className="flex h-12 shrink-0 items-center gap-2 border-b border-line px-4">
+      {title}
+      <span className="min-w-0 flex-1" />
+      {trailing}
+    </div>
+  )
+  /** Second bar: the open file's path plus file-level actions. */
+  const pathBar = (filePath: string, actions?: ReactNode): ReactNode => (
+    <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-4">
+      <Icon name={fileIconName(filePath)} size={13} className="shrink-0 text-fg-faint" />
+      <span className="min-w-0 flex-1 truncate font-mono text-xs text-fg-muted">{filePath}</span>
+      {actions}
+    </div>
+  )
+  /** A quiet one-line read-only marker (a full Notice card is too loud per file). */
+  const readOnlyLine = (text: string): ReactNode => (
+    <p className="m-0 mb-3 flex items-center gap-1.5 text-xs text-fg-faint">
+      <Icon name="lock" size={12} className="shrink-0" />{text}
+    </p>
+  )
+  const skillTitle = (name: string, source: SkillRow['source']): ReactNode => (
+    <>
+      <Icon name="zap" size={14} className="shrink-0 text-fg-muted" />
+      <span className="min-w-0 truncate text-sm font-medium text-fg">{name}</span>
+      <Badge tone={badgeTone(source)}>{sourceLabel(source)}</Badge>
+    </>
+  )
 
   const detailBody = (): ReactNode => {
     if (editing !== null) {
       return (
-        <Section title={editing.isNew ? 'New skill' : `Edit ${editing.name}`}>
-          {editing.isNew ? (
-            <Field
-              label="Name"
-              tone={nameInvalid || nameTaken ? 'bad' : 'default'}
-              hint={nameInvalid ? 'Use lowercase letters, numbers, and single hyphens.' : nameTaken ? 'A skill with this name exists — edit it from the list instead.' : 'Kebab-case directory name, e.g. deploy-notes.'}
-            >
-              <TextInput mono invalid={nameInvalid || nameTaken} value={newName} placeholder="deploy-notes" onChange={(e) => setNewName(e.target.value)} />
+        <>
+          {paneHeader(
+            <span className="text-sm font-medium text-fg">{editing.isNew ? 'New skill' : `Edit ${editing.name}`}</span>,
+            <Badge tone="blue">Workspace</Badge>,
+          )}
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+            {editing.isNew ? (
+              <Field
+                label="Name"
+                tone={nameInvalid || nameTaken ? 'bad' : 'default'}
+                hint={nameInvalid ? 'Use lowercase letters, numbers, and single hyphens.' : nameTaken ? 'A skill with this name exists — open it from the tree instead.' : 'Kebab-case folder name, e.g. deploy-notes.'}
+              >
+                <TextInput mono invalid={nameInvalid || nameTaken} value={newName} placeholder="deploy-notes" onChange={(e) => setNewName(e.target.value)} />
+              </Field>
+            ) : null}
+            <Field label="SKILL.md" hint="Markdown with frontmatter (name, description).">
+              <CodeArea tall value={content} placeholder={SKILL_PLACEHOLDER} onChange={(e) => setContent(e.target.value)} />
             </Field>
-          ) : null}
-          <Field label="SKILL.md content" hint="Markdown with frontmatter (name, description). The frontmatter name should match the skill name.">
-            <CodeArea tall value={content} placeholder={SKILL_PLACEHOLDER} onChange={(e) => setContent(e.target.value)} />
-          </Field>
-          {conflict ? (
-            <div className="flex flex-wrap items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn">
-              <span className="min-w-0 flex-1 basis-48">The file changed on disk since you opened it.</span>
-              <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void reloadServer()}>Reload server version</Button>
-              <Button variant="outline-danger" size="sm" disabled={busy !== null} onClick={() => void overwrite()}>Overwrite anyway</Button>
-            </div>
-          ) : null}
-          <div className="flex flex-wrap gap-2">
-            <Button variant="primary" size="sm" disabled={busy !== null || cannotSave} onClick={() => void save()}>{busy === 'save' ? 'Saving…' : 'Save skill'}</Button>
-            <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => { setEditing(null); setConflict(false) }}>Cancel</Button>
+            {conflict ? (
+              <div className="flex flex-wrap items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn">
+                <span className="min-w-0 flex-1 basis-48">The file changed on disk since you opened it.</span>
+                <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void reloadServer()}>Reload server version</Button>
+                <Button variant="outline-danger" size="sm" disabled={busy !== null} onClick={() => void overwrite()}>Overwrite anyway</Button>
+              </div>
+            ) : null}
           </div>
-        </Section>
+          <div className="flex shrink-0 justify-end gap-2 border-t border-line px-4 py-3">
+            <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => { setEditing(null); setConflict(false) }}>Cancel</Button>
+            <Button variant="primary" size="sm" disabled={busy !== null || cannotSave} onClick={() => void save()}>{busy === 'save' ? 'Saving…' : 'Save skill'}</Button>
+          </div>
+        </>
       )
     }
-    if (selected === null) return <EmptyState>Select a skill to preview it.</EmptyState>
+    if (selected === null || (selected.file === 'SKILL.md' ? detail === null : fileDetail === null)) {
+      return (
+        <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
+          <Icon name="fileText" size={20} className="text-fg-faint" />
+          <p className="m-0 text-[13px] text-fg-muted">Select a skill or one of its files to preview it.</p>
+        </div>
+      )
+    }
     if (selected.file !== 'SKILL.md' && fileDetail !== null) {
       return (
-        <Section title={`${selected.name} — ${fileDetail.path}`}>
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge tone={badgeTone(selected.source)}>{selected.source}</Badge>
-            <span className="min-w-0 break-all font-mono text-xs text-fg-faint">{fileDetail.path}</span>
+        <>
+          {paneHeader(skillTitle(selected.name, selected.source))}
+          {pathBar(fileDetail.path)}
+          <div className="min-h-0 flex-1 overflow-auto p-4">
+            {readOnlyLine('Preview only — edit with an external editor; changes load on the next read.')}
+            <pre className="m-0 font-mono text-xs leading-relaxed whitespace-pre-wrap text-fg">{fileDetail.content}</pre>
           </div>
-          <Notice kind="info" text="Preview only — edit the file with an external editor; changes load fresh on the next read." />
-          <pre className="max-h-[50vh] overflow-auto rounded-lg border border-border-subtle bg-bg-inset p-3 font-mono text-xs whitespace-pre-wrap">{fileDetail.content}</pre>
-        </Section>
+        </>
       )
     }
-    if (detail === null) return <EmptyState>Select a skill to preview it.</EmptyState>
+    if (detail === null) return null
     const readOnly = selected.source !== 'workspace'
     return (
-      <Section title={detail.title === detail.name ? detail.name : `${detail.name} — ${detail.title}`}>
-        <div className="flex flex-wrap items-center gap-2">
-          <Badge tone={badgeTone(selected.source)}>{selected.source}</Badge>
-          {(detail.hidden ?? false) ? <Icon name="eyeOff" size={13} className="text-fg-faint" /> : null}
-          <span className="min-w-0 flex-1" />
-          <label className="flex cursor-pointer items-center gap-1.5 text-[13px] text-fg-muted" title="List in the model's skill catalog">
+      <>
+        {paneHeader(
+          skillTitle(detail.name, selected.source),
+          <label className="flex cursor-pointer items-center gap-1.5 text-[13px] text-fg-muted" title="Offer this skill in the model's skill catalog">
             <input
               type="checkbox"
               className="size-3.5 accent-primary"
@@ -329,33 +383,31 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
               onChange={() => void toggleCatalog({ ...detail, source: selected.source })}
             />
             In catalog
-          </label>
-        </div>
-        <p className="font-mono text-xs text-fg-faint">/SKILL.md</p>
-        {readOnly ? <Notice kind="info" text="This layer is read-only here — edit the file with an external editor; changes load fresh on the next read." /> : null}
-        {detail.description !== '' ? <p className="text-[13px] text-fg-muted">{detail.description}</p> : null}
-        <div className="max-h-[50vh] overflow-auto rounded-lg border border-border-subtle p-3 text-[13px]">
+          </label>,
+        )}
+        {pathBar('SKILL.md', !readOnly ? (
+          deleteName === detail.name ? (
+            <InlineConfirm
+              message={`Delete “${detail.name}”?`}
+              confirmLabel="Delete"
+              busy={busy === `delete:${detail.name}`}
+              onConfirm={() => void remove(detail)}
+              onCancel={() => setDeleteName(null)}
+            />
+          ) : (
+            <>
+              <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => openEditorFromDetail(detail)}>
+                <Icon name="pencil" size={13} />Edit raw
+              </Button>
+              <IconButton label={`Delete ${detail.name}`} disabled={busy !== null} onClick={() => setDeleteName(detail.name)}><Icon name="trash" size={14} /></IconButton>
+            </>
+          )
+        ) : undefined)}
+        <div className="min-h-0 flex-1 overflow-auto px-5 py-4 text-[13px]">
+          {readOnly ? readOnlyLine('Read-only layer — edit with an external editor; changes load on the next read.') : null}
           <Markdown content={detail.instructions} />
         </div>
-        {!readOnly ? (
-          <div className="flex flex-wrap items-center gap-2">
-            <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => openEditorFromDetail(detail)}>
-              <Icon name="pencil" size={13} />Edit raw
-            </Button>
-            {deleteName === detail.name ? (
-              <InlineConfirm
-                message={`Delete “${detail.name}”? Its SKILL.md is removed from this workspace.`}
-                confirmLabel="Delete permanently"
-                busy={busy === `delete:${detail.name}`}
-                onConfirm={() => void remove(detail)}
-                onCancel={() => setDeleteName(null)}
-              />
-            ) : (
-              <IconButton label={`Delete ${detail.name}`} disabled={busy !== null} onClick={() => setDeleteName(detail.name)}><Icon name="trash" size={14} /></IconButton>
-            )}
-          </div>
-        ) : null}
-      </Section>
+      </>
     )
   }
 
@@ -368,116 +420,141 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
     <PanelBody>
       <PanelIntro>Skills are SKILL.md instruction packages the model loads by name. Project folders (.claude/skills, .agents/skills) follow the rule list in “Source folders” — precedence is list order, first match wins.</PanelIntro>
       {notice !== null ? <Notice kind={notice.kind} text={notice.text} /> : null}
-      <div className="flex gap-1 rounded-lg bg-bg-inset p-1 text-[13px]" role="tablist">
+      <div className="inline-flex self-start rounded-lg bg-muted p-0.5" role="tablist" aria-label="Skills view">
         {(['skills', 'folders'] as const).map((candidate) => (
           <button
             key={candidate}
             type="button"
             role="tab"
             aria-selected={tab === candidate}
-            className={`rounded-md px-3 py-1.5 ${tab === candidate ? 'bg-bg-surface text-fg shadow-sm' : 'text-fg-muted'}`}
+            className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[13px] transition-colors ${tab === candidate ? 'bg-surface text-fg shadow-sm dark:bg-hover' : 'text-fg-muted hover:text-fg'}`}
             onClick={() => setTab(candidate)}
           >
+            <Icon name={candidate === 'skills' ? 'zap' : 'folder'} size={13} />
             {candidate === 'skills' ? 'Skills' : 'Source folders'}
+            <span className="rounded-full bg-hover px-1.5 text-[11px] leading-4 text-fg-faint">{candidate === 'skills' ? totalSkills : rules.length}</span>
           </button>
         ))}
       </div>
       {tab === 'skills' ? (
-        <div className="grid gap-3 lg:grid-cols-[minmax(240px,2fr)_3fr]">
-          <Section
-            title="Skills"
-            count={totalVisible}
-            actions={(
-              <>
-                <IconButton label="Refresh skills" disabled={busy !== null} onClick={() => void refresh()}><Icon name="refresh" size={14} /></IconButton>
-                <Button variant="outline" size="sm" disabled={busy !== null} onClick={beginNew}><Icon name="plus" size={13} />New skill</Button>
-              </>
-            )}
-          >
-            <div className="flex gap-2">
-              <div className="min-w-0 flex-1">
-                <TextInput value={search} placeholder="Search skills" onChange={(e) => setSearch(e.target.value)} />
-              </div>
-              <select
-                aria-label="Filter by layer"
-                className="shrink-0 rounded-md border border-border-subtle bg-bg-surface px-2 py-1.5 text-[13px]"
-                value={sourceFilter}
-                onChange={(e) => setSourceFilter(e.target.value as 'all' | SkillRow['source'])}
-              >
-                <option value="all">All</option>
-                <option value="project">Project</option>
-                <option value="workspace">Workspace</option>
-                <option value="user">User</option>
-                <option value="bundled">Bundled</option>
-              </select>
+        <div className="grid h-[min(560px,calc(100vh-460px))] min-h-[360px] overflow-hidden rounded-xl border border-line md:grid-cols-[minmax(260px,320px)_1fr]">
+          <div className="flex min-h-0 flex-col border-b border-line md:border-r md:border-b-0">
+            <div className="flex h-12 shrink-0 items-center gap-1 border-b border-line pr-2 pl-4">
+              <span className="text-[11px] font-semibold tracking-wider text-fg-faint uppercase">Skills</span>
+              <span className="min-w-0 flex-1" />
+              <IconButton label="Refresh skills" disabled={busy !== null} onClick={() => void refresh()}><Icon name="refresh" size={14} /></IconButton>
+              <IconButton label="New skill" disabled={busy !== null} onClick={beginNew}><Icon name="plus" size={15} /></IconButton>
             </div>
-            {visibleGroups.length === 0 ? <EmptyState>No skills match.</EmptyState> : (
-              <ItemList label="Skills">
-                {visibleGroups.map((group) => (
-                  <div key={group.key} className="space-y-1">
-                    <p className="flex items-center gap-1.5 pt-1 text-xs font-medium text-fg-faint">
-                      <Icon name="folder" size={12} />{group.label}
-                      <span className="ml-auto">{group.rows.length}</span>
-                    </p>
-                    {group.rows.map((row) => {
+            <div className="flex shrink-0 gap-2 border-b border-line p-2">
+              <div className="min-w-0 flex-1">
+                <TextInput
+                  className="h-8"
+                  leading={<Icon name="search" size={13} />}
+                  value={search}
+                  placeholder="Search skills"
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+              </div>
+              <div className="w-[112px] shrink-0">
+                <Select
+                  label="Filter by layer"
+                  triggerClassName="h-8 px-2.5 text-[13px]"
+                  value={sourceFilter}
+                  onChange={(value) => setSourceFilter(value as 'all' | SkillRow['source'])}
+                  options={[
+                    { value: 'all', label: `All (${totalSkills})` },
+                    { value: 'project', label: 'Project' },
+                    { value: 'workspace', label: 'Workspace' },
+                    { value: 'user', label: 'User' },
+                    { value: 'bundled', label: 'Bundled' },
+                  ]}
+                />
+              </div>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto py-1" role="tree" aria-label="Skills">
+              {visibleGroups.length === 0 ? (
+                <p className="m-0 px-4 py-6 text-center text-[13px] text-fg-muted">{totalSkills === 0 ? 'No skills yet.' : 'No skills match.'}</p>
+              ) : visibleGroups.map((group) => {
+                const groupOpen = !collapsedGroups.has(group.key) || search !== ''
+                return (
+                  <div key={group.key} role="group">
+                    <button
+                      type="button"
+                      className={`${TREE_ROW} gap-1.5 pl-2 font-medium text-fg`}
+                      aria-expanded={groupOpen}
+                      title={group.label}
+                      onClick={() => toggleGroup(group.key)}
+                    >
+                      <Icon name="chevron" size={12} className={`shrink-0 text-fg-faint transition-transform ${groupOpen ? '' : '-rotate-90'}`} />
+                      <Icon name={groupOpen ? 'folderOpen' : 'folder'} size={14} className="shrink-0 text-fg-muted" />
+                      <span className="min-w-0 flex-1 truncate">{group.label}</span>
+                      <span className="shrink-0 text-xs font-normal text-fg-faint">{group.rows.length}</span>
+                    </button>
+                    {groupOpen ? group.rows.map((row) => {
                       const key = `${group.key}:${row.name}`
                       const isOpen = expanded.has(key)
                       const files = filesByKey[key]
                       const shadowedIn = group.source !== 'project' ? shadowingProjects(row.name) : []
                       const description = row.description !== '' ? row.description : row.title !== row.name ? row.title : ''
+                      const rowActive = selected?.name === row.name && selected.source === row.source
                       return (
-                        <div key={key}>
-                          <div className="flex items-center gap-0.5">
-                            <IconButton label={`Toggle ${row.name}`} disabled={busy !== null} onClick={() => toggleSkill(row, key)}>
-                              <Icon name="chevron" size={12} className={isOpen ? '' : '-rotate-90'} />
-                            </IconButton>
+                        <div key={key} role="treeitem" aria-expanded={isOpen}>
+                          <div className={`${TREE_ROW} pl-6 ${rowActive && !isOpen ? 'bg-hover' : ''}`}>
+                            <button
+                              type="button"
+                              aria-label={`Toggle ${row.name}`}
+                              className="flex size-5 shrink-0 items-center justify-center rounded text-fg-faint hover:text-fg"
+                              onClick={() => toggleSkill(row, key)}
+                            >
+                              <Icon name="chevron" size={12} className={`transition-transform ${isOpen ? '' : '-rotate-90'}`} />
+                            </button>
                             <button
                               type="button"
                               title={description !== '' ? `${row.name} — ${description}` : row.name}
-                              className={`flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1 py-0.5 text-left text-[13px] ${selected?.name === row.name && selected.source === row.source ? 'text-fg' : 'text-fg-muted hover:text-fg'}`}
-                              onClick={() => { toggleSkill(row, key); void openDetail(row) }}
+                              className={`flex h-full min-w-0 flex-1 items-center gap-1.5 text-left ${(row.hidden ?? false) ? 'text-fg-faint' : 'text-fg'}`}
+                              onClick={() => { if (!isOpen) toggleSkill(row, key); void openDetail(row) }}
                             >
-                              <Icon name="folder" size={13} className="shrink-0" />
-                              <span className={`truncate ${(row.hidden ?? false) ? 'opacity-60' : ''}`}>{row.name}</span>
+                              <Icon name={isOpen ? 'folderOpen' : 'folder'} size={14} className="shrink-0 text-fg-muted" />
+                              <span className="min-w-0 truncate">{row.name}</span>
                             </button>
-                            {(row.hidden ?? false) ? <Icon name="eyeOff" size={12} className="shrink-0 text-fg-faint" /> : null}
+                            {(row.hidden ?? false) ? <span title="Hidden from the catalog" className="flex shrink-0"><Icon name="eyeOff" size={12} className="text-fg-faint" /></span> : null}
                             {shadowedIn.length > 0 ? (
-                              <Badge
-                                tone="amber"
-                                title={`Also defined in ${shadowedIn.join(', ')} — that copy wins for those projects' sessions (first match in the rule list).`}
-                              >
-                                shadowed
-                              </Badge>
+                              <span
+                                className="size-1.5 shrink-0 rounded-full bg-warn"
+                                title={`Shadowed: also defined in ${shadowedIn.join(', ')} — that copy wins for those projects' sessions (first match in the rule list).`}
+                                aria-label="shadowed"
+                              />
                             ) : null}
                           </div>
                           {isOpen ? (
-                            <div className="ml-6 space-y-0.5 border-l border-border-subtle pl-2">
-                              {files === undefined ? (
-                                <p className="px-1 py-0.5 text-xs text-fg-faint">Loading files…</p>
-                              ) : files.length === 0 ? (
-                                <p className="px-1 py-0.5 text-xs text-fg-faint">No files.</p>
-                              ) : files.map((file) => (
+                            files === undefined ? (
+                              <p className="m-0 flex h-7 items-center pl-[68px] text-xs text-fg-faint">Loading…</p>
+                            ) : files.map((file) => {
+                              const fileActive = rowActive && selected?.file === file.path
+                              return (
                                 <button
                                   key={file.path}
                                   type="button"
-                                  className={`flex w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-left text-xs ${selected?.name === row.name && selected.file === file.path ? 'text-fg' : 'text-fg-muted hover:text-fg'}`}
+                                  role="treeitem"
+                                  aria-label={file.path}
+                                  className={`${TREE_ROW} gap-1.5 pl-[52px] ${fileActive ? 'bg-hover text-fg' : 'text-fg-muted'}`}
                                   onClick={() => void openFile(row, file.path)}
                                 >
-                                  <Icon name={fileIconName(file.path)} size={12} className="shrink-0 text-fg-faint" />
-                                  <span className="truncate">{file.path}</span>
+                                  <Icon name={fileIconName(file.path)} size={13} className="shrink-0 text-fg-faint" />
+                                  <span className="min-w-0 truncate">{file.path}</span>
                                 </button>
-                              ))}
-                            </div>
+                              )
+                            })
                           ) : null}
                         </div>
                       )
-                    })}
+                    }) : null}
                   </div>
-                ))}
-              </ItemList>
-            )}
-          </Section>
-          {detailBody()}
+                )
+              })}
+            </div>
+          </div>
+          <div className="flex min-h-0 min-w-0 flex-col">{detailBody()}</div>
         </div>
       ) : (
         <Section title="Source folders" count={rules.length}>
@@ -572,21 +649,22 @@ function FoldersEditor(props: {
           />
         ))}
       </ItemList>
-      <div className="flex flex-wrap items-end gap-2">
-        <Field label="Kind">
-          <select
-            aria-label="New rule kind"
-            className="rounded-md border border-border-subtle bg-bg-surface px-2 py-1.5 text-[13px]"
+      <div className="flex flex-wrap items-center gap-2 rounded-xl border border-dashed border-line p-3">
+        <div className="w-[150px] shrink-0">
+          <Select
+            label="New rule kind"
+            triggerClassName="h-8 px-2.5 text-[13px]"
             value={newKind}
-            onChange={(e) => setNewKind(e.target.value as 'project' | 'absolute')}
-          >
-            <option value="project">Project folder</option>
-            <option value="absolute">Absolute path</option>
-          </select>
-        </Field>
-        <Field label={newKind === 'project' ? 'Relative folder (e.g. .claude/skills)' : 'Absolute folder (e.g. D:/shared-skills)'}>
-          <TextInput mono aria-label="New rule path" value={newPath} placeholder={newKind === 'project' ? '.team/skills' : 'D:/shared-skills'} onChange={(e) => setNewPath(e.target.value)} />
-        </Field>
+            onChange={(value) => setNewKind(value as 'project' | 'absolute')}
+            options={[
+              { value: 'project', label: 'Project folder' },
+              { value: 'absolute', label: 'Absolute path' },
+            ]}
+          />
+        </div>
+        <div className="min-w-[200px] flex-1">
+          <TextInput className="h-8" mono aria-label="New rule path" value={newPath} placeholder={newKind === 'project' ? 'Relative, e.g. .team/skills' : 'Absolute, e.g. D:/shared-skills'} onChange={(e) => setNewPath(e.target.value)} />
+        </div>
         <Button
           variant="outline"
           size="sm"
