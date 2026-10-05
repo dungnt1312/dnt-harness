@@ -65,7 +65,8 @@ describe('projectRuleBase / absoluteRuleBase', () => {
   })
 
   it('expands ~ against the home dir and refuses relative absolute rules', () => {
-    expect(absoluteRuleBase('D:/shared')).toBe(path.normalize('D:/shared'))
+    // A drive-anchored path is only absolute where drive letters exist.
+    expect(absoluteRuleBase('D:/shared')).toBe(process.platform === 'win32' ? path.normalize('D:/shared') : undefined)
     expect(absoluteRuleBase('~')).toBe(homedir())
     expect(absoluteRuleBase('relative')).toBeUndefined()
   })
@@ -101,10 +102,12 @@ describe('resolveSkillLayers', () => {
 
 describe('protectedRootsForRules', () => {
   it('collects enabled absolute rule folders only', () => {
+    // A real temp dir keeps this cross-platform; 'D:/skills' is undefined off Windows.
+    const enabled = path.join(homedir(), 'skills-protected-root')
     expect(protectedRootsForRules([
-      { id: 'u', kind: 'absolute', path: 'D:/skills', enabled: true },
-      { id: 'off', kind: 'absolute', path: 'E:/off', enabled: false },
+      { id: 'u', kind: 'absolute', path: enabled, enabled: true },
+      { id: 'off', kind: 'absolute', path: path.join(homedir(), 'skills-off'), enabled: false },
       { id: 'p', kind: 'project', path: '.claude/skills', enabled: true },
-    ])).toEqual([path.normalize('D:/skills')])
+    ])).toEqual([path.normalize(enabled)])
   })
 })

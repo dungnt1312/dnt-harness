@@ -88,6 +88,15 @@ async function readProcessSample(pid: number): Promise<ProcessSample | undefined
       return { memoryMb: parsed.m ?? 0, cpuSeconds: parsed.c ?? 0 }
     } catch { return undefined }
   }
+  if (process.platform === 'darwin') {
+    const stdout = await new Promise<string | undefined>((resolve) => {
+      execFile('ps', ['-o', 'rss=,cputime=', '-p', String(pid)], { encoding: 'utf8', timeout: 5_000 }, (error, out) => resolve(error === null ? out : undefined))
+    })
+    if (stdout === undefined) return undefined
+    const match = /^\s*(\d+)\s+(\S+)\s*$/.exec(stdout)
+    if (match === null) return undefined
+    return { memoryMb: Number(match[1]) / 1024, cpuSeconds: parseCpuTime(match[2] ?? '') }
+  }
   try {
     const status = readFileSync(`/proc/${pid}/status`, 'utf8')
     const stat = readFileSync(`/proc/${pid}/stat`, 'utf8').trim().split(/\s+/)
@@ -97,6 +106,14 @@ async function readProcessSample(pid: number): Promise<ProcessSample | undefined
     const ticks = Number(stat[13] ?? 0) + Number(stat[14] ?? 0)
     return { memoryMb: kb / 1024, cpuSeconds: ticks / 100 }
   } catch { return undefined }
+}
+
+/** `[[dd-]hh:]mm:ss[.cc]` as `ps cputime` prints it, as cumulative seconds. */
+function parseCpuTime(raw: string): number {
+  const normalized = raw.replace(/^(\d+)-(\d+):/, (_all, days: string, hours: string) => `${(Number(days) * 24 + Number(hours)) * 60}:`)
+  const [clock = '', centis = ''] = normalized.split('.')
+  const seconds = clock.split(':').reduce((total, part) => total * 60 + (Number(part) || 0), 0)
+  return seconds + (Number(centis) || 0) / 100
 }
 
 /** stdio: one subprocess per (workspace, server), newline-delimited JSON-RPC. */

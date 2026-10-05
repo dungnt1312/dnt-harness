@@ -254,8 +254,18 @@ describe('G5 web MCP + hooks', () => {
   it('enabling authorizes the canonical executable; a changed file is refused until enabled again', async () => {
     const provider: LlmProvider = { name: 'idle', models: ['idle'], async *stream() { yield { type: 'delta', delta: 'ok' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }
     const { base, wsId, home } = await boot(provider)
-    const binary = path.join(home, `node-copy${path.extname(process.execPath)}`)
-    await fs.copyFile(process.execPath, binary)
+    // A file we own at an absolute path that can run the fixture. A node
+    // binary copy cannot: dynamically linked builds (Homebrew, non-Windows
+    // system node) lose their libraries when moved. A one-line script keeps
+    // the pin meaningful — own file, own bytes, runnable — everywhere.
+    let binary: string
+    if (process.platform === 'win32') {
+      binary = path.join(home, `node-copy${path.extname(process.execPath)}`)
+      await fs.copyFile(process.execPath, binary)
+    } else {
+      binary = path.join(home, 'fixture-runner.sh')
+      await fs.writeFile(binary, `#!/bin/sh\nexec '${process.execPath.replace(/'/g, `'\\''`)}' '${mcpFixture.replace(/'/g, `'\\''`)}' "$@"\n`, { mode: 0o755 })
+    }
     const route = `/api/workspaces/${wsId}/mcp/pinned`
     expect((await post(base, route, { transport: 'stdio', command: binary, args: [mcpFixture], enabled: false })).status).toBe(201)
     expect((await post(base, `${route}/enable`)).status).toBe(200)
