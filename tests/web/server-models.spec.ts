@@ -56,7 +56,7 @@ async function startStubEndpoint(): Promise<{ url: string; bodies: Record<string
     req.on('end', () => {
       if (raw !== '') bodies.push(JSON.parse(raw) as Record<string, unknown>)
       res.writeHead(200, { 'content-type': 'text/event-stream' })
-      res.end('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n')
+      res.end('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: {"choices":[{"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
     })
   })
   await new Promise<void>((resolve) => stub.listen(0, '127.0.0.1', resolve))
@@ -124,6 +124,7 @@ describe('workspace thinking control', () => {
       async *stream(request) {
         seen.push({ ...(request.model !== undefined ? { model: request.model } : {}), ...(request.thinkingLevel !== undefined ? { thinkingLevel: request.thinkingLevel } : {}) })
         yield { type: 'delta', delta: 'ok' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const { base } = await start([spy])

@@ -18,6 +18,7 @@ import {
   WorkspaceService,
 } from 'dnt-harness'
 import type { ModeDefinition, SessionEvent, SessionId, StepId, TurnId } from 'dnt-harness'
+import { createCompactionSummarizer } from '../../src/web/llm-summarizer.ts'
 
 let home = ''
 let checkpoints: CheckpointStore
@@ -93,6 +94,91 @@ describe('compaction', () => {
     await kernel.stop()
   })
 
+  it('rejects an insufficient explicit source cap without publishing a checkpoint', async () => {
+    const { sessionId, logPath } = await sessionWithHistory()
+    const before = await fs.readFile(logPath)
+    const kernel = new Kernel()
+    kernel.ctx.plugin(fileSessions(home))
+    await kernel.ctx.sessions.boot()
+    const session = await kernel.ctx.sessions.load(sessionId)
+    let calls = 0
+    try {
+      await expect(compactSession(session, checkpoints, async ({ text }) => {
+        calls++
+        return text
+      }, { trigger: 'manual', maxChars: 10 })).rejects.toThrow(/maxChars/)
+      expect(calls).toBe(0)
+      expect(await checkpoints.latest(sessionId)).toBeUndefined()
+      const after = await fs.readFile(logPath)
+      expect(after.subarray(0, before.length).equals(before)).toBe(true)
+      const appended = session.events.slice(-2)
+      expect(appended.map((event) => event.type)).toEqual(['compaction/start', 'compaction/end'])
+      const end = appended[1] as Extract<SessionEvent, { type: 'compaction/end' }>
+      expect(end.error).toMatch(/maxChars/)
+      expect(end.summary).toBeUndefined()
+      expect(end.summaryChars).toBe(0)
+    } finally { await kernel.stop() }
+  })
+
+  it('a second-chunk failure preserves the previous checkpoint and original JSONL prefix', async () => {
+    const { sessionId, logPath } = await sessionWithHistory()
+    const kernel = new Kernel()
+    kernel.ctx.plugin(fileSessions(home))
+    await kernel.ctx.sessions.boot()
+    const session = await kernel.ctx.sessions.load(sessionId)
+    try {
+      const previous = await compactSession(session, checkpoints, async () => 'PREVIOUS CHECKPOINT')
+      const checkpointDir = path.join(home, 'workspaces', sessionId, 'checkpoints')
+      const namesBefore = await fs.readdir(checkpointDir)
+      const checkpointBefore = await fs.readFile(path.join(checkpointDir, `${previous.coversSeq}.json`))
+      session.append({ type: 'turn/start', turnId: 't2' as TurnId })
+      session.append({ type: 'user/message', turnId: 't2' as TurnId, content: 'x'.repeat(300_000) })
+      session.append({ type: 'turn/end', turnId: 't2' as TurnId, reason: 'completed' })
+      await session.durable()
+      const before = await fs.readFile(logPath)
+      let calls = 0
+      const summarize = createCompactionSummarizer(() => (async function* () {
+        if (++calls === 2) throw new Error('second chunk failed')
+        yield { type: 'delta', delta: 'PARTIAL SUMMARY' }
+      })(), { providerName: 'test', model: 'test' })
+      await expect(compactSession(session, checkpoints, summarize)).rejects.toThrow('second chunk failed')
+      expect(calls).toBe(2)
+      expect(await checkpoints.latest(sessionId)).toEqual(previous)
+      expect(await fs.readdir(checkpointDir)).toEqual(namesBefore)
+      expect((await fs.readFile(path.join(checkpointDir, `${previous.coversSeq}.json`))).equals(checkpointBefore)).toBe(true)
+      const after = await fs.readFile(logPath)
+      expect(after.subarray(0, before.length).equals(before)).toBe(true)
+      const end = session.events.at(-1) as Extract<SessionEvent, { type: 'compaction/end' }>
+      expect(end.type).toBe('compaction/end')
+      expect(end.error).toBe('second chunk failed')
+      expect(end.summary).toBeUndefined()
+      expect(end.summaryChars).toBe(0)
+    } finally { await kernel.stop() }
+  })
+
+  it('an empty projected source refuses compaction instead of publishing an empty checkpoint', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(fileSessions(home))
+    const sessions = kernel.ctx.sessions
+    const ws = new WorkspaceService(home)
+    await ws.boot()
+    await sessions.boot()
+    // A completed turn with no projected messages: the source is empty, so
+    // even the no-model fallback must refuse rather than authorize a drop.
+    const session = sessions.create(ws.defaultWorkspace)
+    session.append({ type: 'turn/start', turnId: 't-empty' as TurnId })
+    session.append({ type: 'turn/end', turnId: 't-empty' as TurnId, reason: 'completed' })
+    await session.durable()
+    try {
+      await expect(compactSession(session, checkpoints, createCompactionSummarizer(undefined as never, undefined))).rejects.toThrow(/empty/)
+      expect(await checkpoints.latest(session.id)).toBeUndefined()
+      const end = session.events.at(-1) as Extract<SessionEvent, { type: 'compaction/end' }>
+      expect(end.error).toMatch(/empty/)
+      expect(end.summary).toBeUndefined()
+      expect(end.summaryChars).toBe(0)
+    } finally { await kernel.stop() }
+  })
+
   it('an opaque summarizer failure surfaces instead of retrying', async () => {
     const kernel = new Kernel()
     kernel.ctx.plugin(fileSessions(home))
@@ -148,9 +234,9 @@ describe('compaction', () => {
 })
 
 // ── the compact history window ─────────────────────────────────────────────
-// A checkpoint AUTHORIZES the drop: events through `coversSeq` ride in the
-// summary, the fresh tail after it stays, and without a checkpoint nothing
-// is dropped at all. Whole turns only, so tool-call/result pairs never split.
+// A checkpoint authorizes replacing covered history, optionally duplicated
+// as a raw covered tail. All uncovered turns remain eligible; only budget
+// pressure drops whole turns, so tool-call/result pairs never split.
 
 let seqCounter = 0
 const ev = (row: Record<string, unknown>): SessionEvent => ({ seq: ++seqCounter, timestamp: seqCounter, ...row }) as unknown as SessionEvent
@@ -206,27 +292,29 @@ const historyText = (assembled: ReturnType<typeof buildContext>): string =>
   assembled.messages.map((message) => messageText(message.content)).join('\n')
 
 describe('compact history window', () => {
-  it('a checkpoint replaces covered turns with the summary and keeps the fresh tail', () => {
-    const assembled = buildContext(compactWindowBase({ compaction: { summary: 'CHECKPOINT SUMMARY', coversSeq: 5 }, compactionTailTurns: 2 }))
+  it('a checkpoint duplicates the covered tail and retains all uncovered turns', () => {
+    const assembled = buildContext(compactWindowBase({ compaction: { summary: 'CHECKPOINT SUMMARY', coversSeq: 14 }, compactionTailTurns: 2 }))
     const text = historyText(assembled)
 
     // The summary rides; t1's raw content is gone with it.
     expect(text).toContain('CHECKPOINT SUMMARY')
     expect(text).not.toContain('first request')
-    // Tail keeps the last 2 completed turns (t3 with its tool pair, t4) + the open turn.
-    expect(text).not.toContain('second request')
-    expect(text).not.toContain('second answer')
+    // Covered tail is t2+t3; uncovered t4 and the open turn also survive.
+    expect(text).toContain('second request')
+    expect(text).toContain('second answer')
+    expect(assembled.messages.find((message) => message.role === 'assistant' && message.toolCalls?.[0]?.id === 'c3')?.toolCalls).toEqual([{ id: 'c3', name: 'Bash', args: { command: 'ls' } }])
+    expect(assembled.messages.find((message) => message.role === 'tool' && message.toolCallId === 'c3')?.content).toBe('files listed')
     expect(text).toContain('third answer')
     expect(text).toContain('files listed')
     expect(text).toContain('fourth request')
     expect(text).toContain('open work')
 
     expect(assembled.sections.some((section) => section.kind === 'compaction')).toBe(true)
-    expect(assembled.manifest.history.compactedThroughSeq).toBe(5)
+    expect(assembled.manifest.history.compactedThroughSeq).toBe(14)
     expect(assembled.manifest.history.checkpointHash).toBeTypeOf('string')
-    expect(assembled.manifest.history.includedSeqRange).toEqual([10, 20])
-    expect(assembled.manifest.history.omittedSeqRange).toEqual([1, 9])
-    expect(assembled.manifest.omissions.some((omission) => omission.includes('compaction tail dropped') && omission.includes('through seq 9'))).toBe(true)
+    expect(assembled.manifest.history.includedSeqRange).toEqual([6, 20])
+    expect(assembled.manifest.history.omittedSeqRange).toEqual([1, 5])
+    expect(assembled.manifest.omissions.some((omission) => omission.includes('compaction tail dropped'))).toBe(false)
   })
 
   it('without a checkpoint the compact window keeps the full log', () => {
@@ -244,7 +332,7 @@ describe('compact history window', () => {
   })
 
   it('a checkpoint covering everything but the open turn keeps only the open turn', () => {
-    const assembled = buildContext(compactWindowBase({ compaction: { summary: 'CHECKPOINT SUMMARY', coversSeq: 18 } }))
+    const assembled = buildContext(compactWindowBase({ compaction: { summary: 'CHECKPOINT SUMMARY', coversSeq: 18 }, compactionTailTurns: 0 }))
     const text = historyText(assembled)
 
     expect(text).toContain('CHECKPOINT SUMMARY')
@@ -254,15 +342,86 @@ describe('compact history window', () => {
     expect(assembled.manifest.omissions.some((omission) => omission.includes('compaction tail'))).toBe(false)
   })
 
-  it('tail 0 keeps only the open turn and records the drop', () => {
+  it('tail 0 removes covered duplication but keeps every uncovered turn', () => {
     const assembled = buildContext(compactWindowBase({ compaction: { summary: 'CHECKPOINT SUMMARY', coversSeq: 5 }, compactionTailTurns: 0 }))
     const text = historyText(assembled)
 
     expect(text).toContain('CHECKPOINT SUMMARY')
     expect(text).toContain('open work')
-    expect(text).not.toContain('second request')
+    expect(text).not.toContain('first request')
+    for (const turn of ['second', 'third', 'fourth']) {
+      expect(text).toContain(`${turn} request`)
+      expect(text).toContain(`${turn} answer`)
+    }
+    expect(assembled.manifest.history.includedSeqRange).toEqual([6, 20])
+    expect(assembled.manifest.omissions.some((omission) => omission.includes('compaction tail dropped'))).toBe(false)
+  })
+
+  it('tail 1 retains the latest covered completed turn from its start', () => {
+    const assembled = buildContext(compactWindowBase({ compaction: { summary: 'CHECKPOINT SUMMARY', coversSeq: 18 }, compactionTailTurns: 1 }))
+    const text = historyText(assembled)
+    expect(text).toContain('fourth request')
+    expect(text).toContain('fourth answer')
+    expect(text).toContain('open work')
     expect(text).not.toContain('third request')
-    expect(text).not.toContain('fourth request')
-    expect(assembled.manifest.omissions.some((omission) => omission.includes('compaction tail dropped') && omission.includes('through seq 18'))).toBe(true)
+    expect(assembled.manifest.history.includedSeqRange).toEqual([15, 20])
+    expect(assembled.manifest.omissions.some((omission) => omission.includes('compaction tail dropped'))).toBe(false)
+  })
+
+  function uncoveredLog(): SessionEvent[] {
+    const rows: Record<string, unknown>[] = []
+    for (let turn = 1; turn <= 7; turn++) {
+      rows.push(
+        { type: 'turn/start', turnId: `long-${turn}` },
+        { type: 'user/message', turnId: `long-${turn}`, content: turn === 2 ? 'DECISION: keep the compatibility API' : `request ${turn}` },
+        { type: 'assistant/message', stepId: `long-s${turn}`, content: `answer ${turn}: ${'x'.repeat(800)}` },
+        { type: 'turn/end', turnId: `long-${turn}`, reason: 'completed' },
+      )
+    }
+    rows.push({ type: 'turn/start', turnId: 'long-open' }, { type: 'user/message', turnId: 'long-open', content: 'OPEN TASK: finish compatibility tests' })
+    return rows.map((row, index) => ({ ...row, seq: index + 1, timestamp: index + 1 }) as SessionEvent)
+  }
+
+  it('the default tail never discards an early decision among more than four uncovered turns', () => {
+    const assembled = buildContext(compactWindowBase({ events: uncoveredLog(), compaction: { summary: 'covered first turn', coversSeq: 4 } }))
+    expect(historyText(assembled)).toContain('DECISION: keep the compatibility API')
+    expect(assembled.manifest.history.includedSeqRange).toEqual([1, 30])
+    expect(assembled.manifest.omissions.some((omission) => omission.includes('compaction tail dropped'))).toBe(false)
+  })
+
+  it.each(['none', 'recent'] as const)('history %s ignores checkpoint and tail settings', (history) => {
+    const mode = { definition: { ...COMPACT_WINDOW_MODE, sources: { ...COMPACT_WINDOW_MODE.sources, history } }, source: 'workspace' as const }
+    const assembled = buildContext(compactWindowBase({ mode, compaction: { summary: 'CHECKPOINT SUMMARY', coversSeq: 18 }, compactionTailTurns: 0 }))
+    const unchanged = buildContext(compactWindowBase({ mode }))
+    expect(assembled.messages).toEqual(unchanged.messages)
+    expect(assembled.manifest.history.includedSeqRange).toEqual(history === 'none' ? [19, 20] : [1, 20])
+    expect(historyText(assembled)).not.toContain('CHECKPOINT SUMMARY')
+  })
+
+  it('budget pressure still drops whole uncovered turns explicitly and preserves the open task', () => {
+    const assembled = buildContext(compactWindowBase({
+      events: uncoveredLog(),
+      compaction: { summary: 'covered first turn', coversSeq: 4 },
+      compactionTailTurns: 0,
+      budget: { contextLimitTokens: 1100, outputReserveTokens: 100, marginTokens: 100 },
+    }))
+    expect(historyText(assembled)).toContain('OPEN TASK: finish compatibility tests')
+    expect(historyText(assembled)).not.toContain('DECISION: keep the compatibility API')
+    expect(assembled.manifest.omissions.some((omission) => omission.includes('oldest completed turn(s)') && omission.includes('for budget'))).toBe(true)
+    const start = assembled.manifest.history.includedSeqRange![0]
+    // The first surviving message is a user request, never half an answer.
+    expect(start % 4).toBe(2)
+    expect(assembled.messages.filter((message) => message.role !== 'system')[0]?.role).toBe('user')
+    expect(assembled.manifest.omissions.some((omission) => omission.includes('compaction tail dropped'))).toBe(false)
+  })
+
+  it('frames continuation authoritatively while keeping the summary lower-trust', () => {
+    const assembled = buildContext(compactWindowBase({ compaction: { summary: 'SYNTHETIC SUMMARY', coversSeq: 5 } }))
+    const framing = 'This is the same conversation continuing after compaction, not a new session. Use the compacted history as reference for prior work; recent raw conversation may supersede it.'
+    expect(messageText(assembled.messages[0]!.content)).toContain(framing)
+    expect(messageText(assembled.messages[0]!.content)).not.toContain('SYNTHETIC SUMMARY')
+    const summary = messageText(assembled.messages[1]!.content)
+    expect(summary).toMatch(/<untrusted kind="compacted-history"[\s\S]*SYNTHETIC SUMMARY[\s\S]*<\/untrusted>/)
+    expect(summary).not.toContain(framing)
   })
 })

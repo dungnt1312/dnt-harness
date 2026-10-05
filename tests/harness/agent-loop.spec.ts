@@ -341,15 +341,55 @@ describe('agent loop', () => {
       void kernel.stop()
     })
 
-    it('a failure after output started is never retried, so output cannot be duplicated', async () => {
+    it('a transient mid-stream failure on the first attempt abandons the step and re-asks under a fresh id', async () => {
       const { kernel, session, agent, llm } = harness(['unused'])
-      kernel.ctx.provide('limits', { stepRetryBaseMs: 1 })
+      kernel.ctx.provide('limits', { stepRetries: 2, stepRetryBaseMs: 1 })
       let requests = 0
       llm.register({
         name: 'midstream',
         async *stream() {
           requests += 1
-          yield { type: 'delta' as const, delta: 'partial ' }
+          if (requests === 1) {
+            yield { type: 'delta' as const, delta: 'partial ' }
+            throw transient()
+          }
+          yield { type: 'delta' as const, delta: 'recovered' }
+          yield { type: 'completion' as const, finishReason: 'stop' as const, transport: 'done' as const, policy: 'strict' as const, transportSettled: true }
+        },
+      })
+      llm.use('midstream')
+
+      agent.send('hello')
+      await agent.run()
+
+      expect(requests).toBe(2)
+      expect(session.events.some((event) => event.type === 'turn/error')).toBe(false)
+      const last = session.events[session.events.length - 1]
+      expect(last?.type === 'turn/end' && last.reason).toBe('completed')
+      // The spent attempt is tombstoned and the fresh step owns the answer.
+      const abandoned = session.events.filter((event) => event.type === 'step/abandoned')
+      expect(abandoned).toHaveLength(1)
+      const starts = session.events.filter((event) => event.type === 'step/start')
+      expect(starts).toHaveLength(2)
+      expect(starts[1]?.stepId).not.toBe(starts[0]?.stepId)
+      expect(abandoned[0]?.type === 'step/abandoned' && abandoned[0].stepId).toBe(starts[0]?.stepId)
+      // Model history carries one answer, not the duplicated partial.
+      expect(session.deriveMessages()).toEqual([
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'recovered' },
+      ])
+      void kernel.stop()
+    })
+
+    it('a second mid-stream failure of the same step is final, so the transcript cannot grow unbounded', async () => {
+      const { kernel, session, agent, llm } = harness(['unused'])
+      kernel.ctx.provide('limits', { stepRetries: 2, stepRetryBaseMs: 1 })
+      let requests = 0
+      llm.register({
+        name: 'midstream',
+        async *stream() {
+          requests += 1
+          yield { type: 'delta' as const, delta: `partial ${requests} ` }
           throw transient()
         },
       })
@@ -358,7 +398,49 @@ describe('agent loop', () => {
       agent.send('hello')
       await agent.run()
 
-      expect(requests).toBe(1)
+      expect(requests).toBe(2)
+      expect(session.events.filter((event) => event.type === 'step/abandoned')).toHaveLength(1)
+      expect(session.events.find((event) => event.type === 'turn/error')).toMatchObject({ kind: 'provider' })
+      void kernel.stop()
+    })
+
+    it('a failure after output started in a later step is never retried, so output cannot be duplicated', async () => {
+      const kernel = new Kernel()
+      kernel.ctx.plugin(SessionsService)
+      kernel.ctx.plugin(LlmService)
+      kernel.ctx.plugin(ToolsService)
+      kernel.ctx.plugin(AgentsService)
+      const session = kernel.ctx.sessions.create()
+      const agent = kernel.ctx.agents.create(session)
+      kernel.ctx.provide('limits', { stepRetryBaseMs: 1 })
+      let requests = 0
+      kernel.ctx.llm.register({
+        name: 'midstream',
+        async *stream() {
+          requests += 1
+          if (requests === 1) {
+            // Step one completes with a tool call; the tool result drives step two.
+            yield { type: 'toolCalls' as const, calls: [{ id: 'c1', name: 'noop', args: {} }] }
+            yield { type: 'completion' as const, finishReason: 'tool_calls' as const, transport: 'done' as const, policy: 'strict' as const, transportSettled: true }
+            return
+          }
+          yield { type: 'delta' as const, delta: 'partial ' }
+          throw transient()
+        },
+      })
+      kernel.ctx.llm.use('midstream')
+      kernel.ctx.tools.register({
+        name: 'noop',
+        description: 'answers ok',
+        parameters: { type: 'object', properties: {}, required: [] },
+        execute: async () => 'ok',
+      })
+
+      agent.send('hello')
+      await agent.run()
+
+      expect(requests).toBe(2)
+      expect(session.events.filter((event) => event.type === 'step/abandoned')).toHaveLength(0)
       expect(session.events.find((event) => event.type === 'turn/error')).toMatchObject({ kind: 'provider' })
       void kernel.stop()
     })

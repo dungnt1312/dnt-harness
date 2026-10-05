@@ -57,6 +57,11 @@ export type SessionEvent =
       readonly invocationId?: string
     } & SessionEventStamp)
   | ({ readonly type: 'step/end'; readonly turnId: TurnId; readonly stepId: StepId } & SessionEventStamp)
+  // A step whose model request failed mid-stream and was abandoned for a fresh
+  // retry under a new step id. The attempt's streamed chunks belong to this
+  // step and never join model history (there is no assistant/message); the
+  // marker lets every projection fold them away as an interrupted attempt.
+  | ({ readonly type: 'step/abandoned'; readonly turnId: TurnId; readonly stepId: StepId; readonly reason: string } & SessionEventStamp)
   | ({ readonly type: 'turn/end'; readonly turnId: TurnId; readonly reason: TurnEndReason } & SessionEventStamp)
   | ({ readonly type: 'turn/error'; readonly turnId: TurnId; readonly kind: TurnErrorKind; readonly message: string } & SessionEventStamp)
   | ({
@@ -335,6 +340,7 @@ export function deriveMessages(events: readonly SessionEvent[], attachments?: At
       case 'assistant/chunk':
       case 'tool/call':
       case 'step/end':
+      case 'step/abandoned':
       case 'turn/end':
       case 'turn/error':
       case 'approval/request':

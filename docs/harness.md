@@ -238,6 +238,8 @@ turn/start
      append admitted input as user/message
      derive model history from the log (+ tool schemas)
      agent/request (waterfall) -> llm/stream (waterfall) -> assistant/chunk*
+     transient mid-stream failure on the first attempt of a step
+       -> step/abandoned (chunks are spent) -> fresh step/start -> re-ask
      assistant/message (+toolCalls)
      tool/call* -> tools/pre-execute -> execute -> tools/post-execute -> tool/result*
      step/end
@@ -537,8 +539,8 @@ started is never retried), `toolTimeoutMs`, `approvalExpiryMs`, `toolOutputLimit
 `maxPendingInputs`, `automaticCompactionPressure` (usedTokens/availableTokens
 ratio from the session's newest context manifest that triggers automatic
 compaction at a completed boundary; 0 disables), `compactionTailTurns`
-(completed turns kept in context after the newest compaction checkpoint,
-default 4), plus composer-attachment limits
+(latest covered completed turns duplicated raw beside the summary,
+default 4; 0 disables covered duplication, not uncovered history), plus composer-attachment limits
 `maxAttachmentBytes`, `maxAttachmentsPerMessage`, and `attachmentTextLimit`
 (model-visible cap for inlined text attachments; images travel as `ContentPart`
 image parts with a flat `IMAGE_TOKEN_ESTIMATE` so multi-image turns do not
@@ -570,13 +572,26 @@ never shed; as a last resort before `ContextBudgetError` it keeps only the
 newest result. Disabled loaders contribute nothing. Compaction (`context/compaction.ts`)
 writes immutable checkpoints with range/provenance at completed boundaries and
 never mutates the original JSONL. A checkpoint replaces only the covered range:
-the covered events ride in the summary (a lower-trust wrapped block), the last
-`compactionTailTurns` completed turns after it stay raw so fresh context
-survives the boundary, and older post-checkpoint turns drop as recorded
-omissions until the next compaction covers them. The host summarizer is the
-session's effective (provider, model) pair with a structured-section prompt
-(`COMPACT_SUMMARY_PROMPT`); with no pair it degrades to the bounded extractive
-fallback. Automatic compaction triggers on context pressure —
+the covered events ride in the summary (a lower-trust wrapped block), with the
+latest `compactionTailTurns` covered completed turns optionally duplicated raw
+(default four; zero disables duplication). **All uncovered history** remains
+eligible, regardless of the tail count. Existing budget trimming may still drop
+oldest completed turns as whole units, preserving tool-call/result pairing and
+the open task; those budget omissions are explicitly recorded in the manifest.
+Trusted context frames this as the same conversation continuing after compaction,
+not a new session, and recent raw conversation may supersede the summary.
+The summary itself remains lower-trust reference data, never authoritative instructions.
+The host summarizer uses the session's effective (provider, model) pair with a
+structured-section prompt (`COMPACT_SUMMARY_PROMPT`). It folds the entire covered
+projection chronologically through bounded requests, carrying the accumulated
+summary into each later request. Each conversation-source payload, including the
+accumulated summary, is at most 200,000 characters; returned summaries are at
+most 24,000 characters. Failed, empty, or oversized output prevents publication
+of a new checkpoint rather than silently claiming partial coverage. An explicit
+`maxChars` source cap rejects insufficient bounds instead of slicing the source.
+With no model pair, the extractive fallback preserves the exact source only if
+it fits within 24,000 characters, otherwise it fails explicitly.
+Automatic compaction triggers on context pressure —
 `usedTokens/availableTokens` from the newest manifest at a settled boundary —
 and PreCompact hooks gate both the manual route and the automatic trigger.
 Every attempt is durably visible through two log-only events:
@@ -619,8 +634,16 @@ root stops waiting:
   model progress. After progress starts there is no silence timeout: a hung
   upstream must be stopped by the user. First-progress timeouts are retried like
   an empty stream (`stepRetries`, exponential
-  backoff). Requests are re-assembled per attempt. Nothing is retried once a
-  chunk has reached the log, and a user stop is never retried.
+  backoff). Requests are re-assembled per attempt. A user stop is never retried.
+- *Died mid-stream.* A transient failure after chunks reached the log is no
+  longer final either, on the step's first attempt: the streamed text never
+  joined model history (only `assistant/message` does) and no tool ran under
+  that step id, so re-asking duplicates nothing. The loop appends
+  `step/abandoned` for the spent step, mints a fresh step id, and re-asks
+  wholesale — once per step; a second failure is final, and later steps of the
+  same turn (whose input was tool output, not user input) still fail at once.
+  Projections fold the abandoned step's chunks behind a discarded-attempt
+  disclosure instead of duplicating them.
 - *The root stops calling tools while children run.* Closing the turn would
   cancel them and lose their work. Instead the `agent/turn-continuation` serial
   event lets the host join the turn's unreported children

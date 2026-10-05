@@ -328,7 +328,7 @@ export class Agent {
       }
 
       let lastStep: StepId | null = null
-      let nextContents: readonly string[] = decision.contents
+      let nextContents: readonly string[] | undefined = decision.contents
       let nextClaimed: readonly InboxItem[] = claimed
       // A turn keeps spending steps while tools owe the model their results —
       // and while delegated work it left running still owes it a report.
@@ -348,7 +348,7 @@ export class Agent {
           throw error
         }
         lastStep = step.stepId
-        nextContents = []
+        nextContents = undefined
         nextClaimed = []
         if (step.toolCalls.length > 0) continue
         // The model is done asking. Work it delegated and left running would be
@@ -447,17 +447,17 @@ export class Agent {
    *
    * @returns the step id and the tool calls the model made.
    */
-  private async step(turnId: TurnId, contents: readonly string[], claimed: readonly InboxItem[]): Promise<{ stepId: StepId; toolCalls: readonly ToolCall[] }> {
+  private async step(turnId: TurnId, contents: readonly string[] | undefined, claimed: readonly InboxItem[]): Promise<{ stepId: StepId; toolCalls: readonly ToolCall[] }> {
     const signal = this.abortController?.signal
     const assertLive = (): void => {
       if (signal?.aborted === true) throw this.abortError()
     }
 
-    const stepId = newStepId()
+    let stepId = newStepId()
     this.session.append({ type: 'step/start', turnId, stepId })
-    const metadataByContentIndex = matchClaimedContents(contents, claimed)
-    for (let index = 0; index < contents.length; index++) {
-      const content = contents[index] ?? ''
+    const metadataByContentIndex = matchClaimedContents(contents ?? [], claimed)
+    for (let index = 0; index < (contents?.length ?? 0); index++) {
+      const content = contents?.[index] ?? ''
       // Middleware may insert/reorder content. Metadata follows only the exact
       // original item it belongs to; inserted context never steals an input id
       // or attachment merely because it occupies the same array position.
@@ -494,6 +494,11 @@ export class Agent {
     let calls: readonly ToolCall[] = []
     let request: ModelRequest = { messages: [] }
     let squeeze = 0
+    // A discarded attempt's chunks never became an assistant/message, so no
+    // tool ran under this step id yet; the first mid-stream failure may still
+    // be retried by abandoning the step wholesale and re-asking under a fresh
+    // id. Only once per step: after the re-ask, a second failure is final.
+    let discardBudget = 1
     const owner = new LogicalRequest({ firstProgressMs: this.limits().streamFirstEventMs, idleMs: this.limits().streamIdleMs, totalMs: this.limits().logicalRequestMs, retryBaseMs: this.limits().stepRetryBaseMs, maxAttempts: Math.min(4, this.limits().stepRetries + 1) })
     const cancelOwner = (): void => owner.cancel()
     signal?.addEventListener('abort', cancelOwner, { once: true })
@@ -612,6 +617,23 @@ export class Agent {
         const stopped = signal?.aborted === true
         if (stopped) throw this.abortError()
         const error = caught
+        // A mid-stream failure with output already in the log used to end the
+        // turn: re-asking would duplicate the streamed text. It is safe to ask
+        // again anyway — the chunks never joined model history (only
+        // assistant/message does) and no tool ran under this step id — so the
+        // step is abandoned as consumed and a fresh one re-asks wholesale.
+        // One discard per step keeps the spent transcript bounded.
+        if (emitted && discardBudget > 0 && error instanceof ProviderError && error.transient && contents !== undefined) {
+          discardBudget -= 1
+          this.session.append({ type: 'step/abandoned', turnId, stepId, reason: error.message.slice(0, 200) })
+          await this.flushOrHalt()
+          stepId = newStepId()
+          this.session.append({ type: 'step/start', turnId, stepId })
+          // The same gateway just failed; wait like any retry would before
+          // spending the fresh step, so a dead upstream gets its backoff.
+          try { await owner.backoff(signal, error.retryAfterMs) } catch (error) { assertLive(); throw error }
+          continue
+        }
         // Only a request that produced nothing may be asked again: once a chunk
         // reached the log, a second attempt would duplicate it.
         if (!(error instanceof ProviderError) || stopped || !owner.canRetry(error, emitted)) throw error

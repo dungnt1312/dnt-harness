@@ -61,9 +61,9 @@ export interface BuildContextInput {
    */
   readonly compaction?: { readonly summary: string; readonly coversSeq: number }
   /**
-   * Completed turns kept in context after the compaction checkpoint (the
-   * fresh tail). Defaults to {@link DEFAULT_COMPACTION_TAIL_TURNS}; 0 keeps
-   * only the open turn.
+   * Latest covered completed turns duplicated raw alongside the summary.
+   * Defaults to {@link DEFAULT_COMPACTION_TAIL_TURNS}; 0 disables covered
+   * duplication. All uncovered history remains eligible until budget trimming.
    */
   readonly compactionTailTurns?: number
   /**
@@ -359,6 +359,9 @@ export function buildContext(input: BuildContextInput): AssembledContext {
   if (input.fileScope !== undefined && input.fileScope.primary !== '' && schemas.some((schema) => FILE_TOOLS.has(schema.name))) {
     systemParts.push(fileScopeText(input.fileScope))
   }
+  if (mode.definition.sources.history === 'compact' && input.compaction !== undefined) {
+    systemParts.push('This is the same conversation continuing after compaction, not a new session. Use the compacted history as reference for prior work; recent raw conversation may supersede it.')
+  }
   // The instruction prose alone, before lower-trust workspace text joins the
   // block — the breakdown reports the two separately.
   const promptText = systemParts.join('\n\n')
@@ -386,9 +389,6 @@ export function buildContext(input: BuildContextInput): AssembledContext {
 
   // ── history window per setting ─────────────────────────────
   const window = historyWindow(input.events, mode.definition.sources.history, input.compaction, input.compactionTailTurns)
-  if (window.tailDroppedThroughSeq !== undefined) {
-    omissions.push(`history: compaction tail dropped older completed turn(s) through seq ${window.tailDroppedThroughSeq}`)
-  }
   let dated = deriveDatedMessages(input.events, window.startSeq, input.attachments)
   const totalTurns = countTurns(input.events)
 
@@ -663,11 +663,9 @@ interface HistoryWindow {
   /** Seq of the still-open turn (undefined when none is open). */
   readonly openTurnStartSeq: number | undefined
   readonly omittedTurns: number
-  /** Set when the compaction tail dropped older completed turns: the exclusive seq through which they left context. */
-  readonly tailDroppedThroughSeq?: number
 }
 
-/** Completed turns kept in context after the newest compaction checkpoint. */
+/** Latest covered completed turns duplicated raw beside the checkpoint summary. */
 const DEFAULT_COMPACTION_TAIL_TURNS = 4
 
 /** The window of log events a history setting includes. */
@@ -687,35 +685,28 @@ function historyWindow(
     if (open === undefined) return { startSeq: lastSeq + 1, openTurnStartSeq: undefined, omittedTurns: total }
     return { startSeq: open, openTurnStartSeq: open, omittedTurns: total - 1 }
   }
-  // `compact`: a checkpoint AUTHORIZES replacing raw history with its
-  // summary — events through `coversSeq` ride in the summary, never as raw
-  // messages. Without a checkpoint nothing authorized a drop, so the window
-  // is the full log (the budget trimmer still bounds the request, loudly).
-  // The tail after the checkpoint keeps the last `tailTurns` completed turns
-  // so fresh context survives the summary boundary; older post-checkpoint
-  // turns fall out as recorded omissions until the next compaction covers
-  // them.
+  // `compact`: only covered history may be replaced by the summary. Keep
+  // the latest `tailTurns` covered completed turns raw as optional duplication,
+  // plus ALL uncovered history. Only the budget trimmer may drop uncovered
+  // completed turns, explicitly; without a checkpoint the full log is eligible.
   const covered = compaction?.coversSeq ?? 0
   if (covered <= 0) return { startSeq: 1, openTurnStartSeq: open, omittedTurns: 0 }
   const starts = completedTurnStarts(events, covered)
   const tail = tailTurns > 0 ? Math.floor(tailTurns) : 0
   let startSeq = covered + 1
-  let tailDroppedThroughSeq: number | undefined
-  if (starts.length > tail) {
-    startSeq = tail === 0 ? open : starts[starts.length - tail]!
-    tailDroppedThroughSeq = startSeq - 1
+  if (tail > 0 && starts.length > 0) {
+    startSeq = starts[Math.max(0, starts.length - tail)]!
   }
   if (startSeq > open) startSeq = open // defensive: the open turn is never dropped
   return {
     startSeq,
     openTurnStartSeq: open,
-    omittedTurns: total - 1,
-    ...(tailDroppedThroughSeq !== undefined ? { tailDroppedThroughSeq } : {}),
+    omittedTurns: total - countTurnsFrom(events, startSeq),
   }
 }
 
-/** Start seqs of completed turns that begin after `afterSeq`. */
-function completedTurnStarts(events: readonly SessionEvent[], afterSeq: number): number[] {
+/** Start seqs of completed turns covered by the checkpoint boundary. */
+function completedTurnStarts(events: readonly SessionEvent[], coversSeq: number): number[] {
   const starts: number[] = []
   let openTurnId: string | undefined
   let pendingStart: number | undefined
@@ -724,7 +715,7 @@ function completedTurnStarts(events: readonly SessionEvent[], afterSeq: number):
       openTurnId = event.turnId
       pendingStart = event.seq
     } else if (event.type === 'turn/end' && event.turnId === openTurnId) {
-      if (pendingStart !== undefined && pendingStart > afterSeq) starts.push(pendingStart)
+      if (pendingStart !== undefined && pendingStart <= coversSeq) starts.push(pendingStart)
       openTurnId = undefined
       pendingStart = undefined
     }

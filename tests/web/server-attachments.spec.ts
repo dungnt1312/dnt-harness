@@ -24,6 +24,7 @@ const capturing: LlmProvider = {
   async *stream(request) {
     lastMessages = request.messages
     yield { type: 'delta', delta: 'seen' }
+    yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
   },
 }
 

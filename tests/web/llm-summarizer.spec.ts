@@ -46,29 +46,99 @@ describe('llm compaction summarizer', () => {
     await expect(summarize({ text: 'user: hello' })).rejects.toThrow(/empty summary/)
   })
 
-  it('bounds the source conversation and the returned summary', async () => {
+  it('folds every character of a >1.1M transcript and carries latest state forward', async () => {
+    const markers = ['START_STATE', 'MIDDLE_STATE', 'END_STATE', '44f6ada', '60 suites / 1.204 tests',
+      'browser audio acceptance', 'media smoke automation', 'production secret rotation', 'flake monitoring']
+    const text = `${markers[0]}\n${'synthetic exchange\n'.repeat(33_000)}${markers[1]}\n${'synthetic exchange\n'.repeat(33_000)}${markers.slice(2).join('\n')}`
+    expect(text.length).toBeGreaterThan(1_100_000)
     const seen: ModelRequest[] = []
-    const summarize = createCompactionSummarizer(scriptedStream([
-      { type: 'delta', delta: 'x'.repeat(30_000) },
-    ], seen), PAIR)
-    const summary = await summarize({ text: 'y'.repeat(300_000) })
-    expect(summary).toHaveLength(24_000)
-    const content = seen[0]!.messages[0]!.content as string
-    // prompt + '<conversation>' wrapper + at most 200k source chars
-    expect(content.length).toBeLessThanOrEqual(COMPACT_SUMMARY_PROMPT.length + 200_000 + 40)
+    const chunks: string[] = []
+    const outputs: string[] = []
+    const summarize = createCompactionSummarizer((request) => (async function* () {
+      seen.push(request)
+      const content = request.messages[0]!.content as string
+      expect(content.length).toBeLessThanOrEqual(200_000)
+      const source = content.slice(content.indexOf('<conversation>\n') + '<conversation>\n'.length, content.lastIndexOf('\n</conversation>'))
+      chunks.push(source)
+      if (outputs.length > 0) {
+        expect(content).toContain('<earlier-summary>')
+        expect(content).toContain(outputs.at(-1))
+        expect(content.indexOf('<earlier-summary>\n')).toBeLessThan(content.indexOf('<conversation>\n'))
+      }
+      const output = markers.filter((marker) => source.includes(marker) || outputs.at(-1)?.includes(marker)).join('\n')
+      outputs.push(output)
+      yield { type: 'delta', delta: output }
+    })(), PAIR)
+    const summary = await summarize({ text })
+    expect(chunks.join('')).toBe(text)
+    expect(seen.length).toBeGreaterThan(5)
+    for (const marker of markers) expect(summary).toContain(marker)
+    // With many available newlines, chunks should end at a line boundary.
+    for (const chunk of chunks.slice(0, -1)) expect(chunk.endsWith('\n')).toBe(true)
+  })
+
+  it('chunks oversized single lines without splitting a UTF-16 surrogate pair', async () => {
+    const overhead = `${COMPACT_SUMMARY_PROMPT}\n\n<conversation>\n\n</conversation>`.length
+    const text = `${'x'.repeat(200_000 - overhead - 1)}😀${'y'.repeat(250_000)}`
+    const chunks: string[] = []
+    const summarize = createCompactionSummarizer((request) => (async function* () {
+      const content = request.messages[0]!.content as string
+      expect(content.length).toBeLessThanOrEqual(200_000)
+      const chunk = content.slice(content.indexOf('<conversation>\n') + '<conversation>\n'.length, content.lastIndexOf('\n</conversation>'))
+      expect(chunk).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/u)
+      chunks.push(chunk)
+      yield { type: 'delta', delta: 'bounded summary' }
+    })(), PAIR)
+    await summarize({ text })
+    expect(chunks.join('')).toBe(text)
+    expect(chunks.length).toBeGreaterThan(1)
+  })
+
+  it.each([[24_001], [12_000, 12_001]])('rejects overflowing deltas %j without consuming further output', async (...sizes: number[]) => {
+    let consumed = 0
+    let closed = false
+    const summarize = createCompactionSummarizer(() => (async function* () {
+      try {
+        for (const size of sizes) {
+          consumed++
+          yield { type: 'delta', delta: 'x'.repeat(size) }
+        }
+        consumed++
+        yield { type: 'delta', delta: 'must not be consumed' }
+      } finally { closed = true }
+    })(), PAIR)
+    await expect(summarize({ text: 'user: hello' })).rejects.toThrow(/24,?000|24000/)
+    expect(consumed).toBe(sizes.length)
+    expect(closed).toBe(true)
+  })
+
+  it('rejects a second-chunk exception rather than returning partial coverage', async () => {
+    let calls = 0
+    const summarize = createCompactionSummarizer(() => (async function* () {
+      if (++calls === 2) throw new Error('second chunk failed')
+      yield { type: 'delta', delta: 'first summary' }
+    })(), PAIR)
+    await expect(summarize({ text: 'x'.repeat(300_000) })).rejects.toThrow('second chunk failed')
+    expect(calls).toBe(2)
   })
 
   it('falls back to the extractive summary when no pair resolves', async () => {
     const seen: ModelRequest[] = []
     const summarize = createCompactionSummarizer(scriptedStream([{ type: 'delta', delta: 'should not run' }], seen), undefined)
     const summary = await summarize({ text: 'line one\n\nline two\nline three' })
-    expect(summary).toBe('line one\nline two\nline three')
+    expect(summary).toBe('line one\n\nline two\nline three')
     expect(seen).toHaveLength(0)
   })
 
-  it('the extractive summary keeps at most 120 non-empty lines', () => {
-    const lines = Array.from({ length: 150 }, (_, index) => `line ${index}`)
-    expect(extractiveSummary(lines.join('\n')).split('\n')).toHaveLength(120)
-    expect(extractiveSummary('\n\n  \nkept\n')).toBe('kept')
+  it('the extractive summary retains exact bounded input and rejects insufficient bounds', async () => {
+    const text = Array.from({ length: 150 }, (_, index) => `line ${index}`).join('\n')
+    expect(extractiveSummary(text)).toBe(text)
+    expect(extractiveSummary('\n\n  \nkept\n')).toBe('\n\n  \nkept\n')
+    expect(extractiveSummary('x'.repeat(24_000))).toHaveLength(24_000)
+    expect(() => extractiveSummary('x'.repeat(24_001))).toThrow(/24,?000|24000/)
+    const seen: ModelRequest[] = []
+    const summarize = createCompactionSummarizer(scriptedStream([], seen), undefined)
+    await expect(summarize({ text: 'x'.repeat(24_001) })).rejects.toThrow(/24,?000|24000/)
+    expect(seen).toHaveLength(0)
   })
 })

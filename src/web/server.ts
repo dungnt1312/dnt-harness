@@ -6464,15 +6464,17 @@ async function readBytes(req: IncomingMessage, maxBytes: number): Promise<Buffer
  */
 function compactReplayEvents(events: readonly SessionEvent[]): SessionEvent[] {
   const finalizedSteps = new Set<string>()
+  const abandonedSteps = new Set<string>()
   for (const event of events) {
     if (event.type === 'assistant/message' && event.stepId !== undefined) finalizedSteps.add(event.stepId)
+    if (event.type === 'step/abandoned' && event.stepId !== undefined) abandonedSteps.add(event.stepId)
   }
   const compacted: SessionEvent[] = []
   const folded = new Map<string, number>()
   for (const event of events) {
     if (event.type === 'context/body') continue
     if (event.type === 'assistant/chunk' && event.stepId !== undefined) {
-      if (finalizedSteps.has(event.stepId) && event.thinking !== true) continue
+      if (event.thinking !== true && (finalizedSteps.has(event.stepId) || abandonedSteps.has(event.stepId))) continue
       if (event.thinking === true) {
         const at = folded.get(event.stepId)
         if (at !== undefined) {

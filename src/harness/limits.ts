@@ -45,7 +45,7 @@ export interface HarnessLimits {
    * the manifest inspector shows, not a character projection.
    */
   readonly automaticCompactionPressure: number
-  /** Completed turns kept in context after the newest compaction checkpoint. */
+  /** Latest covered completed turns duplicated raw beside the summary; uncovered history remains eligible for budget trimming. */
   readonly compactionTailTurns: number
   /** Largest single composer attachment accepted for storage. */
   readonly maxAttachmentBytes: number

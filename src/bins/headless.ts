@@ -101,6 +101,9 @@ function render(event: SessionEvent): void {
       process.stdout.write(`[${event.ok ? 'tool→' : 'tool✗'}] ${output}\n`)
       break
     }
+    case 'step/abandoned':
+      process.stdout.write(`\n[attempt discarded, retrying] ${event.reason}\n`)
+      break
     case 'turn/error':
       process.stdout.write(`[turn ${event.kind}] ${event.message}\n`)
       break

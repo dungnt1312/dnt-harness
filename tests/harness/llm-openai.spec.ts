@@ -6,6 +6,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { OpenAiCompletionsProvider, ProviderError } from 'dnt-harness'
 import { LogicalRequest } from '../../src/harness/llm/request-lifecycle.ts'
+import { wrapUntrusted } from '../../src/harness/context/builder.ts'
 
 interface CapturedRequest {
   url: string
@@ -45,6 +46,29 @@ async function run(request: Parameters<OpenAiCompletionsProvider['stream']>[0]):
 }
 
 describe('openai completions adapter: thinking + wire shape', () => {
+  it('preserves base system and wrapped compaction system blocks in order on the local wire', async () => {
+    const captured = stubFetch()
+    const baseSystem = 'Base system instructions. This is the same conversation continuing after compaction, not a new session.'
+    const compactionSystem = wrapUntrusted('compacted-history', 'through-seq="42"', 'Synthetic summary: 44f6ada; browser audio acceptance pending.')
+    await run({
+      messages: [
+        { role: 'system', content: baseSystem },
+        { role: 'system', content: compactionSystem },
+        { role: 'user', content: 'Còn vấn đề gì không' },
+      ],
+    })
+    // stubFetch parses the outgoing JSON body; this asserts local serialization,
+    // not whether an external gateway preserves or interprets either block.
+    expect(captured).toHaveLength(1)
+    const messages = captured[0]!.body['messages'] as { role: string; content: string }[]
+    expect(messages.map((message) => message.role)).toEqual(['system', 'system', 'user'])
+    expect(messages).toEqual([
+      { role: 'system', content: baseSystem },
+      { role: 'system', content: compactionSystem },
+      { role: 'user', content: 'Còn vấn đề gì không' },
+    ])
+  })
+
   it('carries bounded Retry-After and safe HTTP metadata to the harness coordinator', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('SECRET', { status: 503, headers: { 'retry-after': '99' } })))
     const owner = new LogicalRequest()

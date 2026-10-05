@@ -56,7 +56,9 @@ describe('explicit stream completion', () => {
     expect(approval).not.toHaveBeenCalled()
     expect(body).not.toHaveBeenCalled()
     expect(session.events.some(e => e.type === 'approval/request')).toBe(false)
-    if (kind === 'batch-error') expect(attempts).toBe(1)
+    // A streamed batch that dies transiently is retried once by abandoning the
+    // step (no side effects exist yet), then fails the turn.
+    if (kind === 'batch-error') expect(attempts).toBe(2)
     expect(session.events.some(e => e.type === 'assistant/chunk')).toBe(kind !== 'calls' && kind !== 'batch-error')
     expect(session.events.some(e => e.type === 'assistant/message')).toBe(false)
     expect(session.deriveMessages().filter(m => m.role === 'assistant')).toEqual([])
