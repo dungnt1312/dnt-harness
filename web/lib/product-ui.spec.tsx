@@ -1406,7 +1406,7 @@ describe('workbench files', () => {
     expect(host.querySelector('button[title="src"]')?.getAttribute('aria-expanded')).toBe('true')
     await act(async () => button('index.ts').click())
     expect(readProjectFile).toHaveBeenCalledWith('w1', 'p1', 'src/index.ts')
-    const tab = host.querySelector<HTMLButtonElement>('[role="tablist"] button[title="src/index.ts"][aria-selected="true"]')
+    const tab = host.querySelector<HTMLButtonElement>('[aria-label="Open files"] button[title="src/index.ts"][aria-pressed="true"]')
     expect(tab?.textContent).toContain('index.ts')
     const contents = host.querySelector('[aria-label="Contents of src/index.ts"]')!
     expect(contents.textContent).toContain('export const answer = 42')
@@ -1436,7 +1436,7 @@ describe('workbench files', () => {
     expect(host.querySelector('[aria-label="Project files"]')).not.toBeNull()
     expect(host.querySelector('[aria-label="Resize file tree"]')?.getAttribute('aria-valuenow')).toBe('36')
     await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Close src/index.ts"]')!.click())
-    expect(host.querySelector('[role="tablist"] button[title="src/index.ts"]')).toBeNull()
+    expect(host.querySelector('[aria-label="Open files"] button[title="src/index.ts"]')).toBeNull()
     expect(host.querySelector('[aria-label="Project files"]')).not.toBeNull()
     expect(host.textContent).toContain('Open a file from the tree.')
   })

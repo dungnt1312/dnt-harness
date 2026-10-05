@@ -1025,10 +1025,14 @@ describe('context manifest records', () => {
     expect(raw).toContain('context/manifest')
     expect(raw).toContain('context/body')
 
-    // Raw section bodies: both steps carried the identical system text, so it
-    // is recorded exactly once, keyed by its own content hash.
-    const bodies = events.filter((event) => event.type === 'context/body') as { hash?: string; kind?: string; body?: string; chars?: number }[]
+    // Raw section bodies live in the canonical JSONL, deduped by content
+    // hash: both steps carried the identical system text, so exactly one
+    // record exists. The SSE replay profile drops them (a client fetches by
+    // hash on demand), so they are asserted against the raw log instead.
+    const logRecords = raw.trim().split('\n').map((line) => JSON.parse(line) as { type: string; [key: string]: unknown })
+    const bodies = logRecords.filter((event) => event.type === 'context/body') as { hash?: string; kind?: string; body?: string; chars?: number }[]
     expect(bodies).toHaveLength(1)
+    expect(events.filter((event) => event.type === 'context/body')).toHaveLength(0)
     expect(bodies[0]?.kind).toBe('system')
     expect(bodies[0]?.body).toContain('You are dnt-harness')
     expect(bodies[0]?.chars).toBe(bodies[0]?.body?.length)
