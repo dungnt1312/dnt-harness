@@ -3,8 +3,10 @@
  * transcript: the project's git line, live subagents, and background
  * processes. Collapsed it is one chip row; the first live process or
  * subagent expands it exactly once per session, and an explicit user
- * collapse sticks until the conversation changes. State derives from the
- * durable event stream; one GET reconciles what an SSE gap may have missed.
+ * collapse sticks until the conversation changes. Ended subagents fold
+ * behind an "Ended" group with a Clear, like ended processes. State
+ * derives from the durable event stream; one GET reconciles what an SSE
+ * gap may have missed.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import Icon from '../common/Icon.tsx'
@@ -12,10 +14,11 @@ import { Spinner } from '../common/Spinner.tsx'
 import { Sheet } from '../ui/Sheet.tsx'
 import { cn } from '../../lib/cn.ts'
 import { useMediaQuery } from '../../hooks/useMediaQuery.ts'
-import { fetchGitStatus, listSessionProcesses, stopSessionProcess } from '../../lib/api.ts'
+import { fetchGitStatus, listSessionProcesses, stopSessionProcess, cancelChild } from '../../lib/api.ts'
 import { processRows, subagentRows, type ProcessRow, type SubagentRow } from '../../lib/processes-view.ts'
 import { agentRoleIcon, AGENT_ROLE_TONE } from '../../lib/agent-icons.ts'
 import { todosFromEvents } from '../../lib/todos-view.ts'
+import { formatAge } from '../../lib/format.ts'
 import type { SseEvent } from '../../lib/types.ts'
 
 interface GitLine {
@@ -35,6 +38,8 @@ interface Props {
   readonly onOpenView: (view: 'git' | 'agents') => void
   /** A process row click: open its live detail in the workbench. */
   readonly onOpenProcess: (processId: string) => void
+  /** A subagent row click: open the child's own conversation. */
+  readonly onOpenChild?: (childSessionId: string) => void
 }
 
 const TERMINAL_CLASS: Record<string, string | undefined> = { killed: 'text-bad', failed: 'text-bad', interrupted: 'text-bad' }
@@ -80,13 +85,15 @@ const COMPACT_QUERY = '(max-width: 767px)'
 /** Subagent rows shown before the panel defers to the workbench list. */
 const MAX_PANEL_SUBAGENTS = 6
 
-export function EnvironmentPanel({ workspaceId, sessionId, project, events, connected, onOpenView, onOpenProcess }: Props) {
+export function EnvironmentPanel({ workspaceId, sessionId, project, events, connected, onOpenView, onOpenProcess, onOpenChild }: Props) {
   // Panel state is scoped to the conversation: switching resets the collapse,
   // the one-shot auto-open, and the per-section disclosure.
-  const [state, setState] = useState<{ scope: string | null; expanded: boolean; autoOpened: boolean; processesOpen: boolean; subagentsOpen: boolean; tasksOpen: boolean; endedOpen: boolean; dismissed: ReadonlySet<string> }>({ scope: sessionId, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, tasksOpen: true, endedOpen: false, dismissed: new Set() })
+  const [state, setState] = useState<{ scope: string | null; expanded: boolean; autoOpened: boolean; processesOpen: boolean; subagentsOpen: boolean; tasksOpen: boolean; endedOpen: boolean; endedAgentsOpen: boolean; dismissed: ReadonlySet<string> }>({ scope: sessionId, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, tasksOpen: true, endedOpen: false, endedAgentsOpen: false, dismissed: new Set() })
   const [git, setGit] = useState<GitLine | null>(null)
+  const [gitFailed, setGitFailed] = useState(false)
   const [liveRunning, setLiveRunning] = useState<readonly string[]>([])
   const [stopping, setStopping] = useState<readonly string[]>([])
+  const [stoppingChild, setStoppingChild] = useState<readonly string[]>([])
   const [now, setNow] = useState(() => Date.now())
   const compact = useMediaQuery(COMPACT_QUERY)
 
@@ -101,17 +108,15 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
   // Ended rows the user has not cleared. Dismissal is per-session view state:
   // the durable log (and the Process view) keeps the full history.
   const ended = useMemo(() => rows.filter((row) => row.status !== 'running' && !state.dismissed.has(row.id)), [rows, state.dismissed])
-  const runningAgents = useMemo(() => agents.filter((row) => row.running), [agents])
-  // The panel is a glance, not the archive: at most MAX_PANEL_SUBAGENTS rows
-  // (list is newest-dispatch-first). Running children claim their slots first
-  // — the header's "N running" always has its row — and the newest ended ones
-  // fill the rest; the workbench list holds the full run history.
-  const visibleAgents = useMemo(() => {
-    const live = agents.filter((row) => row.running).slice(0, MAX_PANEL_SUBAGENTS)
-    const settled = agents.filter((row) => !row.running).slice(0, MAX_PANEL_SUBAGENTS - live.length)
-    return [...live, ...settled]
-  }, [agents])
-  const hiddenAgents = agents.length - visibleAgents.length
+  const runningAgents = useMemo(() => agents.filter((row) => row.running && !state.dismissed.has(row.childSessionId)), [agents, state.dismissed])
+  // Ended subagents, minus those the user cleared (the workbench list keeps
+  // the full history). Mirrors the ended-processes group's policy.
+  const endedAgents = useMemo(() => agents.filter((row) => !row.running && !state.dismissed.has(row.childSessionId)), [agents, state.dismissed])
+  // The panel is a glance, not the archive: running children claim the rows
+  // (capped — the "+N earlier" jump leads to the workbench list), and ended
+  // ones fold behind the section's ended group like ended processes do.
+  const liveAgents = useMemo(() => runningAgents.slice(0, MAX_PANEL_SUBAGENTS), [runningAgents])
+  const hiddenRunningAgents = runningAgents.length - liveAgents.length
   const hasLive = running.length > 0 || runningAgents.length > 0
   const todo = useMemo(() => todosFromEvents(events), [events])
   const todoDone = useMemo(() => todo.todos.filter((item) => item.status === 'completed').length, [todo])
@@ -127,10 +132,10 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
     }
     return null
   }, [events])
-  const ticking = running.length > 0 || workingSince !== null
+  const ticking = running.length > 0 || runningAgents.length > 0 || workingSince !== null
 
   const scope = sessionId ?? null
-  if (state.scope !== scope) setState({ scope, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, tasksOpen: true, endedOpen: false, dismissed: new Set() })
+  if (state.scope !== scope) setState({ scope, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, tasksOpen: true, endedOpen: false, endedAgentsOpen: false, dismissed: new Set() })
 
   // The one-shot auto-open: the first live process or subagent for this
   // conversation expands the panel; a user collapse never reopens it. On a
@@ -165,8 +170,11 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
           removed += change.removed ?? 0
         }
         setGit({ branch: report.branch, added, removed, ahead: report.ahead ?? 0, behind: report.behind ?? 0 })
+        setGitFailed(false)
       } catch {
-        // Offline stays on the last known line; the panel never blocks chat.
+        // Offline: say so instead of an eternal loading ellipsis; the next
+        // settled turn (or a reconnect) retries and the line recovers.
+        if (!disposed) setGitFailed(true)
       }
     }
     void load()
@@ -201,6 +209,22 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
     [workspaceId, sessionId],
   )
 
+  /** Cancel a running child from its panel row; the child-result carries the truth. */
+  const stopChild = useCallback(
+    async (childSessionId: string): Promise<void> => {
+      if (workspaceId === null || sessionId === null) return
+      setStoppingChild((prev) => [...prev, childSessionId])
+      try {
+        await cancelChild(workspaceId, sessionId, childSessionId)
+      } catch {
+        // The result event (or the workbench list) carries the truth.
+      } finally {
+        setStoppingChild((prev) => prev.filter((item) => item !== childSessionId))
+      }
+    },
+    [workspaceId, sessionId],
+  )
+
   if (sessionId === null) return null
 
   const expanded = state.expanded && !compact
@@ -219,7 +243,7 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
             <Icon name="gitBranch" size={14} className="shrink-0 text-fg-faint" />
             <span className="min-w-0 flex-1 truncate font-medium text-fg" title={git?.branch ?? project.path}>{git?.branch ?? project.name}</span>
             <SyncArrows ahead={git?.ahead ?? 0} behind={git?.behind ?? 0} />
-            {git !== null ? <DiffCounts added={git.added} removed={git.removed} /> : <span className="text-[12px] text-fg-faint">…</span>}
+            {git !== null ? <DiffCounts added={git.added} removed={git.removed} /> : <span className="text-[12px] text-fg-faint">{gitFailed ? 'unavailable' : '…'}</span>}
           </button>
         </section>
       ) : null}
@@ -237,7 +261,7 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
             <span className={cn('shrink-0 whitespace-nowrap text-[12px]', running.length > 0 ? 'text-warn' : 'text-fg-faint')}>
               {running.length > 0 ? `${running.length} running${ended.length > 0 ? ` · ${running.length + ended.length} total` : ''}` : `${ended.length} ended`}
             </span>
-            <Icon name="chevron" size={13} className={cn('shrink-0 text-fg-faint transition-transform', state.processesOpen ? '' : 'rotate-180')} />
+            <Icon name="chevron" size={13} className={cn('shrink-0 text-fg-faint transition-transform', state.processesOpen ? 'rotate-180' : '')} />
           </button>
           {state.processesOpen ? (
             <div className="flex flex-col gap-0.5 pb-1">
@@ -253,7 +277,7 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
                     onClick={() => setState((prev) => ({ ...prev, endedOpen: !prev.endedOpen }))}
                     className="flex min-w-0 flex-1 items-center gap-1.5 rounded-sm py-1 text-left text-[12px] text-fg-faint transition-colors hover:text-fg-muted"
                   >
-                    <Icon name="chevron" size={12} className={cn('shrink-0 transition-transform', state.endedOpen ? 'rotate-180' : '')} />
+                    <Icon name="chevron" size={12} className={cn('shrink-0 transition-transform', state.endedOpen ? '' : 'rotate-180')} />
                     Ended · {ended.length}
                   </button>
                   <button
@@ -284,7 +308,7 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
         </section>
       ) : null}
 
-      {agents.length > 0 ? (
+      {runningAgents.length + endedAgents.length > 0 ? (
         <section aria-label="Subagents" className="flex flex-col">
           <button
             type="button"
@@ -294,26 +318,63 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
           >
             <Icon name="gitBranch" size={14} className="shrink-0 text-fg-faint" />
             <span className="min-w-0 flex-1 truncate font-medium text-fg-muted">Subagents</span>
-            <span className={cn('shrink-0 whitespace-nowrap text-[12px]', runningAgents.length > 0 ? 'text-warn' : 'text-fg-faint')}>
-              {runningAgents.length > 0 ? `${runningAgents.length} running` : `${agents.length}`}
+            <span className={cn('shrink-0 whitespace-nowrap text-[12px]', runningAgents.length > 0 ? 'text-ok' : 'text-fg-faint')}>
+              {runningAgents.length > 0 ? `${runningAgents.length} running` : `${runningAgents.length + endedAgents.length} total`}
             </span>
-            <Icon name="chevron" size={13} className={cn('shrink-0 text-fg-faint transition-transform', state.subagentsOpen ? '' : 'rotate-180')} />
+            <Icon name="chevron" size={13} className={cn('shrink-0 text-fg-faint transition-transform', state.subagentsOpen ? 'rotate-180' : '')} />
           </button>
           {state.subagentsOpen ? (
             <div className="flex flex-col gap-0.5 pb-1">
-              {visibleAgents.map((row) => (
-                <SubagentLine key={row.childSessionId} row={row} onOpen={() => onOpenView('agents')} />
+              {liveAgents.map((row) => (
+                <SubagentLine key={row.childSessionId} row={row} now={now} pending={stoppingChild.includes(row.childSessionId)} onOpen={() => onOpenChild?.(row.childSessionId)} onStop={() => void stopChild(row.childSessionId)} />
               ))}
-              {hiddenAgents > 0 ? (
+              {hiddenRunningAgents > 0 ? (
                 <button
                   type="button"
                   aria-label="Open the full subagent list in the workbench"
-                  title={`Open the Subagents workbench view for all ${agents.length}`}
+                  title={`Open the Subagents workbench view for all ${runningAgents.length + endedAgents.length}`}
                   onClick={() => onOpenView('agents')}
                   className="flex w-full items-center gap-1.5 rounded-lg py-1 pl-2.5 pr-1.5 text-left text-[12px] text-fg-faint transition-colors hover:bg-hover hover:text-fg-muted"
                 >
-                  +{hiddenAgents} earlier · view all in Workbench
+                  +{hiddenRunningAgents} more running · view all in Workbench
                 </button>
+              ) : null}
+              {endedAgents.length > 0 ? (
+                <>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      aria-label="Toggle ended subagents"
+                      aria-expanded={state.endedAgentsOpen}
+                      onClick={() => setState((prev) => ({ ...prev, endedAgentsOpen: !prev.endedAgentsOpen }))}
+                      className="flex min-w-0 flex-1 items-center gap-1.5 rounded-sm py-1 text-left text-[12px] text-fg-faint transition-colors hover:text-fg-muted"
+                    >
+                      <Icon name="chevron" size={12} className={cn('shrink-0 transition-transform', state.endedAgentsOpen ? '' : 'rotate-180')} />
+                      Ended · {endedAgents.length}
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Clear ended subagents"
+                      title="Clear ended subagents"
+                      onClick={() => setState((prev) => {
+                        const dismissed = new Set(prev.dismissed)
+                        for (const row of endedAgents) dismissed.add(row.childSessionId)
+                        return { ...prev, dismissed }
+                      })}
+                      className="flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 text-[11px] text-fg-faint transition-colors hover:bg-hover hover:text-fg-muted"
+                    >
+                      <Icon name="trash" size={11} />
+                      Clear
+                    </button>
+                  </div>
+                  {state.endedAgentsOpen ? (
+                    <div className="flex flex-col gap-0.5">
+                      {endedAgents.map((row) => (
+                        <SubagentLine key={row.childSessionId} row={row} now={now} pending={false} onOpen={() => onOpenChild?.(row.childSessionId)} />
+                      ))}
+                    </div>
+                  ) : null}
+                </>
               ) : null}
             </div>
           ) : null}
@@ -333,7 +394,7 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
             <span className={cn('shrink-0 whitespace-nowrap text-[12px]', todoAllDone ? 'text-ok' : 'text-fg-faint')}>
               {todoAllDone ? 'Done' : `${todoDone}/${todo.todos.length}`}
             </span>
-            <Icon name="chevron" size={13} className={cn('shrink-0 text-fg-faint transition-transform', state.tasksOpen ? '' : 'rotate-180')} />
+            <Icon name="chevron" size={13} className={cn('shrink-0 text-fg-faint transition-transform', state.tasksOpen ? 'rotate-180' : '')} />
           </button>
           {state.tasksOpen ? (
             <div className="flex flex-col gap-0.5 pb-1">
@@ -400,13 +461,13 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
                 <span className="truncate text-[11px] text-fg-muted">{git?.branch ?? project.name}</span>
               ) : null}
               {running.length > 0 ? (
-                <span className="flex shrink-0 items-center gap-0.5 rounded bg-warn-soft px-1 py-px text-[10px] font-medium leading-[14px] text-warn" title={`${running.length} background process${running.length === 1 ? '' : 'es'} running`}>
+                <span className="flex shrink-0 items-center gap-0.5 rounded bg-ok-soft px-1 py-px text-[10px] font-medium leading-[14px] text-ok" title={`${running.length} background process${running.length === 1 ? '' : 'es'} running`}>
                   <Icon name="terminal" size={9} />
                   {running.length}
                 </span>
               ) : null}
               {runningAgents.length > 0 ? (
-                <span className="flex shrink-0 items-center gap-0.5 rounded bg-muted px-1 py-px text-[10px] font-medium leading-[14px] text-fg-muted" title={`${runningAgents.length} subagent${runningAgents.length === 1 ? '' : 's'} running`}>
+                <span className="flex shrink-0 items-center gap-0.5 rounded bg-ok-soft px-1 py-px text-[10px] font-medium leading-[14px] text-ok" title={`${runningAgents.length} subagent${runningAgents.length === 1 ? '' : 's'} running`}>
                   <Icon name="bot" size={9} />
                   {runningAgents.length}
                 </span>
@@ -463,21 +524,39 @@ function ProcessLine({ row, now, pending, onOpen, onStop }: { readonly row: Proc
   )
 }
 
-function SubagentLine({ row, onOpen }: { readonly row: SubagentRow; readonly onOpen: () => void }) {
+/** One subagent row: the role's face, the brief as its title, a live age, and a stop for the running ones. */
+function SubagentLine({ row, now, pending, onOpen, onStop }: { readonly row: SubagentRow; readonly now: number; readonly pending: boolean; readonly onOpen: () => void; readonly onStop?: () => void }) {
   const icon = agentRoleIcon(row.definition)
+  const title = row.brief !== '' ? row.brief : row.definition
   return (
-    <button
-      type="button"
-      onClick={onOpen}
-      className="flex w-full items-center gap-2 rounded-lg py-1 pl-1.5 pr-1.5 text-left text-[13px] transition-colors hover:bg-hover"
-    >
-      <span className={cn('flex size-5 shrink-0 items-center justify-center rounded-md bg-muted', AGENT_ROLE_TONE[icon])}>
-        {row.running ? <Spinner size={11} /> : <Icon name={icon} size={12} />}
-      </span>
-      <span className="min-w-0 flex-1 truncate text-fg" title={row.definition}>{row.definition}</span>
-      <span className={cn('shrink-0 text-[12px]', row.running ? 'text-warn' : (TERMINAL_CLASS[row.status ?? ''] ?? 'text-fg-faint'))}>
-        {row.running ? 'running' : (row.status ?? '')}
-      </span>
-    </button>
+    <div className="flex items-center gap-2 rounded-lg py-1 pl-1.5 pr-1.5 text-[13px]">
+      <button
+        type="button"
+        onClick={onOpen}
+        title={row.brief !== '' ? `${row.definition}: ${row.brief}` : row.definition}
+        className="flex min-w-0 flex-1 items-center gap-2 rounded-sm text-left"
+      >
+        <span className={cn('flex size-5 shrink-0 items-center justify-center rounded-md bg-muted', AGENT_ROLE_TONE[icon])}>
+          {row.running ? <Spinner size={11} /> : <Icon name={icon} size={12} />}
+        </span>
+        <span className="min-w-0 flex-1 truncate text-fg">{title}</span>
+        <span className="shrink-0 text-[12px] text-fg-faint">{formatAge(row.running ? row.dispatchedAt : (row.endedAt ?? row.dispatchedAt), now)}</span>
+        <span className={cn('shrink-0 text-[12px]', row.running ? 'text-ok' : (TERMINAL_CLASS[row.status ?? ''] ?? 'text-fg-faint'))}>
+          {row.running ? 'running' : (row.status ?? '')}
+        </span>
+      </button>
+      {row.running && onStop !== undefined ? (
+        <button
+          type="button"
+          aria-label={`Stop ${title}`}
+          title={`Stop ${title}`}
+          disabled={pending}
+          onClick={onStop}
+          className="flex size-5 shrink-0 items-center justify-center rounded text-fg-faint transition-colors hover:bg-hover hover:text-fg disabled:opacity-50"
+        >
+          <Icon name="square" size={10} />
+        </button>
+      ) : null}
+    </div>
   )
 }

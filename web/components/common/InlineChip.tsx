@@ -1,5 +1,7 @@
 import { chipLabel, chipTitle, isBuiltinCommand, type ChipSegment } from '../../lib/inline-chips.ts'
+import { fileStyle, materialIconSrc } from '../../lib/file-icons.ts'
 import { cn } from '../../lib/cn.ts'
+import { FileTypeIcon } from './FileTypeIcon.tsx'
 
 /**
  * One look for inline chips wherever they appear: the composer builds them as
@@ -32,6 +34,14 @@ export const CHIP_ICON_PATHS: Readonly<Record<ChipSegment['kind'], readonly stri
 
 export const CHIP_ICON_SIZE = 13
 
+/** Material icon theme glyph — the same drawing the `@` picker row shows. */
+export function mentionIconSrc(path: string): string {
+  return fileStyle(path).src
+}
+
+/** Fallback when a mention's themed asset is missing. */
+export const MENTION_ICON_FALLBACK = materialIconSrc('document')
+
 /** Accessible name shared by both renderers. */
 export function chipAriaLabel(segment: ChipSegment): string {
   if (segment.kind === 'mention') return `File mention ${segment.path}`
@@ -42,20 +52,24 @@ export function chipAriaLabel(segment: ChipSegment): string {
 export function InlineChip({ segment }: { readonly segment: ChipSegment }) {
   return (
     <span className={cn(CHIP_CLASS, CHIP_TONE.bubble)} title={chipTitle(segment)} aria-label={chipAriaLabel(segment)} data-chip-kind={segment.kind}>
-      <svg
-        className={CHIP_ICON_CLASS[segment.kind]}
-        width={CHIP_ICON_SIZE}
-        height={CHIP_ICON_SIZE}
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth={1.8}
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        aria-hidden="true"
-      >
-        {CHIP_ICON_PATHS[segment.kind].map((d) => <path key={d} d={d} />)}
-      </svg>
+      {segment.kind === 'mention'
+        ? <FileTypeIcon path={segment.path} size={CHIP_ICON_SIZE} />
+        : (
+          <svg
+            className={CHIP_ICON_CLASS[segment.kind]}
+            width={CHIP_ICON_SIZE}
+            height={CHIP_ICON_SIZE}
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={1.8}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            {CHIP_ICON_PATHS[segment.kind].map((d) => <path key={d} d={d} />)}
+          </svg>
+        )}
       <span className={CHIP_LABEL_CLASS}>{chipLabel(segment)}</span>
     </span>
   )

@@ -175,7 +175,7 @@ function useLiveContent(content: string, live: boolean): string {
   return live ? displayed : content
 }
 
-export const AssistantMessage = memo(function AssistantMessage({ item, modelLabel, turn, changes, changesProject, changesWorkspaceId, changesOpenPath, changesReviewAll }: {
+export const AssistantMessage = memo(function AssistantMessage({ item, modelLabel, turn, changes, changesProject, changesWorkspaceId, changesOpenPath, changesReviewFile, changesReviewAll }: {
   readonly item: Extract<ViewItem, { kind: 'assistant' }>
   readonly modelLabel?: string
   /** Present on the last answer of a closed turn; text is the turn's full answer. */
@@ -185,6 +185,8 @@ export const AssistantMessage = memo(function AssistantMessage({ item, modelLabe
   readonly changesProject?: WorkbenchProject | null
   readonly changesWorkspaceId?: string | null
   readonly changesOpenPath?: OpenPathResolver
+  /** Reviews one file: the Git view focused on its diff. */
+  readonly changesReviewFile?: (path: string) => void
   readonly changesReviewAll?: () => void
 }) {
   const visibleContent = useLiveContent(item.content, item.live)
@@ -194,18 +196,43 @@ export const AssistantMessage = memo(function AssistantMessage({ item, modelLabe
     ? [item.controls.model, item.controls.provider].filter((part) => part !== undefined && part !== '').join(' · ')
     : ''
   const label = controlsLabel !== '' ? controlsLabel : modelLabel
+  const [disclosed, setDisclosed] = useState(false)
   return (
     <div className="group flex flex-col gap-1">
-      {item.thinking.length > 0 || item.thinkingLive ? <ThinkingPanel thinking={item.thinking} live={item.live && item.thinkingLive} /> : null}
-      {item.content !== '' ? (
-        <div className="text-fg">
-          {item.live
-            ? <p className="m-0 whitespace-pre-wrap break-words">{visibleContent}</p>
-            : <Markdown content={visibleContent} />}
-          {item.live ? <span className="ml-0.5 inline-block size-2.5 translate-y-[-1px] rounded-full bg-fg align-middle animate-dot" aria-hidden="true" /> : null}
+      {item.discarded === true ? (
+        // The model's answer was cut off mid-stream and the request re-asked
+        // under a new step: what streamed here never became the answer, so it
+        // stays behind a quiet disclosure instead of duplicating the retry.
+        <div className="flex min-h-6 items-center gap-1.5 text-xs text-fg-faint" role="note">
+          <Icon name="alertTriangle" size={12} className="shrink-0 text-warn" />
+          <button
+            type="button"
+            onClick={() => setDisclosed(!disclosed)}
+            aria-expanded={disclosed}
+            className="rounded px-0.5 hover:text-fg-muted"
+          >
+            {disclosed ? 'Hide interrupted answer' : 'Interrupted answer — discarded and retried'}
+          </button>
         </div>
       ) : null}
-      {!item.live && turn !== undefined ? (
+      {item.discarded === true && disclosed ? (
+        <div className="whitespace-pre-wrap break-words border-l-2 border-line pl-4 text-[13px] leading-relaxed text-fg-muted">
+          {item.thinking.length > 0 ? `${item.thinking.join('')}\n\n` : ''}{item.content}
+        </div>
+      ) : (
+        <>
+          {item.thinking.length > 0 || item.thinkingLive ? <ThinkingPanel thinking={item.thinking} live={item.live && item.thinkingLive} /> : null}
+          {item.content !== '' ? (
+            <div className="text-fg">
+              {item.live
+                ? <p className="m-0 whitespace-pre-wrap break-words">{visibleContent}</p>
+                : <Markdown content={visibleContent} />}
+              {item.live ? <span className="ml-0.5 inline-block size-2.5 translate-y-[-1px] rounded-full bg-fg align-middle animate-dot" aria-hidden="true" /> : null}
+            </div>
+          ) : null}
+        </>
+      )}
+      {!item.live && !item.discarded && turn !== undefined ? (
         <>
           {/* Reserved, not hover-inserted (a hover must not shift the transcript),
               so the row stays short: it is height every answer pays for. */}
@@ -221,6 +248,7 @@ export const AssistantMessage = memo(function AssistantMessage({ item, modelLabe
               project={changesProject ?? null}
               workspaceId={changesWorkspaceId ?? null}
               {...(changesOpenPath !== undefined ? { onOpenPath: changesOpenPath } : {})}
+              {...(changesReviewFile !== undefined ? { onReviewFile: changesReviewFile } : {})}
               {...(changesReviewAll !== undefined ? { onReviewAll: changesReviewAll } : {})}
             />
           ) : null}
@@ -239,6 +267,7 @@ export const AssistantMessage = memo(function AssistantMessage({ item, modelLabe
   if (previous.turn?.text !== next.turn?.text) return false
   if (previous.changes !== next.changes) return false
   if (previous.changesReviewAll !== next.changesReviewAll) return false
+  if (previous.changesReviewFile !== next.changesReviewFile) return false
   if (previous.changesOpenPath !== next.changesOpenPath) return false
   if (previous.changesWorkspaceId !== next.changesWorkspaceId) return false
   if (previous.changesProject?.id !== next.changesProject?.id

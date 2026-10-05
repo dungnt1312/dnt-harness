@@ -82,7 +82,7 @@ function ViewTab({ view, active, onClick, onClose }: {
  * Terminal is a view tab like the others (Ctrl+` opens it). The chat column
  * has a separate footer terminal; this panel does not own that one.
  */
-export function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, onClearGitFilter, processFocus = null }: {
+export function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, gitFocusPath = null, onClearGitFilter, processFocus = null }: {
   readonly workspaceId: string | null
   /** The project whose files are browsable; null for chat-only conversations. */
   readonly project: WorkbenchProject | null
@@ -134,6 +134,8 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
    * recorded writes; null shows every change. Set by a card's Review all.
    */
   readonly gitPathFilter?: readonly string[] | null
+  /** The Git view row a card's file click opened, pre-expanded to its diff. */
+  readonly gitFocusPath?: string | null
   /** Clears the turn filter (the banner's Show all). */
   readonly onClearGitFilter?: () => void
 }) {
@@ -202,7 +204,15 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
     body = <TrajectoryPanel events={events} {...(openPath !== undefined ? { openPath } : {})} />
   } else if (activeView === 'git') {
     body = project !== null && workspaceId !== null
-      ? <GitPanel key={project.id} workspaceId={workspaceId} project={project} {...(gitPathFilter !== null && gitPathFilter.length > 0 ? { pathFilter: gitPathFilter } : {})} {...(onClearGitFilter !== undefined ? { onShowAll: onClearGitFilter } : {})} />
+      ? <GitPanel
+          key={project.id}
+          workspaceId={workspaceId}
+          project={project}
+          {...(gitPathFilter !== null && gitPathFilter.length > 0 ? { pathFilter: gitPathFilter } : {})}
+          {...(gitFocusPath !== null ? { focusPath: gitFocusPath } : {})}
+          {...(openPath !== undefined ? { onOpenFile: (path: string) => { openPath(`${project.path}/${path}`)?.() } } : {})}
+          {...(onClearGitFilter !== undefined ? { onShowAll: onClearGitFilter } : {})}
+        />
       : (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
           <Icon name="gitBranch" size={22} className="text-fg-faint" />

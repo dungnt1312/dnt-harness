@@ -48,9 +48,9 @@ export function chipWireText(segment: ChipSegment): string {
   return bare ? `@${segment.path}` : `@"${segment.path}"`
 }
 
-/** Short on-chip label: a file's base name, a skill as `/name`. */
+/** Short on-chip label: a file's base name, a skill as its bare name. */
 export function chipLabel(segment: ChipSegment): string {
-  if (segment.kind === 'command') return `/${segment.name}`
+  if (segment.kind === 'command') return segment.name
   return segment.path.split('/').at(-1) || segment.path
 }
 

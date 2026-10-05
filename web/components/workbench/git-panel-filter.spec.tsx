@@ -88,3 +88,20 @@ it('an opened binary media row previews the media instead of a diff', async () =
   expect(view.querySelector('img[alt="shots/01.png"]')).not.toBeNull()
   expect(view.textContent).not.toContain('No textual diff')
 })
+
+it('focusPath opens with that diff already expanded', async () => {
+  const view = await mount({ focusPath: 'notes.md' })
+  await act(async () => { await vi.waitFor(() => expect(fetchGitStatus).toHaveBeenCalledOnce()) })
+  expect(view.querySelector('button[aria-expanded="true"]')?.textContent).toContain('notes.md')
+  expect(view.textContent).toContain('No textual diff.')
+})
+
+it('a focused file row can open the file itself in the workbench', async () => {
+  const onOpenFile = vi.fn()
+  const view = await mount({ onOpenFile })
+  await act(async () => { await vi.waitFor(() => expect(rows(view)).toHaveLength(3)) })
+  const openFirst = view.querySelector<HTMLButtonElement>('ul li button[aria-label="Open a.ts in workbench"]')
+  expect(openFirst).not.toBeNull()
+  await act(async () => openFirst!.click())
+  expect(onOpenFile).toHaveBeenCalledWith('src/a.ts')
+})

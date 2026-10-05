@@ -3,7 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { TurnChangesCard } from './TurnChangesCard.tsx'
-import type { GitDiffReport, GitStatusReport } from '../../lib/api.ts'
+import type { GitStatusReport } from '../../lib/api.ts'
 import type { TurnChanges } from '../../lib/turn-changes.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
@@ -14,21 +14,8 @@ const fetchGitStatus = vi.fn(async (): Promise<GitStatusReport> => ({
   changes: [{ path: 'src/a.ts', status: 'modified', added: 7, removed: 2 }],
 }))
 
-const fetchGitDiff = vi.fn(async (_workspaceId: string, _projectId: string, path: string): Promise<GitDiffReport> => ({
-  path,
-  truncated: false,
-  binary: false,
-  lines: [
-    { kind: 'hunk', text: '@@ -1,2 +1,2 @@' },
-    { kind: 'context', text: 'line one' },
-    { kind: 'del', text: 'old line' },
-    { kind: 'add', text: 'new line' },
-  ],
-}))
-
 vi.mock('../../lib/api.ts', () => ({
   fetchGitStatus: () => fetchGitStatus(),
-  fetchGitDiff: (ws: string, p: string, path: string) => fetchGitDiff(ws, p, path),
   mediaKindOf: () => null,
   projectMediaUrl: (_ws: string, _project: string, path: string) => `/media?path=${encodeURIComponent(path)}`,
 }))
@@ -41,7 +28,6 @@ afterEach(async () => {
   root = undefined
   host?.remove()
   fetchGitStatus.mockClear()
-  fetchGitDiff.mockClear()
 })
 
 const CHANGES: TurnChanges = {
@@ -116,34 +102,32 @@ it('Review all is offered only with the callback', async () => {
   expect([...plain.querySelectorAll('button')].some((button) => button.textContent === 'Review all')).toBe(false)
 })
 
-it('clicking a file expands its git diff in place, not the raw file', async () => {
-  const view = await mount(CHANGES, { onOpenPath: () => () => {} })
+it('clicking a file opens the Git view focused on its diff, not an inline diff', async () => {
+  const onReviewFile = vi.fn()
+  const view = await mount(CHANGES, { onReviewFile, onOpenPath: () => () => {} })
   await act(async () => view.querySelector<HTMLButtonElement>('button[aria-expanded]')!.click())
   await act(async () => { await vi.waitFor(() => expect(fetchGitStatus).toHaveBeenCalledOnce()) })
-  expect(fetchGitDiff).not.toHaveBeenCalled()
+  expect(view.querySelector('[role="region"][aria-label="Diff of src/a.ts"]')).toBeNull()
   const fileRow = [...view.querySelectorAll<HTMLButtonElement>('ul li button')].find((button) => button.textContent?.includes('a.ts'))!
   await act(async () => fileRow.click())
-  await act(async () => { await vi.waitFor(() => expect(fetchGitDiff).toHaveBeenCalledWith('ws1', 'p1', 'src/a.ts')) })
-  const diff = view.querySelector('[role="region"][aria-label="Diff of src/a.ts"]')
-  expect(diff).not.toBeNull()
-  expect(diff?.textContent).toContain('new line')
-  expect(diff?.textContent).toContain('old line')
-  // The workbench file remains reachable, as a secondary link inside the row.
-  expect(view.textContent).toContain('Open a.ts in workbench')
+  expect(onReviewFile).toHaveBeenCalledOnce()
+  // The Git view narrows to project-relative paths, the form git reports.
+  expect(onReviewFile).toHaveBeenCalledWith('src/a.ts')
+  // The workbench file remains reachable, as a quiet button beside the row.
+  const openFile = view.querySelector<HTMLButtonElement>('button[aria-label="Open a.ts in workbench"]')
+  expect(openFile).not.toBeNull()
 })
 
-it('a file outside the project diffs from the recorded call instead', async () => {
+it('a file outside the project has no git focus; the file opener stays', async () => {
+  const onReviewFile = vi.fn()
   const OUTSIDE: TurnChanges = {
     files: [{ path: 'C:/elsewhere/x.md', status: 'modified', lines: { added: 1, removed: 1 }, args: { path: 'C:/elsewhere/x.md', old: 'before', new: 'after' } }],
     uncertain: [],
   }
-  const view = await mount(OUTSIDE)
+  const view = await mount(OUTSIDE, { onReviewFile, onOpenPath: () => () => {} })
   await act(async () => view.querySelector<HTMLButtonElement>('button[aria-expanded]')!.click())
-  expect(fetchGitDiff).not.toHaveBeenCalled()
-  const fileRow = [...view.querySelectorAll<HTMLButtonElement>('ul li button')].find((button) => button.textContent?.includes('x.md'))!
-  await act(async () => fileRow.click())
-  const diff = view.querySelector('[role="region"][aria-label="Recorded change to C:/elsewhere/x.md"]')
-  expect(diff).not.toBeNull()
-  expect(diff?.textContent).toContain('before')
-  expect(diff?.textContent).toContain('after')
+  const fileRow = [...view.querySelectorAll('ul li div[title="C:/elsewhere/x.md"]')]
+  expect(fileRow).toHaveLength(1)
+  await act(async () => view.querySelector<HTMLButtonElement>('button[aria-label="Open x.md in workbench"]')!.click())
+  expect(onReviewFile).not.toHaveBeenCalled()
 })

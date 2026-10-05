@@ -21,6 +21,11 @@ import type { ShellRow, TerminalRow } from '../../lib/types.ts'
 const INPUT_FLUSH_MS = 16
 /** Dragging the panel divider fires a resize per pointer move; only the settled size matters. */
 const RESIZE_DEBOUNCE_MS = 100
+/**
+ * How long a dead terminal's tab lingers, so its exit note is readable before
+ * the tab — and, in the footer, the surface itself — goes away.
+ */
+const EXIT_NOTICE_MS = 1_500
 
 const NEW_TERMINAL_CLASS = 'flex size-7 shrink-0 items-center justify-center rounded-md text-fg-muted transition-colors hover:bg-hover hover:text-fg disabled:cursor-not-allowed disabled:opacity-40'
 
@@ -71,8 +76,9 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
   readonly defaultShell?: string | null
   readonly onDefaultShell?: (shellId: string | null) => void
   /**
-   * Hides the whole panel without killing shells. The chat footer uses it;
-   * the workbench tab does not, because closing that tab is the tab's own X.
+   * Hides the whole panel without killing shells. The chat footer passes it
+   * for its own close button and for the last-shell exit below; the workbench
+   * tab does not, because closing that tab is the tab's own X.
    */
   readonly onHide?: () => void
   /**
@@ -97,8 +103,19 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
   const [ready, setReady] = useState(false)
   const attached = useRef(new Map<string, Attached>())
   const mountRef = useRef<HTMLDivElement | null>(null)
-  /** Auto-open fires once per mount; closing the last terminal must not reopen it. */
+  /** Synchronous mirror of `rows`: the stream handler must judge a frame against the shells it already knows, not wait for a render. */
+  const rowsRef = useRef<readonly TerminalRow[]>([])
+  /**
+   * Set once this mount has settled its one auto-open — either it fired a
+   * shell of its own or it found some already running. Closing the last
+   * terminal afterwards is a decision, from this surface or another, and is
+   * never undone here.
+   */
   const autoOpened = useRef(false)
+  /** Pending close-the-surface-after-last-exit timer; a fresh shell of this view cancels it. */
+  const surfaceCloseTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  /** Latest `onHide`, so the stream handler can close the surface without resubscribing when its identity changes. */
+  const onHideRef = useRef(onHide)
 
   /** Build (or reuse) the xterm instance backing one terminal id. */
   const attach = useCallback((id: string, cols: number, rows_: number): Attached | undefined => {
@@ -110,9 +127,12 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
     const host = document.createElement('div')
     // The gutter belongs here, not on the mount: an absolutely positioned
     // child resolves `inset-0` against the mount's padding box, so padding
-    // there would be covered rather than seen. FitAddon reads this element's
-    // content box, so the columns shrink to match instead of overflowing.
-    host.className = 'absolute inset-0 pl-3 pr-2 py-2'
+    // there would be covered rather than seen. FitAddon proposes dimensions
+    // from this element's computed `height`/`width`; preflight boxes are
+    // border-box, so those numbers would include the gutter and the grid
+    // would spill through the padding. `box-content` measures only the box
+    // the grid may fill.
+    host.className = 'absolute inset-0 box-content pl-3 pr-2 py-2'
     mount.appendChild(host)
 
     const term = new Terminal({
@@ -175,6 +195,12 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
     attached.current.delete(id)
   }, [])
 
+  // The stream handler closes through the latest onHide without the
+  // subscription depending on it.
+  useEffect(() => {
+    onHideRef.current = onHide
+  }, [onHide])
+
   // Load the catalog, then follow the workspace's terminal stream. The
   // snapshot carries scrollback, so a reload reattaches instead of restarting.
   useEffect(() => {
@@ -203,7 +229,15 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
         for (const id of [...attached.current.keys()]) {
           if (!present.has(id)) detach(id)
         }
-        setRows(frame.terminals.map(({ scrollback: _scrollback, ...info }) => info))
+        const nextRows = frame.terminals.map(({ scrollback: _scrollback, ...info }) => info)
+        rowsRef.current = nextRows
+        setRows(nextRows)
+        // A shell that outlived a reconnect is the truth; a pending
+        // last-exit close has nothing left to close.
+        if (surfaceCloseTimer.current !== undefined) {
+          clearTimeout(surfaceCloseTimer.current)
+          surfaceCloseTimer.current = undefined
+        }
         for (const entry of frame.terminals) {
           // Another project's shell stays alive on the host but is not drawn
           // here; attaching it would show its prompt in this project's view.
@@ -233,7 +267,18 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
         return
       }
       if (frame.kind === 'created') {
-        setRows((current) => current.some((row) => row.id === frame.terminal.id) ? current : [...current, frame.terminal])
+        // A shell of this view's own cancels a pending last-exit close: the
+        // surface has something to show again. (Another project's shell does
+        // not — it is remembered below but never drawn here.)
+        if (surfaceCloseTimer.current !== undefined && (frame.terminal.projectId ?? null) === projectId) {
+          clearTimeout(surfaceCloseTimer.current)
+          surfaceCloseTimer.current = undefined
+        }
+        setRows((current) => {
+          const next = current.some((row) => row.id === frame.terminal.id) ? current : [...current, frame.terminal]
+          rowsRef.current = next
+          return next
+        })
         // The stream is per workspace, so a shell opened for another project
         // arrives here too. Remember it, but do not surface it in this view.
         if ((frame.terminal.projectId ?? null) !== projectId) return
@@ -245,16 +290,35 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
         attached.current.get(frame.terminalId)?.term.write(fromBase64(frame.data))
         return
       }
+      // Exit: show the note, drop the tab, and — when this was the view's
+      // last shell — close the surface itself once the note has had its
+      // moment. That is the convention the surface promised: closing the
+      // last tab closes the terminal; it does not park an empty panel or
+      // invite a fresh shell.
       const record = attached.current.get(frame.terminalId)
       record?.term.write(`\r\n\u001b[2m[${frame.reason === 'idle' ? 'closed: idle' : `exited: ${frame.exitCode}`}]\u001b[0m\r\n`)
-      setRows((current) => current.filter((row) => row.id !== frame.terminalId))
+      const remaining = rowsRef.current.filter((row) => row.id !== frame.terminalId)
+      rowsRef.current = remaining
+      setRows(remaining)
       setActiveId((current) => (current === frame.terminalId ? null : current))
-      window.setTimeout(() => detach(frame.terminalId), 1_500)
+      window.setTimeout(() => detach(frame.terminalId), EXIT_NOTICE_MS)
+      if (onHideRef.current === undefined) return
+      if (remaining.some((row) => (row.projectId ?? null) === projectId)) return
+      if (surfaceCloseTimer.current !== undefined) clearTimeout(surfaceCloseTimer.current)
+      surfaceCloseTimer.current = setTimeout(() => {
+        surfaceCloseTimer.current = undefined
+        // Re-checked against the live truth: a shell created during the
+        // notice window (or reported by a reconnect snapshot) means the
+        // surface has something to show and stays open.
+        if (rowsRef.current.some((row) => (row.projectId ?? null) === projectId)) return
+        onHideRef.current?.()
+      }, EXIT_NOTICE_MS)
     })
 
     return () => {
       live = false
       unsubscribe()
+      if (surfaceCloseTimer.current !== undefined) clearTimeout(surfaceCloseTimer.current)
       for (const id of [...instances.keys()]) detach(id)
     }
   }, [workspaceId, projectId, attach, detach])
@@ -285,13 +349,15 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
     : undefined
 
   // Opening the Terminal view should land in a usable shell, not in a picker:
-  // once per mount, an empty workspace gets one terminal on the preferred
-  // shell. Closing the last one is a decision, so it is never undone here. A
-  // caller whose project binding is still loading holds the open — firing in
-  // that window would create the shell in the wrong folder.
+  // once per mount, an empty view gets one terminal on the preferred shell.
+  // The allowance is spent whether it fired or the view already had a shell —
+  // closing the last one is a decision, so it is never undone here. A caller
+  // whose project binding is still loading holds the open — firing in that
+  // window would create the shell in the wrong folder.
   useEffect(() => {
-    if (!ready || !bindingReady || autoOpened.current || unavailable !== null || visibleRows.length > 0) return
+    if (!ready || !bindingReady || autoOpened.current || unavailable !== null) return
     autoOpened.current = true
+    if (visibleRows.length > 0) return
     void open(preferredShell)
   }, [ready, bindingReady, unavailable, visibleRows.length, preferredShell, open])
 

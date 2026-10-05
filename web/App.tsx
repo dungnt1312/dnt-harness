@@ -2,6 +2,7 @@ import { errorSummary, modeLabel } from './lib/copy.ts'
 import { Generation, composerKey, emptyComposer, acceptedDraft, freshRequestId, requestIdFor, validConversationScope } from './lib/interaction.ts'
 import { ComposerStore, useComposerSlice } from './lib/composer-store.ts'
 import { draftAttachments, draftIsEmpty, draftText, messageDraft, textDraft, type AttachmentRef, type RichDraft } from './lib/composer-draft.ts'
+import type { ChipSegment } from './lib/inline-chips.ts'
 import { parseRoute, routePath, sessionRoute, workspaceRoute, type AppRoute } from './lib/route.ts'
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
 import {
@@ -414,6 +415,8 @@ function AppShell() {
   // The Git view narrowed to one turn's recorded files (a card's Review all).
   // Session-scoped state, not a preference: the review is a moment's focus.
   const [gitPathFilter, setGitPathFilter] = useState<readonly string[] | null>(null)
+  // The Git view row a card's file click opened, pre-expanded to its diff.
+  const [gitFocusPath, setGitFocusPath] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsSection, setSettingsSection] = useState<'providers' | 'projects' | 'permissions' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'>('providers')
   const [pendingDelete, setPendingDelete] = useState<SessionListing | null>(null)
@@ -567,6 +570,19 @@ function AppShell() {
     }
   }, [workbenchProject, openWorkbenchFile, patchSessionTabs, onWorkbenchOpenChange])
   /**
+   * A clicked mention chip opens that file in the workbench — the same action
+   * as a recorded path, minus the focus window. The composer passes the
+   * chip's segment; the opener itself stays null without a project.
+   */
+  const openMentionChip = useCallback((segment: ChipSegment): void => {
+    if (segment.kind !== 'mention' || workbenchProject === null) return
+    const relative = toProjectRelative(workbenchProject.path, segment.path)
+    if (relative === null) return
+    openWorkbenchFile(relative)
+    patchSessionTabs({ inspectorTab: 'files' })
+    onWorkbenchOpenChange(true)
+  }, [workbenchProject, openWorkbenchFile, patchSessionTabs, onWorkbenchOpenChange])
+  /**
    * Open a fixed workbench view programmatically: the tab must join the
    * strip in the same patch, or the clamp folds the selection back to Files.
    */
@@ -582,6 +598,13 @@ function AppShell() {
   /** The per-turn change card's Review all: the Git view narrowed to that turn's recorded files. */
   const reviewTurnChanges = useCallback((paths: readonly string[]) => {
     setGitPathFilter(paths)
+    setGitFocusPath(null)
+    openWorkbenchView('git')
+  }, [openWorkbenchView])
+  /** One card file row: the Git view over the whole project, its diff open. */
+  const reviewTurnFile = useCallback((path: string) => {
+    setGitPathFilter(null)
+    setGitFocusPath(path)
     openWorkbenchView('git')
   }, [openWorkbenchView])
   /** Show all: the Git view without the turn's narrowing. */
@@ -1497,6 +1520,7 @@ function AppShell() {
       onMode={(value) => void selectMode(value)}
       {...(workbenchProject !== null ? { onSearchFiles: searchFiles } : {})}
       {...(activeWs !== null ? { onUploadFiles: uploadFiles } : {})}
+      onChipClick={openMentionChip}
       skills={skills}
       onRecallLast={recallLast}
       autoFocus={current === null}
@@ -1538,6 +1562,7 @@ function AppShell() {
       onTerminalShell={(shellId) => patchPreferences({ terminalShell: shellId })}
       bindingReady={listedWorkspace === activeWs}
       gitPathFilter={gitPathFilter}
+      gitFocusPath={gitFocusPath}
       onClearGitFilter={clearGitPathFilter}
       context={{ meta, ...(modelDefaults !== null ? { globalDefaults: modelDefaults } : {}), ...(currentSessionModel !== undefined ? { sessionModel: currentSessionModel } : {}), ...(current !== null && currentSessionModelState?.status === 'loading' ? { sessionControlsStatus: 'loading' as const } : {}), ...(current !== null && currentSessionModelState?.status === 'error' ? { sessionControlsStatus: 'unavailable' as const } : {}), stream, sessionId: current, sessionFolder: currentProject?.path ?? null, eventCount: events.length, manifest, workspaceId: activeWs, running, modeLabel: envModeLabel, onCompacted: () => setCompactNonce((nonce) => nonce + 1), onOpenSettingsTab: (tab) => openSettings(tab) }}
     />
@@ -1652,6 +1677,7 @@ function AppShell() {
                 connected={stream !== 'reconnecting'}
                 onOpenView={openEnvironmentView}
                 onOpenProcess={openEnvironmentProcess}
+                onOpenChild={openSession}
               />
               {events.length === 0 ? (
                 <div className="flex flex-1 items-center justify-center gap-2 text-sm text-fg-muted" role="status" aria-live="polite">
@@ -1667,6 +1693,7 @@ function AppShell() {
                   workspaceId={activeWs}
                   project={currentProject}
                   onReviewChanges={reviewTurnChanges}
+                  onReviewFile={reviewTurnFile}
                   onOpenProcess={openEnvironmentProcess}
                   onReuse={reuseInDraft}
                   onOpenChild={openSession}

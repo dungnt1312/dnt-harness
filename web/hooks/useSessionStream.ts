@@ -52,14 +52,20 @@ export function compactClientEvents(events: readonly SseEvent[]): readonly SseEv
 export function createEventCompactor(): (batch: readonly SseEvent[]) => readonly SseEvent[] {
   let events: SseEvent[] = []
   const finalizedSteps = new Set<string>()
+  const abandonedSteps = new Set<string>()
   const thinkingAt = new Map<string, number>()
   return (batch) => {
     if (batch.length === 0) return events
     let newlyFinalized = false
+    let newlyAbandoned = false
     for (const event of batch) {
       if (event.type === 'assistant/message' && event.stepId !== undefined && !finalizedSteps.has(event.stepId)) {
         finalizedSteps.add(event.stepId)
         newlyFinalized = true
+      }
+      if (event.type === 'step/abandoned' && event.stepId !== undefined && !abandonedSteps.has(event.stepId)) {
+        abandonedSteps.add(event.stepId)
+        newlyAbandoned = true
       }
     }
     const pushed: SseEvent[] = []
@@ -83,18 +89,21 @@ export function createEventCompactor(): (batch: readonly SseEvent[]) => readonly
           }
           // The fold target lands at this index once `pushed` joins `events`.
           thinkingAt.set(event.stepId, events.length + pushed.length)
-        } else if (finalizedSteps.has(event.stepId)) {
+        } else if (finalizedSteps.has(event.stepId) || abandonedSteps.has(event.stepId)) {
+          // A step's content chunks leave once the step finalized or was
+          // abandoned: a durable message replaces the former, and the latter's
+          // partial text never renders again.
           continue
         }
       }
       pushed.push(event)
     }
     if (pushed.length > 0 || folded) events = pushed.length > 0 ? [...events, ...pushed] : [...events]
-    if (newlyFinalized) {
-      // Earlier content chunks of the finalized steps leave the kept list;
-      // fold indices shift with them, so the map rebuilds from the result.
+    if (newlyFinalized || newlyAbandoned) {
+      // Earlier content chunks of the settled steps leave the kept list; fold
+      // indices shift with them, so the map rebuilds from the result.
       events = events.filter((event) => !(
-        event.type === 'assistant/chunk' && event.thinking !== true && event.stepId !== undefined && finalizedSteps.has(event.stepId)
+        event.type === 'assistant/chunk' && event.thinking !== true && event.stepId !== undefined && (finalizedSteps.has(event.stepId) || abandonedSteps.has(event.stepId))
       ))
       thinkingAt.clear()
       events.forEach((event, index) => {

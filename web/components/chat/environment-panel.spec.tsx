@@ -15,11 +15,13 @@ afterEach(async () => {
   root = undefined
   vi.unstubAllGlobals()
   vi.useRealTimers()
+  vi.clearAllMocks()
 })
 
 const ev = (type: string, fields: Record<string, unknown>): SseEvent => ({ type, seq: 0, ...fields }) as SseEvent
 const onOpenView = vi.fn()
 const onOpenProcess = vi.fn()
+const onOpenChild = vi.fn()
 interface Base {
   readonly workspaceId: string | null
   readonly sessionId: string | null
@@ -28,6 +30,7 @@ interface Base {
   readonly connected: boolean
   readonly onOpenView: (view: 'git' | 'agents') => void
   readonly onOpenProcess: (processId: string) => void
+  readonly onOpenChild: (childSessionId: string) => void
 }
 const base: Base = {
   workspaceId: 'ws',
@@ -37,6 +40,7 @@ const base: Base = {
   connected: true,
   onOpenView,
   onOpenProcess,
+  onOpenChild,
 }
 
 async function render(props: Base): Promise<void> {
@@ -174,11 +178,11 @@ it('caps the subagent list at six newest and defers the rest to the workbench', 
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
   const spawns = Array.from({ length: 9 }, (_, index) => ev('agent/child-spawn', { childSessionId: `c${index}`, definition: `agent-${index}`, timestamp: index + 1 }))
   await render({ ...base, events: spawns })
-  const section = () => host.querySelector('section[aria-label="Subagents"]')!.textContent ?? ''
+  const section = () => host.querySelector('section[aria-label="Subagents"]')?.textContent ?? ''
   // Six newest rows (newest first) plus a jump to the workbench; the rest hides.
   expect(section()).toContain('agent-8')
   expect(section()).not.toContain('agent-2')
-  expect(section()).toContain('+3 earlier · view all in Workbench')
+  expect(section()).toContain('+3 more running · view all in Workbench')
   await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Open the full subagent list in the workbench"]')!.click())
   expect(onOpenView).toHaveBeenCalledWith('agents')
 })
@@ -199,10 +203,56 @@ it('subagent rows show the role icon the workbench uses', async () => {
     ev('agent/child-spawn', { childSessionId: 'c2', definition: 'unknown-role', timestamp: 2 }),
     ev('agent/child-result', { childSessionId: 'c1', status: 'completed' }),
   ] })
+  // The ended explorer sits behind the ended group; open it before reading faces.
+  await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Toggle ended subagents"]')!.click())
   const tones = [...host.querySelectorAll('section[aria-label="Subagents"] span')].map((span) => span.getAttribute('class') ?? '')
   // explorer keeps its telescope face (search tone); an unbundled role reads as a bot (agent tone).
   expect(tones.some((cls) => cls.includes('text-tool-search'))).toBe(true)
   expect(tones.some((cls) => cls.includes('text-tool-agent'))).toBe(true)
+})
+
+it('titles subagent rows by the brief and opens the child conversation from a row', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
+  await render({ ...base, events: [ev('agent/child-spawn', { childSessionId: 'child-1', definition: 'explorer', brief: 'Map the auth modules' })] })
+  const section = () => host.querySelector('section[aria-label="Subagents"]')!.textContent ?? ''
+  expect(section()).toContain('Map the auth modules')
+  await act(async () => host.querySelector<HTMLButtonElement>('button[title="explorer: Map the auth modules"]')!.click())
+  expect(onOpenChild).toHaveBeenCalledWith('child-1')
+})
+
+it('stops a running subagent from its panel row', async () => {
+  const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }))
+  vi.stubGlobal('fetch', fetchMock)
+  await render({ ...base, events: [ev('agent/child-spawn', { childSessionId: 'child-2', definition: 'explorer', brief: 'Map the auth modules' })] })
+  const stop = host.querySelector<HTMLButtonElement>('button[aria-label="Stop Map the auth modules"]')
+  expect(stop).not.toBeNull()
+  await act(async () => stop!.click())
+  expect(fetchMock).toHaveBeenCalledWith('/api/workspaces/ws/sessions/s1/children/child-2/cancel', expect.objectContaining({ method: 'POST' }))
+  // The click on the row itself never triggers a stop — separate targets.
+  expect(onOpenChild).not.toHaveBeenCalled()
+})
+
+it('folds ended subagents behind a toggle and clears them', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
+  const events = [
+    ev('agent/child-spawn', { childSessionId: 'c1', definition: 'explorer', timestamp: 1 }),
+    ev('agent/child-spawn', { childSessionId: 'c2', definition: 'coder', timestamp: 2 }),
+    ev('agent/child-result', { childSessionId: 'c2', status: 'completed', timestamp: 3 }),
+  ]
+  await render({ ...base, events })
+  const section = () => host.querySelector('section[aria-label="Subagents"]')!.textContent ?? ''
+  // The running row stays in view; the ended one is behind the collapsed group.
+  expect(section()).toContain('explorer')
+  expect(section()).not.toContain('coder')
+  expect(section()).toContain('Ended · 1')
+  // Expanding the group reveals it.
+  await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Toggle ended subagents"]')!.click())
+  expect(section()).toContain('coder')
+  // Clear drops every ended row.
+  await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Clear ended subagents"]')!.click())
+  expect(section()).not.toContain('coder')
+  expect(section()).not.toContain('Ended · 1')
+  expect(section()).toContain('explorer')
 })
 
 it('renders nothing without a session', async () => {

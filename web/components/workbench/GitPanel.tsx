@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type Ref } from 'react'
 import Icon from '../common/Icon.tsx'
 import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import { Spinner } from '../common/Spinner.tsx'
@@ -42,18 +42,39 @@ const STATUS_MARK: Readonly<Record<GitChangeStatus, string>> = {
  * recorded (project-relative, from the TurnChangesCard's Review all). The
  * rows are still git's own status rows — the filter only hides the rest,
  * and the header says so. `onShowAll` clears it.
+ *
+ * `focusPath` opens with one row already expanded to its diff (a chat card's
+ * file click); another click from chat moves the expansion, while toggling
+ * rows here stays the user's own. When the focused file no longer differs
+ * from HEAD, a note says so instead of an unexplained quiet list.
  */
-export function GitPanel({ workspaceId, project, pathFilter, onShowAll }: {
+export function GitPanel({ workspaceId, project, pathFilter, focusPath, onOpenFile, onShowAll }: {
   readonly workspaceId: string
   readonly project: WorkbenchProject
   readonly pathFilter?: readonly string[]
+  readonly focusPath?: string
+  /** Opens a changed file itself in the workbench, when a resolver is wired. */
+  readonly onOpenFile?: (path: string) => void
   readonly onShowAll?: () => void
 }) {
   const [report, setReport] = useState<GitStatusReport | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
-  const [openPath, setOpenPath] = useState<string | null>(null)
+  const [openPath, setOpenPath] = useState<string | null>(focusPath ?? null)
   const generation = useRef(0)
+
+  // A new focus from the chat card moves the open row (and scrolls to it
+  // below); `null` — Review all — leaves the reader's state alone.
+  useEffect(() => {
+    if (focusPath !== undefined && focusPath !== null && focusPath !== '') setOpenPath(focusPath)
+  }, [focusPath])
+
+  // The focused row may render only once the status report lands, so the
+  // scroll rides on both: a focus change, and the list arriving under one.
+  const focusRowRef = useRef<HTMLButtonElement | null>(null)
+  useEffect(() => {
+    focusRowRef.current?.scrollIntoView?.({ block: 'nearest' })
+  }, [focusPath, report])
 
   const load = useCallback(async () => {
     const request = ++generation.current
@@ -81,6 +102,15 @@ export function GitPanel({ workspaceId, project, pathFilter, onShowAll }: {
     added: sum.added + (change.added ?? 0),
     removed: sum.removed + (change.removed ?? 0),
   }), { added: 0, removed: 0 })
+  // A card click aimed at a file git no longer lists: say so where the row
+  // was expected, rather than leaving an unexplained quiet list.
+  const focusNote = focusPath !== undefined && focusPath !== null && focusPath !== '' && !loading && report !== null && !changes.some((change) => change.path === focusPath)
+    ? (
+      <p className="m-0 px-2.5 py-2 text-xs text-fg-faint" role="note">
+        {focusPath} no longer differs from HEAD — a later turn may have changed it back.
+      </p>
+    )
+    : null
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -135,7 +165,13 @@ export function GitPanel({ workspaceId, project, pathFilter, onShowAll }: {
           <ul aria-label="Changed files" className="m-0 flex list-none flex-col p-1">
             {changes.map((change) => (
               <li key={change.path}>
-                <ChangeRow change={change} open={openPath === change.path} onToggle={() => setOpenPath((current) => current === change.path ? null : change.path)} />
+                <ChangeRow
+                  change={change}
+                  open={openPath === change.path}
+                  onToggle={() => setOpenPath((current) => current === change.path ? null : change.path)}
+                  {...(focusPath === change.path ? { rowRef: focusRowRef } : {})}
+                  {...(onOpenFile !== undefined ? { onOpenFile: () => onOpenFile(change.path) } : {})}
+                />
                 {openPath === change.path ? (
                   <DiffView key={change.path} workspaceId={workspaceId} projectId={project.id} path={change.path} />
                 ) : null}
@@ -143,36 +179,49 @@ export function GitPanel({ workspaceId, project, pathFilter, onShowAll }: {
             ))}
           </ul>
         )}
+        {focusNote}
         {report?.truncated === true ? <p className="m-0 px-3 py-2 text-xs text-fg-faint">Showing the first {changes.length} changed files.</p> : null}
       </div>
     </div>
   )
 }
 
-function ChangeRow({ change, open, onToggle }: {
+function ChangeRow({ change, open, onToggle, onOpenFile, rowRef }: {
   readonly change: GitChange
   readonly open: boolean
   readonly onToggle: () => void
+  /** Opens the file itself in the workbench; absent without an opener. */
+  readonly onOpenFile?: () => void
+  /** The focused row (a chat card's file click), for a scroll into view. */
+  readonly rowRef?: Ref<HTMLButtonElement>
 }) {
   const name = change.path.split('/').pop() ?? change.path
   const directory = change.path.slice(0, change.path.length - name.length).replace(/\/$/, '')
   return (
-    <button
-      type="button"
-      aria-expanded={open}
-      title={change.previousPath !== undefined ? `${change.previousPath} → ${change.path}` : change.path}
-      onClick={onToggle}
-      className={cn('flex min-h-8 w-full items-center gap-1.5 rounded-md px-1.5 text-left text-[13px] hover:bg-hover', open && 'bg-hover')}
-    >
-      <Icon name="chevronRight" size={12} className={cn('shrink-0 text-fg-faint transition-transform', open && 'rotate-90')} />
-      <span className={cn('w-3 shrink-0 text-center font-mono text-[11px] font-semibold', markColor(change.status))} aria-label={STATUS_LABEL[change.status]}>{STATUS_MARK[change.status]}</span>
-      <FileTypeIcon path={change.path} size={16} />
-      <span className="min-w-0 flex-1 truncate">
-        <span className={cn(change.status === 'deleted' && 'line-through')}>{name}</span>
-        {directory !== '' ? <span className="ml-1.5 text-fg-faint">{directory}</span> : null}
-      </span>
-      <LineCount {...(change.added !== undefined ? { added: change.added } : {})} {...(change.removed !== undefined ? { removed: change.removed } : {})} />
-    </button>
+    <div className="flex items-center gap-0.5">
+      <button
+        ref={rowRef}
+        type="button"
+        aria-expanded={open}
+        title={change.previousPath !== undefined ? `${change.previousPath} → ${change.path}` : change.path}
+        onClick={onToggle}
+        className={cn('flex min-h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px] hover:bg-hover', open && 'bg-hover')}
+      >
+        <Icon name="chevronRight" size={12} className={cn('shrink-0 text-fg-faint transition-transform', open && 'rotate-90')} />
+        <span className={cn('w-3 shrink-0 text-center font-mono text-[11px] font-semibold', markColor(change.status))} aria-label={STATUS_LABEL[change.status]}>{STATUS_MARK[change.status]}</span>
+        <FileTypeIcon path={change.path} size={16} />
+        <span className="min-w-0 flex-1 truncate">
+          <span className={cn(change.status === 'deleted' && 'line-through')}>{name}</span>
+          {directory !== '' ? <span className="ml-1.5 text-fg-faint">{directory}</span> : null}
+        </span>
+        <LineCount {...(change.added !== undefined ? { added: change.added } : {})} {...(change.removed !== undefined ? { removed: change.removed } : {})} />
+      </button>
+      {onOpenFile !== undefined ? (
+        <IconButton label={`Open ${name} in workbench`} onClick={onOpenFile} className="mr-0.5">
+          <Icon name="fileText" size={13} />
+        </IconButton>
+      ) : null}
+    </div>
   )
 }
 

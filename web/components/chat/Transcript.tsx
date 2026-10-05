@@ -30,7 +30,7 @@ export interface TurnFooter { readonly parts: readonly string[]; readonly text: 
 export function turnFooters(items: readonly ViewItem[]): ReadonlyMap<number, TurnFooter> {
   const groups = new Map<string, { readonly indexes: number[]; readonly parts: string[]; open: boolean }>()
   items.forEach((item, index) => {
-    if (item.kind !== 'assistant') return
+    if (item.kind !== 'assistant' || item.discarded === true) return
     const key = item.turnId ?? `index:${index}`
     const group = groups.get(key) ?? { indexes: [], parts: [], open: false }
     // Only answers that said something can carry the footer: a trailing
@@ -108,7 +108,7 @@ export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
  * Memoized: the app re-renders on every composer keystroke, and a long
  * transcript must not re-render with it while its own props are unchanged.
  */
-export const Transcript = memo(function Transcript({ items, events, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, openPath, project, onReviewChanges, onOpenProcess }: {
+export const Transcript = memo(function Transcript({ items, events, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, openPath, project, onReviewFile, onReviewChanges, onOpenProcess }: {
   readonly items: readonly ViewItem[]
   /** The raw log behind `items`; per-turn changes project from it. */
   readonly events?: readonly SseEvent[]
@@ -122,6 +122,8 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   readonly openPath?: OpenPathResolver
   /** The conversation's project, for the per-turn change card's git chips. */
   readonly project?: WorkbenchProject | null
+  /** Reviews one file of a turn: the Git view focused on that diff. */
+  readonly onReviewFile?: (path: string) => void
   /** Reviews one turn: the Git view narrowed to the turn's recorded files. */
   readonly onReviewChanges?: (paths: readonly string[]) => void
   /** Opens a background process's live detail in the workbench. */
@@ -213,6 +215,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
             {...(changes !== undefined && project !== undefined ? { changesProject: project } : {})}
             {...(changes !== undefined ? { changesWorkspaceId: workspaceId ?? null } : {})}
             {...(changes !== undefined && openPath !== undefined ? { changesOpenPath: openPath } : {})}
+            {...(changes !== undefined && onReviewFile !== undefined ? { changesReviewFile: onReviewFile } : {})}
             {...(review !== undefined ? { changesReviewAll: review } : {})}
           />
         )

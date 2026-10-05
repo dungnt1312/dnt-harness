@@ -190,6 +190,95 @@ describe('file mentions', () => {
   })
 })
 
+describe('mention chip interactions', () => {
+  /** Draft `look at @composer`, pick the first suggestion, return the chip. */
+  const insertChip = async (): Promise<HTMLElement> => {
+    render({ onSearchFiles: async () => files })
+    type('look at @composer')
+    await settle()
+    key('Enter')
+    const chip = chips()[0]
+    if (chip === undefined) throw new Error('the chip was not inserted')
+    return chip
+  }
+
+  /** Move the collapsed caret to a text node offset, the way a click would. */
+  const placeCaret = (node: Node, offset: number): void => {
+    const range = document.createRange()
+    range.setStart(node, offset)
+    range.collapse(true)
+    const selection = document.getSelection()
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+  }
+
+  it('shows the file themed picker icon instead of the generic stroke drawing', async () => {
+    const chip = await insertChip()
+    // The label icon is now the themed image; the only svg left is the × button's cross.
+    const icons = chip.querySelector('img')
+    expect(icons).not.toBeNull()
+    expect(icons?.getAttribute('src')).toContain('/material-icons/typescript.svg')
+    expect(chip.querySelector('svg')?.getAttribute('aria-hidden')).toBe('true')
+  })
+
+  it('removes the chip when Backspace is pressed right after it', async () => {
+    const chip = await insertChip()
+    // The pick leaves the caret before the inserted trailing space — directly
+    // after the chip — which is where Backspace now removes the chip itself.
+    const tail = chip.nextSibling as Text
+    placeCaret(tail, 0)
+    key('Backspace')
+    expect(chips()).toHaveLength(0)
+    expect(current.segments).toEqual([{ kind: 'text', text: 'look at  ' }])
+  })
+
+  it('removes the chip when Delete is pressed right before it', async () => {
+    const chip = await insertChip()
+    const head = chip.previousSibling as Text
+    placeCaret(head, head.textContent?.length ?? 0)
+    key('Delete')
+    expect(chips()).toHaveLength(0)
+    expect(current.segments).toEqual([{ kind: 'text', text: 'look at  ' }])
+  })
+
+  it('leaves plain deletion alone when the caret is not beside a chip', async () => {
+    const chip = await insertChip()
+    const head = chip.previousSibling as Text
+    placeCaret(head, 2)
+    key('Backspace')
+    expect(chips()).toHaveLength(1)
+    placeCaret(head, 1)
+    key('Delete')
+    expect(chips()).toHaveLength(1)
+  })
+
+  it('reports a clicked mention chip through onChipClick, but not the × button', async () => {
+    const onChipClick = vi.fn()
+    render({ onSearchFiles: async () => files, onChipClick })
+    type('@composer')
+    await settle()
+    key('Enter')
+    const chip = chips()[0]
+    act(() => { chip.click() })
+    expect(onChipClick).toHaveBeenCalledWith({ kind: 'mention', path: 'web/composer.ts' })
+
+    const remove = chip.querySelector('[data-chip-remove]')
+    if (remove === null) throw new Error('the chip has no remove button')
+    act(() => { (remove as HTMLElement).click() })
+    expect(chips()).toHaveLength(0)
+    expect(onChipClick).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not report a clicked command chip — there is nothing to open', async () => {
+    const onChipClick = vi.fn()
+    render({ skills: [{ name: 'review' }], onChipClick })
+    type('/rev')
+    key('Enter')
+    act(() => { chips()[0].click() })
+    expect(onChipClick).not.toHaveBeenCalled()
+  })
+})
+
 describe('skill commands', () => {
   const skills = [{ name: 'review', description: 'Check a diff' }, { name: 'test', description: 'Run the suite' }]
 
@@ -200,7 +289,7 @@ describe('skill commands', () => {
     key('Enter')
     expect(chips()).toHaveLength(1)
     expect(chips()[0]?.getAttribute('aria-label')).toBe('Skill command review')
-    expect(chips()[0]?.textContent).toBe('/review')
+    expect(chips()[0]?.textContent).toBe('review')
     expect(draftText(current)).toBe('Use the review skill: ')
     expect(current.segments).toEqual([{ kind: 'command', name: 'review' }, { kind: 'text', text: ' ' }])
   })

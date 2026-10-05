@@ -1,7 +1,7 @@
 import { forwardRef, useImperativeHandle, useLayoutEffect, useRef } from 'react'
 import { normalizeDraft, type DraftSegment, type RichDraft } from '../../lib/composer-draft.ts'
 import { chipLabel, chipTitle, type ChipSegment } from '../../lib/inline-chips.ts'
-import { CHIP_CLASS, CHIP_ICON_CLASS, CHIP_ICON_PATHS, CHIP_ICON_SIZE, CHIP_LABEL_CLASS, CHIP_TONE, chipAriaLabel } from '../common/InlineChip.tsx'
+import { CHIP_CLASS, CHIP_ICON_CLASS, CHIP_ICON_PATHS, CHIP_ICON_SIZE, CHIP_LABEL_CLASS, CHIP_TONE, MENTION_ICON_FALLBACK, chipAriaLabel, mentionIconSrc } from '../common/InlineChip.tsx'
 import { classifyPlainTextPaste, SAFE_MODEL_VISIBLE_BYTES, utf8Bytes } from './paste-classification.ts'
 
 /**
@@ -66,6 +66,8 @@ export interface RichInputProps {
   readonly onConvertibleText: (text: string, bookmark: CaretBookmark | null) => void
   /** Reports an unsafe paste while preserving it inline. */
   readonly onPasteError: (text: string, bookmark: CaretBookmark | null) => void
+  /** A chip was clicked (the remove button still only removes). */
+  readonly onChipClick?: (segment: ChipSegment) => void
   readonly placeholder: string
   readonly disabled: boolean
   readonly ariaLabel: string
@@ -155,7 +157,26 @@ function chipElement(segment: ChipSegment, document: Document): HTMLElement {
   host.className = `${CHIP_CLASS} ${CHIP_TONE.editor} select-none`
   host.title = chipTitle(segment)
   host.setAttribute('aria-label', chipAriaLabel(segment))
-  host.append(strokeIcon(document, CHIP_ICON_PATHS[segment.kind], CHIP_ICON_CLASS[segment.kind]))
+  // Mentions carry the file's themed icon — the same glyph the `@` picker row
+  // shows — while commands keep the stroke drawing.
+  if (segment.kind === 'mention') {
+    const icon = document.createElement('img')
+    const src = mentionIconSrc(segment.path)
+    icon.src = src
+    icon.width = CHIP_ICON_SIZE
+    icon.height = CHIP_ICON_SIZE
+    icon.draggable = false
+    icon.alt = ''
+    icon.setAttribute('aria-hidden', 'true')
+    icon.className = 'shrink-0'
+    // Same fallback contract as FileTypeIcon: a missing themed asset degrades
+    // to the plain document icon rather than a broken image.
+    const fallbackHref = new URL(MENTION_ICON_FALLBACK, document.baseURI).href
+    icon.addEventListener('error', () => { if (icon.src !== fallbackHref) icon.src = MENTION_ICON_FALLBACK }, { once: true })
+    host.append(icon)
+  } else {
+    host.append(strokeIcon(document, CHIP_ICON_PATHS[segment.kind], CHIP_ICON_CLASS[segment.kind]))
+  }
 
   const label = document.createElement('span')
   label.className = CHIP_LABEL_CLASS
@@ -173,7 +194,7 @@ function chipElement(segment: ChipSegment, document: Document): HTMLElement {
 }
 
 export const RichInput = forwardRef<RichInputHandle, RichInputProps>(function RichInput({
-  draft, onChange, onKeyDown, onFiles, onTextAttachment, onConvertibleText, onPasteError, placeholder, disabled, ariaLabel, ariaDescribedBy,
+  draft, onChange, onKeyDown, onFiles, onTextAttachment, onConvertibleText, onPasteError, onChipClick, placeholder, disabled, ariaLabel, ariaDescribedBy,
   autoFocus = false, listId, expanded, activeOptionId,
 }, ref) {
   const host = useRef<HTMLDivElement | null>(null)
@@ -328,6 +349,31 @@ export const RichInput = forwardRef<RichInputHandle, RichInputProps>(function Ri
     return offset === null ? null : segmentsWithInsertAtBookmark({ offset, revision: revision.current }, segment)
   }
 
+  /**
+   * The chip the delete key would reach: the one ending exactly at the caret
+   * (Backspace) or starting exactly at it (Delete). A caret in the middle of
+   * text, or with no chip on that side, is no chip at all.
+   */
+  const chipBesideCaret = (side: 'before' | 'after'): Element | null => {
+    const element = host.current
+    const selection = element?.ownerDocument.getSelection()
+    if (element === null || selection == null || selection.rangeCount === 0 || !selection.isCollapsed) return null
+    const { anchorNode, anchorOffset } = selection
+    if (anchorNode === element) {
+      const target = side === 'before' ? anchorOffset - 1 : anchorOffset
+      const child = element.childNodes[target] ?? null
+      return child instanceof Element && child.hasAttribute(CHIP_ATTRIBUTE) ? child : null
+    }
+    // A caret at a text boundary is also beside a chip that ends (or starts)
+    // exactly there: Backspace at a node's start reaches behind it, Delete at
+    // its end reaches past it.
+    const text = anchorNode?.nodeType === Node.TEXT_NODE ? anchorNode.textContent ?? '' : null
+    if (text === null || anchorNode === null || !element.contains(anchorNode)) return null
+    if (side === 'before' ? anchorOffset !== 0 : anchorOffset !== text.length) return null
+    const node = side === 'before' ? anchorNode.previousSibling : anchorNode.nextSibling
+    return node instanceof Element && node.hasAttribute(CHIP_ATTRIBUTE) ? node : null
+  }
+
   const setCaretAtBookmark = (bookmark: CaretBookmark): boolean => {
     if (bookmark.revision !== revision.current || bookmark.offset < 0) return false
     const element = host.current
@@ -435,16 +481,47 @@ export const RichInput = forwardRef<RichInputHandle, RichInputProps>(function Ri
         // A chip remove button is an interactive descendant, not editor input.
         // Do not let its activation key bubble into the composer's send shortcut.
         if ((event.target as HTMLElement).closest('[data-chip-remove]') !== null) return
+        // Backspace/Delete with the caret beside a chip removes that chip, the
+        // way the picker's remove button does — typing text alone would only
+        // sit next to it and the chip would survive every other delete route.
+        if (event.key === 'Backspace' || event.key === 'Delete') {
+          const chip = chipBesideCaret(event.key === 'Backspace' ? 'before' : 'after')
+          if (chip !== null) {
+            event.preventDefault()
+            chip.remove()
+            emit()
+          }
+          return
+        }
         onKeyDown(event)
       }}
       onClick={(event) => {
         // Chips are inert content, so their remove button is handled here.
-        const button = (event.target as HTMLElement).closest('[data-chip-remove]')
-        if (button === null) return
-        event.preventDefault()
-        button.closest(`[${CHIP_ATTRIBUTE}]`)?.remove()
-        emit()
-        host.current?.focus()
+        const target = event.target as HTMLElement
+        const button = target.closest('[data-chip-remove]')
+        if (button !== null) {
+          event.preventDefault()
+          button.closest(`[${CHIP_ATTRIBUTE}]`)?.remove()
+          emit()
+          host.current?.focus()
+          return
+        }
+        // Clicking a chip itself reports it: a file mention opens in the
+        // workbench, a command chip has nothing to open.
+        if (onChipClick === undefined) return
+        const chip = target.closest(`[${CHIP_ATTRIBUTE}]`)
+        if (chip === null) return
+        const encoded = chip.getAttribute(CHIP_ATTRIBUTE)
+        if (encoded === null) return
+        try {
+          const segment = JSON.parse(encoded) as ChipSegment
+          if (segment.kind === 'mention') {
+            event.preventDefault()
+            onChipClick(segment)
+          }
+        } catch {
+          // An unreadable payload has nothing to act on.
+        }
       }}
       onPaste={(event) => {
         event.preventDefault()

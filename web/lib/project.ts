@@ -33,6 +33,12 @@ export type ViewItem =
       readonly turnId?: string
       /** True while the owning turn is still open — the turn footer waits for it to close. */
       turnOpen?: boolean
+      /**
+       * This partial answer's step was abandoned after a mid-stream failure and
+       * re-asked under a new step id: the text is spent, never part of the
+       * turn's durable answer, and renders collapsed behind a disclosure.
+       */
+      discarded?: boolean
     }
   | {
       readonly kind: 'tool'
@@ -118,6 +124,9 @@ interface AssistantDraft {
   controls?: { readonly model?: string; readonly provider?: string }
   turnId?: string
   turnOpen?: boolean
+  /** The open step this draft streams for; `step/abandoned` keys on it. */
+  stepId?: string
+  discarded?: boolean
 }
 
 const DECISION_LABELS: Readonly<Record<string, string>> = {
@@ -311,6 +320,7 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
             draft = {
               kind: 'assistant', content: '', live: true, thinking: [], thinkingLive: false,
               ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
+              ...(event.stepId !== undefined ? { stepId: event.stepId } : {}),
               ...(openTurnId !== undefined ? { turnId: openTurnId, turnOpen: true } : {}),
             }
             add(draft)
@@ -325,6 +335,19 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
             draft.thinkingLive = false
           }
           break
+        case 'step/abandoned': {
+          // The step's streamed text is spent: the model never answered it and
+          // the retry re-asks under a new step id. Collapse the partial answer
+          // behind a disclosure instead of duplicating it in the transcript.
+          if (draft !== null && draft.stepId !== undefined && event.stepId === draft.stepId) {
+            touch(draft)
+            draft.discarded = true
+            draft.live = false
+            draft.thinkingLive = false
+            draft = null
+          }
+          break
+        }
         case 'assistant/message': {
           const content = event.content ?? ''
           const controls = event.controls !== undefined

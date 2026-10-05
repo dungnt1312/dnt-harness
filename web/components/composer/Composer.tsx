@@ -21,7 +21,7 @@ import {
   type CompletionItem,
   type CompletionRequest,
 } from '../../lib/composer-completion.ts'
-import { BUILTIN_COMMANDS, isBuiltinCommand } from '../../lib/inline-chips.ts'
+import { BUILTIN_COMMANDS, isBuiltinCommand, type ChipSegment } from '../../lib/inline-chips.ts'
 import {
   appendAttachments,
   draftIsEmpty,
@@ -97,7 +97,7 @@ export function Composer({
   modelValue, thinkingValue = null, modelSettings, onThinking, thinkingMenuLabel, thinkingDisabled = false,
   controlsUnavailable = false, controlsUnavailableMessage, onRetryControls,
   modes, modeValue, modeMenuLabel, onMode,
-  onSearchFiles, onUploadFiles, skills, onRecallLast, autoFocus = false,
+  onSearchFiles, onUploadFiles, skills, onRecallLast, autoFocus = false, onChipClick,
 }: {
   readonly workspaceId?: string | null
   /** Model picker, owned by the app; shown beside Send. */
@@ -143,6 +143,8 @@ export function Composer({
   /** Newest own message, for ArrowUp on an empty draft. */
   readonly onRecallLast?: () => string | null
   readonly autoFocus?: boolean
+  /** A mention chip was clicked; the app decides what it opens. */
+  readonly onChipClick?: (segment: ChipSegment) => void
 }) {
   const editor = useRef<RichInputHandle | null>(null)
   const fileInput = useRef<HTMLInputElement | null>(null)
@@ -522,6 +524,7 @@ export function Composer({
         onFiles={uploadFiles}
         onTextAttachment={uploadPastedText}
         onConvertibleText={(text, bookmark) => setConversion({ text, bookmark })}
+        {...(onChipClick !== undefined ? { onChipClick } : {})}
         // An oversized paste stays inline; the draft itself raises the notice.
         onPasteError={() => {}}
       />

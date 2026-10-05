@@ -77,4 +77,38 @@ describe('incremental event compactor', () => {
     ])
     expect(latest.map((event) => event.seq)).toEqual([1, 2])
   })
+
+  it('drops the content chunks of an abandoned step but keeps its folded thinking', () => {
+    const events: SseEvent[] = [
+      { seq: 1, type: 'turn/start', turnId: 't' },
+      { seq: 2, type: 'assistant/chunk', stepId: 's1', thinking: true, delta: 'reasoning ' },
+      { seq: 3, type: 'assistant/chunk', stepId: 's1', thinking: true, delta: 'more' },
+      { seq: 4, type: 'assistant/chunk', stepId: 's1', delta: 'partial answer' },
+      { seq: 5, type: 'step/abandoned', stepId: 's1', reason: 'stream ended' },
+      { seq: 6, type: 'assistant/chunk', stepId: 's2', delta: 'recovered' },
+      { seq: 7, type: 'assistant/message', stepId: 's2', content: 'recovered' },
+      { seq: 8, type: 'turn/end', turnId: 't', reason: 'completed' },
+    ]
+    const compacted = compactClientEvents(events)
+    expect(compacted.map((event) => event.seq)).toEqual([1, 2, 5, 7, 8])
+    expect(compacted[1]).toMatchObject({ type: 'assistant/chunk', thinking: true, delta: 'reasoning more' })
+  })
+
+  it('matches whole-array compaction when the abandonment arrives in a later batch', () => {
+    const batches: readonly SseEvent[][] = [
+      [{ seq: 1, type: 'turn/start', turnId: 't' }],
+      [{ seq: 2, type: 'assistant/chunk', stepId: 's1', delta: 'partial ' }],
+      [{ seq: 3, type: 'assistant/chunk', stepId: 's1', delta: 'text' }],
+      [
+        { seq: 4, type: 'step/abandoned', stepId: 's1', reason: 'reset' },
+        { seq: 5, type: 'assistant/chunk', stepId: 's2', delta: 'ok' },
+        { seq: 6, type: 'assistant/message', stepId: 's2', content: 'ok' },
+      ],
+    ]
+    const compact = createEventCompactor()
+    let latest: readonly SseEvent[] = []
+    for (const batch of batches) latest = compact(batch)
+    expect(latest.map((event) => event.seq)).toEqual(compactClientEvents(batches.flat()).map((event) => event.seq))
+    expect(latest.some((event) => event.type === 'assistant/chunk' && event.stepId === 's1' && event.thinking !== true)).toBe(false)
+  })
 })

@@ -28,13 +28,13 @@ describe('processRows', () => {
 describe('subagentRows', () => {
   it('derives running and finished children, newest dispatch first', () => {
     const rows = subagentRows([
-      ev('agent/child-spawn', { childSessionId: 'c1', definition: 'researcher', timestamp: 1_000 }),
+      ev('agent/child-spawn', { childSessionId: 'c1', definition: 'researcher', brief: 'Map the auth modules\nmore detail', timestamp: 1_000 }),
       ev('agent/child-spawn', { childSessionId: 'c2', definition: 'coder', timestamp: 2_000 }),
-      ev('agent/child-result', { childSessionId: 'c2', status: 'completed' }),
+      ev('agent/child-result', { childSessionId: 'c2', status: 'completed', timestamp: 3_000 }),
     ])
     expect(rows).toEqual([
-      { childSessionId: 'c2', definition: 'coder', running: false, status: 'completed', dispatchedAt: 2_000 },
-      { childSessionId: 'c1', definition: 'researcher', running: true, dispatchedAt: 1_000 },
+      { childSessionId: 'c2', definition: 'coder', brief: '', running: false, status: 'completed', dispatchedAt: 2_000, endedAt: 3_000 },
+      { childSessionId: 'c1', definition: 'researcher', brief: 'Map the auth modules', running: true, dispatchedAt: 1_000 },
     ])
   })
 
@@ -44,5 +44,15 @@ describe('subagentRows', () => {
       ev('agent/child-spawn', { childSessionId: 'c2', definition: 'coder' }),
     ])
     expect(rows.map((row) => row.childSessionId)).toEqual(['c1', 'c2'])
+  })
+
+  it('reads the legacy objective as the brief and keeps an endedAt-less row running-clean', () => {
+    const rows = subagentRows([
+      ev('agent/child-spawn', { childSessionId: 'c1', definition: 'reviewer', objective: '## Audit the run\nsecond line' }),
+      ev('agent/child-result', { childSessionId: 'c1', status: 'failed' }),
+    ])
+    expect(rows[0]?.brief).toBe('Audit the run')
+    expect(rows[0]?.status).toBe('failed')
+    expect(rows[0]?.endedAt).toBeUndefined()
   })
 })

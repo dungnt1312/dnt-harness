@@ -1,6 +1,12 @@
 /** Pure derivation of Environment-panel rows from the session event log. */
 import type { SseEvent } from './types.ts'
 
+/** One non-empty line, markdown heading marks dropped — the same title rule the transcript's DelegationCard applies. */
+function briefLine(text: string | undefined): string {
+  const line = (text ?? '').split('\n').map((part) => part.trim()).find((part) => part !== '') ?? ''
+  return line.replace(/^#+\s*/, '').replace(/\*\*/g, '')
+}
+
 export interface ProcessRow {
   readonly id: string
   readonly command: string
@@ -27,21 +33,25 @@ export function processRows(events: readonly SseEvent[]): readonly ProcessRow[] 
 export interface SubagentRow {
   readonly childSessionId: string
   readonly definition: string
+  /** First line of the child's brief — the row's title; empty when the spawn carried none. */
+  readonly brief: string
   readonly running: boolean
   readonly status?: string
   /** Wall-clock dispatch time of the spawn; 0 on legacy events without one. */
   readonly dispatchedAt: number
+  /** Wall-clock the child settled at, when the result event carried one. */
+  readonly endedAt?: number
 }
 
 export function subagentRows(events: readonly SseEvent[]): readonly SubagentRow[] {
   const rows = new Map<string, SubagentRow>()
   for (const event of events) {
     if (event.type === 'agent/child-spawn' && event.childSessionId !== undefined) {
-      rows.set(event.childSessionId, { childSessionId: event.childSessionId, definition: event.definition ?? 'subagent', running: true, dispatchedAt: event.timestamp ?? 0 })
+      rows.set(event.childSessionId, { childSessionId: event.childSessionId, definition: event.definition ?? 'subagent', brief: briefLine(event.brief ?? event.objective), running: true, dispatchedAt: event.timestamp ?? 0 })
     } else if (event.type === 'agent/child-result' && event.childSessionId !== undefined) {
       const row = rows.get(event.childSessionId)
       if (row === undefined) continue
-      rows.set(event.childSessionId, { ...row, running: false, status: event.status ?? 'finished' })
+      rows.set(event.childSessionId, { ...row, running: false, status: event.status ?? 'finished', ...(event.timestamp !== undefined ? { endedAt: event.timestamp } : {}) })
     }
   }
   // Newest dispatch first: the child just sent out leads the list instead of

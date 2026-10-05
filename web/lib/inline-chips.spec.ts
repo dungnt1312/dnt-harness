@@ -9,9 +9,9 @@ describe('chip wire text', () => {
     expect(chipWireText({ kind: 'command', name: 'ak-plan' })).toBe('Use the ak-plan skill:')
   })
 
-  it('labels a file by base name and a skill as /name', () => {
+  it('labels a file by base name and a skill by its bare name', () => {
     expect(chipLabel({ kind: 'mention', path: 'web/lib/api.ts' })).toBe('api.ts')
-    expect(chipLabel({ kind: 'command', name: 'ak-plan' })).toBe('/ak-plan')
+    expect(chipLabel({ kind: 'command', name: 'ak-plan' })).toBe('ak-plan')
   })
 
   it('titles built-in commands apart from workspace skills', () => {

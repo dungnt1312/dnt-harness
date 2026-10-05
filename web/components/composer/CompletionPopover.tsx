@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 import Icon from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
+import { CHIP_ICON_CLASS, CHIP_ICON_SIZE } from '../common/InlineChip.tsx'
 import { cn } from '../../lib/cn.ts'
 import type { CompletionItem, CompletionKind } from '../../lib/composer-completion.ts'
 
@@ -69,7 +70,7 @@ export function CompletionPopover({ id, kind, items, activeIndex, loading, note,
                 ? <FileTypeIcon path={item.label} size={16} />
                 : isCommand
                   ? null
-                  : <Icon name="dollarSign" size={15} className="shrink-0 text-fg-muted" />}
+                  : <Icon name="zap" size={CHIP_ICON_SIZE} className={CHIP_ICON_CLASS.command} />}
               <span className="flex min-w-0 flex-1 flex-col">
                 <span className="truncate">{item.label}</span>
                 {item.detail !== undefined && item.detail !== '' ? <span className="truncate text-xs text-fg-faint">{item.detail}</span> : null}

@@ -660,10 +660,10 @@ describe('transcript truthfulness', () => {
     await mount(<UserBubble item={{ kind: 'user', content: 'Use the review skill: check @web/lib/api.ts now' }} />)
     const chips = Array.from(host.querySelectorAll('[data-chip-kind]'))
     expect(chips.map((chip) => [chip.getAttribute('data-chip-kind'), chip.textContent, chip.getAttribute('title')])).toEqual([
-      ['command', '/review', 'Skill: review'],
+      ['command', 'review', 'Skill: review'],
       ['mention', 'api.ts', 'Project file: web/lib/api.ts'],
     ])
-    expect(host.querySelector('p')?.textContent).toBe('/review check api.ts now')
+    expect(host.querySelector('p')?.textContent).toBe('review check api.ts now')
   })
 })
 

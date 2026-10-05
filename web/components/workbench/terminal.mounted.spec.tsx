@@ -136,6 +136,7 @@ async function mount(props: {
   projectId?: string | null
   defaultShell?: string | null
   onDefaultShell?: (shellId: string | null) => void
+  onHide?: () => void
   bindingReady?: boolean
 } = {}): Promise<void> {
   await act(async () => {
@@ -145,6 +146,7 @@ async function mount(props: {
         projectId={props.projectId ?? null}
         defaultShell={props.defaultShell ?? null}
         {...(props.onDefaultShell !== undefined ? { onDefaultShell: props.onDefaultShell } : {})}
+        {...(props.onHide !== undefined ? { onHide: props.onHide } : {})}
         bindingReady={props.bindingReady ?? true}
       />,
     )
@@ -216,6 +218,64 @@ describe('terminal panel', () => {
 
     // Closing the last terminal is a decision, not a gap to fill.
     expect(api.createTerminal).toHaveBeenCalledTimes(1)
+    expect(host.textContent).toContain('No terminal open')
+  })
+
+  it('does not auto-open when the mount inherits a shell and it later exits', async () => {
+    // Ctrl+` reopened over a live shell (a hidden footer kept it alive): this
+    // mount adopted that shell instead of opening one, and when it exits the
+    // close is still final — no fresh shell appears in its place.
+    const onHide = vi.fn()
+    await mount({ onHide })
+    await act(async () => push({
+      kind: 'snapshot',
+      terminals: [{ ...row('terminal-1'), scrollback: '' }],
+    }))
+    expect(api.createTerminal).not.toHaveBeenCalled()
+
+    await act(async () => push({ kind: 'exit', terminalId: 'terminal-1', exitCode: 0, reason: 'killed' }))
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1_600))
+    })
+
+    expect(api.createTerminal).not.toHaveBeenCalled()
+    expect(onHide).toHaveBeenCalledTimes(1)
+  })
+
+  it('closes the footer itself once the last shell exits, but stays for a fresh one', async () => {
+    const onHide = vi.fn()
+    await mount({ onHide })
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+    await act(async () => push({ kind: 'created', terminal: row('terminal-1') }))
+
+    await act(async () => push({ kind: 'exit', terminalId: 'terminal-1', exitCode: 0, reason: 'exit' }))
+    // The exit note gets its moment before the surface folds.
+    expect(onHide).not.toHaveBeenCalled()
+    await act(async () => push({ kind: 'created', terminal: row('terminal-2', 'PowerShell', 'powershell') }))
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1_600))
+    })
+    // A shell opened during the notice window keeps the surface open.
+    expect(onHide).not.toHaveBeenCalled()
+
+    await act(async () => push({ kind: 'exit', terminalId: 'terminal-2', exitCode: 0, reason: 'exit' }))
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1_600))
+    })
+    expect(onHide).toHaveBeenCalledTimes(1)
+  })
+
+  it('closes the footer after the last exit only when it can hide, and the workbench stays', async () => {
+    await mount()
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+    await act(async () => push({ kind: 'created', terminal: row('terminal-1') }))
+    await act(async () => push({ kind: 'exit', terminalId: 'terminal-1', exitCode: 0, reason: 'exit' }))
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1_600))
+    })
+
+    // No onHide: the workbench tab cannot fold itself, so the empty state
+    // remains until the operator opens or closes it.
     expect(host.textContent).toContain('No terminal open')
   })
 
