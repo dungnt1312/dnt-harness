@@ -18,10 +18,13 @@ import type { SessionEvent } from '../harness/session/events.ts'
 import { agentScope } from '../harness/agent/scope.ts'
 import { bundledDefinition, BUNDLED_AGENT_ROLES, type AgentDefinitionService } from '../harness/agents/definition-service.ts'
 import { type ChildExecutor, type ChildHandle, type ChildModel, type SpawnAdmissionResolver, type TaskPacket } from '../harness/agents/executor.ts'
+import { formatChildReports as formatChildReportsText } from './child-reports.ts'
 import type { GrantedRoot, ToolDefinition } from '../harness/tools/types.ts'
 
 /** Most parent-conversation text an `inherit: 'brief'` child receives. */
 export const MAX_INHERITED_CHARS = 12_000
+
+export { CHILD_REPORTS_HEADER } from './child-reports.ts'
 
 /**
  * The bounded parent projection behind `inherit: 'brief'`: recent user and
@@ -362,24 +365,11 @@ async function spawn(
 
 /**
  * The message a root's turn continues with when delegated children finished
- * after the model stopped calling tools: one section per child, reports first.
- * Nothing in it is an instruction — it is data the model asked for.
+ * after the model stopped calling tools — see `child-reports.ts`, which owns
+ * the format; this adapter just widens the handles to it.
  */
 export function formatChildReports(handles: readonly ChildHandle[]): string {
-  const sections = handles.map((child) => {
-    const head = `### ${child.definitionName} (${child.childSessionId}) — ${child.status}`
-    if (child.result !== undefined) {
-      const files = child.result.filesTouched.length > 0 ? `\nFiles touched: ${child.result.filesTouched.join(', ')}` : ''
-      return `${head}\n${child.result.report}${files}`
-    }
-    const lines = [head, child.error ?? 'no result']
-    if (child.partial !== undefined) {
-      if (child.partial.report !== '') lines.push(`Last thing it said before stopping: ${child.partial.report}`)
-      if (child.partial.filesTouched.length > 0) lines.push(`Files touched before stopping: ${child.partial.filesTouched.join(', ')} (unverified — check them before relying on them)`)
-    }
-    return lines.join('\n')
-  })
-  return ['Delegated agents you left running have finished. Their reports follow; use them to complete the task.', ...sections].join('\n\n')
+  return formatChildReportsText(handles)
 }
 
 async function wait(

@@ -6,7 +6,7 @@
  * did not stamp is never invented — a span with no end simply has no duration.
  */
 import { toolFacts } from '../../lib/tool-facts.ts'
-import { isMcpOutcome, type SseEvent, type ToolCall } from '../../lib/types.ts'
+import { isMcpOutcome, type ContextManifestView, type SseEvent, type ToolCall } from '../../lib/types.ts'
 
 /** How a recorded call ended, in the same terms the transcript uses. */
 export type CallState = 'running' | 'ok' | 'failed' | 'unknown'
@@ -26,12 +26,64 @@ export interface TrajectorySegment {
 /** One model request inside a turn: the gap between two tool batches. */
 export interface TrajectoryStep {
   readonly index: number
+  /** The log's step id, when the message carried one (legacy logs did not). */
+  readonly stepId?: string
   readonly start: number
   readonly end: number
   /** What the model answered, when the log kept the text. */
   readonly content: string
   /** Tool calls the answer named. */
   readonly calls: number
+}
+
+/** What one physical attempt at a request recorded, exactly as the log kept it. */
+export interface TrajectoryAttempt {
+  readonly state: 'start' | 'end' | 'uncertain' | 'reconciled'
+  readonly attempt: number
+  readonly requestId: string
+  readonly attemptId: string
+  readonly provider?: string
+  readonly model?: string
+  readonly queuedAt?: number
+  readonly startedAt?: number
+  readonly endedAt?: number
+  readonly firstProgressAt?: number
+  readonly lastProgressAt?: number
+  readonly finish?: string
+  readonly reason?: string
+  readonly committed?: boolean
+}
+
+/** Why a step has no answer of its own. */
+export interface StepAbandonment {
+  readonly reason: string
+  readonly stepId?: string
+  readonly at?: number
+}
+
+/** Everything one model request said, in the shape the inspector renders. */
+export interface StepTrace {
+  /** The finalized answer's step id; a `#N` fallback for legacy logs without one. */
+  readonly stepId: string
+  /** The assembled request's manifest, when the log recorded one. */
+  readonly manifest?: ContextManifestView
+  /** Non-history context blocks by sha256, fetchable raw through the body route. */
+  readonly sections?: NonNullable<ContextManifestView['sections']>
+  /** Every physical attempt, in log order. */
+  readonly attempts: readonly TrajectoryAttempt[]
+  /** A mid-stream failure abandoned an earlier step of this request. */
+  readonly abandoned?: StepAbandonment
+  /** Answer text streamed before the message finalized (a live step only). */
+  readonly partial?: string
+  /** Full streamed reasoning, folded across chunks. */
+  readonly thinking?: string
+}
+
+/** How a turn failed, exactly as the log classified it. */
+export interface TrajectoryError {
+  readonly kind: string
+  readonly message: string
+  readonly at?: number
 }
 
 export interface TrajectoryCall {
@@ -81,6 +133,10 @@ export interface TrajectoryTurn {
   readonly failedCalls: number
   /** One entry per model request the turn made. */
   readonly steps: readonly TrajectoryStep[]
+  /** One trace per request that produced a message, in log order; absent on legacy logs. */
+  readonly traces?: readonly StepTrace[]
+  /** How the turn failed, when the log classified it. */
+  readonly error?: TrajectoryError
   /** Tool marks, filled in after every call has been paired with its result. */
   segments: TrajectorySegment[]
 }
@@ -120,14 +176,45 @@ interface OpenTurn {
   /** Calls the answer in flight named. */
   stepCalls: number
   steps: TrajectoryStep[]
+  /** The request in flight, under construction. */
+  trace?: StepTraceDraft
+  /** Requests that produced a message, in log order. */
+  traces: StepTraceDraft[]
+  error?: TrajectoryError
   segments: TrajectorySegment[]
   calls: number
   failedCalls: number
 }
 
-/** `exactOptionalPropertyTypes` forbids assigning undefined, so a closed request drops the field. */
+interface StepTraceDraft {
+  stepId: string
+  manifest?: ContextManifestView
+  sections?: NonNullable<ContextManifestView['sections']>
+  attempts: TrajectoryAttempt[]
+  partial: string
+  thinking: string
+  abandoned?: StepAbandonment
+}
+
+function finalizeTrace(draft: StepTraceDraft, key: number): StepTrace {
+  return {
+    stepId: draft.stepId !== '' ? draft.stepId : `#${key}`,
+    attempts: draft.attempts,
+    ...(draft.manifest !== undefined ? { manifest: draft.manifest } : {}),
+    ...(draft.sections !== undefined ? { sections: draft.sections } : {}),
+    ...(draft.abandoned !== undefined ? { abandoned: draft.abandoned } : {}),
+    ...(draft.partial !== '' ? { partial: draft.partial } : {}),
+    ...(draft.thinking !== '' ? { thinking: draft.thinking } : {}),
+  }
+}
+
 function clearStep(turn: OpenTurn): void {
   delete turn.stepStart
+}
+
+/** `exactOptionalPropertyTypes` forbids assigning undefined; a fresh request drops the draft instead. */
+function clearTrace(turn: OpenTurn): void {
+  delete turn.trace
 }
 
 interface OpenCall {
@@ -156,6 +243,10 @@ export function projectTrajectory(events: readonly SseEvent[]): Trajectory {
     // A turn/end names its turn. One that names some other turn does not close the open one.
     if (turn === null || (turnId !== undefined && turnId !== '' && turn.id !== turnId)) return
     const target = turn
+    const traces = target.traces.length > 0
+      ? target.traces.map((draft, at_) => finalizeTrace(draft, at_ + 1))
+      : undefined
+    const error = target.error
     turns.push({
       id: target.id,
       index: target.index,
@@ -167,6 +258,8 @@ export function projectTrajectory(events: readonly SseEvent[]): Trajectory {
       calls: target.calls,
       failedCalls: target.failedCalls,
       steps: target.steps,
+      ...(traces !== undefined ? { traces } : {}),
+      ...(error !== undefined ? { error } : {}),
       segments: target.segments,
     })
     turn = null
@@ -174,10 +267,6 @@ export function projectTrajectory(events: readonly SseEvent[]): Trajectory {
 
   for (const event of events) {
     switch (event.type) {
-      case 'model/attempt':
-      case 'execution/uncertain':
-      case 'execution/reconciled':
-        break // Physical settlement does not close a logical turn.
       case 'turn/start': {
         if (turn !== null) settle(undefined, event.timestamp, turn.id)
         turn = {
@@ -188,6 +277,7 @@ export function projectTrajectory(events: readonly SseEvent[]): Trajectory {
           stepContent: '',
           stepCalls: 0,
           steps: [],
+          traces: [],
           segments: [],
           calls: 0,
           failedCalls: 0,
@@ -207,22 +297,104 @@ export function projectTrajectory(events: readonly SseEvent[]): Trajectory {
         if (turn.stepStart !== undefined && event.timestamp !== undefined && event.timestamp >= turn.stepStart) {
           turn.steps.push({
             index: turn.steps.length + 1,
+            ...(event.stepId !== undefined ? { stepId: event.stepId } : {}),
             start: turn.stepStart,
             end: event.timestamp,
             content: turn.stepContent,
             calls: turn.stepCalls,
           })
+          // The finalized message supersedes the streamed partial, but the
+          // trace keeps the rest: manifest, attempts, thinking, abandonment.
+          if (turn.trace !== undefined) {
+            turn.trace.partial = ''
+            turn.traces.push(turn.trace)
+            delete turn.trace
+          }
           clearStep(turn)
           turn.stepContent = ''
           turn.stepCalls = 0
         }
         break
       }
+      case 'assistant/chunk': {
+        if (turn?.trace === undefined) break
+        const delta = event.delta ?? ''
+        if (delta === '') break
+        if (event.thinking === true) turn.trace.thinking = `${turn.trace.thinking}${delta}`
+        else turn.trace.partial = `${turn.trace.partial}${delta}`
+        break
+      }
       case 'step/start': {
         if (turn === null || event.timestamp === undefined) break
         turn.stepStart ??= event.timestamp
+        if (turn.trace === undefined) {
+          turn.trace = { stepId: event.stepId ?? '', attempts: [], partial: '', thinking: '' }
+        } else if (event.stepId !== undefined) {
+          // A retry re-asks under a fresh step id; the trace follows the one that answers.
+          turn.trace.stepId = event.stepId
+        }
         break
       }
+      case 'step/abandoned': {
+        // The abandoned step's partial text never became history; the next
+        // step/start re-asks the whole request. Its evidence rides the trace
+        // of the request that finally answered, so nothing is lost.
+        if (turn === null) break
+        if (turn.trace !== undefined) {
+          turn.trace.abandoned = {
+            reason: event.reason ?? 'unknown',
+            ...(event.stepId !== undefined ? { stepId: event.stepId } : {}),
+            ...(event.timestamp !== undefined ? { at: event.timestamp } : {}),
+          }
+        }
+        clearStep(turn)
+        break
+      }
+      case 'context/manifest': {
+        if (turn === null || event.manifest === undefined) break
+        if (turn.trace === undefined) turn.trace = { stepId: '', attempts: [], partial: '', thinking: '' }
+        turn.trace.manifest = event.manifest
+        if (event.manifest.sections !== undefined) turn.trace.sections = event.manifest.sections
+        break
+      }
+      case 'model/attempt': {
+        if (turn === null || event.fact === undefined) break
+        if (turn.trace === undefined) {
+          turn.trace = { stepId: event.fact.attribution?.stepId ?? '', attempts: [], partial: '', thinking: '' }
+        } else if (turn.trace.stepId === '' && event.fact.attribution?.stepId !== undefined) {
+          turn.trace.stepId = event.fact.attribution.stepId
+        }
+        const fact = event.fact
+        turn.trace.attempts.push({
+          state: fact.state,
+          attempt: fact.attempt,
+          requestId: fact.requestId,
+          attemptId: fact.attemptId,
+          ...(fact.provider !== undefined ? { provider: fact.provider } : {}),
+          ...(fact.model !== undefined ? { model: fact.model } : {}),
+          ...(fact.queuedAt !== undefined ? { queuedAt: fact.queuedAt } : {}),
+          ...(fact.startedAt !== undefined ? { startedAt: fact.startedAt } : {}),
+          ...(fact.endedAt !== undefined ? { endedAt: fact.endedAt } : {}),
+          ...(fact.firstProgressAt !== undefined ? { firstProgressAt: fact.firstProgressAt } : {}),
+          ...(fact.lastProgressAt !== undefined ? { lastProgressAt: fact.lastProgressAt } : {}),
+          ...(fact.finish !== undefined ? { finish: fact.finish } : {}),
+          ...(fact.reason !== undefined ? { reason: fact.reason } : {}),
+          ...(fact.committed ? { committed: true } : {}),
+        })
+        break
+      }
+      case 'turn/error': {
+        if (turn === null) break
+        turn.error = {
+          kind: event.kind ?? 'internal',
+          message: event.message ?? '',
+          ...(event.timestamp !== undefined ? { at: event.timestamp } : {}),
+        }
+        break
+      }
+      case 'execution/uncertain':
+      case 'execution/reconciled':
+        break // Physical settlement does not close a logical turn.
       case 'tool/call': {
         if (event.call === undefined || openCalls.has(event.call.id)) break
         openCalls.set(event.call.id, { call: event.call, ...(turn !== null ? { turnId: turn.id, step: turn.steps.length } : {}), event })
@@ -272,6 +444,15 @@ export function projectTrajectory(events: readonly SseEvent[]): Trajectory {
 
   if (turn !== null) {
     const dangling = turn
+    // A still-open turn's streaming trace is the inspector's live view: keep it
+    // when anything said it exists, drop a stray empty one.
+    if (dangling.trace !== undefined && (dangling.trace.attempts.length > 0 || dangling.trace.abandoned !== undefined || dangling.trace.partial !== '' || dangling.trace.manifest !== undefined)) {
+      dangling.traces.push(dangling.trace)
+      delete dangling.trace
+    }
+    const traces = dangling.traces.length > 0
+      ? dangling.traces.map((draft, at_) => finalizeTrace(draft, at_ + 1))
+      : undefined
     turns.push({
       id: dangling.id,
       index: dangling.index,
@@ -282,6 +463,8 @@ export function projectTrajectory(events: readonly SseEvent[]): Trajectory {
       calls: dangling.calls,
       failedCalls: dangling.failedCalls,
       steps: dangling.steps,
+      ...(traces !== undefined ? { traces } : {}),
+      ...(dangling.error !== undefined ? { error: dangling.error } : {}),
       segments: dangling.segments,
     })
   }

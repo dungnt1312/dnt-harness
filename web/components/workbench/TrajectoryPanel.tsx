@@ -4,9 +4,10 @@ import { TextInput } from '../ui/TextInput.tsx'
 import { cn } from '../../lib/cn.ts'
 import { formatDuration } from '../../lib/format.ts'
 import type { SseEvent } from '../../lib/types.ts'
-import { projectTrajectory, trajectoryMatches, type TrajectoryCall, type TrajectoryTurn, type TurnOutcome } from './trajectory.ts'
+import { projectTrajectory, trajectoryMatches, type TrajectoryCall, type TrajectoryStep, type TrajectoryTurn, type TurnOutcome } from './trajectory.ts'
 import { slotsOf, type Slot } from './trajectory-slots.ts'
 import { ToolCard } from '../chat/MessageParts.tsx'
+import { StepInspector } from './StepInspector.tsx'
 import { mcpServerOf } from '../../lib/tool-facts.ts'
 import type { ViewItem } from '../../lib/project.ts'
 import type { OpenPathResolver } from '../../lib/project-paths.ts'
@@ -138,17 +139,17 @@ function Badge({ kind }: { readonly kind: Slot['kind'] }) {
 }
 
 /** One line of prose that opens in place to the full text the log kept. */
-function TextRow({ text, empty, meta }: { readonly text: string; readonly empty: string; readonly meta?: string }) {
+function TextRow({ text, empty, meta, onClick }: { readonly text: string; readonly empty: string; readonly meta?: string; readonly onClick?: () => void }) {
   const [open, setOpen] = useState(false)
   const shown = text !== '' ? text : empty
   return (
     <button
       type="button"
-      aria-expanded={open}
-      onClick={() => setOpen((value) => !value)}
+      aria-expanded={onClick === undefined ? open : undefined}
+      onClick={() => (onClick !== undefined ? onClick() : setOpen((value) => !value))}
       className="-mx-2 flex min-h-8 min-w-0 flex-1 items-start gap-3 rounded-lg px-2 py-1.5 text-left text-[13px] transition-colors hover:bg-muted"
     >
-      <span className={cn('min-w-0 flex-1', open ? 'whitespace-pre-wrap break-words' : 'truncate', text === '' && 'text-fg-faint')}>{shown}</span>
+      <span className={cn('min-w-0 flex-1', open && onClick === undefined ? 'whitespace-pre-wrap break-words' : 'truncate', text === '' && 'text-fg-faint')}>{shown}</span>
       {meta !== undefined && meta !== '' ? <span className="shrink-0 font-mono text-xs text-fg-faint">{meta}</span> : null}
     </button>
   )
@@ -158,16 +159,30 @@ function turnMeta(turn: TrajectoryTurn): string {
   return [OUTCOME_LABEL[turn.outcome], turn.model, durationOf(turn.start, turn.end)].filter((part) => part !== undefined && part !== '').join(' · ')
 }
 
+/** One-phrase warning a model row should carry: why this request deserves a look. */
+function stepHint(turn: TrajectoryTurn, step: TrajectoryStep): string {
+  const trace = turn.traces?.find((candidate) => candidate.stepId === step.stepId)
+  if (trace === undefined) return ''
+  const parts = [
+    trace.abandoned !== undefined ? 'retried' : undefined,
+    trace.attempts.some((attempt) => attempt.state === 'uncertain') ? 'uncertain' : undefined,
+    trace.attempts.length > 1 ? `${trace.attempts.length} attempts` : undefined,
+  ].filter((part) => part !== undefined)
+  return parts.length > 0 ? ` · ${parts.join(', ')}` : ''
+}
+
 /**
  * Every step of the conversation, in timeline order, readable at once:
  * the prompt, each answer, each tool call. A click on a timeline mark
- * brings its rows into view; a click on a row opens what the log recorded.
+ * brings its rows into view; a click on a model row opens the request
+ * inspector; a click on a row opens what the log recorded.
  */
-function StepLog({ slots, selected, openPath, rowRefs }: {
+function StepLog({ slots, selected, openPath, rowRefs, onOpenStep }: {
   readonly slots: readonly Slot[]
   readonly selected: string | null
   readonly openPath?: OpenPathResolver
   readonly rowRefs: Map<string, HTMLElement>
+  readonly onOpenStep: (turn: TrajectoryTurn, step: TrajectoryStep) => void
 }) {
   return (
     <ol aria-label="Steps" className="m-0 flex list-none flex-col p-0">
@@ -188,7 +203,12 @@ function StepLog({ slots, selected, openPath, rowRefs }: {
             ) : slot.kind === 'model' ? (
               <div className="flex items-start gap-3">
                 <Badge kind="model" />
-                <TextRow text={slot.step.content} empty="(tool call only)" meta={durationOf(slot.step.start, slot.step.end)} />
+                <TextRow
+                  text={slot.step.content}
+                  empty="(tool call only)"
+                  meta={`${durationOf(slot.step.start, slot.step.end)}${stepHint(slot.turn, slot.step)}`}
+                  onClick={() => onOpenStep(slot.turn, slot.step)}
+                />
               </div>
             ) : (
               <ul aria-label={slotLabel(slot)} className="m-0 flex list-none flex-col p-0">
@@ -207,12 +227,13 @@ function StepLog({ slots, selected, openPath, rowRefs }: {
   )
 }
 
-function Duration({ turns, calls, selected, onSelect, openPath }: {
+function Duration({ turns, calls, selected, onSelect, openPath, onOpenStep }: {
   readonly turns: readonly TrajectoryTurn[]
   readonly calls: readonly TrajectoryCall[]
   readonly selected: string | null
   readonly onSelect: (key: string) => void
   readonly openPath?: OpenPathResolver
+  readonly onOpenStep: (turn: TrajectoryTurn, step: TrajectoryStep) => void
 }) {
   const slots = useMemo(() => slotsOf(turns, calls), [turns, calls])
   const rowRefs = useRef(new Map<string, HTMLElement>()).current
@@ -224,7 +245,7 @@ function Duration({ turns, calls, selected, onSelect, openPath }: {
     <div className="flex min-h-0 flex-1 flex-col">
       <Timeline slots={slots} selected={selected} onSelect={select} />
       <div className="relative min-h-0 flex-1 overflow-y-auto">
-        <StepLog slots={slots} selected={selected} rowRefs={rowRefs} {...(openPath !== undefined ? { openPath } : {})} />
+        <StepLog slots={slots} selected={selected} rowRefs={rowRefs} onOpenStep={onOpenStep} {...(openPath !== undefined ? { openPath } : {})} />
       </div>
     </div>
   )
@@ -247,13 +268,21 @@ function TurnRow({ turn }: { readonly turn: TrajectoryTurn }) {
 /**
  * Duration, Turns and Calls for the open conversation, projected from the
  * events the workbench already holds. Search narrows Turns and Calls; it
- * never adds a row the log did not record.
+ * never adds a row the log did not record. Opening a model step swaps the
+ * Duration view for the request inspector — the whole request, response and
+ * physical attempt record of that one call to the model.
  */
-export function TrajectoryPanel({ events, openPath }: { readonly events: readonly SseEvent[]; readonly openPath?: OpenPathResolver }) {
+export function TrajectoryPanel({ events, openPath, workspaceId = null, sessionId = null }: {
+  readonly events: readonly SseEvent[]
+  readonly openPath?: OpenPathResolver
+  readonly workspaceId?: string | null
+  readonly sessionId?: string | null
+}) {
   const trajectory = useMemo(() => projectTrajectory(events), [events])
   const [lens, setLens] = useState<Lens>('duration')
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<string | null>(null)
+  const [openStep, setOpenStep] = useState<{ readonly turn: TrajectoryTurn; readonly step: TrajectoryStep } | null>(null)
 
   const turns = useMemo(
     () => trajectory.turns.filter((turn) => trajectoryMatches(turn, undefined, query)),
@@ -265,57 +294,86 @@ export function TrajectoryPanel({ events, openPath }: { readonly events: readonl
   )
   const quiet = trajectory.turns.length === 0 && trajectory.calls.length === 0
 
+  const openInspector = (turn: TrajectoryTurn, step: TrajectoryStep): void => {
+    setSelected(`step:${turn.id}:${step.index}`)
+    setOpenStep({ turn, step })
+  }
+  const stepCalls = useMemo(
+    () => openStep === null ? [] : calls.filter((call) => call.turnId === openStep.turn.id && call.step === openStep.step.index),
+    [calls, openStep],
+  )
+  const stepTrace = useMemo(() => {
+    if (openStep === null || openStep.turn.traces === undefined) return undefined
+    const traces = openStep.turn.traces
+    return traces.find((candidate) => candidate.stepId === openStep.step.stepId)
+      ?? (openStep.step.index <= traces.length ? traces[openStep.step.index - 1] : undefined)
+  }, [openStep])
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-line px-3 py-2">
-        <div role="group" aria-label="Trajectory view" className="flex h-8 items-center rounded-lg bg-muted p-0.5">
-          {LENSES.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              aria-pressed={lens === item.id}
-              onClick={() => setLens(item.id)}
-              className={cn('h-7 rounded-md px-2.5 text-[13px]', lens === item.id ? 'bg-surface text-fg' : 'text-fg-muted hover:text-fg')}
-            >
-              {item.label}
-            </button>
-          ))}
-        </div>
-        <div className="ml-auto flex min-w-0 basis-48 items-center">
-          <TextInput
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="Search…"
-            aria-label="Search trajectory"
-            leading={<Icon name="search" size={14} />}
-          />
-        </div>
-      </div>
-      <div className="flex shrink-0 items-center gap-3 px-4 pt-2 text-[11px] text-fg-faint">
-        <span className="flex items-center gap-1.5"><span className="h-2 w-3 rounded-sm bg-fg-muted" aria-hidden="true" />Input</span>
-        <span className="flex items-center gap-1.5"><span className="h-2 w-3 rounded-sm bg-fg-faint" aria-hidden="true" />Model</span>
-        <span className="flex items-center gap-1.5"><span className="h-2 w-3 rounded-sm bg-warn" aria-hidden="true" />Tools</span>
-        <span className="ml-auto font-mono">{trajectory.turns.length} {trajectory.turns.length === 1 ? 'turn' : 'turns'} · {trajectory.calls.length} {trajectory.calls.length === 1 ? 'call' : 'calls'}</span>
-      </div>
-      {quiet ? (
-        <p className="m-0 px-4 py-6 text-center text-sm text-fg-faint">{EMPTY}</p>
-      ) : lens === 'duration' ? (
-        <Duration turns={turns} calls={calls} selected={selected} onSelect={setSelected} {...(openPath !== undefined ? { openPath } : {})} />
-      ) : lens === 'turns' ? (
-        <ol aria-label="Turns" className="relative m-0 flex min-h-0 flex-1 list-none flex-col overflow-y-auto px-3 py-1">
-          {turns.map((turn) => <TurnRow key={turn.id} turn={turn} />)}
-        </ol>
+      {openStep !== null ? (
+        <StepInspector
+          turn={openStep.turn}
+          step={openStep.step}
+          trace={stepTrace}
+          calls={stepCalls}
+          workspaceId={workspaceId}
+          sessionId={sessionId}
+          onBack={() => setOpenStep(null)}
+        />
       ) : (
-        // `relative` makes this scroller the containing block of every row's
-        // sr-only (position:absolute) status text; without it those spans
-        // resolve against the viewport and stretch the whole app's scroll.
-        // min-h-0 + flex-1 bound the list to the panel. Rows are the chat's
-        // own ToolCard, as in the Duration detail.
-        <div className="relative min-h-0 flex-1 overflow-y-auto px-4 py-2">
-          <ol aria-label="Calls" className="m-0 flex list-none flex-col gap-0.5 p-0">
-            {calls.map((call) => <li key={call.id}><ToolCard item={toolItem(call)} {...(openPath !== undefined ? { openPath } : {})} /></li>)}
-          </ol>
-        </div>
+        <>
+          <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-line px-3 py-2">
+            <div role="group" aria-label="Trajectory view" className="flex h-8 items-center rounded-lg bg-muted p-0.5">
+              {LENSES.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  aria-pressed={lens === item.id}
+                  onClick={() => setLens(item.id)}
+                  className={cn('h-7 rounded-md px-2.5 text-[13px]', lens === item.id ? 'bg-surface text-fg' : 'text-fg-muted hover:text-fg')}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+            <div className="ml-auto flex min-w-0 basis-48 items-center">
+              <TextInput
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Search…"
+                aria-label="Search trajectory"
+                leading={<Icon name="search" size={14} />}
+              />
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-3 px-4 pt-2 text-[11px] text-fg-faint">
+            <span className="flex items-center gap-1.5"><span className="h-2 w-3 rounded-sm bg-fg-muted" aria-hidden="true" />Input</span>
+            <span className="flex items-center gap-1.5"><span className="h-2 w-3 rounded-sm bg-fg-faint" aria-hidden="true" />Model</span>
+            <span className="flex items-center gap-1.5"><span className="h-2 w-3 rounded-sm bg-warn" aria-hidden="true" />Tools</span>
+            <span className="ml-auto font-mono">{trajectory.turns.length} {trajectory.turns.length === 1 ? 'turn' : 'turns'} · {trajectory.calls.length} {trajectory.calls.length === 1 ? 'call' : 'calls'}</span>
+          </div>
+          {quiet ? (
+            <p className="m-0 px-4 py-6 text-center text-sm text-fg-faint">{EMPTY}</p>
+          ) : lens === 'duration' ? (
+            <Duration turns={turns} calls={calls} selected={selected} onSelect={setSelected} onOpenStep={openInspector} {...(openPath !== undefined ? { openPath } : {})} />
+          ) : lens === 'turns' ? (
+            <ol aria-label="Turns" className="relative m-0 flex min-h-0 flex-1 list-none flex-col overflow-y-auto px-3 py-1">
+              {turns.map((turn) => <TurnRow key={turn.id} turn={turn} />)}
+            </ol>
+          ) : (
+            // `relative` makes this scroller the containing block of every row's
+            // sr-only (position:absolute) status text; without it those spans
+            // resolve against the viewport and stretch the whole app's scroll.
+            // min-h-0 + flex-1 bound the list to the panel. Rows are the chat's
+            // own ToolCard, as in the Duration detail.
+            <div className="relative min-h-0 flex-1 overflow-y-auto px-4 py-2">
+              <ol aria-label="Calls" className="m-0 flex list-none flex-col gap-0.5 p-0">
+                {calls.map((call) => <li key={call.id}><ToolCard item={toolItem(call)} {...(openPath !== undefined ? { openPath } : {})} /></li>)}
+              </ol>
+            </div>
+          )}
+        </>
       )}
     </div>
   )

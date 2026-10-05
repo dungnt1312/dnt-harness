@@ -7,7 +7,7 @@ import type { OpenPathResolver } from '../../lib/project-paths.ts'
 import { toProjectRelative } from '../../lib/project-paths.ts'
 import { processRows, type ProcessRow } from '../../lib/processes-view.ts'
 import { hiddenSpawnCalls } from '../../lib/spawn-merge.ts'
-import { ActivityBlock, AssistantMessage, AuditLine, CompactionMarker, ContextMarker, DelegationCard, JumpToBottom, ProcessLinkContext, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
+import { ActivityBlock, AssistantMessage, AuditLine, CompactionMarker, ContinuationMarker, ContextMarker, DelegationCard, JumpToBottom, ProcessLinkContext, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
 import { TurnChangesCard } from './TurnChangesCard.tsx'
 import type { WorkbenchProject } from '../workbench/Workbench.tsx'
 import { ConversationMinimap } from './ConversationMinimap.tsx'
@@ -230,6 +230,8 @@ export const Transcript = memo(function Transcript({ items, events, conversation
         return <ContextMarker key={`context-${index}`} item={item} workspaceId={workspaceId ?? null} sessionId={conversationId} />
       case 'compaction':
         return <CompactionMarker key={`compaction-${index}`} item={item} />
+      case 'continuation':
+        return <ContinuationMarker key={`continuation-${index}`} item={item} />
       case 'status':
         {
           // Retry exists only where the log names what to resend: the failed

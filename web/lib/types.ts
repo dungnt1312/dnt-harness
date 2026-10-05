@@ -59,6 +59,11 @@ export interface SseEvent {
   readonly delivery?: 'steer'
   /** Files the user attached to this input (references, never bytes). */
   readonly attachments?: readonly AttachmentRef[]
+  /**
+   * `user/message` not typed by the user: `continuation` is the joined
+   * delegated-agent reports the turn continues with (`formatChildReports`).
+   */
+  readonly origin?: string
   /** Approval traffic. */
   readonly approvalId?: string
   readonly decision?: string

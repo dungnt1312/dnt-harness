@@ -32,7 +32,7 @@ export type SessionEvent =
   | ({ readonly type: 'model/attempt' | 'execution/uncertain' | 'execution/reconciled'; readonly fact: import('../llm/request-lifecycle.ts').AttemptFact } & SessionEventStamp)
   | ({ readonly type: 'turn/start'; readonly turnId: TurnId; readonly kind?: 'conversation' | 'delegation' } & SessionEventStamp)
   | ({ readonly type: 'turn/closing'; readonly turnId: TurnId } & SessionEventStamp)
-  | ({ readonly type: 'user/message'; readonly turnId: TurnId; readonly content: string; readonly inputId?: string; readonly attachments?: readonly AttachmentRef[] } & SessionEventStamp)
+  | ({ readonly type: 'user/message'; readonly turnId: TurnId; readonly content: string; readonly inputId?: string; readonly attachments?: readonly AttachmentRef[]; readonly origin?: 'continuation' } & SessionEventStamp)
   | ({ readonly type: 'step/start'; readonly turnId: TurnId; readonly stepId: StepId } & SessionEventStamp)
   | ({ readonly type: 'assistant/chunk'; readonly stepId: StepId; readonly delta: string; readonly thinking?: boolean } & SessionEventStamp)
   | ({ readonly type: 'assistant/message'; readonly stepId: StepId; readonly content: string; readonly toolCalls?: readonly ToolCall[]; readonly controls?: RequestControls } & SessionEventStamp)

@@ -1,6 +1,7 @@
 import { isMcpOutcome, type AttachmentRef, type ContextManifestView, type SseEvent, type ToolCall } from './types.ts'
 import { toolTarget } from './format.ts'
 import { mcpServerOf } from './tool-facts.ts'
+import { CHILD_REPORTS_HEADER } from '../../src/web/child-reports.ts'
 
 /** View items projected from the durable log — the UI's deriveMessages(). */
 export type ViewItem =
@@ -74,6 +75,12 @@ export type ViewItem =
        * it (a retry could repeat their side effects).
        */
       retry?: RetryTarget
+    }
+  | {
+      /** Joined delegated-agent reports; system data, not something the user typed. */
+      readonly kind: 'continuation'
+      readonly ts?: number
+      readonly content: string
     }
   | {
       readonly kind: 'compaction'
@@ -244,6 +251,13 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
           break
         case 'user/message': {
           if (event.content === undefined) break
+          if (event.origin === 'continuation' || event.content.startsWith(CHILD_REPORTS_HEADER)) {
+            // The joined delegated-agent reports the turn continues with:
+            // system data for the model, never something the user typed.
+            // (Legacy logs predate the origin stamp; the exact header covers those.)
+            add({ kind: 'continuation', content: event.content, ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}) })
+            break
+          }
           if (event.inputId !== undefined && event.inputId !== '') {
             // Retry resends what the user typed, not a hook's rewrite of it.
             if (!turnInputIds.has(event.inputId)) {

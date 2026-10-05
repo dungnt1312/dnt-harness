@@ -782,6 +782,26 @@ share their batch's slot. Selecting a slot shows what the log recorded for it; a
 tool call in that detail expands to its exact arguments and output, the same row
 the chat renders.
 
+Clicking a model step opens the **request inspector** (`StepInspector`) in place of
+the timeline: what one request carried, what answered, and how it physically went.
+The projection additionally reads the observability events the transcript ignores —
+`context/manifest` (per request, not folded per turn), `model/attempt` (every physical
+attempt: provider, model, queue/progress timing, finish reason, retries, uncertain
+settlement), `step/abandoned` (a mid-stream failure whose text never joined history,
+kept on the trace of the request that finally answered), and `turn/error` (the turn's
+durable failure classification). The inspector has three tabs: **Summary** (window,
+per-source breakdown, attempts); **Request** (the full manifest plus every non-history
+context block's raw text, fetched by content hash through the existing body route —
+the same on-demand fetch the chat context marker uses); **Response** (the answer,
+the streamed thinking the transcript never renders, tool calls as the chat's own
+ToolCard rows, and the turn error if the turn failed). A model row warns in place
+when its request was retried or settled uncertain. Legacy logs that never stamped
+step ids still render: traces fall back positionally, and a request the log recorded
+nothing about says so instead of showing an empty pane. Raw message arrays and tool
+schemas as the provider received them are NOT reconstructible byte-for-byte; the log
+keeps tool names and schema counts only, so the inspector presents the log's own
+facts and no more.
+
 The layout follows a ChatGPT-style shell: a resizable 280px-default sidebar
 (232–420px) docked at 768px and above (a modal drawer below), one centered chat
 column whose transcript scroller follows the tail only while the reader is at the
@@ -818,9 +838,11 @@ request that no longer exists). None of these are server settings. See
 
 Context manifest loading is lazy and uses the existing endpoint only while the
 sheet is open, Context is selected, a valid conversation exists, and the turn is
-settled. Trajectory causes no request. Reconnect presentation remains separate from
-durable running truth: drafts stay editable, Stop remains available, and the client
-does not automatically resend or replay.
+settled. Trajectory causes no request while the timeline shows; only opening a
+step's inspector fetches, on demand and per hash, the raw context bodies that
+step's manifest references (never automatically, never speculatively). Reconnect
+presentation remains separate from durable running truth: drafts stay editable,
+Stop remains available, and the client does not automatically resend or replay.
 
 Settings remains a client for the existing provider/workspace APIs. Desktop uses
 grouped tabs and narrow mobile uses a section selector; Providers, Projects,

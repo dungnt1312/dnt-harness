@@ -1346,6 +1346,40 @@ export const CompactionMarker = memo(function CompactionMarker({ item }: {
 })
 
 /**
+ * The joined delegated-agent reports a turn continues with — one collapsed
+ * line saying what came back (a child card already carries each child's own
+ * status), the full report text one click away. System data the model reads,
+ * so it never renders as a bubble of something the user typed.
+ */
+export const ContinuationMarker = memo(function ContinuationMarker({ item }: {
+  readonly item: Extract<ViewItem, { kind: 'continuation' }>
+}) {
+  const [open, setOpen] = useState(false)
+  const children = [...item.content.matchAll(/^### .+$/gm)].length
+  return (
+    <div className="min-w-0">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        title={item.ts !== undefined ? formatTime(item.ts) : undefined}
+        className="flex min-w-0 items-center gap-2 py-0.5 text-left text-xs text-fg-muted transition-colors hover:text-fg"
+      >
+        <Icon name="gitBranch" size={13} className="shrink-0 text-fg-faint" />
+        <span className="shrink-0">Agent reports joined</span>
+        {children > 0 ? <span className="min-w-0 font-mono text-fg-faint">{children} report{children === 1 ? '' : 's'}</span> : null}
+        <Icon name="chevron" size={12} className={cn('ml-auto shrink-0 text-fg-faint transition-transform', open ? 'rotate-180' : '')} />
+      </button>
+      {open ? (
+        <div className="mt-1.5 rounded-xl border border-line bg-surface px-3 py-2.5">
+          <p className="m-0 max-h-72 overflow-y-auto whitespace-pre-wrap break-words text-xs leading-5 text-fg-muted">{item.content}</p>
+        </div>
+      ) : null}
+    </div>
+  )
+})
+
+/**
  * One request's context record, sitting between the input and the answer it
  * produced: the collapsed line says when context was injected and how big it
  * ran; expanding reveals the full manifest — budget fill, per-source

@@ -201,7 +201,7 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
   } else if (activeView === 'context') {
     body = <div className="min-h-0 flex-1 overflow-y-auto p-4"><ContextPanel {...context} /></div>
   } else if (activeView === 'trajectory') {
-    body = <TrajectoryPanel events={events} {...(openPath !== undefined ? { openPath } : {})} />
+    body = <TrajectoryPanel events={events} workspaceId={workspaceId} sessionId={sessionId} {...(openPath !== undefined ? { openPath } : {})} />
   } else if (activeView === 'git') {
     body = project !== null && workspaceId !== null
       ? <GitPanel

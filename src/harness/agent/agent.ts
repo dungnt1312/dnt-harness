@@ -330,12 +330,13 @@ export class Agent {
       let lastStep: StepId | null = null
       let nextContents: readonly string[] | undefined = decision.contents
       let nextClaimed: readonly InboxItem[] = claimed
+      let nextOrigin: 'continuation' | undefined
       // A turn keeps spending steps while tools owe the model their results —
       // and while delegated work it left running still owes it a report.
       for (;;) {
         let step: { stepId: StepId; toolCalls: readonly ToolCall[] }
         try {
-          step = await this.step(turnId, nextContents, nextClaimed)
+          step = await this.step(turnId, nextContents, nextClaimed, nextOrigin)
         } catch (error) {
           // A user stop is a durable result, not a failure: close the turn
           // with the `cancelled` (or `steered`) reason and end the run.
@@ -350,15 +351,20 @@ export class Agent {
         lastStep = step.stepId
         nextContents = undefined
         nextClaimed = []
+        nextOrigin = undefined
         if (step.toolCalls.length > 0) continue
         // The model is done asking. Work it delegated and left running would be
         // cancelled by closing the turn, and everything the children did lost:
         // the host joins them and hands the reports back for one more step.
+        // The reports ride a user message (the model answers to user content)
+        // marked `origin: 'continuation'` so no projection reads them as
+        // something the user typed.
         const continuation = await this.ctx
           .serial('agent/turn-continuation', { turnId, ...(controller?.signal !== undefined ? { signal: controller.signal } : {}) })
           .catch(() => undefined)
         if (typeof continuation !== 'string' || continuation === '' || stopRequested()) break
         nextContents = [continuation]
+        nextOrigin = 'continuation'
       }
 
       await this.ctx.serial('agent/turn-stopping', { turnId, lastStep })
@@ -447,7 +453,7 @@ export class Agent {
    *
    * @returns the step id and the tool calls the model made.
    */
-  private async step(turnId: TurnId, contents: readonly string[] | undefined, claimed: readonly InboxItem[]): Promise<{ stepId: StepId; toolCalls: readonly ToolCall[] }> {
+  private async step(turnId: TurnId, contents: readonly string[] | undefined, claimed: readonly InboxItem[], origin?: 'continuation'): Promise<{ stepId: StepId; toolCalls: readonly ToolCall[] }> {
     const signal = this.abortController?.signal
     const assertLive = (): void => {
       if (signal?.aborted === true) throw this.abortError()
@@ -468,6 +474,7 @@ export class Agent {
         content,
         ...(item?.inputId !== undefined ? { inputId: item.inputId } : {}),
         ...(item?.attachments !== undefined && item.attachments.length > 0 ? { attachments: item.attachments } : {}),
+        ...(origin !== undefined ? { origin } : {}),
       })
     }
     // Admission settles every accepted input even when middleware replaces its

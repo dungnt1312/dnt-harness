@@ -118,4 +118,105 @@ describe('projectTrajectory', () => {
     expect(trajectoryMatches(turn, call, '   ')).toBe(true)
     expect(trajectoryMatches(turn, call, 'not-in-the-log')).toBe(false)
   })
+
+  it('attaches the request manifest and attempts to the trace of the step that answered', () => {
+    const manifest = {
+      modeId: 'default',
+      modeRevision: 1,
+      budget: { availableTokens: 100_000, usedTokens: 12_000, estimated: true },
+      history: { setting: 'recent', includedTurns: 3, omittedTurns: 0 },
+      sources: { skills: [], memory: [], toolNames: ['Read'], toolSchemas: 1 }, omissions: [],
+    }
+    const trajectory = projectTrajectory([
+      event({ type: 'turn/start', seq: 1, timestamp: 1_000, turnId: 't1' }),
+      event({ type: 'step/start', seq: 2, timestamp: 1_100, turnId: 't1', stepId: 's1' }),
+      event({ type: 'context/manifest', seq: 3, timestamp: 1_150, turnId: 't1', manifest }),
+      event({
+        type: 'model/attempt', seq: 4, timestamp: 1_160,
+        fact: { requestId: 'r1', attemptId: 'a1', attempt: 1, state: 'start', committed: false, transportSettled: false, queuedAt: 1_150, startedAt: 1_160, attribution: { sessionId: 'sess', turnId: 't1', stepId: 's1' }, provider: 'zai', model: 'glm-5.3' },
+      }),
+      event({
+        type: 'model/attempt', seq: 5, timestamp: 1_400,
+        fact: { requestId: 'r1', attemptId: 'a1', attempt: 1, state: 'end', committed: true, transportSettled: true, queuedAt: 1_150, startedAt: 1_160, endedAt: 1_400, finish: 'stop', attribution: { sessionId: 'sess', turnId: 't1', stepId: 's1' }, provider: 'zai', model: 'glm-5.3' },
+      }),
+      event({ type: 'assistant/chunk', seq: 6, timestamp: 1_200, stepId: 's1', delta: 'thinking…', thinking: true }),
+      event({ type: 'assistant/chunk', seq: 7, timestamp: 1_300, stepId: 's1', delta: 'partial answer' }),
+      event({ type: 'assistant/message', seq: 8, timestamp: 1_400, stepId: 's1', content: 'final answer', controls: { model: 'glm-5.3' } }),
+      event({ type: 'turn/end', seq: 9, timestamp: 1_500, turnId: 't1', reason: 'completed' }),
+    ])
+    const turn = trajectory.turns[0]
+    expect(turn?.steps).toEqual([{ index: 1, stepId: 's1', start: 1_000, end: 1_400, content: 'final answer', calls: 0 }])
+    expect(turn?.traces).toHaveLength(1)
+    const trace = turn?.traces?.[0]
+    expect(trace?.stepId).toBe('s1')
+    expect(trace?.manifest).toBe(manifest)
+    expect(trace?.attempts).toHaveLength(2)
+    expect(trace?.attempts[1]).toMatchObject({ state: 'end', attempt: 1, finish: 'stop', committed: true, model: 'glm-5.3' })
+    // The finalized message supersedes the streamed partial; thinking is kept.
+    expect(trace?.partial).toBeUndefined()
+    expect(trace?.thinking).toBe('thinking…')
+  })
+
+  it('carries an abandonment and retried attempts on the trace of the request that finally answered', () => {
+    const trajectory = projectTrajectory([
+      event({ type: 'turn/start', seq: 1, timestamp: 0, turnId: 't1' }),
+      event({ type: 'step/start', seq: 2, timestamp: 100, turnId: 't1', stepId: 's1' }),
+      event({ type: 'assistant/chunk', seq: 3, timestamp: 150, stepId: 's1', delta: 'half an' }),
+      event({
+        type: 'model/attempt', seq: 4, timestamp: 200,
+        fact: { requestId: 'r1', attemptId: 'a1', attempt: 1, state: 'end', committed: false, transportSettled: true, reason: 'reset', queuedAt: 90, startedAt: 100, endedAt: 200, attribution: { sessionId: 'sess', turnId: 't1', stepId: 's1' } },
+      }),
+      event({ type: 'step/abandoned', seq: 5, timestamp: 210, turnId: 't1', stepId: 's1', reason: 'provider transport interrupted' }),
+      event({ type: 'step/start', seq: 6, timestamp: 300, turnId: 't1', stepId: 's2' }),
+      event({ type: 'assistant/message', seq: 7, timestamp: 500, stepId: 's2', content: 'recovered answer' }),
+      event({ type: 'turn/end', seq: 8, timestamp: 600, turnId: 't1', reason: 'completed' }),
+    ])
+    const turn = trajectory.turns[0]
+    expect(turn?.steps.map((step) => step.stepId)).toEqual(['s2'])
+    expect(turn?.traces).toHaveLength(1)
+    const trace = turn?.traces?.[0]
+    // The trace follows the step that answered, but keeps the abandonment's evidence.
+    expect(trace?.stepId).toBe('s2')
+    expect(trace?.abandoned).toMatchObject({ stepId: 's1', reason: 'provider transport interrupted', at: 210 })
+    expect(trace?.attempts[0]).toMatchObject({ state: 'end' })
+    // `reason` is a wire-reserved key: the attempt fact keeps it at fact.reason,
+    // and the attempt projection never re-spells it at the top level.
+    expect(trace?.attempts[0]?.finish).toBeUndefined()
+    expect(trace?.partial).toBeUndefined()
+  })
+
+  it('keeps a turn/error classification on the turn it names', () => {
+    const trajectory = projectTrajectory([
+      event({ type: 'turn/start', seq: 1, timestamp: 0, turnId: 't1' }),
+      event({ type: 'step/start', seq: 2, timestamp: 10, turnId: 't1', stepId: 's1' }),
+      event({ type: 'turn/error', seq: 3, timestamp: 120, turnId: 't1', kind: 'provider', message: 'provider transport interrupted' }),
+      event({ type: 'turn/end', seq: 4, timestamp: 130, turnId: 't1', reason: 'failed' }),
+    ])
+    expect(trajectory.turns[0]).toMatchObject({ outcome: 'failed', error: { kind: 'provider', message: 'provider transport interrupted', at: 120 } })
+  })
+
+  it('synthesizes #N step ids for traces when the log never stamped one', () => {
+    const trajectory = projectTrajectory([
+      event({ type: 'turn/start', seq: 1, timestamp: 0, turnId: 't1' }),
+      event({ type: 'context/manifest', seq: 2, timestamp: 10, turnId: 't1', manifest: { modeId: 'm', modeRevision: 1, budget: { availableTokens: 1, usedTokens: 1, estimated: true }, history: { setting: 'all', includedTurns: 1, omittedTurns: 0 }, sources: { skills: [], memory: [], toolNames: [], toolSchemas: 0 }, omissions: [] } }),
+      event({ type: 'assistant/message', seq: 3, timestamp: 20, content: 'legacy answer' }),
+      event({ type: 'turn/end', seq: 4, timestamp: 30, turnId: 't1', reason: 'completed' }),
+    ])
+    const trace = trajectory.turns[0]?.traces?.[0]
+    expect(trace?.stepId).toBe('#1')
+    expect(trace?.manifest?.modeId).toBe('m')
+  })
+
+  it('exposes an in-flight trace with partial text and attempts while the turn is open', () => {
+    const trajectory = projectTrajectory([
+      event({ type: 'turn/start', seq: 1, timestamp: 0, turnId: 't1' }),
+      event({ type: 'step/start', seq: 2, timestamp: 10, turnId: 't1', stepId: 's1' }),
+      event({ type: 'assistant/chunk', seq: 3, timestamp: 20, stepId: 's1', delta: 'streaming st' }),
+      event({ type: 'assistant/chunk', seq: 4, timestamp: 30, stepId: 's1', delta: 'ill going' }),
+    ])
+    const trace = trajectory.turns[0]?.traces?.[0]
+    expect(trace?.stepId).toBe('s1')
+    expect(trace?.partial).toBe('streaming still going')
+    expect(trace?.attempts).toHaveLength(0)
+  })
 })
