@@ -11,7 +11,7 @@
 import type { DraftSegment, RichDraft } from './composer-draft.ts'
 import { BUILTIN_COMMANDS, isBuiltinCommand, messageText } from './inline-chips.ts'
 
-export type CompletionKind = 'file' | 'skill'
+export type CompletionKind = 'file' | 'skill' | 'skillDollar'
 
 export interface CompletionRequest {
   readonly kind: CompletionKind
@@ -87,6 +87,8 @@ export function draftIsOnlyCommand(draft: RichDraft, name: string): boolean {
 const FILE_TRIGGER = /(^|\s)@([^\s@]*)$/
 /** Skill names are one token; the trigger is anchored to the draft start. */
 const SKILL_TRIGGER = /^\/([^\s/]*)$/
+/** The `$` menu is skill-only and also works mid-draft, like a `@` mention. */
+const SKILL_DOLLAR_TRIGGER = /(^|\s)\$([a-z0-9][a-z0-9-]*)?$/
 
 /**
  * The completion the caret is inside, or null. `caret` is the selection start;
@@ -98,6 +100,11 @@ export function completionAt(draft: string, caret: number, selectionEnd = caret)
 
   const skill = SKILL_TRIGGER.exec(before)
   if (skill !== null) return { kind: 'skill', query: skill[1] ?? '', start: 0, end: caret }
+
+  // `$` opens the skill-only menu anywhere a word starts; the query stops at
+  // whitespace, exactly like a file mention.
+  const dollar = SKILL_DOLLAR_TRIGGER.exec(before)
+  if (dollar !== null) return { kind: 'skillDollar', query: dollar[2] ?? '', start: caret - (dollar[2]?.length ?? 0) - 1, end: caret }
 
   const file = FILE_TRIGGER.exec(before)
   if (file === null) return null

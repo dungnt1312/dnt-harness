@@ -82,7 +82,7 @@ function ViewTab({ view, active, onClick, onClose }: {
  * Terminal is a view tab like the others (Ctrl+` opens it). The chat column
  * has a separate footer terminal; this panel does not own that one.
  */
-export function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, terminalShell = null, onTerminalShell, gitPathFilter = null, onClearGitFilter, processFocus = null }: {
+export function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, onClearGitFilter, processFocus = null }: {
   readonly workspaceId: string | null
   /** The project whose files are browsable; null for chat-only conversations. */
   readonly project: WorkbenchProject | null
@@ -120,6 +120,13 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
   /** Shell the Terminal tab opens without being asked. */
   readonly terminalShell?: string | null
   readonly onTerminalShell?: (shellId: string | null) => void
+  /**
+   * Whether the conversation binding behind `project` is final. False while
+   * the session list loads (a restored Terminal tab would otherwise auto-open
+   * its shell before the project is known, landing it in the host's default
+   * folder instead of the conversation's project).
+   */
+  readonly bindingReady?: boolean
   /** The background process the Environment panel focused, if any. */
   readonly processFocus?: string | null
   /**
@@ -130,7 +137,9 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
   /** Clears the turn filter (the banner's Show all). */
   readonly onClearGitFilter?: () => void
 }) {
-  const [treeVisible, setTreeVisible] = useState(true)
+  // The file tree defaults off on touch: a 380px sheet gives it ~130px, too
+  // narrow to browse and too narrow to leave for the file the reader opened.
+  const [treeVisible, setTreeVisible] = useState(() => typeof window.matchMedia !== 'function' || !window.matchMedia('(pointer: coarse)').matches)
   const [treeFraction, setTreeFraction] = useState(0.34)
   // One pass: the strip decides, and the selection follows it. Deriving the
   // active view here (rather than asserting `view` into the strip) is what
@@ -220,6 +229,7 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
           projectId={project?.id ?? null}
           defaultShell={terminalShell}
           onDefaultShell={onTerminalShell ?? (() => undefined)}
+          bindingReady={bindingReady}
         />
       </Suspense>
     )
@@ -282,16 +292,16 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
         <IconButton label="Hide workbench" onClick={onClose}><Icon name="close" size={17} /></IconButton>
       </div>
       {activeView === 'files' && files.openFiles.length > 0 ? (
-        <div className="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-line bg-bg" role="tablist" aria-label="Open files">
+        <div className="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-line bg-bg" role="group" aria-label="Open files">
           {files.openFiles.map((path) => {
             const active = files.activeFile === path
             return (
               <span key={path} className={cn('group relative flex h-full shrink-0 items-center border-r border-line', active ? 'bg-bg' : 'bg-muted/40 hover:bg-hover')}>
-                <button type="button" role="tab" aria-selected={active} title={path} onClick={() => files.openFile(path)} className={cn('flex h-full items-center gap-1.5 pl-3 pr-1 text-[13px]', active ? 'text-fg' : 'text-fg-muted hover:text-fg')}>
+                <button type="button" aria-pressed={active} title={path} onClick={() => files.openFile(path)} className={cn('flex h-full items-center gap-1.5 pl-3 pr-1 text-[13px]', active ? 'text-fg' : 'text-fg-muted hover:text-fg')}>
                   <FileTypeIcon path={path} size={14} />
                   <span className="max-w-[12rem] truncate">{baseName(path)}</span>
                 </button>
-                <button type="button" aria-label={`Close ${path}`} title="Close" onClick={() => files.closeFile(path)} className={cn('mr-1 flex size-5 items-center justify-center rounded text-fg-faint hover:bg-hover hover:text-fg', active ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100')}>
+                <button type="button" aria-label={`Close ${path}`} title="Close" onClick={() => files.closeFile(path)} className={cn('mr-1 flex size-5 items-center justify-center rounded text-fg-faint hover:bg-hover hover:text-fg [@media(pointer:coarse)]:size-7', active ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100 [@media(pointer:coarse)]:opacity-100')}>
                   <Icon name="close" size={12} />
                 </button>
                 {active ? <span aria-hidden="true" className="absolute inset-x-0 bottom-0 h-0.5 bg-link" /> : null}

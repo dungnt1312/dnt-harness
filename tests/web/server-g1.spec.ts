@@ -32,8 +32,12 @@ function hangProvider(): LlmProvider {
   return {
     name: 'hang',
     models: ['hang'],
-    async *stream() {
-      await new Promise(() => {})
+    async *stream(_request, options) {
+      // Park until aborted: a real transport honours the stop signal, and the
+      // shutdown join cannot wait out a turn whose stream never settles.
+      await new Promise<void>((_resolve, reject) => {
+        options?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+      })
       yield { type: 'delta', delta: 'never' }
     },
   }
@@ -152,6 +156,7 @@ describe('input acceptance over REST', () => {
             })
           }
           yield { type: 'delta', delta: `reply ${calls}` }
+          yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
         },
       }
     }
@@ -299,6 +304,7 @@ describe('approval replay and durability', () => {
       models: ['scripted'],
       async *stream() {
         yield { type: 'toolCalls', calls: [{ id: 'c1', name: 'write', args: { path: 'replay.txt', content: 'x' } }] }
+        yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const server = await createWebServer({ root, providers: [gated] })
@@ -430,9 +436,11 @@ describe('approval lifecycle over REST', () => {
         if (!asked) {
           asked = true
           yield { type: 'toolCalls', calls: [{ id: 'c1', name: 'write', args: { path: 'expired.txt', content: 'x' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         yield { type: 'delta', delta: 'the write failed' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const server = await createWebServer({ root, providers: [gated], limits: { approvalExpiryMs: 150 } })
@@ -484,6 +492,7 @@ describe('restart persistence', () => {
           async *stream() {
             yield { type: 'delta', delta: 'remembered ' }
             yield { type: 'delta', delta: 'reply' }
+            yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
           },
         }],
       })
@@ -506,7 +515,7 @@ describe('restart persistence', () => {
         root,
         home,
         configFile: path.join(root, 'providers-restart.json'),
-        providers: [{ name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'x' } } }],
+        providers: [{ name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'x' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }],
       })
       // Visible before any load — boot listed the stored summaries.
       const listing = (await (await fetch(`${second.url}/api/sessions`)).json()) as { id: string; title: string }[]
@@ -560,7 +569,7 @@ describe('restart persistence', () => {
         root,
         home,
         configFile: path.join(root, 'providers-derived-title.json'),
-        providers: [{ name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'ok' } } }],
+        providers: [{ name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'ok' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }],
       })
       const created = (await (await post(first.url, '/api/sessions')).json()) as { id: string }
       id = created.id
@@ -576,7 +585,7 @@ describe('restart persistence', () => {
         root,
         home,
         configFile: path.join(root, 'providers-derived-title.json'),
-        providers: [{ name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'ok' } } }],
+        providers: [{ name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'ok' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }],
       })
       // The regression: this listing is served from storage with no session
       // loaded and no rename ever recorded, so a title that only existed in

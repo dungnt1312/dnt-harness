@@ -60,6 +60,17 @@ export interface ChildModel {
   readonly thinkingLevel?: string | null
 }
 
+export interface SpawnAdmissionInput {
+  readonly workspaceId: WorkspaceId
+  readonly parentSessionId: SessionId
+  /** The child definition being admitted (Explorer-class rules key on it). */
+  readonly definition: string
+  readonly candidates: readonly string[]
+}
+
+/** Trusted host callback evaluated inside the executor's serialized admission. */
+export type SpawnAdmissionResolver = (input: SpawnAdmissionInput) => Promise<readonly string[]>
+
 export interface SpawnRequest {
   readonly workspaceId: WorkspaceId
   readonly projectId?: ProjectId | undefined
@@ -67,6 +78,10 @@ export interface SpawnRequest {
   readonly parentSessionId: SessionId
   readonly parentTurnId: string
   readonly definition: AgentDefinition
+  /** Explicit trusted fixture ceiling, primarily for low-level/headless callers. */
+  readonly exposureCeiling?: readonly string[] | undefined
+  /** Host authority resolver, evaluated at the admission linearization point. */
+  readonly admissionResolver?: SpawnAdmissionResolver | undefined
   readonly packet: TaskPacket
   /**
    * Spawn grant: INTERSECTS the definition's tool ceiling (never widens it).
@@ -117,18 +132,18 @@ export interface ChildHandle {
   readonly endedAt?: number
   /** Only a completed child that ended on a tool-free message has one. */
   readonly result?: ChildResult
+  /**
+   * What a child that did NOT complete (failed, cancelled, interrupted) got
+   * done: its last message and the files it touched. Evidence, not a verdict —
+   * a caller must verify it, but it never has to start from zero.
+   */
+  readonly partial?: ChildResult
   /** Why there is no result; always names the child's full-log session. */
   readonly error?: string
   /** A running child parked on an approval nobody has answered yet. */
   readonly awaitingApproval?: boolean
 }
 
-/** Queued, dispatching, running, or uncertain children one root may hold. */
-export const MAX_ACTIVE_PER_ROOT = 6
-/** Host dispatch semaphore; excess children wait fairly, never fail admission. */
-export const MAX_ACTIVE_GLOBAL = 12
-/** Spawn attempts one root turn may make; consumed by attempts, not completions. */
-export const MAX_CHILDREN_PER_TURN = 8
 /** Longest report handed back before an explicit truncation marker. */
 export const MAX_REPORT_CHARS = 16_000
 const MAX_FILES_TOUCHED = 40
@@ -142,6 +157,28 @@ export class SpawnError extends Error {
   ) {
     super(message)
     this.name = 'SpawnError'
+  }
+}
+
+function snapshotSpawnRequest<T extends SpawnRequest | Omit<SpawnRequest, 'parentTurnId'>>(request: T): T {
+  const definition: AgentDefinition = {
+    ...request.definition,
+    tools: [...request.definition.tools],
+    disallowedTools: [...request.definition.disallowedTools],
+    ...(request.definition.skills !== undefined ? { skills: [...request.definition.skills] } : {}),
+  }
+  const packet: TaskPacket = {
+    ...request.packet,
+    ...(request.packet.constraints !== undefined ? { constraints: [...request.packet.constraints] } : {}),
+    ...(request.packet.references !== undefined ? { references: [...request.packet.references] } : {}),
+  }
+  return {
+    ...request,
+    definition,
+    packet,
+    ...(request.exposureCeiling !== undefined ? { exposureCeiling: [...request.exposureCeiling] } : {}),
+    ...(request.grantTools !== undefined ? { grantTools: [...request.grantTools] } : {}),
+    ...(request.grants !== undefined ? { grants: request.grants.map((grant) => ({ ...grant })) } : {}),
   }
 }
 
@@ -186,6 +223,7 @@ interface InternalChild {
   failure?: string
   /** Result-or-error derivation, memoized by `resultComputed`. */
   result?: ChildResult
+  partial?: ChildResult
   error?: string
   resultComputed: boolean
   /** Terminal bookkeeping ran (capacity released, record written). */
@@ -203,6 +241,8 @@ interface SettledEntry {
 }
 
 const MAX_SETTLED_HANDLES = 256
+/** Reported-child ids kept per executor; the oldest leave first. */
+const MAX_REPORTED = 4096
 
 export class ChildExecutor {
   /** ACTIVE children only; settled entries are evicted once durable. */
@@ -218,10 +258,12 @@ export class ChildExecutor {
   /** One canonical settlement writer per child; concurrent retries share it. */
   private readonly settlements = new Map<SessionId, Promise<ChildHandle | undefined>>()
   private readonly spawnedPerTurn = new Map<string, number>()
+  /** Children each root turn spawned (`root:turn` → ids), until the turn settles. */
+  private readonly turnChildren = new Map<string, Set<SessionId>>()
+  /** Children whose outcome already reached the model that spawned them. */
+  private readonly reported = new Set<SessionId>()
   /** Active reservations include spawns that have not launched yet. */
   private readonly reservedPerRoot = new Map<SessionId, number>()
-  /** Host dispatch slots, distinct from per-root logical admission. */
-  private dispatching = 0
   /** FIFO within each root; the root queue rotates after every dispatch. */
   private readonly pendingByRoot = new Map<SessionId, InternalChild[]>()
   private readonly runnableRoots: SessionId[] = []
@@ -283,7 +325,7 @@ export class ChildExecutor {
     if (this.pumping) return
     this.pumping = true
     try {
-      while (this.dispatching < MAX_ACTIVE_GLOBAL && this.runnableRoots.length > 0) {
+      while (this.runnableRoots.length > 0) {
         const root = this.runnableRoots.shift() as SessionId
         const queue = this.pendingByRoot.get(root)
         const child = queue?.shift()
@@ -291,7 +333,6 @@ export class ChildExecutor {
         else this.pendingByRoot.delete(root)
         if (child === undefined || child.status !== 'queued' || child.launch === undefined) continue
         child.status = 'dispatching'
-        this.dispatching += 1
         void child.launch().catch(async (error: unknown) => {
           if (!child.finished) {
             child.status = 'failed'
@@ -299,7 +340,6 @@ export class ChildExecutor {
             await this.finish(child)
           }
         }).finally(() => {
-          this.dispatching -= 1
           this.pump()
         })
       }
@@ -413,7 +453,7 @@ export class ChildExecutor {
       .map((child) => child.childSessionId)
   }
 
-  /** Active capacity this conversation holds, for `active n/6` reporting. */
+  /** Active children this conversation holds, for `active` reporting. */
   activeOfRoot(parentSessionId: SessionId): number {
     return this.reservedPerRoot.get(parentSessionId) ?? 0
   }
@@ -428,11 +468,15 @@ export class ChildExecutor {
    * failed child and only active capacity is released.
    */
   async spawn(request: SpawnRequest): Promise<ChildHandle> {
-    const key = `${request.parentSessionId}:${request.parentTurnId}`
+    // Authority-bearing request fields are copied before the first await. A
+    // caller mutating its request/role/grants while admission is queued cannot
+    // widen the child that eventually commits.
+    const pinned = snapshotSpawnRequest(request)
+    const key = `${pinned.parentSessionId}:${pinned.parentTurnId}`
     if (this.closingTurns.has(key)) throw new SpawnError('ownership', 'turn is closing')
-    return this.withAdmission(request.parentSessionId, async () => {
+    return this.withAdmission(pinned.parentSessionId, async () => {
       if (this.closingTurns.has(key)) throw new SpawnError('ownership', 'turn is closing')
-      return this.spawnAdmitted(request)
+      return this.spawnAdmitted(pinned)
     })
   }
 
@@ -443,8 +487,9 @@ export class ChildExecutor {
    * Its lifecycle shares the root's admission writer with model-driven spawn.
    */
   async spawnManual(request: Omit<SpawnRequest, 'parentTurnId'>, rootBusy: () => boolean, options: { turnId?: string; keepOpen?: boolean } = {}): Promise<{ turnId: string; handle: ChildHandle }> {
-    return this.withAdmission(request.parentSessionId, async () => {
-      const parent = await this.sessions()?.load(request.parentSessionId)
+    const pinned = snapshotSpawnRequest(request)
+    return this.withAdmission(pinned.parentSessionId, async () => {
+      const parent = await this.sessions()?.load(pinned.parentSessionId)
       if (parent === undefined) throw new SpawnError('ownership', 'no such root session')
       if (childMetaOf(parent.events) !== undefined) throw new SpawnError('depth', 'one-level delegation: a child agent cannot spawn children')
       if (rootBusy()) throw new SpawnError('ownership', 'the root has an active conversation Turn')
@@ -452,7 +497,7 @@ export class ChildExecutor {
       let turnId: string
       if (options.turnId !== undefined) {
         if (open?.type !== 'turn/start' || open.kind !== 'delegation' || open.turnId !== options.turnId ||
-          this.closingTurns.has(`${request.parentSessionId}:${options.turnId}`)) {
+          this.closingTurns.has(`${pinned.parentSessionId}:${options.turnId}`)) {
           throw new SpawnError('ownership', 'no such open delegation Turn')
         }
         turnId = options.turnId
@@ -464,7 +509,7 @@ export class ChildExecutor {
       }
       let handle: ChildHandle
       try {
-        handle = await this.spawnAdmitted({ ...request, parentTurnId: turnId })
+        handle = await this.spawnAdmitted({ ...pinned, parentTurnId: turnId })
       } catch (error) {
         // A failed spawn still closes the real delegation Turn. If storage is
         // poisoned, the open Turn remains visibly interrupted on recovery.
@@ -476,7 +521,7 @@ export class ChildExecutor {
         throw error
       }
       if (options.keepOpen !== true) {
-        const key = `${request.parentSessionId}:${turnId}`
+        const key = `${pinned.parentSessionId}:${turnId}`
         this.closingTurns.add(key)
         parent.append({ type: 'turn/closing', turnId: turnId as never })
         await parent.durable()
@@ -537,25 +582,38 @@ export class ChildExecutor {
     if (sessions.workspaceOf(parent.id) !== request.workspaceId || boundProject(parent.events) !== request.projectId) {
       throw new SpawnError('ownership', 'the parent session belongs to another workspace or project')
     }
+
+    // Permission linearization point: resolve the trusted host snapshot after
+    // queued admission waits, but before any reservation or durable child/root
+    // metadata. The returned list is pinned for this child; later widening
+    // cannot add tools, while the ordinary live root gate can still narrow it.
+    const exposureCeiling = request.admissionResolver !== undefined
+      ? await request.admissionResolver({
+          workspaceId: request.workspaceId,
+          parentSessionId: request.parentSessionId,
+          definition: request.definition.name,
+          candidates: request.definition.tools,
+        })
+      : request.exposureCeiling
+    if (exposureCeiling === undefined) {
+      throw new SpawnError('ownership', 'trusted spawn admission authority is required')
+    }
+    const pinnedExposureCeiling = [...exposureCeiling]
+
     const turnStart = parent.events.find((event) => event.type === 'turn/start' && event.turnId === request.parentTurnId)
     if (turnStart !== undefined && parent.events.some((event) =>
       (event.type === 'turn/closing' || event.type === 'turn/end') && event.turnId === request.parentTurnId)) {
       throw new SpawnError('ownership', 'turn is closing or already closed')
     }
 
-    // Synchronous reservation: no await between the checks and the increments.
+    // Reservation accounting, uncapped: the per-turn counter decides whether
+    // closeTurn still owes a durable turn/closing marker; the per-root counter
+    // is the live child count surfaced to the parent. Both are released by the
+    // same rollback/cleanup paths as before.
     const root = request.parentSessionId
     const turnKey = `${root}:${request.parentTurnId}`
-    const rootActive = this.reservedPerRoot.get(root) ?? 0
-    if (rootActive >= MAX_ACTIVE_PER_ROOT) {
-      throw new SpawnError('capacity', `capacity reached: ${MAX_ACTIVE_PER_ROOT} active children for this conversation`)
-    }
-    const spawned = this.spawnedPerTurn.get(turnKey) ?? 0
-    if (spawned >= MAX_CHILDREN_PER_TURN) {
-      throw new SpawnError('capacity', `capacity reached: ${MAX_CHILDREN_PER_TURN} children per turn`)
-    }
-    this.spawnedPerTurn.set(turnKey, spawned + 1)
-    this.reservedPerRoot.set(root, rootActive + 1)
+    this.spawnedPerTurn.set(turnKey, (this.spawnedPerTurn.get(turnKey) ?? 0) + 1)
+    this.reservedPerRoot.set(root, (this.reservedPerRoot.get(root) ?? 0) + 1)
 
     // ── durable records, up to the commit point ─────────────────
     // The child is active from the moment its session exists, so a list that
@@ -583,6 +641,9 @@ export class ChildExecutor {
         settle,
       }
       this.active.set(child.childSessionId, child)
+      const siblings = this.turnChildren.get(turnKey) ?? new Set<SessionId>()
+      siblings.add(child.childSessionId)
+      this.turnChildren.set(turnKey, siblings)
       // The model is a session-level ownership boundary, exactly as it is for
       // a user's own pick: stamping it in the child's log pins the pair for
       // the child's whole life, survives restart, and stops a child from
@@ -635,6 +696,7 @@ export class ChildExecutor {
       // parent's record it is not a child.)
       if (child !== undefined) {
         this.active.delete(child.childSessionId)
+        this.turnChildren.get(turnKey)?.delete(child.childSessionId)
         if (child.status === 'queued') {
           child.status = 'failed'
           child.failure = `spawn failed before it was recorded: ${errorText(error)}`
@@ -656,16 +718,15 @@ export class ChildExecutor {
     if (child.status === 'uncertain') return this.withResult(child)
 
     try {
-      // Ceiling = (grant ? definition ∩ grant : definition) − disallowed.
-      // A grant NARROWS; it never adds a tool the definition lacks.
+      // Ceiling = admission exposure ∩ definition ∩ explicit grant − disallowed.
+      // Admission exposure is host-resolved and pinned before durable spawn;
+      // a grant only narrows it. MCP always requires an explicit spawn grant.
       const disallowed = new Set(request.definition.disallowedTools)
+      const eligible = new Set(pinnedExposureCeiling)
       const grant = request.grantTools ?? undefined
       const base = request.definition.tools.filter((tool) => {
-        if (tool.startsWith('mcp__')) {
-          // G5: Worker/custom children require an EXPLICIT spawn grant for
-          // every MCP tool. Omitted grants exclude all MCP names.
-          return grant?.includes(tool) === true
-        }
+        if (!eligible.has(tool)) return false
+        if (tool.startsWith('mcp__')) return grant?.includes(tool) === true
         return grant !== undefined ? grant.includes(tool) : true
       })
       const toolCeiling = [...new Set(base)].filter((tool) => !disallowed.has(tool))
@@ -782,7 +843,14 @@ export class ChildExecutor {
   async cancel(workspaceId: WorkspaceId, childSessionId: SessionId): Promise<ChildHandle | undefined> {
     const child = await this.lookup(workspaceId, childSessionId)
     if (child === undefined) return undefined
-    if (!isLive(child)) return child.handle
+    if (!isLive(child)) {
+      await this.cancelProcesses(childSessionId)
+      return child.handle
+    }
+    if (child.status === 'uncertain') {
+      await this.cancelProcesses(childSessionId)
+      return this.withResult(child)
+    }
     if (child.status === 'queued' || child.status === 'dispatching' || child.status === 'running') {
       const wasQueued = child.status === 'queued'
       child.status = 'cancelled' // sticky: the runner never overwrites it
@@ -876,6 +944,10 @@ export class ChildExecutor {
       }
       return this.withResult(child)
     }
+    // A canonical cancelled turn is not proof that process cleanup succeeded.
+    if (terminalTurnReason(childEvents) === 'cancelled') {
+      try { await this.cancelProcesses(childSessionId) } catch { return this.withResult(child) }
+    }
     let result = latestChildResult(parentEvents, childSessionId)
     if (result === undefined || !isTerminalStatus(result.status)) {
       // A child no live runner owns can never come back: with no terminal turn
@@ -894,6 +966,7 @@ export class ChildExecutor {
           live.failure = 'the spawn commit could not be confirmed before launch; the child never ran'
           live.resultComputed = false
           delete live.result
+          delete live.partial
           delete live.error
           this.finalizeCanonical(live)
           return this.withResult(live)
@@ -943,10 +1016,67 @@ export class ChildExecutor {
     child.endedAt ??= result.timestamp
     child.resultComputed = false
     delete child.result
+    delete child.partial
     delete child.error
     if (live !== undefined) this.finalizeCanonical(child)
     else this.remember({ handle: this.withResult(child), workspaceId: child.workspaceId, parentSessionId: child.parentSessionId })
     return this.withResult(child)
+  }
+
+  /** Record that these children's outcomes reached the model that spawned them. */
+  markReported(childSessionIds: readonly SessionId[]): void {
+    for (const id of childSessionIds) {
+      this.reported.delete(id)
+      this.reported.add(id)
+    }
+    while (this.reported.size > MAX_REPORTED) {
+      const oldest = this.reported.values().next().value
+      if (oldest === undefined) break
+      this.reported.delete(oldest)
+    }
+  }
+
+  /** Children one root turn spawned whose outcome the model has not been handed yet. */
+  owedChildrenOfTurn(root: SessionId, turnId: string): SessionId[] {
+    return [...(this.turnChildren.get(`${root}:${turnId}`) ?? [])].filter((id) => !this.reported.has(id))
+  }
+
+  /**
+   * The children one root turn spawned whose outcome the model has not seen,
+   * waited for until they settle. A root that closes its turn while they run
+   * would cancel them and lose everything they did; this is what it joins
+   * instead. Bounded by `timeoutMs` — children still running then are
+   * cancelled (and report what they got done) — and by `signal`, a user stop,
+   * which ends the wait without cancelling: Stop owns that cleanup.
+   */
+  async joinTurnChildren(
+    workspaceId: WorkspaceId,
+    root: SessionId,
+    turnId: string,
+    options: { readonly timeoutMs: number; readonly signal?: AbortSignal },
+  ): Promise<ChildHandle[]> {
+    const ids = this.owedChildrenOfTurn(root, turnId)
+    if (ids.length === 0) return []
+    const deadline = Date.now() + Math.max(options.timeoutMs, 0)
+    const live = (): SessionId[] => ids.filter((id) => {
+      const child = this.active.get(id)
+      return child !== undefined && !child.finished && (child.status === 'queued' || child.status === 'dispatching' || child.status === 'running')
+    })
+    for (let pending = live(); pending.length > 0; pending = live()) {
+      if (options.signal?.aborted === true) return []
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) {
+        for (const id of pending) await this.cancel(workspaceId, id)
+        break
+      }
+      await this.wait(workspaceId, pending, {
+        timeoutMs: Math.min(remaining, 60_000),
+        ...(options.signal !== undefined ? { signal: options.signal } : {}),
+      })
+    }
+    const handles = await this.wait(workspaceId, ids, { timeoutMs: 1 })
+    this.markReported(handles.filter((handle) => handle.status !== 'running' && handle.status !== 'queued' && handle.status !== 'dispatching').map((handle) => handle.childSessionId))
+    return handles
   }
 
   /** Root Stop: cancel every queued or running child of one root and await settlement. */
@@ -990,6 +1120,11 @@ export class ChildExecutor {
       const prefix = `${parentSessionId}:`
       for (const key of [...this.spawnedPerTurn.keys()]) {
         if (key.startsWith(prefix)) this.spawnedPerTurn.delete(key)
+      }
+      for (const [key, ids] of [...this.turnChildren]) {
+        if (!key.startsWith(prefix)) continue
+        for (const id of ids) this.reported.delete(id)
+        this.turnChildren.delete(key)
       }
     })
   }
@@ -1065,6 +1200,17 @@ export class ChildExecutor {
    * per-turn attempt stays charged), write the durable terminal record,
    * settle waiters, and evict the entry only once that record is durable.
    */
+  private async cancelProcesses(sessionId: SessionId): Promise<void> {
+    const processes = this.ctx.get('processes') as { cancelSession(id: SessionId): Promise<void> } | undefined
+    await processes?.cancelSession(sessionId)
+    await this.flushProcesses(sessionId)
+  }
+
+  private async flushProcesses(sessionId: SessionId): Promise<void> {
+    const bridge = this.ctx.get('process-events') as { flush(id: SessionId): Promise<void> } | undefined
+    await bridge?.flush(sessionId)
+  }
+
   private async finish(child: InternalChild): Promise<void> {
     if (child.finished) return
     child.endedAt ??= Date.now()
@@ -1074,6 +1220,8 @@ export class ChildExecutor {
     try {
       const sessions = this.sessions()
       if (sessions === undefined) throw new Error('no sessions service mounted')
+      if (child.status === 'cancelled') await this.cancelProcesses(child.childSessionId)
+      else await this.flushProcesses(child.childSessionId)
       // Flush the child before making its terminal status visible from the
       // parent. Otherwise a failed child flush can leave a durable completed
       // parent record that contradicts the child's recoverable log.
@@ -1095,6 +1243,7 @@ export class ChildExecutor {
         child.status = 'uncertain'
         child.failure = 'the parent result record may have persisted, but canonical storage could not be read'
         delete child.result
+        delete child.partial
         delete child.error
         child.resultComputed = false
         child.finished = true
@@ -1111,6 +1260,7 @@ export class ChildExecutor {
         ? `the parent result record is not durably known: ${errorText(error)}`
         : `terminal persistence is not durably known: ${errorText(error)}`
       delete child.result
+      delete child.partial
       delete child.error
       child.resultComputed = false
       child.finished = true
@@ -1233,6 +1383,8 @@ export class ChildExecutor {
         if (result !== undefined) child.result = result
         else child.error = `the child produced no final report; ${logPointer}`
       } else {
+        const partial = digestPartial(child.events)
+        if (partial !== undefined) child.partial = partial
         child.error = child.failure !== undefined
           ? `${child.failure}; the child did not complete (${child.status}); ${logPointer}`
           : `the child did not complete (${child.status}); ${logPointer}`
@@ -1247,6 +1399,7 @@ export class ChildExecutor {
       startedAt: child.startedAt,
       ...(child.endedAt !== undefined ? { endedAt: child.endedAt } : {}),
       ...(child.result !== undefined ? { result: child.result } : {}),
+      ...(child.partial !== undefined ? { partial: child.partial } : {}),
       ...(child.error !== undefined ? { error: child.error } : {}),
       ...(child.status === 'running' && awaitsApproval(child.events) ? { awaitingApproval: true } : {}),
     }
@@ -1255,29 +1408,49 @@ export class ChildExecutor {
 
 /** The report (last tool-free message) and files touched, or undefined. */
 function digest(events: readonly SessionEvent[]): ChildResult | undefined {
-  let report: string | undefined
-  for (let i = events.length - 1; i >= 0; i--) {
-    const event = events[i]
-    if (event?.type !== 'assistant/message') continue
-    if (event.toolCalls !== undefined && event.toolCalls.length > 0) continue
-    const content = event.content.trim()
-    if (content === '') continue
-    report = content
-    break
-  }
-  if (report === undefined) return undefined
+  return digestMessage(events, false)
+}
+
+/**
+ * What a child that never finished left behind: its last non-empty message —
+ * narration beside a tool call included — and the files it touched.
+ */
+function digestPartial(events: readonly SessionEvent[]): ChildResult | undefined {
+  const touched = digestMessage(events, true)
+  if (touched !== undefined) return touched
+  const files = filesTouchedBy(events)
+  return files.length > 0 ? { report: '', filesTouched: files } : undefined
+}
+
+function filesTouchedBy(events: readonly SessionEvent[]): string[] {
   const files = new Set<string>()
   for (const event of events) {
     if (event.type !== 'tool/call' || !FILE_ARG_TOOLS.has(event.call.name)) continue
     const filePath = event.call.args['path']
     if (typeof filePath === 'string' && filePath !== '') files.add(filePath)
   }
+  return [...files].slice(0, MAX_FILES_TOUCHED)
+}
+
+function digestMessage(events: readonly SessionEvent[], includeToolTurns: boolean): ChildResult | undefined {
+  let report: string | undefined
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]
+    if (event?.type !== 'assistant/message') continue
+    if (!includeToolTurns && event.toolCalls !== undefined && event.toolCalls.length > 0) continue
+    const content = event.content.trim()
+    if (content === '') continue
+    report = content
+    break
+  }
+  if (report === undefined) return undefined
+  const files = filesTouchedBy(events)
   const truncated = report.length > MAX_REPORT_CHARS
   return {
     report: truncated
       ? `${report.slice(0, MAX_REPORT_CHARS)}\n… [truncated ${report.length - MAX_REPORT_CHARS} chars]`
       : report,
-    filesTouched: [...files].slice(0, MAX_FILES_TOUCHED),
+    filesTouched: files,
     ...(truncated ? { truncated: true } : {}),
   }
 }

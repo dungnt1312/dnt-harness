@@ -11,8 +11,10 @@ import { ThinkingPanel } from './ThinkingPanel.tsx'
 import { useHoldScroll } from '../../hooks/useStickToBottom.ts'
 import { budgetTone, contextFill, formatBytes, formatElapsed, formatTime, formatTokenCount } from '../../lib/format.ts'
 import { isDenied, mcpServerOf, toolFacts, type ToolFacts } from '../../lib/tool-facts.ts'
+import { ansiToHtml } from '../../lib/ansi.ts'
 import { Section, ToolArguments, preClass } from './ToolArguments.tsx'
 import { attachmentUrl, fetchContextBody, waitChild } from '../../lib/api.ts'
+import { agentRoleIcon } from '../../lib/agent-icons.ts'
 import { cn } from '../../lib/cn.ts'
 import type { AttachmentRef } from '../../lib/composer-draft.ts'
 import { parseMessageText } from '../../lib/inline-chips.ts'
@@ -50,28 +52,27 @@ const isImageAttachment = (ref: AttachmentRef): boolean => ref.mediaType.startsW
 /** Hover-revealed on fine pointers, always visible on touch and keyboard focus. */
 const revealActions = 'opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 [@media(pointer:coarse)]:opacity-100'
 
-export const UserBubble = memo(function UserBubble({ item, workspaceId, onReuse, onSendNow, running = false }: {
+/**
+ * A delivered user message. Queued input never renders here: it waits on the
+ * strip above the composer (QueuedBar) until a turn consumes it, at which
+ * point the projection flips the twin in place and this shows the message.
+ */
+export const UserBubble = memo(function UserBubble({ item, workspaceId, onReuse }: {
   readonly item: Extract<ViewItem, { kind: 'user' }>
   /** Needed to fetch attachment bytes; without it they show as file chips. */
   readonly workspaceId?: string | null
   readonly onReuse?: (text: string) => void
-  /** Steer: stop the running turn (if any) and run every queued input now. */
-  readonly onSendNow?: () => void
-  /** A turn is open: a steered input is still stopping it, not stranded. */
-  readonly running?: boolean
 }) {
-  const queued = item.queued === true
-  // A steer only "steers" while a turn is open; one stranded by a restart is
-  // plain queued input again and gets Send now like any other.
-  const steering = queued && item.steer === true && running
   const notSent = item.notSent
   const attachments = item.attachments ?? []
   const [preview, setPreview] = useState<AttachmentRef | null>(null)
+  // Queued input waits on the composer strip; here it would only duplicate it.
+  if (item.queued === true) return null
   // Images sit above the bubble as bare thumbnails — nested inside the grey
   // bubble they read as a box within a box. Other files stay in the bubble.
   const images = workspaceId != null ? attachments.filter(isImageAttachment) : []
   const files = attachments.filter((ref) => !images.includes(ref))
-  const hasBubble = item.content !== '' || files.length > 0 || queued
+  const hasBubble = item.content !== '' || files.length > 0
   return (
     <div className="group flex flex-col items-end gap-1.5" title={item.ts !== undefined ? formatTime(item.ts) : undefined}>
       {images.length > 0 && workspaceId != null ? (
@@ -102,19 +103,7 @@ export const UserBubble = memo(function UserBubble({ item, workspaceId, onReuse,
         // Actions sit beside the bubble, not under it: the bubble never spans the
         // column, so the room they need is already there.
         <div className="flex w-full items-end justify-end gap-1">
-          {queued && !steering && onSendNow !== undefined ? (
-            // Always visible: a queued message after a stop does nothing until
-            // someone runs it, so the way to run it must not hide on hover.
-            <button
-              type="button"
-              onClick={onSendNow}
-              title="Stop the current turn and run the queued messages now"
-              className="mb-0.5 shrink-0 rounded-full border border-line-strong px-2.5 py-1 text-xs font-medium text-fg hover:bg-hover"
-            >
-              Send now
-            </button>
-          ) : null}
-          {!queued && onReuse !== undefined ? (
+          {onReuse !== undefined ? (
             <div className={cn('flex shrink-0 items-center gap-0.5 pb-0.5', revealActions)}>
               <CopyButton text={item.content} label="Copy message" className="size-7" />
               <IconButton label="Reuse in composer" className="size-7" onClick={() => onReuse(item.content)}>
@@ -125,14 +114,9 @@ export const UserBubble = memo(function UserBubble({ item, workspaceId, onReuse,
           <div
             className={cn(
               'max-w-[85%] rounded-3xl px-4 py-2.5 text-[15px] leading-relaxed sm:max-w-[70%]',
-              queued || notSent !== undefined ? 'border border-dashed border-line-strong text-fg-muted' : 'bg-muted',
+              notSent !== undefined ? 'border border-dashed border-line-strong text-fg-muted' : 'bg-muted',
             )}
           >
-            {queued ? (
-              <span className="mb-0.5 block text-[11px] font-medium uppercase tracking-wide text-fg-faint">
-                {steering ? 'Steering · stopping current turn…' : 'Queued'}
-              </span>
-            ) : null}
             {notSent !== undefined ? (
               <span className="mb-0.5 flex items-center gap-1 text-[11px] font-medium uppercase tracking-wide text-bad">
                 <Icon name="alertTriangle" size={11} />
@@ -277,7 +261,7 @@ const InGroupContext = createContext(false)
  * background. Only the chevron reveals on hover. A settled success adds
  * nothing to the line; only an outcome worth a look gets a status word.
  */
-const rowClass = 'inline-flex max-w-full items-center gap-2 self-start text-left text-sm leading-5 text-fg-faint'
+const rowClass = 'inline-flex min-h-6 max-w-full items-center gap-2 self-start text-left text-sm leading-5 text-fg-faint'
 
 /** Built-in tools only. An MCP tool called `read` is not the built-in and does not borrow its icon. */
 const TOOL_ICON: Readonly<Record<string, IconName>> = {
@@ -313,6 +297,12 @@ const ICON_TONE: Readonly<Partial<Record<IconName, string>>> = {
   lightbulb: 'text-tool-search',
   globe: 'text-tool-ext',
   wrench: 'text-tool-ext',
+  // Roles take the hue their family of work has; an unnamed role stays pink.
+  telescope: 'text-tool-search',
+  hammer: 'text-tool-edit',
+  searchCheck: 'text-tool-read',
+  shieldCheck: 'text-tool-run',
+  bot: 'text-tool-agent',
 }
 
 /** The word a row leads with: running, landed, and anything else. */
@@ -349,6 +339,8 @@ interface RowSpec {
   readonly kind: string
   /** A qualifier beside the kind: an MCP server, an agent role. */
   readonly kindDetail?: string
+  /** Draw the icon in a rounded chip (agent roles keep one face everywhere). */
+  readonly chip?: boolean
   /** A `·` between the kind and what follows, when the kind is a noun. */
   readonly separator?: boolean
   readonly primary?: ReactNode
@@ -397,11 +389,19 @@ function RowLine({ spec, state, showIcon }: { readonly spec: RowSpec; readonly s
   const hasSummary = spec.primary !== undefined || spec.secondary !== undefined || spec.diff !== undefined || spec.status !== undefined
   return (
     <>
-      {showIcon ? <Icon name={spec.icon} size={16} className={cn('shrink-0', ICON_TONE[spec.icon] ?? 'text-fg-faint')} /> : null}
-      <span className={cn('shrink-0 whitespace-nowrap font-medium', running ? 'text-shimmer' : 'text-fg-muted')}>{spec.kind}</span>
+      {showIcon ? (
+        spec.chip === true ? (
+          <span className={cn('flex size-5 shrink-0 items-center justify-center rounded-md bg-muted', ICON_TONE[spec.icon] ?? 'text-fg-faint')}>
+            {running ? <Spinner size={13} /> : <Icon name={spec.icon} size={13} />}
+          </span>
+        ) : (
+          <Icon name={spec.icon} size={16} className={cn('shrink-0', ICON_TONE[spec.icon] ?? 'text-fg-faint')} />
+        )
+      ) : null}
+      <span className={cn('min-w-0 max-w-[40%] shrink-0 truncate whitespace-nowrap font-medium', running ? 'text-shimmer' : 'text-fg-muted')}>{spec.kind}</span>
       {/* A kind that stays a noun while it runs still has to say so aloud. */}
       {running && !spec.kind.endsWith('ing') ? <span className="sr-only">, running</span> : null}
-      {spec.kindDetail !== undefined && spec.kindDetail !== '' ? <span className="shrink-0 whitespace-nowrap text-fg">{spec.kindDetail}</span> : null}
+      {spec.kindDetail !== undefined && spec.kindDetail !== '' ? <span className="min-w-0 max-w-[45%] shrink-0 truncate whitespace-nowrap text-fg">{spec.kindDetail}</span> : null}
       {hasSummary ? (
         <span className="flex min-w-0 items-center gap-1.5">
           {spec.separator === true && spec.primary !== undefined ? <span aria-hidden="true" className="shrink-0 text-fg-faint">·</span> : null}
@@ -615,7 +615,13 @@ export function ActivityBlock({ items, children }: { readonly items: readonly Vi
   // row (and anything it fetched) with it. A deliberate fold still wins.
   const pin = useCallback(() => { setUserPreference((current) => current ?? true) }, [])
 
-  if (items.length < COLLAPSE_MIN_ROWS) return <div className="flex flex-col gap-4">{children}</div>
+  // The same beat the transcript puts between blocks, so a row inside a run
+  // sits exactly as far from its neighbour as a row that stands on its own.
+  const rowGap = 'gap-2.5 sm:gap-4'
+  // Thinking rides along inside the run so it cannot split the column, but it
+  // is not a work row: counting it would fold three tool cards behind a summary.
+  const workRows = items.reduce((count, item) => count + (item.kind === 'assistant' ? 0 : 1), 0)
+  if (workRows < COLLAPSE_MIN_ROWS) return <div className={cn('flex flex-col', rowGap)}>{children}</div>
   const unknown = summary.problems > 0 && summary.state === 'unknown'
   return (
     <div className="flex flex-col">
@@ -651,11 +657,11 @@ export function ActivityBlock({ items, children }: { readonly items: readonly Vi
       </button>
       {/* Behind a rail: an opened run reads as the header's contents, not as
           loose rows that happen to follow it. The rail already names them, so
-          the rows drop their icons. */}
+          the rows drop their icons. The gap matches a row standing alone. */}
       {open ? (
         <PinRunContext.Provider value={pin}>
           <InGroupContext.Provider value>
-            <div id={bodyId} className="ml-2 mt-2 flex flex-col gap-2 border-l border-line pl-3.5">{children}</div>
+            <div id={bodyId} className={cn('ml-2 mt-2.5 flex flex-col border-l border-line pl-3.5 sm:mt-4', rowGap)}>{children}</div>
           </InGroupContext.Provider>
         </PinRunContext.Provider>
       ) : null}
@@ -749,7 +755,16 @@ function toolRowSpec(item: Extract<ViewItem, { kind: 'tool' }>, state: RowState,
   if (builtin === 'agent') {
     const action = typeof call.args['action'] === 'string' ? call.args['action'] : 'spawn'
     const role = typeof call.args['definition'] === 'string' ? call.args['definition'] : undefined
-    return { ...base, icon: 'gitBranch', kind: kind!, ...(role !== undefined ? { kindDetail: role } : {}), separator: true, primary: action }
+    const waitish = action !== 'spawn' && action !== 'catalog'
+    return {
+      ...base,
+      icon: role !== undefined && !waitish ? agentRoleIcon(role) : 'gitBranch',
+      kind: kind!,
+      ...(role !== undefined ? { kindDetail: role } : {}),
+      chip: !waitish,
+      separator: true,
+      primary: action,
+    }
   }
   if (MEMORY_VERB[builtin] !== undefined) {
     return { ...base, icon: 'lightbulb', kind: 'Memory', separator: true, primary: `${MEMORY_VERB[builtin]} ${facts.target}`.trim() }
@@ -789,12 +804,13 @@ function OutcomeNotes({ item }: { readonly item: Extract<ViewItem, { kind: 'tool
 }
 
 /**
- * Every opened tool body sits in the Git panel's diff frame: a rule above and
- * below, a faint fill, square corners. One frame, so a command, a change and a
- * result read as the same kind of thing.
+ * Every opened tool body sits in one frame: a rule above and below and a faint
+ * fill — except the terminal, a dark well by design, and notes, which keep
+ * their chip. The frame is the contract: same padding, same cap, so a
+ * command, a change and a result read as the same kind of thing.
  */
 const panelClass = 'min-w-0 border-y border-line bg-muted/40'
-const panelText = 'm-0 px-3 py-1.5 font-mono text-[12px] leading-5'
+const panelText = 'm-0 px-3 py-2 font-mono text-[12px] leading-5'
 
 /** The trailer `Bash` appends to every result: the exit, or how it was stopped. */
 const BASH_TRAILER = /\n?\[(exit code: -?\d+|terminated[^\]]*)\]\s*$/
@@ -814,37 +830,52 @@ function splitTerminalOutput(output: string): { body: string; footer?: { text: s
 }
 
 /**
- * A command the way a terminal shows it: a dark well in both themes, the
- * prompt and command on top — clamped to three lines, since the row already
- * names it — then what came back. A clean `exit 0` is not repeated; any other
- * ending gets one short footer.
+ * A command the way a terminal shows it: a dark well in both themes under the
+ * shared frame's rules, the prompt and command on top — clamped to three
+ * lines, since the row already names it — then what came back. Output keeps
+ * the ANSI colours the command emitted (`ansiToHtml` escapes every non-escape
+ * byte, so tool text can never become markup); copy hands over the plain text.
+ * A clean `exit 0` is not repeated; any other ending gets one short footer.
  */
 function TerminalPanel({ command, output, running }: { readonly command: string; readonly output?: string; readonly running: boolean }) {
   const [commandOpen, setCommandOpen] = useState(false)
   const long = command.length > 240 || command.split('\n').length > 3
   const split = output !== undefined ? splitTerminalOutput(output) : undefined
+  const html = useMemo(() => (split === undefined ? undefined : ansiToHtml(split.body)), [split])
   return (
-    <div className="relative min-w-0 overflow-hidden rounded-lg bg-term-bg font-mono text-[12px] leading-5 text-term-fg">
+    <div className={cn(panelClass, 'relative bg-term-bg font-mono text-[12px] leading-5 text-term-fg')}>
       <div className="border-b border-white/10 px-3 py-2 pr-10">
         <pre aria-label="Command" className={cn('m-0 whitespace-pre-wrap break-words', long && !commandOpen && 'line-clamp-3')}>
           <span aria-hidden="true" className="select-none text-term-dim">$ </span><span>{command}</span>
         </pre>
         {long ? (
-          <button type="button" onClick={() => setCommandOpen((value) => !value)} className="mt-1 font-sans text-[11px] text-term-dim hover:text-term-fg">
+          <button
+            type="button"
+            onClick={() => setCommandOpen((value) => !value)}
+            className="-mx-1 -mt-0.5 inline-flex min-h-6 items-center rounded-sm px-1 font-sans text-[11px] text-term-dim hover:text-term-fg"
+          >
             {commandOpen ? 'Show less' : 'Show full command'}
           </button>
         ) : null}
       </div>
       <CopyButton text={command} label="Copy command" className="absolute right-1 top-1 size-7 text-term-dim hover:bg-white/10 hover:text-term-fg" />
       {split !== undefined ? (
-        <>
+        <div className="relative">
           {split.body === ''
             ? <p className="m-0 px-3 py-2 font-sans text-term-dim">No output.</p>
-            : <pre tabIndex={0} aria-label="Tool output" className="m-0 max-h-60 overflow-auto whitespace-pre-wrap break-words px-3 py-2 text-term-fg">{split.body}</pre>}
+            : <pre
+                tabIndex={0}
+                aria-label="Tool output"
+                className="m-0 max-h-72 overflow-auto whitespace-pre-wrap break-words px-3 py-2 pr-10 text-term-fg"
+                {...(html !== undefined ? { dangerouslySetInnerHTML: { __html: html } } : {})}
+              >
+                {html === undefined ? split.body : undefined}
+              </pre>}
           {split.footer !== undefined ? (
             <p className={cn('m-0 border-t border-white/10 px-3 py-1', split.footer.bad ? 'text-[#ff8a8a]' : 'text-term-dim')}>{split.footer.text}</p>
           ) : null}
-        </>
+          {split.body !== '' ? <CopyButton text={split.body} label="Copy output" className="absolute right-1 top-1 size-7 text-term-dim hover:bg-white/10 hover:text-term-fg" /> : null}
+        </div>
       ) : running ? <p className="m-0 px-3 py-2 font-sans text-term-dim">Running…</p> : null}
     </div>
   )
@@ -853,29 +884,36 @@ function TerminalPanel({ command, output, running }: { readonly command: string;
 /**
  * An edit or a write as the Git panel shows a change: the same frame, the
  * same numbered gutters, the same tints. The row above already names the file
- * and opens it, so the frame carries nothing but the lines.
+ * and opens it, so the frame carries nothing but the lines. The row also
+ * names this body, so it stays a group — not a landmark of its own.
  */
 function ChangePanel({ rows, path }: { readonly rows: readonly DiffRow[]; readonly path: string }) {
   if (rows.length === 0) return <p className="m-0 text-xs text-fg-muted">No textual change.</p>
   return (
-    <div className={cn(panelClass, 'max-h-72 overflow-auto')} role="region" aria-label={`Diff of ${path}`} tabIndex={0}>
+    <div className={cn(panelClass, 'max-h-72 overflow-auto')} role="group" aria-label={`Diff of ${path}`} tabIndex={0}>
       <DiffLines rows={rows} />
     </div>
   )
 }
 
-/** What came back, in the same frame — or the error, in the diff's red. */
-function ResultPanel({ output, tone }: { readonly output: string; readonly tone: 'plain' | 'bad' | 'quiet' }) {
+/** What came back, in the same frame — or the error, in the diff's red. With no
+ *  output yet the frame is already there with its word, so settling changes a
+ *  word inside the frame instead of moving the text that follows it. */
+function ResultPanel({ output, tone }: { readonly output?: string; readonly tone: 'plain' | 'bad' | 'quiet' }) {
   return (
     <div className={cn(panelClass, 'relative', tone === 'bad' && 'bg-bad-soft')}>
-      <pre
-        tabIndex={0}
-        aria-label="Tool output"
-        className={cn(panelText, 'max-h-72 overflow-auto whitespace-pre-wrap break-words pr-10', tone === 'bad' ? 'text-bad' : tone === 'quiet' ? 'text-fg-muted' : 'text-fg')}
-      >
-        {output === '' ? 'No output.' : output}
-      </pre>
-      {output !== '' ? <CopyButton text={output} label="Copy output" className="absolute right-1 top-0.5 size-7" /> : null}
+      {output === undefined ? (
+        <p className="m-0 px-3 py-2 text-[12px] text-shimmer">Running…</p>
+      ) : (
+        <pre
+          tabIndex={0}
+          aria-label="Tool output"
+          className={cn(panelText, 'max-h-72 overflow-auto whitespace-pre-wrap break-words pr-10', tone === 'bad' ? 'text-bad' : tone === 'quiet' ? 'text-fg-muted' : 'text-fg')}
+        >
+          {output === '' ? 'No output.' : output}
+        </pre>
+      )}
+      {output !== undefined && output !== '' ? <CopyButton text={output} label="Copy output" className="absolute right-1 top-0.5 size-7" /> : null}
     </div>
   )
 }
@@ -912,7 +950,7 @@ function BashCard({ item, spec, state, command }: {
         <button
           type="button"
           onClick={() => link.open(processId)}
-          className="inline-flex items-center gap-1 self-start rounded-sm text-[12px] text-fg-muted transition-colors hover:text-fg"
+          className="-mx-1 inline-flex min-h-6 items-center gap-1 self-start rounded-sm px-1 text-[12px] text-fg-muted transition-colors hover:text-fg"
         >
           <Icon name="terminal" size={12} />
           View process in workbench
@@ -930,7 +968,7 @@ function CallDetails({ call }: { readonly call: ToolCall }) {
   const id = useId()
   return (
     <div className="flex min-w-0 flex-col gap-2">
-      <button type="button" aria-expanded={open} aria-controls={id} onClick={() => setOpen((value) => !value)} className="inline-flex items-center gap-1 self-start rounded-sm text-[12px] text-fg-faint hover:text-fg-muted">
+      <button type="button" aria-expanded={open} aria-controls={id} onClick={() => setOpen((value) => !value)} className="-mx-1 inline-flex min-h-6 items-center gap-1 self-start rounded-sm px-1 text-[12px] text-fg-faint hover:text-fg-muted">
         <Icon name="chevronRight" size={12} className={cn('transition-transform', open && 'rotate-90')} />
         View call details
       </button>
@@ -944,13 +982,17 @@ function CallDetails({ call }: { readonly call: ToolCall }) {
  * it is worth a look, how it ended. Opening it shows what the tool produced in
  * the shape that tool's output has — a terminal, a diff, a result.
  */
-export const ToolCard = memo(function ToolCard({ item, openPath }: { readonly item: Extract<ViewItem, { kind: 'tool' }>; readonly openPath?: OpenPathResolver }) {
+export const ToolCard = memo(function ToolCard({ item, openPath, hidden }: { readonly item: Extract<ViewItem, { kind: 'tool' }>; readonly openPath?: OpenPathResolver; readonly hidden?: boolean }) {
   const { call, result } = item
   const facts = toolFacts(call, result)
   const open = facts.path !== undefined ? openPath?.(facts.path, facts.focus) ?? null : null
   const state = toolState(item)
   const builtin = mcpServerOf(call.name) === undefined ? call.name.toLowerCase() : ''
   const arg = (key: string): string => (typeof call.args[key] === 'string' ? call.args[key] as string : '')
+
+  // A delegation row renders the spawn itself — same child, one line — so the
+  // tool call that only reports the same child id stays out of the transcript.
+  if (hidden === true) return null
 
   // A read that landed is opened in the workbench, not in the transcript: its
   // file is the link. Anything that did not land opens to say why.
@@ -961,7 +1003,9 @@ export const ToolCard = memo(function ToolCard({ item, openPath }: { readonly it
     return (
       <ActivityRow spec={spec} state={state}>
         <OutcomeNotes item={item} />
-        {result !== undefined ? <ResultPanel output={result.output} tone={state === 'failed' ? 'bad' : state === 'denied' ? 'quiet' : 'plain'} /> : null}
+        {result === undefined
+          ? <ResultPanel tone="plain" />
+          : <ResultPanel output={result.output} tone={state === 'failed' ? 'bad' : state === 'denied' ? 'quiet' : 'plain'} />}
       </ActivityRow>
     )
   }
@@ -979,16 +1023,21 @@ export const ToolCard = memo(function ToolCard({ item, openPath }: { readonly it
       <ActivityRow spec={spec} state={state}>
         <OutcomeNotes item={item} />
         {landed ? <ChangePanel rows={rows} path={facts.fullTarget} /> : null}
-        {!landed && result !== undefined ? <ResultPanel output={result.output} tone={state === 'failed' ? 'bad' : 'quiet'} /> : null}
+        {!landed
+          ? result === undefined
+            ? <ResultPanel tone="quiet" />
+            : <ResultPanel output={result.output} tone={state === 'failed' ? 'bad' : 'quiet'} />
+          : null}
       </ActivityRow>
     )
   }
   return (
     <ActivityRow spec={spec} state={state}>
       <OutcomeNotes item={item} />
-      {result !== undefined
-        ? <ResultPanel output={result.output} tone={state === 'failed' ? 'bad' : state === 'denied' ? 'quiet' : 'plain'} />
-        : <p className="m-0 text-[12px] text-shimmer">Running…</p>}
+      <ResultPanel
+        {...(result === undefined ? { running: true as const } : { output: result.output })}
+        tone={state === 'failed' ? 'bad' : state === 'denied' ? 'quiet' : 'plain'}
+      />
       <CallDetails call={call} />
     </ActivityRow>
   )
@@ -1020,10 +1069,12 @@ export const DelegationCard = memo(function DelegationCard({ item, workspaceId, 
   readonly onOpen?: (childSessionId: string) => void
 }) {
   const status = DELEGATION_STATUS[item.status]
+  const icon = agentRoleIcon(item.definition)
   const spec: RowSpec = {
-    icon: 'gitBranch',
+    icon,
     kind: item.status === 'running' ? 'Delegating' : 'Delegated',
     kindDetail: item.definition !== '' ? item.definition : 'agent',
+    chip: true,
     separator: true,
     ...(item.brief !== '' ? { primary: item.brief, title: item.brief } : {}),
     ...(status !== undefined ? { status } : {}),
@@ -1111,7 +1162,7 @@ const AUDIT_ICONS = {
 export const AuditLine = memo(function AuditLine({ item }: { readonly item: Extract<ViewItem, { kind: 'audit' }> }) {
   const glyph = AUDIT_ICONS[item.icon]
   return (
-    <div className="flex min-w-0 items-center gap-2 text-xs text-fg-muted" role="note">
+    <div className="flex min-h-6 min-w-0 items-center gap-2 text-xs text-fg-muted" role="note">
       <Icon name={glyph.icon} size={13} className={glyph.className} />
       <span className="min-w-0 break-words">{item.text}</span>
       {item.durationMs !== undefined ? <span className="font-mono text-fg-faint">{formatElapsed(item.durationMs)}</span> : null}

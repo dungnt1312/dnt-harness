@@ -66,6 +66,16 @@ declare module 'dnt-harness' {
     'agent/turn-stopping'(state: { readonly turnId: TurnId; readonly lastStep: StepId | null }): Promise<void>
 
     /**
+     * Serial, asked when the model has stopped calling tools and the turn is
+     * about to close. A listener that knows of work still owed to the model
+     * (delegated children still running) waits for it and returns a message
+     * carrying the outcome; the turn then spends one more step on it instead of
+     * closing over — and cancelling — that work. Resolves to nothing when
+     * nothing is owed. The signal fires when the user stops the run.
+     */
+    'agent/turn-continuation'(state: { readonly turnId: TurnId; readonly signal?: AbortSignal }): Promise<string | undefined>
+
+    /**
      * Fired after EVERY turn terminalization (completed, rejected, empty,
      * cancelled, limit, failed) once its durable record is in. Host-level
      * per-Turn resources — the writer lease above all — release here, so a

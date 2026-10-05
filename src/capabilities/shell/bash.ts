@@ -15,6 +15,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { timerBudget } from '../../harness/processes/shutdown.ts'
 import { detectShell } from './detect.ts'
 import { scrubbedChildEnv } from '../../harness/child-env.ts'
 import type { ProcessRegistry } from '../../harness/processes/registry.ts'
@@ -26,8 +27,9 @@ const CAPTURE_SLACK = 4_000
 
 /** Options for the bash tool. */
 export interface BashToolOptions {
-  /** Wall-clock kill for one command; defaults to the harness limit (30s). */
+  /** Foreground wait before eligible managed commands auto-background (default 120s). */
   readonly timeoutMs?: number
+  readonly maxWaitMs?: number
   /**
    * Compatibility fallback for direct calls lacking an execution root. Pipeline
    * calls always use `ToolExecution.root` as the authoritative working folder.
@@ -104,7 +106,8 @@ export function killTree(child: ChildProcess, shell: string, treeTag: string): v
 
 /** The `Bash` tool: one command, captured output, timeout and stop handling. */
 export function bashTool(options: BashToolOptions = {}): ToolDefinition {
-  const timeoutMs = options.timeoutMs ?? 30_000
+  const maxWaitMs = timerBudget(options.maxWaitMs, 600_000)
+  const timeoutMs = Math.min(timerBudget(options.timeoutMs, 120_000), maxWaitMs)
   // Used only for direct compatibility calls without a granted root. Pipeline
   // executions must derive their working directory from `exec.root`.
   const configuredCwd = options.cwd
@@ -112,13 +115,13 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
   const detection = detectShell(options.executable)
   return {
     name: 'Bash',
-    description: 'Run one bash command and return its combined stdout/stderr and exit code.',
+    description: 'Run Bash once; return output and exit code if completed, or a running process ID after the foreground wait. Watch that ID with BashOutput; do not rerun a still-running command.',
     requiresRoot: true,
     parameters: {
       type: 'object',
       properties: {
         command: { type: 'string', description: 'the bash command line to run' },
-        timeoutMs: { type: 'number', description: `kill after this many milliseconds (default 30000, max ${timeoutMs})` },
+        timeoutMs: { type: 'number', description: `foreground wait budget in milliseconds (default ${timeoutMs}, max ${maxWaitMs}; eligible commands keep running in background after this wait)` },
         run_in_background: { type: 'boolean', description: 'run the command in the background and return a process id immediately; read output with BashOutput, kill with KillShell. timeoutMs is ignored in background mode' },
       },
       required: ['command'],
@@ -132,48 +135,55 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
         return `error: bash is not available on this system; ${detection.hint}`
       }
       const background = args['run_in_background'] === true
-      if (background) {
-        // Background registration: same spawn (tree tag, granted root), but
-        // the call returns immediately with a process id. No timeout timer
-        // and no abort wiring here — the process must survive the turn.
-        if (options.processes === undefined) {
-          return 'error: background processes are not available on this host'
-        }
-        if (exec.sessionId === undefined) {
-          return 'error: background mode requires a session; it cannot run as a direct compatibility call'
-        }
-        if (exec.signal?.aborted === true) {
-          return 'cancelled: stop requested before this command started'
-        }
-        const cwd = exec.root !== '' ? exec.root : fallbackCwd()
+      if (options.processes !== undefined && exec.sessionId !== undefined) {
+        if (exec.signal?.aborted) return 'cancelled: stop requested before this command started'
+        const processes = options.processes
+        const sessionId = exec.sessionId
+        const capacity = processes.canRegister(sessionId)
+        if (!capacity.ok) return `error: ${capacity.error}`
         const treeTag = randomUUID()
-        let child: ChildProcess
-        try {
-          child = spawn(detection.executable, ['-lc', command], {
-            cwd,
-            detached: true,
-            env: scrubbedChildEnv(process.platform === 'win32' ? { [TREE_TAG_ENV]: treeTag } : {}),
-          })
-        } catch (error) {
-          return `error: bash spawn failed (${String(error)}); verify the shell at '${detection.hint}'`
-        }
-        const admitted = options.processes.tryRegister({
-          sessionId: exec.sessionId,
-          command,
-          cwd,
-          child,
-          executable: detection.executable,
-          treeTag,
+        const cwd = exec.root !== '' ? exec.root : fallbackCwd()
+        const child = spawn(detection.executable, ['-lc', command], {
+          cwd, detached: true,
+          env: { ...scrubbedChildEnv(), ...(process.platform === 'win32' ? { [TREE_TAG_ENV]: treeTag } : {}), FORCE_COLOR: '1' },
         })
-        if (!admitted.ok) {
-          killTree(child, detection.executable, treeTag)
-          return `error: ${admitted.error}`
+        // Even rejected registration must observe spawn errors and reap its tree.
+        child.on('error', () => {})
+        const admitted = processes.tryRegister({ sessionId, command, cwd, child, executable: detection.executable, treeTag, ...(exec.turnId !== undefined ? { turnId: exec.turnId } : {}) })
+        if (!admitted.ok) { killTree(child, detection.executable, treeTag); return `error: ${admitted.error}` }
+        const id = admitted.record.id
+        const formatOutput = () => {
+          const result = processes.read(sessionId, id)!
+          const limit = exec.outputLimit ?? OUTPUT_CAP
+          const output = result.output.length > limit ? `${result.output.slice(0, limit)}\n… [truncated ${result.output.length - limit} chars]` : result.output
+          return `${output}${result.outputTruncated ? '\n… [output truncated during capture]' : ''}`
         }
-        return `background process started: id=${admitted.record.id}; read output with BashOutput; kill with KillShell`
+        const commit = () => processes.commitBackground(sessionId, id, exec.subagentBackgroundBashMaxMs !== undefined ? { maxRuntimeMs: exec.subagentBackgroundBashMaxMs } : {})
+        const running = () => `background process started: id=${id}; read output with BashOutput; kill with KillShell`
+        if (background && commit()) return running()
+        const requested = args['timeoutMs']
+        const waitMs = typeof requested === 'number' && Number.isFinite(requested) && requested > 0 ? Math.min(requested, maxWaitMs) : timeoutMs
+        await processes.wait(sessionId, id, { timeoutMs: waitMs, ...(exec.signal !== undefined ? { signal: exec.signal } : {}) })
+        if (processes.isDraining(sessionId, id)) {
+          await processes.wait(sessionId, id, { timeoutMs: 10_000 })
+          if (processes.isRunning(sessionId, id)) throw new Error(`process ${id} output drain did not settle`)
+        }
+        if (exec.signal?.aborted && processes.isRunning(sessionId, id)) {
+          await processes.kill(sessionId, id)
+          return `${formatOutput()}\n[terminated by stop; killed]`
+        }
+        if (processes.isRunning(sessionId, id)) {
+          if (command.trim().split(/\s+/)[0] !== 'sleep' && commit()) return running()
+          await processes.kill(sessionId, id)
+          return `${formatOutput()}\n[terminated by timeout; killed]`
+        }
+        const result = processes.read(sessionId, id)!
+        return `${formatOutput()}\n[${result.status === 'exited' ? `exit code: ${result.exitCode}` : `status: ${result.status}`}]`
       }
+      if (background) return options.processes === undefined ? 'error: background processes are not available on this host' : 'error: background mode requires a session'
       const requested = args['timeoutMs']
       const kill = typeof requested === 'number' && Number.isFinite(requested) && requested > 0
-        ? Math.min(requested, timeoutMs)
+        ? Math.min(requested, maxWaitMs)
         : timeoutMs
 
       return await new Promise<string>((resolve) => {
@@ -223,6 +233,10 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
         // Detached so the timeout can kill the whole process tree. Some
         // platforms throw synchronously for non-executable targets — that
         // must settle the call, never hang it.
+        // FORCE_COLOR asks CLI tools (vitest, eslint…) to keep their ANSI
+        // colours even though this is not a TTY: the transcript renders them.
+        // NO_COLOR stays deliberately unpinned — an operator-set NO_COLOR=1
+        // is a real instruction to keep output plain.
         let child: ChildProcess
         try {
           child = spawn(detection.executable as string, ['-lc', command], {
@@ -230,7 +244,7 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
             // requiresRoot tool. The fallback retains direct-call compatibility.
             cwd: exec.root !== '' ? exec.root : fallbackCwd(),
             detached: true,
-            env: scrubbedChildEnv(process.platform === 'win32' ? { [TREE_TAG_ENV]: treeTag } : {}),
+            env: { ...scrubbedChildEnv(), ...(process.platform === 'win32' ? { [TREE_TAG_ENV]: treeTag } : {}), FORCE_COLOR: '1' },
           })
         } catch (error) {
           finish(`error: bash spawn failed (${String(error)}); verify the shell at '${detection.hint}'`)

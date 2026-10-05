@@ -6,7 +6,7 @@ import { cn } from '../../lib/cn.ts'
 export const menuItemClass = 'flex w-full min-h-9 items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-sm text-fg outline-none hover:bg-hover focus-visible:bg-hover disabled:pointer-events-none disabled:opacity-40'
 
 /** Popover menu: callers render trigger contents and items; Radix owns portal, focus and dismissal. */
-export function Menu({ label, trigger, triggerClassName, panelClassName, panelRole = 'menu', disabled = false, side = 'bottom', align = 'start', children }: {
+export function Menu({ label, trigger, triggerClassName, panelClassName, panelRole = 'menu', disabled = false, side = 'bottom', align = 'start', compact = false, children }: {
   readonly label: string
   readonly trigger: (open: boolean) => ReactNode
   readonly triggerClassName?: string
@@ -15,6 +15,8 @@ export function Menu({ label, trigger, triggerClassName, panelClassName, panelRo
   readonly disabled?: boolean
   readonly side?: 'top' | 'bottom' | 'left' | 'right'
   readonly align?: 'start' | 'center' | 'end'
+  /** Exempts the trigger from the 44px coarse-pointer floor (composer control row). */
+  readonly compact?: boolean
   readonly children: (close: () => void) => ReactNode
 }) {
   const [open, setOpen] = useState(false)
@@ -22,7 +24,7 @@ export function Menu({ label, trigger, triggerClassName, panelClassName, panelRo
     <Popover.Root open={open} onOpenChange={setOpen}>
       <Popover.Trigger asChild>
         {/* `title` mirrors the label so an icon-only chip still names itself on hover. */}
-        <button type="button" disabled={disabled} className={triggerClassName} title={label} aria-label={label} aria-haspopup={panelRole}>
+        <button type="button" disabled={disabled} className={triggerClassName} title={label} aria-label={label} aria-haspopup={panelRole} {...(compact ? { 'data-compact-control': true } : {})}>
           {trigger(open)}
         </button>
       </Popover.Trigger>

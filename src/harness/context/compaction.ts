@@ -26,6 +26,12 @@ export interface CompactionCheckpoint {
  * deleting them loses nothing canonical.
  */
 export class CheckpointStore {
+  private closed = false
+  private readonly pending = new Set<Promise<void>>()
+  async close(): Promise<void> {
+    this.closed = true
+    await Promise.all([...this.pending])
+  }
   constructor(private readonly sessionsRoot: string) {}
 
   private dir(sessionId: string): string {
@@ -33,9 +39,14 @@ export class CheckpointStore {
   }
 
   async save(sessionId: string, checkpoint: CompactionCheckpoint): Promise<void> {
-    const dir = this.dir(sessionId)
-    await fs.mkdir(dir, { recursive: true })
-    await fs.writeFile(path.join(dir, `${checkpoint.coversSeq}.json`), `${JSON.stringify(checkpoint, null, 2)}\n`, 'utf8')
+    if (this.closed) throw new Error('checkpoint store closing')
+    const write = (async () => {
+      const dir = this.dir(sessionId)
+      await fs.mkdir(dir, { recursive: true })
+      await fs.writeFile(path.join(dir, `${checkpoint.coversSeq}.json`), `${JSON.stringify(checkpoint, null, 2)}\n`, 'utf8')
+    })()
+    this.pending.add(write)
+    try { await write } finally { this.pending.delete(write) }
   }
 
   /** The newest checkpoint, or undefined when none exists. */
@@ -147,6 +158,7 @@ export async function compactSession(
         trigger: options.trigger,
       },
     }
+    if (session.closing) throw new Error('session closing; compaction checkpoint refused')
     await checkpoints.save(session.id, checkpoint)
     session.append({
       type: 'compaction/end',
@@ -181,6 +193,10 @@ function projectForSummary(events: readonly SessionEvent[], throughSeq: number):
   for (const event of events) {
     if (event.seq > throughSeq) break
     switch (event.type) {
+      case 'model/attempt':
+      case 'execution/uncertain':
+      case 'execution/reconciled':
+        break // Diagnostics are never summary input.
       case 'user/message':
         lines.push(`user: ${event.content}`)
         break

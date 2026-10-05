@@ -45,15 +45,18 @@ export function ModelMenu({ menuLabel, disabled = false, modelLabel, modelValue,
       panelRole="dialog"
       side="top"
       align="end"
+      compact
       panelClassName="w-[min(560px,calc(100vw-24px))] p-0"
       // The one chip that gives way when the row is tight — but never to
       // nothing: a model chip with no name tells the reader less than a
-      // truncated one.
-      triggerClassName={`${composerChipClass} min-w-[5.5rem]`}
+      // truncated one. On a phone the whole row is icon-only, so the chip
+      // collapses to the cpu glyph and the full name lives in the tooltip.
+      triggerClassName={`${composerChipClass} min-w-[5.5rem] [@media(pointer:coarse)]:min-w-9`}
       trigger={(open) => (
         <>
-          <span className="truncate" title={providerName !== null ? `${providerName} / ${modelName}` : modelName}>{modelName}</span>
-          <Icon name="chevron" size={13} className={cn('shrink-0 transition-transform', open && 'rotate-180')} />
+          <Icon name="cpu" size={16} className="@min-[30rem]:hidden" />
+          <span className="truncate @max-[30rem]:hidden" title={providerName !== null ? `${providerName} / ${modelName}` : modelName}>{modelName}</span>
+          <Icon name="chevron" size={13} className={cn('shrink-0 transition-transform @max-[30rem]:hidden', open && 'rotate-180')} />
         </>
       )}
     >
@@ -85,7 +88,17 @@ function PickerPanel({ enabled, byProvider, activeProvider, activeModelId, model
   const [query, setQuery] = useState('')
   const [previewId, setPreviewId] = useState<string | null>(null)
   const searchRef = useRef<HTMLInputElement | null>(null)
+  const activeRowRef = useRef<HTMLButtonElement | null>(null)
+  const activeProviderRef = useRef<HTMLButtonElement | null>(null)
   useEffect(() => { searchRef.current?.focus() }, [])
+  // Opening on the active provider's column is only half of it: without a
+  // scroll, forty models bury the checked row below the fold and the reader
+  // cannot tell which model is live. `nearest` leaves an already-visible row
+  // where it is.
+  useEffect(() => {
+    activeRowRef.current?.scrollIntoView({ block: 'nearest' })
+    activeProviderRef.current?.scrollIntoView({ block: 'nearest' })
+  }, [])
 
   const q = query.trim().toLowerCase()
   const matches = (option: ModelOption): boolean => q === '' || option.model.toLowerCase().includes(q) || option.label.toLowerCase().includes(q)
@@ -133,6 +146,7 @@ function PickerPanel({ enabled, byProvider, activeProvider, activeModelId, model
                   type="button"
                   role="option"
                   aria-selected={provider.id === preview?.id}
+                  ref={provider.id === activeProvider ? activeProviderRef : undefined}
                   title={provider.name}
                   onMouseEnter={() => setPreviewId(provider.id)}
                   onFocus={() => setPreviewId(provider.id)}
@@ -158,9 +172,10 @@ function PickerPanel({ enabled, byProvider, activeProvider, activeModelId, model
                   type="button"
                   role="option"
                   aria-selected={active}
+                  ref={active ? activeRowRef : undefined}
                   title={option.model}
                   onClick={() => onModel(option.value)}
-                  className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left hover:bg-hover"
+                  className={cn('flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left hover:bg-hover', active && 'bg-hover')}
                 >
                   <span className="flex min-w-0 flex-1 flex-col gap-0.5">
                     <span className="break-all text-sm">{option.model}</span>

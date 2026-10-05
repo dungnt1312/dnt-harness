@@ -212,6 +212,37 @@ describe('skill commands', () => {
   })
 })
 
+describe('$ skill menu', () => {
+  const skills = [{ name: 'review', description: 'Check a diff' }, { name: 'test', description: 'Run the suite' }]
+
+  it('opens mid-draft on $ and inserts the same command chip as the / menu', () => {
+    render({ skills })
+    type('use $rev')
+    expect(options().map((option) => option.textContent)).toEqual(['reviewCheck a diff'])
+    key('Enter')
+    expect(chips()).toHaveLength(1)
+    expect(draftText(current)).toBe('use Use the review skill: ')
+    expect(current.segments).toEqual([
+      { kind: 'text', text: 'use ' },
+      { kind: 'command', name: 'review' },
+      { kind: 'text', text: ' ' },
+    ])
+  })
+
+  it('lists every skill under the Skills caption and never the built-in commands', () => {
+    render({ skills })
+    type('$')
+    expect(groupHeaders()).toEqual(['Skills'])
+    expect(options().map((option) => option.textContent)).toEqual(['reviewCheck a diff', 'testRun the suite'])
+  })
+
+  it('stays shut without a catalog', () => {
+    render({})
+    type('$rev')
+    expect(options()).toHaveLength(0)
+  })
+})
+
 describe('built-in commands', () => {
   it('picking /compact executes at once through onCommand — nothing lands in the draft', () => {
     const onCommand = vi.fn()

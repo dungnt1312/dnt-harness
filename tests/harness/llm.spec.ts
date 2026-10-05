@@ -23,7 +23,7 @@ async function collect(stream: AsyncIterable<StreamEvent>): Promise<{ text: stri
   const toolCalls: StreamEvent[] = []
   for await (const event of stream) {
     if (event.type === 'delta') text += event.delta
-    else toolCalls.push(event)
+    else if (event.type !== 'completion') toolCalls.push(event)
   }
   return { text, toolCalls }
 }

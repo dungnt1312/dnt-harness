@@ -4,7 +4,10 @@
  * a schema version, the stamped fields, and the event payload.
  *
  * Durability here means the bytes reached the file and the file was synced
- * (`fsync`) before the write is acknowledged. Directory entries are synced
+ * (`fsync`) before the write is acknowledged — except for records appended
+ * with `relaxed`, which are written immediately but synced at the caller's
+ * next `checkpoint()`/`flush()`, one fsync batching the whole prefix
+ * (streaming chunks ride this path). Directory entries are synced
  * best-effort: Windows cannot fsync a directory handle, so rename durability
  * there relies on the platform's metadata journaling — a documented limit,
  * not a silent claim.
@@ -60,7 +63,42 @@ function validateRecord(parsed: unknown, filePath: string, lineNumber: number): 
   if (typeof record['timestamp'] !== 'number') {
     throw new SessionLogError('schema', `line ${lineNumber} has an invalid timestamp`, filePath, lineNumber)
   }
+  if (record['type'] === 'model/attempt' || record['type'] === 'execution/uncertain' || record['type'] === 'execution/reconciled') {
+    if (!validAttemptFact(record['fact'], record['type'])) {
+      throw new SessionLogError('schema', `line ${lineNumber} has an invalid attempt fact`, filePath, lineNumber)
+    }
+  }
   return record as unknown as SessionEvent
+}
+
+/** Validate only the new vocabulary; historical event payloads keep their reader contract. */
+function validAttemptFact(value: unknown, type: string): boolean {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const fact = value as Record<string, unknown>
+  const keys = ['attribution', 'provider', 'model', 'queuedAt', 'startedAt', 'endedAt', 'firstProgressAt', 'lastProgressAt', 'finish', 'requestId', 'attemptId', 'attempt', 'state', 'committed', 'reason', 'transportSettled']
+  if (Object.keys(fact).some(key => !keys.includes(key))) return false
+  const id = (v: unknown): boolean => typeof v === 'string' && v.length > 0
+  if (!id(fact['requestId']) || !id(fact['attemptId'])) return false
+  if (!Number.isSafeInteger(fact['attempt']) || (fact['attempt'] as number) < 1 || (fact['attempt'] as number) > 4) return false
+  if (typeof fact['committed'] !== 'boolean' || typeof fact['transportSettled'] !== 'boolean') return false
+  if (type === 'model/attempt' && fact['state'] !== 'start' && fact['state'] !== 'end') return false
+  if (type === 'execution/uncertain' && (fact['state'] !== 'uncertain' || fact['transportSettled'] !== false)) return false
+  if (type === 'execution/reconciled' && (fact['state'] !== 'reconciled' || fact['transportSettled'] !== true)) return false
+  for (const key of ['provider', 'model']) {
+    if (fact[key] !== undefined && (typeof fact[key] !== 'string' || (fact[key] as string).length > 128)) return false
+  }
+  for (const key of ['queuedAt', 'startedAt', 'endedAt', 'firstProgressAt', 'lastProgressAt']) {
+    if (fact[key] !== undefined && (typeof fact[key] !== 'number' || !Number.isFinite(fact[key]) || (fact[key] as number) < 0)) return false
+  }
+  if (fact['attribution'] !== undefined) {
+    const attribution = fact['attribution']
+    if (attribution === null || typeof attribution !== 'object' || Array.isArray(attribution)) return false
+    const a = attribution as Record<string, unknown>
+    if (Object.keys(a).some(key => !['sessionId', 'turnId', 'stepId'].includes(key)) || !id(a['sessionId']) || !id(a['turnId']) || !id(a['stepId'])) return false
+  }
+  if (fact['finish'] !== undefined && !['stop', 'tool_calls', 'length', 'content_filter', 'error', 'unknown'].includes(fact['finish'] as string)) return false
+  if (fact['reason'] !== undefined && !['cancelled', 'connect', 'read', 'reset', 'first_progress_timeout', 'idle_timeout', 'total_timeout', 'rate_limit', 'server_error', 'auth_configuration', 'quota', 'context_exceeded', 'malformed_protocol', 'invalid_tool_input', 'incomplete_completion', 'output_limit', 'length', 'content_filter', 'unknown'].includes(fact['reason'] as string)) return false
+  return true
 }
 
 export interface EventLogRead {
@@ -169,13 +207,15 @@ async function quarantineTail(filePath: string, goodPrefix: string, tornLine: st
 }
 
 /**
- * Append one canonical line through an open handle and sync it. The sync is
+ * Append one canonical line through an open handle. With `relaxed` the record
+ * is only written; the caller's later checkpoint/flush supplies the single
+ * fsync that batches the whole deferred prefix. Without it the sync here is
  * the durability barrier: the caller may only acknowledge the record after
- * this resolves.
+ * the write resolves.
  */
-export async function appendEventLine(handle: fs.FileHandle, line: string): Promise<void> {
+export async function appendEventLine(handle: fs.FileHandle, line: string, options?: { readonly relaxed?: boolean }): Promise<void> {
   await handle.write(line, null, 'utf8')
-  await handle.sync()
+  if (options?.relaxed !== true) await handle.sync()
 }
 
 /**

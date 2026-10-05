@@ -53,7 +53,10 @@ function fixtureEvents(state: FixtureState): readonly unknown[] {
     { type: 'tool/call', seq: 7, call: { id: 'recovered', name: 'Read', args: { path: 'C:/fixture/project/recovered.ts' } } },
     { type: 'tool/result', seq: 8, callId: 'recovered', ok: true, output: 'partial recovered output', recovery: true },
   ]
-  if (state === 'delegation') return [{ type: 'agent/child-spawn', seq: 0, childSessionId: 'child', definition: 'explorer', objective: 'Map the app' }]
+  if (state === 'delegation') return [
+    { type: 'agent/child-spawn', seq: 0, childSessionId: 'child', definition: 'explorer', objective: 'Map the app' },
+    { type: 'agent/child-result', seq: 1, childSessionId: 'child', status: 'completed' },
+  ]
   if (state === 'approval') return [
     ...Array.from({ length: 14 }, (_, index) => ({ type: 'user/message', seq: index, content: `Approval context ${index + 1}\n${'Detailed transcript content '.repeat(12)}` })),
     { type: 'turn/start', seq: 14 },
@@ -180,6 +183,16 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
       if (path === '/api/workspaces/w/secrets/FIXTURE_SECRET' && method === 'DELETE') { secretDeleteCount += 1; return secretDeleteCount === 1 ? json(route, { error: 'secret delete refused' }, 503) : json(route, { deleted: 'FIXTURE_SECRET' }) }
     }
     if (path === '/api/workspaces/w/skills' && method === 'GET') return json(route, [])
+    // Boot-time surfaces the shell reconciles on load.
+    if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/mode$/.test(path) && method === 'GET') return json(route, { modeId: 'chat', name: 'Chat', revision: 1, source: 'workspace-default' })
+    if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/processes$/.test(path) && method === 'GET') return json(route, [])
+    if (path === '/api/workspaces/w/terminals' && method === 'GET') return json(route, { terminals: [], shells: [], max: 4, available: false })
+    if (path === '/api/workspaces/w/projects/p/git' && method === 'GET') return json(route, { branch: null, changes: [], truncated: false })
+    if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/children\/[^/]+$/.test(path) && method === 'GET') {
+      return json(route, { childSessionId: 'child', status: 'completed', definitionName: 'explorer', startedAt: 0, endedAt: 1, result: { report: 'Mapped the app.', filesTouched: [] } })
+    }
+    if (path === '/api/workspaces/w/skills/sources') return json(route, { rules: [{ id: 'workspace', kind: 'workspace', enabled: true }] })
+    if (path === '/api/workspaces/w/skills/fixture-skill/files') return json(route, { files: [{ path: 'SKILL.md', bytes: 64 }] })
     throw new Error(`Unexpected fixture API request: ${method} ${url.href}`)
   })
 
@@ -196,7 +209,9 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
     await page.evaluate(() => window.dispatchEvent(new Event('focus')))
     const openNavigation = page.getByRole('button', { name: 'Open sidebar' })
     if (await openNavigation.count() > 0) await openNavigation.click()
-    await expect(page.getByRole('button', { name: /^Fixture conversation/ })).toBeVisible()
+    // A running session's accessible name carries the sr-only "working with …"
+    // prefix before the title, so the match may not anchor to the title's start.
+    await expect(page.getByRole('button', { name: /Fixture conversation \d/ }).or(page.getByRole('button', { name: /^Fixture conversation/ }))).toBeVisible()
     await expect(page.locator('[aria-current="page"]')).toHaveCount(1)
     const drawer = page.getByRole('dialog', { name: 'Conversation navigation' })
     if (await drawer.count() > 0) await page.keyboard.press('Escape')
@@ -252,7 +267,7 @@ for (const width of [320, 375, 768, 1024, 1440]) {
       await page.keyboard.press('ArrowDown')
       await expect(dialog.getByRole('tab', { name: /Projects/ })).toBeFocused()
       for (const label of labels) {
-        const tab = dialog.getByRole('tab', { name: new RegExp(label) })
+        const tab = dialog.getByRole('tab', { name: new RegExp(`^${label}`) }).first()
         await tab.click()
         await expect(tab).toHaveAttribute('aria-selected', 'true')
         await expect(dialog.getByRole('heading', { name: label, exact: true }).first()).toBeVisible()
@@ -325,10 +340,10 @@ test('discarding a provider draft actually clears it — later tab switches and 
   await (await settingsTrigger(page)).click()
   const dialog = page.getByRole('dialog', { name: 'Settings' })
   await (await providerName(dialog)).fill('dirty and discarded')
-  await dialog.getByRole('tab', { name: /Skills/ }).click()
+  await dialog.getByRole('tab', { name: /^Skills/ }).first().click()
   await expect(page.getByRole('dialog', { name: 'Discard unsaved provider changes?' })).toBeVisible()
   await page.getByRole('button', { name: 'Discard changes' }).click()
-  await expect(dialog.getByRole('tab', { name: /Skills/ })).toHaveAttribute('aria-selected', 'true')
+  await expect(dialog.getByRole('tab', { name: /^Skills/ }).first()).toHaveAttribute('aria-selected', 'true')
 
   // A resolved discard must not leave the draft comparison permanently dirty:
   // every further navigation should move directly, with no repeat prompt.
@@ -348,7 +363,7 @@ test('provider dirty draft survives sections, confirms discard, and omits a blan
   const dialog = page.getByRole('dialog', { name: 'Settings' })
   const name = await providerName(dialog)
   await name.fill('Fixture provider edited')
-  await dialog.getByRole('tab', { name: /Skills/ }).click()
+  await dialog.getByRole('tab', { name: /^Skills/ }).first().click()
   await expect(page.getByRole('dialog', { name: 'Discard unsaved provider changes?' })).toBeVisible()
   await page.getByRole('button', { name: 'Cancel' }).click()
   await expect(name).toHaveValue('Fixture provider edited')
@@ -487,9 +502,11 @@ test('Skills and Memory 409 conflicts require explicit reload or overwrite', asy
   const state = await fixture(page, 'settings')
   await (await settingsTrigger(page)).click()
   const dialog = page.getByRole('dialog', { name: 'Settings' })
-  await dialog.getByRole('tab', { name: /Skills/ }).click()
-  await dialog.getByRole('button', { name: 'Edit' }).click()
-  await dialog.getByLabel('SKILL.md content').fill('local skill body')
+  await dialog.getByRole('tab', { name: /^Skills/ }).first().click()
+  // Opening the skill's detail pane is the entry to its editor.
+  await dialog.getByRole('button', { name: 'fixture-skill', exact: true }).click()
+  await dialog.getByRole('button', { name: 'Edit raw' }).click()
+  await dialog.getByRole('textbox', { name: 'SKILL.md' }).fill('local skill body')
   await dialog.getByRole('button', { name: 'Save skill' }).click()
   await expect(dialog.getByRole('button', { name: 'Reload server version' })).toBeVisible()
   await expect(dialog.getByRole('button', { name: 'Overwrite anyway' })).toBeVisible()
@@ -497,7 +514,7 @@ test('Skills and Memory 409 conflicts require explicit reload or overwrite', asy
   await dialog.getByRole('button', { name: 'Overwrite anyway' }).click()
   await expect.poll(() => state.count('PUT', '/api/workspaces/w/skills/fixture-skill')).toBe(2)
 
-  await dialog.getByRole('tab', { name: /Memory/ }).click()
+  await dialog.getByRole('tab', { name: /^Memory/ }).first().click()
   await dialog.getByRole('button', { name: /Fixture memory/ }).click()
   await dialog.getByLabel('Body').fill('local body')
   await dialog.getByRole('button', { name: 'Save', exact: true }).click()
@@ -511,7 +528,7 @@ const transcriptOf = (page: Page) => page.getByRole('region', { name: 'Conversat
 test('a running tool shows inline as one running row without an output disclosure', async ({ page }) => {
   const state = await fixture(page, 'running-tool')
   const before = state.requests().filter((request) => request.method !== 'GET').length
-  const row = transcriptOf(page).getByRole('button', { name: /Bash/ })
+  const row = transcriptOf(page).getByRole('button', { name: /npm test/ })
   await expect(row).toHaveCount(1)
   await expect(row).toContainText('Running')
   await row.click()
@@ -522,11 +539,11 @@ test('a running tool shows inline as one running row without an output disclosur
 test('a completed tool row expands to recorded output without requests', async ({ page }) => {
   const state = await fixture(page, 'completed-tool')
   const before = state.requests().filter((request) => request.method !== 'GET').length
-  const row = transcriptOf(page).getByRole('button', { name: /Bash/ })
-  await expect(row).toContainText('Succeeded')
-  // The command and what came back are on the row itself, before any click.
+  const row = transcriptOf(page).getByRole('button', { name: /npm test/ })
+  // A settled success states its kind and command; failure wording never shows.
+  await expect(row).toContainText('Terminal')
+  await expect(row).not.toContainText(/Failed|Unknown/)
   await expect(row).toContainText('npm test')
-  await expect(row).toContainText('recorded output')
   await row.click()
   await expect(transcriptOf(page).locator('pre[aria-label="Tool output"]')).toContainText('recorded output')
   await row.click()
@@ -538,9 +555,9 @@ test('a completed tool row expands to recorded output without requests', async (
 test('a recovered tool outcome is unknown and never successful without requests', async ({ page }) => {
   const state = await fixture(page, 'recovered-tool')
   const before = state.requests().filter((request) => request.method !== 'GET').length
-  const row = transcriptOf(page).getByRole('button', { name: /Bash/ })
-  await expect(row).toContainText('Outcome unknown')
-  await expect(row).not.toContainText('Succeeded')
+  const row = transcriptOf(page).getByRole('button', { name: /npm test/ })
+  await expect(row).toContainText('Unknown')
+  await expect(row).not.toContainText(/Failed|Denied/)
   await row.click()
   await expect(transcriptOf(page).getByRole('note')).toContainText('Outcome unknown — the host restarted before this result was recorded.')
   expectNoMutationRequests(state, before)
@@ -548,7 +565,7 @@ test('a recovered tool outcome is unknown and never successful without requests'
 
 test('a delegation row opens its existing child conversation route', async ({ page }) => {
   await fixture(page, 'delegation')
-  await transcriptOf(page).getByRole('button', { name: /Delegated to explorer/ }).click()
+  await transcriptOf(page).getByRole('button', { name: /Delegated explorer/ }).click()
   await transcriptOf(page).getByRole('button', { name: /Open conversation/ }).click()
   await expect(page).toHaveURL('/workspaces/w/sessions/child')
 })
@@ -576,7 +593,7 @@ test('Trajectory projects existing event data without any additional API request
   await expect(calls).toContainText('README.md')
   await expect(calls).toContainText('npm test')
   await expect(calls).toContainText('Failed')
-  await expect(calls).toContainText('Outcome unknown')
+  await expect(calls).toContainText('Unknown')
   await page.waitForTimeout(750)
   expect(state.requests()).toHaveLength(before)
   await page.reload()
@@ -593,11 +610,10 @@ test('Trajectory projects existing event data without any additional API request
 test('a tool row states its window and opens the workbench at the lines it read', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 })
   const state = await fixture(page, 'artifacts')
-  // The window is on the row: nothing about it needs a click to be read.
+  // The window is on the row: nothing about it needs a click to be read. A
+  // landed Read is a link row, not an expandable one.
   const row = transcriptOf(page).getByRole('button', { name: /README\.md:30-35/ })
-  await expect(row).toHaveAttribute('aria-expanded', 'false')
   await row.click()
-  await transcriptOf(page).getByRole('button', { name: /Open .* in workbench/ }).click()
   const contents = page.getByRole('region', { name: 'Contents of README.md' })
   await expect(contents).toContainText('export const answer = 42')
   // The viewer lands on the recorded window rather than the top of the file.
@@ -724,8 +740,8 @@ test('reconnect retains running state, editable draft, queue and stop controls a
   await input.fill('draft retained during reconnect')
   await expect(page.getByRole('status', { name: 'Work status' })).toContainText('Working')
   await expect(page.getByRole('status', { name: 'Work status' })).toContainText('does not mean work has stopped')
-  await expect(transcriptOf(page).getByRole('button', { name: /Bash/ })).toContainText('Running')
-  await expect(transcriptOf(page).getByRole('button', { name: /Bash/ })).not.toContainText(/Succeeded|Failed/)
+  await expect(transcriptOf(page).getByRole('button', { name: /npm test/ })).toContainText('Running')
+  await expect(transcriptOf(page).getByRole('button', { name: /npm test/ })).not.toContainText(/Succeeded|Failed/)
   await expect(input).toHaveText('draft retained during reconnect')
   await expect(input).toBeEditable()
   await expect(page.getByRole('button', { name: 'Stop work' })).toBeVisible()
@@ -736,8 +752,8 @@ test('reconnect retains running state, editable draft, queue and stop controls a
   await expect(page.getByRole('button', { name: /^(Open|Close) workbench$/ })).toBeVisible()
   await page.evaluate(() => window.dispatchEvent(new Event('focus')))
   await expect(page.getByRole('status', { name: 'Work status' })).toContainText('Working')
-  await expect(transcriptOf(page).getByRole('button', { name: /Bash/ })).toContainText('Running')
-  await expect(transcriptOf(page).getByRole('button', { name: /Bash/ })).not.toContainText(/Succeeded|Failed/)
+  await expect(transcriptOf(page).getByRole('button', { name: /npm test/ })).toContainText('Running')
+  await expect(transcriptOf(page).getByRole('button', { name: /npm test/ })).not.toContainText(/Succeeded|Failed/)
   await expect(page.getByRole('button', { name: 'Stop work' })).toBeVisible()
   expect(state.count('POST', `${SESSION_PATH}/messages`)).toBe(0)
   expect(state.count('POST', `${SESSION_PATH}/stop`)).toBe(0)
@@ -854,7 +870,7 @@ test('reduced motion collapses nonessential motion while running status remains 
     expect([...durations(timing.animation), ...durations(timing.transition)].every(value => value <= 0.02)).toBe(true)
   }
   await expect(page.getByRole('status', { name: 'Work status' })).toContainText('Working')
-  await expect(transcriptOf(page).getByRole('button', { name: /Bash/ })).toContainText('Running')
+  await expect(transcriptOf(page).getByRole('button', { name: /npm test/ })).toContainText('Running')
   await expect(page.getByRole('button', { name: 'Stop work' })).toBeVisible()
 })
 
@@ -894,7 +910,7 @@ test('captures the deterministic screenshot matrix', async ({ browser }) => {
     { name: 'trajectory-empty', fixture: 'no-work', prepare: async page => { await selectWorkbenchView(page, 'Trajectory') } },
     { name: 'trajectory-populated', fixture: 'artifacts', prepare: async page => { await selectWorkbenchView(page, 'Trajectory') } },
     { name: 'settings-dirty', fixture: 'settings', prepare: async page => { await (await settingsTrigger(page)).click(); await (await providerName(page.getByRole('dialog', { name: 'Settings' }))).fill('Dirty provider draft') } },
-    { name: 'settings-conflict', fixture: 'settings', prepare: async page => { const dialog = page.getByRole('dialog', { name: 'Settings' }); await (await settingsTrigger(page)).click(); await expect(dialog).toBeVisible(); if ((page.viewportSize()?.width ?? 0) > 600) await dialog.getByRole('tab', { name: /Skills/ }).click(); else { await page.getByRole('combobox', { name: 'Settings section' }).click(); await page.getByRole('option', { name: 'Skills' }).click() } await dialog.getByRole('button', { name: 'Edit' }).click(); await dialog.getByLabel('SKILL.md content').fill('local conflict draft'); await dialog.getByRole('button', { name: 'Save skill' }).click(); await expect(dialog.getByRole('button', { name: 'Overwrite anyway' })).toBeVisible() } },
+    { name: 'settings-conflict', fixture: 'settings', prepare: async page => { const dialog = page.getByRole('dialog', { name: 'Settings' }); await (await settingsTrigger(page)).click(); await expect(dialog).toBeVisible(); if ((page.viewportSize()?.width ?? 0) > 600) await dialog.getByRole('tab', { name: /^Skills/ }).first().click(); else { await page.getByRole('combobox', { name: 'Settings section' }).click(); await page.getByRole('option', { name: 'Skills' }).click() } await dialog.getByRole('button', { name: 'Edit' }).click(); await dialog.getByLabel('SKILL.md content').fill('local conflict draft'); await dialog.getByRole('button', { name: 'Save skill' }).click(); await expect(dialog.getByRole('button', { name: 'Overwrite anyway' })).toBeVisible() } },
   ]
   for (const width of REQUIRED_WIDTHS) {
     for (const state of states) {

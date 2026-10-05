@@ -1,57 +1,64 @@
 import hljs from 'highlight.js/lib/core'
-import typescript from 'highlight.js/lib/languages/typescript'
-import javascript from 'highlight.js/lib/languages/javascript'
-import bash from 'highlight.js/lib/languages/bash'
-import json from 'highlight.js/lib/languages/json'
-import yaml from 'highlight.js/lib/languages/yaml'
-import css from 'highlight.js/lib/languages/css'
-import markdown from 'highlight.js/lib/languages/markdown'
-import xml from 'highlight.js/lib/languages/xml'
-import python from 'highlight.js/lib/languages/python'
-import go from 'highlight.js/lib/languages/go'
-import rust from 'highlight.js/lib/languages/rust'
-import java from 'highlight.js/lib/languages/java'
-import kotlin from 'highlight.js/lib/languages/kotlin'
-import swift from 'highlight.js/lib/languages/swift'
-import c from 'highlight.js/lib/languages/c'
-import cpp from 'highlight.js/lib/languages/cpp'
-import csharp from 'highlight.js/lib/languages/csharp'
-import php from 'highlight.js/lib/languages/php'
-import ruby from 'highlight.js/lib/languages/ruby'
-import sql from 'highlight.js/lib/languages/sql'
-import graphql from 'highlight.js/lib/languages/graphql'
-import dockerfile from 'highlight.js/lib/languages/dockerfile'
-import ini from 'highlight.js/lib/languages/ini'
-import diff from 'highlight.js/lib/languages/diff'
-import shell from 'highlight.js/lib/languages/shell'
-import powershell from 'highlight.js/lib/languages/powershell'
+import type { LanguageFn } from 'highlight.js'
 
-hljs.registerLanguage('typescript', typescript)
-hljs.registerLanguage('javascript', javascript)
-hljs.registerLanguage('bash', bash)
-hljs.registerLanguage('shell', shell)
-hljs.registerLanguage('json', json)
-hljs.registerLanguage('yaml', yaml)
-hljs.registerLanguage('css', css)
-hljs.registerLanguage('markdown', markdown)
-hljs.registerLanguage('xml', xml)
-hljs.registerLanguage('python', python)
-hljs.registerLanguage('go', go)
-hljs.registerLanguage('rust', rust)
-hljs.registerLanguage('java', java)
-hljs.registerLanguage('kotlin', kotlin)
-hljs.registerLanguage('swift', swift)
-hljs.registerLanguage('c', c)
-hljs.registerLanguage('cpp', cpp)
-hljs.registerLanguage('csharp', csharp)
-hljs.registerLanguage('php', php)
-hljs.registerLanguage('ruby', ruby)
-hljs.registerLanguage('sql', sql)
-hljs.registerLanguage('graphql', graphql)
-hljs.registerLanguage('dockerfile', dockerfile)
-hljs.registerLanguage('ini', ini)
-hljs.registerLanguage('diff', diff)
-hljs.registerLanguage('powershell', powershell)
+/**
+ * Grammar loaders stay out of the main bundle: each language is a dynamic
+ * import Vite code-splits into its own chunk, fetched the first time a code
+ * block of that language renders. Until a grammar arrives (or when the
+ * language is unknown) `highlight()` falls back to escaped plain text, so
+ * rendering never waits on the network.
+ */
+const LOADERS: Readonly<Record<string, () => Promise<{ default: LanguageFn }>>> = {
+  typescript: () => import('highlight.js/lib/languages/typescript'),
+  javascript: () => import('highlight.js/lib/languages/javascript'),
+  bash: () => import('highlight.js/lib/languages/bash'),
+  shell: () => import('highlight.js/lib/languages/shell'),
+  json: () => import('highlight.js/lib/languages/json'),
+  yaml: () => import('highlight.js/lib/languages/yaml'),
+  css: () => import('highlight.js/lib/languages/css'),
+  markdown: () => import('highlight.js/lib/languages/markdown'),
+  xml: () => import('highlight.js/lib/languages/xml'),
+  python: () => import('highlight.js/lib/languages/python'),
+  go: () => import('highlight.js/lib/languages/go'),
+  rust: () => import('highlight.js/lib/languages/rust'),
+  java: () => import('highlight.js/lib/languages/java'),
+  kotlin: () => import('highlight.js/lib/languages/kotlin'),
+  swift: () => import('highlight.js/lib/languages/swift'),
+  c: () => import('highlight.js/lib/languages/c'),
+  cpp: () => import('highlight.js/lib/languages/cpp'),
+  csharp: () => import('highlight.js/lib/languages/csharp'),
+  php: () => import('highlight.js/lib/languages/php'),
+  ruby: () => import('highlight.js/lib/languages/ruby'),
+  sql: () => import('highlight.js/lib/languages/sql'),
+  graphql: () => import('highlight.js/lib/languages/graphql'),
+  dockerfile: () => import('highlight.js/lib/languages/dockerfile'),
+  ini: () => import('highlight.js/lib/languages/ini'),
+  diff: () => import('highlight.js/lib/languages/diff'),
+  powershell: () => import('highlight.js/lib/languages/powershell'),
+}
+
+const pending = new Map<string, Promise<boolean>>()
+
+/**
+ * Fetch and register one grammar. Resolves `true` once `highlight()` can use
+ * the language, `false` when it is not loadable. Concurrent callers share one
+ * request; a registered language resolves immediately.
+ */
+export function ensureLanguage(language: string): Promise<boolean> {
+  if (hljs.getLanguage(language) !== undefined) return Promise.resolve(true)
+  const load = LOADERS[language]
+  if (load === undefined) return Promise.resolve(false)
+  const inFlight = pending.get(language)
+  if (inFlight !== undefined) return inFlight
+  const registered = load()
+    .then((mod) => {
+      hljs.registerLanguage(language, mod.default)
+      return true
+    })
+    .catch(() => false)
+  pending.set(language, registered)
+  return registered
+}
 
 /** Escape text that survives a language miss; never inject raw HTML. */
 export function escapeHtml(text: string): string {

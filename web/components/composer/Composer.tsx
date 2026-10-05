@@ -96,7 +96,7 @@ export function Composer({
   draft, onDraft, onSend, onStop, onCommand,
   modelValue, thinkingValue = null, modelSettings, onThinking, thinkingMenuLabel, thinkingDisabled = false,
   controlsUnavailable = false, controlsUnavailableMessage, onRetryControls,
-  modes, modeValue, onMode,
+  modes, modeValue, modeMenuLabel, onMode,
   onSearchFiles, onUploadFiles, skills, onRecallLast, autoFocus = false,
 }: {
   readonly workspaceId?: string | null
@@ -128,6 +128,8 @@ export function Composer({
   readonly onRetryControls?: () => void
   readonly modes: readonly { readonly value: string; readonly label: string }[]
   readonly modeValue: string | null
+  /** What the picker edits here: a draft's workspace default or the conversation's own live mode. */
+  readonly modeMenuLabel?: string
   readonly onMode: (value: string) => void
   /** Absent without a project: `@` then has no files to offer. */
   readonly onSearchFiles?: (query: string) => Promise<readonly CompletionItem[]>
@@ -209,12 +211,13 @@ export function Composer({
     })
   }
 
-  // ── Completion (`@` files, `/` skills) ─────────────────────────────────
+  // ── Completion (`@` files, `/` and `$` skills) ──────────────────────────
 
   // A menu with no source stays shut: `@` needs a project. `/` opens for the
   // workspace skill catalog AND for the built-in commands, which are always
-  // there — `/compact` must not depend on the workspace having skills.
-  const available = request === null ? false : request.kind === 'file' ? onSearchFiles !== undefined : true
+  // there — `/compact` must not depend on the workspace having skills. `$` is
+  // the skill-only menu and stays shut without a catalog.
+  const available = request === null ? false : request.kind === 'file' ? onSearchFiles !== undefined : (request.kind === 'skill' || (skills?.length ?? 0) > 0)
   const open = request !== null && available && dismissed !== signature(request)
   const fileSearch = open && request?.kind === 'file' ? onSearchFiles : undefined
   const fileQuery = request?.kind === 'file' ? request.query : null
@@ -246,6 +249,16 @@ export function Composer({
     ).map(skillCompletionItem)
     const commands = rankSkills(BUILTIN_COMMANDS, request.query, MAX_SUGGESTIONS).map(builtinCompletionItem)
     setItems([...commands, ...skillItems].slice(0, MAX_SUGGESTIONS))
+    setActive(0)
+    setSearching(false)
+  }, [open, request?.kind, request?.query, skills])
+
+  // The `$` menu lists the catalog without the built-in commands. A skill whose
+  // name is reserved stays unpickable here too: its chip would send as the
+  // host command, because the wire namespace belongs to the host.
+  useEffect(() => {
+    if (!open || request?.kind !== 'skillDollar') return
+    setItems(rankSkills((skills ?? []).filter((skill) => !isBuiltinCommand(skill.name)), request.query, MAX_SUGGESTIONS).map(skillCompletionItem))
     setActive(0)
     setSearching(false)
   }, [open, request?.kind, request?.query, skills])
@@ -512,12 +525,14 @@ export function Composer({
         // An oversized paste stays inline; the draft itself raises the notice.
         onPasteError={() => {}}
       />
-      {/* One row once the composer itself is wide enough for six controls,
-          two deliberate rows below that. The left cluster keeps its natural
-          width and the right one absorbs the squeeze, so a long model name
-          truncates instead of dropping every chip onto a line of its own. */}
-      <div className="flex flex-col gap-1.5 px-2.5 pb-2.5 @min-[30rem]:flex-row @min-[30rem]:items-center @min-[30rem]:gap-1">
-        <div className="flex min-w-0 flex-none items-center gap-0.5">
+      {/* One row, always. On a phone every chip collapses to its icon and
+          drops to a 36px target ([data-compact-control] exempts them from the
+          44px coarse-pointer floor), so the whole control set — attach, mode,
+          folders, context, model, thinking and the run cluster — shares a
+          single line instead of stacking into two or three. Text survives in
+          tooltips and menu panels; the row scrolls only as a last resort. */}
+      <div className="flex min-w-0 items-center gap-1 overflow-x-auto px-2.5 pb-2.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+        <div className="flex flex-none items-center gap-0.5">
           {onUploadFiles !== undefined || onSearchFiles !== undefined ? (
             <AttachMenu
               uploading={uploading}
@@ -525,7 +540,7 @@ export function Composer({
               onMention={onSearchFiles !== undefined ? mentionFile : undefined}
             />
           ) : null}
-          {modeValue !== null && modes.length > 0 ? <ModeMenu modes={modes} value={modeValue} onChange={onMode} /> : null}
+          {modeValue !== null && modes.length > 0 ? <ModeMenu modes={modes} value={modeValue} {...(modeMenuLabel !== undefined ? { label: modeMenuLabel } : {})} onChange={onMode} /> : null}
           {controlsUnavailable && controlsUnavailableMessage !== undefined ? (
             <ControlsStatus message={controlsUnavailableMessage} onRetry={onRetryControls} />
           ) : null}
@@ -533,7 +548,7 @@ export function Composer({
         {/* The run cluster sits next to Send: the model answers, and the
             thinking level is the model's own control — its levels come from
             that model's capability, so the two belong side by side. */}
-        <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5">
+        <div className="flex min-w-0 flex-1 items-center justify-end gap-1">
           {contextControl}
           {modelControl}
           {modelId !== null && onThinking !== undefined ? (
@@ -565,6 +580,7 @@ export function Composer({
           {running ? (
             <button
               type="button"
+              data-compact-control
               aria-label="Stop work"
               title="Stop"
               onClick={onStop}
@@ -578,6 +594,7 @@ export function Composer({
             // message last. Outlined so Queue stays the default action.
             <button
               type="button"
+              data-compact-control
               aria-label="Steer — stop the current turn and send now"
               title="Steer — stop the current turn and send now (Ctrl/⌘+Enter)"
               disabled={!eligible || sending}
@@ -585,7 +602,7 @@ export function Composer({
               className="flex min-h-9 shrink-0 items-center justify-center gap-1.5 rounded-full border border-line-strong px-3 text-fg hover:bg-hover disabled:opacity-30"
             >
               <Icon name="zap" size={15} strokeWidth={2.2} />
-              <span className="text-[13px] font-medium">Steer</span>
+              <span className="text-[13px] font-medium @max-[30rem]:hidden">Steer</span>
             </button>
           ) : null}
           {!running || !empty ? (
@@ -593,6 +610,7 @@ export function Composer({
             // it says so: an identical arrow would read as "sent now".
             <button
               type="submit"
+              data-compact-control
               aria-label={running ? 'Queue message' : 'Send'}
               title={running ? 'Queue — runs after the current turn (Enter)' : 'Send (Enter) · Shift+Enter for a new line'}
               disabled={!eligible || sending}
@@ -602,7 +620,7 @@ export function Composer({
               )}
             >
               {sending ? <Spinner size={14} className="border-primary-fg/40 border-t-primary-fg" /> : <Icon name={running ? 'clock' : 'arrowUp'} size={running ? 15 : 18} strokeWidth={2.2} />}
-              {running ? <span className="text-[13px] font-medium">Queue</span> : null}
+              {running ? <span className="text-[13px] font-medium @max-[30rem]:hidden">Queue</span> : null}
             </button>
           ) : null}
         </div>

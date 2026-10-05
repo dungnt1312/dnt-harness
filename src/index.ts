@@ -33,6 +33,8 @@ export {
 export type { Branded, SessionId, StepId, TurnId, ExecutionId, InputId, WorkspaceId, ProjectId } from './util/brand.ts'
 export { newSessionId, newStepId, newTurnId, newExecutionId, newInputId, newWorkspaceId, newProjectId } from './util/brand.ts'
 
+export { AttemptAdmission, LogicalRequest, classifyTransport, runAttempt, type AttemptTicket, type PhysicalAdmission, type RequestPolicy, type AttemptFact, type AttemptObserver } from './harness/llm/request-lifecycle.ts'
+
 // ── Harness: limits ──────────────────────────────────────────────────────
 export { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from './harness/limits.ts'
 
@@ -73,6 +75,11 @@ export {
 // ── Harness: LLM seam ────────────────────────────────────────────────────
 export type {
   ContentPart,
+  ModelFinishReason,
+  ModelCompletion,
+  CompletionPolicy,
+  ProviderErrorReason,
+  ProviderErrorPhase,
   LlmProvider,
   ModelMessage,
   ModelRequest,
@@ -82,6 +89,7 @@ export type {
   ToolSchema,
 } from './harness/llm/types.ts'
 export { messageText, ProviderError } from './harness/llm/types.ts'
+export { WIRE_LIMITS, encodedBytes, normalizeFinishReason, validateCompletion, validateToolBatch, withLegacyCompletion, readBoundedError, readSse } from './harness/llm/completion.ts'
 export {
   AttachmentError,
   AttachmentStore,
@@ -149,6 +157,8 @@ export {
   DEFAULT_BASE_SYSTEM,
   DEFAULT_CHILD_SYSTEM,
   ContextBudgetError,
+  CLEARED_TOOL_RESULT,
+  MICROCOMPACT_KEEP_RECENT,
   type ActiveSkill,
   type AssembledContext,
   type BuildContextInput,
@@ -191,9 +201,6 @@ export {
   ChildExecutor,
   SpawnError,
   normalizeBrief,
-  MAX_ACTIVE_PER_ROOT,
-  MAX_ACTIVE_GLOBAL,
-  MAX_CHILDREN_PER_TURN,
   MAX_REPORT_CHARS,
   type TaskPacket,
   type SpawnRequest,
@@ -221,7 +228,7 @@ export {
 
 // ── Harness: tool pipeline ───────────────────────────────────────────────
 export type { ApprovedPath, GrantedRoot, PathIntent, PreExecuteDecision, ToolDefinition, ToolExecution, ToolResult } from './harness/tools/types.ts'
-export { ToolsService, type RootResolver } from './harness/tools/service.ts'
+export { ToolsService, type AuthorityRetirer, type RootResolver } from './harness/tools/service.ts'
 export {
   CANONICAL_TOOLS,
   canonicalCall,
@@ -231,8 +238,9 @@ export {
 } from './harness/tools/names.ts'
 
 // ── Harness: approval ────────────────────────────────────────────────────
-export type { ApprovalHandle, ApprovalMode, ApprovalOptions, PolicySource } from './harness/approval/policy.ts'
-export { attachApproval } from './harness/approval/policy.ts'
+export type { ApprovalHandle, ApprovalMode, ApprovalOptions, ApprovalReceipt, ApprovalReceiptRegistry, ApprovalScope, PolicySource } from './harness/approval/policy.ts'
+export { approvalCallFingerprint, attachApproval, createApprovalReceiptRegistry } from './harness/approval/policy.ts'
+export type { AskRequirement, AuthorityDecision } from './harness/tools/authority.ts'
 
 // ── Capabilities: filesystem + shell ─────────────────────────────────────
 export { fsTools, resolveGrantedPath, resolveWithin } from './capabilities/fs/tools.ts'

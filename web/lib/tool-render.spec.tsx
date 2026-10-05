@@ -282,7 +282,7 @@ describe('what an opened row shows', () => {
     expect(host.textContent).toContain('No output.')
   })
   /** Each diff row as `old|new|text`, the way the Git panel's gutters read it. */
-  const diffRows = () => [...host.querySelectorAll('[role="region"][aria-label^="Diff of"] [data-kind]')].map((line) => {
+  const diffRows = () => [...host.querySelectorAll('[role="group"][aria-label^="Diff of"] [data-kind]')].map((line) => {
     const [oldNo, newNo] = [...line.querySelectorAll('span[aria-hidden="true"]')].map((gutter) => gutter.textContent)
     return `${oldNo}|${newNo}|${line.lastChild?.textContent ?? ''}`
   })
@@ -296,7 +296,7 @@ describe('what an opened row shows', () => {
     expect(lines[1]!.className).toContain('bg-bad-soft text-bad')
     expect(lines[2]!.className).toContain('bg-ok-soft text-ok')
     // Same frame as the Git panel; nothing on top of the lines.
-    const frame = host.querySelector('[role="region"][aria-label^="Diff of"]')!
+    const frame = host.querySelector('[role="group"][aria-label^="Diff of"]')!
     expect(frame.className).toContain('border-y')
     expect(frame.className).toContain('bg-muted/40')
     expect(frame.textContent).not.toContain('web/lib/format.ts')

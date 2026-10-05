@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import Icon from '../common/Icon.tsx'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
+import { MediaPreview } from '../common/MediaPreview.tsx'
 import { DiffLines, diffRowsFromEdit, diffRowsFromWrite, diffRowsFromUnified } from '../common/DiffLines.tsx'
 import { cn } from '../../lib/cn.ts'
 import type { GitStatusReport, GitDiffReport } from '../../lib/api.ts'
@@ -256,8 +257,9 @@ function TurnFileDiff({ project, workspaceId, relative, file }: {
     if (diff === null) {
       return <p className="m-0 px-1 py-1 text-[12px] text-fg-muted" role="status">Loading diff…</p>
     }
+    // A binary the browser can render shows the media itself; the rest say so.
     if (diff.binary) {
-      return <p className="m-0 px-1 py-1 text-[12px] text-fg-muted" role="note">Binary file — diff not shown.</p>
+      return <MediaPreview workspaceId={workspaceId} projectId={project.id} path={relative} />
     }
     if (diff.lines.length === 0) {
       return <p className="m-0 px-1 py-1 text-[12px] text-fg-faint" role="note">No textual diff right now — a later turn may have changed this file back.</p>

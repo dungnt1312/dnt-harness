@@ -7,7 +7,7 @@ import { useRestoreFocus } from '../../hooks/useRestoreFocus.ts'
 export function Sheet({ open, onOpenChange, side, label, className, children }: {
   readonly open: boolean
   readonly onOpenChange: (open: boolean) => void
-  readonly side: 'left' | 'right'
+  readonly side: 'left' | 'right' | 'bottom'
   readonly label: string
   readonly className?: string
   readonly children: ReactNode
@@ -22,8 +22,18 @@ export function Sheet({ open, onOpenChange, side, label, className, children }: 
           aria-describedby={undefined}
           onCloseAutoFocus={restoreFocus}
           className={cn(
-            'fixed inset-y-0 z-40 flex h-dvh flex-col overflow-hidden text-fg shadow-pop outline-none',
-            side === 'left' ? 'left-0 w-[min(300px,calc(100vw-48px))] bg-sidebar' : 'right-0 w-[min(440px,100vw)] border-l border-line bg-bg',
+            'fixed z-40 flex flex-col overflow-hidden text-fg shadow-pop outline-none',
+            // Safe-area padding: the drawer is fixed to the viewport, so unlike
+            // the padded shell it must keep its own edges off the notch and
+            // home indicator in the standalone PWA.
+            side === 'bottom'
+              ? 'inset-x-0 bottom-0 max-h-[min(70dvh,520px)] rounded-t-2xl border-t border-line bg-surface pb-[env(safe-area-inset-bottom)]'
+              : cn(
+                  'inset-y-0 h-dvh pt-[env(safe-area-inset-top)]',
+                  side === 'left'
+                    ? 'left-0 w-[min(300px,calc(100vw-48px))] bg-sidebar pl-[env(safe-area-inset-left)] pb-[env(safe-area-inset-bottom)]'
+                    : 'right-0 w-[min(440px,100vw)] border-l border-line bg-bg pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)]',
+                ),
             className,
           )}
         >

@@ -32,7 +32,9 @@ export interface PendingInput {
   readonly attachments?: readonly AttachmentRef[]
 }
 
-/** Options for the sessions service. */
+/**
+ * Options for the sessions service.
+ */
 export interface SessionsServiceOptions {
   /**
    * A fixed store for every session (unit tests). Omitted with `home`
@@ -47,11 +49,19 @@ export interface SessionsServiceOptions {
   readonly home?: string
   /** Injectable clock for deterministic tests. */
   readonly now?: () => number
+  /**
+   * Session construction passes `relaxedStreamingAppends` to its store:
+   * streaming chunks defer their fsync to the next `durable()` barrier.
+   * `undefined` resolves per-record strictness (tests, explicit opt-out).
+   */
+  readonly relaxedStreamingAppends?: boolean
 }
 
 /**
  * Mount the file-backed sessions service on a data home. Workspace layout:
  * one directory per workspace, the G1 store contract inside each.
+ * `relaxedStreamingAppends` defers each streaming chunk's fsync to the next
+ * durability barrier; see {@link FileSessionStore.checkpoint}.
  */
 export function fileSessions(home: string, options: Omit<SessionsServiceOptions, 'store' | 'home'> = {}):
   (ctx: Context) => void {
@@ -87,12 +97,14 @@ export class SessionsService extends Service {
   private readonly fixedStore: SessionStore | undefined
   private readonly home: string | undefined
   private readonly now: () => number
+  private readonly relaxedStreamingAppends: boolean | undefined
 
   constructor(ctx: Context, name = 'sessions', options: SessionsServiceOptions = {}) {
     super(ctx, name)
     this.fixedStore = options.store
     this.home = options.home
     this.now = options.now ?? Date.now
+    this.relaxedStreamingAppends = options.relaxedStreamingAppends
     ctx.effect(() => () => this.closeStores(), 'sessions.close-stores')
   }
 
@@ -125,6 +137,7 @@ export class SessionsService extends Service {
       id: newSessionId(),
       ...(store !== undefined ? { store } : {}),
       now: this.now,
+      ...(this.relaxedStreamingAppends !== undefined ? { relaxedStreamingAppends: this.relaxedStreamingAppends } : {}),
     })
     this.loaded.set(session.id, session)
     if (workspaceId !== undefined) this.ownership.set(session.id, workspaceId)
@@ -216,6 +229,7 @@ export class SessionsService extends Service {
         id,
         store,
         now: this.now,
+        ...(this.relaxedStreamingAppends !== undefined ? { relaxedStreamingAppends: this.relaxedStreamingAppends } : {}),
       })
       session.setDurableListener((lastSeq) => this.scheduleSummary(session, lastSeq))
       // Seed the log without re-broadcasting or rewriting history: recovery
@@ -398,6 +412,10 @@ export class SessionsService extends Service {
       `${turnId ?? ''}\u0000${stepId}\u0000${callId}`
     for (const event of session.events) {
       switch (event.type) {
+        case 'model/attempt':
+        case 'execution/uncertain':
+        case 'execution/reconciled':
+          break // A restart is not proof of provider transport settlement.
         case 'turn/start':
           currentTurn = event.turnId
           openTurns.add(event.turnId)
@@ -533,6 +551,9 @@ export class SessionsService extends Service {
     if (this.deleting.has(session.id)) return
     const store = this.storeFor(this.ownership.get(session.id))
     if (store === undefined) return
+    // Relaxed chunk appends sync here: the summary must never describe a
+    // prefix whose bytes are not yet durable on disk.
+    await store.checkpoint?.(session.id)
     const targetSeq = durableSeq ?? session.events.length
     // Summary must never claim records that have not passed a durability
     // barrier. Slice to the captured canonical prefix if later appends exist.

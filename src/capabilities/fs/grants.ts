@@ -147,6 +147,16 @@ export function grantedRoots(exec: Pick<ToolExecution, 'root' | 'additionalRoots
   return [{ path: path.resolve(exec.root), access: 'write' }, ...(exec.additionalRoots ?? [])]
 }
 
+/** The longest additional root containing an absolute path. */
+export function classifyGrantedRoots(roots: readonly GrantedRoot[], abs: string): GrantedRoot | undefined {
+  let match: GrantedRoot | undefined
+  for (const root of roots) {
+    if (!within(root.path, abs)) continue
+    if (match === undefined || root.path.length > match.path.length) match = root
+  }
+  return match
+}
+
 /**
  * Classify `target` against the run's grants without touching the
  * filesystem. The longest containing root wins, so a read-only folder nested
@@ -161,11 +171,7 @@ export function classifyTarget(
   const blocked = blockedReason(target, abs)
   if (blocked !== undefined) return { kind: 'blocked', abs, reason: blocked }
   if (exec.deniedRoots?.some((denied) => within(denied, abs)) === true) return { kind: 'denied', abs }
-  let match: GrantedRoot | undefined
-  for (const root of grantedRoots(exec)) {
-    if (!within(root.path, abs)) continue
-    if (match === undefined || root.path.length > match.path.length) match = root
-  }
+  const match = classifyGrantedRoots(grantedRoots(exec), abs)
   if (match === undefined) return { kind: 'out-of-grant', abs }
   if (intent === 'write' && match.access === 'read') return { kind: 'read-only', abs, root: match }
   return { kind: 'in-grant', abs, root: match }

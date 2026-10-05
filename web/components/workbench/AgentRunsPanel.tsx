@@ -4,6 +4,7 @@ import Icon from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { cancelChild, listChildren, reconcileChild } from '../../lib/api.ts'
 import { formatAge } from '../../lib/format.ts'
+import { agentRoleIcon, AGENT_ROLE_TONE } from '../../lib/agent-icons.ts'
 import { cn } from '../../lib/cn.ts'
 import type { ChildRow } from '../../lib/types.ts'
 
@@ -43,6 +44,14 @@ function firstLine(text: string | undefined): string {
 export function AgentRunsPanel(props: AgentRunsPanelProps) {
   // Scope changes remount before paint: no conversation A row can reach B.
   return <AgentRunsPanelContent key={JSON.stringify([props.workspaceId, props.rootSessionId])} {...props} />
+}
+
+/** How a settled row's pill reads: a verdict, a stop, or someone else's call. */
+const STATUS_TONE: Readonly<Partial<Record<ChildRow['status'], string>>> = {
+  failed: 'bg-bad-soft text-bad',
+  cancelled: 'bg-muted text-fg-muted',
+  interrupted: 'bg-warn-soft text-warn',
+  uncertain: 'bg-warn-soft text-warn',
 }
 
 function AgentRunsPanelContent({ workspaceId, rootSessionId, briefs, refreshSignal, onOpenChild }: AgentRunsPanelProps) {
@@ -99,39 +108,52 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, briefs, refreshSign
     const preview = child.status === 'queued' ? 'Waiting for a host slot'
       : child.status === 'dispatching' ? 'Starting agent'
       : child.status === 'running' ? (child.awaitingApproval === true ? 'Waiting for your approval' : '')
-      : child.error !== undefined && child.result === undefined ? firstLine(child.error) : firstLine(child.result?.report)
+      : child.error !== undefined && child.result === undefined
+        ? (child.partial !== undefined && child.partial.report !== ''
+            ? `${firstLine(child.error)} · it had said: ${firstLine(child.partial.report)}`
+            : firstLine(child.error))
+        : firstLine(child.result?.report)
     const bad = child.status === 'failed' || (child.error !== undefined && child.result === undefined && !active.includes(child))
     const time = formatAge(child.endedAt ?? child.startedAt)
+    const icon = agentRoleIcon(child.definitionName)
+    const pill = STATUS_TONE[child.status]
     return (
-      <li key={child.childSessionId} className="group relative">
+      <li key={child.childSessionId} className="group flex items-center gap-1">
         <button
           type="button"
           disabled={onOpenChild === undefined}
           onClick={() => onOpenChild?.(child.childSessionId)}
           title={brief ?? child.definitionName}
-          className="flex w-full items-start gap-3 rounded-lg px-2 py-2.5 text-left transition-colors enabled:hover:bg-hover"
+          className="flex min-w-0 flex-1 items-start gap-2.5 rounded-lg px-2 py-2.5 text-left transition-colors enabled:hover:bg-hover"
         >
-          <span className="mt-0.5 flex size-4 shrink-0 items-center justify-center text-fg-faint">
-            {active.includes(child)
-              ? <Spinner size={13} />
-              : <Icon name={bad ? 'alertTriangle' : 'check'} size={14} className={bad ? 'text-bad' : undefined} />}
+          {/* The role is the row's face; the spinner only overrides it while it runs. */}
+          <span className={cn('mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-md bg-muted', AGENT_ROLE_TONE[icon])}>
+            {active.includes(child) ? <Spinner size={13} /> : <Icon name={icon} size={14} />}
           </span>
           <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-            <span className="flex min-w-0 items-baseline gap-2">
+            <span className="flex min-w-0 items-center gap-2">
               <span className="truncate text-sm font-semibold text-fg">{title}</span>
-              <span className={cn('shrink-0 text-xs', bad ? 'text-bad' : 'text-fg-faint')}>{STATUS_LABEL[child.status]}</span>
+              <span className="ml-auto flex shrink-0 items-center gap-2">
+                <span className={cn('text-xs', bad ? 'text-bad' : 'text-fg-faint')}>{time}</span>
+                <span className={cn(
+                  'flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-medium leading-4',
+                  pill ?? 'bg-ok-soft text-ok',
+                )}>
+                  {active.includes(child) ? <span className="size-1.5 animate-dot rounded-full bg-current" /> : null}
+                  {STATUS_LABEL[child.status]}
+                </span>
+              </span>
             </span>
-            {preview !== '' ? <span className={cn('truncate text-[13px]', child.awaitingApproval === true ? 'text-warn' : 'text-fg-muted')}>{preview}</span> : null}
             <span className="truncate font-mono text-[11px] text-fg-faint">{child.definitionName}{child.model !== undefined ? ` · ${child.model}` : ''}</span>
+            {preview !== '' ? <span className={cn('truncate text-[13px]', child.awaitingApproval === true ? 'text-warn' : 'text-fg-muted')}>{preview}</span> : null}
           </span>
-          <span className="shrink-0 pt-0.5 text-xs text-fg-faint">{time}</span>
         </button>
         {child.status === 'queued' || child.status === 'dispatching' || child.status === 'running' ? (
           <button
             type="button"
             disabled={busy !== null}
             onClick={() => void act(child.childSessionId, () => cancelChild(workspaceId, rootSessionId, child.childSessionId))}
-            className="absolute right-2 bottom-2 rounded-md px-2 py-0.5 text-xs text-fg-muted opacity-0 transition-opacity hover:bg-hover hover:text-bad focus-visible:opacity-100 group-hover:opacity-100"
+            className="mr-1 shrink-0 rounded-md border border-line bg-surface px-2 py-1 text-xs text-fg-muted opacity-0 transition-opacity hover:text-bad focus-visible:opacity-100 group-hover:opacity-100 [@media(pointer:coarse)]:opacity-100"
           >
             {busy === child.childSessionId ? 'Stopping…' : 'Stop'}
           </button>
@@ -141,7 +163,7 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, briefs, refreshSign
             type="button"
             disabled={busy !== null}
             onClick={() => void act(child.childSessionId, () => reconcileChild(workspaceId, rootSessionId, child.childSessionId))}
-            className="absolute right-2 bottom-2 rounded-md px-2 py-0.5 text-xs text-fg-muted hover:bg-hover hover:text-fg"
+            className="shrink-0 rounded-md border border-line bg-surface px-2 py-1 text-xs text-fg-muted opacity-0 transition-opacity hover:text-fg focus-visible:opacity-100 group-hover:opacity-100 [@media(pointer:coarse)]:opacity-100"
           >
             {busy === child.childSessionId ? 'Settling…' : 'Retry settlement'}
           </button>
@@ -153,7 +175,7 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, briefs, refreshSign
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
       <section aria-label="Active subagents" className="flex flex-col px-3 pt-4">
-        <h3 className="m-0 px-2 pb-1 text-xs font-medium text-fg-faint">Active · {active.length}/6</h3>
+        <h3 className="m-0 px-2 pb-1 text-xs font-medium text-fg-faint">Active · {active.length}</h3>
         {active.length === 0
           ? <p className="m-0 px-2 py-2 text-[13px] text-fg-faint">No active subagents</p>
           : <ul className="m-0 flex list-none flex-col p-0">{active.map(row)}</ul>}

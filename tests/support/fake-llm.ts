@@ -34,6 +34,7 @@ export class FakeScriptedLlm implements LlmProvider {
     const reply = typeof step === 'string' ? step : (step.content ?? '')
     if (!isToolStep(step)) {
       yield* words(reply)
+      yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       return
     }
     if (step.thinking !== undefined && step.thinking !== '') {
@@ -48,6 +49,7 @@ export class FakeScriptedLlm implements LlmProvider {
       }))
       yield { type: 'toolCalls', calls }
     }
+    yield { type: 'completion', finishReason: step.toolCalls?.length ? 'tool_calls' : 'stop', transport: 'done', policy: 'strict', transportSettled: true }
   }
 }
 

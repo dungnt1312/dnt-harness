@@ -79,12 +79,13 @@ export function SessionFoldersChip({ workspaceId, sessionId, revision }: {
         panelRole="dialog"
         side="top"
         align="end"
+        compact
         triggerClassName={cn(
-          'flex h-8 shrink-0 items-center gap-1 rounded-full px-2 text-xs text-fg-muted transition-colors hover:bg-hover [@media(pointer:coarse)]:h-11',
+          'flex h-8 shrink-0 items-center gap-1 rounded-full px-2 text-xs text-fg-muted transition-colors hover:bg-hover [@media(pointer:coarse)]:h-9',
           count > 0 && 'text-fg',
         )}
         panelClassName="w-80 p-4"
-        trigger={() => <><Icon name="folder" size={15} />{count > 0 ? <span className="font-mono">+{count}</span> : null}</>}
+        trigger={() => <><Icon name="folder" size={15} />{count > 0 ? <span className="font-mono @max-[30rem]:hidden">+{count}</span> : null}</>}
       >
         {() => (
           <div className="flex flex-col gap-3 text-sm">

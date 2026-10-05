@@ -43,6 +43,8 @@ import {
   OwnershipError,
 } from '../index.ts'
 import { DEFAULT_LIMITS } from '../harness/limits.ts'
+import { createProcessSessionEventBridge } from '../harness/processes/session-event-bridge.ts'
+import { runCleanup, boundedCleanup } from '../harness/processes/shutdown.ts'
 import { ProcessRegistry } from '../harness/processes/registry.ts'
 import { todoWriteTool } from '../harness/tools/todo.ts'
 
@@ -73,6 +75,14 @@ function parseArgs(argv: readonly string[]): CliOptions {
 /** Render one session's durable stream to stdout as events arrive. */
 function render(event: SessionEvent): void {
   switch (event.type) {
+    case 'model/attempt':
+      break
+    case 'execution/uncertain':
+      process.stdout.write(`[provider ownership unresolved] attempt ${event.fact.attempt}; replacement execution fenced\n`)
+      break
+    case 'execution/reconciled':
+      process.stdout.write(`[provider locally settled] attempt ${event.fact.attempt}; ownership released\n`)
+      break
     case 'assistant/chunk':
       process.stdout.write(event.delta)
       break
@@ -156,7 +166,10 @@ async function main(): Promise<void> {
   for (const tool of fsTools()) {
     kernel.ctx.tools.register(tool)
   }
-  const processes = new ProcessRegistry({})
+  const processEvents = createProcessSessionEventBridge(kernel.ctx.sessions)
+  const processes = new ProcessRegistry(processEvents)
+  kernel.ctx.provide('processes', processes)
+  kernel.ctx.provide('process-events', processEvents)
   kernel.ctx.tools.register(bashTool({ timeoutMs: DEFAULT_LIMITS.toolTimeoutMs, processes }))
   kernel.ctx.tools.register(bashOutputTool({ processes }))
   kernel.ctx.tools.register(killShellTool({ processes }))
@@ -202,8 +215,16 @@ async function main(): Promise<void> {
       rl.close()
     }
   } finally {
-    await kernel.stop()
-    await ownerLock.release()
+    processes.closeAdmission()
+    const agentDrivers = kernel.ctx.agents
+    let teardownSafe = true
+    await runCleanup([
+      () => agentDrivers.stopAll(),
+      () => processes.disposeAll(),
+      async () => { try { await boundedCleanup(() => processEvents.flushAll()) } catch (error) { teardownSafe = false; throw error } },
+      async () => { try { await boundedCleanup(() => kernel.stop()) } catch (error) { teardownSafe = false; throw error } },
+      () => { if (!teardownSafe || !agentDrivers.persistenceSafe) throw new Error('ownership retained: canonical writers unresolved'); return ownerLock.release() },
+    ])
   }
 }
 

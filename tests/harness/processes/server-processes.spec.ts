@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { createWebServer, type LlmProvider, type WebEnvelope, type WebServer } from 'dnt-harness'
-import { FakeScriptedLlm } from '../../web/fake-llm.ts'
+import { FakeScriptedLlm } from '../../support/fake-llm.ts'
 
 let root = ''
 let server: WebServer
@@ -183,6 +183,12 @@ describe('background process routes', () => {
     try {
       const rows = (await (await fetch(`${baseUrl}/api/workspaces/${ws}/sessions/${sessionId}/processes`)).json()) as { id: string }[]
       expect(rows).toHaveLength(1)
+      // turn/end is emitted before the driver's final idle transition.
+      // Await the runner, not merely the SSE record, before testing idle deletion.
+      const driver = server.kernel.ctx.agents.create(await server.kernel.ctx.sessions.load(sessionId as never))
+      const deadline = Date.now() + 5000
+      while (driver.busy && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
+      expect(driver.busy).toBe(false)
       const del = await fetch(`${baseUrl}/api/workspaces/${ws}/sessions/${sessionId}`, { method: 'DELETE' })
       expect(del.status).toBe(200)
       expect((await del.json()).deleted).toBe(true)

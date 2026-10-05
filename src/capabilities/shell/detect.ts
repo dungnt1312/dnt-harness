@@ -32,7 +32,7 @@ export interface ShellOption {
 }
 
 /** The shells this host knows how to launch. */
-export type ShellId = 'bash' | 'powershell' | 'cmd'
+export type ShellId = 'zsh' | 'bash' | 'powershell' | 'cmd'
 
 /** Locate a real bash. Checked in order: explicit option, env, known paths. */
 export function detectShell(explicit?: string): ShellDetection {
@@ -88,6 +88,23 @@ export function detectShell(explicit?: string): ShellDetection {
 }
 
 /**
+ * Locate the macOS zsh — the platform's default login shell, so a web
+ * terminal should lead with it there. Checked in order: the account's login
+ * shell from `dscl` when it is a zsh (respects `chsh`, and picks up a
+ * Homebrew zsh's exact path), then the well-known path, then `zsh` on PATH.
+ */
+function detectZsh(): ShellDetection {
+  const lookup = spawnSync('dscl', ['.', '-read', `/Users/${process.env['USER'] ?? ''}`, 'UserShell'], { encoding: 'utf8' })
+  if (lookup.status === 0) {
+    const match = /UserShell:\s*(\S+)/.exec(lookup.stdout)
+    const login = match?.[1]
+    if (login !== undefined && login.endsWith('/zsh') && existsSync(login)) return { executable: login, hint: login }
+  }
+  if (existsSync('/bin/zsh')) return { executable: '/bin/zsh', hint: '/bin/zsh' }
+  return { executable: 'zsh', hint: 'zsh on PATH' }
+}
+
+/**
  * The shells that exist on this host, for a terminal client's picker.
  *
  * Only resolvable shells are listed: a picker that offers `powershell` on
@@ -107,11 +124,23 @@ let catalogCache: ShellOption[] | undefined
 
 function buildShellCatalog(): ShellOption[] {
   const options: ShellOption[] = []
+  // The user's login shell leads the picker: a web terminal that opens
+  // something other than what Terminal.app opens answers a question the user
+  // did not ask. The Bash tool keeps its own bash resolution.
+  if (process.platform === 'darwin') {
+    const zsh = detectZsh()
+    if (zsh.executable !== undefined) {
+      options.push({ id: 'zsh', label: 'zsh', executable: zsh.executable, args: ['-i'] })
+    }
+  }
   const bash = detectShell()
   if (bash.executable !== undefined) {
     // `-i` gives the interactive prompt and job control a PTY user expects;
     // the Bash tool's `-lc` form is for one captured command, not a session.
-    options.push({ id: 'bash', label: 'Git Bash', executable: bash.executable, args: ['-i'] })
+    // "Git Bash" is the Windows distribution; POSIX machines run system bash
+    // (or whatever DNT_HARNESS_BASH pins), so the label says only Bash.
+    const label = process.platform === 'win32' ? 'Git Bash' : 'Bash'
+    options.push({ id: 'bash', label, executable: bash.executable, args: ['-i'] })
   }
   if (process.platform === 'win32') {
     const system = process.env['SystemRoot'] ?? 'C:\\Windows'

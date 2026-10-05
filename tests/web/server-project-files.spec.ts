@@ -36,6 +36,10 @@ beforeAll(async () => {
   await fs.writeFile(path.join(project, 'README.md'), '# Title\n', 'utf8')
   await fs.writeFile(path.join(project, 'src', 'index.ts'), 'export const answer = 42\n', 'utf8')
   await fs.writeFile(path.join(project, 'logo.bin'), Buffer.from([0x89, 0x50, 0x00, 0x47]))
+  await fs.writeFile(path.join(project, 'shot.png'), Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('fakepngbody')]))
+  await fs.writeFile(path.join(project, 'fakeshot.png'), Buffer.from('this is not really a png at all'))
+  await fs.writeFile(path.join(project, 'tone.mp3'), Buffer.from([0x49, 0x44, 0x33, 0x03, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04]))
+  await fs.writeFile(path.join(project, 'clip.mp4'), Buffer.concat([Buffer.from([0x00, 0x00, 0x00, 0x18]), Buffer.from('ftypmp42'), Buffer.from('0'.repeat(400))]))
   await fs.writeFile(path.join(project, 'big.txt'), 'x'.repeat(1024 * 1024 + 10), 'utf8')
   await fs.writeFile(path.join(outside, 'secret.txt'), 'outside', 'utf8')
 
@@ -86,6 +90,7 @@ afterAll(async () => {
 
 const files = (query: string) => fetch(`${server.url}/api/workspaces/${wsId}/projects/${projectId}/files?path=${encodeURIComponent(query)}`)
 const file = (query: string) => fetch(`${server.url}/api/workspaces/${wsId}/projects/${projectId}/file?path=${encodeURIComponent(query)}`)
+const media = (query: string, init?: RequestInit) => fetch(`${server.url}/api/workspaces/${wsId}/projects/${projectId}/media?path=${encodeURIComponent(query)}`, init)
 const search = (query: string, limit?: number) =>
   fetch(`${server.url}/api/workspaces/${wsId}/projects/${searchProjectId}/search?q=${encodeURIComponent(query)}${limit !== undefined ? `&limit=${limit}` : ''}`)
 const searched = async (query: string, limit?: number): Promise<string[]> =>
@@ -97,7 +102,7 @@ describe('project file browsing', () => {
     expect(response.status).toBe(200)
     const listing = (await response.json()) as { path: string; entries: { name: string; path: string; kind: string; size?: number }[] }
     expect(listing.path).toBe('')
-    expect(listing.entries.map((entry) => `${entry.kind}:${entry.path}`)).toEqual(['dir:src', 'file:big.txt', 'file:logo.bin', 'file:README.md'])
+    expect(listing.entries.map((entry) => `${entry.kind}:${entry.path}`)).toEqual(['dir:src', 'file:big.txt', 'file:clip.mp4', 'file:fakeshot.png', 'file:logo.bin', 'file:README.md', 'file:shot.png', 'file:tone.mp3'])
     expect(listing.entries.find((entry) => entry.name === 'README.md')?.size).toBe(8)
   })
 
@@ -132,6 +137,49 @@ describe('project file browsing', () => {
   it('fails closed for unknown projects and rejects writes', async () => {
     expect((await fetch(`${server.url}/api/workspaces/${wsId}/projects/nope/files`)).status).toBe(404)
     expect((await fetch(`${server.url}/api/workspaces/${wsId}/projects/${projectId}/file?path=README.md`, { method: 'PUT', body: 'x' })).status).toBe(405)
+  })
+})
+
+describe('project media streaming', () => {
+  it('serves an image with the sniffed type and refuses traversal and misses', async () => {
+    const shot = await media('shot.png')
+    expect(shot.status).toBe(200)
+    expect(shot.headers.get('content-type')).toBe('image/png')
+    expect(shot.headers.get('accept-ranges')).toBe('bytes')
+    const bytes = Buffer.from(await shot.arrayBuffer())
+    expect(bytes.subarray(0, 4).toString('latin1')).toBe('\x89PNG')
+    expect((await media('../secret.txt')).status).toBe(400)
+    expect((await media('README.md')).status).toBe(404)
+    expect((await media('missing.png')).status).toBe(404)
+  })
+
+  it('does not trust an image extension: bytes must match', async () => {
+    expect((await media('fakeshot.png')).status).toBe(404)
+  })
+
+  it('serves audio and video by extension', async () => {
+    const tone = await media('tone.mp3')
+    expect(tone.status).toBe(200)
+    expect(tone.headers.get('content-type')).toBe('audio/mpeg')
+    const clip = await media('clip.mp4')
+    expect(clip.status).toBe(200)
+    expect(clip.headers.get('content-type')).toBe('video/mp4')
+  })
+
+  it('answers a byte range for seeking and honours HEAD', async () => {
+    const ranged = await media('clip.mp4', { headers: { range: 'bytes=4-11' } })
+    expect(ranged.status).toBe(206)
+    expect(ranged.headers.get('content-range')).toBe('bytes 4-11/412')
+    expect(ranged.headers.get('content-length')).toBe('8')
+    expect(Buffer.from(await ranged.arrayBuffer()).toString('latin1')).toBe('ftypmp42')
+    const head = await fetch(`${server.url}/api/workspaces/${wsId}/projects/${projectId}/media?path=${encodeURIComponent('clip.mp4')}`, { method: 'HEAD' })
+    expect(head.status).toBe(200)
+    expect(head.headers.get('content-length')).toBe('412')
+    expect((await media('clip.mp4', { headers: { range: 'bytes=99999-' } })).status).toBe(416)
+  })
+
+  it('rejects writes', async () => {
+    expect((await media('shot.png', { method: 'POST' })).status).toBe(405)
   })
 })
 

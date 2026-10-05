@@ -69,7 +69,12 @@ export interface ToolExecution {
   readonly signal?: AbortSignal
   /** Model-visible output cap for one tool result (from the harness limits). */
   readonly outputLimit?: number
+  readonly turnId?: string
+  readonly subagentBackgroundBashMaxMs?: number
   readonly sessionId?: SessionId
+  /** Explicit host authority scope; absent for compatible standalone callers. */
+  readonly rootSessionId?: SessionId
+  readonly workspaceId?: string
   /** Host-owned transient file observations, scoped by session. */
   readonly observations?: FileObservations
   /**

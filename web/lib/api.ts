@@ -343,6 +343,25 @@ export function readProjectFile(workspaceId: string, projectId: string, path: st
   return apiFetch(`${projectBase(workspaceId, projectId)}/file?path=${encodeURIComponent(path)}`).then((r) => json<ProjectFileView>(r))
 }
 
+/** The URL that streams one project file as image/audio/video media. */
+export function projectMediaUrl(workspaceId: string, projectId: string, path: string): string {
+  return `${projectBase(workspaceId, projectId)}/media?path=${encodeURIComponent(path)}`
+}
+
+/** Media kinds the browser renders itself, decided by the file name alone. */
+export type MediaKind = 'image' | 'audio' | 'video'
+
+const MEDIA_BY_EXTENSION: Readonly<Record<string, MediaKind>> = {
+  png: 'image', jpg: 'image', jpeg: 'image', gif: 'image', webp: 'image', bmp: 'image', avif: 'image', heic: 'image', svg: 'image',
+  mp3: 'audio', wav: 'audio', ogg: 'audio', oga: 'audio', m4a: 'audio', aac: 'audio', flac: 'audio', opus: 'audio', weba: 'audio',
+  mp4: 'video', webm: 'video', mov: 'video', mkv: 'video', ogv: 'video',
+}
+
+/** The preview kind a path qualifies for, or null when it is not media. */
+export function mediaKindOf(path: string): MediaKind | null {
+  return MEDIA_BY_EXTENSION[path.split('.').pop()?.toLowerCase() ?? ''] ?? null
+}
+
 /** One `@` mention candidate: a file name and its root-relative path. */
 export interface ProjectMatch {
   readonly name: string
@@ -600,6 +619,28 @@ export function setMode(workspaceId: string, modeId: string): Promise<{ modeId: 
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ modeId }),
   }).then((r) => json<{ modeId: string; revision: number }>(r))
+}
+
+export interface SessionModeSelection {
+  readonly modeId: string
+  readonly name: string
+  readonly revision: number
+  /** `'workspace-default'` follows the workspace selection; `'session'` is this conversation's own. */
+  readonly source: 'session' | 'workspace-default'
+}
+
+/** Read one conversation's own mode; a conversation without one reports the workspace default. */
+export function getSessionMode(workspaceId: string, sessionId: string): Promise<SessionModeSelection> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/mode`).then((r) => json<SessionModeSelection>(r))
+}
+
+/** Update one conversation's mode: live for its next tool gate and request, mid-turn included. */
+export function setSessionMode(workspaceId: string, sessionId: string, modeId: string): Promise<SessionModeSelection> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/mode`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ modeId }),
+  }).then((r) => json<SessionModeSelection>(r))
 }
 
 // ── Mode authoring (Settings). The selection control above stays separate. ──

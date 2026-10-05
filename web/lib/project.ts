@@ -212,6 +212,20 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
         openCompaction.status = 'interrupted'
       }
       switch (event.type) {
+        case 'model/attempt':
+          // Physical accounting is not a message or turn-terminal fact.
+          break
+        case 'execution/uncertain':
+        case 'execution/reconciled':
+          if (event.fact !== undefined) add({
+            kind: 'audit',
+            icon: event.type === 'execution/uncertain' ? 'fail' : 'expired',
+            text: event.type === 'execution/uncertain'
+              ? `Provider request ownership unresolved · attempt ${event.fact.attempt}; replacement execution fenced`
+              : `Provider request locally settled · attempt ${event.fact.attempt}; ownership released`,
+            ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
+          })
+          break
         case 'turn/start':
           if (event.turnId !== undefined && event.turnId !== '') openTurnId = event.turnId
           turnInputs = []

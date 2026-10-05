@@ -22,7 +22,9 @@ export function bashOutputTool(options: { readonly processes: ProcessRegistry })
     parameters: {
       type: 'object',
       properties: {
-        processId: { type: 'string', description: 'the process id returned by Bash run_in_background' },
+        processId: { type: 'string', description: 'the process id returned by Bash' },
+        block: { type: 'boolean', description: 'wait for completion; default false' },
+        timeoutMs: { type: 'number', description: 'wait budget, default 30000, max 600000; never kills the process' },
       },
       required: ['processId'],
     },
@@ -32,7 +34,11 @@ export function bashOutputTool(options: { readonly processes: ProcessRegistry })
         return "error: argument 'processId' must be a non-empty string"
       }
       if (exec.sessionId === undefined) return 'error: no session scope for background processes'
-      const read = options.processes.read(exec.sessionId, processId)
+      const requested = args['timeoutMs']
+      const waitMs = typeof requested === 'number' && Number.isFinite(requested) && requested > 0 ? Math.min(requested, 600_000) : 30_000
+      const read = args['block'] === true
+        ? await options.processes.wait(exec.sessionId, processId, { timeoutMs: waitMs, ...(exec.signal !== undefined ? { signal: exec.signal } : {}) })
+        : options.processes.read(exec.sessionId, processId)
       if (read === undefined) {
         return `error: unknown processId '${processId}' in this session; running: ${knownIds(options.processes, exec)}`
       }

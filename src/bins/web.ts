@@ -8,7 +8,7 @@
  * Serve the built client first:
  *
  *   npm run build:web
- *   npm run web [-- --port 3082 --root . --yolo --auth]
+ *   npm run web [-- --port 3082 --root . --yolo --auth --allowed-host <name,ip>]
  *
  * The listener is loopback-only, so control-plane pairing stays off unless
  * `--auth` (or `DNT_HARNESS_AUTH=1`) asks for it.
@@ -32,6 +32,7 @@ interface CliOptions {
   readonly dataDir: string
   readonly yolo: boolean
   readonly auth: boolean
+  readonly allowedHosts: readonly string[]
 }
 
 function parseArgs(argv: readonly string[]): CliOptions {
@@ -43,6 +44,9 @@ function parseArgs(argv: readonly string[]): CliOptions {
   // machine's user: pairing is opt-in. Turn it on whenever the port is shared
   // beyond that user, e.g. behind a proxy or a forwarded tunnel.
   let auth = process.env['DNT_HARNESS_AUTH'] === '1'
+  // Extra names the Host allowlist should answer to — a reverse proxy's
+  // hostname or the tailnet IP when served through `tailscale serve`.
+  const allowedHosts: string[] = []
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (arg === '--port') port = Number(argv[i + 1] ?? port) || port
@@ -51,12 +55,18 @@ function parseArgs(argv: readonly string[]): CliOptions {
     else if (arg === '--yolo') yolo = true
     else if (arg === '--auth') auth = true
     else if (arg === '--no-auth') auth = false
+    else if (arg === '--allowed-host') {
+      for (const host of (argv[i + 1] ?? '').split(',')) {
+        const trimmed = host.trim().toLowerCase()
+        if (trimmed !== '') allowedHosts.push(trimmed)
+      }
+    }
   }
-  return { port, root, dataDir, yolo, auth }
+  return { port, root, dataDir, yolo, auth, allowedHosts }
 }
 
 async function main(): Promise<void> {
-  const { port, root, dataDir, yolo, auth } = parseArgs(process.argv.slice(2))
+  const { port, root, dataDir, yolo, auth, allowedHosts } = parseArgs(process.argv.slice(2))
   await assertSchemaFloor(dataDir)
 
   const server = await createWebServer({
@@ -73,6 +83,7 @@ async function main(): Promise<void> {
     terminals: { defaultCwd: root },
     port,
     controlPlaneAuth: auth,
+    ...(allowedHosts.length > 0 ? { allowedHosts } : {}),
   })
 
   process.stdout.write(`dnt-harness web: ${server.url}\n`)

@@ -29,7 +29,18 @@ async function post(base: string, pathname: string, body?: unknown): Promise<Res
 async function boot(providers: LlmProvider[], mode?: string): Promise<{ server: WebServer; base: string; wsId: string; home: string }> {
   const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-subagents-'))
   homes.push(home)
-  const server = await createWebServer({ home, providers, configFile: path.join(home, 'p.json') })
+  const strictProviders = providers.map((provider): LlmProvider => ({
+    ...provider,
+    async *stream(request, options) {
+      let toolCalls = false
+      for await (const event of provider.stream(request, options)) {
+        if (event.type === 'toolCalls') toolCalls = true
+        yield event
+      }
+      yield { type: 'completion', finishReason: toolCalls ? 'tool_calls' : 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+    },
+  }))
+  const server = await createWebServer({ home, providers: strictProviders, configFile: path.join(home, 'p.json') })
   servers.push(server)
   const base = server.url
   const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
@@ -194,6 +205,118 @@ describe('subagent contract over HTTP', () => {
     expect(manifest.sources.toolNames.sort()).toEqual(['Glob', 'Grep', 'Read'])
   }, 20_000)
 
+  it('pins an admitted HTTP child to the same owning root across Plan/Full transitions', async () => {
+    async function scenario(rootMode: 'plan' | 'full-access', rootAfter: 'plan' | 'full-access') {
+      let releaseChild: () => void = () => {}
+      let markChildStarted: () => void = () => {}
+      const childGate = new Promise<void>((resolve) => { releaseChild = resolve })
+      const childStarted = new Promise<void>((resolve) => { markChildStarted = resolve })
+      const childSchemas: string[][] = []
+      let childStep = 0
+      const provider: LlmProvider = {
+        name: `mode-${rootMode}`, models: [`mode-${rootMode}`],
+        async *stream(request) {
+          if (!isChild(request)) { yield { type: 'delta', delta: 'root' }; return }
+          childSchemas.push((request.tools ?? []).map((tool) => tool.name))
+          childStep += 1
+          if (childStep === 1) {
+            markChildStarted()
+            await childGate
+            yield { type: 'toolCalls', calls: [{ id: 'fabricated-write', name: 'Write', args: { path: 'child-mode.txt', content: rootMode } }] }
+            return
+          }
+          yield { type: 'delta', delta: 'done' }
+        },
+      }
+      const { base, wsId } = await boot([provider], rootMode)
+      const root = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+      const spawned = await post(base, `/api/workspaces/${wsId}/agents/worker`, { rootSessionId: root.id, task: { prompt: 'Try the fabricated write.' } })
+      expect(spawned.status).toBe(202)
+      const child = (await spawned.json()) as { childSessionId: string }
+      await childStarted
+      expect((await snapshot(base, wsId, root.id)).some((event) => event.type === 'agent/child-spawn' && event['childSessionId'] === child.childSessionId)).toBe(true)
+      expect((await snapshot(base, wsId, child.childSessionId)).some((event) => event.type === 'session/child-meta' && event['parentSessionId'] === root.id)).toBe(true)
+      expect((await fetch(`${base}/api/workspaces/${wsId}/sessions/${root.id}/mode`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: rootAfter }),
+      })).status).toBe(200)
+      releaseChild()
+      await fetch(`${base}/api/workspaces/${wsId}/sessions/${root.id}/children/${child.childSessionId}?waitMs=8000`)
+      return { schemas: childSchemas[0] ?? [], events: await snapshot(base, wsId, child.childSessionId) }
+    }
+
+    const widened = await scenario('plan', 'full-access')
+    expect(widened.schemas).not.toContain('Write')
+    expect(widened.events.find((event) => event.type === 'tool/result')?.['output']).toMatch(/not exposed|does not expose|unknown tool/i)
+
+    const narrowed = await scenario('full-access', 'plan')
+    expect(narrowed.schemas).toContain('Write')
+    expect(narrowed.events.find((event) => event.type === 'tool/result')?.['output']).toMatch(/not exposed|does not expose|unknown tool/i)
+  }, 30_000)
+
+  it('Agent-tool child admission is pinned and live-denied by transitions on the same owning root', async () => {
+    async function scenario(rootMode: 'plan' | 'full-access', rootAfter: 'plan' | 'full-access') {
+      let releaseChild: () => void = () => {}
+      let markChildStarted: () => void = () => {}
+      const childGate = new Promise<void>((resolve) => { releaseChild = resolve })
+      const childStarted = new Promise<void>((resolve) => { markChildStarted = resolve })
+      const childSchemas: string[][] = []
+      let rootStep = 0
+      let childStep = 0
+      const provider: LlmProvider = {
+        name: `agent-mode-${rootMode}`, models: [`agent-mode-${rootMode}`],
+        async *stream(request) {
+          if (isChild(request)) {
+            childSchemas.push((request.tools ?? []).map((tool) => tool.name))
+            childStep += 1
+            if (childStep === 1) {
+              markChildStarted()
+              await childGate
+              yield { type: 'toolCalls', calls: [{ id: 'fabricated-write', name: 'Write', args: { path: 'agent-child.txt', content: rootMode } }] }
+              return
+            }
+            yield { type: 'delta', delta: 'child done' }
+            return
+          }
+          rootStep += 1
+          if (rootStep === 1) {
+            yield { type: 'toolCalls', calls: [{ id: 'spawn-child', name: 'Agent', args: { action: 'spawn', definition: 'worker', prompt: 'Try the fabricated write.' } }] }
+            return
+          }
+          yield { type: 'delta', delta: 'root done' }
+        },
+      }
+      const { base, wsId } = await boot([provider], rootMode)
+      const root = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+      const sent = post(base, `/api/workspaces/${wsId}/sessions/${root.id}/messages`, { content: 'Delegate it.' })
+      await childStarted
+      const admitted = await snapshot(base, wsId, root.id)
+      const childId = admitted.find((event) => event.type === 'agent/child-spawn')?.['childSessionId']
+      expect(typeof childId).toBe('string')
+      expect((await snapshot(base, wsId, String(childId))).some((event) => event.type === 'session/child-meta' && event['parentSessionId'] === root.id)).toBe(true)
+      expect((await fetch(`${base}/api/workspaces/${wsId}/sessions/${root.id}/mode`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: rootAfter }),
+      })).status).toBe(200)
+      releaseChild()
+      expect((await sent).status).toBe(202)
+      const deadline = Date.now() + 12_000
+      let rootEvents: { type: string; [key: string]: unknown }[] = []
+      while (Date.now() < deadline) {
+        rootEvents = await snapshot(base, wsId, root.id)
+        if (rootEvents.some((event) => event.type === 'agent/child-result')) break
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      }
+      return { schemas: childSchemas[0] ?? [], events: await snapshot(base, wsId, String(childId)) }
+    }
+
+    const widened = await scenario('plan', 'full-access')
+    expect(widened.schemas).not.toContain('Write')
+    expect(widened.events.find((event) => event.type === 'tool/result')?.['output']).toMatch(/not exposed|does not expose|unknown tool/i)
+
+    const narrowed = await scenario('full-access', 'plan')
+    expect(narrowed.schemas).toContain('Write')
+    expect(narrowed.events.find((event) => event.type === 'tool/result')?.['output']).toMatch(/not exposed|does not expose|unknown tool/i)
+  }, 30_000)
+
   it('inherit:"brief" lets a child answer from the conversation, never from tool output', async () => {
     let childMessages = ''
     let rootStep = 0
@@ -227,6 +350,7 @@ describe('subagent contract over HTTP', () => {
       task: { prompt: 'Which file did we say configures the build?', references: ['docs/web.md'] },
       inherit: 'brief',
     })
+    if (spawned.status !== 202) throw new Error(`spawn failed: ${spawned.status} ${await spawned.text()}`)
     const child = (await spawned.json()) as { childSessionId: string; inheritedChars: number }
     expect(child.inheritedChars).toBeGreaterThan(0)
     const settled = await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${root.id}/children/${child.childSessionId}?waitMs=8000`)).json() as { result?: { report: string } }
@@ -237,6 +361,87 @@ describe('subagent contract over HTTP', () => {
     expect(childMessages).toContain('## References')
     expect(childMessages).toContain('- docs/web.md')
   }, 20_000)
+
+  it('a manual spawn offered after the root turn ends is admitted', async () => {
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream(request) {
+        yield { type: 'delta', delta: isChild(request) ? 'done' : 'ok' }
+      },
+    }
+    const { base, wsId } = await boot([provider])
+    const root = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${root.id}/messages`, { content: 'Say ok.' })
+    const deadline = Date.now() + 8_000
+    while (Date.now() < deadline) {
+      const log = await snapshot(base, wsId, root.id)
+      if (log.some((event) => event.type === 'turn/end')) break
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    // `turn/end` is appended before the agent flips to idle, but manual-spawn
+    // admission reads the durable log (rootBusy AND turnTerminal), so the
+    // spawn must be admitted on the first attempt.
+    const response = await post(base, `/api/workspaces/${wsId}/agents/explorer`, {
+      rootSessionId: root.id,
+      task: { prompt: 'x' },
+      keepOpen: true,
+    })
+    if (response.status !== 202) throw new Error(`spawn failed: ${response.status} ${await response.text()}`)
+    expect(response.status).toBe(202)
+  }, 20_000)
+
+  it('a root that spawns a child and ends its turn without waiting joins it: the child finishes, the root answers from its report', async () => {
+    let rootStep = 0
+    let childSteps = 0
+    let rootSawReport = ''
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream(request) {
+        if (isChild(request)) {
+          childSteps += 1
+          // A child that takes a while and then answers — long enough that a root
+          // closing its turn at once would have cancelled it mid-work.
+          await new Promise((resolve) => setTimeout(resolve, 400))
+          yield { type: 'delta', delta: 'The build config is vite.config.ts.' }
+          return
+        }
+        rootStep += 1
+        if (rootStep === 1) {
+          yield { type: 'toolCalls', calls: [{ id: 'spawn-1', name: 'Agent', args: { action: 'spawn', definition: 'explorer', prompt: 'Which file configures the build?' } }] }
+          return
+        }
+        if (rootStep === 2) {
+          // The model forgets to wait and just answers: the old behaviour cancelled the child here.
+          yield { type: 'delta', delta: 'Delegated; I will answer when it reports.' }
+          return
+        }
+        rootSawReport = request.messages.map((message) => (typeof message.content === 'string' ? message.content : '')).join('\n')
+        yield { type: 'delta', delta: 'It is vite.config.ts.' }
+      },
+    }
+    const { base, wsId } = await boot([provider], 'full-access')
+    const root = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${root.id}/messages`, { content: 'Find the build config.' })
+    let log: { type: string; [key: string]: unknown }[] = []
+    const deadline = Date.now() + 15_000
+    while (Date.now() < deadline) {
+      log = await snapshot(base, wsId, root.id)
+      if (log.some((event) => event.type === 'turn/end')) break
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+
+    const end = log.findLast((event) => event.type === 'turn/end')
+    expect(end?.reason).toBe('completed')
+    // The child ran to its end, was not cancelled, and its result is durable.
+    expect(childSteps).toBe(1)
+    const result = log.find((event) => event.type === 'agent/child-result')
+    expect(result?.status).toBe('completed')
+    // The root got one more step, with the child's report in it.
+    expect(rootStep).toBe(3)
+    expect(rootSawReport).toContain('Delegated agents you left running have finished')
+    expect(rootSawReport).toContain('The build config is vite.config.ts.')
+    expect(log.filter((event) => event.type === 'step/start')).toHaveLength(3)
+  }, 30_000)
 
   it('writer boundary: the handoff precedes the child write, the child holds no whole-run lease, and the root can write again', async () => {
     const project = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-subagents-proj-'))

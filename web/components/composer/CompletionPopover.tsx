@@ -29,19 +29,23 @@ export function CompletionPopover({ id, kind, items, activeIndex, loading, note,
     active?.scrollIntoView({ block: 'nearest' })
   }, [id, activeIndex, items.length])
 
+  // The `$` menu is skill-only, so it reads under the same catalog caption as
+  // the tail of the `/` menu — but without the commands head, always.
+  const skillsCaption = kind === 'skillDollar' || items.some((item) => !item.id.startsWith('command:'))
+
   return (
     <div
       ref={listRef}
       id={id}
       role="listbox"
-      aria-label={kind === 'file' ? 'Project files' : 'Commands and skills'}
+      aria-label={kind === 'file' ? 'Project files' : 'Skills'}
       className="absolute bottom-full left-0 right-0 z-30 mb-2 max-h-72 overflow-y-auto rounded-2xl border border-line bg-surface p-1.5 shadow-pop animate-fade-up"
     >
       {items.map((item, index) => {
         // Built-in commands open the list unheadered; the catalog reads under
         // its own caption, exactly once, before its first row.
         const isCommand = item.id.startsWith('command:')
-        const header = !isCommand && index === items.findIndex((entry) => !entry.id.startsWith('command:')) ? (
+        const header = !isCommand && skillsCaption && index === items.findIndex((entry) => !entry.id.startsWith('command:')) ? (
           <div className="px-2.5 pb-0.5 pt-1.5 text-[11px] font-medium uppercase tracking-wider text-fg-faint">Skills</div>
         ) : null
         return (

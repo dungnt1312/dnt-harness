@@ -50,7 +50,7 @@ async function boot(provider: LlmProvider, extra?: Partial<Parameters<typeof cre
 
 describe('G5 web MCP server config editing', () => {
   it('returns one stored config with fields the form does not show, and deletes a server', async () => {
-    const provider: LlmProvider = { name: 'idle', models: ['idle'], async *stream() { yield { type: 'delta', delta: 'ok' } } }
+    const provider: LlmProvider = { name: 'idle', models: ['idle'], async *stream() { yield { type: 'delta', delta: 'ok' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }
     const { base, wsId } = await boot(provider)
     const config = { transport: 'stdio', command: process.execPath, args: [mcpFixture], env: { API_KEY: '${API_KEY}' }, enabled: false }
     expect((await post(base, `/api/workspaces/${wsId}/mcp/fixture`, config)).status).toBe(201)
@@ -77,9 +77,11 @@ describe('G5 web MCP + hooks', () => {
         step += 1
         if (step === 1) {
           yield { type: 'toolCalls', calls: [{ id: 'm1', name: 'mcp__fixture__query', args: { q: 'secret-query' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const { home, base, wsId } = await boot(provider)
@@ -144,7 +146,7 @@ describe('G5 web MCP + hooks', () => {
     let modelCalls = 0
     const provider: LlmProvider = {
       name: 'scripted', models: ['scripted'],
-      async *stream() { modelCalls += 1; yield { type: 'delta', delta: 'should not run' } },
+      async *stream() { modelCalls += 1; yield { type: 'delta', delta: 'should not run' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } },
     }
     const { home, base, wsId } = await boot(provider)
     await fs.writeFile(path.join(home, 'workspaces', wsId, 'mcp.json'), '{ invalid', 'utf8')
@@ -162,8 +164,9 @@ describe('G5 web MCP + hooks', () => {
       name: 'scripted', models: ['scripted'],
       async *stream() {
         step += 1
-        if (step === 1) { yield { type: 'toolCalls', calls: [{ id: 'i1', name: 'mcp__fixture__interactive', args: {} }] }; return }
+        if (step === 1) { yield { type: 'toolCalls', calls: [{ id: 'i1', name: 'mcp__fixture__interactive', args: {} }] }; yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }; return }
         yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const { base, wsId } = await boot(provider)
@@ -180,6 +183,34 @@ describe('G5 web MCP + hooks', () => {
     reader.cancel().catch(() => {})
   }, 20_000)
 
+  it('full access runs a plain MCP tool without an approval; only the interactive one still asks', async () => {
+    let step = 0
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() {
+        step += 1
+        if (step === 1) { yield { type: 'toolCalls', calls: [{ id: 'f1', name: 'mcp__fixture__query', args: { q: 'x' } }] }; yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }; return }
+        yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const { base, wsId } = await boot(provider)
+    await post(base, `/api/workspaces/${wsId}/mcp/fixture`, { transport: 'stdio', command: process.execPath, args: [mcpFixture], enabled: true, allowedTools: ['query', 'interactive'] })
+    await post(base, `/api/workspaces/${wsId}/mcp/fixture/enable`)
+    await fetch(`${base}/api/workspaces/${wsId}/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: 'full-access' }) })
+    const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    void post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'query' })
+    let events: Record<string, unknown>[] = []
+    for (let i = 0; i < 50; i++) {
+      events = await sessionEvents(base, wsId, session.id)
+      if (events.some((event) => event.type === 'mcp/call')) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    // The dispatch happened — no human answered anything.
+    expect(events.find((event) => event.type === 'mcp/call')).toMatchObject({ server: 'fixture', tool: 'query', isError: false })
+    expect(events.some((event) => event.type === 'approval/request')).toBe(false)
+  }, 20_000)
+
   it('a repeated call is a new invocation with its own approval; the first grant is not reused', async () => {
     let step = 0
     const provider: LlmProvider = {
@@ -187,12 +218,13 @@ describe('G5 web MCP + hooks', () => {
       async *stream() {
         step += 1
         // The same action twice, as a model (or a user asking again) repeats it.
-        if (step === 1) { yield { type: 'toolCalls', calls: [{ id: 'first', name: 'mcp__fixture__interactive', args: {} }] }; return }
+        if (step === 1) { yield { type: 'toolCalls', calls: [{ id: 'first', name: 'mcp__fixture__interactive', args: {} }] }; yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }; return }
         // Same call id on purpose: some providers restart their numbering, and
         // an approved repeat must still be sent rather than answered from the
         // earlier record.
-        if (step === 2) { yield { type: 'toolCalls', calls: [{ id: 'first', name: 'mcp__fixture__interactive', args: {} }] }; return }
+        if (step === 2) { yield { type: 'toolCalls', calls: [{ id: 'first', name: 'mcp__fixture__interactive', args: {} }] }; yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }; return }
         yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const { base, wsId, home } = await boot(provider)
@@ -220,7 +252,7 @@ describe('G5 web MCP + hooks', () => {
   }, 20_000)
 
   it('enabling authorizes the canonical executable; a changed file is refused until enabled again', async () => {
-    const provider: LlmProvider = { name: 'idle', models: ['idle'], async *stream() { yield { type: 'delta', delta: 'ok' } } }
+    const provider: LlmProvider = { name: 'idle', models: ['idle'], async *stream() { yield { type: 'delta', delta: 'ok' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }
     const { base, wsId, home } = await boot(provider)
     const binary = path.join(home, `node-copy${path.extname(process.execPath)}`)
     await fs.copyFile(process.execPath, binary)
@@ -259,7 +291,7 @@ describe('G5 web MCP + hooks', () => {
   }, 30_000)
 
   it('disable and host close cancel delayed in-flight MCP initialization (no late descriptors/process)', async () => {
-    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'x' } } }
+    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'x' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }
     // Disable race.
     {
       const { home, base, wsId, server } = await boot(provider)
@@ -297,7 +329,7 @@ describe('G5 web MCP + hooks', () => {
   }, 30_000)
 
   it('secret rotation reconnects affected enabled servers before returning', async () => {
-    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'x' } } }
+    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'x' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }
     const { home, base, wsId } = await boot(provider)
     const initFile = path.join(home, 'rotation-pids.txt')
     await fetch(`${base}/api/workspaces/${wsId}/secrets/API_KEY`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ value: 'first' }) })
@@ -314,7 +346,7 @@ describe('G5 web MCP + hooks', () => {
   }, 20_000)
 
   it('concurrent first use creates exactly one MCP process per workspace/server', async () => {
-    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'x' } } }
+    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'x' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }
     const { home, base, wsId } = await boot(provider)
     const initFile = path.join(home, 'init-pids.txt')
     await post(base, `/api/workspaces/${wsId}/mcp/fixture`, { transport: 'stdio', command: process.execPath, args: [mcpFixture], env: { INIT_FILE: initFile }, enabled: true })
@@ -333,6 +365,7 @@ describe('G5 web MCP + hooks', () => {
       async *stream(request) {
         requests.push(request.tools?.map((tool) => tool.name) ?? [])
         yield { type: 'delta', delta: 'x' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const { base, wsId } = await boot(provider)
@@ -356,6 +389,7 @@ describe('G5 web MCP + hooks', () => {
       async *stream(request) {
         seen[currentLabel]?.push(request.tools?.map((tool) => tool.name) ?? [])
         yield { type: 'delta', delta: 'x' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const { base, wsId: workId } = await boot(provider)
@@ -388,9 +422,11 @@ describe('G5 web MCP + hooks', () => {
         requestNo += 1
         if (requestNo === 2) {
           yield { type: 'toolCalls', calls: [{ id: 'blocked-mcp', name: 'mcp__fixture__query', args: { q: 'x' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         yield { type: 'delta', delta: 'x' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const { base, wsId } = await boot(provider, { blockedTools: ['mcp__*__query'] })
@@ -430,9 +466,11 @@ describe('G5 web MCP + hooks', () => {
         step += 1
         if (step === 1) {
           yield { type: 'toolCalls', calls: [{ id: 'e1', name: 'Edit', args: { path: 'x', old: 'a', new: 'b' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const { base, wsId } = await boot(provider)
@@ -467,6 +505,7 @@ describe('G5 web MCP + hooks', () => {
       async *stream(request) {
         seen.push(request.messages.map((message) => messageText(message.content)))
         yield { type: 'toolCalls', calls: [{ id: 'b1', name: 'Bash', args: { command: 'echo should-not-run' } }] }
+        yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const { base, wsId } = await boot(provider)

@@ -1,8 +1,12 @@
 import { applyThinkingOverride } from './model-catalog.ts'
+import { classifyTransport } from './request-lifecycle.ts'
+import { cancelReader, encodedBytes, normalizeFinishReason, protocolError, readBoundedError, readSse, validateCompletion, validateToolBatch, WIRE_LIMITS } from './completion.ts'
+import type { ModelCompletion, ModelFinishReason } from './types.ts'
 import { messageText, ProviderError } from './types.ts'
 import type { LlmProvider, ModelMessage, ModelRequest, StreamEvent, StreamOptions, TokenUsage } from './types.ts'
 
 interface StreamChoice {
+  finish_reason?: unknown
   delta?: {
     content?: string
     reasoning_content?: string
@@ -93,6 +97,8 @@ export interface OpenAiCompletionsOptions {
   readonly maxRetries?: number
   /** First backoff delay; doubles per attempt with jitter (default 1000ms). */
   readonly retryBaseMs?: number
+  /** Explicit gateway profile; default requires choice finish plus DONE. */
+  readonly completionPolicy?: 'strict' | 'finish-eof'
 }
 
 const DEFAULT_MAX_RETRIES = 3
@@ -100,7 +106,7 @@ const DEFAULT_RETRY_BASE_MS = 1_000
 /** A single wait never exceeds this, whatever `retry-after` asks for. */
 const MAX_RETRY_DELAY_MS = 30_000
 /** Error bodies are diagnostics: keep enough to explain, never an unbounded read. */
-const MAX_ERROR_BODY_CHARS = 4_000
+const boundedText = readBoundedError
 const RETRYABLE_STATUS: ReadonlySet<number> = new Set([408, 409, 425, 429, 500, 502, 503, 504, 529])
 
 function backoffMs(attempt: number, base: number): number {
@@ -115,15 +121,6 @@ function retryAfterMs(header: string | null): number | undefined {
   if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000
   const date = Date.parse(header)
   return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now())
-}
-
-async function boundedText(response: Response): Promise<string> {
-  try {
-    const text = await response.text()
-    return text.length > MAX_ERROR_BODY_CHARS ? `${text.slice(0, MAX_ERROR_BODY_CHARS)}… [truncated]` : text
-  } catch {
-    return '(unreadable body)'
-  }
 }
 
 /** Wait, but wake with the abort reason as soon as the run is stopped. */
@@ -185,7 +182,8 @@ export class OpenAiCompletionsProvider implements LlmProvider {
     applyThinkingOverride(body, model, request.thinkingLevel)
     const payload = JSON.stringify(body)
     const signal = options?.signal
-    const maxAttempts = 1 + Math.max(0, this.options.maxRetries ?? DEFAULT_MAX_RETRIES)
+    // Standalone use retains a bounded header-only retry policy; harness use never stacks it.
+    const maxAttempts = options?.requestOwner ? 1 : Math.min(4, 1 + Math.max(0, this.options.maxRetries ?? DEFAULT_MAX_RETRIES))
     let response: Response
     // Retry only before the stream starts: nothing has been yielded, so a
     // second request cannot duplicate output. Rate limits and transient
@@ -206,89 +204,146 @@ export class OpenAiCompletionsProvider implements LlmProvider {
           body: payload,
         })
       } catch (error) {
-        // A connection-level failure (reset, DNS, refused) is transient; a stop is not.
-        if (signal?.aborted === true || attempt >= maxAttempts) throw error
+        const classified = signal?.aborted ? new ProviderError('provider request cancelled', { reason: 'cancelled', phase: 'connect' }) : classifyTransport(error, 'connect')
+        if (!classified.retryable || attempt >= maxAttempts) throw classified
         await sleep(backoffMs(attempt, this.options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS), signal)
         continue
       }
       if (response.ok) break
-      const detail = await boundedText(response)
-      if (!RETRYABLE_STATUS.has(response.status) || attempt >= maxAttempts) {
-        throw new ProviderError(`${this.name}: HTTP ${response.status}: ${detail}${attempt > 1 ? ` (after ${attempt} attempts)` : ''}`)
+      let cleanupSettled = true
+      const detail = await boundedText(response, settled => { cleanupSettled = settled }, options?.onTransportSettled)
+      const quota = /insufficient_quota|quota|billing|credit|balance/i.test(detail)
+      const reason = isContextExceeded(response.status, detail) ? 'context_exceeded' : quota ? 'quota' : response.status === 401 || response.status === 403 ? 'auth_configuration' : response.status === 429 ? 'rate_limit' : RETRYABLE_STATUS.has(response.status) ? 'server_error' : 'unknown'
+      const retryable = !quota && RETRYABLE_STATUS.has(response.status)
+      if (!cleanupSettled || !retryable || attempt >= maxAttempts) {
+        const retryAfter = retryAfterMs(response.headers.get('retry-after'))
+        const error = new ProviderError(`provider HTTP ${response.status}: ${reason}`, { reason, phase: 'headers', transient: retryable, status: response.status, ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}) })
+        error.transportSettled = cleanupSettled
+        throw error
       }
       wait = retryAfterMs(response.headers.get('retry-after'))
       await sleep(Math.min(MAX_RETRY_DELAY_MS, wait ?? backoffMs(attempt, this.options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS)), signal)
     }
     if (response.body === null) {
-      throw new ProviderError(`${this.name}: empty response body`)
+      throw new ProviderError(`${this.name}: empty response body`, { transient: true })
     }
 
     const calls: AccumulatedCall[] = []
     const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-    // Gateways that fail upstream mid-stream answer 200 and then close
-    // cleanly; without this flag that reads as a successful empty turn.
-    let sawModelOutput = false
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      let newline = buffer.indexOf('\n')
-      while (newline >= 0) {
-        const line = buffer.slice(0, newline).trim()
-        buffer = buffer.slice(newline + 1)
-        newline = buffer.indexOf('\n')
-        if (!line.startsWith('data:')) continue
-        const data = line.slice(5).trim()
-        if (data === '[DONE]') {
-          yield* finishCalls(this.name, calls)
-          if (!sawModelOutput) throw new ProviderError(`${this.name}: stream ended without any model output`)
-          return
-        }
+    let finishReason: ModelFinishReason | undefined
+    let boundary: 'done' | 'eof' = 'eof'
+    let outputBytes = 0
+    let argumentBytes = 0
+    let settled = false
+    let cleanupAttempted = false
+    try {
+      for await (const data of readSse(reader)) {
+        if (data === '[DONE]') { boundary = 'done'; break }
         let parsed: { choices?: StreamChoice[]; usage?: WireUsage | null; error?: unknown }
         try {
           parsed = JSON.parse(data) as { choices?: StreamChoice[]; usage?: WireUsage | null; error?: unknown }
         } catch (error) {
-          throw new ProviderError(`${this.name}: malformed stream chunk '${data}': ${String(error instanceof Error ? error.message : error)}`)
+          throw protocolError('malformed_protocol', `${this.name}: malformed stream JSON`)
         }
+        if (parsed === null || typeof parsed !== 'object' || (parsed.choices !== undefined && !Array.isArray(parsed.choices))) throw protocolError('malformed_protocol', 'invalid stream record')
         // One API-style relays report upstream failures as an error object in
         // a 200 stream; that payload is the only diagnosis the user ever sees.
         if (parsed.error !== undefined) {
-          throw new ProviderError(`${this.name}: gateway error: ${gatewayErrorText(parsed.error)}`)
+          const text = gatewayErrorText(parsed.error).slice(0, WIRE_LIMITS.errorChars)
+          const quota = /quota|billing|credit|balance/i.test(text)
+          const code = parsed.error !== null && typeof parsed.error === 'object' ? (parsed.error as { code?: unknown }).code : undefined
+          const transient = !quota && ((typeof code === 'number' && RETRYABLE_STATUS.has(code)) || (typeof code === 'string' && ['server_error', 'rate_limit_exceeded', 'service_unavailable', 'overloaded_error'].includes(code)) || /gateway|temporarily|overloaded|unavailable|disconnect|reset|terminated/i.test(text))
+          throw new ProviderError('provider gateway failure', { reason: isContextExceeded(400, text) ? 'context_exceeded' : quota ? 'quota' : transient ? 'server_error' : 'unknown', transient })
         }
         const usage = parseUsage(parsed.usage)
         if (usage !== undefined) yield { type: 'usage', usage }
-        const delta = parsed.choices?.[0]?.delta
+        if (parsed === null || typeof parsed !== 'object') throw protocolError('malformed_protocol', 'invalid stream record')
+        if ((parsed.choices?.length ?? 0) > 1) throw protocolError('malformed_protocol', 'multiple choices are unsupported')
+        const choice = parsed.choices?.[0]
+        const alreadyFinished = finishReason !== undefined
+        if (choice?.finish_reason !== undefined && choice.finish_reason !== null) {
+          const next = normalizeFinishReason(choice.finish_reason)
+          if (finishReason !== undefined && finishReason !== next) throw protocolError('malformed_protocol', 'conflicting finish reasons')
+          finishReason = next
+        }
+        const delta = choice?.delta
         const content = delta?.content
+        if ((content !== undefined && content !== null && typeof content !== 'string') || (delta?.reasoning_content !== undefined && typeof delta.reasoning_content !== 'string') || (delta?.tool_calls !== undefined && !Array.isArray(delta.tool_calls))) throw protocolError('malformed_protocol', 'invalid model delta')
+        if (alreadyFinished && (delta?.content || delta?.reasoning_content || delta?.tool_calls?.length)) throw protocolError('malformed_protocol', 'output after semantic finish')
+        outputBytes += encodedBytes(delta?.content ?? '') + encodedBytes(delta?.reasoning_content ?? '')
+        if (outputBytes > WIRE_LIMITS.outputBytes) throw protocolError('output_limit', 'model output exceeds limit')
         // Reasoning-capable models emit thinking separately from content:
         // the thinking text never joins the answered content and is marked
         // for the UI as a `thinking` delta.
         if (typeof content === 'string' && content !== '') {
-          sawModelOutput = true
           yield { type: 'delta', delta: content }
         }
         const thinking = delta?.reasoning_content
         if (typeof thinking === 'string' && thinking !== '') {
-          sawModelOutput = true
           yield { type: 'delta', delta: thinking, thinking: true }
         }
-        if (delta?.tool_calls !== undefined) {
-          sawModelOutput = true
+        if (delta?.tool_calls !== undefined && delta.tool_calls.length > 0) {
           for (const fragment of delta.tool_calls) {
-            const index = fragment.index ?? 0
+            if (fragment === null || typeof fragment !== 'object' || Array.isArray(fragment) || (fragment.function !== undefined && (fragment.function === null || typeof fragment.function !== 'object' || Array.isArray(fragment.function)))) throw protocolError('malformed_protocol', 'invalid tool fragment shape')
+            const index = fragment.index
+            if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index >= WIRE_LIMITS.calls) throw protocolError('invalid_tool_input', 'invalid tool index')
             const slot = calls[index] ?? { id: '', name: '', argsString: '' }
-            if (fragment.id !== undefined) slot.id = fragment.id
-            if (fragment.function?.name !== undefined) slot.name = fragment.function.name
-            slot.argsString += fragment.function?.arguments ?? ''
+            if (fragment.id !== undefined) {
+              if (typeof fragment.id !== 'string' || !fragment.id.trim() || (slot.id && slot.id !== fragment.id)) throw protocolError('invalid_tool_input', 'conflicting tool ID')
+              slot.id = fragment.id
+            }
+            if (fragment.function?.name !== undefined) {
+              const name = fragment.function.name
+              if (typeof name !== 'string' || !name.trim() || (slot.name && slot.name !== name)) throw protocolError('invalid_tool_input', 'conflicting tool name')
+              slot.name = name
+            }
+            const args = fragment.function?.arguments ?? ''
+            if (typeof args !== 'string') throw protocolError('invalid_tool_input', 'invalid argument fragment')
+            const bytes = encodedBytes(args)
+            argumentBytes += bytes
+            outputBytes += bytes + encodedBytes(fragment.id ?? '') + encodedBytes(fragment.function?.name ?? '')
+            if (argumentBytes > WIRE_LIMITS.aggregateArgumentBytes || outputBytes > WIRE_LIMITS.outputBytes || encodedBytes(slot.argsString) + bytes > WIRE_LIMITS.argumentBytes) throw protocolError('output_limit', 'tool argument/output limit exceeded')
+            slot.argsString += args
             calls[index] = slot
           }
+          // Arguments may stream for minutes. Report model progress without
+          // exposing or executing a call until its complete JSON is available.
+          yield { type: 'toolCallProgress' }
         }
       }
+      if (finishReason === undefined || (boundary === 'eof' && this.options.completionPolicy !== 'finish-eof')) throw protocolError('incomplete_completion', `${this.name}: stream ended without completion proof`)
+      const completion: ModelCompletion = { type: 'completion', finishReason, transport: boundary, policy: boundary === 'done' ? 'strict' : 'finish-eof', transportSettled: true }
+      validateCompletion(completion)
+      const batch = [...finishCalls(this.name, calls)]
+      cleanupAttempted = true
+      settled = await cancelReader(reader, options?.onTransportSettled)
+      if (!settled) throw new ProviderError('transport cleanup unresolved', { reason: 'incomplete_completion', phase: 'cleanup' })
+      reader.releaseLock()
+      yield* batch
+      yield completion
+    } catch (error) {
+      const failure = signal?.aborted ? new ProviderError('provider request cancelled', { reason: 'cancelled', phase: 'stream' }) : error instanceof ProviderError ? error : classifyTransport(error, 'stream')
+      if (!cleanupAttempted) {
+        cleanupAttempted = true
+        settled = await cancelReader(reader, options?.onTransportSettled)
+      }
+      failure.transportSettled = settled
+      if (settled) reader.releaseLock()
+      throw failure
+    } finally {
+      if (!settled) {
+        if (!cleanupAttempted) await cancelReader(reader, options?.onTransportSettled)
+        reader.releaseLock()
+      }
     }
-    yield* finishCalls(this.name, calls)
-    if (!sawModelOutput) throw new ProviderError(`${this.name}: stream ended without any model output`)
   }
+}
+
+const CONTEXT_EXCEEDED = /context[_ -]?(length|window)|maximum context|too (long|large|many tokens)|exceeds? (the )?(model'?s? )?(maximum|max|limit|context)|reduce the (length|size)|prompt is too long|input (is )?too long|tokens? (limit|exceeded)/i
+
+/** Whether an HTTP error says the request did not fit the model's window. */
+export function isContextExceeded(status: number, detail: string): boolean {
+  return (status === 400 || status === 413 || status === 422) && CONTEXT_EXCEEDED.test(detail)
 }
 
 /** A relay's error payload: OpenAI object shape, bare string, or anything else. */
@@ -325,19 +380,17 @@ function parseUsage(usage: WireUsage | null | undefined): TokenUsage | undefined
 /** Emit accumulated calls once, with arguments parsed at the boundary. */
 function* finishCalls(name: string, calls: readonly AccumulatedCall[]): Generator<StreamEvent> {
   if (calls.length === 0) return
-  yield {
-    type: 'toolCalls',
-    calls: calls.map((call) => ({
-      id: call.id,
-      name: call.name,
-      args: parseArgs(name, call.argsString),
-    })),
+  const batch = []
+  for (const call of calls) {
+    if (!call) throw protocolError('invalid_tool_input', 'sparse tool indices')
+    batch.push({ id: call.id, name: call.name, args: parseArgs(name, call.argsString) })
   }
+  validateToolBatch(batch)
+  yield { type: 'toolCalls', calls: batch }
 }
 
-/** Parse streamed JSON arguments; an empty body means no arguments. */
+/** Parse strictly: missing/empty arguments are not repaired into an object. */
 function parseArgs(name: string, argsString: string): Record<string, unknown> {
-  if (argsString === '') return {}
   try {
     const parsed: unknown = JSON.parse(argsString)
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -345,6 +398,6 @@ function parseArgs(name: string, argsString: string): Record<string, unknown> {
     }
     return parsed as Record<string, unknown>
   } catch (error) {
-    throw new ProviderError(`${name}: invalid tool arguments JSON '${argsString}': ${String(error instanceof Error ? error.message : error)}`)
+    throw protocolError('invalid_tool_input', `${name}: invalid tool arguments JSON`)
   }
 }

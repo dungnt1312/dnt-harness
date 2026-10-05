@@ -68,6 +68,38 @@ describe('file session store', () => {
     expect(read.truncatedTail).toBe(false)
   })
 
+  it('defers a relaxed append sync to the checkpoint that batches the prefix', async () => {
+    const store = new FileSessionStore({ dir: dataDir })
+    await store.init()
+    const id = 'session-relaxed' as SessionId
+    await store.replace(id, [])
+    const event = (seq: number): SessionEvent =>
+      ({ v: 1, seq, timestamp: 1_700_000_000_000 + seq, type: 'assistant/chunk', stepId: 's1', delta: `d${seq}` }) as unknown as SessionEvent
+    await store.append(id, event(1), { relaxed: true })
+    await store.append(id, event(2), { relaxed: true })
+    // One checkpoint syncs the whole written prefix.
+    await store.checkpoint(id)
+    const fresh = new FileSessionStore({ dir: dataDir })
+    expect((await fresh.read(id)).events.map((e) => e.seq)).toEqual([1, 2])
+    // Nothing is deferred anymore, so further flushes are immediate no-ops.
+    await store.flush(id)
+    await store.checkpoint(id)
+  })
+
+  it('a strict append after relaxed ones keeps flush covering the whole prefix', async () => {
+    const store = new FileSessionStore({ dir: dataDir })
+    await store.init()
+    const id = 'session-mixed' as SessionId
+    await store.replace(id, [])
+    const event = (seq: number, type: string): SessionEvent =>
+      ({ v: 1, seq, timestamp: 1_700_000_000_000 + seq, type }) as unknown as SessionEvent
+    await store.append(id, event(1, 'assistant/chunk'), { relaxed: true })
+    await store.append(id, event(2, 'assistant/message'))
+    await store.flush(id)
+    const fresh = new FileSessionStore({ dir: dataDir })
+    expect((await fresh.read(id)).events.map((e) => e.type)).toEqual(['assistant/chunk', 'assistant/message'])
+  })
+
   it('repairs a torn final record, quarantines it, and keeps the good prefix', async () => {
     const id = 'session-torn' as SessionId
     const good = line(1, { type: 'turn/start', turnId: 't1' }) + line(2, { type: 'user/message', turnId: 't1', content: 'hi' })
@@ -423,6 +455,32 @@ describe('sessions service over files', () => {
       { role: 'tool', toolCallId: 'call-9', content: expect.stringMatching(/outcome unknown/) },
     ])
     void kernel.stop()
+  })
+
+  it('relaxed streaming appends batch their sync into the next durable barrier', async () => {
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-relaxed-'))
+    try {
+      const kernel = new Kernel()
+      kernel.ctx.plugin(fileSessions(dir, { relaxedStreamingAppends: true }))
+      const sessions = kernel.ctx.sessions
+      const session = sessions.create('ws-relaxed' as never)
+      for (let seq = 1; seq <= 50; seq++) {
+        session.append({ type: 'assistant/chunk', stepId: 's1' as never, delta: `token ${seq} ` })
+      }
+      session.append({ type: 'assistant/message', stepId: 's1' as never, content: 'the assembled answer' })
+      await session.durable()
+      await sessions.flushSummary(session)
+      // The shutdown checkpoint syncs any remaining deferred prefix before
+      // handles close; afterwards the canonical log must be complete on disk.
+      await kernel.stop()
+      const fresh = new FileSessionStore({ dir, workspaceId: 'ws-relaxed' as never })
+      const read = await fresh.read(session.id)
+      expect(read.events.filter((event) => event.type === 'assistant/chunk')).toHaveLength(50)
+      expect(read.events.at(-1)?.type).toBe('assistant/message')
+      await fresh.close?.()
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
   })
 
   it('legacy limit records remain closed and readable after restart', async () => {

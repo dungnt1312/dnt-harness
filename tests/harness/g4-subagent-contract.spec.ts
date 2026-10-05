@@ -91,6 +91,7 @@ function request(harness: Harness, definition: AgentDefinition, overrides: Parti
     parentSessionId: harness.rootSessionId as never,
     parentTurnId: 'turn-1',
     definition,
+    exposureCeiling: definition.tools,
     packet: { prompt: 'Inspect the repository.', requiredResult: 'a short answer' },
     ...overrides,
   }
@@ -107,6 +108,122 @@ function childEvents(harness: Harness, childSessionId: string) {
 
 const explorer = bundledDefinition('explorer')
 const worker = bundledDefinition('worker')
+
+describe('child identity and admission ceiling', () => {
+  it('preserves a supplied root identity while ordinary roots self-root and repeated create keeps the first identity', async () => {
+    const harness = await boot([])
+    const rootSession = harness.kernel.ctx.sessions.get(harness.rootSessionId as never)
+    const root = harness.kernel.ctx.agents.create(rootSession, { workspaceId: harness.workspaceId as never })
+    expect(root.identity.rootSessionId).toBe(rootSession.id)
+
+    const childSession = harness.kernel.ctx.sessions.create(harness.workspaceId as never)
+    const suppliedRoot = 'owning-root' as never
+    const child = harness.kernel.ctx.agents.create(childSession, { workspaceId: harness.workspaceId as never, rootSessionId: suppliedRoot })
+    expect(child.identity.rootSessionId).toBe(suppliedRoot)
+    expect(harness.kernel.ctx.agents.create(childSession, { workspaceId: harness.workspaceId as never, rootSessionId: 'other-root' as never })).toBe(child)
+    expect(child.identity.rootSessionId).toBe(suppliedRoot)
+    await harness.kernel.stop()
+  })
+
+  it('pins the resolved exposure ceiling before dispatch and lets grants only narrow it', async () => {
+    const harness = await boot(['done'])
+    let captured: readonly string[] | undefined
+    const service = harness.kernel.ctx.agents
+    const create = service.create.bind(service)
+    service.create = ((session, identity) => {
+      captured = (identity as { childOf?: { toolCeiling?: readonly string[] } } | undefined)?.childOf?.toolCeiling
+      return create(session, identity)
+    }) as typeof service.create
+    const handle = await harness.executor.spawn(request(harness, worker, {
+      exposureCeiling: ['Read'],
+      grantTools: ['Read', 'Write'],
+    }))
+    await settle(harness, handle.childSessionId)
+    expect(captured).toEqual(['Read'])
+    await harness.kernel.stop()
+  })
+
+  it('a child keeps its admitted ceiling while authority widens before it launches', async () => {
+    const harness = await boot([])
+    const ceilings = new Map<string, readonly string[] | undefined>()
+    const service = harness.kernel.ctx.agents
+    const create = service.create.bind(service)
+    service.create = ((session, identity) => {
+      if (session !== undefined) ceilings.set(session.id, (identity as { childOf?: { toolCeiling?: readonly string[] } } | undefined)?.childOf?.toolCeiling)
+      return create(session, identity)
+    }) as typeof service.create
+
+    // Admit the child under the narrow authority; widen the live authority
+    // inside the window between pinning and launch (the child session's
+    // creation). The admitted snapshot must win — the widened authority must
+    // not leak into the child.
+    let liveExposure: readonly string[] = ['Read']
+    const sessions = harness.kernel.ctx.sessions
+    const createSession = sessions.create.bind(sessions)
+    sessions.create = ((...args: Parameters<typeof sessions.create>) => {
+      liveExposure = ['Read', 'Write']
+      return createSession(...args)
+    }) as typeof sessions.create
+    const target = await harness.executor.spawn(request(harness, worker, {
+      parentTurnId: 'queued-target',
+      admissionResolver: async () => liveExposure,
+      exposureCeiling: undefined,
+      packet: { prompt: 'queued target', requiredResult: 'done' },
+    }))
+    await settle(harness, target.childSessionId)
+    expect(ceilings.get(target.childSessionId)).toEqual(['Read'])
+    await harness.kernel.stop()
+  }, 20_000)
+
+  it('snapshots mutable authority inputs before async admission and resolves before child durability', async () => {
+    const harness = await boot(['done'])
+    let release!: () => void
+    const barrier = new Promise<void>((resolve) => { release = resolve })
+    let resolverStarted!: () => void
+    const started = new Promise<void>((resolve) => { resolverStarted = resolve })
+    let created = 0
+    const sessions = harness.kernel.ctx.sessions
+    const createSession = sessions.create.bind(sessions)
+    sessions.create = ((...args: Parameters<typeof sessions.create>) => {
+      created += 1
+      return createSession(...args)
+    }) as typeof sessions.create
+
+    let captured: readonly string[] | undefined
+    const agents = harness.kernel.ctx.agents
+    const createAgent = agents.create.bind(agents)
+    agents.create = ((session, identity) => {
+      captured = (identity as { childOf?: { toolCeiling?: readonly string[] } } | undefined)?.childOf?.toolCeiling
+      return createAgent(session, identity)
+    }) as typeof agents.create
+
+    const mutableTools = ['Read']
+    const mutableGrant = ['Read']
+    const mutableCeiling = ['Read']
+    const mutable = request(harness, { ...worker, tools: mutableTools }, {
+      exposureCeiling: mutableCeiling,
+      grantTools: mutableGrant,
+      admissionResolver: async ({ candidates }) => {
+        expect(candidates).toEqual(['Read'])
+        resolverStarted()
+        await barrier
+        return candidates
+      },
+    })
+    const spawning = harness.executor.spawn(mutable)
+    await started
+    expect(created).toBe(0)
+    mutableTools.push('Write')
+    mutableGrant.push('Write')
+    mutableCeiling.push('Write')
+    ;(mutable as unknown as { exposureCeiling?: string[] }).exposureCeiling = ['Read', 'Write']
+    release()
+    const handle = await spawning
+    await settle(harness, handle.childSessionId)
+    expect(captured).toEqual(['Read'])
+    await harness.kernel.stop()
+  })
+})
 
 describe('result contract', () => {
   it('reports the last tool-free message, never narration that accompanied tool calls', async () => {
@@ -810,47 +927,44 @@ describe('lifecycle boundary', () => {
 })
 
 describe('capacity', () => {
-  it('per-turn budget counts attempts, not completions, until the turn hook releases it', async () => {
+  it('per-turn spawning is uncapped; releaseTurns still clears the accounting', async () => {
     const harness = await boot(['done'])
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 9; i++) {
       const handle = await harness.executor.spawn(request(harness, explorer))
       await settle(harness, handle.childSessionId)
     }
-    await expect(harness.executor.spawn(request(harness, explorer))).rejects.toThrow(/8 children per turn/)
+    const next = await harness.executor.spawn(request(harness, explorer))
+    await settle(harness, next.childSessionId)
     await harness.executor.releaseTurns(harness.rootSessionId as never)
     const fresh = await harness.executor.spawn(request(harness, explorer))
     await settle(harness, fresh.childSessionId)
     await harness.kernel.stop()
   }, 30_000)
 
-  it('concurrent spawns cannot race past a conversation\'s limit, and one conversation cannot starve another', async () => {
+  it('concurrent spawns beyond the old limits all admit, and conversations do not interfere', async () => {
     const harness = await boot([{ toolCalls: [{ name: 'Read', args: {} }] }], { blocking: true })
     const other = harness.kernel.ctx.sessions.create(harness.workspaceId as never).id as unknown as string
     const [mine, theirs] = await Promise.all([
       Promise.allSettled([0, 1, 2, 3, 4, 5, 6].map(() => harness.executor.spawn(request(harness, explorer)))),
       Promise.allSettled([0, 1, 2, 3, 4, 5].map(() => harness.executor.spawn(request(harness, explorer, { parentSessionId: other as never })))),
     ])
-    expect(mine.filter((result) => result.status === 'fulfilled')).toHaveLength(6)
-    const refused = mine.filter((result): result is PromiseRejectedResult => result.status === 'rejected')
-    expect(refused).toHaveLength(1)
-    expect(refused[0]?.reason).toMatchObject({ code: 'capacity', message: expect.stringMatching(/for this conversation/) })
+    expect(mine.filter((result) => result.status === 'fulfilled')).toHaveLength(7)
+    expect(mine.filter((result) => result.status === 'rejected')).toHaveLength(0)
     expect(theirs.every((result) => result.status === 'fulfilled')).toBe(true)
     await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)
     await harness.executor.cancelAllOfRoot(other as never)
     await harness.kernel.stop()
   }, 20_000)
 
-  it('root slots are independent; host dispatch capacity queues rather than denying another root', async () => {
+  it('root slots are independent; every root holds many active children at once', async () => {
     const harness = await boot([{ toolCalls: [{ name: 'Read', args: {} }] }], { blocking: true })
     const roots = [harness.rootSessionId, ...[1, 2, 3].map(() => harness.kernel.ctx.sessions.create(harness.workspaceId as never).id as unknown as string)]
     for (const rootId of roots) {
       for (let i = 0; i < 6; i++) await harness.executor.spawn(request(harness, explorer, { parentSessionId: rootId as never }))
       expect(harness.executor.activeOfRoot(rootId as never)).toBe(6)
     }
-    await expect(harness.executor.spawn(request(harness, explorer, { parentSessionId: roots[0] as never }))).rejects.toThrow(/for this conversation/)
     const all = await Promise.all(roots.map((rootId) => harness.executor.childrenOfRoot(rootId as never)))
     expect(all.flat()).toHaveLength(24)
-    expect(all.flat().filter((child) => child.status === 'queued').length).toBeGreaterThan(0)
     for (const rootId of roots) {
       await harness.executor.cancelAllOfRoot(rootId as never)
       expect(harness.executor.activeOfRoot(rootId as never)).toBe(0)
@@ -972,6 +1086,7 @@ describe('the Agent tool', () => {
       childModelFor: () => undefined,
       providers: () => [],
       modelsOf: () => [],
+      admissionResolver: async ({ candidates }) => candidates,
     }
   }
 
@@ -983,10 +1098,19 @@ describe('the Agent tool', () => {
     const raw = await run('ws-tool', () => tool.execute({ action: 'spawn', definition: 'reviewer', prompt: 'Review src/a.ts', objective: 'old form', grantTools: ['Read', 'Write'] }, {} as never))
     const result = JSON.parse(String(raw)) as Record<string, unknown>
     expect(spawned[0]?.packet.prompt).toBe('Review src/a.ts')
-    expect(result['active']).toBe('1/6')
+    expect(result['active']).toBe(1)
     expect(result['droppedGrants']).toEqual(['Write'])
     expect(String(result['note'])).toContain("the prompt is the brief")
     expect(result['inheritedChars']).toBeUndefined()
+  })
+
+  it('passes trusted host admission through the Agent-tool spawn path', async () => {
+    const { executor, spawned } = fakeExecutor()
+    const base = deps(new AgentDefinitionService(home), executor)
+    const resolver = async () => ['Read'] as const
+    const tool = agentTool({ ...base, admissionResolver: resolver })
+    await run('ws-tool', () => tool.execute({ action: 'spawn', definition: 'reviewer', prompt: 'Review it', grantTools: ['Read'] }, {} as never))
+    expect(spawned[0]?.admissionResolver).toBe(resolver)
   })
 
   it('captures inherited context at spawn and reports its size', async () => {
@@ -1042,3 +1166,21 @@ describe('the Agent tool', () => {
     }
   })
 })
+
+it('cancel reconciliation retries failed process cleanup before publishing cancelled', async () => {
+  const harness = await boot([{ toolCalls: [{ name: 'Read', args: { path: 'a.ts' } }] }, 'stopped'], { blocking: true })
+  let attempts = 0
+  let fail = true
+  harness.kernel.ctx.provide('processes', { async cancelSession() { attempts++; if (fail) throw new Error('cleanup unavailable') } })
+  const handle = await harness.executor.spawn(request(harness, explorer))
+  const cancelled = await harness.executor.cancel(harness.workspaceId as never, handle.childSessionId)
+  expect(cancelled?.status).toBe('uncertain')
+  const before = attempts
+  const unresolved = await harness.executor.reconcile(harness.workspaceId as never, handle.childSessionId)
+  expect(unresolved?.status).toBe('uncertain')
+  expect(attempts).toBeGreaterThan(before)
+  fail = false
+  const resolved = await harness.executor.reconcile(harness.workspaceId as never, handle.childSessionId)
+  expect(resolved?.status).toBe('cancelled')
+  await harness.kernel.stop()
+}, 15000)

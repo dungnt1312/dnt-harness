@@ -34,7 +34,16 @@ const writer: LlmProvider = {
     // A child lists the project on its first request, so it makes a second one.
     if (systemText(request).includes('subagent') && !request.messages.some((message) => message.role === 'tool')) {
       await childGate
-      yield { type: 'toolCalls', calls: [{ id: `g-${Math.random()}`, name: 'Glob', args: { pattern: '*' } }] }
+      const text = request.messages.map((message) => typeof message.content === 'string' ? message.content : '').join('\n')
+      const pair = /write-pair (\S+) (\S+)/.exec(text)
+      const calls = pair === null
+        ? [{ id: `g-${Math.random()}`, name: 'Glob', args: { pattern: '*' } }]
+        : [
+            { id: `w-${Math.random()}`, name: 'Write', args: { path: pair[1]!, content: 'nested' } },
+            { id: `w-${Math.random()}`, name: 'Write', args: { path: pair[2]!, content: 'sibling' } },
+          ]
+      yield { type: 'toolCalls', calls }
+      yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
       return
     }
     const lastUser = [...request.messages].reverse().find((message) => message.role === 'user')
@@ -42,9 +51,11 @@ const writer: LlmProvider = {
     if (text.startsWith('write ') && !request.messages.some((message) => message.role === 'tool')) {
       const target = text.slice('write '.length)
       yield { type: 'toolCalls', calls: [{ id: `w-${Math.random()}`, name: 'Write', args: { path: target, content: 'granted' } }] }
+      yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
       return
     }
     yield { type: 'delta', delta: 'done' }
+    yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
   },
 }
 
@@ -68,6 +79,41 @@ async function waitFor<T>(probe: () => Promise<T | undefined> | T | undefined, w
     await new Promise((resolve) => setTimeout(resolve, 50))
   }
   throw new Error(`timed out waiting for ${what}`)
+}
+
+interface ApprovalFrame { readonly kind: string; readonly approvalId?: string }
+
+class ApprovalStream {
+  readonly frames: ApprovalFrame[] = []
+  private readonly reader: ReadableStreamDefaultReader<Uint8Array>
+
+  constructor(response: Response) {
+    this.reader = (response.body as ReadableStream<Uint8Array>).getReader()
+    void this.pump()
+  }
+
+  private async pump(): Promise<void> {
+    const decoder = new TextDecoder()
+    let buffer = ''
+    try {
+      for (;;) {
+        const chunk = await this.reader.read()
+        if (chunk.done) return
+        buffer += decoder.decode(chunk.value, { stream: true })
+        let boundary = buffer.indexOf('\n\n')
+        while (boundary >= 0) {
+          const data = buffer.slice(0, boundary).split('\n').find((line) => line.startsWith('data: '))
+          buffer = buffer.slice(boundary + 2)
+          boundary = buffer.indexOf('\n\n')
+          if (data !== undefined) this.frames.push(JSON.parse(data.slice(6)) as ApprovalFrame)
+        }
+      }
+    } catch {
+      // closed
+    }
+  }
+
+  close(): void { void this.reader.cancel().catch(() => {}) }
 }
 
 async function start(): Promise<WebServer> {
@@ -223,6 +269,61 @@ describe('folder grants', () => {
     )
     expect(systemText(second)).toContain(`Granted folder (read-only, use absolute paths): ${docs}`)
     expect(systemText(second)).not.toContain(shared)
+  }, 20_000)
+
+  it('a parent grant removed after spawn disappears from the running child context', async () => {
+    const { url: base } = await start()
+    const { wsId, sessionId } = await setup(base)
+    let release: () => void = () => {}
+    childGate = new Promise<void>((resolve) => { release = resolve })
+    const grantsUrl = `${base}/api/workspaces/${wsId}/sessions/${sessionId}/grants`
+    await send('PUT', grantsUrl, { expectedRevision: 0, roots: [{ path: docs, access: 'write' }] })
+    expect((await send('POST', `${base}/api/workspaces/${wsId}/agents/explorer`, { rootSessionId: sessionId, task: { prompt: 'Look around.' } })).status).toBe(202)
+    await waitFor(() => requests.find((request) => systemText(request).includes('subagent')), 'first child request')
+
+    await send('PUT', grantsUrl, { expectedRevision: 1, roots: [] })
+    release()
+    const second = await waitFor(
+      () => requests.find((request) => systemText(request).includes('subagent') && request.messages.some((message) => message.role === 'tool')),
+      'second child request',
+    )
+    expect(systemText(second)).not.toContain(docs)
+  }, 20_000)
+
+  it('a pending child write uses longest-root live narrowing and leaves a sibling grant unaffected', async () => {
+    const { url: base } = await start()
+    const { wsId, projectId, sessionId } = await setup(base)
+    const nested = path.join(shared, 'nested')
+    await fs.mkdir(nested)
+    const grantsUrl = `${base}/api/workspaces/${wsId}/sessions/${sessionId}/grants`
+    await send('PUT', grantsUrl, { expectedRevision: 0, roots: [{ path: shared, access: 'write' }, { path: docs, access: 'write' }] })
+    const stream = new ApprovalStream(await fetch(`${base}/api/workspaces/${wsId}/sessions/${sessionId}/events`))
+    try {
+      await waitFor(() => stream.frames.find((frame) => frame.kind === 'snapshot'), 'snapshot')
+      expect((await send('POST', `${base}/api/workspaces/${wsId}/agents/worker`, {
+        rootSessionId: sessionId,
+        task: { prompt: `write-pair ${path.join(nested, 'blocked.txt')} ${path.join(docs, 'allowed.txt')}` },
+        grantTools: ['Write'],
+      })).status).toBe(202)
+      const approval = await waitFor(() => stream.frames.find((frame) => frame.kind === 'approval'), 'child write approval')
+
+      // The broad root remains write, but its nested live root is read-only.
+      // Calls are already prepared and parked at the approval handshake.
+      expect((await send('PATCH', `${base}/api/workspaces/${wsId}/projects/${projectId}`, {
+        additionalDirectories: [{ kind: 'path', path: nested, access: 'read' }],
+      })).status).toBe(200)
+      expect((await send('POST', `${base}/api/approvals/${approval.approvalId}`, { allow: true })).status).toBe(200)
+      const siblingApproval = await waitFor(
+        () => stream.frames.find((frame) => frame.kind === 'approval' && frame.approvalId !== approval.approvalId),
+        'sibling write approval',
+      )
+      expect((await send('POST', `${base}/api/approvals/${siblingApproval.approvalId}`, { allow: true })).status).toBe(200)
+
+      await waitFor(() => fs.readFile(path.join(docs, 'allowed.txt'), 'utf8').catch(() => undefined), 'sibling write')
+      await expect(fs.readFile(path.join(nested, 'blocked.txt'), 'utf8')).rejects.toThrow()
+    } finally {
+      stream.close()
+    }
   }, 20_000)
 
   it('a child agent receives the parent session grants at spawn', async () => {

@@ -26,7 +26,12 @@ const fetchGitDiff = vi.fn(async (_workspaceId: string, _projectId: string, path
   ],
 }))
 
-vi.mock('../../lib/api.ts', () => ({ fetchGitStatus: () => fetchGitStatus(), fetchGitDiff: (ws: string, p: string, path: string) => fetchGitDiff(ws, p, path) }))
+vi.mock('../../lib/api.ts', () => ({
+  fetchGitStatus: () => fetchGitStatus(),
+  fetchGitDiff: (ws: string, p: string, path: string) => fetchGitDiff(ws, p, path),
+  mediaKindOf: () => null,
+  projectMediaUrl: (_ws: string, _project: string, path: string) => `/media?path=${encodeURIComponent(path)}`,
+}))
 
 let root: Root | undefined
 let host: HTMLDivElement

@@ -39,7 +39,7 @@ export interface AgentScope {
      * ceiling below is the enforcement).
      */
     readonly instructions: string
-    /** Hard ceiling: definition ∩ spawn grant (MCP always explicit). */
+    /** Hard ceiling: admission exposure ∩ definition ∩ spawn grant (MCP explicit). */
     readonly toolCeiling: readonly string[]
     /**
      * The parent's additional file-tool folders, snapshotted AT SPAWN. Like

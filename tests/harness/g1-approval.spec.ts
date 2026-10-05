@@ -8,6 +8,8 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
+import type { ExecutionId, SessionId, WorkspaceId } from '../../src/util/brand.ts'
+import type { ApprovalScope } from '../../src/harness/approval/policy.ts'
 import {
   AgentsService,
   Kernel,
@@ -16,6 +18,8 @@ import {
   ToolsService,
   agentScope,
   attachApproval,
+  approvalCallFingerprint,
+  createApprovalReceiptRegistry,
   type ApprovalHandle,
   type ApprovalMode,
   type PolicySource,
@@ -35,6 +39,13 @@ const echoTool: ToolDefinition = {
 
 function call(name: string): ToolCall {
   return { id: 'call-1', name, args: { message: 'hi' } }
+}
+
+const mcpQueryTool: ToolDefinition = {
+  name: 'mcp__fixture__query',
+  description: 'mcp query',
+  parameters: { type: 'object', properties: {}, required: [] },
+  async execute() { return 'ok' },
 }
 
 const rootTmp = path.join(tmpdir(), 'dnt-harness-approval-files')
@@ -59,6 +70,192 @@ function boot(policy: PolicySource, askUser?: (c: ToolCall) => Promise<boolean>)
 }
 
 describe('approval lifecycle', () => {
+  it.each([false, true])('resolves each stamped scope outside agentScope (failure=%s)', async (fail) => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.tools.register(echoTool)
+    const seen: unknown[] = []
+    let asking!: () => void
+    const asked = new Promise<void>((resolve) => { asking = resolve })
+    let current: 'ask' | 'allow' = 'ask'
+    const handle = attachApproval(kernel.ctx, {
+      authorityResolver: async (_call, scope) => {
+        seen.push({ ...scope })
+        if (current === 'allow' && fail) throw new Error('resolver unavailable')
+        return current === 'ask' ? { kind: 'ask', requirements: [{ kind: 'tool-policy' }] } : { kind: 'allow' }
+      },
+      askUser: () => { asking(); return new Promise<boolean>(() => {}) },
+    })
+    const scope = { sessionId: 'child', rootSessionId: 'root', workspaceId: 'work' } as unknown as Parameters<typeof agentScope.run>[0]
+    const result = agentScope.run(scope, () => kernel.ctx.tools.execute(call('Echo')))
+    await asked
+    expect(agentScope.getStore()).toBeUndefined()
+    current = 'allow'
+    await handle.reevaluate({ rootSessionId: 'root' })
+    expect((await result).ok).toBe(!fail)
+    expect(seen).toHaveLength(2)
+    expect(seen[1]).toMatchObject({ sessionId: 'child', rootSessionId: 'root', workspaceId: 'work', executionId: expect.any(String) })
+    await kernel.stop()
+  })
+
+  it('contains resolver failures after a human answer and synchronous answerer failures', async () => {
+    for (const answererFails of [false, true]) {
+      const kernel = new Kernel()
+      kernel.ctx.plugin(ToolsService)
+      kernel.ctx.tools.register(echoTool)
+      let reads = 0
+      attachApproval(kernel.ctx, {
+        authorityResolver: async () => {
+          if (++reads > 1) throw new Error('authority unavailable')
+          return { kind: 'ask', requirements: [{ kind: 'tool-policy' }] }
+        },
+        askUser: () => {
+          if (answererFails) throw new Error('answerer unavailable')
+          return Promise.resolve(true)
+        },
+      })
+      const result = await kernel.ctx.tools.execute(call('Echo'))
+      expect(result.ok).toBe(false)
+      expect(result.output).toMatch(/failed/)
+      await kernel.stop()
+    }
+  })
+
+  it('cancels an initial async resolver allow when Stop arrives during resolution', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(ToolsService)
+    let effects = 0
+    kernel.ctx.tools.register({ ...echoTool, execute: async () => { effects++; return 'ok' } })
+    let resolving!: () => void
+    const started = new Promise<void>((resolve) => { resolving = resolve })
+    let release!: () => void
+    const wait = new Promise<void>((resolve) => { release = resolve })
+    attachApproval(kernel.ctx, {
+      authorityResolver: async () => {
+        resolving()
+        await wait
+        return { kind: 'allow' }
+      },
+    })
+    const controller = new AbortController()
+    const result = kernel.ctx.tools.execute(call('Echo'), { signal: controller.signal })
+    await started
+    controller.abort()
+    release()
+    const outcome = await result
+    await kernel.stop()
+    expect(outcome.ok).toBe(false)
+    expect(outcome.output).toMatch(/cancelled/)
+    expect(effects).toBe(0)
+  })
+
+  it.each(['concurrent', 'already settling'] as const)('each reevaluation awaits durable settlement (%s)', async (timing) => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(ToolsService)
+    let effects = 0
+    kernel.ctx.tools.register({ ...echoTool, execute: async () => { effects++; return 'ok' } })
+    let asking!: () => void
+    const asked = new Promise<void>((resolve) => { asking = resolve })
+    let release!: () => void
+    const durable = new Promise<void>((resolve) => { release = resolve })
+    const events: Record<string, unknown>[] = []
+    kernel.ctx.provide('sessions', { get: () => ({
+      append: (event: Record<string, unknown>) => { events.push(event) },
+      durable: () => events.some((event) => event['type'] === 'approval/decision') ? durable : Promise.resolve(),
+    }) } as never)
+    let current: 'ask' | 'allow' = 'ask'
+    const handle = attachApproval(kernel.ctx, {
+      authorityResolver: async () => current === 'ask' ? { kind: 'ask', requirements: [] } : { kind: 'allow' },
+      askUser: () => { asking(); return new Promise<boolean>(() => {}) },
+    })
+    const sessionId = 'session' as Session['id']
+    const result = agentScope.run({ sessionId, workspaceId: 'work' as WorkspaceId }, () => kernel.ctx.tools.execute(call('Echo')))
+    await asked
+    current = 'allow'
+    const completed = [false, false]
+    const first = handle.reevaluate({ workspaceId: 'work' }).then(() => { completed[0] = true })
+    if (timing === 'already settling') await new Promise((resolve) => setTimeout(resolve, 0))
+    const second = handle.reevaluate({ workspaceId: 'work' }).then(() => { completed[1] = true })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    // A different workspace must not wait for this settlement.
+    await handle.reevaluate({ workspaceId: 'other' })
+    const beforeDurability = [...completed]
+    const effectsBeforeDurability = effects
+    const decisionCount = events.filter((event) => event['type'] === 'approval/decision').length
+    release()
+    await Promise.all([first, second])
+    const outcome = await result
+    await kernel.stop()
+    expect(beforeDurability).toEqual([false, false])
+    expect(effectsBeforeDurability).toBe(0)
+    expect(decisionCount).toBe(1)
+    expect(outcome.ok).toBe(true)
+    expect(effects).toBe(1)
+  })
+
+  it('receipts bind exact call and execution scope and cover only shown requirement subjects', () => {
+    const registry = createApprovalReceiptRegistry()
+    const approved = call('Echo')
+    const scope: ApprovalScope = { workspaceId: 'work', rootSessionId: 'root' as SessionId, sessionId: 'child' as SessionId, executionId: 'exec' as ExecutionId, turnId: undefined }
+    const shown = [{ kind: 'tool-policy' as const, subjectFingerprint: 'Echo:ask', version: 1 }]
+    const receipt = registry.issue(approved, scope, shown)
+    expect(receipt?.callFingerprint).toBe(approvalCallFingerprint(approved))
+    expect(registry.covers(approved, scope, shown)).toBe(true)
+    expect(registry.covers({ ...approved, args: { message: 'changed' } }, scope, shown)).toBe(false)
+    expect(registry.covers(approved, { ...scope, rootSessionId: 'other-root' as SessionId }, shown)).toBe(false)
+    expect(registry.covers(approved, { ...scope, workspaceId: 'other-work' }, shown)).toBe(false)
+    expect(registry.covers(approved, { ...scope, executionId: 'other-exec' as ExecutionId }, shown)).toBe(false)
+    expect(registry.covers(approved, scope, [{ ...shown[0]!, version: 2 }])).toBe(false)
+    expect(registry.covers(approved, scope, [{ kind: 'outside-path', subjectFingerprint: '/tmp:x' }])).toBe(false)
+    registry.retire('exec' as ExecutionId)
+    expect(registry.covers(approved, scope, shown)).toBe(false)
+  })
+
+  it('policy-only reevaluation allow creates no human receipt', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.tools.register(echoTool)
+    const registry = createApprovalReceiptRegistry()
+    let current: 'ask' | 'allow' = 'ask'
+    let asked!: () => void
+    const waiting = new Promise<void>((resolve) => { asked = resolve })
+    const handle = attachApproval(kernel.ctx, {
+      receiptRegistry: registry,
+      authorityResolver: async () => current === 'ask'
+        ? { kind: 'ask', requirements: [{ kind: 'tool-policy', version: 1 }] }
+        : { kind: 'allow' },
+      askUser: () => { asked(); return new Promise<boolean>(() => {}) },
+    })
+    const executionId = 'policy-only' as ExecutionId
+    const scope = { sessionId: 'session' as SessionId, rootSessionId: 'root' as SessionId, workspaceId: 'work' as WorkspaceId }
+    const result = agentScope.run(scope, () => kernel.ctx.tools.prepare(call('Echo'), { executionId }))
+    await waiting
+    current = 'allow'
+    await handle.reevaluate({ workspaceId: 'work' })
+    const prepared = await result
+    expect(registry.receiptFor(prepared.call, { ...scope, turnId: undefined, executionId })).toBeUndefined()
+    await prepared.execute()
+    await kernel.stop()
+  })
+
+  it('a human receipt survives an unrelated authority change', () => {
+    const registry = createApprovalReceiptRegistry()
+    const approved = call('Echo')
+    const scope: ApprovalScope = { workspaceId: 'work', rootSessionId: 'root' as SessionId, sessionId: 'child' as SessionId, executionId: 'exec-human' as ExecutionId, turnId: undefined }
+    const shown = [{ kind: 'tool-policy' as const, subjectFingerprint: 'Echo:ask', version: 7 }]
+    registry.issue(approved, scope, shown)
+    // An unrelated tool/config revision does not alter the shown requirement.
+    expect(registry.covers(approved, scope, shown)).toBe(true)
+  })
+
+  it('standalone ToolsService retains generic policy compatibility without execution scope', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.tools.register(echoTool)
+    attachApproval(kernel.ctx, { policy: { Echo: 'allow' } })
+    expect(await kernel.ctx.tools.execute(call('Echo'))).toEqual({ ok: true, output: 'echo: hi' })
+    await kernel.stop()
+  })
   it('an undecided approval expires and never approves implicitly', async () => {
     const { kernel, session } = boot({ Echo: 'ask' }, () => new Promise<boolean>(() => {}))
     kernel.ctx.tools.register(echoTool)
@@ -281,6 +478,40 @@ describe('approval lifecycle', () => {
     await session.durable()
     const decision = session.events.find((e) => e.type === 'approval/decision')
     expect(decision?.type === 'approval/decision' && decision.decision).toBe('deny')
+    void kernel.stop()
+  })
+
+  it('a mode switch with a non-empty built-in exposure ceiling leaves a pending MCP ask exposed', async () => {
+    // Mode files can only list built-ins in toolExposure; mcp__* names are
+    // dynamic. A switch to a mode that exposes built-ins must not cancel a
+    // pending MCP ask just because its name is absent from the list — the
+    // gate matches the web host's exposureDenial (zero ceiling is the only
+    // honest MCP off-switch).
+    let current: Record<string, ApprovalMode> = { 'mcp__fixture__query': 'ask' }
+    const { kernel, session, handle } = boot(() => current, () => new Promise<boolean>(() => {}))
+    kernel.ctx.tools.register(mcpQueryTool)
+    const resultPromise = agentScope.run({ sessionId: session.id }, () =>
+      kernel.ctx.tools.execute({ id: 'm1', name: 'mcp__fixture__query', args: {} }),
+    ) as Promise<{ ok: boolean; output: string }>
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    current = { 'mcp__fixture__query': 'allow' }
+    handle.reevaluate({ toolExposure: ['Read', 'Bash'] })
+    const result = await resultPromise
+    expect(result).toEqual({ ok: true, output: 'ok' })
+    void kernel.stop()
+  })
+
+  it('a zero-exposure mode change cancels a pending MCP ask', async () => {
+    const { kernel, session, handle } = boot({ 'mcp__fixture__query': 'ask' }, () => new Promise<boolean>(() => {}))
+    kernel.ctx.tools.register(mcpQueryTool)
+    const resultPromise = agentScope.run({ sessionId: session.id }, () =>
+      kernel.ctx.tools.execute({ id: 'm1', name: 'mcp__fixture__query', args: {} }),
+    ) as Promise<{ ok: boolean; output: string }>
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    handle.reevaluate({ toolExposure: [] })
+    const result = await resultPromise
+    expect(result?.ok).toBe(false)
+    expect(result?.output).toMatch(/no longer exposed/)
     void kernel.stop()
   })
 

@@ -32,7 +32,8 @@ function boot(): { kernel: Kernel; guard: ReturnType<typeof attachPathScopeGuard
   kernel.ctx.plugin(ToolsService)
   for (const tool of fsTools()) kernel.ctx.tools.register(tool)
   kernel.ctx.tools.setRootResolver(() => ({ root }))
-  const guard = attachPathScopeGuard(kernel.ctx, { exempt: () => false, proposeGrant: async () => undefined })
+  const guard = attachPathScopeGuard(kernel.ctx, { proposeGrant: async () => undefined })
+  kernel.ctx.tools.setAuthorityRetirer((executionId) => { guard.retire(executionId) })
   kernel.ctx.tools.setApprovedPathResolver(async (call, allowed, exec) => {
     const match = guard.take(exec?.executionId, call, allowed)
     return match === undefined ? undefined : [{ path: match.path, intent: match.intent }]
@@ -63,6 +64,10 @@ describe('path-scope guard', () => {
     expect(matched).toMatchObject({ path: path.join(outside, 'x.txt'), intent: 'read' })
     // No approval layer here: the allowed call reads the approved path once.
     expect((await prepared.execute()).output).toBe('1\toutside')
+    // `take()` consumed the one-call grant, while immutable classification is
+    // retained for the host's final authority check until execution retires.
+    expect(guard.get(prepared.executionId, prepared.call)?.path).toBe(path.join(outside, 'x.txt'))
+    guard.retire(prepared.executionId)
     expect(guard.get(prepared.executionId, prepared.call)).toBeUndefined()
   })
 

@@ -3,7 +3,8 @@
  * into the running turn, never auto-executed after stop), execution budgets,
  * the stream-inactivity watchdog, and storage-failure classification.
  */
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+afterEach(() => vi.useRealTimers())
 import {
   AgentsService,
   Kernel,
@@ -171,14 +172,17 @@ describe('stop semantics', () => {
   }, 5_000)
 
   it('the inactivity watchdog fails a silent provider as a provider error', async () => {
+    vi.useFakeTimers()
     const kernel = new Kernel()
     kernel.ctx.plugin(SessionsService)
     kernel.ctx.plugin(LlmService)
     kernel.ctx.plugin(AgentsService)
-    kernel.ctx.provide('limits', { streamFirstEventMs: 80 })
+    kernel.ctx.provide('limits', { streamFirstEventMs: 80, stepRetries: 1, stepRetryBaseMs: 1 })
+    let requests = 0
     kernel.ctx.llm.register({
       name: 'silent',
       async *stream(): AsyncIterable<StreamEvent> {
+        requests += 1
         await new Promise(() => {})
         yield { type: 'delta', delta: 'never' }
       },
@@ -186,14 +190,45 @@ describe('stop semantics', () => {
     const session = kernel.ctx.sessions.create()
     const agent = kernel.ctx.agents.create(session)
     agent.send('hello?')
-    await agent.run()
+    const running = agent.run()
+    await vi.advanceTimersByTimeAsync(10_100)
+    await running
 
+    // An uncooperative transport cannot be overlapped by a retry.
+    expect(requests).toBe(1)
+    expect(kernel.ctx.llm.admission('silent').uncertain.size).toBe(1)
     const error = session.events.find((e) => e.type === 'turn/error')
     expect(error?.type === 'turn/error' && error.kind).toBe('provider')
+    expect(error?.type === 'turn/error' && error.message).toMatch(/first_progress_timeout/)
     const end = session.events.findLast((e) => e.type === 'turn/end')
     expect(end?.type === 'turn/end' && end.reason).toBe('failed')
     void kernel.stop()
   }, 5_000)
+
+  it.each([
+    { type: 'delta', delta: '' },
+    { type: 'toolCalls', calls: [] },
+    { type: 'usage', usage: { inputTokens: 1 } },
+  ] satisfies StreamEvent[])('non-progress event $type does not release the first-event deadline', async (event) => {
+    vi.useFakeTimers()
+    const h = boot([], { limits: { streamFirstEventMs: 30, stepRetries: 1, stepRetryBaseMs: 1 } })
+    h.llm.register({
+      name: 'no-progress',
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield event
+        await new Promise(() => {})
+      },
+    })
+    h.llm.use('no-progress')
+    h.agent.send('go')
+    const running = h.agent.run()
+    await vi.advanceTimersByTimeAsync(10_100)
+    const error = h.session.events.find((e) => e.type === 'turn/error')
+    h.agent.stop()
+    await running
+    expect(error).toMatchObject({ kind: 'provider', message: expect.stringMatching(/first_progress_timeout/) })
+    void h.kernel.stop()
+  })
 
   it('thinking-length silence before the first event survives when it fits the first-event window', async () => {
     const kernel = new Kernel()
@@ -203,12 +238,13 @@ describe('stop semantics', () => {
     // The pre-output silence (150ms) exceeds the between-events window but
     // fits the first-event window — the real shape of an extended-thinking
     // turn whose gateway swallows the reasoning deltas.
-    kernel.ctx.provide('limits', { streamFirstEventMs: 1_000, streamInactivityMs: 50 })
+    kernel.ctx.provide('limits', { streamFirstEventMs: 1_000 })
     kernel.ctx.llm.register({
       name: 'thinking',
       async *stream(): AsyncIterable<StreamEvent> {
         await new Promise((resolve) => setTimeout(resolve, 150))
         yield { type: 'delta', delta: 'thought it through' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     })
     const session = kernel.ctx.sessions.create()
@@ -223,12 +259,45 @@ describe('stop semantics', () => {
     void kernel.stop()
   }, 5_000)
 
-  it('a stall after output started still fails the turn as a provider error', async () => {
+  it('tool argument progress releases the first-event deadline without logging or executing partial calls', async () => {
+    const h = boot([], { limits: { streamFirstEventMs: 40 } })
+    let release!: () => void
+    const hold = new Promise<void>((resolve) => { release = resolve })
+    let progressed!: () => void
+    const progress = new Promise<void>((resolve) => { progressed = resolve })
+    h.llm.register({
+      name: 'tool-progress',
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: 'toolCallProgress' }
+        progressed()
+        await hold
+        yield { type: 'delta', delta: 'finished' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    })
+    h.llm.use('tool-progress')
+    h.agent.send('write')
+    const running = h.agent.run()
+    await progress
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    const beforeCompletion = [...h.session.events]
+    release()
+    await running
+
+    expect(beforeCompletion.some((e) => ['assistant/chunk', 'assistant/message', 'tool/call', 'turn/end'].includes(e.type))).toBe(false)
+    expect(h.session.events.some((e) => e.type === 'turn/error')).toBe(false)
+    expect(h.session.events.findLast((e) => e.type === 'turn/end')).toMatchObject({ reason: 'completed' })
+    expect(h.session.events.find((e) => e.type === 'assistant/message')).toMatchObject({ content: 'finished' })
+    void h.kernel.stop()
+  })
+
+  it('silence after output is unlimited and can still be stopped by the user', async () => {
     const kernel = new Kernel()
     kernel.ctx.plugin(SessionsService)
     kernel.ctx.plugin(LlmService)
     kernel.ctx.plugin(AgentsService)
-    kernel.ctx.provide('limits', { streamFirstEventMs: 60_000, streamInactivityMs: 80 })
+    // Silence after output started must never impose a deadline.
+    kernel.ctx.provide('limits', { streamFirstEventMs: 80 })
     kernel.ctx.llm.register({
       name: 'stall-after-first',
       async *stream(): AsyncIterable<StreamEvent> {
@@ -239,12 +308,16 @@ describe('stop semantics', () => {
     const session = kernel.ctx.sessions.create()
     const agent = kernel.ctx.agents.create(session)
     agent.send('hello?')
-    await agent.run()
+    const running = agent.run()
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const endedBeforeStop = session.events.some((e) => e.type === 'turn/end')
+    agent.stop()
+    await running
 
-    const error = session.events.find((e) => e.type === 'turn/error')
-    expect(error?.type === 'turn/error' && error.kind).toBe('provider')
+    expect(endedBeforeStop).toBe(false)
+    expect(session.events.some((e) => e.type === 'turn/error')).toBe(false)
     const end = session.events.findLast((e) => e.type === 'turn/end')
-    expect(end?.type === 'turn/end' && end.reason).toBe('failed')
+    expect(end?.type === 'turn/end' && end.reason).toBe('cancelled')
     void kernel.stop()
   }, 5_000)
 })
@@ -394,9 +467,7 @@ describe('turn invariants', () => {
 describe('unbounded turns', () => {
   it('legacy step and deadline overrides no longer cut off a turn', async () => {
     const toolStep = { toolCalls: [call('c', 'Glob')] }
-    const h = boot([toolStep, toolStep, toolStep, toolStep, 'done'], {
-      limits: { maxSteps: 2, turnDeadlineMs: 1 },
-    })
+    const h = boot([toolStep, toolStep, toolStep, toolStep, 'done'])
     h.kernel.ctx.tools.register({
       name: 'Glob',
       description: 'slow noop',
@@ -509,7 +580,7 @@ describe('turn settlement', () => {
 
   it('agent/turn-settled fires exactly once after an extended tool loop', async () => {
     const toolStep = { toolCalls: [call('c', 'Glob')] }
-    const h = boot([toolStep, toolStep, toolStep, 'done'], { limits: { maxSteps: 1, turnDeadlineMs: 1 } })
+    const h = boot([toolStep, toolStep, toolStep, 'done'])
     h.kernel.ctx.tools.register({
       name: 'Glob', description: 'n', parameters: { type: 'object', properties: {}, required: [] },
       async execute() { return 'none' },

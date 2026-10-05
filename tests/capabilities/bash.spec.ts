@@ -4,12 +4,13 @@
  * environments with actionable errors, and stop cancellation.
  */
 import { promises as fs } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { bashTool, fsTools, Kernel, ToolsService, type ToolExecution } from 'dnt-harness'
 import { sweepByTag, TREE_TAG_ENV } from '../../src/capabilities/shell/bash.ts'
-import { detectShell } from '../../src/capabilities/shell/detect.ts'
+import { detectShell, shellCatalog } from '../../src/capabilities/shell/detect.ts'
 
 const exec: ToolExecution = { root: process.cwd() }
 
@@ -47,7 +48,7 @@ describe('bash tool', () => {
     await expect(kernel.ctx.tools.execute({ id: 'unbound-bash', name: 'Bash', args: { command: 'echo escaped' } }))
       .resolves.toEqual({
         ok: false,
-        output: "no workspace root is granted for 'Bash'; grant one before running root-aware tools",
+        output: "denied: no workspace root is granted for 'Bash'; grant one before running root-aware tools",
       })
   })
 
@@ -134,6 +135,30 @@ describe('bash tool', () => {
     await fs.rm(root, { recursive: true, force: true })
     expect(markerExists).toBe(false)
   }, 10_000)
+
+  it('labels the interactive shell Bash on POSIX and Git Bash on Windows', () => {
+    const bash = shellCatalog().find((option) => option.id === 'bash')
+    expect(bash).toBeDefined()
+    expect(bash!.label).toBe(process.platform === 'win32' ? 'Git Bash' : 'Bash')
+  })
+
+  it('leads the macOS catalog with zsh and still offers bash after it', () => {
+    if (process.platform !== 'darwin') return
+    const catalog = shellCatalog()
+    expect(catalog[0]).toMatchObject({ id: 'zsh', label: 'zsh', executable: expect.stringMatching(/\/zsh$/) })
+    expect(catalog.map((option) => option.id)).toContain('bash')
+  })
+
+  it('resolves the zsh option to an existing executable with interactive args', () => {
+    const zsh = shellCatalog().find((option) => option.id === 'zsh')
+    if (process.platform !== 'darwin') {
+      expect(zsh).toBeUndefined()
+      return
+    }
+    expect(zsh).toBeDefined()
+    expect(existsSync(zsh!.executable)).toBe(true)
+    expect(zsh!.args).toEqual(['-i'])
+  })
 
   it.runIf(process.platform === 'win32')('the tag sweep alone kills a tagged tree whose root no walk can reach', async () => {
     // Models the orphan taskkill /T misses: nothing here walks a tree, so

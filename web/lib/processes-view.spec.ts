@@ -26,15 +26,23 @@ describe('processRows', () => {
 })
 
 describe('subagentRows', () => {
-  it('derives running and finished children', () => {
+  it('derives running and finished children, newest dispatch first', () => {
     const rows = subagentRows([
-      ev('agent/child-spawn', { childSessionId: 'c1', definition: 'researcher' }),
-      ev('agent/child-spawn', { childSessionId: 'c2', definition: 'coder' }),
+      ev('agent/child-spawn', { childSessionId: 'c1', definition: 'researcher', timestamp: 1_000 }),
+      ev('agent/child-spawn', { childSessionId: 'c2', definition: 'coder', timestamp: 2_000 }),
       ev('agent/child-result', { childSessionId: 'c2', status: 'completed' }),
     ])
     expect(rows).toEqual([
-      { childSessionId: 'c1', definition: 'researcher', running: true },
-      { childSessionId: 'c2', definition: 'coder', running: false, status: 'completed' },
+      { childSessionId: 'c2', definition: 'coder', running: false, status: 'completed', dispatchedAt: 2_000 },
+      { childSessionId: 'c1', definition: 'researcher', running: true, dispatchedAt: 1_000 },
     ])
+  })
+
+  it('keeps spawn order for legacy events without timestamps', () => {
+    const rows = subagentRows([
+      ev('agent/child-spawn', { childSessionId: 'c1', definition: 'researcher' }),
+      ev('agent/child-spawn', { childSessionId: 'c2', definition: 'coder' }),
+    ])
+    expect(rows.map((row) => row.childSessionId)).toEqual(['c1', 'c2'])
   })
 })

@@ -21,6 +21,12 @@ afterEach(() => {
   host.remove()
 })
 
+// jsdom does no layout, so it has no scrollIntoView; the model picker calls it
+// to bring the active row into view on open.
+if (typeof Element !== 'undefined' && typeof Element.prototype.scrollIntoView !== 'function') {
+  Element.prototype.scrollIntoView = function scrollIntoView(): void {}
+}
+
 describe('session control labels', () => {
   it('labels the model control as conversation scoped', () => {
     act(() => root.render(<ModelMenu
@@ -64,5 +70,35 @@ describe('session control labels', () => {
     expect(rows[0]?.textContent).toContain('Saved Max is not available on this model')
     expect(rows.filter((row) => row.getAttribute('aria-checked') === 'true')).toHaveLength(1)
     expect(rows[0]?.getAttribute('aria-checked')).toBe('true')
+  })
+
+  it('marks the active model row and lands the open panel on it', () => {
+    const options = [
+      { value: 'cliproxy:gpt-6-luna', label: 'cliproxy / gpt-6-luna', provider: 'cliproxy', model: 'gpt-6-luna' },
+      { value: 'cliproxy:gpt-6-astra', label: 'cliproxy / gpt-6-astra', provider: 'cliproxy', model: 'gpt-6-astra' },
+    ]
+    act(() => root.render(<ModelMenu
+      menuLabel="Conversation model (next request)"
+      modelLabel="cliproxy / gpt-6-astra"
+      modelValue="cliproxy:gpt-6-astra"
+      options={options}
+      providers={[{ id: 'cliproxy', name: 'cliproxy', baseUrl: '', enabled: true, keyMasked: '', models: ['gpt-6-luna', 'gpt-6-astra'] }]}
+      onModel={() => {}}
+      onManage={() => {}}
+    />))
+    const scrolled: Element[] = []
+    const original = Element.prototype.scrollIntoView
+    Element.prototype.scrollIntoView = function scrollIntoView(this: Element): void { scrolled.push(this) }
+    try {
+      act(() => (host.querySelector('button') as HTMLButtonElement).click())
+      const modelRow = document.querySelector('[aria-label="Models"] [role="option"][aria-selected="true"]') as HTMLButtonElement | null
+      expect(modelRow?.textContent).toContain('gpt-6-astra')
+      expect(modelRow?.className).toContain('bg-hover')
+      expect(scrolled).toContain(modelRow)
+      const providerRow = document.querySelector('[aria-label="Providers"] [role="option"][aria-selected="true"]')
+      expect(scrolled).toContain(providerRow)
+    } finally {
+      Element.prototype.scrollIntoView = original
+    }
   })
 })

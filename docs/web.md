@@ -15,7 +15,9 @@ web-dist/           Vite build output (gitignored, produced by npm run build:web
 
 The browser client holds **no model state of its own**. The transcript is
 projected from the durable session events streamed over SSE — a fresh connection
-first receives a **snapshot** of the whole log, then live `session/event`
+first receives a **snapshot** of the whole log (server-compacted: raw content
+chunks of finalized steps and `context/body` payloads never ship; reasoning
+folds to one event per step), then live `session/event`
 frames. Approval questions arrive on the same stream as `approval` envelopes,
 and answers go back over one POST. This is the "render from `session/event`"
 principle: the log is the single source of truth, and any client can rebuild the
@@ -31,12 +33,12 @@ UI from it at any time.
 - Model menus offer search for larger lists, provider grouping, keyboard navigation and full wrapping option labels. Popups portal into document.body with viewport-clamped positioning and scroll/resize updates; Escape belongs to the popup before a drawer or modal.
 - Model and thinking level are **per-conversation controls**, backed by the session's durable preference (`GET/PUT …/:wid/sessions/:id/model`). The client caches them per workspace+session, serializes partial writes per conversation, and never substitutes defaults while a conversation's controls are loading or failed: the composer blocks sending with a status hint and offers a Retry refetch on failure. With no conversation selected the same pickers edit the **global default** (`/api/model-defaults`) that future sessions snapshot.
 - The sidebar docks at 768px and above (its collapsed state is remembered); below that it is a modal drawer with a scrim, Escape handling, focus containment and focus restoration. Settings tabs use arrow/Home/End navigation, roving tabindex and linked tabpanels. Provider edits survive tab changes; close/provider changes request discard confirmation, including pending model text.
-- Expanded tool rows show all arguments and output; transcript identities are explicit (right-aligned user bubbles, plain assistant prose).
+- Tool rows are lines of text, not boxes: one line names what ran and what it acted on, and only a row with something to show opens — into one shared frame (rule above and below, faint fill) that presents a command as a terminal, a change as the Git panel's diff, and anything else as its result. The exact arguments stay one click away under "View call details". Transcript identities are explicit (right-aligned user bubbles, plain assistant prose).
 
 ### Production task workflows
 
 - **New conversation** and Ctrl/Cmd+N clear the canvas without creating a session. The composer's scope chip picks an existing project, a newly chosen folder, or **Chat only**; the session is created by the first sent message, and a failed first send keeps the draft.
-- The sidebar footer owns workspace selection; the sidebar also groups project history and search. History filters only affect navigation, never a session's immutable execution project.
+- The sidebar footer owns workspace selection; the sidebar also groups project history and search. History filters only affect navigation, never a session's immutable execution project. Subagent conversations are not top-level rows: a **running** child (or the child being viewed) nests under its parent conversation as a branch-icon row — running ones carry a spinner — that opens the child's own conversation, while ended children stay in the parent's Subagents workbench view; every parent conversation itself always keeps its row so its next prompt stays one click away. A search match on a shown child's title keeps the parent row visible so the nest stays reachable.
 - The Context sheet starts closed at every viewport size. Context manifests load only while it is open. The main pane shows durable task lifecycle and separately explains event-stream connection loss. Queued/being-submitted inputs show preparing; open turns show running or waiting approval; terminal reasons remain visible. Partial assistant chunks stop appearing live at turn end.
 - Composer is a contenteditable with inline chips: `@` lists files from the conversation's project (bounded search that never follows symlinks or walks hidden/`node_modules` trees) and inserts a mention chip rendered where the caret was; `/` at the start inserts a skill invocation phrase as plain text; `+` attaches a project file (reference chip) or an uploaded file (stored blob chip), and pasted/dropped images become attachment chips. Neither completion nor attachment grants a permission, reads a file, or pins a skill by itself. Both menus stay shut without a source, are driven from the contenteditable (a combobox with `aria-activedescendant`), and Escape closes them until the query changes. Removing a chip removes exactly that segment; ArrowUp on an empty composer brings back the newest own message; unsent drafts (text plus chips) survive a reload.
 - Composer context shows the fixed project path or an explicit no-project warning with a new-conversation CTA. “Chat-only” describes absence of a project, not a mode switch or a promise to disable every tool. Model and thinking controls belong to the conversation and apply at its next request (the no-conversation pickers write the global default for future sessions); the selected mode governs permissions at the next request/tool gate. Mode and server restrictions still apply.
@@ -47,7 +49,7 @@ UI from it at any time.
 - The selected mode is the workspace's permission truth. Its `permissionDefaults` decide each tool; `--yolo` is stated on the trigger and maps asks to allows, but never lifts an explicit deny.
 - Failed, cancelled, limited and interrupted work offers inspection-first recovery guidance. Unknown recovered tool results are explicitly called out. There is no automatic retry or replay control: inspect actual effects, then submit new instructions limited to remaining work.
 - The Providers pane states each fact once. The provider name is its editable title (rename in place) with enablement as a state pill plus the opposite verb, and delete lives on that title row; the rail carries the name, the `default` marker and the enabled dot. A model row is one pill — id, `Vision` when it accepts images, its context window — with the provider-default radio and the global-default, edit and remove actions beside it. Per-model overrides open in **Edit model settings**, committed or abandoned as one decision: id (renaming carries its overrides), context window, input types — text is shown locked because every model takes it, image is a checkbox whose state is the effective one, with a link back to the catalog default once it is overridden — and thinking default. **Sync from /models** probes the endpoint and opens a selection: checked models are kept, unchecking one removes it, models the endpoint does not offer are left alone, and nothing is stored until Save.
-- Settings distinguish global provider storage plus the global default model from workspace services. **Modes** sits after Projects in the Workspace group: its structured editor loads a workspace file into a form (name, instructions, context sources, tool exposure, per-key permissions), saves existing files with `expectedHash`, and offers Reload or an overwrite that first reloads the fresh hash after a conflict. Its catalog puts bundled read-only modes first (Duplicate only), then workspace modes (Edit/Delete); every row can be disabled, which hides the mode from the composer picker until re-enabled. It plainly lists each `permissionDefaults` key including `*` and MCP patterns. A saved mode change applies only when the mode is next selected; deleting the selected file likewise leaves the workspace's active cached snapshot active until another mode is selected. Agent definitions are workspace-scoped; child listings are current-session-scoped. Saving configuration is not evidence of connectivity; provider connection checks use saved configuration rather than unsaved drafts.
+- Settings distinguish global provider storage plus the global default model from workspace services. **Modes** sits after Projects in the Workspace group: its structured editor loads a workspace file into a form (name, instructions, context sources, tool exposure, per-key permissions), saves existing files with `expectedHash`, and offers Reload or an overwrite that first reloads the fresh hash after a conflict. Its catalog puts bundled read-only modes first (Duplicate only), then workspace modes (Edit/Delete); every row can be disabled, which hides the mode from the composer picker until re-enabled. It plainly lists each `permissionDefaults` key including `*` and MCP patterns. Mode authoring does not switch an existing conversation: each root owns its live selected mode, and a conversation mode switch applies at its next model request or unstarted tool gate. Workspace mode selection seeds new conversations and draft UI. Agent definitions are workspace-scoped; child listings are current-session-scoped. Saving configuration is not evidence of connectivity; provider connection checks use saved configuration rather than unsaved drafts.
 - Automated workflow regressions cover scope validation, creation markup, durable lifecycle, stopped partial chunks, recovery guidance and approval arguments/decision rendering. Fixture-backed Chromium interactions, mobile layout, keyboard focus and all settings sections pass. Real-backend end-to-end workflows, native zoom and screen-reader acceptance remain separate gates.
 
 ## Starting it
@@ -133,14 +135,15 @@ tool root. The families, at a glance:
 | `…/:wid/sessions/:id/manifest`, `…/compact` | per-request context manifest; compaction into an immutable checkpoint — manual via the route, automatic when the context-pressure limit is set. PreCompact hooks gate both |
 | `GET/PUT /api/model-defaults` | the **global** default provider/model/thinking level, shared by every workspace: the pair new sessions snapshot at creation, the draft pickers' target, and the live fallback for legacy conversations without a snapshot |
 | `PUT …/:wid/model`, `PUT …/:wid/thinking` | compatibility proxies: they verify workspace ownership, then mutate the **global** default above; new clients use `/api/model-defaults` |
-| `PUT …/:wid/mode`, `GET …/:wid/meta` | workspace-local mode control. The selected mode is the sole permission source. The `GET …/mode` catalog lists **enabled modes only** (a disabled mode refused for selection answers `400`); `GET …/meta` returns the selected mode's `permissionDefaults`, `mode`, and `yolo` when enabled; it does not return a policy or effective-policy overlay. |
-| `GET …/:wid/modes`, `GET/PUT/DELETE …/:wid/modes/:mid`, `POST …/:wid/modes/:mid/duplicate`, `PUT …/:wid/modes/:mid/enabled` | mode **authoring**, separate from the selection control above. The catalog carries each mode's `enabled` flag, `toolExposure`, and `permissionDefaults`; the single-mode read returns raw Markdown plus a hash, and `PUT` takes `{ content, expectedHash? }` (required when replacing an existing file). Bundled modes are read-only (`400`), a stale or missing update hash is `409`, and invalid content is rejected before anything is written. `PUT …/enabled` takes `{ enabled: boolean }`: it shows or hides a mode in this workspace's picker — bundled modes may be hidden too, disabling the currently selected mode is `409` (select another first), the disabled set persists beside the mode files, and saving a mode always re-enables it. Editing a selected mode applies only when it is **re-selected**: the live selection retains its cached snapshot. Deleting that selected file also leaves its cached snapshot active, but its deleted id cannot be selected again; select another mode instead. |
+| `PUT …/:wid/mode`, `GET …/:wid/meta` | workspace-local default mode control for new conversations and draft UI. Existing roots keep their own selected mode. The `GET …/mode` catalog lists **enabled modes only** (a disabled mode refused for selection answers `400`); `GET …/meta` returns the workspace default's `permissionDefaults`, `mode`, and `yolo` when enabled; it does not return a policy or effective-policy overlay. |
+| `GET …/:wid/modes`, `GET/PUT/DELETE …/:wid/modes/:mid`, `POST …/:wid/modes/:mid/duplicate`, `PUT …/:wid/modes/:mid/enabled` | mode **authoring**, separate from workspace-default and conversation selection. The catalog carries each mode's `enabled` flag, `toolExposure`, and `permissionDefaults`; the single-mode read returns raw Markdown plus a hash, and `PUT` takes `{ content, expectedHash? }` (required when replacing an existing file). Bundled modes are read-only (`400`), a stale or missing update hash is `409`, and invalid content is rejected before anything is written. `PUT …/enabled` takes `{ enabled: boolean }`: it shows or hides a mode in this workspace's picker — bundled modes may be hidden too, disabling the workspace default is `409` (select another first), the disabled set persists beside the mode files, and saving a mode always re-enables it. `GET/PUT …/:wid/sessions/:id/mode` reads or switches one root's live mode; the switch is durable and governs its next model request or unstarted tool gate, including its children, without affecting sibling roots. |
 | `…/:wid/projects` (+ `/projects/:pid`) | project binding: working folder, ownership, overlap rejection. `PATCH` also takes `additionalDirectories: [{ kind: "path", path, access } \| { kind: "project", projectId, access }]` (browser principal only, every folder validated); retargeting is `409` while any turn — this project's or another's through a grant — holds a write lease inside it |
 | `GET …/:wid/projects/:pid/(files\|file\|search)` | read-only project browsing: one directory listing, one file body, and a bounded file-name search for composer mentions |
-| `GET …/:wid/projects/:pid/git(?path=)` | read-only git: status (branch, changed paths, added/removed counts) with no `path`, or one file's unified diff against HEAD. Not a repository answers an empty status; traversal is refused. Nothing is staged or written |
+| `GET …/:wid/projects/:pid/media(?path=)` | stream one project file as renderable media for previews: images by magic bytes, audio/video by extension; anything else is 404. Honours single byte `Range` requests (seeking) and `HEAD`; capped at 64 MB; traversal refused |
+| `GET …/:wid/projects/:pid/git(?path=)` | read-only git: status (branch, changed paths, added/removed counts) with no `path`, or one file's unified diff against HEAD (untracked files diff as all additions; a repository with no commit diffs the staged index). Not a repository answers an empty status; traversal is refused. Nothing is staged or written |
 | `…/:wid/terminals` (+ `/events` SSE, `/:tid` DELETE, `/:tid/(input\|resize)`) | interactive Workbench terminals: PTY lifecycle, one multiplexed output stream per workspace — see the terminal section |
 | `POST …/:wid/attachments`, `GET …/:wid/attachments/:id` | composer attachments: upload (content-addressed by sha256, verified media type) and serve (immutable, workspace-scoped) |
-| `…/:wid/agents/:name` (GET resolve / DELETE), `POST …/:wid/agents/:name` | agent definitions; POST spawns a bounded child from `task: { prompt, requiredResult }` or the four-field `task: { objective, constraints, references, requiredResult }`, optionally `inherit: "brief"`, `model` (`provider:model`) and `grantTools`. 202 with the handle (+ `inheritedChars`, `note`); an empty brief, a bad `inherit`, or a role that refuses inheritance is 400; capacity (per conversation or host) is 429 |
+| `…/:wid/agents/:name` (GET resolve / DELETE), `POST …/:wid/agents/:name` | agent definitions; POST spawns a bounded child from `task: { prompt, requiredResult }` or the four-field `task: { objective, constraints, references, requiredResult }`, optionally `inherit: "brief"`, `model` (`provider:model`) and `grantTools`. 202 with the handle (+ `inheritedChars`, `note`); an empty brief, a bad `inherit`, or a role that refuses inheritance is 400 |
 | `POST …/:wid/agents/:name/import` | save a definition: `dialect: "claude"` / `"codex"` import with provenance, or `"dnt-harness"` to save a native document verbatim (keeps `inheritable`) |
 | `GET …/:wid/agents/children?root=…`, `GET/DELETE …/:wid/children/:childId` (+ `/cancel`), `POST …/:wid/sessions/:parentSessionId/children/:childSessionId/reconcile` | child list / wait-result / cancel / settlement; statuses may include `uncertain`, which is stable across restarts until settled — repair runs through the Agent tool, the Workbench's Retry settlement, or the reconcile route (below); the legacy `POST /api/sessions/...` reconcile address is retained |
 | `…/:wid/mcp` (+ `/:server` GET/POST/DELETE, `/:server/(enable\|disable\|reconnect)`, `/mcp/import`) | MCP server lifecycle, stored config for editing, deletion, and imports with provenance |
@@ -390,7 +393,7 @@ Three ways to act on a running conversation. All acceptance is durable
 | **Queue** (Enter) | `POST …/messages { content }` | finishes normally | the next turn claims all of it |
 | **Stop** | `POST …/stop` | closes `turn/end: cancelled` | stays queued — never auto-runs, including input sent while the stop settles |
 | **Steer** (Ctrl/⌘+Enter, Steer button) | `POST …/messages { content, delivery: "steer" }` | closes `turn/end: steered` | old queue + the new message run in one new turn, oldest first |
-| **Send now** (on a queued bubble) | `POST …/steer` | closes `turn/end: steered` | the whole queue runs in one new turn |
+| **Send now** (on the queue strip above the composer) | `POST …/steer` | closes `turn/end: steered` | the whole queue runs in one new turn |
 
 - `delivery` defaults to `"queue"`; anything else answers `400`. The reply is
   `202 { inputId, queued, delivery }` (`queued` is true only for a queue-delivery
@@ -632,15 +635,19 @@ boundaries matter more than the feature:
   reaped. `server.close()` kills every PTY, so none outlives the host.
 - **Opening the view opens a shell.** The panel creates one terminal by itself,
   once per mount, rather than presenting a picker — landing in a chooser is not
-  landing in a terminal. Closing the last terminal is a decision and is never
-  undone automatically.
+  landing in a terminal. The auto-open waits until the conversation's project
+  binding is final (`bindingReady`), so a shell never opens in the host's
+  default folder just because the session list was still loading. Closing the
+  last terminal is a decision and is never undone automatically.
 - **Default shell** is a browser-local preference (`terminalShell` in
   `dnt-harness.workbench.v1`), set from the Terminal view's shell menu. Unset, it
-  defers to the host's own order: Git Bash first, PowerShell when Git Bash is
-  absent on Windows. A remembered shell the host no longer offers falls back to
-  that order instead of failing every open.
+  defers to the host's own order: the platform's login shell first (zsh on
+  macOS), then Bash, then PowerShell when Bash is absent on Windows. A
+  remembered shell the host no longer offers falls back to that order instead
+  of failing every open.
 - **Shells** come from the shared resolver (`capabilities/shell/detect.ts`) and
-  the client renders only what the host reports — Git Bash, and on Windows
+  the client renders only what the host reports — zsh and Bash on macOS, Bash
+  elsewhere (labelled Git Bash on Windows), and on Windows
   PowerShell and cmd. On Windows the PTY is created with `useConptyDll`: the
   default kill path forks a console-list helper that dies with
   `AttachConsole failed` once the shell has exited, and both paths were
@@ -699,6 +706,12 @@ state stands up; if the client is not built, a `404` suggests
 `npm run build:web`. Path traversal outside `staticDir` is rejected.
 `index.html`, the shell fallback, and `sw.js` are sent with `cache-control: no-cache`.
 
+The build emits precompressed `.br` (brotli, max quality) and `.gz` twins for
+every compressible asset ≥1 KB (`web/pwa/pwa-plugin.ts`); the server streams
+those bytes as-is when the request's `Accept-Encoding` allows — no per-request
+compression on the hot path — and answers identity bytes otherwise. Hashed
+`/assets/*` paths carry `cache-control: public, max-age=31536000, immutable`.
+
 ### Installable client (PWA)
 
 The built client is an installable PWA: `web/public/manifest.webmanifest` plus
@@ -710,7 +723,11 @@ network-first with the cached shell as offline fallback; `/assets/` and
 `/icons/` are cache-first. Registration runs only in production builds
 (`web/pwa/register-service-worker.ts`). Install from the browser address bar
 on `http://127.0.0.1:<port>` — localhost counts as a secure context; any other
-host needs HTTPS.
+host needs HTTPS. Chrome also hides the install icon until the worker is
+controlling the page, so a failed install (previously `cache.addAll` aborting
+on a proxy `Vary: *` response) looks the same as “not installable”. The worker
+precaches each shell file on its own and still activates when one cannot be
+cached.
 
 ## Shutdown
 

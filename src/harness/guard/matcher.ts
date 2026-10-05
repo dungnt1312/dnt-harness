@@ -3,19 +3,56 @@ import { PRESET_REGEXES } from './presets.ts'
 import { PRESET_LABELS } from './defaults.ts'
 
 export function normalizeCommand(cmd: string): string {
-  let s = cmd.trim().replace(/\s+/g, ' ')
+  let normalized = ''
   let inSingle = false
   let inDouble = false
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i]
-    if (c === "'" && !inDouble) inSingle = !inSingle
-    if (c === '"' && !inSingle) inDouble = !inDouble
-    if (c === '#' && !inSingle && !inDouble && i > 0 && s[i - 1] === ' ') {
-      s = s.slice(0, i).trimEnd()
-      break
-    }
+  let lineHasContent = false
+
+  const isEscaped = (index: number): boolean => {
+    let backslashes = 0
+    for (let i = index - 1; i >= 0 && cmd[i] === '\\'; i--) backslashes++
+    return backslashes % 2 === 1
   }
-  return s
+
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i]!
+    const escaped = isEscaped(i)
+    const nextIsNewline = cmd[i + 1] === '\n' || (cmd[i + 1] === '\r' && cmd[i + 2] === '\n')
+
+    if (c === '\\' && nextIsNewline && !inSingle && !inDouble) {
+      i += cmd[i + 1] === '\r' ? 2 : 1
+      continue
+    }
+
+    const startsComment =
+      c === '#' &&
+      !escaped &&
+      !inSingle &&
+      !inDouble &&
+      (!lineHasContent || (i > 0 && /\s/.test(cmd[i - 1]!)))
+
+    if (startsComment) {
+      while (i + 1 < cmd.length && cmd[i + 1] !== '\n' && cmd[i + 1] !== '\r') i++
+      continue
+    }
+
+    if (c === '\n' || c === '\r') {
+      if (c === '\r' && cmd[i + 1] === '\n') i++
+      normalized += ' '
+      lineHasContent = false
+      continue
+    }
+
+    // Outside quotes a backslash escapes the next byte, so \' is a literal
+    // quote and must not open a single-quoted region; inside single quotes
+    // backslashes are literal, so a closing ' always closes.
+    if (c === "'" && !inDouble && (inSingle || !escaped)) inSingle = !inSingle
+    if (c === '"' && !escaped && !inSingle) inDouble = !inDouble
+    normalized += c
+    if (!/\s/.test(c)) lineHasContent = true
+  }
+
+  return normalized.trim().replace(/\s+/g, ' ')
 }
 
 const PRESET_PRIORITY: PresetId[] = [

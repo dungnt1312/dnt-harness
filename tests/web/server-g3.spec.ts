@@ -96,6 +96,7 @@ describe('live mode control', () => {
         const tools = request.tools?.map((schema) => ({ name: schema.name }))
         requests.push(tools !== undefined ? { tools } : {})
         yield { type: 'delta', delta: 'plain answer' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const server = await start([spy])
@@ -132,9 +133,11 @@ describe('live mode control', () => {
             { id: 'c1', name: 'Glob', args: { pattern: '*' } },
             { id: 'c2', name: 'Write', args: { path: 'blocked.txt', content: 'x' } },
           ] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const server = await start([loop])
@@ -241,7 +244,7 @@ describe('live mode control', () => {
 
   it('enables and disables modes: the picker hides disabled ones until re-enabled', async () => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-mode-enabled-'))
-    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'hi' } } }
+    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'hi' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }
     let server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json') })
     let base = server.url
     try {
@@ -412,7 +415,7 @@ describe('live mode control', () => {
   it('the manifest endpoint records mode/model/revision and omissions', async () => {
     const server = await start([{
       name: 'scripted', models: ['scripted'],
-      async *stream() { yield { type: 'delta', delta: 'hi' } },
+      async *stream() { yield { type: 'delta', delta: 'hi' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } },
     }])
     const base = server.url
     const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
@@ -449,7 +452,7 @@ describe('live mode control', () => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-manifest-'))
     const provider: LlmProvider = {
       name: 'scripted', models: ['scripted'],
-      async *stream() { yield { type: 'delta', delta: 'hi' } },
+      async *stream() { yield { type: 'delta', delta: 'hi' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } },
     }
     const first = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json') })
     const wsId = (await (await fetch(`${first.url}/api/workspaces`)).json() as { id: string }[])[0]!.id
@@ -482,8 +485,11 @@ describe('live mode control', () => {
       name: 'scripted', models: ['scripted'],
       async *stream() {
         step += 1
-        if (step === 1) { yield { type: 'toolCalls', calls: [{ id: 'revision-read', name: 'Read', args: { path: 'missing.txt' } }] }; return }
+        if (step === 1) { yield { type: 'toolCalls', calls: [{ id: 'revision-read', name: 'Read', args: { path: 'missing.txt' } }] }
+        yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+        return }
         yield { type: 'delta', delta: 'hi' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }])
     const base = server.url
@@ -520,7 +526,7 @@ describe('live mode control', () => {
 
   it('retires non-empty workspace policy files without honoring their overrides', async () => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-policy-'))
-    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'hi' } } }
+    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'hi' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }
     let server: WebServer | undefined
     try {
       server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json') })
@@ -603,7 +609,7 @@ describe('live mode control', () => {
 
   it('preserves both files when an exclusive retirement copy races a new migration target', async () => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-policy-race-'))
-    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'hi' } } }
+    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'hi' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }
     let server: WebServer | undefined
     try {
       server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json') })
@@ -646,7 +652,7 @@ describe('live mode control', () => {
 
   it('stops after five transient exclusive-copy failures without losing the source', async () => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-policy-exhaust-'))
-    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'hi' } } }
+    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'hi' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }
     let server: WebServer | undefined
     try {
       server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json') })
@@ -694,7 +700,7 @@ describe('live mode control', () => {
     const proj = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-yolo-deny-proj-'))
     const provider: LlmProvider = {
       name: 'scripted', models: ['scripted'],
-      async *stream() { yield { type: 'toolCalls', calls: [{ id: 'b1', name: 'Bash', args: { command: 'printf bad' } }] } },
+      async *stream() { yield { type: 'toolCalls', calls: [{ id: 'b1', name: 'Bash', args: { command: 'printf bad' } }] }; yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true } },
     }
     const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json'), yolo: true })
     try {
@@ -712,7 +718,7 @@ describe('live mode control', () => {
       void post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'run bash' })
       const result = await waitForToolResult(base, wsId, session.id)
       expect(result.ok).toBe(false)
-      expect(result.output).toMatch(/policy denies 'Bash'/)
+      expect(result.output).toMatch(/^denied: tool policy denies this call/)
     } finally {
       await server.close()
       await fs.rm(home, { recursive: true, force: true })
@@ -725,7 +731,7 @@ describe('live mode control', () => {
     const projectRoot = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-yolo-fallback-proj-'))
     const provider: LlmProvider = {
       name: 'scripted', models: ['scripted'],
-      async *stream() { yield { type: 'toolCalls', calls: [{ id: 'omitted-read', name: 'Read', args: { path: 'missing.txt' } }] } },
+      async *stream() { yield { type: 'toolCalls', calls: [{ id: 'omitted-read', name: 'Read', args: { path: 'missing.txt' } }] }; yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true } },
     }
     const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json'), yolo: true, defaultMode: 'deny' })
     try {
@@ -743,7 +749,7 @@ describe('live mode control', () => {
       void post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'read' })
       const result = await waitForToolResult(base, wsId, session.id)
       expect(result.ok).toBe(false)
-      expect(result.output).toMatch(/policy denies 'Read'/)
+      expect(result.output).toMatch(/^denied: tool policy denies this call/)
     } finally {
       await server.close()
       await fs.rm(home, { recursive: true, force: true })
@@ -753,7 +759,7 @@ describe('live mode control', () => {
 
   it('keeps omitted selected-mode keys on default ask under yolo', async () => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g3-yolo-ask-fallback-'))
-    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'toolCalls', calls: [{ id: 'omitted', name: 'Read', args: { path: 'missing.txt' } }] } } }
+    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'toolCalls', calls: [{ id: 'omitted', name: 'Read', args: { path: 'missing.txt' } }] }; yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true } } }
     const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json'), yolo: true })
     try {
       const base = server.url
@@ -779,13 +785,16 @@ describe('live mode control', () => {
         step += 1
         if (step === 1) {
           yield { type: 'toolCalls', calls: [{ id: 'skill-catalog', name: 'Skill', args: { action: 'catalog' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         if (step === 2) {
           yield { type: 'toolCalls', calls: [{ id: 'skill-missing', name: 'Skill', args: { action: 'load', name: 'missing-skill' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const server = await start([provider])
@@ -813,13 +822,16 @@ describe('live mode control', () => {
         step += 1
         if (step === 1) {
           yield { type: 'toolCalls', calls: [{ id: 'skill-catalog', name: 'Skill', args: { action: 'catalog' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         if (step === 2) {
           yield { type: 'toolCalls', calls: [{ id: 'skill-hidden-load', name: 'Skill', args: { action: 'load', name: 'quiet-skill' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const server = await start([provider])
@@ -860,9 +872,11 @@ describe('live mode control', () => {
         step += 1
         if (step === 1) {
           yield { type: 'toolCalls', calls: [{ id: 'w1', name: 'Write', args: { path: 'yolo.txt', content: 'ok' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         yield { type: 'delta', delta: 'wrote' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const server = await createWebServer({
@@ -958,9 +972,11 @@ describe('context manifest records', () => {
         calls += 1
         if (calls === 1) {
           yield { type: 'toolCalls', calls: [{ id: 'c1', name: 'Glob', args: { pattern: '*' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         yield { type: 'delta', delta: 'answer' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const server = await start([scripted])

@@ -67,6 +67,7 @@ describe('G4 HTTP surface', () => {
       async *stream() {
         await new Promise(() => {})
         yield { type: 'delta', delta: 'never' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-home-'))
@@ -115,7 +116,7 @@ describe('G4 HTTP surface', () => {
   it('reconciles only a child owned by the addressed non-default workspace parent session', async () => {
     const stall: LlmProvider = {
       name: 'scripted', models: ['scripted'],
-      async *stream() { await new Promise(() => {}); yield { type: 'delta', delta: 'never' } },
+      async *stream() { await new Promise(() => {}); yield { type: 'delta', delta: 'never' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } },
     }
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-reconcile-http-'))
     const server = await createWebServer({ home, providers: [stall], configFile: path.join(home, 'p.json') })
@@ -153,9 +154,11 @@ describe('G4 HTTP surface', () => {
         requests += 1
         if (requests === 1) {
           yield { type: 'toolCalls', calls: [{ id: 'c1', name: 'Bash', args: { command: 'echo hacked > hacked.txt' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         yield { type: 'delta', delta: 'Bash was denied; stopping without retrying.' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-ceil-'))
@@ -226,7 +229,7 @@ describe('G4 HTTP surface', () => {
   it('one-level delegation: a child session cannot spawn a grandchild', async () => {
     const stall: LlmProvider = {
       name: 'scripted', models: ['scripted'],
-      async *stream() { await new Promise(() => {}); yield { type: 'delta', delta: 'never' } },
+      async *stream() { await new Promise(() => {}); yield { type: 'delta', delta: 'never' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } },
     }
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-depth-'))
     const server = await createWebServer({ home, providers: [stall], configFile: path.join(home, 'p.json') })
@@ -256,9 +259,10 @@ describe('G4 HTTP surface', () => {
   it('a child runs on the resolved pair: spawn choice > role model > parent session', async () => {
     // Two providers so the cross-provider case is real: the model the caller
     // names does not exist on the parent's provider at all.
-    const stall = async function* (): AsyncGenerator<{ type: 'delta'; delta: string }> {
+    const stall = async function* (): AsyncGenerator<{ type: 'delta'; delta: string } | { type: 'completion'; finishReason: 'stop'; transport: 'done'; policy: 'strict'; transportSettled: true }> {
       await new Promise(() => {})
       yield { type: 'delta', delta: 'never' }
+      yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
     }
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-model-'))
     const server = await createWebServer({
@@ -340,6 +344,7 @@ describe('G4 HTTP surface', () => {
         await new Promise((resolve) => setTimeout(resolve, 200))
         active -= 1
         yield { type: 'delta', delta: 'child inspected src/index.ts' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     let step = 0
@@ -355,13 +360,16 @@ describe('G4 HTTP surface', () => {
               { id: 'a2', name: 'Agent', args: { action: 'spawn', definition: 'explorer', objective: 'research b', model: 'far:gpt-luna' } },
             ],
           }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         if (step === 2) {
           yield { type: 'toolCalls', calls: [{ id: 'a3', name: 'Agent', args: { action: 'wait', timeoutMs: 5000 } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         yield { type: 'delta', delta: 'both children reported back' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-tool-'))
@@ -393,11 +401,13 @@ describe('G4 HTTP surface', () => {
     expect(children.map((child) => child.model)).toEqual(['far:gpt-luna', 'far:gpt-luna'])
     expect(peak).toBe(2)
 
+    // The wait result is durable before the root takes its next step, so the
+    // third request is the point after which the log can be read without racing
+    // the root (the children finishing says nothing about its tool result).
+    await expect.poll(() => step, { timeout: 5_000 }).toBe(3)
     // The root saw both digests through one wait call.
     const waited = await toolResultMatching(base, wsId, rootSession.id, /child inspected/)
     expect(waited).toContain('child inspected src/index.ts')
-    // The wait result is durable before the root takes its next step.
-    await expect.poll(() => step, { timeout: 5_000 }).toBe(3)
     await server.close()
   }, 30_000)
 
@@ -409,9 +419,11 @@ describe('G4 HTTP surface', () => {
         childRequests += 1
         if (childRequests === 1) {
           yield { type: 'toolCalls', calls: [{ id: 'd1', name: 'Agent', args: { action: 'spawn', definition: 'explorer', objective: 'grandchild' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         yield { type: 'delta', delta: 'delegation was denied; stopping' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-nodeleg-'))
@@ -457,9 +469,11 @@ describe('G4 HTTP surface', () => {
         step += 1
         if (step === 1) {
           yield { type: 'toolCalls', calls: [{ id: 'w1', name: 'Write', args: { path: 'x.txt', content: 'x' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-appr-'))
@@ -524,7 +538,7 @@ describe('G4 HTTP surface', () => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-imp-'))
     const server = await createWebServer({
       home,
-      providers: [{ name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'x' } } }],
+      providers: [{ name: 'scripted', models: ['scripted'], async *stream() { yield { type: 'delta', delta: 'x' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } } }],
       configFile: path.join(home, 'p.json'),
     })
     servers.push(server)

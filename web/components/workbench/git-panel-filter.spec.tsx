@@ -21,7 +21,10 @@ const fetchGitStatus = vi.fn(async (): Promise<GitStatusReport> => REPORT)
 
 vi.mock('../../lib/api.ts', () => ({
   fetchGitStatus: () => fetchGitStatus(),
-  fetchGitDiff: vi.fn(async () => ({ path: 'src/a.ts', lines: [], truncated: false, binary: false })),
+  fetchGitDiff: vi.fn(async (_ws: string, _project: string, path: string) =>
+    ({ path, lines: [], truncated: false, binary: path.endsWith('.png') })),
+  mediaKindOf: (path: string) => (path.endsWith('.png') ? 'image' : path.endsWith('.mp3') ? 'audio' : path.endsWith('.mp4') ? 'video' : null),
+  projectMediaUrl: (_ws: string, _project: string, path: string) => `/media?path=${encodeURIComponent(path)}`,
 }))
 
 let root: Root | undefined
@@ -70,4 +73,18 @@ it('a filter matching nothing says so instead of reading as a clean tree', async
   const view = await mount({ pathFilter: ['gone.ts'] })
   await act(async () => { await vi.waitFor(() => expect(fetchGitStatus).toHaveBeenCalledOnce()) })
   expect(view.textContent).toContain('None of the files this turn wrote')
+})
+
+it('an opened binary media row previews the media instead of a diff', async () => {
+  const binaryReport: GitStatusReport = {
+    branch: 'main',
+    truncated: false,
+    changes: [{ path: 'shots/01.png', status: 'untracked' }],
+  }
+  fetchGitStatus.mockResolvedValueOnce(binaryReport)
+  const view = await mount()
+  await act(async () => { await vi.waitFor(() => expect(rows(view)).toHaveLength(1)) })
+  await act(async () => { view.querySelector<HTMLElement>('ul li button')!.click() })
+  expect(view.querySelector('img[alt="shots/01.png"]')).not.toBeNull()
+  expect(view.textContent).not.toContain('No textual diff')
 })

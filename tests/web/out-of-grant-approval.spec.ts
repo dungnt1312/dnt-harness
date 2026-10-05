@@ -11,7 +11,7 @@
 import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
 import { DEFAULT_CONFIG } from '../../src/harness/guard/defaults.ts'
 
@@ -37,11 +37,12 @@ const actor: LlmProvider = {
       const verb = command[1]
       const target = command[2] ?? ''
       const id = `c-${Math.random().toString(36).slice(2)}`
-      if (verb === 'read') { yield { type: 'toolCalls', calls: [{ id, name: 'Read', args: { path: target } }] }; return }
-      if (verb === 'write') { yield { type: 'toolCalls', calls: [{ id, name: 'Write', args: { path: target, content: 'written' } }] }; return }
-      if (verb === 'grep') { yield { type: 'toolCalls', calls: [{ id, name: 'Grep', args: { pattern: 'secret', path: target } }] }; return }
+      if (verb === 'read') { yield { type: 'toolCalls', calls: [{ id, name: 'Read', args: { path: target } }] }; yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }; return }
+      if (verb === 'write') { yield { type: 'toolCalls', calls: [{ id, name: 'Write', args: { path: target, content: 'written' } }] }; yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }; return }
+      if (verb === 'grep') { yield { type: 'toolCalls', calls: [{ id, name: 'Grep', args: { pattern: 'secret', path: target } }] }; yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }; return }
     }
     yield { type: 'delta', delta: 'done' }
+    yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
   },
 }
 
@@ -219,6 +220,72 @@ describe('out-of-grant approvals', () => {
     expect(question.proposedGrant).toBeUndefined()
     expect((await send('POST', `${f.url}/api/approvals/${question.approvalId}`, { allow: true, scope: 'session' })).status).toBe(400)
     await send('POST', `${f.url}/api/approvals/${question.approvalId}`, { allow: false })
+  }, 20_000)
+
+  it('revalidates a proposed session grant inside the serialized mutation queue', async () => {
+    const f = await fixture()
+    const target = path.join(outside, 'a.txt')
+    const mark = f.stream.frames.length
+    await f.say(`read ${target}`)
+    const question = await f.stream.wait((frame) => frame.kind === 'approval', 'approval', mark)
+    expect(question.proposedGrant).toBe(outside)
+
+    // Park a competing composer mutation in the session-grant queue after its
+    // own validation. The approval mutation queues behind it and must validate
+    // only after the barrier releases, not before entering the queue.
+    const session = server!.kernel.ctx.sessions.get(f.sessionId as never)
+    const originalDurable = session.durable.bind(session)
+    let releaseBarrier: () => void = () => {}
+    const barrier = new Promise<void>((resolve) => { releaseBarrier = resolve })
+    let enteredBarrier: () => void = () => {}
+    const barrierEntered = new Promise<void>((resolve) => { enteredBarrier = resolve })
+    vi.spyOn(session, 'durable').mockImplementationOnce(async () => {
+      enteredBarrier()
+      await barrier
+      await originalDurable()
+    })
+    const grantsUrl = `${f.url}/api/workspaces/${f.wsId}/sessions/${f.sessionId}/grants`
+    const competing = send('PUT', grantsUrl, { expectedRevision: 0, roots: [] })
+    await barrierEntered
+
+    expect((await send('POST', `${f.url}/api/approvals/${question.approvalId}`, { allow: true, scope: 'session' })).status).toBe(200)
+    // Let the admitted call reach the queued mutation. An implementation that
+    // validates before queueing also completes that stale validation here.
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    await fs.rm(outside, { recursive: true, force: true })
+    releaseBarrier()
+    expect((await competing).status).toBe(200)
+
+    const result = await f.toolResult(mark)
+    expect(result.event?.ok).toBe(false)
+    const grants = (await (await fetch(grantsUrl)).json()) as { roots: unknown[] }
+    expect(grants.roots).toEqual([])
+  }, 20_000)
+
+  it('replaces a policy ask with the live outside-path ask when the governing mode narrows', async () => {
+    const f = await fixture()
+    expect((await send('POST', `${f.url}/api/workspaces/${f.wsId}/modes/full-access/duplicate`, { newId: 'read-ask-outside-allow' })).status).toBe(200)
+    const modeRecord = (await (await fetch(`${f.url}/api/workspaces/${f.wsId}/modes/read-ask-outside-allow`)).json()) as { raw: string; hash: string }
+    const custom = modeRecord.raw.replace('"Read":"allow"', '"Read":"ask"')
+    expect((await send('PUT', `${f.url}/api/workspaces/${f.wsId}/modes/read-ask-outside-allow`, { content: custom, expectedHash: modeRecord.hash })).status).toBe(200)
+    const modeUrl = `${f.url}/api/workspaces/${f.wsId}/sessions/${f.sessionId}/mode`
+    expect((await send('PUT', modeUrl, { modeId: 'read-ask-outside-allow' })).status).toBe(200)
+
+    const mark = f.stream.frames.length
+    await f.say(`read ${path.join(outside, 'a.txt')}`)
+    const question = await f.stream.wait((frame) => frame.kind === 'approval', 'policy approval', mark)
+    expect(question.scopeWarning).toBeUndefined()
+
+    // Read becomes policy-allowed, but outside-path authority becomes ask. The
+    // existing waiter must stay pending; policy allowance is not human consent.
+    expect((await send('PUT', modeUrl, { modeId: 'ask-before-changes' })).status).toBe(200)
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(f.stream.frames.slice(mark).some((frame) => frame.event?.type === 'tool/result')).toBe(false)
+    expect((await send('POST', `${f.url}/api/approvals/${question.approvalId}`, { allow: true })).status).toBe(200)
+    const result = await f.toolResult(mark)
+    expect(result.event?.ok).toBe(false)
+    expect(result.event?.output).toContain('current authority requires fresh approval')
+    expect(result.event?.output).not.toContain('secret a')
   }, 20_000)
 
   it('Full access and its duplicates run out-of-grant paths without a question', async () => {

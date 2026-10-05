@@ -37,7 +37,9 @@ A run may use the **primary root** (the project folder, read-write) and any
   wins, with a `revision`). Added from the composer or by answering an
   out-of-grant approval "for this session".
 - **Child agents** receive a snapshot of the parent's effective grant at
-  spawn and never gain more.
+  spawn and never gain more. Their usable folders are that immutable maximum
+  intersected with the owning parent's current effective grants, so parent
+  removals and write-to-read downgrades narrow unstarted child file calls.
 
 Every grant source goes through one validator (`src/web/folder-grants.ts`):
 absolute existing directories only; never a drive root, the home folder
@@ -108,21 +110,32 @@ marker. Argument errors throw inside `execute` and surface as failed
   and the model-visible result is truncated with an explicit marker.
 - **Exit code**: the resolved string ends with an `[exit code: N]` suffix, a
   `[terminated: timeout or stop]` marker, or `[terminated by stop]`.
-- **Timeout & stop**: default 30 s (a per-call `timeoutMs` argument is
-  clamped to the configured maximum). The run's abort signal also kills the
-  command — stop reaches running tools.
-- **Cleanup**: the child spawns detached into its own process group (POSIX:
-  group SIGKILL; Windows: `taskkill /T /F` with a second pass for MSYS spawn
-  races), and the call settles on the process `exit` event with a short
-  grace, so a straggler grandchild holding the stdio pipes cannot stall the
-  result.
+- **Foreground wait & stop**: managed commands wait 120 s by default, up to
+  600 s via `timeoutMs`. Eligible commands still running return a process ID
+  without killing or respawning; use `BashOutput` to watch. First-token `sleep`
+  and session-less calls retain foreground deadline termination. Foreground Stop
+  kills the tree; committed background commands survive root turn Stop.
+- **Child lifecycle**: explicit child cancellation stops owned processes; normal
+  completion retains ownership and execution. Child background Bash has a configurable
+  1-hour maximum; root commands have no such cap. Interactive PTYs are unchanged.
 
 A shell is never path-confined: Bash can reach anything the OS user can, and
 granted folders do not change that. Path checks protect the file tools, not
 the shell. A `tools/rewrite` guard
 (`src/harness/guard/`) can block or force-ask risky Bash commands by content
 (preset groups + custom rules, workspace-scoped and Mode-independent — see
-`docs/harness.md`); it does not sandbox the OS and does not resist obfuscation.
+`docs/harness.md`). Its normalization joins only unquoted backslash-newline
+continuations and strips comments separately on every LF/CRLF line before
+whitespace collapse, so a comment cannot hide executable text on a later line;
+quoted continuations remain content boundaries, and quoted or escaped hashes
+remain literal.
+
+The guard is not a shell parser or OS sandbox. Documented non-matching fixtures
+include quoted executable names, command substitutions (`$(...)`), heredocs,
+commands run through interpreters, and Windows-shell syntax; general obfuscation
+can also bypass it. A matching custom substring `allow` exempts the whole
+normalized compound command, including later commands. Use narrowly anchored
+custom patterns; per-command exception handling is deferred.
 
 ## The Skill tool (`src/web/server.ts`, service in `src/harness/skills/`)
 
@@ -191,10 +204,9 @@ several children, capped at 120 s, honours Stop), `list`, `cancel`, `reconcile`,
   stored; the spawn result reports the size. A role with `inheritable: false`
   refuses it. `references` are unaffected and still ride in the brief.
 - **Asynchronous on purpose**: a step runs its tool calls in sequence, so
-  `spawn` must return immediately for children to overlap. A conversation holds
-  up to 3 active children (reported as `active: n/3`); the host caps all
-  conversations at 12, and each root turn at 8 spawn attempts. A capacity
-  refusal names which limit was hit.
+  `spawn` must return immediately for children to overlap. Spawning is
+  uncapped — no per-conversation, host, or per-turn ceiling; the spawn result
+  reports the conversation's active-child count.
 - **Writers do not serialize**: a root turn holds the project lease from its
   first write until it settles. Spawning a write-capable child hands that lease
   off; the child then locks per call, nothing locks its whole run, and the
@@ -208,18 +220,28 @@ several children, capped at 120 s, honours Stop), `list`, `cancel`, `reconcile`,
   The live catalog rides in the tool description and in `action: "catalog"`, so
   the model names an id the host can actually serve. See
   [the harness notes](harness.md#which-model-a-child-runs-on).
-- **No authority gained**: a child's own calls re-enter the same mode exposure
-  and approval policy, which is why `Agent` is `ask` only in *Ask before
-  changes* and `allow` in Plan, *Edit automatically*, and *Full access*. Chat
-  exposes it nowhere. In Plan a child is read-only by construction — it
-  resolves the same mode.
+- **No authority gained**: a child's own calls re-enter the owning root's live
+  mode exposure and approval policy. Its immutable admission ceiling is pinned
+  at spawn as admission exposure ∩ role tools ∩ explicit grant; later mode
+  widening cannot add tools, while later narrowing denies unstarted calls.
+  `Agent` is `ask` only in *Ask before changes* and `allow` in Plan, *Edit
+  automatically*, and *Full access*. Chat exposes it nowhere. In Plan, MCP is
+  exposed only when the server has a non-empty explicit allowlist entry whose
+  tool name matches the read-safe naming heuristic; this is not proof that the
+  remote implementation is side-effect-free.
 - **Grants only narrow**: a `grantTools` entry the role lacks is reported back,
   never silently dropped.
 - **Four bundled roles**, each described by when to pick it and each stating
   the shape of its final report: `explorer` (find and explain; read-only),
-  `worker` (one decided edit; file tools, no shell), `reviewer` (find defects;
-  read-only) and `verifier` (run tests/typecheck/build and judge; `Bash`, no
-  file edits). `catalog` also lists the workspace's valid custom roles; copy a
+  `worker` (one bounded, agreed task; file edits plus `Bash`, `BashOutput`,
+  and `KillShell` for relevant checks), `reviewer` (find defects; read-only)
+  and `verifier` (run tests/typecheck/build and judge; shell lifecycle tools,
+  no source edits).
+  Worker shell access still obeys mode/policy and narrowing spawn grants;
+  its instructions prohibit scope expansion and unauthorized destructive,
+  dependency, or commit/push operations (these are not shell sandbox guarantees).
+  Workers report changed files, checks and outcomes, and incomplete or blocked work.
+  `catalog` also lists the workspace's valid custom roles; copy a
   bundled role in Settings → Agents to customize it.
 
 ## Memory tools (`src/harness/memory/tools.ts`)
@@ -278,6 +300,10 @@ Servers from a workspace's `mcp.json` register dynamically as
   `*`, then `defaultMode`. `--yolo` maps asks to allows but preserves explicit
   denies. Host `blockedTools` can never be widened. A tool annotated
   `requiresUserInteraction` **always asks**, regardless of the selected mode.
+  Bundled **Full access** sets the `*` catch-all to `allow`, so its MCP tools
+  run without asking; modes without an MCP/catch-all entry leave every
+  `mcp__*` name on the `defaultMode` (`ask`) fallback — that is the intended
+  ask-by-default, not a bug.
 - **`allowedTools` is exposure-only**: it filters which tools appear in
   request schemas — it is never a permission bypass, and every call still goes
   through the same pre-execute waterfall as built-ins.
@@ -313,8 +339,12 @@ A workspace mode's raw Markdown frontmatter owns its `toolExposure` ceiling and
 those entries literally — including the `*` fallback and `mcp__server__*`
 patterns — rather than simulating gate resolution. Bundled modes are read-only
 and must be duplicated into the workspace before editing; workspace mode files
-use hash-checked writes. A saved change takes effect when the mode is next
-selected because an active selection retains its cached snapshot.
+use hash-checked writes. Saving a mode file is save-only: it does not change
+roots that already hold a stamped snapshot of that mode. Selecting a mode for a
+root is live: request assembly re-resolves the selected mode at the next model
+request, and tool exposure/permission re-resolves at the next unstarted tool
+gate. Existing children keep their pinned admission maximum, so widening a root
+mode cannot widen them.
 
 ## Where they are mounted
 

@@ -35,9 +35,11 @@ const scripted: LlmProvider = {
     // One tool-call step (read the marker file), then a plain answer.
     if (!request.messages.some((m) => m.role === 'tool')) {
       yield { type: 'toolCalls', calls: [{ id: 'c1', name: 'read', args: { path: 'marker.txt' } }] }
+      yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
       return
     }
     yield { type: 'delta', delta: 'read it' }
+    yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
   },
 }
 
@@ -265,9 +267,11 @@ describe('workspace HTTP surface', () => {
       async *stream(request) {
         if (!request.messages.some((message) => message.role === 'tool')) {
           yield { type: 'toolCalls', calls: [{ id: `write-${Math.random()}`, name: 'Write', args: { path: 'mode.txt', content: 'mode scoped' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json') })
@@ -415,11 +419,11 @@ describe('G2 review hardening', () => {
     const seen: { provider: string; model: string }[] = []
     const alpha: LlmProvider = {
       name: 'alpha', models: ['a1'],
-      async *stream(request) { seen.push({ provider: 'alpha', model: request.model ?? '' }); yield { type: 'delta', delta: 'a' } },
+      async *stream(request) { seen.push({ provider: 'alpha', model: request.model ?? '' }); yield { type: 'delta', delta: 'a' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } },
     }
     const beta: LlmProvider = {
       name: 'beta', models: ['b1'],
-      async *stream(request) { seen.push({ provider: 'beta', model: request.model ?? '' }); yield { type: 'delta', delta: 'b' } },
+      async *stream(request) { seen.push({ provider: 'beta', model: request.model ?? '' }); yield { type: 'delta', delta: 'b' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } },
     }
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-prov-'))
     const server = await createWebServer({ home, providers: [alpha, beta], configFile: path.join(home, 'p.json') })
@@ -452,7 +456,7 @@ describe('G2 review hardening', () => {
       const wsId = ((await (await fetch(`${server.url}/api/workspaces`)).json()) as WorkspaceRow[])[0]!.id
       const gate: LlmProvider = {
         name: 'scripted', models: ['scripted'],
-        async *stream() { yield { type: 'toolCalls', calls: [{ id: 'c1', name: 'write', args: { path: 'cap.txt', content: 'x' } }] } },
+        async *stream() { yield { type: 'toolCalls', calls: [{ id: 'c1', name: 'write', args: { path: 'cap.txt', content: 'x' } }] }; yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true } },
       }
       void gate
       // Two pending approvals through two sessions.

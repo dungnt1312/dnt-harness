@@ -17,6 +17,9 @@
  * the native module never built.
  */
 import { randomUUID } from 'node:crypto'
+import { chmod } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import path from 'node:path'
 import { shellCatalog, type ShellId, type ShellOption } from '../capabilities/shell/detect.ts'
 import type { ProjectId, WorkspaceId } from '../util/brand.ts'
 
@@ -158,12 +161,31 @@ interface LiveTerminal {
   closed: boolean
 }
 
+/**
+ * node-pty's npm tarball stores the macOS `spawn-helper` helper executable with
+ * mode 0644, so `posix_spawnp` fails with every command it is asked to launch
+ * and every terminal open reports a bare "could not start". Restore the
+ * execute bit once per load; EACCES/EROFS are swallowed because a failed heal
+ * must not turn into a broken host.
+ */
+async function healSpawnHelperExecBit(): Promise<void> {
+  if (process.platform !== 'darwin') return
+  try {
+    const pkgDir = path.dirname(createRequire(import.meta.url).resolve('node-pty/package.json'))
+    await chmod(path.join(pkgDir, 'prebuilds', 'darwin-arm64', 'spawn-helper'), 0o755).catch(() => {})
+    await chmod(path.join(pkgDir, 'prebuilds', 'darwin-x64', 'spawn-helper'), 0o755).catch(() => {})
+  } catch {
+    // No resolvable node-pty install: the load below reports that itself.
+  }
+}
+
 /** The default backend: `node-pty`, loaded on first use. */
 function nodePtySpawner(): { spawner: PtySpawner; load: () => Promise<string | undefined> } {
   let loaded: { spawn: (file: string, args: string[], opts: unknown) => PtyHandle } | undefined
   let failure: string | undefined
   const load = async (): Promise<string | undefined> => {
     if (loaded !== undefined || failure !== undefined) return failure
+    await healSpawnHelperExecBit()
     try {
       loaded = (await import('node-pty')) as unknown as typeof loaded
       return undefined
@@ -345,9 +367,12 @@ export function createTerminalService(options: TerminalServiceOptions = {}): Ter
         })
       } catch (error) {
         // A raw spawn failure would escape as a 500 carrying the shell path and
-        // command line. Report the fact, not the host's layout.
+        // command line. Report the reason (node-pty's own message, e.g. the
+        // macOS "posix_spawnp failed." when its spawn-helper lost the execute
+        // bit) without the host's file layout.
         if (error instanceof TerminalError) throw error
-        throw new TerminalError('bad-shell', `could not start ${shell.label} in '${input.cwd}'`)
+        const reason = error instanceof Error ? error.message : String(error)
+        throw new TerminalError('bad-shell', `could not start ${shell.label} in '${input.cwd}': ${reason}`)
       }
       const info: TerminalInfo = {
         id: `terminal-${randomUUID()}`,

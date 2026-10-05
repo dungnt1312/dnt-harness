@@ -66,7 +66,8 @@ export function ContextMeter({ manifest }: { readonly manifest: ContextManifestV
       panelRole="dialog"
       side="top"
       align="end"
-      triggerClassName="flex size-8 shrink-0 items-center justify-center rounded-full transition-colors hover:bg-hover [@media(pointer:coarse)]:size-11"
+      compact
+      triggerClassName="flex size-8 shrink-0 items-center justify-center rounded-full transition-colors hover:bg-hover [@media(pointer:coarse)]:size-9"
       panelClassName="w-72 p-4"
       trigger={() => <Ring ratio={fill?.ratio ?? 0} tone={tone} />}
     >

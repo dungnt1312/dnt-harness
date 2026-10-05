@@ -109,6 +109,32 @@ describe('events (tutorial ch.4)', () => {
     await kernel.stop()
   })
 
+  it('checkedWaterfall: a null boundary result replaces; undefined accepts; forward sees every next()', async () => {
+    const kernel = new Kernel()
+    const forwards: unknown[][] = []
+    kernel.ctx.on('demo/transform', async (input, next) => {
+      await next()
+      return next(`${input}!`)
+    })
+    const accepted = await kernel.ctx.events.checkedWaterfall(
+      'demo/transform',
+      { forward: (_current, proposed) => { forwards.push([...proposed]); return undefined } },
+      'a',
+      async (input) => `default:${input}`,
+    )
+    expect(accepted).toBe('default:a!')
+    expect(forwards).toEqual([['a'], ['a!']])
+
+    const replaced = await kernel.ctx.events.checkedWaterfall(
+      'demo/transform',
+      { result: () => null as never },
+      'a',
+      async (input) => `default:${input}`,
+    )
+    expect(replaced).toBeNull()
+    await kernel.stop()
+  })
+
   it('waterfall: no listeners runs the default directly', async () => {
     const kernel = new Kernel()
     const result = await kernel.ctx.waterfall('demo/transform', 'hello', async () => 'fallback')

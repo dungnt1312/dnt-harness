@@ -28,6 +28,21 @@ export const DEFAULT_BUDGET: ResolvedBudget = {
   verified: false,
 }
 
+/**
+ * Budget fractions for a request the provider already rejected as too large.
+ * The estimate is chars/4, so a real tokenizer (non-English text, code) can
+ * run well above it; each level assumes the window is that much smaller.
+ */
+const SQUEEZE_FACTORS: readonly number[] = [1, 0.7, 0.45, 0.25]
+/** Highest squeeze level; beyond it the provider's refusal is final. */
+export const MAX_SQUEEZE_LEVEL = SQUEEZE_FACTORS.length - 1
+
+/** The budget to assemble under after `level` provider rejections for size. */
+export function squeezeBudget<T extends BudgetConfig>(budget: T, level: number | undefined): T {
+  const factor = SQUEEZE_FACTORS[Math.min(Math.max(Math.floor(level ?? 0), 0), MAX_SQUEEZE_LEVEL)] ?? 1
+  return factor === 1 ? budget : { ...budget, contextLimitTokens: Math.floor(budget.contextLimitTokens * factor) }
+}
+
 /** Estimate one string's token cost (chars/4, rounded up). */
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4)

@@ -4,7 +4,7 @@
  * fork/resume mid-conversation, and the model-visible-means-logged
  * invariant.
  */
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   AgentsService,
   Kernel,
@@ -41,6 +41,50 @@ function harness(replies: readonly string[], provider?: LlmProvider): Harness {
 }
 
 describe('agent loop', () => {
+  it.each(['agent/context', 'agent/request'] as const)('logical deadline races hung %s and rejects late downstream work', async hook => {
+    vi.useFakeTimers()
+    const { kernel, session, agent } = harness(['must not fetch'])
+    kernel.ctx.provide('limits', { logicalRequestMs: 10 })
+    let resume!: () => void; let finished = false; let lateAccepted = false
+    kernel.ctx.on(hook, async (request, next) => {
+      await new Promise<void>(resolve => { resume = resolve })
+      try { await next(request); lateAccepted = true } catch { /* closed request scope */ }
+      return request
+    })
+    agent.send('go'); const running = agent.run().then(() => { finished = true })
+    try {
+      await vi.advanceTimersByTimeAsync(20)
+      expect(finished).toBe(true)
+      resume(); await vi.advanceTimersByTimeAsync(0); await running
+      expect(lateAccepted).toBe(false)
+      expect(session.events.some(event => event.type === 'assistant/message')).toBe(false)
+    } finally { vi.useRealTimers(); await kernel.stop() }
+  })
+  it('retries a pre-commit timeout only after verified cleanup during grace', async () => {
+    vi.useFakeTimers()
+    let starts = 0; let settle!: () => void
+    const provider: LlmProvider = { name: 'cleanup', stream(_request, options) {
+      starts++
+      if (starts === 1) {
+        settle = () => options?.onTransportSettled?.()
+        return { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }) }
+      }
+      return (async function* () {
+        yield { type: 'delta', delta: 'ok' } as const
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } as const
+      })()
+    } }
+    const { kernel, session, agent } = harness([], provider)
+    kernel.ctx.provide('limits', { streamFirstEventMs: 10, stepRetryBaseMs: 1 })
+    agent.send('go'); const running = agent.run()
+    try {
+      await vi.advanceTimersByTimeAsync(11); expect(starts).toBe(1)
+      settle(); await vi.advanceTimersByTimeAsync(2); await running
+      expect(starts).toBe(2)
+      expect(session.events.filter(event => event.type === 'assistant/message')).toHaveLength(1)
+      expect(kernel.ctx.llm.admission('cleanup').active).toBe(0)
+    } finally { vi.useRealTimers(); await kernel.stop() }
+  })
   it('one turn produces the durable event order turn→step→chunks→message→turn/end', async () => {
     const { kernel, session, agent } = harness(['Hi there'])
 
@@ -51,8 +95,10 @@ describe('agent loop', () => {
       'turn/start',
       'step/start',
       'user/message',
+      'model/attempt',
       'assistant/chunk',
       'assistant/chunk',
+      'model/attempt',
       'assistant/message',
       'step/end',
       'turn/end',
@@ -105,6 +151,7 @@ describe('agent loop', () => {
       async *stream(request) {
         seen.push(request)
         yield { type: 'delta', delta: 'ok' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     })
     llm.use('recorder')
@@ -156,6 +203,7 @@ describe('agent loop', () => {
 
   it('a model stream that yields nothing fails the turn durably instead of completing silently', async () => {
     const { kernel, session, agent, llm } = harness(['unused'])
+    kernel.ctx.provide('limits', { stepRetryBaseMs: 1 })
     llm.register({
       name: 'silent',
       async *stream() {
@@ -175,7 +223,7 @@ describe('agent loop', () => {
     expect(
       session.events.find((event) => event.type === 'turn/error')?.type === 'turn/error'
         && session.events.find((event) => event.type === 'turn/error')?.message,
-    ).toMatch(/empty response/)
+    ).toMatch(/without explicit completion/)
     const last = session.events[session.events.length - 1]
     expect(last?.type === 'turn/end' && last.reason).toBe('failed')
     void kernel.stop()
@@ -183,6 +231,7 @@ describe('agent loop', () => {
 
   it('a thinking-only stream with no answer fails the turn as a provider error', async () => {
     const { kernel, session, agent, llm } = harness(['unused'])
+    kernel.ctx.provide('limits', { stepRetryBaseMs: 1 })
     llm.register({
       name: 'reasoner',
       async *stream() {
@@ -224,6 +273,116 @@ describe('agent loop', () => {
     void kernel.stop()
   })
 
+  describe('transient provider failures', () => {
+    /** A provider whose first `failures` requests fail before any output, then answers. */
+    function flaky(failures: number, error: () => Error) {
+      let requests = 0
+      return {
+        provider: {
+          name: 'flaky',
+          async *stream() {
+            requests += 1
+            if (requests <= failures) throw error()
+            yield { type: 'delta' as const, delta: 'recovered' }
+            yield { type: 'completion' as const, finishReason: 'stop' as const, transport: 'done' as const, policy: 'strict' as const, transportSettled: true }
+          },
+        } satisfies LlmProvider,
+        requests: () => requests,
+      }
+    }
+    const transient = () => new ProviderError('flaky: stream ended without any model output', { transient: true })
+
+    it('a request that fails transiently before any output is asked again and the turn completes', async () => {
+      const { kernel, session, agent, llm } = harness(['unused'])
+      kernel.ctx.provide('limits', { stepRetryBaseMs: 1 })
+      const { provider, requests } = flaky(2, transient)
+      llm.register(provider)
+      llm.use('flaky')
+
+      agent.send('hello')
+      await agent.run()
+
+      expect(requests()).toBe(3)
+      expect(session.events.some((event) => event.type === 'turn/error')).toBe(false)
+      const last = session.events[session.events.length - 1]
+      expect(last?.type === 'turn/end' && last.reason).toBe('completed')
+      // The retried attempts left nothing behind: exactly one answer in the log.
+      expect(session.events.filter((event) => event.type === 'assistant/message')).toHaveLength(1)
+      void kernel.stop()
+    })
+
+    it('gives up after the retry budget and records the provider failure', async () => {
+      const { kernel, session, agent, llm } = harness(['unused'])
+      kernel.ctx.provide('limits', { stepRetries: 2, stepRetryBaseMs: 1 })
+      const { provider, requests } = flaky(99, transient)
+      llm.register(provider)
+      llm.use('flaky')
+
+      agent.send('hello')
+      await agent.run()
+
+      expect(requests()).toBe(3) // first attempt + 2 retries
+      expect(session.events.find((event) => event.type === 'turn/error')).toMatchObject({ kind: 'provider' })
+      void kernel.stop()
+    })
+
+    it('a failure that is not marked transient is never retried', async () => {
+      const { kernel, session, agent, llm } = harness(['unused'])
+      kernel.ctx.provide('limits', { stepRetryBaseMs: 1 })
+      const { provider, requests } = flaky(99, () => new ProviderError('flaky: HTTP 400: bad request'))
+      llm.register(provider)
+      llm.use('flaky')
+
+      agent.send('hello')
+      await agent.run()
+
+      expect(requests()).toBe(1)
+      expect(session.events.find((event) => event.type === 'turn/error')).toMatchObject({ kind: 'provider' })
+      void kernel.stop()
+    })
+
+    it('a failure after output started is never retried, so output cannot be duplicated', async () => {
+      const { kernel, session, agent, llm } = harness(['unused'])
+      kernel.ctx.provide('limits', { stepRetryBaseMs: 1 })
+      let requests = 0
+      llm.register({
+        name: 'midstream',
+        async *stream() {
+          requests += 1
+          yield { type: 'delta' as const, delta: 'partial ' }
+          throw transient()
+        },
+      })
+      llm.use('midstream')
+
+      agent.send('hello')
+      await agent.run()
+
+      expect(requests).toBe(1)
+      expect(session.events.find((event) => event.type === 'turn/error')).toMatchObject({ kind: 'provider' })
+      void kernel.stop()
+    })
+
+    it('a stop during the backoff ends the run as cancelled instead of retrying', async () => {
+      const { kernel, session, agent, llm } = harness(['unused'])
+      kernel.ctx.provide('limits', { stepRetryBaseMs: 60_000 })
+      const { provider, requests } = flaky(99, transient)
+      llm.register(provider)
+      llm.use('flaky')
+
+      agent.send('hello')
+      const running = agent.run()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      agent.stop()
+      await running
+
+      expect(requests()).toBe(1)
+      const last = session.events[session.events.length - 1]
+      expect(last?.type === 'turn/end' && last.reason).toBe('cancelled')
+      void kernel.stop()
+    })
+  })
+
   it('a tool abort that loses the stop race still closes the turn as cancelled', async () => {
     const kernel = new Kernel()
     kernel.ctx.plugin(SessionsService)
@@ -250,6 +409,7 @@ describe('agent loop', () => {
       models: ['scripted'],
       async *stream() {
         yield { type: 'toolCalls', calls: [{ id: 'c1', name: 'Hang', args: {} }] }
+        yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     kernel.ctx.llm.register(scripted)
@@ -290,6 +450,7 @@ describe('agent loop', () => {
             return
           }
           yield { type: 'delta', delta: `reply ${calls}` }
+          yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
         },
       }
       const h = harness([], provider)
@@ -520,6 +681,7 @@ describe('agent loop', () => {
       async *stream(request) {
         for (const message of request.messages) seen.push(messageText(message.content))
         yield { type: 'delta', delta: 'fine' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     })
     llm.use('spy')
@@ -563,6 +725,7 @@ describe('agent loop', () => {
       async *stream(request) {
         projections.push(request.messages.map((message) => messageText(message.content)))
         yield { type: 'delta', delta: 'audited' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     })
     llm.use('auditor')

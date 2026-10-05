@@ -29,6 +29,24 @@ export function acceptedDraft(state: ComposerState, revision: number): ComposerS
 }
 
 /**
+ * A UUID without `crypto.randomUUID`: that function only exists in secure
+ * contexts, and this app is served over plain HTTP from a LAN or tailnet IP.
+ * `getRandomValues` however is available everywhere.
+ */
+export function freshRequestId(): string {
+  const bytes = new Uint8Array(16)
+  if (typeof globalThis.crypto?.getRandomValues === 'function') {
+    globalThis.crypto.getRandomValues(bytes)
+  } else {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256)
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+/**
  * The request id for submitting `state` now: reused only for the very same
  * unchanged draft. The id names the message, not how it is delivered — a
  * failed Queue resent as a Steer keeps it (no second copy of the message);

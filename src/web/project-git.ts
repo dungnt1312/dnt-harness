@@ -246,15 +246,26 @@ async function lineCounts(root: string): Promise<Map<string, { added: number; re
 export async function gitDiff(root: string, rawPath: string, deniedRoots?: readonly string[]): Promise<GitDiffReport> {
   const rel = await contain(root, rawPath, deniedRoots)
   if (rel === null || rel === '') throw new ProjectGitError('path must be a file inside this project')
-  const { stdout, code } = await git(root, ['diff', '--no-color', '--unified=3', '--find-renames', 'HEAD', '--', rel])
+  // A repository with no commit yet has no HEAD for `diff` to name; the
+  // staged index against the empty state is the whole story there.
+  const hasHead = (await git(root, ['rev-parse', '--verify', '-q', 'HEAD'])).code === 0
+  const { stdout, code } = await git(root, hasHead
+    ? ['diff', '--no-color', '--unified=3', '--find-renames', 'HEAD', '--', rel]
+    : ['diff', '--no-color', '--unified=3', '--cached', '--', rel])
   if (code !== 0) throw new ProjectGitError(`git cannot diff '${rel}'`)
   let text = stdout.toString('utf8')
-  // Untracked files have no HEAD diff. `git diff --no-index` against NUL
-  // prints them as a new file and exits 1 because the sides differ, which is
-  // the result rather than a failure.
+  // A path with no HEAD diff is either unchanged-tracked or never staged.
+  // Only the never-staged one has content to show: an all-additions diff
+  // against the empty device, spelled per platform (NUL on Windows,
+  // /dev/null elsewhere — git must be able to open it). It exits 1 because
+  // the sides differ, which is the result rather than a failure.
   if (text.trim() === '') {
-    const added = await git(root, ['diff', '--no-color', '--unified=3', '--no-index', '--', 'NUL', rel])
-    if (added.stdout.length > 0) text = added.stdout.toString('utf8')
+    const { stdout: tracked } = await git(root, ['ls-files', '-z', '--', rel])
+    if (tracked.length === 0) {
+      const empty = process.platform === 'win32' ? 'NUL' : '/dev/null'
+      const added = await git(root, ['diff', '--no-color', '--unified=3', '--no-index', '--', empty, rel])
+      if (added.stdout.length > 0) text = added.stdout.toString('utf8')
+    }
   }
   const truncated = Buffer.byteLength(text) > MAX_DIFF_BYTES
   if (truncated) text = text.slice(0, MAX_DIFF_BYTES)

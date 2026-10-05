@@ -15,6 +15,7 @@ import {
   listAgentDefinitions,
 } from '../../lib/api.ts'
 import { cn } from '../../lib/cn.ts'
+import { agentRoleIcon, AGENT_ROLE_TONE } from '../../lib/agent-icons.ts'
 import type { AgentDefinitionRow } from '../../lib/types.ts'
 import {
   CodeArea,
@@ -206,6 +207,9 @@ function AgentsPanelContent({ workspaceId, modelOptions }: AgentsPanelProps) {
                   )}
                 >
                   <span className="flex w-full min-w-0 items-center gap-2 text-sm font-medium">
+                    <span className={cn('flex size-5 shrink-0 items-center justify-center rounded-md bg-muted', AGENT_ROLE_TONE[agentRoleIcon(row.definition.name)])}>
+                      <Icon name={agentRoleIcon(row.definition.name)} size={12} />
+                    </span>
                     <span className="truncate">{row.definition.name}</span>
                     <Badge tone={row.source === 'workspace' ? 'blue' : 'gray'}>{row.source}</Badge>
                   </span>

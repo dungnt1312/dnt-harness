@@ -4,6 +4,7 @@
  * session through the ambient agent scope.
  */
 import { promises as fs } from 'node:fs'
+import { brotliCompressSync } from 'node:zlib'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -106,11 +107,12 @@ function slowProvider(): LlmProvider {
   return {
     name: 'slow',
     models: ['slow'],
-    async *stream(): AsyncIterable<{ type: 'delta'; delta: string }> {
+    async *stream() {
       for (const word of ['one', 'two', 'three', 'four', 'five']) {
         await new Promise((resolve) => setTimeout(resolve, 40))
         yield { type: 'delta', delta: `${word} ` }
       }
+      yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
     },
   }
 }
@@ -248,6 +250,9 @@ describe('web server', () => {
       // per-request manifest: the trajectory's durable "what it carried".
       'context/body',
       'context/manifest',
+      // Per-attempt lifecycle facts for the one physical model attempt.
+      'model/attempt',
+      'model/attempt',
       'assistant/message',
       'step/end',
       'turn/end',
@@ -974,6 +979,19 @@ describe('static PWA files', () => {
       const worker = await fetch(`${baseUrl}/sw.js`)
       expect(worker.headers.get('content-type')).toContain('text/javascript')
       expect(worker.headers.get('cache-control')).toBe('no-cache')
+
+      // A precompressed twin ships as-is with its encoding header; a request
+      // without encoding support gets the identity bytes. The twin carries
+      // real brotli bytes because the fetch stack decodes transparently.
+      const big = `console.log(${JSON.stringify('x'.repeat(4_096))})`
+      await fs.writeFile(path.join(staticDir, 'big.js'), big)
+      await fs.writeFile(`${path.join(staticDir, 'big.js')}.br`, brotliCompressSync(Buffer.from(big)))
+      const encoded = await fetch(`${baseUrl}/big.js`, { headers: { 'accept-encoding': 'gzip, deflate, br' } })
+      expect(encoded.headers.get('content-encoding')).toBe('br')
+      expect(await encoded.text()).toBe(big)
+      const plain = await fetch(`${baseUrl}/big.js`, { headers: { 'accept-encoding': 'identity' } })
+      expect(plain.headers.get('content-encoding')).toBeNull()
+      expect(await plain.text()).toBe(big)
 
       const shell = await fetch(`${baseUrl}/some/client/route`)
       expect(shell.headers.get('content-type')).toContain('text/html')

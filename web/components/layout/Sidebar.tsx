@@ -237,7 +237,7 @@ export function Sidebar(props: SidebarProps) {
             <Icon name="chevron" size={14} className="shrink-0 rotate-180 text-fg-faint" />
           </Popover.Trigger>
           <Popover.Portal>
-            <Popover.Content side="top" align="start" sideOffset={6} collisionPadding={12} className="z-50 w-[min(340px,calc(100vw-24px))] rounded-2xl border border-line bg-surface p-1.5 text-fg shadow-pop outline-none animate-fade-up">
+            <Popover.Content side="top" align="start" sideOffset={6} collisionPadding={12} className="z-50 max-h-[min(70vh,var(--radix-popover-content-available-height))] w-[min(340px,calc(100vw-24px))] overflow-y-auto rounded-2xl border border-line bg-surface p-1.5 text-fg shadow-pop outline-none animate-fade-up">
               <WorkspacePopover
                 workspaces={workspaces}
                 activeWorkspaceId={activeWorkspaceId}

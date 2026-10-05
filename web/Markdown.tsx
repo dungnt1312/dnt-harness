@@ -1,13 +1,27 @@
-import { memo, useMemo, useState, type ComponentProps } from 'react'
+import { memo, useEffect, useMemo, useState, type ComponentProps } from 'react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import Icon from './components/common/Icon.tsx'
-import { highlight } from './lib/highlight.ts'
+import { ensureLanguage, escapeHtml, highlight } from './lib/highlight.ts'
 
 /** Fenced code block with a language chip and a copy button. */
 function CodeBlock({ lang, code }: { readonly lang: string; readonly code: string }) {
   const [copied, setCopied] = useState(false)
-  const html = useMemo(() => highlight(code, lang), [code, lang])
+  // The grammar loads after first paint: the block renders escaped plain text
+  // immediately, then re-renders highlighted once the language arrives.
+  const [ready, setReady] = useState(lang === '' || lang === 'text')
+  useEffect(() => {
+    if (ready) return
+    let live = true
+    void ensureLanguage(lang).then((ok) => {
+      if (live && ok) setReady(true)
+    })
+    return () => { live = false }
+  }, [lang, ready])
+  const html = useMemo(
+    () => (ready ? highlight(code, lang) : escapeHtml(code)),
+    [code, lang, ready],
+  )
   return (
     <div className="codeblock">
       <div className="codeblock-head">

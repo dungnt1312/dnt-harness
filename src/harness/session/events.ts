@@ -29,6 +29,7 @@ export interface RequestControls {
  * and every switch over it, ending in `assertNever`.
  */
 export type SessionEvent =
+  | ({ readonly type: 'model/attempt' | 'execution/uncertain' | 'execution/reconciled'; readonly fact: import('../llm/request-lifecycle.ts').AttemptFact } & SessionEventStamp)
   | ({ readonly type: 'turn/start'; readonly turnId: TurnId; readonly kind?: 'conversation' | 'delegation' } & SessionEventStamp)
   | ({ readonly type: 'turn/closing'; readonly turnId: TurnId } & SessionEventStamp)
   | ({ readonly type: 'user/message'; readonly turnId: TurnId; readonly content: string; readonly inputId?: string; readonly attachments?: readonly AttachmentRef[] } & SessionEventStamp)
@@ -325,6 +326,9 @@ export function deriveMessages(events: readonly SessionEvent[], attachments?: At
       case 'tool/result':
         messages.push({ role: 'tool', content: event.output, toolCallId: event.callId })
         break
+      case 'model/attempt':
+      case 'execution/uncertain':
+      case 'execution/reconciled':
       case 'turn/start':
       case 'turn/closing':
       case 'step/start':

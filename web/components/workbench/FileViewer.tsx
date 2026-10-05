@@ -8,7 +8,8 @@ import { IconButton } from '../ui/IconButton.tsx'
 import { readProjectFile, type ProjectFileView } from '../../lib/api.ts'
 import type { ViewerFocus } from '../../hooks/useWorkbenchFiles.ts'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
-import { escapeHtml, highlight, languageOfFile } from '../../lib/highlight.ts'
+import { MediaPreview } from '../common/MediaPreview.tsx'
+import { escapeHtml, ensureLanguage, highlight, languageOfFile } from '../../lib/highlight.ts'
 
 /** Above this size files render as plain escaped text to keep the viewer responsive. */
 const HIGHLIGHT_LIMIT = 200_000
@@ -49,10 +50,22 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
   useEffect(() => { void load() }, [load])
 
   const language = languageOfFile(path)
+  // The grammar loads after first paint: big files never wait on it, and the
+  // escaped text is already correct before the highlighted pass re-renders.
+  const [grammarReady, setGrammarReady] = useState(language === 'text')
+  useEffect(() => {
+    if (language === 'text') return
+    let live = true
+    void ensureLanguage(language).then((ok) => {
+      if (live && ok) setGrammarReady(true)
+    })
+    return () => { live = false }
+  }, [language])
   const html = useMemo(() => {
     if (file === null || file.binary) return ''
-    return file.content.length > HIGHLIGHT_LIMIT ? escapeHtml(file.content) : highlight(file.content, language)
-  }, [file, language])
+    if (file.content.length > HIGHLIGHT_LIMIT || !grammarReady) return escapeHtml(file.content)
+    return highlight(file.content, language)
+  }, [file, language, grammarReady])
   const lineCount = file === null || file.binary ? 0 : file.content.replace(/\n$/, '').split('\n').length
 
   useLayoutEffect(() => {
@@ -102,11 +115,13 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
       ) : file !== null ? (
         <>
           <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-line px-3 text-xs text-fg-muted">
-            <span className="font-mono">{language}{file.truncated ? ` · first ${Math.round(file.content.length / 1024)} KB of ${Math.round(file.size / 1024)} KB` : ''}</span>
+            <span className="font-mono">{file.binary ? 'binary' : language}{file.truncated && !file.binary ? ` · first ${Math.round(file.content.length / 1024)} KB of ${Math.round(file.size / 1024)} KB` : ''}</span>
             {!file.binary ? <CopyButton text={file.content} label="Copy file contents" className="size-7" /> : null}
           </div>
           {file.binary ? (
-            <p className="m-0 p-4 text-sm text-fg-muted">Binary file ({file.size.toLocaleString()} bytes) — not shown.</p>
+            <div className="min-h-0 flex-1 overflow-auto" role="region" aria-label={`Preview of ${path}`}>
+              <MediaPreview workspaceId={workspaceId} projectId={projectId} path={path} layout="full" />
+            </div>
           ) : (
             <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto" role="region" aria-label={`Contents of ${path}`} tabIndex={0}>
               {file.truncated ? <p className="m-0 border-b border-line bg-warn-soft px-3 py-1.5 text-xs text-warn">File is larger than 1 MB; only the beginning is shown.</p> : null}

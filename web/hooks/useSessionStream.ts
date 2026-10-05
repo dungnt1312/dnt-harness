@@ -33,33 +33,76 @@ export function reconcileApprovals(pending: readonly PendingApproval[], events: 
  * Remove payloads the browser never renders and chunks superseded by a
  * durable assistant message. Reasoning chunks remain available for the
  * collapsed thought-process disclosure, but are folded to one event per step.
+ * The incremental twin below powers the live stream; this whole-array form
+ * stays for one-shot inputs (tests, snapshots).
  */
 export function compactClientEvents(events: readonly SseEvent[]): readonly SseEvent[] {
+  return createEventCompactor()(events)
+}
+
+/**
+ * Incremental twin of {@link compactClientEvents}: each streamed batch folds
+ * into the kept list as it arrives, so a frame costs O(batch) instead of
+ * rescanning the session's whole history every animation frame. The one full
+ * scan happens when a step finalizes (its earlier content chunks must go) —
+ * once per step, not once per chunk. Thinking folds and drops follow exactly
+ * the whole-array rules, and a batch that changes nothing returns the same
+ * array reference so downstream memos skip work.
+ */
+export function createEventCompactor(): (batch: readonly SseEvent[]) => readonly SseEvent[] {
+  let events: SseEvent[] = []
   const finalizedSteps = new Set<string>()
-  for (const event of events) {
-    if (event.type === 'assistant/message' && event.stepId !== undefined) finalizedSteps.add(event.stepId)
-  }
-  const compacted: SseEvent[] = []
-  const thinkingByStep = new Map<string, number>()
-  for (const event of events) {
-    // Raw context bodies are fetched on demand by hash and never render from
-    // the session stream. Keeping them here duplicates potentially large text.
-    if (event.type === 'context/body') continue
-    if (event.type === 'assistant/chunk' && event.stepId !== undefined) {
-      if (finalizedSteps.has(event.stepId) && event.thinking !== true) continue
-      if (event.thinking === true) {
-        const at = thinkingByStep.get(event.stepId)
-        if (at !== undefined) {
-          const previous = compacted[at]!
-          compacted[at] = { ...previous, delta: `${previous.delta ?? ''}${event.delta ?? ''}` }
-          continue
-        }
-        thinkingByStep.set(event.stepId, compacted.length)
+  const thinkingAt = new Map<string, number>()
+  return (batch) => {
+    if (batch.length === 0) return events
+    let newlyFinalized = false
+    for (const event of batch) {
+      if (event.type === 'assistant/message' && event.stepId !== undefined && !finalizedSteps.has(event.stepId)) {
+        finalizedSteps.add(event.stepId)
+        newlyFinalized = true
       }
     }
-    compacted.push(event)
+    const pushed: SseEvent[] = []
+    let folded = false
+    for (const event of batch) {
+      if (event.type === 'context/body') continue
+      if (event.type === 'assistant/chunk' && event.stepId !== undefined) {
+        if (event.thinking === true) {
+          const at = thinkingAt.get(event.stepId)
+          if (at !== undefined) {
+            // The fold target may still sit in this batch's `pushed` tail
+            // (same-batch chunks), not yet joined into `events`.
+            const target = at < events.length ? events[at] : pushed[at - events.length]
+            if (target !== undefined) {
+              const merged = { ...target, delta: `${target.delta ?? ''}${event.delta ?? ''}` }
+              if (at < events.length) events[at] = merged
+              else pushed[at - events.length] = merged
+              folded = true
+              continue
+            }
+          }
+          // The fold target lands at this index once `pushed` joins `events`.
+          thinkingAt.set(event.stepId, events.length + pushed.length)
+        } else if (finalizedSteps.has(event.stepId)) {
+          continue
+        }
+      }
+      pushed.push(event)
+    }
+    if (pushed.length > 0 || folded) events = pushed.length > 0 ? [...events, ...pushed] : [...events]
+    if (newlyFinalized) {
+      // Earlier content chunks of the finalized steps leave the kept list;
+      // fold indices shift with them, so the map rebuilds from the result.
+      events = events.filter((event) => !(
+        event.type === 'assistant/chunk' && event.thinking !== true && event.stepId !== undefined && finalizedSteps.has(event.stepId)
+      ))
+      thinkingAt.clear()
+      events.forEach((event, index) => {
+        if (event.type === 'assistant/chunk' && event.thinking === true && event.stepId !== undefined) thinkingAt.set(event.stepId, index)
+      })
+    }
+    return events
   }
-  return compacted.length === events.length && compacted.every((event, index) => event === events[index]) ? events : compacted
 }
 
 export function useSessionStream(workspaceId: string | null, sessionId: string | null) {
@@ -67,6 +110,9 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
   const [items, setItems] = useState<readonly ViewItem[]>([])
   const [approvals, setApprovals] = useState<readonly PendingApproval[]>([])
   const [stream, setStream] = useState<StreamState>('idle')
+  // True once this conversation's first snapshot/resume frame landed: before
+  // that, `events` reflects nothing and "is it running?" is unknown, not no.
+  const [settled, setSettled] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const seenSeq = useRef(0)
   const dismissApproval = useCallback((id: string) => {
@@ -77,7 +123,11 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
     seenSeq.current = 0
     setEvents([])
     setItems([])
+    setSettled(false)
     let projector = createProjector()
+    // The compactor owns the kept-event list across the whole stream: batches
+    // fold in place, snapshots replace it wholesale.
+    const compact = createEventCompactor()
     setApprovals([])
     setError(null)
     setStream(sessionId === null || workspaceId === null ? 'idle' : 'connecting')
@@ -91,7 +141,7 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
       const batch = pending
       pending = []
       setItems(projector.apply(batch))
-      setEvents((prev) => compactClientEvents([...prev, ...batch]))
+      setEvents(compact(batch))
     }
     const discardPending = (): void => {
       if (frame !== 0) cancelAnimationFrame(frame)
@@ -104,9 +154,10 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
         discardPending()
         projector = createProjector()
         setItems(projector.apply(envelope.events))
-        setEvents(compactClientEvents(envelope.events))
+        setEvents(compact(envelope.events))
         setApprovals(reconcileApprovals([], envelope.events))
         seenSeq.current = envelope.events.at(-1)?.seq ?? 0
+        setSettled(true)
       } else if (envelope.kind === 'resume') {
         const unseen = envelope.events.filter((event) => event.seq > seenSeq.current)
         for (const event of unseen) {
@@ -114,6 +165,7 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
           pending.push(event)
         }
         setApprovals((prev) => reconcileApprovals(prev, unseen))
+        setSettled(true)
         if (pending.length > 0 && frame === 0) frame = requestAnimationFrame(flush)
       } else if (envelope.kind === 'session') {
         const { event } = envelope
@@ -155,5 +207,5 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
     return () => { disposed = true; discardPending(); dispose() }
   }, [workspaceId, sessionId])
 
-  return { events, items, approvals, stream, error, dismissApproval }
+  return { events, items, approvals, stream, error, dismissApproval, settled }
 }

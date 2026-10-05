@@ -19,6 +19,8 @@ export const isMcpOutcome = (value: string | undefined): value is McpOutcome => 
 /** One durable session event; fields are optional per `type`. */
 export interface SseEvent {
   readonly type: string
+  /** Canonical physical-attempt diagnostics; absent on legacy events. */
+  readonly fact?: import('../../src/harness/llm/request-lifecycle.ts').AttemptFact
   readonly seq: number
   readonly timestamp?: number
   readonly content?: string
@@ -421,6 +423,15 @@ export interface ChildRow {
     /** Files it read or wrote (Read/Write/Edit); found paths live in `report`. */
     readonly filesTouched: readonly string[]
     /** The report was cut at the host's cap; the marker is in the text. */
+    readonly truncated?: boolean
+  }
+  /**
+   * What a child that did not complete got done (its last message and the files
+   * it touched). Evidence, never a verdict; shown only when there is no result.
+   */
+  readonly partial?: {
+    readonly report: string
+    readonly filesTouched: readonly string[]
     readonly truncated?: boolean
   }
   /** Why there is no result; names the child's full-log session. */

@@ -243,12 +243,23 @@ describe('terminal service', () => {
   it('rejects a shell this host cannot launch', async () => {
     const { terminals } = service()
     await expect(
-      terminals.create({ workspaceId: WS, cwd: process.cwd(), shellId: 'powershell' }),
-    ).resolves.toBeDefined()
-    await expect(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       terminals.create({ workspaceId: WS, cwd: process.cwd(), shellId: 'nonesuch' as any }),
     ).rejects.toMatchObject({ code: 'bad-shell' })
+  })
+
+  it('reports the underlying spawn failure, not just the shell and cwd', async () => {
+    const terminals = createTerminalService({
+      spawner: {
+        spawn() {
+          throw new Error('posix_spawnp failed.')
+        },
+      },
+    })
+    await expect(terminals.create({ workspaceId: WS, cwd: process.cwd() })).rejects.toThrow(
+      /could not start .*: posix_spawnp failed\./,
+    )
+    terminals.disposeAll()
   })
 
   it('reports unavailability instead of throwing on boot when node-pty is missing', async () => {

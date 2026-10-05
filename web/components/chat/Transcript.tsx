@@ -6,6 +6,7 @@ import type { SseEvent } from '../../lib/types.ts'
 import type { OpenPathResolver } from '../../lib/project-paths.ts'
 import { toProjectRelative } from '../../lib/project-paths.ts'
 import { processRows, type ProcessRow } from '../../lib/processes-view.ts'
+import { hiddenSpawnCalls } from '../../lib/spawn-merge.ts'
 import { ActivityBlock, AssistantMessage, AuditLine, CompactionMarker, ContextMarker, DelegationCard, JumpToBottom, ProcessLinkContext, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
 import { TurnChangesCard } from './TurnChangesCard.tsx'
 import type { WorkbenchProject } from '../workbench/Workbench.tsx'
@@ -64,32 +65,32 @@ const rendersNothing = (item: ViewItem): boolean =>
   item.kind === 'assistant' && item.content === '' && !item.live && item.thinking.length === 0 && !item.thinkingLive
 
 /**
- * Work that must stay legible on its own line, never folded into a run's
- * summary: anything that changed the workspace, and handing work to an agent.
- * Reading twenty files is one step; editing one file is not.
+ * A step that shows thinking but no answer. It stays in the column, but it
+ * must not split the work around it into two blocks: each block carries its
+ * own top margin, so the split would open a double gap on either side of the
+ * thinking while every other work row sits one gap apart.
  */
-const STANDALONE_TOOLS: ReadonlySet<string> = new Set(['write', 'edit', 'multiedit', 'notebookedit', 'patch', 'applypatch', 'agent'])
+const isThinkingBeat = (item: ViewItem): boolean =>
+  item.kind === 'assistant' && item.content === '' && (item.thinking.length > 0 || item.thinkingLive)
 
-const standsAlone = (item: ViewItem): boolean =>
-  item.kind === 'delegation' || (item.kind === 'tool' && STANDALONE_TOOLS.has(item.call.name.toLowerCase()))
-
-/** Rows that read as activity rather than as a message, for grouping and spacing. */
-const isActivity = (item: ViewItem): boolean => ACTIVITY_KINDS.has(item.kind)
-
-/** A block the reader skims past: it sits close to its neighbour, not a message apart. */
-const isQuiet = (block: Block): boolean => block.kind === 'activity'
-  || isActivity(block.row.item)
-  || (block.row.item.kind === 'assistant' && block.row.item.content === '')
+/** Rows that read as activity rather than as a message, for grouping. */
+const isActivity = (item: ViewItem): boolean => ACTIVITY_KINDS.has(item.kind) || isThinkingBeat(item)
 
 export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
   const blocks: Block[] = []
   items.forEach((item, index) => {
     if (item.kind === 'status' && item.reason === 'completed') return
+    // Queued input waits on the strip above the composer (QueuedBar), not in
+    // the transcript: the twin becomes a real row only when a turn consumes it.
+    if (item.kind === 'user' && item.queued === true) return
     if (rendersNothing(item)) return
     const previous = items[index - 1]
     if (item.kind === 'status' && item.reason === 'failed' && previous?.kind === 'status' && previous.reason.includes(':')) return
     const last = blocks.at(-1)
-    if (isActivity(item) && !standsAlone(item)) {
+    // Every consecutive work row joins the same run, edits and delegations
+    // included. Splitting them out made each one its own block, and a block
+    // margin on top of the run's own gap is the uneven spacing in the column.
+    if (isActivity(item)) {
       if (last?.kind === 'activity') (last.rows as Indexed[]).push({ item, index })
       else blocks.push({ kind: 'activity', rows: [{ item, index }] })
       return
@@ -107,7 +108,7 @@ export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
  * Memoized: the app re-renders on every composer keystroke, and a long
  * transcript must not re-render with it while its own props are unchanged.
  */
-export const Transcript = memo(function Transcript({ items, events, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, onSendNow, running = false, openPath, project, onReviewChanges, onOpenProcess }: {
+export const Transcript = memo(function Transcript({ items, events, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, openPath, project, onReviewChanges, onOpenProcess }: {
   readonly items: readonly ViewItem[]
   /** The raw log behind `items`; per-turn changes project from it. */
   readonly events?: readonly SseEvent[]
@@ -118,10 +119,6 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   readonly onOpenChild?: (childSessionId: string) => void
   /** Resends one failed turn's own inputs. */
   readonly onRetry?: (target: RetryTarget) => void
-  /** Steer the queue: stop the running turn and run queued input now. */
-  readonly onSendNow?: () => void
-  /** A turn is open (steered bubbles are still stopping it). */
-  readonly running?: boolean
   readonly openPath?: OpenPathResolver
   /** The conversation's project, for the per-turn change card's git chips. */
   readonly project?: WorkbenchProject | null
@@ -157,6 +154,8 @@ export const Transcript = memo(function Transcript({ items, events, conversation
     () => onOpenProcess === undefined ? null : { statuses: processStatuses, open: onOpenProcess },
     [onOpenProcess, processStatuses],
   )
+  // Spawn calls the delegation row absorbs: one delegation, one row.
+  const hiddenSpawns = useMemo(() => hiddenSpawnCalls(events ?? []), [events])
   const turnChangeFooter = (turnId?: string): TurnChanges | undefined => {
     if (turnId === undefined) return undefined
     const changes = turnChangeMap.get(turnId)
@@ -174,13 +173,6 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   }, [atBottom, items.length])
   const unseen = Math.max(0, items.length - seen)
 
-  /**
-   * An answer already reserves a (hover-revealed) action row underneath, so it
-   * does not also need a full message gap: the reserved row is the gap. A user
-   * bubble keeps its actions beside it and reserves nothing.
-   */
-  const carriesActions = (block: Block): boolean => block.kind === 'row' && footers.has(block.row.index)
-
   const render = ({ item, index }: Indexed): ReactNode => {
     switch (item.kind) {
       case 'user':
@@ -189,9 +181,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
             key={`user-${index}`}
             item={item}
             workspaceId={workspaceId ?? null}
-            running={running}
             {...(onReuse !== undefined ? { onReuse } : {})}
-            {...(onSendNow !== undefined ? { onSendNow } : {})}
           />
         )
       case 'assistant': {
@@ -228,7 +218,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
         )
       }
       case 'tool':
-        return <ToolCard key={item.call.id} item={item} {...(openPath !== undefined ? { openPath } : {})} />
+        return <ToolCard key={item.call.id} item={item} hidden={hiddenSpawns.has(item.call.id)} {...(openPath !== undefined ? { openPath } : {})} />
       case 'delegation':
         return <DelegationCard key={item.childSessionId} item={item} {...(workspaceId !== undefined ? { workspaceId } : {})} rootSessionId={conversationId} {...(onOpenChild !== undefined ? { onOpen: onOpenChild } : {})} />
       case 'audit':
@@ -268,9 +258,10 @@ export const Transcript = memo(function Transcript({ items, events, conversation
           className="chat-scroll absolute inset-0 overflow-y-auto overflow-x-hidden outline-none"
         >
           <div ref={contentRef} className="px-3 pb-8 pt-4 sm:px-6">
-            {/* Spacing is per neighbour, not one flat gap: activity sits as its
-                own beat (a full gap above and below), and a message whose
-                reserved action row already adds height does not add one on top. */}
+            {/* One beat between every block. Top margin only: an activity run
+                and a standalone tool row are both work items, so they share the
+                same gap instead of a run's vertical margin stacking on the
+                next row's. */}
             <div className="mx-auto flex w-full max-w-3xl flex-col px-1">
               {visibleStart > 0 ? (
                 <button
@@ -282,9 +273,12 @@ export const Transcript = memo(function Transcript({ items, events, conversation
                 </button>
               ) : null}
               {visibleBlocks.map((block) => {
-                // Activity is its own beat: a full gap above and below, like the
-                // 16px between any two work items in a turn.
-                const spacing = block.kind === 'activity' ? 'my-4' : 'mt-1.5'
+                // A spawn call its delegation row absorbed renders nothing —
+                // not even its spacing wrapper.
+                if (block.kind === 'row' && block.row.item.kind === 'tool' && hiddenSpawns.has(block.row.item.call.id)) return null
+                // One beat above every block. Rows inside a run take the same beat
+                // from the run, so nothing here adds a second margin.
+                const spacing = 'mt-2.5 sm:mt-4'
                 const row = block.kind === 'row' ? block.row : null
                 const isUserRow = row?.item.kind === 'user'
                 if (block.kind === 'activity') {

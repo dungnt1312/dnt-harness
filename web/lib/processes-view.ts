@@ -29,18 +29,22 @@ export interface SubagentRow {
   readonly definition: string
   readonly running: boolean
   readonly status?: string
+  /** Wall-clock dispatch time of the spawn; 0 on legacy events without one. */
+  readonly dispatchedAt: number
 }
 
 export function subagentRows(events: readonly SseEvent[]): readonly SubagentRow[] {
   const rows = new Map<string, SubagentRow>()
   for (const event of events) {
     if (event.type === 'agent/child-spawn' && event.childSessionId !== undefined) {
-      rows.set(event.childSessionId, { childSessionId: event.childSessionId, definition: event.definition ?? 'subagent', running: true })
+      rows.set(event.childSessionId, { childSessionId: event.childSessionId, definition: event.definition ?? 'subagent', running: true, dispatchedAt: event.timestamp ?? 0 })
     } else if (event.type === 'agent/child-result' && event.childSessionId !== undefined) {
       const row = rows.get(event.childSessionId)
       if (row === undefined) continue
       rows.set(event.childSessionId, { ...row, running: false, status: event.status ?? 'finished' })
     }
   }
-  return [...rows.values()]
+  // Newest dispatch first: the child just sent out leads the list instead of
+  // hiding at the bottom under the whole ended history.
+  return [...rows.values()].sort((left, right) => right.dispatchedAt - left.dispatchedAt)
 }

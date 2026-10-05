@@ -6,22 +6,24 @@ import { composerChipClass } from './composer-chip.ts'
 
 const staticChipClass = cn(composerChipClass, 'hover:bg-transparent hover:text-fg-muted')
 
-export function ModeMenu({ modes, value, onChange }: {
+export function ModeMenu({ modes, value, label = 'Workspace mode (next tool gate and request)', onChange }: {
   readonly modes: readonly { readonly value: string; readonly label: string }[]
   readonly value: string
+  readonly label?: string
   readonly onChange: (value: string) => void
 }) {
-  const label = modes.find((mode) => mode.value === value)?.label ?? value
+  const current = modes.find((mode) => mode.value === value)?.label ?? value
   return (
     <Menu
-      label="Workspace mode (next tool gate and request)"
+      label={label}
       side="top"
+      compact
       triggerClassName={cn(composerChipClass, value === 'full-access' && 'text-warn hover:text-warn')}
       trigger={() => (
         <>
           <Icon name="layers" size={15} />
-          <span className="truncate">{label}</span>
-          <Icon name="chevron" size={13} />
+          <span className="truncate @max-[30rem]:hidden">{current}</span>
+          <Icon name="chevron" size={13} className="@max-[30rem]:hidden" />
         </>
       )}
     >
@@ -56,15 +58,15 @@ export function ControlsStatus({ message, onRetry }: { readonly message: string;
     return (
       <span className={cn(staticChipClass, 'text-warn hover:text-warn')} title={message}>
         <Icon name="alertTriangle" size={14} />
-        <span className="truncate">{message}</span>
+        <span className="truncate @max-[30rem]:hidden">{message}</span>
       </span>
     )
   }
   return (
-    <button type="button" className={cn(composerChipClass, 'text-warn hover:text-warn')} title={`${message} — retry`} onClick={onRetry}>
+    <button type="button" data-compact-control className={cn(composerChipClass, 'text-warn hover:text-warn')} title={`${message} — retry`} onClick={onRetry}>
       <Icon name="refresh" size={14} />
-      <span className="truncate">{message}</span>
-      <span className="shrink-0 font-medium underline">Retry</span>
+      <span className="truncate @max-[30rem]:hidden">{message}</span>
+      <span className="shrink-0 font-medium underline @max-[30rem]:hidden">Retry</span>
     </button>
   )
 }
@@ -83,7 +85,8 @@ export function AttachMenu({ uploading, onUpload, onMention }: {
       label="Attach a file"
       side="top"
       align="start"
-      triggerClassName="flex size-8 shrink-0 items-center justify-center rounded-full text-fg-muted transition-colors hover:bg-hover hover:text-fg disabled:pointer-events-none disabled:opacity-40 [@media(pointer:coarse)]:size-11"
+      compact
+      triggerClassName="flex size-8 shrink-0 items-center justify-center rounded-full text-fg-muted transition-colors hover:bg-hover hover:text-fg disabled:pointer-events-none disabled:opacity-40 [@media(pointer:coarse)]:size-9"
       trigger={() => (uploading ? <Spinner size={14} /> : <Icon name="plus" size={18} />)}
     >
       {(close) => (

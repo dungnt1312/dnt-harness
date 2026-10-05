@@ -47,12 +47,17 @@ export function useStickToBottom(resetKey: unknown) {
 
   useEffect(() => {
     const content = contentRef.current
+    const scroller = scrollRef.current
     if (content === null || typeof ResizeObserver === 'undefined') return
     // Unpinned growth re-measures instead: content that grew without pushing
     // the tail off screen (a short transcript) must not leave a stale
     // "Jump to latest" behind.
     const observer = new ResizeObserver(() => { if (pinned.current) jump('auto'); else measure() })
     observer.observe(content)
+    // A touch keyboard (useKeyboardInset) and collapsing browser chrome
+    // shrink the scroller while its content is unchanged, so the container
+    // needs watching too — or a pinned tail drifts above the fold.
+    if (scroller !== null) observer.observe(scroller)
     return () => observer.disconnect()
   }, [jump, measure])
 

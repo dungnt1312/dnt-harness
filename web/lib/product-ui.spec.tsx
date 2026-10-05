@@ -9,11 +9,13 @@ import { ScopeControl } from '../components/layout/ScopeControl.tsx'
 import { ModeMenu } from '../components/composer/ComposerControls.tsx'
 import { ToastHost, useToast } from '../components/common/Toast.tsx'
 import { ToolCard, ActivityBlock, AssistantMessage, DelegationCard, AuditLine, StatusLine, UserBubble, summarizeActivity } from '../components/chat/MessageParts.tsx'
+import { QueuedBar } from '../components/chat/QueuedBar.tsx'
 import { groupBlocks, turnFooters } from '../components/chat/Transcript.tsx'
 import { activeMinimapIndex, minimapEntries, minimapPreview, minimapScrollTarget } from '../components/chat/ConversationMinimap.tsx'
 import { modeLabel, errorSummary } from './copy.ts'
 import { emptyDraft, textDraft } from './composer-draft.ts'
 import { budgetTone, formatTime } from './format.ts'
+import { hiddenSpawnCalls } from './spawn-merge.ts'
 import { projectItems } from './project.ts'
 import { compactSession, fetchHooks, saveHooks, renameWorkspace, listProjectFiles, readProjectFile } from './api.ts'
 import { ContextPanel } from '../components/layout/ContextPanel.tsx'
@@ -243,7 +245,7 @@ describe('transcript grouping', () => {
     ])
     expect(blocks.map((block) => block.kind === 'activity' ? `activity:${block.rows.length}` : block.row.item.kind)).toEqual(['user', 'activity:3', 'assistant', 'status', 'status'])
   })
-  it('keeps edits, delegations and reasoning out of a run: only lookups group', () => {
+  it('keeps every consecutive work row in one run, edits and delegations included', () => {
     const blocks = groupBlocks([
       { kind: 'user', content: 'go' },
       { kind: 'tool', call: { id: 'a', name: 'Grep', args: {} } },
@@ -254,8 +256,11 @@ describe('transcript grouping', () => {
       { kind: 'tool', call: { id: 'e', name: 'Read', args: {} } },
       { kind: 'delegation', childSessionId: 'child', definition: 'explorer', brief: 'look', status: 'completed' },
     ])
+    // Thinking renders, but it does not split the work around it: a split
+    // would put a block margin on both sides of it, twice the gap everywhere
+    // else. A real answer still breaks the run.
     expect(blocks.map((block) => block.kind === 'activity' ? `activity:${block.rows.length}` : block.row.item.kind))
-      .toEqual(['user', 'activity:2', 'tool', 'activity:1', 'assistant', 'activity:1', 'delegation'])
+      .toEqual(['user', 'activity:7'])
   })
   it('merges tool rows across invisible tool-only assistant steps into one tight block', () => {
     const emptyStep = { kind: 'assistant' as const, content: '', live: false, thinking: [] as string[], thinkingLive: false }
@@ -311,7 +316,7 @@ describe('activity block summary', () => {
   it('counts calls, ignores reasoning rows, and nests the open run behind a rail', async () => {
     const rows = [toolRow('a', 'Read'), toolRow('b', 'Read'), toolRow('c', 'Grep'), toolRow('d', 'Grep')]
     const items = [...rows, { kind: 'assistant' as const, content: '', live: false, thinking: ['why'], thinkingLive: false }]
-    await mount(<ActivityBlock items={items}>{rows.map((row) => <ToolCard key={row.call.id} item={row} />)}</ActivityBlock>)
+    await mount(<ActivityBlock items={items}>{[...rows.map((row) => <ToolCard key={row.call.id} item={row} />), <span key="why">why</span>]}</ActivityBlock>)
     const header = host.querySelector('button')!
     expect(header.textContent).toContain('2 files, 2 searches')
     await act(async () => header.click())
@@ -382,7 +387,7 @@ describe('tool row facts', () => {
     expect(added?.className).toContain('text-ok')
     expect(removed?.className).toContain('text-bad')
     await act(async () => line().click())
-    const diff = host.querySelector('[role="region"][aria-label="Diff of web/lib/format.ts"]')!
+    const diff = host.querySelector('[role="group"][aria-label="Diff of web/lib/format.ts"]')!
     expect(diff.textContent).toContain('const a = 1')
     expect(diff.textContent).toContain('const a = 2')
   })
@@ -434,17 +439,30 @@ describe('failed request line', () => {
 describe('queued input bubble', () => {
   it('a queued message offers Send now; a steered one says it is stopping the turn', async () => {
     const sendNow = vi.fn()
-    await mount(<UserBubble item={{ kind: 'user', content: 'Later', queued: true, inputId: 'i' }} onSendNow={sendNow} running />)
+    await mount(<QueuedBar items={[{ kind: 'user', content: 'Later', queued: true, inputId: 'i' }]} running onSendNow={sendNow} />)
     await act(async () => button('Send now').click())
     expect(sendNow).toHaveBeenCalledTimes(1)
-    await mount(<UserBubble item={{ kind: 'user', content: 'Now', queued: true, inputId: 's', steer: true }} onSendNow={sendNow} running />)
-    expect(host.textContent).toContain('Steering')
+    await mount(<QueuedBar items={[{ kind: 'user', content: 'Now', queued: true, inputId: 's', steer: true }]} running onSendNow={sendNow} />)
+    expect(host.textContent).toContain('stopping the current turn')
     expect([...host.querySelectorAll('button')].some((b) => b.textContent === 'Send now')).toBe(false)
   })
   it('a steer stranded by a restart is plain queued input with Send now', async () => {
-    await mount(<UserBubble item={{ kind: 'user', content: 'Now', queued: true, inputId: 's', steer: true }} onSendNow={vi.fn()} running={false} />)
-    expect(host.textContent).not.toContain('Steering')
+    await mount(<QueuedBar items={[{ kind: 'user', content: 'Now', queued: true, inputId: 's', steer: true }]} running={false} onSendNow={vi.fn()} />)
+    expect(host.textContent).not.toContain('stopping the current turn')
     expect(button('Send now')).toBeDefined()
+  })
+  it('counts queued messages and lists them in submission order', async () => {
+    await mount(<QueuedBar items={[
+      { kind: 'user', content: 'First', queued: true, inputId: 'i1' },
+      { kind: 'user', content: 'Second', queued: true, inputId: 'i2' },
+    ]} running />)
+    expect(host.textContent).toContain('2 messages')
+    expect(host.textContent).toContain('runs after the current turn')
+    expect(host.textContent.indexOf('First')).toBeLessThan(host.textContent.indexOf('Second'))
+  })
+  it('renders nothing without queued messages', async () => {
+    await mount(<QueuedBar items={[]} running onSendNow={vi.fn()} />)
+    expect(host.children).toHaveLength(0)
   })
   it('a rejected input reads Not sent and can be reused', async () => {
     const reuse = vi.fn()
@@ -604,6 +622,11 @@ describe('transcript truthfulness', () => {
     const head = host.querySelector('button')!
     expect(head.textContent).toMatch(/^Delegated.*explorer/)
     expect(head.textContent).toContain('Map auth modules')
+    // The role icon sits in the same rounded chip the panels use.
+    const chip = head.querySelector('span')
+    expect(chip?.className).toContain('bg-muted')
+    expect(chip?.className).toContain('rounded-md')
+    expect(chip?.querySelector('svg')).not.toBeNull()
     // A clean finish adds nothing to the row.
     expect(head.textContent).not.toMatch(/Failed|Stopped|Interrupted/)
     await act(async () => head.click())
@@ -624,14 +647,14 @@ describe('transcript truthfulness', () => {
     expect(note.textContent).toContain('hook blocked · PreToolUse · Bash*')
     expect(note.textContent).toContain('120ms')
   })
-  it('offers copy and reuse on real user messages, never on queued twins', async () => {
+  it('renders nothing for a queued twin — it lives on the composer strip', async () => {
     const onReuse = vi.fn()
     await mount(<UserBubble item={{ kind: 'user', content: 'Run the migration' }} onReuse={onReuse} />)
     await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Reuse in composer"]')!.click())
     expect(onReuse).toHaveBeenCalledWith('Run the migration')
     await mount(<UserBubble item={{ kind: 'user', content: 'Queued work', queued: true }} onReuse={onReuse} />)
+    expect(host.textContent).toBe('')
     expect(host.querySelector('button[aria-label="Reuse in composer"]')).toBeNull()
-    expect(host.textContent).toContain('Queued')
   })
   it('renders skill and file chips inline in a user message', async () => {
     await mount(<UserBubble item={{ kind: 'user', content: 'Use the review skill: check @web/lib/api.ts now' }} />)
@@ -684,6 +707,31 @@ describe('projection of delegation, hook and approval events', () => {
     ])
     expect(items.filter(item => item.kind === 'tool')).toHaveLength(1)
     expect(items[0]).toMatchObject({ kind: 'tool', server: 'docs', recovered: true })
+  })
+})
+
+describe('spawn call merging', () => {
+  const spawnCall = { type: 'tool/call', seq: 0, call: { id: 't1', name: 'Agent', args: { action: 'spawn', definition: 'worker', prompt: 'do it' } } }
+  const spawnOk = { type: 'tool/result', seq: 1, callId: 't1', ok: true, output: JSON.stringify({ childSessionId: 'ch1', status: 'running' }) }
+  const childSpawn = { type: 'agent/child-spawn', seq: 2, childSessionId: 'ch1', definition: 'worker', brief: 'do it' }
+
+  it('hides the spawn call its delegation row tracks — one delegation, one row', () => {
+    expect(hiddenSpawnCalls([spawnCall, spawnOk, childSpawn])).toEqual(new Set(['t1']))
+  })
+  it('keeps a spawn call whose result never recorded: its digest is the only trace', () => {
+    expect(hiddenSpawnCalls([spawnCall])).toEqual(new Set())
+    expect(hiddenSpawnCalls([{ ...spawnCall }, childSpawn])).toEqual(new Set())
+  })
+  it('keeps a failed spawn call: the error is on the call row, not the delegation', () => {
+    expect(hiddenSpawnCalls([spawnCall, { ...spawnOk, ok: false, output: 'error: no role' }, childSpawn])).toEqual(new Set())
+  })
+  it('keeps calls of actions that answer without a delegation row', () => {
+    const wait = { type: 'tool/call', seq: 0, call: { id: 'w1', name: 'Agent', args: { action: 'wait' } } }
+    expect(hiddenSpawnCalls([wait, { type: 'tool/result', seq: 1, callId: 'w1', ok: true, output: '{"children":[]}' }])).toEqual(new Set())
+  })
+  it('requires the parent log to confirm the child: a stray id hides nothing', () => {
+    const other = { ...spawnOk, output: JSON.stringify({ childSessionId: 'elsewhere' }) }
+    expect(hiddenSpawnCalls([spawnCall, other, childSpawn])).toEqual(new Set())
   })
 })
 
@@ -966,16 +1014,38 @@ describe('sidebar sections + live rows + workspace management', () => {
     await act(async () => bodyButton('Unpin').click())
     expect(togglePinned).toHaveBeenCalledWith('s9', false)
   })
-  it('hides subagent conversations from the sidebar entirely, expanded or searched', async () => {
+  it('nests running subagent conversations under their parent row; ended ones stay hidden', async () => {
     const onSelect = vi.fn()
-    const list = [...sessions, { id: 'c1', title: 'Explore repo', projectId: 'p1', status: 'running' as const, parentSessionId: 's1', pendingInputs: 0, ...base }]
+    const list = [
+      ...sessions,
+      { id: 'c1', title: 'Explore repo', projectId: 'p1', status: 'running' as const, parentSessionId: 's1', pendingInputs: 0, ...base },
+      { id: 'c2', title: 'Ended dig', projectId: 'p1', status: 'idle' as const, parentSessionId: 's1', pendingInputs: 0, ...base },
+    ]
     await mount(<SessionList sessions={list} projects={[project]} current="c1" filter="" liveRunning={false} onSelect={onSelect} onRename={() => {}} onDeleteRequest={() => {}} />)
-    // No toggle row, no child row, and the open child adds nothing either —
-    // subagents are reached from their parent's own view instead.
-    expect(host.textContent).not.toContain('Subagents')
-    expect(host.textContent).not.toContain('Explore repo')
+    // The running child reads as a branch of its parent; the ended one adds
+    // nothing — ended children stay in the parent's Subagents workbench view.
+    expect(host.textContent).toContain('Explore repo')
+    expect(host.textContent).not.toContain('Ended dig')
+    const childRow = [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('Explore repo'))!
+    expect(childRow.getAttribute('aria-current')).toBe('page')
+    expect(childRow.textContent).toContain('working')
+    // Opening the child conversation navigates to it.
+    await act(async () => childRow.click())
+    expect(onSelect).toHaveBeenCalledWith('c1')
+    // The viewed child stays visible even once its own turn ends.
+    await mount(<SessionList sessions={list} projects={[project]} current="c2" filter="" liveRunning={false} onSelect={onSelect} onRename={() => {}} onDeleteRequest={() => {}} />)
+    expect(host.textContent).toContain('Ended dig')
+    expect(host.textContent).toContain('Explore repo')
+    // An ended child vanishes again as soon as another conversation is open.
+    await mount(<SessionList sessions={list} projects={[project]} current="s2" filter="" liveRunning={false} onSelect={onSelect} onRename={() => {}} onDeleteRequest={() => {}} />)
+    expect(host.textContent).not.toContain('Ended dig')
+    // A child-title match keeps its parent row so the nest stays reachable.
     await mount(<SessionList sessions={list} projects={[project]} current={null} filter="explore" liveRunning={false} onSelect={onSelect} onRename={() => {}} onDeleteRequest={() => {}} />)
-    expect(host.textContent).not.toContain('Explore repo')
+    expect(host.textContent).toContain('Explore repo')
+    expect(host.textContent).toContain('Auth refactor')
+    // No child match, no parent: the nest contributes nothing on its own.
+    await mount(<SessionList sessions={list} projects={[project]} current={null} filter="nothing-matches" liveRunning={false} onSelect={onSelect} onRename={() => {}} onDeleteRequest={() => {}} />)
+    expect(host.textContent).not.toContain('Auth refactor')
   })
   it('reads a subagent conversation as a parent → sub breadcrumb trail in the header', async () => {
     const onSelect = vi.fn()

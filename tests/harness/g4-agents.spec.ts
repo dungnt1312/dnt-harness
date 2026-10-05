@@ -1,7 +1,7 @@
 ﻿/**
  * G4: agent definitions (bundled Explorer/Worker, strict parsing, imports)
- * and bounded one-level delegation â€” capacity, ceiling enforcement,
- * isolation, root Stop cleanup.
+ * and one-level delegation — ceiling enforcement (one level only, no count
+ * caps), isolation, root Stop cleanup.
  */
 import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -54,7 +54,7 @@ describe('agent definitions', () => {
       expect(row.definition.instructions).toMatch(/final message/i)
     }
     const verifier = await service.resolve('ws-x' as never, 'verifier')
-    expect(verifier.definition.tools).toContain('Bash')
+    expect(verifier.definition.tools).toEqual(['Read', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell'])
     expect(verifier.definition.disallowedTools).toEqual(expect.arrayContaining(['Write', 'Edit']))
     const reviewer = await service.resolve('ws-x' as never, 'reviewer')
     expect(reviewer.definition.tools).toEqual(['Read', 'Glob', 'Grep'])
@@ -89,14 +89,20 @@ describe('agent definitions', () => {
     }
   })
 
-  it('bundled Explorer is read-only with no shell; Worker has no Bash', async () => {
+  it('bundled Explorer is read-only with no shell', async () => {
     const service = new AgentDefinitionService(home)
     const explorer = await service.resolve('ws-x' as never, 'explorer')
     expect(explorer.definition.tools).toEqual(['Read', 'Glob', 'Grep'])
     expect(explorer.definition.disallowedTools).toContain('Bash')
+  })
+
+  it('bundled Worker exposes file edits and the complete shell lifecycle for a bounded task', async () => {
+    const service = new AgentDefinitionService(home)
     const worker = await service.resolve('ws-x' as never, 'worker')
-    expect(worker.definition.tools).not.toContain('Bash')
-    expect(worker.definition.disallowedTools).toContain('Bash')
+    expect(worker.definition.tools).toEqual(['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell'])
+    for (const tool of ['Bash', 'BashOutput', 'KillShell']) {
+      expect(worker.definition.disallowedTools).not.toContain(tool)
+    }
   })
 
   it('strict parsing rejects unknown keys and missing descriptions', async () => {
@@ -193,6 +199,7 @@ describe('bounded delegation', () => {
       parentSessionId: harness.rootSessionId as never,
       parentTurnId: 'turn-1',
       definition,
+      exposureCeiling: definition.tools,
       packet: { objective: 'inspect the repo', constraints: [], references: [], requiredResult: 'summary' },
       ...overrides,
     }
@@ -242,7 +249,7 @@ describe('bounded delegation', () => {
     void harness.kernel.stop()
   }, 20_000)
 
-  it('capacity: the seventh active child of one root reports capacity reached', async () => {
+  it('no per-root cap: more concurrent children than the old limit all stay active and cancel cleanly', async () => {
     const harness = await bootChildHarness([{ toolCalls: [{ name: 'Read', args: {} }] }])
     const { AgentDefinitionService } = await import('dnt-harness')
     const worker = (await new AgentDefinitionService(home).resolve(harness.workspaceId as never, 'worker')).definition
@@ -258,14 +265,15 @@ describe('bounded delegation', () => {
         return 'read'
       },
     })
-    // Spawn six children (the per-root active limit); the seventh is refused.
+    // Spawn past the old per-root active limit: every child is admitted.
     const handles = []
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 8; i++) {
       handles.push(await harness.executor.spawn(spawnRequest(harness, worker)))
     }
-    await expect(harness.executor.spawn(spawnRequest(harness, worker))).rejects.toMatchObject({ code: 'capacity' })
+    expect(handles).toHaveLength(8)
+    expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(8)
     // Cancel all: root Stop cleanup (awaited settlement confirmed).
-    expect(await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)).toBe(6)
+    expect(await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)).toBe(8)
     for (const handle of handles) {
       const settled = await waitOne(harness.executor, harness.workspaceId, handle.childSessionId, 3_000)
       expect(settled !== undefined && settled.status).toBe('cancelled')
@@ -273,7 +281,7 @@ describe('bounded delegation', () => {
     void harness.kernel.stop()
   }, 20_000)
 
-  it('simultaneous spawns reserve per-root capacity atomically: the seventh is refused', async () => {
+  it('simultaneous spawns all admit and per-root accounting stays exact', async () => {
     const harness = await bootChildHarness([{ toolCalls: [{ name: 'Read', args: {} }] }])
     const worker = (await new AgentDefinitionService(home).resolve(harness.workspaceId as never, 'worker')).definition
     // A gate tool that never finishes keeps every child active, so the
@@ -289,9 +297,10 @@ describe('bounded delegation', () => {
         return 'read'
       },
     })
-    const results = await Promise.allSettled(Array.from({ length: 7 }, () => harness.executor.spawn(spawnRequest(harness, worker))))
-    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(6)
-    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1)
+    const results = await Promise.allSettled(Array.from({ length: 8 }, () => harness.executor.spawn(spawnRequest(harness, worker))))
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(8)
+    expect(results.filter((result) => result.status === 'rejected')).toHaveLength(0)
+    expect(harness.executor.activeOfRoot(harness.rootSessionId as never)).toBe(8)
     await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)
     await harness.kernel.stop()
   }, 20_000)

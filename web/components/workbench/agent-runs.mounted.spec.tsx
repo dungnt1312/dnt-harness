@@ -37,7 +37,7 @@ describe('subagents panel', () => {
     const { host, unmount } = await mount(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" briefs={briefs} />)
 
     const running = section(host, 'Active subagents')
-    expect(running.textContent).toContain('Active · 1/6')
+    expect(running.textContent).toContain('Active · 1')
     expect(running.textContent).toContain('Explore delegation terminal')
     expect(running.textContent).toContain('reviewer · far:gpt-luna')
 

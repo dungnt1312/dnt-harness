@@ -77,6 +77,7 @@ function toolFor(harness: Harness) {
     childModelFor: () => undefined,
     providers: () => [],
     modelsOf: () => [],
+    admissionResolver: async ({ candidates }) => candidates,
   }
   return agentTool(deps)
 }
@@ -98,6 +99,7 @@ describe('Agent tool child ownership', () => {
         parentSessionId: harness.siblingRootId as never,
         parentTurnId: 'sibling-turn',
         definition: bundledDefinition('explorer'),
+        exposureCeiling: bundledDefinition('explorer').tools,
         packet: { prompt: 'Read the blocked file.', requiredResult: 'status' },
       })
 
@@ -128,6 +130,7 @@ describe('Agent tool child ownership', () => {
         parentSessionId: harness.callerRootId as never,
         parentTurnId: 'caller-turn',
         definition: bundledDefinition('explorer'),
+        exposureCeiling: bundledDefinition('explorer').tools,
         packet,
       })
       const siblingChild = await harness.executor.spawn({
@@ -135,6 +138,7 @@ describe('Agent tool child ownership', () => {
         parentSessionId: harness.siblingRootId as never,
         parentTurnId: 'sibling-turn',
         definition: bundledDefinition('explorer'),
+        exposureCeiling: bundledDefinition('explorer').tools,
         packet,
       })
 

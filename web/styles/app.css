@@ -135,6 +135,8 @@
 
 @layer base {
   html, body, #root { height: 100%; }
+  /* Mobile browsers inflate text in landscape otherwise; the app sets its own sizes. */
+  html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   body {
     margin: 0;
     background: var(--bg);
@@ -143,6 +145,10 @@
     font-size: 14px;
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
+    /* An app shell, not a document: no pull-to-refresh or rubber-band at the
+       page level (scrollable panes keep their own overscroll). */
+    overscroll-behavior-y: none;
+    -webkit-tap-highlight-color: transparent;
   }
   button, input, textarea, select { font: inherit; color: inherit; }
   button:not(:disabled), summary { cursor: pointer; }
@@ -150,9 +156,15 @@
   ::placeholder { color: var(--fg-faint); }
   code, pre, kbd { font-family: var(--font-mono); }
   /* Touch targets: at least 44px on coarse pointers. Important so compact
-     desktop utilities (min-h-9 rows, min-w-0 chips) never shrink them on touch. */
+     desktop utilities (min-h-9 rows, min-w-0 chips) never shrink them on touch.
+     A button may opt out with [data-compact-control] — the composer's control
+     row needs 36px chips so nine icon-only controls share one phone row. */
   @media (pointer: coarse) {
-    button, [role="button"], [role="tab"], [role="option"], [role="combobox"], summary { min-height: 44px !important; min-width: 44px !important; }
+    button:not([data-compact-control]), [role="button"], [role="tab"], [role="option"], [role="combobox"], summary { min-height: 44px !important; min-width: 44px !important; }
+    /* iOS Safari zooms the viewport on focusing any editable smaller than
+       16px, which reads as the page lurching. One rule here covers every
+       input, select and the composer's contenteditable at once. */
+    input, textarea, select, [contenteditable="true"] { font-size: 16px !important; }
   }
   .icon { display: inline-block; flex-shrink: 0; }
 }

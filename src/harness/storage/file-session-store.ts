@@ -54,7 +54,14 @@ export interface SessionStore {
   /** Eagerly create/validate the data root; hosts await it at startup. */
   init?(): Promise<void>
   /** Durable-append one stamped event; resolves after the record is synced. */
-  append(id: SessionId, event: SessionEvent): Promise<void>
+  append(id: SessionId, event: SessionEvent, options?: AppendOptions): Promise<void>
+  /**
+   * Sync every deferred record of this session. With only strict appends the
+   * session is already durable and this resolves immediately. Must exist
+   * whenever `append()` accepts a relaxed option — a caller deferring syncs
+   * has no other way to name the barrier.
+   */
+  checkpoint?(id: SessionId): Promise<void>
   /** Resolve once every queued append for the session is synced. */
   flush(id: SessionId): Promise<void>
   /** Load the full log (tail-repairing a torn final record). */
@@ -75,6 +82,17 @@ export interface SessionStore {
   close?(): Promise<void>
 }
 
+/** Append options: `relaxed` defers the fsync to the next `checkpoint()`. */
+export interface AppendOptions {
+  /**
+   * Write without syncing. High-frequency records (streaming chunks) batch
+   * their durability into the next `checkpoint()` instead of paying one fsync
+   * per line; the data is still written to the file in order. Omitted means
+   * the record syncs before `append()` resolves.
+   */
+  readonly relaxed?: boolean
+}
+
 /** Options for the file-backed store. */
 export interface FileSessionStoreOptions {
   /** The one writable data root this process owns. */
@@ -93,6 +111,8 @@ export class FileSessionStore implements SessionStore {
   private readonly workspaceId: WorkspaceId | undefined
   private readonly handles = new Map<SessionId, fs.FileHandle>()
   private readonly writers = new Map<SessionId, Promise<void>>()
+  /** Sessions whose relaxed appends are written but not yet synced. */
+  private readonly dirty = new Set<SessionId>()
   private closed = false
 
   constructor(options: FileSessionStoreOptions) {
@@ -107,20 +127,34 @@ export class FileSessionStore implements SessionStore {
     await fs.mkdir(this.sessionsDir, { recursive: true })
   }
 
-  async append(id: SessionId, event: SessionEvent): Promise<void> {
+  async append(id: SessionId, event: SessionEvent, options?: AppendOptions): Promise<void> {
     if (this.closed) throw new Error('session store is closed')
     const line = encodeEventLine(event)
     const previous = this.writers.get(id) ?? Promise.resolve()
     // The chain carries rejections: once a record fails, every later write
     // for this session fails with the first error (the writer is poisoned —
     // memory can no longer be claimed durable), and flush() surfaces it.
-    const next = previous.then(() => this.writeRecord(id, line))
+    // A relaxed append only writes; its sync joins the session's next
+    // checkpoint, where one fsync batches the whole written prefix.
+    const relaxed = options?.relaxed === true
+    if (relaxed) this.dirty.add(id)
+    const next = previous.then(() => this.writeRecord(id, line, relaxed))
     void next.catch(() => {})
     this.writers.set(id, next)
     // A settled, healthy chain carries nothing; drop it so the map does not
     // grow with every session written. A failed chain stays (poisoned).
     void next.then(() => { if (this.writers.get(id) === next) this.writers.delete(id) }, () => {})
     await next
+  }
+
+  /**
+   * Sync the session's written-but-unsynced prefix. Strict appends never
+   * leave the session dirty, so this is usually a no-op; after relaxed
+   * appends it is the one fsync that makes the whole prefix durable.
+   */
+  async checkpoint(id: SessionId): Promise<void> {
+    if (!this.dirty.has(id)) return
+    await this.flush(id)
   }
 
   /**
@@ -141,12 +175,24 @@ export class FileSessionStore implements SessionStore {
   }
 
   async flush(id: SessionId): Promise<void> {
+    // Draining the writer chain settles every queued append; the sync below
+    // then covers whatever the prefix carried — a relaxed batch, or nothing
+    // new when every record already synced itself.
     await this.writers.get(id)
+    if (this.dirty.has(id)) {
+      const handle = await this.openAppend(id)
+      try {
+        await handle.sync()
+        this.dirty.delete(id)
+      } catch (error) {
+        throw error
+      }
+    }
   }
 
-  private async writeRecord(id: SessionId, line: string): Promise<void> {
+  private async writeRecord(id: SessionId, line: string, relaxed: boolean): Promise<void> {
     const handle = await this.openAppend(id)
-    await appendEventLine(handle, line)
+    await appendEventLine(handle, line, relaxed ? { relaxed: true } : undefined)
   }
 
   async read(id: SessionId): Promise<{ events: SessionEvent[]; truncatedTail: boolean }> {
@@ -280,6 +326,8 @@ export class FileSessionStore implements SessionStore {
     this.assertSafeId(id)
     await this.exclusive(id, async () => {
       await this.closeHandle(id)
+      // The log is gone: a deferred sync must not recreate its directory.
+      this.dirty.delete(id)
       await fs.rm(this.sessionDir(id), { recursive: true, force: true })
     })
   }
@@ -289,6 +337,9 @@ export class FileSessionStore implements SessionStore {
     // Store callers normally drain at the service boundary; retain this guard
     // for direct store users so no pending append races handle closure.
     await Promise.allSettled([...this.writers.values()])
+    // A deferred batch syncs here — the shutdown checkpoint — so closing the
+    // store never discards written-but-unsynced records.
+    await Promise.allSettled([...this.dirty].map((id) => this.checkpoint(id)))
     await Promise.all([...this.handles.keys()].map((id) => this.closeHandle(id)))
   }
 

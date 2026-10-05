@@ -41,6 +41,7 @@ export class FakeScriptedLlm implements LlmProvider {
     const reply = typeof step === 'string' ? step : (step.content ?? '')
     if (!isToolStep(step)) {
       yield* words(reply)
+      yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       return
     }
     if (step.thinking !== undefined && step.thinking !== '') {
@@ -55,6 +56,7 @@ export class FakeScriptedLlm implements LlmProvider {
       }))
       yield { type: 'toolCalls', calls }
     }
+    yield { type: 'completion', finishReason: step.toolCalls !== undefined ? 'tool_calls' : 'stop', transport: 'done', policy: 'strict', transportSettled: true }
   }
 }
 
@@ -158,6 +160,9 @@ export class FakeOpenAiServer {
         this.frame(res, { choices: [{ delta: { content: word } }] })
       }
       if (!isToolStep(step)) {
+        // The adapter derives the completion from a frame carrying
+        // finish_reason; EOF alone is an incomplete stream now.
+        this.frame(res, { choices: [{ delta: {}, finish_reason: 'stop' }] })
         res.write('data: [DONE]\n\n')
         res.end()
         return
@@ -176,6 +181,7 @@ export class FakeOpenAiServer {
         this.frame(res, { choices: [{ delta: { tool_calls: [{ index: position, function: { arguments: argsJson.slice(0, half) } }] } }] })
         this.frame(res, { choices: [{ delta: { tool_calls: [{ index: position, function: { arguments: argsJson.slice(half) } }] } }] })
       })
+      this.frame(res, { choices: [{ delta: {}, finish_reason: 'tool_calls' }] })
       res.write('data: [DONE]\n\n')
       res.end()
       return

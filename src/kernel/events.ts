@@ -28,6 +28,17 @@ export interface EventOptions {
 }
 
 /**
+ * Per-listener checks for {@link EventBus.checkedWaterfall}. Each hook gets the
+ * argument list the listener received; returning `undefined` accepts.
+ */
+export interface WaterfallBoundary {
+  /** Called before `next(...proposed)` forwards replacement arguments; a non-undefined value is returned from `next` instead of delegating. */
+  forward?(current: readonly unknown[], proposed: readonly unknown[]): unknown
+  /** Called with a listener's settled result; a non-undefined value replaces it. */
+  result?(current: readonly unknown[], result: unknown): unknown
+}
+
+/**
  * Listener callback at the dispatch boundary: arguments are whatever the
  * producer dispatches, checked statically against `Events` at call sites.
  */
@@ -159,6 +170,52 @@ export class EventBus {
       const next = (...nextArgs: unknown[]): unknown =>
         invoke(index + 1, nextArgs.length > 0 ? nextArgs : args)
       return listener(...args, next)
+    }
+
+    return invoke(0, eventArgs)
+  }
+
+  /**
+   * {@link waterfall} with a checked boundary around EVERY listener. Before a
+   * listener's `next(...)` forwards replacement arguments downstream,
+   * `boundary.forward(current, proposed)` runs; a non-`undefined` return is
+   * handed back to the caller of `next` and nothing downstream sees the
+   * replacement. After a listener settles — the terminal default included —
+   * `boundary.result(current, result)` runs against the arguments that listener received; a non-`undefined`
+   * return replaces its result. Plain {@link waterfall} is unchanged.
+   */
+  checkedWaterfall<K extends string & keyof Events>(name: K, boundary: WaterfallBoundary, ...args: Parameters<Events[K]>): ReturnType<Events[K]>
+  checkedWaterfall(name: string, boundary: WaterfallBoundary, ...dispatchArgs: unknown[]): unknown
+  checkedWaterfall(name: string, boundary: WaterfallBoundary, ...dispatchArgs: unknown[]): unknown {
+    const listeners = this.snapshot(name)
+    const defaultNext = dispatchArgs[dispatchArgs.length - 1] as AnyListener
+    const eventArgs = dispatchArgs.slice(0, -1)
+
+    // `undefined` from the result boundary accepts the settled value; any
+    // other value — `null` included — replaces it.
+    const settleResult = async (result: unknown, received: readonly unknown[]): Promise<unknown> => {
+      const settled = await result
+      const checked = boundary.result?.(received, settled)
+      return checked === undefined ? settled : checked
+    }
+
+    const invoke = (index: number, args: unknown[]): unknown => {
+      const listener = listeners[index]
+      if (listener === undefined) {
+        // The terminal default settles like a listener: the result boundary
+        // still governs what the dispatcher ultimately receives.
+        return settleResult(defaultNext(...args), args)
+      }
+      const next = (...nextArgs: unknown[]): unknown => {
+        // A bare next() forwards the received arguments downstream and is
+        // checked like an explicit replacement: every hand-off crosses the
+        // boundary.
+        const proposed = nextArgs.length > 0 ? nextArgs : args
+        const rejected = boundary.forward?.(args, proposed)
+        if (rejected !== undefined) return rejected
+        return invoke(index + 1, proposed)
+      }
+      return Promise.resolve(listener(...args, next)).then((result) => settleResult(result, args))
     }
 
     return invoke(0, eventArgs)

@@ -29,6 +29,7 @@ function summarizingProvider(): { provider: LlmProvider; requests: ModelRequest[
       const text = isSummaryCall ? SUMMARY_TEXT : 'turn reply'
       return (async function* (): AsyncIterable<StreamEvent> {
         yield { type: 'delta', delta: text }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       })()
     },
   }
@@ -113,6 +114,12 @@ describe('web compaction', () => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ content: 'second message' }),
     })
+    // Wait for the follow-up turn to settle so its model request is in the
+    // provider log before the log is read (the POST alone only queues it).
+    await until(async () => {
+      const sessions = (await (await fetch(`${base}/api/workspaces/${wsId}/sessions`)).json()) as { id: string; status: string }[]
+      return sessions.find((session) => session.id === id)?.status === 'idle' ? true : undefined
+    })
     const manifest = await until<ManifestView>(async () => {
       const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/manifest`)
       if (response.status !== 200) return undefined
@@ -158,6 +165,12 @@ describe('web compaction', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ content: 'continue after compaction' }),
+    })
+    // Settle the follow-up turn first, so the summary request is guaranteed to
+    // be in the provider log when the counts below read it.
+    await until(async () => {
+      const sessions = (await (await fetch(`${base}/api/workspaces/${wsId}/sessions`)).json()) as { id: string; status: string }[]
+      return sessions.find((session) => session.id === id)?.status === 'idle' ? true : undefined
     })
     const manifest = await until<ManifestView>(async () => {
       const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/manifest`)

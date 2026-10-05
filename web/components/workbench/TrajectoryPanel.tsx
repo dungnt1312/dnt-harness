@@ -72,7 +72,7 @@ function Timeline({ slots, selected, onSelect }: {
   return (
     <div className="flex shrink-0 border-b border-line" role="group" aria-label="Conversation timeline">
       <div className="flex shrink-0 flex-col gap-1 pb-2 pl-4 pr-2 pt-6">
-        {LANES.map((lane) => <span key={lane.kind} className="h-3 text-right text-[11px] leading-3 text-fg-faint">{lane.name}</span>)}
+        {LANES.map((lane) => <span key={lane.kind} className="h-3 text-right text-[11px] leading-3 text-fg-faint [@media(pointer:coarse)]:h-4 [@media(pointer:coarse)]:leading-4">{lane.name}</span>)}
       </div>
       <div className="min-w-0 flex-1 overflow-x-auto pb-2">
         <div className="flex" style={{ width: slots.length * SLOT }}>
@@ -83,7 +83,7 @@ function Timeline({ slots, selected, onSelect }: {
               <div key={slot.key} className={cn('flex shrink-0 flex-col gap-1 pt-1', opensTurn && index > 0 && 'border-l border-line')} style={{ width: SLOT }}>
                 <span className="h-4 truncate px-1 font-mono text-[10px] leading-4 text-fg-faint">{opensTurn ? `Turn ${slot.turn.index}` : ''}</span>
                 {LANES.map((lane) => (
-                  <div key={lane.kind} className="h-3 px-0.5">
+                  <div key={lane.kind} className="h-3 px-0.5 [@media(pointer:coarse)]:h-4">
                     {lane.kind === slot.kind ? (
                       <button
                         type="button"

@@ -164,14 +164,15 @@ export function bundledDefinition(name: string): AgentDefinition {
   if (name === 'worker') {
     return {
       name: 'worker',
-      description: 'Makes one concrete, already-decided change to files. Use it when you know exactly what to edit and want it done without spending your own context on it.',
+      description: 'Implements one bounded, already-agreed task and runs relevant checks. Use it when the goal and constraints are decided and you want the implementation done without spending your own context on it.',
       instructions: [
-        'You make exactly the change the brief describes — nothing beyond it. Read the files before editing them and re-read what you wrote to check it.',
-        'If the brief is ambiguous or the change turns out to be wrong, stop and say so instead of improvising.',
-        'Your final message lists every file you changed as `path` — what changed, followed by anything you could not do and why.',
+        'You implement exactly the task the brief describes — nothing beyond it. Read the files before editing them, preserve unrelated changes, and re-read what you wrote to check it. Do not expand the scope or refactor unrelated code.',
+        'If the brief is ambiguous, a design decision is unresolved, or the change turns out to be wrong, stop and report what is blocked instead of improvising.',
+        'Use shell commands only to support the task: tests, typecheck, build, and inspecting diffs. Do not commit, push, run destructive commands, or change dependencies unless the brief explicitly requires it. Bash may return a running process ID after its foreground wait; watch the same execution with BashOutput (block:true for bounded waiting), never rerun it just because it is still running. Stop unneeded processes with KillShell.',
+        'Your final message lists every file you changed as `path` — what changed, then each check you ran with its command and outcome. Clearly identify checks not run, incomplete verification, and anything blocked or unfinished and why. Never claim a check passed without its completed result.',
       ].join(' '),
-      tools: ['Read', 'Glob', 'Grep', 'Write', 'Edit'],
-      disallowedTools: ['Bash'],
+      tools: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell'],
+      disallowedTools: [],
     }
   }
   if (name === 'reviewer') {
@@ -192,11 +193,11 @@ export function bundledDefinition(name: string): AgentDefinition {
       name: 'verifier',
       description: 'Runs a command and judges its outcome. Use it when you need tests, a typecheck, or a build run and want a verdict back instead of the raw output.',
       instructions: [
-        'You run the commands the brief names (tests, typecheck, build) and judge the outcome. You cannot edit files.',
-        'Run each command once; rerun only to confirm a flaky result. Read the code a failure points at when that explains it.',
-        'Your final message starts with PASS or FAIL, then one line per command: the command — its exit code — the failing cases, each with `path:line` and the assertion or error text.',
+        'You run the commands the brief names (tests, typecheck, build) and judge the outcome. Do not modify source or update snapshots; commands may create build artifacts or caches.',
+        'Run each command once; rerun only to confirm a flaky result. If Bash returns a running process ID, watch it with BashOutput (block:true for bounded waiting); use KillShell to stop unneeded commands. Read the code a failure points at when that explains it.',
+        'Your final message starts with PASS, FAIL, BLOCKED, or INCONCLUSIVE; never claim a still-running check passed, then one line per command: the command — its exit code — the failing cases, each with `path:line` and the assertion or error text.',
       ].join(' '),
-      tools: ['Read', 'Glob', 'Grep', 'Bash'],
+      tools: ['Read', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell'],
       disallowedTools: ['Write', 'Edit', 'Skill', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget'],
     }
   }

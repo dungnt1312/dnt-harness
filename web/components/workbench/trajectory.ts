@@ -174,6 +174,10 @@ export function projectTrajectory(events: readonly SseEvent[]): Trajectory {
 
   for (const event of events) {
     switch (event.type) {
+      case 'model/attempt':
+      case 'execution/uncertain':
+      case 'execution/reconciled':
+        break // Physical settlement does not close a logical turn.
       case 'turn/start': {
         if (turn !== null) settle(undefined, event.timestamp, turn.id)
         turn = {

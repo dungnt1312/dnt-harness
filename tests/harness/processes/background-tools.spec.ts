@@ -18,7 +18,7 @@ describe('BashOutput', () => {
   it('reads captured output and status while running, then the final exit', async () => {
     const registry = new ProcessRegistry({})
     const output = bashOutputTool({ processes: registry })
-    const id = await startBackground(registry, 'echo out-from-bg')
+    const id = await startBackground(registry, 'echo out-from-bg; sleep 1')
     await new Promise((resolve) => setTimeout(resolve, 300))
     const running = await output.execute({ processId: id }, exec('s1'))
     expect(running).toContain('[status: running]')

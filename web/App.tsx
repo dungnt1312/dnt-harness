@@ -1,5 +1,5 @@
 import { errorSummary, modeLabel } from './lib/copy.ts'
-import { Generation, composerKey, emptyComposer, acceptedDraft, requestIdFor, validConversationScope } from './lib/interaction.ts'
+import { Generation, composerKey, emptyComposer, acceptedDraft, freshRequestId, requestIdFor, validConversationScope } from './lib/interaction.ts'
 import { ComposerStore, useComposerSlice } from './lib/composer-store.ts'
 import { draftAttachments, draftIsEmpty, draftText, messageDraft, textDraft, type AttachmentRef, type RichDraft } from './lib/composer-draft.ts'
 import { parseRoute, routePath, sessionRoute, workspaceRoute, type AppRoute } from './lib/route.ts'
@@ -30,6 +30,8 @@ import {
   uploadAttachment,
   stopSessionIn,
   setMode,
+  getSessionMode,
+  setSessionMode,
   listModes,
   setSessionModel,
   setModelDefaults,
@@ -38,7 +40,7 @@ import {
 } from './lib/api.ts'
 import { PairingGate } from './components/auth/PairingGate.tsx'
 import { decodeModelChoice, activeModelValue, modelOptions } from './lib/providers.ts'
-import { isTurnRunning, type RetryTarget } from './lib/project.ts'
+import { isTurnRunning, type RetryTarget, type ViewItem } from './lib/project.ts'
 import { sameListing } from './lib/listing-equality.ts'
 import { manifestRefreshKey } from './lib/manifest-refresh.ts'
 import type { FileFocus } from './lib/tool-facts.ts'
@@ -48,6 +50,7 @@ import { useWorkbenchPreferences } from './hooks/useWorkbenchPreferences.ts'
 import { useWorkbenchTabs } from './hooks/useWorkbenchTabs.ts'
 import { useHotkeys } from './hooks/useHotkeys.ts'
 import { useMediaQuery } from './hooks/useMediaQuery.ts'
+import { useKeyboardInset } from './hooks/useKeyboardInset.ts'
 import { useTheme } from './hooks/useTheme.ts'
 import { useToast } from './components/common/Toast.tsx'
 import Icon from './components/common/Icon.tsx'
@@ -67,6 +70,7 @@ import { toProjectRelative } from './lib/project-paths.ts'
 import { PANEL_LIMITS, type WorkbenchViewName } from './lib/workbench-preferences.ts'
 import { LazySettings } from './components/settings/LazySettings.tsx'
 import { TaskStatus } from './components/chat/TaskStatus.tsx'
+import { QueuedBar } from './components/chat/QueuedBar.tsx'
 import { EnvironmentPanel } from './components/chat/EnvironmentPanel.tsx'
 import { Transcript } from './components/chat/Transcript.tsx'
 import { ApprovalBar } from './components/chat/ApprovalBar.tsx'
@@ -76,7 +80,7 @@ import { ContextMeter } from './components/composer/ContextMeter.tsx'
 import { SessionFoldersChip } from './components/composer/SessionFoldersChip.tsx'
 import { FolderPickerModal } from './components/composer/FolderPickerModal.tsx'
 import ConfirmDialog from './components/common/ConfirmDialog.tsx'
-import type { ContextManifestView } from './lib/api.ts'
+import type { ContextManifestView, SessionModeSelection } from './lib/api.ts'
 import { builtinCommandIn, draftIsOnlyCommand, type CompletionItem } from './lib/composer-completion.ts'
 import type { ModelDefaults, ProjectRow, SessionListing, SessionModel, SkillRow, WorkspaceMeta, WorkspaceRow } from './lib/types.ts'
 
@@ -117,6 +121,11 @@ export function subagentsRootSession(currentSession: { readonly id: string; read
 export type SessionModelLoadState =
   | { readonly status: 'loading' }
   | { readonly status: 'ready'; readonly model: SessionModel }
+  | { readonly status: 'error'; readonly error: string }
+
+export type SessionModeLoadState =
+  | { readonly status: 'loading' }
+  | { readonly status: 'ready'; readonly mode: SessionModeSelection }
   | { readonly status: 'error'; readonly error: string }
 
 /** Serializes partial writes for each conversation so the server observes their intended order. */
@@ -280,6 +289,9 @@ export function App() {
 function AppShell() {
   const toast = useToast()
   const theme = useTheme()
+  // Touch keyboards must not cover the composer (see the hook): the shell
+  // pads its bottom by `--kb-inset`, which this hook keeps current.
+  useKeyboardInset()
   const initialRoute = useRef<AppRoute | null>(parseRoute(window.location.pathname))
   const routeRef = useRef<AppRoute | null>(initialRoute.current)
   const [workspaces, setWorkspaces] = useState<readonly WorkspaceRow[]>([])
@@ -376,6 +388,9 @@ function AppShell() {
   /** Resolved session controls, loading, and failure are distinct so `null` remains meaningful. */
   const [sessionModelStates, setSessionModelStates] = useState<ReadonlyMap<string, SessionModelLoadState>>(() => new Map())
   const sessionModelRequests = useRef(new Map<string, number>())
+  const [sessionModeStates, setSessionModeStates] = useState<ReadonlyMap<string, SessionModeLoadState>>(() => new Map())
+  const sessionModeRequests = useRef(new Map<string, number>())
+  const sessionModeWrites = useRef(new Map<string, number>())
   const [pendingSessionModelMutations, setPendingSessionModelMutations] = useState<ReadonlyMap<string, number>>(() => new Map())
   const sessionModelQueue = useRef(new SessionModelMutationQueue((cacheKey, count) => {
     setPendingSessionModelMutations((pending) => {
@@ -474,11 +489,20 @@ function AppShell() {
   // workspace listing has confirmed membership. This prevents foreign or stale
   // deep links from ever opening an SSE connection.
   const validatedCurrent = listedWorkspace === activeWs && (sessions.some((session) => session.id === current) || (current !== null && createdHere.current.has(current))) ? current : null
-  const { events, items: projectedItems, approvals, stream, error: streamError, dismissApproval } = useSessionStream(activeWs, validatedCurrent)
+  const { events, items: projectedItems, approvals, stream, error: streamError, dismissApproval, settled } = useSessionStream(activeWs, validatedCurrent)
   const notify = useApprovalNotify(approvals, activeWorkspace?.name)
   const running = useMemo(() => isTurnRunning(events), [events])
-  const manifestKey = useMemo(() => manifestRefreshKey(events, compactNonce), [events, compactNonce])
   const currentSession = useMemo(() => sessions.find((session) => session.id === current) ?? null, [sessions, current])
+  // The stream's snapshot proves the turn state; until it lands, the listing's
+  // claim is the conservative answer. A running session never fetches a
+  // manifest, and "unknown" must not read as idle during that first moment.
+  const runningOrUnknown = running || (currentSession?.status === 'running' && !settled)
+  /** Queued input as a strip above the composer, in submission order. */
+  const queuedItems = useMemo(
+    () => projectedItems.filter((item): item is Extract<ViewItem, { kind: 'user' }> => item.kind === 'user' && item.queued === true),
+    [projectedItems],
+  )
+  const manifestKey = useMemo(() => manifestRefreshKey(events, compactNonce), [events, compactNonce])
   // A subagent conversation reads as parent → sub in the header trail.
   const currentParentSession = useMemo(
     () => (currentSession?.parentSessionId != null ? sessions.find((session) => session.id === currentSession.parentSessionId) ?? null : null),
@@ -575,9 +599,13 @@ function AppShell() {
     () => projects.find((project) => project.id === effectiveDraftProject)?.name,
     [projects, effectiveDraftProject],
   )
+  /** The open conversation's own mode once loaded; drafts follow the workspace selection. */
+  const currentSessionModeState = current !== null && activeWs !== null ? sessionModeStates.get(sessionModelKey(activeWs, current)) : undefined
+  const currentSessionMode = currentSessionModeState?.status === 'ready' ? currentSessionModeState.mode : undefined
+  const effectiveModeId = currentSessionMode?.modeId ?? modeSelection.selected
   const envModeLabel = useMemo(
-    () => modeSelection.modes.find((mode) => mode.value === modeSelection.selected)?.label ?? null,
-    [modeSelection],
+    () => modeSelection.modes.find((mode) => mode.value === effectiveModeId)?.label ?? null,
+    [modeSelection, effectiveModeId],
   )
   const sessionCounts = useMemo(() => {
     const counts: Record<string, number> = {}
@@ -853,6 +881,30 @@ function AppShell() {
     if (activeWs !== null && current !== null) loadSessionModel(activeWs, current)
   }, [activeWs, current, loadSessionModel])
 
+  /** The conversation's own mode, loaded like its model controls. A child
+   * follows its root's mode and has no picker, so it never loads one. */
+  const loadSessionMode = useCallback((workspaceId: string, sessionId: string, force = false): void => {
+    const cacheKey = sessionModelKey(workspaceId, sessionId)
+    const existing = sessionModeStates.get(cacheKey)
+    if (!force && (existing?.status === 'loading' || existing?.status === 'ready')) return
+    const request = (sessionModeRequests.current.get(cacheKey) ?? 0) + 1
+    sessionModeRequests.current.set(cacheKey, request)
+    setSessionModeStates((states) => new Map(states).set(cacheKey, { status: 'loading' }))
+    void getSessionMode(workspaceId, sessionId).then(
+      (mode) => {
+        if (sessionModeRequests.current.get(cacheKey) !== request) return
+        setSessionModeStates((states) => new Map(states).set(cacheKey, { status: 'ready', mode }))
+      },
+      (cause: unknown) => {
+        if (sessionModeRequests.current.get(cacheKey) !== request) return
+        setSessionModeStates((states) => new Map(states).set(cacheKey, { status: 'error', error: String(cause) }))
+      },
+    )
+  }, [sessionModeStates])
+  useEffect(() => {
+    if (activeWs !== null && current !== null && currentParentSession === null) loadSessionMode(activeWs, current)
+  }, [activeWs, current, currentParentSession, loadSessionMode])
+
   // Skill catalog for the composer's `/` menu, per workspace.
   useEffect(() => {
     setSkills([])
@@ -872,7 +924,7 @@ function AppShell() {
   // the selected conversation's manifest arrives, so the meter never flashes
   // empty. An in-flight turn keeps what it last showed.
   useEffect(() => {
-    if (activeWs === null || current === null || running) return
+    if (activeWs === null || current === null || runningOrUnknown) return
     const switched = manifestSession.current !== `${activeWs}:${current}`
     manifestSession.current = `${activeWs}:${current}`
     let cancelled = false
@@ -890,7 +942,7 @@ function AppShell() {
       cancelled = true
       clearTimeout(timer)
     }
-  }, [activeWs, current, running, manifestKey])
+  }, [activeWs, current, runningOrUnknown, manifestKey])
 
   useEffect(() => {
     if (streamError === null) return
@@ -967,7 +1019,7 @@ function AppShell() {
     const revision = composer.revision
     // Same unchanged draft after a failed submit → same id, so a request the
     // server accepted before its reply was lost dedups instead of re-running.
-    const requestId = requestIdFor(composer, () => globalThis.crypto.randomUUID())
+    const requestId = requestIdFor(composer, freshRequestId)
     updateComposer(sourceKey, (state) => ({ ...state, sending: true, error: null, pendingRequest: { id: requestId, revision } }))
     const nav = navigation.current.current()
     const content = draftText(draft)
@@ -1044,7 +1096,7 @@ function AppShell() {
     // One id set per failed turn, kept until it is accepted: clicking Retry
     // again after a lost reply dedups server-side instead of running twice.
     const retryKey = `${current}\u0000${target.key}`
-    const ids = retryIds.current.get(retryKey) ?? target.inputs.map(() => globalThis.crypto.randomUUID())
+    const ids = retryIds.current.get(retryKey) ?? target.inputs.map(() => freshRequestId())
     retryIds.current.set(retryKey, ids)
     try {
       // Sequential, so acceptance order is the original order: the first
@@ -1174,16 +1226,36 @@ function AppShell() {
 
   const selectMode = useCallback(async (modeId: string) => {
     if (activeWs === null) return
-    const nav = navigation.current.current()
-    const token = controls.current.next()
-    metadata.current.next()
+    if (current === null) {
+      // A draft edits the workspace default every new conversation snapshots.
+      const nav = navigation.current.current()
+      const token = controls.current.next()
+      metadata.current.next()
+      try {
+        await setMode(activeWs, modeId)
+        if (navigation.current.matches(nav) && controls.current.matches(token)) await refreshMeta()
+      } catch (cause) {
+        toast.notify(String(cause))
+      }
+      return
+    }
+    // An open conversation edits its own live snapshot: the server re-evaluates
+    // pending approvals, and the next tool gate and request read the new mode.
+    const workspaceId = activeWs
+    const sessionId = current
+    const cacheKey = sessionModelKey(workspaceId, sessionId)
+    const write = (sessionModeWrites.current.get(cacheKey) ?? 0) + 1
+    sessionModeWrites.current.set(cacheKey, write)
     try {
-      await setMode(activeWs, modeId)
-      if (navigation.current.matches(nav) && controls.current.matches(token)) await refreshMeta()
+      const saved = await setSessionMode(workspaceId, sessionId, modeId)
+      if (sessionModeWrites.current.get(cacheKey) !== write) return
+      setSessionModeStates((states) => new Map(states).set(cacheKey, { status: 'ready', mode: saved }))
     } catch (cause) {
+      // Do not restore a historical snapshot: reload the server's authoritative state.
+      loadSessionMode(workspaceId, sessionId, true)
       toast.notify(String(cause))
     }
-  }, [activeWs, refreshMeta, toast])
+  }, [activeWs, current, loadSessionMode, refreshMeta, toast])
 
   /** Draft thinking changes global defaults; conversations edit their snapshot. */
   const selectThinking = useCallback(async (level: string | null) => {
@@ -1332,7 +1404,7 @@ function AppShell() {
       onManage={() => openSettings()}
     />
   ) : meta !== null ? (
-    <button type="button" onClick={() => openSettings()} className={composerChipClass}>
+    <button type="button" data-compact-control onClick={() => openSettings()} className={composerChipClass}>
       <span className="truncate">{modelLabel ?? 'Configure a model'}</span>
       <Icon name="chevron" size={13} />
     </button>
@@ -1420,7 +1492,8 @@ function AppShell() {
       {...(activeModelSettings !== undefined ? { modelSettings: activeModelSettings } : {})}
       onThinking={(level) => void selectThinking(level)}
       modes={modeSelection.modes}
-      modeValue={modeSelection.selected}
+      modeValue={effectiveModeId}
+      modeMenuLabel={current === null ? 'Workspace mode (default for new conversations)' : currentSessionMode?.source === 'session' ? 'Conversation mode (next tool gate and request)' : 'Conversation mode (follows the workspace default)'}
       onMode={(value) => void selectMode(value)}
       {...(workbenchProject !== null ? { onSearchFiles: searchFiles } : {})}
       {...(activeWs !== null ? { onUploadFiles: uploadFiles } : {})}
@@ -1463,6 +1536,7 @@ function AppShell() {
       processFocus={processFocus}
       terminalShell={preferences.terminalShell}
       onTerminalShell={(shellId) => patchPreferences({ terminalShell: shellId })}
+      bindingReady={listedWorkspace === activeWs}
       gitPathFilter={gitPathFilter}
       onClearGitFilter={clearGitPathFilter}
       context={{ meta, ...(modelDefaults !== null ? { globalDefaults: modelDefaults } : {}), ...(currentSessionModel !== undefined ? { sessionModel: currentSessionModel } : {}), ...(current !== null && currentSessionModelState?.status === 'loading' ? { sessionControlsStatus: 'loading' as const } : {}), ...(current !== null && currentSessionModelState?.status === 'error' ? { sessionControlsStatus: 'unavailable' as const } : {}), stream, sessionId: current, sessionFolder: currentProject?.path ?? null, eventCount: events.length, manifest, workspaceId: activeWs, running, modeLabel: envModeLabel, onCompacted: () => setCompactNonce((nonce) => nonce + 1), onOpenSettingsTab: (tab) => openSettings(tab) }}
@@ -1479,6 +1553,7 @@ function AppShell() {
       onOpenChange={(terminalOpen) => patchPreferences({ terminalOpen })}
       defaultShell={preferences.terminalShell}
       onDefaultShell={(shellId) => patchPreferences({ terminalShell: shellId })}
+      bindingReady={listedWorkspace === activeWs}
     />
   )
 
@@ -1489,7 +1564,19 @@ function AppShell() {
   return (
     <>
       {documentTitle}
-      <div className="flex h-dvh overflow-hidden bg-bg text-fg">
+      {/* Padded, not margined, so the docked panes' h-full tracks the visible
+          box: safe-area insets keep chrome off the notch/home indicator in the
+          standalone PWA, and `--kb-inset` (useKeyboardInset) lifts the
+          composer above a touch keyboard the viewport never reports. */}
+      <div
+        className="flex h-dvh overflow-hidden bg-bg text-fg"
+        style={{
+          paddingTop: 'env(safe-area-inset-top)',
+          paddingRight: 'env(safe-area-inset-right)',
+          paddingBottom: 'calc(env(safe-area-inset-bottom) + var(--kb-inset, 0px))',
+          paddingLeft: 'env(safe-area-inset-left)',
+        }}
+      >
         {sidebarDocked && sidebarOpen ? (
           <>
             <aside className="h-full min-w-0 shrink-0" style={{ width: preferences.leftWidth }}>{sidebar}</aside>
@@ -1584,13 +1671,12 @@ function AppShell() {
                   onReuse={reuseInDraft}
                   onOpenChild={openSession}
                   onRetry={retryFailedTurn}
-                  onSendNow={sendQueuedNow}
-                  running={running}
                   openPath={openRecordedPath}
                 />
               )}
               <section aria-label="Conversation composer" className="shrink-0 px-3 pb-3 sm:px-6 sm:pb-4">
                 <div className="mx-auto flex w-full max-w-3xl flex-col gap-2">
+                  <QueuedBar items={queuedItems} running={running} onSendNow={sendQueuedNow} />
                   <TaskStatus events={events} pending={approvals.length} sending={sending} connected={stream !== 'reconnecting'} />
                   <ApprovalBar key={key} approvals={approvals} scope={currentProject?.path ?? 'No project attached'} onAnswer={answer} />
                   {sendErrorNotice}

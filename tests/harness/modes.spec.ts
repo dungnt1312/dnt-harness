@@ -70,6 +70,13 @@ describe('bundled modes', () => {
     const full = await modes.resolve(WS, 'full-access')
     expect(full.definition.permissionDefaults.Bash).toBe('allow')
     expect(full.definition.instructions).toMatch(/no OS sandbox/i)
+    // The catch-all is what lets dynamic mcp__* tools run without asking;
+    // without it every MCP name falls to the defaultMode fallback and asks.
+    expect(full.definition.permissionDefaults['*']).toBe('allow')
+    // The bundled form round-trips through canonical serialization with '*'.
+    const loadedFull = await modes.load(WS, 'full-access')
+    expect(parseModeFile('full-access', loadedFull.raw).permissionDefaults)
+      .toEqual(full.definition.permissionDefaults)
   })
 })
 

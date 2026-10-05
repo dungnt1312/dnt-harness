@@ -63,7 +63,7 @@ function SessionRow({ session, active, liveRunning, onSelect, onRename, onDelete
         type="button"
         onClick={onSelect}
         aria-current={active ? 'page' : undefined}
-        className="flex min-h-9 min-w-0 flex-1 items-center gap-2 py-1.5 pl-2.5 pr-2 text-left text-sm"
+        className="flex min-h-9 min-w-0 flex-1 items-center gap-2 py-1.5 pl-2.5 pr-2 text-left text-sm [@media(pointer:coarse)]:pr-12"
       >
         {isRunning ? (
           <span className="flex shrink-0 items-center" title={`Working with ${session.activity === 'tool' ? 'tool' : 'model'}`}>
@@ -110,6 +110,35 @@ function SessionRow({ session, active, liveRunning, onSelect, onRename, onDelete
         </Menu>
       </span>
     </div>
+  )
+}
+
+/** One nested subagent row: branch icon + title, opening the child conversation. */
+function ChildRow({ child, active, onSelect }: {
+  readonly child: SessionListing
+  readonly active: boolean
+  readonly onSelect: () => void
+}) {
+  const running = (child.status ?? 'idle') === 'running'
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={onSelect}
+        aria-current={active ? 'page' : undefined}
+        title={child.title || 'Subagent conversation'}
+        className="flex min-h-7 w-full min-w-0 items-center gap-1.5 rounded-md py-1 pl-2 pr-2 text-left text-[13px] text-fg-muted hover:bg-hover hover:text-fg"
+      >
+        <Icon name="gitBranch" size={12} className="shrink-0 text-fg-faint" aria-hidden />
+        <span className="min-w-0 flex-1 truncate">{child.title || 'Subagent conversation'}</span>
+        {running ? (
+          <span className="flex shrink-0 items-center" title="Working">
+            <Spinner size={10} />
+            <span className="sr-only">working</span>
+          </span>
+        ) : null}
+      </button>
+    </li>
   )
 }
 
@@ -197,27 +226,47 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
   const matches = (session: SessionListing): boolean => query === ''
     || session.title.toLowerCase().includes(query)
     || (session.projectId != null && (projectNames.get(session.projectId) ?? '').includes(query))
-  // Subagent conversations never appear here — nearly every session spawns
-  // some, and a toggle row each turned the sidebar into noise. They stay
-  // reachable from their parent's own view (trajectory, delegation cards);
-  // the listing still carries them for the header breadcrumb and send gate.
-  const shown = sessions.filter((session) => session.parentSessionId == null).filter(matches)
+  // Subagent rows nest under their parent while they are live: a running
+  // child, or the child being viewed. Ended children stay in the parent's
+  // Subagents workbench view; search reveals them all so old work is reached.
+  const childrenOf = new Map<string, SessionListing[]>()
+  for (const session of sessions) {
+    const parent = session.parentSessionId
+    if (parent == null) continue
+    const live = (session.status ?? 'idle') === 'running' || session.id === current
+    if ((live || query !== '') && matches(session)) {
+      const siblings = childrenOf.get(parent)
+      if (siblings !== undefined) siblings.push(session)
+      else childrenOf.set(parent, [session])
+    }
+  }
+  const shown = sessions.filter((session) => session.parentSessionId == null && (matches(session) || childrenOf.has(session.id)))
 
   const rows = (list: readonly SessionListing[]): ReactNode => (
     <ul className="m-0 flex list-none flex-col gap-px p-0">
-      {list.map((session) => (
-        <li key={session.id}>
-          <SessionRow
-            session={session}
-            active={session.id === current}
-            liveRunning={liveRunning}
-            onSelect={() => onSelect(session.id)}
-            onRename={onRename}
-            onDeleteRequest={onDeleteRequest}
-            {...(onTogglePinned !== undefined ? { onTogglePinned } : {})}
-          />
-        </li>
-      ))}
+      {list.map((session) => {
+        const children = childrenOf.get(session.id)
+        return (
+          <li key={session.id}>
+            <SessionRow
+              session={session}
+              active={session.id === current}
+              liveRunning={liveRunning}
+              onSelect={() => onSelect(session.id)}
+              onRename={onRename}
+              onDeleteRequest={onDeleteRequest}
+              {...(onTogglePinned !== undefined ? { onTogglePinned } : {})}
+            />
+            {children !== undefined ? (
+              <ul aria-label={`Subagents of ${session.title || 'conversation'}`} className="ml-6 m-0 flex list-none flex-col gap-px p-0 pb-1">
+                {children.map((child) => (
+                  <ChildRow key={child.id} child={child} active={child.id === current} onSelect={() => onSelect(child.id)} />
+                ))}
+              </ul>
+            ) : null}
+          </li>
+        )
+      })}
     </ul>
   )
   const timeline = (list: readonly SessionListing[]): ReactNode => sort === 'recent' ? bucketed(list).map(([bucket, group]) => (
@@ -297,11 +346,14 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
         // than force the folder open, so an explicit "Show more" stays sticky.
         const expanded = expandedState[project.id] === true || query !== ''
         const cut = expanded ? projectSessions.length : FOLDER_PREVIEW_COUNT
-        const currentAt = projectSessions.findIndex((session) => session.id === current)
-        // Grafting appends rather than swaps so nothing already on screen
-        // vanishes when the open conversation sits past the cut.
-        const visible = currentAt >= cut
-          ? [...projectSessions.slice(0, cut), projectSessions[currentAt]!]
+        // Only a top-level row can sit past the cut: the open conversation
+        // when it is one, or the parent of the open subagent. Grafting appends
+        // rather than swaps so nothing already on screen vanishes, and a
+        // grafted open child brings its parent or the nest would lose its root.
+        const rootId = sessions.find((session) => session.id === current)?.parentSessionId ?? current
+        const rootAt = rootId !== undefined && rootId !== null ? projectSessions.findIndex((session) => session.id === rootId) : -1
+        const visible = rootAt >= cut
+          ? [...projectSessions.slice(0, cut), projectSessions[rootAt]!]
           : projectSessions.slice(0, cut)
         const showToggle = projectSessions.length > FOLDER_PREVIEW_COUNT && query === ''
         return (

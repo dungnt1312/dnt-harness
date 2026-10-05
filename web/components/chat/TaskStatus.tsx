@@ -33,7 +33,7 @@ export function TaskStatus({ events, pending, sending, connected }: { readonly e
         <div className="flex flex-wrap items-center gap-2">
           {busy ? <Spinner size={12} /> : <Icon name={phase === 'waiting' ? 'shield' : 'info'} size={14} className={phase === 'waiting' ? 'text-warn' : undefined} />}
           <strong className={busy ? 'font-medium text-shimmer' : 'font-medium text-fg'}>{phaseLabel}</strong>
-          {phase === 'held' ? <span>They do not run on their own after a stop or restart — use Send now on a queued message.</span> : null}
+          {phase === 'held' ? <span>They do not run on their own after a stop or restart — use Send now on the queue above.</span> : null}
         </div>
       ) : null}
       {!connected ? (

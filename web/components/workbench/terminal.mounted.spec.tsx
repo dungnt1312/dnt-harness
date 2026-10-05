@@ -136,6 +136,7 @@ async function mount(props: {
   projectId?: string | null
   defaultShell?: string | null
   onDefaultShell?: (shellId: string | null) => void
+  bindingReady?: boolean
 } = {}): Promise<void> {
   await act(async () => {
     root.render(
@@ -144,6 +145,7 @@ async function mount(props: {
         projectId={props.projectId ?? null}
         defaultShell={props.defaultShell ?? null}
         {...(props.onDefaultShell !== undefined ? { onDefaultShell: props.onDefaultShell } : {})}
+        bindingReady={props.bindingReady ?? true}
       />,
     )
   })
@@ -228,6 +230,34 @@ describe('terminal panel', () => {
     await mount()
     await act(async () => push({ kind: 'snapshot', terminals: [] }))
 
+    expect(api.createTerminal).not.toHaveBeenCalled()
+  })
+
+  it('holds the auto-open while the project binding is still loading, then opens for the project', async () => {
+    await act(async () => {
+      root.render(<TerminalPanel workspaceId="ws" projectId={null} defaultShell={null} bindingReady={false} />)
+    })
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+    // The session list has not landed yet: opening now would create the shell
+    // in the host's default folder instead of the conversation's project.
+    expect(api.createTerminal).not.toHaveBeenCalled()
+
+    // The binding resolves (project known); the held auto-open may fire.
+    await act(async () => {
+      root.render(<TerminalPanel workspaceId="ws" projectId="project-1" defaultShell={null} bindingReady />)
+    })
+    expect(api.createTerminal).toHaveBeenCalledTimes(1)
+    expect(api.createTerminal).toHaveBeenCalledWith('ws', expect.objectContaining({ projectId: 'project-1' }))
+  })
+
+  it('disables manual opens while the project binding is still loading', async () => {
+    await mount({ bindingReady: false })
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+
+    const plus = host.querySelector<HTMLButtonElement>('button[aria-label="New terminal"]')
+    expect(plus).not.toBeNull()
+    expect(plus!.disabled).toBe(true)
+    await act(async () => plus!.click())
     expect(api.createTerminal).not.toHaveBeenCalled()
   })
 

@@ -79,6 +79,11 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
       Skill: 'allow', Agent: 'allow',
       MemorySearch: 'allow', MemoryRead: 'allow', MemoryCreate: 'allow', MemoryUpdate: 'allow', MemoryForget: 'allow',
       TodoWrite: 'allow',
+      // Full access means the workspace's MCP tools too: without a catch-all,
+      // every mcp__* name falls to the defaultMode fallback and asks forever.
+      // Host blockedTools, interactive annotations, and explicit denies still
+      // win over this.
+      '*': 'allow',
     },
     // Paths outside the granted folders run without an extra approval here;
     // unsafe paths are still refused by the host.

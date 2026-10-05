@@ -5,6 +5,7 @@ import '@xterm/xterm/css/xterm.css'
 import Icon from '../common/Icon.tsx'
 import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import { cn } from '../../lib/cn.ts'
+import { ansiToHtml } from '../../lib/ansi.ts'
 import {
   createTerminal,
   fromBase64,
@@ -63,7 +64,7 @@ interface Attached {
  * disposing one would throw away scrollback and cursor state that the server
  * has no obligation to resend.
  */
-export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultShell, onHide }: {
+export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultShell, onHide, bindingReady = true }: {
   readonly workspaceId: string | null
   readonly projectId: string | null
   /** Preferred shell id; `null` defers to the host's own order. */
@@ -74,6 +75,14 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
    * the workbench tab does not, because closing that tab is the tab's own X.
    */
   readonly onHide?: () => void
+  /**
+   * Whether the caller's project binding is final. While the conversation's
+   * session list is still loading the project is unknown (null), and an
+   * auto-open in that window creates a shell in the host's default folder
+   * instead of the session's project; false holds the auto-open until the
+   * binding resolves. Manual opens are never held.
+   */
+  readonly bindingReady?: boolean
 }) {
   const [rows, setRows] = useState<readonly TerminalRow[]>([])
   // The view shows one project's shells. A terminal with no project only
@@ -277,12 +286,14 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
 
   // Opening the Terminal view should land in a usable shell, not in a picker:
   // once per mount, an empty workspace gets one terminal on the preferred
-  // shell. Closing the last one is a decision, so it is never undone here.
+  // shell. Closing the last one is a decision, so it is never undone here. A
+  // caller whose project binding is still loading holds the open — firing in
+  // that window would create the shell in the wrong folder.
   useEffect(() => {
-    if (!ready || autoOpened.current || unavailable !== null || visibleRows.length > 0) return
+    if (!ready || !bindingReady || autoOpened.current || unavailable !== null || visibleRows.length > 0) return
     autoOpened.current = true
     void open(preferredShell)
-  }, [ready, unavailable, visibleRows.length, preferredShell, open])
+  }, [ready, bindingReady, unavailable, visibleRows.length, preferredShell, open])
 
   // Only the selected terminal is visible, and it refits whenever it becomes
   // so: xterm cannot measure a hidden element, so fitting on mount alone
@@ -348,10 +359,13 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
 
   // The cap is the workspace's, so shells open in other projects count.
   const atCap = rows.length >= max
+  // Until the caller's project binding is final, a new shell would open in the
+  // host's default folder instead of the conversation's project.
+  const openBlocked = !bindingReady
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex h-9 shrink-0 items-center gap-0.5 border-b border-line px-1.5" role="toolbar" aria-label="Terminals">
+      <div className="flex h-9 shrink-0 items-center gap-0.5 overflow-x-auto border-b border-line px-1.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" role="toolbar" aria-label="Terminals">
         {visibleRows.map((row) => (
           <span
             key={row.id}
@@ -382,8 +396,8 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
         <button
           type="button"
           aria-label="New terminal"
-          title={atCap ? `At most ${max} terminals per workspace` : 'New terminal'}
-          disabled={atCap}
+          title={atCap ? `At most ${max} terminals per workspace` : openBlocked ? 'Loading conversation…' : 'New terminal'}
+          disabled={atCap || openBlocked}
           onClick={() => void open(preferredShell)}
           className={NEW_TERMINAL_CLASS}
         >

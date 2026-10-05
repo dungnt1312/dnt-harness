@@ -20,7 +20,9 @@ declare module 'dnt-harness' {
   }
 }
 
-/** Construction options for a `Session`. */
+/**
+ * Construction options for a `Session`.
+ */
 export interface SessionOptions {
   readonly id?: SessionId
   /** Durable store; omitted keeps the log memory-only (unit tests). */
@@ -29,6 +31,15 @@ export interface SessionOptions {
   readonly now?: () => number
   /** Called after an append prefix has crossed the durability barrier. */
   readonly onDurable?: (lastSeq: number) => void
+  /**
+   * High-frequency records (`assistant/chunk`) append without a per-record
+   * fsync; the next `durable()` barrier syncs the whole batch in one call.
+   * A crash may lose the unsynced tail of an in-flight answer — a fact the
+   * restart-recovery contract already treats as unknown — while every
+   * barriered record (inputs, tool calls, assembled messages) keeps its
+   * strict per-record sync. Off by default.
+   */
+  readonly relaxedStreamingAppends?: boolean
 }
 
 /**
@@ -40,7 +51,9 @@ export interface SessionOptions {
  * Appending stamps and stores the event synchronously and hands the record
  * to the store's single writer. Durability is a separate, explicit barrier:
  * {@link Session.durable} resolves only once every record appended so far
- * has been written **and** fsynced. Callers acknowledge durable input, start
+ * has been written **and** fsynced — one batched sync per barrier when the
+ * session was built with `relaxedStreamingAppends`, per-record otherwise.
+ * Callers acknowledge durable input, start
  * recorded side effects, or report terminal state only after it resolves.
  * A failed write poisons the session: later appends throw, because memory
  * can no longer be claimed to match the disk.
@@ -53,6 +66,8 @@ export class Session {
   private poisonedError: unknown
   private disposed = false
   private closed = false
+  private readonly relaxedStreamingAppends: boolean
+  get closing(): boolean { return this.closed || this.disposed }
   private lazyId: SessionId | undefined
 
   constructor(
@@ -60,6 +75,7 @@ export class Session {
     private readonly options: SessionOptions = {},
   ) {
     this.durableListener = options.onDurable
+    this.relaxedStreamingAppends = options.relaxedStreamingAppends ?? false
   }
 
   private get store(): SessionStore | undefined {
@@ -108,7 +124,8 @@ export class Session {
       // Queue the canonical append before notifying observers. A synchronous
       // observer must never prevent a durable fact from entering this chain.
       // Captured durable() barriers retain their exact append prefix.
-      const write = this.writeTail.then(() => this.store?.append(this.id, stamped))
+      const relaxed = this.relaxedStreamingAppends && stamped.type === 'assistant/chunk'
+      const write = this.writeTail.then(() => this.store?.append(this.id, stamped, relaxed ? { relaxed: true } : undefined))
       void write.catch(() => {})
       this.writeTail = write
     }
@@ -133,6 +150,9 @@ export class Session {
     const lastSeq = this.log.length
     try {
       await captured
+      // Relaxed appends sync here: one fsync batches the whole captured
+      // prefix. Strict-only sessions have nothing deferred and this is a no-op.
+      await this.store?.checkpoint?.(this.id)
       await this.store?.flush(this.id)
       this.durableListener?.(lastSeq)
     } catch (error) {
@@ -217,6 +237,7 @@ export class Session {
       ...(this.options.store !== undefined ? { store: this.options.store } : {}),
       ...(this.options.now !== undefined ? { now: this.options.now } : {}),
       ...(this.durableListener !== undefined ? { onDurable: this.durableListener } : {}),
+      ...(this.relaxedStreamingAppends ? { relaxedStreamingAppends: true } : {}),
     })
     const limit = boundarySeq ?? this.log[this.log.length - 1]?.seq ?? 0
     for (const event of this.log) {

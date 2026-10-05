@@ -14,6 +14,7 @@ import {
 } from '../../lib/api.ts'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
 import { DiffLines, LineCount, diffRowsFromUnified } from '../common/DiffLines.tsx'
+import { MediaPreview } from '../common/MediaPreview.tsx'
 import { cn } from '../../lib/cn.ts'
 import type { WorkbenchProject } from './Workbench.tsx'
 
@@ -213,7 +214,8 @@ function DiffView({ workspaceId, projectId, path }: {
     )
   }
   if (diff === null) return <div className="flex items-center gap-2 py-1.5 pl-7 text-xs text-fg-muted" role="status"><Spinner size={12} />Loading diff…</div>
-  if (diff.binary) return <p className="m-0 py-1.5 pl-7 pr-2 text-xs text-fg-muted">Binary file — diff not shown.</p>
+  // A binary the browser can render shows the media itself; the rest say so.
+  if (diff.binary) return <div className="py-1 pl-5 pr-2"><MediaPreview workspaceId={workspaceId} projectId={projectId} path={path} /></div>
   if (diff.lines.length === 0) return <p className="m-0 py-1.5 pl-7 pr-2 text-xs text-fg-muted">No textual diff.</p>
   // The file header rows repeat the name the change row already shows and the
   // hunk header is noise; row numbers are read from the hunk instead.

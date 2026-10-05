@@ -11,9 +11,36 @@
  * generic internal failure — or worse, a silently completed empty turn.
  */
 export class ProviderError extends Error {
-  constructor(message: string) {
+  /**
+   * True only when the failure left no model output behind and asking again is
+   * safe and plausible (a stream that closed empty). Anything else — an HTTP
+   * error the adapter already retried, a rejected request, a failure after
+   * output started — stays false and fails the turn at once.
+   */
+  readonly retryable: boolean
+  get transient(): boolean { return this.retryable }
+  /**
+   * True when the provider rejected the request because it does not fit the
+   * model's context window. Asking again with a smaller request is the cure,
+   * so the loop re-assembles under a tighter budget instead of failing.
+   */
+  get contextExceeded(): boolean { return this.reason === 'context_exceeded' }
+
+  readonly reason: ProviderErrorReason
+  readonly phase: ProviderErrorPhase
+  /** False fences retries when physical transport cleanup could not be confirmed. */
+  transportSettled = true
+  readonly retryAfterMs: number | undefined
+  readonly status: number | undefined
+
+  constructor(message: string, options?: { readonly retryAfterMs?: number; readonly status?: number; readonly transient?: boolean; readonly contextExceeded?: boolean; readonly reason?: ProviderErrorReason; readonly phase?: ProviderErrorPhase }) {
     super(message)
     this.name = 'ProviderError'
+    this.retryAfterMs = typeof options?.retryAfterMs === 'number' && Number.isFinite(options.retryAfterMs) && options.retryAfterMs >= 0 ? Math.min(30_000, Math.ceil(options.retryAfterMs)) : undefined
+    this.status = Number.isSafeInteger(options?.status) && options!.status! >= 100 && options!.status! <= 599 ? options?.status : undefined
+    this.reason = options?.reason ?? (options?.contextExceeded ? 'context_exceeded' : 'unknown')
+    this.phase = options?.phase ?? 'stream'
+    this.retryable = options?.transient === true
   }
 }
 
@@ -79,6 +106,8 @@ export interface ToolSchema {
 
 /** One model request, projected from the session log by `deriveMessages()`. */
 export interface ModelRequest {
+  /** Host-only assembly scope; hooks must check after awaits before side effects. Never serialized. */
+  readonly assemblySignal?: AbortSignal
   /** Provider-specific model name; providers apply their own default. */
   readonly model?: string
   readonly messages: readonly ModelMessage[]
@@ -98,11 +127,32 @@ export interface ModelRequest {
    * directly onto the wire.
    */
   readonly thinkingLevel?: string
+  /**
+   * Host-only assembly hint, never serialized: how many times this request was
+   * already rejected as too large. The context builder shrinks its budget by
+   * level (see `squeezeBudget`) so a retry actually sends less.
+   */
+  readonly squeeze?: number
+}
+
+export type ModelFinishReason = 'stop' | 'tool_calls' | 'length' | 'content_filter' | 'error' | 'unknown'
+export type CompletionPolicy = 'strict' | 'finish-eof' | 'legacy-iterable'
+export type ProviderErrorReason = 'cancelled' | 'connect' | 'read' | 'reset' | 'first_progress_timeout' | 'idle_timeout' | 'total_timeout' | 'rate_limit' | 'server_error' | 'auth_configuration' | 'quota' | 'context_exceeded' | 'malformed_protocol' | 'invalid_tool_input' | 'incomplete_completion' | 'output_limit' | 'length' | 'content_filter' | 'unknown'
+export type ProviderErrorPhase = 'connect' | 'headers' | 'stream' | 'completion' | 'cleanup'
+export interface ModelCompletion {
+  readonly type: 'completion'
+  readonly finishReason: ModelFinishReason
+  readonly transport: 'done' | 'eof' | 'legacy'
+  readonly policy: CompletionPolicy
+  readonly transportSettled: boolean
 }
 
 /** What a provider yields while streaming one completion. */
 export type StreamEvent =
+  | ModelCompletion
   | { readonly type: 'delta'; readonly delta: string; readonly thinking?: true }
+  // Model progress only: no partial arguments, execution or transcript entry.
+  | { readonly type: 'toolCallProgress' }
   | { readonly type: 'toolCalls'; readonly calls: readonly ToolCall[] }
   | { readonly type: 'usage'; readonly usage: TokenUsage }
 
@@ -130,6 +180,13 @@ export interface LlmProvider {
 
 /** Per-request stream options. */
 export interface StreamOptions {
+  readonly attribution?: import('./request-lifecycle.ts').AttemptAttribution
+  /** Mandatory canonical sink, distinct from contained optional telemetry. */
+  readonly recordAttempt?: (fact: import('./request-lifecycle.ts').AttemptFact) => Promise<void>
   /** Fires when the owning turn stops or its provider stream becomes inactive. */
   readonly signal?: AbortSignal
+  /** Present under harness ownership: built-in adapters perform exactly one physical attempt. */
+  readonly requestOwner?: import('./request-lifecycle.ts').LogicalRequest
+  /** Adapter calls only after verified local transport settlement, including late cleanup. */
+  readonly onTransportSettled?: () => void
 }

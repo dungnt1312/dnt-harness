@@ -43,6 +43,7 @@ function provider(name: string, models: readonly string[], seen: { model?: strin
         ...(request.thinkingLevel !== undefined ? { thinkingLevel: request.thinkingLevel } : {}),
       })
       yield { type: 'delta', delta: 'ok' }
+      yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
     },
   }
 }
@@ -124,8 +125,10 @@ describe('workspace session model controls', () => {
     const spawned = await post(base, `/api/workspaces/${workspaceId}/agents/modeler`, { rootSessionId: root.id, task: { objective: 'test override' } })
     expect(spawned.status).toBe(202)
     const { childSessionId } = (await spawned.json()) as { childSessionId: string }
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const child = (await (await fetch(`${base}/api/workspaces/${workspaceId}/children/${childSessionId}?waitMs=50`)).json()) as { status: string }
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      // Child lifecycle routes require the owning root session in the address;
+      // the legacy address-less route is gone and cannot observe the child.
+      const child = (await (await fetch(`${base}/api/workspaces/${workspaceId}/sessions/${root.id}/children/${childSessionId}?waitMs=1000`)).json()) as { status: string }
       if (child.status === 'completed') break
     }
     const manifest = (await (await fetch(`${base}/api/workspaces/${workspaceId}/sessions/${childSessionId}/manifest`)).json()) as { model: string; provider: string }
@@ -146,9 +149,11 @@ describe('workspace session model controls', () => {
         if (streamCount === 1) {
           await firstStarted
           yield { type: 'toolCalls', calls: [{ id: 'read', name: 'Read', args: { path: 'missing.txt' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return
         }
         yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const { base } = await start([stepped])

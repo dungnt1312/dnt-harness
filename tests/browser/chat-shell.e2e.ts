@@ -113,6 +113,11 @@ async function fixture(page: Page, options: Options = {}): Promise<{ readonly po
     if (path === '/api/workspaces/w/agents/children/child') return json(route, { childSessionId: 'child', definitionName: 'explorer', status: 'completed', result: { report: 'Mapped 12 modules.', filesTouched: ['src/index.ts'] } })
     if (path === '/api/workspaces/w/sessions/s/messages' && method === 'POST') return json(route, { inputId: 'accepted', queued: false })
     if (path === '/api/approvals/approval-1' && method === 'POST') return json(route, { answered: true })
+    // Boot-time surfaces the shell reconciles on load; terminal tests own richer mocks.
+    if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/mode$/.test(path) && method === 'GET') return json(route, { modeId: 'chat', name: 'Chat', revision: 1, source: 'workspace-default' })
+    if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/processes$/.test(path) && method === 'GET') return json(route, [])
+    if (path === '/api/workspaces/w/terminals' && method === 'GET') return json(route, { terminals: [], shells: [], max: 4, available: false })
+    if (path === '/api/workspaces/w/projects/p/git' && method === 'GET') return json(route, { branch: null, changes: [], truncated: false })
     // Fail loudly instead of leaving the request hanging.
     unexpected.push(`${method} ${path}`)
     return json(route, { error: `unexpected fixture request ${method} ${path}` }, 500)
@@ -153,7 +158,8 @@ test('opens a long conversation at the latest message and lets the reader scroll
   expect(scrolledUp.max - scrolledUp.top).toBeGreaterThan(500)
 
   // Expanding a row while scrolled up must not yank the reader to the bottom.
-  await transcript.getByRole('button', { name: /Read/ }).first().click()
+  // Bash rows expand to a terminal frame; Read rows land in the workbench.
+  await transcript.getByRole('button', { name: /npm test/ }).first().click()
   await page.waitForTimeout(200)
   expect((await transcriptMetrics(page)).top).toBeLessThan(scrolledUp.top + 1)
 
@@ -166,12 +172,16 @@ test('tool rows stay inline and collapsed; expanding shows exact arguments and o
   await page.setViewportSize({ width: 1440, height: 900 })
   await fixture(page)
   const transcript = page.getByRole('region', { name: 'Conversation transcript' })
-  const row = transcript.getByRole('button', { name: /Bash.*npm test -- step-8/ })
+  // The settled Bash row states its kind ("Terminal") and the command itself.
+  const row = transcript.getByRole('button', { name: /npm test -- step-8/ })
   await expect(row).toHaveAttribute('aria-expanded', 'false')
   await row.click()
   await expect(row).toHaveAttribute('aria-expanded', 'true')
-  await expect(transcript.getByText('"command": "npm test -- step-8"')).toBeVisible()
+  // The terminal frame shows the command and the recorded output. A settled
+  // failure row keeps its own status word; exact JSON args are copy-only here.
+  await expect(transcript.getByText('npm test -- step-8').last()).toBeVisible()
   await expect(transcript.getByText('All tests passed').last()).toBeVisible()
+  await expect(transcript.getByText('$ npm test -- step-8')).toBeVisible()
   await expect(transcript.getByText('Failed').first()).toBeAttached()
   await expect(page.locator('[data-workbench-surface]')).toHaveCount(0)
 })
@@ -249,17 +259,21 @@ test('workbench docks beside the chat, browses project files and opens them as t
   const files = workbench.getByRole('list', { name: 'Project files' })
   await expect(files).toContainText('package.json')
   await files.getByRole('button', { name: /^src/ }).click()
-  await expect(workbench.getByRole('navigation', { name: 'Folder path' })).toContainText('src')
+  // The folder expands in place: its child listing is the navigation proof.
+  await expect(files.getByRole('button', { name: /step-8\.ts/ })).toBeVisible()
   await files.getByRole('button', { name: /step-8\.ts/ }).click()
-  await expect(workbench.getByRole('button', { name: 'step-8.ts', exact: true })).toHaveAttribute('aria-pressed', 'true')
+  // The opened file becomes the active tab and shows its recorded contents.
+  // The tab strip only renders on the Files view, so the close happens here.
+  const openedTab = workbench.getByRole('group', { name: 'Open files' }).getByRole('button', { name: 'step-8.ts', exact: true })
+  await expect(openedTab).toHaveAttribute('aria-pressed', 'true')
   await expect(workbench.getByRole('region', { name: 'Contents of src/step-8.ts' })).toContainText('"private": true')
+  await workbench.getByRole('button', { name: 'Close src/step-8.ts' }).click()
+  await expect(openedTab).toHaveCount(0)
 
   await selectWorkbenchView(page, 'Context')
-  await expect(workbench.getByText('~12000/32000 tok (est)')).toBeVisible()
-  await selectWorkbenchView(page, 'Artifacts')
-  await expect(workbench.getByRole('list', { name: 'Recorded artifacts' })).toBeVisible()
-  await workbench.getByRole('button', { name: 'Close src/step-8.ts' }).click()
-  await expect(workbench.getByRole('button', { name: 'step-8.ts', exact: true })).toHaveCount(0)
+  await expect(workbench.getByText('12000/32000 tok (est)')).toBeVisible()
+  await selectWorkbenchView(page, 'Git')
+  await expect(workbench.getByText('No changes')).toBeVisible()
 })
 
 test('tool rows open recorded project paths in the workbench', async ({ page }) => {
@@ -268,8 +282,9 @@ test('tool rows open recorded project paths in the workbench', async ({ page }) 
   await page.getByRole('button', { name: 'Close workbench' }).click()
   await expect(page.getByRole('region', { name: 'Workbench' })).toHaveCount(0)
   const transcript = page.getByRole('region', { name: 'Conversation transcript' })
-  await transcript.getByRole('button', { name: /Read.*step-8\.ts/ }).click()
-  await transcript.getByRole('button', { name: /Open C:\/fixture\/project\/src\/step-8\.ts in workbench/ }).click()
+  // The landed Read row's file chip is the link into the workbench (its
+  // accessible name is the file name; the title carries the full path).
+  await transcript.getByRole('button', { name: 'step-8.ts' }).click()
   const workbench = page.getByRole('region', { name: 'Workbench' })
   await expect(workbench.getByRole('region', { name: 'Contents of src/step-8.ts' })).toBeVisible()
 })

@@ -131,7 +131,7 @@ export function ApprovalBar({
               <Button variant="outline" size="sm" disabled={submittingRow} onClick={() => void answer(approvalId, false)}>Deny</Button>
               {sessionGrant !== undefined ? (
                 <Button variant="outline" size="sm" disabled={submittingRow} title={sessionGrant} onClick={() => void answer(approvalId, true, 'session')}>
-                  <span className="max-w-[20rem] truncate">Allow {proposedAccess === 'write' ? 'read & write' : 'read'} in <code>{shortFolder(sessionGrant)}</code> for this session</span>
+                  <span className="max-w-[min(20rem,calc(100vw-12rem))] truncate">Allow {proposedAccess === 'write' ? 'read & write' : 'read'} in <code>{shortFolder(sessionGrant)}</code> for this session</span>
                 </Button>
               ) : null}
               <Button variant="primary" size="sm" disabled={submittingRow} onClick={() => void answer(approvalId, true)}>{submittingRow ? 'Submitting decision…' : 'Allow once'}</Button>

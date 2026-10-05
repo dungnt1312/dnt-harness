@@ -36,6 +36,14 @@ describe('completionAt', () => {
     expect(completionAt('/usr/bin', 8)).toBeNull()
   })
 
+  it('triggers the $ skill menu at a word boundary, anywhere in the draft', () => {
+    expect(completionAt('$rev', 4)).toEqual({ kind: 'skillDollar', query: 'rev', start: 0, end: 4 })
+    expect(completionAt('use $rev now', 8)).toEqual({ kind: 'skillDollar', query: 'rev', start: 4, end: 8 })
+    expect(completionAt('hi $', 4)).toEqual({ kind: 'skillDollar', query: '', start: 3, end: 4 })
+    expect(completionAt('($test', 6)).toBeNull()
+    expect(completionAt('$rev and', 8)).toBeNull()
+  })
+
   it('reads the caret, not the end of the draft', () => {
     expect(completionAt('@rea and more', 4)).toEqual({ kind: 'file', query: 'rea', start: 0, end: 4 })
   })

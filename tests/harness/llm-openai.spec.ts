@@ -5,6 +5,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { OpenAiCompletionsProvider, ProviderError } from 'dnt-harness'
+import { LogicalRequest } from '../../src/harness/llm/request-lifecycle.ts'
 
 interface CapturedRequest {
   url: string
@@ -20,6 +21,7 @@ function stubFetch(chunks: readonly string[] = ['{"choices":[{"delta":{"content"
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         for (const chunk of chunks) controller.enqueue(encoder.encode(`data: ${chunk}\n\n`))
+        if (chunks.length > 0) controller.enqueue(encoder.encode('data: {"choices":[{"finish_reason":"stop"}]}\n\n'))
         controller.enqueue(encoder.encode('data: [DONE]\n\n'))
         controller.close()
       },
@@ -43,6 +45,17 @@ async function run(request: Parameters<OpenAiCompletionsProvider['stream']>[0]):
 }
 
 describe('openai completions adapter: thinking + wire shape', () => {
+  it('carries bounded Retry-After and safe HTTP metadata to the harness coordinator', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('SECRET', { status: 503, headers: { 'retry-after': '99' } })))
+    const owner = new LogicalRequest()
+    const result = (async () => { for await (const _ of provider().stream({ messages: [] }, { requestOwner: owner })) void _ })()
+    await expect(result).rejects.toMatchObject({ retryAfterMs: 30_000, status: 503, reason: 'server_error' })
+    owner.dispose()
+  })
+  it('classifies a numeric gateway 503 without text heuristics', async () => {
+    stubFetch(['{"error":{"code":503,"message":"SECRET"}}'])
+    await expect(run({ messages: [] })).rejects.toMatchObject({ reason: 'server_error', retryable: true })
+  })
   it('translates thinkingLevel into documented fields for the model', async () => {
     const captured = stubFetch()
     await run({ model: 'gpt-5.6', thinkingLevel: 'max', messages: [{ role: 'user', content: 'hi' }] })
@@ -142,6 +155,40 @@ describe('openai completions adapter: thinking + wire shape', () => {
   })
 })
 
+describe('openai completions adapter: tool progress', () => {
+  it('reports argument progress before completion without exposing partial calls', async () => {
+    const encoder = new TextEncoder()
+    let controller!: ReadableStreamDefaultController<Uint8Array>
+    vi.stubGlobal('fetch', async () => new Response(new ReadableStream<Uint8Array>({
+      start(value) { controller = value },
+    })))
+    const iterator = provider().stream({ messages: [{ role: 'user', content: 'write' }] })[Symbol.asyncIterator]()
+    const first = iterator.next()
+    await Promise.resolve()
+    controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"Write","arguments":"{\\"content\\":\\""}}]}}]}\n\n'))
+    // The stream stays open: progress must be observable before [DONE].
+    await expect(Promise.race([
+      first,
+      new Promise((resolve) => setTimeout(() => resolve('no progress'), 80)),
+    ])).resolves.toMatchObject({ done: false, value: { type: 'toolCallProgress' } })
+    controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"hello\\"}"}}]}}]}\n\n'))
+    controller.enqueue(encoder.encode('data: {"choices":[{"finish_reason":"tool_calls"}]}\n\n'))
+    controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+    controller.close()
+    const events = []
+    for (;;) {
+      const result = await iterator.next()
+      if (result.done) break
+      events.push(result.value)
+    }
+    expect(events).toEqual([
+      { type: 'toolCallProgress' },
+      { type: 'toolCalls', calls: [{ id: 'c1', name: 'Write', args: { content: 'hello' } }] },
+      { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true },
+    ])
+  })
+})
+
 describe('openai completions adapter: failure surfacing', () => {
   it('a mid-stream gateway error chunk rejects with the gateway message', async () => {
     // One API-style relays answer 200, stream a little, then fail upstream:
@@ -150,17 +197,17 @@ describe('openai completions adapter: failure surfacing', () => {
       '{"choices":[{"delta":{"content":"par"}}]}',
       '{"error":{"message":"no available channel for this model","code":503}}',
     ])
-    await expect(run({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(/no available channel/)
+    await expect(run({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(/provider gateway failure/)
   })
 
   it('a string-form gateway error chunk is surfaced too', async () => {
     stubFetch(['{"error":"upstream connect error"}'])
-    await expect(run({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(/upstream connect error/)
+    await expect(run({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(/provider gateway failure/)
   })
 
   it('a stream that closes without any model output is an error, not silence', async () => {
     stubFetch([])
-    await expect(run({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(/without any model output/)
+    await expect(run({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(/without completion proof/)
   })
 
   it('a malformed SSE data chunk is a provider error, not a raw SyntaxError', async () => {
@@ -176,7 +223,7 @@ describe('openai completions adapter: failure surfacing', () => {
 
 describe('openai completions adapter: retry before the stream starts', () => {
   function sse(text: string): Response {
-    return new Response(`data: {"choices":[{"delta":{"content":"${text}"}}]}\n\ndata: [DONE]\n\n`, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    return new Response(`data: {"choices":[{"delta":{"content":"${text}"}}]}\n\ndata: {"choices":[{"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n`, { status: 200, headers: { 'content-type': 'text/event-stream' } })
   }
 
   function scripted(responses: (() => Response | Promise<Response>)[]): ReturnType<typeof vi.fn> {
@@ -214,7 +261,7 @@ describe('openai completions adapter: retry before the stream starts', () => {
 
   it('retries a connection failure', async () => {
     const fake = scripted([
-      () => { throw new TypeError('fetch failed') },
+      () => { throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } }) },
       () => sse('back'),
     ])
     expect(await collect(fast())).toBe('back')
@@ -223,13 +270,13 @@ describe('openai completions adapter: retry before the stream starts', () => {
 
   it('does not retry a client error', async () => {
     const fake = scripted([() => new Response('bad key', { status: 401 })])
-    await expect(collect(fast())).rejects.toThrow(/HTTP 401: bad key/)
+    await expect(collect(fast())).rejects.toThrow(/HTTP 401: auth_configuration/)
     expect(fake).toHaveBeenCalledTimes(1)
   })
 
   it('gives up after maxRetries and reports the attempts', async () => {
     const fake = scripted([() => new Response('down', { status: 502 })])
-    await expect(collect(fast(2))).rejects.toThrow(/HTTP 502: down \(after 3 attempts\)/)
+    await expect(collect(fast(2))).rejects.toThrow(/HTTP 502: server_error/)
     expect(fake).toHaveBeenCalledTimes(3)
   })
 
@@ -247,6 +294,6 @@ describe('openai completions adapter: retry before the stream starts', () => {
     scripted([() => new Response('x'.repeat(50_000), { status: 400 })])
     const error = await collect(fast()).catch((caught: unknown) => caught as Error)
     expect((error as Error).message.length).toBeLessThan(5_000)
-    expect((error as Error).message).toContain('[truncated]')
+    expect((error as Error).message).not.toContain('x'.repeat(100))
   })
 })

@@ -7,14 +7,13 @@
  *   folder are denied outright (never askable);
  * - paths inside a granted folder pass through unchanged;
  * - paths outside every granted folder are recorded as a match, which the
- *   host turns into a forced approval (unless the mode's `outOfGrant` is
- *   `allow`). Only an ALLOW settlement authorizes that exact path, for that
- *   one call, via {@link PathScopeGuard.take}.
+ *   host turns into a forced approval when the CURRENT owning mode requires
+ *   it. Only an ALLOW settlement authorizes that exact path, for that one
+ *   call, via {@link PathScopeGuard.take}.
  *
- * The match remembers the workspace and exemption computed at
- * classification time, so a later re-evaluation that runs outside any agent
- * scope (a mode switch, a settings save) reads the right answer instead of
- * guessing a workspace.
+ * The target and intent are immutable classification snapshots. The host
+ * rechecks that snapshot against current grants and current mode authority;
+ * no exemption is snapshotted here.
  */
 import path from 'node:path'
 import type { Context } from '../kernel/index.ts'
@@ -29,11 +28,13 @@ export interface PathScopeMatch {
   readonly sessionId: string | undefined
   readonly executionId: string
   readonly workspaceId: string | undefined
+  readonly projectId: string | undefined
+  readonly parentSessionId: string | undefined
+  /** Child spawn snapshot; root sessions leave this undefined. */
+  readonly grantSnapshot: readonly { readonly path: string; readonly access: 'read' | 'write' }[] | undefined
   /** Absolute lexical path, exactly as the approver sees it. */
   readonly path: string
   readonly intent: PathIntent
-  /** True when the executing mode lets out-of-grant paths run without an extra approval. */
-  readonly exempt: boolean
   /** Folder a session-scoped approval would grant, when that folder is grantable. */
   readonly proposedGrant?: string
   /** Set by the answer route: grant `proposedGrant` to the session once the call is allowed. */
@@ -45,8 +46,6 @@ export interface PathScopeMatch {
 }
 
 export interface PathScopeOptions {
-  /** Evaluated inside the executing scope at classification time. */
-  readonly exempt: () => boolean
   /** Validate `folder` for a session-scoped answer; undefined when it is not grantable. */
   readonly proposeGrant: (folder: string) => Promise<string | undefined>
 }
@@ -59,6 +58,8 @@ export interface PathScopeGuard {
    * when allowed, returns the single path it authorizes.
    */
   take(executionId: string | undefined, call: ToolCall, allowed: boolean): PathScopeMatch | undefined
+  /** Drop all immutable classification state for a completed/refused execution. */
+  retire(executionId: string | undefined): void
 }
 
 const SEARCH_TOOLS = new Set(['Glob', 'Grep'])
@@ -77,6 +78,9 @@ function argsKeyOf(call: ToolCall): string {
  */
 export function attachPathScopeGuard(ctx: Context, options: PathScopeOptions): PathScopeGuard {
   const matches = new Map<string, PathScopeMatch>()
+  // `take()` consumes the authorization grant, but current authority still
+  // needs the immutable classification through final admission.
+  const snapshots = new Map<string, PathScopeMatch>()
 
   ctx.on('tools/rewrite', async (
     payload: { readonly call: ToolCall; readonly exec: ToolExecution | undefined },
@@ -121,21 +125,26 @@ export function attachPathScopeGuard(ctx: Context, options: PathScopeOptions): P
       // and a bare call-id key would leak across roots. Fail closed.
       return { kind: 'deny', reason: 'path approval requires a host execution identity' }
     }
-    matches.set(keyOf(executionId, payload.call), {
+    const match: PathScopeMatch = {
       sessionId: scope?.sessionId,
       executionId,
       workspaceId: scope?.workspaceId,
+      projectId: scope?.projectId,
+      parentSessionId: scope?.childOf?.parentSessionId,
+      grantSnapshot: scope?.childOf?.grants,
       path: outside.path,
       intent: outside.intent,
-      exempt: options.exempt(),
       ...(proposedGrant !== undefined ? { proposedGrant } : {}),
       argsKey: argsKeyOf(payload.call),
-    })
+    }
+    const key = keyOf(executionId, payload.call)
+    matches.set(key, match)
+    snapshots.set(key, match)
     return next({ call: payload.call, ...(exec !== undefined ? { exec } : {}) })
   })
 
   const get = (executionId: string | undefined, call: ToolCall): PathScopeMatch | undefined => {
-    const match = matches.get(keyOf(executionId, call))
+    const match = snapshots.get(keyOf(executionId, call))
     return match !== undefined && match.argsKey === argsKeyOf(call) ? match : undefined
   }
 
@@ -145,8 +154,15 @@ export function attachPathScopeGuard(ctx: Context, options: PathScopeOptions): P
       const key = keyOf(executionId, call)
       const match = matches.get(key)
       matches.delete(key)
+      if (!allowed) snapshots.delete(key)
       if (!allowed || match === undefined || match.argsKey !== argsKeyOf(call)) return undefined
       return match
+    },
+    retire(executionId) {
+      if (executionId === undefined) return
+      const prefix = `${executionId}\u0000`
+      for (const key of matches.keys()) if (key.startsWith(prefix)) matches.delete(key)
+      for (const key of snapshots.keys()) if (key.startsWith(prefix)) snapshots.delete(key)
     },
   }
 }

@@ -6,6 +6,12 @@
  * Strategy: the API and SSE streams are always live and never touched here;
  * navigations are network-first with the cached shell as offline fallback;
  * hashed build assets are cache-first.
+ *
+ * Precache is best-effort per file. `cache.addAll` is all-or-nothing and also
+ * rejects any response a reverse proxy marks `Vary: *` (typical once gzip is
+ * on) or redirects. One such response used to abort install, so the worker
+ * never controlled the page and browsers hid the install icon everywhere
+ * except a proxy-free localhost.
  */
 const VERSION = '__PWA_VERSION__'
 const PRECACHE = /** @type {string[]} */ (__PWA_PRECACHE__)
@@ -14,12 +20,29 @@ const CACHE_PREFIX = 'dnt-harness-'
 const LEGACY_CACHE_PREFIX = 'mini-dsh-'
 const CACHE = `${CACHE_PREFIX}${VERSION}`
 
+/** Whether the Cache API will accept this response. Opaque, errored, and `Vary: *` bodies are not. */
+function cacheable(response) {
+  if (!response || !response.ok || response.type === 'opaque') return false
+  const vary = response.headers.get('vary')
+  if (vary !== null && vary.split(',').some((part) => part.trim() === '*')) return false
+  return true
+}
+
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches
-      .open(CACHE)
-      .then((cache) => cache.addAll(PRECACHE))
-      .then(() => self.skipWaiting()),
+    caches.open(CACHE).then(async (cache) => {
+      await Promise.all(
+        PRECACHE.map(async (path) => {
+          try {
+            const response = await fetch(path, { cache: 'reload' })
+            if (cacheable(response)) await cache.put(path, response)
+          } catch {
+            // A missing shell file must not block install; the page stays network-backed.
+          }
+        }),
+      )
+      await self.skipWaiting()
+    }),
   )
 })
 
@@ -50,7 +73,7 @@ self.addEventListener('fetch', (event) => {
           fetch(request).then((response) => {
             // The server answers unknown paths with the HTML shell; never cache that as an asset.
             const isShell = (response.headers.get('content-type') ?? '').startsWith('text/html')
-            if (response.ok && !isShell) {
+            if (cacheable(response) && !isShell) {
               const copy = response.clone()
               void caches.open(CACHE).then((cache) => cache.put(request, copy))
             }

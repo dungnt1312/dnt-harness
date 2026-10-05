@@ -1,13 +1,13 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { Context } from '../../kernel/index.ts'
 import type { ExecutionId, SessionId, TurnId } from '../../util/brand.ts'
 import { agentScope } from '../agent/scope.ts'
 import type { ToolCall } from '../llm/types.ts'
-import { canonicalCall, canonicalPolicy } from '../tools/names.ts'
+import { canonicalCall } from '../tools/names.ts'
+import { resolvePermission, type ApprovalMode } from './resolution.ts'
+import type { AskRequirement, AuthorityDecision } from '../tools/authority.ts'
+export type { ApprovalMode } from './resolution.ts'
 import type { PreExecuteDecision, ToolExecution } from '../tools/types.ts'
-
-/** What the policy wants for one tool call. */
-export type ApprovalMode = 'allow' | 'ask' | 'deny'
 
 /** A live or static permission map; the getter form re-reads on every call. */
 export type PolicySource = Readonly<Record<string, ApprovalMode>> | (() => Readonly<Record<string, ApprovalMode>>)
@@ -35,7 +35,7 @@ export interface ApprovalHandle {
    * other workspaces are never touched, and previously denied or cancelled
    * calls never resurrect.
    */
-  reevaluate(scope: Reevaluation): void
+  reevaluate(scope: Reevaluation): Promise<void>
 }
 
 /**
@@ -63,6 +63,10 @@ export interface ApprovalLifecycle {
 
 /** Options for attaching an approval policy. */
 export interface ApprovalOptions {
+  /** Authoritative host resolver, called with immutable entry scope; failures deny. Overrides legacy policy lookup. */
+  readonly authorityResolver?: (call: ToolCall, scope: ApprovalScope) => AuthorityDecision | Promise<AuthorityDecision>
+  /** Host-owned, execution-scoped human-approval evidence. Omit for generic harness compatibility. */
+  readonly receiptRegistry?: ApprovalReceiptRegistry & { issue(call: ToolCall, scope: ApprovalScope, requirements: readonly AskRequirement[]): ApprovalReceipt | undefined }
   /** Per-tool modes (canonical or legacy names); unnamed tools use `defaultMode`. */
   readonly policy?: PolicySource
   /** Mode for tools the policy map does not name. */
@@ -102,6 +106,68 @@ export interface ApprovalScope {
   readonly workspaceId: string | undefined
 }
 
+export interface ApprovalReceipt {
+  readonly callFingerprint: string
+  readonly workspaceId: string
+  readonly rootSessionId: SessionId
+  readonly sessionId: SessionId
+  readonly executionId: ExecutionId
+  readonly requirements: readonly AskRequirement[]
+}
+
+export interface ApprovalReceiptRegistry {
+  readonly receiptFor: (call: ToolCall, scope: ApprovalScope) => ApprovalReceipt | undefined
+  readonly covers: (call: ToolCall, scope: ApprovalScope, requirements: readonly AskRequirement[]) => boolean
+  readonly retire: (executionId: ExecutionId | undefined) => void
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
+  return `{${Object.entries(value as Record<string, unknown>).sort().map(([key, child]) => `${JSON.stringify(key)}:${stableJson(child)}`).join(',')}}`
+}
+
+export function approvalCallFingerprint(call: ToolCall): string {
+  const canonical = canonicalCall(call)
+  return createHash('sha256').update(stableJson({ name: canonical.name, args: canonical.args })).digest('hex')
+}
+
+function sameRequirement(left: AskRequirement, right: AskRequirement): boolean {
+  return left.kind === right.kind && left.subjectFingerprint === right.subjectFingerprint && left.version === right.version
+}
+
+export function createApprovalReceiptRegistry(): ApprovalReceiptRegistry & { issue(call: ToolCall, scope: ApprovalScope, requirements: readonly AskRequirement[]): ApprovalReceipt | undefined } {
+  const receipts = new Map<ExecutionId, ApprovalReceipt>()
+  const complete = (scope: ApprovalScope): boolean =>
+    scope.workspaceId !== undefined && scope.rootSessionId !== undefined && scope.sessionId !== undefined && scope.executionId !== undefined
+  return {
+    issue(call, scope, requirements) {
+      if (!complete(scope)) return undefined
+      const receipt: ApprovalReceipt = Object.freeze({
+        callFingerprint: approvalCallFingerprint(call),
+        workspaceId: scope.workspaceId!,
+        rootSessionId: scope.rootSessionId!,
+        sessionId: scope.sessionId!,
+        executionId: scope.executionId!,
+        requirements: Object.freeze(requirements.map((requirement) => Object.freeze({ ...requirement }))),
+      })
+      receipts.set(scope.executionId!, receipt)
+      return receipt
+    },
+    receiptFor(call, scope) {
+      if (!complete(scope)) return undefined
+      const receipt = receipts.get(scope.executionId!)
+      if (receipt === undefined || receipt.callFingerprint !== approvalCallFingerprint(call) || receipt.workspaceId !== scope.workspaceId || receipt.rootSessionId !== scope.rootSessionId || receipt.sessionId !== scope.sessionId) return undefined
+      return receipt
+    },
+    covers(call, scope, requirements) {
+      const receipt = this.receiptFor(call, scope)
+      return receipt !== undefined && requirements.every((required) => receipt.requirements.some((shown) => sameRequirement(shown, required)))
+    },
+    retire(executionId) { if (executionId !== undefined) receipts.delete(executionId) },
+  }
+}
+
 /** Minimal structural slice of the sessions service the policy records into. */
 interface RecordingSession {
   append(event: Record<string, unknown>): unknown
@@ -114,6 +180,7 @@ interface PendingEntry {
   readonly approvalId: string
   readonly call: ToolCall
   readonly mode: ApprovalMode
+  readonly requirements: readonly AskRequirement[]
   /** Immutable execution scope — a control change in another workspace must never touch this entry. */
   readonly workspaceId: string | undefined
   readonly sessionId: SessionId | undefined
@@ -127,7 +194,7 @@ interface PendingEntry {
 
 function readPolicy(source: PolicySource | undefined): Record<string, ApprovalMode> {
   const raw = typeof source === 'function' ? source() : (source ?? {})
-  return canonicalPolicy(raw) as Record<string, ApprovalMode>
+  return { ...raw }
 }
 
 /**
@@ -137,14 +204,19 @@ function readPolicy(source: PolicySource | undefined): Record<string, ApprovalMo
  * overrides this for tools annotated as requiring interaction.
  */
 function modeFor(policy: Readonly<Record<string, ApprovalMode>>, tool: string, defaultMode: ApprovalMode): ApprovalMode {
-  const exact = policy[tool]
-  if (exact !== undefined) return exact
-  if (tool.startsWith('mcp__')) {
-    const parts = tool.split('__')
-    const wildcard = parts.length >= 3 ? policy[`mcp__${parts[1]}__*`] : undefined
-    if (wildcard !== undefined) return wildcard
-  }
-  return policy['*'] ?? defaultMode
+  return resolvePermission(policy, tool, { defaultMode })
+}
+
+/**
+ * The exposure ceiling a mode change keeps pending asks under. Built-in
+ * tools must be listed by name; MCP names are dynamic, so the gate matches
+ * the web host's `exposureDenial`: they stay exposed unless the incoming
+ * mode has a ZERO-length ceiling (no tools at all) — a list of built-ins
+ * says nothing about which `mcp__server__tool` names exist.
+ */
+function exposedBy(toolExposure: readonly string[], tool: string): boolean {
+  if (tool.startsWith('mcp__')) return toolExposure.length > 0
+  return toolExposure.includes(tool)
 }
 
 /**
@@ -165,15 +237,36 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
   const defaultMode = options.defaultMode ?? 'ask'
   const expiryMs = options.expiryMs ?? 5 * 60_000
   const pending = new Map<string, PendingEntry>()
+  // Claimed entries remain visible until their durable settlement completes.
+  const settling = new Map<PendingEntry, Promise<void>>()
+
+  const legacyAuthority = (policy: Readonly<Record<string, ApprovalMode>>, tool: string): AuthorityDecision => {
+    const mode = modeFor(policy, tool, defaultMode)
+    if (mode === 'deny') return { kind: 'deny', reason: `policy denies '${tool}'` }
+    return mode === 'ask' ? { kind: 'ask', requirements: [{ kind: 'tool-policy' }] } : { kind: 'allow' }
+  }
+
+  const authority = async (call: ToolCall, scope: ApprovalScope, policy?: Readonly<Record<string, ApprovalMode>>): Promise<AuthorityDecision> => {
+    try {
+      const decision = options.authorityResolver !== undefined
+        ? await options.authorityResolver(call, scope)
+        : legacyAuthority(policy ?? readPolicy(options.policy), call.name)
+
+      if (decision.kind === 'deny') return { kind: 'deny', reason: decision.reason ?? `policy denies '${call.name}'` }
+      if (decision.kind === 'allow' && options.forceAsk?.(call, scope) === true) {
+        return { kind: 'ask', requirements: [{ kind: 'interaction' }] }
+      }
+      return decision
+    } catch (error) {
+      return { kind: 'deny', reason: `authority resolver failed: ${String(error instanceof Error ? error.message : error)}` }
+    }
+  }
 
   // Structural lookup keeps this module decoupled from the sessions service
   // type; recording is skipped when no store-backed registry is mounted.
-  const recorder = (): { session: RecordingSession; sessionId: SessionId; workspaceId: string | undefined } | undefined => {
-    const scope = agentScope.getStore()
-    if (scope === undefined) return undefined
+  const recorder = (scope: ApprovalScope): { session: RecordingSession } | undefined => {
     const session = recordingSession(scope.sessionId)
-    if (session === undefined) return undefined
-    return { session, sessionId: scope.sessionId, workspaceId: scope.workspaceId }
+    return session === undefined ? undefined : { session }
   }
 
   /**
@@ -200,58 +293,72 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
    * authorization that never happened, and the side effect must not run.
    * Denials resolve even when recording fails: fail closed.
    */
-  const settle = async (entry: PendingEntry, decision: 'allow' | 'deny' | 'expired' | 'cancelled', reason?: string): Promise<void> => {
-    if (!pending.delete(entry.approvalId)) return
-    entry.done()
-    const session = recordingSession(entry.sessionId)
-    if (session !== undefined) {
-      try {
-        session.append({
-          type: 'approval/decision',
-          approvalId: entry.approvalId,
-          ...(entry.executionId !== undefined ? { executionId: entry.executionId } : {}),
-          decision,
-          ...(reason !== undefined ? { reason } : {}),
-        })
-        await session.durable()
-      } catch (error) {
-        if (decision === 'allow') {
-          entry.resolve({
-            decision: 'deny',
-            reason: `approval decision could not be recorded: ${String(error instanceof Error ? error.message : error)}`,
+  const settle = (entry: PendingEntry, decision: 'allow' | 'deny' | 'expired' | 'cancelled', reason?: string, humanApproved = false): Promise<void> => {
+    const inFlight = settling.get(entry)
+    if (inFlight !== undefined) return inFlight
+    if (!pending.delete(entry.approvalId)) return Promise.resolve()
+    // Publish completion before invoking lifecycle/recording callbacks.
+    const completion = Promise.resolve().then(async () => {
+      entry.done()
+      const session = recordingSession(entry.sessionId)
+      if (session !== undefined) {
+        try {
+          session.append({
+            type: 'approval/decision',
+            approvalId: entry.approvalId,
+            ...(entry.executionId !== undefined ? { executionId: entry.executionId } : {}),
+            decision,
+            ...(reason !== undefined ? { reason } : {}),
           })
-          return
+          await session.durable()
+        } catch (error) {
+          if (decision === 'allow') {
+            entry.resolve({
+              decision: 'deny',
+              reason: `approval decision could not be recorded: ${String(error instanceof Error ? error.message : error)}`,
+            })
+            return
+          }
         }
       }
-    }
-    entry.resolve({ decision, ...(reason !== undefined ? { reason } : {}) })
+      if (decision === 'allow' && humanApproved) {
+        options.receiptRegistry?.issue(entry.call, {
+          sessionId: entry.sessionId,
+          rootSessionId: entry.rootSessionId,
+          turnId: entry.turnId,
+          executionId: entry.executionId,
+          workspaceId: entry.workspaceId,
+        }, entry.requirements)
+      }
+      entry.resolve({ decision, ...(reason !== undefined ? { reason } : {}) })
+    }).finally(() => { settling.delete(entry) })
+    settling.set(entry, completion)
+    return completion
   }
 
   ctx.on('tools/pre-execute', async (payload: { call: ToolCall; exec: ToolExecution }, next: (replacement?: { call: ToolCall }) => Promise<PreExecuteDecision>): Promise<PreExecuteDecision> => {
     const call = canonicalCall(payload.call)
-    const policy = readPolicy(options.policy)
-    const baseMode = modeFor(policy, call.name, defaultMode)
     const executing = agentScope.getStore()
     const callScope: ApprovalScope = {
-      sessionId: executing?.sessionId,
-      rootSessionId: executing?.rootSessionId,
+      sessionId: payload.exec.sessionId ?? executing?.sessionId,
+      rootSessionId: payload.exec.rootSessionId ?? executing?.rootSessionId,
       turnId: executing?.turnId,
       executionId: payload.exec.executionId,
-      workspaceId: executing?.workspaceId,
+      workspaceId: payload.exec.workspaceId ?? executing?.workspaceId,
     }
-    const mode = baseMode === 'allow' && options.forceAsk?.(call, callScope) === true ? 'ask' : baseMode
-    if (mode === 'allow') return next()
-    if (mode === 'deny') {
-      return { kind: 'deny', reason: `policy denies '${call.name}'` }
-    }
+    Object.freeze(callScope)
+    const decision = await authority(call, callScope)
+    const mode = decision.kind
     if (payload.exec.signal?.aborted === true) {
       return { kind: 'deny', reason: `cancelled: stop requested while awaiting approval for '${call.name}'` }
     }
+    if (decision.kind === 'allow') return next()
+    if (decision.kind === 'deny') return decision
     if (options.askUser === undefined) {
       return { kind: 'deny', reason: `approval required for '${call.name}' but no askUser answerer is configured` }
     }
 
-    const record = recorder()
+    const record = recorder(callScope)
     // Unguessable capability id: the answer route is transport-global.
     const approvalId = `approval-${randomUUID()}`
     if (record !== undefined) {
@@ -281,8 +388,9 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
         approvalId,
         call,
         mode,
-        workspaceId: record?.workspaceId,
-        sessionId: record?.sessionId,
+        requirements: Object.freeze(decision.requirements.map((requirement) => Object.freeze({ ...requirement }))),
+        workspaceId: callScope.workspaceId,
+        sessionId: callScope.sessionId,
         rootSessionId: callScope.rootSessionId,
         turnId: callScope.turnId,
         executionId: callScope.executionId,
@@ -300,21 +408,23 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
       }
       payload.exec.signal?.addEventListener('abort', onAbort, { once: true })
       if (payload.exec.signal?.aborted === true) onAbort()
-      void options.askUser?.(call, { approvalId, executionId: callScope.executionId, done, expiresAt }).then((allowed) => {
+      const cleanup = (): void => {
         payload.exec.signal?.removeEventListener('abort', onAbort)
         clearTimeout(timer)
-        // Re-read the live policy: an approval cannot override a deny that
-        // arrived after the question was asked.
-        const current = modeFor(readPolicy(options.policy), call.name, defaultMode)
-        if (current === 'deny') {
-          void settle(pendingEntry, 'deny', `policy now denies '${call.name}'`)
+      }
+      void done.then(cleanup)
+      // Promise.resolve also contains synchronous answerer failures. The async
+      // authority check cannot escape a fire-and-forget callback.
+      void Promise.resolve().then(() => options.askUser!(call, { approvalId, executionId: callScope.executionId, done, expiresAt })).then(async (allowed) => {
+        if (!pending.has(approvalId)) return
+        const current = await authority(call, callScope)
+        if (current.kind === 'deny') {
+          await settle(pendingEntry, 'deny', options.authorityResolver === undefined ? `policy now denies '${call.name}'` : current.reason)
           return
         }
-        void settle(pendingEntry, allowed ? 'allow' : 'deny', allowed ? undefined : `the user denied '${call.name}'`)
-      }, (error: unknown) => {
-        payload.exec.signal?.removeEventListener('abort', onAbort)
-        clearTimeout(timer)
-        void settle(pendingEntry, 'deny', `approval answerer failed: ${String(error instanceof Error ? error.message : error)}`)
+        await settle(pendingEntry, allowed ? 'allow' : 'deny', allowed ? undefined : `the user denied '${call.name}'`, allowed)
+      }).catch(async (error: unknown) => {
+        await settle(pendingEntry, 'deny', `approval answerer failed: ${String(error instanceof Error ? error.message : error)}`)
       })
     })
 
@@ -323,17 +433,20 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
   })
 
   return {
-    reevaluate: (scope: Reevaluation = {}): void => {
-      const policy = scope.policy ?? readPolicy(options.policy)
-      for (const entry of [...pending.values()]) {
+    reevaluate: async (scope: Reevaluation = {}): Promise<void> => {
+      for (const entry of [...pending.values(), ...settling.keys()]) {
         // Immutable scope: a control change addresses its own workspace only.
         if (scope.workspaceId !== undefined && entry.workspaceId !== scope.workspaceId) continue
         if (scope.rootSessionId !== undefined && (entry.rootSessionId ?? entry.sessionId) !== scope.rootSessionId) continue
-        if (scope.toolExposure !== undefined && !scope.toolExposure.includes(entry.call.name)) {
-          void settle(entry, 'cancelled', `mode change: '${entry.call.name}' is no longer exposed`)
+        const inFlight = settling.get(entry)
+        if (inFlight !== undefined) {
+          await inFlight
           continue
         }
-        const baseMode = modeFor(policy, entry.call.name, defaultMode)
+        if (scope.toolExposure !== undefined && !exposedBy(scope.toolExposure, entry.call.name)) {
+          await settle(entry, 'cancelled', `mode change: '${entry.call.name}' is no longer exposed`)
+          continue
+        }
         const entryScope: ApprovalScope = {
           sessionId: entry.sessionId,
           rootSessionId: entry.rootSessionId,
@@ -341,19 +454,22 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
           executionId: entry.executionId,
           workspaceId: entry.workspaceId,
         }
-        const mode = baseMode === 'allow' && options.forceAsk?.(entry.call, entryScope) === true ? 'ask' : baseMode
-        if (mode === 'deny') {
-          void settle(entry, 'deny', `policy now denies '${entry.call.name}'`)
+        const decision = await authority(entry.call, Object.freeze(entryScope), scope.policy)
+        if (decision.kind === 'deny') {
+          await settle(entry, 'deny', options.authorityResolver === undefined ? `policy now denies '${entry.call.name}'` : decision.reason)
           continue
         }
-        if (mode === 'allow') {
+        if (decision.kind === 'allow') {
           // Newly allowed: the checks above are the serialized final gate
           // (scope match, exposure, policy); host root restrictions still
           // apply downstream in the tool pipeline. Exactly one settlement
           // wins because settle() claims the entry atomically.
-          void settle(entry, 'allow')
+          await settle(entry, 'allow')
         }
-        // still 'ask': remains pending for its human answer.
+        // An answer/Stop/other reevaluation may have claimed it while the
+        // resolver waited, even if this resolver still returns 'ask'.
+        await settling.get(entry)
+        // still 'ask' and unclaimed: remains pending for its human answer.
       }
     },
   }

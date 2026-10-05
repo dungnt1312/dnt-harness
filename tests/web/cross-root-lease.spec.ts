@@ -36,10 +36,12 @@ const writer: LlmProvider = {
       yield command[1] === 'read'
         ? { type: 'toolCalls', calls: [{ id, name: 'Read', args: { path: command[2] } }] }
         : { type: 'toolCalls', calls: [{ id, name: 'Write', args: { path: command[2], content: 'x' } }] }
+      yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
       return
     }
     if (text.includes(' hold')) await gate
     yield { type: 'delta', delta: 'done' }
+    yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
   },
 }
 

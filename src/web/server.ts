@@ -21,6 +21,7 @@
  * questions — answered by `POST /api/approvals/:id`.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { createReadStream } from 'node:fs'
 import { bearerAllows, CLEARED_SESSION_COOKIE, ControlPlaneAuthService, isPublicPath, readSessionCookie } from './control-plane-auth.ts'
 import { OPERATOR_HEADER, publishOperatorChannel } from './operator-channel.ts'
 import { promises as fs, type Dirent } from 'node:fs'
@@ -31,14 +32,16 @@ import { AgentsService } from '../harness/agent/service.ts'
 import { resolveAppHome } from '../harness/app-home.ts'
 import { agentScope, type AgentScope } from '../harness/agent/scope.ts'
 import type { GrantedRoot } from '../harness/tools/types.ts'
-import { within } from '../capabilities/fs/grants.ts'
+import { classifyGrantedRoots, classifyTarget, within } from '../capabilities/fs/grants.ts'
 import { mergeGrants, parseAccess, projectGrants, validateGrantFolder, type GrantPolicy } from './folder-grants.ts'
 import { approvedPathOf, attachPathScopeGuard, type PathScopeGuard, type PathScopeMatch } from './path-scope-guard.ts'
 import type { Agent } from '../harness/agent/agent.ts'
-import { attachApproval, type ApprovalHandle, type ApprovalMode } from '../harness/approval/policy.ts'
+import { approvalCallFingerprint, attachApproval, createApprovalReceiptRegistry, type ApprovalHandle, type ApprovalMode, type ApprovalScope } from '../harness/approval/policy.ts'
+import { resolvePermission } from '../harness/approval/resolution.ts'
+import { composeAuthority, type AskRequirement, type AuthorityDecision } from '../harness/tools/authority.ts'
 import { DangerousCommandsStore } from '../harness/guard/store.ts'
-import { attachDangerousCommandGuard } from '../harness/guard/guard.ts'
-import { DEFAULT_LIMITS, type HarnessLimits } from '../harness/limits.ts'
+import { attachDangerousCommandGuard, guardMatchFingerprint } from '../harness/guard/guard.ts'
+import { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from '../harness/limits.ts'
 import { LlmService } from '../harness/llm/service.ts'
 import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
 import { isThinkingLevel, resolveContextLimit } from '../harness/llm/model-catalog.ts'
@@ -51,9 +54,11 @@ import { newInputId, type ProjectId, type SessionId, type TurnId, type Workspace
 import { ToolsService } from '../harness/tools/service.ts'
 import { bashTool } from '../capabilities/shell/bash.ts'
 import { bashOutputTool, killShellTool } from '../capabilities/shell/background-tools.ts'
+import { createProcessSessionEventBridge } from '../harness/processes/session-event-bridge.ts'
+import { runCleanup, boundedCleanup } from '../harness/processes/shutdown.ts'
 import { ProcessRegistry } from '../harness/processes/registry.ts'
 import { fsTools } from '../capabilities/fs/tools.ts'
-import { listProjectEntries, readProjectFile, searchProjectFiles, ProjectFileError } from './project-files.ts'
+import { listProjectEntries, readProjectFile, searchProjectFiles, ProjectFileError, classifyProjectMedia, resolveProjectMediaPath, MAX_MEDIA_BYTES } from './project-files.ts'
 import { gitDiff, gitStatus, ProjectGitError } from './project-git.ts'
 import {
   AttachmentError,
@@ -103,6 +108,7 @@ import {
   type McpServerConfig,
 } from '../harness/mcp/config.ts'
 import { McpServerClient, McpTransportError, type McpToolDescriptor } from '../harness/mcp/client.ts'
+import { createExecutionAuthority, mcpToolExposed, projectExposedSchemas } from './execution-authority.ts'
 import { configRevision, upsertServer, withServerActivated, withServerEnabled, withoutServer } from '../harness/mcp/config-v2.ts'
 import { clearAuditFault, dispatchToolCall, faultIsOpen } from '../harness/mcp/execution-coordinator.ts'
 import { McpExecutionJournal } from '../harness/mcp/execution-journal.ts'
@@ -117,7 +123,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { runHook, isBlockingDecision, isFailureDecision } from '../harness/hooks/runner.ts'
 import type { HooksConfig } from '../harness/mcp/config.ts'
 import { ChildExecutor, SpawnError, normalizeBrief, type ChildModel, type TaskPacket } from '../harness/agents/executor.ts'
-import { agentTool, ChildModelError, projectInheritedMessages, resolveChildModel } from './agent-delegation.ts'
+import { agentTool, ChildModelError, formatChildReports, projectInheritedMessages, resolveChildModel } from './agent-delegation.ts'
 import { importClaudeDefinition } from '../harness/agents/compatibility/claude.ts'
 import { SkillsService, SkillError } from '../harness/skills/service.ts'
 import { protectedRootsForRules, resolveSkillLayers, type SkillLayer } from '../harness/skills/layers.ts'
@@ -499,7 +505,10 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
 
   const kernel = new Kernel()
   if (options.home !== undefined) {
-    kernel.ctx.plugin(fileSessions(options.home))
+    // Streaming chunks ride relaxed appends (one fsync per durability barrier
+    // instead of per token); the env opt-out restores strict per-record syncs.
+    const relaxedStreamingAppends = process.env['DNT_HARNESS_FSYNC_EVERY_EVENT'] !== '1'
+    kernel.ctx.plugin(fileSessions(options.home, { relaxedStreamingAppends }))
   } else {
     kernel.ctx.plugin(SessionsService)
   }
@@ -507,7 +516,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   kernel.ctx.plugin(ToolsService)
   kernel.ctx.plugin(AgentsService)
 
-  const limits: HarnessLimits = { ...DEFAULT_LIMITS, ...(options.limits ?? {}) }
+  const limits: HarnessLimits = resolveLimits(options.limits)
   kernel.ctx.provide('limits', limits)
 
   // ── workspace registry ───────────────────────────────────────
@@ -834,8 +843,23 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     const session = sessions.get(sessionId)?.session
     return mergeGrants(projectGrants(project, lookup), session !== undefined ? sessionGrants(session).roots : [])
   }
-  const scopeGrants = (scope: AgentScope): GrantedRoot[] =>
-    scope.childOf !== undefined ? [...(scope.childOf.grants ?? [])] : effectiveGrants(scope.sessionId, scope.projectId, scope.workspaceId)
+  const intersectGrants = (snapshot: readonly GrantedRoot[], current: readonly GrantedRoot[]): GrantedRoot[] => {
+    const boundaries = mergeGrants(
+      snapshot,
+      current.filter((root) => snapshot.some((spawned) => within(spawned.path, root.path))),
+    )
+    return boundaries.flatMap((root) => {
+      const spawned = classifyGrantedRoots(snapshot, root.path)
+      const live = classifyGrantedRoots(current, root.path)
+      if (spawned === undefined || live === undefined) return []
+      return [{ path: root.path, access: spawned.access === 'write' && live.access === 'write' ? 'write' as const : 'read' as const }]
+    })
+  }
+  const scopeGrants = (scope: AgentScope): GrantedRoot[] => {
+    if (scope.childOf === undefined) return effectiveGrants(scope.sessionId, scope.projectId, scope.workspaceId)
+    const currentParent = effectiveGrants(scope.childOf.parentSessionId, scope.projectId, scope.workspaceId)
+    return intersectGrants(scope.childOf.grants ?? [], currentParent)
+  }
   // Every change to one session's grants runs through one queue, so a
   // composer edit and an approval's "allow for session" never overwrite
   // each other: each derives its list from the durable current value.
@@ -895,15 +919,11 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   // Background-process registry: host-owned, per session. The bridge appends
   // durable process/* events to the OWNING session's log — a session deleted
   // mid-flight simply has no reader left, and dispose emits nothing anyway.
-  const processes = new ProcessRegistry({
-    onStart: (record) => {
-      sessions.get(record.sessionId)?.session.append({ type: 'process/start', processId: record.id, command: record.command, cwd: record.cwd, ...(record.turnId !== undefined ? { turnId: record.turnId as TurnId } : {}) })
-    },
-    onExit: (record) => {
-      sessions.get(record.sessionId)?.session.append({ type: 'process/exit', processId: record.id, exitCode: record.exitCode, termination: record.status as 'exited' | 'killed' | 'failed' | 'interrupted', durationMs: (record.endedAt ?? record.startedAt) - record.startedAt })
-    },
-  })
-  kernel.ctx.tools.register(bashTool({ timeoutMs: limits.toolTimeoutMs, processes }))
+  const processEvents = createProcessSessionEventBridge(kernel.ctx.sessions)
+  const processes = new ProcessRegistry(processEvents)
+  kernel.ctx.provide('processes', processes)
+  kernel.ctx.provide('process-events', processEvents)
+  kernel.ctx.tools.register(bashTool({ timeoutMs: limits.toolTimeoutMs, maxWaitMs: limits.bashMaxWaitMs, processes }))
   kernel.ctx.tools.register(bashOutputTool({ processes }))
   kernel.ctx.tools.register(killShellTool({ processes }))
 
@@ -1027,7 +1047,23 @@ ${decision.injected}`, ...contents]
     return next({ contents })
   }, true)
 
-  // G4 root lifecycle: the root cannot complete a turn while its children
+  // G4 root lifecycle, part one: the model stopped calling tools while children
+  // it delegated are still running or unreported. Closing the turn would cancel
+  // them and lose everything they did, so the root joins them (bounded, and a
+  // user Stop ends the wait) and spends one more step on their reports.
+  kernel.ctx.on('agent/turn-continuation', async (state) => {
+    const scope = agentScope.getStore()
+    if (scope?.sessionId === undefined || scope.workspaceId === undefined || scope.childOf !== undefined) return undefined
+    const handles = await depsRef.current?.childExecutor.joinTurnChildren(
+      scope.workspaceId,
+      scope.sessionId,
+      state.turnId,
+      { timeoutMs: limits.delegationJoinMs, ...(state.signal !== undefined ? { signal: state.signal } : {}) },
+    )
+    return handles !== undefined && handles.length > 0 ? formatChildReports(handles) : undefined
+  })
+
+  // G4 root lifecycle, part two: the root cannot complete a turn while its children
   // remain active. Cancelling remaining children within the root's budget
   // is the spec's sanctioned resolution; settlement is awaited so
   // `turn/end: completed` never hides active work.
@@ -1236,6 +1272,7 @@ ${entry.description}`.toLowerCase().includes(query))
     childModelFor,
     providers: () => usableIds(),
     modelsOf: (provider) => kernel.ctx.llm.providerModels(provider),
+    admissionResolver: ({ parentSessionId, workspaceId, definition, candidates }) => admissionExposureCeiling(parentSessionId, workspaceId, definition, candidates),
     grantsOf: (parentSessionId) => {
       const entry = sessions.get(parentSessionId)
       return entry === undefined ? [] : effectiveGrants(parentSessionId, entry.projectId, entry.workspaceId)
@@ -1474,16 +1511,6 @@ ${entry.description}`.toLowerCase().includes(query))
   }
 
   
-/**
- * An omitted or empty allowedTools list exposes every tool the server
- * discovered. A non-empty list is an exposure filter, not a permission grant.
- * Names may be the server tool or the public mcp__server__tool name.
- */
-function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string, fullName: string): boolean {
-  if (allowed === undefined || allowed.length === 0) return true
-  return allowed.includes(toolName) || allowed.includes(fullName)
-}
-
 /** Register `mcp__server__tool` tools through the effect-disposed seam. */
   async function reconcileMcpTools(workspaceId: WorkspaceId, serverName: string, client: McpServerClient): Promise<void> {
     const config = await mcpStore.loadMcp(workspaceId)
@@ -1625,6 +1652,21 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
   }
 
   /**
+   * Whether the root's latest durable turn is terminal. `agent.busy` flips
+   * idle only after the turn's terminal append settles, so manual-spawn
+   * admission checks the durable log to avoid rejecting a spawn offered in
+   * that window with a false "active conversation Turn".
+   */
+  function turnTerminal(session: Session): boolean {
+    for (let index = session.events.length - 1; index >= 0; index -= 1) {
+      const event = session.events[index]
+      if (event?.type === 'turn/end' || event?.type === 'turn/closing') return true
+      if (event?.type === 'turn/start') return false
+    }
+    return true
+  }
+
+  /**
    * The mode governing one execution: the ROOT session's latest durable
    * snapshot. A child resolves its root's record, so a root switching mode
    * narrows its own children and nobody else. A legacy root with no snapshot
@@ -1639,6 +1681,26 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     }
     const state = controlsFor(workspaceId)
     return { mode: state.modeDefinition, revision: state.modeRevision }
+  }
+
+  /**
+   * The ONE host exposure resolver: schema projection, spawn admission, and
+   * both tool gates ask it, so they cannot drift. Exposure is a hard ceiling,
+   * never a permission grant.
+   */
+  const executionAuthority = createExecutionAuthority({
+    get blockedTools() { return options.blockedTools ?? [] },
+    modeOf: (scope, workspaceId) => {
+      const owner = (scope.rootSessionId ?? scope.sessionId) as SessionId | undefined
+      const { mode, revision } = rootModeOf(owner !== undefined ? { sessionId: owner, rootSessionId: owner } : undefined, workspaceId as WorkspaceId)
+      return { mode: mode.definition, revision }
+    },
+    loadMcp: (workspaceId) => mcpStore.loadMcp(workspaceId),
+  })
+
+  /** Spawn admission ceiling; called by the executor at its admission linearization point. */
+  async function admissionExposureCeiling(rootSessionId: SessionId, workspaceId: WorkspaceId, definition: string, candidates: readonly string[]): Promise<readonly string[]> {
+    return executionAuthority.admissionCeiling({ workspaceId, rootSessionId, definition, candidates })
   }
 
   /**
@@ -1701,48 +1763,10 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
    * while a call waits (approval, stale batch) is enforced identically.
    */
   async function exposureDenial(call: ToolCall, scope: AgentScope | undefined): Promise<string | undefined> {
-    // Mandatory host restrictions are the outermost hard deny and never
-    // pass through approval. Glob patterns are anchored (`*` = any chars).
-    for (const pattern of options.blockedTools ?? []) {
-      const regex = new RegExp(`^${pattern.split('*').map(escapeRegExp).join('.*')}$`)
-      if (regex.test(call.name)) return `host blockedTools denies '${call.name}'`
-    }
-    if (scope?.workspaceId === undefined) return undefined
-    const { mode } = rootModeOf(scope, scope.workspaceId)
-    if (call.name.startsWith('mcp__')) {
-      // G5 mode ceiling: a zero-exposure mode sees no MCP tools either
-      // (MCP names are dynamic, so emptiness is the only honest ceiling);
-      // Explorer sees none regardless of grant/mode; Plan exposes none
-      // unless the workspace explicitly allowlisted the full tool AND its
-      // name looks read-safe.
-      if (mode.definition.toolExposure.length === 0) return `mode '${mode.definition.name}' exposes no MCP tools`
-      if (scope.childOf?.definition === 'explorer') return `Explorer exposes zero MCP tools`
-      if (mode.definition.id === 'plan') {
-        const parts = call.name.split('__')
-        const serverName = parts[1] ?? ''
-        const toolName = parts.slice(2).join('__')
-        const config = await mcpStore.loadMcp(scope.workspaceId)
-        const allowed = config.servers[serverName]?.allowedTools
-        const readSafe = /^(read|get|list|search|query|fetch|inspect|describe)/i.test(toolName)
-        if (!readSafe || !mcpToolExposed(allowed, toolName, call.name)) {
-          return `mode 'Plan' does not expose MCP tool '${call.name}' without a read-safe allowlist entry`
-        }
-      }
-    } else if (!mode.definition.toolExposure.includes(call.name)) {
-      return `mode '${mode.definition.name}' does not expose '${call.name}'`
-    }
-    // G4 one level: delegation is denied to a child before any ceiling or
-    // approval is consulted, whatever its definition happens to list.
-    if (scope.childOf !== undefined && call.name === 'Agent') return 'one-level delegation: a child agent cannot delegate'
-    // G4 child ceiling: definition ∩ spawn grant narrows the mode's
-    // exposure. A child can never gain a tool its definition lacks — even
-    // if the parent later switches to Full access (spawn-time grants never
-    // expand; Explorer cannot acquire Bash by a mode switch).
-    if (scope.childOf !== undefined && !scope.childOf.toolCeiling.includes(call.name)) {
-      return `agent '${scope.childOf.definition}' does not expose '${call.name}' (definition ceiling)`
-    }
-    return undefined
+    return executionAuthority.refusal(scope, call.name)
   }
+
+  const approvalReceipts = createApprovalReceiptRegistry()
 
   // G3 tool gate: the mode's exposure is a HARD ceiling — the FIRST
   // pre-execute listener denies unexposed tools even from stale model
@@ -1752,13 +1776,62 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     if (refused !== undefined) return { kind: 'deny', reason: refused }
     return next()
   }, true)
-  // The same authority, re-read right before the side effect: a mode that
-  // narrowed while this call waited on approval refuses it here.
+  // The same authority, re-read right before the side effect. This check is
+  // non-interactive: a new ask must be retried as a fresh model call.
   kernel.ctx.on('tools/final-gate', async (payload) => {
-    const refused = await exposureDenial(payload.call, agentScope.getStore())
-    if (refused !== undefined) return refused
-    const policy = effectivePolicy(executingMode().mode.definition.permissionDefaults, options.yolo === true)
-    return policy[payload.call.name] === 'deny' ? `policy now denies '${payload.call.name}'` : undefined
+    const scope: ApprovalScope = Object.freeze({
+      sessionId: payload.exec.sessionId,
+      rootSessionId: payload.exec.rootSessionId,
+      turnId: payload.exec.turnId as TurnId | undefined,
+      executionId: payload.exec.executionId,
+      workspaceId: payload.exec.workspaceId,
+    })
+    const decision = await hostAuthority(payload.call, scope)
+    if (decision.kind === 'deny') {
+      approvalReceipts.retire(scope.executionId)
+      pathScope.retire(scope.executionId)
+      return decision.reason
+    }
+    if (decision.kind === 'ask' && !approvalReceipts.covers(payload.call, scope, decision.requirements)) {
+      approvalReceipts.retire(scope.executionId)
+      pathScope.retire(scope.executionId)
+      return `current authority requires fresh approval for '${payload.call.name}'; retry as a new call`
+    }
+    const outside = pathScope.get(scope.executionId, payload.call)
+    if (outside?.grantForSession === true && outside.proposedGrant !== undefined && outside.parentSessionId === undefined && outside.sessionId !== undefined) {
+      const session = sessions.get(outside.sessionId as SessionId)?.session
+      if (session === undefined) return 'the session grant could not be recorded: session not loaded'
+      try {
+        const primary = outside.projectId === undefined
+          ? undefined
+          : workspaces.getProject(outside.projectId as ProjectId, outside.workspaceId as WorkspaceId | undefined).path
+        await mutateSessionGrants(session, async (current) => {
+          const validated = await validateGrantFolder(outside.proposedGrant, primary, grantPolicy)
+          return mergeGrants(current.roots, [{ path: validated, access: outside.intent }])
+        }, outside.approvalId)
+      } catch (error) {
+        return `the session grant could not be recorded: ${String(error instanceof Error ? error.message : error)}`
+      }
+      // The grant queue wait can outlive the decision above: authority that
+      // narrowed (mode, guard, receipts) while this mutation queued must
+      // still gate the dispatch, so re-run the final check after persisting.
+      const after = await hostAuthority(payload.call, scope)
+      if (after.kind === 'deny') {
+        approvalReceipts.retire(scope.executionId)
+        pathScope.retire(scope.executionId)
+        return after.reason
+      }
+      if (after.kind === 'ask' && !approvalReceipts.covers(payload.call, scope, after.requirements)) {
+        approvalReceipts.retire(scope.executionId)
+        pathScope.retire(scope.executionId)
+        return `current authority requires fresh approval for '${payload.call.name}'; retry as a new call`
+      }
+    }
+    // Admission consumes the evidence. Prepared calls are single-use, so no
+    // authorization state survives dispatch or a later call-id collision.
+    approvalReceipts.retire(scope.executionId)
+    pathScope.retire(scope.executionId)
+    return undefined
   })
 
   /** Last request's manifest per session — the inspector renders this. */
@@ -1875,28 +1948,9 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     // config/allowlist ceiling (zero-exposure modes none; Plan read-safe
     // allowlist only; Explorer none; other children require explicit spawn
     // grant).
-    const workspaceMcpConfig = await mcpStore.loadMcp(workspaceId)
-    let exposed = projected.tools?.filter((schema) => {
-      // A child sees only its ceiling, and never the delegation tool: the
-      // schemas it carries are exactly what its capability line advertises.
-      if (scope?.childOf !== undefined && (schema.name === 'Agent' || !scope.childOf.toolCeiling.includes(schema.name))) return false
-      if (!schema.name.startsWith('mcp__')) return mode.definition.toolExposure.includes(schema.name)
-      const parts = schema.name.split('__')
-      const serverName = parts[1] ?? ''
-      const toolName = parts.slice(2).join('__')
-      const server = workspaceMcpConfig.servers[serverName]
-      if (server === undefined || !server.enabled) return false
-      if (!mcpToolExposed(server.allowedTools, toolName, schema.name)) return false
-      if (mode.definition.toolExposure.length === 0) return false
-      if (scope?.childOf?.definition === 'explorer') return false
-      if (scope?.childOf !== undefined && !scope.childOf.toolCeiling.includes(schema.name)) return false
-      if (mode.definition.id === 'plan') {
-        // readOnlyHint never auto-allows permission; Plan uses a conservative
-        // name heuristic plus the explicit allowlist above for exposure.
-        return /^(read|get|list|search|query|fetch|inspect|describe)/i.test(toolName)
-      }
-      return true
-    }) ?? []
+    const exposureScope = { ...(scope ?? { sessionId: undefined }), workspaceId }
+    const exposureSnapshot = await executionAuthority.snapshot(exposureScope, workspaceId, (projected.tools ?? []).some((schema) => schema.name.startsWith('mcp__')))
+    let exposed = projectExposedSchemas(exposureSnapshot, exposureScope, projected.tools ?? [])
     // Workspace-level instructions load for ANY workspace-scoped session;
     // project instructions join when a project is bound.
     const workspaceInstructions =
@@ -1934,12 +1988,14 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
         if (perTurn.has(name)) continue
         try {
           const loaded = await skills.load(workspaceId, name)
+          projected.assemblySignal?.throwIfAborted()
           perTurn.set(name, { name: loaded.name, instructions: loaded.instructions, hash: loaded.hash })
         } catch {
           // An invalid/missing definition skill surfaces as an omission in
           // the manifest rather than broadening authority.
         }
       }
+      projected.assemblySignal?.throwIfAborted()
       if (perTurn.size > 0) skillSnapshots.set(scope.sessionId, perTurn)
       activeSkills.push(...perTurn.values())
     }
@@ -1968,6 +2024,7 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
       if (checkpoint !== undefined) compaction = { summary: checkpoint.summary, coversSeq: checkpoint.coversSeq }
     }
 
+    projected.assemblySignal?.throwIfAborted()
     const events = session?.events ?? []
     // Attachment bytes are read once per request and cached by the store: the
     // log holds references, and the model needs the content itself.
@@ -1976,6 +2033,7 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
       ? await attachments.load(workspaceId, referenced, { textLimit: limits.attachmentTextLimit })
       : undefined
 
+    projected.assemblySignal?.throwIfAborted()
     // The same grant the tool pipeline resolves, so the model is told exactly
     // the folders its file tools can reach.
     const fileScope = scope !== undefined ? agentScope.run(scope, () => kernel.ctx.tools.currentGrant()) : undefined
@@ -2001,6 +2059,7 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
       pinnedMemory,
       compactionTailTurns: limits.compactionTailTurns,
       budget,
+      ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
       ...(compaction !== undefined ? { compaction } : {}),
       ...(loadedAttachments !== undefined ? { attachments: loadedAttachments } : {}),
       ...(promptOverrides?.base.overridden === true ? { baseSystemOverride: promptOverrides.base.text } : {}),
@@ -2094,18 +2153,14 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
       const wid = workspaceId
         ?? (agentScope.getStore()?.workspaceId as string | undefined)
         ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE) as string
-      const { config } = await dangerousStore.load(wid)
-      return config
+      const { config, hash } = await dangerousStore.load(wid)
+      return { config, hash, revision: hash }
     },
   })
 
   // Out-of-grant file paths: classified last in the rewrite chain (after
   // hooks), forced to an approval unless the executing mode allows them.
   const pathScope = attachPathScopeGuard(kernel.ctx, {
-    exempt: () => {
-      if (options.yolo === true) return true
-      return executingMode().mode.definition.outOfGrant === 'allow'
-    },
     proposeGrant: async (folder) => {
       const scope = agentScope.getStore()
       if (scope?.projectId === undefined) return undefined
@@ -2116,8 +2171,28 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
       }
     },
   })
+  const currentOutsideRequirement = (match: PathScopeMatch, outOfGrant: 'allow' | 'ask' | undefined): boolean => {
+    if (options.yolo === true || outOfGrant === 'allow') return false
+    if (match.projectId === undefined || match.sessionId === undefined) return true
+    const current = match.parentSessionId === undefined
+      ? effectiveGrants(match.sessionId as SessionId, match.projectId as ProjectId, match.workspaceId as WorkspaceId | undefined)
+      : intersectGrants(
+        match.grantSnapshot ?? [],
+        effectiveGrants(match.parentSessionId as SessionId, match.projectId as ProjectId, match.workspaceId as WorkspaceId | undefined),
+      )
+    return classifyTarget({
+      root: workspaces.getProject(match.projectId as ProjectId, match.workspaceId as WorkspaceId | undefined).path,
+      ...(current.length > 0 ? { additionalRoots: current } : {}),
+      ...(deniedRoots !== undefined ? { deniedRoots } : {}),
+    }, match.path, match.intent).kind === 'out-of-grant'
+  }
   const scopeWarningOf = (match: PathScopeMatch): string =>
     `Outside granted folders: ${match.path} (${match.intent === 'write' ? 'write' : 'read'})`
+  kernel.ctx.tools.setAuthorityRetirer((executionId) => {
+    approvalReceipts.retire(executionId)
+    dangerousGuard.retire(executionId)
+    pathScope.retire(executionId)
+  })
   // After authorization settles: drop the match; on allow, authorize exactly
   // that path for this call, and grant the folder to the session first when
   // the approver chose "allow for this session".
@@ -2125,36 +2200,89 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     const scope = agentScope.getStore()
     const match = pathScope.take(exec?.executionId ?? scope?.sessionId, call, allowed)
     if (match === undefined) return undefined
-    if (match.grantForSession === true && match.proposedGrant !== undefined && scope !== undefined && scope.childOf === undefined) {
-      const session = sessions.get(scope.sessionId)?.session
-      if (session === undefined) throw new Error('the session grant could not be recorded: session not loaded')
-      const folder = match.proposedGrant
-      await mutateSessionGrants(session, (current) => mergeGrants(current.roots, [{ path: folder, access: match.intent }]), match.approvalId)
-        .catch((error: unknown) => {
-          throw new Error(`the session grant could not be recorded: ${String(error instanceof Error ? error.message : error)}`)
-        })
-    }
     return [approvedPathOf(match)]
   })
 
+  const hostAuthority = async (call: ToolCall, scope: ApprovalScope): Promise<AuthorityDecision> => {
+    if (scope.workspaceId === undefined || scope.sessionId === undefined || scope.rootSessionId === undefined || scope.executionId === undefined) {
+      return { kind: 'deny', reason: 'required host execution authority scope is missing' }
+    }
+    const workspaceId = scope.workspaceId
+    const sessionId = scope.sessionId
+    const rootSessionId = scope.rootSessionId
+    const executionId = scope.executionId
+    const exposureScope = { ...agentScope.getStore(), workspaceId, sessionId, rootSessionId }
+    try {
+      return await executionAuthority.stableModeRead(exposureScope, workspaceId, async (mode, revision) => {
+        const hardDenial = await executionAuthority.refusal(exposureScope, call.name)
+        const policy = effectivePolicy(mode.permissionDefaults ?? {}, options.yolo === true)
+        const permission = resolvePermission(policy, call.name, { defaultMode: options.defaultMode ?? 'ask' })
+        const requirements: AskRequirement[] = []
+        if (permission === 'ask') requirements.push({ kind: 'tool-policy', subjectFingerprint: createHash('sha256').update(`${call.name}:ask`).digest('hex') })
+        const outside = pathScope.get(executionId, call)
+        if (outside !== undefined && currentOutsideRequirement(outside, mode.outOfGrant)) requirements.push({ kind: 'outside-path', subjectFingerprint: createHash('sha256').update(`${outside.path}:${outside.intent}`).digest('hex') })
+        const guardEvaluation = await dangerousGuard.evaluate(call, workspaceId, {
+          workspaceId,
+          sessionId,
+          rootSessionId,
+          executionId,
+          root: '',
+        })
+        const guard = guardEvaluation.match
+        const guardDenial = guard?.action === 'deny'
+          ? `blocked by Dangerous Commands: matched ${guard.presetId ?? guard.ruleId ?? 'rule'} — ${guard.reason}`
+          : undefined
+        if (guard?.action === 'ask') requirements.push({
+          kind: 'dangerous-command',
+          // Bound to the matched rule/preset identity (id + action + pattern
+          // hash), not the whole config: an unrelated guard edit must not
+          // invalidate a pending question, while a change to this rule does.
+          subjectFingerprint: guardMatchFingerprint(guard),
+        })
+        if (toolRequiresInteraction(call, workspaceId as WorkspaceId, mcpDescriptors)) requirements.push({ kind: 'interaction', subjectFingerprint: createHash('sha256').update(`${workspaceId}:${call.name}:interaction`).digest('hex') })
+        const currentHardDenial = hardDenial ?? guardDenial
+        return composeAuthority({
+          permission,
+          ...(currentHardDenial !== undefined ? { hardDenial: currentHardDenial } : {}),
+          requirements,
+          scopeMode: 'host',
+          facts: {
+            workspaceId,
+            rootSessionId,
+            sessionId,
+            executionId,
+            callFingerprint: approvalCallFingerprint(call),
+            modeRevision: revision,
+            guardRevision: guardEvaluation.revision,
+            guardHash: guardEvaluation.hash,
+          },
+        })
+      })
+    } catch (error) {
+      return { kind: 'deny', reason: String(error instanceof Error ? error.message : error) }
+    }
+  }
+
   const approvalHandle: ApprovalHandle = attachApproval(kernel.ctx, {
-    // Live permission control, scoped to the executing ROOT's own mode. The
-    // selected mode is the single policy source; host restrictions and the
-    // mode's exposure ceiling are enforced separately at the gate.
-    policy: () => effectivePolicy(executingMode().mode.definition.permissionDefaults, options.yolo === true),
+    authorityResolver: hostAuthority,
+    receiptRegistry: approvalReceipts,
     defaultMode: options.defaultMode ?? 'ask',
     expiryMs: limits.approvalExpiryMs,
     // The scope is the call's own (stamped on re-evaluation), never whatever
     // happens to be ambient when a settings change re-checks pending asks.
     forceAsk: (call, scope) => {
       const outside = pathScope.get(scope.executionId ?? scope.sessionId, call)
-      return (outside !== undefined && !outside.exempt) ||
-        dangerousGuard.getMatch(call, scope.executionId)?.action === 'ask' ||
+      const mode = scope.workspaceId !== undefined ? rootModeOf({
+        sessionId: scope.sessionId as SessionId,
+        ...(scope.rootSessionId !== undefined ? { rootSessionId: scope.rootSessionId as SessionId } : {}),
+        workspaceId: scope.workspaceId as WorkspaceId,
+      }, scope.workspaceId as WorkspaceId).mode.definition : undefined
+      return (outside !== undefined && currentOutsideRequirement(outside, mode?.outOfGrant)) ||
         toolRequiresInteraction(call, scope.workspaceId as WorkspaceId | undefined, mcpDescriptors)
     },
     requestDetails: (call, scope) => {
       const outside = pathScope.get(scope?.executionId ?? agentScope.getStore()?.sessionId, call)
-      if (outside === undefined || outside.exempt) return undefined
+      if (outside === undefined) return undefined
       return {
         scopeWarning: scopeWarningOf(outside),
         ...(outside.proposedGrant !== undefined ? { proposedGrant: outside.proposedGrant, proposedAccess: outside.intent } : {}),
@@ -2181,7 +2309,7 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
         const definitionName = scope.childOf?.definition
         const principalId = sessionPrincipals.get(scope.sessionId)
         const outside = pathScope.get(lifecycle.executionId ?? scope.sessionId, call)
-        const scopeWarning = outside !== undefined && !outside.exempt ? scopeWarningOf(outside) : undefined
+        const scopeWarning = outside !== undefined && currentOutsideRequirement(outside, executingMode().mode.definition.outOfGrant) ? scopeWarningOf(outside) : undefined
         const proposedGrant = scopeWarning !== undefined ? outside?.proposedGrant : undefined
         const proposedAccess = proposedGrant !== undefined ? outside?.intent : undefined
         pending.set(approvalId, {
@@ -2337,6 +2465,8 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     adoptMode,
     stampRootMode,
     rootModeOf,
+    admissionExposureCeiling,
+    turnTerminal,
     agentDefinitions,
     childExecutor,
     childModelFor,
@@ -2409,7 +2539,9 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     if (recovered > 0) console.log(`web: recovered ${recovered} child relationship(s) from storage`)
   }
 
+  let shuttingDown = false
   const server = createServer((req, res) => {
+    if (shuttingDown) { res.writeHead(503); res.end('host shutting down'); return }
     handle(req, res, deps).catch((error: unknown) => {
       if (!res.headersSent) {
         res.writeHead(error instanceof ScopeError ? 404 : 500, { 'content-type': 'application/json' })
@@ -2439,31 +2571,48 @@ function mcpToolExposed(allowed: readonly string[] | undefined, toolName: string
     ? await publishOperatorChannel(options.home, { url: `http://${publicHost}:${address.port}`, key: deps.auth.armOperatorKey() })
     : undefined
 
+  let closePromise: Promise<void> | undefined
   return {
     url: `http://${publicHost}:${address.port}`,
     port: address.port,
     kernel,
     auth: deps.auth,
-    close: async () => {
+    close: () => closePromise ??= (async () => {
+      shuttingDown = true
+      processes.closeAdmission()
+      kernel.ctx.agents.closeAdmission()
+      for (const entry of sessions.values()) entry.agent.stop()
       mcpHostClosing = true
-      await retireOperatorChannel?.()
-      for (const key of mcpConnecting.keys()) mcpCancelled.add(key)
-      await Promise.allSettled([...mcpConnecting.values()])
-      // SSE connections never drain on their own — a browser holds its
-      // EventSource open indefinitely — so close() would hang on them.
-      // Force every connection down first, then wait for the listener.
-      server.closeAllConnections()
-      // PTYs are children of this process: leaving them running would orphan
-      // a shell per terminal every time the host restarts.
-      terminals.disposeAll()
-      await new Promise<void>((resolve) => server.close(() => resolve()))
-      for (const client of mcpClients.values()) await client.disconnect()
-      mcpClients.clear()
-      await ownerLock.release()
-      for (const dispose of disposers.values()) dispose()
-      disposers.clear()
-      await kernel.stop()
-    },
+      const agentDrivers = kernel.ctx.agents
+      let teardownSafe = true
+      await runCleanup([
+        async () => { await retireOperatorChannel?.() },
+        async () => {
+          for (const key of mcpConnecting.keys()) mcpCancelled.add(key)
+          await Promise.allSettled([...mcpConnecting.values()])
+        },
+        () => { server.closeAllConnections(); terminals.disposeAll() },
+        () => agentDrivers.stopAll(),
+        () => processes.disposeAll(),
+        async () => { try { await boundedCleanup(() => checkpoints.close()) } catch (error) { teardownSafe = false; throw error } },
+        async () => { try { await boundedCleanup(() => processEvents.flushAll()) } catch (error) { teardownSafe = false; throw error } },
+        () => new Promise<void>((resolve, reject) => server.close(error => error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve())),
+        async () => {
+          const results = await Promise.allSettled([...mcpClients.values()].map(client => client.disconnect()))
+          mcpClients.clear()
+          const errors = results.filter(result => result.status === 'rejected')
+          if (errors.length) throw new AggregateError(errors, 'MCP teardown failed')
+        },
+        () => {
+          const errors: unknown[] = []
+          for (const dispose of disposers.values()) { try { dispose() } catch (error) { errors.push(error) } }
+          disposers.clear()
+          if (errors.length) throw new AggregateError(errors, 'listener teardown failed')
+        },
+        async () => { try { await boundedCleanup(() => kernel.stop()) } catch (error) { teardownSafe = false; throw error } },
+        () => { if (!teardownSafe || !agentDrivers.persistenceSafe) throw new Error('ownership retained: canonical writers unresolved'); return ownerLock.release() },
+      ])
+    })(),
   }
 }
 
@@ -2531,6 +2680,9 @@ interface HandlerDeps {
   readonly adoptMode: (workspaceId: WorkspaceId, modeId: string) => Promise<ResolvedMode>
   readonly stampRootMode: (session: Session, resolved: ResolvedMode) => Extract<SessionEvent, { type: 'session/mode' }>
   readonly rootModeOf: (scope: { readonly sessionId: SessionId; readonly rootSessionId?: SessionId }, workspaceId: WorkspaceId) => { mode: ResolvedMode; revision: number }
+  readonly admissionExposureCeiling: (rootSessionId: SessionId, workspaceId: WorkspaceId, definition: string, candidates: readonly string[]) => Promise<readonly string[]>
+  /** Whether the root's latest durable turn is terminal; admission reads this because `agent.busy` lags the durable append. */
+  readonly turnTerminal: (session: Session) => boolean
   readonly agentDefinitions: AgentDefinitionService
   readonly childExecutor: ChildExecutor
   /** Resolves a child's pair: spawn choice > role definition > parent session. */
@@ -2706,7 +2858,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: HandlerDe
     return
   }
   if (req.method === 'GET') {
-    await serveStatic(res, pathname, deps.staticDir)
+    await serveStatic(res, pathname, deps.staticDir, req.headers['accept-encoding'])
     return
   }
   res.writeHead(405, { 'content-type': 'application/json' })
@@ -3158,6 +3310,9 @@ async function handleApi(
           // session's log (their only reader) is being deleted.
           await deps.processes.dispose(entry.session.id)
           await deps.childExecutor.cancelAllOfRoot(entry.session.id)
+          for (const child of await deps.childExecutor.childrenOfRoot(entry.session.id, wsId)) {
+            await deps.childExecutor.cancel(wsId, child.childSessionId)
+          }
           deps.sessions.delete(entry.session.id)
           deps.kernel.ctx.agents.forget(entry.session.id)
           await deps.kernel.ctx.sessions.delete(entry.session.id)
@@ -3288,13 +3443,17 @@ async function handleApi(
             workspaceId: wsId,
             parentSessionId: parent.session.id,
             definition: resolved.definition,
+            admissionResolver: ({ parentSessionId, workspaceId, definition, candidates }) => deps.admissionExposureCeiling(parentSessionId, workspaceId, definition, candidates),
             packet: task,
             ...(inheritedContext !== undefined ? { inherit: 'brief' as const, inheritedContext } : {}),
             ...(parent.projectId !== undefined ? { projectId: parent.projectId } : {}),
             ...(Array.isArray(body['grantTools']) ? { grantTools: (body['grantTools'] as unknown[]).map(String) } : {}),
             ...(model !== undefined ? { model } : {}),
             grants: deps.grants.effective(parent.session.id, parent.projectId, wsId),
-          }, () => parent.agent.busy, {
+            // `agent.busy` lags the durable log: it flips idle only after the
+            // turn's terminal append settles, so a spawn offered right after
+            // turn/end must consult the events, not just the busy flag.
+          }, () => parent.agent.busy && !deps.turnTerminal(parent.session), {
             ...(typeof body['parentTurnId'] === 'string' ? { turnId: body['parentTurnId'] } : {}),
             keepOpen: body['keepOpen'] === true,
           })
@@ -3932,7 +4091,12 @@ async function handleApi(
             send(409, { error: 'session is running; stop it before deleting' })
             return
           }
+          await deps.processes.dispose(entry.session.id)
+          const ownerWorkspace = entry.workspaceId
           await deps.childExecutor.cancelAllOfRoot(entry.session.id)
+          for (const child of await deps.childExecutor.childrenOfRoot(entry.session.id, ownerWorkspace)) {
+            await deps.childExecutor.cancel(ownerWorkspace, child.childSessionId)
+          }
           deps.sessions.delete(entry.session.id)
           deps.kernel.ctx.agents.forget(entry.session.id)
           await deps.kernel.ctx.sessions.delete(entry.session.id)
@@ -4950,12 +5114,13 @@ async function handleApi(
 
     // ── read-only project browsing (workbench Files) ───────────
     // Git is read-only status and diff for the workbench Git view.
-    const wsProjectFilesMatch = /^\/api\/workspaces\/([^/]+)\/projects\/([^/]+)\/(files|file|search|git)$/.exec(pathname)
+    const wsProjectFilesMatch = /^\/api\/workspaces\/([^/]+)\/projects\/([^/]+)\/(files|file|search|git|media)$/.exec(pathname)
     if (wsProjectFilesMatch !== null) {
       const wsId = decodeURIComponent(wsProjectFilesMatch[1] ?? '') as WorkspaceId
       requireWorkspace(deps, wsId, false)
       const project = deps.workspaces.getProject(decodeURIComponent(wsProjectFilesMatch[2] ?? '') as ProjectId, wsId)
-      if (req.method !== 'GET') {
+      // HEAD joins GET: a media element asks for headers before it streams.
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
         send(405, { error: 'method not allowed' })
         return
       }
@@ -4966,6 +5131,10 @@ async function handleApi(
           send(200, target === ''
             ? await gitStatus(project.path, deps.deniedRoots)
             : await gitDiff(project.path, target, deps.deniedRoots))
+          return
+        }
+        if (kind === 'media') {
+          await serveProjectMedia(project.path, target, req, res, deps.deniedRoots)
           return
         }
         if (kind === 'search') {
@@ -5220,7 +5389,7 @@ async function handleApi(
           const result = await deps.dangerousStore.save(wid, config as never, expectedHash)
           // Invalidate guard cache so re-evaluation reflects the new config.
           deps.dangerousGuard.clearForWorkspace(wid)
-          deps.approvalHandle.reevaluate({ workspaceId: wid })
+          await deps.approvalHandle.reevaluate({ workspaceId: wid })
           send(200, result)
         } catch (error) {
           const msg = String(error instanceof Error ? error.message : error)
@@ -5253,7 +5422,7 @@ async function handleApi(
             const hasFile = await deps.dangerousStore.hasWorkspaceFile(ws.id)
             if (!hasFile) {
               deps.dangerousGuard.clearForWorkspace(ws.id)
-              deps.approvalHandle.reevaluate({ workspaceId: ws.id })
+              await deps.approvalHandle.reevaluate({ workspaceId: ws.id })
             }
           }
           send(200, result)
@@ -6244,10 +6413,6 @@ export function extractModelIds(parsed: unknown): string[] {
 
 // ── shared helpers ─────────────────────────────────────────────
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
 const MAX_BODY_BYTES = 1_000_000
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -6286,6 +6451,41 @@ async function readBytes(req: IncomingMessage, maxBytes: number): Promise<Buffer
     chunks.push(chunk as Buffer)
   }
   return Buffer.concat(chunks)
+}
+
+/**
+ * The replay profile a fresh SSE client needs: `context/body` payloads (fetched
+ * on demand by hash) are dropped, content chunks of steps that later carry a
+ * durable `assistant/message` are dropped, and reasoning chunks fold to one
+ * event per step. Mirrors the client's `compactClientEvents` so the wire
+ * carries exactly what the browser would keep, instead of every raw chunk of
+ * a long session's history on each fresh connect. Live events after this
+ * frame stream raw and the client still compacts them, so both paths agree.
+ */
+function compactReplayEvents(events: readonly SessionEvent[]): SessionEvent[] {
+  const finalizedSteps = new Set<string>()
+  for (const event of events) {
+    if (event.type === 'assistant/message' && event.stepId !== undefined) finalizedSteps.add(event.stepId)
+  }
+  const compacted: SessionEvent[] = []
+  const folded = new Map<string, number>()
+  for (const event of events) {
+    if (event.type === 'context/body') continue
+    if (event.type === 'assistant/chunk' && event.stepId !== undefined) {
+      if (finalizedSteps.has(event.stepId) && event.thinking !== true) continue
+      if (event.thinking === true) {
+        const at = folded.get(event.stepId)
+        if (at !== undefined) {
+          const previous = compacted[at] as Extract<SessionEvent, { type: 'assistant/chunk' }>
+          compacted[at] = { ...previous, delta: `${previous.delta}${event.delta}` }
+          continue
+        }
+        folded.set(event.stepId, compacted.length)
+      }
+    }
+    compacted.push(event)
+  }
+  return compacted
 }
 
 /** Write one SSE `data:` frame and flush it. */
@@ -6444,7 +6644,7 @@ function reconcileInterruptedProcesses(entry: SessionEntry, deps: HandlerDeps): 
   }
   for (const event of session.events) {
     if (event.type !== 'process/start') continue
-    if (closed.has(event.processId) || deps.processes.isRunning(session.id, event.processId)) continue
+    if (closed.has(event.processId) || deps.processes.read(session.id, event.processId) !== undefined) continue
     session.append({ type: 'process/exit', processId: event.processId, exitCode: null, termination: 'interrupted', durationMs: 0 })
   }
 }
@@ -6477,7 +6677,11 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   const latest = session.events.at(-1)?.seq ?? 0
   const earliest = session.events[0]?.seq ?? 1
   const resumable = Number.isSafeInteger(cursor) && cursor >= earliest - 1 && cursor <= latest
-  const replay = resumable ? session.events.filter((event) => event.seq > cursor) : [...session.events]
+  // Both replay shapes are compacted: a fresh snapshot otherwise ships every
+  // raw chunk of the session's history, and a long-disconnect resume replays
+  // the same bulk. Sequence numbers stay untouched so the client's seen-cursor
+  // filtering and its own compaction keep working unchanged.
+  const replay = compactReplayEvents(resumable ? session.events.filter((event) => event.seq > cursor) : [...session.events])
   writeFrame(res, { kind: resumable ? 'resume' : 'snapshot', events: replay }, latest)
   for (const [approvalId, waiting] of deps.pending) {
     if (waiting.sessionId === session.id || waiting.parentSessionId === session.id) {
@@ -6561,8 +6765,76 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   req.once('close', () => settle(false))
 }
 
+/**
+ * Stream one project file as renderable media (image, audio, video) to the
+ * paired browser. The type is sniffed — images must match their magic bytes,
+ * audio and video may match by extension — and anything else is 404 rather
+ * than bytes the caller would have to interpret. `Range` is honoured so
+ * audio and video can seek; the whole body is capped at {@link MAX_MEDIA_BYTES}.
+ */
+async function serveProjectMedia(root: string, rawPath: string, req: IncomingMessage, res: ServerResponse, deniedRoots?: readonly string[]): Promise<void> {
+  const deny = (status: number, message: string): void => {
+    res.writeHead(status, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: message }))
+  }
+  let media: Awaited<ReturnType<typeof classifyProjectMedia>>
+  try {
+    media = await classifyProjectMedia(root, rawPath, deniedRoots)
+  } catch (error) {
+    deny(400, error instanceof ProjectFileError ? error.message : 'path must be a file inside this project')
+    return
+  }
+  if (media === null) {
+    deny(404, 'no viewable media at this path')
+    return
+  }
+  const resolved = await resolveProjectMediaPath(root, rawPath, deniedRoots)
+  if (resolved === null) {
+    deny(404, 'no viewable media at this path')
+    return
+  }
+  const baseHeaders: Record<string, string | number> = {
+    'content-type': media.mediaType,
+    'accept-ranges': 'bytes',
+    // The path is the only identity a project file has, and the bytes behind
+    // it can change; a stale media element must revalidate, not replay.
+    'cache-control': 'private, no-cache',
+    'x-content-type-options': 'nosniff',
+  }
+  const range = req.headers.range
+  if (range === undefined) {
+    res.writeHead(200, { ...baseHeaders, 'content-length': media.size })
+    if (req.method === 'HEAD') { res.end(); return }
+    const stream = createReadStream(resolved.abs)
+    stream.on('error', () => { res.destroy() })
+    await new Promise<void>((resolve) => stream.pipe(res).on('close', resolve))
+    return
+  }
+  // A single `bytes=first-last` (or open-ended) range; the media elements
+  // never need more than one, and a syntactic refusal reads better than
+  // silently ignoring the header.
+  const match = /^bytes=(\d*)-(\d*)$/.exec(range.trim())
+  const first = match === null ? undefined : match[1] === '' ? undefined : Number(match[1])
+  const last = match === null || match[2] === '' ? undefined : Number(match[2])
+  if (match === null || (first === undefined && last === undefined) || (first !== undefined && first >= media.size) || (last !== undefined && last >= media.size && first === undefined)) {
+    res.writeHead(416, { 'content-range': `bytes */${media.size}` })
+    res.end()
+    return
+  }
+  const start = first ?? Math.max(0, media.size - (last ?? 0))
+  const end = last !== undefined && first !== undefined ? Math.min(last, media.size - 1) : media.size - 1
+  res.writeHead(206, { ...baseHeaders, 'content-range': `bytes ${start}-${end}/${media.size}`, 'content-length': end - start + 1 })
+  if (req.method === 'HEAD') { res.end(); return }
+  const stream = createReadStream(resolved.abs, { start, end })
+  stream.on('error', () => { res.destroy() })
+  await new Promise<void>((resolve) => stream.pipe(res).on('close', resolve))
+}
+
+/** Hashed asset paths are safe to cache forever; everything else revalidates per request. */
+const IMMUTABLE_ASSET_PATH = /^\/assets\//
+
 /** Serve the built client: `/` (and unknown paths) fall back to index.html for the router. */
-async function serveStatic(res: ServerResponse, pathname: string, staticDir: string): Promise<void> {
+async function serveStatic(res: ServerResponse, pathname: string, staticDir: string, acceptEncoding: string | undefined): Promise<void> {
   const relative = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '')
   const abs = path.resolve(staticDir, relative)
   if (abs !== path.resolve(staticDir) && !abs.startsWith(`${path.resolve(staticDir)}${path.sep}`)) {
@@ -6570,14 +6842,34 @@ async function serveStatic(res: ServerResponse, pathname: string, staticDir: str
     res.end(JSON.stringify({ error: 'forbidden' }))
     return
   }
+  // Precompressed twins (.br/.gz, emitted at build time) stream as-is when the
+  // client's Accept-Encoding allows: no per-request compression on the hot path.
+  const encoding = acceptEncoding !== undefined && acceptEncoding.includes('br')
+    ? { extension: '.br', name: 'br' }
+    : acceptEncoding !== undefined && acceptEncoding.includes('gzip')
+      ? { extension: '.gz', name: 'gzip' }
+      : undefined
   try {
-    const content = await fs.readFile(abs)
+    let content: Buffer
+    const headers: Record<string, string> = {}
+    if (encoding !== undefined) {
+      try {
+        content = await fs.readFile(`${abs}${encoding.extension}`)
+        headers['content-encoding'] = encoding.name
+        headers['vary'] = 'Accept-Encoding'
+      } catch {
+        // No precompressed twin (dev tree, non-build file): identity bytes.
+        content = await fs.readFile(abs)
+      }
+    } else {
+      content = await fs.readFile(abs)
+    }
     // The shell and the service worker must revalidate so a rebuilt client takes over promptly.
     const revalidate = relative === 'index.html' || relative === 'sw.js'
-    res.writeHead(200, {
-      'content-type': CONTENT_TYPES[path.extname(abs)] ?? 'application/octet-stream',
-      ...(revalidate ? { 'cache-control': 'no-cache' } : {}),
-    })
+    headers['content-type'] = CONTENT_TYPES[path.extname(abs)] ?? 'application/octet-stream'
+    if (revalidate) headers['cache-control'] = 'no-cache'
+    else if (IMMUTABLE_ASSET_PATH.test(pathname)) headers['cache-control'] = 'public, max-age=31536000, immutable'
+    res.writeHead(200, headers)
     res.end(content)
   } catch {
     // Unknown non-API path: serve the app shell so client-side state stands up.

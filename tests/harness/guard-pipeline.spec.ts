@@ -3,8 +3,8 @@ import { Kernel } from '../../src/kernel/registry.ts'
 import { SessionsService } from '../../src/harness/session/service.ts'
 import { ToolsService } from '../../src/harness/tools/service.ts'
 import { AgentsService } from '../../src/harness/agent/service.ts'
-import { attachApproval } from '../../src/harness/approval/policy.ts'
-import { attachDangerousCommandGuard } from '../../src/harness/guard/guard.ts'
+import { approvalCallFingerprint, attachApproval, createApprovalReceiptRegistry } from '../../src/harness/approval/policy.ts'
+import { attachDangerousCommandGuard, guardMatchFingerprint } from '../../src/harness/guard/guard.ts'
 import { DEFAULT_CONFIG } from '../../src/harness/guard/defaults.ts'
 import type { DangerousCommandsConfig } from '../../src/harness/guard/types.ts'
 import type { ToolCall } from '../../src/harness/llm/types.ts'
@@ -28,6 +28,8 @@ const readTool: ToolDefinition = {
     return `read: ${String(args['path'])}`
   },
 }
+
+const DANGEROUS = 'git reset --hard HEAD~1'
 
 function bashCall(command: string, id = 'call-1'): ToolCall {
   return { id, name: 'Bash', args: { command } }
@@ -204,6 +206,48 @@ describe('guard pipeline', () => {
     await kernel.stop()
   })
 
+  it.each([
+    ['safe to deny', 'echo harmless', 'rm -rf /', false, false],
+    ['safe to ask', 'echo harmless', 'git reset --hard HEAD~1', true, true],
+    ['dangerous to safe', 'rm -rf /', 'echo rewritten-safe', false, true],
+  ] as const)('evaluates the finalized Bash command after a later-registered rewrite: %s', async (_label, original, rewritten, shouldAsk, shouldRun) => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(SessionsService)
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.plugin(AgentsService)
+    const session = kernel.ctx.sessions.create()
+    const executed: string[] = []
+    kernel.ctx.tools.register({
+      ...bashTool,
+      async execute(args) {
+        const command = String(args['command'])
+        executed.push(command)
+        return `ran: ${command}`
+      },
+    })
+    const guard = attachDangerousCommandGuard(kernel.ctx, { configSource: () => DEFAULT_CONFIG })
+    let asks = 0
+    attachApproval(kernel.ctx, {
+      policy: { Bash: 'allow' },
+      forceAsk: (call, scope) => guard.getMatch(call, scope.executionId)?.action === 'ask',
+      askUser: async () => { asks += 1; return true },
+    })
+    // Real registration order: guard attaches first, rewrite hook arrives later.
+    kernel.ctx.on('tools/rewrite', async (payload, next) => next({
+      call: { ...payload.call, args: { ...payload.call.args, command: rewritten } },
+      exec: payload.exec,
+    }))
+
+    let result: { ok: boolean; output: string } | undefined
+    await agentScope.run({ sessionId: session.id }, async () => {
+      result = await kernel.ctx.tools.execute(bashCall(original))
+    })
+    expect(asks).toBe(shouldAsk ? 1 : 0)
+    expect(result?.ok).toBe(shouldRun)
+    expect(executed).toEqual(shouldRun ? [rewritten] : [])
+    await kernel.stop()
+  })
+
   it('an ask match never leaks to another execution reusing the model call id', async () => {
     const kernel = new Kernel()
     kernel.ctx.plugin(SessionsService)
@@ -231,6 +275,83 @@ describe('guard pipeline', () => {
     })
     // Only the dangerous command asked; the innocent one inherited nothing.
     expect(asked).toEqual(['git reset --hard HEAD~1'])
+    await kernel.stop()
+  })
+
+  it('a stale ask match cannot survive invalidation: re-evaluating without a match, or with unavailable config, drops all evidence', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(SessionsService)
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.plugin(AgentsService)
+    let source: () => DangerousCommandsConfig = () => DEFAULT_CONFIG
+    const guard = attachDangerousCommandGuard(kernel.ctx, { configSource: () => source() })
+    const call = bashCall(DANGEROUS)
+    const exec = { root: '', executionId: 'exec-1' } as never
+
+    const asked = await guard.evaluate(call, 'ws', exec)
+    expect(asked.match?.action).toBe('ask')
+    // Presentation evidence is reachable by call identity and by execution.
+    expect(guard.getMatch(call)?.action).toBe('ask')
+    expect(guard.getMatch(call, 'exec-1')?.action).toBe('ask')
+
+    // Config invalidated to "no longer matches": the old match must not linger.
+    source = () => ({ ...DEFAULT_CONFIG, presets: { ...DEFAULT_CONFIG.presets, gitDestructive: 'off' } })
+    expect((await guard.evaluate(call, 'ws', exec)).match).toBeNull()
+    expect(guard.getMatch(call)).toBeNull()
+    expect(guard.getMatch(call, 'exec-1')).toBeNull()
+
+    // Re-arm, then make the config unavailable: evaluation fails closed AND clears.
+    source = () => DEFAULT_CONFIG
+    await guard.evaluate(call, 'ws', exec)
+    expect(guard.getMatch(call)?.action).toBe('ask')
+    source = () => { throw new Error('config offline') }
+    await expect(guard.evaluate(call, 'ws', exec)).rejects.toThrow(/fail-closed/)
+    expect(guard.getMatch(call)).toBeNull()
+    expect(guard.getMatch(call, 'exec-1')).toBeNull()
+    await kernel.stop()
+  })
+
+  it('the ask requirement is scoped to the matched rule: unrelated edits keep a receipt valid, edits to the matched rule invalidate it', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(SessionsService)
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.plugin(AgentsService)
+    let config: DangerousCommandsConfig = DEFAULT_CONFIG
+    const guard = attachDangerousCommandGuard(kernel.ctx, { configSource: () => config })
+    const registry = createApprovalReceiptRegistry()
+    const call = bashCall(DANGEROUS)
+    const scope = {
+      sessionId: 's1' as never, rootSessionId: 's1' as never, turnId: undefined,
+      executionId: 'exec-1' as never, workspaceId: 'ws',
+    }
+    const requirementOf = async (): Promise<{ kind: 'dangerous-command'; subjectFingerprint: string; version?: string | number }> => {
+      const evaluation = await guard.evaluate(call, 'ws', { root: '', executionId: 'exec-1' } as never)
+      expect(evaluation.match?.action).toBe('ask')
+      return { kind: 'dangerous-command', subjectFingerprint: guardMatchFingerprint(evaluation.match!) }
+    }
+
+    const shown = await requirementOf()
+    registry.issue(call, scope, [shown])
+    expect(registry.receiptFor(call, scope)?.callFingerprint).toBe(approvalCallFingerprint(call))
+
+    // Unrelated preset edit: the whole-config hash changes, the matched rule does not.
+    const before = (await guard.evaluate(call, 'ws', { root: '', executionId: 'exec-1' } as never)).hash
+    config = { ...DEFAULT_CONFIG, presets: { ...DEFAULT_CONFIG.presets, dbDestructive: 'off' } }
+    expect((await guard.evaluate(call, 'ws', { root: '', executionId: 'exec-1' } as never)).hash).not.toBe(before)
+    expect(registry.covers(call, scope, [await requirementOf()])).toBe(true)
+
+    // An unrelated custom rule appended: still the same matched preset.
+    config = { ...config, customRules: [{ id: 'cr-x', pattern: 'unrelated-thing', isRegex: false, action: 'deny' }] }
+    expect(registry.covers(call, scope, [await requirementOf()])).toBe(true)
+
+    // A custom rule that now claims the command (custom rules match first) is a different identity.
+    config = { ...config, customRules: [{ id: 'cr-claim', pattern: 'git reset', isRegex: false, action: 'ask' }] }
+    expect(registry.covers(call, scope, [await requirementOf()])).toBe(false)
+
+    // Same custom rule id, edited pattern that still matches: identity changes.
+    registry.issue(call, scope, [await requirementOf()])
+    config = { ...config, customRules: [{ id: 'cr-claim', pattern: 'git reset --hard', isRegex: false, action: 'ask' }] }
+    expect(registry.covers(call, scope, [await requirementOf()])).toBe(false)
     await kernel.stop()
   })
 })

@@ -51,7 +51,7 @@ describe('agent runs panel', () => {
 
   it('follows runs once a conversation is open, with no delegation form', () => {
     const html = renderToStaticMarkup(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />)
-    expect(html).toContain('Active · 0/6')
+    expect(html).toContain('Active · 0')
     expect(html).toContain('Ended · 0')
     expect(html).not.toContain('Spawn')
   })

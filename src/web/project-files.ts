@@ -13,6 +13,10 @@ import { resolveGrantedPath } from '../capabilities/fs/tools.ts'
 export const MAX_FILE_BYTES = 1024 * 1024
 /** Bytes sniffed for a NUL byte to classify a file as binary. */
 const BINARY_SNIFF_BYTES = 8 * 1024
+/** Largest media file served whole; bigger media answers 413 rather than a partial. */
+export const MAX_MEDIA_BYTES = 64 * 1024 * 1024
+/** Bytes read to identify a file's real media type. */
+const MEDIA_SNIFF_BYTES = 64
 
 export interface ProjectEntry {
   readonly name: string
@@ -182,4 +186,93 @@ export async function readProjectFile(root: string, raw: string, deniedRoots?: r
   } finally {
     await handle.close()
   }
+}
+
+/** Media types the viewer renders itself: images, audio and video. */
+export type ProjectMediaKind = 'image' | 'audio' | 'video'
+
+export interface ProjectMedia {
+  readonly path: string
+  readonly kind: ProjectMediaKind
+  /** The sniffed media type, never the caller's spelling of it. */
+  readonly mediaType: string
+  readonly size: number
+}
+
+/**
+ * Leading bytes that prove what a file really is. Extensions are only ever a
+ * hint for audio and video, whose containers carry no single magic string the
+ * browser cannot itself re-derive; an image must match its signature.
+ */
+const MEDIA_SIGNATURES: readonly { readonly mediaType: string; readonly kind: ProjectMediaKind; readonly test: (bytes: Buffer) => boolean }[] = [
+  { mediaType: 'image/png', kind: 'image', test: (b) => b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
+  { mediaType: 'image/jpeg', kind: 'image', test: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  { mediaType: 'image/gif', kind: 'image', test: (b) => b.subarray(0, 6).toString('latin1') === 'GIF87a' || b.subarray(0, 6).toString('latin1') === 'GIF89a' },
+  { mediaType: 'image/webp', kind: 'image', test: (b) => b.subarray(0, 4).toString('latin1') === 'RIFF' && b.subarray(8, 12).toString('latin1') === 'WEBP' },
+  { mediaType: 'image/bmp', kind: 'image', test: (b) => b[0] === 0x42 && b[1] === 0x4d },
+  { mediaType: 'image/avif', kind: 'image', test: (b) => b.subarray(4, 12).toString('latin1') === 'ftypavif' },
+  { mediaType: 'image/heic', kind: 'image', test: (b) => b.subarray(4, 12).toString('latin1') === 'ftypheic' || b.subarray(4, 12).toString('latin1') === 'ftypheix' },
+  { mediaType: 'image/svg+xml', kind: 'image', test: (b) => /^\s*<\?xml|^\s*<svg/i.test(b.toString('utf8')) },
+]
+
+/** Extensions browsers can play, per kind. The bytes still decide for images. */
+const MEDIA_EXTENSIONS: Readonly<Record<string, { readonly kind: ProjectMediaKind; readonly mediaType: string }>> = {
+  mp3: { kind: 'audio', mediaType: 'audio/mpeg' },
+  wav: { kind: 'audio', mediaType: 'audio/wav' },
+  ogg: { kind: 'audio', mediaType: 'audio/ogg' },
+  oga: { kind: 'audio', mediaType: 'audio/ogg' },
+  m4a: { kind: 'audio', mediaType: 'audio/mp4' },
+  aac: { kind: 'audio', mediaType: 'audio/aac' },
+  flac: { kind: 'audio', mediaType: 'audio/flac' },
+  opus: { kind: 'audio', mediaType: 'audio/ogg' },
+  weba: { kind: 'audio', mediaType: 'audio/webm' },
+  mp4: { kind: 'video', mediaType: 'video/mp4' },
+  webm: { kind: 'video', mediaType: 'video/webm' },
+  mov: { kind: 'video', mediaType: 'video/quicktime' },
+  mkv: { kind: 'video', mediaType: 'video/x-matroska' },
+  ogv: { kind: 'video', mediaType: 'video/ogg' },
+}
+
+/** What the leading bytes say the file is, or null when none matches. */
+export function sniffProjectMedia(bytes: Buffer): { kind: ProjectMediaKind; mediaType: string } | null {
+  return MEDIA_SIGNATURES.find((signature) => signature.test(bytes)) ?? null
+}
+
+/** The media a path's extension names, or null for everything else. */
+export function mediaFromExtension(path: string): { kind: ProjectMediaKind; mediaType: string } | null {
+  return MEDIA_EXTENSIONS[path.split('.').pop()?.toLowerCase() ?? ''] ?? null
+}
+
+/**
+ * Classify one project file as renderable media without reading its body:
+ * images by magic bytes, audio and video by extension. Anything else —
+ * including a file whose bytes prove it is not what its name claimed — is
+ * null, and the caller answers 404 rather than guessing.
+ */
+export async function classifyProjectMedia(root: string, raw: string, deniedRoots?: readonly string[]): Promise<ProjectMedia | null> {
+  const { abs, rel } = await resolve(root, raw, deniedRoots)
+  const stat = await fs.stat(abs).catch(() => null)
+  if (stat === null || !stat.isFile() || stat.size > MAX_MEDIA_BYTES) return null
+  const handle = await fs.open(abs, 'r')
+  try {
+    const buffer = Buffer.alloc(Math.min(MEDIA_SNIFF_BYTES, stat.size))
+    const { bytesRead } = stat.size > 0 ? await handle.read(buffer, 0, buffer.length, 0) : { bytesRead: 0 }
+    const head = buffer.subarray(0, bytesRead)
+    const sniffed = sniffProjectMedia(head)
+    if (sniffed !== null) return { path: rel, size: stat.size, ...sniffed }
+    // An image extension without the bytes to prove it is not the image.
+    const byExtension = mediaFromExtension(rel)
+    if (byExtension !== null && byExtension.kind !== 'image') return { path: rel, size: stat.size, ...byExtension }
+    return null
+  } finally {
+    await handle.close()
+  }
+}
+
+/** Absolute path of a contained project file, for a stream the route pipes. */
+export async function resolveProjectMediaPath(root: string, raw: string, deniedRoots?: readonly string[]): Promise<{ abs: string; rel: string; size: number } | null> {
+  const { abs, rel } = await resolve(root, raw, deniedRoots)
+  const stat = await fs.stat(abs).catch(() => null)
+  if (stat === null || !stat.isFile() || stat.size > MAX_MEDIA_BYTES) return null
+  return { abs, rel, size: stat.size }
 }

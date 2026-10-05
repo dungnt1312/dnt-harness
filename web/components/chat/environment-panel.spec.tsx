@@ -48,13 +48,15 @@ async function render(props: Base): Promise<void> {
 
 const startEvents = [ev('process/start', { processId: 'p1', command: 'dev', cwd: 'x' })]
 
-it('renders collapsed git chips when nothing is live', async () => {
+it('renders the collapsed branch line without diff noise', async () => {
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ branch: 'main', changes: [{ path: 'a.ts', status: 'modified', added: 2173, removed: 628 }], truncated: false, ahead: 70, behind: 0 }), { status: 200 })))
   await render({ ...base, events: [] })
+  // The capsule carries the branch only: diff counts and sync arrows wait
+  // for the expanded panel (and the git workbench view).
   expect(host.textContent).toContain('main')
-  expect(host.textContent).toContain('+2,173')
-  expect(host.textContent).toContain('−628')
-  expect(host.textContent).toContain('↑70')
+  expect(host.textContent).not.toContain('+2,173')
+  expect(host.textContent).not.toContain('−628')
+  expect(host.textContent).not.toContain('↑70')
   // Zero counts never render (↓0 noise).
   expect(host.textContent).not.toContain('↓0')
   // Collapse affordance is a chevron, never a close glyph.
@@ -98,14 +100,15 @@ it('groups ended processes behind a collapsed toggle and clears them', async () 
   expect(section()).not.toContain('old-build')
 })
 
-it('header shows a working indicator while a turn is open', async () => {
+it('header shows a working spinner with the elapsed time for assistive tech', async () => {
   vi.useFakeTimers()
   vi.setSystemTime(new Date('2026-10-01T12:00:00Z'))
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
   const t = Date.now()
   await render({ ...base, events: [ev('turn/start', { turnId: 't1', timestamp: t - 100_000 })] })
-  expect(host.textContent).toContain('Working')
-  expect(host.textContent).toContain('1m 40s')
+  // The visible capsule is icon-only; the elapsed time stays available to
+  // screen readers (and as the hover tooltip).
+  expect(host.querySelector('[role="status"] .sr-only')?.textContent).toContain('1m 40s')
   // A closed turn clears it.
   await act(async () => root!.render(<EnvironmentPanel {...base} events={[ev('turn/start', { turnId: 't1', timestamp: t - 100_000 }), ev('turn/end', { turnId: 't1', timestamp: t })]} />))
   expect(host.textContent).not.toContain('Working')
@@ -167,6 +170,41 @@ it('git row click opens the git workbench view', async () => {
   expect(onOpenView).toHaveBeenCalledWith('git')
 })
 
+it('caps the subagent list at six newest and defers the rest to the workbench', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
+  const spawns = Array.from({ length: 9 }, (_, index) => ev('agent/child-spawn', { childSessionId: `c${index}`, definition: `agent-${index}`, timestamp: index + 1 }))
+  await render({ ...base, events: spawns })
+  const section = () => host.querySelector('section[aria-label="Subagents"]')!.textContent ?? ''
+  // Six newest rows (newest first) plus a jump to the workbench; the rest hides.
+  expect(section()).toContain('agent-8')
+  expect(section()).not.toContain('agent-2')
+  expect(section()).toContain('+3 earlier · view all in Workbench')
+  await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Open the full subagent list in the workbench"]')!.click())
+  expect(onOpenView).toHaveBeenCalledWith('agents')
+})
+
+it('running subagents keep panel slots over older ended ones', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
+  const spawns = Array.from({ length: 8 }, (_, index) => ev('agent/child-spawn', { childSessionId: `c${index}`, definition: `agent-${index}`, timestamp: index + 1 }))
+  await render({ ...base, events: [...spawns, ev('agent/child-result', { childSessionId: 'c0', status: 'completed' })] })
+  // c0 ended and c7 still runs; the six slots go to the running ones first.
+  expect(host.querySelector('section[aria-label="Subagents"]')?.textContent).toContain('agent-7')
+  expect(host.querySelector('section[aria-label="Subagents"]')?.textContent).not.toContain('agent-0')
+})
+
+it('subagent rows show the role icon the workbench uses', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
+  await render({ ...base, events: [
+    ev('agent/child-spawn', { childSessionId: 'c1', definition: 'explorer', timestamp: 1 }),
+    ev('agent/child-spawn', { childSessionId: 'c2', definition: 'unknown-role', timestamp: 2 }),
+    ev('agent/child-result', { childSessionId: 'c1', status: 'completed' }),
+  ] })
+  const tones = [...host.querySelectorAll('section[aria-label="Subagents"] span')].map((span) => span.getAttribute('class') ?? '')
+  // explorer keeps its telescope face (search tone); an unbundled role reads as a bot (agent tone).
+  expect(tones.some((cls) => cls.includes('text-tool-search'))).toBe(true)
+  expect(tones.some((cls) => cls.includes('text-tool-agent'))).toBe(true)
+})
+
 it('renders nothing without a session', async () => {
   await render({ ...base, sessionId: null, project: null, events: [] })
   expect(host.textContent).toBe('')
@@ -197,19 +235,19 @@ it('shows the Tasks section with counter and item rows', async () => {
   expect(section?.textContent).toContain('Test')
 })
 
-it('stays collapsed for tasks and shows the capsule chip instead', async () => {
+it('stays collapsed for tasks', async () => {
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
   await render({ ...base, events: todoEvents })
-  // No auto-open: the collapse button is still the collapsed one.
+  // No auto-open: the collapse button is still the collapsed one, and the
+  // capsule carries no task chip — TaskStatus above the composer owns the
+  // in-turn progress.
   expect(host.querySelector('button[aria-label="Expand environment"]')).not.toBeNull()
-  expect(host.querySelector('[data-todo-chip]')?.textContent).toContain('1/3')
 })
 
-it('omits the Tasks section and chip when there is no list or after clearing', async () => {
+it('omits the Tasks section when there is no list or after clearing', async () => {
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
   await render({ ...base, events: [] })
   expect(host.querySelector('section[aria-label="Tasks"]')).toBeNull()
-  expect(host.querySelector('[data-todo-chip]')).toBeNull()
 
   const cleared = [
     ev('tool/call', { call: { id: 'c1', name: 'TodoWrite', args: { todos: [{ content: 'A', status: 'completed', activeForm: 'Doing a' }] } } }),
@@ -219,5 +257,4 @@ it('omits the Tasks section and chip when there is no list or after clearing', a
   ]
   await render({ ...base, events: cleared })
   expect(host.querySelector('section[aria-label="Tasks"]')).toBeNull()
-  expect(host.querySelector('[data-todo-chip]')).toBeNull()
 })

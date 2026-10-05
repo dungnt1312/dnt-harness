@@ -134,7 +134,15 @@ never loses data). One writer per session keeps appends serialized with
 monotonic `seq` and a schema version on every record.
 
 - **Durability barriers**: an append is acknowledged only after the record is
-  `fsync`-ed; directory entries are synced best-effort (Windows cannot fsync a
+  `fsync`-ed — with one exception: sessions built with
+  `relaxedStreamingAppends` (the web host default; opt out with
+  `DNT_HARNESS_FSYNC_EVERY_EVENT=1`) append `assistant/chunk` records without
+  a per-record sync, and the session's next `durable()` barrier (or summary
+  projection, or store close) supplies one batched `checkpoint()` fsync for
+  the whole written prefix. A crash may lose the unsynced tail of an
+  in-flight streamed answer — a fact restart recovery already treats as
+  unknown — while every barriered record keeps its strict per-record sync.
+  Directory entries are synced best-effort (Windows cannot fsync a
   directory handle — a documented limit), and replacements use
   temp + sync + rename.
 - **Torn-tail quarantine**: a truncated final record — the classic
@@ -307,10 +315,25 @@ call waited for approval no longer authorizes it.
 
 An unknown tool, a **denied** call, or a **throwing** tool body all become a
 failed `ToolResult` the model can see — never an exception into the loop. The
-durable `tool/call` and `tool/result` events belong to the agent loop; this
-method only decides and executes.
+finalized call is recorded before dispatch, then current exposure, permission,
+guard, path, and interaction authority are checked again immediately before the
+body. A human approval receipt is exact-call and requirement-bound. If the
+final check newly requires an ask not covered by that receipt, dispatch fails
+with a fresh-call requirement; the final gate never opens a second question or
+retries the side effect. Prepared calls are single-use. The durable `tool/call`
+and `tool/result` events belong to the agent loop; this method only decides and
+executes.
 
-## Background processes (`processes/`, background branch of the Bash tool)
+## Managed commands and background processes (`processes/`)
+
+Managed Bash waits 120 s by default (maximum 600 s), then auto-backgrounds eligible
+commands without killing or rerunning. First-token `sleep` and session-less calls
+retain deadline termination. `BashOutput` accepts `block` (default false) and
+`timeoutMs` (default 30000, maximum 600000); expiry/abort ends waiting, not execution.
+Normal child completion retains processes under the child owner. Cancel child stops
+them, including retained processes of a completed child, without rewriting its result.
+Child background lifetime defaults to 3600000 ms from commitment; root has no such
+cap. Process events persist to canonical owner sessions. Interactive PTYs are unchanged.
 
 `Bash { run_in_background: true }` spawns exactly like a foreground call (tree
 tag, granted root, full approval waterfall — background is not a bypass) but
@@ -380,7 +403,14 @@ permission layer; workspace overrides and policy routes do not exist. Web
 `--yolo` maps every `ask` in that map to `allow`, while preserving every
 explicit `deny`; unnamed tools still use the unchanged `defaultMode` fallback.
 Headless uses its explicit map. Interactive MCP (`requiresUserInteraction`)
-still force-asks.
+still force-asks. Bundled Full access carries a `'*': 'allow'` catch-all, so
+MCP tools run there without asking.
+
+On re-evaluation (a mode switch while a call waits), the exposure check
+matches the host gate: built-ins must be listed by name, while `mcp__*` calls
+stay exposed unless the incoming mode's ceiling is empty — mode files cannot
+name dynamic MCP tools, so a non-empty built-in list never cancels their
+pending asks.
 
 `forceAsk(call, scope)` receives the call's own session/workspace — the
 executing scope at first evaluation, the pending entry's stamped scope on
@@ -402,9 +432,9 @@ authorization.
 
 ## Dangerous command guard (`guard/`)
 
-`attachDangerousCommandGuard(ctx, { configSource })` attaches one
-`tools/rewrite` listener that inspects the `command` argument of every
-`Bash` call before the approval waterfall:
+`attachDangerousCommandGuard(ctx, { configSource })` evaluates the finalized
+`command` argument of every `Bash` call after rewrite hooks and before the
+approval decision/final dispatch:
 
 - **Presets** — six curated groups (`fsDestructive`, `gitDestructive`,
   `systemPriv`, `networkExfil`, `dbDestructive`, `resourceExhaust`), each
@@ -413,10 +443,19 @@ authorization.
 - **Custom rules** — ordered `isRegex` or case-insensitive substring rules,
   each `deny | ask | allow` with highest priority (an `allow` can exempt a
   narrow path from a preset `deny`).
-- **Normalization** — trim, collapse whitespace, strip trailing `#` comment
-  outside quotes; matching is case-insensitive. No shell AST, no
-  obfuscation resistance — `eval $(echo ...|base64 -d)` bypasses the guard
-  by design (documented limitation).
+- **Normalization** — join unquoted Bash backslash-newline continuations, strip
+  `#` comments outside quotes on each LF/CRLF line, then trim and collapse
+  whitespace; quoted continuations remain content boundaries, quoted or escaped
+  hashes are preserved, and matching is case-insensitive. This prevents a
+  comment on one line from hiding executable text on a later line without
+  manufacturing tokens inside quotes.
+- **Limitations** — this is regex matching, not a shell AST. Documented
+  non-matching fixtures include quoted executable names, command substitutions
+  (`$(...)`), heredocs, commands delegated through interpreters, and Windows-shell
+  syntax. A matching custom substring `allow` exempts the whole normalized
+  compound command, including later commands; use narrowly anchored custom
+  patterns. Per-command exceptions require a deferred redesign. Obfuscation such
+  as `eval $(echo ...|base64 -d)` can bypass the guard.
 - **Enforcement** — `deny` returns `{kind:'deny', reason}` before any
   `approval/request`; `ask` stores a `GuardMatch` and forces the approval
   waterfall via `forceAsk` so a Mode `allow` cannot skip the question,
@@ -428,23 +467,26 @@ authorization.
   (`expectedHash` → `409` on conflict), atomic `replaceFileAtomic` writes.
 
 The guard never widens a Mode denial (`toolExposure` or
-`permissionDefaults` deny still wins), and Mode changes re-evaluate
-pending approvals the same way they always have.
+`permissionDefaults` deny still wins), and Mode changes re-evaluate pending
+approvals the same way they always have. It is advisory application-level
+matching, not shell confinement: Bash still has the OS user's reach, and the
+known parser/obfuscation gaps above remain outside this non-sandbox guard.
 
 ## Path-scope guard (`src/web/path-scope-guard.ts`)
 
-The web host appends one more `tools/rewrite` listener — after every
-prepended one (PreToolUse hooks, the dangerous-command guard), so it sees the
-final call — that classifies each `Read/Write/Edit/Glob/Grep` path against the
-run's grants without touching the filesystem (see `docs/capabilities.md`):
+The web host appends a final `tools/rewrite` listener after rewrite-capable
+hooks, so it sees the finalized call before classifying each
+`Read/Write/Edit/Glob/Grep` path against the run's grants without touching the
+filesystem (see `docs/capabilities.md`):
 
 - network/device paths, app storage, and writes into a read-only granted
   folder are denied before any `approval/request`;
-- a path outside every granted folder is recorded with the workspace and the
-  mode's exemption computed **at classification time**, then forces an
-  approval via `forceAsk` (even when the tool itself is `allow`) — unless the
-  executing mode has `outOfGrant: allow` (bundled Full access; duplicates
-  inherit it) or the host runs `--yolo`;
+- a path outside every granted folder is recorded with immutable path/intent
+  and owning-root scope, then current grants and the live mode's exemption are
+  resolved by authority at approval and final dispatch. It forces an approval
+  even when the tool itself is `allow`, unless the executing mode currently has
+  `outOfGrant: allow` (bundled Full access; duplicates inherit it) or the host
+  runs `--yolo`;
 - the card shows `Outside granted folders: <path> (read|write)`; a root
   session's card may also offer `Allow <folder> for this session` when that
   folder passes grant validation. Children answer `once` only.
@@ -472,9 +514,11 @@ turn:
   a legacy log without any `session/model` event falls back to the global
   default (`/api/model-defaults`), which every workspace shares.
 - **Permission** — re-resolved at each tool-start gate (the next gated call).
-- **Mode** — the strongest: re-gates tool exposure and permission defaults at
-  the next tool start *and* reassembles context at the next model request,
-  with pending approvals re-evaluated (newly unexposed calls are cancelled).
+- **Mode** — root-owned and live: re-gates tool exposure and permission
+  defaults at the next unstarted tool call *and* reassembles context at the next
+  model request, with pending approvals re-evaluated (newly unexposed calls are
+  cancelled). A sibling root is unaffected. A child resolves this owning root
+  mode, intersected with the child's immutable admission ceiling.
 
 Messages sent while a turn runs are **queued, never injected**: each pending
 input gets a stable id, duplicate `clientRequestId`s dedup, the queue is
@@ -484,7 +528,12 @@ close before claiming the next one.
 Turns have no wall-clock deadline or model-step budget: the loop continues until
 the model returns no tool calls or the user explicitly stops it. Operational
 watchdogs and resource caps remain centralized in `limits.ts`:
-`streamInactivityMs`, `toolTimeoutMs`, `approvalExpiryMs`, `toolOutputLimit`,
+`streamFirstEventMs` (10 minutes before the first model output or tool-call
+fragment; no silence deadline after output starts), `stepRetries` / `stepRetryBaseMs` (a model request that
+fails *transiently before producing any output* — `ProviderError.transient`,
+e.g. a stream that closed empty — is asked again with exponential backoff, 3
+extra attempts by default; a stop cancels the wait, and a failure after output
+started is never retried), `toolTimeoutMs`, `approvalExpiryMs`, `toolOutputLimit`,
 `maxPendingInputs`, `automaticCompactionPressure` (usedTokens/availableTokens
 ratio from the session's newest context manifest that triggers automatic
 compaction at a completed boundary; 0 disables), `compactionTailTurns`
@@ -510,8 +559,15 @@ margin` — the window is the operator's per-model override when set
 (verified), else the shared model catalog's documented value for the model
 (exact ID → known family → a 256k default; see
 `src/harness/llm/model-catalog.ts`). Over-budget content trims in a defined
-order or fails loud, and
-disabled loaders contribute nothing. Compaction (`context/compaction.ts`)
+order or fails loud. The first, cheapest bucket is **microcompact**: once the
+request passes 85% of the budget, old results of reproducible tools
+(`Read`/`Glob`/`Grep`/`Bash`/`BashOutput`/`Write`/`Edit`/`mcp__*`) become a
+short placeholder *in that request only* — the log is untouched — keeping the
+newest 5 verbatim and never touching the unanswered tool batch or
+`Agent`/`Skill`/`Memory`/`TodoWrite` results. It is the only lever for a long
+single-turn run such as a subagent, whose open turn whole-turn dropping can
+never shed; as a last resort before `ContextBudgetError` it keeps only the
+newest result. Disabled loaders contribute nothing. Compaction (`context/compaction.ts`)
 writes immutable checkpoints with range/provenance at completed boundaries and
 never mutates the original JSONL. A checkpoint replaces only the covered range:
 the covered events ride in the summary (a lower-trust wrapped block), the last
@@ -536,22 +592,62 @@ the UI's inspector renders as-is.
 
 One root agent spawns children through the **same** loop and builder — there is
 no second runtime. `ChildExecutor` owns the lifecycle (spawn / list / wait /
-cancel / reconcile), caps it (3 active per conversation, 12 on the host, 8 spawn
-attempts per root turn), and enforces one level: a child cannot delegate. Each child
-gets an isolated session, a brief, and a ceiling of mode exposure ∩ definition
-∩ spawn grant, where a grant only ever narrows.
+cancel / reconcile) and enforces one level: a child cannot delegate. Spawning is
+uncapped — no per-conversation, host, or per-turn ceiling — though each child
+still gets an isolated session, a brief, and an immutable admission ceiling of
+owning-root mode exposure ∩ definition ∩ spawn grant. The ceiling is pinned at
+the serialized admission point before child durability: later root widening
+cannot add tools, while the owning root's live mode can still narrow unstarted
+child calls.
+
+**Staying alive on long work.** A child is one long open turn — dozens of model
+requests with nothing to drop between them — so stability is decided by what
+happens when a request fails or grows, and by what happens to the child when its
+root stops waiting:
+
+- *Too large.* The provider's refusal (`ProviderError.contextExceeded`, from the
+  wordings OpenAI-compatible gateways use) is not final: the loop assembles the
+  request again with `ModelRequest.squeeze` raised, and `squeezeBudget` shrinks
+  the builder's budget by level (×0.7, ×0.45, ×0.25) so microcompact and the
+  other trims actually send less. The chars/4 estimate runs low on non-English
+  text and code; this is the correction. Only after the last level is the
+  failure final.
+- *Stalled or empty.* Every attempt streams under its own abort controller, so a
+  timeout before first model progress (`streamFirstEventMs`) aborts that attempt,
+  not the run. Tool argument fragments yield `toolCallProgress` without logging
+  partial arguments or executing calls; accounting and SSE heartbeats are not
+  model progress. After progress starts there is no silence timeout: a hung
+  upstream must be stopped by the user. First-progress timeouts are retried like
+  an empty stream (`stepRetries`, exponential
+  backoff). Requests are re-assembled per attempt. Nothing is retried once a
+  chunk has reached the log, and a user stop is never retried.
+- *The root stops calling tools while children run.* Closing the turn would
+  cancel them and lose their work. Instead the `agent/turn-continuation` serial
+  event lets the host join the turn's unreported children
+  (`ChildExecutor.joinTurnChildren`, bounded by `delegationJoinMs`, 30 min by
+  default; a user stop ends the wait and leaves cleanup to Stop). Their reports
+  come back as one user message of the same turn (`formatChildReports`) and the
+  model gets one more step; a child the model already `wait`ed on is not
+  delivered twice. Past the deadline a child is cancelled and reports what it did.
+- *A child that did not finish.* `ChildHandle.partial` carries its last message
+  and the files it touched for `failed` / `cancelled` / `interrupted` children.
+  It is evidence, not a verdict — `result` stays exclusive to a completed child,
+  and the root's report marks partial files as unverified.
+- *A wait that outlives the turn's patience.* The `Agent` tool's `wait` honors
+  the call's abort signal, so Stop returns at once instead of sitting out the
+  timeout.
 
 **Lifecycle boundary.** `spawn` checks, in order: the brief and inherit fields
 (`SpawnError('packet' | 'inherit')`), that the parent is a root owned by the
 requested workspace and project (`'ownership'`) and not itself a child
-(`'depth'`), then reserves capacity in one synchronous block with no `await`
+(`'depth'`), then records reservations in one synchronous block with no `await`
 inside. It writes the child's `session/child-meta`, then the parent's
 `agent/child-spawn` — the commit point. A failure before it deletes the new
 child session and rolls every reservation back; after it, the child settles as
 a durable failed child — unless the append's own durability cannot be
-established, which leaves it `uncertain` (below). Settling releases active
-capacity; the per-turn attempt stays charged until the root turn's
-`agent/turn-settled`. A child
+established, which leaves it `uncertain` (below). Settling releases the
+conversation's active count; the per-turn attempt stays recorded until the
+root turn's `agent/turn-settled`. A child
 session is driven by the executor only: the message routes answer 409 for any
 session carrying `session/child-meta`, so a child can never be resumed as a
 plain root Agent.

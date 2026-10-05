@@ -55,14 +55,16 @@ export function ThinkingMenu({ menuLabel = 'Default thinking level for new conve
       label={menuLabel}
       disabled={disabled}
       side="top"
+      compact
       // Never the chip that gives: the level is two words at most, while the
       // model name beside it is what should truncate when the row is tight.
+      // On a phone every chip is icon-only, so the level lives in the tooltip.
       triggerClassName={`${composerChipClass} shrink-0`}
       trigger={() => (
         <>
           <Icon name="lightbulb" size={15} />
-          <span className="truncate">{shown}</span>
-          <Icon name="chevron" size={13} />
+          <span className="truncate @max-[30rem]:hidden">{shown}</span>
+          <Icon name="chevron" size={13} className="@max-[30rem]:hidden" />
         </>
       )}
     >

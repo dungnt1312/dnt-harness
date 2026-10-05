@@ -173,9 +173,16 @@ describe('Skill tool with project layers', () => {
       name: 'scripted', models: ['scripted'],
       async *stream() {
         step += 1
-        if (step === 1) yield { type: 'toolCalls' as const, calls: [{ id: 'c1', name: 'Skill', args: { action: 'catalog' } }] }
-        else if (step === 2) yield { type: 'toolCalls' as const, calls: [{ id: 'l1', name: 'Skill', args: { action: 'load', name: 'proj-skill' } }] }
-        else yield { type: 'delta' as const, delta: 'done' }
+        if (step === 1) {
+          yield { type: 'toolCalls' as const, calls: [{ id: 'c1', name: 'Skill', args: { action: 'catalog' } }] }
+          yield { type: 'completion' as const, finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+        } else if (step === 2) {
+          yield { type: 'toolCalls' as const, calls: [{ id: 'l1', name: 'Skill', args: { action: 'load', name: 'proj-skill' } }] }
+          yield { type: 'completion' as const, finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+        } else {
+          yield { type: 'delta' as const, delta: 'done' }
+          yield { type: 'completion' as const, finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+        }
       },
     }
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-skill-tool-home-'))

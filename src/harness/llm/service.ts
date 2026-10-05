@@ -1,5 +1,6 @@
 import { Service, type Context } from '../../kernel/index.ts'
-import type { LlmProvider, ModelRequest, StreamEvent, StreamOptions } from './types.ts'
+import { AttemptAdmission, LogicalRequest, runAttempt, type AttemptObserver, type PhysicalAdmission } from './request-lifecycle.ts'
+import { ProviderError, type LlmProvider, type ModelRequest, type StreamEvent, type StreamOptions } from './types.ts'
 
 declare module 'dnt-harness' {
   interface Context {
@@ -27,6 +28,44 @@ declare module 'dnt-harness' {
 export class LlmService extends Service {
   private providers = new Map<string, LlmProvider>()
   private selected: string | undefined
+  /** Shared host registry survives Agent/session residency changes. */
+  private readonly admissions = new Map<string, AttemptAdmission>()
+  observer: AttemptObserver | undefined
+
+  configureAdmission(providerName: string, admission: PhysicalAdmission): void {
+    const previous = this.admissions.get(providerName)
+    if (previous && previous.active > 0) throw new Error('cannot replace live provider admission')
+    this.admissions.set(providerName, admission instanceof AttemptAdmission ? admission : new AttemptAdmission(4, admission))
+  }
+
+  admission(providerName: string): AttemptAdmission {
+    let admission = this.admissions.get(providerName)
+    if (!admission) { admission = new AttemptAdmission(); this.admissions.set(providerName, admission) }
+    return admission
+  }
+
+  private readonly sessionsInFlight = new Set<string>()
+
+  sessionUncertain(sessionId: string): boolean {
+    return [...this.admissions.values()].some(admission => [...admission.uncertain.values()].some(fact => fact.attribution?.sessionId === sessionId))
+  }
+
+  private async *admitted(provider: LlmProvider, request: ModelRequest, options?: StreamOptions): AsyncIterable<StreamEvent> {
+    const sessionId = options?.attribution?.sessionId
+    if (sessionId && (this.sessionsInFlight.has(sessionId) || this.sessionUncertain(sessionId))) {
+      const error = new ProviderError('session retains provider request ownership')
+      error.transportSettled = false
+      throw error
+    }
+    if (sessionId) this.sessionsInFlight.add(sessionId)
+    const owner = options?.requestOwner ?? new LogicalRequest()
+    try {
+      yield* runAttempt(provider, request, { owner, admission: this.admission(provider.name), provider: provider.name, ...(options?.attribution ? { attribution: options.attribution } : {}), ...(options?.recordAttempt ? { recordAttempt: options.recordAttempt } : {}), ...(options?.signal ? { signal: options.signal } : {}), ...(this.observer ? { observer: this.observer } : {}) })
+    } finally {
+      if (sessionId) this.sessionsInFlight.delete(sessionId)
+      if (!options?.requestOwner) owner.dispose()
+    }
+  }
 
   constructor(ctx: Context) {
     super(ctx, 'llm')
@@ -85,24 +124,33 @@ export class LlmService extends Service {
    * always receive an `AsyncIterable`.
    */
   stream(request: ModelRequest, options?: StreamOptions): AsyncIterable<StreamEvent> {
-    const chained = this.ctx.waterfall('llm/stream', request, (replacement) => {
-      const target = replacement ?? request
-      // Trusted explicit scope fails closed: a stamped provider that is no
-      // longer registered is an error, never a silent fallback to the
-      // process-global selection (that would cross workspaces).
-      if (target.providerName !== undefined) {
-        const provider = this.providers.get(target.providerName)
-        if (provider === undefined) {
-          throw new Error(`llm: requested provider '${target.providerName}' is not registered`)
+    const selected = request.providerName === undefined ? this.active() : this.providers.get(request.providerName)
+    if (!selected) throw new Error(`llm: requested provider '${request.providerName}' is not registered`)
+    // Admission surrounds middleware as well as default dispatch: a short circuit
+    // cannot evade the owner's attempt budget or host uncertainty accounting.
+    const dispatch: LlmProvider = { name: selected.name, stream: (_request, attemptOptions) => {
+      let dispatched = false
+      const chained = this.ctx.waterfall('llm/stream', request, (replacement) => {
+        if (dispatched) throw new Error('llm middleware default dispatch is single-use')
+        dispatched = true
+        const target = replacement ?? request
+        // Admission is for the already selected connection; fail closed on rerouting.
+        if (target.providerName !== undefined) {
+          const provider = this.providers.get(target.providerName)
+          if (provider === undefined) {
+            throw new Error(`llm: requested provider '${target.providerName}' is not registered`)
+          }
+          if (provider.name !== selected.name) throw new Error('llm middleware cannot change admitted provider connection')
+          return provider.stream(target, attemptOptions)
         }
-        return provider.stream(target, options)
-      }
-      return this.active().stream(target, options)
-    })
-    if (isAsyncIterable(chained)) return chained
-    return (async function* resolve(awaited: Promise<AsyncIterable<StreamEvent>>) {
-      yield* await awaited
-    })(chained as Promise<AsyncIterable<StreamEvent>>)
+        return selected.stream(target, attemptOptions)
+      })
+      if (isAsyncIterable(chained)) return chained
+      return (async function* resolve(awaited: Promise<AsyncIterable<StreamEvent>>) {
+        yield* await awaited
+      })(chained as Promise<AsyncIterable<StreamEvent>>)
+    } }
+    return this.admitted(dispatch, request, options)
   }
 
   /** The registered provider's model list, resolved by id (no global pointer). */

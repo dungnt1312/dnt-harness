@@ -8,7 +8,7 @@ const TerminalPanel = lazy(async () => import('./TerminalPanel.tsx'))
  * window. The shell tabs are the only chrome; the close button lives on
  * that strip. The workbench has its own Terminal tab.
  */
-export function TerminalDock({ workspaceId, projectId, height, resizeHandle, open, onOpenChange, defaultShell, onDefaultShell }: {
+export function TerminalDock({ workspaceId, projectId, height, resizeHandle, open, onOpenChange, defaultShell, onDefaultShell, bindingReady = true }: {
   readonly workspaceId: string | null
   readonly projectId: string | null
   /** Height in px while the dock is open. Closed renders nothing. */
@@ -19,6 +19,8 @@ export function TerminalDock({ workspaceId, projectId, height, resizeHandle, ope
   readonly onOpenChange: (open: boolean) => void
   readonly defaultShell: string | null
   readonly onDefaultShell: (shellId: string | null) => void
+  /** Passed to the panel; holds its auto-open until the project binding is final. */
+  readonly bindingReady?: boolean
 }) {
   let body: ReactNode = null
   if (open) {
@@ -31,6 +33,7 @@ export function TerminalDock({ workspaceId, projectId, height, resizeHandle, ope
           defaultShell={defaultShell}
           onDefaultShell={onDefaultShell}
           onHide={() => onOpenChange(false)}
+          bindingReady={bindingReady}
         />
       </Suspense>
     )

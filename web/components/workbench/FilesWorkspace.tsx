@@ -78,9 +78,9 @@ export function FilesWorkspace({ workspaceId, project, files, treeVisible, treeF
         onPointerCancel={endDrag}
         onKeyDown={onKeyDown}
         onDoubleClick={() => { setWidth(TREE_LIMITS.default); onTreeFraction(fraction.current) }}
-        className={cn('group relative w-px shrink-0 cursor-col-resize bg-line outline-none focus-visible:bg-link', !treeVisible && 'hidden')}
+        className={cn('group relative w-px shrink-0 touch-none cursor-col-resize bg-line outline-none focus-visible:bg-link', !treeVisible && 'hidden')}
       >
-        <span aria-hidden="true" className="absolute inset-y-0 -left-1.5 -right-1.5 group-hover:bg-line/60" />
+        <span aria-hidden="true" className="absolute inset-y-0 -left-3 -right-3 group-hover:bg-line/60" />
       </div>
       <div ref={treeRef} className={cn('min-h-0 min-w-0 shrink-0 flex-col', treeVisible ? 'flex' : 'hidden')} style={{ width: `${treeFraction * 100}%` }}>
         <FileBrowser key={project.id} workspaceId={workspaceId} project={project} activeFile={files.activeFile} onOpenFile={files.openFile} />

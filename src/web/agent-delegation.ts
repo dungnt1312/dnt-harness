@@ -17,7 +17,7 @@ import type { Session } from '../harness/session/session.ts'
 import type { SessionEvent } from '../harness/session/events.ts'
 import { agentScope } from '../harness/agent/scope.ts'
 import { bundledDefinition, BUNDLED_AGENT_ROLES, type AgentDefinitionService } from '../harness/agents/definition-service.ts'
-import { MAX_ACTIVE_PER_ROOT, type ChildExecutor, type ChildModel, type TaskPacket } from '../harness/agents/executor.ts'
+import { type ChildExecutor, type ChildHandle, type ChildModel, type SpawnAdmissionResolver, type TaskPacket } from '../harness/agents/executor.ts'
 import type { GrantedRoot, ToolDefinition } from '../harness/tools/types.ts'
 
 /** Most parent-conversation text an `inherit: 'brief'` child receives. */
@@ -168,7 +168,7 @@ const ROLE_CACHE_MS = 5_000
 
 export interface DelegationDeps {
   readonly definitions: AgentDefinitionService
-  readonly executor: Pick<ChildExecutor, 'spawn' | 'childrenOfRoot' | 'wait' | 'cancel' | 'reconcile' | 'activeOfRoot' | 'runningChildrenOfRoot'>
+  readonly executor: Pick<ChildExecutor, 'spawn' | 'childrenOfRoot' | 'wait' | 'cancel' | 'reconcile' | 'activeOfRoot' | 'runningChildrenOfRoot'> & Partial<Pick<ChildExecutor, 'markReported' | 'owedChildrenOfTurn'>>
   /** The executing session, root or child. */
   readonly session: (sessionId: SessionId) => Promise<Session | undefined>
   readonly childModelFor: (
@@ -180,6 +180,8 @@ export interface DelegationDeps {
   /** Usable provider ids and their advertised models, for the live catalog. */
   readonly providers: () => readonly string[]
   readonly modelsOf: (provider: string) => readonly string[]
+  /** Trusted host authority, invoked by the executor at serialized admission. */
+  readonly admissionResolver: SpawnAdmissionResolver
   /** The parent's effective additional folders, snapshotted into the child at spawn. */
   readonly grantsOf?: (parentSessionId: SessionId) => readonly GrantedRoot[]
 }
@@ -225,7 +227,7 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
       'Delegate a bounded task to a child agent and collect its result.',
       'spawn returns immediately, so several children run at the same time; wait blocks until they settle.',
       'One level only: a child can never delegate further.',
-      'Wait for the children before you finish your turn — children still running when the turn closes are cancelled.',
+      'Children you leave running are joined when your turn would close: their reports come back to you as a message, and you get one more step to use them. Calling wait yourself is still the way to get a result earlier or to work on something else in between.',
       'Delegate when the work is separable and its result compresses — a search across many files, a review, a verification run. Do not delegate what you can do in two tool calls, and do not delegate work whose context you would have to retype.',
       'Write the prompt as you would brief a colleague who cannot see this conversation: name the files and the facts it needs, and say what the answer must contain. The child\'s final message is all you get back.',
       'Children share the project filesystem with their root. Coordinate edits to the same files and re-read before writing; unrelated conversations never own or block this project.',
@@ -241,7 +243,7 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
     requiresRoot: false,
     schema: () => ({ description: describe(), parameters: PARAMETERS }),
     parameters: PARAMETERS,
-    async execute(args) {
+    async execute(args, exec) {
       const scope = agentScope.getStore()
       if (scope?.workspaceId === undefined) throw new Error('Agent requires a workspace-scoped execution')
       if (scope.childOf !== undefined) throw new Error('one-level delegation: a child agent cannot delegate')
@@ -253,7 +255,7 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
       switch (action) {
         case 'spawn': return spawn(deps, args, scope.sessionId, workspaceId, scope.projectId, parent)
         case 'list': return JSON.stringify({ children: await deps.executor.childrenOfRoot(scope.sessionId, workspaceId) })
-        case 'wait': return wait(deps, args, scope.sessionId, workspaceId)
+        case 'wait': return wait(deps, args, scope.sessionId, workspaceId, exec.signal, scope.turnId)
         case 'cancel': return cancel(deps, args, scope.sessionId, workspaceId)
         case 'reconcile': return reconcile(deps, args, scope.sessionId, workspaceId)
         case 'catalog': return catalog(deps, workspaceId)
@@ -330,6 +332,7 @@ async function spawn(
     parentSessionId,
     parentTurnId: turnId,
     definition: resolved.definition,
+    admissionResolver: deps.admissionResolver,
     packet,
     ...(grantTools !== undefined ? { grantTools } : {}),
     ...(model !== undefined ? { model } : {}),
@@ -348,13 +351,35 @@ async function spawn(
     definition: handle.definitionName,
     ...(handle.model !== undefined ? { model: handle.model } : {}),
     status: handle.status,
-    // Active children of THIS conversation; the host-wide ceiling is not shown.
-    active: `${deps.executor.activeOfRoot(parentSessionId)}/${MAX_ACTIVE_PER_ROOT}`,
+    // Active children of THIS conversation; there is no host-wide ceiling.
+    active: deps.executor.activeOfRoot(parentSessionId),
     ...(inheritedContext !== undefined ? { inheritedChars: inheritedContext.length } : {}),
     ...(dropped.length > 0 ? { droppedGrants: dropped } : {}),
     ...(notes.length > 0 ? { note: notes.join('; ') } : {}),
-    next: 'call Agent with action:"wait" before finishing this turn',
+    next: 'call Agent with action:"wait" for the report, or keep working — unreported children are joined when your turn would close',
   })
+}
+
+/**
+ * The message a root's turn continues with when delegated children finished
+ * after the model stopped calling tools: one section per child, reports first.
+ * Nothing in it is an instruction — it is data the model asked for.
+ */
+export function formatChildReports(handles: readonly ChildHandle[]): string {
+  const sections = handles.map((child) => {
+    const head = `### ${child.definitionName} (${child.childSessionId}) — ${child.status}`
+    if (child.result !== undefined) {
+      const files = child.result.filesTouched.length > 0 ? `\nFiles touched: ${child.result.filesTouched.join(', ')}` : ''
+      return `${head}\n${child.result.report}${files}`
+    }
+    const lines = [head, child.error ?? 'no result']
+    if (child.partial !== undefined) {
+      if (child.partial.report !== '') lines.push(`Last thing it said before stopping: ${child.partial.report}`)
+      if (child.partial.filesTouched.length > 0) lines.push(`Files touched before stopping: ${child.partial.filesTouched.join(', ')} (unverified — check them before relying on them)`)
+    }
+    return lines.join('\n')
+  })
+  return ['Delegated agents you left running have finished. Their reports follow; use them to complete the task.', ...sections].join('\n\n')
 }
 
 async function wait(
@@ -362,16 +387,29 @@ async function wait(
   args: Record<string, unknown>,
   parentSessionId: SessionId,
   workspaceId: WorkspaceId,
+  signal?: AbortSignal,
+  turnId?: string,
 ): Promise<string> {
   const requested = stringList(args['childIds'])
+  // Without ids: everything running, plus children of this turn that already
+  // finished but whose outcome the model was never handed — "none running"
+  // would otherwise hide a report it asked for.
   const ids = requested.length > 0
     ? await ownedChildIds(deps, requested, parentSessionId)
-    : deps.executor.runningChildrenOfRoot(parentSessionId)
+    : [...new Set([
+        ...deps.executor.runningChildrenOfRoot(parentSessionId),
+        ...(turnId !== undefined ? deps.executor.owedChildrenOfTurn?.(parentSessionId, turnId) ?? [] : []),
+      ])]
   if (ids.length === 0) return JSON.stringify({ children: [], note: 'no children are running for this conversation' })
 
   const raw = Number(args['timeoutMs'])
   const timeoutMs = Number.isFinite(raw) && raw > 0 ? Math.min(raw, MAX_WAIT_MS) : DEFAULT_WAIT_MS
-  const handles = await deps.executor.wait(workspaceId, ids, { timeoutMs })
+  // A user Stop reaches the tool through its signal: the wait returns at once
+  // instead of sitting out the timeout (Stop cancels the children itself).
+  const handles = await deps.executor.wait(workspaceId, ids, { timeoutMs, ...(signal !== undefined ? { signal } : {}) })
+  // What this wait handed the model is reported: closing the turn will not
+  // repeat it as a continuation.
+  deps.executor.markReported?.(handles.filter((child) => child.status !== 'running' && child.status !== 'queued' && child.status !== 'dispatching').map((child) => child.childSessionId))
   const running = handles.filter((child) => child.status === 'running')
   return JSON.stringify({
     children: handles,

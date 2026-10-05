@@ -1,9 +1,12 @@
 import type { Context } from '../../kernel/index.ts'
 import { newExecutionId, newStepId, newTurnId, type ExecutionId, type InputId, type StepId, type TurnId } from '../../util/brand.ts'
 import { resolveLimits, type HarnessLimits } from '../limits.ts'
+import { MAX_SQUEEZE_LEVEL } from '../context/budget.ts'
 import type { AttachmentRef } from '../attachments/store.ts'
 import { ProviderError, type ModelRequest, type ToolCall, type ToolSchema } from '../llm/types.ts'
 import { canonicalCall } from '../tools/names.ts'
+import { LogicalRequest } from '../llm/request-lifecycle.ts'
+import { encodedBytes, protocolError, validateCompletion, validateToolBatch, WIRE_LIMITS } from '../llm/completion.ts'
 import type { ToolResult } from '../tools/types.ts'
 import type { Session } from '../session/session.ts'
 import { agentScope, type AgentScope } from './scope.ts'
@@ -32,9 +35,6 @@ class StopRequested extends Error {
     super('agent: stop requested')
   }
 }
-
-/** Why the abort controller fired; decides the truthful terminal reason. */
-type AbortCause = 'stop' | 'inactivity'
 
 /** Storage acknowledged nothing; the turn fails and the run halts. */
 class StorageFailed extends Error {
@@ -68,7 +68,6 @@ export class Agent {
   /** Accepted inputs removed from the inbox but not yet durably settled. */
   private readonly claimedInputIds = new Set<InputId>()
   private abortController: AbortController | null = null
-  private abortCause: AbortCause = 'stop'
   /**
    * Set by {@link steer}: the in-flight run stops like a user stop, but the
    * inbox runs right after instead of staying queued. Consumed when the
@@ -94,6 +93,15 @@ export class Agent {
   /** Whether a run is in flight; the web UI's Stop button reads this. */
   get busy(): boolean {
     return this.status !== 'idle'
+  }
+
+  private admissionClosed = false
+  closeAdmission(): void { this.admissionClosed = true; this.stop() }
+
+  /** Shutdown escalation: prohibit late canonical writes and drain their queued prefix. */
+  async fencePersistence(): Promise<void> {
+    this.session.close()
+    await this.session.drain()
   }
 
   /** Queue a user message; wakes the driver on the next `run()`. Ephemeral: durable acceptance is the caller's job via an `input/queued` event plus {@link enqueueAccepted}. */
@@ -171,9 +179,6 @@ export class Agent {
 
   /** The shared abort of stop and steer. */
   private abortRun(): void {
-    // An inactivity abort already fired keeps its truthful cause; a user
-    // stop arriving afterwards must not relabel that provider failure.
-    if (this.abortController?.signal.aborted !== true) this.abortCause = 'stop'
     if (this.status === 'running') this.status = 'cancelling'
     this.abortController?.abort()
   }
@@ -192,9 +197,11 @@ export class Agent {
    * logged. A stopped run leaves the loop without consuming queued input.
    */
   async run(): Promise<void> {
+    if (this.admissionClosed) return
+    if (this.ctx.llm.sessionUncertain(this.session.id)) { this.status = 'cancelling'; return }
+    if (this.status === 'cancelling' && this.abortController === null) this.status = 'idle'
     if (this.status !== 'idle') return
     this.status = 'running'
-    this.abortCause = 'stop'
     this.abortController = new AbortController()
     let stopped = false
     let steered = false
@@ -226,11 +233,11 @@ export class Agent {
     } finally {
       // A stop that raced a turn finishing on its own still counts as a stop:
       // input queued meanwhile stays queued (only a steer runs it).
-      if (this.abortController?.signal.aborted === true && this.abortCause === 'stop') stopped = true
+      if (this.abortController?.signal.aborted === true) stopped = true
       // Consumed exactly once per run, even when the run throws.
       steered = this.steerRequested
       this.steerRequested = false
-      this.status = 'idle'
+      this.status = this.ctx.llm.sessionUncertain(this.session.id) ? 'cancelling' : 'idle'
       this.activity = null
       this.abortController = null
     }
@@ -278,6 +285,9 @@ export class Agent {
     return agentScope.run({ ...this.identity, turnId }, async () => {
       this.session.append({ type: 'turn/start', turnId })
       const controller = this.abortController
+      // A function, not a flag: stop can land at any await, and a plain property
+      // check would be narrowed by the first one.
+      const stopRequested = (): boolean => controller?.signal.aborted === true
       const claimed = this.inbox.splice(0, this.inbox.length)
       try {
       for (const item of claimed) {
@@ -298,7 +308,7 @@ export class Agent {
       // nothing has reached the model or the log as admitted yet. Hand the
       // claimed input back, oldest first, instead of logging it and then
       // cancelling it unanswered — a steer re-runs it, a stop leaves it queued.
-      if (controller?.signal.aborted === true && this.abortCause === 'stop') {
+      if (stopRequested()) {
         this.inbox.unshift(...claimed)
         const reason = this.stopReason()
         await this.recordTurnEnd(turnId, reason)
@@ -318,11 +328,14 @@ export class Agent {
       }
 
       let lastStep: StepId | null = null
-      // A turn keeps spending steps while tools owe the model their results.
-      for (let spent = 1; ; spent++) {
+      let nextContents: readonly string[] = decision.contents
+      let nextClaimed: readonly InboxItem[] = claimed
+      // A turn keeps spending steps while tools owe the model their results —
+      // and while delegated work it left running still owes it a report.
+      for (;;) {
         let step: { stepId: StepId; toolCalls: readonly ToolCall[] }
         try {
-          step = await this.step(turnId, spent === 1 ? decision.contents : [], spent === 1 ? claimed : [])
+          step = await this.step(turnId, nextContents, nextClaimed)
         } catch (error) {
           // A user stop is a durable result, not a failure: close the turn
           // with the `cancelled` (or `steered`) reason and end the run.
@@ -335,11 +348,21 @@ export class Agent {
           throw error
         }
         lastStep = step.stepId
-        if (step.toolCalls.length === 0) break
+        nextContents = []
+        nextClaimed = []
+        if (step.toolCalls.length > 0) continue
+        // The model is done asking. Work it delegated and left running would be
+        // cancelled by closing the turn, and everything the children did lost:
+        // the host joins them and hands the reports back for one more step.
+        const continuation = await this.ctx
+          .serial('agent/turn-continuation', { turnId, ...(controller?.signal !== undefined ? { signal: controller.signal } : {}) })
+          .catch(() => undefined)
+        if (typeof continuation !== 'string' || continuation === '' || stopRequested()) break
+        nextContents = [continuation]
       }
 
       await this.ctx.serial('agent/turn-stopping', { turnId, lastStep })
-      if (controller?.signal.aborted === true) {
+      if (stopRequested()) {
         const reason = this.stopReason()
         await this.recordTurnEnd(turnId, reason)
         return reason
@@ -350,14 +373,11 @@ export class Agent {
       // Classified failures append the durable reason before closing. A
       // poisoned session records nothing further — the throw is the truth.
       if (!this.session.poisoned) {
-        const aborted = controller?.signal.aborted === true
         const { kind, message, reason } = error instanceof StorageFailed
           ? { kind: 'storage' as const, message: error.message, reason: 'failed' as const }
-          : aborted && this.abortCause === 'inactivity'
-            ? { kind: 'provider' as const, message: 'provider stream stayed inactive past the limit', reason: 'failed' as const }
-            : error instanceof ProviderError
-              ? { kind: 'provider' as const, message: error.message, reason: 'failed' as const }
-              : { kind: 'internal' as const, message: String(error instanceof Error ? error.message : error), reason: 'failed' as const }
+          : error instanceof ProviderError
+            ? { kind: 'provider' as const, message: error.message, reason: 'failed' as const }
+            : { kind: 'internal' as const, message: String(error instanceof Error ? error.message : error), reason: 'failed' as const }
         try {
           this.session.append({ type: 'turn/error', turnId, kind, message })
           await this.session.durable()
@@ -428,8 +448,7 @@ export class Agent {
    * @returns the step id and the tool calls the model made.
    */
   private async step(turnId: TurnId, contents: readonly string[], claimed: readonly InboxItem[]): Promise<{ stepId: StepId; toolCalls: readonly ToolCall[] }> {
-    const controller = this.abortController
-    const signal = controller?.signal
+    const signal = this.abortController?.signal
     const assertLive = (): void => {
       if (signal?.aborted === true) throw this.abortError()
     }
@@ -464,91 +483,153 @@ export class Agent {
     // The tools service is optional: without it the loop still runs, and
     // tool calls fail as unknown tools.
     const tools = this.ctx.get('tools') as ToolRuntime | undefined
-    const schemas = tools?.schemas() ?? []
-    const projected: ModelRequest = {
-      messages: this.session.deriveMessages(),
-      ...(tools !== undefined && schemas.length > 0 ? { tools: schemas } : {}),
-    }
-    assertLive()
-    // The mode-driven context builder replaces the assembly wholesale (G3:
-    // there is exactly one assembly path). Everything downstream — controls
-    // stamping, providers — sees the builder's output.
-    const assembled = await this.ctx.waterfall(
-      'agent/context',
-      projected,
-      (replacement) => Promise.resolve(replacement ?? projected),
-    )
-    const request = await this.ctx.waterfall(
-      'agent/request',
-      assembled,
-      (replacement) => Promise.resolve(replacement ?? assembled),
-    )
 
+    // One model request. Every attempt assembles its request afresh from the log
+    // (the context builder is where size is decided) and streams under its OWN
+    // abort controller: a stalled stream aborts that attempt, not the whole run,
+    // so it can be asked again. A run of dozens of requests — a subagent — would
+    // otherwise die on the first gateway hiccup, and a provider that rejects the
+    // request as too large would be sent the identical request forever.
     let full = ''
     let calls: readonly ToolCall[] = []
-    this.activity = 'model'
+    let request: ModelRequest = { messages: [] }
+    let squeeze = 0
+    const owner = new LogicalRequest({ firstProgressMs: this.limits().streamFirstEventMs, idleMs: this.limits().streamIdleMs, totalMs: this.limits().logicalRequestMs, retryBaseMs: this.limits().stepRetryBaseMs, maxAttempts: Math.min(4, this.limits().stepRetries + 1) })
+    const cancelOwner = (): void => owner.cancel()
+    signal?.addEventListener('abort', cancelOwner, { once: true })
+    if (signal?.aborted) owner.cancel()
     try {
-      const stream = this.ctx.llm.stream(request, signal !== undefined ? { signal } : {})
-      // The abort check runs between stream events, and the iteration itself
-      // races the abort signal: a provider that never yields (no data, hung
-      // socket) is still stopped by the watchdog instead of blocking forever.
-      const iterator = stream[Symbol.asyncIterator]()
-      // Two silence windows. Before the first event a provider may legitimately
-      // think for minutes (extended thinking whose reasoning deltas the gateway
-      // never forwards), so that window is generous; once output has started,
-      // silence is a stalled stream and dies fast. bump() re-arms on every event.
-      let sawFirstEvent = false
-      let watchdog: ReturnType<typeof setTimeout> | undefined
-      const bump = (): void => {
-        if (watchdog !== undefined) clearTimeout(watchdog)
-        const silenceWindow = sawFirstEvent ? this.limits().streamInactivityMs : this.limits().streamFirstEventMs
-        watchdog = setTimeout(() => {
-          this.abortCause = 'inactivity'
-          controller?.abort()
-        }, silenceWindow)
-        watchdog.unref?.()
+    for (;;) {
+      owner.assertLive()
+      assertLive()
+      const schemas = tools?.schemas() ?? []
+      const projected: ModelRequest = {
+        assemblySignal: owner.signal,
+        messages: this.session.deriveMessages(),
+        ...(tools !== undefined && schemas.length > 0 ? { tools: schemas } : {}),
+        ...(squeeze > 0 ? { squeeze } : {}),
       }
+      // The mode-driven context builder replaces the assembly wholesale (G3:
+      // there is exactly one assembly path). Everything downstream — controls
+      // stamping, providers — sees the builder's output.
+      const assembled = await owner.wait(this.ctx.waterfall(
+        'agent/context',
+        projected,
+        (replacement) => { owner.assertLive(); assertLive(); return Promise.resolve(replacement ?? projected) },
+      ))
+      owner.assertLive(); assertLive()
+      request = await owner.wait(this.ctx.waterfall(
+        'agent/request',
+        { ...assembled, assemblySignal: owner.signal },
+        (replacement) => { owner.assertLive(); assertLive(); return Promise.resolve(replacement ?? assembled) },
+      ))
+      owner.assertLive(); assertLive()
+      full = ''
+      calls = []
+
+      const attemptController = new AbortController()
+      const relayStop = (): void => attemptController.abort()
+      if (signal?.aborted === true) attemptController.abort()
+      else signal?.addEventListener('abort', relayStop, { once: true })
+      const attemptSignal = attemptController.signal
+      let emitted = false
+      let completed = false
+      let outputBytes = 0
+      this.activity = 'model'
       try {
-        bump()
-        for (;;) {
-          assertLive()
-          const result = await raceAbort(iterator.next(), signal, () => this.abortError())
-          if (result.done === true) break
-          const event = result.value
-          assertLive()
-          sawFirstEvent = true
-          bump()
-          if (event.type === 'delta') {
-            // Thinking deltas are logged for UI fidelity but never join the
-            // assembled assistant message — the model's answer is content only.
-            if (event.thinking !== true) full += event.delta
-            this.session.append({
-              type: 'assistant/chunk',
-              stepId,
-              delta: event.delta,
-              ...(event.thinking === true ? { thinking: true } : {}),
-            })
-          } else if (event.type === 'toolCalls') {
-            calls = event.calls
+        const stream = this.ctx.llm.stream(request, {
+          signal: attemptSignal, requestOwner: owner,
+          attribution: { sessionId: this.session.id, turnId, stepId },
+          recordAttempt: async fact => {
+            this.session.append({ type: fact.state === 'uncertain' ? 'execution/uncertain' : fact.state === 'reconciled' ? 'execution/reconciled' : 'model/attempt', fact })
+            await this.flushOrHalt()
+          },
+        })
+        // The abort check runs between stream events, and the iteration itself
+        // races the abort signal: a provider that never yields (no data, hung
+        // socket) is still stopped by the watchdog instead of blocking forever.
+        const iterator = stream[Symbol.asyncIterator]()
+        // Physical admission owns progress/idle timers and transport settlement.
+        try {
+          for (;;) {
+            assertLive()
+            const result = await iterator.next()
+            if (result.done === true) break
+            const event = result.value
+            assertLive()
+            if (completed) throw protocolError('malformed_protocol', 'provider emitted events after completion')
+            if (event.type === 'completion') {
+              validateCompletion(event)
+              validateToolBatch(calls)
+              completed = true
+              if (calls.length > 0) emitted = true
+              continue
+            }
+            // Accounting alone is not model progress. Tool argument fragments
+            // are progress, but never become transcript entries or executable calls.
+            if (event.type === 'delta') {
+              if (event.delta === '') continue
+              outputBytes += encodedBytes(event.delta)
+              if (outputBytes > WIRE_LIMITS.outputBytes) throw protocolError('output_limit', 'provider output exceeds limit')
+              // Thinking deltas are logged for UI fidelity but never join the
+              // assembled assistant message — the model's answer is content only.
+              if (event.thinking !== true) full += event.delta
+              emitted = true
+              this.session.append({
+                type: 'assistant/chunk',
+                stepId,
+                delta: event.delta,
+                ...(event.thinking === true ? { thinking: true } : {}),
+              })
+            } else if (event.type === 'toolCalls') {
+              if (calls.length > 0) throw protocolError('invalid_tool_input', 'multiple tool batches')
+              validateToolBatch(event.calls)
+              if (event.calls.length > 0) emitted = true
+              for (const call of event.calls) {
+                outputBytes += encodedBytes(call.id) + encodedBytes(call.name) + encodedBytes(JSON.stringify(call.args))
+              }
+              if (outputBytes > WIRE_LIMITS.outputBytes) throw protocolError('output_limit', 'provider output exceeds limit')
+              calls = event.calls
+            }
+            // `usage` events are accounting for observers (the host taps them
+            // on `llm/stream`); they carry nothing the loop acts on.
           }
-          // `usage` events are accounting for observers (the host taps them
-          // on `llm/stream`); they carry nothing the loop acts on.
+        } finally {
+          // Not awaited: a provider parked on an unresolvable await would hang
+          // its generator's return() too, and the loop must stay free.
+          void iterator.return?.().catch(() => {})
         }
+        // A stop racing with normal stream completion still owns the terminal
+        // outcome and must not allow tool preparation to begin.
+        assertLive()
+        if (!completed) throw protocolError('incomplete_completion', 'provider iterable ended without explicit completion')
+        if (full === '' && calls.length === 0) {
+          throw new ProviderError('provider returned an empty response', { transient: !emitted })
+        }
+      } catch (caught) {
+        // The attempt's own abort (a stall) reads as a provider failure; the
+        // user's stop never does.
+        const stopped = signal?.aborted === true
+        if (stopped) throw this.abortError()
+        const error = caught
+        // Only a request that produced nothing may be asked again: once a chunk
+        // reached the log, a second attempt would duplicate it.
+        if (!(error instanceof ProviderError) || stopped || !owner.canRetry(error, emitted)) throw error
+        if (error.contextExceeded && squeeze < MAX_SQUEEZE_LEVEL) {
+          squeeze += 1
+          continue
+        }
+        if (!error.transient) throw error
+        try { await owner.backoff(signal, error.retryAfterMs) } catch (error) { assertLive(); throw error }
+        continue
       } finally {
-        if (watchdog !== undefined) clearTimeout(watchdog)
-        // Not awaited: a provider parked on an unresolvable await would hang
-        // its generator's return() too, and the loop must stay free.
-        void iterator.return?.().catch(() => {})
+        signal?.removeEventListener('abort', relayStop)
+        this.activity = null
       }
-    } finally {
-      this.activity = null
+      break
     }
-    // A stop racing with normal stream completion still owns the terminal
-    // outcome and must not allow tool preparation to begin.
-    assertLive()
-    if (full === '' && calls.length === 0) {
-      throw new ProviderError('provider returned an empty response')
-    }
+    } catch (error) { assertLive(); throw error }
+    finally { signal?.removeEventListener('abort', cancelOwner); owner.dispose() }
     // Canonical identity in the durable log: legacy lowercase names from a
     // model normalize once, here, so permission rules and results match.
     calls = calls.map((call) => canonicalCall(call))
@@ -664,9 +745,9 @@ export class Agent {
     return this.steerRequested ? 'steered' : 'cancelled'
   }
 
-  /** The abort error matching the recorded cause. */
+  /** The error a stopped step unwinds with. */
   private abortError(): Error {
-    return this.abortCause === 'stop' ? new StopRequested() : new Error(`agent: ${this.abortCause}`)
+    return new StopRequested()
   }
 
   private limits(): HarnessLimits {
@@ -694,6 +775,15 @@ function matchClaimedContents(contents: readonly string[], claimed: readonly Inb
     }
   }
   return matched
+}
+
+/** Longest pause between two attempts of one transiently failing model request. */
+const MAX_STEP_RETRY_DELAY_MS = 30_000
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms).unref?.()
+  })
 }
 
 function safeProviderName(ctx: Context): string | undefined {
