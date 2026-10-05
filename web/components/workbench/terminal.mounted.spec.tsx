@@ -501,6 +501,83 @@ describe('terminal panel', () => {
     expect(api.createTerminal).toHaveBeenCalledWith('ws', expect.objectContaining({ projectId: 'project-7' }))
   })
 
+  it('does not auto-open against four hidden workspace terminals', async () => {
+    const onHide = vi.fn()
+    await mount({ projectId: 'project-7', onHide })
+    await act(async () => push({
+      kind: 'snapshot',
+      terminals: ['hidden-1', 'hidden-2', 'hidden-3', 'hidden-4'].map((id, index) => ({
+        ...row(id),
+        ...(index < 3 ? { projectId: 'project-9' } : {}),
+        scrollback: Buffer.from('private output').toString('base64'),
+      })),
+    } as Frame))
+
+    expect(api.createTerminal).not.toHaveBeenCalled()
+    expect(api.killTerminal).not.toHaveBeenCalled()
+    expect(host.textContent).toMatch(/workspace.*limit/i)
+    expect(host.textContent).toContain('other projects')
+    expect(host.textContent).toContain('unbound')
+    expect(MockTerminal.instances).toHaveLength(0)
+    expect(written).not.toContain('private output')
+    const close = host.querySelector<HTMLButtonElement>('button[aria-label="Close hidden terminal hidden-4"]')
+    expect(close).not.toBeNull()
+    await act(async () => close!.click())
+    expect(api.killTerminal).toHaveBeenCalledWith('ws', 'hidden-4')
+    await act(async () => push({ kind: 'exit', terminalId: 'hidden-4', exitCode: 0, reason: 'killed' }))
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1_600))
+    })
+    expect(onHide).not.toHaveBeenCalled()
+    // Freeing capacity is an explicit recovery, not permission to auto-open.
+    expect(api.createTerminal).not.toHaveBeenCalled()
+    const plus = host.querySelector<HTMLButtonElement>('button[aria-label="New terminal"]')!
+    expect(plus.disabled).toBe(false)
+    await act(async () => plus.click())
+    expect(api.createTerminal).toHaveBeenCalledWith('ws', expect.objectContaining({ projectId: 'project-7' }))
+  })
+
+  it('hydrates hidden quota rows from GET without waiting for SSE', async () => {
+    api.listTerminals.mockResolvedValue({
+      terminals: ['hidden-1', 'hidden-2', 'hidden-3', 'hidden-4'].map((id) => ({ ...row(id), projectId: 'project-9' })),
+      shells: [{ id: 'bash', label: 'Git Bash' }], max: 4, available: true,
+    })
+    await mount({ projectId: 'project-7' })
+
+    expect(api.createTerminal).not.toHaveBeenCalled()
+    expect(host.querySelector<HTMLButtonElement>('button[aria-label="New terminal"]')?.disabled).toBe(true)
+    expect(host.querySelector('button[aria-label="Close hidden terminal hidden-1"]')).not.toBeNull()
+    expect(MockTerminal.instances).toHaveLength(0)
+  })
+
+  it('hydrates a create response when SSE is missing, then replays its snapshot once', async () => {
+    api.createTerminal.mockResolvedValue({ ...row('terminal-1'), projectId: 'project-7' })
+    await mount({ projectId: 'project-7' })
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+
+    expect(host.querySelector('button[aria-label="Close Git Bash"]')).not.toBeNull()
+    expect(MockTerminal.instances).toHaveLength(1)
+    await act(async () => push({ kind: 'created', terminal: { ...row('terminal-1'), projectId: 'project-7' } }))
+    await act(async () => push({ kind: 'snapshot', terminals: [{
+      ...row('terminal-1'), projectId: 'project-7', scrollback: Buffer.from('replayed output').toString('base64'),
+    }] } as Frame))
+    expect(MockTerminal.instances).toHaveLength(1)
+    expect(MockTerminal.instances[0]?.writes).toEqual(['replayed output'])
+  })
+
+  it('does not let a late GET resurrect rows removed by a stream snapshot', async () => {
+    let resolve!: (listing: unknown) => void
+    api.listTerminals.mockReturnValue(new Promise((done) => { resolve = done }))
+    await mount({ projectId: 'project-7', bindingReady: false })
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+    await act(async () => resolve({
+      terminals: [{ ...row('stale'), projectId: 'project-9' }],
+      shells: [{ id: 'bash', label: 'Git Bash' }], max: 1, available: true,
+    }))
+    expect(host.querySelector<HTMLButtonElement>('button[aria-label="New terminal"]')?.title).not.toMatch(/At most/)
+    expect(host.querySelector('button[aria-label="Close hidden terminal stale"]')).toBeNull()
+  })
+
   it('disables opening another terminal at the cap', async () => {
     api.listTerminals.mockResolvedValue({
       terminals: [],

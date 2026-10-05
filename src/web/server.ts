@@ -5855,7 +5855,11 @@ async function acceptMessage(
   entry.agent.adoptPending(stillPending)
   entry.agent.enqueueAccepted({ content, inputId, ...(refs.length > 0 ? { attachments: refs } : {}) })
   const wasBusy = entry.agent.busy
-  await dispatchInbox(entry, deps, delivery)
+  if (!await dispatchInbox(entry, deps, delivery)) {
+    // Acceptance is already durable: acknowledge it so callers do not resend
+    // the message. Only dispatch is blocked; /steer can resume the queue later.
+    return { ok: true, status: 202, body: { inputId, queued: true, delivery, dispatchBlocked: 'transport_cleanup' } }
+  }
   return { ok: true, status: 202, body: { inputId, queued: wasBusy && delivery === 'queue', delivery } }
 }
 
@@ -5894,7 +5898,9 @@ async function steerSession(
     return { ok: false, status: 400, error: `configured session provider/model is unavailable: ${String(error instanceof Error ? error.message : error)}` }
   }
   entry.agent.adoptPending(pending)
-  await dispatchInbox(entry, deps, 'steer')
+  if (!await dispatchInbox(entry, deps, 'steer')) {
+    return { ok: false, status: 409, error: 'transport cleanup is unresolved; input remains queued, retry Send now after cleanup settles' }
+  }
   return { ok: true, status: 202, body: { steered: true, pending: waiting.length } }
 }
 
@@ -5904,7 +5910,10 @@ async function steerSession(
  * steer: stop the turn — children included, like Stop — and let the agent
  * re-run the inbox once the stopped run settles.
  */
-async function dispatchInbox(entry: SessionEntry, deps: HandlerDeps, delivery: 'queue' | 'steer'): Promise<void> {
+async function dispatchInbox(entry: SessionEntry, deps: HandlerDeps, delivery: 'queue' | 'steer'): Promise<boolean> {
+  // Uncertain transport ownership is not a live driver to steer. Keep input
+  // queued, and never acknowledge Send now as dispatched until cleanup is verified.
+  if (deps.kernel.ctx.llm.sessionUncertain(entry.session.id)) return delivery === 'queue'
   if (!entry.agent.busy) {
     // Fire-and-forget: the reply (and any failure, which closes the turn
     // durably) reaches the client through the SSE stream.
@@ -5913,12 +5922,13 @@ async function dispatchInbox(entry: SessionEntry, deps: HandlerDeps, delivery: '
       console.error(`web: agent run failed for ${entry.session.id}: ${message}`)
       deps.kernel.ctx.emit('web/turn-error', { sessionId: entry.session.id, message })
     })
-    return
+    return true
   }
   if (delivery === 'steer') {
     entry.agent.steer()
     await deps.childExecutor.cancelAllOfRoot(entry.session.id)
   }
+  return true
 }
 
 async function putSessionModel(

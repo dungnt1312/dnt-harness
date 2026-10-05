@@ -160,7 +160,7 @@ describe('input acceptance over REST', () => {
         },
       }
     }
-    type LogEvent = { type: string; reason?: string; content?: string; delivery?: string }
+    type LogEvent = { type: string; reason?: string; content?: string; delivery?: string; inputId?: string }
     const ws = (id: string, action: string): string => `/api/workspaces/default/sessions/${id}/${action}`
     async function events(base: string, id: string): Promise<LogEvent[]> {
       const response = await fetch(`${base}${ws(id, 'events')}`)
@@ -189,6 +189,59 @@ describe('input acceptance over REST', () => {
     const ends = (log: LogEvent[]): string[] => log.flatMap((e) => e.type === 'turn/end' ? [e.reason ?? ''] : [])
     const users = (log: LogEvent[]): string[] => log.flatMap((e) => e.type === 'user/message' ? [e.content ?? ''] : [])
     const stepping = (log: LogEvent[]): boolean => log.some((e) => e.type === 'step/start')
+
+    it.each([false, true])('Send now gates unresolved cleanup then restarts after late settlement (conflict=%s)', async conflict => {
+      let calls = 0
+      let transportSettled!: () => void
+      const provider: LlmProvider = { name: 'hang', models: ['hang'], stream(_request, options) {
+        calls++
+        if (calls === 1) {
+          transportSettled = () => options?.onTransportSettled?.()
+          return { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }) }
+        }
+        return (async function* () {
+          yield { type: 'delta', delta: 'reply' } as const
+          yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } as const
+        })()
+      } }
+      const server = await createWebServer({ root, providers: [provider] })
+      try {
+        const { id } = (await (await post(server.url, '/api/sessions')).json()) as { id: string }
+        await post(server.url, ws(id, 'messages'), { content: 'first' })
+        await settle(server.url, id, () => calls === 1)
+        await post(server.url, ws(id, 'messages'), { content: 'left behind' })
+        await post(server.url, ws(id, 'stop'))
+        const stopped = await settle(server.url, id, l => ends(l).length === 1)
+        expect(ends(stopped)).toEqual(['cancelled'])
+        if (conflict) {
+          const unresolved = await post(server.url, ws(id, 'steer'))
+          expect(unresolved.status).toBe(409)
+          expect(await unresolved.json()).toMatchObject({ error: expect.stringMatching(/cleanup|uncertain/i) })
+          expect(calls).toBe(1)
+          const newInput = await post(server.url, ws(id, 'messages'), { content: 'also queued', delivery: 'steer' })
+          expect(newInput.status).toBe(202)
+          const accepted = await newInput.json() as { inputId: string }
+          expect(accepted).toEqual({
+            inputId: expect.any(String), queued: true, delivery: 'steer', dispatchBlocked: 'transport_cleanup',
+          })
+          expect(accepted.inputId).not.toBe('')
+          const queued = (await events(server.url, id)).filter(e => e.type === 'input/queued' && e.content === 'also queued')
+          expect(queued).toHaveLength(1)
+          expect(queued[0]?.inputId).toBe(accepted.inputId)
+          expect(calls).toBe(1)
+        }
+        transportSettled()
+        await new Promise(resolve => setTimeout(resolve, 50))
+        expect(calls).toBe(1) // late cleanup alone must not advance a Stop queue
+        expect(users(await events(server.url, id))).toEqual(['first'])
+        expect((await post(server.url, ws(id, 'steer'))).status).toBe(202)
+        const log = await settle(server.url, id, l => ends(l).length === 2)
+        expect(ends(log)).toEqual(['cancelled', 'completed'])
+        expect(users(log)).toEqual(conflict ? ['first', 'left behind', 'also queued'] : ['first', 'left behind'])
+        expect(await (await post(server.url, ws(id, 'steer'))).json()).toEqual({ steered: false, pending: 0 })
+        expect(calls).toBe(2)
+      } finally { transportSettled?.(); await server.close() }
+    })
 
     it('delivery:steer stops the running turn and runs the old queue plus the new message', async () => {
       const server = await createWebServer({ root, providers: [steerableProvider()] })

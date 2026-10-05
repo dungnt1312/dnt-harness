@@ -60,7 +60,18 @@ class StorageFailed extends Error {
  * further executes against unrecorded state.
  */
 export class Agent {
-  status: AgentStatus = 'idle'
+  private currentStatus: AgentStatus = 'idle'
+
+  /** Reconcile only verified transport cleanup after the driver has exited. */
+  get status(): AgentStatus {
+    if (this.currentStatus === 'cancelling' && this.abortController === null
+      && !this.ctx.llm.sessionUncertain(this.session.id)) {
+      this.currentStatus = 'idle'
+    }
+    return this.currentStatus
+  }
+
+  set status(value: AgentStatus) { this.currentStatus = value }
   /** What the driver is currently busy with (transient, for status UIs). */
   activity: 'model' | 'tool' | null = null
 

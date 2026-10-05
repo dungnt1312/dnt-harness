@@ -51,9 +51,16 @@ export function withLegacyCompletion(provider: LlmProvider): LlmProvider {
 /** Await transport cancellation for at most the spec cleanup grace. */
 export async function cancelReader(reader: ReadableStreamDefaultReader<Uint8Array>, onSettled?: () => void): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined
+  // Capture terminal stream failure BEFORE cancellation. cancel() on an
+  // already-errored fetch body rejects with its stored AbortError; that is
+  // different from an underlying source whose cancellation itself fails.
+  let alreadyErrored = false
+  const closed = reader.closed.then(() => {}, () => { alreadyErrored = true })
+  await Promise.resolve()
+  const confirm = (): boolean => { try { onSettled?.() } catch { /* notification only */ }; return true }
   try {
     return await Promise.race([
-      reader.cancel().then(() => { try { onSettled?.() } catch { /* notification only */ }; return true }, () => false),
+      alreadyErrored ? closed.then(confirm) : reader.cancel().then(confirm, () => false),
       new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 10_000); timer.unref?.() }),
     ])
   } finally { if (timer !== undefined) clearTimeout(timer) }

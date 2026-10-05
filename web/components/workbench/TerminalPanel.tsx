@@ -94,6 +94,7 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
   // The view shows one project's shells. A terminal with no project only
   // appears while no project is open.
   const visibleRows = rows.filter((row) => (row.projectId ?? null) === projectId)
+  const hiddenRows = rows.filter((row) => (row.projectId ?? null) !== projectId)
   const [shells, setShells] = useState<readonly ShellRow[]>([])
   const [max, setMax] = useState(4)
   const [unavailable, setUnavailable] = useState<string | null>(null)
@@ -206,6 +207,7 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
   useEffect(() => {
     if (workspaceId === null) return undefined
     let live = true
+    let streamReceived = false
     const instances = attached.current
 
     void listTerminals(workspaceId).then((listing) => {
@@ -213,12 +215,19 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
       setShells(listing.shells)
       setMax(listing.max)
       setUnavailable(listing.available ? null : listing.unavailable ?? 'no PTY backend on this host')
+      // GET supplies quota metadata even if EventSource never connects. A
+      // later GET must not overwrite newer stream truth; only SSE replays output.
+      if (!streamReceived) {
+        rowsRef.current = listing.terminals
+        setRows(listing.terminals)
+      }
     }).catch((cause: unknown) => {
       if (live) setError(String(cause))
     })
 
     const unsubscribe = subscribeTerminals(workspaceId, (frame) => {
       if (!live) return
+      streamReceived = true
       if (frame.kind === 'snapshot') {
         // A snapshot also arrives on every EventSource reconnect, so it must
         // be treated as the full truth, not as more output: replay it into a
@@ -297,12 +306,13 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
       // invite a fresh shell.
       const record = attached.current.get(frame.terminalId)
       record?.term.write(`\r\n\u001b[2m[${frame.reason === 'idle' ? 'closed: idle' : `exited: ${frame.exitCode}`}]\u001b[0m\r\n`)
+      const exitedHere = rowsRef.current.some((row) => row.id === frame.terminalId && (row.projectId ?? null) === projectId)
       const remaining = rowsRef.current.filter((row) => row.id !== frame.terminalId)
       rowsRef.current = remaining
       setRows(remaining)
       setActiveId((current) => (current === frame.terminalId ? null : current))
       window.setTimeout(() => detach(frame.terminalId), EXIT_NOTICE_MS)
-      if (onHideRef.current === undefined) return
+      if (!exitedHere || onHideRef.current === undefined) return
       if (remaining.some((row) => (row.projectId ?? null) === projectId)) return
       if (surfaceCloseTimer.current !== undefined) clearTimeout(surfaceCloseTimer.current)
       surfaceCloseTimer.current = setTimeout(() => {
@@ -327,16 +337,27 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
     if (workspaceId === null) return
     setError(null)
     try {
-      await createTerminal(workspaceId, {
+      const terminal = await createTerminal(workspaceId, {
         cols: 80,
         rows: 24,
         ...(shellId !== undefined ? { shellId } : {}),
         ...(projectId !== null ? { projectId } : {}),
       })
+      // The response and SSE created frame may arrive in either order (or
+      // SSE may be absent). Adopt metadata idempotently, never replay here.
+      if (!rowsRef.current.some((row) => row.id === terminal.id)) {
+        const next = [...rowsRef.current, terminal]
+        rowsRef.current = next
+        setRows(next)
+      }
+      if ((terminal.projectId ?? null) === projectId) {
+        attach(terminal.id, terminal.cols, terminal.rows)
+        setActiveId(terminal.id)
+      }
     } catch (cause: unknown) {
       setError(String(cause))
     }
-  }, [workspaceId, projectId])
+  }, [workspaceId, projectId, attach])
 
   /**
    * The remembered shell, but only while the host still offers it — an
@@ -357,9 +378,9 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
   useEffect(() => {
     if (!ready || !bindingReady || autoOpened.current || unavailable !== null) return
     autoOpened.current = true
-    if (visibleRows.length > 0) return
+    if (visibleRows.length > 0 || rows.length >= max) return
     void open(preferredShell)
-  }, [ready, bindingReady, unavailable, visibleRows.length, preferredShell, open])
+  }, [ready, bindingReady, unavailable, visibleRows.length, rows.length, max, preferredShell, open])
 
   // Only the selected terminal is visible, and it refits whenever it becomes
   // so: xterm cannot measure a hidden element, so fitting on mount alone
@@ -543,9 +564,31 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
           <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
             <Icon name="terminal" size={22} className="text-fg-faint" />
             <p className="m-0 text-sm font-medium">No terminal open</p>
-            <p className="m-0 max-w-xs text-[13px] text-fg-muted">
-              Open one to run commands yourself. This shell is separate from the assistant&apos;s tools.
+            <p className="m-0 max-w-sm text-[13px] text-fg-muted">
+              {atCap && hiddenRows.length > 0
+                ? `Workspace terminal limit reached (${rows.length}/${max}). Terminals in other projects or unbound shells occupy the quota. Close one explicitly to free a slot, then use New terminal.`
+                : 'Open one to run commands yourself. This shell is separate from the assistant\'s tools.'}
             </p>
+            {hiddenRows.length > 0 ? (
+              <div className="flex max-h-40 w-full max-w-sm flex-col gap-1 overflow-y-auto px-3 text-[12px]">
+                <p className="m-0 text-fg-muted">Hidden workspace terminals (closing stops the shell):</p>
+                {hiddenRows.map((row) => (
+                  <div key={row.id} className="flex items-center justify-between gap-2">
+                    <span className="min-w-0 truncate text-fg-muted">
+                      {row.id} — {row.projectId === undefined ? 'Unbound shell' : 'Other project'}
+                    </span>
+                    <button
+                      type="button"
+                      aria-label={`Close hidden terminal ${row.id}`}
+                      className="shrink-0 rounded px-2 py-1 text-danger hover:bg-hover"
+                      onClick={() => void close(row.id)}
+                    >
+                      Close shell
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
           </div>
         ) : null}
       </div>

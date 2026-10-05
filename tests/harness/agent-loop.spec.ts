@@ -85,6 +85,47 @@ describe('agent loop', () => {
       expect(kernel.ctx.llm.admission('cleanup').active).toBe(0)
     } finally { vi.useRealTimers(); await kernel.stop() }
   })
+  it('reconciles late verified settlement without advancing a plain Stop queue or overlapping drivers', async () => {
+    let starts = 0
+    let settled!: () => void
+    const provider: LlmProvider = { name: 'late-cleanup', stream(_request, options) {
+      starts++
+      if (starts === 1) {
+        settled = () => options?.onTransportSettled?.()
+        return { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }) }
+      }
+      return (async function* () {
+        yield { type: 'delta', delta: 'resumed' } as const
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } as const
+      })()
+    } }
+    const { kernel, session, agent } = harness([], provider)
+    try {
+      agent.send('first')
+      const running = agent.run()
+      await vi.waitFor(() => expect(starts).toBe(1))
+      await agent.run()
+      expect(starts).toBe(1)
+      agent.send('queued')
+      agent.stop()
+      await running
+      expect(agent.busy).toBe(true)
+      expect(agent.status).toBe('cancelling')
+      await agent.run()
+      expect(starts).toBe(1)
+      expect(kernel.ctx.llm.sessionUncertain(session.id)).toBe(true)
+      settled()
+      expect(kernel.ctx.llm.sessionUncertain(session.id)).toBe(false)
+      expect(agent.busy).toBe(false)
+      expect(agent.status).toBe('idle')
+      expect(starts).toBe(1)
+      expect(agent.pendingCount).toBe(1)
+      await agent.run()
+      expect(starts).toBe(2)
+      expect(agent.pendingCount).toBe(0)
+    } finally { settled?.(); await kernel.stop() }
+  })
+
   it('one turn produces the durable event order turn→step→chunks→message→turn/end', async () => {
     const { kernel, session, agent } = harness(['Hi there'])
 
