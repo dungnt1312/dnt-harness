@@ -18,7 +18,7 @@ src/harness/
 ├── modes/     Four bundled + custom file modes (instructions, sources, exposure, permissions)
 ├── context/   Mode-driven builder: budget, trim order, compaction, per-request manifest
 ├── skills/    Workspace skill files + on-demand, mode-gated loading
-├── memory/    Workspace/project Markdown memory + five tools
+├── memory/    Workspace/project Markdown topic files + MEMORY.md indexes
 ├── agents/    Definitions, bounded one-level delegation, Claude/Codex adapters
 ├── mcp/       MCP client (stdio + Streamable HTTP), config/secrets, health/retry/breaker
 ├── hooks/     Command hook runner behind the tool-gate waterfalls
@@ -279,7 +279,7 @@ mount order never matters.
 `agentScope.run({ sessionId }, fn)` — an `AsyncLocalStorage` populated while a
 turn is in flight. Tool pipeline listeners (like the web approval bridge) read
 it to attribute a tool call to the right session; the store is absent outside
-any run. This is the miniature counterpart of the upstream initiator scope.
+any run. This scope carries the initiator's identity through the run.
 
 ## Tool pipeline (`tools/`)
 
@@ -329,8 +329,9 @@ executes.
 ## Managed commands and background processes (`processes/`)
 
 Managed Bash waits 120 s by default (maximum 600 s), then auto-backgrounds eligible
-commands without killing or rerunning. First-token `sleep` and session-less calls
-retain deadline termination. `BashOutput` accepts `block` (default false) and
+commands without killing or rerunning. A bare `sleep` (including leading
+`VAR=value` assignments) and session-less calls retain deadline termination.
+`BashOutput` accepts `block` (default false) and
 `timeoutMs` (default 30000, maximum 600000); expiry/abort ends waiting, not execution.
 Normal child completion retains processes under the child owner. Cancel child stops
 them, including retained processes of a completed child, without rewriting its result.
@@ -344,7 +345,9 @@ ignores the turn's abort signal, so it survives the turn. The host-owned
 `ProcessRegistry` (`src/harness/processes/registry.ts`) keeps the child per
 session, a 64 KB head-capped output ring, and kills through the shell
 capability's `killTree` (process-group kill on POSIX; `taskkill /T` plus an
-MSYS environment-tag sweep on Windows).
+MSYS environment-tag sweep on Windows). Ended records stay readable for one
+hour (configurable via `endedRetentionMs`) and are pruned on later lookups;
+the durable event log remains the archive.
 
 - Caps: **8 running per session**, **24 host-global**; beyond either, the call
   fails with an actionable error. No queueing.
@@ -536,8 +539,8 @@ fails *transiently before producing any output* — `ProviderError.transient`,
 e.g. a stream that closed empty — is asked again with exponential backoff, 3
 extra attempts by default; a stop cancels the wait, and a failure after output
 started is never retried), `toolTimeoutMs`, `approvalExpiryMs`, `toolOutputLimit`,
-`maxPendingInputs`, `automaticCompactionPressure` (usedTokens/availableTokens
-ratio from the session's newest context manifest that triggers automatic
+`maxPendingInputs`, `automaticCompactionPressure` (estimated pre-trim tokens/availableTokens
+ratio from the settled turn's fresh context manifest that triggers automatic
 compaction at a completed boundary; 0 disables), `compactionTailTurns`
 (latest covered completed turns duplicated raw beside the summary,
 default 4; 0 disables covered duplication, not uncovered history), plus composer-attachment limits
@@ -550,12 +553,18 @@ silently under-count).
 
 Every model request is assembled by one context builder
 (`src/harness/context/builder.ts`) from the active mode's definition
-(`src/harness/modes/`): system + mode instructions, workspace/project
+(`src/harness/modes/`) — the full message layout, trust model, environment
+block, and trim order are normative in `docs/prompt-contract.md` and locked
+by `tests/harness/g5-prompt-contract.spec.ts`. In short: one trusted system
+message (base prompt or child preamble + capability line + role body, mode
+instructions, the `<environment_context>` date/platform/workspace/git
+block, file scope, compaction continuation note), then wrapped lower-trust
+system messages for workspace/project
 instructions, history per the mode's history setting (`none`/`recent`/
 `compact` — `none` still keeps the current turn's tool loop; `compact` reads
 a compaction checkpoint when one exists and equals `recent` when none does —
 nothing is dropped without a summary covering it), active skills,
-pinned/retrieved memory, tool results and the schemas the mode's exposure
+bounded MEMORY.md indexes (never pinned topic bodies), tool results and the schemas the mode's exposure
 ceiling allows. The budget is `context window − output reserve − safety
 margin` — the window is the operator's per-model override when set
 (verified), else the shared model catalog's documented value for the model
@@ -582,18 +591,52 @@ Trusted context frames this as the same conversation continuing after compaction
 not a new session, and recent raw conversation may supersede the summary.
 The summary itself remains lower-trust reference data, never authoritative instructions.
 The host summarizer uses the session's effective (provider, model) pair with a
-structured-section prompt (`COMPACT_SUMMARY_PROMPT`). It folds the entire covered
-projection chronologically through bounded requests, carrying the accumulated
-summary into each later request. Each conversation-source payload, including the
-accumulated summary, is at most 200,000 characters; returned summaries are at
-most 24,000 characters. Failed, empty, or oversized output prevents publication
+structured-section prompt (`COMPACT_SUMMARY_PROMPT`). Folding is incremental:
+when a valid canonical checkpoint exists, it seeds the accumulated summary and
+only the uncovered delta beyond `coversSeq` is projected and folded — a repeat
+attempt never re-summarizes already-covered history, and an unchanged boundary
+is an idempotent no-op that appends no lifecycle events. The delta folds
+chronologically through bounded requests, carrying the accumulated summary
+into each later request. Each conversation-source payload, including the
+accumulated summary, is at most 200,000 characters; returned summaries are
+at most 24,000 characters. An invalid seed (unproven boundary, empty or
+oversized summary) fails closed rather than silently folding from scratch.
+A transient provider failure re-asks the same chunk with agent-loop retry
+policy (`stepRetries`, exponential backoff); each attempt's partial output is
+discarded, so a retry never duplicates text. When one chunk's answer would
+exceed the cap, it is re-asked once with an explicit hard-length constraint;
+still-oversized, failed, empty output prevents publication
 of a new checkpoint rather than silently claiming partial coverage. An explicit
 `maxChars` source cap rejects insufficient bounds instead of slicing the source.
 With no model pair, the extractive fallback preserves the exact source only if
 it fits within 24,000 characters, otherwise it fails explicitly.
-Automatic compaction triggers on context pressure —
-`usedTokens/availableTokens` from the newest manifest at a settled boundary —
-and PreCompact hooks gate both the manual route and the automatic trigger.
+Automatic compaction triggers only for compact-history mode after a completed
+turn, using that turn's fresh estimated `preTrimTokens/availableTokens` pressure
+(falling back to `usedTokens` for older manifests). This measures pressure before
+microcompaction and budget trimming, not provider-measured token usage. Attempts
+are deduplicated by completed boundary; rejected, empty, failed and cancelled
+turns never reuse stale pressure. The standard web bin enables 0.85; embedded
+hosts default to disabled and explicit zero disables it. Headless integration
+is deferred. PreCompact hooks gate both manual and automatic attempts under one
+per-session reservation. New inputs may be durably queued but cannot run a model
+until maintenance settles; Stop/delete/shutdown cancel maintenance without
+advancing queued input. Cancellation reaches the running PreCompact command's
+process tree and prevents subsequent hooks from starting.
+
+A successful durable canonical `compaction/end` is the authority. Checkpoint
+JSON is an atomic, rebuildable cache: loaders validate coverage against session
+facts and recover missing/corrupt cache from qualifying canonical success.
+The builder also requires the supplied summary and coverage to match qualifying
+canonical success; a closed turn alone cannot authorize invented summary text.
+Unproven legacy or invalid coverage leaves history intact. Summarizer streams
+require exactly one valid settled stop completion, no tool calls and bounded
+nonempty text; configured first-progress, idle and total logical-request
+deadlines and provider ownership apply. Text attachments use ordinary bounded
+loading; images are explicit references, never claims about unseen pixels.
+Compaction does not rewrite the last-request manifest: only the next real
+request demonstrates consumption. Covered raw duplication may shrink by whole
+turns to fit, with explicit omissions; the default four and explicit zero do
+not cap uncovered history.
 Every attempt is durably visible through two log-only events:
 `compaction/start` opens the transaction before the summarizer runs, and
 `compaction/end` closes it with the stored summary (or `error` on failure) —

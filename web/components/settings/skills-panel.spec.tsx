@@ -23,13 +23,16 @@ const mocked = vi.mocked({ listSkills, getSkill, saveSkill, deleteSkill, setSkil
 const row = (name: string, source: 'project' | 'workspace' | 'user', extra: Record<string, unknown> = {}) =>
   ({ name, title: name, description: `${name} does things`, source, hash: `hash-${name}`, ...extra })
 
+/** Like the real API: a project-scoped list carries EVERY layer, project rows first. */
+const baseList = () => [row('ws-skill', 'workspace'), row('user-skill', 'user', { ruleId: 'user' })]
+
 beforeEach(() => {
   mocked.listSkills.mockImplementation(async (_ws: string, projectId?: string) =>
     projectId === undefined
-      ? [row('ws-skill', 'workspace'), row('user-skill', 'user', { ruleId: 'user' })]
+      ? baseList()
       : projectId === 'p1'
-        ? [row('proj-claude', 'project', { ruleId: 'project-claude' })]
-        : [])
+        ? [row('proj-claude', 'project', { ruleId: 'project-claude' }), ...baseList()]
+        : baseList())
   mocked.getSkillSources.mockResolvedValue({ rules: [
     { id: 'project-claude', kind: 'project', path: '.claude/skills', enabled: true },
     { id: 'project-agents', kind: 'project', path: '.agents/skills', enabled: true },
@@ -86,15 +89,47 @@ describe('SkillsPanel skills tab', () => {
     expect(document.body.textContent).toContain('~/.claude/skills')
   })
 
+  it('does not mark base rows shadowed just because project lists include every layer', async () => {
+    await renderPanel()
+    expect(document.body.querySelector('[aria-label="shadowed"]')).toBeNull()
+  })
+
   it('marks a base row shadowed when a project defines the same name', async () => {
     mocked.listSkills.mockImplementation(async (_ws: string, projectId?: string) =>
       projectId === 'p1'
-        ? [row('ws-skill', 'project', { ruleId: 'project-claude' })]
-        : [row('ws-skill', 'workspace')])
+        ? [row('ws-skill', 'project', { ruleId: 'project-claude' }), row('user-skill', 'user', { ruleId: 'user' })]
+        : projectId === undefined
+          ? [row('ws-skill', 'workspace'), row('user-skill', 'user', { ruleId: 'user' })]
+          : [row('ws-skill', 'workspace'), row('user-skill', 'user', { ruleId: 'user' })])
     await renderPanel()
-    const dot = document.body.querySelector('[aria-label="shadowed"]')
-    expect(dot).not.toBeNull()
-    expect(dot?.getAttribute('title')).toContain('Alpha')
+    const dots = [...document.body.querySelectorAll('[aria-label="shadowed"]')]
+    // Only ws-skill (project-owned in Alpha) is shadowed, and only by Alpha.
+    expect(dots).toHaveLength(1)
+    expect(dots[0]?.getAttribute('title')).toContain('Alpha')
+    expect(dots[0]?.getAttribute('title')).not.toContain('Beta')
+    // The project copy itself carries the "overrides" marker naming the layer it replaces.
+    const overrides = document.body.querySelector('[aria-label="overrides"]')
+    expect(overrides).not.toBeNull()
+    expect(overrides?.getAttribute('title')).toContain('workspace')
+  })
+
+  it('a project row without a base twin carries no overrides marker', async () => {
+    await renderPanel()
+    expect(document.body.querySelector('[aria-label="overrides"]')).toBeNull()
+  })
+
+  it('save warnings from the server surface in the notice', async () => {
+    mocked.saveSkill.mockResolvedValue({ name: 'ws-skill', hash: 'hash-new', warnings: ['Project folders define the same name and win in their sessions: Alpha.'] })
+    await renderPanel()
+    await act(async () => button('ws-skill').click())
+    await settle()
+    await act(async () => button('Edit raw').click())
+    await settle()
+    const area = document.body.querySelector<HTMLTextAreaElement>('textarea')!
+    await act(async () => type(area, '---\nname: ws-skill\ndescription: x\n---\n\nNEW BODY'))
+    await act(async () => button('Save skill').click())
+    await settle()
+    expect(document.body.textContent).toContain('win in their sessions: Alpha')
   })
 
   it('opens the detail pane with rendered preview and edit only for workspace rows', async () => {
@@ -172,6 +207,18 @@ describe('SkillsPanel skills tab', () => {
     await settle()
     expect(document.body.textContent).toContain('New skill')
     expect(document.body.querySelector('textarea')).not.toBeNull()
+  })
+
+  it("refuses the reserved name 'sources' before saving", async () => {
+    await renderPanel()
+    await act(async () => button('New skill').click())
+    await settle()
+    const input = document.body.querySelector<HTMLInputElement>('input[placeholder="deploy-notes"]')!
+    await act(async () => type(input, 'sources'))
+    await act(async () => type(document.body.querySelector<HTMLTextAreaElement>('textarea')!, '---\nname: sources\n---\n\nBODY'))
+    await settle()
+    expect(document.body.textContent).toContain('reserved')
+    expect(button('Save skill').disabled).toBe(true)
   })
 })
 

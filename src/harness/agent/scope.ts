@@ -5,11 +5,11 @@ import type { GrantedRoot } from '../tools/types.ts'
 /**
  * The ambient agent scope: while `Agent.run()` drives a turn, pipeline
  * listeners can read which session/workspace/project is executing — the
- * miniature counterpart of the upstream initiator scope. The workspace and
- * project come from the host at agent creation and are fixed for the run:
- * model-supplied arguments can never choose a different workspace, and
- * approval routing, tool grants, and scoped controls all resolve through
- * this store. The store is absent outside any run.
+ * same initiator-scope idea found in other agent harnesses, rebuilt here.
+ * The workspace and project come from the host at agent creation and are
+ * fixed for the run: model-supplied arguments can never choose a different
+ * workspace, and approval routing, tool grants, and scoped controls all
+ * resolve through this store. The store is absent outside any run.
  */
 export interface AgentScope {
   readonly sessionId: SessionId
@@ -39,6 +39,8 @@ export interface AgentScope {
      * ceiling below is the enforcement).
      */
     readonly instructions: string
+    /** Provenance of the pinned definition (bundled role vs workspace file). */
+    readonly definitionSource?: 'bundled' | 'workspace'
     /** Hard ceiling: admission exposure ∩ definition ∩ spawn grant (MCP explicit). */
     readonly toolCeiling: readonly string[]
     /**

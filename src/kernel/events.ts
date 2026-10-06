@@ -14,7 +14,7 @@
  * ```
  *
  * Every method also carries an untyped string-key overload for code that
- * dispatches dynamically (loaders, bridges), mirroring Cordis.
+ * dispatches dynamically (loaders, bridges).
  */
 export interface Events {}
 

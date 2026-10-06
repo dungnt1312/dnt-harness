@@ -10,7 +10,7 @@ dnt-harness already has two out-of-process extension tiers, both in production s
 - **MCP servers** are external tool plugins: their tools enter the same registry, the same guarded pipeline, and the same approval gates as built-ins (`docs/decisions/mcp-production-boundaries.md`).
 - **Hooks** are external lifecycle scripts with blocking decisions (`src/harness/hooks/runner.ts`).
 
-"Plugin" in the rest of this document means the third tier: an **in-process Cordis plugin** mounted on the kernel. The kernel (`src/kernel/`) and every seam a plugin needs on the agent side already exist and are dogfooded — the harness itself mounts as plugins. What is missing is the platform around the kernel: no production bin loads a composition file, the web host has no route registration seam, and the package surface is not published. This spec closes exactly those three gaps and nothing else.
+"Plugin" in the rest of this document means the third tier: an **in-process kernel plugin** mounted on the kernel. The kernel (`src/kernel/`) and every seam a plugin needs on the agent side already exist and are dogfooded — the harness itself mounts as plugins. What is missing is the platform around the kernel: no production bin loads a composition file, the web host has no route registration seam, and the package surface is not published. This spec closes exactly those three gaps and nothing else.
 
 ## Composition and loading
 

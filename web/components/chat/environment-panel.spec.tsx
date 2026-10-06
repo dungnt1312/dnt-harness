@@ -232,6 +232,27 @@ it('stops a running subagent from its panel row', async () => {
   expect(onOpenChild).not.toHaveBeenCalled()
 })
 
+it('settles a stuck running subagent from the host registry', async () => {
+  // The child list answers a failed child; the result event never arrived.
+  const fetchMock = vi.fn().mockImplementation((url: string) => {
+    if (String(url).includes('/agents/children?root=')) {
+      return Promise.resolve(new Response(JSON.stringify([{ childSessionId: 'child-3', status: 'failed', definitionName: 'explorer', startedAt: 1 }]), { status: 200 }))
+    }
+    return Promise.resolve(new Response('[]', { status: 200 }))
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  const spawn = ev('agent/child-spawn', { childSessionId: 'child-3', definition: 'explorer', brief: 'Fix the flaky spec' })
+  await render({ ...base, events: [spawn] })
+  // The registry fold settles the row during the first render: it folds behind
+  // the ended group; open it to read the host's verdict.
+  const section = () => host.querySelector('section[aria-label="Subagents"]')!.textContent ?? ''
+  expect(section()).not.toContain('running')
+  expect(section()).toContain('Ended · 1')
+  await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Toggle ended subagents"]')!.click())
+  expect(section()).toContain('failed')
+  expect(fetchMock).toHaveBeenCalledWith('/api/workspaces/ws/agents/children?root=s1', expect.anything())
+})
+
 it('folds ended subagents behind a toggle and clears them', async () => {
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('[]', { status: 200 })))
   const events = [

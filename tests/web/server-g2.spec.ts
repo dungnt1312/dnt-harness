@@ -152,6 +152,41 @@ describe('workspace HTTP surface', () => {
     expect(cross.status).toBe(404)
   })
 
+  it('unbound Read rejects relative paths but accepts its absolute scoped memory index', async () => {
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g2-memory-'))
+    let memoryPath = ''
+    const provider: LlmProvider = {
+      name: 'memory-reader', models: ['memory-reader'],
+      async *stream(request) {
+        if (!request.messages.some((message) => message.role === 'tool')) {
+          const target = request.messages.some((message) => message.role === 'user' && message.content === 'memory index') ? memoryPath : 'marker.txt'
+          yield { type: 'toolCalls', calls: [{ id: 'read-memory', name: 'Read', args: { path: target } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+          return
+        }
+        yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json') })
+    try {
+      const wsId = ((await (await fetch(`${server.url}/api/workspaces`)).json()) as WorkspaceRow[])[0]!.id
+      memoryPath = path.join(home, 'workspaces', wsId, 'memory', 'workspace', 'MEMORY.md')
+      await fs.mkdir(path.dirname(memoryPath), { recursive: true })
+      await fs.writeFile(memoryPath, 'Scoped memory index\n')
+      for (const [content, expected] of [['relative read', /no workspace root is granted/], ['memory index', /Scoped memory index/]] as const) {
+        const { id } = await (await post(server.url, `/api/workspaces/${wsId}/sessions`)).json() as { id: string }
+        void post(server.url, `/api/workspaces/${wsId}/sessions/${id}/messages`, { content })
+        const result = await readFirstToolResult(server.url, wsId, id)
+        expect(result.output).toMatch(expected)
+        expect(result.ok).toBe(content === 'memory index')
+      }
+    } finally {
+      await server.close()
+      await fs.rm(home, { recursive: true, force: true })
+    }
+  })
+
   it('PUT projects/order persists a dragged sidebar folder order', async () => {
     const server = await start()
     const base = server.url

@@ -3,7 +3,7 @@
 Capabilities are just tools registered into `ctx.tools`. This doc covers the
 tool families a model can call: a granted-root filesystem toolset (canonical
 names `Read`, `Write`, `Edit`, `Glob`, `Grep`) and a real-Bash shell tool in
-`src/capabilities/`, plus the harness-registered `Skill`, `Agent`, five memory tools,
+`src/capabilities/`, plus the harness-registered `Skill`, `Agent`,
 and the dynamically discovered `mcp__<server>__<tool>` family. The six
 Claude-style built-ins are the canonical identity: legacy lowercase names
 (`read`, `write`, ...) arriving from a model or an old permission map normalize
@@ -43,8 +43,10 @@ A run may use the **primary root** (the project folder, read-write) and any
 
 Every grant source goes through one validator (`src/web/folder-grants.ts`):
 absolute existing directories only; never a drive root, the home folder
-itself, a network/device path, anything overlapping app storage or the user
-skills folder, or anything overlapping the project's own folder (so a
+itself, a network/device path, anything overlapping app storage, the user or
+bundled skills folder, or any enabled absolute skill-rule folder of ANY
+workspace (recomputed from every workspace's rules at startup and after each
+rules save), or anything overlapping the project's own folder (so a
 relative path can never bypass a read-only grant).
 
 The model is told the granted folders in its system block; Glob/Grep print
@@ -112,8 +114,9 @@ marker. Argument errors throw inside `execute` and surface as failed
   `[terminated: timeout or stop]` marker, or `[terminated by stop]`.
 - **Foreground wait & stop**: managed commands wait 120 s by default, up to
   600 s via `timeoutMs`. Eligible commands still running return a process ID
-  without killing or respawning; use `BashOutput` to watch. First-token `sleep`
-  and session-less calls retain foreground deadline termination. Foreground Stop
+  without killing or respawning; use `BashOutput` to watch. A bare `sleep`
+  (including leading `VAR=value` assignments) and session-less calls retain
+  foreground deadline termination. Foreground Stop
   kills the tree; committed background commands survive root turn Stop.
 - **Child lifecycle**: explicit child cancellation stops owned processes; normal
   completion retains ownership and execution. Child background Bash has a configurable
@@ -142,10 +145,31 @@ custom patterns; per-command exception handling is deferred.
 `Skill` loads one workspace skill's instructions **on demand** — there is no
 classifier and no auto-load:
 
-- **Layered catalog**: names resolve workspace (`<data-dir>/workspaces/<id>/skills`)
-  > user (`userSkillsDir`; the web bin passes `~/.claude/skills`) > bundled.
-  Only workspace skills are writable; a workspace skill shadows a same-named
-  user or bundled one.
+- **Layered catalog**: each workspace keeps an ordered list of source rules
+  (`<data-dir>/workspaces/<id>/skills/sources.json`; Settings → Skills →
+  Source folders). Rule kinds: `project` (a folder relative to the session's
+  bound project, contained inside it), `workspace`
+  (`<data-dir>/workspaces/<id>/skills`), and `absolute` (an absolute folder;
+  `~` expands; saving an ENABLED rule that is a drive root, the home
+  folder, or any ancestor of it is refused — case-insensitively on macOS and
+  Windows; such a rule already stored keeps the rest of the list and is just
+  skipped). Defaults: `.claude/skills` > `.agents/skills` >
+  workspace > user (`userSkillsDir`; the web bin passes `~/.claude/skills`).
+  The bundled layer (`bundledSkillsDir`) always rides last. The first layer
+  holding a name wins — the catalog, `Skill` load, the settings tree, and
+  agent-definition `skills:` preloads all resolve through the same layers.
+  Note the default puts a project's own folders FIRST: a repository can
+  override a workspace/user skill of the same name in its sessions (Settings
+  marks such project rows); reorder the rules to change that.
+- **Names**: a skill is a kebab-case folder (`[a-z0-9][a-z0-9-]{0,63}`)
+  holding `SKILL.md`; other folder names are neither listed nor loadable.
+  Lookup uses the folder name, the frontmatter `name:` is only the title.
+  `sources` is reserved for new workspace skills (it is the rules route).
+- **Writes**: only the workspace folder is writable (save/delete via the
+  API); every other layer is read-only. A save reports `warnings` when the
+  workspace rule is disabled or a higher layer/project owns the name.
+  Skill-file previews resolve symlinks and refuse targets outside the skill
+  folder.
 - **Mode-gated**: the tool resolves the current mode through the ambient agent
   scope and refuses when the mode turns skills off; a live mode switch means
   the next call gates fresh.
@@ -244,22 +268,18 @@ several children, capped at 120 s, honours Stop), `list`, `cancel`, `reconcile`,
   `catalog` also lists the workspace's valid custom roles; copy a
   bundled role in Settings → Agents to customize it.
 
-## Memory tools (`src/harness/memory/tools.ts`)
+## File-based memory (`src/harness/memory/service.ts`)
 
-Five native tools over workspace/project-scoped Markdown files — writes are
-always explicit, never auto-extracted from conversation:
-
-| Tool | What it does |
-|---|---|
-| `MemorySearch` | keyword search across the workspace's memory entries |
-| `MemoryRead` | read one entry by topic |
-| `MemoryCreate` | create an entry (conflict-detected against existing files) |
-| `MemoryUpdate` | update an entry (stale-state conflict detection) |
-| `MemoryForget` | remove an entry |
-
-Scope comes from the ambient agent scope (workspace, optional project); a
-child agent sees only what its definition grants. Conflicting or invalid files
-surface as tool failures — they are never silently merged.
+When the selected mode enables both memory sources, the workspace and current
+project `MEMORY.md` indexes are loaded as bounded untrusted reference; no
+conversation is auto-extracted. Their absolute roots are advertised to the
+model. Use `Read`, `Glob`, and `Grep` with an explicit memory-root path to browse
+Markdown; `Write` and `Edit` can maintain `.md` topics and indexes with normal
+file observation/conflict checks. Memory grants do not permit browsing the rest
+of application storage, sensitive subdirectories, symlink escapes or foreign
+scopes. Explicit denies and child role ceilings still apply. The old dedicated
+MemorySearch/Read/Create/Update/Forget tools are not registered for model calls;
+settings CRUD remains available for compatibility.
 
 ## The TodoWrite tool (`src/harness/tools/todo.ts`)
 
@@ -290,7 +310,7 @@ Servers from a workspace's `mcp.json` register dynamically as
 `mcp__<server>__<tool>`:
 
 - **Naming**: the `mcp__<server>__<tool>` namespace is reserved-protected —
-  no MCP tool can shadow a built-in identity (`Read`, `Skill`, `MemorySearch`,
+  no MCP tool can shadow a built-in identity (`Read`, `Skill`,
   ...), and the built-ins cannot be re-registered by a server.
 - **Workspace isolation**: one connection per (workspace, server); two
   workspaces pointing at the same server name get separate connections, and
@@ -354,10 +374,8 @@ mode cannot widen them.
 - **Web host** (`src/web/server.ts`): the same pair, with the root resolver
   reading the ambient agent scope — a session bound to a project gets that
   project's folder; a workspace-mode session with no project has **no
-  filesystem grant**; memory-mode sessions keep the legacy per-session/default
-  folder grants. `Skill`, the memory tools, and `TodoWrite` register with
-  the harness; MCP
-  tools register per workspace as its servers connect.
+  filesystem grant** except enabled memory roots. `Skill` and `TodoWrite`
+  register with the harness; MCP tools register per workspace as its servers connect.
 
 ## Reading further
 

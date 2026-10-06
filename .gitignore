@@ -8,6 +8,9 @@ web-dist/
 # brainstorming visual companion mockups
 .superpowers/
 
+# isolated implementation worktrees
+.worktrees/
+
 # generated test/browser evidence (regenerable; not approved visual baselines)
 /artifacts/
 /web/styles/artifacts/

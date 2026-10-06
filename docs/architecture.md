@@ -24,9 +24,9 @@ composition that consumes the harness through the context.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Layer 0 — the kernel (mini-Cordis)
+## Layer 0 — the kernel
 
-The kernel is a self-contained, Cordis-shaped plugin runtime. It has no notion
+The kernel is a self-contained, Cordis-inspired plugin runtime. It has no notion
 of agents, LLMs, or tools; it only provides the mechanics of composition:
 
 - **One typed event bus** (`EventBus`) with five dispatch modes — `emit`,
@@ -78,7 +78,7 @@ concept, and the web host is the composition that wires them together:
 | `storage/` | The file-first session store: `events.jsonl` is canonical, `summary.json` is a rebuildable index, with durability barriers and torn-tail quarantine |
 | `workspace/` | The workspace registry: workspaces, project binding, ownership checks at the service boundary, per-root writer leases |
 | `modes/` + `context/` | Four bundled + custom file modes; the single mode-driven context builder with budget, trim order, compaction, and a per-request manifest |
-| `skills/` | Workspace skill files and the on-demand, mode-gated `Skill` tool |
+| `skills/` | Skill files across project/workspace/user/bundled layers and the on-demand, mode-gated `Skill` tool ([skills.md](skills.md)) |
 | `memory/` | Workspace/project-scoped Markdown memory and its five tools |
 | `agents/` | Agent definitions, bounded one-level delegation, and the Claude-first/Codex compatibility adapters |
 | `mcp/` | The workspace-scoped MCP client (stdio + Streamable HTTP), config/secrets stores, health/retry/circuit breaker |

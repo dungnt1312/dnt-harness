@@ -1,5 +1,5 @@
 /** Pure derivation of Environment-panel rows from the session event log. */
-import type { SseEvent } from './types.ts'
+import type { ChildRow, SseEvent } from './types.ts'
 
 /** One non-empty line, markdown heading marks dropped — the same title rule the transcript's DelegationCard applies. */
 function briefLine(text: string | undefined): string {
@@ -57,4 +57,25 @@ export function subagentRows(events: readonly SseEvent[]): readonly SubagentRow[
   // Newest dispatch first: the child just sent out leads the list instead of
   // hiding at the bottom under the whole ended history.
   return [...rows.values()].sort((left, right) => right.dispatchedAt - left.dispatchedAt)
+}
+
+/**
+ * Fold the host's child registry (the workbench list's source of truth) into
+ * event-derived rows. A spawn whose result event an SSE gap dropped — or that
+ * the host never wrote because the parent append failed and the child settled
+ * `uncertain` — otherwise reads `running` forever. Only the running bit flips:
+ * the log keeps the row's brief, role, and dispatch time.
+ */
+export function reconcileSubagentRows(rows: readonly SubagentRow[], children: readonly ChildRow[]): readonly SubagentRow[] {
+  if (rows.every((row) => !row.running) || children.length === 0) return rows
+  const settled = new Map(children.map((child) => [child.childSessionId, child]))
+  let changed = false
+  const next = rows.map((row) => {
+    if (!row.running) return row
+    const child = settled.get(row.childSessionId)
+    if (child === undefined || child.status === 'queued' || child.status === 'dispatching' || child.status === 'running' || child.status === 'uncertain') return row
+    changed = true
+    return { ...row, running: false, status: child.status, ...(child.endedAt !== undefined ? { endedAt: child.endedAt } : {}) }
+  })
+  return changed ? next : rows
 }

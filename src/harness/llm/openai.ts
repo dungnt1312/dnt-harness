@@ -93,7 +93,7 @@ export interface OpenAiCompletionsOptions {
   readonly baseUrl: string
   /** Model names offered to selectors; the first is the fallback model. */
   readonly models?: readonly string[]
-  /** Extra attempts for 408/409/425/429/5xx or a connection failure before streaming starts (default 3). */
+  /** Extra attempts for transient client statuses, non-deterministic 5xx, or a connection failure before streaming starts (default 3). */
   readonly maxRetries?: number
   /** First backoff delay; doubles per attempt with jitter (default 1000ms). */
   readonly retryBaseMs?: number
@@ -107,7 +107,39 @@ const DEFAULT_RETRY_BASE_MS = 1_000
 const MAX_RETRY_DELAY_MS = 30_000
 /** Error bodies are diagnostics: keep enough to explain, never an unbounded read. */
 const boundedText = readBoundedError
-const RETRYABLE_STATUS: ReadonlySet<number> = new Set([408, 409, 425, 429, 500, 502, 503, 504, 529])
+/**
+ * HTTP statuses that are transient without reading the body. Deterministic
+ * client 4xx stay out; everything else with a 5xx body classifies as
+ * `server_error` and is retried unless the body proves otherwise.
+ */
+const TRANSIENT_STATUS: ReadonlySet<number> = new Set([408, 409, 425, 429, 500, 502, 503, 504, 524, 529])
+/** 5xx statuses whose semantics are deterministic: the same request will fail again. */
+const DETERMINISTIC_SERVER_STATUS: ReadonlySet<number> = new Set([501, 505, 511])
+
+/**
+ * A status is retried when transient by code, or when the server reported a
+ * 5xx-class failure (default-retryable) unless the body names a condition a
+ * second identical request could not fix (auth at the upstream, quota,
+ * context size). Client 4xx stays non-retryable; the caller re-reads nothing.
+ */
+function retryableStatus(status: number, detail: string): boolean {
+  if (status < 500) return TRANSIENT_STATUS.has(status)
+  if (DETERMINISTIC_SERVER_STATUS.has(status)) return false
+  if (detail === '') return true
+  return !/insufficient_quota|quota|billing|credit|balance|invalid api key|authentication/i.test(detail)
+}
+
+/** Gateway error `code` strings that unambiguously name a transient condition. */
+const TRANSIENT_GATEWAY_CODES: ReadonlySet<string> = new Set(['server_error', 'rate_limit_exceeded', 'service_unavailable', 'overloaded_error'])
+
+/** A gateway `code` is transient for 5xx-class numbers and known transient strings; text decides the rest. */
+function gatewayCodeRetryable(code: unknown): boolean {
+  if (typeof code === 'number') return code >= 500 || TRANSIENT_STATUS.has(code)
+  return typeof code === 'string' && TRANSIENT_GATEWAY_CODES.has(code)
+}
+
+/** Error text that names a condition a second identical request cannot fix: the opt-OUT from default-retryable. */
+const PERMANENT_GATEWAY_TEXT = /invalid api key|authenticat|unauthorized|forbidden|permission denied|not found|unsupported|invalid request|malformed|context[_ -]?(length|window)|too (long|large)|exceeds? (the )?(model'?s? )?(maximum|context)/i
 
 function backoffMs(attempt: number, base: number): number {
   const exponential = base * 2 ** (attempt - 1)
@@ -213,8 +245,8 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       let cleanupSettled = true
       const detail = await boundedText(response, settled => { cleanupSettled = settled }, options?.onTransportSettled)
       const quota = /insufficient_quota|quota|billing|credit|balance/i.test(detail)
-      const reason = isContextExceeded(response.status, detail) ? 'context_exceeded' : quota ? 'quota' : response.status === 401 || response.status === 403 ? 'auth_configuration' : response.status === 429 ? 'rate_limit' : RETRYABLE_STATUS.has(response.status) ? 'server_error' : 'unknown'
-      const retryable = !quota && RETRYABLE_STATUS.has(response.status)
+      const reason = isContextExceeded(response.status, detail) ? 'context_exceeded' : quota ? 'quota' : response.status === 401 || response.status === 403 ? 'auth_configuration' : response.status === 429 ? 'rate_limit' : response.status >= 500 ? 'server_error' : 'unknown'
+      const retryable = !quota && retryableStatus(response.status, detail)
       if (!cleanupSettled || !retryable || attempt >= maxAttempts) {
         const retryAfter = retryAfterMs(response.headers.get('retry-after'))
         const error = new ProviderError(`provider HTTP ${response.status}: ${reason}`, { reason, phase: 'headers', transient: retryable, status: response.status, ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}) })
@@ -247,13 +279,19 @@ export class OpenAiCompletionsProvider implements LlmProvider {
         }
         if (parsed === null || typeof parsed !== 'object' || (parsed.choices !== undefined && !Array.isArray(parsed.choices))) throw protocolError('malformed_protocol', 'invalid stream record')
         // One API-style relays report upstream failures as an error object in
-        // a 200 stream; that payload is the only diagnosis the user ever sees.
+        // a 200 stream. That payload is the only diagnosis of the upstream
+        // failure the user ever sees: classify on it, and carry it in the
+        // message (bounded — this text lands in the durable session log).
         if (parsed.error !== undefined) {
           const text = gatewayErrorText(parsed.error).slice(0, WIRE_LIMITS.errorChars)
           const quota = /quota|billing|credit|balance/i.test(text)
           const code = parsed.error !== null && typeof parsed.error === 'object' ? (parsed.error as { code?: unknown }).code : undefined
-          const transient = !quota && ((typeof code === 'number' && RETRYABLE_STATUS.has(code)) || (typeof code === 'string' && ['server_error', 'rate_limit_exceeded', 'service_unavailable', 'overloaded_error'].includes(code)) || /gateway|temporarily|overloaded|unavailable|disconnect|reset|terminated/i.test(text))
-          throw new ProviderError('provider gateway failure', { reason: isContextExceeded(400, text) ? 'context_exceeded' : quota ? 'quota' : transient ? 'server_error' : 'unknown', transient })
+          // Default-retryable: a gateway error naming no recognizable permanent
+          // condition gets the benefit of the doubt; only a permanent-looking
+          // body opts out.
+          const transient = !quota && (gatewayCodeRetryable(code) || !PERMANENT_GATEWAY_TEXT.test(text))
+          const detail = text.slice(0, 300)
+          throw new ProviderError(`provider gateway failure${detail === '' ? '' : `: ${detail}`}`, { reason: isContextExceeded(400, text) ? 'context_exceeded' : quota ? 'quota' : transient ? 'server_error' : 'unknown', transient })
         }
         const usage = parseUsage(parsed.usage)
         if (usage !== undefined) yield { type: 'usage', usage }

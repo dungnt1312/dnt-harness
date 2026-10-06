@@ -157,20 +157,39 @@ export function classifyGrantedRoots(roots: readonly GrantedRoot[], abs: string)
   return match
 }
 
+function memoryStorageCarveout(
+  exec: Pick<ToolExecution, 'hostStorageRoot' | 'deniedRoots'>,
+  denied: string,
+  memoryRoot: string | undefined,
+): boolean {
+  const hostStorageRoot = exec.hostStorageRoot
+  return memoryRoot !== undefined && hostStorageRoot !== undefined
+    && exec.deniedRoots?.some((root) => samePath(root, hostStorageRoot)) === true
+    && samePath(denied, hostStorageRoot) && within(denied, memoryRoot)
+    && !samePath(denied, memoryRoot)
+}
+
 /**
  * Classify `target` against the run's grants without touching the
  * filesystem. The longest containing root wins, so a read-only folder nested
  * in a read-write one stays read-only.
  */
 export function classifyTarget(
-  exec: Pick<ToolExecution, 'root' | 'additionalRoots' | 'deniedRoots'>,
+  exec: Pick<ToolExecution, 'root' | 'additionalRoots' | 'deniedRoots' | 'memoryRoots' | 'hostStorageRoot'>,
   target: string,
   intent: PathIntent,
 ): PathClass {
   const abs = path.resolve(exec.root, target)
   const blocked = blockedReason(target, abs)
   if (blocked !== undefined) return { kind: 'blocked', abs, reason: blocked }
-  if (exec.deniedRoots?.some((denied) => within(denied, abs)) === true) return { kind: 'denied', abs }
+  const memoryRoot = exec.memoryRoots?.find((root) => within(root, abs))
+  if (memoryRoot !== undefined) {
+    if (path.relative(memoryRoot, abs).split(path.sep).some((part) => ['.git', '.env', 'secrets', 'skills', 'agents', 'commands'].includes(part.toLowerCase()))) return { kind: 'denied', abs }
+    if (intent === 'write' && (samePath(memoryRoot, abs) || path.extname(abs).toLowerCase() !== '.md')) return { kind: 'denied', abs }
+  }
+  // A read target may also be an existing directory used as a search base.
+  // resolveInGrants verifies that case on disk before allowing access.
+  if (exec.deniedRoots?.some((denied) => within(denied, abs) && !memoryStorageCarveout(exec, denied, memoryRoot)) === true) return { kind: 'denied', abs }
   const match = classifyGrantedRoots(grantedRoots(exec), abs)
   if (match === undefined) return { kind: 'out-of-grant', abs }
   if (intent === 'write' && match.access === 'read') return { kind: 'read-only', abs, root: match }
@@ -223,6 +242,24 @@ function approvedFor(approved: readonly ApprovedPath[] | undefined, abs: string,
  */
 export async function resolveInGrants(exec: ToolExecution, target: string, intent: PathIntent): Promise<string> {
   const classified = classifyTarget(exec, target, intent)
+  const memoryRoot = exec.memoryRoots?.find((root) => within(root, classified.abs))
+  // Only the designated host storage ancestor is exempted, never an explicit
+  // root/subpath deny (nor another ancestor deny). Check real containment too.
+  const denied = exec.deniedRoots?.filter((root) => !memoryStorageCarveout(exec, root, memoryRoot))
+  if (memoryRoot !== undefined && classified.kind !== 'denied' && classified.kind !== 'blocked') {
+    const real = await realTargetOf(classified.abs)
+    const realRoot = await realpathSafe(memoryRoot)
+    if (!within(realRoot, real)) throw new Error(`path '${target}' escapes the memory root`)
+    if (path.relative(realRoot, real).split(path.sep).some((part) => ['.git', '.env', 'secrets', 'skills', 'agents', 'commands'].includes(part.toLowerCase()))) throw new Error(`path '${target}' resolves into sensitive memory storage`)
+    if (path.extname(real).toLowerCase() !== '.md') {
+      const stat = await fs.stat(real).catch(() => undefined)
+      if (intent === 'write' || !stat?.isDirectory()) throw new Error(`path '${target}' resolves to non-Markdown memory storage`)
+    }
+    if (intent === 'read' && !samePath(memoryRoot, classified.abs) && path.extname(classified.abs).toLowerCase() !== '.md') {
+      const stat = await fs.stat(classified.abs).catch(() => undefined)
+      if (!stat?.isDirectory()) throw new Error(`path '${target}' is not a Markdown file or readable memory directory`)
+    }
+  }
   switch (classified.kind) {
     case 'blocked':
       throw new Error(`path '${target}' is refused: ${classified.reason}`)
@@ -231,7 +268,7 @@ export async function resolveInGrants(exec: ToolExecution, target: string, inten
     case 'read-only':
       throw new Error(`path '${target}' is in a read-only granted folder (${classified.root.path})`)
     case 'in-grant': {
-      const abs = await resolveGrantedPath(classified.root.path, classified.abs, exec.deniedRoots)
+      const abs = await resolveGrantedPath(classified.root.path, classified.abs, denied)
       await assertSameGrantOnDisk(exec, classified.root, abs, target, intent)
       return abs
     }
@@ -245,7 +282,7 @@ export async function resolveInGrants(exec: ToolExecution, target: string, inten
       if (!samePath(realTarget, classified.abs)) {
         throw new Error(`path '${target}' resolves through a link to '${realTarget}'; approve the real path instead`)
       }
-      await assertNotDenied(target, classified.abs, realTarget, exec.deniedRoots)
+      await assertNotDenied(target, classified.abs, realTarget, denied)
       return classified.abs
     }
   }

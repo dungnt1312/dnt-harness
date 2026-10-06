@@ -288,9 +288,17 @@ export function TrajectoryPanel({ events, openPath, workspaceId = null, sessionI
     () => trajectory.turns.filter((turn) => trajectoryMatches(turn, undefined, query)),
     [trajectory, query],
   )
+  // First turn wins on duplicate ids, matching the Array.find it replaces.
+  const turnById = useMemo(() => {
+    const byId = new Map<string, TrajectoryTurn>()
+    for (const turn of trajectory.turns) {
+      if (!byId.has(turn.id)) byId.set(turn.id, turn)
+    }
+    return byId
+  }, [trajectory])
   const calls = useMemo(
-    () => trajectory.calls.filter((call) => trajectoryMatches(trajectory.turns.find((turn) => turn.id === call.turnId), call, query)),
-    [trajectory, query],
+    () => trajectory.calls.filter((call) => trajectoryMatches(call.turnId === undefined ? undefined : turnById.get(call.turnId), call, query)),
+    [trajectory, turnById, query],
   )
   const quiet = trajectory.turns.length === 0 && trajectory.calls.length === 0
 

@@ -47,6 +47,14 @@ import { createProcessSessionEventBridge } from '../harness/processes/session-ev
 import { runCleanup, boundedCleanup } from '../harness/processes/shutdown.ts'
 import { ProcessRegistry } from '../harness/processes/registry.ts'
 import { todoWriteTool } from '../harness/tools/todo.ts'
+import { promises as fs } from 'node:fs'
+import { MemoryService } from '../harness/memory/service.ts'
+import { memoryRoots, memoryGuidance, memoryIndexes } from '../harness/memory/context.ts'
+import { ModesService, DEFAULT_MODE_ID } from '../harness/modes/service.ts'
+import { buildContext } from '../harness/context/builder.ts'
+import { renderEnvironmentContext } from '../harness/context/environment.ts'
+import { DEFAULT_BUDGET } from '../harness/context/budget.ts'
+import { resolvePermission } from '../harness/approval/resolution.ts'
 
 loadRepoEnv()
 
@@ -158,13 +166,26 @@ async function main(): Promise<void> {
   await workspaces.boot()
   kernel.ctx.provide('workspaces', workspaces)
   await kernel.ctx.sessions.boot()
-  const options: ApprovalOptions = yolo
-    ? { defaultMode: 'allow', askUser }
-    : {
-        defaultMode: 'ask',
-        askUser,
-        policy: { Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'ask', Edit: 'ask', Bash: 'ask' },
-      }
+  const workspaceId = workspaces.defaultWorkspace
+  const canonicalRoot = await fs.realpath(path.resolve(root))
+  const project = workspaces.listProjects(workspaceId).find((record) => record.path === canonicalRoot)
+    ?? await workspaces.createProject(workspaceId, path.basename(canonicalRoot), canonicalRoot)
+  const scope = { workspaceId, projectId: project.id }
+  const memory = new MemoryService(dataDir)
+  const modes = new ModesService(dataDir)
+  const mode = await modes.resolve(workspaceId, await modes.selectedId(workspaceId) ?? DEFAULT_MODE_ID)
+  const memoryEnabled = mode.definition.sources.memoryPinned && mode.definition.sources.memoryRetrieval
+  const roots = memoryEnabled ? memoryRoots(memory, scope) : []
+  const memoryAccess = mode.definition.toolExposure.includes('Write') || mode.definition.toolExposure.includes('Edit') ? 'write' as const : 'read' as const
+  kernel.ctx.on('tools/pre-execute', async (payload, next) => {
+    if (!mode.definition.toolExposure.includes(payload.call.name)) return { kind: 'deny', reason: `tool '${payload.call.name}' is not exposed by the selected mode` }
+    if (resolvePermission(mode.definition.permissionDefaults, payload.call.name) === 'deny') return { kind: 'deny', reason: `tool '${payload.call.name}' is denied by the selected mode` }
+    return next()
+  }, true)
+  const options: ApprovalOptions = {
+    defaultMode: yolo ? 'allow' : 'ask', askUser,
+    policy: Object.fromEntries(Object.entries(mode.definition.permissionDefaults).map(([name, permission]) => [name, yolo && permission !== 'deny' ? 'allow' : permission])),
+  }
   attachApproval(kernel.ctx, options)
   for (const tool of fsTools()) {
     kernel.ctx.tools.register(tool)
@@ -177,7 +198,7 @@ async function main(): Promise<void> {
   kernel.ctx.tools.register(bashOutputTool({ processes }))
   kernel.ctx.tools.register(killShellTool({ processes }))
   kernel.ctx.tools.register(todoWriteTool())
-  kernel.ctx.tools.setRootResolver(() => ({ root, deniedRoots: [dataDir] }))
+  kernel.ctx.tools.setRootResolver(() => ({ root: canonicalRoot, deniedRoots: [path.resolve(dataDir)], hostStorageRoot: path.resolve(dataDir), memoryRoots: roots, additionalRoots: roots.map((folder) => ({ path: folder, access: memoryAccess })) }))
   if (apiKey !== undefined) {
     kernel.ctx.llm.register(new DeepSeekProvider(apiKey, process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com'))
   } else {
@@ -185,11 +206,34 @@ async function main(): Promise<void> {
   }
 
   const session: Session = kernel.ctx.sessions.create(workspaces.defaultWorkspace)
+  session.append({ type: 'session/project', projectId: project.id })
+  await session.durable()
   kernel.ctx.on('session/event', (emitter, event) => {
     if (emitter === session) render(event)
   })
 
-  const agent = kernel.ctx.agents.create(session, { workspaceId: workspaces.defaultWorkspace })
+  const agent = kernel.ctx.agents.create(session, scope)
+  kernel.ctx.on('agent/context', async (projected, next) => {
+    const schemas = kernel.ctx.tools.schemas().filter((schema) => mode.definition.toolExposure.includes(schema.name))
+    const pinnedMemory = memoryEnabled ? await memoryIndexes(memory, scope) : []
+    if (roots.length > 0 && schemas.some((schema) => ['Read', 'Write', 'Edit', 'Glob', 'Grep'].includes(schema.name))) pinnedMemory.unshift(memoryGuidance(roots))
+    const environment = renderEnvironmentContext({
+      now: new Date(),
+      platform: process.platform,
+      arch: process.arch,
+      nodeVersion: process.version,
+      workspacePath: canonicalRoot,
+    })
+    const assembled = buildContext({
+      events: session.events, mode, modeRevision: 0,
+      model: projected.model, providerName: projected.providerName,
+      schemas, activeSkills: [], pinnedMemory, budget: DEFAULT_BUDGET,
+      ...(environment !== undefined ? { environment } : {}),
+      ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
+      fileScope: { primary: canonicalRoot, additional: roots.map((folder) => ({ path: folder, access: memoryAccess })), outsideAsks: !yolo },
+    })
+    return next({ ...projected, messages: assembled.messages, tools: schemas })
+  }, true)
 
   /** Durably accept one input, adopt anything still pending, then run. */
   const acceptAndRun = async (text: string): Promise<void> => {

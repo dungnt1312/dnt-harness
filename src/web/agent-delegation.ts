@@ -335,6 +335,7 @@ async function spawn(
     parentSessionId,
     parentTurnId: turnId,
     definition: resolved.definition,
+    ...(resolved.source !== undefined ? { definitionSource: resolved.source } : {}),
     admissionResolver: deps.admissionResolver,
     packet,
     ...(grantTools !== undefined ? { grantTools } : {}),

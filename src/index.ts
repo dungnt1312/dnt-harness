@@ -1,7 +1,7 @@
 /**
- * dnt-harness: a miniature TypeScript replica of the DeepSeek Harness
- * architecture — a Cordis-shaped plugin kernel plus an agent core (durable
- * session log, LLM streaming seam, turn/step driver).
+ * dnt-harness: a TypeScript agent harness built from scratch — a
+ * Cordis-inspired plugin kernel plus an agent core (durable session log, LLM
+ * streaming seam, turn/step driver).
  */
 // ── Kernel ────────────────────────────────────────────────────────────────
 export { EventBus, type Events, type DispatchMode, type EventOptions } from './kernel/events.ts'
@@ -159,12 +159,19 @@ export {
   ContextBudgetError,
   CLEARED_TOOL_RESULT,
   MICROCOMPACT_KEEP_RECENT,
+  wrapUntrusted,
   type ActiveSkill,
   type AssembledContext,
   type BuildContextInput,
   type ContextManifest,
+  type ContextSection,
   type MemorySnippet,
 } from './harness/context/builder.ts'
+export {
+  renderEnvironmentContext,
+  formatEnvironmentDate,
+  type EnvironmentFacts,
+} from './harness/context/environment.ts'
 export {
   DEFAULT_BUDGET,
   budgetFor,
@@ -182,7 +189,7 @@ export {
 
 // ── Harness: skills (G3) ────────────────────────────────────────────────
 export { SkillsService, parseSkill, type SkillEntry, type LoadedSkill } from './harness/skills/service.ts'
-export { SkillError, defaultSkillRules, projectRuleBase, absoluteRuleBase, validateSkillRules, resolveSkillLayers, protectedRootsForRules, MAX_SKILL_RULES, type SkillRule, type SkillLayer, type SkillSource } from './harness/skills/layers.ts'
+export { SkillError, defaultSkillRules, projectRuleBase, absoluteRuleBase, absoluteRuleTooBroad, assertSkillName, assertWritableSkillName, RESERVED_SKILL_NAMES, SKILL_NAME_PATTERN, validateSkillRules, validateSkillRulesForWrite, resolveSkillLayers, protectedRootsForRules, MAX_SKILL_RULES, type SkillRule, type SkillLayer, type SkillSource } from './harness/skills/layers.ts'
 
 // ── Harness: memory (G3) ────────────────────────────────────────────────
 export { MemoryService, MemoryError, memoryTools, type MemoryEntry } from './harness/memory/index.ts'

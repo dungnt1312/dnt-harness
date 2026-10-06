@@ -186,7 +186,7 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
     // Boot-time surfaces the shell reconciles on load.
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/mode$/.test(path) && method === 'GET') return json(route, { modeId: 'chat', name: 'Chat', revision: 1, source: 'workspace-default' })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/processes$/.test(path) && method === 'GET') return json(route, [])
-    if (path === '/api/workspaces/w/terminals' && method === 'GET') return json(route, { terminals: [], shells: [], max: 4, available: false })
+    if (path === '/api/workspaces/w/terminals' && method === 'GET') return json(route, { terminals: [], shells: [], available: false })
     if (path === '/api/workspaces/w/projects/p/git' && method === 'GET') return json(route, { branch: null, changes: [], truncated: false })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/children\/[^/]+$/.test(path) && method === 'GET') {
       return json(route, { childSessionId: 'child', status: 'completed', definitionName: 'explorer', startedAt: 0, endedAt: 1, result: { report: 'Mapped the app.', filesTouched: [] } })

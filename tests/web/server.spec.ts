@@ -246,9 +246,6 @@ describe('web server', () => {
       'step/start',
       'user/message',
       'input/settled',
-      // The request's raw system block (recorded once per session), then the
-      // per-request manifest: the trajectory's durable "what it carried".
-      'context/body',
       'context/manifest',
       // Per-attempt lifecycle facts for the one physical model attempt.
       'model/attempt',
@@ -257,6 +254,8 @@ describe('web server', () => {
       'step/end',
       'turn/end',
     ])
+    const bodies = envelopes.filter((e) => e.kind === 'session' && e.event.type === 'context/body')
+    expect(bodies.length).toBe(0)
     const chunks = envelopes.filter((e) => e.kind === 'session' && e.event.type === 'assistant/chunk')
     expect(chunks.length).toBeGreaterThan(0)
   })

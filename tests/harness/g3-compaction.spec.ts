@@ -140,6 +140,7 @@ describe('compaction', () => {
       const summarize = createCompactionSummarizer(() => (async function* () {
         if (++calls === 2) throw new Error('second chunk failed')
         yield { type: 'delta', delta: 'PARTIAL SUMMARY' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       })(), { providerName: 'test', model: 'test' })
       await expect(compactSession(session, checkpoints, summarize)).rejects.toThrow('second chunk failed')
       expect(calls).toBe(2)
@@ -274,8 +275,17 @@ const COMPACT_WINDOW_MODE: ModeDefinition = {
 }
 
 function compactWindowBase(overrides: Partial<Parameters<typeof buildContext>[0]> = {}): Parameters<typeof buildContext>[0] {
+  const source = overrides.events ?? TAIL_LOG
+  const checkpoint = overrides.compaction
+  // Synthetic checkpoints must have the same canonical success facts as production.
+  const events = checkpoint === undefined || overrides.mode?.definition.sources.history === 'none' || overrides.mode?.definition.sources.history === 'recent' ? source : source.flatMap(event => {
+    const shifted = event.seq > checkpoint.coversSeq ? { ...event, seq: event.seq + 2 } : event
+    return event.seq !== checkpoint.coversSeq ? [shifted] : [shifted,
+      { type: 'compaction/start', trigger: 'manual', seq: event.seq + 1, timestamp: event.timestamp } as SessionEvent,
+      { type: 'compaction/end', trigger: 'manual', coversSeq: checkpoint.coversSeq, summary: checkpoint.summary, summaryChars: checkpoint.summary.length, durationMs: 1, seq: event.seq + 2, timestamp: event.timestamp } as SessionEvent,
+    ]
+  })
   return {
-    events: TAIL_LOG,
     mode: { definition: COMPACT_WINDOW_MODE, source: 'workspace' },
     modeRevision: 1,
     model: 'test-model',
@@ -285,6 +295,7 @@ function compactWindowBase(overrides: Partial<Parameters<typeof buildContext>[0]
     pinnedMemory: [],
     budget: DEFAULT_BUDGET,
     ...overrides,
+    events,
   }
 }
 
@@ -312,7 +323,7 @@ describe('compact history window', () => {
     expect(assembled.sections.some((section) => section.kind === 'compaction')).toBe(true)
     expect(assembled.manifest.history.compactedThroughSeq).toBe(14)
     expect(assembled.manifest.history.checkpointHash).toBeTypeOf('string')
-    expect(assembled.manifest.history.includedSeqRange).toEqual([6, 20])
+    expect(assembled.manifest.history.includedSeqRange).toEqual([6, 22])
     expect(assembled.manifest.history.omittedSeqRange).toEqual([1, 5])
     expect(assembled.manifest.omissions.some((omission) => omission.includes('compaction tail dropped'))).toBe(false)
   })
@@ -338,7 +349,7 @@ describe('compact history window', () => {
     expect(text).toContain('CHECKPOINT SUMMARY')
     expect(text).toContain('open work')
     expect(text).not.toContain('fourth request')
-    expect(assembled.manifest.history.includedSeqRange).toEqual([19, 20])
+    expect(assembled.manifest.history.includedSeqRange).toEqual([19, 22])
     expect(assembled.manifest.omissions.some((omission) => omission.includes('compaction tail'))).toBe(false)
   })
 
@@ -353,7 +364,7 @@ describe('compact history window', () => {
       expect(text).toContain(`${turn} request`)
       expect(text).toContain(`${turn} answer`)
     }
-    expect(assembled.manifest.history.includedSeqRange).toEqual([6, 20])
+    expect(assembled.manifest.history.includedSeqRange).toEqual([6, 22])
     expect(assembled.manifest.omissions.some((omission) => omission.includes('compaction tail dropped'))).toBe(false)
   })
 
@@ -364,7 +375,7 @@ describe('compact history window', () => {
     expect(text).toContain('fourth answer')
     expect(text).toContain('open work')
     expect(text).not.toContain('third request')
-    expect(assembled.manifest.history.includedSeqRange).toEqual([15, 20])
+    expect(assembled.manifest.history.includedSeqRange).toEqual([15, 22])
     expect(assembled.manifest.omissions.some((omission) => omission.includes('compaction tail dropped'))).toBe(false)
   })
 
@@ -385,7 +396,7 @@ describe('compact history window', () => {
   it('the default tail never discards an early decision among more than four uncovered turns', () => {
     const assembled = buildContext(compactWindowBase({ events: uncoveredLog(), compaction: { summary: 'covered first turn', coversSeq: 4 } }))
     expect(historyText(assembled)).toContain('DECISION: keep the compatibility API')
-    expect(assembled.manifest.history.includedSeqRange).toEqual([1, 30])
+    expect(assembled.manifest.history.includedSeqRange).toEqual([1, 32])
     expect(assembled.manifest.omissions.some((omission) => omission.includes('compaction tail dropped'))).toBe(false)
   })
 
@@ -410,7 +421,7 @@ describe('compact history window', () => {
     expect(assembled.manifest.omissions.some((omission) => omission.includes('oldest completed turn(s)') && omission.includes('for budget'))).toBe(true)
     const start = assembled.manifest.history.includedSeqRange![0]
     // The first surviving message is a user request, never half an answer.
-    expect(start % 4).toBe(2)
+    expect(start % 4).toBe(0)
     expect(assembled.messages.filter((message) => message.role !== 'system')[0]?.role).toBe('user')
     expect(assembled.manifest.omissions.some((omission) => omission.includes('compaction tail dropped'))).toBe(false)
   })

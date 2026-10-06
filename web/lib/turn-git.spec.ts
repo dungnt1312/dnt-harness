@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { overlayTotals, overlayTurnChanges } from './turn-git.ts'
+import { overlayTurnChanges } from './turn-git.ts'
 import type { GitStatusReport } from './api.ts'
 import type { TurnChanges } from './turn-changes.ts'
 
@@ -41,9 +41,3 @@ describe('overlayTurnChanges', () => {
   })
 })
 
-describe('overlayTotals', () => {
-  it('sums only rows git counted', () => {
-    const rows = overlayTurnChanges(changes, 'C:/proj', REPORT)
-    expect(overlayTotals(rows)).toEqual({ added: 19, removed: 3, counted: 2 })
-  })
-})

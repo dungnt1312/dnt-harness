@@ -21,6 +21,7 @@
  * questions — answered by `POST /api/approvals/:id`.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { execFile } from 'node:child_process'
 import { createReadStream } from 'node:fs'
 import { bearerAllows, CLEARED_SESSION_COOKIE, ControlPlaneAuthService, isPublicPath, readSessionCookie } from './control-plane-auth.ts'
 import { OPERATOR_HEADER, publishOperatorChannel } from './operator-channel.ts'
@@ -43,9 +44,11 @@ import { DangerousCommandsStore } from '../harness/guard/store.ts'
 import { attachDangerousCommandGuard, guardMatchFingerprint } from '../harness/guard/guard.ts'
 import { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from '../harness/limits.ts'
 import { LlmService } from '../harness/llm/service.ts'
+import { LogicalRequest, classifyTransport } from '../harness/llm/request-lifecycle.ts'
 import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
 import { isThinkingLevel, resolveContextLimit } from '../harness/llm/model-catalog.ts'
-import type { LlmProvider, TokenUsage, ToolCall } from '../harness/llm/types.ts'
+import { ProviderError } from '../harness/llm/types.ts'
+import type { LlmProvider, StreamEvent, TokenUsage, ToolCall } from '../harness/llm/types.ts'
 import { fileSessions, SessionsService } from '../harness/session/service.ts'
 import type { Session } from '../harness/session/session.ts'
 import { sessionGrantsOf, sessionModeOf, sessionModelOf, type SessionEvent, type SessionGrant, type SessionGrants } from '../harness/session/events.ts'
@@ -128,9 +131,10 @@ import { importClaudeDefinition } from '../harness/agents/compatibility/claude.t
 import { SkillsService, SkillError } from '../harness/skills/service.ts'
 import { protectedRootsForRules, resolveSkillLayers, type SkillLayer } from '../harness/skills/layers.ts'
 import { MemoryService, MemoryError } from '../harness/memory/service.ts'
-import { memoryTools } from '../harness/memory/tools.ts'
+import { memoryGuidance, memoryIndexes } from '../harness/memory/context.ts'
 import { todoWriteTool } from '../harness/tools/todo.ts'
 import { buildContext, DEFAULT_BASE_SYSTEM, DEFAULT_CHILD_SYSTEM, type ContextManifest, type ActiveSkill, type MemorySnippet } from '../harness/context/builder.ts'
+import { renderEnvironmentContext } from '../harness/context/environment.ts'
 import { SystemPromptsStore, type SystemPromptsSnapshot } from '../harness/prompts/store.ts'
 import { CheckpointStore } from '../harness/context/compaction.ts'
 import { createCompactionSummarizer } from './llm-summarizer.ts'
@@ -259,6 +263,8 @@ export interface WebServerOptions {
   readonly blockedTools?: readonly string[]
   /** Read-only user skill layer (e.g. `~/.claude/skills`); workspace skills shadow it by name. */
   readonly userSkillsDir?: string
+  /** Read-only bundled skill layer shipped with the app; scanned when the dir exists. */
+  readonly bundledSkillsDir?: string
   /** Directory of built client assets; defaults to the repo's `web-dist/`. */
   readonly staticDir?: string
   /** Port to listen on; `0` (default) picks an ephemeral port. */
@@ -533,7 +539,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   // hosts bind them to a fresh temp home so tests stay hermetic.
   const resourceHome = options.home ?? (await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-resources-')))
   const modes = new ModesService(resourceHome)
-  const skills = new SkillsService(resourceHome, undefined, options.userSkillsDir)
+  const skills = new SkillsService(resourceHome, options.bundledSkillsDir, options.userSkillsDir)
   const memory = new MemoryService(resourceHome)
   const checkpoints = new CheckpointStore(path.join(resourceHome, 'workspaces'))
   // Workspace-authored system prompt replacements (Settings → System Prompts).
@@ -814,9 +820,46 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
 
   // Extra file-tool folders: the project's `additionalDirectories` plus the
   // session's own `session/grants`. Children use the snapshot taken at spawn.
-  const grantPolicy: GrantPolicy = {
-    protectedRoots: [...(deniedRoots ?? []), ...(options.userSkillsDir !== undefined ? [options.userSkillsDir] : [])],
+  const staticProtectedRoots = [
+    ...(deniedRoots ?? []),
+    ...(options.userSkillsDir !== undefined ? [options.userSkillsDir] : []),
+    ...(options.bundledSkillsDir !== undefined ? [options.bundledSkillsDir] : []),
+  ]
+  const grantPolicy: GrantPolicy = { protectedRoots: [...staticProtectedRoots] }
+  // Absolute skill-rule folders of EVERY workspace stay ungrantable: the
+  // policy is host-wide, so it is recomputed from the union of all
+  // workspaces' rules — at startup (persisted rules) and after each rules
+  // PUT — never replaced by one workspace's list. A generation counter keeps
+  // an older, slower recompute from overwriting a newer one.
+  let protectedRootsGeneration = 0
+  const refreshSkillProtectedRoots = async (): Promise<void> => {
+    const generation = ++protectedRootsGeneration
+    const ruleRoots: string[] = []
+    let incomplete = false
+    for (const ws of workspaces.list({ includeArchived: true })) {
+      // One unreadable workspace must not drop every other workspace's
+      // folders, nor its own: a failed read marks the pass incomplete.
+      const rules = await skills.sources(ws.id).catch(() => undefined)
+      if (rules === undefined) {
+        incomplete = true
+        continue
+      }
+      for (const root of protectedRootsForRules(rules)) {
+        if (!ruleRoots.includes(root)) ruleRoots.push(root)
+      }
+    }
+    if (generation !== protectedRootsGeneration) return
+    // Incomplete pass: keep every root already protected (fail closed) and
+    // only add; a complete pass replaces, so removed rules unprotect.
+    const keep = incomplete ? grantPolicy.protectedRoots.filter((root) => !staticProtectedRoots.includes(root)) : []
+    const merged = [...ruleRoots, ...keep.filter((root) => !ruleRoots.includes(root))]
+    grantPolicy.protectedRoots.splice(0, grantPolicy.protectedRoots.length, ...staticProtectedRoots, ...merged)
   }
+  /** Fail-closed fallback: ADD roots without dropping any (over-protecting is safe). */
+  const addSkillProtectedRoots = (roots: readonly string[]): void => {
+    for (const root of roots) if (!grantPolicy.protectedRoots.includes(root)) grantPolicy.protectedRoots.push(root)
+  }
+  await refreshSkillProtectedRoots()
   const grantCache = new WeakMap<readonly SessionEvent[], { length: number; grants: SessionGrants }>()
   const sessionGrants = (session: Session): SessionGrants => {
     const cached = grantCache.get(session.events)
@@ -891,14 +934,22 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   // filesystem grant.
   kernel.ctx.tools.setRootResolver(() => {
     const scope = agentScope.getStore()
+    const mode = scope?.workspaceId !== undefined ? rootModeOf(scope, scope.workspaceId).mode.definition : undefined
+    const memoryOn = scope !== undefined && mode?.sources.memoryRetrieval === true && mode.sources.memoryPinned === true
+    const roots = memoryOn && scope?.workspaceId !== undefined
+      ? [memory.root({ workspaceId: scope.workspaceId }), ...(scope.projectId !== undefined ? [memory.root({ workspaceId: scope.workspaceId, projectId: scope.projectId })] : [])]
+      : []
+    const childCanWrite = scope?.childOf === undefined || (scope.childOf.toolCeiling.includes('Write') || scope.childOf.toolCeiling.includes('Edit'))
+    const memoryGrants = roots.map((root) => ({ path: root, access: childCanWrite ? 'write' as const : 'read' as const }))
     if (scope?.projectId !== undefined) {
       try {
         const project = workspaces.getProject(scope.projectId, scope.workspaceId)
-        const additionalRoots = scopeGrants(scope)
+        const additionalRoots = [...scopeGrants(scope), ...memoryGrants]
         return {
           root: project.path,
           ...(additionalRoots.length > 0 ? { additionalRoots } : {}),
-          ...(deniedRoots !== undefined ? { deniedRoots } : {}),
+          ...(roots.length > 0 ? { memoryRoots: roots } : {}),
+          ...(deniedRoots !== undefined ? { deniedRoots, hostStorageRoot: options.home } : {}),
         }
       } catch {
         return undefined
@@ -908,8 +959,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     // server's current default, then the configured root).
     if (deniedRoots === undefined && scope !== undefined) {
       const granted = legacyFolders.get(scope.sessionId) ?? legacyFolderDefault.current
-      if (granted !== undefined) return { root: granted }
+      if (granted !== undefined) return { root: granted, ...(memoryGrants.length > 0 ? { additionalRoots: memoryGrants, memoryRoots: roots } : {}) }
     }
+    if (scope !== undefined && roots.length > 0) return { root: '', additionalRoots: memoryGrants, memoryRoots: roots, ...(deniedRoots !== undefined ? { deniedRoots, hostStorageRoot: options.home } : {}) }
     return undefined
   })
 
@@ -954,10 +1006,13 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
    * hooks gate both. Returns the blocking reason when a hook denies
    * compaction, or undefined when compaction may proceed.
    */
-  const runPreCompactHooks = async (session: Session, workspaceId: WorkspaceId): Promise<string | undefined> => {
+  const runPreCompactHooks = async (session: Session, workspaceId: WorkspaceId, signal?: AbortSignal): Promise<string | undefined> => {
+    signal?.throwIfAborted()
     const hooks = await mcpStore.loadHooks(workspaceId)
     for (const binding of hooks.hooks['PreCompact'] ?? []) {
-      const decision = await runHook(binding, { hook_event: 'PreCompact', sessionId: session.id, workspaceId })
+      signal?.throwIfAborted()
+      const decision = await runHook(binding, { hook_event: 'PreCompact', sessionId: session.id, workspaceId }, undefined, signal)
+      signal?.throwIfAborted()
       session.append({ type: 'hook/run', event: 'PreCompact', matcher: binding.matcher, exitCode: decision.exitCode, durationMs: decision.durationMs, decision: isBlockingDecision(decision) ? 'block' : isFailureDecision(decision) ? `failure:${binding.onFailure}` : 'allow' })
       await session.durable()
       if (isBlockingDecision(decision) || (isFailureDecision(decision) && binding.onFailure === 'deny')) {
@@ -967,40 +1022,97 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     return undefined
   }
 
-  // Automatic compaction (G3): when enabled, a completed boundary whose last
-  // request's context pressure reaches the threshold compacts once. Pressure
-  // reads the session's newest context manifest — the same token budget the
-  // inspector shows — not a character projection. Failures surface (console)
-  // and never loop; the next boundary may try again.
-  kernel.ctx.on('agent/turn-settled', async () => {
-    if (limits.automaticCompactionPressure <= 0) return
-    const scope = agentScope.getStore()
-    if (scope?.sessionId === undefined || scope.workspaceId === undefined) return
-    const entry = sessions.get(scope.sessionId)
-    if (entry === undefined) return
-    try {
-      const manifest = lastManifests.get(scope.sessionId)
-      if (manifest === undefined) return
-      const { usedTokens, availableTokens } = manifest.budget
-      if (availableTokens <= 0 || usedTokens / availableTokens < limits.automaticCompactionPressure) return
-      const lastSeq = entry.session.events[entry.session.events.length - 1]?.seq ?? 0
-      const latest = await checkpoints.latest(scope.sessionId).catch(() => undefined)
-      if (latest !== undefined && latest.coversSeq >= lastSeq) return
-      const blocked = await runPreCompactHooks(entry.session, scope.workspaceId)
-      if (blocked !== undefined) {
-        console.error(`web: automatic compaction skipped for ${scope.sessionId}: ${blocked}`)
-        return
+  // Reservation is acquired synchronously, before hooks or snapshot loading.
+  // Accepted inputs remain in the durable inbox until maintenance settles.
+  const compactions = new Map<SessionId, { controller: AbortController; done: Promise<unknown> | undefined }>()
+  const manifestTurns = new Map<SessionId, TurnId>()
+  const automaticBoundaries = new Map<SessionId, number>()
+  let compactionClosing = false
+  const cancelCompaction = (sessionId: SessionId): void => {
+    compactions.get(sessionId)?.controller.abort(new Error('compaction cancelled'))
+  }
+  const runCompaction = (entry: SessionEntry, trigger: 'manual' | 'automatic') => {
+    if (compactionClosing || entry.closed || compactions.has(entry.session.id)
+      || (trigger === 'manual' && entry.agent.busy)
+      || kernel.ctx.llm.sessionUncertain(entry.session.id)) {
+      return Promise.reject(new Error('compaction requires a completed exchange boundary; session is active or reserved'))
+    }
+    const reservation = { controller: new AbortController(), done: undefined as Promise<unknown> | undefined }
+    compactions.set(entry.session.id, reservation)
+    const signal = reservation.controller.signal
+    const done = agentScope.exit(async () => {
+      try {
+        const blocked = await runPreCompactHooks(entry.session, entry.workspaceId, signal)
+        signal.throwIfAborted()
+        if (blocked !== undefined) throw new Error(blocked)
+        const refs = entry.session.events.flatMap((event) => event.type === 'user/message' ? [...(event.attachments ?? [])] : [])
+        const loaded = refs.length > 0 ? await attachments.load(entry.workspaceId, refs, { textLimit: limits.attachmentTextLimit }) : undefined
+        signal.throwIfAborted()
+        const pair = summarizerModelOf(entry.session)
+        const summarizer = createCompactionSummarizer((request) => (async function* () {
+          // Each summarizer chunk is idempotent from the caller's view: a failed
+          // attempt's partial output is discarded (buffered, never yielded), so a
+          // transient transport failure may re-ask the same chunk — bounded like
+          // the agent loop by stepRetries, with the same exponential backoff.
+          const owner = new LogicalRequest({ firstProgressMs: limits.streamFirstEventMs, idleMs: limits.streamIdleMs, totalMs: limits.logicalRequestMs, retryBaseMs: limits.stepRetryBaseMs, maxAttempts: Math.min(4, limits.stepRetries + 1) })
+          try {
+            for (;;) {
+              const buffered: StreamEvent[] = []
+              try {
+                // Maintenance must not inherit the settled turn's AsyncLocalStorage:
+                // context/usage middleware must not replace or account this prompt.
+                for await (const event of agentScope.exit(() => kernel.ctx.llm.stream(request, {
+                  signal, requestOwner: owner,
+                  attribution: { sessionId: entry.session.id, turnId: `compaction:${entry.session.id}`, stepId: randomUUID() },
+                }))) buffered.push(event)
+                yield* buffered
+                return
+              } catch (caught) {
+                const error = caught instanceof ProviderError ? caught : classifyTransport(caught, 'stream')
+                if (!owner.canRetry(error, false)) throw error
+                await owner.backoff(signal, error.retryAfterMs)
+              }
+            }
+          } finally { owner.dispose() }
+        })(), pair)
+        const { compactSession } = await import('../harness/context/compaction.ts')
+        // Incremental fold: seed from the latest valid canonical checkpoint so
+        // only the uncovered delta is summarized, never the covered prefix.
+        const seed = await checkpoints.latest(entry.session.id, entry.session.committedEvents).catch(() => undefined)
+        return await compactSession(entry.session, checkpoints, summarizer, {
+          trigger, signal, ...(pair !== undefined ? { model: pair.model } : {}),
+          ...(loaded !== undefined ? { attachments: loaded } : {}),
+          ...(seed !== undefined ? { seed } : {}),
+        })
+      } finally {
+        if (compactions.get(entry.session.id) === reservation) compactions.delete(entry.session.id)
+        if (!signal.aborted && !compactionClosing && !entry.closed && depsRef.current !== undefined) {
+          // Automatic runs are awaited by the driver, which drains its own inbox.
+          if (!entry.agent.busy && kernel.ctx.sessions.pendingInputs(entry.session).length > 0) await dispatchInbox(entry, depsRef.current, 'queue')
+        }
       }
-      const pair = summarizerModelOf(entry.session)
-      const { compactSession } = await import('../harness/context/compaction.ts')
-      await compactSession(
-        entry.session,
-        checkpoints,
-        createCompactionSummarizer((request) => kernel.ctx.llm.stream(request), pair),
-        pair !== undefined ? { trigger: 'automatic', model: pair.model } : { trigger: 'automatic' },
-      )
+    })
+    reservation.done = done
+    return done
+  }
+
+  kernel.ctx.on('agent/turn-settled', async ({ turnId, reason }) => {
+    if (limits.automaticCompactionPressure <= 0 || reason !== 'completed' || compactionClosing) return
+    const scope = agentScope.getStore()
+    if (scope?.sessionId === undefined || scope.workspaceId === undefined || scope.childOf !== undefined) return
+    const entry = sessions.get(scope.sessionId)
+    if (entry === undefined || entry.closed || manifestTurns.get(scope.sessionId) !== turnId) return
+    if (rootModeOf(scope, scope.workspaceId).mode.definition.sources.history !== 'compact') return
+    const manifest = lastManifests.get(scope.sessionId)
+    if (manifest === undefined) return
+    const { usedTokens, availableTokens, preTrimTokens } = manifest.budget
+    if (availableTokens <= 0 || (preTrimTokens ?? usedTokens) / availableTokens < limits.automaticCompactionPressure) return
+    const boundary = entry.session.events.findLast((event) => event.type === 'turn/end' && event.turnId === turnId)
+    if (boundary === undefined || automaticBoundaries.get(scope.sessionId) === boundary.seq) return
+    automaticBoundaries.set(scope.sessionId, boundary.seq)
+    try {
+      await runCompaction(entry, 'automatic')
     } catch (error) {
-      // Surfaced, bounded: no retry loop.
       console.error(`web: automatic compaction failed for ${scope.sessionId}: ${String(error instanceof Error ? error.message : error)}`)
     }
   })
@@ -1256,9 +1368,6 @@ ${entry.description}`.toLowerCase().includes(query))
       }
     },
   })
-  for (const tool of memoryTools(memory)) {
-    kernel.ctx.tools.register(tool)
-  }
   // Claude-style session task list: full-replacement tool, state IS the log.
   kernel.ctx.tools.register(todoWriteTool())
 
@@ -1911,6 +2020,58 @@ ${entry.description}`.toLowerCase().includes(query))
     return parts.join('\n\n')
   }
 
+  /**
+   * Git branch for the environment block, cached per project root for the
+   * server's lifetime: freshness yields to never stalling assembly, and the
+   * Git view remains the source of truth. Read-only flags match
+   * project-git.ts (no fsmonitor, no hooks, no pager); any failure or
+   * timeout omits the branch line, never the request.
+   */
+  const gitBranchCache = new Map<string, string | undefined>()
+  const ENV_GIT_TIMEOUT_MS = 2_000
+  async function cachedGitBranch(root: string): Promise<string | undefined> {
+    if (gitBranchCache.has(root)) return gitBranchCache.get(root)
+    // A cheap existence check first: non-repos (temp dirs, plain folders)
+    // never pay a process spawn, and `git rev-parse` walks parent dirs so
+    // the lookup stays correct when the repo root is an ancestor.
+    const hasGitDir = await fs.stat(path.join(root, '.git')).then(() => true, () => false)
+    const branch = hasGitDir !== true
+      ? undefined
+      : await new Promise<string | undefined>((resolve) => {
+        execFile('git', ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '--no-optional-locks', 'rev-parse', '--abbrev-ref', 'HEAD'], {
+          cwd: root,
+          timeout: ENV_GIT_TIMEOUT_MS,
+          windowsHide: true,
+        }, (error, stdout) => {
+          if (error !== null) { resolve(undefined); return }
+          const name = String(stdout).trim()
+          resolve(name === '' || name === 'HEAD' ? undefined : name)
+        })
+      })
+    gitBranchCache.set(root, branch)
+    return branch
+  }
+
+  /**
+   * The trusted environment facts for this request: host clock (minute
+   * granularity), platform, and — for a root session whose project folder is
+   * known — the workspace path and cached git branch. Children inherit the
+   * same facts; nothing here is content-derived.
+   */
+  async function environmentBlockFor(scope: AgentScope | undefined, fileScope: { root: string } | undefined): Promise<string | undefined> {
+    const isChild = scope?.childOf !== undefined
+    const workspacePath = isChild ? undefined : fileScope?.root
+    const gitBranch = workspacePath !== undefined ? await cachedGitBranch(workspacePath).catch(() => undefined) : undefined
+    return renderEnvironmentContext({
+      now: new Date(),
+      platform: process.platform,
+      arch: process.arch,
+      nodeVersion: process.version,
+      ...(workspacePath !== undefined ? { workspacePath } : {}),
+      ...(gitBranch !== undefined ? { gitBranch } : {}),
+    })
+  }
+
   // G3 single assembly path: the mode-driven builder replaces the projected
   // request wholesale. Effective permission is the selected mode's map; host
   // restrictions stay above it.
@@ -1984,10 +2145,17 @@ ${entry.description}`.toLowerCase().includes(query))
       const perTurn = skillSnapshots.get(scope.sessionId) ?? new Map<string, ActiveSkill>()
       // Definition skills preload ONCE for this child Turn, then remain
       // hash-pinned like explicit Skill loads (no mid-turn file reload).
-      for (const name of scope.childOf?.skills ?? []) {
-        if (perTurn.has(name)) continue
+      // They resolve through the SAME rule layers as the Skill tool (project
+      // folders included, disabled rules excluded), never the legacy defaults.
+      const pending = (scope.childOf?.skills ?? []).filter((name) => !perTurn.has(name))
+      const childLayers = pending.length === 0
+        ? []
+        : await skillLayers(skills, workspaces, workspaceId, scope.projectId)
+            .catch(() => skillLayers(skills, workspaces, workspaceId, undefined))
+            .catch(() => [] as SkillLayer[])
+      for (const name of pending) {
         try {
-          const loaded = await skills.load(workspaceId, name)
+          const loaded = await skills.loadIn(childLayers, name)
           projected.assemblySignal?.throwIfAborted()
           perTurn.set(name, { name: loaded.name, instructions: loaded.instructions, hash: loaded.hash })
         } catch {
@@ -2000,27 +2168,17 @@ ${entry.description}`.toLowerCase().includes(query))
       activeSkills.push(...perTurn.values())
     }
 
-    // Pinned memory within scope (project scope when bound).
+    // Indexes are reference data, not pinned memory bodies. Load both
+    // workspace and current project on every enabled request, including children.
     const pinnedMemory: MemorySnippet[] = []
-    if (mode.definition.sources.memoryPinned && scope?.workspaceId !== undefined) {
-      try {
-        const entries = await memory.pinned(
-          scope.projectId !== undefined
-            ? { workspaceId: scope.workspaceId, projectId: scope.projectId }
-            : { workspaceId: scope.workspaceId },
-        )
-        for (const entry of entries.slice(0, 20)) {
-          pinnedMemory.push({ id: entry.id, title: entry.title, body: entry.body, hash: entry.hash })
-        }
-      } catch {
-        // Memory failures degrade to omission, never to a wrong request.
-      }
+    if (mode.definition.sources.memoryPinned && mode.definition.sources.memoryRetrieval && scope?.workspaceId !== undefined) {
+      pinnedMemory.push(...await memoryIndexes(memory, { workspaceId: scope.workspaceId, ...(scope.projectId !== undefined ? { projectId: scope.projectId } : {}) }))
     }
 
     // Compaction summaries only apply when the mode's history reads them.
     let compaction: { summary: string; coversSeq: number } | undefined
     if (mode.definition.sources.history === 'compact' && scope !== undefined) {
-      const checkpoint = await checkpoints.latest(scope.sessionId).catch(() => undefined)
+      const checkpoint = await checkpoints.latest(scope.sessionId, session?.committedEvents ?? []).catch(() => undefined)
       if (checkpoint !== undefined) compaction = { summary: checkpoint.summary, coversSeq: checkpoint.coversSeq }
     }
 
@@ -2037,6 +2195,10 @@ ${entry.description}`.toLowerCase().includes(query))
     // The same grant the tool pipeline resolves, so the model is told exactly
     // the folders its file tools can reach.
     const fileScope = scope !== undefined ? agentScope.run(scope, () => kernel.ctx.tools.currentGrant()) : undefined
+    if (scope !== undefined && fileScope?.memoryRoots !== undefined && exposed.some((schema) => ['Read', 'Write', 'Edit', 'Glob', 'Grep'].includes(schema.name))) {
+      pinnedMemory.unshift(memoryGuidance(fileScope.memoryRoots))
+    }
+    const environment = await environmentBlockFor(scope, fileScope).catch(() => undefined)
     const assembled = buildContext({
       ...(fileScope !== undefined
         ? {
@@ -2047,6 +2209,7 @@ ${entry.description}`.toLowerCase().includes(query))
           },
         }
         : {}),
+      ...(environment !== undefined ? { environment } : {}),
       events,
       mode,
       modeRevision,
@@ -2065,12 +2228,16 @@ ${entry.description}`.toLowerCase().includes(query))
       ...(promptOverrides?.base.overridden === true ? { baseSystemOverride: promptOverrides.base.text } : {}),
       ...(promptOverrides?.child.overridden === true ? { childSystemOverride: promptOverrides.child.text } : {}),
       ...(scope?.childOf !== undefined
-        ? { child: { definition: scope.childOf.definition, instructions: scope.childOf.instructions } }
+        ? {
+          child: { definition: scope.childOf.definition, instructions: scope.childOf.instructions },
+          ...(scope.childOf.definitionSource !== undefined ? { childSource: scope.childOf.definitionSource } : {}),
+        }
         : {}),
       ...(scope?.childOf?.inheritedContext !== undefined ? { inheritedContext: scope.childOf.inheritedContext } : {}),
     })
     if (scope !== undefined) {
       lastManifests.set(scope.sessionId, assembled.manifest)
+      if (scope.turnId !== undefined) manifestTurns.set(scope.sessionId, scope.turnId)
       // This manifest describes the request about to run, not the previous
       // one. Drop its prompt count until `llm/stream` reports the new usage;
       // the running cache totals stay, because they are session-scoped.
@@ -2216,7 +2383,15 @@ ${entry.description}`.toLowerCase().includes(query))
       return await executionAuthority.stableModeRead(exposureScope, workspaceId, async (mode, revision) => {
         const hardDenial = await executionAuthority.refusal(exposureScope, call.name)
         const policy = effectivePolicy(mode.permissionDefaults ?? {}, options.yolo === true)
-        const permission = resolvePermission(policy, call.name, { defaultMode: options.defaultMode ?? 'ask' })
+        const normalPermission = resolvePermission(policy, call.name, { defaultMode: options.defaultMode ?? 'ask' })
+        const grant = agentScope.getStore() !== undefined ? kernel.ctx.tools.currentGrant() : undefined
+        const target = (call.name === 'Write' || call.name === 'Edit') && typeof call.args['path'] === 'string' ? call.args['path'] : undefined
+        const memoryWrite = target !== undefined && grant !== undefined && grant.memoryRoots?.some((root) => within(root, path.resolve(grant.root, target))) === true
+          && classifyTarget(grant, target, 'write').kind === 'in-grant'
+        // An explicit deny remains authoritative; only an implicit/ask default
+        // becomes allow for a structurally safe Markdown path in this scope.
+        const explicit = Object.hasOwn(policy, call.name) ? policy[call.name] : policy['*']
+        const permission = memoryWrite && normalPermission === 'ask' && explicit !== 'deny' ? 'allow' : normalPermission
         const requirements: AskRequirement[] = []
         if (permission === 'ask') requirements.push({ kind: 'tool-policy', subjectFingerprint: createHash('sha256').update(`${call.name}:ask`).digest('hex') })
         const outside = pathScope.get(executionId, call)
@@ -2456,6 +2631,9 @@ ${entry.description}`.toLowerCase().includes(query))
     modes,
     skills,
     ...(options.userSkillsDir !== undefined ? { userSkillsDir: options.userSkillsDir } : {}),
+    ...(options.bundledSkillsDir !== undefined ? { bundledSkillsDir: options.bundledSkillsDir } : {}),
+    refreshSkillProtectedRoots,
+    addSkillProtectedRoots,
     memory,
     attachments,
     checkpoints,
@@ -2472,6 +2650,10 @@ ${entry.description}`.toLowerCase().includes(query))
     childModelFor,
     summarizerModelOf,
     runPreCompactHooks,
+    runCompaction,
+    cancelCompaction,
+    compactionPending: (sessionId) => compactions.has(sessionId),
+    settleCompaction: async (sessionId) => { await compactions.get(sessionId)?.done?.catch(() => {}) },
     mcpStore,
     mcpClients,
     mcpDescriptors,
@@ -2579,6 +2761,8 @@ ${entry.description}`.toLowerCase().includes(query))
     auth: deps.auth,
     close: () => closePromise ??= (async () => {
       shuttingDown = true
+      compactionClosing = true
+      for (const sessionId of compactions.keys()) cancelCompaction(sessionId)
       processes.closeAdmission()
       kernel.ctx.agents.closeAdmission()
       for (const entry of sessions.values()) entry.agent.stop()
@@ -2593,6 +2777,7 @@ ${entry.description}`.toLowerCase().includes(query))
         },
         () => { server.closeAllConnections(); terminals.disposeAll() },
         () => agentDrivers.stopAll(),
+        async () => { await boundedCleanup(async () => { await Promise.allSettled([...compactions.values()].flatMap((reservation) => reservation.done === undefined ? [] : [reservation.done])) }) },
         () => processes.disposeAll(),
         async () => { try { await boundedCleanup(() => checkpoints.close()) } catch (error) { teardownSafe = false; throw error } },
         async () => { try { await boundedCleanup(() => processEvents.flushAll()) } catch (error) { teardownSafe = false; throw error } },
@@ -2670,6 +2855,12 @@ interface HandlerDeps {
   readonly skills: SkillsService
   /** Read-only user skill layer (`~/.claude/skills`), for protected-root refresh. */
   readonly userSkillsDir?: string
+  /** Read-only bundled skill layer, for protected-root refresh. */
+  readonly bundledSkillsDir?: string
+  /** Recompute grant-protected roots from every workspace's skill rules. */
+  readonly refreshSkillProtectedRoots: () => Promise<void>
+  /** Fail-closed fallback when a recompute fails: add roots, never drop any. */
+  readonly addSkillProtectedRoots: (roots: readonly string[]) => void
   readonly memory: MemoryService
   readonly attachments: AttachmentStore
   readonly checkpoints: CheckpointStore
@@ -2696,6 +2887,10 @@ interface HandlerDeps {
   readonly summarizerModelOf: (session: Session) => { readonly providerName: string; readonly model: string } | undefined
   /** Runs PreCompact hooks (durable hook/run events); returns the blocking reason, or undefined to proceed. */
   readonly runPreCompactHooks: (session: Session, workspaceId: WorkspaceId) => Promise<string | undefined>
+  readonly runCompaction: (entry: SessionEntry, trigger: 'manual' | 'automatic') => Promise<{ coversSeq: number; summary: string }>
+  readonly cancelCompaction: (sessionId: SessionId) => void
+  readonly compactionPending: (sessionId: SessionId) => boolean
+  readonly settleCompaction: (sessionId: SessionId) => Promise<void>
   readonly mcpStore: McpConfigStore
   readonly mcpClients: Map<string, McpServerClient>
   readonly mcpDescriptors: Map<string, McpToolDescriptor>
@@ -2784,7 +2979,56 @@ async function skillLayers(
   const rules = await skills.sources(workspaceId)
   let projectPath: string | undefined
   if (projectId !== undefined) projectPath = workspaces.getProject(projectId, workspaceId).path
-  return resolveSkillLayers(rules, { workspaceDir: skills.workspaceSkillsDir(workspaceId), ...(projectPath !== undefined ? { projectPath } : {}) })
+  const layers = resolveSkillLayers(rules, { workspaceDir: skills.workspaceSkillsDir(workspaceId), ...(projectPath !== undefined ? { projectPath } : {}) })
+  // Bundled rides last: every rule layer shadows it, and it stays scannable
+  // even under a custom rule list (which never names it).
+  const bundled = skills.bundledLayer()
+  return bundled !== undefined ? [...layers, bundled] : layers
+}
+
+/** Route helper: layers for an optional `?projectId=`; undefined (after a 400) when the id is unknown. */
+async function skillLayersForQuery(
+  deps: Pick<HandlerDeps, 'skills' | 'workspaces'>,
+  wsId: WorkspaceId,
+  query: URLSearchParams,
+  send: (status: number, body: unknown) => void,
+): Promise<SkillLayer[] | undefined> {
+  const rawProject = query.get('projectId')
+  try {
+    return await skillLayers(deps.skills, deps.workspaces, wsId, rawProject !== null && rawProject !== '' ? (rawProject as ProjectId) : undefined)
+  } catch {
+    send(400, { error: 'unknown projectId' })
+    return undefined
+  }
+}
+
+/**
+ * Why a just-saved workspace skill may not be what sessions see: the
+ * workspace rule is disabled/removed, or a higher layer (a project folder,
+ * or an absolute rule ordered above workspace) owns the same name. Saving
+ * still succeeds — the warnings make the shadowing visible instead of silent.
+ */
+async function workspaceSaveWarnings(deps: Pick<HandlerDeps, 'skills' | 'workspaces'>, wsId: WorkspaceId, name: string): Promise<string[]> {
+  const warnings: string[] = []
+  const rules = await deps.skills.sources(wsId)
+  if (!rules.some((rule) => rule.kind === 'workspace' && rule.enabled)) {
+    warnings.push('The workspace skill folder is disabled in Source folders, so sessions will not see this skill.')
+    return warnings
+  }
+  const owner = await deps.skills.ownerLayer(await skillLayers(deps.skills, deps.workspaces, wsId, undefined), name)
+  if (owner !== undefined && owner.source !== 'workspace') {
+    warnings.push(`A ${owner.source} skill with this name (${owner.base}) is ordered above the workspace folder and wins.`)
+  }
+  const shadowedIn: string[] = []
+  for (const project of deps.workspaces.listProjects(wsId)) {
+    const layers = await skillLayers(deps.skills, deps.workspaces, wsId, project.id).catch(() => [] as SkillLayer[])
+    const projectOwner = await deps.skills.ownerLayer(layers, name).catch(() => undefined)
+    if (projectOwner !== undefined && projectOwner.source === 'project') shadowedIn.push(project.name)
+  }
+  if (shadowedIn.length > 0) {
+    warnings.push(`Project folders define the same name and win in their sessions: ${shadowedIn.join(', ')}.`)
+  }
+  return warnings
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse, deps: HandlerDeps): Promise<void> {  const url = new URL(req.url ?? '/', 'http://localhost')
@@ -3289,6 +3533,8 @@ async function handleApi(
           }
         }
         if (req.method === 'DELETE') {
+          deps.cancelCompaction(entry.session.id)
+          await deps.settleCompaction(entry.session.id)
           if (entry.agent.busy) {
             send(409, { error: 'session is running; stop it before deleting' })
             return
@@ -3317,6 +3563,7 @@ async function handleApi(
           deps.kernel.ctx.agents.forget(entry.session.id)
           await deps.kernel.ctx.sessions.delete(entry.session.id)
           await forgetSessionState(entry.session.id, deps)
+          deps.cancelCompaction(entry.session.id)
           entry.closed = true
           send(200, { deleted: true })
           return
@@ -3341,6 +3588,7 @@ async function handleApi(
       if (action === 'stop' && req.method === 'POST') {
         // Root Stop cleans up descendants first, then the root: stopped is
         // reported once children are cancelled (cleanup confirmed).
+        deps.cancelCompaction(entry.session.id)
         entry.agent.stop()
         const cleaned = await deps.childExecutor.cancelAllOfRoot(entry.session.id)
         send(202, { stopped: true, ...(cleaned > 0 ? { childrenCancelled: cleaned } : {}) })
@@ -3443,6 +3691,7 @@ async function handleApi(
             workspaceId: wsId,
             parentSessionId: parent.session.id,
             definition: resolved.definition,
+            ...(resolved.source !== undefined ? { definitionSource: resolved.source } : {}),
             admissionResolver: ({ parentSessionId, workspaceId, definition, candidates }) => deps.admissionExposureCeiling(parentSessionId, workspaceId, definition, candidates),
             packet: task,
             ...(inheritedContext !== undefined ? { inherit: 'brief' as const, inheritedContext } : {}),
@@ -4087,6 +4336,8 @@ async function handleApi(
       }
       if (action === undefined) {
         if (req.method === 'DELETE') {
+          deps.cancelCompaction(entry.session.id)
+          await deps.settleCompaction(entry.session.id)
           if (entry.agent.busy) {
             send(409, { error: 'session is running; stop it before deleting' })
             return
@@ -4101,6 +4352,7 @@ async function handleApi(
           deps.kernel.ctx.agents.forget(entry.session.id)
           await deps.kernel.ctx.sessions.delete(entry.session.id)
           await forgetSessionState(entry.session.id, deps)
+          deps.cancelCompaction(entry.session.id)
           entry.closed = true
           deps.legacyFolders.delete(entry.session.id)
           send(200, { deleted: true })
@@ -4124,6 +4376,7 @@ async function handleApi(
         return
       }
       if (action === 'stop' && req.method === 'POST') {
+        deps.cancelCompaction(entry.session.id)
         entry.agent.stop()
         send(202, { stopped: true })
         return
@@ -4439,14 +4692,8 @@ async function handleApi(
       const wsId = decodeURIComponent(wsSkillFiles[1] ?? '') as WorkspaceId
       requireWorkspace(deps, wsId, false)
       const skillName = decodeURIComponent(wsSkillFiles[2] ?? '')
-      const rawProject = query.get('projectId')
-      let layers: SkillLayer[]
-      try {
-        layers = await skillLayers(deps.skills, deps.workspaces, wsId, rawProject !== null && rawProject !== '' ? (rawProject as ProjectId) : undefined)
-      } catch {
-        send(400, { error: 'unknown projectId' })
-        return
-      }
+      const layers = await skillLayersForQuery(deps, wsId, query, send)
+      if (layers === undefined) return
       try {
         send(200, { files: await deps.skills.filesIn(layers, skillName) })
       } catch (error) {
@@ -4464,14 +4711,8 @@ async function handleApi(
       requireWorkspace(deps, wsId, false)
       const skillName = decodeURIComponent(wsSkillFile[2] ?? '')
       const filePath = query.get('path') ?? ''
-      const rawProject = query.get('projectId')
-      let layers: SkillLayer[]
-      try {
-        layers = await skillLayers(deps.skills, deps.workspaces, wsId, rawProject !== null && rawProject !== '' ? (rawProject as ProjectId) : undefined)
-      } catch {
-        send(400, { error: 'unknown projectId' })
-        return
-      }
+      const layers = await skillLayersForQuery(deps, wsId, query, send)
+      if (layers === undefined) return
       try {
         send(200, await deps.skills.readFileIn(layers, skillName, filePath))
       } catch (error) {
@@ -4499,13 +4740,14 @@ async function handleApi(
         const rules = await deps.skills.setSources(wsId, body)
         // Absolute rule folders join the protected roots immediately: grant
         // validation reads this array, so rules take effect on the next grant.
-        deps.grants.policy.protectedRoots.splice(
-          0,
-          deps.grants.policy.protectedRoots.length,
-          ...(deps.deniedRoots ?? []),
-          ...protectedRootsForRules(rules),
-          ...(deps.userSkillsDir !== undefined ? [deps.userSkillsDir] : []),
-        )
+        // Recomputed from EVERY workspace's rules — the policy is host-wide.
+        // The rules are already stored, so a failed recompute must not turn
+        // into a 500: fall back to adding this list's folders (fail closed).
+        try {
+          await deps.refreshSkillProtectedRoots()
+        } catch {
+          deps.addSkillProtectedRoots(protectedRootsForRules(rules))
+        }
         send(200, { rules })
       } catch (error) {
         if (error instanceof SkillError) {
@@ -4552,14 +4794,8 @@ async function handleApi(
         // The settings list shows every row (hidden included) with its state;
         // discovery surfaces filter separately via listVisible. A projectId
         // query adds that project's rule layers (unknown id → 400).
-        const rawProject = query.get('projectId')
-        let layers: SkillLayer[]
-        try {
-          layers = await skillLayers(deps.skills, deps.workspaces, wsId, rawProject !== null && rawProject !== '' ? (rawProject as ProjectId) : undefined)
-        } catch {
-          send(400, { error: 'unknown projectId' })
-          return
-        }
+        const layers = await skillLayersForQuery(deps, wsId, query, send)
+        if (layers === undefined) return
         const [rows, hidden] = await Promise.all([deps.skills.listIn(layers), deps.skills.hiddenNames(wsId)])
         const hiddenSet = new Set(hidden)
         send(200, rows.map((row) => ({ ...row, ...(hiddenSet.has(row.name) ? { hidden: true } : {}) })))
@@ -4575,7 +4811,8 @@ async function handleApi(
         }
         try {
           const saved = await deps.skills.save(wsId, skillName, content, typeof body['expectedHash'] === 'string' ? body['expectedHash'] : undefined)
-          send(200, { name: saved.name, hash: saved.hash })
+          const warnings = await workspaceSaveWarnings(deps, wsId, saved.name).catch(() => [] as string[])
+          send(200, { name: saved.name, hash: saved.hash, ...(warnings.length > 0 ? { warnings } : {}) })
         } catch (error) {
           if (error instanceof SkillError) {
             send(error.code === 'conflict' ? 409 : 400, { error: error.message })
@@ -4587,7 +4824,15 @@ async function handleApi(
       }
       if (req.method === 'DELETE' && skillName !== undefined) {
         requireWorkspace(deps, wsId, true)
-        await deps.skills.delete(wsId, skillName)
+        try {
+          await deps.skills.delete(wsId, skillName)
+        } catch (error) {
+          if (error instanceof SkillError) {
+            send(400, { error: error.message })
+            return
+          }
+          throw error
+        }
         send(200, { deleted: true })
         return
       }
@@ -4595,14 +4840,8 @@ async function handleApi(
         // One skill's raw instructions + hash: the settings editor loads
         // real content so saves are never blind overwrites. projectId
         // selects the project's rule layers for project-layer rows.
-        const rawProject = query.get('projectId')
-        let layers: SkillLayer[]
-        try {
-          layers = await skillLayers(deps.skills, deps.workspaces, wsId, rawProject !== null && rawProject !== '' ? (rawProject as ProjectId) : undefined)
-        } catch {
-          send(400, { error: 'unknown projectId' })
-          return
-        }
+        const layers = await skillLayersForQuery(deps, wsId, query, send)
+        if (layers === undefined) return
         try {
           const loaded = await deps.skills.loadIn(layers, skillName)
           send(200, { name: loaded.name, title: loaded.title, description: loaded.description, source: loaded.source, ruleId: loaded.ruleId, hash: loaded.hash, instructions: loaded.instructions })
@@ -4655,8 +4894,8 @@ async function handleApi(
         try {
           send(200, await deps.memory.read(scope, entryId))
         } catch (error) {
-          if (error instanceof MemoryError && error.code === 'not-found') {
-            send(404, { error: error.message })
+          if (error instanceof MemoryError) {
+            send(error.code === 'not-found' ? 404 : 400, { error: error.message })
             return
           }
           fail(error)
@@ -4690,8 +4929,13 @@ async function handleApi(
       }
       if (req.method === 'DELETE' && entryId !== undefined) {
         requireWorkspace(deps, wsId, true)
-        await deps.memory.forget(scope, entryId)
-        send(200, { forgotten: true })
+        try {
+          await deps.memory.forget(scope, entryId)
+          send(200, { forgotten: true })
+        } catch (error) {
+          if (error instanceof MemoryError) send(400, { error: error.message })
+          else fail(error)
+        }
         return
       }
       send(405, { error: 'method not allowed' })
@@ -4886,19 +5130,7 @@ async function handleApi(
         return
       }
       try {
-        const blocked = await deps.runPreCompactHooks(entry.session, wsId)
-        if (blocked !== undefined) {
-          send(409, { error: blocked })
-          return
-        }
-        const pair = deps.summarizerModelOf(entry.session)
-        const { compactSession } = await import('../harness/context/compaction.ts')
-        const checkpoint = await compactSession(
-          entry.session,
-          deps.checkpoints,
-          createCompactionSummarizer((request) => deps.kernel.ctx.llm.stream(request), pair),
-          pair !== undefined ? { trigger: 'manual', model: pair.model } : { trigger: 'manual' },
-        )
+        const checkpoint = await deps.runCompaction(entry, 'manual')
         send(200, { coversSeq: checkpoint.coversSeq, summaryChars: checkpoint.summary.length })
       } catch (error) {
         send(409, { error: String(error instanceof Error ? error.message : error) })
@@ -5028,7 +5260,6 @@ async function handleApi(
             send(200, {
               terminals: deps.terminals.list(wsId),
               shells: deps.terminals.shells(),
-              max: 4,
               available: probe.available,
               ...(probe.available ? {} : { unavailable: probe.hint }),
             })
@@ -5854,6 +6085,9 @@ async function acceptMessage(
   // accepted input is never lost and runs in submission order.
   entry.agent.adoptPending(stillPending)
   entry.agent.enqueueAccepted({ content, inputId, ...(refs.length > 0 ? { attachments: refs } : {}) })
+  if (deps.compactionPending(entry.session.id)) {
+    return { ok: true, status: 202, body: { inputId, queued: true, delivery, dispatchBlocked: 'maintenance' } }
+  }
   const wasBusy = entry.agent.busy
   if (!await dispatchInbox(entry, deps, delivery)) {
     // Acceptance is already durable: acknowledge it so callers do not resend
@@ -5898,6 +6132,9 @@ async function steerSession(
     return { ok: false, status: 400, error: `configured session provider/model is unavailable: ${String(error instanceof Error ? error.message : error)}` }
   }
   entry.agent.adoptPending(pending)
+  if (deps.compactionPending(entry.session.id)) {
+    return { ok: true, status: 202, body: { steered: false, queued: true, pending: waiting.length, dispatchBlocked: 'maintenance' } }
+  }
   if (!await dispatchInbox(entry, deps, 'steer')) {
     return { ok: false, status: 409, error: 'transport cleanup is unresolved; input remains queued, retry Send now after cleanup settles' }
   }
@@ -5913,6 +6150,8 @@ async function steerSession(
 async function dispatchInbox(entry: SessionEntry, deps: HandlerDeps, delivery: 'queue' | 'steer'): Promise<boolean> {
   // Uncertain transport ownership is not a live driver to steer. Keep input
   // queued, and never acknowledge Send now as dispatched until cleanup is verified.
+  if (deps.compactionPending(entry.session.id)) return true
+  if (entry.closed) return false
   if (deps.kernel.ctx.llm.sessionUncertain(entry.session.id)) return delivery === 'queue'
   if (!entry.agent.busy) {
     // Fire-and-forget: the reply (and any failure, which closes the turn
@@ -6672,6 +6911,9 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     res.end(JSON.stringify({ error: 'session generation was revoked' }))
     return
   }
+  let disposeForBackpressure: (() => void) | undefined
+  let backpressured = false
+  const streamFrame=(envelope:WebEnvelope,sequence?:number):void=>{if(res.destroyed||res.writableEnded)return;if(res.writableLength>4_000_000){backpressured=true;disposeForBackpressure?.();res.end();return;}writeFrame(res,envelope,sequence)}
   res.writeHead(200, {
     'content-type': 'text/event-stream',
     'cache-control': 'no-cache',
@@ -6694,24 +6936,24 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   // the same bulk. Sequence numbers stay untouched so the client's seen-cursor
   // filtering and its own compaction keep working unchanged.
   const replay = compactReplayEvents(resumable ? session.events.filter((event) => event.seq > cursor) : [...session.events])
-  writeFrame(res, { kind: resumable ? 'resume' : 'snapshot', events: replay }, latest)
+  streamFrame({ kind: resumable ? 'resume' : 'snapshot', events: replay }, latest)
   for (const [approvalId, waiting] of deps.pending) {
     if (waiting.sessionId === session.id || waiting.parentSessionId === session.id) {
-      writeFrame(res, approvalEnvelope(approvalId, waiting, session.id))
+      streamFrame(approvalEnvelope(approvalId, waiting, session.id))
     }
   }
 
   const disposeSession = deps.kernel.ctx.on('session/event', (emitter, event) => {
-    if (emitter.id === session.id) writeFrame(res, { kind: 'session', event }, event.seq)
+    if (emitter.id === session.id && event.type !== 'context/body') streamFrame({ kind: 'session', event }, event.seq)
   })
   const disposeApproval = deps.kernel.ctx.on('web/approval', (payload) => {
     if (payload.sessionId === session.id || payload.parentSessionId === session.id) {
       const waiting = deps.pending.get(payload.approvalId)
       if (waiting !== undefined) {
-        writeFrame(res, approvalEnvelope(payload.approvalId, waiting, session.id))
+        streamFrame(approvalEnvelope(payload.approvalId, waiting, session.id))
         return
       }
-      writeFrame(res, {
+      streamFrame({
         kind: 'approval',
         approvalId: payload.approvalId,
         call: payload.call,
@@ -6732,11 +6974,11 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   })
   const disposeApprovalSettled = deps.kernel.ctx.on('web/approval-settled', (payload) => {
     if (payload.sessionId === session.id || payload.parentSessionId === session.id) {
-      writeFrame(res, { kind: 'approval-settled', approvalId: payload.approvalId })
+      streamFrame({ kind: 'approval-settled', approvalId: payload.approvalId })
     }
   })
   const disposeError = deps.kernel.ctx.on('web/turn-error', (payload) => {
-    if (payload.sessionId === session.id) writeFrame(res, { kind: 'error', message: payload.message })
+    if (payload.sessionId === session.id) streamFrame({ kind: 'error', message: payload.message })
   })
   const principalId = (req as IncomingMessage & { dntHarnessPrincipalId?: string }).dntHarnessPrincipalId
   let closed = false
@@ -6767,14 +7009,23 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     }
     // A deleted session must end its streams: no more frames can ever come.
     if (entry.closed === true) {
-      writeFrame(res, { kind: 'error', message: 'session deleted' })
+      streamFrame({ kind: 'error', message: 'session deleted' })
       close()
+      return
+    }
+    if (res.destroyed || res.writableEnded) return
+    if (res.writableLength > 4_000_000) {
+      settle(false)
+      res.end()
       return
     }
     res.write(': ping\n\n')
   }, 2_000)
 
   req.once('close', () => settle(false))
+  res.once('close', () => settle(false))
+  disposeForBackpressure = () => settle(false)
+  if (backpressured) settle(false)
 }
 
 /**

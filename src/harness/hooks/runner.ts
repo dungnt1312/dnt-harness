@@ -41,7 +41,8 @@ function splitCommand(command: string): { file: string; args: string[] } {
  * binding's onFailure policy — the runner reports what happened; the
  * caller (the gate listener) decides deny vs allow from it.
  */
-export function runHook(binding: HookBinding, payload: Record<string, unknown>, defaultTimeoutMs = 3_000): Promise<HookDecision> {
+export function runHook(binding: HookBinding, payload: Record<string, unknown>, defaultTimeoutMs = 3_000, signal?: AbortSignal): Promise<HookDecision> {
+  signal?.throwIfAborted()
   const started = Date.now()
   // Prefer explicit args (direct command+args contract). Legacy command
   // strings are split only when args is absent.
@@ -58,6 +59,7 @@ export function runHook(binding: HookBinding, payload: Record<string, unknown>, 
       if (settled) return
       settled = true
       clearTimeout(timer)
+      signal?.removeEventListener('abort', cancel)
       let decision: HookDecision = {
         exitCode,
         blocked: false,
@@ -76,9 +78,23 @@ export function runHook(binding: HookBinding, payload: Record<string, unknown>, 
       }
       resolve(decision)
     }
-    let child
+    let child: ReturnType<typeof spawn>
+    const cancel = (): void => {
+      // Direct commands get their own process group, as in the shell runner.
+      if (process.platform === 'win32' && child.pid !== undefined) {
+        spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }).on('error', () => child.kill('SIGKILL'))
+      } else {
+        try { if (child.pid !== undefined) process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL') }
+        catch { child.kill('SIGKILL') }
+      }
+      // Do not wait on inherited pipes held by a surviving descendant.
+      child.stdout?.destroy()
+      child.stderr?.destroy()
+      child.stdin?.destroy()
+      finish(null)
+    }
     try {
-      child = spawn(file, args, { stdio: ['pipe', 'pipe', 'pipe'], env: scrubbedChildEnv(), windowsHide: true })
+      child = spawn(file, args, { stdio: ['pipe', 'pipe', 'pipe'], env: scrubbedChildEnv(), windowsHide: true, detached: true })
     } catch {
       // Spawn failures are non-blocking failures (exit 1 semantics); the
       // caller applies onFailure.
@@ -87,9 +103,11 @@ export function runHook(binding: HookBinding, payload: Record<string, unknown>, 
     }
     const timer = setTimeout(() => {
       timedOut = true
-      child.kill('SIGKILL')
+      cancel()
     }, timeoutMs)
     timer.unref?.()
+    signal?.addEventListener('abort', cancel, { once: true })
+    if (signal?.aborted) { cancel(); return }
     child.stdout?.on('data', (chunk: Buffer) => {
       if (stdout.length < HOOK_OUTPUT_CAP) stdout += chunk.toString('utf8').slice(0, HOOK_OUTPUT_CAP - stdout.length)
     })

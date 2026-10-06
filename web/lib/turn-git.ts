@@ -50,16 +50,3 @@ export function overlayTurnChanges(changes: TurnChanges, root: string, report: G
   })
 }
 
-/** Sum of the overlay's git line counts, for the collapsed row's chips. */
-export function overlayTotals(rows: readonly TurnChangeOverlay[]): { added: number; removed: number; counted: number } {
-  let added = 0
-  let removed = 0
-  let counted = 0
-  for (const row of rows) {
-    if (row.git?.added === undefined && row.git?.removed === undefined) continue
-    counted += 1
-    added += row.git?.added ?? 0
-    removed += row.git?.removed ?? 0
-  }
-  return { added, removed, counted }
-}

@@ -515,8 +515,8 @@ function ModeEditor({ draft, onDraft, disabled, isNew, newId, onNewId }: {
           </div>
         </div>
         <Switch label="Workspace instructions" hint="Load workspace and project instruction files." checked={draft.workspaceInstructions} disabled={disabled} onChange={(next) => patch({ workspaceInstructions: next })} />
-        <Switch label="Pinned memory" hint="Pinned memory entries load automatically." checked={draft.memoryPinned} disabled={disabled} onChange={(next) => patch({ memoryPinned: next })} />
-        <Switch label="Memory retrieval" hint="Memory search stays available as a tool." checked={draft.memoryRetrieval} disabled={disabled} onChange={(next) => patch({ memoryRetrieval: next })} />
+        <Switch label="Memory indexes" hint="Load bounded MEMORY.md pointers (not topic bodies). Both memory switches must be on." checked={draft.memoryPinned} disabled={disabled} onChange={(next) => patch({ memoryPinned: next })} />
+        <Switch label="Memory retrieval" hint="Permit ordinary file tools to browse scoped Markdown memory. Both memory switches must be on." checked={draft.memoryRetrieval} disabled={disabled} onChange={(next) => patch({ memoryRetrieval: next })} />
         <Switch label="Allow paths outside granted folders" hint="File tools may use other folders without an extra approval. Network, device, and app-storage paths stay refused." checked={draft.outOfGrant === 'allow'} disabled={disabled} onChange={(next) => patch({ outOfGrant: next ? 'allow' : 'ask' })} />
       </div>
 

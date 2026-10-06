@@ -19,6 +19,7 @@ import { cn } from '../../lib/cn.ts'
 import type { AttachmentRef } from '../../lib/composer-draft.ts'
 import { parseMessageText } from '../../lib/inline-chips.ts'
 import { InlineChip } from '../common/InlineChip.tsx'
+import type { TurnTiming } from '../../lib/turn-timing.ts'
 import { ImageLightbox } from './ImageLightbox.tsx'
 import type { ChildRow, ContextManifestView, ToolCall } from '../../lib/types.ts'
 import type { ViewItem } from '../../lib/project.ts'
@@ -73,8 +74,18 @@ export const UserBubble = memo(function UserBubble({ item, workspaceId, onReuse 
   const images = workspaceId != null ? attachments.filter(isImageAttachment) : []
   const files = attachments.filter((ref) => !images.includes(ref))
   const hasBubble = item.content !== '' || files.length > 0
+  const sentAt = item.ts !== undefined ? formatTime(item.ts) : undefined
   return (
-    <div className="group flex flex-col items-end gap-1.5" title={item.ts !== undefined ? formatTime(item.ts) : undefined}>
+    <div className="group flex flex-col items-end gap-1.5" title={sentAt !== undefined ? sentAt : undefined}>
+      {/* The turn's opening line: who sent it and when — kept out of the
+          bubble so the not-sent state can restyle it freely. Queued input
+          never renders here at all. */}
+      {sentAt !== undefined ? (
+        <div className="flex items-baseline gap-1.5 text-[11px] text-fg-faint">
+          <span className="font-medium text-fg-muted">You</span>
+          <span>{sentAt}</span>
+        </div>
+      ) : null}
       {images.length > 0 && workspaceId != null ? (
         <ul className="m-0 flex max-w-[85%] list-none flex-wrap justify-end gap-1.5 p-0 sm:max-w-[70%]">
           {images.map((ref) => (
@@ -175,11 +186,13 @@ function useLiveContent(content: string, live: boolean): string {
   return live ? displayed : content
 }
 
-export const AssistantMessage = memo(function AssistantMessage({ item, modelLabel, turn, changes, changesProject, changesWorkspaceId, changesOpenPath, changesReviewFile, changesReviewAll }: {
+export const AssistantMessage = memo(function AssistantMessage({ item, modelLabel, turn, timing, changes, changesProject, changesWorkspaceId, changesOpenPath, changesReviewFile, changesReviewAll }: {
   readonly item: Extract<ViewItem, { kind: 'assistant' }>
   readonly modelLabel?: string
   /** Present on the last answer of a closed turn; text is the turn's full answer. */
   readonly turn?: { readonly parts?: readonly string[]; readonly text: string }
+  /** The turn's recorded start/end stamps; the footer reads the end and span. */
+  readonly timing?: TurnTiming
   /** Files this turn's Write/Edit calls landed; present on the same anchor answer. */
   readonly changes?: TurnChanges
   readonly changesProject?: WorkbenchProject | null
@@ -197,6 +210,15 @@ export const AssistantMessage = memo(function AssistantMessage({ item, modelLabe
     : ''
   const label = controlsLabel !== '' ? controlsLabel : modelLabel
   const [disclosed, setDisclosed] = useState(false)
+  // The turn's wall-clock story: when it finished and how long it ran. Both
+  // come from the recorded turn/end and turn/start stamps; legacy logs carry
+  // neither, so the footer falls back to the answer's own time and no span.
+  const endedAt = timing?.endedAt
+  const duration = timing?.startedAt !== undefined && endedAt !== undefined && endedAt >= timing.startedAt
+    ? formatElapsed(endedAt - timing.startedAt)
+    : undefined
+  // Turn end when recorded; the answer's own time covers legacy logs.
+  const endLabel = formatTime(endedAt ?? item.ts)
   return (
     <div className="group flex flex-col gap-1">
       {item.discarded === true ? (
@@ -239,7 +261,8 @@ export const AssistantMessage = memo(function AssistantMessage({ item, modelLabe
           <div className={cn('-ml-2 -mb-0.5 flex h-6 items-center gap-1 text-[11px] text-fg-faint', revealActions)}>
             <CopyButton getText={() => turn.parts?.join('\n\n') ?? turn.text ?? ''} label="Copy response" className="size-6" />
             {label !== undefined ? <span className="truncate">{label}</span> : null}
-            {item.ts !== undefined ? <span>· {formatTime(item.ts)}</span> : null}
+            {endLabel !== '' ? <span>· {endLabel}</span> : null}
+            {duration !== undefined ? <span aria-label="Turn duration">· {duration}</span> : null}
           </div>
           {changes !== undefined ? (
             <TurnChangesCard
@@ -258,6 +281,8 @@ export const AssistantMessage = memo(function AssistantMessage({ item, modelLabe
   )
 }, (previous, next) => {
   if (previous.item !== next.item || previous.modelLabel !== next.modelLabel) return false
+  if (previous.timing?.startedAt !== next.timing?.startedAt
+    || previous.timing?.endedAt !== next.timing?.endedAt) return false
   const previousParts = previous.turn?.parts
   const nextParts = next.turn?.parts
   if (previousParts !== undefined || nextParts !== undefined) {
@@ -282,8 +307,6 @@ type RowState = 'running' | 'ok' | 'failed' | 'unknown' | 'cancelled' | 'denied'
  * last step settles would unmount the very row someone is reading.
  */
 const PinRunContext = createContext<() => void>(() => {})
-/** Inside a group the rail already says what the rows are, so their icons give way. */
-const InGroupContext = createContext(false)
 
 /**
  * Activity rows are a line of text, not a card: no box, no fill, no hover
@@ -342,7 +365,7 @@ const KIND: Readonly<Record<string, { readonly running: string; readonly done: s
   glob: { running: 'Finding', done: 'Find', otherwise: 'Find' },
   grep: { running: 'Searching', done: 'Search', otherwise: 'Search' },
   bash: { running: 'Running', done: 'Terminal', otherwise: 'Terminal' },
-  skill: { running: 'Loading skill', done: 'Skill', otherwise: 'Skill' },
+  skill: { running: 'Loading', done: 'Skill', otherwise: 'Skill' },
   agent: { running: 'Agent', done: 'Agent', otherwise: 'Agent' },
 }
 
@@ -466,10 +489,9 @@ function ActivityRow({ spec, state, expandable = true, children }: {
   const [expanded, setExpanded] = useState(false)
   const holdScroll = useHoldScroll()
   const pinRun = useContext(PinRunContext)
-  const inGroup = useContext(InGroupContext)
   const bodyId = useId()
   const buttonId = useId()
-  const line = <RowLine spec={spec} state={state} showIcon={!inGroup} />
+  const line = <RowLine spec={spec} state={state} showIcon />
   if (!expandable) {
     return <div className={rowClass} {...(spec.title !== undefined ? { title: spec.title } : {})}>{line}</div>
   }
@@ -685,13 +707,11 @@ export function ActivityBlock({ items, children }: { readonly items: readonly Vi
         />
       </button>
       {/* Behind a rail: an opened run reads as the header's contents, not as
-          loose rows that happen to follow it. The rail already names them, so
-          the rows drop their icons. The gap matches a row standing alone. */}
+          loose rows that happen to follow it. The gap matches a row standing
+          alone. */}
       {open ? (
         <PinRunContext.Provider value={pin}>
-          <InGroupContext.Provider value>
-            <div id={bodyId} className={cn('ml-2 mt-2.5 flex flex-col border-l border-line pl-3.5 sm:mt-4', rowGap)}>{children}</div>
-          </InGroupContext.Provider>
+          <div id={bodyId} className={cn('ml-2 mt-2.5 flex flex-col border-l border-line pl-3.5 sm:mt-4', rowGap)}>{children}</div>
         </PinRunContext.Provider>
       ) : null}
     </div>
@@ -799,7 +819,7 @@ function toolRowSpec(item: Extract<ViewItem, { kind: 'tool' }>, state: RowState,
     return { ...base, icon: 'lightbulb', kind: 'Memory', separator: true, primary: `${MEMORY_VERB[builtin]} ${facts.target}`.trim() }
   }
   if (builtin === 'skill') {
-    return { ...base, icon: 'zap', kind: kind!, primary: facts.target }
+    return { ...base, icon: 'zap', kind: kind!, separator: true, primary: facts.target, primaryMono: true }
   }
   if (server !== undefined || mcpServerOf(call.name) !== undefined) {
     return {
@@ -1381,10 +1401,10 @@ export const ContinuationMarker = memo(function ContinuationMarker({ item }: {
 
 /**
  * One request's context record, sitting between the input and the answer it
- * produced: the collapsed line says when context was injected and how big it
- * ran; expanding reveals the full manifest — budget fill, per-source
- * breakdown, history window, pinned sources, what was omitted — plus the raw
- * text of every non-history block the request carried.
+ * produced: the collapsed line says when context was injected, how big it ran,
+ * and on which model; expanding reveals the full manifest — budget fill,
+ * per-source breakdown, history window, pinned sources, what was omitted —
+ * plus the raw text of every non-history block the request carried.
  */
 export const ContextMarker = memo(function ContextMarker({ item, workspaceId, sessionId }: {
   readonly item: Extract<ViewItem, { kind: 'context' }>
@@ -1411,6 +1431,7 @@ export const ContextMarker = memo(function ContextMarker({ item, workspaceId, se
     (item.requests ?? 1) > 1 ? `${item.requests} requests` : undefined,
     sources.skills.length > 0 ? `${sources.skills.length} skill${sources.skills.length === 1 ? '' : 's'}` : undefined,
     sources.memory.length > 0 ? `${sources.memory.length} mem` : undefined,
+    ...(manifest.model !== undefined && manifest.model !== '' ? [manifest.model] : []),
     ...(parent !== undefined ? [`${formatTokenCount(parent.chars)} chars inherited`] : []),
   ].filter((fact) => fact !== undefined)
 

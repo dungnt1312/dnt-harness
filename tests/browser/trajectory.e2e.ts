@@ -78,7 +78,7 @@ async function serve(page: Page, events: readonly unknown[], children: readonly 
     if (path.startsWith('/api/workspaces/w/attachments/')) return route.fulfill({ status: 404, body: '' })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/mode$/.test(path)) return json(route, { modeId: 'chat', name: 'Chat', revision: 1, source: 'workspace-default' })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/processes$/.test(path)) return json(route, [])
-    if (path === '/api/workspaces/w/terminals') return json(route, { terminals: [], shells: [], max: 4, available: false })
+    if (path === '/api/workspaces/w/terminals') return json(route, { terminals: [], shells: [], available: false })
     if (path === '/api/workspaces/w/projects/p/git') return json(route, { branch: null, changes: [], truncated: false })
     throw new Error(`Unexpected fixture API request: ${route.request().method()} ${url.href}`)
   })

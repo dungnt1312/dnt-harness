@@ -4,7 +4,7 @@
   "license": "MIT",
   "private": true,
   "type": "module",
-  "description": "A miniature TypeScript replica of the DeepSeek Harness architecture: mini-Cordis kernel, agent loop, tool pipeline, capability seams.",
+  "description": "A TypeScript agent harness with a Cordis-inspired plugin kernel: agent loop, tool pipeline, capability seams.",
   "engines": {
     "node": ">=22.19.0"
   },

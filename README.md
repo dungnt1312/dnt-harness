@@ -1,8 +1,8 @@
 # dnt-harness
 
-A miniature TypeScript replica of the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) architecture, built for learning: the same plugin-runtime ideas — everything is a plugin, typed events with five dispatch modes, reversible effects, dependency-driven lifecycle — reimplemented from scratch on a kernel small enough to read in an afternoon.
+A TypeScript agent harness built from scratch: a small plugin-runtime kernel, an agent core (durable session log, LLM streaming seam, turn/step driver), a guarded tool pipeline, and a web UI — designed to stay small enough to read in an afternoon.
 
-The reference architecture lives in the DeepSeek Harness repository (`docs/architecture.md`, `docs/cordis-primer.md`, `docs/cordis-tutorial/`). This project rebuilds those ideas without importing them; the test suite reproduces the Cordis tutorial chapters against this kernel.
+The kernel design takes inspiration from the Cordis plugin runtime (everything is a plugin, typed events with five dispatch modes, reversible effects, dependency-driven lifecycle), reimplemented from scratch without importing any of its code. What the harness grew into — tools, modes, skills, memory, workspaces, MCP — has since developed well beyond that starting point.
 
 ## Documentation
 
@@ -13,11 +13,12 @@ Full docs live in [`docs/`](docs/README.md):
 - [harness.md](docs/harness.md) — session log, LLM seam, turn/step driver, tools, approval
 - [capabilities.md](docs/capabilities.md) — filesystem and bash tools
 - [web.md](docs/web.md) — the web host API and React client
+- [skills.md](docs/skills.md) — skill layers, SKILL.md format, the Skill tool
 - [guides.md](docs/guides.md) — setup, config, CLI, plugin authoring, testing
 
 ## Status
 
-- **Phase 0–1 (done)** — mini-Cordis kernel: event bus with all five dispatch modes, fiber lifecycle with reverse-order effect disposal, service store with `inject` dependency tracking, and a YAML composition loader. 37 tests reproduce tutorial chapters 2–4 on this kernel.
+- **Phase 0–1 (done)** — plugin kernel: event bus with all five dispatch modes, fiber lifecycle with reverse-order effect disposal, service store with `inject` dependency tracking, and a YAML composition loader. 37 tests cover the kernel's event, effect, service, and loader mechanics.
 - **Phase 2 (done)** — agent core: durable session log (event sourcing, `deriveMessages()`, fork), LLM streaming seam (`agent/request` + `llm/stream` waterfalls, mock + DeepSeek SSE providers), and the turn/step driver (inbox with `send`/`inject`, `agent/pre-step`, `agent/turn-stopping`). Headless CLI chats multi-turn.
 - **Phase 3 (done)** — tool pipeline: `ToolsService` with the guarded `tools/pre-execute` → execute → `tools/post-execute` path, approval policy (allow/ask/deny riding pre-execute), and the canonical built-in tools `Read`/`Write`/`Edit`/`Glob`/`Grep`/`Bash` (legacy lowercase names normalize at the boundary). The loop spends another step while tools owe the model their results, with no turn deadline or step budget — the model decides when the turn ends, unless the user stops it. Verified end-to-end against the real DeepSeek API.
 - **Phase 4 (done)** — web UI: `createWebServer` (REST + SSE) with the React client (`web/`, built by Vite). The client renders purely from the session event stream — snapshot replay plus live `session/event` frames — and approval questions ride the same stream, answered over `POST /api/approvals/:id`; routing to the right session goes through the ambient agent scope (`AsyncLocalStorage`), so concurrent sessions share one policy listener without cross-talk. A failed step closes its turn durably (`turn/end: failed`). The UI is product-grade: collapsible thinking panel, expandable tool cards, session rename/delete/search, a stop button (`turn/end: stopped`), syntax-highlighted code blocks, toasts, and a mobile drawer. 105 tests cover kernel, harness, capabilities, and the web API.
@@ -112,9 +113,9 @@ src/kernel/
 └── loader.ts    cordis.yml → plugin tree through dynamic import()
 ```
 
-### Concepts (mapped to DeepSeek Harness)
+### Concepts (shared vocabulary with Cordis-inspired kernels)
 
-| dnt-harness | DeepSeek Harness / Cordis |
+| dnt-harness | Cordis term |
 |---|---|
 | `Kernel` | Cordis app + Loader assembly |
 | `Context` proxy over `ServiceStore` | `Context` + `ReflectService` |
@@ -134,7 +135,7 @@ src/kernel/
 | `bail` | no | registration | synchronous first-bail |
 | `waterfall` | chain | outermost→innermost | each listener wraps or vetoes via `next()` |
 
-A waterfall listener that only observes must call `next()`; returning without it is a deliberate veto — the same standing rule as the upstream repository.
+A waterfall listener that only observes must call `next()`; returning without it is a deliberate veto — a standing rule this kernel keeps by design.
 
 ## The harness
 
@@ -161,7 +162,7 @@ src/capabilities/
 └── shell/     Bash tool: timeout, process-tree kill, exit-code report
 ```
 
-The turn flow, matching the upstream `Turn flow` map:
+The turn flow:
 
 ```
 turn/start
@@ -180,7 +181,7 @@ turn/start
 turn/end
 ```
 
-Three invariants carried over verbatim:
+Three standing invariants:
 
 - **Model-visible means logged.** Every model request is `session.deriveMessages()` at that moment; a test asserts it with tools in the loop.
 - **Raw `assistant/chunk` events preserve replay and UI fidelity** but never re-enter model history — only the assembled `assistant/message` projects.

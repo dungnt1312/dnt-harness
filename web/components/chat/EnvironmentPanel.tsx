@@ -5,21 +5,22 @@
  * subagent expands it exactly once per session, and an explicit user
  * collapse sticks until the conversation changes. Ended subagents fold
  * behind an "Ended" group with a Clear, like ended processes. State
- * derives from the durable event stream; one GET reconciles what an SSE
- * gap may have missed.
+ * derives from the durable event stream; host-registry GETs reconcile
+ * what an SSE gap or a skipped result write may have missed — processes
+ * once per connect, subagents on a short poll while any still runs.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import Icon from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { Sheet } from '../ui/Sheet.tsx'
 import { cn } from '../../lib/cn.ts'
 import { useMediaQuery } from '../../hooks/useMediaQuery.ts'
-import { fetchGitStatus, listSessionProcesses, stopSessionProcess, cancelChild } from '../../lib/api.ts'
-import { processRows, subagentRows, type ProcessRow, type SubagentRow } from '../../lib/processes-view.ts'
+import { fetchGitStatus, listSessionProcesses, stopSessionProcess, cancelChild, listChildren } from '../../lib/api.ts'
+import { processRows, subagentRows, reconcileSubagentRows, type ProcessRow, type SubagentRow } from '../../lib/processes-view.ts'
 import { agentRoleIcon, AGENT_ROLE_TONE } from '../../lib/agent-icons.ts'
 import { todosFromEvents } from '../../lib/todos-view.ts'
 import { formatAge } from '../../lib/format.ts'
-import type { SseEvent } from '../../lib/types.ts'
+import type { ChildRow, SseEvent } from '../../lib/types.ts'
 
 interface GitLine {
   readonly branch: string | null
@@ -57,9 +58,9 @@ export function formatDuration(ms: number): string {
 
 /** Signed colored diff counts: `+2,173 −628`, zero parts omitted. */
 function DiffCounts({ added, removed }: { readonly added: number; readonly removed: number }) {
-  if (added === 0 && removed === 0) return <span className="text-[12px] text-fg-faint">clean</span>
+  if (added === 0 && removed === 0) return <span className="text-[11px] text-fg-faint">clean</span>
   return (
-    <span className="shrink-0 text-[12px]">
+    <span className="shrink-0 text-[11px]">
       {added > 0 ? <span className="text-ok">+{added.toLocaleString()}</span> : null}
       {added > 0 && removed > 0 ? ' ' : ''}
       {removed > 0 ? <span className="text-bad">−{removed.toLocaleString()}</span> : null}
@@ -71,7 +72,7 @@ function DiffCounts({ added, removed }: { readonly added: number; readonly remov
 function SyncArrows({ ahead, behind }: { readonly ahead: number; readonly behind: number }) {
   if (ahead <= 0 && behind <= 0) return null
   return (
-    <span className="shrink-0 text-[12px] text-fg-faint">
+    <span className="shrink-0 text-[11px] text-fg-faint">
       {ahead > 0 ? <span title={`${ahead} ahead of upstream`}>↑{ahead}</span> : null}
       {ahead > 0 && behind > 0 ? ' ' : ''}
       {behind > 0 ? <span title={`${behind} behind upstream`}>↓{behind}</span> : null}
@@ -92,13 +93,18 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
   const [git, setGit] = useState<GitLine | null>(null)
   const [gitFailed, setGitFailed] = useState(false)
   const [liveRunning, setLiveRunning] = useState<readonly string[]>([])
+  const [childRows, setChildRows] = useState<readonly ChildRow[]>([])
   const [stopping, setStopping] = useState<readonly string[]>([])
   const [stoppingChild, setStoppingChild] = useState<readonly string[]>([])
   const [now, setNow] = useState(() => Date.now())
   const compact = useMediaQuery(COMPACT_QUERY)
 
   const derived = useMemo(() => processRows(events), [events])
-  const agents = useMemo(() => subagentRows(events), [events])
+  const spawned = useMemo(() => subagentRows(events), [events])
+  // The registry fold settles rows the log still calls running: a result event
+  // an SSE gap dropped, or one the host never wrote for an uncertain child.
+  const agents = useMemo(() => reconcileSubagentRows(spawned, childRows), [spawned, childRows])
+  const hasRunningSpawns = useMemo(() => spawned.some((row) => row.running), [spawned])
   const liveRunningIds = useMemo(() => new Set(liveRunning), [liveRunning])
   const rows = useMemo(
     () => derived.map((row) => (liveRunningIds.has(row.id) && row.status !== 'running' ? { ...row, status: 'running' as const } : row)),
@@ -181,7 +187,10 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
     return () => { disposed = true }
   }, [workspaceId, project, sessionId, turnEndCount])
 
-  // Live reconciliation: correct state an SSE gap may have missed.
+  // Live reconciliation: correct state an SSE gap may have missed — processes
+  // from the host registry, and subagents from the same child list the
+  // workbench reads (a settled child whose parent result never landed would
+  // otherwise read running forever).
   const reconcile = useCallback(async (): Promise<void> => {
     if (workspaceId === null || sessionId === null) return
     try {
@@ -193,6 +202,24 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
   }, [workspaceId, sessionId])
 
   useEffect(() => { void reconcile() }, [reconcile, connected])
+
+  const reconcileChildren = useCallback(async (): Promise<void> => {
+    if (workspaceId === null || sessionId === null) return
+    try {
+      setChildRows(await listChildren(workspaceId, sessionId))
+    } catch {
+      // Last known state, never a blocker — the result event still carries it.
+    }
+  }, [workspaceId, sessionId])
+
+  useEffect(() => {
+    // Only fetch while the log still shows a live child: nothing to correct
+    // once every spawn has a result. `connected` re-runs it after a reconnect.
+    if (workspaceId === null || sessionId === null || !hasRunningSpawns) return
+    void reconcileChildren()
+    const timer = window.setInterval(() => void reconcileChildren(), 3_000)
+    return () => window.clearInterval(timer)
+  }, [workspaceId, sessionId, hasRunningSpawns, reconcileChildren, connected])
 
   const stop = useCallback(
     async (id: string): Promise<void> => {
@@ -231,190 +258,157 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
   const collapseLabel = expanded ? 'Collapse environment' : 'Expand environment'
   const workingLabel = workingSince !== null ? formatDuration(now - workingSince) : null
   const detail = (
-    <div className="flex flex-col gap-1.5">
+    <div className="flex flex-col gap-1">
       {project !== null ? (
         <section aria-label="Git">
           <button
             type="button"
             aria-label="Open git panel"
             onClick={() => onOpenView('git')}
-            className="flex w-full items-center gap-2 rounded-lg px-1.5 py-1.5 text-left text-[13px] transition-colors hover:bg-hover"
+            className="flex w-full items-center gap-2 rounded-md px-1 py-1.5 text-left text-[12px] transition-colors hover:bg-hover"
           >
-            <Icon name="gitBranch" size={14} className="shrink-0 text-fg-faint" />
+            <Icon name="gitBranch" size={13} className="shrink-0 text-fg-faint" />
             <span className="min-w-0 flex-1 truncate font-medium text-fg" title={git?.branch ?? project.path}>{git?.branch ?? project.name}</span>
             <SyncArrows ahead={git?.ahead ?? 0} behind={git?.behind ?? 0} />
-            {git !== null ? <DiffCounts added={git.added} removed={git.removed} /> : <span className="text-[12px] text-fg-faint">{gitFailed ? 'unavailable' : '…'}</span>}
+            {git !== null ? <DiffCounts added={git.added} removed={git.removed} /> : <span className="text-[11px] text-fg-faint">{gitFailed ? 'unavailable' : '…'}</span>}
           </button>
         </section>
       ) : null}
 
       {running.length + ended.length > 0 ? (
-        <section aria-label="Background processes" className="flex flex-col">
-          <button
-            type="button"
-            aria-expanded={state.processesOpen}
-            onClick={() => setState((prev) => ({ ...prev, processesOpen: !prev.processesOpen }))}
-            className="flex w-full items-center gap-2 rounded-lg px-1.5 py-1.5 text-left text-[13px] transition-colors hover:bg-hover"
-          >
-            <Icon name="terminal" size={14} className="shrink-0 text-fg-faint" />
-            <span className="min-w-0 flex-1 truncate font-medium text-fg-muted">Background processes</span>
-            <span className={cn('shrink-0 whitespace-nowrap text-[12px]', running.length > 0 ? 'text-warn' : 'text-fg-faint')}>
-              {running.length > 0 ? `${running.length} running${ended.length > 0 ? ` · ${running.length + ended.length} total` : ''}` : `${ended.length} ended`}
-            </span>
-            <Icon name="chevron" size={13} className={cn('shrink-0 text-fg-faint transition-transform', state.processesOpen ? 'rotate-180' : '')} />
-          </button>
-          {state.processesOpen ? (
-            <div className="flex flex-col gap-0.5 pb-1">
-              {running.map((row) => (
-                <ProcessLine key={row.id} row={row} now={now} pending={stopping.includes(row.id)} onOpen={() => onOpenProcess(row.id)} onStop={() => void stop(row.id)} />
-              ))}
-              {ended.length > 0 ? (
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    aria-label="Toggle ended processes"
-                    aria-expanded={state.endedOpen}
-                    onClick={() => setState((prev) => ({ ...prev, endedOpen: !prev.endedOpen }))}
-                    className="flex min-w-0 flex-1 items-center gap-1.5 rounded-sm py-1 text-left text-[12px] text-fg-faint transition-colors hover:text-fg-muted"
-                  >
-                    <Icon name="chevron" size={12} className={cn('shrink-0 transition-transform', state.endedOpen ? '' : 'rotate-180')} />
-                    Ended · {ended.length}
-                  </button>
-                  <button
-                    type="button"
-                    aria-label="Clear ended processes"
-                    title="Clear ended processes"
-                    onClick={() => setState((prev) => {
-                      const dismissed = new Set(prev.dismissed)
-                      for (const row of ended) dismissed.add(row.id)
-                      return { ...prev, dismissed, endedOpen: false }
-                    })}
-                    className="flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 text-[11px] text-fg-faint transition-colors hover:bg-hover hover:text-fg-muted"
-                  >
-                    <Icon name="trash" size={11} />
-                    Clear
-                  </button>
-                </div>
-              ) : null}
-              {state.endedOpen ? (
-                <div className="flex flex-col gap-0.5">
-                  {ended.map((row) => (
-                    <ProcessLine key={row.id} row={row} now={now} pending={stopping.includes(row.id)} onOpen={() => onOpenProcess(row.id)} onStop={() => void stop(row.id)} />
-                  ))}
-                </div>
-              ) : null}
+        <Section
+          label="Background processes"
+          tone={running.length > 0 ? 'warn' : 'faint'}
+          count={running.length > 0 ? `${running.length} running${ended.length > 0 ? ` · ${running.length + ended.length} total` : ''}` : `${ended.length} ended`}
+          open={state.processesOpen}
+          onToggle={() => setState((prev) => ({ ...prev, processesOpen: !prev.processesOpen }))}
+        >
+          {running.map((row) => (
+            <ProcessLine key={row.id} row={row} now={now} pending={stopping.includes(row.id)} onOpen={() => onOpenProcess(row.id)} onStop={() => void stop(row.id)} />
+          ))}
+          {ended.length > 0 ? (
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                aria-label="Toggle ended processes"
+                aria-expanded={state.endedOpen}
+                onClick={() => setState((prev) => ({ ...prev, endedOpen: !prev.endedOpen }))}
+                className="flex min-w-0 flex-1 items-center gap-1 rounded py-0.5 text-left text-[11px] text-fg-faint transition-colors hover:text-fg-muted"
+              >
+                <Icon name="chevron" size={11} className={cn('shrink-0 transition-transform', state.endedOpen ? '' : 'rotate-180')} />
+                Ended · {ended.length}
+              </button>
+              <button
+                type="button"
+                aria-label="Clear ended processes"
+                title="Clear ended processes"
+                onClick={() => setState((prev) => {
+                  const dismissed = new Set(prev.dismissed)
+                  for (const row of ended) dismissed.add(row.id)
+                  return { ...prev, dismissed, endedOpen: false }
+                })}
+                className="flex h-5 shrink-0 items-center gap-1 rounded px-1 text-[11px] text-fg-faint transition-colors hover:bg-hover hover:text-fg-muted"
+              >
+                <Icon name="trash" size={10} />
+                Clear
+              </button>
             </div>
           ) : null}
-        </section>
+          {state.endedOpen ? (
+            <div className="flex flex-col gap-px">
+              {ended.map((row) => (
+                <ProcessLine key={row.id} row={row} now={now} pending={stopping.includes(row.id)} onOpen={() => onOpenProcess(row.id)} onStop={() => void stop(row.id)} />
+              ))}
+            </div>
+          ) : null}
+        </Section>
       ) : null}
 
       {runningAgents.length + endedAgents.length > 0 ? (
-        <section aria-label="Subagents" className="flex flex-col">
-          <button
-            type="button"
-            aria-expanded={state.subagentsOpen}
-            onClick={() => setState((prev) => ({ ...prev, subagentsOpen: !prev.subagentsOpen }))}
-            className="flex w-full items-center gap-2 rounded-lg px-1.5 py-1.5 text-left text-[13px] transition-colors hover:bg-hover"
-          >
-            <Icon name="gitBranch" size={14} className="shrink-0 text-fg-faint" />
-            <span className="min-w-0 flex-1 truncate font-medium text-fg-muted">Subagents</span>
-            <span className={cn('shrink-0 whitespace-nowrap text-[12px]', runningAgents.length > 0 ? 'text-ok' : 'text-fg-faint')}>
-              {runningAgents.length > 0 ? `${runningAgents.length} running` : `${runningAgents.length + endedAgents.length} total`}
-            </span>
-            <Icon name="chevron" size={13} className={cn('shrink-0 text-fg-faint transition-transform', state.subagentsOpen ? 'rotate-180' : '')} />
-          </button>
-          {state.subagentsOpen ? (
-            <div className="flex flex-col gap-0.5 pb-1">
-              {liveAgents.map((row) => (
-                <SubagentLine key={row.childSessionId} row={row} now={now} pending={stoppingChild.includes(row.childSessionId)} onOpen={() => onOpenChild?.(row.childSessionId)} onStop={() => void stopChild(row.childSessionId)} />
-              ))}
-              {hiddenRunningAgents > 0 ? (
+        <Section
+          label="Subagents"
+          tone={runningAgents.length > 0 ? 'ok' : 'faint'}
+          count={runningAgents.length > 0 ? `${runningAgents.length} running` : `${runningAgents.length + endedAgents.length} total`}
+          open={state.subagentsOpen}
+          onToggle={() => setState((prev) => ({ ...prev, subagentsOpen: !prev.subagentsOpen }))}
+        >
+          {liveAgents.map((row) => (
+            <SubagentLine key={row.childSessionId} row={row} now={now} pending={stoppingChild.includes(row.childSessionId)} onOpen={() => onOpenChild?.(row.childSessionId)} onStop={() => void stopChild(row.childSessionId)} />
+          ))}
+          {hiddenRunningAgents > 0 ? (
+            <button
+              type="button"
+              aria-label="Open the full subagent list in the workbench"
+              title={`Open the Subagents workbench view for all ${runningAgents.length + endedAgents.length}`}
+              onClick={() => onOpenView('agents')}
+              className="flex w-full items-center rounded py-0.5 pl-1 pr-0.5 text-left text-[11px] text-fg-faint transition-colors hover:bg-hover hover:text-fg-muted"
+            >
+              +{hiddenRunningAgents} more running · view all in Workbench
+            </button>
+          ) : null}
+          {endedAgents.length > 0 ? (
+            <>
+              <div className="flex items-center gap-1.5">
                 <button
                   type="button"
-                  aria-label="Open the full subagent list in the workbench"
-                  title={`Open the Subagents workbench view for all ${runningAgents.length + endedAgents.length}`}
-                  onClick={() => onOpenView('agents')}
-                  className="flex w-full items-center gap-1.5 rounded-lg py-1 pl-2.5 pr-1.5 text-left text-[12px] text-fg-faint transition-colors hover:bg-hover hover:text-fg-muted"
+                  aria-label="Toggle ended subagents"
+                  aria-expanded={state.endedAgentsOpen}
+                  onClick={() => setState((prev) => ({ ...prev, endedAgentsOpen: !prev.endedAgentsOpen }))}
+                  className="flex min-w-0 flex-1 items-center gap-1 rounded py-0.5 text-left text-[11px] text-fg-faint transition-colors hover:text-fg-muted"
                 >
-                  +{hiddenRunningAgents} more running · view all in Workbench
+                  <Icon name="chevron" size={11} className={cn('shrink-0 transition-transform', state.endedAgentsOpen ? '' : 'rotate-180')} />
+                  Ended · {endedAgents.length}
                 </button>
+                <button
+                  type="button"
+                  aria-label="Clear ended subagents"
+                  title="Clear ended subagents"
+                  onClick={() => setState((prev) => {
+                    const dismissed = new Set(prev.dismissed)
+                    for (const row of endedAgents) dismissed.add(row.childSessionId)
+                    return { ...prev, dismissed }
+                  })}
+                  className="flex h-5 shrink-0 items-center gap-1 rounded px-1 text-[11px] text-fg-faint transition-colors hover:bg-hover hover:text-fg-muted"
+                >
+                  <Icon name="trash" size={10} />
+                  Clear
+                </button>
+              </div>
+              {state.endedAgentsOpen ? (
+                <div className="flex flex-col gap-px">
+                  {endedAgents.map((row) => (
+                    <SubagentLine key={row.childSessionId} row={row} now={now} pending={false} onOpen={() => onOpenChild?.(row.childSessionId)} />
+                  ))}
+                </div>
               ) : null}
-              {endedAgents.length > 0 ? (
-                <>
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      aria-label="Toggle ended subagents"
-                      aria-expanded={state.endedAgentsOpen}
-                      onClick={() => setState((prev) => ({ ...prev, endedAgentsOpen: !prev.endedAgentsOpen }))}
-                      className="flex min-w-0 flex-1 items-center gap-1.5 rounded-sm py-1 text-left text-[12px] text-fg-faint transition-colors hover:text-fg-muted"
-                    >
-                      <Icon name="chevron" size={12} className={cn('shrink-0 transition-transform', state.endedAgentsOpen ? '' : 'rotate-180')} />
-                      Ended · {endedAgents.length}
-                    </button>
-                    <button
-                      type="button"
-                      aria-label="Clear ended subagents"
-                      title="Clear ended subagents"
-                      onClick={() => setState((prev) => {
-                        const dismissed = new Set(prev.dismissed)
-                        for (const row of endedAgents) dismissed.add(row.childSessionId)
-                        return { ...prev, dismissed }
-                      })}
-                      className="flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 text-[11px] text-fg-faint transition-colors hover:bg-hover hover:text-fg-muted"
-                    >
-                      <Icon name="trash" size={11} />
-                      Clear
-                    </button>
-                  </div>
-                  {state.endedAgentsOpen ? (
-                    <div className="flex flex-col gap-0.5">
-                      {endedAgents.map((row) => (
-                        <SubagentLine key={row.childSessionId} row={row} now={now} pending={false} onOpen={() => onOpenChild?.(row.childSessionId)} />
-                      ))}
-                    </div>
-                  ) : null}
-                </>
-              ) : null}
-            </div>
+            </>
           ) : null}
-        </section>
+        </Section>
       ) : null}
 
       {todo.todos.length > 0 ? (
-        <section aria-label="Tasks" className="flex flex-col">
-          <button
-            type="button"
-            aria-expanded={state.tasksOpen}
-            onClick={() => setState((prev) => ({ ...prev, tasksOpen: !prev.tasksOpen }))}
-            className="flex w-full items-center gap-2 rounded-lg px-1.5 py-1.5 text-left text-[13px] transition-colors hover:bg-hover"
-          >
-            <Icon name="check" size={14} className="shrink-0 text-fg-faint" />
-            <span className="min-w-0 flex-1 truncate font-medium text-fg-muted">Tasks</span>
-            <span className={cn('shrink-0 whitespace-nowrap text-[12px]', todoAllDone ? 'text-ok' : 'text-fg-faint')}>
-              {todoAllDone ? 'Done' : `${todoDone}/${todo.todos.length}`}
-            </span>
-            <Icon name="chevron" size={13} className={cn('shrink-0 text-fg-faint transition-transform', state.tasksOpen ? 'rotate-180' : '')} />
-          </button>
-          {state.tasksOpen ? (
-            <div className="flex flex-col gap-0.5 pb-1">
-              {todo.todos.map((item, index) => (
-                <div key={index} className="flex items-center gap-2 rounded-lg py-1 pl-2.5 pr-1.5 text-[13px]">
-                  {item.status === 'in_progress' ? (
-                    <Spinner size={11} />
-                  ) : item.status === 'completed' ? (
-                    <Icon name="check" size={11} className="shrink-0 text-ok" />
-                  ) : (
-                    <span className="inline-block size-[11px] shrink-0 rounded-full border border-line" aria-hidden />
-                  )}
-                  <span className={cn('min-w-0 flex-1 truncate', item.status === 'completed' ? 'text-fg-faint' : 'text-fg')} title={item.status === 'in_progress' ? item.activeForm : item.content}>
-                    {item.content}
-                  </span>
-                </div>
-              ))}
+        <Section
+          label="Tasks"
+          tone={todoAllDone ? 'ok' : 'faint'}
+          count={todoAllDone ? 'Done' : `${todoDone}/${todo.todos.length}`}
+          open={state.tasksOpen}
+          onToggle={() => setState((prev) => ({ ...prev, tasksOpen: !prev.tasksOpen }))}
+        >
+          {todo.todos.map((item, index) => (
+            <div key={index} className="flex items-center gap-1.5 rounded-md py-1 pl-1 pr-0.5 text-[12px]">
+              {item.status === 'in_progress' ? (
+                <Spinner size={11} />
+              ) : item.status === 'completed' ? (
+                <Icon name="check" size={11} className="shrink-0 text-ok" />
+              ) : (
+                <span className="inline-block size-[10px] shrink-0 rounded-full border border-line" aria-hidden />
+              )}
+              <span className={cn('min-w-0 flex-1 truncate', item.status === 'completed' ? 'text-fg-faint' : 'text-fg')} title={item.status === 'in_progress' ? item.activeForm : item.content}>
+                {item.content}
+              </span>
             </div>
-          ) : null}
-        </section>
+          ))}
+        </Section>
       ) : null}
     </div>
   )
@@ -436,7 +430,7 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
         // the capsule stays collapsed; the detail opens as a bottom sheet.
         'absolute right-2 top-[60px] z-30 border border-line bg-surface sm:right-4',
         expanded
-          ? 'flex max-h-[calc(100dvh-320px)] w-[min(320px,calc(100%-2rem))] flex-col overflow-y-auto rounded-xl px-3.5 py-2 shadow-lg'
+          ? 'flex max-h-[calc(100dvh-320px)] w-[min(300px,calc(100%-2rem))] flex-col overflow-y-auto rounded-xl px-3 py-1.5 shadow-lg'
           : 'inline-flex h-[30px] max-w-[min(220px,calc(100%-5.5rem))] items-center rounded-full py-0 pl-2.5 pr-1.5 shadow-sm sm:max-w-[min(480px,calc(100%-2rem))] sm:pl-3',
       )}
     >
@@ -477,7 +471,7 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
           <Icon name="chevron" size={13} className={cn('icon-chevron ml-auto shrink-0 rounded-full p-0.5 text-fg-faint transition-transform hover:bg-hover hover:text-fg', expanded ? 'rotate-180' : '')} />
         </button>
 
-        {expanded ? <div className="mt-1.5 border-t border-line pt-1.5">{detail}</div> : null}
+        {expanded ? <div className="mt-1 border-t border-line pt-1">{detail}</div> : null}
     </aside>
     {compact ? (
       <Sheet open={state.expanded} onOpenChange={(open) => setState((prev) => ({ ...prev, expanded: open }))} side="bottom" label="Environment">
@@ -491,22 +485,49 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
   )
 }
 
+/** A collapsible section: an uppercase eyebrow head, then child rows behind a rail. */
+function Section({ label, tone, count, open, onToggle, children }: {
+  readonly label: string
+  readonly tone: 'warn' | 'ok' | 'faint'
+  readonly count: string
+  readonly open: boolean
+  readonly onToggle: () => void
+  readonly children: ReactNode
+}) {
+  return (
+    <section aria-label={label} className="flex flex-col">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={onToggle}
+        className="group flex w-full items-center gap-2 rounded-lg px-1 py-1.5 text-left transition-colors hover:bg-hover"
+      >
+        <span className="truncate text-[11px] font-medium text-fg-faint group-hover:text-fg-muted">{label}</span>
+        <span className={cn('shrink-0 whitespace-nowrap text-[11px] tabular-nums', tone === 'warn' ? 'text-warn' : tone === 'ok' ? 'text-ok' : 'text-fg-faint')}>{count}</span>
+        <Icon name="chevron" size={12} className={cn('shrink-0 text-fg-faint transition-transform', open ? 'rotate-180' : '')} />
+      </button>
+      {open ? <div className="flex flex-col gap-px pb-1 pl-2.5">{children}</div> : null}
+    </section>
+  )
+}
+
+/** One background process row. */
 function ProcessLine({ row, now, pending, onOpen, onStop }: { readonly row: ProcessRow; readonly now: number; readonly pending: boolean; readonly onOpen: () => void; readonly onStop: () => void }) {
   const runningRow = row.status === 'running'
   const duration = runningRow ? now - row.startedAt : row.durationMs
   const statusLabel = runningRow ? 'running' : row.exitCode !== null ? `${row.status} (${row.exitCode})` : row.status
   return (
-    <div className="flex items-center gap-2 rounded-lg py-1 pl-2.5 pr-1.5 text-[13px]">
+    <div className="flex items-center gap-2 rounded-md py-1 pl-1 pr-1 text-[12px]">
       <button
         type="button"
         onClick={onOpen}
         title={`Open ${row.command} in the workbench`}
         className="flex min-w-0 flex-1 items-center gap-2 rounded-sm text-left"
       >
-        {runningRow ? <Spinner size={11} /> : <span className="inline-block size-[11px] shrink-0" aria-hidden />}
+        {runningRow ? <Spinner size={11} /> : <span className="inline-block size-[10px] shrink-0" aria-hidden />}
         <span className="min-w-0 flex-1 truncate text-fg">{row.command}</span>
-        <span className="shrink-0 text-[12px] text-fg-faint">{formatDuration(duration)}</span>
-        <span className={cn('shrink-0 text-[12px]', runningRow ? 'text-warn' : (TERMINAL_CLASS[row.status] ?? 'text-fg-faint'))}>{statusLabel}</span>
+        <span className="shrink-0 text-[11px] text-fg-faint">{formatDuration(duration)}</span>
+        <span className={cn('shrink-0 text-[11px]', runningRow ? 'text-warn' : (TERMINAL_CLASS[row.status] ?? 'text-fg-faint'))}>{statusLabel}</span>
       </button>
       {runningRow ? (
         <button
@@ -529,19 +550,19 @@ function SubagentLine({ row, now, pending, onOpen, onStop }: { readonly row: Sub
   const icon = agentRoleIcon(row.definition)
   const title = row.brief !== '' ? row.brief : row.definition
   return (
-    <div className="flex items-center gap-2 rounded-lg py-1 pl-1.5 pr-1.5 text-[13px]">
+    <div className="flex items-center gap-1.5 rounded-md py-1 pl-0.5 pr-0.5 text-[12px]">
       <button
         type="button"
         onClick={onOpen}
         title={row.brief !== '' ? `${row.definition}: ${row.brief}` : row.definition}
-        className="flex min-w-0 flex-1 items-center gap-2 rounded-sm text-left"
+        className="flex min-w-0 flex-1 items-center gap-1.5 rounded-sm text-left"
       >
-        <span className={cn('flex size-5 shrink-0 items-center justify-center rounded-md bg-muted', AGENT_ROLE_TONE[icon])}>
-          {row.running ? <Spinner size={11} /> : <Icon name={icon} size={12} />}
+        <span className={cn('flex size-[18px] shrink-0 items-center justify-center rounded-md bg-muted', AGENT_ROLE_TONE[icon])}>
+          {row.running ? <Spinner size={10} /> : <Icon name={icon} size={11} />}
         </span>
         <span className="min-w-0 flex-1 truncate text-fg">{title}</span>
-        <span className="shrink-0 text-[12px] text-fg-faint">{formatAge(row.running ? row.dispatchedAt : (row.endedAt ?? row.dispatchedAt), now)}</span>
-        <span className={cn('shrink-0 text-[12px]', row.running ? 'text-ok' : (TERMINAL_CLASS[row.status ?? ''] ?? 'text-fg-faint'))}>
+        <span className="shrink-0 text-[11px] text-fg-faint">{formatAge(row.running ? row.dispatchedAt : (row.endedAt ?? row.dispatchedAt), now)}</span>
+        <span className={cn('shrink-0 text-[11px]', row.running ? 'text-ok' : (TERMINAL_CLASS[row.status ?? ''] ?? 'text-fg-faint'))}>
           {row.running ? 'running' : (row.status ?? '')}
         </span>
       </button>

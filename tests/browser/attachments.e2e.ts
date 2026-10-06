@@ -91,7 +91,7 @@ async function serve(page: Page): Promise<void> {
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/grants$/.test(path)) return json(route, { revision: 0, roots: [], effective: [] })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/mode$/.test(path)) return json(route, { modeId: 'chat', name: 'Chat', revision: 1, source: 'workspace-default' })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/processes$/.test(path)) return json(route, [])
-    if (path === '/api/workspaces/w/terminals') return json(route, { terminals: [], shells: [], max: 4, available: false })
+    if (path === '/api/workspaces/w/terminals') return json(route, { terminals: [], shells: [], available: false })
     if (path === '/api/workspaces/w/projects/p/git') return json(route, { branch: null, changes: [], truncated: false })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/manifest$/.test(path)) return json(route, { modeId: 'chat', modeRevision: 1, budget: { availableTokens: 32000, usedTokens: 0, estimated: false }, history: { setting: 'all', includedTurns: 0, omittedTurns: 0 }, sources: { skills: [], memory: [], toolNames: [], toolSchemas: 0 }, omissions: [] })
     if (path === '/api/workspaces/w/skills') return json(route, [])

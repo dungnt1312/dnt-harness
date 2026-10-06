@@ -46,6 +46,11 @@ describe('managed command lifecycle', () => {
     const r = registry()
     expect(await bashTool({ processes: r, timeoutMs: 30 }).execute({ command: 'sleep 5' }, exec)).toContain('terminated by timeout')
   })
+  it('sleep with environment assignments retains the foreground deadline', async () => {
+    const r = registry()
+    expect(await bashTool({ processes: r, timeoutMs: 30 }).execute({ command: 'FOO=bar sleep 5' }, exec)).toContain('terminated by timeout')
+    expect(await bashTool({ processes: r, timeoutMs: 30 }).execute({ command: 'FOO=bar BAZ=qux sleep 5' }, exec)).toContain('terminated by timeout')
+  })
 })
 
 it('watch abort leaves background alive while foreground abort kills', async () => {
@@ -73,6 +78,26 @@ it('foreground root exit does not turn a held pipe into a retained background tr
   const result = await bashTool({ processes: r, timeoutMs: 80 }).execute({ command: 'sleep 5 & exit 0' }, exec)
   expect(result).toContain('exit code: 0')
   expect(r.runningCount(exec.sessionId)).toBe(0)
+})
+
+it('ended records prune after the retention window; running records never do', async () => {
+  const r = new ProcessRegistry({}, { endedRetentionMs: 50 }); registries.push(r)
+  const endedId = idOf(await bashTool({ processes: r }).execute({ command: 'echo short-lived', run_in_background: true }, exec))
+  await r.wait(exec.sessionId, endedId, { timeoutMs: 5000 })
+  const runningId = idOf(await bashTool({ processes: r }).execute({ command: 'sleep 5', run_in_background: true }, exec))
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  expect(r.read(exec.sessionId, endedId)).toBeUndefined()
+  expect(r.read(exec.sessionId, runningId)).toBeDefined()
+  expect(r.isRunning(exec.sessionId, runningId)).toBe(true)
+})
+
+it('an ended record inside the retention window stays readable through every lookup', async () => {
+  const r = new ProcessRegistry({}, { endedRetentionMs: 60_000 }); registries.push(r)
+  const id = idOf(await bashTool({ processes: r }).execute({ command: 'echo still-readable', run_in_background: true }, exec))
+  await r.wait(exec.sessionId, id, { timeoutMs: 5000 })
+  expect(r.read(exec.sessionId, id)?.status).toBe('exited')
+  expect(r.detail(exec.sessionId, id)).toBeDefined()
+  expect(r.snapshot(exec.sessionId).map((row) => row.id)).toContain(id)
 })
 
 it('capacity is denied before any second command is spawned', async () => {

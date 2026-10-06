@@ -39,10 +39,9 @@ export interface HarnessLimits {
   /** Bound on durably queued pending inputs per session. */
   readonly maxPendingInputs: number
   /**
-   * Context pressure (usedTokens/availableTokens from the session's newest
-   * context manifest) that triggers automatic compaction at a completed
-   * boundary; 0 disables. Token-accurate: it reads the same budget numbers
-   * the manifest inspector shows, not a character projection.
+   * Estimated pre-trim context pressure (preTrimTokens/availableTokens from
+   * the settled turn's fresh context manifest) that triggers automatic
+   * compaction at a completed boundary; 0 disables.
    */
   readonly automaticCompactionPressure: number
   /** Latest covered completed turns duplicated raw beside the summary; uncovered history remains eligible for budget trimming. */
@@ -81,8 +80,9 @@ export function resolveLimits(partial?: Partial<HarnessLimits>): HarnessLimits {
   const merged = { ...DEFAULT_LIMITS }
   for (const key of Object.keys(merged) as (keyof HarnessLimits)[]) {
     const value = partial[key]
-    const integerRequestLimit = ['streamFirstEventMs', 'streamIdleMs', 'logicalRequestMs', 'stepRetries', 'stepRetryBaseMs'].includes(key)
-    if (typeof value === 'number' && Number.isFinite(value) && (!integerRequestLimit || Number.isSafeInteger(value)) && value > 0 && value <= MAX_TIMER_MS) {
+    const integerRequestLimit = ['streamFirstEventMs', 'streamIdleMs', 'logicalRequestMs', 'stepRetries', 'stepRetryBaseMs', 'compactionTailTurns'].includes(key)
+    const zeroCapable = key === 'compactionTailTurns' || key === 'automaticCompactionPressure'
+    if (typeof value === 'number' && Number.isFinite(value) && (!integerRequestLimit || Number.isSafeInteger(value)) && (zeroCapable ? value >= 0 : value > 0) && value <= MAX_TIMER_MS) {
       merged[key] = value
     }
   }

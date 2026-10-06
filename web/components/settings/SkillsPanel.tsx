@@ -26,8 +26,15 @@ import {
 } from './settings-kit.tsx'
 
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
+/** Mirrors the server's reserved names (`/skills/sources` is the rules route). */
+const RESERVED_SKILL_NAMES: ReadonlySet<string> = new Set(['sources'])
 const SKILL_PLACEHOLDER = '---\nname: deploy-notes\ndescription: how deploys work\n---\n\nDeploy runs via pm2…'
 const isConflict = (cause: unknown): boolean => /409/.test(String(cause))
+/** Save notice: shadow/disabled warnings from the server turn it informational. */
+const savedNotice = (saved: { readonly name: string; readonly hash: string; readonly warnings?: readonly string[] }): NoticeState =>
+  saved.warnings !== undefined && saved.warnings.length > 0
+    ? { kind: 'info', text: `Saved ${saved.name} (${saved.hash.slice(0, 8)}), but: ${saved.warnings.join(' ')}` }
+    : { kind: 'ok', text: `Saved ${saved.name} (${saved.hash.slice(0, 8)}).` }
 /** One tree row: fixed height, full-width hover; callers add the indent. */
 const TREE_ROW = 'flex h-7 w-full min-w-0 items-center pr-3 text-left text-[13px] hover:bg-hover'
 type PanelTab = 'skills' | 'folders'
@@ -130,11 +137,18 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
     return out
   })()
 
+  /** Base copies a project row overrides: a repo's own folder outranks the
+   *  workspace/user layers by default, so a cloned project can replace a
+   *  trusted skill under the same name — make that visible on the project row. */
+  const overriddenBase = (name: string): SkillRow | undefined => baseRows.find((row) => row.name === name)
+
   /** Base rows shadowed for some project's sessions: that project's copy wins
    *  there (first-hit-wins), so the base row must not read as universally live. */
   const shadowingProjects = (name: string): readonly string[] =>
     projectRows
-      .filter((entry) => entry.rows.some((row) => row.name === name))
+      // A project-scoped catalog lists EVERY layer (workspace/user too); only
+      // a row the project's own folder owns actually shadows the base copy.
+      .filter((entry) => entry.rows.some((row) => row.name === name && row.source === 'project'))
       .map((entry) => projectName(entry.projectId))
 
   const visibleGroups = groups
@@ -216,7 +230,8 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
 
   const name = editing === null ? '' : editing.isNew ? newName.trim() : editing.name
   const allNames = groups.flatMap((group) => group.rows.map((row) => row.name))
-  const nameInvalid = editing?.isNew === true && newName.trim() !== '' && !SKILL_NAME.test(newName.trim())
+  const nameReserved = editing?.isNew === true && RESERVED_SKILL_NAMES.has(newName.trim())
+  const nameInvalid = editing?.isNew === true && newName.trim() !== '' && (!SKILL_NAME.test(newName.trim()) || nameReserved)
   const nameTaken = editing?.isNew === true && allNames.includes(newName.trim())
   const unchanged = editing !== null && !editing.isNew && content === editing.loaded
   const cannotSave = name === '' || content.trim() === '' || nameInvalid || nameTaken || unchanged
@@ -225,7 +240,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
     if (editing === null) return
     try {
       const saved = await saveSkill(workspaceId, name, content, hashOverride ?? editing.hash ?? undefined)
-      setNotice({ kind: 'ok', text: `Saved ${saved.name} (${saved.hash.slice(0, 8)}).` })
+      setNotice(savedNotice(saved))
       setEditing(null)
       setDetail(null)
       setSelected(null)
@@ -241,7 +256,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
     if (editing === null || editing.isNew) return
     const fresh = await getSkill(workspaceId, editing.name)
     const saved = await saveSkill(workspaceId, editing.name, content, fresh.hash)
-    setNotice({ kind: 'ok', text: `Saved ${saved.name} (${saved.hash.slice(0, 8)}).` })
+    setNotice(savedNotice(saved))
     setEditing(null)
     await refresh()
   })
@@ -324,7 +339,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
               <Field
                 label="Name"
                 tone={nameInvalid || nameTaken ? 'bad' : 'default'}
-                hint={nameInvalid ? 'Use lowercase letters, numbers, and single hyphens.' : nameTaken ? 'A skill with this name exists — open it from the tree instead.' : 'Kebab-case folder name, e.g. deploy-notes.'}
+                hint={nameReserved ? `'${newName.trim()}' is reserved; choose another name.` : nameInvalid ? 'Use lowercase letters, numbers, and single hyphens.' : nameTaken ? 'A skill with this name exists — open it from the tree instead.' : 'Kebab-case folder name, e.g. deploy-notes.'}
               >
                 <TextInput mono invalid={nameInvalid || nameTaken} value={newName} placeholder="deploy-notes" onChange={(e) => setNewName(e.target.value)} />
               </Field>
@@ -495,6 +510,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
                       const isOpen = expanded.has(key)
                       const files = filesByKey[key]
                       const shadowedIn = group.source !== 'project' ? shadowingProjects(row.name) : []
+                      const overrides = group.source === 'project' ? overriddenBase(row.name) : undefined
                       const description = row.description !== '' ? row.description : row.title !== row.name ? row.title : ''
                       const rowActive = selected?.name === row.name && selected.source === row.source
                       return (
@@ -518,6 +534,13 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
                               <span className="min-w-0 truncate">{row.name}</span>
                             </button>
                             {(row.hidden ?? false) ? <span title="Hidden from the catalog" className="flex shrink-0"><Icon name="eyeOff" size={12} className="text-fg-faint" /></span> : null}
+                            {overrides !== undefined ? (
+                              <span
+                                className="size-1.5 shrink-0 rounded-full bg-bad"
+                                title={`Overrides the ${sourceLabel(overrides.source).toLowerCase()} skill “${row.name}” in this project's sessions — review this project copy before trusting it.`}
+                                aria-label="overrides"
+                              />
+                            ) : null}
                             {shadowedIn.length > 0 ? (
                               <span
                                 className="size-1.5 shrink-0 rounded-full bg-warn"

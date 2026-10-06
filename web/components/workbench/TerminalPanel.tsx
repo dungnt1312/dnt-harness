@@ -27,6 +27,14 @@ const RESIZE_DEBOUNCE_MS = 100
  */
 const EXIT_NOTICE_MS = 1_500
 
+/**
+ * Auto-opens in flight, keyed by workspace and project. The chat footer and
+ * the workbench Terminal tab are separate mounts; restored together after a
+ * reload, both would see an empty snapshot and each spawn a shell. The first
+ * claims the open; the other adopts the shell through its `created` frame.
+ */
+const autoOpenClaims = new Set<string>()
+
 const NEW_TERMINAL_CLASS = 'flex size-7 shrink-0 items-center justify-center rounded-md text-fg-muted transition-colors hover:bg-hover hover:text-fg disabled:cursor-not-allowed disabled:opacity-40'
 
 /** Read a CSS custom property from the shell, so the terminal follows the app theme. */
@@ -91,17 +99,23 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
   readonly bindingReady?: boolean
 }) {
   const [rows, setRows] = useState<readonly TerminalRow[]>([])
-  // The view shows one project's shells. A terminal with no project only
-  // appears while no project is open.
+  // The surface shows the open project's shells (or unbound ones when no
+  // project is open); every other live shell still appears on the strip as a
+  // dimmed tab.
   const visibleRows = rows.filter((row) => (row.projectId ?? null) === projectId)
-  const hiddenRows = rows.filter((row) => (row.projectId ?? null) !== projectId)
   const [shells, setShells] = useState<readonly ShellRow[]>([])
-  const [max, setMax] = useState(4)
   const [unavailable, setUnavailable] = useState<string | null>(null)
   const [activeId, setActiveId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   /** Set once the host's terminal list has arrived, so auto-open knows what exists. */
   const [ready, setReady] = useState(false)
+  /**
+   * Set once the GET listing settled. It alone carries the shell catalog and
+   * the availability verdict, and it races the stream: an auto-open on the
+   * snapshot alone would drop the remembered shell (the catalog is still
+   * empty) or try to spawn on a host with no PTY backend.
+   */
+  const [catalogReady, setCatalogReady] = useState(false)
   const attached = useRef(new Map<string, Attached>())
   const mountRef = useRef<HTMLDivElement | null>(null)
   /** Synchronous mirror of `rows`: the stream handler must judge a frame against the shells it already knows, not wait for a render. */
@@ -213,16 +227,20 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
     void listTerminals(workspaceId).then((listing) => {
       if (!live) return
       setShells(listing.shells)
-      setMax(listing.max)
       setUnavailable(listing.available ? null : listing.unavailable ?? 'no PTY backend on this host')
-      // GET supplies quota metadata even if EventSource never connects. A
+      // GET supplies the initial listing even if EventSource never connects. A
       // later GET must not overwrite newer stream truth; only SSE replays output.
       if (!streamReceived) {
         rowsRef.current = listing.terminals
         setRows(listing.terminals)
       }
+      setCatalogReady(true)
     }).catch((cause: unknown) => {
-      if (live) setError(String(cause))
+      if (!live) return
+      setError(String(cause))
+      // A failed listing must not hold the auto-open forever; the host's
+      // order is the honest fallback when the catalog is unknown.
+      setCatalogReady(true)
     })
 
     const unsubscribe = subscribeTerminals(workspaceId, (frame) => {
@@ -248,8 +266,8 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
           surfaceCloseTimer.current = undefined
         }
         for (const entry of frame.terminals) {
-          // Another project's shell stays alive on the host but is not drawn
-          // here; attaching it would show its prompt in this project's view.
+          // Another project's shell shows as a dimmed tab only; attaching it
+          // would draw its prompt into this project's surface.
           if ((entry.projectId ?? null) !== projectId) continue
           const record = attach(entry.id, entry.cols, entry.rows)
           if (record === undefined) continue
@@ -278,7 +296,7 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
       if (frame.kind === 'created') {
         // A shell of this view's own cancels a pending last-exit close: the
         // surface has something to show again. (Another project's shell does
-        // not — it is remembered below but never drawn here.)
+        // not — it joins the strip as a dimmed tab only.)
         if (surfaceCloseTimer.current !== undefined && (frame.terminal.projectId ?? null) === projectId) {
           clearTimeout(surfaceCloseTimer.current)
           surfaceCloseTimer.current = undefined
@@ -289,7 +307,8 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
           return next
         })
         // The stream is per workspace, so a shell opened for another project
-        // arrives here too. Remember it, but do not surface it in this view.
+        // arrives here too. It joins the strip as a dimmed tab; its surface
+        // is never attached to this view.
         if ((frame.terminal.projectId ?? null) !== projectId) return
         attach(frame.terminal.id, frame.terminal.cols, frame.terminal.rows)
         setActiveId(frame.terminal.id)
@@ -310,7 +329,12 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
       const remaining = rowsRef.current.filter((row) => row.id !== frame.terminalId)
       rowsRef.current = remaining
       setRows(remaining)
-      setActiveId((current) => (current === frame.terminalId ? null : current))
+      // An exiting active tab hands the surface to a remaining shell of this
+      // view; null here would hide every instance while the strip still shows
+      // tabs, leaving a blank surface with no placeholder.
+      setActiveId((current) => (current === frame.terminalId
+        ? remaining.find((row) => (row.projectId ?? null) === projectId)?.id ?? null
+        : current))
       window.setTimeout(() => detach(frame.terminalId), EXIT_NOTICE_MS)
       if (!exitedHere || onHideRef.current === undefined) return
       if (remaining.some((row) => (row.projectId ?? null) === projectId)) return
@@ -337,9 +361,12 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
     if (workspaceId === null) return
     setError(null)
     try {
+      // A shell already on this surface was fitted to it; starting the new one
+      // at that size spares a prompt drawn at 80x24 and redrawn after the fit.
+      const sized = [...attached.current.values()].find((record) => record.host.style.display !== 'none')?.term
       const terminal = await createTerminal(workspaceId, {
-        cols: 80,
-        rows: 24,
+        cols: sized?.cols ?? 80,
+        rows: sized?.rows ?? 24,
         ...(shellId !== undefined ? { shellId } : {}),
         ...(projectId !== null ? { projectId } : {}),
       })
@@ -376,11 +403,14 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
   // whose project binding is still loading holds the open — firing in that
   // window would create the shell in the wrong folder.
   useEffect(() => {
-    if (!ready || !bindingReady || autoOpened.current || unavailable !== null) return
+    if (!ready || !catalogReady || !bindingReady || autoOpened.current || unavailable !== null) return
     autoOpened.current = true
-    if (visibleRows.length > 0 || rows.length >= max) return
-    void open(preferredShell)
-  }, [ready, bindingReady, unavailable, visibleRows.length, rows.length, max, preferredShell, open])
+    if (visibleRows.length > 0) return
+    const claim = `${workspaceId ?? ''}\u0000${projectId ?? ''}`
+    if (autoOpenClaims.has(claim)) return
+    autoOpenClaims.add(claim)
+    void open(preferredShell).finally(() => autoOpenClaims.delete(claim))
+  }, [ready, catalogReady, bindingReady, unavailable, visibleRows.length, preferredShell, open, workspaceId, projectId])
 
   // Only the selected terminal is visible, and it refits whenever it becomes
   // so: xterm cannot measure a hidden element, so fitting on mount alone
@@ -398,6 +428,18 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
       record.term.focus()
     }
   }, [activeId, rows])
+
+  // The palette is read from CSS tokens, which change when the app theme flips
+  // (`<html data-theme>`); live instances must follow, not keep the old colours.
+  useEffect(() => {
+    if (typeof MutationObserver === 'undefined') return undefined
+    const observer = new MutationObserver(() => {
+      const theme = themeFromTokens()
+      for (const record of attached.current.values()) record.term.options.theme = theme
+    })
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'class'] })
+    return () => observer.disconnect()
+  }, [])
 
   useEffect(() => {
     const mount = mountRef.current
@@ -444,8 +486,6 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
     )
   }
 
-  // The cap is the workspace's, so shells open in other projects count.
-  const atCap = rows.length >= max
   // Until the caller's project binding is final, a new shell would open in the
   // host's default folder instead of the conversation's project.
   const openBlocked = !bindingReady
@@ -453,38 +493,58 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex h-9 shrink-0 items-center gap-0.5 overflow-x-auto border-b border-line px-1.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" role="toolbar" aria-label="Terminals">
-        {visibleRows.map((row) => (
-          <span
-            key={row.id}
-            className={cn('group flex h-7 shrink-0 items-center rounded-md', row.id === activeId ? 'bg-muted' : 'hover:bg-hover')}
-          >
-            <button
-              type="button"
-              aria-pressed={row.id === activeId}
-              title={`${row.label} — ${row.cwd}`}
-              onClick={() => setActiveId(row.id)}
-              className={cn('flex h-full items-center gap-1.5 pl-2 pr-1 text-[12px]', row.id === activeId ? 'text-fg' : 'text-fg-muted hover:text-fg')}
+        {/* Every live shell in the workspace is visible, so a shell opened
+            elsewhere can always be found and stopped from here. This view's
+            project owns the real tabs; the rest are dimmed display tabs whose
+            only affordance is their close button. */}
+        {rows.map((row) => {
+          const mine = (row.projectId ?? null) === projectId
+          return (
+            <span
+              key={row.id}
+              className={cn(
+                'group flex h-7 shrink-0 items-center rounded-md',
+                mine ? (row.id === activeId ? 'bg-muted' : 'hover:bg-hover') : 'opacity-50 hover:opacity-80',
+              )}
             >
-              <Icon name="terminal" size={13} />
-              {row.label}
-            </button>
-            <button
-              type="button"
-              aria-label={`Close ${row.label}`}
-              title="Close"
-              onClick={() => void close(row.id)}
-              className="mr-1 flex size-5 items-center justify-center rounded text-fg-faint hover:bg-hover hover:text-fg"
-            >
-              <Icon name="close" size={11} />
-            </button>
-          </span>
-        ))}
+              {mine ? (
+                <button
+                  type="button"
+                  aria-pressed={row.id === activeId}
+                  title={`${row.label} — ${row.cwd}`}
+                  onClick={() => setActiveId(row.id)}
+                  className={cn('flex h-full items-center gap-1.5 pl-2 pr-1 text-[12px]', row.id === activeId ? 'text-fg' : 'text-fg-muted hover:text-fg')}
+                >
+                  <Icon name="terminal" size={13} />
+                  {row.label}
+                </button>
+              ) : (
+                <span
+                  title={`${row.label} — ${row.cwd} (${row.projectId === undefined ? 'unbound shell' : 'another project'})`}
+                  className="flex h-full items-center gap-1.5 pl-2 pr-1 text-[12px] text-fg-faint"
+                >
+                  <Icon name="terminal" size={13} />
+                  {row.label}
+                </span>
+              )}
+              <button
+                type="button"
+                aria-label={`Close ${row.label}`}
+                title="Close"
+                onClick={() => void close(row.id)}
+                className="mr-1 flex size-5 items-center justify-center rounded text-fg-faint hover:bg-hover hover:text-fg"
+              >
+                <Icon name="close" size={11} />
+              </button>
+            </span>
+          )
+        })}
         {/* The primary action never asks: it opens the shell already chosen. */}
         <button
           type="button"
           aria-label="New terminal"
-          title={atCap ? `At most ${max} terminals per workspace` : openBlocked ? 'Loading conversation…' : 'New terminal'}
-          disabled={atCap || openBlocked}
+          title={openBlocked ? 'Loading conversation…' : 'New terminal'}
+          disabled={openBlocked}
           onClick={() => void open(preferredShell)}
           className={NEW_TERMINAL_CLASS}
         >
@@ -506,7 +566,6 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
                     type="button"
                     role="menuitem"
                     className={menuItemClass}
-                    disabled={atCap}
                     onClick={() => { close(); void open(shell.id) }}
                   >
                     <Icon name="terminal" size={13} />
@@ -565,30 +624,8 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
             <Icon name="terminal" size={22} className="text-fg-faint" />
             <p className="m-0 text-sm font-medium">No terminal open</p>
             <p className="m-0 max-w-sm text-[13px] text-fg-muted">
-              {atCap && hiddenRows.length > 0
-                ? `Workspace terminal limit reached (${rows.length}/${max}). Terminals in other projects or unbound shells occupy the quota. Close one explicitly to free a slot, then use New terminal.`
-                : 'Open one to run commands yourself. This shell is separate from the assistant\'s tools.'}
+              Open one to run commands yourself. This shell is separate from the assistant's tools.
             </p>
-            {hiddenRows.length > 0 ? (
-              <div className="flex max-h-40 w-full max-w-sm flex-col gap-1 overflow-y-auto px-3 text-[12px]">
-                <p className="m-0 text-fg-muted">Hidden workspace terminals (closing stops the shell):</p>
-                {hiddenRows.map((row) => (
-                  <div key={row.id} className="flex items-center justify-between gap-2">
-                    <span className="min-w-0 truncate text-fg-muted">
-                      {row.id} — {row.projectId === undefined ? 'Unbound shell' : 'Other project'}
-                    </span>
-                    <button
-                      type="button"
-                      aria-label={`Close hidden terminal ${row.id}`}
-                      className="shrink-0 rounded px-2 py-1 text-danger hover:bg-hover"
-                      onClick={() => void close(row.id)}
-                    >
-                      Close shell
-                    </button>
-                  </div>
-                ))}
-              </div>
-            ) : null}
           </div>
         ) : null}
       </div>

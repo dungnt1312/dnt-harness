@@ -7,13 +7,14 @@ import type { OpenPathResolver } from '../../lib/project-paths.ts'
 import { toProjectRelative } from '../../lib/project-paths.ts'
 import { processRows, type ProcessRow } from '../../lib/processes-view.ts'
 import { hiddenSpawnCalls } from '../../lib/spawn-merge.ts'
+import { turnTimings, type TurnTiming } from '../../lib/turn-timing.ts'
 import { ActivityBlock, AssistantMessage, AuditLine, CompactionMarker, ContinuationMarker, ContextMarker, DelegationCard, JumpToBottom, ProcessLinkContext, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
 import { TurnChangesCard } from './TurnChangesCard.tsx'
 import type { WorkbenchProject } from '../workbench/Workbench.tsx'
 import { ConversationMinimap } from './ConversationMinimap.tsx'
 
 interface Indexed { readonly item: ViewItem; readonly index: number }
-type Block = { readonly kind: 'row'; readonly row: Indexed } | { readonly kind: 'activity'; readonly rows: readonly Indexed[] }
+type Block = { readonly kind: 'row'; readonly row: Indexed } | { readonly kind: 'activity'; readonly rows: readonly Indexed[]; breakAfter?: boolean }
 
 const ACTIVITY_KINDS: ReadonlySet<ViewItem['kind']> = new Set(['tool', 'delegation', 'audit'])
 const TRANSCRIPT_WINDOW = 300
@@ -54,7 +55,10 @@ export function turnFooters(items: readonly ViewItem[]): ReadonlyMap<number, Tur
 
 /**
  * Consecutive tool/delegation/audit rows render as one tight block so a busy
- * turn reads as a compact activity log between messages. Terminal markers
+ * turn reads as a compact activity log between messages — except a landed
+ * Edit or Write: it closes the run before it, reads as a run of its own, and
+ * other work after it starts fresh, so no summary line can bury the turn's
+ * product among the steps around it. Terminal markers
  * that render nothing, and a bare "failed" marker right after a detailed
  * failure card, are dropped so they cannot add empty spacing. An assistant
  * step that renders nothing either (a tool-only step: no text, no thinking,
@@ -76,8 +80,31 @@ const isThinkingBeat = (item: ViewItem): boolean =>
 /** Rows that read as activity rather than as a message, for grouping. */
 const isActivity = (item: ViewItem): boolean => ACTIVITY_KINDS.has(item.kind) || isThinkingBeat(item)
 
+/**
+ * A landed change (Edit/Write) is the work the turn was for. It breaks the
+ * run: work before it closes, the change stands alone, work after it starts
+ * fresh. A change that failed, was refused or never recorded is not a landed
+ * change and cannot split anything.
+ */
+const isChange = (item: ViewItem): boolean => {
+  if (item.kind !== 'tool') return false
+  const name = item.call.name.toLowerCase()
+  return (name === 'edit' || name === 'write') && toolSettled(item)
+}
+
+/** The call has a recorded result: a state a run can close on. */
+const toolSettled = (item: ViewItem): boolean => item.kind === 'tool' && item.result !== undefined
+
 export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
   const blocks: Block[] = []
+  const close = (stopBeforeChange: boolean) => {
+    const last = blocks.at(-1)
+    if (last?.kind === 'activity') {
+      if (stopBeforeChange) last.breakAfter = true
+      return true
+    }
+    return false
+  }
   items.forEach((item, index) => {
     if (item.kind === 'status' && item.reason === 'completed') return
     // Queued input waits on the strip above the composer (QueuedBar), not in
@@ -86,12 +113,20 @@ export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
     if (rendersNothing(item)) return
     const previous = items[index - 1]
     if (item.kind === 'status' && item.reason === 'failed' && previous?.kind === 'status' && previous.reason.includes(':')) return
-    const last = blocks.at(-1)
-    // Every consecutive work row joins the same run, edits and delegations
-    // included. Splitting them out made each one its own block, and a block
-    // margin on top of the run's own gap is the uneven spacing in the column.
+    // Every consecutive work row joins the same run, delegations included.
+    // A landed Edit or Write is the exception: it ends the run it follows, so
+    // the turn's product reads as its own step instead of one row of twenty-
+    // two commands — and work after it groups from scratch.
+    if (isChange(item)) {
+      if (close(true)) blocks.push({ kind: 'activity', rows: [{ item, index }], breakAfter: true })
+      else blocks.push({ kind: 'row', row: { item, index } })
+      return
+    }
+    // The change closed the run before it; this row starts the next one.
+    const afterBreak = previous !== undefined && isChange(previous)
     if (isActivity(item)) {
-      if (last?.kind === 'activity') (last.rows as Indexed[]).push({ item, index })
+      const tail = blocks.at(-1)
+      if (tail?.kind === 'activity' && !(tail.breakAfter === true && afterBreak)) (tail.rows as Indexed[]).push({ item, index })
       else blocks.push({ kind: 'activity', rows: [{ item, index }] })
       return
     }
@@ -140,6 +175,9 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   // event revision from the raw log (tool traffic carries only a stepId —
   // the projection attributes positionally, like the transcript itself).
   const turnChangeMap = useMemo(() => turnChanges(events ?? []), [events])
+  // Wall-clock boundaries per turn: the user row renders the start, the turn
+  // footer the end and the span. Rebuilt only with the raw log.
+  const turnTimingMap = useMemo(() => turnTimings(events ?? []), [events])
   // Live background-process state for the tool rows, keyed off the process
   // events only so unrelated log traffic does not rebuild the map (and
   // re-render every memoized card) with it.
@@ -188,6 +226,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
         )
       case 'assistant': {
         const turn = footers.get(index)
+        const timing: TurnTiming | undefined = item.turnId !== undefined ? turnTimingMap.get(item.turnId) : undefined
         // The card rides the same anchor row as the footer: the last answer
         // of a CLOSED turn. An open turn's card would render mid-work and
         // then never leave.
@@ -211,6 +250,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
             item={item}
             {...(modelLabel !== undefined ? { modelLabel } : {})}
             {...(turn !== undefined ? { turn } : {})}
+            {...(timing !== undefined ? { timing } : {})}
             {...(changes !== undefined ? { changes } : {})}
             {...(changes !== undefined && project !== undefined ? { changesProject: project } : {})}
             {...(changes !== undefined ? { changesWorkspaceId: workspaceId ?? null } : {})}

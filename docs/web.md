@@ -11,6 +11,25 @@ web/                React client (stateless, renders from the event stream)
 web-dist/           Vite build output (gitignored, produced by npm run build:web)
 ```
 
+## Compaction lifecycle
+
+Manual and automatic maintenance reserve a session before hooks and attachment
+snapshot loading. Accepted messages remain ordered in the durable inbox, with
+no model execution overlapping summary work. Stop, deletion and shutdown cancel
+owned requests and do not automatically resume queued inputs. Summary requests
+have no tools and use configured logical-request first-progress/idle/total
+limits and provider admission. Each chunk must end in a valid settled stop.
+Text attachment content is bounded as in normal context; image/file references
+are disclosed without claiming unseen image content.
+
+A successful canonical `compaction/end` authorizes history replacement;
+checkpoint JSON is validated, atomic derived cache and may be rebuilt on the
+next request. Four covered tail turns are optional raw duplication by default;
+zero disables duplication, not uncovered history, and budget fitting may reduce
+the covered tail by whole turns with omissions. The manifest remains the last
+real request until another request consumes the checkpoint. Headless automatic
+integration and stronger power-loss durability guarantees are not claimed.
+
 ## The client is stateless by design
 
 The browser client holds **no model state of its own**. The transcript is
@@ -132,7 +151,7 @@ tool root. The families, at a glance:
 | `…/:wid/sessions`, `…/:wid/sessions/:id` (+ `/events` SSE, `/messages`, `/stop`, `/steer`) | session lifecycle, streaming, queued messages, stop, steer. `/messages` answers 409 for a child agent session: children are executor-managed and cannot be resumed directly. See "Queue, stop, and steer" below |
 | `GET/PUT …/:wid/sessions/:id/model` | the conversation's own model controls (model, provider, thinking level) — see the per-conversation model section |
 | `GET/PUT …/:wid/sessions/:id/grants` | the conversation's extra file-tool folders: `GET` returns `{ revision, roots, effective }` (effective = project + session grants merged); `PUT { expectedRevision, roots: [{ path, access }] }` replaces the list — browser principal only, `409` on a stale revision or a conversation without a project, `400` for a folder the grant validator refuses (see `docs/capabilities.md`) |
-| `…/:wid/sessions/:id/manifest`, `…/compact` | per-request context manifest; compaction into an immutable checkpoint — manual via the route, automatic when the context-pressure limit is set. PreCompact hooks gate both |
+| `…/:wid/sessions/:id/manifest`, `…/compact` | last real request's context manifest; manual compaction returns `{ coversSeq, summaryChars }`, with 409 for active/duplicate ownership. Automatic compaction uses fresh completed-turn pre-trim pressure in compact-history mode; the standard bin enables 0.85 (embedded default/explicit zero disables). PreCompact hooks share the reservation. |
 | `GET/PUT /api/model-defaults` | the **global** default provider/model/thinking level, shared by every workspace: the pair new sessions snapshot at creation, the draft pickers' target, and the live fallback for legacy conversations without a snapshot |
 | `PUT …/:wid/model`, `PUT …/:wid/thinking` | compatibility proxies: they verify workspace ownership, then mutate the **global** default above; new clients use `/api/model-defaults` |
 | `PUT …/:wid/mode`, `GET …/:wid/meta` | workspace-local default mode control for new conversations and draft UI. Existing roots keep their own selected mode. The `GET …/mode` catalog lists **enabled modes only** (a disabled mode refused for selection answers `400`); `GET …/meta` returns the workspace default's `permissionDefaults`, `mode`, and `yolo` when enabled; it does not return a policy or effective-policy overlay. |
@@ -168,6 +187,16 @@ The unscoped routes documented below (`/api/meta`, `/api/model`,
 `/api/folder`, `/api/sessions…`) are **legacy**: they exist only for
 memory-mode hosts without the workspace model and resolve through one
 implicit workspace. New clients use the workspace-scoped families.
+
+Memory is stored as workspace and project Markdown topic files under the
+application home's `workspaces/<id>/memory/{workspace,projects/<project-id>}`.
+On an enabled request, existing `MEMORY.md` indexes (at most 200 lines and
+25 KiB each) are wrapped as untrusted reference; topic bodies are only read
+through ordinary Read/Glob/Grep file tools. Write/Edit may access only Markdown
+inside the current scope's memory roots; path-jail and explicit denial still
+apply. The five legacy Memory* tools are not registered. The existing memory
+REST/UI edits the same Markdown files; the old pinned flag is metadata only.
+Memory switches in a mode must both be on for indexes and file access.
 
 ### Legacy: `GET /api/meta`
 
@@ -396,8 +425,10 @@ Three ways to act on a running conversation. All acceptance is durable
 | **Send now** (on the queue strip above the composer) | `POST …/steer` | closes `turn/end: steered` | the whole queue runs in one new turn |
 
 - `delivery` defaults to `"queue"`; anything else answers `400`. The reply is
-  `202 { inputId, queued, delivery }` (`queued` is true only for a queue-delivery
-  that waits behind a running turn). A steered input is recorded with
+  `202 { inputId, queued, delivery }` (`queued` is true for queue-delivery
+  behind a running turn, or either delivery during compaction maintenance).
+  Maintenance adds `dispatchBlocked: "maintenance"`; acceptance is durable but
+  no turn has been dispatched. A steered input is recorded with
   `delivery: "steer"` on its `input/queued` event.
 - Steer stops like Stop does — the provider stream, cancellable tools, pending
   approvals, and child agents — and only then runs the queue. A tool that cannot
@@ -407,8 +438,9 @@ Three ways to act on a running conversation. All acceptance is durable
   (pending-input bound), `400`, `503`, and a failed durable write leave the
   running turn untouched.
 - `POST …/steer` with nothing pending is `200 { steered: false, pending: 0 }` —
-  never a hidden Stop. Otherwise `202 { steered: true, pending }`. Idle, it simply
-  runs the queue.
+  never a hidden Stop. Otherwise `202 { steered: true, pending }`. During
+  compaction it instead returns `202 { steered: false, queued: true, pending,
+  dispatchBlocked: "maintenance" }`. Idle, it simply runs the queue.
 - Not durable as an intent: if the host restarts before the steered turn
   starts, recovery closes the open turn as `interrupted` and the input is plain
   pending input again (it does not auto-run).
@@ -628,8 +660,9 @@ boundaries matter more than the feature:
   panel shows only the open project's shells and opens one for a project that
   has none; switching projects never surfaces another project's shell. The
   shell can still `cd` afterwards — the binding says where it belongs.
-- **Bounded.** Four terminals per workspace, whichever project they belong to;
-  output is coalesced into 16 ms
+- **Unbounded in count, bounded in bytes.** A workspace may open as many
+  terminals as it wants; every live one is listed and attachable from the
+  panel. Output is coalesced into 16 ms
   frames and a flush past 1 MB is dropped with an
   `[output truncated: too fast]` marker; a terminal idle for 30 minutes is
   reaped. `server.close()` kills every PTY, so none outlives the host.

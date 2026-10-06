@@ -29,7 +29,7 @@ const TERMINAL = {
   createdAt: 0,
 }
 
-async function fixture(page: Page, options: { readonly shells?: readonly { id: string; label: string }[]; readonly max?: number } = {}): Promise<TerminalFixture> {
+async function fixture(page: Page, options: { readonly shells?: readonly { id: string; label: string }[] } = {}): Promise<TerminalFixture> {
   const posts: { method: string; path: string; body: unknown }[] = []
   const unexpected: string[] = []
   const json = (route: Route, value: unknown, status = 200) => route.fulfill({ status, json: value })
@@ -106,7 +106,6 @@ async function fixture(page: Page, options: { readonly shells?: readonly { id: s
       return json(route, {
         terminals: [],
         shells: options.shells ?? [{ id: 'bash', label: 'Git Bash' }, { id: 'powershell', label: 'PowerShell' }],
-        max: options.max ?? 4,
         available: true,
       })
     }
@@ -204,12 +203,16 @@ test('closing a terminal asks the host to kill it and empties the panel', async 
   await expect(page.getByText('No terminal open')).toBeVisible()
 })
 
-test('stops offering new terminals at the host cap', async ({ page }) => {
+test('keeps offering new terminals however many already exist', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 })
-  const terminal = await fixture(page, { max: 1, shells: [{ id: 'bash', label: 'Git Bash' }] })
+  const terminal = await fixture(page, { shells: [{ id: 'bash', label: 'Git Bash' }] })
 
   // The panel must have subscribed before a frame is pushed, or it is lost.
   await expect(page.getByText('No terminal open')).toBeVisible()
   await terminal.push({ kind: 'created', terminal: TERMINAL })
-  await expect(page.getByRole('button', { name: 'New terminal' })).toBeDisabled()
+  const plus = page.getByRole('button', { name: 'New terminal' })
+  await expect(plus).toBeEnabled()
+  await plus.click()
+  await expect.poll(() => terminal.posts().filter((entry) => entry.method === 'POST' && entry.path.endsWith('/terminals')).length)
+    .toBe(2)
 })

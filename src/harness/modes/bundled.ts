@@ -21,7 +21,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     instructions:
       'You are a careful assistant working inside the user’s workspace. Read files freely; before any write, edit, or shell command, ask for approval. Prefer explaining what you are about to change.',
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
-    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'MemorySearch', 'MemoryRead', 'TodoWrite'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow',
       Write: 'ask', Edit: 'ask', Bash: 'ask',
@@ -30,7 +30,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
       BashOutput: 'allow', KillShell: 'allow',
       // Delegation asks here for the same reason a write does: this mode's
       // premise is that the user sees consequential work before it starts.
-      Skill: 'allow', Agent: 'ask', MemorySearch: 'allow', MemoryRead: 'allow',
+      Skill: 'allow', Agent: 'ask',
       // The session task list touches no workspace state, so it never asks.
       TodoWrite: 'allow',
     },
@@ -41,13 +41,12 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     instructions:
       'You are an assistant that edits files directly inside the user’s workspace. Read and edit files without asking; shell commands and deletions still require approval. Keep edits minimal and verifiable.',
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
-    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'MemorySearch', 'MemoryRead', 'MemoryCreate', 'MemoryUpdate', 'TodoWrite'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow',
       // A child's own calls re-enter this same policy, so delegating cannot
       // widen what the conversation may already do.
       Bash: 'ask', BashOutput: 'allow', KillShell: 'allow', Skill: 'allow', Agent: 'allow',
-      MemorySearch: 'allow', MemoryRead: 'allow', MemoryCreate: 'ask', MemoryUpdate: 'ask',
       TodoWrite: 'allow',
     },
   },
@@ -59,10 +58,9 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
     // Delegation is exposed here safely: a child resolves the SAME mode, so
     // anything it spawns is read-only too — there is no write path to grant.
-    toolExposure: ['Read', 'Glob', 'Grep', 'Skill', 'Agent', 'MemorySearch', 'MemoryRead', 'TodoWrite'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Skill', 'Agent', 'TodoWrite'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Skill: 'allow', Agent: 'allow',
-      MemorySearch: 'allow', MemoryRead: 'allow',
       TodoWrite: 'allow',
     },
   },
@@ -72,12 +70,11 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     instructions:
       'You are an assistant with full access to the workspace tools. Host and workspace restrictions still apply and cannot be overridden by you. There is no OS sandbox: shell commands run with host privileges, so stay deliberate.',
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
-    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'MemorySearch', 'MemoryRead', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget', 'TodoWrite'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow', Bash: 'allow',
       BashOutput: 'allow', KillShell: 'allow',
       Skill: 'allow', Agent: 'allow',
-      MemorySearch: 'allow', MemoryRead: 'allow', MemoryCreate: 'allow', MemoryUpdate: 'allow', MemoryForget: 'allow',
       TodoWrite: 'allow',
       // Full access means the workspace's MCP tools too: without a catch-all,
       // every mcp__* name falls to the defaultMode fallback and asks forever.
@@ -96,5 +93,5 @@ export const DEFAULT_MODE_ID = 'ask-before-changes'
 /** The full exposure ceiling any mode can grant (skills/memory included). */
 export const KNOWN_MODE_TOOLS: readonly string[] = [
   'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent',
-  'MemorySearch', 'MemoryRead', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget', 'TodoWrite',
+  'TodoWrite',
 ]

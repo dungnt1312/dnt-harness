@@ -126,7 +126,15 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
       >
         {manifest !== undefined && manifest !== null ? (
           <>
-            <Row term="mode">{manifest.modeId} · rev {manifest.modeRevision}</Row>
+            <Row term="mode">{manifest.modeId} · rev {manifest.modeRevision}{manifest.sources.modeSource !== undefined ? ` · ${manifest.sources.modeSource}` : ''}</Row>
+            {manifest.sources.environment !== undefined ? (
+              <Row term="environment">
+                <span title={[manifest.sources.environment.date, manifest.sources.environment.platform, manifest.sources.environment.workspacePath, manifest.sources.environment.gitBranch !== undefined ? `git ${manifest.sources.environment.gitBranch}` : undefined].filter(Boolean).join('\n') || 'environment facts'}>
+                  {manifest.sources.environment.date ?? '—'}
+                  {manifest.sources.environment.gitBranch !== undefined ? ` · git ${manifest.sources.environment.gitBranch}` : ''}
+                </span>
+              </Row>
+            ) : null}
             <Row term="window">
               {fill !== undefined ? (
                 <span className="flex flex-col gap-1.5">
@@ -144,7 +152,9 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
             {manifest.sources.child !== undefined ? (
               <Row term="role">
                 <span title={`instructions sha256 ${manifest.sources.child.instructionsHash}`}>
-                  {manifest.sources.child.definition} · {manifest.sources.child.instructionsHash.slice(0, 12)}
+                  {manifest.sources.child.definition}
+                  {manifest.sources.child.source !== undefined ? ` · ${manifest.sources.child.source}` : ''}
+                  {` · ${manifest.sources.child.instructionsHash.slice(0, 12)}`}
                 </span>
               </Row>
             ) : null}

@@ -198,7 +198,7 @@ function MemoryPanelContent({ workspaceId }: { readonly workspaceId: string | nu
               <TextInput value={draft.title} placeholder="Deploy notes" onChange={(e) => setDraft({ ...draft, title: e.target.value })} />
             </Field>
             <div className="rounded-xl border border-line px-3.5 py-2.5">
-              <Switch checked={draft.pinned} label="Pinned" hint="Always loaded into context." onChange={(pinned) => setDraft({ ...draft, pinned })} />
+              <Switch checked={draft.pinned} label="Legacy pin (metadata only)" hint="Only MEMORY.md pointers load into context; topic bodies are read on demand." onChange={(pinned) => setDraft({ ...draft, pinned })} />
             </div>
             <Field label="Body">
               <CodeArea tall rows={10} value={draft.body} onChange={(e) => setDraft({ ...draft, body: e.target.value })} />
@@ -212,7 +212,7 @@ function MemoryPanelContent({ workspaceId }: { readonly workspaceId: string | nu
             ) : null}
             {confirmDelete ? (
               <InlineConfirm
-                message="Delete this memory entry? It stops loading into context."
+                message="Delete this memory file and its index pointer?"
                 confirmLabel="Delete permanently"
                 busy={busy === 'delete'}
                 onConfirm={() => void remove()}

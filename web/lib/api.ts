@@ -753,13 +753,14 @@ export function putSkillSources(workspaceId: string, rules: readonly SkillRuleRo
   }).then((r) => json<{ readonly rules: readonly SkillRuleRow[] }>(r))
 }
 
-/** Save raw SKILL.md content; pass the row's hash to reject drifted writes. */
-export function saveSkill(workspaceId: string, name: string, content: string, expectedHash?: string): Promise<{ readonly name: string; readonly hash: string }> {
+/** Save raw SKILL.md content; pass the row's hash to reject drifted writes.
+ *  `warnings` explains when the saved copy is disabled or shadowed elsewhere. */
+export function saveSkill(workspaceId: string, name: string, content: string, expectedHash?: string): Promise<{ readonly name: string; readonly hash: string; readonly warnings?: readonly string[] }> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ content, ...(expectedHash !== undefined ? { expectedHash } : {}) }),
-  }).then((r) => json<{ readonly name: string; readonly hash: string }>(r))
+  }).then((r) => json<{ readonly name: string; readonly hash: string; readonly warnings?: readonly string[] }>(r))
 }
 
 export function deleteSkill(workspaceId: string, name: string): Promise<{ readonly deleted: boolean }> {

@@ -49,7 +49,7 @@ describe('openai completions adapter: thinking + wire shape', () => {
   it('preserves base system and wrapped compaction system blocks in order on the local wire', async () => {
     const captured = stubFetch()
     const baseSystem = 'Base system instructions. This is the same conversation continuing after compaction, not a new session.'
-    const compactionSystem = wrapUntrusted('compacted-history', 'through-seq="42"', 'Synthetic summary: 44f6ada; browser audio acceptance pending.')
+    const compactionSystem = wrapUntrusted('compacted-history', { 'through-seq': '42' }, 'Synthetic summary: 44f6ada; browser audio acceptance pending.')
     await run({
       messages: [
         { role: 'system', content: baseSystem },
@@ -221,12 +221,20 @@ describe('openai completions adapter: failure surfacing', () => {
       '{"choices":[{"delta":{"content":"par"}}]}',
       '{"error":{"message":"no available channel for this model","code":503}}',
     ])
-    await expect(run({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(/provider gateway failure/)
+    await expect(run({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(/provider gateway failure: no available channel for this model/)
   })
 
   it('a string-form gateway error chunk is surfaced too', async () => {
     stubFetch(['{"error":"upstream connect error"}'])
-    await expect(run({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(/provider gateway failure/)
+    await expect(run({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(/provider gateway failure: upstream connect error/)
+  })
+
+  it('a long upstream gateway message is truncated, not pasted wholesale', async () => {
+    stubFetch([`{"error":{"message":"${'x'.repeat(400)}TAIL-MARKER"}}`])
+    const caught = await run({ messages: [{ role: 'user', content: 'hi' }] }).then(() => null, (error: unknown) => error)
+    expect(caught).toBeInstanceOf(ProviderError)
+    expect((caught as ProviderError).message.startsWith('provider gateway failure: ')).toBe(true)
+    expect((caught as ProviderError).message).not.toContain('TAIL-MARKER')
   })
 
   it('a stream that closes without any model output is an error, not silence', async () => {
@@ -248,6 +256,11 @@ describe('openai completions adapter: failure surfacing', () => {
 describe('openai completions adapter: retry before the stream starts', () => {
   function sse(text: string): Response {
     return new Response(`data: {"choices":[{"delta":{"content":"${text}"}}]}\n\ndata: {"choices":[{"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n`, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  }
+
+  /** One raw SSE record as the gateway would emit it, un-wrapped. */
+  function raw(record: string): Response {
+    return new Response(`data: ${record}\n\ndata: [DONE]\n\n`, { status: 200, headers: { 'content-type': 'text/event-stream' } })
   }
 
   function scripted(responses: (() => Response | Promise<Response>)[]): ReturnType<typeof vi.fn> {
@@ -302,6 +315,46 @@ describe('openai completions adapter: retry before the stream starts', () => {
     const fake = scripted([() => new Response('down', { status: 502 })])
     await expect(collect(fast(2))).rejects.toThrow(/HTTP 502: server_error/)
     expect(fake).toHaveBeenCalledTimes(3)
+  })
+
+  it('retries a cloudflare 524 like any other 5xx timeout', async () => {
+    const fake = scripted([
+      () => new Response('origin timeout', { status: 524 }),
+      () => sse('after-524'),
+    ])
+    expect(await collect(fast())).toBe('after-524')
+    expect(fake).toHaveBeenCalledTimes(2)
+  })
+
+  it('treats an unknown 5xx as retryable by default', async () => {
+    const fake = scripted([
+      () => new Response('surprise', { status: 598 }),
+      () => sse('after-598'),
+    ])
+    expect(await collect(fast())).toBe('after-598')
+    expect(fake).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not retry a 5xx whose body proves the failure is deterministic', async () => {
+    const fake = scripted([() => new Response('{"error":{"message":"Invalid API key provided"}}', { status: 502 })])
+    await expect(collect(fast())).rejects.toThrow(/HTTP 502/)
+    expect(fake).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not retry deterministic server statuses like 501', async () => {
+    const fake = scripted([() => new Response('not implemented', { status: 501 })])
+    await expect(collect(fast())).rejects.toThrow(/HTTP 501: server_error/)
+    expect(fake).toHaveBeenCalledTimes(1)
+  })
+
+  it('a gateway error with unknown text is transient; permanent text is not', async () => {
+    const hiccup = scripted([() => raw('{"error":{"message":"upstream hiccup 42"}}')])
+    await expect(collect(fast())).rejects.toMatchObject({ transient: true, reason: 'server_error' })
+    expect(hiccup).toHaveBeenCalledTimes(1)
+
+    const once = scripted([() => raw('{"error":{"message":"Invalid API key provided"}}')])
+    await expect(collect(fast())).rejects.toMatchObject({ transient: false })
+    expect(once).toHaveBeenCalledTimes(1)
   })
 
   it('a stop during backoff ends the wait at once', async () => {

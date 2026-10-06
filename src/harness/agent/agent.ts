@@ -285,8 +285,8 @@ export class Agent {
   }
 
   /**
-   * One turn. Claims the whole pending inbox (a simplification of the
-   * upstream bounded claim), asks `agent/pre-step` to admit it, then spends
+   * One turn. Claims the whole pending inbox (this harness keeps claim simple
+   * rather than bounded), asks `agent/pre-step` to admit it, then spends
    * steps while tools keep owing the model their results. Returns the terminal
    * reason so `run()` knows which outcomes end the run (a stop leaves queued
    * input queued).

@@ -277,6 +277,19 @@ function agentDigest(action: string, output: string): string {
   return [...counts].map(([status, count]) => `${count} ${status}`).join(' · ')
 }
 
+/**
+ * The Skill tool's own receipts: a load answers `loaded (hash …)`, a miss is a
+ * normal result, a catalog answers with one row per skill plus an optional
+ * `… N more` note.
+ */
+function skillDigest(output: string): string {
+  if (/^skill '.+' loaded /.test(output)) return 'loaded'
+  if (/^skill '.+' not found/.test(output)) return 'not found'
+  if (output.startsWith('no skills')) return 'no matches'
+  const rows = output.split('\n').filter((line) => line.trim() !== '' && !line.startsWith('… '))
+  return plural(rows.length, 'skill')
+}
+
 /** The memory tools write their own one-line receipts; the row reads them. */
 function memoryDigest(builtin: string, output: string): string {
   switch (builtin) {
@@ -358,6 +371,18 @@ export function toolFacts(call: ToolCall, result?: ToolResultView): ToolFacts {
       fullTarget = agentTarget(args)
       target = shortCommand(fullTarget)
       digest = result === undefined ? undefined : failed ? excerpt(result.output) : agentDigest(str(args, 'action') ?? 'spawn', result.output)
+      break
+    }
+    case 'skill': {
+      const skill = str(args, 'name')
+      const action = (str(args, 'action') ?? (skill !== undefined ? 'load' : 'catalog')).toLowerCase()
+      const query = str(args, 'query')
+      // The skill name is the row's read; the action stays a qualifier at most,
+      // in the full target the row's tooltip holds.
+      fullTarget = action === 'load' ? `load ${skill ?? ''}` : `catalog${query !== undefined ? ` ${query}` : ''}`
+      target = action === 'load' ? shortCommand(skill ?? '') : shortCommand(fullTarget)
+      path = undefined
+      digest = result === undefined ? undefined : failed ? excerpt(result.output) : skillDigest(result.output)
       break
     }
     case 'memorysearch':

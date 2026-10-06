@@ -1,5 +1,5 @@
 /**
- * The terminal service: lifecycle, per-workspace caps, scrollback ring,
+ * The terminal service: lifecycle, scrollback ring,
  * output coalescing and flood truncation, idle reaping, multiplexed
  * subscription, and shutdown.
  *
@@ -106,14 +106,18 @@ describe('terminal service', () => {
     expect(terminals.scrollback(info.id)).toBe('before after')
   })
 
-  it('refuses to open more than the per-workspace cap, and counts per workspace', async () => {
-    const { terminals } = service({ maxPerWorkspace: 2 })
-    await terminals.create({ workspaceId: WS, cwd: process.cwd() })
-    await terminals.create({ workspaceId: WS, cwd: process.cwd() })
+  it('opens as many terminals as asked, counting per workspace only for the record', async () => {
+    const { terminals } = service()
+    const created = []
+    for (let index = 0; index < 6; index += 1) {
+      created.push(await terminals.create({ workspaceId: WS, cwd: process.cwd() }))
+    }
+    expect(new Set(created.map((info) => info.id)).size).toBe(6)
+    expect(terminals.list(WS)).toHaveLength(6)
 
-    await expect(terminals.create({ workspaceId: WS, cwd: process.cwd() })).rejects.toMatchObject({ code: 'cap' })
-    // A different workspace has its own budget.
+    // A different workspace's shells live beside these, untouched.
     await expect(terminals.create({ workspaceId: OTHER, cwd: process.cwd() })).resolves.toBeDefined()
+    expect(terminals.list(WS)).toHaveLength(6)
   })
 
   it('coalesces bursts into one frame instead of one frame per chunk', async () => {
@@ -154,6 +158,19 @@ describe('terminal service', () => {
     const scrollback = terminals.scrollback(info.id)
     expect(scrollback).toHaveLength(100)
     expect(scrollback.endsWith('NEWEST')).toBe(true)
+  })
+
+  it('never starts the trimmed scrollback on half of a surrogate pair', async () => {
+    const { terminals, spawned } = service({ scrollbackChars: 4 })
+    const info = await terminals.create({ workspaceId: WS, cwd: process.cwd() })
+    // '😀' is two UTF-16 units; keeping the last 4 of 'a😀bcd' starts on its low half.
+    spawned[0]?.emit('a😀bcd')
+    await flushed()
+
+    const scrollback = terminals.scrollback(info.id)
+    const first = scrollback.charCodeAt(0)
+    expect(first >= 0xdc00 && first <= 0xdfff).toBe(false)
+    expect(scrollback).toBe('bcd')
   })
 
   it('reports the shell exit to subscribers and forgets the terminal', async () => {

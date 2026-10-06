@@ -23,8 +23,6 @@ import path from 'node:path'
 import { shellCatalog, type ShellId, type ShellOption } from '../capabilities/shell/detect.ts'
 import type { ProjectId, WorkspaceId } from '../util/brand.ts'
 
-/** Live terminals allowed per workspace. */
-const MAX_PER_WORKSPACE = 4
 /** Scrollback retained per terminal, in characters. */
 const SCROLLBACK_CHARS = 256_000
 /** Output is coalesced into one frame per this many ms, never one per chunk. */
@@ -100,7 +98,7 @@ export interface PtySpawner {
 }
 
 /** Failure kinds the HTTP layer maps onto status codes. */
-export type TerminalErrorCode = 'unavailable' | 'cap' | 'not-found' | 'bad-shell'
+export type TerminalErrorCode = 'unavailable' | 'not-found' | 'bad-shell'
 
 export class TerminalError extends Error {
   constructor(readonly code: TerminalErrorCode, message: string) {
@@ -122,7 +120,6 @@ export interface CreateTerminalInput {
 
 export interface TerminalServiceOptions {
   readonly spawner?: PtySpawner
-  readonly maxPerWorkspace?: number
   readonly scrollbackChars?: number
   readonly idleMs?: number
   readonly reapIntervalMs?: number
@@ -220,7 +217,6 @@ function ptyEnv(): Record<string, string> {
 }
 
 export function createTerminalService(options: TerminalServiceOptions = {}): TerminalService {
-  const maxPerWorkspace = options.maxPerWorkspace ?? MAX_PER_WORKSPACE
   const scrollbackChars = options.scrollbackChars ?? SCROLLBACK_CHARS
   const idleMs = options.idleMs ?? IDLE_MS
   const reapIntervalMs = options.reapIntervalMs ?? REAP_INTERVAL_MS
@@ -249,7 +245,12 @@ export function createTerminalService(options: TerminalServiceOptions = {}): Ter
     }
     live.scrollback += payload
     if (live.scrollback.length > scrollbackChars) {
-      live.scrollback = live.scrollback.slice(live.scrollback.length - scrollbackChars)
+      let start = live.scrollback.length - scrollbackChars
+      // Never start on the low half of a surrogate pair: a lone half would
+      // replay as U+FFFD at the head of every reattach.
+      const code = live.scrollback.charCodeAt(start)
+      if (code >= 0xdc00 && code <= 0xdfff) start += 1
+      live.scrollback = live.scrollback.slice(start)
     }
     emit(live.info.workspaceId, { kind: 'data', terminalId: live.info.id, data: payload })
   }
@@ -340,10 +341,6 @@ export function createTerminalService(options: TerminalServiceOptions = {}): Ter
         available = failure === undefined
         hint = failure ?? 'node-pty'
         if (failure !== undefined) throw new TerminalError('unavailable', failure)
-      }
-      const open = [...terminals.values()].filter((live) => live.info.workspaceId === input.workspaceId)
-      if (open.length >= maxPerWorkspace) {
-        throw new TerminalError('cap', `this workspace already has ${maxPerWorkspace} terminals open`)
       }
       const catalog = shellCatalog()
       const shell = input.shellId === undefined

@@ -99,7 +99,7 @@ function cap(output: string, limit: number): string {
  */
 async function walk(
   dir: string,
-  deniedRoots: readonly string[] | undefined,
+  exec: ToolExecution,
   signal: AbortSignal | undefined,
   budget = { left: WALK_BUDGET },
   ignored: ReadonlySet<string> = DEFAULT_IGNORED_SET,
@@ -109,7 +109,11 @@ async function walk(
   const stopped = (): boolean => signal?.aborted === true
   const found: string[] = []
   if (stopped()) throw new Error('cancelled: stop requested during search')
-  if (budget.left <= 0 || deniedRoots?.some((denied) => within(denied, dir))) return found
+  if (budget.left <= 0) return found
+  // Recheck each directory and candidate against the same grant/deny policy as
+  // Read; never discard the app-home deny for an entire search tree.
+  const memoryRoot = exec.memoryRoots?.find((root) => within(root, dir))
+  try { await granted(exec, memoryRoot !== undefined && dir !== memoryRoot ? path.join(dir, 'MEMORY.md') : dir, 'read') } catch { return found }
   let entries
   try {
     entries = await fs.readdir(dir, { withFileTypes: true })
@@ -124,9 +128,9 @@ async function walk(
     if (entry.isSymbolicLink()) continue
     if (entry.isDirectory()) {
       if (ignored.has(entry.name)) continue
-      found.push(...(await walk(full, deniedRoots, signal, budget, ignored)))
+      found.push(...(await walk(full, exec, signal, budget, ignored)))
     } else if (entry.isFile()) {
-      found.push(full)
+      try { await granted(exec, full, 'read'); found.push(full) } catch { /* inaccessible search result */ }
     }
   }
   return found
@@ -475,7 +479,7 @@ export function globTool(): ToolDefinition {
       const base = await searchBase(args, exec)
       const pattern = argString(args, 'pattern')
       const regex = globToRegExp(pattern)
-      const matches = (await walk(base, exec.deniedRoots, exec.signal, undefined, searchIgnore(args, pattern)))
+      const matches = (await walk(base, exec, exec.signal, undefined, searchIgnore(args, pattern)))
         .filter((full) => regex.test(path.relative(base, full).split(path.sep).join('/')))
       const files = matches.slice(0, GLOB_CAP).map((full) => displayPath(exec.root, full))
       if (matches.length > GLOB_CAP) files.push(`… [+${matches.length - GLOB_CAP} more matches]`)
@@ -505,7 +509,7 @@ export function grepTool(): ToolDefinition {
       // Validate here so a bad pattern fails as before, not inside the worker.
       void new RegExp(pattern)
       const base = await searchBase(args, exec)
-      const files = await walk(base, exec.deniedRoots, exec.signal, undefined, searchIgnore(args))
+      const files = await walk(base, exec, exec.signal, undefined, searchIgnore(args))
       let run
       try {
         run = await runGrep(pattern, files.map((full) => ({ full })), {

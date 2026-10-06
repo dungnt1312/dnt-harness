@@ -5,7 +5,9 @@
  * nothing about the web, SSE, or the session log — hosts bridge the
  * onStart/onExit callbacks to durable events. Processes outlive turns; only
  * a KillShell/operator stop, a child error, natural exit, or session delete
- * (dispose, which emits nothing — the log is going away) ends one.
+ * (dispose, which emits nothing — the log is going away) ends one. Ended
+ * records stay readable for a retention window (one hour by default) and are
+ * pruned on later lookups; the durable event log remains the archive.
  */
 import type { ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -62,9 +64,11 @@ export interface RegistryLimits {
   readonly perSession: number
   readonly host: number
   readonly ringChars: number
+  /** How long an ended record stays readable before a lookup prunes it. */
+  readonly endedRetentionMs: number
 }
 
-const DEFAULT_LIMITS: RegistryLimits = { perSession: 8, host: 24, ringChars: 64_000 }
+const DEFAULT_LIMITS: RegistryLimits = { perSession: 8, host: 24, ringChars: 64_000, endedRetentionMs: 3_600_000 }
 
 /** Kill-to-close grace: a straggler grandchild can outlive the tree walk, and
  * a loaded host (parallel test workers) delays taskkill noticeably. */
@@ -92,7 +96,16 @@ export class ProcessRegistry {
     this.limits = { ...DEFAULT_LIMITS, ...limits }
   }
 
+  /** Drop ended records past their retention window; running records are never touched. */
+  private pruneEnded(): void {
+    const cutoff = Date.now() - this.limits.endedRetentionMs
+    for (const [id, record] of this.byId) {
+      if (record.status !== 'running' && record.endedAt !== null && record.endedAt < cutoff) this.byId.delete(id)
+    }
+  }
+
   canRegister(sessionId: SessionId): { ok: true } | { ok: false; error: string } {
+    this.pruneEnded()
     if (this.admissionClosed) return { ok: false, error: 'host is shutting down; command admission closed' }
     if (this.runningCount(sessionId) >= this.limits.perSession) return { ok: false, error: `this session already has ${this.limits.perSession} background processes running; kill one (KillShell) or wait for it to exit before starting another` }
     if (this.runningTotal() >= this.limits.host) return { ok: false, error: `the host limit of ${this.limits.host} running background processes is reached; kill or wait for one before starting another` }
@@ -165,6 +178,7 @@ export class ProcessRegistry {
   }
 
   read(sessionId: SessionId, processId: string): { output: string; outputTruncated: boolean; status: ProcessStatus; exitCode: number | null } | undefined {
+    this.pruneEnded()
     const record = this.byId.get(processId)
     if (record === undefined || record.sessionId !== sessionId) return undefined
     return { output: record.output, outputTruncated: record.outputTruncated, status: record.status, exitCode: record.exitCode }
@@ -270,6 +284,7 @@ export class ProcessRegistry {
   }
 
   snapshot(sessionId: SessionId): readonly ProcessSnapshot[] {
+    this.pruneEnded()
     const rows: ProcessSnapshot[] = []
     for (const record of this.byId.values()) {
       if (record.sessionId !== sessionId) continue
@@ -280,6 +295,7 @@ export class ProcessRegistry {
 
   /** One process with its captured output; undefined for a foreign or unknown id. */
   detail(sessionId: SessionId, processId: string): (ProcessSnapshot & { readonly output: string; readonly outputTruncated: boolean }) | undefined {
+    this.pruneEnded()
     const record = this.byId.get(processId)
     if (record === undefined || record.sessionId !== sessionId) return undefined
     return { ...this.snapshotOf(record), output: record.output, outputTruncated: record.outputTruncated }

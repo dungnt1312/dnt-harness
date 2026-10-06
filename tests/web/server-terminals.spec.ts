@@ -1,6 +1,7 @@
 /**
  * The terminal HTTP surface: REST lifecycle, the multiplexed SSE stream, the
  * gates (disabled host, non-loopback bind, missing PTY backend), and shutdown.
+ * There is no per-workspace cap: every open answers `201` while the PTY lives.
  *
  * A fake PTY backend is injected throughout, so these tests assert the web
  * host's behaviour rather than a native module's.
@@ -163,11 +164,9 @@ describe('terminal HTTP surface', () => {
     const listed = (await (await fetch(`${baseUrl}/api/workspaces/${wid}/terminals`)).json()) as {
       terminals: Array<{ id: string }>
       shells: Array<{ id: string }>
-      max: number
     }
     expect(listed.terminals.map((row) => row.id)).toEqual([info.id])
     expect(listed.shells.length).toBeGreaterThan(0)
-    expect(listed.max).toBe(4)
 
     const input = await fetch(`${baseUrl}/api/workspaces/${wid}/terminals/${info.id}/input`, {
       method: 'POST',
@@ -261,7 +260,7 @@ describe('terminal HTTP surface', () => {
     expect(spawned).toHaveLength(1)
   })
 
-  it('refuses to exceed the per-workspace cap', async () => {
+  it('opens every terminal asked for without a per-workspace cap', async () => {
     const baseUrl = await start()
     const wid = await workspaceId(baseUrl)
     const open = async (): Promise<Response> =>
@@ -271,10 +270,8 @@ describe('terminal HTTP surface', () => {
         body: JSON.stringify({ cols: 80, rows: 24 }),
       })
 
-    for (let index = 0; index < 4; index += 1) expect((await open()).status).toBe(201)
-    const rejected = await open()
-    expect(rejected.status).toBe(400)
-    expect(((await rejected.json()) as { error: string }).error).toMatch(/4 terminals/)
+    for (let index = 0; index < 6; index += 1) expect((await open()).status).toBe(201)
+    expect(spawned).toHaveLength(6)
   })
 
   it('fails closed on unknown workspaces and unknown terminals', async () => {

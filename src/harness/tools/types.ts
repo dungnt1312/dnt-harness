@@ -57,6 +57,10 @@ export interface ToolExecution {
    * resolve against `root`; absolute paths may land in any granted folder.
    */
   readonly additionalRoots?: readonly GrantedRoot[]
+  /** Host-owned memory namespaces; only Markdown files are reachable in them. */
+  readonly memoryRoots?: readonly string[]
+  /** The host application-storage deny (if any); only this designated ancestor may be carved out for memory roots. */
+  readonly hostStorageRoot?: string
   /**
    * Exact paths outside every granted folder that an approval allowed for
    * THIS call only. Set by the pipeline after the approval decision, never by

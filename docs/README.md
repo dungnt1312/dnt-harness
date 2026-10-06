@@ -1,12 +1,12 @@
 # dnt-harness — Documentation
 
-**dnt-harness** is a miniature TypeScript replica of the
-[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) architecture,
-built for learning. It reimplements the same plugin-runtime ideas — everything is
-a plugin, typed events with five dispatch modes, reversible effects,
-dependency-driven lifecycle — from scratch on a kernel small enough to read in an
-afternoon, then layers an agent core (durable session log, LLM streaming seam,
-turn/step driver), a guarded tool pipeline, and a web UI on top.
+**dnt-harness** is a TypeScript agent harness, built from scratch and small
+enough to read in an afternoon. Its kernel takes inspiration from the Cordis
+plugin runtime — everything is a plugin, typed events with five dispatch modes,
+reversible effects, dependency-driven lifecycle — reimplemented from scratch
+without importing any of its code, then layers an agent core (durable session
+log, LLM streaming seam, turn/step driver), a guarded tool pipeline, and a web
+UI on top.
 
 This documentation is organized so each layer can be read independently:
 
@@ -17,6 +17,7 @@ This documentation is organized so each layer can be read independently:
 | [harness.md](harness.md) | The agent harness: session log, LLM seam, turn/step driver, tools, approval |
 | [capabilities.md](capabilities.md) | The built-in tools: filesystem and bash |
 | [web.md](web.md) | The web host: REST + SSE API and the React client |
+| [skills.md](skills.md) | Skills: layers, SKILL.md format, the Skill tool, the skills API |
 | [guides.md](guides.md) | Getting started, configuration, CLI, plugin authoring, testing |
 | [decisions/plugin-platform.md](decisions/plugin-platform.md) | Plugin platform spec: composition loading, route seam, SDK surface policy (proposed) |
 | [decisions/mcp-production-boundaries.md](decisions/mcp-production-boundaries.md) | MCP protocol pin, outcomes, receipts, deployment boundary |
@@ -82,11 +83,9 @@ tests/                  Vitest suite + composition fixtures
 
 ## Why this shape
 
-The reference architecture lives in the DeepSeek Harness repository
-(`docs/architecture.md`, `docs/cordis-primer.md`, `docs/cordis-tutorial/`).
-dnt-harness rebuilds those ideas *without importing them*; the test suite
-reproduces the Cordis tutorial chapters against this kernel. The three core
-invariants, carried over verbatim from upstream, are:
+The kernel borrows its plugin-runtime ideas from Cordis; nothing is imported
+from it, and the rest of the harness has since grown in its own direction. The
+three core invariants of this kernel are:
 
 1. **Model-visible means logged.** Every model request is
    `session.deriveMessages()` at that moment; a test asserts it with tools in

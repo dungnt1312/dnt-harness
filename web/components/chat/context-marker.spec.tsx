@@ -54,7 +54,15 @@ it('the collapsed line names the size and the per-request facts', async () => {
   expect(view.textContent).toContain('1 skill')
   expect(view.textContent).toContain('1 mem')
   expect(view.textContent).toContain('1 omitted')
+  expect(view.textContent).toContain('gpt-x')
   expect(view.querySelector('button')!.getAttribute('aria-expanded')).toBe('false')
+})
+
+it('the collapsed line drops the model fact when the manifest has none', async () => {
+  const { model: _omitted, ...noModel } = MANIFEST
+  void _omitted
+  const view = await openMarker({ ...item, manifest: noModel } as Extract<ViewItem, { kind: 'context' }>, false)
+  expect(view.textContent).not.toContain('gpt-x')
 })
 
 it('expanding reveals the manifest: window, mode, history, sources, omissions', async () => {

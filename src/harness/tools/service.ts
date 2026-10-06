@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from 'node:util'
+import path from 'node:path'
 import { Service, type Context } from '../../kernel/index.ts'
 import { newExecutionId, type ExecutionId } from '../../util/brand.ts'
 import type { ToolCall, ToolSchema } from '../llm/types.ts'
@@ -21,6 +22,8 @@ export type RootResolver = () => {
   root: string
   additionalRoots?: readonly GrantedRoot[]
   deniedRoots?: readonly string[]
+  memoryRoots?: readonly string[]
+  hostStorageRoot?: string
 } | undefined
 
 /**
@@ -94,6 +97,7 @@ function freezeExecution(exec: ToolExecution): ToolExecution {
       approvedPaths: Object.freeze(exec.approvedPaths.map((approved) => Object.freeze({ ...approved }))),
     } : {}),
     ...(exec.deniedRoots !== undefined ? { deniedRoots: Object.freeze([...exec.deniedRoots]) } : {}),
+    ...(exec.memoryRoots !== undefined ? { memoryRoots: Object.freeze([...exec.memoryRoots]) } : {}),
     ...(exec.observationParents !== undefined ? { observationParents: Object.freeze([...exec.observationParents]) } : {}),
   })
 }
@@ -311,7 +315,9 @@ export class ToolsService extends Service {
       throw error
     }
     if (attemptedRewrite || (decision.call !== undefined && !isDeepStrictEqual(decision.call, rewritten))) decision = rewriteDenied()
-    if (decision.kind === 'allow' && (tool.requiresRoot ?? false) && exec.root === '') {
+    const target = rewritten.args['path']
+    const scopedMemoryPath = typeof target === 'string' && path.isAbsolute(target) && exec.memoryRoots?.some((root) => within(root, target)) === true
+    if (decision.kind === 'allow' && (tool.requiresRoot ?? false) && exec.root === '' && !scopedMemoryPath) {
       decision = { kind: 'deny', reason: `no workspace root is granted for '${rewritten.name}'; grant one before running root-aware tools`, call: rewritten }
     }
     const preparedCall = rewritten
@@ -396,18 +402,25 @@ export class ToolsService extends Service {
    * fails the call instead of running somewhere the approver did not see.
    */
   private executionAtRun(exec: ToolExecution, approvedPaths: readonly ApprovedPath[] | undefined): ToolExecution {
-    const { additionalRoots: _before, approvedPaths: _unused, ...base } = exec
+    const { additionalRoots: _before, memoryRoots: _memoryBefore, hostStorageRoot: _storageBefore, approvedPaths: _unused, ...base } = exec
     let additionalRoots = exec.additionalRoots
-    if (exec.root !== '' && this.rootResolver !== undefined) {
+    let memoryRoots = exec.memoryRoots
+    let hostStorageRoot = exec.hostStorageRoot
+    if ((exec.root !== '' || memoryRoots !== undefined) && this.rootResolver !== undefined) {
       const now = this.rootResolver()
       if (now === undefined || now.root !== exec.root) {
         throw new Error('the workspace folder changed while this call was waiting; retry the call')
       }
       additionalRoots = stillGranted(exec.additionalRoots, now.additionalRoots)
+      memoryRoots = exec.memoryRoots?.filter((root) => now.memoryRoots?.some((live) => samePath(root, live)))
+      hostStorageRoot = exec.hostStorageRoot !== undefined && now.hostStorageRoot !== undefined
+        && samePath(exec.hostStorageRoot, now.hostStorageRoot) ? exec.hostStorageRoot : undefined
     }
     return freezeExecution({
       ...base,
       ...(additionalRoots !== undefined && additionalRoots.length > 0 ? { additionalRoots } : {}),
+      ...(memoryRoots !== undefined && memoryRoots.length > 0 ? { memoryRoots } : {}),
+      ...(hostStorageRoot !== undefined ? { hostStorageRoot } : {}),
       ...(approvedPaths !== undefined && approvedPaths.length > 0 ? { approvedPaths } : {}),
     })
   }
@@ -431,6 +444,8 @@ export class ToolsService extends Service {
       ...(scope?.sessionId !== undefined && scope.childOf !== undefined ? { observationParents: [scope.childOf.parentSessionId] } : {}),
       ...(grant?.additionalRoots !== undefined && grant.additionalRoots.length > 0 ? { additionalRoots: grant.additionalRoots } : {}),
       ...(grant?.deniedRoots !== undefined ? { deniedRoots: grant.deniedRoots } : {}),
+      ...(grant?.memoryRoots !== undefined ? { memoryRoots: grant.memoryRoots } : {}),
+      ...(grant?.hostStorageRoot !== undefined ? { hostStorageRoot: grant.hostStorageRoot } : {}),
       ...(signal !== undefined ? { signal } : {}),
       ...(limits?.toolOutputLimit !== undefined ? { outputLimit: limits.toolOutputLimit } : {}),
       ...(executionId !== undefined ? { executionId } : {}),

@@ -78,6 +78,8 @@ export interface SpawnRequest {
   readonly parentSessionId: SessionId
   readonly parentTurnId: string
   readonly definition: AgentDefinition
+  /** Provenance of `definition` (bundled role vs workspace file), for manifests. */
+  readonly definitionSource?: 'bundled' | 'workspace' | undefined
   /** Explicit trusted fixture ceiling, primarily for low-level/headless callers. */
   readonly exposureCeiling?: readonly string[] | undefined
   /** Host authority resolver, evaluated at the admission linearization point. */
@@ -745,6 +747,7 @@ export class ChildExecutor {
           parentTurnId: request.parentTurnId,
           definition: request.definition.name,
           instructions: request.definition.instructions,
+          ...(request.definitionSource !== undefined ? { definitionSource: request.definitionSource } : {}),
           toolCeiling,
           ...(request.definition.skills !== undefined ? { skills: request.definition.skills } : {}),
           ...(request.inheritedContext !== undefined ? { inheritedContext: request.inheritedContext } : {}),

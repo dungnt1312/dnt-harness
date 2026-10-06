@@ -6,11 +6,15 @@ import {
   MAX_SKILL_RULES,
   SkillError,
   absoluteRuleBase,
+  absoluteRuleTooBroad,
+  assertSkillName,
+  assertWritableSkillName,
   defaultSkillRules,
   projectRuleBase,
   protectedRootsForRules,
   resolveSkillLayers,
   validateSkillRules,
+  validateSkillRulesForWrite,
 } from 'dnt-harness'
 
 describe('defaultSkillRules', () => {
@@ -97,6 +101,63 @@ describe('resolveSkillLayers', () => {
       { workspaceDir: 'C:/ws', projectPath: 'C:/proj' },
     )
     expect(escape).toEqual([])
+  })
+})
+
+describe('absoluteRuleTooBroad / too-broad absolute rules', () => {
+  it('flags drive roots, the home folder, and its ancestors only', () => {
+    const home = path.resolve('/Users/someone')
+    expect(absoluteRuleTooBroad(path.parse(home).root, home)).toBe(true)
+    expect(absoluteRuleTooBroad(home, home)).toBe(true)
+    expect(absoluteRuleTooBroad(path.dirname(home), home)).toBe(true)
+    expect(absoluteRuleTooBroad(path.join(home, '.claude', 'skills'), home)).toBe(false)
+    expect(absoluteRuleTooBroad(path.resolve('/opt/skills'), home)).toBe(false)
+    // A sibling whose name merely starts with the home path is not an ancestor.
+    expect(absoluteRuleTooBroad(`${home}-other`, home)).toBe(false)
+  })
+
+  it('folds case on case-insensitive volumes only', () => {
+    const home = path.resolve('/Users/someone')
+    const lowerParent = path.resolve('/users')
+    expect(absoluteRuleTooBroad(lowerParent, home, true)).toBe(true)
+    expect(absoluteRuleTooBroad(path.resolve('/USERS/SOMEONE'), home, true)).toBe(true)
+    expect(absoluteRuleTooBroad(lowerParent, home, false)).toBe(false)
+  })
+
+  it('writes refuse enabled ~, drive root, and home rules; disabled ones may stay', () => {
+    for (const bad of ['~', path.parse(homedir()).root, homedir()]) {
+      expect(() => validateSkillRulesForWrite({ rules: [{ id: 'a', kind: 'absolute', path: bad, enabled: true }] })).toThrow(/too broad/)
+      expect(validateSkillRulesForWrite({ rules: [{ id: 'a', kind: 'absolute', path: bad, enabled: false }] })).toHaveLength(1)
+    }
+  })
+
+  it('a stored broad rule still reads (no reset to defaults); resolution and protection skip it', () => {
+    const stored = { rules: [
+      { id: 'home', kind: 'absolute', path: '~', enabled: true },
+      { id: 'proj', kind: 'project', path: 'custom/skills', enabled: true },
+      { id: 'ws', kind: 'workspace', enabled: false },
+    ] }
+    const rules = validateSkillRules(stored)
+    expect(rules.map((rule) => rule.id)).toEqual(['home', 'proj', 'ws'])
+    const layers = resolveSkillLayers(rules, { workspaceDir: '/ws', projectPath: '/proj' })
+    expect(layers.map((layer) => layer.ruleId)).toEqual(['proj'])
+    expect(protectedRootsForRules(rules)).toEqual([])
+  })
+})
+
+describe('assertSkillName', () => {
+  it('accepts kebab-case names and refuses traversal or separators', () => {
+    expect(() => assertSkillName('deploy-notes')).not.toThrow()
+    for (const bad of ['..', '../..', 'a/b', 'a\\b', '', 'Upper', '-lead', '.hidden']) {
+      expect(() => assertSkillName(bad, 'invalid')).toThrow(SkillError)
+    }
+  })
+
+  it('writes refuse reserved names that collide with API routes', () => {
+    expect(() => assertWritableSkillName('sources')).toThrow(/reserved/)
+    expect(() => assertWritableSkillName('sources-notes')).not.toThrow()
+    // Reads stay permissive: the name is well-formed.
+    expect(() => assertSkillName('sources')).not.toThrow()
   })
 })
 

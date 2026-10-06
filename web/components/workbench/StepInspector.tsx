@@ -26,6 +26,7 @@ const TABS: readonly { readonly id: InspectorTab; readonly label: string }[] = [
 
 const SECTION_KIND: Readonly<Record<string, string>> = {
   system: 'System block',
+  'workspace-instructions': 'Workspace instructions',
   compaction: 'Compaction summary',
   'parent-context': 'Parent context',
   skill: 'Skill',

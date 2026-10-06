@@ -123,13 +123,10 @@ export type SessionEvent =
   // model-visible text. Recorded once per distinct hash per session — a body
   // the request already carried is never re-recorded. The `body` field name
   // (not `content`/`output`) keeps it out of the compaction size projection.
-  | ({ readonly type: 'context/body'; readonly hash: string; readonly kind: 'system' | 'compaction' | 'parent-context' | 'skill' | 'skill-catalog' | 'memory'; readonly name?: string; readonly chars: number; readonly body: string } & SessionEventStamp)
-  // Compaction lifecycle, log-only (DeepSeek-Harness-style): `start` opens the
-  // transaction before the summarizer runs; `end` closes it after the
-  // checkpoint is durable — with the summary body for immediate UI review, or
-  // `error` for a failed attempt. A dangling start (crash mid-compaction)
-  // stays visible as an unfinished transaction; there is never an end that
-  // claims success without a checkpoint on disk. Model projection ignores both.
+  | ({ readonly type: 'context/body'; readonly hash: string; readonly kind: 'system' | 'workspace-instructions' | 'compaction' | 'parent-context' | 'skill' | 'skill-catalog' | 'memory'; readonly name?: string; readonly chars: number; readonly body: string } & SessionEventStamp)
+  // Compaction lifecycle, log-only: a durable successful end is authoritative;
+  // checkpoint JSON is an atomic, rebuildable cache. A dangling start never
+  // authorizes history replacement. Model projection ignores both.
   | ({ readonly type: 'compaction/start'; readonly trigger: 'manual' | 'automatic'; readonly model?: string } & SessionEventStamp)
   | ({
       readonly type: 'compaction/end'
@@ -300,7 +297,26 @@ export function sessionModeOf(events: readonly SessionEvent[]): Extract<SessionE
   return undefined
 }
 
+export interface DatedMessage {
+  readonly seq: number
+  readonly message: ModelMessage
+}
+
+/** Canonical effective-call projection with source sequence retained for windows. */
+export function deriveDatedMessages(events: readonly SessionEvent[], attachments?: AttachmentLookup): DatedMessage[]
+export function deriveDatedMessages(events: readonly SessionEvent[], startSeq: number, attachments?: AttachmentLookup): DatedMessage[]
+export function deriveDatedMessages(events: readonly SessionEvent[], startOrAttachments: number | AttachmentLookup = 0, attachments?: AttachmentLookup): DatedMessage[] {
+  const startSeq = typeof startOrAttachments === 'number' ? startOrAttachments : 0
+  const projected = projectMessages(events, typeof startOrAttachments === 'number' ? attachments : startOrAttachments)
+  const contentEvents = events.filter(event => event.type === 'user/message' || event.type === 'assistant/message' || event.type === 'tool/result')
+  return projected.map((message, index) => ({ message, seq: contentEvents[index]!.seq })).filter(item => item.seq >= startSeq)
+}
+
 export function deriveMessages(events: readonly SessionEvent[], attachments?: AttachmentLookup): ModelMessage[] {
+  return deriveDatedMessages(events, 0, attachments).map(item => item.message)
+}
+
+function projectMessages(events: readonly SessionEvent[], attachments?: AttachmentLookup): ModelMessage[] {
   // Authorization hooks may rewrite a requested tool call. The durable
   // tool/call is the effective identity that actually crossed the side-effect
   // boundary, so model history must project it instead of stale provider args.

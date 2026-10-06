@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 /**
  * The terminal panel's own behaviour: catalog-driven shell picker, tab strip,
- * cap handling, scrollback reattach from the snapshot, batched input, and the
- * unavailable-host message.
+ * cross-project visibility, scrollback reattach from the snapshot, batched
+ * input, and the unavailable-host message.
  *
  * xterm is mocked. jsdom has no renderer or layout, so asserting against a
  * real terminal here would prove nothing about rendering while making the
@@ -109,7 +109,6 @@ beforeEach(() => {
   api.listTerminals.mockResolvedValue({
     terminals: [],
     shells: [{ id: 'bash', label: 'Git Bash' }, { id: 'powershell', label: 'PowerShell' }],
-    max: 4,
     available: true,
   })
   api.createTerminal.mockResolvedValue(row('terminal-1'))
@@ -283,7 +282,6 @@ describe('terminal panel', () => {
     api.listTerminals.mockResolvedValue({
       terminals: [],
       shells: [],
-      max: 4,
       available: false,
       unavailable: 'node-pty is not available (test)',
     })
@@ -455,7 +453,6 @@ describe('terminal panel', () => {
     api.listTerminals.mockResolvedValue({
       terminals: [],
       shells: [{ id: 'bash', label: 'Git Bash' }],
-      max: 4,
       available: true,
     })
     await mount({ projectId: 'project-7', defaultShell: 'bash' })
@@ -480,10 +477,9 @@ describe('terminal panel', () => {
       ],
     } as Frame))
 
-    // The other project's shell is alive on the host but not in this view,
-    // and it must not be drawn or replayed here.
-    expect(host.textContent).toContain('Git Bash')
-    expect(host.textContent).not.toContain('PowerShell')
+    // The other project's shell is alive on the host and shows as a dimmed tab,
+    // but its output is never drawn or replayed here.
+    expect(host.querySelectorAll('span[title*="another project"]')).toHaveLength(1)
     expect(written).toContain('mine')
     expect(written).not.toContain('theirs')
     expect(MockTerminal.instances).toHaveLength(1)
@@ -501,52 +497,40 @@ describe('terminal panel', () => {
     expect(api.createTerminal).toHaveBeenCalledWith('ws', expect.objectContaining({ projectId: 'project-7' }))
   })
 
-  it('does not auto-open against four hidden workspace terminals', async () => {
-    const onHide = vi.fn()
-    await mount({ projectId: 'project-7', onHide })
+  it('opens for this project even when other projects already hold live shells', async () => {
+    await mount({ projectId: 'project-7' })
     await act(async () => push({
       kind: 'snapshot',
-      terminals: ['hidden-1', 'hidden-2', 'hidden-3', 'hidden-4'].map((id, index) => ({
-        ...row(id),
-        ...(index < 3 ? { projectId: 'project-9' } : {}),
+      terminals: ['other-1', 'other-2', 'other-3'].map((id) => ({
+        ...row(id), projectId: 'project-9',
         scrollback: Buffer.from('private output').toString('base64'),
       })),
     } as Frame))
 
-    expect(api.createTerminal).not.toHaveBeenCalled()
-    expect(api.killTerminal).not.toHaveBeenCalled()
-    expect(host.textContent).toMatch(/workspace.*limit/i)
-    expect(host.textContent).toContain('other projects')
-    expect(host.textContent).toContain('unbound')
-    expect(MockTerminal.instances).toHaveLength(0)
-    expect(written).not.toContain('private output')
-    const close = host.querySelector<HTMLButtonElement>('button[aria-label="Close hidden terminal hidden-4"]')
-    expect(close).not.toBeNull()
-    await act(async () => close!.click())
-    expect(api.killTerminal).toHaveBeenCalledWith('ws', 'hidden-4')
-    await act(async () => push({ kind: 'exit', terminalId: 'hidden-4', exitCode: 0, reason: 'killed' }))
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 1_600))
-    })
-    expect(onHide).not.toHaveBeenCalled()
-    // Freeing capacity is an explicit recovery, not permission to auto-open.
-    expect(api.createTerminal).not.toHaveBeenCalled()
-    const plus = host.querySelector<HTMLButtonElement>('button[aria-label="New terminal"]')!
-    expect(plus.disabled).toBe(false)
-    await act(async () => plus.click())
+    // There is no quota: the view still opens its own shell.
     expect(api.createTerminal).toHaveBeenCalledWith('ws', expect.objectContaining({ projectId: 'project-7' }))
+    // Foreign shells stay visible as dimmed tabs, never replayed here.
+    expect(host.querySelectorAll('span[title*="another project"]')).toHaveLength(3)
+    expect(written).not.toContain('private output')
+    expect(MockTerminal.instances).toHaveLength(0)
+
+    // Closing one from its dimmed tab stops that shell.
+    const closeButtons = [...host.querySelectorAll<HTMLButtonElement>('[role="toolbar"] button[aria-label^="Close "]')]
+    await act(async () => closeButtons[1]!.click())
+    expect(api.killTerminal).toHaveBeenCalledWith('ws', 'other-2')
   })
 
-  it('hydrates hidden quota rows from GET without waiting for SSE', async () => {
+  it('hydrates foreign tabs from GET without waiting for SSE', async () => {
     api.listTerminals.mockResolvedValue({
-      terminals: ['hidden-1', 'hidden-2', 'hidden-3', 'hidden-4'].map((id) => ({ ...row(id), projectId: 'project-9' })),
-      shells: [{ id: 'bash', label: 'Git Bash' }], max: 4, available: true,
+      terminals: ['other-1', 'other-2'].map((id) => ({ ...row(id), projectId: 'project-9' })),
+      shells: [{ id: 'bash', label: 'Git Bash' }], available: true,
     })
     await mount({ projectId: 'project-7' })
 
+    // The auto-open waits for the stream's snapshot, not the GET.
     expect(api.createTerminal).not.toHaveBeenCalled()
-    expect(host.querySelector<HTMLButtonElement>('button[aria-label="New terminal"]')?.disabled).toBe(true)
-    expect(host.querySelector('button[aria-label="Close hidden terminal hidden-1"]')).not.toBeNull()
+    expect(host.querySelectorAll('span[title*="another project"]')).toHaveLength(2)
+    expect(host.querySelector<HTMLButtonElement>('button[aria-label="New terminal"]')?.disabled).toBe(false)
     expect(MockTerminal.instances).toHaveLength(0)
   })
 
@@ -572,25 +556,23 @@ describe('terminal panel', () => {
     await act(async () => push({ kind: 'snapshot', terminals: [] }))
     await act(async () => resolve({
       terminals: [{ ...row('stale'), projectId: 'project-9' }],
-      shells: [{ id: 'bash', label: 'Git Bash' }], max: 1, available: true,
+      shells: [{ id: 'bash', label: 'Git Bash' }], available: true,
     }))
-    expect(host.querySelector<HTMLButtonElement>('button[aria-label="New terminal"]')?.title).not.toMatch(/At most/)
-    expect(host.querySelector('button[aria-label="Close hidden terminal stale"]')).toBeNull()
+    // The stream snapshot is the truth: the GET must not resurrect its row.
+    expect(host.querySelectorAll('span[title*="another project"]')).toHaveLength(0)
   })
 
-  it('disables opening another terminal at the cap', async () => {
-    api.listTerminals.mockResolvedValue({
-      terminals: [],
-      shells: [{ id: 'bash', label: 'Git Bash' }],
-      max: 2,
-      available: true,
-    })
+  it('opens past any number of existing terminals', async () => {
     await mount()
-    await act(async () => push({ kind: 'snapshot', terminals: [row('terminal-1'), row('terminal-2')].map((entry) => ({ ...entry, scrollback: '' })) }))
+    await act(async () => push({
+      kind: 'snapshot',
+      terminals: ['terminal-1', 'terminal-2', 'terminal-3', 'terminal-4', 'terminal-5'].map((entry) => ({ ...row(entry), scrollback: '' })),
+    } as Frame))
 
     const plus = host.querySelector<HTMLButtonElement>('button[aria-label="New terminal"]')
-    expect(plus?.disabled).toBe(true)
-    expect(plus?.title).toMatch(/At most 2/)
+    expect(plus?.disabled).toBe(false)
+    await act(async () => plus!.click())
+    expect(api.createTerminal).toHaveBeenCalledTimes(1)
   })
 
   it('reports the exit and drops the tab', async () => {
@@ -604,11 +586,97 @@ describe('terminal panel', () => {
     expect(host.textContent).toContain('No terminal open')
   })
 
+  it('hands the surface to a remaining tab when the active one exits', async () => {
+    await mount()
+    await act(async () => push({ kind: 'snapshot', terminals: [{ ...row('terminal-1'), scrollback: '' }, { ...row('terminal-2'), scrollback: '' }] }))
+    const tabs = [...host.querySelectorAll('button[aria-pressed]')] as HTMLButtonElement[]
+    await act(async () => tabs[1]!.click())
+
+    await act(async () => push({ kind: 'exit', terminalId: 'terminal-2', exitCode: 0, reason: 'exit' }))
+
+    const active = host.querySelector('button[aria-pressed="true"]')
+    expect(active).not.toBeNull()
+    expect(active?.getAttribute('title')).toContain('Git Bash')
+    expect(host.querySelectorAll('button[aria-pressed]')).toHaveLength(1)
+  })
+
+  it('keeps the remembered shell when the stream snapshot beats the listing', async () => {
+    let resolveListing!: (value: unknown) => void
+    api.listTerminals.mockReturnValue(new Promise((resolve) => { resolveListing = resolve }) as never)
+    await mount({ defaultShell: 'powershell' })
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+    expect(api.createTerminal).not.toHaveBeenCalled()
+
+    await act(async () => resolveListing({
+      terminals: [],
+      shells: [{ id: 'bash', label: 'Git Bash' }, { id: 'powershell', label: 'PowerShell' }],
+      available: true,
+    }))
+
+    expect(api.createTerminal).toHaveBeenCalledTimes(1)
+    expect(api.createTerminal.mock.calls[0]?.[1]).toMatchObject({ shellId: 'powershell' })
+  })
+
+  it('does not try to spawn when the snapshot beats a listing that reports no PTY', async () => {
+    let resolveListing!: (value: unknown) => void
+    api.listTerminals.mockReturnValue(new Promise((resolve) => { resolveListing = resolve }) as never)
+    await mount()
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+    await act(async () => resolveListing({ terminals: [], shells: [], available: false, unavailable: 'no pty' }))
+
+    expect(api.createTerminal).not.toHaveBeenCalled()
+    expect(host.textContent).toContain('Terminals are unavailable on this host')
+  })
+
+  it('opens one shell when the footer and the workbench tab mount together on an empty project', async () => {
+    const pushes: Array<(frame: Frame) => void> = []
+    api.subscribeTerminals.mockImplementation((_ws: string, onFrame: (frame: Frame) => void) => {
+      pushes.push(onFrame)
+      return () => {}
+    })
+    await act(async () => {
+      root.render(
+        <>
+          <TerminalPanel workspaceId="ws" projectId="project-1" defaultShell={null} onHide={() => {}} bindingReady />
+          <TerminalPanel workspaceId="ws" projectId="project-1" defaultShell={null} bindingReady />
+        </>,
+      )
+    })
+    await act(async () => { for (const deliver of pushes) deliver({ kind: 'snapshot', terminals: [] }) })
+
+    expect(api.createTerminal).toHaveBeenCalledTimes(1)
+  })
+
+  it('repaints live terminals when the app theme flips', async () => {
+    await mount()
+    await act(async () => push({ kind: 'created', terminal: row('terminal-1') }))
+    const term = MockTerminal.last!
+    document.documentElement.style.setProperty('--bg', '#ffffff')
+    await act(async () => {
+      document.documentElement.dataset['theme'] = 'light'
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect((term.options['theme'] as Record<string, string>)['background']).toBe('#ffffff')
+    document.documentElement.style.removeProperty('--bg')
+    delete document.documentElement.dataset['theme']
+  })
+
+  it('starts a new shell at the size of the shell already on the surface', async () => {
+    await mount()
+    await act(async () => push({ kind: 'created', terminal: row('terminal-1') }))
+    Object.assign(MockTerminal.last!, { cols: 132, rows: 41 })
+    api.createTerminal.mockClear()
+
+    const newButton = host.querySelector('button[aria-label="New terminal"]') as HTMLButtonElement
+    await act(async () => newButton.click())
+
+    expect(api.createTerminal.mock.calls[0]?.[1]).toMatchObject({ cols: 132, rows: 41 })
+  })
+
   it('explains an unavailable host instead of showing a broken terminal', async () => {
     api.listTerminals.mockResolvedValue({
       terminals: [],
       shells: [],
-      max: 4,
       available: false,
       unavailable: 'node-pty is not available (test)',
     })

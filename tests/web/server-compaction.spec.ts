@@ -10,7 +10,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
+import { createWebServer, ProviderError, type LlmProvider, type WebServer } from 'dnt-harness'
 import type { ModelRequest, StreamEvent } from '../../src/harness/llm/types.ts'
 import type { HarnessLimits } from '../../src/harness/limits.ts'
 
@@ -117,6 +117,183 @@ async function completedMessage(base: string, wsId: string, id: string, logPath:
 }
 
 describe('web compaction', () => {
+  it.each(['stop', 'delete', 'shutdown', 'success'] as const)('reserves summary ownership and queues follow-up during %s', async (action) => {
+    let entered!: () => void
+    const started = new Promise<void>((resolve) => { entered = resolve })
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const requests: ModelRequest[] = []
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      stream(request) {
+        requests.push(request)
+        return (async function* (): AsyncIterable<StreamEvent> {
+          if (request.messages.some((m) => typeof m.content === 'string' && m.content.includes(COMPACT_MARK))) {
+            entered()
+            await gate
+          }
+          yield { type: 'delta', delta: SUMMARY_TEXT }
+          yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+        })()
+      },
+    }
+    const { server, home, base, wsId } = await start(provider)
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const route = `${base}/api/workspaces/${wsId}/sessions/${id}`
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    await completedMessage(base, wsId, id, logPath, 'first', 1)
+    const compact = fetch(`${route}/compact`, { method: 'POST' }).catch(() => undefined)
+    await started
+    try {
+      expect((await fetch(`${route}/compact`, { method: 'POST' })).status).toBe(409)
+      const steeredMessage = await fetch(`${route}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'queued', delivery: 'steer' }) })
+      expect(steeredMessage.status).toBe(202)
+      expect(await steeredMessage.json()).toMatchObject({ queued: true, dispatchBlocked: 'maintenance' })
+      const steering = await fetch(`${route}/steer`, { method: 'POST' })
+      expect(await steering.json()).toMatchObject({ steered: false, queued: true, dispatchBlocked: 'maintenance' })
+      expect(requests).toHaveLength(2)
+      if (action === 'stop') await fetch(`${route}/stop`, { method: 'POST' })
+      if (action === 'delete') {
+        const deleting = fetch(route, { method: 'DELETE' })
+        await new Promise((resolve) => setTimeout(resolve, 50))
+        release()
+        expect((await deleting).status).toBe(200)
+      }
+      if (action === 'shutdown') {
+        const closing = server.close()
+        release()
+        await closing
+      }
+    } finally { release() }
+    const response = await compact
+    if (action !== 'shutdown') expect(response?.status).toBe(action === 'success' ? 200 : 409)
+    if (action === 'success') {
+      await until(async () => {
+        const rows = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+        const sessions = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`)).json() as { id: string; status: string }[]
+        return requests.length >= 3 && rows.filter(row => row.type === 'turn/end').length >= 2 && sessions.find(session => session.id === id)?.status === 'idle' ? true : undefined
+      })
+    } else {
+      // Cancellation has settled, so assert canonical evidence of no follow-up execution.
+      const rows = (await fs.readFile(logPath, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+      expect(rows.filter(row => row.type === 'turn/start').length).toBeLessThanOrEqual(1)
+    }
+    expect(requests).toHaveLength(action === 'success' ? 3 : 2)
+    expect((await fs.readdir(checkpointsDir(home, id)).catch(() => [])).length).toBe(action === 'success' ? 1 : 0)
+  })
+
+  it.each(['stop', 'delete', 'shutdown'] as const)('cancels a hanging PreCompact hook tree on %s without running the next hook', async (action) => {
+    const { provider, requests } = summarizingProvider()
+    const { server, home, base, wsId } = await start(provider)
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const route = `${base}/api/workspaces/${wsId}/sessions/${id}`
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    await completedMessage(base, wsId, id, logPath, 'first', 1)
+    const entered = path.join(home, 'hook-entered')
+    const effect = path.join(home, 'second-hook-effect')
+    await fs.writeFile(path.join(home, 'workspaces', wsId, 'hooks.json'), JSON.stringify({ version: 1, hooks: { PreCompact: [
+      { type: 'command', command: process.execPath, args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(entered)}, 'started'); setInterval(() => {}, 1000)`], timeoutMs: 2000, onFailure: 'allow' },
+      { type: 'command', command: process.execPath, args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(effect)}, 'ran')`], onFailure: 'allow' },
+    ] } }))
+    let settled = false
+    const compact = fetch(`${route}/compact`, { method: 'POST' }).then(response => { settled = true; return response }, () => { settled = true; return undefined })
+    await until(async () => await fs.stat(entered).then(() => true, () => undefined))
+    const cancelling = action === 'shutdown' ? server.close() : fetch(action === 'delete' ? route : `${route}/stop`, { method: action === 'delete' ? 'DELETE' : 'POST' })
+    try {
+      await until(async () => settled ? true : undefined, 700)
+    } finally { await cancelling; await compact }
+    expect(await fs.stat(effect).then(() => true, () => false)).toBe(false)
+    expect(requests).toHaveLength(1)
+  })
+
+  it('passes text attachment content and image references, then rebuilds a missing checkpoint cache', async () => {
+    const chunks: string[] = []
+    const { provider, requests } = summarizingProvider({ summarize(request) { chunks.push(conversationChunk(request)); return SUMMARY_TEXT } })
+    const { home, base, wsId } = await start(provider)
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const route = `${base}/api/workspaces/${wsId}/sessions/${id}`
+    const refs = []
+    for (const [name, mediaType, bytes] of [
+      ['requirements.txt', 'text/plain', Buffer.from('ATTACHED REQUIREMENT: retain deployment gate')],
+      ['diagram.png', 'image/png', Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX9sAAAAASUVORK5CYII=', 'base64')],
+    ] as const) {
+      const upload = await fetch(`${base}/api/workspaces/${wsId}/attachments`, { method: 'POST', headers: { 'content-type': mediaType, 'x-file-name': name }, body: new Uint8Array(bytes) })
+      expect(upload.status).toBe(201)
+      refs.push(await upload.json())
+    }
+    await fetch(`${route}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'requirements', attachments: refs }) })
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    await until(async () => {
+      const entries = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`)).json() as { id: string; status: string }[]
+      return entries.find((s) => s.id === id)?.status === 'idle' ? true : undefined
+    })
+    const response = await fetch(`${route}/compact`, { method: 'POST' })
+    expect(response.status).toBe(200)
+    const { coversSeq } = await response.json() as { coversSeq: number }
+    expect(chunks.join('')).toContain('ATTACHED REQUIREMENT: retain deployment gate')
+    expect(chunks.join('')).toContain('diagram.png')
+    await fs.unlink(path.join(checkpointsDir(home, id), `${coversSeq}.json`))
+    await completedMessage(base, wsId, id, logPath, 'continue', 2)
+    expect(requests.at(-1)!.messages.some((m) => typeof m.content === 'string' && m.content.includes(SUMMARY_TEXT))).toBe(true)
+    expect(await fs.readdir(checkpointsDir(home, id))).toContain(`${coversSeq}.json`)
+  })
+
+  it.each(['streamFirstEventMs', 'streamIdleMs', 'logicalRequestMs'] as const)('bounds maintenance by configured %s', async (deadline) => {
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      stream(request) {
+        return (async function* (): AsyncIterable<StreamEvent> {
+          const summary = request.messages.some((m) => typeof m.content === 'string' && m.content.includes(COMPACT_MARK))
+          if (summary) {
+            if (deadline === 'streamIdleMs') yield { type: 'delta', delta: 'partial' }
+            await new Promise((resolve) => setTimeout(resolve, 200))
+          }
+          yield { type: 'delta', delta: SUMMARY_TEXT }
+          yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+        })()
+      },
+    }
+    const { home, base, wsId } = await start(provider, { [deadline]: 30 })
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    await completedMessage(base, wsId, id, logPath, 'first', 1)
+    const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })
+    expect(response.status).toBe(409)
+    expect(await fs.readdir(checkpointsDir(home, id)).catch(() => [])).toEqual([])
+  })
+
+  it('automatic pressure uses fresh pre-trim cost and never reuses it after rejected turns', async () => {
+    const { provider, requests } = summarizingProvider({ replies: ['x'.repeat(1_100_000), 'small reply'] })
+    const { server, home, base, wsId } = await start(provider, { automaticCompactionPressure: 0.85 })
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    await completedMessage(base, wsId, id, logPath, 'first', 1)
+    expect(requests).toHaveLength(1)
+    await completedMessage(base, wsId, id, logPath, 'second', 2)
+    const manifest = await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/manifest`)).json() as { budget: { usedTokens: number; preTrimTokens: number; availableTokens: number } }
+    expect(manifest.budget.usedTokens / manifest.budget.availableTokens).toBeLessThan(0.85)
+    expect(manifest.budget.preTrimTokens / manifest.budget.availableTokens).toBeGreaterThan(0.85)
+    const log = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+    expect(log.filter((e) => e.type === 'compaction/start')).toHaveLength(1)
+    const summaries = requests.filter((r) => r.messages.some((m) => typeof m.content === 'string' && m.content.includes(COMPACT_MARK)))
+    expect(summaries.length).toBeGreaterThan(0)
+    expect(summaries.every((r) => r.tools === undefined || r.tools.length === 0)).toBe(true)
+    server.kernel.ctx.on('agent/pre-step', () => ({ kind: 'reject', reason: 'synthetic rejection' }), true)
+    await completedMessage(base, wsId, id, logPath, 'rejected', 3)
+    expect(requests).toHaveLength(2 + summaries.length)
+    const later = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+    expect(later.filter((e) => e.type === 'compaction/start')).toHaveLength(1)
+  })
+
+  it('explicit zero disables automatic compaction', async () => {
+    const { provider, requests } = summarizingProvider()
+    const { home, base, wsId } = await start(provider, { automaticCompactionPressure: 0 })
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    await completedMessage(base, wsId, id, path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl'), 'first', 1)
+    expect(requests).toHaveLength(1)
+    expect(await fs.readdir(checkpointsDir(home, id)).catch(() => [])).toEqual([])
+  })
+
   it('folds every long-source chunk and continues the same session with latest state and a raw tail', async () => {
     const longReply = 'synthetic historical detail\n'.repeat(9_000)
     const tailReply = `RECENT RAW TAIL\n${LATEST_STATE}`
@@ -309,5 +486,84 @@ describe('web compaction', () => {
     expect(manifest.history.compactedThroughSeq).toBeTypeOf('number')
     // The summary call went through the same provider as the turns.
     expect(requests.length).toBeGreaterThanOrEqual(3)
+  })
+
+  it('a transient summarizer chunk failure retries and still publishes', async () => {
+    let summaryCalls = 0
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      stream(request) {
+        const isSummaryCall = request.messages.some((message) => typeof message.content === 'string' && message.content.includes(COMPACT_MARK))
+        return (async function* (): AsyncIterable<StreamEvent> {
+          if (!isSummaryCall) {
+            yield { type: 'delta', delta: 'turn reply' }
+          } else if (summaryCalls++ === 0) {
+            // First summary attempt dies mid-stream like a gateway blip.
+            yield { type: 'delta', delta: 'part' }
+            throw new ProviderError('gateway reset mid-stream', { transient: true })
+          } else {
+            yield { type: 'delta', delta: SUMMARY_TEXT }
+          }
+          yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+        })()
+      },
+    }
+    const { home, base, wsId } = await start(provider, { stepRetryBaseMs: 1 })
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    await completedMessage(base, wsId, id, logPath, 'first', 1)
+    const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })
+    expect(response.status).toBe(200)
+    expect(summaryCalls).toBe(2)
+    const names = await fs.readdir(checkpointsDir(home, id))
+    expect(names).toHaveLength(1)
+    const checkpoint = JSON.parse(await fs.readFile(path.join(checkpointsDir(home, id), names[0]!), 'utf8')) as { summary: string }
+    expect(checkpoint.summary).toBe(SUMMARY_TEXT)
+  })
+
+  it('re-compacts incrementally: only the delta beyond the prior checkpoint is summarized', async () => {
+    const { provider, requests } = summarizingProvider()
+    const { home, base, wsId } = await start(provider)
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    await completedMessage(base, wsId, id, logPath, 'FIRST EXCHANGE', 1)
+    const first = await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })).json() as { coversSeq: number; summaryChars: number }
+    expect(first.coversSeq).toBeGreaterThan(0)
+    await completedMessage(base, wsId, id, logPath, 'SECOND EXCHANGE', 2)
+    const before = requests.length
+    const second = await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })).json() as { coversSeq: number }
+    expect(second.coversSeq).toBeGreaterThan(first.coversSeq)
+    // Exactly one summarizer call: no re-folding of the covered prefix.
+    const summaryCalls = requests.slice(before).filter((request) => request.messages.some((message) => typeof message.content === 'string' && message.content.includes(COMPACT_MARK)))
+    expect(summaryCalls).toHaveLength(1)
+    // The delta chunk contains only the new exchange, seeded by the prior summary.
+    const chunk = conversationChunk(summaryCalls[0]!)
+    expect(chunk).toContain('SECOND EXCHANGE')
+    expect(chunk).not.toContain('FIRST EXCHANGE')
+    const prompt = summaryCalls[0]!.messages[0]!.content as string
+    expect(prompt).toContain('<earlier-summary>')
+    expect(prompt).toContain('CHECKPOINT SUMMARY TEXT')
+    // The next request consumes the new checkpoint.
+    await completedMessage(base, wsId, id, logPath, 'third', 3)
+    const manifest = await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/manifest`)).json() as ManifestView
+    expect(manifest.history.compactedThroughSeq).toBe(second.coversSeq)
+  })
+
+  it('compacting an unchanged boundary is an idempotent no-op', async () => {
+    const { provider, requests } = summarizingProvider()
+    const { home, base, wsId } = await start(provider)
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    await completedMessage(base, wsId, id, logPath, 'only exchange', 1)
+    const first = await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })).json() as { coversSeq: number; summaryChars: number }
+    const before = requests.length
+    const again = await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })).json() as { coversSeq: number; summaryChars: number }
+    expect(again.coversSeq).toBe(first.coversSeq)
+    expect(again.summaryChars).toBe(first.summaryChars)
+    // No new summarizer call and no appended lifecycle events.
+    expect(requests.length).toBe(before)
+    const log = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { type: string })
+    expect(log.filter((event) => event.type === 'compaction/start')).toHaveLength(1)
+    expect(log.filter((event) => event.type === 'compaction/end')).toHaveLength(1)
   })
 })

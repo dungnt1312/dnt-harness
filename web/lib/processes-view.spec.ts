@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { processRows, subagentRows } from './processes-view.ts'
+import { processRows, subagentRows, reconcileSubagentRows } from './processes-view.ts'
 import type { SseEvent } from './types.ts'
 
 const ev = (type: string, fields: Record<string, unknown>): SseEvent => ({ type, seq: 0, ...fields }) as SseEvent
@@ -54,5 +54,38 @@ describe('subagentRows', () => {
     expect(rows[0]?.brief).toBe('Audit the run')
     expect(rows[0]?.status).toBe('failed')
     expect(rows[0]?.endedAt).toBeUndefined()
+  })
+})
+
+describe('reconcileSubagentRows', () => {
+  const spawn = (childSessionId: string, timestamp = 1_000) =>
+    ev('agent/child-spawn', { childSessionId, definition: 'explorer', timestamp })
+
+  it('settles a row the host registry says ended', () => {
+    const rows = subagentRows([spawn('c1')])
+    const reconciled = reconcileSubagentRows(rows, [
+      { childSessionId: 'c1', status: 'failed', definitionName: 'explorer', startedAt: 1_000, endedAt: 5_000 },
+    ])
+    expect(reconciled).toEqual([{ childSessionId: 'c1', definition: 'explorer', brief: '', running: false, status: 'failed', dispatchedAt: 1_000, endedAt: 5_000 }])
+  })
+
+  it('leaves rows alone while the registry still shows them live', () => {
+    const rows = subagentRows([spawn('c1'), spawn('c2', 2_000)])
+    const live = { childSessionId: 'c1', status: 'running' as const, definitionName: 'explorer', startedAt: 1_000 }
+    expect(reconcileSubagentRows(rows, [live])).toBe(rows)
+    const uncertain = { childSessionId: 'c2', status: 'uncertain' as const, definitionName: 'explorer', startedAt: 2_000 }
+    expect(reconcileSubagentRows(rows, [live, uncertain])).toBe(rows)
+  })
+
+  it('keeps the log row when the registry has no entry for it', () => {
+    const rows = subagentRows([spawn('c1')])
+    expect(reconcileSubagentRows(rows, [])).toBe(rows)
+  })
+
+  it('is a no-op when every row already ended', () => {
+    const rows = subagentRows([spawn('c1'), ev('agent/child-result', { childSessionId: 'c1', status: 'completed', timestamp: 2_000 })])
+    expect(reconcileSubagentRows(rows, [
+      { childSessionId: 'c1', status: 'failed', definitionName: 'explorer', startedAt: 1_000 },
+    ])).toBe(rows)
   })
 })

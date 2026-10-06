@@ -104,6 +104,20 @@ export function killTree(child: ChildProcess, shell: string, treeTag: string): v
   }
 }
 
+/**
+ * The auto-background eligibility exception: a bare `sleep` keeps its
+ * foreground deadline, because the model is explicitly parking the turn.
+ * Leading `VAR=value` assignments still count as sleep; a value with
+ * embedded whitespace defeats the scan and the call auto-backgrounds
+ * like any other command.
+ */
+function isBareSleep(command: string): boolean {
+  const tokens = command.trim().split(/\s+/)
+  let index = 0
+  while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index]!)) index += 1
+  return tokens[index] === 'sleep'
+}
+
 /** The `Bash` tool: one command, captured output, timeout and stop handling. */
 export function bashTool(options: BashToolOptions = {}): ToolDefinition {
   const maxWaitMs = timerBudget(options.maxWaitMs, 600_000)
@@ -173,7 +187,7 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
           return `${formatOutput()}\n[terminated by stop; killed]`
         }
         if (processes.isRunning(sessionId, id)) {
-          if (command.trim().split(/\s+/)[0] !== 'sleep' && commit()) return running()
+          if (!isBareSleep(command) && commit()) return running()
           await processes.kill(sessionId, id)
           return `${formatOutput()}\n[terminated by timeout; killed]`
         }

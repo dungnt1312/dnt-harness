@@ -60,6 +60,7 @@ export interface SessionOptions {
  */
 export class Session {
   private log: SessionEvent[] = []
+  private committedLog: readonly SessionEvent[] = []
   /** Monotonic append completion chain; never detach a captured prefix. */
   private writeTail: Promise<void> = Promise.resolve()
   private durableListener: ((lastSeq: number) => void) | undefined
@@ -86,9 +87,19 @@ export class Session {
     return this.options.now ?? Date.now
   }
 
-  /** The durable log so far, in append order. */
+  /** The live appended log, including records not yet acknowledged as durable. */
   get events(): readonly SessionEvent[] {
     return this.log
+  }
+
+  /** Stable snapshot of the last successfully barriered (or loaded) prefix. */
+  get committedEvents(): readonly SessionEvent[] {
+    return this.committedLog
+  }
+
+  /** Last sequence acknowledged as durable, or zero for an empty prefix. */
+  get committedSeq(): number {
+    return this.committedLog.at(-1)?.seq ?? 0
   }
 
   /** The session id (minted at construction when not supplied). */
@@ -154,6 +165,8 @@ export class Session {
       // prefix. Strict-only sessions have nothing deferred and this is a no-op.
       await this.store?.checkpoint?.(this.id)
       await this.store?.flush(this.id)
+      // Overlapping barriers may settle out of order; never retract a prefix.
+      if (lastSeq > this.committedLog.length) this.committedLog = this.log.slice(0, lastSeq)
       this.durableListener?.(lastSeq)
     } catch (error) {
       this.poisonedError = error
@@ -221,6 +234,7 @@ export class Session {
    */
   adoptHistory(events: readonly SessionEvent[]): void {
     for (const event of events) this.log.push(event)
+    this.committedLog = [...this.log]
   }
 
   /**

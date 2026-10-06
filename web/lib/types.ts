@@ -160,6 +160,10 @@ export interface ContextManifestView {
   }
   readonly sources: {
     readonly instructionsHash?: string
+    /** Where the active mode definition came from — bundled or workspace-authored. */
+    readonly modeSource?: 'bundled' | 'workspace'
+    /** Environment facts carried in the system block (when the host supplied them). */
+    readonly environment?: { readonly date?: string; readonly platform?: string; readonly workspacePath?: string; readonly gitBranch?: string }
     readonly skills: readonly string[]
     /** Discovery rows the request carried; absent when dropped or skills off. */
     readonly skillCatalog?: { readonly names: readonly string[]; readonly hash: string }
@@ -167,14 +171,14 @@ export interface ContextManifestView {
     readonly toolNames: readonly string[]
     readonly toolSchemas: number
     /** Present when the request ran as a child role. */
-    readonly child?: { readonly definition: string; readonly instructionsHash: string }
+    readonly child?: { readonly definition: string; readonly instructionsHash: string; readonly source?: 'bundled' | 'workspace' }
     /** Inherited parent context the request carried (absent when dropped). */
     readonly parentContext?: { readonly hash: string; readonly chars: number }
   }
   readonly omissions: readonly string[]
   /** Fetchable raw blocks of this request; hash keys the body store. */
   readonly sections?: readonly {
-    readonly kind: 'system' | 'compaction' | 'parent-context' | 'skill' | 'skill-catalog' | 'memory'
+    readonly kind: 'system' | 'workspace-instructions' | 'compaction' | 'parent-context' | 'skill' | 'skill-catalog' | 'memory'
     readonly name?: string
     readonly hash: string
     readonly chars: number
@@ -557,7 +561,6 @@ export interface ShellRow {
 export interface TerminalListing {
   readonly terminals: readonly TerminalRow[]
   readonly shells: readonly ShellRow[]
-  readonly max: number
   readonly available: boolean
   /** Why no PTY backend resolved, when `available` is false. */
   readonly unavailable?: string

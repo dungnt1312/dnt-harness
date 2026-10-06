@@ -1,6 +1,7 @@
 /**
  * Opaque cross-boundary ids: branded so a `SessionId` never flows where a
- * `TurnId` is expected, mirroring the upstream `dsh-brand` utility.
+ * `TurnId` is expected, following the branded-id pattern common to harnesses
+ * of this kind.
  */
 declare const brand: unique symbol
 

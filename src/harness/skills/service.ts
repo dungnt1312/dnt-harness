@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
-import { SkillError, defaultSkillRules, validateSkillRules, type SkillLayer, type SkillRule, type SkillSource } from './layers.ts'
+import { SKILL_NAME_PATTERN, SkillError, assertSkillName, assertWritableSkillName, defaultSkillRules, validateSkillRules, validateSkillRulesForWrite, type SkillLayer, type SkillRule, type SkillSource } from './layers.ts'
 
 export { SkillError } from './layers.ts'
 export type { SkillSource } from './layers.ts'
@@ -29,8 +29,12 @@ export interface LoadedSkill extends SkillEntry {
  * file-native, editable by external editors. Loading validates and hashes;
  * an externally edited file loads fresh content with a NEW hash (the hash
  * pins what an execution saw, it never blocks a read). Layers resolve by
- * name in precedence order workspace > user (e.g. `~/.claude/skills`) >
- * bundled; user and bundled skills are read-only.
+ * name, first hit wins. The `*In` methods take explicit layers resolved from
+ * the workspace's source rules (`sources.json`, see layers.ts: project rule
+ * folders, the workspace folder, absolute/user folders, in rule order, with
+ * bundled appended last by the host). The legacy workspace-only methods use
+ * the fixed order workspace > user > bundled. Only the workspace folder is
+ * writable; every other layer is read-only.
  */
 export class SkillsService {
   private readonly home: string
@@ -51,6 +55,11 @@ export class SkillsService {
   /** The workspace layer's folder, for callers that resolve rule layers. */
   workspaceSkillsDir(workspaceId: string): string {
     return this.dir(workspaceId)
+  }
+
+  /** The bundled layer's scan root, when the service was built with one. */
+  bundledLayer(): SkillLayer | undefined {
+    return this.bundledDir !== undefined ? { base: this.bundledDir, source: 'bundled' } : undefined
   }
 
   /** Default layers when no rules apply: workspace > user > bundled. */
@@ -87,7 +96,7 @@ export class SkillsService {
 
   /** Replace the rule list; validated, atomic; returns what was stored. */
   async setSources(workspaceId: string, raw: unknown): Promise<SkillRule[]> {
-    const rules = validateSkillRules(raw)
+    const rules = validateSkillRulesForWrite(raw)
     await this.withMutationLock(workspaceId, 'sources', async () => {
       const file = this.sourcesPath(workspaceId)
       await fs.mkdir(path.dirname(file), { recursive: true })
@@ -101,7 +110,13 @@ export class SkillsService {
     return this.listIn(this.defaultLayers(workspaceId))
   }
 
-  /** Layer-aware catalog scan; the first layer carrying a name wins. */
+  /**
+   * Layer-aware catalog scan; the first layer carrying a name wins. Only
+   * folders whose name is loadable (kebab-case) are listed, so the catalog
+   * never advertises a skill `loadIn` would refuse. Names already claimed by
+   * a higher layer are skipped before any read, and parsed SKILL.md heads are
+   * cached by (mtime, size) — this scan runs on every model request.
+   */
   async listIn(layers: readonly SkillLayer[]): Promise<SkillEntry[]> {
     const rows = new Map<string, SkillEntry>()
     for (const layer of layers) {
@@ -111,25 +126,43 @@ export class SkillsService {
       } catch {
         continue
       }
-      for (const entry of entries) {
-        if (!entry.isDirectory()) continue
-        const raw = await fs.readFile(path.join(layer.base, entry.name, 'SKILL.md'), 'utf8').catch(() => undefined)
-        if (raw === undefined) continue
-        const parsed = parseSkill(raw)
-        if (parsed === undefined) continue // invalid skills are surfaced on load, not served
-        if (!rows.has(entry.name)) {
-          rows.set(entry.name, {
-            name: entry.name,
-            title: parsed.title ?? entry.name,
-            description: parsed.description ?? '',
-            source: layer.source,
-            ...(layer.ruleId !== undefined ? { ruleId: layer.ruleId } : {}),
-            hash: sha256(raw),
-          })
-        }
-      }
+      await Promise.all(entries.map(async (entry) => {
+        if (!entry.isDirectory() && !entry.isSymbolicLink()) return
+        if (!SKILL_NAME_PATTERN.test(entry.name) || rows.has(entry.name)) return
+        const head = await this.readHead(path.join(layer.base, entry.name, 'SKILL.md'))
+        if (head === undefined) return // missing or invalid: surfaced on load, not served
+        rows.set(entry.name, {
+          name: entry.name,
+          title: head.title ?? entry.name,
+          description: head.description ?? '',
+          source: layer.source,
+          ...(layer.ruleId !== undefined ? { ruleId: layer.ruleId } : {}),
+          hash: head.hash,
+        })
+      }))
     }
     return [...rows.values()].sort((a, b) => a.name.localeCompare(b.name))
+  }
+
+  /** Parsed catalog head of one SKILL.md, keyed by path and validated by (mtime, size). */
+  private readonly headCache = new Map<string, { readonly mtimeMs: number; readonly size: number; readonly head: SkillHead | undefined }>()
+
+  private async readHead(file: string): Promise<SkillHead | undefined> {
+    const stat = await fs.stat(file).catch(() => undefined)
+    if (stat === undefined || !stat.isFile()) {
+      this.headCache.delete(file)
+      return undefined
+    }
+    const cached = this.headCache.get(file)
+    if (cached !== undefined && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.head
+    const raw = await fs.readFile(file, 'utf8').catch(() => undefined)
+    const parsed = raw !== undefined ? parseSkill(raw) : undefined
+    const head: SkillHead | undefined = raw !== undefined && parsed !== undefined
+      ? { ...(parsed.title !== undefined ? { title: parsed.title } : {}), ...(parsed.description !== undefined ? { description: parsed.description } : {}), hash: sha256(raw) }
+      : undefined
+    if (this.headCache.size > 2_000) this.headCache.clear()
+    this.headCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, head })
+    return head
   }
 
   /** Load one skill's instructions; validates the file before returning. */
@@ -139,9 +172,7 @@ export class SkillsService {
 
   /** Layer-aware load; the first layer holding the name wins. */
   async loadIn(layers: readonly SkillLayer[], name: string): Promise<LoadedSkill> {
-    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) {
-      throw new SkillError('not-found', `no skill '${name}'`)
-    }
+    assertSkillName(name)
     for (const layer of layers) {
       const raw = await fs.readFile(path.join(layer.base, name, 'SKILL.md'), 'utf8').catch(() => undefined)
       if (raw === undefined) continue
@@ -167,14 +198,21 @@ export class SkillsService {
   // layer is the first layer holding <base>/<name>/SKILL.md — the same
   // first-hit rule the catalog row used, so the tree shows what that row is.
 
-  private async owningSkillDir(layers: readonly SkillLayer[], name: string): Promise<string> {
-    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) throw new SkillError('not-found', `no skill '${name}'`)
+  /** The first layer holding `<base>/<name>/SKILL.md`, or undefined. */
+  async ownerLayer(layers: readonly SkillLayer[], name: string): Promise<SkillLayer | undefined> {
+    assertSkillName(name)
     for (const layer of layers) {
-      const dir = path.join(layer.base, name)
-      const stat = await fs.stat(path.join(dir, 'SKILL.md')).catch(() => undefined)
-      if (stat !== undefined && stat.isFile()) return dir
+      const stat = await fs.stat(path.join(layer.base, name, 'SKILL.md')).catch(() => undefined)
+      if (stat !== undefined && stat.isFile()) return layer
     }
-    throw new SkillError('not-found', `no skill '${name}'`)
+    return undefined
+  }
+
+  /** The owning skill folder, as a REAL path (symlinks resolved once, here). */
+  private async owningSkillDir(layers: readonly SkillLayer[], name: string): Promise<string> {
+    const owner = await this.ownerLayer(layers, name)
+    if (owner === undefined) throw new SkillError('not-found', `no skill '${name}'`)
+    return await fs.realpath(path.join(owner.base, name))
   }
 
   /** Every file inside one skill's folder (recursive, `/`-separated, SKILL.md first). */
@@ -206,8 +244,13 @@ export class SkillsService {
       throw new SkillError('invalid', 'file path escapes the skill folder')
     }
     const target = path.resolve(dir, normalized)
-    if (!target.startsWith(path.resolve(dir) + path.sep)) throw new SkillError('invalid', 'file path escapes the skill folder')
-    const raw = await fs.readFile(target, 'utf8').catch(() => undefined)
+    if (!target.startsWith(dir + path.sep)) throw new SkillError('invalid', 'file path escapes the skill folder')
+    // Lexical containment is not enough: a symlink inside the folder (or a
+    // symlinked subfolder) can point anywhere. Re-check on the real path.
+    const real = await fs.realpath(target).catch(() => undefined)
+    if (real === undefined) throw new SkillError('not-found', `no file '${normalized}' in skill '${name}'`)
+    if (!real.startsWith(dir + path.sep)) throw new SkillError('invalid', 'file path escapes the skill folder')
+    const raw = await fs.readFile(real, 'utf8').catch(() => undefined)
     if (raw === undefined) throw new SkillError('not-found', `no file '${normalized}' in skill '${name}'`)
     if (raw.length > 512 * 1024) throw new SkillError('invalid', 'file too large to preview (over 512 KB)')
     if (raw.includes('\0')) throw new SkillError('invalid', 'binary file — preview is text-only')
@@ -220,9 +263,7 @@ export class SkillsService {
    * of clobbering external edits.
    */
   async save(workspaceId: string, name: string, raw: string, expectedHash?: string): Promise<LoadedSkill> {
-    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) {
-      throw new SkillError('invalid', `skill name '${name}' must be kebab-case`)
-    }
+    assertWritableSkillName(name)
     const parsed = parseSkill(raw)
     if (parsed === undefined) throw new SkillError('invalid', 'SKILL.md needs `name:`/`description:` frontmatter and a body')
     const file = path.join(this.dir(workspaceId), name, 'SKILL.md')
@@ -244,7 +285,13 @@ export class SkillsService {
     }
   }
 
+  /**
+   * Remove one workspace skill folder. The name is validated first: it is
+   * joined onto the workspace folder and removed recursively, so a `..` or a
+   * separator smuggled through a URL decode would otherwise delete app data.
+   */
   async delete(workspaceId: string, name: string): Promise<void> {
+    assertSkillName(name, 'invalid')
     await fs.rm(path.join(this.dir(workspaceId), name), { recursive: true, force: true })
   }
 
@@ -296,9 +343,7 @@ export class SkillsService {
    * an absent skill is harmless.
    */
   async setHidden(workspaceId: string, name: string, hidden: boolean): Promise<void> {
-    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) {
-      throw new SkillError('not-found', `no skill '${name}'`)
-    }
+    assertSkillName(name)
     await this.withMutationLock(workspaceId, '.hidden', async () => {
       const current = new Set(await this.hiddenNames(workspaceId))
       if (hidden) current.add(name)
@@ -322,6 +367,13 @@ export class SkillsService {
       if (this.mutationTails.get(key) === tail) this.mutationTails.delete(key)
     }))
   }
+}
+
+/** The catalog-relevant part of a parsed SKILL.md (no body). */
+interface SkillHead {
+  readonly title?: string
+  readonly description?: string
+  readonly hash: string
 }
 
 export interface ParsedSkill {

@@ -87,6 +87,61 @@ async function snapshotTypes(base: string, wsId: string, sessionId: string): Pro
   return []
 }
 
+it('HTTP memory supports encoded nested ids, underscore files and exact pointer title updates', async () => {
+  const server = await start([])
+  const base = server.url
+  const ws = await (await post(base, '/api/workspaces', { name: 'Nested memory' })).json() as { id: string }
+  const endpoint = `/api/workspaces/${ws.id}/memory`
+  for (const id of ['topics/deploy', 'deployment_notes']) {
+    const created = await post(base, endpoint, { id, title: 'Original', body: 'topic body' })
+    expect(created.status).toBe(201)
+    const entry = await created.json() as { hash: string }
+    const url = `${base}${endpoint}/${encodeURIComponent(id)}`
+    expect((await fetch(url)).status).toBe(200)
+    const updated = await fetch(url, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Renamed', expectedHash: entry.hash }) })
+    expect(updated.status).toBe(200)
+    const index = path.join(serverHomes.get(server)!, 'workspaces', ws.id, 'memory', 'workspace', 'MEMORY.md')
+    expect(await fs.readFile(index, 'utf8')).toContain(`- [Renamed](${id}.md)`)
+    expect((await (await fetch(`${base}${endpoint}`)).json() as { id: string }[]).map((row) => row.id)).toContain(id)
+    expect((await fetch(url, { method: 'DELETE' })).status).toBe(200)
+    expect((await fetch(url)).status).toBe(404)
+  }
+  for (const id of ['../escape', 'secrets/note', 'MEMORY']) {
+    expect((await post(base, endpoint, { id, title: 'No', body: 'No' })).status).toBe(400)
+    expect((await fetch(`${base}${endpoint}/${encodeURIComponent(id)}`)).status).toBe(400)
+    expect((await fetch(`${base}${endpoint}/${encodeURIComponent(id)}`, { method: 'DELETE' })).status).toBe(400)
+  }
+})
+
+it('HTTP memory rejects oversized components with 400 and no partial topic parents', async () => {
+  const server = await start([])
+  const ws = await (await post(server.url, '/api/workspaces', { name: 'Length validation' })).json() as { id: string }
+  const endpoint = `/api/workspaces/${ws.id}/memory`
+  const memoryRoot = path.join(serverHomes.get(server)!, 'workspaces', ws.id, 'memory', 'workspace')
+  const before = await fs.readdir(memoryRoot).catch(() => [])
+  for (const id of [`partial/${'a'.repeat(253)}`, `partial/${'a'.repeat(255)}`, `partial/${'a'.repeat(256)}/note`]) {
+    expect((await post(server.url, endpoint, { id, title: 'No', body: 'No' })).status).toBe(400)
+    const url = `${server.url}${endpoint}/${encodeURIComponent(id)}`
+    expect((await fetch(url)).status).toBe(400)
+    expect((await fetch(url, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'No', expectedHash: '' }) })).status).toBe(400)
+    expect((await fetch(url, { method: 'DELETE' })).status).toBe(400)
+    expect(await fs.readdir(memoryRoot).catch(() => [])).toEqual(before)
+  }
+})
+
+it('HTTP memory retitles CRLF auto pointers and preserves authored index bytes', async () => {
+  const server = await start([])
+  const ws = await (await post(server.url, '/api/workspaces', { name: 'CRLF pointers' })).json() as { id: string }
+  const endpoint = `/api/workspaces/${ws.id}/memory`
+  const entry = await (await post(server.url, endpoint, { id: 'note', title: 'Original', body: 'Body' })).json() as { hash: string }
+  const index = path.join(serverHomes.get(server)!, 'workspaces', ws.id, 'memory', 'workspace', 'MEMORY.md')
+  const before = '# Keep  \r\n- [Original](note.md)\r\n- [Custom](note.md)\r\nNo final newline'
+  await fs.writeFile(index, before)
+  const updated = await fetch(`${server.url}${endpoint}/note`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Renamed', expectedHash: entry.hash }) })
+  expect(updated.status).toBe(200)
+  expect(await fs.readFile(index, 'utf8')).toBe(before.replace('- [Original](note.md)', '- [Renamed](note.md)'))
+})
+
 describe('live mode control', () => {
   it('Chat sends no tool schemas and executes no tools', async () => {
     const requests: { tools?: { name: string }[] }[] = []
@@ -963,6 +1018,56 @@ async function waitForToolCall(base: string, wsId: string, sessionId: string): P
   throw new Error('no tool/call observed')
 }
 
+describe('memory file tools through the server', () => {
+  it('executes scoped Read/Write/Edit/Glob/Grep and refuses non-Markdown and foreign roots', async () => {
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-memory-server-'))
+    const projectDir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-memory-project-'))
+    let calls = 0
+    let memoryRoot = ''
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() {
+        if (calls++ === 0) {
+          yield { type: 'toolCalls', calls: [
+            { id: 'write', name: 'Write', args: { path: path.join(memoryRoot, 'note.md'), content: 'memory needle' } },
+            { id: 'read', name: 'Read', args: { path: path.join(memoryRoot, 'note.md') } },
+            { id: 'glob', name: 'Glob', args: { path: memoryRoot, pattern: '*.md' } },
+            { id: 'grep', name: 'Grep', args: { path: memoryRoot, pattern: 'needle' } },
+            { id: 'edit', name: 'Edit', args: { path: path.join(memoryRoot, 'note.md'), old: 'needle', new: 'updated' } },
+            { id: 'denied', name: 'Write', args: { path: path.join(memoryRoot, 'bad.txt'), content: 'bad' } },
+            { id: 'foreign', name: 'Read', args: { path: path.join(home, 'workspaces', 'foreign', 'memory', 'workspace', 'note.md') } },
+          ] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+          return
+        }
+        yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const server = await createWebServer({ home, providers: [provider], configFile: path.join(home, 'p.json'), yolo: true })
+    try {
+      const base = server.url
+      const ws = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
+      const project = await (await post(base, `/api/workspaces/${ws}/projects`, { name: 'P', path: projectDir })).json() as { id: string }
+      memoryRoot = path.join(home, 'workspaces', ws, 'memory', 'workspace')
+      const session = await (await post(base, `/api/workspaces/${ws}/sessions`, { projectId: project.id })).json() as { id: string }
+      await post(base, `/api/workspaces/${ws}/sessions/${session.id}/messages`, { content: 'memory' })
+      await expect.poll(async () => (await readAllEvents(base, ws, session.id)).filter((event) => event.type === 'tool/result').length, { timeout: 10_000 }).toBe(7)
+      const results = (await readAllEvents(base, ws, session.id)).filter((event) => event.type === 'tool/result') as unknown as { callId: string; ok: boolean; output: string }[]
+      for (const id of ['write', 'read', 'glob', 'grep', 'edit']) expect(results.find((result) => result.callId === id)?.ok, id).toBe(true)
+      expect(results.find((result) => result.callId === 'glob')?.output).toContain('note.md')
+      expect(results.find((result) => result.callId === 'grep')?.output).toContain('memory needle')
+      expect(results.find((result) => result.callId === 'denied')?.ok).toBe(false)
+      expect(results.find((result) => result.callId === 'foreign')?.ok).toBe(false)
+      expect(await fs.readFile(path.join(memoryRoot, 'note.md'), 'utf8')).toBe('memory updated')
+    } finally {
+      await server.close()
+      await fs.rm(home, { recursive: true, force: true })
+      await fs.rm(projectDir, { recursive: true, force: true })
+    }
+  }, 20_000)
+})
+
 describe('context manifest records', () => {
   it('each request records a durable context/manifest between step/start and its answer', async () => {
     let calls = 0
@@ -1026,22 +1131,22 @@ describe('context manifest records', () => {
     expect(raw).toContain('context/body')
 
     // Raw section bodies live in the canonical JSONL, deduped by content
-    // hash: both steps carried the identical system text, so exactly one
-    // record exists. The SSE replay profile drops them (a client fetches by
+    // hash. The system block is stable across steps; other reference sections
+    // (including memory) may add distinct bodies. SSE replay drops them (a client fetches by
     // hash on demand), so they are asserted against the raw log instead.
     const logRecords = raw.trim().split('\n').map((line) => JSON.parse(line) as { type: string; [key: string]: unknown })
     const bodies = logRecords.filter((event) => event.type === 'context/body') as { hash?: string; kind?: string; body?: string; chars?: number }[]
-    expect(bodies).toHaveLength(1)
+    const systemBody = bodies.find((body) => body.kind === 'system' && body.body?.includes('You are dnt-harness'))
+    expect(systemBody).toBeDefined()
+    expect(new Set(bodies.map((body) => body.hash)).size).toBe(bodies.length)
     expect(events.filter((event) => event.type === 'context/body')).toHaveLength(0)
-    expect(bodies[0]?.kind).toBe('system')
-    expect(bodies[0]?.body).toContain('You are dnt-harness')
-    expect(bodies[0]?.chars).toBe(bodies[0]?.body?.length)
-    expect(createHash('sha256').update(bodies[0]?.body ?? '', 'utf8').digest('hex')).toBe(bodies[0]?.hash)
+    expect(systemBody?.chars).toBe(systemBody?.body?.length)
+    expect(createHash('sha256').update(systemBody?.body ?? '', 'utf8').digest('hex')).toBe(systemBody?.hash)
     const manifestSections = (events[manifestAt[0]!] as unknown as { manifest: { sections: { kind: string; hash: string; chars: number }[] } }).manifest.sections
-    expect(manifestSections.map((section) => section.hash)).toContain(bodies[0]?.hash)
+    expect(manifestSections.map((section) => section.hash)).toContain(systemBody?.hash)
 
     // The raw block fetches back by hash; unknown hashes fail honestly.
-    const bodyResponse = await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/context/${bodies[0]?.hash}`)
+    const bodyResponse = await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/context/${systemBody?.hash}`)
     expect(bodyResponse.status).toBe(200)
     const bodyPayload = await bodyResponse.json() as { kind?: string; body?: string }
     expect(bodyPayload.kind).toBe('system')

@@ -78,9 +78,10 @@ it('expanding loads the git overlay and marks counted rows', async () => {
   expect(rows[0]?.textContent).toContain('a.ts')
   expect(rows[0]?.textContent).toContain('+7')
   expect(rows[0]?.textContent).toContain('−2')
-  // notes.md is inside the project root but git does not list it: the note
-  // says the counts do not cover every row rather than implying a clean file.
-  expect(view.textContent).toContain('shared across turns')
+  // notes.md is inside the project root but git does not list it: the row
+  // carries no git line counts rather than implying a clean file.
+  expect(rows[1]?.textContent).toContain('notes.md')
+  expect(rows[1]?.textContent).not.toMatch(/[+−]/)
 })
 
 it('a write whose result never landed reads as unconfirmed, not clean', async () => {

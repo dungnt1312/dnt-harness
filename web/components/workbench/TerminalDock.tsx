@@ -47,9 +47,9 @@ export function TerminalDock({ workspaceId, projectId, height, resizeHandle, ope
       <div
         {...resizeHandle}
         aria-label="Resize terminal"
-        className="group relative h-px shrink-0 cursor-row-resize bg-line outline-none focus-visible:bg-link"
+        className="group relative h-3 shrink-0 cursor-row-resize outline-none hover:bg-line/60"
       >
-        <span aria-hidden="true" className="absolute inset-x-0 -top-1.5 -bottom-1.5 group-hover:bg-line/60" />
+        <span aria-hidden="true" className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-line group-focus-visible:bg-link" />
       </div>
       <div className="flex min-h-0 flex-col overflow-hidden bg-bg" style={{ height }}>
         {body}

@@ -1608,9 +1608,9 @@ function AppShell() {
             <div
               {...sidebarResize}
               aria-label="Resize sidebar"
-              className="group relative w-px shrink-0 cursor-col-resize bg-line outline-none focus-visible:bg-link dark:bg-transparent dark:focus-visible:bg-link"
+              className="group relative w-3 shrink-0 cursor-col-resize outline-none hover:bg-line/60"
             >
-              <span aria-hidden="true" className="absolute inset-y-0 -left-1.5 -right-1.5 group-hover:bg-line/60" />
+              <span aria-hidden="true" className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-line group-focus-visible:bg-link dark:bg-transparent dark:group-focus-visible:bg-link" />
             </div>
           </>
         ) : null}
@@ -1721,9 +1721,9 @@ function AppShell() {
               <div
                 {...workbenchResize}
                 aria-label="Resize workbench"
-                className="group relative w-px shrink-0 cursor-col-resize bg-line outline-none focus-visible:bg-link"
+                className="group relative w-3 shrink-0 cursor-col-resize outline-none hover:bg-line/60"
               >
-                <span aria-hidden="true" className="absolute inset-y-0 -left-1.5 -right-1.5 group-hover:bg-line/60" />
+                <span aria-hidden="true" className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-line group-focus-visible:bg-link" />
               </div>
             ) : null}
             <aside className="h-full min-w-0 shrink-0" style={workbenchExpanded ? { flex: '1 1 0%' } : { width: preferences.rightWidth, maxWidth: '60vw' }}>

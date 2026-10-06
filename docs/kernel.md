@@ -1,9 +1,9 @@
 # The mini-Cordis kernel
 
-The kernel is a self-contained plugin runtime that reimplements the Cordis ideas
-in the DeepSeek Harness: everything is a plugin, typed events with five dispatch
-modes, reversible effects, and dependency-driven lifecycle. This document walks
-each file in `src/kernel/`.
+The kernel is a self-contained plugin runtime inspired by the Cordis ideas —
+everything is a plugin, typed events with five dispatch modes, reversible
+effects, and dependency-driven lifecycle — reimplemented from scratch without
+importing any of its code. This document walks each file in `src/kernel/`.
 
 ## Module map
 
@@ -52,8 +52,8 @@ innermost `next`. Each listener wraps the rest of the chain:
   none, or with replacement arguments when called with some;
 - returning *without* calling `next()` vetoes the rest of the chain.
 
-A waterfall listener that only observes must call `next()` — the same standing
-rule as the upstream repository.
+A waterfall listener that only observes must call `next()` — a standing rule
+this kernel keeps by design.
 
 ### Typing
 
@@ -69,7 +69,7 @@ declare module 'dnt-harness' {
 ```
 
 Every method also carries an untyped string-key overload for code that
-dispatches dynamically (loaders, bridges), mirroring Cordis.
+dispatches dynamically (loaders, bridges).
 
 ### Ownership and disposal
 
@@ -230,7 +230,7 @@ disposes the root fiber. Safe to call once per kernel.
 
 ## Loader (`loader.ts`)
 
-A composition file (Cordis-style) turns into a plugin tree:
+A composition file (in the Cordis YAML style) turns into a plugin tree:
 
 ```yaml
 - name: './hello.ts'
@@ -263,9 +263,8 @@ export function apply(ctx: Context): void {
 
 ## Reading further
 
-- The tutorial chapters this kernel reproduces live in the DeepSeek Harness
-  repo (`docs/cordis-tutorial/`): chapter 2 = events + effects
-  (`dispatch-modes.spec.ts`, `effects.spec.ts`, `events.spec.ts`), chapter 3 =
-  services (`services.spec.ts`), chapter 4 = composition loader
-  (`loader.spec.ts`).
+- The kernel's own test suite covers the mechanics end to end in
+  `tests/kernel/`: dispatch modes, effects and disposal, the service store,
+  and the composition loader (`dispatch-modes.spec.ts`, `effects.spec.ts`,
+  `events.spec.ts`, `services.spec.ts`, `loader.spec.ts`).
 - Public exports: `src/kernel/index.ts`.

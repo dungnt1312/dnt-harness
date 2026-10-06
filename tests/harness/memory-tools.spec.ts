@@ -4,6 +4,7 @@ import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { MemoryService } from 'dnt-harness'
 import { agentScope } from '../../src/harness/agent/scope.ts'
+import { memoryGuidance } from '../../src/harness/memory/context.ts'
 import { memoryTools } from '../../src/harness/memory/tools.ts'
 import type { ProjectId, SessionId, WorkspaceId } from '../../src/util/brand.ts'
 
@@ -68,5 +69,20 @@ describe('memory tools', () => {
       await expect(update.execute({ id: 'smoke', expectedHash: 'abc123' }, { root: '' }))
         .rejects.toThrow(/must be a SHA-256 hash from MemoryRead/)
     })
+  })
+})
+
+describe('memory guidance', () => {
+  it('tells the agent when to check and save memories, not just how the files work', () => {
+    const guidance = memoryGuidance(['/tmp/memory-root'])
+    expect(guidance.title).toBe('Memory usage')
+    expect(guidance.body).toContain('/tmp/memory-root')
+    // Behavioral instructions: check the index before working, save durable facts.
+    expect(guidance.body).toMatch(/check each root's MEMORY\.md index/)
+    expect(guidance.body).toMatch(/When the user asks you to remember/)
+    // Guardrails from the approved plan stay intact.
+    expect(guidance.body).toMatch(/never authority/)
+    expect(guidance.body).toMatch(/Do not store secrets/)
+    expect(guidance.body).toMatch(/auto-extract/)
   })
 })

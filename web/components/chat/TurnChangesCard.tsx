@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
 import Icon from '../common/Icon.tsx'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
+import { LineCount } from '../common/DiffLines.tsx'
+import { IconButton } from '../ui/IconButton.tsx'
 import { cn } from '../../lib/cn.ts'
 import type { GitStatusReport } from '../../lib/api.ts'
 import { fetchGitStatus } from '../../lib/api.ts'
-import { overlayTotals, overlayTurnChanges, type TurnChangeOverlay } from '../../lib/turn-git.ts'
+import { overlayTurnChanges, type TurnChangeOverlay } from '../../lib/turn-git.ts'
 import type { TurnChanges } from '../../lib/turn-changes.ts'
 import type { OpenPathResolver } from '../../lib/project-paths.ts'
 import { toProjectRelative } from '../../lib/project-paths.ts'
@@ -23,11 +25,6 @@ const STATUS_MARK: Readonly<Record<'modified' | 'created', string>> = {
 }
 
 const markColor = (status: 'modified' | 'created'): string => (status === 'created' ? 'text-ok' : 'text-warn')
-
-/** Letters for the git statuses a row may carry beside its own mark. */
-const GIT_MARK: Readonly<Record<string, string>> = {
-  modified: 'M', added: 'A', deleted: 'D', renamed: 'R', copied: 'C', untracked: 'U', conflict: '!',
-}
 
 function turnChangesLabel(count: number): string {
   return `${count} ${count === 1 ? 'file' : 'files'} changed`
@@ -68,16 +65,11 @@ export function TurnChangesCard({ turnId, changes, project, workspaceId, onOpenP
     () => (open ? overlayTurnChanges(changes, project?.path ?? '', report) : []),
     [open, changes, project?.path, report],
   )
-  const totals = overlayTotals(rows)
   const outsideCount = rows.filter((row) => row.outside === true).length
   const logTotals = changes.files.reduce((sum, file) => ({
     added: sum.added + (file.lines?.added ?? 0),
     removed: sum.removed + (file.lines?.removed ?? 0),
   }), { added: 0, removed: 0 })
-  // A missing git view (no project, no repository) or uncounted rows means
-  // the numbers may not cover the list, so the note says where the whole
-  // picture lives instead of claiming completeness.
-  const noteNeeded = open && (project === null || report === null || report.changes.length === 0 || totals.counted < rows.length)
 
   return (
     <div className="-ml-2 mt-0.5">
@@ -89,7 +81,7 @@ export function TurnChangesCard({ turnId, changes, project, workspaceId, onOpenP
           className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 py-0.5 text-left text-fg-muted transition-colors hover:bg-hover hover:text-fg"
         >
           <Icon name="chevronRight" size={12} className={cn('shrink-0 text-fg-faint transition-transform', open && 'rotate-90')} />
-          <Icon name="squarePen" size={14} className="shrink-0 text-fg-faint" />
+          <Icon name="gitBranch" size={14} className="shrink-0 text-fg-faint" />
           <span className="shrink-0 font-medium">{turnChangesLabel(changes.files.length)}</span>
           {logTotals.added > 0 ? <span className="shrink-0 font-mono text-xs text-ok">+{logTotals.added}</span> : null}
           {logTotals.removed > 0 ? <span className="shrink-0 font-mono text-xs text-bad">−{logTotals.removed}</span> : null}
@@ -138,11 +130,6 @@ export function TurnChangesCard({ turnId, changes, project, workspaceId, onOpenP
               {outsideCount === 1 ? 'One file sits' : `${outsideCount} files sit`} outside the project folder — git does not count {outsideCount === 1 ? 'it' : 'them'} here.
             </p>
           ) : null}
-          {noteNeeded ? (
-            <p className="m-0 px-1 pb-1 pt-0.5 text-[12px] text-fg-faint" role="note">
-              Counts come from git over the project folder's current changes, shared across turns — shell edits and child writes are not attributed here. Git view has the full picture.
-            </p>
-          ) : null}
         </div>
       ) : null}
     </div>
@@ -166,8 +153,6 @@ function ChangeFileRow({ row, project, onReviewFile, onOpenPath }: {
   const open = onOpenPath?.(row.path) ?? null
   const name = row.path.split(/[\\/]/).pop() ?? row.path
   const directory = row.path.slice(0, row.path.length - name.length).replace(/[\\/]+$/, '')
-  const gitMark = row.git !== undefined ? GIT_MARK[row.git.status] : undefined
-  const gitLabel = row.git !== undefined ? `git: ${row.git.status}` : undefined
   const relative = project !== undefined ? toProjectRelative(project.path, row.path) : null
   // The Git view focuses project-relative paths; an unresolvable path leaves
   // the row informational.
@@ -188,9 +173,9 @@ function ChangeFileRow({ row, project, onReviewFile, onOpenPath }: {
         <span className={cn(row.status === 'created' && 'font-medium')}>{name}</span>
         {directory !== '' ? <span className="ml-1.5 text-fg-faint">{directory}</span> : null}
       </span>
-      {gitMark !== undefined ? <span className="shrink-0 font-mono text-[11px] text-fg-faint" title={gitLabel}>{gitMark}</span> : null}
-      {row.git?.added !== undefined && row.git.added > 0 ? <span className="shrink-0 font-mono text-xs text-ok">+{row.git.added}</span> : null}
-      {row.git?.removed !== undefined && row.git.removed > 0 ? <span className="shrink-0 font-mono text-xs text-bad">−{row.git.removed}</span> : null}
+      {row.git !== undefined
+        ? <LineCount {...(row.git.added !== undefined ? { added: row.git.added } : {})} {...(row.git.removed !== undefined ? { removed: row.git.removed } : {})} />
+        : null}
       {row.outside === true ? <span className="shrink-0 text-[11px] text-fg-faint">outside project</span> : null}
     </>
   )
@@ -202,25 +187,19 @@ function ChangeFileRow({ row, project, onReviewFile, onOpenPath }: {
             type="button"
             title={`${row.path} — show the diff in the Git view`}
             onClick={review}
-            className="flex min-h-7 min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px] transition-colors hover:bg-hover"
+            className="flex min-h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px] transition-colors hover:bg-hover"
           >
             {body}
           </button>
         ) : (
-          <div title={row.path} className="flex min-h-7 min-w-0 flex-1 items-center gap-1.5 px-1.5 text-[13px]">
+          <div title={row.path} className="flex min-h-8 min-w-0 flex-1 items-center gap-1.5 px-1.5 text-[13px]">
             {body}
           </div>
         )}
         {open !== null ? (
-          <button
-            type="button"
-            aria-label={`Open ${name} in workbench`}
-            title={`Open ${name} in workbench`}
-            onClick={open}
-            className="mr-0.5 flex size-6 shrink-0 items-center justify-center rounded text-fg-faint transition-colors hover:bg-hover hover:text-fg"
-          >
+          <IconButton label={`Open ${name} in workbench`} onClick={open} className="mr-0.5">
             <Icon name="fileText" size={13} />
-          </button>
+          </IconButton>
         ) : null}
       </div>
     </li>

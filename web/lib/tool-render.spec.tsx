@@ -88,6 +88,17 @@ describe('digest per tool', () => {
     expect(facts('MemoryRead', { id: 'x-y' }, '# The title\nbody\n\n[sha256 abc]').digest).toBe('The title')
     expect(facts('MemoryCreate', { id: 'x-y' }, "created memory 'x-y' (sha256 abc)").target).toBe('x-y')
   })
+  it('leads a Skill load with the skill name, and reads its receipt as the digest', () => {
+    const load = facts('Skill', { action: 'load', name: 'systematic-debugging' }, "skill 'systematic-debugging' loaded (hash 808fc5717aa8); its instructions are included in context")
+    expect(load.target).toBe('systematic-debugging')
+    expect(load.fullTarget).toBe('load systematic-debugging')
+    expect(load.digest).toBe('loaded')
+    expect(facts('Skill', { action: 'load', name: 'nope' }, "skill 'nope' not found; use Skill action:\"catalog\"").digest).toBe('not found')
+    const catalog = facts('Skill', { action: 'catalog', query: 'rev' }, 'review [project] Review a diff\nreplay [user] Replay a run\n… 3 more; refine query or raise limit')
+    expect(catalog.target).toBe('catalog rev')
+    expect(catalog.digest).toBe('2 skills')
+    expect(facts('Skill', { action: 'catalog' }, 'no skills available').digest).toBe('no matches')
+  })
   it('keeps a refusal quiet: it shows its reason but is not a failure digest', () => {
     const denied = facts('Bash', { command: 'rm -rf build' }, 'denied: blocked by the dangerous-command guard', false)
     expect(isDenied({ ok: false, output: 'denied: nope' })).toBe(true)
@@ -199,6 +210,11 @@ describe('a tool row is a line of text', () => {
       await rerender(<ToolCard item={item} />)
       expect(words()).toMatch(/^Edit(?!ed)/)
     }
+  })
+  it('shows a Skill load as the skill name, not the action', async () => {
+    await mount(<ToolCard item={row('c', 'Skill', { action: 'load', name: 'systematic-debugging' }, { ok: true, output: "skill 'systematic-debugging' loaded (hash 808fc5717aa8); its instructions are included in context" })} />)
+    expect(words()).toMatch(/systematic-debugging/)
+    expect(words()).not.toMatch(/load/)
   })
   it('ends with a status word only when the outcome is worth a look, its reason on hover', async () => {
     await mount(<ToolCard item={row('c', 'Read', { path: 'docs/missing.md' }, { ok: false, output: 'no such file: docs/missing.md' })} />)
@@ -387,13 +403,13 @@ describe('a run reads as one line of work', () => {
     expect(header().textContent).toContain('1 not run')
     expect(header().textContent).not.toContain('failed')
   })
-  it('drops the icons of the rows inside: the rail already names them', async () => {
+  it('keeps the row icons inside: every row reads on its own, rail or not', async () => {
     await mount(block([grep('a'), grep('b'), bash('c', '1 failing\n[exit code: 1]'), grep('d')]))
     const body = document.getElementById(header().getAttribute('aria-controls')!)!
     expect(body.className).toContain('border-l')
     const rows = [...body.querySelectorAll('button[aria-expanded]')]
     expect(rows.length).toBe(4)
-    for (const line of rows) expect(line.firstElementChild?.tagName.toLowerCase()).toBe('span')
+    for (const line of rows) expect(line.firstElementChild?.tagName.toLowerCase()).toBe('svg')
   })
 })
 
