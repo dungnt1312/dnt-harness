@@ -62,8 +62,9 @@ interface PluginEntry {
    * Every generation fiber this logical entry created, current one last.
    * Teardown disposes them all — current generation last — so a replacement
    * never orphans an older generation still holding effects. Retired
-   * generations are pruned: their disposal promises stay reachable through
-   * {@link Kernel.handles}, keyed by the fiber handle itself.
+   * generations STAY in the set so a stale handle keeps resolving to this
+   * entry; their disposal promises stay cached in {@link Kernel.closings},
+   * keyed by the fiber handle itself.
    */
   readonly generations: Set<Fiber>
   /**
@@ -474,13 +475,19 @@ export class Kernel {
     }
 
     entry.fiber.state = 'loading'
+    // The generation this startup runs. Its settlement handlers are bound to
+    // THIS fiber, not to the entry: a coordinated restart may swap
+    // `entry.fiber` while the body is still in flight, and a superseded
+    // generation's late resolution or rejection must never act on the
+    // replacement generation.
+    const fiber = entry.fiber
     let result: void | Promise<void>
     try {
       result = entry.definition.apply(entry.ctx)
     } catch (error) {
       // The unwind and the report are owned even when the caller also gets
       // the synchronous throw.
-      this.track(this.failStartup(entry, error))
+      this.track(this.failStartup(entry, error, fiber))
       if (direct) throw error
       return
     }
@@ -492,12 +499,12 @@ export class Kernel {
       // rejection itself lands.
       this.track(
         result.then(
-          () => this.activated(entry),
-          (error: unknown) => this.failStartup(entry, error),
+          () => this.activated(entry, fiber),
+          (error: unknown) => this.failStartup(entry, error, fiber),
         ),
       )
     } else {
-      this.activated(entry)
+      this.activated(entry, fiber)
     }
   }
 
@@ -508,17 +515,23 @@ export class Kernel {
    * (original first) in the published payload — never replacing it — and end
    * the fiber `failed`; a clean unwind ends it `disposed`.
    */
-  private async failStartup(entry: PluginEntry, error: unknown): Promise<void> {
+  private async failStartup(entry: PluginEntry, error: unknown, fiber: Fiber): Promise<void> {
     let cleanupError: unknown
     try {
-      // Once-only teardown, kernel-internal: on a live fiber this unwinds the
-      // acquired effects; on an already-unloaded one it re-observes the cached
-      // completion and cleans nothing twice. A startup failure retires the
-      // entry anyway; it must not route through the public dispose override.
-      await this.disposeGeneration(entry.fiber)
+      // Once-only teardown, kernel-internal, bound to the GENERATION that
+      // failed: on a live fiber this unwinds the acquired effects; on an
+      // already-unloaded one it re-observes the cached completion and cleans
+      // nothing twice. It must not route through the public dispose override.
+      await this.disposeGeneration(fiber)
     } catch (disposed) {
       cleanupError = disposed
     }
+    // The generation was superseded while its body was in flight: the entry
+    // already belongs to a replacement that owns its own fate. Disposing the
+    // captured generation above is all this settlement may do — no retire, no
+    // diagnostic overwrite, no startup failure published against the
+    // replacement.
+    if (entry.fiber !== fiber) return
     entry.retired = true
     if (this.stopped) return
     entry.error = error
@@ -563,14 +576,18 @@ export class Kernel {
     }
   }
 
-  private activated(entry: PluginEntry): void {
+  private activated(entry: PluginEntry, fiber: Fiber): void {
     // A late completion after unload or a dependency-driven restart is
     // history: never reactivate a stale entry.
     if (entry.generation !== this.generation) return
     // Explicit disposal through a stale generation handle while this body was
     // in flight must not reactivate the closed entry.
     if (entry.closed) return
-    if (entry.fiber.state !== 'loading') return
+    // Generation fence: this completion belongs to the fiber captured at
+    // start. The entry must still be running THAT generation, and only a
+    // body still in flight (loading) may settle it — a superseded or already
+    // settled generation never reactivates the entry nor fires the flush.
+    if (entry.fiber !== fiber || fiber.state !== 'loading') return
     entry.fiber.state = 'active'
     this.flushPending()
   }

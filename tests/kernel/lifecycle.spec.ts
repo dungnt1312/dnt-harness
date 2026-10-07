@@ -7,7 +7,7 @@
  * `kernel/plugin-failed` event, and nothing a plugin does after its own unload
  * can resurrect it or leak a service, listener, or child plugin.
  */
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Kernel, type Context, type PluginFailedDetail } from 'dnt-harness'
 
 describe('kernel lifecycle stabilization (task 2)', () => {
@@ -345,5 +345,208 @@ describe('kernel lifecycle stabilization (task 2)', () => {
     expect(failures[0]?.name).toBe('messy')
     expect(failures[0]?.phase).toBe('teardown')
     expect(String(failures[0]?.error)).toContain('cleanup boom')
+  })
+})
+
+/**
+ * Kernel lifecycle stabilization — task 3 fix round 1: generation-fenced
+ * startup settlement. A generation's apply settlement handlers are bound to
+ * the generation fiber that started, so a settlement landing after a
+ * coordinated restart can never act on the replacement generation.
+ *
+ * These tests hold superseded generations' bodies on gates, so they must not
+ * `settle()` while a gate is held (settle drains that parked transition and
+ * would hang): a `flush()` lets the already-started work cascade through
+ * microtasks, and `vi.waitFor` polls the coordinate-transition checkpoints
+ * whose completion the parked gate does not block.
+ */
+describe('kernel lifecycle stabilization (task 3 fix round 1)', () => {
+  const flush = async (): Promise<void> => {
+    for (let i = 0; i < 10; i++) await Promise.resolve()
+  }
+
+  it('superseded_late_rejection_spares_replacement', async () => {
+    const kernel = new Kernel()
+    const failures: PluginFailedDetail[] = []
+    kernel.events.on('kernel/plugin-failed', (detail) => {
+      failures.push(detail)
+    })
+    const boom = new Error('superseded generation failed')
+
+    // Every generation parks its body on its OWN gate, so the test holds the
+    // exact generation it wants to settle late.
+    const gates: Array<{ release: () => void; fail: (error: unknown) => void }> = []
+    const consumerDef = {
+      name: 'consumer',
+      inject: ['svc'],
+      apply: () =>
+        new Promise<void>((resolve, reject) => {
+          gates.push({ release: resolve, fail: reject })
+        }),
+    }
+    const providerDef = {
+      name: 'provider',
+      apply: (ctx: Context) => {
+        ctx.provide('svc', { n: 1 })
+      },
+    }
+
+    const gen1 = kernel.ctx.plugin(consumerDef)
+    const provider = kernel.ctx.plugin(providerDef)
+    await flush()
+    expect(gen1.state).toBe('loading')
+    expect(gates).toHaveLength(1)
+
+    // Dependency loss: the coordinated restart disposes gen1 and attaches a
+    // fresh generation, which pends until the service returns. The gen1
+    // startup transition is still parked on its gate, so a plain settle()
+    // would block on it — wait for the replacement to exist instead.
+    void provider.dispose()
+    await vi.waitFor(() => {
+      const current = kernel.inspect().find((d) => d.name === 'consumer')?.fiber
+      expect(current).not.toBe(gen1)
+      expect(current?.state).toBe('pending')
+    })
+    const gen2 = kernel.inspect().find((d) => d.name === 'consumer')?.fiber
+    expect(gen1.state).toBe('disposed')
+
+    // The service returns: gen2 starts and parks on ITS OWN gate.
+    const provider2 = kernel.ctx.plugin(providerDef)
+    await flush()
+    expect(gen2?.state).toBe('loading')
+    expect(gates).toHaveLength(2)
+
+    // NOW the superseded generation's startup rejects. Its settlement is
+    // stale history: it may dispose nothing but its own (already disposed)
+    // fiber and must not retire the entry, fail its diagnostic, or be
+    // reported against the replacement. The mandated fence SKIPS the publish
+    // for a superseded generation entirely, so no startup failure is expected
+    // here at all — the stale rejection stays fully contained (it is also
+    // never an unhandled rejection, which vitest would fail the run for).
+    gates[0]?.fail(boom)
+    await flush()
+
+    expect(gen2?.state).toBe('loading')
+    expect(failures).toHaveLength(0)
+    const diagnostic = kernel.inspect().find((d) => d.name === 'consumer')
+    expect(diagnostic?.fiber).toBe(gen2)
+    expect(diagnostic?.error).toBeUndefined()
+    expect(kernel.inspect().filter((d) => d.name === 'consumer')).toHaveLength(1)
+
+    // The replacement completes normally on its own gate and activates.
+    gates[1]?.release()
+    await flush()
+
+    expect(gen2?.state).toBe('active')
+    expect(kernel.services.has('svc')).toBe(true)
+    expect(failures).toHaveLength(0)
+
+    // The entry is NOT retired: a further dependency removal still
+    // coordinates a restart (a retired entry never restarts).
+    void provider2.dispose()
+    await vi.waitFor(() => {
+      const gen3 = kernel.inspect().find((d) => d.name === 'consumer')?.fiber
+      expect(gen3).not.toBe(gen2)
+      expect(gen3?.state).toBe('pending')
+    })
+    const gen3 = kernel.inspect().find((d) => d.name === 'consumer')?.fiber
+    expect(gen2?.state).toBe('disposed')
+
+    await kernel.stop()
+  })
+
+  it('superseded_late_resolution_does_not_activate_replacement', async () => {
+    const kernel = new Kernel()
+    const failures: PluginFailedDetail[] = []
+    kernel.events.on('kernel/plugin-failed', (detail) => {
+      failures.push(detail)
+    })
+
+    // Only a replacement generation's own completion may advertise svc-b and
+    // activate the entry; the superseded generation's late resolution may do
+    // neither. The pending follower is the flush witness: it stays pending
+    // through the stale resolution and wakes only through the replacement's
+    // own completion cascade.
+    let generation = 0
+    const gates: Array<() => void> = []
+    const consumerDef = {
+      name: 'consumer',
+      inject: ['svc'],
+      apply: (ctx: Context) => {
+        const n = generation++
+        return new Promise<void>((resolve) => {
+          gates.push(() => {
+            if (n >= 1) ctx.provide('svc-b', { from: n })
+            resolve()
+          })
+        })
+      },
+    }
+    const providerDef = {
+      name: 'provider',
+      apply: (ctx: Context) => {
+        ctx.provide('svc', { n: 1 })
+      },
+    }
+
+    const gen1 = kernel.ctx.plugin(consumerDef)
+    const provider = kernel.ctx.plugin(providerDef)
+    await flush()
+    expect(gen1.state).toBe('loading')
+
+    let followerRuns = 0
+    kernel.ctx.plugin({
+      name: 'follower',
+      inject: ['svc-b'],
+      apply: () => {
+        followerRuns++
+      },
+    })
+    await flush()
+    expect(kernel.inspect().find((d) => d.name === 'follower')?.fiber.state).toBe('pending')
+
+    // Dependency loss and return: gen2 replaces gen1 and parks on its own
+    // gate while the follower is still waiting for svc-b. The gen1 startup
+    // transition is still parked, so wait for the replacement instead of a
+    // settle() that would block on it.
+    void provider.dispose()
+    await vi.waitFor(() => {
+      const current = kernel.inspect().find((d) => d.name === 'consumer')?.fiber
+      expect(current).not.toBe(gen1)
+      expect(current?.state).toBe('pending')
+    })
+    const gen2 = kernel.inspect().find((d) => d.name === 'consumer')?.fiber
+    expect(gen1.state).toBe('disposed')
+
+    kernel.ctx.plugin(providerDef)
+    await flush()
+    expect(gen2?.state).toBe('loading')
+    expect(gates).toHaveLength(2)
+    expect(followerRuns).toBe(0)
+
+    // The SUPERSEDED generation resolves while gen2's own body is in flight.
+    gates[0]?.()
+    await flush()
+
+    // gen2 must NOT be advertised active before its own apply settles, and
+    // the stale resolution must not fire the activation flush on its behalf.
+    expect(gen2?.state).toBe('loading')
+    expect(followerRuns).toBe(0)
+    expect(kernel.inspect().find((d) => d.name === 'follower')?.fiber.state).toBe('pending')
+
+    // gen2's own gate: it provides svc-b and settles. Only now may the entry
+    // activate — exactly once — and wake the pending consumer.
+    gates[1]?.()
+    await flush()
+
+    expect(gen2?.state).toBe('active')
+    expect(followerRuns).toBe(1)
+    expect(kernel.inspect().find((d) => d.name === 'follower')?.fiber.state).toBe('active')
+    expect(kernel.services.has('svc-b')).toBe(true)
+    expect(kernel.inspect().filter((d) => d.name === 'consumer')).toHaveLength(1)
+    expect(kernel.inspect().filter((d) => d.name === 'follower')).toHaveLength(1)
+    expect(failures).toHaveLength(0)
+
+    await kernel.stop()
   })
 })
