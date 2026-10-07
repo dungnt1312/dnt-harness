@@ -74,4 +74,40 @@ describe('attachment store', () => {
     expect(sniffImageMediaType(Buffer.from('GIF89a...'))).toBe('image/gif')
     expect(sniffImageMediaType(Buffer.from('plain'))).toBeNull()
   })
+
+  it('applies a cap captured by the caller instead of the static one', async () => {
+    const bytes = Buffer.alloc(1500, 0x62)
+    await expect(store.put('ws-cap', { name: 'big.txt', mediaType: 'text/plain', bytes })).rejects.toThrow(/the limit is 1024/)
+    const ref = await store.put('ws-cap', { name: 'big.txt', mediaType: 'text/plain', bytes }, { maxBytes: 2048 })
+    expect(ref.bytes).toBe(1500)
+    await expect(store.put('ws-cap', { name: 'small.txt', mediaType: 'text/plain', bytes: Buffer.from('abc') }, { maxBytes: 2 }))
+      .rejects.toThrow(/the limit is 2/)
+  })
+
+  it('re-projects cached text when the text limit changes', async () => {
+    const ref = await store.put('ws-text', { name: 'letters.txt', mediaType: 'text/plain', bytes: Buffer.from('abcdefgh') })
+    const at = async (textLimit: number) => {
+      const loaded = (await store.load('ws-text', [ref], { textLimit })).get(ref.id)
+      return { mediaType: loaded?.mediaType, text: loaded?.text, ...(loaded?.truncated === true ? { truncated: true } : {}) }
+    }
+    expect(await at(3)).toEqual({ mediaType: 'text/plain', text: 'abc', truncated: true })
+    expect(await at(8)).toEqual({ mediaType: 'text/plain', text: 'abcdefgh' })
+    expect(await at(2)).toEqual({ mediaType: 'text/plain', text: 'ab', truncated: true })
+    expect(await at(3)).toEqual({ mediaType: 'text/plain', text: 'abc', truncated: true })
+  })
+
+  it('keys cached entries by normalized media type; images ignore the text limit', async () => {
+    const text = await store.put('ws-type', { name: 'data.json', mediaType: 'application/json', bytes: Buffer.from('{"a":1}') })
+    const asJson = (await store.load('ws-type', [text], { textLimit: 100 })).get(text.id)
+    const asPlain = (await store.load('ws-type', [{ ...text, mediaType: 'Text/Plain; charset=utf-8' }], { textLimit: 100 })).get(text.id)
+    expect(asJson?.mediaType).toBe('application/json')
+    expect(asPlain?.mediaType).toBe('text/plain')
+    const image = await store.put('ws-type', { name: 'shot.png', mediaType: 'image/png', bytes: PNG })
+    const first = (await store.load('ws-type', [image], { textLimit: 1 })).get(image.id)
+    const second = (await store.load('ws-type', [image], { textLimit: 999 })).get(image.id)
+    expect(first).toMatchObject({ mediaType: 'image/png', base64: PNG.toString('base64') })
+    expect(first?.text).toBeUndefined()
+    // One cache entry serves every text limit for an image.
+    expect(second).toMatchObject({ mediaType: 'image/png', base64: PNG.toString('base64') })
+  })
 })

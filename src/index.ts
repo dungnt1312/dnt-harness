@@ -112,6 +112,7 @@ export {
   isTextMediaType,
   normalizeMediaType,
   sniffImageMediaType,
+  type AttachmentLimits,
   type AttachmentLookup,
   type AttachmentRef,
   type LoadedAttachment,

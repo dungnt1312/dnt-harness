@@ -15,6 +15,7 @@
  */
 import { homedir } from 'node:os'
 import path from 'node:path'
+import { WEB_LIMIT_DEFAULTS } from '../harness/limits-config.ts'
 import { assertSchemaFloor } from '../harness/mcp/migration.ts'
 import { createWebServer } from '../web/server.ts'
 import { loadRepoEnv, repoRoot, resolveAppHome } from './env.ts'
@@ -78,7 +79,8 @@ async function main(): Promise<void> {
     // Skills shipped with the app land in the read-only bundled layer.
     bundledSkillsDir: path.join(repoRoot(), 'skills'),
     seedDeepseekFromEnv: true,
-    limits: { automaticCompactionPressure: 0.85 },
+    // Host profile defaults: `<data-dir>/app-config.json` overrides them.
+    limitDefaults: WEB_LIMIT_DEFAULTS,
     ...(yolo ? { yolo: true, defaultMode: 'allow' as const } : { defaultMode: 'ask' as const }),
     // `--root` picks where an unbound Workbench terminal opens. It is not
     // passed as `root`: that would widen the file tools' legacy grant, which

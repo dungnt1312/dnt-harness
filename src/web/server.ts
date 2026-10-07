@@ -42,7 +42,10 @@ import { resolvePermission } from '../harness/approval/resolution.ts'
 import { composeAuthority, type AskRequirement, type AuthorityDecision } from '../harness/tools/authority.ts'
 import { DangerousCommandsStore } from '../harness/guard/store.ts'
 import { attachDangerousCommandGuard, guardMatchFingerprint } from '../harness/guard/guard.ts'
-import { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from '../harness/limits.ts'
+import type { HarnessLimits } from '../harness/limits.ts'
+import { AppConfigStore, type ConfigStoreIo } from '../harness/config/store.ts'
+import { AppConfigService } from '../harness/config/service.ts'
+import type { LimitsReader } from '../harness/config/types.ts'
 import { LlmService } from '../harness/llm/service.ts'
 import { LogicalRequest, classifyTransport } from '../harness/llm/request-lifecycle.ts'
 import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
@@ -281,8 +284,22 @@ export interface WebServerOptions {
    * `requiresUserInteraction` still apply.
    */
   readonly yolo?: boolean
-  /** Harness limits override (watchdogs, resource caps, and queue bounds). */
+  /**
+   * Explicit harness limits (watchdogs, resource caps, and queue bounds). Each
+   * valid field wins over the app-config file and locks that field; invalid
+   * fields fall through to lower layers.
+   */
   readonly limits?: Partial<HarnessLimits>
+  /** Host profile limit defaults, layered under the app-config file (the web bin's compaction pressure). */
+  readonly limitDefaults?: Partial<HarnessLimits>
+  /**
+   * Global app-config file (limits overrides); defaults to
+   * `<data home>/app-config.json`, or the memory-mode temp home. Separate from
+   * the provider `configFile`.
+   */
+  readonly appConfigFile?: string
+  /** Test seam for app-config file I/O; production reads utf8 and writes atomically. */
+  readonly appConfigIo?: ConfigStoreIo
   /** Host-level tool deny patterns (supports `*`); cannot be widened by mode/workspace/child/approval. */
   readonly blockedTools?: readonly string[]
   /** Read-only user skill layer (e.g. `~/.claude/skills`); workspace skills shadow it by name. */
@@ -370,6 +387,8 @@ export interface WebServer {
   readonly port: number
   readonly kernel: Kernel
   readonly auth: ControlPlaneAuthService
+  /** Global configuration coordinator; also mounted as `app-config` and `limits-reader`. */
+  readonly appConfig: AppConfigService
   close(): Promise<void>
 }
 
@@ -546,8 +565,55 @@ function publicProvider(entry: ProviderConfig): PublicProvider {
   }
 }
 
+/**
+ * What a boot in progress has acquired. A failed boot releases it: teardown
+ * steps in reverse, then the partial kernel, then the data-home lock — only
+ * once canonical writers settled — and last the temp home this boot created.
+ */
+interface BootScope {
+  readonly teardown: (() => void | Promise<void>)[]
+  /** A canonical-writer step failed to settle: ownership must be retained. */
+  unsafe: boolean
+  kernel?: Kernel
+  agents?: { readonly persistenceSafe: boolean }
+  lock?: DataHomeLock
+  tempHome?: string
+}
+
+async function releaseFailedBoot(boot: BootScope): Promise<void> {
+  await runCleanup([
+    ...boot.teardown.toReversed(),
+    async () => {
+      if (boot.kernel === undefined) return
+      try { await boundedCleanup(() => boot.kernel!.stop()) } catch (error) { boot.unsafe = true; throw error }
+    },
+    async () => {
+      if (boot.lock === undefined) return
+      if (boot.unsafe || boot.agents?.persistenceSafe === false) throw new Error('ownership retained: canonical writers unresolved')
+      await boot.lock.release()
+    },
+    async () => {
+      if (boot.tempHome !== undefined && !boot.unsafe) await fs.rm(boot.tempHome, { recursive: true, force: true })
+    },
+  ])
+}
+
 /** Boot the harness on a kernel and expose it over HTTP. */
 export async function createWebServer(options: WebServerOptions): Promise<WebServer> {
+  const boot: BootScope = { teardown: [], unsafe: false }
+  try {
+    return await startWebServer(options, boot)
+  } catch (error) {
+    try {
+      await releaseFailedBoot(boot)
+    } catch (cleanupError) {
+      console.error(`web: failed boot left resources behind: ${String(cleanupError instanceof Error ? cleanupError.message : cleanupError)}`)
+    }
+    throw error
+  }
+}
+
+async function startWebServer(options: WebServerOptions, boot: BootScope): Promise<WebServer> {
   const boundHost = options.host ?? '127.0.0.1'
   const loopbackBind = boundHost === '127.0.0.1' || boundHost === '::1' || boundHost === 'localhost'
   // Refused before anything is constructed: an unauthenticated API on a
@@ -563,6 +629,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   }
 
   const kernel = new Kernel()
+  boot.kernel = kernel
   if (options.home !== undefined) {
     // Streaming chunks ride relaxed appends (one fsync per durability barrier
     // instead of per token); the env opt-out restores strict per-record syncs.
@@ -574,9 +641,27 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   kernel.ctx.plugin(LlmService)
   kernel.ctx.plugin(ToolsService)
   kernel.ctx.plugin(AgentsService)
+  boot.agents = kernel.ctx.agents
 
-  const limits: HarnessLimits = resolveLimits(options.limits)
-  kernel.ctx.provide('limits', limits)
+  // G3 resource services: workspace-owned modes/skills/memory. Memory-mode
+  // hosts bind them to a fresh temp home so tests stay hermetic.
+  const resourceHome = options.home ?? (boot.tempHome = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-resources-')))
+  // Global limits: booted before any consumer or the data-home lock, so an
+  // invalid file refuses startup with nothing to unwind. Operations capture
+  // `appConfig.read()` at their own boundary; `limits` stays the static
+  // startup value for legacy readers.
+  const appConfig = new AppConfigService(
+    new AppConfigStore(options.appConfigFile ?? path.join(resourceHome, 'app-config.json'), options.appConfigIo),
+    {
+      ...(options.limitDefaults !== undefined ? { hostDefaults: options.limitDefaults } : {}),
+      ...(options.limits !== undefined ? { explicit: options.limits } : {}),
+    },
+  )
+  await appConfig.boot()
+  const liveLimits = (): Readonly<HarnessLimits> => appConfig.read().values
+  kernel.ctx.provide('limits', liveLimits())
+  kernel.ctx.provide('limits-reader', appConfig)
+  kernel.ctx.provide('app-config', appConfig)
 
   // ── workspace registry ───────────────────────────────────────
   const workspaces = new WorkspaceService(options.home ?? process.cwd())
@@ -588,13 +673,13 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   }
   kernel.ctx.provide('workspaces', workspaces)
   const deniedRoots = options.home !== undefined ? [options.home] : undefined
-  // G3 resource services: workspace-owned modes/skills/memory. Memory-mode
-  // hosts bind them to a fresh temp home so tests stay hermetic.
-  const resourceHome = options.home ?? (await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-resources-')))
   const modes = new ModesService(resourceHome)
   const skills = new SkillsService(resourceHome, options.bundledSkillsDir, options.userSkillsDir)
   const memory = new MemoryService(resourceHome)
   const checkpoints = new CheckpointStore(path.join(resourceHome, 'workspaces'))
+  boot.teardown.push(async () => {
+    try { await boundedCleanup(() => checkpoints.close()) } catch (error) { boot.unsafe = true; throw error }
+  })
   // Workspace-authored system prompt replacements (Settings → System Prompts).
   const systemPrompts = new SystemPromptsStore(resourceHome)
   kernel.ctx.provide('modes', modes)
@@ -602,7 +687,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   kernel.ctx.provide('memory', memory)
   // Composer attachments: content-addressed blobs beside the workspace's other
   // resources, so a memory-mode host gets a hermetic temp home like the rest.
-  const attachments = new AttachmentStore(resourceHome, { maxBytes: limits.maxAttachmentBytes })
+  // The static cap is a fallback only: uploads pass the cap they captured.
+  const attachments = new AttachmentStore(resourceHome, { maxBytes: liveLimits().maxAttachmentBytes })
   const agentDefinitions = new AgentDefinitionService(resourceHome)
   const childExecutor = new ChildExecutor(kernel.ctx)
   kernel.ctx.provide('agent-definitions', agentDefinitions)
@@ -611,6 +697,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   // server) gets one McpServerClient; tools register as `mcp__server__tool`.
   const mcpStore = new McpConfigStore(resourceHome)
   const ownerLock = await DataHomeLock.acquire(resourceHome)
+  boot.lock = ownerLock
   const mutations = new MutationStore(resourceHome)
   await mutations.recover()
   // An interrupted `migrate-mcp` run is rolled back to its verified backup
@@ -674,6 +761,10 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   }
 
   const disposers = new Map<string, () => void>()
+  boot.teardown.push(() => {
+    for (const dispose of disposers.values()) dispose()
+    disposers.clear()
+  })
 
   /** Live workspace mode state, lazily initialized on first selection. */
   const controls = new Map<WorkspaceId, WorkspaceControls>()
@@ -1026,9 +1117,13 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   // mid-flight simply has no reader left, and dispose emits nothing anyway.
   const processEvents = createProcessSessionEventBridge(kernel.ctx.sessions)
   const processes = new ProcessRegistry(processEvents)
+  boot.teardown.push(async () => {
+    try { await boundedCleanup(() => processEvents.flushAll()) } catch (error) { boot.unsafe = true; throw error }
+  })
+  boot.teardown.push(() => processes.disposeAll())
   kernel.ctx.provide('processes', processes)
   kernel.ctx.provide('process-events', processEvents)
-  kernel.ctx.tools.register(bashTool({ timeoutMs: limits.toolTimeoutMs, maxWaitMs: limits.bashMaxWaitMs, processes }))
+  kernel.ctx.tools.register(bashTool({ processes, limits: appConfig }))
   kernel.ctx.tools.register(bashOutputTool({ processes }))
   kernel.ctx.tools.register(killShellTool({ processes }))
 
@@ -1099,7 +1194,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         signal.throwIfAborted()
         if (blocked !== undefined) throw new Error(blocked)
         const refs = entry.session.events.flatMap((event) => event.type === 'user/message' ? [...(event.attachments ?? [])] : [])
-        const loaded = refs.length > 0 ? await attachments.load(entry.workspaceId, refs, { textLimit: limits.attachmentTextLimit }) : undefined
+        // This compaction's attachment projection follows the policy current when it began.
+        const loaded = refs.length > 0 ? await attachments.load(entry.workspaceId, refs, { textLimit: liveLimits().attachmentTextLimit }) : undefined
         signal.throwIfAborted()
         const pair = summarizerModelOf(entry.session)
         const summarizer = createCompactionSummarizer((request) => (async function* () {
@@ -1107,7 +1203,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
           // attempt's partial output is discarded (buffered, never yielded), so a
           // transient transport failure may re-ask the same chunk — bounded like
           // the agent loop by stepRetries, with the same exponential backoff.
-          const owner = new LogicalRequest({ firstProgressMs: limits.streamFirstEventMs, idleMs: limits.streamIdleMs, totalMs: limits.logicalRequestMs, retryBaseMs: limits.stepRetryBaseMs, maxAttempts: Math.min(4, limits.stepRetries + 1) })
+          // One policy per logical request: every retry of this chunk keeps it.
+          const policy = liveLimits()
+          const owner = new LogicalRequest({ firstProgressMs: policy.streamFirstEventMs, idleMs: policy.streamIdleMs, totalMs: policy.logicalRequestMs, retryBaseMs: policy.stepRetryBaseMs, maxAttempts: Math.min(4, policy.stepRetries + 1) })
           try {
             for (;;) {
               const buffered: StreamEvent[] = []
@@ -1150,7 +1248,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   }
 
   kernel.ctx.on('agent/turn-settled', async ({ turnId, reason }) => {
-    if (limits.automaticCompactionPressure <= 0 || reason !== 'completed' || compactionClosing) return
+    // The threshold is read at each settled decision; a running compaction is never re-judged.
+    const pressure = liveLimits().automaticCompactionPressure
+    if (pressure <= 0 || reason !== 'completed' || compactionClosing) return
     const scope = agentScope.getStore()
     if (scope?.sessionId === undefined || scope.workspaceId === undefined || scope.childOf !== undefined) return
     const entry = sessions.get(scope.sessionId)
@@ -1159,7 +1259,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     const manifest = lastManifests.get(scope.sessionId)
     if (manifest === undefined) return
     const { usedTokens, availableTokens, preTrimTokens } = manifest.budget
-    if (availableTokens <= 0 || (preTrimTokens ?? usedTokens) / availableTokens < limits.automaticCompactionPressure) return
+    if (availableTokens <= 0 || (preTrimTokens ?? usedTokens) / availableTokens < pressure) return
     const boundary = entry.session.events.findLast((event) => event.type === 'turn/end' && event.turnId === turnId)
     if (boundary === undefined || automaticBoundaries.get(scope.sessionId) === boundary.seq) return
     automaticBoundaries.set(scope.sessionId, boundary.seq)
@@ -1223,7 +1323,8 @@ ${decision.injected}`, ...contents]
       scope.workspaceId,
       scope.sessionId,
       state.turnId,
-      { timeoutMs: limits.delegationJoinMs, ...(state.signal !== undefined ? { signal: state.signal } : {}) },
+      // Captured as this join starts; a later update never re-times it.
+      { timeoutMs: liveLimits().delegationJoinMs, ...(state.signal !== undefined ? { signal: state.signal } : {}) },
     )
     return handles !== undefined && handles.length > 0 ? formatChildReports(handles) : undefined
   })
@@ -1445,7 +1546,9 @@ ${entry.description}`.toLowerCase().includes(query))
       const definitionName = scope.childOf?.definition
       const principalId = sessionPrincipals.get(scope.sessionId)
       const workspaceId = (scope.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)) as WorkspaceId
-      const expiresAt = Date.now() + limits.questionExpiryMs
+      // Captured at question creation: a pending question keeps its deadline.
+      const questionExpiryMs = liveLimits().questionExpiryMs
+      const expiresAt = Date.now() + questionExpiryMs
       let settled = false
       const finish = (apply: () => void): void => {
         if (settled) return
@@ -1462,7 +1565,7 @@ ${entry.description}`.toLowerCase().includes(query))
       }
       const timer = setTimeout(() => {
         finish(() => resolve({ kind: 'declined', reason: 'no answer before the question expired' }))
-      }, limits.questionExpiryMs)
+      }, questionExpiryMs)
       timer.unref?.()
       const onAbort = (): void => {
         finish(() => reject(new Error('cancelled: stop requested while asking the user')))
@@ -2192,6 +2295,8 @@ ${entry.description}`.toLowerCase().includes(query))
   // request wholesale. Effective permission is the selected mode's map; host
   // restrictions stay above it.
   kernel.ctx.on('agent/context', async (projected, next) => {
+    // One limits policy for this whole assembly (history tail, attachment text).
+    const assemblyLimits = liveLimits()
     const scope = agentScope.getStore()
     const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
     const session = await scopedSession(scope?.sessionId)
@@ -2304,7 +2409,7 @@ ${entry.description}`.toLowerCase().includes(query))
     // log holds references, and the model needs the content itself.
     const referenced = events.flatMap((event) => (event.type === 'user/message' ? [...(event.attachments ?? [])] : []))
     const loadedAttachments = referenced.length > 0
-      ? await attachments.load(workspaceId, referenced, { textLimit: limits.attachmentTextLimit })
+      ? await attachments.load(workspaceId, referenced, { textLimit: assemblyLimits.attachmentTextLimit })
       : undefined
 
     projected.assemblySignal?.throwIfAborted()
@@ -2336,7 +2441,7 @@ ${entry.description}`.toLowerCase().includes(query))
       activeSkills,
       ...(skillCatalog !== undefined ? { skillCatalog } : {}),
       pinnedMemory,
-      compactionTailTurns: limits.compactionTailTurns,
+      compactionTailTurns: assemblyLimits.compactionTailTurns,
       budget,
       ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
       ...(compaction !== undefined ? { compaction } : {}),
@@ -2558,7 +2663,8 @@ ${entry.description}`.toLowerCase().includes(query))
     authorityResolver: hostAuthority,
     receiptRegistry: approvalReceipts,
     defaultMode: options.defaultMode ?? 'ask',
-    expiryMs: limits.approvalExpiryMs,
+    expiryMs: liveLimits().approvalExpiryMs,
+    expiryMsOf: () => liveLimits().approvalExpiryMs,
     // The scope is the call's own (stamped on re-evaluation), never whatever
     // happens to be ambient when a settings change re-checks pending asks.
     forceAsk: (call, scope) => {
@@ -2698,6 +2804,7 @@ ${entry.description}`.toLowerCase().includes(query))
   const terminals = createTerminalService(
     options.terminals?.spawner !== undefined ? { spawner: options.terminals.spawner } : {},
   )
+  boot.teardown.push(() => terminals.disposeAll())
   const terminalsEnabled = options.terminals?.enabled ?? true
   // Resolved, not passed through: hosts are commonly started with `--root .`,
   // and a terminal reporting its cwd as "." tells a client nothing about where
@@ -2729,7 +2836,7 @@ ${entry.description}`.toLowerCase().includes(query))
     pending,
     pendingQuestions,
     staticDir,
-    limits,
+    limitsReader: appConfig,
     approvalHandle,
     dangerousGuard,
     yolo: options.yolo === true,
@@ -2849,20 +2956,14 @@ ${entry.description}`.toLowerCase().includes(query))
     })
   })
 
+  boot.teardown.push(() => new Promise<void>((resolve) => server.close(() => resolve())))
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject)
     server.listen(options.port ?? 0, options.host ?? '127.0.0.1', resolve)
   })
 
   const address = server.address()
-  if (address === null || typeof address === 'string') {
-    await new Promise<void>((resolve) => server.close(() => resolve()))
-    for (const dispose of disposers.values()) dispose()
-    disposers.clear()
-    await kernel.stop()
-    await ownerLock.release()
-    throw new Error('web: unexpected listen address')
-  }
+  if (address === null || typeof address === 'string') throw new Error('web: unexpected listen address')
 
   const publicHost = options.host ?? '127.0.0.1'
   deps.auth.bindOrigin(`http://${publicHost}:${address.port}`)
@@ -2876,6 +2977,7 @@ ${entry.description}`.toLowerCase().includes(query))
     port: address.port,
     kernel,
     auth: deps.auth,
+    appConfig,
     close: () => closePromise ??= (async () => {
       shuttingDown = true
       compactionClosing = true
@@ -2938,7 +3040,8 @@ interface HandlerDeps {
   /** Live AskUserQuestion waiters, answered by `POST /api/questions/:id`. */
   readonly pendingQuestions: Map<string, PendingQuestion>
   readonly staticDir: string
-  readonly limits: HarnessLimits
+  /** Live limits; each admission captures its own snapshot. */
+  readonly limitsReader: LimitsReader
   readonly approvalHandle: ApprovalHandle
   readonly dangerousGuard: ReturnType<typeof attachDangerousCommandGuard>
   readonly yolo: boolean
@@ -5341,12 +5444,14 @@ async function handleApi(
         if (id === undefined && req.method === 'POST') {
           requireWorkspace(deps, wsId, true) // archived: no new content
           const name = decodeURIComponent(String(req.headers['x-file-name'] ?? '')).trim()
-          const bytes = await readBytes(req, deps.limits.maxAttachmentBytes)
+          // One cap per upload, captured before the body is read and shared by store validation.
+          const maxBytes = deps.limitsReader.read().values.maxAttachmentBytes
+          const bytes = await readBytes(req, maxBytes)
           const stored = await deps.attachments.put(wsId, {
             name: name === '' ? 'attachment' : name,
             mediaType: String(req.headers['content-type'] ?? ''),
             bytes,
-          })
+          }, { maxBytes })
           send(201, stored)
           return
         }
@@ -6189,7 +6294,7 @@ async function acceptMessage(
     return { ok: false, status: 400, error: "'delivery' must be 'queue' or 'steer'" }
   }
   const delivery: 'queue' | 'steer' = rawDelivery === 'steer' ? 'steer' : 'queue'
-  const parsedAttachments = parseAttachments(body['attachments'], deps.limits.maxAttachmentsPerMessage)
+  const parsedAttachments = parseAttachments(body['attachments'], deps.limitsReader.read().values.maxAttachmentsPerMessage)
   if (!parsedAttachments.ok) return parsedAttachments
   const refs = parsedAttachments.refs
   // An attachment is a message on its own; only a wholly empty submission is
@@ -6242,9 +6347,12 @@ async function acceptMessage(
 
   // Bound check before anything is adopted or stopped: a refused message
   // leaves the agent and the running turn exactly as they were.
+  // The bound is read here, synchronously with the durable append below: a
+  // lowered bound refuses new admissions and never drops accepted inputs.
   const stillPending = deps.kernel.ctx.sessions.pendingInputs(entry.session)
-  if (stillPending.length >= deps.limits.maxPendingInputs) {
-    return { ok: false, status: 429, error: `too many queued inputs (limit ${deps.limits.maxPendingInputs})` }
+  const maxPendingInputs = deps.limitsReader.read().values.maxPendingInputs
+  if (stillPending.length >= maxPendingInputs) {
+    return { ok: false, status: 429, error: `too many queued inputs (limit ${maxPendingInputs})` }
   }
 
   // Durable acceptance before the driver sees the input, and before a steer

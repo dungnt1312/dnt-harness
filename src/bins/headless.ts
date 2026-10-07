@@ -41,8 +41,9 @@ import {
   type SessionsService,
   DataHomeLock,
   OwnershipError,
+  AppConfigService,
+  AppConfigStore,
 } from '../index.ts'
-import { DEFAULT_LIMITS } from '../harness/limits.ts'
 import { createProcessSessionEventBridge } from '../harness/processes/session-event-bridge.ts'
 import { runCleanup, boundedCleanup } from '../harness/processes/shutdown.ts'
 import { ProcessRegistry } from '../harness/processes/registry.ts'
@@ -140,6 +141,17 @@ async function askUser(call: { name: string; args: Record<string, unknown> }): P
 async function main(): Promise<void> {
   const { yolo, root, dataDir, message } = parseArgs(process.argv.slice(2))
   const apiKey = readApiKey()
+  // Global limits from `<data-dir>/app-config.json`, the same file contract
+  // as the web host. Booted before the data-home lock: an invalid file
+  // refuses to start with nothing acquired.
+  const appConfig = new AppConfigService(new AppConfigStore(path.join(dataDir, 'app-config.json')))
+  try {
+    await appConfig.boot()
+  } catch (error) {
+    process.stderr.write(`dnt-harness: cannot load '${path.join(dataDir, 'app-config.json')}': ${error instanceof Error ? error.message : String(error)}\n`)
+    process.exitCode = 1
+    return
+  }
   // One writer per data home: a web host (or another CLI) on the same
   // directory would append independent sequence numbers to shared logs.
   let ownerLock: DataHomeLock
@@ -155,99 +167,106 @@ async function main(): Promise<void> {
   }
 
   const kernel = new Kernel()
-  kernel.ctx.plugin(fileSessions(dataDir))
-  kernel.ctx.provide('limits', DEFAULT_LIMITS)
-  kernel.ctx.plugin(LlmService)
-  kernel.ctx.plugin(ToolsService)
-  kernel.ctx.plugin(AgentsService)
-  // One data home, workspace-scoped sessions: the CLI works inside the
-  // home's Default workspace (stable id, idempotently migrated).
-  const workspaces = new WorkspaceService(dataDir)
-  await workspaces.boot()
-  kernel.ctx.provide('workspaces', workspaces)
-  await kernel.ctx.sessions.boot()
-  const workspaceId = workspaces.defaultWorkspace
-  const canonicalRoot = await fs.realpath(path.resolve(root))
-  const project = workspaces.listProjects(workspaceId).find((record) => record.path === canonicalRoot)
-    ?? await workspaces.createProject(workspaceId, path.basename(canonicalRoot), canonicalRoot)
-  const scope = { workspaceId, projectId: project.id }
-  const memory = new MemoryService(dataDir)
-  const modes = new ModesService(dataDir)
-  const mode = await modes.resolve(workspaceId, await modes.selectedId(workspaceId) ?? DEFAULT_MODE_ID)
-  const memoryEnabled = mode.definition.sources.memoryPinned && mode.definition.sources.memoryRetrieval
-  const roots = memoryEnabled ? memoryRoots(memory, scope) : []
-  const memoryAccess = mode.definition.toolExposure.includes('Write') || mode.definition.toolExposure.includes('Edit') ? 'write' as const : 'read' as const
-  kernel.ctx.on('tools/pre-execute', async (payload, next) => {
-    if (!mode.definition.toolExposure.includes(payload.call.name)) return { kind: 'deny', reason: `tool '${payload.call.name}' is not exposed by the selected mode` }
-    if (resolvePermission(mode.definition.permissionDefaults, payload.call.name) === 'deny') return { kind: 'deny', reason: `tool '${payload.call.name}' is denied by the selected mode` }
-    return next()
-  }, true)
-  const options: ApprovalOptions = {
-    defaultMode: yolo ? 'allow' : 'ask', askUser,
-    policy: Object.fromEntries(Object.entries(mode.definition.permissionDefaults).map(([name, permission]) => [name, yolo && permission !== 'deny' ? 'allow' : permission])),
-  }
-  attachApproval(kernel.ctx, options)
-  for (const tool of fsTools()) {
-    kernel.ctx.tools.register(tool)
-  }
-  const processEvents = createProcessSessionEventBridge(kernel.ctx.sessions)
-  const processes = new ProcessRegistry(processEvents)
-  kernel.ctx.provide('processes', processes)
-  kernel.ctx.provide('process-events', processEvents)
-  kernel.ctx.tools.register(bashTool({ timeoutMs: DEFAULT_LIMITS.toolTimeoutMs, processes }))
-  kernel.ctx.tools.register(bashOutputTool({ processes }))
-  kernel.ctx.tools.register(killShellTool({ processes }))
-  kernel.ctx.tools.register(todoWriteTool())
-  kernel.ctx.tools.setRootResolver(() => ({ root: canonicalRoot, deniedRoots: [path.resolve(dataDir)], hostStorageRoot: path.resolve(dataDir), memoryRoots: roots, additionalRoots: roots.map((folder) => ({ path: folder, access: memoryAccess })) }))
-  if (apiKey !== undefined) {
-    kernel.ctx.llm.register(new DeepSeekProvider(apiKey, process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com'))
-  } else {
-    process.stderr.write('no DEEPSEEK_API_KEY; model calls fail until a provider is registered.\n')
-  }
-
-  const session: Session = kernel.ctx.sessions.create(workspaces.defaultWorkspace)
-  session.append({ type: 'session/project', projectId: project.id })
-  await session.durable()
-  kernel.ctx.on('session/event', (emitter, event) => {
-    if (emitter === session) render(event)
-  })
-
-  const agent = kernel.ctx.agents.create(session, scope)
-  kernel.ctx.on('agent/context', async (projected, next) => {
-    const schemas = kernel.ctx.tools.schemas().filter((schema) => mode.definition.toolExposure.includes(schema.name))
-    const pinnedMemory = memoryEnabled ? await memoryIndexes(memory, scope) : []
-    if (roots.length > 0 && schemas.some((schema) => ['Read', 'Write', 'Edit', 'Glob', 'Grep'].includes(schema.name))) pinnedMemory.unshift(memoryGuidance(roots))
-    const environment = renderEnvironmentContext({
-      now: new Date(),
-      platform: process.platform,
-      arch: process.arch,
-      nodeVersion: process.version,
-      workspacePath: canonicalRoot,
-    })
-    const assembled = buildContext({
-      events: session.events, mode, modeRevision: 0,
-      model: projected.model, providerName: projected.providerName,
-      schemas, activeSkills: [], pinnedMemory, budget: DEFAULT_BUDGET,
-      ...(environment !== undefined ? { environment } : {}),
-      ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
-      fileScope: { primary: canonicalRoot, additional: roots.map((folder) => ({ path: folder, access: memoryAccess })), outsideAsks: !yolo },
-    })
-    return next({ ...projected, messages: assembled.messages, tools: schemas })
-  }, true)
-
-  /** Durably accept one input, adopt anything still pending, then run. */
-  const acceptAndRun = async (text: string): Promise<void> => {
-    const inputId = newInputId()
-    session.append({ type: 'input/queued', inputId, content: text })
-    await session.durable()
-    const sessions: SessionsService = kernel.ctx.sessions
-    for (const item of sessions.pendingInputs(session)) {
-      agent.enqueueAccepted(item)
-    }
-    await (agent as Agent).run()
-  }
-
+  let processes: ProcessRegistry | undefined
+  let processEvents: ReturnType<typeof createProcessSessionEventBridge> | undefined
+  // Everything after acquisition runs inside this scope, so a failed startup
+  // still stops the kernel and releases the lock once writers settled.
   try {
+    kernel.ctx.plugin(fileSessions(dataDir))
+    // Static startup value for legacy readers; operations capture the reader.
+    kernel.ctx.provide('limits', appConfig.read().values)
+    kernel.ctx.provide('limits-reader', appConfig)
+    kernel.ctx.provide('app-config', appConfig)
+    kernel.ctx.plugin(LlmService)
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.plugin(AgentsService)
+    // One data home, workspace-scoped sessions: the CLI works inside the
+    // home's Default workspace (stable id, idempotently migrated).
+    const workspaces = new WorkspaceService(dataDir)
+    await workspaces.boot()
+    kernel.ctx.provide('workspaces', workspaces)
+    await kernel.ctx.sessions.boot()
+    const workspaceId = workspaces.defaultWorkspace
+    const canonicalRoot = await fs.realpath(path.resolve(root))
+    const project = workspaces.listProjects(workspaceId).find((record) => record.path === canonicalRoot)
+      ?? await workspaces.createProject(workspaceId, path.basename(canonicalRoot), canonicalRoot)
+    const scope = { workspaceId, projectId: project.id }
+    const memory = new MemoryService(dataDir)
+    const modes = new ModesService(dataDir)
+    const mode = await modes.resolve(workspaceId, await modes.selectedId(workspaceId) ?? DEFAULT_MODE_ID)
+    const memoryEnabled = mode.definition.sources.memoryPinned && mode.definition.sources.memoryRetrieval
+    const roots = memoryEnabled ? memoryRoots(memory, scope) : []
+    const memoryAccess = mode.definition.toolExposure.includes('Write') || mode.definition.toolExposure.includes('Edit') ? 'write' as const : 'read' as const
+    kernel.ctx.on('tools/pre-execute', async (payload, next) => {
+      if (!mode.definition.toolExposure.includes(payload.call.name)) return { kind: 'deny', reason: `tool '${payload.call.name}' is not exposed by the selected mode` }
+      if (resolvePermission(mode.definition.permissionDefaults, payload.call.name) === 'deny') return { kind: 'deny', reason: `tool '${payload.call.name}' is denied by the selected mode` }
+      return next()
+    }, true)
+    const options: ApprovalOptions = {
+      defaultMode: yolo ? 'allow' : 'ask', askUser,
+      policy: Object.fromEntries(Object.entries(mode.definition.permissionDefaults).map(([name, permission]) => [name, yolo && permission !== 'deny' ? 'allow' : permission])),
+    }
+    attachApproval(kernel.ctx, { ...options, expiryMsOf: () => appConfig.read().values.approvalExpiryMs })
+    for (const tool of fsTools()) {
+      kernel.ctx.tools.register(tool)
+    }
+    processEvents = createProcessSessionEventBridge(kernel.ctx.sessions)
+    processes = new ProcessRegistry(processEvents)
+    kernel.ctx.provide('processes', processes)
+    kernel.ctx.provide('process-events', processEvents)
+    kernel.ctx.tools.register(bashTool({ processes, limits: appConfig }))
+    kernel.ctx.tools.register(bashOutputTool({ processes }))
+    kernel.ctx.tools.register(killShellTool({ processes }))
+    kernel.ctx.tools.register(todoWriteTool())
+    kernel.ctx.tools.setRootResolver(() => ({ root: canonicalRoot, deniedRoots: [path.resolve(dataDir)], hostStorageRoot: path.resolve(dataDir), memoryRoots: roots, additionalRoots: roots.map((folder) => ({ path: folder, access: memoryAccess })) }))
+    if (apiKey !== undefined) {
+      kernel.ctx.llm.register(new DeepSeekProvider(apiKey, process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com'))
+    } else {
+      process.stderr.write('no DEEPSEEK_API_KEY; model calls fail until a provider is registered.\n')
+    }
+
+    const session: Session = kernel.ctx.sessions.create(workspaces.defaultWorkspace)
+    session.append({ type: 'session/project', projectId: project.id })
+    await session.durable()
+    kernel.ctx.on('session/event', (emitter, event) => {
+      if (emitter === session) render(event)
+    })
+
+    const agent = kernel.ctx.agents.create(session, scope)
+    kernel.ctx.on('agent/context', async (projected, next) => {
+      const schemas = kernel.ctx.tools.schemas().filter((schema) => mode.definition.toolExposure.includes(schema.name))
+      const pinnedMemory = memoryEnabled ? await memoryIndexes(memory, scope) : []
+      if (roots.length > 0 && schemas.some((schema) => ['Read', 'Write', 'Edit', 'Glob', 'Grep'].includes(schema.name))) pinnedMemory.unshift(memoryGuidance(roots))
+      const environment = renderEnvironmentContext({
+        now: new Date(),
+        platform: process.platform,
+        arch: process.arch,
+        nodeVersion: process.version,
+        workspacePath: canonicalRoot,
+      })
+      const assembled = buildContext({
+        events: session.events, mode, modeRevision: 0,
+        model: projected.model, providerName: projected.providerName,
+        schemas, activeSkills: [], pinnedMemory, budget: DEFAULT_BUDGET,
+        ...(environment !== undefined ? { environment } : {}),
+        ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
+        fileScope: { primary: canonicalRoot, additional: roots.map((folder) => ({ path: folder, access: memoryAccess })), outsideAsks: !yolo },
+      })
+      return next({ ...projected, messages: assembled.messages, tools: schemas })
+    }, true)
+
+    /** Durably accept one input, adopt anything still pending, then run. */
+    const acceptAndRun = async (text: string): Promise<void> => {
+      const inputId = newInputId()
+      session.append({ type: 'input/queued', inputId, content: text })
+      await session.durable()
+      const sessions: SessionsService = kernel.ctx.sessions
+      for (const item of sessions.pendingInputs(session)) {
+        agent.enqueueAccepted(item)
+      }
+      await (agent as Agent).run()
+    }
+
     if (message !== undefined) {
       await acceptAndRun(message)
     } else {
@@ -262,15 +281,17 @@ async function main(): Promise<void> {
       rl.close()
     }
   } finally {
-    processes.closeAdmission()
-    const agentDrivers = kernel.ctx.agents
+    processes?.closeAdmission()
+    const agentDrivers = kernel.ctx.get('agents') as AgentsService | undefined
+    const ownedProcesses = processes
+    const ownedEvents = processEvents
     let teardownSafe = true
     await runCleanup([
-      () => agentDrivers.stopAll(),
-      () => processes.disposeAll(),
-      async () => { try { await boundedCleanup(() => processEvents.flushAll()) } catch (error) { teardownSafe = false; throw error } },
+      () => agentDrivers?.stopAll(),
+      () => ownedProcesses?.disposeAll(),
+      async () => { try { if (ownedEvents !== undefined) await boundedCleanup(() => ownedEvents.flushAll()) } catch (error) { teardownSafe = false; throw error } },
       async () => { try { await boundedCleanup(() => kernel.stop()) } catch (error) { teardownSafe = false; throw error } },
-      () => { if (!teardownSafe || !agentDrivers.persistenceSafe) throw new Error('ownership retained: canonical writers unresolved'); return ownerLock.release() },
+      () => { if (!teardownSafe || agentDrivers?.persistenceSafe === false) throw new Error('ownership retained: canonical writers unresolved'); return ownerLock.release() },
     ])
   }
 }
