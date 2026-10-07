@@ -8,8 +8,9 @@ import { promises as fs } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createWebServer, WEB_LIMIT_DEFAULTS, type LlmProvider, type WebServer, type WebServerOptions } from 'dnt-harness'
+import { ChildExecutor } from '../../src/harness/agents/executor.ts'
 import type { HarnessLimits } from '../../src/harness/limits.ts'
 import type { LimitKey } from '../../src/harness/limits-config.ts'
 import type { ModelRequest, StreamEvent } from '../../src/harness/llm/types.ts'
@@ -18,6 +19,7 @@ const servers: WebServer[] = []
 const dirs: string[] = []
 
 afterEach(async () => {
+  vi.restoreAllMocks()
   for (const server of servers.splice(0)) await server.close().catch(() => {})
   for (const dir of dirs.splice(0)) await fs.rm(dir, { recursive: true, force: true }).catch(() => {})
 })
@@ -80,8 +82,6 @@ async function until<T>(probe: () => Promise<T | undefined>, timeoutMs = 10_000)
     await new Promise((resolve) => setTimeout(resolve, 40))
   }
 }
-
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
 
 interface LoggedEvent { readonly type: string; readonly turnId?: string; readonly reason?: string; readonly [key: string]: unknown }
 
@@ -214,6 +214,11 @@ describe('admissions', () => {
     const server = await start({ home, providers: [], configFile: path.join(home, 'p.json') })
     const wsId = await defaultWorkspace(server)
     const url = new URL(`${server.url}/api/workspaces/${wsId}/attachments`)
+    // Barrier: the upload handler's first limits read is its cap capture.
+    const read = server.appConfig.read.bind(server.appConfig)
+    let captured: () => void = () => {}
+    const capture = new Promise<void>((resolve) => { captured = resolve })
+    server.appConfig.read = () => { const snapshot = read(); captured(); return snapshot }
     const response = new Promise<{ status: number; body: string }>((resolve, reject) => {
       const req = httpRequest({
         host: url.hostname, port: url.port, path: url.pathname, method: 'POST',
@@ -226,7 +231,9 @@ describe('admissions', () => {
       req.on('error', reject)
       req.write('01234')
       // The body is held while the cap is lowered below its eventual size.
-      void sleep(150).then(() => setLimits(server, { maxAttachmentBytes: 4 })).then(() => req.end('56789'), reject)
+      void capture
+        .then(() => { server.appConfig.read = read; return setLimits(server, { maxAttachmentBytes: 4 }) })
+        .then(() => req.end('56789'), reject)
     })
     const settled = await response
     expect(settled.status).toBe(201)
@@ -313,6 +320,14 @@ describe('delegation join', () => {
         yield done
       },
     }
+    // Record each join's captured deadline and whether it has finished.
+    const joins: { timeoutMs: number; settled: boolean }[] = []
+    const join = ChildExecutor.prototype.joinTurnChildren
+    vi.spyOn(ChildExecutor.prototype, 'joinTurnChildren').mockImplementation(function (this: ChildExecutor, ...args) {
+      const record = { timeoutMs: args[3].timeoutMs, settled: false }
+      joins.push(record)
+      return join.apply(this, args).finally(() => { record.settled = true })
+    })
     const server = await start({ home, providers: [provider], configFile: path.join(home, 'p.json') })
     const wsId = await defaultWorkspace(server)
     expect((await fetch(`${server.url}/api/workspaces/${wsId}/mode`, {
@@ -323,10 +338,9 @@ describe('delegation join', () => {
 
     // Turn one joins under the default (30 minute) deadline.
     expect((await post(`${server.url}/api/workspaces/${wsId}/sessions/${id}/messages`, { content: 'go-1' })).status).toBe(202)
-    await until(async () => delegated === 1 ? true : undefined)
-    await sleep(100)
+    await until(async () => delegated === 1 && joins.length === 1 ? true : undefined)
     await setLimits(server, { delegationJoinMs: 150 })
-    await sleep(900)
+    expect(joins[0]).toEqual({ timeoutMs: 30 * 60_000, settled: false })
     expect(await turnEnds()).toBe(0)
     await post(`${server.url}/api/workspaces/${wsId}/sessions/${id}/stop`)
     await until(async () => (await turnEnds()) === 1 ? true : undefined)
@@ -338,6 +352,11 @@ describe('delegation join', () => {
     const end = (await eventLog(home, wsId, id)).findLast((event) => event.type === 'turn/end')
     expect(end?.reason).toBe('completed')
     expect(delegated).toBe(2)
+    // The first join kept 30 minutes; every join after the update (including the
+    // continuation check after the reports step) captured 150ms.
+    expect(joins[0]!.timeoutMs).toBe(30 * 60_000)
+    expect(joins.length).toBeGreaterThanOrEqual(2)
+    expect(joins.slice(1).every((entry) => entry.timeoutMs === 150)).toBe(true)
   }, 30_000)
 })
 

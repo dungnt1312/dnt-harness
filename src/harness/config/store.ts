@@ -4,6 +4,9 @@ import { replaceFileAtomic } from '../storage/events-jsonl.ts'
 import { isPlainObject, parseLimitOverrides } from '../limits-config.ts'
 import { AppConfigError, type AppConfigDocument } from './types.ts'
 
+/** File name of the global app-config document inside a data home. */
+export const APP_CONFIG_FILE = 'app-config.json'
+
 /** Optional test/production seam; defaults read utf8 and write via replaceFileAtomic. */
 export interface ConfigStoreIo {
   read?: (file: string) => Promise<string>

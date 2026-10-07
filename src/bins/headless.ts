@@ -43,6 +43,7 @@ import {
   OwnershipError,
   AppConfigService,
   AppConfigStore,
+  APP_CONFIG_FILE,
 } from '../index.ts'
 import { createProcessSessionEventBridge } from '../harness/processes/session-event-bridge.ts'
 import { runCleanup, boundedCleanup } from '../harness/processes/shutdown.ts'
@@ -144,11 +145,12 @@ async function main(): Promise<void> {
   // Global limits from `<data-dir>/app-config.json`, the same file contract
   // as the web host. Booted before the data-home lock: an invalid file
   // refuses to start with nothing acquired.
-  const appConfig = new AppConfigService(new AppConfigStore(path.join(dataDir, 'app-config.json')))
+  const appConfigFile = path.join(dataDir, APP_CONFIG_FILE)
+  const appConfig = new AppConfigService(new AppConfigStore(appConfigFile))
   try {
     await appConfig.boot()
   } catch (error) {
-    process.stderr.write(`dnt-harness: cannot load '${path.join(dataDir, 'app-config.json')}': ${error instanceof Error ? error.message : String(error)}\n`)
+    process.stderr.write(`dnt-harness: cannot load '${appConfigFile}': ${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1
     return
   }
@@ -171,6 +173,7 @@ async function main(): Promise<void> {
   let processEvents: ReturnType<typeof createProcessSessionEventBridge> | undefined
   // Everything after acquisition runs inside this scope, so a failed startup
   // still stops the kernel and releases the lock once writers settled.
+  let failure: { readonly error: unknown } | undefined
   try {
     kernel.ctx.plugin(fileSessions(dataDir))
     // Static startup value for legacy readers; operations capture the reader.
@@ -280,19 +283,29 @@ async function main(): Promise<void> {
       }
       rl.close()
     }
+  } catch (error) {
+    failure = { error }
+    throw error
   } finally {
     processes?.closeAdmission()
     const agentDrivers = kernel.ctx.get('agents') as AgentsService | undefined
     const ownedProcesses = processes
     const ownedEvents = processEvents
     let teardownSafe = true
-    await runCleanup([
+    const cleanup = runCleanup([
       () => agentDrivers?.stopAll(),
       () => ownedProcesses?.disposeAll(),
       async () => { try { if (ownedEvents !== undefined) await boundedCleanup(() => ownedEvents.flushAll()) } catch (error) { teardownSafe = false; throw error } },
       async () => { try { await boundedCleanup(() => kernel.stop()) } catch (error) { teardownSafe = false; throw error } },
       () => { if (!teardownSafe || agentDrivers?.persistenceSafe === false) throw new Error('ownership retained: canonical writers unresolved'); return ownerLock.release() },
     ])
+    try {
+      await cleanup
+    } catch (cleanupError) {
+      // A cleanup failure must not hide why startup or the run failed.
+      if (failure !== undefined) throw new AggregateError([failure.error, cleanupError], 'run failed and cleanup did not complete')
+      throw cleanupError
+    }
   }
 }
 

@@ -43,7 +43,7 @@ import { composeAuthority, type AskRequirement, type AuthorityDecision } from '.
 import { DangerousCommandsStore } from '../harness/guard/store.ts'
 import { attachDangerousCommandGuard, guardMatchFingerprint } from '../harness/guard/guard.ts'
 import type { HarnessLimits } from '../harness/limits.ts'
-import { AppConfigStore, type ConfigStoreIo } from '../harness/config/store.ts'
+import { APP_CONFIG_FILE, AppConfigStore, type ConfigStoreIo } from '../harness/config/store.ts'
 import { AppConfigService } from '../harness/config/service.ts'
 import type { LimitsReader } from '../harness/config/types.ts'
 import { LlmService } from '../harness/llm/service.ts'
@@ -569,6 +569,7 @@ function publicProvider(entry: ProviderConfig): PublicProvider {
  * What a boot in progress has acquired. A failed boot releases it: teardown
  * steps in reverse, then the partial kernel, then the data-home lock — only
  * once canonical writers settled — and last the temp home this boot created.
+ * No MCP connection or agent run starts before boot completes, so none is stopped here.
  */
 interface BootScope {
   readonly teardown: (() => void | Promise<void>)[]
@@ -588,8 +589,9 @@ async function releaseFailedBoot(boot: BootScope): Promise<void> {
       try { await boundedCleanup(() => boot.kernel!.stop()) } catch (error) { boot.unsafe = true; throw error }
     },
     async () => {
+      if (boot.agents?.persistenceSafe === false) boot.unsafe = true
       if (boot.lock === undefined) return
-      if (boot.unsafe || boot.agents?.persistenceSafe === false) throw new Error('ownership retained: canonical writers unresolved')
+      if (boot.unsafe) throw new Error('ownership retained: canonical writers unresolved')
       await boot.lock.release()
     },
     async () => {
@@ -607,7 +609,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     try {
       await releaseFailedBoot(boot)
     } catch (cleanupError) {
-      console.error(`web: failed boot left resources behind: ${String(cleanupError instanceof Error ? cleanupError.message : cleanupError)}`)
+      const causes = cleanupError instanceof AggregateError ? cleanupError.errors : [cleanupError]
+      console.error('web: failed boot left resources behind:', ...causes)
     }
     throw error
   }
@@ -651,7 +654,7 @@ async function startWebServer(options: WebServerOptions, boot: BootScope): Promi
   // `appConfig.read()` at their own boundary; `limits` stays the static
   // startup value for legacy readers.
   const appConfig = new AppConfigService(
-    new AppConfigStore(options.appConfigFile ?? path.join(resourceHome, 'app-config.json'), options.appConfigIo),
+    new AppConfigStore(options.appConfigFile ?? path.join(resourceHome, APP_CONFIG_FILE), options.appConfigIo),
     {
       ...(options.limitDefaults !== undefined ? { hostDefaults: options.limitDefaults } : {}),
       ...(options.limits !== undefined ? { explicit: options.limits } : {}),
@@ -2956,7 +2959,7 @@ ${entry.description}`.toLowerCase().includes(query))
     })
   })
 
-  boot.teardown.push(() => new Promise<void>((resolve) => server.close(() => resolve())))
+  boot.teardown.push(() => new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()) }))
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject)
     server.listen(options.port ?? 0, options.host ?? '127.0.0.1', resolve)
@@ -3040,7 +3043,7 @@ interface HandlerDeps {
   /** Live AskUserQuestion waiters, answered by `POST /api/questions/:id`. */
   readonly pendingQuestions: Map<string, PendingQuestion>
   readonly staticDir: string
-  /** Live limits; each admission captures its own snapshot. */
+  /** Live limits; each bound is read at its own enforcement point. */
   readonly limitsReader: LimitsReader
   readonly approvalHandle: ApprovalHandle
   readonly dangerousGuard: ReturnType<typeof attachDangerousCommandGuard>

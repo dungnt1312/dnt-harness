@@ -104,10 +104,18 @@ describe('attachment store', () => {
     expect(asPlain?.mediaType).toBe('text/plain')
     const image = await store.put('ws-type', { name: 'shot.png', mediaType: 'image/png', bytes: PNG })
     const first = (await store.load('ws-type', [image], { textLimit: 1 })).get(image.id)
-    const second = (await store.load('ws-type', [image], { textLimit: 999 })).get(image.id)
     expect(first).toMatchObject({ mediaType: 'image/png', base64: PNG.toString('base64') })
     expect(first?.text).toBeUndefined()
-    // One cache entry serves every text limit for an image.
+    // With the blob gone, only the cache can answer: one entry serves every text limit.
+    await fs.rm(path.join(home, 'workspaces', 'ws-type', 'attachments', image.id))
+    const second = (await store.load('ws-type', [image], { textLimit: 999 })).get(image.id)
     expect(second).toMatchObject({ mediaType: 'image/png', base64: PNG.toString('base64') })
+  })
+
+  it('accounts one cache entry once when concurrent loads both miss', async () => {
+    const fresh = new AttachmentStore(home, { maxBytes: 1024 })
+    const ref = await fresh.put('ws-race', { name: 'race.txt', mediaType: 'text/plain', bytes: Buffer.from('racing bytes') })
+    await Promise.all([fresh.load('ws-race', [ref], { textLimit: 100 }), fresh.load('ws-race', [ref], { textLimit: 100 })])
+    expect((fresh as unknown as { cachedBytes: number }).cachedBytes).toBe(ref.bytes)
   })
 })

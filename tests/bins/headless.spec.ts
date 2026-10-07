@@ -121,7 +121,7 @@ describe('headless CLI', () => {
     try {
       await writeFile(configFile, JSON.stringify({ v: 1, limits: { bogus: 1 } }))
       const refused = await runCli(['--data-dir', dataDir, '--message', 'hello'], env)
-      expect(refused.code).toBe(1)
+      expect(refused.code, refused.stderr).toBe(1)
       expect(refused.stderr).toContain('app-config.json')
       expect(refused.stderr).toContain('unknown limit key: bogus')
       expect(requests).toHaveLength(0)
@@ -130,11 +130,11 @@ describe('headless CLI', () => {
       // A startup failure after the lock was taken still releases it.
       await writeFile(configFile, JSON.stringify({ v: 1, limits: { toolTimeoutMs: 1234, bashMaxWaitMs: 5678 } }))
       const missingRoot = await runCli(['--data-dir', dataDir, '--root', path.join(dataDir, 'no-such-root'), '--message', 'hello'], env)
-      expect(missingRoot.code).toBe(1)
+      expect(missingRoot.code, missingRoot.stderr).toBe(1)
       await expect(readFile(lockFile)).rejects.toThrow()
 
       const ok = await runCli(['--data-dir', dataDir, '--message', 'hello'], env)
-      expect(ok.code).toBe(0)
+      expect(ok.code, ok.stderr).toBe(0)
       expect(requests).toHaveLength(1)
       // The advertised Bash budget follows the file's live limits.
       expect(requests[0]).toContain('default 1234, max 5678')

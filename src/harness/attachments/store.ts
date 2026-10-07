@@ -201,6 +201,12 @@ export class AttachmentStore {
   }
 
   private remember(key: string, content: LoadedAttachment, bytes: number): void {
+    // Concurrent loads of one key both miss and both remember: replace, never double-count.
+    const previous = this.cache.get(key)
+    if (previous !== undefined) {
+      this.cache.delete(key)
+      this.cachedBytes -= previous.bytes
+    }
     this.cache.set(key, { ...content, bytes })
     this.cachedBytes += bytes
     for (const [oldest, entry] of this.cache) {
