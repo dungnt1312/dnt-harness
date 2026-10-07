@@ -37,7 +37,8 @@ export { newSessionId, newStepId, newTurnId, newExecutionId, newInputId, newWork
 export { AttemptAdmission, LogicalRequest, classifyTransport, runAttempt, type AttemptTicket, type PhysicalAdmission, type RequestPolicy, type AttemptFact, type AttemptObserver } from './harness/llm/request-lifecycle.ts'
 
 // ── Harness: limits ──────────────────────────────────────────────────────
-export { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from './harness/limits.ts'
+export { DEFAULT_LIMITS, resolveLimits, isValidLimit, type HarnessLimits } from './harness/limits.ts'
+export { parseLimitOverrides, LIMIT_FIELDS, WEB_LIMIT_DEFAULTS, type LimitKey, type LimitField } from './harness/limits-config.ts'
 
 // ── Harness: session log ─────────────────────────────────────────────────
 export {

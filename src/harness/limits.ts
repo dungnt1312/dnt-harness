@@ -77,17 +77,35 @@ export const DEFAULT_LIMITS: HarnessLimits = {
   attachmentTextLimit: 60_000,
 }
 
+/**
+ * Keys whose values must be whole numbers (durations feeding timers and
+ * retry/backoff counts). Every other key accepts legacy fractions.
+ */
+const INTEGER_LIMIT_KEYS: readonly (keyof HarnessLimits)[] = ['streamFirstEventMs', 'streamIdleMs', 'logicalRequestMs', 'stepRetries', 'stepRetryBaseMs', 'compactionTailTurns']
+/** The only keys where 0 is an accepted value — both act as an off switch. */
+const ZERO_CAPABLE_KEYS: readonly (keyof HarnessLimits)[] = ['compactionTailTurns', 'automaticCompactionPressure']
+
+/**
+ * One accepted-value predicate for every limit: finite numbers within
+ * [0, MAX_TIMER_MS], whole numbers on the timer/retry keys, 0 only where a
+ * limit doubles as an off switch. resolveLimits filters overrides through
+ * this; the strict config parser (limits-config.ts) reuses it verbatim so the
+ * two paths can never drift.
+ */
+export function isValidLimit(key: keyof HarnessLimits, value: unknown): value is number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return false
+  if (INTEGER_LIMIT_KEYS.includes(key) && !Number.isSafeInteger(value)) return false
+  if (!(ZERO_CAPABLE_KEYS.includes(key) ? value >= 0 : value > 0)) return false
+  return value <= MAX_TIMER_MS
+}
+
 /** Merge overrides; invalid request durations/counts (including fractions) use defaults. */
 export function resolveLimits(partial?: Partial<HarnessLimits>): HarnessLimits {
   if (partial === undefined) return DEFAULT_LIMITS
   const merged = { ...DEFAULT_LIMITS }
   for (const key of Object.keys(merged) as (keyof HarnessLimits)[]) {
     const value = partial[key]
-    const integerRequestLimit = ['streamFirstEventMs', 'streamIdleMs', 'logicalRequestMs', 'stepRetries', 'stepRetryBaseMs', 'compactionTailTurns'].includes(key)
-    const zeroCapable = key === 'compactionTailTurns' || key === 'automaticCompactionPressure'
-    if (typeof value === 'number' && Number.isFinite(value) && (!integerRequestLimit || Number.isSafeInteger(value)) && (zeroCapable ? value >= 0 : value > 0) && value <= MAX_TIMER_MS) {
-      merged[key] = value
-    }
+    if (isValidLimit(key, value)) merged[key] = value
   }
   return merged
 }
