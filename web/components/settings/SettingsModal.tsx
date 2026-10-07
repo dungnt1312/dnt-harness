@@ -29,11 +29,12 @@ import { ModelSettingsDialog, SyncModelsDialog } from './model-dialogs.tsx'
 import { AgentsPanel, HooksPanel, McpPanel, MemoryPanel, SecretsPanel, SkillsPanel } from './ManagementPanels.tsx'
 import { PermissionsPanel } from './PermissionsPanel.tsx'
 import { SystemPromptsPanel } from './SystemPromptsPanel.tsx'
+import { AdvancedPanel, type AdvancedGuard } from './AdvancedPanel.tsx'
 import { modelOptions } from '../../lib/providers.ts'
 import type { ModelSettings, ProjectRow, ProviderSummary } from '../../lib/types.ts'
 
-/** Settings are grouped per concern; providers keep their own full editor. */
-type SettingsTab = 'providers' | 'projects' | 'permissions' | 'prompts' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'
+/** Settings are grouped per concern; providers and global limits keep their own editors. */
+type SettingsTab = 'providers' | 'advanced' | 'projects' | 'permissions' | 'prompts' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'
 
 const LEGACY_TAB_REDIRECT: Readonly<Record<string, SettingsTab>> = {
   modes: 'permissions',
@@ -48,6 +49,7 @@ function normalizeTab(raw: string | undefined): SettingsTab | undefined {
 
 const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonly hint: string; readonly icon: IconName }[] = [
   { id: 'providers', label: 'Providers', hint: 'Model endpoints and keys', icon: 'globe' },
+  { id: 'advanced', label: 'Advanced', hint: 'Timeouts and limits for requests, tools, context and admission', icon: 'sliders' },
   { id: 'projects', label: 'Projects', hint: 'Folders conversations in this workspace can work in', icon: 'folder' },
   { id: 'permissions', label: 'Permissions', hint: 'Modes & dangerous command guard', icon: 'shield' },
   { id: 'prompts', label: 'System Prompts', hint: 'Replace the fixed base & subagent prompts for this workspace', icon: 'fileText' },
@@ -61,7 +63,7 @@ const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonl
 
 /** Nav groups: global settings first, then the active workspace's. */
 const TAB_GROUPS: readonly { readonly label: string; readonly ids: readonly SettingsTab[] }[] = [
-  { label: 'Global', ids: ['providers'] },
+  { label: 'Global', ids: ['providers', 'advanced'] },
   { label: 'Workspace', ids: ['projects', 'permissions', 'prompts', 'skills', 'memory', 'agents', 'mcp', 'hooks', 'secrets'] },
 ]
 
@@ -144,8 +146,19 @@ export function SettingsModal({
   readonly onDismiss: () => void
   readonly onRefresh: () => Promise<void>
 }) {
-  const [pendingLeave, setPendingLeave] = useState<(() => void) | null>(null)
+  /**
+   * Navigation held back by unsaved work, with what confirming discards. The
+   * discard is captured with the request so it reaches the draft that was
+   * dirty when the operator asked to leave.
+   */
+  const [pendingLeave, setPendingLeave] = useState<{
+    readonly action: () => void
+    readonly provider: boolean
+    readonly discardAdvanced: (() => void) | null
+  } | null>(null)
   const [tab, setTab] = useState<SettingsTab>('providers')
+  /** Guard published by the mounted Advanced panel; cleared whenever it unmounts. */
+  const [advancedGuard, setAdvancedGuard] = useState<AdvancedGuard | null>(null)
   // Roles pin a model from the same enabled provider/model list the composer
   // offers, so a role can never name an endpoint the host cannot serve.
   const roleModelOptions = useMemo(
@@ -212,8 +225,13 @@ export function SettingsModal({
     setDraft(draftOf(first))
   }, [providers])
 
-  // Opening Settings at another tab while it is already open still switches.
-  useEffect(() => { if (open) setTab(normalizeTab(initialTab) ?? 'providers') }, [initialTab])
+  // Opening Settings at another tab while it is already open still switches,
+  // through the same guard as any other navigation.
+  useEffect(() => {
+    if (!open) return
+    const next = normalizeTab(initialTab) ?? 'providers'
+    if (next !== tab) leave(() => setTab(next))
+  }, [initialTab])
 
   const dirty = useMemo(() => {
     if (selected === undefined) return JSON.stringify(draft) !== JSON.stringify(BLANK)
@@ -228,9 +246,19 @@ export function SettingsModal({
     )
   }, [draft, selected])
 
-  const leave = (action: () => void) => {
-    if (busy !== null) return
-    if (dirty || modelDraft.trim() !== '') setPendingLeave(() => action)
+  const advanced = tab === 'advanced' ? advancedGuard : null
+  const anyBusy = busy !== null || advanced?.busy === true
+
+  // Leaving the tab or closing Settings unmounts the Advanced panel, so its
+  // guard goes with it. A remount publishes a fresh one at layout time, before
+  // this passive effect runs, and is therefore never cleared by it.
+  useEffect(() => { if (!open || tab !== 'advanced') setAdvancedGuard(null) }, [open, tab])
+
+  function leave(action: () => void): void {
+    if (anyBusy) return
+    const provider = dirty || modelDraft.trim() !== ''
+    const discardAdvanced = advanced?.dirty === true ? advanced.discard : null
+    if (provider || discardAdvanced !== null) setPendingLeave({ action, provider, discardAdvanced })
     else action()
   }
   const dismiss = () => leave(onDismiss)
@@ -242,6 +270,9 @@ export function SettingsModal({
     setModelTests({})
   }
   if (!open) return null
+  const leaveTitle = pendingLeave === null || (pendingLeave.provider && pendingLeave.discardAdvanced !== null)
+    ? 'Discard unsaved changes?'
+    : pendingLeave.provider ? 'Discard unsaved provider changes?' : 'Discard unsaved advanced settings?'
 
   const patch = (next: Partial<Draft>): void => {
     setDraft((current) => ({ ...current, ...next }))
@@ -477,7 +508,7 @@ export function SettingsModal({
                 {group.ids.map((id) => {
                   const entry = TABS.find((item) => item.id === id)
                   return entry === undefined ? null : (
-                    <Tabs.Trigger key={entry.id} value={entry.id} className={tabTrigger} disabled={busy !== null && entry.id !== tab}>
+                    <Tabs.Trigger key={entry.id} value={entry.id} className={tabTrigger} disabled={anyBusy && entry.id !== tab}>
                       <Icon name={entry.icon} size={16} className="shrink-0" aria-hidden="true" />
                       <span className="truncate">{entry.label}</span>
                     </Tabs.Trigger>
@@ -493,19 +524,20 @@ export function SettingsModal({
             <div className="flex min-w-0 flex-col">
               <div className="flex min-w-0 items-center gap-2">
                 <h2 className="m-0 text-base font-semibold">{activeTab?.label ?? 'Settings'}</h2>
-                {tab === 'providers'
+                {tab === 'providers' || tab === 'advanced'
                   ? <Badge>All workspaces</Badge>
                   : <Badge tone="blue" title="These settings apply only to this workspace.">Workspace: {workspaceName ?? workspaceId ?? 'none'}</Badge>}
               </div>
               <span className="truncate text-[13px] text-fg-faint">{activeTab?.hint ?? ''}</span>
             </div>
-            <IconButton label="Close settings" size="md" disabled={busy !== null} onClick={dismiss}><Icon name="close" size={18} /></IconButton>
+            <IconButton label="Close settings" size="md" disabled={anyBusy} onClick={dismiss}><Icon name="close" size={18} /></IconButton>
           </header>
 
           <Tabs.Content key={tab} value={tab} tabIndex={0} className="min-h-0 min-w-0 flex-1 overflow-y-auto px-5 py-5 outline-none">
 
             {tab !== 'providers' ? (
               <>
+                {tab === 'advanced' ? <AdvancedPanel onGuardChanged={setAdvancedGuard} /> : null}
                 {tab === 'projects' ? <ProjectsPanel workspaceId={workspaceId} projects={projects} onChanged={onProjectsChanged} sessionCounts={sessionCounts} /> : null}
                 {tab === 'permissions' ? <PermissionsPanel workspaceId={workspaceId} onChanged={onRefresh} /> : null}
                 {tab === 'prompts' ? <SystemPromptsPanel workspaceId={workspaceId} /> : null}
@@ -721,10 +753,17 @@ export function SettingsModal({
     </Modal>
     <ConfirmDialog
       open={pendingLeave !== null}
-      title="Discard unsaved provider changes?"
+      title={leaveTitle}
       confirmLabel="Discard changes"
       onDismiss={() => setPendingLeave(null)}
-      onConfirm={() => { const action = pendingLeave; setPendingLeave(null); discardDraft(); action?.() }}
+      onConfirm={() => {
+        const pending = pendingLeave
+        setPendingLeave(null)
+        if (pending === null) return
+        if (pending.provider) discardDraft()
+        pending.discardAdvanced?.()
+        pending.action()
+      }}
     />
     {editingModel !== null && draft.models.includes(editingModel) ? (
       <ModelSettingsDialog
