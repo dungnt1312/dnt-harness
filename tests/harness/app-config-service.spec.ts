@@ -291,6 +291,47 @@ describe('AppConfigService', () => {
     expect(field(view, 'toolTimeoutMs').source).toBe('library')
   })
 
+  it('edits are validated copies the caller cannot change during the write path', async () => {
+    const { io, service } = setup(undefined, { explicit: { toolOutputLimit: 77 } })
+    await service.boot()
+    const edit = { op: 'set', key: 'toolTimeoutMs', value: 5 } as { op: 'set'; key: string; value: number }
+    io.onRead = () => {
+      edit.key = 'toolOutputLimit'
+      edit.value = 1
+    }
+    const view = await service.edit([edit as LimitEdit], EMPTY_HASH)
+    expect(io.document).toEqual({ v: 1, limits: { toolTimeoutMs: 5 } })
+    expect(view.active.values).toMatchObject({ toolTimeoutMs: 5, toolOutputLimit: 77 })
+  })
+
+  it('concurrent edits with the same expected hash: one wins, one conflicts, one write', async () => {
+    const { io, service } = setup()
+    await service.boot()
+    const results = await Promise.allSettled([
+      service.edit([{ op: 'set', key: 'toolTimeoutMs', value: 5 }], EMPTY_HASH),
+      service.edit([{ op: 'set', key: 'streamIdleMs', value: 6 }], EMPTY_HASH),
+    ])
+    expect(results.map(r => r.status)).toEqual(['fulfilled', 'rejected'])
+    const failure = results[1] as PromiseRejectedResult
+    expect(failure.reason).toBeInstanceOf(AppConfigError)
+    expect((failure.reason as AppConfigError).code).toBe('conflict')
+    expect(io.writes).toBe(1)
+    expect(io.document).toEqual({ v: 1, limits: { toolTimeoutMs: 5 } })
+    expect(service.read().revision).toBe(1)
+  })
+
+  it('negative zero in the file is the same effective value as zero', async () => {
+    const published: LimitsSnapshot[] = []
+    const { io, service } = setup({ v: 1, limits: { compactionTailTurns: 0 } }, { onPublished: s => published.push(s) })
+    await service.boot()
+    const before = service.read()
+    io.content = '{"v":1,"limits":{"compactionTailTurns":-0}}'
+    const view = await service.reload()
+    expect(service.read()).toBe(before)
+    expect(view.outOfSync).toBe(false)
+    expect(published).toEqual([])
+  })
+
   it('notification_throw_does_not_reject_committed_edit', async () => {
     const reported: unknown[] = []
     const boom = new Error('listener failed')
@@ -386,6 +427,14 @@ describe('AppConfigService', () => {
     const ioError = await rejection(service.reload())
     expect(ioError.code).toBe('io')
     expect(service.read()).toBe(before)
+  })
+
+  it('boot twice rejects and keeps the first snapshot', async () => {
+    const { service } = setup()
+    await service.boot()
+    const first = service.read()
+    await expect(service.boot()).rejects.toThrow(/already booted/)
+    expect(service.read()).toBe(first)
   })
 
   it('boot_invalid_refuses', async () => {
@@ -502,6 +551,25 @@ describe('readLimits', () => {
     expect(readLimits(kernel.ctx)).toBe(service.read())
     await service.edit([{ op: 'set', key: 'toolTimeoutMs', value: 43 }], hashOf({ v: 1, limits: { toolTimeoutMs: 42 } }))
     expect(readLimits(kernel.ctx)).toMatchObject({ revision: 1, values: { toolTimeoutMs: 43 } })
+    await kernel.stop()
+  })
+
+  it('repeated legacy fallback reads return the same snapshot', async () => {
+    const kernel = new Kernel()
+    expect(readLimits(kernel.ctx)).toBe(readLimits(kernel.ctx))
+    const legacy = { toolTimeoutMs: 1234 }
+    kernel.ctx.provide('limits', legacy)
+    const first = readLimits(kernel.ctx)
+    expect(readLimits(kernel.ctx)).toBe(first)
+    expect(first.values.toolTimeoutMs).toBe(1234)
+    await kernel.stop()
+  })
+
+  it('a mounted limits-reader without read() is a wiring error, not a fallback', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.provide('limits', { toolTimeoutMs: 1234 })
+    kernel.ctx.provide('limits-reader', { snapshot: 1 })
+    expect(() => readLimits(kernel.ctx)).toThrow(/limits-reader/)
     await kernel.stop()
   })
 

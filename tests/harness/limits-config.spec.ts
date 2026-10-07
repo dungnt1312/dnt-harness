@@ -79,6 +79,11 @@ describe('parseLimitOverrides', () => {
   it('accepts zero pressure and zero tail', () => {
     expect(parseLimitOverrides({ automaticCompactionPressure: 0, compactionTailTurns: 0 })).toEqual({ automaticCompactionPressure: 0, compactionTailTurns: 0 })
   })
+  it('normalises negative zero to zero on zero-capable keys', () => {
+    const parsed = parseLimitOverrides({ compactionTailTurns: -0, automaticCompactionPressure: -0 })
+    expect(Object.is(parsed.compactionTailTurns, 0)).toBe(true)
+    expect(Object.is(parsed.automaticCompactionPressure, 0)).toBe(true)
+  })
   it('rejects zero stepRetries, fractional streamIdleMs and unknown keys', () => {
     expect(() => parseLimitOverrides({ stepRetries: 0 })).toThrow()
     expect(() => parseLimitOverrides({ streamIdleMs: 1.5 })).toThrow()

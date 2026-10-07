@@ -1,5 +1,5 @@
 import { DEFAULT_LIMITS, isValidLimit, type HarnessLimits } from '../limits.ts'
-import { LIMIT_FIELDS, type LimitKey } from '../limits-config.ts'
+import { LIMIT_FIELDS, isPlainObject, type LimitKey } from '../limits-config.ts'
 import type { AppConfigStore, ConfigRead } from './store.ts'
 import {
   AppConfigError,
@@ -36,7 +36,10 @@ const KNOWN_KEYS = new Set<string>(LIMIT_KEYS)
 function validEntries(partial: Partial<HarnessLimits> | undefined): Readonly<Limits> {
   const out: Limits = {}
   if (partial !== null && typeof partial === 'object') {
-    for (const key of LIMIT_KEYS) if (isValidLimit(key, partial[key])) out[key] = partial[key]
+    for (const key of LIMIT_KEYS) {
+      const value = partial[key]
+      if (isValidLimit(key, value)) out[key] = value === 0 ? 0 : value
+    }
   }
   return Object.freeze(out)
 }
@@ -48,42 +51,46 @@ function freezeDocument(document: AppConfigDocument): AppConfigDocument {
 }
 
 function sameValues(a: Readonly<HarnessLimits>, b: Readonly<HarnessLimits>): boolean {
-  return LIMIT_KEYS.every(key => Object.is(a[key], b[key]))
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
-  const proto = Object.getPrototypeOf(value) as object | null
-  return proto === Object.prototype || proto === null
+  // `===` on purpose: -0 and 0 are the same effective limit.
+  return LIMIT_KEYS.every(key => a[key] === b[key])
 }
 
 /**
  * Strict runtime validation of an untrusted edit batch: every entry must be a
  * plain `{op,key[,value]}` with a known key, a valid value for `set`, and at
- * most one edit per key; an empty batch is refused. Any failure rejects the whole batch.
+ * most one edit per key; an empty batch is refused. Any failure rejects the
+ * whole batch. Each property is read once and the result is a frozen array of
+ * fresh frozen edits, so later caller mutations cannot alter what is applied.
  */
 function validateEdits(edits: unknown): readonly LimitEdit[] {
   if (!Array.isArray(edits)) throw new AppConfigError('invalid', 'edits must be an array')
   // The operator's file is only rewritten through explicit set/unset edits.
   if (edits.length === 0) throw new AppConfigError('invalid', 'edits must not be empty')
   const seen = new Set<string>()
+  const validated: LimitEdit[] = []
   for (const edit of edits as unknown[]) {
     if (!isPlainObject(edit)) throw new AppConfigError('invalid', 'each edit must be a plain object')
-    const { op, key } = edit
+    const fields = Object.keys(edit)
+    const op = edit['op']
+    const key = edit['key']
+    const value = edit['value']
     if (typeof key !== 'string' || !KNOWN_KEYS.has(key)) throw new AppConfigError('invalid', `unknown limit key: ${String(key)}`)
     const limitKey = key as LimitKey
     if (seen.has(key)) throw new AppConfigError('invalid', `duplicate edit for limit ${key}`, limitKey)
     seen.add(key)
     const allowed = op === 'set' ? ['op', 'key', 'value'] : op === 'unset' ? ['op', 'key'] : undefined
     if (allowed === undefined) throw new AppConfigError('invalid', `unknown edit op: ${String(op)}`, limitKey)
-    for (const field of Object.keys(edit)) {
+    for (const field of fields) {
       if (!allowed.includes(field)) throw new AppConfigError('invalid', `unexpected edit field '${field}' for ${key}`, limitKey)
     }
-    if (op === 'set' && !isValidLimit(limitKey, edit['value'])) {
-      throw new AppConfigError('invalid', `invalid value for limit ${key}`, limitKey)
+    if (op === 'set') {
+      if (!isValidLimit(limitKey, value)) throw new AppConfigError('invalid', `invalid value for limit ${key}`, limitKey)
+      validated.push(Object.freeze({ op, key: limitKey, value: value === 0 ? 0 : value }))
+    } else {
+      validated.push(Object.freeze({ op: 'unset' as const, key: limitKey }))
     }
   }
-  return edits as readonly LimitEdit[]
+  return Object.freeze(validated)
 }
 
 /**
@@ -121,10 +128,8 @@ export class AppConfigService implements LimitsReader {
   boot(): Promise<void> {
     return this.serialize(async () => {
       if (this.snapshot !== undefined) throw new Error('app-config service already booted')
-      const observed = this.requireValid(await this.store.read())
-      this.activeFile = Object.freeze({ ...observed.document.limits })
-      this.activeHash = observed.hash
-      this.snapshot = Object.freeze({ revision: 0, values: this.compose(this.activeFile) })
+      const values = this.adopt(this.requireValid(await this.store.read()))
+      this.snapshot = Object.freeze({ revision: 0, values })
     })
   }
 
@@ -133,7 +138,11 @@ export class AppConfigService implements LimitsReader {
     return this.snapshot
   }
 
-  /** Observe the disk for an editor; never activates. Unreadable files reject with `io`. */
+  /**
+   * Observe the disk for an editor; never activates. Unreadable files reject
+   * with `io`. Not serialized behind edit/reload: during an in-flight edit it
+   * may transiently report `outOfSync` until that edit publishes.
+   */
   async describe(): Promise<AppConfigView> {
     this.read()
     return this.view(await this.store.read())
@@ -194,17 +203,17 @@ export class AppConfigService implements LimitsReader {
     return read
   }
 
-  private compose(file: Readonly<Limits>): Readonly<HarnessLimits> {
-    return Object.freeze({ ...this.inherited, ...file, ...this.explicit })
+  /** Make an observation the active file layer and return its composed values. */
+  private adopt(observed: Observation): Readonly<HarnessLimits> {
+    this.activeFile = Object.freeze({ ...observed.document.limits })
+    this.activeHash = observed.hash
+    return Object.freeze({ ...this.inherited, ...this.activeFile, ...this.explicit })
   }
 
   /** Synchronous, non-throwing swap; notification failures are contained. */
   private activate(observed: Observation): void {
-    const file = Object.freeze({ ...observed.document.limits })
-    const values = this.compose(file)
     const previous = this.read()
-    this.activeFile = file
-    this.activeHash = observed.hash
+    const values = this.adopt(observed)
     if (sameValues(previous.values, values)) return
     const snapshot: LimitsSnapshot = Object.freeze({ revision: previous.revision + 1, values })
     this.snapshot = snapshot

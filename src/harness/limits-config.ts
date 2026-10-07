@@ -42,6 +42,13 @@ export const LIMIT_FIELDS: readonly LimitField[] = [
 /** Web-host-only limit defaults: automatic compaction at 0.85 pressure; the library default stays 0 (disabled). */
 export const WEB_LIMIT_DEFAULTS: Readonly<Partial<HarnessLimits>> = Object.freeze({ automaticCompactionPressure: 0.85 })
 
+/** True for JSON-style plain objects (Object or null prototype), never arrays. */
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const proto = Object.getPrototypeOf(value) as object | null
+  return proto === Object.prototype || proto === null
+}
+
 const LIMIT_FIELDS_BY_KEY = new Map(LIMIT_FIELDS.map(f => [f.key, f]))
 
 /**
@@ -51,13 +58,7 @@ const LIMIT_FIELDS_BY_KEY = new Map(LIMIT_FIELDS.map(f => [f.key, f]))
  * `Partial<HarnessLimits>` — missing keys mean "inherit", never a default fill.
  */
 export function parseLimitOverrides(input: unknown): Partial<HarnessLimits> {
-  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
-    throw new Error('limits overrides must be a plain object')
-  }
-  const proto = Object.getPrototypeOf(input) as object | null
-  if (proto !== Object.prototype && proto !== null) {
-    throw new Error('limits overrides must be a plain object')
-  }
+  if (!isPlainObject(input)) throw new Error('limits overrides must be a plain object')
   // HarnessLimits properties are readonly; the accumulator is a fresh detached
   // object the caller owns, so writes go through a mutable view of the same shape.
   const overrides = {} as { -readonly [K in LimitKey]?: number }
@@ -65,7 +66,8 @@ export function parseLimitOverrides(input: unknown): Partial<HarnessLimits> {
     const key = rawKey as LimitKey
     if (!LIMIT_FIELDS_BY_KEY.has(key)) throw new Error(`unknown limit key: ${rawKey}`)
     if (!isValidLimit(key, value)) throw new Error(`invalid value for limit ${rawKey}`)
-    overrides[key] = value
+    // `-0 === 0`: store a plain 0 so values, canonical bytes and hashes agree.
+    overrides[key] = value === 0 ? 0 : value
   }
   return overrides as Partial<HarnessLimits>
 }

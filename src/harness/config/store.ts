@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
-import { parseLimitOverrides } from '../limits-config.ts'
+import { isPlainObject, parseLimitOverrides } from '../limits-config.ts'
 import { AppConfigError, type AppConfigDocument } from './types.ts'
 
 /** Optional test/production seam; defaults read utf8 and write via replaceFileAtomic. */
@@ -46,14 +46,8 @@ function parseDocument(raw: string): AppConfigDocument {
   } catch (error) {
     throw new AppConfigError('invalid', `app-config is not valid JSON: ${String(error)}`)
   }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new AppConfigError('invalid', 'app-config must be a JSON object')
-  }
-  const proto = Object.getPrototypeOf(parsed) as object | null
-  if (proto !== Object.prototype && proto !== null) {
-    throw new AppConfigError('invalid', 'app-config must be a plain JSON object')
-  }
-  const record = parsed as Record<string, unknown>
+  if (!isPlainObject(parsed)) throw new AppConfigError('invalid', 'app-config must be a plain JSON object')
+  const record = parsed
   for (const key of Object.keys(record)) {
     if (key !== 'v' && key !== 'limits') throw new AppConfigError('invalid', `unknown app-config section: ${key}`)
   }
