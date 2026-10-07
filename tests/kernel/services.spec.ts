@@ -168,4 +168,86 @@ describe('services and inject (tutorial ch.3)', () => {
     expect(() => kernel.ctx.plugin(greeterPlugin)).toThrow(/already provided/)
     void kernel.stop()
   })
+
+  it('dependency-woken consumer failure is contained — the publisher stays active', async () => {
+    const kernel = new Kernel()
+    const boom = new Error('consumer startup failed')
+
+    const provider = {
+      name: 'provider',
+      apply: (ctx: Context) => {
+        ctx.provide('greeter', { greet: (who: string) => `Hello, ${who}!` })
+      },
+    }
+
+    // The consumer pends; the provider's publication inside its own start is
+    // what wakes it. The woken consumer throws synchronously during that wake
+    // pass — the throw is contained at the producer and never reaches the
+    // caller who mounted the provider.
+    kernel.ctx.plugin({
+      name: 'woken-consumer',
+      inject: ['greeter'],
+      apply: () => {
+        throw boom
+      },
+    })
+
+    let providerFiber: import('dnt-harness').Fiber | undefined
+    expect(() => {
+      providerFiber = kernel.ctx.plugin(provider)
+    }).not.toThrow()
+
+    await kernel.settle()
+
+    expect(providerFiber?.state).toBe('active')
+    // The publisher stays active and owns its service; the failed consumer does not.
+    expect(kernel.services.has('greeter')).toBe(true)
+    const failed = kernel.inspect().find((d) => d.name === 'woken-consumer')
+    expect(failed?.error).toBe(boom)
+    expect(failed?.fiber.state).toBe('disposed')
+    await kernel.stop()
+  })
+
+  it('failed and retired entries are not wake or restart candidates', async () => {
+    const kernel = new Kernel()
+    let consumerRuns = 0
+    const boom = new Error('consumer startup failed')
+
+    // The consumer pends, then is woken by the provider's publication inside
+    // that provider's own startup — a kernel-internal wake — and fails. That
+    // first run retires the entry for good.
+    const consumer = {
+      name: 'consumer',
+      inject: ['greeter'],
+      apply: () => {
+        consumerRuns++
+        throw boom
+      },
+    }
+    const provider = {
+      name: 'provider',
+      apply: (ctx: Context) => {
+        ctx.provide('greeter', { greet: (who: string) => `Hello, ${who}!` })
+      },
+    }
+
+    kernel.ctx.plugin(consumer)
+    const providerFiber = kernel.ctx.plugin(provider)
+    await kernel.settle()
+
+    expect(consumerRuns).toBe(1)
+    expect(kernel.inspect().find((d) => d.name === 'consumer')?.error).toBe(boom)
+    expect(providerFiber.state).toBe('active')
+
+    // The service goes away and returns: only live pending entries react; the
+    // retired consumer never restarts.
+    await providerFiber.dispose()
+    await kernel.settle()
+    expect(consumerRuns).toBe(1)
+
+    kernel.ctx.plugin(provider)
+    await kernel.settle()
+    expect(consumerRuns).toBe(1)
+    await kernel.stop()
+  })
 })

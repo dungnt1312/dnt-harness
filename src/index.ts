@@ -4,7 +4,7 @@
  * streaming seam, turn/step driver).
  */
 // ── Kernel ────────────────────────────────────────────────────────────────
-export { EventBus, type Events, type DispatchMode, type EventOptions } from './kernel/events.ts'
+export { EventBus, type Events, type DispatchMode, type EventOptions, type PluginFailedDetail, type PluginFailedPhase } from './kernel/events.ts'
 export {
   Fiber,
   assertNever,
@@ -20,6 +20,7 @@ export {
   resolvePlugin,
   type PluginTarget,
   type ResolvedPlugin,
+  type PluginDiagnostic,
 } from './kernel/registry.ts'
 export {
   boot,

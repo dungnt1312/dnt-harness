@@ -1,5 +1,5 @@
 import type { EventBus, Events, EventOptions } from './events.ts'
-import { Fiber, type Effect } from './fiber.ts'
+import { assertNever, Fiber, type Effect } from './fiber.ts'
 import type { Kernel, PluginTarget } from './registry.ts'
 
 /**
@@ -33,8 +33,15 @@ export class Context {
   on<K extends string & keyof Events>(name: K, listener: Events[K], options?: boolean | EventOptions): () => boolean
   on(name: string, listener: (...args: never[]) => unknown, options?: boolean | EventOptions): () => boolean
   on(name: string, listener: (...args: never[]) => unknown, options?: boolean | EventOptions): () => boolean {
+    this.guard('ctx.on')
     const dispose = this.events.on(name, listener, options)
-    void this.fiber.effect(() => dispose, `ctx.on(${name})`)
+    try {
+      this.fiber.effect(() => dispose, `ctx.on(${name})`)
+    } catch (error) {
+      // The owner cannot own it: undo the bus registration, then rethrow.
+      dispose()
+      throw error
+    }
     return dispose
   }
 
@@ -47,8 +54,15 @@ export class Context {
   once<K extends string & keyof Events>(name: K, listener: Events[K], options?: boolean | EventOptions): () => boolean
   once(name: string, listener: (...args: never[]) => unknown, options?: boolean | EventOptions): () => boolean
   once(name: string, listener: (...args: never[]) => unknown, options?: boolean | EventOptions): () => boolean {
+    this.guard('ctx.once')
     const dispose = this.events.once(name, listener, options)
-    void this.fiber.effect(() => dispose, `ctx.once(${name})`)
+    try {
+      this.fiber.effect(() => dispose, `ctx.once(${name})`)
+    } catch (error) {
+      // The owner cannot own it: undo the bus registration, then rethrow.
+      dispose()
+      throw error
+    }
     return dispose
   }
 
@@ -103,6 +117,7 @@ export class Context {
    * @returns a disposer that tears this one effect down and settles once done.
    */
   effect(execute: () => Effect, label?: string): () => Promise<void> {
+    this.guard('ctx.effect')
     return this.fiber.effect(execute, label)
   }
 
@@ -110,13 +125,22 @@ export class Context {
    * Register a service implementation owned by the current fiber. The value
    * becomes visible as `ctx.<name>` to consumers; it is unregistered when the
    * returned disposer runs or the fiber unloads. Throws when the name is
-   * already provided.
+   * already provided or when the owning fiber can no longer own it — the
+   * store is never mutated in that case, so the service cannot leak.
    *
    * @returns a disposer that unregisters the service.
    */
   provide(name: string, value: unknown): () => Promise<void> {
+    this.guard(`ctx.provide(${name})`)
     this.kernel.services.set(name, value)
-    return this.fiber.effect(() => () => this.kernel.services.delete(name), `ctx.provide(${name})`)
+    try {
+      return this.fiber.effect(() => () => this.kernel.services.delete(name), `ctx.provide(${name})`)
+    } catch (error) {
+      // The owner cannot own it: undo the store mutation so the service never
+      // leaks past a fiber that cannot unload it.
+      this.kernel.services.delete(name)
+      throw error
+    }
   }
 
   /**
@@ -133,16 +157,51 @@ export class Context {
    * child, the fresh fiber mounts root-owned — parent linkage is not
    * re-established across dependency-driven restarts.
    *
+   * Throws when the owning fiber can no longer own the child; the child is
+   * never mounted in that case.
+   *
    * @returns the child fiber.
    */
   plugin(target: PluginTarget): Fiber {
+    this.guard('ctx.plugin')
     const definition = this.kernel.resolvePlugin(target)
-    const child = this.kernel.plugin(definition)
+    const child = this.kernel.plugin(definition, this.fiber)
     // The effect body must return a disposer, not the teardown promise
     // itself: returning `child.dispose()` here would be mistaken for a
     // promise *of* a disposer and crash at unload.
-    void this.fiber.effect(() => () => child.dispose(), `ctx.plugin(${definition.name})`)
+    try {
+      this.fiber.effect(() => () => child.dispose(), `ctx.plugin(${definition.name})`)
+    } catch (error) {
+      // Undo the mount so the child never outlives an owner that cannot own
+      // it. The child has not run yet (its body starts asynchronously when
+      // `apply` is async) or ran synchronously — either way its fiber's
+      // teardown unwinds whatever it acquired.
+      void child.dispose().catch(() => {})
+      throw error
+    }
     return child
+  }
+
+  /**
+   * Ownership guard: registration side effects run only while this context's
+   * fiber can still own what it registers — before it, a service could leak
+   * past its unloader or a child outlive its parent.
+   *
+   * @param what — label used in the thrown error.
+   */
+  private guard(what: string): void {
+    switch (this.fiber.state) {
+      case 'pending':
+      case 'loading':
+      case 'active':
+        return
+      case 'unloading':
+      case 'disposed':
+      case 'failed':
+        throw new Error(`cannot register '${what}' on fiber '${this.fiber.name}' in state '${this.fiber.state}'`)
+      default:
+        assertNever(this.fiber.state)
+    }
   }
 }
 

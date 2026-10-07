@@ -2,7 +2,7 @@
  * The mini-Cordis kernel surface: event bus, fiber lifecycle, service store,
  * context proxy, service base, kernel registry, and the YAML loader.
  */
-export { EventBus, type Events, type DispatchMode, type EventOptions, type WaterfallBoundary } from './events.ts'
+export { EventBus, type Events, type DispatchMode, type EventOptions, type WaterfallBoundary, type PluginFailedDetail, type PluginFailedPhase } from './events.ts'
 export {
   Fiber,
   assertNever,
@@ -18,6 +18,7 @@ export {
   resolvePlugin,
   type PluginTarget,
   type ResolvedPlugin,
+  type PluginDiagnostic,
 } from './registry.ts'
 export {
   boot,
