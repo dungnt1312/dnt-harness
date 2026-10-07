@@ -789,21 +789,16 @@ export function setSkillHidden(workspaceId: string, name: string, hidden: boolea
 
 // ── G3 memory ───────────────────────────────────────────────────────────────
 
-/** `?projectId=` selects the project tier; null/undefined is the workspace tier. */
-function memoryScopeQuery(projectId: string | null | undefined, lead: '?' | '&'): string {
-  return projectId === null || projectId === undefined || projectId === '' ? '' : `${lead}projectId=${encodeURIComponent(projectId)}`
+export function searchMemory(workspaceId: string, query: string): Promise<MemoryEntryRow[]> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory?q=${encodeURIComponent(query)}`).then((r) => json<MemoryEntryRow[]>(r))
 }
 
-export function searchMemory(workspaceId: string, query: string, projectId?: string | null): Promise<MemoryEntryRow[]> {
-  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory?q=${encodeURIComponent(query)}${memoryScopeQuery(projectId, '&')}`).then((r) => json<MemoryEntryRow[]>(r))
+export function readMemory(workspaceId: string, id: string): Promise<MemoryEntryRow> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory/${encodeURIComponent(id)}`).then((r) => json<MemoryEntryRow>(r))
 }
 
-export function readMemory(workspaceId: string, id: string, projectId?: string | null): Promise<MemoryEntryRow> {
-  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory/${encodeURIComponent(id)}${memoryScopeQuery(projectId, '?')}`).then((r) => json<MemoryEntryRow>(r))
-}
-
-export function createMemory(workspaceId: string, input: { readonly id: string; readonly title: string; readonly body: string; readonly pinned?: boolean }, projectId?: string | null): Promise<MemoryEntryRow> {
-  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory${memoryScopeQuery(projectId, '?')}`, {
+export function createMemory(workspaceId: string, input: { readonly id: string; readonly title: string; readonly body: string; readonly pinned?: boolean }): Promise<MemoryEntryRow> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ ...input, ...(input.pinned === true ? { pinned: true } : {}) }),
@@ -814,9 +809,8 @@ export function updateMemory(
   workspaceId: string,
   id: string,
   input: { readonly expectedHash: string; readonly title?: string; readonly body?: string; readonly pinned?: boolean },
-  projectId?: string | null,
 ): Promise<MemoryEntryRow> {
-  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory/${encodeURIComponent(id)}${memoryScopeQuery(projectId, '?')}`, {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory/${encodeURIComponent(id)}`, {
     method: 'PATCH',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -828,8 +822,8 @@ export function updateMemory(
   }).then((r) => json<MemoryEntryRow>(r))
 }
 
-export function deleteMemory(workspaceId: string, id: string, projectId?: string | null): Promise<{ readonly forgotten: boolean }> {
-  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory/${encodeURIComponent(id)}${memoryScopeQuery(projectId, '?')}`, { method: 'DELETE' }).then((r) =>
+export function deleteMemory(workspaceId: string, id: string): Promise<{ readonly forgotten: boolean }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory/${encodeURIComponent(id)}`, { method: 'DELETE' }).then((r) =>
     json<{ readonly forgotten: boolean }>(r),
   )
 }

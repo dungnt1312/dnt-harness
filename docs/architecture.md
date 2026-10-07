@@ -42,7 +42,9 @@ of agents, LLMs, or tools; it only provides the mechanics of composition:
 - **Dependency-driven boot** (`Kernel`): boot order comes from `inject`, never
   from mount order. Missing dependencies leave a plugin `pending`; mounting a
   provider wakes it. Losing a required service disposes and re-mounts every
-  dependent.
+  dependent. `kernel.stop()` fences mounts and restarts, attempts every
+  cleanup, and reports one cached whole-kernel verdict — resolving clean or
+  rejecting with an `AggregateError` of the unresolved teardown failures.
 - **Composition loader** (`loader.ts`): a `cordis.yml`-style YAML file turns
   into a plugin tree through dynamic `import()`.
 
@@ -186,6 +188,23 @@ Kernel constructor
           └─ agent.send(msg); await agent.run()
               └─ turn() … step() … tool pipeline … turn/end
 Kernel.stop()
-  └─ detaches store observer, disposes every fiber (reverse effect order),
-     then the root fiber
+  └─ fences mounts/restarts synchronously (later mounts throw; the store
+     observer is detached so a removal cannot schedule a replacement)
+  └─ disposes every mounted plugin — attempting EVERY cleanup; one failing
+     disposer never skips another — then the root fiber
+  └─ awaits the kernel-owned transitions it started (NOT a `loading` body
+     still parked on its own I/O: in-flight JavaScript is not cancellable)
+  └─ settles the whole-kernel verdict ONCE, cached for every caller:
+     resolves clean, or rejects with one AggregateError listing the
+     unresolved teardown failures (already-cleaned startup failures are
+     never replayed)
 ```
+
+The kernel cannot cancel arbitrary running JavaScript: a plugin body that never
+settles keeps running after `stop()` returns, fenced out of the (now empty)
+registry. Hosts that must bound a shutdown wrap `kernel.stop()` in their own
+deadline (`boundedCleanup`) and report ownership as retained when quiescence
+cannot be proven — e.g. the data-home writer lock is released only when every
+durable writer provably unwound, so a timed-out shutdown leaves the home locked
+rather than handing it to a successor while a zombie writer might still touch
+it.

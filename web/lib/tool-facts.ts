@@ -77,7 +77,7 @@ export function toolDisplayName(name: string): string {
 
 const PATH_KEYS = ['path', 'file_path'] as const
 /** The marker `cap()` appends when a tool output was cut to its limit. */
-const TRUNCATION = /(?:^|\n)… \[(?:truncated \d+ chars|output truncated)\](?=\n|$)/
+const TRUNCATION = /\n… \[truncated \d+ chars\]$/
 
 function str(args: Record<string, unknown>, key: string): string | undefined {
   const value = args[key]
@@ -185,28 +185,25 @@ function fileParts(path: string, window = ''): { name: string; directory: string
 }
 
 /** The note `Glob` appends once it has listed its cap: `… [+523 more matches]`. */
-const GLOB_MORE = /(?:^|\n)… \[\+(\d+) more matches\](?=\n|$)/
-const SEARCH_INCOMPLETE = /(?:^|\n)… \[search incomplete:/
+const GLOB_MORE = /\n… \[\+(\d+) more matches\]\s*$/
 /** A note a list tool writes about itself (`… [more matches truncated]`), not a match. */
 const NOTE_LINE = /^… \[/
 
 function globDigest(output: string): string {
-  const incomplete = SEARCH_INCOMPLETE.test(output)
-  if (output.startsWith('no matches')) return incomplete ? 'search incomplete' : 'no matches'
+  if (output.startsWith('no matches')) return 'no matches'
   const body = output.replace(TRUNCATION, '')
   const more = GLOB_MORE.exec(body)
-  const shown = listLines(body).filter((line) => !NOTE_LINE.test(line)).length
-  if (incomplete && shown === 0) return 'search incomplete'
-  const count = more?.[1] !== undefined ? `${shown} of ${shown + Number(more[1])} files` : plural(shown, 'file')
-  return `${count}${incomplete ? ' · search incomplete' : TRUNCATION.test(output) ? ' · truncated' : ''}`
+  const shown = listLines(body.replace(GLOB_MORE, '')).length
+  // The note is a count, not a file: it is never listed, and the total it
+  // reports is what the reader wants to know.
+  if (more?.[1] !== undefined) return `${shown} of ${shown + Number(more[1])} files`
+  return `${plural(shown, 'file')}${TRUNCATION.test(output) ? ' · truncated' : ''}`
 }
 
 function grepDigest(output: string): string {
-  const incomplete = SEARCH_INCOMPLETE.test(output)
-  if (output.startsWith('no matches')) return incomplete ? 'search incomplete' : 'no matches'
+  if (output.startsWith('no matches')) return 'no matches'
   const lines = listLines(output)
   const hits = lines.filter((line) => !NOTE_LINE.test(line))
-  if (incomplete && hits.length === 0) return 'search incomplete'
   const files = new Set<string>()
   for (const line of hits) {
     const match = /^(.*?):\d+: /.exec(line)
@@ -215,7 +212,7 @@ function grepDigest(output: string): string {
   const truncated = hits.length < lines.length || TRUNCATION.test(output)
   const matches = plural(hits.length, 'match', 'matches')
   const where = files.size > 1 ? ` · ${plural(files.size, 'file')}` : ''
-  return `${matches}${where}${incomplete ? ' · search incomplete' : truncated ? ' · truncated' : ''}`
+  return `${matches}${where}${truncated ? ' · truncated' : ''}`
 }
 
 /** What `Bash` writes when it cut its own output. */

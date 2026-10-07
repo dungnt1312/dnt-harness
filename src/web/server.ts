@@ -133,6 +133,7 @@ import { protectedRootsForRules, resolveSkillLayers, type SkillLayer } from '../
 import { MemoryService, MemoryError } from '../harness/memory/service.ts'
 import { memoryGuidance, memoryIndexes } from '../harness/memory/context.ts'
 import { todoWriteTool } from '../harness/tools/todo.ts'
+import { askUserQuestionTool, validateAnswers, type QuestionOutcome, type UserQuestion } from '../harness/tools/ask-user.ts'
 import { buildContext, DEFAULT_BASE_SYSTEM, DEFAULT_CHILD_SYSTEM, type ContextManifest, type ActiveSkill, type MemorySnippet } from '../harness/context/builder.ts'
 import { renderEnvironmentContext } from '../harness/context/environment.ts'
 import { SystemPromptsStore, type SystemPromptsSnapshot } from '../harness/prompts/store.ts'
@@ -167,6 +168,18 @@ declare module 'dnt-harness' {
     'web/approval-settled'(payload: {
       readonly sessionId: SessionId
       readonly approvalId: string
+      readonly parentSessionId?: SessionId
+    }): void
+    /** The model asked the human questions (AskUserQuestion) on one session. */
+    'web/question'(payload: {
+      readonly sessionId: SessionId
+      readonly questionId: string
+      readonly parentSessionId?: SessionId
+    }): void
+    /** A pending AskUserQuestion was answered, declined, expired, or stopped. */
+    'web/question-settled'(payload: {
+      readonly sessionId: SessionId
+      readonly questionId: string
       readonly parentSessionId?: SessionId
     }): void
     /**
@@ -215,6 +228,17 @@ export type WebEnvelope =
     readonly expiresAt?: number
   }
   | { readonly kind: 'approval-settled'; readonly approvalId: string }
+  | {
+    readonly kind: 'question'
+    readonly questionId: string
+    /** The model's tool call id, so the transcript can anchor the card. */
+    readonly callId: string
+    readonly questions: readonly UserQuestion[]
+    readonly expiresAt: number
+    readonly childSessionId?: string
+    readonly definitionName?: string
+  }
+  | { readonly kind: 'question-settled'; readonly questionId: string }
   | { readonly kind: 'error'; readonly message: string }
 
 /** Options for {@link createWebServer}. */
@@ -382,6 +406,35 @@ interface PendingApproval {
   readonly proposedGrant?: string
   readonly proposedAccess?: 'read' | 'write'
   resolve(allow: boolean): void
+}
+
+/** One AskUserQuestion call waiting for its human (see `askUserQuestionTool`). */
+interface PendingQuestion {
+  readonly sessionId: SessionId
+  readonly workspaceId: WorkspaceId
+  readonly principalId?: string
+  readonly callId: string
+  readonly questions: readonly UserQuestion[]
+  readonly parentSessionId?: SessionId
+  readonly definitionName?: string
+  readonly expiresAt: number
+  settle(outcome: QuestionOutcome): void
+}
+
+function questionEnvelope(questionId: string, waiting: PendingQuestion, viewerSessionId: SessionId): Extract<WebEnvelope, { kind: 'question' }> {
+  return {
+    kind: 'question',
+    questionId,
+    callId: waiting.callId,
+    questions: waiting.questions,
+    expiresAt: waiting.expiresAt,
+    ...(waiting.parentSessionId !== undefined && viewerSessionId === waiting.parentSessionId
+      ? {
+        childSessionId: waiting.sessionId,
+        ...(waiting.definitionName !== undefined ? { definitionName: waiting.definitionName } : {}),
+      }
+      : {}),
+  }
 }
 
 /**
@@ -1370,6 +1423,69 @@ ${entry.description}`.toLowerCase().includes(query))
   })
   // Claude-style session task list: full-replacement tool, state IS the log.
   kernel.ctx.tools.register(todoWriteTool())
+
+  // AskUserQuestion: the model pauses for a human choice. The question
+  // itself is the durable `tool/call`, the answer the `tool/result`; this map
+  // only holds the live waiter (a restart ends the turn, so nothing to rebuild).
+  const pendingQuestions = new Map<string, PendingQuestion>()
+  kernel.ctx.tools.register(askUserQuestionTool({
+    ask: (questions, exec) => new Promise<QuestionOutcome>((resolve, reject) => {
+      const scope = agentScope.getStore()
+      if (scope === undefined) {
+        reject(new Error('AskUserQuestion needs an interactive conversation; no human is attached'))
+        return
+      }
+      if (exec.signal?.aborted === true) {
+        reject(new Error('cancelled: stop requested while asking the user'))
+        return
+      }
+      // Unguessable capability id: the answer route is transport-global.
+      const questionId = `question-${randomUUID()}`
+      const parentSessionId = scope.childOf?.parentSessionId
+      const definitionName = scope.childOf?.definition
+      const principalId = sessionPrincipals.get(scope.sessionId)
+      const workspaceId = (scope.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)) as WorkspaceId
+      const expiresAt = Date.now() + limits.questionExpiryMs
+      let settled = false
+      const finish = (apply: () => void): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        exec.signal?.removeEventListener('abort', onAbort)
+        pendingQuestions.delete(questionId)
+        kernel.ctx.emit('web/question-settled', {
+          sessionId: scope.sessionId,
+          questionId,
+          ...(parentSessionId !== undefined ? { parentSessionId } : {}),
+        })
+        apply()
+      }
+      const timer = setTimeout(() => {
+        finish(() => resolve({ kind: 'declined', reason: 'no answer before the question expired' }))
+      }, limits.questionExpiryMs)
+      timer.unref?.()
+      const onAbort = (): void => {
+        finish(() => reject(new Error('cancelled: stop requested while asking the user')))
+      }
+      exec.signal?.addEventListener('abort', onAbort, { once: true })
+      pendingQuestions.set(questionId, {
+        sessionId: scope.sessionId,
+        workspaceId,
+        ...(principalId !== undefined ? { principalId } : {}),
+        callId: exec.toolCallId ?? '',
+        questions,
+        ...(parentSessionId !== undefined ? { parentSessionId } : {}),
+        ...(definitionName !== undefined ? { definitionName } : {}),
+        expiresAt,
+        settle: (outcome) => finish(() => resolve(outcome)),
+      })
+      kernel.ctx.emit('web/question', {
+        sessionId: scope.sessionId,
+        questionId,
+        ...(parentSessionId !== undefined ? { parentSessionId } : {}),
+      })
+    }),
+  }))
 
   // G4 delegation for the model itself. Async by design: one step runs its
   // tool calls in sequence, so a blocking spawn would serialize children and
@@ -2611,6 +2727,7 @@ ${entry.description}`.toLowerCase().includes(query))
     processReconciled: new Set<SessionId>(),
     unavailableSessions,
     pending,
+    pendingQuestions,
     staticDir,
     limits,
     approvalHandle,
@@ -2818,6 +2935,8 @@ interface HandlerDeps {
   readonly processReconciled: Set<SessionId>
   readonly unavailableSessions: Set<SessionId>
   readonly pending: Map<string, PendingApproval>
+  /** Live AskUserQuestion waiters, answered by `POST /api/questions/:id`. */
+  readonly pendingQuestions: Map<string, PendingQuestion>
   readonly staticDir: string
   readonly limits: HarnessLimits
   readonly approvalHandle: ApprovalHandle
@@ -3214,6 +3333,9 @@ async function handleAuth(req: IncomingMessage, res: ServerResponse, pathname: s
         waiting.resolve(false)
       }
     }
+    for (const waiting of [...deps.pendingQuestions.values()]) {
+      if (waiting.principalId === decision.principal.id) waiting.settle({ kind: 'declined', reason: 'the user signed out' })
+    }
     send(200, { revoked: true }, { 'set-cookie': CLEARED_SESSION_COOKIE })
     return
   }
@@ -3254,6 +3376,9 @@ async function handleApi(
             if (entry.agent.busy) running += 1
           }
           for (const waiting of deps.pending.values()) {
+            if (waiting.workspaceId === ws.id) approvals += 1
+          }
+          for (const waiting of deps.pendingQuestions.values()) {
             if (waiting.workspaceId === ws.id) approvals += 1
           }
           return { ...ws, running, approvals, default: deps.workspaces.defaultWorkspace === ws.id }
@@ -4864,25 +4989,9 @@ async function handleApi(
       const wsId = decodeURIComponent(wsMemoryMatch[1] ?? '') as WorkspaceId
       requireWorkspace(deps, wsId, false)
       const entryId = wsMemoryMatch[2] !== undefined ? decodeURIComponent(wsMemoryMatch[2]) : undefined
-      // `?projectId=` selects the project tier (what the agent writes while a
-      // conversation is bound to a project); absent = the workspace tier. The
-      // id is checked against this workspace, so a foreign project is a 404.
-      const rawMemoryProject = query.get('projectId')
-      let memoryProject: ProjectId | undefined
-      if (rawMemoryProject !== null && rawMemoryProject !== '') {
-        try {
-          deps.workspaces.getProject(rawMemoryProject as ProjectId, wsId)
-        } catch (error) {
-          fail(error)
-          return
-        }
-        memoryProject = rawMemoryProject as ProjectId
-      }
-      const scope = { workspaceId: wsId, ...(memoryProject !== undefined ? { projectId: memoryProject } : {}) }
+      const scope = { workspaceId: wsId }
       if (req.method === 'GET' && entryId === undefined) {
-        // The settings list shows every entry of a tier, so the listing is not
-        // held to the model-facing default of 20 hits.
-        const hits = await deps.memory.search(scope, typeof query.get('q') === 'string' ? (query.get('q') ?? '') : '', 500)
+        const hits = await deps.memory.search(scope, typeof query.get('q') === 'string' ? (query.get('q') ?? '') : '')
         send(200, hits)
         return
       }
@@ -5856,6 +5965,49 @@ async function handleApi(
         outside.approvalId = approvalId
       }
       waiting.resolve(allow)
+      send(200, { answered: true })
+      return
+    }
+
+    // AskUserQuestion answers follow the approval rule: the browser principal
+    // that owns the conversation answers; the UUID alone is not a bearer.
+    const questionMatch = /^\/api\/questions\/([^/]+)$/.exec(pathname)
+    if (req.method === 'POST' && questionMatch !== null) {
+      const questionId = questionMatch[1] ?? ''
+      const waiting = deps.pendingQuestions.get(questionId)
+      if (deps.auth.enabled) {
+        const decision = deps.auth.authenticate(req.headers, 'POST')
+        if (!decision.ok || decision.principal.kind !== 'browser') {
+          send(401, { error: 'question answers require the browser session that owns the workspace' })
+          return
+        }
+        if (waiting?.principalId !== undefined && waiting.principalId !== decision.principal.id) {
+          send(403, { error: 'question belongs to a different principal' })
+          return
+        }
+      }
+      if (waiting === undefined) {
+        send(404, { error: 'no such question' })
+        return
+      }
+      const body = await readJson(req)
+      let outcome: QuestionOutcome
+      if (body['decline'] === true) {
+        outcome = { kind: 'declined' }
+      } else {
+        try {
+          outcome = { kind: 'answered', answers: validateAnswers(waiting.questions, body['answers']) }
+        } catch (error) {
+          send(400, { error: String(error instanceof Error ? error.message : error) })
+          return
+        }
+      }
+      // The body read is async: expiry or stop may have settled it meanwhile.
+      if (deps.pendingQuestions.get(questionId) !== waiting) {
+        send(404, { error: 'no such question' })
+        return
+      }
+      waiting.settle(outcome)
       send(200, { answered: true })
       return
     }
@@ -6958,6 +7110,21 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
       streamFrame(approvalEnvelope(approvalId, waiting, session.id))
     }
   }
+  for (const [questionId, waiting] of deps.pendingQuestions) {
+    if (waiting.sessionId === session.id || waiting.parentSessionId === session.id) {
+      streamFrame(questionEnvelope(questionId, waiting, session.id))
+    }
+  }
+  const disposeQuestion = deps.kernel.ctx.on('web/question', (payload) => {
+    if (payload.sessionId !== session.id && payload.parentSessionId !== session.id) return
+    const waiting = deps.pendingQuestions.get(payload.questionId)
+    if (waiting !== undefined) streamFrame(questionEnvelope(payload.questionId, waiting, session.id))
+  })
+  const disposeQuestionSettled = deps.kernel.ctx.on('web/question-settled', (payload) => {
+    if (payload.sessionId === session.id || payload.parentSessionId === session.id) {
+      streamFrame({ kind: 'question-settled', questionId: payload.questionId })
+    }
+  })
 
   const disposeSession = deps.kernel.ctx.on('session/event', (emitter, event) => {
     if (emitter.id === session.id && event.type !== 'context/body') streamFrame({ kind: 'session', event }, event.seq)
@@ -7007,6 +7174,8 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     disposeSession()
     disposeApproval()
     disposeApprovalSettled()
+    disposeQuestion()
+    disposeQuestionSettled()
     disposeError()
     if (streamRecord !== undefined) {
       const index = deps.liveStreams.indexOf(streamRecord)

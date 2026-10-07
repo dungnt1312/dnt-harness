@@ -147,17 +147,8 @@ describe('skills + memory tabs', () => {
   it('memory starts empty with search and a create entry point', () => {
     const html = renderToStaticMarkup(<MemoryPanel workspaceId="ws-1" />)
     expect(html).toContain('Search memory')
-    expect(html).toContain('New memory entry')
+    expect(html).toContain('New entry')
     expect(html).toContain('No memory entries yet')
-    expect(html).toContain('Select an entry to preview it, or create a new one.')
-    // With no projects there is only the workspace tier, so no scope filter.
-    expect(html).not.toContain('Filter by scope')
-  })
-  it('memory offers a scope filter once the workspace has projects', () => {
-    const projects = [{ id: 'project-1', name: 'dnt-harness', path: '/work/dnt-harness', order: 0 }] as never
-    const html = renderToStaticMarkup(<MemoryPanel workspaceId="ws-1" projects={projects} />)
-    expect(html).toContain('Filter by scope')
-    expect(html).toContain('All (0)')
   })
   it('skills list offers a create form with layer guidance', () => {
     const html = renderToStaticMarkup(<SkillsPanel workspaceId="ws-1" />)

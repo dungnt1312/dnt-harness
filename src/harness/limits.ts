@@ -34,6 +34,8 @@ export interface HarnessLimits {
   readonly subagentBackgroundBashMaxMs: number
   /** Undecided approval requests expire (never approve implicitly). */
   readonly approvalExpiryMs: number
+  /** Unanswered AskUserQuestion prompts expire (the model is told the user did not answer). */
+  readonly questionExpiryMs: number
   /** Model-visible cap for one tool result. */
   readonly toolOutputLimit: number
   /** Bound on durably queued pending inputs per session. */
@@ -65,6 +67,7 @@ export const DEFAULT_LIMITS: HarnessLimits = {
   bashMaxWaitMs: 600_000,
   subagentBackgroundBashMaxMs: 3_600_000,
   approvalExpiryMs: 5 * 60_000,
+  questionExpiryMs: 30 * 60_000,
   toolOutputLimit: 60_000,
   maxPendingInputs: 100,
   automaticCompactionPressure: 0,

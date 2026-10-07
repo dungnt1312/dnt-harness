@@ -21,7 +21,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     instructions:
       'You are a careful assistant working inside the user’s workspace. Read files freely; before any write, edit, or shell command, ask for approval. Prefer explaining what you are about to change.',
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
-    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow',
       Write: 'ask', Edit: 'ask', Bash: 'ask',
@@ -33,6 +33,8 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
       Skill: 'allow', Agent: 'ask',
       // The session task list touches no workspace state, so it never asks.
       TodoWrite: 'allow',
+      // Asking the user a question is itself the human checkpoint.
+      AskUserQuestion: 'allow',
     },
   },
   {
@@ -41,13 +43,15 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     instructions:
       'You are an assistant that edits files directly inside the user’s workspace. Read and edit files without asking; shell commands and deletions still require approval. Keep edits minimal and verifiable.',
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
-    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow',
       // A child's own calls re-enter this same policy, so delegating cannot
       // widen what the conversation may already do.
       Bash: 'ask', BashOutput: 'allow', KillShell: 'allow', Skill: 'allow', Agent: 'allow',
       TodoWrite: 'allow',
+      // Asking the user a question is itself the human checkpoint.
+      AskUserQuestion: 'allow',
     },
   },
   {
@@ -58,10 +62,12 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
     // Delegation is exposed here safely: a child resolves the SAME mode, so
     // anything it spawns is read-only too — there is no write path to grant.
-    toolExposure: ['Read', 'Glob', 'Grep', 'Skill', 'Agent', 'TodoWrite'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Skill: 'allow', Agent: 'allow',
       TodoWrite: 'allow',
+      // Asking the user a question is itself the human checkpoint.
+      AskUserQuestion: 'allow',
     },
   },
   {
@@ -70,12 +76,14 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     instructions:
       'You are an assistant with full access to the workspace tools. Host and workspace restrictions still apply and cannot be overridden by you. There is no OS sandbox: shell commands run with host privileges, so stay deliberate.',
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
-    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow', Bash: 'allow',
       BashOutput: 'allow', KillShell: 'allow',
       Skill: 'allow', Agent: 'allow',
       TodoWrite: 'allow',
+      // Asking the user a question is itself the human checkpoint.
+      AskUserQuestion: 'allow',
       // Full access means the workspace's MCP tools too: without a catch-all,
       // every mcp__* name falls to the defaultMode fallback and asks forever.
       // Host blockedTools, interactive annotations, and explicit denies still
@@ -93,5 +101,5 @@ export const DEFAULT_MODE_ID = 'ask-before-changes'
 /** The full exposure ceiling any mode can grant (skills/memory included). */
 export const KNOWN_MODE_TOOLS: readonly string[] = [
   'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent',
-  'TodoWrite',
+  'TodoWrite', 'AskUserQuestion',
 ]

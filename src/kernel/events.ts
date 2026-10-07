@@ -13,10 +13,17 @@
  * }
  * ```
  *
- * Every method also carries an untyped string-key overload for code that
- * dispatches dynamically (loaders, bridges).
+ * The kernel publishes its own lifecycle event here, so listening through
+ * `kernel.events.on('kernel/plugin-failed', ...)` is fully typed without any
+ * augmentation. Every method also carries an untyped string-key overload for
+ * code that dispatches dynamically (loaders, bridges).
  */
-export interface Events {}
+import type { Fiber } from './fiber.ts'
+
+export interface Events {
+  /** A plugin failed to start or its cleanup failed; see {@link PluginFailedDetail}. */
+  'kernel/plugin-failed'(detail: PluginFailedDetail): void
+}
 
 /** Event dispatch strategy; see each method for its exact semantics. */
 export type DispatchMode = 'emit' | 'parallel' | 'serial' | 'bail' | 'waterfall'
@@ -36,6 +43,26 @@ export interface WaterfallBoundary {
   forward?(current: readonly unknown[], proposed: readonly unknown[]): unknown
   /** Called with a listener's settled result; a non-undefined value replaces it. */
   result?(current: readonly unknown[], result: unknown): unknown
+}
+
+/** Where in the lifecycle a plugin failed: running its body or its cleanup. */
+export type PluginFailedPhase = 'startup' | 'teardown'
+
+/**
+ * Payload of the kernel's own `kernel/plugin-failed` event. The failed entry
+ * stays inspectable through `kernel.inspect()` after the failure, until
+ * kernel stop; the payload's `error` carries the original startup error, with
+ * any cleanup failures added alongside it (never replacing it).
+ */
+export interface PluginFailedDetail {
+  /** Plugin display name, as mounted. */
+  name: string
+  /** The fiber that failed, retained and inspectable after the failure. */
+  fiber: Fiber
+  /** Which phase failed: running the plugin body, or its cleanup. */
+  phase: PluginFailedPhase
+  /** The original error; cleanup errors accompany it in an AggregateError. */
+  error: unknown
 }
 
 /**
@@ -219,6 +246,26 @@ export class EventBus {
     }
 
     return invoke(0, eventArgs)
+  }
+
+  /**
+   * Contained producer for the kernel's own failure event: dispatches
+   * synchronously like `emit` but catches what each listener throws, so a
+   * broken failure observer cannot mask the original failure it reports.
+   * Ordinary `emit` remains fail-fast.
+   *
+   * @returns the errors the listeners threw, in dispatch order.
+   */
+  emitContained(name: string, ...args: unknown[]): unknown[] {
+    const thrown: unknown[] = []
+    for (const listener of this.snapshot(name)) {
+      try {
+        listener(...args)
+      } catch (error) {
+        thrown.push(error)
+      }
+    }
+    return thrown
   }
 
   /** Copy of the currently registered, undisposed listeners for `name`. */

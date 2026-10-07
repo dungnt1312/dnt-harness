@@ -5,14 +5,24 @@
  *
  * Runs the web bin through tsx so the session log, tools, and SSE stream are
  * live; serve the built client first (npm run build:web).
+ *
+ * Optional environment variables (read when pm2 loads this file):
+ *   PORT                    listen port (default 3082)
+ *   DNT_HARNESS_ALLOWED_HOSTS  comma-separated extra Host names/IPs the server
+ *                              should answer to, e.g. a LAN IP or reverse-proxy
+ *                              hostname. Loopback and the bind host are always
+ *                              allowed.
  */
+const port = process.env.PORT || '3082'
+const allowedHosts = (process.env.DNT_HARNESS_ALLOWED_HOSTS || '').trim()
+
 module.exports = {
   apps: [
     {
       name: 'dnt-harness',
       cwd: __dirname,
       script: 'node_modules/tsx/dist/cli.mjs',
-      args: 'src/bins/web.ts --port 3082 --root . --allowed-host 100.120.204.10,dungnts-mac-mini.tail034a88.ts.net,dungnts-mac-mini,harness.smarttraffic.today',
+      args: `src/bins/web.ts --port ${port} --root .${allowedHosts ? ` --allowed-host ${allowedHosts}` : ''}`,
       interpreter: 'node',
       exec_mode: 'fork',
       instances: 1,
@@ -22,21 +32,6 @@ module.exports = {
       env: {
         NODE_ENV: 'development',
       },
-    },
-    {
-      // Cloudflare Tunnel for harness.smarttraffic.today -> 127.0.0.1:3082.
-      // Ingress lives in ~/.cloudflared/dnt-harness.yml; Zero Trust (Cloudflare
-      // Access) policies are attached to that hostname in the CF dashboard.
-      name: 'dnt-harness-tunnel',
-      cwd: __dirname,
-      script: '/opt/homebrew/bin/cloudflared',
-      args: 'tunnel --config /Users/dungnt/.cloudflared/dnt-harness.yml run dnt-harness',
-      interpreter: 'none',
-      exec_mode: 'fork',
-      instances: 1,
-      kill_timeout: 10_000,
-      max_memory_restart: '500M',
-      autorestart: true,
     },
   ],
 }
