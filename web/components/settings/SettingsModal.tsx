@@ -157,7 +157,11 @@ export function SettingsModal({
     readonly discardAdvanced: (() => void) | null
   } | null>(null)
   const [tab, setTab] = useState<SettingsTab>('providers')
-  /** Guard published by the mounted Advanced panel; cleared whenever it unmounts. */
+  /**
+   * Guard published by the Advanced panel. Read only while that tab is shown:
+   * a remount publishes a fresh guard at layout time, so a value left by an
+   * unmounted panel is never consulted.
+   */
   const [advancedGuard, setAdvancedGuard] = useState<AdvancedGuard | null>(null)
   // Roles pin a model from the same enabled provider/model list the composer
   // offers, so a role can never name an endpoint the host cannot serve.
@@ -226,7 +230,8 @@ export function SettingsModal({
   }, [providers])
 
   // Opening Settings at another tab while it is already open still switches,
-  // through the same guard as any other navigation.
+  // through the same guard as any other navigation. A request that arrives
+  // while a save is in flight is dropped, like any other navigation then.
   useEffect(() => {
     if (!open) return
     const next = normalizeTab(initialTab) ?? 'providers'
@@ -248,11 +253,6 @@ export function SettingsModal({
 
   const advanced = tab === 'advanced' ? advancedGuard : null
   const anyBusy = busy !== null || advanced?.busy === true
-
-  // Leaving the tab or closing Settings unmounts the Advanced panel, so its
-  // guard goes with it. A remount publishes a fresh one at layout time, before
-  // this passive effect runs, and is therefore never cleared by it.
-  useEffect(() => { if (!open || tab !== 'advanced') setAdvancedGuard(null) }, [open, tab])
 
   function leave(action: () => void): void {
     if (anyBusy) return

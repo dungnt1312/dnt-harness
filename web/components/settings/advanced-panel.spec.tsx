@@ -254,6 +254,34 @@ describe('advanced settings panel', () => {
     expect(patchAppConfig).toHaveBeenLastCalledWith([{ op: 'set', key: 'toolTimeoutMs', value: 300_000 }], 'h2')
   })
 
+  it('removes an edit to a field the host locked meanwhile, naming it, and keeps the rest', async () => {
+    vi.mocked(patchAppConfig).mockRejectedValueOnce(new HttpError(409, JSON.stringify({ error: 'configuration changed', code: 'conflict' })))
+    await render()
+    await act(async () => type(input('Tool timeout'), '300000'))
+    await act(async () => type(input('Stream idle timeout'), '45000'))
+    await act(async () => button('Save changes').click())
+    await settle()
+    vi.mocked(getAppConfig).mockResolvedValueOnce(descriptor({
+      hash: 'h2',
+      fields: { toolTimeoutMs: { source: 'explicit', locked: true, fileValue: 120_000, shadowed: true } },
+      active: { toolTimeoutMs: 60_000 },
+    }))
+    await act(async () => button('Refresh and keep edits').click())
+    await settle()
+    expect(text()).toContain('Tool timeout is now locked by the host; your edit was removed.')
+    expect(input('Tool timeout').disabled).toBe(true)
+    expect(input('Tool timeout').value).toBe('60000')
+    expect(input('Stream idle timeout').value).toBe('45000')
+    // A locked field never enters the review path.
+    expect(() => button('Keep my edits')).toThrow()
+    expect(text()).not.toMatch(/Changed in file/)
+    expect(lastGuard().dirty).toBe(true)
+    vi.mocked(patchAppConfig).mockResolvedValueOnce(descriptor({ hash: 'h3' }))
+    await act(async () => button('Save changes').click())
+    await settle()
+    expect(patchAppConfig).toHaveBeenLastCalledWith([{ op: 'set', key: 'streamIdleMs', value: 45_000 }], 'h2')
+  })
+
   it('discards explicitly without touching the server', async () => {
     await render()
     await act(async () => type(input('Tool timeout'), '300000'))
@@ -322,7 +350,13 @@ describe('advanced settings panel', () => {
     expect(document.body.querySelectorAll('input')).toHaveLength(18)
   })
 
-  it('drops a late load after unmount', async () => {
+  // Late responses are safe by construction: every async setter comes from
+  // useScopedState (ignored once unmounted) and the guard is only published
+  // from a layout effect, which cannot run without a render. These tests pin
+  // the observable half of that contract — the parent hears nothing after
+  // unmount, and React reports nothing — so a handler that called the guard
+  // directly from a late response would fail here.
+  it('reports no guard after unmount when a late load resolves', async () => {
     const late = deferred<AppConfigView>()
     vi.mocked(getAppConfig).mockReturnValueOnce(late.promise)
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -336,7 +370,7 @@ describe('advanced settings panel', () => {
     root = createRoot(host)
   })
 
-  it('drops a late save after unmount and reports busy while saving', async () => {
+  it('reports busy while saving, and no guard after unmount when the save resolves late', async () => {
     const late = deferred<AppConfigView>()
     vi.mocked(patchAppConfig).mockReturnValueOnce(late.promise)
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {})

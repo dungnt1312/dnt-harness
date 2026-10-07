@@ -72,21 +72,31 @@ function isNoop(view: AppConfigView, field: ViewField, intent: Intent): boolean 
 
 /**
  * Carry pending edits onto a refreshed descriptor. Edits that the new file
- * already satisfies are dropped; edits whose field changed underneath them
- * (override or lock) are kept but reported, so the operator reviews the new
- * baseline before anything is resubmitted.
+ * already satisfies are dropped, and so are edits to fields the host has
+ * since locked — they could never be saved — which are reported by name.
+ * Edits whose file value changed underneath them are kept but reported, so
+ * the operator reviews the new baseline before anything is resubmitted.
  */
-function rebase(edits: Edits, before: AppConfigView, after: AppConfigView): { readonly edits: Edits; readonly changed: readonly LimitKey[] } {
+function rebase(edits: Edits, before: AppConfigView, after: AppConfigView): {
+  readonly edits: Edits
+  readonly changed: readonly LimitKey[]
+  readonly locked: readonly string[]
+} {
   const next: Partial<Record<LimitKey, Intent>> = {}
   const changed: LimitKey[] = []
+  const locked: string[] = []
   for (const [key, intent] of Object.entries(edits) as [LimitKey, Intent][]) {
     const now = after.fields.find((field) => field.key === key)
     if (now === undefined || isNoop(after, now, intent)) continue
+    if (now.locked) {
+      locked.push(now.label)
+      continue
+    }
     next[key] = intent
     const was = before.fields.find((field) => field.key === key)
-    if (was?.fileValue !== now.fileValue || was?.locked !== now.locked) changed.push(key)
+    if (was?.fileValue !== now.fileValue) changed.push(key)
   }
-  return { edits: next, changed }
+  return { edits: next, changed, locked }
 }
 
 /** The server's refusal message and code from a JSON error body, when there is one. */
@@ -215,7 +225,12 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
         setEdits(rebased.edits)
         setRemote(rebased.changed)
         setConflict(false)
-        setNotice(rebased.changed.length > 0 ? null : { kind: 'info', text: 'Loaded the latest file. Your edits are kept; save again when ready.' })
+        if (rebased.locked.length > 0) {
+          const names = rebased.locked.join(', ')
+          setNotice({ kind: 'info', text: `${names} ${rebased.locked.length === 1 ? 'is' : 'are'} now locked by the host; your ${rebased.locked.length === 1 ? 'edit was' : 'edits were'} removed.` })
+        } else {
+          setNotice(rebased.changed.length > 0 ? null : { kind: 'info', text: 'Loaded the latest file. Your edits are kept; save again when ready.' })
+        }
       } catch (cause) {
         setNotice({ kind: 'bad', text: refusalOf(cause).message })
       }
@@ -340,7 +355,7 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
         ) : null}
         {remote.length > 0 ? (
           <div className="flex w-full flex-wrap items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn">
-            <span className="min-w-0 flex-1 basis-48">Also changed in the file: {remoteLabels.join(', ')}. Review the new saved values, then keep your edits to save over them.</span>
+            <span className="min-w-0 flex-1 basis-48">Also changed in the file: {remoteLabels.join(', ')}. Review the new saved values, then keep your edits to replace them when you save.</span>
             <Button size="sm" onClick={() => setRemote([])}>Keep my edits</Button>
           </div>
         ) : null}
