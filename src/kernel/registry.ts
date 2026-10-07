@@ -31,24 +31,54 @@ export interface PluginDiagnostic {
   /** The fiber running (or having run) this plugin. */
   readonly fiber: Fiber
   /**
-   * uid of the fiber whose unload disposes this entry, or `null` when the
-   * entry is root-owned (only a kernel stop disposes it).
+   * uid of the fiber whose unload disposes this logical entry — across
+   * dependency-driven replacement — or `null` when the entry is root-owned
+   * (only a kernel stop disposes it).
    */
   readonly parentUid: number | null
   /** The original startup error; absent when the plugin did not fail to start. */
   readonly error?: unknown
 }
 
-/** One mounted plugin: its definition plus the fiber/context pair running it. */
+/** One mounted plugin: its definition plus the fiber/context pair running its
+ * CURRENT generation. The entry itself is the logical identity: it survives
+ * dependency-driven replacement, so ownership, diagnostics, and explicit
+ * disposal stay attached to one stable record while `fiber` moves forward.
+ */
 interface PluginEntry {
   definition: ResolvedPlugin
+  /** The current generation's fiber; replaced by a dependency-driven restart. */
   fiber: Fiber
   ctx: Context
   /**
-   * uid of the fiber whose unload disposes this entry, or `null` when
-   * root-owned (only a kernel stop disposes it).
+   * The fiber whose unload disposes this logical entry, or `null` when
+   * root-owned (only a kernel stop disposes it). Kept across dependency-driven
+   * replacement: a restart re-mounts under the SAME owner, never root-owned.
    */
-  parentUid: number | null
+  owner: Fiber | null
+  /** {@link owner}'s uid, as reported by {@link Kernel.inspect}. */
+  ownerUid: number | null
+  /**
+   * Every generation fiber this logical entry created, current one last.
+   * Teardown disposes them all — current generation last — so a replacement
+   * never orphans an older generation still holding effects. Retired
+   * generations are pruned: their disposal promises stay reachable through
+   * {@link Kernel.handles}, keyed by the fiber handle itself.
+   */
+  readonly generations: Set<Fiber>
+  /**
+   * Admission to this entry is closed: explicit disposal — through ANY
+   * generation's returned Fiber handle — arrived. A closed entry never starts,
+   * never wakes, and never remounts; it stays in the registry until kernel
+   * stop so it remains inspectable.
+   */
+  closed: boolean
+  /**
+   * The one coalesced teardown transition in flight, if any. A second
+   * dependency removal while a cleanup is still running joins it instead of
+   * queueing another teardown+remount; the slot reopens when the body settles.
+   */
+  transition: Promise<void> | undefined
   /**
    * Stop generation this entry was mounted in: `0` until the first stop, then
    * one more per stop. A completion from an older generation is stale history
@@ -60,8 +90,9 @@ interface PluginEntry {
   /**
    * Nothing is left to dispose or report for this entry: its startup
    * settlement fully finished (cleanup ran, the failure was published once),
-   * or the restart that disposed it already published its teardown failure.
-   * `stop()` skips retired entries, so a failure is published exactly once.
+   * or the restart or explicit disposal that cleaned it already published its
+   * teardown failure. `stop()` skips retired entries, so a failure is
+   * published exactly once.
    */
   retired: boolean
 }
@@ -122,6 +153,27 @@ function isLiveEntry(entry: PluginEntry): boolean {
 }
 
 /**
+ * Whether an owner fiber can still own effects: `pending`, `loading`, and
+ * `active` owners live; an `unloading`, `disposed`, or `failed` owner has
+ * lost (or is losing) ownership, so a replacement generation must not attach
+ * to it.
+ */
+function ownerAlive(owner: Fiber): boolean {
+  switch (owner.state) {
+    case 'pending':
+    case 'loading':
+    case 'active':
+      return true
+    case 'unloading':
+    case 'disposed':
+    case 'failed':
+      return false
+    default:
+      return false
+  }
+}
+
+/**
  * The kernel runtime: one event bus, one service store, and the set of
  * mounted plugins with dependency-driven lifecycle.
  *
@@ -135,6 +187,15 @@ function isLiveEntry(entry: PluginEntry): boolean {
  * outcomes, and each failure publishes exactly one typed
  * `kernel/plugin-failed` event whose listener exceptions are contained at the
  * producer.
+ *
+ * A mounted plugin has a stable LOGICAL entry: when a dependency disappears,
+ * the current generation fiber is disposed and a fresh one is mounted under
+ * the SAME owner on the SAME entry — it pends again until the service
+ * returns. Multiple dependency removals landing while one teardown is still
+ * in flight coalesce into a single cleanup + reevaluation. Disposal through
+ * ANY generation's returned Fiber handle closes the whole logical entry;
+ * kernel-initiated generation cleanup uses a distinct internal path that
+ * leaves admission open.
  */
 export class Kernel {
   /** The shared event bus. */
@@ -151,12 +212,14 @@ export class Kernel {
   /** Tracked startup/restart settlements; drained by {@link settle}. */
   private readonly transitions = new Set<Promise<void>>()
   private readonly observeServices: () => void
+  /** Latest logical-entry disposal requested through a Fiber handle. */
+  private readonly closings = new WeakMap<Fiber, Promise<void>>()
   /**
    * Bumped on every stop only. It fences late completions: an entry mounted
    * before a stop carries the older generation, so a body resolving after
    * `stop()` began can never flip it back to `active`. Restart fencing is
-   * handled separately by {@link restartEntry}, which deletes the old entry
-   * before remounting and refuses to remount after `stopped`.
+   * handled separately by {@link coordinate}, which refuses to attach a fresh
+   * generation after `stopped`.
    */
   private generation = 0
   private stopped = false
@@ -179,12 +242,28 @@ export class Kernel {
    * caller; its unwind is nevertheless owned and tracked (see
    * {@link settle}), and the failure is published once.
    *
-   * Prefer {@link Context.plugin}, which also ties the child to a parent.
+   * The returned handle stays valid for the entry's whole life: disposing it
+   * — before or after a dependency-driven replacement replaced the fiber —
+   * closes the logical entry and disposes its current generation.
    *
-   * @param parent — the fiber whose unload disposes this entry; `null`/omitted means root-owned.
+   * Prefer {@link Context.plugin}, which also ties the child to an owner.
+   *
+   * @param owner — the fiber whose unload disposes this logical entry;
+   * `null`/omitted means root-owned.
    */
-  plugin(definition: ResolvedPlugin, parent?: Fiber): Fiber {
-    return this.mount(definition, parent ?? null, true)
+  plugin(definition: ResolvedPlugin, owner?: Fiber): Fiber {
+    return this.mount(definition, owner ?? null, true)
+  }
+
+  /**
+   * Dispose a kernel-issued plugin Fiber: resolves the handle to its logical
+   * entry — any generation's handle works, even after a restart — closes the
+   * entry's admission and disposes its current generation. The returned
+   * promise rejects when the underlying cleanup throws. A Fiber the kernel
+   * never issued keeps plain per-fiber disposal.
+   */
+  disposeFiber(fiber: Fiber): Promise<void> {
+    return this.disposeOf(fiber)
   }
 
   /**
@@ -202,7 +281,7 @@ export class Kernel {
       > & { error?: unknown } = {
         name: entry.definition.name,
         fiber: entry.fiber,
-        parentUid: entry.parentUid,
+        parentUid: entry.ownerUid,
       }
       if (entry.error !== undefined) diagnostic.error = entry.error
       diagnostics.push(diagnostic)
@@ -242,11 +321,19 @@ export class Kernel {
     for (const entry of [...this.entries]) {
       if (entry.retired) continue
       try {
-        await entry.fiber.dispose()
+        // Every generation this logical entry created unwinds here — current
+        // first, then already-retired ones re-observing their cached
+        // teardowns — so no effect or service outlives the stop.
+        // Kernel-internal path: plain generation teardown, not the handle
+        // override that closes a logical entry.
+        for (const fiber of [...entry.generations].reverse()) {
+          await this.disposeGeneration(fiber)
+        }
       } catch (error) {
-        // Same ownership rule as restartEntry: whoever reports this entry's
-        // teardown failure retires it first, so a restart already in flight
-        // over the same cached teardown publishes it exactly once.
+        // Same ownership rule as the coordinated teardown: whoever reports
+        // this entry's teardown failure retires it first, so a restart or an
+        // explicit disposal already in flight over the same cached teardown
+        // publishes it exactly once.
         if (!entry.retired) {
           entry.retired = true
           this.publishFailure(entry, 'teardown', error)
@@ -262,21 +349,102 @@ export class Kernel {
   }
 
   /** Create and register an entry, then try to start it. */
-  private mount(definition: ResolvedPlugin, parent: Fiber | null, direct: boolean): Fiber {
+  private mount(definition: ResolvedPlugin, owner: Fiber | null, direct: boolean): Fiber {
     const fiber = new Fiber(definition.name)
     const entry: PluginEntry = {
       definition,
       fiber,
       ctx: createContext(this, fiber),
       // `null` means root-owned: mounted by the kernel or through the root
-      // context, so no plugin parent's unload disposes it — only a stop does.
-      parentUid: parent === null || parent === this.rootFiber ? null : parent.uid,
+      // context, so no plugin owner's unload disposes it — only a stop does.
+      owner: owner === null || owner === this.rootFiber ? null : owner,
+      ownerUid: owner === null || owner === this.rootFiber ? null : owner.uid,
+      generations: new Set([fiber]),
+      closed: false,
+      transition: undefined,
       generation: this.generation,
       retired: false,
     }
+    // Register the disposal with the owner once, binding the LOGICAL entry:
+    // every later generation remounts under the same owner without touching
+    // the owner's effect list again.
+    if (entry.owner !== null) {
+      entry.owner.effect(() => () => this.closeEntry(entry), `kernel-entry(${definition.name})`)
+    }
     this.entries.add(entry)
+    // A kernel-issued Fiber handle stays valid across dependency-driven
+    // replacement: disposing ANY generation's handle closes the logical entry
+    // (K4), so `dispose()` routes through the entry instead of tearing down
+    // only this fiber. Kernel-internal teardown never calls this override —
+    // it goes through {@link disposeGeneration}, the plain fiber unload.
+    fiber.dispose = (): Promise<void> => this.disposeOf(fiber)
     this.start(entry, direct)
     return fiber
+  }
+
+  /**
+   * Kernel-internal generation teardown: the plain once-only fiber unload,
+   * deliberately bypassing the `dispose` override mounted fibers carry. This
+   * is the distinct internal cleanup path — it must not close the logical
+   * entry nor recurse through the public dispose.
+   */
+  private disposeGeneration(fiber: Fiber): Promise<void> {
+    return Fiber.prototype.dispose.call(fiber)
+  }
+
+  /**
+   * Resolve a Fiber handle to its logical entry. Any generation's handle —
+   * including one retired by a restart — resolves to the SAME entry, which is
+   * what keeps "dispose the initial handle after a restart" meaningful.
+   * Handles the kernel never issued resolve to `undefined`, so unowned Fiber
+   * instances keep their plain teardown behavior.
+   */
+  private entryOf(fiber: Fiber): PluginEntry | undefined {
+    return [...this.entries].find((entry) => entry.generations.has(fiber))
+  }
+
+  /**
+   * Explicit disposal through ANY generation's Fiber handle: closes the
+   * logical entry's admission and disposes its current generation through the
+   * coordinated path. `closed` makes the entry invisible to starts, wakes,
+   * and restarts; a racing restart joins the same transition (one cleanup)
+   * or has already finished.
+   */
+  private disposeEntry(entry: PluginEntry): Promise<void> {
+    entry.closed = true
+    return this.runCoordinated(entry, () => false)
+  }
+
+  /**
+   * The owner-registered disposer: closes the logical entry and disposes its
+   * current generation. When a coordinated transition is ALREADY in flight it
+   * is disposing this entry's generations anyway — this disposer closes
+   * admission and returns WITHOUT awaiting that transition, so an owner
+   * unloading during a racing dependency restart never blocks on the child's
+   * held cleanup; the transition completes the disposal (closed bars the
+   * remount) and reports its own failure.
+   */
+  private closeEntry(entry: PluginEntry): Promise<void> | undefined {
+    entry.closed = true
+    if (entry.transition !== undefined) return undefined
+    return this.runCoordinated(entry, () => false)
+  }
+
+  /**
+   * Public dispose facade on a kernel-issued Fiber handle. Shared per handle
+   * through {@link closings} so every concurrent caller awaits the same
+   * logical-entry disposal; a failure propagates to every caller, and the
+   * coordinated teardown failure itself is published once.
+   */
+  private disposeOf(fiber: Fiber): Promise<void> {
+    const cached = this.closings.get(fiber)
+    if (cached !== undefined) return cached
+    const entry = this.entryOf(fiber)
+    // A Fiber the kernel never issued keeps its plain per-fiber disposal.
+    if (entry === undefined) return this.disposeGeneration(fiber)
+    const closing = this.disposeEntry(entry)
+    this.closings.set(fiber, closing)
+    return closing
   }
 
   /**
@@ -290,8 +458,12 @@ export class Kernel {
     // A stop clears the registry; a pending flush already in flight must not
     // start anything new afterwards.
     if (this.stopped) return
+    // Admission closed (explicit disposal through any generation handle), or
+    // the coordinated transition already owns this entry's fate: a coalesced
+    // reevaluation — not a stale flush pass — decides what runs next.
+    if (entry.closed || entry.transition !== undefined) return
     // Barrier against a stale flush: a `flushPending` snapshot taken before a
-    // nested wake (or before a tracked restart's remount) still lists this
+    // nested wake (or before a coordinated restart's remount) still lists this
     // entry, but a fiber that already ran its body — or is running it — must
     // not run it again. Only a fresh `pending` fiber may start here.
     if (entry.fiber.state !== 'pending') return
@@ -339,10 +511,11 @@ export class Kernel {
   private async failStartup(entry: PluginEntry, error: unknown): Promise<void> {
     let cleanupError: unknown
     try {
-      // Once-only teardown: on a live fiber this unwinds the acquired
-      // effects; on an already-unloaded one it re-observes the cached
-      // completion and cleans nothing twice.
-      await entry.fiber.dispose()
+      // Once-only teardown, kernel-internal: on a live fiber this unwinds the
+      // acquired effects; on an already-unloaded one it re-observes the cached
+      // completion and cleans nothing twice. A startup failure retires the
+      // entry anyway; it must not route through the public dispose override.
+      await this.disposeGeneration(entry.fiber)
     } catch (disposed) {
       cleanupError = disposed
     }
@@ -364,10 +537,20 @@ export class Kernel {
    * contained here at the producer — a broken failure observer must not mask
    * the original failure it reports — while ordinary `emit` stays fail-fast.
    */
-  private publishFailure(entry: PluginEntry, phase: PluginFailedPhase, error: unknown): void {
+  private publishFailure(
+    entry: PluginEntry,
+    phase: PluginFailedPhase,
+    fiberOrError: Fiber | unknown,
+    maybeError?: unknown,
+  ): void {
+    // New signature carries the reporting generation explicitly: teardown
+    // failures surface on the generation whose cleanup failed, while the
+    // logical entry may already have moved to a replacement.
+    const fiber = maybeError !== undefined ? (fiberOrError as Fiber) : entry.fiber
+    const error = maybeError !== undefined ? maybeError : fiberOrError
     const detail: PluginFailedDetail = {
       name: entry.definition.name,
-      fiber: entry.fiber,
+      fiber,
       phase,
       error,
     }
@@ -384,6 +567,9 @@ export class Kernel {
     // A late completion after unload or a dependency-driven restart is
     // history: never reactivate a stale entry.
     if (entry.generation !== this.generation) return
+    // Explicit disposal through a stale generation handle while this body was
+    // in flight must not reactivate the closed entry.
+    if (entry.closed) return
     if (entry.fiber.state !== 'loading') return
     entry.fiber.state = 'active'
     this.flushPending()
@@ -401,11 +587,11 @@ export class Kernel {
   }
 
   /**
-   * Service additions wake pending plugins; removals dispose every loaded
-   * dependent and re-mount it, so it pends until the service returns. Failed
-   * and unloaded entries are not candidates: a settled failure never
-   * restarts. The removal of a service during kernel teardown is not
-   * observed: `stop()` detaches the listener first.
+   * Service additions wake pending plugins; removals coordinate the teardown
+   * and remount of every loaded dependent through its stable logical entry.
+   * Failed, unloaded, closed, and mid-transition entries are not candidates:
+   * a settled failure never restarts, and a transition already in flight
+   * reevaluates the new state itself.
    */
   private onServiceChange(change: ServiceChange): void {
     if (this.stopped) return
@@ -414,31 +600,96 @@ export class Kernel {
       return
     }
     for (const entry of [...this.entries]) {
+      if (entry.closed || entry.retired || entry.transition !== undefined) continue
       if (!isLiveEntry(entry)) continue
       if (!entry.definition.inject.includes(change.name)) continue
-      this.track(this.restartEntry(entry))
+      this.track(this.coordinate(entry))
     }
   }
 
-  private async restartEntry(entry: PluginEntry): Promise<void> {
-    try {
-      await entry.fiber.dispose()
-    } catch (error) {
-      // Publish only when nobody else has taken ownership of reporting this
-      // entry's teardown: a concurrent stop skips retired entries and would
-      // never publish, so the restart keeps it; anything that publishes here
-      // instead retires the entry first.
-      if (!entry.retired) {
-        entry.retired = true
-        this.publishFailure(entry, 'teardown', error)
+  /**
+   * The kernel-internal replacement path. Disposes the entry's generations
+   * through {@link runCoordinated} and attaches a fresh generation on the SAME
+   * entry under the SAME owner when the owner reevaluates alive — the fresh
+   * generation then pends until its dependencies return. This is not the
+   * public dispose: it never closes the logical entry, and it never delegates
+   * through a public Fiber handle.
+   *
+   * A failed teardown blocks the replacement: the cleanup that failed cannot
+   * prove the plugin unwound safely, so the entry stays retired with its
+   * teardown failure published.
+   */
+  private async coordinate(entry: PluginEntry): Promise<void> {
+    await this.runCoordinated(entry, () => {
+      // An explicitly closed entry never remounts — even through a transition
+      // that started as a dependency restart.
+      if (entry.closed) return false
+      // Owner liveness reevaluated after cleanup: an owner that unloaded (or
+      // is unloading) while the cleanup ran must not own a replacement. The
+      // DEPENDENCIES are reevaluated by `start()` on the fresh generation — a
+      // missing service simply leaves it `pending`.
+      return entry.owner === null || ownerAlive(entry.owner)
+    })
+  }
+
+  /**
+   * Shared coordinated body: open the entry's single transition slot (a
+   * concurrent request joins the in-flight run instead of queueing a second
+   * teardown), dispose every generation the entry created, then either attach
+   * a fresh generation under the same owner or leave the entry with none. A
+   * teardown failure retires the entry with one published `teardown` failure
+   * and blocks any replacement.
+   */
+  private async runCoordinated(entry: PluginEntry, shouldAttach: () => boolean): Promise<void> {
+    // Coalescing: a request landing while this entry's transition is in
+    // flight joins it — one cleanup, one reevaluation — instead of queueing
+    // another teardown+remount.
+    if (entry.transition !== undefined) return entry.transition
+    const run = (async () => {
+      let teardownError: unknown
+      try {
+        for (const fiber of [...entry.generations].reverse()) {
+          await this.disposeGeneration(fiber)
+        }
+      } catch (error) {
+        teardownError = error
       }
+
+      // A failed teardown blocks the replacement. Whoever reports the entry's
+      // teardown failure retires it first, so a racing explicit disposal or
+      // stop over the same cached teardown publishes it exactly once.
+      if (teardownError !== undefined) {
+        if (!entry.retired) {
+          entry.retired = true
+          this.publishFailure(entry, 'teardown', entry.fiber, teardownError)
+        }
+        return
+      }
+
+      // Restart path: attach a fresh generation to the SAME logical entry
+      // (parent-preserving remount). Retired generations STAY in the set —
+      // a stale handle must still resolve to this entry — and a disposed
+      // fiber is never mutated back into circulation.
+      if (this.stopped) return
+      if (!shouldAttach()) return
+      const fiber = new Fiber(entry.definition.name)
+      entry.fiber = fiber
+      entry.ctx = createContext(this, fiber)
+      entry.generations.add(fiber)
+      // The teardown this slot was coalescing is finished; reopen the start
+      // gate so the fresh generation may run (or pend) right now. From here
+      // to `start()` there is no await, so no other request can interleave.
+      entry.transition = undefined
+      this.start(entry, false)
+    })()
+    entry.transition = run
+    try {
+      await run
+    } finally {
+      // The slot reopens exactly when the body settles, so a request arriving
+      // DURING the body has joined the in-flight run instead.
+      if (entry.transition === run) entry.transition = undefined
     }
-    this.entries.delete(entry)
-    // A stop that raced this restart must not see a fresh mount afterwards.
-    if (this.stopped) return
-    // The re-mount is kernel-internal, never a direct caller: its startup is
-    // wake-contained.
-    this.mount(entry.definition, this.rootFiber, false)
   }
 
   /**
@@ -464,7 +715,7 @@ export class Kernel {
    * entry, so stop does not dispose the fiber again or report it twice.
    */
   trackUndo(disposal: Promise<void>, fiber: Fiber): void {
-    const entry = [...this.entries].find((candidate) => candidate.fiber === fiber)
+    const entry = this.entryOf(fiber)
     this.track(
       disposal.then(
         () => {
@@ -473,7 +724,7 @@ export class Kernel {
         (error: unknown) => {
           if (entry) {
             entry.retired = true
-            this.publishFailure(entry, 'teardown', error)
+            this.publishFailure(entry, 'teardown', fiber, error)
           }
         },
       ),

@@ -152,15 +152,15 @@ export class Context {
   }
 
   /**
-   * Mount a plugin as a child of the current fiber. The child is disposed
-   * when this fiber unloads. When a dependency change later restarts the
-   * child, the fresh fiber mounts root-owned — parent linkage is not
-   * re-established across dependency-driven restarts.
+   * Mount a plugin as a child of the current fiber. The child's LOGICAL entry
+   * is disposed when this fiber unloads — across dependency-driven
+   * replacement, so a restart under the same owner stays parent-owned and a
+   * parent teardown also disposes any generation that replaced the first.
    *
    * Throws when the owning fiber can no longer own the child; the child is
    * never mounted in that case.
    *
-   * @returns the child fiber.
+   * @returns the child's current generation fiber.
    */
   plugin(target: PluginTarget): Fiber {
     this.guard('ctx.plugin')
@@ -170,14 +170,14 @@ export class Context {
     // itself: returning `child.dispose()` here would be mistaken for a
     // promise *of* a disposer and crash at unload.
     try {
-      this.fiber.effect(() => () => child.dispose(), `ctx.plugin(${definition.name})`)
+      this.fiber.effect(() => () => this.kernel.disposeFiber(child), `ctx.plugin(${definition.name})`)
     } catch (error) {
       // Undo the mount so the child never outlives an owner that cannot own
       // it. The undo is awaited as a kernel-owned transition: settle() and
       // stop() wait for it, and its cleanup failures are published once, so
       // stop never re-disposes the child and re-observes the cached error as
       // a second teardown failure.
-      const undo = child.dispose()
+      const undo = this.kernel.disposeFiber(child)
       this.kernel.trackUndo(undo, child)
       throw error
     }
