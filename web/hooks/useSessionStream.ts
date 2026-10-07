@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { subscribeEventsIn, type StreamState } from '../lib/api.ts'
-import type { PendingApproval, SseEvent } from '../lib/types.ts'
+import type { PendingApproval, PendingQuestion, SseEvent } from '../lib/types.ts'
 import { createProjector, type ViewItem } from '../lib/project.ts'
 
 /** Rebuild pending questions from durable facts, including reconnect replay. */
@@ -118,6 +118,8 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
   const [events, setEvents] = useState<readonly SseEvent[]>([])
   const [items, setItems] = useState<readonly ViewItem[]>([])
   const [approvals, setApprovals] = useState<readonly PendingApproval[]>([])
+  // Live-only: the server re-sends every still-open question on (re)connect.
+  const [questions, setQuestions] = useState<readonly PendingQuestion[]>([])
   const [stream, setStream] = useState<StreamState>('idle')
   // True once this conversation's first snapshot/resume frame landed: before
   // that, `events` reflects nothing and "is it running?" is unknown, not no.
@@ -126,6 +128,9 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
   const seenSeq = useRef(0)
   const dismissApproval = useCallback((id: string) => {
     setApprovals((prev) => prev.filter((row) => row.approvalId !== id))
+  }, [])
+  const dismissQuestion = useCallback((id: string) => {
+    setQuestions((prev) => prev.filter((row) => row.questionId !== id))
   }, [])
 
   useEffect(() => {
@@ -138,6 +143,7 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
     // fold in place, snapshots replace it wholesale.
     const compact = createEventCompactor()
     setApprovals([])
+    setQuestions([])
     setError(null)
     setStream(sessionId === null || workspaceId === null ? 'idle' : 'connecting')
     if (sessionId === null || workspaceId === null) return
@@ -159,8 +165,21 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
     }
     const dispose = subscribeEventsIn(workspaceId, sessionId, (envelope) => {
       if (disposed) return
+      if (envelope.kind === 'question') {
+        const { kind: _kind, ...row } = envelope
+        setQuestions((prev) => prev.some((q) => q.questionId === row.questionId)
+          ? prev.map((q) => q.questionId === row.questionId ? row : q)
+          : [...prev, row])
+        return
+      }
+      if (envelope.kind === 'question-settled') {
+        setQuestions((prev) => prev.filter((q) => q.questionId !== envelope.questionId))
+        return
+      }
       if (envelope.kind === 'snapshot') {
         discardPending()
+        // A fresh snapshot precedes the server's re-sent open questions.
+        setQuestions([])
         projector = createProjector()
         setItems(projector.apply(envelope.events))
         setEvents(compact(envelope.events))
@@ -181,6 +200,16 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
         if (event.seq <= seenSeq.current) return
         seenSeq.current = event.seq
         pending.push(event)
+        if (event.type === 'tool/result' || event.type === 'turn/end') {
+          // A question's own tool result (or the turn ending) retires its card
+          // even if the settled frame was missed.
+          setQuestions((prev) => {
+            if (prev.length === 0) return prev
+            // Only this session's own questions: a child's card follows its own settled frame.
+            const next = prev.filter((q) => q.childSessionId !== undefined || (event.type === 'turn/end' ? false : q.callId === '' || q.callId !== event.callId))
+            return next.length === prev.length ? prev : next
+          })
+        }
         if (event.type === 'approval/request' || event.type === 'approval/decision' || event.type === 'tool/result' || event.type === 'turn/end') {
           setApprovals((prev) => {
             const next = reconcileApprovals(prev, [event])
@@ -216,5 +245,5 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
     return () => { disposed = true; discardPending(); dispose() }
   }, [workspaceId, sessionId])
 
-  return { events, items, approvals, stream, error, dismissApproval, settled }
+  return { events, items, approvals, questions, stream, error, dismissApproval, dismissQuestion, settled }
 }

@@ -1,27 +1,43 @@
-import { useMemo } from 'react'
+import { memo, useMemo } from 'react'
 import Icon from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { taskPhase, type TaskPhase } from '../../lib/project.ts'
+import { todosFromEvents, type TodoView } from '../../lib/todos-view.ts'
 import type { SseEvent } from '../../lib/types.ts'
-import { todosFromEvents } from '../../lib/todos-view.ts'
 
 const LABELS: Record<TaskPhase, string> = { idle: 'Ready', preparing: 'Preparing · submitting or queued', held: 'Stopped · queued messages are waiting', running: 'Working', waiting: 'Approval required', completed: 'Completed', failed: 'Failed', interrupted: 'Interrupted', cancelled: 'Stopped', steered: 'Redirected', rejected: 'Request rejected', empty: 'Ended without a response', limit: 'Turn limit reached' }
 
 /**
  * Slim lifecycle line above the composer. Durable phase and connection loss
  * are reported separately: a dropped stream never implies work stopped.
+ *
+ * The full-scan derivations (phase, todos, recovery) are also computed here
+ * from props when the caller does not supply them — standalone mounts (tests,
+ * storybook-style hosts) keep working — but the app shell supplies them so a
+ * streaming frame re-runs each scan once per batch, not once per mount point.
+ * The memo keeps a `connected` flip from rescanning anything.
  */
-export function TaskStatus({ events, pending, sending, connected }: { readonly events: readonly SseEvent[]; readonly pending: number; readonly sending: boolean; readonly connected: boolean }) {
-  const phase = useMemo(() => taskPhase(events, pending, sending), [events, pending, sending])
-  const todo = useMemo(() => todosFromEvents(events), [events])
+export const TaskStatus = memo(function TaskStatus({ events, pending, sending, connected, phase: phaseProp, todos: todosProp, recovered: recoveredProp }: {
+  readonly events: readonly SseEvent[]
+  readonly pending: number
+  readonly sending: boolean
+  readonly connected: boolean
+  /** Precomputed by the shell (session-derived); scanned here when absent. */
+  readonly phase?: TaskPhase
+  readonly todos?: TodoView
+  readonly recovered?: boolean
+}) {
+  // Falls back to a local scan only when the shell did not derive the value.
+  const phase = useMemo(() => phaseProp ?? taskPhase(events, pending, sending), [phaseProp, events, pending, sending])
+  const todo = useMemo(() => todosProp ?? todosFromEvents(events), [todosProp, events])
   const recovered = useMemo(() => {
-    let found = false
+    if (recoveredProp !== undefined) return recoveredProp
     for (let i = events.length - 1; i >= 0; i--) {
       if (events[i]?.type === 'turn/start') break
-      if (events[i]?.recovery === true) found = true
+      if (events[i]?.recovery === true) return true
     }
-    return found
-  }, [events])
+    return false
+  }, [recoveredProp, events])
   // Failed and rejected turns render as one card inside the transcript itself.
   const showPhase = !(phase === 'idle' || phase === 'completed' || phase === 'failed' || phase === 'rejected')
   if (!showPhase && connected) return null
@@ -45,4 +61,4 @@ export function TaskStatus({ events, pending, sending, connected }: { readonly e
       {showPhase && recovered ? <p className="m-0 text-xs">A recovered tool outcome may be unknown. Inspect the file or target system before requesting another action.</p> : null}
     </section>
   )
-}
+})

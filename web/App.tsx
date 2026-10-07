@@ -7,6 +7,7 @@ import { parseRoute, routePath, sessionRoute, workspaceRoute, type AppRoute } fr
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
 import {
   answerApproval,
+  answerQuestion,
   createProject,
   createSessionIn,
   createWorkspace,
@@ -41,7 +42,8 @@ import {
 } from './lib/api.ts'
 import { PairingGate } from './components/auth/PairingGate.tsx'
 import { decodeModelChoice, activeModelValue, modelOptions } from './lib/providers.ts'
-import { isTurnRunning, type RetryTarget, type ViewItem } from './lib/project.ts'
+import { type RetryTarget, type ViewItem } from './lib/project.ts'
+import { useSessionDerivedValues } from './lib/session-derived.ts'
 import { sameListing } from './lib/listing-equality.ts'
 import { manifestRefreshKey } from './lib/manifest-refresh.ts'
 import type { FileFocus } from './lib/tool-facts.ts'
@@ -75,6 +77,7 @@ import { QueuedBar } from './components/chat/QueuedBar.tsx'
 import { EnvironmentPanel } from './components/chat/EnvironmentPanel.tsx'
 import { Transcript } from './components/chat/Transcript.tsx'
 import { ApprovalBar } from './components/chat/ApprovalBar.tsx'
+import { QuestionBar } from './components/chat/QuestionBar.tsx'
 import { Composer } from './components/composer/Composer.tsx'
 import { ModelMenu } from './components/composer/ModelMenu.tsx'
 import { ContextMeter } from './components/composer/ContextMeter.tsx'
@@ -83,7 +86,7 @@ import { FolderPickerModal } from './components/composer/FolderPickerModal.tsx'
 import ConfirmDialog from './components/common/ConfirmDialog.tsx'
 import type { ContextManifestView, SessionModeSelection } from './lib/api.ts'
 import { builtinCommandIn, draftIsOnlyCommand, type CompletionItem } from './lib/composer-completion.ts'
-import type { ModelDefaults, ProjectRow, SessionListing, SessionModel, SkillRow, WorkspaceMeta, WorkspaceRow } from './lib/types.ts'
+import type { ModelDefaults, ProjectRow, QuestionReply, SessionListing, SessionModel, SkillRow, WorkspaceMeta, WorkspaceRow } from './lib/types.ts'
 
 /** The sidebar docks beside the conversation at this width; below it is a drawer. */
 const SIDEBAR_DOCK_QUERY = '(min-width: 768px)'
@@ -492,9 +495,13 @@ function AppShell() {
   // workspace listing has confirmed membership. This prevents foreign or stale
   // deep links from ever opening an SSE connection.
   const validatedCurrent = listedWorkspace === activeWs && (sessions.some((session) => session.id === current) || (current !== null && createdHere.current.has(current))) ? current : null
-  const { events, items: projectedItems, approvals, stream, error: streamError, dismissApproval, settled } = useSessionStream(activeWs, validatedCurrent)
+  const { events, items: projectedItems, approvals, questions, stream, error: streamError, dismissApproval, dismissQuestion, settled } = useSessionStream(activeWs, validatedCurrent)
   const notify = useApprovalNotify(approvals, activeWorkspace?.name)
-  const running = useMemo(() => isTurnRunning(events), [events])
+  // Everything the shell and its panels read from the log, derived once per
+  // event arrival — each value gated on the event types it reads, so a
+  // streaming frame of chunks re-derives none of them.
+  const derived = useSessionDerivedValues(events, approvals.length, sending)
+  const running = derived.running
   const currentSession = useMemo(() => sessions.find((session) => session.id === current) ?? null, [sessions, current])
   // The stream's snapshot proves the turn state; until it lands, the listing's
   // claim is the conservative answer. A running session never fetches a
@@ -730,6 +737,9 @@ function AppShell() {
       return []
     }
   }, [toast])
+
+  /** Sidebar footer refresh hook: identity-stable so the memoized sidebar skips frames. */
+  const refreshWorkspacesDiscard = useCallback(async () => { await refreshWorkspaces() }, [refreshWorkspaces])
 
   const navigate = useCallback((route: AppRoute, mode: 'push' | 'replace' = 'push') => {
     const path = routePath(route)
@@ -1160,6 +1170,11 @@ function AppShell() {
     }
   }, [toast, dismissApproval])
 
+  const answerQuestionFn = useCallback(async (questionId: string, reply: QuestionReply) => {
+    await answerQuestion(questionId, reply)
+    dismissQuestion(questionId)
+  }, [dismissQuestion])
+
   const rename = useCallback(async (id: string, title: string) => {
     if (activeWs === null) return
     const nav = navigation.current.current()
@@ -1374,7 +1389,7 @@ function AppShell() {
       onNewWorkspaceName={setNewWorkspaceName}
       onSelectWorkspace={switchWorkspace}
       onCreateWorkspace={() => void addWorkspace()}
-      onWorkspacesChanged={async () => { await refreshWorkspaces() }}
+      onWorkspacesChanged={refreshWorkspacesDiscard}
       onFilter={setFilter}
       onSelect={openSession}
       onNew={beginConversation}
@@ -1469,8 +1484,14 @@ function AppShell() {
 
   /** ArrowUp on an empty composer edits the newest own message again. */
   const recallLast = useCallback((): string | null => {
-    const lastUser = [...projectedItems].reverse().find((item) => item.kind === 'user')
-    return lastUser !== undefined && lastUser.kind === 'user' ? lastUser.content : null
+    // Newest-first scan without copying/reversing the projection: this runs
+    // on every shell render (each streamed frame), though it reads nothing
+    // until the composer's ArrowUp handler fires.
+    for (let index = projectedItems.length - 1; index >= 0; index -= 1) {
+      const item = projectedItems[index]
+      if (item !== undefined && item.kind === 'user') return item.content
+    }
+    return null
   }, [projectedItems])
 
   // The latest folder-grant revision on the stream: an approval that granted
@@ -1675,6 +1696,8 @@ function AppShell() {
                 project={currentProject}
                 events={events}
                 connected={stream !== 'reconnecting'}
+                todos={derived.todos}
+                workingSince={derived.workingSince}
                 onOpenView={openEnvironmentView}
                 onOpenProcess={openEnvironmentProcess}
                 onOpenChild={openSession}
@@ -1704,8 +1727,9 @@ function AppShell() {
               <section aria-label="Conversation composer" className="shrink-0 px-3 pb-3 sm:px-6 sm:pb-4">
                 <div className="mx-auto flex w-full max-w-3xl flex-col gap-2">
                   <QueuedBar items={queuedItems} running={running} onSendNow={sendQueuedNow} />
-                  <TaskStatus events={events} pending={approvals.length} sending={sending} connected={stream !== 'reconnecting'} />
+                  <TaskStatus events={events} pending={approvals.length} sending={sending} connected={stream !== 'reconnecting'} phase={derived.phase} todos={derived.todos} recovered={derived.recovered} />
                   <ApprovalBar key={key} approvals={approvals} scope={currentProject?.path ?? 'No project attached'} onAnswer={answer} />
+                  <QuestionBar questions={questions} onAnswer={answerQuestionFn} />
                   {sendErrorNotice}
                   {composerNode}
                 </div>

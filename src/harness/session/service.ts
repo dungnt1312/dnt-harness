@@ -90,6 +90,22 @@ export class SessionsService extends Service {
   private readonly summaryWriters = new Map<SessionId, Promise<void>>()
   /** Highest durable canonical prefix awaiting its rebuildable projection. */
   private readonly summaryTargets = new Map<SessionId, number>()
+  /**
+   * Memoized full-prefix summary per loaded session, keyed by log length.
+   * `listSessions` re-reads `summaries()` on every UI poll (a 10s heartbeat,
+   * plus focus and visibilitychange); without this each poll copied and
+   * re-scanned every loaded session's whole log. `summarize` is a pure
+   * function of `events[0..lastSeq)` with monotonic seqs, so the same length
+   * is the same summary; a changed log has a new length.
+   */
+  private readonly summaryCache = new Map<SessionId, { readonly length: number; readonly summary: SessionSummary }>()
+  /**
+   * Memoized pending-input scan per loaded session, keyed by log length, for
+   * the same reason: the listing endpoint calls `pendingInputs` per session
+   * per poll and the scan is a whole-log pass. Invalidated on append (the
+   * session observer below) and dropped with the session.
+   */
+  private readonly pendingInputsCache = new Map<SessionId, { readonly length: number; readonly pending: PendingInput[] }>()
   /** Deleted ids suppress late summary callbacks from recreating directories. */
   private readonly deleting = new Set<SessionId>()
   /** Shutdown suppresses new projections after the stores begin closing. */
@@ -315,7 +331,7 @@ export class SessionsService extends Service {
   summaries(): SessionSummary[] {
     const all = new Map<SessionId, SessionSummary>()
     for (const [id, summary] of this.known) all.set(id, summary)
-    for (const session of this.loaded.values()) all.set(session.id, this.summarize(session))
+    for (const session of this.loaded.values()) all.set(session.id, this.cachedSummarize(session))
     return [...all.values()].sort((a, b) => b.updatedAt - a.updatedAt)
   }
 
@@ -361,6 +377,8 @@ export class SessionsService extends Service {
     await this.summaryWriters.get(id)?.catch(() => {})
     this.summaryWriters.delete(id)
     this.summaryTargets.delete(id)
+    this.summaryCache.delete(id)
+    this.pendingInputsCache.delete(id)
     this.loaded.delete(id)
     this.known.delete(id)
     this.ownership.delete(id)
@@ -375,8 +393,15 @@ export class SessionsService extends Service {
    * a restart these stay pending and are never executed on their own.
    * Attachments ride along: a re-adopted input must reach the model with the
    * same files the user attached to it.
+   *
+   * Memoized per log length: the session listing re-derives this on every
+   * UI poll and the scan is a whole-log pass. The listing is a read path —
+   * a stale entry is impossible here because a session can only change by
+   * appending, and any append changes `events.length`.
    */
   pendingInputs(session: Session): PendingInput[] {
+    const cached = this.pendingInputsCache.get(session.id)
+    if (cached !== undefined && cached.length === session.events.length) return cached.pending
     const consumed = new Set<string>()
     const queued: PendingInput[] = []
     for (const event of session.events) {
@@ -393,7 +418,9 @@ export class SessionsService extends Service {
         consumed.add(event.inputId)
       }
     }
-    return queued.filter((item) => !consumed.has(item.inputId))
+    const pending = queued.filter((item) => !consumed.has(item.inputId))
+    this.pendingInputsCache.set(session.id, { length: session.events.length, pending })
+    return pending
   }
 
   /**
@@ -579,6 +606,22 @@ export class SessionsService extends Service {
       ...this.stores.values(),
     ])
     await Promise.allSettled([...stores].map((store) => store.close?.()))
+  }
+
+  /**
+   * `summarize` memoized for the full-prefix read path (`summaries()` ← the
+   * session listing endpoint). Keyed by log length: seqs are monotonic, so
+   * one length is one canonical prefix and one summary. The projection
+   * writer (`persistSummary`) still calls `summarize` directly — it derives
+   * at a captured durable prefix, not the live tail.
+   */
+  private cachedSummarize(session: Session): SessionSummary {
+    const cached = this.summaryCache.get(session.id)
+    const length = session.events.length
+    if (cached !== undefined && cached.length === length) return cached.summary
+    const summary = this.summarize(session, length)
+    this.summaryCache.set(session.id, { length, summary })
+    return summary
   }
 
   /** Summary computed from a live session's log through a durable prefix. */

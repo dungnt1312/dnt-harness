@@ -77,12 +77,12 @@ vi.mock('../../lib/api.ts', () => ({
   toBase64: (value: string) => Buffer.from(value, 'utf8').toString('base64'),
 }))
 
-const { TerminalPanel } = await import('./TerminalPanel.tsx')
+const { TerminalPanel, clearAutoOpenClaims } = await import('./TerminalPanel.tsx')
 
 type Frame = Parameters<Parameters<typeof api.subscribeTerminals>[1]>[0]
 
 let host: HTMLDivElement
-let root: Root
+let root: Root | undefined
 let push: (frame: Frame) => void
 
 const row = (id: string, label = 'Git Bash', shellId = 'bash') => ({
@@ -102,6 +102,7 @@ beforeEach(() => {
   MockTerminal.instances = []
   MockTerminal.last = undefined
   vi.clearAllMocks()
+  clearAutoOpenClaims()
   global.ResizeObserver = class {
     observe(): void {}
     disconnect(): void {}
@@ -126,7 +127,8 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  act(() => root.unmount())
+  if (root !== undefined) act(() => root.unmount())
+  root = undefined
   host.remove()
 })
 
@@ -138,6 +140,9 @@ async function mount(props: {
   onHide?: () => void
   bindingReady?: boolean
 } = {}): Promise<void> {
+  if (root === undefined) {
+    root = createRoot(host)
+  }
   await act(async () => {
     root.render(
       <TerminalPanel
@@ -150,6 +155,12 @@ async function mount(props: {
       />,
     )
   })
+}
+
+/** Unmount the current tree; the next mount starts a fresh root, like a remount. */
+async function unmount(): Promise<void> {
+  await act(async () => root.unmount())
+  root = undefined as unknown as Root
 }
 
 describe('terminal panel', () => {
@@ -495,6 +506,52 @@ describe('terminal panel', () => {
     } as Frame))
 
     expect(api.createTerminal).toHaveBeenCalledWith('ws', expect.objectContaining({ projectId: 'project-7' }))
+  })
+
+  it('does not stack another shell when session switches remount the view', async () => {
+    // Session A (project-7) spends its auto-open; switching to session B in
+    // another folder remounts the panel (the key follows the project) and
+    // spends project-9's; switching back must not open a second project-7
+    // shell — the '+' button is the way to a new one.
+    await mount({ projectId: 'project-7' })
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+    expect(api.createTerminal).toHaveBeenCalledTimes(1)
+
+    await unmount()
+    await mount({ projectId: 'project-9' })
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+    // project-9's own first open, not a second project-7 shell.
+    expect(api.createTerminal).toHaveBeenCalledTimes(1)
+
+    await unmount()
+    api.createTerminal.mockClear()
+    await mount({ projectId: 'project-7' })
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+
+    expect(api.createTerminal).not.toHaveBeenCalled()
+    expect(host.textContent).toContain('No terminal open')
+  })
+
+  it('still opens for a project whose claim exists but which has no live shell from a previous page load', async () => {
+    // The claim is page-lifetime, not durable: a shell that died with the
+    // previous page (or was closed there) leaves this mount empty and the
+    // claim spent — but this is a new page, so the project gets one shell.
+    await mount({ projectId: 'project-7' })
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+    expect(api.createTerminal).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not spend a project claim while the binding is loading, then unmounts', async () => {
+    // The claim is spent only when an open actually fires. A mount that
+    // unmounts while still holding the open (binding loading) leaves the
+    // project's allowance intact for the next mount.
+    await act(async () => {
+      root.render(<TerminalPanel workspaceId="ws" projectId="project-1" defaultShell={null} bindingReady={false} />)
+    })
+    await unmount()
+    await mount({ projectId: 'project-1' })
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+    expect(api.createTerminal).toHaveBeenCalledTimes(1)
   })
 
   it('opens for this project even when other projects already hold live shells', async () => {

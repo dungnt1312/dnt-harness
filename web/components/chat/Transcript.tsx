@@ -8,13 +8,14 @@ import { toProjectRelative } from '../../lib/project-paths.ts'
 import { processRows, type ProcessRow } from '../../lib/processes-view.ts'
 import { hiddenSpawnCalls } from '../../lib/spawn-merge.ts'
 import { turnTimings, type TurnTiming } from '../../lib/turn-timing.ts'
+import { useSessionDerivedGates } from '../../lib/session-derived.ts'
 import { ActivityBlock, AssistantMessage, AuditLine, CompactionMarker, ContinuationMarker, ContextMarker, DelegationCard, JumpToBottom, ProcessLinkContext, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
 import { TurnChangesCard } from './TurnChangesCard.tsx'
 import type { WorkbenchProject } from '../workbench/Workbench.tsx'
 import { ConversationMinimap } from './ConversationMinimap.tsx'
 
 interface Indexed { readonly item: ViewItem; readonly index: number }
-type Block = { readonly kind: 'row'; readonly row: Indexed } | { readonly kind: 'activity'; readonly rows: readonly Indexed[]; breakAfter?: boolean }
+type Block = { readonly kind: 'row'; readonly row: Indexed } | { readonly kind: 'activity'; readonly rows: readonly Indexed[] }
 
 const ACTIVITY_KINDS: ReadonlySet<ViewItem['kind']> = new Set(['tool', 'delegation', 'audit'])
 const TRANSCRIPT_WINDOW = 300
@@ -55,10 +56,7 @@ export function turnFooters(items: readonly ViewItem[]): ReadonlyMap<number, Tur
 
 /**
  * Consecutive tool/delegation/audit rows render as one tight block so a busy
- * turn reads as a compact activity log between messages — except a landed
- * Edit or Write: it closes the run before it, reads as a run of its own, and
- * other work after it starts fresh, so no summary line can bury the turn's
- * product among the steps around it. Terminal markers
+ * turn reads as a compact activity log between messages. Terminal markers
  * that render nothing, and a bare "failed" marker right after a detailed
  * failure card, are dropped so they cannot add empty spacing. An assistant
  * step that renders nothing either (a tool-only step: no text, no thinking,
@@ -81,30 +79,29 @@ const isThinkingBeat = (item: ViewItem): boolean =>
 const isActivity = (item: ViewItem): boolean => ACTIVITY_KINDS.has(item.kind) || isThinkingBeat(item)
 
 /**
- * A landed change (Edit/Write) is the work the turn was for. It breaks the
- * run: work before it closes, the change stands alone, work after it starts
- * fresh. A change that failed, was refused or never recorded is not a landed
- * change and cannot split anything.
+ * A landed change (Edit/Write with a recorded result) is the work the turn was
+ * for. It breaks the run: work before it closes, the change stands as a run of
+ * changes, and other work after it starts fresh — so no summary line can bury
+ * the turn's product among the steps around it. A change still running,
+ * failed or refused never landed and breaks nothing.
  */
 const isChange = (item: ViewItem): boolean => {
-  if (item.kind !== 'tool') return false
+  if (item.kind !== 'tool' || item.result === undefined || !item.result.ok) return false
   const name = item.call.name.toLowerCase()
-  return (name === 'edit' || name === 'write') && toolSettled(item)
+  return name === 'edit' || name === 'write'
 }
-
-/** The call has a recorded result: a state a run can close on. */
-const toolSettled = (item: ViewItem): boolean => item.kind === 'tool' && item.result !== undefined
 
 export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
   const blocks: Block[] = []
-  const close = (stopBeforeChange: boolean) => {
+  /** The open run a work row joins, or a fresh one when none is open. */
+  const join = (item: ViewItem, index: number): void => {
     const last = blocks.at(-1)
-    if (last?.kind === 'activity') {
-      if (stopBeforeChange) last.breakAfter = true
-      return true
-    }
-    return false
+    if (last?.kind === 'activity') (last.rows as Indexed[]).push({ item, index })
+    else blocks.push({ kind: 'activity', rows: [{ item, index }] })
   }
+  // A landed change closes the run before it; a batch of changes keeps one
+  // run; any row that is not itself a change ends that batch state.
+  let afterChange = false
   items.forEach((item, index) => {
     if (item.kind === 'status' && item.reason === 'completed') return
     // Queued input waits on the strip above the composer (QueuedBar), not in
@@ -113,21 +110,23 @@ export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
     if (rendersNothing(item)) return
     const previous = items[index - 1]
     if (item.kind === 'status' && item.reason === 'failed' && previous?.kind === 'status' && previous.reason.includes(':')) return
-    // Every consecutive work row joins the same run, delegations included.
-    // A landed Edit or Write is the exception: it ends the run it follows, so
-    // the turn's product reads as its own step instead of one row of twenty-
-    // two commands — and work after it groups from scratch.
+    // Every consecutive work row joins the same run, delegations included —
+    // except a landed Edit or Write, which ends the run it follows: the
+    // turn's product must read as its own step, not as one row among
+    // twenty-two commands.
     if (isChange(item)) {
-      if (close(true)) blocks.push({ kind: 'activity', rows: [{ item, index }], breakAfter: true })
-      else blocks.push({ kind: 'row', row: { item, index } })
+      if (afterChange) join(item, index)
+      else blocks.push({ kind: 'activity', rows: [{ item, index }] })
+      afterChange = true
       return
     }
-    // The change closed the run before it; this row starts the next one.
-    const afterBreak = previous !== undefined && isChange(previous)
+    const afterBreak = afterChange
+    afterChange = false
     if (isActivity(item)) {
-      const tail = blocks.at(-1)
-      if (tail?.kind === 'activity' && !(tail.breakAfter === true && afterBreak)) (tail.rows as Indexed[]).push({ item, index })
-      else blocks.push({ kind: 'activity', rows: [{ item, index }] })
+      // The change closed the run before it: this row opens the next one
+      // instead of joining the change's own run or standing alone.
+      if (afterBreak) blocks.push({ kind: 'activity', rows: [{ item, index }] })
+      else join(item, index)
       return
     }
     blocks.push({ kind: 'row', row: { item, index } })
@@ -174,28 +173,41 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   // Files each closed turn's Write/Edit calls landed, projected once per
   // event revision from the raw log (tool traffic carries only a stepId —
   // the projection attributes positionally, like the transcript itself).
-  const turnChangeMap = useMemo(() => turnChanges(events ?? []), [events])
+  // Gated: these four maps re-derive from whole-log scans, so each recomputes
+  // only when traffic of the event types it reads arrived. A streaming frame
+  // of chunks leaves every map untouched, and the memoized cards above keep
+  // their references.
+  const gates = useSessionDerivedGates(events ?? [])
+  const turnChangeMap = useMemo(
+    () => turnChanges(events ?? []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on tool traffic, not array identity (a new array lands every streamed frame)
+    [gates.taskCount, events],
+  )
   // Wall-clock boundaries per turn: the user row renders the start, the turn
-  // footer the end and the span. Rebuilt only with the raw log.
-  const turnTimingMap = useMemo(() => turnTimings(events ?? []), [events])
+  // footer the end and the span. Rebuilt only when turn traffic arrived.
+  const turnTimingMap = useMemo(
+    () => turnTimings(events ?? []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on turn-boundary traffic
+    [gates.turnCount, events],
+  )
   // Live background-process state for the tool rows, keyed off the process
   // events only so unrelated log traffic does not rebuild the map (and
   // re-render every memoized card) with it.
-  const processEventCount = useMemo(
-    () => (events ?? []).reduce((count, event) => count + (event.type === 'process/start' || event.type === 'process/exit' ? 1 : 0), 0),
-    [events],
-  )
   const processStatuses = useMemo(
     () => new Map<string, ProcessRow>(processRows(events ?? []).map((row) => [row.id, row])),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- rebuilt only when process traffic changes
-    [processEventCount],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on process traffic
+    [gates.processCount, events],
   )
   const processLink = useMemo<ProcessLink | null>(
     () => onOpenProcess === undefined ? null : { statuses: processStatuses, open: onOpenProcess },
     [onOpenProcess, processStatuses],
   )
   // Spawn calls the delegation row absorbs: one delegation, one row.
-  const hiddenSpawns = useMemo(() => hiddenSpawnCalls(events ?? []), [events])
+  const hiddenSpawns = useMemo(
+    () => hiddenSpawnCalls(events ?? []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on tool + agent traffic
+    [gates.taskCount, gates.agentCount, events],
+  )
   const turnChangeFooter = (turnId?: string): TurnChanges | undefined => {
     if (turnId === undefined) return undefined
     const changes = turnChangeMap.get(turnId)

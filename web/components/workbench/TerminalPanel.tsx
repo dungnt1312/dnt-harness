@@ -28,12 +28,20 @@ const RESIZE_DEBOUNCE_MS = 100
 const EXIT_NOTICE_MS = 1_500
 
 /**
- * Auto-opens in flight, keyed by workspace and project. The chat footer and
- * the workbench Terminal tab are separate mounts; restored together after a
- * reload, both would see an empty snapshot and each spawn a shell. The first
- * claims the open; the other adopts the shell through its `created` frame.
+ * Projects that have spent their auto-open, keyed by workspace and project.
+ * The chat footer and the workbench Terminal tab are separate mounts; restored
+ * together after a reload, both would see an empty snapshot and each spawn a
+ * shell — the first claims the open, the other adopts the shell through its
+ * `created` frame. The claim also outlives the mount: a session switch
+ * remounts this panel (the key follows the project), and a per-mount allowance
+ * would stack one more shell on every switch between folders.
  */
 const autoOpenClaims = new Set<string>()
+
+/** Test seam: the claims live for the page's lifetime; a test is a fresh page. */
+export function clearAutoOpenClaims(): void {
+  autoOpenClaims.clear()
+}
 
 const NEW_TERMINAL_CLASS = 'flex size-7 shrink-0 items-center justify-center rounded-md text-fg-muted transition-colors hover:bg-hover hover:text-fg disabled:cursor-not-allowed disabled:opacity-40'
 
@@ -407,9 +415,12 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
     autoOpened.current = true
     if (visibleRows.length > 0) return
     const claim = `${workspaceId ?? ''}\u0000${projectId ?? ''}`
+    // One auto-open per project for the page's lifetime: the claim is not
+    // refunded, so session switches that remount this view cannot stack
+    // shells. The '+' button and Ctrl+` remain unlimited manual opens.
     if (autoOpenClaims.has(claim)) return
     autoOpenClaims.add(claim)
-    void open(preferredShell).finally(() => autoOpenClaims.delete(claim))
+    void open(preferredShell)
   }, [ready, catalogReady, bindingReady, unavailable, visibleRows.length, preferredShell, open, workspaceId, projectId])
 
   // Only the selected terminal is visible, and it refits whenever it becomes

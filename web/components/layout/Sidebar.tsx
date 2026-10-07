@@ -1,5 +1,5 @@
 import * as Popover from '@radix-ui/react-popover'
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import Icon from '../common/Icon.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Kbd } from '../ui/Kbd.tsx'
@@ -78,8 +78,12 @@ export interface SidebarProps {
  * Conversation navigation: new chat + search, project-grouped history, and a
  * footer owning workspace switching, notifications, appearance and Settings.
  * An archived workspace disables New and shows one quiet note.
+ *
+ * Memoized: the shell re-renders every streaming frame, and none of this
+ * component's props change with chat traffic — sessions, projects, callbacks
+ * and markers all keep their references across frames.
  */
-export function Sidebar(props: SidebarProps) {
+export const Sidebar = memo(function Sidebar(props: SidebarProps) {
   const { sessions, projects, current, filter, running, workspaces, activeWorkspaceId, onFilter, onSelect, onNew, onNewInProject, onRename, onDeleteRequest, onClose } = props
   const searchRef = useRef<HTMLInputElement | null>(null)
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
@@ -291,4 +295,4 @@ export function Sidebar(props: SidebarProps) {
       </div>
     </nav>
   )
-}
+})

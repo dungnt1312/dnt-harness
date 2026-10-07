@@ -205,7 +205,50 @@ export type Envelope =
     readonly proposedAccess?: 'read' | 'write'
   }
   | { readonly kind: 'approval-settled'; readonly approvalId: string }
+  | {
+    readonly kind: 'question'
+    readonly questionId: string
+    readonly callId: string
+    readonly questions: readonly UserQuestion[]
+    readonly expiresAt: number
+    readonly childSessionId?: string
+    readonly definitionName?: string
+  }
+  | { readonly kind: 'question-settled'; readonly questionId: string }
   | { readonly kind: 'error'; readonly message: string }
+
+/** One AskUserQuestion option, exactly as the model offered it. */
+export interface UserQuestionOption {
+  readonly label: string
+  readonly description?: string
+}
+
+/** One question of an AskUserQuestion call. */
+export interface UserQuestion {
+  readonly question: string
+  readonly header?: string
+  readonly options: readonly UserQuestionOption[]
+  readonly multiSelect: boolean
+}
+
+/** The human's answer to one question, aligned by index. */
+export interface UserQuestionAnswer {
+  readonly selected: readonly string[]
+  readonly other?: string
+}
+
+/** The human's reply to an AskUserQuestion: answers aligned with its questions, or a decline. */
+export type QuestionReply = { readonly answers: readonly UserQuestionAnswer[] } | { readonly decline: true }
+
+/** A live AskUserQuestion waiting on the human. */
+export interface PendingQuestion {
+  readonly questionId: string
+  readonly callId: string
+  readonly questions: readonly UserQuestion[]
+  readonly expiresAt: number
+  readonly childSessionId?: string
+  readonly definitionName?: string
+}
 
 /** Sidebar ordering for the conversation list. */
 export type SessionSort = 'recent' | 'oldest' | 'title'

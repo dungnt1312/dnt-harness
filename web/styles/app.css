@@ -137,6 +137,10 @@
   html, body, #root { height: 100%; }
   /* Mobile browsers inflate text in landscape otherwise; the app sets its own sizes. */
   html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  /* Belt and braces: every scrollable surface lives inside the h-dvh app shell,
+     so the document itself must never scroll, not even transiently while the
+     shell lays out (a fleeting 16px overflow was observed once in landscape). */
+  html { overflow: hidden; }
   body {
     margin: 0;
     background: var(--bg);

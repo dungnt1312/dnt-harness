@@ -1,5 +1,5 @@
 import type { AttachmentRef } from './composer-draft.ts'
-import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillFileRow, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, WorkspaceMeta, WorkspaceRow } from './types.ts'
+import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillFileRow, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, UserQuestionAnswer, WorkspaceMeta, WorkspaceRow } from './types.ts'
 
 const CSRF_HEADER = 'x-dnt-harness-csrf'
 let csrfToken: string | undefined
@@ -119,6 +119,15 @@ export function answerApproval(approvalId: string, allow: boolean, scope: 'once'
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ allow, ...(scope === 'session' ? { scope } : {}) }),
+  }).then((r) => json<{ answered: boolean }>(r)).then(() => undefined)
+}
+
+/** Answer (or decline) one AskUserQuestion; `answers` align with its questions. */
+export function answerQuestion(questionId: string, reply: { readonly answers: readonly UserQuestionAnswer[] } | { readonly decline: true }): Promise<void> {
+  return apiFetch(`/api/questions/${encodeURIComponent(questionId)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(reply),
   }).then((r) => json<{ answered: boolean }>(r)).then(() => undefined)
 }
 

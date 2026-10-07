@@ -9,7 +9,7 @@
  * what an SSE gap or a skipped result write may have missed — processes
  * once per connect, subagents on a short poll while any still runs.
  */
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { memo, useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import Icon from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { Sheet } from '../ui/Sheet.tsx'
@@ -18,7 +18,7 @@ import { useMediaQuery } from '../../hooks/useMediaQuery.ts'
 import { fetchGitStatus, listSessionProcesses, stopSessionProcess, cancelChild, listChildren } from '../../lib/api.ts'
 import { processRows, subagentRows, reconcileSubagentRows, type ProcessRow, type SubagentRow } from '../../lib/processes-view.ts'
 import { agentRoleIcon, AGENT_ROLE_TONE } from '../../lib/agent-icons.ts'
-import { todosFromEvents } from '../../lib/todos-view.ts'
+import { todosFromEvents, type TodoView } from '../../lib/todos-view.ts'
 import { formatAge } from '../../lib/format.ts'
 import type { ChildRow, SseEvent } from '../../lib/types.ts'
 
@@ -36,6 +36,10 @@ interface Props {
   readonly project: { readonly id: string; readonly name: string; readonly path: string } | null
   readonly events: readonly SseEvent[]
   readonly connected: boolean
+  /** Precomputed by the shell (session-derived); scanned here when absent. */
+  readonly todos?: TodoView
+  /** The open turn's start stamp, when the shell already derived it. */
+  readonly workingSince?: number | null
   readonly onOpenView: (view: 'git' | 'agents') => void
   /** A process row click: open its live detail in the workbench. */
   readonly onOpenProcess: (processId: string) => void
@@ -86,7 +90,24 @@ const COMPACT_QUERY = '(max-width: 767px)'
 /** Subagent rows shown before the panel defers to the workbench list. */
 const MAX_PANEL_SUBAGENTS = 6
 
-export function EnvironmentPanel({ workspaceId, sessionId, project, events, connected, onOpenView, onOpenProcess, onOpenChild }: Props) {
+/**
+ * Live seconds tick: ages and the working-elapsed label re-format once a
+ * second while something on screen is live. The tick owns its own state so
+ * only the components that take `now` re-render — the panel body subscribes
+ * through it once, and row memoization can key on the value.
+ */
+function useNow(ticking: boolean): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!ticking) return
+    setNow(Date.now())
+    const id = window.setInterval(() => setNow(Date.now()), 1_000)
+    return () => window.clearInterval(id)
+  }, [ticking])
+  return now
+}
+
+export const EnvironmentPanel = memo(function EnvironmentPanel({ workspaceId, sessionId, project, events, connected, todos: todosProp, workingSince: workingSinceProp, onOpenView, onOpenProcess, onOpenChild }: Props) {
   // Panel state is scoped to the conversation: switching resets the collapse,
   // the one-shot auto-open, and the per-section disclosure.
   const [state, setState] = useState<{ scope: string | null; expanded: boolean; autoOpened: boolean; processesOpen: boolean; subagentsOpen: boolean; tasksOpen: boolean; endedOpen: boolean; endedAgentsOpen: boolean; dismissed: ReadonlySet<string> }>({ scope: sessionId, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, tasksOpen: true, endedOpen: false, endedAgentsOpen: false, dismissed: new Set() })
@@ -96,8 +117,13 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
   const [childRows, setChildRows] = useState<readonly ChildRow[]>([])
   const [stopping, setStopping] = useState<readonly string[]>([])
   const [stoppingChild, setStoppingChild] = useState<readonly string[]>([])
-  const [now, setNow] = useState(() => Date.now())
   const compact = useMediaQuery(COMPACT_QUERY)
+  // The git line re-reads after each settled turn; the gate counts turn/end
+  // traffic in the same single pass the other gates share.
+  const turnEndGate = useMemo(
+    () => events.reduce((count, event) => count + (event.type === 'turn/end' ? 1 : 0), 0),
+    [events],
+  )
 
   const derived = useMemo(() => processRows(events), [events])
   const spawned = useMemo(() => subagentRows(events), [events])
@@ -124,21 +150,19 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
   const liveAgents = useMemo(() => runningAgents.slice(0, MAX_PANEL_SUBAGENTS), [runningAgents])
   const hiddenRunningAgents = runningAgents.length - liveAgents.length
   const hasLive = running.length > 0 || runningAgents.length > 0
-  const todo = useMemo(() => todosFromEvents(events), [events])
+  // Shell-supplied when mounted from AppShell; a standalone mount scans here.
+  const todo = useMemo(() => todosProp ?? todosFromEvents(events), [todosProp, events])
   const todoDone = useMemo(() => todo.todos.filter((item) => item.status === 'completed').length, [todo])
   const todoAllDone = todo.todos.length > 0 && todoDone === todo.todos.length
 
   // The turn currently open in this conversation, if any — the header's
   // `Working · <elapsed>` indicator, same semantics as the TaskStatus line.
-  const workingSince = useMemo(() => {
-    for (let index = events.length - 1; index >= 0; index -= 1) {
-      const event = events[index]
-      if (event.type === 'turn/end') return null
-      if (event.type === 'turn/start') return event.timestamp ?? null
-    }
-    return null
-  }, [events])
+  // Shell-supplied when mounted from AppShell; a standalone mount scans here.
+  const workingSince = useMemo(() => (workingSinceProp !== undefined ? workingSinceProp : workingSinceOf(events)), [workingSinceProp, events])
   const ticking = running.length > 0 || runningAgents.length > 0 || workingSince !== null
+  // One state per live second (see useNow): the tick re-renders the rows that
+  // format ages, not the shell around the panel.
+  const now = useNow(ticking)
 
   const scope = sessionId ?? null
   if (state.scope !== scope) setState({ scope, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, tasksOpen: true, endedOpen: false, endedAgentsOpen: false, dismissed: new Set() })
@@ -152,14 +176,13 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
     setState((prev) => (prev.scope === scope && !prev.autoOpened ? { ...prev, expanded: true, autoOpened: true } : prev))
   }, [compact, hasLive, scope, state.scope, state.autoOpened, state.expanded])
 
-  // Live durations: working elapsed and running process ages.
-  useEffect(() => {
-    if (!ticking) return
-    const id = window.setInterval(() => setNow(Date.now()), 1_000)
-    return () => window.clearInterval(id)
-  }, [ticking])
-
-  const turnEndCount = useMemo(() => events.filter((event) => event.type === 'turn/end').length, [events])
+  // Settled turns re-read the git line — counted from boundary traffic only,
+  // so a streaming frame does not recompute it.
+  const turnEndCount = useMemo(
+    () => events.reduce((count, event) => count + (event.type === 'turn/end' ? 1 : 0), 0),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- gate: re-run only when a turn/end arrived
+    [turnEndGate],
+  )
 
   // Git line: on mount and after each settled turn.
   useEffect(() => {
@@ -483,6 +506,17 @@ export function EnvironmentPanel({ workspaceId, sessionId, project, events, conn
     ) : null}
     </>
   )
+})
+
+/** Newest boundary backwards: an open turn's start stamp, else null. */
+function workingSinceOf(events: readonly SseEvent[]): number | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event === undefined) continue
+    if (event.type === 'turn/end') return null
+    if (event.type === 'turn/start') return event.timestamp ?? null
+  }
+  return null
 }
 
 /** A collapsible section: an uppercase eyebrow head, then child rows behind a rail. */

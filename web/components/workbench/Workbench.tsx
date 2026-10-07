@@ -1,4 +1,4 @@
-﻿import { lazy, Suspense, useMemo, useState, type ReactNode } from 'react'
+﻿import { lazy, memo, Suspense, useMemo, useState, type ReactNode } from 'react'
 import Icon from '../common/Icon.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Menu, menuItemClass } from '../ui/Menu.tsx'
@@ -81,8 +81,16 @@ function ViewTab({ view, active, onClick, onClose }: {
  * File bodies come from the project browsing endpoints rather than tool output.
  * Terminal is a view tab like the others (Ctrl+` opens it). The chat column
  * has a separate footer terminal; this panel does not own that one.
+ *
+ * Memoized with a custom comparator: the shell re-renders every streaming
+ * frame, and this panel only consumes the log through the Trajectory and
+ * Subagents views. The log props are compared by identity for everything
+ * else, and treated as "changed" only when one of those two views is open —
+ * a frames-long stream of chunks never re-renders Files, Git, Context or the
+ * tab strip. (`events`/`agentEvents` are new arrays per frame by design; the
+ * views that read them re-render on their own `useMemo` deps instead.)
  */
-export function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, gitFocusPath = null, onClearGitFilter, processFocus = null }: {
+export const Workbench = memo(function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, gitFocusPath = null, onClearGitFilter, processFocus = null }: {
   readonly workspaceId: string | null
   /** The project whose files are browsable; null for chat-only conversations. */
   readonly project: WorkbenchProject | null
@@ -323,4 +331,29 @@ export function Workbench({ workspaceId, project, view, onView, views, onViews, 
       <div className="flex min-h-0 flex-1 flex-col">{body}</div>
     </section>
   )
-}
+}, (previous, next) => {
+  // Log props (events, agentEvents, context.eventCount) arrive fresh each
+  // streamed frame; only the views that read the log re-render for them.
+  const logReads = next.view === 'trajectory' || next.view === 'agents'
+  if (logReads && (previous.events !== next.events || previous.agentEvents !== next.agentEvents)) return false
+  return previous.workspaceId === next.workspaceId
+    && previous.project === next.project
+    && previous.view === next.view
+    && previous.views === next.views
+    && previous.files === next.files
+    && previous.context === next.context
+    && previous.expanded === next.expanded
+    && previous.onToggleExpand === next.onToggleExpand
+    && previous.onClose === next.onClose
+    && previous.openPath === next.openPath
+    && previous.sessionId === next.sessionId
+    && previous.agentsSessionId === next.agentsSessionId
+    && previous.onOpenChild === next.onOpenChild
+    && previous.terminalShell === next.terminalShell
+    && previous.onTerminalShell === next.onTerminalShell
+    && previous.bindingReady === next.bindingReady
+    && previous.processFocus === next.processFocus
+    && previous.gitPathFilter === next.gitPathFilter
+    && previous.gitFocusPath === next.gitFocusPath
+    && previous.onClearGitFilter === next.onClearGitFilter
+})
