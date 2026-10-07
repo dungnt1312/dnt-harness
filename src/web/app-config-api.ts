@@ -63,10 +63,10 @@ export async function handleAppConfigApi(
       requireKeys(await readBody(req, readJson), [])
       send(200, await service.reload())
     } else {
-      send(405, { error: 'method not allowed' })
+      send(405, { error: 'method not allowed', code: 'method' })
     }
   } catch (error) {
-    if (error instanceof BadRequest) send(400, { error: error.message })
+    if (error instanceof BadRequest) send(400, { error: error.message, code: 'invalid' })
     else if (error instanceof AppConfigError) {
       send(statusOf(error), { error: error.message, code: error.code, ...(error.key !== undefined ? { key: error.key } : {}) })
     } else send(500, { error: error instanceof Error ? error.message : String(error) })

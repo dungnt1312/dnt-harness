@@ -166,9 +166,11 @@ describe('global configuration API', () => {
     for (const body of bodies) {
       const response = await call(server, 'PATCH', '/api/app-config', body)
       expect(response.status, JSON.stringify(body)).toBe(400)
+      expect(await response.json()).toMatchObject({ code: 'invalid' })
     }
     const reloadWithKeys = await call(server, 'POST', '/api/app-config/reload', { force: true })
     expect(reloadWithKeys.status).toBe(400)
+    expect(await reloadWithKeys.json()).toMatchObject({ code: 'invalid' })
     await expect(fs.access(configFile(home))).rejects.toThrow()
     expect((await view(server)).active.revision).toBe(0)
   })
@@ -176,6 +178,12 @@ describe('global configuration API', () => {
   it('keeps the last good snapshot on an invalid reload and refuses edits until the file is repaired', async () => {
     const home = await tempHome()
     const server = await start(home)
+    const initial = await view(server)
+    const published = await call(server, 'PATCH', '/api/app-config', {
+      expectedHash: initial.hash,
+      edits: [{ op: 'set', key: 'toolTimeoutMs', value: 250_000 }],
+    })
+    expect(published.status).toBe(200)
     await fs.writeFile(configFile(home), '{"v":1,"limits":{"toolTimeoutMs":-5}}', 'utf8')
 
     const reload = await call(server, 'POST', '/api/app-config/reload', {})
@@ -186,14 +194,16 @@ describe('global configuration API', () => {
     expect(described.document).toBeNull()
     expect(described.hash).toBeNull()
     expect(typeof described.error).toBe('string')
-    expect(described.active.revision).toBe(0)
-    expect(described.active.values.toolTimeoutMs).toBe(DEFAULT_LIMITS.toolTimeoutMs)
+    expect(described.active.revision).toBe(1)
+    expect(described.active.values.toolTimeoutMs).toBe(250_000)
+    expect(server.appConfig.read().values.toolTimeoutMs).toBe(250_000)
 
     const refused = await call(server, 'PATCH', '/api/app-config', {
       expectedHash: 'anything',
       edits: [{ op: 'set', key: 'toolTimeoutMs', value: 300_000 }],
     })
     expect(refused.status).toBe(400)
+    expect(await refused.json()).toMatchObject({ code: 'invalid' })
 
     await fs.writeFile(configFile(home), '{"v":1}', 'utf8')
     const repaired = await view(server)
@@ -260,9 +270,16 @@ describe('global configuration API', () => {
 
   it('answers other methods on its routes with 405', async () => {
     const server = await start(await tempHome())
-    expect((await call(server, 'GET', '/api/app-config/reload')).status).toBe(405)
-    expect((await call(server, 'DELETE', '/api/app-config')).status).toBe(405)
-    expect((await call(server, 'PUT', '/api/app-config', {})).status).toBe(405)
-    expect((await call(server, 'POST', '/api/app-config', {})).status).toBe(405)
+    const refusals: [string, string, unknown?][] = [
+      ['GET', '/api/app-config/reload'],
+      ['DELETE', '/api/app-config'],
+      ['PUT', '/api/app-config', {}],
+      ['POST', '/api/app-config', {}],
+    ]
+    for (const [method, route, body] of refusals) {
+      const response = await call(server, method, route, body)
+      expect(response.status, `${method} ${route}`).toBe(405)
+      expect(await response.json()).toMatchObject({ code: 'method' })
+    }
   })
 })
