@@ -238,10 +238,16 @@ root-owned.
   resolving. No cleanup ever re-runs for a later caller.
 - **Every cleanup is attempted.** One entry's failing disposer never skips
   another entry's cleanup or the root fiber's unwind; each failure is collected,
-  published once as a `teardown` failure, and listed in the aggregate.
+  published once as a `teardown` failure, and listed in the aggregate. A
+  teardown failure observed through the coordinator that reports it is rethrown
+  to `stop()` for the aggregate; one surfaced only as a re-observation of an
+  already-explicitly-disposed fiber's cached rejection is resolved history and
+  is deliberately not re-aggregated.
 - **Already-settled failures are not replayed.** A startup failure whose cleanup
   already ran (fiber `disposed`, diagnostic retained in `inspect()`) is history:
-  stop skips it and still resolves.
+  stop skips it and still resolves. An `apply` rejection that arrives after a
+  completed stop publishes no event, but its diagnostic is still recorded and
+  inspectable.
 - **Owned work is drained; foreign work is not awaited.** Stop waits for the
   cleanups and kernel-owned transitions it starts — including `trackUndo` undo
   paths. It does *not* wait for a `loading` body still parked on its own I/O:

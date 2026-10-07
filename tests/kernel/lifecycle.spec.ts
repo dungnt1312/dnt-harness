@@ -719,8 +719,10 @@ describe('kernel lifecycle stabilization (task 4)', () => {
     const logs: string[] = []
     const cleanupBoom = new Error('bad cleanup boom')
 
-    // Mounted FIRST so teardown order unwinds it last: the bad cleanup must
-    // not stop the good one or the root fiber's own effects.
+    // Mounted FIRST; fix round 1 unwinds children/dependents first (reverse
+    // mount order), so the good entry — mounted last — is disposed before the
+    // bad one. The bad cleanup must still not stop the good one or the root
+    // fiber's own effects.
     kernel.ctx.plugin({
       name: 'bad',
       apply: (ctx: Context) => {
@@ -760,8 +762,9 @@ describe('kernel lifecycle stabilization (task 4)', () => {
 
     // Every cleanup was attempted: the bad one ran (and threw), the good one
     // and the root fiber's own effect still ran, and the store is empty.
-    // (Order: entries in mount order, then the root's own effects last.)
-    expect(logs).toEqual(['bad cleanup', 'good cleanup', 'root cleanup'])
+    // (Fix round 1: entries unwind in reverse mount order — children and
+    // dependents first — then the root's own effects last.)
+    expect(logs).toEqual(['good cleanup', 'bad cleanup', 'root cleanup'])
     expect(kernel.services.has('good-svc')).toBe(false)
 
     // The failure is published once as a teardown failure, carrying the
@@ -826,5 +829,57 @@ describe('kernel lifecycle stabilization (task 4)', () => {
     // A publication attempted after the unload is refused loud instead.
     expect(() => (lateCtx as Context).provide('late-svc-2', 2)).toThrow(/cannot register/)
     expect(kernel.services.has('late-svc-2')).toBe(false)
+  })
+
+  it('stop_collects_nested_child_cleanup_failure', async () => {
+    const kernel = new Kernel()
+    const failures: PluginFailedDetail[] = []
+    kernel.events.on('kernel/plugin-failed', (detail) => {
+      failures.push(detail)
+    })
+    const childBoom = new Error('child cleanup boom')
+
+    // The parent mounts a child through ctx.plugin: the parent fiber owns the
+    // child's logical entry, so the parent's own unwind (its ctx.plugin
+    // disposer) re-observes the child's cached teardown failure and retires
+    // the child entry itself. Stop must still report that failure as part of
+    // the whole-kernel verdict — children unwind first, so the stop pass is
+    // the one that collects and publishes it.
+    kernel.ctx.plugin({
+      name: 'parent',
+      apply: (ctx: Context) => {
+        ctx.plugin({
+          name: 'child',
+          apply: (childCtx: Context) => {
+            childCtx.effect(() => () => {
+              throw childBoom
+            })
+          },
+        })
+      },
+    })
+
+    const outcome = kernel.stop().then(
+      () => 'resolved' as const,
+      (error: unknown) => error,
+    )
+    const error = await outcome
+    expect(error).toBeInstanceOf(AggregateError)
+    const flat = (error as AggregateError).errors
+    expect(flat).toHaveLength(1)
+    expect(flat[0]).toBe(childBoom)
+
+    // The stop pass owns the reporting: exactly one teardown publish, carrying
+    // the child cleanup error (the fiber aggregates its own effect failures).
+    expect(failures).toHaveLength(1)
+    expect(failures[0]?.name).toBe('child')
+    expect(failures[0]?.phase).toBe('teardown')
+    expect(failures[0]?.error).toBeInstanceOf(AggregateError)
+    expect((failures[0]?.error as AggregateError).errors).toEqual([childBoom])
+
+    // The verdict is cached: a second stop re-observes the identical aggregate
+    // without re-running anything and without extra publishes.
+    await expect(kernel.stop()).rejects.toBe(error)
+    expect(failures).toHaveLength(1)
   })
 })

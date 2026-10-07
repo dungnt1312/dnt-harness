@@ -377,7 +377,14 @@ export class Kernel {
         }
       }
     }
-    for (const entry of [...this.entries]) {
+    for (const entry of [...this.entries].reverse()) {
+      // Reverse mount order: children and dependents unwind BEFORE their
+      // owners, so the stop pass itself observes a nested child's failing
+      // cleanup — collects it into the aggregate and publishes it — while the
+      // entry is still live. In insertion order an owner disposed first would
+      // retire the child through its own `ctx.plugin` disposer, and the stop
+      // loop would then skip the already-retired child: the failure would
+      // escape the whole-kernel verdict entirely.
       // A retired entry is fully settled history — a failed startup whose
       // cleanup already ran (K1: the diagnostic stays, stop never replays it),
       // or an earlier teardown failure stop itself must not re-report. Skip it.
@@ -611,7 +618,15 @@ export class Kernel {
     // replacement.
     if (entry.fiber !== fiber) return
     entry.retired = true
-    if (this.stopped) return
+    if (this.stopped) {
+      // Shutdown fenced this completion: no event is published after a stop,
+      // but the failure must not vanish entirely — recording it on the entry
+      // keeps it inspectable through `Kernel.inspect()` for anyone still
+      // holding the diagnostic snapshot (the registry is already empty, so
+      // this is the only trace left).
+      entry.error ??= error
+      return
+    }
     entry.error = error
     const published =
       cleanupError === undefined
