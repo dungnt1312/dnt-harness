@@ -47,7 +47,8 @@ export interface BashToolOptions {
    * the static `timeoutMs`/`maxWaitMs` above: the pipeline-stamped
    * `ToolExecution.limitsSnapshot` first, else a fresh read. Without it the
    * static options always govern, so fixed-option callers keep their budget
-   * and schema even inside the tool pipeline.
+   * and schema even inside the tool pipeline. `read()` must not throw: the
+   * tool's `schema()` calls it on every request assembly.
    */
   readonly limits?: LimitsReader
 }

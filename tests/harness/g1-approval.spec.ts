@@ -542,6 +542,29 @@ describe('approval lifecycle', () => {
     void kernel.stop()
   })
 
+  it('an invalid live approval expiry keeps the static expiry', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.tools.register(echoTool)
+    const before = Date.now()
+    let deadline = 0
+    attachApproval(kernel.ctx, {
+      policy: { Echo: 'ask' },
+      expiryMs: 60_000,
+      expiryMsOf: () => Number.NaN,
+      askUser: (_call, lifecycle) => {
+        deadline = lifecycle.expiresAt
+        return Promise.resolve(false)
+      },
+    })
+    try {
+      await kernel.ctx.tools.execute(call('Echo'))
+      expect(deadline).toBeGreaterThanOrEqual(before + 60_000)
+    } finally {
+      await kernel.stop()
+    }
+  })
+
   it('a changed approval expiry applies only to questions asked after it', async () => {
     vi.useFakeTimers()
     const kernel = new Kernel()

@@ -270,6 +270,43 @@ describe('limits operation boundaries', () => {
     expect(configured.body?.outputLimit).toBe(25)
   })
 
+  it('a call failing before dispatch releases its execution authority', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(ToolsService)
+    let readable = true
+    kernel.ctx.provide('limits-reader', {
+      read: () => {
+        if (!readable) throw new Error('limits unavailable')
+        return Object.freeze({ revision: 0, values: Object.freeze({ ...resolveLimits() }) })
+      },
+    })
+    const retired: string[] = []
+    kernel.ctx.tools.setAuthorityRetirer((executionId) => { retired.push(executionId) })
+    let ran = false
+    kernel.ctx.tools.register({
+      name: 'Probe',
+      description: 'must not run',
+      parameters: { type: 'object', properties: {}, required: [] },
+      async execute() { ran = true; return 'ran' },
+    })
+    try {
+      const unknown = await kernel.ctx.tools.prepare({ id: 'u', name: 'Missing', args: {} })
+      expect(retired).toEqual([unknown.executionId])
+
+      const atRun = await kernel.ctx.tools.prepare({ id: 'r', name: 'Probe', args: {} })
+      readable = false
+      const result = await atRun.execute()
+      expect(result).toMatchObject({ ok: false, output: expect.stringMatching(/^error: .*limits unavailable/) })
+      expect(retired).toEqual([unknown.executionId, atRun.executionId])
+
+      const atPrepare = await kernel.ctx.tools.prepare({ id: 'p', name: 'Probe', args: {} })
+      expect(retired).toEqual([unknown.executionId, atRun.executionId, atPrepare.executionId])
+      expect(ran).toBe(false)
+    } finally {
+      await kernel.stop()
+    }
+  })
+
   it('an unreadable limits source fails the call without throwing from prepare', async () => {
     const kernel = new Kernel()
     kernel.ctx.plugin(ToolsService)

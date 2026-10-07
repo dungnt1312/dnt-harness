@@ -209,6 +209,7 @@ describe('bash tool', () => {
     snapshot = Object.freeze({ revision: 2, values: Object.freeze({ ...DEFAULT_LIMITS, toolTimeoutMs: 60_000, bashMaxWaitMs: 60_000 }) })
     let output = await running
     expect(output).toContain('[terminated by timeout; killed]')
+    expect(output).not.toContain('never')
     expect(Date.now() - started).toBeLessThan(3_000)
 
     // An explicit argument above the current maximum clamps to it.
@@ -216,6 +217,7 @@ describe('bash tool', () => {
     started = Date.now()
     output = await tool.execute({ command: 'sleep 5; echo never', timeoutMs: 60_000 }, exec)
     expect(output).toContain('[terminated by timeout; killed]')
+    expect(output).not.toContain('never')
     expect(Date.now() - started).toBeLessThan(3_000)
 
     // A trusted execution snapshot outranks the reader.
@@ -223,6 +225,7 @@ describe('bash tool', () => {
     started = Date.now()
     output = await tool.execute({ command: 'sleep 5; echo never' }, { ...exec, limitsSnapshot: Object.freeze({ revision: 5, values: Object.freeze({ ...DEFAULT_LIMITS, toolTimeoutMs: 100 }) }) })
     expect(output).toContain('[terminated by timeout; killed]')
+    expect(output).not.toContain('never')
     expect(Date.now() - started).toBeLessThan(3_000)
   }, 20_000)
 
@@ -235,6 +238,7 @@ describe('bash tool', () => {
       const started = Date.now()
       const result = await kernel.ctx.tools.execute({ id: 'fixed', name: 'Bash', args: { command: 'sleep 5; echo never' } })
       expect(result.output).toContain('[terminated by timeout; killed]')
+      expect(result.output).not.toContain('never')
       expect(Date.now() - started).toBeLessThan(3_000)
     } finally {
       await kernel.stop()
@@ -245,8 +249,9 @@ describe('bash tool', () => {
     const tool = bashTool({ timeoutMs: 2_000 })
     const description = (tool.parameters.properties['timeoutMs'] as { description: string }).description
     expect(description).toContain('default 2000, max 600000')
-    expect(tool.schema?.() ?? { description: tool.description, parameters: tool.parameters }).toEqual({ description: tool.description, parameters: tool.parameters })
+    expect(tool.schema).toBeUndefined()
     const output = await bashTool({ timeoutMs: 100 }).execute({ command: 'sleep 5; echo never' }, exec)
     expect(output).toContain('[terminated by timeout; killed]')
+    expect(output).not.toContain('never')
   }, 10_000)
 })

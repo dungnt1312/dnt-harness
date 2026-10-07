@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { Context } from '../../kernel/index.ts'
 import type { ExecutionId, SessionId, TurnId } from '../../util/brand.ts'
 import { agentScope } from '../agent/scope.ts'
+import { timerBudget } from '../processes/shutdown.ts'
 import type { ToolCall } from '../llm/types.ts'
 import { canonicalCall } from '../tools/names.ts'
 import { resolvePermission, type ApprovalMode } from './resolution.ts'
@@ -85,7 +86,7 @@ export interface ApprovalOptions {
   /**
    * Live expiry source, read once when each approval is created; a pending
    * approval keeps its deadline when the value changes. Falls back to
-   * `expiryMs`.
+   * `expiryMs` when absent or not a valid timer duration.
    */
   readonly expiryMsOf?: () => number
   /**
@@ -367,7 +368,8 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
     const record = recorder(callScope)
     // Unguessable capability id: the answer route is transport-global.
     const approvalId = `approval-${randomUUID()}`
-    const expiresIn = options.expiryMsOf?.() ?? expiryMs
+    // An invalid live value (non-finite, non-positive, past the timer cap) keeps the static expiry.
+    const expiresIn = timerBudget(options.expiryMsOf?.(), expiryMs)
     if (record !== undefined) {
       record.session.append({
         ...(options.requestDetails?.(call, callScope) ?? {}),
