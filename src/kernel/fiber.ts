@@ -40,12 +40,70 @@ function normalizeDisposer(result: Effect): () => void | Promise<void> {
   if (result !== null && typeof result === 'object' && Symbol.iterator in result) {
     const disposers = [...(result as Iterable<() => unknown>)]
     return async () => {
+      // Every disposer runs even when an earlier one throws: failures are
+      // collected and rethrown as one AggregateError after the loop unwinds.
+      const errors: unknown[] = []
       for (const disposer of disposers.reverse()) {
-        await disposer()
+        try {
+          await disposer()
+        } catch (error) {
+          errors.push(error)
+        }
       }
+      if (errors.length > 0) throw new AggregateError(errors, 'effect cleanup failed')
     }
   }
   throw new TypeError(`invalid effect result: expected disposer, promise, or iterable; got ${typeof result}`)
+}
+
+/**
+ * One registered effect: a once-only teardown starter. Whatever starts the
+ * teardown — the returned early disposer or the whole-fiber unload — awaits
+ * the same cached promise, so cleanup runs exactly once however many callers
+ * race it.
+ */
+interface EffectRecord {
+  /**
+   * Starts the cleanup exactly once and returns its shared promise, which
+   * rejects with whatever cleanup threw.
+   */
+  start: () => Promise<void>
+}
+
+/** Create the once-only teardown starter for one registered effect. */
+function createEffectRecord(disposer: () => void | Promise<void>): EffectRecord {
+  let run: Promise<void> | undefined
+  return {
+    start: () => {
+      if (run === undefined) {
+        run = (async () => {
+          await disposer()
+        })()
+        // A dropped early-disposer promise must not surface as an unhandled
+        // rejection. Attaching this handler only silences the default
+        // report: every caller who awaits `start()` — the early disposer and
+        // the whole-fiber teardown — still observes the rejection and
+        // decides what to do with it.
+        run.catch(() => {})
+      }
+      return run
+    },
+  }
+}
+
+/** Flatten nested aggregates so the fiber's error carries each cause once. */
+function flattenErrors(errors: readonly unknown[]): unknown[] {
+  const flat: unknown[] = []
+  for (const error of errors) {
+    if (error instanceof AggregateError) flat.push(...flattenErrors(error.errors))
+    else flat.push(error)
+  }
+  return flat
+}
+
+/** Short description used to summarize cleanup failures in one message. */
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 let nextUid = 1
@@ -64,8 +122,12 @@ export class Fiber {
   /** Current lifecycle state; `pending` while required services are absent. */
   state: FiberState = 'pending'
 
-  private disposers: Array<() => void | Promise<void>> = []
+  private disposers: Array<EffectRecord> = []
   private effectMetas: EffectMeta[] = []
+  /** Whole-fiber teardown completion; cached so every caller shares it. */
+  private teardown: Promise<void> | undefined
+  /** Started-but-running early disposals; whole-fiber teardown awaits them. */
+  private readonly runningDisposals: Set<Promise<void>> = new Set()
 
   /**
    * @param name — display name used in diagnostics, inherited from the plugin.
@@ -98,18 +160,35 @@ export class Fiber {
         assertNever(this.state)
     }
 
-    const disposer = normalizeDisposer(execute())
-    this.disposers.push(disposer)
+    const record = createEffectRecord(normalizeDisposer(execute()))
+    this.disposers.push(record)
     this.effectMetas.push({ label, children: [] })
 
-    let settled = false
-    return async () => {
-      if (settled) return
-      settled = true
-      const index = this.disposers.indexOf(disposer)
-      if (index >= 0) this.disposers.splice(index, 1)
-      await disposer()
+    const index = () => this.disposers.indexOf(record)
+    return () => this.runEarlyDisposal(record, index)
+  }
+
+  /**
+   * Run one effect's cleanup outside the fiber list, once, and track the run
+   * so a racing {@link dispose} awaits it instead of skipping it. The returned
+   * promise rejects when this cleanup throws — for `ctx.on`/`ctx.provide`
+   * fire-and-forget callers that rejection is a drop-on-the-floor detail, not
+   * the teardown verdict.
+   */
+  private runEarlyDisposal(record: EffectRecord, locate: () => number): Promise<void> {
+    const index = locate()
+    // Only a disposer still in the list can start here: once unload claimed
+    // it, it is either running already (awaited below) or finished, and the
+    // shared `start()` promise keeps the second call a no-op either way.
+    if (index >= 0) {
+      this.disposers.splice(index, 1)
+      const run = record.start()
+      this.runningDisposals.add(run)
+      void run.finally(() => {
+        this.runningDisposals.delete(run)
+      })
     }
+    return record.start()
   }
 
   /** Copy of the currently registered effect labels, for diagnostics. */
@@ -118,18 +197,57 @@ export class Fiber {
   }
 
   /**
-   * Unload this fiber: run every collected disposer in reverse registration
-   * order, awaiting each one, then settle as `disposed`. Safe to call twice;
-   * the second call awaits the same teardown and returns.
+   * Unload this fiber: run every remaining disposer in reverse registration
+   * order, awaiting each one, together with any early disposal still running,
+   * then settle. All callers share one teardown: concurrent calls await the
+   * same completion, and callers arriving after it observe its cached outcome.
+   *
+   * Successful teardown ends the fiber `disposed`; a cleanup failure ends it
+   * `failed` and every caller — current or late — sees an `AggregateError`
+   * carrying each cleanup error. `getEffects()` is empty afterwards either
+   * way: every disposer was attempted.
    */
   async dispose(): Promise<void> {
-    if (this.state === 'unloading' || this.state === 'disposed') return
+    this.teardown ??= this.runTeardown()
+    await this.teardown
+  }
+
+  /**
+   * Whole-fiber teardown body, started at most once per fiber. Unwinds the
+   * remaining effects newest-first, awaits early disposals that are still
+   * running, collects every cleanup error, and settles: `disposed` when every
+   * cleanup succeeded, `failed` with an `AggregateError` otherwise.
+   */
+  private async runTeardown(): Promise<void> {
     this.state = 'unloading'
+    const errors: unknown[] = []
+    // Not-yet-started effects unwind newest-first. `start()` hands every
+    // caller the same run, and each disposer runs exactly once; a failing
+    // cleanup is collected and the remaining effects still run.
     while (this.disposers.length > 0) {
-      const disposer = this.disposers.pop()
-      if (disposer) await disposer()
+      const record = this.disposers.pop()
+      if (!record) continue
+      try {
+        await record.start()
+      } catch (error) {
+        errors.push(error)
+      }
+    }
+    // An early disposer may have started its cleanup before unload; its
+    // failure counts too, and unload settles only after it finishes.
+    for (const run of [...this.runningDisposals]) {
+      try {
+        await run
+      } catch (error) {
+        errors.push(error)
+      }
     }
     this.effectMetas = []
+    if (errors.length > 0) {
+      this.state = 'failed'
+      const flat = flattenErrors(errors)
+      throw new AggregateError(flat, `fiber '${this.name}' cleanup failed: ${flat.map(describeError).join('; ')}`)
+    }
     this.state = 'disposed'
   }
 }
