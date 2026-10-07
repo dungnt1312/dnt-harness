@@ -42,6 +42,8 @@ const SOURCE_LABEL: Readonly<Record<LimitSource, string>> = {
   explicit: 'Host override (locked)',
 }
 
+const APPLY_CANCEL_LABEL = 'Keep editing'
+
 /** Counts are bare numbers; every other unit is shown beside the value. */
 const UNIT_LABEL: Readonly<Record<LimitField['unit'], string>> = { ms: 'ms', bytes: 'bytes', chars: 'chars', count: '', ratio: 'ratio' }
 
@@ -130,7 +132,7 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
   /** Control to focus once the render that enables it has committed. */
   const [focusTarget, setFocusTarget] = useScopedState<'save' | 'keep' | 'apply' | 'confirm' | null>(null)
   const { busy, run } = useActionRunner((text) => setNotice({ kind: 'bad', text }))
-  const ids = { save: useId(), keep: useId(), apply: useId(), confirm: useId() }
+  const ids = { save: useId(), keep: useId(), apply: useId(), confirm: useId(), intro: useId() }
 
   const load = async (): Promise<void> => {
     setLoading(true)
@@ -149,8 +151,14 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
   useLayoutEffect(() => {
     if (focusTarget === null || busy !== null) return
     const target = document.getElementById(ids[focusTarget])
-    const control = focusTarget === 'confirm' ? target?.querySelector('button') : target
-    control?.focus()
+    // The confirmation lands on its safe choice, never the destructive one.
+    const control = focusTarget === 'confirm'
+      ? [...(target?.querySelectorAll('button') ?? [])].find((node) => node.textContent === APPLY_CANCEL_LABEL)
+      : target
+    // Save may stay disabled after a refresh (no edits left, invalid values):
+    // focus then rests on the panel intro instead of being lost to the body.
+    if (control instanceof HTMLButtonElement && control.disabled) document.getElementById(ids.intro)?.focus()
+    else control?.focus()
     setFocusTarget(null)
   }, [focusTarget, busy])
 
@@ -279,10 +287,10 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
 
   return (
     <PanelBody>
-      <PanelIntro>
+      <div id={ids.intro} tabIndex={-1} className="outline-none"><PanelIntro>
         Limits for every workspace, in their native units. Changes apply from the next operation; a host
         override locks a field. Reset returns a field to its inherited value.
-      </PanelIntro>
+      </PanelIntro></div>
 
       {view.error !== undefined ? (
         <Notice kind="bad" text={`The configuration file is invalid: ${view.error}. Fix the file, then apply it.`} />
@@ -299,6 +307,7 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
               confirmLabel="Apply and discard edits"
               busy={busy !== null}
               onConfirm={() => void applyFile()}
+              cancelLabel={APPLY_CANCEL_LABEL}
               onCancel={() => { setConfirmApply(false); setFocusTarget('apply') }}
             /></div>
           ) : (
