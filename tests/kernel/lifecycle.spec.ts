@@ -10,6 +10,11 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Kernel, type Context, type PluginFailedDetail } from 'dnt-harness'
 
+/** Flush the microtask queue so already-started work cascades deterministically. */
+const flushQueue = async (): Promise<void> => {
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+}
+
 describe('kernel lifecycle stabilization (task 2)', () => {
   it('async_apply_failure_unwinds_effects', async () => {
     const kernel = new Kernel()
@@ -339,7 +344,10 @@ describe('kernel lifecycle stabilization (task 2)', () => {
       },
     })
 
-    await kernel.stop()
+    // Task4 contract: stop attempts every cleanup, reports the teardown
+    // failure once, and REJECTS with the same failure as the whole-kernel
+    // verdict (Minor#4).
+    await expect(kernel.stop()).rejects.toThrow(AggregateError)
 
     expect(failures).toHaveLength(1)
     expect(failures[0]?.name).toBe('messy')
@@ -548,5 +556,275 @@ describe('kernel lifecycle stabilization (task 3 fix round 1)', () => {
     expect(failures).toHaveLength(0)
 
     await kernel.stop()
+  })
+})
+
+/**
+ * Kernel lifecycle stabilization — task 4: shutdown fencing and whole-kernel
+ * acceptance. `Kernel.stop()` is the whole-kernel verdict: it completes once
+ * (cached, including its rejection), fences mounts/restarts synchronously,
+ * attempts EVERY cleanup and rejects with an AggregateError listing the
+ * unresolved teardown failures — while never replaying an already-cleaned
+ * startup failure, and never waiting for dependencies a held startup may
+ * still be parked on (arbitrary in-flight JavaScript is not cancellable).
+ *
+ * These tests hold gates: `settle()` would drain a parked transition and
+ * hang, so they drive already-started work with `flush()` microtask cascades
+ * and await `stop()` itself (or poll registry state with `vi.waitFor`).
+ */
+describe('kernel lifecycle stabilization (task 4)', () => {
+  const flush = flushQueue
+
+  it('stop_racing_restart_never_remounts', async () => {
+    const kernel = new Kernel()
+    const failures: PluginFailedDetail[] = []
+    kernel.events.on('kernel/plugin-failed', (detail) => {
+      failures.push(detail)
+    })
+    let runs = 0
+    let cleanups = 0
+    let release: () => void = () => {}
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve
+    })
+
+    const providerDef = {
+      name: 'provider',
+      apply: (ctx: Context) => {
+        ctx.provide('svc', 1)
+      },
+    }
+
+    kernel.ctx.plugin({
+      name: 'consumer',
+      inject: ['svc'],
+      apply: (ctx: Context) => {
+        runs++
+        ctx.provide('derived', { n: runs })
+        ctx.effect(() => async () => {
+          cleanups++
+          await barrier
+        })
+      },
+    })
+    const provider = kernel.ctx.plugin(providerDef)
+    await flush()
+    expect(runs).toBe(1)
+
+    // The dependency loss starts the coordinated teardown, whose cleanup is
+    // held; the replacement generation pends. Stop lands DURING that held
+    // teardown — the restart must never remount anything after it.
+    void provider.dispose()
+    await vi.waitFor(() => expect(cleanups).toBe(1))
+    const stopping = kernel.stop()
+    await flush()
+    expect(kernel.inspect().find((d) => d.name === 'consumer')?.fiber.state).not.toBe('loading')
+
+    release()
+    await stopping
+    await flush()
+
+    // Exactly one run and one cleanup: no apply after stop, no replacement
+    // generation, and the derived service stays unpublished. (The registry
+    // itself is empty after stop — stop tears the entries down with it.)
+    expect(runs).toBe(1)
+    expect(cleanups).toBe(1)
+    expect(kernel.services.has('derived')).toBe(false)
+    expect(failures).toHaveLength(0)
+
+    // A provider mounted after stop is fenced loud — the silent-pending hole
+    // is closed (Minor#7) — and never wakes the entry either.
+    expect(() => kernel.ctx.plugin(providerDef)).toThrow()
+    expect(runs).toBe(1)
+  })
+
+  it('concurrent_stop_waits_for_same_teardown', async () => {
+    const kernel = new Kernel()
+    let cleanups = 0
+    let release: () => void = () => {}
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve
+    })
+
+    kernel.ctx.plugin({
+      name: 'held',
+      apply: (ctx: Context) => {
+        ctx.effect(() => async () => {
+          cleanups++
+          await barrier
+        })
+      },
+    })
+
+    const first = kernel.stop()
+    await vi.waitFor(() => expect(cleanups).toBe(1))
+    const second = kernel.stop()
+    let secondSettled = false
+    void second.then(
+      () => {
+        secondSettled = true
+      },
+      () => {
+        secondSettled = true
+      },
+    )
+    await flush()
+
+    // The concurrent stop joins the SAME in-flight teardown: it cannot settle
+    // while the barrier holds the one cleanup it shares.
+    expect(secondSettled).toBe(false)
+
+    release()
+    await Promise.all([first, second])
+    expect(cleanups).toBe(1)
+  })
+
+  it('mount_after_stop_is_rejected', async () => {
+    const kernel = new Kernel()
+    await kernel.stop()
+
+    // Both public mounts refuse loud after stop — never a silent pending
+    // entry (Minor#7).
+    expect(() =>
+      kernel.plugin({
+        name: 'direct',
+        inject: [],
+        apply: () => {},
+      }),
+    ).toThrow(/stopped/)
+
+    let lateCaptured: Context | undefined
+    expect(() => {
+      kernel.ctx.plugin({
+        name: 'late',
+        apply: (ctx: Context) => {
+          lateCaptured = ctx
+        },
+      })
+    }).toThrow()
+    expect(lateCaptured).toBeUndefined()
+
+    // Nothing entered the registry, and nothing can wake it afterwards.
+    expect(kernel.inspect()).toHaveLength(0)
+    expect(() => kernel.ctx.provide('svc-after-stop', 1)).toThrow()
+    expect(kernel.inspect()).toHaveLength(0)
+  })
+
+  it('stop_attempts_all_cleanup_after_failure', async () => {
+    const kernel = new Kernel()
+    const failures: PluginFailedDetail[] = []
+    kernel.events.on('kernel/plugin-failed', (detail) => {
+      failures.push(detail)
+    })
+    const logs: string[] = []
+    const cleanupBoom = new Error('bad cleanup boom')
+
+    // Mounted FIRST so teardown order unwinds it last: the bad cleanup must
+    // not stop the good one or the root fiber's own effects.
+    kernel.ctx.plugin({
+      name: 'bad',
+      apply: (ctx: Context) => {
+        ctx.effect(() => () => {
+          logs.push('bad cleanup')
+          throw cleanupBoom
+        })
+      },
+    })
+    kernel.ctx.plugin({
+      name: 'good',
+      apply: (ctx: Context) => {
+        ctx.provide('good-svc', 1)
+        ctx.effect(() => () => {
+          logs.push('good cleanup')
+        })
+      },
+    })
+    let rootRan = 0
+    kernel.ctx.effect(
+      () => () => {
+        rootRan++
+        logs.push('root cleanup')
+      },
+      'root-witness',
+    )
+
+    const outcome = kernel.stop().then(
+      () => 'resolved',
+      (error: unknown) => error,
+    )
+    const error = await outcome
+    expect(error).toBeInstanceOf(AggregateError)
+    const flat = (error as AggregateError).errors
+    expect(flat).toHaveLength(1)
+    expect(flat[0]).toBe(cleanupBoom)
+
+    // Every cleanup was attempted: the bad one ran (and threw), the good one
+    // and the root fiber's own effect still ran, and the store is empty.
+    // (Order: entries in mount order, then the root's own effects last.)
+    expect(logs).toEqual(['bad cleanup', 'good cleanup', 'root cleanup'])
+    expect(kernel.services.has('good-svc')).toBe(false)
+
+    // The failure is published once as a teardown failure, carrying the
+    // cleanup error (the fiber aggregates its own effect failures, so the
+    // payload wraps the original in the fiber's AggregateError)...
+    expect(failures).toHaveLength(1)
+    expect(failures[0]?.name).toBe('bad')
+    expect(failures[0]?.phase).toBe('teardown')
+    expect(failures[0]?.error).toBeInstanceOf(AggregateError)
+    expect((failures[0]?.error as AggregateError).errors).toEqual([cleanupBoom])
+
+    // ...and the SAME verdict is cached: the second stop awaits the same
+    // outcome, re-observing the identical AggregateError without re-running
+    // any cleanup.
+    logs.length = 0
+    await expect(kernel.stop()).rejects.toBe(error)
+    expect(logs).toEqual([])
+    expect(failures).toHaveLength(1)
+  })
+
+  it('loading_plugin_cannot_publish_after_stop', async () => {
+    const kernel = new Kernel()
+    const failures: PluginFailedDetail[] = []
+    kernel.events.on('kernel/plugin-failed', (detail) => {
+      failures.push(detail)
+    })
+    let lateCtx: Context | undefined
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+
+    // The apply parks on a gate AFTER capturing its context: stop begins and
+    // finishes while the body is still in flight.
+    kernel.plugin({
+      name: 'late-loader',
+      inject: [],
+      apply: async (ctx: Context) => {
+        lateCtx = ctx
+        await gate
+      },
+    })
+    await flush()
+    expect(lateCtx).toBeDefined()
+    expect(kernel.inspect().find((d) => d.name === 'late-loader')?.fiber.state).toBe('loading')
+
+    await kernel.stop()
+    expect(kernel.services.has('late-svc')).toBe(false)
+    // The entry was torn down with the kernel: its registry slot is gone, so
+    // the late completion has nothing left to activate.
+    expect(kernel.inspect()).toHaveLength(0)
+
+    // The late apply completion is fenced (not cancellable, so not awaited):
+    // its publication is undone (the store stays empty) and nothing can
+    // resurrect the entry.
+    release()
+    await flush()
+    expect(kernel.services.has('late-svc')).toBe(false)
+    expect(kernel.inspect()).toHaveLength(0)
+    expect(failures).toHaveLength(0)
+
+    // A publication attempted after the unload is refused loud instead.
+    expect(() => (lateCtx as Context).provide('late-svc-2', 2)).toThrow(/cannot register/)
+    expect(kernel.services.has('late-svc-2')).toBe(false)
   })
 })

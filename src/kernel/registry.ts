@@ -197,6 +197,13 @@ function ownerAlive(owner: Fiber): boolean {
  * ANY generation's returned Fiber handle closes the whole logical entry;
  * kernel-initiated generation cleanup uses a distinct internal path that
  * leaves admission open.
+ *
+ * Shutdown is fenced and total: `stop()` synchronously closes admission for
+ * mounts and restarts, drains every kernel-owned transition and teardown,
+ * attempts EVERY cleanup, and reports the whole-kernel verdict — resolving
+ * when every cleanup succeeded, rejecting with one `AggregateError` listing
+ * the unresolved teardown failures otherwise. The verdict is computed once
+ * and cached for every caller.
  */
 export class Kernel {
   /** The shared event bus. */
@@ -224,6 +231,13 @@ export class Kernel {
    */
   private generation = 0
   private stopped = false
+  /**
+   * The whole-kernel shutdown verdict, started once. Every `stop()` caller —
+   * concurrent or late — awaits this same promise, including its rejection:
+   * the aggregate of unresolved teardown failures is the cached outcome, not
+   * something a second stop rediscovers by re-running cleanups.
+   */
+  private stopping: Promise<void> | undefined
 
   constructor() {
     this.ctx = createContext(this, this.rootFiber)
@@ -306,51 +320,115 @@ export class Kernel {
   }
 
   /**
-   * Tear the kernel down: stop observing the store, dispose every mounted
-   * plugin, then dispose the root fiber. Safe to call once per kernel.
+   * Tear the kernel down: fence every mount/restart, dispose every mounted
+   * plugin, then dispose the root fiber.
    *
-   * A startup failure that already settled has been cleaned and reported
-   * exactly once; stop does not dispose its fiber again, so the original
-   * error is never replayed. A cleanup failure during stop is published as a
-   * `teardown` failure instead of rejecting the stop itself (minimal support:
-   * the full shutdown rewrite is a later task).
+   * **One verdict, cached.** The first call starts the shutdown; every later
+   * call — concurrent or after completion — awaits the SAME promise, including
+   * its rejection. A stop that found unresolved teardown failures rejects with
+   * an `AggregateError` and keeps rejecting with that same aggregate; a
+   * successful stop keeps resolving. No cleanup ever re-runs for a later
+   * caller.
+   *
+   * **Every cleanup is attempted.** One entry's failing disposer never skips
+   * another entry's cleanup nor the root fiber's unwind; each failure is
+   * collected, the entry's own teardown failure is published once, and stop
+   * rejects with one `AggregateError` listing every unresolved teardown
+   * failure.
+   *
+   * **Already-settled failures are not replayed.** A startup failure that
+   * already cleaned up (and a teardown failure an explicit disposal already
+   * reported) are history: stop reports only what IT observed failing, so the
+   * original error is never published or thrown a second time.
+   *
+   * **Owned work is drained; foreign work is not waited for.** Stop awaits the
+   * cleanups and the kernel-owned tracked transitions (including their
+   * `trackUndo` undo paths) it starts. It does NOT wait for a `loading` body
+   * still parked on its own I/O or gates: arbitrary in-flight JavaScript
+   * cannot be cancelled, so stop fences its late completion instead (the
+   * entry can never activate and its post-stop registrations are refused).
+   * A host that must bound that wait wraps stop in its own deadline (see
+   * `boundedCleanup`).
    */
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    this.stopping ??= this.stopAll()
+    return this.stopping
+  }
+
+  /** The one shutdown body behind the cached {@link stop} verdict. */
+  private async stopAll(): Promise<void> {
+    // The synchronous fence: from this line on, mounts and restarts are
+    // refused, entries stop admitting work, and the store observer is
+    // detached so a removal during teardown cannot schedule a replacement.
     this.stopped = true
     this.generation++
     this.observeServices()
-    for (const entry of [...this.entries]) {
-      if (entry.retired) continue
-      try {
-        // Every generation this logical entry created unwinds here — current
-        // first, then already-retired ones re-observing their cached
-        // teardowns — so no effect or service outlives the stop.
-        // Kernel-internal path: plain generation teardown, not the handle
-        // override that closes a logical entry.
-        for (const fiber of [...entry.generations].reverse()) {
-          await this.disposeGeneration(fiber)
+    // Unresolved teardown failures, flattened to their leaves and deduped by
+    // identity: the root fiber's `ctx.plugin` disposer re-observes each child
+    // entry's cached teardown (the SAME rejection object), so the root unwind
+    // must not list a failure the entry pass already collected.
+    const teardownErrors: unknown[] = []
+    const seen = new Set<unknown>()
+    const collect = (error: unknown): void => {
+      for (const leaf of flattenErrors(error)) {
+        if (!seen.has(leaf)) {
+          seen.add(leaf)
+          teardownErrors.push(leaf)
         }
-      } catch (error) {
-        // Same ownership rule as the coordinated teardown: whoever reports
-        // this entry's teardown failure retires it first, so a restart or an
-        // explicit disposal already in flight over the same cached teardown
-        // publishes it exactly once.
-        if (!entry.retired) {
-          entry.retired = true
-          this.publishFailure(entry, 'teardown', error)
+      }
+    }
+    for (const entry of [...this.entries]) {
+      // A retired entry is fully settled history — a failed startup whose
+      // cleanup already ran (K1: the diagnostic stays, stop never replays it),
+      // or an earlier teardown failure stop itself must not re-report. Skip it.
+      if (entry.retired) continue
+      // Snapshot the generations FIRST, then dispose through the kernel's
+      // internal path — plain once-only fiber teardowns, never the public
+      // handle override that closes a logical entry. Every generation this
+      // entry created unwinds — the current one first, already-retired ones
+      // re-observing their cached teardowns. Admission closes and the entry
+      // retires up front: stop owns the reporting, exactly once — a nested
+      // child disposal coordinate that runs inside this loop's own pass, or a
+      // racing stop, can no longer double-report this entry.
+      const generations = [...entry.generations].reverse()
+      entry.closed = true
+      entry.retired = true
+      for (const fiber of generations) {
+        try {
+          await this.disposeGeneration(fiber)
+        } catch (error) {
+          collect(error)
+          this.publishFailure(entry, 'teardown', fiber, error)
         }
       }
     }
     this.entries.clear()
-    // A failing child cleanup also fails its parent's disposal (the parent's
-    // own `ctx.plugin` disposer re-observes the child's cached outcome). The
-    // child's failure was already published; the parent aggregate is the same
-    // errors propagating outward — contain it instead of rejecting stop.
-    await this.rootFiber.dispose().catch(() => {})
+    // Root last: the parent dispose re-observes each child's cached teardown
+    // through its own `ctx.plugin` disposer (already settled above, so real
+    // duplicates are filtered) and unwinds the root fiber's own effects. A
+    // genuine root failure — an effect registered directly on the root
+    // context — joins the same aggregate.
+    try {
+      await this.rootFiber.dispose()
+    } catch (error) {
+      collect(error)
+    }
+    if (teardownErrors.length > 0) {
+      // The aggregate IS the verdict: it lists every unresolved teardown
+      // failure this stop observed, and stays the cached rejection forever.
+      throw new AggregateError(
+        teardownErrors,
+        `kernel stop: ${teardownErrors.length} unresolved teardown failure(s) during shutdown`,
+      )
+    }
   }
 
   /** Create and register an entry, then try to start it. */
   private mount(definition: ResolvedPlugin, owner: Fiber | null, direct: boolean): Fiber {
+    // Loud fence: after (or during) a stop nothing mounts — not even to pend
+    // silently. Both public paths (`Kernel.plugin`, `Context.plugin`) reach
+    // the kernel here, so both callers get the same refusal.
+    if (this.stopped) throw new Error('kernel is stopped: plugins cannot be mounted after stop()')
     const fiber = new Fiber(definition.name)
     const entry: PluginEntry = {
       definition,
@@ -577,8 +655,8 @@ export class Kernel {
   }
 
   private activated(entry: PluginEntry, fiber: Fiber): void {
-    // A late completion after unload or a dependency-driven restart is
-    // history: never reactivate a stale entry.
+    // A late completion after a stop is history: never reactivate a stale
+    // entry (the stop-generation fence), and never wake pending plugins then.
     if (entry.generation !== this.generation) return
     // Explicit disposal through a stale generation handle while this body was
     // in flight must not reactivate the closed entry.
@@ -594,6 +672,9 @@ export class Kernel {
 
   /** Re-try every `pending` entry — a new provider may satisfy it now. */
   private flushPending(): void {
+    // After a stop nothing wakes: the registry is already emptied, so this
+    // would be a no-op — the explicit guard keeps the invariant readable.
+    if (this.stopped) return
     for (const entry of this.pendingEntries()) {
       this.start(entry, false)
     }
@@ -687,6 +768,8 @@ export class Kernel {
       // (parent-preserving remount). Retired generations STAY in the set —
       // a stale handle must still resolve to this entry — and a disposed
       // fiber is never mutated back into circulation.
+      // A stop fences the restart: nothing remounts once shutdown began
+      // (synchronously — the fence is checked before any await above).
       if (this.stopped) return
       if (!shouldAttach()) return
       const fiber = new Fiber(entry.definition.name)
@@ -727,7 +810,10 @@ export class Kernel {
 
   /**
    * Track an externally started teardown — the undo of a `ctx.plugin` mount
-   * whose ownership registration just failed — so {@link settle} awaits it.
+   * whose ownership registration just failed — so {@link settle} and
+   * {@link stop} drain it: stop awaits this undo path it owns even though the
+   * undo runs while shutdown is already fenced (the entry was mounted before
+   * the stop, and its cleanup still must run).
    * Cleanup failures are reported once as `teardown` failures and retire the
    * entry, so stop does not dispose the fiber again or report it twice.
    */

@@ -556,7 +556,14 @@ describe('services and inject (tutorial ch.3)', () => {
     expect(failures).toHaveLength(1)
     expect(kernel.inspect().filter((d) => d.name === 'consumer')).toHaveLength(1)
 
-    await kernel.stop()
+    // Task4 contract: the unresolved teardown failure is the whole-kernel
+    // verdict — stop rejects with the SAME failure (published once here), and
+    // a second stop re-observes the cached aggregate without re-running
+    // anything.
+    await expect(kernel.stop()).rejects.toBeInstanceOf(AggregateError)
+    await expect(kernel.stop()).rejects.toThrow(/1 unresolved teardown failure/)
+    expect(applies).toBe(1)
+    expect(failures).toHaveLength(1)
   })
 
   it('disposed_pending_child_never_wakes', async () => {

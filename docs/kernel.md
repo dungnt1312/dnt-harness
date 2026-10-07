@@ -225,8 +225,36 @@ root-owned.
 
 ### Teardown
 
-`kernel.stop()` detaches the store observer, disposes every mounted plugin, then
-disposes the root fiber. Safe to call once per kernel.
+`kernel.stop()` is the whole-kernel shutdown verdict:
+
+- **Fenced synchronously.** From the moment `stop()` is called, nothing mounts
+  (both `kernel.plugin()` and `ctx.plugin()` throw), restarts and wake-ups are
+  suppressed, and the store observer is detached. Mounting after a completed
+  stop refuses loud — never a silent pending plugin.
+- **One cached verdict.** The first call starts the shutdown; every other call —
+  concurrent or issued later — awaits the *same* promise. A stop that found
+  unresolved teardown failures rejects with one `AggregateError` listing each
+  failure, and keeps rejecting with that same aggregate; a clean stop keeps
+  resolving. No cleanup ever re-runs for a later caller.
+- **Every cleanup is attempted.** One entry's failing disposer never skips
+  another entry's cleanup or the root fiber's unwind; each failure is collected,
+  published once as a `teardown` failure, and listed in the aggregate.
+- **Already-settled failures are not replayed.** A startup failure whose cleanup
+  already ran (fiber `disposed`, diagnostic retained in `inspect()`) is history:
+  stop skips it and still resolves.
+- **Owned work is drained; foreign work is not awaited.** Stop waits for the
+  cleanups and kernel-owned transitions it starts — including `trackUndo` undo
+  paths. It does *not* wait for a `loading` body still parked on its own I/O:
+  arbitrary in-flight JavaScript cannot be cancelled from outside, so stop
+  fences the late completion instead (the entry can never activate, and any
+  publication the body attempts after its unload throws). A host that must bound
+  that wait wraps `stop()` in its own deadline — the web server and headless bin
+  use `boundedCleanup`, which intentionally gives up (and reports ownership as
+  retained) rather than force-releasing.
+
+`settle()` remains a drain API, not an activation-success guarantee: it resolves
+when every kernel-owned transition has settled; callers inspect `inspect()` for
+failed entries and `pending` fibers.
 
 ## Loader (`loader.ts`)
 
