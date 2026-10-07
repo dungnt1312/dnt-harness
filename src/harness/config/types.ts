@@ -1,5 +1,5 @@
 import type { HarnessLimits } from '../limits.ts'
-import type { LimitKey } from '../limits-config.ts'
+import type { LimitField, LimitKey } from '../limits-config.ts'
 
 /** Durable, versioned global configuration document (currently limits-only). */
 export interface AppConfigDocument {
@@ -27,4 +27,33 @@ export class AppConfigError extends Error {
     this.code = code
     if (key !== undefined) this.key = key
   }
+}
+
+/**
+ * Immutable effective limits captured at an operation boundary. `revision` is
+ * process-local and monotonic: it starts at 0 after boot and advances only
+ * when effective values change — never a durable hash.
+ */
+export interface LimitsSnapshot { readonly revision: number; readonly values: Readonly<HarnessLimits> }
+
+/** Stable reader seam (`ctx.get('limits-reader')`); identity never changes across publications. */
+export interface LimitsReader { read(): LimitsSnapshot }
+
+/** Layer that supplied a field's active value, lowest to highest precedence. */
+export type LimitSource = 'library' | 'host' | 'file' | 'explicit'
+
+/**
+ * Editor descriptor. `document`/`hash` are the observed disk state (both null
+ * with `error` when the file is invalid); `active` is the published snapshot,
+ * which a describe never changes. `inherited` holds library+host values — what
+ * a field falls back to when its file override is unset. Per-field `source`
+ * and `locked` describe the active layers; `fileValue` is the observed disk
+ * override, `shadowed` when an explicit lock hides it. `outOfSync` means the
+ * disk differs from the file layer currently active.
+ */
+export interface AppConfigView {
+  readonly document: AppConfigDocument | null; readonly hash: string | null
+  readonly active: LimitsSnapshot; readonly inherited: Readonly<HarnessLimits>
+  readonly fields: readonly (LimitField & { readonly source: LimitSource; readonly locked: boolean; readonly fileValue?: number; readonly shadowed: boolean })[]
+  readonly outOfSync: boolean; readonly error?: string
 }

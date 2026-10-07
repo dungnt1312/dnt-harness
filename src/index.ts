@@ -39,6 +39,18 @@ export { AttemptAdmission, LogicalRequest, classifyTransport, runAttempt, type A
 // ── Harness: limits ──────────────────────────────────────────────────────
 export { DEFAULT_LIMITS, resolveLimits, isValidLimit, type HarnessLimits } from './harness/limits.ts'
 export { parseLimitOverrides, LIMIT_FIELDS, WEB_LIMIT_DEFAULTS, type LimitKey, type LimitField } from './harness/limits-config.ts'
+export { AppConfigStore, type ConfigRead, type ConfigStoreIo } from './harness/config/store.ts'
+export { AppConfigService, type AppConfigServiceOptions } from './harness/config/service.ts'
+export { readLimits } from './harness/config/limits-reader.ts'
+export {
+  AppConfigError,
+  type AppConfigDocument,
+  type AppConfigView,
+  type LimitEdit,
+  type LimitSource,
+  type LimitsReader,
+  type LimitsSnapshot,
+} from './harness/config/types.ts'
 
 // ── Harness: session log ─────────────────────────────────────────────────
 export {
