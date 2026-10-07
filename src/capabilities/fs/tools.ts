@@ -14,7 +14,8 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import type { PathIntent, ToolDefinition, ToolExecution } from '../../harness/tools/types.ts'
-import { displayPath, resolveInGrants, within } from './grants.ts'
+import { displayPath, resolveInGrants } from './grants.ts'
+import { expandGlob, searchFiles, searchOutput } from './search.ts'
 import { canonical, observe, replaceFile, requirementFor, withFileLock } from './observation.ts'
 import { findEditMatch, foldEol, formatLines, type MatchStrategy } from './edit-match.ts'
 import { GrepTimeoutError, runGrep } from './grep-worker.ts'
@@ -32,11 +33,11 @@ import {
 } from './text-document.ts'
 
 export { resolveGrantedPath, resolveWithin } from './grants.ts'
+export { DEFAULT_IGNORED_DIRS } from './search.ts'
 
 const OUTPUT_CAP = 60_000
 const GLOB_CAP = 100
 const GREP_CAP = 250
-const WALK_BUDGET = 20_000
 /** Grep does not search files larger than this. */
 const GREP_MAX_FILE_BYTES = 16 * 1024 * 1024
 /** Wall-clock budget for one Grep (the worker is terminated past it). */
@@ -48,33 +49,6 @@ const GREP_TIMEOUT_MS = 20_000
  */
 const MAX_FILE_BYTES = 32 * 1024 * 1024
 
-/**
- * Generated/dependency folders the search walk skips by default: VCS
- * internals, package directories, build outputs, and tool caches. They are
- * huge, machine-generated, and almost never the target of a search — yet they
- * would flood results and exhaust the walk budget first. A pattern that names
- * one as an explicit segment, `includeIgnored: true`, or a search `path`
- * pointing inside one, all search them anyway.
- */
-export const DEFAULT_IGNORED_DIRS: readonly string[] = [
-  // version-control internals
-  '.git', '.svn', '.hg',
-  // package managers and vendored dependencies
-  'node_modules', 'bower_components', 'vendor', 'Pods',
-  // build outputs
-  'dist', 'build', 'out', 'target', 'obj',
-  // framework and bundler caches
-  '.next', '.nuxt', '.output', '.svelte-kit', '.vite', '.turbo', '.parcel-cache', '.cache', '.docusaurus',
-  // test coverage
-  'coverage', '.nyc_output',
-  // python environments and tooling
-  '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.venv', 'venv', '.tox', '.nox', '.eggs',
-  // jvm, terraform, editor state
-  '.gradle', '.terraform', '.idea', '.vscode',
-]
-const DEFAULT_IGNORED_SET: ReadonlySet<string> = new Set(DEFAULT_IGNORED_DIRS)
-const NO_IGNORED: ReadonlySet<string> = new Set()
-
 /** The model-visible output cap for this execution (limits-overridable). */
 function limitOf(exec: ToolExecution): number {
   return exec.outputLimit ?? OUTPUT_CAP
@@ -82,85 +56,6 @@ function limitOf(exec: ToolExecution): number {
 
 function granted(exec: ToolExecution, target: string, intent: PathIntent): Promise<string> {
   return resolveInGrants(exec, target, intent)
-}
-
-/** Truncate a tool output to its cap, keeping the head and a marker. */
-function cap(output: string, limit: number): string {
-  if (output.length <= limit) return output
-  return `${output.slice(0, limit)}\n… [truncated ${output.length - limit} chars]`
-}
-
-/**
- * Walk `dir` recursively, yielding file paths (depth-first, sorted).
- * Symlinks are never followed; the run's abort signal is honored between
- * directories; the node budget keeps a huge tree from being materialized
- * just to truncate it afterwards; directories named in `ignored` are pruned
- * during the walk so their subtrees never consume the budget.
- */
-async function walk(
-  dir: string,
-  exec: ToolExecution,
-  signal: AbortSignal | undefined,
-  budget = { left: WALK_BUDGET },
-  ignored: ReadonlySet<string> = DEFAULT_IGNORED_SET,
-): Promise<string[]> {
-  // Indirect through a function: the signal can abort during any await, and
-  // control-flow narrowing must not hide that from later checks.
-  const stopped = (): boolean => signal?.aborted === true
-  const found: string[] = []
-  if (stopped()) throw new Error('cancelled: stop requested during search')
-  if (budget.left <= 0) return found
-  // Recheck each directory and candidate against the same grant/deny policy as
-  // Read; never discard the app-home deny for an entire search tree.
-  const memoryRoot = exec.memoryRoots?.find((root) => within(root, dir))
-  try { await granted(exec, memoryRoot !== undefined && dir !== memoryRoot ? path.join(dir, 'MEMORY.md') : dir, 'read') } catch { return found }
-  let entries
-  try {
-    entries = await fs.readdir(dir, { withFileTypes: true })
-  } catch {
-    return found
-  }
-  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-    if (stopped()) throw new Error('cancelled: stop requested during search')
-    if (budget.left <= 0) break
-    budget.left -= 1
-    const full = path.join(dir, entry.name)
-    if (entry.isSymbolicLink()) continue
-    if (entry.isDirectory()) {
-      if (ignored.has(entry.name)) continue
-      found.push(...(await walk(full, exec, signal, budget, ignored)))
-    } else if (entry.isFile()) {
-      try { await granted(exec, full, 'read'); found.push(full) } catch { /* inaccessible search result */ }
-    }
-  }
-  return found
-}
-
-/** Glob segment pattern (`*`, `**`, literals) to a regular expression. */
-function globToRegExp(pattern: string): RegExp {
-  let source = ''
-  let i = 0
-  while (i < pattern.length) {
-    const char: string = pattern[i] ?? ''
-    if (char === '*') {
-      if (pattern[i + 1] === '*') {
-        source += '.*'
-        i += 2
-        if (pattern[i] === '/') i++
-      } else {
-        source += '[^/]*'
-        i++
-      }
-    } else {
-      source += escapeLiteral(char)
-      i++
-    }
-  }
-  return new RegExp(`^${source}$`)
-}
-
-function escapeLiteral(char: string): string {
-  return char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function argString(args: Record<string, unknown>, key: string): string {
@@ -176,17 +71,6 @@ function argBoolean(args: Record<string, unknown>, key: string): boolean | undef
   if (value === undefined) return undefined
   if (typeof value !== 'boolean') throw new Error(`argument '${key}' must be a boolean`)
   return value
-}
-
-/** True when a glob pattern names a default-ignored folder as an explicit path segment (its own slash-delimited segment). */
-function namesIgnoredDir(pattern: string): boolean {
-  return pattern.split('/').some((segment) => segment !== '**' && DEFAULT_IGNORED_SET.has(segment))
-}
-
-/** The ignored-dir set for a search: none when explicitly included or when the glob pattern names one, else the defaults. */
-function searchIgnore(args: Record<string, unknown>, pattern?: string): ReadonlySet<string> {
-  if (argBoolean(args, 'includeIgnored') === true || (pattern !== undefined && namesIgnoredDir(pattern))) return NO_IGNORED
-  return DEFAULT_IGNORED_SET
 }
 
 /** True only when the boolean argument is present and true. */
@@ -464,26 +348,25 @@ export function globTool(): ToolDefinition {
   return {
     name: 'Glob',
     description:
-      'List files matching a glob pattern (`*` within a segment, `**` across segments). Common generated folders (node_modules, .git, dist, build, target, __pycache__, …) are skipped unless the pattern names one explicitly or `includeIgnored` is true. Paths inside the workspace are shown relative to it; paths in other granted folders are absolute.',
+      'List files matching a glob pattern (`*` within a segment, `**` for zero or more segments, `{a,b}` for choices; at most 64 expansions, no nested braces). Project .gitignore rules and common generated folders are skipped by default. Explicit file/directory patterns or a path inside an ignored folder override ignores only for that scope; includeIgnored searches all. Incomplete searches carry an explicit warning, not an exhaustive no matches. Paths inside the workspace are shown relative to it; paths in other granted folders are absolute.',
     requiresRoot: true,
     parameters: {
       type: 'object',
       properties: {
         pattern: { type: 'string', description: 'glob pattern relative to the search directory' },
         path: { type: 'string', description: 'optional directory to search within (default: the workspace root); may be absolute inside a granted folder' },
-        includeIgnored: { type: 'boolean', description: 'set true to also list default-skipped folders (node_modules, .git, dist, …); a pattern naming one explicitly already does this' },
+        includeIgnored: { type: 'boolean', description: 'set true to bypass .gitignore and default generated-folder exclusions; explicit file/directory patterns also override their own scope' },
       },
       required: ['pattern'],
     },
     async execute(args, exec) {
       const base = await searchBase(args, exec)
       const pattern = argString(args, 'pattern')
-      const regex = globToRegExp(pattern)
-      const matches = (await walk(base, exec, exec.signal, undefined, searchIgnore(args, pattern)))
-        .filter((full) => regex.test(path.relative(base, full).split(path.sep).join('/')))
+      const search = await searchFiles(base, exec, { patterns: expandGlob(pattern), includeIgnored: argBoolean(args, 'includeIgnored') === true })
+      const matches = search.files
       const files = matches.slice(0, GLOB_CAP).map((full) => displayPath(exec.root, full))
       if (matches.length > GLOB_CAP) files.push(`… [+${matches.length - GLOB_CAP} more matches]`)
-      return files.length === 0 ? 'no matches' : cap(files.join('\n'), limitOf(exec))
+      return searchOutput(files, search.incomplete, limitOf(exec))
     },
   }
 }
@@ -493,14 +376,14 @@ export function grepTool(): ToolDefinition {
   return {
     name: 'Grep',
     description:
-      'Search files with a regular expression; returns `path:line: text` matches. Common generated folders (node_modules, .git, dist, build, target, __pycache__, …) are skipped; point `path` inside one or set `includeIgnored` to search them. Paths inside the workspace are shown relative to it; paths in other granted folders are absolute.',
+      'Search files with a regular expression; returns `path:line: text` matches. Project .gitignore rules and common generated folders are skipped; point path inside an ignored folder or set includeIgnored to search it. Incomplete searches carry an explicit warning, not an exhaustive no matches. Paths inside the workspace are shown relative to it; paths in other granted folders are absolute.',
     requiresRoot: true,
     parameters: {
       type: 'object',
       properties: {
         pattern: { type: 'string', description: 'regular expression to search for' },
         path: { type: 'string', description: 'optional directory to search within; may be absolute inside a granted folder' },
-        includeIgnored: { type: 'boolean', description: 'set true to also search default-skipped folders (node_modules, .git, dist, …); pointing `path` inside one already does this' },
+        includeIgnored: { type: 'boolean', description: 'set true to bypass .gitignore and default generated-folder exclusions; an explicit path can enter an ignored folder' },
       },
       required: ['pattern'],
     },
@@ -509,7 +392,8 @@ export function grepTool(): ToolDefinition {
       // Validate here so a bad pattern fails as before, not inside the worker.
       void new RegExp(pattern)
       const base = await searchBase(args, exec)
-      const files = await walk(base, exec, exec.signal, undefined, searchIgnore(args))
+      const search = await searchFiles(base, exec, { includeIgnored: argBoolean(args, 'includeIgnored') === true })
+      const files = search.files
       let run
       try {
         run = await runGrep(pattern, files.map((full) => ({ full })), {
@@ -530,7 +414,7 @@ export function grepTool(): ToolDefinition {
       })
       if (run.truncated) lines.push('… [more matches truncated]')
       if (run.skippedLarge > 0) lines.push(`… [${run.skippedLarge} file(s) over ${GREP_MAX_FILE_BYTES / (1024 * 1024)} MiB not searched]`)
-      return lines.length === 0 ? 'no matches' : cap(lines.join('\n'), limitOf(exec))
+      return searchOutput(lines, search.incomplete, limitOf(exec))
     },
   }
 }

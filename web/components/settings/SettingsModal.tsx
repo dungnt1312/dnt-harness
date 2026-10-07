@@ -510,7 +510,7 @@ export function SettingsModal({
                 {tab === 'permissions' ? <PermissionsPanel workspaceId={workspaceId} onChanged={onRefresh} /> : null}
                 {tab === 'prompts' ? <SystemPromptsPanel workspaceId={workspaceId} /> : null}
                 {tab === 'skills' ? <SkillsPanel workspaceId={workspaceId} /> : null}
-                {tab === 'memory' ? <MemoryPanel workspaceId={workspaceId} /> : null}
+                {tab === 'memory' ? <MemoryPanel workspaceId={workspaceId} projects={projects} /> : null}
                 {tab === 'agents' ? <AgentsPanel workspaceId={workspaceId} modelOptions={roleModelOptions} /> : null}
                 {tab === 'mcp' ? <McpPanel workspaceId={workspaceId} /> : null}
                 {tab === 'hooks' ? <HooksPanel workspaceId={workspaceId} /> : null}

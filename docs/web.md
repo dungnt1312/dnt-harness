@@ -667,11 +667,14 @@ boundaries matter more than the feature:
   `[output truncated: too fast]` marker; a terminal idle for 30 minutes is
   reaped. `server.close()` kills every PTY, so none outlives the host.
 - **Opening the view opens a shell.** The panel creates one terminal by itself,
-  once per mount, rather than presenting a picker — landing in a chooser is not
-  landing in a terminal. The auto-open waits until the conversation's project
-  binding is final (`bindingReady`), so a shell never opens in the host's
-  default folder just because the session list was still loading. Closing the
-  last terminal is a decision and is never undone automatically.
+  once per project per page load, rather than presenting a picker — landing in
+  a chooser is not landing in a terminal. The auto-open waits until the
+  conversation's project binding is final (`bindingReady`), so a shell never
+  opens in the host's default folder just because the session list was still
+  loading. The per-project allowance is spent on the first empty mount and is
+  not refunded: switching sessions between folders remounts the panel but
+  never stacks another shell — a new one is always a manual '+' or Ctrl+`.
+  Closing the last terminal is a decision and is never undone automatically.
 - **Default shell** is a browser-local preference (`terminalShell` in
   `dnt-harness.workbench.v1`), set from the Terminal view's shell menu. Unset, it
   defers to the host's own order: the platform's login shell first (zsh on

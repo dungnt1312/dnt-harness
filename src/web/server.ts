@@ -4864,9 +4864,25 @@ async function handleApi(
       const wsId = decodeURIComponent(wsMemoryMatch[1] ?? '') as WorkspaceId
       requireWorkspace(deps, wsId, false)
       const entryId = wsMemoryMatch[2] !== undefined ? decodeURIComponent(wsMemoryMatch[2]) : undefined
-      const scope = { workspaceId: wsId }
+      // `?projectId=` selects the project tier (what the agent writes while a
+      // conversation is bound to a project); absent = the workspace tier. The
+      // id is checked against this workspace, so a foreign project is a 404.
+      const rawMemoryProject = query.get('projectId')
+      let memoryProject: ProjectId | undefined
+      if (rawMemoryProject !== null && rawMemoryProject !== '') {
+        try {
+          deps.workspaces.getProject(rawMemoryProject as ProjectId, wsId)
+        } catch (error) {
+          fail(error)
+          return
+        }
+        memoryProject = rawMemoryProject as ProjectId
+      }
+      const scope = { workspaceId: wsId, ...(memoryProject !== undefined ? { projectId: memoryProject } : {}) }
       if (req.method === 'GET' && entryId === undefined) {
-        const hits = await deps.memory.search(scope, typeof query.get('q') === 'string' ? (query.get('q') ?? '') : '')
+        // The settings list shows every entry of a tier, so the listing is not
+        // held to the model-facing default of 20 hits.
+        const hits = await deps.memory.search(scope, typeof query.get('q') === 'string' ? (query.get('q') ?? '') : '', 500)
         send(200, hits)
         return
       }

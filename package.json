@@ -17,6 +17,8 @@
     "pair": "tsx src/bins/pair.ts",
     "migrate:mcp": "tsx src/bins/migrate-mcp.ts",
     "build:web": "vite build",
+    "restart": "pm2 restart dnt-harness --update-env && sleep 2 && curl -fsS http://127.0.0.1:3082/api/health",
+    "deploy": "npm run build:web && npm run restart",
     "test:browser": "playwright test",
     "test:browser:mcp": "vitest run tests/web/mcp-production-stack.spec.ts",
     "test:live-ui": "node scripts/live-ui-smoke.mjs"
@@ -39,6 +41,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "highlight.js": "^11.12.0",
+    "ignore": "^7.0.12",
     "js-yaml": "^4.3.2",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",

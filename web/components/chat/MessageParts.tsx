@@ -758,6 +758,9 @@ function rowStatus(item: Extract<ViewItem, { kind: 'tool' }>, state: RowState, f
       if (item.outcome === 'audit_fault') return { text: 'Audit fault', tone: 'warn', detail: 'The outcome is known but its evidence was not durably recorded.' }
       return { text: 'Unknown', tone: 'warn', detail: 'The host restarted before this result was recorded.' }
     case 'ok':
+      if (['glob', 'grep'].includes(item.call.name.toLowerCase()) && /(?:^|\n)… \[search incomplete:/.test(output)) {
+        return { text: 'Search incomplete', tone: 'warn', detail: excerptTail(output) }
+      }
       // A command that ran and exited badly: the call succeeded, the work did not.
       return facts.digestFailed === true && facts.digest !== undefined ? { text: capitalize(facts.digest), tone: 'bad', detail: excerptTail(output) } : undefined
   }

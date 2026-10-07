@@ -113,6 +113,43 @@ it('HTTP memory supports encoded nested ids, underscore files and exact pointer 
   }
 })
 
+it('HTTP memory serves the project tier through ?projectId= and keeps it apart from the workspace tier', async () => {
+  const server = await start([])
+  const base = server.url
+  const projectDir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-memory-tier-'))
+  try {
+    const ws = await (await post(base, '/api/workspaces', { name: 'Tiers' })).json() as { id: string }
+    const project = await (await post(base, `/api/workspaces/${ws.id}/projects`, { name: 'P', path: projectDir })).json() as { id: string }
+    const endpoint = `/api/workspaces/${ws.id}/memory`
+    const tier = `?projectId=${encodeURIComponent(project.id)}`
+    const ids = async (suffix: string): Promise<string[]> =>
+      (await (await fetch(`${base}${endpoint}${suffix}`)).json() as { id: string }[]).map((row) => row.id)
+
+    expect((await post(base, `${endpoint}${tier}`, { id: 'project-note', title: 'Project note', body: 'only here' })).status).toBe(201)
+    expect((await post(base, endpoint, { id: 'shared-note', title: 'Shared note', body: 'everywhere' })).status).toBe(201)
+
+    // Each tier lists only its own entries; the files land under their own roots.
+    expect(await ids('')).toEqual(['shared-note'])
+    expect(await ids(tier)).toEqual(['project-note'])
+    const home = serverHomes.get(server)!
+    await expect(fs.stat(path.join(home, 'workspaces', ws.id, 'memory', 'projects', project.id, 'project-note.md'))).resolves.toBeDefined()
+
+    // A project entry is not readable through the workspace tier, and the reverse.
+    expect((await fetch(`${base}${endpoint}/project-note`)).status).toBe(404)
+    expect((await fetch(`${base}${endpoint}/project-note${tier}`)).status).toBe(200)
+    expect((await fetch(`${base}${endpoint}/shared-note${tier}`)).status).toBe(404)
+
+    // A project id from nowhere is rejected, not silently mapped to the workspace tier.
+    expect((await fetch(`${base}${endpoint}?projectId=project-nope`)).status).toBe(404)
+    expect((await post(base, `${endpoint}?projectId=project-nope`, { id: 'x', title: 'X', body: 'X' })).status).toBe(404)
+
+    expect((await fetch(`${base}${endpoint}/project-note${tier}`, { method: 'DELETE' })).status).toBe(200)
+    expect(await ids(tier)).toEqual([])
+  } finally {
+    await fs.rm(projectDir, { recursive: true, force: true })
+  }
+})
+
 it('HTTP memory rejects oversized components with 400 and no partial topic parents', async () => {
   const server = await start([])
   const ws = await (await post(server.url, '/api/workspaces', { name: 'Length validation' })).json() as { id: string }

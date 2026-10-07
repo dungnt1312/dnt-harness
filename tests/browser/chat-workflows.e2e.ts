@@ -169,7 +169,7 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
       if (path === '/api/workspaces/w/skills' && method === 'GET') return json(route, [{ name: 'fixture-skill', title: 'Fixture skill', description: '', source: 'workspace', hash: 'skill-old' }])
       if (path === '/api/workspaces/w/skills/fixture-skill' && method === 'GET') return json(route, { name: 'fixture-skill', title: 'Fixture skill', description: '', source: 'workspace', hash: skillPutCount === 0 ? 'skill-old' : 'skill-fresh', instructions: '---\nname: fixture-skill\n---\n\nserver content' })
       if (path === '/api/workspaces/w/skills/fixture-skill' && method === 'PUT') { skillPutCount += 1; return skillPutCount === 1 ? json(route, { error: 'skill conflict' }, 409) : json(route, { name: 'fixture-skill', hash: 'skill-saved' }) }
-      if (path === '/api/workspaces/w/memory' && method === 'GET') return json(route, [{ id: 'fixture-memory', title: 'Fixture memory', pinned: false, createdAt: 0, updatedAt: 0, body: 'server body', hash: memoryPatchCount === 0 ? 'memory-old' : 'memory-fresh' }])
+      if (path === '/api/workspaces/w/memory' && method === 'GET') return url.searchParams.has('projectId') ? json(route, []) : json(route, [{ id: 'fixture-memory', title: 'Fixture memory', pinned: false, createdAt: 0, updatedAt: 0, body: 'server body', hash: memoryPatchCount === 0 ? 'memory-old' : 'memory-fresh' }])
       if (path === '/api/workspaces/w/memory/fixture-memory' && method === 'GET') return json(route, { id: 'fixture-memory', title: 'Fixture memory', pinned: false, createdAt: 0, updatedAt: 0, body: 'server body', hash: memoryPatchCount === 0 ? 'memory-old' : 'memory-fresh' })
       if (path === '/api/workspaces/w/memory/fixture-memory' && method === 'PATCH') { memoryPatchCount += 1; return memoryPatchCount === 1 ? json(route, { error: 'memory conflict' }, 409) : json(route, { id: 'fixture-memory', title: 'Fixture memory', pinned: false, createdAt: 0, updatedAt: 0, body: 'local body', hash: 'memory-saved' }) }
       if (path === '/api/workspaces/w/agents' && method === 'GET') return json(route, agentDeleteCount === 0 ? [{ source: 'workspace', definition: { name: 'fixture-agent', description: 'Fixture agent', tools: [], disallowedTools: [] } }] : [])
@@ -515,7 +515,9 @@ test('Skills and Memory 409 conflicts require explicit reload or overwrite', asy
   await expect.poll(() => state.count('PUT', '/api/workspaces/w/skills/fixture-skill')).toBe(2)
 
   await dialog.getByRole('tab', { name: /^Memory/ }).first().click()
+  // Like skills: the entry opens as a preview first; Edit opens the form.
   await dialog.getByRole('button', { name: /Fixture memory/ }).click()
+  await dialog.getByRole('button', { name: 'Edit', exact: true }).click()
   await dialog.getByLabel('Body').fill('local body')
   await dialog.getByRole('button', { name: 'Save', exact: true }).click()
   await expect(dialog.getByRole('button', { name: 'Reload server version' })).toBeVisible()

@@ -82,7 +82,7 @@ const { TerminalPanel, clearAutoOpenClaims } = await import('./TerminalPanel.tsx
 type Frame = Parameters<Parameters<typeof api.subscribeTerminals>[1]>[0]
 
 let host: HTMLDivElement
-let root: Root | undefined
+let root: Root
 let push: (frame: Frame) => void
 
 const row = (id: string, label = 'Git Bash', shellId = 'bash') => ({
@@ -127,8 +127,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  if (root !== undefined) act(() => root.unmount())
-  root = undefined
+  act(() => root.unmount())
   host.remove()
 })
 
@@ -140,9 +139,6 @@ async function mount(props: {
   onHide?: () => void
   bindingReady?: boolean
 } = {}): Promise<void> {
-  if (root === undefined) {
-    root = createRoot(host)
-  }
   await act(async () => {
     root.render(
       <TerminalPanel
@@ -157,10 +153,10 @@ async function mount(props: {
   })
 }
 
-/** Unmount the current tree; the next mount starts a fresh root, like a remount. */
+/** Unmount the current tree and start a fresh root, like a key-driven remount. */
 async function unmount(): Promise<void> {
   await act(async () => root.unmount())
-  root = undefined as unknown as Root
+  root = createRoot(host)
 }
 
 describe('terminal panel', () => {
@@ -517,6 +513,7 @@ describe('terminal panel', () => {
     await act(async () => push({ kind: 'snapshot', terminals: [] }))
     expect(api.createTerminal).toHaveBeenCalledTimes(1)
 
+    api.createTerminal.mockClear()
     await unmount()
     await mount({ projectId: 'project-9' })
     await act(async () => push({ kind: 'snapshot', terminals: [] }))

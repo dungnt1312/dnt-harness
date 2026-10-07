@@ -60,6 +60,24 @@ describe('digest per tool', () => {
     const listed = Array.from({ length: 100 }, (_, index) => `f${index}.ts`).join('\n')
     expect(facts('Glob', { pattern: '**/*.ts' }, `${listed}\n… [+523 more matches]`).digest).toBe('100 of 623 files')
   })
+  it('keeps incomplete searches visible and never counts warnings as files or matches', () => {
+    const note = '… [search incomplete: walk budget exhausted; narrow the search path]'
+    for (const name of ['Glob', 'Grep']) {
+      expect(facts(name, { pattern: 'x' }, note).digest).toBe('search incomplete')
+      expect(facts(name, { pattern: 'x' }, `no matches\n${note}`).digest).toBe('search incomplete')
+    }
+    expect(facts('Glob', { pattern: '*' }, `a.ts\n${note}`).digest).toBe('1 file · search incomplete')
+    expect(facts('Glob', { pattern: '*' }, `a.ts\n… [+5 more matches]\n${note}`).digest).toBe('1 of 6 files · search incomplete')
+    expect(facts('Grep', { pattern: 'x' }, `a.ts:1: x\n${note}`).digest).toBe('1 match · search incomplete')
+  })
+  it('recognizes output truncation notes without counting them as hits', () => {
+    expect(facts('Glob', { pattern: '*' }, 'a.ts\n… [output truncated]').digest).toBe('1 file · truncated')
+    expect(facts('Grep', { pattern: 'x' }, 'a.ts:1: x\n… [output truncated]').digest).toBe('1 match · truncated')
+  })
+  it('shows the incomplete warning on a settled search row, without opening details', async () => {
+    await mount(<ToolCard item={row('incomplete', 'Glob', { pattern: '**/*.ts' }, { ok: true, output: 'a.ts\n… [search incomplete: walk budget exhausted; narrow the search path]' })} />)
+    expect(host.querySelector('button')?.textContent).toContain('Search incomplete')
+  })
   it('does not count the Grep truncation note as a match', () => {
     const hits = Array.from({ length: 250 }, (_, index) => `a.ts:${index + 1}: x`).join('\n')
     expect(facts('Grep', { pattern: 'x' }, `${hits}\n… [more matches truncated]`).digest).toBe('250 matches · truncated')
