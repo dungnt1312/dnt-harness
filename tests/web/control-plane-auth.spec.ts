@@ -263,6 +263,43 @@ describe('control-plane authentication', () => {
     expect(stale.headers['content-type']).toContain('application/json')
   })
 
+  it('guards the global configuration routes like every other privileged mutation', async () => {
+    const live = await start()
+    expect((await raw(live.url, 'GET', '/api/app-config')).status).toBe(401)
+    const unpairedReload = await raw(live.url, 'POST', '/api/app-config/reload', { 'content-type': 'application/json' }, '{}')
+    expect(unpairedReload.status).toBe(401)
+
+    const code = live.auth.issuePairingCode().code
+    const paired = await raw(live.url, 'POST', '/api/auth/pair', { 'content-type': 'application/json' }, JSON.stringify({ code }))
+    const sessionCookie = String(paired.headers['set-cookie']).split(';')[0] ?? ''
+    const csrf = (JSON.parse(paired.body) as { csrf: string }).csrf
+
+    const described = await raw(live.url, 'GET', '/api/app-config', { cookie: sessionCookie })
+    expect(described.status).toBe(200)
+    const hash = (JSON.parse(described.body) as { hash: string }).hash
+    const patch = JSON.stringify({ expectedHash: hash, edits: [{ op: 'set', key: 'toolTimeoutMs', value: 300_000 }] })
+    const json = { cookie: sessionCookie, origin: live.auth.canonicalOrigin, 'content-type': 'application/json' }
+
+    expect((await raw(live.url, 'PATCH', '/api/app-config', json, patch)).status).toBe(403)
+    expect((await raw(live.url, 'PATCH', '/api/app-config', { ...json, 'x-dnt-harness-csrf': 'wrong' }, patch)).status).toBe(403)
+    expect((await raw(live.url, 'POST', '/api/app-config/reload', json, '{}')).status).toBe(403)
+    expect((await raw(live.url, 'PATCH', '/api/app-config', { cookie: sessionCookie, 'content-type': 'application/json', 'x-dnt-harness-csrf': csrf }, patch)).status).toBe(403)
+
+    // A scoped bearer cannot reach global configuration through any scope it holds.
+    const scoped = live.auth.issueBearer(['sessions', 'providers', 'mcp'])
+    const bearer = { authorization: `Bearer ${scoped.token}`, 'content-type': 'application/json' }
+    expect((await raw(live.url, 'GET', '/api/app-config', bearer)).status).toBe(403)
+    expect((await raw(live.url, 'PATCH', '/api/app-config', bearer, patch)).status).toBe(403)
+    expect((await raw(live.url, 'POST', '/api/app-config/reload', bearer, '{}')).status).toBe(403)
+    expect(live.appConfig.read().revision).toBe(0)
+
+    const saved = await raw(live.url, 'PATCH', '/api/app-config', { ...json, 'x-dnt-harness-csrf': csrf }, patch)
+    expect(saved.status).toBe(200)
+    expect(live.appConfig.read().values.toolTimeoutMs).toBe(300_000)
+    const reloaded = await raw(live.url, 'POST', '/api/app-config/reload', { ...json, 'x-dnt-harness-csrf': csrf }, '{}')
+    expect(reloaded.status).toBe(200)
+  })
+
   it('does not treat an approval id as a credential', async () => {
     const live = await start()
     const answered = await raw(live.url, 'POST', '/api/approvals/not-a-session', {

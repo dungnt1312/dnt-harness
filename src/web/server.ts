@@ -23,6 +23,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { execFile } from 'node:child_process'
 import { createReadStream } from 'node:fs'
+import { handleAppConfigApi } from './app-config-api.ts'
 import { bearerAllows, CLEARED_SESSION_COOKIE, ControlPlaneAuthService, isPublicPath, readSessionCookie } from './control-plane-auth.ts'
 import { OPERATOR_HEADER, publishOperatorChannel } from './operator-channel.ts'
 import { promises as fs, type Dirent } from 'node:fs'
@@ -2840,6 +2841,7 @@ ${entry.description}`.toLowerCase().includes(query))
     pendingQuestions,
     staticDir,
     limitsReader: appConfig,
+    appConfig,
     approvalHandle,
     dangerousGuard,
     yolo: options.yolo === true,
@@ -3045,6 +3047,8 @@ interface HandlerDeps {
   readonly staticDir: string
   /** Live limits; each bound is read at its own enforcement point. */
   readonly limitsReader: LimitsReader
+  /** Global configuration coordinator behind the `/api/app-config` routes. */
+  readonly appConfig: AppConfigService
   readonly approvalHandle: ApprovalHandle
   readonly dangerousGuard: ReturnType<typeof attachDangerousCommandGuard>
   readonly yolo: boolean
@@ -4672,6 +4676,9 @@ async function handleApi(
       }
       return
     }
+
+    // ── global configuration (limits) ────────────────────────
+    if (await handleAppConfigApi(req, pathname, deps.appConfig, send, readJson)) return
 
     // ── global provider/model defaults ───────────────────────
     if (pathname === '/api/model-defaults') {
