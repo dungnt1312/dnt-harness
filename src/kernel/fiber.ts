@@ -126,7 +126,11 @@ export class Fiber {
   private effectMetas: EffectMeta[] = []
   /** Whole-fiber teardown completion; cached so every caller shares it. */
   private teardown: Promise<void> | undefined
-  /** Started-but-running early disposals; whole-fiber teardown awaits them. */
+  /**
+   * Early disposals the whole-fiber teardown must await: still-running ones,
+   * plus every run that finished failed (its error counts toward the
+   * aggregate). Successful runs are removed once settled.
+   */
   private readonly runningDisposals: Set<Promise<void>> = new Set()
 
   /**
@@ -160,6 +164,11 @@ export class Fiber {
         assertNever(this.state)
     }
 
+    // Cleanup restriction: a cleanup must never await its own `fiber.dispose()`
+    // (e.g. a parent plugin's cleanup awaiting the child fiber that
+    // `ctx.plugin` returned): by the time cleanup runs the fiber is already
+    // `unloading`, so the awaited teardown promise is the caller's own —
+    // waiting for it deadlocks instead of completing.
     const record = createEffectRecord(normalizeDisposer(execute()))
     this.disposers.push(record)
     this.effectMetas.push({ label, children: [] })
@@ -184,9 +193,26 @@ export class Fiber {
       this.disposers.splice(index, 1)
       const run = record.start()
       this.runningDisposals.add(run)
-      void run.finally(() => {
-        this.runningDisposals.delete(run)
-      })
+      // Bookkeeping on the side, not via `run.finally(...)`: `finally` derives
+      // a NEW promise that rejects whenever `run` does (after the callback
+      // runs), so a `void`ed `finally` chain leaks an unhandled rejection —
+      // the catch on `run` itself does not cover that derived promise.
+      // `.then(onFulfilled, onRejected)` instead returns a promise both of
+      // whose branches settle normally, so the derived promise can never
+      // reject and `void`ing it is safe. A settled run is dropped from the
+      // set unless it failed: failures stay listed until the whole-fiber
+      // teardown awaits them and collects the error; successes have nothing
+      // left to await (already settled) and are removed to bound the set.
+      void run.then(
+        () => {
+          this.runningDisposals.delete(run)
+        },
+        () => {
+          // Failed: retained below for runTeardown to observe. The rejection
+          // itself belongs to whoever awaits `run`; if nobody does (fire-and-
+          // forget `ctx.on`/`ctx.provide`), it surfaces only through dispose().
+        },
+      )
     }
     return record.start()
   }

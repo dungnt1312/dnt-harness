@@ -184,7 +184,10 @@ describe('fiber teardown (once-only completion)', () => {
     })
 
     // Attach a catch up front: this teardown will surface through dispose().
-    void disposer().catch(() => {})
+    let earlyFinished = false
+    void disposer().catch(() => {
+      earlyFinished = true
+    })
     let unloadFinished = false
     const unload = fiber.dispose().then(() => {
       unloadFinished = true
@@ -194,6 +197,7 @@ describe('fiber teardown (once-only completion)', () => {
     await Promise.resolve()
     await Promise.resolve()
     expect(calls).toBe(1)
+    expect(earlyFinished).toBe(false)
     expect(unloadFinished).toBe(false)
 
     gate.resolve()
@@ -250,9 +254,53 @@ describe('fiber teardown (once-only completion)', () => {
     const result = await outcome
     expect(result).toContain('rejected:AggregateError')
     expect(result).toContain('iter middle failed')
-    // Reverse order continues past the throwing middle disposer.
+    // Reverse order continues past the throwing early disposer.
     expect(logs).toEqual(['iter last', 'iter middle', 'iter first'])
     expect(fiber.state).toBe('failed')
     expect(fiber.getEffects()).toEqual([])
+  })
+
+  it('failing early disposer rejects dispose with the error exactly once', async () => {
+    // Test-level unhandled-rejection tripwire: vitest reports any rejection
+    // that reaches the process unobserved, which is exactly what this
+    // regression guards against.
+    const unhandled: unknown[] = []
+    const onUnhandled = (error: unknown) => {
+      unhandled.push(error)
+    }
+    process.on('unhandledRejection', onUnhandled)
+
+    const fiber = new Fiber('regress')
+    const gate = deferred<void>()
+
+    const disposer = fiber.effect(() => async () => {
+      await gate.promise
+      throw new Error('early failed')
+    })
+
+    // Call the early disposer and let its rejection land immediately: the
+    // returned promise must be observed (caught) right here.
+    gate.resolve()
+    await expect(disposer()).rejects.toThrow('early failed')
+
+    // Whole-fiber dispose must still learn about the failure, exactly once.
+    await expect(fiber.dispose()).rejects.toThrow(AggregateError)
+    await expect(fiber.dispose()).rejects.toThrow(/early failed/)
+    await expect(fiber.dispose()).rejects.toSatisfy((error: unknown) => {
+      return (
+        error instanceof AggregateError &&
+        error.errors.length === 1 &&
+        error.errors[0] instanceof Error &&
+        error.errors[0].message === 'early failed'
+      )
+    })
+    expect(fiber.state).toBe('failed')
+    expect(fiber.getEffects()).toEqual([])
+
+    // Let the process drain; nothing may surface as unhandled.
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(unhandled).toEqual([])
+
+    process.off('unhandledRejection', onUnhandled)
   })
 })
