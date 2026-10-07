@@ -277,7 +277,7 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
         setEdits({})
         setRemote([])
         setConflict(false)
-        setNotice(next.error === undefined ? { kind: 'ok', text: 'Applied the configuration file.' } : null)
+        setNotice({ kind: 'ok', text: 'Applied the configuration file.' })
       } catch (cause) {
         setNotice({ kind: 'bad', text: refusalOf(cause).message })
       }

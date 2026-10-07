@@ -69,7 +69,7 @@ export async function handleAppConfigApi(
     if (error instanceof BadRequest) send(400, { error: error.message, code: 'invalid' })
     else if (error instanceof AppConfigError) {
       send(statusOf(error), { error: error.message, code: error.code, ...(error.key !== undefined ? { key: error.key } : {}) })
-    } else send(500, { error: error instanceof Error ? error.message : String(error) })
+    } else send(500, { error: error instanceof Error ? error.message : String(error), code: 'internal' })
   }
   return true
 }

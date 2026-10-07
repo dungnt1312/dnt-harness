@@ -581,7 +581,7 @@ ratio); nothing converts them.
   | Limits | Captured |
   |---|---|
   | `streamFirstEventMs`, `streamIdleMs`, `logicalRequestMs`, `stepRetries`, `stepRetryBaseMs` | per logical model request, retries included |
-  | `toolOutputLimit`, `toolTimeoutMs`, `bashMaxWaitMs`, `subagentBackgroundBashMaxMs` | per tool call, after approval and just before dispatch (the Bash schema advertises the current budget at each request) |
+  | `toolOutputLimit`, `toolTimeoutMs`, `bashMaxWaitMs`, `subagentBackgroundBashMaxMs` | per tool call, after approval and just before dispatch (the Bash schema advertises the current budget at each request, so changing `toolTimeoutMs` or `bashMaxWaitMs` changes the tool schema and invalidates the provider prompt cache on the next request) |
   | `approvalExpiryMs`, `questionExpiryMs` | when the approval or question is created |
   | `delegationJoinMs` | when each join starts |
   | `automaticCompactionPressure` | at each settled-turn decision; a compaction already running is not cancelled |
@@ -596,7 +596,8 @@ ratio); nothing converts them.
 - **Invalid file.** Malformed JSON, a version other than `v: 1`, unknown
   sections or keys, and out-of-range values all count as invalid. Hosts do not
   repair or overwrite an invalid file. At boot, both bins refuse to start and
-  print the error, and nothing is acquired: no data-home lock, no temp home.
+  print the error, and nothing is left behind: the data-home lock is never
+  taken, and a memory-mode web host removes the temp home it created.
   To recover, fix the file, or rename it aside to keep its contents (defaults
   then apply), and restart. At runtime, an invalid file makes edit and reload
   fail with `invalid`, and the last good snapshot stays active.

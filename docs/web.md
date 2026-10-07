@@ -421,7 +421,8 @@ Origin, or an admin bearer. Other bearer scopes get `403`.
 
 Errors are `{ error, code, key? }`: `400 invalid` (bad shape, key, or value, or
 an invalid file on disk), `409 conflict` (stale `expectedHash`), `409 locked`
-(an explicit override owns the field), `500 io`, `405 method`. A failed reload
+(an explicit override owns the field), `500 io`, `500 internal` (any other
+host failure), `405 method`. A failed reload
 keeps the last good snapshot. An invalid file at startup stops the host from
 booting (see harness.md for recovery). Running operations keep the policy they
 captured; the next operation in every workspace uses the new snapshot.

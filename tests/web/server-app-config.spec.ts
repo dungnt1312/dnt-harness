@@ -74,7 +74,7 @@ describe('handleAppConfigApi', () => {
     const send = vi.fn()
     const service = { describe: async () => { throw new Error('app-config service is not booted') } } as unknown as AppConfigService
     expect(await handleAppConfigApi({ method: 'GET' } as IncomingMessage, '/api/app-config', service, send, async () => ({}))).toBe(true)
-    expect(send).toHaveBeenCalledWith(500, { error: 'app-config service is not booted' })
+    expect(send).toHaveBeenCalledWith(500, { error: 'app-config service is not booted', code: 'internal' })
   })
 })
 
