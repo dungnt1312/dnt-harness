@@ -181,7 +181,7 @@ describe('limits operation boundaries', () => {
       return admitted
     })
     const commit = vi.spyOn(registry, 'commitBackground')
-    kernel.ctx.tools.register(bashTool({ processes: registry }))
+    kernel.ctx.tools.register(bashTool({ processes: registry, limits: live.reader }))
     const scope = {
       sessionId: 'child',
       rootSessionId: 'root',
@@ -192,6 +192,101 @@ describe('limits operation boundaries', () => {
       expect(result.output).toMatch(/background process started/)
       expect(commit).toHaveBeenCalledTimes(1)
       expect(commit.mock.calls[0]![2]).toEqual({ maxRuntimeMs: 111_000 })
+    } finally {
+      await kernel.stop()
+    }
+  })
+
+  it('child background budget is read at body start, after an approval wait', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(ToolsService)
+    const live = liveLimits({ toolTimeoutMs: 50, subagentBackgroundBashMaxMs: 111_000 })
+    kernel.ctx.provide('limits-reader', live.reader)
+    kernel.ctx.tools.setRootResolver(() => ({ root: process.cwd() }))
+    const registry = new ProcessRegistry()
+    registries.push(registry)
+    const register = registry.tryRegister.bind(registry)
+    vi.spyOn(registry, 'tryRegister').mockImplementation((input) => {
+      const admitted = register(input)
+      live.publish({ subagentBackgroundBashMaxMs: 333_000 })
+      return admitted
+    })
+    const commit = vi.spyOn(registry, 'commitBackground')
+    kernel.ctx.tools.register(bashTool({ processes: registry, limits: live.reader }))
+    let approve!: (allowed: boolean) => void
+    let asked!: () => void
+    const askedOnce = new Promise<void>((resolve) => { asked = resolve })
+    attachApproval(kernel.ctx, {
+      policy: { Bash: 'ask' },
+      askUser: () => { asked(); return new Promise<boolean>((resolve) => { approve = resolve }) },
+    })
+    const scope = {
+      sessionId: 'child',
+      rootSessionId: 'root',
+      childOf: { parentSessionId: 'root', parentTurnId: 'turn', definition: 'general', instructions: '', toolCeiling: ['Bash'] },
+    } as unknown as Parameters<typeof agentScope.run>[0]
+    try {
+      const running = agentScope.run(scope, () => kernel.ctx.tools.execute({ id: 'bg', name: 'Bash', args: { command: 'true; sleep 5' } }))
+      await askedOnce
+      live.publish({ subagentBackgroundBashMaxMs: 222_000 })
+      approve(true)
+      const result = await running
+      expect(result.output).toMatch(/background process started/)
+      expect(commit).toHaveBeenCalledTimes(1)
+      expect(commit.mock.calls[0]![2]).toEqual({ maxRuntimeMs: 222_000 })
+    } finally {
+      await kernel.stop()
+    }
+  })
+
+  it('a kernel without limits leaves each tool its own output default', async () => {
+    const envelopes = async (legacy?: object): Promise<{ prepared?: ToolExecution; body?: ToolExecution }> => {
+      const kernel = new Kernel()
+      kernel.ctx.plugin(ToolsService)
+      if (legacy !== undefined) kernel.ctx.provide('limits', legacy)
+      const seen: { prepared?: ToolExecution; body?: ToolExecution } = {}
+      kernel.ctx.tools.register({
+        name: 'Probe',
+        description: 'records its execution envelope',
+        parameters: { type: 'object', properties: {}, required: [] },
+        async execute(_args, exec) { seen.body = exec; return 'ok' },
+      })
+      kernel.ctx.on('tools/pre-execute', async (payload, next) => { seen.prepared = payload.exec; return next() })
+      try {
+        await kernel.ctx.tools.execute({ id: 'p', name: 'Probe', args: {} })
+      } finally {
+        await kernel.stop()
+      }
+      return seen
+    }
+    const bare = await envelopes()
+    expect(bare.prepared?.outputLimit).toBeUndefined()
+    expect(bare.body?.outputLimit).toBeUndefined()
+    const unrelated = await envelopes({ streamIdleMs: 5_000 })
+    expect(unrelated.prepared?.outputLimit).toBeUndefined()
+    expect(unrelated.body?.outputLimit).toBeUndefined()
+    const configured = await envelopes({ toolOutputLimit: 25 })
+    expect(configured.prepared?.outputLimit).toBe(25)
+    expect(configured.body?.outputLimit).toBe(25)
+  })
+
+  it('an unreadable limits source fails the call without throwing from prepare', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.provide('limits-reader', {})
+    let ran = false
+    kernel.ctx.tools.register({
+      name: 'Probe',
+      description: 'must not run',
+      parameters: { type: 'object', properties: {}, required: [] },
+      async execute() { ran = true; return 'ran' },
+    })
+    try {
+      const prepared = await kernel.ctx.tools.prepare({ id: 'p', name: 'Probe', args: {} })
+      const result = await prepared.execute()
+      expect(result.ok).toBe(false)
+      expect(result.output).toMatch(/^error: .*limits-reader/)
+      expect(ran).toBe(false)
     } finally {
       await kernel.stop()
     }

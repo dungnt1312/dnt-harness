@@ -43,9 +43,11 @@ export interface BashToolOptions {
   readonly processes?: ProcessRegistry
   /**
    * Live limits source. When present, the advertised schema and each
-   * execution's wait budget follow its current `toolTimeoutMs`/`bashMaxWaitMs`
-   * instead of the static `timeoutMs`/`maxWaitMs` above. A pipeline-stamped
-   * `ToolExecution.limitsSnapshot` still outranks it.
+   * execution's wait budget follow `toolTimeoutMs`/`bashMaxWaitMs` instead of
+   * the static `timeoutMs`/`maxWaitMs` above: the pipeline-stamped
+   * `ToolExecution.limitsSnapshot` first, else a fresh read. Without it the
+   * static options always govern, so fixed-option callers keep their budget
+   * and schema even inside the tool pipeline.
    */
   readonly limits?: LimitsReader
 }
@@ -142,7 +144,7 @@ function isBareSleep(command: string): boolean {
 /** The `Bash` tool: one command, captured output, timeout and stop handling. */
 export function bashTool(options: BashToolOptions = {}): ToolDefinition {
   const staticBudget = waitBudget(options.timeoutMs, options.maxWaitMs)
-  const currentBudget = (): WaitBudget => options.limits !== undefined ? budgetOf(options.limits.read().values) : staticBudget
+  const live = options.limits
   // Used only for direct compatibility calls without a granted root. Pipeline
   // executions must derive their working directory from `exec.root`.
   const configuredCwd = options.cwd
@@ -164,11 +166,12 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
     description,
     requiresRoot: true,
     parameters: parameters(staticBudget),
-    ...(options.limits !== undefined ? { schema: () => ({ description, parameters: parameters(currentBudget()) }) } : {}),
+    ...(live !== undefined ? { schema: () => ({ description, parameters: parameters(budgetOf(live.read().values)) }) } : {}),
     async execute(args, exec: ToolExecution) {
-      // One wait policy per execution, taken before any await: the trusted
-      // pipeline snapshot, else the live reader, else the static options.
-      const { timeoutMs, maxWaitMs } = exec.limitsSnapshot !== undefined ? budgetOf(exec.limitsSnapshot.values) : currentBudget()
+      // One wait policy per execution, taken before any await: with a live
+      // reader, the trusted pipeline snapshot or else a fresh read; without
+      // one, the static options.
+      const { timeoutMs, maxWaitMs } = live !== undefined ? budgetOf((exec.limitsSnapshot ?? live.read()).values) : staticBudget
       const command = args['command']
       if (typeof command !== 'string' || command === '') {
         throw new Error("argument 'command' must be a non-empty string")

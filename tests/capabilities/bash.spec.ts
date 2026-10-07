@@ -226,6 +226,21 @@ describe('bash tool', () => {
     expect(Date.now() - started).toBeLessThan(3_000)
   }, 20_000)
 
+  it('a fixed-option Bash keeps its configured timeout through the tool pipeline', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.tools.setRootResolver(() => ({ root: process.cwd() }))
+    kernel.ctx.tools.register(bashTool({ timeoutMs: 200 }))
+    try {
+      const started = Date.now()
+      const result = await kernel.ctx.tools.execute({ id: 'fixed', name: 'Bash', args: { command: 'sleep 5; echo never' } })
+      expect(result.output).toContain('[terminated by timeout; killed]')
+      expect(Date.now() - started).toBeLessThan(3_000)
+    } finally {
+      await kernel.stop()
+    }
+  }, 10_000)
+
   it('static callers keep their configured wait budget and schema', async () => {
     const tool = bashTool({ timeoutMs: 2_000 })
     const description = (tool.parameters.properties['timeoutMs'] as { description: string }).description

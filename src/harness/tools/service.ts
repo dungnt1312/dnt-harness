@@ -10,6 +10,7 @@ import { agentScope } from '../agent/scope.ts'
 import { FileObservations } from '../../capabilities/fs/observation.ts'
 import { classifyGrantedRoots, samePath, within } from '../../capabilities/fs/grants.ts'
 import { readLimits } from '../config/limits-reader.ts'
+import { DEFAULT_LIMITS } from '../limits.ts'
 import type { LimitsSnapshot } from '../config/types.ts'
 import type { ApprovedPath, GrantedRoot, PreExecuteDecision, PreparedToolCall, ToolDefinition, ToolExecution, ToolResult } from './types.ts'
 
@@ -18,6 +19,9 @@ declare module 'dnt-harness' {
     tools: ToolsService
   }
 }
+
+/** One captured limits snapshot and the output cap the host configured, if any. */
+interface LimitsPolicy { readonly snapshot: LimitsSnapshot; readonly outputLimit?: number }
 
 /** Resolves the workspace grant for the tool run in flight, if any. */
 export type RootResolver = () => {
@@ -202,10 +206,22 @@ export class ToolsService extends Service {
   async prepare(call: ToolCall, options: { signal?: AbortSignal; executionId?: ExecutionId } = {}): Promise<PreparedToolCall> {
     const executionId = options.executionId ?? newExecutionId()
     const canonical = snapshotCall(call)
-    const exec = this.buildExecution(canonical, options.signal, executionId)
+    let policy: LimitsPolicy | undefined
+    let policyError: unknown
+    try {
+      policy = this.limitsPolicy()
+    } catch (error) {
+      policyError = error
+    }
+    const exec = this.buildExecution(canonical, options.signal, executionId, policy)
     let prepared: PreparedToolCall
-    // Unknown original identity is not recoverable by hooks: fail closed.
-    if (!this.tools.has(canonical.name)) {
+    if (policy === undefined) {
+      // An unreadable limits source authorizes nothing: fail the call the
+      // same way an unreadable policy at body start would.
+      await this.approvedPathResolver?.(canonical, false, exec).catch(() => undefined)
+      prepared = { call: canonical, executionId, execute: () => this.postExecute(canonical, exec, { ok: false, output: `error: ${String(policyError)}` }) }
+    } else if (!this.tools.has(canonical.name)) {
+      // Unknown original identity is not recoverable by hooks: fail closed.
       await this.approvedPathResolver?.(canonical, false, exec).catch(() => undefined)
       prepared = { call: canonical, executionId, execute: () => this.postExecute(canonical, exec, { ok: false, output: `unknown tool '${canonical.name}' (registered: ${[...this.tools.keys()].join(', ') || 'none'})` }) }
     } else {
@@ -375,7 +391,7 @@ export class ToolsService extends Service {
           // The body's limits policy is captured exactly once, here: after
           // every authority and approval wait, before dispatch. The result
           // below is shaped under the same envelope, never a recapture.
-          runExec = this.executionAtRun(exec, approvedPaths, readLimits(this.ctx))
+          runExec = this.executionAtRun(exec, approvedPaths, this.limitsPolicy())
           output = await tool.execute(preparedCall.args, runExec)
         } catch (error) {
           return this.postExecute(preparedCall, runExec ?? exec, { ok: false, output: `error: ${String(error)}` })
@@ -408,8 +424,8 @@ export class ToolsService extends Service {
    * The limits policy captured for this run replaces the preparation-time
    * output cap and child background maximum.
    */
-  private executionAtRun(exec: ToolExecution, approvedPaths: readonly ApprovedPath[] | undefined, limits: LimitsSnapshot): ToolExecution {
-    const { additionalRoots: _before, memoryRoots: _memoryBefore, hostStorageRoot: _storageBefore, approvedPaths: _unused, ...base } = exec
+  private executionAtRun(exec: ToolExecution, approvedPaths: readonly ApprovedPath[] | undefined, policy: LimitsPolicy): ToolExecution {
+    const { additionalRoots: _before, memoryRoots: _memoryBefore, hostStorageRoot: _storageBefore, approvedPaths: _unused, outputLimit: _outputBefore, ...base } = exec
     let additionalRoots = exec.additionalRoots
     let memoryRoots = exec.memoryRoots
     let hostStorageRoot = exec.hostStorageRoot
@@ -425,9 +441,9 @@ export class ToolsService extends Service {
     }
     return freezeExecution({
       ...base,
-      outputLimit: limits.values.toolOutputLimit,
-      ...(exec.subagentBackgroundBashMaxMs !== undefined ? { subagentBackgroundBashMaxMs: limits.values.subagentBackgroundBashMaxMs } : {}),
-      limitsSnapshot: limits,
+      ...(policy.outputLimit !== undefined ? { outputLimit: policy.outputLimit } : {}),
+      ...(exec.subagentBackgroundBashMaxMs !== undefined ? { subagentBackgroundBashMaxMs: policy.snapshot.values.subagentBackgroundBashMaxMs } : {}),
+      limitsSnapshot: policy.snapshot,
       ...(additionalRoots !== undefined && additionalRoots.length > 0 ? { additionalRoots } : {}),
       ...(memoryRoots !== undefined && memoryRoots.length > 0 ? { memoryRoots } : {}),
       ...(hostStorageRoot !== undefined ? { hostStorageRoot } : {}),
@@ -440,15 +456,14 @@ export class ToolsService extends Service {
    * requiresRoot fail-closed check runs after the permission gate, so a
    * policy denial always outranks a missing (or present) grant.
    */
-  private buildExecution(call: ToolCall, signal: AbortSignal | undefined, executionId?: ExecutionId): ToolExecution {
+  private buildExecution(call: ToolCall, signal: AbortSignal | undefined, executionId: ExecutionId, policy: LimitsPolicy | undefined): ToolExecution {
     const grant = this.rootResolver?.()
     // Preparation envelope only (denials before dispatch); the body gets its
     // own policy captured at run time and no snapshot is pinned here.
-    const limits = readLimits(this.ctx).values
     const scope = agentScope.getStore()
     return freezeExecution({
       ...(scope?.turnId !== undefined ? { turnId: scope.turnId } : {}),
-      ...(scope?.childOf !== undefined ? { subagentBackgroundBashMaxMs: limits.subagentBackgroundBashMaxMs } : {}),
+      ...(scope?.childOf !== undefined ? { subagentBackgroundBashMaxMs: policy?.snapshot.values.subagentBackgroundBashMaxMs ?? DEFAULT_LIMITS.subagentBackgroundBashMaxMs } : {}),
       root: grant?.root ?? '',
       ...(scope?.sessionId !== undefined ? { sessionId: scope.sessionId, observations: this.fileObservations } : {}),
       ...(scope?.rootSessionId !== undefined ? { rootSessionId: scope.rootSessionId } : {}),
@@ -459,10 +474,22 @@ export class ToolsService extends Service {
       ...(grant?.memoryRoots !== undefined ? { memoryRoots: grant.memoryRoots } : {}),
       ...(grant?.hostStorageRoot !== undefined ? { hostStorageRoot: grant.hostStorageRoot } : {}),
       ...(signal !== undefined ? { signal } : {}),
-      outputLimit: limits.toolOutputLimit,
-      ...(executionId !== undefined ? { executionId } : {}),
+      ...(policy?.outputLimit !== undefined ? { outputLimit: policy.outputLimit } : {}),
+      executionId,
       ...(call.id !== '' ? { toolCallId: call.id } : {}),
     })
+  }
+
+  /**
+   * Capture the limits policy for one envelope. `outputLimit` is present only
+   * when the host configured one — a mounted reader, or a legacy `limits`
+   * value naming it — so a bare kernel leaves each tool its own default.
+   */
+  private limitsPolicy(): LimitsPolicy {
+    const snapshot = readLimits(this.ctx)
+    const legacy = this.ctx.get('limits') as { toolOutputLimit?: unknown } | null | undefined
+    const configured = this.ctx.get('limits-reader') !== undefined || legacy?.toolOutputLimit !== undefined
+    return configured ? { snapshot, outputLimit: snapshot.values.toolOutputLimit } : { snapshot }
   }
 
   private retireAuthority(executionId: ExecutionId): void {
