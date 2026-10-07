@@ -3,7 +3,7 @@ import * as Tabs from '@radix-ui/react-tabs'
 import { ProjectsPanel } from './ProjectsPanel.tsx'
 import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import ConfirmDialog from '../common/ConfirmDialog.tsx'
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import Icon, { type IconName } from '../common/Icon.tsx'
 import { Badge } from '../ui/Badge.tsx'
 import { Button } from '../ui/Button.tsx'
@@ -157,11 +157,7 @@ export function SettingsModal({
     readonly discardAdvanced: (() => void) | null
   } | null>(null)
   const [tab, setTab] = useState<SettingsTab>('providers')
-  /**
-   * Guard published by the Advanced panel. Read only while that tab is shown:
-   * a remount publishes a fresh guard at layout time, so a value left by an
-   * unmounted panel is never consulted.
-   */
+  /** Guard published by the mounted Advanced panel; cleared when it unmounts. */
   const [advancedGuard, setAdvancedGuard] = useState<AdvancedGuard | null>(null)
   // Roles pin a model from the same enabled provider/model list the composer
   // offers, so a role can never name an endpoint the host cannot serve.
@@ -251,8 +247,14 @@ export function SettingsModal({
     )
   }, [draft, selected])
 
-  const advanced = tab === 'advanced' ? advancedGuard : null
+  const advanced = advancedGuard
   const anyBusy = busy !== null || advanced?.busy === true
+
+  // Leaving the tab or closing Settings unmounts the Advanced panel without a
+  // final publish (a confirmed discard navigates in the same batch), so its
+  // last guard is dropped here, before the next event can read it. A remount
+  // publishes from its own layout effect, which runs before this one.
+  useLayoutEffect(() => { if (!open || tab !== 'advanced') setAdvancedGuard(null) }, [open, tab])
 
   function leave(action: () => void): void {
     if (anyBusy) return

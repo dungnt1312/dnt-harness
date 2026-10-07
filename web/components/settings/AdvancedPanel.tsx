@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef } from 'react'
+import { useEffect, useId, useLayoutEffect, useRef } from 'react'
 import type { AppConfigView, LimitEdit, LimitSource } from '../../../src/harness/config/types.ts'
 import type { LimitField, LimitKey } from '../../../src/harness/limits-config.ts'
 import { getAppConfig, HttpError, patchAppConfig, reloadAppConfig } from '../../lib/api.ts'
@@ -39,7 +39,7 @@ const SOURCE_LABEL: Readonly<Record<LimitSource, string>> = {
   library: 'Default',
   host: 'Host default',
   file: 'Config file',
-  explicit: 'Host override',
+  explicit: 'Host override (locked)',
 }
 
 /** Counts are bare numbers; every other unit is shown beside the value. */
@@ -126,17 +126,33 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
   const [conflict, setConflict] = useScopedState(false)
   const [confirmApply, setConfirmApply] = useScopedState(false)
   const [notice, setNotice] = useScopedState<NoticeState>(null)
+  const [loading, setLoading] = useScopedState(true)
+  /** Control to focus once the render that enables it has committed. */
+  const [focusTarget, setFocusTarget] = useScopedState<'save' | 'keep' | 'apply' | 'confirm' | null>(null)
   const { busy, run } = useActionRunner((text) => setNotice({ kind: 'bad', text }))
+  const ids = { save: useId(), keep: useId(), apply: useId(), confirm: useId() }
 
   const load = async (): Promise<void> => {
-    setLoadError(null)
+    setLoading(true)
     try {
       setView(await getAppConfig())
+      setLoadError(null)
     } catch (cause) {
       setLoadError(refusalOf(cause).message)
+    } finally {
+      setLoading(false)
     }
   }
   useEffect(() => { void load() }, [])
+
+  // Focus waits for the action lock to release, since busy disables every button.
+  useLayoutEffect(() => {
+    if (focusTarget === null || busy !== null) return
+    const target = document.getElementById(ids[focusTarget])
+    const control = focusTarget === 'confirm' ? target?.querySelector('button') : target
+    control?.focus()
+    setFocusTarget(null)
+  }, [focusTarget, busy])
 
   const dirty = Object.keys(edits).length > 0
   const discard = (): void => {
@@ -150,6 +166,8 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
   // The parent reads the guard while handling Escape or a tab press, so it is
   // published at layout time — never a paint behind the latest keystroke. The
   // discard handed out stays stable and always reaches the current setters.
+  // `onGuardChanged` is read through the same ref, so a parent passing a new
+  // callback identity each render neither republishes nor misses an update.
   const latest = useRef({ discard, onGuardChanged })
   useLayoutEffect(() => { latest.current = { discard, onGuardChanged } })
   const stableDiscard = useRef(() => latest.current.discard()).current
@@ -162,7 +180,7 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
     return (
       <PanelBody>
         <Notice kind="bad" text={loadError} />
-        <div><Button size="sm" onClick={() => void load()}>Retry</Button></div>
+        <div><Button size="sm" disabled={loading} onClick={() => void load()}>{loading ? 'Retrying…' : 'Retry'}</Button></div>
       </PanelBody>
     )
   }
@@ -185,7 +203,7 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
     return error === null ? [] : [field.key]
   })
   const saveBlocker = view.hash === null ? 'Fix the configuration file first.'
-    : conflict ? 'Refresh first: the file changed since it was loaded.'
+    : conflict ? 'Refresh first: the host or file changed since this was loaded.'
     : remote.length > 0 ? 'Review the fields that changed in the file first.'
     : errors.length > 0 ? 'Fix the highlighted values first.'
     : !dirty ? 'No changes to save.'
@@ -208,9 +226,14 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
         setNotice({ kind: 'ok', text: 'Saved. New limits apply from the next operation.' })
       } catch (cause) {
         const refusal = refusalOf(cause)
+        // A lock refusal means the descriptor is stale too (say, the host
+        // restarted with a new override): both recover by refreshing.
         if (refusal.code === 'conflict') {
           setConflict(true)
           setNotice(null)
+        } else if (refusal.code === 'locked') {
+          setConflict(true)
+          setNotice({ kind: 'info', text: refusal.message })
         } else setNotice({ kind: 'bad', text: refusal.message })
       }
     })
@@ -225,6 +248,7 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
         setEdits(rebased.edits)
         setRemote(rebased.changed)
         setConflict(false)
+        setFocusTarget(rebased.changed.length > 0 ? 'keep' : 'save')
         if (rebased.locked.length > 0) {
           const names = rebased.locked.join(', ')
           setNotice({ kind: 'info', text: `${names} ${rebased.locked.length === 1 ? 'is' : 'are'} now locked by the host; your ${rebased.locked.length === 1 ? 'edit was' : 'edits were'} removed.` })
@@ -270,16 +294,16 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
             <span className="min-w-0">The configuration file changed outside this editor. Fields show the saved values; the active values differ until you apply the file.</span>
           </span>
           {confirmApply ? (
-            <InlineConfirm
+            <div id={ids.confirm}><InlineConfirm
               message="Applying the file discards your unsaved edits here."
               confirmLabel="Apply and discard edits"
               busy={busy !== null}
               onConfirm={() => void applyFile()}
-              onCancel={() => setConfirmApply(false)}
-            />
+              onCancel={() => { setConfirmApply(false); setFocusTarget('apply') }}
+            /></div>
           ) : (
             <div>
-              <Button size="sm" disabled={busy !== null} onClick={() => { if (dirty) setConfirmApply(true); else void applyFile() }}>
+              <Button id={ids.apply} size="sm" disabled={busy !== null} onClick={() => { if (dirty) { setConfirmApply(true); setFocusTarget('confirm') } else void applyFile() }}>
                 {busy === 'apply' ? 'Applying…' : 'Apply file changes'}
               </Button>
             </div>
@@ -305,7 +329,7 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
                   <Field label={field.label} hint={error ?? field.hint} tone={error === null ? 'default' : 'bad'}>
                     <TextInput
                       type="number"
-                      inputMode="decimal"
+                      inputMode={field.integer ? 'numeric' : 'decimal'}
                       min={field.minimum}
                       max={field.maximum}
                       step={field.integer ? 1 : 'any'}
@@ -348,20 +372,20 @@ export function AdvancedPanel({ onGuardChanged }: { readonly onGuardChanged: (gu
 
       <PanelFooter notice={notice}>
         {conflict ? (
-          <div className="flex w-full flex-wrap items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn">
-            <span className="min-w-0 flex-1 basis-48">The configuration file changed since it was loaded. Your edits are kept.</span>
+          <div role="alert" className="flex w-full flex-wrap items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn">
+            <span className="min-w-0 flex-1 basis-48">The host or the configuration file changed since this was loaded. Your edits are kept.</span>
             <Button size="sm" disabled={busy !== null} onClick={() => void refresh()}>{busy === 'refresh' ? 'Refreshing…' : 'Refresh and keep edits'}</Button>
           </div>
         ) : null}
         {remote.length > 0 ? (
-          <div className="flex w-full flex-wrap items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn">
+          <div role="status" className="flex w-full flex-wrap items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn">
             <span className="min-w-0 flex-1 basis-48">Also changed in the file: {remoteLabels.join(', ')}. Review the new saved values, then keep your edits to replace them when you save.</span>
-            <Button size="sm" onClick={() => setRemote([])}>Keep my edits</Button>
+            <Button id={ids.keep} size="sm" onClick={() => { setRemote([]); setFocusTarget('save') }}>Keep my edits</Button>
           </div>
         ) : null}
         <span className="ml-auto flex items-center gap-2">
           <Button variant="ghost" size="sm" disabled={!dirty || busy !== null} onClick={discard}>Discard edits</Button>
-          <Button variant="primary" size="sm" disabled={saveBlocker !== null || busy !== null} title={saveBlocker ?? undefined} onClick={() => void save()}>
+          <Button id={ids.save} variant="primary" size="sm" disabled={saveBlocker !== null || busy !== null} title={saveBlocker ?? undefined} onClick={() => void save()}>
             {busy === 'save' ? 'Saving…' : 'Save changes'}
           </Button>
         </span>

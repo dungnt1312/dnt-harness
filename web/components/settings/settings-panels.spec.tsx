@@ -714,6 +714,17 @@ describe('settings dialog leave guard', () => {
     expect(heading()).toBe('Providers')
   })
 
+  it('forgets the advanced guard once its panel unmounts after a confirmed discard', async () => {
+    await openDirtyAdvanced()
+    await act(async () => pressTab('Projects'))
+    await act(async () => button('Discard changes').click())
+    expect(heading()).toBe('Projects')
+    // The discarded panel never published a clean guard before unmounting.
+    await act(async () => button('Close settings').click())
+    expect(confirmTitle()).toBeUndefined()
+    expect(onDismiss).toHaveBeenCalledTimes(1)
+  })
+
   it('blocks leaving while an advanced save is in flight', async () => {
     let finish!: (value: AppConfigView) => void
     vi.mocked(patchAppConfig).mockReturnValueOnce(new Promise((resolve) => { finish = resolve }))
