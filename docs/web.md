@@ -395,6 +395,41 @@ request. Each `assistant/message` records the pair that actually served it
 in its `controls`, so the log answers "what did this reply come from".
 
 
+### Global limits: `GET/PATCH /api/app-config`, `POST /api/app-config/reload`
+
+These routes manage the per-data-home `<data-dir>/app-config.json`
+(`appConfigFile` overrides the path). It is separate from the provider
+`configFile`. For layers, locks, and when each limit takes effect, see
+[harness.md](harness.md#global-limits-configuration-config). The web bin layers
+`WEB_LIMIT_DEFAULTS` (automatic compaction pressure 0.85) under the file and
+passes no explicit `limits`, so no field is locked there. Only embedders
+passing `limits` create locks. When control-plane auth is on, the routes are
+admin-only: they need a browser session with the CSRF header and canonical
+Origin, or an admin bearer. Other bearer scopes get `403`.
+
+- `GET` returns the editor view: `document` and `hash` (both `null`, plus
+  `error`, while the file is invalid), the active `{ revision, values }`,
+  `inherited` (library plus host values), `fields` (metadata with `source`,
+  `locked`, `fileValue`, `shadowed`), and `outOfSync` (the disk differs from
+  what is active). Reading never activates anything.
+- `PATCH { expectedHash, edits: [{ op: "set", key, value } | { op: "unset", key }] }`
+  validates the whole batch (non-empty, one edit per key), writes the file
+  atomically, publishes it, and returns the new view. `unset` is the reset: the
+  field inherits the current defaults.
+- `POST /reload` (body `{}`) re-reads a hand-edited file and publishes it. The
+  host has no file watcher.
+
+Errors are `{ error, code, key? }`: `400 invalid` (bad shape, key, or value, or
+an invalid file on disk), `409 conflict` (stale `expectedHash`), `409 locked`
+(an explicit override owns the field), `500 io`, `405 method`. A failed reload
+keeps the last good snapshot. An invalid file at startup stops the host from
+booting (see harness.md for recovery). Running operations keep the policy they
+captured; the next operation in every workspace uses the new snapshot.
+
+Settings → **Advanced** is the client: it sends only changed fields, resets
+with `unset`, keeps your edits across a conflict refresh, maps **Apply file
+changes** to reload, and asks before discarding unsaved edits.
+
 ### Legacy: `GET /api/sessions`
 
 List sessions: `[{ id, title, eventCount, folder }]`. `folder` is the
@@ -783,7 +818,7 @@ graceful close and a second to an immediate exit.
 | `components/chat` | `Transcript`, message/tool/delegation rows, thinking, work status, approvals |
 | `components/composer` | `Composer` with attach/mode/thinking/permission chips, `ModelMenu` beside Send, `@`/`/` completion popover, attachment tray, folder picker |
 | `components/workbench` | Files browser/viewer, Git (read-only status and diff), Trajectory (`projectTrajectory`, step slots), Subagents, and the lazily-loaded xterm `TerminalPanel` |
-| `components/settings` | Settings dialog and provider editor; one module per workspace panel (Projects, Skills, Memory, Agents, MCP, Hooks, Secrets) built on the shared `settings-kit` |
+| `components/settings` | Settings dialog and provider editor; one module per workspace panel (Projects, Skills, Memory, Agents, MCP, Hooks, Secrets) built on the shared `settings-kit`, plus the global Advanced limits panel |
 | `components/ui` | Tailwind/CVA primitives with Radix interaction mechanics |
 | `components/common` | icons, copy, confirmation, error, spinner, and toast surfaces |
 | `hooks/` | SSE subscription, theme, media queries, transcript follow, focus restore, preferences |

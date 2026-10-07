@@ -4,6 +4,7 @@
  * operation at its own boundary — uploads, admissions, joins, compaction and
  * context assembly — without replacing any service.
  */
+import { execFileSync } from 'node:child_process'
 import { promises as fs } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -11,8 +12,8 @@ import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createWebServer, WEB_LIMIT_DEFAULTS, type LlmProvider, type WebServer, type WebServerOptions } from 'dnt-harness'
 import { ChildExecutor } from '../../src/harness/agents/executor.ts'
-import type { HarnessLimits } from '../../src/harness/limits.ts'
-import type { LimitKey } from '../../src/harness/limits-config.ts'
+import { DEFAULT_LIMITS, type HarnessLimits } from '../../src/harness/limits.ts'
+import { LIMIT_FIELDS, type LimitKey } from '../../src/harness/limits-config.ts'
 import type { ModelRequest, StreamEvent } from '../../src/harness/llm/types.ts'
 
 const servers: WebServer[] = []
@@ -432,4 +433,107 @@ describe('compaction and context assembly', () => {
     // Pressure 0 scheduled no further compaction.
     expect(await checkpoints()).toHaveLength(2)
   }, 40_000)
+})
+
+describe('whole-slice publication', () => {
+  it('an HTTP edit reaches the next operation in every workspace while a running one keeps its policy', async () => {
+    if (process.platform === 'win32') return
+    const home = await tempDir()
+    const providerFile = path.join(home, 'providers.json')
+    const providerBytes = '{"providers":[]}\n'
+    await fs.writeFile(providerFile, providerBytes)
+    await fs.writeFile(path.join(home, 'app-config.json'), JSON.stringify({ v: 1, limits: { toolOutputLimit: 60 } }))
+    // Each workspace's project is its Bash root; operation A blocks on a FIFO
+    // until the test opens it for writing, after the edit was published.
+    const projectA = await tempDir('dnt-harness-app-config-project-a-')
+    const projectB = await tempDir('dnt-harness-app-config-project-b-')
+    const fifo = path.join(projectA, 'gate')
+    execFileSync('mkfifo', [fifo])
+    const commands: Record<string, string> = {
+      'run-A': "touch started && cat gate >/dev/null && head -c 100 /dev/zero | tr '\\0' a",
+      'run-B': "head -c 100 /dev/zero | tr '\\0' b",
+      'run-C': "head -c 100 /dev/zero | tr '\\0' c",
+    }
+    const results = new Map<string, string>()
+    const provider: LlmProvider = {
+      name: 'scripted',
+      models: ['scripted'],
+      async *stream(request) {
+        const last = request.messages.at(-1)
+        const text = textOf(last)
+        const key = Object.keys(commands).find((name) => text.includes(name))
+        if (last?.role === 'user' && key !== undefined) {
+          yield { type: 'toolCalls', calls: [{ id: `call-${key}`, name: 'Bash', args: { command: commands[key] } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+          return
+        }
+        if (last?.role === 'tool') {
+          const letter = /([abc])\1{4,}/.exec(text)?.[1]
+          if (letter !== undefined) results.set(letter, text)
+        }
+        yield { type: 'delta', delta: 'done' }
+        yield done
+      },
+    }
+    const server = await start({ home, providers: [provider], configFile: providerFile })
+    const ctx = server.kernel.ctx
+    const identities = [ctx.agents, ctx.tools, ctx.sessions, ctx.get('processes'), ctx.get('limits'), ctx.get('limits-reader')]
+    const first = await defaultWorkspace(server)
+    const second = ((await (await post(`${server.url}/api/workspaces`, { name: 'Second' })).json()) as { id: string }).id
+    const sessionIn = async (wsId: string, projectDir: string): Promise<string> => {
+      expect((await fetch(`${server.url}/api/workspaces/${wsId}/mode`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: 'full-access' }),
+      })).status).toBe(200)
+      const project = (await (await post(`${server.url}/api/workspaces/${wsId}/projects`, { path: projectDir })).json()) as { id: string }
+      return ((await (await post(`${server.url}/api/workspaces/${wsId}/sessions`, { projectId: project.id })).json()) as { id: string }).id
+    }
+    const sessionA = await sessionIn(first, projectA)
+    const sessionB = await sessionIn(second, projectB)
+    expect(server.appConfig.read()).toMatchObject({ revision: 0, values: { toolOutputLimit: 60 } })
+
+    // Operation A dispatches under revision 0 and parks inside its command.
+    expect((await post(`${server.url}/api/workspaces/${first}/sessions/${sessionA}/messages`, { content: 'run-A' })).status).toBe(202)
+    await until(async () => (await fs.stat(path.join(projectA, 'started')).catch(() => undefined)) !== undefined ? true : undefined)
+
+    // Revision 1 is published through the authenticated HTTP edit route.
+    const described = (await (await fetch(`${server.url}/api/app-config`)).json()) as { hash: string }
+    const patched = await fetch(`${server.url}/api/app-config`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedHash: described.hash, edits: [{ op: 'set', key: 'toolOutputLimit', value: 10 }] }),
+    })
+    expect(patched.status).toBe(200)
+    expect(((await patched.json()) as { active: { revision: number } }).active.revision).toBe(1)
+    const revisionB = server.appConfig.read()
+    expect(revisionB).toMatchObject({ revision: 1, values: { toolOutputLimit: 10 } })
+
+    // Operation B in the other workspace runs to completion under revision 1
+    // while A is still held.
+    await completedTurn(server, home, second, sessionB, { content: 'run-B' })
+    expect(results.has('a')).toBe(false)
+    expect(results.get('b')).toContain(`${'b'.repeat(10)}\n… [truncated 90 chars]`)
+    expect(results.get('b')).not.toContain('b'.repeat(11))
+
+    // Releasing A: its output is shaped by the policy it captured at dispatch.
+    await fs.writeFile(fifo, 'go')
+    await until(async () => results.has('a') ? true : undefined)
+    expect(results.get('a')).toContain(`${'a'.repeat(60)}\n… [truncated 40 chars]`)
+    expect(results.get('a')).not.toContain('a'.repeat(61))
+    await idle(server, first, sessionA)
+
+    // The next operation in A's workspace reads the same active snapshot as B's.
+    expect(server.appConfig.read()).toBe(revisionB)
+    await completedTurn(server, home, first, sessionA, { content: 'run-C' })
+    expect(results.get('c')).toContain(`${'c'.repeat(10)}\n… [truncated 90 chars]`)
+
+    // No service was replaced; the legacy reader keeps its startup value.
+    const after = [ctx.agents, ctx.tools, ctx.sessions, ctx.get('processes'), ctx.get('limits'), ctx.get('limits-reader')]
+    identities.forEach((service, index) => expect(after[index]).toBe(service))
+    expect((ctx.get('limits') as HarnessLimits).toolOutputLimit).toBe(60)
+    // The slice adds no subagent-count limit, and never touches the provider file.
+    expect(LIMIT_FIELDS.map((field) => field.key).filter((key) => /subagent/i.test(key))).toEqual(['subagentBackgroundBashMaxMs'])
+    expect(Object.keys(DEFAULT_LIMITS).filter((key) => /max.*(subagent|agent|child)/i.test(key))).toEqual([])
+    expect(await fs.readFile(providerFile, 'utf8')).toBe(providerBytes)
+    expect(JSON.parse(await fs.readFile(path.join(home, 'app-config.json'), 'utf8'))).toEqual({ v: 1, limits: { toolOutputLimit: 10 } })
+  }, 30_000)
 })

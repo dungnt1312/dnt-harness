@@ -22,6 +22,7 @@ src/harness/
 ├── agents/    Definitions, bounded one-level delegation, Claude/Codex adapters
 ├── mcp/       MCP client (stdio + Streamable HTTP), config/secrets, health/retry/breaker
 ├── hooks/     Command hook runner behind the tool-gate waterfalls
+├── config/    Global app-config file: layered limits, revisioned snapshots, edit/reload
 └── limits.ts  Centralized bounded-execution defaults
 ```
 
@@ -548,6 +549,62 @@ default 4; 0 disables covered duplication, not uncovered history), plus composer
 (model-visible cap for inlined text attachments; images travel as `ContentPart`
 image parts with a flat `IMAGE_TOKEN_ESTIMATE` so multi-image turns do not
 silently under-count).
+
+### Global limits configuration (`config/`)
+
+All 18 limits can be changed without a restart. Their keys, units, and
+accepted ranges are listed in [`limits-config.ts`](../src/harness/limits-config.ts)
+(`LIMIT_FIELDS`). Values stay in their native units (ms, bytes, chars, count,
+ratio); nothing converts them.
+
+- **File.** One sparse document per data home: `<data-dir>/app-config.json`
+  (`APP_CONFIG_FILE`; a memory-mode web host uses its temp home), shaped
+  `{ "v": 1, "limits": { "toolOutputLimit": 20000 } }`. A key missing from the
+  file means "inherit". This is not the provider `configFile`.
+- **Layers**, lowest to highest: library `DEFAULT_LIMITS`, then the host
+  profile (`limitDefaults`), then the file, then explicit `limits` options. An
+  explicit value locks its field, so an edit to that field fails with `locked`.
+  The web bin's profile is `WEB_LIMIT_DEFAULTS` (automatic compaction at 0.85).
+  That is a web-host default only: the library and the headless bin keep 0
+  (disabled). Unsetting a field (reset) inherits whatever the lower layers
+  currently say. It never pins today's number.
+- **Snapshots.** [`AppConfigService`](../src/harness/config/service.ts) publishes
+  frozen `{ revision, values }` snapshots through `ctx.get('limits-reader')`.
+  The revision starts at 0 at boot and advances only when an effective value
+  changes. Boot, edit (hash-checked set/unset, then an atomic write), and
+  reload share one serialized path. `describe()` reads the disk without
+  activating anything.
+- **When a change applies.** Each operation captures the snapshot once, at its
+  own boundary, and keeps it until it finishes. Nothing running is
+  interrupted:
+
+  | Limits | Captured |
+  |---|---|
+  | `streamFirstEventMs`, `streamIdleMs`, `logicalRequestMs`, `stepRetries`, `stepRetryBaseMs` | per logical model request, retries included |
+  | `toolOutputLimit`, `toolTimeoutMs`, `bashMaxWaitMs`, `subagentBackgroundBashMaxMs` | per tool call, after approval and just before dispatch (the Bash schema advertises the current budget at each request) |
+  | `approvalExpiryMs`, `questionExpiryMs` | when the approval or question is created |
+  | `delegationJoinMs` | when each join starts |
+  | `automaticCompactionPressure` | at each settled-turn decision; a compaction already running is not cancelled |
+  | `compactionTailTurns`, `attachmentTextLimit` | at each context assembly; a compaction captures attachment text when it starts |
+  | `maxAttachmentBytes` | before an upload body is read |
+  | `maxAttachmentsPerMessage`, `maxPendingInputs` | when a message is validated or durably queued; inputs already accepted stay |
+
+- **Reload, never watch.** There is no file watcher and no code HMR. A
+  hand-edited file takes effect only on an explicit reload (the web API, or
+  **Apply file changes** in the UI) or on a restart. The headless bin reads the
+  file once, at startup.
+- **Invalid file.** Malformed JSON, a version other than `v: 1`, unknown
+  sections or keys, and out-of-range values all count as invalid. Hosts do not
+  repair or overwrite an invalid file. At boot, both bins refuse to start and
+  print the error, and nothing is acquired: no data-home lock, no temp home.
+  To recover, fix the file, or rename it aside to keep its contents (defaults
+  then apply), and restart. At runtime, an invalid file makes edit and reload
+  fail with `invalid`, and the last good snapshot stays active.
+- **Legacy reader.** `ctx.get('limits')` remains the static startup value for
+  existing consumers. Code that should follow live edits calls
+  `readLimits(ctx)` ([`limits-reader.ts`](../src/harness/config/limits-reader.ts))
+  at its boundary. It falls back to that static value on hosts without a
+  reader.
 
 ## Mode-driven context assembly
 

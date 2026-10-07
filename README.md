@@ -61,6 +61,13 @@ Optional: `DEEPSEEK_BASE_URL` (defaults to the public API). Never commit the key
 echo 'DEEPSEEK_API_KEY=sk-...' > .env
 ```
 
+Runtime limits (timeouts, output caps, queue and attachment bounds, compaction
+pressure) live in `<data-dir>/app-config.json`. Both bins read it, and the web
+host edits it live under Settings → **Advanced** (`/api/app-config`). A
+hand-edited file applies on **Apply file changes** or on restart. An invalid
+file stops the host from starting until you fix it or rename it aside. See
+[the harness docs](docs/harness.md#global-limits-configuration-config).
+
 ### Renamed from mini-dsh
 
 The project was called **mini-dsh**. Existing installs keep working without changes:

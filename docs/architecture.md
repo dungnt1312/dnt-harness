@@ -85,6 +85,7 @@ concept, and the web host is the composition that wires them together:
 | `agents/` | Agent definitions, bounded one-level delegation, and the Claude-first/Codex compatibility adapters |
 | `mcp/` | The workspace-scoped MCP client (stdio + Streamable HTTP), config/secrets stores, health/retry/circuit breaker |
 | `hooks/` | The command hook runner behind the tool-gate waterfalls |
+| `config/` | The global `app-config.json` per data home. It layers library, host, file, and explicit limits into revisioned snapshots that each operation captures at its own boundary, with no service restart ([harness.md](harness.md#global-limits-configuration-config)) |
 
 Every isolation guarantee in these subsystems is **application-level**:
 workspace ownership, filesystem containment (including granted extra
