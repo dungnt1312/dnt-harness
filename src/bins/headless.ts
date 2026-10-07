@@ -18,6 +18,7 @@
  *   tsx src/bins/headless.ts            # interactive REPL, 'exit' quits
  */
 import { createInterface } from 'node:readline/promises'
+import { inspect } from 'node:util'
 import path from 'node:path'
 import { loadRepoEnv, readApiKey, resolveAppHome } from './env.ts'
 import {
@@ -310,6 +311,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((error: unknown) => {
-  process.stderr.write(`dnt-harness: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`)
+  // inspect prints AggregateError members too, so a cleanup failure never hides the original.
+  process.stderr.write(`dnt-harness: ${inspect(error, { depth: 4 })}\n`)
   process.exitCode = 1
 })
