@@ -7,7 +7,7 @@
 import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { ExecutionId, SessionId, WorkspaceId } from '../../src/util/brand.ts'
 import type { ApprovalScope } from '../../src/harness/approval/policy.ts'
 import {
@@ -540,6 +540,54 @@ describe('approval lifecycle', () => {
     // deadline comes from the policy's own timer, not a second estimate.
     expect(deadline).toBeGreaterThanOrEqual(before + 60_000)
     void kernel.stop()
+  })
+
+  it('a changed approval expiry applies only to questions asked after it', async () => {
+    vi.useFakeTimers()
+    const kernel = new Kernel()
+    kernel.ctx.plugin(ToolsService)
+    let ran = 0
+    kernel.ctx.tools.register({ ...echoTool, async execute() { ran += 1; return 'ran' } })
+    let expiry = 1_000
+    const deadlines: number[] = []
+    let created!: () => void
+    let barrier = new Promise<void>((resolve) => { created = resolve })
+    attachApproval(kernel.ctx, {
+      policy: { Echo: 'ask' },
+      expiryMs: 99_000,
+      expiryMsOf: () => expiry,
+      askUser: (_call, lifecycle) => {
+        deadlines.push(lifecycle.expiresAt)
+        created()
+        // Undecided: only expiry can settle these questions.
+        return new Promise<boolean>(() => {})
+      },
+    })
+    try {
+      const start = Date.now()
+      let settledA = false
+      let settledB = false
+      const resultA = kernel.ctx.tools.execute({ id: 'a', name: 'Echo', args: { message: 'a' } }).finally(() => { settledA = true })
+      await barrier
+      expiry = 5_000
+      barrier = new Promise<void>((resolve) => { created = resolve })
+      const resultB = kernel.ctx.tools.execute({ id: 'b', name: 'Echo', args: { message: 'b' } }).finally(() => { settledB = true })
+      await barrier
+      expect(deadlines).toEqual([start + 1_000, start + 5_000])
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(settledA).toBe(true)
+      expect(settledB).toBe(false)
+      expect(await resultA).toMatchObject({ ok: false, output: expect.stringMatching(/expired/) })
+
+      await vi.advanceTimersByTimeAsync(4_000)
+      expect(settledB).toBe(true)
+      expect(await resultB).toMatchObject({ ok: false, output: expect.stringMatching(/expired/) })
+      expect(ran).toBe(0)
+    } finally {
+      vi.useRealTimers()
+      await kernel.stop()
+    }
   })
 
   it('legacy lowercase permission keys normalize to canonical built-in tools', async () => {

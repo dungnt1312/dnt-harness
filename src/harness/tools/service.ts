@@ -9,6 +9,8 @@ import { toolExecutionScope } from './execution-scope.ts'
 import { agentScope } from '../agent/scope.ts'
 import { FileObservations } from '../../capabilities/fs/observation.ts'
 import { classifyGrantedRoots, samePath, within } from '../../capabilities/fs/grants.ts'
+import { readLimits } from '../config/limits-reader.ts'
+import type { LimitsSnapshot } from '../config/types.ts'
 import type { ApprovedPath, GrantedRoot, PreExecuteDecision, PreparedToolCall, ToolDefinition, ToolExecution, ToolResult } from './types.ts'
 
 declare module 'dnt-harness' {
@@ -368,23 +370,26 @@ export class ToolsService extends Service {
           return this.postExecute(preparedCall, exec, { ok: false, output: `denied: cancelled: stop requested before dispatch of '${preparedCall.name}'` })
         }
         let output: string
-        let runExec: ToolExecution
+        let runExec: ToolExecution | undefined
         try {
-          runExec = this.executionAtRun(exec, approvedPaths)
+          // The body's limits policy is captured exactly once, here: after
+          // every authority and approval wait, before dispatch. The result
+          // below is shaped under the same envelope, never a recapture.
+          runExec = this.executionAtRun(exec, approvedPaths, readLimits(this.ctx))
           output = await tool.execute(preparedCall.args, runExec)
         } catch (error) {
-          return this.postExecute(preparedCall, exec, { ok: false, output: `error: ${String(error)}` })
+          return this.postExecute(preparedCall, runExec ?? exec, { ok: false, output: `error: ${String(error)}` })
         }
         const staged = exec.executionId !== undefined ? takeMcpOutcome(exec.executionId) : undefined
         if (staged !== undefined) {
-          return this.postExecute(preparedCall, exec, {
+          return this.postExecute(preparedCall, runExec, {
             ok: staged.ok,
             output,
             outcome: staged.outcome,
             invocationId: staged.invocationId,
           })
         }
-        return this.postExecute(preparedCall, exec, { ok: true, output })
+        return this.postExecute(preparedCall, runExec, { ok: true, output })
       },
     }
   }
@@ -400,8 +405,10 @@ export class ToolsService extends Service {
    * be long; a revoked folder must stop authorizing), and the approved
    * out-of-grant paths for this call are attached. A changed primary root
    * fails the call instead of running somewhere the approver did not see.
+   * The limits policy captured for this run replaces the preparation-time
+   * output cap and child background maximum.
    */
-  private executionAtRun(exec: ToolExecution, approvedPaths: readonly ApprovedPath[] | undefined): ToolExecution {
+  private executionAtRun(exec: ToolExecution, approvedPaths: readonly ApprovedPath[] | undefined, limits: LimitsSnapshot): ToolExecution {
     const { additionalRoots: _before, memoryRoots: _memoryBefore, hostStorageRoot: _storageBefore, approvedPaths: _unused, ...base } = exec
     let additionalRoots = exec.additionalRoots
     let memoryRoots = exec.memoryRoots
@@ -418,6 +425,9 @@ export class ToolsService extends Service {
     }
     return freezeExecution({
       ...base,
+      outputLimit: limits.values.toolOutputLimit,
+      ...(exec.subagentBackgroundBashMaxMs !== undefined ? { subagentBackgroundBashMaxMs: limits.values.subagentBackgroundBashMaxMs } : {}),
+      limitsSnapshot: limits,
       ...(additionalRoots !== undefined && additionalRoots.length > 0 ? { additionalRoots } : {}),
       ...(memoryRoots !== undefined && memoryRoots.length > 0 ? { memoryRoots } : {}),
       ...(hostStorageRoot !== undefined ? { hostStorageRoot } : {}),
@@ -432,11 +442,13 @@ export class ToolsService extends Service {
    */
   private buildExecution(call: ToolCall, signal: AbortSignal | undefined, executionId?: ExecutionId): ToolExecution {
     const grant = this.rootResolver?.()
-    const limits = this.ctx.get('limits') as { toolOutputLimit?: number; subagentBackgroundBashMaxMs?: number } | undefined
+    // Preparation envelope only (denials before dispatch); the body gets its
+    // own policy captured at run time and no snapshot is pinned here.
+    const limits = readLimits(this.ctx).values
     const scope = agentScope.getStore()
     return freezeExecution({
       ...(scope?.turnId !== undefined ? { turnId: scope.turnId } : {}),
-      ...(scope?.childOf !== undefined ? { subagentBackgroundBashMaxMs: limits?.subagentBackgroundBashMaxMs ?? 3_600_000 } : {}),
+      ...(scope?.childOf !== undefined ? { subagentBackgroundBashMaxMs: limits.subagentBackgroundBashMaxMs } : {}),
       root: grant?.root ?? '',
       ...(scope?.sessionId !== undefined ? { sessionId: scope.sessionId, observations: this.fileObservations } : {}),
       ...(scope?.rootSessionId !== undefined ? { rootSessionId: scope.rootSessionId } : {}),
@@ -447,7 +459,7 @@ export class ToolsService extends Service {
       ...(grant?.memoryRoots !== undefined ? { memoryRoots: grant.memoryRoots } : {}),
       ...(grant?.hostStorageRoot !== undefined ? { hostStorageRoot: grant.hostStorageRoot } : {}),
       ...(signal !== undefined ? { signal } : {}),
-      ...(limits?.toolOutputLimit !== undefined ? { outputLimit: limits.toolOutputLimit } : {}),
+      outputLimit: limits.toolOutputLimit,
       ...(executionId !== undefined ? { executionId } : {}),
       ...(call.id !== '' ? { toolCallId: call.id } : {}),
     })

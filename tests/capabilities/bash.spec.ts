@@ -8,7 +8,7 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { bashTool, fsTools, Kernel, ToolsService, type ToolExecution } from 'dnt-harness'
+import { bashTool, DEFAULT_LIMITS, fsTools, Kernel, ToolsService, type LimitsSnapshot, type ToolExecution } from 'dnt-harness'
 import { sweepByTag, TREE_TAG_ENV } from '../../src/capabilities/shell/bash.ts'
 import { detectShell, shellCatalog } from '../../src/capabilities/shell/detect.ts'
 
@@ -193,4 +193,45 @@ describe('bash tool', () => {
     expect(output.length).toBeLessThan(4_000)
     expect(output).toMatch(/truncated/)
   }, 20_000)
+
+  it('schema and execution read the current limits', async () => {
+    let snapshot: LimitsSnapshot = Object.freeze({ revision: 0, values: DEFAULT_LIMITS })
+    const tool = bashTool({ limits: { read: () => snapshot }, timeoutMs: 5_000 })
+    const waitDescription = (): string => (tool.schema?.()?.parameters.properties['timeoutMs'] as { description: string }).description
+    expect(waitDescription()).toContain('default 120000, max 600000')
+
+    snapshot = Object.freeze({ revision: 1, values: Object.freeze({ ...DEFAULT_LIMITS, toolTimeoutMs: 100, bashMaxWaitMs: 200 }) })
+    expect(waitDescription()).toContain('default 100, max 200')
+
+    // The clamp is taken once at start: a later publication does not re-time it.
+    let started = Date.now()
+    const running = tool.execute({ command: 'sleep 5; echo never' }, exec)
+    snapshot = Object.freeze({ revision: 2, values: Object.freeze({ ...DEFAULT_LIMITS, toolTimeoutMs: 60_000, bashMaxWaitMs: 60_000 }) })
+    let output = await running
+    expect(output).toContain('[terminated by timeout; killed]')
+    expect(Date.now() - started).toBeLessThan(3_000)
+
+    // An explicit argument above the current maximum clamps to it.
+    snapshot = Object.freeze({ revision: 3, values: Object.freeze({ ...DEFAULT_LIMITS, toolTimeoutMs: 100, bashMaxWaitMs: 200 }) })
+    started = Date.now()
+    output = await tool.execute({ command: 'sleep 5; echo never', timeoutMs: 60_000 }, exec)
+    expect(output).toContain('[terminated by timeout; killed]')
+    expect(Date.now() - started).toBeLessThan(3_000)
+
+    // A trusted execution snapshot outranks the reader.
+    snapshot = Object.freeze({ revision: 4, values: DEFAULT_LIMITS })
+    started = Date.now()
+    output = await tool.execute({ command: 'sleep 5; echo never' }, { ...exec, limitsSnapshot: Object.freeze({ revision: 5, values: Object.freeze({ ...DEFAULT_LIMITS, toolTimeoutMs: 100 }) }) })
+    expect(output).toContain('[terminated by timeout; killed]')
+    expect(Date.now() - started).toBeLessThan(3_000)
+  }, 20_000)
+
+  it('static callers keep their configured wait budget and schema', async () => {
+    const tool = bashTool({ timeoutMs: 2_000 })
+    const description = (tool.parameters.properties['timeoutMs'] as { description: string }).description
+    expect(description).toContain('default 2000, max 600000')
+    expect(tool.schema?.() ?? { description: tool.description, parameters: tool.parameters }).toEqual({ description: tool.description, parameters: tool.parameters })
+    const output = await bashTool({ timeoutMs: 100 }).execute({ command: 'sleep 5; echo never' }, exec)
+    expect(output).toContain('[terminated by timeout; killed]')
+  }, 10_000)
 })

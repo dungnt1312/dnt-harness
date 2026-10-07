@@ -19,6 +19,8 @@ import { timerBudget } from '../../harness/processes/shutdown.ts'
 import { detectShell } from './detect.ts'
 import { scrubbedChildEnv } from '../../harness/child-env.ts'
 import type { ProcessRegistry } from '../../harness/processes/registry.ts'
+import type { LimitsReader } from '../../harness/config/types.ts'
+import type { HarnessLimits } from '../../harness/limits.ts'
 import type { ToolDefinition, ToolExecution } from '../../harness/tools/types.ts'
 
 const OUTPUT_CAP = 60_000
@@ -39,6 +41,25 @@ export interface BashToolOptions {
   readonly executable?: string
   /** Background-mode owner: registers run_in_background children. */
   readonly processes?: ProcessRegistry
+  /**
+   * Live limits source. When present, the advertised schema and each
+   * execution's wait budget follow its current `toolTimeoutMs`/`bashMaxWaitMs`
+   * instead of the static `timeoutMs`/`maxWaitMs` above. A pipeline-stamped
+   * `ToolExecution.limitsSnapshot` still outranks it.
+   */
+  readonly limits?: LimitsReader
+}
+
+interface WaitBudget { readonly timeoutMs: number; readonly maxWaitMs: number }
+
+/** The foreground default and its ceiling, clamped like the static options. */
+function waitBudget(timeoutMs: number | undefined, maxWaitMs: number | undefined): WaitBudget {
+  const max = timerBudget(maxWaitMs, 600_000)
+  return { timeoutMs: Math.min(timerBudget(timeoutMs, 120_000), max), maxWaitMs: max }
+}
+
+function budgetOf(values: Readonly<HarnessLimits>): WaitBudget {
+  return waitBudget(values.toolTimeoutMs, values.bashMaxWaitMs)
 }
 
 /** Environment marker every process of one Bash call inherits (Windows only). */
@@ -120,27 +141,34 @@ function isBareSleep(command: string): boolean {
 
 /** The `Bash` tool: one command, captured output, timeout and stop handling. */
 export function bashTool(options: BashToolOptions = {}): ToolDefinition {
-  const maxWaitMs = timerBudget(options.maxWaitMs, 600_000)
-  const timeoutMs = Math.min(timerBudget(options.timeoutMs, 120_000), maxWaitMs)
+  const staticBudget = waitBudget(options.timeoutMs, options.maxWaitMs)
+  const currentBudget = (): WaitBudget => options.limits !== undefined ? budgetOf(options.limits.read().values) : staticBudget
   // Used only for direct compatibility calls without a granted root. Pipeline
   // executions must derive their working directory from `exec.root`.
   const configuredCwd = options.cwd
   const fallbackCwd = typeof configuredCwd === 'function' ? configuredCwd : () => configuredCwd ?? process.cwd()
   const detection = detectShell(options.executable)
+  const description = 'Run Bash once; return output and exit code if completed, or a running process ID after the foreground wait. Watch that ID with BashOutput; do not rerun a still-running command.'
+  // The advertised wait bounds must agree with the clamp execute applies.
+  const parameters = ({ timeoutMs, maxWaitMs }: WaitBudget): ToolDefinition['parameters'] => ({
+    type: 'object',
+    properties: {
+      command: { type: 'string', description: 'the bash command line to run' },
+      timeoutMs: { type: 'number', description: `foreground wait budget in milliseconds (default ${timeoutMs}, max ${maxWaitMs}; eligible commands keep running in background after this wait)` },
+      run_in_background: { type: 'boolean', description: 'run the command in the background and return a process id immediately; read output with BashOutput, kill with KillShell. timeoutMs is ignored in background mode' },
+    },
+    required: ['command'],
+  })
   return {
     name: 'Bash',
-    description: 'Run Bash once; return output and exit code if completed, or a running process ID after the foreground wait. Watch that ID with BashOutput; do not rerun a still-running command.',
+    description,
     requiresRoot: true,
-    parameters: {
-      type: 'object',
-      properties: {
-        command: { type: 'string', description: 'the bash command line to run' },
-        timeoutMs: { type: 'number', description: `foreground wait budget in milliseconds (default ${timeoutMs}, max ${maxWaitMs}; eligible commands keep running in background after this wait)` },
-        run_in_background: { type: 'boolean', description: 'run the command in the background and return a process id immediately; read output with BashOutput, kill with KillShell. timeoutMs is ignored in background mode' },
-      },
-      required: ['command'],
-    },
+    parameters: parameters(staticBudget),
+    ...(options.limits !== undefined ? { schema: () => ({ description, parameters: parameters(currentBudget()) }) } : {}),
     async execute(args, exec: ToolExecution) {
+      // One wait policy per execution, taken before any await: the trusted
+      // pipeline snapshot, else the live reader, else the static options.
+      const { timeoutMs, maxWaitMs } = exec.limitsSnapshot !== undefined ? budgetOf(exec.limitsSnapshot.values) : currentBudget()
       const command = args['command']
       if (typeof command !== 'string' || command === '') {
         throw new Error("argument 'command' must be a non-empty string")

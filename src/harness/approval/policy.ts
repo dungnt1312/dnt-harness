@@ -83,6 +83,12 @@ export interface ApprovalOptions {
   /** Undecided approvals expire after this long; defaults to the harness limit. */
   readonly expiryMs?: number
   /**
+   * Live expiry source, read once when each approval is created; a pending
+   * approval keeps its deadline when the value changes. Falls back to
+   * `expiryMs`.
+   */
+  readonly expiryMsOf?: () => number
+  /**
    * Hard interaction annotation: true forces ask even if policy exact/wildcard
    * says allow. `scope` is the call's own session/workspace — at first
    * evaluation the executing scope, on re-evaluation the pending entry's
@@ -361,6 +367,7 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
     const record = recorder(callScope)
     // Unguessable capability id: the answer route is transport-global.
     const approvalId = `approval-${randomUUID()}`
+    const expiresIn = options.expiryMsOf?.() ?? expiryMs
     if (record !== undefined) {
       record.session.append({
         ...(options.requestDetails?.(call, callScope) ?? {}),
@@ -398,10 +405,10 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
         resolve,
       }
       pending.set(approvalId, pendingEntry)
-      const expiresAt = Date.now() + expiryMs
+      const expiresAt = Date.now() + expiresIn
       const timer = setTimeout(() => {
         void settle(pendingEntry, 'expired', `approval for '${call.name}' expired undecided`)
-      }, expiryMs)
+      }, expiresIn)
       timer.unref?.()
       const onAbort = (): void => {
         void settle(pendingEntry, 'cancelled', `cancelled: stop requested while awaiting approval for '${call.name}'`)

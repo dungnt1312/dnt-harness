@@ -1,6 +1,7 @@
 import type { ExecutionId, SessionId } from '../../util/brand.ts'
 import type { ToolCall, ToolSchema } from '../llm/types.ts'
 import type { FileObservations } from '../../capabilities/fs/observation.ts'
+import type { LimitsSnapshot } from '../config/types.ts'
 
 /**
  * Structured MCP tool outcome. Non-MCP tools omit it.
@@ -75,6 +76,13 @@ export interface ToolExecution {
   readonly outputLimit?: number
   readonly turnId?: string
   readonly subagentBackgroundBashMaxMs?: number
+  /**
+   * The frozen limits policy captured by the pipeline immediately before the
+   * tool body starts; `outputLimit` and `subagentBackgroundBashMaxMs` above
+   * come from it. Absent while a call is still being prepared and for direct
+   * callers. Host-stamped only — never derived from model arguments.
+   */
+  readonly limitsSnapshot?: LimitsSnapshot
   readonly sessionId?: SessionId
   /** Explicit host authority scope; absent for compatible standalone callers. */
   readonly rootSessionId?: SessionId
