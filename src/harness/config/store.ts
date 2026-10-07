@@ -119,7 +119,12 @@ export class AppConfigStore {
     for (const key of Object.keys(document)) {
       if (key !== 'v' && key !== 'limits') throw new AppConfigError('invalid', `unknown app-config section: ${key}`)
     }
-    const limits = document.limits === undefined ? undefined : parseLimitOverrides(document.limits)
+    let limits: Partial<Record<string, number>> | undefined
+    try {
+      limits = document.limits === undefined ? undefined : parseLimitOverrides(document.limits)
+    } catch (error) {
+      throw new AppConfigError('invalid', error instanceof Error ? error.message : String(error))
+    }
     const clean: { v: 1; limits?: Partial<Record<string, number>> } = { v: 1 }
     if (limits !== undefined) clean.limits = limits
     const canonical = clean as AppConfigDocument

@@ -47,7 +47,7 @@ describe('AppConfigStore', () => {
     expect(read.hash).toBe(EMPTY_HASH)
     // Reading must not create the file (or any temp artifact).
     await expect(access(file)).rejects.toMatchObject({ code: 'ENOENT' })
-    await expect(access(`${file}.tmp`)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(access(`${file}.tmp-1-aaaa`)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('sparse_save_roundtrips an exact sparse document across a restart', async () => {
@@ -112,6 +112,20 @@ describe('AppConfigStore', () => {
       // Original bytes preserved.
       expect(await readFile(file, 'utf8')).toBe(raw)
     }
+  })
+
+  it('save_rejects_non_finite_limit_as_invalid_not_bare_error', async () => {
+    const store = new AppConfigStore(file)
+    // NaN passes the structural AppConfigDocument type but not parseLimitOverrides.
+    const document = { v: 1, limits: { toolTimeoutMs: Number.NaN } } as AppConfigDocument
+    const error = await store.save(document, EMPTY_HASH).then(
+      () => { throw new Error('expected save to reject') },
+      (e: unknown) => e,
+    )
+    expect(error).toBeInstanceOf(AppConfigError)
+    expect((error as AppConfigError).code).toBe('invalid')
+    // Nothing was written: the file stays absent.
+    await expect(access(file)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('read_permission_error_is_io_not_missing', async () => {
