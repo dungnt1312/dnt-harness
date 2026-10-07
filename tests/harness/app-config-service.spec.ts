@@ -207,12 +207,13 @@ describe('AppConfigService', () => {
       [{ op: 'set', key: 'toolTimeoutMs', value: 5 }, { op: 'unset', key: 'toolTimeoutMs' }],
       [null],
       'not-an-array',
+      [],
     ]
     for (const edits of bad) {
       const error = await rejection(service.edit(edits as readonly LimitEdit[], EMPTY_HASH))
       expect(error.code).toBe('invalid')
     }
-    const hashError = await rejection(service.edit([], 42 as unknown as string))
+    const hashError = await rejection(service.edit([{ op: 'set', key: 'toolTimeoutMs', value: 5 }], 42 as unknown as string))
     expect(hashError.code).toBe('invalid')
     expect(io.writes).toBe(0)
     expect(io.content).toBeUndefined()
@@ -224,6 +225,26 @@ describe('AppConfigService', () => {
     await service.boot()
     const before = service.read()
     const error = await rejection(service.edit([{ op: 'set', key: 'toolTimeoutMs', value: 5 }], EMPTY_HASH))
+    expect(error.code).toBe('conflict')
+    expect(io.writes).toBe(0)
+    expect(service.read()).toBe(before)
+  })
+
+  it('edit refuses a document the caller never observed even if the file reverts before save', async () => {
+    const observed = { v: 1, limits: { streamIdleMs: 123 } } as const
+    const { io, service } = setup(observed)
+    await service.boot()
+    const before = service.read()
+    // The edit's read sees a concurrent manual change; by the store's
+    // re-read the file is back to what the caller observed.
+    const manual = JSON.stringify({ v: 1, limits: { streamIdleMs: 999 } })
+    const original = io.content
+    let reads = 0
+    io.onRead = () => {
+      reads++
+      io.content = reads === 1 ? manual : original
+    }
+    const error = await rejection(service.edit([{ op: 'set', key: 'toolTimeoutMs', value: 5 }], hashOf(observed)))
     expect(error.code).toBe('conflict')
     expect(io.writes).toBe(0)
     expect(service.read()).toBe(before)
@@ -246,8 +267,12 @@ describe('AppConfigService', () => {
     expect(removed.hash).toBe(EMPTY_HASH)
     expect(field(removed, 'automaticCompactionPressure').source).toBe('host')
     expect(service.read()).toBe(before)
-    // Empty batch on an unchanged file is a no-op too.
-    await service.edit([], EMPTY_HASH)
+    // An empty batch is refused rather than rewriting the operator's file.
+    const writes = io.writes
+    const empty = await rejection(service.edit([], EMPTY_HASH))
+    expect(empty.code).toBe('invalid')
+    expect(empty.message).toMatch(/must not be empty/)
+    expect(io.writes).toBe(writes)
     expect(service.read()).toBe(before)
     expect(published).toEqual([])
   })

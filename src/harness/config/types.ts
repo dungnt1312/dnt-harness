@@ -55,5 +55,10 @@ export interface AppConfigView {
   readonly document: AppConfigDocument | null; readonly hash: string | null
   readonly active: LimitsSnapshot; readonly inherited: Readonly<HarnessLimits>
   readonly fields: readonly (LimitField & { readonly source: LimitSource; readonly locked: boolean; readonly fileValue?: number; readonly shadowed: boolean })[]
-  readonly outOfSync: boolean; readonly error?: string
+  readonly outOfSync: boolean
+  /**
+   * Validation error of the current disk observation, so a failed reload of a
+   * still-bad file stays visible here; unreadable files reject `describe()`.
+   */
+  readonly error?: string
 }

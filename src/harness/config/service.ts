@@ -60,10 +60,12 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 /**
  * Strict runtime validation of an untrusted edit batch: every entry must be a
  * plain `{op,key[,value]}` with a known key, a valid value for `set`, and at
- * most one edit per key. Any failure rejects the whole batch.
+ * most one edit per key; an empty batch is refused. Any failure rejects the whole batch.
  */
 function validateEdits(edits: unknown): readonly LimitEdit[] {
   if (!Array.isArray(edits)) throw new AppConfigError('invalid', 'edits must be an array')
+  // The operator's file is only rewritten through explicit set/unset edits.
+  if (edits.length === 0) throw new AppConfigError('invalid', 'edits must not be empty')
   const seen = new Set<string>()
   for (const edit of edits as unknown[]) {
     if (!isPlainObject(edit)) throw new AppConfigError('invalid', 'each edit must be a plain object')
@@ -153,6 +155,11 @@ export class AppConfigService implements LimitsReader {
         }
       }
       const current = this.requireValid(await this.store.read())
+      // Only apply edits to the document the caller observed; the store
+      // re-checks the hash again inside its own save lock.
+      if (current.hash !== expectedHash) {
+        throw new AppConfigError('conflict', `app-config changed: stored hash ${current.hash} does not match expected ${expectedHash}`)
+      }
       const limits: Limits = { ...current.document.limits }
       for (const edit of batch) {
         if (edit.op === 'set') limits[edit.key] = edit.value
