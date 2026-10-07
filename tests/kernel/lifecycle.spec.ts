@@ -147,10 +147,14 @@ describe('kernel lifecycle stabilization (task 2)', () => {
   it('provide_after_unload_does_not_leak_service', async () => {
     const kernel = new Kernel()
     let captured: Context | undefined
+    let leakedCalls = 0
     const fiber = kernel.ctx.plugin({
       name: 'holder',
       apply: async (ctx: Context) => {
         captured = ctx
+        ctx.on('leak-event', () => {
+          leakedCalls++
+        })
         await new Promise(() => {})
       },
     })
@@ -164,11 +168,11 @@ describe('kernel lifecycle stabilization (task 2)', () => {
     expect(() => owner.plugin(() => {})).toThrow()
     expect(() => owner.effect(() => () => {})).toThrow()
 
-    // Nothing leaked into the store or the bus.
+    // Nothing leaked into the store, and the listener the plugin owned while
+    // it ran no longer receives events after its unload.
     expect(kernel.services.has('leaked')).toBe(false)
-    let called = 0
     kernel.events.emit('leak-event')
-    void called
+    expect(leakedCalls).toBe(0)
 
     await kernel.stop()
   })
@@ -212,19 +216,21 @@ describe('kernel lifecycle stabilization (task 2)', () => {
     const snapshot = kernel.inspect()
     expect(snapshot).toHaveLength(2)
 
+    // Parent-owned entries carry the owner's uid; root-owned ones report null.
     const childDiagnostic = snapshot.find((d) => d.name === 'child')
     expect(childDiagnostic?.fiber).toBe(child)
     expect(childDiagnostic?.parentUid).toBe(parent.uid)
 
     const rootDiagnostic = kernel.inspect().find((d) => d.name === 'parent')
-    expect(rootDiagnostic?.parentUid).toBe(kernel.ctx.fiber.uid)
+    expect(rootDiagnostic?.parentUid).toBeNull()
 
-    // Copies: mutating a snapshot changes nothing the kernel reports.
-    snapshot.length = 0
-    const again = kernel.inspect()
-    expect(again).toHaveLength(2)
-    const mutable = again.find((d) => d.name === 'child')
-    if (mutable) mutable.error = 'injected'
+    // Fresh copies: a second call never aliases the first snapshot, and
+    // mutating a detached copy changes nothing the kernel reports.
+    expect(kernel.inspect()).not.toBe(snapshot)
+    const mutableCopies = kernel.inspect().map((d) => ({ ...d }))
+    expect(mutableCopies).toHaveLength(2)
+    const detached = mutableCopies.find((d) => d.name === 'child')
+    if (detached) detached.error = 'injected'
     expect(kernel.inspect().find((d) => d.name === 'child')?.error).toBeUndefined()
 
     await kernel.stop()
@@ -248,7 +254,7 @@ describe('kernel lifecycle stabilization (task 2)', () => {
     await kernel.stop()
   })
 
-  it('stop_does_not_replay_an_already_settled_startup_failure', async () => {
+  it('cleaned_startup_failure_does_not_reject_stop', async () => {
     const kernel = new Kernel()
     const failures: PluginFailedDetail[] = []
     kernel.events.on('kernel/plugin-failed', (detail) => {
@@ -266,10 +272,54 @@ describe('kernel lifecycle stabilization (task 2)', () => {
     expect(failures).toHaveLength(1)
     expect(failures[0]?.phase).toBe('startup')
 
-    await kernel.stop()
+    await expect(kernel.stop()).resolves.toBeUndefined()
     // The startup failure was already cleaned and reported once; stop must not
     // dispose the fiber again and re-observe the cached error.
     expect(failures).toHaveLength(1)
+    expect(failures[0]?.phase).toBe('startup')
+  })
+
+  it('double_start_via_stale_flush_snapshot', async () => {
+    const kernel = new Kernel()
+    let starts = 0
+
+    // Pends on early-svc; when woken, providing late-svc re-entrantly flushes
+    // pending entries while the outer flush snapshot is still in flight.
+    kernel.ctx.plugin({
+      name: 'bridging-provider',
+      inject: ['early-svc'],
+      apply: (ctx: Context) => {
+        ctx.provide('late-svc', {})
+      },
+    })
+    // Pends on late-svc; when woken it must run exactly once, even though the
+    // flush pass that wakes it is itself nested inside another flush pass
+    // whose snapshot still lists this entry as pending.
+    kernel.ctx.plugin({
+      name: 'late-waiter',
+      inject: ['late-svc'],
+      apply: () => {
+        starts++
+      },
+    })
+    // The gate publication starts the nested flush cascade.
+    kernel.ctx.plugin({
+      name: 'gate',
+      apply: (ctx: Context) => {
+        ctx.provide('early-svc', {})
+      },
+    })
+
+    await kernel.settle()
+
+    expect(starts).toBe(1)
+    const waiter = kernel.inspect().find((d) => d.name === 'late-waiter')
+    expect(waiter?.fiber.state).toBe('active')
+    expect(kernel.inspect().filter((d) => d.name === 'late-waiter')).toHaveLength(1)
+    expect(kernel.services.has('late-svc')).toBe(true)
+    expect(kernel.services.has('early-svc')).toBe(true)
+
+    await kernel.stop()
   })
 
   it('stop_reports_a_cleanup_failure_with_the_teardown_phase', async () => {

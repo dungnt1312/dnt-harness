@@ -169,7 +169,7 @@ describe('services and inject (tutorial ch.3)', () => {
     void kernel.stop()
   })
 
-  it('dependency-woken consumer failure is contained — the publisher stays active', async () => {
+  it('pending_consumer_failure_does_not_fail_publisher', async () => {
     const kernel = new Kernel()
     const boom = new Error('consumer startup failed')
 
@@ -205,10 +205,17 @@ describe('services and inject (tutorial ch.3)', () => {
     const failed = kernel.inspect().find((d) => d.name === 'woken-consumer')
     expect(failed?.error).toBe(boom)
     expect(failed?.fiber.state).toBe('disposed')
+
+    // Removing the publisher disposes it and, with it, its cleanup-owned
+    // service — even though a consumer failed during the wake pass earlier.
+    await providerFiber?.dispose()
+    await kernel.settle()
+    expect(kernel.services.has('greeter')).toBe(false)
+
     await kernel.stop()
   })
 
-  it('failed and retired entries are not wake or restart candidates', async () => {
+  it('failed_entry_does_not_restart_on_dependency_removal', async () => {
     const kernel = new Kernel()
     let consumerRuns = 0
     const boom = new Error('consumer startup failed')

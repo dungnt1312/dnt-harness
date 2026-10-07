@@ -173,10 +173,12 @@ export class Context {
       this.fiber.effect(() => () => child.dispose(), `ctx.plugin(${definition.name})`)
     } catch (error) {
       // Undo the mount so the child never outlives an owner that cannot own
-      // it. The child has not run yet (its body starts asynchronously when
-      // `apply` is async) or ran synchronously — either way its fiber's
-      // teardown unwinds whatever it acquired.
-      void child.dispose().catch(() => {})
+      // it. The undo is awaited as a kernel-owned transition: settle() and
+      // stop() wait for it, and its cleanup failures are published once, so
+      // stop never re-disposes the child and re-observes the cached error as
+      // a second teardown failure.
+      const undo = child.dispose()
+      this.kernel.trackUndo(undo, child)
       throw error
     }
     return child

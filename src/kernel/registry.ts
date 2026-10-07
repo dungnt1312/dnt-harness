@@ -27,13 +27,16 @@ export interface ResolvedPlugin {
  */
 export interface PluginDiagnostic {
   /** Plugin display name, as mounted. */
-  name: string
+  readonly name: string
   /** The fiber running (or having run) this plugin. */
-  fiber: Fiber
-  /** uid of the fiber whose unload disposes this entry; the root's uid when root-owned. */
-  parentUid: number
+  readonly fiber: Fiber
+  /**
+   * uid of the fiber whose unload disposes this entry, or `null` when the
+   * entry is root-owned (only a kernel stop disposes it).
+   */
+  readonly parentUid: number | null
   /** The original startup error; absent when the plugin did not fail to start. */
-  error?: unknown
+  readonly error?: unknown
 }
 
 /** One mounted plugin: its definition plus the fiber/context pair running it. */
@@ -41,15 +44,24 @@ interface PluginEntry {
   definition: ResolvedPlugin
   fiber: Fiber
   ctx: Context
-  /** uid of the fiber whose unload disposes this entry (the root when root-owned). */
-  parentUid: number
-  /** Registry generation at mount; an entry from an older generation never reactivates after stop. */
+  /**
+   * uid of the fiber whose unload disposes this entry, or `null` when
+   * root-owned (only a kernel stop disposes it).
+   */
+  parentUid: number | null
+  /**
+   * Stop generation this entry was mounted in: `0` until the first stop, then
+   * one more per stop. A completion from an older generation is stale history
+   * and never reactivates its entry.
+   */
   generation: number
   /** The original startup error, retained until kernel stop. */
   error?: unknown
   /**
-   * The startup settlement is fully done — cleanup ran, the failure was
-   * published once — so `stop()` has nothing left to replay for this entry.
+   * Nothing is left to dispose or report for this entry: its startup
+   * settlement fully finished (cleanup ran, the failure was published once),
+   * or the restart that disposed it already published its teardown failure.
+   * `stop()` skips retired entries, so a failure is published exactly once.
    */
   retired: boolean
 }
@@ -139,7 +151,13 @@ export class Kernel {
   /** Tracked startup/restart settlements; drained by {@link settle}. */
   private readonly transitions = new Set<Promise<void>>()
   private readonly observeServices: () => void
-  /** Bumped on every dependency-driven remount and on stop. */
+  /**
+   * Bumped on every stop only. It fences late completions: an entry mounted
+   * before a stop carries the older generation, so a body resolving after
+   * `stop()` began can never flip it back to `active`. Restart fencing is
+   * handled separately by {@link restartEntry}, which deletes the old entry
+   * before remounting and refuses to remount after `stopped`.
+   */
   private generation = 0
   private stopped = false
 
@@ -163,20 +181,25 @@ export class Kernel {
    *
    * Prefer {@link Context.plugin}, which also ties the child to a parent.
    *
-   * @param parent — the fiber whose unload disposes this entry; the root when omitted.
+   * @param parent — the fiber whose unload disposes this entry; `null`/omitted means root-owned.
    */
   plugin(definition: ResolvedPlugin, parent?: Fiber): Fiber {
-    return this.mount(definition, parent ?? this.rootFiber, true)
+    return this.mount(definition, parent ?? null, true)
   }
 
   /**
    * Snapshot every mounted plugin — live, pending, failed, or unloaded — as
    * fresh copies. Mutating a snapshot never changes what the kernel reports.
    */
-  inspect(): PluginDiagnostic[] {
+  inspect(): readonly PluginDiagnostic[] {
     const diagnostics: PluginDiagnostic[] = []
     for (const entry of this.entries) {
-      const diagnostic: PluginDiagnostic = {
+      // Built as a mutable local, then handed out through the read-only
+      // interface: fresh object per call, no aliasing of registry internals.
+      const diagnostic: Omit<
+        { -readonly [K in keyof PluginDiagnostic]-?: PluginDiagnostic[K] },
+        'error'
+      > & { error?: unknown } = {
         name: entry.definition.name,
         fiber: entry.fiber,
         parentUid: entry.parentUid,
@@ -221,7 +244,13 @@ export class Kernel {
       try {
         await entry.fiber.dispose()
       } catch (error) {
-        this.publishFailure(entry, 'teardown', error)
+        // Same ownership rule as restartEntry: whoever reports this entry's
+        // teardown failure retires it first, so a restart already in flight
+        // over the same cached teardown publishes it exactly once.
+        if (!entry.retired) {
+          entry.retired = true
+          this.publishFailure(entry, 'teardown', error)
+        }
       }
     }
     this.entries.clear()
@@ -233,13 +262,15 @@ export class Kernel {
   }
 
   /** Create and register an entry, then try to start it. */
-  private mount(definition: ResolvedPlugin, parent: Fiber, direct: boolean): Fiber {
+  private mount(definition: ResolvedPlugin, parent: Fiber | null, direct: boolean): Fiber {
     const fiber = new Fiber(definition.name)
     const entry: PluginEntry = {
       definition,
       fiber,
       ctx: createContext(this, fiber),
-      parentUid: parent.uid,
+      // `null` means root-owned: mounted by the kernel or through the root
+      // context, so no plugin parent's unload disposes it — only a stop does.
+      parentUid: parent === null || parent === this.rootFiber ? null : parent.uid,
       generation: this.generation,
       retired: false,
     }
@@ -259,6 +290,11 @@ export class Kernel {
     // A stop clears the registry; a pending flush already in flight must not
     // start anything new afterwards.
     if (this.stopped) return
+    // Barrier against a stale flush: a `flushPending` snapshot taken before a
+    // nested wake (or before a tracked restart's remount) still lists this
+    // entry, but a fiber that already ran its body — or is running it — must
+    // not run it again. Only a fresh `pending` fiber may start here.
+    if (entry.fiber.state !== 'pending') return
     const missing = entry.definition.inject.filter((name) => !this.services.has(name))
     if (missing.length > 0) {
       entry.fiber.state = 'pending'
@@ -388,7 +424,14 @@ export class Kernel {
     try {
       await entry.fiber.dispose()
     } catch (error) {
-      this.publishFailure(entry, 'teardown', error)
+      // Publish only when nobody else has taken ownership of reporting this
+      // entry's teardown: a concurrent stop skips retired entries and would
+      // never publish, so the restart keeps it; anything that publishes here
+      // instead retires the entry first.
+      if (!entry.retired) {
+        entry.retired = true
+        this.publishFailure(entry, 'teardown', error)
+      }
     }
     this.entries.delete(entry)
     // A stop that raced this restart must not see a fresh mount afterwards.
@@ -411,6 +454,29 @@ export class Kernel {
       () => {
         this.transitions.delete(task)
       },
+    )
+  }
+
+  /**
+   * Track an externally started teardown — the undo of a `ctx.plugin` mount
+   * whose ownership registration just failed — so {@link settle} awaits it.
+   * Cleanup failures are reported once as `teardown` failures and retire the
+   * entry, so stop does not dispose the fiber again or report it twice.
+   */
+  trackUndo(disposal: Promise<void>, fiber: Fiber): void {
+    const entry = [...this.entries].find((candidate) => candidate.fiber === fiber)
+    this.track(
+      disposal.then(
+        () => {
+          if (entry) entry.retired = true
+        },
+        (error: unknown) => {
+          if (entry) {
+            entry.retired = true
+            this.publishFailure(entry, 'teardown', error)
+          }
+        },
+      ),
     )
   }
 }
