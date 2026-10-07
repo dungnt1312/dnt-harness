@@ -187,8 +187,8 @@ export interface ContextManifestView {
 
 /** One frame on the events stream. */
 export type Envelope =
-  | { readonly kind: 'snapshot'; readonly events: SseEvent[] }
-  | { readonly kind: 'resume'; readonly events: SseEvent[] }
+  | { readonly kind: 'snapshot'; readonly events: SseEvent[]; readonly cursor?: number }
+  | { readonly kind: 'resume'; readonly events: SseEvent[]; readonly cursor?: number }
   | { readonly kind: 'session'; readonly event: SseEvent }
   | {
     readonly kind: 'approval'

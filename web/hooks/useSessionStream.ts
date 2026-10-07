@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { subscribeEventsIn, type StreamState } from '../lib/api.ts'
 import type { PendingApproval, PendingQuestion, SseEvent } from '../lib/types.ts'
 import { createProjector, type ViewItem } from '../lib/project.ts'
+import { createSessionStreamCache } from '../lib/session-stream-cache.ts'
 
 /** Rebuild pending questions from durable facts, including reconnect replay. */
 export function reconcileApprovals(pending: readonly PendingApproval[], events: readonly SseEvent[]): readonly PendingApproval[] {
@@ -114,7 +115,7 @@ export function createEventCompactor(): (batch: readonly SseEvent[]) => readonly
   }
 }
 
-export function useSessionStream(workspaceId: string | null, sessionId: string | null) {
+export function useSessionStream(workspaceId: string | null, sessionId: string | null, delegationsOnly = false) {
   const [events, setEvents] = useState<readonly SseEvent[]>([])
   const [items, setItems] = useState<readonly ViewItem[]>([])
   const [approvals, setApprovals] = useState<readonly PendingApproval[]>([])
@@ -126,6 +127,7 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
   const [settled, setSettled] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const seenSeq = useRef(0)
+  const cache = useRef(createSessionStreamCache())
   const dismissApproval = useCallback((id: string) => {
     setApprovals((prev) => prev.filter((row) => row.approvalId !== id))
   }, [])
@@ -141,12 +143,22 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
     let projector = createProjector()
     // The compactor owns the kept-event list across the whole stream: batches
     // fold in place, snapshots replace it wholesale.
-    const compact = createEventCompactor()
+    let compact = createEventCompactor()
     setApprovals([])
     setQuestions([])
     setError(null)
     setStream(sessionId === null || workspaceId === null ? 'idle' : 'connecting')
-    if (sessionId === null || workspaceId === null) return
+    if (sessionId === null || workspaceId === null) { cache.current.clear(); return }
+    const cacheKey = JSON.stringify([workspaceId, sessionId, delegationsOnly])
+    const cached = cache.current.get(cacheKey)
+    let kept: readonly SseEvent[] = cached?.events ?? []
+    if (cached) {
+      seenSeq.current = cached.cursor
+      setItems(projector.apply(kept))
+      setEvents(compact(kept))
+      setApprovals(reconcileApprovals([], kept))
+    }
+    let receivedSnapshot = cached !== undefined
     let disposed = false
     let frame = 0
     let pending: SseEvent[] = []
@@ -156,7 +168,8 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
       const batch = pending
       pending = []
       setItems(projector.apply(batch))
-      setEvents(compact(batch))
+      kept = compact(batch)
+      setEvents(kept)
     }
     const discardPending = (): void => {
       if (frame !== 0) cancelAnimationFrame(frame)
@@ -181,10 +194,13 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
         // A fresh snapshot precedes the server's re-sent open questions.
         setQuestions([])
         projector = createProjector()
+        compact = createEventCompactor()
         setItems(projector.apply(envelope.events))
-        setEvents(compact(envelope.events))
+        kept = compact(envelope.events)
+        setEvents(kept)
+        receivedSnapshot = true
         setApprovals(reconcileApprovals([], envelope.events))
-        seenSeq.current = envelope.events.at(-1)?.seq ?? 0
+        seenSeq.current = envelope.cursor ?? envelope.events.at(-1)?.seq ?? 0
         setSettled(true)
       } else if (envelope.kind === 'resume') {
         const unseen = envelope.events.filter((event) => event.seq > seenSeq.current)
@@ -192,6 +208,8 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
           seenSeq.current = event.seq
           pending.push(event)
         }
+        seenSeq.current = Math.max(seenSeq.current, envelope.cursor ?? 0)
+        receivedSnapshot = true
         setApprovals((prev) => reconcileApprovals(prev, unseen))
         setSettled(true)
         if (pending.length > 0 && frame === 0) frame = requestAnimationFrame(flush)
@@ -241,9 +259,12 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
           return [...prev, next]
         })
       }
-    }, (state) => { if (!disposed) setStream(state) })
-    return () => { disposed = true; discardPending(); dispose() }
-  }, [workspaceId, sessionId])
+    }, (state) => { if (!disposed) setStream(state) }, { delegationsOnly, ...(cached ? { cursor: cached.cursor } : {}) })
+    return () => {
+      if (receivedSnapshot) cache.current.set(cacheKey, { events: pending.length ? compact(pending) : kept, cursor: seenSeq.current })
+      disposed = true; discardPending(); dispose()
+    }
+  }, [workspaceId, sessionId, delegationsOnly])
 
   return { events, items, approvals, questions, stream, error, dismissApproval, dismissQuestion, settled }
 }

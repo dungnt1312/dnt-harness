@@ -51,6 +51,8 @@ const AGENT_TYPES = ['agent/child-spawn', 'agent/child-result'] as const
  * type groups, the scan happens once per frame instead of once per gate.
  */
 export interface SessionDerivedGates {
+  /** First retained event identity resets gates on snapshot/session replacement. */
+  readonly history: SseEvent | undefined
   readonly turnCount: number
   readonly taskCount: number
   readonly processCount: number
@@ -62,6 +64,7 @@ export function useSessionDerivedGates(events: readonly SseEvent[]): SessionDeri
   return useMemo(() => {
     const counts = typeCounts(events)
     return {
+      history: events.find((event) => event.type !== 'assistant/chunk'),
       turnCount: countOf(counts, TURN_BOUNDARY_TYPES),
       taskCount: countOf(counts, TASK_TYPES),
       processCount: countOf(counts, PROCESS_TYPES),
@@ -137,11 +140,11 @@ export function useSessionDerivedValues(events: readonly SseEvent[], pending: nu
   const gates = useSessionDerivedGates(events)
   const eventsRef = useRef(events)
   eventsRef.current = events
-  const phase = useGated(gates.turnCount, () => taskPhase(eventsRef.current, pending, sending), [pending, sending])
-  const running = useGated(gates.turnCount, () => isTurnRunning(eventsRef.current), [])
-  const todos = useGated(gates.taskCount, () => (gates.taskCount === 0 ? EMPTY_TODOS : todosFromEvents(eventsRef.current)), [])
-  const workingSince = useGated(gates.turnCount, () => workingSinceOf(eventsRef.current), [])
-  const recovered = useGated(gates.recoveryCount, () => recoveredOf(eventsRef.current), [])
+  const phase = useGated(gates.turnCount, () => taskPhase(eventsRef.current, pending, sending), [gates.history, pending, sending])
+  const running = useGated(gates.turnCount, () => isTurnRunning(eventsRef.current), [gates.history])
+  const todos = useGated(gates.taskCount, () => (gates.taskCount === 0 ? EMPTY_TODOS : todosFromEvents(eventsRef.current)), [gates.history])
+  const workingSince = useGated(gates.turnCount, () => workingSinceOf(eventsRef.current), [gates.history])
+  const recovered = useGated(gates.recoveryCount, () => recoveredOf(eventsRef.current), [gates.history])
   return { phase, running, todos, workingSince, recovered }
 }
 

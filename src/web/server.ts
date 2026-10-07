@@ -22,6 +22,7 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { execFile } from 'node:child_process'
+import { replayView } from './replay-view.ts'
 import { createReadStream } from 'node:fs'
 import { bearerAllows, CLEARED_SESSION_COOKIE, ControlPlaneAuthService, isPublicPath, readSessionCookie } from './control-plane-auth.ts'
 import { OPERATOR_HEADER, publishOperatorChannel } from './operator-channel.ts'
@@ -7110,7 +7111,9 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   // are not re-adopted — KillShell/BashOutput answer unknown truthfully).
   reconcileInterruptedProcesses(entry, deps)
 
-  const rawCursor = req.headers['last-event-id']
+  const streamUrl = new URL(req.url ?? '/', 'http://localhost')
+  const delegationsOnly = streamUrl.searchParams.get('view') === 'delegations'
+  const rawCursor = req.headers['last-event-id'] ?? streamUrl.searchParams.get('cursor')
   const cursor = typeof rawCursor === 'string' && /^\d+$/.test(rawCursor) ? Number(rawCursor) : NaN
   const latest = session.events.at(-1)?.seq ?? 0
   const earliest = session.events[0]?.seq ?? 1
@@ -7119,7 +7122,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   // raw chunk of the session's history, and a long-disconnect resume replays
   // the same bulk. Sequence numbers stay untouched so the client's seen-cursor
   // filtering and its own compaction keep working unchanged.
-  const replay = compactReplayEvents(resumable ? session.events.filter((event) => event.seq > cursor) : [...session.events])
+  const replay = compactReplayEvents([...replayView(resumable ? session.events.filter((event) => event.seq > cursor) : session.events, delegationsOnly)])
   streamFrame({ kind: resumable ? 'resume' : 'snapshot', events: replay }, latest)
   for (const [approvalId, waiting] of deps.pending) {
     if (waiting.sessionId === session.id || waiting.parentSessionId === session.id) {
@@ -7143,7 +7146,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   })
 
   const disposeSession = deps.kernel.ctx.on('session/event', (emitter, event) => {
-    if (emitter.id === session.id && event.type !== 'context/body') streamFrame({ kind: 'session', event }, event.seq)
+    if (emitter.id === session.id && event.type !== 'context/body' && replayView([event], delegationsOnly).length > 0) streamFrame({ kind: 'session', event }, event.seq)
   })
   const disposeApproval = deps.kernel.ctx.on('web/approval', (payload) => {
     if (payload.sessionId === session.id || payload.parentSessionId === session.id) {

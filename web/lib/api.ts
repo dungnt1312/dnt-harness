@@ -225,8 +225,12 @@ export function subscribeEventsIn(
   sessionId: string,
   onEnvelope: (envelope: Envelope) => void,
   onState?: (state: StreamState) => void,
+  options?: { readonly delegationsOnly?: boolean; readonly cursor?: number },
 ): () => void {
-  const source = new EventSource(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/events`)
+  const query = new URLSearchParams()
+  if (options?.delegationsOnly) query.set('view', 'delegations')
+  if (options?.cursor !== undefined) query.set('cursor', String(options.cursor))
+  const source = new EventSource(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/events${query.size ? `?${query}` : ''}`)
   return wire(source, onEnvelope, onState)
 }
 
@@ -240,7 +244,10 @@ function wire(
     onState?.(source.readyState === EventSource.CONNECTING ? 'reconnecting' : 'connecting')
   }
   source.onmessage = (message: MessageEvent<string>) => {
-    onEnvelope(JSON.parse(message.data) as Envelope)
+    const envelope = JSON.parse(message.data) as Envelope
+    if ((envelope.kind === 'snapshot' || envelope.kind === 'resume') && /^\d+$/.test(message.lastEventId)) {
+      onEnvelope({ ...envelope, cursor: Number(message.lastEventId) })
+    } else onEnvelope(envelope)
   }
   return () => {
     source.close()

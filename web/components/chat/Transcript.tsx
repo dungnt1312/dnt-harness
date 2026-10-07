@@ -181,14 +181,14 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   const turnChangeMap = useMemo(
     () => turnChanges(events ?? []),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on tool traffic, not array identity (a new array lands every streamed frame)
-    [gates.taskCount, events],
+    [gates.history, gates.taskCount, gates.turnCount],
   )
   // Wall-clock boundaries per turn: the user row renders the start, the turn
   // footer the end and the span. Rebuilt only when turn traffic arrived.
   const turnTimingMap = useMemo(
     () => turnTimings(events ?? []),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on turn-boundary traffic
-    [gates.turnCount, events],
+    [gates.history, gates.turnCount],
   )
   // Live background-process state for the tool rows, keyed off the process
   // events only so unrelated log traffic does not rebuild the map (and
@@ -196,7 +196,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   const processStatuses = useMemo(
     () => new Map<string, ProcessRow>(processRows(events ?? []).map((row) => [row.id, row])),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on process traffic
-    [gates.processCount, events],
+    [gates.history, gates.processCount],
   )
   const processLink = useMemo<ProcessLink | null>(
     () => onOpenProcess === undefined ? null : { statuses: processStatuses, open: onOpenProcess },
@@ -206,7 +206,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   const hiddenSpawns = useMemo(
     () => hiddenSpawnCalls(events ?? []),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on tool + agent traffic
-    [gates.taskCount, gates.agentCount, events],
+    [gates.history, gates.taskCount, gates.agentCount],
   )
   const turnChangeFooter = (turnId?: string): TurnChanges | undefined => {
     if (turnId === undefined) return undefined

@@ -14,8 +14,8 @@ let root: Root | undefined
 let renders: number[] = []
 let approvals: string[] = []
 let projected: readonly import('../lib/project.ts').ViewItem[] = []
-function Probe() {
-  const { events, items, approvals: pending } = useSessionStream('w', 's')
+function Probe({ session = 's' }: { session?: string }) {
+  const { events, items, approvals: pending } = useSessionStream('w', session)
   projected = items
   renders.push(events.length)
   approvals = pending.map((row) => row.approvalId)
@@ -32,6 +32,24 @@ async function mount() {
 afterEach(async () => { if (root) await act(async () => root!.unmount()); root = undefined; receive = undefined; renders = []; approvals = []; dispose.mockClear(); document.body.replaceChildren(); vi.unstubAllGlobals(); vi.restoreAllMocks() })
 
 describe('session stream frame batching', () => {
+  it('replaces the compactor as well as the projection on a fresh snapshot', async () => {
+    const host = await mount()
+    await act(async () => receive?.({ kind: 'snapshot', events: [{ seq: 1, type: 'user/message', content: 'old' }] }))
+    await act(async () => receive?.({ kind: 'snapshot', events: [{ seq: 9, type: 'user/message', content: 'replacement' }] }))
+    expect(host.textContent).toBe('9')
+    expect(projected).toHaveLength(1)
+  })
+  it('restores a visited session and accepts an empty cursor resume without duplicate rows', async () => {
+    const host = await mount()
+    await act(async () => receive?.({ kind: 'snapshot', cursor: 5, events: [{ seq: 1, type: 'user/message', content: 'cached' }] }))
+    await act(async () => root!.render(<Probe session="other" />))
+    await act(async () => receive?.({ kind: 'snapshot', events: [{ seq: 2, type: 'user/message', content: 'other' }] }))
+    await act(async () => root!.render(<Probe />))
+    expect(host.textContent).toBe('1')
+    await act(async () => receive?.({ kind: 'resume', cursor: 8, events: [] }))
+    await act(async () => receive?.({ kind: 'session', event: { seq: 7, type: 'user/message', content: 'duplicate' } }))
+    expect(projected).toHaveLength(1)
+  })
   it('resumes buffered live projection without replaying or duplicating old rows', async () => {
     const frames: FrameRequestCallback[] = []
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { frames.push(callback); return frames.length })
