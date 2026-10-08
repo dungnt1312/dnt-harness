@@ -14,11 +14,12 @@ import {
   deleteAgentDefinition,
   importAgentDefinition,
   listAgentDefinitions,
+  listModelAliases,
   readAgentFile,
 } from '../../lib/api.ts'
 import { cn } from '../../lib/cn.ts'
 import { agentRoleIcon, AGENT_ROLE_TONE } from '../../lib/agent-icons.ts'
-import type { AgentDefinitionRow } from '../../lib/types.ts'
+import type { AgentDefinitionRow, ModelAliasRow } from '../../lib/types.ts'
 import {
   CodeArea,
   Disclosure,
@@ -86,10 +87,12 @@ const rowKey = (row: AgentDefinitionRow): string => row.definition.name.toLowerC
 function modelText(row: AgentDefinitionRow): { readonly short: string; readonly long: string; readonly warn: boolean } {
   const asked = row.definition.model
   const resolution = row.modelResolution
+  if (resolution?.blocked === true) return { short: `${resolution.alias ?? resolution.unresolved ?? asked}?`, long: resolution.error ?? 'This model alias is unusable and blocks spawn', warn: true }
   if (resolution?.resolved !== undefined) {
     const pair = resolution.resolved
-    const shortModel = pair.slice(pair.indexOf(':') + 1)
-    return { short: shortModel, long: asked !== undefined && asked !== pair ? `${asked} → ${pair}` : pair, warn: false }
+    const shortModel = resolution.alias ?? pair.slice(pair.indexOf(':') + 1)
+    const thinking = resolution.alias !== undefined ? ` · thinking ${resolution.thinkingLevel ?? 'model default'}` : ''
+    return { short: shortModel, long: resolution.alias !== undefined ? `${resolution.alias} → ${pair}${thinking}` : (asked !== undefined && asked !== pair ? `${asked} → ${pair}` : pair), warn: false }
   }
   if (resolution?.unresolved !== undefined) {
     return { short: `${resolution.unresolved}?`, long: `${resolution.unresolved} is not served by any provider here — runs on the conversation’s model`, warn: true }
@@ -150,6 +153,7 @@ type View =
 
 function AgentsPanelContent({ workspaceId, projectId, modelOptions }: AgentsPanelProps) {
   const [definitions, setDefinitions] = useScopedState<readonly AgentDefinitionRow[] | null>(null)
+  const [aliases, setAliases] = useScopedState<readonly ModelAliasRow[]>([])
   const [view, setView] = useScopedState<View | null>(null)
   const [search, setSearch] = useScopedState('')
   const [sourceFilter, setSourceFilter] = useScopedState<'all' | Source>('all')
@@ -174,6 +178,7 @@ function AgentsPanelContent({ workspaceId, projectId, modelOptions }: AgentsPane
   }, [workspaceId, projectId])
 
   useEffect(() => { void refreshDefinitions() }, [refreshDefinitions])
+  useEffect(() => { void listModelAliases().then(setAliases).catch(() => setAliases([])) }, [])
 
   const rows = definitions ?? []
   const groups = useMemo(() => {
@@ -420,7 +425,8 @@ function AgentsPanelContent({ workspaceId, projectId, modelOptions }: AgentsPane
                 value={draft.model}
                 options={[
                   { value: '', label: 'Inherit from the conversation' },
-                  ...(['sonnet', 'opus', 'haiku'].includes(draft.model) ? [{ value: draft.model, label: `${draft.model} (alias)` }] : []),
+                  ...(['sonnet', 'opus', 'haiku'].includes(draft.model) ? [{ value: draft.model, label: `${draft.model} (built-in alias)` }] : []),
+                  ...aliases.map((alias) => ({ value: alias.name, label: `${alias.name} → ${alias.provider}:${alias.model}${alias.status === 'invalid' ? ' (unusable)' : ''}`, disabled: alias.status === 'invalid' })),
                   ...(modelOptions ?? []).map((option) => ({ value: option.value, label: option.label })),
                   ...(draft.model !== '' && !['sonnet', 'opus', 'haiku'].includes(draft.model) && !(modelOptions ?? []).some((option) => option.value === draft.model) ? [{ value: draft.model, label: draft.model }] : []),
                 ]}

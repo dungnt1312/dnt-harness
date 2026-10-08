@@ -47,7 +47,7 @@ import { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from '../harness/li
 import { LlmService } from '../harness/llm/service.ts'
 import { LogicalRequest, classifyTransport } from '../harness/llm/request-lifecycle.ts'
 import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
-import { isThinkingLevel, resolveContextLimit } from '../harness/llm/model-catalog.ts'
+import { expressibleThinkingLevel, isThinkingLevel, resolveContextLimit } from '../harness/llm/model-catalog.ts'
 import { ProviderError } from '../harness/llm/types.ts'
 import type { LlmProvider, StreamEvent, TokenUsage, ToolCall } from '../harness/llm/types.ts'
 import { fileSessions, SessionsService } from '../harness/session/service.ts'
@@ -89,8 +89,10 @@ import {
   repairDefaults,
   type ModelDefaults,
   slugify,
+  type ModelAlias,
   type ModelSettings,
   type ProviderConfig,
+  validateModelAliasName,
 } from './provider-store.ts'
 import { ScopeError, WorkspaceService, type AdditionalDirectory, type ProjectRecord, type WorkspaceRecord } from '../harness/workspace/service.ts'
 import { ModesService, ModeError, DEFAULT_MODE_ID, BUNDLED_MODES, type ResolvedMode } from '../harness/modes/service.ts'
@@ -704,6 +706,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const configFile = options.configFile ?? path.join(resolveAppHome(), 'providers.json')
   const storedProviders = loadProviderStore(configFile)
   let list: ProviderConfig[] = [...storedProviders.providers]
+  let aliases: ModelAlias[] = [...storedProviders.aliases]
   let durableDefaults: ModelDefaults = storedProviders.defaults
   let runtimeModelOverride: { readonly provider: string; readonly model: string } | undefined
   let defaults: ModelDefaults = durableDefaults
@@ -720,7 +723,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       }]
       durableDefaults = repairDefaults(durableDefaults, list)
       defaults = durableDefaults
-      await saveProviderStore(configFile, { version: 2, defaults: durableDefaults, providers: list })
+      await saveProviderStore(configFile, { version: 2, defaults: durableDefaults, providers: list, aliases })
     }
   }
 
@@ -910,6 +913,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
           throw new ChildModelError(String(error instanceof Error ? error.message : error))
         }
       },
+      alias: (name) => aliases.find((entry) => entry.name === name),
     })
 
   // ── per-session entries ──────────────────────────────────────
@@ -1640,6 +1644,13 @@ ${entry.description}`.toLowerCase().includes(query))
     childModelFor,
     providers: () => usableIds(),
     modelsOf: (provider) => kernel.ctx.llm.providerModels(provider),
+    aliases: () => aliases.map((alias) => {
+      try {
+        validateProviderModel(alias.provider, alias.model)
+        if (alias.thinkingLevel !== null && expressibleThinkingLevel(alias.model, alias.thinkingLevel) !== alias.thinkingLevel) throw new Error(`unsupported thinking '${alias.thinkingLevel}'`)
+        return { ...alias, valid: true }
+      } catch (error) { return { ...alias, valid: false, error: String(error instanceof Error ? error.message : error) } }
+    }),
     admissionResolver: ({ parentSessionId, workspaceId, definition, candidates }) => admissionExposureCeiling(parentSessionId, workspaceId, definition, candidates),
     grantsOf: (parentSessionId) => {
       const entry = sessions.get(parentSessionId)
@@ -2888,7 +2899,7 @@ ${entry.description}`.toLowerCase().includes(query))
    */
   let providerTransactionTail: Promise<void> = Promise.resolve()
   const mutateProviderStore = async <T>(
-    derive: (current: { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults }) => { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly result: T } | Promise<{ readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly result: T }>,
+    derive: (current: { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases: readonly ModelAlias[] }) => { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases?: readonly ModelAlias[]; readonly result: T } | Promise<{ readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases?: readonly ModelAlias[]; readonly result: T }>,
     transactionOptions?: { readonly clearRuntimeModelOverride?: boolean },
   ): Promise<T> => {
     let release: (() => void) | undefined
@@ -2896,10 +2907,12 @@ ${entry.description}`.toLowerCase().includes(query))
     providerTransactionTail = new Promise<void>((resolve) => { release = resolve })
     await predecessor
     try {
-      const derived = await derive({ providers: list, defaults: durableDefaults })
+      const derived = await derive({ providers: list, defaults: durableDefaults, aliases })
       const repaired = repairGlobalDefaults(derived.defaults, derived.providers)
-      await (options.providerStoreWriter ?? saveProviderStore)(configFile, { version: 2, defaults: repaired, providers: derived.providers })
+      const nextAliases = derived.aliases ?? aliases
+      await (options.providerStoreWriter ?? saveProviderStore)(configFile, { version: 2, defaults: repaired, providers: derived.providers, aliases: nextAliases })
       list = [...derived.providers]
+      aliases = [...nextAliases]
       durableDefaults = repaired
       if (transactionOptions?.clearRuntimeModelOverride === true) runtimeModelOverride = undefined
       // The process-local startup override is valid only while its selected
@@ -3023,7 +3036,10 @@ ${entry.description}`.toLowerCase().includes(query))
       parent: { provider: defaults.provider, model: defaults.model },
       providers: usableIds(),
       modelsOf: (provider) => kernel.ctx.llm.providerModels(provider),
+      validate: (provider, model) => { validateProviderModel(provider, model) },
+      alias: (name) => aliases.find((entry) => entry.name === name),
     }),
+    aliases: () => aliases,
     defaults: () => defaults,
     setDefaults: (next) => { defaults = next },
     mutateProviderStore,
@@ -3271,9 +3287,10 @@ interface HandlerDeps {
   readonly systemPrompts: SystemPromptsStore
   readonly seedWorkspaceControls: (workspaceId: WorkspaceId, seed?: { provider?: string; model?: string }) => void
   readonly providers: () => readonly ProviderConfig[]
+  readonly aliases: () => readonly ModelAlias[]
   readonly defaults: () => ModelDefaults
   readonly setDefaults: (next: ModelDefaults) => void
-  readonly mutateProviderStore: <T>(derive: (current: { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults }) => { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly result: T } | Promise<{ readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly result: T }>, options?: { readonly clearRuntimeModelOverride?: boolean }) => Promise<T>
+  readonly mutateProviderStore: <T>(derive: (current: { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases: readonly ModelAlias[] }) => { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases?: readonly ModelAlias[]; readonly result: T } | Promise<{ readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases?: readonly ModelAlias[]; readonly result: T }>, options?: { readonly clearRuntimeModelOverride?: boolean }) => Promise<T>
   readonly publicSummary: () => readonly PublicProvider[]
   readonly terminals: TerminalService
   readonly terminalsEnabled: boolean
@@ -6180,6 +6197,62 @@ async function handleApi(
       return
     }
 
+    // ── global subagent model aliases ──
+    if (req.method === 'GET' && pathname === '/api/model-aliases') {
+      send(200, deps.aliases().map((alias) => modelAliasRow(deps, alias)))
+      return
+    }
+
+    if (req.method === 'POST' && pathname === '/api/model-aliases') {
+      const body = await readJson(req)
+      try {
+        const input = parseModelAliasInput(deps, body)
+        const created = await deps.mutateProviderStore(({ providers, defaults, aliases }) => {
+          if (aliases.some((alias) => alias.name === input.name)) throw new ModelAliasConflict(`model alias '${input.name}' already exists`)
+          const entry: ModelAlias = { ...input, revision: 1 }
+          return { providers, defaults, aliases: [...aliases, entry], result: entry }
+        })
+        send(201, modelAliasRow(deps, created))
+      } catch (error) {
+        send(error instanceof ModelAliasConflict ? 409 : 400, { error: String(error instanceof Error ? error.message : error) })
+      }
+      return
+    }
+
+    const aliasMatch = /^\/api\/model-aliases\/([^/]+)$/.exec(pathname)
+    if ((req.method === 'PATCH' || req.method === 'DELETE') && aliasMatch !== null) {
+      const currentName = decodeURIComponent(aliasMatch[1] ?? '')
+      const body = await readJson(req)
+      const expectedRevision = body['expectedRevision']
+      if (typeof expectedRevision !== 'number' || !Number.isInteger(expectedRevision)) { send(400, { error: "body needs integer 'expectedRevision'" }); return }
+      try {
+        if (req.method === 'DELETE') {
+          const deleted = await deps.mutateProviderStore(({ providers, defaults, aliases }) => {
+            const current = aliases.find((alias) => alias.name === currentName)
+            if (current === undefined) throw new ModelAliasMissing(currentName)
+            if (current.revision !== expectedRevision) throw new ModelAliasConflict(`model alias '${currentName}' changed since it was loaded`)
+            return { providers, defaults, aliases: aliases.filter((alias) => alias.name !== currentName), result: true }
+          })
+          send(200, { deleted })
+        } else {
+          const patched = await deps.mutateProviderStore(({ providers, defaults, aliases }) => {
+            const current = aliases.find((alias) => alias.name === currentName)
+            if (current === undefined) throw new ModelAliasMissing(currentName)
+            if (current.revision !== expectedRevision) throw new ModelAliasConflict(`model alias '${currentName}' changed since it was loaded`)
+            const input = parseModelAliasInput(deps, { ...current, ...body })
+            if (input.name !== currentName && aliases.some((alias) => alias.name === input.name)) throw new ModelAliasConflict(`model alias '${input.name}' already exists`)
+            const entry: ModelAlias = { ...input, revision: current.revision + 1 }
+            return { providers, defaults, aliases: aliases.map((alias) => alias.name === currentName ? entry : alias), result: entry }
+          })
+          send(200, modelAliasRow(deps, patched))
+        }
+      } catch (error) {
+        const status = error instanceof ModelAliasMissing ? 404 : error instanceof ModelAliasConflict ? 409 : 400
+        send(status, { error: String(error instanceof Error ? error.message : error) })
+      }
+      return
+    }
+
     // ── provider registry (app-wide; selection is per workspace) ──
     if (req.method === 'GET' && pathname === '/api/providers') {
       send(200, deps.providers().map(publicProvider))
@@ -7098,6 +7171,39 @@ function boundProject(session: Session): ProjectId | undefined {
 }
 
 // ── provider helpers ───────────────────────────────────────────
+
+class ModelAliasConflict extends Error {}
+class ModelAliasMissing extends Error {
+  constructor(name: string) { super(`no model alias '${name}'`) }
+}
+
+function parseModelAliasInput(deps: HandlerDeps, body: Record<string, unknown>): Omit<ModelAlias, 'revision'> {
+  const name = validateModelAliasName(typeof body['name'] === 'string' ? body['name'] : '')
+  const provider = typeof body['provider'] === 'string' ? body['provider'].trim() : ''
+  const model = typeof body['model'] === 'string' ? body['model'].trim() : ''
+  const thinkingLevel = body['thinkingLevel'] === null ? null : body['thinkingLevel']
+  if (provider === '' || model === '') throw new Error("model alias needs non-empty 'provider' and 'model'")
+  deps.validateProviderModel(provider, model)
+  if (thinkingLevel !== null) {
+    if (!isThinkingLevel(thinkingLevel)) throw new Error("'thinkingLevel' must be a supported level or null")
+    if (expressibleThinkingLevel(model, thinkingLevel) !== thinkingLevel) throw new Error(`model '${model}' does not support thinking '${thinkingLevel}'`)
+  }
+  return { name, provider, model, thinkingLevel }
+}
+
+function modelAliasRow(deps: HandlerDeps, alias: ModelAlias): ModelAlias & { readonly status: 'valid' | 'invalid'; readonly message?: string; readonly warnings: readonly string[] } {
+  let message: string | undefined
+  try {
+    deps.validateProviderModel(alias.provider, alias.model)
+    if (alias.thinkingLevel !== null && expressibleThinkingLevel(alias.model, alias.thinkingLevel) !== alias.thinkingLevel) {
+      message = `thinking '${alias.thinkingLevel}' is not supported by ${alias.provider}:${alias.model}`
+    }
+  } catch (error) { message = String(error instanceof Error ? error.message : error) }
+  const warnings: string[] = []
+  if (['sonnet', 'opus', 'haiku', 'fable'].includes(alias.name.toLowerCase())) warnings.push(`shadows built-in model alias '${alias.name}'`)
+  if (deps.providers().some((provider) => provider.models.includes(alias.name))) warnings.push(`shadows advertised model '${alias.name}'`)
+  return { ...alias, status: message === undefined ? 'valid' : 'invalid', ...(message === undefined ? {} : { message }), warnings }
+}
 
 async function createProvider(
   deps: HandlerDeps,

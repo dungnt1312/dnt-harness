@@ -444,6 +444,20 @@ export interface WorkspaceMeta {
 
 // ── G4: agent definitions + children ───────────────────────────────────────
 
+export interface ModelAliasInput {
+  readonly name: string
+  readonly provider: string
+  readonly model: string
+  readonly thinkingLevel: string | null
+}
+
+export interface ModelAliasRow extends ModelAliasInput {
+  readonly revision: number
+  readonly status: 'valid' | 'invalid'
+  readonly message?: string
+  readonly warnings: readonly string[]
+}
+
 /** One agent role definition (bundled read-only or workspace-owned). */
 export interface AgentDefinitionRow {
   readonly definition: {
@@ -463,7 +477,7 @@ export interface AgentDefinitionRow {
     readonly warnings?: readonly string[]
   }
   /** What `model:` runs on here: a resolved `provider:model`, or inherit (with what could not be served). */
-  readonly modelResolution?: { readonly resolved?: string; readonly inherit: boolean; readonly unresolved?: string }
+  readonly modelResolution?: { readonly resolved?: string; readonly inherit: boolean; readonly unresolved?: string; readonly alias?: string; readonly thinkingLevel?: string | null; readonly blocked?: boolean; readonly error?: string }
   /** Claude Code layer: bundled < user (~/.claude/agents) < workspace < project (.claude/agents). */
   readonly source: 'bundled' | 'user' | 'workspace' | 'project'
   readonly path?: string

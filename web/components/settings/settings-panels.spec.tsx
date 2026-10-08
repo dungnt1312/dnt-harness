@@ -29,6 +29,7 @@ vi.mock('../../lib/api.ts', () => ({
   importMcpServers: vi.fn(async () => ({ imported: ['x'] })),
   setMcpServerAction: vi.fn(async () => ({ status: 'ready' })),
   listAgentDefinitions: vi.fn(async () => []),
+  listModelAliases: vi.fn(async () => []),
   cloneAgentToWorkspace: vi.fn(),
   readAgentFile: vi.fn(),
   listChildren: vi.fn(async () => []),
@@ -558,7 +559,7 @@ describe('settings dialog', () => {
   it('gives every section tab an icon', async () => {
     await render()
     const tabs = [...document.body.querySelectorAll('[role="tab"]')]
-    expect(tabs).toHaveLength(11)
+    expect(tabs).toHaveLength(12)
     for (const tab of tabs) expect(tab.querySelector('svg')).not.toBeNull()
   })
 

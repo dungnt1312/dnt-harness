@@ -31,11 +31,12 @@ import { PermissionsPanel, type PermissionsSubTab } from './PermissionsPanel.tsx
 import { UnsavedChangesContext, type UnsavedChangesApi } from './unsaved-changes.tsx'
 import { SystemPromptsPanel } from './SystemPromptsPanel.tsx'
 import { UsagePanel } from './UsagePanel.tsx'
+import { ModelAliasesPanel } from './ModelAliasesPanel.tsx'
 import { modelOptions } from '../../lib/providers.ts'
 import type { ModelSettings, ProjectRow, ProviderSummary } from '../../lib/types.ts'
 
 /** Settings are grouped per concern; providers keep their own full editor. */
-type SettingsTab = 'providers' | 'usage' | 'projects' | 'permissions' | 'prompts' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'
+type SettingsTab = 'providers' | 'model-aliases' | 'usage' | 'projects' | 'permissions' | 'prompts' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'
 
 const LEGACY_TAB_REDIRECT: Readonly<Record<string, SettingsTab>> = {
   modes: 'permissions',
@@ -55,6 +56,7 @@ function normalizeTab(raw: string | undefined): SettingsTab | undefined {
 
 const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonly hint: string; readonly icon: IconName }[] = [
   { id: 'providers', label: 'Providers', hint: 'Model endpoints and keys', icon: 'globe' },
+  { id: 'model-aliases', label: 'Model aliases', hint: 'Global subagent model mappings', icon: 'gitBranch' },
   { id: 'usage', label: 'Usage', hint: 'Token usage across every workspace', icon: 'layers' },
   { id: 'projects', label: 'Projects', hint: 'Folders conversations in this workspace can work in', icon: 'folder' },
   { id: 'permissions', label: 'Permissions', hint: 'Modes & dangerous command guard', icon: 'shield' },
@@ -69,7 +71,7 @@ const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonl
 
 /** Nav groups: global settings first, then the active workspace's. */
 const TAB_GROUPS: readonly { readonly label: string; readonly ids: readonly SettingsTab[] }[] = [
-  { label: 'Global', ids: ['providers', 'usage'] },
+  { label: 'Global', ids: ['providers', 'model-aliases', 'usage'] },
   { label: 'Workspace', ids: ['projects', 'permissions', 'prompts', 'skills', 'memory', 'agents', 'mcp', 'hooks', 'secrets'] },
 ]
 
@@ -536,7 +538,7 @@ export function SettingsModal({
             <div className="flex min-w-0 flex-col">
               <div className="flex min-w-0 items-center gap-2">
                 <h2 className="m-0 text-base font-semibold">{activeTab?.label ?? 'Settings'}</h2>
-                {tab === 'providers' || tab === 'usage'
+                {tab === 'providers' || tab === 'model-aliases' || tab === 'usage'
                   ? <Badge>All workspaces</Badge>
                   : <Badge tone="blue" title="These settings apply only to this workspace.">Workspace: {workspaceName ?? workspaceId ?? 'none'}</Badge>}
               </div>
@@ -549,6 +551,7 @@ export function SettingsModal({
 
             {tab === 'usage' ? <UsagePanel /> : tab !== 'providers' ? (
               <UnsavedChangesContext.Provider value={unsavedApi}>
+                {tab === 'model-aliases' ? <ModelAliasesPanel providers={providers} /> : null}
                 {tab === 'projects' ? <ProjectsPanel workspaceId={workspaceId} projects={projects} onChanged={onProjectsChanged} sessionCounts={sessionCounts} /> : null}
                 {tab === 'permissions' ? <PermissionsPanel workspaceId={workspaceId} onChanged={onRefresh} initialSub={permissionsSubOf(initialTab)} /> : null}
                 {tab === 'prompts' ? <SystemPromptsPanel workspaceId={workspaceId} /> : null}

@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { loadProviderStore, loadProviders, maskKey, parseProviderStore, parseProviders, saveProviderStore, saveProviders, slugify } from '../../src/web/provider-store.ts'
+import { loadProviderStore, loadProviders, maskKey, parseProviderStore, parseProviders, saveProviderStore, saveProviders, slugify, validateModelAliasName } from '../../src/web/provider-store.ts'
 
 let dir = ''
 
@@ -46,7 +46,7 @@ describe('provider store', () => {
     expect(parseProviderStore(JSON.stringify([{
       id: 'alpha', name: 'Alpha', baseUrl: 'http://x/v1', apiKey: 'secret',
       models: ['first', 'preferred'], enabled: true,
-    }]))).toEqual({ version: 2, defaults: { provider: null, model: null, thinkingLevel: null }, providers: [] })
+    }]))).toEqual({ version: 2, defaults: { provider: null, model: null, thinkingLevel: null }, providers: [], aliases: [] })
   })
 
   it('ignores a stored defaultModel field: model choice is never per provider', () => {
@@ -64,8 +64,9 @@ describe('provider store', () => {
       version: 2,
       defaults: { provider: 'beta', model: 'b2', thinkingLevel: 'high' },
       providers: [{ id: 'beta', name: 'Beta', baseUrl: 'http://x/v1', apiKey: '', models: ['b1', 'b2'], enabled: true }],
+      aliases: [{ name: 'fast', provider: 'beta', model: 'b2', thinkingLevel: null, revision: 1 }],
     })
-    expect(loadProviderStore(file)).toMatchObject({ defaults: { provider: 'beta', model: 'b2', thinkingLevel: 'high' } })
+    expect(loadProviderStore(file)).toMatchObject({ defaults: { provider: 'beta', model: 'b2', thinkingLevel: 'high' }, aliases: [{ name: 'fast', provider: 'beta', model: 'b2', thinkingLevel: null, revision: 1 }] })
     expect((await readFile(file, 'utf8')).trimStart()).toMatch(/^\{/)
   })
 
@@ -74,6 +75,22 @@ describe('provider store', () => {
       .toEqual({ provider: null, model: null, thinkingLevel: null })
     expect(parseProviderStore(envelope([{ id: 'a', name: 'A', baseUrl: 'http://x', apiKey: '', models: [], enabled: true }])).defaults)
       .toEqual({ provider: null, model: null, thinkingLevel: null })
+  })
+
+  it('loads old v2 files without aliases and retains broken alias targets', async () => {
+    const old = parseProviderStore(envelope([]))
+    expect(old.aliases).toEqual([])
+    const parsed = parseProviderStore(JSON.stringify({ version: 2, defaults: { provider: null, model: null, thinkingLevel: null }, providers: [], aliases: [{ name: 'broken', provider: 'gone', model: 'removed', thinkingLevel: null, revision: 2 }] }))
+    expect(parsed.aliases).toHaveLength(1)
+    const file = path.join(dir, 'retain-aliases.json')
+    await saveProviderStore(file, parsed)
+    await saveProviders(file, [{ id: 'new', name: 'New', baseUrl: 'http://x', apiKey: '', models: ['m'], enabled: true }])
+    expect(loadProviderStore(file).aliases[0]?.name).toBe('broken')
+  })
+
+  it('validates plain alias names', () => {
+    expect(validateModelAliasName(' Fast ')).toBe('Fast')
+    for (const invalid of ['', ' ', 'inherit', 'a b', 'p:m', '@x', 'a\nb']) expect(() => validateModelAliasName(invalid)).toThrow()
   })
 
   it('slugify produces stable url-safe ids', () => {

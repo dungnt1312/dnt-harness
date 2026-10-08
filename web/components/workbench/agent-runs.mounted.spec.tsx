@@ -61,9 +61,8 @@ describe('subagents panel', () => {
     const { host, unmount } = await mount(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />)
     expect(host.textContent).toContain('No active subagents')
     expect(host.textContent).toContain('No ended subagents')
-    // No delegation form: the model delegates, roles live in Settings.
-    expect(host.querySelector('textarea')).toBeNull()
-    expect(host.textContent).not.toContain('Spawn')
+    expect(host.querySelector('textarea[aria-label="Subagent brief"]')).not.toBeNull()
+    expect(host.textContent).toContain('Spawn subagent')
     await unmount()
   })
 
