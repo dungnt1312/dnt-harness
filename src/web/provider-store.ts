@@ -2,7 +2,7 @@ import { mkdir, readFileSync, rename, writeFile } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { open } from 'node:fs/promises'
 import path from 'node:path'
-import { isThinkingLevel } from '../harness/llm/model-catalog.ts'
+import { isThinkingLevel, type ThinkingLevel } from '../harness/llm/model-catalog.ts'
 
 /** Per-model operator overrides stored on one provider entry. */
 export interface ModelSettings {
@@ -29,10 +29,30 @@ export interface ModelDefaults {
   readonly thinkingLevel: string | null
 }
 
+export interface ModelAlias {
+  readonly name: string
+  readonly provider: string
+  readonly model: string
+  readonly thinkingLevel: ThinkingLevel | null
+  readonly revision: number
+}
+
 export interface ProviderStore {
   readonly version: 2
   readonly defaults: ModelDefaults
   readonly providers: readonly ProviderConfig[]
+  readonly aliases: readonly ModelAlias[]
+  /** Monotonic alias mutation generation; never reused after delete/recreate. */
+  readonly aliasGeneration: number
+}
+
+/** Plain alias names are intentionally distinguishable from direct provider:model references. */
+export function validateModelAliasName(raw: string): string {
+  const name = raw.trim()
+  if (name === '') throw new Error('alias name must not be empty')
+  if (name === 'inherit') throw new Error("alias name 'inherit' is reserved")
+  if (/[\s:@\u0000-\u001f\u007f]/.test(name)) throw new Error('alias name must not contain whitespace, colon, @, or control characters')
+  return name
 }
 
 const blankDefaults = (): ModelDefaults => ({ provider: null, model: null, thinkingLevel: null })
@@ -63,13 +83,18 @@ export function repairDefaults(defaults: ModelDefaults, providers: readonly Prov
   return preferredDefaults(providers, defaults.thinkingLevel)
 }
 
-/** Load the complete versioned store. Missing or malformed data is empty. */
+/** Load the complete versioned store. A missing file is empty; other I/O failures surface. */
 export function loadProviderStore(file: string): ProviderStore {
   try {
     return parseProviderStore(readFileSync(file, 'utf8'))
-  } catch {
-    return { version: 2, defaults: blankDefaults(), providers: [] }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return emptyProviderStore()
+    throw error
   }
+}
+
+function emptyProviderStore(): ProviderStore {
+  return { version: 2, defaults: blankDefaults(), providers: [], aliases: [], aliasGeneration: 0 }
 }
 
 /** Backwards-compatible list projection for existing callers. */
@@ -82,23 +107,28 @@ export function parseProviderStore(raw: string): ProviderStore {
   try {
     const parsed: unknown = JSON.parse(raw)
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return { version: 2, defaults: blankDefaults(), providers: [] }
+      return emptyProviderStore()
     }
     const envelope = parsed as Record<string, unknown>
     if (envelope['version'] !== 2 || !Array.isArray(envelope['providers'])) {
-      return { version: 2, defaults: blankDefaults(), providers: [] }
+      return emptyProviderStore()
     }
     const providers = parseProviderEntries(envelope['providers'])
     const rawDefaults = envelope['defaults']
     const defaults = rawDefaults !== null && typeof rawDefaults === 'object' && !Array.isArray(rawDefaults)
       ? parseDefaults(rawDefaults as Record<string, unknown>)
       : blankDefaults()
+    const aliases = Array.isArray(envelope['aliases']) ? parseModelAliases(envelope['aliases']) : []
+    const storedGeneration = envelope['aliasGeneration']
+    const aliasGeneration = typeof storedGeneration === 'number' && Number.isSafeInteger(storedGeneration) && storedGeneration >= 0
+      ? Math.max(storedGeneration, ...aliases.map((alias) => alias.revision), 0)
+      : Math.max(...aliases.map((alias) => alias.revision), 0)
     // The host may supply an injected provider not represented in this file.
-    // Keep a syntactically valid envelope selection intact; the server repairs
-    // it against its complete runtime catalog at the boundary.
-    return { version: 2, defaults, providers }
+    // Keep syntactically valid selections and aliases intact; target availability
+    // is checked live because provider mutations may intentionally break aliases.
+    return { version: 2, defaults, providers, aliases, aliasGeneration }
   } catch {
-    return { version: 2, defaults: blankDefaults(), providers: [] }
+    return emptyProviderStore()
   }
 }
 
@@ -114,6 +144,27 @@ function parseDefaults(candidate: Record<string, unknown>): ModelDefaults {
     ? candidate['thinkingLevel'] as string | null
     : null
   return provider === null || model === null ? { provider: null, model: null, thinkingLevel } : { provider, model, thinkingLevel }
+}
+
+function parseModelAliases(entries: readonly unknown[]): ModelAlias[] {
+  const out: ModelAlias[] = []
+  for (const entry of entries) {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
+    const candidate = entry as Record<string, unknown>
+    try {
+      const name = typeof candidate['name'] === 'string' ? validateModelAliasName(candidate['name']) : ''
+      const provider = candidate['provider']
+      const model = candidate['model']
+      const thinkingLevel = candidate['thinkingLevel']
+      const revision = candidate['revision']
+      if (name === '' || typeof provider !== 'string' || provider === '' || typeof model !== 'string' || model === '') continue
+      if (thinkingLevel !== null && !isThinkingLevel(thinkingLevel)) continue
+      if (typeof revision !== 'number' || !Number.isInteger(revision) || revision < 1) continue
+      if (out.some((alias) => alias.name === name)) continue
+      out.push({ name, provider, model, thinkingLevel, revision })
+    } catch { /* malformed row is dropped; unavailable targets are retained */ }
+  }
+  return out
 }
 
 function parseProviderEntries(entries: readonly unknown[]): ProviderConfig[] {
@@ -179,7 +230,7 @@ async function flushIfSupported(handle: Awaited<ReturnType<typeof open>>): Promi
 /** Compatibility writer: retains the defaults currently on disk where valid. */
 export async function saveProviders(file: string, providers: readonly ProviderConfig[]): Promise<void> {
   const current = loadProviderStore(file)
-  await saveProviderStore(file, { version: 2, defaults: repairDefaults(current.defaults, providers), providers })
+  await saveProviderStore(file, { version: 2, defaults: repairDefaults(current.defaults, providers), providers, aliases: current.aliases, aliasGeneration: current.aliasGeneration })
 }
 
 export function slugify(name: string): string {

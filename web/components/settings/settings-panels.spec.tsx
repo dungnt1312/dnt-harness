@@ -29,6 +29,7 @@ vi.mock('../../lib/api.ts', () => ({
   importMcpServers: vi.fn(async () => ({ imported: ['x'] })),
   setMcpServerAction: vi.fn(async () => ({ status: 'ready' })),
   listAgentDefinitions: vi.fn(async () => []),
+  listModelAliases: vi.fn(async () => []),
   cloneAgentToWorkspace: vi.fn(),
   readAgentFile: vi.fn(),
   listChildren: vi.fn(async () => []),
@@ -230,6 +231,24 @@ describe('agents panel', () => {
     definition: { name: 'auditor', description: 'Audits', tools: ['Read'], disallowedTools: [], instructions: 'Audit.', model: 'opus' },
     modelResolution: { inherit: false, resolved: 'cliproxy:claude-opus-5-5' },
   }
+
+  it('shows resolved and blocking alias role details and stores the plain alias in the role chooser', async () => {
+    const aliased = { ...workspaceRow, definition: { ...workspaceRow.definition, model: 'fast' }, modelResolution: { inherit: false, resolved: 'far:gpt', alias: 'fast', thinkingLevel: null } }
+    const blocked = { ...userRow, definition: { ...userRow.definition, model: 'broken' }, modelResolution: { inherit: false, unresolved: 'broken', alias: 'broken', thinkingLevel: 'high', blocked: true, error: 'model alias broken is unusable' } }
+    vi.mocked(listAgentDefinitions).mockResolvedValueOnce([aliased, blocked] as never)
+    const { listModelAliases } = await import('../../lib/api.ts')
+    vi.mocked(listModelAliases).mockResolvedValueOnce([
+      { name: 'fast', provider: 'far', model: 'gpt', thinkingLevel: null, revision: 1, status: 'valid', warnings: [] },
+      { name: 'broken', provider: 'gone', model: 'old', thinkingLevel: 'high', revision: 1, status: 'invalid', message: 'unusable', warnings: [] },
+    ] as never)
+    await act(async () => root.render(<AgentsPanel workspaceId="ws" />)); await settle()
+    expect(document.body.textContent).toContain('fast → far:gpt · thinking model default')
+    await act(async () => button('Edit').click())
+    expect(document.body.querySelector<HTMLButtonElement>('button[aria-label="Role model"]')?.title).toContain('fast → far:gpt')
+    await act(async () => button('Cancel').click())
+    await act(async () => [...document.body.querySelectorAll<HTMLButtonElement>('[role="option"]')].find((node) => node.textContent?.includes('code-reviewer'))!.click())
+    expect(document.body.textContent).toContain('model alias broken is unusable')
+  })
 
   it('lists roles grouped by layer, opens the first, and shows detail beside the list', async () => {
     vi.mocked(listAgentDefinitions).mockResolvedValueOnce([explorerRow, userRow, workspaceRow] as never)
@@ -558,7 +577,7 @@ describe('settings dialog', () => {
   it('gives every section tab an icon', async () => {
     await render()
     const tabs = [...document.body.querySelectorAll('[role="tab"]')]
-    expect(tabs).toHaveLength(11)
+    expect(tabs).toHaveLength(12)
     for (const tab of tabs) expect(tab.querySelector('svg')).not.toBeNull()
   })
 

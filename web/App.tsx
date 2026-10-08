@@ -525,6 +525,7 @@ function AppShell() {
   // listed child is listed too (delegation is one-level and in-workspace), so
   // no extra route guard is needed.
   const subagentsRootId = subagentsRootSession(currentSession)
+  const subagentsRootProjectId = sessions.find((session) => session.id === subagentsRootId)?.projectId ?? null
   const subagentsRootIsViewed = subagentsRootId === null || subagentsRootId === current
   const subagentsRootStream = useSessionStream(activeWs, subagentsRootIsViewed ? null : subagentsRootId)
   const agentEvents = subagentsRootIsViewed ? events : subagentsRootStream.events
@@ -1639,6 +1640,7 @@ function AppShell() {
       openPath={openRecordedPath}
       sessionId={current}
       agentsSessionId={subagentsRootId ?? current}
+      agentsProjectId={subagentsRootProjectId}
       onOpenChild={openSession}
       processFocus={processFocus}
       terminalShell={preferences.terminalShell}

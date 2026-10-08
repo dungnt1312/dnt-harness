@@ -813,14 +813,19 @@ Resolution order, applied once at spawn (`resolveChildModel`):
 2. the role definition's `model:` frontmatter (set in Settings → Agents),
 3. the parent conversation's effective pair.
 
-The reference is `provider:model` (split on the first colon) or a bare model
-name, which resolves to the parent's provider when that provider offers it,
-otherwise to the single provider that does — an ambiguous name is an error
-naming the candidates, never a silent pick. The pair is validated at spawn and
-then **stamped into the child's own log as a `session/model` event**, so the
-child resolves its model exactly like any other session: the pin survives
-restart, never re-inherits a later global default, and a role may name a model
-hosted by a different provider than its parent.
+A plain reference is first matched exactly and case-sensitively against the
+global model-alias collection. A matching alias resolves to its concrete
+provider/model/thinking target before built-in Claude aliases or bare-model
+resolution. A present but unusable alias is fail-closed: missing/disabled
+providers, removed models, or unsupported thinking reject spawn without
+fallback. Alias `thinkingLevel: null` means the target model's default, never
+the parent's thinking level. `provider:model` bypasses alias matching; an
+unmatched plain name keeps the existing bare-model and Claude-role semantics.
+
+The pair is validated at spawn and then **stamped into the child's own log as a
+`session/model` event**, so the child resolves its model exactly like any other
+session: the pin survives restart, never re-inherits a later global default,
+and alias edits affect future children only.
 
 ## Reading further
 

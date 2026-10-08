@@ -20,6 +20,8 @@ import { bundledDefinition, BUNDLED_AGENT_ROLES, type AgentDefinitionService } f
 import { type ChildExecutor, type ChildHandle, type ChildModel, type SpawnAdmissionResolver, type TaskPacket } from '../harness/agents/executor.ts'
 import { formatChildReports as formatChildReportsText } from './child-reports.ts'
 import type { GrantedRoot, ToolDefinition } from '../harness/tools/types.ts'
+import { expressibleThinkingLevel, type ThinkingLevel } from '../harness/llm/model-catalog.ts'
+import type { ModelAlias } from './provider-store.ts'
 
 /** Most parent-conversation text an `inherit: 'brief'` child receives. */
 export const MAX_INHERITED_CHARS = 12_000
@@ -81,6 +83,8 @@ export interface ChildModelDeps {
   readonly modelsOf: (provider: string) => readonly string[]
   /** Host validation; its message already lists what the provider offers. */
   readonly validate: (provider: string, model: string) => void
+  /** Current global alias authority. */
+  readonly alias?: (name: string) => ModelAlias | undefined
 }
 
 /** How many `provider:model` ids an error message may enumerate. */
@@ -90,6 +94,14 @@ export class ChildModelError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'ChildModelError'
+  }
+}
+
+/** Marker that legacy unresolved-role inheritance must never swallow. */
+export class ModelAliasError extends ChildModelError {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ModelAliasError'
   }
 }
 
@@ -116,11 +128,14 @@ export function resolveChildModel(
   // than failing the spawn.
   const fromDefinition = definitionModel.trim()
   if (fromDefinition === '' || fromDefinition === 'inherit') return resolveModelReference('', deps)
-  const aliased = resolveModelAlias(fromDefinition, deps) ?? fromDefinition
   try {
+    // Custom aliases are exact and case-sensitive, and must win even when their
+    // name collides with a Claude shorthand such as sonnet/opus/haiku.
+    if (deps.alias?.(fromDefinition) !== undefined) return resolveModelReference(fromDefinition, deps)
+    const aliased = resolveModelAlias(fromDefinition, deps) ?? fromDefinition
     return resolveModelReference(aliased, deps)
   } catch (error) {
-    if (error instanceof ChildModelError) return resolveModelReference('', deps)
+    if (error instanceof ChildModelError && !(error instanceof ModelAliasError)) return resolveModelReference('', deps)
     throw error
   }
 }
@@ -133,10 +148,19 @@ export function resolveChildModel(
  */
 export function describeRoleModel(
   definitionModel: string | undefined,
-  deps: Pick<ChildModelDeps, 'parent' | 'providers' | 'modelsOf'>,
-): { readonly resolved?: string; readonly inherit: boolean; readonly unresolved?: string } {
+  deps: Pick<ChildModelDeps, 'parent' | 'providers' | 'modelsOf'> & Partial<Pick<ChildModelDeps, 'validate' | 'alias'>>,
+): { readonly resolved?: string; readonly inherit: boolean; readonly unresolved?: string; readonly alias?: string; readonly thinkingLevel?: ThinkingLevel | null; readonly blocked?: boolean; readonly error?: string } {
   const asked = definitionModel?.trim() ?? ''
   if (asked === '' || asked === 'inherit') return { inherit: true }
+  const custom = deps.alias?.(asked)
+  if (custom !== undefined) {
+    try {
+      validateAlias(custom, { validate: deps.validate ?? (() => undefined) })
+      return { resolved: `${custom.provider}:${custom.model}`, inherit: false, alias: custom.name, thinkingLevel: custom.thinkingLevel }
+    } catch (error) {
+      return { inherit: false, unresolved: asked, alias: custom.name, thinkingLevel: custom.thinkingLevel, blocked: true, error: String(error instanceof Error ? error.message : error) }
+    }
+  }
   const aliased = resolveModelAlias(asked, deps)
   if (aliased !== undefined) return { resolved: aliased, inherit: false }
   const boundary = asked.indexOf(':')
@@ -166,10 +190,16 @@ export function resolveModelAlias(alias: string, deps: Pick<ChildModelDeps, 'par
   return undefined
 }
 
-function resolveModelReference(requested: string, deps: ChildModelDeps): ChildModel | undefined {
+export function resolveModelReference(requested: string, deps: ChildModelDeps): ChildModel | undefined {
   const thinkingLevel = deps.parent.thinkingLevel
   const inherited = withThinking(deps.parent, thinkingLevel)
   if (requested === '') return inherited
+
+  const custom = deps.alias?.(requested)
+  if (custom !== undefined) {
+    validateAlias(custom, deps)
+    return { provider: custom.provider, model: custom.model, thinkingLevel: custom.thinkingLevel }
+  }
 
   const boundary = requested.indexOf(':')
   if (boundary > 0 && boundary < requested.length - 1) {
@@ -199,6 +229,17 @@ function resolveModelReference(requested: string, deps: ChildModelDeps): ChildMo
   }
   deps.validate(chosen, requested)
   return { provider: chosen, model: requested, ...(thinkingLevel !== undefined ? { thinkingLevel } : {}) }
+}
+
+function validateAlias(alias: ModelAlias, deps: Pick<ChildModelDeps, 'validate'>): void {
+  try {
+    deps.validate(alias.provider, alias.model)
+  } catch (error) {
+    throw new ModelAliasError(`model alias '${alias.name}' targets ${alias.provider}:${alias.model}: ${String(error instanceof Error ? error.message : error)}`)
+  }
+  if (alias.thinkingLevel !== null && expressibleThinkingLevel(alias.model, alias.thinkingLevel) !== alias.thinkingLevel) {
+    throw new ModelAliasError(`model alias '${alias.name}' targets ${alias.provider}:${alias.model} with unsupported thinking '${alias.thinkingLevel}'`)
+  }
 }
 
 /** Every usable `provider:model` id, bounded for messages and descriptions. */
@@ -241,6 +282,7 @@ export interface DelegationDeps {
   /** Usable provider ids and their advertised models, for the live catalog. */
   readonly providers: () => readonly string[]
   readonly modelsOf: (provider: string) => readonly string[]
+  readonly aliases?: () => readonly (ModelAlias & { readonly valid: boolean; readonly error?: string })[]
   /** Trusted host authority, invoked by the executor at serialized admission. */
   readonly admissionResolver: SpawnAdmissionResolver
   /** The parent's effective additional folders, snapshotted into the child at spawn. */
@@ -286,6 +328,7 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
     const scope = agentScope.getStore()
     const roles = scope?.workspaceId !== undefined ? rolesFor(scope.workspaceId, scope.projectId) : BUNDLED_ROLES
     const models = availableModels({ providers: deps.providers(), modelsOf: deps.modelsOf })
+    const aliases = deps.aliases?.() ?? []
     const total = deps.providers().reduce((sum, provider) => sum + deps.modelsOf(provider).length, 0)
     return [
       'Delegate a bounded task to a child agent and collect its result.',
@@ -297,7 +340,8 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
       'Children share the project filesystem with their root. Coordinate edits to the same files and re-read before writing; unrelated conversations never own or block this project.',
       `Roles: ${roles.map((role) => `${role.name} (${role.description})`).join('; ') || 'none'}.`,
       `Models as provider:model — ${models.join(', ') || 'none'}${total > models.length ? `, +${total - models.length} more, use action:"catalog"` : ''}.`,
-      'Omit model to inherit this conversation\'s model; grantTools only narrows the role, never widens it.',
+      `Model aliases — ${aliases.map((alias) => alias.valid ? `${alias.name} (${alias.provider}:${alias.model}, thinking ${alias.thinkingLevel ?? 'model default'})` : `${alias.name} (unusable: ${alias.error ?? 'invalid target'})`).join('; ') || 'none'}.`,
+      'Omit model to inherit this conversation\'s model; model accepts a plain alias or provider:model; grantTools only narrows the role, never widens it.',
     ].join(' ')
   }
 
@@ -342,7 +386,7 @@ const PARAMETERS: ToolDefinition['parameters'] = {
     constraints: { type: 'array', items: { type: 'string' }, description: 'spawn: limits the child must respect' },
     references: { type: 'array', items: { type: 'string' }, description: 'spawn: files or facts the child should start from' },
     grantTools: { type: 'array', items: { type: 'string' }, description: 'spawn: narrows the role\'s tools; never widens them' },
-    model: { type: 'string', description: 'spawn: provider:model (or a bare model name); omit to inherit this conversation\'s' },
+    model: { type: 'string', description: 'spawn: a model alias, provider:model, or bare model name; omit to inherit this conversation\'s' },
     childIds: { type: 'array', items: { type: 'string' }, description: 'wait/cancel: child session ids; wait defaults to every running child' },
     timeoutMs: { type: 'number', description: `wait: how long to block, capped at ${MAX_WAIT_MS}` },
   },

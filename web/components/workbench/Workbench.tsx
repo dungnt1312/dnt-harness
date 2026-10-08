@@ -90,10 +90,12 @@ function ViewTab({ view, active, onClick, onClose }: {
  * tab strip. (`events`/`agentEvents` are new arrays per frame by design; the
  * views that read them re-render on their own `useMemo` deps instead.)
  */
-export const Workbench = memo(function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, gitFocusPath = null, onClearGitFilter, processFocus = null }: {
+export const Workbench = memo(function Workbench({ workspaceId, project, agentsProjectId = null, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, gitFocusPath = null, onClearGitFilter, processFocus = null }: {
   readonly workspaceId: string | null
   /** The project whose files are browsable; null for chat-only conversations. */
   readonly project: WorkbenchProject | null
+  /** Project binding of the root delegation session, not necessarily the viewed child. */
+  readonly agentsProjectId?: string | null
   readonly view: WorkbenchView
   readonly onView: (view: WorkbenchView) => void
   /**
@@ -233,6 +235,7 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
       <AgentRunsPanel
         workspaceId={workspaceId}
         rootSessionId={agentsSessionId ?? sessionId}
+        rootProjectId={agentsProjectId}
         briefs={delegation.briefs}
         refreshSignal={delegation.count}
         {...(onOpenChild !== undefined ? { onOpenChild } : {})}
@@ -338,6 +341,7 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
   if (logReads && (previous.events !== next.events || previous.agentEvents !== next.agentEvents)) return false
   return previous.workspaceId === next.workspaceId
     && previous.project === next.project
+    && previous.agentsProjectId === next.agentsProjectId
     && previous.view === next.view
     && previous.views === next.views
     && previous.files === next.files

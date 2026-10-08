@@ -1,5 +1,5 @@
 import type { AttachmentRef } from './composer-draft.ts'
-import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, HooksSectionRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillFileRow, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, UsageDailyResponse, UserQuestionAnswer, WorkspaceMeta, WorkspaceRow } from './types.ts'
+import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, HooksSectionRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelAliasInput, ModelAliasRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillFileRow, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, UsageDailyResponse, UserQuestionAnswer, WorkspaceMeta, WorkspaceRow } from './types.ts'
 
 const CSRF_HEADER = 'x-dnt-harness-csrf'
 let csrfToken: string | undefined
@@ -156,6 +156,22 @@ export function setFolder(path: string): Promise<Meta> {
 
 export function listProviders(): Promise<ProviderSummary[]> {
   return apiFetch('/api/providers').then((r) => json<ProviderSummary[]>(r))
+}
+
+export function listModelAliases(): Promise<ModelAliasRow[]> {
+  return apiFetch('/api/model-aliases').then((r) => json<ModelAliasRow[]>(r))
+}
+
+export function createModelAlias(input: ModelAliasInput): Promise<ModelAliasRow> {
+  return apiFetch('/api/model-aliases', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }).then((r) => json<ModelAliasRow>(r))
+}
+
+export function updateModelAlias(name: string, input: Partial<ModelAliasInput> & { readonly expectedRevision: number }): Promise<ModelAliasRow> {
+  return apiFetch(`/api/model-aliases/${encodeURIComponent(name)}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(input) }).then((r) => json<ModelAliasRow>(r))
+}
+
+export function deleteModelAlias(name: string, expectedRevision: number): Promise<{ deleted: boolean }> {
+  return apiFetch(`/api/model-aliases/${encodeURIComponent(name)}`, { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ expectedRevision }) }).then((r) => json<{ deleted: boolean }>(r))
 }
 
 /** Settings → Usage: daily token rows across every workspace. */
@@ -882,7 +898,7 @@ export function spawnChild(
   rootSessionId: string,
   task: SpawnTaskInput,
   grantTools?: readonly string[],
-  /** `provider:model`; omitted inherits the conversation's own pair. */
+  /** Plain model alias, `provider:model`, or bare model; omitted inherits the conversation's pair. */
   model?: string,
   /** `'brief'` hands the child a bounded slice of the conversation; default off. */
   inherit?: 'none' | 'brief',

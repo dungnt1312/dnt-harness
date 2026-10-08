@@ -1,0 +1,102 @@
+# Task 1 report — Global subagent model aliases
+
+## Trạng thái
+
+**DONE_WITH_CONCERNS**
+
+Đã triển khai end-to-end alias model toàn cục: persistence v2 tương thích file cũ, transaction chung với provider/default, CRUD REST revision-aware, resolver alias-first fail-closed, role/tool catalog, client API/types, Settings CRUD, Agents picker và manual spawn form.
+
+## Files
+
+- `src/web/provider-store.ts` — `ModelAlias`, parser tương thích cũ, validator tên, giữ aliases qua compatibility writer.
+- `src/web/agent-delegation.ts` — alias-first resolver, `ModelAliasError`, null thinking, blocking role display, tool catalog.
+- `src/web/server.ts` — alias runtime state, transaction atomic chung, CRUD REST, row status/warning, shared admission.
+- `web/lib/types.ts`, `web/lib/api.ts` — wire contracts và CRUD client.
+- `web/components/settings/ModelAliasesPanel.tsx` — global CRUD/editor, broken mapping repair/delete, disabled provider guard, discard integration.
+- `web/components/settings/SettingsModal.tsx` — Global nav/tab.
+- `web/components/settings/AgentsPanel.tsx` — alias picker và resolved/broken display.
+- `web/components/workbench/AgentRunsPanel.tsx` — manual spawn role/brief/inherit/alias/direct.
+- `tests/web/provider-store.spec.ts`, `tests/web/agent-model-alias.spec.ts` — persistence/name/resolver/null/fail-closed compatibility.
+- `web/components/settings/settings-panels.spec.tsx`, `web/components/settings/management.spec.tsx`, `web/components/workbench/agent-runs.mounted.spec.tsx` — cập nhật contract UI mới.
+- `docs/harness.md` — precedence, fail-closed, null thinking, future-spawn snapshot.
+- `plans/261008-subagent-model-alias/plan.md`, `progress.md`, file report này — plan/progress evidence.
+
+## Red/green và verification
+
+- Baseline: `npx vitest run tests/web/provider-store.spec.ts tests/web/server-g4.spec.ts tests/web/server-subagents.spec.ts` — PASS, 30 tests.
+- Red đầu tiên: `npx vitest run tests/web/provider-store.spec.ts tests/web/agent-model-alias.spec.ts && npm run typecheck` — resolver suite 1 fail do fixture dùng default parameter khi muốn biểu diễn alias đã xóa; sửa fixture thành `null`, không phải product bug.
+- Green store/resolver: `npx vitest run tests/web/provider-store.spec.ts tests/web/agent-model-alias.spec.ts` — PASS, 17 tests.
+- Typecheck lần đầu — FAIL do compatibility signature `describeRoleModel` bắt buộc `validate`; sửa thành optional seam để caller cũ tương thích.
+- `npm run typecheck` — PASS.
+- Server regressions: `npx vitest run tests/web/server-session-model.spec.ts tests/web/server-g4.spec.ts tests/web/server-subagents.spec.ts` — PASS, 41 tests.
+- UI lần đầu: settings suite FAIL 7 assertions: mocks thiếu API mới và hai assertion contract cũ “không có manual form”/11 tabs; cập nhật theo binding spec.
+- Settings green: `npx vitest run web/components/settings/settings-panels.spec.tsx web/components/settings/management.spec.tsx web/components/settings/unsaved-changes.spec.tsx` — PASS, 71 tests.
+- Workbench lần đầu FAIL do stub trả cùng body cho catalog và child list, cộng assertion contract cũ; lọc defensive catalog rows và cập nhật form assertion.
+- Workbench green: `npx vitest run web/components/workbench/agent-runs.mounted.spec.tsx` — PASS, 6 tests.
+- Final covering: `npm run typecheck && npx vitest run tests/web/provider-store.spec.ts tests/web/agent-model-alias.spec.ts tests/web/server-session-model.spec.ts tests/web/server-g4.spec.ts tests/web/server-subagents.spec.ts web/components/settings/settings-panels.spec.tsx web/components/settings/management.spec.tsx web/components/settings/unsaved-changes.spec.tsx web/components/workbench/agent-runs.mounted.spec.tsx` — PASS, typecheck + 135 tests.
+- `npm run build:web` — PASS, Vite 550 modules, built in 1.56s.
+
+## Follow-up hoàn tất trước review
+
+- Thêm `tests/web/server-model-alias.spec.ts`: CRUD HTTP chuyên biệt, restart/global collection, validation tên/target/thinking, collision warning, rename/delete revision 409, alias độc lập + provider/default mutation đồng thời, injected write failure không publish runtime.
+- Thêm `tests/web/server-model-alias-spawn.spec.ts`: manual HTTP chứng minh explicit alias > role alias, `thinkingLevel: null`, edit chỉ tác động child tương lai và child cũ giữ snapshot; Agent tool dùng alias plain; alias invalid fail trước `agent/child-spawn`, không tạo child.
+- Thêm `web/components/settings/model-aliases-panel.spec.tsx`: mounted create/edit/rename/delete, broken repair/delete, collision warning, disabled provider, inline validation và discard guard.
+- Mở rộng `web/components/settings/settings-panels.spec.tsx` cho alias role resolved/null-thinking và broken-blocking; mở rộng `web/components/workbench/agent-runs.mounted.spec.tsx` cho role/manual chooser alias/direct, unusable option và refresh sau spawn.
+- Sửa hai bug thật: lỗi persistence trong alias CRUD trước đây bị map nhầm thành HTTP 400, nay trả 500; `Select` trước đây bỏ qua `disabled` option nên disabled provider/alias vẫn chọn được, nay chặn mouse/keyboard và expose disabled semantics.
+- Đồng bộ assertion Settings từ 11 lên 12 tabs trong `web/components/ui/ui.spec.tsx`.
+
+## Verification follow-up
+
+- `npx vitest run tests/web/server-model-alias.spec.ts` — PASS, 5 tests.
+- `npx vitest run tests/web/server-model-alias-spawn.spec.ts` — PASS, 2 tests.
+- `npx vitest run web/components/settings/model-aliases-panel.spec.tsx` — PASS, 3 tests.
+- `npx vitest run web/components/workbench/agent-runs.mounted.spec.tsx` — PASS, 7 tests.
+- `npx vitest run web/components/settings/settings-panels.spec.tsx` — PASS, 40 tests.
+- `npm run typecheck && npx vitest run tests/web/provider-store.spec.ts tests/web/agent-model-alias.spec.ts tests/web/server-model-alias.spec.ts tests/web/server-model-alias-spawn.spec.ts tests/web/server-session-model.spec.ts tests/web/server-g4.spec.ts tests/web/server-subagents.spec.ts web/components/settings/model-aliases-panel.spec.tsx web/components/settings/settings-panels.spec.tsx web/components/settings/management.spec.tsx web/components/settings/unsaved-changes.spec.tsx web/components/workbench/agent-runs.mounted.spec.tsx web/components/ui/ui.spec.tsx && npm run build:web` — PASS: typecheck, 164 tests, Vite 550 modules, build 1.63s.
+- `git diff --check` — PASS.
+
+## Fix round 1/5 — findings 1–9
+
+Round 1 xử lý 8 findings; finding 7 mới xử lý project binding nhưng còn residual stale-request được đóng ở round 2:
+
+1. Role model tra custom alias exact trước Claude shorthand, khóa regression alias `sonnet`.
+2. POST alias parse/validate target bên trong serialized provider transaction.
+3. Thêm `aliasGeneration` monotonic persisted; revision không tái sử dụng sau delete/recreate và restart, file v2 cũ seed generation từ revision lớn nhất.
+4. Thinking picker lọc bằng `expressibleThinkingLevel`, có `max`, tự reset level không còn hợp lệ khi đổi model.
+5. Provider catalog rỗng hiển thị text input để nhập concrete model ID.
+6. Blank manual option đổi nhãn đúng ruling: **Use role default / conversation fallback**; không thêm force-inherit semantics.
+7. Manual role catalog nhận project binding của root session kể cả khi đang xem child.
+8. Delete alias đi qua `guardDiscard`.
+9. Store chỉ fallback empty cho `ENOENT`; lỗi read khác được surface, trong khi malformed/old schema vẫn giữ compatibility parser.
+
+Rulings: precedence blank manual giữ nguyên; ABA dùng persisted monotonic generation thay timestamp; target validation nằm trong cùng transaction; project catalog lấy root binding, không lấy child view.
+
+## Verification fix round 1
+
+- `npm run typecheck` — PASS; cả hai `tsc --noEmit` hoàn tất, exit 0.
+- `npx vitest run tests/web/provider-store.spec.ts tests/web/agent-model-alias.spec.ts tests/web/server-model-alias.spec.ts web/components/settings/model-aliases-panel.spec.tsx web/components/workbench/agent-runs.mounted.spec.tsx` — lần đầu FAIL 1/37 do test race dùng injected provider không có provider REST row (PATCH 404); sửa fixture tạo configured provider trước. Rerun PASS: 5 files, 37 tests.
+- `npx vitest run tests/web/provider-store.spec.ts tests/web/agent-model-alias.spec.ts tests/web/server-model-alias.spec.ts tests/web/server-model-alias-spawn.spec.ts tests/web/server-session-model.spec.ts tests/web/server-g4.spec.ts tests/web/server-subagents.spec.ts web/components/settings/model-aliases-panel.spec.tsx web/components/settings/settings-panels.spec.tsx web/components/settings/management.spec.tsx web/components/settings/unsaved-changes.spec.tsx web/components/workbench/agent-runs.mounted.spec.tsx web/components/ui/ui.spec.tsx` — PASS: 13 files, 169 tests, exit 0.
+- `npm run build:web` — PASS: Vite 550 modules, built in 1.65s, exit 0.
+- `git diff --check` — PASS, exit 0.
+
+## Fix round 2/5 — residual F7 P2
+
+Kết luận lại round 1: **8 finding đã đóng, 1 finding còn mở**. Finding 7 mới chỉ truyền `rootProjectId`; effect catalog trong `AgentRunsPanel` vẫn cho response request cũ ghi đè khi binding đổi `null → project` trong cùng root scope.
+
+Round 2 đã đóng residual này:
+
+- Catalog effect có request generation và cleanup invalidation; success/error từ generation cũ không còn publish state.
+- Khi binding đổi, role/alias cũ bị xóa và form chuyển sang loading-disabled, nên không thể spawn role thuộc binding trước trong lúc request mới chưa hoàn tất hoặc lỗi.
+- Sau mỗi catalog hợp lệ, selection được reconcile: giữ role đang chọn nếu role còn tồn tại, ngược lại chọn role hợp lệ đầu tiên hoặc rỗng.
+- Thêm mounted regression dùng hai deferred response resolve ngược thứ tự; project role/selection vẫn được giữ và POST chỉ dùng project role.
+
+## Verification fix round 2
+
+- `npx vitest run web/components/workbench/agent-runs.mounted.spec.tsx` — PASS: 1 file, 8 tests, exit 0.
+- `npm run typecheck` — PASS: cả hai `tsc --noEmit` hoàn tất, exit 0.
+- `git diff --check` — PASS, exit 0.
+
+## Concerns
+
+- Không còn concern mở trong scope được yêu cầu.
+- Không chạy full repository suite; round 2 chỉ chạy mounted suite được yêu cầu, typecheck và diff check. Ma trận rộng/build của round 1 vẫn được ghi ở trên.
