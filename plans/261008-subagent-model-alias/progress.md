@@ -56,6 +56,21 @@ Ruling: Test hiện hữu “no delegation form” là contract cũ trái bindin
 
 Ruling: Không thêm phase files/AK validation theo chỉ thị; giữ checklist evidence tại progress này. Cost nếu sai: low, plan tooling không theo dõi phase nhưng artifact delivery vẫn đầy đủ.
 
+## Fix round 1/5 (2026-10-08 Asia/Saigon)
+
+- [x] Findings 1–9 đều đã sửa và có regression tương ứng.
+- [x] Ruling finding 6: chỉ relabel blank option thành `Use role default / conversation fallback`, giữ precedence hiện tại.
+- [x] ABA: persisted monotonic `aliasGeneration`, sống qua restart và delete/recreate; không dùng `Date.now`.
+- [x] POST validation chuyển vào serialized callback; provider mutation trước đó được quan sát đúng.
+- [x] Store read chỉ swallow `ENOENT`; lỗi I/O khác chặn boot/mutation, parser schema cũ/malformed vẫn compatible như trước.
+- [x] Manual catalog dùng root session project binding khi xem child.
+- [x] UI thinking capability-based, provider empty catalog có concrete model input, Delete có discard guard.
+- [x] Verification: typecheck PASS; focused 37 tests PASS; covering 169 tests PASS; web build PASS; diff check PASS.
+
+Ruling/cost: persisted generation thêm optional-compatible field vào v2 envelope; parser file cũ suy ra từ max row revision. Nếu sai, stale revision có thể xóa row recreate (high), nên regression restart + stale delete khóa hành vi.
+
+Ruling/cost: root project id lấy từ durable session listing của root, không từ project của child đang xem. Nếu sai, project role biến mất trên manual spawn (medium), nên mounted API URL assertion khóa query.
+
 ## Concerns
 
 - Scope vẫn cross-layer và `src/web/server.ts` lớn; nguy cơ cao nhất là thêm alias state nhưng bỏ sót một store literal hoặc một provider/default mutation. Compile + provider transaction tests phải bắt buộc.

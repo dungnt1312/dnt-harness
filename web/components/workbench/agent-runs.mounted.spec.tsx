@@ -34,16 +34,18 @@ describe('subagents panel', () => {
       calls.push({ url, ...(init === undefined ? {} : { init }) })
       const body = url === '/api/model-aliases'
         ? [{ name: 'fast', provider: 'far', model: 'gpt', thinkingLevel: null, revision: 1, status: 'valid', warnings: [] }, { name: 'broken', provider: 'gone', model: 'old', thinkingLevel: null, revision: 1, status: 'invalid', message: 'gone', warnings: [] }]
-        : url === '/api/workspaces/ws-1/agents' ? [{ source: 'bundled', definition: { name: 'explorer', description: 'Explore', tools: [], disallowedTools: [], instructions: '' } }]
+        : url === '/api/workspaces/ws-1/agents?projectId=project-root' ? [{ source: 'project', definition: { name: 'explorer', description: 'Explore', tools: [], disallowedTools: [], instructions: '' } }]
           : url.includes('/agents/children') ? (childrenReads++, [])
             : { childSessionId: 'child', status: 'running' }
       return Promise.resolve({ ok: true, json: async () => body })
     }))
-    const { host, unmount } = await mount(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />)
+    const { host, unmount } = await mount(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" rootProjectId="project-root" />)
     await act(async () => { await Promise.resolve(); await Promise.resolve() })
     const role = host.querySelector<HTMLSelectElement>('select[aria-label="Subagent role"]')!
     const model = host.querySelector<HTMLSelectElement>('select[aria-label="Subagent model"]')!
     expect(role.value).toBe('explorer')
+    expect(calls.some((call) => call.url === '/api/workspaces/ws-1/agents?projectId=project-root')).toBe(true)
+    expect(model.options[0]?.textContent).toBe('Use role default / conversation fallback')
     expect([...model.options].find((option) => option.value === 'broken')?.disabled).toBe(true)
     await act(async () => { Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')!.set!.call(model, 'fast'); model.dispatchEvent(new Event('change', { bubbles: true })) })
     const brief = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Subagent brief"]')!

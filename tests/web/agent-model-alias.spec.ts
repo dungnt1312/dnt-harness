@@ -18,6 +18,11 @@ describe('global model aliases', () => {
     expect(resolveChildModel('p1:fast', undefined, deps())).toEqual({ provider: 'p1', model: 'fast', thinkingLevel: 'medium' })
   })
 
+  it('lets a custom role alias shadow Claude shorthand before heuristic conversion', () => {
+    const sonnet = { ...alias(), name: 'sonnet' }
+    expect(resolveChildModel(undefined, 'sonnet', deps(sonnet))).toEqual({ provider: 'p2', model: 'gpt-5', thinkingLevel: 'high' })
+  })
+
   it('keeps null thinking instead of inheriting parent thinking', () => {
     expect(resolveChildModel('fast', undefined, deps(alias(null)))).toEqual({ provider: 'p2', model: 'gpt-5', thinkingLevel: null })
   })

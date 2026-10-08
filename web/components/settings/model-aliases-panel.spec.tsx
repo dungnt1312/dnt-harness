@@ -14,6 +14,7 @@ vi.mock('../../lib/api.ts', () => ({
 const providers = [
   { id: 'alpha', name: 'Alpha', enabled: true, models: ['a1', 'a2'], keyMasked: '', baseUrl: '' },
   { id: 'off', name: 'Off', enabled: false, models: ['o1'], keyMasked: '', baseUrl: '' },
+  { id: 'open', name: 'Open catalog', enabled: true, models: [], keyMasked: '', baseUrl: '' },
 ] as never
 const valid = { name: 'fast', provider: 'alpha', model: 'a1', thinkingLevel: null, revision: 1, status: 'valid', warnings: ['shadows advertised model'] } as const
 const broken = { name: 'broken', provider: 'gone', model: 'old', thinkingLevel: 'high', revision: 3, status: 'invalid', message: "no usable provider 'gone'", warnings: [] } as const
@@ -82,7 +83,21 @@ describe('ModelAliasesPanel mounted CRUD', () => {
     expect(button('Save alias').disabled).toBe(true)
   })
 
-  it('guards row switches and New when a draft is dirty', async () => {
+  it('uses capability-based thinking options, resets invalid thinking on model change, and accepts empty-catalog model IDs', async () => {
+    await act(async () => root.render(<ModelAliasesPanel providers={providers} />)); await settle()
+    await act(async () => button('New').click())
+    await choose('Alias provider', 'Open catalog')
+    expect(input('Alias model')).not.toBeNull()
+    await act(async () => set(input('Alias model'), 'glm-5.2'))
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Alias thinking"]')!.click())
+    expect([...document.body.querySelectorAll('[role="option"]')].map((node) => node.textContent)).toContain('max')
+    await act(async () => document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+    await choose('Alias thinking', 'max')
+    await act(async () => set(input('Alias model'), 'glm-5.1'))
+    expect(host.querySelector<HTMLButtonElement>('button[aria-label="Alias thinking"]')!.textContent).toContain('Model default')
+  })
+
+  it('guards row switches, New, and Delete when a draft is dirty', async () => {
     const confirmDiscard = vi.fn()
     await act(async () => root.render(<UnsavedChangesContext.Provider value={{ report: vi.fn(), confirmDiscard }}><ModelAliasesPanel providers={providers} /></UnsavedChangesContext.Provider>)); await settle()
     await act(async () => button('fast').click())
@@ -92,5 +107,8 @@ describe('ModelAliasesPanel mounted CRUD', () => {
     expect(input('Alias name').value).toBe('changed')
     await act(async () => button('New').click())
     expect(confirmDiscard).toHaveBeenCalledTimes(2)
+    await act(async () => button('Delete alias').click())
+    expect(confirmDiscard).toHaveBeenCalledTimes(3)
+    expect(api.deleteModelAlias).not.toHaveBeenCalled()
   })
 })

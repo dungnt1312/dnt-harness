@@ -128,8 +128,11 @@ export function resolveChildModel(
   // than failing the spawn.
   const fromDefinition = definitionModel.trim()
   if (fromDefinition === '' || fromDefinition === 'inherit') return resolveModelReference('', deps)
-  const aliased = resolveModelAlias(fromDefinition, deps) ?? fromDefinition
   try {
+    // Custom aliases are exact and case-sensitive, and must win even when their
+    // name collides with a Claude shorthand such as sonnet/opus/haiku.
+    if (deps.alias?.(fromDefinition) !== undefined) return resolveModelReference(fromDefinition, deps)
+    const aliased = resolveModelAlias(fromDefinition, deps) ?? fromDefinition
     return resolveModelReference(aliased, deps)
   } catch (error) {
     if (error instanceof ChildModelError && !(error instanceof ModelAliasError)) return resolveModelReference('', deps)

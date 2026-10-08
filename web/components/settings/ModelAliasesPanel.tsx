@@ -6,6 +6,7 @@ import { Field } from '../ui/Field.tsx'
 import { Select } from '../ui/Select.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
 import { useUnsavedChanges } from './unsaved-changes.tsx'
+import { expressibleThinkingLevel } from '../../lib/model-info.ts'
 
 const EMPTY: ModelAliasInput = { name: '', provider: '', model: '', thinkingLevel: null }
 
@@ -19,6 +20,8 @@ export function ModelAliasesPanel({ providers }: { readonly providers: readonly 
   const dirty = JSON.stringify(draft) !== JSON.stringify(selected === null ? EMPTY : { name: selected.name, provider: selected.provider, model: selected.model, thinkingLevel: selected.thinkingLevel })
   const guardDiscard = useUnsavedChanges(dirty)
   const provider = providers.find((entry) => entry.id === draft.provider)
+  const thinkingLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].filter((level) => expressibleThinkingLevel(draft.model, level) === level)
+  const changeModel = (model: string) => setDraft({ ...draft, model, thinkingLevel: draft.thinkingLevel !== null && expressibleThinkingLevel(model, draft.thinkingLevel) !== draft.thinkingLevel ? null : draft.thinkingLevel })
   const nameError = draft.name.trim() === '' || /[\s:@\u0000-\u001f\u007f]/.test(draft.name.trim()) || draft.name.trim() === 'inherit'
     ? 'Use a non-empty name without whitespace, colon, @, controls, or “inherit”.' : null
   const save = async () => {
@@ -39,14 +42,16 @@ export function ModelAliasesPanel({ providers }: { readonly providers: readonly 
     <section className="min-w-0 flex-1 space-y-4" aria-label="Model alias editor">
       <p className="m-0 text-sm text-fg-muted">Aliases are global. Rename or deletion does not update role files; old names return to normal model resolution.</p>
       <Field label="Alias name" hint={nameError ?? undefined} tone={nameError === null ? 'default' : 'bad'}><TextInput aria-label="Alias name" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></Field>
-      <Field label="Provider"><Select label="Alias provider" value={draft.provider} onChange={(value) => setDraft({ ...draft, provider: value, model: '' })} options={[{ value: '', label: 'Select provider' }, ...providers.map((entry) => ({ value: entry.id, label: `${entry.name}${entry.enabled ? '' : ' (disabled)'}`, disabled: !entry.enabled }))]} /></Field>
-      <Field label="Model"><Select label="Alias model" value={draft.model} onChange={(value) => setDraft({ ...draft, model: value })} options={[{ value: '', label: 'Select model' }, ...(provider?.models ?? []).map((model) => ({ value: model, label: model }))]} /></Field>
-      <Field label="Thinking"><Select label="Alias thinking" value={draft.thinkingLevel ?? ''} onChange={(value) => setDraft({ ...draft, thinkingLevel: value === '' ? null : value })} options={[{ value: '', label: 'Model default' }, ...['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].map((level) => ({ value: level, label: level }))]} /></Field>
+      <Field label="Provider"><Select label="Alias provider" value={draft.provider} onChange={(value) => setDraft({ ...draft, provider: value, model: '', thinkingLevel: null })} options={[{ value: '', label: 'Select provider' }, ...providers.map((entry) => ({ value: entry.id, label: `${entry.name}${entry.enabled ? '' : ' (disabled)'}`, disabled: !entry.enabled }))]} /></Field>
+      <Field label="Model">{provider !== undefined && provider.models.length === 0
+        ? <TextInput aria-label="Alias model" value={draft.model} onChange={(event) => changeModel(event.target.value)} placeholder="Concrete model ID" />
+        : <Select label="Alias model" value={draft.model} onChange={changeModel} options={[{ value: '', label: 'Select model' }, ...(provider?.models ?? []).map((model) => ({ value: model, label: model }))]} />}</Field>
+      <Field label="Thinking"><Select label="Alias thinking" value={draft.thinkingLevel ?? ''} onChange={(value) => setDraft({ ...draft, thinkingLevel: value === '' ? null : value })} options={[{ value: '', label: 'Model default' }, ...thinkingLevels.map((level) => ({ value: level, label: level }))]} /></Field>
       <p className="text-sm text-fg-muted">Target: {draft.provider && draft.model ? `${draft.provider}:${draft.model} · ${draft.thinkingLevel ?? 'model default'}` : 'Select a provider and model'}</p>
       {selected?.status === 'invalid' ? <p role="alert" className="text-sm text-bad">Unusable: {selected.message}. Repair the target or delete this alias.</p> : null}
       {selected?.warnings.map((warning) => <p key={warning} className="text-sm text-warn">Warning: {warning}</p>)}
       {error !== null ? <p role="alert" className="text-sm text-bad">{error}</p> : null}
-      <div className="flex gap-2"><Button disabled={nameError !== null || draft.provider === '' || draft.model === ''} onClick={() => void save()}>Save alias</Button>{selected !== null ? <Button onClick={() => void deleteModelAlias(selected.name, selected.revision).then(() => { setSelected(null); setDraft(EMPTY); return refresh() }).catch((cause) => setError(String(cause)))}>Delete alias</Button> : null}</div>
+      <div className="flex gap-2"><Button disabled={nameError !== null || draft.provider === '' || draft.model === ''} onClick={() => void save()}>Save alias</Button>{selected !== null ? <Button onClick={() => guardDiscard(() => { void deleteModelAlias(selected.name, selected.revision).then(() => { setSelected(null); setDraft(EMPTY); return refresh() }).catch((cause) => setError(String(cause))) })}>Delete alias</Button> : null}</div>
     </section>
   </div>
 }

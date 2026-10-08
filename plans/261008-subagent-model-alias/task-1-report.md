@@ -55,6 +55,30 @@
 - `npm run typecheck && npx vitest run tests/web/provider-store.spec.ts tests/web/agent-model-alias.spec.ts tests/web/server-model-alias.spec.ts tests/web/server-model-alias-spawn.spec.ts tests/web/server-session-model.spec.ts tests/web/server-g4.spec.ts tests/web/server-subagents.spec.ts web/components/settings/model-aliases-panel.spec.tsx web/components/settings/settings-panels.spec.tsx web/components/settings/management.spec.tsx web/components/settings/unsaved-changes.spec.tsx web/components/workbench/agent-runs.mounted.spec.tsx web/components/ui/ui.spec.tsx && npm run build:web` — PASS: typecheck, 164 tests, Vite 550 modules, build 1.63s.
 - `git diff --check` — PASS.
 
+## Fix round 1/5 — findings 1–9
+
+Đã xử lý toàn bộ review findings trong một wave:
+
+1. Role model tra custom alias exact trước Claude shorthand, khóa regression alias `sonnet`.
+2. POST alias parse/validate target bên trong serialized provider transaction.
+3. Thêm `aliasGeneration` monotonic persisted; revision không tái sử dụng sau delete/recreate và restart, file v2 cũ seed generation từ revision lớn nhất.
+4. Thinking picker lọc bằng `expressibleThinkingLevel`, có `max`, tự reset level không còn hợp lệ khi đổi model.
+5. Provider catalog rỗng hiển thị text input để nhập concrete model ID.
+6. Blank manual option đổi nhãn đúng ruling: **Use role default / conversation fallback**; không thêm force-inherit semantics.
+7. Manual role catalog nhận project binding của root session kể cả khi đang xem child.
+8. Delete alias đi qua `guardDiscard`.
+9. Store chỉ fallback empty cho `ENOENT`; lỗi read khác được surface, trong khi malformed/old schema vẫn giữ compatibility parser.
+
+Rulings: precedence blank manual giữ nguyên; ABA dùng persisted monotonic generation thay timestamp; target validation nằm trong cùng transaction; project catalog lấy root binding, không lấy child view.
+
+## Verification fix round 1
+
+- `npm run typecheck` — PASS; cả hai `tsc --noEmit` hoàn tất, exit 0.
+- `npx vitest run tests/web/provider-store.spec.ts tests/web/agent-model-alias.spec.ts tests/web/server-model-alias.spec.ts web/components/settings/model-aliases-panel.spec.tsx web/components/workbench/agent-runs.mounted.spec.tsx` — lần đầu FAIL 1/37 do test race dùng injected provider không có provider REST row (PATCH 404); sửa fixture tạo configured provider trước. Rerun PASS: 5 files, 37 tests.
+- `npx vitest run tests/web/provider-store.spec.ts tests/web/agent-model-alias.spec.ts tests/web/server-model-alias.spec.ts tests/web/server-model-alias-spawn.spec.ts tests/web/server-session-model.spec.ts tests/web/server-g4.spec.ts tests/web/server-subagents.spec.ts web/components/settings/model-aliases-panel.spec.tsx web/components/settings/settings-panels.spec.tsx web/components/settings/management.spec.tsx web/components/settings/unsaved-changes.spec.tsx web/components/workbench/agent-runs.mounted.spec.tsx web/components/ui/ui.spec.tsx` — PASS: 13 files, 169 tests, exit 0.
+- `npm run build:web` — PASS: Vite 550 modules, built in 1.65s, exit 0.
+- `git diff --check` — PASS, exit 0.
+
 ## Concerns
 
 - Không còn concern mở trong scope được yêu cầu.

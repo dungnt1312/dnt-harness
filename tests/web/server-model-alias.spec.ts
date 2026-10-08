@@ -75,6 +75,30 @@ describe('global model alias HTTP CRUD', () => {
     expect((await create(base, { name: 'sonnet', provider: 'alpha', model: 'a1', thinkingLevel: null })).status).toBe(409)
   })
 
+  it('never reuses a revision after delete/recreate, including across restart', async () => {
+    const { server, base, home, file } = await boot()
+    const first = await create(base, { name: 'fast', provider: 'alpha', model: 'a1', thinkingLevel: null })
+    const firstRow = await first.json() as { revision: number }
+    await remove(base, 'fast', firstRow.revision)
+    await server.close(); servers.splice(servers.indexOf(server), 1)
+    const restarted = await createWebServer({ home, configFile: file, providers: [provider('alpha', ['a1', 'a2'])] })
+    servers.push(restarted)
+    const recreated = await create(restarted.url, { name: 'fast', provider: 'alpha', model: 'a1', thinkingLevel: null })
+    const recreatedRow = await recreated.json() as { revision: number }
+    expect(recreatedRow.revision).toBeGreaterThan(firstRow.revision)
+    expect((await remove(restarted.url, 'fast', firstRow.revision)).status).toBe(409)
+  })
+
+  it('validates create targets inside the serialized transaction', async () => {
+    const { base } = await boot({ providers: [] })
+    expect((await json(base, 'POST', '/api/providers', { name: 'Alpha', baseUrl: 'http://127.0.0.1:9/v1', apiKey: '', models: ['a1'] })).status).toBe(201)
+    const disable = json(base, 'PATCH', '/api/providers/alpha', { enabled: false })
+    const createAfter = create(base, { name: 'late', provider: 'alpha', model: 'a1', thinkingLevel: null })
+    expect((await disable).status).toBe(200)
+    expect((await createAfter).status).toBe(400)
+    expect(await list(base)).toEqual([])
+  })
+
   it('returns 409 for stale rename/delete revisions and keeps the committed row', async () => {
     const { base } = await boot()
     await create(base, { name: 'fast', provider: 'alpha', model: 'a1', thinkingLevel: null })
@@ -96,6 +120,7 @@ describe('global model alias HTTP CRUD', () => {
         { id: 'beta', name: 'Beta', baseUrl: 'http://127.0.0.1:9/v1', apiKey: '', models: ['b1'], enabled: true },
       ],
       aliases: [],
+      aliasGeneration: 0,
     }
     await saveProviderStore(file, initial)
     const server = await createWebServer({ home, configFile: file })

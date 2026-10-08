@@ -17,6 +17,8 @@ import type { AgentDefinitionRow, ChildRow, ModelAliasRow } from '../../lib/type
 export interface AgentRunsPanelProps {
   readonly workspaceId: string | null
   readonly rootSessionId: string | null
+  /** Project bound to the root session, even while a child conversation is viewed. */
+  readonly rootProjectId?: string | null
   /** Each child's brief from the root's log, keyed by child session id. */
   readonly briefs?: ReadonlyMap<string, string>
   /** Bumped when the conversation itself delegates, so its children appear at once. */
@@ -54,7 +56,7 @@ const STATUS_TONE: Readonly<Partial<Record<ChildRow['status'], string>>> = {
   uncertain: 'bg-warn-soft text-warn',
 }
 
-function AgentRunsPanelContent({ workspaceId, rootSessionId, briefs, refreshSignal, onOpenChild }: AgentRunsPanelProps) {
+function AgentRunsPanelContent({ workspaceId, rootSessionId, rootProjectId, briefs, refreshSignal, onOpenChild }: AgentRunsPanelProps) {
   const [children, setChildren] = useScopedState<readonly ChildRow[]>([])
   const [failure, setFailure] = useScopedState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
@@ -77,12 +79,12 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, briefs, refreshSign
   useEffect(() => { void refresh() }, [refresh, refreshSignal])
   useEffect(() => {
     if (workspaceId === null) return
-    void Promise.all([listAgentDefinitions(workspaceId), listModelAliases()]).then(([nextRoles, nextAliases]) => {
+    void Promise.all([listAgentDefinitions(workspaceId, rootProjectId), listModelAliases()]).then(([nextRoles, nextAliases]) => {
       const validRoles = nextRoles.filter((entry) => entry?.definition?.name !== undefined)
       const validAliases = nextAliases.filter((entry) => typeof entry?.name === 'string')
       setRoles(validRoles); setAliases(validAliases); if (role === '' && validRoles[0] !== undefined) setRole(validRoles[0].definition.name)
     }).catch((cause) => setFailure(String(cause)))
-  }, [workspaceId])
+  }, [workspaceId, rootProjectId])
 
   // Poll only while a child runs or settles; it stops by itself when none do.
   useEffect(() => {
@@ -199,7 +201,7 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, briefs, refreshSign
         <h3 className="m-0 text-sm font-semibold">Spawn subagent</h3>
         <label className="block text-xs text-fg-muted">Role<select aria-label="Subagent role" className="mt-1 h-9 w-full rounded-md border border-line bg-bg px-2 text-sm" value={role} onChange={(event) => setRole(event.target.value)}>{roles.map((entry) => <option key={entry.definition.name} value={entry.definition.name}>{entry.definition.name}</option>)}</select></label>
         <label className="block text-xs text-fg-muted">Brief<textarea aria-label="Subagent brief" className="mt-1 min-h-20 w-full rounded-md border border-line bg-bg p-2 text-sm" value={brief} onChange={(event) => setBrief(event.target.value)} /></label>
-        <label className="block text-xs text-fg-muted">Model<select aria-label="Subagent model" className="mt-1 h-9 w-full rounded-md border border-line bg-bg px-2 text-sm" value={model} onChange={(event) => setModel(event.target.value)}><option value="">Inherit conversation model</option>{aliases.map((alias) => <option key={alias.name} value={alias.name} disabled={alias.status === 'invalid'}>{alias.name} → {alias.provider}:{alias.model}{alias.status === 'invalid' ? ' (unusable)' : ''}</option>)}</select></label>
+        <label className="block text-xs text-fg-muted">Model<select aria-label="Subagent model" className="mt-1 h-9 w-full rounded-md border border-line bg-bg px-2 text-sm" value={model} onChange={(event) => setModel(event.target.value)}><option value="">Use role default / conversation fallback</option>{aliases.map((alias) => <option key={alias.name} value={alias.name} disabled={alias.status === 'invalid'}>{alias.name} → {alias.provider}:{alias.model}{alias.status === 'invalid' ? ' (unusable)' : ''}</option>)}</select></label>
         <label className="block text-xs text-fg-muted">Direct provider:model<input aria-label="Direct subagent model" className="mt-1 h-9 w-full rounded-md border border-line bg-bg px-2 text-sm" value={model.includes(':') ? model : ''} onChange={(event) => setModel(event.target.value)} placeholder="provider:model" /></label>
         {selectedAlias?.status === 'invalid' ? <p role="alert" className="m-0 text-xs text-bad">Alias unusable: {selectedAlias.message}</p> : null}
         <button type="submit" disabled={busy !== null || role === '' || brief.trim() === '' || selectedAlias?.status === 'invalid'} className="rounded-md bg-accent px-3 py-2 text-sm text-white disabled:opacity-50">{busy === 'spawn' ? 'Spawning…' : 'Spawn'}</button>

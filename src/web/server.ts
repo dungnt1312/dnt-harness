@@ -707,6 +707,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const storedProviders = loadProviderStore(configFile)
   let list: ProviderConfig[] = [...storedProviders.providers]
   let aliases: ModelAlias[] = [...storedProviders.aliases]
+  let aliasGeneration = storedProviders.aliasGeneration
   let durableDefaults: ModelDefaults = storedProviders.defaults
   let runtimeModelOverride: { readonly provider: string; readonly model: string } | undefined
   let defaults: ModelDefaults = durableDefaults
@@ -723,7 +724,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       }]
       durableDefaults = repairDefaults(durableDefaults, list)
       defaults = durableDefaults
-      await saveProviderStore(configFile, { version: 2, defaults: durableDefaults, providers: list, aliases })
+      await saveProviderStore(configFile, { version: 2, defaults: durableDefaults, providers: list, aliases, aliasGeneration })
     }
   }
 
@@ -2899,7 +2900,7 @@ ${entry.description}`.toLowerCase().includes(query))
    */
   let providerTransactionTail: Promise<void> = Promise.resolve()
   const mutateProviderStore = async <T>(
-    derive: (current: { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases: readonly ModelAlias[] }) => { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases?: readonly ModelAlias[]; readonly result: T } | Promise<{ readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases?: readonly ModelAlias[]; readonly result: T }>,
+    derive: (current: { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases: readonly ModelAlias[]; readonly aliasGeneration: number }) => { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases?: readonly ModelAlias[]; readonly aliasGeneration?: number; readonly result: T } | Promise<{ readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases?: readonly ModelAlias[]; readonly aliasGeneration?: number; readonly result: T }>,
     transactionOptions?: { readonly clearRuntimeModelOverride?: boolean },
   ): Promise<T> => {
     let release: (() => void) | undefined
@@ -2907,12 +2908,14 @@ ${entry.description}`.toLowerCase().includes(query))
     providerTransactionTail = new Promise<void>((resolve) => { release = resolve })
     await predecessor
     try {
-      const derived = await derive({ providers: list, defaults: durableDefaults, aliases })
+      const derived = await derive({ providers: list, defaults: durableDefaults, aliases, aliasGeneration })
       const repaired = repairGlobalDefaults(derived.defaults, derived.providers)
       const nextAliases = derived.aliases ?? aliases
-      await (options.providerStoreWriter ?? saveProviderStore)(configFile, { version: 2, defaults: repaired, providers: derived.providers, aliases: nextAliases })
+      const nextAliasGeneration = derived.aliasGeneration ?? aliasGeneration
+      await (options.providerStoreWriter ?? saveProviderStore)(configFile, { version: 2, defaults: repaired, providers: derived.providers, aliases: nextAliases, aliasGeneration: nextAliasGeneration })
       list = [...derived.providers]
       aliases = [...nextAliases]
+      aliasGeneration = nextAliasGeneration
       durableDefaults = repaired
       if (transactionOptions?.clearRuntimeModelOverride === true) runtimeModelOverride = undefined
       // The process-local startup override is valid only while its selected
@@ -3290,7 +3293,7 @@ interface HandlerDeps {
   readonly aliases: () => readonly ModelAlias[]
   readonly defaults: () => ModelDefaults
   readonly setDefaults: (next: ModelDefaults) => void
-  readonly mutateProviderStore: <T>(derive: (current: { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases: readonly ModelAlias[] }) => { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases?: readonly ModelAlias[]; readonly result: T } | Promise<{ readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases?: readonly ModelAlias[]; readonly result: T }>, options?: { readonly clearRuntimeModelOverride?: boolean }) => Promise<T>
+  readonly mutateProviderStore: <T>(derive: (current: { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases: readonly ModelAlias[]; readonly aliasGeneration: number }) => { readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases?: readonly ModelAlias[]; readonly aliasGeneration?: number; readonly result: T } | Promise<{ readonly providers: readonly ProviderConfig[]; readonly defaults: ModelDefaults; readonly aliases?: readonly ModelAlias[]; readonly aliasGeneration?: number; readonly result: T }>, options?: { readonly clearRuntimeModelOverride?: boolean }) => Promise<T>
   readonly publicSummary: () => readonly PublicProvider[]
   readonly terminals: TerminalService
   readonly terminalsEnabled: boolean
@@ -6206,11 +6209,12 @@ async function handleApi(
     if (req.method === 'POST' && pathname === '/api/model-aliases') {
       const body = await readJson(req)
       try {
-        const input = parseModelAliasInput(deps, body)
-        const created = await deps.mutateProviderStore(({ providers, defaults, aliases }) => {
+        const created = await deps.mutateProviderStore(({ providers, defaults, aliases, aliasGeneration }) => {
+          const input = parseModelAliasInput(deps, body)
           if (aliases.some((alias) => alias.name === input.name)) throw new ModelAliasConflict(`model alias '${input.name}' already exists`)
-          const entry: ModelAlias = { ...input, revision: 1 }
-          return { providers, defaults, aliases: [...aliases, entry], result: entry }
+          const revision = aliasGeneration + 1
+          const entry: ModelAlias = { ...input, revision }
+          return { providers, defaults, aliases: [...aliases, entry], aliasGeneration: revision, result: entry }
         })
         send(201, modelAliasRow(deps, created))
       } catch (error) {
@@ -6236,14 +6240,15 @@ async function handleApi(
           })
           send(200, { deleted })
         } else {
-          const patched = await deps.mutateProviderStore(({ providers, defaults, aliases }) => {
+          const patched = await deps.mutateProviderStore(({ providers, defaults, aliases, aliasGeneration }) => {
             const current = aliases.find((alias) => alias.name === currentName)
             if (current === undefined) throw new ModelAliasMissing(currentName)
             if (current.revision !== expectedRevision) throw new ModelAliasConflict(`model alias '${currentName}' changed since it was loaded`)
             const input = parseModelAliasInput(deps, { ...current, ...body })
             if (input.name !== currentName && aliases.some((alias) => alias.name === input.name)) throw new ModelAliasConflict(`model alias '${input.name}' already exists`)
-            const entry: ModelAlias = { ...input, revision: current.revision + 1 }
-            return { providers, defaults, aliases: aliases.map((alias) => alias.name === currentName ? entry : alias), result: entry }
+            const revision = aliasGeneration + 1
+            const entry: ModelAlias = { ...input, revision }
+            return { providers, defaults, aliases: aliases.map((alias) => alias.name === currentName ? entry : alias), aliasGeneration: revision, result: entry }
           })
           send(200, modelAliasRow(deps, patched))
         }
