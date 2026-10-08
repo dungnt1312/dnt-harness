@@ -99,6 +99,27 @@ describe('MemoryPanel', () => {
     expect(mocked.searchMemory).toHaveBeenCalledWith('ws-1', '', 'p1')
   })
 
+  it('marks each entry with its metadata.type icon, falling back to a plain document icon', async () => {
+    mocked.searchMemory.mockImplementation(async (_ws: string, _q: string, projectId?: string | null) => projectId === null
+      ? [
+          { ...entry('who', 'Who I am'), type: 'user' as const },
+          { ...entry('tone', 'Tone feedback'), type: 'feedback' as const },
+          { ...entry('plan', 'Plan state'), type: 'project' as const },
+          { ...entry('ref', 'API ref'), type: 'reference' as const },
+          entry('plain', 'Untyped'),
+        ]
+      : [])
+    await renderPanel(false)
+    const kindOf = (title: string): string | null =>
+      button(title).querySelector('[data-memory-type]')?.getAttribute('data-memory-type') ?? null
+    expect(kindOf('Who I am')).toBe('user')
+    expect(kindOf('Tone feedback')).toBe('feedback')
+    expect(kindOf('Plan state')).toBe('project')
+    expect(kindOf('API ref')).toBe('reference')
+    expect(kindOf('Untyped')).toBeNull()
+    expect(button('Untyped').querySelector('svg')).not.toBeNull()
+  })
+
   it('previews an entry from its own tier and offers Edit and Delete', async () => {
     await renderPanel()
     await click(button('Alpha one'))
@@ -114,7 +135,7 @@ describe('MemoryPanel', () => {
     await click(button('Alpha one'))
     await click(button('Edit'))
     await act(async () => type(textarea(), 'changed body'))
-    await click(button('Save'))
+    await click(button('Save entry'))
     expect(mocked.updateMemory).toHaveBeenCalledTimes(1)
     expect(mocked.updateMemory).toHaveBeenCalledWith('ws-1', 'alpha-one', expect.objectContaining({ expectedHash: 'hash-alpha-one', body: 'changed body' }), 'p1')
     // Back to the preview of the saved entry.
@@ -127,7 +148,7 @@ describe('MemoryPanel', () => {
     await click(button('Alpha one'))
     await click(button('Edit'))
     await act(async () => type(textarea(), 'mine'))
-    await click(button('Save'))
+    await click(button('Save entry'))
     expect(button('Reload server version')).toBeDefined()
     expect(button('Overwrite anyway')).toBeDefined()
 

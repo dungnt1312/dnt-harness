@@ -8,9 +8,9 @@ import type { LlmProvider, ModelMessage, ModelRequest, StreamEvent, StreamOption
 interface StreamChoice {
   finish_reason?: unknown
   delta?: {
-    content?: string
-    reasoning_content?: string
-    tool_calls?: StreamToolCall[]
+    content?: string | null
+    reasoning_content?: string | null
+    tool_calls?: StreamToolCall[] | null
   }
 }
 
@@ -129,15 +129,6 @@ function retryableStatus(status: number, detail: string): boolean {
   return !/insufficient_quota|quota|billing|credit|balance|invalid api key|authentication/i.test(detail)
 }
 
-/** Gateway error `code` strings that unambiguously name a transient condition. */
-const TRANSIENT_GATEWAY_CODES: ReadonlySet<string> = new Set(['server_error', 'rate_limit_exceeded', 'service_unavailable', 'overloaded_error'])
-
-/** A gateway `code` is transient for 5xx-class numbers and known transient strings; text decides the rest. */
-function gatewayCodeRetryable(code: unknown): boolean {
-  if (typeof code === 'number') return code >= 500 || TRANSIENT_STATUS.has(code)
-  return typeof code === 'string' && TRANSIENT_GATEWAY_CODES.has(code)
-}
-
 /** Error text that names a condition a second identical request cannot fix: the opt-OUT from default-retryable. */
 const PERMANENT_GATEWAY_TEXT = /invalid api key|authenticat|unauthorized|forbidden|permission denied|not found|unsupported|invalid request|malformed|context[_ -]?(length|window)|too (long|large)|exceeds? (the )?(model'?s? )?(maximum|context)/i
 
@@ -246,7 +237,7 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       const detail = await boundedText(response, settled => { cleanupSettled = settled }, options?.onTransportSettled)
       const quota = /insufficient_quota|quota|billing|credit|balance/i.test(detail)
       const reason = isContextExceeded(response.status, detail) ? 'context_exceeded' : quota ? 'quota' : response.status === 401 || response.status === 403 ? 'auth_configuration' : response.status === 429 ? 'rate_limit' : response.status >= 500 ? 'server_error' : 'unknown'
-      const retryable = !quota && retryableStatus(response.status, detail)
+      const retryable = reason !== 'context_exceeded' && !quota && retryableStatus(response.status, detail)
       if (!cleanupSettled || !retryable || attempt >= maxAttempts) {
         const retryAfter = retryAfterMs(response.headers.get('retry-after'))
         const error = new ProviderError(`provider HTTP ${response.status}: ${reason}`, { reason, phase: 'headers', transient: retryable, status: response.status, ...(retryAfter !== undefined ? { retryAfterMs: retryAfter } : {}) })
@@ -285,13 +276,12 @@ export class OpenAiCompletionsProvider implements LlmProvider {
         if (parsed.error !== undefined) {
           const text = gatewayErrorText(parsed.error).slice(0, WIRE_LIMITS.errorChars)
           const quota = /quota|billing|credit|balance/i.test(text)
-          const code = parsed.error !== null && typeof parsed.error === 'object' ? (parsed.error as { code?: unknown }).code : undefined
-          // Default-retryable: a gateway error naming no recognizable permanent
-          // condition gets the benefit of the doubt; only a permanent-looking
-          // body opts out.
-          const transient = !quota && (gatewayCodeRetryable(code) || !PERMANENT_GATEWAY_TEXT.test(text))
+          const contextExceeded = isContextExceeded(400, text)
+          // Default-retryable, but permanent diagnostics always win over a
+          // transient gateway code. Context errors require squeezing, not replay.
+          const transient = !contextExceeded && !quota && !PERMANENT_GATEWAY_TEXT.test(text)
           const detail = text.slice(0, 300)
-          throw new ProviderError(`provider gateway failure${detail === '' ? '' : `: ${detail}`}`, { reason: isContextExceeded(400, text) ? 'context_exceeded' : quota ? 'quota' : transient ? 'server_error' : 'unknown', transient })
+          throw new ProviderError(`provider gateway failure${detail === '' ? '' : `: ${detail}`}`, { reason: contextExceeded ? 'context_exceeded' : quota ? 'quota' : transient ? 'server_error' : 'unknown', transient })
         }
         const usage = parseUsage(parsed.usage)
         if (usage !== undefined) yield { type: 'usage', usage }
@@ -306,7 +296,7 @@ export class OpenAiCompletionsProvider implements LlmProvider {
         }
         const delta = choice?.delta
         const content = delta?.content
-        if ((content !== undefined && content !== null && typeof content !== 'string') || (delta?.reasoning_content !== undefined && typeof delta.reasoning_content !== 'string') || (delta?.tool_calls !== undefined && !Array.isArray(delta.tool_calls))) throw protocolError('malformed_protocol', 'invalid model delta')
+        if ((content !== undefined && content !== null && typeof content !== 'string') || (delta?.reasoning_content !== undefined && delta.reasoning_content !== null && typeof delta.reasoning_content !== 'string') || (delta?.tool_calls !== undefined && delta.tool_calls !== null && !Array.isArray(delta.tool_calls))) throw protocolError('malformed_protocol', 'invalid model delta')
         if (alreadyFinished && (delta?.content || delta?.reasoning_content || delta?.tool_calls?.length)) throw protocolError('malformed_protocol', 'output after semantic finish')
         outputBytes += encodedBytes(delta?.content ?? '') + encodedBytes(delta?.reasoning_content ?? '')
         if (outputBytes > WIRE_LIMITS.outputBytes) throw protocolError('output_limit', 'model output exceeds limit')
@@ -320,7 +310,7 @@ export class OpenAiCompletionsProvider implements LlmProvider {
         if (typeof thinking === 'string' && thinking !== '') {
           yield { type: 'delta', delta: thinking, thinking: true }
         }
-        if (delta?.tool_calls !== undefined && delta.tool_calls.length > 0) {
+        if (delta?.tool_calls != null && delta.tool_calls.length > 0) {
           for (const fragment of delta.tool_calls) {
             if (fragment === null || typeof fragment !== 'object' || Array.isArray(fragment) || (fragment.function !== undefined && (fragment.function === null || typeof fragment.function !== 'object' || Array.isArray(fragment.function)))) throw protocolError('malformed_protocol', 'invalid tool fragment shape')
             const index = fragment.index
@@ -370,8 +360,17 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       throw failure
     } finally {
       if (!settled) {
-        if (!cleanupAttempted) await cancelReader(reader, options?.onTransportSettled)
-        reader.releaseLock()
+        const closing = !cleanupAttempted
+        try {
+          if (closing) settled = await cancelReader(reader, options?.onTransportSettled)
+        } finally { reader.releaseLock() }
+        // A consumer return must reject rather than report done while transport
+        // cleanup is unresolved. Existing catch failures already carry this fact.
+        if (closing && !settled) {
+          const failure = new ProviderError('transport cleanup unresolved', { reason: 'incomplete_completion', phase: 'cleanup' })
+          failure.transportSettled = false
+          throw failure
+        }
       }
     }
   }
@@ -379,9 +378,21 @@ export class OpenAiCompletionsProvider implements LlmProvider {
 
 const CONTEXT_EXCEEDED = /context[_ -]?(length|window)|maximum context|too (long|large|many tokens)|exceeds? (the )?(model'?s? )?(maximum|max|limit|context)|reduce the (length|size)|prompt is too long|input (is )?too long|tokens? (limit|exceeded)/i
 
-/** Whether an HTTP error says the request did not fit the model's window. */
+/** Explicit model-window diagnostics survive relays that rewrite the HTTP status. */
+const EXPLICIT_CONTEXT_EXCEEDED = /context[_ -]?(length|window)|maximum context|prompt is too long|input (is )?too long|too many tokens|tokens? (limit|exceeded)/i
+
+/** Gateway statuses a relay substitutes for the upstream request error. */
+const RELAY_STATUSES: ReadonlySet<number> = new Set([502, 503, 504])
+
+/**
+ * Whether an HTTP error says the request did not fit the model's window.
+ * Request errors (400/413/422) match the broad wording; a relay's gateway
+ * status matches only explicit window diagnostics. Auth failures and origin
+ * 500s never count: the request may fit, and squeezing would hide the fault.
+ */
 export function isContextExceeded(status: number, detail: string): boolean {
-  return (status === 400 || status === 413 || status === 422) && CONTEXT_EXCEEDED.test(detail)
+  if (status === 400 || status === 413 || status === 422) return CONTEXT_EXCEEDED.test(detail)
+  return RELAY_STATUSES.has(status) && EXPLICIT_CONTEXT_EXCEEDED.test(detail)
 }
 
 /** A relay's error payload: OpenAI object shape, bare string, or anything else. */

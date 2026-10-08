@@ -10,6 +10,8 @@
  * must stay plain (copy text, length checks, the model-visible projection).
  */
 
+import type { LineLinker, LinkRange } from './path-links.ts'
+
 const ESC = '\u001b'
 
 const FG: Readonly<Record<number, string>> = {
@@ -175,8 +177,47 @@ function tokenizeLine(line: string, start: Readonly<SgrState>): readonly Token[]
   return tokens
 }
 
-/** Tool output with ANSI codes rendered as safe HTML, colours as spans. */
-export function ansiToHtml(output: string): string {
+/** Attribute marking a rendered file link; its value is the path, `data-line` the line. */
+export const PATH_LINK_ATTR = 'data-open-path'
+
+const escapeAttr = (text: string): string => escapeHtml(text).replaceAll('"', '&quot;')
+
+function renderLine(tokens: readonly Token[], ranges: readonly LinkRange[]): string {
+  if (ranges.length === 0) return tokens.map((token) => `<span${styleOf(token.state)}>${escapeHtml(token.text)}</span>`).join('')
+  // Split every token at the link boundaries so an anchor only ever wraps
+  // whole spans: `<button><span>…</span><span>…</span></button>`.
+  const cuts = new Set<number>(ranges.flatMap((range) => [range.start, range.end]))
+  const out: string[] = []
+  let position = 0
+  let open: LinkRange | undefined
+  for (const token of tokens) {
+    let rest = token.text
+    while (rest !== '') {
+      const range = ranges.find((candidate) => position >= candidate.start && position < candidate.end)
+      if (open !== undefined && open !== range) { out.push('</button>'); open = undefined }
+      if (range !== undefined && open === undefined) {
+        const line = range.ref.line !== undefined ? ` data-line="${range.ref.line}"` : ''
+        out.push(`<button type="button" class="path-link" ${PATH_LINK_ATTR}="${escapeAttr(range.ref.path)}"${line} title="Open ${escapeAttr(range.ref.path)} in workbench">`)
+        open = range
+      }
+      let length = rest.length
+      for (const cut of cuts) if (cut > position && cut - position < length) length = cut - position
+      out.push(`<span${styleOf(token.state)}>${escapeHtml(rest.slice(0, length))}</span>`)
+      rest = rest.slice(length)
+      position += length
+    }
+  }
+  if (open !== undefined) out.push('</button>')
+  return out.join('')
+}
+
+/**
+ * Tool output with ANSI codes rendered as safe HTML, colours as spans. With
+ * `link`, the ranges it finds in each line's visible text (escapes already
+ * removed) become `<button data-open-path>` elements the caller handles by
+ * delegation.
+ */
+export function ansiToHtml(output: string, link?: LineLinker): string {
   const lines = output.split('\n')
   const state: SgrState = { ...EMPTY_STATE }
   const rendered: string[] = []
@@ -187,7 +228,8 @@ export function ansiToHtml(output: string): string {
     const closing = last !== undefined ? last.state : state
     if (Object.keys(closing).length > 0) Object.assign(state, closing)
     else for (const key of Object.keys(state) as (keyof SgrState)[]) delete state[key]
-    rendered.push(tokens.map((token) => `<span${styleOf(token.state)}>${escapeHtml(token.text)}</span>`).join(''))
+    const ranges = link !== undefined ? link(tokens.map((token) => token.text).join('')) : []
+    rendered.push(renderLine(tokens, ranges))
   }
   return rendered.join('\n')
 }

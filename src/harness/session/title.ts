@@ -16,7 +16,8 @@ export const TITLE_MAX_LENGTH = 48
  */
 export function deriveTitle(events: readonly SessionEvent[]): string | null {
   for (const event of events) {
-    if (event.type !== 'user/message') continue
+    // Host-injected context and joined reports are not what the user typed.
+    if (event.type !== 'user/message' || event.origin !== undefined) continue
     const content = event.content.trim().replace(/\s+/g, ' ')
     if (content === '') continue
     return content.length > TITLE_MAX_LENGTH ? `${content.slice(0, TITLE_MAX_LENGTH)}…` : content

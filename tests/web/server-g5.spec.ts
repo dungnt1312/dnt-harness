@@ -12,7 +12,15 @@ import { createWebServer, messageText, type LlmProvider, type WebServer } from '
 
 const mcpFixture = fileURLToPath(new URL('../fixtures/mcp-stdio-server.mjs', import.meta.url))
 const hookFixture = fileURLToPath(new URL('../fixtures/hook-command.mjs', import.meta.url))
+const hookCmd = (mode: string): string => `"${process.execPath}" "${hookFixture}" ${mode}`
 const servers: WebServer[] = []
+
+/** Replace the workspace layer's hooks (`<ws>/settings.json`, Claude format). */
+function putHooks(base: string, wsId: string, hooks: unknown): Promise<Response> {
+  return fetch(`${base}/api/workspaces/${wsId}/hooks`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hooks }),
+  })
+}
 
 afterAll(async () => {
   for (const server of servers) await server.close().catch(() => {})
@@ -484,12 +492,9 @@ describe('G5 web MCP + hooks', () => {
       },
     }
     const { base, wsId } = await boot(provider)
-    await fetch(`${base}/api/workspaces/${wsId}/hooks`, {
-      method: 'PUT', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ version: 1, hooks: {
-        PreToolUse: [{ matcher: 'Edit', type: 'command', command: process.execPath, args: [hookFixture, 'rewrite'], timeoutMs: 2_000, onFailure: 'deny' }],
-      } }),
-    })
+    expect((await putHooks(base, wsId, {
+      PreToolUse: [{ matcher: 'Edit', hooks: [{ type: 'command', command: hookCmd('rewrite'), timeout: 5 }] }],
+    })).status).toBe(200)
     // Full access allows Edit, so approval does not mask the rewrite seam. No
     // project means the root gate later fails closed, but the recorded intent
     // is still the rewritten call.
@@ -505,45 +510,292 @@ describe('G5 web MCP + hooks', () => {
     const call = events.find((event) => event.type === 'tool/call') as { call?: { args?: Record<string, unknown> } } | undefined
     expect(call?.call?.args?.rewritten).toBe(true)
     const audit = events.find((event) => event.type === 'hook/run' && event.event === 'PreToolUse')
-    expect(audit?.decision).toBe('rewrite')
+    expect(audit?.decision).toBe('allow+rewrite')
   }, 20_000)
 
-  it('PreToolUse blocks Bash; PostToolUse flags output; UserPromptSubmit injects context and hooks are audited', async () => {
+  it('PreToolUse blocks Bash; PostToolUse adds context; UserPromptSubmit injects context and hooks are audited', async () => {
     const seen: string[][] = []
     const provider: LlmProvider = {
       name: 'scripted', models: ['scripted'],
       async *stream(request) {
         seen.push(request.messages.map((message) => messageText(message.content)))
-        yield { type: 'toolCalls', calls: [{ id: 'b1', name: 'Bash', args: { command: 'echo should-not-run' } }] }
+        yield { type: 'toolCalls', calls: [
+          { id: 'b1', name: 'Bash', args: { command: 'echo should-not-run' } },
+          { id: 'g1', name: 'Glob', args: { pattern: '*' } },
+        ] }
         yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
       },
     }
     const { base, wsId } = await boot(provider)
-    expect((await fetch(`${base}/api/workspaces/${wsId}/hooks`, {
-      method: 'PUT', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ version: 1, hooks: {
-        PreToolUse: [{ matcher: 'Bash', type: 'command', command: `${process.execPath} ${hookFixture} block`, timeoutMs: 2_000, onFailure: 'deny' }],
-        PostToolUse: [{ matcher: '*', type: 'command', command: `${process.execPath} ${hookFixture} flag`, timeoutMs: 2_000, onFailure: 'allow' }],
-        UserPromptSubmit: [{ matcher: '*', type: 'command', command: `${process.execPath} ${hookFixture} inject`, timeoutMs: 2_000, onFailure: 'allow' }],
-      } }),
+    await fetch(`${base}/api/workspaces/${wsId}/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: 'full-access' }) })
+    const project = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g5-post-'))
+    const projectId = ((await (await post(base, `/api/workspaces/${wsId}/projects`, { name: 'p', path: project })).json()) as { id: string }).id
+    expect((await putHooks(base, wsId, {
+      PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: hookCmd('block'), timeout: 5 }] }],
+      PostToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: hookCmd('context'), timeout: 5 }] }],
+      UserPromptSubmit: [{ hooks: [{ type: 'command', command: hookCmd('stdout'), timeout: 5 }] }],
     })).status).toBe(200)
-    const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`, { projectId })).json()) as { id: string }
     await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'try bash' })
-    // Under full-suite parallel load, wait until the durable hook/tool result lands.
+    // Under full-suite parallel load, wait until both durable results land.
     let events: Record<string, unknown>[] = []
     for (let i = 0; i < 40; i++) {
       events = await sessionEvents(base, wsId, session.id)
-      if (events.some((event) => event.type === 'tool/result')) break
+      if (events.filter((event) => event.type === 'tool/result').length >= 2) break
       await new Promise((resolve) => setTimeout(resolve, 100))
     }
-    expect(seen[0]?.join('\n')).toContain('fixture injected context')
-    const toolResult = events.find((event) => event.type === 'tool/result')
-    expect(toolResult?.ok).toBe(false)
-    expect(String(toolResult?.output)).toMatch(/hook .* blocked 'Bash'/)
+    await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/stop`)
+    expect(seen[0]?.join('\n')).toContain('fixture plain stdout context')
+    const bash = events.find((event) => event.type === 'tool/result' && event.callId === 'b1')
+    expect(bash?.ok).toBe(false)
+    expect(String(bash?.output)).toMatch(/PreToolUse hook blocked 'Bash': blocked by fixture/)
+    // Claude: a call that never ran fires no post hook.
+    expect(String(bash?.output)).not.toContain('fixture additional context')
+    const glob = events.find((event) => event.type === 'tool/result' && event.callId === 'g1')
+    expect(glob?.ok).toBe(true)
+    expect(String(glob?.output)).toContain('PostToolUse hook additional context')
+    expect(String(glob?.output)).toContain('fixture additional context')
     const hooks = events.filter((event) => event.type === 'hook/run')
-    expect(hooks.some((event) => event.event === 'UserPromptSubmit' && event.decision === 'inject')).toBe(true)
+    expect(hooks.some((event) => event.event === 'UserPromptSubmit' && event.decision === 'context')).toBe(true)
     expect(hooks.some((event) => event.event === 'PreToolUse' && event.decision === 'block')).toBe(true)
+    expect(hooks.filter((event) => event.event === 'PostToolUse')).toHaveLength(1)
   }, 20_000)
+
+  it('Stop hook decision:block continues the turn once; stop_hook_active lets it end', async () => {
+    const seen: string[][] = []
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream(request) {
+        seen.push(request.messages.map((message) => messageText(message.content)))
+        yield { type: 'delta', delta: `answer ${seen.length}` }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const { base, wsId } = await boot(provider)
+    expect((await putHooks(base, wsId, { Stop: [{ hooks: [{ type: 'command', command: hookCmd('stop-once'), timeout: 5 }] }] })).status).toBe(200)
+    const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'hi' })
+    let events: Record<string, unknown>[] = []
+    for (let i = 0; i < 50; i++) {
+      events = await sessionEvents(base, wsId, session.id)
+      if (events.some((event) => event.type === 'turn/end')) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    expect(seen).toHaveLength(2)
+    expect(seen[1]?.join('\n')).toContain('fixture says keep going')
+    expect(events.filter((event) => event.type === 'hook/run' && event.event === 'Stop').map((event) => event.decision)).toEqual(['block', 'ok'])
+  }, 20_000)
+
+  it('PreToolUse permissionDecision ask forces an approval even in full access', async () => {
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() {
+        yield { type: 'toolCalls', calls: [{ id: 'g1', name: 'Glob', args: { pattern: '*' } }] }
+        yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const { base, wsId } = await boot(provider)
+    await fetch(`${base}/api/workspaces/${wsId}/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: 'full-access' }) })
+    expect((await putHooks(base, wsId, { PreToolUse: [{ matcher: 'Glob', hooks: [{ type: 'command', command: hookCmd('ask'), timeout: 5 }] }] })).status).toBe(200)
+    const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'glob' })
+    let events: Record<string, unknown>[] = []
+    for (let i = 0; i < 40; i++) {
+      events = await sessionEvents(base, wsId, session.id)
+      if (events.some((event) => event.type === 'approval/request')) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    expect(events.some((event) => event.type === 'approval/request')).toBe(true)
+    await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/stop`)
+  }, 20_000)
+
+  it('writing project hook settings always asks, and hooks are snapshotted per conversation', async () => {
+    const project = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-hook-snap-')))
+    const marker = path.join(project, 'hook-ran')
+    const script = path.join(project, 'mark.cjs')
+    await fs.writeFile(script, `require('fs').writeFileSync(${JSON.stringify(marker)}, 'x')`)
+    const evil = JSON.stringify({ hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: `"${process.execPath}" "${script}"` }] }] } })
+    let step = 0
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() {
+        step += 1
+        if (step === 1) {
+          yield { type: 'toolCalls', calls: [{ id: 'w1', name: 'Write', args: { path: '.claude/settings.json', content: evil } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+          return
+        }
+        if (step === 6) {
+          // A tool call AFTER the file appeared: PreToolUse would fire it.
+          yield { type: 'toolCalls', calls: [{ id: 'g6', name: 'Glob', args: { pattern: '*' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+          return
+        }
+        yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const { base, wsId } = await boot(provider)
+    await fetch(`${base}/api/workspaces/${wsId}/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: 'full-access' }) })
+    const projectId = ((await (await post(base, `/api/workspaces/${wsId}/projects`, { name: 'p', path: project })).json()) as { id: string }).id
+    const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`, { projectId })).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'write settings' })
+    let events: Record<string, unknown>[] = []
+    for (let i = 0; i < 40; i++) {
+      events = await sessionEvents(base, wsId, session.id)
+      if (events.some((event) => event.type === 'approval/request')) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    // Full access would allow a Write; hook configuration still asks a human.
+    expect(events.some((event) => event.type === 'approval/request')).toBe(true)
+    await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/stop`)
+    for (let i = 0; i < 40; i++) {
+      const listed = (await (await fetch(`${base}/api/workspaces/${wsId}/sessions`)).json()) as { id: string; status: string }[]
+      if (listed.find((row) => row.id === session.id)?.status === 'idle') break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+
+    // Even if the file appears mid-conversation (e.g. an external editor),
+    // this conversation keeps the hooks it started with.
+    await fs.mkdir(path.join(project, '.claude'), { recursive: true })
+    await fs.writeFile(path.join(project, '.claude', 'settings.json'), evil)
+    step = 5
+    await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'again' })
+    for (let i = 0; i < 30; i++) {
+      events = await sessionEvents(base, wsId, session.id)
+      if (events.filter((event) => event.type === 'turn/end').length >= 2) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    expect(events.some((event) => event.type === 'tool/result' && event.callId === 'g6')).toBe(true)
+    expect(await fs.stat(marker).then(() => true, () => false)).toBe(false)
+    // A new conversation reads the file (Claude: settings load at startup).
+    step = 5
+    const fresh = (await (await post(base, `/api/workspaces/${wsId}/sessions`, { projectId })).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${fresh.id}/messages`, { content: 'fresh' })
+    for (let i = 0; i < 40 && !(await fs.stat(marker).then(() => true, () => false)); i++) await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(await fs.stat(marker).then(() => true, () => false)).toBe(true)
+  }, 20_000)
+
+  it('continue:false from a PreToolUse hook stops the turn; PreToolUse additionalContext reaches the model', async () => {
+    const seen: string[][] = []
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream(request) {
+        seen.push(request.messages.map((message) => messageText(message.content)))
+        yield { type: 'toolCalls', calls: [{ id: `g${seen.length}`, name: 'Glob', args: { pattern: '*' } }] }
+        yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const { base, wsId } = await boot(provider)
+    await fetch(`${base}/api/workspaces/${wsId}/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: 'full-access' }) })
+    expect((await putHooks(base, wsId, { PreToolUse: [{ matcher: 'Glob', hooks: [{ type: 'command', command: hookCmd('stop'), timeout: 5 }] }] })).status).toBe(200)
+    const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'glob' })
+    let events: Record<string, unknown>[] = []
+    for (let i = 0; i < 40; i++) {
+      events = await sessionEvents(base, wsId, session.id)
+      if (events.some((event) => event.type === 'turn/end')) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    expect(events.find((event) => event.type === 'turn/end')?.reason).toBe('cancelled')
+    expect(seen.length).toBeLessThanOrEqual(2)
+    expect(events.find((event) => event.type === 'hook/run')?.message).toBe('fixture stopped')
+
+    // additionalContext: Settings save re-reads hooks for running conversations too.
+    expect((await putHooks(base, wsId, { PreToolUse: [{ matcher: 'Glob', hooks: [{ type: 'command', command: hookCmd('context'), timeout: 5 }] }] })).status).toBe(200)
+    const second = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    seen.length = 0
+    await post(base, `/api/workspaces/${wsId}/sessions/${second.id}/messages`, { content: 'glob' })
+    for (let i = 0; i < 40 && seen.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 100))
+    const secondEvents = await sessionEvents(base, wsId, second.id)
+    expect(String(secondEvents.find((event) => event.type === 'tool/result')?.output)).toContain('PreToolUse hook additional context')
+    expect(seen[1]?.join('\n')).toContain('PreToolUse hook additional context')
+    await post(base, `/api/workspaces/${wsId}/sessions/${second.id}/stop`)
+  }, 20_000)
+
+  it('reads project .claude/settings.json hooks, CLAUDE.md layers, and SessionStart context', async () => {
+    const seen: string[][] = []
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream(request) {
+        seen.push(request.messages.map((message) => messageText(message.content)))
+        yield { type: 'delta', delta: 'ok' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const userClaudeDir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-user-claude-'))
+    await fs.writeFile(path.join(userClaudeDir, 'CLAUDE.md'), 'USER LAYER RULE')
+    const { base, wsId, home } = await boot(provider, { userClaudeDir })
+    await fs.writeFile(path.join(home, 'workspaces', wsId, 'CLAUDE.md'), 'WORKSPACE LAYER RULE')
+    const project = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-claude-project-'))
+    await fs.writeFile(path.join(project, 'CLAUDE.md'), 'PROJECT LAYER RULE @AGENTS.md')
+    await fs.writeFile(path.join(project, 'AGENTS.md'), 'AGENTS IMPORTED RULE')
+    await fs.mkdir(path.join(project, '.claude'))
+    await fs.writeFile(path.join(project, '.claude', 'settings.json'), JSON.stringify({
+      hooks: { SessionStart: [{ matcher: 'startup', hooks: [{ type: 'command', command: hookCmd('echo') }] }] },
+    }))
+    const created = await post(base, `/api/workspaces/${wsId}/projects`, { name: 'p', path: project })
+    expect(created.status).toBe(201)
+    const projectId = ((await created.json()) as { id: string }).id
+    const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`, { projectId })).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'hi' })
+    for (let i = 0; i < 40 && seen.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 100))
+    const text = seen[0]?.join('\n') ?? ''
+    expect(text.indexOf('USER LAYER RULE')).toBeGreaterThanOrEqual(0)
+    expect(text.indexOf('USER LAYER RULE')).toBeLessThan(text.indexOf('WORKSPACE LAYER RULE'))
+    expect(text.indexOf('WORKSPACE LAYER RULE')).toBeLessThan(text.indexOf('PROJECT LAYER RULE'))
+    expect(text).toContain('AGENTS IMPORTED RULE')
+    // SessionStart echo: Claude input fields reached the project hook.
+    expect(text).toContain('SessionStart hook additional context')
+    expect(text).toContain('"hook_event_name":"SessionStart"')
+    expect(text).toContain('"source":"startup"')
+    // The project binding stores the canonical (realpath) folder.
+    expect(text).toContain(`"CLAUDE_PROJECT_DIR":${JSON.stringify(await fs.realpath(project))}`)
+    const listed = (await (await fetch(`${base}/api/workspaces/${wsId}/hooks?projectId=${projectId}`)).json()) as { effective: { layer: string }[] }
+    expect(listed.effective.map((hook) => hook.layer)).toEqual(['project'])
+  }, 20_000)
+
+  it('one server that cannot connect is skipped: the Turn runs with the other servers, and Settings shows why', async () => {
+    const requests: string[][] = []
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream(request) {
+        requests.push(request.tools?.map((tool) => tool.name) ?? [])
+        yield { type: 'delta', delta: 'ok' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const { base, wsId } = await boot(provider)
+    // A server listing one provider-safe tool and one name providers reject.
+    const odd = `
+      const rl = require('node:readline').createInterface({ input: process.stdin })
+      const out = (m) => process.stdout.write(JSON.stringify(m) + '\\n')
+      rl.on('line', (line) => {
+        const msg = JSON.parse(line)
+        if (msg.method === 'initialize') return out({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-06-18', capabilities: { tools: {} } } })
+        if (msg.method === 'tools/list') return out({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'fine', inputSchema: { type: 'object' } }, { name: 'get.file', inputSchema: { type: 'object' } }] } })
+      })`
+    expect((await post(base, `/api/workspaces/${wsId}/mcp/good`, { transport: 'stdio', command: process.execPath, args: ['-e', odd], enabled: false })).status).toBe(201)
+    expect((await post(base, `/api/workspaces/${wsId}/mcp/good/enable`)).status).toBe(200)
+    // Starts, writes a reason to stderr, and exits before initialize.
+    expect((await post(base, `/api/workspaces/${wsId}/mcp/broken`, { transport: 'stdio', command: process.execPath, args: ['-e', "process.stderr.write('cannot open database'); process.exit(2)"], enabled: false })).status).toBe(201)
+    expect((await post(base, `/api/workspaces/${wsId}/mcp/broken/enable`)).status).toBe(502)
+
+    const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'hello' })
+    for (let i = 0; i < 50 && requests.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(requests[0]).toContain('mcp__good__fine')
+    expect(requests[0]).not.toContain('mcp__good__get.file')
+    expect(requests[0]?.some((name) => name.startsWith('mcp__broken__'))).toBe(false)
+    const events = await sessionEvents(base, wsId, session.id)
+    expect(events.some((event) => event.type === 'turn/end' && event.reason === 'rejected')).toBe(false)
+
+    const rows = await (await fetch(`${base}/api/workspaces/${wsId}/mcp`)).json() as { name: string; status: string; lastError?: string; unusableTools?: string[] }[]
+    const broken = rows.find((row) => row.name === 'broken')
+    expect(broken?.status).toBe('failed')
+    expect(broken?.lastError).toBeTruthy()
+    expect(rows.find((row) => row.name === 'good')?.unusableTools).toEqual(['get.file'])
+  }, 30_000)
 })
 
 async function waitApproval(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<string> {

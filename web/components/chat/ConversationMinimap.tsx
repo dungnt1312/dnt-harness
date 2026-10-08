@@ -52,7 +52,7 @@ export function minimapEntries(items: readonly ViewItem[]): readonly MinimapEntr
   return items.flatMap((item, index) => {
     if (item.kind !== 'user') return []
     // Queued input renders on the composer strip, not as a transcript row.
-    if (item.queued === true) return []
+    if (item.queued === true || item.withdrawn === true) return []
     if (item.content.trim() === '') return []
     const preview = minimapPreview(item.content)
     const width = Math.min(20, Math.max(8, 7 + Math.round(preview.title.length / 6)))

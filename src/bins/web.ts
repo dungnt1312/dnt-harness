@@ -17,6 +17,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { assertSchemaFloor } from '../harness/mcp/migration.ts'
 import { createWebServer } from '../web/server.ts'
+import { defaultSecretRoots } from '../capabilities/fs/secret-roots.ts'
 import { loadRepoEnv, repoRoot, resolveAppHome } from './env.ts'
 
 // `~/.dnt-harness`, or the pre-rename `~/.mini-dsh` while only that exists.
@@ -75,8 +76,12 @@ async function main(): Promise<void> {
     configFile: path.join(appHome, 'providers.json'),
     // Claude Code user skills are a read-only layer under workspace skills.
     userSkillsDir: path.join(homedir(), '.claude', 'skills'),
+    // Claude Code user layer: CLAUDE.md, settings.json hooks, agents/.
+    userClaudeDir: path.join(homedir(), '.claude'),
     // Skills shipped with the app land in the read-only bundled layer.
     bundledSkillsDir: path.join(repoRoot(), 'skills'),
+    // Credential folders stay off-limits to file tools in every mode.
+    secretRoots: defaultSecretRoots(homedir()),
     seedDeepseekFromEnv: true,
     limits: { automaticCompactionPressure: 0.85 },
     ...(yolo ? { yolo: true, defaultMode: 'allow' as const } : { defaultMode: 'ask' as const }),

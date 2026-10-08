@@ -115,7 +115,9 @@ describe('ask-user tool shape', () => {
     expect(() => validateAnswers(questions, [{ selected: ['MySQL'] }])).toThrow(/not an offered option/)
     expect(() => validateAnswers(questions, [{ selected: ['PostgreSQL', 'SQLite'] }])).toThrow(/single choice/)
     expect(validateAnswers(questions, [{ selected: [], other: 'Use CockroachDB' }])).toEqual([{ selected: [], other: 'Use CockroachDB' }])
-    expect(() => validateAnswers(questions, [{}])).toThrow()
+    // Answers are optional per question: an empty entry means "skipped".
+    expect(validateAnswers(questions, [{}])).toEqual([{ selected: [] }])
+    expect(() => validateAnswers(questions, [])).toThrow(/one entry per question/)
   })
 
   it('is exposed and allowed by every bundled mode', () => {

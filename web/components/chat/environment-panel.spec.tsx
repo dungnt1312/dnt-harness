@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { EnvironmentPanel } from './EnvironmentPanel.tsx'
+import { resetDismissedCache } from '../../lib/dismissed-rows.ts'
 import type { SseEvent } from '../../lib/types.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
@@ -10,6 +11,8 @@ import type { SseEvent } from '../../lib/types.ts'
 let root: Root | undefined
 let host: HTMLDivElement
 afterEach(async () => {
+  window.localStorage.clear()
+  resetDismissedCache()
   if (root) await act(async () => root!.unmount())
   host?.remove()
   root = undefined

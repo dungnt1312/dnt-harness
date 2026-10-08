@@ -1016,14 +1016,6 @@ describe('brief and inheritance', () => {
     await harness.kernel.stop()
   }, 15_000)
 
-  it('a role with inheritable:false refuses inherited context by name', async () => {
-    const harness = await boot(['ok'])
-    const sealed = { ...explorer, name: 'sealed', inheritable: false }
-    await expect(harness.executor.spawn(request(harness, sealed, { inherit: 'brief', inheritedContext: 'User: hi' })))
-      .rejects.toMatchObject({ code: 'inherit', message: expect.stringContaining("'sealed'") })
-    await harness.kernel.stop()
-  }, 15_000)
-
   it('records inheritance as audit metadata only — never the inherited text', async () => {
     const harness = await boot(['ok'])
     const inherited = 'User: the secret plan lives in plan-7.md'

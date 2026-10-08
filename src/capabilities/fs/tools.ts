@@ -365,8 +365,7 @@ export function globTool(): ToolDefinition {
       const search = await searchFiles(base, exec, { patterns: expandGlob(pattern), includeIgnored: argBoolean(args, 'includeIgnored') === true })
       const matches = search.files
       const files = matches.slice(0, GLOB_CAP).map((full) => displayPath(exec.root, full))
-      if (matches.length > GLOB_CAP) files.push(`… [+${matches.length - GLOB_CAP} more matches]`)
-      return searchOutput(files, search.incomplete, limitOf(exec))
+      return searchOutput(files, search.incomplete, limitOf(exec), { totalMatches: matches.length })
     },
   }
 }
@@ -412,9 +411,10 @@ export function grepTool(): ToolDefinition {
         const text = hit.text.length > READ_MAX_LINE ? `${hit.text.slice(0, READ_MAX_LINE)}… [line truncated]` : hit.text
         return `${displayPath(exec.root, files[hit.file] as string)}:${hit.line}: ${text}`
       })
-      if (run.truncated) lines.push('… [more matches truncated]')
-      if (run.skippedLarge > 0) lines.push(`… [${run.skippedLarge} file(s) over ${GREP_MAX_FILE_BYTES / (1024 * 1024)} MiB not searched]`)
-      return searchOutput(lines, search.incomplete, limitOf(exec))
+      const notes: string[] = []
+      if (run.truncated) notes.push('… [more matches truncated]')
+      if (run.skippedLarge > 0) notes.push(`… [${run.skippedLarge} file(s) over ${GREP_MAX_FILE_BYTES / (1024 * 1024)} MiB not searched]`)
+      return searchOutput(lines, search.incomplete, limitOf(exec), { notes })
     },
   }
 }

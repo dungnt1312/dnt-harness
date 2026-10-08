@@ -9,6 +9,7 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { cpus } from 'node:os'
+import { StringDecoder } from 'node:string_decoder'
 import { McpDispatchError, receiptForTransportFailure, boundToolMetadata } from './boundaries.ts'
 import type { McpServerConfig } from './config.ts'
 import { MCP_LIMITS } from './limits.ts'
@@ -41,6 +42,39 @@ export class McpTransportError extends Error {
   }
 }
 
+/** Longest server-supplied JSON-RPC error message passed on to the caller. */
+const RPC_ERROR_MESSAGE_MAX = 500
+
+/**
+ * The server answered with a JSON-RPC error: the transport is healthy and the
+ * outcome is known. Code and (bounded) message reach the caller so a model can
+ * correct, for example, invalid params.
+ */
+export class McpRpcError extends McpTransportError {
+  constructor(readonly code: number | undefined, readonly rpcMessage: string) {
+    super(`MCP JSON-RPC error${code !== undefined ? ` ${code}` : ''}: ${rpcMessage}`)
+    this.name = 'McpRpcError'
+  }
+}
+
+function rpcErrorOf(raw: unknown): McpRpcError {
+  const record = (raw !== null && typeof raw === 'object' ? raw : {}) as { code?: unknown; message?: unknown }
+  const code = typeof record.code === 'number' && Number.isInteger(record.code) ? record.code : undefined
+  const message = typeof record.message === 'string' && record.message.trim() !== ''
+    ? record.message.slice(0, RPC_ERROR_MESSAGE_MAX)
+    : 'request failed'
+  return new McpRpcError(code, message)
+}
+
+/** Events a transport reports up to the client that owns it. */
+interface TransportEvents {
+  readonly onNotification?: (method: string) => void
+  /** The connection is gone (process exit, spawn error, fatal frame). */
+  readonly onDead?: () => void
+  /** Raw server stderr text, for the bounded diagnostic tail. */
+  readonly onStderr?: (text: string) => void
+}
+
 /** JSON-RPC framing over a request/response channel. */
 interface Transport {
   start(): Promise<void>
@@ -67,6 +101,9 @@ function killOwnedProcessTree(child: ChildProcess): void {
     try { process.kill(-child.pid, 'SIGKILL') } catch { child.kill('SIGKILL') }
   }
 }
+
+/** Characters of server stderr kept for diagnostics. */
+const STDERR_TAIL_CHARS = 8_192
 
 /** Watchdog sampling period. */
 const WATCHDOG_INTERVAL_MS = 1_000
@@ -124,6 +161,9 @@ class StdioTransport implements Transport {
   private nextId = 1
   private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>()
   private buffer = ''
+  /** Holds a multibyte character split across stdout chunks until it completes. */
+  private readonly decoder = new StringDecoder('utf8')
+  private readonly stderrDecoder = new StringDecoder('utf8')
   private resourceTimer: ReturnType<typeof setInterval> | undefined
   private previousSample: { readonly at: number; readonly cpuSeconds: number } | undefined
   private lifetimeTimer: ReturnType<typeof setTimeout> | undefined
@@ -132,8 +172,24 @@ class StdioTransport implements Transport {
   constructor(
     private readonly config: McpServerConfig,
     private readonly resolvedEnv: Record<string, string>,
-    private readonly onNotification?: (method: string) => void,
+    private readonly events: TransportEvents = {},
   ) {}
+
+  /** The connection is gone: fail every waiter and tell the owning client once. */
+  private markDead(error: Error): void {
+    const wasDead = this.state === 'failed'
+    this.state = 'failed'
+    for (const pending of this.pending.values()) pending.reject(error)
+    this.pending.clear()
+    if (!wasDead && !this.stopped) this.events.onDead?.()
+  }
+
+  /** Whether stdin can still take a frame; a dead child provably receives nothing. */
+  private get writable(): boolean {
+    const child = this.child
+    return child !== undefined && this.state !== 'failed' && child.exitCode === null && child.signalCode === null &&
+      child.stdin !== null && child.stdin.writable
+  }
 
   async start(): Promise<void> {
     const command = this.config.command
@@ -171,7 +227,7 @@ class StdioTransport implements Transport {
         this.failPending(new McpTransportError('stdio frame exceeded the byte limit'))
         return
       }
-      this.buffer += chunk.toString('utf8')
+      this.buffer += this.decoder.write(chunk)
       let newline = this.buffer.indexOf('\n')
       while (newline >= 0) {
         const line = this.buffer.slice(0, newline).trim()
@@ -187,22 +243,19 @@ class StdioTransport implements Transport {
       this.failPending(new McpTransportError(`stdin write failed: ${error.message}`))
     })
     child.stderr?.on('data', (chunk: Buffer) => {
-      // stderr = server logs; surfaced via diagnostics, never parsed.
-      void chunk
+      // stderr = server logs; kept as a bounded, redacted tail, never parsed.
+      this.events.onStderr?.(this.stderrDecoder.write(chunk))
+    })
+    // `exit` fires as soon as the process is gone; `close` can wait on pipes a
+    // helper still holds open. Either one means this transport is dead.
+    child.on('exit', () => {
+      this.markDead(new McpTransportError('server process exited'))
     })
     child.on('close', () => {
-      this.state = 'failed'
-      for (const pending of this.pending.values()) {
-        pending.reject(new McpTransportError('server closed the connection'))
-      }
-      this.pending.clear()
+      this.markDead(new McpTransportError('server closed the connection'))
     })
     child.on('error', (error: Error) => {
-      this.state = 'failed'
-      for (const pending of this.pending.values()) {
-        pending.reject(new McpTransportError(`spawn error: ${error.message}`))
-      }
-      this.pending.clear()
+      this.markDead(new McpTransportError(`spawn error: ${error.message}`))
     })
     // MCP initialize handshake. A bad version never receives notifications/initialized.
     const initialized = await this.request('initialize', {
@@ -216,9 +269,7 @@ class StdioTransport implements Transport {
   }
 
   private failPending(error: Error): void {
-    this.state = 'failed'
-    for (const pending of this.pending.values()) pending.reject(error)
-    this.pending.clear()
+    this.markDead(error)
     if (this.child !== undefined) killOwnedProcessTree(this.child)
   }
 
@@ -231,7 +282,7 @@ class StdioTransport implements Transport {
     }
     const record = parsed as { id?: unknown; method?: unknown; result?: unknown; error?: unknown }
     if (typeof record.method === 'string') {
-      this.onNotification?.(record.method)
+      this.events.onNotification?.(record.method)
       return
     }
     if (typeof record.id !== 'number') return
@@ -239,13 +290,17 @@ class StdioTransport implements Transport {
     if (pending === undefined) return
     this.pending.delete(record.id)
     if (record.error !== undefined) {
-      pending.reject(new McpTransportError('MCP JSON-RPC request failed'))
+      pending.reject(rpcErrorOf(record.error))
     } else {
       pending.resolve(record.result)
     }
   }
 
   async request(method: string, params: unknown, timeoutMs: number, signal?: AbortSignal): Promise<unknown> {
+    // Nothing is written to a dead process, so nothing can have been sent.
+    if (!this.writable) {
+      throw new McpDispatchError(`${method} not sent: the server process is not running`, receiptForTransportFailure(false, 'not_connected'))
+    }
     const id = this.nextId++
     const message = JSON.stringify({ jsonrpc: '2.0', id, method, ...(params !== undefined ? { params } : {}) })
     const promise = new Promise<unknown>((resolve, reject) => {
@@ -333,8 +388,8 @@ class StdioTransport implements Transport {
   }
 
   async notify(method: string, params: unknown): Promise<void> {
-    this.child?.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', method, ...(params !== undefined ? { params } : {}) })}
-`)
+    if (!this.writable) return
+    this.child?.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', method, ...(params !== undefined ? { params } : {}) })}\n`)
   }
 
   async stop(): Promise<void> {
@@ -367,18 +422,30 @@ class StdioTransport implements Transport {
   }
 }
 
+/**
+ * Where an HTTP transport gets its bearer token, asked before every request.
+ * `rejected` is the token the server last refused (401/403), so a managed
+ * source refreshes instead of handing the same dead token back.
+ */
+export type BearerTokenSource = (rejected?: string) => Promise<string | undefined>
+
 /** Streamable HTTP: JSON-RPC over POST with bearer auth. */
 class HttpTransport implements Transport {
   private sessionId: string | undefined
+  /** Negotiated at initialize; sent on every later request (2025-06-18). */
+  private protocolVersion: string | undefined
   private nextId = 1
   private stopped = false
   private readonly abort = new AbortController()
+  /** The token the server refused last, handed to the source on the next ask. */
+  private rejectedToken: string | undefined
+  private lastToken: string | undefined
   state: TransportState = 'connecting'
 
   constructor(
     private readonly config: McpServerConfig,
-    private readonly bearerToken: string | undefined,
-    private readonly onNotification?: (method: string) => void,
+    private readonly tokens: BearerTokenSource,
+    private readonly events: TransportEvents = {},
   ) {}
 
   async start(): Promise<void> {
@@ -390,8 +457,15 @@ class HttpTransport implements Transport {
     }, 10_000)
     if (this.stopped) throw new McpTransportError('transport stopped before spawn')
     assertInitializeResult(initialized)
+    this.protocolVersion = (initialized as { protocolVersion: string }).protocolVersion
     await this.notify('notifications/initialized', {})
     this.state = 'ready'
+  }
+
+  private markDead(): void {
+    if (this.state === 'failed') return
+    this.state = 'failed'
+    if (!this.stopped) this.events.onDead?.()
   }
 
   async request(method: string, params: unknown, timeoutMs: number, signal?: AbortSignal): Promise<unknown> {
@@ -414,7 +488,7 @@ class HttpTransport implements Transport {
         throw new McpTransportError('MCP response is not valid JSON')
       }
       if (body.id !== id) throw new McpTransportError(`MCP response id mismatch: expected ${id}`)
-      if (body.error !== undefined) throw new McpTransportError('MCP JSON-RPC request failed')
+      if (body.error !== undefined) throw rpcErrorOf(body.error)
       return body.result
     } finally {
       signal?.removeEventListener('abort', onAbort)
@@ -430,6 +504,20 @@ class HttpTransport implements Transport {
   private async post(body: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal): Promise<Response> {
     if (this.config.url === undefined) throw new McpTransportError('http transport requires a url')
     const target = assertOutboundUrl(this.config.url, { allowLoopbackHttp: true })
+    // Resolving the token happens before any byte leaves: a failure here is
+    // provably not dispatched.
+    let token: string | undefined
+    try {
+      token = await this.tokens(this.rejectedToken)
+    } catch (error) {
+      throw new McpDispatchError(
+        `bearer token unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        receiptForTransportFailure(false, 'not_connected'),
+      )
+    }
+    if (token !== this.rejectedToken) this.rejectedToken = undefined
+    this.lastToken = token
+    const sessionAtSend = this.sessionId
     const response = await fetch(target, {
       method: 'POST',
       redirect: 'manual',
@@ -438,21 +526,40 @@ class HttpTransport implements Transport {
         'content-type': 'application/json',
         accept: 'application/json, text/event-stream',
         origin: target.origin,
-        ...(this.bearerToken !== undefined ? { authorization: `Bearer ${this.bearerToken}` } : {}),
-        ...(this.sessionId !== undefined ? { 'mcp-session-id': this.sessionId } : {}),
+        ...(token !== undefined ? { authorization: `Bearer ${token}` } : {}),
+        ...(sessionAtSend !== undefined ? { 'mcp-session-id': sessionAtSend } : {}),
+        ...(this.protocolVersion !== undefined ? { 'mcp-protocol-version': this.protocolVersion } : {}),
       },
       body: JSON.stringify(body),
       signal: AbortSignal.any([AbortSignal.timeout(timeoutMs), this.abort.signal, ...(signal !== undefined ? [signal] : [])]),
     })
     if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel().catch(() => {})
       throw new McpDispatchError('HTTP redirect was not followed', receiptForTransportFailure(true, 'redirect_followed'))
+    }
+    if (response.status === 401 || response.status === 403) {
+      // The server refused the credentials before processing the request.
+      await response.body?.cancel().catch(() => {})
+      this.rejectedToken = token
+      throw new McpDispatchError(`HTTP ${response.status}: the server rejected the credentials`, receiptForTransportFailure(false, 'auth_rejected'))
+    }
+    if (response.status === 404 && sessionAtSend !== undefined) {
+      // 2025-06-18: 404 for a request carrying a session id means the session
+      // is gone and was not processed. The client must initialize again.
+      await response.body?.cancel().catch(() => {})
+      this.sessionId = undefined
+      this.markDead()
+      throw new McpDispatchError('HTTP 404: the MCP session expired', receiptForTransportFailure(false, 'session_expired'))
     }
     const sessionHeader = response.headers.get('mcp-session-id')
     if (sessionHeader !== null) {
       assertSessionId(sessionHeader)
       this.sessionId = sessionHeader
     }
-    if (!response.ok) throw new McpTransportError(`HTTP ${response.status}`)
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {})
+      throw new McpTransportError(`HTTP ${response.status}`)
+    }
     return response
   }
 
@@ -471,15 +578,18 @@ class HttpTransport implements Transport {
           let parsed: { id?: unknown; method?: unknown; result?: unknown; error?: unknown }
           try { parsed = JSON.parse(event.data) as typeof parsed } catch { continue }
           if (typeof parsed.method === 'string') {
-            this.onNotification?.(parsed.method)
+            this.events.onNotification?.(parsed.method)
             continue
           }
           if (parsed.id !== requestId) continue
-          if (parsed.error !== undefined) throw new McpTransportError('MCP JSON-RPC request failed')
+          if (parsed.error !== undefined) throw rpcErrorOf(parsed.error)
           return parsed.result
         }
       }
     } finally {
+      // Once the result (or an error) is in hand, close the stream: a server
+      // that keeps it open must not pin the socket until it gives up.
+      await reader.cancel().catch(() => undefined)
       reader.releaseLock()
     }
     throw new McpTransportError('SSE response carried no matching JSON-RPC result')
@@ -496,8 +606,10 @@ class HttpTransport implements Transport {
         headers: {
           origin: new URL(this.config.url).origin,
           'mcp-session-id': this.sessionId,
-          ...(this.bearerToken !== undefined ? { authorization: `Bearer ${this.bearerToken}` } : {}),
+          ...(this.protocolVersion !== undefined ? { 'mcp-protocol-version': this.protocolVersion } : {}),
+          ...(this.lastToken !== undefined ? { authorization: `Bearer ${this.lastToken}` } : {}),
         },
+        signal: AbortSignal.timeout(5_000),
       }).catch(() => undefined)
     }
     this.sessionId = undefined
@@ -572,11 +684,19 @@ export class McpServerClient {
   private healthTimer: ReturnType<typeof setInterval> | undefined
   private onReconnected: (() => Promise<void>) | undefined
   private toolsCache: readonly McpToolDescriptor[] = []
+  /** Bounded tail of the stdio server's stderr, redacted when read. */
+  private stderrTail = ''
 
   constructor(
     readonly serverName: string,
     private readonly config: McpServerConfig,
-    private readonly resolved: { readonly env?: Record<string, string> | undefined; readonly bearerToken?: string | undefined; readonly headers?: Record<string, string> | undefined },
+    private readonly resolved: {
+      readonly env?: Record<string, string> | undefined
+      readonly bearerToken?: string | undefined
+      readonly headers?: Record<string, string> | undefined
+      /** Asked before every HTTP request; wins over the fixed `bearerToken`. */
+      readonly tokenSource?: BearerTokenSource | undefined
+    },
     private readonly onAudit: (event: { readonly kind: 'call' | 'breaker' | 'reconnect'; readonly detail: string; readonly durationMs: number; readonly isError: boolean }) => void,
     private readonly runtime: { readonly breakerDurationMs?: number; readonly healthIntervalMs?: number; readonly reconnectJitterMs?: number } = {},
   ) {}
@@ -595,10 +715,33 @@ export class McpServerClient {
     if (Date.now() < this.breakerUntil) {
       throw new McpTransportError(`server '${this.serverName}' is disabled by the circuit breaker`)
     }
+    // The first connect is not retried: a server that cannot start (or never
+    // answers initialize) would only cost the caller three timeouts. Later
+    // attempts reconnect first, since retrying on a transport that died
+    // mid-listing would repeat the same failure.
     await this.ensureConnected()
-    const tools = await this.withRetry(() => this.fetchAllTools(this.config.timeoutMs ?? 15_000))
+    const tools = await this.withRetry(async () => {
+      await this.ensureConnected()
+      return this.fetchAllTools(this.config.timeoutMs ?? 15_000)
+    })
     this.toolsCache = tools
     return tools
+  }
+
+  /** Recent server stderr (stdio), with every configured secret value masked. */
+  recentStderr(): string {
+    let text = this.stderrTail
+    const secrets = [
+      ...Object.values(this.resolved.env ?? {}),
+      ...Object.values(this.resolved.headers ?? {}),
+      ...(this.resolved.bearerToken !== undefined ? [this.resolved.bearerToken] : []),
+    ].filter((value) => value.length >= 6).sort((a, b) => b.length - a.length)
+    for (const secret of secrets) text = text.split(secret).join('[redacted]')
+    return text
+  }
+
+  private appendStderr(text: string): void {
+    this.stderrTail = (this.stderrTail + text).slice(-STDERR_TAIL_CHARS)
   }
 
   /**
@@ -656,13 +799,24 @@ export class McpServerClient {
       if (signal?.aborted === true) {
         throw new McpDispatchError('cancelled before the call was sent', receiptForTransportFailure(false, 'cancelled_before_send'))
       }
+      const transport = this.transport
+      if (transport === undefined) {
+        throw new McpDispatchError('no connected transport', receiptForTransportFailure(false, 'not_connected'))
+      }
       sent = true
-      const raw = await this.transport?.request('tools/call', { name: tool, arguments: args }, timeoutMs, signal)
+      const raw = await transport.request('tools/call', { name: tool, arguments: args }, timeoutMs, signal)
       this.recordSuccess()
       const result = (raw ?? {}) as { isError?: boolean; content?: unknown }
       this.onAudit({ kind: 'call', detail: `${this.serverName}.${tool}`, durationMs: Date.now() - started, isError: result.isError === true })
       return { isError: result.isError === true, content: result.content ?? null }
     } catch (error) {
+      if (error instanceof McpRpcError) {
+        // The server answered: the connection is healthy and the outcome is a
+        // known error the model can act on (for example invalid params).
+        this.recordSuccess()
+        this.onAudit({ kind: 'call', detail: `${this.serverName}.${tool}`, durationMs: Date.now() - started, isError: true })
+        return { isError: true, content: [{ type: 'text', text: error.message }] }
+      }
       const dispatch = error instanceof McpDispatchError
         ? error
         : new McpDispatchError(
@@ -752,6 +906,12 @@ export class McpServerClient {
     if (this.retired) {
       throw new McpDispatchError('runtime generation was fenced', receiptForTransportFailure(false, 'not_connected'))
     }
+    if (this.resourceKilled) {
+      throw new McpDispatchError(
+        `server '${this.serverName}' was stopped by its resource limit; reconnect it to start it again`,
+        receiptForTransportFailure(false, 'not_connected'),
+      )
+    }
     if (this.breakerState === 'open') {
       if (!halfOpen && Date.now() < this.breakerUntil) {
         throw new McpTransportError(`server '${this.serverName}' is disabled by the circuit breaker`)
@@ -759,7 +919,9 @@ export class McpServerClient {
       // Recovery window elapsed: this caller becomes the half-open probe.
       this.breakerState = 'half-open'
     }
-    if (this.transport !== undefined && this.state === 'ready') return
+    // Both must agree: a transport whose process exited reports itself
+    // failed even if no call has noticed yet.
+    if (this.transport !== undefined && this.state === 'ready' && this.transport.state === 'ready') return
     // Single flight: concurrent callers share one connect. Two unshared
     // connects would each build a transport, and the one overwritten would
     // leak its process or session.
@@ -770,21 +932,37 @@ export class McpServerClient {
   }
 
   private connecting: Promise<void> | undefined
+  /** The resource watchdog killed this client's process; sticky until a new client. */
+  private resourceKilled = false
 
   private async connect(): Promise<void> {
     this.state = 'connecting'
-    const onNotification = (method: string): void => {
-      if (method === 'notifications/tools/list_changed') this.refreshToolsFromNotification()
+    // Assigned below; the events only act while this transport is current.
+    let transport: Transport | undefined
+    const events: TransportEvents = {
+      onNotification: (method: string): void => {
+        if (method === 'notifications/tools/list_changed') this.refreshToolsFromNotification()
+      },
+      onDead: (): void => {
+        if (this.transport !== transport) return
+        // A resource-limit kill is the operator's policy, not a crash: never
+        // respawn on the next call (that loops kill → spawn). Reconnect resets it.
+        if (transport instanceof StdioTransport && transport.watchdogKills > 0) this.resourceKilled = true
+        if (this.state === 'ready') this.state = 'failed'
+      },
+      onStderr: (text: string): void => { this.appendStderr(text) },
     }
-    const transport =
+    const fixedToken = this.resolved.bearerToken
+    const tokens: BearerTokenSource = this.resolved.tokenSource ?? (async () => fixedToken)
+    transport =
       this.config.transport === 'stdio'
-        ? new StdioTransport(this.config, this.resolved.env ?? {}, onNotification)
+        ? new StdioTransport(this.config, this.resolved.env ?? {}, events)
         : new HttpTransport({
             ...this.config,
             ...((this.resolved.headers ?? this.config.headers) !== undefined
               ? { headers: this.resolved.headers ?? this.config.headers }
               : {}),
-          }, this.resolved.bearerToken, onNotification)
+          }, tokens, events)
     // A failed or dead transport is replaced, never abandoned: its process
     // (and watchdog timers) would otherwise outlive the reference to it.
     const previous = this.transport
@@ -850,7 +1028,10 @@ export class McpServerClient {
         return await operation()
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error))
-        await new Promise((resolve) => setTimeout(resolve, 200 * 2 ** attempt))
+        // A fenced client, an open breaker, or a server that answered with a
+        // JSON-RPC error will give the same answer again: fail at once.
+        if (this.retired || this.breakerState === 'open' || error instanceof McpRpcError) throw lastError
+        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 200 * 2 ** attempt))
       }
     }
     throw lastError ?? new McpTransportError('operation failed')

@@ -93,6 +93,37 @@ describe('headless CLI', () => {
     }
   }, 30_000)
 
+  it('applies Dangerous Commands even under --yolo: a deny preset blocks the Bash call', async () => {
+    dataDir = await mkdtemp(path.join(tmpdir(), 'cli-guard-'))
+    const victim = path.join(dataDir, 'victim')
+    await mkdir(victim, { recursive: true })
+    await writeFile(path.join(victim, 'keep.txt'), 'still here')
+    const root = fileURLToPath(new URL('../../', import.meta.url))
+    let calls = 0
+    const provider = createServer(async (req, res) => {
+      for await (const _chunk of req) { /* drain */ }
+      calls += 1
+      const first = calls === 1
+      const delta = first
+        ? { tool_calls: [{ index: 0, id: 'rm-call', type: 'function', function: { name: 'Bash', arguments: JSON.stringify({ command: `rm -rf ${victim}` }) } }] }
+        : { content: 'done' }
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: first ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`)
+    })
+    await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve))
+    const address = provider.address() as { port: number }
+    try {
+      const result = await runCli(['--data-dir', dataDir, '--root', root, '--yolo', '--message', 'clean up'], {
+        DEEPSEEK_API_KEY: 'test-key', DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}`,
+      })
+      expect(result.code).toBe(0)
+      expect(result.stdout).toContain('blocked by Dangerous Commands')
+      expect(await readFile(path.join(victim, 'keep.txt'), 'utf8')).toBe('still here')
+    } finally {
+      await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()))
+    }
+  }, 30_000)
+
   it('starts without DEEPSEEK_API_KEY and does not fall back to a mock provider', async () => {
     dataDir = await mkdtemp(path.join(tmpdir(), 'dnt-harness-headless-'))
     const { code, stdout, stderr } = await runCli(['--data-dir', dataDir, '--message', 'hello'])

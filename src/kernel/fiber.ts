@@ -32,6 +32,11 @@ function normalizeDisposer(result: Effect): () => void | Promise<void> {
     }
   }
   if (result instanceof Promise) {
+    // A rejected disposer promise must not surface as an unhandled rejection
+    // while the effect waits for teardown. The no-op handler goes on a
+    // DERIVED promise; teardown still awaits the original and observes the
+    // rejection as this effect's cleanup failure.
+    result.then(undefined, () => {})
     return async () => {
       const disposer = await result
       await disposer()
@@ -170,11 +175,12 @@ export class Fiber {
     // `unloading`, so the awaited teardown promise is the caller's own —
     // waiting for it deadlocks instead of completing.
     const record = createEffectRecord(normalizeDisposer(execute()))
+    const meta: EffectMeta = { label, children: [] }
     this.disposers.push(record)
-    this.effectMetas.push({ label, children: [] })
+    this.effectMetas.push(meta)
 
     const index = () => this.disposers.indexOf(record)
-    return () => this.runEarlyDisposal(record, index)
+    return () => this.runEarlyDisposal(record, index, meta)
   }
 
   /**
@@ -184,13 +190,18 @@ export class Fiber {
    * fire-and-forget callers that rejection is a drop-on-the-floor detail, not
    * the teardown verdict.
    */
-  private runEarlyDisposal(record: EffectRecord, locate: () => number): Promise<void> {
+  private runEarlyDisposal(record: EffectRecord, locate: () => number, meta: EffectMeta): Promise<void> {
     const index = locate()
     // Only a disposer still in the list can start here: once unload claimed
     // it, it is either running already (awaited below) or finished, and the
     // shared `start()` promise keeps the second call a no-op either way.
     if (index >= 0) {
       this.disposers.splice(index, 1)
+      // The diagnostic record leaves with the disposer: an early-disposed
+      // effect is no longer registered, so subscribe/unsubscribe loops keep
+      // `getEffects()` (and memory) bounded.
+      const metaIndex = this.effectMetas.indexOf(meta)
+      if (metaIndex >= 0) this.effectMetas.splice(metaIndex, 1)
       const run = record.start()
       this.runningDisposals.add(run)
       // Bookkeeping on the side, not via `run.finally(...)`: `finally` derives

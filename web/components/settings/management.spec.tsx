@@ -35,10 +35,9 @@ describe('agent panel', () => {
 
     const html = renderToStaticMarkup(<AgentsPanel workspaceId="ws-1" />)
     expect(html).toContain('Roles')
-    expect(html).toContain('Create a role')
-    // Spawning belongs to the conversation, not to Settings: the tab points
-    // at the workbench instead of rendering controls nothing can act on.
-    expect(html).toContain('Subagents view of the workbench')
+    expect(html).toContain('aria-label="New role"')
+    expect(html).toContain('aria-label="Search roles"')
+    // Spawning belongs to the conversation, not to Settings.
     expect(html).not.toContain('Spawn')
   })
 })
@@ -91,26 +90,28 @@ describe('mcp panel', () => {
 describe('hooks + secrets panels', () => {
   it.each([
     [null, 'document must be an object'],
-    [{}, 'version must be 1'],
-    [{ version: 1 }, 'hooks is required'],
-    [{ version: 1, hooks: { PreToolUse: {} } }, 'PreToolUse must be an array'],
-    [{ version: 1, hooks: { PreToolUse: [null] } }, 'PreToolUse[0] must be an object'],
-    [{ version: 1, hooks: { PreToolUse: [{ matcher: '*', type: 'command', command: '', onFailure: 'deny' }] } }, 'command must be a non-empty string'],
-    [{ version: 1, hooks: { PreToolUse: [{ matcher: 1, type: 'command', command: 'node guard.mjs', onFailure: 'deny' }] } }, 'matcher must be a string'],
-    [{ version: 1, hooks: { PreToolUse: [{ matcher: '*', type: 'shell', command: 'node guard.mjs', onFailure: 'deny' }] } }, 'type must be "command"'],
-    [{ version: 1, hooks: { PreToolUse: [{ matcher: '*', type: 'command', command: 'node guard.mjs', args: [1], onFailure: 'deny' }] } }, 'args must be an array of strings'],
-    [{ version: 1, hooks: { PreToolUse: [{ matcher: '*', type: 'command', command: 'node guard.mjs', timeoutMs: 0, onFailure: 'deny' }] } }, 'timeoutMs must be a positive finite number'],
-    [{ version: 1, hooks: {}, extra: true }, 'unknown top-level key "extra"'],
-    [{ version: 1, hooks: { PreToolUse: [{ matcher: '*', type: 'command', command: 'node guard.mjs', onFailure: 'deny', extra: true }] } }, 'PreToolUse[0] has unknown key "extra"'],
-    [{ version: 1, hooks: { PreToolUse: [{ matcher: '*', type: 'command', command: 'node guard.mjs', onFailure: 'ignore' }] } }, 'onFailure must be "deny" or "allow"'],
-  ] as const)('rejects malformed hooks documents without casting them: %#', (input, message) => {
+    [{ hooks: [] }, '"hooks" must be an object'],
+    [{ hooks: { PreToolUse: {} } }, 'PreToolUse must be an array'],
+    [{ hooks: { PreToolUse: [null] } }, 'PreToolUse[0] must be an object'],
+    [{ hooks: { PreToolUse: [{ matcher: 1, hooks: [] }] } }, 'matcher must be a string'],
+    [{ hooks: { PreToolUse: [{ matcher: 'Bash' }] } }, 'PreToolUse[0].hooks must be an array'],
+    [{ hooks: { PreToolUse: [{ hooks: [{ type: 'prompt', prompt: 'x' }] }] } }, 'type must be "command"'],
+    [{ hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: 'x', timeout: 0 }] }] } }, 'timeout must be a positive number of seconds'],
+    [{ hooks: { Nope: [] } }, 'unknown hook event "Nope"'],
+  ] as const)('rejects malformed Claude hooks sections without casting them: %#', (input, message) => {
     expect(() => validateHooksConfig(input)).toThrow(message)
   })
 
-  it('accepts a complete hooks document with partial known event arrays', () => {
-    expect(validateHooksConfig({ version: 1, hooks: { PreToolUse: [{ matcher: 'Bash*', type: 'command', command: 'node guard.mjs', args: ['--strict'], timeoutMs: 500, onFailure: 'deny' }] } })).toEqual({
-      version: 1,
-      hooks: { PreToolUse: [{ matcher: 'Bash*', type: 'command', command: 'node guard.mjs', args: ['--strict'], timeoutMs: 500, onFailure: 'deny' }] },
+  it('keeps Claude events dnt-harness does not fire instead of rejecting the file', () => {
+    expect(validateHooksConfig({ hooks: { PermissionRequest: [{ hooks: [{ type: 'command', command: 'x' }] }] } }).hooks.PermissionRequest).toHaveLength(1)
+  })
+
+  it('accepts a Claude Code hooks section', () => {
+    expect(validateHooksConfig({ hooks: { PreToolUse: [{ matcher: 'Write|Edit', hooks: [{ type: 'command', command: '"$CLAUDE_PROJECT_DIR"/guard.sh', timeout: 5 }] }], Stop: [{ hooks: [{ type: 'command', command: 'x' }] }] } })).toEqual({
+      hooks: {
+        PreToolUse: [{ matcher: 'Write|Edit', hooks: [{ type: 'command', command: '"$CLAUDE_PROJECT_DIR"/guard.sh', timeout: 5 }] }],
+        Stop: [{ hooks: [{ type: 'command', command: 'x' }] }],
+      },
     })
   })
 

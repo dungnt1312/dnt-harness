@@ -58,6 +58,32 @@ async function settle(base: string, workspaceId: string, sessionId: string): Pro
 }
 
 describe('workspace session model controls', () => {
+  it('executes the submitted draft model even when another conversation changed global defaults', async () => {
+    const seen: { model?: string; provider?: string; thinkingLevel?: string }[] = []
+    const { base } = await start([provider('cliproxy', ['claude-opus-5-5', 'gpt-6.1-sol'], seen)])
+    const workspaceId = await firstWorkspace(base)
+    const selected = { provider: 'cliproxy', model: 'claude-opus-5-5', thinkingLevel: 'medium' }
+    await put(base, '/api/model-defaults', selected)
+    await put(base, '/api/model-defaults', { provider: 'cliproxy', model: 'gpt-6.1-sol', thinkingLevel: 'high' })
+    const response = await post(base, `/api/workspaces/${workspaceId}/sessions`, { controls: selected })
+    expect(response.status).toBe(201)
+    const { id } = await response.json() as { id: string }
+    expect(await (await fetch(`${base}/api/workspaces/${workspaceId}/sessions/${id}/model`)).json()).toEqual({ ...selected, source: 'session' })
+    await post(base, `/api/workspaces/${workspaceId}/sessions/${id}/messages`, { content: 'go' })
+    await settle(base, workspaceId, id)
+    expect(seen).toEqual([selected])
+  })
+
+  it('rejects invalid creation controls before creating a session instead of falling back', async () => {
+    const { base } = await start([provider('alpha', ['a1'], [])])
+    const workspaceId = await firstWorkspace(base)
+    const route = `/api/workspaces/${workspaceId}/sessions`
+    for (const controls of [null, 'a1', {}, { provider: 'alpha' }, { provider: 'alpha', model: 'missing', thinkingLevel: null }, { provider: 'alpha', model: 'a1', thinkingLevel: 'invalid' }]) {
+      expect((await post(base, route, { controls })).status).toBe(400)
+    }
+    expect(await (await fetch(`${base}${route}`)).json()).toEqual([])
+  })
+
   it('snapshots workspace defaults at creation, isolates sessions, and leaves existing sessions unchanged', async () => {
     const seen: { model?: string; provider?: string; thinkingLevel?: string }[] = []
     const { base } = await start([provider('alpha', ['a1', 'a2'], seen), provider('beta', ['b1'], seen)])

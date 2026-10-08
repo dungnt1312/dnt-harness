@@ -11,6 +11,7 @@ import { Select } from '../ui/Select.tsx'
 import { Switch } from '../ui/Switch.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
 import Icon from '../common/Icon.tsx'
+import { cn } from '../../lib/cn.ts'
 import {
   EmptyState,
   ItemList,
@@ -19,10 +20,15 @@ import {
   PanelBody,
   PanelIntro,
   Section,
+  LoadFailed,
   WorkspaceRequired,
   useActionRunner,
   type NoticeState,
+  SaveBar,
+  ConflictBanner,
+  RowMenu,
 } from './settings-kit.tsx'
+import { useUnsavedChanges } from './unsaved-changes.tsx'
 import { matchCommand } from '../../../src/harness/guard/matcher.ts'
 import { DEFAULT_CONFIG, PRESET_IDS, PRESET_LABELS, PRESET_RULE_TEXTS } from '../../../src/harness/guard/defaults.ts'
 import type { CustomRuleAction, GuardAction } from '../../../src/harness/guard/types.ts'
@@ -38,6 +44,11 @@ const RULE_ACTION_OPTIONS: readonly { readonly value: CustomRuleAction; readonly
   { value: 'ask', label: 'Ask' },
   { value: 'allow', label: 'Allow' },
 ]
+
+/** One colour per verdict, so deny / ask / allow / off never share a badge. */
+function actionTone(action: string): 'red' | 'amber' | 'green' | 'gray' {
+  return action === 'deny' ? 'red' : action === 'ask' ? 'amber' : action === 'allow' ? 'green' : 'gray'
+}
 
 function isConflict(cause: unknown): boolean {
   return /409/.test(String(cause))
@@ -116,7 +127,12 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
 
   useEffect(() => { void load() }, [load])
 
+  useUnsavedChanges(config !== null && baseline !== null && serializeConfig(config) !== baseline)
+
   if (workspaceId === null) return <WorkspaceRequired />
+  if (!loading && config === null && notice?.kind === 'bad') {
+    return <LoadFailed what="the guard configuration" error={notice.text} onRetry={() => void load()} />
+  }
   if (loading || config === null) {
     return (
       <PanelBody>
@@ -285,7 +301,6 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
         Presets deny or ask for risky patterns; custom rules override presets. Obfuscated payloads may bypass matching — this is not an OS sandbox.
       </PanelIntro>
 
-      {notice !== null ? <Notice kind={notice.kind} text={notice.text} /> : null}
 
       <Section title="Presets" count={PRESET_IDS.length}>
         <ItemList label="Preset groups">
@@ -301,15 +316,15 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
                 title={(
                   <>
                     <span className={toneClass}>{info.name}</span>
-                    <Badge tone={value === 'deny' ? 'amber' : value === 'ask' ? 'amber' : 'gray'}>{value}</Badge>
+                    <Badge tone={actionTone(value)}>{value}</Badge>
                     <button
                       type="button"
-                      className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-xs font-normal text-fg-muted hover:bg-hover hover:text-fg"
+                      className="inline-flex h-6 items-center gap-1 rounded-full border border-line px-2 text-[11px] font-medium text-fg-muted transition-colors hover:bg-hover hover:text-fg"
                       onClick={() => togglePreset(id)}
                       aria-expanded={expanded}
                       aria-label={`${expanded ? 'Hide' : 'Show'} rules for ${info.name}`}
                     >
-                      <Icon name="chevron" size={11} className={expanded ? 'rotate-180' : ''} />
+                      <Icon name="chevron" size={12} className={cn('transition-transform', expanded && 'rotate-180')} />
                       {expanded ? 'Hide rules' : `${rules.length} rules`}
                     </button>
                   </>
@@ -356,14 +371,18 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
                   <>
                     <code className="break-all font-mono text-[13px]">{rule.pattern}</code>
                     <Badge tone="gray">{rule.isRegex ? 'Regex' : 'Text'}</Badge>
-                    <Badge tone={rule.action === 'deny' ? 'amber' : rule.action === 'ask' ? 'amber' : 'gray'}>{rule.action}</Badge>
+                    <Badge tone={actionTone(rule.action)}>{rule.action}</Badge>
                   </>
                 )}
                 meta={rule.description ?? ''}
                 actions={(
                   <>
-                    <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => openEdit(rule)}>Edit</Button>
-                    <IconButton label={`Delete rule ${rule.pattern}`} disabled={busy !== null} onClick={() => deleteRule(rule.id)}><Icon name="trash" size={14} /></IconButton>
+                    <IconButton label={`Edit rule ${rule.pattern}`} disabled={busy !== null} onClick={() => openEdit(rule)}><Icon name="pencil" size={14} /></IconButton>
+                    <RowMenu
+                      label={`More actions for rule ${rule.pattern}`}
+                      disabled={busy !== null}
+                      actions={[{ label: 'Remove rule', icon: 'trash', danger: true, onSelect: () => deleteRule(rule.id) }]}
+                    />
                   </>
                 )}
               />
@@ -392,19 +411,16 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
         ) : null}
       </Section>
 
-      {conflict ? (
-        <div className="flex flex-wrap items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn">
-          <span className="min-w-0 flex-1 basis-48">The file changed on disk since you opened it.</span>
-          <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void reload()}>Reload server version</Button>
-          <Button variant="outline-danger" size="sm" disabled={busy !== null} onClick={() => void overwrite()}>Overwrite anyway</Button>
-        </div>
-      ) : null}
+      {conflict ? <ConflictBanner what="file" busy={busy !== null} onReload={() => void reload()} onOverwrite={() => void overwrite()} /> : null}
 
-      <div className="flex flex-wrap gap-2">
-        <Button variant="primary" size="sm" disabled={busy !== null || !dirty} onClick={() => void save()}>{busy === 'save' ? 'Saving…' : 'Save'}</Button>
-        <Button variant="ghost" size="sm" disabled={busy !== null || !dirty} onClick={cancel}>Cancel</Button>
-        {dirty ? <span className="self-center text-xs text-fg-faint">Unsaved changes</span> : null}
-      </div>
+      <SaveBar
+        dirty={dirty}
+        busy={busy !== null}
+        saving={busy === 'save'}
+        notice={notice}
+        onSave={() => void save()}
+        onDiscard={cancel}
+      />
 
       {editing !== null ? (
         <Modal open label={editing.id === '__new__' ? 'Add rule' : 'Edit rule'} width="md" onDismiss={closeDialog}>
@@ -436,9 +452,9 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
                 onChange={(e) => setDraftDesc(e.target.value)}
               />
             </Field>
-            <div className="flex gap-2">
-              <Button variant="primary" size="sm" disabled={!canSaveRule} onClick={saveRule}>{editing.id === '__new__' ? 'Add rule' : 'Save rule'}</Button>
+            <div className="flex justify-end gap-2 pt-1">
               <Button variant="ghost" size="sm" onClick={closeDialog}>Cancel</Button>
+              <Button variant="primary" size="sm" disabled={!canSaveRule} onClick={saveRule}>{editing.id === '__new__' ? 'Add rule' : 'Save rule'}</Button>
             </div>
           </div>
         </Modal>

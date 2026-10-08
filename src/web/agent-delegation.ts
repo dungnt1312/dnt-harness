@@ -39,7 +39,7 @@ export function projectInheritedMessages(events: readonly SessionEvent[], maxCha
   for (let i = events.length - 1; i >= 0 && used < maxChars; i--) {
     const event = events[i]
     let line: string | undefined
-    if (event?.type === 'user/message' && event.content.trim() !== '') line = `User: ${event.content.trim()}`
+    if (event?.type === 'user/message' && event.origin !== 'context' && event.content.trim() !== '') line = `User: ${event.content.trim()}`
     else if (event?.type === 'assistant/message' && (event.toolCalls === undefined || event.toolCalls.length === 0) && event.content.trim() !== '') {
       line = `Assistant: ${event.content.trim()}`
     }
@@ -108,9 +108,67 @@ export function resolveChildModel(
   definitionModel: string | undefined,
   deps: ChildModelDeps,
 ): ChildModel | undefined {
+  const explicit = reference?.trim() ?? ''
+  if (explicit !== '' || definitionModel === undefined) return resolveModelReference(explicit, deps)
+  // Claude subagent `model:` semantics: `inherit`, an alias resolved against
+  // what this host serves, or an id. A definition written for another host
+  // (an alias or id this one lacks) runs on the conversation's model rather
+  // than failing the spawn.
+  const fromDefinition = definitionModel.trim()
+  if (fromDefinition === '' || fromDefinition === 'inherit') return resolveModelReference('', deps)
+  const aliased = resolveModelAlias(fromDefinition, deps) ?? fromDefinition
+  try {
+    return resolveModelReference(aliased, deps)
+  } catch (error) {
+    if (error instanceof ChildModelError) return resolveModelReference('', deps)
+    throw error
+  }
+}
+
+/**
+ * What a role's `model:` resolves to on this host, for display: the
+ * `provider:model` it would run on, or `inherit` when it follows the
+ * conversation (no model, `inherit`, or a model this host cannot serve —
+ * then `unresolved` names what was asked for).
+ */
+export function describeRoleModel(
+  definitionModel: string | undefined,
+  deps: Pick<ChildModelDeps, 'parent' | 'providers' | 'modelsOf'>,
+): { readonly resolved?: string; readonly inherit: boolean; readonly unresolved?: string } {
+  const asked = definitionModel?.trim() ?? ''
+  if (asked === '' || asked === 'inherit') return { inherit: true }
+  const aliased = resolveModelAlias(asked, deps)
+  if (aliased !== undefined) return { resolved: aliased, inherit: false }
+  const boundary = asked.indexOf(':')
+  if (boundary > 0 && deps.providers.includes(asked.slice(0, boundary))) return { resolved: asked, inherit: false }
+  const owner = deps.providers.find((provider) => deps.modelsOf(provider).includes(asked))
+  if (owner !== undefined) return { resolved: `${owner}:${asked}`, inherit: false }
+  return { inherit: true, unresolved: asked }
+}
+
+/** Claude model aliases a subagent file may carry. */
+const CLAUDE_MODEL_ALIASES = new Set(['sonnet', 'opus', 'haiku', 'fable'])
+
+/**
+ * `sonnet`/`opus`/`haiku` → the first served model whose id contains the
+ * alias, preferring the conversation's provider. Undefined when not an alias
+ * or nothing matches.
+ */
+export function resolveModelAlias(alias: string, deps: Pick<ChildModelDeps, 'parent' | 'providers' | 'modelsOf'>): string | undefined {
+  const key = alias.trim().toLowerCase()
+  if (!CLAUDE_MODEL_ALIASES.has(key)) return undefined
+  const parentProvider = typeof deps.parent.provider === 'string' && deps.parent.provider !== '' ? deps.parent.provider : undefined
+  const order = [...(parentProvider !== undefined ? [parentProvider] : []), ...deps.providers.filter((provider) => provider !== parentProvider)]
+  for (const provider of order) {
+    const model = deps.modelsOf(provider).find((id) => id.toLowerCase().includes(key))
+    if (model !== undefined) return `${provider}:${model}`
+  }
+  return undefined
+}
+
+function resolveModelReference(requested: string, deps: ChildModelDeps): ChildModel | undefined {
   const thinkingLevel = deps.parent.thinkingLevel
   const inherited = withThinking(deps.parent, thinkingLevel)
-  const requested = (reference ?? definitionModel ?? '').trim()
   if (requested === '') return inherited
 
   const boundary = requested.indexOf(':')
@@ -203,19 +261,22 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
     const definition = bundledDefinition(name)
     return { name: definition.name, description: definition.description }
   })
-  const roleCache = new Map<WorkspaceId, { roles: readonly { readonly name: string; readonly description: string }[]; refreshedAt: number }>()
+  // Keyed by workspace AND bound project: project `.claude/agents` roles
+  // belong to that project's conversations only.
+  const roleCache = new Map<string, { roles: readonly { readonly name: string; readonly description: string }[]; refreshedAt: number }>()
 
-  const rolesFor = (workspaceId: WorkspaceId): readonly { readonly name: string; readonly description: string }[] => {
+  const rolesFor = (workspaceId: WorkspaceId, projectId: ProjectId | undefined): readonly { readonly name: string; readonly description: string }[] => {
     const now = Date.now()
+    const key = `${workspaceId}:${projectId ?? ''}`
     // Lazy TTL eviction keeps the long-lived closure bounded.
     for (const [id, entry] of roleCache) {
-      if (id !== workspaceId && now - entry.refreshedAt >= ROLE_CACHE_MS) roleCache.delete(id)
+      if (id !== key && now - entry.refreshedAt >= ROLE_CACHE_MS) roleCache.delete(id)
     }
-    const cached = roleCache.get(workspaceId)
+    const cached = roleCache.get(key)
     if (cached !== undefined && now - cached.refreshedAt < ROLE_CACHE_MS) return cached.roles
     const entry = { roles: cached?.roles ?? BUNDLED_ROLES, refreshedAt: now }
-    roleCache.set(workspaceId, entry)
-    void deps.definitions.list(workspaceId)
+    roleCache.set(key, entry)
+    void deps.definitions.list(workspaceId, projectId)
       .then((rows) => { entry.roles = rows.map((row) => ({ name: row.definition.name, description: row.definition.description })) })
       .catch(() => { /* keep the previous listing; `catalog` reports the truth */ })
     return entry.roles
@@ -223,7 +284,7 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
 
   const describe = (): string => {
     const scope = agentScope.getStore()
-    const roles = scope?.workspaceId !== undefined ? rolesFor(scope.workspaceId) : BUNDLED_ROLES
+    const roles = scope?.workspaceId !== undefined ? rolesFor(scope.workspaceId, scope.projectId) : BUNDLED_ROLES
     const models = availableModels({ providers: deps.providers(), modelsOf: deps.modelsOf })
     const total = deps.providers().reduce((sum, provider) => sum + deps.modelsOf(provider).length, 0)
     return [
@@ -261,7 +322,7 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
         case 'wait': return wait(deps, args, scope.sessionId, workspaceId, exec.signal, scope.turnId)
         case 'cancel': return cancel(deps, args, scope.sessionId, workspaceId)
         case 'reconcile': return reconcile(deps, args, scope.sessionId, workspaceId)
-        case 'catalog': return catalog(deps, workspaceId)
+        case 'catalog': return catalog(deps, workspaceId, scope.projectId)
         default:
           throw new Error(`unknown action '${action}'; use spawn, wait, cancel, reconcile or catalog`)
       }
@@ -306,8 +367,8 @@ async function spawn(
   // while the role and model resolve can never leak into the snapshot.
   const inheritedContext = inherit === 'brief' ? projectInheritedMessages(parent.events) : undefined
 
-  const resolved = await deps.definitions.resolve(workspaceId, name).catch(async (error: unknown) => {
-    const rows = await deps.definitions.list(workspaceId).catch(() => [])
+  const resolved = await deps.definitions.resolve(workspaceId, name, projectId).catch(async (error: unknown) => {
+    const rows = await deps.definitions.list(workspaceId, projectId).catch(() => [])
     throw new Error(`${String(error instanceof Error ? error.message : error)}; available roles: ${rows.map((row) => row.definition.name).join(', ') || 'none'}`)
   })
   const packet: TaskPacket = {
@@ -345,7 +406,10 @@ async function spawn(
   })
   // A grant that asked for something the role lacks is reported, never
   // silently dropped: the model would otherwise plan around a missing tool.
-  const dropped = grantTools?.filter((tool) => !resolved.definition.tools.includes(tool)) ?? []
+  const dropped = grantTools?.filter((tool) =>
+    !resolved.definition.tools.includes(tool)
+    // A role that inherits every tool admits granted MCP tools.
+    && !(resolved.definition.inheritsTools === true && tool.startsWith('mcp__'))) ?? []
   const notes = [
     ...(dropped.length > 0 ? [`role '${handle.definitionName}' does not expose ${dropped.join(', ')}`] : []),
     ...(both ? ["both 'prompt' and 'objective' were given; the prompt is the brief"] : []),
@@ -465,8 +529,8 @@ function childParentSessionId(session: Session | undefined): SessionId | undefin
   return undefined
 }
 
-async function catalog(deps: DelegationDeps, workspaceId: WorkspaceId): Promise<string> {
-  const rows = await deps.definitions.list(workspaceId)
+async function catalog(deps: DelegationDeps, workspaceId: WorkspaceId, projectId: ProjectId | undefined): Promise<string> {
+  const rows = await deps.definitions.list(workspaceId, projectId)
   return JSON.stringify({
     roles: rows.map((row) => ({
       name: row.definition.name,

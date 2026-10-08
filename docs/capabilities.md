@@ -225,8 +225,8 @@ several children, capped at 120 s, honours Stop), `list`, `cancel`, `reconcile`,
   never tool calls, tool output or a compaction summary — captured at spawn,
   wrapped as lower-trust `parent-context` data, and dropped (with a manifest
   omission) under budget pressure before history is. Only its hash and size are
-  stored; the spawn result reports the size. A role with `inheritable: false`
-  refuses it. `references` are unaffected and still ride in the brief.
+  stored; the spawn result reports the size. `references` are unaffected and
+  still ride in the brief.
 - **Asynchronous on purpose**: a step runs its tool calls in sequence, so
   `spawn` must return immediately for children to overlap. Spawning is
   uncapped — no per-conversation, host, or per-turn ceiling; the spawn result
@@ -249,10 +249,20 @@ several children, capped at 120 s, honours Stop), `list`, `cancel`, `reconcile`,
   at spawn as admission exposure ∩ role tools ∩ explicit grant; later mode
   widening cannot add tools, while later narrowing denies unstarted calls.
   `Agent` is `ask` only in *Ask before changes* and `allow` in Plan, *Edit
-  automatically*, and *Full access*. Chat exposes it nowhere. In Plan, MCP is
-  exposed only when the server has a non-empty explicit allowlist entry whose
-  tool name matches the read-safe naming heuristic; this is not proof that the
-  remote implementation is side-effect-free.
+  automatically*, and *Full access*. Chat exposes it nowhere.
+- **MCP exposure is a mode property** (`mcpExposure: none | read-safe | all`),
+  so a duplicated Plan keeps it. `read-safe` exposes an MCP tool only when the
+  server has a non-empty explicit allowlist entry for it AND its name matches
+  the read-safe heuristic (`read|get|list|search|query|fetch|inspect|describe`);
+  this is not proof that the remote implementation is side-effect-free. When
+  the field is absent it is derived: a zero tool ceiling is always `none` (an
+  explicit value cannot reopen it); Plan and any mode exposing none of
+  `Write`, `Edit`, `Bash` get `read-safe`; everything else gets `all`. Bundled
+  Plan sets `read-safe` explicitly; the other bundled modes derive `all`.
+  **Behavior change (2026-10):** custom modes that cannot write/edit/run a
+  shell — including conversations already stamped with such a mode — lose
+  mutating MCP tools at their next request; add `mcpExposure: all` and
+  reselect the mode to opt back in.
 - **Grants only narrow**: a `grantTools` entry the role lacks is reported back,
   never silently dropped.
 - **Four bundled roles**, each described by when to pick it and each stating

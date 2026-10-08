@@ -29,7 +29,7 @@ const VIEW_META: Readonly<Record<WorkbenchView, { readonly icon: 'folder' | 'inf
   agents: { icon: 'gitBranch', label: 'Subagents' },
   trajectory: { icon: 'clock', label: 'Trajectory' },
   terminal: { icon: 'terminal', label: 'Terminal' },
-  process: { icon: 'terminal', label: 'Process' },
+  process: { icon: 'terminal', label: 'Processes' },
 }
 
 /** Picker order; the strip itself keeps the order the operator opened views in. */
@@ -143,7 +143,7 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
    */
   readonly gitPathFilter?: readonly string[] | null
   /** The Git view row a card's file click opened, pre-expanded to its diff. */
-  readonly gitFocusPath?: string | null
+  readonly gitFocusPath?: { readonly path: string; readonly nonce: number } | null
   /** Clears the turn filter (the banner's Show all). */
   readonly onClearGitFilter?: () => void
 }) {
@@ -217,7 +217,7 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
           workspaceId={workspaceId}
           project={project}
           {...(gitPathFilter !== null && gitPathFilter.length > 0 ? { pathFilter: gitPathFilter } : {})}
-          {...(gitFocusPath !== null ? { focusPath: gitFocusPath } : {})}
+          {...(gitFocusPath !== null ? { focusPath: gitFocusPath.path, focusNonce: gitFocusPath.nonce } : {})}
           {...(openPath !== undefined ? { onOpenFile: (path: string) => { openPath(`${project.path}/${path}`)?.() } } : {})}
           {...(onClearGitFilter !== undefined ? { onShowAll: onClearGitFilter } : {})}
         />

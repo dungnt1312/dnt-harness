@@ -6,7 +6,7 @@
  *
  * Dynamic client registration is not implemented.
  */
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { assertOutboundUrl, OutboundPolicyError } from './outbound-policy.ts'
 import { OAuthStore, type OAuthTokens } from './oauth-store.ts'
 
@@ -28,6 +28,14 @@ export class OAuthFlowError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'OAuthFlowError'
+  }
+}
+
+/** The token endpoint could not answer now; the stored grant is still good. */
+export class OAuthTemporaryError extends OAuthFlowError {
+  constructor(message: string) {
+    super(message)
+    this.name = 'OAuthTemporaryError'
   }
 }
 
@@ -101,25 +109,48 @@ export class ManagedOAuth {
     return tokens
   }
 
+  /**
+   * The access token to send now, refreshed when it is about to expire.
+   * `undefined` means a person has to authorize again; a thrown
+   * {@link OAuthTemporaryError} means try later with the same grant.
+   */
   async accessToken(workspaceId: string, server: string): Promise<string | undefined> {
     const stored = await this.store.readTokens(workspaceId, server)
-    if (stored === undefined || stored.phase === 'local_revoked') return undefined
-    if (stored.phase === 'refresh_in_progress') return undefined
-    if (stored.expiresAt <= this.now() + SKEW_MS) {
+    if (stored === undefined || stored.phase === 'local_revoked' || stored.phase === 'auth_required') return undefined
+    // `refresh_in_progress` outside the lock is either a refresh running in
+    // this process (refresh() waits for it) or one a crash interrupted
+    // (refresh() resumes it). Neither is a reason to give up the grant.
+    if (stored.phase !== 'active' || stored.expiresAt <= this.now() + SKEW_MS) {
       const refreshed = await this.refresh(workspaceId, server)
       return refreshed?.accessToken
     }
     return stored.accessToken
   }
 
-  async refresh(workspaceId: string, server: string): Promise<OAuthTokens | undefined> {
+  /**
+   * The server refused `rejected` (HTTP 401/403). Refresh once, however many
+   * callers report the same token; a token already replaced is returned as is.
+   */
+  async replaceRejected(workspaceId: string, server: string, rejected: string | undefined): Promise<string | undefined> {
+    const refreshed = await this.refresh(workspaceId, server, rejected)
+    return refreshed?.accessToken
+  }
+
+  async refresh(workspaceId: string, server: string, rejected?: string): Promise<OAuthTokens | undefined> {
     return this.store.withServerLock(workspaceId, server, async () => {
       const current = await this.store.readTokens(workspaceId, server)
-      if (current === undefined || current.phase === 'local_revoked') return undefined
+      if (current === undefined || current.phase === 'local_revoked' || current.phase === 'auth_required') return undefined
       if (current.phase === 'replacement_persisted') {
         const active = { ...current, phase: 'active' as const }
         await this.store.saveTokens(workspaceId, server, active)
         return active
+      }
+      // Another caller refreshed while this one waited for the lock.
+      const stillGood = current.phase === 'active' && current.expiresAt > this.now() + SKEW_MS
+      if (stillGood && (rejected === undefined || current.accessToken !== rejected)) return current
+      if (current.refreshToken === '') {
+        await this.store.saveTokens(workspaceId, server, { ...current, phase: 'auth_required' })
+        return undefined
       }
       await this.store.saveTokens(workspaceId, server, { ...current, phase: 'refresh_in_progress' })
       let next: OAuthTokens
@@ -130,7 +161,12 @@ export class ManagedOAuth {
           client_id: current.clientId,
           resource: current.resource,
         }))
-      } catch {
+      } catch (error) {
+        if (error instanceof OAuthTemporaryError) {
+          // Network trouble or a 5xx/429 says nothing about the grant: keep it.
+          await this.store.saveTokens(workspaceId, server, { ...current, phase: 'active' })
+          throw error
+        }
         await this.store.saveTokens(workspaceId, server, { ...current, phase: 'auth_required' })
         return undefined
       }
@@ -168,13 +204,23 @@ export class ManagedOAuth {
 
   private async exchange(endpoint: string, body: URLSearchParams): Promise<OAuthTokens> {
     assertOauthUrl(endpoint)
-    const response = await this.fetchImpl(endpoint, {
-      method: 'POST',
-      redirect: 'manual',
-      headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
-      body,
-    })
+    let response: Response
+    try {
+      response = await this.fetchImpl(endpoint, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+        body,
+        signal: AbortSignal.timeout(15_000),
+      })
+    } catch (error) {
+      throw new OAuthTemporaryError(`token endpoint temporarily unreachable: ${error instanceof Error ? error.message : String(error)}`)
+    }
     if (response.status >= 300 && response.status < 400) throw new OAuthFlowError('token endpoint redirected')
+    if (response.status >= 500 || response.status === 429) {
+      await response.body?.cancel().catch(() => undefined)
+      throw new OAuthTemporaryError(`token endpoint temporarily unavailable (HTTP ${response.status})`)
+    }
     if (!response.ok) throw new OAuthFlowError('token endpoint rejected the exchange')
     const parsed = await response.json() as { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown; token_type?: unknown }
     if (typeof parsed.access_token !== 'string' || parsed.access_token === '') throw new OAuthFlowError('token response has no access token')
@@ -202,14 +248,6 @@ function assertOauthUrl(raw: string): void {
     throw error
   }
 }
-
-function same(left: string, right: string): boolean {
-  const a = Buffer.from(left)
-  const b = Buffer.from(right)
-  return a.length === b.length && timingSafeEqual(a, b)
-}
-
-void same
 
 function tombstone(workspaceId: string, server: string): OAuthTokens {
   return {

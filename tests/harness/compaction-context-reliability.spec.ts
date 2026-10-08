@@ -67,6 +67,29 @@ describe('compaction context reliability', () => {
     expect(text(result)).toContain('COVERED REQUEST')
     expect(result.sections.some(s => s.kind === 'compaction')).toBe(false)
   })
+  it('host-attested checkpoints skip canonical re-derivation but still need a completed boundary', () => {
+    // Attested: accepted at a valid boundary.
+    const ok = buildContext(base({ compaction: { summary: 'SUMMARY', coversSeq: 6, verifiedAgainst: 'committed-log' }, compactionTailTurns: 0 }))
+    expect(ok.manifest.history.compactedThroughSeq).toBe(6)
+    expect(text(ok)).not.toContain('COVERED REQUEST')
+    // Attested but not on a completed boundary, or beyond the log: ignored with an omission.
+    for (const coversSeq of [5, 7, 100]) {
+      const bad = buildContext(base({ compaction: { summary: 'SUMMARY', coversSeq, verifiedAgainst: 'committed-log' }, compactionTailTurns: 0 }))
+      expect(bad.manifest.history.compactedThroughSeq).toBeUndefined()
+      expect(bad.manifest.omissions.some(o => o.includes('invalid checkpoint'))).toBe(true)
+    }
+    // Attested but invalid summary: ignored.
+    for (const summary of ['', '   ', 'x'.repeat(24_001)]) {
+      const bad = buildContext(base({ compaction: { summary, coversSeq: 6, verifiedAgainst: 'committed-log' }, compactionTailTurns: 0 }))
+      expect(bad.manifest.history.compactedThroughSeq).toBeUndefined()
+    }
+    // The attestation is what skips re-derivation: the builder trusts the
+    // host's committed-log check (an unattested caller is still re-checked).
+    const attested = buildContext(base({ compaction: { summary: 'HOST VERIFIED', coversSeq: 6, verifiedAgainst: 'committed-log' }, compactionTailTurns: 0 }))
+    expect(text(attested)).toContain('HOST VERIFIED')
+    const unattested = buildContext(base({ compaction: { summary: 'HOST VERIFIED', coversSeq: 6 }, compactionTailTurns: 0 }))
+    expect(text(unattested)).not.toContain('HOST VERIFIED')
+  })
   it('rejects a turn/end without its matching start', () => {
     const mismatched = events.map(e => e.type === 'turn/end' ? { ...e, turnId: 'other' as typeof e.turnId } : e)
     const result = buildContext(base({ events: mismatched, compaction: { summary: 'INVALID SUMMARY', coversSeq: 6 }, compactionTailTurns: 0 }))

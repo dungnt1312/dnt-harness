@@ -23,7 +23,12 @@ import {
   WorkspaceRequired,
   useActionRunner,
   type NoticeState,
+  ConflictBanner,
+  InlineSwitch,
+  RowMenu,
+  SubTabs,
 } from './settings-kit.tsx'
+import { useUnsavedChanges } from './unsaved-changes.tsx'
 
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 /** Mirrors the server's reserved names (`/skills/sources` is the rules route). */
@@ -36,7 +41,7 @@ const savedNotice = (saved: { readonly name: string; readonly hash: string; read
     ? { kind: 'info', text: `Saved ${saved.name} (${saved.hash.slice(0, 8)}), but: ${saved.warnings.join(' ')}` }
     : { kind: 'ok', text: `Saved ${saved.name} (${saved.hash.slice(0, 8)}).` }
 /** One tree row: fixed height, full-width hover; callers add the indent. */
-const TREE_ROW = 'flex h-7 w-full min-w-0 items-center pr-3 text-left text-[13px] hover:bg-hover'
+const TREE_ROW = 'flex h-7 w-full min-w-0 items-center pr-3 text-left text-[13px] outline-none hover:bg-hover focus-visible:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-link'
 type PanelTab = 'skills' | 'folders'
 
 interface SkillGroup {
@@ -102,6 +107,10 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
   }, [workspaceId])
 
   useEffect(() => { void refresh() }, [refresh])
+
+  const guardDiscard = useUnsavedChanges(editing !== null && (
+    editing.isNew ? newName.trim() !== '' || content.trim() !== '' : content !== editing.loaded
+  ))
 
   if (workspaceId === null) return <WorkspaceRequired />
 
@@ -347,16 +356,10 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
             <Field label="SKILL.md" hint="Markdown with frontmatter (name, description).">
               <CodeArea tall value={content} placeholder={SKILL_PLACEHOLDER} onChange={(e) => setContent(e.target.value)} />
             </Field>
-            {conflict ? (
-              <div className="flex flex-wrap items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn">
-                <span className="min-w-0 flex-1 basis-48">The file changed on disk since you opened it.</span>
-                <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void reloadServer()}>Reload server version</Button>
-                <Button variant="outline-danger" size="sm" disabled={busy !== null} onClick={() => void overwrite()}>Overwrite anyway</Button>
-              </div>
-            ) : null}
+            {conflict ? <ConflictBanner what="file" busy={busy !== null} onReload={() => void reloadServer()} onOverwrite={() => void overwrite()} /> : null}
           </div>
           <div className="flex shrink-0 justify-end gap-2 border-t border-line px-4 py-3">
-            <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => { setEditing(null); setConflict(false) }}>Cancel</Button>
+            <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => guardDiscard(() => { setEditing(null); setConflict(false) })}>Cancel</Button>
             <Button variant="primary" size="sm" disabled={busy !== null || cannotSave} onClick={() => void save()}>{busy === 'save' ? 'Saving…' : 'Save skill'}</Button>
           </div>
         </>
@@ -411,7 +414,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
             />
           ) : (
             <>
-              <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => openEditorFromDetail(detail)}>
+              <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => openEditorFromDetail(detail)}>
                 <Icon name="pencil" size={13} />Edit raw
               </Button>
               <IconButton label={`Delete ${detail.name}`} disabled={busy !== null} onClick={() => setDeleteName(detail.name)}><Icon name="trash" size={14} /></IconButton>
@@ -435,22 +438,15 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
     <PanelBody>
       <PanelIntro>Skills are SKILL.md instruction packages the model loads by name. Project folders (.claude/skills, .agents/skills) follow the rule list in “Source folders” — precedence is list order, first match wins.</PanelIntro>
       {notice !== null ? <Notice kind={notice.kind} text={notice.text} /> : null}
-      <div className="inline-flex self-start rounded-lg bg-muted p-0.5" role="tablist" aria-label="Skills view">
-        {(['skills', 'folders'] as const).map((candidate) => (
-          <button
-            key={candidate}
-            type="button"
-            role="tab"
-            aria-selected={tab === candidate}
-            className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[13px] transition-colors ${tab === candidate ? 'bg-surface text-fg shadow-sm dark:bg-hover' : 'text-fg-muted hover:text-fg'}`}
-            onClick={() => setTab(candidate)}
-          >
-            <Icon name={candidate === 'skills' ? 'zap' : 'folder'} size={13} />
-            {candidate === 'skills' ? 'Skills' : 'Source folders'}
-            <span className="rounded-full bg-hover px-1.5 text-[11px] leading-4 text-fg-faint">{candidate === 'skills' ? totalSkills : rules.length}</span>
-          </button>
-        ))}
-      </div>
+      <SubTabs
+        label="Skills view"
+        value={tab}
+        onChange={setTab}
+        tabs={[
+          { value: 'skills', label: 'Skills', icon: 'zap', count: totalSkills },
+          { value: 'folders', label: 'Source folders', icon: 'folder', count: rules.length },
+        ]}
+      />
       {tab === 'skills' ? (
         <div className="grid h-[min(560px,calc(100vh-460px))] min-h-[360px] overflow-hidden rounded-xl border border-line md:grid-cols-[minmax(260px,320px)_1fr]">
           <div className="flex min-h-0 flex-col border-b border-line md:border-r md:border-b-0">
@@ -458,13 +454,14 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
               <span className="text-[11px] font-semibold tracking-wider text-fg-faint uppercase">Skills</span>
               <span className="min-w-0 flex-1" />
               <IconButton label="Refresh skills" disabled={busy !== null} onClick={() => void refresh()}><Icon name="refresh" size={14} /></IconButton>
-              <IconButton label="New skill" disabled={busy !== null} onClick={beginNew}><Icon name="plus" size={15} /></IconButton>
+              <IconButton label="New skill" disabled={busy !== null} onClick={() => guardDiscard(beginNew)}><Icon name="plus" size={14} /></IconButton>
             </div>
             <div className="flex shrink-0 gap-2 border-b border-line p-2">
               <div className="min-w-0 flex-1">
                 <TextInput
                   className="h-8"
                   leading={<Icon name="search" size={13} />}
+                  aria-label="Search skills"
                   value={search}
                   placeholder="Search skills"
                   onChange={(e) => setSearch(e.target.value)}
@@ -519,7 +516,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
                             <button
                               type="button"
                               aria-label={`Toggle ${row.name}`}
-                              className="flex size-5 shrink-0 items-center justify-center rounded text-fg-faint hover:text-fg"
+                              className="flex size-6 shrink-0 items-center justify-center rounded-md text-fg-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-link"
                               onClick={() => toggleSkill(row, key)}
                             >
                               <Icon name="chevron" size={12} className={`transition-transform ${isOpen ? '' : '-rotate-90'}`} />
@@ -527,8 +524,9 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
                             <button
                               type="button"
                               title={description !== '' ? `${row.name} — ${description}` : row.name}
-                              className={`flex h-full min-w-0 flex-1 items-center gap-1.5 text-left ${(row.hidden ?? false) ? 'text-fg-faint' : 'text-fg'}`}
-                              onClick={() => { if (!isOpen) toggleSkill(row, key); void openDetail(row) }}
+                              aria-selected={rowActive}
+                              className={`flex h-full min-w-0 flex-1 items-center gap-1.5 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-link ${(row.hidden ?? false) ? 'text-fg-faint' : 'text-fg'}`}
+                              onClick={() => guardDiscard(() => { if (!isOpen) toggleSkill(row, key); void openDetail(row) })}
                             >
                               <Icon name={isOpen ? 'folderOpen' : 'folder'} size={14} className="shrink-0 text-fg-muted" />
                               <span className="min-w-0 truncate">{row.name}</span>
@@ -538,14 +536,16 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
                               <span
                                 className="size-1.5 shrink-0 rounded-full bg-bad"
                                 title={`Overrides the ${sourceLabel(overrides.source).toLowerCase()} skill “${row.name}” in this project's sessions — review this project copy before trusting it.`}
-                                aria-label="overrides"
+                                role="img"
+                                aria-label="Overrides another layer"
                               />
                             ) : null}
                             {shadowedIn.length > 0 ? (
                               <span
                                 className="size-1.5 shrink-0 rounded-full bg-warn"
                                 title={`Shadowed: also defined in ${shadowedIn.join(', ')} — that copy wins for those projects' sessions (first match in the rule list).`}
-                                aria-label="shadowed"
+                                role="img"
+                                aria-label="Shadowed in a project"
                               />
                             ) : null}
                           </div>
@@ -561,7 +561,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
                                   role="treeitem"
                                   aria-label={file.path}
                                   className={`${TREE_ROW} gap-1.5 pl-[52px] ${fileActive ? 'bg-hover text-fg' : 'text-fg-muted'}`}
-                                  onClick={() => void openFile(row, file.path)}
+                                  onClick={() => guardDiscard(() => void openFile(row, file.path))}
                                 >
                                   <Icon name={fileIconName(file.path)} size={13} className="shrink-0 text-fg-faint" />
                                   <span className="min-w-0 truncate">{file.path}</span>
@@ -602,6 +602,8 @@ function FoldersEditor(props: {
 }): ReactNode {
   const [newKind, setNewKind] = useScopedState<'project' | 'absolute'>('project')
   const [newPath, setNewPath] = useScopedState('')
+  /** Rule awaiting a remove confirmation: removing saves immediately. */
+  const [removing, setRemoving] = useScopedState<string | null>(null)
   const { busy, run } = useActionRunner((text) => props.setNotice({ kind: 'bad', text }))
 
   const persist = (next: readonly SkillRuleRow[]): Promise<void> => run('sources', async () => {
@@ -645,31 +647,37 @@ function FoldersEditor(props: {
             meta={rowHint(rule)}
             actions={(
               <>
-                <label className="flex cursor-pointer items-center gap-1.5 text-[13px] text-fg-muted">
-                  <input
-                    type="checkbox"
-                    className="size-3.5 accent-primary"
-                    aria-label={`Enable ${rowLabel(rule)}`}
-                    checked={rule.enabled}
-                    disabled={busy !== null}
-                    onChange={() => void persist(props.rules.map((candidate) => (candidate.id === rule.id ? { ...candidate, enabled: !candidate.enabled } : candidate)))}
-                  />
-                  Enabled
-                </label>
-                <IconButton label={`Move ${rowLabel(rule)} up`} disabled={busy !== null || index === 0} onClick={() => move(index, -1)}>
-                  <Icon name="chevron" size={13} className="rotate-180" />
-                </IconButton>
-                <IconButton label={`Move ${rowLabel(rule)} down`} disabled={busy !== null || index === props.rules.length - 1} onClick={() => move(index, 1)}>
-                  <Icon name="chevron" size={13} />
-                </IconButton>
-                {rule.kind !== 'workspace' ? (
-                  <IconButton label={`Remove ${rowLabel(rule)}`} disabled={busy !== null} onClick={() => void persist(props.rules.filter((candidate) => candidate.id !== rule.id))}>
-                    <Icon name="trash" size={14} />
-                  </IconButton>
-                ) : null}
+                <InlineSwitch
+                  label="Enabled"
+                  ariaLabel={`Enable ${rowLabel(rule)}`}
+                  checked={rule.enabled}
+                  disabled={busy !== null}
+                  onChange={() => void persist(props.rules.map((candidate) => (candidate.id === rule.id ? { ...candidate, enabled: !candidate.enabled } : candidate)))}
+                />
+                <RowMenu
+                  label={`More actions for ${rowLabel(rule)}`}
+                  disabled={busy !== null}
+                  actions={[
+                    { label: 'Move up', icon: 'arrowUp', disabled: index === 0, onSelect: () => move(index, -1) },
+                    { label: 'Move down', icon: 'arrowDown', disabled: index === props.rules.length - 1, onSelect: () => move(index, 1) },
+                    ...(rule.kind !== 'workspace'
+                      ? [{ label: 'Remove folder', icon: 'trash' as const, danger: true, onSelect: () => setRemoving(rule.id) }]
+                      : []),
+                  ]}
+                />
               </>
             )}
-          />
+          >
+            {removing === rule.id ? (
+              <InlineConfirm
+                message={`Stop loading skills from ${rowLabel(rule)}? Files stay on disk.`}
+                confirmLabel="Remove folder"
+                busy={busy !== null}
+                onConfirm={() => { setRemoving(null); void persist(props.rules.filter((candidate) => candidate.id !== rule.id)) }}
+                onCancel={() => setRemoving(null)}
+              />
+            ) : null}
+          </ItemRow>
         ))}
       </ItemList>
       <div className="flex flex-wrap items-center gap-2 rounded-xl border border-dashed border-line p-3">

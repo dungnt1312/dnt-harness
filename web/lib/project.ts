@@ -3,6 +3,9 @@ import { toolTarget } from './format.ts'
 import { mcpServerOf } from './tool-facts.ts'
 import { CHILD_REPORTS_HEADER } from '../../src/web/child-reports.ts'
 
+/** The header every hook context block starts with (see `hookContextBlock`). */
+const HOOK_CONTEXT_PREFIX = /^(?:UserPromptSubmit|SessionStart|SubagentStart) hook additional context \(lower-trust data/
+
 /** View items projected from the durable log — the UI's deriveMessages(). */
 export type ViewItem =
   | {
@@ -19,6 +22,8 @@ export type ViewItem =
       steer?: boolean
       /** Accepted but never reached the model (pre-step rejected it, or admitted nothing). */
       notSent?: 'rejected' | 'empty'
+      /** Deleted from the queue before any turn claimed it: renders nowhere. */
+      withdrawn?: true
     }
   | {
       readonly kind: 'assistant'
@@ -79,6 +84,12 @@ export type ViewItem =
   | {
       /** Joined delegated-agent reports; system data, not something the user typed. */
       readonly kind: 'continuation'
+      readonly ts?: number
+      readonly content: string
+    }
+  | {
+      /** Hook-provided context the model read with this turn (collapsed in the transcript). */
+      readonly kind: 'hook-context'
       readonly ts?: number
       readonly content: string
     }
@@ -209,6 +220,22 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
     dirty.add(items.length)
     items.push(item)
   }
+  /**
+   * Move a row to the end of the transcript. A queued twin sits where it was
+   * typed — inside the turn it waited behind — so the turn that finally runs
+   * it must find it right before its own answer, not above the previous one.
+   */
+  const moveToEnd = (item: ViewItem): void => {
+    const from = indexes.get(item)
+    if (from === undefined || from === items.length - 1) { touch(item); return }
+    items.splice(from, 1)
+    if (from < published.length) published = [...published.slice(0, from), ...published.slice(from + 1)]
+    for (let index = from; index < items.length; index += 1) indexes.set(items[index]!, index)
+    const shifted = [...dirty].filter((index) => index !== from).map((index) => (index > from ? index - 1 : index))
+    dirty.clear()
+    for (const index of shifted) dirty.add(index)
+    add(item)
+  }
 
   /** Register an answer under its open turn so `turn/end` can close it in place. */
   const trackAssistant = (item: Extract<ViewItem, { kind: 'assistant' }>): void => {
@@ -251,6 +278,13 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
           break
         case 'user/message': {
           if (event.content === undefined) break
+          if (event.origin === 'context' || HOOK_CONTEXT_PREFIX.test(event.content)) {
+            // Host-injected context (hook additionalContext): the model reads
+            // it; the transcript shows one collapsed line, never a user bubble.
+            // (Logs written before the origin stamp are matched by the header.)
+            add({ kind: 'hook-context', content: event.content, ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}) })
+            break
+          }
           if (event.origin === 'continuation' || event.content.startsWith(CHILD_REPORTS_HEADER)) {
             // The joined delegated-agent reports the turn continues with:
             // system data for the model, never something the user typed.
@@ -271,8 +305,11 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
           }
           const pending = event.inputId !== undefined && event.inputId !== '' ? queuedUsers.get(event.inputId) : undefined
           if (pending !== undefined && event.inputId !== undefined) {
-            // The queued bubble becomes the real message at the same position.
-            touch(pending)
+            // The queued twin becomes the real message. One that waited behind
+            // another turn moves down to open the turn that runs it; one the
+            // host ran at once is already in place.
+            if (pending.queued === true) moveToEnd(pending)
+            else touch(pending)
             pending.queued = false
             delete pending.inputId
             delete pending.steer
@@ -294,18 +331,43 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
             content: event.content,
             ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
             ...(event.attachments !== undefined && event.attachments.length > 0 ? { attachments: event.attachments } : {}),
-            queued: true,
+            // The host decides: input it dispatches at once is a sent message
+            // in the transcript; only input waiting behind a turn is queued.
+            queued: event.runsNow !== true,
             inputId: event.inputId,
-            ...(event.delivery === 'steer' ? { steer: true } : {}),
+            ...(event.delivery === 'steer' && event.runsNow !== true ? { steer: true } : {}),
           }
           acceptedInputs.set(event.inputId, retryInputOf(event))
           queuedUsers.set(event.inputId, item)
           add(item)
           break
         }
+        case 'input/revised': {
+          if (event.inputId === undefined || event.inputId === '' || event.content === undefined) break
+          const accepted = acceptedInputs.get(event.inputId)
+          if (accepted !== undefined) acceptedInputs.set(event.inputId, { ...accepted, content: event.content })
+          const pending = queuedUsers.get(event.inputId)
+          if (pending === undefined) break
+          touch(pending)
+          // The row is projector-owned and mutable; content is readonly only to readers.
+          ;(pending as { content: string }).content = event.content
+          break
+        }
         case 'input/settled': {
           if (event.inputId === undefined || event.inputId === '') break
           const settled = event.outcome
+          if (settled === 'withdrawn') {
+            acceptedInputs.delete(event.inputId)
+            const withdrawn = queuedUsers.get(event.inputId)
+            if (withdrawn === undefined) break
+            touch(withdrawn)
+            withdrawn.queued = false
+            withdrawn.withdrawn = true
+            delete withdrawn.inputId
+            delete withdrawn.steer
+            queuedUsers.delete(event.inputId)
+            break
+          }
           // Every settled input belongs to the turn that claimed it — also a
           // rejected/empty one (no user/message at all) and an admitted one a
           // hook rewrote wholesale (its user/message carries no id). Retry
@@ -437,23 +499,27 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
           break
         }
         case 'hook/run': {
+          // Allowing/observing hooks stay out of the timeline; blocks, stops
+          // and failures show with the hook's own message when it gave one.
           const decision = event.decision ?? ''
-          if (decision === 'block') {
-            add({
-              kind: 'audit',
-              icon: 'block',
-              text: `hook blocked · ${event.event ?? 'hook'} · ${event.matcher ?? ''}`,
-              ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
-              ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
-            })
+          const where = `${event.event ?? 'hook'}${event.matcher !== undefined && event.matcher !== '' ? ` · ${event.matcher}` : ''}`
+          const said = typeof event.message === 'string' && event.message !== '' ? ` — ${event.message}` : ''
+          const stamp = {
+            ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
+            ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
+          }
+          if (decision === 'block' || decision === 'deny' || decision.startsWith('deny+')) {
+            add({ kind: 'audit', icon: 'block', text: `hook blocked · ${where}${said}`, ...stamp })
+          } else if (decision === 'stop') {
+            add({ kind: 'audit', icon: 'block', text: `hook stopped the turn · ${where}${said}`, ...stamp })
+          } else if (decision === 'timeout' || decision === 'killed' || decision.startsWith('error:')) {
+            add({ kind: 'audit', icon: 'fail', text: `hook failed · ${where} (${decision})${said}`, ...stamp })
           } else if (decision.startsWith('failure:')) {
-            add({
-              kind: 'audit',
-              icon: 'fail',
-              text: `hook failed · ${event.event ?? 'hook'} · ${event.matcher ?? ''} (${decision.slice('failure:'.length)})`,
-              ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
-              ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
-            })
+            // Legacy hooks.json logs.
+            add({ kind: 'audit', icon: 'fail', text: `hook failed · ${where} (${decision.slice('failure:'.length)})`, ...stamp })
+          } else if (said !== '') {
+            // systemMessage: Claude shows it to the user.
+            add({ kind: 'audit', icon: 'allow', text: `hook · ${where}${said}`, ...stamp })
           }
           break
         }
@@ -581,6 +647,11 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
           }
           for (const item of delegations.values()) {
             if (item.status === 'running') { touch(item); item.status = 'interrupted' }
+          }
+          // Input the host meant to run at once but no turn claimed is
+          // waiting after all: it goes back to the queue strip.
+          for (const item of queuedUsers.values()) {
+            if (item.queued !== true) { touch(item); item.queued = true }
           }
           if (event.reason !== undefined) {
             add({ kind: 'status', reason: event.reason })

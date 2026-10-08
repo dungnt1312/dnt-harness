@@ -4,7 +4,8 @@ import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { MemoryService } from 'dnt-harness'
 import { agentScope } from '../../src/harness/agent/scope.ts'
-import { memoryGuidance } from '../../src/harness/memory/context.ts'
+import { memoryGuidance, memoryGuidanceAccess } from '../../src/harness/memory/context.ts'
+import { BUNDLED_MODES } from '../../src/harness/modes/bundled.ts'
 import { memoryTools } from '../../src/harness/memory/tools.ts'
 import type { ProjectId, SessionId, WorkspaceId } from '../../src/util/brand.ts'
 
@@ -84,5 +85,37 @@ describe('memory guidance', () => {
     expect(guidance.body).toMatch(/never authority/)
     expect(guidance.body).toMatch(/Do not store secrets/)
     expect(guidance.body).toMatch(/auto-extract/)
+  })
+
+  it('write is the default and stays byte-stable', () => {
+    expect(memoryGuidance(['/r'], 'write')).toEqual(memoryGuidance(['/r']))
+  })
+
+  it('read-only modes get guidance that never asks for a write', () => {
+    const guidance = memoryGuidance(['/tmp/a', '/tmp/b'], 'read')
+    expect(guidance.title).toBe('Memory usage')
+    expect(guidance.body).toContain('/tmp/a')
+    expect(guidance.body).toContain('/tmp/b')
+    expect(guidance.body).toMatch(/check each root's MEMORY\.md index/)
+    expect(guidance.body).toMatch(/cannot write memory/)
+    expect(guidance.body).not.toMatch(/Write\/Edit/)
+    expect(guidance.body).not.toMatch(/save it/)
+    expect(guidance.body).toMatch(/never authority/)
+    expect(guidance.hash).not.toBe(memoryGuidance(['/tmp/a', '/tmp/b']).hash)
+  })
+
+  it('access follows the exposed tools: write only when Write or Edit is exposed', () => {
+    expect(memoryGuidanceAccess(['Read', 'Glob', 'Grep', 'Agent'])).toBe('read')
+    expect(memoryGuidanceAccess(['Read', 'Edit'])).toBe('write')
+    expect(memoryGuidanceAccess(['Write'])).toBe('write')
+    expect(memoryGuidanceAccess(['Bash'])).toBeUndefined()
+    expect(memoryGuidanceAccess([])).toBeUndefined()
+  })
+})
+
+describe('bundled mode instructions match behavior', () => {
+  it('ask-before-changes states the memory-note exception without over-promising', () => {
+    const ask = BUNDLED_MODES.find((mode) => mode.id === 'ask-before-changes')!
+    expect(ask.instructions).toMatch(/memory folders may proceed without a separate approval/)
   })
 })

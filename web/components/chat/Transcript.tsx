@@ -9,13 +9,33 @@ import { processRows, type ProcessRow } from '../../lib/processes-view.ts'
 import { hiddenSpawnCalls } from '../../lib/spawn-merge.ts'
 import { turnTimings, type TurnTiming } from '../../lib/turn-timing.ts'
 import { useSessionDerivedGates } from '../../lib/session-derived.ts'
-import { ActivityBlock, AssistantMessage, AuditLine, CompactionMarker, ContinuationMarker, ContextMarker, DelegationCard, JumpToBottom, ProcessLinkContext, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
+import { ActivityBlock, AssistantMessage, AuditLine, CompactionMarker, ContinuationMarker, ContextMarker, HookContextMarker, DelegationCard, JumpToBottom, ProcessLinkContext, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
 import { TurnChangesCard } from './TurnChangesCard.tsx'
 import type { WorkbenchProject } from '../workbench/Workbench.tsx'
 import { ConversationMinimap } from './ConversationMinimap.tsx'
 
-interface Indexed { readonly item: ViewItem; readonly index: number }
-type Block = { readonly kind: 'row'; readonly row: Indexed } | { readonly kind: 'activity'; readonly rows: readonly Indexed[] }
+interface Indexed {
+  readonly item: ViewItem
+  readonly index: number
+  /**
+   * Earlier `Agent · wait` calls this row stands for: a model polling a slow
+   * child waits again and again, and nine identical rows say less than one
+   * row that counts them. Oldest first; the row itself is the newest wait.
+   */
+  readonly folded?: readonly ViewItem[]
+}
+type Block =
+  | { readonly kind: 'row'; readonly row: Indexed }
+  | {
+      readonly kind: 'activity'
+      readonly rows: readonly Indexed[]
+      /**
+       * The turn this run belongs to is still open: between two steps no
+       * call is running, yet the turn is working. Read from the turn's
+       * assistant steps — tool rows carry no turn of their own.
+       */
+      readonly turnOpen: boolean
+    }
 
 const ACTIVITY_KINDS: ReadonlySet<ViewItem['kind']> = new Set(['tool', 'delegation', 'audit'])
 const TRANSCRIPT_WINDOW = 300
@@ -91,13 +111,34 @@ const isChange = (item: ViewItem): boolean => {
   return name === 'edit' || name === 'write'
 }
 
-export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
+/** An `Agent` call that only waits on children already spawned. */
+const isWait = (item: ViewItem): boolean =>
+  item.kind === 'tool' && item.call.name.toLowerCase() === 'agent' && item.call.args['action'] === 'wait'
+
+/** A wait that came back cleanly: only those fold, so a failed wait keeps its own row. */
+const isCleanWait = (item: ViewItem): boolean =>
+  isWait(item) && item.kind === 'tool' && item.result?.ok === true && item.recovered !== true
+
+/** Every item a row stands for, folded waits included — what a run's summary counts. */
+export function rowItems(row: Indexed): readonly ViewItem[] {
+  return row.folded === undefined ? [row.item] : [...row.folded, row.item]
+}
+
+/**
+ * `hidden`: tool calls another row already stands for (a spawn its
+ * delegation row absorbed). They take no part in grouping, so a run neither
+ * counts them nor folds early because of them.
+ */
+export function groupBlocks(items: readonly ViewItem[], hidden?: ReadonlySet<string>): readonly Block[] {
   const blocks: Block[] = []
+  const open = (item: ViewItem, index: number): void => {
+    blocks.push({ kind: 'activity', rows: [{ item, index }], turnOpen: false })
+  }
   /** The open run a work row joins, or a fresh one when none is open. */
   const join = (item: ViewItem, index: number): void => {
     const last = blocks.at(-1)
     if (last?.kind === 'activity') (last.rows as Indexed[]).push({ item, index })
-    else blocks.push({ kind: 'activity', rows: [{ item, index }] })
+    else open(item, index)
   }
   // A landed change closes the run before it; a batch of changes keeps one
   // run; any row that is not itself a change ends that batch state.
@@ -106,8 +147,9 @@ export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
     if (item.kind === 'status' && item.reason === 'completed') return
     // Queued input waits on the strip above the composer (QueuedBar), not in
     // the transcript: the twin becomes a real row only when a turn consumes it.
-    if (item.kind === 'user' && item.queued === true) return
+    if (item.kind === 'user' && (item.queued === true || item.withdrawn === true)) return
     if (rendersNothing(item)) return
+    if (item.kind === 'tool' && hidden?.has(item.call.id) === true) return
     const previous = items[index - 1]
     if (item.kind === 'status' && item.reason === 'failed' && previous?.kind === 'status' && previous.reason.includes(':')) return
     // Every consecutive work row joins the same run, delegations included —
@@ -116,22 +158,46 @@ export function groupBlocks(items: readonly ViewItem[]): readonly Block[] {
     // twenty-two commands.
     if (isChange(item)) {
       if (afterChange) join(item, index)
-      else blocks.push({ kind: 'activity', rows: [{ item, index }] })
+      else open(item, index)
       afterChange = true
       return
     }
     const afterBreak = afterChange
     afterChange = false
     if (isActivity(item)) {
+      // A wait right after a wait in the same run folds into it: the row now
+      // shows the newest wait and counts the ones before.
+      const last = blocks.at(-1)
+      const rows = last?.kind === 'activity' ? last.rows as Indexed[] : undefined
+      const previous = rows?.at(-1)
+      if (!afterBreak && rows !== undefined && previous !== undefined && isWait(item) && isCleanWait(previous.item)) {
+        rows[rows.length - 1] = { item, index: previous.index, folded: [...(previous.folded ?? []), previous.item] }
+        return
+      }
       // The change closed the run before it: this row opens the next one
       // instead of joining the change's own run or standing alone.
-      if (afterBreak) blocks.push({ kind: 'activity', rows: [{ item, index }] })
+      if (afterBreak) open(item, index)
       else join(item, index)
       return
     }
     blocks.push({ kind: 'row', row: { item, index } })
   })
+  // The tail run of a turn still open is that turn's live work, even in the
+  // gap between two steps when no call is running. Every step of a turn —
+  // tool-only ones included — carries `turnOpen`; the newest step decides.
+  const tail = blocks.at(-1)
+  if (tail?.kind === 'activity' && latestStepOpen(items)) (tail as { turnOpen: boolean }).turnOpen = true
   return blocks
+}
+
+/** The newest assistant step belongs to a turn still open, and no newer message followed it. */
+function latestStepOpen(items: readonly ViewItem[]): boolean {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index]!
+    if (item.kind === 'assistant') return item.turnOpen === true
+    if (item.kind === 'user' && item.queued !== true && item.withdrawn !== true) return false
+  }
+  return false
 }
 
 /**
@@ -163,12 +229,6 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   /** Opens a background process's live detail in the workbench. */
   readonly onOpenProcess?: (processId: string) => void
 }) {
-  const blocks = useMemo(() => groupBlocks(items), [items])
-  // Keep browser DOM/layout memory bounded for long conversations. Older
-  // blocks remain in the lightweight projection and can be mounted on demand.
-  const [visibleLimit, setVisibleLimit] = useState(TRANSCRIPT_WINDOW)
-  const visibleStart = Math.max(0, blocks.length - visibleLimit)
-  const visibleBlocks = blocks.slice(visibleStart)
   const footers = useMemo(() => turnFooters(items), [items])
   // Files each closed turn's Write/Edit calls landed, projected once per
   // event revision from the raw log (tool traffic carries only a stepId —
@@ -208,6 +268,25 @@ export const Transcript = memo(function Transcript({ items, events, conversation
     // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on tool + agent traffic
     [gates.taskCount, gates.agentCount, events],
   )
+  // Grouping skips the spawn calls their delegation rows absorbed, so a run's
+  // summary counts one delegation once.
+  const blocks = useMemo(() => groupBlocks(items, hiddenSpawns), [items, hiddenSpawns])
+  // Keep browser DOM/layout memory bounded for long conversations. Older
+  // blocks remain in the lightweight projection and can be mounted on demand.
+  const [visibleLimit, setVisibleLimit] = useState(TRANSCRIPT_WINDOW)
+  const visibleStart = Math.max(0, blocks.length - visibleLimit)
+  const visibleBlocks = blocks.slice(visibleStart)
+  // A Write/Edit row's file opens its diff the way the turn card's file row
+  // does: the Git view focused on that path. Stable across renders so the
+  // memoized tool cards keep their props.
+  const projectRoot = project?.path
+  const openDiff = useMemo<OpenPathResolver | undefined>(() => {
+    if (onReviewFile === undefined || projectRoot === undefined) return undefined
+    return (reference) => {
+      const relative = toProjectRelative(projectRoot, reference)
+      return relative === null ? null : () => onReviewFile(relative)
+    }
+  }, [onReviewFile, projectRoot])
   const turnChangeFooter = (turnId?: string): TurnChanges | undefined => {
     if (turnId === undefined) return undefined
     const changes = turnChangeMap.get(turnId)
@@ -225,7 +304,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   }, [atBottom, items.length])
   const unseen = Math.max(0, items.length - seen)
 
-  const render = ({ item, index }: Indexed): ReactNode => {
+  const render = ({ item, index, folded }: Indexed): ReactNode => {
     switch (item.kind) {
       case 'user':
         return (
@@ -273,7 +352,9 @@ export const Transcript = memo(function Transcript({ items, events, conversation
         )
       }
       case 'tool':
-        return <ToolCard key={item.call.id} item={item} hidden={hiddenSpawns.has(item.call.id)} {...(openPath !== undefined ? { openPath } : {})} />
+        // A folded run of waits keys on its first wait, so the row keeps its
+        // identity (and an opened body) while newer waits replace it.
+        return <ToolCard key={folded?.[0]?.kind === 'tool' ? folded[0].call.id : item.call.id} item={item} {...(folded !== undefined ? { repeats: folded.length + 1 } : {})} hidden={hiddenSpawns.has(item.call.id)} {...(openPath !== undefined ? { openPath } : {})} {...(openDiff !== undefined ? { openDiff } : {})} />
       case 'delegation':
         return <DelegationCard key={item.childSessionId} item={item} {...(workspaceId !== undefined ? { workspaceId } : {})} rootSessionId={conversationId} {...(onOpenChild !== undefined ? { onOpen: onOpenChild } : {})} />
       case 'audit':
@@ -284,6 +365,8 @@ export const Transcript = memo(function Transcript({ items, events, conversation
         return <CompactionMarker key={`compaction-${index}`} item={item} />
       case 'continuation':
         return <ContinuationMarker key={`continuation-${index}`} item={item} />
+      case 'hook-context':
+        return <HookContextMarker key={`hook-context-${index}`} item={item} />
       case 'status':
         {
           // Retry exists only where the log names what to resend: the failed
@@ -341,7 +424,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
                 if (block.kind === 'activity') {
                   return (
                     <div key={`activity-${block.rows[0]?.index ?? 0}`} className={spacing}>
-                      <ActivityBlock items={block.rows.map((row) => row.item)}>{block.rows.map(render)}</ActivityBlock>
+                      <ActivityBlock items={block.rows.flatMap(rowItems)} turnOpen={block.turnOpen}>{block.rows.map(render)}</ActivityBlock>
                     </div>
                   )
                 }

@@ -151,6 +151,25 @@ export class Agent {
     for (const item of pending) this.enqueueAccepted(item)
   }
 
+  /**
+   * Revise a waiting input in place (same id, same queue position). Returns
+   * false once a turn has claimed it: it is no longer the user's to change.
+   * An input not in the inbox (left pending by a restart) is only checked —
+   * the host's durable record is what adoption reads later.
+   */
+  reviseQueued(inputId: InputId, content: string): boolean {
+    if (this.claimedInputIds.has(inputId)) return false
+    this.inbox = this.inbox.map((item) => (item.kind === 'user' && item.inputId === inputId ? { ...item, content } : item))
+    return true
+  }
+
+  /** Withdraw a waiting input from the inbox. False once a turn has claimed it. */
+  withdrawQueued(inputId: InputId): boolean {
+    if (this.claimedInputIds.has(inputId)) return false
+    this.inbox = this.inbox.filter((item) => item.kind !== 'user' || item.inputId !== inputId)
+    return true
+  }
+
   /** Whether a running turn has claimed this input (pre-step or later): it is no longer waiting. */
   isClaimed(inputId: InputId): boolean {
     return this.claimedInputIds.has(inputId)
@@ -307,11 +326,12 @@ export class Agent {
       const contents = claimed.map((item) => item.content)
       const decision = await this.ctx.waterfall(
         'agent/pre-step',
-        { contents },
+        { contents, ...(controller?.signal !== undefined ? { signal: controller.signal } : {}) },
         (replacement) =>
           Promise.resolve({
             kind: 'enter',
             contents: replacement?.contents ?? contents,
+            ...(replacement?.context !== undefined && replacement.context.length > 0 ? { context: replacement.context } : {}),
           } satisfies PreStepDecision),
       )
 
@@ -340,6 +360,7 @@ export class Agent {
 
       let lastStep: StepId | null = null
       let nextContents: readonly string[] | undefined = decision.contents
+      let nextContext: readonly string[] | undefined = decision.context
       let nextClaimed: readonly InboxItem[] = claimed
       let nextOrigin: 'continuation' | undefined
       // A turn keeps spending steps while tools owe the model their results —
@@ -347,7 +368,7 @@ export class Agent {
       for (;;) {
         let step: { stepId: StepId; toolCalls: readonly ToolCall[] }
         try {
-          step = await this.step(turnId, nextContents, nextClaimed, nextOrigin)
+          step = await this.step(turnId, nextContents, nextClaimed, nextOrigin, nextContext)
         } catch (error) {
           // A user stop is a durable result, not a failure: close the turn
           // with the `cancelled` (or `steered`) reason and end the run.
@@ -361,6 +382,7 @@ export class Agent {
         }
         lastStep = step.stepId
         nextContents = undefined
+        nextContext = undefined
         nextClaimed = []
         nextOrigin = undefined
         if (step.toolCalls.length > 0) continue
@@ -464,7 +486,7 @@ export class Agent {
    *
    * @returns the step id and the tool calls the model made.
    */
-  private async step(turnId: TurnId, contents: readonly string[] | undefined, claimed: readonly InboxItem[], origin?: 'continuation'): Promise<{ stepId: StepId; toolCalls: readonly ToolCall[] }> {
+  private async step(turnId: TurnId, contents: readonly string[] | undefined, claimed: readonly InboxItem[], origin?: 'continuation', context?: readonly string[]): Promise<{ stepId: StepId; toolCalls: readonly ToolCall[] }> {
     const signal = this.abortController?.signal
     const assertLive = (): void => {
       if (signal?.aborted === true) throw this.abortError()
@@ -472,6 +494,11 @@ export class Agent {
 
     let stepId = newStepId()
     this.session.append({ type: 'step/start', turnId, stepId })
+    // Host context first (hook additionalContext): model-visible, but
+    // marked so no projection shows it as something the user typed.
+    for (const content of context ?? []) {
+      this.session.append({ type: 'user/message', turnId, content, origin: 'context' })
+    }
     const metadataByContentIndex = matchClaimedContents(contents ?? [], claimed)
     for (let index = 0; index < (contents?.length ?? 0); index++) {
       const content = contents?.[index] ?? ''
@@ -485,7 +512,8 @@ export class Agent {
         content,
         ...(item?.inputId !== undefined ? { inputId: item.inputId } : {}),
         ...(item?.attachments !== undefined && item.attachments.length > 0 ? { attachments: item.attachments } : {}),
-        ...(origin !== undefined ? { origin } : {}),
+        // Injected host context (SessionStart hooks) is context, not user text.
+        ...(origin !== undefined ? { origin } : item?.kind === 'injected' ? { origin: 'context' as const } : {}),
       })
     }
     // Admission settles every accepted input even when middleware replaces its
@@ -817,47 +845,10 @@ function matchClaimedContents(contents: readonly string[], claimed: readonly Inb
   return matched
 }
 
-/** Longest pause between two attempts of one transiently failing model request. */
-const MAX_STEP_RETRY_DELAY_MS = 30_000
-
-function sleepMs(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms).unref?.()
-  })
-}
-
 function safeProviderName(ctx: Context): string | undefined {
   try {
     return (ctx.get('llm') as { active?: () => { name: string } } | undefined)?.active?.().name
   } catch {
     return undefined
   }
-}
-
-/**
- * Race one iterator step against the abort signal, so a provider that never
- * yields cannot hold the loop past a stop or inactivity abort.
- */
-function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, makeError: () => Error): Promise<T> {
-  if (signal === undefined) return promise
-  return new Promise<T>((resolve, reject) => {
-    if (signal.aborted === true) {
-      reject(makeError())
-      return
-    }
-    const onAbort = (): void => {
-      reject(makeError())
-    }
-    signal.addEventListener('abort', onAbort, { once: true })
-    promise.then(
-      (value) => {
-        signal.removeEventListener('abort', onAbort)
-        resolve(value)
-      },
-      (error: unknown) => {
-        signal.removeEventListener('abort', onAbort)
-        reject(error)
-      },
-    )
-  })
 }

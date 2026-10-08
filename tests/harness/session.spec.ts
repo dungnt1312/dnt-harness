@@ -3,7 +3,8 @@
  * history projection, and fork boundaries.
  */
 import { describe, expect, it, vi } from 'vitest'
-import { Kernel, SessionsService } from 'dnt-harness'
+import { Kernel, Session, SessionsService } from 'dnt-harness'
+import type { SessionStore } from '../../src/harness/storage/file-session-store.ts'
 
 /** Boot a kernel with the session service mounted. */
 function boot(): Kernel {
@@ -13,6 +14,29 @@ function boot(): Kernel {
 }
 
 describe('session log', () => {
+  it.each([undefined, null, 'storage unavailable'])('keeps poisoning sticky for rejection %s', async (reason) => {
+    const kernel = new Kernel()
+    const flush = vi.fn().mockRejectedValueOnce(reason).mockResolvedValue(undefined)
+    const store = {
+      append: async () => {},
+      flush,
+    } as unknown as SessionStore
+    const session = new Session(kernel.ctx, { store })
+    try {
+      session.append({ type: 'user/message', turnId: 't1' as never, content: 'first' })
+      await expect(session.durable()).rejects.toBe(reason)
+      expect(session.poisoned).toBe(true)
+      expect(() => session.append({ type: 'user/message', turnId: 't1' as never, content: 'blocked' })).toThrow(Error)
+      // Even a later successful barrier cannot rehabilitate this instance.
+      await session.durable()
+      expect(session.poisoned).toBe(true)
+      expect(() => session.append({ type: 'turn/end', turnId: 't1' as never, reason: 'completed' })).toThrow(Error)
+      expect(session.events).toHaveLength(1)
+    } finally {
+      await kernel.stop()
+    }
+  })
+
   it('stamps appends with increasing seq and broadcasts session/event', () => {
     const kernel = boot()
     const session = kernel.ctx.sessions.create()
@@ -46,18 +70,18 @@ describe('session log', () => {
     }
     kernel.ctx.plugin((ctx) => { new SessionsService(ctx, 'sessions', { store: store as never }) })
     const session = kernel.ctx.sessions.create()
-    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const removeThrowing = kernel.ctx.on('session/event', () => { throw new Error('throwing observer') })
+    // A later observer still sees every event: the kernel's `parallel`
+    // contains a synchronous throw instead of aborting the dispatch.
+    const seen: number[] = []
+    kernel.ctx.on('session/event', (_session, event) => { seen.push(event.seq) })
 
     expect(() => session.append({ type: 'user/message', turnId: 't1' as never, content: 'saved' })).not.toThrow()
     await session.durable()
     await Promise.resolve()
     expect(writes).toEqual([1])
     expect(session.events).toHaveLength(1)
-    expect(warning).toHaveBeenCalledWith(
-      expect.stringContaining('event observer failed'),
-      expect.objectContaining({ message: 'throwing observer' }),
-    )
+    expect(seen).toEqual([1])
 
     removeThrowing()
     kernel.ctx.on('session/event', async () => { throw new Error('rejecting observer') })
@@ -65,7 +89,7 @@ describe('session log', () => {
     await session.durable()
     await Promise.resolve()
     expect(writes).toEqual([1, 2])
-    warning.mockRestore()
+    expect(seen).toEqual([1, 2])
     await kernel.stop()
   })
 

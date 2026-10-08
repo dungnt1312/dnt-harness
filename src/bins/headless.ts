@@ -49,12 +49,16 @@ import { ProcessRegistry } from '../harness/processes/registry.ts'
 import { todoWriteTool } from '../harness/tools/todo.ts'
 import { promises as fs } from 'node:fs'
 import { MemoryService } from '../harness/memory/service.ts'
-import { memoryRoots, memoryGuidance, memoryIndexes } from '../harness/memory/context.ts'
+import { memoryRoots, memoryGuidance, memoryGuidanceAccess, memoryIndexes } from '../harness/memory/context.ts'
 import { ModesService, DEFAULT_MODE_ID } from '../harness/modes/service.ts'
 import { buildContext } from '../harness/context/builder.ts'
 import { renderEnvironmentContext } from '../harness/context/environment.ts'
 import { DEFAULT_BUDGET } from '../harness/context/budget.ts'
 import { resolvePermission } from '../harness/approval/resolution.ts'
+import { attachDangerousCommandGuard } from '../harness/guard/guard.ts'
+import { DangerousCommandsStore } from '../harness/guard/store.ts'
+import { defaultSecretRoots } from '../capabilities/fs/secret-roots.ts'
+import { homedir } from 'node:os'
 
 loadRepoEnv()
 
@@ -182,8 +186,21 @@ async function main(): Promise<void> {
     if (resolvePermission(mode.definition.permissionDefaults, payload.call.name) === 'deny') return { kind: 'deny', reason: `tool '${payload.call.name}' is denied by the selected mode` }
     return next()
   }, true)
+  // Dangerous Commands: the same workspace config the web host edits (same
+  // data home). Registered AFTER the exposure gate with prepend, so it runs
+  // first: a `deny` rule refuses the Bash call outright; an `ask` rule forces
+  // an approval even when the mode (or --yolo) allows Bash — the same
+  // contract as the web host, where yolo never answers a guard question.
+  const dangerousStore = new DangerousCommandsStore(dataDir)
+  const dangerousGuard = attachDangerousCommandGuard(kernel.ctx, {
+    configSource: async (requested?: string) => {
+      const { config, hash } = await dangerousStore.load(requested ?? workspaceId)
+      return { config, hash, revision: hash }
+    },
+  })
   const options: ApprovalOptions = {
     defaultMode: yolo ? 'allow' : 'ask', askUser,
+    forceAsk: (call, approvalScope) => dangerousGuard.getMatch(call, approvalScope.executionId)?.action === 'ask',
     policy: Object.fromEntries(Object.entries(mode.definition.permissionDefaults).map(([name, permission]) => [name, yolo && permission !== 'deny' ? 'allow' : permission])),
   }
   attachApproval(kernel.ctx, options)
@@ -198,7 +215,7 @@ async function main(): Promise<void> {
   kernel.ctx.tools.register(bashOutputTool({ processes }))
   kernel.ctx.tools.register(killShellTool({ processes }))
   kernel.ctx.tools.register(todoWriteTool())
-  kernel.ctx.tools.setRootResolver(() => ({ root: canonicalRoot, deniedRoots: [path.resolve(dataDir)], hostStorageRoot: path.resolve(dataDir), memoryRoots: roots, additionalRoots: roots.map((folder) => ({ path: folder, access: memoryAccess })) }))
+  kernel.ctx.tools.setRootResolver(() => ({ root: canonicalRoot, deniedRoots: [path.resolve(dataDir), ...defaultSecretRoots(homedir())], hostStorageRoot: path.resolve(dataDir), memoryRoots: roots, additionalRoots: roots.map((folder) => ({ path: folder, access: memoryAccess })) }))
   if (apiKey !== undefined) {
     kernel.ctx.llm.register(new DeepSeekProvider(apiKey, process.env['DEEPSEEK_BASE_URL'] ?? 'https://api.deepseek.com'))
   } else {
@@ -216,7 +233,8 @@ async function main(): Promise<void> {
   kernel.ctx.on('agent/context', async (projected, next) => {
     const schemas = kernel.ctx.tools.schemas().filter((schema) => mode.definition.toolExposure.includes(schema.name))
     const pinnedMemory = memoryEnabled ? await memoryIndexes(memory, scope) : []
-    if (roots.length > 0 && schemas.some((schema) => ['Read', 'Write', 'Edit', 'Glob', 'Grep'].includes(schema.name))) pinnedMemory.unshift(memoryGuidance(roots))
+    const guidanceAccess = memoryGuidanceAccess(schemas.map((schema) => schema.name))
+    if (roots.length > 0 && guidanceAccess !== undefined) pinnedMemory.unshift(memoryGuidance(roots, guidanceAccess))
     const environment = renderEnvironmentContext({
       now: new Date(),
       platform: process.platform,

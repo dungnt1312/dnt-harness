@@ -44,17 +44,30 @@ export function expandGlob(pattern: string): string[] {
   }))]
 }
 
-function segmentRegex(segment: string): RegExp {
-  return new RegExp(`^${segment.split('*').map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[^/]*')}$`)
+/** Dynamic programming: O(segment.length × name.length), O(name.length) memory.
+ * No regex backtracking, even for repeated `*literal` on a near-matching name.
+ */
+function segmentMatches(segment: string, name: string): boolean {
+  if (!segment.includes('*')) return segment === name
+  let previous = new Uint8Array(name.length + 1)
+  previous[0] = 1
+  for (let token = 0; token < segment.length; token++) {
+    const char = segment[token]!
+    const next = new Uint8Array(name.length + 1)
+    if (char === '*') next[0] = previous[0]!
+    for (let index = 1; index <= name.length; index++) {
+      next[index] = char === '*'
+        ? previous[index]! | next[index - 1]!
+        : char === name[index - 1] ? previous[index - 1]! : 0
+    }
+    previous = next
+  }
+  return previous[name.length] === 1
 }
 
-interface Pattern {
-  segments: string[]
-  regexes: RegExp[]
-}
+interface Pattern { segments: string[] }
 function compile(pattern: string): Pattern {
-  const segments = pattern.split('/')
-  return { segments, regexes: segments.map(segmentRegex) }
+  return { segments: pattern.split('/') }
 }
 /** NFA over path segments: ** matches zero or more whole segments, never part of a directory name. */
 function statesFor(pattern: Pattern, parts: string[]): Set<number> {
@@ -67,7 +80,7 @@ function statesFor(pattern: Pattern, parts: string[]): Set<number> {
     const next = new Set<number>()
     for (const index of states) {
       if (pattern.segments[index] === '**') next.add(index)
-      else if (pattern.regexes[index]?.test(part)) next.add(index + 1)
+      else if (pattern.segments[index] !== undefined && segmentMatches(pattern.segments[index]!, part)) next.add(index + 1)
     }
     states = close(next)
   }
@@ -212,8 +225,11 @@ export async function searchFiles(
     return result
   }
 
+  // Each alternative carries its own ignore state. Reading a directory and
+  // spending its node budget is still shared, so 64 choices cannot multiply IO.
+  interface Branch { pattern: Pattern | undefined; layers: Layer[] }
   let left = WALK_BUDGET
-  async function walk(dir: string, parts: string[], inherited: Layer[], alreadyLoaded = false): Promise<void> {
+  async function walk(dir: string, parts: string[], inherited: Branch[], alreadyLoaded = false): Promise<void> {
     checkAbort()
     const memoryRoot = exec.memoryRoots?.find((root) => within(root, dir))
     try { await resolveInGrants(exec, memoryRoot !== undefined && dir !== memoryRoot ? path.join(dir, 'MEMORY.md') : dir, 'read') }
@@ -224,7 +240,8 @@ export async function searchFiles(
       if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) result.incomplete.add('could not read search directory')
       return
     }
-    const rules = alreadyLoaded ? inherited : await loadRules(dir, inherited)
+    const localLayers = alreadyLoaded ? [] : await loadRules(dir, [])
+    const branches = inherited.map((branch) => ({ ...branch, layers: [...branch.layers, ...localLayers] }))
     for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
       checkAbort()
       if (left <= 0) { result.incomplete.add('walk budget exhausted'); break }
@@ -233,30 +250,60 @@ export async function searchFiles(
       const full = path.join(dir, entry.name)
       const relativeParts = [...parts, entry.name]
       if (entry.isDirectory()) {
-        if (patterns && !patterns.some((pattern) => couldDescend(pattern, relativeParts))) continue
-        const explicit = patterns?.some((pattern) => explicitDirectory(pattern, relativeParts)) === true
-        if (!options.includeIgnored && !explicit && (DEFAULT_IGNORED.has(entry.name) || isIgnored(rules, full, true))) continue
-        const childRules = explicit && !options.includeIgnored ? unignoreDirectory(rules, full) : rules
-        await walk(full, relativeParts, childRules)
+        const children: Branch[] = []
+        for (const branch of branches) {
+          const pattern = branch.pattern
+          if (pattern && !couldDescend(pattern, relativeParts)) continue
+          const explicit = pattern !== undefined && explicitDirectory(pattern, relativeParts)
+          if (!options.includeIgnored && !explicit && (DEFAULT_IGNORED.has(entry.name) || isIgnored(branch.layers, full, true))) continue
+          children.push({ pattern, layers: explicit && !options.includeIgnored ? unignoreDirectory(branch.layers, full) : branch.layers })
+        }
+        if (children.length) await walk(full, relativeParts, children)
       } else if (entry.isFile()) {
-        if (patterns && !patterns.some((pattern) => matches(pattern, relativeParts))) continue
-        const explicit = patterns?.some((pattern) => pattern.segments.at(-1) === entry.name && matches(pattern, relativeParts)) === true
-        if (!options.includeIgnored && !explicit && isIgnored(rules, full, false)) continue
+        const accepted = branches.some(({ pattern, layers }) => {
+          if (pattern && !matches(pattern, relativeParts)) return false
+          const explicit = pattern?.segments.at(-1) === entry.name
+          return options.includeIgnored || explicit || !isIgnored(layers, full, false)
+        })
+        if (!accepted) continue
         try { await resolveInGrants(exec, full, 'read'); result.files.push(full) } catch { /* excluded by grant policy */ }
       }
     }
   }
-  await walk(start, prefix, layers, true)
+  const branches: Branch[] = patterns ? patterns.map((pattern) => ({ pattern, layers })) : [{ pattern: undefined, layers }]
+  await walk(start, prefix, branches, true)
   return result
 }
 
-/** Keep the completeness warning even when the model-visible body is truncated. */
-export function searchOutput(lines: string[], incomplete: Set<string>, limit: number): string {
-  const note = incomplete.size ? `… [search incomplete: ${[...incomplete].join('; ')}; narrow the search path]` : ''
-  const body = lines.length ? lines.join('\n') : note ? '' : 'no matches'
-  const reserve = note ? note.length + 1 : 0
-  const available = Math.max(0, limit - reserve)
+/** Whole rows only. Completeness takes priority over results; metadata is never cut.
+ * totalMatches is Glob's discovered total (including rows outside its result cap).
+ * Grep supplies its worker/size notes separately, never as result rows.
+ */
+export function searchOutput(
+  lines: string[], incomplete: Set<string>, limit: number,
+  options: { totalMatches?: number; notes?: string[] } = {},
+): string {
+  if (!Number.isFinite(limit) || limit < 64) throw new Error('search output limit must be at least 64 characters')
+  limit = Math.floor(limit)
+  let note = incomplete.size ? `… [search incomplete: ${[...incomplete].join('; ')}; narrow the search path]` : ''
   const truncation = '… [output truncated]'
-  const shown = body.length <= available ? body : `${body.slice(0, Math.max(0, available - truncation.length - 1))}\n${truncation}`.trimStart()
-  return [shown, note].filter(Boolean).join('\n')
+  const total = options.totalMatches
+  const extra = options.notes ?? []
+  const remaining = (shown: number): string[] => total !== undefined
+    ? total > shown ? [`… [+${total - shown} more matches]`] : []
+    : shown < lines.length ? [truncation] : []
+  // Reserve a whole omission footer before deciding how much reason text fits.
+  const reserve = [...remaining(0), ...extra].join('\n').length
+  if (note && note.length + reserve + (reserve ? 1 : 0) > limit) note = '… [search incomplete: partial]'
+  let metadata = [...extra]
+  // Size/truncation notes may exceed a tiny cap: preserve their existence, not
+  // an arbitrary fragment that could masquerade as a filename or match.
+  if ([...remaining(0), ...metadata, note].filter(Boolean).join('\n').length > limit) metadata = [truncation]
+  for (let shown = lines.length; shown >= 0; shown--) {
+    const footers = [...new Set([...remaining(shown), ...metadata, note].filter(Boolean))]
+    const output = [...lines.slice(0, shown), ...footers].join('\n')
+    if (output.length <= limit) return output || 'no matches'
+  }
+  // At least 64 characters fits the compact warning plus an omission footer.
+  throw new Error('search output metadata exceeds output limit')
 }

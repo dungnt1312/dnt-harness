@@ -84,7 +84,7 @@ describe('DangerousCommandsPanel', () => {
     expect(offButtons.length).toBeGreaterThan(0)
     await act(async () => offButtons[0]!.click())
     expect(document.body.textContent).toContain('Unsaved changes')
-    const saveBtn = buttonByText('Save')
+    const saveBtn = buttonByText('Save changes')
     expect(saveBtn.disabled).toBe(false)
   })
 
@@ -148,7 +148,7 @@ describe('DangerousCommandsPanel', () => {
     const offButtons = buttons().filter((b) => b.textContent === 'Off')
     await act(async () => offButtons[0]!.click())
     // Save once succeeds
-    await act(async () => buttonByText('Save').click())
+    await act(async () => buttonByText('Save changes').click())
     await settle()
     expect(mockPut).toHaveBeenCalledWith('ws-1', expect.any(Object), 'hash-1')
 
@@ -156,7 +156,7 @@ describe('DangerousCommandsPanel', () => {
     mockPut.mockRejectedValueOnce(new HttpError(409, 'conflict: dangerous-commands.json changed externally'))
     const askButtons = buttons().filter((b) => b.textContent === 'Ask')
     await act(async () => askButtons[0]!.click())
-    await act(async () => buttonByText('Save').click())
+    await act(async () => buttonByText('Save changes').click())
     await settle()
     expect(document.body.textContent).toMatch(/changed on disk/i)
     expect(document.body.textContent).toContain('Reload server version')
@@ -170,8 +170,8 @@ describe('DangerousCommandsPanel', () => {
     const offButtons = buttons().filter((b) => b.textContent === 'Off')
     await act(async () => offButtons[0]!.click())
     expect(document.body.textContent).toContain('Unsaved changes')
-    await act(async () => buttonByText('Cancel').click())
+    await act(async () => buttonByText('Discard').click())
     expect(document.body.textContent).not.toContain('Unsaved changes')
-    expect(buttonByText('Save').disabled).toBe(true)
+    expect(buttonByText('Save changes').disabled).toBe(true)
   })
 })

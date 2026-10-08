@@ -35,14 +35,7 @@ export class Context {
   on(name: string, listener: (...args: never[]) => unknown, options?: boolean | EventOptions): () => boolean {
     this.guard('ctx.on')
     const dispose = this.events.on(name, listener, options)
-    try {
-      this.fiber.effect(() => dispose, `ctx.on(${name})`)
-    } catch (error) {
-      // The owner cannot own it: undo the bus registration, then rethrow.
-      dispose()
-      throw error
-    }
-    return dispose
+    return this.ownListener(dispose, `ctx.on(${name})`)
   }
 
   /**
@@ -55,15 +48,42 @@ export class Context {
   once(name: string, listener: (...args: never[]) => unknown, options?: boolean | EventOptions): () => boolean
   once(name: string, listener: (...args: never[]) => unknown, options?: boolean | EventOptions): () => boolean {
     this.guard('ctx.once')
-    const dispose = this.events.once(name, listener, options)
+    // Firing also retires the fiber effect record, not just the bus entry.
+    let owned: () => boolean = () => false
+    const dispose = this.events.once(
+      name,
+      (...args: never[]) => {
+        owned()
+        return listener(...args)
+      },
+      options,
+    )
+    owned = this.ownListener(dispose, `ctx.once(${name})`)
+    return owned
+  }
+
+  /**
+   * Tie a bus registration to this fiber. The returned disposer removes the
+   * listener synchronously (reporting whether it was still registered) AND
+   * disposes the owning fiber effect, so an early removal leaves no effect
+   * record behind on the fiber.
+   */
+  private ownListener(dispose: () => boolean, label: string): () => boolean {
+    let disposeEffect: () => Promise<void>
     try {
-      this.fiber.effect(() => dispose, `ctx.once(${name})`)
+      disposeEffect = this.fiber.effect(() => dispose, label)
     } catch (error) {
       // The owner cannot own it: undo the bus registration, then rethrow.
       dispose()
       throw error
     }
-    return dispose
+    return () => {
+      const removed = dispose()
+      // The effect's cleanup only re-runs the (now no-op) bus disposer, so it
+      // cannot fail; the returned promise is safe to drop.
+      void disposeEffect()
+      return removed
+    }
   }
 
   /** Dispatch synchronously, in registration order; return values are ignored. */

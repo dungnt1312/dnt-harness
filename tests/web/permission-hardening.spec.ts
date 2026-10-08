@@ -17,6 +17,7 @@ import { afterAll, describe, expect, it } from 'vitest'
 import { createWebServer, serializeModeFile, type LlmProvider, type ModelRequest, type WebServer } from 'dnt-harness'
 import {
   createExecutionAuthority,
+  effectiveMcpExposure,
   exposureRefusal,
   isToolExposed,
   type ExposureMode,
@@ -92,6 +93,56 @@ describe('Plan MCP exposure (concrete allowlist + read-safe name)', () => {
 
   it('zero toolExposure means no MCP', () => {
     expect(exposedIn(ZERO, ['get_item'])).toEqual([])
+  })
+
+  describe('mcpExposure is a mode property, not a Plan id check', () => {
+    const PLAN_COPY: ExposureMode = { ...PLAN, id: 'plan-copy', name: 'Plan copy', mcpExposure: 'read-safe' }
+    const READ_ONLY: ExposureMode = { id: 'ro', name: 'Read only', toolExposure: ['Read', 'Glob', 'Grep'] }
+    const AGENT_ONLY: ExposureMode = { id: 'ao', name: 'Agent only', toolExposure: ['Agent'] }
+    const READ_ONLY_OPT_IN: ExposureMode = { ...READ_ONLY, id: 'ro-all', mcpExposure: 'all' }
+    const LEGACY_PLAN: ExposureMode = { id: 'plan', name: 'Plan', toolExposure: ['Read', 'Glob', 'Grep', 'Agent'] }
+    const FULL_NONE: ExposureMode = { ...FULL, id: 'full-none', mcpExposure: 'none' }
+    const ZERO_ALL: ExposureMode = { ...ZERO, id: 'zero-all', mcpExposure: 'all' }
+    const ZERO_READ_SAFE: ExposureMode = { ...ZERO, id: 'zero-rs', mcpExposure: 'read-safe' }
+
+    it('a duplicated Plan keeps the read-safe restriction', () => {
+      expect(exposedIn(PLAN_COPY, ['delete_item', 'get_item'])).toEqual(['mcp__s__get_item'])
+      expect(exposedIn(PLAN_COPY, undefined)).toEqual([])
+      expect(exposureRefusal(snap(PLAN_COPY, [server('s', true, ['delete_item'])]), ROOT, 'mcp__s__delete_item'))
+        .toMatch(/^mode 'Plan copy' does not expose MCP tool 'mcp__s__delete_item' without a read-safe allowlist entry/)
+    })
+
+    it('a custom mode that cannot write/edit/run shell defaults to read-safe', () => {
+      expect(exposedIn(READ_ONLY, ['delete_item', 'get_item'])).toEqual(['mcp__s__get_item'])
+      expect(exposedIn(AGENT_ONLY, ['delete_item', 'get_item'])).toEqual(['mcp__s__get_item'])
+    })
+
+    it('an explicit all opts a read-only mode back in', () => {
+      expect(exposedIn(READ_ONLY_OPT_IN, undefined)).toEqual(MCP_TOOLS)
+    })
+
+    it('a legacy Plan snapshot without the field stays read-safe', () => {
+      expect(exposedIn(LEGACY_PLAN, ['delete_item', 'get_item'])).toEqual(['mcp__s__get_item'])
+    })
+
+    it('an explicit none hides MCP even in a writing mode', () => {
+      expect(exposedIn(FULL_NONE, undefined)).toEqual([])
+      expect(exposureRefusal(snap(FULL_NONE, [server('s', true)]), ROOT, 'mcp__s__get_item')).toMatch(/exposes no MCP tools/)
+    })
+
+    it('a zero tool ceiling refuses MCP whatever the field says', () => {
+      for (const mode of [ZERO_ALL, ZERO_READ_SAFE]) {
+        expect(exposedIn(mode, ['get_item'])).toEqual([])
+        expect(exposureRefusal(snap(mode, [server('s', true, ['get_item'])]), ROOT, 'mcp__s__get_item')).toMatch(/exposes no MCP tools/)
+      }
+    })
+
+    it('effective values for bundled modes are unchanged', async () => {
+      const { BUNDLED_MODES } = await import('../../src/harness/modes/bundled.ts')
+      expect(Object.fromEntries(BUNDLED_MODES.map((mode) => [mode.id, effectiveMcpExposure(mode)]))).toEqual({
+        'ask-before-changes': 'all', 'edit-automatically': 'all', plan: 'read-safe', 'full-access': 'all',
+      })
+    })
   })
 
   it('Explorer children get no MCP even when the ceiling lists it', () => {

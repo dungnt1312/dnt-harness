@@ -20,6 +20,7 @@ import { processRows, subagentRows, reconcileSubagentRows, type ProcessRow, type
 import { agentRoleIcon, AGENT_ROLE_TONE } from '../../lib/agent-icons.ts'
 import { todosFromEvents, type TodoView } from '../../lib/todos-view.ts'
 import { formatAge } from '../../lib/format.ts'
+import { useDismissedRows } from '../../lib/dismissed-rows.ts'
 import type { ChildRow, SseEvent } from '../../lib/types.ts'
 
 interface GitLine {
@@ -110,7 +111,10 @@ function useNow(ticking: boolean): number {
 export const EnvironmentPanel = memo(function EnvironmentPanel({ workspaceId, sessionId, project, events, connected, todos: todosProp, workingSince: workingSinceProp, onOpenView, onOpenProcess, onOpenChild }: Props) {
   // Panel state is scoped to the conversation: switching resets the collapse,
   // the one-shot auto-open, and the per-section disclosure.
-  const [state, setState] = useState<{ scope: string | null; expanded: boolean; autoOpened: boolean; processesOpen: boolean; subagentsOpen: boolean; tasksOpen: boolean; endedOpen: boolean; endedAgentsOpen: boolean; dismissed: ReadonlySet<string> }>({ scope: sessionId, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, tasksOpen: true, endedOpen: false, endedAgentsOpen: false, dismissed: new Set() })
+  const [state, setState] = useState<{ scope: string | null; expanded: boolean; autoOpened: boolean; processesOpen: boolean; subagentsOpen: boolean; tasksOpen: boolean; endedOpen: boolean; endedAgentsOpen: boolean }>({ scope: sessionId, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, tasksOpen: true, endedOpen: false, endedAgentsOpen: false })
+  // Cleared rows persist per conversation (shared with the workbench Process
+  // view), so a reload does not bring them back.
+  const { dismissed, dismiss } = useDismissedRows(workspaceId, sessionId)
   const [git, setGit] = useState<GitLine | null>(null)
   const [gitFailed, setGitFailed] = useState(false)
   const [liveRunning, setLiveRunning] = useState<readonly string[]>([])
@@ -137,13 +141,13 @@ export const EnvironmentPanel = memo(function EnvironmentPanel({ workspaceId, se
     [derived, liveRunningIds],
   )
   const running = useMemo(() => rows.filter((row) => row.status === 'running'), [rows])
-  // Ended rows the user has not cleared. Dismissal is per-session view state:
-  // the durable log (and the Process view) keeps the full history.
-  const ended = useMemo(() => rows.filter((row) => row.status !== 'running' && !state.dismissed.has(row.id)), [rows, state.dismissed])
-  const runningAgents = useMemo(() => agents.filter((row) => row.running && !state.dismissed.has(row.childSessionId)), [agents, state.dismissed])
+  // Ended rows the user has not cleared. Dismissal is persisted view state:
+  // the durable log and the host registry keep the full history.
+  const ended = useMemo(() => rows.filter((row) => row.status !== 'running' && !dismissed.has(row.id)), [rows, dismissed])
+  const runningAgents = useMemo(() => agents.filter((row) => row.running && !dismissed.has(row.childSessionId)), [agents, dismissed])
   // Ended subagents, minus those the user cleared (the workbench list keeps
   // the full history). Mirrors the ended-processes group's policy.
-  const endedAgents = useMemo(() => agents.filter((row) => !row.running && !state.dismissed.has(row.childSessionId)), [agents, state.dismissed])
+  const endedAgents = useMemo(() => agents.filter((row) => !row.running && !dismissed.has(row.childSessionId)), [agents, dismissed])
   // The panel is a glance, not the archive: running children claim the rows
   // (capped — the "+N earlier" jump leads to the workbench list), and ended
   // ones fold behind the section's ended group like ended processes do.
@@ -165,7 +169,7 @@ export const EnvironmentPanel = memo(function EnvironmentPanel({ workspaceId, se
   const now = useNow(ticking)
 
   const scope = sessionId ?? null
-  if (state.scope !== scope) setState({ scope, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, tasksOpen: true, endedOpen: false, endedAgentsOpen: false, dismissed: new Set() })
+  if (state.scope !== scope) setState({ scope, expanded: false, autoOpened: false, processesOpen: true, subagentsOpen: true, tasksOpen: true, endedOpen: false, endedAgentsOpen: false })
 
   // The one-shot auto-open: the first live process or subagent for this
   // conversation expands the panel; a user collapse never reopens it. On a
@@ -325,11 +329,10 @@ export const EnvironmentPanel = memo(function EnvironmentPanel({ workspaceId, se
                 type="button"
                 aria-label="Clear ended processes"
                 title="Clear ended processes"
-                onClick={() => setState((prev) => {
-                  const dismissed = new Set(prev.dismissed)
-                  for (const row of ended) dismissed.add(row.id)
-                  return { ...prev, dismissed, endedOpen: false }
-                })}
+                onClick={() => {
+                  dismiss(ended.map((row) => row.id))
+                  setState((prev) => ({ ...prev, endedOpen: false }))
+                }}
                 className="flex h-5 shrink-0 items-center gap-1 rounded px-1 text-[11px] text-fg-faint transition-colors hover:bg-hover hover:text-fg-muted"
               >
                 <Icon name="trash" size={10} />
@@ -386,11 +389,7 @@ export const EnvironmentPanel = memo(function EnvironmentPanel({ workspaceId, se
                   type="button"
                   aria-label="Clear ended subagents"
                   title="Clear ended subagents"
-                  onClick={() => setState((prev) => {
-                    const dismissed = new Set(prev.dismissed)
-                    for (const row of endedAgents) dismissed.add(row.childSessionId)
-                    return { ...prev, dismissed }
-                  })}
+                  onClick={() => dismiss(endedAgents.map((row) => row.childSessionId))}
                   className="flex h-5 shrink-0 items-center gap-1 rounded px-1 text-[11px] text-fg-faint transition-colors hover:bg-hover hover:text-fg-muted"
                 >
                   <Icon name="trash" size={10} />

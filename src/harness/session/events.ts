@@ -32,7 +32,7 @@ export type SessionEvent =
   | ({ readonly type: 'model/attempt' | 'execution/uncertain' | 'execution/reconciled'; readonly fact: import('../llm/request-lifecycle.ts').AttemptFact } & SessionEventStamp)
   | ({ readonly type: 'turn/start'; readonly turnId: TurnId; readonly kind?: 'conversation' | 'delegation' } & SessionEventStamp)
   | ({ readonly type: 'turn/closing'; readonly turnId: TurnId } & SessionEventStamp)
-  | ({ readonly type: 'user/message'; readonly turnId: TurnId; readonly content: string; readonly inputId?: string; readonly attachments?: readonly AttachmentRef[]; readonly origin?: 'continuation' } & SessionEventStamp)
+  | ({ readonly type: 'user/message'; readonly turnId: TurnId; readonly content: string; readonly inputId?: string; readonly attachments?: readonly AttachmentRef[]; readonly origin?: 'continuation' | 'context' } & SessionEventStamp)
   | ({ readonly type: 'step/start'; readonly turnId: TurnId; readonly stepId: StepId } & SessionEventStamp)
   | ({ readonly type: 'assistant/chunk'; readonly stepId: StepId; readonly delta: string; readonly thinking?: boolean } & SessionEventStamp)
   | ({ readonly type: 'assistant/message'; readonly stepId: StepId; readonly content: string; readonly toolCalls?: readonly ToolCall[]; readonly controls?: RequestControls } & SessionEventStamp)
@@ -79,8 +79,13 @@ export type SessionEvent =
       readonly proposedAccess?: 'read' | 'write'
     } & SessionEventStamp)
   | ({ readonly type: 'approval/decision'; readonly approvalId: string; readonly executionId?: ExecutionId; readonly decision: ApprovalDecision; readonly reason?: string } & SessionEventStamp)
-  | ({ readonly type: 'input/queued'; readonly inputId: string; readonly clientRequestId?: string; readonly content: string; readonly attachments?: readonly AttachmentRef[]; readonly delivery?: 'steer' } & SessionEventStamp)
-  | ({ readonly type: 'input/settled'; readonly inputId: string; readonly outcome: 'admitted' | 'rejected' | 'empty' } & SessionEventStamp)
+  | ({ readonly type: 'input/queued'; readonly inputId: string; readonly clientRequestId?: string; readonly content: string; readonly attachments?: readonly AttachmentRef[]; readonly delivery?: 'steer'; readonly runsNow?: true } & SessionEventStamp)
+  // `runsNow`: the host found the session idle at acceptance and dispatches a
+  // turn for it at once — the UI shows it as a sent message, not a queued one.
+  // The user edited a still-waiting input: later readers take this content.
+  | ({ readonly type: 'input/revised'; readonly inputId: string; readonly content: string } & SessionEventStamp)
+  // `withdrawn`: the user deleted it from the queue before any turn claimed it.
+  | ({ readonly type: 'input/settled'; readonly inputId: string; readonly outcome: 'admitted' | 'rejected' | 'empty' | 'withdrawn' } & SessionEventStamp)
   | ({ readonly type: 'session/title'; readonly title: string | null } & SessionEventStamp)
   | ({ readonly type: 'session/pinned'; readonly pinned: boolean } & SessionEventStamp)
   | ({ readonly type: 'session/project'; readonly projectId: string | null } & SessionEventStamp)
@@ -112,7 +117,9 @@ export type SessionEvent =
   | ({ readonly type: 'agent/child-spawn'; readonly childSessionId: string; readonly parentTurnId: string; readonly definition: string; readonly brief?: string; readonly objective?: string } & SessionEventStamp)
   | ({ readonly type: 'agent/child-result'; readonly childSessionId: string; readonly parentTurnId: string; readonly status: string; readonly error?: string } & SessionEventStamp)
   | ({ readonly type: 'mcp/call'; readonly server: string; readonly tool: string; readonly argsHash: string; readonly resultHash: string; readonly durationMs: number; readonly isError: boolean } & SessionEventStamp)
-  | ({ readonly type: 'hook/run'; readonly event: string; readonly matcher: string; readonly exitCode: number | null; readonly durationMs: number; readonly decision: string } & SessionEventStamp)
+  // `message` (optional, capped): the hook's user-facing text — systemMessage,
+  // stopReason, or stderr of a failing/blocking hook — shown in the timeline.
+  | ({ readonly type: 'hook/run'; readonly event: string; readonly matcher: string; readonly exitCode: number | null; readonly durationMs: number; readonly decision: string; readonly message?: string } & SessionEventStamp)
   // Observability, not model content: the context manifest of the request this
   // step is about to send, recorded between `step/start` and the step's
   // answer. The trajectory reads it as "what this request carried"; model
@@ -362,6 +369,7 @@ function projectMessages(events: readonly SessionEvent[], attachments?: Attachme
       case 'approval/request':
       case 'approval/decision':
       case 'input/queued':
+      case 'input/revised':
       case 'input/settled':
       case 'session/title':
       case 'session/pinned':

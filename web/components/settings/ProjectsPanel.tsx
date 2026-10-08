@@ -10,7 +10,8 @@ import { Button } from '../ui/Button.tsx'
 import { Field } from '../ui/Field.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
-import { EmptyState, InlineConfirm, ItemList, ItemRow, Notice, PanelBody, PanelIntro, Section } from './settings-kit.tsx'
+import { EmptyState, InlineConfirm, ItemList, ItemRow, Notice, PanelBody, PanelIntro, RowMenu, Section, FormActions } from './settings-kit.tsx'
+import { useUnsavedChanges } from './unsaved-changes.tsx'
 
 type RowMode = { readonly id: string; readonly kind: 'rename' | 'path' | 'remove' | 'folders' }
 
@@ -47,6 +48,17 @@ function ProjectsPanelContent({ workspaceId, projects, onChanged, sessionCounts 
   const lock = useRef(false)
   const alive = useRef(true)
   useEffect(() => () => { alive.current = false; lock.current = false }, [])
+  /** The open extra-folders editor reports its own draft state up here. */
+  const [foldersDirty, setFoldersDirty] = useScopedState(false)
+  const editedProject = mode === null ? undefined : projects.find((project) => project.id === mode.id)
+  const rowDirty = editedProject !== undefined && mode !== null && (
+    mode.kind === 'rename' ? editValue !== editedProject.name
+      : mode.kind === 'path' ? editValue !== editedProject.path
+        : mode.kind === 'folders' ? foldersDirty : false)
+  // Row actions replace the open row editor, so they guard only that draft;
+  // the register form is reported separately for tab switches and close.
+  const guardDiscard = useUnsavedChanges(rowDirty)
+  useUnsavedChanges(name.trim() !== '' || path.trim() !== '')
 
   const mutate = async (projectId: string, action: () => Promise<unknown>): Promise<void> => {
     if (lock.current || workspaceId === null) return
@@ -108,12 +120,16 @@ function ProjectsPanelContent({ workspaceId, projects, onChanged, sessionCounts 
                     ) : null}
                   </>}
                   actions={active === null ? (
-                    <>
-                      <Button variant="ghost" size="sm" disabled={busy} onClick={() => startMode(project, 'rename')}>Rename</Button>
-                      <Button variant="ghost" size="sm" disabled={busy} onClick={() => startMode(project, 'path')}>Change folder</Button>
-                      <Button variant="ghost" size="sm" disabled={busy} onClick={() => startMode(project, 'folders')}>Extra folders</Button>
-                      <Button variant="ghost" size="sm" className="text-bad" disabled={busy} onClick={() => startMode(project, 'remove')}>Remove project</Button>
-                    </>
+                    <RowMenu
+                      label={`Actions for ${project.name}`}
+                      disabled={busy}
+                      actions={[
+                        { label: 'Rename', icon: 'pencil', onSelect: () => guardDiscard(() => startMode(project, 'rename')) },
+                        { label: 'Change folder', icon: 'folderOpen', onSelect: () => guardDiscard(() => startMode(project, 'path')) },
+                        { label: 'Extra folders', icon: 'layers', onSelect: () => guardDiscard(() => startMode(project, 'folders')) },
+                        { label: 'Remove project', icon: 'trash', danger: true, onSelect: () => guardDiscard(() => startMode(project, 'remove')) },
+                      ]}
+                    />
                   ) : undefined}
                 >
                   {active === 'rename' || active === 'path' ? (
@@ -136,8 +152,8 @@ function ProjectsPanelContent({ workspaceId, projects, onChanged, sessionCounts 
                           trailing={active === 'path' ? <IconButton label="Browse folders" onClick={() => setPicker('path')}><Icon name="folder" size={15} /></IconButton> : undefined}
                         />
                       </div>
-                      <Button type="submit" variant="primary" size="sm" disabled={busy || editValue.trim() === ''}>{active === 'rename' ? 'Save name' : 'Save path'}</Button>
-                      <Button variant="ghost" size="sm" disabled={busy} onClick={() => setMode(null)}>Cancel</Button>
+                      <Button variant="ghost" size="sm" disabled={busy} onClick={() => guardDiscard(() => setMode(null))}>Cancel</Button>
+                      <Button type="submit" variant="primary" size="sm" disabled={busy || editValue.trim() === ''}>{active === 'rename' ? 'Save name' : 'Save folder'}</Button>
                     </form>
                   ) : null}
                   {active === 'folders' && workspaceId !== null ? (
@@ -147,14 +163,14 @@ function ProjectsPanelContent({ workspaceId, projects, onChanged, sessionCounts 
                       projects={projects}
                       onSaved={async () => { await onChanged(); if (alive.current) setMode(null) }}
                       onCancel={() => setMode(null)}
+                      onDirtyChange={setFoldersDirty}
                     />
                   ) : null}
                   {active === 'remove' ? (
                     <InlineConfirm
                       message="Remove this registration? Files stay on disk. Removal is refused while any conversation is bound to this project."
                       confirmLabel="Remove registration"
-                      cancelLabel="Cancel removal"
-                      busy={busy}
+                                            busy={busy}
                       onConfirm={() => { if (workspaceId !== null) void mutate(project.id, () => removeProject(workspaceId, project.id)) }}
                       onCancel={() => setMode(null)}
                     />
@@ -174,7 +190,7 @@ function ProjectsPanelContent({ workspaceId, projects, onChanged, sessionCounts 
               <TextInput
                 mono
                 value={path}
-                placeholder="C:/workspace/project"
+                placeholder="/Users/you/workspace/project"
                 disabled={busy}
                 onChange={(event) => setPath(event.target.value)}
                 trailing={<IconButton label="Browse folders" disabled={busy} onClick={() => setPicker('register')}><Icon name="folder" size={15} /></IconButton>}
@@ -186,9 +202,9 @@ function ProjectsPanelContent({ workspaceId, projects, onChanged, sessionCounts 
           </div>
           {error !== null ? <ErrorNotice raw={error} /> : null}
           {saved ? <Notice kind="ok" text="Project registered. Start a new conversation to use it." /> : null}
-          <div>
+          <FormActions>
             <Button type="submit" variant="primary" size="sm" disabled={busy || workspaceId === null || path.trim() === ''}>{busy ? 'Registering…' : 'Register project'}</Button>
-          </div>
+          </FormActions>
         </form>
       </Section>
 

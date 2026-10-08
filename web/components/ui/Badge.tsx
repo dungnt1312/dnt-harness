@@ -9,13 +9,14 @@ const badgeStyles = cva('inline-flex shrink-0 items-center gap-1 rounded-full px
       blue: 'bg-muted text-link',
       green: 'bg-ok-soft text-ok',
       amber: 'bg-warn-soft text-warn',
+      red: 'bg-bad-soft text-bad',
     },
   },
   defaultVariants: { tone: 'gray' },
 })
 
 export function Badge({ tone = 'gray', children, className, ...rest }: {
-  readonly tone?: 'gray' | 'blue' | 'green' | 'amber'
+  readonly tone?: 'gray' | 'blue' | 'green' | 'amber' | 'red'
   readonly children: ReactNode
   readonly className?: string
 } & HTMLAttributes<HTMLSpanElement>) {

@@ -33,7 +33,7 @@ schemas travel in `tools`, never in a message.
 | Base/child prompt, environment, file scope, compaction note | **trusted** | Host-owned constants or facts |
 | Mode instructions | **trusted** | Configuration the workspace author chose; the exposure/permission gates — not prose — are the enforcement boundary. `manifest.sources.modeSource` records provenance (`bundled`/`workspace`) so drift is auditable. |
 | Child role body | **trusted** | Same rationale as modes; pinned at spawn, `child.source` records provenance. |
-| Workspace INSTRUCTIONS.md | **wrapped lower-trust** | Workspace-authored prose, one step removed from configuration |
+| CLAUDE.md layers (user, workspace, project, local; `@imports`) | **wrapped lower-trust** | Human-authored prose, one step removed from configuration — see [Claude Code format parity](claude-format.md) |
 | Skills, skill catalog, memory, compaction summary, parent-context | **wrapped lower-trust** | Derived from or authored by untrusted content |
 
 The envelope (`wrapUntrusted`): a preamble declaring the body is DATA, then

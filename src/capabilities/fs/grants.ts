@@ -80,7 +80,7 @@ async function assertNotDenied(target: string, abs: string, realTarget: string, 
   for (const denied of deniedRoots) {
     const deniedReal = await realpathSafe(denied)
     if (within(denied, abs) || within(deniedReal, realTarget)) {
-      throw new Error(`path '${target}' is inside application-internal storage and is not accessible to tools`)
+      throw new Error(`path '${target}' is inside application-internal storage or a protected credential folder and is not accessible to tools`)
     }
   }
 }
@@ -264,7 +264,7 @@ export async function resolveInGrants(exec: ToolExecution, target: string, inten
     case 'blocked':
       throw new Error(`path '${target}' is refused: ${classified.reason}`)
     case 'denied':
-      throw new Error(`path '${target}' is inside application-internal storage and is not accessible to tools`)
+      throw new Error(`path '${target}' is inside application-internal storage or a protected credential folder and is not accessible to tools`)
     case 'read-only':
       throw new Error(`path '${target}' is in a read-only granted folder (${classified.root.path})`)
     case 'in-grant': {

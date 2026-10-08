@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { spawn, type ChildProcess } from 'node:child_process'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { ProcessRegistry, type ProcessRecord } from '../../../src/harness/processes/registry.ts'
 
 const SHELL = process.platform === 'win32' ? 'bash' : '/bin/sh'
@@ -29,6 +32,32 @@ describe('ProcessRegistry', () => {
     expect(exits.at(-1)?.status).toBe('exited')
     expect(exits.at(-1)?.exitCode).toBe(0)
     expect(registry.read(fakeSession('s1'), admitted.record.id)?.output).toContain('hi')
+  })
+
+  it.skipIf(process.platform === 'win32')('reaps background descendants before settling when root stdio closes', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'registry-descendant-'))
+    const pidFile = join(dir, 'pid')
+    const registry = new ProcessRegistry()
+    try {
+      const child = spawn('/bin/bash', ['-lc', `sleep 60 >/dev/null 2>&1 & echo $! > "${pidFile}"`], { detached: true, stdio: 'ignore' })
+      const admitted = registry.tryRegister({ sessionId: fakeSession('s-bg'), command: 'background sleep', cwd: dir, child, executable: '/bin/bash', treeTag: 't-bg-reap' })
+      if (!admitted.ok) throw new Error(String(admitted.error))
+      expect(registry.commitBackground(fakeSession('s-bg'), admitted.record.id, { maxRuntimeMs: 5_000 })).toBe(true)
+      await new Promise<void>((resolve) => child.on('close', () => resolve()))
+      await new Promise<void>((resolve) => {
+        const poll = (): void => {
+          if (registry.isRunning(fakeSession('s-bg'), admitted.record.id)) setTimeout(poll, 10)
+          else resolve()
+        }
+        poll()
+      })
+      const pid = Number((await readFile(pidFile, 'utf8')).trim())
+      expect(() => process.kill(pid, 0)).toThrow()
+      expect(registry.read(fakeSession('s-bg'), admitted.record.id)?.status).toBe('exited')
+    } finally {
+      await registry.disposeAll()
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   it('kill() tree-kills and reports termination killed', async () => {

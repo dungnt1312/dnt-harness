@@ -148,7 +148,18 @@ export class EventBus {
   parallel<K extends string & keyof Events>(name: K, ...args: Parameters<Events[K]>): Promise<void>
   parallel(name: string, ...args: unknown[]): Promise<void>
   async parallel(name: string, ...args: unknown[]): Promise<void> {
-    await Promise.allSettled(this.snapshot(name).map((listener) => listener(...args)))
+    // Each listener is still invoked synchronously, in registration order, but
+    // a synchronous throw is converted into a settled rejection: it neither
+    // aborts the remaining invocations nor rejects the dispatch.
+    await Promise.allSettled(
+      this.snapshot(name).map((listener) => {
+        try {
+          return listener(...args)
+        } catch (error) {
+          return Promise.reject(error)
+        }
+      }),
+    )
   }
 
   /**
@@ -245,7 +256,16 @@ export class EventBus {
       return Promise.resolve(listener(...args, next)).then((result) => settleResult(result, args))
     }
 
-    return invoke(0, eventArgs)
+    // The checked chain is promise-returning throughout: a synchronous throw
+    // from the first listener (or the terminal default) surfaces as a
+    // rejection, never as a synchronous exception at the dispatch site.
+    // Nested synchronous throws still reach the upstream listener's `next()`
+    // call first, where middleware may catch them.
+    try {
+      return invoke(0, eventArgs)
+    } catch (error) {
+      return Promise.reject(error)
+    }
   }
 
   /**

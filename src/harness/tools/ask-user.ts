@@ -106,7 +106,7 @@ export function validateAnswers(questions: readonly UserQuestion[], raw: unknown
     if (otherRaw !== undefined && typeof otherRaw !== 'string') throw new Error(`answers[${index}].other must be a string`)
     const other = typeof otherRaw === 'string' ? otherRaw.trim() : ''
     if (other.length > MAX_OTHER) throw new Error(`answers[${index}].other is limited to ${MAX_OTHER} characters`)
-    if (unique.length === 0 && other === '') throw new Error(`answers[${index}] needs a selected option or typed text`)
+    // An empty answer is allowed: the user may skip individual questions.
     // Keep the offered order, not the click order.
     const ordered = question.options.map((option) => option.label).filter((label) => unique.includes(label))
     return other === '' ? { selected: ordered } : { selected: ordered, other }
@@ -123,7 +123,7 @@ export function formatOutcome(questions: readonly UserQuestion[], outcome: Quest
       ...(answer?.selected.length ? [answer.selected.join(', ')] : []),
       ...(answer?.other !== undefined ? [`(typed) ${answer.other}`] : []),
     ]
-    return `${index + 1}. ${JSON.stringify(question.question)} → ${parts.join('; ') || '(no answer)'}`
+    return `${index + 1}. ${JSON.stringify(question.question)} → ${parts.join('; ') || '(skipped — no answer)'}`
   })
   return `The user answered:\n${lines.join('\n')}`
 }

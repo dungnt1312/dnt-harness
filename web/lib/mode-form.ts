@@ -1,18 +1,18 @@
 import type { PolicyMode } from './types.ts'
+// The harness list itself (a dependency-free module): a copy drifted once
+// and silently dropped tools from every edited mode.
+import { KNOWN_MODE_TOOLS } from '../../src/harness/modes/known-tools.ts'
 
-/**
- * The canonical built-in tools a mode may name, mirroring the harness's
- * `KNOWN_MODE_TOOLS`. One duplication, traded against a REST round-trip for a
- * static list; the server still validates every save.
- */
-export const KNOWN_MODE_TOOLS: readonly string[] = [
-  'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'Skill', 'Agent',
-  'MemorySearch', 'MemoryRead', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget',
-]
+/** The canonical built-in tools a mode may name; the server validates every save. */
+export { KNOWN_MODE_TOOLS }
+
+export type McpExposureChoice = 'none' | 'read-safe' | 'all'
 
 /** The structured shape the Modes panel edits; serialized to canonical frontmatter. */
 export interface ModeForm {
   readonly name: string
+  /** Optional authoring description; written right after `name` when set. */
+  readonly description?: string
   readonly instructions: string
   readonly history: 'none' | 'recent' | 'compact'
   readonly workspaceInstructions: boolean
@@ -27,6 +27,8 @@ export interface ModeForm {
    * extra approval. Absent means the default (`ask`) and is not written.
    */
   readonly outOfGrant?: 'allow' | 'ask'
+  /** MCP ceiling; absent means derived by the server (read-only modes → read-safe). */
+  readonly mcpExposure?: McpExposureChoice
 }
 
 export const emptyModeForm = (): ModeForm => ({
@@ -44,6 +46,8 @@ export const emptyModeForm = (): ModeForm => ({
 /** Frontmatter of a mode file, loosely typed; junk falls back to defaults. */
 type LooseFrontmatter = {
   name?: unknown
+  description?: unknown
+  mcpExposure?: unknown
   history?: unknown
   workspaceInstructions?: unknown
   skills?: unknown
@@ -81,6 +85,8 @@ export function parseModeForm(raw: string): ModeForm {
     form.permissions = permissions
   }
   if (frontmatter.outOfGrant === 'allow' || frontmatter.outOfGrant === 'ask') form.outOfGrant = frontmatter.outOfGrant
+  if (typeof frontmatter.description === 'string' && frontmatter.description.trim() !== '') form.description = frontmatter.description.trim()
+  if (frontmatter.mcpExposure === 'none' || frontmatter.mcpExposure === 'read-safe' || frontmatter.mcpExposure === 'all') form.mcpExposure = frontmatter.mcpExposure
   return form
 }
 
@@ -105,6 +111,7 @@ function parseFrontmatter(block: string): LooseFrontmatter {
 export function serializeModeForm(form: ModeForm): string {
   const fm = [
     `name: ${JSON.stringify(form.name)}`,
+    ...(form.description !== undefined && form.description.trim() !== '' ? [`description: ${JSON.stringify(form.description.trim())}`] : []),
     `history: ${form.history}`,
     `workspaceInstructions: ${form.workspaceInstructions}`,
     `skills: ${form.skills}`,
@@ -113,6 +120,7 @@ export function serializeModeForm(form: ModeForm): string {
     `toolExposure: ${JSON.stringify(form.exposure)}`,
     `permissionDefaults: ${JSON.stringify(form.permissions)}`,
     ...(form.outOfGrant !== undefined ? [`outOfGrant: ${form.outOfGrant}`] : []),
+    ...(form.mcpExposure !== undefined ? [`mcpExposure: ${form.mcpExposure}`] : []),
   ]
   return `---\n${fm.join('\n')}\n---\n\n${form.instructions.trim()}\n`
 }

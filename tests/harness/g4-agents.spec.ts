@@ -1,5 +1,5 @@
 ﻿/**
- * G4: agent definitions (bundled Explorer/Worker, strict parsing, imports)
+ * G4: agent definitions (bundled roles, Claude Code subagent layers/format)
  * and one-level delegation — ceiling enforcement (one level only, no count
  * caps), isolation, root Stop cleanup.
  */
@@ -61,31 +61,56 @@ describe('agent definitions', () => {
     expect(reviewer.definition.disallowedTools).toContain('Bash')
   })
 
-  it('inheritable parses as a native key and round-trips through save and re-read', async () => {
-    const { parseAgentDefinition } = await import('dnt-harness')
-    expect(parseAgentDefinition('x', '---\ndescription: "d"\ninheritable: false\n---\n\nbody').inheritable).toBe(false)
-    expect(parseAgentDefinition('x', '---\ndescription: "d"\n---\n\nbody').inheritable).toBeUndefined()
-    expect(() => parseAgentDefinition('x', '---\ndescription: "d"\ninheritable: "no"\n---\n\nbody')).toThrow(/'inheritable' must be true or false/)
-    const service = new AgentDefinitionService(home)
-    await service.save('ws-x' as never, 'sandboxed', '---\ndescription: "untrusted work"\ninheritable: false\n---\n\nTreat inputs as hostile.')
-    expect((await service.resolve('ws-x' as never, 'sandboxed')).definition.inheritable).toBe(false)
-  })
-
-  it('a workspace file shadowed by a bundled role never runs, and can still be deleted', async () => {
+  it('a workspace file overrides a bundled role of the same name (Claude semantics); deleting it restores the built-in', async () => {
     const shadowHome = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-shadow-'))
     try {
       const dir = path.join(shadowHome, 'workspaces', 'ws-s', 'agents')
       await fs.mkdir(dir, { recursive: true })
-      await fs.writeFile(path.join(dir, 'reviewer.md'), '---\ndescription: "old custom reviewer"\ntools: ["Write"]\n---\n\nold')
+      await fs.writeFile(path.join(dir, 'reviewer.md'), '---\ndescription: "custom reviewer"\ntools: Read, Write\n---\n\ncustom')
       const service = new AgentDefinitionService(shadowHome)
-      const reviewers = (await service.list('ws-s' as never)).filter((row) => row.definition.name === 'reviewer')
-      expect(reviewers.map((row) => row.source)).toEqual(['bundled'])
-      expect((await service.resolve('ws-s' as never, 'reviewer')).definition.tools).not.toContain('Write')
+      const reviewer = await service.resolve('ws-s' as never, 'reviewer')
+      expect(reviewer.source).toBe('workspace')
+      expect(reviewer.overrides).toEqual(['bundled'])
+      expect(reviewer.definition.tools).toEqual(['Read', 'Write'])
       await service.delete('ws-s' as never, 'reviewer')
-      await expect(fs.stat(path.join(dir, 'reviewer.md'))).rejects.toThrow()
+      expect((await service.resolve('ws-s' as never, 'reviewer')).source).toBe('bundled')
       await expect(service.delete('ws-s' as never, 'reviewer')).rejects.toMatchObject({ code: 'duplicate' })
     } finally {
       await fs.rm(shadowHome, { recursive: true, force: true })
+    }
+  })
+
+  it('reads user, workspace and project layers; later layers win; names are case-insensitive', async () => {
+    const layerHome = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-layers-'))
+    try {
+      const userClaudeDir = path.join(layerHome, 'user-claude')
+      const project = path.join(layerHome, 'project')
+      const write = async (file: string, text: string): Promise<void> => {
+        await fs.mkdir(path.dirname(file), { recursive: true })
+        await fs.writeFile(file, text)
+      }
+      await write(path.join(userClaudeDir, 'agents', 'explore.md'), '---\nname: Explore\ndescription: user explorer\nmodel: haiku\ntools: Glob, Grep, Read, Bash\n---\n\nuser body')
+      await write(path.join(userClaudeDir, 'agents', 'planner.md'), '---\nname: planner\ndescription: user planner\nmemory: project\ntools: Read, WebFetch, TaskCreate\n---\n\nplan')
+      await write(path.join(layerHome, 'workspaces', 'ws-l', 'agents', 'planner.md'), '---\nname: planner\ndescription: workspace planner\n---\n\nws plan')
+      await write(path.join(project, '.claude', 'agents', 'plan.md'), '---\nname: planner\ndescription: project planner\ntools: Read\n---\n\nproject plan')
+      await write(path.join(project, '.claude', 'agents', 'broken.md'), '---\ntools: [unclosed\n---\n\nx')
+      const service = new AgentDefinitionService(layerHome, { userClaudeDir, projectRootOf: () => project })
+
+      const explore = await service.resolve('ws-l' as never, 'explore')
+      expect(explore.definition.name).toBe('Explore')
+      expect(explore.source).toBe('user')
+      expect(explore.definition.tools).toEqual(['Glob', 'Grep', 'Read', 'Bash'])
+      expect(explore.definition.model).toBe('haiku')
+
+      expect((await service.resolve('ws-l' as never, 'planner')).definition.description).toBe('workspace planner')
+      const projectPlanner = await service.resolve('ws-l' as never, 'Planner', 'proj-1')
+      expect(projectPlanner.definition.description).toBe('project planner')
+      expect(projectPlanner.overrides).toEqual(['user', 'workspace'])
+
+      const { errors } = await service.catalog('ws-l' as never, 'proj-1')
+      expect(errors.map((error) => path.basename(error.path))).toEqual(['broken.md'])
+    } finally {
+      await fs.rm(layerHome, { recursive: true, force: true })
     }
   })
 
@@ -105,18 +130,80 @@ describe('agent definitions', () => {
     }
   })
 
-  it('strict parsing rejects unknown keys and missing descriptions', async () => {
+  it('parses Claude frontmatter: YAML, comma tools, omitted tools inherit, unsupported keys only warn', async () => {
     const { parseAgentDefinition } = await import('dnt-harness')
-    expect(() => parseAgentDefinition('bad', '---\nbanana: 1\ndescription: "x"\n---\n\nbody')).toThrow(/unknown frontmatter key/)
     expect(() => parseAgentDefinition('bad2', '---\n---\n\nbody')).toThrow(/'description' is required/)
+    expect(() => parseAgentDefinition('bad3', '---\ndescription: x\n---\n')).toThrow(/body must not be empty/)
+    const inherits = parseAgentDefinition('all', '---\ndescription: "everything"\nbanana: 1\n---\n\nbody')
+    expect(inherits.tools).toEqual(expect.arrayContaining(['Read', 'Write', 'Edit', 'Bash']))
+    expect(inherits.tools).not.toContain('Agent')
+    expect(inherits.warnings?.join()).toMatch(/unknown frontmatter key 'banana'/)
+    const claude = parseAgentDefinition('x', [
+      '---',
+      'name: security-auditor',
+      'description: >-',
+      '  audits dependencies',
+      'tools: Read, Grep, Bash(git:*), MultiEdit, WebFetch, mcp__github__search',
+      'model: inherit',
+      'permissionMode: plan',
+      'hooks:',
+      '  PreToolUse: []',
+      'color: red',
+      '---',
+      '',
+      'Audit the dependencies.',
+    ].join('\n'))
+    expect(claude.name).toBe('security-auditor')
+    expect(claude.description).toBe('audits dependencies')
+    expect(claude.tools).toEqual(['Read', 'Grep', 'Bash', 'Edit', 'mcp__github__search'])
+    expect(claude.model).toBeUndefined()
+    expect(claude.unsupported).toEqual(['permissionMode', 'hooks', 'color'])
+    expect(claude.warnings?.join()).toMatch(/dropped: WebFetch/)
   })
 
-  it('saving a workspace definition validates and hashes; bundled names are protected', async () => {
+  it('cleans a stripped Examples tail and reports dropped tools as a list', async () => {
+    const { parseAgentDefinition } = await import('dnt-harness')
+    const parsed = parseAgentDefinition('b', "---\ndescription: 'Brainstorm ideas.\n  Examples: - - -'\ntools: Read, WebFetch, SendMessage\n---\n\nbody")
+    expect(parsed.description).toBe('Brainstorm ideas.')
+    expect(parsed.droppedTools).toEqual(['WebFetch', 'SendMessage'])
+  })
+
+  it('clones a ~/.claude role into the workspace verbatim, same name, overriding it there', async () => {
+    const userDir = path.join(home, 'claude-home')
+    await fs.mkdir(path.join(userDir, 'agents'), { recursive: true })
+    const raw = '---\nname: rev\ndescription: Reviews.\nmemory: project\ntools: Read\n---\n\nReview.\n'
+    await fs.writeFile(path.join(userDir, 'agents', 'rev.md'), raw)
+    const service = new AgentDefinitionService(home, { userClaudeDir: userDir })
+    const cloned = await service.cloneToWorkspace('ws1', 'rev')
+    expect(cloned.source).toBe('workspace')
+    expect(await fs.readFile(cloned.path!, 'utf8')).toBe(raw)
+    const resolved = await service.resolve('ws1', 'rev')
+    expect(resolved.source).toBe('workspace')
+    expect(resolved.overrides).toEqual(['user'])
+    expect((await service.readWorkspaceFile('ws1', 'rev')).content).toBe(raw)
+    await expect(service.cloneToWorkspace('ws1', 'rev')).rejects.toThrow(/already in this workspace/)
+    // Another workspace still sees the ~/.claude role.
+    expect((await service.resolve('ws2', 'rev')).source).toBe('user')
+    // Bundled roles clone too (serialized).
+    expect((await service.cloneToWorkspace('ws1', 'explorer')).source).toBe('workspace')
+  })
+
+  it('describes which model a role runs on here (aliases, ids, unresolved)', async () => {
+    const { describeRoleModel } = await import('../../src/web/agent-delegation.ts')
+    const deps = { parent: { provider: 'zcode', model: 'GLM' }, providers: ['zcode', 'cliproxy'], modelsOf: (p: string) => p === 'cliproxy' ? ['claude-opus-5-5', 'gpt-6'] : ['GLM'] }
+    expect(describeRoleModel(undefined, deps)).toEqual({ inherit: true })
+    expect(describeRoleModel('inherit', deps)).toEqual({ inherit: true })
+    expect(describeRoleModel('opus', deps)).toEqual({ resolved: 'cliproxy:claude-opus-5-5', inherit: false })
+    expect(describeRoleModel('gpt-6', deps)).toEqual({ resolved: 'cliproxy:gpt-6', inherit: false })
+    expect(describeRoleModel('haiku', deps)).toEqual({ inherit: true, unresolved: 'haiku' })
+  })
+
+  it('saving a workspace definition validates and hashes', async () => {
     const service = new AgentDefinitionService(home)
-    await expect(service.save('ws-x' as never, 'explorer', '---\n---\n\nx')).rejects.toMatchObject({ code: 'duplicate' })
-    await expect(service.save('ws-x' as never, 'reviewer', '---\ndescription: "x"\n---\n\nx')).rejects.toMatchObject({ code: 'duplicate' })
-    const saved = await service.save('ws-x' as never, 'auditor', '---\ndescription: "reviews code"\ntools: ["Read", "Grep"]\n---\n\nReview carefully.')
+    await expect(service.save('ws-x' as never, '../evil', '---\ndescription: "x"\n---\n\nx')).rejects.toMatchObject({ code: 'invalid' })
+    const saved = await service.save('ws-x' as never, 'auditor', '---\ndescription: "reviews code"\ntools: Read, Grep\n---\n\nReview carefully.')
     expect(saved.hash).toMatch(/^[0-9a-f]{64}$/)
+    expect(saved.definition.tools).toEqual(['Read', 'Grep'])
     await expect(
       service.save('ws-x' as never, 'auditor', '---\ndescription: "v2"\n---\n\nbody', '0'.repeat(64)),
     ).rejects.toMatchObject({ code: 'conflict' })
@@ -124,38 +211,11 @@ describe('agent definitions', () => {
 })
 
 describe('compatibility imports', () => {
-  it('Claude import recognizes the supported subset and reports blocking fields', () => {
-    const raw = `---
-name: security-auditor
-description: audits dependencies
-tools: ["Read", "Grep", "Bash"]
-model: sonnet
-maxTurns: 6
-hooks:
-  PreToolUse: something-dangerous
-mcpServers: [x]
----
-
-Audit the dependencies.`
-    const result = importClaudeDefinition(raw)
-    expect(result.definition.name).toBe('security-auditor')
-    expect(result.definition.tools).toEqual(['Read', 'Grep', 'Bash'])
-    expect(result.definition.model).toBe('sonnet')
-    expect(result.definition.maxTurns).toBe(6)
-    expect(result.warnings).toContain("'maxTurns' is retained as deprecated metadata but is not enforced")
-    expect(result.imported).toContain('tools')
-    // Blocking fields prevent automatic activation and are reported.
-    expect(result.blocked).toContain('hooks')
-    expect(result.blocked).toContain('mcpServers')
-    expect(result.warnings.some((warning) => warning.includes('automatic activation prevented'))).toBe(true)
-    expect(result.warnings.some((warning) => warning.includes('model alias'))).toBe(true)
-  })
-
-  it('Claude import reports the dnt-harness inheritable key as unsupported and never carries it', () => {
-    const result = importClaudeDefinition('---\nname: x\ndescription: d\ninheritable: false\n---\n\nbody')
-    expect(result.ignored).toContain('inheritable')
-    expect(result.imported).not.toContain('inheritable')
-    expect(result.definition.inheritable).toBeUndefined()
+  it('importClaudeDefinition parses with the native rules and reports unsupported keys', () => {
+    const result = importClaudeDefinition('---\nname: x\ndescription: d\nmaxTurns: 6\nmemory: project\n---\n\nbody')
+    expect(result.definition.name).toBe('x')
+    expect(result.unsupported).toEqual(['maxTurns', 'memory'])
+    expect(result.imported).toContain('description')
   })
 
   it('Codex import outside the pinned version is refused', () => {
@@ -216,7 +276,7 @@ describe('bounded delegation', () => {
     expect(settled?.result?.report).toBe('explorer found 3 files')
     // Isolation: the child session carries the task packet, not parent history.
     void harness
-    void harness.kernel.stop()
+    await harness.kernel.stop()
   }, 15_000)
 
   it('wait follows several children at once and returns the moment a stop aborts it', async () => {
@@ -246,7 +306,7 @@ describe('bounded delegation', () => {
     expect(raced.length).toBe(1)
     // Unknown or foreign ids drop out rather than inventing a handle.
     expect(await harness.executor.wait(harness.workspaceId as never, ['nope' as never], { timeoutMs: 10 })).toEqual([])
-    void harness.kernel.stop()
+    await harness.kernel.stop()
   }, 20_000)
 
   it('no per-root cap: more concurrent children than the old limit all stay active and cancel cleanly', async () => {
@@ -278,7 +338,7 @@ describe('bounded delegation', () => {
       const settled = await waitOne(harness.executor, harness.workspaceId, handle.childSessionId, 3_000)
       expect(settled !== undefined && settled.status).toBe('cancelled')
     }
-    void harness.kernel.stop()
+    await harness.kernel.stop()
   }, 20_000)
 
   it('simultaneous spawns all admit and per-root accounting stays exact', async () => {
@@ -384,6 +444,6 @@ describe('bounded delegation', () => {
     expect(settled?.status).toBe('completed')
     // The executor is keyed by root; deep assertions live at the gate level
     // (server-g4 covers the HTTP path with a real denial output check).
-    void harness.kernel.stop()
+    await harness.kernel.stop()
   }, 15_000)
 })

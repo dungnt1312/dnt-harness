@@ -198,4 +198,14 @@
     border-radius: 10px; background: var(--surface); outline: none;
   }
   .filter-input:focus { border-color: var(--line-strong); }
+  /* A file named inside tool output (rendered by `ansiToHtml`): reads as the
+     text it is, keeps its colours, and underlines on hover like a link. */
+  .path-link {
+    display: inline; padding: 0; margin: 0; border: 0; background: none;
+    font: inherit; color: inherit; text-align: inherit; cursor: pointer;
+    text-decoration: underline dotted; text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+    text-underline-offset: 2px; border-radius: 2px;
+  }
+  .path-link:hover { text-decoration: underline; text-decoration-color: currentColor; }
+  .path-link:focus-visible { outline: 1px solid currentColor; outline-offset: 1px; }
 }

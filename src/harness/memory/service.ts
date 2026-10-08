@@ -9,11 +9,16 @@ export interface MemoryEntry {
   readonly title: string
   readonly scope: { readonly workspaceId: WorkspaceId; readonly projectId?: ProjectId }
   readonly pinned: boolean
+  /** Frontmatter `metadata.type`, when it is one of the documented kinds. */
+  readonly type?: MemoryType
   readonly createdAt: number
   readonly updatedAt: number
   readonly body: string
   readonly hash: string
 }
+
+export type MemoryType = 'user' | 'feedback' | 'project' | 'reference'
+const MEMORY_TYPES: readonly string[] = ['user', 'feedback', 'project', 'reference'] satisfies readonly MemoryType[]
 
 export class MemoryError extends Error {
   constructor(
@@ -241,6 +246,7 @@ export class MemoryService {
       title: parsed.frontmatter.name ?? parsed.frontmatter.title ?? id,
       scope: { workspaceId: scope.workspaceId, ...(scope.projectId !== undefined ? { projectId: scope.projectId } : {}) },
       pinned: parsed.frontmatter.pinned === true,
+      ...(parsed.frontmatter.type !== undefined ? { type: parsed.frontmatter.type } : {}),
       createdAt: parsed.frontmatter.createdAt ?? 0,
       updatedAt: parsed.frontmatter.updatedAt ?? 0,
       body: parsed.body,
@@ -369,7 +375,7 @@ function pointer(id: string, title: string): string {
 }
 
 interface ParsedMemory {
-  frontmatter: { title?: string; name?: string; description?: string; type?: string; pinned?: boolean; createdAt?: number; updatedAt?: number }
+  frontmatter: { title?: string; name?: string; description?: string; type?: MemoryType; pinned?: boolean; createdAt?: number; updatedAt?: number }
   body: string
 }
 
@@ -392,7 +398,7 @@ function parseMemory(raw: string): ParsedMemory | undefined {
       if (key === 'title' && typeof value === 'string') frontmatter.title = value
       if (key === 'name' && typeof value === 'string') frontmatter.name = value
       if (key === 'description' && typeof value === 'string') frontmatter.description = value
-      if (key === 'type' && typeof value === 'string' && ['user', 'feedback', 'project', 'reference'].includes(value)) frontmatter.type = value
+      if (key === 'type' && typeof value === 'string' && MEMORY_TYPES.includes(value)) frontmatter.type = value as MemoryType
       if (key === 'pinned' && value === true) frontmatter.pinned = true
       if (key === 'createdAt' && typeof value === 'number') frontmatter.createdAt = value
       if (key === 'updatedAt' && typeof value === 'number') frontmatter.updatedAt = value

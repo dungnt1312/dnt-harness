@@ -31,6 +31,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AgentsService } from '../harness/agent/service.ts'
 import { resolveAppHome } from '../harness/app-home.ts'
+import { memoryUsageLog, openUsageLog, type UsageLog } from './usage-log.ts'
 import { agentScope, type AgentScope } from '../harness/agent/scope.ts'
 import type { GrantedRoot } from '../harness/tools/types.ts'
 import { classifyGrantedRoots, classifyTarget, within } from '../capabilities/fs/grants.ts'
@@ -94,12 +95,11 @@ import {
 import { ScopeError, WorkspaceService, type AdditionalDirectory, type ProjectRecord, type WorkspaceRecord } from '../harness/workspace/service.ts'
 import { ModesService, ModeError, DEFAULT_MODE_ID, BUNDLED_MODES, type ResolvedMode } from '../harness/modes/service.ts'
 import { migrateRootModes } from '../harness/modes/root-migration.ts'
-import { AgentDefinitionService, AgentDefinitionError } from '../harness/agents/definition-service.ts'
+import { AgentDefinitionService, AgentDefinitionError, serializeAgentDefinition } from '../harness/agents/definition-service.ts'
 import {
   McpConfigStore,
   McpConfigError,
   parseMcpConfig,
-  parseHooksConfig,
   importClaudeMcp,
   importCodexMcp,
   resolveSecretRefs,
@@ -123,15 +123,17 @@ import { OAuthStore } from '../harness/mcp/oauth-store.ts'
 import { containmentCapability, resolveCanonicalExecutable } from '../harness/mcp/process-controller.ts'
 import { stageMcpOutcome } from '../harness/mcp/staged-outcome.ts'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { runHook, isBlockingDecision, isFailureDecision } from '../harness/hooks/runner.ts'
-import type { HooksConfig } from '../harness/mcp/config.ts'
+import { loadClaudeMd, renderClaudeMd } from '../harness/instructions/claude-md.ts'
+import { HookSettingsError, isHookConfigPath, readWorkspaceHooks, setHookActive, workspaceSettingsPath, writeWorkspaceHooks } from '../harness/hooks/settings.ts'
+import { fromClaudeToolInput, toClaudeToolInput } from '../harness/hooks/tool-input.ts'
+import { HookHost, hookContextBlock } from './claude-hooks.ts'
 import { ChildExecutor, SpawnError, normalizeBrief, type ChildModel, type TaskPacket } from '../harness/agents/executor.ts'
-import { agentTool, ChildModelError, formatChildReports, projectInheritedMessages, resolveChildModel } from './agent-delegation.ts'
-import { importClaudeDefinition } from '../harness/agents/compatibility/claude.ts'
+import { agentTool, ChildModelError, describeRoleModel, formatChildReports, projectInheritedMessages, resolveChildModel } from './agent-delegation.ts'
+import { importCodexDefinition } from '../harness/agents/compatibility/claude.ts'
 import { SkillsService, SkillError } from '../harness/skills/service.ts'
 import { protectedRootsForRules, resolveSkillLayers, type SkillLayer } from '../harness/skills/layers.ts'
 import { MemoryService, MemoryError } from '../harness/memory/service.ts'
-import { memoryGuidance, memoryIndexes } from '../harness/memory/context.ts'
+import { memoryGuidance, memoryGuidanceAccess, memoryIndexes } from '../harness/memory/context.ts'
 import { todoWriteTool } from '../harness/tools/todo.ts'
 import { askUserQuestionTool, validateAnswers, type QuestionOutcome, type UserQuestion } from '../harness/tools/ask-user.ts'
 import { buildContext, DEFAULT_BASE_SYSTEM, DEFAULT_CHILD_SYSTEM, type ContextManifest, type ActiveSkill, type MemorySnippet } from '../harness/context/builder.ts'
@@ -192,6 +194,15 @@ declare module 'dnt-harness' {
 
 /** The synthetic workspace owning memory-mode sessions. */
 const MEMORY_WORKSPACE = 'default' as WorkspaceId
+
+/** How long a pre-step waits before trying a server that failed to connect again. */
+const MCP_CONNECT_BACKOFF_MS = 30_000
+
+/**
+ * Tool names every supported LLM provider accepts. A public name outside
+ * this is not sent to the model: one bad name would fail every request.
+ */
+const PROVIDER_TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/
 
 /** The bundled default mode definition (controls initialize with it). */
 function BUNDLED_DEFAULT() {
@@ -287,8 +298,19 @@ export interface WebServerOptions {
   readonly blockedTools?: readonly string[]
   /** Read-only user skill layer (e.g. `~/.claude/skills`); workspace skills shadow it by name. */
   readonly userSkillsDir?: string
+  /**
+   * Claude Code user folder (`~/.claude`): the user layer for CLAUDE.md,
+   * settings.json hooks and agents/. Omitted skips the user layer (tests).
+   */
+  readonly userClaudeDir?: string
   /** Read-only bundled skill layer shipped with the app; scanned when the dir exists. */
   readonly bundledSkillsDir?: string
+  /**
+   * Credential locations (e.g. `~/.ssh`) refused to the file tools in every
+   * mode and never grantable. Applied only with `home` (durable hosts);
+   * memory-mode hosts keep their legacy permissive roots.
+   */
+  readonly secretRoots?: readonly string[]
   /** Directory of built client assets; defaults to the repo's `web-dist/`. */
   readonly staticDir?: string
   /** Port to listen on; `0` (default) picks an ephemeral port. */
@@ -587,7 +609,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     }
   }
   kernel.ctx.provide('workspaces', workspaces)
-  const deniedRoots = options.home !== undefined ? [options.home] : undefined
+  // App storage first: `memoryStorageCarveout` keys on it as hostStorageRoot.
+  const deniedRoots = options.home !== undefined ? [options.home, ...(options.secretRoots ?? [])] : undefined
   // G3 resource services: workspace-owned modes/skills/memory. Memory-mode
   // hosts bind them to a fresh temp home so tests stay hermetic.
   const resourceHome = options.home ?? (await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-resources-')))
@@ -595,6 +618,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const skills = new SkillsService(resourceHome, options.bundledSkillsDir, options.userSkillsDir)
   const memory = new MemoryService(resourceHome)
   const checkpoints = new CheckpointStore(path.join(resourceHome, 'workspaces'))
+  // Settings → Usage: durable cross-workspace token accounting.
+  const usageLog = options.home !== undefined ? await openUsageLog(path.join(options.home, 'usage.jsonl')) : memoryUsageLog()
   // Workspace-authored system prompt replacements (Settings → System Prompts).
   const systemPrompts = new SystemPromptsStore(resourceHome)
   kernel.ctx.provide('modes', modes)
@@ -603,13 +628,37 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   // Composer attachments: content-addressed blobs beside the workspace's other
   // resources, so a memory-mode host gets a hermetic temp home like the rest.
   const attachments = new AttachmentStore(resourceHome, { maxBytes: limits.maxAttachmentBytes })
-  const agentDefinitions = new AgentDefinitionService(resourceHome)
+  // Claude Code subagent layers: bundled < ~/.claude/agents < <ws>/agents <
+  // <project>/.claude/agents.
+  const agentDefinitions = new AgentDefinitionService(resourceHome, {
+    ...(options.userClaudeDir !== undefined ? { userClaudeDir: options.userClaudeDir } : {}),
+    projectRootOf: (workspaceId, projectId) => {
+      try { return workspaces.getProject(projectId as ProjectId, workspaceId as WorkspaceId).path } catch { return undefined }
+    },
+  })
   const childExecutor = new ChildExecutor(kernel.ctx)
   kernel.ctx.provide('agent-definitions', agentDefinitions)
 
   // G5: MCP servers + hooks, workspace-scoped. Each (workspace, enabled
   // server) gets one McpServerClient; tools register as `mcp__server__tool`.
   const mcpStore = new McpConfigStore(resourceHome)
+  // Claude Code hooks from settings.json layers (user/workspace/project/local).
+  const hookHost = new HookHost({
+    home: resourceHome,
+    userClaudeDir: options.userClaudeDir,
+    projectRootOf: (workspaceId, projectId) => {
+      if (projectId === undefined) return undefined
+      try { return workspaces.getProject(projectId as ProjectId, workspaceId as WorkspaceId).path } catch { return undefined }
+    },
+    sessionOf: (sessionId) => {
+      const entry = sessions.get(sessionId as SessionId)
+      if (entry !== undefined) return entry.session
+      try { return kernel.ctx.sessions.get(sessionId as SessionId) } catch { return undefined }
+    },
+    modeIdOf: (sessionId, workspaceId) => {
+      try { return rootModeOf({ sessionId: sessionId as SessionId, workspaceId: workspaceId as WorkspaceId }, workspaceId as WorkspaceId).mode.definition.id } catch { return undefined }
+    },
+  })
   const ownerLock = await DataHomeLock.acquire(resourceHome)
   const mutations = new MutationStore(resourceHome)
   await mutations.recover()
@@ -642,6 +691,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const mcpConnecting = new Map<string, Promise<McpServerClient>>()
   /** Disable/close cancellation epochs prevent late connection publication. */
   const mcpCancelled = new Set<string>()
+  /** Last failed connect per `${wsId}:${server}`: shown in Settings, and backs off pre-step retries. */
+  const mcpConnectFailures = new Map<string, { readonly at: number; readonly message: string }>()
   let mcpHostClosing = false
   /** Per-workspace live descriptor snapshots used by dynamic schema resolvers. */
   const mcpDescriptors = new Map<string, McpToolDescriptor>() // `${wsId}:${fullName}`
@@ -1059,20 +1110,20 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
    * hooks gate both. Returns the blocking reason when a hook denies
    * compaction, or undefined when compaction may proceed.
    */
-  const runPreCompactHooks = async (session: Session, workspaceId: WorkspaceId, signal?: AbortSignal): Promise<string | undefined> => {
+  const runPreCompactHooks = async (session: Session, workspaceId: WorkspaceId, signal?: AbortSignal, trigger: 'manual' | 'auto' = 'manual'): Promise<string | undefined> => {
     signal?.throwIfAborted()
-    const hooks = await mcpStore.loadHooks(workspaceId)
-    for (const binding of hooks.hooks['PreCompact'] ?? []) {
-      signal?.throwIfAborted()
-      const decision = await runHook(binding, { hook_event: 'PreCompact', sessionId: session.id, workspaceId }, undefined, signal)
-      signal?.throwIfAborted()
-      session.append({ type: 'hook/run', event: 'PreCompact', matcher: binding.matcher, exitCode: decision.exitCode, durationMs: decision.durationMs, decision: isBlockingDecision(decision) ? 'block' : isFailureDecision(decision) ? `failure:${binding.onFailure}` : 'allow' })
-      await session.durable()
-      if (isBlockingDecision(decision) || (isFailureDecision(decision) && binding.onFailure === 'deny')) {
-        return `PreCompact hook blocked compaction: ${binding.command}`
-      }
-    }
-    return undefined
+    // Claude semantics: PreCompact observes (exit 2 only shows stderr to the
+    // user); `continue: false` is the one way a hook stops the compaction.
+    const { verdict } = await hookHost.fire('PreCompact', {
+      workspaceId,
+      projectId: sessions.get(session.id)?.projectId,
+      sessionId: session.id,
+      matchValue: trigger,
+      input: { trigger, custom_instructions: '' },
+      ...(signal !== undefined ? { signal } : {}),
+    })
+    signal?.throwIfAborted()
+    return verdict.stop !== undefined ? `PreCompact hook stopped compaction: ${verdict.stop.reason}` : undefined
   }
 
   // Reservation is acquired synchronously, before hooks or snapshot loading.
@@ -1095,10 +1146,16 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     const signal = reservation.controller.signal
     const done = agentScope.exit(async () => {
       try {
-        const blocked = await runPreCompactHooks(entry.session, entry.workspaceId, signal)
+        const blocked = await runPreCompactHooks(entry.session, entry.workspaceId, signal, trigger === 'automatic' ? 'auto' : 'manual')
         signal.throwIfAborted()
         if (blocked !== undefined) throw new Error(blocked)
-        const refs = entry.session.events.flatMap((event) => event.type === 'user/message' ? [...(event.attachments ?? [])] : [])
+        // Incremental fold: seed from the latest valid canonical checkpoint so
+        // only the uncovered delta is summarized, never the covered prefix —
+        // and only the delta's attachments need loading.
+        const seed = await checkpoints.latest(entry.session.id, entry.session.committedEvents).catch(() => undefined)
+        signal.throwIfAborted()
+        const fromSeq = seed?.coversSeq ?? 0
+        const refs = entry.session.events.flatMap((event) => event.type === 'user/message' && event.seq > fromSeq ? [...(event.attachments ?? [])] : [])
         const loaded = refs.length > 0 ? await attachments.load(entry.workspaceId, refs, { textLimit: limits.attachmentTextLimit }) : undefined
         signal.throwIfAborted()
         const pair = summarizerModelOf(entry.session)
@@ -1114,26 +1171,38 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
               try {
                 // Maintenance must not inherit the settled turn's AsyncLocalStorage:
                 // context/usage middleware must not replace or account this prompt.
+                // The usage tap therefore cannot see it; record its tokens here.
+                const startedAt = Date.now()
                 for await (const event of agentScope.exit(() => kernel.ctx.llm.stream(request, {
                   signal, requestOwner: owner,
                   attribution: { sessionId: entry.session.id, turnId: `compaction:${entry.session.id}`, stepId: randomUUID() },
                 }))) buffered.push(event)
+                const usage = buffered.findLast((event) => event.type === 'usage')
+                if (usage?.type === 'usage') {
+                  usageLog.record({
+                    at: Date.now(), startedAt, workspaceId: entry.workspaceId,
+                    sessionId: entry.session.id, rootSessionId: entry.session.id,
+                    kind: 'compaction',
+                    ...(request.providerName !== undefined ? { provider: request.providerName } : {}),
+                    model: request.model ?? 'unknown',
+                    input: usage.usage.inputTokens, cached: usage.usage.cachedInputTokens ?? 0, output: usage.usage.outputTokens ?? 0,
+                  })
+                }
                 yield* buffered
                 return
               } catch (caught) {
                 const error = caught instanceof ProviderError ? caught : classifyTransport(caught, 'stream')
-                if (!owner.canRetry(error, false)) throw error
+                // A context overflow re-sent with identical input can only fail
+                // again; the agent loop squeezes, the summarizer cannot.
+                if (error.contextExceeded || !owner.canRetry(error, false)) throw error
                 await owner.backoff(signal, error.retryAfterMs)
               }
             }
           } finally { owner.dispose() }
         })(), pair)
-        const { compactSession } = await import('../harness/context/compaction.ts')
-        // Incremental fold: seed from the latest valid canonical checkpoint so
-        // only the uncovered delta is summarized, never the covered prefix.
-        const seed = await checkpoints.latest(entry.session.id, entry.session.committedEvents).catch(() => undefined)
+        const { compactSession, MAX_COMPACTION_SUMMARY_CHARS } = await import('../harness/context/compaction.ts')
         return await compactSession(entry.session, checkpoints, summarizer, {
-          trigger, signal, ...(pair !== undefined ? { model: pair.model } : {}),
+          trigger, signal, ...(pair !== undefined ? { model: pair.model } : { extractiveCap: MAX_COMPACTION_SUMMARY_CHARS }),
           ...(loaded !== undefined ? { attachments: loaded } : {}),
           ...(seed !== undefined ? { seed } : {}),
         })
@@ -1181,35 +1250,40 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     } catch (error) {
       return { kind: 'reject', reason: `workspace MCP configuration invalid/unavailable: ${String(error instanceof Error ? error.message : error)}` }
     }
-    let contents = [...claim.contents]
-    let hooks: HooksConfig
+    const contents = [...claim.contents]
+    // Claude: UserPromptSubmit fires for the user's prompt; a subagent's
+    // first turn fires SubagentStart instead (matcher = agent type).
+    const child = scope?.childOf
+    const event = child !== undefined ? 'SubagentStart' as const : 'UserPromptSubmit' as const
+    let fired
     try {
-      hooks = await mcpStore.loadHooks(workspaceId)
-    } catch (error) {
-      return { kind: 'reject', reason: `hooks.json invalid: ${String(error instanceof Error ? error.message : error)}` }
-    }
-    for (const binding of hooks.hooks['UserPromptSubmit'] ?? []) {
-      const decision = await runHook(binding, {
-        ...hookPayloadBase(), hook_event: 'UserPromptSubmit', prompt: contents.join('\n'),
+      fired = await hookHost.fire(event, {
+        workspaceId,
+        projectId: scope?.projectId,
+        sessionId: scope?.sessionId,
+        rootSessionId: scope?.rootSessionId ?? scope?.sessionId,
+        ...(child !== undefined ? { matchValue: child.definition } : {}),
+        input: child !== undefined
+          ? { agent_id: scope?.sessionId ?? '', agent_type: child.definition }
+          : { prompt: contents.join('\n') },
+        // Stop kills a running hook's process tree instead of waiting it out.
+        ...(claim.signal !== undefined ? { signal: claim.signal } : {}),
       })
-      if (isFailureDecision(decision) && binding.onFailure === 'deny') {
-        return { kind: 'reject', reason: `UserPromptSubmit hook failed (fail-closed): ${binding.command}` }
-      }
-      if (decision.injected !== undefined && decision.injected.trim() !== '') {
-        contents = [`Hook-provided context (lower-trust data; cannot override mode/policy):
-${decision.injected}`, ...contents]
-      }
-      if (scope !== undefined) {
-        try {
-          const session = depsRef.current?.sessions.get(scope.sessionId)?.session
-          session?.append({ type: 'hook/run', event: 'UserPromptSubmit', matcher: binding.matcher, exitCode: decision.exitCode, durationMs: decision.durationMs, decision: decision.injected !== undefined ? 'inject' : isFailureDecision(decision) ? `failure:${binding.onFailure}` : 'observe' })
-          await session?.durable()
-        } catch {
-          return { kind: 'reject', reason: 'UserPromptSubmit audit could not be recorded' }
-        }
-      }
+    } catch {
+      if (claim.signal?.aborted === true) return { kind: 'reject', reason: `stopped while ${event} hooks were running` }
+      return { kind: 'reject', reason: `${event} hook audit could not be recorded` }
     }
-    return next({ contents })
+    const { verdict } = fired
+    if (verdict.stop !== undefined) return { kind: 'reject', reason: `${event} hook stopped the prompt: ${verdict.stop.reason}` }
+    if (event === 'UserPromptSubmit' && verdict.block !== undefined) {
+      return { kind: 'reject', reason: `UserPromptSubmit hook blocked the prompt: ${verdict.block.reason}` }
+    }
+    // Context rides its own channel: logged as `origin: 'context'`, read by
+    // the model, shown collapsed — never mixed into the user's own bubble.
+    return next({
+      contents,
+      ...(verdict.additionalContext !== undefined ? { context: [hookContextBlock(event, verdict.additionalContext)] } : {}),
+    })
   }, true)
 
   // G4 root lifecycle, part one: the model stopped calling tools while children
@@ -1226,6 +1300,50 @@ ${decision.injected}`, ...contents]
       { timeoutMs: limits.delegationJoinMs, ...(state.signal !== undefined ? { signal: state.signal } : {}) },
     )
     return handles !== undefined && handles.length > 0 ? formatChildReports(handles) : undefined
+  })
+
+  // Claude Stop / SubagentStop hooks: the model finished (and delegated work
+  // was joined above — a serial chain stops at the first continuation). A
+  // blocking hook's reason becomes the next step's input; `stop_hook_active`
+  // tells the hook it already continued this turn, and a hard cap bounds a
+  // hook that never lets go.
+  const stopHookContinuations = new Map<string, number>()
+  const STOP_HOOK_CONTINUATION_CAP = 8
+  kernel.ctx.on('agent/turn-continuation', async (state) => {
+    const scope = agentScope.getStore()
+    if (scope?.sessionId === undefined || scope.workspaceId === undefined) return undefined
+    if (state.signal?.aborted === true) return undefined
+    const key = `${scope.sessionId}:${state.turnId}`
+    const count = stopHookContinuations.get(key) ?? 0
+    const child = scope.childOf
+    const event = child !== undefined ? 'SubagentStop' as const : 'Stop' as const
+    let verdict
+    try {
+      ({ verdict } = await hookHost.fire(event, {
+        workspaceId: scope.workspaceId,
+        projectId: scope.projectId,
+        sessionId: scope.sessionId,
+        rootSessionId: scope.rootSessionId ?? scope.sessionId,
+        ...(child !== undefined ? { matchValue: child.definition } : {}),
+        input: {
+          stop_hook_active: count > 0,
+          ...(child !== undefined ? { agent_id: scope.sessionId, agent_type: child.definition } : {}),
+        },
+        ...(state.signal !== undefined ? { signal: state.signal } : {}),
+      }))
+    } catch {
+      return undefined
+    }
+    if (verdict.stop !== undefined || verdict.block === undefined || count >= STOP_HOOK_CONTINUATION_CAP) {
+      stopHookContinuations.delete(key)
+      return undefined
+    }
+    stopHookContinuations.set(key, count + 1)
+    return `${event} hook feedback (the turn continues):\n${verdict.block.reason}`
+  })
+  kernel.ctx.on('agent/turn-stopping', (state) => {
+    const scope = agentScope.getStore()
+    if (scope?.sessionId !== undefined) stopHookContinuations.delete(`${scope.sessionId}:${state.turnId}`)
   })
 
   // G4 root lifecycle, part two: the root cannot complete a turn while its children
@@ -1247,104 +1365,129 @@ ${decision.injected}`, ...contents]
     }
   })
 
-  // ── G5 hooks ─────────────────────────────────────────────────
-  /** Hook payload identity for a run in flight. */
-  const hookPayloadBase = (): Record<string, unknown> => {
-    const scope = agentScope.getStore()
-    return scope !== undefined ? { sessionId: scope.sessionId, workspaceId: scope.workspaceId ?? '' } : {}
+  // ── Claude Code PreToolUse / PostToolUse hooks ───────────────
+  /**
+   * Calls a PreToolUse hook answered `permissionDecision: "ask"` for: the
+   * approval policy's forceAsk turns an otherwise-allowed call into a prompt.
+   * Keyed by execution (or session) + exact call fingerprint.
+   */
+  const hookAskCalls = new Set<string>()
+  /** PreToolUse `additionalContext` waiting for its call's result (same key). */
+  const hookToolContext = new Map<string, string>()
+  const HOOK_CALL_STATE_CAP = 1_000
+  const hookAskKey = (owner: string | undefined, call: ToolCall): string => `${owner ?? ''}:${approvalCallFingerprint(call)}`
+  /** Write/Edit aimed at hook settings or hook scripts (see isHookConfigPath). */
+  const writesHookConfig = (call: ToolCall): boolean => {
+    if (call.name !== 'Write' && call.name !== 'Edit') return false
+    const target = call.args['path']
+    return typeof target === 'string' && isHookConfigPath(target, options.userClaudeDir !== undefined ? [options.userClaudeDir] : [])
   }
 
-  /** PreToolUse hooks may block or rewrite; failures follow onFailure. */
+  /**
+   * PreToolUse: hooks see the Claude `tool_input` shape and may deny, force
+   * an approval prompt, or rewrite the input. `allow` never bypasses mode,
+   * policy or the guard — the rewritten call re-enters every gate.
+   */
   kernel.ctx.on('tools/rewrite', async (payload, next) => {
     const scope = agentScope.getStore()
     const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
-    let hooks: HooksConfig
-    try {
-      hooks = await mcpStore.loadHooks(workspaceId)
-    } catch (error) {
-      return { kind: 'deny', reason: `hooks.json invalid: ${String(error instanceof Error ? error.message : error)}` }
-    }
-    const bindings = hooks.hooks['PreToolUse'] ?? []
     let call = payload.call
-    for (const binding of bindings) {
-      if (binding.matcher !== '*' && binding.matcher !== call.name && !call.name.startsWith(binding.matcher.replace(/\*$/, ''))) continue
-      const decision = await runHook(binding, {
-        ...hookPayloadBase(),
-        hook_event: 'PreToolUse',
-        tool: call.name,
-        args: call.args,
+    let fired
+    try {
+      fired = await hookHost.fire('PreToolUse', {
+        workspaceId,
+        projectId: scope?.projectId,
+        sessionId: scope?.sessionId,
+        rootSessionId: scope?.rootSessionId ?? scope?.sessionId,
+        matchValue: call.name,
+        input: { tool_name: call.name, tool_input: toClaudeToolInput(call.name, call.args), tool_use_id: call.id },
+        ...(payload.exec.signal !== undefined ? { signal: payload.exec.signal } : {}),
       })
-      // Durable audit BEFORE authorization/side effects. If the security-
-      // relevant decision cannot be recorded, fail closed.
-      if (scope !== undefined) {
-        try {
-          const session = depsRef.current?.sessions.get(scope.sessionId)?.session
-          session?.append({
-            type: 'hook/run', event: 'PreToolUse', matcher: binding.matcher,
-            exitCode: decision.exitCode, durationMs: decision.durationMs,
-            decision: isBlockingDecision(decision) ? 'block' : isFailureDecision(decision) ? `failure:${binding.onFailure}` : decision.updatedInput !== undefined ? 'rewrite' : 'allow',
-          })
-          await session?.durable()
-        } catch {
-          return { kind: 'deny', reason: 'PreToolUse audit could not be recorded (fail-closed)', call }
-        }
-      }
-      if (isBlockingDecision(decision)) {
-        return { kind: 'deny', reason: `hook ${binding.command} blocked '${call.name}'`, call }
-      }
-      if (isFailureDecision(decision) && binding.onFailure === 'deny') {
-        return { kind: 'deny', reason: `hook ${binding.command} failed (fail-closed)`, call }
-      }
-      // Structured rewrite: the rewritten call re-enters every gate.
-      if (decision.updatedInput !== undefined) {
-        call = { ...call, args: decision.updatedInput }
-      }
+    } catch {
+      // Durable audit BEFORE authorization/side effects: fail closed.
+      return { kind: 'deny', reason: 'PreToolUse hook audit could not be recorded (fail-closed)', call }
     }
+    const { verdict } = fired
+    if (verdict.stop !== undefined) {
+      stopTurnForHook(scope)
+      return { kind: 'deny', reason: `PreToolUse hook stopped the turn: ${verdict.stop.reason}`, call }
+    }
+    if (verdict.block !== undefined) return { kind: 'deny', reason: `PreToolUse hook blocked '${call.name}': ${verdict.block.reason}`, call }
+    if (verdict.updatedInput !== undefined) call = { ...call, args: fromClaudeToolInput(call.name, verdict.updatedInput) }
+    if (verdict.permission === 'ask') hookAskCalls.add(hookAskKey(payload.exec.executionId ?? scope?.sessionId, call))
+    // PreToolUse additionalContext reaches the model with this call's result.
+    if (verdict.additionalContext !== undefined) hookToolContext.set(hookAskKey(payload.exec.executionId ?? scope?.sessionId, call), verdict.additionalContext)
+    // Post-execute clears both; a preparation that throws never reaches it,
+    // so keep them bounded (oldest first).
+    while (hookAskCalls.size > HOOK_CALL_STATE_CAP) hookAskCalls.delete(hookAskCalls.values().next().value as string)
+    while (hookToolContext.size > HOOK_CALL_STATE_CAP) hookToolContext.delete(hookToolContext.keys().next().value as string)
     return next({ call, exec: payload.exec })
   }, true)
 
-  // PostToolUse hooks validate output (secret scan etc.); fail-open.
+  /**
+   * PostToolUse: hooks see `tool_input` and `tool_response`; exit 2 or
+   * `decision: "block"` sends the reason to the model beside the result,
+   * `additionalContext` rides along as lower-trust data.
+   */
   kernel.ctx.on('tools/post-execute', async (payload, next) => {
     const scope = agentScope.getStore()
     const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
-    let hooks: HooksConfig
-    try {
-      hooks = await depsRef.current?.mcpStore.loadHooks(workspaceId) ?? { version: 1, hooks: {} }
-    } catch {
-      return next() // invalid hooks.json already surfaces at PreToolUse
-    }
     const result = await next()
-    for (const binding of hooks.hooks['PostToolUse'] ?? []) {
-      if (binding.matcher !== '*' && binding.matcher !== payload.call.name && !payload.call.name.startsWith(binding.matcher.replace(/\*$/, ''))) continue
-      const decision = await runHook(
-        binding,
-        { ...hookPayloadBase(), hook_event: 'PostToolUse', tool: payload.call.name, result: result.output },
-        2_000,
-      )
-      const flagHash = decision.flagged !== undefined ? auditHash(decision.flagged) : undefined
-      if (scope !== undefined) {
-        try {
-          const session = depsRef.current?.sessions.get(scope.sessionId)?.session
-          session?.append({
-            type: 'hook/run', event: 'PostToolUse', matcher: binding.matcher,
-            exitCode: decision.exitCode, durationMs: decision.durationMs,
-            decision: flagHash !== undefined ? `flagged:${flagHash}` : isFailureDecision(decision) ? `failure:${binding.onFailure}` : 'ok',
-          })
-          await session?.durable()
-        } catch {
-          // Observation hook: fail-open, but surface a bounded categorical
-          // marker rather than silently losing the audit failure.
-          return { ...result, output: `${result.output}
-[hook audit unavailable]` }
-        }
-      }
-      if (flagHash !== undefined) {
-        return { ...result, output: `${result.output}
-[hook flagged:${flagHash}]` }
-      }
+    const callKey = hookAskKey(payload.exec.executionId ?? scope?.sessionId, payload.call)
+    hookAskCalls.delete(callKey)
+    const preContext = hookToolContext.get(callKey)
+    hookToolContext.delete(callKey)
+    // Claude: a call that never ran (denied by a hook, policy or the user)
+    // fires no post hook; one that ran and failed fires PostToolUseFailure.
+    const denied = !result.ok && result.output.startsWith('denied:')
+    if (denied) {
+      // PreToolUse context still reaches the model with the denial.
+      return preContext === undefined ? result : { ...result, output: `${result.output}\n\n${hookContextBlock('PreToolUse', preContext)}` }
     }
-    return result
+    const event = result.ok ? 'PostToolUse' as const : 'PostToolUseFailure' as const
+    let verdict
+    try {
+      ({ verdict } = await hookHost.fire(event, {
+        workspaceId,
+        projectId: scope?.projectId,
+        sessionId: scope?.sessionId,
+        rootSessionId: scope?.rootSessionId ?? scope?.sessionId,
+        matchValue: payload.call.name,
+        input: {
+          tool_name: payload.call.name,
+          tool_input: toClaudeToolInput(payload.call.name, payload.call.args),
+          tool_use_id: payload.call.id,
+          ...(result.ok ? { tool_response: result.output } : { error: result.output }),
+        },
+        ...(payload.exec.signal !== undefined ? { signal: payload.exec.signal } : {}),
+      }))
+    } catch {
+      // A stop while post hooks ran: the result stands as it is.
+      if (payload.exec.signal?.aborted === true) return result
+      // Observation hook: fail-open, but say the audit was lost.
+      return { ...result, output: `${result.output}\n[hook audit unavailable]` }
+    }
+    // Claude `continue: false`: stop the whole turn after this result lands.
+    if (verdict.stop !== undefined) stopTurnForHook(scope)
+    const notes = [
+      ...(preContext !== undefined ? [hookContextBlock('PreToolUse', preContext)] : []),
+      ...(verdict.block !== undefined ? [`${event} hook feedback: ${verdict.block.reason}`] : []),
+      ...(verdict.stop !== undefined ? [`${event} hook stopped the turn: ${verdict.stop.reason}`] : []),
+      ...(verdict.additionalContext !== undefined ? [hookContextBlock(event, verdict.additionalContext)] : []),
+    ]
+    return notes.length === 0 ? result : { ...result, output: `${result.output}\n\n${notes.join('\n\n')}` }
   })
+
+  /**
+   * A hook answered `continue: false`: stop the executing conversation's
+   * turn, as Claude Code stops processing. A child stops itself only.
+   */
+  function stopTurnForHook(scope: AgentScope | undefined): void {
+    if (scope === undefined) return
+    const entry = sessions.get(scope.sessionId)
+    if (entry !== undefined) { entry.agent.stop(); return }
+    kernel.ctx.agents.get(scope.sessionId)?.stop()
+  }
 
   // The Skill tool: explicit catalog or on-demand load — no classifier and
   // no auto-load. Legacy `{ name }` calls still mean load.
@@ -1508,6 +1651,7 @@ ${entry.description}`.toLowerCase().includes(query))
   async function cancelMcpConnection(workspaceId: WorkspaceId, serverName: string): Promise<void> {
     const key = `${workspaceId}:${serverName}`
     mcpCancelled.add(key)
+    mcpConnectFailures.delete(key)
     const connecting = mcpConnecting.get(key)
     if (connecting !== undefined) {
       const client = await connecting.catch(() => undefined)
@@ -1537,6 +1681,10 @@ ${entry.description}`.toLowerCase().includes(query))
     mcpGeneration.set(workspaceId, generationOf(workspaceId) + 1)
     for (const key of mcpConnecting.keys()) {
       if (key.startsWith(`${workspaceId}:`)) mcpCancelled.add(key)
+    }
+    // A config or secret change may be the fix: try failed servers again now.
+    for (const key of [...mcpConnectFailures.keys()]) {
+      if (key.startsWith(`${workspaceId}:`)) mcpConnectFailures.delete(key)
     }
     for (const [key, client] of [...mcpClients]) {
       if (!key.startsWith(`${workspaceId}:`)) continue
@@ -1688,16 +1836,26 @@ ${entry.description}`.toLowerCase().includes(query))
           resolvedHeaders[header] = resolveSecretRefs(ref, secrets, `mcp.json server '${serverName}' headers.${header}`)
         }
         const secretRef = authSecretRef(serverConfig.auth)
-        const storedToken = serverConfig.auth?.type === 'managed_oauth'
-          ? await oauth.accessToken(workspaceId, serverName)
-          : undefined
-        if (serverConfig.auth?.type === 'managed_oauth' && storedToken === undefined) {
+        const managedOAuth = serverConfig.auth?.type === 'managed_oauth'
+        if (managedOAuth && await oauth.accessToken(workspaceId, serverName) === undefined) {
           throw new McpTransportError(`MCP server '${serverName}' requires managed OAuth authorization`)
         }
-        const bearerToken = storedToken ?? (secretRef === undefined
+        const bearerToken = managedOAuth || secretRef === undefined
           ? undefined
-          : resolveSecretRefs(secretRef, secrets, `mcp.json server '${serverName}' auth`))
-        client = new McpServerClient(serverName, serverConfig, { env: resolvedEnv, bearerToken, headers: resolvedHeaders }, (event) => {
+          : resolveSecretRefs(secretRef, secrets, `mcp.json server '${serverName}' auth`)
+        // Managed OAuth is asked per request: an access token that expires (or
+        // that the server revokes) while this client lives is refreshed instead
+        // of being sent until the breaker opens.
+        const tokenSource = managedOAuth
+          ? async (rejected?: string): Promise<string | undefined> => {
+            const token = rejected !== undefined
+              ? await oauth.replaceRejected(workspaceId, serverName, rejected)
+              : await oauth.accessToken(workspaceId, serverName)
+            if (token === undefined) throw new Error(`MCP server '${serverName}' requires managed OAuth authorization`)
+            return token
+          }
+          : undefined
+        client = new McpServerClient(serverName, serverConfig, { env: resolvedEnv, bearerToken, headers: resolvedHeaders, tokenSource }, (event) => {
           // Redacted diagnostics: category/server only — no server-returned
           // raw error detail or secret-bearing payload.
           if (event.isError) console.warn(`mcp [${serverName}] ${event.kind}: operation failed`)
@@ -1719,6 +1877,7 @@ ${entry.description}`.toLowerCase().includes(query))
         }
         mcpClients.set(key, client)
         mcpClientGeneration.set(key, generationAtStart)
+        mcpConnectFailures.delete(key)
         return client
       } catch (error) {
         await client?.disconnect().catch(() => {})
@@ -1758,6 +1917,8 @@ ${entry.description}`.toLowerCase().includes(query))
       if (RESERVED_TOOL_NAMES.has(fullName) || RESERVED_TOOL_NAMES.has(tool.name)) {
         throw new McpConfigError('reserved-name', `tool name '${fullName}' collides with a reserved built-in identity`)
       }
+      // Skip, never send: providers reject the whole request for one bad name.
+      if (!PROVIDER_TOOL_NAME.test(fullName) || tool.name.includes('__')) continue
       if (!mcpToolExposed(allowed, tool.name, fullName)) continue
       // Server annotation: interaction always asks via forceAsk; readOnlyHint
       // is display only and NEVER drives auto-allow. Do not write into the
@@ -1852,18 +2013,43 @@ ${entry.description}`.toLowerCase().includes(query))
     }
   }
 
-  /** Connect every enabled server for a workspace; invalid config surfaces. */
+  /**
+   * Connect every enabled server for a workspace. An unreadable or invalid
+   * config FILE still rejects the Turn. One server that cannot connect (down,
+   * missing secret, OAuth needed) is skipped: its tools stay out of this
+   * Turn, the reason is shown in Settings, and the other servers still work.
+   * A failed server is retried after {@link MCP_CONNECT_BACKOFF_MS}, so a dead
+   * one does not cost every Turn a connect timeout.
+   */
   async function connectWorkspaceMcp(workspaceId: WorkspaceId): Promise<void> {
-    // Strict validation of all workspace-owned G5 config at the boundary.
-    // Any invalid file rejects the Turn before model/tool execution — no
-    // partial built-in execution with a broken MCP/hooks/secrets config.
+    // Strict validation of workspace-owned MCP/secrets config at the boundary.
+    // Any invalid file rejects the Turn before model/tool execution. Hook
+    // settings follow Claude Code: a malformed entry is skipped and reported
+    // in Settings, never failing the Turn.
     const config = await mcpStore.loadMcp(workspaceId)
-    await mcpStore.loadHooks(workspaceId)
     await mcpStore.loadSecrets(workspaceId)
-    for (const server of Object.values(config.servers)) {
-      if (!server.enabled) continue
-      await ensureMcpServer(workspaceId, server.name)
-    }
+    const now = Date.now()
+    const attempts = Object.values(config.servers)
+      .filter((server) => server.enabled)
+      .filter((server) => {
+        const key = `${workspaceId}:${server.name}`
+        if (mcpClients.has(key) || mcpConnecting.has(key)) return true
+        const failed = mcpConnectFailures.get(key)
+        return failed === undefined || now - failed.at >= MCP_CONNECT_BACKOFF_MS
+      })
+      .map(async (server) => {
+        const key = `${workspaceId}:${server.name}`
+        try {
+          await ensureMcpServer(workspaceId, server.name)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          // A disable/close that cancelled this connect is not a failure.
+          if (mcpHostClosing || mcpCancelled.has(key)) return
+          mcpConnectFailures.set(key, { at: Date.now(), message: message.slice(0, 500) })
+          console.warn(`web: MCP server '${server.name}' unavailable in ${workspaceId}; its tools are skipped this turn: ${message}`)
+        }
+      })
+    await Promise.all(attempts)
   }
 
   /**
@@ -2083,13 +2269,34 @@ ${entry.description}`.toLowerCase().includes(query))
   // those two points would show the previous prompt count over the new
   // breakdown.
   kernel.ctx.on('llm/stream', (request, next) => {
-    const sessionId = agentScope.getStore()?.sessionId
+    const scope = agentScope.getStore()
+    const sessionId = scope?.sessionId
     const upstream = next(request)
     if (sessionId === undefined) return upstream
+    const startedAt = Date.now()
     return (async function* tap() {
-      for await (const event of upstream) {
-        if (event.type === 'usage') recordUsage(sessionUsage, sessionId, event.usage)
-        yield event
+      // Some providers report usage more than once; the last report wins.
+      let reported: TokenUsage | undefined
+      try {
+        for await (const event of upstream) {
+          if (event.type === 'usage') {
+            recordUsage(sessionUsage, sessionId, event.usage)
+            reported = event.usage
+          }
+          yield event
+        }
+      } finally {
+        if (reported !== undefined) {
+          usageLog.record({
+            at: Date.now(), startedAt,
+            ...(scope?.workspaceId !== undefined ? { workspaceId: scope.workspaceId } : {}),
+            sessionId, rootSessionId: scope?.rootSessionId ?? sessionId,
+            kind: scope?.childOf !== undefined ? 'child' : 'turn',
+            ...(request.providerName !== undefined ? { provider: request.providerName } : {}),
+            model: request.model ?? 'unknown',
+            input: reported.inputTokens, cached: reported.cachedInputTokens ?? 0, output: reported.outputTokens ?? 0,
+          })
+        }
       }
     })()
   }, true)
@@ -2123,17 +2330,23 @@ ${entry.description}`.toLowerCase().includes(query))
     return loaded
   }
 
-  /** Workspace INSTRUCTIONS.md, plus the bound project's when present. */
+  /**
+   * Claude Code CLAUDE.md layering plus the workspace layer (spec
+   * 2026-10-08-claude-format-parity): user < workspace < project < local.
+   */
   async function readWorkspaceInstructions(home: string, workspaceId: WorkspaceId, projectId: ProjectId | undefined): Promise<string> {
-    const parts: string[] = []
-    for (const file of [
-      path.join(home, 'workspaces', workspaceId, 'INSTRUCTIONS.md'),
-      ...(projectId !== undefined ? [path.join(home, 'workspaces', workspaceId, 'projects', projectId, 'INSTRUCTIONS.md')] : []),
-    ]) {
-      const text = await fs.readFile(file, 'utf8').catch(() => undefined)
-      if (text !== undefined && text.trim() !== '') parts.push(text.trim())
+    let projectRoot: string | undefined
+    if (projectId !== undefined) {
+      try { projectRoot = workspaces.getProject(projectId, workspaceId).path } catch { projectRoot = undefined }
     }
-    return parts.join('\n\n')
+    const files = await loadClaudeMd({
+      ...(options.userClaudeDir !== undefined ? { userDir: options.userClaudeDir } : {}),
+      workspaceDir: path.join(home, 'workspaces', workspaceId),
+      ...(projectRoot !== undefined ? { projectRoot } : {}),
+      // Imports never reach credential roots or app storage (other workspaces).
+      deniedRoots: [...(options.secretRoots ?? []), ...(options.home !== undefined ? [options.home] : [])],
+    })
+    return renderClaudeMd(files)
   }
 
   /**
@@ -2292,10 +2505,12 @@ ${entry.description}`.toLowerCase().includes(query))
     }
 
     // Compaction summaries only apply when the mode's history reads them.
-    let compaction: { summary: string; coversSeq: number } | undefined
+    let compaction: { summary: string; coversSeq: number; verifiedAgainst: 'committed-log' } | undefined
     if (mode.definition.sources.history === 'compact' && scope !== undefined) {
+      // `latest(id, events)` returns only the canonical checkpoint recovered
+      // from the committed log, so the builder need not re-derive it.
       const checkpoint = await checkpoints.latest(scope.sessionId, session?.committedEvents ?? []).catch(() => undefined)
-      if (checkpoint !== undefined) compaction = { summary: checkpoint.summary, coversSeq: checkpoint.coversSeq }
+      if (checkpoint !== undefined) compaction = { summary: checkpoint.summary, coversSeq: checkpoint.coversSeq, verifiedAgainst: 'committed-log' }
     }
 
     projected.assemblySignal?.throwIfAborted()
@@ -2311,8 +2526,10 @@ ${entry.description}`.toLowerCase().includes(query))
     // The same grant the tool pipeline resolves, so the model is told exactly
     // the folders its file tools can reach.
     const fileScope = scope !== undefined ? agentScope.run(scope, () => kernel.ctx.tools.currentGrant()) : undefined
-    if (scope !== undefined && fileScope?.memoryRoots !== undefined && exposed.some((schema) => ['Read', 'Write', 'Edit', 'Glob', 'Grep'].includes(schema.name))) {
-      pinnedMemory.unshift(memoryGuidance(fileScope.memoryRoots))
+    // Read-only modes get guidance that never asks for a write they cannot make.
+    const guidanceAccess = memoryGuidanceAccess(exposed.map((schema) => schema.name))
+    if (scope !== undefined && fileScope?.memoryRoots !== undefined && guidanceAccess !== undefined) {
+      pinnedMemory.unshift(memoryGuidance(fileScope.memoryRoots, guidanceAccess))
     }
     const environment = await environmentBlockFor(scope, fileScope).catch(() => undefined)
     const assembled = buildContext({
@@ -2504,10 +2721,12 @@ ${entry.description}`.toLowerCase().includes(query))
         const target = (call.name === 'Write' || call.name === 'Edit') && typeof call.args['path'] === 'string' ? call.args['path'] : undefined
         const memoryWrite = target !== undefined && grant !== undefined && grant.memoryRoots?.some((root) => within(root, path.resolve(grant.root, target))) === true
           && classifyTarget(grant, target, 'write').kind === 'in-grant'
-        // An explicit deny remains authoritative; only an implicit/ask default
-        // becomes allow for a structurally safe Markdown path in this scope.
-        const explicit = Object.hasOwn(policy, call.name) ? policy[call.name] : policy['*']
-        const permission = memoryWrite && normalPermission === 'ask' && explicit !== 'deny' ? 'allow' : normalPermission
+        // Only an `ask` becomes allow for a memory path; `classifyTarget` +
+        // `resolveInGrants` restrict that path to `.md` files outside
+        // `.git`/`.env`/`secrets`/`skills`/`agents`/`commands`. A deny —
+        // exact, legacy-named, or via `*` — already resolved to `deny` in
+        // `normalPermission` (canonical lookup), so it can never be lifted.
+        const permission = memoryWrite && normalPermission === 'ask' ? 'allow' : normalPermission
         const requirements: AskRequirement[] = []
         if (permission === 'ask') requirements.push({ kind: 'tool-policy', subjectFingerprint: createHash('sha256').update(`${call.name}:ask`).digest('hex') })
         const outside = pathScope.get(executionId, call)
@@ -2569,7 +2788,12 @@ ${entry.description}`.toLowerCase().includes(query))
         workspaceId: scope.workspaceId as WorkspaceId,
       }, scope.workspaceId as WorkspaceId).mode.definition : undefined
       return (outside !== undefined && currentOutsideRequirement(outside, mode?.outOfGrant)) ||
-        toolRequiresInteraction(call, scope.workspaceId as WorkspaceId | undefined, mcpDescriptors)
+        toolRequiresInteraction(call, scope.workspaceId as WorkspaceId | undefined, mcpDescriptors) ||
+        // A PreToolUse hook answered `permissionDecision: "ask"`.
+        hookAskCalls.has(hookAskKey(scope.executionId ?? scope.sessionId, call)) ||
+        // Writing hook configuration changes which shell commands run next:
+        // always a human decision, whatever the mode allows for edits.
+        writesHookConfig(call)
     },
     requestDetails: (call, scope) => {
       const outside = pathScope.get(scope?.executionId ?? agentScope.getStore()?.sessionId, call)
@@ -2643,6 +2867,16 @@ ${entry.description}`.toLowerCase().includes(query))
           ...(proposedGrant !== undefined ? { proposedGrant } : {}),
           ...(proposedAccess !== undefined ? { proposedAccess } : {}),
         })
+        // Claude Notification hook: a permission prompt is waiting. Fire and
+        // forget — a notification never gates the approval.
+        void hookHost.fire('Notification', {
+          workspaceId,
+          projectId: scope.projectId,
+          sessionId: scope.sessionId,
+          rootSessionId: scope.rootSessionId ?? scope.sessionId,
+          matchValue: 'permission_prompt',
+          input: { message: `Claude needs your permission to use ${call.name}`, notification_type: 'permission_prompt' },
+        }).catch(() => undefined)
       }),
   })
 
@@ -2757,6 +2991,7 @@ ${entry.description}`.toLowerCase().includes(query))
     lastManifests,
     contextBodies,
     sessionUsage,
+    usageLog,
     adoptMode,
     stampRootMode,
     rootModeOf,
@@ -2767,6 +3002,7 @@ ${entry.description}`.toLowerCase().includes(query))
     childModelFor,
     summarizerModelOf,
     runPreCompactHooks,
+    hookHost,
     runCompaction,
     cancelCompaction,
     compactionPending: (sessionId) => compactions.has(sessionId),
@@ -2776,12 +3012,18 @@ ${entry.description}`.toLowerCase().includes(query))
     mcpDescriptors,
     mcpConnecting,
     mcpCancelled,
+    mcpConnectFailures,
     connectWorkspaceMcp,
     cancelMcpConnection,
     ensureMcpServer,
     dangerousStore,
     systemPrompts,
     providers: () => list,
+    roleModelOf: (definitionModel) => describeRoleModel(definitionModel, {
+      parent: { provider: defaults.provider, model: defaults.model },
+      providers: usableIds(),
+      modelsOf: (provider) => kernel.ctx.llm.providerModels(provider),
+    }),
     defaults: () => defaults,
     setDefaults: (next) => { defaults = next },
     mutateProviderStore,
@@ -2898,6 +3140,7 @@ ${entry.description}`.toLowerCase().includes(query))
         () => processes.disposeAll(),
         async () => { try { await boundedCleanup(() => checkpoints.close()) } catch (error) { teardownSafe = false; throw error } },
         async () => { try { await boundedCleanup(() => processEvents.flushAll()) } catch (error) { teardownSafe = false; throw error } },
+        async () => { await boundedCleanup(() => usageLog.flush()) },
         () => new Promise<void>((resolve, reject) => server.close(error => error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve())),
         async () => {
           const results = await Promise.allSettled([...mcpClients.values()].map(client => client.disconnect()))
@@ -3002,10 +3245,15 @@ interface HandlerDeps {
     requested?: string,
     definitionModel?: string,
   ) => ChildModel | undefined
+  /** Display-only: what a role's `model:` resolves to on this host (aliases mapped). */
+  readonly roleModelOf: (definitionModel: string | undefined) => ReturnType<typeof describeRoleModel>
   /** The (provider, model) pair host-side maintenance calls run on; undefined → extractive compaction fallback. */
+  /** Durable token accounting behind GET /api/usage. */
+  readonly usageLog: UsageLog
   readonly summarizerModelOf: (session: Session) => { readonly providerName: string; readonly model: string } | undefined
   /** Runs PreCompact hooks (durable hook/run events); returns the blocking reason, or undefined to proceed. */
   readonly runPreCompactHooks: (session: Session, workspaceId: WorkspaceId) => Promise<string | undefined>
+  readonly hookHost: HookHost
   readonly runCompaction: (entry: SessionEntry, trigger: 'manual' | 'automatic') => Promise<{ coversSeq: number; summary: string }>
   readonly cancelCompaction: (sessionId: SessionId) => void
   readonly compactionPending: (sessionId: SessionId) => boolean
@@ -3015,6 +3263,7 @@ interface HandlerDeps {
   readonly mcpDescriptors: Map<string, McpToolDescriptor>
   readonly mcpConnecting: Map<string, Promise<McpServerClient>>
   readonly mcpCancelled: Set<string>
+  readonly mcpConnectFailures: ReadonlyMap<string, { readonly at: number; readonly message: string }>
   readonly connectWorkspaceMcp: (workspaceId: WorkspaceId) => Promise<void>
   readonly cancelMcpConnection: (workspaceId: WorkspaceId, serverName: string) => Promise<void>
   readonly ensureMcpServer: (workspaceId: WorkspaceId, serverName: string) => Promise<McpServerClient>
@@ -3456,13 +3705,36 @@ async function handleApi(
           }
           projectId = rawProject as ProjectId
         }
+        // A browser submits the controls it displayed. Never re-read a shared
+        // default in place of that choice: another tab/session may have changed it.
+        let defaults = deps.defaults()
+        const submitted = body['controls']
+        if (submitted !== undefined) {
+          if (submitted === null || typeof submitted !== 'object' || Array.isArray(submitted)) {
+            send(400, { error: "'controls' must contain provider, model, and thinkingLevel" })
+            return
+          }
+          const { provider, model, thinkingLevel } = submitted as Record<string, unknown>
+          if ((provider !== null && typeof provider !== 'string')
+            || (model !== null && typeof model !== 'string')
+            || (thinkingLevel !== null && !isThinkingLevel(thinkingLevel))
+            || (provider === null) !== (model === null)) {
+            send(400, { error: "'controls' requires a complete string|null provider/model pair and valid thinkingLevel|null" })
+            return
+          }
+          if (provider !== null && model !== null) {
+            try {
+              deps.validateProviderModel(provider, model)
+            } catch (error) {
+              send(400, { error: String(error instanceof Error ? error.message : error) })
+              return
+            }
+          }
+          defaults = { provider, model, thinkingLevel }
+        }
         const session = deps.kernel.ctx.sessions.create(wsId)
-        const defaults = deps.defaults()
-        // Snapshot global defaults so later changes apply to future sessions
-        // only. The global pair tracks the model actually in use (a
-        // conversation model change repoints it), so a new conversation opens
-        // on what the operator was last chatting with. Explicit null thinking
-        // preserves "use model default".
+        // Older API callers may omit controls and snapshot the global default.
+        // Explicit null thinking preserves "use model default".
         session.append({
           type: 'session/model',
           provider: defaults.provider,
@@ -3494,13 +3766,19 @@ async function handleApi(
           workspaceId: wsId,
           projectId,
         })
-        // SessionStart hooks are audit-only; failure follows each binding's
-        // onFailure but cannot grant permissions.
+        // Claude SessionStart hooks (source "startup"): their context
+        // (`additionalContext` or plain stdout) waits in the inbox and joins
+        // the first user message as lower-trust data.
         try {
-          const hooks = await deps.mcpStore.loadHooks(wsId)
-          for (const binding of hooks.hooks['SessionStart'] ?? []) {
-            const decision = await runHook(binding, { hook_event: 'SessionStart', sessionId: session.id, workspaceId: wsId })
-            session.append({ type: 'hook/run', event: 'SessionStart', matcher: binding.matcher, exitCode: decision.exitCode, durationMs: decision.durationMs, decision: isFailureDecision(decision) ? `failure:${binding.onFailure}` : 'audit' })
+          const { verdict } = await deps.hookHost.fire('SessionStart', {
+            workspaceId: wsId,
+            projectId,
+            sessionId: session.id,
+            matchValue: 'startup',
+            input: { source: 'startup' },
+          })
+          if (verdict.additionalContext !== undefined) {
+            deps.sessions.get(session.id)?.agent.inject(hookContextBlock('SessionStart', verdict.additionalContext))
           }
           await session.durable()
         } catch (error) {
@@ -3632,10 +3910,11 @@ async function handleApi(
       return
     }
 
-    const wsSessionMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)(?:\/(events|messages|stop|steer))?$/.exec(pathname)
+    const wsSessionMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)(?:\/(events|messages|stop|steer)|\/(inputs)\/([^/]+))?$/.exec(pathname)
     if (wsSessionMatch !== null) {
       const wsId = decodeURIComponent(wsSessionMatch[1] ?? '') as WorkspaceId
-      const action = wsSessionMatch[3]
+      const action = wsSessionMatch[3] ?? wsSessionMatch[4]
+      const inputPathId = wsSessionMatch[5] !== undefined ? decodeURIComponent(wsSessionMatch[5]) : undefined
       const entry = await findSession(decodeURIComponent(wsSessionMatch[2] ?? ''), wsId, deps)
       if (entry === undefined) {
         // Unknown ids and foreign-workspace ids are indistinguishable: 404.
@@ -3665,11 +3944,15 @@ async function handleApi(
             return
           }
           try {
-            const hooks = await deps.mcpStore.loadHooks(wsId)
-            for (const binding of hooks.hooks['SessionEnd'] ?? []) {
-              const decision = await runHook(binding, { hook_event: 'SessionEnd', sessionId: entry.session.id, workspaceId: wsId })
-              entry.session.append({ type: 'hook/run', event: 'SessionEnd', matcher: binding.matcher, exitCode: decision.exitCode, durationMs: decision.durationMs, decision: isFailureDecision(decision) ? `failure:${binding.onFailure}` : 'audit' })
-            }
+            // Claude SessionEnd (reason "clear" for a deleted conversation): observe-only.
+            await deps.hookHost.fire('SessionEnd', {
+              workspaceId: wsId,
+              projectId: entry.projectId,
+              sessionId: entry.session.id,
+              matchValue: 'clear',
+              input: { reason: 'clear' },
+            })
+            deps.hookHost.forgetSession(entry.session.id)
             await entry.session.durable()
           } catch (error) {
             send(500, { error: `SessionEnd hook/audit failed; session kept: ${String(error instanceof Error ? error.message : error)}` })
@@ -3728,6 +4011,15 @@ async function handleApi(
         send(outcome.status, outcome.body)
         return
       }
+      if (action === 'inputs' && inputPathId !== undefined && (req.method === 'PATCH' || req.method === 'DELETE')) {
+        const outcome = await amendQueuedInput(entry, inputPathId, req, deps)
+        if (!outcome.ok) {
+          send(outcome.status, { error: outcome.error })
+          return
+        }
+        send(200, outcome.body)
+        return
+      }
       if (action === 'messages' && req.method === 'POST') {
         const outcome = await acceptMessage(entry, req, deps)
         if (!outcome.ok) {
@@ -3746,7 +4038,13 @@ async function handleApi(
       const wsId = decodeURIComponent(agentCatalog[1] ?? '') as WorkspaceId
       requireWorkspace(deps, wsId, false)
       if (req.method !== 'GET') { send(405, { error: 'method not allowed' }); return }
-      send(200, await deps.agentDefinitions.list(wsId))
+      // Every layer that applies: bundled, ~/.claude/agents, the workspace,
+      // and the project's .claude/agents when ?projectId= is given.
+      const projectParam = query.get('projectId') ?? undefined
+      const rows = await deps.agentDefinitions.list(wsId, projectParam)
+      // Each row also says which model it would run on here (aliases such
+      // as `opus` resolved against the configured providers).
+      send(200, rows.map((row) => ({ ...row, modelResolution: deps.roleModelOf(row.definition.model) })))
       return
     }
 
@@ -3785,7 +4083,7 @@ async function handleApi(
         // await: a parent message appended later can never leak in.
         const inheritedContext = inherit === 'brief' ? projectInheritedMessages(parent.session.events) : undefined
         try {
-          const resolved = await deps.agentDefinitions.resolve(wsId, name)
+          const resolved = await deps.agentDefinitions.resolve(wsId, name, parent.projectId)
           const task: TaskPacket = {
             ...(typeof packet['prompt'] === 'string' ? { prompt: packet['prompt'] } : {}),
             ...(typeof packet['objective'] === 'string' ? { objective: packet['objective'] } : {}),
@@ -3798,12 +4096,6 @@ async function handleApi(
           }
           if (normalizeBrief(task) === undefined) {
             send(400, { error: "the task needs a non-empty 'prompt' (or the structured 'objective')" })
-            return
-          }
-          // Validate the role's own refusals before touching Turn admission:
-          // a bad request must not be reported as a missing delegation batch.
-          if (inherit === 'brief' && resolved.definition.inheritable === false) {
-            send(400, { error: `role '${resolved.definition.name}' does not accept inherited context (inheritable: false)` })
             return
           }
           const model = deps.childModelFor(
@@ -3868,10 +4160,10 @@ async function handleApi(
       }
       if (req.method === 'GET') {
         try {
-          send(200, await deps.agentDefinitions.resolve(wsId, name))
+          send(200, await deps.agentDefinitions.resolve(wsId, name, query.get('projectId') ?? undefined))
         } catch (error) {
-          if (error instanceof AgentDefinitionError && error.code === 'not-found') {
-            send(404, { error: error.message })
+          if (error instanceof AgentDefinitionError && (error.code === 'not-found' || error.code === 'invalid')) {
+            send(error.code === 'not-found' ? 404 : 422, { error: error.message })
             return
           }
           fail(error)
@@ -3880,7 +4172,16 @@ async function handleApi(
       }
       if (req.method === 'DELETE') {
         requireWorkspace(deps, wsId, true)
-        await deps.agentDefinitions.delete(wsId, name)
+        try {
+          await deps.agentDefinitions.delete(wsId, name)
+        } catch (error) {
+          // An invalid or traversal name is the client's error, not a 500.
+          if (error instanceof AgentDefinitionError) {
+            send(error.code === 'not-found' ? 404 : 400, { error: error.message })
+            return
+          }
+          throw error
+        }
         send(200, { deleted: true })
         return
       }
@@ -3969,8 +4270,39 @@ async function handleApi(
       return
     }
 
-    // Claude/Codex definition import: explicit, provenance-preserving,
-    // never executes content; blocking fields prevent auto-activation.
+    // Save one subagent file into the workspace layer. The document IS a
+    // Claude Code subagent file (YAML frontmatter + body), stored verbatim
+    // after validation. `dialect: "codex"` still converts a pinned Codex spec.
+    // Clone a ~/.claude or bundled role into this workspace (same name, file
+    // copied verbatim) so it overrides here and can be edited; and read a
+    // workspace file's exact text for the raw editor.
+    const wsAgentFile = /^\/api\/workspaces\/([^/]+)\/agents\/([^/]+)\/(clone|file)$/.exec(pathname)
+    if (wsAgentFile !== null) {
+      const wsId = decodeURIComponent(wsAgentFile[1] ?? '') as WorkspaceId
+      const name = decodeURIComponent(wsAgentFile[2] ?? '')
+      const action = wsAgentFile[3]
+      try {
+        if (action === 'clone' && req.method === 'POST') {
+          requireWorkspace(deps, wsId, true)
+          send(201, { definition: await deps.agentDefinitions.cloneToWorkspace(wsId, name) })
+          return
+        }
+        if (action === 'file' && req.method === 'GET') {
+          requireWorkspace(deps, wsId, false)
+          send(200, await deps.agentDefinitions.readWorkspaceFile(wsId, name))
+          return
+        }
+      } catch (error) {
+        if (error instanceof AgentDefinitionError) {
+          send(error.code === 'not-found' ? 404 : error.code === 'duplicate' ? 409 : 400, { error: error.message })
+          return
+        }
+        throw error
+      }
+      send(405, { error: 'method not allowed' })
+      return
+    }
+
     const wsAgentImport = /^\/api\/workspaces\/([^/]+)\/agents\/([^/]+)\/import$/.exec(pathname)
     if (wsAgentImport !== null && req.method === 'POST') {
       const wsId = decodeURIComponent(wsAgentImport[1] ?? '') as WorkspaceId
@@ -3984,45 +4316,21 @@ async function handleApi(
       }
       try {
         const dialect = typeof body['dialect'] === 'string' ? body['dialect'] : 'claude'
-        // `mini-dsh` is the pre-rename name of the native dialect; older clients still send it.
-        if (dialect === 'dnt-harness' || dialect === 'mini-dsh') {
-          // A native document (the Settings create/copy form): saved verbatim
-          // after the strict native parse, so dnt-harness-only keys such as
-          // `inheritable` survive the round-trip.
-          const saved = await deps.agentDefinitions.save(wsId, targetName, content)
-          const keys = Object.keys(saved.definition).filter((key) => key !== 'instructions' && key !== 'name')
-          send(201, { definition: saved, imported: keys, warnings: [], active: true })
-          return
-        }
-        const result =
-          dialect === 'codex'
-            ? await import('../harness/agents/compatibility/claude.ts').then((mod) =>
-                mod.importCodexDefinition(content, typeof body['sourceVersion'] === 'string' ? body['sourceVersion'] : undefined),
-              )
-            : importClaudeDefinition(content)
-        const blockedFields = (result as { blocked?: readonly string[] }).blocked ?? []
-        if (blockedFields.length > 0) {
-          // Quarantine: a definition with unresolved blocking fields is
-          // NEVER saved as executable. The operator resolves the fields and
-          // re-imports; the parsed preview comes back for that purpose.
-          send(422, {
-            error: `definition blocked by unresolved fields: ${blockedFields.join(', ')}`,
-            blocked: blockedFields,
-            warnings: result.warnings,
-            preview: result.definition,
-          })
-          return
-        }
-        const saved = await deps.agentDefinitions.save(wsId, targetName, serializeDefinition(result.definition))
+        const document = dialect === 'codex'
+          ? serializeAgentDefinition(importCodexDefinition(content, typeof body['sourceVersion'] === 'string' ? body['sourceVersion'] : undefined).definition)
+          : content
+        // The raw editor sends the hash it read: an external edit since then is a 409.
+        const expectedHash = typeof body['expectedHash'] === 'string' ? body['expectedHash'] : undefined
+        const saved = await deps.agentDefinitions.save(wsId, targetName, document, expectedHash)
         send(201, {
           definition: saved,
-          imported: (result as { imported?: readonly string[] }).imported ?? [],
-          warnings: result.warnings,
+          imported: Object.keys(saved.definition).filter((key) => key !== 'instructions' && key !== 'warnings' && key !== 'unsupported'),
+          warnings: saved.definition.warnings ?? [],
           active: true,
         })
       } catch (error) {
         if (error instanceof AgentDefinitionError) {
-          send(error.code === 'blocked' ? 422 : error.code === 'not-found' ? 404 : 400, { error: error.message })
+          send(error.code === 'blocked' ? 422 : error.code === 'not-found' ? 404 : error.code === 'conflict' ? 409 : 400, { error: error.message })
           return
         }
         fail(error)
@@ -4150,11 +4458,17 @@ async function handleApi(
             const client = deps.mcpClients.get(`${wsId}:${server.name}`)
             const discovered = (client?.cachedTools() ?? []).map((tool) => tool.name)
             const unmatchedAllowlist = (server.allowedTools ?? []).filter((name) => !name.includes('*') && !discovered.includes(name))
+            const unusableTools = discovered.filter((name) => !PROVIDER_TOOL_NAME.test(mcpToolName(server.name, name)) || name.includes('__'))
+            const connectFailure = server.enabled ? deps.mcpConnectFailures.get(`${wsId}:${server.name}`) : undefined
+            const stderr = client?.recentStderr() ?? ''
             rows.push({
               name: server.name,
               transport: server.transport,
               enabled: server.enabled,
-              status: !server.enabled ? 'disabled' : client?.state ?? 'connecting',
+              status: !server.enabled ? 'disabled' : client?.state ?? (connectFailure !== undefined ? 'failed' : 'connecting'),
+              ...(connectFailure !== undefined ? { lastError: connectFailure.message } : {}),
+              ...(unusableTools.length > 0 ? { unusableTools } : {}),
+              ...(stderr !== '' ? { stderrTail: stderr.slice(-2_000) } : {}),
               breakerOpenUntil: client !== undefined && client.breakerOpenUntil > Date.now() ? client.breakerOpenUntil : null,
               containment: deps.containmentDetail,
               generation: deps.generationOf(wsId),
@@ -4315,19 +4629,70 @@ async function handleApi(
     if (wsHooksMatch !== null) {
       const wsId = decodeURIComponent(wsHooksMatch[1] ?? '') as WorkspaceId
       requireWorkspace(deps, wsId, false)
+      // The workspace layer is `<ws>/settings.json` in Claude Code format;
+      // GET also reports every layer that applies (user/workspace, plus the
+      // project's `.claude/settings*.json` when ?projectId= is given).
+      const workspaceDir = deps.hookHost.workspaceDir(wsId)
+      if (workspaceDir === undefined) { send(409, { error: 'hook settings need a data home' }); return }
       if (req.method === 'GET') {
-        send(200, await deps.mcpStore.loadHooks(wsId))
+        try {
+          const own = await readWorkspaceHooks(workspaceDir)
+          const projectParam = query.get('projectId') ?? undefined
+          const effective = await deps.hookHost.resolve(wsId, projectParam)
+          send(200, {
+            file: workspaceSettingsPath(workspaceDir),
+            hooks: own.hooks,
+            disableAllHooks: own.disableAllHooks,
+            sources: effective.sources,
+            // Every configured hook from every layer, with `active` and
+            // `supported`; Settings groups them by event.
+            effective: effective.all,
+            disabled: effective.disabled,
+            diagnostics: effective.diagnostics,
+          })
+        } catch (error) {
+          if (error instanceof HookSettingsError) { send(400, { error: error.message }); return }
+          throw error
+        }
         return
       }
       if (req.method === 'PUT') {
         requireWorkspace(deps, wsId, true)
         const body = await readJson(req)
-        parseHooksConfig(JSON.stringify(body)) // strict validate
-        await deps.mcpStore.saveHooks(wsId, body as unknown as HooksConfig)
+        try {
+          await writeWorkspaceHooks(
+            workspaceDir,
+            body['hooks'] ?? {},
+            typeof body['disableAllHooks'] === 'boolean' ? body['disableAllHooks'] : undefined,
+          )
+          // The user reviewed and saved hooks: running conversations pick them up.
+          deps.hookHost.invalidateWorkspace(wsId)
+        } catch (error) {
+          if (error instanceof HookSettingsError) { send(400, { error: error.message }); return }
+          throw error
+        }
         send(200, { saved: true })
         return
       }
       send(405, { error: 'method not allowed' })
+      return
+    }
+
+    // Switch one hook (any layer) on or off for this workspace; the Claude
+    // settings files are left exactly as written.
+    const wsHookStateMatch = /^\/api\/workspaces\/([^/]+)\/hooks\/([0-9a-f]{16})$/.exec(pathname)
+    if (wsHookStateMatch !== null) {
+      const wsId = decodeURIComponent(wsHookStateMatch[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, true)
+      const workspaceDir = deps.hookHost.workspaceDir(wsId)
+      if (workspaceDir === undefined) { send(409, { error: 'hook settings need a data home' }); return }
+      if (req.method !== 'PUT') { send(405, { error: 'method not allowed' }); return }
+      const body = await readJson(req)
+      if (typeof body['active'] !== 'boolean') { send(400, { error: "body needs a boolean 'active'" }); return }
+      await setHookActive(workspaceDir, wsHookStateMatch[2] ?? '', body['active'])
+      // Running conversations follow the switch immediately.
+      deps.hookHost.invalidateWorkspace(wsId)
+      send(200, { id: wsHookStateMatch[2], active: body['active'] })
       return
     }
 
@@ -4583,6 +4948,12 @@ async function handleApi(
         return
       }
       send(405, { error: 'method not allowed' })
+      return
+    }
+
+    // Settings → Usage: daily token rows across every workspace.
+    if (pathname === '/api/usage' && req.method === 'GET') {
+      send(200, deps.usageLog.daily())
       return
     }
 
@@ -6054,21 +6425,6 @@ function browserPrincipal(req: IncomingMessage, deps: HandlerDeps, method: strin
 
 // ── session operation helpers ──────────────────────────────────
 
-/** Serialize a definition to canonical Markdown/frontmatter for import. */
-function serializeDefinition(definition: import('../harness/agents/definition-service.ts').AgentDefinition): string {
-  const fm = [
-    `name: ${JSON.stringify(definition.name)}`,
-    `description: ${JSON.stringify(definition.description)}`,
-    `tools: ${JSON.stringify(definition.tools)}`,
-    `disallowedTools: ${JSON.stringify(definition.disallowedTools)}`,
-    ...(definition.skills !== undefined ? [`skills: ${JSON.stringify(definition.skills)}`] : []),
-    ...(definition.model !== undefined ? [`model: ${JSON.stringify(definition.model)}`] : []),
-    ...(definition.maxTurns !== undefined ? [`maxTurns: ${definition.maxTurns}`] : []),
-    ...(definition.inheritable !== undefined ? [`inheritable: ${definition.inheritable}`] : []),
-  ]
-  return `---\n${fm.join('\n')}\n---\n\n${definition.instructions.trim()}\n`
-}
-
 /** The workspace owning sessions when the caller does not address one. */
 function implicitWorkspace(deps: HandlerDeps): WorkspaceId {
   return deps.deniedRoots !== undefined ? defaultWorkspaceId(deps) : MEMORY_WORKSPACE
@@ -6250,6 +6606,13 @@ async function acceptMessage(
   // Durable acceptance before the driver sees the input, and before a steer
   // stops anything: a write failure leaves the running turn untouched.
   const inputId = newInputId()
+  // The host, not the client, decides whether this input starts a turn now
+  // (idle, nothing blocking dispatch) or waits behind one. The stamp lets the
+  // UI render a sent message right away instead of a queued row.
+  const runsNow = !entry.agent.busy
+    && entry.closed !== true
+    && !deps.compactionPending(entry.session.id)
+    && !deps.kernel.ctx.llm.sessionUncertain(entry.session.id)
   entry.session.append({
     type: 'input/queued',
     inputId,
@@ -6257,6 +6620,7 @@ async function acceptMessage(
     content,
     ...(refs.length > 0 ? { attachments: refs } : {}),
     ...(delivery === 'steer' ? { delivery: 'steer' as const } : {}),
+    ...(runsNow ? { runsNow: true as const } : {}),
   })
   try {
     await entry.session.durable()
@@ -6279,6 +6643,54 @@ async function acceptMessage(
     return { ok: true, status: 202, body: { inputId, queued: true, delivery, dispatchBlocked: 'transport_cleanup' } }
   }
   return { ok: true, status: 202, body: { inputId, queued: wasBusy && delivery === 'queue', delivery } }
+}
+
+/**
+ * Edit (PATCH `{ content }`) or delete (DELETE) one queued input while it
+ * still waits: `input/revised`, or `input/settled { outcome: "withdrawn" }`,
+ * applied to the live inbox in the same tick it is appended. Input a turn already claimed (pre-step or later) answers 409: it is
+ * on its way to the model and no longer the user's to change.
+ */
+async function amendQueuedInput(
+  entry: SessionEntry,
+  inputId: string,
+  req: IncomingMessage,
+  deps: HandlerDeps,
+): Promise<{ ok: false; status: number; error: string } | { ok: true; body: Record<string, unknown> }> {
+  if (entry.session.events.some((event) => event.type === 'session/child-meta')) {
+    return { ok: false, status: 409, error: 'this is a child agent session; its input is executor-managed' }
+  }
+  requireWorkspace(deps, entry.workspaceId, true)
+  let content: string | undefined
+  if (req.method === 'PATCH') {
+    const body = await readJson(req)
+    const raw = body['content']
+    if (typeof raw !== 'string') return { ok: false, status: 400, error: 'body needs a string content' }
+    content = raw
+  }
+  const pending = deps.kernel.ctx.sessions.pendingInputs(entry.session).find((item) => item.inputId === inputId)
+  if (pending === undefined) return { ok: false, status: 404, error: 'no such queued input (it may already have run)' }
+  const id = pending.inputId
+  // Editing to nothing would leave an input the composer itself refuses.
+  if (content !== undefined && content.trim() === '' && (pending.attachments?.length ?? 0) === 0) {
+    return { ok: false, status: 400, error: 'body needs a non-empty string content (delete the input instead)' }
+  }
+  // Check, inbox change and append are one synchronous step: a turn claims
+  // its input synchronously too, so it sees either the old or the new queue,
+  // never a deleted input it already logged.
+  const applied = content !== undefined ? entry.agent.reviseQueued(id, content) : entry.agent.withdrawQueued(id)
+  if (!applied) return { ok: false, status: 409, error: 'this input is already being processed' }
+  entry.session.append(
+    content !== undefined
+      ? { type: 'input/revised', inputId: id, content }
+      : { type: 'input/settled', inputId: id, outcome: 'withdrawn' },
+  )
+  try {
+    await entry.session.durable()
+  } catch (error) {
+    return { ok: false, status: 500, error: `change could not be durably recorded: ${String(error instanceof Error ? error.message : error)}` }
+  }
+  return { ok: true, body: content !== undefined ? { inputId: id, revised: true } : { inputId: id, withdrawn: true } }
 }
 
 /**

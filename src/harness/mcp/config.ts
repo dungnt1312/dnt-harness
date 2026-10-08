@@ -1,6 +1,6 @@
 /**
  * G5 workspace-owned configuration: `mcp.json` (servers), `secrets.json`
- * (credential store), `hooks.json` (hook bindings). Strict validation — an
+ * (credential store). Strict validation — an
  * invalid file surfaces a full error and is never partially executed.
  * Secrets are referenced from `mcp.json` via `${VAR}` and resolved ONLY
  * from the secrets store; `mcp.json` never carries plain credentials.
@@ -51,20 +51,6 @@ export interface McpConfig {
   readonly revision?: number
   readonly contentHash?: string
   readonly servers: Readonly<Record<string, McpServerConfig>>
-}
-
-export interface HookBinding {
-  readonly matcher: string
-  readonly type: 'command'
-  readonly command: string
-  readonly args?: readonly string[]
-  readonly timeoutMs?: number
-  readonly onFailure: 'deny' | 'allow'
-}
-
-export interface HooksConfig {
-  readonly version: 1
-  readonly hooks: Partial<Record<'PreToolUse' | 'PostToolUse' | 'UserPromptSubmit' | 'SessionStart' | 'SessionEnd' | 'PreCompact', readonly HookBinding[]>>
 }
 
 export class McpConfigError extends Error {
@@ -303,76 +289,6 @@ function sanitizeStringRecord(value: unknown): Record<string, string> {
   return out
 }
 
-/** Strict `hooks.json` parse. */
-export function parseHooksConfig(raw: string): HooksConfig {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch (error) {
-    throw new McpConfigError('invalid', `hooks.json is not valid JSON: ${String(error)}`)
-  }
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new McpConfigError('invalid', 'hooks.json must be an object')
-  }
-  const record = parsed as Record<string, unknown>
-  for (const key of Object.keys(record)) {
-    if (!['version', 'hooks'].includes(key)) throw new McpConfigError('invalid', `hooks.json: unknown top-level key '${key}'`)
-  }
-  if (record['version'] !== 1) {
-    throw new McpConfigError('invalid', `hooks.json version must be 1, got ${JSON.stringify(record['version'])}`)
-  }
-  const hooksRaw = record['hooks']
-  if (hooksRaw === null || typeof hooksRaw !== 'object' || Array.isArray(hooksRaw)) {
-    throw new McpConfigError('invalid', "'hooks' must be an object keyed by event")
-  }
-  const EVENTS = ['PreToolUse', 'PostToolUse', 'UserPromptSubmit', 'SessionStart', 'SessionEnd', 'PreCompact'] as const
-  const hooks: HooksConfig['hooks'] = {}
-  for (const [event, bindingsRaw] of Object.entries(hooksRaw as Record<string, unknown>)) {
-    if (!(EVENTS as readonly string[]).includes(event)) {
-      throw new McpConfigError('invalid', `unknown hook event '${event}'`)
-    }
-    if (!Array.isArray(bindingsRaw)) {
-      throw new McpConfigError('invalid', `hooks.${event} must be an array`)
-    }
-    const bindings: HookBinding[] = []
-    for (const bindingRaw of bindingsRaw) {
-      if (bindingRaw === null || typeof bindingRaw !== 'object') {
-        throw new McpConfigError('invalid', `hooks.${event} entries must be objects`)
-      }
-      const binding = bindingRaw as Record<string, unknown>
-      for (const key of Object.keys(binding)) {
-        if (!['matcher', 'type', 'command', 'args', 'timeoutMs', 'onFailure'].includes(key)) throw new McpConfigError('invalid', `hooks.${event}: unknown key '${key}'`)
-      }
-      if (binding['type'] !== 'command') {
-        throw new McpConfigError('invalid', `hooks.${event}: only 'command' type is supported in G5`)
-      }
-      if (typeof binding['command'] !== 'string' || binding['command'] === '') {
-        throw new McpConfigError('invalid', `hooks.${event}: 'command' must be a non-empty string`)
-      }
-      if (binding['args'] !== undefined && (!Array.isArray(binding['args']) || !(binding['args'] as unknown[]).every((item) => typeof item === 'string'))) {
-        throw new McpConfigError('invalid', `hooks.${event}: 'args' must be an array of strings`)
-      }
-      if (binding['timeoutMs'] !== undefined && (typeof binding['timeoutMs'] !== 'number' || !Number.isFinite(binding['timeoutMs']) || binding['timeoutMs'] <= 0)) {
-        throw new McpConfigError('invalid', `hooks.${event}: 'timeoutMs' must be a finite positive number`)
-      }
-      if (binding['onFailure'] !== 'deny' && binding['onFailure'] !== 'allow') {
-        throw new McpConfigError('invalid', `hooks.${event}: 'onFailure' must be deny|allow`)
-      }
-      bindings.push({
-        matcher: typeof binding['matcher'] === 'string' ? binding['matcher'] : '*',
-        type: 'command',
-        command: binding['command'],
-        ...(Array.isArray(binding['args']) ? { args: binding['args'] as string[] } : {}),
-        ...(typeof binding['timeoutMs'] === 'number' ? { timeoutMs: binding['timeoutMs'] } : {}),
-        onFailure: binding['onFailure'],
-      })
-    }
-    hooks[event as (typeof EVENTS)[number]] = bindings
-  }
-  return { version: 1, hooks }
-}
-
-
 /** Explicit Claude `.mcp.json` import: provenance recorded, every server disabled (never spawned). */
 export function importClaudeMcp(raw: string): McpConfig {
   let parsed: unknown
@@ -441,7 +357,7 @@ export function importCodexMcp(toml: string, sourceVersion: string): McpConfig {
   return parseMcpConfig(JSON.stringify({ version: 1, servers }))
 }
 
-/** Workspace-scoped G5 config store: mcp.json / hooks.json / secrets.json. */
+/** Workspace-scoped G5 config store: mcp.json / secrets.json (hooks live in settings.json, see hooks/settings.ts). */
 export class McpConfigStore {
   constructor(private readonly home: string) {}
 
@@ -451,10 +367,6 @@ export class McpConfigStore {
 
   mcpPath(workspaceId: string): string {
     return path.join(this.workspaceDir(workspaceId), 'mcp.json')
-  }
-
-  hooksPath(workspaceId: string): string {
-    return path.join(this.workspaceDir(workspaceId), 'hooks.json')
   }
 
   secretsPath(workspaceId: string): string {
@@ -471,17 +383,6 @@ export class McpConfigStore {
   async saveMcp(workspaceId: string, config: McpConfig): Promise<void> {
     await fs.mkdir(this.workspaceDir(workspaceId), { recursive: true })
     await replaceFileAtomic(this.mcpPath(workspaceId), `${JSON.stringify(config, null, 2)}\n`)
-  }
-
-  async loadHooks(workspaceId: string): Promise<HooksConfig> {
-    const raw = await readOptionalText(this.hooksPath(workspaceId))
-    if (raw === undefined) return { version: 1, hooks: {} }
-    return parseHooksConfig(raw)
-  }
-
-  async saveHooks(workspaceId: string, config: HooksConfig): Promise<void> {
-    await fs.mkdir(this.workspaceDir(workspaceId), { recursive: true })
-    await replaceFileAtomic(this.hooksPath(workspaceId), `${JSON.stringify(config, null, 2)}\n`)
   }
 
   /**

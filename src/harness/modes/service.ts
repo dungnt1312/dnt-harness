@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
 import { BUNDLED_MODES, DEFAULT_MODE_ID, KNOWN_MODE_TOOLS } from './bundled.ts'
-import { ModeError, type ModeDefinition, type ModeFrontmatter, type ModeSources, type ResolvedMode } from './types.ts'
+import { ModeError, type McpExposure, type ModeDefinition, type ModeFrontmatter, type ModeSources, type ResolvedMode } from './types.ts'
 
 export { BUNDLED_MODES, DEFAULT_MODE_ID }
 export { ModeError }
@@ -285,7 +285,7 @@ export class ModesService {
 /** The exact frontmatter keys a mode file may carry. */
 const KNOWN_FRONTMATTER_KEYS = new Set([
   'name', 'description', 'history', 'workspaceInstructions', 'skills',
-  'memoryPinned', 'memoryRetrieval', 'toolExposure', 'permissionDefaults', 'outOfGrant',
+  'memoryPinned', 'memoryRetrieval', 'toolExposure', 'permissionDefaults', 'outOfGrant', 'mcpExposure',
 ])
 
 /**
@@ -323,6 +323,12 @@ export function parseModeFile(id: string, raw: string): ModeDefinition {
     invalid.push("'name' must be a string")
   }
   const name = typeof frontmatter.name === 'string' && frontmatter.name.trim() !== '' ? frontmatter.name.trim() : id
+  if (frontmatter.description !== undefined && typeof frontmatter.description !== 'string') {
+    invalid.push("'description' must be a string")
+  }
+  const description = typeof frontmatter.description === 'string' && frontmatter.description.trim() !== ''
+    ? frontmatter.description.trim()
+    : undefined
 
   let history: ModeSources['history'] = 'recent'
   if (frontmatter.history !== undefined) {
@@ -395,17 +401,25 @@ export function parseModeFile(id: string, raw: string): ModeDefinition {
     else invalid.push(`'outOfGrant' must be allow|ask, got ${JSON.stringify(frontmatter.outOfGrant)}`)
   }
 
+  let mcpExposure: McpExposure | undefined
+  if (frontmatter.mcpExposure !== undefined) {
+    if (frontmatter.mcpExposure === 'none' || frontmatter.mcpExposure === 'read-safe' || frontmatter.mcpExposure === 'all') mcpExposure = frontmatter.mcpExposure
+    else invalid.push(`'mcpExposure' must be none|read-safe|all, got ${JSON.stringify(frontmatter.mcpExposure)}`)
+  }
+
   if (invalid.length > 0) {
     throw new ModeError('invalid', `mode '${id}' is invalid: ${invalid.join('; ')}`)
   }
   return {
     id,
     name,
+    ...(description !== undefined ? { description } : {}),
     instructions: body.trim(),
     sources,
     toolExposure,
     permissionDefaults,
     ...(outOfGrant !== undefined ? { outOfGrant } : {}),
+    ...(mcpExposure !== undefined ? { mcpExposure } : {}),
   }
 }
 
@@ -429,12 +443,15 @@ function parseFrontmatter(block: string): ModeFrontmatter {
 
 /** Serialize a definition back to canonical Markdown/frontmatter form. */
 export function serializeModeFile(definition: ModeDefinition): string {
-  const fm: string[] = [`name: ${JSON.stringify(definition.name)}`, `history: ${definition.sources.history}`,
+  const fm: string[] = [`name: ${JSON.stringify(definition.name)}`,
+    ...(definition.description !== undefined ? [`description: ${JSON.stringify(definition.description)}`] : []),
+    `history: ${definition.sources.history}`,
     `workspaceInstructions: ${definition.sources.workspaceInstructions}`, `skills: ${definition.sources.skills}`,
     `memoryPinned: ${definition.sources.memoryPinned}`, `memoryRetrieval: ${definition.sources.memoryRetrieval}`,
     `toolExposure: ${JSON.stringify(definition.toolExposure)}`,
     `permissionDefaults: ${JSON.stringify(definition.permissionDefaults)}`,
-    ...(definition.outOfGrant !== undefined ? [`outOfGrant: ${definition.outOfGrant}`] : [])]
+    ...(definition.outOfGrant !== undefined ? [`outOfGrant: ${definition.outOfGrant}`] : []),
+    ...(definition.mcpExposure !== undefined ? [`mcpExposure: ${definition.mcpExposure}`] : [])]
   return `---\n${fm.join('\n')}\n---\n\n${definition.instructions.trim()}\n`
 }
 

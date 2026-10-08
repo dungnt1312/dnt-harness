@@ -105,8 +105,10 @@ describe('production conversation workflows', () => {
       { type: 'turn/start', seq: 3, turnId: 't2' },
       { type: 'user/message', seq: 4, turnId: 't2', inputId: 's', content: 'Do this instead' },
     ])
-    expect(done[0]).toMatchObject({ kind: 'user', queued: false })
-    expect(done[0]).not.toHaveProperty('steer')
+    // The claimed steer opens the turn it runs: after the stopped turn's status.
+    expect(done.map((item) => item.kind)).toEqual(['status', 'user'])
+    expect(done.at(-1)).toMatchObject({ kind: 'user', queued: false })
+    expect(done.at(-1)).not.toHaveProperty('steer')
     expect(taskPhase([{ type: 'turn/start', seq: 0 }, { type: 'turn/end', seq: 1, reason: 'steered' }])).toBe('steered')
   })
   it.each(['completed', 'failed', 'interrupted', 'cancelled', 'steered', 'limit', 'empty', 'rejected'] as const)('preserves durable terminal reason %s', (reason) => {
