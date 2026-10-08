@@ -85,4 +85,12 @@ Ruling/cost: không remount theo `rootProjectId` để tránh reset brief/model 
 ## Concerns
 
 - Không còn concern mở trong scope round 2.
-- Không chạy full repository suite; round 2 bounded theo mounted suite + typecheck. Regression rộng/build đã PASS ở round 1.
+- Controller đã chạy kiểm chứng cuối: typecheck PASS, 13 files / 170 tests PASS, build PASS.
+- Full suite: 2361 passed, 4 failed, 1 skipped. `product-copy` lỗi `Toast.tsx:102` tái hiện trên baseline e4cb0b2. Hai tests server-g1 và một test server-g5 fail trong full parallel run nhưng cả hai files pass khi rerun trên baseline và feature HEAD; nguyên nhân timing chưa được chứng minh.
+- Review độc lập toàn feature + scoped re-review: 9 findings đã đóng; round 2 PASS, không phát hiện breakage mới.
+
+Task 1: complete (commits e4cb0b2..f0debac, review clean; full-suite baseline failure remains).
+
+Ruling: Giữ branch/worktree, không merge/push/deploy và không sửa test/product code ngoài feature để làm full suite xanh — user yêu cầu không hỏi lại, chưa ủy quyền integration; cost nếu sai: tính năng chưa xuất hiện trong app đang chạy và cần integration riêng.
+
+Ruling: Giữ artifacts trong plans thay vì xóa ledger — user có thể kiểm chứng quyết định và logs; cost nếu sai: thêm tài liệu vận hành vào branch, không ảnh hưởng runtime.
