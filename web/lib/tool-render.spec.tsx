@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { ActivityBlock, ToolCard, summarizeActivity } from '../components/chat/MessageParts.tsx'
+import { finalProgram } from './tool-facts.ts'
 import { ApprovalBar } from '../components/chat/ApprovalBar.tsx'
 import { formatElapsed } from './format.ts'
 import { isDenied, toolFacts } from './tool-facts.ts'
@@ -69,6 +70,11 @@ describe('digest per tool', () => {
     expect(facts('Glob', { pattern: '*' }, `a.ts\n${note}`).digest).toBe('1 file · search incomplete')
     expect(facts('Glob', { pattern: '*' }, `a.ts\n… [+5 more matches]\n${note}`).digest).toBe('1 of 6 files · search incomplete')
     expect(facts('Grep', { pattern: 'x' }, `a.ts:1: x\n${note}`).digest).toBe('1 match · search incomplete')
+  })
+  it('counts only whole displayed rows with recomputed omission counts and compact completeness notes', () => {
+    expect(facts('Glob', { pattern: '*' }, 'file-000.ts\n… [+104 more matches]').digest).toBe('1 of 105 files')
+    expect(facts('Glob', { pattern: '*' }, '… [+105 more matches]\n… [search incomplete: partial]').digest).toBe('search incomplete')
+    expect(facts('Grep', { pattern: 'x' }, '… [output truncated]\n… [search incomplete: partial]').digest).toBe('search incomplete')
   })
   it('recognizes output truncation notes without counting them as hits', () => {
     expect(facts('Glob', { pattern: '*' }, 'a.ts\n… [output truncated]').digest).toBe('1 file · truncated')
@@ -143,6 +149,21 @@ describe('run summary', () => {
     const denied = summarizeActivity(run(row('c', 'Bash', { command: 'rm -rf /' }, { ok: false, output: 'denied: guard' })))
     expect(denied.problems).toBe(0)
     expect(denied.state).toBe('denied')
+  })
+  it('does not count an exit 1 that answers: grep found nothing, diff found a difference', () => {
+    const grepNone = summarizeActivity(run(row('c', 'Bash', { command: 'ls tests | grep -i "g4\\|agent\\|child"' }, { ok: true, output: '[exit code: 1]' })))
+    expect(grepNone.problems).toBe(0)
+    expect(grepNone.state).toBe('ok')
+    expect(summarizeActivity(run(row('c', 'Bash', { command: 'git diff --no-index a b 2>&1 | diff - c' }, { ok: true, output: '< x\n[exit code: 1]' }))).problems).toBe(0)
+    // Exit 2 from grep is a real error; exit 1 from anything else still fails.
+    expect(summarizeActivity(run(row('c', 'Bash', { command: 'grep x missing.txt' }, { ok: true, output: 'no such file\n[exit code: 2]' }))).problems).toBe(1)
+    expect(summarizeActivity(run(row('c', 'Bash', { command: 'grep x a | npm test' }, { ok: true, output: '[exit code: 1]' }))).problems).toBe(1)
+  })
+  it('reads the program that decides the exit', () => {
+    expect(finalProgram('cd x && grep -n "a\\|b" f | head; ls t | grep -i "g4|agent"')).toBe('grep')
+    expect(finalProgram('npm test 2>&1')).toBe('npm')
+    expect(finalProgram('FOO=1 sudo /usr/bin/diff a b')).toBe('diff')
+    expect(finalProgram('grep x a; npm test')).toBe('npm')
   })
   it('still counts a tool that really failed', () => {
     expect(summarizeActivity(run(row('c', 'Read', { path: 'zz.ts' }, { ok: false, output: 'no such file' }))).problems).toBe(1)
@@ -409,9 +430,10 @@ describe('a run reads as one line of work', () => {
     expect(header().textContent).toContain('2 files')
     expect(header().textContent).toContain('+8')
   })
-  it('stays open and says how many failed, while a refusal is only "not run"', async () => {
+  it('folds a settled failure but says how many failed, while a refusal is only "not run"', async () => {
     await mount(block([read('a'), read('b'), bash('c', '1 failing\n[exit code: 1]'), read('d')]))
-    expect(header().getAttribute('aria-expanded')).toBe('true')
+    // Settled: folded, the red count is what admits it.
+    expect(header().getAttribute('aria-expanded')).toBe('false')
     expect(header().textContent).toContain('1 failed')
     await act(async () => root!.unmount())
     host.remove()
@@ -423,11 +445,47 @@ describe('a run reads as one line of work', () => {
   })
   it('keeps the row icons inside: every row reads on its own, rail or not', async () => {
     await mount(block([grep('a'), grep('b'), bash('c', '1 failing\n[exit code: 1]'), grep('d')]))
+    await act(async () => header().click())
     const body = document.getElementById(header().getAttribute('aria-controls')!)!
     expect(body.className).toContain('border-l')
     const rows = [...body.querySelectorAll('button[aria-expanded]')]
     expect(rows.length).toBe(4)
     for (const line of rows) expect(line.firstElementChild?.tagName.toLowerCase()).toBe('svg')
+  })
+})
+
+describe('a run that keeps working, counted honestly', () => {
+  const Run = ({ items, turnOpen }: { items: ToolItem[]; turnOpen?: boolean }) => (
+    <ActivityBlock items={items} {...(turnOpen !== undefined ? { turnOpen } : {})}>{items.map((item) => <ToolCard key={item.call.id} item={item} />)}</ActivityBlock>
+  )
+  const header = () => host.querySelector('button')!
+  const settled = (): ToolItem[] => [read('a'), read('b'), read('c'), row('d', 'Bash', { command: 'ls' }, { ok: true, output: 'x\n[exit code: 0]' })]
+  it('reads as Working and stays open between steps while its turn is open', async () => {
+    await mount(<Run items={settled()} turnOpen />)
+    expect(header().textContent).toContain('Working')
+    expect(header().getAttribute('aria-expanded')).toBe('true')
+  })
+  it('folds once the turn closes', async () => {
+    await mount(<Run items={settled()} turnOpen />)
+    await rerender(<Run items={settled()} turnOpen={false} />)
+    expect(header().textContent).toContain('Activity')
+    expect(header().getAttribute('aria-expanded')).toBe('false')
+  })
+  it('counts files once however many windows were read', () => {
+    const window = (id: string, offset: number): ToolItem => row(id, 'Read', { path: 'src/x.ts', offset, limit: 10 }, { ok: true, output: 'a' })
+    const summary = summarizeActivity([window('a', 1), window('b', 20), window('c', 40), read('d')])
+    expect(summary.text).toBe('2 files')
+    expect(summary.steps).toBe(4)
+  })
+  it('counts a retrieval MCP tool as a search, an opaque one as a tool', () => {
+    const mcp = (id: string, name: string): ToolItem => row(id, name, { q: 'x' }, { ok: true, output: 'a' })
+    expect(summarizeActivity([mcp('a', 'mcp__codebase-retrieval__codebase-retrieval')]).text).toBe('1 search')
+    expect(summarizeActivity([mcp('a', 'mcp__github__create_issue')]).text).toBe('1 tool')
+  })
+  it('does not fold three steps behind a summary because an audit note rode along', async () => {
+    const items = [read('a'), read('b'), read('c'), { kind: 'audit' as const, icon: 'allow' as const, text: 'Allowed · Read' }]
+    await mount(<ActivityBlock items={items}>{items.map((item, index) => <span key={index}>row</span>)}</ActivityBlock>)
+    expect(host.querySelector('button[aria-expanded]')).toBeNull()
   })
 })
 
@@ -452,5 +510,24 @@ describe('todowrite rows', () => {
   it('keeps the failure excerpt on a failed call', () => {
     const failed = toolFacts({ id: 't1', name: 'TodoWrite', args: { todos } }, { ok: false, output: 'error: every todo needs non-empty …' })
     expect(failed.digestFailed).toBe(true)
+  })
+})
+
+describe('agent wait rows', () => {
+  it('says how many waits a folded row stands for and what the newest one came back with', async () => {
+    const output = JSON.stringify({ children: [{ status: 'running' }], note: 'still running after the timeout; call wait again' })
+    await mount(<ToolCard item={row('w', 'Agent', { action: 'wait' }, { ok: true, output })} repeats={9} />)
+    const text = host.querySelector('button')?.textContent ?? ''
+    expect(text).toContain('wait · 9 times')
+    expect(text).toContain('1 running')
+  })
+  it('counts a spawn as an agent and waits as waits in a run summary', () => {
+    const summary = summarizeActivity([
+      row('s', 'Agent', { action: 'spawn', definition: 'reviewer' }, { ok: true, output: '{"status":"running"}' }),
+      row('w1', 'Agent', { action: 'wait' }, { ok: true, output: '{"children":[]}' }),
+      row('w2', 'Agent', { action: 'wait' }, { ok: true, output: '{"children":[]}' }),
+      row('l', 'Agent', { action: 'list' }, { ok: true, output: '{"children":[]}' }),
+    ])
+    expect(summary.text).toBe('1 agent, 2 waits, 1 tool')
   })
 })

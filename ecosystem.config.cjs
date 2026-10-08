@@ -12,7 +12,13 @@
  *                              should answer to, e.g. a LAN IP or reverse-proxy
  *                              hostname. Loopback and the bind host are always
  *                              allowed.
+ *
+ * These may also live in a `.env` file next to this config (gitignored); real
+ * environment variables win over values from the file.
  */
+const envFile = require('node:path').join(__dirname, '.env')
+if (require('node:fs').existsSync(envFile)) process.loadEnvFile(envFile)
+
 const port = process.env.PORT || '3082'
 const allowedHosts = (process.env.DNT_HARNESS_ALLOWED_HOSTS || '').trim()
 

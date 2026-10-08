@@ -10,7 +10,7 @@ export interface ToolCall {
 }
 
 export type McpOutcome = 'success' | 'error' | 'indeterminate' | 'audit_fault'
-export type InputOutcome = 'admitted' | 'rejected' | 'empty'
+export type InputOutcome = 'admitted' | 'rejected' | 'empty' | 'withdrawn'
 
 const MCP_OUTCOMES: ReadonlySet<string> = new Set<McpOutcome>(['success', 'error', 'indeterminate', 'audit_fault'])
 /** Narrows the shared `outcome` key to a tool-result outcome. */
@@ -47,7 +47,8 @@ export interface SseEvent {
    * must not be retried automatically. `audit_fault` means the known outcome
    * could not be durably recorded and further MCP dispatch is blocked.
    * `input/settled`: whether the accepted input reached the model —
-   * `admitted`, or `rejected`/`empty` (never logged as a user/message).
+   * `admitted`, or `rejected`/`empty` (never logged as a user/message), or
+   * `withdrawn` (the user deleted it from the queue).
    */
   readonly outcome?: McpOutcome | InputOutcome
   /** MCP invocation id. A manual repeat is a new invocation. */
@@ -57,6 +58,8 @@ export interface SseEvent {
   readonly clientRequestId?: string
   /** `input/queued`: set when the input was sent with Steer. */
   readonly delivery?: 'steer'
+  /** `input/queued`: the host found the session idle and starts a turn for it now. */
+  readonly runsNow?: true
   /** Files the user attached to this input (references, never bytes). */
   readonly attachments?: readonly AttachmentRef[]
   /**
@@ -171,7 +174,7 @@ export interface ContextManifestView {
     readonly toolNames: readonly string[]
     readonly toolSchemas: number
     /** Present when the request ran as a child role. */
-    readonly child?: { readonly definition: string; readonly instructionsHash: string; readonly source?: 'bundled' | 'workspace' }
+    readonly child?: { readonly definition: string; readonly instructionsHash: string; readonly source?: 'bundled' | 'user' | 'workspace' | 'project' }
     /** Inherited parent context the request carried (absent when dropped). */
     readonly parentContext?: { readonly hash: string; readonly chars: number }
   }
@@ -451,12 +454,22 @@ export interface AgentDefinitionRow {
     readonly disallowedTools: readonly string[]
     readonly skills?: readonly string[]
     readonly model?: string
-    readonly maxTurns?: number
-    /** dnt-harness native: `false` refuses inherited parent context. */
-    readonly inheritable?: boolean
+    /** Claude fields recognized but not enforced by dnt-harness. */
+    readonly unsupported?: readonly string[]
+    /** Tools the file named that dnt-harness does not provide. */
+    readonly droppedTools?: readonly string[]
+    /** `tools` omitted in the file: the role inherits every tool. */
+    readonly inheritsTools?: boolean
+    readonly warnings?: readonly string[]
   }
-  readonly source: 'bundled' | 'workspace'
+  /** What `model:` runs on here: a resolved `provider:model`, or inherit (with what could not be served). */
+  readonly modelResolution?: { readonly resolved?: string; readonly inherit: boolean; readonly unresolved?: string }
+  /** Claude Code layer: bundled < user (~/.claude/agents) < workspace < project (.claude/agents). */
+  readonly source: 'bundled' | 'user' | 'workspace' | 'project'
+  readonly path?: string
   readonly hash?: string
+  /** Lower layers this definition overrides. */
+  readonly overrides?: readonly ('bundled' | 'user' | 'workspace' | 'project')[]
 }
 
 /** One child agent card: runtime status is separate from model claims. */
@@ -511,28 +524,72 @@ export interface McpServerRow {
   readonly revision?: string
   readonly stale?: boolean
   readonly unmatchedAllowlist?: readonly string[]
+  /** Why the last connect failed; the server's tools are skipped until it connects. */
+  readonly lastError?: string
+  /** Discovered tools whose public name LLM providers reject; never sent to the model. */
+  readonly unusableTools?: readonly string[]
+  /** Recent server stderr, secrets masked. */
+  readonly stderrTail?: string
 }
 
-export interface HookBindingRow {
-  readonly matcher: string
+/** One Claude Code hook command (`settings.json` → hooks → Event → group → hooks[]). */
+export interface HookCommandRow {
   readonly type: 'command'
   readonly command: string
-  readonly args?: readonly string[]
-  readonly timeoutMs?: number
-  readonly onFailure: 'deny' | 'allow'
+  /** Seconds (Claude); omitted = 60. */
+  readonly timeout?: number
+}
+
+/** One Claude Code matcher group. */
+export interface HookMatcherGroupRow {
+  /** Regex over the tool name / source / trigger; omitted or `*` matches all. */
+  readonly matcher?: string
+  readonly hooks: readonly HookCommandRow[]
 }
 
 export type HookEvent =
   | 'PreToolUse'
   | 'PostToolUse'
   | 'UserPromptSubmit'
+  | 'Notification'
+  | 'Stop'
+  | 'SubagentStart'
+  | 'SubagentStop'
+  | 'PreCompact'
   | 'SessionStart'
   | 'SessionEnd'
-  | 'PreCompact'
+  | 'PostToolUseFailure'
+  /** Claude event dnt-harness keeps in the file but does not fire yet. */
+  | 'PermissionRequest'
 
-export type HooksConfigRow = {
-  readonly version: 1
-  readonly hooks: Partial<Record<HookEvent, readonly HookBindingRow[]>>
+/** The `hooks` section of a Claude Code settings file. */
+export type HooksSectionRow = Partial<Record<HookEvent, readonly HookMatcherGroupRow[]>>
+
+export interface EffectiveHookRow {
+  readonly id: string
+  readonly event: HookEvent
+  readonly matcher: string
+  readonly command: string
+  readonly timeout?: number
+  readonly layer: 'user' | 'workspace' | 'project' | 'local'
+  readonly source: string
+  /** False when switched off for this workspace. */
+  readonly active: boolean
+  /** False for Claude events dnt-harness does not fire yet. */
+  readonly supported: boolean
+}
+
+/** GET /hooks: the workspace layer plus every layer that applies. */
+export interface HooksConfigRow {
+  /** `<ws>/settings.json` — the layer this editor writes. */
+  readonly file: string
+  readonly hooks: HooksSectionRow
+  readonly disableAllHooks: boolean
+  readonly sources: readonly { readonly layer: 'user' | 'workspace' | 'project' | 'local'; readonly path: string; readonly exists: boolean }[]
+  /** Every configured hook from every layer (active or not). */
+  readonly effective: readonly EffectiveHookRow[]
+  readonly disabled: boolean
+  readonly diagnostics: readonly string[]
 }
 
 export interface SecretRow {
@@ -575,6 +632,8 @@ export interface MemoryEntryRow {
   readonly id: string
   readonly title: string
   readonly pinned: boolean
+  /** Frontmatter `metadata.type`; absent when the file does not declare one. */
+  readonly type?: 'user' | 'feedback' | 'project' | 'reference'
   readonly createdAt: number
   readonly updatedAt: number
   readonly body: string
@@ -615,3 +674,22 @@ export type TerminalFrame =
   | { readonly kind: 'created'; readonly terminal: TerminalRow }
   | { readonly kind: 'data'; readonly terminalId: string; readonly data: string }
   | { readonly kind: 'exit'; readonly terminalId: string; readonly exitCode: number; readonly reason: 'exit' | 'killed' | 'idle' }
+
+/** One host-local day's tokens for one model (`GET /api/usage`). */
+export interface UsageDayRow {
+  readonly date: string
+  readonly model: string
+  /** Prompt tokens, cached ones included. */
+  readonly input: number
+  readonly cached: number
+  readonly output: number
+  readonly requests: number
+}
+
+export interface UsageDailyResponse {
+  readonly days: readonly UsageDayRow[]
+  readonly longestSessionMs: number
+  readonly firstRecordAt?: number
+  /** Host-local `YYYY-MM-DD` of now. */
+  readonly today: string
+}

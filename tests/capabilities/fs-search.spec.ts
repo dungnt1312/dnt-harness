@@ -1,8 +1,11 @@
 import { promises as fs, type Dirent } from 'node:fs'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { globTool, grepTool } from '../../src/capabilities/fs/tools.ts'
+import { searchOutput } from '../../src/capabilities/fs/search.ts'
 
 let root: string
 beforeEach(async () => { root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-search-')) })
@@ -24,6 +27,23 @@ function hugeSnapshot() {
 }
 
 describe('search reliability', () => {
+  it('settles adversarial supported wildcards without blocking the host', async () => {
+    await put(`${'a'.repeat(40)}.ts`)
+    const module = fileURLToPath(new URL('../../src/capabilities/fs/tools.ts', import.meta.url))
+    const code = `import(${JSON.stringify(module)}).then(async ({globTool}) => console.log(await globTool().execute({pattern:${JSON.stringify('*a'.repeat(18) + 'b')}},{root:${JSON.stringify(root)}})))`
+    const run = spawnSync(process.execPath, ['--import', 'tsx', '-e', code], { timeout: 2500, encoding: 'utf8' })
+    expect(run.error?.message).toBeUndefined()
+    expect(run.status).toBe(0)
+    expect(run.stdout.trim()).toBe('no matches')
+  })
+
+  it('preserves wildcard semantics for empty spans, multiple stars, literals and Unicode', async () => {
+    for (const name of ['ab.ts', 'axxb.ts', 'axb.jsx', 'a+b.ts', 'đề-mục.ts']) await put(name)
+    expect((await glob('a**b.ts')).split('\n').sort()).toEqual(['a+b.ts', 'ab.ts', 'axxb.ts'])
+    expect(await glob('a+b.*')).toBe('a+b.ts')
+    expect(await glob('*mục.ts')).toBe('đề-mục.ts')
+    expect(await glob('*a*a*a*a*b*.ts')).toBe('no matches')
+  })
   it('does not traverse irrelevant subtrees for shallow, exact or literal-prefix globs', async () => {
     await put('.superpowers/a.txt')
     await put('README.md')
@@ -83,6 +103,19 @@ describe('search reliability', () => {
     expect(await glob('*.log', { path: 'src' })).toBe('no matches')
   })
 
+  it('isolates ignored-directory overrides across alternatives, independent of branch order', async () => {
+    await put('.gitignore', 'snapshots/\nnode_modules/\n*.log\n')
+    await put('snapshots/a.ts'); await put('snapshots/b.ts'); await put('snapshots/debug.log')
+    await put('src/c.ts'); await put('node_modules/pkg/a.ts'); await put('node_modules/pkg/b.ts')
+    for (const pattern of ['{snapshots/a.ts,**/*.ts}', '{**/*.ts,snapshots/a.ts}', '{snapshots/a.ts,**/*.ts,snapshots/a.ts}']) {
+      expect((await glob(pattern)).split('\n')).toEqual(['snapshots/a.ts', 'src/c.ts'])
+    }
+    expect((await glob('{node_modules/pkg/a.ts,**/*.ts}')).split('\n')).toEqual(['node_modules/pkg/a.ts', 'src/c.ts'])
+    expect((await glob('{snapshots/*.ts,**/*.ts}')).split('\n')).toEqual(['snapshots/a.ts', 'snapshots/b.ts', 'src/c.ts'])
+    expect((await glob('{snapshots/a.ts,**/*.ts}', { includeIgnored: true })).split('\n')).toContain('snapshots/b.ts')
+    expect(await glob('{snapshots/a.ts,**/*.ts}', {}, { deniedRoots: [path.join(root, 'snapshots')] })).toBe('src/c.ts')
+  })
+
   it('keeps descendant file rules when entering an ignored scope, and honors directory negation semantics', async () => {
     await put('.gitignore', 'snapshots/\n*.log\ncache/*\n!cache/keep/\n')
     await put('snapshots/a.ts'); await put('snapshots/debug.log')
@@ -128,6 +161,41 @@ describe('search reliability', () => {
     expect(await grep('absent')).toContain('search incomplete: walk budget exhausted')
     const found = await grep('needle')
     expect(found).toContain('!first.ts:1: needle'); expect(found).toContain('search incomplete:')
+  })
+
+  it('emits only whole result lines and keeps completeness metadata within the output cap', () => {
+    const rows = ['src/' + 'long-name'.repeat(20) + '.ts', 'src/other.ts']
+    for (const limit of [64, 80, 160, 512]) {
+      for (const incomplete of [new Set<string>(), new Set(['walk budget exhausted']), new Set(['very long reason '.repeat(50)])]) {
+        const output = searchOutput(rows, incomplete, limit)
+        expect(output.length).toBeLessThanOrEqual(limit)
+        for (const line of output.split('\n').filter((line) => !line.startsWith('… ['))) expect(rows).toContain(line)
+        if (incomplete.size) expect(output).toContain('search incomplete:')
+        if (!output.includes(rows[0]!)) expect(output).toContain('output truncated')
+      }
+    }
+    const combined = searchOutput(rows, new Set(['walk budget exhausted']), 64, {
+      notes: ['… [more matches truncated]', '… [7 file(s) over 16 MiB not searched]'],
+    })
+    expect(combined.length).toBeLessThanOrEqual(64)
+    expect(combined).toContain('search incomplete:')
+    expect(combined.split('\n').filter((line) => line === '… [output truncated]')).toHaveLength(1)
+    for (const limit of [0, 10, 63, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => searchOutput(rows, new Set(), limit)).toThrow(/output.*limit.*64/i)
+    }
+  })
+
+  it('recomputes omitted Glob matches after output pruning and never emits a partial Grep row', async () => {
+    const names = Array.from({ length: 105 }, (_, i) => `file-${String(i).padStart(3, '0')}-${'x'.repeat(60)}.ts`)
+    for (const name of names) await put(name, 'needle ' + 'y'.repeat(500))
+    const output = await glob('*.ts', {}, { outputLimit: 160 })
+    const shown = output.split('\n').filter((line) => !line.startsWith('… ['))
+    expect(output.length).toBeLessThanOrEqual(160)
+    for (const line of shown) expect(names).toContain(line)
+    expect(output).toContain(`… [+${105 - shown.length} more matches]`)
+    const hits = await grep('needle', {}, { outputLimit: 64 })
+    expect(hits).toBe('… [output truncated]')
+    await expect(glob('*', {}, { outputLimit: 10 })).rejects.toThrow(/output.*limit.*64/i)
   })
 
   it('reports unreadable directories rather than an exhaustive no matches', async () => {

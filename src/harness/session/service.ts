@@ -5,6 +5,7 @@ import {
   newSessionId,
   type InputId,
   type SessionId,
+  type StepId,
   type WorkspaceId,
 } from '../../util/brand.ts'
 import type { AttachmentRef } from '../attachments/store.ts'
@@ -412,6 +413,10 @@ export class SessionsService extends Service {
           content: event.content,
           ...(event.attachments !== undefined ? { attachments: event.attachments } : {}),
         })
+      } else if (event.type === 'input/revised') {
+        const index = queued.findIndex((item) => item.inputId === event.inputId)
+        const prior = queued[index]
+        if (prior !== undefined) queued[index] = { ...prior, content: event.content }
       } else if (event.type === 'user/message' && event.inputId !== undefined) {
         consumed.add(event.inputId)
       } else if (event.type === 'input/settled') {
@@ -425,14 +430,17 @@ export class SessionsService extends Service {
 
   /**
    * Recovery after a restart: close open turns as `interrupted`, synthesize
-   * explicitly identified unknown-outcome records for tool calls whose
-   * results never landed, and invalidate undecided approvals. Everything is
-   * a durable append; nothing is replayed.
+   * explicitly identified unknown-outcome records for recorded tool calls and
+   * never-started results for declarations without calls, and invalidate
+   * undecided approvals. Everything is a durable append; nothing is replayed.
    */
   private async recover(session: Session): Promise<void> {
     const openTurns = new Set<string>()
     const unansweredByExecution = new Map<string, Extract<SessionEvent, { type: 'tool/call' }>>()
     const unansweredLegacy = new Map<string, Extract<SessionEvent, { type: 'tool/call' }>[]>()
+    const declared = new Map<string, { stepId: StepId; callId: string }>()
+    const answered = new Set<string>()
+    const callKey = (stepId: string, callId: string): string => `${stepId}\u0000${callId}`
     const decided = new Set<string>()
     let currentTurn: string | undefined
     const legacyKey = (turnId: string | undefined, stepId: string, callId: string): string =>
@@ -451,6 +459,11 @@ export class SessionsService extends Service {
           openTurns.delete(event.turnId)
           if (currentTurn === event.turnId) currentTurn = undefined
           break
+        case 'assistant/message':
+          for (const call of event.toolCalls ?? []) {
+            declared.set(callKey(event.stepId, call.id), { stepId: event.stepId, callId: call.id })
+          }
+          break
         case 'tool/call':
           if (event.executionId !== undefined) {
             unansweredByExecution.set(event.executionId, event)
@@ -462,6 +475,7 @@ export class SessionsService extends Service {
           }
           break
         case 'tool/result':
+          answered.add(callKey(event.stepId, event.callId))
           if (event.executionId !== undefined) {
             unansweredByExecution.delete(event.executionId)
           } else {
@@ -491,6 +505,21 @@ export class SessionsService extends Service {
         callId: event.call.id,
         ok: false,
         output: `recovery: outcome unknown — the host was interrupted after this call was recorded; inspect actual state before retrying`,
+        recovery: true,
+      })
+      answered.add(callKey(event.stepId, event.call.id))
+    }
+    // A durable assistant batch may outlive a crash before preparation or
+    // between calls. Complete its model-visible replies without claiming that
+    // these unrecorded calls crossed the side-effect boundary.
+    for (const [key, call] of declared) {
+      if (answered.has(key)) continue
+      session.append({
+        type: 'tool/result',
+        stepId: call.stepId,
+        callId: call.callId,
+        ok: false,
+        output: 'recovery: call never started — the host was interrupted before it ran',
         recovery: true,
       })
     }

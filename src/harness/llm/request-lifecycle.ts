@@ -134,6 +134,7 @@ export async function* runAttempt(provider: { stream(request: ModelRequest, opti
   let timer: ReturnType<typeof setTimeout> | undefined
   let settled = false
   let cleanupUnknown = false
+  let attemptFailed = false
   let reconcile: (() => void) | undefined
   let resolveSettlement!: () => void
   const settlement = new Promise<void>(resolve => { resolveSettlement = resolve })
@@ -177,6 +178,7 @@ export async function* runAttempt(provider: { stream(request: ModelRequest, opti
     }
     await notify('end')
   } catch (caught) {
+    attemptFailed = true
     const error = controller.signal.aborted ? controller.signal.reason as ProviderError : caught instanceof ProviderError ? caught : classifyTransport(caught, 'stream')
     cleanupUnknown = caught instanceof ProviderError && !caught.transportSettled
     // A timed-out read is not settled merely because return() resolves.
@@ -230,10 +232,19 @@ export async function* runAttempt(provider: { stream(request: ModelRequest, opti
         released = true; admission.uncertain.delete(id); ownedTicket.release()
         void notify('reconciled').catch(() => { /* canonical store surfaces poisoning; local settlement remains verified */ })
       }
-      await notify('uncertain')
-      if (settled) reconcile()
-      if (!pending && !cleanupUnknown && iterator.return) {
-        void Promise.resolve(iterator.return()).then(result => { if (result.done) onTransportSettled() }, () => {})
+      try {
+        await notify('uncertain')
+      } catch (error) {
+        // Do not replace the attempt (or canonical end-record) failure already
+        // propagating. A consumer return still surfaces a canonical sink failure.
+        if (!attemptFailed) throw error
+      } finally {
+        if (settled) reconcile()
+        if (!pending && !cleanupUnknown && iterator.return) {
+          try {
+            void Promise.resolve(iterator.return()).then(result => { if (result.done) onTransportSettled() }, () => {})
+          } catch { /* failed cleanup is not settlement and must not mask the attempt failure */ }
+        }
       }
     }
   }

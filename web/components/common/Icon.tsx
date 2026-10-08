@@ -261,6 +261,16 @@ const PATHS: Readonly<Record<string, ReactNode>> = {
       <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1z" />
     </>
   ),
+  grip: (
+    <>
+      <circle cx="9" cy="6" r="1.3" fill="currentColor" strokeWidth={0} />
+      <circle cx="15" cy="6" r="1.3" fill="currentColor" strokeWidth={0} />
+      <circle cx="9" cy="12" r="1.3" fill="currentColor" strokeWidth={0} />
+      <circle cx="15" cy="12" r="1.3" fill="currentColor" strokeWidth={0} />
+      <circle cx="9" cy="18" r="1.3" fill="currentColor" strokeWidth={0} />
+      <circle cx="15" cy="18" r="1.3" fill="currentColor" strokeWidth={0} />
+    </>
+  ),
   dots: (
     <>
       <circle cx="5" cy="12" r="1.4" fill="currentColor" strokeWidth={0} />
@@ -367,6 +377,13 @@ const PATHS: Readonly<Record<string, ReactNode>> = {
       <path d="m9 12 2 2 4-4" />
     </>
   ),
+  user: (
+    <>
+      <circle cx="12" cy="8" r="4" />
+      <path d="M20 21a8 8 0 0 0-16 0" />
+    </>
+  ),
+  bookmark: <path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z" />,
 }
 
 export type IconName = keyof typeof PATHS

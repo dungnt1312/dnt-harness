@@ -21,7 +21,8 @@ src/harness/
 ├── memory/    Workspace/project Markdown topic files + MEMORY.md indexes
 ├── agents/    Definitions, bounded one-level delegation, Claude/Codex adapters
 ├── mcp/       MCP client (stdio + Streamable HTTP), config/secrets, health/retry/breaker
-├── hooks/     Command hook runner behind the tool-gate waterfalls
+├── hooks/     Claude Code hooks: settings.json layers, shell runner, verdicts
+├── instructions/ CLAUDE.md layers + @imports
 └── limits.ts  Centralized bounded-execution defaults
 ```
 
@@ -53,6 +54,8 @@ approval/request    a pending approval question, recorded durably (out-of-grant
                     questions also carry `scopeWarning` and `proposedGrant`)
 approval/decision   its settlement: allow | deny | expired | cancelled | invalidated
 input/queued        a pending input waiting for the current turn to close
+                    (`runsNow: true` when the host dispatches a turn for it
+                    at once because the session was idle)
 session/title       derived or custom session title
 session/project     session project binding
 session/model       the session's model preference (provider/model/thinkingLevel;

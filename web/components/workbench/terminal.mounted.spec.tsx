@@ -248,6 +248,16 @@ describe('terminal panel', () => {
     expect(onHide).toHaveBeenCalledTimes(1)
   })
 
+  it('closes the footer at once when the last tab is killed, without the exit-notice delay', async () => {
+    const onHide = vi.fn()
+    await mount({ onHide })
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+    await act(async () => push({ kind: 'created', terminal: row('terminal-1') }))
+
+    await act(async () => push({ kind: 'exit', terminalId: 'terminal-1', exitCode: 0, reason: 'killed' }))
+    expect(onHide).toHaveBeenCalledTimes(1)
+  })
+
   it('closes the footer itself once the last shell exits, but stays for a fresh one', async () => {
     const onHide = vi.fn()
     await mount({ onHide })
@@ -484,9 +494,10 @@ describe('terminal panel', () => {
       ],
     } as Frame))
 
-    // The other project's shell is alive on the host and shows as a dimmed tab,
-    // but its output is never drawn or replayed here.
-    expect(host.querySelectorAll('span[title*="another project"]')).toHaveLength(1)
+    // The other project's shell is alive on the host but belongs to its own
+    // folder: no tab here, and its output is never drawn or replayed.
+    expect(host.querySelectorAll('[role="toolbar"] button[aria-pressed]')).toHaveLength(1)
+    expect(host.querySelector('button[aria-label="Close PowerShell"]')).toBeNull()
     expect(written).toContain('mine')
     expect(written).not.toContain('theirs')
     expect(MockTerminal.instances).toHaveLength(1)
@@ -563,18 +574,13 @@ describe('terminal panel', () => {
 
     // There is no quota: the view still opens its own shell.
     expect(api.createTerminal).toHaveBeenCalledWith('ws', expect.objectContaining({ projectId: 'project-7' }))
-    // Foreign shells stay visible as dimmed tabs, never replayed here.
-    expect(host.querySelectorAll('span[title*="another project"]')).toHaveLength(3)
+    // Another folder's shells get no tab here and are never replayed.
+    expect(host.querySelectorAll('[role="toolbar"] button[aria-label^="Close "]')).toHaveLength(0)
     expect(written).not.toContain('private output')
     expect(MockTerminal.instances).toHaveLength(0)
-
-    // Closing one from its dimmed tab stops that shell.
-    const closeButtons = [...host.querySelectorAll<HTMLButtonElement>('[role="toolbar"] button[aria-label^="Close "]')]
-    await act(async () => closeButtons[1]!.click())
-    expect(api.killTerminal).toHaveBeenCalledWith('ws', 'other-2')
   })
 
-  it('hydrates foreign tabs from GET without waiting for SSE', async () => {
+  it('keeps foreign shells off the strip when GET lists them before SSE', async () => {
     api.listTerminals.mockResolvedValue({
       terminals: ['other-1', 'other-2'].map((id) => ({ ...row(id), projectId: 'project-9' })),
       shells: [{ id: 'bash', label: 'Git Bash' }], available: true,
@@ -583,7 +589,7 @@ describe('terminal panel', () => {
 
     // The auto-open waits for the stream's snapshot, not the GET.
     expect(api.createTerminal).not.toHaveBeenCalled()
-    expect(host.querySelectorAll('span[title*="another project"]')).toHaveLength(2)
+    expect(host.querySelectorAll('[role="toolbar"] button[aria-label^="Close "]')).toHaveLength(0)
     expect(host.querySelector<HTMLButtonElement>('button[aria-label="New terminal"]')?.disabled).toBe(false)
     expect(MockTerminal.instances).toHaveLength(0)
   })
@@ -613,7 +619,29 @@ describe('terminal panel', () => {
       shells: [{ id: 'bash', label: 'Git Bash' }], available: true,
     }))
     // The stream snapshot is the truth: the GET must not resurrect its row.
-    expect(host.querySelectorAll('span[title*="another project"]')).toHaveLength(0)
+    expect(host.querySelectorAll('[role="toolbar"] button[aria-label^="Close "]')).toHaveLength(0)
+  })
+
+  it('returns to the tab a project had selected after a session switch remounts the view', async () => {
+    const shells = [
+      { ...row('terminal-1'), projectId: 'project-7', scrollback: '' },
+      { ...row('terminal-2', 'PowerShell', 'powershell'), projectId: 'project-7', scrollback: '' },
+      { ...row('terminal-3'), projectId: 'project-9', scrollback: '' },
+    ]
+    await mount({ projectId: 'project-7' })
+    await act(async () => push({ kind: 'snapshot', terminals: shells } as Frame))
+    await act(async () => host.querySelector<HTMLButtonElement>('button[title^="PowerShell"]')!.click())
+    expect(host.querySelector('button[title^="PowerShell"]')?.getAttribute('aria-pressed')).toBe('true')
+
+    // Another folder, then back: a fresh mount each time (the key follows the project).
+    await unmount()
+    await mount({ projectId: 'project-9' })
+    await act(async () => push({ kind: 'snapshot', terminals: shells } as Frame))
+    expect(host.querySelectorAll('[role="toolbar"] button[aria-pressed]')).toHaveLength(1)
+    await unmount()
+    await mount({ projectId: 'project-7' })
+    await act(async () => push({ kind: 'snapshot', terminals: shells } as Frame))
+    expect(host.querySelector('button[title^="PowerShell"]')?.getAttribute('aria-pressed')).toBe('true')
   })
 
   it('opens past any number of existing terminals', async () => {

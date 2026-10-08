@@ -27,17 +27,24 @@ import {
 } from '../../lib/model-info.ts'
 import { ModelSettingsDialog, SyncModelsDialog } from './model-dialogs.tsx'
 import { AgentsPanel, HooksPanel, McpPanel, MemoryPanel, SecretsPanel, SkillsPanel } from './ManagementPanels.tsx'
-import { PermissionsPanel } from './PermissionsPanel.tsx'
+import { PermissionsPanel, type PermissionsSubTab } from './PermissionsPanel.tsx'
+import { UnsavedChangesContext, type UnsavedChangesApi } from './unsaved-changes.tsx'
 import { SystemPromptsPanel } from './SystemPromptsPanel.tsx'
+import { UsagePanel } from './UsagePanel.tsx'
 import { modelOptions } from '../../lib/providers.ts'
 import type { ModelSettings, ProjectRow, ProviderSummary } from '../../lib/types.ts'
 
 /** Settings are grouped per concern; providers keep their own full editor. */
-type SettingsTab = 'providers' | 'projects' | 'permissions' | 'prompts' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'
+type SettingsTab = 'providers' | 'usage' | 'projects' | 'permissions' | 'prompts' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'
 
 const LEGACY_TAB_REDIRECT: Readonly<Record<string, SettingsTab>> = {
   modes: 'permissions',
   'dangerous-commands': 'permissions',
+}
+
+/** Legacy links that named a Permissions sub-pane directly. */
+function permissionsSubOf(raw: string | undefined): PermissionsSubTab | undefined {
+  return raw === 'dangerous-commands' ? 'guard' : undefined
 }
 
 function normalizeTab(raw: string | undefined): SettingsTab | undefined {
@@ -48,6 +55,7 @@ function normalizeTab(raw: string | undefined): SettingsTab | undefined {
 
 const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonly hint: string; readonly icon: IconName }[] = [
   { id: 'providers', label: 'Providers', hint: 'Model endpoints and keys', icon: 'globe' },
+  { id: 'usage', label: 'Usage', hint: 'Token usage across every workspace', icon: 'layers' },
   { id: 'projects', label: 'Projects', hint: 'Folders conversations in this workspace can work in', icon: 'folder' },
   { id: 'permissions', label: 'Permissions', hint: 'Modes & dangerous command guard', icon: 'shield' },
   { id: 'prompts', label: 'System Prompts', hint: 'Replace the fixed base & subagent prompts for this workspace', icon: 'fileText' },
@@ -61,7 +69,7 @@ const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonl
 
 /** Nav groups: global settings first, then the active workspace's. */
 const TAB_GROUPS: readonly { readonly label: string; readonly ids: readonly SettingsTab[] }[] = [
-  { label: 'Global', ids: ['providers'] },
+  { label: 'Global', ids: ['providers', 'usage'] },
   { label: 'Workspace', ids: ['projects', 'permissions', 'prompts', 'skills', 'memory', 'agents', 'mcp', 'hooks', 'secrets'] },
 ]
 
@@ -130,8 +138,11 @@ export function SettingsModal({
   onRefresh,
   workspaceId,
   initialTab = 'providers', workspaceName, projects = [], onProjectsChanged = async () => {}, sessionCounts = {},
+  activeProjectId = null,
 }: {
-  readonly initialTab?: SettingsTab
+  readonly initialTab?: SettingsTab | 'modes' | 'dangerous-commands'
+  /** The open conversation's project: its `.claude/` layers show in Agents and Hooks. */
+  readonly activeProjectId?: string | null
   readonly workspaceName?: string | undefined
   readonly projects?: readonly ProjectRow[]
   readonly onProjectsChanged?: () => Promise<void>
@@ -145,6 +156,16 @@ export function SettingsModal({
   readonly onRefresh: () => Promise<void>
 }) {
   const [pendingLeave, setPendingLeave] = useState<(() => void) | null>(null)
+  /** Dirty flags reported by the workspace panels (see unsaved-changes.tsx). */
+  const panelDirty = useRef(new Map<string, boolean>())
+  const panelsDirty = (): boolean => [...panelDirty.current.values()].some(Boolean)
+  const unsavedApi = useMemo<UnsavedChangesApi>(() => ({
+    report: (key, isDirty) => {
+      if (isDirty) panelDirty.current.set(key, true)
+      else panelDirty.current.delete(key)
+    },
+    confirmDiscard: (action) => setPendingLeave(() => action),
+  }), [])
   const [tab, setTab] = useState<SettingsTab>('providers')
   // Roles pin a model from the same enabled provider/model list the composer
   // offers, so a role can never name an endpoint the host cannot serve.
@@ -165,6 +186,9 @@ export function SettingsModal({
   const [editingModel, setEditingModel] = useState<string | null>(null)
   /** What the endpoint offered, awaiting the operator's selection. */
   const [syncOffer, setSyncOffer] = useState<readonly string[] | null>(null)
+  /** Model row being dragged, and the row it currently hovers. */
+  const [dragModel, setDragModel] = useState<string | null>(null)
+  const [dragOver, setDragOver] = useState<string | null>(null)
   /**
    * Per-model connection verdict, shown on the row it belongs to. Keyed by
    * model so testing one row never rewrites another's result, and cleared
@@ -228,9 +252,13 @@ export function SettingsModal({
     )
   }, [draft, selected])
 
+  /**
+   * Leaving a tab or the dialog unmounts the panel, so ANY unsaved draft —
+   * provider or workspace panel — must be confirmed first, not just ours.
+   */
   const leave = (action: () => void) => {
     if (busy !== null) return
-    if (dirty || modelDraft.trim() !== '') setPendingLeave(() => action)
+    if (dirty || modelDraft.trim() !== '' || panelsDirty()) setPendingLeave(() => action)
     else action()
   }
   const dismiss = () => leave(onDismiss)
@@ -423,6 +451,21 @@ export function SettingsModal({
     setModelDraft('')
   }
 
+  /**
+   * Reorder the list in place. The saved order is what the composer picker
+   * shows, so this is the operator's way to put favourite models on top.
+   */
+  const moveModel = (name: string, target: number): void => {
+    const from = draft.models.indexOf(name)
+    if (from < 0) return
+    const to = Math.max(0, Math.min(draft.models.length - 1, target))
+    if (from === to) return
+    const models = [...draft.models]
+    models.splice(from, 1)
+    models.splice(to, 0, name)
+    patch({ models })
+  }
+
   const dropModel = (name: string): void => {
     const models = draft.models.filter((model) => model !== name)
     const { [name]: _dropped, ...modelSettings } = draft.modelSettings
@@ -493,7 +536,7 @@ export function SettingsModal({
             <div className="flex min-w-0 flex-col">
               <div className="flex min-w-0 items-center gap-2">
                 <h2 className="m-0 text-base font-semibold">{activeTab?.label ?? 'Settings'}</h2>
-                {tab === 'providers'
+                {tab === 'providers' || tab === 'usage'
                   ? <Badge>All workspaces</Badge>
                   : <Badge tone="blue" title="These settings apply only to this workspace.">Workspace: {workspaceName ?? workspaceId ?? 'none'}</Badge>}
               </div>
@@ -504,18 +547,18 @@ export function SettingsModal({
 
           <Tabs.Content key={tab} value={tab} tabIndex={0} className="min-h-0 min-w-0 flex-1 overflow-y-auto px-5 py-5 outline-none">
 
-            {tab !== 'providers' ? (
-              <>
+            {tab === 'usage' ? <UsagePanel /> : tab !== 'providers' ? (
+              <UnsavedChangesContext.Provider value={unsavedApi}>
                 {tab === 'projects' ? <ProjectsPanel workspaceId={workspaceId} projects={projects} onChanged={onProjectsChanged} sessionCounts={sessionCounts} /> : null}
-                {tab === 'permissions' ? <PermissionsPanel workspaceId={workspaceId} onChanged={onRefresh} /> : null}
+                {tab === 'permissions' ? <PermissionsPanel workspaceId={workspaceId} onChanged={onRefresh} initialSub={permissionsSubOf(initialTab)} /> : null}
                 {tab === 'prompts' ? <SystemPromptsPanel workspaceId={workspaceId} /> : null}
                 {tab === 'skills' ? <SkillsPanel workspaceId={workspaceId} /> : null}
-                {tab === 'memory' ? <MemoryPanel workspaceId={workspaceId} /> : null}
-                {tab === 'agents' ? <AgentsPanel workspaceId={workspaceId} modelOptions={roleModelOptions} /> : null}
+                {tab === 'memory' ? <MemoryPanel workspaceId={workspaceId} projects={projects} /> : null}
+                {tab === 'agents' ? <AgentsPanel workspaceId={workspaceId} projectId={activeProjectId} modelOptions={roleModelOptions} /> : null}
                 {tab === 'mcp' ? <McpPanel workspaceId={workspaceId} /> : null}
-                {tab === 'hooks' ? <HooksPanel workspaceId={workspaceId} /> : null}
+                {tab === 'hooks' ? <HooksPanel workspaceId={workspaceId} projectId={activeProjectId} /> : null}
                 {tab === 'secrets' ? <SecretsPanel workspaceId={workspaceId} /> : null}
-              </>
+              </UnsavedChangesContext.Provider>
             ) : (
               <div className="grid min-w-0 gap-6 lg:grid-cols-[13rem_minmax(0,1fr)]">
                 <aside className="flex min-w-0 flex-col gap-1">
@@ -530,7 +573,7 @@ export function SettingsModal({
                           role="option"
                           aria-selected={isSelected}
                           onClick={() => { if (!isSelected) leave(() => select(provider)) }}
-                          className={`flex min-h-9 w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left hover:bg-hover ${isSelected ? 'bg-hover' : ''}`}
+                          className={`flex min-h-9 w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-link ${isSelected ? 'bg-hover font-medium' : ''}`}
                         >
                           <span className="truncate text-sm">{provider.name}</span>
                           {provider.id === activeProvider ? <Badge title="Currently used for new conversations">in use</Badge> : null}
@@ -544,9 +587,9 @@ export function SettingsModal({
                       role="option"
                       aria-selected={isNew}
                       onClick={() => leave(beginNew)}
-                      className={`flex min-h-10 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-sm text-fg-muted hover:bg-hover hover:text-fg ${isNew ? 'bg-hover text-fg' : ''}`}
+                      className={`mt-1 flex min-h-9 w-full items-center gap-2 rounded-lg border border-dashed border-line px-2.5 py-1.5 text-left text-sm text-fg-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-link ${isNew ? 'bg-hover text-fg' : ''}`}
                     >
-                      <Icon name="plus" size={15} />Add provider
+                      <Icon name="plus" size={14} />Add provider
                     </button>
                   </div>
                 </aside>
@@ -569,15 +612,19 @@ export function SettingsModal({
                       className="min-w-0 max-w-full rounded-md border border-transparent bg-transparent px-1.5 py-0.5 text-lg font-semibold outline-none [field-sizing:content] hover:border-line focus:border-line"
                       onChange={(event) => patch({ name: event.target.value })}
                     />
-                    <IconButton label="Rename provider" onClick={() => nameRef.current?.focus()}><Icon name="pencil" size={15} /></IconButton>
+                    <IconButton label="Rename provider" onClick={() => nameRef.current?.focus()}><Icon name="pencil" size={14} /></IconButton>
                     <Badge tone={draft.enabled ? 'green' : 'gray'}>{draft.enabled ? 'Enabled' : 'Disabled'}</Badge>
-                    <Button variant="outline" size="sm" onClick={() => patch({ enabled: !draft.enabled })}>{draft.enabled ? 'Disable' : 'Enable'}</Button>
                     {dirty ? <Badge tone="amber">Unsaved</Badge> : null}
-                    {isNew ? null : (
-                      <IconButton className="ml-auto text-fg-faint hover:text-bad" label="Delete provider" disabled={busy !== null} onClick={() => setConfirmDelete(true)}>
-                        <Icon name="trash" size={16} />
-                      </IconButton>
-                    )}
+                    <span className="ml-auto flex items-center gap-2">
+                      <Button variant="outline" size="sm" onClick={() => patch({ enabled: !draft.enabled })}>
+                        <Icon name={draft.enabled ? 'circle' : 'circleDot'} size={13} />{draft.enabled ? 'Disable' : 'Enable'}
+                      </Button>
+                      {isNew ? null : (
+                        <Button variant="outline-danger" size="sm" disabled={busy !== null} onClick={() => setConfirmDelete(true)}>
+                          <Icon name="trash" size={13} />Delete provider
+                        </Button>
+                      )}
+                    </span>
                   </div>
 
                   <div className="flex flex-col gap-4">
@@ -619,7 +666,7 @@ export function SettingsModal({
                       </p>
                     ) : (
                       <ul className="m-0 flex list-none flex-col gap-1.5 p-0">
-                        {draft.models.map((model) => {
+                        {draft.models.map((model, index) => {
                           const isLive = selected?.id === activeProvider && model === activeModel
                           const settings = draft.modelSettings[model]
                           const context = modelContext(model, settings)
@@ -627,11 +674,52 @@ export function SettingsModal({
                           const blocker = modelTestBlocker(model)
                           const canTest = blocker === null && verdict?.status !== 'testing'
                           return (
-                            <li key={model} className="flex flex-col">
+                            <li
+                              key={model}
+                              className={`flex flex-col rounded-lg ${dragModel === model ? 'opacity-50' : ''} ${dragOver === model && dragModel !== null && dragModel !== model ? 'ring-2 ring-link' : ''}`}
+                              onDragOver={(event) => {
+                                if (dragModel === null) return
+                                event.preventDefault()
+                                event.dataTransfer.dropEffect = 'move'
+                                if (dragOver !== model) setDragOver(model)
+                              }}
+                              onDrop={(event) => {
+                                event.preventDefault()
+                                if (dragModel !== null) moveModel(dragModel, index)
+                                setDragModel(null)
+                                setDragOver(null)
+                              }}
+                            >
                               {/* One pill per model, metadata right-aligned inside it and
                                   actions outside: 40 rows of an endpoint's catalog stay
-                                  scannable by id instead of by chip soup. */}
-                              <div className="flex min-w-0 items-center gap-1">
+                                  scannable by id instead of by chip soup. The grip drags
+                                  the row (or ↑/↓/Home/End while focused) — this order is
+                                  the order the composer's model picker shows. */}
+                              <div className="group/model flex min-w-0 items-center gap-1">
+                                <button
+                                  type="button"
+                                  draggable
+                                  aria-label={`Reorder ${model} (position ${index + 1} of ${draft.models.length}); use arrow keys to move`}
+                                  title="Drag to reorder"
+                                  className="flex h-9 w-5 shrink-0 cursor-grab items-center justify-center rounded text-fg-faint hover:text-fg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-link active:cursor-grabbing"
+                                  onDragStart={(event) => {
+                                    event.dataTransfer.effectAllowed = 'move'
+                                    event.dataTransfer.setData('text/plain', model)
+                                    setDragModel(model)
+                                  }}
+                                  onDragEnd={() => { setDragModel(null); setDragOver(null) }}
+                                  onKeyDown={(event) => {
+                                    const step = event.key === 'ArrowUp' ? -1 : event.key === 'ArrowDown' ? 1 : 0
+                                    const jump = event.key === 'Home' ? 0 : event.key === 'End' ? draft.models.length - 1 : null
+                                    if (step === 0 && jump === null) return
+                                    event.preventDefault()
+                                    moveModel(model, jump ?? index + step)
+                                    const target = event.currentTarget
+                                    requestAnimationFrame(() => target.focus())
+                                  }}
+                                >
+                                  <Icon name="grip" size={14} />
+                                </button>
                                 <span className="flex min-w-0 flex-1 items-center gap-2 rounded-lg border border-line bg-surface px-3 py-2">
                                   <code className="min-w-0 flex-1 break-all font-mono text-[13px]">{model}</code>
                                   {isLive ? <Badge tone="green" title="Used for new conversations">in use</Badge> : null}
@@ -645,18 +733,20 @@ export function SettingsModal({
                                     {context.label}
                                   </Badge>
                                 </span>
-                                <span className="flex shrink-0 items-center gap-0.5">
+                                {/* Row tools fade in on hover/focus so a 40-model catalog
+                                    is not a column of 120 icons; touch keeps them visible. */}
+                                <span className="flex shrink-0 items-center gap-0.5 transition-opacity [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/model:opacity-100 [@media(hover:hover)]:group-focus-within/model:opacity-100">
                                   <IconButton
                                     label={verdict?.status === 'testing' ? `Testing ${model}` : `Test model ${model}`}
                                     disabled={!canTest}
                                     onClick={() => void testModel(model)}
                                   >
-                                    {verdict?.status === 'testing' ? <Spinner size={14} /> : <Icon name="zap" size={15} />}
+                                    {verdict?.status === 'testing' ? <Spinner size={14} /> : <Icon name="zap" size={14} />}
                                   </IconButton>
                                   <IconButton label={`Edit ${model} settings`} onClick={() => setEditingModel(model)}>
-                                    <Icon name="sliders" size={15} />
+                                    <Icon name="sliders" size={14} />
                                   </IconButton>
-                                  <IconButton label={`Remove model ${model}`} onClick={() => dropModel(model)}><Icon name="trash" size={15} /></IconButton>
+                                  <IconButton label={`Remove model ${model}`} className="hover:text-bad" onClick={() => dropModel(model)}><Icon name="trash" size={14} /></IconButton>
                                 </span>
                               </div>
                               {verdict?.status === 'ok' ? (
@@ -682,7 +772,7 @@ export function SettingsModal({
                           onChange={(event) => setModelDraft(event.target.value)}
                           onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); addModels() } }}
                         />
-                        <Button variant="outline" disabled={modelDraft.trim() === ''} onClick={addModels}><Icon name="plus" size={15} />Add</Button>
+                        <Button variant="outline" size="sm" className="h-9" disabled={modelDraft.trim() === ''} onClick={addModels}><Icon name="plus" size={13} />Add</Button>
                       </div>
                     ) : (
                       <Button
@@ -691,7 +781,7 @@ export function SettingsModal({
                         className="self-start"
                         onClick={() => { setAddingModel(true); requestAnimationFrame(() => modelDraftRef.current?.focus()) }}
                       >
-                        <Icon name="plus" size={15} />Add model
+                        <Icon name="plus" size={13} />Add model
                       </Button>
                     )}
                   </section>
@@ -709,11 +799,15 @@ export function SettingsModal({
             </div>
           ) : null}
           {tab === 'providers' ? (
-            <footer className={`flex shrink-0 flex-wrap items-center justify-end gap-2 px-5 py-3 ${notice === null ? 'border-t border-line' : ''}`}>
-              <span className="flex items-center gap-2">
-                <Button variant="outline" size="sm" disabled={testBlocker !== null || busy !== null} title={testBlocker ?? 'Send a short completion with the saved configuration'} onClick={() => void test()}>{busy === 'test' ? 'Testing…' : 'Test connection'}</Button>
-                <Button variant="primary" size="sm" disabled={busy !== null || !dirty} onClick={() => void save()}>{busy === 'save' ? 'Saving…' : isNew ? 'Add provider' : 'Save changes'}</Button>
+            <footer className={`flex shrink-0 flex-wrap items-center gap-2 px-5 py-3 ${notice === null ? 'border-t border-line' : ''}`}>
+              {/* Why Test is unavailable, as text rather than a hover-only tooltip. */}
+              <span className={`flex min-w-0 flex-1 items-center gap-2 text-[13px] ${dirty ? 'text-warn' : 'text-fg-faint'}`}>
+                <span className={`size-1.5 shrink-0 rounded-full ${dirty ? 'bg-warn' : 'bg-line-strong'}`} aria-hidden="true" />
+                <span className="truncate">{dirty ? (isNew ? 'New provider — not saved yet' : 'Unsaved changes · save before testing') : 'All changes saved'}</span>
               </span>
+              <Button variant="outline" size="sm" disabled={testBlocker !== null || busy !== null} title={testBlocker ?? 'Send a short completion with the saved configuration'} onClick={() => void test()}><Icon name="zap" size={13} />{busy === 'test' ? 'Testing…' : 'Test connection'}</Button>
+              <Button variant="ghost" size="sm" disabled={busy !== null || !dirty} onClick={discardDraft}>Discard</Button>
+              <Button variant="primary" size="sm" disabled={busy !== null || !dirty} onClick={() => void save()}>{busy === 'save' ? 'Saving…' : isNew ? 'Add provider' : 'Save changes'}</Button>
             </footer>
           ) : null}
         </div>
@@ -721,7 +815,8 @@ export function SettingsModal({
     </Modal>
     <ConfirmDialog
       open={pendingLeave !== null}
-      title="Discard unsaved provider changes?"
+      title="Discard unsaved changes?"
+      body={<p className="m-0">Edits that have not been saved will be lost.</p>}
       confirmLabel="Discard changes"
       onDismiss={() => setPendingLeave(null)}
       onConfirm={() => { const action = pendingLeave; setPendingLeave(null); discardDraft(); action?.() }}

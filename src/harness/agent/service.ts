@@ -82,6 +82,11 @@ export class AgentsService extends Service {
     }
   }
 
+  /** The agent already driving `id`, if any (never creates one). */
+  get(id: SessionId): Agent | undefined {
+    return this.bySession.get(id)
+  }
+
   /** Drop the registry entry for a removed session. */
   forget(id: SessionId): void {
     this.bySession.delete(id)

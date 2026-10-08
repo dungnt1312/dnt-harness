@@ -260,6 +260,41 @@ describe('incremental seed folding', () => {
     expect(await store.latest(session.id, session.events)).toEqual(checkpoint)
   })
 
+  it('an extractive run that cannot fit seed + delta fails before any lifecycle event', async () => {
+    const { session, store } = await setupTwoTurns()
+    const seed = await compactSession(session, store, async () => 'x'.repeat(23_990), { trigger: 'manual' })
+    session.append({ type: 'turn/start', turnId: 't3' as TurnId })
+    session.append({ type: 'user/message', turnId: 't3' as TurnId, content: 'third request that no longer fits' })
+    session.append({ type: 'turn/end', turnId: 't3' as TurnId, reason: 'completed' })
+    await session.durable()
+    const before = session.events.length
+    const summarize = vi.fn(async () => 'never')
+    await expect(compactSession(session, store, summarize, { trigger: 'automatic', seed, extractiveCap: 24_000 }))
+      .rejects.toThrow(/extractive capacity/)
+    expect(summarize).not.toHaveBeenCalled()
+    expect(session.events.length).toBe(before)
+  })
+
+  it('an unseeded extractive run over the cap also refuses before lifecycle events', async () => {
+    const { session, store } = await setup('z'.repeat(24_500))
+    await session.durable()
+    const summarize = vi.fn(async () => 'never')
+    await expect(compactSession(session, store, summarize, { trigger: 'automatic', extractiveCap: 24_000 })).rejects.toThrow(/extractive capacity/)
+    expect(summarize).not.toHaveBeenCalled()
+    expect(session.events.some(event => event.type.startsWith('compaction/'))).toBe(false)
+  })
+
+  it('an extractive run that fits proceeds normally', async () => {
+    const { session, store } = await setupTwoTurns()
+    const seed = await compactSession(session, store, async () => 'SEED', { trigger: 'manual' })
+    session.append({ type: 'turn/start', turnId: 't3' as TurnId })
+    session.append({ type: 'user/message', turnId: 't3' as TurnId, content: 'third' })
+    session.append({ type: 'turn/end', turnId: 't3' as TurnId, reason: 'completed' })
+    await session.durable()
+    const checkpoint = await compactSession(session, store, async ({ text, seed: s }) => `${s?.summary}\n\n${text}`, { trigger: 'manual', seed, extractiveCap: 24_000 })
+    expect(checkpoint.summary).toBe('SEED\n\nuser: third')
+  })
+
   it('rejects a seed covering a different boundary than a completed turn', async () => {
     const { session, store } = await setupTwoTurns()
     // seq 6 is a user message inside t2, not a completed boundary.

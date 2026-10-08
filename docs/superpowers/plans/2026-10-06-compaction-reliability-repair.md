@@ -1,6 +1,6 @@
 # Compaction Reliability Repair Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Make completed-boundary compaction fail closed, retain actual work, and activate safely in the web host.
 
@@ -43,11 +43,11 @@
 
 **Interfaces:** Preserve `compactSession` with optional attachments/signal input. Export shared dated projection and valid canonical checkpoint recovery; allow `CheckpointStore.latest(sessionId, events?)` to validate/rebuild against session facts. Keep v1 cache shape.
 
-- [ ] Write parameterized regressions for unsuccessful/missing/duplicate completion, output after completion, toolCalls, empty/oversized custom summary, rewritten calls, attachments, concurrent compaction, cancelled publication, cache failures and legacy/invalid coverage.
-- [ ] Run targeted suites and confirm each new behavior fails before implementation.
-- [ ] Implement strict stream validation using `validateCompletion`; shared projection; core bounds/exclusion; durable successful end before atomic cache publication. Recover only qualifying canonical facts and ignore invalid cache.
-- [ ] Update existing successful scripted streams to emit declared completion; retain chunk bounds and prefix invariance tests.
-- [ ] Run targeted suites; expected all pass. No commit.
+- [x] Write parameterized regressions for unsuccessful/missing/duplicate completion, output after completion, toolCalls, empty/oversized custom summary, rewritten calls, attachments, concurrent compaction, cancelled publication, cache failures and legacy/invalid coverage.
+- [x] Run targeted suites and confirm each new behavior fails before implementation.
+- [x] Implement strict stream validation using `validateCompletion`; shared projection; core bounds/exclusion; durable successful end before atomic cache publication. Recover only qualifying canonical facts and ignore invalid cache.
+- [x] Update existing successful scripted streams to emit declared completion; retain chunk bounds and prefix invariance tests.
+- [x] Run targeted suites; expected all pass. No commit.
 
 ### Task 2: Truthful context pressure and tail configuration
 
@@ -55,10 +55,10 @@
 
 **Interfaces:** Consume Task 1 shared dated projection. Add optional `budget.preTrimTokens` preserving existing manifest fields. Keep configured tail default four; allow zero. Reject unchecked invalid coverage without deleting uncovered history.
 
-- [ ] Write failures for rewritten tool projection, zero tail override, malformed/future/active coverage, oversized covered duplication fitting by whole-turn removal, pre-trim pressure exceeding post-trim usage.
-- [ ] Run targeted suites to confirm RED.
-- [ ] Implement shared projection and coverage validation, capture pre-trim cost, accept zero-capable limits; preserve uncovered/open history pairing and explicit omissions.
-- [ ] Run context/limits suites; expected all pass. No commit.
+- [x] Write failures for rewritten tool projection, zero tail override, malformed/future/active coverage, oversized covered duplication fitting by whole-turn removal, pre-trim pressure exceeding post-trim usage.
+- [x] Run targeted suites to confirm RED.
+- [x] Implement shared projection and coverage validation, capture pre-trim cost, accept zero-capable limits; preserve uncovered/open history pairing and explicit omissions.
+- [x] Run context/limits suites; expected all pass. No commit.
 
 ### Task 3: Serialized host compaction and automatic enablement
 
@@ -66,14 +66,14 @@
 
 **Interfaces:** Consume Task 1 cache validation and options, Task 2 pressure. Use existing session dispatch queue and LLM stream options/session attribution with configured deadlines. Manual compact returns conflict for duplicate/active reservation and retains API success response.
 
-- [ ] Write failures for gated concurrent compact, queued follow-up, Stop/delete/shutdown cancellation, attachments and rebuilt cache on next request, explicit auto disable and fresh pre-trim auto pressure with boundary deduplication.
-- [ ] Run server compaction suites and confirm RED.
-- [ ] Implement one host reservation shared by manual/automatic paths including hooks; defer queued execution until reservation settles, propagate cancellation/attribution and load attachments. Trigger only eligible completed turn with fresh compact-mode pressure. Enable 0.85 in standard web bin only.
-- [ ] Update docs: canonical end authority, cache recovery, strict completion, estimated pre-trim pressure, four optional covered tail turns, zero disable, next-request manifest semantics, headless deferred.
-- [ ] Run targeted suites; expected all pass. No commit.
+- [x] Write failures for gated concurrent compact, queued follow-up, Stop/delete/shutdown cancellation, attachments and rebuilt cache on next request, explicit auto disable and fresh pre-trim auto pressure with boundary deduplication.
+- [x] Run server compaction suites and confirm RED.
+- [x] Implement one host reservation shared by manual/automatic paths including hooks; defer queued execution until reservation settles, propagate cancellation/attribution and load attachments. Trigger only eligible completed turn with fresh compact-mode pressure. Enable 0.85 in standard web bin only.
+- [x] Update docs: canonical end authority, cache recovery, strict completion, estimated pre-trim pressure, four optional covered tail turns, zero disable, next-request manifest semantics, headless deferred.
+- [x] Run targeted suites; expected all pass. No commit.
 
 ### Task 4: Whole-change verification and independent review
 
-- [ ] Run `npm run typecheck`, `npm test`, `npm run build:web`; record exit codes and named failures. Preserve baseline evidence for unrelated work.
-- [ ] Dispatch fresh reviewer against baseline diff, spec and plan; address Important/Critical findings with failing regressions first and rerun suites.
-- [ ] Report exact verified scope, deferred findings and operational limitations; no restart/live recovery/commit.
+- [x] Run `npm run typecheck`, `npm test`, `npm run build:web`; record exit codes and named failures. Preserve baseline evidence for unrelated work.
+- [x] Dispatch fresh reviewer against baseline diff, spec and plan; address Important/Critical findings with failing regressions first and rerun suites.
+- [x] Report exact verified scope, deferred findings and operational limitations; no restart/live recovery/commit.

@@ -12,6 +12,7 @@ import { Switch } from '../ui/Switch.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
 import { deleteModeFile, duplicateModeFile, getModeFile, listModeFiles, listModes, saveModeFile, setModeEnabled } from '../../lib/api.ts'
 import type { ModeCatalogRow, PolicyMode } from '../../lib/types.ts'
+import { useUnsavedChanges } from './unsaved-changes.tsx'
 import {
   CodeArea,
   EmptyState,
@@ -25,6 +26,10 @@ import {
   WorkspaceRequired,
   useActionRunner,
   type NoticeState,
+  ConflictBanner,
+  PanelFooter,
+  RowMenu,
+  InlineSwitch,
 } from './settings-kit.tsx'
 
 const isConflict = (cause: unknown): boolean => /409/.test(String(cause))
@@ -94,6 +99,12 @@ function ModesPanelContent({ workspaceId, onChanged }: { readonly workspaceId: s
   }, [workspaceId])
 
   useEffect(() => { void refresh() }, [refresh])
+
+  // Before the early return: hooks run unconditionally. A new mode counts as
+  // dirty once it has an id, even if the form still matches the empty default.
+  const guardDiscard = useUnsavedChanges(editing !== null && (
+    serializeModeForm(draft) !== editing.baseline || (editing.isNew && newId.trim() !== '')
+  ))
 
   if (workspaceId === null) return <WorkspaceRequired />
 
@@ -202,30 +213,35 @@ function ModesPanelContent({ workspaceId, onChanged }: { readonly workspaceId: s
     await onChanged?.()
   })
 
-  /** The picker checkbox: checked means the composer offers this mode. */
-  const pickerCheckbox = (row: ModeCatalogRow): ReactNode => (
-    <label className="flex cursor-pointer items-center gap-1.5 text-[13px] text-fg-muted" title="Show in the composer picker">
-      <input
-        type="checkbox"
-        className="size-3.5 accent-primary"
-        aria-label={`Offer ${row.id} in the composer picker`}
-        checked={row.enabled ?? true}
-        disabled={busy !== null}
+  /**
+   * The picker switch: on means the composer offers this mode. The selected
+   * mode is locked on — the server refuses to hide it (409), so the control
+   * does not offer the action at all.
+   */
+  const pickerCheckbox = (row: ModeCatalogRow): ReactNode => {
+    const locked = row.id === selected
+    return (
+      <InlineSwitch
+        label="In picker"
+        ariaLabel={`Offer ${row.id} in the composer picker`}
+        checked={locked || (row.enabled ?? true)}
+        disabled={busy !== null || locked}
+        {...(locked ? { title: 'The selected mode always stays in the picker. Select another mode to hide it.' } : {})}
         onChange={() => void toggle(row)}
       />
-      In picker
-    </label>
-  )
+    )
+  }
 
   return (
     <PanelBody>
       <PanelIntro>
         A mode defines the permission defaults and tool exposure for conversations in this workspace. The
         composer selects one; this is where they are written. Bundled modes are read-only: duplicate one to
-        customize it. Untick “In picker” to hide a mode from the composer (a selected mode must be moved off
-        first); a saved edit applies when the mode is next selected.
+        customize it. Switch off “In picker” to hide a mode from the composer (the selected mode is locked on;
+        select another first); a saved edit applies when the mode is next selected.
       </PanelIntro>
-      {notice !== null ? <Notice kind={notice.kind} text={notice.text} /> : null}
+      {/* While editing, results show in the sticky footer next to Save. */}
+      {notice !== null && editing === null ? <Notice kind={notice.kind} text={notice.text} /> : null}
 
       {viewing !== null ? (
         <Section
@@ -248,7 +264,7 @@ function ModesPanelContent({ workspaceId, onChanged }: { readonly workspaceId: s
                   title={(
                     <button
                       type="button"
-                      className="break-all text-left hover:text-link hover:underline"
+                      className="break-all rounded-sm text-left hover:text-link hover:underline"
                       onClick={() => void openView(row)}
                       title={`View ${row.name}`}
                     >
@@ -258,7 +274,7 @@ function ModesPanelContent({ workspaceId, onChanged }: { readonly workspaceId: s
                   meta={(
                     <>
                       <span className="inline-flex items-center gap-1">
-                        <Badge tone={row.source === 'workspace' ? 'blue' : 'gray'}>{row.source}</Badge>
+                        <Badge tone={row.source === 'workspace' ? 'blue' : 'gray'}>{row.source === 'workspace' ? 'workspace' : 'bundled · Read-only'}</Badge>
                         {row.id === selected ? <Badge tone="green">selected</Badge> : null}
                         {row.enabled === false ? <Badge tone="gray">hidden</Badge> : null}
                       </span>
@@ -268,16 +284,21 @@ function ModesPanelContent({ workspaceId, onChanged }: { readonly workspaceId: s
                   actions={row.source === 'workspace' ? (
                     <>
                       {pickerCheckbox(row)}
-                      <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void openView(row)}><Icon name="eye" size={13} />View</Button>
-                      <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void openEditor(row)}>{busy === `open:${row.id}` ? 'Opening…' : 'Edit'}</Button>
-                      <IconButton label={`Delete ${row.id}`} disabled={busy !== null} onClick={() => setDeleteId(row.id)}><Icon name="trash" size={14} /></IconButton>
+                      <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void openEditor(row)}><Icon name="pencil" size={13} />{busy === `open:${row.id}` ? 'Opening…' : 'Edit'}</Button>
+                      <RowMenu
+                        label={`More actions for ${row.id}`}
+                        disabled={busy !== null}
+                        actions={[
+                          { label: 'View', icon: 'eye', onSelect: () => void openView(row) },
+                          { label: 'Delete mode', icon: 'trash', danger: true, onSelect: () => setDeleteId(row.id) },
+                        ]}
+                      />
                     </>
                   ) : (
                     <>
-                      <Badge tone="gray">Read-only</Badge>
                       {pickerCheckbox(row)}
                       <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void openView(row)}><Icon name="eye" size={13} />View</Button>
-                      <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => { setNotice(null); setCopying({ from: row.id, to: `${row.id}-custom` }) }}>Duplicate</Button>
+                      <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => { setNotice(null); setCopying({ from: row.id, to: `${row.id}-custom` }) }}><Icon name="copy" size={13} />Duplicate</Button>
                     </>
                   )}
                 >
@@ -318,22 +339,18 @@ function ModesPanelContent({ workspaceId, onChanged }: { readonly workspaceId: s
       ) : (
         <Section
           title={editing.isNew ? 'New mode' : `Edit ${editing.id}`}
-          actions={<Button variant="ghost" size="sm" disabled={busy !== null} onClick={closeEditor}><Icon name="chevronRight" size={13} className="rotate-180" />Back to list</Button>}
+          actions={<Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => guardDiscard(closeEditor)}><Icon name="chevronRight" size={13} className="rotate-180" />Back to list</Button>}
         >
           <ModeEditor draft={draft} onDraft={setDraft} disabled={busy !== null} isNew={editing.isNew} newId={newId} onNewId={setNewId} />
-          {conflict ? (
-            <div className="flex flex-wrap items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn">
-              <span className="min-w-0 flex-1 basis-48">The file changed on disk since you opened it.</span>
-              <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void reloadServer()}>Reload server version</Button>
-              <Button variant="outline-danger" size="sm" disabled={busy !== null} onClick={() => void overwrite()}>Overwrite anyway</Button>
-            </div>
-          ) : null}
-          <div className="flex flex-wrap gap-2">
-            <Button variant="primary" size="sm" disabled={busy !== null || id === '' || !dirty} onClick={() => void save()}>{busy === 'save' ? 'Saving…' : 'Save mode'}</Button>
-            <Button variant="ghost" size="sm" disabled={busy !== null} onClick={closeEditor}>Cancel</Button>
-          </div>
+          {conflict ? <ConflictBanner what="file" busy={busy !== null} onReload={() => void reloadServer()} onOverwrite={() => void overwrite()} /> : null}
         </Section>
       )}
+      {editing !== null ? (
+        <PanelFooter notice={notice}>
+          <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => guardDiscard(closeEditor)}>Cancel</Button>
+          <Button variant="primary" size="sm" disabled={busy !== null || id === '' || !dirty} onClick={() => void save()}>{busy === 'save' ? 'Saving…' : editing.isNew ? 'Create mode' : 'Save mode'}</Button>
+        </PanelFooter>
+      ) : null}
     </PanelBody>
   )
 }
@@ -352,15 +369,22 @@ function PermissionRow({ label, code, value, disabled, onSet, onRemove }: {
       <span className="flex min-w-0 items-center gap-1">
         <code className="truncate text-[13px]" title={code}>{label}</code>
         {onRemove !== undefined && value !== null ? (
-          <IconButton label={`Remove the ${code} entry`} disabled={disabled} onClick={onRemove}><Icon name="close" size={12} /></IconButton>
+          <IconButton label={`Remove the ${code} entry`} className="hover:text-bad" disabled={disabled} onClick={onRemove}><Icon name="close" size={14} /></IconButton>
         ) : null}
       </span>
-      <Segmented label={`Permission for ${code}`} value={value} options={PERMISSION_SEGMENTS} onChange={onSet} />
+      <Segmented label={`Permission for ${code}`} value={value} options={PERMISSION_SEGMENTS} disabled={disabled} onChange={onSet} />
     </div>
   )
 }
 
 /** The structured editor: identity, instructions, context sources, exposure, permissions. */
+const MCP_EXPOSURE_LABELS: Record<'default' | 'none' | 'read-safe' | 'all', string> = {
+  default: 'Default',
+  none: 'None',
+  'read-safe': 'Read-safe only',
+  all: 'All allowlisted',
+}
+
 function ModeView({ draft, onEdit }: { readonly draft: ModeForm; readonly onEdit?: (() => void) | undefined }) {
   const historyLabel: Record<string, string> = { none: 'None', recent: 'Recent', compact: 'Compact' }
   const permissionEntries = Object.entries(draft.permissions)
@@ -385,6 +409,7 @@ function ModeView({ draft, onEdit }: { readonly draft: ModeForm; readonly onEdit
           <span>Pinned memory <Badge tone={draft.memoryPinned ? 'green' : 'gray'}>{draft.memoryPinned ? 'On' : 'Off'}</Badge></span>
           <span>Memory retrieval <Badge tone={draft.memoryRetrieval ? 'green' : 'gray'}>{draft.memoryRetrieval ? 'On' : 'Off'}</Badge></span>
           <span>Paths outside granted folders <Badge tone={draft.outOfGrant === 'allow' ? 'green' : 'gray'}>{draft.outOfGrant === 'allow' ? 'Allowed' : 'Ask'}</Badge></span>
+          <span>MCP tools <Badge tone="gray">{MCP_EXPOSURE_LABELS[draft.mcpExposure ?? 'default']}</Badge></span>
         </div>
       </div>
 
@@ -426,7 +451,7 @@ function ModeView({ draft, onEdit }: { readonly draft: ModeForm; readonly onEdit
       </div>
 
       {onEdit !== undefined ? (
-        <Button variant="primary" size="sm" onClick={onEdit}><Icon name="pencil" size={13} />Edit mode</Button>
+        <div className="flex justify-end"><Button variant="outline" size="sm" onClick={onEdit}><Icon name="pencil" size={13} />Edit mode</Button></div>
       ) : (
         <p className="m-0 text-xs text-fg-faint">Bundled modes are read-only. Duplicate to customize.</p>
       )}
@@ -486,6 +511,12 @@ function ModeEditor({ draft, onDraft, disabled, isNew, newId, onNewId }: {
       <Field label="Name" hint="Shown in the composer's mode menu.">
         <TextInput value={draft.name} placeholder="Review only" onChange={(e) => patch({ name: e.target.value })} />
       </Field>
+      <Field label="Description" hint="Optional one-line note for authors. Not sent to the model.">
+        <TextInput value={draft.description ?? ''} placeholder="Read-only review of a pull request" onChange={(e) => {
+          const { description: _omit, ...rest } = draft
+          onDraft(e.target.value === '' ? rest : { ...rest, description: e.target.value })
+        }} />
+      </Field>
       <Field label="Instructions" hint="System-level guidance injected for every request while this mode is selected.">
         <CodeArea tall value={draft.instructions} placeholder="Read the workspace and report what you find. Do not change anything." onChange={(e) => patch({ instructions: e.target.value })} />
       </Field>
@@ -528,6 +559,22 @@ function ModeEditor({ draft, onDraft, disabled, isNew, newId, onNewId }: {
             <Switch key={tool} label={tool} checked={draft.exposure.includes(tool)} disabled={disabled} onChange={(next) => toggleExposure(tool, next)} />
           ))}
         </div>
+        <Field label="MCP tools" hint="Ceiling for workspace MCP tools. Default: none when no tools are exposed; read-safe allowlisted tools only when the mode exposes none of Write, Edit, or Bash; otherwise every allowlisted tool.">
+          <Select
+            label="MCP tools"
+            value={draft.mcpExposure ?? 'default'}
+            options={[
+              { value: 'default', label: 'Default (derived)' },
+              { value: 'none', label: 'None' },
+              { value: 'read-safe', label: 'Read-safe allowlisted only' },
+              { value: 'all', label: 'All allowlisted' },
+            ]}
+            onChange={(value) => {
+              const { mcpExposure: _omit, ...rest } = draft
+              onDraft(value === 'default' ? rest : { ...rest, mcpExposure: value as NonNullable<ModeForm['mcpExposure']> })
+            }}
+          />
+        </Field>
       </div>
 
       <div className="flex flex-col gap-2.5">

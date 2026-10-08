@@ -41,6 +41,12 @@ export interface ToolFacts {
   /** The digest reports a failure — an error excerpt or a non-zero exit. */
   readonly digestFailed?: boolean
   /**
+   * A non-zero exit that is an answer, not a fault: `grep` found nothing,
+   * `diff` found a difference, `test` said no. The row still names the exit,
+   * quietly; a collapsed run does not count it as failed.
+   */
+  readonly digestSoft?: boolean
+  /**
    * A file call reads as the reference row: the file name is the title and
    * its directory sits beside it. Absent for commands, patterns and MCP calls.
    */
@@ -221,12 +227,70 @@ function grepDigest(output: string): string {
 /** What `Bash` writes when it cut its own output. */
 const BASH_CUT = /\n… \[(?:truncated \d+ chars|output truncated during capture)\]/
 
+/**
+ * Commands whose exit 1 is an answer: no match, a difference, a false test.
+ * Exit 2 and above stays a real error for each of them.
+ */
+const ANSWERING_EXIT_ONE = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'diff', 'cmp', 'test', '[', '[[', 'pgrep', 'which', 'command'])
+
+/**
+ * The program that decides a shell line's exit status: the first word of its
+ * last simple command (`a; b | grep x` → `grep`). Leading `!`, env
+ * assignments and `sudo`/`xargs`-style wrappers are skipped. Separators
+ * inside quotes (`grep "a\|b"`) do not split. Anything it cannot read leaves
+ * the exit reported as a failure — the safe default.
+ */
+export function finalProgram(command: string): string | undefined {
+  let last = ''
+  let current = ''
+  let quote: '"' | "'" | null = null
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index]!
+    if (quote !== null) {
+      if (char === '\\' && quote === '"') { current += char + (command[index + 1] ?? ''); index += 1; continue }
+      if (char === quote) quote = null
+      current += char
+      continue
+    }
+    if (char === '\\') { current += char + (command[index + 1] ?? ''); index += 1; continue }
+    if (char === '"' || char === "'") { quote = char; current += char; continue }
+    // `2>&1`, `&>file`, `>&2`: redirections, not a background separator.
+    if (char === '&' && (/[<>]$/.test(current) || command[index + 1] === '>')) { current += char; continue }
+    if (char === ';' || char === '|' || char === '&' || char === '\n') {
+      if (current.trim() !== '') last = current
+      current = ''
+      continue
+    }
+    current += char
+  }
+  if (current.trim() !== '') last = current
+  last = last.trim()
+  if (last === '') return undefined
+  const words = last.split(/\s+/)
+  let index = 0
+  while (index < words.length) {
+    const word = words[index]!
+    if (word === '!' || /^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || word === 'sudo' || word === 'xargs' || word === 'nice' || word === 'time') { index += 1; continue }
+    return word.replace(/^.*\//, '')
+  }
+  return undefined
+}
+
+/** A shell line's exit that answers a question (`grep` found nothing) rather than reporting a fault. */
+export function exitIsAnswer(command: string, code: number): boolean {
+  if (code !== 1) return false
+  const program = finalProgram(command)
+  return program !== undefined && ANSWERING_EXIT_ONE.has(program)
+}
+
 /** `Bash` always settles as a recorded result; the exit code is the outcome. */
-function bashDigest(output: string): { digest: string; failed: boolean } {
+function bashDigest(output: string, command = ''): { digest: string; failed: boolean; soft?: boolean } {
   const exit = /\[exit code: (-?\d+)\]\s*$/.exec(output)
   if (exit?.[1] !== undefined) {
     const code = Number(exit[1])
-    return { digest: `exit ${code}${BASH_CUT.test(output) ? ' · truncated' : ''}`, failed: code !== 0 }
+    const digest = `exit ${code}${BASH_CUT.test(output) ? ' · truncated' : ''}`
+    if (exitIsAnswer(command, code)) return { digest, failed: false, soft: true }
+    return { digest, failed: code !== 0 }
   }
   if (/\[terminated[^\]]*\]\s*$/.test(output)) return { digest: 'terminated', failed: true }
   if (output.startsWith('cancelled:')) return { digest: 'cancelled', failed: true }
@@ -247,9 +311,14 @@ function parseJson(output: string): unknown {
   try { return JSON.parse(output) } catch { return undefined }
 }
 
+/** The `Agent` tool's action; an absent one is a spawn, as the tool reads it. */
+export function agentAction(args: Record<string, unknown>): string {
+  return str(args, 'action') ?? 'spawn'
+}
+
 /** `spawn · explorer`, `wait`: what an `Agent` call asked for. */
 function agentTarget(args: Record<string, unknown>): string {
-  const action = str(args, 'action') ?? 'spawn'
+  const action = agentAction(args)
   const role = action === 'spawn' ? str(args, 'definition') : undefined
   return role !== undefined ? `${action} · ${role}` : action
 }
@@ -334,6 +403,7 @@ export function toolFacts(call: ToolCall, result?: ToolResultView): ToolFacts {
   let focus: FileFocus | undefined
   let digest: string | undefined
   let digestFailed = failed && !denied
+  let digestSoft = false
   let file: { name: string; directory: string } | undefined
   let lines: { added: number; removed: number } | undefined
 
@@ -414,9 +484,10 @@ export function toolFacts(call: ToolCall, result?: ToolResultView): ToolFacts {
       if (result !== undefined) {
         if (failed) digest = excerpt(result.output)
         else {
-          const read = bashDigest(result.output)
+          const read = bashDigest(result.output, fullTarget)
           digest = read.digest
           digestFailed = read.failed
+          digestSoft = read.soft === true
         }
       }
       break
@@ -450,7 +521,7 @@ export function toolFacts(call: ToolCall, result?: ToolResultView): ToolFacts {
     fullTarget,
     ...(path !== undefined ? { path } : {}),
     ...(focus !== undefined ? { focus } : {}),
-    ...(digest !== undefined && digest !== '' ? { digest, digestFailed } : {}),
+    ...(digest !== undefined && digest !== '' ? { digest, digestFailed, ...(digestSoft ? { digestSoft } : {}) } : {}),
     ...(file !== undefined ? { file } : {}),
     ...(lines !== undefined ? { lines } : {}),
   }

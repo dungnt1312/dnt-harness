@@ -1,110 +1,31 @@
 /**
- * Compatibility imports (G4): Claude-first definition import of the
- * SUPPORTED subset, with unsupported execution/security fields reported —
- * never silently discarded with broader permissions, never executed, never
- * carrying credentials. The Codex adapter targets a pinned source version;
- * unsupported semantics are reported, not faked.
+ * Claude Code subagent files need no importer: `definition-service.ts` reads
+ * them natively from `~/.claude/agents`, the workspace layer and
+ * `<project>/.claude/agents`. `importClaudeDefinition` remains as a thin
+ * parse-and-report helper for callers that only hold the text.
+ *
+ * The Codex adapter targets a pinned source version; unsupported semantics
+ * are reported, not faked.
  */
-import { AgentDefinitionError, type AgentDefinition } from '../definition-service.ts'
-
-/** Fields the Claude sub-agent frontmatter may carry (documented subset). */
-// dnt-harness's native `inheritable` is deliberately absent: it is not a Claude
-// key, so a Claude file carrying it reports it under `ignored` and no Claude
-// import ever produces it.
-const CLAUDE_SUPPORTED_KEYS = new Set(['name', 'description', 'tools', 'disallowedTools', 'skills', 'model', 'maxTurns'])
-
-/**
- * Fields we RECOGNIZE but cannot honor safely. Their presence blocks
- * automatic activation: the import reports them and the definition stays
- * disabled until the operator resolves each explicitly.
- */
-const CLAUDE_BLOCKING_KEYS = new Set([
-  'permissionMode', 'isolation', 'effort', 'mcpServers', 'hooks', 'background', 'worktree', 'memory',
-])
+import { AgentDefinitionError, parseAgentDefinition, type AgentDefinition } from '../definition-service.ts'
 
 export interface ClaudeImportResult {
   readonly definition: AgentDefinition
-  /** Supported subset actually imported (provenance). */
+  /** Frontmatter keys honored. */
   readonly imported: readonly string[]
-  /** Blocking fields that prevent automatic activation. */
-  readonly blocked: readonly string[]
-  /** Unknown fields ignored with provenance (no security impact). */
-  readonly ignored: readonly string[]
+  /** Claude keys recognized but not enforced by dnt-harness. */
+  readonly unsupported: readonly string[]
   readonly warnings: readonly string[]
 }
 
-/**
- * Import one Claude sub-agent Markdown/frontmatter file. Recognizes name,
- * description, tools, disallowedTools, model, and legacy maxTurns metadata.
- * maxTurns is retained for round-trip compatibility but is not enforced.
- * Blocking fields (hooks/mcpServers/permissionMode/isolation/
- * background/worktree/memory/effort) surface in `blocked`; the caller must
- * NOT auto-activate such definitions. Import never executes anything.
- */
-export function importClaudeDefinition(raw: string): ClaudeImportResult {
-  const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(raw)
-  const body = (match !== null ? raw.slice(match[0].length) : raw).trim()
-  const frontmatter = match !== null ? parseFrontmatter(match[1] ?? '') : {}
-  const imported: string[] = []
-  const blocked: string[] = []
-  const ignored: string[] = []
-  const warnings: string[] = []
-
-  for (const key of Object.keys(frontmatter)) {
-    if (CLAUDE_SUPPORTED_KEYS.has(key)) continue
-    if (CLAUDE_BLOCKING_KEYS.has(key)) blocked.push(key)
-    else ignored.push(key)
-  }
-
-  const name = typeof frontmatter['name'] === 'string' ? frontmatter['name'].trim() : ''
-  if (name === '') throw new AgentDefinitionError('invalid', "Claude import needs a non-empty 'name'")
-  const description = typeof frontmatter['description'] === 'string' ? frontmatter['description'].trim() : ''
-  if (description === '') warnings.push("'description' missing; imported with an empty description")
-
-  let tools: string[] = []
-  if (Array.isArray(frontmatter['tools'])) tools = (frontmatter['tools'] as unknown[]).map(String)
-  let disallowedTools: string[] = []
-  if (Array.isArray(frontmatter['disallowedTools'])) disallowedTools = (frontmatter['disallowedTools'] as unknown[]).map(String)
-
-  const skills = Array.isArray(frontmatter['skills']) ? (frontmatter['skills'] as unknown[]).map(String) : undefined
-  let model: string | undefined
-  if (typeof frontmatter['model'] === 'string' && frontmatter['model'].trim() !== '') {
-    // Claude model aliases map to workspace resources at ACTIVATION time;
-    // the alias is carried verbatim and the host resolves/reports it.
-    model = frontmatter['model'].trim()
-    warnings.push(`model alias '${model}' is resolved against workspace providers at activation`)
-  }
-
-  let maxTurns: number | undefined
-  if (frontmatter['maxTurns'] !== undefined) {
-    const value = Number(frontmatter['maxTurns'])
-    if (Number.isInteger(value) && value > 0) {
-      maxTurns = value
-      warnings.push("'maxTurns' is retained as deprecated metadata but is not enforced")
-    } else {
-      warnings.push(`'maxTurns' ${JSON.stringify(frontmatter['maxTurns'])} is not a positive integer and was ignored`)
-    }
-  }
-
-  if (blocked.length > 0) {
-    warnings.push(`blocking fields present (${blocked.join(', ')}): automatic activation prevented until resolved`)
-  }
-
+/** Parse one Claude Code subagent document (same rules as the layered loader). */
+export function importClaudeDefinition(raw: string, fallbackName = 'agent'): ClaudeImportResult {
+  const definition = parseAgentDefinition(fallbackName, raw)
   return {
-    definition: {
-      name,
-      description,
-      instructions: body,
-      tools,
-      disallowedTools,
-      ...(skills !== undefined ? { skills } : {}),
-      ...(model !== undefined ? { model } : {}),
-      ...(maxTurns !== undefined ? { maxTurns } : {}),
-    },
-    imported: [...CLAUDE_SUPPORTED_KEYS].filter((key) => frontmatter[key] !== undefined),
-    blocked,
-    ignored,
-    warnings,
+    definition,
+    imported: (['name', 'description', 'tools', 'disallowedTools', 'skills', 'model'] as const).filter((key) => definition[key] !== undefined),
+    unsupported: definition.unsupported ?? [],
+    warnings: definition.warnings ?? [],
   }
 }
 
@@ -159,19 +80,4 @@ export function importCodexDefinition(toml: string, sourceVersion?: string): Cod
       'messaging/resume/fork/worktree semantics are unsupported and reported, not faked',
     ],
   }
-}
-
-function parseFrontmatter(block: string): Record<string, unknown> {
-  const result: Record<string, unknown> = {}
-  for (const line of block.split('\n')) {
-    const match = /^([a-zA-Z][a-zA-Z0-9]*):\s*(.*)$/.exec(line.trim())
-    if (match === null) continue
-    const rawValue = match[2]?.trim() ?? ''
-    try {
-      result[match[1] as string] = JSON.parse(rawValue) as unknown
-    } catch {
-      result[match[1] as string] = rawValue
-    }
-  }
-  return result
 }

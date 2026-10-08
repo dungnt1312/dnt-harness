@@ -20,7 +20,11 @@ export interface WorkbenchPreferencesV1 {
    * remembered shell that is no longer installed cannot strand the view.
    */
   readonly terminalShell: string | null
-  /** Whether the terminal footer under the chat is shown. Ctrl+` toggles it. */
+  /**
+   * Legacy global footer flag. The footer is now remembered per project
+   * ({@link TerminalProjectState}); this value only seeds projects that have
+   * no record of their own yet, so an upgrade does not hide an open footer.
+   */
   readonly terminalOpen: boolean
   /** Height of the terminal dock in CSS pixels. */
   readonly terminalHeight: number
@@ -122,6 +126,58 @@ export function parseWorkbenchLegacyTabs(raw: string | null): WorkbenchSessionTa
   } catch {
     return WORKBENCH_TABS_DEFAULTS
   }
+}
+
+/**
+ * Terminal surfaces belong to a project folder, not to a conversation or the
+ * whole app: every conversation in one folder sees the same footer and the
+ * same Terminal tab, and a conversation in another folder sees its own.
+ * Keyed by `<workspaceId>:<projectId>` (empty project id for conversations
+ * without a folder).
+ */
+export interface TerminalProjectState {
+  /** Whether the chat footer terminal is shown. Ctrl+` toggles it. */
+  readonly footerOpen: boolean
+  /** Whether the workbench strip carries the Terminal tab. */
+  readonly workbenchTab: boolean
+}
+
+export const TERMINAL_PROJECTS_STORAGE_KEY = 'dnt-harness.terminal.projects.v1'
+
+export type TerminalProjectsRecord = Record<string, TerminalProjectState>
+
+export function terminalProjectKey(workspaceId: string, projectId: string | null): string {
+  return `${workspaceId}:${projectId ?? ''}`
+}
+
+export function parseTerminalProjects(raw: string | null): TerminalProjectsRecord {
+  if (raw === null) return {}
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const record: TerminalProjectsRecord = {}
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) continue
+      const entry = value as Record<string, unknown>
+      if (typeof entry.footerOpen !== 'boolean' || typeof entry.workbenchTab !== 'boolean') continue
+      record[key] = { footerOpen: entry.footerOpen, workbenchTab: entry.workbenchTab }
+    }
+    return record
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * Splice the project's Terminal tab into a conversation's strip: the session
+ * record owns every other view, the project owns this one. The tab keeps its
+ * place when the session strip already lists it, otherwise it joins the end.
+ * A selection of 'terminal' with the tab absent is clamped away by
+ * {@link clampInspectorTab}.
+ */
+export function withProjectTerminalTab(views: readonly WorkbenchViewName[], terminalTab: boolean): readonly WorkbenchViewName[] {
+  if (!terminalTab) return views.filter((view) => view !== 'terminal')
+  return views.includes('terminal') ? views : [...views, 'terminal']
 }
 
 export const PANEL_LIMITS = {

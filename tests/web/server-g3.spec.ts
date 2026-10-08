@@ -179,6 +179,37 @@ it('HTTP memory retitles CRLF auto pointers and preserves authored index bytes',
   expect(await fs.readFile(index, 'utf8')).toBe(before.replace('- [Original](note.md)', '- [Renamed](note.md)'))
 })
 
+describe('memory guidance follows the mode', () => {
+  it('Plan gets the read-only note; Full access gets the write note', async () => {
+    const systems: string[] = []
+    const spy: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream(request) {
+        systems.push(request.messages.filter((message) => message.role === 'system').map((message) => String(message.content)).join('\n'))
+        yield { type: 'delta', delta: 'ok' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const server = await start([spy])
+    const base = server.url
+    const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
+    const project = await fs.mkdtemp(path.join(root, 'proj-'))
+    const projectId = (await (await post(base, `/api/workspaces/${wsId}/projects`, { name: 'P', path: project })).json() as { id: string }).id
+    for (const [index, modeId] of (['plan', 'full-access'] as const).entries()) {
+      const { id } = (await (await post(base, `/api/workspaces/${wsId}/sessions`, { projectId })).json()) as { id: string }
+      expect((await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/mode`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId }),
+      })).status).toBe(200)
+      await post(base, `/api/workspaces/${wsId}/sessions/${id}/messages`, { content: 'hi' })
+      await expect.poll(() => systems.length, { timeout: 5_000 }).toBe(index + 1)
+    }
+    expect(systems[0]).toMatch(/This mode cannot write memory/)
+    expect(systems[0]).not.toMatch(/Write\/Edit Markdown files/)
+    expect(systems[1]).toMatch(/Write\/Edit Markdown files/)
+    expect(systems[1]).not.toMatch(/This mode cannot write memory/)
+  })
+})
+
 describe('live mode control', () => {
   it('Chat sends no tool schemas and executes no tools', async () => {
     const requests: { tools?: { name: string }[] }[] = []

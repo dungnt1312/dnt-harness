@@ -18,7 +18,9 @@ import {
   WorkspaceRequired,
   useActionRunner,
   type NoticeState,
+  FormActions,
 } from './settings-kit.tsx'
+import { useUnsavedChanges } from './unsaved-changes.tsx'
 
 /** Secret names are referenced as ${NAME}, so they follow environment-variable rules. */
 const SECRET_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -45,6 +47,8 @@ function SecretsPanelContent({ workspaceId }: { readonly workspaceId: string | n
   }, [workspaceId])
 
   useEffect(() => { void refresh() }, [refresh])
+
+  useUnsavedChanges(value !== '')
 
   if (workspaceId === null) return <WorkspaceRequired />
 
@@ -89,7 +93,7 @@ function SecretsPanelContent({ workspaceId }: { readonly workspaceId: string | n
                 meta="Value hidden"
                 actions={
                   <>
-                    <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => { setName(row.name); setValue(''); valueRef.current?.focus() }}>Replace value</Button>
+                    <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => { setName(row.name); setValue(''); valueRef.current?.focus() }}><Icon name="pencil" size={13} />Replace value</Button>
                     <IconButton label={`Delete ${row.name}`} disabled={busy !== null} onClick={() => setConfirming(row.name)}><Icon name="trash" size={14} /></IconButton>
                   </>
                 }
@@ -130,11 +134,11 @@ function SecretsPanelContent({ workspaceId }: { readonly workspaceId: string | n
               />
             </Field>
           </div>
-          <div>
+          <FormActions>
             <Button type="submit" variant="primary" size="sm" disabled={busy !== null || trimmed === '' || nameInvalid || value === ''}>
               {busy === 'save' ? 'Saving…' : exists ? 'Replace key' : 'Save key'}
             </Button>
-          </div>
+          </FormActions>
         </form>
       </Section>
     </PanelBody>

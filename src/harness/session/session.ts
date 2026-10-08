@@ -65,6 +65,7 @@ export class Session {
   private writeTail: Promise<void> = Promise.resolve()
   private durableListener: ((lastSeq: number) => void) | undefined
   private poisonedError: unknown
+  private poisonedFlag = false
   private disposed = false
   private closed = false
   private readonly relaxedStreamingAppends: boolean
@@ -124,7 +125,7 @@ export class Session {
     if (this.closed) {
       throw new Error(`session '${this.id}' is closing`)
     }
-    if (this.poisonedError !== undefined) {
+    if (this.poisonedFlag) {
       throw this.poisonedError instanceof Error
         ? this.poisonedError
         : new Error(String(this.poisonedError))
@@ -169,6 +170,7 @@ export class Session {
       if (lastSeq > this.committedLog.length) this.committedLog = this.log.slice(0, lastSeq)
       this.durableListener?.(lastSeq)
     } catch (error) {
+      this.poisonedFlag = true
       this.poisonedError = error
       throw error
     }
@@ -199,7 +201,7 @@ export class Session {
    * poisoned error.
    */
   get poisoned(): boolean {
-    return this.poisonedError !== undefined
+    return this.poisonedFlag
   }
 
   /** The last recorded custom title, or undefined when the title is derived. */

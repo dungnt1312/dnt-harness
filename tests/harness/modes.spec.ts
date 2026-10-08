@@ -128,6 +128,23 @@ describe('custom modes', () => {
     expect(serializeModeFile(parseModeFile('wide-perms', serialized))).toBe(serialized)
   })
 
+  it('mcpExposure and description parse strictly and round-trip; duplicate keeps description', async () => {
+    const definition = parseModeFile('ro', `---\nname: "RO"\ndescription: "Security review"\ntoolExposure: ["Read"]\nmcpExposure: none\n---\n\nbody`)
+    expect(definition.mcpExposure).toBe('none')
+    expect(definition.description).toBe('Security review')
+    const serialized = serializeModeFile(definition)
+    expect(serializeModeFile(parseModeFile('ro', serialized))).toBe(serialized)
+    expect(parseModeFile('ro', serialized)).toEqual(definition)
+    expect(() => parseModeFile('bad', '---\nmcpExposure: sometimes\n---\n\nbody')).toThrow(/mcpExposure/)
+    expect(() => parseModeFile('bad', '---\ndescription: 42\n---\n\nbody')).toThrow(/description/)
+    // Bundled modes have no description: their canonical bytes do not grow one.
+    for (const mode of BUNDLED_MODES) expect(serializeModeFile(mode)).not.toContain('description:')
+
+    const modes = new ModesService(home)
+    await modes.save(WS, 'described', `---\nname: "Described"\ndescription: "Keep me"\n---\n\nbody`)
+    expect((await modes.duplicate(WS, 'described', 'described-copy')).definition.description).toBe('Keep me')
+  })
+
   it('rejects permission keys the gate could never match with accepted shapes', () => {
     for (const key of [
       'mcp__*__read', 'Ba*h', 'bash',
@@ -148,6 +165,8 @@ describe('custom modes', () => {
     expect(copy.definition.name).toBe('Plan')
     expect(copy.definition.id).toBe('plan-custom')
     expect(copy.source).toBe('workspace')
+    // The MCP restriction is a property of the mode, so the copy keeps it.
+    expect(copy.definition.mcpExposure).toBe('read-safe')
     // Customizing the copy does not touch the bundled original; a read
     // supplies the optimistic-concurrency hash required for replacement.
     const editable = await modes.load(WS, 'plan-custom')

@@ -10,8 +10,9 @@ import { Markdown } from '../../Markdown.tsx'
 import { ThinkingPanel } from './ThinkingPanel.tsx'
 import { useHoldScroll } from '../../hooks/useStickToBottom.ts'
 import { budgetTone, contextFill, formatBytes, formatElapsed, formatTime, formatTokenCount } from '../../lib/format.ts'
-import { isDenied, mcpServerOf, toolFacts, type ToolFacts } from '../../lib/tool-facts.ts'
-import { ansiToHtml } from '../../lib/ansi.ts'
+import { agentAction, exitIsAnswer, isDenied, mcpServerOf, toolFacts, type ToolFacts } from '../../lib/tool-facts.ts'
+import { PATH_LINK_ATTR, ansiToHtml } from '../../lib/ansi.ts'
+import { commandBase, freeTextLinker, rebase, searchLinker, type LineLinker, type PathRef } from '../../lib/path-links.ts'
 import { Section, ToolArguments, preClass } from './ToolArguments.tsx'
 import { attachmentUrl, fetchContextBody, waitChild } from '../../lib/api.ts'
 import { agentRoleIcon } from '../../lib/agent-icons.ts'
@@ -396,6 +397,8 @@ interface RowSpec {
   /** A `·` between the kind and what follows, when the kind is a noun. */
   readonly separator?: boolean
   readonly primary?: ReactNode
+  /** `primary` is its own button (a file chip that opens the workbench), so the line must not be one. */
+  readonly primaryOpens?: boolean
   /** Commands and patterns are code; names and sentences are not. */
   readonly primaryMono?: boolean
   /** Quiet context — a directory, a search scope. First to go when space runs out. */
@@ -416,7 +419,7 @@ const STATUS_TONE: Readonly<Record<StatusTone, string>> = {
  * A file, named the way the Git panel names a changed one: its type icon, then
  * its name at full strength. The folder beside it is the row's quiet context.
  */
-function FileChip({ path, name, onOpen }: { readonly path: string; readonly name: string; readonly onOpen?: () => void }) {
+function FileChip({ path, name, onOpen, openLabel }: { readonly path: string; readonly name: string; readonly onOpen?: () => void; readonly openLabel?: string }) {
   const body = (
     <>
       <FileTypeIcon path={path} size={16} />
@@ -424,8 +427,16 @@ function FileChip({ path, name, onOpen }: { readonly path: string; readonly name
     </>
   )
   if (onOpen === undefined) return <span className="inline-flex min-w-0 items-center gap-1.5 text-fg">{body}</span>
+  const label = openLabel ?? `Open ${path} in workbench`
   return (
-    <button type="button" onClick={onOpen} title={`Open ${path} in workbench`} className="inline-flex min-w-0 items-center gap-1.5 rounded-sm text-fg hover:underline">
+    <button
+      type="button"
+      {...{ [ROW_OWN_ACTION]: '' }}
+      onClick={(event) => { event.stopPropagation(); onOpen() }}
+      title={label}
+      aria-label={label}
+      className="inline-flex min-w-0 items-center gap-1.5 rounded-sm text-fg hover:underline"
+    >
       {body}
     </button>
   )
@@ -479,7 +490,17 @@ function RowLine({ spec, state, showIcon }: { readonly spec: RowSpec; readonly s
   )
 }
 
-/** One activity line, opening to what the call recorded when there is something to show. */
+/** Marks a control inside a row line that acts on its own (a file chip), not on the row. */
+const ROW_OWN_ACTION = 'data-row-own-action'
+
+/**
+ * One activity line, opening to what the call recorded when there is something to show.
+ *
+ * A line whose file chip is itself a button (`spec.primaryOpens`) cannot sit
+ * inside the expander — a button cannot hold another button. That line is a
+ * plain row instead: clicking anywhere but the chip toggles it, and the
+ * chevron is the expander keyboard and assistive tech reach.
+ */
 function ActivityRow({ spec, state, expandable = true, children }: {
   readonly spec: RowSpec
   readonly state: RowState
@@ -495,32 +516,61 @@ function ActivityRow({ spec, state, expandable = true, children }: {
   if (!expandable) {
     return <div className={rowClass} {...(spec.title !== undefined ? { title: spec.title } : {})}>{line}</div>
   }
-  return (
-    <div className="flex min-w-0 flex-col">
+  // Opening a row must not scroll it away: growth the reader asked for
+  // releases the tail instead of following it.
+  const toggle = (): void => {
+    if (!expanded) { holdScroll(); pinRun() }
+    setExpanded((prev) => !prev)
+  }
+  const chevron = (
+    <Icon
+      name="chevronRight"
+      size={14}
+      className={cn(
+        'shrink-0 text-fg-faint opacity-0 transition duration-200 group-hover/row:opacity-100 group-focus-visible/row:opacity-100 group-focus-within/row:opacity-100 [@media(pointer:coarse)]:opacity-100',
+        expanded && 'rotate-90 opacity-100',
+      )}
+    />
+  )
+  const head = spec.primaryOpens === true ? (
+    <div
+      className={cn(rowClass, 'group/row cursor-pointer rounded-sm')}
+      onClick={(event) => {
+        if ((event.target as Element).closest(`[${ROW_OWN_ACTION}]`) !== null) return
+        toggle()
+      }}
+      {...(spec.title !== undefined ? { title: spec.title } : {})}
+    >
+      {line}
       <button
         type="button"
         id={buttonId}
-        // Opening a row must not scroll it away: growth the reader asked for
-        // releases the tail instead of following it.
-        onClick={() => {
-          if (!expanded) { holdScroll(); pinRun() }
-          setExpanded((prev) => !prev)
-        }}
+        onClick={(event) => { event.stopPropagation(); toggle() }}
         aria-expanded={expanded}
         aria-controls={bodyId}
-        className={cn(rowClass, 'group/row cursor-pointer rounded-sm')}
-        {...(spec.title !== undefined ? { title: spec.title } : {})}
+        aria-label={expanded ? `Hide ${spec.kind} details` : `Show ${spec.kind} details`}
+        className="inline-flex shrink-0 items-center rounded-sm"
       >
-        {line}
-        <Icon
-          name="chevronRight"
-          size={14}
-          className={cn(
-            'shrink-0 text-fg-faint opacity-0 transition duration-200 group-hover/row:opacity-100 group-focus-visible/row:opacity-100 [@media(pointer:coarse)]:opacity-100',
-            expanded && 'rotate-90 opacity-100',
-          )}
-        />
+        {chevron}
       </button>
+    </div>
+  ) : (
+    <button
+      type="button"
+      id={buttonId}
+      onClick={toggle}
+      aria-expanded={expanded}
+      aria-controls={bodyId}
+      className={cn(rowClass, 'group/row cursor-pointer rounded-sm')}
+      {...(spec.title !== undefined ? { title: spec.title } : {})}
+    >
+      {line}
+      {chevron}
+    </button>
+  )
+  return (
+    <div className="flex min-w-0 flex-col">
+      {head}
       {expanded ? (
         <div id={bodyId} role="group" aria-labelledby={buttonId} className="flex min-w-0 flex-col gap-2 pt-2 animate-fade-up">
           {children}
@@ -535,21 +585,25 @@ const COLLAPSE_MIN_ROWS = 4
 /** Running outranks a settled failure: while work continues, that is the state. */
 const STATE_RANK: Readonly<Record<RowState, number>> = { running: 5, failed: 4, unknown: 3, cancelled: 1, denied: 1, ok: 0 }
 
-type Bucket = 'search' | 'file' | 'command' | 'change' | 'agent' | 'tool'
+type Bucket = 'search' | 'file' | 'command' | 'change' | 'agent' | 'wait' | 'tool'
 const BUCKET_WORDS: Readonly<Record<Bucket, readonly [string, string]>> = {
   file: ['file', 'files'],
   search: ['search', 'searches'],
   command: ['command', 'commands'],
   change: ['edit', 'edits'],
   agent: ['agent', 'agents'],
+  wait: ['wait', 'waits'],
   tool: ['tool', 'tools'],
 }
-const BUCKET_ORDER: readonly Bucket[] = ['file', 'search', 'command', 'change', 'agent', 'tool']
+const BUCKET_ORDER: readonly Bucket[] = ['file', 'search', 'command', 'change', 'agent', 'wait', 'tool']
+
+/** An MCP tool whose own name says it looks things up reads as a search, not an opaque tool. */
+const MCP_SEARCH = /search|retriev|grep|find|lookup|query/i
 
 function bucketOf(item: ViewItem): Bucket | null {
   if (item.kind === 'delegation') return 'agent'
   if (item.kind !== 'tool') return null
-  if (mcpServerOf(item.call.name) !== undefined) return 'tool'
+  if (mcpServerOf(item.call.name) !== undefined) return MCP_SEARCH.test(item.call.name.slice(item.call.name.lastIndexOf('__') + 2)) ? 'search' : 'tool'
   switch (item.call.name.toLowerCase()) {
     case 'read': return 'file'
     case 'glob':
@@ -557,7 +611,13 @@ function bucketOf(item: ViewItem): Bucket | null {
     case 'bash': return 'command'
     case 'edit':
     case 'write': return 'change'
-    case 'agent': return 'agent'
+    // Only a spawn starts an agent. A wait polls children already counted and
+    // list/cancel/reconcile/catalog are bookkeeping — counting them as agents
+    // made one reviewer plus nine waits read as `11 agents`.
+    case 'agent': {
+      const action = agentAction(item.call.args)
+      return action === 'spawn' ? 'agent' : action === 'wait' ? 'wait' : 'tool'
+    }
     default: return 'tool'
   }
 }
@@ -587,10 +647,20 @@ interface ActivitySummary {
   readonly diff: { readonly added: number; readonly removed: number }
 }
 
-/** One line for a whole run: what kind of work it was, counted, and how it ended. */
-export function summarizeActivity(items: readonly ViewItem[]): ActivitySummary {
+/**
+ * One line for a whole run: what kind of work it was, counted, and how it ended.
+ *
+ * `turnOpen`: the run is the tail of a turn still working. Between two steps
+ * no call is running, but the run is not done — it reads as live until the
+ * turn closes, so the header does not flip Working → Activity → Working on
+ * every step.
+ */
+export function summarizeActivity(items: readonly ViewItem[], turnOpen = false): ActivitySummary {
   const counts = new Map<Bucket, number>()
   const changedPaths = new Set<string>()
+  // Files count once however many windows of them were read.
+  const readPaths = new Set<string>()
+  let unnamedReads = 0
   let state: RowState = 'ok'
   let steps = 0
   let problems = 0
@@ -616,6 +686,10 @@ export function summarizeActivity(items: readonly ViewItem[]): ActivitySummary {
       if (STATE_RANK.failed > STATE_RANK[state]) state = 'failed'
     }
     if (bucket === 'change' && facts.path !== undefined) changedPaths.add(facts.path)
+    if (bucket === 'file') {
+      if (facts.path !== undefined) readPaths.add(facts.path)
+      else unnamedReads += 1
+    }
     if (bucket === 'change' && rowState === 'ok') {
       const lines = changeLines(item)
       added += lines.added
@@ -629,12 +703,15 @@ export function summarizeActivity(items: readonly ViewItem[]): ActivitySummary {
   const parts = BUCKET_ORDER
     .filter((bucket) => (counts.get(bucket) ?? 0) > 0)
     .map((bucket) => {
-      // A Changes run counts files, not calls: three edits to one file is one file changed.
-      const count = bucket === 'change' && group === GROUP_KIND.changes ? changedPaths.size || (counts.get(bucket) ?? 0) : counts.get(bucket) ?? 0
+      // Files, not calls: three edits to one file is one file changed, and
+      // three windows of one file is one file read.
+      const count = bucket === 'change' && group === GROUP_KIND.changes
+        ? changedPaths.size || (counts.get(bucket) ?? 0)
+        : bucket === 'file' ? readPaths.size + unnamedReads : counts.get(bucket) ?? 0
       const [one, many] = bucket === 'change' && group === GROUP_KIND.changes ? ['file', 'files'] : BUCKET_WORDS[bucket]
       return `${count} ${count === 1 ? one : many}`
     })
-  const live = state === 'running'
+  const live = state === 'running' || turnOpen
   return {
     state,
     live,
@@ -649,18 +726,23 @@ export function summarizeActivity(items: readonly ViewItem[]): ActivitySummary {
 }
 
 /**
- * A run of tool calls, delegations and audit lines. Four rows or more collapse
- * into one summary line once the work settles — `Explore · 2 searches, 3 files`
- * — so a turn that read twenty files reads as one step instead of twenty. It
- * stays open while anything is still running or ended badly, and a reader's
- * own toggle wins either way.
+ * A run of tool calls, delegations and audit lines. Four steps or more
+ * collapse into one summary line once the work settles — `Explore · 2
+ * searches, 3 files` — so a turn that read twenty files reads as one step
+ * instead of twenty.
+ *
+ * It stays open for as long as its turn is working (`turnOpen`), not only
+ * while a call runs: otherwise it would fold and unfold on every step. Once
+ * settled it folds even when something failed — the header's `1 failed`
+ * says so in red, and opening it is one click. A reader's own toggle wins
+ * either way.
  */
-export function ActivityBlock({ items, children }: { readonly items: readonly ViewItem[]; readonly children: ReactNode }) {
+export function ActivityBlock({ items, turnOpen = false, children }: { readonly items: readonly ViewItem[]; readonly turnOpen?: boolean; readonly children: ReactNode }) {
   const [userPreference, setUserPreference] = useState<boolean | null>(null)
   const holdScroll = useHoldScroll()
   const bodyId = useId()
-  const summary = useMemo(() => summarizeActivity(items), [items])
-  const open = userPreference ?? (summary.live || summary.problems > 0)
+  const summary = useMemo(() => summarizeActivity(items, turnOpen), [items, turnOpen])
+  const open = userPreference ?? summary.live
   // Opening a row inside the run is a decision to keep reading it. Without
   // this the run would fold shut when its last step settled and take the open
   // row (and anything it fetched) with it. A deliberate fold still wins.
@@ -669,10 +751,11 @@ export function ActivityBlock({ items, children }: { readonly items: readonly Vi
   // The same beat the transcript puts between blocks, so a row inside a run
   // sits exactly as far from its neighbour as a row that stands on its own.
   const rowGap = 'gap-2.5 sm:gap-4'
-  // Thinking rides along inside the run so it cannot split the column, but it
-  // is not a work row: counting it would fold three tool cards behind a summary.
-  const workRows = items.reduce((count, item) => count + (item.kind === 'assistant' ? 0 : 1), 0)
-  if (workRows < COLLAPSE_MIN_ROWS) return <div className={cn('flex flex-col', rowGap)}>{children}</div>
+  // Only calls and delegations count — the same steps the header counts.
+  // Thinking and audit notes ride along inside the run, but folding three
+  // tool cards plus an audit line behind a `3 files` summary hides more than
+  // it saves.
+  if (summary.steps < COLLAPSE_MIN_ROWS) return <div className={cn('flex flex-col', rowGap)}>{children}</div>
   const unknown = summary.problems > 0 && summary.state === 'unknown'
   return (
     <div className="flex flex-col">
@@ -761,6 +844,9 @@ function rowStatus(item: Extract<ViewItem, { kind: 'tool' }>, state: RowState, f
       if (['glob', 'grep'].includes(item.call.name.toLowerCase()) && /(?:^|\n)… \[search incomplete:/.test(output)) {
         return { text: 'Search incomplete', tone: 'warn', detail: excerptTail(output) }
       }
+      // `grep` with no match, `diff` with a difference: the exit is an answer.
+      // Named, quietly — not a failure.
+      if (facts.digestSoft === true && facts.digest !== undefined) return { text: capitalize(facts.digest), tone: 'quiet', detail: excerptTail(output) }
       // A command that ran and exited badly: the call succeeded, the work did not.
       return facts.digestFailed === true && facts.digest !== undefined ? { text: capitalize(facts.digest), tone: 'bad', detail: excerptTail(output) } : undefined
   }
@@ -773,7 +859,7 @@ function excerptTail(output: string, max = 400): string {
 }
 
 /** What one tool row draws. */
-function toolRowSpec(item: Extract<ViewItem, { kind: 'tool' }>, state: RowState, facts: ToolFacts, onOpenFile?: () => void): RowSpec {
+function toolRowSpec(item: Extract<ViewItem, { kind: 'tool' }>, state: RowState, facts: ToolFacts, opener?: { readonly open: () => void; readonly label: string }, repeats = 1): RowSpec {
   const { call, server } = item
   const builtin = mcpServerOf(call.name) === undefined ? call.name.toLowerCase() : ''
   const kindWords = KIND[builtin]
@@ -788,7 +874,8 @@ function toolRowSpec(item: Extract<ViewItem, { kind: 'tool' }>, state: RowState,
       ...base,
       icon: TOOL_ICON[builtin]!,
       kind: kind!,
-      primary: <FileChip path={facts.path} name={facts.file.name} {...(onOpenFile !== undefined ? { onOpen: onOpenFile } : {})} />,
+      primary: <FileChip path={facts.path} name={facts.file.name} {...(opener !== undefined ? { onOpen: opener.open, openLabel: opener.label } : {})} />,
+      ...(opener !== undefined ? { primaryOpens: true } : {}),
       ...(facts.file.directory !== '' ? { secondary: facts.file.directory } : {}),
       ...(lines !== undefined ? { diff: lines } : {}),
     }
@@ -808,6 +895,12 @@ function toolRowSpec(item: Extract<ViewItem, { kind: 'tool' }>, state: RowState,
     const action = typeof call.args['action'] === 'string' ? call.args['action'] : 'spawn'
     const role = typeof call.args['definition'] === 'string' ? call.args['definition'] : undefined
     const waitish = action !== 'spawn' && action !== 'catalog'
+    // What the wait came back with (`1 running`, `2 completed`): without it
+    // nine polls of one slow child read as nine identical, empty rows.
+    const outcome = waitish && state === 'ok' && facts.digest !== undefined ? facts.digest : undefined
+    const childIds = Array.isArray(call.args['childIds']) ? call.args['childIds'].length : 0
+    const scope = action === 'wait' && outcome === undefined && childIds > 0 ? `${childIds} ${childIds === 1 ? 'child' : 'children'}` : undefined
+    const secondary = outcome ?? scope
     return {
       ...base,
       icon: role !== undefined && !waitish ? agentRoleIcon(role) : 'gitBranch',
@@ -815,7 +908,8 @@ function toolRowSpec(item: Extract<ViewItem, { kind: 'tool' }>, state: RowState,
       ...(role !== undefined ? { kindDetail: role } : {}),
       chip: !waitish,
       separator: true,
-      primary: action,
+      primary: repeats > 1 ? `${action} · ${repeats} times` : action,
+      ...(secondary !== undefined ? { secondary } : {}),
     }
   }
   if (MEMORY_VERB[builtin] !== undefined) {
@@ -868,7 +962,7 @@ const panelText = 'm-0 px-3 py-2 font-mono text-[12px] leading-5'
 const BASH_TRAILER = /\n?\[(exit code: -?\d+|terminated[^\]]*)\]\s*$/
 
 /** A command's output without its trailer, and the trailer as a short footer. */
-function splitTerminalOutput(output: string): { body: string; footer?: { text: string; bad: boolean } } {
+function splitTerminalOutput(output: string, command = ''): { body: string; footer?: { text: string; bad: boolean } } {
   const match = BASH_TRAILER.exec(output)
   if (match === null) return { body: output.replace(/\s+$/, '') }
   const trailer = match[1]!
@@ -876,9 +970,50 @@ function splitTerminalOutput(output: string): { body: string; footer?: { text: s
   const body = output.slice(0, match.index).replace(/\s+$/, '')
   if (exit !== null) {
     // A clean exit is the expected case; the row already said nothing went wrong.
-    return Number(exit[1]) === 0 ? { body } : { body, footer: { text: `exit ${exit[1]}`, bad: true } }
+    const code = Number(exit[1])
+    return code === 0 ? { body } : { body, footer: { text: `exit ${exit[1]}`, bad: !exitIsAnswer(command, code) } }
   }
   return { body, footer: { text: trailer.replace(/;.*$/, ''), bad: true } }
+}
+
+/** File links inside a tool body: what to link, and the one delegated click that opens them. */
+interface PathLinks {
+  readonly linker: LineLinker
+  readonly onClick: (event: React.MouseEvent<HTMLElement>) => void
+}
+
+/**
+ * Links for a tool body whose text names files. Glob and Grep list paths in a
+ * known shape (relative to the project root, like the resolver expects); a
+ * command's text is free-form, so only path-shaped tokens count, re-rooted on
+ * a leading `cd <abs> &&`. A path the resolver refuses (outside the project,
+ * no project) stays text. Stable per call, so memoized bodies keep their HTML.
+ */
+function usePathLinks(builtin: string, command: string, openPath?: OpenPathResolver): PathLinks | undefined {
+  return useMemo(() => {
+    if (openPath === undefined || (builtin !== 'bash' && builtin !== 'grep' && builtin !== 'glob')) return undefined
+    const accept = (ref: PathRef): PathRef | null => (openPath(ref.path) !== null ? ref : null)
+    let linker: LineLinker
+    if (builtin === 'bash') {
+      const base = commandBase(command)
+      linker = freeTextLinker((ref) => {
+        const rebased = rebase(ref, base)
+        return rebased === null ? null : accept(rebased)
+      })
+    } else {
+      linker = searchLinker(builtin, accept)
+    }
+    const onClick = (event: React.MouseEvent<HTMLElement>): void => {
+      const target = (event.target as Element).closest(`[${PATH_LINK_ATTR}]`)
+      if (target === null) return
+      event.preventDefault()
+      event.stopPropagation()
+      const path = target.getAttribute(PATH_LINK_ATTR) ?? ''
+      const line = Number(target.getAttribute('data-line') ?? '')
+      openPath(path, Number.isInteger(line) && line > 0 ? { line } : undefined)?.()
+    }
+    return { linker, onClick }
+  }, [builtin, command, openPath])
 }
 
 /**
@@ -888,17 +1023,21 @@ function splitTerminalOutput(output: string): { body: string; footer?: { text: s
  * the ANSI colours the command emitted (`ansiToHtml` escapes every non-escape
  * byte, so tool text can never become markup); copy hands over the plain text.
  * A clean `exit 0` is not repeated; any other ending gets one short footer.
+ * With `links`, files the command or its output names open in the workbench.
  */
-function TerminalPanel({ command, output, running }: { readonly command: string; readonly output?: string; readonly running: boolean }) {
+function TerminalPanel({ command, output, running, links }: { readonly command: string; readonly output?: string; readonly running: boolean; readonly links?: PathLinks }) {
   const [commandOpen, setCommandOpen] = useState(false)
   const long = command.length > 240 || command.split('\n').length > 3
-  const split = output !== undefined ? splitTerminalOutput(output) : undefined
-  const html = useMemo(() => (split === undefined ? undefined : ansiToHtml(split.body)), [split])
+  const split = output !== undefined ? splitTerminalOutput(output, command) : undefined
+  const linker = links?.linker
+  const html = useMemo(() => (split === undefined ? undefined : ansiToHtml(split.body, linker)), [split, linker])
+  const commandHtml = useMemo(() => (linker === undefined ? undefined : ansiToHtml(command, linker)), [command, linker])
   return (
-    <div className={cn(panelClass, 'relative bg-term-bg font-mono text-[12px] leading-5 text-term-fg')}>
+    <div className={cn(panelClass, 'relative bg-term-bg font-mono text-[12px] leading-5 text-term-fg')} {...(links !== undefined ? { onClick: links.onClick } : {})}>
       <div className="border-b border-white/10 px-3 py-2 pr-10">
         <pre aria-label="Command" className={cn('m-0 whitespace-pre-wrap break-words', long && !commandOpen && 'line-clamp-3')}>
-          <span aria-hidden="true" className="select-none text-term-dim">$ </span><span>{command}</span>
+          <span aria-hidden="true" className="select-none text-term-dim">$ </span>
+          {commandHtml !== undefined ? <span dangerouslySetInnerHTML={{ __html: commandHtml }} /> : <span>{command}</span>}
         </pre>
         {long ? (
           <button
@@ -951,7 +1090,11 @@ function ChangePanel({ rows, path }: { readonly rows: readonly DiffRow[]; readon
 /** What came back, in the same frame — or the error, in the diff's red. With no
  *  output yet the frame is already there with its word, so settling changes a
  *  word inside the frame instead of moving the text that follows it. */
-function ResultPanel({ output, tone }: { readonly output?: string; readonly tone: 'plain' | 'bad' | 'quiet' }) {
+function ResultPanel({ output, tone, links }: { readonly output?: string; readonly tone: 'plain' | 'bad' | 'quiet'; readonly links?: PathLinks }) {
+  const linker = links?.linker
+  // Linked output goes through the same escaper the terminal uses: every byte
+  // that is not a recognised file reference stays text.
+  const html = useMemo(() => (output === undefined || output === '' || linker === undefined ? undefined : ansiToHtml(output, linker)), [output, linker])
   return (
     <div className={cn(panelClass, 'relative', tone === 'bad' && 'bg-bad-soft')}>
       {output === undefined ? (
@@ -961,8 +1104,10 @@ function ResultPanel({ output, tone }: { readonly output?: string; readonly tone
           tabIndex={0}
           aria-label="Tool output"
           className={cn(panelText, 'max-h-72 overflow-auto whitespace-pre-wrap break-words pr-10', tone === 'bad' ? 'text-bad' : tone === 'quiet' ? 'text-fg-muted' : 'text-fg')}
+          {...(html !== undefined ? { dangerouslySetInnerHTML: { __html: html } } : {})}
+          {...(links !== undefined ? { onClick: links.onClick } : {})}
         >
-          {output === '' ? 'No output.' : output}
+          {html !== undefined ? undefined : output === '' ? 'No output.' : output}
         </pre>
       )}
       {output !== undefined && output !== '' ? <CopyButton text={output} label="Copy output" className="absolute right-1 top-0.5 size-7" /> : null}
@@ -976,11 +1121,12 @@ function ResultPanel({ output, tone }: { readonly output?: string; readonly tone
  * from the session's process events and a jump to the workbench's Process
  * view — without these the row reads exactly like a command that finished.
  */
-function BashCard({ item, spec, state, command }: {
+function BashCard({ item, spec, state, command, links }: {
   readonly item: Extract<ViewItem, { kind: 'tool' }>
   readonly spec: RowSpec
   readonly state: RowState
   readonly command: string
+  readonly links?: PathLinks
 }) {
   const link = useContext(ProcessLinkContext)
   const processId = backgroundProcessId(item.call, item.result)
@@ -997,7 +1143,7 @@ function BashCard({ item, spec, state, command }: {
   return (
     <ActivityRow spec={specWithBackground} state={state}>
       <OutcomeNotes item={item} />
-      <TerminalPanel command={command} {...(item.result !== undefined ? { output: item.result.output } : {})} running={state === 'running'} />
+      <TerminalPanel command={command} {...(item.result !== undefined ? { output: item.result.output } : {})} running={state === 'running'} {...(links !== undefined ? { links } : {})} />
       {processId !== undefined && link !== null ? (
         <button
           type="button"
@@ -1034,13 +1180,22 @@ function CallDetails({ call }: { readonly call: ToolCall }) {
  * it is worth a look, how it ended. Opening it shows what the tool produced in
  * the shape that tool's output has — a terminal, a diff, a result.
  */
-export const ToolCard = memo(function ToolCard({ item, openPath, hidden }: { readonly item: Extract<ViewItem, { kind: 'tool' }>; readonly openPath?: OpenPathResolver; readonly hidden?: boolean }) {
+export const ToolCard = memo(function ToolCard({ item, openPath, openDiff, hidden, repeats }: {
+  readonly item: Extract<ViewItem, { kind: 'tool' }>
+  /** Consecutive identical waits this row stands for (itself included). */
+  readonly repeats?: number
+  readonly openPath?: OpenPathResolver
+  /** Opens a recorded path's diff in the workbench Git view; null when git cannot see it. */
+  readonly openDiff?: OpenPathResolver
+  readonly hidden?: boolean
+}) {
   const { call, result } = item
   const facts = toolFacts(call, result)
   const open = facts.path !== undefined ? openPath?.(facts.path, facts.focus) ?? null : null
   const state = toolState(item)
   const builtin = mcpServerOf(call.name) === undefined ? call.name.toLowerCase() : ''
   const arg = (key: string): string => (typeof call.args[key] === 'string' ? call.args[key] as string : '')
+  const links = usePathLinks(builtin, builtin === 'bash' ? arg('command') : '', openPath)
 
   // A delegation row renders the spawn itself — same child, one line — so the
   // tool call that only reports the same child id stays out of the transcript.
@@ -1050,7 +1205,7 @@ export const ToolCard = memo(function ToolCard({ item, openPath, hidden }: { rea
   // file is the link. Anything that did not land opens to say why.
   if (builtin === 'read' && facts.file !== undefined) {
     const settledClean = state === 'ok'
-    const spec = toolRowSpec(item, state, facts, settledClean && open !== null ? open : undefined)
+    const spec = toolRowSpec(item, state, facts, settledClean && open !== null ? { open, label: `Open ${facts.path ?? ''} in workbench` } : undefined)
     if (settledClean || state === 'running') return <ActivityRow spec={spec} state={state} expandable={false} />
     return (
       <ActivityRow spec={spec} state={state}>
@@ -1062,15 +1217,18 @@ export const ToolCard = memo(function ToolCard({ item, openPath, hidden }: { rea
     )
   }
 
-  const spec = toolRowSpec(item, state, facts)
-  if (builtin === 'bash') {
-    return <BashCard item={item} spec={spec} state={state} command={arg('command')} />
-  }
   if ((builtin === 'edit' || builtin === 'write') && facts.path !== undefined) {
     // A refused or failed change never landed: what to show is why, not lines
     // that are not in the file.
     const landed = state === 'ok' || state === 'running' || state === 'unknown'
     const rows = builtin === 'edit' ? diffRowsFromEdit(arg('old'), arg('new'), result?.output) : diffRowsFromWrite(arg('content'))
+    // A change that landed is reviewed where every change is: its file opens
+    // the Git view on that diff. Without one (no git wiring), the file itself.
+    const diff = state === 'ok' ? openDiff?.(facts.path) ?? null : null
+    const opener = diff !== null
+      ? { open: diff, label: `Show ${facts.path} diff in workbench` }
+      : state === 'ok' && open !== null ? { open, label: `Open ${facts.path} in workbench` } : undefined
+    const spec = toolRowSpec(item, state, facts, opener)
     return (
       <ActivityRow spec={spec} state={state}>
         <OutcomeNotes item={item} />
@@ -1083,12 +1241,20 @@ export const ToolCard = memo(function ToolCard({ item, openPath, hidden }: { rea
       </ActivityRow>
     )
   }
+  const spec = toolRowSpec(item, state, facts, undefined, repeats)
+  if (builtin === 'bash') {
+    return <BashCard item={item} spec={spec} state={state} command={arg('command')} {...(links !== undefined ? { links } : {})} />
+  }
+  // A search's list is only a list of files when the search ran; an error
+  // or a refusal is prose.
+  const searchLinks = (builtin === 'grep' || builtin === 'glob') && state === 'ok' ? links : undefined
   return (
     <ActivityRow spec={spec} state={state}>
       <OutcomeNotes item={item} />
       <ResultPanel
         {...(result === undefined ? { running: true as const } : { output: result.output })}
         tone={state === 'failed' ? 'bad' : state === 'denied' ? 'quiet' : 'plain'}
+        {...(searchLinks !== undefined ? { links: searchLinks } : {})}
       />
       <CallDetails call={call} />
     </ActivityRow>
@@ -1396,6 +1562,41 @@ export const ContinuationMarker = memo(function ContinuationMarker({ item }: {
       {open ? (
         <div className="mt-1.5 rounded-xl border border-line bg-surface px-3 py-2.5">
           <p className="m-0 max-h-72 overflow-y-auto whitespace-pre-wrap break-words text-xs leading-5 text-fg-muted">{item.content}</p>
+        </div>
+      ) : null}
+    </div>
+  )
+})
+
+/**
+ * Context a hook added for the model (UserPromptSubmit / SessionStart /
+ * SubagentStart additionalContext): one collapsed line, text one click away.
+ * The model read it; the user did not type it.
+ */
+export const HookContextMarker = memo(function HookContextMarker({ item }: {
+  readonly item: Extract<ViewItem, { kind: 'hook-context' }>
+}) {
+  const [open, setOpen] = useState(false)
+  const firstLine = item.content.split('\n', 1)[0] ?? ''
+  const event = /^(\w+) hook/.exec(firstLine)?.[1] ?? 'Hook'
+  const body = item.content.slice(firstLine.length).trim()
+  return (
+    <div className="min-w-0">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        title={item.ts !== undefined ? formatTime(item.ts) : undefined}
+        className="flex min-w-0 items-center gap-2 py-0.5 text-left text-xs text-fg-muted transition-colors hover:text-fg"
+      >
+        <Icon name="zap" size={13} className="shrink-0 text-fg-faint" />
+        <span className="shrink-0">{event} hook added context</span>
+        <span className="min-w-0 font-mono text-fg-faint">{body.length.toLocaleString()} chars</span>
+        <Icon name="chevron" size={12} className={cn('ml-auto shrink-0 text-fg-faint transition-transform', open ? 'rotate-180' : '')} />
+      </button>
+      {open ? (
+        <div className="mt-1.5 rounded-xl border border-line bg-surface px-3 py-2.5">
+          <p className="m-0 max-h-72 overflow-y-auto whitespace-pre-wrap break-words text-xs leading-5 text-fg-muted">{body}</p>
         </div>
       ) : null}
     </div>

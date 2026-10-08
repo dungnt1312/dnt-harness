@@ -160,7 +160,7 @@ describe('input acceptance over REST', () => {
         },
       }
     }
-    type LogEvent = { type: string; reason?: string; content?: string; delivery?: string; inputId?: string }
+    type LogEvent = { type: string; reason?: string; content?: string; delivery?: string; inputId?: string; outcome?: string }
     const ws = (id: string, action: string): string => `/api/workspaces/default/sessions/${id}/${action}`
     async function events(base: string, id: string): Promise<LogEvent[]> {
       const response = await fetch(`${base}${ws(id, 'events')}`)
@@ -258,6 +258,45 @@ describe('input acceptance over REST', () => {
         expect(ends(log)).toEqual(['steered', 'completed'])
         expect(users(log)).toEqual(['first', 'queued', 'instead'])
         expect(log.find((e) => e.type === 'input/queued' && e.content === 'instead')?.delivery).toBe('steer')
+        // The host stamps only input it dispatches at once (idle session).
+        const runsNow = (content: string): unknown => (log.find((e) => e.type === 'input/queued' && e.content === content) as { runsNow?: unknown } | undefined)?.runsNow
+        expect(runsNow('first')).toBe(true)
+        expect(runsNow('queued')).toBeUndefined()
+        expect(runsNow('instead')).toBeUndefined()
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('a queued input can be edited and deleted until a turn claims it', async () => {
+      const server = await createWebServer({ root, providers: [steerableProvider()] })
+      try {
+        const { id } = (await (await post(server.url, '/api/sessions')).json()) as { id: string }
+        await post(server.url, ws(id, 'messages'), { content: 'first' })
+        await settle(server.url, id, stepping)
+        const keep = (await (await post(server.url, ws(id, 'messages'), { content: 'typo' })).json()) as { inputId: string }
+        const drop = (await (await post(server.url, ws(id, 'messages'), { content: 'never mind' })).json()) as { inputId: string }
+        const input = (inputId: string, init: RequestInit): Promise<Response> =>
+          fetch(`${server.url}${ws(id, `inputs/${inputId}`)}`, init)
+
+        const edited = await input(keep.inputId, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'fixed' }) })
+        expect(edited.status).toBe(200)
+        expect(await edited.json()).toEqual({ inputId: keep.inputId, revised: true })
+        expect((await input(keep.inputId, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: '  ' }) })).status).toBe(400)
+        const deleted = await input(drop.inputId, { method: 'DELETE' })
+        expect(deleted.status).toBe(200)
+        expect(await deleted.json()).toEqual({ inputId: drop.inputId, withdrawn: true })
+        expect((await input(drop.inputId, { method: 'DELETE' })).status).toBe(404)
+        expect((await input('input_nope', { method: 'DELETE' })).status).toBe(404)
+
+        expect((await post(server.url, ws(id, 'steer'))).status).toBe(202)
+        const log = await settle(server.url, id, (l) => ends(l).length >= 2)
+        expect(ends(log)).toEqual(['steered', 'completed'])
+        // The model saw the revision; the deleted input never ran.
+        expect(users(log)).toEqual(['first', 'fixed'])
+        expect(log.find((e) => e.type === 'input/settled' && e.inputId === drop.inputId)?.outcome).toBe('withdrawn')
+        // Consumed: no longer editable.
+        expect((await input(keep.inputId, { method: 'DELETE' })).status).toBe(404)
       } finally {
         await server.close()
       }

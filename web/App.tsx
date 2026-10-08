@@ -28,6 +28,8 @@ import {
   searchProjectFiles,
   sendMessageIn,
   steerSessionIn,
+  reviseQueuedInputIn,
+  withdrawQueuedInputIn,
   type Delivery,
   uploadAttachment,
   stopSessionIn,
@@ -51,6 +53,7 @@ import { useSessionStream } from './hooks/useSessionStream.ts'
 import { useApprovalNotify } from './hooks/useApprovalNotify.ts'
 import { useWorkbenchPreferences } from './hooks/useWorkbenchPreferences.ts'
 import { useWorkbenchTabs } from './hooks/useWorkbenchTabs.ts'
+import { useTerminalProjects } from './hooks/useTerminalProjects.ts'
 import { useHotkeys } from './hooks/useHotkeys.ts'
 import { useMediaQuery } from './hooks/useMediaQuery.ts'
 import { useKeyboardInset } from './hooks/useKeyboardInset.ts'
@@ -70,7 +73,7 @@ import { TerminalDock } from './components/workbench/TerminalDock.tsx'
 import { useWorkbenchFiles } from './hooks/useWorkbenchFiles.ts'
 import { usePanelResize } from './hooks/usePanelResize.ts'
 import { toProjectRelative } from './lib/project-paths.ts'
-import { PANEL_LIMITS, type WorkbenchViewName } from './lib/workbench-preferences.ts'
+import { clampInspectorTab, PANEL_LIMITS, terminalProjectKey, withProjectTerminalTab, type WorkbenchViewName } from './lib/workbench-preferences.ts'
 import { LazySettings } from './components/settings/LazySettings.tsx'
 import { TaskStatus } from './components/chat/TaskStatus.tsx'
 import { QueuedBar } from './components/chat/QueuedBar.tsx'
@@ -419,7 +422,8 @@ function AppShell() {
   // Session-scoped state, not a preference: the review is a moment's focus.
   const [gitPathFilter, setGitPathFilter] = useState<readonly string[] | null>(null)
   // The Git view row a card's file click opened, pre-expanded to its diff.
-  const [gitFocusPath, setGitFocusPath] = useState<string | null>(null)
+  // A fresh object per click, so the same file clicked again focuses again.
+  const [gitFocusPath, setGitFocusPath] = useState<{ readonly path: string; readonly nonce: number } | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsSection, setSettingsSection] = useState<'providers' | 'projects' | 'permissions' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'>('providers')
   const [pendingDelete, setPendingDelete] = useState<SessionListing | null>(null)
@@ -495,7 +499,7 @@ function AppShell() {
   // workspace listing has confirmed membership. This prevents foreign or stale
   // deep links from ever opening an SSE connection.
   const validatedCurrent = listedWorkspace === activeWs && (sessions.some((session) => session.id === current) || (current !== null && createdHere.current.has(current))) ? current : null
-  const { events, items: projectedItems, approvals, questions, stream, error: streamError, dismissApproval, dismissQuestion, settled } = useSessionStream(activeWs, validatedCurrent)
+  const { events, items: projectedItems, approvals, questions, stream, error: streamError, dismissApproval, dismissQuestion } = useSessionStream(activeWs, validatedCurrent)
   const notify = useApprovalNotify(approvals, activeWorkspace?.name)
   // Everything the shell and its panels read from the log, derived once per
   // event arrival — each value gated on the event types it reads, so a
@@ -503,10 +507,6 @@ function AppShell() {
   const derived = useSessionDerivedValues(events, approvals.length, sending)
   const running = derived.running
   const currentSession = useMemo(() => sessions.find((session) => session.id === current) ?? null, [sessions, current])
-  // The stream's snapshot proves the turn state; until it lands, the listing's
-  // claim is the conservative answer. A running session never fetches a
-  // manifest, and "unknown" must not read as idle during that first moment.
-  const runningOrUnknown = running || (currentSession?.status === 'running' && !settled)
   /** Queued input as a strip above the composer, in submission order. */
   const queuedItems = useMemo(
     () => projectedItems.filter((item): item is Extract<ViewItem, { kind: 'user' }> => item.kind === 'user' && item.queued === true),
@@ -533,8 +533,7 @@ function AppShell() {
   // so one conversation's open tabs never leak into another while a child and
   // its parent read as one workbench.
   const workbenchTabsKey = activeWs !== null ? `${activeWs}:${subagentsRootId ?? 'draft'}` : null
-  const { tabs: sessionTabs, patchTabs: patchSessionTabs } = useWorkbenchTabs(workbenchTabsKey)
-  const inspectorTab = sessionTabs.inspectorTab
+  const { tabs: storedSessionTabs, patchTabs: patchSessionTabs } = useWorkbenchTabs(workbenchTabsKey)
   const currentSessionModelState = current !== null && activeWs !== null ? sessionModelStates.get(sessionModelKey(activeWs, current)) : undefined
   const currentSessionModel = currentSessionModelState?.status === 'ready' ? currentSessionModelState.model : undefined
   // A loaded conversation owns its values exactly, including deliberate nulls.
@@ -564,6 +563,42 @@ function AppShell() {
   )
   // Files browse the open conversation's project, or the draft's chosen project.
   const workbenchProject = current !== null ? currentProject : projects.find((project) => project.id === effectiveDraftProject) ?? null
+  // Terminal surfaces follow the folder, not the conversation: the footer and
+  // the workbench Terminal tab are one record per project, shared by every
+  // conversation in it and independent across folders. Until the session list
+  // has landed the project is unknown, so nothing is read or written.
+  const terminalStateKey = activeWs !== null && listedWorkspace === activeWs
+    ? terminalProjectKey(activeWs, workbenchProject?.id ?? null)
+    : null
+  const { state: terminalProjectState, patch: patchTerminalProject } = useTerminalProjects(
+    terminalStateKey,
+    storedSessionTabs.inspectorViews.includes('terminal'),
+  )
+  const sessionTabs = useMemo(() => {
+    const inspectorViews = withProjectTerminalTab(storedSessionTabs.inspectorViews, terminalProjectState.workbenchTab)
+    return { inspectorViews, inspectorTab: clampInspectorTab(storedSessionTabs.inspectorTab, inspectorViews) }
+  }, [storedSessionTabs, terminalProjectState.workbenchTab])
+  const inspectorTab = sessionTabs.inspectorTab
+  /**
+   * The strip as the Workbench writes it. Whether the Terminal tab is present
+   * is the project's call; the conversation's record keeps its own copy only
+   * so its selection and tab order survive normalization.
+   */
+  const setInspectorViews = useCallback((views: readonly WorkbenchViewName[]) => {
+    const terminalTab = views.includes('terminal')
+    if (terminalTab !== terminalProjectState.workbenchTab) patchTerminalProject({ workbenchTab: terminalTab })
+    patchSessionTabs({ inspectorViews: views })
+  }, [terminalProjectState.workbenchTab, patchTerminalProject, patchSessionTabs])
+  /**
+   * Selecting a view. The Terminal tab may be on screen only because the
+   * folder has it (another conversation opened it), so the strip is written
+   * with the selection — alone, the record's clamp would fold it to Files.
+   */
+  const setInspectorTab = useCallback((view: WorkbenchViewName) => {
+    patchSessionTabs(storedSessionTabs.inspectorViews.includes(view)
+      ? { inspectorTab: view }
+      : { inspectorTab: view, inspectorViews: [...storedSessionTabs.inspectorViews, view] })
+  }, [storedSessionTabs.inspectorViews, patchSessionTabs])
   const workbenchFiles = useWorkbenchFiles(activeWs !== null && workbenchProject !== null ? `${activeWs}:${workbenchProject.id}` : null)
   const openWorkbenchFile = workbenchFiles.openFile
   const openRecordedPath = useCallback((reference: string, focus?: FileFocus): (() => void) | null => {
@@ -594,12 +629,10 @@ function AppShell() {
    * strip in the same patch, or the clamp folds the selection back to Files.
    */
   const openWorkbenchView = useCallback((view: WorkbenchViewName) => {
-    patchSessionTabs({
-      inspectorTab: view,
-      inspectorViews: sessionTabs.inspectorViews.includes(view) ? sessionTabs.inspectorViews : [...sessionTabs.inspectorViews, view],
-    })
+    if (!sessionTabs.inspectorViews.includes(view)) setInspectorViews([...sessionTabs.inspectorViews, view])
+    setInspectorTab(view)
     onWorkbenchOpenChange(true)
-  }, [patchSessionTabs, sessionTabs.inspectorViews, onWorkbenchOpenChange])
+  }, [setInspectorViews, setInspectorTab, sessionTabs.inspectorViews, onWorkbenchOpenChange])
   /** The background process the Environment panel focused, if any. */
   const [processFocus, setProcessFocus] = useState<string | null>(null)
   /** The per-turn change card's Review all: the Git view narrowed to that turn's recorded files. */
@@ -611,7 +644,7 @@ function AppShell() {
   /** One card file row: the Git view over the whole project, its diff open. */
   const reviewTurnFile = useCallback((path: string) => {
     setGitPathFilter(null)
-    setGitFocusPath(path)
+    setGitFocusPath((previous) => ({ path, nonce: (previous?.nonce ?? 0) + 1 }))
     openWorkbenchView('git')
   }, [openWorkbenchView])
   /** Show all: the Git view without the turn's narrowing. */
@@ -951,13 +984,14 @@ function AppShell() {
 
   // Session whose manifest is currently on screen. A change means the user
   // switched conversations, which fetches at once; the same session refreshes
-  // on a short delay after a turn settles.
+  // shortly after each request is assembled, each step ends, and the turn ends
+  // — so the meter fills as soon as a message is sent, not only after the turn.
   const manifestSession = useRef<string | null>(null)
   // Composer context meter + inspector. The previous figures stay up until
   // the selected conversation's manifest arrives, so the meter never flashes
-  // empty. An in-flight turn keeps what it last showed.
+  // empty.
   useEffect(() => {
-    if (activeWs === null || current === null || runningOrUnknown) return
+    if (activeWs === null || current === null) return
     const switched = manifestSession.current !== `${activeWs}:${current}`
     manifestSession.current = `${activeWs}:${current}`
     let cancelled = false
@@ -970,12 +1004,12 @@ function AppShell() {
           if (!cancelled && currentRef.current === current && workspaceRef.current === activeWs) setManifest(null)
         },
       )
-    }, switched ? 0 : 600)
+    }, switched ? 0 : 150)
     return () => {
       cancelled = true
       clearTimeout(timer)
     }
-  }, [activeWs, current, runningOrUnknown, manifestKey])
+  }, [activeWs, current, manifestKey])
 
   useEffect(() => {
     if (streamError === null) return
@@ -1063,7 +1097,11 @@ function AppShell() {
       if (sessionId === null) {
         // Session creation is allowed to finish after navigation changes, but
         // only the operation's original navigation/workspace may select it.
-        const created = await createSessionIn(workspaceId, effectiveDraftProject ?? undefined)
+        const created = await createSessionIn(workspaceId, effectiveDraftProject ?? undefined, {
+          provider: effectiveProvider,
+          model: effectiveModel,
+          thinkingLevel: effectiveThinking,
+        })
         sessionId = created.id
         createdHere.current.add(sessionId)
         targetKey = composerKey(workspaceId, sessionId)
@@ -1104,7 +1142,7 @@ function AppShell() {
       sendingRef.current.delete(sourceKey)
       updateComposer(targetKey, (state) => ({ ...state, sending: false }))
     }
-  }, [current, composers, key, modelValue, activeWs, effectiveDraftProject, navigate, projects, refreshList, refreshWorkspaces, toast, runBuiltinCommand])
+  }, [current, composers, key, modelValue, effectiveProvider, effectiveModel, effectiveThinking, activeWs, effectiveDraftProject, navigate, projects, refreshList, refreshWorkspaces, toast, runBuiltinCommand])
 
   const stop = useCallback(async () => {
     if (current === null || activeWs === null) return
@@ -1157,6 +1195,27 @@ function AppShell() {
       void refreshWorkspaces()
     } catch (cause) {
       toast.notify(String(cause))
+    }
+  }, [current, activeWs, toast])
+
+  // Edit / delete one waiting message. Failures (e.g. 409: a turn already
+  // claimed it) are reported and rethrown so the row keeps its state.
+  const editQueued = useCallback(async (inputId: string, content: string) => {
+    if (current === null || activeWs === null) return
+    try {
+      await reviseQueuedInputIn(activeWs, current, inputId, content)
+    } catch (cause) {
+      toast.notify(String(cause))
+      throw cause
+    }
+  }, [current, activeWs, toast])
+  const deleteQueued = useCallback(async (inputId: string) => {
+    if (current === null || activeWs === null) return
+    try {
+      await withdrawQueuedInputIn(activeWs, current, inputId)
+    } catch (cause) {
+      toast.notify(String(cause))
+      throw cause
     }
   }, [current, activeWs, toast])
 
@@ -1355,8 +1414,10 @@ function AppShell() {
   const toggleTerminal = useCallback(() => {
     // Ctrl+` belongs to the chat footer. The workbench has its own Terminal
     // tab, opened from the view picker rather than this shortcut.
-    patchPreferences({ terminalOpen: !preferences.terminalOpen })
-  }, [preferences.terminalOpen, patchPreferences])
+    // The footer is the open folder's: toggling it here leaves every other
+    // folder's footer as it was.
+    patchTerminalProject({ footerOpen: !terminalProjectState.footerOpen })
+  }, [terminalProjectState.footerOpen, patchTerminalProject])
 
   useHotkeys([
     { key: 'n', mod: true, onPress: beginConversation },
@@ -1489,7 +1550,7 @@ function AppShell() {
     // until the composer's ArrowUp handler fires.
     for (let index = projectedItems.length - 1; index >= 0; index -= 1) {
       const item = projectedItems[index]
-      if (item !== undefined && item.kind === 'user') return item.content
+      if (item !== undefined && item.kind === 'user' && item.withdrawn !== true) return item.content
     }
     return null
   }, [projectedItems])
@@ -1565,9 +1626,9 @@ function AppShell() {
       workspaceId={activeWs}
       project={workbenchProject}
       view={inspectorTab}
-      onView={(view) => patchSessionTabs({ inspectorTab: view })}
+      onView={setInspectorTab}
       views={sessionTabs.inspectorViews}
-      onViews={(views) => patchSessionTabs({ inspectorViews: views })}
+      onViews={setInspectorViews}
       files={workbenchFiles}
       events={events}
       agentEvents={agentEvents}
@@ -1595,8 +1656,8 @@ function AppShell() {
       projectId={workbenchProject?.id ?? null}
       height={preferences.terminalHeight}
       resizeHandle={terminalResize}
-      open={preferences.terminalOpen}
-      onOpenChange={(terminalOpen) => patchPreferences({ terminalOpen })}
+      open={terminalProjectState.footerOpen}
+      onOpenChange={(footerOpen) => patchTerminalProject({ footerOpen })}
       defaultShell={preferences.terminalShell}
       onDefaultShell={(shellId) => patchPreferences({ terminalShell: shellId })}
       bindingReady={listedWorkspace === activeWs}
@@ -1726,12 +1787,15 @@ function AppShell() {
               )}
               <section aria-label="Conversation composer" className="shrink-0 px-3 pb-3 sm:px-6 sm:pb-4">
                 <div className="mx-auto flex w-full max-w-3xl flex-col gap-2">
-                  <QueuedBar items={queuedItems} running={running} onSendNow={sendQueuedNow} />
                   <TaskStatus events={events} pending={approvals.length} sending={sending} connected={stream !== 'reconnecting'} phase={derived.phase} todos={derived.todos} recovered={derived.recovered} />
                   <ApprovalBar key={key} approvals={approvals} scope={currentProject?.path ?? 'No project attached'} onAnswer={answer} />
                   <QuestionBar questions={questions} onAnswer={answerQuestionFn} />
                   {sendErrorNotice}
-                  {composerNode}
+                  {/* The queue docks onto the composer's top edge: no gap between them. */}
+                  <div className="flex flex-col">
+                    <QueuedBar items={queuedItems} workspaceId={activeWs} running={running} onSendNow={sendQueuedNow} onEdit={editQueued} onDelete={deleteQueued} />
+                    {composerNode}
+                  </div>
                 </div>
               </section>
             </>
@@ -1765,6 +1829,7 @@ function AppShell() {
       <LazySettings
         initialTab={settingsSection}
         workspaceName={activeWorkspace?.name}
+        activeProjectId={workbenchProject?.id ?? null}
         projects={projects}
         onProjectsChanged={refreshList}
         sessionCounts={sessionCounts}

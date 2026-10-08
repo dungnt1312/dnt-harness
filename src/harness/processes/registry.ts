@@ -174,7 +174,16 @@ export class ProcessRegistry {
       }, 20).unref?.()
     })
     input.child.on('error', () => settle('failed', null))
-    input.child.on('close', (code: number | null) => settle(record.killRequested ? 'killed' : 'exited', code))
+    input.child.on('close', (code: number | null) => {
+      if (record.backgrounded && !record.killRequested) {
+        // Root stdio closing does not prove its descendants have exited. Reap
+        // the detached process group before releasing ownership/runtime limits.
+        killTree(input.child, input.executable, input.treeTag)
+        setTimeout(() => settle('exited', code), 20).unref?.()
+        return
+      }
+      settle(record.killRequested ? 'killed' : 'exited', code)
+    })
   }
 
   read(sessionId: SessionId, processId: string): { output: string; outputTruncated: boolean; status: ProcessStatus; exitCode: number | null } | undefined {

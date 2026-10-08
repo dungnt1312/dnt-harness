@@ -104,7 +104,7 @@ export function attachPathScopeGuard(ctx: Context, options: PathScopeOptions): P
         case 'blocked':
           return { kind: 'deny', reason: `path '${target.target}' is refused: ${classified.reason}` }
         case 'denied':
-          return { kind: 'deny', reason: `path '${target.target}' is inside application-internal storage and is not accessible to tools` }
+          return { kind: 'deny', reason: `path '${target.target}' is inside application-internal storage or a protected credential folder and is not accessible to tools` }
         case 'read-only':
           return { kind: 'deny', reason: `path '${target.target}' is in a read-only granted folder (${classified.root.path})` }
         case 'in-grant':

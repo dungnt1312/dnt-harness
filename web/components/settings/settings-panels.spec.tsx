@@ -2,7 +2,7 @@
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { deleteMcpServer, duplicateModeFile, fetchProviderModels, getMcpServer, getModeFile, getSystemPrompts, HttpError, importAgentDefinition, importMcpServers, listModeFiles, listModes, putSystemPrompts, saveModeFile, setModeEnabled, testProvider, upsertMcpServer } from '../../lib/api.ts'
+import { cloneAgentToWorkspace, readAgentFile, deleteMcpServer, listAgentDefinitions, duplicateModeFile, fetchProviderModels, getMcpServer, getModeFile, getSystemPrompts, HttpError, importAgentDefinition, importMcpServers, listModeFiles, listModes, putSystemPrompts, saveModeFile, setModeEnabled, testProvider, upsertMcpServer } from '../../lib/api.ts'
 import { emptyModeForm, parseModeForm, permissionKeyError, serializeModeForm } from '../../lib/mode-form.ts'
 import { McpPanel } from './McpPanel.tsx'
 import { AgentsPanel, definitionDocument } from './AgentsPanel.tsx'
@@ -29,6 +29,8 @@ vi.mock('../../lib/api.ts', () => ({
   importMcpServers: vi.fn(async () => ({ imported: ['x'] })),
   setMcpServerAction: vi.fn(async () => ({ status: 'ready' })),
   listAgentDefinitions: vi.fn(async () => []),
+  cloneAgentToWorkspace: vi.fn(),
+  readAgentFile: vi.fn(),
   listChildren: vi.fn(async () => []),
   importAgentDefinition: vi.fn(async () => ({ imported: ['reviewer'] })),
   listModeFiles: vi.fn(async () => []),
@@ -97,7 +99,7 @@ describe('MCP panel', () => {
     expect(input('Command').value).toBe('npx')
     expect((input('Server name') as HTMLInputElement).disabled).toBe(true)
     await act(async () => type(input('Command'), 'node'))
-    await act(async () => button('Save changes').click())
+    await act(async () => button('Save server').click())
     expect(upsertMcpServer).toHaveBeenCalledWith('ws', 'fs', expect.objectContaining({
       transport: 'stdio', command: 'node', args: ['-y', 'fs-mcp'], env: { API_KEY: '${API_KEY}' }, timeoutMs: 5000,
     }))
@@ -108,7 +110,7 @@ describe('MCP panel', () => {
     await act(async () => root.render(<McpPanel workspaceId="ws" />))
     await settle()
     await act(async () => button('Edit fs').click())
-    await act(async () => button('Save changes').click())
+    await act(async () => button('Save server').click())
     await settle()
     expect(document.body.textContent).toContain('changed since this form was loaded')
     expect(input('Command').value).toBe('npx')
@@ -117,6 +119,10 @@ describe('MCP panel', () => {
   it('lists each tool the server discovered and marks names the allowlist hides', async () => {
     await act(async () => root.render(<McpPanel workspaceId="ws" />))
     await settle()
+    // The tool list folds behind a one-line exposure summary.
+    expect(document.body.textContent).toContain('1 exposed by the allowlist · 1 hidden')
+    expect(document.querySelector('[aria-label="Tools from fs"]')).toBeNull()
+    await act(async () => buttons().find((node) => node.textContent?.startsWith('2 tools') === true)!.click())
     const list = document.querySelector('[aria-label="Tools from fs"]')
     expect(list?.textContent).toContain('query')
     expect(list?.textContent).toContain('explode hidden')
@@ -126,9 +132,11 @@ describe('MCP panel', () => {
   it('deletes a server only after an inline confirmation', async () => {
     await act(async () => root.render(<McpPanel workspaceId="ws" />))
     await settle()
-    await act(async () => button('Delete fs').click())
+    // Delete lives in the row's overflow menu, then asks inline.
+    await act(async () => button('More actions for fs').click())
+    await act(async () => [...document.body.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((node) => node.textContent === 'Delete server')!.click())
     expect(deleteMcpServer).not.toHaveBeenCalled()
-    await act(async () => button('Delete server').click())
+    await act(async () => buttons().filter((node) => node.textContent === 'Delete server').at(-1)!.click())
     expect(deleteMcpServer).toHaveBeenCalledTimes(1)
     expect(deleteMcpServer).toHaveBeenCalledWith('ws', 'fs')
   })
@@ -155,6 +163,11 @@ describe('MCP panel', () => {
     expect(() => input('Server name')).toThrow()
     await act(async () => button('Add server').click())
     expect(input('Server name')).toBeTruthy()
+    // The editor replaces the list instead of stacking under it.
+    expect(document.querySelector('[aria-label="MCP servers"]')).toBeNull()
+    await act(async () => button('Back to servers').click())
+    expect(document.querySelector('[aria-label="MCP servers"]')).not.toBeNull()
+    await act(async () => button('Add server').click())
     // Advanced caps stay folded until asked for, so the common path is short.
     expect(() => input('CPU limit (%)')).toThrow()
     await act(async () => button('Advanced · tool exposure and resource limits').click())
@@ -174,7 +187,7 @@ describe('MCP panel', () => {
   it('imports Codex configuration with its pinned version', async () => {
     await act(async () => root.render(<McpPanel workspaceId="ws" />))
     await settle()
-    await act(async () => button('Import from a Claude .mcp.json or Codex configuration').click())
+    await act(async () => button('Import…').click())
     await act(async () => button('Codex (pinned)').click())
     await act(async () => type(input('Content'), '[mcp_servers.x]'))
     expect(button('Import servers').disabled).toBe(true)
@@ -184,57 +197,126 @@ describe('MCP panel', () => {
   })
 })
 
+describe('MCP panel replace guard', () => {
+  it('asks before "Add server" replaces a server with the same name', async () => {
+    await act(async () => root.render(<McpPanel workspaceId="ws" />))
+    await settle()
+    await act(async () => button('Add server').click())
+    await act(async () => { type(input('Server name'), 'fs'); type(input('Command'), 'node') })
+    await act(async () => button('Replace server…').click())
+    expect(upsertMcpServer).not.toHaveBeenCalled()
+    expect(document.body.textContent).toContain('Replace the existing “fs”?')
+    await act(async () => buttons().filter((node) => node.textContent === 'Replace server').at(-1)!.click())
+    await settle()
+    expect(upsertMcpServer).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe('agents panel', () => {
-  it('shows a real multi-line import placeholder', async () => {
+  const explorerRow = {
+    source: 'bundled',
+    definition: { name: 'explorer', description: 'Finds things', tools: ['Read'], disallowedTools: [], instructions: 'Look **around**.' },
+  }
+  const userRow = {
+    source: 'user',
+    path: '/home/u/.claude/agents/code-reviewer.md',
+    definition: { name: 'code-reviewer', description: 'Reviews code', tools: ['Read', 'Grep'], disallowedTools: [], instructions: 'Review.', model: 'haiku', droppedTools: ['WebFetch'], unsupported: ['memory'] },
+    modelResolution: { inherit: true, unresolved: 'haiku' },
+  }
+  const workspaceRow = {
+    source: 'workspace',
+    path: '/data/ws/agents/auditor-file.md',
+    overrides: ['user'],
+    definition: { name: 'auditor', description: 'Audits', tools: ['Read'], disallowedTools: [], instructions: 'Audit.', model: 'opus' },
+    modelResolution: { inherit: false, resolved: 'cliproxy:claude-opus-5-5' },
+  }
+
+  it('lists roles grouped by layer, opens the first, and shows detail beside the list', async () => {
+    vi.mocked(listAgentDefinitions).mockResolvedValueOnce([explorerRow, userRow, workspaceRow] as never)
     await act(async () => root.render(<AgentsPanel workspaceId="ws" />))
-    await act(async () => button('Import a definition').click())
-    const placeholder = input('Definition content').getAttribute('placeholder') ?? ''
+    await settle()
+    const groups = [...document.body.querySelectorAll('[role="listbox"] [role="group"]')].map((group) => group.getAttribute('aria-label'))
+    expect(groups).toEqual(['Workspace', '~/.claude', 'Bundled'])
+    // The most specific layer is first, and opened by default.
+    expect(document.body.querySelector('h3')?.textContent).toBe('auditor')
+    expect(document.body.textContent).toContain('opus → cliproxy:claude-opus-5-5')
+    await act(async () => [...document.body.querySelectorAll<HTMLButtonElement>('[role="option"]')].find((node) => node.textContent?.includes('code-reviewer'))!.click())
+    expect(document.body.textContent).toContain('haiku is not served by any provider here')
+    expect(document.body.textContent).toContain('WebFetch')
+    expect(document.body.textContent).toContain('Clone to workspace')
+    // Search narrows the list.
+    await act(async () => type(document.body.querySelector<HTMLInputElement>('input[aria-label="Search roles"]')!, 'explor'))
+    expect([...document.body.querySelectorAll('[role="option"]')].map((node) => node.textContent)).toEqual([expect.stringContaining('explorer')])
+  })
+
+  it('"Clone to workspace" copies the global role under the same name and opens its file', async () => {
+    const cloned = { source: 'workspace', path: '/data/ws/agents/code-reviewer.md', overrides: ['user'], definition: { ...userRow.definition } }
+    vi.mocked(listAgentDefinitions).mockResolvedValueOnce([userRow] as never).mockResolvedValueOnce([cloned] as never)
+    vi.mocked(cloneAgentToWorkspace).mockResolvedValueOnce({ definition: cloned } as never)
+    vi.mocked(readAgentFile).mockResolvedValueOnce({ content: '---\nname: code-reviewer\nmemory: project\n---\n\nReview.', hash: 'h1' })
+    await act(async () => root.render(<AgentsPanel workspaceId="ws" />))
+    await settle()
+    await act(async () => button('Clone to workspace').click())
+    await settle()
+    expect(cloneAgentToWorkspace).toHaveBeenCalledWith('ws', 'code-reviewer')
+    expect(readAgentFile).toHaveBeenCalledWith('ws', 'code-reviewer')
+    const file = input('Subagent file') as HTMLTextAreaElement
+    expect(file.value).toContain('memory: project')
+    await act(async () => type(file, file.value.replace('Review.', 'Review harder.')))
+    await act(async () => button('Save file').click())
+    const [, name, payload] = vi.mocked(importAgentDefinition).mock.calls[0]!
+    expect(name).toBe('code-reviewer')
+    expect(payload).toMatchObject({ dialect: 'claude', expectedHash: 'h1' })
+    expect(payload.content).toContain('memory: project')
+    expect(payload.content).toContain('Review harder.')
+  })
+
+  it('edits a workspace role in place, keeping its file name', async () => {
+    vi.mocked(listAgentDefinitions).mockResolvedValue([workspaceRow] as never)
+    await act(async () => root.render(<AgentsPanel workspaceId="ws" />))
+    await settle()
+    await act(async () => button('Edit').click())
+    await act(async () => type(input('Description'), 'Audits carefully'))
+    await act(async () => button('Save changes').click())
+    const [, file, payload] = vi.mocked(importAgentDefinition).mock.calls[0]!
+    expect(file).toBe('auditor-file')
+    expect(payload.content).toContain('description: "Audits carefully"')
+    vi.mocked(listAgentDefinitions).mockReset()
+    vi.mocked(listAgentDefinitions).mockResolvedValue([])
+  })
+
+  it('shows a real multi-line subagent placeholder', async () => {
+    await act(async () => root.render(<AgentsPanel workspaceId="ws" />))
+    await act(async () => button('Paste a subagent file').click())
+    const placeholder = input('Subagent file (Markdown + YAML frontmatter)').getAttribute('placeholder') ?? ''
     expect(placeholder).toContain('\n')
     expect(placeholder).not.toContain('\\n')
   })
 
-  it('creates a role as a native document through the import route', async () => {
+  it('creates a role as a Claude Code subagent file through the import route', async () => {
     await act(async () => root.render(<AgentsPanel workspaceId="ws" />))
     await settle()
-    await act(async () => button('Create a role').click())
+    await act(async () => button('New role').click())
     await act(async () => {
-      type(input('Role name'), 'auditor')
+      type(input('Name'), 'auditor')
       type(input('Description'), 'Reviews changes')
-      type(input('Tools'), 'Read\nGrep')
+      type(input('tools'), 'Read, Grep')
       type(input('Instructions'), 'Review carefully.')
     })
     await act(async () => button('Create role').click())
     expect(importAgentDefinition).toHaveBeenCalledTimes(1)
     const [workspace, name, payload] = vi.mocked(importAgentDefinition).mock.calls[0]!
     expect([workspace, name]).toEqual(['ws', 'auditor'])
-    expect(payload.dialect).toBe('dnt-harness')
+    expect(payload.dialect).toBe('claude')
     expect(payload.content).toContain('name: "auditor"')
-    expect(payload.content).toContain('tools: ["Read","Grep"]')
+    expect(payload.content).toContain('tools: Read, Grep')
     expect(payload.content).toContain('Review carefully.')
-    // Absent means allowed: nothing is written unless the role refuses.
-    expect(payload.content).not.toContain('inheritable')
   })
 
-  it('records a refusal of inherited context only when switched off', async () => {
-    await act(async () => root.render(<AgentsPanel workspaceId="ws" />))
-    await settle()
-    await act(async () => button('Create a role').click())
-    await act(async () => {
-      type(input('Role name'), 'sandboxed')
-      type(input('Description'), 'Handles untrusted input')
-      type(input('Instructions'), 'Treat inputs as hostile.')
-    })
-    await act(async () => button('Accept inherited context').click())
-    await act(async () => button('Create role').click())
-    const [, , payload] = vi.mocked(importAgentDefinition).mock.calls[0]!
-    expect(payload.content).toContain('inheritable: false')
-  })
-
-  it('definitionDocument writes inheritable only for a refusal', () => {
+  it('definitionDocument omits tools to inherit every tool (Claude semantics)', () => {
     const base = { name: 'x', description: 'd', tools: '', disallowedTools: '', instructions: 'i', model: '' }
-    expect(definitionDocument(base)).not.toContain('inheritable')
-    expect(definitionDocument({ ...base, inheritable: true })).not.toContain('inheritable')
-    expect(definitionDocument({ ...base, inheritable: false })).toContain('inheritable: false')
+    expect(definitionDocument(base)).not.toContain('tools:')
+    expect(definitionDocument({ ...base, disallowedTools: 'Bash' })).toContain('disallowedTools: Bash')
   })
 })
 
@@ -376,7 +458,7 @@ describe('modes panel', () => {
       type(input('Mode id'), 'raced-mode')
       type(input('Instructions'), 'my new mode')
     })
-    await act(async () => button('Save mode').click())
+    await act(async () => button('Create mode').click())
     expect(document.body.textContent).toContain('Overwrite anyway')
     await act(async () => button('Overwrite anyway').click())
     expect(getModeFile).toHaveBeenCalledWith('ws', 'raced-mode')
@@ -404,35 +486,54 @@ describe('modes panel', () => {
     expect(vi.mocked(saveModeFile).mock.calls[1]![3]).toBe('fresh-hash')
   })
 
-  it('toggles a mode between picker-visible and hidden via its checkbox, refreshing the app selection', async () => {
+  it('toggles a mode between picker-visible and hidden via its switch, refreshing the app selection', async () => {
     vi.mocked(listModeFiles)
       .mockResolvedValueOnce([workspaceMode])
       .mockResolvedValueOnce([{ ...workspaceMode, enabled: false }])
     const onChanged = vi.fn(async () => {})
     await act(async () => root.render(<ModesPanel workspaceId="ws" onChanged={onChanged} />))
     await settle()
-    const box = (): HTMLInputElement => document.body.querySelector<HTMLInputElement>('input[aria-label="Offer review-only in the composer picker"]')!
-    expect(box().checked).toBe(true)
+    // A switch (role="switch"), not a native checkbox: its state is aria-checked.
+    const box = (): HTMLButtonElement => document.body.querySelector<HTMLButtonElement>('[role="switch"][aria-label="Offer review-only in the composer picker"]')!
+    expect(box().getAttribute('aria-checked')).toBe('true')
     await act(async () => box().click())
     expect(setModeEnabled).toHaveBeenCalledWith('ws', 'review-only', false)
     expect(listModeFiles).toHaveBeenCalledTimes(2)
     expect(onChanged).toHaveBeenCalledTimes(1)
     expect(document.body.textContent).toContain('hidden from the composer picker')
-    expect(box().checked).toBe(false)
+    expect(box().getAttribute('aria-checked')).toBe('false')
 
     await act(async () => box().click())
     expect(setModeEnabled).toHaveBeenLastCalledWith('ws', 'review-only', true)
     expect(onChanged).toHaveBeenCalledTimes(2)
   })
 
-  it('surfaces the selected-mode refusal when unchecking a selected mode', async () => {
-    vi.mocked(listModeFiles).mockResolvedValue([workspaceMode])
-    vi.mocked(setModeEnabled).mockRejectedValueOnce(new Error("HTTP 409: mode 'review-only' is selected; select another mode before disabling it"))
+  it('locks the picker switch on for the selected mode, so the refused action is never offered', async () => {
+    vi.mocked(setModeEnabled).mockClear()
+    vi.mocked(listModeFiles).mockResolvedValue([bundledMode, workspaceMode])
+    vi.mocked(listModes).mockResolvedValue({ modes: [], selected: 'review-only', revision: 1 })
     await act(async () => root.render(<ModesPanel workspaceId="ws" />))
     await settle()
-    await act(async () => document.body.querySelector<HTMLInputElement>('input[aria-label="Offer review-only in the composer picker"]')!.click())
-    expect(document.body.querySelector('.error-notice')?.textContent ?? document.body.textContent).toContain('select another mode')
-    expect(listModeFiles).toHaveBeenCalledTimes(1)
+    const switchFor = (id: string): HTMLButtonElement =>
+      document.body.querySelector<HTMLButtonElement>(`[role="switch"][aria-label="Offer ${id} in the composer picker"]`)!
+    const selectedSwitch = switchFor('review-only')
+    expect(selectedSwitch.getAttribute('aria-checked')).toBe('true')
+    expect(selectedSwitch.disabled).toBe(true)
+    expect(selectedSwitch.closest('label')?.getAttribute('title')).toContain('Select another mode')
+    await act(async () => selectedSwitch.click())
+    expect(setModeEnabled).not.toHaveBeenCalled()
+    // Every other row stays switchable.
+    expect(switchFor('plan').disabled).toBe(false)
+  })
+
+  it('keeps the selected mode locked on even if its stored flag says hidden', async () => {
+    vi.mocked(listModeFiles).mockResolvedValue([{ ...workspaceMode, enabled: false }])
+    vi.mocked(listModes).mockResolvedValue({ modes: [], selected: 'review-only', revision: 1 })
+    await act(async () => root.render(<ModesPanel workspaceId="ws" />))
+    await settle()
+    const box = document.body.querySelector<HTMLButtonElement>('[role="switch"][aria-label="Offer review-only in the composer picker"]')!
+    expect(box.getAttribute('aria-checked')).toBe('true')
+    expect(box.disabled).toBe(true)
   })
 })
 
@@ -457,7 +558,7 @@ describe('settings dialog', () => {
   it('gives every section tab an icon', async () => {
     await render()
     const tabs = [...document.body.querySelectorAll('[role="tab"]')]
-    expect(tabs).toHaveLength(10)
+    expect(tabs).toHaveLength(11)
     for (const tab of tabs) expect(tab.querySelector('svg')).not.toBeNull()
   })
 
@@ -530,6 +631,34 @@ describe('settings dialog', () => {
     const rows = [...document.body.querySelectorAll('li')].map((node) => node.textContent ?? '')
     expect(rows.some((text) => text.includes('hand-added'))).toBe(true)
     expect(rows.some((text) => text.includes('auto'))).toBe(false)
+  })
+
+  it('reorders models with the grip handle, which marks the draft dirty', async () => {
+    await act(async () => root.render(
+      <SettingsModal
+        open
+        workspaceId="ws"
+        providers={[{ id: 'p1', name: 'local', baseUrl: 'http://localhost:8080/v1', enabled: true, keyMasked: '', models: ['alpha', 'beta', 'gamma'] }]}
+        activeProvider="p0"
+        onDismiss={() => {}}
+        onRefresh={async () => {}}
+      />,
+    ))
+    const order = (): string[] => [...document.body.querySelectorAll('li code')].map((node) => node.textContent ?? '')
+    const press = async (model: string, key: string): Promise<void> => {
+      const grip = document.body.querySelector<HTMLButtonElement>(`button[aria-label^="Reorder ${model} "]`)!
+      await act(async () => { grip.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true })) })
+    }
+    expect(order()).toEqual(['alpha', 'beta', 'gamma'])
+    await press('gamma', 'ArrowUp')
+    expect(order()).toEqual(['alpha', 'gamma', 'beta'])
+    await press('gamma', 'Home')
+    expect(order()).toEqual(['gamma', 'alpha', 'beta'])
+    await press('gamma', 'End')
+    expect(order()).toEqual(['alpha', 'beta', 'gamma'])
+    await press('alpha', 'ArrowDown')
+    expect(order()).toEqual(['beta', 'alpha', 'gamma'])
+    expect(button('Save changes').disabled).toBe(false)
   })
 
   it('edits one model in a dialog, carrying its overrides through a rename', async () => {
@@ -608,7 +737,7 @@ describe('system prompts panel', () => {
     expect(textarea('Subagent prompt (delegated roles)').value).toBe('DEFAULT CHILD')
 
     await act(async () => type(textarea('Base prompt (conversations)'), 'NEW BASE'))
-    await act(async () => button('Save').click())
+    await act(async () => button('Save changes').click())
     await settle()
     expect(vi.mocked(putSystemPrompts)).toHaveBeenCalledWith('ws-1', { base: 'NEW BASE', child: 'DEFAULT CHILD' }, 'h0')
     expect(document.body.textContent).toContain('Saved.')
@@ -617,7 +746,7 @@ describe('system prompts panel', () => {
     // no-override config on the server side (blank means default).
     await act(async () => button('Reset to default').click())
     expect(textarea('Base prompt (conversations)').value).toBe('DEFAULT BASE')
-    await act(async () => button('Save').click())
+    await act(async () => button('Save changes').click())
     await settle()
     expect(vi.mocked(putSystemPrompts)).toHaveBeenLastCalledWith('ws-1', { base: 'DEFAULT BASE', child: 'DEFAULT CHILD' }, 'h2')
   })

@@ -10,14 +10,14 @@ import { ModeMenu } from '../components/composer/ComposerControls.tsx'
 import { ToastHost, useToast } from '../components/common/Toast.tsx'
 import { ToolCard, ActivityBlock, AssistantMessage, DelegationCard, AuditLine, StatusLine, UserBubble, summarizeActivity } from '../components/chat/MessageParts.tsx'
 import { QueuedBar } from '../components/chat/QueuedBar.tsx'
-import { groupBlocks, turnFooters } from '../components/chat/Transcript.tsx'
+import { groupBlocks, rowItems, turnFooters } from '../components/chat/Transcript.tsx'
 import { activeMinimapIndex, minimapEntries, minimapPreview, minimapScrollTarget } from '../components/chat/ConversationMinimap.tsx'
 import { modeLabel, errorSummary } from './copy.ts'
 import { emptyDraft, textDraft } from './composer-draft.ts'
 import { budgetTone, formatTime } from './format.ts'
 import { hiddenSpawnCalls } from './spawn-merge.ts'
-import { projectItems } from './project.ts'
-import { compactSession, fetchHooks, saveHooks, renameWorkspace, listProjectFiles, readProjectFile } from './api.ts'
+import { createProjector, projectItems } from './project.ts'
+import { compactSession, fetchHooks, saveHooks, setHookActive, renameWorkspace, listProjectFiles, readProjectFile } from './api.ts'
 import { ContextPanel } from '../components/layout/ContextPanel.tsx'
 import { Workbench, type WorkbenchView } from '../components/workbench/Workbench.tsx'
 import { closeFileTab, useWorkbenchFiles } from '../hooks/useWorkbenchFiles.ts'
@@ -34,6 +34,7 @@ import type { SseEvent } from './types.ts'
 import type { ViewItem } from './project.ts'
 
 vi.mock('./api.ts', () => ({
+  attachmentUrl: (workspaceId: string, id: string) => `/api/workspaces/${workspaceId}/attachments/${id}`,
   renameWorkspace: vi.fn(async () => ({ id: 'w1', name: 'Renamed', archived: false, createdAt: 0 })),
   setWorkspaceArchived: vi.fn(async () => ({ id: 'w1', name: 'W', archived: true, createdAt: 0 })),
   deleteWorkspace: vi.fn(async () => ({ deleted: true })),
@@ -42,8 +43,9 @@ vi.mock('./api.ts', () => ({
   saveSkill: vi.fn(async () => ({ name: 's', hash: 'h' })),
   getSkill: vi.fn(async () => ({ name: 's', title: 's', description: '', source: 'workspace' as const, hash: 'h', instructions: 'body' })),
   deleteSkill: vi.fn(async () => ({ deleted: true })),
-  fetchHooks: vi.fn(async () => ({ version: 1 as const, hooks: {} })),
+  fetchHooks: vi.fn(async () => ({ file: '/ws/settings.json', hooks: {}, disableAllHooks: false, sources: [], effective: [], disabled: false, diagnostics: [] })),
   saveHooks: vi.fn(async () => ({ saved: true })),
+  setHookActive: vi.fn(async (_ws: string, id: string, active: boolean) => ({ id, active })),
   searchMemory: vi.fn(async () => []),
   readMemory: vi.fn(async () => ({ id: 'm', title: 'm', pinned: false, createdAt: 0, updatedAt: 0, body: 'b', hash: 'h' })),
   createMemory: vi.fn(async () => ({ id: 'm', title: 'm', pinned: false, createdAt: 0, updatedAt: 0, body: 'b', hash: 'h' })),
@@ -279,6 +281,30 @@ describe('transcript grouping', () => {
   })
 })
 
+describe('transcript grouping: hidden spawns and open turns', () => {
+  const shape = (blocks: ReturnType<typeof groupBlocks>) => blocks.map((block) => block.kind === 'activity' ? `activity:${block.rows.length}:${block.turnOpen ? 'open' : 'closed'}` : block.row.item.kind)
+  const step = (turnOpen: boolean) => ({ kind: 'assistant' as const, content: '', live: false, thinking: [] as string[], thinkingLive: false, turnId: 't1', turnOpen })
+  it('leaves a spawn call its delegation row absorbed out of the run', () => {
+    const blocks = groupBlocks([
+      { kind: 'user', content: 'go' },
+      { kind: 'tool', call: { id: 'spawn', name: 'Agent', args: { action: 'spawn' } }, result: { ok: true, output: '{}' } },
+      { kind: 'delegation', childSessionId: 'child', definition: 'explorer', brief: 'look', status: 'completed' },
+      { kind: 'tool', call: { id: 'a', name: 'Read', args: {} } },
+    ], new Set(['spawn']))
+    expect(shape(blocks)).toEqual(['user', 'activity:2:closed'])
+  })
+  it('marks the tail run of a turn still open, even between steps with nothing running', () => {
+    const items = [
+      { kind: 'user' as const, content: 'go' },
+      step(true),
+      { kind: 'tool' as const, call: { id: 'a', name: 'Read', args: {} }, result: { ok: true, output: 'x' } },
+      step(true),
+    ]
+    expect(shape(groupBlocks(items))).toEqual(['user', 'activity:1:open'])
+    expect(shape(groupBlocks(items.map((item) => item.kind === 'assistant' ? step(false) : item)))).toEqual(['user', 'activity:1:closed'])
+  })
+})
+
 describe('activity block summary', () => {
   const toolRow = (id: string, name: string, ok = true): Extract<ViewItem, { kind: 'tool' }> => ({
     kind: 'tool', call: { id, name, args: name === 'Grep' ? { pattern: id } : name === 'Bash' ? { command: `echo ${id}` } : { path: `app/Services/Deep/Nested/${id}.php` } }, result: { ok, output: 'x' }, ts: 0, doneAt: 5,
@@ -299,11 +325,11 @@ describe('activity block summary', () => {
     expect(toggles().length).toBe(2)
     expect(host.textContent).toContain('c.php')
   })
-  it('keeps a run open, and says how many rows need attention, when one failed', async () => {
+  it('folds a settled run even when one failed, and says how many need attention', async () => {
     const rows = [toolRow('a', 'Read'), toolRow('b', 'Read'), toolRow('c', 'Bash', false), toolRow('d', 'Read')]
     await mount(<ActivityBlock items={rows}>{rows.map((row) => <ToolCard key={row.call.id} item={row} />)}</ActivityBlock>)
     const header = host.querySelector('button')!
-    expect(header.getAttribute('aria-expanded')).toBe('true')
+    expect(header.getAttribute('aria-expanded')).toBe('false')
     expect(header.textContent).toContain('1 failed')
   })
   it('leaves a short run alone — no summary to hide three rows behind', async () => {
@@ -456,9 +482,45 @@ describe('queued input bubble', () => {
       { kind: 'user', content: 'First', queued: true, inputId: 'i1' },
       { kind: 'user', content: 'Second', queued: true, inputId: 'i2' },
     ]} running />)
-    expect(host.textContent).toContain('2 messages')
-    expect(host.textContent).toContain('runs after the current turn')
+    expect(host.textContent).toContain('2 queued')
+    expect(host.textContent).not.toContain('runs after the current turn')
     expect(host.textContent.indexOf('First')).toBeLessThan(host.textContent.indexOf('Second'))
+  })
+  it('shows image attachments as thumbnails and other files by name, not a count', async () => {
+    await mount(<QueuedBar workspaceId="ws" items={[{
+      kind: 'user', content: 'Look', queued: true, inputId: 'i1',
+      attachments: [
+        { id: 'a1', name: 'shot.png', mediaType: 'image/png', bytes: 10 },
+        { id: 'a2', name: 'notes.pdf', mediaType: 'application/pdf', bytes: 20 },
+      ],
+    }]} running />)
+    const image = host.querySelector('img') as HTMLImageElement
+    expect(image.alt).toBe('shot.png')
+    expect(image.getAttribute('src')).toContain('a1')
+    expect(host.textContent).toContain('notes.pdf')
+    expect(host.textContent).not.toContain('attachment')
+  })
+  it('edits a queued message in place and deletes one', async () => {
+    const onEdit = vi.fn(async () => {})
+    const onDelete = vi.fn(async () => {})
+    await mount(<QueuedBar items={[{ kind: 'user', content: 'Typo', queued: true, inputId: 'i1' }]} running onEdit={onEdit} onDelete={onDelete} />)
+    await act(async () => (host.querySelector('[aria-label="Delete queued message"]') as HTMLButtonElement).click())
+    expect(onDelete).toHaveBeenCalledWith('i1')
+    await act(async () => (host.querySelector('button[aria-label="Edit queued message"]') as HTMLButtonElement).click())
+    const field = host.querySelector('textarea') as HTMLTextAreaElement
+    expect(field.value).toBe('Typo')
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(field, 'Fixed')
+      field.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => button('Save').click())
+    expect(onEdit).toHaveBeenCalledWith('i1', 'Fixed')
+    expect(host.querySelector('textarea')).toBeNull()
+  })
+  it('a steer that is stopping the turn cannot be edited or deleted', async () => {
+    await mount(<QueuedBar items={[{ kind: 'user', content: 'Now', queued: true, inputId: 's', steer: true }]} running onEdit={vi.fn()} onDelete={vi.fn()} />)
+    expect(host.querySelector('[aria-label="Edit queued message"]')).toBeNull()
+    expect(host.querySelector('[aria-label="Delete queued message"]')).toBeNull()
   })
   it('renders nothing without queued messages', async () => {
     await mount(<QueuedBar items={[]} running onSendNow={vi.fn()} />)
@@ -539,6 +601,17 @@ describe('queued input projection', () => {
     expect(items).toHaveLength(1)
     expect(items[0]).toMatchObject({ kind: 'user', content: 'Run the migration', queued: false })
   })
+  it('a revised input shows and runs with its new text; a withdrawn one leaves the queue', () => {
+    const items = projectItems([
+      { type: 'input/queued', seq: 0, inputId: 'i1', content: 'Typo' },
+      { type: 'input/queued', seq: 1, inputId: 'i2', content: 'Drop me' },
+      { type: 'input/revised', seq: 2, inputId: 'i1', content: 'Fixed' },
+      { type: 'input/settled', seq: 3, inputId: 'i2', outcome: 'withdrawn' },
+    ])
+    expect(items[0]).toMatchObject({ content: 'Fixed', queued: true, inputId: 'i1' })
+    expect(items[1]).toMatchObject({ content: 'Drop me', queued: false, withdrawn: true })
+    expect(items[1]).not.toHaveProperty('notSent')
+  })
   it('keeps the twin queued until its own inputId is consumed', () => {
     const items = projectItems([
       { type: 'input/queued', seq: 0, inputId: 'i1', content: 'First' },
@@ -546,8 +619,61 @@ describe('queued input projection', () => {
       { type: 'user/message', seq: 2, inputId: 'i1', content: 'First' },
     ])
     expect(items).toHaveLength(2)
-    expect(items[0]).toMatchObject({ content: 'First', queued: false })
-    expect(items[1]).toMatchObject({ content: 'Second', queued: true })
+    const byContent = (content: string) => items.find((item) => item.kind === 'user' && item.content === content)
+    expect(byContent('First')).toMatchObject({ queued: false })
+    expect(byContent('Second')).toMatchObject({ queued: true })
+  })
+  it('a message queued behind a turn opens the turn that runs it, below the earlier answer', () => {
+    const items = projectItems([
+      { type: 'turn/start', seq: 0, turnId: 't1' },
+      { type: 'user/message', seq: 1, turnId: 't1', inputId: 'i0', content: 'First ask' },
+      { type: 'input/queued', seq: 2, inputId: 'i1', content: 'Follow-up' },
+      { type: 'assistant/chunk', seq: 3, turnId: 't1', stepId: 's1', delta: 'First answer' },
+      { type: 'turn/end', seq: 4, turnId: 't1' },
+      { type: 'turn/start', seq: 5, turnId: 't2' },
+      { type: 'user/message', seq: 6, turnId: 't2', inputId: 'i1', content: 'Follow-up' },
+      { type: 'assistant/chunk', seq: 7, turnId: 't2', stepId: 's2', delta: 'Second answer' },
+    ] as never)
+    const order = items.map((item) => (item.kind === 'user' || item.kind === 'assistant' ? item.content : item.kind))
+      .filter((text) => typeof text === 'string' && /ask|answer|Follow-up/.test(text))
+    expect(order).toEqual(['First ask', 'First answer', 'Follow-up', 'Second answer'])
+  })
+  it('moving a consumed twin keeps incremental projection identical to a full replay', () => {
+    const events = [
+      { type: 'turn/start', seq: 0, turnId: 't1' },
+      { type: 'user/message', seq: 1, turnId: 't1', inputId: 'i0', content: 'First ask' },
+      { type: 'input/queued', seq: 2, inputId: 'i1', content: 'Follow-up' },
+      { type: 'assistant/chunk', seq: 3, turnId: 't1', stepId: 's1', delta: 'First answer' },
+      { type: 'turn/end', seq: 4, turnId: 't1' },
+      { type: 'turn/start', seq: 5, turnId: 't2' },
+      { type: 'user/message', seq: 6, turnId: 't2', inputId: 'i1', content: 'Follow-up' },
+      { type: 'assistant/chunk', seq: 7, turnId: 't2', stepId: 's2', delta: 'Second answer' },
+    ] as never as Parameters<typeof projectItems>[0]
+    const projector = createProjector()
+    let last: readonly unknown[] = []
+    for (const event of events) last = projector.apply([event])
+    expect(last).toEqual(projectItems(events))
+  })
+  it('input the host dispatches at once renders as a sent message, never as queued', () => {
+    const accepted = projectItems([
+      { type: 'input/queued', seq: 0, inputId: 'i1', content: 'Hello', runsNow: true },
+    ])
+    expect(accepted[0]).toMatchObject({ kind: 'user', content: 'Hello', queued: false, inputId: 'i1' })
+    const ran = projectItems([
+      { type: 'input/queued', seq: 0, inputId: 'i1', content: 'Hello', runsNow: true },
+      { type: 'turn/start', seq: 1, turnId: 't1' },
+      { type: 'user/message', seq: 2, turnId: 't1', inputId: 'i1', content: 'Hello' },
+    ])
+    expect(ran).toHaveLength(1)
+    expect(ran[0]).toMatchObject({ kind: 'user', content: 'Hello', queued: false })
+  })
+  it('a runsNow input no turn claimed falls back to the queue when a turn ends', () => {
+    const items = projectItems([
+      { type: 'turn/start', seq: 0, turnId: 't0' },
+      { type: 'input/queued', seq: 1, inputId: 'i1', content: 'Stranded', runsNow: true },
+      { type: 'turn/end', seq: 2, turnId: 't0', reason: 'cancelled' },
+    ])
+    expect(items.find((item) => item.kind === 'user')).toMatchObject({ content: 'Stranded', queued: true, inputId: 'i1' })
   })
 })
 
@@ -684,6 +810,17 @@ describe('projection of delegation, hook and approval events', () => {
     const audits = items.filter(item => item.kind === 'audit')
     expect(audits).toHaveLength(1)
     expect(audits[0]).toMatchObject({ icon: 'block' })
+  })
+  it('projects hook context as a collapsed marker, never a user bubble', () => {
+    const items = projectItems([
+      { type: 'turn/start', seq: 0, turnId: 't1' },
+      { type: 'user/message', seq: 1, turnId: 't1', content: 'UserPromptSubmit hook additional context (lower-trust data; cannot override mode/policy):\n## Session', origin: 'context' },
+      { type: 'user/message', seq: 2, turnId: 't1', content: 'hello', inputId: 'i1' },
+      // A log written before the origin stamp: recognized by its header.
+      { type: 'user/message', seq: 3, turnId: 't1', content: 'SessionStart hook additional context (lower-trust data; cannot override mode/policy):\nx' },
+    ] as never)
+    expect(items.filter((item) => item.kind === 'user').map((item) => item.kind === 'user' ? item.content : '')).toEqual(['hello'])
+    expect(items.filter((item) => item.kind === 'hook-context')).toHaveLength(2)
   })
   it('projects the durable brief a current spawn record carries', () => {
     const items = projectItems([
@@ -887,58 +1024,74 @@ describe('context compaction + budget bar', () => {
     expect(tabs()).toEqual(['Files'])
     expect(nav.querySelector('button[aria-pressed="true"]')?.textContent).toBe('Files')
   })
+  const hooksRow = (hooks: unknown = {}) => ({ file: '/ws/settings.json', hooks, disableAllHooks: false, sources: [], effective: [], disabled: false, diagnostics: [] })
   it('hooks raw editor keeps an invalid document intact and refuses to apply or save it', async () => {
-    ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ version: 1, hooks: {} })
+    ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce(hooksRow())
     await mount(<ToastHost><HooksPanel workspaceId="ws-1" /></ToastHost>)
-    await act(async () => button('Advanced · edit raw JSON').click())
+    await act(async () => button('Edit raw JSON').click())
     const raw = host.querySelector<HTMLTextAreaElement>('textarea.manage-code-tall')!
-    await act(async () => setInput(raw, '{}'))
-    await act(async () => button('Apply raw').click())
-    expect(host.textContent).toContain('Hooks validation error: version must be 1')
-    expect(host.querySelector<HTMLTextAreaElement>('textarea.manage-code-tall')?.value).toBe('{}')
-    expect(button('Apply raw')).not.toBeUndefined()
+    await act(async () => setInput(raw, '[]'))
+    await act(async () => button('Apply JSON').click())
+    expect(host.textContent).toContain('Hooks validation error: "hooks" must be an object')
+    expect(host.querySelector<HTMLTextAreaElement>('textarea.manage-code-tall')?.value).toBe('[]')
+    expect(button('Apply JSON')).not.toBeUndefined()
     expect(saveHooks).not.toHaveBeenCalled()
   })
   it.each([
-    ['unknown top-level key', '{\n  "version": 1,\n  "hooks": {},\n  "extra": true\n}', 'unknown top-level key "extra"'],
-    ['unknown binding key', '{"version":1,"hooks":{"PreToolUse":[{"matcher":"*","type":"command","command":"node guard.mjs","onFailure":"deny","extra":true}]}}', 'PreToolUse[0] has unknown key "extra"'],
+    ['unknown event', '{"Nope":[]}', 'unknown hook event "Nope"'],
+    ['non-command hook', '{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"prompt","prompt":"x"}]}]}', 'type must be "command"'],
   ])('hooks raw editor keeps %s verbatim/open and issues zero PUT', async (_case, draft, error) => {
-    ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ version: 1, hooks: {} })
+    ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce(hooksRow())
     await mount(<ToastHost><HooksPanel workspaceId="ws-1" /></ToastHost>)
-    await act(async () => button('Advanced · edit raw JSON').click())
+    await act(async () => button('Edit raw JSON').click())
     const raw = host.querySelector<HTMLTextAreaElement>('textarea.manage-code-tall')!
     await act(async () => setInput(raw, draft))
-    await act(async () => button('Apply raw').click())
+    await act(async () => button('Apply JSON').click())
     expect(host.textContent).toContain(error)
     expect(host.querySelector<HTMLTextAreaElement>('textarea.manage-code-tall')?.value).toBe(draft)
-    expect(button('Apply raw')).not.toBeUndefined()
+    expect(button('Apply JSON')).not.toBeUndefined()
     expect(saveHooks).not.toHaveBeenCalled()
   })
-  it('hooks raw editor validates then saves the exact whole document', async () => {
-    ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ version: 1, hooks: {} })
+  it('hooks raw editor validates then saves the exact Claude hooks section', async () => {
+    ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce(hooksRow())
     await mount(<ToastHost><HooksPanel workspaceId="ws-1" /></ToastHost>)
-    await act(async () => button('Advanced · edit raw JSON').click())
+    await act(async () => button('Edit raw JSON').click())
     const raw = host.querySelector<HTMLTextAreaElement>('textarea.manage-code-tall')!
-    const doc = { version: 1 as const, hooks: { UserPromptSubmit: [{ matcher: '*', type: 'command' as const, command: 'node prompt.mjs', args: ['--safe'], timeoutMs: 700, onFailure: 'deny' as const }] } }
-    await act(async () => setInput(raw, JSON.stringify(doc)))
-    await act(async () => button('Apply raw').click())
-    await act(async () => button('Save hooks').click())
-    expect(saveHooks).toHaveBeenCalledWith('ws-1', doc)
+    const hooks = { UserPromptSubmit: [{ hooks: [{ type: 'command' as const, command: 'node prompt.mjs --safe', timeout: 7 }] }] }
+    await act(async () => setInput(raw, JSON.stringify(hooks)))
+    await act(async () => button('Apply JSON').click())
+    await act(async () => button('Save changes').click())
+    expect(saveHooks).toHaveBeenCalledWith('ws-1', hooks, false)
   })
-  it('hooks editor lists every event section and saves the edited document', async () => {
-    ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-      version: 1,
-      hooks: { PreToolUse: [{ matcher: 'Bash*', type: 'command' as const, command: 'node guard.mjs', onFailure: 'deny' as const }] },
-    })
+  it('hooks editor lists every event section and saves the edited section', async () => {
+    ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce(hooksRow({ PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'node guard.mjs' }] }] }))
     await mount(<ToastHost><HooksPanel workspaceId="ws-1" /></ToastHost>)
-    for (const label of ['PreToolUse', 'PostToolUse', 'UserPromptSubmit', 'SessionStart', 'SessionEnd', 'PreCompact']) expect(host.textContent).toContain(label)
+    for (const label of ['PreToolUse', 'PostToolUse', 'UserPromptSubmit', 'Stop', 'SubagentStop', 'SessionStart', 'SessionEnd', 'PreCompact', 'Notification']) expect(host.textContent).toContain(label)
     const matcher = host.querySelector<HTMLInputElement>('.hooks-binding input')!
-    expect(matcher.value).toBe('Bash*')
-    await act(async () => setInput(matcher, 'Bash'))
-    await act(async () => [...host.querySelectorAll('button')].find(b => b.textContent === 'Save hooks')!.click())
-    expect(saveHooks).toHaveBeenCalledWith('ws-1', expect.objectContaining({
-      hooks: expect.objectContaining({ PreToolUse: [expect.objectContaining({ matcher: 'Bash', command: 'node guard.mjs' })] }),
-    }))
+    expect(matcher.value).toBe('Bash')
+    await act(async () => setInput(matcher, 'Write|Edit'))
+    await act(async () => [...host.querySelectorAll('button')].find(b => b.textContent === 'Save changes')!.click())
+    expect(saveHooks).toHaveBeenCalledWith('ws-1', { PreToolUse: [{ matcher: 'Write|Edit', hooks: [{ type: 'command', command: 'node guard.mjs' }] }] }, false)
+  })
+
+  it('hooks editor asks before removing a hook', async () => {
+    ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce(hooksRow({ PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'node guard.mjs' }] }] }))
+    await mount(<ToastHost><HooksPanel workspaceId="ws-1" /></ToastHost>)
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Remove PreToolUse hook 1"]')!.click())
+    // Still there until confirmed.
+    expect(host.querySelectorAll('.hooks-binding')).toHaveLength(1)
+    await act(async () => [...host.querySelectorAll('button')].find(b => b.textContent === 'Remove')!.click())
+    expect(host.querySelectorAll('.hooks-binding')).toHaveLength(0)
+  })
+
+  it('lists other-layer hooks under their event and switches one off', async () => {
+    const row = { id: '0123456789abcdef', event: 'Stop', matcher: '', command: '"/opt/homebrew/bin/node" "/Users/x/.claude/hooks/session-state.cjs"', layer: 'user', source: '/Users/x/.claude/settings.json', active: true, supported: true }
+    ;(fetchHooks as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ ...hooksRow(), effective: [row] })
+    await mount(<ToastHost><HooksPanel workspaceId="ws-1" /></ToastHost>)
+    const stop = [...host.querySelectorAll('.hooks-event')].find((section) => section.textContent?.startsWith('Stop'))!
+    expect(stop.querySelector('.hooks-row')?.textContent).toContain('session-state.cjs')
+    await act(async () => stop.querySelector<HTMLButtonElement>('button[role="switch"]')!.click())
+    expect(setHookActive).toHaveBeenCalledWith('ws-1', '0123456789abcdef', false)
   })
 })
 
@@ -1305,6 +1458,45 @@ describe('global feedback', () => {
     expect(host.querySelectorAll('[role="alert"] [role="alert"]')).toHaveLength(0)
     expect(host.querySelectorAll('button[aria-label="Dismiss notification"]')).toHaveLength(3)
   })
+  it('does not stack copies of the same message: a repeat refreshes the one live toast', async () => {
+    const probe: { notify?: (text: string, kind?: 'ok' | 'bad' | 'info') => void } = {}
+    function Probe(): null {
+      probe.notify = useToast().notify
+      return null
+    }
+    await mount(<ToastHost><Probe /></ToastHost>)
+    for (let i = 0; i < 5; i++) await act(async () => probe.notify?.('HTTP 503: fetch failed', 'bad'))
+    const alerts = host.querySelectorAll('[role="alert"]')
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]!.textContent).toContain('HTTP 503')
+  })
+  it('collapses errors that read the same: distinct raw failures with one summary show once with a count', async () => {
+    const probe: { notify?: (text: string, kind?: 'ok' | 'bad' | 'info') => void } = {}
+    function Probe(): null {
+      probe.notify = useToast().notify
+      return null
+    }
+    await mount(<ToastHost><Probe /></ToastHost>)
+    const raws = ['TypeError: Failed to fetch', 'HTTP 502: bad gateway', 'network error on /api/sessions', 'HTTP 503: unavailable']
+    for (const raw of raws) await act(async () => probe.notify?.(raw, 'bad'))
+    const alerts = host.querySelectorAll('[role="alert"]')
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]!.textContent).toContain('HTTP 503: unavailable')
+    expect(alerts[0]!.textContent).toContain('×4')
+  })
+  it('caps the stack: the oldest toast leaves when more than four are live', async () => {
+    const probe: { notify?: (text: string, kind?: 'ok' | 'bad' | 'info') => void } = {}
+    function Probe(): null {
+      probe.notify = useToast().notify
+      return null
+    }
+    await mount(<ToastHost><Probe /></ToastHost>)
+    for (let i = 1; i <= 6; i++) await act(async () => probe.notify?.(`failure ${i}`, 'bad'))
+    const texts = [...host.querySelectorAll('[role="alert"]')].map((node) => node.textContent)
+    expect(texts).toHaveLength(4)
+    expect(texts[0]).toContain('failure 3')
+    expect(texts[3]).toContain('failure 6')
+  })
   it('keeps the notification toggle honest: enabled only after granted permission', async () => {
     let latest: { enabled: boolean; blocked: boolean; toggle: () => void } | undefined
     function Probe(): null {
@@ -1466,5 +1658,25 @@ describe('workbench files', () => {
     await mount(<ToolCard item={item} openPath={() => null} />)
     expect(host.querySelector('button')).toBeNull()
     expect(host.textContent).toContain('index.ts')
+  })
+})
+describe('transcript grouping: agent waits', () => {
+  const wait = (id: string, output = JSON.stringify({ children: [{ status: 'running' }] }), ok = true) =>
+    ({ kind: 'tool' as const, call: { id, name: 'Agent', args: { action: 'wait' } }, result: { ok, output } })
+  const delegation = { kind: 'delegation' as const, childSessionId: 'child', definition: 'reviewer', brief: 'review docs', status: 'running' as const }
+  it('folds consecutive waits into one row and counts one agent, not one per wait', () => {
+    const items = [{ kind: 'user' as const, content: 'go' }, delegation, ...Array.from({ length: 9 }, (_, i) => wait(`w${i}`))]
+    const blocks = groupBlocks(items)
+    const run = blocks[1]
+    expect(run?.kind).toBe('activity')
+    if (run?.kind !== 'activity') return
+    expect(run.rows).toHaveLength(2)
+    expect(run.rows[1]?.folded).toHaveLength(8)
+    const summary = summarizeActivity(run.rows.flatMap(rowItems))
+    expect(summary.text).toBe('1 agent, 9 waits')
+  })
+  it('keeps a failed wait on its own row', () => {
+    const blocks = groupBlocks([delegation, wait('a', 'boom', false), wait('b'), wait('c')])
+    expect(blocks[0]?.kind === 'activity' ? blocks[0].rows.length : 0).toBe(3)
   })
 })

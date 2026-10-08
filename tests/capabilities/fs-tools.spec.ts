@@ -11,6 +11,7 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { fsTools, type ToolDefinition, type ToolExecution } from 'dnt-harness'
+import { defaultSecretRoots } from '../../src/capabilities/fs/secret-roots.ts'
 
 let root = ''
 let outside = ''
@@ -229,5 +230,25 @@ describe('fs tools', () => {
     await expect(tool('Grep').execute({ pattern: 'secret' }, guarded)).resolves.toBe('no matches')
     // Outside the denied root everything still works.
     await expect(tool('Read').execute({ path: 'src/app.ts' }, guarded)).resolves.toBe('1\tv2')
+  })
+
+  it('default secret roots refuse credential files even when the out-of-grant path was approved', async () => {
+    const fakeHome = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-home-'))
+    try {
+      await fs.mkdir(path.join(fakeHome, '.ssh'), { recursive: true })
+      const key = path.join(fakeHome, '.ssh', 'id_ed25519')
+      await fs.writeFile(key, 'PRIVATE KEY', 'utf8')
+      const netrc = path.join(fakeHome, '.netrc')
+      await fs.writeFile(netrc, 'machine x password y', 'utf8')
+      const secretRoots = defaultSecretRoots(fakeHome)
+      // Full access (`outOfGrant: allow`) or an approval lands as an approved path.
+      const approved = exec({ deniedRoots: secretRoots, approvedPaths: [{ path: key, intent: 'write' }, { path: netrc, intent: 'write' }] })
+      await expect(tool('Read').execute({ path: key }, approved)).rejects.toThrow(/protected credential folder/)
+      await expect(tool('Write').execute({ path: key, content: 'x' }, approved)).rejects.toThrow(/protected credential folder/)
+      await expect(tool('Read').execute({ path: netrc }, approved)).rejects.toThrow(/protected credential folder/)
+      expect(await fs.readFile(key, 'utf8')).toBe('PRIVATE KEY')
+    } finally {
+      await fs.rm(fakeHome, { recursive: true, force: true })
+    }
   })
 })

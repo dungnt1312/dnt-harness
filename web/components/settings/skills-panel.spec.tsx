@@ -63,6 +63,7 @@ afterEach(() => {
 })
 
 const buttons = (): HTMLButtonElement[] => [...document.body.querySelectorAll<HTMLButtonElement>('button')]
+const menuItem = (name: string): HTMLButtonElement => [...document.body.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((node) => node.textContent === name)!
 const button = (name: string): HTMLButtonElement => {
   const found = buttons().find((node) => node.textContent === name || node.getAttribute('aria-label') === name)
   if (found === undefined) throw new Error(`no button "${name}"`)
@@ -91,7 +92,7 @@ describe('SkillsPanel skills tab', () => {
 
   it('does not mark base rows shadowed just because project lists include every layer', async () => {
     await renderPanel()
-    expect(document.body.querySelector('[aria-label="shadowed"]')).toBeNull()
+    expect(document.body.querySelector('[aria-label="Shadowed in a project"]')).toBeNull()
   })
 
   it('marks a base row shadowed when a project defines the same name', async () => {
@@ -102,20 +103,20 @@ describe('SkillsPanel skills tab', () => {
           ? [row('ws-skill', 'workspace'), row('user-skill', 'user', { ruleId: 'user' })]
           : [row('ws-skill', 'workspace'), row('user-skill', 'user', { ruleId: 'user' })])
     await renderPanel()
-    const dots = [...document.body.querySelectorAll('[aria-label="shadowed"]')]
+    const dots = [...document.body.querySelectorAll('[aria-label="Shadowed in a project"]')]
     // Only ws-skill (project-owned in Alpha) is shadowed, and only by Alpha.
     expect(dots).toHaveLength(1)
     expect(dots[0]?.getAttribute('title')).toContain('Alpha')
     expect(dots[0]?.getAttribute('title')).not.toContain('Beta')
     // The project copy itself carries the "overrides" marker naming the layer it replaces.
-    const overrides = document.body.querySelector('[aria-label="overrides"]')
+    const overrides = document.body.querySelector('[aria-label="Overrides another layer"]')
     expect(overrides).not.toBeNull()
     expect(overrides?.getAttribute('title')).toContain('workspace')
   })
 
   it('a project row without a base twin carries no overrides marker', async () => {
     await renderPanel()
-    expect(document.body.querySelector('[aria-label="overrides"]')).toBeNull()
+    expect(document.body.querySelector('[aria-label="Overrides another layer"]')).toBeNull()
   })
 
   it('save warnings from the server surface in the notice', async () => {
@@ -240,12 +241,13 @@ describe('SkillsPanel source folders tab', () => {
     expect(document.body.textContent).toContain('.claude/skills')
     expect(document.body.textContent).toContain('.agents/skills')
     expect(document.body.textContent).toContain('Workspace skills')
-    expect(buttons().some((node) => (node.getAttribute('aria-label') ?? '').startsWith('Remove Workspace skills'))).toBe(false)
+    await act(async () => button('More actions for Workspace skills').click())
+    expect([...document.body.querySelectorAll('[role="menuitem"]')].some((node) => node.textContent === 'Remove folder')).toBe(false)
   })
 
   it('toggling a rule persists immediately via putSkillSources', async () => {
     await openFolders()
-    const box = document.body.querySelector<HTMLInputElement>('input[aria-label="Enable .agents/skills"]')!
+    const box = document.body.querySelector<HTMLButtonElement>('[role="switch"][aria-label="Enable .agents/skills"]')!
     await act(async () => box.click())
     await settle()
     expect(mocked.putSkillSources).toHaveBeenCalledTimes(1)
@@ -255,7 +257,8 @@ describe('SkillsPanel source folders tab', () => {
 
   it('reorder buttons move a rule up and persist the swapped order', async () => {
     await openFolders()
-    await act(async () => button('Move .agents/skills up').click())
+    await act(async () => button('More actions for .agents/skills').click())
+    await act(async () => menuItem('Move up').click())
     await settle()
     const rules = mocked.putSkillSources.mock.calls[0]?.[1] as readonly { id: string }[]
     expect(rules.map((rule) => rule.id)).toEqual(['project-agents', 'project-claude', 'workspace', 'user'])
@@ -263,7 +266,11 @@ describe('SkillsPanel source folders tab', () => {
 
   it('remove deletes a rule and add appends a new one', async () => {
     await openFolders()
-    await act(async () => button('Remove .agents/skills').click())
+    // Remove is in the row menu and asks first: nothing saved until confirmed.
+    await act(async () => button('More actions for .agents/skills').click())
+    await act(async () => menuItem('Remove folder').click())
+    expect(mocked.putSkillSources).not.toHaveBeenCalled()
+    await act(async () => buttons().filter((node) => node.textContent === 'Remove folder').at(-1)!.click())
     await settle()
     let rules = mocked.putSkillSources.mock.calls[0]?.[1] as readonly { id: string }[]
     expect(rules.some((rule) => rule.id === 'project-agents')).toBe(false)

@@ -40,7 +40,7 @@ export interface AgentScope {
      */
     readonly instructions: string
     /** Provenance of the pinned definition (bundled role vs workspace file). */
-    readonly definitionSource?: 'bundled' | 'workspace'
+    readonly definitionSource?: 'bundled' | 'user' | 'workspace' | 'project'
     /** Hard ceiling: admission exposure ∩ definition ∩ spawn grant (MCP explicit). */
     readonly toolCeiling: readonly string[]
     /**

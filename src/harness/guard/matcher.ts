@@ -2,7 +2,14 @@ import type { DangerousCommandsConfig, GuardMatch, PresetId } from './types.ts'
 import { PRESET_REGEXES } from './presets.ts'
 import { PRESET_LABELS } from './defaults.ts'
 
-export function normalizeCommand(cmd: string): string {
+/**
+ * `lineSeparator` replaces an unquoted line break. The default `' '` keeps
+ * the historical form custom rules were written against; preset matching
+ * passes `' ; '` because a newline ends a shell command, and a flag on the
+ * next line must not be read as belonging to the previous command
+ * (`rm -f a` ⏎ `ls -R` is not a recursive rm). Quoted line breaks stay `' '`.
+ */
+export function normalizeCommand(cmd: string, lineSeparator = ' '): string {
   let normalized = ''
   let inSingle = false
   let inDouble = false
@@ -38,7 +45,7 @@ export function normalizeCommand(cmd: string): string {
 
     if (c === '\n' || c === '\r') {
       if (c === '\r' && cmd[i + 1] === '\n') i++
-      normalized += ' '
+      normalized += inSingle || inDouble ? ' ' : lineSeparator
       lineHasContent = false
       continue
     }
@@ -52,7 +59,35 @@ export function normalizeCommand(cmd: string): string {
     if (!/\s/.test(c)) lineHasContent = true
   }
 
-  return normalized.trim().replace(/\s+/g, ' ')
+  const collapsed = normalized.trim().replace(/\s+/g, ' ')
+  // Blank or comment-only lines must not leave empty `; ;` runs or edges.
+  return lineSeparator === ' ' ? collapsed : collapsed.replace(/(?:\s*;\s*)+$/, '').replace(/^(?:\s*;\s*)+/, '').replace(/(?:\s;){2,}/g, ' ;')
+}
+
+/**
+ * `git rm` is not the filesystem `rm`: per simple command (split on `;`,
+ * `&&`, `||`, `|`, `&`), `git [-C dir …] rm --cached …` only untracks and is
+ * dropped from preset matching; any other `git rm` deletes working-tree
+ * files and its verb is rewritten to the single word `gitrm` (no `-`, which
+ * would still be a `\b` boundary) so fsDestructive's `\brm\b` does not match
+ * it while gitDestructive's `\bgitrm\b` rule (ask) does. Only the git
+ * segment itself is touched — a real `rm` chained after it is still seen.
+ */
+function classifyGitRm(commands: string): string {
+  return commands
+    .split(/(\s*(?:;|&&|\|\||\||&)\s*)/)
+    .map((segment) => {
+      const git = /^(\s*(?:sudo\s+)?git(?:\s+-[Cc]\s+\S+|\s+--?[a-z][\w-]*(?:=\S+)?)*\s+)rm\b(.*)$/i.exec(segment)
+      if (git === null) return segment
+      // A substitution would run its own command; never exempt that text.
+      if (/[`]|\$\(|[<>]\(/.test(segment)) return segment
+      const args = (git[2] ?? '').trim().split(/\s+/)
+      const optionEnd = args.indexOf('--')
+      const options = optionEnd === -1 ? args : args.slice(0, optionEnd)
+      if (options.some((token) => token.toLowerCase() === '--cached')) return ''
+      return `${git[1]}gitrm${git[2]}`
+    })
+    .join('')
 }
 
 const PRESET_PRIORITY: PresetId[] = [
@@ -88,10 +123,13 @@ export function matchCommand(command: string, config: DangerousCommandsConfig): 
     }
   }
 
+  // Presets see line breaks as command separators (custom rules keep the
+  // historical single-space form they were authored against).
+  const commands = classifyGitRm(normalizeCommand(command, ' ; '))
   for (const id of PRESET_PRIORITY) {
     if (config.presets[id] === 'off') continue
     const regexes = PRESET_REGEXES[id]
-    const matched = regexes.find((rx) => rx.test(normalized))
+    const matched = regexes.find((rx) => rx.test(commands))
     if (matched) {
       return {
         presetId: id,

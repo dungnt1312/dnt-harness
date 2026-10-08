@@ -1,7 +1,7 @@
 import { useCallback, useEffect, type ReactNode } from 'react'
 import { useScopedState } from '../../hooks/useScopedState.ts'
 import { Markdown } from '../../Markdown.tsx'
-import Icon from '../common/Icon.tsx'
+import Icon, { type IconName } from '../common/Icon.tsx'
 import { Badge } from '../ui/Badge.tsx'
 import { Button } from '../ui/Button.tsx'
 import { Field } from '../ui/Field.tsx'
@@ -20,10 +20,12 @@ import {
   WorkspaceRequired,
   useActionRunner,
   type NoticeState,
+  ConflictBanner,
 } from './settings-kit.tsx'
+import { useUnsavedChanges } from './unsaved-changes.tsx'
 
 /** One tree row: fixed height, full-width hover; callers add the indent. */
-const TREE_ROW = 'flex h-7 w-full min-w-0 items-center pr-3 text-left text-[13px] hover:bg-hover'
+const TREE_ROW = 'flex h-7 w-full min-w-0 items-center pr-3 text-left text-[13px] outline-none hover:bg-hover focus-visible:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-link'
 const WORKSPACE_FILTER = 'workspace'
 
 /** kebab-case id from a title (memory create uses it as the entry id). */
@@ -32,6 +34,25 @@ function slugify(title: string): string {
 }
 
 const isConflict = (cause: unknown): boolean => /409/.test(String(cause))
+
+/** Icon, colour and label per frontmatter `metadata.type`, so kinds read at a glance. */
+const TYPE_ICON: Readonly<Record<NonNullable<MemoryEntryRow['type']>, { readonly icon: IconName; readonly className: string; readonly label: string }>> = {
+  user: { icon: 'user', className: 'text-tool-agent', label: 'User' },
+  feedback: { icon: 'messageSquare', className: 'text-warn', label: 'Feedback' },
+  project: { icon: 'layers', className: 'text-tool-edit', label: 'Project' },
+  reference: { icon: 'bookmark', className: 'text-link', label: 'Reference' },
+}
+
+/** The entry's kind icon; an untyped file keeps the plain document icon. */
+function EntryIcon({ type, size }: { readonly type: MemoryEntryRow['type']; readonly size: number }) {
+  const kind = type === undefined ? undefined : TYPE_ICON[type]
+  if (kind === undefined) return <Icon name="fileText" size={size} className="shrink-0 text-fg-faint" />
+  return (
+    <span className="flex shrink-0" title={kind.label} data-memory-type={type}>
+      <Icon name={kind.icon} size={size} className={kind.className} />
+    </span>
+  )
+}
 
 /** `null` is the workspace tier; a project id is that project's tier. */
 type Tier = string | null
@@ -112,6 +133,10 @@ function MemoryPanelContent({ workspaceId, projects = [] }: {
   }, [workspaceId, projectKey])
 
   useEffect(() => { void refresh() }, [refresh])
+
+  const guardDiscard = useUnsavedChanges(editing !== null && (
+    draft.title !== editing.loaded.title || draft.body !== editing.loaded.body || draft.pinned !== editing.loaded.pinned
+  ))
 
   if (workspaceId === null) return <WorkspaceRequired />
 
@@ -250,9 +275,9 @@ function MemoryPanelContent({ workspaceId, projects = [] }: {
       {trailing}
     </div>
   )
-  const entryTitle = (title: string, tier: Tier): ReactNode => (
+  const entryTitle = (title: string, tier: Tier, type: MemoryEntryRow['type']): ReactNode => (
     <>
-      <Icon name="fileText" size={14} className="shrink-0 text-fg-muted" />
+      <EntryIcon type={type} size={14} />
       <span className="min-w-0 truncate text-sm font-medium text-fg">{title}</span>
       <Badge tone={badgeTone(tier)}>{tier === null ? 'Workspace' : `Project · ${tierLabel(tier)}`}</Badge>
     </>
@@ -288,18 +313,12 @@ function MemoryPanelContent({ workspaceId, projects = [] }: {
             <Field label="Body">
               <CodeArea tall rows={10} value={draft.body} onChange={(e) => setDraft({ ...draft, body: e.target.value })} />
             </Field>
-            {conflict ? (
-              <div className="flex flex-wrap items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn">
-                <span className="min-w-0 flex-1 basis-48">The entry changed on disk since you opened it.</span>
-                <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void reloadServer()}>Reload server version</Button>
-                <Button variant="outline-danger" size="sm" disabled={busy !== null} onClick={() => void overwrite()}>Overwrite anyway</Button>
-              </div>
-            ) : null}
+            {conflict ? <ConflictBanner what="entry" busy={busy !== null} onReload={() => void reloadServer()} onOverwrite={() => void overwrite()} /> : null}
           </div>
           <div className="flex shrink-0 justify-end gap-2 border-t border-line px-4 py-3">
-            <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => { setEditing(null); setConflict(false) }}>Cancel</Button>
+            <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => guardDiscard(() => { setEditing(null); setConflict(false) })}>Cancel</Button>
             <Button variant="primary" size="sm" disabled={busy !== null || cannotSave} onClick={() => void save()}>
-              {busy === 'save' ? (editing.isNew ? 'Creating…' : 'Saving…') : editing.isNew ? 'Create entry' : 'Save'}
+              {busy === 'save' ? (editing.isNew ? 'Creating…' : 'Saving…') : editing.isNew ? 'Create entry' : 'Save entry'}
             </Button>
           </div>
         </>
@@ -315,7 +334,7 @@ function MemoryPanelContent({ workspaceId, projects = [] }: {
     }
     return (
       <>
-        {paneHeader(entryTitle(detail.title, selected.tier), detail.pinned ? <span title="Legacy pin" className="flex shrink-0"><Icon name="pin" size={13} className="text-fg-faint" /></span> : undefined)}
+        {paneHeader(entryTitle(detail.title, selected.tier, detail.type), detail.pinned ? <span title="Legacy pin" className="flex shrink-0"><Icon name="pin" size={13} className="text-fg-faint" /></span> : undefined)}
         <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-4">
           <Icon name="fileText" size={13} className="shrink-0 text-fg-faint" />
           <span className="min-w-0 flex-1 truncate font-mono text-xs text-fg-muted">{detail.id}.md</span>
@@ -329,7 +348,7 @@ function MemoryPanelContent({ workspaceId, projects = [] }: {
             />
           ) : (
             <>
-              <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => beginEdit(detail, selected.tier)}>
+              <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => beginEdit(detail, selected.tier)}>
                 <Icon name="pencil" size={13} />Edit
               </Button>
               <IconButton label={`Delete ${detail.id}`} disabled={busy !== null} onClick={() => setConfirmDelete(true)}><Icon name="trash" size={14} /></IconButton>
@@ -359,7 +378,7 @@ function MemoryPanelContent({ workspaceId, projects = [] }: {
             <span className="text-[11px] font-semibold tracking-wider text-fg-faint uppercase">Memory</span>
             <span className="min-w-0 flex-1" />
             <IconButton label="Refresh memory" disabled={busy !== null} onClick={() => void refresh()}><Icon name="refresh" size={14} /></IconButton>
-            <IconButton label="New memory entry" disabled={busy !== null} onClick={beginNew}><Icon name="plus" size={15} /></IconButton>
+            <IconButton label="New memory entry" disabled={busy !== null} onClick={() => guardDiscard(beginNew)}><Icon name="plus" size={14} /></IconButton>
           </div>
           <div className="flex shrink-0 gap-2 border-b border-line p-2">
             <div className="min-w-0 flex-1">
@@ -412,9 +431,9 @@ function MemoryPanelContent({ workspaceId, projects = [] }: {
                           type="button"
                           title={firstLine !== '' ? `${row.title} — ${firstLine}` : row.title}
                           className={`${TREE_ROW} gap-1.5 pl-7 text-fg ${active ? 'bg-hover' : ''}`}
-                          onClick={() => void openDetail(group.tier, row)}
+                          onClick={() => guardDiscard(() => void openDetail(group.tier, row))}
                         >
-                          <Icon name="fileText" size={13} className="shrink-0 text-fg-faint" />
+                          <EntryIcon type={row.type} size={13} />
                           <span className="min-w-0 flex-1 truncate">{row.title}</span>
                           {row.pinned ? <Icon name="pin" size={12} className="shrink-0 text-fg-faint" /> : null}
                         </button>

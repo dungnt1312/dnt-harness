@@ -162,6 +162,12 @@ export interface CompactionOptions {
   readonly signal?: AbortSignal
   /** Latest valid canonical checkpoint; folds only the uncovered delta onto it. */
   readonly seed?: CompactionCheckpoint
+  /**
+   * Set when the summarizer retains source verbatim (no model): the result is
+   * `seed + delta`, so an oversize pair is refused BEFORE any lifecycle event
+   * instead of appending a failed transaction on every attempt.
+   */
+  readonly extractiveCap?: number
 }
 const inFlight = new Set<string>()
 
@@ -202,6 +208,16 @@ export async function compactSession(session: Session, checkpoints: CheckpointSt
       }
     }
     const fromSeq = options.seed?.coversSeq ?? 0
+    // Only when the covered boundary is already acknowledged can the preflight
+    // project the same source the transaction will; otherwise keep the
+    // normal path (the summarizer still fails closed on overflow).
+    if (options.extractiveCap !== undefined && session.committedEvents.some(event => event.seq === lastEnd)) {
+      const preview = projectForSummary(session.committedEvents, lastEnd, options.attachments, fromSeq)
+      const needed = (options.seed !== undefined ? options.seed.summary.length + 2 : 0) + preview.length
+      if (needed > options.extractiveCap) {
+        throw new Error(`compaction source exceeds extractive capacity (${needed} > ${options.extractiveCap} characters); configure a model to compact`)
+      }
+    }
     session.append({ type: 'compaction/start', trigger: options.trigger, ...(options.model !== undefined ? { model: options.model } : {}) })
     started = true
     await session.durable()

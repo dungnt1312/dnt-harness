@@ -202,7 +202,10 @@ export {
   BUNDLED_AGENT_ROLES,
   bundledDefinition,
   parseAgentDefinition,
+  serializeAgentDefinition,
+  agentKey,
   type AgentDefinition,
+  type AgentSource,
   type ResolvedAgentDefinition,
 } from './harness/agents/definition-service.ts'
 export {
@@ -263,7 +266,6 @@ export {
   McpConfigError,
   RESERVED_TOOL_NAMES,
   parseMcpConfig,
-  parseHooksConfig,
   importClaudeMcp,
   importCodexMcp,
   resolveSecretRefs,
@@ -271,8 +273,6 @@ export {
   auditHash,
   type McpConfig,
   type McpServerConfig,
-  type HooksConfig,
-  type HookBinding,
 } from './harness/mcp/config.ts'
 export {
   MCP_ACCEPTED_PROTOCOL_VERSION,
@@ -301,7 +301,9 @@ export {
 export {
   McpServerClient,
   McpTransportError,
+  McpRpcError,
   MCP_PROTOCOL_VERSION,
+  type BearerTokenSource,
   type McpToolDescriptor,
   type McpCallResult,
   type TransportState,
@@ -316,15 +318,41 @@ export type { MigrationRecovery, MigrationStep, MigrationStepObserver } from './
 export { minimalStdioEnv, containmentCapability, assertHardContainmentAvailable } from './harness/mcp/process-controller.ts'
 export { assertOutboundUrl, OutboundPolicyError } from './harness/mcp/outbound-policy.ts'
 export { SseParser } from './harness/mcp/sse-parser.ts'
-export { ManagedOAuth } from './harness/mcp/oauth.ts'
+export { ManagedOAuth, OAuthFlowError, OAuthTemporaryError } from './harness/mcp/oauth.ts'
 export { OAuthStore } from './harness/mcp/oauth-store.ts'
 export { bearerAllows } from './web/control-plane-auth.ts'
 export {
   runHook,
-  isBlockingDecision,
-  isFailureDecision,
-  type HookDecision,
+  runHooks,
+  interpretHooks,
+  auditDecision,
+  type HookOutcome,
+  type HookVerdict,
+  type HookRunOptions,
 } from './harness/hooks/runner.ts'
+export {
+  CLAUDE_HOOK_EVENTS,
+  SUPPORTED_HOOK_EVENTS,
+  DEFAULT_HOOK_TIMEOUT_SECONDS,
+  HookSettingsError,
+  hookMatches,
+  hookSourceFiles,
+  loadHooks,
+  migrateLegacyHooksJson,
+  parseHooksSection,
+  readWorkspaceHooks,
+  selectHooks,
+  setHookActive,
+  readInactiveHooks,
+  hookId,
+  writeWorkspaceHooks,
+  type ClaudeHookEvent,
+  type HookLayer,
+  type ResolvedHook,
+  type ResolvedHooks,
+} from './harness/hooks/settings.ts'
+export { toClaudeToolInput, fromClaudeToolInput } from './harness/hooks/tool-input.ts'
+export { loadClaudeMd, renderClaudeMd, type ClaudeMdFile, type ClaudeMdLayer } from './harness/instructions/claude-md.ts'
 
 // ── Web host ──────────────────────────────────────────────────────────────
 export { ControlPlaneAuthService, isPublicPath, SESSION_COOKIE } from './web/control-plane-auth.ts'

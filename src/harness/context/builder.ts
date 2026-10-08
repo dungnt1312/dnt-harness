@@ -3,7 +3,7 @@ import type { ModelMessage, ToolSchema, ContentPart } from '../llm/types.ts'
 import type { AttachmentLookup } from '../attachments/store.ts'
 import { deriveDatedMessages, type SessionEvent } from '../session/events.ts'
 import type { Session } from '../session/session.ts'
-import { recoverCanonicalCheckpoint } from './compaction.ts'
+import { isCompletedCompactionBoundary, MAX_COMPACTION_SUMMARY_CHARS, recoverCanonicalCheckpoint } from './compaction.ts'
 import type { ResolvedMode } from '../modes/types.ts'
 import type { GrantedRoot } from '../tools/types.ts'
 import { estimateTokens, estimateContentTokens, schemaCost, budgetFor, squeezeBudget, ContextBudgetError, type BudgetConfig } from './budget.ts'
@@ -60,7 +60,18 @@ export interface BuildContextInput {
   /**
    * Latest compaction checkpoint, when the history setting is `compact`.
    */
-  readonly compaction?: { readonly summary: string; readonly coversSeq: number }
+  readonly compaction?: {
+    readonly summary: string
+    readonly coversSeq: number
+    /**
+     * Host attestation: the checkpoint was recovered canonically from the
+     * session's committed log (`CheckpointStore.latest(id, committedEvents)`).
+     * The builder then skips the O(log × compactions) re-derivation and only
+     * re-checks summary bounds and the completed-turn boundary. Without it the
+     * full canonical check runs (unknown callers stay defended).
+     */
+    readonly verifiedAgainst?: 'committed-log'
+  }
   /**
    * Latest covered completed turns duplicated raw alongside the summary.
    * Defaults to {@link DEFAULT_COMPACTION_TAIL_TURNS}; 0 disables covered
@@ -81,7 +92,7 @@ export interface BuildContextInput {
     readonly instructions: string
   }
   /** Provenance of the child's role definition (bundled role vs workspace file). */
-  readonly childSource?: 'bundled' | 'workspace'
+  readonly childSource?: 'bundled' | 'user' | 'workspace' | 'project'
   /**
    * Workspace-authored replacement for the base system prompt (root
    * conversations). Blank/undefined falls back to {@link DEFAULT_BASE_SYSTEM};
@@ -170,7 +181,7 @@ export interface ContextManifest {
     readonly toolNames: readonly string[]
     readonly toolSchemas: number
     /** The child role this request ran as, with its pinned instructions' hash. */
-    readonly child?: { readonly definition: string; readonly instructionsHash: string; readonly source?: 'bundled' | 'workspace' }
+    readonly child?: { readonly definition: string; readonly instructionsHash: string; readonly source?: 'bundled' | 'user' | 'workspace' | 'project' }
     /** Inherited parent context the request carried (absent when dropped). */
     readonly parentContext?: { readonly hash: string; readonly chars: number }
   }
@@ -771,6 +782,10 @@ const DEFAULT_COMPACTION_TAIL_TURNS = 4
 
 /** Defense in depth for callers passing unchecked checkpoint data. */
 function validCompactionCoverage(events: readonly SessionEvent[], checkpoint: NonNullable<BuildContextInput['compaction']>): boolean {
+  if (checkpoint.verifiedAgainst === 'committed-log') {
+    return typeof checkpoint.summary === 'string' && checkpoint.summary.trim() !== '' && checkpoint.summary.length <= MAX_COMPACTION_SUMMARY_CHARS
+      && isCompletedCompactionBoundary(events, checkpoint.coversSeq)
+  }
   const canonical = recoverCanonicalCheckpoint(events)
   return canonical !== undefined && canonical.coversSeq === checkpoint.coversSeq && canonical.summary === checkpoint.summary
 }

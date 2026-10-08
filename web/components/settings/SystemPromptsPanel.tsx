@@ -6,15 +6,18 @@ import { Button } from '../ui/Button.tsx'
 import Icon from '../common/Icon.tsx'
 import {
   CodeArea,
+  LoadFailed,
   Notice,
   PanelBody,
-  PanelFooter,
+  SaveBar,
   PanelIntro,
   Section,
   WorkspaceRequired,
   useActionRunner,
   type NoticeState,
+  ConflictBanner,
 } from './settings-kit.tsx'
+import { useUnsavedChanges } from './unsaved-changes.tsx'
 
 /**
  * Workspace-authored replacements for the fixed harness system prompts.
@@ -70,7 +73,13 @@ function SystemPromptsPanelContent({ workspaceId }: { readonly workspaceId: stri
 
   useEffect(() => { void load() }, [load])
 
+  useUnsavedChanges(response !== null && draft !== null
+    && (draft.base !== draftOf(response).base || draft.child !== draftOf(response).child))
+
   if (workspaceId === null) return <WorkspaceRequired />
+  if (!loading && response === null && notice?.kind === 'bad') {
+    return <LoadFailed what="system prompts" error={notice.text} onRetry={() => void load()} />
+  }
   if (loading || response === null || draft === null) {
     return (
       <PanelBody>
@@ -161,33 +170,19 @@ function SystemPromptsPanelContent({ workspaceId }: { readonly workspaceId: stri
         default; other workspaces are never affected. Mode instructions, roles and skill text are edited in their own tabs.
       </PanelIntro>
 
-      {notice !== null ? <Notice kind={notice.kind} text={notice.text} /> : null}
-
       {editor('base', 'Base prompt (conversations)', 'Sent as the first system block of every root conversation in this workspace.')}
       {editor('child', 'Subagent prompt (delegated roles)', 'Sent to every subagent this workspace delegates to, before the role’s own instructions.')}
 
-      {conflict ? (
-        <div className="flex flex-wrap items-center gap-2 rounded-lg bg-warn-soft px-3 py-2 text-[13px] text-warn">
-          <span className="min-w-0 flex-1 basis-48">The prompts changed on the server since you opened this panel.</span>
-          <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void reload()}>Reload server version</Button>
-          <Button variant="outline-danger" size="sm" disabled={busy !== null} onClick={() => void overwrite()}>Overwrite anyway</Button>
-        </div>
-      ) : null}
+      {conflict ? <ConflictBanner what="prompts" busy={busy !== null} onReload={() => void reload()} onOverwrite={() => void overwrite()} /> : null}
 
-      <PanelFooter notice={null}>
-        <Button variant="primary" size="sm" disabled={busy !== null || !dirty} onClick={() => void save()}>
-          {busy === 'save' ? 'Saving…' : 'Save'}
-        </Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          disabled={busy !== null || !dirty}
-          onClick={() => { setDraft(baseline); setNotice(null); setConflict(false) }}
-        >
-          Cancel
-        </Button>
-        {dirty ? <span className="self-center text-xs text-fg-faint">Unsaved changes</span> : null}
-      </PanelFooter>
+      <SaveBar
+        dirty={dirty}
+        busy={busy !== null}
+        saving={busy === 'save'}
+        notice={notice}
+        onSave={() => void save()}
+        onDiscard={() => { setDraft(baseline); setNotice(null); setConflict(false) }}
+      />
     </PanelBody>
   )
 }

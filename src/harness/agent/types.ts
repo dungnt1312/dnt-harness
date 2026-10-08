@@ -21,7 +21,16 @@ export type AgentStatus = 'idle' | 'running' | 'cancelling'
  * no step, so the log records the attempt.
  */
 export type PreStepDecision =
-  | { readonly kind: 'enter'; readonly contents: readonly string[] }
+  | {
+      readonly kind: 'enter'
+      readonly contents: readonly string[]
+      /**
+       * Host context to log BEFORE the contents as `origin: 'context'` user
+       * messages (hook additionalContext): the model reads it, the
+       * transcript shows it as context, never as something the user typed.
+       */
+      readonly context?: readonly string[]
+    }
   | { readonly kind: 'reject'; readonly reason?: string }
 
 declare module 'dnt-harness' {
@@ -32,8 +41,9 @@ declare module 'dnt-harness' {
      * by returning `{ kind: 'reject' }` without calling it.
      */
     'agent/pre-step'(
-      claim: { readonly contents: readonly string[] },
-      next: (replacement?: { readonly contents: readonly string[] }) => Promise<PreStepDecision>,
+      /** `signal` fires when the turn is stopped; long listeners (hooks) honor it. */
+      claim: { readonly contents: readonly string[]; readonly signal?: AbortSignal },
+      next: (replacement?: { readonly contents: readonly string[]; readonly context?: readonly string[] }) => Promise<PreStepDecision>,
     ): Promise<PreStepDecision>
 
     /**

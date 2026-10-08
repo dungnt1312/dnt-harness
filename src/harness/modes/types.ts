@@ -12,6 +12,8 @@ export interface ModeDefinition {
   readonly id: string
   /** Display name. */
   readonly name: string
+  /** Optional one-line description (authoring metadata; never authority). */
+  readonly description?: string
   /** System-level instructions injected for every request in this mode. */
   readonly instructions: string
   /** What the context builder may load for this mode. */
@@ -32,7 +34,18 @@ export interface ModeDefinition {
    * either way.
    */
   readonly outOfGrant?: 'allow' | 'ask'
+  /**
+   * Which MCP tools this mode may expose (a ceiling, never a permission):
+   * `none`; `read-safe` — only tools named by an explicit server allowlist
+   * entry AND carrying a read-safe name prefix; `all` — every enabled,
+   * allowlist-filtered tool. Absent derives from the mode: a zero tool
+   * ceiling is always `none`; a mode exposing none of Write/Edit/Bash is
+   * `read-safe`; otherwise `all`. A zero ceiling wins over any explicit value.
+   */
+  readonly mcpExposure?: McpExposure
 }
+
+export type McpExposure = 'none' | 'read-safe' | 'all'
 
 /** Context sources a mode enables. Disabled loaders contribute nothing. */
 export interface ModeSources {
@@ -60,6 +73,7 @@ export interface ModeFrontmatter {
   /** Keys: a canonical known tool, `mcp__<server>__<tool>`, `mcp__<server>__*`, or `*`. */
   readonly permissionDefaults?: Readonly<Record<string, string>>
   readonly outOfGrant?: string
+  readonly mcpExposure?: string
 }
 
 /** A validated, ready-to-use mode with its provenance. */

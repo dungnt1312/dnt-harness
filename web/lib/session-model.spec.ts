@@ -1,11 +1,23 @@
 import { describe, expect, it, vi } from 'vitest'
-import { getModelDefaults, getSessionModel, setModelDefaults, setSessionModel } from './api.ts'
+import { createSessionIn, getModelDefaults, getSessionModel, setModelDefaults, setSessionModel } from './api.ts'
 
 /** Every call goes through apiFetch: same-origin credentials, a Headers bag. */
 type Call = [string, RequestInit]
 const callOf = (mock: ReturnType<typeof vi.fn>, index: number): Call => mock.mock.calls[index] as unknown as Call
 
 describe('session model API', () => {
+  it('sends the displayed controls with session creation, including explicit null thinking', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ id: 's' })))
+    vi.stubGlobal('fetch', fetchMock)
+    const controls = { provider: 'cliproxy', model: 'claude-opus-5-5', thinkingLevel: null }
+    try {
+      await createSessionIn('w', 'project', controls)
+      expect(callOf(fetchMock, 0)[1].body).toBe(JSON.stringify({ projectId: 'project', controls }))
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('gets an encoded workspace/session model route', async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ provider: 'p', model: 'm', thinkingLevel: null, source: 'session' })))
     vi.stubGlobal('fetch', fetchMock)

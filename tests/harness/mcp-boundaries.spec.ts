@@ -109,7 +109,6 @@ describe('fail-closed config reads', () => {
     const store = new McpConfigStore(home)
     const id = 'ws'
     expect((await store.loadMcp(id)).servers).toEqual({})
-    expect((await store.loadHooks(id)).hooks).toEqual({})
     expect(await store.loadSecrets(id)).toEqual({})
   })
 

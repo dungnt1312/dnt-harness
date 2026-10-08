@@ -38,9 +38,22 @@ const EXIT_NOTICE_MS = 1_500
  */
 const autoOpenClaims = new Set<string>()
 
-/** Test seam: the claims live for the page's lifetime; a test is a fresh page. */
+/**
+ * The tab each project last had selected, keyed like {@link autoOpenClaims}.
+ * Switching sessions between folders remounts this panel; without the memory
+ * a project would always come back on its first shell instead of the one the
+ * operator left it on.
+ */
+const rememberedActive = new Map<string, string>()
+
+/** Test seam: the claims and selections live for the page's lifetime; a test is a fresh page. */
 export function clearAutoOpenClaims(): void {
   autoOpenClaims.clear()
+  rememberedActive.clear()
+}
+
+function projectKey(workspaceId: string | null, projectId: string | null): string {
+  return `${workspaceId ?? ''}\u0000${projectId ?? ''}`
 }
 
 const NEW_TERMINAL_CLASS = 'flex size-7 shrink-0 items-center justify-center rounded-md text-fg-muted transition-colors hover:bg-hover hover:text-fg disabled:cursor-not-allowed disabled:opacity-40'
@@ -113,7 +126,9 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
   const visibleRows = rows.filter((row) => (row.projectId ?? null) === projectId)
   const [shells, setShells] = useState<readonly ShellRow[]>([])
   const [unavailable, setUnavailable] = useState<string | null>(null)
-  const [activeId, setActiveId] = useState<string | null>(null)
+  // Starts on the shell this project had selected before the panel last
+  // unmounted; the snapshot validates it against the live shells.
+  const [activeId, setActiveId] = useState<string | null>(() => rememberedActive.get(projectKey(workspaceId, projectId)) ?? null)
   const [error, setError] = useState<string | null>(null)
   /** Set once the host's terminal list has arrived, so auto-open knows what exists. */
   const [ready, setReady] = useState(false)
@@ -217,6 +232,14 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
     record.host.remove()
     attached.current.delete(id)
   }, [])
+
+  // Remember the selection per project, so a remount (session switch to
+  // another folder and back) lands on the same tab.
+  useEffect(() => {
+    const key = projectKey(workspaceId, projectId)
+    if (activeId === null) rememberedActive.delete(key)
+    else rememberedActive.set(key, activeId)
+  }, [activeId, workspaceId, projectId])
 
   // The stream handler closes through the latest onHide without the
   // subscription depending on it.
@@ -343,10 +366,20 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
       setActiveId((current) => (current === frame.terminalId
         ? remaining.find((row) => (row.projectId ?? null) === projectId)?.id ?? null
         : current))
-      window.setTimeout(() => detach(frame.terminalId), EXIT_NOTICE_MS)
+      // A kill is the operator closing the tab: there is no exit note worth
+      // reading, so the surface goes at once instead of lingering for the
+      // notice window. A shell that ended by itself (or went idle) keeps it.
+      const deliberate = frame.reason === 'killed'
+      if (deliberate) detach(frame.terminalId)
+      else window.setTimeout(() => detach(frame.terminalId), EXIT_NOTICE_MS)
       if (!exitedHere || onHideRef.current === undefined) return
       if (remaining.some((row) => (row.projectId ?? null) === projectId)) return
       if (surfaceCloseTimer.current !== undefined) clearTimeout(surfaceCloseTimer.current)
+      if (deliberate) {
+        surfaceCloseTimer.current = undefined
+        onHideRef.current?.()
+        return
+      }
       surfaceCloseTimer.current = setTimeout(() => {
         surfaceCloseTimer.current = undefined
         // Re-checked against the live truth: a shell created during the
@@ -414,7 +447,7 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
     if (!ready || !catalogReady || !bindingReady || autoOpened.current || unavailable !== null) return
     autoOpened.current = true
     if (visibleRows.length > 0) return
-    const claim = `${workspaceId ?? ''}\u0000${projectId ?? ''}`
+    const claim = projectKey(workspaceId, projectId)
     // One auto-open per project for the page's lifetime: the claim is not
     // refunded, so session switches that remount this view cannot stack
     // shells. The '+' button and Ctrl+` remain unlimited manual opens.
@@ -504,40 +537,29 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex h-9 shrink-0 items-center gap-0.5 overflow-x-auto border-b border-line px-1.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" role="toolbar" aria-label="Terminals">
-        {/* Every live shell in the workspace is visible, so a shell opened
-            elsewhere can always be found and stopped from here. This view's
-            project owns the real tabs; the rest are dimmed display tabs whose
-            only affordance is their close button. */}
-        {rows.map((row) => {
-          const mine = (row.projectId ?? null) === projectId
+        {/* Only this view's project's shells: a terminal belongs to its
+            folder, and another folder's shells keep running out of sight
+            until a conversation in that folder is opened (the sidebar marks
+            folders with live shells). */}
+        {visibleRows.map((row) => {
           return (
             <span
               key={row.id}
               className={cn(
                 'group flex h-7 shrink-0 items-center rounded-md',
-                mine ? (row.id === activeId ? 'bg-muted' : 'hover:bg-hover') : 'opacity-50 hover:opacity-80',
+                row.id === activeId ? 'bg-muted' : 'hover:bg-hover',
               )}
             >
-              {mine ? (
-                <button
-                  type="button"
-                  aria-pressed={row.id === activeId}
-                  title={`${row.label} — ${row.cwd}`}
-                  onClick={() => setActiveId(row.id)}
-                  className={cn('flex h-full items-center gap-1.5 pl-2 pr-1 text-[12px]', row.id === activeId ? 'text-fg' : 'text-fg-muted hover:text-fg')}
-                >
-                  <Icon name="terminal" size={13} />
-                  {row.label}
-                </button>
-              ) : (
-                <span
-                  title={`${row.label} — ${row.cwd} (${row.projectId === undefined ? 'unbound shell' : 'another project'})`}
-                  className="flex h-full items-center gap-1.5 pl-2 pr-1 text-[12px] text-fg-faint"
-                >
-                  <Icon name="terminal" size={13} />
-                  {row.label}
-                </span>
-              )}
+              <button
+                type="button"
+                aria-pressed={row.id === activeId}
+                title={`${row.label} — ${row.cwd}`}
+                onClick={() => setActiveId(row.id)}
+                className={cn('flex h-full items-center gap-1.5 pl-2 pr-1 text-[12px]', row.id === activeId ? 'text-fg' : 'text-fg-muted hover:text-fg')}
+              >
+                <Icon name="terminal" size={13} />
+                {row.label}
+              </button>
               <button
                 type="button"
                 aria-label={`Close ${row.label}`}

@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { useUnsavedChanges } from './unsaved-changes.tsx'
 import { setProjectFolders } from '../../lib/api.ts'
 import type { AdditionalDirectory, ProjectRow } from '../../lib/types.ts'
 import Icon from '../common/Icon.tsx'
@@ -32,18 +33,24 @@ function describe(entry: AdditionalDirectory, projects: readonly ProjectRow[]): 
  * read-only or read-write. The server validates every folder; its refusal is
  * shown inline and nothing is saved.
  */
-export function ProjectFoldersEditor({ workspaceId, project, projects, onSaved, onCancel }: {
+export function ProjectFoldersEditor({ workspaceId, project, projects, onSaved, onCancel, onDirtyChange }: {
   readonly workspaceId: string
   readonly project: ProjectRow
   readonly projects: readonly ProjectRow[]
   readonly onSaved: () => Promise<void>
   readonly onCancel: () => void
+  /** Mirrors this editor's draft state to the parent's row guard. */
+  readonly onDirtyChange?: (dirty: boolean) => void
 }) {
   const [entries, setEntries] = useState<readonly AdditionalDirectory[]>(project.additionalDirectories ?? [])
   const [newPath, setNewPath] = useState('')
   const [picking, setPicking] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const dirty = newPath.trim() !== '' || JSON.stringify(entries) !== JSON.stringify(project.additionalDirectories ?? [])
+  const guardDiscard = useUnsavedChanges(dirty)
+  useEffect(() => { onDirtyChange?.(dirty) }, [dirty])
+  useEffect(() => () => onDirtyChange?.(false), [])
 
   const others = projects.filter((candidate) => candidate.id !== project.id
     && !entries.some((entry) => entry.kind === 'project' && entry.projectId === candidate.id))
@@ -53,6 +60,9 @@ export function ProjectFoldersEditor({ workspaceId, project, projects, onSaved, 
   const addPath = (): void => {
     const value = newPath.trim()
     if (value === '') return
+    // The same folder twice would be two React rows with one key and a
+    // duplicate grant on save; adding it again is simply a no-op.
+    if (entries.some((entry) => entry.kind === 'path' && entry.path === value)) { setNewPath(''); return }
     setEntries((all) => [...all, { kind: 'path', path: value, access: 'read' }])
     setNewPath('')
   }
@@ -84,8 +94,8 @@ export function ProjectFoldersEditor({ workspaceId, project, projects, onSaved, 
                   <span className={view.missing ? 'text-sm text-bad' : 'break-all text-sm'}>{view.label}</span>
                   {view.detail !== undefined ? <code className="block break-all font-mono text-xs text-fg-faint">{view.detail}</code> : null}
                 </span>
-                <Segmented label="Access" value={entry.access} options={ACCESS_OPTIONS} onChange={(access) => setAccess(index, access)} />
-                <IconButton label={`Remove ${view.label}`} onClick={() => remove(index)}><Icon name="close" size={14} /></IconButton>
+                <Segmented label="Access" value={entry.access} options={ACCESS_OPTIONS} disabled={busy} onChange={(access) => setAccess(index, access)} />
+                <IconButton label={`Remove ${view.label}`} disabled={busy} onClick={() => remove(index)}><Icon name="close" size={14} /></IconButton>
               </li>
             )
           })}
@@ -96,7 +106,7 @@ export function ProjectFoldersEditor({ workspaceId, project, projects, onSaved, 
           <TextInput
             mono
             aria-label="Folder to add"
-            placeholder="C:/workspace/shared"
+            placeholder="/Users/you/workspace/shared"
             value={newPath}
             disabled={busy}
             onChange={(event) => setNewPath(event.target.value)}
@@ -104,7 +114,7 @@ export function ProjectFoldersEditor({ workspaceId, project, projects, onSaved, 
             trailing={<IconButton label="Browse folders" disabled={busy} onClick={() => setPicking(true)}><Icon name="folder" size={15} /></IconButton>}
           />
         </div>
-        <Button variant="outline" size="sm" disabled={busy || newPath.trim() === ''} onClick={addPath}>Add folder</Button>
+        <Button variant="outline" size="sm" disabled={busy || newPath.trim() === ''} onClick={addPath}><Icon name="plus" size={13} />Add folder</Button>
         {others.length > 0 ? (
           <div className="w-52">
             <Select
@@ -112,15 +122,15 @@ export function ProjectFoldersEditor({ workspaceId, project, projects, onSaved, 
               value=""
               options={others.map((candidate) => ({ value: candidate.id, label: candidate.name }))}
               onChange={(projectId) => setEntries((all) => [...all, { kind: 'project', projectId, access: 'read' }])}
-              renderTrigger={() => <Button variant="outline" size="sm">Add a project…</Button>}
+              renderTrigger={() => <Button variant="outline" size="sm"><Icon name="plus" size={13} />Add a project…</Button>}
             />
           </div>
         ) : null}
       </div>
       {error !== null ? <ErrorNotice raw={error} /> : null}
-      <div className="flex gap-2">
-        <Button variant="primary" size="sm" disabled={busy} onClick={() => void save()}>{busy ? 'Saving…' : 'Save folders'}</Button>
-        <Button variant="ghost" size="sm" disabled={busy} onClick={onCancel}>Cancel</Button>
+      <div className="flex flex-wrap justify-end gap-2">
+        <Button variant="ghost" size="sm" disabled={busy} onClick={() => guardDiscard(onCancel)}>Cancel</Button>
+        <Button variant="primary" size="sm" disabled={busy || !dirty} onClick={() => void save()}>{busy ? 'Saving…' : 'Save folders'}</Button>
       </div>
       <FolderPickerModal
         open={picking}

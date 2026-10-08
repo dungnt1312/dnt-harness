@@ -26,7 +26,10 @@ import {
   parsePositiveInt,
   useActionRunner,
   type NoticeState,
+  RowMenu,
+  FormActions,
 } from './settings-kit.tsx'
+import { useUnsavedChanges } from './unsaved-changes.tsx'
 
 const SERVER_NAME = /^[A-Za-z0-9_-]+$/
 const DEFAULT_TIMEOUT_MS = 15000
@@ -46,7 +49,7 @@ const STATUS_META: Readonly<Record<McpServerRow['status'], string | undefined>> 
   ready: undefined,
   connecting: 'Starting up — tools appear once the handshake completes.',
   failed: 'The connection failed. Check the command and arguments, then reconnect.',
-  disabled: undefined,
+  disabled: 'Not running. Enable it to start the server.',
 }
 
 interface ServerForm {
@@ -137,35 +140,74 @@ function toolExposed(allowed: readonly string[] | undefined, server: string, nam
   return allowed.includes(name) || allowed.includes(`mcp__${server}__${name}`)
 }
 
-/** Names the live server listed, and whether the saved allowlist exposes each one. */
+/**
+ * Names the live server listed, and whether the saved allowlist exposes each
+ * one. The full list folds behind a one-line count so a server with dozens of
+ * tools does not turn its row into a wall of badges; warnings stay visible.
+ */
 function DiscoveredTools({ row }: { readonly row: McpServerRow }) {
   const tools = row.discoveredTools ?? []
-  if (tools.length === 0 && (row.unmatchedAllowlist === undefined || row.unmatchedAllowlist.length === 0)) return null
+  const hasWarnings = (row.unmatchedAllowlist?.length ?? 0) > 0 || (row.unusableTools?.length ?? 0) > 0
+  if (tools.length === 0 && !hasWarnings) return null
   const allowed = row.allowedTools
   const restricted = allowed !== undefined && allowed.length > 0
+  const exposedCount = tools.filter((name) => toolExposed(allowed, row.name, name)).length
   return (
     <div className="flex min-w-0 flex-col gap-1.5">
-      <p className="m-0 text-xs text-fg-faint">
-        {tools.length === 0
-          ? 'No tools listed yet. Enable or test the connection.'
-          : restricted
-            ? `${tools.length} tools from the server. Only the allowlist is exposed to the agent.`
-            : `${tools.length} tools from the server. A blank allowlist exposes all of them.`}
-      </p>
       {tools.length > 0 ? (
-        <ul aria-label={`Tools from ${row.name}`} className="m-0 flex list-none flex-wrap gap-1 p-0">
-          {tools.map((name) => {
-            const exposed = toolExposed(allowed, row.name, name)
-            return (
-              <li key={name}>
-                <Badge tone={exposed ? 'blue' : 'amber'} className="font-mono">{exposed ? name : `${name} hidden`}</Badge>
-              </li>
-            )
-          })}
-        </ul>
+        <Disclosure
+          summary={
+            <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+              <span>{tools.length} {tools.length === 1 ? 'tool' : 'tools'}</span>
+              <span className="text-xs font-normal text-fg-faint">
+                {restricted ? `${exposedCount} exposed by the allowlist · ${tools.length - exposedCount} hidden` : 'all exposed'}
+              </span>
+            </span>
+          }
+        >
+          <ul aria-label={`Tools from ${row.name}`} className="m-0 flex list-none flex-wrap gap-1 p-0">
+            {tools.map((name) => {
+              const exposed = toolExposed(allowed, row.name, name)
+              return (
+                <li key={name}>
+                  {exposed ? (
+                    <Badge tone="blue" className="font-mono">{name}</Badge>
+                  ) : (
+                    <Badge tone="gray" className="font-mono text-fg-faint line-through" title="Hidden by the allowlist">
+                      <Icon name="eyeOff" size={11} aria-hidden="true" />{name}<span className="sr-only"> hidden</span>
+                    </Badge>
+                  )}
+                </li>
+              )
+            })}
+          </ul>
+        </Disclosure>
       ) : null}
       {row.unmatchedAllowlist !== undefined && row.unmatchedAllowlist.length > 0 ? (
         <p className="m-0 text-xs text-warn">Allowlist names not on this server: {row.unmatchedAllowlist.join(', ')}</p>
+      ) : null}
+      {row.unusableTools !== undefined && row.unusableTools.length > 0 ? (
+        <p className="m-0 text-xs text-warn">
+          Not sent to the model, because model providers reject these names (letters, numbers, _ and - only, at most 64 characters including the mcp__{row.name}__ prefix): {row.unusableTools.join(', ')}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+/** Why the server is not usable right now, and what it last wrote to stderr. */
+function ServerDiagnostics({ row }: { readonly row: McpServerRow }) {
+  const hasLog = row.stderrTail !== undefined && row.stderrTail !== ''
+  if (row.lastError === undefined && !hasLog) return null
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      {row.lastError !== undefined ? (
+        <p className="m-0 text-xs text-bad">Last connection attempt failed: {row.lastError}. Conversations continue without this server's tools until it connects.</p>
+      ) : null}
+      {hasLog ? (
+        <Disclosure summary="Server log (stderr, secrets masked)">
+          <pre className="m-0 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[11px] text-fg-muted">{row.stderrTail}</pre>
+        </Disclosure>
       ) : null}
     </div>
   )
@@ -184,8 +226,12 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
   const [editing, setEditing] = useScopedState<{ readonly name: string; readonly stored: Record<string, unknown> } | null>(null)
   /** The editor is opened deliberately, so the list is what the tab opens on. */
   const [editorOpen, setEditorOpen] = useScopedState(false)
+  /** Import is its own view too, so the list is never buried under two forms. */
+  const [importing, setImporting] = useScopedState(false)
   const [confirmDelete, setConfirmDelete] = useScopedState<string | null>(null)
   const [confirmEnable, setConfirmEnable] = useScopedState<string | null>(null)
+  /** "Add" with a taken name replaces a server: ask before doing that. */
+  const [confirmReplace, setConfirmReplace] = useScopedState(false)
   const [importDialect, setImportDialect] = useScopedState<'claude' | 'codex'>('claude')
   const [importVersion, setImportVersion] = useScopedState('')
   const [importContent, setImportContent] = useScopedState('')
@@ -201,7 +247,14 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
 
   useEffect(() => { void refresh() }, [refresh])
 
+  const formBaseline = editing === null ? BLANK_FORM : formOf(editing.name, editing.stored)
+  const guardDiscard = useUnsavedChanges(
+    (editorOpen && JSON.stringify(form) !== JSON.stringify(formBaseline)) || importContent.trim() !== '',
+  )
+
   if (workspaceId === null) return <WorkspaceRequired />
+
+  const view: 'list' | 'edit' | 'import' = editorOpen ? 'edit' : importing ? 'import' : 'list'
 
   const patch = (next: Partial<ServerForm>): void => { setForm((current) => ({ ...current, ...next })) }
 
@@ -219,14 +272,11 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
     }
   })
 
-  /**
-   * Bring the editor into view: it sits below the list and may be offscreen,
-   * so editing a server would otherwise look like nothing happened.
-   */
+  /** The editor replaces the list; scroll its top into view and focus the first field. */
   const revealEditor = (): void => {
     window.requestAnimationFrame(() => {
       const editor = editorRef.current
-      if (typeof editor?.scrollIntoView === 'function') editor.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+      if (typeof editor?.scrollIntoView === 'function') editor.scrollIntoView({ block: 'start' })
       nameRef.current?.focus()
     })
   }
@@ -235,6 +285,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
     const stored = await getMcpServer(workspaceId, server)
     setEditing({ name: server, stored })
     setForm(formOf(server, stored))
+    setImporting(false)
     setEditorOpen(true)
     setNotice(null)
     revealEditor()
@@ -243,12 +294,19 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
   const beginAdd = (): void => {
     setEditing(null)
     setForm(BLANK_FORM)
+    setImporting(false)
     setEditorOpen(true)
     setNotice(null)
     revealEditor()
   }
 
   const resetForm = (): void => { setEditing(null); setForm(BLANK_FORM); setEditorOpen(false) }
+
+  const beginImport = (): void => {
+    resetForm()
+    setImporting(true)
+    setNotice(null)
+  }
 
   const invalid = formError(form)
   const save = (): Promise<void> => run('save', async () => {
@@ -268,7 +326,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
       }
       throw cause
     }
-    setNotice({ kind: 'ok', text: `Saved ${name}. Saving does not start a process — use Enable on the list. This is not a sandbox.` })
+    setNotice({ kind: 'ok', text: editing !== null && rows.find((row) => row.name === name)?.enabled === true ? `Saved ${name}.` : `Saved ${name}. It is not running yet — use Enable to start it.` })
     resetForm()
     await refresh()
   })
@@ -289,6 +347,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
       ...(importDialect === 'codex' ? { sourceVersion: importVersion.trim() } : {}),
     })
     setImportContent('')
+    setImporting(false)
     setNotice({ kind: 'ok', text: `Imported ${result.imported.join(', ')} (disabled)` })
     await refresh()
   })
@@ -298,90 +357,111 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
   /** Set once a limit is stored, so an existing override is never hidden. */
   const advancedInUse = form.allowedTools.trim() !== '' || form.memoryMb.trim() !== '' || form.cpuPercent.trim() !== '' || form.timeoutMs !== String(DEFAULT_TIMEOUT_MS)
 
+  const serverList = (
+    <Section
+      title="Servers"
+      count={rows.length}
+      actions={
+        <>
+          <IconButton label="Refresh servers" disabled={busy !== null} onClick={() => void refresh()}><Icon name="refresh" size={14} /></IconButton>
+          <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => guardDiscard(beginImport)}>Import…</Button>
+          <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => guardDiscard(beginAdd)}><Icon name="plus" size={13} />Add server</Button>
+        </>
+      }
+    >
+      {rows.length === 0 ? (
+        <EmptyState>No MCP servers yet. Add one, or import an existing Claude .mcp.json / Codex config.</EmptyState>
+      ) : (
+        <ItemList label="MCP servers">
+          {rows.map((row) => (
+            <ItemRow
+              key={row.name}
+              selected={editing?.name === row.name}
+              title={
+                <>
+                  <span className="break-all">{row.name}</span>
+                  <Badge tone={STATUS_TONE[row.status]} {...(row.generation !== undefined ? { title: `generation ${row.generation}` } : {})}>{row.status}</Badge>
+                  {row.breakerOpenUntil !== null ? <Badge tone="amber">breaker open</Badge> : null}
+                  {row.auditFault === true ? <Badge tone="amber">audit fault</Badge> : null}
+                  {row.stale === true ? <Badge tone="amber">stale file</Badge> : null}
+                </>
+              }
+              meta={[
+                row.transport === 'http' ? 'Streamable HTTP' : 'stdio',
+                STATUS_META[row.status],
+              ].filter((line): line is string => line !== undefined && line !== '').join(' · ')}
+              actions={
+                <>
+                  {row.enabled ? (
+                    <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void act(row.name, 'disable')}>{busy === `disable:${row.name}` ? 'Disabling…' : 'Disable'}</Button>
+                  ) : (
+                    <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => setConfirmEnable(row.name)}>{busy === `enable:${row.name}` ? 'Enabling…' : 'Enable'}</Button>
+                  )}
+                  <IconButton label={`Edit ${row.name}`} disabled={busy !== null} onClick={() => guardDiscard(() => void beginEdit(row.name))}><Icon name="pencil" size={14} /></IconButton>
+                  <RowMenu
+                    label={`More actions for ${row.name}`}
+                    disabled={busy !== null}
+                    actions={[
+                      { label: busy === `test:${row.name}` ? 'Testing…' : 'Test connection', icon: 'zap', onSelect: () => void act(row.name, 'test') },
+                      { label: 'Reconnect', icon: 'refresh', disabled: !row.enabled, onSelect: () => void act(row.name, 'reconnect') },
+                      { label: 'Delete server', icon: 'trash', danger: true, onSelect: () => setConfirmDelete(row.name) },
+                    ]}
+                  />
+                </>
+              }
+            >
+              {confirmEnable === row.name ? (
+                <InlineConfirm
+                  message={`Start ${row.name}? It runs as you, with network and file access — not a sandbox.`}
+                  confirmLabel="Start server"
+                  busy={busy === `enable:${row.name}`}
+                  onConfirm={() => { setConfirmEnable(null); void act(row.name, 'enable') }}
+                  onCancel={() => setConfirmEnable(null)}
+                />
+              ) : null}
+              {confirmDelete === row.name ? (
+                <InlineConfirm
+                  message={`Delete ${row.name}? Its process stops and its tools disappear from new requests.`}
+                  confirmLabel="Delete server"
+                  busy={busy === `delete:${row.name}`}
+                  onConfirm={() => void remove(row.name)}
+                  onCancel={() => setConfirmDelete(null)}
+                />
+              ) : null}
+              <ServerDiagnostics row={row} />
+              <DiscoveredTools row={row} />
+            </ItemRow>
+          ))}
+        </ItemList>
+      )}
+    </Section>
+  )
+
+  /** Return from the editor or import view to the list. */
+  const backToList = (
+    <Button variant="ghost" size="sm" className="-ml-2 self-start" disabled={busy !== null} onClick={() => guardDiscard(() => { resetForm(); setImporting(false); setImportContent('') })}>
+      <Icon name="chevronRight" size={13} className="rotate-180" />Back to servers
+    </Button>
+  )
+
   return (
     <PanelBody>
-      <div className="flex flex-col gap-2">
-        <PanelIntro>
-          MCP tools default to ask. requiresUserInteraction always requires approval and cannot become allow. allowedTools filters exposure; it does not grant permission. Saving a server does not start it. A stdio server runs as you; the watchdog is not a sandbox. An indeterminate result may already have run and is not retried.
-        </PanelIntro>
-        <IsolationSummary />
-      </div>
+      {view === 'list' ? (
+        <>
+          <div className="flex flex-col gap-2">
+            <PanelIntro>
+              Connect MCP servers to give the agent extra tools. MCP tools default to ask; requiresUserInteraction always requires approval and cannot become allow. allowedTools filters exposure; it does not grant permission.
+            </PanelIntro>
+            <IsolationSummary />
+          </div>
+          {serverList}
+        </>
+      ) : backToList}
 
-      <Section
-        title="Servers"
-        count={rows.length}
-        actions={
-          <>
-            <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void refresh()}><Icon name="refresh" size={13} />Refresh</Button>
-            <Button variant="outline" size="sm" disabled={busy !== null} onClick={beginAdd}><Icon name="plus" size={13} />Add server</Button>
-          </>
-        }
-      >
-        {rows.length === 0 ? <EmptyState>No MCP servers configured in this workspace.</EmptyState> : (
-          <ItemList label="MCP servers">
-            {rows.map((row) => (
-              <ItemRow
-                key={row.name}
-                selected={editing?.name === row.name}
-                title={
-                  <>
-                    <span className="break-all">{row.name}</span>
-                    <Badge>{row.transport}</Badge>
-                    <Badge tone={STATUS_TONE[row.status]}>{row.status}</Badge>
-                    {row.breakerOpenUntil !== null ? <Badge tone="amber">breaker open</Badge> : null}
-                    {row.auditFault === true ? <Badge tone="amber">audit fault</Badge> : null}
-                    {row.stale === true ? <Badge tone="amber">stale file</Badge> : null}
-                  </>
-                }
-                meta={[
-                  STATUS_META[row.status],
-                  row.containment,
-                  row.generation !== undefined ? `generation ${row.generation}` : undefined,
-                ].filter((line): line is string => line !== undefined && line !== '').join(' · ') || undefined}
-                actions={
-                  <>
-                    {row.enabled ? (
-                      <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void act(row.name, 'disable')}>{busy === `disable:${row.name}` ? 'Disabling…' : 'Disable'}</Button>
-                    ) : (
-                      <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => setConfirmEnable(row.name)}>{busy === `enable:${row.name}` ? 'Enabling…' : 'Enable'}</Button>
-                    )}
-                    <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void act(row.name, 'test')}>{busy === `test:${row.name}` ? 'Testing…' : 'Test connection'}</Button>
-                    <IconButton label={`Reconnect ${row.name}`} disabled={busy !== null} onClick={() => void act(row.name, 'reconnect')}><Icon name="refresh" size={14} /></IconButton>
-                    <IconButton label={`Edit ${row.name}`} disabled={busy !== null} onClick={() => void beginEdit(row.name)}><Icon name="pencil" size={14} /></IconButton>
-                    <IconButton label={`Delete ${row.name}`} disabled={busy !== null} onClick={() => setConfirmDelete(row.name)}><Icon name="trash" size={14} /></IconButton>
-                  </>
-                }
-              >
-                {confirmEnable === row.name ? (
-                  <InlineConfirm
-                    message={`Start ${row.name}? It runs as you, with network and file access. This is not a sandbox. Saving did not start it.`}
-                    confirmLabel="Start server"
-                    busy={busy === `enable:${row.name}`}
-                    onConfirm={() => { setConfirmEnable(null); void act(row.name, 'enable') }}
-                    onCancel={() => setConfirmEnable(null)}
-                  />
-                ) : null}
-                {confirmDelete === row.name ? (
-                  <InlineConfirm
-                    message={`Delete ${row.name}? Its process stops and its tools disappear from new requests.`}
-                    confirmLabel="Delete server"
-                    busy={busy === `delete:${row.name}`}
-                    onConfirm={() => void remove(row.name)}
-                    onCancel={() => setConfirmDelete(null)}
-                  />
-                ) : null}
-                <DiscoveredTools row={row} />
-              </ItemRow>
-            ))}
-          </ItemList>
-        )}
-      </Section>
-
-      {editorOpen ? (
+      {view === 'edit' ? (
         <Section
           ref={editorRef}
           title={editing !== null ? `Edit ${editing.name}` : 'Add a server'}
-          actions={<Button variant="ghost" size="sm" disabled={busy !== null} onClick={resetForm}>{editing !== null ? 'Cancel editing' : 'Cancel'}</Button>}
         >
           <div className="grid gap-4 md:grid-cols-2">
             <Field
@@ -419,7 +499,6 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
                 </Field>
               </>
             )}
-            <p className="text-sm text-muted md:col-span-2">Saving does not start the process. Use Enable on the server list. The server runs with your user account; that is not a sandbox.</p>
           </div>
 
           {/* Exposure and resource caps: rarely changed, so they start folded. */}
@@ -440,18 +519,29 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
             </div>
           </Disclosure>
 
-          <div className="flex flex-wrap items-center gap-2">
-            <Button variant="primary" size="sm" disabled={busy !== null || invalid !== null} title={invalid ?? undefined} onClick={() => void save()}>
-              {busy === 'save' ? 'Saving…' : editing !== null ? 'Save changes' : 'Add server'}
-            </Button>
-            {invalid !== null && form.name.trim() !== '' ? <span className="text-xs text-fg-faint">{invalid}</span> : null}
-          </div>
+          {confirmReplace && nameTaken ? (
+            <InlineConfirm
+              message={`Replace the existing “${form.name.trim()}”? Its stored env, headers and limits are overwritten by this form.`}
+              confirmLabel="Replace server"
+              busy={busy === 'save'}
+              onConfirm={() => { setConfirmReplace(false); void save() }}
+              onCancel={() => setConfirmReplace(false)}
+            />
+          ) : (
+            <FormActions>
+              <span className="mr-auto text-xs text-fg-faint">{invalid ?? 'Saving does not start the server — use Enable on the list.'}</span>
+              <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => guardDiscard(resetForm)}>Cancel</Button>
+              <Button variant="primary" size="sm" disabled={busy !== null || invalid !== null} onClick={() => { if (nameTaken) setConfirmReplace(true); else void save() }}>
+                {busy === 'save' ? 'Saving…' : editing !== null ? 'Save server' : nameTaken ? 'Replace server…' : 'Add server'}
+              </Button>
+            </FormActions>
+          )}
         </Section>
       ) : null}
 
-      <Section title="Import servers">
-        <Disclosure summary="Import from a Claude .mcp.json or Codex configuration">
-          <PanelIntro>Imports record provenance. Imported servers always stay disabled and do not start.</PanelIntro>
+      {view === 'import' ? (
+        <Section title="Import servers">
+          <PanelIntro>Paste a Claude .mcp.json or Codex configuration. Imported servers stay disabled until you enable them; provenance is recorded.</PanelIntro>
           <div className="grid gap-4 md:grid-cols-2">
             <div className="flex flex-col gap-1.5">
               <span className="text-[13px] font-medium">Format</span>
@@ -459,6 +549,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
                 label="Import format"
                 value={importDialect}
                 options={[{ value: 'claude', label: 'Claude .mcp.json' }, { value: 'codex', label: 'Codex (pinned)' }]}
+                disabled={busy !== null}
                 onChange={setImportDialect}
               />
             </div>
@@ -478,13 +569,14 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
               </Field>
             </div>
           </div>
-          <div>
-            <Button variant="outline" size="sm" disabled={busy !== null || importContent.trim() === '' || codexNeedsVersion} onClick={() => void importServers()}>
+          <FormActions>
+            <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => guardDiscard(() => { setImporting(false); setImportContent('') })}>Cancel</Button>
+            <Button variant="primary" size="sm" disabled={busy !== null || importContent.trim() === '' || codexNeedsVersion} onClick={() => void importServers()}>
               {busy === 'import' ? 'Importing…' : 'Import servers'}
             </Button>
-          </div>
-        </Disclosure>
-      </Section>
+          </FormActions>
+        </Section>
+      ) : null}
 
       <PanelFooter notice={notice} />
     </PanelBody>

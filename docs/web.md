@@ -68,7 +68,7 @@ UI from it at any time.
 - The selected mode is the workspace's permission truth. Its `permissionDefaults` decide each tool; `--yolo` is stated on the trigger and maps asks to allows, but never lifts an explicit deny.
 - Failed, cancelled, limited and interrupted work offers inspection-first recovery guidance. Unknown recovered tool results are explicitly called out. There is no automatic retry or replay control: inspect actual effects, then submit new instructions limited to remaining work.
 - The Providers pane states each fact once. The provider name is its editable title (rename in place) with enablement as a state pill plus the opposite verb, and delete lives on that title row; the rail carries the name, the `default` marker and the enabled dot. A model row is one pill — id, `Vision` when it accepts images, its context window — with the provider-default radio and the global-default, edit and remove actions beside it. Per-model overrides open in **Edit model settings**, committed or abandoned as one decision: id (renaming carries its overrides), context window, input types — text is shown locked because every model takes it, image is a checkbox whose state is the effective one, with a link back to the catalog default once it is overridden — and thinking default. **Sync from /models** probes the endpoint and opens a selection: checked models are kept, unchecking one removes it, models the endpoint does not offer are left alone, and nothing is stored until Save.
-- Settings distinguish global provider storage plus the global default model from workspace services. **Modes** sits after Projects in the Workspace group: its structured editor loads a workspace file into a form (name, instructions, context sources, tool exposure, per-key permissions), saves existing files with `expectedHash`, and offers Reload or an overwrite that first reloads the fresh hash after a conflict. Its catalog puts bundled read-only modes first (Duplicate only), then workspace modes (Edit/Delete); every row can be disabled, which hides the mode from the composer picker until re-enabled. It plainly lists each `permissionDefaults` key including `*` and MCP patterns. Mode authoring does not switch an existing conversation: each root owns its live selected mode, and a conversation mode switch applies at its next model request or unstarted tool gate. Workspace mode selection seeds new conversations and draft UI. Agent definitions are workspace-scoped; child listings are current-session-scoped. Saving configuration is not evidence of connectivity; provider connection checks use saved configuration rather than unsaved drafts.
+- Settings distinguish global provider storage plus the global default model from workspace services. **Modes** sits after Projects in the Workspace group: its structured editor loads a workspace file into a form (name, optional description, instructions, context sources, tool exposure, the MCP tools ceiling — Default/None/Read-safe/All — and per-key permissions; the tool list is the harness's own `KNOWN_MODE_TOOLS`, and every server-valid field round-trips byte-for-byte), saves existing files with `expectedHash`, and offers Reload or an overwrite that first reloads the fresh hash after a conflict. Its catalog puts bundled read-only modes first (Duplicate only), then workspace modes (Edit/Delete); every row has an **In picker** switch that hides the mode from the composer picker until re-enabled, except the workspace's selected mode, whose switch is locked on (the server answers `409` to hiding it). It plainly lists each `permissionDefaults` key including `*` and MCP patterns. Mode authoring does not switch an existing conversation: each root owns its live selected mode, and a conversation mode switch applies at its next model request or unstarted tool gate. Workspace mode selection seeds new conversations and draft UI. Agent definitions are workspace-scoped; child listings are current-session-scoped. Saving configuration is not evidence of connectivity; provider connection checks use saved configuration rather than unsaved drafts.
 - Automated workflow regressions cover scope validation, creation markup, durable lifecycle, stopped partial chunks, recovery guidance and approval arguments/decision rendering. Fixture-backed Chromium interactions, mobile layout, keyboard focus and all settings sections pass. Real-backend end-to-end workflows, native zoom and screen-reader acceptance remain separate gates.
 
 ## Starting it
@@ -163,10 +163,12 @@ tool root. The families, at a glance:
 | `…/:wid/terminals` (+ `/events` SSE, `/:tid` DELETE, `/:tid/(input\|resize)`) | interactive Workbench terminals: PTY lifecycle, one multiplexed output stream per workspace — see the terminal section |
 | `POST …/:wid/attachments`, `GET …/:wid/attachments/:id` | composer attachments: upload (content-addressed by sha256, verified media type) and serve (immutable, workspace-scoped) |
 | `…/:wid/agents/:name` (GET resolve / DELETE), `POST …/:wid/agents/:name` | agent definitions; POST spawns a bounded child from `task: { prompt, requiredResult }` or the four-field `task: { objective, constraints, references, requiredResult }`, optionally `inherit: "brief"`, `model` (`provider:model`) and `grantTools`. 202 with the handle (+ `inheritedChars`, `note`); an empty brief, a bad `inherit`, or a role that refuses inheritance is 400 |
-| `POST …/:wid/agents/:name/import` | save a definition: `dialect: "claude"` / `"codex"` import with provenance, or `"dnt-harness"` to save a native document verbatim (keeps `inheritable`) |
+| `GET …/:wid/agents(?projectId=)` | every effective subagent: bundled, `~/.claude/agents`, the workspace layer and the project's `.claude/agents`; each row carries `source`, `path`, `overrides`, `definition.warnings` |
+| `POST …/:wid/agents/:name/import` | save a Claude Code subagent file verbatim into `<ws>/agents/<name>.md` (`dialect: "codex"` converts a pinned Codex spec first) |
 | `GET …/:wid/agents/children?root=…`, `GET/DELETE …/:wid/children/:childId` (+ `/cancel`), `POST …/:wid/sessions/:parentSessionId/children/:childSessionId/reconcile` | child list / wait-result / cancel / settlement; statuses may include `uncertain`, which is stable across restarts until settled — repair runs through the Agent tool, the Workbench's Retry settlement, or the reconcile route (below); the legacy `POST /api/sessions/...` reconcile address is retained |
 | `…/:wid/mcp` (+ `/:server` GET/POST/DELETE, `/:server/(enable\|disable\|reconnect)`, `/mcp/import`) | MCP server lifecycle, stored config for editing, deletion, and imports with provenance |
-| `…/:wid/hooks`, `…/:wid/secrets(/:key)` | hook bindings; encrypted secret management (masked responses) |
+| `GET/PUT …/:wid/hooks(?projectId=)` | Claude Code hooks: GET returns the workspace layer's `hooks` section of `<ws>/settings.json` plus every applying layer (`sources`, `effective`, `diagnostics`); PUT `{ hooks, disableAllHooks? }` replaces that section and keeps other settings keys |
+| `…/:wid/secrets(/:key)` | encrypted secret management (masked responses) |
 
 Approval answering stays transport-global at `POST /api/approvals/:id`
 (below) — approval ids are unguessable capabilities, not session-scoped
@@ -238,6 +240,16 @@ variable — no re-registration, and the change applies to the next tool call.
 ```
 
 `400` when the path is empty, missing, or not a directory.
+
+### `GET /api/usage`
+
+Token statistics behind **Settings → Usage**, which sits in the Global group and covers every workspace. Each completed model request appends one line to `<home>/usage.jsonl`. A line carries `v`, `at`, `startedAt`, `workspaceId`, `sessionId`, `rootSessionId`, `kind` (`turn` / `child` / `compaction`), `provider`, `model`, `input` (cached prompt included), `cached`, and `output`. A request whose provider reports usage more than once is recorded with the last report. A stream that ends without any usage report records nothing. The host rebuilds a `day × model` index from that file at boot. Malformed or truncated lines are skipped. A failing append logs one warning and never affects the turn. Usage before this log existed was never stored, so it cannot be backfilled.
+
+The response is `{ days: [{ date, model, input, cached, output, requests }], longestSessionMs, firstRecordAt?, today }`. `days` covers the last 371 host-local days. `today` is the host-local date, so the client never guesses the timezone. `longestSessionMs` is the longest block of activity per root conversation, with child agents folded into their root, after merging gaps of 30 minutes or less. The panel derives everything else in `web/lib/usage-stats.ts`:
+- totals and the peak day (input + output);
+- the current and longest streaks (an empty today does not break the current streak);
+- a 53-week heatmap with Sunday-first columns in Daily, Weekly, or Cumulative mode, coloured by quantile levels;
+- a 7- or 30-day trend with one monotone curve per model (top 7 plus "Other").
 
 ### `GET /api/providers`
 
@@ -423,6 +435,8 @@ Three ways to act on a running conversation. All acceptance is durable
 | **Stop** | `POST …/stop` | closes `turn/end: cancelled` | stays queued — never auto-runs, including input sent while the stop settles |
 | **Steer** (Ctrl/⌘+Enter, Steer button) | `POST …/messages { content, delivery: "steer" }` | closes `turn/end: steered` | old queue + the new message run in one new turn, oldest first |
 | **Send now** (on the queue strip above the composer) | `POST …/steer` | closes `turn/end: steered` | the whole queue runs in one new turn |
+| **Edit** (pencil on a queued row) | `PATCH …/inputs/:inputId { content }` | untouched | same id and position, new text (`input/revised`) |
+| **Delete** (trash on a queued row) | `DELETE …/inputs/:inputId` | untouched | removed; `input/settled { outcome: "withdrawn" }`, never runs |
 
 - `delivery` defaults to `"queue"`; anything else answers `400`. The reply is
   `202 { inputId, queued, delivery }` (`queued` is true for queue-delivery
@@ -430,6 +444,13 @@ Three ways to act on a running conversation. All acceptance is durable
   Maintenance adds `dispatchBlocked: "maintenance"`; acceptance is durable but
   no turn has been dispatched. A steered input is recorded with
   `delivery: "steer"` on its `input/queued` event.
+- The host, not the client, decides how a new message renders. When the
+  session is idle and nothing blocks dispatch (no compaction, no uncertain
+  transport, not closed), `input/queued` carries `runsNow: true` and the UI
+  shows it at once as a sent user message in the transcript. Without the stamp
+  the input waits behind a turn and shows only on the queue strip above the
+  composer. A `runsNow` input that a `turn/end` finds still unclaimed falls
+  back to the queue strip.
 - Steer stops like Stop does — the provider stream, cancellable tools, pending
   approvals, and child agents — and only then runs the queue. A tool that cannot
   be cancelled delays it until it returns.
@@ -444,8 +465,13 @@ Three ways to act on a running conversation. All acceptance is durable
 - Not durable as an intent: if the host restarts before the steered turn
   starts, recovery closes the open turn as `interrupted` and the input is plain
   pending input again (it does not auto-run).
+- Edit/Delete answer `200 { inputId, revised: true }` / `200 { inputId,
+  withdrawn: true }`; `404` once the input is no longer pending (already ran
+  or deleted), `409` once a turn claimed it (pre-step or later), `400` for an
+  edit to empty text without attachments. The live inbox and the log change in
+  the same tick, so a turn sees either the old or the new queue.
 - Each accepted input ends with `input/settled { outcome: admitted | rejected |
-  empty }`. A pre-step rejection (hooks, MCP configuration) settles it as
+  empty | withdrawn }`. A pre-step rejection (hooks, MCP configuration) settles it as
   `rejected` without a `user/message`; the UI shows the bubble as "Not sent".
 
 ### Legacy: `POST /api/sessions/:id/messages`
@@ -657,12 +683,24 @@ boundaries matter more than the feature:
   restart does not.
 - **Per project.** A terminal records the project it was opened for and starts
   in that project's folder (the host's `--root` when no project is open). The
-  panel shows only the open project's shells and opens one for a project that
-  has none; switching projects never surfaces another project's shell. The
-  shell can still `cd` afterwards — the binding says where it belongs.
+  panel shows only the open project's shells — another folder's shells get no
+  tab, keep running out of sight, and the sidebar marks their folder with a
+  terminal icon. The shell can still `cd` afterwards — the binding says where
+  it belongs.
+- **Surface state follows the folder.** Conversations in the same folder share
+  one terminal state; conversations in different folders never touch each
+  other's. Whether the chat footer is open (Ctrl+`) and whether the workbench
+  strip carries the Terminal tab live per project under
+  `dnt-harness.terminal.projects.v1`, keyed `<workspaceId>:<projectId>` (empty
+  project id without a folder). The selected shell tab is remembered per
+  project for the page's lifetime, so going to another folder and back lands
+  on the same tab. The last shell of one folder exiting closes only that
+  folder's footer. On upgrade, the old global `terminalOpen` flag and a
+  conversation's stored Terminal tab seed projects until any project record
+  exists.
 - **Unbounded in count, bounded in bytes.** A workspace may open as many
-  terminals as it wants; every live one is listed and attachable from the
-  panel. Output is coalesced into 16 ms
+  terminals as it wants; every live one is listed and attachable from its
+  project's panel. Output is coalesced into 16 ms
   frames and a flush past 1 MB is dropped with an
   `[output truncated: too fast]` marker; a terminal idle for 30 minutes is
   reaped. `server.close()` kills every PTY, so none outlives the host.
@@ -863,7 +901,9 @@ widths are browser-local preferences under `dnt-harness.workbench.v1`; the opene
 Workbench views and the selected one are remembered **per conversation** under
 `dnt-harness.workbench.tabs.v1`, keyed `<workspaceId>:<sessionId>` (or `draft`
 before the first message) — a subagent conversation shares its root's record,
-so a child and its parent read as one workbench. One conversation's tabs never
+so a child and its parent read as one workbench. The Terminal tab is the
+exception: its presence follows the project (see Terminal above), so every
+conversation in a folder shows it or none does. One conversation's tabs never
 leak into another; conversations without a record start from the tab fields of
 the old global key until they gain one (the upgrade seed fades as records are
 written); appearance (System/Light/Dark) is stored under
@@ -916,4 +956,4 @@ written to `artifacts/product-ui/chat/`; it is not an approved visual baseline.
 
 Workspace session listings may include optional `createdAt`/`updatedAt` from existing event-backed summaries. Empty conversations omit these fields; clients must not invent dates. No existing request or approval wire format changed.
 
-Agent catalog: `GET /api/workspaces/:id/agents` returns bundled and workspace definitions using the existing definition service. Imported definitions can be selected, inspected, spawned and explicitly deleted. Bundled-role deletion remains prohibited. Management panels reset on workspace/root changes and invalidate stale async state feedback. New providers may omit API keys for keyless endpoints.
+Agent catalog: `GET /api/workspaces/:id/agents` returns bundled, user (`~/.claude/agents`), workspace and (with `?projectId=`) project definitions; later layers override by name. Imported definitions can be selected, inspected, spawned and explicitly deleted. Bundled-role deletion remains prohibited. Management panels reset on workspace/root changes and invalidate stale async state feedback. New providers may omit API keys for keyless endpoints.

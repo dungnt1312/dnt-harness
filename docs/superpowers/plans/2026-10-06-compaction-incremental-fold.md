@@ -1,6 +1,6 @@
 # Compaction Incremental Fold Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Make repeated compaction cheap and resilient: seed from the latest valid canonical checkpoint instead of re-folding the entire projection, retry transient summarizer chunk failures, and re-ask once with a hard length constraint when a chunk exceeds the summary cap.
 
@@ -37,11 +37,11 @@
 
 **Interfaces:** Extend `Summarizer` input with optional `seed?: { summary: string; coversSeq: number }`. `CompactionOptions` gains optional `seed` passed through after validation (`validSummary` on the seed summary; seed `coversSeq` must be an existing completed boundary ≤ the new boundary). When a valid seed exists, `compactSession` projects only events with `seed.coversSeq < seq ≤ lastEnd`. Unchanged boundary (seed covers the new `lastEnd` exactly) returns the existing checkpoint material as a new checkpoint write without appending lifecycle events or invoking the summarizer — idempotent.
 
-- [ ] RED: compacting a session whose latest canonical checkpoint covers an earlier boundary projects ONLY the delta (chunk boundary math: first chunk content starts at the first event after `coversSeq`), and the seed summary reaches the summarizer.
-- [ ] RED: seed with invalid summary or non-boundary/future `coversSeq` is rejected (fail-closed), not silently ignored.
-- [ ] RED: unchanged boundary with a valid seed is a no-op returning the prior checkpoint; no `compaction/start` appended, summarizer not called.
-- [ ] GREEN: implement seed validation, delta projection, idempotent no-op.
-- [ ] Run targeted harness suites; expected all pass.
+- [x] RED: compacting a session whose latest canonical checkpoint covers an earlier boundary projects ONLY the delta (chunk boundary math: first chunk content starts at the first event after `coversSeq`), and the seed summary reaches the summarizer.
+- [x] RED: seed with invalid summary or non-boundary/future `coversSeq` is rejected (fail-closed), not silently ignored.
+- [x] RED: unchanged boundary with a valid seed is a no-op returning the prior checkpoint; no `compaction/start` appended, summarizer not called.
+- [x] GREEN: implement seed validation, delta projection, idempotent no-op.
+- [x] Run targeted harness suites; expected all pass.
 
 ### Task 2: Per-chunk bounded retry (host)
 
@@ -49,9 +49,9 @@
 
 **Interfaces:** Summarizer logical request uses `maxAttempts: Math.min(4, limits.stepRetries + 1)` and inherits the configured first-progress/idle/total deadlines. No change to fail-closed validation after final attempt exhaustion.
 
-- [ ] RED: a summarizer chunk stream that fails transiently once (then emits a valid stop completion) still produces a checkpoint; the retry is visible in the provider stream log.
-- [ ] RED: exhaustion after `min(4, stepRetries + 1)` attempts fails closed with the safe error surface (409 + `error` in `compaction/end`, no checkpoint).
-- [ ] GREEN: implement; keep attribution/cancellation wiring unchanged.
+- [x] RED: a summarizer chunk stream that fails transiently once (then emits a valid stop completion) still produces a checkpoint; the retry is visible in the provider stream log.
+- [x] RED: exhaustion after `min(4, stepRetries + 1)` attempts fails closed with the safe error surface (409 + `error` in `compaction/end`, no checkpoint).
+- [x] GREEN: implement; keep attribution/cancellation wiring unchanged.
 
 ### Task 3: Cap-aware re-ask inside the summarizer
 
@@ -59,13 +59,13 @@
 
 **Interfaces:** When a chunk's answer would exceed `MAX_SUMMARY_CHARS` (24k), do not fail immediately: discard it and re-issue THE SAME chunk once with an appended hard-length instruction (`Your previous answer was N characters; rewrite the merged summary in at most M characters` where M = cap − headroom). If the re-ask also fails/oversized → fail closed. Cap math unchanged; no truncation.
 
-- [ ] RED: first answer 25k chars → re-ask seen by the stream fn (prompt contains the hard-length line and the same `<conversation>` chunk) → second answer within cap succeeds; final summary is the second answer.
-- [ ] RED: oversized twice → fail with the existing error, no partial publication.
-- [ ] GREEN: implement re-ask loop (attempt cap 2).
-- [ ] Run targeted web suites; expected all pass.
+- [x] RED: first answer 25k chars → re-ask seen by the stream fn (prompt contains the hard-length line and the same `<conversation>` chunk) → second answer within cap succeeds; final summary is the second answer.
+- [x] RED: oversized twice → fail with the existing error, no partial publication.
+- [x] GREEN: implement re-ask loop (attempt cap 2).
+- [x] Run targeted web suites; expected all pass.
 
 ### Task 4: Whole-change verification and docs
 
-- [ ] `npm run typecheck`; `npm test` (or targeted: harness compaction suites + web compaction/summarizer suites); record exit codes and any unrelated failures by name.
-- [ ] Update `docs/harness.md`: incremental delta folding from the latest canonical checkpoint, idempotent unchanged-boundary no-op, summarizer retry attempts, cap-aware re-ask. Note the spec deviation approval.
-- [ ] Report exact verified scope; no restart/live recovery/commit.
+- [x] `npm run typecheck`; `npm test` (or targeted: harness compaction suites + web compaction/summarizer suites); record exit codes and any unrelated failures by name.
+- [x] Update `docs/harness.md`: incremental delta folding from the latest canonical checkpoint, idempotent unchanged-boundary no-op, summarizer retry attempts, cap-aware re-ask. Note the spec deviation approval.
+- [x] Report exact verified scope; no restart/live recovery/commit.

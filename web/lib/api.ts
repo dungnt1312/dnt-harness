@@ -1,5 +1,5 @@
 import type { AttachmentRef } from './composer-draft.ts'
-import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillFileRow, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, UserQuestionAnswer, WorkspaceMeta, WorkspaceRow } from './types.ts'
+import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, HooksSectionRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillFileRow, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, UsageDailyResponse, UserQuestionAnswer, WorkspaceMeta, WorkspaceRow } from './types.ts'
 
 const CSRF_HEADER = 'x-dnt-harness-csrf'
 let csrfToken: string | undefined
@@ -156,6 +156,11 @@ export function setFolder(path: string): Promise<Meta> {
 
 export function listProviders(): Promise<ProviderSummary[]> {
   return apiFetch('/api/providers').then((r) => json<ProviderSummary[]>(r))
+}
+
+/** Settings → Usage: daily token rows across every workspace. */
+export function fetchUsage(): Promise<UsageDailyResponse> {
+  return apiFetch('/api/usage').then((r) => json<UsageDailyResponse>(r))
 }
 
 export function createProvider(input: Required<Pick<ProviderInput, 'name' | 'baseUrl' | 'apiKey'>> & ProviderInput): Promise<ProviderSummary> {
@@ -526,11 +531,14 @@ export function listSessionsIn(workspaceId: string): Promise<SessionListing[]> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions`).then((r) => json<SessionListing[]>(r))
 }
 
-export function createSessionIn(workspaceId: string, projectId?: string): Promise<{ id: string; projectId?: string }> {
+export function createSessionIn(workspaceId: string, projectId?: string, controls?: ModelDefaults): Promise<{ id: string; projectId?: string }> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(projectId !== undefined && projectId !== '' ? { projectId } : {}),
+    body: JSON.stringify({
+      ...(projectId !== undefined && projectId !== '' ? { projectId } : {}),
+      ...(controls !== undefined ? { controls } : {}),
+    }),
   }).then((r) => json<{ id: string; projectId?: string }>(r))
 }
 
@@ -601,6 +609,22 @@ export function steerSessionIn(workspaceId: string, sessionId: string): Promise<
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/steer`, {
     method: 'POST',
   }).then((r) => json<{ steered: boolean; pending: number }>(r))
+}
+
+/** Edit a queued input while it still waits (409 once a turn claimed it). */
+export function reviseQueuedInputIn(workspaceId: string, sessionId: string, inputId: string, content: string): Promise<{ inputId: string; revised: boolean }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/inputs/${encodeURIComponent(inputId)}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ content }),
+  }).then((r) => json<{ inputId: string; revised: boolean }>(r))
+}
+
+/** Delete a queued input before it runs (409 once a turn claimed it). */
+export function withdrawQueuedInputIn(workspaceId: string, sessionId: string, inputId: string): Promise<{ inputId: string; withdrawn: boolean }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/inputs/${encodeURIComponent(inputId)}`, {
+    method: 'DELETE',
+  }).then((r) => json<{ inputId: string; withdrawn: boolean }>(r))
 }
 
 // ── G3: modes + manifest ────────────────────────────────────────────────────
@@ -902,13 +926,18 @@ export function reconcileChild(workspaceId: string, rootSessionId: string, child
 }
 
 export interface ImportAgentInput {
+  /** A Claude Code subagent file (YAML frontmatter + body), saved verbatim. */
   readonly content: string
-  /** `dnt-harness` saves a native document verbatim (strict native parse). */
+  /** `codex` converts a pinned Codex spec; `dnt-harness` is an alias of `claude`. */
   readonly dialect: 'claude' | 'codex' | 'dnt-harness'
   readonly sourceVersion?: string
+  /** Hash the raw editor read; a file changed since then is rejected (409). */
+  readonly expectedHash?: string
 }
 
 export interface ImportResult {
+  /** The saved role (agent saves). */
+  readonly definition?: AgentDefinitionRow
   readonly imported: readonly string[]
   readonly blocked?: readonly string[]
   readonly warnings?: readonly string[]
@@ -923,6 +952,18 @@ export function importAgentDefinition(workspaceId: string, name: string, input: 
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(input),
   }).then((r) => json<ImportResult>(r))
+}
+
+/** Copy a ~/.claude or bundled role into this workspace, same name, file verbatim. */
+export function cloneAgentToWorkspace(workspaceId: string, name: string): Promise<{ readonly definition: AgentDefinitionRow }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/agents/${encodeURIComponent(name)}/clone`, { method: 'POST' })
+    .then((r) => json<{ readonly definition: AgentDefinitionRow }>(r))
+}
+
+/** The exact text of a workspace role file, with the hash a save must match. */
+export function readAgentFile(workspaceId: string, file: string): Promise<{ readonly content: string; readonly hash: string }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/agents/${encodeURIComponent(file)}/file`)
+    .then((r) => json<{ readonly content: string; readonly hash: string }>(r))
 }
 
 // ── G5: MCP, hooks, secrets ─────────────────────────────────────────────────
@@ -964,15 +1005,27 @@ export function importMcpServers(workspaceId: string, input: ImportAgentInput): 
   }).then((r) => json<ImportResult>(r))
 }
 
-export function fetchHooks(workspaceId: string): Promise<HooksConfigRow> {
-  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/hooks`).then((r) => json<HooksConfigRow>(r))
+/** Switch one configured hook (any layer) on or off for this workspace. */
+export function setHookActive(workspaceId: string, hookId: string, active: boolean): Promise<{ readonly id: string; readonly active: boolean }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/hooks/${encodeURIComponent(hookId)}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ active }),
+  }).then((r) => json<{ readonly id: string; readonly active: boolean }>(r))
 }
 
-export function saveHooks(workspaceId: string, config: HooksConfigRow): Promise<{ readonly saved: boolean }> {
+/** The workspace layer (`<ws>/settings.json`) plus every Claude Code layer that applies. */
+export function fetchHooks(workspaceId: string, projectId?: string | null): Promise<HooksConfigRow> {
+  const query = projectId !== undefined && projectId !== null ? `?projectId=${encodeURIComponent(projectId)}` : ''
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/hooks${query}`).then((r) => json<HooksConfigRow>(r))
+}
+
+/** Replace the workspace layer's `hooks` section (Claude Code format); other settings keys are kept. */
+export function saveHooks(workspaceId: string, hooks: HooksSectionRow, disableAllHooks?: boolean): Promise<{ readonly saved: boolean }> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/hooks`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(config),
+    body: JSON.stringify({ hooks, ...(disableAllHooks !== undefined ? { disableAllHooks } : {}) }),
   }).then((r) => json<{ readonly saved: boolean }>(r))
 }
 
@@ -1030,8 +1083,10 @@ export function removeProject(workspaceId: string, projectId: string): Promise<{
   return apiFetch('/api/workspaces/' + encodeURIComponent(workspaceId) + '/projects/' + encodeURIComponent(projectId), { method: 'DELETE' }).then(r => json<{ deleted: boolean }>(r))
 }
 
-export function listAgentDefinitions(workspaceId: string): Promise<AgentDefinitionRow[]> {
-  return apiFetch('/api/workspaces/' + encodeURIComponent(workspaceId) + '/agents').then(r => json<AgentDefinitionRow[]>(r))
+/** Every effective subagent (bundled, ~/.claude/agents, workspace, and the project's .claude/agents when given). */
+export function listAgentDefinitions(workspaceId: string, projectId?: string | null): Promise<AgentDefinitionRow[]> {
+  const query = projectId !== undefined && projectId !== null ? `?projectId=${encodeURIComponent(projectId)}` : ''
+  return apiFetch('/api/workspaces/' + encodeURIComponent(workspaceId) + '/agents' + query).then(r => json<AgentDefinitionRow[]>(r))
 }
 export function deleteAgentDefinition(workspaceId: string, name: string): Promise<{ deleted: boolean }> {
   return apiFetch('/api/workspaces/' + encodeURIComponent(workspaceId) + '/agents/' + encodeURIComponent(name), { method: 'DELETE' }).then(r => json<{ deleted: boolean }>(r))

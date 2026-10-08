@@ -2,13 +2,16 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
-import { ProcessPanel } from './ProcessPanel.tsx'
+import { ProcessPanel, processStatus } from './ProcessPanel.tsx'
+import { resetDismissedCache } from '../../lib/dismissed-rows.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
 let root: Root | undefined
 let host: HTMLDivElement
 afterEach(async () => {
+  window.localStorage.clear()
+  resetDismissedCache()
   if (root) await act(async () => root!.unmount())
   host?.remove()
   root = undefined
@@ -35,59 +38,103 @@ const runningDetail = {
   output: 'VITE ready in 320ms\nLocal: http://localhost:5173/',
   outputTruncated: false,
 }
+const doneDetail = { ...runningDetail, id: 'proc_2', command: 'npm test', status: 'exited' as const, exitCode: 0, startedAt: Date.now() - 60_000, durationMs: 8_000, output: '# pass 5\n# fail 0' }
+const failedDetail = { ...doneDetail, id: 'proc_3', command: 'npm run lint', exitCode: 2, startedAt: Date.now() - 90_000 }
 
 const jsonResponse = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), { status })
 
-it('asks for a process when none is focused', async () => {
+/** Route the list and detail endpoints over a mutable set of processes. */
+function routes(initial: readonly (typeof runningDetail | typeof doneDetail)[]) {
+  let processes = [...initial]
+  const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+    const path = String(url)
+    if (init?.method === 'POST') return jsonResponse({ stopped: true, processId: 'proc_1' })
+    if (path.endsWith('/processes')) return jsonResponse(processes.map(({ output: _o, outputTruncated: _t, ...row }) => row))
+    const id = path.split('/').pop()
+    const found = processes.find((row) => row.id === id)
+    return found === undefined ? new Response('{"error":"no such process"}', { status: 404 }) : jsonResponse(found)
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  return { fetchMock, set: (next: typeof processes) => { processes = next } }
+}
+
+const card = (id: string) => host.querySelector<HTMLElement>(`[data-process-id="${id}"]`)
+
+it('says so when the conversation has no background tasks', async () => {
+  routes([])
   await render({ workspaceId: 'ws', sessionId: 's1', processId: null })
-  expect(host.textContent).toContain('Environment panel')
+  expect(host.textContent).toContain('No background tasks')
 })
 
-it('renders the focused process with its live output', async () => {
-  const fetchMock = vi.fn().mockResolvedValue(jsonResponse(runningDetail))
-  vi.stubGlobal('fetch', fetchMock)
+it('lists running and finished tasks with Claude-style status labels', async () => {
+  routes([runningDetail, doneDetail, failedDetail])
+  await render({ workspaceId: 'ws', sessionId: 's1', processId: null })
+  expect(host.textContent).toContain('Background tasks')
+  expect(host.textContent).toContain('1 running')
+  expect(host.textContent).toContain('Finished 2')
+  expect(card('proc_2')!.textContent).toContain('Completed')
+  expect(card('proc_3')!.textContent).toContain('Failed (exit 2)')
+  // Collapsed cards do not fetch or show output.
+  expect(host.textContent).not.toContain('# pass 5')
+})
+
+it('opens the focused process expanded with its live output', async () => {
+  routes([runningDetail])
   await render({ workspaceId: 'ws', sessionId: 's1', processId: 'proc_1' })
-  expect(host.textContent).toContain('pnpm dev')
-  expect(host.textContent).toContain('running')
-  expect(host.textContent).toContain('VITE ready')
-  expect(host.textContent).toContain('localhost:5173')
+  expect(card('proc_1')!.textContent).toContain('pnpm dev')
+  expect(card('proc_1')!.textContent).toContain('Running')
+  expect(host.querySelector('[aria-label="Process output"]')!.textContent).toContain('localhost:5173')
 })
 
-it('polls while running and stops polling once ended', async () => {
+it('expands a finished card on click to show its output', async () => {
+  routes([doneDetail])
+  await render({ workspaceId: 'ws', sessionId: 's1', processId: null })
+  await act(async () => card('proc_2')!.querySelector<HTMLButtonElement>('button[aria-expanded]')!.click())
+  expect(host.querySelector('[aria-label="Process output"]')!.textContent).toContain('# pass 5')
+})
+
+it('polls while running and the detail follows the exit', async () => {
   vi.useFakeTimers()
-  // A fresh Response per call: a Response body can be consumed exactly once.
-  const fetchMock = vi.fn().mockImplementation(async () => jsonResponse(runningDetail))
-  vi.stubGlobal('fetch', fetchMock)
+  const { fetchMock, set } = routes([runningDetail])
   await render({ workspaceId: 'ws', sessionId: 's1', processId: 'proc_1' })
   const afterMount = fetchMock.mock.calls.length
   await act(async () => { await vi.advanceTimersByTimeAsync(2_100) })
   expect(fetchMock.mock.calls.length).toBeGreaterThan(afterMount)
-  // Ended: the poll wheel comes off.
-  const ended = { ...runningDetail, status: 'exited' as const, exitCode: 0 }
-  fetchMock.mockImplementation(async () => jsonResponse(ended))
+  set([{ ...runningDetail, status: 'exited' as const, exitCode: 0, output: 'bye' } as unknown as typeof runningDetail])
   await act(async () => { await vi.advanceTimersByTimeAsync(2_100) })
-  const afterEnd = fetchMock.mock.calls.length
-  await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
-  expect(fetchMock.mock.calls.length).toBe(afterEnd)
-  expect(host.textContent).toContain('exited')
+  await act(async () => { await vi.advanceTimersByTimeAsync(10) })
+  expect(card('proc_1')!.textContent).toContain('Completed')
+  expect(host.querySelector('[aria-label="Process output"]')!.textContent).toContain('bye')
 })
 
-it('stop button posts the stop route and refetches', async () => {
-  const fetchMock = vi.fn()
-    .mockImplementationOnce(async () => jsonResponse(runningDetail))
-    .mockImplementationOnce(async () => jsonResponse({ stopped: true, processId: 'proc_1' }))
-    .mockImplementation(async () => jsonResponse({ ...runningDetail, status: 'killed', exitCode: 1 }))
-  vi.stubGlobal('fetch', fetchMock)
-  await render({ workspaceId: 'ws', sessionId: 's1', processId: 'proc_1' })
+it('stop button posts the stop route', async () => {
+  const { fetchMock } = routes([runningDetail])
+  await render({ workspaceId: 'ws', sessionId: 's1', processId: null })
   const stop = host.querySelector<HTMLButtonElement>('button[aria-label="Stop pnpm dev"]')
   expect(stop).not.toBeNull()
   await act(async () => stop!.click())
-  const stopCall = fetchMock.mock.calls.find(([url, init]) => String(url).endsWith('/processes/proc_1/stop') && (init as RequestInit | undefined)?.method === 'POST')
+  const stopCall = fetchMock.mock.calls.find(([url, init]) => String(url).endsWith('/processes/proc_1/stop') && init?.method === 'POST')
   expect(stopCall).toBeDefined()
 })
 
-it('a process the host no longer knows says so truthfully', async () => {
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{"error":"no such process"}', { status: 404 })))
+it('clears finished tasks from the view', async () => {
+  routes([runningDetail, doneDetail])
+  await render({ workspaceId: 'ws', sessionId: 's1', processId: null })
+  await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Clear finished tasks"]')!.click())
+  expect(card('proc_2')).toBeNull()
+  expect(card('proc_1')).not.toBeNull()
+})
+
+it('a focused process the host no longer knows says so truthfully', async () => {
+  routes([])
   await render({ workspaceId: 'ws', sessionId: 's1', processId: 'proc_gone' })
+  await act(async () => { await Promise.resolve() })
   expect(host.textContent).toContain('no longer running on the host')
+})
+
+it('maps statuses to labels', () => {
+  expect(processStatus({ status: 'exited', exitCode: 0 }).label).toBe('Completed')
+  expect(processStatus({ status: 'exited', exitCode: 1 }).label).toBe('Failed (exit 1)')
+  expect(processStatus({ status: 'killed', exitCode: null }).label).toBe('Stopped')
+  expect(processStatus({ status: 'failed', exitCode: null }).label).toBe('Failed')
 })

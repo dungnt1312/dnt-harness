@@ -89,6 +89,11 @@ interface PluginEntry {
   /** The original startup error, retained until kernel stop. */
   error?: unknown
   /**
+   * Kernel-wide sequence number of the latest body start of this entry (any
+   * generation); `0` while no body ever ran. Drives stop's unwind order.
+   */
+  startedAt: number
+  /**
    * Nothing is left to dispose or report for this entry: its startup
    * settlement fully finished (cleanup ran, the failure was published once),
    * or the restart or explicit disposal that cleaned it already published its
@@ -230,6 +235,10 @@ export class Kernel {
    * generation after `stopped`.
    */
   private generation = 0
+  /** Source of {@link PluginEntry.startedAt} stamps. */
+  private startSequence = 0
+  /** Error leaves already carried by a published `kernel/plugin-failed`. */
+  private readonly reported = new WeakSet<object>()
   private stopped = false
   /**
    * The whole-kernel shutdown verdict, started once. Every `stop()` caller —
@@ -377,14 +386,15 @@ export class Kernel {
         }
       }
     }
-    for (const entry of [...this.entries].reverse()) {
-      // Reverse mount order: children and dependents unwind BEFORE their
-      // owners, so the stop pass itself observes a nested child's failing
-      // cleanup — collects it into the aggregate and publishes it — while the
-      // entry is still live. In insertion order an owner disposed first would
-      // retire the child through its own `ctx.plugin` disposer, and the stop
-      // loop would then skip the already-retired child: the failure would
-      // escape the whole-kernel verdict entirely.
+    for (const entry of this.unwindOrder()) {
+      // Reverse START order (see {@link unwindOrder}): nested children and
+      // inject dependents unwind BEFORE their owners and providers, so a
+      // consumer's cleanup still sees `ctx.<svc>`, and the stop pass itself
+      // observes a nested child's failing cleanup — collects it into the
+      // aggregate and publishes it — while the entry is still live. Were an
+      // owner disposed first, it would retire the child through its own
+      // `ctx.plugin` disposer, and the stop loop would then skip the
+      // already-retired child: the failure would escape the verdict entirely.
       // A retired entry is fully settled history — a failed startup whose
       // cleanup already ran (K1: the diagnostic stays, stop never replays it),
       // or an earlier teardown failure stop itself must not re-report. Skip it.
@@ -430,6 +440,21 @@ export class Kernel {
     }
   }
 
+  /**
+   * Stop's unwind order: entries whose body never started first (they hold
+   * nothing), then reverse body-START order. Mount order is the wrong key:
+   * `inject` decides boot order, so a consumer mounted before its provider
+   * still starts after it (the provider's `ctx.provide` is what wakes it),
+   * and a nested `ctx.plugin` child starts inside its owner's body — both
+   * therefore carry a later start stamp and unwind first. Ties (never
+   * started) keep reverse mount order.
+   */
+  private unwindOrder(): PluginEntry[] {
+    // Array#sort is stable, so equal keys keep the reverse-mount pre-order.
+    const key = (entry: PluginEntry): number => (entry.startedAt === 0 ? Number.MAX_SAFE_INTEGER : entry.startedAt)
+    return [...this.entries].reverse().sort((a, b) => key(b) - key(a))
+  }
+
   /** Create and register an entry, then try to start it. */
   private mount(definition: ResolvedPlugin, owner: Fiber | null, direct: boolean): Fiber {
     // Loud fence: after (or during) a stop nothing mounts — not even to pend
@@ -450,6 +475,7 @@ export class Kernel {
       transition: undefined,
       generation: this.generation,
       retired: false,
+      startedAt: 0,
     }
     // Register the disposal with the owner once, binding the LOGICAL entry:
     // every later generation remounts under the same owner without touching
@@ -513,7 +539,10 @@ export class Kernel {
   private closeEntry(entry: PluginEntry): Promise<void> | undefined {
     entry.closed = true
     if (entry.transition !== undefined) return undefined
-    return this.runCoordinated(entry, () => false)
+    // The child's teardown failure belongs to the child: runCoordinated (or
+    // the stop pass) already published it once. It must not also fail the
+    // OWNER's unwind, which would report it a second time as the owner's.
+    return this.runCoordinated(entry, () => false).catch(() => {})
   }
 
   /**
@@ -560,6 +589,9 @@ export class Kernel {
     }
 
     entry.fiber.state = 'loading'
+    // Stamped BEFORE the body runs: dependents it wakes (through
+    // `ctx.provide`) and children it mounts start later and so unwind first.
+    entry.startedAt = ++this.startSequence
     // The generation this startup runs. Its settlement handlers are bound to
     // THIS fiber, not to the entry: a coordinated restart may swap
     // `entry.fiber` while the body is still in flight, and a superseded
@@ -654,6 +686,16 @@ export class Kernel {
     // logical entry may already have moved to a replacement.
     const fiber = maybeError !== undefined ? (fiberOrError as Fiber) : entry.fiber
     const error = maybeError !== undefined ? maybeError : fiberOrError
+    // Exactly-once across owners: an owner's unwind awaits its `ctx.plugin`
+    // child's disposal, so a child's teardown failure also fails the owner's
+    // fiber — carrying the SAME leaf errors. That failure was already
+    // published against the child; re-publishing it against the owner would
+    // report one cleanup failure twice.
+    const leaves = flattenErrors(error)
+    if (phase === 'teardown' && leaves.every((leaf) => this.isReported(leaf))) return
+    for (const leaf of leaves) {
+      if (typeof leaf === 'object' && leaf !== null) this.reported.add(leaf)
+    }
     const detail: PluginFailedDetail = {
       name: entry.definition.name,
       fiber,
@@ -667,6 +709,11 @@ export class Kernel {
         ...observed,
       )
     }
+  }
+
+  /** Whether an error leaf was already carried by a published failure. */
+  private isReported(leaf: unknown): boolean {
+    return typeof leaf === 'object' && leaf !== null && this.reported.has(leaf)
   }
 
   private activated(entry: PluginEntry, fiber: Fiber): void {
@@ -733,16 +780,21 @@ export class Kernel {
    * teardown failure published.
    */
   private async coordinate(entry: PluginEntry): Promise<void> {
-    await this.runCoordinated(entry, () => {
-      // An explicitly closed entry never remounts — even through a transition
-      // that started as a dependency restart.
-      if (entry.closed) return false
-      // Owner liveness reevaluated after cleanup: an owner that unloaded (or
-      // is unloading) while the cleanup ran must not own a replacement. The
-      // DEPENDENCIES are reevaluated by `start()` on the fresh generation — a
-      // missing service simply leaves it `pending`.
-      return entry.owner === null || ownerAlive(entry.owner)
-    })
+    try {
+      await this.runCoordinated(entry, () => {
+        // An explicitly closed entry never remounts — even through a transition
+        // that started as a dependency restart.
+        if (entry.closed) return false
+        // Owner liveness reevaluated after cleanup: an owner that unloaded (or
+        // is unloading) while the cleanup ran must not own a replacement. The
+        // DEPENDENCIES are reevaluated by `start()` on the fresh generation — a
+        // missing service simply leaves it `pending`.
+        return entry.owner === null || ownerAlive(entry.owner)
+      })
+    } catch {
+      // Already published by runCoordinated: a tracked restart contains its
+      // own failure so `settle()` never rejects.
+    }
   }
 
   /**
@@ -771,12 +823,18 @@ export class Kernel {
       // A failed teardown blocks the replacement. Whoever reports the entry's
       // teardown failure retires it first, so a racing explicit disposal or
       // stop over the same cached teardown publishes it exactly once.
+      // The failure is then rethrown, so every awaiting caller — the public
+      // `fiber.dispose()` / `kernel.disposeFiber()` facade and any request
+      // that joined this transition — rejects with it. Internal callers that
+      // only need the side effect ({@link coordinate}, {@link closeEntry},
+      // the `ctx.plugin` owner disposer) contain it, since it is already
+      // published here (or by the stop pass that retired the entry).
       if (teardownError !== undefined) {
         if (!entry.retired) {
           entry.retired = true
           this.publishFailure(entry, 'teardown', entry.fiber, teardownError)
         }
-        return
+        throw teardownError
       }
 
       // Restart path: attach a fresh generation to the SAME logical entry
@@ -840,7 +898,9 @@ export class Kernel {
           if (entry) entry.retired = true
         },
         (error: unknown) => {
-          if (entry) {
+          // The coordinated disposal normally publishes and retires before it
+          // rejects; publish here only if nothing reported it yet.
+          if (entry && !entry.retired) {
             entry.retired = true
             this.publishFailure(entry, 'teardown', fiber, error)
           }

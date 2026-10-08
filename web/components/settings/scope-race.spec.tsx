@@ -10,7 +10,7 @@ describe('management scope isolation', () => {
   it.each(['agents', 'mcp', 'hooks', 'secrets'])('drops delayed A loads and clears drafts before B actions: %s', async kind => {
     const host = document.createElement('div'); document.body.append(host); const root = createRoot(host)
     const pending: (() => void)[] = []; const calls: string[] = []
-    const data = (scope: string, url: string) => kind === 'agents' ? (url.includes('children') ? [] : [{ source: 'workspace', definition: { name: scope + '-agent', description: scope + ' description', tools: [], disallowedTools: [] } }]) : kind === 'mcp' ? [{ name: scope + '-server', transport: 'stdio', enabled: false, status: 'disabled', breakerOpenUntil: null }] : kind === 'hooks' ? { version: 1, hooks: { PreToolUse: [{ matcher: '*', type: 'command', command: `node ${scope}.mjs`, onFailure: 'deny' }] } } : [{ name: scope + '_SECRET' }]
+    const data = (scope: string, url: string) => kind === 'agents' ? (url.includes('children') ? [] : [{ source: 'workspace', definition: { name: scope + '-agent', description: scope + ' description', tools: [], disallowedTools: [] } }]) : kind === 'mcp' ? [{ name: scope + '-server', transport: 'stdio', enabled: false, status: 'disabled', breakerOpenUntil: null }] : kind === 'hooks' ? { file: `/${scope}/settings.json`, hooks: { PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: `node ${scope}.mjs` }] }] }, disableAllHooks: false, sources: [], effective: [], disabled: false, diagnostics: [] } : [{ name: scope + '_SECRET' }]
     vi.stubGlobal('fetch', vi.fn((url: string) => {
       calls.push(url)
       const scope = url.includes('/A/') ? 'A' : 'B'
@@ -27,7 +27,7 @@ describe('management scope isolation', () => {
       expect(host.textContent).not.toContain('A_SECRET')
       if (kind === 'hooks') {
         // The form-first editor reflects B through its raw JSON escape hatch.
-        const advanced = [...host.querySelectorAll('button')].find(b => b.textContent === 'Advanced · edit raw JSON')
+        const advanced = [...host.querySelectorAll('button')].find(b => b.textContent === 'Edit raw JSON')
         await act(async () => advanced!.click())
         expect(host.querySelector<HTMLTextAreaElement>('textarea.manage-code-tall')?.value).toContain('node B.mjs')
         expect(host.querySelector<HTMLTextAreaElement>('textarea.manage-code-tall')?.value).not.toContain('node A.mjs')

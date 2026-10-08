@@ -46,6 +46,11 @@ it('migrates legacy entries once, preserves existing index and exposes direct au
   expect((await memory.read(scope, 'old')).body).toBe('Legacy body')
   expect((await memory.read(scope, 'old')).createdAt).toBe(created.createdAt)
   expect((await memory.read(scope, 'new')).title).toBe('New note')
+  // metadata.type surfaces so the settings tree can show the kind; create() stamps `reference`.
+  expect((await memory.read(scope, 'new')).type).toBe('feedback')
+  expect((await memory.read(scope, 'old')).type).toBe('reference')
+  await fs.writeFile(path.join(root, 'bare.md'), '---\ntitle: Bare\n---\n\nNo kind\n')
+  expect((await memory.read(scope, 'bare')).type).toBeUndefined()
   expect((await memory.search(scope, 'Direct'))[0]?.id).toBe('new')
   const updated = await memory.update(scope, { id: 'new', body: 'Edited through API', expectedHash: (await memory.read(scope, 'new')).hash })
   expect(await fs.readFile(path.join(root, 'new.md'), 'utf8')).toContain('type: feedback\n  source: agent')

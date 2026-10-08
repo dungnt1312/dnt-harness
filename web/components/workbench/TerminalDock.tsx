@@ -43,12 +43,13 @@ export function TerminalDock({ workspaceId, projectId, height, resizeHandle, ope
   if (!open) return null
 
   return (
-    <section aria-label="Terminal" className="flex shrink-0 flex-col border-t border-line bg-bg">
+    <section aria-label="Terminal" className="flex shrink-0 flex-col bg-bg">
       <div
         {...resizeHandle}
         aria-label="Resize terminal"
         className="group relative h-3 shrink-0 cursor-row-resize outline-none hover:bg-line/60"
       >
+        {/* The grip is the footer's only top rule; a border on the section would double it. */}
         <span aria-hidden="true" className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-line group-focus-visible:bg-link" />
       </div>
       <div className="flex min-h-0 flex-col overflow-hidden bg-bg" style={{ height }}>

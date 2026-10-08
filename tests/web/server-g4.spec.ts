@@ -534,7 +534,7 @@ describe('G4 HTTP surface', () => {
     await server.close()
   }, 20_000)
 
-  it('Claude import over HTTP reports blocked fields and prevents activation', async () => {
+  it('saving a Claude subagent file over HTTP keeps it verbatim; unsupported fields only warn', async () => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-g4-imp-'))
     const server = await createWebServer({
       home,
@@ -555,12 +555,13 @@ hooks:
 
 body`,
     })
-    // Blocked content is QUARANTINED (422): never saved as executable.
-    expect(imported.status).toBe(422)
-    const body = (await imported.json()) as { blocked: string[]; preview: { name: string } }
-    expect(body.blocked).toContain('hooks')
-    expect(body.preview.name).toBe('auditor')
-    // A clean import (no blocking fields) saves and activates.
+    // Claude fields dnt-harness does not enforce are reported, never blocking.
+    expect(imported.status).toBe(201)
+    const body = (await imported.json()) as { warnings: string[]; definition: { definition: { name: string; unsupported?: string[] } } }
+    expect(body.definition.definition.name).toBe('auditor')
+    expect(body.definition.definition.unsupported).toEqual(['hooks'])
+    expect(body.warnings.join()).toMatch(/not enforced by dnt-harness: hooks/)
+    expect(await fs.readFile(path.join(home, 'workspaces', wsId, 'agents', 'from-claude.md'), 'utf8')).toContain('PreToolUse: x')
     const clean = await post(base, `/api/workspaces/${wsId}/agents/from-claude/import`, {
       content: `---
 name: cleaner
@@ -573,13 +574,17 @@ body`,
     expect(clean.status).toBe(201)
     expect(((await clean.json()) as { active: boolean }).active).toBe(true)
     const catalog = await (await fetch(`${base}/api/workspaces/${wsId}/agents`)).json() as { definition: { name: string } }[]
-    expect(catalog.map(row => row.definition.name)).toContain('from-claude')
+    // Identity is the `name:` field (Claude); the file name stays a handle.
+    expect(catalog.map(row => row.definition.name)).toContain('cleaner')
+    expect((await fetch(`${base}/api/workspaces/${wsId}/agents/cleaner`)).status).toBe(200)
     expect((await fetch(`${base}/api/workspaces/${wsId}/agents/from-claude`)).status).toBe(200)
     const session = await (await post(base, `/api/workspaces/${wsId}/sessions`)).json() as { id: string }
     expect((await post(base, `/api/workspaces/${wsId}/agents/from-claude`, { rootSessionId: session.id, task: { objective: 'Inspect only' } })).status).toBe(202)
     expect((await fetch(`${base}/api/workspaces/${wsId}/agents/from-claude`, { method: 'DELETE' })).status).toBe(200)
     const remaining = await (await fetch(`${base}/api/workspaces/${wsId}/agents`)).json() as typeof catalog
-    expect(remaining.map(row => row.definition.name)).not.toContain('from-claude')
+    expect(remaining.map(row => row.definition.name)).not.toContain('cleaner')
+    // A traversal name is refused as a client error and touches nothing.
+    expect((await fetch(`${base}/api/workspaces/${wsId}/agents/${encodeURIComponent('../skills/x')}`, { method: 'DELETE' })).status).toBe(400)
     await server.close()
   }, 15_000)
 })

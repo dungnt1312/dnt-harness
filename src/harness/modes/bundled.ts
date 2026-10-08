@@ -19,7 +19,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     id: 'ask-before-changes',
     name: 'Ask before changes',
     instructions:
-      'You are a careful assistant working inside the user’s workspace. Read files freely; before any write, edit, or shell command, ask for approval. Prefer explaining what you are about to change.',
+      'You are a careful assistant working inside the user’s workspace. Read files freely; before any write, edit, or shell command, ask for approval. Prefer explaining what you are about to change. Saving Markdown notes inside the memory folders may proceed without a separate approval.',
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
     toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion'],
     permissionDefaults: {
@@ -69,6 +69,8 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
       // Asking the user a question is itself the human checkpoint.
       AskUserQuestion: 'allow',
     },
+    // A property, not an id check: a duplicated Plan keeps it.
+    mcpExposure: 'read-safe',
   },
   {
     id: 'full-access',
@@ -99,7 +101,4 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
 export const DEFAULT_MODE_ID = 'ask-before-changes'
 
 /** The full exposure ceiling any mode can grant (skills/memory included). */
-export const KNOWN_MODE_TOOLS: readonly string[] = [
-  'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent',
-  'TodoWrite', 'AskUserQuestion',
-]
+export { KNOWN_MODE_TOOLS } from './known-tools.ts'

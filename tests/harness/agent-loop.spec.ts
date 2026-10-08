@@ -352,6 +352,30 @@ describe('agent loop', () => {
       void kernel.stop()
     })
 
+    it.each([false, true])('request-owned backoff stays capped and abortable (stop=%s)', async (stop) => {
+      vi.useFakeTimers()
+      const { provider, requests } = flaky(1, () => new ProviderError('retry later', { transient: true, retryAfterMs: 60_000 }))
+      const { kernel, session, agent } = harness([], provider)
+      try {
+        agent.send('hello')
+        const running = agent.run()
+        await vi.advanceTimersByTimeAsync(29_999)
+        expect(requests()).toBe(1)
+        expect(agent.busy).toBe(true)
+        if (stop) agent.stop()
+        else await vi.advanceTimersByTimeAsync(1)
+        await running
+        expect(requests()).toBe(stop ? 1 : 2)
+        expect(session.events.at(-1)).toMatchObject({ type: 'turn/end', reason: stop ? 'cancelled' : 'completed' })
+        await vi.advanceTimersByTimeAsync(60_000)
+        expect(requests()).toBe(stop ? 1 : 2)
+        expect(agent.busy).toBe(false)
+      } finally {
+        vi.useRealTimers()
+        await kernel.stop()
+      }
+    })
+
     it('gives up after the retry budget and records the provider failure', async () => {
       const { kernel, session, agent, llm } = harness(['unused'])
       kernel.ctx.provide('limits', { stepRetries: 2, stepRetryBaseMs: 1 })

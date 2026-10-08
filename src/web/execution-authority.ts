@@ -6,13 +6,14 @@
  * Exposure is a hard ceiling, never a permission grant: nothing here (and no
  * MCP annotation such as `readOnlyHint`) can turn an `ask` into an `allow`.
  *
- * Plan + MCP limitation: Plan exposes an MCP tool only when the workspace
+ * Read-safe MCP limitation (Plan, its copies, and modes that cannot write —
+ * see `effectiveMcpExposure`): an MCP tool is exposed only when the workspace
  * allowlist names that exact tool AND the tool name has a read-safe prefix.
  * That is a conservative exposure filter, NOT a sandbox: a remote tool named
  * `get_…` may still have side effects. Disabling MCP in Plan altogether is a
  * separate, stronger product option and is deliberately not introduced here.
  */
-import type { ModeDefinition } from '../harness/modes/types.ts'
+import type { McpExposure, ModeDefinition } from '../harness/modes/types.ts'
 import type { McpConfig } from '../harness/mcp/config.ts'
 import { configRevision } from '../harness/mcp/config-v2.ts'
 
@@ -37,7 +38,25 @@ export interface ExposureScope {
   } | undefined
 }
 
-export type ExposureMode = Pick<ModeDefinition, 'id' | 'name' | 'toolExposure'> & Pick<Partial<ModeDefinition>, 'permissionDefaults' | 'outOfGrant'>
+export type ExposureMode = Pick<ModeDefinition, 'id' | 'name' | 'toolExposure'> & Pick<Partial<ModeDefinition>, 'permissionDefaults' | 'outOfGrant' | 'mcpExposure'>
+
+/** Tools whose exposure means a mode can change the workspace. */
+const MUTATING_BUILTINS = ['Write', 'Edit', 'Bash']
+
+/**
+ * The MCP ceiling a mode actually gets. A zero tool ceiling is always
+ * `none` (the request carries no schemas, so nothing may execute either) and
+ * wins over an explicit value. Otherwise the explicit field; otherwise
+ * `read-safe` for Plan (legacy snapshots predating the field) and for any
+ * mode that cannot write, edit, or run a shell — a read-only mode does not
+ * get mutating remote tools by default; otherwise `all`.
+ */
+export function effectiveMcpExposure(mode: ExposureMode): McpExposure {
+  if (mode.toolExposure.length === 0) return 'none'
+  if (mode.mcpExposure !== undefined) return mode.mcpExposure
+  if (mode.id === 'plan') return 'read-safe'
+  return mode.toolExposure.some((tool) => MUTATING_BUILTINS.includes(tool)) ? 'all' : 'read-safe'
+}
 
 /** A versioned view of everything the predicate depends on. */
 export interface ExposureSnapshot {
@@ -102,14 +121,15 @@ export function exposureRefusal(snapshot: ExposureSnapshot, scope: ExposureScope
   if (name.startsWith('mcp__')) {
     // Zero-exposure modes see no MCP tools (names are dynamic, so emptiness is
     // the only honest ceiling). Explorer sees none regardless of grant/mode.
-    if (mode.toolExposure.length === 0) return `mode '${mode.name}' exposes no MCP tools`
+    const mcpExposure = effectiveMcpExposure(mode)
+    if (mcpExposure === 'none') return `mode '${mode.name}' exposes no MCP tools`
     if (scope?.childOf?.definition === 'explorer') return 'Explorer exposes zero MCP tools'
     const { server: serverName, tool: toolName } = parseMcpName(name)
     const server = snapshot.mcp?.servers[serverName]
     if (server === undefined || !server.enabled) return `MCP server '${serverName}' is not enabled in this workspace`
-    if (mode.id === 'plan') {
+    if (mcpExposure === 'read-safe') {
       if (!mcpToolExplicitlyAllowlisted(server.allowedTools, toolName, name) || !READ_SAFE_TOOL_NAME.test(toolName)) {
-        return `mode 'Plan' does not expose MCP tool '${name}' without a read-safe allowlist entry`
+        return `mode '${mode.name}' does not expose MCP tool '${name}' without a read-safe allowlist entry`
       }
     } else if (!mcpToolExposed(server.allowedTools, toolName, name)) {
       return `MCP tool '${name}' is not exposed in this workspace`

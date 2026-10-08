@@ -71,6 +71,10 @@ export type DispatchNotSentReason =
   | 'write_rejected_before_flush'
   | 'cancelled_before_send'
   | 'local_policy_denied'
+  /** HTTP 404 for a terminated Streamable HTTP session: the server did not process it. */
+  | 'session_expired'
+  /** HTTP 401/403: the server refused the credentials before processing. */
+  | 'auth_rejected'
 
 export type DispatchMaybeSentReason =
   | 'write_accepted_or_buffered'

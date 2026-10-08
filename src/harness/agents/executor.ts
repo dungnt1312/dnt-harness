@@ -19,7 +19,7 @@ import type { Context } from '../../kernel/index.ts'
 import { newTurnId, type SessionId, type WorkspaceId, type ProjectId } from '../../util/brand.ts'
 import type { Agent } from '../agent/agent.ts'
 import { agentScope, type AgentScope } from '../agent/scope.ts'
-import type { AgentDefinition } from './definition-service.ts'
+import type { AgentDefinition, AgentSource } from './definition-service.ts'
 import type { SessionEvent, TurnEndReason } from '../session/events.ts'
 import type { GrantedRoot } from '../tools/types.ts'
 
@@ -79,7 +79,7 @@ export interface SpawnRequest {
   readonly parentTurnId: string
   readonly definition: AgentDefinition
   /** Provenance of `definition` (bundled role vs workspace file), for manifests. */
-  readonly definitionSource?: 'bundled' | 'workspace' | undefined
+  readonly definitionSource?: AgentSource | undefined
   /** Explicit trusted fixture ceiling, primarily for low-level/headless callers. */
   readonly exposureCeiling?: readonly string[] | undefined
   /** Host authority resolver, evaluated at the admission linearization point. */
@@ -160,6 +160,17 @@ export class SpawnError extends Error {
     super(message)
     this.name = 'SpawnError'
   }
+}
+
+/**
+ * The tools a role can ever hold. A role that omitted `tools` (Claude:
+ * inherit everything) also admits MCP tools — but only those an explicit
+ * spawn grant names, so MCP still always requires a grant.
+ */
+function roleCandidates(definition: AgentDefinition, grant: readonly string[] | undefined): readonly string[] {
+  if (definition.inheritsTools !== true || grant === undefined) return definition.tools
+  const extra = grant.filter((tool) => tool.startsWith('mcp__') && !definition.tools.includes(tool))
+  return extra.length === 0 ? definition.tools : [...definition.tools, ...extra]
 }
 
 function snapshotSpawnRequest<T extends SpawnRequest | Omit<SpawnRequest, 'parentTurnId'>>(request: T): T {
@@ -272,7 +283,12 @@ export class ChildExecutor {
   private pumping = false
   /** Parent-session writer: spawn admission and closing serialize here. */
   private readonly admissionTails = new Map<SessionId, Promise<void>>()
-  /** Closing is synchronous before the first await, so new spawns refuse it. */
+  /**
+   * Closing is synchronous before the first await, so new spawns refuse it.
+   * Entries leave once the turn's `turn/end` is durable (releaseTurns) or the
+   * root is forgotten; the durable closing/end check in spawnAdmitted then
+   * keeps refusing late spawns for that turn.
+   */
   private readonly closingTurns = new Set<string>()
 
   constructor(private readonly ctx: Context) {}
@@ -300,12 +316,15 @@ export class ChildExecutor {
    * in-flight spawn either commits before this marker or cannot dispatch.
    * A turn that never spawned anything needs no record: the in-memory guard
    * still refuses a late spawn, and the log stays free of empty markers.
+   * The writer is joined even then: a spawn already admitted but still
+   * awaiting its parent load/admission resolver has not counted itself yet,
+   * so the count is read only after that spawn committed (or refused).
    */
   async closeTurn(root: SessionId, turnId: string): Promise<void> {
     const key = `${root}:${turnId}`
     this.closingTurns.add(key)
-    if ((this.spawnedPerTurn.get(key) ?? 0) === 0) return
     await this.withAdmission(root, async () => {
+      if ((this.spawnedPerTurn.get(key) ?? 0) === 0) return
       const parent = await this.sessions()?.load(root)
       if (parent === undefined) throw new SpawnError('ownership', 'no such parent session')
       if (parent.events.some((event) => event.type === 'turn/closing' && event.turnId === turnId)) return
@@ -513,8 +532,12 @@ export class ChildExecutor {
       try {
         handle = await this.spawnAdmitted({ ...pinned, parentTurnId: turnId })
       } catch (error) {
-        // A failed spawn still closes the real delegation Turn. If storage is
-        // poisoned, the open Turn remains visibly interrupted on recovery.
+        // Joining an existing keepOpen batch: earlier children keep running,
+        // so the batch stays open and only this spawn fails.
+        if (options.turnId !== undefined) throw error
+        // A failed spawn still closes the real delegation Turn this call
+        // created. If storage is poisoned, the open Turn remains visibly
+        // interrupted on recovery.
         if (parent.poisoned !== true) {
           parent.append({ type: 'turn/closing', turnId })
           parent.append({ type: 'turn/end', turnId, reason: 'failed' })
@@ -565,9 +588,6 @@ export class ChildExecutor {
     if ((inherit === 'brief') !== (request.inheritedContext !== undefined)) {
       throw new SpawnError('packet', "inheritedContext must accompany inherit:'brief' and nothing else")
     }
-    if (inherit === 'brief' && request.definition.inheritable === false) {
-      throw new SpawnError('inherit', `role '${request.definition.name}' does not accept inherited context (inheritable: false)`)
-    }
 
     // One-level enforcement and ownership: the parent must be a root of the
     // requested workspace/project, checked before any child state exists.
@@ -594,7 +614,7 @@ export class ChildExecutor {
           workspaceId: request.workspaceId,
           parentSessionId: request.parentSessionId,
           definition: request.definition.name,
-          candidates: request.definition.tools,
+          candidates: roleCandidates(request.definition, request.grantTools),
         })
       : request.exposureCeiling
     if (exposureCeiling === undefined) {
@@ -602,8 +622,10 @@ export class ChildExecutor {
     }
     const pinnedExposureCeiling = [...exposureCeiling]
 
-    const turnStart = parent.events.find((event) => event.type === 'turn/start' && event.turnId === request.parentTurnId)
-    if (turnStart !== undefined && parent.events.some((event) =>
+    // Durable closing/end facts refuse a late spawn whether or not the
+    // turn's start is still in the log, and whatever the in-memory guard
+    // has already forgotten.
+    if (parent.events.some((event) =>
       (event.type === 'turn/closing' || event.type === 'turn/end') && event.turnId === request.parentTurnId)) {
       throw new SpawnError('ownership', 'turn is closing or already closed')
     }
@@ -614,6 +636,9 @@ export class ChildExecutor {
     // same rollback/cleanup paths as before.
     const root = request.parentSessionId
     const turnKey = `${root}:${request.parentTurnId}`
+    // Re-checked after the awaits above: closeTurn may have started while
+    // this spawn waited on the parent load or the admission resolver.
+    if (this.closingTurns.has(turnKey)) throw new SpawnError('ownership', 'turn is closing')
     this.spawnedPerTurn.set(turnKey, (this.spawnedPerTurn.get(turnKey) ?? 0) + 1)
     this.reservedPerRoot.set(root, (this.reservedPerRoot.get(root) ?? 0) + 1)
 
@@ -726,7 +751,7 @@ export class ChildExecutor {
       const disallowed = new Set(request.definition.disallowedTools)
       const eligible = new Set(pinnedExposureCeiling)
       const grant = request.grantTools ?? undefined
-      const base = request.definition.tools.filter((tool) => {
+      const base = roleCandidates(request.definition, grant).filter((tool) => {
         if (!eligible.has(tool)) return false
         if (tool.startsWith('mcp__')) return grant?.includes(tool) === true
         return grant !== undefined ? grant.includes(tool) : true
@@ -1084,7 +1109,13 @@ export class ChildExecutor {
 
   /** Root Stop: cancel every queued or running child of one root and await settlement. */
   async cancelAllOfRoot(parentSessionId: SessionId): Promise<number> {
-    return this.cancelWhere((child) => child.parentSessionId === parentSessionId)
+    // Fence admission: a spawn already admitted for this root (possibly still
+    // awaiting its parent load or resolver before it becomes active) commits
+    // first and is then cancelled here. Settlement is awaited outside the
+    // writer so child teardown never holds up admission.
+    const marked = await this.withAdmission(parentSessionId, async () =>
+      this.markCancelled((child) => child.parentSessionId === parentSessionId))
+    return this.awaitCancelled(marked)
   }
 
   /** Root turn completion cleans up only children of this Turn. */
@@ -1093,6 +1124,11 @@ export class ChildExecutor {
   }
 
   private async cancelWhere(owns: (child: InternalChild) => boolean): Promise<number> {
+    return this.awaitCancelled(this.markCancelled(owns))
+  }
+
+  /** Synchronously cancel every owned live child; returns what to await. */
+  private markCancelled(owns: (child: InternalChild) => boolean): { active: InternalChild[]; queued: Promise<void>[] } {
     const active = [...this.active.values()].filter((child) =>
       owns(child) && (child.status === 'queued' || child.status === 'dispatching' || child.status === 'running'))
     const queued: Promise<void>[] = []
@@ -1107,6 +1143,10 @@ export class ChildExecutor {
         child.agent?.stop()
       }
     }
+    return { active, queued }
+  }
+
+  private async awaitCancelled({ active, queued }: { active: InternalChild[]; queued: Promise<void>[] }): Promise<number> {
     await Promise.all([...queued, ...active.map((child) => child.settled)])
     return active.length
   }
@@ -1118,11 +1158,26 @@ export class ChildExecutor {
    * turn completes first, so its key cannot be dropped and then re-created
    * by the commit — a leak only forgetRoot would remove.
    */
-  async releaseTurns(parentSessionId: SessionId): Promise<void> {
+  async releaseTurns(parentSessionId: SessionId, options: { forget?: boolean } = {}): Promise<void> {
     await this.withAdmission(parentSessionId, async () => {
       const prefix = `${parentSessionId}:`
       for (const key of [...this.spawnedPerTurn.keys()]) {
         if (key.startsWith(prefix)) this.spawnedPerTurn.delete(key)
+      }
+      // A closing guard goes once its turn is terminal in the parent log (the
+      // durable turn/end then refuses late spawns), or with the root itself.
+      // A turn still between closing and its turn/end keeps its guard.
+      const closing = [...this.closingTurns].filter((key) => key.startsWith(prefix))
+      if (closing.length > 0) {
+        const parent = options.forget === true
+          ? undefined
+          : await this.sessions()?.load(parentSessionId).catch(() => undefined)
+        for (const key of closing) {
+          const turnId = key.slice(prefix.length)
+          if (parent === undefined || parent.events.some((event) => event.type === 'turn/end' && event.turnId === turnId)) {
+            this.closingTurns.delete(key)
+          }
+        }
       }
       for (const [key, ids] of [...this.turnChildren]) {
         if (!key.startsWith(prefix)) continue
@@ -1141,7 +1196,7 @@ export class ChildExecutor {
     // deletion leaves the root able to recover its terminal failure, so its
     // reservations must remain held.
     if (this.sessions()?.has(parentSessionId) !== false) return []
-    await this.releaseTurns(parentSessionId)
+    await this.releaseTurns(parentSessionId, { forget: true })
     const ids = [...(this.childIdsByRoot.get(parentSessionId) ?? [])]
     this.childIdsByRoot.delete(parentSessionId)
     for (const child of [...this.active.values()]) {

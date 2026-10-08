@@ -96,6 +96,30 @@ it('focusPath opens with that diff already expanded', async () => {
   expect(view.textContent).toContain('No textual diff.')
 })
 
+it('focusPath scrolls its row to the top of the list once the diff loads, and again on a repeat click', async () => {
+  // jsdom has no layout: every row sits 300px into the list's content, so
+  // its on-screen top moves with the list's own scrollTop.
+  const rect = (top: number) => ({ top, bottom: top + 20, left: 0, right: 0, width: 0, height: 20, x: 0, y: top, toJSON: () => ({}) })
+  const spy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+    if (this.tagName !== 'BUTTON') return rect(0)
+    const list = this.closest('ul')?.parentElement
+    return rect(300 - (list?.scrollTop ?? 0))
+  })
+  try {
+    const view = await mount({ focusPath: 'notes.md', focusNonce: 1 })
+    await act(async () => { await vi.waitFor(() => expect(view.textContent).toContain('No textual diff.')) })
+    const list = view.querySelector('ul[aria-label="Changed files"]')!.parentElement!
+    expect(list.scrollTop).toBe(296)
+
+    // The reader scrolls away; clicking the same file in chat brings it back.
+    list.scrollTop = 0
+    await act(async () => root!.render(<GitPanel workspaceId="ws1" project={PROJECT} focusPath="notes.md" focusNonce={2} />))
+    expect(list.scrollTop).toBe(296)
+  } finally {
+    spy.mockRestore()
+  }
+})
+
 it('a focused file row can open the file itself in the workbench', async () => {
   const onOpenFile = vi.fn()
   const view = await mount({ onOpenFile })

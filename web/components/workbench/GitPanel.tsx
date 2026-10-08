@@ -48,11 +48,13 @@ const STATUS_MARK: Readonly<Record<GitChangeStatus, string>> = {
  * rows here stays the user's own. When the focused file no longer differs
  * from HEAD, a note says so instead of an unexplained quiet list.
  */
-export function GitPanel({ workspaceId, project, pathFilter, focusPath, onOpenFile, onShowAll }: {
+export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNonce, onOpenFile, onShowAll }: {
   readonly workspaceId: string
   readonly project: WorkbenchProject
   readonly pathFilter?: readonly string[]
   readonly focusPath?: string
+  /** Bumped on every chat click, so clicking the same file again re-focuses it. */
+  readonly focusNonce?: number
   /** Opens a changed file itself in the workbench, when a resolver is wired. */
   readonly onOpenFile?: (path: string) => void
   readonly onShowAll?: () => void
@@ -63,18 +65,47 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, onOpenFi
   const [openPath, setOpenPath] = useState<string | null>(focusPath ?? null)
   const generation = useRef(0)
 
-  // A new focus from the chat card moves the open row (and scrolls to it
-  // below); `null` — Review all — leaves the reader's state alone.
-  useEffect(() => {
-    if (focusPath !== undefined && focusPath !== null && focusPath !== '') setOpenPath(focusPath)
-  }, [focusPath])
-
-  // The focused row may render only once the status report lands, so the
-  // scroll rides on both: a focus change, and the list arriving under one.
+  // The focused row lands at the top of the list with its diff below it — a
+  // `nearest` scroll left it on the bottom edge and the diff out of view. The
+  // row may render only once the status report lands and the diff only after
+  // its own fetch, so the focus stays pending until the diff has settled.
+  const scrollRef = useRef<HTMLDivElement | null>(null)
   const focusRowRef = useRef<HTMLButtonElement | null>(null)
+  const pendingFocus = useRef(false)
+  const scrollFocusToTop = useCallback(() => {
+    const row = focusRowRef.current
+    const box = scrollRef.current
+    if (row === null || box === null) return
+    box.scrollTop += row.getBoundingClientRect().top - box.getBoundingClientRect().top - 4
+  }, [])
+
+  // A new focus from the chat card moves the open row; `null` — Review all —
+  // leaves the reader's state alone. The pending flag is armed during render:
+  // child effects run before this component's, and an already-open diff
+  // reports ready from its own effect in the same commit.
+  const hasFocus = focusPath !== undefined && focusPath !== null && focusPath !== ''
+  const focusKey = hasFocus ? `${focusPath}\u0000${focusNonce ?? 0}` : null
+  const armedKey = useRef<string | null>(null)
+  if (focusKey !== null && armedKey.current !== focusKey) {
+    armedKey.current = focusKey
+    pendingFocus.current = true
+  }
   useEffect(() => {
-    focusRowRef.current?.scrollIntoView?.({ block: 'nearest' })
-  }, [focusPath, report])
+    if (hasFocus) setOpenPath(focusPath)
+  }, [hasFocus, focusPath, focusNonce])
+
+  useEffect(() => {
+    if (pendingFocus.current) scrollFocusToTop()
+  }, [focusPath, focusNonce, report, scrollFocusToTop])
+
+  // A new identity per focus: a diff already on screen re-fires it, so a
+  // repeat click on the same file settles (and clears) the focus too.
+  const onFocusedDiffReady = useCallback(() => {
+    if (!pendingFocus.current) return
+    pendingFocus.current = false
+    scrollFocusToTop()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- focus identity is the point
+  }, [scrollFocusToTop, focusPath, focusNonce])
 
   const load = useCallback(async () => {
     const request = ++generation.current
@@ -141,7 +172,7 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, onOpenFi
         ) : null}
         <IconButton label="Refresh git status" onClick={() => void load()}><Icon name="refresh" size={14} /></IconButton>
       </div>
-      <div className="min-h-0 flex-1 overflow-auto">
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto">
         {error !== null && report === null ? (
           <div className="flex flex-col items-start gap-2 p-3">
             <ErrorNotice raw={error} />
@@ -168,12 +199,22 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, onOpenFi
                 <ChangeRow
                   change={change}
                   open={openPath === change.path}
-                  onToggle={() => setOpenPath((current) => current === change.path ? null : change.path)}
+                  onToggle={() => {
+                    // The reader took over: a late diff must not yank the list back.
+                    pendingFocus.current = false
+                    setOpenPath((current) => current === change.path ? null : change.path)
+                  }}
                   {...(focusPath === change.path ? { rowRef: focusRowRef } : {})}
                   {...(onOpenFile !== undefined ? { onOpenFile: () => onOpenFile(change.path) } : {})}
                 />
                 {openPath === change.path ? (
-                  <DiffView key={change.path} workspaceId={workspaceId} projectId={project.id} path={change.path} />
+                  <DiffView
+                    key={change.path}
+                    workspaceId={workspaceId}
+                    projectId={project.id}
+                    path={change.path}
+                    {...(focusPath === change.path ? { onReady: onFocusedDiffReady } : {})}
+                  />
                 ) : null}
               </li>
             ))}
@@ -232,14 +273,19 @@ function markColor(status: GitChangeStatus): string {
 }
 
 /** The unified diff of one changed file, loaded when its row opens. */
-function DiffView({ workspaceId, projectId, path }: {
+function DiffView({ workspaceId, projectId, path, onReady }: {
   readonly workspaceId: string
   readonly projectId: string
   readonly path: string
+  /** Called once the diff (or its error) has rendered — the focused row's cue to scroll. */
+  readonly onReady?: () => void
 }) {
   const [diff, setDiff] = useState<GitDiffReport | null>(null)
   const [error, setError] = useState<string | null>(null)
   const generation = useRef(0)
+  useEffect(() => {
+    if (diff !== null || error !== null) onReady?.()
+  }, [diff, error, onReady])
 
   const load = useCallback(async () => {
     const request = ++generation.current
