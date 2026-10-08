@@ -58,7 +58,7 @@ Ruling: Không thêm phase files/AK validation theo chỉ thị; giữ checklist
 
 ## Fix round 1/5 (2026-10-08 Asia/Saigon)
 
-- [x] Findings 1–9 đều đã sửa và có regression tương ứng.
+- [x] 8/9 findings đã đóng; finding 7 đã truyền root project binding nhưng còn residual stale-request được phát hiện ở round 2.
 - [x] Ruling finding 6: chỉ relabel blank option thành `Use role default / conversation fallback`, giữ precedence hiện tại.
 - [x] ABA: persisted monotonic `aliasGeneration`, sống qua restart và delete/recreate; không dùng `Date.now`.
 - [x] POST validation chuyển vào serialized callback; provider mutation trước đó được quan sát đúng.
@@ -71,8 +71,18 @@ Ruling/cost: persisted generation thêm optional-compatible field vào v2 envelo
 
 Ruling/cost: root project id lấy từ durable session listing của root, không từ project của child đang xem. Nếu sai, project role biến mất trên manual spawn (medium), nên mounted API URL assertion khóa query.
 
+## Fix round 2/5 (2026-10-08 Asia/Saigon)
+
+- [x] Reconcile trạng thái round 1 thành 8 finding đóng, residual F7 P2 còn mở: catalog request chưa chống response cũ.
+- [x] Thêm generation/cleanup invalidation cho catalog effect khi `rootProjectId` đổi trong cùng root scope.
+- [x] Xóa catalog/selection cũ và disable spawn trong lúc binding mới loading; stale success/error không publish.
+- [x] Reconcile selected role theo catalog mới: giữ nếu còn hợp lệ, nếu không chọn row đầu hoặc rỗng.
+- [x] Mounted deferred regression resolve project request trước/no-project request sau; project role và selection không bị ghi đè, spawn chỉ dùng project role.
+- [x] Verification: agent-runs mounted 8 tests PASS; typecheck PASS; diff check PASS.
+
+Ruling/cost: không remount theo `rootProjectId` để tránh reset brief/model không cần thiết; catalog state được invalidation riêng và brief được giữ. Nếu sai, stale role có thể spawn vào project mới (high), nên submit kiểm membership trong current roles ngoài UI disabled state.
+
 ## Concerns
 
-- Scope vẫn cross-layer và `src/web/server.ts` lớn; nguy cơ cao nhất là thêm alias state nhưng bỏ sót một store literal hoặc một provider/default mutation. Compile + provider transaction tests phải bắt buộc.
-- Spec nói “manual subagent spawn form”, trong code hiện không có form; plan đặt form trong Workbench Subagents vì đây là surface owner rõ nhất. Không nên đặt vào Settings vì test/UX hiện khẳng định Settings không spawn.
-- `thinkingLevel: null` cần được truyền như model default chứ không bị helper bỏ field rồi vô tình copy parent; pure resolver test phải khóa chi tiết này trước implementation.
+- Không còn concern mở trong scope round 2.
+- Không chạy full repository suite; round 2 bounded theo mounted suite + typecheck. Regression rộng/build đã PASS ở round 1.

@@ -57,7 +57,7 @@
 
 ## Fix round 1/5 — findings 1–9
 
-Đã xử lý toàn bộ review findings trong một wave:
+Round 1 xử lý 8 findings; finding 7 mới xử lý project binding nhưng còn residual stale-request được đóng ở round 2:
 
 1. Role model tra custom alias exact trước Claude shorthand, khóa regression alias `sonnet`.
 2. POST alias parse/validate target bên trong serialized provider transaction.
@@ -79,7 +79,24 @@ Rulings: precedence blank manual giữ nguyên; ABA dùng persisted monotonic ge
 - `npm run build:web` — PASS: Vite 550 modules, built in 1.65s, exit 0.
 - `git diff --check` — PASS, exit 0.
 
+## Fix round 2/5 — residual F7 P2
+
+Kết luận lại round 1: **8 finding đã đóng, 1 finding còn mở**. Finding 7 mới chỉ truyền `rootProjectId`; effect catalog trong `AgentRunsPanel` vẫn cho response request cũ ghi đè khi binding đổi `null → project` trong cùng root scope.
+
+Round 2 đã đóng residual này:
+
+- Catalog effect có request generation và cleanup invalidation; success/error từ generation cũ không còn publish state.
+- Khi binding đổi, role/alias cũ bị xóa và form chuyển sang loading-disabled, nên không thể spawn role thuộc binding trước trong lúc request mới chưa hoàn tất hoặc lỗi.
+- Sau mỗi catalog hợp lệ, selection được reconcile: giữ role đang chọn nếu role còn tồn tại, ngược lại chọn role hợp lệ đầu tiên hoặc rỗng.
+- Thêm mounted regression dùng hai deferred response resolve ngược thứ tự; project role/selection vẫn được giữ và POST chỉ dùng project role.
+
+## Verification fix round 2
+
+- `npx vitest run web/components/workbench/agent-runs.mounted.spec.tsx` — PASS: 1 file, 8 tests, exit 0.
+- `npm run typecheck` — PASS: cả hai `tsc --noEmit` hoàn tất, exit 0.
+- `git diff --check` — PASS, exit 0.
+
 ## Concerns
 
 - Không còn concern mở trong scope được yêu cầu.
-- Không chạy full repository suite; đã chạy toàn bộ ma trận alias cùng regression server/settings/workbench liên quan, typecheck và web build.
+- Không chạy full repository suite; round 2 chỉ chạy mounted suite được yêu cầu, typecheck và diff check. Ma trận rộng/build của round 1 vẫn được ghi ở trên.

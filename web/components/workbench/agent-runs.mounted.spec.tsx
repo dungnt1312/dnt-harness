@@ -5,6 +5,12 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { AgentRunsPanel } from './AgentRunsPanel.tsx'
 ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
 /** Serve the children read; record every request. */
 function stubApi(children: unknown[]): { calls: string[] } {
   const calls: string[] = []
@@ -60,6 +66,48 @@ describe('subagents panel', () => {
     expect(host.querySelector<HTMLInputElement>('input[aria-label="Direct subagent model"]')!.value).toBe('far:gpt')
     await unmount()
   })
+  it('keeps the newest project catalog when binding requests resolve out of order', async () => {
+    const noProject = deferred<unknown>()
+    const project = deferred<unknown>()
+    const calls: { url: string; init?: RequestInit }[] = []
+    vi.stubGlobal('fetch', vi.fn((url: string, init?: RequestInit) => {
+      calls.push({ url, ...(init === undefined ? {} : { init }) })
+      const body = url === '/api/workspaces/ws-1/agents'
+        ? noProject.promise
+        : url === '/api/workspaces/ws-1/agents?projectId=project-root'
+          ? project.promise
+          : Promise.resolve([])
+      return Promise.resolve({ ok: true, json: async () => body })
+    }))
+    const host = document.createElement('div'); document.body.append(host)
+    const root = createRoot(host)
+    await act(async () => root.render(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" rootProjectId={null} />))
+    const brief = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Subagent brief"]')!
+    await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(brief, 'Do it'); brief.dispatchEvent(new Event('input', { bubbles: true })) })
+    await act(async () => root.render(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" rootProjectId="project-root" />))
+    expect(host.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(true)
+
+    project.resolve([
+      { source: 'project', definition: { name: 'project-reviewer', description: 'Review', tools: [], disallowedTools: [], instructions: '' } },
+      { source: 'project', definition: { name: 'project-explorer', description: 'Explore', tools: [], disallowedTools: [], instructions: '' } },
+    ])
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    const role = host.querySelector<HTMLSelectElement>('select[aria-label="Subagent role"]')!
+    expect(role.value).toBe('project-reviewer')
+    await act(async () => { Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')!.set!.call(role, 'project-explorer'); role.dispatchEvent(new Event('change', { bubbles: true })) })
+    expect(role.value).toBe('project-explorer')
+    expect(host.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(false)
+
+    noProject.resolve([{ source: 'user', definition: { name: 'global-explorer', description: 'Explore', tools: [], disallowedTools: [], instructions: '' } }])
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect([...role.options].map((option) => option.value)).toEqual(['project-reviewer', 'project-explorer'])
+    expect(role.value).toBe('project-explorer')
+    await act(async () => { host.querySelector<HTMLFormElement>('form[aria-label="Spawn subagent"]')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); await Promise.resolve() })
+    expect(calls.some((call) => call.init?.method === 'POST' && call.url.includes('/agents/project-explorer'))).toBe(true)
+    expect(calls.some((call) => call.init?.method === 'POST' && call.url.includes('/agents/global-explorer'))).toBe(false)
+    await act(async () => root.unmount()); host.remove()
+  })
+
   it('splits running from ended, newest ended first, titled by the brief', async () => {
     stubApi([
       { childSessionId: 'old', status: 'completed', definitionName: 'explorer', startedAt: 1, endedAt: 2, result: { report: '## Verified findings\n1. first', filesTouched: [] } },

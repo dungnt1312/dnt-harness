@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useScopedState } from '../../hooks/useScopedState.ts'
 import Icon from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
@@ -62,9 +62,11 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, rootProjectId, brie
   const [busy, setBusy] = useState<string | null>(null)
   const [roles, setRoles] = useScopedState<readonly AgentDefinitionRow[]>([])
   const [aliases, setAliases] = useScopedState<readonly ModelAliasRow[]>([])
+  const [catalogLoading, setCatalogLoading] = useScopedState(false)
   const [role, setRole] = useScopedState('')
   const [brief, setBrief] = useScopedState('')
   const [model, setModel] = useScopedState('')
+  const catalogGeneration = useRef(0)
 
   const refresh = useCallback(async () => {
     if (workspaceId === null || rootSessionId === null) return
@@ -78,12 +80,26 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, rootProjectId, brie
   // spawned must show up without waiting for the running-child poll.
   useEffect(() => { void refresh() }, [refresh, refreshSignal])
   useEffect(() => {
+    const generation = ++catalogGeneration.current
+    setCatalogLoading(workspaceId !== null)
+    setRoles([])
+    setAliases([])
     if (workspaceId === null) return
     void Promise.all([listAgentDefinitions(workspaceId, rootProjectId), listModelAliases()]).then(([nextRoles, nextAliases]) => {
+      if (catalogGeneration.current !== generation) return
       const validRoles = nextRoles.filter((entry) => entry?.definition?.name !== undefined)
       const validAliases = nextAliases.filter((entry) => typeof entry?.name === 'string')
-      setRoles(validRoles); setAliases(validAliases); if (role === '' && validRoles[0] !== undefined) setRole(validRoles[0].definition.name)
-    }).catch((cause) => setFailure(String(cause)))
+      setRoles(validRoles)
+      setAliases(validAliases)
+      setRole((selected) => validRoles.some((entry) => entry.definition.name === selected) ? selected : (validRoles[0]?.definition.name ?? ''))
+      setFailure(null)
+      setCatalogLoading(false)
+    }).catch((cause) => {
+      if (catalogGeneration.current !== generation) return
+      setFailure(String(cause))
+      setCatalogLoading(false)
+    })
+    return () => { if (catalogGeneration.current === generation) catalogGeneration.current += 1 }
   }, [workspaceId, rootProjectId])
 
   // Poll only while a child runs or settles; it stops by itself when none do.
@@ -189,7 +205,7 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, rootProjectId, brie
 
   const selectedAlias = aliases.find((alias) => alias.name === model)
   const submit = async () => {
-    if (role === '' || brief.trim() === '' || selectedAlias?.status === 'invalid') return
+    if (catalogLoading || !roles.some((entry) => entry.definition.name === role) || brief.trim() === '' || selectedAlias?.status === 'invalid') return
     setBusy('spawn')
     try { await spawnChild(workspaceId, role, rootSessionId, { prompt: brief.trim() }, undefined, model || undefined); setBrief(''); setFailure(null); await refresh() }
     catch (cause) { setFailure(String(cause)) } finally { setBusy(null) }
@@ -199,12 +215,12 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, rootProjectId, brie
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
       <form aria-label="Spawn subagent" className="space-y-2 border-b border-line p-4" onSubmit={(event) => { event.preventDefault(); void submit() }}>
         <h3 className="m-0 text-sm font-semibold">Spawn subagent</h3>
-        <label className="block text-xs text-fg-muted">Role<select aria-label="Subagent role" className="mt-1 h-9 w-full rounded-md border border-line bg-bg px-2 text-sm" value={role} onChange={(event) => setRole(event.target.value)}>{roles.map((entry) => <option key={entry.definition.name} value={entry.definition.name}>{entry.definition.name}</option>)}</select></label>
+        <label className="block text-xs text-fg-muted">Role<select aria-label="Subagent role" disabled={catalogLoading} className="mt-1 h-9 w-full rounded-md border border-line bg-bg px-2 text-sm" value={role} onChange={(event) => setRole(event.target.value)}>{roles.map((entry) => <option key={entry.definition.name} value={entry.definition.name}>{entry.definition.name}</option>)}</select></label>
         <label className="block text-xs text-fg-muted">Brief<textarea aria-label="Subagent brief" className="mt-1 min-h-20 w-full rounded-md border border-line bg-bg p-2 text-sm" value={brief} onChange={(event) => setBrief(event.target.value)} /></label>
         <label className="block text-xs text-fg-muted">Model<select aria-label="Subagent model" className="mt-1 h-9 w-full rounded-md border border-line bg-bg px-2 text-sm" value={model} onChange={(event) => setModel(event.target.value)}><option value="">Use role default / conversation fallback</option>{aliases.map((alias) => <option key={alias.name} value={alias.name} disabled={alias.status === 'invalid'}>{alias.name} → {alias.provider}:{alias.model}{alias.status === 'invalid' ? ' (unusable)' : ''}</option>)}</select></label>
         <label className="block text-xs text-fg-muted">Direct provider:model<input aria-label="Direct subagent model" className="mt-1 h-9 w-full rounded-md border border-line bg-bg px-2 text-sm" value={model.includes(':') ? model : ''} onChange={(event) => setModel(event.target.value)} placeholder="provider:model" /></label>
         {selectedAlias?.status === 'invalid' ? <p role="alert" className="m-0 text-xs text-bad">Alias unusable: {selectedAlias.message}</p> : null}
-        <button type="submit" disabled={busy !== null || role === '' || brief.trim() === '' || selectedAlias?.status === 'invalid'} className="rounded-md bg-accent px-3 py-2 text-sm text-white disabled:opacity-50">{busy === 'spawn' ? 'Spawning…' : 'Spawn'}</button>
+        <button type="submit" disabled={busy !== null || catalogLoading || !roles.some((entry) => entry.definition.name === role) || brief.trim() === '' || selectedAlias?.status === 'invalid'} className="rounded-md bg-accent px-3 py-2 text-sm text-white disabled:opacity-50">{busy === 'spawn' ? 'Spawning…' : 'Spawn'}</button>
       </form>
       <section aria-label="Active subagents" className="flex flex-col px-3 pt-4">
         <h3 className="m-0 px-2 pb-1 text-xs font-medium text-fg-faint">Active · {active.length}</h3>
