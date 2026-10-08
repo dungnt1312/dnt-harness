@@ -6214,7 +6214,8 @@ async function handleApi(
         })
         send(201, modelAliasRow(deps, created))
       } catch (error) {
-        send(error instanceof ModelAliasConflict ? 409 : 400, { error: String(error instanceof Error ? error.message : error) })
+        const status = error instanceof ModelAliasConflict ? 409 : error instanceof ModelAliasValidation ? 400 : 500
+        send(status, { error: String(error instanceof Error ? error.message : error) })
       }
       return
     }
@@ -6247,7 +6248,7 @@ async function handleApi(
           send(200, modelAliasRow(deps, patched))
         }
       } catch (error) {
-        const status = error instanceof ModelAliasMissing ? 404 : error instanceof ModelAliasConflict ? 409 : 400
+        const status = error instanceof ModelAliasMissing ? 404 : error instanceof ModelAliasConflict ? 409 : error instanceof ModelAliasValidation ? 400 : 500
         send(status, { error: String(error instanceof Error ? error.message : error) })
       }
       return
@@ -7173,22 +7174,27 @@ function boundProject(session: Session): ProjectId | undefined {
 // ── provider helpers ───────────────────────────────────────────
 
 class ModelAliasConflict extends Error {}
+class ModelAliasValidation extends Error {}
 class ModelAliasMissing extends Error {
   constructor(name: string) { super(`no model alias '${name}'`) }
 }
 
 function parseModelAliasInput(deps: HandlerDeps, body: Record<string, unknown>): Omit<ModelAlias, 'revision'> {
-  const name = validateModelAliasName(typeof body['name'] === 'string' ? body['name'] : '')
-  const provider = typeof body['provider'] === 'string' ? body['provider'].trim() : ''
-  const model = typeof body['model'] === 'string' ? body['model'].trim() : ''
-  const thinkingLevel = body['thinkingLevel'] === null ? null : body['thinkingLevel']
-  if (provider === '' || model === '') throw new Error("model alias needs non-empty 'provider' and 'model'")
-  deps.validateProviderModel(provider, model)
-  if (thinkingLevel !== null) {
-    if (!isThinkingLevel(thinkingLevel)) throw new Error("'thinkingLevel' must be a supported level or null")
-    if (expressibleThinkingLevel(model, thinkingLevel) !== thinkingLevel) throw new Error(`model '${model}' does not support thinking '${thinkingLevel}'`)
+  try {
+    const name = validateModelAliasName(typeof body['name'] === 'string' ? body['name'] : '')
+    const provider = typeof body['provider'] === 'string' ? body['provider'].trim() : ''
+    const model = typeof body['model'] === 'string' ? body['model'].trim() : ''
+    const thinkingLevel = body['thinkingLevel'] === null ? null : body['thinkingLevel']
+    if (provider === '' || model === '') throw new Error("model alias needs non-empty 'provider' and 'model'")
+    deps.validateProviderModel(provider, model)
+    if (thinkingLevel !== null) {
+      if (!isThinkingLevel(thinkingLevel)) throw new Error("'thinkingLevel' must be a supported level or null")
+      if (expressibleThinkingLevel(model, thinkingLevel) !== thinkingLevel) throw new Error(`model '${model}' does not support thinking '${thinkingLevel}'`)
+    }
+    return { name, provider, model, thinkingLevel }
+  } catch (error) {
+    throw new ModelAliasValidation(String(error instanceof Error ? error.message : error))
   }
-  return { name, provider, model, thinkingLevel }
 }
 
 function modelAliasRow(deps: HandlerDeps, alias: ModelAlias): ModelAlias & { readonly status: 'valid' | 'invalid'; readonly message?: string; readonly warnings: readonly string[] } {

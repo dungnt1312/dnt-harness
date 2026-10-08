@@ -27,6 +27,37 @@ const section = (host: HTMLElement, name: string): HTMLElement => host.querySele
 afterEach(() => { vi.unstubAllGlobals() })
 
 describe('subagents panel', () => {
+  it('manual chooser submits a plain alias, disables unusable aliases, supports direct models, and refreshes children', async () => {
+    const calls: { url: string; init?: RequestInit }[] = []
+    let childrenReads = 0
+    vi.stubGlobal('fetch', vi.fn((url: string, init?: RequestInit) => {
+      calls.push({ url, ...(init === undefined ? {} : { init }) })
+      const body = url === '/api/model-aliases'
+        ? [{ name: 'fast', provider: 'far', model: 'gpt', thinkingLevel: null, revision: 1, status: 'valid', warnings: [] }, { name: 'broken', provider: 'gone', model: 'old', thinkingLevel: null, revision: 1, status: 'invalid', message: 'gone', warnings: [] }]
+        : url === '/api/workspaces/ws-1/agents' ? [{ source: 'bundled', definition: { name: 'explorer', description: 'Explore', tools: [], disallowedTools: [], instructions: '' } }]
+          : url.includes('/agents/children') ? (childrenReads++, [])
+            : { childSessionId: 'child', status: 'running' }
+      return Promise.resolve({ ok: true, json: async () => body })
+    }))
+    const { host, unmount } = await mount(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />)
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    const role = host.querySelector<HTMLSelectElement>('select[aria-label="Subagent role"]')!
+    const model = host.querySelector<HTMLSelectElement>('select[aria-label="Subagent model"]')!
+    expect(role.value).toBe('explorer')
+    expect([...model.options].find((option) => option.value === 'broken')?.disabled).toBe(true)
+    await act(async () => { Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')!.set!.call(model, 'fast'); model.dispatchEvent(new Event('change', { bubbles: true })) })
+    const brief = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Subagent brief"]')!
+    await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(brief, 'Do it'); brief.dispatchEvent(new Event('input', { bubbles: true })) })
+    await act(async () => { host.querySelector<HTMLFormElement>('form[aria-label="Spawn subagent"]')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); await Promise.resolve() })
+    const spawn = calls.find((call) => call.init?.method === 'POST' && call.url.includes('/agents/explorer'))!
+    expect(JSON.parse(String(spawn.init?.body))).toMatchObject({ rootSessionId: 'root', model: 'fast', task: { prompt: 'Do it' } })
+    expect(childrenReads).toBeGreaterThan(1)
+
+    const direct = host.querySelector<HTMLInputElement>('input[aria-label="Direct subagent model"]')!
+    await act(async () => { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(direct, 'far:gpt'); direct.dispatchEvent(new Event('input', { bubbles: true })) })
+    expect(host.querySelector<HTMLInputElement>('input[aria-label="Direct subagent model"]')!.value).toBe('far:gpt')
+    await unmount()
+  })
   it('splits running from ended, newest ended first, titled by the brief', async () => {
     stubApi([
       { childSessionId: 'old', status: 'completed', definitionName: 'explorer', startedAt: 1, endedAt: 2, result: { report: '## Verified findings\n1. first', filesTouched: [] } },

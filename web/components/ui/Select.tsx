@@ -3,7 +3,7 @@ import { cloneElement, isValidElement, useId, useRef, useState, type KeyboardEve
 import Icon from '../common/Icon.tsx'
 import { cn } from '../../lib/cn.ts'
 
-export interface SelectOption { readonly value: string; readonly label: string; readonly provider?: string }
+export interface SelectOption { readonly value: string; readonly label: string; readonly provider?: string; readonly disabled?: boolean }
 
 function cloneTrigger(element: ReactElement, id: string | undefined, ariaDescribedBy: string | undefined): ReactElement {
   return cloneElement(element as ReactElement<{ id?: string; 'aria-describedby'?: string }>, {
@@ -35,7 +35,7 @@ export function Select({ value, options, onChange, disabled = false, label, trig
 
   const pick = (index: number): void => {
     const option = visible[index]
-    if (option === undefined) return
+    if (option === undefined || option.disabled === true) return
     onChange(option.value)
     setOpen(false)
     triggerRef.current?.focus()
@@ -99,8 +99,10 @@ export function Select({ value, options, onChange, disabled = false, label, trig
                     type="button"
                     role="option"
                     tabIndex={-1}
+                    disabled={option.disabled === true}
                     aria-selected={option.value === value}
-                    className={cn('flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-2 text-left text-sm', index === active && 'bg-hover')}
+                    aria-disabled={option.disabled === true}
+                    className={cn('flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-2 text-left text-sm disabled:cursor-not-allowed disabled:opacity-50', index === active && option.disabled !== true && 'bg-hover')}
                     onMouseEnter={() => setActive(index)}
                     onClick={() => pick(index)}
                   >

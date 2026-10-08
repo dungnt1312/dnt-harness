@@ -63,21 +63,21 @@ describe('runtime provider UI helpers', () => {
     expect(activeModelValue(meta)).toBe('cliproxy1:gpt-5.6-sol')
   })
 
-  it('settings dialog exposes all eleven sections as linked tabs and lists providers', () => {
+  it('settings dialog exposes all twelve sections as linked tabs and lists providers', () => {
     const html = renderToStaticMarkup(
       <SettingsModal open workspaceId="ws-1" providers={meta.providers} activeProvider="cliproxy1" activeModel="gpt-5.6-sol" onDismiss={() => undefined} onRefresh={async () => undefined} />,
     )
     expect(html).toContain('aria-modal="true"')
     expect(html).toContain('aria-label="Settings"')
-    expect((html.match(/role="tab"/g) ?? []).length).toBe(11)
+    expect((html.match(/role="tab"/g) ?? []).length).toBe(12)
     // Radix mounts the active panel only; each tab still owns a controls link.
     expect((html.match(/role="tabpanel"/g) ?? []).length).toBe(1)
-    expect((html.match(/aria-controls=/g) ?? []).length).toBeGreaterThanOrEqual(11)
+    expect((html.match(/aria-controls=/g) ?? []).length).toBeGreaterThanOrEqual(12)
     const tabTags = html.match(/<[a-z]+[^>]*role="tab"[^>]*>/g) ?? []
     expect(tabTags.filter((tag) => tag.includes('aria-selected="true"')).length).toBe(1)
     const labels = [...html.matchAll(/<button(?=[^>]*role="tab")[\s\S]*?<\/button>/g)]
       .map((match) => match[0].replace(/<[^>]+>/g, ''))
-    expect(labels).toEqual(['Providers', 'Usage', 'Projects', 'Permissions', 'System Prompts', 'Skills', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets'])
+    expect(labels).toEqual(['Providers', 'Model aliases', 'Usage', 'Projects', 'Permissions', 'System Prompts', 'Skills', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets'])
     expect(html).toContain('cliproxy1')
     // The model count belongs to the list it counts, not to the rail row too.
     expect(html).toContain('Model list')

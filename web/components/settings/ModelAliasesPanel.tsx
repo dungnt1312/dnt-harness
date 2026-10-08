@@ -17,7 +17,7 @@ export function ModelAliasesPanel({ providers }: { readonly providers: readonly 
   const refresh = useCallback(async () => { setRows(await listModelAliases()) }, [])
   useEffect(() => { void refresh().catch((cause) => setError(String(cause))) }, [refresh])
   const dirty = JSON.stringify(draft) !== JSON.stringify(selected === null ? EMPTY : { name: selected.name, provider: selected.provider, model: selected.model, thinkingLevel: selected.thinkingLevel })
-  useUnsavedChanges(dirty)
+  const guardDiscard = useUnsavedChanges(dirty)
   const provider = providers.find((entry) => entry.id === draft.provider)
   const nameError = draft.name.trim() === '' || /[\s:@\u0000-\u001f\u007f]/.test(draft.name.trim()) || draft.name.trim() === 'inherit'
     ? 'Use a non-empty name without whitespace, colon, @, controls, or “inherit”.' : null
@@ -29,10 +29,11 @@ export function ModelAliasesPanel({ providers }: { readonly providers: readonly 
       setSelected(row); setDraft(input); setError(null); await refresh()
     } catch (cause) { setError(String(cause)) }
   }
-  const choose = (row: ModelAliasRow) => { setSelected(row); setDraft({ name: row.name, provider: row.provider, model: row.model, thinkingLevel: row.thinkingLevel }); setError(null) }
+  const choose = (row: ModelAliasRow) => guardDiscard(() => { setSelected(row); setDraft({ name: row.name, provider: row.provider, model: row.model, thinkingLevel: row.thinkingLevel }); setError(null) })
+  const startNew = () => guardDiscard(() => { setSelected(null); setDraft(EMPTY); setError(null) })
   return <div className="flex min-h-0 flex-1 gap-4 p-5">
     <section aria-label="Model aliases" className="w-64 shrink-0">
-      <div className="mb-3 flex items-center justify-between"><h2 className="m-0 text-base">Model aliases</h2><Button onClick={() => { setSelected(null); setDraft(EMPTY) }}>New</Button></div>
+      <div className="mb-3 flex items-center justify-between"><h2 className="m-0 text-base">Model aliases</h2><Button onClick={startNew}>New</Button></div>
       <ul className="m-0 list-none space-y-1 p-0">{rows.map((row) => <li key={row.name}><button type="button" onClick={() => choose(row)} className="w-full rounded-md px-2 py-2 text-left hover:bg-hover"><strong>{row.name}</strong><span className={`block text-xs ${row.status === 'invalid' ? 'text-bad' : 'text-fg-muted'}`}>{row.provider}:{row.model}{row.status === 'invalid' ? ' · unusable' : ''}</span></button></li>)}</ul>
     </section>
     <section className="min-w-0 flex-1 space-y-4" aria-label="Model alias editor">
