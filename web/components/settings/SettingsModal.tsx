@@ -33,8 +33,7 @@ import { SubTabs } from './settings-kit.tsx'
 import { SystemPromptsPanel } from './SystemPromptsPanel.tsx'
 import { UsagePanel } from './UsagePanel.tsx'
 import { ModelAliasesPanel } from './ModelAliasesPanel.tsx'
-import { ImageGenerationPanel } from './ImageGenerationPanel.tsx'
-import { ImageUnderstandingPanel } from './ImageUnderstandingPanel.tsx'
+import { ImagesPanel } from './ImagesPanel.tsx'
 import { modelOptions } from '../../lib/providers.ts'
 import type { ModelSettings, ProjectRow, ProviderSummary } from '../../lib/types.ts'
 
@@ -51,18 +50,19 @@ const LEGACY_TAB_REDIRECT: Readonly<Record<string, SettingsTab>> = {
 }
 
 /** Sub-tabs of Providers & Models: everything that picks an endpoint or a model. */
-type ModelsSubTab = 'providers' | 'model-aliases' | 'image-generation' | 'image-understanding'
+type ModelsSubTab = 'providers' | 'model-aliases' | 'images'
+type LegacyModelsSubTab = 'image-generation' | 'image-understanding'
 
 const MODELS_SUB_TABS: readonly { readonly value: ModelsSubTab; readonly label: string; readonly hint: string; readonly icon: IconName }[] = [
   { value: 'providers', label: 'Providers', hint: 'Model endpoints and keys', icon: 'globe' },
   { value: 'model-aliases', label: 'Model aliases', hint: 'Global subagent model mappings', icon: 'gitBranch' },
-  { value: 'image-generation', label: 'Image generation', hint: 'Provider and model for the GenerateImage and EditImage tools', icon: 'fileImage' },
-  { value: 'image-understanding', label: 'Image understanding', hint: 'Vision model for DescribeImage when chat is text-only', icon: 'eye' },
+  { value: 'images', label: 'Images', hint: 'Models for image generation and understanding', icon: 'fileImage' },
 ]
 
 /** Legacy tab ids that named a Providers & Models sub-pane directly. */
 function modelsSubOf(raw: string | undefined): ModelsSubTab | undefined {
-  return raw === 'model-aliases' || raw === 'image-generation' || raw === 'image-understanding' ? raw : undefined
+  if (raw === 'image-generation' || raw === 'image-understanding') return 'images'
+  return raw === 'model-aliases' || raw === 'images' ? raw : undefined
 }
 
 /** Legacy links that named a Permissions sub-pane directly. */
@@ -176,16 +176,17 @@ export function SettingsModal({
   onDismiss,
   onRefresh,
   workspaceId,
-  initialTab, workspaceName, projects = [], onProjectsChanged = async () => {}, sessionCounts = {},
+  initialTab, workspaceName, projects = [], onProjectsChanged = async () => {}, onSkillsChanged = () => {}, sessionCounts = {},
   activeProjectId = null,
 }: {
   /** Deep link; when absent Settings reopens on the tab it last showed. */
-  readonly initialTab?: SettingsTab | 'modes' | 'dangerous-commands' | ModelsSubTab | undefined
+  readonly initialTab?: SettingsTab | 'modes' | 'dangerous-commands' | ModelsSubTab | LegacyModelsSubTab | undefined
   /** The open conversation's project: its `.claude/` layers show in Agents and Hooks. */
   readonly activeProjectId?: string | null
   readonly workspaceName?: string | undefined
   readonly projects?: readonly ProjectRow[]
   readonly onProjectsChanged?: () => Promise<void>
+  readonly onSkillsChanged?: () => void
   readonly sessionCounts?: Readonly<Record<string, number>>
   readonly open: boolean
   readonly workspaceId: string | null
@@ -616,12 +617,11 @@ export function SettingsModal({
             {tab === 'usage' ? <UsagePanel /> : !providerEditor ? (
               <UnsavedChangesContext.Provider value={unsavedApi}>
                 {tab === 'providers' && modelsSub === 'model-aliases' ? <ModelAliasesPanel providers={providers} /> : null}
-                {tab === 'providers' && modelsSub === 'image-generation' ? <ImageGenerationPanel providers={providers} /> : null}
-                {tab === 'providers' && modelsSub === 'image-understanding' ? <ImageUnderstandingPanel providers={providers} /> : null}
+                {tab === 'providers' && modelsSub === 'images' ? <ImagesPanel providers={providers} /> : null}
                 {tab === 'projects' ? <ProjectsPanel workspaceId={workspaceId} projects={projects} onChanged={onProjectsChanged} sessionCounts={sessionCounts} /> : null}
                 {tab === 'permissions' ? <PermissionsPanel workspaceId={workspaceId} onChanged={onRefresh} initialSub={permissionsSubOf(initialTab)} /> : null}
                 {tab === 'prompts' ? <SystemPromptsPanel workspaceId={workspaceId} /> : null}
-                {tab === 'skills' ? <SkillsPanel workspaceId={workspaceId} /> : null}
+                {tab === 'skills' ? <SkillsPanel workspaceId={workspaceId} onChanged={onSkillsChanged} /> : null}
                 {tab === 'memory' ? <MemoryPanel workspaceId={workspaceId} projects={projects} /> : null}
                 {tab === 'agents' ? <AgentsPanel workspaceId={workspaceId} projectId={activeProjectId} modelOptions={roleModelOptions} /> : null}
                 {tab === 'mcp' ? <McpPanel workspaceId={workspaceId} /> : null}

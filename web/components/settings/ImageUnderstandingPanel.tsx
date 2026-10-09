@@ -34,8 +34,9 @@ export function ImageUnderstandingPanel({ providers }: { readonly providers: rea
       DescribeImage uses this vision-capable chat model when the current chat model cannot see image pixels. Choose a model that accepts image input, such as GPT-4o, Gemini, Claude, or a VL model — not an image-generation model.
     </p>
     <Field label="Provider"><Select label="Image understanding provider" value={draft.provider ?? ''} onChange={(value) => { setNotice(null); setDraft({ provider: value === '' ? null : value, model: null }) }} options={[{ value: '', label: 'Not configured' }, ...providers.map((entry) => ({ value: entry.id, label: `${entry.name}${entry.enabled ? '' : ' (disabled)'}`, disabled: !entry.enabled }))]} /></Field>
-    {draft.provider !== null ? <Field label="Vision model" hint="Any concrete multimodal chat model ID is accepted."><TextInput aria-label="Image understanding model" list="vision-model-options" value={draft.model ?? ''} placeholder="e.g. gpt-4o / qwen3-vl-plus" spellCheck={false} onChange={(event) => { setNotice(null); setDraft({ ...draft, model: event.target.value === '' ? null : event.target.value }) }} /></Field> : null}
-    <datalist id="vision-model-options">{(provider?.models ?? []).map((model) => <option key={model} value={model} />)}</datalist>
+    {draft.provider !== null ? <Field label="Vision model" hint={provider !== undefined && provider.models.length === 0 ? 'Enter a concrete multimodal model ID.' : undefined}>{provider !== undefined && provider.models.length === 0
+      ? <TextInput aria-label="Image understanding model" value={draft.model ?? ''} placeholder="e.g. gpt-4o / qwen3-vl-plus" spellCheck={false} onChange={(event) => { setNotice(null); setDraft({ ...draft, model: event.target.value === '' ? null : event.target.value }) }} />
+      : <Select label="Image understanding model" value={draft.model ?? ''} onChange={(value) => { setNotice(null); setDraft({ ...draft, model: value === '' ? null : value }) }} options={[{ value: '', label: 'Select model' }, ...(provider?.models ?? []).map((model) => ({ value: model, label: model }))]} />}</Field> : null}
     {error !== null ? <p role="alert" className="m-0 text-sm text-bad">{error}</p> : null}
     {notice !== null ? <p role="status" className="m-0 text-sm text-ok">{notice}</p> : null}
     <div className="flex gap-2">

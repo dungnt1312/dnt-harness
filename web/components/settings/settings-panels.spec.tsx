@@ -2,7 +2,7 @@
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cloneAgentToWorkspace, readAgentFile, deleteMcpServer, listAgentDefinitions, duplicateModeFile, fetchProviderModels, getMcpServer, getModeFile, getSystemPrompts, HttpError, importAgentDefinition, importMcpServers, listModeFiles, listModes, putSystemPrompts, saveModeFile, setModeEnabled, testProvider, upsertMcpServer } from '../../lib/api.ts'
+import { cloneAgentToWorkspace, readAgentFile, deleteMcpServer, listAgentDefinitions, duplicateModeFile, fetchProviderModels, getImageGenerationSettings, getImageUnderstandingSettings, getMcpServer, getModeFile, getSystemPrompts, HttpError, importAgentDefinition, importMcpServers, listModeFiles, listModes, putSystemPrompts, saveModeFile, setModeEnabled, testProvider, upsertMcpServer } from '../../lib/api.ts'
 import { emptyModeForm, parseModeForm, permissionKeyError, serializeModeForm } from '../../lib/mode-form.ts'
 import { McpPanel } from './McpPanel.tsx'
 import { AgentsPanel, definitionDocument } from './AgentsPanel.tsx'
@@ -124,10 +124,8 @@ describe('MCP panel', () => {
   it('lists each tool the server discovered and marks names the allowlist hides', async () => {
     await act(async () => root.render(<McpPanel workspaceId="ws" />))
     await settle()
-    // The tool list folds behind a one-line exposure summary.
+    // Tools are listed flat — no disclosure to open first.
     expect(document.body.textContent).toContain('1 exposed by the allowlist · 1 hidden')
-    expect(document.querySelector('[aria-label="Tools from fs"]')).toBeNull()
-    await act(async () => buttons().find((node) => node.textContent?.startsWith('2 tools') === true)!.click())
     const list = document.querySelector('[aria-label="Tools from fs"]')
     expect(list?.textContent).toContain('query')
     expect(list?.textContent).toContain('explode hidden')
@@ -583,27 +581,41 @@ describe('settings dialog', () => {
     const sections = [...document.body.querySelectorAll('[aria-label="Settings sections"] [role="tab"]')]
     expect(sections).toHaveLength(11)
     const sub = [...document.body.querySelectorAll('[aria-label="Providers & Models"] [role="tab"]')]
-    expect(sub.map((tab) => tab.textContent)).toEqual(['Providers', 'Model aliases', 'Image generation', 'Image understanding'])
+    expect(sub.map((tab) => tab.textContent)).toEqual(['Providers', 'Model aliases', 'Images'])
     for (const tab of [...sections, ...sub]) expect(tab.querySelector('svg')).not.toBeNull()
   })
 
-  it('keeps providers, model aliases, and image generation as sub-tabs of one section', async () => {
+  it('keeps providers, model aliases, and both image settings as sub-tabs of one section', async () => {
     await render()
     const subTab = (name: string): HTMLElement =>
       [...document.body.querySelectorAll<HTMLElement>('[aria-label="Providers & Models"] [role="tab"]')].find((node) => node.textContent === name)!
     // The provider editor and its footer belong to the Providers sub-tab only.
     expect(input('Name').value).toBe('local')
     expect(button('Save changes')).toBeTruthy()
-    await act(async () => subTab('Image generation').click())
-    expect(subTab('Image generation').getAttribute('aria-selected')).toBe('true')
+    await act(async () => subTab('Images').click())
+    expect(subTab('Images').getAttribute('aria-selected')).toBe('true')
+    expect(document.body.querySelector('[aria-label="Image settings"]')).not.toBeNull()
     expect(document.body.querySelector('[aria-label="Image generation"]')).not.toBeNull()
-    expect([...document.body.querySelectorAll('button')].some((node) => node.textContent === 'Save changes')).toBe(false)
-    await act(async () => subTab('Image understanding').click())
     expect(document.body.querySelector('[aria-label="Image understanding"]')).not.toBeNull()
+    expect([...document.body.querySelectorAll('button')].some((node) => node.textContent === 'Save changes')).toBe(false)
     await act(async () => subTab('Model aliases').click())
     expect(document.body.querySelector('[aria-label="Model alias editor"]')).not.toBeNull()
     await act(async () => subTab('Providers').click())
     expect(input('Name').value).toBe('local')
+  })
+
+  it('uses the model-alias selector contract for both image settings', async () => {
+    vi.mocked(getImageGenerationSettings).mockResolvedValueOnce({ provider: 'p1', model: 'auto' })
+    vi.mocked(getImageUnderstandingSettings).mockResolvedValueOnce({ provider: 'p1', model: 'auto' })
+    await render()
+    const images = [...document.body.querySelectorAll<HTMLElement>('[aria-label="Providers & Models"] [role="tab"]')].find((node) => node.textContent === 'Images')!
+    await act(async () => images.click())
+    await settle()
+
+    expect(document.body.querySelector('input[aria-label="Image model"]')).toBeNull()
+    expect(document.body.querySelector('input[aria-label="Image understanding model"]')).toBeNull()
+    expect(button('Image model')).toBeTruthy()
+    expect(button('Image understanding model')).toBeTruthy()
   })
 
   it('states the provider name once, as the editable title, with enablement as state plus a verb', async () => {

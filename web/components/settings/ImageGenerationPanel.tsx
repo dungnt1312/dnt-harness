@@ -61,20 +61,25 @@ export function ImageGenerationPanel({ providers }: { readonly providers: readon
         />
       </Field>
       {draft.provider !== null ? (
-        <Field label="Model" hint="Image models are often not in a provider's chat model list, so any model ID is accepted.">
-          <TextInput
-            aria-label="Image model"
-            list="image-model-options"
-            value={draft.model ?? ''}
-            placeholder="e.g. gpt-image-1"
-            spellCheck={false}
-            onChange={(event) => { setNotice(null); setDraft({ ...draft, model: event.target.value === '' ? null : event.target.value }) }}
-          />
+        <Field label="Model" hint={provider !== undefined && provider.models.length === 0 ? 'Enter a concrete image model ID.' : undefined}>
+          {provider !== undefined && provider.models.length === 0 ? (
+            <TextInput
+              aria-label="Image model"
+              value={draft.model ?? ''}
+              placeholder="e.g. gpt-image-1"
+              spellCheck={false}
+              onChange={(event) => { setNotice(null); setDraft({ ...draft, model: event.target.value === '' ? null : event.target.value }) }}
+            />
+          ) : (
+            <Select
+              label="Image model"
+              value={draft.model ?? ''}
+              onChange={(value) => { setNotice(null); setDraft({ ...draft, model: value === '' ? null : value }) }}
+              options={[{ value: '', label: 'Select model' }, ...(provider?.models ?? []).map((model) => ({ value: model, label: model }))]}
+            />
+          )}
         </Field>
       ) : null}
-      <datalist id="image-model-options">
-        {(provider?.models ?? []).map((model) => <option key={model} value={model} />)}
-      </datalist>
       {error !== null ? <p role="alert" className="m-0 text-sm text-bad">{error}</p> : null}
       {notice !== null ? <p role="status" className="m-0 text-sm text-ok">{notice}</p> : null}
       <div className="flex gap-2">

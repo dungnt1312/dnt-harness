@@ -81,7 +81,7 @@ describe('runtime provider UI helpers', () => {
       .map((match) => match[0].replace(/<[^>]+>/g, ''))
     expect(labels).toEqual(['Providers &amp; Models', 'Usage', 'Projects', 'Permissions', 'System Prompts', 'Skills', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets'])
     const subTabs = html.match(/<div role="tablist" aria-label="Providers &amp; Models"[\s\S]*?<\/div>/)?.[0] ?? ''
-    expect([...subTabs.matchAll(/<button[\s\S]*?<\/button>/g)].map((match) => match[0].replace(/<[^>]+>/g, ''))).toEqual(['Providers', 'Model aliases', 'Image generation', 'Image understanding'])
+    expect([...subTabs.matchAll(/<button[\s\S]*?<\/button>/g)].map((match) => match[0].replace(/<[^>]+>/g, ''))).toEqual(['Providers', 'Model aliases', 'Images'])
     expect(html).toContain('cliproxy1')
     // The model count belongs to the list it counts, not to the rail row too.
     expect(html).toContain('Model list')

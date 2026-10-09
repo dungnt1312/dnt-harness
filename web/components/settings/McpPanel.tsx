@@ -142,8 +142,8 @@ function toolExposed(allowed: readonly string[] | undefined, server: string, nam
 
 /**
  * Names the live server listed, and whether the saved allowlist exposes each
- * one. The full list folds behind a one-line count so a server with dozens of
- * tools does not turn its row into a wall of badges; warnings stay visible.
+ * one. Shown flat — a collapsed box around a handful of badges read as chrome
+ * with nothing behind it. Warnings stay visible beside the badges.
  */
 function DiscoveredTools({ row }: { readonly row: McpServerRow }) {
   const tools = row.discoveredTools ?? []
@@ -155,16 +155,13 @@ function DiscoveredTools({ row }: { readonly row: McpServerRow }) {
   return (
     <div className="flex min-w-0 flex-col gap-1.5">
       {tools.length > 0 ? (
-        <Disclosure
-          summary={
-            <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-              <span>{tools.length} {tools.length === 1 ? 'tool' : 'tools'}</span>
-              <span className="text-xs font-normal text-fg-faint">
-                {restricted ? `${exposedCount} exposed by the allowlist · ${tools.length - exposedCount} hidden` : 'all exposed'}
-              </span>
+        <>
+          <p className="m-0 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[13px] font-medium">
+            <span>{tools.length} {tools.length === 1 ? 'tool' : 'tools'}</span>
+            <span className="text-xs font-normal text-fg-faint">
+              {restricted ? `${exposedCount} exposed by the allowlist · ${tools.length - exposedCount} hidden` : 'all exposed'}
             </span>
-          }
-        >
+          </p>
           <ul aria-label={`Tools from ${row.name}`} className="m-0 flex list-none flex-wrap gap-1 p-0">
             {tools.map((name) => {
               const exposed = toolExposed(allowed, row.name, name)
@@ -181,7 +178,7 @@ function DiscoveredTools({ row }: { readonly row: McpServerRow }) {
               )
             })}
           </ul>
-        </Disclosure>
+        </>
       ) : null}
       {row.unmatchedAllowlist !== undefined && row.unmatchedAllowlist.length > 0 ? (
         <p className="m-0 text-xs text-warn">Allowlist names not on this server: {row.unmatchedAllowlist.join(', ')}</p>
@@ -364,7 +361,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
       actions={
         <>
           <IconButton label="Refresh servers" disabled={busy !== null} onClick={() => void refresh()}><Icon name="refresh" size={14} /></IconButton>
-          <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => guardDiscard(beginImport)}>Import…</Button>
+          <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => guardDiscard(beginImport)}>Import…</Button>
           <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => guardDiscard(beginAdd)}><Icon name="plus" size={13} />Add server</Button>
         </>
       }
