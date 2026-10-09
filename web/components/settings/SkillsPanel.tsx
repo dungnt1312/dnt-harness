@@ -64,11 +64,11 @@ interface ProjectSkillRows {
  * folders" is the rule editor ({@link FoldersEditor}). Grouping scans ALL
  * projects of the workspace: rules apply to every project, so no selector.
  */
-export function SkillsPanel(props: { readonly workspaceId: string | null }) {
+export function SkillsPanel(props: { readonly workspaceId: string | null; readonly onChanged?: () => void }) {
   return <SkillsPanelContent key={props.workspaceId} {...props} />
 }
 
-function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | null }) {
+function SkillsPanelContent({ workspaceId, onChanged = () => {} }: { readonly workspaceId: string | null; readonly onChanged?: () => void }) {
   const [tab, setTab] = useScopedState<PanelTab>('skills')
   const [notice, setNotice] = useScopedState<NoticeState>(null)
   const [rules, setRules] = useScopedState<readonly SkillRuleRow[]>([])
@@ -254,6 +254,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
       setDetail(null)
       setSelected(null)
       await refresh()
+      onChanged()
     } catch (cause) {
       if (!isConflict(cause)) throw cause
       setConflict(true)
@@ -268,6 +269,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
     setNotice(savedNotice(saved))
     setEditing(null)
     await refresh()
+    onChanged()
   })
 
   const reloadServer = (): Promise<void> => run('reload', async () => {
@@ -286,6 +288,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
     setSelected(null)
     setNotice({ kind: 'ok', text: `Deleted ${row.name}.` })
     await refresh()
+    onChanged()
   })
 
   const toggleCatalog = (row: SkillRow): Promise<void> => run(`catalog:${row.name}`, async () => {
@@ -298,6 +301,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
         : `${row.name} is back in the skill catalog.`,
     })
     await refresh()
+    onChanged()
   })
 
   const badgeTone = (source: SkillRow['source']): 'blue' | 'green' | 'gray' =>
@@ -584,7 +588,7 @@ function SkillsPanelContent({ workspaceId }: { readonly workspaceId: string | nu
           <FoldersEditor
             workspaceId={workspaceId}
             rules={rules}
-            onSaved={(saved) => { setRules(saved.rules); void refresh() }}
+            onSaved={(saved) => { setRules(saved.rules); void refresh(); onChanged() }}
             setNotice={setNotice}
           />
         </Section>

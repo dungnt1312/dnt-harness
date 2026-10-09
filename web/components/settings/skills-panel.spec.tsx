@@ -245,14 +245,19 @@ describe('SkillsPanel source folders tab', () => {
     expect([...document.body.querySelectorAll('[role="menuitem"]')].some((node) => node.textContent === 'Remove folder')).toBe(false)
   })
 
-  it('toggling a rule persists immediately via putSkillSources', async () => {
-    await openFolders()
+  it('toggling a rule persists immediately and notifies catalog consumers', async () => {
+    const onChanged = vi.fn()
+    await act(async () => root!.render(<SkillsPanel workspaceId="ws-1" onChanged={onChanged} />))
+    await settle()
+    const tab = [...document.body.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find((node) => node.textContent?.startsWith('Source folders'))!
+    await act(async () => tab.click())
     const box = document.body.querySelector<HTMLButtonElement>('[role="switch"][aria-label="Enable .agents/skills"]')!
     await act(async () => box.click())
     await settle()
     expect(mocked.putSkillSources).toHaveBeenCalledTimes(1)
     const rules = mocked.putSkillSources.mock.calls[0]?.[1] as readonly { id: string; enabled: boolean }[]
     expect(rules.find((rule) => rule.id === 'project-agents')?.enabled).toBe(false)
+    expect(onChanged).toHaveBeenCalledTimes(1)
   })
 
   it('reorder buttons move a rule up and persist the swapped order', async () => {

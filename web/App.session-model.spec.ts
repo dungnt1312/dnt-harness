@@ -1,5 +1,20 @@
 import { describe, expect, it } from 'vitest'
-import { ModelDefaultsCoordinator, SessionModelMutationQueue, sessionEffectiveControls, sessionModelKey } from './App.tsx'
+import { ModelDefaultsCoordinator, SessionModelMutationQueue, composerSkillRows, sessionEffectiveControls, sessionModelKey } from './App.tsx'
+
+describe('composer skill catalog scope', () => {
+  it('loads the catalog for the bound project so disabled source rules and project layers match context assembly', async () => {
+    const list = async (workspaceId: string, projectId?: string) => [{
+      name: `${workspaceId}:${projectId ?? 'workspace'}`,
+      title: 'skill',
+      description: '',
+      source: 'workspace' as const,
+      hash: 'h',
+    }]
+
+    await expect(composerSkillRows(list, 'ws-1', 'project-1')).resolves.toMatchObject([{ name: 'ws-1:project-1' }])
+    await expect(composerSkillRows(list, 'ws-1', null)).resolves.toMatchObject([{ name: 'ws-1:workspace' }])
+  })
+})
 
 describe('per-session model cache coordination', () => {
   it('uses workspace plus session as the cache address', () => {

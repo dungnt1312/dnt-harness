@@ -114,6 +114,15 @@ function ScopedComposer({ store, scope, ...props }: Omit<ComponentProps<typeof C
 
 export const sessionModelKey =(workspaceId: string, sessionId: string): string => `${workspaceId}:${sessionId}`
 
+/** Fetch the exact layered catalog the current composer/session will execute with. */
+export function composerSkillRows(
+  load: (workspaceId: string, projectId?: string) => Promise<SkillRow[]>,
+  workspaceId: string,
+  projectId: string | null,
+): Promise<SkillRow[]> {
+  return load(workspaceId, projectId ?? undefined)
+}
+
 /**
  * The conversation whose delegation the Subagents view lists: the open
  * conversation itself, or its parent while a subagent is open. Only this view
@@ -422,6 +431,7 @@ function AppShell() {
   // Skill catalog for the composer's `/` menu. A failure just leaves the menu
   // empty — it never interrupts a conversation.
   const [skills, setSkills] = useState<readonly SkillRow[]>([])
+  const [skillsRevision, setSkillsRevision] = useState(0)
   const [modeSelection, setModeSelection] = useState<{ modes: readonly { value: string; label: string }[]; selected: string | null }>({ modes: [], selected: null })
   const { preferences, patchPreferences } = useWorkbenchPreferences()
   const sidebarDocked = useMediaQuery(SIDEBAR_DOCK_QUERY)
@@ -987,16 +997,18 @@ function AppShell() {
     if (activeWs !== null && current !== null && currentParentSession === null) loadSessionMode(activeWs, current)
   }, [activeWs, current, currentParentSession, loadSessionMode])
 
-  // Skill catalog for the composer's `/` menu, per workspace.
+  // Skill catalog for the composer, resolved through the same project-bound
+  // source rules as Skill tool loads and prompt context assembly.
   useEffect(() => {
     setSkills([])
     if (activeWs === null) return
+    const projectId = workbenchProject?.id ?? null
     let cancelled = false
-    void listSkills(activeWs)
+    void composerSkillRows(listSkills, activeWs, projectId)
       .then((rows) => { if (!cancelled && workspaceRef.current === activeWs) setSkills(rows) })
       .catch(() => { /* an unavailable catalog only closes the menu */ })
     return () => { cancelled = true }
-  }, [activeWs])
+  }, [activeWs, workbenchProject?.id, skillsRevision])
 
   // Session whose manifest is currently on screen. A change means the user
   // switched conversations, which fetches at once; the same session refreshes
@@ -1892,6 +1904,7 @@ function AppShell() {
         activeProjectId={workbenchProject?.id ?? null}
         projects={projects}
         onProjectsChanged={refreshList}
+        onSkillsChanged={() => setSkillsRevision((revision) => revision + 1)}
         sessionCounts={sessionCounts}
         open={settingsOpen}
         workspaceId={activeWs}

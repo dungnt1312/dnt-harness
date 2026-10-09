@@ -49,6 +49,25 @@ describe('skill sources routes', () => {
     expect(after.rules).toMatchObject([{ id: 'claude', enabled: false }])
   })
 
+  it('disabling the absolute user source removes its skills from the catalog immediately', async () => {
+    const { base, home } = await start()
+    const wsId = await firstWorkspace(base)
+    const userDir = path.join(home, 'user-skills')
+    await fs.mkdir(path.join(userDir, 'global-only'), { recursive: true })
+    await fs.writeFile(path.join(userDir, 'global-only', 'SKILL.md'), '---\nname: global-only\ndescription: global\n---\n\nGLOBAL', 'utf8')
+    const catalog = async (): Promise<{ name: string }[]> =>
+      (await (await fetch(`${base}/api/workspaces/${wsId}/skills`)).json()) as { name: string }[]
+    expect((await catalog()).some((row) => row.name === 'global-only')).toBe(true)
+
+    const current = (await (await fetch(`${base}/api/workspaces/${wsId}/skills/sources`)).json()) as { rules: Array<{ id: string; kind: string; path?: string; enabled: boolean }> }
+    const put = await fetch(`${base}/api/workspaces/${wsId}/skills/sources`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ rules: current.rules.map((rule) => rule.id === 'user' ? { ...rule, enabled: false } : rule) }),
+    })
+    expect(put.status).toBe(200)
+    expect((await catalog()).some((row) => row.name === 'global-only')).toBe(false)
+  })
+
   it('PUT rejects malformed rule lists with 400', async () => {
     const { base } = await start()
     const wsId = await firstWorkspace(base)
@@ -336,10 +355,12 @@ async function readAllEvents(base: string, wsId: string, sessionId: string): Pro
 
 describe('Skill tool with project layers', () => {
   it('catalog and load resolve project-layer skills for a bound session', async () => {
+    const seen: string[] = []
     let step = 0
     const provider: LlmProvider = {
       name: 'scripted', models: ['scripted'],
-      async *stream() {
+      async *stream(request) {
+        seen.push(request.messages.map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content)).join('\n'))
         step += 1
         if (step === 1) {
           yield { type: 'toolCalls' as const, calls: [{ id: 'c1', name: 'Skill', args: { action: 'catalog' } }] }
@@ -373,6 +394,8 @@ describe('Skill tool with project layers', () => {
     expect(results[0]?.output).toContain('proj-skill [project]')
     expect(results[1]).toMatchObject({ ok: true })
     expect(results[1]?.output).toContain("skill 'proj-skill' loaded")
+    expect(seen[0]).toContain(path.join(home, 'workspaces', wsId, 'skills'))
+    expect(seen[0]).toContain('These locations are not filesystem grants')
   })
 
   it("a child definition's skills preload through the rule layers (project folder included)", async () => {
@@ -404,6 +427,7 @@ describe('Skill tool with project layers', () => {
     const handle = (await spawned.json()) as { childSessionId: string }
     await fetch(`${base}/api/workspaces/${wsId}/sessions/${rootSession.id}/children/${handle.childSessionId}?waitMs=8000`)
     expect(seen.some((text) => text.includes('PROJECT RECIPE BODY'))).toBe(true)
+    expect(seen.some((text) => text.includes('Harness authoring reference') && text.includes(path.join(home, 'workspaces', wsId, 'agents')))).toBe(true)
   }, 20_000)
 })
 })
