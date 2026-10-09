@@ -16,7 +16,7 @@
  * relative to the importing file, `~/` for home, or absolute. Depth 5, every
  * file loaded at most once (cycles end silently), bounded size.
  */
-import { promises as fs } from 'node:fs'
+import { constants, promises as fs } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 
@@ -59,7 +59,7 @@ export interface ClaudeMdSources {
 async function readBounded(file: string, limit: number): Promise<{ text: string; size: number } | undefined> {
   let handle: fs.FileHandle | undefined
   try {
-    handle = await fs.open(file, 'r')
+    handle = await fs.open(file, constants.O_RDONLY | (process.platform === 'win32' ? 0 : constants.O_NONBLOCK))
     const stat = await handle.stat()
     if (!stat.isFile()) return undefined
     const want = Math.max(0, Math.min(limit, stat.size))

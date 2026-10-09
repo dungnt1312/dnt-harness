@@ -138,6 +138,32 @@ describe('system prompt overrides', () => {
     expect(view.base.overridden).toBe(false)
   })
 
+  it('a system-prompts.json FIFO is ignored without blocking chat', async () => {
+    if (process.platform === 'win32') return
+    let calls = 0
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() {
+        calls += 1
+        yield { type: 'delta', delta: 'ok' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const server = await start([provider])
+    const base = server.url
+    const wsId = (await workspaceIds(base))[0]!
+    const home = serverHomes.get(server)!
+    const workspaceDir = path.join(home, 'workspaces', wsId)
+    await fs.mkdir(workspaceDir, { recursive: true })
+    const { execFile } = await import('node:child_process')
+    await new Promise<void>((resolve, reject) => execFile('mkfifo', [path.join(workspaceDir, 'system-prompts.json')], (error) => error === null ? resolve() : reject(error)))
+    const session = await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' }).then((response) => response.json()) as { id: string }
+    await fetch(`${base}/api/workspaces/${wsId}/sessions/${session.id}/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'hello' }),
+    })
+    await expect.poll(() => calls, { timeout: 1_000 }).toBe(1)
+  })
+
   it('an unknown workspace 404s and a corrupt file degrades to defaults with a warning', async () => {
     const server = await start([])
     const base = server.url

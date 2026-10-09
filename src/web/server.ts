@@ -1271,6 +1271,15 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     const key = mcpTurnKey(scope)
     return key !== undefined && mcpDisabledTurns.has(key)
   }
+  const disableMcpForTurn = async (scope: AgentScope | undefined, workspaceId: WorkspaceId, error: unknown): Promise<void> => {
+    const turnKey = mcpTurnKey(scope)
+    if (turnKey !== undefined) mcpDisabledTurns.add(turnKey)
+    await fenceWorkspace(workspaceId).catch(() => undefined)
+    for (const key of mcpDescriptors.keys()) {
+      if (key.startsWith(`${workspaceId}:mcp__`)) mcpDescriptors.delete(key)
+    }
+    console.warn(`web: workspace MCP unavailable in ${workspaceId}; chat continues without MCP tools: ${String(error instanceof Error ? error.message : error)}`)
+  }
   kernel.ctx.on('agent/turn-settled', () => {
     const key = mcpTurnKey(agentScope.getStore())
     if (key !== undefined) mcpDisabledTurns.delete(key)
@@ -1287,13 +1296,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     try {
       await connectWorkspaceMcp(workspaceId)
     } catch (error) {
-      const turnKey = mcpTurnKey(scope)
-      if (turnKey !== undefined) mcpDisabledTurns.add(turnKey)
-      await fenceWorkspace(workspaceId).catch(() => undefined)
-      for (const key of mcpDescriptors.keys()) {
-        if (key.startsWith(`${workspaceId}:mcp__`)) mcpDescriptors.delete(key)
-      }
-      console.warn(`web: workspace MCP unavailable in ${workspaceId}; chat continues without MCP tools: ${String(error instanceof Error ? error.message : error)}`)
+      await disableMcpForTurn(scope, workspaceId, error)
     }
     const contents = [...claim.contents]
     // Claude: UserPromptSubmit fires for the user's prompt; a subagent's
@@ -2532,10 +2535,18 @@ ${entry.description}`.toLowerCase().includes(query))
     // allowlist only; Explorer none; other children require explicit spawn
     // grant).
     const exposureScope = { ...(scope ?? { sessionId: undefined }), workspaceId }
-    const projectedTools = mcpDisabledForTurn(scope)
+    let projectedTools = mcpDisabledForTurn(scope)
       ? (projected.tools ?? []).filter((schema) => !schema.name.startsWith('mcp__'))
       : projected.tools ?? []
-    const exposureSnapshot = await executionAuthority.snapshot(exposureScope, workspaceId, projectedTools.some((schema) => schema.name.startsWith('mcp__')))
+    let exposureSnapshot
+    try {
+      exposureSnapshot = await executionAuthority.snapshot(exposureScope, workspaceId, projectedTools.some((schema) => schema.name.startsWith('mcp__')))
+    } catch (error) {
+      if (!projectedTools.some((schema) => schema.name.startsWith('mcp__'))) throw error
+      await disableMcpForTurn(scope, workspaceId, error)
+      projectedTools = projectedTools.filter((schema) => !schema.name.startsWith('mcp__'))
+      exposureSnapshot = await executionAuthority.snapshot(exposureScope, workspaceId, false)
+    }
     let exposed = projectExposedSchemas(exposureSnapshot, exposureScope, projectedTools)
     // Workspace-level instructions load for ANY workspace-scoped session;
     // project instructions join when a project is bound.

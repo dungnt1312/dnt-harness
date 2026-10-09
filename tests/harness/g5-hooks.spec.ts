@@ -151,6 +151,16 @@ describe('verdicts (Claude output contract)', () => {
     expect((await verdict('Stop', 'stop')).stop?.reason).toBe('fixture stopped')
   })
 
+  it('treats shell syntax errors as failures, not intentional exit-2 blocks', async () => {
+    if (process.platform === 'win32') return
+    const outcome = await runHook({ command: 'echo "unterminated' }, {})
+    expect(outcome.exitCode).toBe(2)
+    const result = interpretHooks('UserPromptSubmit', [outcome])
+    expect(result.block).toBeUndefined()
+    expect(result.userMessages.join('\n')).toMatch(/syntax|unterminated|quote/i)
+    expect((await verdict('UserPromptSubmit', 'block')).block?.reason).toContain('blocked by fixture')
+  })
+
   it('non-blocking errors and non-blockable exit 2 only reach the user', async () => {
     const failed = await verdict('PreToolUse', 'fail')
     expect(failed.block).toBeUndefined()

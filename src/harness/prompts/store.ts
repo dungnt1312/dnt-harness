@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { promises as fs } from 'node:fs'
+import { constants, promises as fs } from 'node:fs'
 import path from 'node:path'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
 import { DEFAULT_BASE_SYSTEM, DEFAULT_CHILD_SYSTEM } from '../context/builder.ts'
@@ -107,11 +107,16 @@ export class SystemPromptsStore {
 
   private async readFile(filePath: string): Promise<ReadResult> {
     let raw: string
+    let handle: fs.FileHandle | undefined
     try {
-      raw = await fs.readFile(filePath, 'utf8')
+      handle = await fs.open(filePath, constants.O_RDONLY | (process.platform === 'win32' ? 0 : constants.O_NONBLOCK))
+      if (!(await handle.stat()).isFile()) return { kind: 'missing' }
+      raw = await handle.readFile('utf8')
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'missing' }
       throw error
+    } finally {
+      await handle?.close().catch(() => undefined)
     }
     try {
       const config = parseConfig(JSON.parse(raw))

@@ -38,6 +38,19 @@ describe('CLAUDE.md layers', () => {
     expect(text).toContain(`Contents of ${path.join(project, 'CLAUDE.md')} (project instructions)`)
   })
 
+  it('skips a CLAUDE.md FIFO without waiting for a writer', async () => {
+    if (process.platform === 'win32') return
+    const project = path.join(home, 'repo')
+    await fs.mkdir(project, { recursive: true })
+    const fifo = path.join(project, 'CLAUDE.md')
+    const { execFile } = await import('node:child_process')
+    await new Promise<void>((resolve, reject) => execFile('mkfifo', [fifo], (error) => error === null ? resolve() : reject(error)))
+    await expect(Promise.race([
+      loadClaudeMd({ projectRoot: project, home }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('FIFO read hung')), 500)),
+    ])).resolves.toEqual([])
+  })
+
   it('reads AGENTS.md only where no CLAUDE.md exists', async () => {
     const project = path.join(home, 'repo')
     await write(path.join(project, 'AGENTS.md'), 'AGENTS ONLY')

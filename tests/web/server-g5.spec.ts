@@ -191,6 +191,46 @@ describe('G5 web MCP + hooks', () => {
     expect(events.some((event) => event.type === 'turn/end' && event.reason === 'completed')).toBe(true)
   }, 15_000)
 
+  it('keeps later model steps alive when mcp.json becomes invalid mid-turn', async () => {
+    const requests: { tools: string[] }[] = []
+    let configFile = ''
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream(request) {
+        requests.push({ tools: request.tools?.map((tool) => tool.name) ?? [] })
+        if (requests.length === 1) {
+          await fs.writeFile(configFile, '{ broken', 'utf8')
+          yield { type: 'toolCalls', calls: [{ id: 'g1', name: 'Glob', args: { pattern: '*' } }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+          return
+        }
+        yield { type: 'delta', delta: 'continued without MCP' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const { home, base, wsId } = await boot(provider)
+    configFile = path.join(home, 'workspaces', wsId, 'mcp.json')
+    await post(base, `/api/workspaces/${wsId}/mcp/fixture`, {
+      transport: 'stdio', command: process.execPath, args: [mcpFixture], enabled: true, allowedTools: ['query'],
+    })
+    await post(base, `/api/workspaces/${wsId}/mcp/fixture/enable`)
+    await fetch(`${base}/api/workspaces/${wsId}/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: 'full-access' }) })
+    const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'use a built-in tool' })
+
+    let events: Record<string, any>[] = []
+    for (let i = 0; i < 50; i++) {
+      events = await sessionEvents(base, wsId, session.id)
+      if (events.some((event) => event.type === 'turn/end')) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    expect(requests).toHaveLength(2)
+    expect(requests[0]?.tools).toContain('mcp__fixture__query')
+    expect(requests[1]?.tools.some((name) => name.startsWith('mcp__'))).toBe(false)
+    expect(events.some((event) => event.type === 'assistant/message' && event.content === 'continued without MCP')).toBe(true)
+    expect(events.find((event) => event.type === 'turn/end')?.reason).toBe('completed')
+  }, 15_000)
+
   it('requiresUserInteraction always asks even exact and wildcard policies say allow', async () => {
     let step = 0
     const provider: LlmProvider = {

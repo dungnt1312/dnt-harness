@@ -32,6 +32,8 @@ export interface HookRunOptions {
 export interface HookOutcome {
   readonly command: string
   readonly exitCode: number | null
+  /** The shell could not parse the command, so exit 2 is not a hook decision. */
+  readonly syntaxError?: boolean
   readonly stdout: string
   readonly stderr: string
   /** Parsed stdout when it is a JSON object (exit 0 only, per Claude). */
@@ -40,10 +42,32 @@ export interface HookOutcome {
   readonly timedOut: boolean
 }
 
+function shellSyntaxError(command: string, signal?: AbortSignal): Promise<boolean> {
+  if (process.platform === 'win32' || signal?.aborted === true) return Promise.resolve(false)
+  return new Promise((resolve) => {
+    const checked = spawn('/bin/sh', ['-n', '-c', command], { stdio: 'ignore', windowsHide: true })
+    let settled = false
+    const finish = (invalid: boolean): void => {
+      if (settled) return
+      settled = true
+      signal?.removeEventListener('abort', cancel)
+      resolve(invalid)
+    }
+    const cancel = (): void => {
+      checked.kill('SIGKILL')
+      finish(false)
+    }
+    signal?.addEventListener('abort', cancel, { once: true })
+    checked.on('error', () => finish(false))
+    checked.on('close', (code) => finish(code !== 0))
+  })
+}
+
 /** Run one hook command with `input` on stdin. Never throws; spawn failures are non-blocking errors. */
-export function runHook(hook: Pick<ResolvedHook, 'command' | 'timeout'>, input: Record<string, unknown>, options: HookRunOptions = {}): Promise<HookOutcome> {
+export async function runHook(hook: Pick<ResolvedHook, 'command' | 'timeout'>, input: Record<string, unknown>, options: HookRunOptions = {}): Promise<HookOutcome> {
   const started = Date.now()
   const timeoutMs = Math.round((hook.timeout ?? DEFAULT_HOOK_TIMEOUT_SECONDS) * 1000)
+  const syntaxError = await shellSyntaxError(hook.command, options.signal)
   return new Promise<HookOutcome>((resolve) => {
     let settled = false
     let stderr = ''
@@ -59,6 +83,7 @@ export function runHook(hook: Pick<ResolvedHook, 'command' | 'timeout'>, input: 
       resolve({
         command: hook.command,
         exitCode,
+        ...(syntaxError ? { syntaxError: true } : {}),
         stdout,
         stderr,
         ...(json !== undefined ? { json } : {}),
@@ -180,7 +205,8 @@ export function interpretHooks(event: ClaudeHookEvent, outcomes: readonly HookOu
   for (const outcome of outcomes) {
     if (outcome.exitCode === 2) {
       const reason = outcome.stderr.trim() !== '' ? outcome.stderr.trim() : `hook '${outcome.command}' exited 2`
-      if (BLOCKABLE.has(event)) blockReasons.push(reason)
+      if (outcome.syntaxError === true) userMessages.push(`hook '${outcome.command}' has invalid shell syntax${outcome.stderr.trim() !== '' ? `: ${outcome.stderr.trim()}` : ''}`)
+      else if (BLOCKABLE.has(event)) blockReasons.push(reason)
       else userMessages.push(reason)
       continue
     }
