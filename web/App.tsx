@@ -3,7 +3,7 @@ import { Generation, composerKey, emptyComposer, acceptedDraft, freshRequestId, 
 import { ComposerStore, useComposerSlice } from './lib/composer-store.ts'
 import { draftAttachments, draftIsEmpty, draftText, messageDraft, textDraft, type AttachmentRef, type RichDraft } from './lib/composer-draft.ts'
 import type { ChipSegment } from './lib/inline-chips.ts'
-import { parseRoute, routePath, sessionRoute, workspaceRoute, type AppRoute } from './lib/route.ts'
+import { automationsRoute, parseRoute, routePath, sessionRoute, workspaceRoute, type AppRoute } from './lib/route.ts'
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
 import {
   answerApproval,
@@ -86,6 +86,7 @@ import { ModelMenu } from './components/composer/ModelMenu.tsx'
 import { ContextMeter } from './components/composer/ContextMeter.tsx'
 import { SessionFoldersChip } from './components/composer/SessionFoldersChip.tsx'
 import { FolderPickerModal } from './components/composer/FolderPickerModal.tsx'
+import { AutomationsView, type AutomationControlsContext } from './components/automations/AutomationsView.tsx'
 import ConfirmDialog from './components/common/ConfirmDialog.tsx'
 import type { ContextManifestView, SessionModeSelection } from './lib/api.ts'
 import { builtinCommandIn, draftIsOnlyCommand, type CompletionItem } from './lib/composer-completion.ts'
@@ -301,6 +302,8 @@ function AppShell() {
   useKeyboardInset()
   const initialRoute = useRef<AppRoute | null>(parseRoute(window.location.pathname))
   const routeRef = useRef<AppRoute | null>(initialRoute.current)
+  /** Non-null while the main column shows Automations (driven by the route). */
+  const [automationsView, setAutomationsView] = useState<{ readonly automationId?: string } | null>(null)
   const [workspaces, setWorkspaces] = useState<readonly WorkspaceRow[]>([])
   const [activeWs, setActiveWs] = useState<string | null>(null)
   const [sessions, setSessions] = useState<readonly SessionListing[]>([])
@@ -779,6 +782,8 @@ function AppShell() {
     const path = routePath(route)
     if (window.location.pathname !== path) window.history[mode === 'push' ? 'pushState' : 'replaceState'](null, '', path)
     routeRef.current = route
+    // Every navigation passes here, so the Automations view follows the route.
+    setAutomationsView(route.kind === 'automations' ? { ...(route.automationId !== undefined ? { automationId: route.automationId } : {}) } : null)
   }, [])
 
   const applyRoute = useCallback((route: AppRoute | null, rows: readonly WorkspaceRow[], mode: 'push' | 'replace') => {
@@ -807,8 +812,9 @@ function AppShell() {
     // effect, a popstate to the same place) must not bump the navigation
     // token: that would discard the workspace load already in flight, and
     // with `activeWs` unchanged nothing would ever reload it.
+    const target = route?.kind === 'session' || route?.kind === 'automations' ? route : workspaceRoute(workspace.id)
     if (workspaceRef.current === workspace.id && currentRef.current === sessionId) {
-      navigate(route?.kind === 'session' ? route : workspaceRoute(workspace.id), mode)
+      navigate(target, mode)
       return
     }
     navigation.current.next()
@@ -817,7 +823,7 @@ function AppShell() {
     setPendingDelete(null)
     setActiveWs(workspace.id)
     setCurrent(sessionId)
-    navigate(route?.kind === 'session' ? route : workspaceRoute(workspace.id), mode)
+    navigate(target, mode)
   }, [navigate])
 
   /** Register the picker's confirmed folder and scope the draft to it. */
@@ -1439,8 +1445,28 @@ function AppShell() {
   const retryFailedTurn = useCallback((target: RetryTarget) => void retryTurn(target), [retryTurn])
   const sendQueuedNow = useCallback(() => void sendNow(), [sendNow])
 
+  /** Automations view navigation; `undefined` is the list. */
+  const openAutomations = useCallback((automationId?: string) => {
+    if (activeWs === null) return
+    navigation.current.next()
+    setCurrent(null)
+    navigate(automationsRoute(activeWs, automationId))
+    if (!sidebarDocked) setSidebarOpen(false)
+  }, [activeWs, navigate, sidebarDocked])
+  const openAutomationsList = useCallback(() => openAutomations(), [openAutomations])
+  const automationContext = useMemo<AutomationControlsContext>(() => ({
+    projects,
+    modes: modeSelection.modes,
+    defaultModeId: modeSelection.selected,
+    modelOptions: availableModelOptions,
+    providers: meta?.providers ?? [],
+    defaults: modelDefaults,
+  }), [projects, modeSelection, availableModelOptions, meta, modelDefaults])
+
   const sidebar = (
     <Sidebar
+      onOpenAutomations={openAutomationsList}
+      automationsActive={automationsView !== null}
       sessions={sessions}
       projects={projects}
       current={current}
@@ -1726,7 +1752,16 @@ function AppShell() {
             } : {})}
           />
 
-          {current === null ? (
+          {automationsView !== null && activeWs !== null ? (
+            <AutomationsView
+              workspaceId={activeWs}
+              automationId={automationsView.automationId}
+              context={automationContext}
+              onNavigate={openAutomations}
+              onOpenSession={openSession}
+              notify={toast.notify}
+            />
+          ) : current === null ? (
             <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 sm:px-6">
               <div className="m-auto flex w-full max-w-3xl flex-col gap-5 pb-[8dvh] pt-6">
                 <div className="flex flex-col items-center gap-2 text-center">

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseRoute, routePath, sessionRoute, workspaceRoute } from './route.ts'
+import { automationsRoute, parseRoute, routePath, sessionRoute, workspaceRoute } from './route.ts'
 
 describe('browser routes', () => {
   it('parses the canonical root, workspace, and conversation routes', () => {
@@ -19,6 +19,13 @@ describe('browser routes', () => {
       '/workspaces/%E0%A4%A/sessions/session',
       '/settings',
     ]) expect(parseRoute(pathname)).toBeNull()
+  })
+
+  it('parses and serializes the Automations routes', () => {
+    expect(parseRoute('/workspaces/work/automations')).toEqual(automationsRoute('work'))
+    expect(parseRoute('/workspaces/work/automations/new')).toEqual(automationsRoute('work', 'new'))
+    expect(parseRoute('/workspaces/work/automations/a/extra')).toBeNull()
+    expect(routePath(automationsRoute('a b', 'auto-1'))).toBe('/workspaces/a%20b/automations/auto-1')
   })
 
   it('serializes routes as root-relative encoded canonical paths', () => {

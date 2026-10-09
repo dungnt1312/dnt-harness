@@ -1143,6 +1143,24 @@ describe('sidebar sections + live rows + workspace management', () => {
     expect(host.textContent).toContain('Unrelated title')
     expect(host.textContent).not.toContain('Auth refactor')
   })
+  it('gathers scheduled runs in an Automations group above the folders', async () => {
+    const list = [
+      ...sessions,
+      { id: 'a1', title: 'Pills run', automationId: 'auto-1', status: 'idle' as const, pendingInputs: 0, ...base },
+      { id: 'a2', title: 'Logs run', projectId: 'p1', automationId: 'auto-2', status: 'idle' as const, pendingInputs: 0, ...base },
+    ]
+    await mount(<SessionList sessions={list} projects={[project]} current={null} filter="" liveRunning={false} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} />)
+    const text = host.textContent ?? ''
+    expect(text.indexOf('Automations')).toBeGreaterThan(-1)
+    expect(text.indexOf('Automations')).toBeLessThan(text.indexOf('Acme'))
+    // Runs show once, inside the group (not again in their project or the timeline).
+    expect(text.indexOf('Logs run')).toBeLessThan(text.indexOf('Acme'))
+    expect(text.split('Pills run').length).toBe(2)
+    expect(text.split('Logs run').length).toBe(2)
+    await act(async () => button('Automations').click())
+    expect(host.textContent).not.toContain('Pills run')
+    expect(host.textContent).toContain('Loose chat')
+  })
   it('marks a folder with a terminal icon while a shell is open in it', async () => {
     await mount(<SessionList sessions={[...sessions]} projects={[project]} current={null} filter="" liveRunning={false} terminalProjects={new Set(['p1'])} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} />)
     expect(host.querySelector('span[title="Terminal or background process active in this folder"]')).not.toBeNull()

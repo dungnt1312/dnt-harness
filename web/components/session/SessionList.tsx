@@ -156,6 +156,8 @@ const BUCKET_LABELS: Readonly<Record<'today' | 'yesterday' | 'earlier', string>>
 const BUCKET_ORDER = ['today', 'yesterday', 'earlier', 'none'] as const
 /** Rows shown per folder before "Show more" takes over; matches the sidebar reference. */
 const FOLDER_PREVIEW_COUNT = 5
+/** Collapse/"Show more" key of the Automations group (never a project id). */
+const AUTOMATIONS_GROUP = '__automations__'
 
 function bucketed(sessions: readonly SessionListing[]): readonly (readonly [typeof BUCKET_ORDER[number], readonly SessionListing[]])[] {
   const buckets = new Map<typeof BUCKET_ORDER[number], SessionListing[]>()
@@ -282,10 +284,45 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
   // Pinned conversations lead the whole list, whatever folder or day they
   // belong to — that is what pinning them was for.
   const pinned = shown.filter((session) => session.pinned === true)
-  const rest = pinned.length > 0 ? shown.filter((session) => session.pinned !== true) : shown
+  const unpinned = pinned.length > 0 ? shown.filter((session) => session.pinned !== true) : shown
   const pinnedBlock = pinned.length > 0 ? <div><GroupHead>Pinned</GroupHead>{rows(pinned)}</div> : null
+  // Scheduled runs gather in one Automations group right below Pinned, so a
+  // result is always in the same place whatever folder the task runs in.
+  const automationRuns = unpinned.filter((session) => session.automationId !== undefined)
+  const rest = automationRuns.length > 0 ? unpinned.filter((session) => session.automationId === undefined) : unpinned
+  const automationsBlock = automationRuns.length > 0 ? (() => {
+    const isCollapsed = collapsedState[AUTOMATIONS_GROUP] === true
+    const expanded = expandedState[AUTOMATIONS_GROUP] === true || query !== ''
+    const cut = expanded ? automationRuns.length : FOLDER_PREVIEW_COUNT
+    const openAt = current !== null ? automationRuns.findIndex((session) => session.id === current) : -1
+    const visible = openAt >= cut ? [...automationRuns.slice(0, cut), automationRuns[openAt]!] : automationRuns.slice(0, cut)
+    const running = automationRuns.some((session) => (session.status ?? 'idle') === 'running')
+    return (
+      <Collapsible.Root open={!isCollapsed} onOpenChange={(open) => setFolderCollapsed(AUTOMATIONS_GROUP, !open)} className="mt-1.5 first:mt-1">
+        <Collapsible.Trigger className="flex min-h-9 w-full min-w-0 items-center gap-2 rounded-lg px-2.5 text-left text-sm font-medium hover:bg-hover">
+          <Icon name="calendarClock" size={15} className="shrink-0 text-fg-muted" />
+          <span className="min-w-0 flex-1 truncate">Automations</span>
+          {running ? <Spinner size={12} /> : null}
+          <span className="shrink-0 text-xs font-normal text-fg-faint">{automationRuns.length}</span>
+        </Collapsible.Trigger>
+        <Collapsible.Content className="mt-0.5 ml-3 pl-1.5">
+          {rows(visible)}
+          {automationRuns.length > FOLDER_PREVIEW_COUNT && query === '' ? (
+            <button
+              type="button"
+              aria-expanded={expanded}
+              onClick={() => setFolderExpanded(AUTOMATIONS_GROUP, !expanded)}
+              className="mt-0.5 rounded-lg px-2.5 py-1 text-xs text-fg-faint hover:bg-hover hover:text-fg"
+            >
+              {expanded ? 'Show less' : 'Show more'}
+            </button>
+          ) : null}
+        </Collapsible.Content>
+      </Collapsible.Root>
+    )
+  })() : null
 
-  if (projects.length === 0) return <div className="flex flex-col">{pinnedBlock}{timeline(rest)}</div>
+  if (projects.length === 0) return <div className="flex flex-col">{pinnedBlock}{automationsBlock}{timeline(rest)}</div>
 
   const loose = rest.filter((session) => session.projectId === undefined || session.projectId === null)
   const orderIds = projects.map((project) => project.id)
@@ -330,6 +367,7 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
   return (
     <div className="flex flex-col">
       {pinnedBlock}
+      {automationsBlock}
       {projects.map((project) => {
         const projectSessions = rest.filter((session) => session.projectId === project.id)
         if (projectSessions.length === 0) return null

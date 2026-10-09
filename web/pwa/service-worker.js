@@ -83,3 +83,49 @@ self.addEventListener('fetch', (event) => {
     )
   }
 })
+
+/**
+ * Web Push from the host (automation results, approvals waiting). The payload
+ * is `{ title, body, url, tag }`; `url` is a same-origin app path.
+ */
+self.addEventListener('push', (event) => {
+  let data = {}
+  try {
+    data = event.data ? event.data.json() : {}
+  } catch {
+    data = { body: event.data ? event.data.text() : '' }
+  }
+  const title = typeof data.title === 'string' && data.title !== '' ? data.title : 'dnt-harness'
+  event.waitUntil(
+    self.registration.showNotification(title, {
+      body: typeof data.body === 'string' ? data.body : '',
+      tag: typeof data.tag === 'string' ? data.tag : undefined,
+      icon: '/icons/icon-192.png',
+      badge: '/icons/icon-192.png',
+      data: { url: typeof data.url === 'string' && data.url.startsWith('/') ? data.url : '/' },
+    }),
+  )
+})
+
+/** Focus an open app window on the target path, or open one. */
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close()
+  const target = new URL(event.notification.data?.url ?? '/', self.location.origin).href
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(async (windows) => {
+      const open = windows.find((client) => new URL(client.url).origin === self.location.origin)
+      if (open !== undefined) {
+        await open.focus()
+        if ('navigate' in open) {
+          try {
+            await open.navigate(target)
+            return
+          } catch {
+            // Uncontrolled windows refuse navigate(); fall through to a new one.
+          }
+        }
+      }
+      await self.clients.openWindow(target)
+    }),
+  )
+})

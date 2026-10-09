@@ -40,12 +40,14 @@
     "@xterm/xterm": "^6.0.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "croner": "^10.0.1",
     "highlight.js": "^11.12.0",
     "ignore": "^7.0.12",
     "js-yaml": "^4.3.2",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
-    "tailwind-merge": "^3.7.0"
+    "tailwind-merge": "^3.7.0",
+    "web-push": "^3.6.7"
   },
   "optionalDependencies": {
     "node-pty": "^1.1.0"
@@ -58,6 +60,7 @@
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.5",
+    "@types/web-push": "^3.6.4",
     "@vitejs/plugin-react": "^4.7.0",
     "jsdom": "^29.1.1",
     "react": "^19.2.8",

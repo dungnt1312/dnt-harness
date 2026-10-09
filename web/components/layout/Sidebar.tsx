@@ -66,6 +66,9 @@ export interface SidebarProps {
   readonly onDeleteRequest: (session: SessionListing) => void
   readonly onTogglePinned?: (id: string, pinned: boolean) => void
   readonly onOpenSettings: () => void
+  /** Opens the Automations view; `automationsActive` marks it current. */
+  readonly onOpenAutomations?: () => void
+  readonly automationsActive?: boolean
   readonly notifyEnabled: boolean
   readonly notifyBlocked: boolean
   readonly onToggleNotify: () => void
@@ -123,6 +126,20 @@ export const Sidebar = memo(function Sidebar(props: SidebarProps) {
           <Icon name="squarePen" size={16} className="shrink-0" />
           New conversation
         </button>
+        {props.onOpenAutomations !== undefined ? (
+          <button
+            type="button"
+            className={cn(
+              'mt-1 flex min-h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-sm transition-colors hover:bg-hover',
+              props.automationsActive === true ? 'bg-hover text-fg' : 'text-fg-muted hover:text-fg',
+            )}
+            aria-current={props.automationsActive === true ? 'page' : undefined}
+            onClick={props.onOpenAutomations}
+          >
+            <Icon name="calendarClock" size={16} className="shrink-0" />
+            Automations
+          </button>
+        ) : null}
         <div className="mt-2 flex items-center gap-0.5 pl-2.5">
           <span className="flex-1 truncate text-xs font-medium text-fg-faint">Conversations</span>
           <IconButton

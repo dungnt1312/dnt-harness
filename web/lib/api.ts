@@ -179,6 +179,159 @@ export function fetchUsage(): Promise<UsageDailyResponse> {
   return apiFetch('/api/usage').then((r) => json<UsageDailyResponse>(r))
 }
 
+// ── automations + web push ─────────────────────────────────────
+
+export interface AutomationControls {
+  readonly provider: string | null
+  readonly model: string | null
+  readonly thinkingLevel: string | null
+}
+
+export interface AutomationInput {
+  readonly title: string
+  readonly prompt: string
+  /** Recurring cron (host time) or one instant. */
+  readonly schedules: readonly ({ readonly cron: string } | { readonly at: number })[]
+  /** No runs after this instant; null = never ends. */
+  readonly endsAt: number | null
+  /** Stop after this many scheduled runs; null = unlimited. */
+  readonly maxRuns: number | null
+  readonly projectId: string | null
+  readonly modeId: string | null
+  readonly controls: AutomationControls | null
+  readonly enabled: boolean
+  /** Send the result to the user when a run ends. */
+  readonly notify: boolean
+  /** `'push'` and/or channel ids; null = push plus every enabled channel. */
+  readonly notifyTargets: readonly string[] | null
+  readonly catchUpMinutes?: number
+}
+
+export interface AutomationRow extends AutomationInput {
+  readonly id: string
+  readonly catchUpMinutes: number
+  /** Scheduled runs started under the current plan. */
+  readonly runCount: number
+  readonly createdAt: number
+  readonly updatedAt: number
+  /** Next fire instants (ms), empty when disabled. */
+  readonly nextRuns: readonly number[]
+  /** No runs left under this plan (one-time done, end date passed, run count used up). */
+  readonly finished: boolean
+}
+
+export type AutomationRunStatus = 'started' | 'done' | 'failed' | 'needs-approval' | 'missed' | 'skipped-busy'
+
+export interface AutomationRun {
+  readonly runId: string
+  readonly automationId: string
+  readonly dueAt: number | null
+  readonly at: number
+  readonly status: AutomationRunStatus
+  readonly sessionId?: string
+  readonly error?: string
+  readonly summary?: string
+}
+
+const automationsPath = (workspaceId: string, id?: string): string =>
+  `/api/workspaces/${encodeURIComponent(workspaceId)}/automations${id !== undefined ? `/${encodeURIComponent(id)}` : ''}`
+
+const jsonInit = (method: string, body: unknown): RequestInit => ({ method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+
+export function listAutomations(workspaceId: string): Promise<readonly AutomationRow[]> {
+  return apiFetch(automationsPath(workspaceId)).then((r) => json<readonly AutomationRow[]>(r))
+}
+
+export function createAutomation(workspaceId: string, input: AutomationInput): Promise<AutomationRow> {
+  return apiFetch(automationsPath(workspaceId), jsonInit('POST', input)).then((r) => json<AutomationRow>(r))
+}
+
+export function updateAutomation(workspaceId: string, id: string, patch: Partial<AutomationInput>): Promise<AutomationRow> {
+  return apiFetch(automationsPath(workspaceId, id), jsonInit('PATCH', patch)).then((r) => json<AutomationRow>(r))
+}
+
+export async function deleteAutomation(workspaceId: string, id: string): Promise<void> {
+  await apiFetch(automationsPath(workspaceId, id), { method: 'DELETE' }).then((r) => json<unknown>(r))
+}
+
+export function runAutomationNow(workspaceId: string, id: string): Promise<{ readonly runId: string; readonly sessionId?: string; readonly skipped?: true }> {
+  return apiFetch(`${automationsPath(workspaceId, id)}/run`, { method: 'POST' }).then((r) => json<{ runId: string; sessionId?: string; skipped?: true }>(r))
+}
+
+export function listAutomationRuns(workspaceId: string, id: string): Promise<readonly AutomationRun[]> {
+  return apiFetch(`${automationsPath(workspaceId, id)}/runs`).then((r) => json<readonly AutomationRun[]>(r))
+}
+
+/** Next fire times for an unsaved plan; rejects with the server's validation error. */
+export function previewSchedules(plan: Pick<AutomationInput, 'schedules' | 'endsAt' | 'maxRuns'>): Promise<{ readonly next: readonly number[] }> {
+  return apiFetch('/api/automations/preview', jsonInit('POST', plan)).then((r) => json<{ next: readonly number[] }>(r))
+}
+
+export interface PushDevice {
+  readonly id: string
+  readonly label: string
+  readonly createdAt: number
+  readonly endpoint: string
+}
+
+export function getPushKey(): Promise<string> {
+  return apiFetch('/api/push/key').then((r) => json<{ publicKey: string }>(r)).then((body) => body.publicKey)
+}
+
+export function listPushDevices(): Promise<readonly PushDevice[]> {
+  return apiFetch('/api/push/subscriptions').then((r) => json<readonly PushDevice[]>(r))
+}
+
+export function registerPushDevice(subscription: PushSubscriptionJSON, label: string): Promise<PushDevice> {
+  return apiFetch('/api/push/subscriptions', jsonInit('POST', { subscription, label })).then((r) => json<PushDevice>(r))
+}
+
+export async function removePushDevice(id: string): Promise<void> {
+  await apiFetch(`/api/push/subscriptions/${encodeURIComponent(id)}`, { method: 'DELETE' }).then((r) => json<unknown>(r))
+}
+
+export function sendTestPush(): Promise<{ readonly sent: number; readonly removed: number; readonly failed: number }> {
+  return apiFetch('/api/push/test', { method: 'POST' }).then((r) => json<{ sent: number; removed: number; failed: number }>(r))
+}
+
+export type ChannelKind = 'telegram' | 'teams' | 'discord'
+
+/** A notification channel as the host shows it; secrets never come back. */
+export interface NotifyChannel {
+  readonly id: string
+  readonly kind: ChannelKind
+  readonly name: string
+  readonly enabled: boolean
+  readonly summary: string
+  readonly createdAt: number
+}
+
+export interface ChannelConfigInput {
+  readonly botToken?: string
+  readonly chatId?: string
+  readonly webhookUrl?: string
+}
+
+export function listChannels(): Promise<readonly NotifyChannel[]> {
+  return apiFetch('/api/notify/channels').then((r) => json<readonly NotifyChannel[]>(r))
+}
+
+export function createChannel(input: { readonly kind: ChannelKind; readonly name: string; readonly config: ChannelConfigInput }): Promise<NotifyChannel> {
+  return apiFetch('/api/notify/channels', jsonInit('POST', input)).then((r) => json<NotifyChannel>(r))
+}
+
+export function updateChannel(id: string, patch: { readonly name?: string; readonly enabled?: boolean; readonly config?: ChannelConfigInput }): Promise<NotifyChannel> {
+  return apiFetch(`/api/notify/channels/${encodeURIComponent(id)}`, jsonInit('PATCH', patch)).then((r) => json<NotifyChannel>(r))
+}
+
+export async function deleteChannel(id: string): Promise<void> {
+  await apiFetch(`/api/notify/channels/${encodeURIComponent(id)}`, { method: 'DELETE' }).then((r) => json<unknown>(r))
+}
+
+export async function testChannel(id: string): Promise<void> {
+  await apiFetch(`/api/notify/channels/${encodeURIComponent(id)}/test`, { method: 'POST' }).then((r) => json<unknown>(r))
+}
+
 export function createProvider(input: Required<Pick<ProviderInput, 'name' | 'baseUrl' | 'apiKey'>> & ProviderInput): Promise<ProviderSummary> {
   return apiFetch('/api/providers', {
     method: 'POST',

@@ -32,6 +32,9 @@ import { fileURLToPath } from 'node:url'
 import { AgentsService } from '../harness/agent/service.ts'
 import { resolveAppHome } from '../harness/app-home.ts'
 import { memoryUsageLog, openUsageLog, type UsageLog } from './usage-log.ts'
+import { AutomationError, AutomationScheduler, AutomationStore, automationContext, excerpt, hasFutureRuns, nextRuns, parseAutomationInput, planOf, runTitle, type Automation } from './automations.ts'
+import { PushError, PushService, type PushSender } from './push.ts'
+import { ChannelError, NotifyChannels, type ChannelFetch } from './notify-channels.ts'
 import { agentScope, type AgentScope } from '../harness/agent/scope.ts'
 import type { GrantedRoot } from '../harness/tools/types.ts'
 import { classifyGrantedRoots, classifyTarget, within } from '../capabilities/fs/grants.ts'
@@ -363,6 +366,12 @@ export interface WebServerOptions {
      */
     readonly defaultCwd?: string
   }
+  /** Automations: whether the scheduler runs (default true). Tests turn it off and use Run now. */
+  readonly automations?: { readonly scheduler?: boolean }
+  /** Web Push transport seam (tests). */
+  readonly pushSender?: PushSender
+  /** Telegram/Teams/Discord HTTP seam (tests). */
+  readonly channelFetch?: ChannelFetch
 }
 
 /**
@@ -2970,7 +2979,144 @@ ${entry.description}`.toLowerCase().includes(query))
     }
   }
 
+  let shuttingDown = false
+
+  // ── automations + web push ───────────────────────────────────
+  // Definitions and run history live beside each workspace's data; push keys
+  // and device subscriptions are host-global. Memory-mode hosts keep both in
+  // memory so tests stay hermetic.
+  const automations = new AutomationStore(options.home !== undefined ? (workspaceId) => workspaces.workspaceDir(workspaceId as WorkspaceId) : undefined)
+  const push = new PushService(options.home !== undefined ? path.join(options.home, 'push') : undefined, options.pushSender)
+  const channels = new NotifyChannels(options.home !== undefined ? path.join(options.home, 'notify') : undefined, options.channelFetch)
+  /** Live runs: session id → run identity, until its first turn settles. */
+  const activeRuns = new Map<SessionId, { readonly workspaceId: WorkspaceId; readonly automationId: string; readonly runId: string; readonly dueAt: number | null; readonly title: string; readonly notify: boolean; readonly targets: readonly string[] | null; notifiedWaiting: boolean }>()
+  const runUrl = (workspaceId: string, sessionId: string): string => `/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}`
+  /**
+   * Tell the user about a run on the automation's targets: Web Push (short
+   * excerpt, opens the session) and the selected channels (fuller text).
+   * `kind: 'result'` respects the notify switch; failures and waiting
+   * approvals always go out, so a broken or stuck task is never silent.
+   */
+  const notifyRun = (run: { readonly workspaceId: string; readonly title: string; readonly runId: string; readonly notify: boolean; readonly targets: readonly string[] | null }, sessionId: string | undefined, kind: 'result' | 'alert', text: string): void => {
+    if (kind === 'result' && !run.notify) return
+    if (run.targets === null || run.targets.includes('push')) {
+      void push.send({ title: run.title, body: excerpt(text), url: sessionId !== undefined ? runUrl(run.workspaceId, sessionId) : `/workspaces/${encodeURIComponent(run.workspaceId)}/automations`, tag: run.runId })
+    }
+    void channels.send({ title: run.title, body: text }, run.targets === null ? null : run.targets.filter((id) => id !== 'push'))
+  }
+  const runAutomation = async (workspaceId: WorkspaceId, automation: Automation, dueAt: number | null): Promise<{ ok: false; status: number; error: string } | { ok: true; runId: string; sessionId?: string; skipped?: true }> => {
+    const runId = `run-${randomUUID()}`
+    const identity = { workspaceId, title: automation.title, runId, notify: automation.notify, targets: automation.notifyTargets }
+    // Never two runs of one automation at once.
+    for (const [sessionId, run] of activeRuns) {
+      if (run.automationId === automation.id && sessions.get(sessionId) !== undefined) {
+        await automations.record(workspaceId, { runId, automationId: automation.id, dueAt, status: 'skipped-busy', sessionId })
+        return { ok: true, runId, skipped: true }
+      }
+    }
+    const fail = async (status: number, error: string): Promise<{ ok: false; status: number; error: string }> => {
+      await automations.record(workspaceId, { runId, automationId: automation.id, dueAt, status: 'failed', error })
+      notifyRun(identity, undefined, 'alert', `Could not start: ${error}`)
+      return { ok: false, status, error }
+    }
+    if (shuttingDown) return fail(503, 'host shutting down')
+    let created: Awaited<ReturnType<typeof createRootSession>>
+    try {
+      created = await createRootSession(deps, workspaceId, {
+        projectId: automation.projectId,
+        ...(automation.controls !== null ? { controls: automation.controls } : {}),
+        modeId: automation.modeId,
+        title: runTitle(automation.title, dueAt ?? Date.now()),
+      })
+    } catch (error) {
+      return fail(500, String(error instanceof Error ? error.message : error))
+    }
+    if (!created.ok) return fail(created.status, created.error)
+    const sessionId = created.entry.session.id
+    activeRuns.set(sessionId, { ...identity, automationId: automation.id, dueAt, notifiedWaiting: false })
+    await automations.record(workspaceId, { runId, automationId: automation.id, dueAt, status: 'started', sessionId })
+    // The agent learns it runs unattended and how its reply reaches the user;
+    // it joins the prompt as host context, not as user text.
+    const mode = rootModeOf({ sessionId, workspaceId }, workspaceId).mode.definition
+    created.entry.agent.inject(automationContext(automation, {
+      dueAt,
+      channels: automation.notify ? await channels.enabledNames(automation.notifyTargets).catch(() => []) : [],
+      push: automation.notifyTargets === null || automation.notifyTargets.includes('push'),
+      approvalsBlock: Object.values(mode.permissionDefaults ?? {}).some((value) => value === 'ask'),
+    }))
+    const submitted = await submitMessage(created.entry, deps, { content: automation.prompt, clientRequestId: runId }, undefined)
+    if (!submitted.ok) {
+      activeRuns.delete(sessionId)
+      await automations.record(workspaceId, { runId, automationId: automation.id, dueAt, status: 'failed', sessionId, error: submitted.error })
+      notifyRun(identity, sessionId, 'alert', `Could not start: ${submitted.error}`)
+      return { ok: false, status: submitted.status, error: submitted.error }
+    }
+    return { ok: true, runId, sessionId }
+  }
+  // Run watcher: the first settled turn ends the run; a waiting approval or
+  // question pings the user once.
+  const lastTurnError = new Map<SessionId, string>()
+  disposers.set('automations:session-event', kernel.ctx.on('session/event', (emitter, event) => {
+    const run = activeRuns.get(emitter.id)
+    if (run === undefined) return
+    if (event.type === 'turn/error') {
+      lastTurnError.set(emitter.id, event.message)
+      return
+    }
+    if (event.type !== 'turn/end') return
+    activeRuns.delete(emitter.id)
+    const error = lastTurnError.get(emitter.id)
+    lastTurnError.delete(emitter.id)
+    if (event.reason === 'completed') {
+      let reply = ''
+      for (let index = emitter.events.length - 1; index >= 0; index -= 1) {
+        const candidate = emitter.events[index]
+        if (candidate?.type === 'assistant/message' && candidate.content.trim() !== '') { reply = candidate.content; break }
+      }
+      const summary = excerpt(reply) || 'Done.'
+      void automations.record(run.workspaceId, { runId: run.runId, automationId: run.automationId, dueAt: run.dueAt, status: 'done', sessionId: emitter.id, summary })
+      notifyRun(run, emitter.id, 'result', reply.trim() !== '' ? reply.trim() : 'Done.')
+    } else {
+      const reason = error ?? `run ended: ${event.reason}`
+      void automations.record(run.workspaceId, { runId: run.runId, automationId: run.automationId, dueAt: run.dueAt, status: 'failed', sessionId: emitter.id, error: reason })
+      notifyRun(run, emitter.id, 'alert', `Failed: ${reason}`)
+    }
+  }))
+  const onWaiting = (payload: { readonly sessionId: SessionId; readonly parentSessionId?: SessionId }): void => {
+    const rootId = payload.parentSessionId ?? payload.sessionId
+    const run = activeRuns.get(rootId)
+    if (run === undefined || run.notifiedWaiting) return
+    run.notifiedWaiting = true
+    void automations.record(run.workspaceId, { runId: run.runId, automationId: run.automationId, dueAt: run.dueAt, status: 'needs-approval', sessionId: rootId })
+    notifyRun(run, rootId, 'alert', 'Waiting for your approval.')
+  }
+  // A run whose driver crashed before `turn/end` must not stay "busy" forever.
+  disposers.set('automations:turn-error', kernel.ctx.on('web/turn-error', (payload) => {
+    const run = activeRuns.get(payload.sessionId)
+    if (run === undefined) return
+    const session = sessions.get(payload.sessionId)?.session
+    if (session !== undefined && !turnTerminal(session)) return // the turn/end watcher settles it
+    activeRuns.delete(payload.sessionId)
+    void automations.record(run.workspaceId, { runId: run.runId, automationId: run.automationId, dueAt: run.dueAt, status: 'failed', sessionId: payload.sessionId, error: payload.message })
+    notifyRun(run, payload.sessionId, 'alert', `Failed: ${payload.message}`)
+  }))
+  disposers.set('automations:approval', kernel.ctx.on('web/approval', onWaiting))
+  disposers.set('automations:question', kernel.ctx.on('web/question', onWaiting))
+  const scheduler = new AutomationScheduler({
+    store: automations,
+    workspaces: () => options.home !== undefined ? workspaces.list().map((ws) => ws.id) : [],
+    fire: async (workspaceId, automation, dueAt) => {
+      const outcome = await runAutomation(workspaceId as WorkspaceId, automation, dueAt)
+      return outcome.ok && outcome.skipped !== true
+    },
+  })
+
   const deps: HandlerDeps = {
+    automations,
+    push,
+    channels,
+    pokeScheduler: () => { void scheduler.poke() },
+    runAutomation,
     kernel,
     sessions,
     processes,
@@ -3099,7 +3245,6 @@ ${entry.description}`.toLowerCase().includes(query))
     if (recovered > 0) console.log(`web: recovered ${recovered} child relationship(s) from storage`)
   }
 
-  let shuttingDown = false
   const server = createServer((req, res) => {
     if (shuttingDown) { res.writeHead(503); res.end('host shutting down'); return }
     handle(req, res, deps).catch((error: unknown) => {
@@ -3131,6 +3276,9 @@ ${entry.description}`.toLowerCase().includes(query))
     ? await publishOperatorChannel(options.home, { url: `http://${publicHost}:${address.port}`, key: deps.auth.armOperatorKey() })
     : undefined
 
+  // Automations fire only once the host is fully up (sessions rebuilt, port bound).
+  if (options.home !== undefined && options.automations?.scheduler !== false) void scheduler.start()
+
   let closePromise: Promise<void> | undefined
   return {
     url: `http://${publicHost}:${address.port}`,
@@ -3139,6 +3287,7 @@ ${entry.description}`.toLowerCase().includes(query))
     auth: deps.auth,
     close: () => closePromise ??= (async () => {
       shuttingDown = true
+      scheduler.stop()
       compactionClosing = true
       for (const sessionId of compactions.keys()) cancelCompaction(sessionId)
       processes.closeAdmission()
@@ -3160,6 +3309,7 @@ ${entry.description}`.toLowerCase().includes(query))
         async () => { try { await boundedCleanup(() => checkpoints.close()) } catch (error) { teardownSafe = false; throw error } },
         async () => { try { await boundedCleanup(() => processEvents.flushAll()) } catch (error) { teardownSafe = false; throw error } },
         async () => { await boundedCleanup(() => usageLog.flush()) },
+        async () => { await boundedCleanup(() => automations.flush()) },
         () => new Promise<void>((resolve, reject) => server.close(error => error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve())),
         async () => {
           const results = await Promise.allSettled([...mcpClients.values()].map(client => client.disconnect()))
@@ -3317,6 +3467,13 @@ interface HandlerDeps {
   readonly testMcpServer: (workspaceId: WorkspaceId, serverName: string) => Promise<readonly string[]>
   readonly isDrifted: (workspaceId: string) => boolean
   readonly repairAudit: (workspaceId: string) => Promise<{ ok: true } | { ok: false; error: string }>
+  readonly automations: AutomationStore
+  readonly push: PushService
+  readonly channels: NotifyChannels
+  /** Re-plan the scheduler after a definition changed. */
+  readonly pokeScheduler: () => void
+  /** Start one automation run now (`dueAt` null = Run now). */
+  readonly runAutomation: (workspaceId: WorkspaceId, automation: Automation, dueAt: number | null) => Promise<{ ok: false; status: number; error: string } | { ok: true; runId: string; sessionId?: string; skipped?: true }>
 }
 
 /**
@@ -3704,112 +3861,18 @@ async function handleApi(
       const wsId = decodeURIComponent(wsSessionsMatch[1] ?? '') as WorkspaceId
       requireWorkspace(deps, wsId, false) // unknown workspaces fail closed
       if (req.method === 'GET') {
-        send(200, listSessions(wsId, deps))
+        send(200, listSessions(wsId, deps, await deps.automations.runSessions(wsId).catch(() => new Map<string, string>())))
         return
       }
       if (req.method === 'POST') {
         deps.workspaces.requireActive(wsId) // archived: no new sessions
         const body = await readJson(req)
-        const rawProject = body['projectId']
-        let projectId: ProjectId | undefined
-        if (rawProject !== undefined && rawProject !== null && rawProject !== '') {
-          if (typeof rawProject !== 'string') {
-            send(400, { error: "'projectId' must be a string" })
-            return
-          }
-          try {
-            deps.workspaces.getProject(rawProject as ProjectId, wsId)
-          } catch (error) {
-            fail(error)
-            return
-          }
-          projectId = rawProject as ProjectId
-        }
-        // A browser submits the controls it displayed. Never re-read a shared
-        // default in place of that choice: another tab/session may have changed it.
-        let defaults = deps.defaults()
-        const submitted = body['controls']
-        if (submitted !== undefined) {
-          if (submitted === null || typeof submitted !== 'object' || Array.isArray(submitted)) {
-            send(400, { error: "'controls' must contain provider, model, and thinkingLevel" })
-            return
-          }
-          const { provider, model, thinkingLevel } = submitted as Record<string, unknown>
-          if ((provider !== null && typeof provider !== 'string')
-            || (model !== null && typeof model !== 'string')
-            || (thinkingLevel !== null && !isThinkingLevel(thinkingLevel))
-            || (provider === null) !== (model === null)) {
-            send(400, { error: "'controls' requires a complete string|null provider/model pair and valid thinkingLevel|null" })
-            return
-          }
-          if (provider !== null && model !== null) {
-            try {
-              deps.validateProviderModel(provider, model)
-            } catch (error) {
-              send(400, { error: String(error instanceof Error ? error.message : error) })
-              return
-            }
-          }
-          defaults = { provider, model, thinkingLevel }
-        }
-        const session = deps.kernel.ctx.sessions.create(wsId)
-        // Older API callers may omit controls and snapshot the global default.
-        // Explicit null thinking preserves "use model default".
-        session.append({
-          type: 'session/model',
-          provider: defaults.provider,
-          model: defaults.model,
-          // Null is an intentional snapshot: use the selected model default,
-          // even if the global default gains a thinking override later.
-          thinkingLevel: defaults.thinkingLevel,
-        })
-        // The workspace's selected mode is only the DEFAULT for new roots: the
-        // root owns its own live mode from here on.
-        deps.stampRootMode(session, deps.controlsFor(wsId).modeDefinition)
-        try {
-          await session.durable()
-        } catch (error) {
-          await deps.kernel.ctx.sessions.delete(session.id).catch(() => {})
-          send(500, { error: `session model/mode snapshot could not be persisted: ${String(error instanceof Error ? error.message : error)}` })
+        const created = await createRootSession(deps, wsId, { projectId: body['projectId'], controls: body['controls'] })
+        if (!created.ok) {
+          send(created.status, { error: created.error })
           return
         }
-        // G5: bring this workspace's enabled MCP servers up on first use.
-        void deps.connectWorkspaceMcp(wsId).catch((error) => console.error(`web: MCP config/start failed for ${wsId}: ${String(error instanceof Error ? error.message : error)}`))
-        if (projectId !== undefined) {
-          // Canonical, rebuildable record of the binding.
-          session.append({ type: 'session/project', projectId })
-          await session.durable().catch(() => {})
-        }
-        deps.sessions.set(session.id, {
-          session,
-          agent: deps.kernel.ctx.agents.create(session, { workspaceId: wsId, ...(projectId !== undefined ? { projectId } : {}) }),
-          workspaceId: wsId,
-          projectId,
-        })
-        // Claude SessionStart hooks (source "startup"): their context
-        // (`additionalContext` or plain stdout) waits in the inbox and joins
-        // the first user message as lower-trust data.
-        try {
-          const { verdict } = await deps.hookHost.fire('SessionStart', {
-            workspaceId: wsId,
-            projectId,
-            sessionId: session.id,
-            matchValue: 'startup',
-            input: { source: 'startup' },
-          })
-          if (verdict.additionalContext !== undefined) {
-            deps.sessions.get(session.id)?.agent.inject(hookContextBlock('SessionStart', verdict.additionalContext))
-          }
-          await session.durable()
-        } catch (error) {
-          // SessionStart is part of the hook lifecycle contract: do not
-          // acknowledge a started session whose hook audit was lost.
-          deps.sessions.delete(session.id)
-          await deps.kernel.ctx.sessions.delete(session.id).catch(() => {})
-          send(500, { error: `SessionStart hook/audit failed: ${String(error instanceof Error ? error.message : error)}` })
-          return
-        }
-        send(201, { id: session.id, workspaceId: wsId, ...(projectId !== undefined ? { projectId } : {}) })
+        send(201, { id: created.entry.session.id, workspaceId: wsId, ...(created.entry.projectId !== undefined ? { projectId: created.entry.projectId } : {}) })
         return
       }
       send(405, { error: 'method not allowed' })
@@ -4974,6 +5037,20 @@ async function handleApi(
     // Settings → Usage: daily token rows across every workspace.
     if (pathname === '/api/usage' && req.method === 'GET') {
       send(200, deps.usageLog.daily())
+      return
+    }
+
+    // ── automations (scheduled prompts) ──────────────────────
+    if (pathname.startsWith('/api/automations/') || /^\/api\/workspaces\/[^/]+\/automations(?:\/|$)/.test(pathname)) {
+      await handleAutomations(req, pathname, deps, send, fail)
+      return
+    }
+    if (pathname === '/api/push/key' || pathname === '/api/push/test' || pathname.startsWith('/api/push/subscriptions')) {
+      await handlePush(req, pathname, deps, send)
+      return
+    }
+    if (pathname === '/api/notify/channels' || pathname.startsWith('/api/notify/channels/')) {
+      await handleChannels(req, pathname, deps, send)
       return
     }
 
@@ -6601,6 +6678,280 @@ function parseAttachments(
   return { ok: true, refs }
 }
 
+type SendJson = (status: number, body: unknown) => void
+
+/** An automation as the API returns it: the definition plus its next fire times. */
+function automationView(row: Automation): Automation & { readonly nextRuns: readonly number[]; readonly finished: boolean } {
+  const now = Date.now()
+  // Finished = nothing left to run under this plan (one-time done, ended, used up).
+  return { ...row, nextRuns: row.enabled ? nextRuns(row, now, 3) : [], finished: !hasFutureRuns(row, now) }
+}
+
+/**
+ * Automations CRUD, Run now, run history and the cron preview.
+ * `/api/workspaces/:ws/automations[/:id[/run|/runs]]`, `/api/automations/preview`.
+ */
+async function handleAutomations(req: IncomingMessage, pathname: string, deps: HandlerDeps, send: SendJson, fail: (error: unknown) => void): Promise<void> {
+  try {
+    if (pathname === '/api/automations/preview') {
+      if (req.method !== 'POST') { send(405, { error: 'method not allowed' }); return }
+      const body = await readJson(req)
+      const input = parseAutomationInput({ ...body, schedules: Array.isArray(body['schedules']) ? body['schedules'] : [{ cron: body['cron'] }] }, true)
+      send(200, { next: nextRuns(planOf(input.schedules ?? [], { endsAt: input.endsAt ?? null, maxRuns: input.maxRuns ?? null }), Date.now(), 5) })
+      return
+    }
+    const match = /^\/api\/workspaces\/([^/]+)\/automations(?:\/([^/]+)(?:\/(run|runs))?)?$/.exec(pathname)
+    if (match === null) { send(404, { error: 'not found' }); return }
+    const wsId = decodeURIComponent(match[1] ?? '') as WorkspaceId
+    const id = match[2] !== undefined ? decodeURIComponent(match[2]) : undefined
+    const action = match[3]
+    requireWorkspace(deps, wsId, req.method !== 'GET')
+    if (id === undefined) {
+      if (req.method === 'GET') {
+        send(200, (await deps.automations.list(wsId)).map(automationView))
+        return
+      }
+      if (req.method === 'POST') {
+        const input = parseAutomationInput(await readJson(req), false)
+        if (input.projectId !== null) deps.workspaces.getProject(input.projectId as ProjectId, wsId)
+        const created = await deps.automations.create(wsId, input)
+        deps.pokeScheduler()
+        send(201, automationView(created))
+        return
+      }
+      send(405, { error: 'method not allowed' })
+      return
+    }
+    if (action === 'runs') {
+      if (req.method !== 'GET') { send(405, { error: 'method not allowed' }); return }
+      await deps.automations.get(wsId, id)
+      send(200, await deps.automations.history(wsId, id))
+      return
+    }
+    if (action === 'run') {
+      if (req.method !== 'POST') { send(405, { error: 'method not allowed' }); return }
+      const outcome = await deps.runAutomation(wsId, await deps.automations.get(wsId, id), null)
+      if (!outcome.ok) { send(outcome.status, { error: outcome.error }); return }
+      send(202, outcome)
+      return
+    }
+    if (req.method === 'GET') {
+      send(200, automationView(await deps.automations.get(wsId, id)))
+      return
+    }
+    if (req.method === 'PATCH') {
+      const patch = parseAutomationInput(await readJson(req), true)
+      if (patch.projectId !== undefined && patch.projectId !== null) deps.workspaces.getProject(patch.projectId as ProjectId, wsId)
+      const updated = await deps.automations.update(wsId, id, patch)
+      deps.pokeScheduler()
+      send(200, automationView(updated))
+      return
+    }
+    if (req.method === 'DELETE') {
+      await deps.automations.remove(wsId, id)
+      deps.pokeScheduler()
+      send(200, { deleted: true })
+      return
+    }
+    send(405, { error: 'method not allowed' })
+  } catch (error) {
+    if (error instanceof AutomationError) { send(error.status, { error: error.message }); return }
+    fail(error)
+  }
+}
+
+/**
+ * Notification channels: `GET|POST /api/notify/channels`,
+ * `PATCH|DELETE /api/notify/channels/:id`, `POST /api/notify/channels/:id/test`.
+ * Secrets are write-only: responses carry a masked summary.
+ */
+async function handleChannels(req: IncomingMessage, pathname: string, deps: HandlerDeps, send: SendJson): Promise<void> {
+  try {
+    if (pathname === '/api/notify/channels') {
+      if (req.method === 'GET') { send(200, await deps.channels.list()); return }
+      if (req.method === 'POST') { send(201, await deps.channels.create(await readJson(req))); return }
+      send(405, { error: 'method not allowed' })
+      return
+    }
+    const match = /^\/api\/notify\/channels\/([^/]+)(?:\/(test))?$/.exec(pathname)
+    if (match === null) { send(404, { error: 'not found' }); return }
+    const id = decodeURIComponent(match[1] ?? '')
+    if (match[2] === 'test') {
+      if (req.method !== 'POST') { send(405, { error: 'method not allowed' }); return }
+      await deps.channels.test(id)
+      send(200, { sent: true })
+      return
+    }
+    if (req.method === 'PATCH') { send(200, await deps.channels.update(id, await readJson(req))); return }
+    if (req.method === 'DELETE') { await deps.channels.remove(id); send(200, { deleted: true }); return }
+    send(405, { error: 'method not allowed' })
+  } catch (error) {
+    if (error instanceof ChannelError) { send(error.status, { error: error.message }); return }
+    send(500, { error: String(error instanceof Error ? error.message : error) })
+  }
+}
+
+/** Web Push: VAPID public key, device subscriptions and a test notification. */
+async function handlePush(req: IncomingMessage, pathname: string, deps: HandlerDeps, send: SendJson): Promise<void> {
+  try {
+    if (pathname === '/api/push/key') {
+      if (req.method !== 'GET') { send(405, { error: 'method not allowed' }); return }
+      send(200, { publicKey: await deps.push.publicKey() })
+      return
+    }
+    if (pathname === '/api/push/test') {
+      if (req.method !== 'POST') { send(405, { error: 'method not allowed' }); return }
+      const result = await deps.push.send({ title: 'dnt-harness', body: 'Notifications are working.', url: '/', tag: 'push-test' })
+      send(200, result)
+      return
+    }
+    if (pathname === '/api/push/subscriptions') {
+      if (req.method === 'GET') {
+        send(200, (await deps.push.list()).map(({ id, label, createdAt, endpoint }) => ({ id, label, createdAt, endpoint })))
+        return
+      }
+      if (req.method === 'POST') {
+        const body = await readJson(req)
+        const label = typeof body['label'] === 'string' ? body['label'] : (req.headers['user-agent'] ?? 'device')
+        const record = await deps.push.subscribe(body['subscription'], label)
+        send(201, { id: record.id, label: record.label, createdAt: record.createdAt, endpoint: record.endpoint })
+        return
+      }
+      send(405, { error: 'method not allowed' })
+      return
+    }
+    const match = /^\/api\/push\/subscriptions\/([^/]+)$/.exec(pathname)
+    if (match !== null && req.method === 'DELETE') {
+      await deps.push.unsubscribe(decodeURIComponent(match[1] ?? ''))
+      send(200, { deleted: true })
+      return
+    }
+    send(match === null ? 404 : 405, { error: match === null ? 'not found' : 'method not allowed' })
+  } catch (error) {
+    if (error instanceof PushError) { send(error.status, { error: error.message }); return }
+    send(500, { error: String(error instanceof Error ? error.message : error) })
+  }
+}
+
+/**
+ * Create one root session: model/mode snapshot, project binding, MCP warm-up
+ * and SessionStart hooks. Shared by `POST …/sessions` and the automation
+ * runner. `controls` absent snapshots the global default; `modeId` absent
+ * uses the workspace's selected mode.
+ */
+async function createRootSession(
+  deps: HandlerDeps,
+  wsId: WorkspaceId,
+  options: { readonly projectId?: unknown; readonly controls?: unknown; readonly modeId?: string | null; readonly title?: string },
+): Promise<{ ok: false; status: number; error: string } | { ok: true; entry: SessionEntry }> {
+  deps.workspaces.requireActive(wsId) // archived: no new sessions
+  const rawProject = options.projectId
+  let projectId: ProjectId | undefined
+  if (rawProject !== undefined && rawProject !== null && rawProject !== '') {
+    if (typeof rawProject !== 'string') return { ok: false, status: 400, error: "'projectId' must be a string" }
+    try {
+      deps.workspaces.getProject(rawProject as ProjectId, wsId)
+    } catch (error) {
+      return { ok: false, status: error instanceof ScopeError ? 404 : 500, error: String(error instanceof Error ? error.message : error) }
+    }
+    projectId = rawProject as ProjectId
+  }
+  // A browser submits the controls it displayed. Never re-read a shared
+  // default in place of that choice: another tab/session may have changed it.
+  let defaults = deps.defaults()
+  const submitted = options.controls
+  if (submitted !== undefined) {
+    if (submitted === null || typeof submitted !== 'object' || Array.isArray(submitted)) {
+      return { ok: false, status: 400, error: "'controls' must contain provider, model, and thinkingLevel" }
+    }
+    const { provider, model, thinkingLevel } = submitted as Record<string, unknown>
+    if ((provider !== null && typeof provider !== 'string')
+      || (model !== null && typeof model !== 'string')
+      || (thinkingLevel !== null && !isThinkingLevel(thinkingLevel))
+      || (provider === null) !== (model === null)) {
+      return { ok: false, status: 400, error: "'controls' requires a complete string|null provider/model pair and valid thinkingLevel|null" }
+    }
+    if (provider !== null && model !== null) {
+      try {
+        deps.validateProviderModel(provider, model)
+      } catch (error) {
+        return { ok: false, status: 400, error: String(error instanceof Error ? error.message : error) }
+      }
+    }
+    defaults = { provider, model, thinkingLevel }
+  }
+  // An explicit mode (automations) resolves before anything is created.
+  let mode = deps.controlsFor(wsId).modeDefinition
+  if (options.modeId !== undefined && options.modeId !== null) {
+    if ((await deps.modes.disabledIds(wsId)).includes(options.modeId)) {
+      return { ok: false, status: 400, error: `mode '${options.modeId}' is disabled in this workspace` }
+    }
+    try {
+      mode = await deps.modes.resolve(wsId, options.modeId)
+    } catch (error) {
+      return { ok: false, status: 400, error: `mode '${options.modeId}' is unavailable: ${String(error instanceof Error ? error.message : error)}` }
+    }
+  }
+  const session = deps.kernel.ctx.sessions.create(wsId)
+  // Older API callers may omit controls and snapshot the global default.
+  // Explicit null thinking preserves "use model default".
+  session.append({
+    type: 'session/model',
+    provider: defaults.provider,
+    model: defaults.model,
+    // Null is an intentional snapshot: use the selected model default,
+    // even if the global default gains a thinking override later.
+    thinkingLevel: defaults.thinkingLevel,
+  })
+  // The workspace's selected mode is only the DEFAULT for new roots: the
+  // root owns its own live mode from here on.
+  deps.stampRootMode(session, mode)
+  if (options.title !== undefined) session.append({ type: 'session/title', title: options.title.slice(0, 80) })
+  try {
+    await session.durable()
+  } catch (error) {
+    await deps.kernel.ctx.sessions.delete(session.id).catch(() => {})
+    return { ok: false, status: 500, error: `session model/mode snapshot could not be persisted: ${String(error instanceof Error ? error.message : error)}` }
+  }
+  // G5: bring this workspace's enabled MCP servers up on first use.
+  void deps.connectWorkspaceMcp(wsId).catch((error) => console.error(`web: MCP config/start failed for ${wsId}: ${String(error instanceof Error ? error.message : error)}`))
+  if (projectId !== undefined) {
+    // Canonical, rebuildable record of the binding.
+    session.append({ type: 'session/project', projectId })
+    await session.durable().catch(() => {})
+  }
+  const entry: SessionEntry = {
+    session,
+    agent: deps.kernel.ctx.agents.create(session, { workspaceId: wsId, ...(projectId !== undefined ? { projectId } : {}) }),
+    workspaceId: wsId,
+    projectId,
+  }
+  deps.sessions.set(session.id, entry)
+  // Claude SessionStart hooks (source "startup"): their context
+  // (`additionalContext` or plain stdout) waits in the inbox and joins
+  // the first user message as lower-trust data.
+  try {
+    const { verdict } = await deps.hookHost.fire('SessionStart', {
+      workspaceId: wsId,
+      projectId,
+      sessionId: session.id,
+      matchValue: 'startup',
+      input: { source: 'startup' },
+    })
+    if (verdict.additionalContext !== undefined) {
+      entry.agent.inject(hookContextBlock('SessionStart', verdict.additionalContext))
+    }
+    await session.durable()
+  } catch (error) {
+    // SessionStart is part of the hook lifecycle contract: do not
+    // acknowledge a started session whose hook audit was lost.
+    deps.sessions.delete(session.id)
+    await deps.kernel.ctx.sessions.delete(session.id).catch(() => {})
+    return { ok: false, status: 500, error: `SessionStart hook/audit failed: ${String(error instanceof Error ? error.message : error)}` }
+  }
+  return { ok: true, entry }
+}
+
 async function acceptMessage(
   entry: SessionEntry,
   req: IncomingMessage,
@@ -6613,6 +6964,25 @@ async function acceptMessage(
     return { ok: false, status: 409, error: 'this is a child agent session; it is executor-managed and cannot receive messages or be resumed directly' }
   }
   const body = await readJson(req)
+  const principalId = (req as IncomingMessage & { dntHarnessPrincipalId?: string }).dntHarnessPrincipalId
+  return submitMessage(entry, deps, body, principalId)
+}
+
+/**
+ * Accept one message into a root session and dispatch it: validation,
+ * durable `input/queued`, then the inbox. `body` is the request shape
+ * (`content`, `delivery`, `attachments`, `clientRequestId`). Shared by the
+ * HTTP route and the automation runner.
+ */
+async function submitMessage(
+  entry: SessionEntry,
+  deps: HandlerDeps,
+  body: Record<string, unknown>,
+  principalId: string | undefined,
+): Promise<{ ok: false; status: number; error: string } | { ok: true; status: number; body: Record<string, unknown> }> {
+  if (entry.session.events.some((event) => event.type === 'session/child-meta')) {
+    return { ok: false, status: 409, error: 'this is a child agent session; it is executor-managed and cannot receive messages or be resumed directly' }
+  }
   const content = body['content']
   if (typeof content !== 'string') {
     return { ok: false, status: 400, error: 'body needs a string content' }
@@ -6642,7 +7012,6 @@ async function acceptMessage(
       return { ok: false, status: 400, error: error.message }
     }
   }
-  const principalId = (req as IncomingMessage & { dntHarnessPrincipalId?: string }).dntHarnessPrincipalId
   if (principalId !== undefined) deps.sessionPrincipals.set(entry.session.id, principalId)
   if (deps.unavailableSessions.has(entry.session.id)) {
     return { ok: false, status: 503, error: 'session unavailable after durable storage failure; restart the host to reload canonical history' }
@@ -7004,7 +7373,7 @@ async function putThinking(
 
 // ── workspace helpers ──────────────────────────────────────────
 
-function listSessions(workspaceId: WorkspaceId, deps: HandlerDeps): Record<string, unknown>[] {
+function listSessions(workspaceId: WorkspaceId, deps: HandlerDeps, automationRuns: ReadonlyMap<string, string> = new Map()): Record<string, unknown>[] {
   const fallbackWs = defaultWorkspaceId(deps)
   const rows: Record<string, unknown>[] = []
   const summaries = deps.kernel.ctx.sessions.summaries()
@@ -7036,6 +7405,8 @@ function listSessions(workspaceId: WorkspaceId, deps: HandlerDeps): Record<strin
       // Subagent conversations: the UI nests them under this parent instead
       // of listing them beside it.
       parentSessionId: summary.parentSessionId ?? null,
+      // Opened by a scheduled run: the sidebar groups these under Automations.
+      ...(automationRuns.has(summary.id) ? { automationId: automationRuns.get(summary.id) } : {}),
       status: entry?.agent.status ?? (runningChildren.has(summary.id) ? 'running' : 'idle'),
       activity: entry?.agent.activity ?? null,
       pendingInputs: entry !== undefined ? deps.kernel.ctx.sessions.pendingInputs(entry.session).length : 0,

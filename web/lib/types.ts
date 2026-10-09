@@ -278,6 +278,8 @@ export interface SessionListing {
   readonly pinned?: boolean
   /** Set when this row is a subagent: the sidebar nests it under this parent instead of listing it. */
   readonly parentSessionId?: string | null
+  /** Set when a scheduled automation run opened this conversation. */
+  readonly automationId?: string
 }
 
 /** Per-model operator overrides stored on one provider entry. */

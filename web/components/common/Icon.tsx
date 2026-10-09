@@ -90,6 +90,16 @@ const PATHS: Readonly<Record<string, ReactNode>> = {
       <path d="M12 7v5l3 2" />
     </>
   ),
+  calendarClock: (
+    <>
+      <path d="M21 10V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h6" />
+      <path d="M16 2v4" />
+      <path d="M8 2v4" />
+      <path d="M3 10h8" />
+      <circle cx="17.5" cy="17.5" r="4.5" />
+      <path d="M17.5 15.5v2l1.5 1" />
+    </>
+  ),
   messageSquare: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />,
   fileText: (
     <>
