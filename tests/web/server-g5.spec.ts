@@ -150,20 +150,45 @@ describe('G5 web MCP + hooks', () => {
     expect(requests.at(-1)?.tools ?? []).not.toContain('mcp__fixture__query')
   }, 30_000)
 
-  it('an invalid mcp.json rejects the Turn before any model request (no partial execution)', async () => {
-    let modelCalls = 0
+  it('keeps chat available when mcp.json is invalid and omits all MCP tools', async () => {
+    const requests: { tools: string[] }[] = []
     const provider: LlmProvider = {
       name: 'scripted', models: ['scripted'],
-      async *stream() { modelCalls += 1; yield { type: 'delta', delta: 'should not run' }; yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } },
+      async *stream(request) {
+        requests.push({ tools: request.tools?.map((tool) => tool.name) ?? [] })
+        yield { type: 'delta', delta: 'chat still works' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
     }
     const { home, base, wsId } = await boot(provider)
-    await fs.writeFile(path.join(home, 'workspaces', wsId, 'mcp.json'), '{ invalid', 'utf8')
+    await post(base, `/api/workspaces/${wsId}/mcp/fixture`, {
+      transport: 'stdio', command: process.execPath, args: [mcpFixture], enabled: true, allowedTools: ['query'],
+    })
+    await post(base, `/api/workspaces/${wsId}/mcp/fixture/enable`)
+    const warmup = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    await post(base, `/api/workspaces/${wsId}/sessions/${warmup.id}/messages`, { content: 'warm up MCP' })
+    for (let i = 0; i < 50 && requests.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 100))
+    expect(requests[0]?.tools).toContain('mcp__fixture__query')
+
+    await fs.writeFile(path.join(home, 'workspaces', wsId, 'mcp.json'), JSON.stringify({
+      version: 1,
+      servers: { superset: { name: 'wrong-name', transport: 'stdio', command: 'node', enabled: true } },
+    }), 'utf8')
     const session = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    const beforeInvalid = requests.length
     await post(base, `/api/workspaces/${wsId}/sessions/${session.id}/messages`, { content: 'hello' })
-    await new Promise((resolve) => setTimeout(resolve, 250))
-    expect(modelCalls).toBe(0)
-    const events = await sessionEvents(base, wsId, session.id)
-    expect(events.some((event) => event.type === 'turn/end' && event.reason === 'rejected')).toBe(true)
+    for (let i = 0; i < 50 && requests.length === beforeInvalid; i++) await new Promise((resolve) => setTimeout(resolve, 100))
+
+    expect(requests).toHaveLength(beforeInvalid + 1)
+    expect(requests.at(-1)?.tools.some((name) => name.startsWith('mcp__'))).toBe(false)
+    let events: Record<string, any>[] = []
+    for (let i = 0; i < 50; i++) {
+      events = await sessionEvents(base, wsId, session.id)
+      if (events.some((event) => event.type === 'turn/end')) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    expect(events.some((event) => event.type === 'assistant/message' && event.content === 'chat still works')).toBe(true)
+    expect(events.some((event) => event.type === 'turn/end' && event.reason === 'completed')).toBe(true)
   }, 15_000)
 
   it('requiresUserInteraction always asks even exact and wildcard policies say allow', async () => {

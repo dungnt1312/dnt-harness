@@ -1264,16 +1264,36 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     }
   })
 
+  const mcpDisabledTurns = new Set<string>()
+  const mcpTurnKey = (scope: AgentScope | undefined): string | undefined =>
+    scope?.turnId === undefined ? undefined : `${scope.sessionId}:${scope.turnId}`
+  const mcpDisabledForTurn = (scope: AgentScope | undefined): boolean => {
+    const key = mcpTurnKey(scope)
+    return key !== undefined && mcpDisabledTurns.has(key)
+  }
+  kernel.ctx.on('agent/turn-settled', () => {
+    const key = mcpTurnKey(agentScope.getStore())
+    if (key !== undefined) mcpDisabledTurns.delete(key)
+  })
+
   // G5 prompt boundary: connect enabled MCP servers BEFORE the agent
-  // snapshots schemas, then run UserPromptSubmit hooks. Injected content is
-  // lower-trust reference data and becomes a logged input in this Turn.
+  // snapshots schemas, then run UserPromptSubmit hooks. MCP is an optional
+  // capability: invalid/unavailable workspace config removes its tools from
+  // this Turn but cannot reject chat. Injected hook content is lower-trust
+  // reference data and becomes a logged input in this Turn.
   kernel.ctx.on('agent/pre-step', async (claim, next) => {
     const scope = agentScope.getStore()
     const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
     try {
       await connectWorkspaceMcp(workspaceId)
     } catch (error) {
-      return { kind: 'reject', reason: `workspace MCP configuration invalid/unavailable: ${String(error instanceof Error ? error.message : error)}` }
+      const turnKey = mcpTurnKey(scope)
+      if (turnKey !== undefined) mcpDisabledTurns.add(turnKey)
+      await fenceWorkspace(workspaceId).catch(() => undefined)
+      for (const key of mcpDescriptors.keys()) {
+        if (key.startsWith(`${workspaceId}:mcp__`)) mcpDescriptors.delete(key)
+      }
+      console.warn(`web: workspace MCP unavailable in ${workspaceId}; chat continues without MCP tools: ${String(error instanceof Error ? error.message : error)}`)
     }
     const contents = [...claim.contents]
     // Claude: UserPromptSubmit fires for the user's prompt; a subagent's
@@ -1806,17 +1826,36 @@ ${entry.description}`.toLowerCase().includes(query))
     }
   }
 
-  /** An outside edit of mcp.json fences dispatch until Settings accepts the file. */
+  /**
+   * Adopt a stable, valid direct edit of mcp.json. The file is an operator-owned
+   * configuration surface, so a digest change fences the old runtime but does
+   * not require a Settings-only acknowledgement. Invalid or concurrently
+   * changing bytes stay fenced and fail closed until a later observation can
+   * validate one stable document.
+   */
   async function observeConfig(workspaceId: string): Promise<void> {
-    const hash = await fileDigest(workspaceId)
-    const previous = configWatch.get(workspaceId)
-    if (previous !== undefined && previous !== hash) {
+    await serializeMcpMutation(workspaceId as WorkspaceId, async () => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const hash = await fileDigest(workspaceId)
+        const previous = configWatch.get(workspaceId)
+        if (previous === hash && !drifted.has(workspaceId)) return
+        if (previous !== undefined && previous !== hash) await fenceWorkspace(workspaceId as WorkspaceId)
+        try {
+          await mcpStore.loadMcp(workspaceId)
+        } catch (error) {
+          drifted.add(workspaceId)
+          throw error
+        }
+        // An editor may replace the file while validation is in flight. Only
+        // acknowledge the exact bytes that were validated.
+        if (await fileDigest(workspaceId) !== hash) continue
+        configWatch.set(workspaceId, hash)
+        drifted.delete(workspaceId)
+        return
+      }
       drifted.add(workspaceId)
-      configWatch.set(workspaceId, hash)
-      await fenceWorkspace(workspaceId as WorkspaceId)
-      return
-    }
-    configWatch.set(workspaceId, hash)
+      throw new McpConfigError('invalid', 'mcp.json kept changing while it was being loaded; retry once the file is stable')
+    })
   }
 
   async function acknowledgeDrift(workspaceId: string): Promise<void> {
@@ -2069,17 +2108,17 @@ ${entry.description}`.toLowerCase().includes(query))
 
   /**
    * Connect every enabled server for a workspace. An unreadable or invalid
-   * config FILE still rejects the Turn. One server that cannot connect (down,
-   * missing secret, OAuth needed) is skipped: its tools stay out of this
-   * Turn, the reason is shown in Settings, and the other servers still work.
-   * A failed server is retried after {@link MCP_CONNECT_BACKOFF_MS}, so a dead
-   * one does not cost every Turn a connect timeout.
+   * config file disables MCP for the Turn without blocking chat. One server
+   * that cannot connect (down, missing secret, OAuth needed) is skipped: its
+   * tools stay out of this Turn, the reason is shown in Settings, and the
+   * other servers still work. A failed server is retried after
+   * {@link MCP_CONNECT_BACKOFF_MS}, so a dead one does not cost every Turn a
+   * connect timeout.
    */
   async function connectWorkspaceMcp(workspaceId: WorkspaceId): Promise<void> {
-    // Strict validation of workspace-owned MCP/secrets config at the boundary.
-    // Any invalid file rejects the Turn before model/tool execution. Hook
-    // settings follow Claude Code: a malformed entry is skipped and reported
-    // in Settings, never failing the Turn.
+    // Parse strictly so Settings can diagnose malformed workspace-owned MCP or
+    // secrets config. The pre-step boundary catches these file-level errors,
+    // removes this workspace's MCP descriptors, and continues without MCP.
     const config = await mcpStore.loadMcp(workspaceId)
     await mcpStore.loadSecrets(workspaceId)
     const now = Date.now()
@@ -2493,8 +2532,11 @@ ${entry.description}`.toLowerCase().includes(query))
     // allowlist only; Explorer none; other children require explicit spawn
     // grant).
     const exposureScope = { ...(scope ?? { sessionId: undefined }), workspaceId }
-    const exposureSnapshot = await executionAuthority.snapshot(exposureScope, workspaceId, (projected.tools ?? []).some((schema) => schema.name.startsWith('mcp__')))
-    let exposed = projectExposedSchemas(exposureSnapshot, exposureScope, projected.tools ?? [])
+    const projectedTools = mcpDisabledForTurn(scope)
+      ? (projected.tools ?? []).filter((schema) => !schema.name.startsWith('mcp__'))
+      : projected.tools ?? []
+    const exposureSnapshot = await executionAuthority.snapshot(exposureScope, workspaceId, projectedTools.some((schema) => schema.name.startsWith('mcp__')))
+    let exposed = projectExposedSchemas(exposureSnapshot, exposureScope, projectedTools)
     // Workspace-level instructions load for ANY workspace-scoped session;
     // project instructions join when a project is bound.
     const workspaceInstructions =
@@ -2597,6 +2639,7 @@ ${entry.description}`.toLowerCase().includes(query))
         }
         : {}),
       ...(environment !== undefined ? { environment } : {}),
+      ...(scope?.workspaceId !== undefined ? { harnessWorkspaceDir: path.join(resourceHome, 'workspaces', scope.workspaceId) } : {}),
       events,
       mode,
       modeRevision,
@@ -2775,7 +2818,9 @@ ${entry.description}`.toLowerCase().includes(query))
     const exposureScope = { ...agentScope.getStore(), workspaceId, sessionId, rootSessionId }
     try {
       return await executionAuthority.stableModeRead(exposureScope, workspaceId, async (mode, revision) => {
-        const hardDenial = await executionAuthority.refusal(exposureScope, call.name)
+        const hardDenial = call.name.startsWith('mcp__') && mcpDisabledForTurn(agentScope.getStore())
+          ? 'MCP is unavailable for this Turn because its workspace configuration could not be loaded'
+          : await executionAuthority.refusal(exposureScope, call.name)
         const policy = effectivePolicy(mode.permissionDefaults ?? {}, options.yolo === true)
         const normalPermission = resolvePermission(policy, call.name, { defaultMode: options.defaultMode ?? 'ask' })
         const grant = agentScope.getStore() !== undefined ? kernel.ctx.tools.currentGrant() : undefined

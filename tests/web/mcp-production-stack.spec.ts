@@ -80,11 +80,10 @@ describe('mcp production stack', () => {
     const parsed = JSON.parse(await fs.readFile(file, 'utf8')) as { servers: { fixture: { timeoutMs?: number } } }
     parsed.servers.fixture.timeoutMs = 12345
     await fs.writeFile(file, JSON.stringify(parsed))
-    const drifted = JSON.parse((await raw(server.url, 'GET', `/api/workspaces/${wsId}/mcp`, { cookie })).body) as { stale?: boolean }[]
-    expect(drifted[0]?.stale).toBe(true)
-    const accepted = await raw(server.url, 'POST', `/api/workspaces/${wsId}/mcp/acknowledge-drift`, headers, '{}')
-    expect(accepted.status).toBe(200)
     const current = JSON.parse((await raw(server.url, 'GET', `/api/workspaces/${wsId}/mcp`, { cookie })).body) as { stale?: boolean; revision?: string }[]
+    // mcp.json is an operator-owned config file. A valid direct edit fences the
+    // old runtime and becomes the next desired state without a Settings-only
+    // acknowledgement step.
     expect(current[0]?.stale).toBe(false)
     expect(current[0]?.revision).not.toBe(revision)
     const enabled = await raw(server.url, 'POST', `/api/workspaces/${wsId}/mcp/fixture/enable`, headers, '{}')
