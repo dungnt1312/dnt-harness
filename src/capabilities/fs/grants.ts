@@ -301,6 +301,8 @@ const PATH_ARGS: Readonly<Record<string, { readonly arg: string; readonly intent
   Edit: { arg: 'path', intent: 'write' },
   Glob: { arg: 'path', intent: 'read', optional: true },
   Grep: { arg: 'path', intent: 'read', optional: true },
+  // An image edit may read its source from a file; an attachment source has no path.
+  EditImage: { arg: 'path', intent: 'read' },
 }
 
 /** One path a tool call targets, with the access it needs. */

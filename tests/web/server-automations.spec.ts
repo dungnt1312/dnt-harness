@@ -6,7 +6,8 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { createWebServer, type WebServer } from 'dnt-harness'
+import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
+import type { ModelRequest, StreamEvent } from '../../src/harness/llm/types.ts'
 import type { PushSender } from '../../src/web/push.ts'
 import type { ChannelFetch } from '../../src/web/notify-channels.ts'
 import { FakeScriptedLlm } from './fake-llm.ts'
@@ -181,5 +182,49 @@ describe('automations API', () => {
     const log = await fs.readFile(path.join(home, 'workspaces', ws, 'sessions', sessionId, 'events.jsonl'), 'utf8')
     expect(log).toContain('Discord \\"Ops\\"')
     expect(log).not.toContain('Web Push to the user')
+  })
+
+  it('runs the conversation itself as a role: role tools, role instructions, no subagent', async () => {
+    const requests: ModelRequest[] = []
+    const recording: LlmProvider = {
+      name: 'scripted',
+      models: ['scripted'],
+      async *stream(request: ModelRequest): AsyncIterable<StreamEvent> {
+        requests.push(request)
+        yield { type: 'delta', delta: 'Explored: all good.' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    server = await createWebServer({ home, providers: [recording], configFile: path.join(home, 'providers.json'), automations: { scheduler: false }, pushSender: sender, channelFetch })
+    const url = server.url
+    const ws = ((await (await fetch(`${url}/api/workspaces`)).json()) as { id: string; default: boolean }[]).find((row) => row.default)!.id
+    await fetch(`${url}/api/push/subscriptions`, json('POST', { subscription: { endpoint: 'https://push.example/1', keys: { p256dh: 'p', auth: 'a' } } }))
+    expect((await fetch(`${url}/api/workspaces/${ws}/automations`, json('POST', { prompt: 'x', schedules: [{ cron: '0 7 * * *' }], agent: 'no-such-role' }))).status).toBe(400)
+
+    const row = await (await fetch(`${url}/api/workspaces/${ws}/automations`, json('POST', { title: 'Explore', prompt: 'look around', schedules: [{ cron: '0 7 * * *' }], agent: 'explorer', modeId: 'full-access' }))).json() as { id: string; agent: string }
+    expect(row.agent).toBe('explorer')
+    const { sessionId } = await (await fetch(`${url}/api/workspaces/${ws}/automations/${row.id}/run`, { method: 'POST' })).json() as { sessionId: string }
+    const history = await until(
+      async () => await (await fetch(`${url}/api/workspaces/${ws}/automations/${row.id}/runs`)).json() as { status: string; summary?: string }[],
+      (rows) => rows[0]?.status === 'done' || rows[0]?.status === 'failed',
+    )
+    expect(history[0]).toMatchObject({ status: 'done', summary: 'Explored: all good.' })
+    await until(async () => pushed.length, (n) => n > 0)
+    expect(pushed[0]?.payload).toMatchObject({ title: 'Explore', url: `/workspaces/${ws}/sessions/${sessionId}` })
+
+    // The run's own conversation ran as explorer: only its read tools reached
+    // the model (full-access mode alone would offer Write/Edit/Bash/Agent), and
+    // the role's instructions replaced the mode prose.
+    const tools = (requests[0]?.tools ?? []).map((tool) => tool.name).sort()
+    expect(tools).toEqual(['Glob', 'Grep', 'Read'])
+    const system = requests[0]?.messages.find((message) => message.role === 'system')?.content ?? ''
+    expect(system).toContain('Role — explorer')
+    expect(system).not.toContain('Mode —')
+    // No subagent: the prompt and the unattended context sit in the root itself.
+    expect(await (await fetch(`${url}/api/workspaces/${ws}/agents/children?root=${sessionId}`)).json()).toEqual([])
+    const rootLog = await fs.readFile(path.join(home, 'workspaces', ws, 'sessions', sessionId, 'events.jsonl'), 'utf8')
+    expect(rootLog).toContain('"type":"session/role"')
+    expect(rootLog).toContain('unattended scheduled task named \\"Explore\\"')
+    expect(rootLog).toContain('look around')
   })
 })

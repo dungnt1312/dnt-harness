@@ -514,8 +514,68 @@ describe('queued input bubble', () => {
       field.dispatchEvent(new Event('input', { bubbles: true }))
     })
     await act(async () => button('Save').click())
-    expect(onEdit).toHaveBeenCalledWith('i1', 'Fixed')
+    expect(onEdit).toHaveBeenCalledWith('i1', 'Fixed', [])
     expect(host.querySelector('textarea')).toBeNull()
+  })
+
+  it('the edit form shows the queued attachments; removing one saves the rest', async () => {
+    const onEdit = vi.fn(async () => {})
+    const image = { id: 'a'.repeat(64), name: 'shot.png', mediaType: 'image/png', bytes: 10 }
+    const file = { id: 'b'.repeat(64), name: 'notes.pdf', mediaType: 'application/pdf', bytes: 20 }
+    await mount(<QueuedBar workspaceId="ws" items={[{ kind: 'user', content: 'Look', queued: true, inputId: 'i1', attachments: [image, file] }]} running onEdit={onEdit} />)
+    await act(async () => (host.querySelector('button[aria-label="Edit queued message"]') as HTMLButtonElement).click())
+    // The form shows the files, not just the text: thumbnails for images, names for the rest.
+    expect(host.querySelector(`img[alt="shot.png"]`)).not.toBeNull()
+    expect(host.textContent).toContain('notes.pdf')
+    await act(async () => (host.querySelector('button[aria-label="Remove shot.png"]') as HTMLButtonElement).click())
+    expect(host.querySelector(`img[alt="shot.png"]`)).toBeNull()
+    await act(async () => button('Save').click())
+    expect(onEdit).toHaveBeenCalledWith('i1', 'Look', [file])
+  })
+
+  it('removing one of two refs with the same content id keeps the other chip', async () => {
+    const onEdit = vi.fn(async () => {})
+    const first = { id: 'a'.repeat(64), name: 'first.png', mediaType: 'image/png', bytes: 10 }
+    const second = { ...first, name: 'copy.png' }
+    await mount(<QueuedBar workspaceId="ws" items={[{ kind: 'user', content: 'Look', queued: true, inputId: 'i1', attachments: [first, second] }]} running onEdit={onEdit} />)
+    await act(async () => (host.querySelector('button[aria-label="Edit queued message"]') as HTMLButtonElement).click())
+    expect(host.querySelectorAll('img')).toHaveLength(2)
+    await act(async () => (host.querySelector('button[aria-label="Remove first.png"]') as HTMLButtonElement).click())
+    expect(host.querySelectorAll('img')).toHaveLength(1)
+    expect(host.querySelector('img[alt="copy.png"]')).not.toBeNull()
+    await act(async () => button('Save').click())
+    expect(onEdit).toHaveBeenCalledWith('i1', 'Look', [second])
+  })
+
+  it('the edit form can add a file through the host uploader before saving', async () => {
+    const onEdit = vi.fn(async () => {})
+    const onUploadFiles = vi.fn(async () => [{ id: 'c'.repeat(64), name: 'added.png', mediaType: 'image/png', bytes: 30 }])
+    await mount(<QueuedBar workspaceId="ws" items={[{ kind: 'user', content: 'Look', queued: true, inputId: 'i1' }]} running onEdit={onEdit} onUploadFiles={onUploadFiles} />)
+    await act(async () => (host.querySelector('button[aria-label="Edit queued message"]') as HTMLButtonElement).click())
+    const picker = host.querySelector('input[type="file"]') as HTMLInputElement
+    expect(picker).not.toBeNull()
+    const file = new File([new Uint8Array([1])], 'added.png', { type: 'image/png' })
+    await act(async () => {
+      Object.defineProperty(picker, 'files', { value: [file] })
+      picker.dispatchEvent(new Event('change', { bubbles: true }))
+      await Promise.resolve()
+    })
+    expect(onUploadFiles).toHaveBeenCalledTimes(1)
+    expect(host.querySelector('img[alt="added.png"]')).not.toBeNull()
+    const stored = await onUploadFiles.mock.results[0]!.value
+    await act(async () => button('Save').click())
+    expect(onEdit).toHaveBeenCalledWith('i1', 'Look', stored)
+  })
+
+  it('saving with empty text keeps working while attachments remain, and removing the last one disables Save', async () => {
+    const onEdit = vi.fn(async () => {})
+    const image = { id: 'a'.repeat(64), name: 'shot.png', mediaType: 'image/png', bytes: 10 }
+    await mount(<QueuedBar workspaceId="ws" items={[{ kind: 'user', content: '', queued: true, inputId: 'i1', attachments: [image] }]} running onEdit={onEdit} />)
+    await act(async () => (host.querySelector('button[aria-label="Edit queued message"]') as HTMLButtonElement).click())
+    // Empty text but an attachment: Save is enabled.
+    expect((host.querySelector('button[title="Save"]') as HTMLButtonElement).disabled).toBe(false)
+    await act(async () => (host.querySelector('button[aria-label="Remove shot.png"]') as HTMLButtonElement).click())
+    expect((host.querySelector('button[title="Save"]') as HTMLButtonElement).disabled).toBe(true)
   })
   it('a steer that is stopping the turn cannot be edited or deleted', async () => {
     await mount(<QueuedBar items={[{ kind: 'user', content: 'Now', queued: true, inputId: 's', steer: true }]} running onEdit={vi.fn()} onDelete={vi.fn()} />)
@@ -611,6 +671,27 @@ describe('queued input projection', () => {
     expect(items[0]).toMatchObject({ content: 'Fixed', queued: true, inputId: 'i1' })
     expect(items[1]).toMatchObject({ content: 'Drop me', queued: false, withdrawn: true })
     expect(items[1]).not.toHaveProperty('notSent')
+  })
+  it('a revision replaces or drops attachments of the queued twin and of the retry input', () => {
+    const image = { id: 'a'.repeat(64), name: 'old.png', mediaType: 'image/png', bytes: 8 }
+    const next = { id: 'b'.repeat(64), name: 'new.png', mediaType: 'image/png', bytes: 16 }
+    const items = projectItems([
+      { type: 'input/queued', seq: 0, inputId: 'i1', content: 'Look', attachments: [image] },
+      { type: 'input/revised', seq: 1, inputId: 'i1', content: 'Look', attachments: [next] },
+      { type: 'input/revised', seq: 2, inputId: 'i1', content: 'Look', attachments: [] },
+    ])
+    // Dropped: the twin shows no attachments after the empty revision.
+    expect(items[0]).toMatchObject({ content: 'Look', queued: true, inputId: 'i1' })
+    expect(items[0]?.kind === 'user' ? (items[0].attachments ?? []) : []).toEqual([])
+
+    const replaced = projectItems([
+      { type: 'input/queued', seq: 0, inputId: 'i1', content: 'Look', attachments: [image] },
+      { type: 'input/revised', seq: 1, inputId: 'i1', content: 'Look', attachments: [next] },
+      { type: 'user/message', seq: 2, turnId: 't1', inputId: 'i1', content: 'Look' },
+    ])
+    expect(replaced[0]).toMatchObject({ content: 'Look', queued: false, attachments: [next] })
+    // Retry resends what the user last edited, not the original queue.
+    expect(replaced.filter((item) => item.kind === 'assistant')).toHaveLength(0)
   })
   it('keeps the twin queued until its own inputId is consumed', () => {
     const items = projectItems([
@@ -1152,14 +1233,28 @@ describe('sidebar sections + live rows + workspace management', () => {
     await mount(<SessionList sessions={list} projects={[project]} current={null} filter="" liveRunning={false} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} />)
     const text = host.textContent ?? ''
     expect(text.indexOf('Automations')).toBeGreaterThan(-1)
-    expect(text.indexOf('Automations')).toBeLessThan(text.indexOf('Acme'))
-    // Runs show once, inside the group (not again in their project or the timeline).
-    expect(text.indexOf('Logs run')).toBeLessThan(text.indexOf('Acme'))
+    // The group sits above the Acme folder header (the last "Acme" in the text;
+    // the earlier one is a run's project line).
+    expect(text.indexOf('Automations')).toBeLessThan(text.lastIndexOf('Acme'))
+    // Runs show once, inside the group (not again in their project or the timeline),
+    // each naming where it ran.
+    expect(text.indexOf('Logs run')).toBeLessThan(text.lastIndexOf('Acme'))
     expect(text.split('Pills run').length).toBe(2)
     expect(text.split('Logs run').length).toBe(2)
+    expect(text).toContain('Pills runChat only')
+    expect(text).toContain('Logs runAcme')
     await act(async () => button('Automations').click())
     expect(host.textContent).not.toContain('Pills run')
     expect(host.textContent).toContain('Loose chat')
+  })
+  it('gives the Automations folder manage and new actions, even with no runs yet', async () => {
+    const opened: string[] = []
+    await mount(<SessionList sessions={[]} projects={[]} current={null} filter="" liveRunning={false} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} automations={{ onOpen: () => opened.push('open'), onNew: () => opened.push('new'), active: false }} />)
+    expect(host.textContent).toContain('Automations')
+    expect(host.textContent).not.toContain('No conversations yet')
+    await act(async () => (host.querySelector('button[aria-label="Manage automations"]') as HTMLButtonElement).click())
+    await act(async () => (host.querySelector('button[aria-label="New scheduled task"]') as HTMLButtonElement).click())
+    expect(opened).toEqual(['open', 'new'])
   })
   it('marks a folder with a terminal icon while a shell is open in it', async () => {
     await mount(<SessionList sessions={[...sessions]} projects={[project]} current={null} filter="" liveRunning={false} terminalProjects={new Set(['p1'])} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} />)

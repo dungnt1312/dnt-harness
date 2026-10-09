@@ -152,14 +152,23 @@ export class Agent {
   }
 
   /**
-   * Revise a waiting input in place (same id, same queue position). Returns
-   * false once a turn has claimed it: it is no longer the user's to change.
-   * An input not in the inbox (left pending by a restart) is only checked —
-   * the host's durable record is what adoption reads later.
+   * Revise a waiting input in place (same id, same queue position). An
+   * `attachments` array replaces the input's list (empty drops them);
+   * omitted, the existing list rides along. Returns false once a turn has
+   * claimed it: it is no longer the user's to change. An input not in the
+   * inbox (left pending by a restart) is only checked — the host's durable
+   * record is what adoption reads later.
    */
-  reviseQueued(inputId: InputId, content: string): boolean {
+  reviseQueued(inputId: InputId, content: string, attachments?: readonly AttachmentRef[]): boolean {
     if (this.claimedInputIds.has(inputId)) return false
-    this.inbox = this.inbox.map((item) => (item.kind === 'user' && item.inputId === inputId ? { ...item, content } : item))
+    this.inbox = this.inbox.map((item) => (item.kind === 'user' && item.inputId === inputId
+      ? {
+        ...item,
+        content,
+        // An empty array must survive as "no attachments", not fall back.
+        ...(attachments !== undefined ? { attachments: [...attachments] } : item.attachments !== undefined ? { attachments: item.attachments } : {}),
+      }
+      : item))
     return true
   }
 

@@ -19,6 +19,10 @@ vi.mock('../../lib/api.ts', () => ({
   },
   fetchProviderModels: vi.fn(async () => ({ ok: true, models: ['auto', 'fresh-1'] })),
   testProvider: vi.fn(async () => ({ ok: true })),
+  getImageGenerationSettings: vi.fn(async () => ({ provider: null, model: null })),
+  setImageGenerationSettings: vi.fn(async (value: unknown) => value),
+  getImageUnderstandingSettings: vi.fn(async () => ({ provider: null, model: null })),
+  setImageUnderstandingSettings: vi.fn(async (value: unknown) => value),
   listMcpServers: vi.fn(async () => [{
     name: 'fs', transport: 'stdio', enabled: true, status: 'ready', breakerOpenUntil: null,
     discoveredTools: ['query', 'explode'], allowedTools: ['query'], unmatchedAllowlist: ['missing'],
@@ -576,9 +580,30 @@ describe('settings dialog', () => {
 
   it('gives every section tab an icon', async () => {
     await render()
-    const tabs = [...document.body.querySelectorAll('[role="tab"]')]
-    expect(tabs).toHaveLength(12)
-    for (const tab of tabs) expect(tab.querySelector('svg')).not.toBeNull()
+    const sections = [...document.body.querySelectorAll('[aria-label="Settings sections"] [role="tab"]')]
+    expect(sections).toHaveLength(11)
+    const sub = [...document.body.querySelectorAll('[aria-label="Providers & Models"] [role="tab"]')]
+    expect(sub.map((tab) => tab.textContent)).toEqual(['Providers', 'Model aliases', 'Image generation', 'Image understanding'])
+    for (const tab of [...sections, ...sub]) expect(tab.querySelector('svg')).not.toBeNull()
+  })
+
+  it('keeps providers, model aliases, and image generation as sub-tabs of one section', async () => {
+    await render()
+    const subTab = (name: string): HTMLElement =>
+      [...document.body.querySelectorAll<HTMLElement>('[aria-label="Providers & Models"] [role="tab"]')].find((node) => node.textContent === name)!
+    // The provider editor and its footer belong to the Providers sub-tab only.
+    expect(input('Name').value).toBe('local')
+    expect(button('Save changes')).toBeTruthy()
+    await act(async () => subTab('Image generation').click())
+    expect(subTab('Image generation').getAttribute('aria-selected')).toBe('true')
+    expect(document.body.querySelector('[aria-label="Image generation"]')).not.toBeNull()
+    expect([...document.body.querySelectorAll('button')].some((node) => node.textContent === 'Save changes')).toBe(false)
+    await act(async () => subTab('Image understanding').click())
+    expect(document.body.querySelector('[aria-label="Image understanding"]')).not.toBeNull()
+    await act(async () => subTab('Model aliases').click())
+    expect(document.body.querySelector('[aria-label="Model alias editor"]')).not.toBeNull()
+    await act(async () => subTab('Providers').click())
+    expect(input('Name').value).toBe('local')
   })
 
   it('states the provider name once, as the editable title, with enablement as state plus a verb', async () => {

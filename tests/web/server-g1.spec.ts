@@ -160,7 +160,7 @@ describe('input acceptance over REST', () => {
         },
       }
     }
-    type LogEvent = { type: string; reason?: string; content?: string; delivery?: string; inputId?: string; outcome?: string }
+    type LogEvent = { type: string; reason?: string; content?: string; delivery?: string; inputId?: string; outcome?: string; attachments?: unknown[] }
     const ws = (id: string, action: string): string => `/api/workspaces/default/sessions/${id}/${action}`
     async function events(base: string, id: string): Promise<LogEvent[]> {
       const response = await fetch(`${base}${ws(id, 'events')}`)
@@ -297,6 +297,64 @@ describe('input acceptance over REST', () => {
         expect(log.find((e) => e.type === 'input/settled' && e.inputId === drop.inputId)?.outcome).toBe('withdrawn')
         // Consumed: no longer editable.
         expect((await input(keep.inputId, { method: 'DELETE' })).status).toBe(404)
+      } finally {
+        await server.close()
+      }
+    })
+
+    it('a queued input can be edited with attachments: added, replaced, and removed', async () => {
+      const server = await createWebServer({ root, providers: [steerableProvider()] })
+      const upload = async (name: string): Promise<{ id: string; name: string; mediaType: string; bytes: number }> => {
+        const response = await fetch(`${server.url}/api/workspaces/default/attachments`, {
+          method: 'POST',
+          headers: { 'content-type': 'image/png', 'x-file-name': encodeURIComponent(name) },
+          body: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...new TextEncoder().encode(name)]),
+        })
+        expect(response.status).toBe(201)
+        return await response.json() as { id: string; name: string; mediaType: string; bytes: number }
+      }
+      try {
+        const { id } = (await (await post(server.url, '/api/sessions')).json()) as { id: string }
+        await post(server.url, ws(id, 'messages'), { content: 'first' })
+        await settle(server.url, id, stepping)
+        const first = (await (await post(server.url, ws(id, 'messages'), { content: 'look', attachments: [await upload('a.png')] })).json()) as { inputId: string }
+        const second = (await (await post(server.url, ws(id, 'messages'), { content: 'plain' })).json()) as { inputId: string }
+        const input = (inputId: string, body: unknown): Promise<Response> =>
+          fetch(`${server.url}${ws(id, `inputs/${inputId}`)}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+
+        // Add one image to an attachment-less input.
+        const b = await upload('b.png')
+        const added = await input(second.inputId, { content: 'look here', attachments: [b] })
+        expect(added.status).toBe(200)
+        expect(await added.json()).toEqual({ inputId: second.inputId, revised: true })
+
+        // Replace the image on an input that already carries one.
+        const c = await upload('c.png')
+        const replaced = await input(first.inputId, { content: 'look', attachments: [c] })
+        expect(replaced.status).toBe(200)
+
+        // Remove every attachment: text alone carries the input again.
+        const removed = await input(second.inputId, { content: 'look here', attachments: [] })
+        expect(removed.status).toBe(200)
+
+        // A bogus reference is refused without touching the queue.
+        const bogus = await input(second.inputId, { content: 'x', attachments: [{ id: '0'.repeat(64), name: 'x.png', mediaType: 'image/png', bytes: 5 }] })
+        expect(bogus.status).toBe(400)
+
+        const log = await settle(server.url, id, (l) => l.filter((e) => e.type === 'input/revised').length >= 3)
+        const revised = log.filter((e) => e.type === 'input/revised')
+        expect(revised.at(-3)?.attachments).toEqual([b])
+        expect(revised.at(-2)?.attachments).toEqual([c])
+        expect(revised.at(-1)?.attachments).toEqual([])
+
+        expect((await post(server.url, ws(id, 'steer'))).status).toBe(202)
+        const final = await settle(server.url, id, (l) => ends(l).length >= 2)
+        expect(ends(final)).toEqual(['steered', 'completed'])
+        const withImage = final.filter((e) => e.type === 'user/message' && e.content === 'look')
+        expect(withImage).toHaveLength(1)
+        expect(withImage[0]?.attachments).toEqual([c])
+        // The empty-text edit kept its attachment long removed: the model saw text.
+        expect(final.filter((e) => e.type === 'user/message' && e.content === 'look here')).toHaveLength(1)
       } finally {
         await server.close()
       }

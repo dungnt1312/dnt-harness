@@ -3,7 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { GitPanel } from './GitPanel.tsx'
-import type { GitStatusReport } from '../../lib/api.ts'
+import type { GitDiffReport, GitStatusReport } from '../../lib/api.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -18,11 +18,12 @@ const REPORT: GitStatusReport = {
 }
 
 const fetchGitStatus = vi.fn(async (): Promise<GitStatusReport> => REPORT)
+const fetchGitDiff = vi.fn(async (_ws: string, _project: string, path: string): Promise<GitDiffReport> =>
+  ({ path, lines: [], truncated: false, binary: path.endsWith('.png') }))
 
 vi.mock('../../lib/api.ts', () => ({
   fetchGitStatus: () => fetchGitStatus(),
-  fetchGitDiff: vi.fn(async (_ws: string, _project: string, path: string) =>
-    ({ path, lines: [], truncated: false, binary: path.endsWith('.png') })),
+  fetchGitDiff: (_ws: string, _project: string, path: string) => fetchGitDiff(_ws, _project, path),
   mediaKindOf: (path: string) => (path.endsWith('.png') ? 'image' : path.endsWith('.mp3') ? 'audio' : path.endsWith('.mp4') ? 'video' : null),
   projectMediaUrl: (_ws: string, _project: string, path: string) => `/media?path=${encodeURIComponent(path)}`,
 }))
@@ -35,6 +36,7 @@ afterEach(async () => {
   root = undefined
   host?.remove()
   fetchGitStatus.mockClear()
+  fetchGitDiff.mockClear()
 })
 
 const PROJECT = { id: 'p1', name: 'proj', path: 'C:/proj' }
@@ -128,4 +130,14 @@ it('a focused file row can open the file itself in the workbench', async () => {
   expect(openFirst).not.toBeNull()
   await act(async () => openFirst!.click())
   expect(onOpenFile).toHaveBeenCalledWith('src/a.ts')
+
+  // The diff frame carries its own opener: one click on the row's diff body
+  // expands it, and the frame's corner button opens the same file.
+  fetchGitDiff.mockResolvedValueOnce({ path: 'src/a.ts', lines: [{ kind: 'context' as const, text: 'const a = 1' }], truncated: false, binary: false })
+  await act(async () => view.querySelector<HTMLButtonElement>('ul li button[aria-expanded]')!.click())
+  await act(async () => { await vi.waitFor(() => expect(view.querySelector('[aria-label="Diff of src/a.ts"]')).not.toBeNull()) })
+  const frameOpener = view.querySelector<HTMLButtonElement>('[aria-label="Diff of src/a.ts"] ~ button[aria-label="Open a.ts in workbench"]')
+  expect(frameOpener).not.toBeNull()
+  await act(async () => frameOpener!.click())
+  expect(onOpenFile).toHaveBeenLastCalledWith('src/a.ts')
 })

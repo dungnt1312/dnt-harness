@@ -145,7 +145,10 @@ export function NotifyChannelsPanel({ notify, errorText }: {
         ) : (
           <div key={row.id} className="flex items-center gap-2 text-[13px]">
             <Badge tone="gray">{LABELS[row.kind]}</Badge>
-            <span className="min-w-0 flex-1 truncate text-fg">{row.name} <span className="text-fg-faint">{row.summary}</span></span>
+            <span className="min-w-0 flex-1 truncate text-fg">
+              {row.name} <span className="text-fg-faint">{row.summary}</span>
+              {row.mentions !== undefined && row.mentions.length > 0 ? <span className="text-fg-faint"> · @{row.mentions.join(', @')}</span> : null}
+            </span>
             <Switch checked={row.enabled} label={row.enabled ? 'On' : 'Off'} onChange={(enabled) => void run(() => updateChannel(row.id, { enabled }).then(() => undefined))} />
             <RowMenu
               label={`Actions for ${row.name}`}
@@ -175,13 +178,16 @@ function ChannelForm({ existing, onCancel, onSaved, notify, errorText }: {
   const [botToken, setBotToken] = useState('')
   const [chatId, setChatId] = useState('')
   const [webhookUrl, setWebhookUrl] = useState('')
+  const [mentions, setMentions] = useState((existing?.mentions ?? []).join(', '))
   const [busy, setBusy] = useState(false)
   const editing = existing !== undefined
   const secretHint = editing ? 'Leave blank to keep the saved value' : undefined
 
   const save = async (): Promise<void> => {
     setBusy(true)
-    const config: ChannelConfigInput = kind === 'telegram' ? { botToken, chatId } : { webhookUrl }
+    const config: ChannelConfigInput = kind === 'telegram'
+      ? { botToken, chatId }
+      : { webhookUrl, ...(kind === 'teams' ? { mentions } : {}) }
     try {
       if (existing === undefined) {
         const created = await createChannel({ kind, name, config })
@@ -191,8 +197,10 @@ function ChannelForm({ existing, onCancel, onSaved, notify, errorText }: {
           (cause: unknown) => notify(`${created.name} added, but the test failed: ${errorText(cause)}`),
         )
       } else {
+        // Teams always sends its config: mentions are editable on their own,
+        // and a blank webhook field keeps the saved URL host-side.
         const hasSecret = kind === 'telegram' ? botToken !== '' || chatId !== '' : webhookUrl !== ''
-        await updateChannel(existing.id, { name, ...(hasSecret ? { config } : {}) })
+        await updateChannel(existing.id, { name, ...(hasSecret || kind === 'teams' ? { config } : {}) })
         notify('Channel saved', 'ok')
       }
       await onSaved()
@@ -232,6 +240,12 @@ function ChannelForm({ existing, onCancel, onSaved, notify, errorText }: {
           <TextInput type="password" autoComplete="off" mono value={webhookUrl} placeholder={secretHint ?? (kind === 'discord' ? 'https://discord.com/api/webhooks/…' : 'https://…')} onChange={(event) => setWebhookUrl(event.target.value)} />
         </label>
       )}
+      {kind === 'teams' ? (
+        <label className="flex flex-col gap-1 text-xs text-fg-muted">Mention (optional)
+          <TextInput value={mentions} placeholder="name@company.com, other@company.com" onChange={(event) => setMentions(event.target.value)} />
+          <span className="text-fg-faint">Work emails to @mention on every message, separated by commas.</span>
+        </label>
+      ) : null}
       <div className="flex justify-end gap-1.5">
         <Button size="sm" variant="ghost" onClick={onCancel}>Cancel</Button>
         <Button size="sm" variant="primary" disabled={busy || !complete} onClick={() => void save()}>{editing ? 'Save' : 'Add and test'}</Button>

@@ -94,6 +94,16 @@ export interface BuildContextInput {
   /** Provenance of the child's role definition (bundled role vs workspace file). */
   readonly childSource?: 'bundled' | 'user' | 'workspace' | 'project'
   /**
+   * A ROOT conversation running as an agent role (automations): the role's
+   * instructions replace the mode prose. Context sources still follow the
+   * mode; tools are already narrowed to the role's ceiling.
+   */
+  readonly rootRole?: {
+    readonly definition: string
+    readonly instructions: string
+    readonly source?: 'bundled' | 'user' | 'workspace' | 'project'
+  }
+  /**
    * Workspace-authored replacement for the base system prompt (root
    * conversations). Blank/undefined falls back to {@link DEFAULT_BASE_SYSTEM};
    * the mode's instructions and every other block are unaffected.
@@ -404,7 +414,21 @@ export function buildContext(input: BuildContextInput): AssembledContext {
   // ── system ─────────────────────────────────────────────────
   const systemParts: string[] = []
   const child = input.child
-  if (child === undefined) {
+  const rootRole = input.rootRole
+  if (child === undefined && rootRole !== undefined) {
+    // A root running as a role (automations): the base prompt stays (it is
+    // still a host conversation), but the ROLE replaces the mode prose, and
+    // the capability line names exactly the tools this request carries.
+    systemParts.push(resolveSystemOverride(input.baseSystemOverride, DEFAULT_BASE_SYSTEM))
+    systemParts.push(
+      schemas.length > 0
+        ? `You may call: ${schemas.map((schema) => schema.name).join(', ')} (each still subject to host policy and approval).`
+        : 'You have no tools in this request.',
+    )
+    if (rootRole.instructions.trim() !== '') {
+      systemParts.push(`Role — ${rootRole.definition}:\n${rootRole.instructions.trim()}`)
+    }
+  } else if (child === undefined) {
     systemParts.push(resolveSystemOverride(input.baseSystemOverride, DEFAULT_BASE_SYSTEM))
     if (mode.definition.instructions.trim() !== '') {
       systemParts.push(`Mode — ${mode.definition.name}:\n${mode.definition.instructions.trim()}`)
@@ -728,7 +752,15 @@ export function buildContext(input: BuildContextInput): AssembledContext {
             ...(input.childSource !== undefined ? { source: input.childSource } : {}),
           },
         }
-        : {}),
+        : rootRole !== undefined
+          ? {
+            child: {
+              definition: rootRole.definition,
+              instructionsHash: sha256Text(rootRole.instructions),
+              ...(rootRole.source !== undefined ? { source: rootRole.source } : {}),
+            },
+          }
+          : {}),
       ...(inheritedMessage !== undefined && input.inheritedContext !== undefined
         ? { parentContext: { hash: sha256Text(input.inheritedContext), chars: input.inheritedContext.length } }
         : {}),

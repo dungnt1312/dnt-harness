@@ -118,8 +118,9 @@ describe('attachments on a message', () => {
 
     const user = lastMessages.find((message) => message.role === 'user')
     expect(Array.isArray(user?.content)).toBe(true)
+    // The text names the image's id so EditImage can use it as a source.
     expect(user?.content).toEqual([
-      { type: 'text', text: 'what is this?' },
+      { type: 'text', text: `what is this?\n\n[image attachment "shot.png" attachmentId=${ref.id}]` },
       { type: 'image', mediaType: 'image/png', base64: PNG.toString('base64'), name: 'shot.png' },
     ])
   })
@@ -139,6 +140,7 @@ describe('attachments on a message', () => {
     const ref = await uploaded('shot.png', 'image/png', PNG)
     expect((await send('', [ref])).status).toBe(202)
     expect(lastMessages.find((message) => message.role === 'user')?.content).toEqual([
+      { type: 'text', text: `[image attachment "shot.png" attachmentId=${ref.id}]` },
       { type: 'image', mediaType: 'image/png', base64: PNG.toString('base64'), name: 'shot.png' },
     ])
   })

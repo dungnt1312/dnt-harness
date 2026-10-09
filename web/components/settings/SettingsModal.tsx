@@ -29,18 +29,40 @@ import { ModelSettingsDialog, SyncModelsDialog } from './model-dialogs.tsx'
 import { AgentsPanel, HooksPanel, McpPanel, MemoryPanel, SecretsPanel, SkillsPanel } from './ManagementPanels.tsx'
 import { PermissionsPanel, type PermissionsSubTab } from './PermissionsPanel.tsx'
 import { UnsavedChangesContext, type UnsavedChangesApi } from './unsaved-changes.tsx'
+import { SubTabs } from './settings-kit.tsx'
 import { SystemPromptsPanel } from './SystemPromptsPanel.tsx'
 import { UsagePanel } from './UsagePanel.tsx'
 import { ModelAliasesPanel } from './ModelAliasesPanel.tsx'
+import { ImageGenerationPanel } from './ImageGenerationPanel.tsx'
+import { ImageUnderstandingPanel } from './ImageUnderstandingPanel.tsx'
 import { modelOptions } from '../../lib/providers.ts'
 import type { ModelSettings, ProjectRow, ProviderSummary } from '../../lib/types.ts'
 
 /** Settings are grouped per concern; providers keep their own full editor. */
-type SettingsTab = 'providers' | 'model-aliases' | 'usage' | 'projects' | 'permissions' | 'prompts' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'
+type SettingsTab = 'providers' | 'usage' | 'projects' | 'permissions' | 'prompts' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'
 
 const LEGACY_TAB_REDIRECT: Readonly<Record<string, SettingsTab>> = {
   modes: 'permissions',
   'dangerous-commands': 'permissions',
+  // Model aliases and image generation are sub-tabs of Providers & Models.
+  'model-aliases': 'providers',
+  'image-generation': 'providers',
+  'image-understanding': 'providers',
+}
+
+/** Sub-tabs of Providers & Models: everything that picks an endpoint or a model. */
+type ModelsSubTab = 'providers' | 'model-aliases' | 'image-generation' | 'image-understanding'
+
+const MODELS_SUB_TABS: readonly { readonly value: ModelsSubTab; readonly label: string; readonly hint: string; readonly icon: IconName }[] = [
+  { value: 'providers', label: 'Providers', hint: 'Model endpoints and keys', icon: 'globe' },
+  { value: 'model-aliases', label: 'Model aliases', hint: 'Global subagent model mappings', icon: 'gitBranch' },
+  { value: 'image-generation', label: 'Image generation', hint: 'Provider and model for the GenerateImage and EditImage tools', icon: 'fileImage' },
+  { value: 'image-understanding', label: 'Image understanding', hint: 'Vision model for DescribeImage when chat is text-only', icon: 'eye' },
+]
+
+/** Legacy tab ids that named a Providers & Models sub-pane directly. */
+function modelsSubOf(raw: string | undefined): ModelsSubTab | undefined {
+  return raw === 'model-aliases' || raw === 'image-generation' || raw === 'image-understanding' ? raw : undefined
 }
 
 /** Legacy links that named a Permissions sub-pane directly. */
@@ -59,8 +81,8 @@ export const SETTINGS_TAB_STORAGE_KEY = 'dnt-harness.settings-tab.v1'
 
 function readStoredTab(): SettingsTab | undefined {
   try {
-    const raw = window.localStorage.getItem(SETTINGS_TAB_STORAGE_KEY)
-    return TABS.some((entry) => entry.id === raw) ? raw as SettingsTab : undefined
+    const raw = normalizeTab(window.localStorage.getItem(SETTINGS_TAB_STORAGE_KEY) ?? undefined)
+    return TABS.some((entry) => entry.id === raw) ? raw : undefined
   } catch {
     return undefined // Storage may be unavailable; fall back to the default tab.
   }
@@ -71,8 +93,7 @@ function storeTab(tab: SettingsTab): void {
 }
 
 const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonly hint: string; readonly icon: IconName }[] = [
-  { id: 'providers', label: 'Providers', hint: 'Model endpoints and keys', icon: 'globe' },
-  { id: 'model-aliases', label: 'Model aliases', hint: 'Global subagent model mappings', icon: 'gitBranch' },
+  { id: 'providers', label: 'Providers & Models', hint: 'Model endpoints, aliases, and image generation', icon: 'globe' },
   { id: 'usage', label: 'Usage', hint: 'Token usage across every workspace', icon: 'layers' },
   { id: 'projects', label: 'Projects', hint: 'Folders conversations in this workspace can work in', icon: 'folder' },
   { id: 'permissions', label: 'Permissions', hint: 'Modes & dangerous command guard', icon: 'shield' },
@@ -87,7 +108,7 @@ const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonl
 
 /** Nav groups: global settings first, then the active workspace's. */
 const TAB_GROUPS: readonly { readonly label: string; readonly ids: readonly SettingsTab[] }[] = [
-  { label: 'Global', ids: ['providers', 'model-aliases', 'usage'] },
+  { label: 'Global', ids: ['providers', 'usage'] },
   { label: 'Workspace', ids: ['projects', 'permissions', 'prompts', 'skills', 'memory', 'agents', 'mcp', 'hooks', 'secrets'] },
 ]
 
@@ -159,7 +180,7 @@ export function SettingsModal({
   activeProjectId = null,
 }: {
   /** Deep link; when absent Settings reopens on the tab it last showed. */
-  readonly initialTab?: SettingsTab | 'modes' | 'dangerous-commands' | undefined
+  readonly initialTab?: SettingsTab | 'modes' | 'dangerous-commands' | ModelsSubTab | undefined
   /** The open conversation's project: its `.claude/` layers show in Agents and Hooks. */
   readonly activeProjectId?: string | null
   readonly workspaceName?: string | undefined
@@ -190,6 +211,9 @@ export function SettingsModal({
     setTabState(next)
     storeTab(next)
   }
+  const [modelsSub, setModelsSub] = useState<ModelsSubTab>('providers')
+  /** The provider editor (with its own footer) is showing. */
+  const providerEditor = tab === 'providers' && modelsSub === 'providers'
   // Roles pin a model from the same enabled provider/model list the composer
   // offers, so a role can never name an endpoint the host cannot serve.
   const roleModelOptions = useMemo(
@@ -236,6 +260,7 @@ export function SettingsModal({
     const first = providers.find((provider) => provider.id === activeProvider) ?? providers[0]
     seeded.current = first !== undefined
     setTab(normalizeTab(initialTab) ?? readStoredTab() ?? 'providers')
+    setModelsSub(modelsSubOf(initialTab) ?? 'providers')
     setSelectedId(first?.id ?? null)
     setDraft(first === undefined ? BLANK : draftOf(first))
     setNotice(null)
@@ -262,7 +287,11 @@ export function SettingsModal({
   // Opening Settings at another tab while it is already open still switches.
   useEffect(() => {
     const next = normalizeTab(initialTab)
-    if (open && next !== undefined) setTab(next)
+    if (open && next !== undefined) {
+      setTab(next)
+      const sub = modelsSubOf(initialTab)
+      if (sub !== undefined) setModelsSub(sub)
+    }
   }, [initialTab])
 
   const dirty = useMemo(() => {
@@ -501,6 +530,7 @@ export function SettingsModal({
   }
 
   const activeTab = TABS.find((entry) => entry.id === tab)
+  const activeHint = tab === 'providers' ? MODELS_SUB_TABS.find((entry) => entry.value === modelsSub)?.hint : activeTab?.hint
   const tabTrigger = 'flex h-9 w-full items-center gap-2.5 rounded-lg px-3 text-left text-sm text-fg-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-link disabled:pointer-events-none disabled:opacity-50 data-[state=active]:bg-hover data-[state=active]:font-medium data-[state=active]:text-fg'
   const testBlocker = isNew ? 'Add the provider first.' : dirty ? 'Save your changes first — the test uses the saved configuration.' : null
 
@@ -562,20 +592,32 @@ export function SettingsModal({
             <div className="flex min-w-0 flex-col">
               <div className="flex min-w-0 items-center gap-2">
                 <h2 className="m-0 text-base font-semibold">{activeTab?.label ?? 'Settings'}</h2>
-                {tab === 'providers' || tab === 'model-aliases' || tab === 'usage'
+                {tab === 'providers' || tab === 'usage'
                   ? <Badge>All workspaces</Badge>
                   : <Badge tone="blue" title="These settings apply only to this workspace.">Workspace: {workspaceName ?? workspaceId ?? 'none'}</Badge>}
               </div>
-              <span className="truncate text-[13px] text-fg-faint">{activeTab?.hint ?? ''}</span>
+              <span className="truncate text-[13px] text-fg-faint">{activeHint ?? ''}</span>
             </div>
             <IconButton label="Close settings" size="md" disabled={busy !== null} onClick={dismiss}><Icon name="close" size={18} /></IconButton>
           </header>
 
           <Tabs.Content key={tab} value={tab} tabIndex={0} className="min-h-0 min-w-0 flex-1 overflow-y-auto px-5 py-5 outline-none">
 
-            {tab === 'usage' ? <UsagePanel /> : tab !== 'providers' ? (
+            {tab === 'providers' ? (
+              <div className="mb-5">
+                <SubTabs
+                  label="Providers & Models"
+                  value={modelsSub}
+                  onChange={(value) => { if (value !== modelsSub) leave(() => setModelsSub(value)) }}
+                  tabs={MODELS_SUB_TABS}
+                />
+              </div>
+            ) : null}
+            {tab === 'usage' ? <UsagePanel /> : !providerEditor ? (
               <UnsavedChangesContext.Provider value={unsavedApi}>
-                {tab === 'model-aliases' ? <ModelAliasesPanel providers={providers} /> : null}
+                {tab === 'providers' && modelsSub === 'model-aliases' ? <ModelAliasesPanel providers={providers} /> : null}
+                {tab === 'providers' && modelsSub === 'image-generation' ? <ImageGenerationPanel providers={providers} /> : null}
+                {tab === 'providers' && modelsSub === 'image-understanding' ? <ImageUnderstandingPanel providers={providers} /> : null}
                 {tab === 'projects' ? <ProjectsPanel workspaceId={workspaceId} projects={projects} onChanged={onProjectsChanged} sessionCounts={sessionCounts} /> : null}
                 {tab === 'permissions' ? <PermissionsPanel workspaceId={workspaceId} onChanged={onRefresh} initialSub={permissionsSubOf(initialTab)} /> : null}
                 {tab === 'prompts' ? <SystemPromptsPanel workspaceId={workspaceId} /> : null}
@@ -817,7 +859,7 @@ export function SettingsModal({
             )}
           </Tabs.Content>
 
-          {tab === 'providers' && notice !== null ? (
+          {providerEditor && notice !== null ? (
             // Outside the scrolling pane, so a save or test result is always in view.
             <div className="shrink-0 border-t border-line px-5 pt-3">
               {notice.kind === 'bad'
@@ -825,7 +867,7 @@ export function SettingsModal({
                 : <p className="m-0 flex items-center gap-2 rounded-lg bg-ok-soft px-3 py-2 text-[13px] text-ok" role="status"><Icon name="check" size={15} />{notice.text}</p>}
             </div>
           ) : null}
-          {tab === 'providers' ? (
+          {providerEditor ? (
             <footer className={`flex shrink-0 flex-wrap items-center gap-2 px-5 py-3 ${notice === null ? 'border-t border-line' : ''}`}>
               {/* Why Test is unavailable, as text rather than a hover-only tooltip. */}
               <span className={`flex min-w-0 flex-1 items-center gap-2 text-[13px] ${dirty ? 'text-warn' : 'text-fg-faint'}`}>

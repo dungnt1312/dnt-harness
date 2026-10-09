@@ -49,6 +49,11 @@ export interface Automation {
   readonly projectId: string | null
   readonly modeId: string | null
   readonly controls: AutomationControls | null
+  /**
+   * Agent role the run delegates to (as a manual subagent spawn: the role's
+   * tool ceiling, instructions and model apply). Null = the main agent.
+   */
+  readonly agent: string | null
   /** False when paused by the user or finished (no future runs left). */
   readonly enabled: boolean
   /** Send the result to the user when a run ends (failures and approvals always go out). */
@@ -66,7 +71,7 @@ export interface Automation {
   readonly updatedAt: number
 }
 
-export type AutomationInput = Pick<Automation, 'title' | 'prompt' | 'schedules' | 'endsAt' | 'maxRuns' | 'projectId' | 'modeId' | 'controls' | 'enabled' | 'notify' | 'notifyTargets' | 'catchUpMinutes'>
+export type AutomationInput = Pick<Automation, 'title' | 'prompt' | 'schedules' | 'endsAt' | 'maxRuns' | 'projectId' | 'modeId' | 'controls' | 'agent' | 'enabled' | 'notify' | 'notifyTargets' | 'catchUpMinutes'>
 
 export type RunStatus = 'started' | 'done' | 'failed' | 'needs-approval' | 'missed' | 'skipped-busy'
 
@@ -246,6 +251,11 @@ export function parseAutomationInput(body: Record<string, unknown>, partial: boo
     out.modeId = modeId as string | null
   }
   if (has('controls') || (!partial && body['controls'] === undefined)) out.controls = parseControls(body['controls'])
+  if (has('agent') || !partial) {
+    const agent = body['agent'] ?? null
+    if (agent !== null && (typeof agent !== 'string' || !/^[\w.-]{1,64}$/.test(agent))) throw new AutomationError(400, "'agent' must be a role name or null")
+    out.agent = agent as string | null
+  }
   if (has('enabled') || !partial) {
     const enabled = body['enabled'] ?? true
     if (typeof enabled !== 'boolean') throw new AutomationError(400, "'enabled' must be a boolean")
@@ -462,7 +472,7 @@ function isAutomation(value: unknown): value is Automation {
 /** Fill fields added after a row was written (older files). */
 function normalizeRow(row: Automation): Automation {
   const raw = row as Partial<Automation> & Automation
-  return { ...row, endsAt: raw.endsAt ?? null, maxRuns: raw.maxRuns ?? null, runCount: raw.runCount ?? 0, notify: raw.notify ?? true, notifyTargets: raw.notifyTargets ?? null }
+  return { ...row, endsAt: raw.endsAt ?? null, maxRuns: raw.maxRuns ?? null, runCount: raw.runCount ?? 0, notify: raw.notify ?? true, notifyTargets: raw.notifyTargets ?? null, agent: raw.agent ?? null }
 }
 
 // ── scheduler ────────────────────────────────────────────────

@@ -56,6 +56,21 @@ export interface AgentScope {
      */
     readonly inheritedContext?: string
   }
+  /**
+   * A ROOT conversation running as an agent role (scheduled automations):
+   * the role's pinned instructions replace the mode prose and its tool
+   * ceiling narrows exposure exactly like a child's. Unlike `childOf` there
+   * is no parent: the root keeps its own turns, hooks and compaction.
+   * Rebuilt from the session's durable `session/role` record.
+   */
+  readonly role?: {
+    readonly definition: string
+    readonly instructions: string
+    readonly definitionSource?: 'bundled' | 'user' | 'workspace' | 'project'
+    /** Pinned at creation: admission exposure ∩ definition − disallowed. */
+    readonly toolCeiling: readonly string[]
+    readonly skills?: readonly string[]
+  }
 }
 
 export const agentScope = new AsyncLocalStorage<AgentScope>()

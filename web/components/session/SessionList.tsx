@@ -1,6 +1,6 @@
 import * as Collapsible from '@radix-ui/react-collapsible'
 import { useState, type DragEvent, type ReactNode } from 'react'
-import Icon from '../common/Icon.tsx'
+import Icon, { type IconName } from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Menu, menuItemClass } from '../ui/Menu.tsx'
@@ -28,9 +28,11 @@ interface RowProps {
   readonly onDeleteRequest: (session: SessionListing) => void
   /** Absent when pinning is unavailable; the row then offers no pin action. */
   readonly onTogglePinned?: (id: string, pinned: boolean) => void
+  /** A second, muted line under the title (the Automations group names the run's project). */
+  readonly detail?: { readonly icon: IconName; readonly text: string }
 }
 
-function SessionRow({ session, active, liveRunning, onSelect, onRename, onDeleteRequest, onTogglePinned }: RowProps) {
+function SessionRow({ session, active, liveRunning, onSelect, onRename, onDeleteRequest, onTogglePinned, detail }: RowProps) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(session.title)
   const status = session.status ?? 'idle'
@@ -72,7 +74,17 @@ function SessionRow({ session, active, liveRunning, onSelect, onRename, onDelete
           </span>
         ) : null}
         {session.pinned === true ? <Icon name="pin" size={13} className="shrink-0 text-fg-faint" aria-label="Pinned" /> : null}
-        <span className="min-w-0 flex-1 truncate font-medium">{session.title || 'New conversation'}</span>
+        {detail === undefined ? (
+          <span className="min-w-0 flex-1 truncate font-medium">{session.title || 'New conversation'}</span>
+        ) : (
+          <span className="flex min-w-0 flex-1 flex-col">
+            <span className="truncate font-medium">{session.title || 'New conversation'}</span>
+            <span className="flex min-w-0 items-center gap-1 text-[11px] text-fg-faint">
+              <Icon name={detail.icon} size={11} className="shrink-0" />
+              <span className="truncate">{detail.text}</span>
+            </span>
+          </span>
+        )}
         {queued > 0 ? <span className="shrink-0 text-[11px] text-fg-faint">{queued} queued</span> : null}
         {cancelling ? <span className="shrink-0 text-[11px] text-fg-faint">stopping…</span> : null}
         {session.updatedAt !== undefined ? (
@@ -172,7 +184,7 @@ function GroupHead({ children }: { readonly children: ReactNode }) {
   return <div className="px-2.5 pb-1 pt-3 text-xs font-medium text-fg-faint">{children}</div>
 }
 
-export function SessionList({ sessions, projects, current, filter, liveRunning, onSelect, onRename, onDeleteRequest, onTogglePinned, onNewInProject, sort = 'recent', emptyLabel, onReorder, collapsedFolders, onToggleFolderCollapsed, expandedFolders, onExpandFolder, terminalProjects }: {
+export function SessionList({ sessions, projects, current, filter, liveRunning, onSelect, onRename, onDeleteRequest, onTogglePinned, onNewInProject, sort = 'recent', emptyLabel, onReorder, collapsedFolders, onToggleFolderCollapsed, expandedFolders, onExpandFolder, terminalProjects, automations }: {
   readonly sessions: readonly SessionListing[]
   readonly projects: readonly ProjectRow[]
   readonly current: string | null
@@ -199,6 +211,8 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
   readonly onExpandFolder?: (projectId: string, expanded: boolean) => void
   /** Project ids with a live terminal shell in this workspace. */
   readonly terminalProjects?: ReadonlySet<string>
+  /** The Automations folder's header actions; when set the folder always shows (it is the way in). */
+  readonly automations?: { readonly onOpen: () => void; readonly onNew: () => void; readonly active: boolean }
 }) {
   // Folder collapse and per-folder "Show more" are controlled from the app
   // shell when wired up — so they survive the sidebar unmounting on close —
@@ -244,7 +258,7 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
   }
   const shown = sessions.filter((session) => session.parentSessionId == null && (matches(session) || childrenOf.has(session.id)))
 
-  const rows = (list: readonly SessionListing[]): ReactNode => (
+  const rows = (list: readonly SessionListing[], detailOf?: (session: SessionListing) => NonNullable<RowProps['detail']>): ReactNode => (
     <ul className="m-0 flex list-none flex-col gap-px p-0">
       {list.map((session) => {
         const children = childrenOf.get(session.id)
@@ -258,6 +272,7 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
               onRename={onRename}
               onDeleteRequest={onDeleteRequest}
               {...(onTogglePinned !== undefined ? { onTogglePinned } : {})}
+              {...(detailOf !== undefined ? { detail: detailOf(session) } : {})}
             />
             {children !== undefined ? (
               <ul aria-label={`Subagents of ${session.title || 'conversation'}`} className="ml-6 m-0 flex list-none flex-col gap-px p-0 pb-1">
@@ -278,7 +293,8 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
     </div>
   )) : rows(list)
 
-  if (shown.length === 0) {
+  // The Automations folder is the way into scheduled tasks, so an empty list still shows it.
+  if (shown.length === 0 && (automations === undefined || query !== '')) {
     return <p className="m-0 px-2.5 py-4 text-sm text-fg-faint">{emptyLabel ?? (query === '' ? 'No conversations yet' : 'No matching conversations')}</p>
   }
   // Pinned conversations lead the whole list, whatever folder or day they
@@ -290,7 +306,7 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
   // result is always in the same place whatever folder the task runs in.
   const automationRuns = unpinned.filter((session) => session.automationId !== undefined)
   const rest = automationRuns.length > 0 ? unpinned.filter((session) => session.automationId === undefined) : unpinned
-  const automationsBlock = automationRuns.length > 0 ? (() => {
+  const automationsBlock = automationRuns.length > 0 || (automations !== undefined && query === '') ? (() => {
     const isCollapsed = collapsedState[AUTOMATIONS_GROUP] === true
     const expanded = expandedState[AUTOMATIONS_GROUP] === true || query !== ''
     const cut = expanded ? automationRuns.length : FOLDER_PREVIEW_COUNT
@@ -299,14 +315,34 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
     const running = automationRuns.some((session) => (session.status ?? 'idle') === 'running')
     return (
       <Collapsible.Root open={!isCollapsed} onOpenChange={(open) => setFolderCollapsed(AUTOMATIONS_GROUP, !open)} className="mt-1.5 first:mt-1">
-        <Collapsible.Trigger className="flex min-h-9 w-full min-w-0 items-center gap-2 rounded-lg px-2.5 text-left text-sm font-medium hover:bg-hover">
-          <Icon name="calendarClock" size={15} className="shrink-0 text-fg-muted" />
-          <span className="min-w-0 flex-1 truncate">Automations</span>
-          {running ? <Spinner size={12} /> : null}
-          <span className="shrink-0 text-xs font-normal text-fg-faint">{automationRuns.length}</span>
-        </Collapsible.Trigger>
+        <div className={cn('group relative flex items-center rounded-lg hover:bg-hover', automations?.active === true && 'bg-hover')}>
+          <Collapsible.Trigger className="flex min-h-9 min-w-0 flex-1 items-center gap-2 px-2.5 text-left text-sm font-medium">
+            <Icon name="calendarClock" size={15} className="shrink-0 text-fg-muted" />
+            <span className="min-w-0 flex-1 truncate">Automations</span>
+            {running ? <Spinner size={12} /> : null}
+            {automationRuns.length > 0 ? <span className="shrink-0 text-xs font-normal text-fg-faint group-hover:hidden">{automationRuns.length}</span> : null}
+          </Collapsible.Trigger>
+          {automations !== undefined ? (
+            <span className="mr-0.5 hidden items-center group-hover:flex group-focus-within:flex [@media(pointer:coarse)]:flex">
+              <IconButton label="Manage automations" className="size-7" onClick={automations.onOpen}>
+                <Icon name="sliders" size={15} />
+              </IconButton>
+              <IconButton label="New scheduled task" className="size-7" onClick={automations.onNew}>
+                <Icon name="plus" size={15} />
+              </IconButton>
+            </span>
+          ) : null}
+        </div>
         <Collapsible.Content className="mt-0.5 ml-3 pl-1.5">
-          {rows(visible)}
+          {automationRuns.length === 0 ? (
+            <button type="button" onClick={automations?.onNew} className="rounded-lg px-2.5 py-1 text-xs text-fg-faint hover:bg-hover hover:text-fg">
+              No runs yet. New scheduled task
+            </button>
+          ) : null}
+          {/* Runs from every folder share this group, so each names where it ran. */}
+          {rows(visible, (session) => session.projectId != null
+            ? { icon: 'folder', text: projects.find((project) => project.id === session.projectId)?.name ?? 'Removed project' }
+            : { icon: 'messageSquare', text: 'Chat only' })}
           {automationRuns.length > FOLDER_PREVIEW_COUNT && query === '' ? (
             <button
               type="button"

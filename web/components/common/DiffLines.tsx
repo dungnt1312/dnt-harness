@@ -112,12 +112,12 @@ export function DiffLines({ rows }: { readonly rows: readonly DiffRow[] }) {
 }
 
 /** Added and removed counts, the way the Git panel and tool rows both state them. */
-export function LineCount({ added, removed }: { readonly added?: number; readonly removed?: number }) {
+export function LineCount({ added, removed, className }: { readonly added?: number; readonly removed?: number; readonly className?: string }) {
   const plus = added ?? 0
   const minus = removed ?? 0
   if (plus === 0 && minus === 0) return null
   return (
-    <span className="flex shrink-0 items-center gap-1.5 whitespace-nowrap font-mono text-xs">
+    <span className={cn('flex shrink-0 items-center gap-1.5 whitespace-nowrap font-mono text-xs', className)}>
       {plus > 0 ? <span className="text-ok">+{plus}</span> : null}
       {minus > 0 ? <span className="text-bad">−{minus}</span> : null}
     </span>

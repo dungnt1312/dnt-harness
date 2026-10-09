@@ -214,6 +214,7 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
                     projectId={project.id}
                     path={change.path}
                     {...(focusPath === change.path ? { onReady: onFocusedDiffReady } : {})}
+                    {...(onOpenFile !== undefined ? { onOpenFile: () => onOpenFile(change.path) } : {})}
                   />
                 ) : null}
               </li>
@@ -239,7 +240,7 @@ function ChangeRow({ change, open, onToggle, onOpenFile, rowRef }: {
   const name = change.path.split('/').pop() ?? change.path
   const directory = change.path.slice(0, change.path.length - name.length).replace(/\/$/, '')
   return (
-    <div className="flex items-center gap-0.5">
+    <div className="relative flex items-center gap-0.5 group/row">
       <button
         ref={rowRef}
         type="button"
@@ -255,10 +256,22 @@ function ChangeRow({ change, open, onToggle, onOpenFile, rowRef }: {
           <span className={cn(change.status === 'deleted' && 'line-through')}>{name}</span>
           {directory !== '' ? <span className="ml-1.5 text-fg-faint">{directory}</span> : null}
         </span>
-        <LineCount {...(change.added !== undefined ? { added: change.added } : {})} {...(change.removed !== undefined ? { removed: change.removed } : {})} />
+        <LineCount
+          {...(change.added !== undefined ? { added: change.added } : {})}
+          {...(change.removed !== undefined ? { removed: change.removed } : {})}
+          className={cn(onOpenFile !== undefined && 'transition-opacity group-hover/row:opacity-0 group-focus-within/row:opacity-0 [@media(pointer:coarse)]:opacity-100')}
+        />
       </button>
       {onOpenFile !== undefined ? (
-        <IconButton label={`Open ${name} in workbench`} onClick={onOpenFile} className="mr-0.5">
+        <IconButton
+          label={`Open ${name} in workbench`}
+          onClick={onOpenFile}
+          // Hover-revealed and overlaid on the row's right edge, so the
+          // actions take no room and never push the line counts; the counts
+          // themselves fade out underneath. `invisible` keeps the hidden
+          // button from intercepting the row's clicks. Always on for touch.
+          className="mr-1 absolute right-0 bg-surface opacity-0 invisible transition-opacity group-hover/row:visible group-hover/row:opacity-100 group-focus-within/row:visible group-focus-within/row:opacity-100 focus-visible:visible focus-visible:opacity-100 [@media(pointer:coarse)]:visible [@media(pointer:coarse)]:opacity-100"
+        >
           <Icon name="fileText" size={13} />
         </IconButton>
       ) : null}
@@ -273,15 +286,18 @@ function markColor(status: GitChangeStatus): string {
 }
 
 /** The unified diff of one changed file, loaded when its row opens. */
-function DiffView({ workspaceId, projectId, path, onReady }: {
+function DiffView({ workspaceId, projectId, path, onReady, onOpenFile }: {
   readonly workspaceId: string
   readonly projectId: string
   readonly path: string
   /** Called once the diff (or its error) has rendered — the focused row's cue to scroll. */
   readonly onReady?: () => void
+  /** Opens the file itself in the workbench; offered with an opener. */
+  readonly onOpenFile?: () => void
 }) {
   const [diff, setDiff] = useState<GitDiffReport | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const name = path.split('/').pop() ?? path
   const generation = useRef(0)
   useEffect(() => {
     if (diff !== null || error !== null) onReady?.()
@@ -310,14 +326,38 @@ function DiffView({ workspaceId, projectId, path, onReady }: {
   }
   if (diff === null) return <div className="flex items-center gap-2 py-1.5 pl-7 text-xs text-fg-muted" role="status"><Spinner size={12} />Loading diff…</div>
   // A binary the browser can render shows the media itself; the rest say so.
-  if (diff.binary) return <div className="py-1 pl-5 pr-2"><MediaPreview workspaceId={workspaceId} projectId={projectId} path={path} /></div>
+  if (diff.binary) return <div className="relative py-1 pl-5 pr-2 group/diff"><MediaPreview workspaceId={workspaceId} projectId={projectId} path={path} /><DiffOpenFile name={name} {...(onOpenFile !== undefined ? { onOpenFile } : {})} /></div>
   if (diff.lines.length === 0) return <p className="m-0 py-1.5 pl-7 pr-2 text-xs text-fg-muted">No textual diff.</p>
   // The file header rows repeat the name the change row already shows and the
-  // hunk header is noise; row numbers are read from the hunk instead.
+  // hunk header is noise; row numbers are read from the hunk instead. The
+  // scroller keeps the focusable region — arrow keys scroll what holds focus —
+  // while the hover-revealed opener stays pinned to the frame's corner.
   return (
-    <div className="overflow-x-auto border-y border-line bg-muted/40" role="region" aria-label={`Diff of ${path}`} tabIndex={0}>
-      {diff.truncated ? <p className="m-0 border-b border-line bg-warn-soft px-3 py-1 text-xs text-warn">Diff is larger than 1 MB; only the beginning is shown.</p> : null}
-      <DiffLines rows={diffRowsFromUnified(diff.lines)} />
+    <div className="relative border-y border-line bg-muted/40 group/diff">
+      <div className="overflow-x-auto" role="region" aria-label={`Diff of ${path}`} tabIndex={0}>
+        {diff.truncated ? <p className="m-0 border-b border-line bg-warn-soft px-3 py-1 text-xs text-warn">Diff is larger than 1 MB; only the beginning is shown.</p> : null}
+        <DiffLines rows={diffRowsFromUnified(diff.lines)} />
+      </div>
+      <DiffOpenFile name={name} {...(onOpenFile !== undefined ? { onOpenFile } : {})} />
     </div>
+  )
+}
+
+/**
+ * The diff frame's own file opener: hover-revealed, absolutely placed in the
+ * frame's top-right corner so it takes no room in the scrolling body. `invisible`
+ * keeps the hidden button from stealing clicks meant for the diff. It keeps the
+ * surface background so the diff lines scroll beneath it, not through it.
+ */
+function DiffOpenFile({ name, onOpenFile }: { readonly name: string; readonly onOpenFile?: () => void }) {
+  if (onOpenFile === undefined) return null
+  return (
+    <IconButton
+      label={`Open ${name} in workbench`}
+      onClick={onOpenFile}
+      className="absolute right-1 top-1 z-10 bg-surface opacity-0 invisible transition-opacity group-hover/diff:visible group-hover/diff:opacity-100 group-focus-within/diff:visible group-focus-within/diff:opacity-100 focus-visible:visible focus-visible:opacity-100 [@media(pointer:coarse)]:visible [@media(pointer:coarse)]:opacity-100"
+    >
+      <Icon name="fileText" size={13} />
+    </IconButton>
   )
 }

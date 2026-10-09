@@ -36,6 +36,11 @@ export interface ExposureScope {
     readonly definition: string
     readonly toolCeiling?: readonly string[] | undefined
   } | undefined
+  /** A root running as an agent role: its pinned ceiling narrows exposure like a child's. */
+  readonly role?: {
+    readonly definition: string
+    readonly toolCeiling: readonly string[]
+  } | undefined
 }
 
 export type ExposureMode = Pick<ModeDefinition, 'id' | 'name' | 'toolExposure'> & Pick<Partial<ModeDefinition>, 'permissionDefaults' | 'outOfGrant' | 'mcpExposure'>
@@ -141,6 +146,10 @@ export function exposureRefusal(snapshot: ExposureSnapshot, scope: ExposureScope
   if (child !== undefined && name === 'Agent') return 'one-level delegation: a child agent cannot delegate'
   if (child?.toolCeiling !== undefined && !child.toolCeiling.includes(name)) {
     return `agent '${child.definition}' does not expose '${name}' (definition ceiling)`
+  }
+  const role = scope?.role
+  if (role !== undefined && !role.toolCeiling.includes(name)) {
+    return `agent '${role.definition}' does not expose '${name}' (definition ceiling)`
   }
   return undefined
 }

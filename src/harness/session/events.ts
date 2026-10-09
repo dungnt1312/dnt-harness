@@ -83,7 +83,9 @@ export type SessionEvent =
   // `runsNow`: the host found the session idle at acceptance and dispatches a
   // turn for it at once — the UI shows it as a sent message, not a queued one.
   // The user edited a still-waiting input: later readers take this content.
-  | ({ readonly type: 'input/revised'; readonly inputId: string; readonly content: string } & SessionEventStamp)
+  // `attachments` replaces the queue's list when present (an empty array
+  // drops them); omitted, the queued attachments ride along unchanged.
+  | ({ readonly type: 'input/revised'; readonly inputId: string; readonly content: string; readonly attachments?: readonly AttachmentRef[] } & SessionEventStamp)
   // `withdrawn`: the user deleted it from the queue before any turn claimed it.
   | ({ readonly type: 'input/settled'; readonly inputId: string; readonly outcome: 'admitted' | 'rejected' | 'empty' | 'withdrawn' } & SessionEventStamp)
   | ({ readonly type: 'session/title'; readonly title: string | null } & SessionEventStamp)
@@ -113,6 +115,16 @@ export type SessionEvent =
       readonly inherit?: 'none' | 'brief'
       readonly inheritedHash?: string
       readonly inheritedChars?: number
+    } & SessionEventStamp)
+  // A root running as an agent role (automations): the pinned role snapshot
+  // its agent is rebuilt from. Written once, before the first turn.
+  | ({
+      readonly type: 'session/role'
+      readonly definition: string
+      readonly instructions: string
+      readonly source?: 'bundled' | 'user' | 'workspace' | 'project'
+      readonly toolCeiling: readonly string[]
+      readonly skills?: readonly string[]
     } & SessionEventStamp)
   | ({ readonly type: 'agent/child-spawn'; readonly childSessionId: string; readonly parentTurnId: string; readonly definition: string; readonly brief?: string; readonly objective?: string } & SessionEventStamp)
   | ({ readonly type: 'agent/child-result'; readonly childSessionId: string; readonly parentTurnId: string; readonly status: string; readonly error?: string } & SessionEventStamp)
@@ -195,6 +207,8 @@ export function userMessageContent(
       continue
     }
     if (isImageMediaType(content.mediaType) && content.base64 !== undefined) {
+      // The id lets image tools (EditImage) name this exact image as a source.
+      texts.push(`[image attachment "${ref.name}" attachmentId=${ref.id}]`)
       parts.push({ type: 'image', mediaType: content.mediaType, base64: content.base64, name: ref.name })
       continue
     }
@@ -378,6 +392,7 @@ function projectMessages(events: readonly SessionEvent[], attachments?: Attachme
       case 'session/mode':
       case 'session/grants':
       case 'session/child-meta':
+      case 'session/role':
       case 'agent/child-spawn':
       case 'agent/child-result':
       case 'mcp/call':

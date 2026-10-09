@@ -199,6 +199,8 @@ export interface AutomationInput {
   readonly projectId: string | null
   readonly modeId: string | null
   readonly controls: AutomationControls | null
+  /** Agent role the run delegates to (as a subagent); null = the main agent. */
+  readonly agent: string | null
   readonly enabled: boolean
   /** Send the result to the user when a run ends. */
   readonly notify: boolean
@@ -303,6 +305,8 @@ export interface NotifyChannel {
   readonly name: string
   readonly enabled: boolean
   readonly summary: string
+  /** Teams: who each message @mentions. */
+  readonly mentions?: readonly string[]
   readonly createdAt: number
 }
 
@@ -310,6 +314,8 @@ export interface ChannelConfigInput {
   readonly botToken?: string
   readonly chatId?: string
   readonly webhookUrl?: string
+  /** Teams: comma-separated emails (an empty string clears them). */
+  readonly mentions?: string
 }
 
 export function listChannels(): Promise<readonly NotifyChannel[]> {
@@ -752,6 +758,39 @@ export function uploadAttachment(workspaceId: string, file: File): Promise<Attac
   }).then((r) => json<AttachmentRef>(r))
 }
 
+/** Settings → Providers & Models → Image generation: the provider/model the GenerateImage tool calls. */
+export interface ImageGenerationSettings {
+  readonly provider: string | null
+  readonly model: string | null
+}
+
+export function getImageGenerationSettings(): Promise<ImageGenerationSettings> {
+  return apiFetch('/api/image-generation').then((r) => json<ImageGenerationSettings>(r))
+}
+
+export function setImageGenerationSettings(update: ImageGenerationSettings): Promise<ImageGenerationSettings> {
+  return apiFetch('/api/image-generation', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(update),
+  }).then((r) => json<ImageGenerationSettings>(r))
+}
+
+/** Settings → Providers & Models → Image understanding: the DescribeImage model. */
+export type ImageUnderstandingSettings = ImageGenerationSettings
+
+export function getImageUnderstandingSettings(): Promise<ImageUnderstandingSettings> {
+  return apiFetch('/api/image-understanding').then((r) => json<ImageUnderstandingSettings>(r))
+}
+
+export function setImageUnderstandingSettings(update: ImageUnderstandingSettings): Promise<ImageUnderstandingSettings> {
+  return apiFetch('/api/image-understanding', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(update),
+  }).then((r) => json<ImageUnderstandingSettings>(r))
+}
+
 /** The URL that serves a stored attachment's bytes (previews, transcript). */
 export function attachmentUrl(workspaceId: string, id: string): string {
   return `/api/workspaces/${encodeURIComponent(workspaceId)}/attachments/${encodeURIComponent(id)}`
@@ -780,12 +819,15 @@ export function steerSessionIn(workspaceId: string, sessionId: string): Promise<
   }).then((r) => json<{ steered: boolean; pending: number }>(r))
 }
 
-/** Edit a queued input while it still waits (409 once a turn claimed it). */
-export function reviseQueuedInputIn(workspaceId: string, sessionId: string, inputId: string, content: string): Promise<{ inputId: string; revised: boolean }> {
+/** Edit a queued input while it still waits (409 once a turn claimed it). An `attachments` array (empty included) replaces the queued files; omitted keeps them. */
+export function reviseQueuedInputIn(workspaceId: string, sessionId: string, inputId: string, content: string, attachments?: readonly AttachmentRef[]): Promise<{ inputId: string; revised: boolean }> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/inputs/${encodeURIComponent(inputId)}`, {
     method: 'PATCH',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({
+      content,
+      ...(attachments !== undefined ? { attachments } : {}),
+    }),
   }).then((r) => json<{ inputId: string; revised: boolean }>(r))
 }
 

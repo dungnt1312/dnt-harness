@@ -16,6 +16,7 @@ export interface AgentIdentity {
   readonly workspaceId?: WorkspaceId
   readonly projectId?: ProjectId
   readonly childOf?: AgentScope['childOf']
+  readonly role?: AgentScope['role']
 }
 
 /**
@@ -54,6 +55,7 @@ export class AgentsService extends Service {
       ...(identity.workspaceId !== undefined ? { workspaceId: identity.workspaceId } : {}),
       ...(identity.projectId !== undefined ? { projectId: identity.projectId } : {}),
       ...(identity.childOf !== undefined ? { childOf: identity.childOf } : {}),
+      ...(identity.role !== undefined ? { role: identity.role } : {}),
     })
     this.bySession.set(target.id, agent)
     return agent

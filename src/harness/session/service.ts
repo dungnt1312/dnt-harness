@@ -416,7 +416,15 @@ export class SessionsService extends Service {
       } else if (event.type === 'input/revised') {
         const index = queued.findIndex((item) => item.inputId === event.inputId)
         const prior = queued[index]
-        if (prior !== undefined) queued[index] = { ...prior, content: event.content }
+        if (prior !== undefined) {
+          queued[index] = {
+            ...prior,
+            content: event.content,
+            // Omitted keeps what the input carries; an array (empty included)
+            // is the whole replacement.
+            ...(event.attachments !== undefined ? { attachments: event.attachments } : {}),
+          }
+        }
       } else if (event.type === 'user/message' && event.inputId !== undefined) {
         consumed.add(event.inputId)
       } else if (event.type === 'input/settled') {

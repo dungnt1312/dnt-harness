@@ -21,7 +21,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     instructions:
       'You are a careful assistant working inside the user’s workspace. Read files freely; before any write, edit, or shell command, ask for approval. Prefer explaining what you are about to change. Saving Markdown notes inside the memory folders may proceed without a separate approval.',
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
-    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion', 'GenerateImage', 'EditImage', 'DescribeImage'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow',
       Write: 'ask', Edit: 'ask', Bash: 'ask',
@@ -35,6 +35,8 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
       TodoWrite: 'allow',
       // Asking the user a question is itself the human checkpoint.
       AskUserQuestion: 'allow',
+      // Paid external calls: the user sees the prompt before it is spent.
+      GenerateImage: 'ask', EditImage: 'ask', DescribeImage: 'allow',
     },
   },
   {
@@ -43,7 +45,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     instructions:
       'You are an assistant that edits files directly inside the user’s workspace. Read and edit files without asking; shell commands and deletions still require approval. Keep edits minimal and verifiable.',
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
-    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion', 'GenerateImage', 'EditImage', 'DescribeImage'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow',
       // A child's own calls re-enter this same policy, so delegating cannot
@@ -52,6 +54,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
       TodoWrite: 'allow',
       // Asking the user a question is itself the human checkpoint.
       AskUserQuestion: 'allow',
+      GenerateImage: 'ask', EditImage: 'ask', DescribeImage: 'allow',
     },
   },
   {
@@ -62,12 +65,12 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
     // Delegation is exposed here safely: a child resolves the SAME mode, so
     // anything it spawns is read-only too — there is no write path to grant.
-    toolExposure: ['Read', 'Glob', 'Grep', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion', 'DescribeImage'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Skill: 'allow', Agent: 'allow',
       TodoWrite: 'allow',
       // Asking the user a question is itself the human checkpoint.
-      AskUserQuestion: 'allow',
+      AskUserQuestion: 'allow', DescribeImage: 'allow',
     },
     // A property, not an id check: a duplicated Plan keeps it.
     mcpExposure: 'read-safe',
@@ -78,7 +81,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     instructions:
       'You are an assistant with full access to the workspace tools. Host and workspace restrictions still apply and cannot be overridden by you. There is no OS sandbox: shell commands run with host privileges, so stay deliberate.',
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
-    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion', 'GenerateImage', 'EditImage', 'DescribeImage'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow', Bash: 'allow',
       BashOutput: 'allow', KillShell: 'allow',
@@ -86,6 +89,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
       TodoWrite: 'allow',
       // Asking the user a question is itself the human checkpoint.
       AskUserQuestion: 'allow',
+      GenerateImage: 'allow', EditImage: 'allow', DescribeImage: 'allow',
       // Full access means the workspace's MCP tools too: without a catch-all,
       // every mcp__* name falls to the defaultMode fallback and asks forever.
       // Host blockedTools, interactive annotations, and explicit denies still

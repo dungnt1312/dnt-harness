@@ -355,7 +355,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
       case 'tool':
         // A folded run of waits keys on its first wait, so the row keeps its
         // identity (and an opened body) while newer waits replace it.
-        return <ToolCard key={folded?.[0]?.kind === 'tool' ? folded[0].call.id : item.call.id} item={item} {...(folded !== undefined ? { repeats: folded.length + 1 } : {})} hidden={hiddenSpawns.has(item.call.id)} {...(openPath !== undefined ? { openPath } : {})} {...(openDiff !== undefined ? { openDiff } : {})} />
+        return <ToolCard key={folded?.[0]?.kind === 'tool' ? folded[0].call.id : item.call.id} item={item} {...(folded !== undefined ? { repeats: folded.length + 1 } : {})} hidden={hiddenSpawns.has(item.call.id)} workspaceId={workspaceId ?? null} {...(openPath !== undefined ? { openPath } : {})} {...(openDiff !== undefined ? { openDiff } : {})} />
       case 'delegation':
         return <DelegationCard key={item.childSessionId} item={item} {...(workspaceId !== undefined ? { workspaceId } : {})} rootSessionId={conversationId} {...(onOpenChild !== undefined ? { onOpen: onOpenChild } : {})} />
       case 'audit':

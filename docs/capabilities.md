@@ -314,6 +314,53 @@ Claude-Code-style:
   older calls away, so the model can lose sight of an old list — accepted
   for v1 (context re-injection is a follow-up).
 
+## Image tools (`src/harness/tools/image-tools.ts`)
+
+`GenerateImage` and `EditImage` call an OpenAI-compatible Images API through
+the provider and model chosen in **Settings → Providers & Models → Image generation**. That choice
+is a `{ provider, model }` reference in `image-generation.json` beside
+`providers.json` (`src/web/image-generation-store.ts`). The base URL and key
+come from the referenced provider and are re-resolved on every call. A missing,
+deleted, or disabled provider fails the call with the Settings fix it needs.
+
+- **GenerateImage** `{ prompt, size? }` sends `POST {baseUrl}/images/generations`.
+- **EditImage** `{ prompt, attachmentId | path, size? }` takes exactly one
+  source. `attachmentId` names a stored image: a previous image result, or an
+  image the user attached. User image attachments are listed in the model's
+  message text as `[image attachment "<name>" attachmentId=<id>]` for this
+  purpose. `path` names a png/jpeg/webp/gif file. It is resolved with
+  `resolveInGrants(…, 'read')` and is listed in `targetPaths`, so it is
+  classified, approved, and refused exactly as a `Read` of that path would
+  be. The request is multipart `POST {baseUrl}/images/edits` with an `image`
+  file part. A client error that names the image encoding or the multipart
+  body (CLIProxy's `Invalid base64-encoded image`) gets one retry as JSON with
+  the image as a data URL. The source is never modified.
+- **Results**: both tools request `b64_json`. A `url`-only answer gets one
+  bounded http(s) download. The bytes are stored in the workspace
+  `AttachmentStore` (content-addressed, capped at `maxAttachmentBytes`). The
+  tool returns `{ attachmentId, mediaType, bytes, model, revisedPrompt,
+  sourceAttachmentId? }`. The call honors the turn's stop signal and a
+  120-second budget.
+- **UI**: the transcript row names the prompt and shows the stored image
+  beneath it, always visible, with a lightbox (`GeneratedImageCard` in
+  `web/components/chat/MessageParts.tsx`). The tool descriptions tell the
+  model not to narrate file paths or ids.
+- **Adaptive vision / DescribeImage**: the selected chat model's effective
+  vision capability is the provider model override first, then the shared
+  model catalog. `vision: false` converts image-bearing history to text-only:
+  the attachment marker (including `attachmentId`) remains, image bytes leave
+  the chat request, and the text tells the model to call `DescribeImage`.
+  `DescribeImage { attachmentId, question? }` reads only from the workspace
+  AttachmentStore and sends that image to the dedicated multimodal chat model
+  selected in **Settings → Providers & Models → Image understanding**. Its
+  result is `{ description, model, attachmentId }`. A native-vision model keeps
+  image parts and does not receive the DescribeImage schema. Unknown capability
+  defaults to native vision, preserving existing/future model behavior.
+- **Modes**: GenerateImage and EditImage are `ask` in Ask before changes and
+  Edit automatically because each call is a paid external request. They are
+  `allow` in Full access and are not exposed in Plan. DescribeImage is a
+  read-like `allow` tool exposed in every bundled mode, including Plan.
+
 ## MCP tools (`src/harness/mcp/`)
 
 Servers from a workspace's `mcp.json` register dynamically as
@@ -384,8 +431,9 @@ mode cannot widen them.
 - **Web host** (`src/web/server.ts`): the same pair, with the root resolver
   reading the ambient agent scope — a session bound to a project gets that
   project's folder; a workspace-mode session with no project has **no
-  filesystem grant** except enabled memory roots. `Skill` and `TodoWrite`
-  register with the harness; MCP tools register per workspace as its servers connect.
+  filesystem grant** except enabled memory roots. `Skill`, `TodoWrite`,
+  `GenerateImage`, and `EditImage` register with the harness; MCP tools
+  register per workspace as its servers connect.
 
 ## Reading further
 
@@ -396,3 +444,12 @@ mode cannot widen them.
 - TodoWrite tool + mode exposure: `tests/harness/todo-tools.spec.ts`,
   `tests/harness/todo-mode-exposure.spec.ts`; web derivation and UI:
   `web/lib/todos-view.spec.ts`, `web/components/chat/environment-panel.spec.tsx`.
+- Image tools: `tests/harness/image-tools.spec.ts`,
+  `tests/harness/image-tools-mode-exposure.spec.ts`,
+  `tests/web/image-generation-store.spec.ts`,
+  `tests/web/server-generate-image.spec.ts`,
+  `tests/harness/describe-image.spec.ts`,
+  `tests/harness/adaptive-vision.spec.ts`,
+  `tests/web/server-adaptive-vision.spec.ts`, and
+  `tests/web/server-native-vision.spec.ts`; row rendering:
+  `web/lib/generated-image.spec.tsx`.

@@ -1,4 +1,4 @@
-import { useState, type KeyboardEvent } from 'react'
+import { useRef, useState, type ChangeEvent, type KeyboardEvent } from 'react'
 import Icon from '../common/Icon.tsx'
 import { attachmentUrl } from '../../lib/api.ts'
 import type { AttachmentRef } from '../../lib/composer-draft.ts'
@@ -7,6 +7,9 @@ import { InlineChip } from '../common/InlineChip.tsx'
 import type { ViewItem } from '../../lib/project.ts'
 
 type QueuedItem = Extract<ViewItem, { kind: 'user' }>
+
+/** Same composer allow-list: the store sniffs the real type from the bytes. */
+const UPLOAD_ACCEPT = 'image/png,image/jpeg,image/webp,image/gif,text/*,application/json,application/xml'
 
 /**
  * Queued follow-ups, pinned above the composer — the surface they were typed
@@ -20,9 +23,11 @@ type QueuedItem = Extract<ViewItem, { kind: 'user' }>
  * turn consumes it, so this strip is the waiting state's only face.
  *
  * Each waiting message can be edited in place (Enter saves, Esc cancels) or
- * deleted until a turn claims it; the host answers 409 after that.
+ * deleted until a turn claims it; the host answers 409 after that. Editing
+ * covers the attachments too: the form lists them, each removable, and the
+ * host uploader can add more; Save submits text and files together.
  */
-export function QueuedBar({ items, workspaceId, running = false, onSendNow, onEdit, onDelete }: {
+export function QueuedBar({ items, workspaceId, running = false, onSendNow, onEdit, onDelete, onUploadFiles }: {
   readonly items: readonly QueuedItem[]
   /** Needed to show image attachments as thumbnails; without it they show as file chips. */
   readonly workspaceId?: string | null
@@ -30,9 +35,11 @@ export function QueuedBar({ items, workspaceId, running = false, onSendNow, onEd
   readonly running?: boolean
   readonly onSendNow?: () => void
   /** Revise one waiting message in place; rejects when a turn already claimed it. */
-  readonly onEdit?: (inputId: string, content: string) => Promise<void>
+  readonly onEdit?: (inputId: string, content: string, attachments: readonly AttachmentRef[]) => Promise<void>
   /** Remove one waiting message from the queue. */
   readonly onDelete?: (inputId: string) => Promise<void>
+  /** Store chosen files while editing; reuses the composer's uploader. */
+  readonly onUploadFiles?: (files: readonly File[]) => Promise<readonly AttachmentRef[]>
 }) {
   if (items.length === 0) return null
   // A steer only "steers" while a turn is open; one stranded by a restart is
@@ -75,6 +82,7 @@ export function QueuedBar({ items, workspaceId, running = false, onSendNow, onEd
             locked={steering}
             {...(onEdit !== undefined ? { onEdit } : {})}
             {...(onDelete !== undefined ? { onDelete } : {})}
+            {...(onUploadFiles !== undefined ? { onUploadFiles } : {})}
           />
         ))}
       </ul>
@@ -87,9 +95,9 @@ function QueuedAttachments({ refs, workspaceId }: { readonly refs: readonly Atta
   if (refs.length === 0) return null
   return (
     <span className="flex shrink-0 items-center gap-1">
-      {refs.map((ref) => workspaceId !== null && ref.mediaType.startsWith('image/') ? (
+      {refs.map((ref, index) => workspaceId !== null && ref.mediaType.startsWith('image/') ? (
         <img
-          key={ref.id}
+          key={`${ref.id}:${index}`}
           src={attachmentUrl(workspaceId, ref.id)}
           alt={ref.name}
           title={ref.name}
@@ -97,7 +105,7 @@ function QueuedAttachments({ refs, workspaceId }: { readonly refs: readonly Atta
           className="size-8 rounded-md border border-line object-cover"
         />
       ) : (
-        <span key={ref.id} title={ref.name} className="flex max-w-32 items-center gap-1 rounded-md bg-bg/60 px-1.5 py-0.5 text-xs text-fg-muted">
+        <span key={`${ref.id}:${index}`} title={ref.name} className="flex max-w-32 items-center gap-1 rounded-md bg-bg/60 px-1.5 py-0.5 text-xs text-fg-muted">
           <Icon name="fileText" size={12} className="shrink-0" />
           <span className="truncate">{ref.name}</span>
         </span>
@@ -106,15 +114,18 @@ function QueuedAttachments({ refs, workspaceId }: { readonly refs: readonly Atta
   )
 }
 
-function QueuedRow({ item, workspaceId, locked, onEdit, onDelete }: {
+function QueuedRow({ item, workspaceId, locked, onEdit, onDelete, onUploadFiles }: {
   readonly item: QueuedItem
   readonly workspaceId: string | null
   readonly locked: boolean
-  readonly onEdit?: (inputId: string, content: string) => Promise<void>
+  readonly onEdit?: (inputId: string, content: string, attachments: readonly AttachmentRef[]) => Promise<void>
   readonly onDelete?: (inputId: string) => Promise<void>
+  readonly onUploadFiles?: (files: readonly File[]) => Promise<readonly AttachmentRef[]>
 }) {
   const [editing, setEditing] = useState<string | null>(null)
+  const [editAttachments, setEditAttachments] = useState<readonly AttachmentRef[]>([])
   const [busy, setBusy] = useState(false)
+  const fileInput = useRef<HTMLInputElement | null>(null)
   const attachments = item.attachments?.length ?? 0
   const inputId = item.inputId
   const canAct = inputId !== undefined && !locked && !busy
@@ -135,14 +146,24 @@ function QueuedRow({ item, workspaceId, locked, onEdit, onDelete }: {
   const save = async (): Promise<void> => {
     if (editing === null || inputId === undefined || onEdit === undefined) return
     const next = editing.trim()
-    if (next === item.content.trim()) { setEditing(null); return }
-    if (next === '' && attachments === 0) return
-    if (await run(() => onEdit(inputId, next))) setEditing(null)
+    if (next === item.content.trim() && sameRefs(editAttachments, item.attachments ?? [])) { setEditing(null); return }
+    if (next === '' && editAttachments.length === 0) return
+    if (await run(() => onEdit(inputId, next, editAttachments))) setEditing(null)
   }
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>): void => {
     if (event.key === 'Escape') { event.preventDefault(); setEditing(null) }
     else if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void save() }
+  }
+
+  const addFiles = async (event: ChangeEvent<HTMLInputElement>): Promise<void> => {
+    const files = Array.from(event.target.files ?? [])
+    event.target.value = ''
+    if (files.length === 0 || onUploadFiles === undefined) return
+    await run(async () => {
+      const stored = await onUploadFiles(files)
+      if (stored.length > 0) setEditAttachments((current) => [...current, ...stored])
+    })
   }
 
   if (editing !== null) {
@@ -159,14 +180,71 @@ function QueuedRow({ item, workspaceId, locked, onEdit, onDelete }: {
           onFocus={(event) => { const end = event.target.value.length; event.target.setSelectionRange(end, end) }}
           className="w-full resize-none rounded-lg border border-line-strong bg-transparent px-2.5 py-1.5 text-sm text-fg outline-none focus:border-link"
         />
+        {editAttachments.length > 0 ? (
+          <div className="flex flex-wrap items-center gap-1">
+            {editAttachments.map((ref, index) => workspaceId !== null && ref.mediaType.startsWith('image/') ? (
+              <span key={`${ref.id}:${index}`} className="relative">
+                <img
+                  src={attachmentUrl(workspaceId, ref.id)}
+                  alt={ref.name}
+                  title={ref.name}
+                  loading="lazy"
+                  className="size-8 rounded-md border border-line object-cover"
+                />
+                <button
+                  type="button"
+                  aria-label={`Remove ${ref.name}`}
+                  title="Remove"
+                  disabled={busy}
+                  onClick={() => setEditAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))}
+                  className="absolute -right-1.5 -top-1.5 flex size-4 items-center justify-center rounded-full border border-line bg-bg text-fg-muted hover:text-bad"
+                >
+                  <Icon name="close" size={10} />
+                </button>
+              </span>
+            ) : (
+              <span key={`${ref.id}:${index}`} className="flex items-center gap-1 rounded-md border border-line bg-bg/60 px-1.5 py-0.5 text-xs text-fg-muted">
+                <Icon name="fileText" size={12} className="shrink-0" />
+                <span className="max-w-32 truncate">{ref.name}</span>
+                <button
+                  type="button"
+                  aria-label={`Remove ${ref.name}`}
+                  title="Remove"
+                  disabled={busy}
+                  onClick={() => setEditAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))}
+                  className="shrink-0 rounded text-fg-faint hover:text-bad"
+                >
+                  <Icon name="close" size={12} />
+                </button>
+              </span>
+            ))}
+          </div>
+        ) : null}
         <div className="flex items-center justify-end gap-1.5 text-xs">
+          {onUploadFiles !== undefined ? (
+            <>
+              <input ref={fileInput} type="file" multiple accept={UPLOAD_ACCEPT} className="hidden" aria-hidden="true" tabIndex={-1} onChange={(event) => void addFiles(event)} />
+              <button
+                type="button"
+                aria-label="Add a file"
+                title="Add a file"
+                disabled={busy}
+                onClick={() => fileInput.current?.click()}
+                className="mr-auto flex items-center gap-1 rounded-full px-2 py-1 text-fg-muted hover:bg-hover hover:text-fg"
+              >
+                <Icon name="plus" size={13} />
+                Add file
+              </button>
+            </>
+          ) : null}
           <button type="button" onClick={() => setEditing(null)} disabled={busy} className="rounded-full px-2.5 py-1 text-fg-muted hover:bg-hover hover:text-fg">
             Cancel
           </button>
           <button
             type="button"
+            title="Save"
             onClick={() => void save()}
-            disabled={busy || (editing.trim() === '' && attachments === 0)}
+            disabled={busy || (editing.trim() === '' && editAttachments.length === 0)}
             className="rounded-full bg-primary px-2.5 py-1 font-medium text-primary-fg hover:opacity-90 disabled:opacity-40"
           >
             Save
@@ -193,7 +271,7 @@ function QueuedRow({ item, workspaceId, locked, onEdit, onDelete }: {
               type="button"
               aria-label="Edit queued message"
               title="Edit"
-              onClick={() => setEditing(item.content)}
+              onClick={() => { setEditAttachments([...(item.attachments ?? [])]); setEditing(item.content) }}
               className="flex size-6 items-center justify-center rounded-md text-fg-faint hover:bg-hover hover:text-fg"
             >
               <Icon name="pencil" size={13} />
@@ -214,4 +292,9 @@ function QueuedRow({ item, workspaceId, locked, onEdit, onDelete }: {
       ) : busy ? <span className="shrink-0 text-xs text-fg-faint">…</span> : null}
     </li>
   )
+}
+
+/** Reference equality by id: names/media types are immutable per stored id. */
+function sameRefs(left: readonly AttachmentRef[], right: readonly AttachmentRef[]): boolean {
+  return left.length === right.length && left.every((ref, index) => ref.id === right[index]?.id)
 }

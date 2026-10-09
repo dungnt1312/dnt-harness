@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { createSessionIn, getModelDefaults, getSessionModel, setModelDefaults, setSessionModel } from './api.ts'
+import { createSessionIn, getModelDefaults, getSessionModel, setModelDefaults, setSessionModel, reviseQueuedInputIn } from './api.ts'
 
 /** Every call goes through apiFetch: same-origin credentials, a Headers bag. */
 type Call = [string, RequestInit]
@@ -59,6 +59,21 @@ describe('session model API', () => {
       expect(init.method).toBe('PUT')
       expect(new Headers(init.headers).get('content-type')).toBe('application/json')
       expect(init.body).toBe(JSON.stringify({ provider: null, thinkingLevel: null }))
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('revising a queued input PATCHes content and the attachment list together', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ inputId: 'i1', revised: true })))
+    vi.stubGlobal('fetch', fetchMock)
+    const attachments = [{ id: 'a'.repeat(64), name: 'shot.png', mediaType: 'image/png', bytes: 8 }]
+    try {
+      await expect(reviseQueuedInputIn('workspace', 'session', 'i1', 'fixed text', attachments)).resolves.toEqual({ inputId: 'i1', revised: true })
+      const [url, init] = callOf(fetchMock, 0)
+      expect(url).toBe('/api/workspaces/workspace/sessions/session/inputs/i1')
+      expect(init.method).toBe('PATCH')
+      expect(init.body).toBe(JSON.stringify({ content: 'fixed text', attachments }))
     } finally {
       vi.unstubAllGlobals()
     }

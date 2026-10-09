@@ -345,12 +345,24 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
         case 'input/revised': {
           if (event.inputId === undefined || event.inputId === '' || event.content === undefined) break
           const accepted = acceptedInputs.get(event.inputId)
-          if (accepted !== undefined) acceptedInputs.set(event.inputId, { ...accepted, content: event.content })
+          if (accepted !== undefined) {
+            acceptedInputs.set(event.inputId, {
+              ...accepted,
+              content: event.content,
+              // Present replaces (an empty array drops); absent rides along.
+              ...(event.attachments !== undefined ? { attachments: event.attachments } : {}),
+            })
+          }
           const pending = queuedUsers.get(event.inputId)
           if (pending === undefined) break
           touch(pending)
           // The row is projector-owned and mutable; content is readonly only to readers.
           ;(pending as { content: string }).content = event.content
+          if (event.attachments !== undefined) {
+            const mutable = pending as { attachments?: readonly typeof event.attachments[number][] }
+            if (event.attachments.length > 0) mutable.attachments = [...event.attachments]
+            else delete mutable.attachments
+          }
           break
         }
         case 'input/settled': {

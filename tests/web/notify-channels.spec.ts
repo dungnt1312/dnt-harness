@@ -36,6 +36,24 @@ describe('NotifyChannels', () => {
     expect(String((discord.body as { content: string }).content).length).toBeLessThan(2000)
     const teams = buildRequest({ ...base, kind: 'teams', config: { webhookUrl: 'https://x.webhook.office.com/a' } }, { title: 'T', body: 'b' })
     expect(JSON.stringify(teams.body)).toContain('"type":"AdaptiveCard"')
+    expect(JSON.stringify(teams.body)).not.toContain('msteams')
+  })
+
+  it('mentions configured people on Teams', async () => {
+    const channels = new NotifyChannels(dir, ok)
+    await expect(channels.create({ kind: 'teams', config: { webhookUrl: 'https://x.webhook.office.com/a', mentions: 'not-an-email' } })).rejects.toThrow(/not an email/)
+    const view = await channels.create({ kind: 'teams', config: { webhookUrl: 'https://x.webhook.office.com/a', mentions: 'DNguyen@softel.vn, a@b.co;a@b.co' } })
+    expect(view.mentions).toEqual(['dnguyen@softel.vn', 'a@b.co'])
+    // Editing only the mentions keeps the saved webhook; an empty value clears them.
+    const kept = await channels.update(view.id, { config: { mentions: ['dnguyen@softel.vn'] } })
+    expect(kept.mentions).toEqual(['dnguyen@softel.vn'])
+    expect(kept.summary).toBe(view.summary)
+    const card = buildRequest({ id: 'c', name: 'n', enabled: true, createdAt: 0, kind: 'teams', config: { webhookUrl: 'https://x.webhook.office.com/a', mentions: ['dnguyen@softel.vn'] } }, { title: 'T', body: 'b' })
+    const content = (card.body as { attachments: { content: { body: { text: string }[]; msteams: { entities: unknown[] } } }[] }).attachments[0]!.content
+    expect(content.body.map((block) => block.text)).toEqual(['T', '<at>dnguyen@softel.vn</at>', 'b'])
+    expect(content.msteams.entities).toEqual([{ type: 'mention', text: '<at>dnguyen@softel.vn</at>', mentioned: { id: 'dnguyen@softel.vn', name: 'dnguyen@softel.vn' } }])
+    const cleared = await channels.update(view.id, { config: { mentions: '' } })
+    expect(cleared.mentions).toBeUndefined()
   })
 
   it('fans out to enabled channels and reports failures without throwing', async () => {

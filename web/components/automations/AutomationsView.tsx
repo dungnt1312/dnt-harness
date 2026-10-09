@@ -32,6 +32,7 @@ import {
 import { describePlan, formatRunTime, newRule, rulesToSchedules, schedulesToRules, type ScheduleRule } from '../../lib/automation-schedule.ts'
 import { ScheduleEditor, endFields, endRuleOf, type EndRule } from './ScheduleEditor.tsx'
 import { NotifyChannelsPanel, NotifyTargets } from './NotifyChannelsPanel.tsx'
+import { AgentSection } from './AgentSection.tsx'
 import { decodeModelChoice, encodeModelChoice, type ModelOption } from '../../lib/providers.ts'
 import { cn } from '../../lib/cn.ts'
 import type { ModelDefaults, ModelSettings, ProjectRow, ProviderSummary } from '../../lib/types.ts'
@@ -125,7 +126,7 @@ export function AutomationsView({ workspaceId, automationId, context, onNavigate
             row={editing}
             context={context}
             onBack={() => onNavigate(undefined)}
-            onSaved={async (saved) => { await refresh(); onNavigate(saved.id) }}
+            onSaved={async () => { await refresh(); onNavigate(undefined) }}
             onOpenSession={onOpenSession}
             notify={notify}
           />
@@ -213,6 +214,7 @@ function AutomationList({ rows, error, workspaceId, onRetry, onOpen, onChanged, 
                 meta={(
                   <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
                     <span>{describePlan(row.schedules, row.endsAt, row.maxRuns)}</span>
+                    {row.agent !== null ? <Badge tone="blue">{row.agent}</Badge> : null}
                     {row.finished ? <Badge tone="gray">Finished</Badge> : null}
                     {row.enabled && row.nextRuns[0] !== undefined ? <span>Next {formatRunTime(row.nextRuns[0])}</span> : null}
                     {last !== undefined ? <Badge tone={STATUS[last.status].tone}>{STATUS[last.status].label}</Badge> : null}
@@ -340,6 +342,7 @@ function AutomationEditor({ workspaceId, row, context, onBack, onSaved, onOpenSe
   const [modeId, setModeId] = useState<string | null>(row?.modeId ?? context.defaultModeId)
   const [controls, setControls] = useState(() => row?.controls ?? context.defaults)
   const [notifyMe, setNotifyMe] = useState(row?.notify ?? true)
+  const [agent, setAgent] = useState<string | null>(row?.agent ?? null)
   // Null = every destination (also how older rows read); the picker makes it explicit once touched.
   const [targets, setTargets] = useState<readonly string[] | null>(row?.notifyTargets ?? null)
   const [saving, setSaving] = useState(false)
@@ -381,6 +384,7 @@ function AutomationEditor({ workspaceId, row, context, onBack, onSaved, onOpenSe
       projectId,
       modeId,
       controls: controls ?? null,
+      agent,
       notify: notifyMe,
       notifyTargets: targets,
       // Saving a plan with runs ahead turns a paused or finished task back on.
@@ -511,6 +515,8 @@ function AutomationEditor({ workspaceId, row, context, onBack, onSaved, onOpenSe
               </div>
             </div>
           </div>
+
+          <AgentSection workspaceId={workspaceId} projectId={projectId} value={agent} onChange={setAgent} />
 
           <NotifyTargets enabled={notifyMe} onEnabled={setNotifyMe} targets={targets} onTargets={setTargets} errorText={errorText} />
         </div>

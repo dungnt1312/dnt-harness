@@ -127,7 +127,7 @@ describe('Settings remembers its tab', () => {
 
   it('reopens on the tab it last showed when no tab is requested', async () => {
     await render({ open: true })
-    expect(tab('Providers').getAttribute('data-state')).toBe('active')
+    expect(tab('Providers & Models').getAttribute('data-state')).toBe('active')
     await pressTab('Secrets')
     await render({ open: false })
     await render({ open: true })
@@ -140,10 +140,16 @@ describe('Settings remembers its tab', () => {
     expect(tab('System Prompts').getAttribute('data-state')).toBe('active')
   })
 
+  it('maps a remembered pre-merge tab onto Providers & Models', async () => {
+    window.localStorage.setItem(SETTINGS_TAB_STORAGE_KEY, 'model-aliases')
+    await render({ open: true })
+    expect(tab('Providers & Models').getAttribute('data-state')).toBe('active')
+  })
+
   it('ignores an unknown stored tab', async () => {
     window.localStorage.setItem(SETTINGS_TAB_STORAGE_KEY, 'bogus')
     await render({ open: true })
-    expect(tab('Providers').getAttribute('data-state')).toBe('active')
+    expect(tab('Providers & Models').getAttribute('data-state')).toBe('active')
   })
 })
 

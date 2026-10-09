@@ -176,5 +176,8 @@ describe('multi-root file grants', () => {
     expect(targetPaths({ name: 'Write', args: { path: 'x', content: '' } })).toEqual([{ target: 'x', intent: 'write' }])
     expect(targetPaths({ name: 'Grep', args: { pattern: 'x' } })).toEqual([{ target: '.', intent: 'read' }])
     expect(targetPaths({ name: 'Bash', args: { command: 'ls' } })).toEqual([])
+    // An image edit's file source is a read under the same grants; an attachment source has no path.
+    expect(targetPaths({ name: 'EditImage', args: { prompt: 'p', path: 'a.png' } })).toEqual([{ target: 'a.png', intent: 'read' }])
+    expect(targetPaths({ name: 'EditImage', args: { prompt: 'p', attachmentId: 'x' } })).toEqual([])
   })
 })

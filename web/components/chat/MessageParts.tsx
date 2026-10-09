@@ -1175,12 +1175,108 @@ function CallDetails({ call }: { readonly call: ToolCall }) {
   )
 }
 
+/** Tools whose result is a stored image the row shows inline. */
+const IMAGE_TOOL_KIND: Readonly<Record<string, { readonly running: string; readonly done: string; readonly alt: string }>> = {
+  GenerateImage: { running: 'Generating image', done: 'Image', alt: 'Generated image' },
+  EditImage: { running: 'Editing image', done: 'Edited image', alt: 'Edited image' },
+}
+
+/** The stored attachment a settled GenerateImage/EditImage call produced, or null. */
+export function generatedImageOf(item: Extract<ViewItem, { kind: 'tool' }>): { readonly id: string; readonly revisedPrompt: string | null } | null {
+  if (IMAGE_TOOL_KIND[item.call.name] === undefined || item.result?.ok !== true) return null
+  try {
+    const parsed = JSON.parse(item.result.output) as Record<string, unknown>
+    const id = parsed['attachmentId']
+    if (typeof id !== 'string' || !/^[0-9a-f]{64}$/.test(id)) return null
+    return { id, revisedPrompt: typeof parsed['revisedPrompt'] === 'string' ? parsed['revisedPrompt'] : null }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * A GenerateImage/EditImage call: the row names the prompt, and the image itself sits
+ * under it, always visible — it is the turn's product, not a detail to open.
+ */
+function GeneratedImageCard({ item, state, facts, workspaceId }: {
+  readonly item: Extract<ViewItem, { kind: 'tool' }>
+  readonly state: RowState
+  readonly facts: ToolFacts
+  readonly workspaceId: string | null
+}) {
+  const [zoomed, setZoomed] = useState(false)
+  const image = generatedImageOf(item)
+  const words = IMAGE_TOOL_KIND[item.call.name] ?? IMAGE_TOOL_KIND['GenerateImage']!
+  const prompt = typeof item.call.args['prompt'] === 'string' ? item.call.args['prompt'] : ''
+  const alt = prompt !== '' ? prompt : words.alt
+  const status = rowStatus(item, state, facts)
+  const spec: RowSpec = {
+    icon: 'fileImage',
+    kind: state === 'running' ? words.running : words.done,
+    separator: true,
+    ...(prompt !== '' ? { primary: prompt, title: prompt } : {}),
+    ...(status !== undefined ? { status } : {}),
+  }
+  const src = image !== null && workspaceId !== null ? attachmentUrl(workspaceId, image.id) : null
+  return (
+    <div className="flex flex-col gap-2">
+      <ActivityRow spec={spec} state={state}>
+        <OutcomeNotes item={item} />
+        {image?.revisedPrompt != null
+          ? <Section label="Revised prompt"><p className="m-0 whitespace-pre-wrap break-words">{image.revisedPrompt}</p></Section>
+          : null}
+        {image === null
+          ? <ResultPanel {...(item.result !== undefined ? { output: item.result.output } : {})} tone={state === 'failed' ? 'bad' : state === 'denied' ? 'quiet' : 'plain'} />
+          : null}
+        <CallDetails call={item.call} />
+      </ActivityRow>
+      {src !== null ? (
+        <button
+          type="button"
+          onClick={() => setZoomed(true)}
+          aria-label={`Preview ${words.alt.toLowerCase()}`}
+          className="block w-fit max-w-full cursor-zoom-in overflow-hidden rounded-2xl bg-muted outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-line-strong"
+        >
+          <img src={src} alt={alt} loading="lazy" className="block max-h-96 max-w-full object-contain" />
+        </button>
+      ) : null}
+      <ImageLightbox src={zoomed ? src : null} alt={alt} onDismiss={() => setZoomed(false)} />
+    </div>
+  )
+}
+
+export function describedImageOf(item: Extract<ViewItem, { kind: 'tool' }>): { readonly description: string; readonly model: string | null } | null {
+  if (item.call.name !== 'DescribeImage' || item.result?.ok !== true) return null
+  try {
+    const parsed = JSON.parse(item.result.output) as Record<string, unknown>
+    const description = typeof parsed['description'] === 'string' ? parsed['description'].trim() : ''
+    return description === '' ? null : { description, model: typeof parsed['model'] === 'string' ? parsed['model'] : null }
+  } catch { return null }
+}
+
+function DescribeImageCard({ item, state, facts }: {
+  readonly item: Extract<ViewItem, { kind: 'tool' }>
+  readonly state: RowState
+  readonly facts: ToolFacts
+}) {
+  const result = describedImageOf(item)
+  const question = typeof item.call.args['question'] === 'string' ? item.call.args['question'].trim() : ''
+  const status = rowStatus(item, state, facts)
+  return <ActivityRow state={state} spec={{ icon: 'eye', kind: state === 'running' ? 'Understanding image' : 'Describe image', separator: true, primary: question || 'General description', ...(status !== undefined ? { status } : {}) }}>
+    <OutcomeNotes item={item} />
+    {result !== null
+      ? <Section label={result.model === null ? 'Description' : `Description · ${result.model}`}><Markdown content={result.description} /></Section>
+      : <ResultPanel {...(item.result !== undefined ? { output: item.result.output } : {})} tone={state === 'failed' ? 'bad' : state === 'denied' ? 'quiet' : 'plain'} />}
+    <CallDetails call={item.call} />
+  </ActivityRow>
+}
+
 /**
  * A tool invocation: one line of text that names what it did and, only when
  * it is worth a look, how it ended. Opening it shows what the tool produced in
  * the shape that tool's output has — a terminal, a diff, a result.
  */
-export const ToolCard = memo(function ToolCard({ item, openPath, openDiff, hidden, repeats }: {
+export const ToolCard = memo(function ToolCard({ item, openPath, openDiff, hidden, repeats, workspaceId }: {
   readonly item: Extract<ViewItem, { kind: 'tool' }>
   /** Consecutive identical waits this row stands for (itself included). */
   readonly repeats?: number
@@ -1188,6 +1284,8 @@ export const ToolCard = memo(function ToolCard({ item, openPath, openDiff, hidde
   /** Opens a recorded path's diff in the workbench Git view; null when git cannot see it. */
   readonly openDiff?: OpenPathResolver
   readonly hidden?: boolean
+  /** Serves a generated image's stored bytes; without it the image row shows no preview. */
+  readonly workspaceId?: string | null
 }) {
   const { call, result } = item
   const facts = toolFacts(call, result)
@@ -1200,6 +1298,9 @@ export const ToolCard = memo(function ToolCard({ item, openPath, openDiff, hidde
   // A delegation row renders the spawn itself — same child, one line — so the
   // tool call that only reports the same child id stays out of the transcript.
   if (hidden === true) return null
+
+  if (IMAGE_TOOL_KIND[call.name] !== undefined) return <GeneratedImageCard item={item} state={state} facts={facts} workspaceId={workspaceId ?? null} />
+  if (call.name === 'DescribeImage') return <DescribeImageCard item={item} state={state} facts={facts} />
 
   // A read that landed is opened in the workbench, not in the transcript: its
   // file is the link. Anything that did not land opens to say why.

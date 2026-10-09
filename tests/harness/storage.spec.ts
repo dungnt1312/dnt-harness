@@ -549,6 +549,29 @@ describe('sessions service over files', () => {
     void kernel.stop()
   })
 
+  it('input/revised replaces content and takes or drops attachments of a pending input', async () => {
+    const { kernel, sessions } = await service()
+    const session = sessions.create('ws-crafted' as never)
+    const image = { id: 'a'.repeat(64), name: 'shot.png', mediaType: 'image/png', bytes: 10 }
+    const other = { id: 'b'.repeat(64), name: 'next.png', mediaType: 'image/png', bytes: 20 }
+    session.append({ type: 'input/queued', inputId: 'input-r1' as never, content: 'with file', attachments: [image] })
+    session.append({ type: 'input/queued', inputId: 'input-r2' as never, content: 'plain' })
+
+    // Text-only revision leaves the attachments riding along.
+    session.append({ type: 'input/revised', inputId: 'input-r1' as never, content: 'edited text' })
+    // A revision carrying attachments replaces them; an empty array drops them.
+    session.append({ type: 'input/revised', inputId: 'input-r1' as never, content: 'edited text', attachments: [other] })
+    // An attachment-less input gains files.
+    session.append({ type: 'input/revised', inputId: 'input-r2' as never, content: 'plain', attachments: [image] })
+
+    const pending = sessions.pendingInputs(session)
+    const first = pending.find((item) => item.inputId === 'input-r1')
+    const second = pending.find((item) => item.inputId === 'input-r2')
+    expect(first).toMatchObject({ content: 'edited text', attachments: [other] })
+    expect(second).toMatchObject({ content: 'plain', attachments: [image] })
+    void kernel.stop()
+  })
+
   it('fork persists the child log; a fresh service loads it independently', async () => {
     const { kernel, sessions, dir } = await service()
     const parent = sessions.create('ws-fork' as never)

@@ -16,6 +16,8 @@ export interface ChannelConfig {
   readonly botToken?: string
   readonly chatId?: string
   readonly webhookUrl?: string
+  /** Teams only: people @mentioned on every message (Entra UPN / email). Not secret. */
+  readonly mentions?: readonly string[]
 }
 
 export interface ChannelRecord {
@@ -34,6 +36,8 @@ export interface ChannelView {
   readonly name: string
   readonly enabled: boolean
   readonly summary: string
+  /** Teams: who each message @mentions. */
+  readonly mentions?: readonly string[]
   readonly createdAt: number
 }
 
@@ -94,7 +98,23 @@ function parseConfig(kind: ChannelKind, raw: unknown, previous?: ChannelConfig):
   if (kind === 'discord' && !/^https:\/\/(?:[\w-]+\.)?(?:discord|discordapp)\.com\/api\/webhooks\//.test(webhookUrl)) {
     throw new ChannelError(400, "'webhookUrl' must be a Discord webhook (https://discord.com/api/webhooks/…)")
   }
-  return { webhookUrl }
+  if (kind !== 'teams') return { webhookUrl }
+  // Mentions are not secret: an explicit value (even empty) replaces them.
+  const mentions = body['mentions'] === undefined ? previous?.mentions ?? [] : parseMentions(body['mentions'])
+  return { webhookUrl, ...(mentions.length > 0 ? { mentions } : {}) }
+}
+
+const EMAIL = /^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>"]+$/
+
+/** Emails to @mention: a list or a comma/space/semicolon separated string. */
+function parseMentions(raw: unknown): string[] {
+  const parts = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(/[\s,;]+/) : null
+  if (parts === null) throw new ChannelError(400, "'mentions' must be a list of emails")
+  const emails = [...new Set(parts.map((part) => String(part).trim().toLowerCase()).filter((part) => part !== ''))]
+  const bad = emails.filter((email) => !EMAIL.test(email))
+  if (bad.length > 0) throw new ChannelError(400, `not an email: ${bad.join(', ')}`)
+  if (emails.length > 20) throw new ChannelError(400, 'at most 20 mentions')
+  return emails
 }
 
 function summaryOf(record: ChannelRecord): string {
@@ -108,7 +128,11 @@ function summaryOf(record: ChannelRecord): string {
 }
 
 export function viewOf(record: ChannelRecord): ChannelView {
-  return { id: record.id, kind: record.kind, name: record.name, enabled: record.enabled, summary: summaryOf(record), createdAt: record.createdAt }
+  return {
+    id: record.id, kind: record.kind, name: record.name, enabled: record.enabled, summary: summaryOf(record),
+    ...(record.config.mentions !== undefined && record.config.mentions.length > 0 ? { mentions: record.config.mentions } : {}),
+    createdAt: record.createdAt,
+  }
 }
 
 /** The request each service expects. Plain text everywhere: model output must never break a parse mode. */
@@ -125,8 +149,11 @@ export function buildRequest(record: ChannelRecord, message: ChannelMessage): { 
         url: record.config.webhookUrl ?? '',
         body: { username: 'dnt-harness', content: `**${message.title.replace(/[*_~`|]/g, '')}**\n${text}`, allowed_mentions: { parse: [] } },
       }
-    case 'teams':
-      // Adaptive Card: accepted by Teams Workflows webhooks and legacy incoming webhooks.
+    case 'teams': {
+      // Adaptive Card: accepted by Teams Workflows webhooks and legacy incoming
+      // webhooks. Mentions pair an `<at>…</at>` token in the text with an
+      // `msteams.entities` entry; the UPN/email is the mentioned id.
+      const mentions = record.config.mentions ?? []
       return {
         url: record.config.webhookUrl ?? '',
         body: {
@@ -139,12 +166,17 @@ export function buildRequest(record: ChannelRecord, message: ChannelMessage): { 
               version: '1.4',
               body: [
                 { type: 'TextBlock', text: message.title, weight: 'Bolder', size: 'Medium', wrap: true },
+                ...(mentions.length > 0 ? [{ type: 'TextBlock', text: mentions.map((email) => `<at>${email}</at>`).join(' '), wrap: true }] : []),
                 { type: 'TextBlock', text, wrap: true },
               ],
+              ...(mentions.length > 0
+                ? { msteams: { entities: mentions.map((email) => ({ type: 'mention', text: `<at>${email}</at>`, mentioned: { id: email, name: email } })) } }
+                : {}),
             },
           }],
         },
       }
+    }
   }
 }
 

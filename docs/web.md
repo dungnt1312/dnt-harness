@@ -251,6 +251,14 @@ The response is `{ days: [{ date, model, input, cached, output, requests }], lon
 - a 53-week heatmap with Sunday-first columns in Daily, Weekly, or Cumulative mode, coloured by quantile levels;
 - a 7- or 30-day trend with one monotone curve per model (top 7 plus "Other").
 
+### `GET/PUT /api/image-generation`
+
+The provider/model pair behind **Settings → Providers & Models → Image generation**, used by the `GenerateImage` and `EditImage` tools (see `docs/capabilities.md`). The body and response are `{ provider, model }`, both strings, or both `null` when the feature is off. `PUT` answers `400` for an unknown provider id or a half-filled pair. The pair is stored in `image-generation.json` beside `providers.json`; the key and base URL stay on the provider entry.
+
+### `GET/PUT /api/image-understanding`
+
+The dedicated multimodal chat pair behind **Settings → Providers & Models → Image understanding**. `DescribeImage` uses it when the active chat model has effective `vision: false`. Body, validation, persistence, and provider references match `/api/image-generation`, but this model must accept image input through chat completions rather than an Images generation endpoint. It is stored in `image-understanding.json` beside `providers.json`.
+
 ### `GET /api/providers`
 
 List configured providers with masked keys: `[{ id, name, baseUrl, enabled, keyMasked, models, modelSettings? }]`.

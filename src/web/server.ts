@@ -37,7 +37,7 @@ import { PushError, PushService, type PushSender } from './push.ts'
 import { ChannelError, NotifyChannels, type ChannelFetch } from './notify-channels.ts'
 import { agentScope, type AgentScope } from '../harness/agent/scope.ts'
 import type { GrantedRoot } from '../harness/tools/types.ts'
-import { classifyGrantedRoots, classifyTarget, within } from '../capabilities/fs/grants.ts'
+import { classifyGrantedRoots, classifyTarget, resolveInGrants, within } from '../capabilities/fs/grants.ts'
 import { mergeGrants, parseAccess, projectGrants, validateGrantFolder, type GrantPolicy } from './folder-grants.ts'
 import { approvedPathOf, attachPathScopeGuard, type PathScopeGuard, type PathScopeMatch } from './path-scope-guard.ts'
 import type { Agent } from '../harness/agent/agent.ts'
@@ -51,6 +51,7 @@ import { LlmService } from '../harness/llm/service.ts'
 import { LogicalRequest, classifyTransport } from '../harness/llm/request-lifecycle.ts'
 import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
 import { expressibleThinkingLevel, isThinkingLevel, resolveContextLimit } from '../harness/llm/model-catalog.ts'
+import { adaptRequestVision, supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
 import { ProviderError } from '../harness/llm/types.ts'
 import type { LlmProvider, StreamEvent, TokenUsage, ToolCall } from '../harness/llm/types.ts'
 import { fileSessions, SessionsService } from '../harness/session/service.ts'
@@ -140,6 +141,10 @@ import { protectedRootsForRules, resolveSkillLayers, type SkillLayer } from '../
 import { MemoryService, MemoryError } from '../harness/memory/service.ts'
 import { memoryGuidance, memoryGuidanceAccess, memoryIndexes } from '../harness/memory/context.ts'
 import { todoWriteTool } from '../harness/tools/todo.ts'
+import { editImageTool, generateImageTool, type ImageToolOptions } from '../harness/tools/image-tools.ts'
+import { describeImageTool } from '../harness/tools/describe-image.ts'
+import { loadImageSettings, parseImageSettings, resolveImageApi, saveImageSettings, type ImageGenerationSettings } from './image-generation-store.ts'
+import { loadImageUnderstandingSettings, parseImageUnderstandingSettings, resolveVisionApi, saveImageUnderstandingSettings, type ImageUnderstandingSettings } from './image-understanding-store.ts'
 import { askUserQuestionTool, validateAnswers, type QuestionOutcome, type UserQuestion } from '../harness/tools/ask-user.ts'
 import { buildContext, DEFAULT_BASE_SYSTEM, DEFAULT_CHILD_SYSTEM, type ContextManifest, type ActiveSkill, type MemorySnippet } from '../harness/context/builder.ts'
 import { renderEnvironmentContext } from '../harness/context/environment.ts'
@@ -720,6 +725,12 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   let durableDefaults: ModelDefaults = storedProviders.defaults
   let runtimeModelOverride: { readonly provider: string; readonly model: string } | undefined
   let defaults: ModelDefaults = durableDefaults
+  // Settings → Providers & Models → Image generation: a provider/model reference beside
+  // providers.json, resolved against the live provider list on every call.
+  const imageSettingsFile = path.join(path.dirname(configFile), 'image-generation.json')
+  let imageSettings: ImageGenerationSettings = loadImageSettings(imageSettingsFile)
+  const imageUnderstandingFile = path.join(path.dirname(configFile), 'image-understanding.json')
+  let imageUnderstanding: ImageUnderstandingSettings = loadImageUnderstandingSettings(imageUnderstandingFile)
   if (list.length === 0 && options.seedDeepseekFromEnv === true) {
     const key = process.env['DEEPSEEK_API_KEY']?.trim()
     if (key !== undefined && key !== '') {
@@ -1580,6 +1591,28 @@ ${entry.description}`.toLowerCase().includes(query))
   })
   // Claude-style session task list: full-replacement tool, state IS the log.
   kernel.ctx.tools.register(todoWriteTool())
+  // Image tools: results land in the executing workspace's attachment
+  // store, so the transcript renders them like any composer image. An edit
+  // reads its source from that store or from a granted file (as Read would).
+  const imageToolOptions: ImageToolOptions = {
+    resolve: () => resolveImageApi(imageSettings, list),
+    store: (workspaceId, input) => attachments.put(workspaceId, { name: input.name, mediaType: sniffImageMediaType(input.bytes) ?? 'application/octet-stream', bytes: input.bytes }),
+    read: async (workspaceId, id) => {
+      const bytes = await attachments.read(workspaceId, id)
+      return { bytes, mediaType: sniffImageMediaType(bytes) ?? 'application/octet-stream' }
+    },
+    resolvePath: (exec, target) => resolveInGrants(exec, target, 'read'),
+    maxBytes: limits.maxAttachmentBytes,
+  }
+  kernel.ctx.tools.register(generateImageTool(imageToolOptions))
+  kernel.ctx.tools.register(editImageTool(imageToolOptions))
+  kernel.ctx.tools.register(describeImageTool({
+    resolve: () => resolveVisionApi(imageUnderstanding, list),
+    read: imageToolOptions.read,
+    // A tool-owned nested model request: it shares the turn's cancellation but
+    // not the outer step's provider-attempt identity.
+    stream: (request, exec) => kernel.ctx.llm.stream(request, exec.signal !== undefined ? { signal: exec.signal } : undefined),
+  }))
 
   // AskUserQuestion: the model pauses for a human choice. The question
   // itself is the durable `tool/call`, the answer the `tool/result`; this map
@@ -2497,7 +2530,7 @@ ${entry.description}`.toLowerCase().includes(query))
       // hash-pinned like explicit Skill loads (no mid-turn file reload).
       // They resolve through the SAME rule layers as the Skill tool (project
       // folders included, disabled rules excluded), never the legacy defaults.
-      const pending = (scope.childOf?.skills ?? []).filter((name) => !perTurn.has(name))
+      const pending = (scope.childOf?.skills ?? scope.role?.skills ?? []).filter((name) => !perTurn.has(name))
       const childLayers = pending.length === 0
         ? []
         : await skillLayers(skills, workspaces, workspaceId, scope.projectId)
@@ -2588,6 +2621,9 @@ ${entry.description}`.toLowerCase().includes(query))
         }
         : {}),
       ...(scope?.childOf?.inheritedContext !== undefined ? { inheritedContext: scope.childOf.inheritedContext } : {}),
+      ...(scope?.childOf === undefined && scope?.role !== undefined
+        ? { rootRole: { definition: scope.role.definition, instructions: scope.role.instructions, ...(scope.role.definitionSource !== undefined ? { source: scope.role.definitionSource } : {}) } }
+        : {}),
     })
     if (scope !== undefined) {
       lastManifests.set(scope.sessionId, assembled.manifest)
@@ -2658,12 +2694,16 @@ ${entry.description}`.toLowerCase().includes(query))
       ?? (model !== undefined && provider !== undefined
         ? list.find((entry) => entry.id === provider)?.modelSettings?.[model]?.thinkingLevel
         : undefined)
-    return next({
+    const stamped = {
       ...request,
       ...(model !== undefined ? { model } : {}),
       ...(provider !== undefined ? { providerName: provider } : {}),
       ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
-    })
+    }
+    const visionOverride = model !== undefined && provider !== undefined
+      ? list.find((entry) => entry.id === provider)?.modelSettings?.[model]?.vision
+      : undefined
+    return next(adaptRequestVision(stamped, supportsNativeVision(model, visionOverride)))
   })
 
   const pending = new Map<string, PendingApproval>()
@@ -3004,6 +3044,35 @@ ${entry.description}`.toLowerCase().includes(query))
     }
     void channels.send({ title: run.title, body: text }, run.targets === null ? null : run.targets.filter((id) => id !== 'push'))
   }
+  /**
+   * Resolve a role for a root about to run as it (automations): its ceiling
+   * is the mode's admission exposure ∩ the definition − disallowed, the same
+   * rule a manual subagent spawn applies. A missing role throws: a run never
+   * silently widens to the main agent.
+   */
+  const pinRole = async (workspaceId: WorkspaceId, name: string, rootId: SessionId, projectId: string | null): Promise<RoleRecord> => {
+    let resolved
+    try {
+      resolved = await agentDefinitions.resolve(workspaceId, name, projectId ?? undefined)
+    } catch (error) {
+      if (error instanceof AgentDefinitionError && error.code === 'not-found') throw new Error(`agent role '${name}' no longer exists`)
+      throw error
+    }
+    const { definition } = resolved
+    // MCP tools need an explicit grant on a spawn; a role run has none, so it
+    // gets MCP tools only when the role names them itself.
+    const candidates = definition.tools
+    const exposed = new Set(await admissionExposureCeiling(rootId, workspaceId, definition.name, candidates))
+    const disallowed = new Set(definition.disallowedTools)
+    const toolCeiling = [...new Set(candidates)].filter((tool) => exposed.has(tool) && !disallowed.has(tool) && tool !== 'Agent')
+    return {
+      definition: definition.name,
+      instructions: definition.instructions,
+      ...(resolved.source !== undefined ? { source: resolved.source } : {}),
+      toolCeiling,
+      ...(definition.skills !== undefined ? { skills: [...definition.skills] } : {}),
+    }
+  }
   const runAutomation = async (workspaceId: WorkspaceId, automation: Automation, dueAt: number | null): Promise<{ ok: false; status: number; error: string } | { ok: true; runId: string; sessionId?: string; skipped?: true }> => {
     const runId = `run-${randomUUID()}`
     const identity = { workspaceId, title: automation.title, runId, notify: automation.notify, targets: automation.notifyTargets }
@@ -3027,6 +3096,9 @@ ${entry.description}`.toLowerCase().includes(query))
         ...(automation.controls !== null ? { controls: automation.controls } : {}),
         modeId: automation.modeId,
         title: runTitle(automation.title, dueAt ?? Date.now()),
+        // A role run IS the role: the conversation itself runs with the
+        // role's tool ceiling, instructions, skills and model.
+        ...(automation.agent !== null ? { role: (rootId: SessionId) => pinRole(workspaceId, automation.agent!, rootId, automation.projectId) } : {}),
       })
     } catch (error) {
       return fail(500, String(error instanceof Error ? error.message : error))
@@ -3038,12 +3110,13 @@ ${entry.description}`.toLowerCase().includes(query))
     // The agent learns it runs unattended and how its reply reaches the user;
     // it joins the prompt as host context, not as user text.
     const mode = rootModeOf({ sessionId, workspaceId }, workspaceId).mode.definition
-    created.entry.agent.inject(automationContext(automation, {
+    const context = automationContext(automation, {
       dueAt,
       channels: automation.notify ? await channels.enabledNames(automation.notifyTargets).catch(() => []) : [],
       push: automation.notifyTargets === null || automation.notifyTargets.includes('push'),
       approvalsBlock: Object.values(mode.permissionDefaults ?? {}).some((value) => value === 'ask'),
-    }))
+    })
+    created.entry.agent.inject(context)
     const submitted = await submitMessage(created.entry, deps, { content: automation.prompt, clientRequestId: runId }, undefined)
     if (!submitted.ok) {
       activeRuns.delete(sessionId)
@@ -3149,6 +3222,16 @@ ${entry.description}`.toLowerCase().includes(query))
     addSkillProtectedRoots,
     memory,
     attachments,
+    imageSettings: () => imageSettings,
+    setImageSettings: async (next: ImageGenerationSettings) => {
+      await saveImageSettings(imageSettingsFile, next)
+      imageSettings = next
+    },
+    imageUnderstanding: () => imageUnderstanding,
+    setImageUnderstanding: async (next: ImageUnderstandingSettings) => {
+      await saveImageUnderstandingSettings(imageUnderstandingFile, next)
+      imageUnderstanding = next
+    },
     checkpoints,
     lastManifests,
     contextBodies,
@@ -3419,6 +3502,12 @@ interface HandlerDeps {
   /** The (provider, model) pair host-side maintenance calls run on; undefined → extractive compaction fallback. */
   /** Durable token accounting behind GET /api/usage. */
   readonly usageLog: UsageLog
+  /** Settings → Providers & Models → Image generation (app-wide provider/model reference). */
+  readonly imageSettings: () => ImageGenerationSettings
+  readonly setImageSettings: (next: ImageGenerationSettings) => Promise<void>
+  /** Settings → Providers & Models → Image understanding (DescribeImage model). */
+  readonly imageUnderstanding: () => ImageUnderstandingSettings
+  readonly setImageUnderstanding: (next: ImageUnderstandingSettings) => Promise<void>
   readonly summarizerModelOf: (session: Session) => { readonly providerName: string; readonly model: string } | undefined
   /** Runs PreCompact hooks (durable hook/run events); returns the blocking reason, or undefined to proceed. */
   readonly runPreCompactHooks: (session: Session, workspaceId: WorkspaceId) => Promise<string | undefined>
@@ -5028,6 +5117,68 @@ async function handleApi(
           return
         }
         send(200, deps.defaults())
+        return
+      }
+      send(405, { error: 'method not allowed' })
+      return
+    }
+
+    // Settings → Providers & Models → Image generation: which provider/model GenerateImage calls.
+    if (pathname === '/api/image-generation') {
+      if (req.method === 'GET') {
+        send(200, deps.imageSettings())
+        return
+      }
+      if (req.method === 'PUT') {
+        const body = await readJson(req)
+        const next = parseImageSettings(body)
+        const blankRequested = body['provider'] === null || body['provider'] === '' || body['model'] === null || body['model'] === ''
+        if (next.provider === null && !blankRequested) {
+          send(400, { error: "body needs 'provider' and 'model' strings, or null to clear" })
+          return
+        }
+        if (next.provider !== null && !deps.providers().some((entry) => entry.id === next.provider)) {
+          send(400, { error: `unknown provider '${next.provider}'` })
+          return
+        }
+        try {
+          await deps.setImageSettings(next)
+        } catch (error) {
+          send(500, { error: `image generation settings could not be saved: ${String(error instanceof Error ? error.message : error)}` })
+          return
+        }
+        send(200, deps.imageSettings())
+        return
+      }
+      send(405, { error: 'method not allowed' })
+      return
+    }
+
+    // Settings → Providers & Models → Image understanding: DescribeImage model.
+    if (pathname === '/api/image-understanding') {
+      if (req.method === 'GET') {
+        send(200, deps.imageUnderstanding())
+        return
+      }
+      if (req.method === 'PUT') {
+        const body = await readJson(req)
+        const next = parseImageUnderstandingSettings(body)
+        const blankRequested = body['provider'] === null || body['provider'] === '' || body['model'] === null || body['model'] === ''
+        if (next.provider === null && !blankRequested) {
+          send(400, { error: "body needs 'provider' and 'model' strings, or null to clear" })
+          return
+        }
+        if (next.provider !== null && !deps.providers().some((entry) => entry.id === next.provider)) {
+          send(400, { error: `unknown provider '${next.provider}'` })
+          return
+        }
+        try {
+          await deps.setImageUnderstanding(next)
+        } catch (error) {
+          send(500, { error: `image understanding settings could not be saved: ${String(error instanceof Error ? error.message : error)}` })
+          return
+        }
+        send(200, deps.imageUnderstanding())
         return
       }
       send(405, { error: 'method not allowed' })
@@ -6680,6 +6831,17 @@ function parseAttachments(
 
 type SendJson = (status: number, body: unknown) => void
 
+/** A named role must resolve where the run will happen (workspace + project layers). */
+async function requireRole(deps: HandlerDeps, wsId: WorkspaceId, agent: string | null, projectId: string | null): Promise<void> {
+  if (agent === null) return
+  try {
+    await deps.agentDefinitions.resolve(wsId, agent, projectId ?? undefined)
+  } catch (error) {
+    if (error instanceof AgentDefinitionError) throw new AutomationError(400, `agent role '${agent}': ${error.message}`)
+    throw error
+  }
+}
+
 /** An automation as the API returns it: the definition plus its next fire times. */
 function automationView(row: Automation): Automation & { readonly nextRuns: readonly number[]; readonly finished: boolean } {
   const now = Date.now()
@@ -6714,6 +6876,7 @@ async function handleAutomations(req: IncomingMessage, pathname: string, deps: H
       if (req.method === 'POST') {
         const input = parseAutomationInput(await readJson(req), false)
         if (input.projectId !== null) deps.workspaces.getProject(input.projectId as ProjectId, wsId)
+        await requireRole(deps, wsId, input.agent, input.projectId)
         const created = await deps.automations.create(wsId, input)
         deps.pokeScheduler()
         send(201, automationView(created))
@@ -6742,6 +6905,10 @@ async function handleAutomations(req: IncomingMessage, pathname: string, deps: H
     if (req.method === 'PATCH') {
       const patch = parseAutomationInput(await readJson(req), true)
       if (patch.projectId !== undefined && patch.projectId !== null) deps.workspaces.getProject(patch.projectId as ProjectId, wsId)
+      if (patch.agent !== undefined) {
+        const current = await deps.automations.get(wsId, id)
+        await requireRole(deps, wsId, patch.agent, patch.projectId !== undefined ? patch.projectId : current.projectId)
+      }
       const updated = await deps.automations.update(wsId, id, patch)
       deps.pokeScheduler()
       send(200, automationView(updated))
@@ -6842,7 +7009,7 @@ async function handlePush(req: IncomingMessage, pathname: string, deps: HandlerD
 async function createRootSession(
   deps: HandlerDeps,
   wsId: WorkspaceId,
-  options: { readonly projectId?: unknown; readonly controls?: unknown; readonly modeId?: string | null; readonly title?: string },
+  options: { readonly projectId?: unknown; readonly controls?: unknown; readonly modeId?: string | null; readonly title?: string; readonly role?: (rootId: SessionId) => Promise<RoleRecord> },
 ): Promise<{ ok: false; status: number; error: string } | { ok: true; entry: SessionEntry }> {
   deps.workspaces.requireActive(wsId) // archived: no new sessions
   const rawProject = options.projectId
@@ -6907,6 +7074,17 @@ async function createRootSession(
   // root owns its own live mode from here on.
   deps.stampRootMode(session, mode)
   if (options.title !== undefined) session.append({ type: 'session/title', title: options.title.slice(0, 80) })
+  if (options.role !== undefined) {
+    // The role ceiling is resolved under the mode just stamped, so it is
+    // admission exposure ∩ definition − disallowed, pinned for the root's life.
+    try {
+      const record = await options.role(session.id)
+      session.append({ type: 'session/role', ...record })
+    } catch (error) {
+      await deps.kernel.ctx.sessions.delete(session.id).catch(() => {})
+      return { ok: false, status: 400, error: String(error instanceof Error ? error.message : error) }
+    }
+  }
   try {
     await session.durable()
   } catch (error) {
@@ -6922,7 +7100,7 @@ async function createRootSession(
   }
   const entry: SessionEntry = {
     session,
-    agent: deps.kernel.ctx.agents.create(session, { workspaceId: wsId, ...(projectId !== undefined ? { projectId } : {}) }),
+    agent: deps.kernel.ctx.agents.create(session, { workspaceId: wsId, ...(projectId !== undefined ? { projectId } : {}), ...roleIdentityOf(session) }),
     workspaceId: wsId,
     projectId,
   }
@@ -7110,27 +7288,45 @@ async function amendQueuedInput(
   }
   requireWorkspace(deps, entry.workspaceId, true)
   let content: string | undefined
+  let attachments: readonly AttachmentRef[] | undefined
   if (req.method === 'PATCH') {
     const body = await readJson(req)
     const raw = body['content']
     if (typeof raw !== 'string') return { ok: false, status: 400, error: 'body needs a string content' }
     content = raw
+    // Present means replacement (an empty array drops them); absent means the
+    // queued list rides along. Same validation a sent message's refs get.
+    if (body['attachments'] !== undefined) {
+      const parsed = parseAttachments(body['attachments'], deps.limits.maxAttachmentsPerMessage)
+      if (!parsed.ok) return parsed
+      for (const ref of parsed.refs) {
+        try {
+          await deps.attachments.verify(entry.workspaceId, ref)
+        } catch (error) {
+          if (!(error instanceof AttachmentError)) throw error
+          return { ok: false, status: 400, error: error.message }
+        }
+      }
+      attachments = parsed.refs
+    }
   }
   const pending = deps.kernel.ctx.sessions.pendingInputs(entry.session).find((item) => item.inputId === inputId)
   if (pending === undefined) return { ok: false, status: 404, error: 'no such queued input (it may already have run)' }
   const id = pending.inputId
-  // Editing to nothing would leave an input the composer itself refuses.
-  if (content !== undefined && content.trim() === '' && (pending.attachments?.length ?? 0) === 0) {
+  // Editing to nothing would leave an input the composer itself refuses:
+  // empty text is fine only while files (queued or just submitted) ride along.
+  const effective = attachments ?? pending.attachments ?? []
+  if (content !== undefined && content.trim() === '' && effective.length === 0) {
     return { ok: false, status: 400, error: 'body needs a non-empty string content (delete the input instead)' }
   }
   // Check, inbox change and append are one synchronous step: a turn claims
   // its input synchronously too, so it sees either the old or the new queue,
   // never a deleted input it already logged.
-  const applied = content !== undefined ? entry.agent.reviseQueued(id, content) : entry.agent.withdrawQueued(id)
+  const applied = content !== undefined ? entry.agent.reviseQueued(id, content, attachments) : entry.agent.withdrawQueued(id)
   if (!applied) return { ok: false, status: 409, error: 'this input is already being processed' }
   entry.session.append(
     content !== undefined
-      ? { type: 'input/revised', inputId: id, content }
+      ? { type: 'input/revised', inputId: id, content, ...(attachments !== undefined ? { attachments } : {}) }
       : { type: 'input/settled', inputId: id, outcome: 'withdrawn' },
   )
   try {
@@ -7522,6 +7718,7 @@ async function findSession(rawId: string, workspaceId: WorkspaceId, deps: Handle
     agent: deps.kernel.ctx.agents.create(session, {
       workspaceId,
       ...(projectId !== undefined ? { projectId } : {}),
+      ...roleIdentityOf(session),
     }),
     workspaceId,
     projectId,
@@ -7531,6 +7728,24 @@ async function findSession(rawId: string, workspaceId: WorkspaceId, deps: Handle
   // running child as a root turn and hold the project lease for its whole run.
   if (!session.events.some((event) => event.type === 'session/child-meta')) deps.sessions.set(id, entry)
   return entry
+}
+
+/** What a `session/role` record carries (minus its stamp). */
+type RoleRecord = Omit<Extract<SessionEvent, { type: 'session/role' }>, 'seq' | 'timestamp' | 'type'>
+
+/** A root's pinned role, rebuilt from its durable `session/role` record. */
+function roleIdentityOf(session: Session): { readonly role?: NonNullable<AgentScope['role']> } {
+  const record = [...session.events].reverse().find((event) => event.type === 'session/role')
+  if (record?.type !== 'session/role') return {}
+  return {
+    role: {
+      definition: record.definition,
+      instructions: record.instructions,
+      toolCeiling: record.toolCeiling,
+      ...(record.source !== undefined ? { definitionSource: record.source } : {}),
+      ...(record.skills !== undefined ? { skills: record.skills } : {}),
+    },
+  }
 }
 
 /**

@@ -48,6 +48,7 @@ import { type RetryTarget, type ViewItem } from './lib/project.ts'
 import { useSessionDerivedValues } from './lib/session-derived.ts'
 import { sameListing } from './lib/listing-equality.ts'
 import { manifestRefreshKey } from './lib/manifest-refresh.ts'
+import { loadCollapsedFolders, storeCollapsedFolders } from './lib/sidebar-folder-state.ts'
 import type { FileFocus } from './lib/tool-facts.ts'
 import { useSessionStream } from './hooks/useSessionStream.ts'
 import { useApprovalNotify } from './hooks/useApprovalNotify.ts'
@@ -320,11 +321,19 @@ function AppShell() {
   const [draftProject, setDraftProjectState] = useState<string | null>(null)
   // Sidebar folder state lives here so closing the sidebar — which unmounts
   // it — never forgets which folders were collapsed or expanded past five rows.
+  // Collapse additionally persists per workspace so a reload restores it.
   const [folderCollapsed, setFolderCollapsed] = useState<Record<string, boolean>>({})
   const [folderExpanded, setFolderExpanded] = useState<Record<string, boolean>>({})
+  useEffect(() => {
+    setFolderCollapsed(activeWs === null ? {} : loadCollapsedFolders(activeWs))
+  }, [activeWs])
   const toggleFolderCollapsed = useCallback((projectId: string, collapsed: boolean) => {
-    setFolderCollapsed((prev) => ({ ...prev, [projectId]: collapsed }))
-  }, [])
+    setFolderCollapsed((prev) => {
+      const next = { ...prev, [projectId]: collapsed }
+      if (activeWs !== null) storeCollapsedFolders(activeWs, next)
+      return next
+    })
+  }, [activeWs])
   const expandFolder = useCallback((projectId: string, expanded: boolean) => {
     setFolderExpanded((prev) => ({ ...prev, [projectId]: expanded }))
   }, [])
@@ -1038,6 +1047,17 @@ function AppShell() {
     navigate(sessionRoute(activeWs, id))
     if (!sidebarDocked) setSidebarOpen(false)
   }, [activeWs, navigate, sidebarDocked])
+  /**
+   * Open a session another surface just created (an automation's Run now):
+   * it is not in the listing yet, so mark it as known instead of letting the
+   * "listed session vanished" guard bounce to a new conversation, and pull
+   * the listing so the sidebar shows it.
+   */
+  const openCreatedSession = useCallback((id: string) => {
+    createdHere.current.add(id)
+    openSession(id)
+    void refreshList()
+  }, [openSession, refreshList])
 
   /** Runs a built-in composer command through the host: the model is never involved. */
   const runBuiltinCommand = useCallback(async (name: string): Promise<void> => {
@@ -1207,10 +1227,10 @@ function AppShell() {
 
   // Edit / delete one waiting message. Failures (e.g. 409: a turn already
   // claimed it) are reported and rethrown so the row keeps its state.
-  const editQueued = useCallback(async (inputId: string, content: string) => {
+  const editQueued = useCallback(async (inputId: string, content: string, attachments: readonly AttachmentRef[]) => {
     if (current === null || activeWs === null) return
     try {
-      await reviseQueuedInputIn(activeWs, current, inputId, content)
+      await reviseQueuedInputIn(activeWs, current, inputId, content, attachments)
     } catch (cause) {
       toast.notify(String(cause))
       throw cause
@@ -1454,6 +1474,7 @@ function AppShell() {
     if (!sidebarDocked) setSidebarOpen(false)
   }, [activeWs, navigate, sidebarDocked])
   const openAutomationsList = useCallback(() => openAutomations(), [openAutomations])
+  const newAutomation = useCallback(() => openAutomations('new'), [openAutomations])
   const automationContext = useMemo<AutomationControlsContext>(() => ({
     projects,
     modes: modeSelection.modes,
@@ -1466,6 +1487,7 @@ function AppShell() {
   const sidebar = (
     <Sidebar
       onOpenAutomations={openAutomationsList}
+      onNewAutomation={newAutomation}
       automationsActive={automationsView !== null}
       sessions={sessions}
       projects={projects}
@@ -1758,7 +1780,7 @@ function AppShell() {
               automationId={automationsView.automationId}
               context={automationContext}
               onNavigate={openAutomations}
-              onOpenSession={openSession}
+              onOpenSession={openCreatedSession}
               notify={toast.notify}
             />
           ) : current === null ? (
@@ -1831,7 +1853,7 @@ function AppShell() {
                   {sendErrorNotice}
                   {/* The queue docks onto the composer's top edge: no gap between them. */}
                   <div className="flex flex-col">
-                    <QueuedBar items={queuedItems} workspaceId={activeWs} running={running} onSendNow={sendQueuedNow} onEdit={editQueued} onDelete={deleteQueued} />
+                    <QueuedBar items={queuedItems} workspaceId={activeWs} running={running} onSendNow={sendQueuedNow} onEdit={editQueued} onDelete={deleteQueued} onUploadFiles={uploadFiles} />
                     {composerNode}
                   </div>
                 </div>

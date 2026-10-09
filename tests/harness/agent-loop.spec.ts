@@ -792,6 +792,33 @@ describe('agent loop', () => {
     void kernel.stop()
   })
 
+  it('reviseQueued rewrites text and attachments of a waiting input before the turn claims it', async () => {
+    const { kernel, session, agent } = harness(['ok'])
+    const original = { id: 'a'.repeat(64), name: 'old.png', mediaType: 'image/png', bytes: 8 } as const
+    const replacement = { id: 'b'.repeat(64), name: 'new.png', mediaType: 'image/png', bytes: 16 } as const
+    agent.enqueueAccepted({ content: 'before', inputId: 'input-edit' as never, attachments: [original] })
+
+    expect(agent.reviseQueued('input-edit' as never, 'after', [replacement])).toBe(true)
+    // Dropping: an empty list leaves the input with no attachments.
+    expect(agent.reviseQueued('input-edit' as never, 'after again', [])).toBe(true)
+    await agent.run()
+
+    const message = session.events.find((event) => event.type === 'user/message')
+    expect(message).toMatchObject({ type: 'user/message', content: 'after again', inputId: 'input-edit' })
+    expect(message?.type === 'user/message' && message.attachments).toBeUndefined()
+    void kernel.stop()
+  })
+
+  it('reviseQueued without attachments keeps the ones the input already carries', async () => {
+    const { kernel, session, agent } = harness(['ok'])
+    const image = { id: 'a'.repeat(64), name: 'shot.png', mediaType: 'image/png', bytes: 8 } as const
+    agent.enqueueAccepted({ content: 'typo', inputId: 'input-keep' as never, attachments: [image] })
+    expect(agent.reviseQueued('input-keep' as never, 'fixed')).toBe(true)
+    await agent.run()
+    expect(session.events.find((event) => event.type === 'user/message')).toMatchObject({ content: 'fixed', attachments: [image] })
+    void kernel.stop()
+  })
+
   it('an inserted duplicate string does not steal accepted input metadata', async () => {
     const { kernel, session, agent } = harness(['ok'])
     kernel.ctx.on('agent/pre-step', async (claim, next) => next({ contents: [claim.contents[0] ?? '', ...claim.contents] }))
