@@ -13,6 +13,7 @@ import { ActivityBlock, AssistantMessage, AuditLine, CompactionMarker, Continuat
 import { TurnChangesCard } from './TurnChangesCard.tsx'
 import type { WorkbenchProject } from '../workbench/Workbench.tsx'
 import { ConversationMinimap } from './ConversationMinimap.tsx'
+import { MarkdownFileLinkContext } from '../../Markdown.tsx'
 
 interface Indexed {
   readonly item: ViewItem
@@ -388,6 +389,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   return (
     <HoldScrollProvider value={holdPosition}>
       <ProcessLinkContext.Provider value={processLink}>
+      <MarkdownFileLinkContext.Provider value={openPath ?? null}>
       <div className="relative min-h-0 flex-1">
         <div
           ref={scrollRef}
@@ -436,6 +438,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
         <ConversationMinimap items={items} scrollRef={scrollRef} contentRef={contentRef} />
         {!atBottom ? <JumpToBottom unseen={unseen} onClick={scrollToBottom} /> : null}
       </div>
+      </MarkdownFileLinkContext.Provider>
       </ProcessLinkContext.Provider>
     </HoldScrollProvider>
   )

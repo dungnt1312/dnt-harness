@@ -33,6 +33,49 @@ export function toProjectRelative(root: string, target: string): string | null {
   return segments.join('/')
 }
 
+/** A file a chat link points at, with the line window it named. */
+export interface FileHref {
+  readonly path: string
+  readonly focus?: FileFocus
+}
+
+/**
+ * Read a Markdown link target as a file reference. Web and mail links
+ * (`https://…`, `mailto:`) and in-page anchors (`#x`) return null so the
+ * browser handles them; everything else — `src/a.ts`, `/abs/a.ts`,
+ * `file:///abs/a.ts`, with an optional `:12`, `:12:3`, `#L12` or `#L12-L20`
+ * line suffix — is a path the workbench can open.
+ */
+export function parseFileHref(href: string | undefined): FileHref | null {
+  if (href === undefined) return null
+  let value = href.trim()
+  if (value === '' || value.startsWith('#')) return null
+  const fileScheme = /^file:\/\//i.test(value)
+  // Any other `scheme:` is not a path — except a drive letter (`C:/x`) and a
+  // bare name with a line suffix (`Makefile:3`, `a.ts:12`).
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(value)
+  if (/^(javascript|vbscript|data):/i.test(value)) return null
+  if (!fileScheme && scheme !== null && !/^[a-z]:[\\/]/i.test(value) && !/^[^:]+:\d+(?::\d+)?$/.test(value)) return null
+  if (fileScheme) value = value.replace(/^file:\/\/(localhost)?/i, '')
+  try {
+    value = decodeURI(value)
+  } catch {
+    // Keep the raw text: a stray `%` in a path is not an encoding.
+  }
+  let focus: FileFocus | undefined
+  const hashLine = /#L(\d+)(?:-L?(\d+))?$/.exec(value)
+  const colonLine = hashLine === null ? /:(\d+)(?::\d+)?$/.exec(value) : null
+  const match = hashLine ?? colonLine
+  if (match !== null) {
+    const line = Number(match[1])
+    const end = hashLine !== null && match[2] !== undefined ? Number(match[2]) : undefined
+    if (line > 0) focus = end !== undefined && end >= line ? { line, lines: end - line + 1 } : { line }
+    value = value.slice(0, match.index)
+  }
+  value = value.replace(/[?#].*$/, '')
+  return value === '' ? null : { path: value, ...(focus !== undefined ? { focus } : {}) }
+}
+
 /** Last path segment, used for tab titles. */
 export function baseName(path: string): string {
   return path.split('/').at(-1) ?? path

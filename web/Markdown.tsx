@@ -1,8 +1,9 @@
-import { memo, useEffect, useMemo, useState, type ComponentProps } from 'react'
-import ReactMarkdown, { type Components } from 'react-markdown'
+import { createContext, memo, useContext, useEffect, useMemo, useState, type ComponentProps } from 'react'
+import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import Icon from './components/common/Icon.tsx'
 import { ensureLanguage, escapeHtml, highlight } from './lib/highlight.ts'
+import { parseFileHref, type OpenPathResolver } from './lib/project-paths.ts'
 
 /** Fenced code block with a language chip and a copy button. */
 function CodeBlock({ lang, code }: { readonly lang: string; readonly code: string }) {
@@ -59,9 +60,44 @@ const COMPONENTS: Components = {
     }
     return <code className="md-inline">{children}</code>
   },
-  a: (props: ComponentProps<'a'>) => (
-    <a {...props} target="_blank" rel="noreferrer" />
-  ),
+  a: (props: ComponentProps<'a'>) => <MarkdownLink {...props} />,
+}
+
+/**
+ * How a rendered link opens a file. The transcript provides the workbench
+ * opener; without one (settings previews) file links stay plain anchors.
+ */
+export const MarkdownFileLinkContext = createContext<OpenPathResolver | null>(null)
+
+/**
+ * Web links open in a new tab. A path the agent wrote as a link opens in the
+ * workbench instead: navigating to it would only load the app at a bogus
+ * route. A path outside the project is inert rather than a broken page.
+ */
+function MarkdownLink(props: ComponentProps<'a'>) {
+  const openPath = useContext(MarkdownFileLinkContext)
+  const file = parseFileHref(props.href)
+  if (file === null || openPath === null) return <a {...props} target="_blank" rel="noreferrer" />
+  const open = openPath(file.path, file.focus)
+  return (
+    <a
+      {...props}
+      title={open !== null ? `Open ${file.path} in workbench` : file.path}
+      onClick={(event) => {
+        event.preventDefault()
+        open?.()
+      }}
+    />
+  )
+}
+
+/**
+ * react-markdown blanks any href whose "protocol" it does not know, which
+ * swallows `file:///…`, `C:/…` and bare `a.ts:12`. File references keep their
+ * text so the link above can open them; everything else gets the default.
+ */
+function urlTransform(value: string): string {
+  return parseFileHref(value) !== null ? value : defaultUrlTransform(value)
 }
 
 /**
@@ -77,7 +113,7 @@ const COMPONENTS: Components = {
 export const Markdown = memo(function Markdown({ content }: { readonly content: string }) {
   return (
     <div className="md">
-      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={COMPONENTS}>
+      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={COMPONENTS} urlTransform={urlTransform}>
         {content}
       </ReactMarkdown>
     </div>
