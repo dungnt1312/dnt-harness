@@ -81,7 +81,7 @@ export function killTree(child: ChildProcess, shell: string, treeTag: string): v
     // Windows has no process groups; taskkill /T takes the tree down. A
     // second pass reaps MSYS children that were mid-spawn during the first
     // tree walk (taskkill's parent walk races Git Bash's fork chain).
-    const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
+    const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
     killer.on('error', () => {
       child.kill('SIGKILL')
     })
@@ -90,7 +90,7 @@ export function killTree(child: ChildProcess, shell: string, treeTag: string): v
     // environment: sweep MSYS processes by that tag until none remain.
     spawn(shell, ['-c', sweepByTag(treeTag)], { stdio: 'ignore', windowsHide: true }).on('error', () => {})
     setTimeout(() => {
-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' }).on('error', () => {})
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }).on('error', () => {})
       child.kill('SIGKILL')
     }, 250).unref?.()
     return
@@ -212,6 +212,9 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
         const cwd = exec.root !== '' ? exec.root : fallbackCwd()
         const child = spawn(detection.executable, ['-lc', command], {
           cwd, detached: true,
+          // Without windowsHide, detached bash.exe on Windows allocates a
+          // visible console window for every command the agent runs.
+          windowsHide: true,
           env: { ...scrubbedChildEnv(), ...(process.platform === 'win32' ? { [TREE_TAG_ENV]: treeTag } : {}), FORCE_COLOR: '1' },
         })
         // Even rejected registration must observe spawn errors and reap its tree.
@@ -311,6 +314,7 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
             // requiresRoot tool. The fallback retains direct-call compatibility.
             cwd: exec.root !== '' ? exec.root : fallbackCwd(),
             detached: true,
+            windowsHide: true,
             env: { ...scrubbedChildEnv(), ...(process.platform === 'win32' ? { [TREE_TAG_ENV]: treeTag } : {}), FORCE_COLOR: '1' },
           })
         } catch (error) {

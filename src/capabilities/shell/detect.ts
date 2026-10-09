@@ -65,7 +65,7 @@ export function detectShell(explicit?: string): ShellDetection {
     // to the git.exe on PATH. WSL launchers (System32, WindowsApps) are
     // deliberately skipped — Bash means Git Bash here, not a remote VM.
     for (const locator of [['where', 'git'], ['where', 'bash']]) {
-      const lookup = spawnSync(locator[0] as string, locator.slice(1) as string[], { encoding: 'utf8' })
+      const lookup = spawnSync(locator[0] as string, locator.slice(1) as string[], { encoding: 'utf8', windowsHide: true })
       if (lookup.status !== 0) continue
       for (const raw of lookup.stdout.split('\n')) {
         const found = raw.trim()

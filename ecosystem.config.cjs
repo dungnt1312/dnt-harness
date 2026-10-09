@@ -34,8 +34,12 @@ module.exports = {
     {
       name: 'dnt-harness',
       cwd: __dirname,
-      script: 'node_modules/tsx/dist/cli.mjs',
-      args: `src/bins/web.ts --port ${port} --root .${allowedHosts ? ` --allowed-host ${allowedHosts}` : ''}${oauthOrigins ? ` --oauth-origin ${oauthOrigins}` : ''}`,
+      // Load tsx in-process (--import) instead of running the tsx CLI: the CLI
+      // spawns a child node with stdio:inherit and no windowsHide, which pops
+      // up a visible console window on Windows.
+      script: 'src/bins/web.ts',
+      node_args: '--import tsx',
+      args: `--port ${port} --root .${allowedHosts ? ` --allowed-host ${allowedHosts}` : ''}${oauthOrigins ? ` --oauth-origin ${oauthOrigins}` : ''}`,
       interpreter: 'node',
       exec_mode: 'fork',
       instances: 1,
