@@ -12,6 +12,9 @@ This documentation is organized so each layer can be read independently:
 
 | Document | Covers |
 |---|---|
+| [agent-guide.md](agent-guide.md) | Start here for agents: skill/agent authoring, scope, directories, delegation and context |
+| [claude-format.md](claude-format.md) | CLAUDE.md/imports, hooks and custom agent file compatibility |
+| [prompt-contract.md](prompt-contract.md) | What enters model context: trust, ordering, budgets and overrides |
 | [architecture.md](architecture.md) | The big picture: layers, module map, core invariants |
 | [kernel.md](kernel.md) | The mini-Cordis plugin kernel: event bus, fiber, service store, loader |
 | [harness.md](harness.md) | The agent harness: session log, LLM seam, turn/step driver, tools, approval |
@@ -25,14 +28,14 @@ This documentation is organized so each layer can be read independently:
 ## Quick reference
 
 ```sh
-npm install        # install dependencies
-npm test           # run the vitest suite
-npm run typecheck  # typecheck server (tsconfig.json) + web (tsconfig.web.json)
+pnpm install        # install dependencies
+pnpm test           # run the vitest suite
+pnpm run typecheck  # typecheck server (tsconfig.json) + web (tsconfig.web.json)
 
-npm run chat       # headless REPL (DeepSeek only when DEEPSEEK_API_KEY is set)
+pnpm run chat       # headless REPL (DeepSeek only when DEEPSEEK_API_KEY is set)
 
-npm run build:web  # build the React client into web-dist/
-npm run web        # serve the web UI (default port 3082)
+pnpm run build:web  # build the React client into web-dist/
+pnpm run web        # serve the web UI (default port 3082)
 ```
 
 ## Where things live
@@ -56,7 +59,7 @@ src/
 │   ├── tools/          Tool registry + guarded pre-execute → run → post-execute
 │   ├── approval/       Policy riding tools/pre-execute: allow | ask | deny
 │   ├── workspace/      Workspace registry, project binding, ownership
-│   ├── modes/          Four bundled + custom file modes
+│   ├── modes/          Five bundled + custom file modes
 │   ├── context/        Mode-driven builder: budget, compaction, manifest
 │   ├── skills/         Workspace skills + on-demand Skill tool
 │   ├── memory/         Workspace/project Markdown memory + five tools

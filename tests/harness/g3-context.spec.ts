@@ -57,6 +57,42 @@ function base(overrides: Partial<Parameters<typeof buildContext>[0]> = {}): Para
   }
 }
 
+describe('harness authoring guidance', () => {
+  const read = { name: 'Read', description: 'read', parameters: { type: 'object' as const, properties: {} } }
+
+  it('exposes actual workspace paths and scope guidance without granting access', () => {
+    const assembled = buildContext(base({ schemas: [read], harnessWorkspaceDir: '/custom/data/workspaces/ws-build' }))
+    const text = messageText(assembled.messages[0]!.content)
+    expect(text).toContain('Harness authoring reference')
+    expect(text).toContain('/custom/data/workspaces/ws-build/skills')
+    expect(text).toContain('/custom/data/workspaces/ws-build/agents')
+    expect(text).toContain('.claude/skills/<name>/SKILL.md')
+    expect(text).toContain('.claude/agents/<name>.md')
+    expect(text).toContain('These locations are not filesystem grants')
+    expect(assembled.tools).toEqual([read])
+    expect(assembled.sections[0]?.content).toContain('Harness authoring reference')
+    const plain = buildContext(base({ schemas: [read] }))
+    expect(assembled.manifest.breakdown.systemPrompt).toBeGreaterThan(plain.manifest.breakdown.systemPrompt)
+  })
+
+  it('keeps the reference for children and custom system prompts', () => {
+    const assembled = buildContext(base({
+      schemas: [read], harnessWorkspaceDir: '/data/workspaces/ws-build',
+      child: { definition: 'explorer', instructions: 'Investigate only.' }, childSystemOverride: 'CUSTOM CHILD',
+    }))
+    const text = messageText(assembled.messages[0]!.content)
+    expect(text).toContain('CUSTOM CHILD')
+    expect(text).toContain('Harness authoring reference')
+    expect(text).toContain('subject to the current mode, tool ceiling and approval policy')
+  })
+
+  it('does not advertise filesystem authoring in a zero-tool mode', () => {
+    const assembled = buildContext(base({ mode: zeroMode(), schemas: [read], harnessWorkspaceDir: '/secret/data/workspaces/ws-build' }))
+    expect(messageText(assembled.messages[0]!.content)).not.toContain('Harness authoring reference')
+    expect(messageText(assembled.messages[0]!.content)).not.toContain('/secret/data')
+  })
+})
+
 describe('mode-driven assembly', () => {
   it('a zero-exposure mode assembles no tools and no optional sources even when inputs exist', () => {
     const assembled = buildContext(base({

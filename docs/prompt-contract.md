@@ -11,8 +11,9 @@ change and is reviewed as one. Assembly happens in exactly one place:
 ```
 [0]   system   TRUSTED   base prompt | child preamble + capability line + role
                          + mode instructions (root only)
-                         + <environment_context>
                          + file scope (when file tools are exposed)
+                         + harness authoring reference (when file tools are exposed)
+                         + <environment_context>
                          + compaction continuation note (compact + checkpoint)
 [1]   system   wrapped   workspace-instructions   (fixed cost)
 [2]   system   wrapped   compacted-history         (fixed cost)
@@ -30,7 +31,7 @@ schemas travel in `tools`, never in a message.
 
 | Source | Trust | Rationale |
 |--------|-------|-----------|
-| Base/child prompt, environment, file scope, compaction note | **trusted** | Host-owned constants or facts |
+| Base/child prompt, environment, file scope, harness authoring reference, compaction note | **trusted** | Host-owned constants or facts |
 | Mode instructions | **trusted** | Configuration the workspace author chose; the exposure/permission gates — not prose — are the enforcement boundary. `manifest.sources.modeSource` records provenance (`bundled`/`workspace`) so drift is auditable. |
 | Child role body | **trusted** | Same rationale as modes; pinned at spawn, `child.source` records provenance. |
 | CLAUDE.md layers (user, workspace, project, local; `@imports`) | **wrapped lower-trust** | Human-authored prose, one step removed from configuration — see [Claude Code format parity](claude-format.md) |
@@ -62,6 +63,22 @@ Workspace: /abs/project (git branch: feat/x)
 - Children receive date/platform but not the workspace line (their project
   path arrives via file scope).
 - The manifest reports the parsed facts under `sources.environment`.
+
+## Harness authoring reference
+
+The web host passes the actual workspace resource folder as
+`harnessWorkspaceDir`. When any filesystem tool is exposed, the builder adds a
+short host-owned reference to message `[0]`: project/workspace/user locations,
+minimal skill and agent formats, discovery checks and scope selection. It is
+included for roots and children, survives base/child prompt overrides, and is
+measured as fixed system-prompt cost in the existing manifest/section body.
+It is absent for zero-tool requests and callers that omit the workspace folder.
+
+The paths are reference facts, **not grants**; filesystem access and writes
+still require the effective mode, exposure and approval policy. The full
+[agent guide](agent-guide.md) is a source-repository doc, not an assumed file in
+arbitrary user projects. Root `CLAUDE.md` points agents working on this repo to
+that guide; the guide is read on demand rather than injected wholesale.
 
 ## System prompt overrides
 

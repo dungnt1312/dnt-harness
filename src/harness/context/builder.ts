@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import path from 'node:path'
 import type { ModelMessage, ToolSchema, ContentPart } from '../llm/types.ts'
 import type { AttachmentLookup } from '../attachments/store.ts'
 import { deriveDatedMessages, type SessionEvent } from '../session/events.ts'
@@ -124,6 +125,8 @@ export interface BuildContextInput {
    * system message so tests stay clock-free.
    */
   readonly environment?: string
+  /** Host-resolved workspace resource folder; reference only, never a grant. */
+  readonly harnessWorkspaceDir?: string
   /**
    * The folders file tools may use this request: the project folder plus
    * any granted folders. Listed in the system block so the model knows the
@@ -451,6 +454,18 @@ export function buildContext(input: BuildContextInput): AssembledContext {
   }
   if (input.fileScope !== undefined && input.fileScope.primary !== '' && schemas.some((schema) => FILE_TOOLS.has(schema.name))) {
     systemParts.push(fileScopeText(input.fileScope))
+  }
+  if (input.harnessWorkspaceDir !== undefined && schemas.some((schema) => FILE_TOOLS.has(schema.name))) {
+    systemParts.push([
+      'Harness authoring reference (locations only; subject to the current mode, tool ceiling and approval policy):',
+      'Choose scope from the user\'s intent: project for repository/team resources, workspace for resources shared by its projects, user only when machine-wide sharing is requested. If unclear, ask before writing.',
+      'Project: .claude/skills/<name>/SKILL.md (also .agents/skills by default); .claude/agents/<name>.md. Do not use a repository\'s top-level skills/ unless explicitly changing bundled harness skills.',
+      `Workspace skills directory: ${JSON.stringify(path.join(input.harnessWorkspaceDir, 'skills'))}. Workspace agents directory: ${JSON.stringify(path.join(input.harnessWorkspaceDir, 'agents'))}. Settings → Skills/Agents writes this layer.`,
+      'User: ~/.claude/skills/<name>/SKILL.md and ~/.claude/agents/<name>.md (when the host enables those layers). These locations are not filesystem grants; use Settings or request authorized access if file tools cannot reach them. Do not bypass restrictions with Bash.',
+      'Skill: kebab-case folder with SKILL.md, name/description frontmatter and non-empty instructions; load create-skill through Skill when available. Skill source folders/order are configurable; confirm discovery with Skill catalog.',
+      'Agent: Markdown file with YAML frontmatter (name, description, optional tools/disallowedTools, model, skills) and non-empty role instructions. Omitted tools inherit exposed tools; explicit tools narrow them. Confirm with Agent catalog when available. Children cannot delegate.',
+      'Project instructions: CLAUDE.md (or AGENTS.md fallback), with @relative/path imports for detailed docs. In the dnt-harness source repository, docs/agent-guide.md is the entrypoint; do not assume it exists in other projects.',
+    ].join('\n'))
   }
   // Host-owned environment facts (date/platform/workspace/git) are trusted and
   // non-droppable; the host renders the block so the builder stays clock-free.

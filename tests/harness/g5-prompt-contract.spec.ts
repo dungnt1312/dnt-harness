@@ -78,6 +78,7 @@ function baseRoot(overrides: Record<string, unknown> = {}) {
     pinnedMemory: [{ id: 'mem-1', title: 'Fact', body: 'MEMORY-BODY', hash: 'f'.repeat(64) }] as MemorySnippet[],
     inheritedContext: 'User: PARENT-CONTEXT-BODY',
     environment: ENV_BLOCK,
+    harnessWorkspaceDir: '/custom/data/workspaces/ws-golden',
     budget: DEFAULT_BUDGET,
     ...overrides,
   })
@@ -100,7 +101,10 @@ describe('root layout (golden)', () => {
     // …then environment as a BLOCK (opening tag + newline), which the base
     // prompt's prose mention of `<environment_context>` must not match.
     const envAt = systemText.indexOf('<environment_context>\n')
-    expect(envAt).toBeGreaterThan(modeAt)
+    const authoringAt = systemText.indexOf('Harness authoring reference')
+    expect(authoringAt).toBeGreaterThan(modeAt)
+    expect(envAt).toBeGreaterThan(authoringAt)
+    expect(systemText).toContain('/custom/data/workspaces/ws-golden/agents')
     expect(systemText).not.toContain('<untrusted')
   })
 
