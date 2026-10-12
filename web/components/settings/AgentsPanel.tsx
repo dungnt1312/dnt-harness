@@ -67,11 +67,12 @@ export function definitionDocument(draft: { readonly name: string; readonly desc
 type Source = AgentDefinitionRow['source']
 
 /** Layer order in the list: the most specific (winning) layer first. */
-const SOURCE_ORDER: readonly Source[] = ['project', 'workspace', 'user', 'bundled']
-const SOURCE_TONE = { bundled: 'gray', user: 'green', workspace: 'blue', project: 'amber' } as const
-const SOURCE_LABEL = { bundled: 'Bundled', user: '~/.claude', workspace: 'Workspace', project: 'Project' } as const
+const SOURCE_ORDER: readonly Source[] = ['project', 'workspace', 'plugin', 'user', 'bundled']
+const SOURCE_TONE = { bundled: 'gray', user: 'green', plugin: 'gray', workspace: 'blue', project: 'amber' } as const
+const SOURCE_LABEL = { bundled: 'Bundled', user: '~/.claude', plugin: 'Plugin', workspace: 'Workspace', project: 'Project' } as const
 const SOURCE_HINT = {
   bundled: 'Ships with dnt-harness. Clone it to this workspace to customize.',
+  plugin: 'From an enabled Claude Code plugin (Settings → Plugins). Clone it to change it for this workspace only.',
   user: '~/.claude/agents — shared with Claude Code and every workspace. Clone it to change it for this workspace only.',
   workspace: 'This workspace’s agents folder. Editable here.',
   project: 'The bound project’s .claude/agents. Edit the file in the repository.',

@@ -64,7 +64,7 @@ function shellSyntaxError(command: string, signal?: AbortSignal): Promise<boolea
 }
 
 /** Run one hook command with `input` on stdin. Never throws; spawn failures are non-blocking errors. */
-export async function runHook(hook: Pick<ResolvedHook, 'command' | 'timeout'>, input: Record<string, unknown>, options: HookRunOptions = {}): Promise<HookOutcome> {
+export async function runHook(hook: Pick<ResolvedHook, 'command' | 'timeout'> & Partial<Pick<ResolvedHook, 'plugin'>>, input: Record<string, unknown>, options: HookRunOptions = {}): Promise<HookOutcome> {
   const started = Date.now()
   const timeoutMs = Math.round((hook.timeout ?? DEFAULT_HOOK_TIMEOUT_SECONDS) * 1000)
   const syntaxError = await shellSyntaxError(hook.command, options.signal)
@@ -122,7 +122,11 @@ export async function runHook(hook: Pick<ResolvedHook, 'command' | 'timeout'>, i
         shell: true,
         ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: scrubbedChildEnv(projectDir !== undefined ? { CLAUDE_PROJECT_DIR: projectDir } : {}),
+        env: scrubbedChildEnv({
+          ...(projectDir !== undefined ? { CLAUDE_PROJECT_DIR: projectDir } : {}),
+          // Claude exports these to a plugin's hooks.
+          ...(hook.plugin !== undefined ? { CLAUDE_PLUGIN_ROOT: hook.plugin.root, CLAUDE_PLUGIN_DATA: hook.plugin.data } : {}),
+        }),
         windowsHide: true,
         // Own process group so a timeout kills the whole tree.
         detached: process.platform !== 'win32',

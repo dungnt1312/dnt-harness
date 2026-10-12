@@ -280,6 +280,7 @@ class StdioTransport implements Transport {
     } catch {
       return // non-JSON line = server log noise
     }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return
     const record = parsed as { id?: unknown; method?: unknown; result?: unknown; error?: unknown }
     if (typeof record.method === 'string') {
       this.events.onNotification?.(record.method)

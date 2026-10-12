@@ -19,6 +19,7 @@ import {
   listProjects,
   reorderProjects,
   listSessionsIn,
+  listCommands,
   listSkills,
   listTerminals,
   listWorkspaces,
@@ -91,7 +92,7 @@ import { AutomationsView, type AutomationControlsContext } from './components/au
 import ConfirmDialog from './components/common/ConfirmDialog.tsx'
 import type { ContextManifestView, SessionModeSelection } from './lib/api.ts'
 import { builtinCommandIn, draftIsOnlyCommand, type CompletionItem } from './lib/composer-completion.ts'
-import type { ModelDefaults, ProjectRow, QuestionReply, SessionListing, SessionModel, SkillRow, WorkspaceMeta, WorkspaceRow } from './lib/types.ts'
+import type { CommandRow, ModelDefaults, ProjectRow, QuestionReply, SessionListing, SessionModel, SkillRow, WorkspaceMeta, WorkspaceRow } from './lib/types.ts'
 
 /** The sidebar docks beside the conversation at this width; below it is a drawer. */
 const SIDEBAR_DOCK_QUERY = '(min-width: 768px)'
@@ -114,13 +115,37 @@ function ScopedComposer({ store, scope, ...props }: Omit<ComponentProps<typeof C
 
 export const sessionModelKey =(workspaceId: string, sessionId: string): string => `${workspaceId}:${sessionId}`
 
-/** Fetch the exact layered catalog the current composer/session will execute with. */
-export function composerSkillRows(
+/**
+ * The `/` menu's catalog, resolved the way the host expands: a skill shadows
+ * a custom command of the same name (Claude loads skills first). Rows a user
+ * cannot run — the skill itself `user-invocable: false` — are left out, and a
+ * shadowed command never resurfaces in its place. A failing commands route
+ * only drops the commands.
+ */
+export async function composerSkillRows(
   load: (workspaceId: string, projectId?: string) => Promise<SkillRow[]>,
   workspaceId: string,
   projectId: string | null,
+  loadCommands?: (workspaceId: string, projectId?: string) => Promise<{ readonly commands: readonly CommandRow[] }>,
 ): Promise<SkillRow[]> {
-  return load(workspaceId, projectId ?? undefined)
+  const [skillRows, commandRows] = await Promise.all([
+    load(workspaceId, projectId ?? undefined),
+    loadCommands !== undefined
+      ? loadCommands(workspaceId, projectId ?? undefined).then((result) => result.commands).catch(() => [] as readonly CommandRow[])
+      : Promise.resolve([] as readonly CommandRow[]),
+  ])
+  const skillNames = new Set(skillRows.map((row) => row.name.toLowerCase()))
+  const commands: SkillRow[] = commandRows
+    .filter((row) => row.userInvocable !== false && !skillNames.has(row.name.toLowerCase()))
+    .map((row) => ({
+      name: row.name,
+      title: row.name,
+      description: row.description,
+      source: row.source === 'project' || row.source === 'workspace' || row.source === 'plugin' || row.source === 'bundled' ? row.source : 'user',
+      hash: '',
+      ...(row.argumentHint !== undefined ? { argumentHint: row.argumentHint } : {}),
+    }))
+  return [...commands, ...skillRows.filter((row) => row.userInvocable !== false)]
 }
 
 /**
@@ -658,6 +683,8 @@ function AppShell() {
   }, [setInspectorViews, setInspectorTab, sessionTabs.inspectorViews, onWorkbenchOpenChange])
   /** The background process the Environment panel focused, if any. */
   const [processFocus, setProcessFocus] = useState<string | null>(null)
+  /** The subagent a transcript delegation row focused in the workbench Subagents view. */
+  const [agentFocus, setAgentFocus] = useState<string | null>(null)
   /** The per-turn change card's Review all: the Git view narrowed to that turn's recorded files. */
   const reviewTurnChanges = useCallback((paths: readonly string[]) => {
     setGitPathFilter(paths)
@@ -677,6 +704,12 @@ function AppShell() {
     openWorkbenchView(view)
   }, [openWorkbenchView])
   /** A process row (or tool-row chip): the workbench Process view, focused. */
+  // A focused subagent belongs to one conversation's delegation.
+  useEffect(() => { setAgentFocus(null) }, [subagentsRootId])
+  const openSubagentDetail = useCallback((childSessionId: string) => {
+    setAgentFocus(childSessionId)
+    openWorkbenchView('agents')
+  }, [openWorkbenchView])
   const openEnvironmentProcess = useCallback((processId: string) => {
     setProcessFocus(processId)
     openWorkbenchView('process')
@@ -1004,7 +1037,7 @@ function AppShell() {
     if (activeWs === null) return
     const projectId = workbenchProject?.id ?? null
     let cancelled = false
-    void composerSkillRows(listSkills, activeWs, projectId)
+    void composerSkillRows(listSkills, activeWs, projectId, listCommands)
       .then((rows) => { if (!cancelled && workspaceRef.current === activeWs) setSkills(rows) })
       .catch(() => { /* an unavailable catalog only closes the menu */ })
     return () => { cancelled = true }
@@ -1702,6 +1735,8 @@ function AppShell() {
       agentsSessionId={subagentsRootId ?? current}
       agentsProjectId={subagentsRootProjectId}
       onOpenChild={openSession}
+      agentFocus={agentFocus}
+      onAgentFocus={setAgentFocus}
       processFocus={processFocus}
       terminalShell={preferences.terminalShell}
       onTerminalShell={(shellId) => patchPreferences({ terminalShell: shellId })}
@@ -1852,7 +1887,7 @@ function AppShell() {
                   onReviewFile={reviewTurnFile}
                   onOpenProcess={openEnvironmentProcess}
                   onReuse={reuseInDraft}
-                  onOpenChild={openSession}
+                  onOpenChild={openSubagentDetail}
                   onRetry={retryFailedTurn}
                   openPath={openRecordedPath}
                 />

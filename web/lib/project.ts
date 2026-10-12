@@ -94,6 +94,12 @@ export type ViewItem =
       readonly content: string
     }
   | {
+      /** What a typed `/name args` expanded to: the model read it, the user typed the slash line. */
+      readonly kind: 'command-expansion'
+      readonly ts?: number
+      readonly content: string
+    }
+  | {
       readonly kind: 'compaction'
       readonly ts?: number
       /** running: start without end yet; completed/failed: end recorded; interrupted: dangling start the log moved past. */
@@ -278,6 +284,10 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
           break
         case 'user/message': {
           if (event.content === undefined) break
+          if (event.origin === 'command') {
+            add({ kind: 'command-expansion', content: event.content, ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}) })
+            break
+          }
           if (event.origin === 'context' || HOOK_CONTEXT_PREFIX.test(event.content)) {
             // Host-injected context (hook additionalContext): the model reads
             // it; the transcript shows one collapsed line, never a user bubble.

@@ -34,7 +34,7 @@ export const SUPPORTED_HOOK_EVENTS: ReadonlySet<ClaudeHookEvent> = new Set<Claud
   'PreCompact', 'SessionStart', 'SessionEnd',
 ])
 
-export type HookLayer = 'user' | 'workspace' | 'project' | 'local'
+export type HookLayer = 'user' | 'plugin' | 'workspace' | 'project' | 'local'
 
 export interface HookCommand {
   readonly type: 'command'
@@ -60,6 +60,8 @@ export interface ResolvedHook {
   readonly timeout?: number
   readonly layer: HookLayer
   readonly source: string
+  /** Plugin hooks: the plugin id and the env Claude exports to them. */
+  readonly plugin?: { readonly id: string; readonly root: string; readonly data: string }
   /** False when the workspace switched this hook off (`hooks-state.json`). */
   readonly active: boolean
   /** True when dnt-harness fires this event. */
@@ -136,6 +138,14 @@ export function parseHooksSection(value: unknown, options: { strict?: boolean; l
         const where = `${event}[${index}].hooks[${hookIndex}]`
         if (!isRecord(hookRaw)) { problem(`${where} must be an object`); continue }
         if (hookRaw['type'] !== 'command') { problem(`${where}: only type "command" hooks run in dnt-harness (got ${JSON.stringify(hookRaw['type'])})`); continue }
+        // Claude fields dnt-harness cannot faithfully execute yet: `if`
+        // predicates, background/async hooks and async rewake. Never run them
+        // unconditionally — report them as "not run" instead.
+        if (hookRaw['if'] !== undefined || hookRaw['asyncRewake'] === true || hookRaw['async'] === true) {
+          const fields = ['if', hookRaw['asyncRewake'] === true ? 'asyncRewake' : undefined, hookRaw['async'] === true ? 'async' : undefined].filter(Boolean).join(', ')
+          problem(`${where}: ${fields} is valid Claude plugin hook configuration but is not run by dnt-harness`)
+          continue
+        }
         if (typeof hookRaw['command'] !== 'string' || hookRaw['command'].trim() === '') { problem(`${where}.command must be a non-empty string`); continue }
         const timeout = hookRaw['timeout']
         if (timeout !== undefined && (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout <= 0)) { problem(`${where}.timeout must be a positive number of seconds`); continue }
@@ -172,6 +182,8 @@ export interface HookSourceDirs {
   readonly workspaceDir?: string
   /** Bound project root. */
   readonly projectRoot?: string
+  /** Hooks of the enabled plugins (raw `hooks` sections, merged as Claude does). */
+  readonly plugins?: readonly { readonly id: string; readonly root: string; readonly data: string; readonly hooks: unknown; readonly label: string }[]
 }
 
 export function hookSourceFiles(dirs: HookSourceDirs): { layer: HookLayer; path: string }[] {
@@ -238,34 +250,49 @@ export async function loadHooks(dirs: HookSourceDirs): Promise<ResolvedHooks> {
   const diagnostics: string[] = []
   const sources: { layer: HookLayer; path: string; exists: boolean }[] = []
   let disabled = false
-  for (const [index, source] of files.entries()) {
-    const read = reads[index]!
-    sources.push({ ...source, exists: read.exists })
-    if (read.error !== undefined) { diagnostics.push(read.error); continue }
-    if (read.doc === undefined) continue
-    if (read.doc['disableAllHooks'] === true) disabled = true
-    const parsed = parseHooksSection(read.doc['hooks'], { label: source.path })
+  const collect = (hooksValue: unknown, layer: HookLayer, sourcePath: string, plugin?: ResolvedHook['plugin']): void => {
+    const parsed = parseHooksSection(hooksValue, { label: sourcePath })
     diagnostics.push(...parsed.diagnostics)
     for (const [event, groups] of Object.entries(parsed.hooks)) {
       const supported = SUPPORTED_HOOK_EVENTS.has(event as ClaudeHookEvent)
       for (const group of groups ?? []) {
         for (const command of group.hooks) {
           const matcher = group.matcher ?? ''
-          const id = hookId(source.layer, event, matcher, command.command)
+          // A plugin's `${CLAUDE_PLUGIN_ROOT}` is part of the command it runs
+          // (Claude substitutes it before spawning); the id keys on the
+          // plugin id instead of the install path, so it survives updates.
+          const text = plugin !== undefined
+            ? command.command.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, () => plugin.root).replace(/\$\{CLAUDE_PLUGIN_DATA\}/g, () => plugin.data)
+            : command.command
+          const id = hookId(layer, event, matcher, plugin !== undefined ? `${plugin.id}\u0000${command.command}` : command.command)
           all.push({
             id,
             event: event as ClaudeHookEvent,
             matcher,
-            command: command.command,
+            command: text,
             ...(command.timeout !== undefined ? { timeout: command.timeout } : {}),
-            layer: source.layer,
-            source: source.path,
+            layer,
+            source: sourcePath,
+            ...(plugin !== undefined ? { plugin } : {}),
             active: !inactive.has(id),
             supported,
           })
         }
       }
     }
+  }
+  for (const [index, source] of files.entries()) {
+    const read = reads[index]!
+    sources.push({ ...source, exists: read.exists })
+    if (read.error !== undefined) { diagnostics.push(read.error); continue }
+    if (read.doc === undefined) continue
+    if (read.doc['disableAllHooks'] === true) disabled = true
+    collect(read.doc['hooks'], source.layer, source.path)
+  }
+  // Plugin hooks merge with the settings hooks; as everywhere in Claude, all
+  // matching hooks run (order does not decide anything).
+  for (const plugin of dirs.plugins ?? []) {
+    collect(plugin.hooks, 'plugin', plugin.label, { id: plugin.id, root: plugin.root, data: plugin.data })
   }
   const hooks = disabled ? [] : all.filter((hook) => hook.active && hook.supported)
   return { all, hooks, disabled, sources, diagnostics }

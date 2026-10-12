@@ -93,7 +93,7 @@ export interface BuildContextInput {
     readonly instructions: string
   }
   /** Provenance of the child's role definition (bundled role vs workspace file). */
-  readonly childSource?: 'bundled' | 'user' | 'workspace' | 'project'
+  readonly childSource?: 'bundled' | 'user' | 'plugin' | 'workspace' | 'project'
   /**
    * A ROOT conversation running as an agent role (automations): the role's
    * instructions replace the mode prose. Context sources still follow the
@@ -102,7 +102,7 @@ export interface BuildContextInput {
   readonly rootRole?: {
     readonly definition: string
     readonly instructions: string
-    readonly source?: 'bundled' | 'user' | 'workspace' | 'project'
+    readonly source?: 'bundled' | 'user' | 'plugin' | 'workspace' | 'project'
   }
   /**
    * Workspace-authored replacement for the base system prompt (root
@@ -194,7 +194,7 @@ export interface ContextManifest {
     readonly toolNames: readonly string[]
     readonly toolSchemas: number
     /** The child role this request ran as, with its pinned instructions' hash. */
-    readonly child?: { readonly definition: string; readonly instructionsHash: string; readonly source?: 'bundled' | 'user' | 'workspace' | 'project' }
+    readonly child?: { readonly definition: string; readonly instructionsHash: string; readonly source?: 'bundled' | 'user' | 'plugin' | 'workspace' | 'project' }
     /** Inherited parent context the request carried (absent when dropped). */
     readonly parentContext?: { readonly hash: string; readonly chars: number }
   }

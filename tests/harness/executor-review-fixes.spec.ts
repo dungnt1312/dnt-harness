@@ -188,7 +188,69 @@ describe('closing guards are bounded', () => {
   }, 15_000)
 })
 
+describe('lifecycle-owned report tracking', () => {
+  it('does not owe any of 4097 reported children again, and releases tracking', async () => {
+    const harness = await boot([])
+    const root = harness.rootSessionId as never
+    const ids = Array.from({ length: 4097 }, (_, i) => `child-${i}` as never)
+    const turns = (harness.executor as unknown as { turnChildren: Map<string, Set<never>> }).turnChildren
+    turns.set(`${root}:turn-1`, new Set(ids))
+    harness.executor.markReported(ids)
+    expect(harness.executor.owedChildrenOfTurn(root, 'turn-1')).toEqual([])
+    await harness.executor.releaseTurns(root)
+    expect(turns.size).toBe(0)
+    await harness.kernel.stop()
+  })
+})
+
+describe('root cancellation storage errors', () => {
+  it('propagates a load failure for an existing root instead of treating it as deleted', async () => {
+    const harness = await boot([])
+    const sessions = harness.kernel.ctx.sessions
+    const load = sessions.load.bind(sessions)
+    const failure = new Error('unexpected root storage failure')
+    sessions.load = async () => { throw failure }
+    try {
+      await expect(harness.executor.cancelAllOfRoot(harness.rootSessionId as never)).rejects.toBe(failure)
+    } finally {
+      sessions.load = load
+      await harness.kernel.stop()
+    }
+  })
+})
+
 describe('manual keepOpen batches', () => {
+  it('Stop durably closes a settled empty batch exactly once and permits a new batch', async () => {
+    const harness = await boot(['done'])
+    const { parentTurnId: _ignored, ...manual } = request(harness, worker)
+    const first = await harness.executor.spawnManual(manual, () => false, { keepOpen: true })
+    await harness.executor.wait(harness.workspaceId as never, [first.handle.childSessionId])
+    await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)
+    await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)
+    expect(parentEvents(harness).filter((event) => event.type === 'turn/end' && event.turnId === first.turnId)).toHaveLength(1)
+    const next = await harness.executor.spawnManual(manual, () => false, { keepOpen: true })
+    expect(next.turnId).not.toBe(first.turnId)
+    await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)
+    await harness.kernel.stop()
+  }, 15_000)
+
+  it('conversation admission waits for a manual spawn awaiting authority and stays queued', async () => {
+    const harness = await boot(['done'])
+    const parked = gate()
+    const { parentTurnId: _ignored, ...manual } = request(harness, worker, { admissionResolver: parked.resolver })
+    const spawning = harness.executor.spawnManual(manual, () => false, { keepOpen: true })
+    await parked.started
+    let started = false
+    const admission = harness.executor.admitConversation(harness.rootSessionId as never, () => { started = true })
+    parked.release()
+    await spawning
+    expect(await admission).toBe(false)
+    expect(started).toBe(false)
+    await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)
+    expect(await harness.executor.admitConversation(harness.rootSessionId as never, () => { started = true })).toBe(true)
+    expect(started).toBe(true)
+    await harness.kernel.stop()
+  }, 15_000)
   it('a failed join leaves the batch open and earlier children running', async () => {
     const harness = await boot([{ toolCalls: [{ name: 'Read', args: {} }] }])
     const base = request(harness, worker)
@@ -208,6 +270,7 @@ describe('manual keepOpen batches', () => {
     const third = await harness.executor.spawnManual(manual, () => false, { turnId: first.turnId, keepOpen: true })
     expect(third.turnId).toBe(first.turnId)
     await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)
+    expect(parentEvents(harness).filter((event) => event.type === 'turn/end' && event.turnId === first.turnId)).toHaveLength(1)
     await harness.kernel.stop()
   }, 15_000)
 })

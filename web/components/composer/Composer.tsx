@@ -45,10 +45,12 @@ const OVERSIZED_MESSAGE = 'Pasted text exceeds the 60,000-byte limit. Shorten or
 /** Fallback when the caret could not be bookmarked: the start of the draft. */
 const DRAFT_START: CaretBookmark = { offset: 0, revision: -1 }
 
-/** One workspace skill offered by the `/` menu. */
+/** One custom slash command or skill offered by the `/` menu (Claude Code style). */
 export interface SkillOption {
   readonly name: string
   readonly description?: string
+  /** Claude `argument-hint`, shown after the name. */
+  readonly argumentHint?: string
 }
 
 /** Pasted text that became an attachment and can still be put back inline. */

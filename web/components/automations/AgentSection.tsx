@@ -9,10 +9,11 @@ const MAIN = '__main__'
 const SOURCE_LABELS: Readonly<Record<AgentDefinitionRow['source'], string>> = {
   bundled: 'Built-in roles',
   user: 'Your roles (~/.claude/agents)',
+  plugin: 'Plugin roles',
   workspace: 'Workspace roles',
   project: 'Project roles',
 }
-const SOURCE_ORDER: readonly AgentDefinitionRow['source'][] = ['project', 'workspace', 'user', 'bundled']
+const SOURCE_ORDER: readonly AgentDefinitionRow['source'][] = ['project', 'workspace', 'plugin', 'user', 'bundled']
 const INSTRUCTIONS_PREVIEW = 280
 
 /**

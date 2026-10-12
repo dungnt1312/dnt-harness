@@ -34,15 +34,16 @@ export interface CompletionItem {
   readonly detail?: string
 }
 
-/** A skill becomes a command chip; its wire text is owned by `inline-chips.ts`. */
-export function skillCompletionItem(skill: { readonly name: string; readonly description?: string }): CompletionItem {
+/** A command or skill becomes a command chip; its wire text is owned by `inline-chips.ts`. */
+export function skillCompletionItem(skill: { readonly name: string; readonly description?: string; readonly argumentHint?: string }): CompletionItem {
   const segment: DraftSegment = { kind: 'command', name: skill.name }
+  const detail = [skill.argumentHint, skill.description].filter((part) => part !== undefined && part !== '').join(' — ')
   return {
     id: `skill:${skill.name}`,
     insert: messageText([segment]),
     segment,
     label: skill.name,
-    ...(skill.description !== undefined ? { detail: skill.description } : {}),
+    ...(detail !== '' ? { detail } : {}),
   }
 }
 
@@ -88,7 +89,7 @@ const FILE_TRIGGER = /(^|\s)@([^\s@]*)$/
 /** Skill names are one token; the trigger is anchored to the draft start. */
 const SKILL_TRIGGER = /^\/([^\s/]*)$/
 /** The `$` menu is skill-only and also works mid-draft, like a `@` mention. */
-const SKILL_DOLLAR_TRIGGER = /(^|\s)\$([a-z0-9][a-z0-9-]*)?$/
+const SKILL_DOLLAR_TRIGGER = /(^|\s)\$([a-zA-Z0-9_][a-zA-Z0-9:_-]*)?$/
 
 /**
  * The completion the caret is inside, or null. `caret` is the selection start;

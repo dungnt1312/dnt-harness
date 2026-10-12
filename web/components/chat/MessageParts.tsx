@@ -14,7 +14,7 @@ import { agentAction, exitIsAnswer, isDenied, mcpServerOf, toolFacts, type ToolF
 import { PATH_LINK_ATTR, ansiToHtml } from '../../lib/ansi.ts'
 import { commandBase, freeTextLinker, rebase, searchLinker, type LineLinker, type PathRef } from '../../lib/path-links.ts'
 import { Section, ToolArguments, preClass } from './ToolArguments.tsx'
-import { attachmentUrl, fetchContextBody, waitChild } from '../../lib/api.ts'
+import { attachmentUrl, fetchContextBody } from '../../lib/api.ts'
 import { agentRoleIcon } from '../../lib/agent-icons.ts'
 import { cn } from '../../lib/cn.ts'
 import type { AttachmentRef } from '../../lib/composer-draft.ts'
@@ -22,7 +22,7 @@ import { parseMessageText } from '../../lib/inline-chips.ts'
 import { InlineChip } from '../common/InlineChip.tsx'
 import type { TurnTiming } from '../../lib/turn-timing.ts'
 import { ImageLightbox } from './ImageLightbox.tsx'
-import type { ChildRow, ContextManifestView, ToolCall } from '../../lib/types.ts'
+import type { ContextManifestView, ToolCall } from '../../lib/types.ts'
 import type { ViewItem } from '../../lib/project.ts'
 import type { OpenPathResolver } from '../../lib/project-paths.ts'
 import type { TurnChanges } from '../../lib/turn-changes.ts'
@@ -501,10 +501,12 @@ const ROW_OWN_ACTION = 'data-row-own-action'
  * plain row instead: clicking anywhere but the chip toggles it, and the
  * chevron is the expander keyboard and assistive tech reach.
  */
-function ActivityRow({ spec, state, expandable = true, children }: {
+function ActivityRow({ spec, state, expandable = true, onActivate, children }: {
   readonly spec: RowSpec
   readonly state: RowState
   readonly expandable?: boolean
+  /** The row opens something elsewhere (the workbench) instead of expanding in place. */
+  readonly onActivate?: () => void
   readonly children?: ReactNode
 }) {
   const [expanded, setExpanded] = useState(false)
@@ -513,6 +515,23 @@ function ActivityRow({ spec, state, expandable = true, children }: {
   const bodyId = useId()
   const buttonId = useId()
   const line = <RowLine spec={spec} state={state} showIcon />
+  if (onActivate !== undefined) {
+    return (
+      <button
+        type="button"
+        onClick={onActivate}
+        className={cn(rowClass, 'group/row cursor-pointer rounded-sm')}
+        {...(spec.title !== undefined ? { title: spec.title } : {})}
+      >
+        {line}
+        <Icon
+          name="chevronRight"
+          size={14}
+          className="shrink-0 text-fg-faint opacity-0 transition duration-200 group-hover/row:opacity-100 group-focus-visible/row:opacity-100 [@media(pointer:coarse)]:opacity-100"
+        />
+      </button>
+    )
+  }
   if (!expandable) {
     return <div className={rowClass} {...(spec.title !== undefined ? { title: spec.title } : {})}>{line}</div>
   }
@@ -1377,14 +1396,12 @@ const DELEGATION_STATUS: Readonly<Partial<Record<Extract<ViewItem, { kind: 'dele
 }
 
 /**
- * One delegation from the durable spawn → result pair. The settled result
- * payload (the child's final report, files touched, error) is fetched when
- * expanded.
+ * One delegation from the durable spawn → result pair. It is a plain line:
+ * clicking it opens that subagent's detail in the workbench rather than
+ * expanding in place.
  */
-export const DelegationCard = memo(function DelegationCard({ item, workspaceId, rootSessionId, onOpen }: {
+export const DelegationCard = memo(function DelegationCard({ item, onOpen }: {
   readonly item: Extract<ViewItem, { kind: 'delegation' }>
-  readonly workspaceId?: string | null
-  readonly rootSessionId?: string | null
   readonly onOpen?: (childSessionId: string) => void
 }) {
   const status = DELEGATION_STATUS[item.status]
@@ -1398,76 +1415,8 @@ export const DelegationCard = memo(function DelegationCard({ item, workspaceId, 
     ...(item.brief !== '' ? { primary: item.brief, title: item.brief } : {}),
     ...(status !== undefined ? { status } : {}),
   }
-  return (
-    <ActivityRow spec={spec} state={DELEGATION_STATE[item.status]}>
-      <DelegationDetail item={item} {...(workspaceId !== undefined ? { workspaceId } : {})} {...(rootSessionId !== undefined ? { rootSessionId } : {})} {...(onOpen !== undefined ? { onOpen } : {})} />
-    </ActivityRow>
-  )
+  return <ActivityRow spec={spec} state={DELEGATION_STATE[item.status]} {...(onOpen !== undefined ? { onActivate: () => onOpen(item.childSessionId) } : { expandable: false })} />
 })
-
-/** Shown whenever a child's report hit the host cap; the full text is in its log. */
-export function TruncatedNote() {
-  return <p className="m-0 text-xs text-warn">Report truncated — open the child conversation for the full text.</p>
-}
-
-function DelegationDetail({ item, workspaceId, rootSessionId, onOpen }: {
-  readonly item: Extract<ViewItem, { kind: 'delegation' }>
-  readonly workspaceId?: string | null
-  readonly rootSessionId?: string | null
-  readonly onOpen?: (childSessionId: string) => void
-}) {
-  const [detail, setDetail] = useState<ChildRow | null>(null)
-  const [failed, setFailed] = useState(false)
-  // Bumped by Try again; the fetch effect keys off it.
-  const [attempt, setAttempt] = useState(0)
-  const settled = item.status !== 'running'
-
-  // Mounted only while expanded, so the result is fetched on demand.
-  useEffect(() => {
-    if (!settled || workspaceId === null || workspaceId === undefined || rootSessionId === null || rootSessionId === undefined) return
-    let cancelled = false
-    setFailed(false)
-    void waitChild(workspaceId, rootSessionId, item.childSessionId, 1_000).then(
-      (row) => { if (!cancelled) setDetail(row) },
-      () => { if (!cancelled) setFailed(true) },
-    )
-    return () => { cancelled = true }
-  }, [settled, workspaceId, rootSessionId, item.childSessionId, attempt])
-
-  return (
-    <>
-      <Section label="Brief"><p className="m-0 whitespace-pre-wrap break-words">{item.brief !== '' ? item.brief : '—'}</p></Section>
-      {settled ? (
-        <Section label={`Result (${item.status})`} {...(detail?.result !== undefined ? { copy: detail.result.report } : {})}>
-          {detail?.result?.truncated === true ? <TruncatedNote /> : null}
-          {detail?.result !== undefined
-            ? <p className="m-0 whitespace-pre-wrap break-words">{detail.result.report}</p>
-            : detail?.error !== undefined
-              ? <p className="m-0 text-bad">{detail.error}</p>
-              : failed
-                ? (
-                  <p className="m-0 flex flex-wrap items-center gap-2 text-fg-muted">
-                    Could not load the result of this child session.
-                    <button type="button" className="text-[13px] text-link hover:underline" onClick={() => setAttempt((count) => count + 1)}>Try again</button>
-                  </p>
-                )
-                : <p className="m-0 text-fg-muted">Result payload unavailable for this child session.</p>}
-          {detail?.result !== undefined && detail.result.filesTouched.length > 0 ? (
-            <div className="flex flex-wrap items-center gap-1">
-              <span className="text-xs text-fg-faint">Files touched:</span>
-              {detail.result.filesTouched.map((file) => <code key={file} className="rounded-md bg-muted px-1.5 py-0.5 text-xs">{file}</code>)}
-            </div>
-          ) : null}
-        </Section>
-      ) : null}
-      {onOpen !== undefined ? (
-        <button type="button" className="self-start text-[13px] text-link hover:underline" onClick={() => onOpen(item.childSessionId)}>
-          Open conversation →
-        </button>
-      ) : null}
-    </>
-  )
-}
 
 const AUDIT_ICONS = {
   block: { icon: 'alertTriangle', className: 'text-warn' },
@@ -1698,6 +1647,38 @@ export const HookContextMarker = memo(function HookContextMarker({ item }: {
       {open ? (
         <div className="mt-1.5 rounded-xl border border-line bg-surface px-3 py-2.5">
           <p className="m-0 max-h-72 overflow-y-auto whitespace-pre-wrap break-words text-xs leading-5 text-fg-muted">{body}</p>
+        </div>
+      ) : null}
+    </div>
+  )
+})
+
+/**
+ * What a slash command expanded to (Claude Code: the command's prompt sent
+ * for the typed `/name args`): one collapsed line under the user's bubble,
+ * the full prompt one click away.
+ */
+export const CommandExpansionMarker = memo(function CommandExpansionMarker({ item }: {
+  readonly item: Extract<ViewItem, { kind: 'command-expansion' }>
+}) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="min-w-0">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        title={item.ts !== undefined ? formatTime(item.ts) : undefined}
+        className="flex min-w-0 items-center gap-2 py-0.5 text-left text-xs text-fg-muted transition-colors hover:text-fg"
+      >
+        <Icon name="zap" size={13} className="shrink-0 text-fg-faint" />
+        <span className="shrink-0">Command expanded</span>
+        <span className="min-w-0 font-mono text-fg-faint">{item.content.length.toLocaleString()} chars</span>
+        <Icon name="chevron" size={12} className={cn('ml-auto shrink-0 text-fg-faint transition-transform', open ? 'rotate-180' : '')} />
+      </button>
+      {open ? (
+        <div className="mt-1.5 rounded-xl border border-line bg-surface px-3 py-2.5">
+          <p className="m-0 max-h-72 overflow-y-auto whitespace-pre-wrap break-words text-xs leading-5 text-fg-muted">{item.content}</p>
         </div>
       ) : null}
     </div>

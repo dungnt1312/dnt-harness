@@ -7,7 +7,7 @@
 import { homedir } from 'node:os'
 import path from 'node:path'
 
-export type SkillSource = 'project' | 'workspace' | 'user' | 'bundled'
+export type SkillSource = 'project' | 'workspace' | 'user' | 'bundled' | 'plugin'
 
 export class SkillError extends Error {
   constructor(
@@ -34,6 +34,31 @@ export interface SkillLayer {
   readonly source: SkillSource
   /** The rule a project/user layer resolved from; absent on the workspace layer. */
   readonly ruleId?: string
+  /** Plugin layers: names are `<prefix>:<folder>` (Claude's plugin namespacing). */
+  readonly prefix?: string
+  /** `base` IS one skill folder (a plugin listing a single skill path). */
+  readonly single?: true
+  /** Plugin identity and roots (`${CLAUDE_PLUGIN_ROOT}` / `${CLAUDE_PLUGIN_DATA}`). */
+  readonly plugin?: { readonly id: string; readonly name: string; readonly root: string; readonly data?: string }
+}
+
+/** A plugin skill's qualified name: `plugin:skill`. */
+export const QUALIFIED_SKILL_NAME = /^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9-]{0,63}$/i
+
+/**
+ * The folder `name` resolves to inside one layer, or undefined when the
+ * layer cannot hold that name. Plain layers take kebab-case names; plugin
+ * layers take `<prefix>:<folder>`. Never joins anything but one validated
+ * segment onto the base.
+ */
+export function skillFolderIn(layer: SkillLayer, name: string): string | undefined {
+  if (layer.prefix === undefined) return SKILL_NAME_PATTERN.test(name) ? path.join(layer.base, name) : undefined
+  if (!QUALIFIED_SKILL_NAME.test(name)) return undefined
+  const colon = name.indexOf(':')
+  if (name.slice(0, colon).toLowerCase() !== layer.prefix.toLowerCase()) return undefined
+  const segment = name.slice(colon + 1)
+  if (layer.single === true) return path.basename(layer.base) === segment ? layer.base : undefined
+  return SKILL_NAME_PATTERN.test(segment) ? path.join(layer.base, segment) : undefined
 }
 
 export const MAX_SKILL_RULES = 20
@@ -48,7 +73,7 @@ export const SKILL_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/
  * path segment, never `..`, a separator, or anything a URL decode smuggled in.
  */
 export function assertSkillName(name: string, code: 'not-found' | 'invalid' = 'not-found'): void {
-  if (!SKILL_NAME_PATTERN.test(name)) {
+  if (!SKILL_NAME_PATTERN.test(name) && !(code === 'not-found' && QUALIFIED_SKILL_NAME.test(name))) {
     throw new SkillError(code, code === 'invalid' ? `skill name '${name}' must be kebab-case` : `no skill '${name}'`)
   }
 }

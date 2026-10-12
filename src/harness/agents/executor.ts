@@ -254,8 +254,6 @@ interface SettledEntry {
 }
 
 const MAX_SETTLED_HANDLES = 256
-/** Reported-child ids kept per executor; the oldest leave first. */
-const MAX_REPORTED = 4096
 
 export class ChildExecutor {
   /** ACTIVE children only; settled entries are evicted once durable. */
@@ -273,8 +271,6 @@ export class ChildExecutor {
   private readonly spawnedPerTurn = new Map<string, number>()
   /** Children each root turn spawned (`root:turn` → ids), until the turn settles. */
   private readonly turnChildren = new Map<string, Set<SessionId>>()
-  /** Children whose outcome already reached the model that spawned them. */
-  private readonly reported = new Set<SessionId>()
   /** Active reservations include spawns that have not launched yet. */
   private readonly reservedPerRoot = new Map<SessionId, number>()
   /** FIFO within each root; the root queue rotates after every dispatch. */
@@ -290,8 +286,27 @@ export class ChildExecutor {
    * keeps refusing late spawns for that turn.
    */
   private readonly closingTurns = new Set<string>()
+  private readonly stoppedManualTurns = new Set<string>()
 
-  constructor(private readonly ctx: Context) {}
+  constructor(private readonly ctx: Context, private readonly onManualTurnSettled?: (root: SessionId) => void) {}
+
+  /** Conversation startup shares the manual-spawn writer, including awaited authority checks. */
+  async admitConversation(root: SessionId, start: () => void): Promise<boolean> {
+    return this.withAdmission(root, async () => {
+      const parent = await this.sessions()?.load(root)
+      const boundary = parent?.events.findLast((event) => event.type === 'turn/start' || event.type === 'turn/end')
+      if (boundary?.type === 'turn/start' && boundary.kind === 'delegation') return false
+      start() // Agent.run sets busy synchronously, before this writer is released.
+      return true
+    })
+  }
+
+  /** Includes admission before a delegation's first durable event exists. */
+  delegationPending(root: SessionId): boolean {
+    const sessions = this.sessions() as (SessionsLike & { get?(id: SessionId): StoredSession }) | undefined
+    const boundary = sessions?.get?.(root)?.events.findLast((event) => event.type === 'turn/start' || event.type === 'turn/end')
+    return this.admissionTails.has(root) || (boundary?.type === 'turn/start' && boundary.kind === 'delegation')
+  }
 
   private sessions(): SessionsLike | undefined {
     return this.ctx.get('sessions') as SessionsLike | undefined
@@ -542,6 +557,7 @@ export class ChildExecutor {
           parent.append({ type: 'turn/closing', turnId })
           parent.append({ type: 'turn/end', turnId, reason: 'failed' })
           await parent.durable()
+          this.onManualTurnSettled?.(parent.id)
         }
         throw error
       }
@@ -562,16 +578,31 @@ export class ChildExecutor {
     const children = [...this.active.values()].filter((child) => child.parentSessionId === parent.id && child.parentTurnId === turnId)
     await Promise.all(children.map((child) => child.settled))
     try {
-      if (parent.poisoned !== true) {
-        parent.append({ type: 'turn/end', turnId, reason: 'completed' })
-        await parent.durable()
-      }
+      await this.terminalizeManualTurn(parent, turnId, 'completed')
     } catch {
-      // The canonical log is authoritative; recovery marks an open Turn
-      // interrupted instead of claiming completion whose append failed.
-    } finally {
-      await this.releaseTurns(parent.id)
+      // A failed durable writer leaves the Turn visibly open for recovery.
     }
+  }
+
+  private async terminalizeManualTurn(parent: StoredSession, turnId: string, reason: TurnEndReason): Promise<void> {
+    const drainInbox = await this.withAdmission(parent.id, async () => {
+      if (parent.poisoned === true) throw new Error('parent storage is poisoned')
+      const terminalReason = this.stoppedManualTurns.has(`${parent.id}:${turnId}`) ? 'cancelled' : reason
+      const alreadyEnded = parent.events.some((event) => event.type === 'turn/end' && event.turnId === turnId)
+      if (!alreadyEnded) {
+        parent.append({ type: 'turn/end', turnId, reason: terminalReason })
+      }
+      await parent.durable()
+      const key = `${parent.id}:${turnId}`
+      this.spawnedPerTurn.delete(key)
+      this.turnChildren.delete(key)
+      this.closingTurns.delete(key)
+      this.stoppedManualTurns.delete(key)
+      // Stop leaves input queued. Competing completion/Stop terminalizers must
+      // neither drain a cancelled Turn nor notify twice for the same Turn.
+      return !alreadyEnded && terminalReason === 'completed'
+    })
+    if (drainInbox) this.onManualTurnSettled?.(parent.id)
   }
 
   private async spawnAdmitted(request: SpawnRequest): Promise<ChildHandle> {
@@ -1053,20 +1084,15 @@ export class ChildExecutor {
 
   /** Record that these children's outcomes reached the model that spawned them. */
   markReported(childSessionIds: readonly SessionId[]): void {
-    for (const id of childSessionIds) {
-      this.reported.delete(id)
-      this.reported.add(id)
-    }
-    while (this.reported.size > MAX_REPORTED) {
-      const oldest = this.reported.values().next().value
-      if (oldest === undefined) break
-      this.reported.delete(oldest)
+    // Ownership lasts until delivery or turn cleanup, never an arbitrary cache cap.
+    for (const ids of this.turnChildren.values()) {
+      for (const id of childSessionIds) ids.delete(id)
     }
   }
 
   /** Children one root turn spawned whose outcome the model has not been handed yet. */
   owedChildrenOfTurn(root: SessionId, turnId: string): SessionId[] {
-    return [...(this.turnChildren.get(`${root}:${turnId}`) ?? [])].filter((id) => !this.reported.has(id))
+    return [...(this.turnChildren.get(`${root}:${turnId}`) ?? [])]
   }
 
   /**
@@ -1113,9 +1139,27 @@ export class ChildExecutor {
     // awaiting its parent load or resolver before it becomes active) commits
     // first and is then cancelled here. Settlement is awaited outside the
     // writer so child teardown never holds up admission.
-    const marked = await this.withAdmission(parentSessionId, async () =>
-      this.markCancelled((child) => child.parentSessionId === parentSessionId))
-    return this.awaitCancelled(marked)
+    let delegation: { parent: StoredSession; turnId: string } | undefined
+    const marked = await this.withAdmission(parentSessionId, async () => {
+      const sessions = this.sessions()
+      // Deleted roots have no Turn left to terminalize, but their live children
+      // still need cancellation. Existing-root load failures remain observable.
+      const parent = sessions?.has(parentSessionId) === true ? await sessions.load(parentSessionId) : undefined
+      const boundary = parent?.events.findLast((event) => event.type === 'turn/start' || event.type === 'turn/end')
+      if (parent !== undefined && boundary?.type === 'turn/start' && boundary.kind === 'delegation') {
+        delegation = { parent, turnId: boundary.turnId }
+        this.closingTurns.add(`${parentSessionId}:${boundary.turnId}`)
+        this.stoppedManualTurns.add(`${parentSessionId}:${boundary.turnId}`)
+        if (!parent.events.some((event) => event.type === 'turn/closing' && event.turnId === boundary.turnId)) {
+          parent.append({ type: 'turn/closing', turnId: boundary.turnId })
+        }
+        await parent.durable()
+      }
+      return this.markCancelled((child) => child.parentSessionId === parentSessionId)
+    })
+    const count = await this.awaitCancelled(marked)
+    if (delegation !== undefined) await this.terminalizeManualTurn(delegation.parent, delegation.turnId, 'cancelled')
+    return count
   }
 
   /** Root turn completion cleans up only children of this Turn. */
@@ -1176,12 +1220,12 @@ export class ChildExecutor {
           const turnId = key.slice(prefix.length)
           if (parent === undefined || parent.events.some((event) => event.type === 'turn/end' && event.turnId === turnId)) {
             this.closingTurns.delete(key)
+            this.stoppedManualTurns.delete(key)
           }
         }
       }
-      for (const [key, ids] of [...this.turnChildren]) {
+      for (const key of [...this.turnChildren.keys()]) {
         if (!key.startsWith(prefix)) continue
-        for (const id of ids) this.reported.delete(id)
         this.turnChildren.delete(key)
       }
     })

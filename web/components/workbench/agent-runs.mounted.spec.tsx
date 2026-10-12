@@ -156,6 +156,19 @@ describe('subagents panel', () => {
     await unmount()
   })
 
+  it('shows the focused subagent detail instead of the list and goes back', async () => {
+    stubApi([{ childSessionId: 'child-1', status: 'completed', definitionName: 'explorer', startedAt: 1, endedAt: 2, result: { report: 'Found 3 files', filesTouched: ['a.ts'] } }])
+    const cleared: string[] = []
+    const { host, unmount } = await mount(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" briefs={new Map([['child-1', 'Map auth']])} focusChildId="child-1" onClearFocus={() => cleared.push('x')} onOpenChild={() => {}} />)
+    expect(host.querySelector('form[aria-label="Spawn subagent"]')).toBeNull()
+    expect(host.textContent).toContain('Map auth')
+    expect(host.textContent).toContain('Found 3 files')
+    expect(host.textContent).toContain('a.ts')
+    await act(async () => [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('All subagents'))!.click())
+    expect(cleared).toEqual(['x'])
+    await unmount()
+  })
+
   it('flags a child parked on an approval and lets it be stopped', async () => {
     const { calls } = stubApi([{ childSessionId: 'child-2', status: 'running', definitionName: 'explorer', startedAt: 1, awaitingApproval: true }])
     const { host, unmount } = await mount(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />)

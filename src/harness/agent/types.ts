@@ -30,8 +30,23 @@ export type PreStepDecision =
        * transcript shows it as context, never as something the user typed.
        */
       readonly context?: readonly string[]
+      /**
+       * Parallel to `contents`: a slash command's expansion, logged right
+       * after the message that invoked it as `origin: 'command'` — the model
+       * reads it, the transcript shows the typed `/name args` as the bubble.
+       */
+      readonly expansions?: readonly (string | undefined)[]
     }
-  | { readonly kind: 'reject'; readonly reason?: string }
+  | {
+      readonly kind: 'reject'
+      readonly reason?: string
+      /**
+       * A pre-step listener may already have performed audited host work
+       * (slash-command inline shell) and therefore must admit the typed input
+       * to the log even though no model request will run.
+       */
+      readonly audited?: true
+    }
 
 declare module 'dnt-harness' {
   interface Events {
@@ -43,7 +58,7 @@ declare module 'dnt-harness' {
     'agent/pre-step'(
       /** `signal` fires when the turn is stopped; long listeners (hooks) honor it. */
       claim: { readonly contents: readonly string[]; readonly signal?: AbortSignal },
-      next: (replacement?: { readonly contents: readonly string[]; readonly context?: readonly string[] }) => Promise<PreStepDecision>,
+      next: (replacement?: { readonly contents: readonly string[]; readonly context?: readonly string[]; readonly expansions?: readonly (string | undefined)[] }) => Promise<PreStepDecision>,
     ): Promise<PreStepDecision>
 
     /**

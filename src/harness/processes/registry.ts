@@ -48,6 +48,8 @@ export interface ProcessSnapshot {
   readonly exitCode: number | null
   readonly durationMs: number
   readonly truncated: boolean
+  /** False for a foreground command: it never shows as a background process. */
+  readonly backgrounded: boolean
 }
 
 export interface RegisterInput {
@@ -135,7 +137,8 @@ export class ProcessRegistry {
     this.byId.set(record.id, record)
     this.owners.set(record.id, { child: input.child, executable: input.executable, treeTag: input.treeTag })
     this.watch(input, record)
-    this.events.onStart?.({ ...record })
+    // No start event yet: a foreground command that finishes inside its wait
+    // is not a background process. `commitBackground` announces it.
     return { ok: true, record }
   }
 
@@ -159,7 +162,8 @@ export class ProcessRegistry {
       record.endedAt = Date.now()
       this.owners.delete(record.id)
       this.fireSettleListeners()
-      if (!record.suppressEvents) this.events.onExit?.({ ...record })
+      // Only backgrounded records announced a start, so only they announce an exit.
+      if (!record.suppressEvents && record.backgrounded) this.events.onExit?.({ ...record })
     }
     input.child.on('exit', (code: number | null) => {
       record.rootExited = true
@@ -235,6 +239,7 @@ export class ProcessRegistry {
     if (!record || record.sessionId !== sessionId || record.status !== 'running' || record.rootExited) return false
     if (record.backgrounded) return true
     record.backgrounded = true
+    if (!record.suppressEvents) this.events.onStart?.({ ...record })
     if (options.maxRuntimeMs !== undefined && Number.isFinite(options.maxRuntimeMs) && options.maxRuntimeMs > 0) {
       const timer = setTimeout(() => { void this.kill(sessionId, processId).catch(() => {}) }, timerBudget(options.maxRuntimeMs, 3_600_000))
       timer.unref?.()
@@ -320,6 +325,7 @@ export class ProcessRegistry {
       exitCode: record.exitCode,
       durationMs: (record.endedAt ?? Date.now()) - record.startedAt,
       truncated: record.outputTruncated,
+      backgrounded: record.backgrounded,
     }
   }
 

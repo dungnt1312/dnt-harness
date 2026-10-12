@@ -341,6 +341,7 @@ export class Agent {
             kind: 'enter',
             contents: replacement?.contents ?? contents,
             ...(replacement?.context !== undefined && replacement.context.length > 0 ? { context: replacement.context } : {}),
+            ...(replacement?.expansions !== undefined && replacement.expansions.some((item) => item !== undefined) ? { expansions: replacement.expansions } : {}),
           } satisfies PreStepDecision),
       )
 
@@ -348,7 +349,10 @@ export class Agent {
       // nothing has reached the model or the log as admitted yet. Hand the
       // claimed input back, oldest first, instead of logging it and then
       // cancelling it unanswered — a steer re-runs it, a stop leaves it queued.
-      if (stopRequested()) {
+      // Exception: a pre-step that already ran audited host work (a command's
+      // `!` shell) must NOT hand the input back — re-running it would repeat
+      // that side effect. It falls through to the audited reject below.
+      if (stopRequested() && !(decision.kind === 'reject' && decision.audited === true)) {
         this.inbox.unshift(...claimed)
         const reason = this.stopReason()
         await this.recordTurnEnd(turnId, reason)
@@ -356,7 +360,26 @@ export class Agent {
       }
 
       if (decision.kind === 'reject') {
-        this.settleClaimedInputs(claimed, 'rejected')
+        if (decision.audited === true) {
+          // The listener already performed durably-audited host work before
+          // discovering the rejection (e.g. an earlier inline shell marker
+          // succeeded and a later one failed). Preserve the user's accepted
+          // input in the turn; otherwise the log would contain a side effect
+          // with no owning prompt.
+          for (const item of claimed) {
+            this.session.append({
+              type: 'user/message',
+              turnId,
+              content: item.content,
+              ...(item.inputId !== undefined ? { inputId: item.inputId } : {}),
+              ...(item.attachments !== undefined && item.attachments.length > 0 ? { attachments: item.attachments } : {}),
+              ...(item.kind === 'injected' ? { origin: 'context' as const } : {}),
+            })
+          }
+          this.settleClaimedInputs(claimed, 'admitted')
+        } else {
+          this.settleClaimedInputs(claimed, 'rejected')
+        }
         this.session.append({ type: 'turn/error', turnId, kind: 'rejected', message: decision.reason ?? 'rejected by pre-step policy' })
         await this.recordTurnEnd(turnId, 'rejected')
         return 'rejected'
@@ -370,6 +393,7 @@ export class Agent {
       let lastStep: StepId | null = null
       let nextContents: readonly string[] | undefined = decision.contents
       let nextContext: readonly string[] | undefined = decision.context
+      let nextExpansions: readonly (string | undefined)[] | undefined = decision.expansions
       let nextClaimed: readonly InboxItem[] = claimed
       let nextOrigin: 'continuation' | undefined
       // A turn keeps spending steps while tools owe the model their results —
@@ -377,7 +401,7 @@ export class Agent {
       for (;;) {
         let step: { stepId: StepId; toolCalls: readonly ToolCall[] }
         try {
-          step = await this.step(turnId, nextContents, nextClaimed, nextOrigin, nextContext)
+          step = await this.step(turnId, nextContents, nextClaimed, nextOrigin, nextContext, nextExpansions)
         } catch (error) {
           // A user stop is a durable result, not a failure: close the turn
           // with the `cancelled` (or `steered`) reason and end the run.
@@ -392,6 +416,7 @@ export class Agent {
         lastStep = step.stepId
         nextContents = undefined
         nextContext = undefined
+        nextExpansions = undefined
         nextClaimed = []
         nextOrigin = undefined
         if (step.toolCalls.length > 0) continue
@@ -464,7 +489,7 @@ export class Agent {
   }
 
   /** Mark accepted inputs terminal even when policy admits no user message. */
-  private settleClaimedInputs(claimed: readonly InboxItem[], outcome: 'rejected' | 'empty'): void {
+  private settleClaimedInputs(claimed: readonly InboxItem[], outcome: 'admitted' | 'rejected' | 'empty'): void {
     for (const item of claimed) {
       if (item.kind === 'user' && item.inputId !== undefined) {
         this.session.append({ type: 'input/settled', inputId: item.inputId, outcome })
@@ -495,7 +520,14 @@ export class Agent {
    *
    * @returns the step id and the tool calls the model made.
    */
-  private async step(turnId: TurnId, contents: readonly string[] | undefined, claimed: readonly InboxItem[], origin?: 'continuation', context?: readonly string[]): Promise<{ stepId: StepId; toolCalls: readonly ToolCall[] }> {
+  private async step(
+    turnId: TurnId,
+    contents: readonly string[] | undefined,
+    claimed: readonly InboxItem[],
+    origin?: 'continuation',
+    context?: readonly string[],
+    expansions?: readonly (string | undefined)[],
+  ): Promise<{ stepId: StepId; toolCalls: readonly ToolCall[] }> {
     const signal = this.abortController?.signal
     const assertLive = (): void => {
       if (signal?.aborted === true) throw this.abortError()
@@ -524,6 +556,8 @@ export class Agent {
         // Injected host context (SessionStart hooks) is context, not user text.
         ...(origin !== undefined ? { origin } : item?.kind === 'injected' ? { origin: 'context' as const } : {}),
       })
+      const expansion = expansions?.[index]
+      if (expansion !== undefined) this.session.append({ type: 'user/message', turnId, content: expansion, origin: 'command' })
     }
     // Admission settles every accepted input even when middleware replaces its
     // text wholesale and therefore no user/message can safely carry its id.

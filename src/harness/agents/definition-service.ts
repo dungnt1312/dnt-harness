@@ -22,7 +22,14 @@ import { KNOWN_MODE_TOOLS } from '../modes/known-tools.ts'
 
 export const BUNDLED_AGENT_ROLES = ['explorer', 'worker', 'reviewer', 'verifier'] as const
 
-export type AgentSource = 'bundled' | 'user' | 'workspace' | 'project'
+export type AgentSource = 'bundled' | 'user' | 'plugin' | 'workspace' | 'project'
+
+/** Plugin agent folders and files: names are `plugin:agent` (Claude's plugin namespacing). */
+export interface PluginAgentLayer {
+  readonly prefix: string
+  readonly dirs: readonly string[]
+  readonly files: readonly string[]
+}
 
 export interface AgentDefinition {
   /** Identity from `name:` (Claude), falling back to the file name. */
@@ -93,7 +100,7 @@ const CLAUDE_TOOL_ALIASES: Readonly<Record<string, string | null>> = {
 }
 
 /** One Claude tool name → a dnt-harness tool, or the name it had to drop. */
-function normalizeTool(raw: string): { tool?: string; dropped?: string } {
+export function normalizeTool(raw: string): { tool?: string; dropped?: string } {
   const name = raw.trim()
   if (name === '' || name === '*') return {}
   if (name.startsWith('mcp__')) return { tool: name }
@@ -307,8 +314,45 @@ export interface AgentLayerDirs {
 export class AgentDefinitionService {
   constructor(
     private readonly home: string,
-    private readonly options: { readonly userClaudeDir?: string; readonly projectRootOf?: (workspaceId: string, projectId: string) => string | undefined } = {},
+    private readonly options: {
+      readonly userClaudeDir?: string
+      readonly projectRootOf?: (workspaceId: string, projectId: string) => string | undefined
+      /** Agent folders of the plugins enabled for this workspace/project. */
+      readonly pluginLayers?: (workspaceId: string, projectId: string | undefined) => Promise<readonly PluginAgentLayer[]>
+    } = {},
   ) {}
+
+  /** Plugin agents (`plugin:name`): every `*.md` in the plugin's agent folders and listed files. */
+  private async readPluginLayers(workspaceId: string, projectId: string | undefined): Promise<{ rows: ResolvedAgentDefinition[]; errors: { path: string; message: string }[] }> {
+    const rows: ResolvedAgentDefinition[] = []
+    const errors: { path: string; message: string }[] = []
+    const layers = await this.options.pluginLayers?.(workspaceId, projectId).catch(() => []) ?? []
+    for (const layer of layers) {
+      const files = [...layer.files]
+      for (const dir of layer.dirs) {
+        const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => [])
+        for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+          if (entry.name.endsWith('.md') && (entry.isFile() || entry.isSymbolicLink())) files.push(path.join(dir, entry.name))
+        }
+      }
+      for (const file of files) {
+        let raw: string
+        try { raw = await fs.readFile(file, 'utf8') } catch { continue }
+        try {
+          const parsed = parseAgentDefinition(path.basename(file, '.md'), raw)
+          // Claude namespaces a plugin agent as `plugin:agent`, always under
+          // the OWNING plugin: a frontmatter `name: other:x` cannot claim
+          // another plugin's namespace — only its local part is kept.
+          const local = parsed.name.includes(':') ? parsed.name.slice(parsed.name.lastIndexOf(':') + 1) : parsed.name
+          const name = `${layer.prefix}:${local}`
+          rows.push({ definition: { ...parsed, name }, source: 'plugin', path: file, hash: sha256(raw) })
+        } catch (error) {
+          errors.push({ path: file, message: String(error instanceof Error ? error.message : error) })
+        }
+      }
+    }
+    return { rows, errors }
+  }
 
   /** The workspace layer folder (the only one the app writes). */
   workspaceAgentsDir(workspaceId: string): string {
@@ -352,7 +396,17 @@ export class AgentDefinitionService {
     const byKey = new Map<string, ResolvedAgentDefinition>()
     for (const name of BUNDLED_AGENT_ROLES) byKey.set(name, { definition: bundledDefinition(name), source: 'bundled' })
     const errors: { path: string; message: string }[] = []
+    const plugins = await this.readPluginLayers(workspaceId, projectId)
+    errors.push(...plugins.errors)
     for (const layer of this.layers(workspaceId, projectId)) {
+      // Plugin agents sit between the user layer and the workspace layer.
+      if (layer.source === 'workspace') {
+        for (const row of plugins.rows) {
+          const key = agentKey(row.definition.name)
+          const lower = byKey.get(key)
+          byKey.set(key, lower === undefined ? row : { ...row, overrides: [...(lower.overrides ?? []), lower.source] })
+        }
+      }
       const read = await this.readLayer(layer.source, layer.dir)
       errors.push(...read.errors)
       for (const row of read.rows) {

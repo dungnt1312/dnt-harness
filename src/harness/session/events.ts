@@ -32,11 +32,16 @@ export type SessionEvent =
   | ({ readonly type: 'model/attempt' | 'execution/uncertain' | 'execution/reconciled'; readonly fact: import('../llm/request-lifecycle.ts').AttemptFact } & SessionEventStamp)
   | ({ readonly type: 'turn/start'; readonly turnId: TurnId; readonly kind?: 'conversation' | 'delegation' } & SessionEventStamp)
   | ({ readonly type: 'turn/closing'; readonly turnId: TurnId } & SessionEventStamp)
-  | ({ readonly type: 'user/message'; readonly turnId: TurnId; readonly content: string; readonly inputId?: string; readonly attachments?: readonly AttachmentRef[]; readonly origin?: 'continuation' | 'context' } & SessionEventStamp)
+  | ({ readonly type: 'user/message'; readonly turnId: TurnId; readonly content: string; readonly inputId?: string; readonly attachments?: readonly AttachmentRef[]; readonly origin?: 'continuation' | 'context' | 'command' } & SessionEventStamp)
   | ({ readonly type: 'step/start'; readonly turnId: TurnId; readonly stepId: StepId } & SessionEventStamp)
   | ({ readonly type: 'assistant/chunk'; readonly stepId: StepId; readonly delta: string; readonly thinking?: boolean } & SessionEventStamp)
   | ({ readonly type: 'assistant/message'; readonly stepId: StepId; readonly content: string; readonly toolCalls?: readonly ToolCall[]; readonly controls?: RequestControls } & SessionEventStamp)
   | ({ readonly type: 'tool/call'; readonly stepId: StepId; readonly executionId?: ExecutionId; readonly call: ToolCall; readonly policyRevision?: number } & SessionEventStamp)
+  // A tool run by host prompt expansion before the first model step (Claude
+  // command `!` shell). Separate event names keep model history free of an
+  // orphaned tool result while preserving durable intent-before-side-effect.
+  | ({ readonly type: 'command/tool-call'; readonly turnId: TurnId; readonly executionId: ExecutionId; readonly call: ToolCall; readonly policyRevision?: number } & SessionEventStamp)
+  | ({ readonly type: 'command/tool-result'; readonly turnId: TurnId; readonly executionId: ExecutionId; readonly callId: string; readonly ok: boolean; readonly output: string } & SessionEventStamp)
   | ({
       readonly type: 'tool/result'
       readonly stepId: StepId
@@ -122,7 +127,7 @@ export type SessionEvent =
       readonly type: 'session/role'
       readonly definition: string
       readonly instructions: string
-      readonly source?: 'bundled' | 'user' | 'workspace' | 'project'
+      readonly source?: 'bundled' | 'user' | 'plugin' | 'workspace' | 'project'
       readonly toolCeiling: readonly string[]
       readonly skills?: readonly string[]
     } & SessionEventStamp)
@@ -376,6 +381,8 @@ function projectMessages(events: readonly SessionEvent[], attachments?: Attachme
       case 'step/start':
       case 'assistant/chunk':
       case 'tool/call':
+      case 'command/tool-call':
+      case 'command/tool-result':
       case 'step/end':
       case 'step/abandoned':
       case 'turn/end':

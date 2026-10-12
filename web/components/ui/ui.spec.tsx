@@ -69,17 +69,17 @@ describe('runtime provider UI helpers', () => {
     )
     expect(html).toContain('aria-modal="true"')
     expect(html).toContain('aria-label="Settings"')
-    // Eleven sections, plus the three Providers & Models sub-tabs on the open pane.
+    // Twelve sections (including Plugins), plus the three Providers & Models sub-tabs on the open pane.
     const sections = html.match(/<div[^>]*aria-label="Settings sections"[\s\S]*?<\/div><\/aside>/)?.[0] ?? ''
-    expect((sections.match(/role="tab"/g) ?? []).length).toBe(11)
+    expect((sections.match(/role="tab"/g) ?? []).length).toBe(12)
     // Radix mounts the active panel only; each tab still owns a controls link.
     expect((html.match(/role="tabpanel"/g) ?? []).length).toBe(1)
-    expect((sections.match(/aria-controls=/g) ?? []).length).toBe(11)
+    expect((sections.match(/aria-controls=/g) ?? []).length).toBe(12)
     const tabTags = sections.match(/<[a-z]+[^>]*role="tab"[^>]*>/g) ?? []
     expect(tabTags.filter((tag) => tag.includes('aria-selected="true"')).length).toBe(1)
     const labels = [...sections.matchAll(/<button(?=[^>]*role="tab")[\s\S]*?<\/button>/g)]
       .map((match) => match[0].replace(/<[^>]+>/g, ''))
-    expect(labels).toEqual(['Providers &amp; Models', 'Usage', 'Projects', 'Permissions', 'System Prompts', 'Skills', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets'])
+    expect(labels).toEqual(['Providers &amp; Models', 'Usage', 'Projects', 'Permissions', 'System Prompts', 'Skills', 'Plugins', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets'])
     const subTabs = html.match(/<div role="tablist" aria-label="Providers &amp; Models"[\s\S]*?<\/div>/)?.[0] ?? ''
     expect([...subTabs.matchAll(/<button[\s\S]*?<\/button>/g)].map((match) => match[0].replace(/<[^>]+>/g, ''))).toEqual(['Providers', 'Model aliases', 'Images'])
     expect(html).toContain('cliproxy1')

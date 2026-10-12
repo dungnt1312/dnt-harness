@@ -282,7 +282,7 @@ describe('mention chip interactions', () => {
 describe('skill commands', () => {
   const skills = [{ name: 'review', description: 'Check a diff' }, { name: 'test', description: 'Run the suite' }]
 
-  it('opens on a leading slash and inserts an atomic /name chip that keeps the established wire text', () => {
+  it('opens on a leading slash and inserts an atomic /name chip that sends as /name', () => {
     render({ skills })
     type('/rev')
     expect(options().map((option) => option.textContent)).toEqual(['reviewCheck a diff'])
@@ -290,7 +290,7 @@ describe('skill commands', () => {
     expect(chips()).toHaveLength(1)
     expect(chips()[0]?.getAttribute('aria-label')).toBe('Skill command review')
     expect(chips()[0]?.textContent).toBe('review')
-    expect(draftText(current)).toBe('Use the review skill: ')
+    expect(draftText(current)).toBe('/review ')
     expect(current.segments).toEqual([{ kind: 'command', name: 'review' }, { kind: 'text', text: ' ' }])
   })
 

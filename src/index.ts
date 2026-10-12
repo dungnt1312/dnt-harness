@@ -192,6 +192,26 @@ export {
 export { SkillsService, parseSkill, type SkillEntry, type LoadedSkill } from './harness/skills/service.ts'
 export { SkillError, defaultSkillRules, projectRuleBase, absoluteRuleBase, absoluteRuleTooBroad, assertSkillName, assertWritableSkillName, RESERVED_SKILL_NAMES, SKILL_NAME_PATTERN, validateSkillRules, validateSkillRulesForWrite, resolveSkillLayers, protectedRootsForRules, MAX_SKILL_RULES, type SkillRule, type SkillLayer, type SkillSource } from './harness/skills/layers.ts'
 
+// ── Harness: Claude Code slash commands ─────────────────────────────────
+export {
+  argumentNames, descriptionFromBody, findInlineShell, neutralizeShellMarkers, replaceInlineShell, splitArguments,
+  substituteArguments, substituteVariables, type InlineShell, type TemplateVariables,
+} from './harness/commands/expand.ts'
+export {
+  MAX_COMMAND_BYTES, commandKey, frontmatterBoolean, loadCommandLayers, parseAllowedTools, parseCommand, projectCommandDirs,
+  scanCommandsDir, splitFrontmatter, type CommandDefinition, type CommandLayer, type CommandSource,
+} from './harness/commands/catalog.ts'
+export { allowedByRules, parseAllowRule, splitCompound, type AllowRule } from './harness/commands/allowed-tools.ts'
+export { COMMAND_NAME, CommandExpansionError, expandCommand, parseSlashInvocation, type ExpansionContext, type SlashInvocation } from './harness/commands/invoke.ts'
+export { CommandsService, type CommandsServiceOptions } from './harness/commands/service.ts'
+
+// ── Harness: Claude Code plugins ────────────────────────────────────────
+export { PLUGIN_NAME, PluginError, assertPluginTreeContained, parseManifest, readManifest, resolveComponents, resolveExistingInside, resolveInside, serverMap, substituteDeep, substitutePluginVars, type ComponentFields, type PluginComponents, type PluginManifest } from './harness/plugins/manifest.ts'
+export { PluginStore, parsePluginId, readEnabledPlugins, readSuggestedMarketplaces, scopeSettingsFile, writeEnabledPlugin, type InstallRecord, type InstalledPlugins, type KnownMarketplace, type LoadedPlugin, type MarketplaceSource, type PluginScope, type SettingsFiles } from './harness/plugins/store.ts'
+export { addMarketplace, assertGitUrl, cloneRepo, fetchPlugin, findEntry, parseMarketplaceInput, readMarketplace, removeMarketplace, updateMarketplace, type MarketplaceDocument, type MarketplaceEntry } from './harness/plugins/marketplace.ts'
+export { pluginServerName, pluginServers, type PluginServerDraft } from './harness/plugins/mcp.ts'
+export { PluginService, type PluginContext, type PluginRow, type PluginServiceDeps } from './harness/plugins/service.ts'
+
 // ── Harness: memory (G3) ────────────────────────────────────────────────
 export { MemoryService, MemoryError, memoryTools, type MemoryEntry } from './harness/memory/index.ts'
 

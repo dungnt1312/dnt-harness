@@ -359,7 +359,12 @@ the durable event log remains the archive.
   the agent itself spawned) and need no granted root. Lookups are scoped by the
   executing session — a foreign session's id is unknown.
 - Lifecycle lands on the session log as durable `process/start` /
-  `process/exit` events; `termination` is one of `exited` (own exit),
+  `process/exit` events, but only for commands committed to the background
+  (explicit `run_in_background` or the auto-background after the foreground
+  wait). A foreground command that finishes within its wait emits neither
+  event and is hidden from the `GET …/processes` snapshot (`backgrounded:
+  false`), so the Environment panel lists real background work only.
+  `termination` is one of `exited` (own exit),
   `killed` (KillShell or operator stop), `failed` (child error), or
   `interrupted` (see restart semantics below). The web Environment panel
   renders from these events.

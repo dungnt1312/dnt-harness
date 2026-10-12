@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useScopedState } from '../../hooks/useScopedState.ts'
 import Icon from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
+import { AgentRunDetail } from './AgentRunDetail.tsx'
 import { cancelChild, listAgentDefinitions, listChildren, listModelAliases, reconcileChild, spawnChild } from '../../lib/api.ts'
 import { formatAge } from '../../lib/format.ts'
 import { agentRoleIcon, AGENT_ROLE_TONE } from '../../lib/agent-icons.ts'
@@ -24,6 +25,10 @@ export interface AgentRunsPanelProps {
   /** Bumped when the conversation itself delegates, so its children appear at once. */
   readonly refreshSignal?: number
   readonly onOpenChild?: (childSessionId: string) => void
+  /** The subagent whose detail replaces the list (set by a transcript delegation row). */
+  readonly focusChildId?: string | null
+  /** Back to the list. */
+  readonly onClearFocus?: () => void
 }
 
 const STATUS_LABEL: Readonly<Record<ChildRow['status'], string>> = {
@@ -56,8 +61,9 @@ const STATUS_TONE: Readonly<Partial<Record<ChildRow['status'], string>>> = {
   uncertain: 'bg-warn-soft text-warn',
 }
 
-function AgentRunsPanelContent({ workspaceId, rootSessionId, rootProjectId, briefs, refreshSignal, onOpenChild }: AgentRunsPanelProps) {
+function AgentRunsPanelContent({ workspaceId, rootSessionId, rootProjectId, briefs, refreshSignal, onOpenChild, focusChildId, onClearFocus }: AgentRunsPanelProps) {
   const [children, setChildren] = useScopedState<readonly ChildRow[]>([])
+  const [loaded, setLoaded] = useScopedState(false)
   const [failure, setFailure] = useScopedState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [roles, setRoles] = useScopedState<readonly AgentDefinitionRow[]>([])
@@ -72,6 +78,7 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, rootProjectId, brie
     if (workspaceId === null || rootSessionId === null) return
     try {
       setChildren(await listChildren(workspaceId, rootSessionId))
+      setLoaded(true)
       setFailure(null)
     } catch (cause) { setFailure(String(cause)) }
   }, [workspaceId, rootSessionId])
@@ -116,6 +123,19 @@ function AgentRunsPanelContent({ workspaceId, rootSessionId, rootProjectId, brie
         <p className="m-0 text-sm font-medium">No conversation selected</p>
         <p className="m-0 max-w-xs text-[13px] text-fg-muted">Open a conversation to follow the subagents it delegates to.</p>
       </div>
+    )
+  }
+
+  if (focusChildId !== null && focusChildId !== undefined) {
+    return (
+      <AgentRunDetail
+        childSessionId={focusChildId}
+        child={children.find((entry) => entry.childSessionId === focusChildId) ?? null}
+        loading={!loaded}
+        brief={briefs?.get(focusChildId)}
+        onBack={() => onClearFocus?.()}
+        {...(onOpenChild !== undefined ? { onOpenConversation: onOpenChild } : {})}
+      />
     )
   }
 

@@ -12,6 +12,33 @@ import { OAuthStore, type OAuthTokens } from './oauth-store.ts'
 
 const SKEW_MS = 30_000
 
+// Shared by managers using the same store. Network refresh locks are separate
+// from short disk-write queues so revocation never waits for the endpoint.
+interface GrantFence {
+  generation: number
+  revoked: boolean
+  writes: Promise<void>
+}
+const grantFences = new WeakMap<OAuthStore, Map<string, GrantFence>>()
+
+function grantFence(store: OAuthStore, workspaceId: string, server: string): GrantFence {
+  let grants = grantFences.get(store)
+  if (grants === undefined) { grants = new Map(); grantFences.set(store, grants) }
+  const key = JSON.stringify([workspaceId, server])
+  let fence = grants.get(key)
+  if (fence === undefined) {
+    fence = { generation: 0, revoked: false, writes: Promise.resolve() }
+    grants.set(key, fence)
+  }
+  return fence
+}
+
+function serializeWrite<T>(fence: GrantFence, body: () => Promise<T>): Promise<T> {
+  const next = fence.writes.then(body)
+  fence.writes = next.then(() => undefined, () => undefined)
+  return next
+}
+
 export interface OAuthBegin {
   readonly workspaceId: string
   readonly server: string
@@ -96,6 +123,8 @@ export class ManagedOAuth {
     if (tx.principalId !== input.principalId || tx.workspaceId !== input.workspaceId || tx.server !== input.server) {
       throw new OAuthFlowError('callback does not belong to this principal, workspace, and server')
     }
+    const fence = grantFence(this.store, tx.workspaceId, tx.server)
+    const generation = fence.generation
     const tokens = await this.exchange(tx.tokenEndpoint, new URLSearchParams({
       grant_type: 'authorization_code',
       code: tx.code,
@@ -104,7 +133,16 @@ export class ManagedOAuth {
       client_id: tx.clientId,
       resource: tx.resource,
     }))
-    await this.store.saveTokens(tx.workspaceId, tx.server, { ...tokens, phase: 'active', resource: tx.resource })
+    await serializeWrite(fence, async () => {
+      if (fence.generation !== generation) throw new OAuthFlowError('authorization was locally revoked or replaced')
+      await this.store.saveTokens(tx.workspaceId, tx.server, { ...tokens, phase: 'active', resource: tx.resource })
+      if (fence.generation !== generation) throw new OAuthFlowError('authorization was locally revoked or replaced')
+      // Linearize replacement after persistence, without an intervening await.
+      // Refreshes started even during this write belong to the previous grant;
+      // queued completes must not overwrite it, and an in-write revoke wins.
+      fence.generation += 1
+      fence.revoked = false
+    })
     await this.store.deleteTransaction(input.state)
     return tokens
   }
@@ -115,7 +153,10 @@ export class ManagedOAuth {
    * {@link OAuthTemporaryError} means try later with the same grant.
    */
   async accessToken(workspaceId: string, server: string): Promise<string | undefined> {
+    const fence = grantFence(this.store, workspaceId, server)
+    if (fence.revoked) return undefined
     const stored = await this.store.readTokens(workspaceId, server)
+    if (fence.revoked) return undefined
     if (stored === undefined || stored.phase === 'local_revoked' || stored.phase === 'auth_required') return undefined
     // `refresh_in_progress` outside the lock is either a refresh running in
     // this process (refresh() waits for it) or one a crash interrupted
@@ -137,22 +178,33 @@ export class ManagedOAuth {
   }
 
   async refresh(workspaceId: string, server: string, rejected?: string): Promise<OAuthTokens | undefined> {
+    const fence = grantFence(this.store, workspaceId, server)
+    const generation = fence.generation
+    const fenced = (): boolean => fence.revoked || fence.generation !== generation
+    const save = (tokens: OAuthTokens): Promise<boolean> => serializeWrite(fence, async () => {
+      if (fenced()) return false
+      await this.store.saveTokens(workspaceId, server, tokens)
+      return !fenced()
+    })
+    if (fenced()) return undefined
     return this.store.withServerLock(workspaceId, server, async () => {
+      if (fenced()) return undefined
       const current = await this.store.readTokens(workspaceId, server)
+      if (fenced()) return undefined
       if (current === undefined || current.phase === 'local_revoked' || current.phase === 'auth_required') return undefined
       if (current.phase === 'replacement_persisted') {
         const active = { ...current, phase: 'active' as const }
-        await this.store.saveTokens(workspaceId, server, active)
+        if (!await save(active)) return undefined
         return active
       }
       // Another caller refreshed while this one waited for the lock.
       const stillGood = current.phase === 'active' && current.expiresAt > this.now() + SKEW_MS
       if (stillGood && (rejected === undefined || current.accessToken !== rejected)) return current
       if (current.refreshToken === '') {
-        await this.store.saveTokens(workspaceId, server, { ...current, phase: 'auth_required' })
+        await save({ ...current, phase: 'auth_required' })
         return undefined
       }
-      await this.store.saveTokens(workspaceId, server, { ...current, phase: 'refresh_in_progress' })
+      if (!await save({ ...current, phase: 'refresh_in_progress' })) return undefined
       let next: OAuthTokens
       try {
         next = await this.exchange(current.tokenEndpoint, new URLSearchParams({
@@ -162,18 +214,19 @@ export class ManagedOAuth {
           resource: current.resource,
         }))
       } catch (error) {
+        if (fenced()) return undefined
         if (error instanceof OAuthTemporaryError) {
           // Network trouble or a 5xx/429 says nothing about the grant: keep it.
-          await this.store.saveTokens(workspaceId, server, { ...current, phase: 'active' })
+          if (!await save({ ...current, phase: 'active' })) return undefined
           throw error
         }
-        await this.store.saveTokens(workspaceId, server, { ...current, phase: 'auth_required' })
+        await save({ ...current, phase: 'auth_required' })
         return undefined
       }
       const persisted = { ...next, phase: 'replacement_persisted' as const, resource: current.resource }
-      await this.store.saveTokens(workspaceId, server, persisted)
+      if (!await save(persisted)) return undefined
       const active = { ...persisted, phase: 'active' as const }
-      await this.store.saveTokens(workspaceId, server, active)
+      if (!await save(active)) return undefined
       return active
     })
   }
@@ -183,10 +236,16 @@ export class ManagedOAuth {
    * reactivate the token.
    */
   async revoke(workspaceId: string, server: string, revocationEndpoint?: string): Promise<{ readonly local: 'revoked'; readonly remote: 'succeeded' | 'failed' | 'unavailable' }> {
-    const current = await this.store.readTokens(workspaceId, server)
-    await this.store.saveTokens(workspaceId, server, current === undefined
-      ? tombstone(workspaceId, server)
-      : { ...current, phase: 'local_revoked', accessToken: '', refreshToken: '' })
+    const fence = grantFence(this.store, workspaceId, server)
+    fence.generation += 1
+    fence.revoked = true // Fence callers synchronously, before any disk/network await.
+    const current = await serializeWrite(fence, async () => {
+      const stored = await this.store.readTokens(workspaceId, server)
+      await this.store.saveTokens(workspaceId, server, stored === undefined
+        ? tombstone(workspaceId, server)
+        : { ...stored, phase: 'local_revoked', accessToken: '', refreshToken: '' })
+      return stored
+    })
     if (revocationEndpoint === undefined || current === undefined) return { local: 'revoked', remote: 'unavailable' }
     try {
       assertOauthUrl(revocationEndpoint)
@@ -230,7 +289,7 @@ export class ManagedOAuth {
     const expiresIn = typeof parsed.expires_in === 'number' ? parsed.expires_in : 3600
     return {
       accessToken: parsed.access_token,
-      refreshToken: typeof parsed.refresh_token === 'string' ? parsed.refresh_token : '',
+      refreshToken: typeof parsed.refresh_token === 'string' ? parsed.refresh_token : (body.get('refresh_token') ?? ''),
       expiresAt: this.now() + expiresIn * 1000,
       tokenEndpoint: endpoint,
       clientId: body.get('client_id') ?? '',

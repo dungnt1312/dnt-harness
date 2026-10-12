@@ -27,6 +27,7 @@ describe('ProcessRegistry', () => {
     expect(admitted.ok).toBe(true)
     if (!admitted.ok) throw new Error('unreachable')
     expect(registry.isRunning(fakeSession('s1'), admitted.record.id)).toBe(true)
+    registry.commitBackground(fakeSession('s1'), admitted.record.id)
     await new Promise<void>((resolve) => child.on('close', () => resolve()))
     await new Promise((resolve) => setTimeout(resolve, 50))
     expect(exits.at(-1)?.status).toBe('exited')
@@ -66,6 +67,7 @@ describe('ProcessRegistry', () => {
     const { child, closed } = spawnSleeper()
     const admitted = registry.tryRegister({ sessionId: fakeSession('s1'), command: 'sleep 30', cwd: process.cwd(), child, executable: SHELL, treeTag: 'tag-2' })
     if (!admitted.ok) throw new Error(String(admitted.error))
+    registry.commitBackground(fakeSession('s1'), admitted.record.id)
     const outcome = await registry.kill(fakeSession('s1'), admitted.record.id)
     expect(outcome).toEqual({ outcome: 'killed' })
     await closed
@@ -135,6 +137,31 @@ describe('ProcessRegistry', () => {
     await closed
     expect(exits).toHaveLength(0)
     expect(registry.runningCount(fakeSession('s1'))).toBe(0)
+  })
+
+  it('announces a process only once it is committed to the background', async () => {
+    const starts: string[] = []
+    const exits: string[] = []
+    const registry = new ProcessRegistry({ onStart: (record) => starts.push(record.id), onExit: (record) => exits.push(record.id) })
+    const quick = spawn(SHELL, process.platform === 'win32' ? ['-lc', 'true'] : ['-c', 'true'], { detached: true, stdio: 'ignore' })
+    const foreground = registry.tryRegister({ sessionId: fakeSession('s1'), command: 'true', cwd: process.cwd(), child: quick, executable: SHELL, treeTag: 't-fg' })
+    if (!foreground.ok) throw new Error(String(foreground.error))
+    await new Promise<void>((resolve) => quick.on('close', () => resolve()))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(starts).toEqual([])
+    expect(exits).toEqual([])
+    expect(registry.snapshot(fakeSession('s1'))[0]?.backgrounded).toBe(false)
+
+    const { child, closed } = spawnSleeper()
+    const background = registry.tryRegister({ sessionId: fakeSession('s1'), command: 'sleep 30', cwd: process.cwd(), child, executable: SHELL, treeTag: 't-bg' })
+    if (!background.ok) throw new Error(String(background.error))
+    expect(starts).toEqual([])
+    expect(registry.commitBackground(fakeSession('s1'), background.record.id)).toBe(true)
+    registry.commitBackground(fakeSession('s1'), background.record.id)
+    expect(starts).toEqual([background.record.id])
+    await registry.kill(fakeSession('s1'), background.record.id)
+    await closed
+    expect(exits).toEqual([background.record.id])
   })
 
   it('snapshot exposes derived durationMs and the ended shape', async () => {

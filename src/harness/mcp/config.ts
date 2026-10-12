@@ -37,7 +37,8 @@ export interface McpServerConfig {
   readonly resourceLimits?: { readonly memoryMb?: number; readonly cpuPercent?: number; readonly maxLifetimeMs?: number; readonly enforcement?: 'hard' | 'best_effort' }
   /** Exposure filter: only these tools register (never a permission bypass). */
   readonly allowedTools?: readonly string[]
-  readonly provenance?: { readonly importedFrom?: 'claude' | 'codex'; readonly importedAt?: number }
+  /** `plugin`: materialized from an enabled Claude Code plugin (`name@marketplace`); the plugin owns it. */
+  readonly provenance?: { readonly importedFrom?: 'claude' | 'codex'; readonly importedAt?: number; readonly plugin?: string }
   /**
    * stdio: the canonical file the operator authorized when enabling. Set only
    * by activation, never by a save; a spawn whose command now resolves to a
@@ -176,7 +177,10 @@ export function parseMcpConfig(raw: string): McpConfig {
       if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new McpConfigError('invalid', `server '${name}': invalid provenance`)
       const provenance = value as Record<string, unknown>
       for (const key of Object.keys(provenance)) {
-        if (!['importedFrom', 'importedAt'].includes(key)) throw new McpConfigError('invalid', `server '${name}': unknown provenance key '${key}'`)
+        if (!['importedFrom', 'importedAt', 'plugin'].includes(key)) throw new McpConfigError('invalid', `server '${name}': unknown provenance key '${key}'`)
+      }
+      if (provenance['plugin'] !== undefined && (typeof provenance['plugin'] !== 'string' || provenance['plugin'] === '')) {
+        throw new McpConfigError('invalid', `server '${name}': provenance.plugin must be a plugin id`)
       }
       if (provenance['importedFrom'] !== undefined && provenance['importedFrom'] !== 'claude' && provenance['importedFrom'] !== 'codex') {
         throw new McpConfigError('invalid', `server '${name}': provenance.importedFrom must be claude|codex`)

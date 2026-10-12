@@ -21,6 +21,7 @@ This documentation is organized so each layer can be read independently:
 | [capabilities.md](capabilities.md) | The built-in tools: filesystem and bash |
 | [web.md](web.md) | The web host: REST + SSE API and the React client |
 | [skills.md](skills.md) | Skills: layers, SKILL.md format, the Skill tool, the skills API |
+| [plugins.md](plugins.md) | Claude Code slash commands, plugins, marketplaces and enable scopes |
 | [guides.md](guides.md) | Getting started, configuration, CLI, plugin authoring, testing |
 | [decisions/plugin-platform.md](decisions/plugin-platform.md) | Plugin platform spec: composition loading, route seam, SDK surface policy (proposed) |
 | [decisions/mcp-production-boundaries.md](decisions/mcp-production-boundaries.md) | MCP protocol pin, outcomes, receipts, deployment boundary |
@@ -61,7 +62,9 @@ src/
 │   ├── workspace/      Workspace registry, project binding, ownership
 │   ├── modes/          Five bundled + custom file modes
 │   ├── context/        Mode-driven builder: budget, compaction, manifest
-│   ├── skills/         Workspace skills + on-demand Skill tool
+│   ├── skills/         Workspace/plugin skills + on-demand Skill tool
+│   ├── commands/       Claude Code custom slash command loading + expansion
+│   ├── plugins/        Claude plugin manifests, store, marketplaces, MCP bridge
 │   ├── memory/         Workspace/project Markdown memory + five tools
 │   ├── agents/         Definitions, bounded delegation, compatibility adapters
 │   ├── mcp/            MCP client (stdio + Streamable HTTP), secrets, breaker

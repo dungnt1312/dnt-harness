@@ -40,7 +40,7 @@ export interface AgentScope {
      */
     readonly instructions: string
     /** Provenance of the pinned definition (bundled role vs workspace file). */
-    readonly definitionSource?: 'bundled' | 'user' | 'workspace' | 'project'
+    readonly definitionSource?: 'bundled' | 'user' | 'plugin' | 'workspace' | 'project'
     /** Hard ceiling: admission exposure ∩ definition ∩ spawn grant (MCP explicit). */
     readonly toolCeiling: readonly string[]
     /**
@@ -66,7 +66,7 @@ export interface AgentScope {
   readonly role?: {
     readonly definition: string
     readonly instructions: string
-    readonly definitionSource?: 'bundled' | 'user' | 'workspace' | 'project'
+    readonly definitionSource?: 'bundled' | 'user' | 'plugin' | 'workspace' | 'project'
     /** Pinned at creation: admission exposure ∩ definition − disallowed. */
     readonly toolCeiling: readonly string[]
     readonly skills?: readonly string[]

@@ -38,7 +38,7 @@ function parseSegment(raw: unknown): DraftSegment | AttachmentRef | null {
     if (typeof row['name'] === 'string' && isSkillName(row['name'])) return { kind: 'command', name: row['name'] }
     // Legacy command chips stored their wire text instead of the skill name.
     const legacy = typeof row['text'] === 'string' ? parseMessageText(row['text']) : []
-    return legacy.length === 1 && legacy[0]?.kind === 'command' ? legacy[0] : null
+    return legacy.length === 1 && legacy[0]?.kind === 'command' ? { kind: 'command', name: legacy[0].name } : null
   }
   // Legacy drafts stored attachment chips among inline editor segments.
   if (row['kind'] === 'attachment') return parseAttachment(row['ref'])

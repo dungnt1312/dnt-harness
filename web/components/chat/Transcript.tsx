@@ -9,7 +9,7 @@ import { processRows, type ProcessRow } from '../../lib/processes-view.ts'
 import { hiddenSpawnCalls } from '../../lib/spawn-merge.ts'
 import { turnTimings, type TurnTiming } from '../../lib/turn-timing.ts'
 import { useSessionDerivedGates } from '../../lib/session-derived.ts'
-import { ActivityBlock, AssistantMessage, AuditLine, CompactionMarker, ContinuationMarker, ContextMarker, HookContextMarker, DelegationCard, JumpToBottom, ProcessLinkContext, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
+import { ActivityBlock, AssistantMessage, AuditLine, CommandExpansionMarker, CompactionMarker, ContinuationMarker, ContextMarker, HookContextMarker, DelegationCard, JumpToBottom, ProcessLinkContext, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
 import { TurnChangesCard } from './TurnChangesCard.tsx'
 import type { WorkbenchProject } from '../workbench/Workbench.tsx'
 import { ConversationMinimap } from './ConversationMinimap.tsx'
@@ -357,7 +357,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
         // identity (and an opened body) while newer waits replace it.
         return <ToolCard key={folded?.[0]?.kind === 'tool' ? folded[0].call.id : item.call.id} item={item} {...(folded !== undefined ? { repeats: folded.length + 1 } : {})} hidden={hiddenSpawns.has(item.call.id)} workspaceId={workspaceId ?? null} {...(openPath !== undefined ? { openPath } : {})} {...(openDiff !== undefined ? { openDiff } : {})} />
       case 'delegation':
-        return <DelegationCard key={item.childSessionId} item={item} {...(workspaceId !== undefined ? { workspaceId } : {})} rootSessionId={conversationId} {...(onOpenChild !== undefined ? { onOpen: onOpenChild } : {})} />
+        return <DelegationCard key={item.childSessionId} item={item} {...(onOpenChild !== undefined ? { onOpen: onOpenChild } : {})} />
       case 'audit':
         return <AuditLine key={`audit-${index}`} item={item} />
       case 'context':
@@ -368,6 +368,8 @@ export const Transcript = memo(function Transcript({ items, events, conversation
         return <ContinuationMarker key={`continuation-${index}`} item={item} />
       case 'hook-context':
         return <HookContextMarker key={`hook-context-${index}`} item={item} />
+      case 'command-expansion':
+        return <CommandExpansionMarker key={`command-expansion-${index}`} item={item} />
       case 'status':
         {
           // Retry exists only where the log names what to resend: the failed

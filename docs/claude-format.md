@@ -118,11 +118,20 @@ a turn stop kills running hook process trees. Each hook's `systemMessage`,
 `timeoutMs` becomes seconds, `prefix*` matchers become `prefix.*`; `onFailure`
 has no Claude equivalent and is dropped) and renamed `hooks.json.migrated`.
 
+## Commands and plugins
+
+Custom commands, plugin manifests, marketplace installs, and `enabledPlugins`
+use Claude Code's formats with the workspace layer inserted. Commands expand
+server-side (`$ARGUMENTS`, `${CLAUDE_*}`, inline shell through the guarded Bash
+pipeline); plugins contribute namespaced commands, skills, agents, hooks and
+MCP servers. See [plugins.md](plugins.md).
+
 ## Subagents (`src/harness/agents/definition-service.ts`)
 
 Layers, later wins by name (case-insensitive): bundled roles
-(`explorer`, `worker`, `reviewer`, `verifier`) < `~/.claude/agents/` <
-`<ws>/agents/` < `<project>/.claude/agents/`. A file named like a bundled role
+(`explorer`, `worker`, `reviewer`, `verifier`) < `~/.claude/agents/` < enabled
+plugin agents (`plugin:agent`) < `<ws>/agents/` < `<project>/.claude/agents/`.
+A file named like a bundled role
 overrides it, as a Claude custom agent overrides a built-in.
 
 Format: Claude Code subagent Markdown with YAML frontmatter.

@@ -18,6 +18,8 @@ export interface HookHostDeps {
   readonly sessionOf: (sessionId: string) => Session | undefined
   /** The executing conversation's mode id (bundled ids map to Claude permission modes). */
   readonly modeIdOf: (sessionId: string, workspaceId: string) => string | undefined
+  /** Hooks of the plugins enabled for a workspace/project. */
+  readonly pluginHooks?: (workspaceId: string, projectId: string | undefined) => Promise<readonly { id: string; root: string; data: string; hooks: unknown; label: string }[]>
 }
 
 export interface HookFire {
@@ -106,10 +108,12 @@ export class HookHost {
   async resolve(workspaceId: string, projectId: string | undefined): Promise<ResolvedHooks> {
     const workspaceDir = this.workspaceDir(workspaceId)
     const projectRoot = this.deps.projectRootOf(workspaceId, projectId)
+    const plugins = await this.deps.pluginHooks?.(workspaceId, projectId).catch(() => []) ?? []
     return loadHooks({
       ...(this.deps.userClaudeDir !== undefined ? { userDir: this.deps.userClaudeDir } : {}),
       ...(workspaceDir !== undefined ? { workspaceDir } : {}),
       ...(projectRoot !== undefined ? { projectRoot } : {}),
+      ...(plugins.length > 0 ? { plugins } : {}),
     })
   }
 

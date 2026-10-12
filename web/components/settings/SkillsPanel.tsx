@@ -141,6 +141,8 @@ function SkillsPanelContent({ workspaceId, onChanged = () => {} }: { readonly wo
         })
       }
     }
+    const plugin = baseRows.filter((row) => row.source === 'plugin')
+    if (plugin.length > 0) out.push({ key: 'base:plugin', label: 'Plugin skills', source: 'plugin', rows: plugin })
     const bundled = baseRows.filter((row) => row.source === 'bundled')
     if (bundled.length > 0) out.push({ key: 'base:bundled', label: 'Bundled', source: 'bundled', rows: bundled })
     return out
@@ -307,7 +309,7 @@ function SkillsPanelContent({ workspaceId, onChanged = () => {} }: { readonly wo
   const badgeTone = (source: SkillRow['source']): 'blue' | 'green' | 'gray' =>
     source === 'workspace' ? 'blue' : source === 'project' ? 'green' : 'gray'
   const sourceLabel = (source: SkillRow['source']): string =>
-    source === 'project' ? 'Project' : source === 'workspace' ? 'Workspace' : source === 'user' ? 'User' : 'Bundled'
+    source === 'project' ? 'Project' : source === 'workspace' ? 'Workspace' : source === 'user' ? 'User' : source === 'plugin' ? 'Plugin' : 'Bundled'
 
   /** Fixed-height bar at the top of the detail pane: identity + catalog toggle. */
   const paneHeader = (title: ReactNode, trailing?: ReactNode): ReactNode => (

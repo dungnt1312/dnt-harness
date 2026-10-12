@@ -823,9 +823,9 @@ describe('transcript truthfulness', () => {
     await mount(<ToolCard item={{ kind: 'tool', call: { id: 'c', name: 'mcp__docs__search', args: { q: 'x' } }, result: { ok: true, output: 'hit' }, server: 'docs' }} />)
     expect([...host.querySelectorAll('span')].some(span => span.textContent === 'docs')).toBe(true)
   })
-  it('shows the delegation timeline and opens the child conversation', async () => {
+  it('renders a delegation as one line that opens the subagent detail on click, with no in-place expansion', async () => {
     const onOpen = vi.fn()
-    await mount(<DelegationCard item={{ kind: 'delegation', childSessionId: 'child-1', definition: 'explorer', brief: 'Map auth modules', status: 'completed' }} workspaceId={null} onOpen={onOpen} />)
+    await mount(<DelegationCard item={{ kind: 'delegation', childSessionId: 'child-1', definition: 'explorer', brief: 'Map auth modules', status: 'completed' }} onOpen={onOpen} />)
     const head = host.querySelector('button')!
     expect(head.textContent).toMatch(/^Delegated.*explorer/)
     expect(head.textContent).toContain('Map auth modules')
@@ -836,16 +836,15 @@ describe('transcript truthfulness', () => {
     expect(chip?.querySelector('svg')).not.toBeNull()
     // A clean finish adds nothing to the row.
     expect(head.textContent).not.toMatch(/Failed|Stopped|Interrupted/)
+    expect(head.getAttribute('aria-expanded')).toBeNull()
     await act(async () => head.click())
-    expect(host.textContent).toContain('Brief')
-    await act(async () => button('Open conversation').click())
     expect(onOpen).toHaveBeenCalledWith('child-1')
+    expect(host.textContent).not.toContain('Brief')
+    expect(host.textContent).not.toContain('Open conversation')
   })
-  it('keeps a running delegation silent about its result until settled', async () => {
-    await mount(<DelegationCard item={{ kind: 'delegation', childSessionId: 'child-2', definition: 'coder', brief: 'Fix', status: 'running' }} workspaceId={null} onOpen={() => {}} />)
+  it('shows a running delegation as shimmering Delegating', async () => {
+    await mount(<DelegationCard item={{ kind: 'delegation', childSessionId: 'child-2', definition: 'coder', brief: 'Fix', status: 'running' }} onOpen={() => {}} />)
     expect(host.querySelector('.text-shimmer')?.textContent).toBe('Delegating')
-    await act(async () => host.querySelector('button')!.click())
-    expect(host.textContent).not.toContain('Result (')
   })
   it('renders audit lines with a glyph, exact text and duration', async () => {
     await mount(<AuditLine item={{ kind: 'audit', icon: 'block', text: 'hook blocked · PreToolUse · Bash*', durationMs: 120 }} />)
@@ -864,10 +863,10 @@ describe('transcript truthfulness', () => {
     expect(host.querySelector('button[aria-label="Reuse in composer"]')).toBeNull()
   })
   it('renders skill and file chips inline in a user message', async () => {
-    await mount(<UserBubble item={{ kind: 'user', content: 'Use the review skill: check @web/lib/api.ts now' }} />)
+    await mount(<UserBubble item={{ kind: 'user', content: '/review check @web/lib/api.ts now' }} />)
     const chips = Array.from(host.querySelectorAll('[data-chip-kind]'))
     expect(chips.map((chip) => [chip.getAttribute('data-chip-kind'), chip.textContent, chip.getAttribute('title')])).toEqual([
-      ['command', 'review', 'Skill: review'],
+      ['command', 'review', 'Command: /review'],
       ['mention', 'api.ts', 'Project file: web/lib/api.ts'],
     ])
     expect(host.querySelector('p')?.textContent).toBe('review check api.ts now')
@@ -1595,7 +1594,7 @@ describe('global feedback', () => {
     const alerts = host.querySelectorAll('[role="alert"]')
     expect(alerts).toHaveLength(1)
     expect(alerts[0]!.textContent).toContain('HTTP 503: unavailable')
-    expect(alerts[0]!.textContent).toContain('×4')
+    expect(alerts[0]!.textContent).toContain('x4')
   })
   it('caps the stack: the oldest toast leaves when more than four are live', async () => {
     const probe: { notify?: (text: string, kind?: 'ok' | 'bad' | 'info') => void } = {}

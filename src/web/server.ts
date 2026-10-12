@@ -54,11 +54,12 @@ import { expressibleThinkingLevel, isThinkingLevel, resolveContextLimit } from '
 import { adaptRequestVision, supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
 import { ProviderError } from '../harness/llm/types.ts'
 import type { LlmProvider, StreamEvent, TokenUsage, ToolCall } from '../harness/llm/types.ts'
+import type { ToolResult } from '../harness/tools/types.ts'
 import { fileSessions, SessionsService } from '../harness/session/service.ts'
 import type { Session } from '../harness/session/session.ts'
 import { sessionGrantsOf, sessionModeOf, sessionModelOf, type SessionEvent, type SessionGrant, type SessionGrants } from '../harness/session/events.ts'
 import { deriveTitle } from '../harness/session/title.ts'
-import { newInputId, type ProjectId, type SessionId, type TurnId, type WorkspaceId } from '../util/brand.ts'
+import { newExecutionId, newInputId, type ProjectId, type SessionId, type TurnId, type WorkspaceId } from '../util/brand.ts'
 import { ToolsService } from '../harness/tools/service.ts'
 import { bashTool } from '../capabilities/shell/bash.ts'
 import { bashOutputTool, killShellTool } from '../capabilities/shell/background-tools.ts'
@@ -121,6 +122,7 @@ import { createExecutionAuthority, mcpToolExposed, projectExposedSchemas } from 
 import { configRevision, upsertServer, withServerActivated, withServerEnabled, withoutServer } from '../harness/mcp/config-v2.ts'
 import { clearAuditFault, dispatchToolCall, faultIsOpen } from '../harness/mcp/execution-coordinator.ts'
 import { McpExecutionJournal } from '../harness/mcp/execution-journal.ts'
+import { McpDispatchError } from '../harness/mcp/boundaries.ts'
 import { MutationStore, readFileIfPresent } from '../harness/mcp/mutation-store.ts'
 import { recoverMigrations } from '../harness/mcp/migration.ts'
 import { DataHomeLock } from '../harness/mcp/ownership-lock.ts'
@@ -152,6 +154,14 @@ import { SystemPromptsStore, type SystemPromptsSnapshot } from '../harness/promp
 import { CheckpointStore } from '../harness/context/compaction.ts'
 import { createCompactionSummarizer } from './llm-summarizer.ts'
 import { DEFAULT_BUDGET, type ResolvedBudget } from '../harness/context/budget.ts'
+import { CommandsService } from '../harness/commands/service.ts'
+import { PluginService } from '../harness/plugins/service.ts'
+import { PluginError } from '../harness/plugins/manifest.ts'
+import { parseMarketplaceInput } from '../harness/plugins/marketplace.ts'
+import { pluginServerName } from '../harness/plugins/mcp.ts'
+import { commandKey, type CommandDefinition } from '../harness/commands/catalog.ts'
+import { CommandExpansionError, expandCommand } from '../harness/commands/invoke.ts'
+import { BUILTIN_COMMAND_NAMES, TurnCommandGrants, expandMessages, inlineShellOutput, resolveCommand, type CommandResolverDeps } from './slash-commands.ts'
 
 declare module 'dnt-harness' {
   interface Events {
@@ -315,6 +325,8 @@ export interface WebServerOptions {
   readonly userClaudeDir?: string
   /** Read-only bundled skill layer shipped with the app; scanned when the dir exists. */
   readonly bundledSkillsDir?: string
+  /** Test seam: replaces the `git` clone the plugin marketplace uses. */
+  readonly pluginClone?: (url: string, target: string, ref?: string, sha?: string) => Promise<string>
   /**
    * Credential locations (e.g. `~/.ssh`) refused to the file tools in every
    * mode and never grantable. Applied only with `home` (durable hosts);
@@ -646,14 +658,44 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const attachments = new AttachmentStore(resourceHome, { maxBytes: limits.maxAttachmentBytes })
   // Claude Code subagent layers: bundled < ~/.claude/agents < <ws>/agents <
   // <project>/.claude/agents.
+  const projectRootOf = (workspaceId: string, projectId: string): string | undefined => {
+    try { return workspaces.getProject(projectId as ProjectId, workspaceId as WorkspaceId).path } catch { return undefined }
+  }
+  // Claude Code plugins: the host's own store (<data>/plugins), enabled via
+  // `enabledPlugins` in ~/.claude (read) < <ws> < project < local settings.
+  const plugins = new PluginService({
+    dataDir: resourceHome,
+    ...(options.userClaudeDir !== undefined ? { userClaudeDir: options.userClaudeDir } : {}),
+    homeDir: homedir(),
+    projectRootOf,
+    ...(options.pluginClone !== undefined ? { clone: options.pluginClone } : {}),
+  })
+  const pluginContext = (workspaceId: string, projectId: string | undefined) => ({ workspaceId, ...(projectId !== undefined ? { projectId } : {}) })
+  if (options.home !== undefined) skills.setPluginLayers((workspaceId, projectId) => plugins.skillLayers(pluginContext(workspaceId, projectId)))
   const agentDefinitions = new AgentDefinitionService(resourceHome, {
     ...(options.userClaudeDir !== undefined ? { userClaudeDir: options.userClaudeDir } : {}),
-    projectRootOf: (workspaceId, projectId) => {
-      try { return workspaces.getProject(projectId as ProjectId, workspaceId as WorkspaceId).path } catch { return undefined }
-    },
+    projectRootOf,
+    ...(options.home !== undefined ? { pluginLayers: (workspaceId: string, projectId: string | undefined) => plugins.agentLayers(pluginContext(workspaceId, projectId)) } : {}),
   })
-  const childExecutor = new ChildExecutor(kernel.ctx)
+  const childExecutor = new ChildExecutor(kernel.ctx, (root) => {
+    const entry = sessions.get(root)
+    const deps = depsRef.current
+    if (entry !== undefined && deps !== undefined && !entry.closed && kernel.ctx.sessions.pendingInputs(entry.session).length > 0) {
+      void dispatchInbox(entry, deps, 'queue').catch((error: unknown) => {
+        console.error(`web: delegation inbox drain failed for ${root}: ${String(error)}`)
+      })
+    }
+  })
   kernel.ctx.provide('agent-definitions', agentDefinitions)
+  // Claude Code custom slash commands: ~/.claude/commands < plugins <
+  // <ws>/commands < <project>/.claude/commands (ancestors first).
+  const commandsService = new CommandsService(resourceHome, {
+    ...(options.userClaudeDir !== undefined ? { userClaudeDir: options.userClaudeDir } : {}),
+    projectRootOf,
+    ...(options.home !== undefined ? { pluginLayers: (workspaceId: string, projectId: string | undefined) => plugins.commandLayers(pluginContext(workspaceId, projectId)) } : {}),
+  })
+  // What the running turn's slash command granted (allowed-tools, model).
+  const turnCommandGrants = new TurnCommandGrants()
 
   // G5: MCP servers + hooks, workspace-scoped. Each (workspace, enabled
   // server) gets one McpServerClient; tools register as `mcp__server__tool`.
@@ -662,6 +704,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const hookHost = new HookHost({
     home: resourceHome,
     userClaudeDir: options.userClaudeDir,
+    ...(options.home !== undefined ? { pluginHooks: (workspaceId: string, projectId: string | undefined) => plugins.hookSources(pluginContext(workspaceId, projectId)) } : {}),
     projectRootOf: (workspaceId, projectId) => {
       if (projectId === undefined) return undefined
       try { return workspaces.getProject(projectId as ProjectId, workspaceId as WorkspaceId).path } catch { return undefined }
@@ -688,6 +731,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const drifted = new Set<string>()
   const generationOf = (workspaceId: string): number => mcpGeneration.get(workspaceId) ?? 1
   const journals = new Map<string, McpExecutionJournal>()
+  const journalsOpening = new Map<string, Promise<McpExecutionJournal>>()
   const auditFaultFile = path.join(resourceHome, 'mcp-audit-fault.json')
   const oauthKeyFile = path.join(resourceHome, 'oauth.master.key')
   let oauthKey: Buffer
@@ -1122,6 +1166,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     const settled = agentScope.getStore()?.sessionId
     if (settled !== undefined) {
       skillSnapshots.delete(settled)
+      turnCommandGrants.clear(settled)
       // A root turn's per-turn spawn budget ends with the turn. The await
       // serializes with spawn admission so a committing spawn cannot
       // re-create the key this cleanup drops.
@@ -1290,10 +1335,81 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   // capability: invalid/unavailable workspace config removes its tools from
   // this Turn but cannot reject chat. Injected hook content is lower-trust
   // reference data and becomes a logged input in this Turn.
+  /** The bound project folder, for `${CLAUDE_PROJECT_DIR}`. */
+  const projectDirOf = (workspaceId: WorkspaceId, projectId: ProjectId | undefined): string | undefined => {
+    if (projectId === undefined) return undefined
+    try { return workspaces.getProject(projectId, workspaceId).path } catch { return undefined }
+  }
+  /** Commands and skills resolve through the same layers every surface uses. */
+  const commandResolver: CommandResolverDeps = {
+    commands: async (workspaceId, projectId) => (await commandsService.catalog(workspaceId, projectId)).rows,
+    skill: async (workspaceId, projectId, name) => {
+      const layers = await skillLayers(skills, workspaces, workspaceId as WorkspaceId, projectId as ProjectId | undefined)
+      return skills.commandIn(layers, name)
+    },
+  }
+  /**
+   * One `!`cmd`` marker → a real Bash call through the conversation's tool
+   * pipeline (PreToolUse hooks, Dangerous Commands, mode, policy, approval),
+   * exactly like a call the model makes. The command's `allowed-tools` is
+   * already granted for this turn, so `Bash(git status:*)` runs unasked.
+   */
+  const runInlineShell = async (
+    shell: { readonly raw: string; readonly command: string },
+    signal: AbortSignal | undefined,
+    session: Session,
+    turnId: TurnId,
+  ): Promise<string> => {
+    const call: ToolCall = { id: `cmd_${randomUUID()}`, name: 'Bash', args: { command: shell.command } }
+    const executionId = newExecutionId()
+    let prepared: { readonly call: ToolCall; readonly executionId?: string; execute(): Promise<ToolResult> }
+    try {
+      prepared = await kernel.ctx.tools.prepare(call, { ...(signal !== undefined ? { signal } : {}), executionId })
+    } catch (error) {
+      session.append({ type: 'command/tool-call', turnId, executionId, call })
+      session.append({
+        type: 'command/tool-result', turnId, executionId, callId: call.id, ok: false,
+        output: `error: tool preparation failed: ${String(error instanceof Error ? error.message : error)}`,
+      })
+      await session.durable()
+      throw error
+    }
+    session.append({
+      type: 'command/tool-call', turnId, executionId,
+      call: prepared.call,
+      policyRevision: kernel.ctx.tools.policyRevision,
+    })
+    // Same invariant as model-issued tools: durable FINAL intent before Bash.
+    await session.durable()
+    let result: ToolResult
+    try {
+      result = await prepared.execute()
+    } catch (error) {
+      result = { ok: false, output: `error: tool pipeline failed: ${String(error instanceof Error ? error.message : error)}` }
+    }
+    session.append({
+      type: 'command/tool-result', turnId, executionId, callId: prepared.call.id,
+      ok: result.ok, output: result.output,
+    })
+    await session.durable()
+    return inlineShellOutput({ raw: shell.raw, command: shell.command, at: 0 }, result)
+  }
+
   kernel.ctx.on('agent/pre-step', async (claim, next) => {
     const scope = agentScope.getStore()
     const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
+    // Plugin servers follow `enabledPlugins` edits made outside the app. A
+    // failed reconcile fails CLOSED: the turn runs without MCP rather than on
+    // a config that may still hold a plugin the user just disabled.
+    let pluginSyncError: unknown
+    if (options.home !== undefined && scope?.childOf === undefined) {
+      await syncPluginMcpIfChanged(workspaceId).catch((error: unknown) => {
+        pluginSyncError = error
+        console.warn(`web: plugin MCP sync failed in ${workspaceId}: ${String(error instanceof Error ? error.message : error)}`)
+      })
+    }
     try {
+      if (pluginSyncError !== undefined) throw new Error(`plugin MCP sync failed: ${String(pluginSyncError instanceof Error ? pluginSyncError.message : pluginSyncError)}`)
       await connectWorkspaceMcp(workspaceId)
     } catch (error) {
       await disableMcpForTurn(scope, workspaceId, error)
@@ -1326,11 +1442,46 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     if (event === 'UserPromptSubmit' && verdict.block !== undefined) {
       return { kind: 'reject', reason: `UserPromptSubmit hook blocked the prompt: ${verdict.block.reason}` }
     }
+    // Claude slash commands: a root prompt `/name args` expands AFTER the
+    // UserPromptSubmit hooks saw what was typed. The typed text stays the
+    // user's message; the expansion follows it as `origin: 'command'`.
+    let expansions: readonly (string | undefined)[] | undefined
+    if (child === undefined && scope?.sessionId !== undefined && contents.some((content) => content.startsWith('/'))) {
+      const sessionId = scope.sessionId
+      const session = await scopedSession(sessionId)
+      if (session === undefined || scope.turnId === undefined) return { kind: 'reject', reason: 'slash command execution scope is unavailable' }
+      let auditedCommandWork = false
+      try {
+        const expanded = await expandMessages(contents, {
+          ...commandResolver,
+          workspaceId,
+          projectId: scope.projectId,
+          ...(projectDirOf(workspaceId, scope.projectId) !== undefined ? { projectDir: projectDirOf(workspaceId, scope.projectId) as string } : {}),
+          sessionId,
+          onGrant: (grant) => turnCommandGrants.add(sessionId, grant),
+          runShell: async (shell) => {
+            auditedCommandWork = true
+            return runInlineShell(shell, claim.signal, session, scope.turnId as TurnId)
+          },
+        })
+        expansions = expanded.expansions
+        // Stopped after `!` shell already ran: settle it here, never hand the
+        // input back to run its side effects a second time.
+        if (auditedCommandWork && claim.signal?.aborted === true) {
+          return { kind: 'reject', reason: 'stopped while the slash command expanded', audited: true }
+        }
+      } catch (error) {
+        if (claim.signal?.aborted === true) return { kind: 'reject', reason: 'stopped while the slash command expanded', ...(auditedCommandWork ? { audited: true as const } : {}) }
+        if (error instanceof CommandExpansionError) return { kind: 'reject', reason: error.message, ...(auditedCommandWork ? { audited: true as const } : {}) }
+        return { kind: 'reject', reason: `slash command failed: ${String(error instanceof Error ? error.message : error)}`, ...(auditedCommandWork ? { audited: true as const } : {}) }
+      }
+    }
     // Context rides its own channel: logged as `origin: 'context'`, read by
     // the model, shown collapsed — never mixed into the user's own bubble.
     return next({
       contents,
       ...(verdict.additionalContext !== undefined ? { context: [hookContextBlock(event, verdict.additionalContext)] } : {}),
+      ...(expansions !== undefined ? { expansions } : {}),
     })
   }, true)
 
@@ -1542,19 +1693,20 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   kernel.ctx.tools.register({
     name: 'Skill',
     description:
-      "Load one skill's instructions on demand (mode-gated; skill content is data, never permissions). The workspace's available skills and their descriptions are already listed in your context; action:'catalog' re-lists or filters them.",
+      "Load one skill's or custom command's instructions on demand, with optional args (mode-gated; skill content is data, never permissions). The workspace's available skills and commands are already listed in your context; action:'catalog' re-lists or filters them.",
     requiresRoot: false,
     parameters: {
       type: 'object',
       properties: {
         action: { type: 'string', description: 'catalog | load (default load when name is present)' },
-        name: { type: 'string', description: 'load: skill name from the catalog' },
+        name: { type: 'string', description: 'load: skill or command name from the catalog (e.g. "review", "git:commit")' },
+        args: { type: 'string', description: 'load: optional arguments, as the user would type them after /name' },
         query: { type: 'string', description: 'catalog: optional name/title/description filter' },
         limit: { type: 'number', description: 'catalog: maximum rows (default 20, max 50)' },
       },
       required: [],
     },
-    async execute(args) {
+    async execute(args, exec) {
       const scope = agentScope.getStore()
       if (scope?.workspaceId === undefined) throw new Error('Skill requires a workspace-scoped execution')
       const wsId: WorkspaceId = scope.workspaceId
@@ -1570,7 +1722,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         // Hidden skills stay undiscoverable here (the workspace hid them on
         // purpose); a load by exact name still works — demand-only. Layers
         // follow the workspace's rules plus the bound project's folders.
-        const all = await skillLayers(skills, workspaces, wsId, scope.projectId).then((layers) => skills.listVisibleIn(wsId, layers))
+        const all = await modelCatalog(wsId, scope.projectId)
         const matches = query === ''
           ? all
           : all.filter((entry) => `${entry.name}
@@ -1580,7 +1732,7 @@ ${entry.description}`.toLowerCase().includes(query))
         const shown = matches.slice(0, limit)
         const suffix = matches.length > shown.length ? `
 … ${matches.length - shown.length} more; refine query or raise limit` : ''
-        return shown.map((entry) => `${entry.name} [${entry.source}] ${entry.title}${entry.description === '' ? '' : ` — ${entry.description}`}`).join('\n') + suffix
+        return shown.map((entry) => `${entry.name}${entry.argumentHint !== undefined ? ` ${entry.argumentHint}` : ''} [${entry.source}] ${entry.title}${entry.description === '' ? '' : ` — ${entry.description}`}`).join('\n') + suffix
       }
       if (action !== 'load') throw new Error(`unknown Skill action '${action}'; use catalog or load`)
       const name = args['name']
@@ -1589,29 +1741,89 @@ ${entry.description}`.toLowerCase().includes(query))
       if (mode.definition.sources.skills !== 'on-demand') {
         throw new Error(`mode '${mode.definition.name}' has skills off; switch modes to load skills`)
       }
+      // Claude's Skill tool: a skill or a custom command, expanded with the
+      // given arguments exactly as `/name args` would be, then pinned for
+      // the turn. `disable-model-invocation` commands are the user's only.
+      const sought = name.trim().replace(/^\//, '')
+      const commandArgs = typeof args['args'] === 'string' ? args['args'].trim() : ''
+      const pinKey = commandArgs === '' ? sought : `${sought} ${commandArgs}`
       const perTurn = skillSnapshots.get(scope.sessionId) ?? new Map<string, ActiveSkill>()
-      const pinned = perTurn.get(name.trim())
+      const pinned = perTurn.get(pinKey)
       if (pinned !== undefined) {
         return `skill '${pinned.name}' loaded (hash ${pinned.hash.slice(0, 12)}); its instructions are included in context`
       }
+      let command: CommandDefinition | undefined
       try {
-        const layers = await skillLayers(skills, workspaces, wsId, scope.projectId)
-        const loaded = await skills.loadIn(layers, name.trim())
-        perTurn.set(loaded.name, { name: loaded.name, instructions: loaded.instructions, hash: loaded.hash })
-        skillSnapshots.set(scope.sessionId, perTurn)
-        return `skill '${loaded.name}' loaded (hash ${loaded.hash.slice(0, 12)}); its instructions are included in context`
+        command = await resolveCommand(commandResolver, wsId, scope.projectId, sought)
       } catch (error) {
-        if (!(error instanceof SkillError) || error.code !== 'not-found') throw error
-        const rows = await skillLayers(skills, workspaces, wsId, scope.projectId).then((layers) => skills.listVisibleIn(wsId, layers))
-        const sought = name.trim().toLowerCase()
+        if (!(error instanceof SkillError)) throw error
+        throw new Error(error.message)
+      }
+      if (command === undefined || BUILTIN_COMMAND_NAMES.has(commandKey(sought))) {
+        const rows = await modelCatalog(wsId, scope.projectId)
+        const lower = sought.toLowerCase()
         const suggestions = rows
-          .filter((entry) => entry.name.includes(sought) || sought.includes(entry.name))
+          .filter((entry) => entry.name.includes(lower) || lower.includes(entry.name))
           .slice(0, 10)
           .map((entry) => entry.name)
-        return `skill '${name.trim()}' not found; ${suggestions.length > 0 ? `similar: ${suggestions.join(', ')}` : 'use Skill action:"catalog" with an optional query'}`
+        return `skill '${sought}' not found; ${suggestions.length > 0 ? `similar: ${suggestions.join(', ')}` : 'use Skill action:"catalog" with an optional query'}`
       }
+      if (command.disableModelInvocation) {
+        return `skill '${command.name}' can only be run by the user (disable-model-invocation); ask the user to type /${command.name}`
+      }
+      // A model-invoked Skill/command carries the same turn-local
+      // allowed-tools/model grant as `/name args`. Install the grant before
+      // expansion so it covers the command's own inline shell; roll it back
+      // if expansion fails.
+      // Root conversations only: a subagent loading a command must never
+      // grant itself the command's allowed-tools (its ceiling stays its own).
+      const undoGrant = scope.childOf === undefined
+        ? turnCommandGrants.add(scope.sessionId, {
+            command: command.name,
+            allowedTools: command.allowedTools,
+            ...(command.model !== undefined ? { model: command.model } : {}),
+          })
+        : () => undefined
+      const instructions = await expandCommand(command, commandArgs, {
+        ...(projectDirOf(wsId, scope.projectId) !== undefined ? { projectDir: projectDirOf(wsId, scope.projectId) as string } : {}),
+        sessionId: scope.rootSessionId ?? scope.sessionId,
+        runShell: async (shell) => {
+          const session = await scopedSession(scope.sessionId)
+          if (session === undefined || scope.turnId === undefined) throw new CommandExpansionError('skill shell execution scope is unavailable')
+          return runInlineShell(shell, exec.signal, session, scope.turnId)
+        },
+      }).catch((error: unknown) => {
+        undoGrant()
+        if (error instanceof CommandExpansionError) throw new Error(error.message)
+        throw error
+      })
+      perTurn.set(pinKey, { name: command.name, instructions, hash: command.hash })
+      skillSnapshots.set(scope.sessionId, perTurn)
+      return `skill '${command.name}' loaded (hash ${command.hash.slice(0, 12)}); its instructions are included in context`
     },
   })
+
+  /**
+   * What the model may run through `Skill`: visible skills and custom
+   * commands, minus `disable-model-invocation` (Claude leaves those out of
+   * the model's list). A skill shadows a command of the same name (Claude
+   * loads skills first), matching {@link resolveCommand}.
+   */
+  async function modelCatalog(workspaceId: WorkspaceId, projectId: ProjectId | undefined): Promise<{ name: string; title: string; description: string; source: string; argumentHint?: string }[]> {
+    const [skillRows, commandRows] = await Promise.all([
+      skillLayers(skills, workspaces, workspaceId, projectId).then((layers) => skills.listVisibleIn(workspaceId, layers)),
+      commandsService.catalog(workspaceId, projectId).then((catalog) => catalog.rows).catch(() => [] as CommandDefinition[]),
+    ])
+    const skillKeys = new Set(skillRows.map((row) => commandKey(row.name)))
+    return [
+      ...skillRows
+        .filter((row) => row.disableModelInvocation !== true)
+        .map((row) => ({ name: row.name, title: row.title, description: row.description, source: row.source, ...(row.argumentHint !== undefined ? { argumentHint: row.argumentHint } : {}) })),
+      ...commandRows
+        .filter((row) => !row.disableModelInvocation && !BUILTIN_COMMAND_NAMES.has(commandKey(row.name)) && !skillKeys.has(commandKey(row.name)))
+        .map((row) => ({ name: row.name, title: row.name, description: row.description, source: `${row.source} command`, ...(row.argumentHint !== undefined ? { argumentHint: row.argumentHint } : {}) })),
+    ].sort((a, b) => a.name.localeCompare(b.name))
+  }
   // Claude-style session task list: full-replacement tool, state IS the log.
   kernel.ctx.tools.register(todoWriteTool())
   // Image tools: results land in the executing workspace's attachment
@@ -1724,6 +1936,86 @@ ${entry.description}`.toLowerCase().includes(query))
     },
   }))
 
+  /**
+   * Reconcile this workspace's `mcp.json` with the Claude Code plugins enabled
+   * anywhere in it: each plugin server becomes an enabled entry owned by the
+   * plugin (`provenance.plugin`), stdio ones pinned to the executable that
+   * resolves now (enabling the plugin authorizes it, as `enable` does for a
+   * hand-added server). Entries of plugins no longer enabled are removed and
+   * disconnected. A user-owned server of the same name is never touched.
+   */
+  const pluginMcpFingerprints = new Map<string, string>()
+  /**
+   * Cheap pre-turn check: settings files can enable a plugin outside the app
+   * (a project's `.claude/settings.json`, `~/.claude/settings.json`). Sync
+   * only when the plugin servers this workspace should have changed.
+   */
+  async function syncPluginMcpIfChanged(workspaceId: WorkspaceId): Promise<void> {
+    const projectIds = workspaces.listProjects(workspaceId).map((project) => project.id)
+    const { drafts } = await plugins.workspaceServers(workspaceId, projectIds)
+    const fingerprint = JSON.stringify(drafts)
+    if (pluginMcpFingerprints.get(workspaceId) === fingerprint) return
+    await syncPluginMcp(workspaceId)
+    pluginMcpFingerprints.set(workspaceId, fingerprint)
+  }
+
+  async function syncPluginMcp(workspaceId: WorkspaceId): Promise<{ readonly notes: readonly string[] }> {
+    const projectIds = workspaces.listProjects(workspaceId).map((project) => project.id)
+    const { drafts, notes } = await plugins.workspaceServers(workspaceId, projectIds)
+    const pins = new Map<string, { readonly path: string; readonly sha256: string } | undefined>()
+    const problems: string[] = [...notes]
+    for (const draft of drafts) {
+      if (draft.body['transport'] !== 'stdio') continue
+      try {
+        pins.set(draft.name, await resolveCanonicalExecutable(String(draft.body['command'])))
+      } catch (error) {
+        problems.push(`${draft.name}: ${String(error instanceof Error ? error.message : error)}`)
+      }
+    }
+    const removed: string[] = []
+    const wanted = new Map(drafts.filter((draft) => draft.body['transport'] !== 'stdio' || pins.has(draft.name)).map((draft) => [draft.name, draft]))
+    let changed = false
+    await updateMcpConfig(workspaceId, (current) => {
+      let next = current
+      for (const [name, server] of Object.entries(current.servers)) {
+        if (server.provenance?.plugin !== undefined && !wanted.has(name)) {
+          next = withoutServer(next, name)
+          removed.push(name)
+          changed = true
+        }
+      }
+      for (const [name, draft] of wanted) {
+        const existing = next.servers[name]
+        if (existing !== undefined && existing.provenance?.plugin === undefined) {
+          problems.push(`${name}: a server you added has this name; the plugin's server is skipped`)
+          continue
+        }
+        const { enabled: _e, executable: _x, name: _n, ...previous } = (existing ?? {}) as unknown as Record<string, unknown>
+        void _e; void _x; void _n
+        if (existing !== undefined && JSON.stringify(previous) === JSON.stringify(draft.body) && existing.enabled
+          && JSON.stringify(existing.executable) === JSON.stringify(pins.get(name))) continue
+        // One invalid plugin server is skipped and reported; it never blocks
+        // the removals or the other plugins' servers in the same reconcile.
+        try {
+          next = withServerActivated(upsertServer(next, name, draft.body), name, pins.get(name))
+          changed = true
+        } catch (error) {
+          problems.push(`${name}: ${String(error instanceof Error ? error.message : error)}`)
+          if (existing !== undefined) {
+            next = withoutServer(next, name)
+            removed.push(name)
+            changed = true
+          }
+        }
+      }
+      // Nothing to do: hand the same document back (no rewrite, no fence).
+      if (!changed) throw new McpRevisionConflict()
+      return next
+    }).catch((error: unknown) => error instanceof McpRevisionConflict ? undefined : Promise.reject(error))
+    for (const name of removed) await cancelMcpConnection(workspaceId, name)
+    return { notes: problems }
+  }
+
   /** Cancel/await an in-flight or connected server, then remove descriptors. */
   async function cancelMcpConnection(workspaceId: WorkspaceId, serverName: string): Promise<void> {
     const key = `${workspaceId}:${serverName}`
@@ -1744,14 +2036,27 @@ ${entry.description}`.toLowerCase().includes(query))
   async function journalFor(workspaceId: string): Promise<McpExecutionJournal> {
     const existing = journals.get(workspaceId)
     if (existing !== undefined) return existing
-    const journal = new McpExecutionJournal(
-      path.join(resourceHome, 'workspaces', workspaceId, 'mcp', 'executions.jsonl'),
-      () => ownerLock.assertHeld(),
-    )
-    await journal.open()
-    await journal.terminalizeUnresolved()
-    journals.set(workspaceId, journal)
-    return journal
+    const inFlight = journalsOpening.get(workspaceId)
+    if (inFlight !== undefined) return inFlight
+    // Publish before awaiting disk I/O: recovery and append sequencing must
+    // have exactly one owner, including concurrent first tool calls.
+    const opening = (async () => {
+      const journal = new McpExecutionJournal(
+        path.join(resourceHome, 'workspaces', workspaceId, 'mcp', 'executions.jsonl'),
+        () => ownerLock.assertHeld(),
+      )
+      await journal.open()
+      await journal.terminalizeUnresolved()
+      journals.set(workspaceId, journal)
+      return journal
+    })()
+    journalsOpening.set(workspaceId, opening)
+    try {
+      return await opening
+    } finally {
+      // Failed opens are not cached: an operator can repair the file and retry.
+      journalsOpening.delete(workspaceId)
+    }
   }
 
   async function fenceWorkspace(workspaceId: WorkspaceId): Promise<void> {
@@ -1866,6 +2171,28 @@ ${entry.description}`.toLowerCase().includes(query))
     drifted.delete(workspaceId)
   }
 
+  /** Both runtime and isolated connection tests use the same live token source. */
+  async function resolveMcpAuth(workspaceId: WorkspaceId, serverName: string, serverConfig: McpServerConfig, secrets: Record<string, string>) {
+    const secretRef = authSecretRef(serverConfig.auth)
+    if (serverConfig.auth?.type !== 'managed_oauth') {
+      return {
+        bearerToken: secretRef === undefined ? undefined : resolveSecretRefs(secretRef, secrets, `mcp.json server '${serverName}' auth`),
+        tokenSource: undefined,
+      }
+    }
+    let lastToken: string | undefined
+    const tokenSource = async (rejected?: string): Promise<string | undefined> => {
+      const token = rejected !== undefined
+        ? await oauth.replaceRejected(workspaceId, serverName, rejected)
+        : await oauth.accessToken(workspaceId, serverName)
+      if (token === undefined) throw new McpTransportError(`MCP server '${serverName}' auth_required: requires managed OAuth authorization`)
+      lastToken = token
+      return token
+    }
+    await tokenSource()
+    return { bearerToken: undefined, tokenSource, replaceRejected: () => tokenSource(lastToken) }
+  }
+
   async function testMcpServer(workspaceId: WorkspaceId, serverName: string): Promise<readonly string[]> {
     const config = await mcpStore.loadMcp(workspaceId)
     const serverConfig = config.servers[serverName]
@@ -1883,12 +2210,19 @@ ${entry.description}`.toLowerCase().includes(query))
     for (const [key, ref] of Object.entries(serverConfig.headers ?? {})) {
       resolvedHeaders[key] = resolveSecretRefs(ref, secrets, `connection test header.${key}`)
     }
-    const secretRef = authSecretRef(serverConfig.auth)
-    const bearerToken = secretRef === undefined ? undefined : resolveSecretRefs(secretRef, secrets, 'connection test auth')
-    const client = new McpServerClient(serverName, serverConfig, { env: resolvedEnv, bearerToken, headers: resolvedHeaders }, () => {})
+    const auth = await resolveMcpAuth(workspaceId, serverName, serverConfig, secrets)
+    const client = new McpServerClient(serverName, serverConfig, { env: resolvedEnv, ...auth, headers: resolvedHeaders }, () => {})
     try {
       const tools = await client.listTools()
       return tools.map((tool) => tool.name)
+    } catch (error) {
+      if (auth.tokenSource !== undefined && error instanceof McpDispatchError && error.receipt.kind === 'not_dispatched' && error.receipt.reason === 'auth_rejected') {
+        // The isolated client is about to be discarded. Persist a replacement
+        // for the next test, without replaying this failed request.
+        await auth.replaceRejected?.()
+        throw new McpTransportError(`MCP server '${serverName}' credentials were rejected; retry the connection test`)
+      }
+      throw error
     } finally {
       await client.disconnect()
     }
@@ -1931,27 +2265,8 @@ ${entry.description}`.toLowerCase().includes(query))
         for (const [header, ref] of Object.entries(serverConfig.headers ?? {})) {
           resolvedHeaders[header] = resolveSecretRefs(ref, secrets, `mcp.json server '${serverName}' headers.${header}`)
         }
-        const secretRef = authSecretRef(serverConfig.auth)
-        const managedOAuth = serverConfig.auth?.type === 'managed_oauth'
-        if (managedOAuth && await oauth.accessToken(workspaceId, serverName) === undefined) {
-          throw new McpTransportError(`MCP server '${serverName}' requires managed OAuth authorization`)
-        }
-        const bearerToken = managedOAuth || secretRef === undefined
-          ? undefined
-          : resolveSecretRefs(secretRef, secrets, `mcp.json server '${serverName}' auth`)
-        // Managed OAuth is asked per request: an access token that expires (or
-        // that the server revokes) while this client lives is refreshed instead
-        // of being sent until the breaker opens.
-        const tokenSource = managedOAuth
-          ? async (rejected?: string): Promise<string | undefined> => {
-            const token = rejected !== undefined
-              ? await oauth.replaceRejected(workspaceId, serverName, rejected)
-              : await oauth.accessToken(workspaceId, serverName)
-            if (token === undefined) throw new Error(`MCP server '${serverName}' requires managed OAuth authorization`)
-            return token
-          }
-          : undefined
-        client = new McpServerClient(serverName, serverConfig, { env: resolvedEnv, bearerToken, headers: resolvedHeaders, tokenSource }, (event) => {
+        const auth = await resolveMcpAuth(workspaceId, serverName, serverConfig, secrets)
+        client = new McpServerClient(serverName, serverConfig, { env: resolvedEnv, ...auth, headers: resolvedHeaders }, (event) => {
           // Redacted diagnostics: category/server only — no server-returned
           // raw error detail or secret-bearing payload.
           if (event.isError) console.warn(`mcp [${serverName}] ${event.kind}: operation failed`)
@@ -2564,8 +2879,7 @@ ${entry.description}`.toLowerCase().includes(query))
     const skillCatalog = mode.definition.sources.skills === 'on-demand'
       && scope?.workspaceId !== undefined
       && exposed.some((schema) => schema.name === 'Skill')
-      ? await skillLayers(skills, workspaces, scope.workspaceId, scope.projectId)
-          .then((layers) => skills.listVisibleIn(scope.workspaceId as WorkspaceId, layers))
+      ? await modelCatalog(scope.workspaceId, scope.projectId)
           .then((rows) => rows.map((entry) => {
             const description = entry.description === '' ? entry.title : entry.description
             return { name: entry.name, description: description.length > 500 ? `${description.slice(0, 499)}…` : description }
@@ -2736,9 +3050,21 @@ ${entry.description}`.toLowerCase().includes(query))
     const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
     const state = controlsFor(workspaceId)
     const session = await scopedSession(scope?.sessionId)
-    const effective = session === undefined
+    const conversation = session === undefined
       ? { provider: defaults.provider, model: defaults.model, thinkingLevel: defaults.thinkingLevel }
       : resolveEffectiveModel(session, workspaceId)
+    // A slash command's `model:` (Claude) runs the turn it started on that
+    // model; one this host cannot serve keeps the conversation's.
+    const commandModel = scope?.childOf === undefined ? turnCommandGrants.model(scope?.sessionId) : undefined
+    let effective = conversation
+    if (commandModel !== undefined && session !== undefined) {
+      try {
+        const picked = childModelFor(session, workspaceId, undefined, commandModel)
+        if (picked !== undefined) effective = { ...conversation, provider: picked.provider, model: picked.model }
+      } catch {
+        // Unservable here: the conversation's model stands.
+      }
+    }
     const model = effective.model ?? undefined
     const provider = effective.provider ?? undefined
     if (provider !== undefined && model !== undefined) validateProviderModel(provider, model)
@@ -2843,7 +3169,13 @@ ${entry.description}`.toLowerCase().includes(query))
         // `.git`/`.env`/`secrets`/`skills`/`agents`/`commands`. A deny —
         // exact, legacy-named, or via `*` — already resolved to `deny` in
         // `normalPermission` (canonical lookup), so it can never be lifted.
-        const permission = memoryWrite && normalPermission === 'ask' ? 'allow' : normalPermission
+        // A slash command's `allowed-tools` (Claude) lifts a policy `ask`
+        // for the turn that ran it — never a deny; guard, path and hook
+        // questions below still apply.
+        // Root sessions only: a child never inherits or creates a command grant.
+        const commandAllowed = normalPermission === 'ask' && sessionId === rootSessionId && agentScope.getStore()?.childOf === undefined
+          && turnCommandGrants.allows(sessionId, call, grant?.root)
+        const permission = (memoryWrite || commandAllowed) && normalPermission === 'ask' ? 'allow' : normalPermission
         const requirements: AskRequirement[] = []
         if (permission === 'ask') requirements.push({ kind: 'tool-policy', subjectFingerprint: createHash('sha256').update(`${call.name}:ask`).digest('hex') })
         const outside = pathScope.get(executionId, call)
@@ -3272,6 +3604,10 @@ ${entry.description}`.toLowerCase().includes(query))
     seedWorkspaceControls,
     modes,
     skills,
+    commands: commandsService,
+    plugins,
+    syncPluginMcp,
+    pluginsEnabled: options.home !== undefined,
     ...(options.userSkillsDir !== undefined ? { userSkillsDir: options.userSkillsDir } : {}),
     ...(options.bundledSkillsDir !== undefined ? { bundledSkillsDir: options.bundledSkillsDir } : {}),
     refreshSkillProtectedRoots,
@@ -3356,17 +3692,41 @@ ${entry.description}`.toLowerCase().includes(query))
     testMcpServer,
     isDrifted: (workspaceId: string) => drifted.has(workspaceId),
     repairAudit: async (workspaceId: string) => {
+      const checkOwner = async (): Promise<string | undefined> => {
+        let raw: string
+        try {
+          raw = await fs.readFile(auditFaultFile, 'utf8')
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+          return 'audit fault cannot be read; restore readable fault metadata before retrying repair'
+        }
+        try {
+          const fault = JSON.parse(raw) as { workspaceId?: unknown } | null
+          if (typeof fault?.workspaceId !== 'string' || fault.workspaceId === '') {
+            return 'audit fault has no workspace owner; identify its invocation in the workspace execution journals and restore verified workspaceId metadata before retrying repair'
+          }
+          if (fault.workspaceId !== workspaceId) return `audit fault belongs to workspace '${fault.workspaceId}'; repair it from that workspace`
+        } catch {
+          return 'audit fault metadata is invalid; restore verified workspaceId metadata before retrying repair'
+        }
+        return undefined
+      }
+      const ownerError = await checkOwner()
+      if (ownerError !== undefined) return { ok: false as const, error: ownerError }
       // A faulted journal is reopened from disk: a transient fault (a full
       // disk, a permission since fixed) recovers once the file validates,
       // while a genuinely corrupt file still fails its checks and stays blocked.
-      if (journals.get(workspaceId)?.faulted === true) {
-        journals.delete(workspaceId)
-        try {
-          await journalFor(workspaceId)
-        } catch (error) {
-          return { ok: false as const, error: `execution journal is still faulted (${error instanceof Error ? error.message : String(error)}); repair the file before clearing the audit block` }
-        }
+      if (journals.get(workspaceId)?.faulted === true) journals.delete(workspaceId)
+      try {
+        // Also validate when an earlier open failed before it could be cached.
+        // Concurrent repairs join the same opening rather than clearing early.
+        await journalFor(workspaceId)
+      } catch (error) {
+        return { ok: false as const, error: `execution journal is still faulted (${error instanceof Error ? error.message : String(error)}); repair the file before clearing the audit block` }
       }
+      // Validation may have awaited disk I/O while another workspace faulted.
+      const currentOwnerError = await checkOwner()
+      if (currentOwnerError !== undefined) return { ok: false as const, error: currentOwnerError }
       await clearAuditFault(auditFaultFile)
       return { ok: true as const }
     },
@@ -3523,6 +3883,12 @@ interface HandlerDeps {
   readonly legacyFolderDefault: { current: string | undefined }
   readonly modes: ModesService
   readonly skills: SkillsService
+  readonly commands: CommandsService
+  readonly plugins: PluginService
+  /** Reconcile a workspace's mcp.json with its enabled plugins' servers. */
+  readonly syncPluginMcp: (workspaceId: WorkspaceId) => Promise<{ readonly notes: readonly string[] }>
+  /** False on memory-only hosts: plugins need a durable data home. */
+  readonly pluginsEnabled: boolean
   /** Read-only user skill layer (`~/.claude/skills`), for protected-root refresh. */
   readonly userSkillsDir?: string
   /** Read-only bundled skill layer, for protected-root refresh. */
@@ -3670,10 +4036,18 @@ async function skillLayers(
   let projectPath: string | undefined
   if (projectId !== undefined) projectPath = workspaces.getProject(projectId, workspaceId).path
   const layers = resolveSkillLayers(rules, { workspaceDir: skills.workspaceSkillsDir(workspaceId), ...(projectPath !== undefined ? { projectPath } : {}) })
-  // Bundled rides last: every rule layer shadows it, and it stays scannable
-  // even under a custom rule list (which never names it).
+  // Plugin skills (`plugin:skill`) never collide with plain names; a bare
+  // name reaches one only when no plain layer has it. Bundled rides last:
+  // every rule layer shadows it, and it stays scannable even under a custom
+  // rule list (which never names it).
+  const plugins = await skills.pluginLayers(workspaceId, projectId).catch(() => [] as SkillLayer[])
   const bundled = skills.bundledLayer()
-  return bundled !== undefined ? [...layers, bundled] : layers
+  // SkillService resolves first-hit wins. Keep all project/workspace rule
+  // layers above plugins and every absolute/user layer below them:
+  // project > workspace > plugin > user > bundled.
+  const local = layers.filter((layer) => layer.source !== 'user')
+  const user = layers.filter((layer) => layer.source === 'user')
+  return [...local, ...plugins, ...user, ...(bundled !== undefined ? [bundled] : [])]
 }
 
 /** Route helper: layers for an optional `?projectId=`; undefined (after a 400) when the id is unknown. */
@@ -3792,7 +4166,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: HandlerDe
     return
   }
   if (req.method === 'GET') {
-    await serveStatic(res, pathname, deps.staticDir, req.headers['accept-encoding'])
+    await serveStatic(res, pathname, deps.staticDir, req.headers['accept-encoding'], req.headers.host)
     return
   }
   res.writeHead(405, { 'content-type': 'application/json' })
@@ -4104,7 +4478,7 @@ async function handleApi(
         // Live reconciliation for the panel: event-derived state is the
         // source of truth; this snapshot corrects stale SSE-gap state.
         if (req.method === 'GET') {
-          send(200, deps.processes.snapshot(entry.session.id))
+          send(200, deps.processes.snapshot(entry.session.id).filter((row) => row.backgrounded))
           return
         }
         send(405, { error: 'method not allowed' })
@@ -5582,6 +5956,131 @@ async function handleApi(
         }
         fail(error)
       }
+      return
+    }
+
+    // ── Claude Code plugins ──────────────────────────────────
+    // Marketplaces are host-wide; plugin rows, install and enable are scoped
+    // by workspace (+ optional ?projectId for project/local scope). A
+    // memory-only host has no durable store: every plugin route refuses.
+    if (!deps.pluginsEnabled && (pathname.startsWith('/api/plugins/') || /^\/api\/workspaces\/[^/]+\/plugins(?:\/|$)/.test(pathname))) {
+      send(409, { error: 'plugins need a durable data home; this host runs in memory' })
+      return
+    }
+    if (pathname === '/api/plugins/marketplaces') {
+      if (req.method === 'GET') {
+        send(200, { marketplaces: await deps.plugins.listMarketplaces() })
+        return
+      }
+      if (req.method === 'POST') {
+        const body = await readJson(req)
+        try {
+          const source = parseMarketplaceInput(typeof body['source'] === 'string' ? body['source'] : '')
+          const added = await deps.plugins.addMarketplace(source)
+          send(201, { name: added.name, plugins: added.document.plugins.length })
+        } catch (error) {
+          if (error instanceof PluginError) { send(error.code === 'not-found' ? 404 : 400, { error: error.message }); return }
+          throw error
+        }
+        return
+      }
+      send(405, { error: 'method not allowed' })
+      return
+    }
+    const marketplaceMatch = /^\/api\/plugins\/marketplaces\/([^/]+)(\/update)?$/.exec(pathname)
+    if (marketplaceMatch !== null) {
+      const name = decodeURIComponent(marketplaceMatch[1] ?? '')
+      try {
+        if (req.method === 'POST' && marketplaceMatch[2] !== undefined) {
+          const document = await deps.plugins.updateMarketplace(name)
+          send(200, { name: document.name, plugins: document.plugins.length })
+          return
+        }
+        if (req.method === 'DELETE' && marketplaceMatch[2] === undefined) {
+          await deps.plugins.removeMarketplace(name)
+          send(200, { removed: true })
+          return
+        }
+      } catch (error) {
+        if (error instanceof PluginError) { send(error.code === 'not-found' ? 404 : 400, { error: error.message }); return }
+        throw error
+      }
+      send(405, { error: 'method not allowed' })
+      return
+    }
+    const wsPluginsMatch = /^\/api\/workspaces\/([^/]+)\/plugins(?:\/([^/]+)(?:\/(install|enable|disable|uninstall|update))?)?$/.exec(pathname)
+    if (wsPluginsMatch !== null) {
+      const wsId = decodeURIComponent(wsPluginsMatch[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, false)
+      const rawProject = query.get('projectId')
+      const projectId = rawProject !== null && rawProject !== '' ? rawProject as ProjectId : undefined
+      if (projectId !== undefined) {
+        try { deps.workspaces.getProject(projectId, wsId) } catch { send(400, { error: 'unknown projectId' }); return }
+      }
+      const context = { workspaceId: wsId, ...(projectId !== undefined ? { projectId } : {}) }
+      const pluginId = wsPluginsMatch[2] !== undefined ? decodeURIComponent(wsPluginsMatch[2]) : undefined
+      const action = wsPluginsMatch[3]
+      if (req.method === 'GET' && pluginId === undefined) {
+        send(200, await deps.plugins.list(context))
+        return
+      }
+      if (req.method === 'POST' && pluginId !== undefined && action !== undefined) {
+        requireWorkspace(deps, wsId, true)
+        const body = await readJson(req)
+        const scope = body['scope'] === 'project' || body['scope'] === 'local' || body['scope'] === 'user' ? body['scope'] : 'workspace'
+        try {
+          if (action === 'install') await deps.plugins.install(pluginId, scope, context)
+          else if (action === 'enable') await deps.plugins.setEnabled(pluginId, scope, context, true)
+          else if (action === 'disable') await deps.plugins.setEnabled(pluginId, scope, context, false)
+          else if (action === 'uninstall') await deps.plugins.uninstall(pluginId, scope, context)
+          else await deps.plugins.update(pluginId)
+        } catch (error) {
+          if (error instanceof PluginError) { send(error.code === 'not-found' ? 404 : error.code === 'unsupported' ? 422 : 400, { error: error.message }); return }
+          throw error
+        }
+        // Hooks, commands and skills follow on the next read; hooks are a
+        // per-conversation snapshot, so a plugin change re-reads them now
+        // (an explicit user action, like saving hooks in Settings).
+        deps.hookHost.invalidateWorkspace(wsId)
+        const synced = await deps.syncPluginMcp(wsId).catch((error: unknown) => ({ notes: [`MCP sync failed: ${String(error instanceof Error ? error.message : error)}`] }))
+        send(200, { ok: true, ...(synced.notes.length > 0 ? { notes: synced.notes } : {}), ...(await deps.plugins.list(context)) })
+        return
+      }
+      send(405, { error: 'method not allowed' })
+      return
+    }
+
+    // Claude Code custom slash commands (the `/` menu's file commands).
+    const wsCommandsMatch = /^\/api\/workspaces\/([^/]+)\/commands$/.exec(pathname)
+    if (wsCommandsMatch !== null) {
+      const wsId = decodeURIComponent(wsCommandsMatch[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, false)
+      if (req.method !== 'GET') {
+        send(405, { error: 'method not allowed' })
+        return
+      }
+      const rawProject = query.get('projectId')
+      const projectId = rawProject !== null && rawProject !== '' ? rawProject as ProjectId : undefined
+      if (projectId !== undefined) {
+        try { deps.workspaces.getProject(projectId, wsId) } catch { send(400, { error: 'unknown projectId' }); return }
+      }
+      const { rows, errors } = await deps.commands.catalog(wsId, projectId)
+      send(200, {
+        commands: rows.map((row) => ({
+          name: row.name,
+          description: row.description,
+          source: row.source,
+          path: row.path,
+          ...(row.argumentHint !== undefined ? { argumentHint: row.argumentHint } : {}),
+          ...(row.allowedTools.length > 0 ? { allowedTools: row.allowedTools } : {}),
+          ...(row.model !== undefined ? { model: row.model } : {}),
+          ...(row.disableModelInvocation ? { disableModelInvocation: true } : {}),
+          ...(!row.userInvocable ? { userInvocable: false } : {}),
+          ...(row.plugin !== undefined ? { plugin: row.plugin.id } : {}),
+          ...(row.notes !== undefined ? { notes: row.notes } : {}),
+        })),
+        errors,
+      })
       return
     }
 
@@ -7292,6 +7791,7 @@ async function submitMessage(
   // (idle, nothing blocking dispatch) or waits behind one. The stamp lets the
   // UI render a sent message right away instead of a queued row.
   const runsNow = !entry.agent.busy
+    && !deps.childExecutor.delegationPending(entry.session.id)
     && entry.closed !== true
     && !deps.compactionPending(entry.session.id)
     && !deps.kernel.ctx.llm.sessionUncertain(entry.session.id)
@@ -7318,7 +7818,7 @@ async function submitMessage(
   if (deps.compactionPending(entry.session.id)) {
     return { ok: true, status: 202, body: { inputId, queued: true, delivery, dispatchBlocked: 'maintenance' } }
   }
-  const wasBusy = entry.agent.busy
+  const wasBusy = entry.agent.busy || deps.childExecutor.delegationPending(entry.session.id)
   if (!await dispatchInbox(entry, deps, delivery)) {
     // Acceptance is already durable: acknowledge it so callers do not resend
     // the message. Only dispatch is blocked; /steer can resume the queue later.
@@ -7452,10 +7952,13 @@ async function dispatchInbox(entry: SessionEntry, deps: HandlerDeps, delivery: '
   if (!entry.agent.busy) {
     // Fire-and-forget: the reply (and any failure, which closes the turn
     // durably) reaches the client through the SSE stream.
-    void entry.agent.run().catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error)
-      console.error(`web: agent run failed for ${entry.session.id}: ${message}`)
-      deps.kernel.ctx.emit('web/turn-error', { sessionId: entry.session.id, message })
+    await deps.childExecutor.admitConversation(entry.session.id, () => {
+      if (entry.closed || deps.compactionPending(entry.session.id)) return
+      void entry.agent.run().catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error)
+        console.error(`web: agent run failed for ${entry.session.id}: ${message}`)
+        deps.kernel.ctx.emit('web/turn-error', { sessionId: entry.session.id, message })
+      })
     })
     return true
   }
@@ -8468,9 +8971,41 @@ async function serveProjectMedia(root: string, rawPath: string, req: IncomingMes
 /** Hashed asset paths are safe to cache forever; everything else revalidates per request. */
 const IMMUTABLE_ASSET_PATH = /^\/assets\//
 
+/**
+ * The host an install should be labelled with, so the same app served from several
+ * domains stays distinguishable in the OS window list and launcher. Loopback hosts
+ * keep the plain name: there is only one of them per machine.
+ */
+function installLabel(hostHeader: string | undefined): string | undefined {
+  const hostname = requestHostname(hostHeader)
+  if (hostname === undefined || hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') return undefined
+  return hostname
+}
+
+/** Host first: taskbars truncate the tail, and the host is the part that differs. */
+function manifestWithHost(manifest: Record<string, unknown>, host: string): Record<string, unknown> {
+  return { ...manifest, name: `${host} · dnt-harness`, short_name: host }
+}
+
+function brandManifest(content: Buffer, host: string): Buffer {
+  try {
+    return Buffer.from(JSON.stringify(manifestWithHost(JSON.parse(content.toString('utf8')) as Record<string, unknown>, host)))
+  } catch {
+    return content
+  }
+}
+
+function brandShell(content: Buffer, host: string): Buffer {
+  const label = `${host} · dnt-harness`.replace(/[&<>"]/g, (c) => `&#${c.charCodeAt(0)};`)
+  return Buffer.from(content.toString('utf8')
+    .replace('<title>dnt-harness</title>', () => `<title>${label}</title>`)
+    .replace('name="apple-mobile-web-app-title" content="dnt-harness"', () => `name="apple-mobile-web-app-title" content="${label}"`))
+}
+
 /** Serve the built client: `/` (and unknown paths) fall back to index.html for the router. */
-async function serveStatic(res: ServerResponse, pathname: string, staticDir: string, acceptEncoding: string | undefined): Promise<void> {
+async function serveStatic(res: ServerResponse, pathname: string, staticDir: string, acceptEncoding: string | undefined, hostHeader?: string): Promise<void> {
   const relative = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '')
+  const host = installLabel(hostHeader)
   const abs = path.resolve(staticDir, relative)
   if (abs !== path.resolve(staticDir) && !abs.startsWith(`${path.resolve(staticDir)}${path.sep}`)) {
     res.writeHead(403, { 'content-type': 'application/json' })
@@ -8479,7 +9014,11 @@ async function serveStatic(res: ServerResponse, pathname: string, staticDir: str
   }
   // Precompressed twins (.br/.gz, emitted at build time) stream as-is when the
   // client's Accept-Encoding allows: no per-request compression on the hot path.
-  const encoding = acceptEncoding !== undefined && acceptEncoding.includes('br')
+  // The manifest and the shell are rewritten per host below, so they never use a precompressed twin.
+  const hostScoped = host !== undefined && (relative === 'manifest.webmanifest' || relative === 'index.html')
+  const encoding = hostScoped
+    ? undefined
+    : acceptEncoding !== undefined && acceptEncoding.includes('br')
     ? { extension: '.br', name: 'br' }
     : acceptEncoding !== undefined && acceptEncoding.includes('gzip')
       ? { extension: '.gz', name: 'gzip' }
@@ -8499,6 +9038,7 @@ async function serveStatic(res: ServerResponse, pathname: string, staticDir: str
     } else {
       content = await fs.readFile(abs)
     }
+    if (host !== undefined && hostScoped) content = relative === 'index.html' ? brandShell(content, host) : brandManifest(content, host)
     // The shell and the service worker must revalidate so a rebuilt client takes over promptly.
     const revalidate = relative === 'index.html' || relative === 'sw.js'
     headers['content-type'] = CONTENT_TYPES[path.extname(abs)] ?? 'application/octet-stream'
@@ -8511,7 +9051,7 @@ async function serveStatic(res: ServerResponse, pathname: string, staticDir: str
     try {
       const shell = await fs.readFile(path.join(staticDir, 'index.html'))
       res.writeHead(200, { 'content-type': CONTENT_TYPES['.html'] ?? 'text/html', 'cache-control': 'no-cache' })
-      res.end(shell)
+      res.end(host === undefined ? shell : brandShell(shell, host))
     } catch {
       res.writeHead(404, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ error: 'client not built; run npm run build:web' }))

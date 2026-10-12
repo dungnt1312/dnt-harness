@@ -579,7 +579,7 @@ describe('settings dialog', () => {
   it('gives every section tab an icon', async () => {
     await render()
     const sections = [...document.body.querySelectorAll('[aria-label="Settings sections"] [role="tab"]')]
-    expect(sections).toHaveLength(11)
+    expect(sections).toHaveLength(12)
     const sub = [...document.body.querySelectorAll('[aria-label="Providers & Models"] [role="tab"]')]
     expect(sub.map((tab) => tab.textContent)).toEqual(['Providers', 'Model aliases', 'Images'])
     for (const tab of [...sections, ...sub]) expect(tab.querySelector('svg')).not.toBeNull()
@@ -616,6 +616,37 @@ describe('settings dialog', () => {
     expect(document.body.querySelector('input[aria-label="Image understanding model"]')).toBeNull()
     expect(button('Image model')).toBeTruthy()
     expect(button('Image understanding model')).toBeTruthy()
+  })
+
+  it('loads image models live from the provider, grouping image-named models first', async () => {
+    vi.mocked(getImageGenerationSettings).mockResolvedValueOnce({ provider: 'p1', model: null })
+    vi.mocked(fetchProviderModels).mockResolvedValue({ ok: true, models: ['gpt-6-sol', 'gpt-image-2', 'dall-e-3'] })
+    await render()
+    const images = [...document.body.querySelectorAll<HTMLElement>('[aria-label="Providers & Models"] [role="tab"]')].find((node) => node.textContent === 'Images')!
+    await act(async () => images.click())
+    await settle(); await settle()
+
+    expect(fetchProviderModels).toHaveBeenCalledWith('p1')
+    await act(async () => { button('Image model').dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0 })); button('Image model').click() })
+    const optionLabels = [...document.body.querySelectorAll('[role="listbox"][aria-label="Image model"] [role="option"]')].map((node) => node.textContent)
+    expect(optionLabels).toEqual(['Select model', 'gpt-image-2', 'dall-e-3', 'gpt-6-sol', 'Enter model ID manually…'])
+    vi.mocked(fetchProviderModels).mockResolvedValue({ ok: true, models: ['auto', 'fresh-1'] })
+  })
+
+  it('falls back to a typed image model ID when the provider model list cannot load', async () => {
+    vi.mocked(getImageGenerationSettings).mockResolvedValueOnce({ provider: 'p1', model: null })
+    vi.mocked(fetchProviderModels).mockRejectedValueOnce(new Error('HTTP 502'))
+    await render()
+    const images = [...document.body.querySelectorAll<HTMLElement>('[aria-label="Providers & Models"] [role="tab"]')].find((node) => node.textContent === 'Images')!
+    await act(async () => images.click())
+    await settle(); await settle()
+
+    const field = document.body.querySelector<HTMLInputElement>('input[aria-label="Image model"]')
+    expect(field).not.toBeNull()
+    expect(document.body.textContent).toContain('Could not load models from the provider (HTTP 502)')
+    await act(async () => type(field!, 'gpt-image-1'))
+    const save = buttons().find((node) => node.textContent === 'Save' && node.closest('[aria-label="Image generation"]') !== null)!
+    expect(save.disabled).toBe(false)
   })
 
   it('states the provider name once, as the editable title, with enablement as state plus a verb', async () => {

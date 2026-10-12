@@ -79,7 +79,14 @@ export async function dispatchToolCall(input: DispatchInput, auditFaultFile: str
     const notSent = error instanceof McpDispatchError && error.receipt.kind === 'not_dispatched'
     const outcome: ToolOutcome = notSent ? 'error' : 'indeterminate'
     const detail = error instanceof Error ? error.message : String(error)
-    await finish(input, auditFaultFile, outcome, detail)
+    const persisted = await finish(input, auditFaultFile, outcome, detail)
+    if (!persisted) {
+      return {
+        outcome: 'audit_fault',
+        output: `${detail}\n\nThe execution record could not be stored. Further MCP calls are blocked until that record is repaired.`,
+        invocationId: input.intent.invocationId,
+      }
+    }
     return { outcome, output: detail, invocationId: input.intent.invocationId }
   }
   const outcome: ToolOutcome = call.isError ? 'error' : 'success'
@@ -108,6 +115,7 @@ async function finish(input: DispatchInput, auditFaultFile: string, outcome: Too
     await fs.mkdir(pathDir(auditFaultFile), { recursive: true }).catch(() => undefined)
     await fs.writeFile(auditFaultFile, JSON.stringify({
       invocationId: input.intent.invocationId,
+      workspaceId: input.intent.workspaceId,
       outcome,
       message: error instanceof Error ? error.message : String(error),
     }), 'utf8').catch(() => undefined)

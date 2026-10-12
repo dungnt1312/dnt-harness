@@ -1,5 +1,5 @@
 import type { AttachmentRef } from './composer-draft.ts'
-import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, HooksSectionRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelAliasInput, ModelAliasRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillFileRow, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, UsageDailyResponse, UserQuestionAnswer, WorkspaceMeta, WorkspaceRow } from './types.ts'
+import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, CommandRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, HooksSectionRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelAliasInput, ModelAliasRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillFileRow, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, UsageDailyResponse, UserQuestionAnswer, WorkspaceMeta, WorkspaceRow } from './types.ts'
 
 const CSRF_HEADER = 'x-dnt-harness-csrf'
 let csrfToken: string | undefined
@@ -957,6 +957,70 @@ export function compactSession(workspaceId: string, sessionId: string): Promise<
 }
 
 // ── G3 skills ───────────────────────────────────────────────────────────────
+
+// ── Claude Code plugins ─────────────────────────────────────────────────────
+
+export type PluginScope = 'workspace' | 'project' | 'local' | 'user'
+
+export interface PluginRowView {
+  readonly id: string
+  readonly name: string
+  readonly marketplace: string
+  readonly description?: string
+  readonly version?: string
+  readonly installed: boolean
+  readonly installedScopes: readonly PluginScope[]
+  readonly enabled?: { readonly value: boolean; readonly scope: PluginScope }
+  readonly active: boolean
+  readonly components?: { readonly commands: number; readonly skills: number; readonly agents: number; readonly hooks: boolean; readonly mcpServers: readonly string[] }
+  readonly notes?: readonly string[]
+  readonly error?: string
+}
+
+export interface MarketplaceView {
+  readonly name: string
+  readonly source: { readonly source: string; readonly repo?: string; readonly url?: string; readonly path?: string }
+  readonly lastUpdated: string
+  readonly document?: { readonly name: string; readonly description?: string; readonly plugins: readonly { readonly name: string; readonly description?: string; readonly version?: string; readonly category?: string; readonly author?: string }[] }
+  readonly error?: string
+}
+
+const pluginQuery = (projectId?: string): string => (projectId !== undefined ? `?projectId=${encodeURIComponent(projectId)}` : '')
+
+export function listPlugins(workspaceId: string, projectId?: string): Promise<{ readonly plugins: readonly PluginRowView[]; readonly suggestedMarketplaces: Readonly<Record<string, unknown>> }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/plugins${pluginQuery(projectId)}`).then((r) => json<{ plugins: PluginRowView[]; suggestedMarketplaces: Record<string, unknown> }>(r))
+}
+
+export function pluginAction(workspaceId: string, pluginId: string, action: 'install' | 'enable' | 'disable' | 'uninstall' | 'update', scope: PluginScope, projectId?: string): Promise<{ readonly plugins: readonly PluginRowView[]; readonly notes?: readonly string[] }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/plugins/${encodeURIComponent(pluginId)}/${action}${pluginQuery(projectId)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ scope }),
+  }).then((r) => json<{ plugins: PluginRowView[]; notes?: string[] }>(r))
+}
+
+export function listMarketplaces(): Promise<{ readonly marketplaces: readonly MarketplaceView[] }> {
+  return apiFetch('/api/plugins/marketplaces').then((r) => json<{ marketplaces: MarketplaceView[] }>(r))
+}
+
+export function addMarketplace(source: string): Promise<{ readonly name: string; readonly plugins: number }> {
+  return apiFetch('/api/plugins/marketplaces', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ source }) })
+    .then((r) => json<{ name: string; plugins: number }>(r))
+}
+
+export function updateMarketplace(name: string): Promise<{ readonly name: string; readonly plugins: number }> {
+  return apiFetch(`/api/plugins/marketplaces/${encodeURIComponent(name)}/update`, { method: 'POST' }).then((r) => json<{ name: string; plugins: number }>(r))
+}
+
+export function removeMarketplace(name: string): Promise<{ readonly removed: boolean }> {
+  return apiFetch(`/api/plugins/marketplaces/${encodeURIComponent(name)}`, { method: 'DELETE' }).then((r) => json<{ removed: boolean }>(r))
+}
+
+/** Claude Code custom slash commands across the user/plugin/workspace/project layers. */
+export function listCommands(workspaceId: string, projectId?: string): Promise<{ readonly commands: readonly CommandRow[]; readonly errors: readonly { path: string; message: string }[] }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/commands${projectId !== undefined ? `?projectId=${encodeURIComponent(projectId)}` : ''}`)
+    .then((r) => json<{ commands: CommandRow[]; errors: { path: string; message: string }[] }>(r))
+}
 
 export function listSkills(workspaceId: string, projectId?: string): Promise<SkillRow[]> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills${projectId !== undefined ? `?projectId=${encodeURIComponent(projectId)}` : ''}`).then((r) => json<SkillRow[]>(r))

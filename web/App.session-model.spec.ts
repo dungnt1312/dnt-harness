@@ -14,6 +14,28 @@ describe('composer skill catalog scope', () => {
     await expect(composerSkillRows(list, 'ws-1', 'project-1')).resolves.toMatchObject([{ name: 'ws-1:project-1' }])
     await expect(composerSkillRows(list, 'ws-1', null)).resolves.toMatchObject([{ name: 'ws-1:workspace' }])
   })
+
+  it('lets a skill shadow a same-named command (Claude loads skills first) and drops non-user-invocable rows', async () => {
+    const skillsList = async () => [
+      { name: 'review', title: 'review', description: 'skill', source: 'workspace' as const, hash: 'h' },
+      { name: 'quiet', title: 'quiet', description: '', source: 'workspace' as const, hash: 'h', userInvocable: false as const },
+      { name: 'lint', title: 'lint', description: 'lint', source: 'user' as const, hash: 'h' },
+    ]
+    const commands = async () => ({ commands: [
+      { name: 'review', description: 'command', source: 'project' as const, path: '/p', argumentHint: '<pr>' },
+      { name: 'git:commit', description: 'commit', source: 'user' as const, path: '/u' },
+      { name: 'hidden', description: '', source: 'user' as const, path: '/h', userInvocable: false as const },
+    ] })
+    const rows = await composerSkillRows(skillsList, 'ws', null, commands)
+    expect(rows.map((row) => [row.name, row.description, row.argumentHint])).toEqual([
+      ['git:commit', 'commit', undefined],
+      ['review', 'skill', undefined],
+      ['lint', 'lint', undefined],
+    ])
+    // A failing commands route only drops the commands.
+    const fallback = await composerSkillRows(skillsList, 'ws', null, async () => { throw new Error('down') })
+    expect(fallback.map((row) => row.name)).toEqual(['review', 'lint'])
+  })
 })
 
 describe('per-session model cache coordination', () => {

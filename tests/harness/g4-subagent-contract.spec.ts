@@ -771,7 +771,8 @@ describe('lifecycle boundary', () => {
     await harness.kernel.ctx.sessions.delete(harness.rootSessionId as never)
     expect(await harness.executor.childrenOfRoot(harness.rootSessionId as never)).toEqual([])
     expect(await harness.executor.childrenOfRoot(harness.rootSessionId as never, harness.workspaceId as never)).toEqual([])
-    await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)
+    expect(await harness.executor.cancelAllOfRoot(harness.rootSessionId as never)).toBe(1)
+    expect(harness.executor.runningChildrenOfRoot(harness.rootSessionId as never)).toEqual([])
     await harness.kernel.stop()
   }, 15_000)
 

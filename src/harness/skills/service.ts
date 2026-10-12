@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
-import { SKILL_NAME_PATTERN, SkillError, assertSkillName, assertWritableSkillName, defaultSkillRules, validateSkillRules, validateSkillRulesForWrite, type SkillLayer, type SkillRule, type SkillSource } from './layers.ts'
+import { frontmatterBoolean, hintText, parseCommand, splitFrontmatter, type CommandDefinition } from '../commands/catalog.ts'
+import { SKILL_NAME_PATTERN, SkillError, skillFolderIn, assertSkillName, assertWritableSkillName, defaultSkillRules, validateSkillRules, validateSkillRulesForWrite, type SkillLayer, type SkillRule, type SkillSource } from './layers.ts'
 
 export { SkillError } from './layers.ts'
 export type { SkillSource } from './layers.ts'
@@ -17,6 +18,12 @@ export interface SkillEntry {
   readonly ruleId?: string
   /** sha256 of the raw SKILL.md. */
   readonly hash: string
+  /** Claude `disable-model-invocation: true`: only the user can run it (`/name`). */
+  readonly disableModelInvocation?: true
+  /** Claude `user-invocable: false`: hidden from the `/` menu, the model may still load it. */
+  readonly userInvocable?: false
+  /** Claude `argument-hint`, shown in the `/` menu. */
+  readonly argumentHint?: string
 }
 
 export interface LoadedSkill extends SkillEntry {
@@ -55,6 +62,17 @@ export class SkillsService {
   /** The workspace layer's folder, for callers that resolve rule layers. */
   workspaceSkillsDir(workspaceId: string): string {
     return this.dir(workspaceId)
+  }
+
+  /** Plugin skill layers for a workspace/project (set by the host when plugins are wired). */
+  private pluginLayerSource: ((workspaceId: string, projectId: string | undefined) => Promise<SkillLayer[]>) | undefined
+
+  setPluginLayers(source: (workspaceId: string, projectId: string | undefined) => Promise<SkillLayer[]>): void {
+    this.pluginLayerSource = source
+  }
+
+  async pluginLayers(workspaceId: string, projectId: string | undefined): Promise<SkillLayer[]> {
+    return this.pluginLayerSource?.(workspaceId, projectId) ?? []
   }
 
   /** The bundled layer's scan root, when the service was built with one. */
@@ -120,24 +138,34 @@ export class SkillsService {
   async listIn(layers: readonly SkillLayer[]): Promise<SkillEntry[]> {
     const rows = new Map<string, SkillEntry>()
     for (const layer of layers) {
-      let entries
-      try {
-        entries = await fs.readdir(layer.base, { withFileTypes: true })
-      } catch {
-        continue
+      let entries: { readonly name: string; readonly folder: string }[]
+      if (layer.single === true) {
+        entries = [{ name: path.basename(layer.base), folder: layer.base }]
+      } else {
+        try {
+          entries = (await fs.readdir(layer.base, { withFileTypes: true }))
+            .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+            .map((entry) => ({ name: entry.name, folder: path.join(layer.base, entry.name) }))
+        } catch {
+          continue
+        }
       }
       await Promise.all(entries.map(async (entry) => {
-        if (!entry.isDirectory() && !entry.isSymbolicLink()) return
-        if (!SKILL_NAME_PATTERN.test(entry.name) || rows.has(entry.name)) return
-        const head = await this.readHead(path.join(layer.base, entry.name, 'SKILL.md'))
+        if (!SKILL_NAME_PATTERN.test(entry.name)) return
+        const name = layer.prefix !== undefined ? `${layer.prefix}:${entry.name}` : entry.name
+        if (rows.has(name)) return
+        const head = await this.readHead(path.join(entry.folder, 'SKILL.md'))
         if (head === undefined) return // missing or invalid: surfaced on load, not served
-        rows.set(entry.name, {
-          name: entry.name,
+        rows.set(name, {
+          name,
           title: head.title ?? entry.name,
           description: head.description ?? '',
           source: layer.source,
           ...(layer.ruleId !== undefined ? { ruleId: layer.ruleId } : {}),
           hash: head.hash,
+          ...(head.disableModelInvocation === true ? { disableModelInvocation: true as const } : {}),
+          ...(head.userInvocable === false ? { userInvocable: false as const } : {}),
+          ...(head.argumentHint !== undefined ? { argumentHint: head.argumentHint } : {}),
         })
       }))
     }
@@ -157,9 +185,19 @@ export class SkillsService {
     if (cached !== undefined && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.head
     const raw = await fs.readFile(file, 'utf8').catch(() => undefined)
     const parsed = raw !== undefined ? parseSkill(raw) : undefined
-    const head: SkillHead | undefined = raw !== undefined && parsed !== undefined
-      ? { ...(parsed.title !== undefined ? { title: parsed.title } : {}), ...(parsed.description !== undefined ? { description: parsed.description } : {}), hash: sha256(raw) }
-      : undefined
+    let head: SkillHead | undefined
+    if (raw !== undefined && parsed !== undefined) {
+      const { frontmatter } = splitFrontmatter(raw)
+      const hint = hintText(frontmatter['argument-hint'])
+      head = {
+        ...(parsed.title !== undefined ? { title: parsed.title } : {}),
+        ...(parsed.description !== undefined ? { description: parsed.description } : {}),
+        hash: sha256(raw),
+        ...(frontmatterBoolean(frontmatter['disable-model-invocation']) === true ? { disableModelInvocation: true } : {}),
+        ...(frontmatterBoolean(frontmatter['user-invocable']) === false ? { userInvocable: false } : {}),
+        ...(hint !== undefined ? { argumentHint: hint } : {}),
+      }
+    }
     if (this.headCache.size > 2_000) this.headCache.clear()
     this.headCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, head })
     return head
@@ -173,21 +211,24 @@ export class SkillsService {
   /** Layer-aware load; the first layer holding the name wins. */
   async loadIn(layers: readonly SkillLayer[], name: string): Promise<LoadedSkill> {
     assertSkillName(name)
-    for (const layer of layers) {
-      const raw = await fs.readFile(path.join(layer.base, name, 'SKILL.md'), 'utf8').catch(() => undefined)
-      if (raw === undefined) continue
-      const parsed = parseSkill(raw)
-      if (parsed === undefined) {
-        throw new SkillError('invalid', `skill '${name}' has invalid frontmatter; fix SKILL.md before loading`)
+    const resolved = await this.resolveName(layers, name)
+    if (resolved !== undefined) {
+      const { layer, folder, qualified } = resolved
+      const raw = await fs.readFile(path.join(folder, 'SKILL.md'), 'utf8').catch(() => undefined)
+      const parsed = raw !== undefined ? parseSkill(raw) : undefined
+      if (raw !== undefined && parsed === undefined) {
+        throw new SkillError('invalid', `skill '${qualified}' has invalid frontmatter; fix SKILL.md before loading`)
       }
-      return {
-        name,
-        title: parsed.title ?? name,
-        description: parsed.description ?? '',
-        source: layer.source,
-        ...(layer.ruleId !== undefined ? { ruleId: layer.ruleId } : {}),
-        hash: sha256(raw),
-        instructions: parsed.body,
+      if (raw !== undefined && parsed !== undefined) {
+        return {
+          name: qualified,
+          title: parsed.title ?? qualified,
+          description: parsed.description ?? '',
+          source: layer.source,
+          ...(layer.ruleId !== undefined ? { ruleId: layer.ruleId } : {}),
+          hash: sha256(raw),
+          instructions: parsed.body,
+        }
       }
     }
     throw new SkillError('not-found', `no skill '${name}'`)
@@ -198,11 +239,61 @@ export class SkillsService {
   // layer is the first layer holding <base>/<name>/SKILL.md — the same
   // first-hit rule the catalog row used, so the tree shows what that row is.
 
-  /** The first layer holding `<base>/<name>/SKILL.md`, or undefined. */
+  /**
+   * A skill as a Claude command (`/name`, or a `Skill` load with arguments):
+   * the full frontmatter (allowed-tools, model, arguments, …) and its real
+   * folder for `Base directory for this skill`. Undefined when no layer has it.
+   */
+  async commandIn(layers: readonly SkillLayer[], name: string): Promise<CommandDefinition | undefined> {
+    const resolved = await this.resolveName(layers, name)
+    if (resolved === undefined) return undefined
+    const { layer, folder, qualified } = resolved
+    const file = path.join(folder, 'SKILL.md')
+    const raw = await fs.readFile(file, 'utf8').catch(() => undefined)
+    if (raw === undefined) return undefined
+    if (parseSkill(raw) === undefined) throw new SkillError('invalid', `skill '${qualified}' has invalid frontmatter; fix SKILL.md before loading`)
+    const dir = await fs.realpath(folder).catch(() => folder)
+    const plugin = layer.plugin
+    return parseCommand(qualified, raw, {
+      source: layer.source,
+      path: file,
+      skillDir: dir,
+      ...(plugin !== undefined ? { plugin } : {}),
+    })
+  }
+
+  /**
+   * A name → its owning layer and folder. Exact names first (first layer
+   * wins); then, as Claude resolves a bare plugin skill name, a unique
+   * `plugin:<name>` when no plain layer has `<name>`.
+   */
+  async resolveName(layers: readonly SkillLayer[], name: string): Promise<{ readonly layer: SkillLayer; readonly folder: string; readonly qualified: string } | undefined> {
+    for (const layer of layers) {
+      const folder = skillFolderIn(layer, name)
+      if (folder === undefined) continue
+      const stat = await fs.stat(path.join(folder, 'SKILL.md')).catch(() => undefined)
+      if (stat !== undefined && stat.isFile()) return { layer, folder, qualified: layer.prefix !== undefined ? `${layer.prefix}:${name.slice(name.indexOf(':') + 1)}` : name }
+    }
+    if (!SKILL_NAME_PATTERN.test(name)) return undefined
+    const found: { layer: SkillLayer; folder: string; qualified: string }[] = []
+    for (const layer of layers) {
+      if (layer.prefix === undefined) continue
+      const qualified = `${layer.prefix}:${name}`
+      const folder = skillFolderIn(layer, qualified)
+      if (folder === undefined) continue
+      const stat = await fs.stat(path.join(folder, 'SKILL.md')).catch(() => undefined)
+      if (stat !== undefined && stat.isFile() && !found.some((item) => item.qualified === qualified)) found.push({ layer, folder, qualified })
+    }
+    return found.length === 1 ? found[0] : undefined
+  }
+
+  /** The first layer holding the skill, or undefined. */
   async ownerLayer(layers: readonly SkillLayer[], name: string): Promise<SkillLayer | undefined> {
     assertSkillName(name)
     for (const layer of layers) {
-      const stat = await fs.stat(path.join(layer.base, name, 'SKILL.md')).catch(() => undefined)
+      const folder = skillFolderIn(layer, name)
+      if (folder === undefined) continue
+      const stat = await fs.stat(path.join(folder, 'SKILL.md')).catch(() => undefined)
       if (stat !== undefined && stat.isFile()) return layer
     }
     return undefined
@@ -211,8 +302,9 @@ export class SkillsService {
   /** The owning skill folder, as a REAL path (symlinks resolved once, here). */
   private async owningSkillDir(layers: readonly SkillLayer[], name: string): Promise<string> {
     const owner = await this.ownerLayer(layers, name)
-    if (owner === undefined) throw new SkillError('not-found', `no skill '${name}'`)
-    return await fs.realpath(path.join(owner.base, name))
+    const folder = owner !== undefined ? skillFolderIn(owner, name) : undefined
+    if (folder === undefined) throw new SkillError('not-found', `no skill '${name}'`)
+    return await fs.realpath(folder)
   }
 
   /** Every file inside one skill's folder (recursive, `/`-separated, SKILL.md first). */
@@ -374,6 +466,9 @@ interface SkillHead {
   readonly title?: string
   readonly description?: string
   readonly hash: string
+  readonly disableModelInvocation?: boolean
+  readonly userInvocable?: boolean
+  readonly argumentHint?: string
 }
 
 export interface ParsedSkill {

@@ -9,6 +9,36 @@ import { DataHomeLock } from '../../src/harness/mcp/ownership-lock.ts'
 const stdioFixture = fileURLToPath(new URL('../fixtures/mcp-stdio-server.mjs', import.meta.url))
 
 describe('mcp execution journal', () => {
+  it.each([false, true])('reports audit_fault when an exception terminal cannot be stored (notSent=%s)', async (notSent) => {
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-fault-'))
+    const fault = path.join(home, 'audit-fault.json')
+    try {
+      let writes = 0
+      const journal = new McpExecutionJournal(path.join(home, 'executions.jsonl'), async () => {
+        if (++writes > 1) throw new Error('disk full')
+      })
+      await journal.open()
+      let calls = 0
+      const input = {
+        journal, intent: intent('exception-fault'),
+        call: async () => {
+          calls += 1
+          throw new McpDispatchError('transport failed', receiptForTransportFailure(!notSent, notSent ? 'not_connected' : 'response_lost'))
+        },
+      }
+      const result = await dispatchToolCall(input, fault)
+      expect(result.outcome).toBe('audit_fault')
+      expect(result.output).toContain('transport failed')
+      expect(result.output).toContain('execution record could not be stored')
+      await expect(dispatchToolCall(input, fault)).rejects.toBeInstanceOf(AuditFaultBlock)
+      await clearAuditFault(fault)
+      expect((await dispatchToolCall(input, fault)).outcome).toBe('indeterminate')
+      expect(calls).toBe(1)
+    } finally {
+      await fs.rm(home, { recursive: true, force: true })
+    }
+  })
+
   it('records one intent and does not dispatch an unresolved invocation again', async () => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-journal-'))
     const file = path.join(home, 'executions.jsonl')
@@ -166,6 +196,7 @@ describe('journal faults fail closed', () => {
       }, fault)
       expect(result.outcome).toBe('audit_fault')
       expect(calls).toBe(1)
+      expect(JSON.parse(await fs.readFile(fault, 'utf8'))).toMatchObject({ workspaceId: intent('perm-4').workspaceId, invocationId: 'perm-4' })
       await expect(faultIsOpen(fault)).resolves.toBe(true)
       await expect(dispatchToolCall({ journal, intent: intent('perm-5'), call: async () => { calls += 1; return { text: 'no', isError: false } } }, fault))
         .rejects.toBeInstanceOf(AuditFaultBlock)

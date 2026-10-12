@@ -2,7 +2,7 @@
 import { afterEach, expect, it } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
-import { DocumentTitle } from './DocumentTitle.tsx'
+import { DocumentTitle, documentTitle } from './DocumentTitle.tsx'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 let root: Root | undefined
@@ -34,4 +34,10 @@ it('tracks the opened profile and its renamed title, falling back while none is 
   expect(document.title).toBe('Renamed Work')
   await render(undefined)
   expect(document.title).toBe('dnt-harness')
+})
+
+it('puts the host first on a non-loopback domain so installs on different domains stay distinguishable', () => {
+  expect(documentTitle(undefined, 'harness.example.com')).toBe('harness.example.com · dnt-harness')
+  expect(documentTitle('Work', 'harness.example.com')).toBe('harness.example.com · Work')
+  expect(documentTitle('Work', undefined)).toBe('Work')
 })

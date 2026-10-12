@@ -56,10 +56,10 @@ describe('completionAt', () => {
 })
 
 describe('skillCompletionItem', () => {
-  it('returns a command segment with the existing wire text', () => {
+  it('returns a command segment whose leading wire text is /name', () => {
     expect(skillCompletionItem({ name: 'review', description: 'Check a diff' })).toEqual({
       id: 'skill:review',
-      insert: 'Use the review skill:',
+      insert: '/review',
       segment: { kind: 'command', name: 'review' },
       label: 'review',
       detail: 'Check a diff',

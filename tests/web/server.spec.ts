@@ -3,6 +3,7 @@
  * live events), and the approval bridge routing questions to the right
  * session through the ambient agent scope.
  */
+import http from 'node:http'
 import { promises as fs } from 'node:fs'
 import { brotliCompressSync } from 'node:zlib'
 import { homedir, tmpdir } from 'node:os'
@@ -954,6 +955,37 @@ describe('folder picker directory browsing', () => {
     const body = (await res.json()) as { path: string; parent: string | null; dirs: unknown[] }
     expect(body.path).toBe(path.resolve(homedir()))
     expect(Array.isArray(body.dirs)).toBe(true)
+  })
+})
+
+describe('static PWA files per host', () => {
+  it('names the install after the requested domain, but keeps loopback plain', async () => {
+    const staticDir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-static-host-'))
+    try {
+      await fs.writeFile(path.join(staticDir, 'index.html'), '<title>dnt-harness</title><meta name="apple-mobile-web-app-title" content="dnt-harness" />')
+      await fs.writeFile(path.join(staticDir, 'manifest.webmanifest'), '{"name":"dnt-harness","short_name":"dnt-harness","id":"/"}')
+      await start([], undefined, { staticDir, allowedHosts: ['harness.example.com'] })
+      const get = (p: string, host?: string) => new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const url = new URL(`${baseUrl}${p}`)
+        const req = http.request({ hostname: url.hostname, port: url.port, path: p, headers: host === undefined ? {} : { host } }, (res) => {
+          let body = ''
+          res.on('data', (c) => { body += c })
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, body }))
+        })
+        req.on('error', reject)
+        req.end()
+      })
+
+      const manifest = JSON.parse((await get('/manifest.webmanifest', 'harness.example.com')).body)
+      expect(manifest).toMatchObject({ name: 'harness.example.com · dnt-harness', short_name: 'harness.example.com', id: '/' })
+      const shell = (await get('/', 'harness.example.com')).body
+      expect(shell).toContain('<title>harness.example.com · dnt-harness</title>')
+      expect(shell).toContain('content="harness.example.com · dnt-harness"')
+
+      expect(JSON.parse((await get('/manifest.webmanifest')).body)).toMatchObject({ name: 'dnt-harness', short_name: 'dnt-harness' })
+    } finally {
+      await fs.rm(staticDir, { recursive: true, force: true })
+    }
   })
 })
 

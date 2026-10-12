@@ -74,6 +74,18 @@ describe('stdio crash recovery', () => {
 })
 
 describe('stdio framing and diagnostics', () => {
+  it('ignores JSON null, primitives, and arrays on stdout without breaking subsequent calls', async () => {
+    const client = stdioClient([stdioFixture])
+    await client.listTools()
+    const transport = (client as unknown as { transport: { handleLine(line: string): void } }).transport
+    for (const value of ['null', 'false', '42', '"log"', '[]']) {
+      expect(() => transport.handleLine(value)).not.toThrow()
+    }
+    const result = await client.callTool('query', { q: 'after-noise' }, 3_000)
+    expect(JSON.stringify(result.content)).toContain('result:after-noise')
+    expect(client.state).toBe('ready')
+  })
+
   it('keeps a multibyte character split across two stdout chunks', async () => {
     // Writes a result whose UTF-8 bytes are split in the middle of "ệ".
     const script = `

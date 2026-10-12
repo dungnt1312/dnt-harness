@@ -288,7 +288,10 @@ afterEach(() => {
 })
 
 afterAll(async () => {
-  for (const dir of liveHomes.splice(0)) await fs.rm(dir, { recursive: true, force: true })
+  // Servers write into these homes until they close; close first, then delete
+  // (otherwise a late write races rm and fails with ENOTEMPTY).
+  for (const s of servers.splice(0)) await s.close().catch(() => {})
+  for (const dir of liveHomes.splice(0)) await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
 })
 
 function send(method: string, url: string, body?: unknown): Promise<Response> {

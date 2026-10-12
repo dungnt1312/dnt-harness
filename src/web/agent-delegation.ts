@@ -41,7 +41,7 @@ export function projectInheritedMessages(events: readonly SessionEvent[], maxCha
   for (let i = events.length - 1; i >= 0 && used < maxChars; i--) {
     const event = events[i]
     let line: string | undefined
-    if (event?.type === 'user/message' && event.origin !== 'context' && event.content.trim() !== '') line = `User: ${event.content.trim()}`
+    if (event?.type === 'user/message' && event.origin !== 'context' && event.origin !== 'command' && event.content.trim() !== '') line = `User: ${event.content.trim()}`
     else if (event?.type === 'assistant/message' && (event.toolCalls === undefined || event.toolCalls.length === 0) && event.content.trim() !== '') {
       line = `Assistant: ${event.content.trim()}`
     }

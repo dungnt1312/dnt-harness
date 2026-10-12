@@ -90,7 +90,7 @@ function ViewTab({ view, active, onClick, onClose }: {
  * tab strip. (`events`/`agentEvents` are new arrays per frame by design; the
  * views that read them re-render on their own `useMemo` deps instead.)
  */
-export const Workbench = memo(function Workbench({ workspaceId, project, agentsProjectId = null, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, gitFocusPath = null, onClearGitFilter, processFocus = null }: {
+export const Workbench = memo(function Workbench({ workspaceId, project, agentsProjectId = null, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, agentFocus = null, onAgentFocus, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, gitFocusPath = null, onClearGitFilter, processFocus = null }: {
   readonly workspaceId: string | null
   /** The project whose files are browsable; null for chat-only conversations. */
   readonly project: WorkbenchProject | null
@@ -121,6 +121,9 @@ export const Workbench = memo(function Workbench({ workspaceId, project, agentsP
    */
   readonly agentsSessionId?: string | null
   readonly onOpenChild?: (childSessionId: string) => void
+  /** The subagent a transcript delegation row opened; its detail replaces the Subagents list. */
+  readonly agentFocus?: string | null
+  readonly onAgentFocus?: (childSessionId: string | null) => void
   /**
    * The delegation source conversation's log, when it is not the viewed one
    * (a second stream keeps the root's log alive while a child is open). The
@@ -238,6 +241,8 @@ export const Workbench = memo(function Workbench({ workspaceId, project, agentsP
         rootProjectId={agentsProjectId}
         briefs={delegation.briefs}
         refreshSignal={delegation.count}
+        focusChildId={agentFocus}
+        onClearFocus={() => onAgentFocus?.(null)}
         {...(onOpenChild !== undefined ? { onOpenChild } : {})}
       />
     )
@@ -353,6 +358,8 @@ export const Workbench = memo(function Workbench({ workspaceId, project, agentsP
     && previous.sessionId === next.sessionId
     && previous.agentsSessionId === next.agentsSessionId
     && previous.onOpenChild === next.onOpenChild
+    && previous.agentFocus === next.agentFocus
+    && previous.onAgentFocus === next.onAgentFocus
     && previous.terminalShell === next.terminalShell
     && previous.onTerminalShell === next.onTerminalShell
     && previous.bindingReady === next.bindingReady

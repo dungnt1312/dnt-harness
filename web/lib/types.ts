@@ -174,7 +174,7 @@ export interface ContextManifestView {
     readonly toolNames: readonly string[]
     readonly toolSchemas: number
     /** Present when the request ran as a child role. */
-    readonly child?: { readonly definition: string; readonly instructionsHash: string; readonly source?: 'bundled' | 'user' | 'workspace' | 'project' }
+    readonly child?: { readonly definition: string; readonly instructionsHash: string; readonly source?: 'bundled' | 'user' | 'plugin' | 'workspace' | 'project' }
     /** Inherited parent context the request carried (absent when dropped). */
     readonly parentContext?: { readonly hash: string; readonly chars: number }
   }
@@ -481,11 +481,11 @@ export interface AgentDefinitionRow {
   /** What `model:` runs on here: a resolved `provider:model`, or inherit (with what could not be served). */
   readonly modelResolution?: { readonly resolved?: string; readonly inherit: boolean; readonly unresolved?: string; readonly alias?: string; readonly thinkingLevel?: string | null; readonly blocked?: boolean; readonly error?: string }
   /** Claude Code layer: bundled < user (~/.claude/agents) < workspace < project (.claude/agents). */
-  readonly source: 'bundled' | 'user' | 'workspace' | 'project'
+  readonly source: 'bundled' | 'user' | 'plugin' | 'workspace' | 'project'
   readonly path?: string
   readonly hash?: string
   /** Lower layers this definition overrides. */
-  readonly overrides?: readonly ('bundled' | 'user' | 'workspace' | 'project')[]
+  readonly overrides?: readonly ('bundled' | 'user' | 'plugin' | 'workspace' | 'project')[]
 }
 
 /** One child agent card: runtime status is separate from model claims. */
@@ -619,13 +619,33 @@ export interface SkillRow {
   readonly name: string
   readonly title: string
   readonly description: string
-  readonly source: 'project' | 'workspace' | 'user' | 'bundled'
+  readonly source: 'project' | 'workspace' | 'user' | 'plugin' | 'bundled'
   /** The source rule a project row resolved from (panel grouping). */
   readonly ruleId?: string
   /** sha256 of the raw SKILL.md — the optimistic-concurrency token. */
   readonly hash: string
   /** Present when this workspace hides the skill from discovery surfaces. */
   readonly hidden?: boolean
+  /** Claude `disable-model-invocation: true`. */
+  readonly disableModelInvocation?: true
+  /** Claude `user-invocable: false`: not offered in the `/` menu. */
+  readonly userInvocable?: false
+  readonly argumentHint?: string
+}
+
+/** One Claude Code custom slash command (`GET …/commands`). */
+export interface CommandRow {
+  readonly name: string
+  readonly description: string
+  readonly source: 'user' | 'plugin' | 'workspace' | 'project' | 'bundled'
+  readonly path: string
+  readonly argumentHint?: string
+  readonly allowedTools?: readonly string[]
+  readonly model?: string
+  readonly disableModelInvocation?: true
+  readonly userInvocable?: false
+  readonly plugin?: string
+  readonly notes?: readonly string[]
 }
 
 /** One configurable skill source folder; list order is precedence order. */

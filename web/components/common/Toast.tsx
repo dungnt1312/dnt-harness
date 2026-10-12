@@ -99,7 +99,7 @@ export function ToastHost({ children }: { readonly children: ReactNode }) {
             {item.kind === 'ok' ? <Icon name="check" size={16} className="mt-2 text-ok" /> : null}
             {item.kind === 'bad' ? <Icon name="alertTriangle" size={16} className="mt-2 text-bad" /> : null}
             <div className="min-w-0 flex-1 py-1.5">{item.kind === 'bad' ? <ErrorNotice raw={item.text} announce={false} /> : <p className="m-0">{item.text}</p>}</div>
-            {(item.count ?? 1) > 1 ? <span className="mt-2 shrink-0 text-xs tabular-nums text-fg-muted" aria-label={`Repeated ${item.count} times`}>×{item.count}</span> : null}
+            {(item.count ?? 1) > 1 ? <span className="mt-2 shrink-0 text-xs tabular-nums text-fg-muted" aria-label={`Repeated ${item.count} times`}>x{item.count}</span> : null}
             <IconButton label="Dismiss notification" onClick={() => dispose(item.id)}><Icon name="close" size={14} /></IconButton>
           </div>
         ))}
