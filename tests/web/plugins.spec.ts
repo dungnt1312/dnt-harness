@@ -195,6 +195,79 @@ describe('Claude Code plugins over the web host', () => {
     expect(((await npm.json()) as { error: string }).error).toMatch(/not supported/)
   })
 
+  it('installs a user-enabled plugin by fetching its marketplace from ~/.claude known_marketplaces first', async () => {
+    const s = await start()
+    const market = await marketplace()
+    await write(path.join(s.userClaude, 'settings.json'), json({ enabledPlugins: { 'toolkit@local-market': true } }))
+    await write(path.join(s.userClaude, 'plugins', 'known_marketplaces.json'), json({ 'local-market': { source: { source: 'directory', path: market }, installLocation: market } }))
+    const before = JSON.stringify(await fs.readdir(s.userClaude, { recursive: true }))
+    const install = await post(s.base, `/api/workspaces/${s.wsId}/plugins/toolkit@local-market/install`, { scope: 'workspace' })
+    expect(install.status).toBe(200)
+    const row = ((await install.json()) as { plugins: PluginRowView[] }).plugins.find((plugin) => plugin.id === 'toolkit@local-market')
+    expect(row).toMatchObject({ installed: true, active: true })
+    const markets = await (await fetch(`${s.base}/api/plugins/marketplaces`)).json() as { marketplaces: { name: string }[] }
+    expect(markets.marketplaces.map((item) => item.name)).toEqual(['local-market'])
+    expect(JSON.stringify(await fs.readdir(s.userClaude, { recursive: true }))).toBe(before)
+  })
+
+  it('knows the official marketplace without being told, and refuses unknown ones', async () => {
+    const cloned: string[] = []
+    const s = await start({
+      pluginClone: async (url, target) => {
+        cloned.push(url)
+        if (url.endsWith('claude-plugins-official.git')) {
+          await write(path.join(target, '.claude-plugin', 'marketplace.json'), json({ name: 'claude-plugins-official', plugins: [{ name: 'superpowers', source: './p' }] }))
+          await write(path.join(target, 'p', 'commands', 'go.md'), 'go')
+        }
+        return 'abcdef1234567890'
+      },
+    })
+    const install = await post(s.base, `/api/workspaces/${s.wsId}/plugins/superpowers@claude-plugins-official/install`, { scope: 'workspace' })
+    expect(install.status).toBe(200)
+    expect(cloned).toEqual(['https://github.com/anthropics/claude-plugins-official.git'])
+    const unknown = await post(s.base, `/api/workspaces/${s.wsId}/plugins/x@nowhere/install`, { scope: 'workspace' })
+    expect(unknown.status).toBe(404)
+    expect(((await unknown.json()) as { error: string }).error).toMatch(/not added/)
+  })
+
+  it('describes what a plugin contains before install (relative and git sources) and after', async () => {
+    const cloned: string[] = []
+    const s = await start({
+      pluginClone: async (url, target) => {
+        cloned.push(url)
+        await write(path.join(target, '.claude-plugin', 'plugin.json'), json({ name: 'remote', version: '0.3.0', author: { name: 'R' } }))
+        await write(path.join(target, 'commands', 'ping.md'), '---\ndescription: Ping it\n---\npong')
+        return 'abcdef1234567890'
+      },
+    })
+    await post(s.base, '/api/plugins/marketplaces', { source: await marketplace() })
+    const local = await (await fetch(`${s.base}/api/workspaces/${s.wsId}/plugins/toolkit%40local-market`)).json() as Record<string, unknown>
+    expect(local).toMatchObject({
+      id: 'toolkit@local-market', version: '1.2.0', description: 'Everything', source: { kind: 'relative', location: './plugins/toolkit' },
+      commands: [{ name: 'toolkit:hello', description: 'Say hello' }],
+      skills: [{ name: 'toolkit:brainstorm', description: 'Brainstorm ideas' }],
+      agents: [{ name: 'toolkit:helper', description: 'Helps' }],
+      hooks: ['UserPromptSubmit'],
+      mcpServers: [{ name: 'docs', type: 'http' }, { name: 'live', type: 'sse' }],
+    })
+    // Describing installs nothing.
+    expect(await fs.readFile(path.join(s.home, 'plugins', 'installed_plugins.json'), 'utf8').catch(() => '')).toBe('')
+
+    const remote = await (await fetch(`${s.base}/api/workspaces/${s.wsId}/plugins/remote%40local-market`)).json() as Record<string, unknown>
+    expect(remote).toMatchObject({ author: 'R', source: { kind: 'url' }, commands: [{ name: 'remote:ping', description: 'Ping it' }] })
+    // Memoized per marketplace revision; the scratch clone is gone.
+    await fetch(`${s.base}/api/workspaces/${s.wsId}/plugins/remote%40local-market`)
+    expect(cloned).toHaveLength(1)
+    expect(await fs.readdir(path.join(s.home, 'plugins', 'tmp')).catch(() => [])).toEqual([])
+
+    expect((await fetch(`${s.base}/api/workspaces/${s.wsId}/plugins/npm-only%40local-market`)).status).toBe(422)
+    expect((await fetch(`${s.base}/api/workspaces/${s.wsId}/plugins/nope%40local-market`)).status).toBe(404)
+
+    await post(s.base, `/api/workspaces/${s.wsId}/plugins/toolkit@local-market/install`, { scope: 'workspace' })
+    const after = await (await fetch(`${s.base}/api/workspaces/${s.wsId}/plugins/toolkit%40local-market`)).json() as { commands: unknown[] }
+    expect(after.commands).toEqual([{ name: 'toolkit:hello', description: 'Say hello' }])
+  })
+
   it('refuses marketplace inputs that are not owner/repo, a git URL or an absolute folder', async () => {
     const s = await start()
     for (const source of ['', 'relative/dir/x', '--upload-pack=evil', 'ftp://x']) {

@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import Icon from '../common/Icon.tsx'
 import { ErrorNotice } from '../common/ErrorNotice.tsx'
-import { Button } from '../ui/Button.tsx'
 import { formatCountdown } from '../../lib/format.ts'
 import type { PendingQuestion, QuestionReply } from '../../lib/types.ts'
 
@@ -21,6 +20,25 @@ export function draftAnswered(draft: Draft | undefined): boolean {
 
 /** Delay before auto-advancing so the user sees the choice land. */
 const ADVANCE_MS = 160
+
+const FOOT_BTN = 'inline-flex h-7 items-center gap-1 rounded-md px-2.5 text-xs transition-colors disabled:opacity-40'
+
+/** Radio = circle with a dot, checkbox = rounded square with a tick. */
+function ChoiceMark({ multi, checked, dashed = false }: {
+  readonly multi: boolean
+  readonly checked: boolean
+  readonly dashed?: boolean
+}) {
+  const shape = multi ? 'rounded-[4px]' : 'rounded-full'
+  const state = checked
+    ? 'border-primary bg-primary text-primary-fg'
+    : `${dashed ? 'border-dashed' : ''} border-fg-faint/70 group-hover:border-fg-muted`
+  return (
+    <span aria-hidden="true" className={`mt-px flex size-4 shrink-0 items-center justify-center border-[1.5px] transition-colors ${shape} ${state}`}>
+      {checked ? (multi ? <Icon name="check" size={10} /> : <span className="size-1.5 rounded-full bg-primary-fg" />) : null}
+    </span>
+  )
+}
 
 function QuestionCard({ row, onAnswer, now }: {
   readonly row: PendingQuestion
@@ -105,7 +123,7 @@ function QuestionCard({ row, onAnswer, now }: {
       onKeyDown={onKeyDown}
       className="flex flex-col overflow-hidden rounded-2xl border border-line bg-surface shadow-composer"
     >
-      <header className="flex items-center gap-1 border-b border-line px-2">
+      <header className="flex items-center gap-1 border-b border-line px-1.5">
         {count > 1 ? (
           <div role="tablist" aria-label="Questions" className="flex min-w-0 flex-1 overflow-x-auto">
             {row.questions.map((q, index) => {
@@ -119,10 +137,10 @@ function QuestionCard({ row, onAnswer, now }: {
                   aria-selected={selected}
                   title={q.question}
                   onClick={() => goTo(index)}
-                  className={`relative flex h-10 max-w-[11rem] shrink-0 items-center gap-1.5 px-2.5 text-xs transition-colors after:absolute after:inset-x-2 after:bottom-0 after:h-0.5 after:rounded-full ${selected ? 'text-fg after:bg-fg' : 'text-fg-faint hover:text-fg-muted after:bg-transparent'}`}
+                  className={`relative flex h-8 max-w-[11rem] shrink-0 items-center gap-1.5 px-2 text-xs transition-colors after:absolute after:inset-x-2 after:bottom-0 after:h-0.5 after:rounded-full ${selected ? 'text-fg after:bg-fg' : 'text-fg-faint hover:text-fg-muted after:bg-transparent'}`}
                 >
-                  <span className={`flex size-4 shrink-0 items-center justify-center rounded-full text-[10px] ${answered ? 'bg-ok text-surface' : selected ? 'bg-fg text-surface' : 'bg-hover'}`}>
-                    {answered ? <Icon name="check" size={10} /> : index + 1}
+                  <span className={`flex size-3.5 shrink-0 items-center justify-center rounded-full text-[9px] ${answered ? 'bg-ok text-surface' : selected ? 'bg-fg text-surface' : 'bg-hover'}`}>
+                    {answered ? <Icon name="check" size={9} /> : index + 1}
                   </span>
                   <span className="truncate">{q.header ?? `Question ${index + 1}`}</span>
                 </button>
@@ -130,7 +148,7 @@ function QuestionCard({ row, onAnswer, now }: {
             })}
           </div>
         ) : (
-          <div className="flex h-10 min-w-0 flex-1 items-center gap-2 px-2 text-xs text-fg-faint">
+          <div className="flex h-8 min-w-0 flex-1 items-center gap-2 px-2 text-xs text-fg-faint">
             <Icon name="messageSquare" size={13} />
             <span className="truncate">
               {row.childSessionId !== undefined
@@ -144,13 +162,13 @@ function QuestionCard({ row, onAnswer, now }: {
         </span>
       </header>
 
-      <div role={count > 1 ? 'tabpanel' : undefined} className="flex flex-col gap-3 px-4 pt-4 pb-3">
-        <h3 className="m-0 text-[15px] leading-snug font-medium text-fg">
+      <div role={count > 1 ? 'tabpanel' : undefined} className="flex flex-col gap-2 px-3 pt-3 pb-2">
+        <h3 className="m-0 text-[13px] leading-snug font-semibold text-fg">
           {question.question}
-          {question.multiSelect ? <span className="ml-2 text-xs font-normal text-fg-faint">Choose any</span> : null}
+          {question.multiSelect ? <span className="ml-2 text-[11px] font-normal text-fg-faint">Choose any</span> : null}
         </h3>
-        <div role={question.multiSelect ? 'group' : 'radiogroup'} aria-label={question.question} className="-mx-2 flex flex-col gap-0.5">
-          {question.options.map((option, index) => {
+        <div role={question.multiSelect ? 'group' : 'radiogroup'} aria-label={question.question} className="-mx-1.5 flex flex-col gap-px">
+          {question.options.map((option) => {
             const checked = draft.selected.includes(option.label)
             return (
               <button
@@ -160,25 +178,24 @@ function QuestionCard({ row, onAnswer, now }: {
                 aria-checked={checked}
                 disabled={submitting}
                 onClick={() => choose(option.label)}
-                className={`group flex w-full items-start gap-3 rounded-xl px-2 py-2 text-left transition-colors disabled:opacity-50 ${checked ? 'bg-hover' : 'hover:bg-hover/60'}`}
+                title={option.description}
+                className={`group flex w-full items-start gap-2.5 rounded-lg px-1.5 py-1.5 text-left transition-colors disabled:opacity-50 ${checked ? 'bg-hover' : 'hover:bg-hover/50'}`}
               >
-                <span className={`mt-px flex size-5 shrink-0 items-center justify-center rounded-md text-[11px] font-medium transition-colors ${checked ? 'bg-fg text-surface' : 'bg-hover text-fg-muted group-hover:text-fg'}`}>
-                  {checked ? <Icon name="check" size={12} /> : index + 1}
-                </span>
+                <ChoiceMark multi={question.multiSelect === true} checked={checked} />
                 <span className="min-w-0 flex-1">
-                  <span className="block text-sm text-fg">{option.label}</span>
-                  {option.description !== undefined ? <span className="mt-0.5 block text-xs leading-relaxed text-fg-muted">{option.description}</span> : null}
+                  <span className={`block text-[13px] leading-[18px] ${checked ? 'font-medium text-fg' : 'text-fg'}`}>{option.label}</span>
+                  {option.description !== undefined ? <span className="mt-0.5 line-clamp-2 block text-xs leading-4 text-fg-faint">{option.description}</span> : null}
                 </span>
               </button>
             )
           })}
-          <label className={`flex items-center gap-3 rounded-xl px-2 py-1.5 transition-colors ${draft.other.trim() !== '' ? 'bg-hover' : 'focus-within:bg-hover/60'}`}>
-            <span className="flex size-5 shrink-0 items-center justify-center rounded-md bg-hover text-fg-muted"><Icon name="pencil" size={11} /></span>
+          <label className="group flex items-center gap-2.5 rounded-lg px-1.5 py-1 transition-colors hover:bg-hover/50">
+            <ChoiceMark multi={question.multiSelect === true} checked={draft.other.trim() !== ''} dashed />
             <input
               type="text"
               aria-label={`Other answer for: ${question.question}`}
-              placeholder="Something else…"
-              className="h-7 min-w-0 flex-1 bg-transparent text-sm text-fg outline-none placeholder:text-fg-faint"
+              placeholder="Other…"
+              className="h-[18px] min-w-0 flex-1 border-0 bg-transparent p-0 text-[13px] leading-[18px] text-fg outline-none placeholder:text-fg-faint"
               value={draft.other}
               disabled={submitting}
               maxLength={4000}
@@ -200,35 +217,36 @@ function QuestionCard({ row, onAnswer, now }: {
         {error !== '' ? <ErrorNotice raw={error} announce={false} /> : null}
       </div>
 
-      <footer className="flex items-center gap-2 px-3 pb-3">
+      <footer className="flex items-center gap-1 border-t border-line px-2 py-1.5">
         <button
           type="button"
           disabled={submitting}
           onClick={() => void send({ decline: true })}
-          className="h-8 rounded-full px-3 text-[13px] text-fg-muted transition-colors hover:bg-hover hover:text-fg disabled:opacity-40"
+          className={`${FOOT_BTN} text-fg-faint hover:bg-hover hover:text-fg`}
         >
-          Skip all
+          {count > 1 ? 'Skip all' : 'Skip'}
         </button>
         <span className="min-w-0 flex-1" />
+        {/* Early send stays available but quiet; the primary button is the next step. */}
+        {!last && answeredCount > 0 ? (
+          <button type="button" disabled={submitting} onClick={submit} className={`${FOOT_BTN} text-fg-muted hover:bg-hover hover:text-fg`}>
+            Send {answeredCount}/{count}
+          </button>
+        ) : null}
         {active > 0 ? (
-          <Button variant="ghost" size="sm" disabled={submitting} onClick={() => goTo(active - 1)} aria-label="Previous question">
+          <button type="button" disabled={submitting} onClick={() => goTo(active - 1)} aria-label="Previous question" className={`${FOOT_BTN} w-7 justify-center px-0 text-fg-muted hover:bg-hover hover:text-fg`}>
             <Icon name="chevron" size={14} className="rotate-90" />
-          </Button>
+          </button>
         ) : null}
-        {!last ? (
-          <Button variant="outline" size="sm" disabled={submitting} onClick={() => goTo(active + 1)}>
-            Next<Icon name="chevronRight" size={14} />
-          </Button>
-        ) : null}
-        <button
-          ref={sendRef}
-          type="button"
-          disabled={submitting}
-          onClick={submit}
-          className={`inline-flex h-8 items-center gap-1.5 rounded-full px-3.5 text-[13px] font-medium transition-colors disabled:opacity-40 ${last ? 'bg-primary text-primary-fg hover:opacity-85' : 'text-fg-muted hover:bg-hover hover:text-fg'}`}
-        >
-          {submitting ? 'Sending…' : count > 1 ? `Send ${answeredCount}/${count}` : 'Send'}
-        </button>
+        {last ? (
+          <button ref={sendRef} type="button" disabled={submitting} onClick={submit} className={`${FOOT_BTN} bg-primary font-medium text-primary-fg hover:opacity-85`}>
+            {submitting ? 'Sending…' : 'Send'}
+          </button>
+        ) : (
+          <button type="button" disabled={submitting} onClick={() => goTo(active + 1)} className={`${FOOT_BTN} bg-primary pr-2 font-medium text-primary-fg hover:opacity-85`}>
+            Next<Icon name="chevronRight" size={13} />
+          </button>
+        )}
       </footer>
     </article>
   )

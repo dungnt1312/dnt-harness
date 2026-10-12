@@ -6,6 +6,7 @@ import { Button } from '../ui/Button.tsx'
 import { Field } from '../ui/Field.tsx'
 import { Segmented } from '../ui/Segmented.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
+import { PluginDetailsModal } from './PluginDetailsModal.tsx'
 import {
   addMarketplace,
   listMarketplaces,
@@ -29,6 +30,7 @@ import {
   PanelIntro,
   RowMenu,
   Section,
+  SubTabs,
   WorkspaceRequired,
   useActionRunner,
   type NoticeState,
@@ -58,6 +60,18 @@ function sourceText(source: MarketplaceView['source']): string {
   return source.repo ?? source.url ?? source.path ?? source.source
 }
 
+/** Sentinel tab/category value; marketplace and category names never start with a space. */
+const ALL = ' all'
+const OTHER = 'other'
+const AVAILABLE_LIMIT = 150
+
+/** Marketplace offered with one click until it is added (the user can still remove it). */
+const RECOMMENDED_MARKETPLACE = {
+  repo: 'anthropics/claude-plugins-official',
+  name: 'claude-plugins-official',
+  description: "Anthropic's official Claude Code plugin marketplace.",
+} as const
+
 /**
  * Claude Code plugins (Settings → Plugins). Marketplaces are shared by the
  * whole host; install and enable write `enabledPlugins` in the chosen scope's
@@ -80,6 +94,9 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
   const [scope, setScope] = useScopedState<PluginScope>('workspace')
   const [confirm, setConfirm] = useScopedState<{ readonly kind: 'uninstall' | 'remove'; readonly id: string } | null>(null)
   const [query, setQuery] = useScopedState('')
+  const [marketTab, setMarketTab] = useScopedState<string>(ALL)
+  const [category, setCategory] = useScopedState<string>(ALL)
+  const [detailsId, setDetailsId] = useScopedState<string | null>(null)
   const { busy, run } = useActionRunner((text) => setNotice({ kind: 'bad', text }))
 
   const load = useCallback(async () => {
@@ -116,10 +133,25 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
     ...(project !== undefined ? [{ value: 'project' as const, label: 'Project' }, { value: 'local' as const, label: 'Local' }] : []),
   ]
   const installedIds = new Set((plugins ?? []).filter((plugin) => plugin.installed).map((plugin) => plugin.id))
+  const recommendedAdded = marketplaces.some((market) => market.name === RECOMMENDED_MARKETPLACE.name || market.source.repo === RECOMMENDED_MARKETPLACE.repo)
   const needle = query.trim().toLowerCase()
-  const available = marketplaces.flatMap((market) => (market.document?.plugins ?? []).map((entry) => ({ ...entry, id: `${entry.name}@${market.name}`, marketplace: market.name })))
+  const notInstalled = marketplaces.flatMap((market) => (market.document?.plugins ?? []).map((entry) => ({ ...entry, id: `${entry.name}@${market.name}`, marketplace: market.name })))
     .filter((entry) => !installedIds.has(entry.id))
-    .filter((entry) => needle === '' || `${entry.name} ${entry.description ?? ''} ${entry.category ?? ''}`.toLowerCase().includes(needle))
+  // One tab per marketplace (plus All when there are several).
+  const marketTabs = [
+    ...(marketplaces.length > 1 ? [{ value: ALL, label: 'All', count: notInstalled.length }] : []),
+    ...marketplaces.map((market) => ({ value: market.name, label: market.name, count: notInstalled.filter((entry) => entry.marketplace === market.name).length })),
+  ]
+  const activeMarket = marketTabs.some((tab) => tab.value === marketTab) ? marketTab : (marketTabs[0]?.value ?? ALL)
+  const inMarket = notInstalled
+    .filter((entry) => activeMarket === ALL || entry.marketplace === activeMarket)
+    .filter((entry) => needle === '' || `${entry.name} ${entry.description ?? ''} ${entry.category ?? ''} ${entry.author ?? ''}`.toLowerCase().includes(needle))
+  const categoryCounts = new Map<string, number>()
+  for (const entry of inMarket) categoryCounts.set(entry.category ?? OTHER, (categoryCounts.get(entry.category ?? OTHER) ?? 0) + 1)
+  const categories = [...categoryCounts].map(([name, count]) => ({ name, count }))
+    .sort((a, b) => (a.name === OTHER ? 1 : b.name === OTHER ? -1 : b.count - a.count || a.name.localeCompare(b.name)))
+  const activeCategory = category === ALL || categoryCounts.has(category) ? category : ALL
+  const available = inMarket.filter((entry) => activeCategory === ALL || (entry.category ?? OTHER) === activeCategory)
 
   return (
     <PanelBody>
@@ -129,7 +161,7 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
 
       <Section title="Installed" count={plugins?.length ?? 0}>
         {plugins === null ? <EmptyState>Loading…</EmptyState> : plugins.length === 0 ? (
-          <EmptyState>No plugins yet. Add a marketplace below, then install from it.</EmptyState>
+          <EmptyState>No plugins yet. Add the recommended marketplace below (or your own), then install from it.</EmptyState>
         ) : (
           <ItemList label="Installed plugins">
             {plugins.map((plugin) => {
@@ -152,7 +184,6 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
                     <>
                       {canToggle ? (
                         <InlineSwitch
-                          label="Enabled"
                           ariaLabel={`Enable ${plugin.id} in ${SCOPE_LABEL[scope]} settings`}
                           checked={plugin.active}
                           disabled={busy !== null}
@@ -169,6 +200,7 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
                           label={`Actions for ${plugin.id}`}
                           disabled={busy !== null}
                           actions={[
+                            { label: 'Details', icon: 'info', onSelect: () => setDetailsId(plugin.id) },
                             { label: 'Update', icon: 'refresh', onSelect: () => act(plugin.id, 'update', scope, `Updated ${plugin.id}`) },
                             ...plugin.installedScopes.filter((at) => at !== 'user').map((at) => ({
                               label: `Uninstall (${SCOPE_LABEL[at]})`, icon: 'trash' as const, danger: true,
@@ -241,8 +273,29 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
             ))}
           </ItemList>
         ) : null}
+        {!recommendedAdded ? (
+          <ItemList label="Recommended marketplaces">
+            <ItemRow
+              title={<><span className="font-mono text-[13px]">{RECOMMENDED_MARKETPLACE.name}</span><Badge tone="blue">recommended</Badge></>}
+              meta={`${RECOMMENDED_MARKETPLACE.description} (${RECOMMENDED_MARKETPLACE.repo})`}
+              actions={(
+                <Button
+                  variant="primary"
+                  size="sm"
+                  disabled={busy !== null}
+                  onClick={() => void run('market:add', async () => {
+                    const added = await addMarketplace(RECOMMENDED_MARKETPLACE.repo)
+                    await load()
+                    setNotice({ kind: 'ok', text: `Added ${added.name} (${added.plugins} plugins)` })
+                  })}
+                >
+                  {busy === 'market:add' ? 'Adding…' : <><Icon name="arrowDown" size={13} />Add</>}
+                </Button>
+              )}
+            />
+          </ItemList>
+        ) : null}
         <form
-          className="flex flex-wrap items-end gap-2"
           onSubmit={(event) => {
             event.preventDefault()
             const value = source.trim()
@@ -255,34 +308,85 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
             })
           }}
         >
-          <div className="min-w-0 flex-1 basis-64">
-            <Field label="Add marketplace" hint="owner/repo on GitHub, a git URL (append #ref for a branch or tag), or an absolute folder path.">
-              <TextInput mono value={source} placeholder="anthropics/claude-plugins-official" onChange={(event) => setSource(event.target.value)} aria-label="Marketplace source" />
-            </Field>
-          </div>
-          <Button type="submit" variant="primary" size="sm" disabled={busy !== null || source.trim() === ''}>{busy === 'market:add' ? 'Adding…' : 'Add'}</Button>
+          {/* The row (input + button) is the Field's control, so the button lines up with the input, not the hint below. */}
+          <Field label="Add marketplace" htmlFor="marketplace-source" hint="owner/repo on GitHub, a git URL (append #ref for a branch or tag), or an absolute folder path.">
+            <div className="flex items-center gap-2">
+              <TextInput
+                id="marketplace-source"
+                mono
+                className="min-w-0 flex-1"
+                value={source}
+                placeholder="anthropics/claude-plugins-official"
+                onChange={(event) => setSource(event.target.value)}
+                aria-label="Marketplace source"
+                aria-describedby="marketplace-source-hint"
+              />
+              <Button type="submit" variant="primary" disabled={busy !== null || source.trim() === ''}>{busy === 'market:add' ? 'Adding…' : 'Add'}</Button>
+            </div>
+          </Field>
         </form>
       </Section>
 
       {marketplaces.length > 0 ? (
-        <Section title="Available" count={available.length} actions={<TextInput value={query} placeholder="Filter" onChange={(event) => setQuery(event.target.value)} aria-label="Filter available plugins" />}>
-          {available.length === 0 ? <EmptyState>Nothing to show.</EmptyState> : (
-            <ItemList label="Available plugins">
-              {available.slice(0, 200).map((entry) => (
-                <ItemRow
-                  key={entry.id}
-                  title={<><span className="font-mono text-[13px]">{entry.name}</span><span className="text-xs text-fg-faint">@{entry.marketplace}</span>{entry.category !== undefined ? <Badge>{entry.category}</Badge> : null}</>}
-                  meta={entry.description}
-                  actions={(
-                    <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => act(entry.id, 'install', scope, `Installed ${entry.id} in ${SCOPE_LABEL[scope]}`)}>
-                      {busy === `install:${entry.id}` ? 'Installing…' : <><Icon name="arrowDown" size={13} />Install</>}
-                    </Button>
-                  )}
-                />
+        <Section title="Available" count={available.length} actions={<TextInput value={query} placeholder="Search plugins" onChange={(event) => setQuery(event.target.value)} aria-label="Filter available plugins" />}>
+          <SubTabs label="Marketplace" value={activeMarket} onChange={(next) => { setMarketTab(next); setCategory(ALL) }} tabs={marketTabs} />
+          {categories.length > 1 ? (
+            <div role="group" aria-label="Category" className="flex flex-wrap gap-1.5">
+              {[{ name: ALL, count: inMarket.length }, ...categories].map((item) => (
+                <button
+                  key={item.name}
+                  type="button"
+                  aria-pressed={activeCategory === item.name}
+                  onClick={() => setCategory(item.name)}
+                  className="inline-flex h-6 items-center gap-1 rounded-full border border-line px-2.5 text-xs text-fg-muted transition-colors hover:text-fg aria-pressed:border-fg-faint aria-pressed:bg-hover aria-pressed:text-fg"
+                >
+                  {item.name === ALL ? 'All' : item.name}
+                  <span className="text-fg-faint">{item.count}</span>
+                </button>
               ))}
-            </ItemList>
+            </div>
+          ) : null}
+          {available.length === 0 ? <EmptyState>Nothing to show.</EmptyState> : (
+            <ul aria-label="Available plugins" className="m-0 flex list-none flex-col divide-y divide-line overflow-hidden rounded-xl border border-line p-0">
+              {available.slice(0, AVAILABLE_LIMIT).map((entry) => (
+                <li key={entry.id} className="group flex min-w-0 items-center gap-3 px-3.5 py-2 hover:bg-hover">
+                  <button
+                    type="button"
+                    className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left outline-none focus-visible:underline"
+                    onClick={() => setDetailsId(entry.id)}
+                    aria-label={`Show what ${entry.id} contains`}
+                  >
+                    <span className="flex min-w-0 max-w-full items-center gap-2">
+                      <span className="truncate font-mono text-[13px] text-fg">{entry.name}</span>
+                      {marketTabs.length > 1 && activeMarket === ALL ? <span className="shrink-0 text-xs text-fg-faint">@{entry.marketplace}</span> : null}
+                      {entry.category !== undefined && activeCategory === ALL ? <Badge>{entry.category}</Badge> : null}
+                    </span>
+                    {entry.description !== undefined ? <span className="line-clamp-1 max-w-full text-xs text-fg-faint" title={entry.description}>{entry.description}</span> : null}
+                  </button>
+                  <Button variant="ghost" size="sm" onClick={() => setDetailsId(entry.id)} aria-label={`Details for ${entry.id}`}>
+                    <Icon name="info" size={13} />Details
+                  </Button>
+                  <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => act(entry.id, 'install', scope, `Installed ${entry.id} in ${SCOPE_LABEL[scope]}`)} aria-label={`Install ${entry.id}`}>
+                    {busy === `install:${entry.id}` ? 'Installing…' : <><Icon name="arrowDown" size={13} />Install</>}
+                  </Button>
+                </li>
+              ))}
+            </ul>
           )}
+          {available.length > AVAILABLE_LIMIT ? <p className="m-0 text-xs text-fg-faint">Showing {AVAILABLE_LIMIT} of {available.length}. Search or pick a category to narrow the list.</p> : null}
         </Section>
+      ) : null}
+
+      {detailsId !== null ? (
+        <PluginDetailsModal
+          workspaceId={workspaceId}
+          {...(project !== undefined ? { projectId: project } : {})}
+          pluginId={detailsId}
+          installed={installedIds.has(detailsId)}
+          busy={busy === `install:${detailsId}`}
+          onInstall={() => act(detailsId, 'install', scope, `Installed ${detailsId} in ${SCOPE_LABEL[scope]}`)}
+          onClose={() => setDetailsId(null)}
+        />
       ) : null}
 
       <PanelFooter notice={notice} />

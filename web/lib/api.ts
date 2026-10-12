@@ -1014,7 +1014,7 @@ export interface MarketplaceView {
   readonly name: string
   readonly source: { readonly source: string; readonly repo?: string; readonly url?: string; readonly path?: string }
   readonly lastUpdated: string
-  readonly document?: { readonly name: string; readonly description?: string; readonly plugins: readonly { readonly name: string; readonly description?: string; readonly version?: string; readonly category?: string; readonly author?: string }[] }
+  readonly document?: { readonly name: string; readonly description?: string; readonly owner?: string; readonly plugins: readonly { readonly name: string; readonly description?: string; readonly version?: string; readonly category?: string; readonly author?: string; readonly homepage?: string }[] }
   readonly error?: string
 }
 
@@ -1030,6 +1030,34 @@ export function pluginAction(workspaceId: string, pluginId: string, action: 'ins
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ scope }),
   }).then((r) => json<{ plugins: PluginRowView[]; notes?: string[] }>(r))
+}
+
+export interface PluginItemView { readonly name: string; readonly description?: string }
+
+/** What a plugin contains (GET …/plugins/:id); not-installed plugins are staged on the server to read it. */
+export interface PluginDetailsView {
+  readonly id: string
+  readonly name: string
+  readonly marketplace: string
+  readonly description?: string
+  readonly version?: string
+  readonly author?: string
+  readonly homepage?: string
+  readonly repository?: string
+  readonly license?: string
+  readonly category?: string
+  readonly keywords?: readonly string[]
+  readonly source: { readonly kind: string; readonly location: string }
+  readonly commands: readonly PluginItemView[]
+  readonly skills: readonly PluginItemView[]
+  readonly agents: readonly PluginItemView[]
+  readonly hooks: readonly string[]
+  readonly mcpServers: readonly { readonly name: string; readonly type: string }[]
+  readonly notes: readonly string[]
+}
+
+export function pluginDetails(workspaceId: string, pluginId: string, projectId?: string): Promise<PluginDetailsView> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/plugins/${encodeURIComponent(pluginId)}${pluginQuery(projectId)}`).then((r) => json<PluginDetailsView>(r))
 }
 
 export function listMarketplaces(): Promise<{ readonly marketplaces: readonly MarketplaceView[] }> {

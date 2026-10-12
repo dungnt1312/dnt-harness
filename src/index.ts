@@ -212,7 +212,8 @@ export { CommandsService, type CommandsServiceOptions } from './harness/commands
 // ── Harness: Claude Code plugins ────────────────────────────────────────
 export { PLUGIN_NAME, PluginError, assertPluginTreeContained, parseManifest, readManifest, resolveComponents, resolveExistingInside, resolveInside, serverMap, substituteDeep, substitutePluginVars, type ComponentFields, type PluginComponents, type PluginManifest } from './harness/plugins/manifest.ts'
 export { PluginStore, parsePluginId, readEnabledPlugins, readSuggestedMarketplaces, scopeSettingsFile, writeEnabledPlugin, type InstallRecord, type InstalledPlugins, type KnownMarketplace, type LoadedPlugin, type MarketplaceSource, type PluginScope, type SettingsFiles } from './harness/plugins/store.ts'
-export { addMarketplace, assertGitUrl, cloneRepo, fetchPlugin, findEntry, parseMarketplaceInput, readMarketplace, removeMarketplace, updateMarketplace, type MarketplaceDocument, type MarketplaceEntry } from './harness/plugins/marketplace.ts'
+export { addMarketplace, assertGitUrl, cloneRepo, fetchPlugin, findEntry, inspectPlugin, parseMarketplaceInput, readMarketplace, removeMarketplace, sourceKind, updateMarketplace, type MarketplaceDocument, type MarketplaceEntry } from './harness/plugins/marketplace.ts'
+export { describePlugin, type PluginDetails, type PluginItem } from './harness/plugins/details.ts'
 export { pluginServerName, pluginServers, type PluginServerDraft } from './harness/plugins/mcp.ts'
 export { PluginService, type PluginContext, type PluginRow, type PluginServiceDeps } from './harness/plugins/service.ts'
 

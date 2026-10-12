@@ -8,8 +8,9 @@ import path from 'node:path'
 import type { CommandLayer } from '../commands/catalog.ts'
 import type { PluginAgentLayer } from '../agents/definition-service.ts'
 import type { SkillLayer } from '../skills/layers.ts'
-import { PluginError } from './manifest.ts'
-import { addMarketplace, fetchPlugin, findEntry, readMarketplace, removeMarketplace, updateMarketplace, type MarketplaceDeps, type MarketplaceDocument } from './marketplace.ts'
+import { describePlugin, type PluginDetails } from './details.ts'
+import { PluginError, readManifest, resolveComponents } from './manifest.ts'
+import { addMarketplace, assertGitUrl, fetchPlugin, findEntry, inspectPlugin, parseMarketplaceInput, readMarketplace, sourceKind, removeMarketplace, updateMarketplace, type MarketplaceDeps, type MarketplaceDocument } from './marketplace.ts'
 import { pluginServers, type PluginServerDraft } from './mcp.ts'
 import {
   PluginStore, parsePluginId, readEnabledPlugins, readSuggestedMarketplaces, scopeSettingsFile, strictlyInside, writeEnabledPlugin,
@@ -54,6 +55,8 @@ export class PluginService {
   private readonly marketplaceDeps: MarketplaceDeps
   /** Serializes installs and settings writes (one store per host). */
   private tail: Promise<unknown> = Promise.resolve()
+  /** Described-not-installed plugins, keyed by id and marketplace revision. */
+  private readonly inspected = new Map<string, Promise<PluginDetails>>()
 
   constructor(private readonly deps: PluginServiceDeps) {
     this.store = new PluginStore(deps.dataDir)
@@ -204,12 +207,81 @@ export class PluginService {
     return {}
   }
 
+  /**
+   * Where an unknown marketplace can be fetched from, as Claude Code resolves
+   * it: settings `extraKnownMarketplaces`, then the user's own Claude Code
+   * `~/.claude/plugins/known_marketplaces.json` (read only), then the
+   * built-in official marketplace.
+   */
+  private async knownSource(name: string, context: PluginContext): Promise<MarketplaceSource | undefined> {
+    const suggested = (await readSuggestedMarketplaces(this.settingsFiles(context)))[name]
+    const fromSettings = toMarketplaceSource(isRecord(suggested) ? suggested['source'] : undefined)
+    if (fromSettings !== undefined) return fromSettings
+    if (this.deps.userClaudeDir !== undefined) {
+      const text = await fs.readFile(path.join(this.deps.userClaudeDir, 'plugins', 'known_marketplaces.json'), 'utf8').catch(() => undefined)
+      let known: unknown
+      try { known = text !== undefined ? JSON.parse(text) : undefined } catch { known = undefined }
+      const entry = isRecord(known) ? known[name] : undefined
+      const fromClaude = toMarketplaceSource(isRecord(entry) ? entry['source'] : undefined)
+      if (fromClaude !== undefined) return fromClaude
+    }
+    return name === OFFICIAL_MARKETPLACE.name ? OFFICIAL_MARKETPLACE.source : undefined
+  }
+
+  /**
+   * What a plugin contains. An installed plugin is read from its cache
+   * folder; otherwise the marketplace entry's files are staged (git sources
+   * cloned into a temporary folder) and described without installing. Results
+   * of staged reads are memoized per marketplace revision.
+   */
+  async details(id: string, context: PluginContext): Promise<PluginDetails> {
+    const parsed = parsePluginId(id)
+    if (parsed === undefined) throw new PluginError('invalid', `'${id}' is not plugin@marketplace`)
+    const known = (await this.store.marketplaces())[parsed.marketplace]
+    const found = await findEntry(this.marketplaceDeps, parsed.marketplace, parsed.name).catch(() => undefined)
+    const entry = found?.entry
+    const source = { kind: entry !== undefined ? sourceKind(entry.source) : 'installed', location: entry !== undefined ? sourceLocation(entry.source) : '' }
+    const extra = {
+      ...(entry?.category !== undefined ? { category: entry.category } : {}),
+      ...(entry?.description !== undefined ? { fallbackDescription: entry.description } : {}),
+      ...(entry?.version !== undefined ? { fallbackVersion: entry.version } : {}),
+    }
+    const projectPath = this.projectRoot(context)
+    const records = (await this.store.installed()).plugins[id] ?? []
+    const record = PluginStore.applicableRecord(records, { workspaceId: context.workspaceId, ...(projectPath !== undefined ? { projectPath } : {}) }) ?? records[0]
+    if (record !== undefined && (await fs.stat(record.installPath).catch(() => undefined))?.isDirectory() === true) {
+      const loaded = await this.store.load(id, parsed, record, async () => entry)
+      return describePlugin({ id, marketplace: parsed.marketplace, manifest: loaded.manifest, components: loaded.components, source, ...extra })
+    }
+    if (found === undefined || entry === undefined) throw new PluginError('not-found', `no plugin '${parsed.name}' in marketplace '${parsed.marketplace}'`)
+    const key = `${id}\u0000${known?.lastUpdated ?? ''}`
+    let pending = this.inspected.get(key)
+    if (pending === undefined) {
+      pending = inspectPlugin(this.marketplaceDeps, parsed.marketplace, entry, found.location, async (dir) => {
+        const manifest = await readManifest(dir, { ...entry.raw, name: entry.name })
+        const components = await resolveComponents(dir, manifest, entry)
+        return describePlugin({ id, marketplace: parsed.marketplace, manifest, components, source, ...extra })
+      })
+      this.inspected.set(key, pending)
+      // A failure (network, unsupported source) is not cached.
+      pending.catch(() => { this.inspected.delete(key) })
+      if (this.inspected.size > 200) this.inspected.delete(this.inspected.keys().next().value as string)
+    }
+    return pending
+  }
+
   /** Fetch into the cache, record it for the scope, and enable it there (Claude's `/plugin install`). */
   install(id: string, scope: PluginScope, context: PluginContext): Promise<InstallRecord> {
     return this.serialize(async () => {
       const parsed = parsePluginId(id)
       if (parsed === undefined) throw new PluginError('invalid', `'${id}' is not plugin@marketplace`)
       const settingsFile = this.scopeFile(scope, context)
+      if ((await this.store.marketplaces())[parsed.marketplace] === undefined) {
+        const source = await this.knownSource(parsed.marketplace, context)
+        if (source === undefined) throw new PluginError('not-found', `marketplace '${parsed.marketplace}' is not added; add it in Settings → Plugins first`)
+        const added = await addMarketplace(this.marketplaceDeps, source)
+        if (added.name !== parsed.marketplace) throw new PluginError('invalid', `marketplace source for '${parsed.marketplace}' declares the name '${added.name}'`)
+      }
       const found = await findEntry(this.marketplaceDeps, parsed.marketplace, parsed.name)
       if (found === undefined) throw new PluginError('not-found', `no plugin '${parsed.name}' in marketplace '${parsed.marketplace}'`)
       const fetched = await fetchPlugin(this.marketplaceDeps, parsed.marketplace, found.entry, found.location)
@@ -326,6 +398,48 @@ export class PluginService {
     }
     return { plugins: rows.sort((a, b) => a.id.localeCompare(b.id)), suggestedMarketplaces: suggested }
   }
+}
+
+/** Anthropic's official marketplace, which Claude Code knows without being told. */
+export const OFFICIAL_MARKETPLACE = {
+  name: 'claude-plugins-official',
+  source: { source: 'github', repo: 'anthropics/claude-plugins-official' },
+} as const satisfies { readonly name: string; readonly source: MarketplaceSource }
+
+/** A marketplace entry source as one readable line. */
+function sourceLocation(source: unknown): string {
+  if (typeof source === 'string') return source
+  if (!isRecord(source)) return ''
+  const where = typeof source['repo'] === 'string' ? source['repo'] : typeof source['url'] === 'string' ? source['url'] : typeof source['package'] === 'string' ? source['package'] : ''
+  const sub = typeof source['path'] === 'string' ? ` (${source['path']})` : ''
+  const ref = typeof source['ref'] === 'string' ? `#${source['ref']}` : ''
+  return `${where}${ref}${sub}`
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** A Claude settings/known-marketplaces `source` object, validated like typed input. */
+function toMarketplaceSource(value: unknown): MarketplaceSource | undefined {
+  if (!isRecord(value)) return undefined
+  const ref = typeof value['ref'] === 'string' ? { ref: value['ref'] } : {}
+  try {
+    if (value['source'] === 'github' && typeof value['repo'] === 'string') {
+      const parsed = parseMarketplaceInput(value['repo'])
+      return parsed.source === 'github' ? { ...parsed, ...ref } : undefined
+    }
+    if ((value['source'] === 'git' || value['source'] === 'url') && typeof value['url'] === 'string') {
+      assertGitUrl(value['url'])
+      return { source: 'git', url: value['url'], ...ref }
+    }
+    if (value['source'] === 'directory' && typeof value['path'] === 'string' && path.isAbsolute(value['path'])) {
+      return { source: 'directory', path: value['path'] }
+    }
+  } catch {
+    return undefined
+  }
+  return undefined
 }
 
 function sameOwner(a: Pick<InstallRecord, 'scope' | 'workspaceId' | 'projectPath'>, b: Pick<InstallRecord, 'scope' | 'workspaceId' | 'projectPath'>): boolean {

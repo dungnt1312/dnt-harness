@@ -6175,6 +6175,15 @@ async function handleApi(
         send(200, await deps.plugins.list(context))
         return
       }
+      if (req.method === 'GET' && pluginId !== undefined && action === undefined) {
+        try {
+          send(200, await deps.plugins.details(pluginId, context))
+        } catch (error) {
+          if (error instanceof PluginError) { send(error.code === 'not-found' ? 404 : error.code === 'unsupported' ? 422 : 400, { error: error.message }); return }
+          throw error
+        }
+        return
+      }
       if (req.method === 'POST' && pluginId !== undefined && action !== undefined) {
         requireWorkspace(deps, wsId, true)
         const body = await readJson(req)

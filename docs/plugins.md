@@ -124,7 +124,27 @@ dnt-harness has its own host-wide store; it never writes Claude Code's
 ```
 
 Settings → Plugins adds a marketplace by GitHub `owner/repo`, git URL, or an
-absolute local folder. Marketplace entries support a relative folder,
+absolute local folder. Until it is added, the panel offers Anthropic's
+official marketplace (`anthropics/claude-plugins-official`) as a one-click
+recommendation.
+
+The **Available** list has one tab per marketplace (plus **All** when there
+are several), category chips with counts, and a search box. Each row opens a
+details dialog (`GET /api/workspaces/<ws>/plugins/<id>`) listing the plugin's
+skills, commands, agents, hook events and MCP servers with their
+descriptions; installed plugins have the same entry under their row menu. An
+installed plugin is read from its cache folder. A plugin that is not
+installed is read from its marketplace source without installing: a relative
+source in place, a git source cloned into `<data>/plugins/tmp/` and removed
+afterwards. Results are memoized per marketplace revision; failures are not.
+
+Installing `plugin@marketplace` from a marketplace that is not added yet adds
+it first, as Claude Code does. The source comes from, in order: settings
+`extraKnownMarketplaces`, Claude Code's own
+`~/.claude/plugins/known_marketplaces.json` (read only), then the built-in
+`claude-plugins-official`. An unknown marketplace is refused with 404. This is
+what makes **Install** work on a plugin that `~/.claude/settings.json` enables
+but this host has not installed. Marketplace entries support a relative folder,
 `github`, `url` (git repository), and `git-subdir` sources. Installation copies
 or clones the plugin into the cache and records the install in Claude's
 `installed_plugins.json` shape. Cache folders are immutable and keyed by

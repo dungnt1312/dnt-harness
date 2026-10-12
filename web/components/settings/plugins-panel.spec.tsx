@@ -2,11 +2,12 @@
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { addMarketplace, listMarketplaces, listPlugins, pluginAction, type PluginRowView } from '../../lib/api.ts'
+import { addMarketplace, listMarketplaces, listPlugins, pluginAction, pluginDetails, type PluginRowView } from '../../lib/api.ts'
 import { PluginsPanel, componentSummary } from './PluginsPanel.tsx'
 
 vi.mock('../../lib/api.ts', () => ({
   listPlugins: vi.fn(),
+  pluginDetails: vi.fn(),
   listMarketplaces: vi.fn(),
   pluginAction: vi.fn(),
   addMarketplace: vi.fn(),
@@ -94,8 +95,59 @@ describe('PluginsPanel', () => {
       setter.call(input, 'anthropics/claude-plugins-official')
       input.dispatchEvent(new Event('input', { bubbles: true }))
     })
-    await act(async () => { button('Add').click() })
+    await act(async () => { (host.querySelector('form button[type="submit"]') as HTMLButtonElement).click() })
     expect(addMarketplace).toHaveBeenCalledWith('anthropics/claude-plugins-official')
     expect(host.textContent).toContain('Added claude-plugins-official (315 plugins)')
+  })
+
+  it('offers the official marketplace with one click until it is added', async () => {
+    vi.mocked(addMarketplace).mockResolvedValue({ name: 'claude-plugins-official', plugins: 315 })
+    await mount()
+    const recommended = host.querySelector('[aria-label="Recommended marketplaces"]')!
+    expect(recommended.textContent).toContain('claude-plugins-official')
+    await act(async () => { (recommended.querySelector('button') as HTMLButtonElement).click() })
+    expect(addMarketplace).toHaveBeenCalledWith('anthropics/claude-plugins-official')
+    expect(host.textContent).toContain('Added claude-plugins-official (315 plugins)')
+  })
+
+  it('tabs available plugins by marketplace and filters by category', async () => {
+    vi.mocked(listMarketplaces).mockResolvedValue({ marketplaces: [
+      { name: 'market', source: { source: 'directory', path: '/m' }, lastUpdated: 'x', document: { name: 'market', plugins: [{ name: 'extra', category: 'dev' }, { name: 'lint', category: 'dev' }, { name: 'audit', category: 'security' }] } },
+      { name: 'mine', source: { source: 'github', repo: 'me/mine' }, lastUpdated: 'x', document: { name: 'mine', plugins: [{ name: 'solo' }] } },
+    ] })
+    await mount()
+    const tabs = [...host.querySelectorAll('[aria-label="Marketplace"] [role="tab"]')].map((tab) => tab.textContent)
+    expect(tabs).toEqual(['All4', 'market3', 'mine1'])
+    const names = (): string[] => [...host.querySelectorAll('[aria-label="Available plugins"] li .font-mono')].map((node) => node.textContent ?? '')
+    expect(names()).toEqual(['extra', 'lint', 'audit', 'solo'])
+    const tab = (label: string): HTMLButtonElement => [...host.querySelectorAll<HTMLButtonElement>('[aria-label="Marketplace"] [role="tab"]')].find((node) => node.textContent?.startsWith(label))!
+    await act(async () => { tab('mine').click() })
+    expect(names()).toEqual(['solo'])
+    await act(async () => { tab('market').click() })
+    await act(async () => { [...host.querySelectorAll<HTMLButtonElement>('[aria-label="Category"] button')].find((chip) => chip.textContent?.startsWith('security'))!.click() })
+    expect(names()).toEqual(['audit'])
+  })
+
+  it('opens plugin details showing what it contains', async () => {
+    vi.mocked(pluginDetails).mockResolvedValue({
+      id: 'extra@market', name: 'extra', marketplace: 'market', description: 'More things', author: 'Ann',
+      source: { kind: 'github', location: 'ann/extra' },
+      commands: [{ name: 'extra:go', description: 'Go' }], skills: [{ name: 'extra:think' }], agents: [],
+      hooks: ['SessionStart'], mcpServers: [{ name: 'db', type: 'stdio' }], notes: [],
+    })
+    await mount()
+    await act(async () => { (host.querySelector('[aria-label="Details for extra@market"]') as HTMLButtonElement).click() })
+    expect(pluginDetails).toHaveBeenCalledWith('ws', 'extra@market', undefined)
+    const dialog = document.body.querySelector('[role="dialog"]')!
+    for (const text of ['/extra:go', 'extra:think', 'SessionStart', 'db', 'ann/extra', 'Ann']) expect(dialog.textContent).toContain(text)
+  })
+
+  it('hides the recommendation once the official marketplace is present', async () => {
+    vi.mocked(listMarketplaces).mockResolvedValue({ marketplaces: [{
+      name: 'claude-plugins-official', source: { source: 'github', repo: 'anthropics/claude-plugins-official' }, lastUpdated: '2026-10-12',
+      document: { name: 'claude-plugins-official', plugins: [] },
+    }] })
+    await mount()
+    expect(host.querySelector('[aria-label="Recommended marketplaces"]')).toBeNull()
   })
 })

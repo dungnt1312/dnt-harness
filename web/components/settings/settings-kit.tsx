@@ -235,7 +235,8 @@ export function SubTabs<V extends string>({ label, value, onChange, tabs }: {
 
 /** Compact labelled switch for list rows ("In picker", "Enabled"). */
 export function InlineSwitch({ label, ariaLabel, checked, disabled = false, title, onChange }: {
-  readonly label: string
+  /** Visible text before the switch; omit when the row already makes the meaning obvious. */
+  readonly label?: string
   readonly ariaLabel: string
   readonly checked: boolean
   readonly disabled?: boolean

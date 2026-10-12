@@ -257,47 +257,86 @@ export async function findEntry(deps: MarketplaceDeps, marketplace: string, plug
   return entry !== undefined ? { entry, location: known.installLocation } : undefined
 }
 
+/** A plugin source kind as the UI shows it: `relative`, `github`, `url`, `git-subdir`, or the raw unsupported kind. */
+export function sourceKind(source: unknown): string {
+  if (typeof source === 'string') return 'relative'
+  if (source !== null && typeof source === 'object') {
+    const kind = (source as Record<string, unknown>)['source']
+    return typeof kind === 'string' ? kind : 'unknown'
+  }
+  return 'unknown'
+}
+
+/**
+ * Put a marketplace entry's files on disk without publishing them. A
+ * relative source is copied into `scratch` when `copyRelative`, else read in
+ * place; git sources clone into `scratch`. The tree must stay contained.
+ */
+async function stagePlugin(deps: MarketplaceDeps, entry: MarketplaceEntry, location: string, scratch: string, copyRelative: boolean): Promise<{ readonly pluginDir: string; readonly commit?: string }> {
+  const clone = deps.clone ?? cloneRepo
+  const source = entry.source
+  let pluginDir: string
+  let commit: string | undefined
+  if (typeof source === 'string') {
+    const resolved = await resolveExistingInside(location, source)
+    if (resolved === undefined) throw new PluginError('invalid', `plugin '${entry.name}': source '${source}' is missing or outside the marketplace after symlink resolution`)
+    if (copyRelative) {
+      await fs.mkdir(path.dirname(scratch), { recursive: true })
+      await fs.cp(resolved, scratch, { recursive: true, dereference: false, filter: (from) => !from.split(path.sep).includes('.git') })
+      pluginDir = scratch
+    } else {
+      pluginDir = resolved
+    }
+  } else if (source !== null && typeof source === 'object') {
+    const spec = source as Record<string, unknown>
+    const kind = spec['source']
+    const ref = typeof spec['ref'] === 'string' ? spec['ref'] : undefined
+    const sha = typeof spec['sha'] === 'string' ? spec['sha'] : undefined
+    if (kind === 'github' && typeof spec['repo'] === 'string') {
+      commit = await clone(githubUrl(spec['repo']), scratch, ref, sha)
+      pluginDir = scratch
+    } else if ((kind === 'url' || kind === 'git') && typeof spec['url'] === 'string') {
+      commit = await clone(spec['url'], scratch, ref, sha)
+      pluginDir = scratch
+    } else if (kind === 'git-subdir' && typeof spec['url'] === 'string' && typeof spec['path'] === 'string') {
+      commit = await clone(spec['url'], scratch, ref, sha)
+      const sub = await resolveExistingInside(scratch, spec['path'])
+      if (sub === undefined) throw new PluginError('invalid', `plugin '${entry.name}': path '${spec['path']}' is missing or outside the repository after symlink resolution`)
+      pluginDir = sub
+    } else {
+      throw new PluginError('unsupported', `plugin '${entry.name}': source ${JSON.stringify(kind)} is not supported by dnt-harness`)
+    }
+  } else {
+    throw new PluginError('invalid', `plugin '${entry.name}' has no source`)
+  }
+  if ((await fs.stat(pluginDir).catch(() => undefined))?.isDirectory() !== true) throw new PluginError('invalid', `plugin '${entry.name}': source folder is missing`)
+  await assertPluginTreeContained(pluginDir)
+  return { pluginDir, ...(commit !== undefined ? { commit } : {}) }
+}
+
+/**
+ * Run `inspect` on a marketplace entry's files without installing anything:
+ * git sources clone into a temporary folder that is removed afterwards.
+ */
+export async function inspectPlugin<T>(deps: MarketplaceDeps, marketplace: string, entry: MarketplaceEntry, location: string, inspect: (pluginDir: string) => Promise<T>): Promise<T> {
+  // Outside cache/<m>/<p>/ so an uninstall's cache prune never races it.
+  const scratch = path.join(deps.store.root, 'tmp', `inspect-${marketplace}-${entry.name}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
+  try {
+    const { pluginDir } = await stagePlugin(deps, entry, location, scratch, false)
+    return await inspect(pluginDir)
+  } finally {
+    await fs.rm(scratch, { recursive: true, force: true })
+  }
+}
+
 /**
  * Fetch one plugin's files into `cache/<m>/<p>/<version>/`. Returns the
  * install path, the version, and the git commit when one was cloned.
  */
 export async function fetchPlugin(deps: MarketplaceDeps, marketplace: string, entry: MarketplaceEntry, location: string): Promise<{ readonly installPath: string; readonly version: string; readonly gitCommitSha?: string }> {
-  const clone = deps.clone ?? cloneRepo
-  const source = entry.source
   const scratch = path.join(deps.store.cacheDir, marketplace, entry.name, `.fetch-${process.pid}-${Date.now()}`)
-  let pluginDir: string
-  let commit: string | undefined
   try {
-    if (typeof source === 'string') {
-      const resolved = await resolveExistingInside(location, source)
-      if (resolved === undefined) throw new PluginError('invalid', `plugin '${entry.name}': source '${source}' is missing or outside the marketplace after symlink resolution`)
-      await fs.mkdir(path.dirname(scratch), { recursive: true })
-      await fs.cp(resolved, scratch, { recursive: true, dereference: false, filter: (from) => !from.split(path.sep).includes('.git') })
-      pluginDir = scratch
-    } else if (source !== null && typeof source === 'object') {
-      const spec = source as Record<string, unknown>
-      const kind = spec['source']
-      const ref = typeof spec['ref'] === 'string' ? spec['ref'] : undefined
-      const sha = typeof spec['sha'] === 'string' ? spec['sha'] : undefined
-      if (kind === 'github' && typeof spec['repo'] === 'string') {
-        commit = await clone(githubUrl(spec['repo']), scratch, ref, sha)
-        pluginDir = scratch
-      } else if ((kind === 'url' || kind === 'git') && typeof spec['url'] === 'string') {
-        commit = await clone(spec['url'], scratch, ref, sha)
-        pluginDir = scratch
-      } else if (kind === 'git-subdir' && typeof spec['url'] === 'string' && typeof spec['path'] === 'string') {
-        commit = await clone(spec['url'], scratch, ref, sha)
-        const sub = await resolveExistingInside(scratch, spec['path'])
-        if (sub === undefined) throw new PluginError('invalid', `plugin '${entry.name}': path '${spec['path']}' is missing or outside the repository after symlink resolution`)
-        pluginDir = sub
-      } else {
-        throw new PluginError('unsupported', `plugin '${entry.name}': source ${JSON.stringify(kind)} is not supported by dnt-harness`)
-      }
-    } else {
-      throw new PluginError('invalid', `plugin '${entry.name}' has no source`)
-    }
-    if ((await fs.stat(pluginDir).catch(() => undefined))?.isDirectory() !== true) throw new PluginError('invalid', `plugin '${entry.name}': source folder is missing`)
-    await assertPluginTreeContained(pluginDir)
+    const { pluginDir, commit } = await stagePlugin(deps, entry, location, scratch, true)
     // plugin.json is optional (Claude derives the name from the entry); an
     // invalid one is still an error.
     const manifest = await readManifest(pluginDir, { ...entry.raw, name: entry.name })
