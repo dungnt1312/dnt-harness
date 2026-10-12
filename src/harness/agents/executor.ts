@@ -22,6 +22,8 @@ import { agentScope, type AgentScope } from '../agent/scope.ts'
 import type { AgentDefinition, AgentSource } from './definition-service.ts'
 import type { SessionEvent, TurnEndReason } from '../session/events.ts'
 import type { GrantedRoot } from '../tools/types.ts'
+import { describeProgress, type ChildProgress } from './child-progress.ts'
+import { resolveLimits, type HarnessLimits } from '../limits.ts'
 
 /**
  * What a child is asked to do. `prompt` is the brief in prose — the primary
@@ -144,6 +146,11 @@ export interface ChildHandle {
   readonly error?: string
   /** A running child parked on an approval nobody has answered yet. */
   readonly awaitingApproval?: boolean
+  /**
+   * Running children only: elapsed time, step/tool counts, last activity and
+   * advisory health, so a caller can tell a slow child from a stuck one.
+   */
+  readonly progress?: ChildProgress
 }
 
 /** Longest report handed back before an explicit truncation marker. */
@@ -289,6 +296,11 @@ export class ChildExecutor {
   private readonly stoppedManualTurns = new Set<string>()
 
   constructor(private readonly ctx: Context, private readonly onManualTurnSettled?: (root: SessionId) => void) {}
+
+  /** The host's resolved limits, read the same way the agent loop reads them. */
+  private limits(): HarnessLimits {
+    return resolveLimits((this.ctx.get('limits') ?? {}) as Partial<HarnessLimits>)
+  }
 
   /** Conversation startup shares the manual-spawn writer, including awaited authority checks. */
   async admitConversation(root: SessionId, start: () => void): Promise<boolean> {
@@ -1504,6 +1516,7 @@ export class ChildExecutor {
       ...(child.partial !== undefined ? { partial: child.partial } : {}),
       ...(child.error !== undefined ? { error: child.error } : {}),
       ...(child.status === 'running' && awaitsApproval(child.events) ? { awaitingApproval: true } : {}),
+      ...(child.status === 'running' ? { progress: describeProgress(child.events, child.startedAt, Date.now(), this.limits()) } : {}),
     }
   }
 }

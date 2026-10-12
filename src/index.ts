@@ -244,6 +244,7 @@ export {
   type ChildResult,
   type ChildStatus,
 } from './harness/agents/executor.ts'
+export { describeProgress, type ChildProgress, type ChildHealth, type ChildActivity } from './harness/agents/child-progress.ts'
 export {
   importClaudeDefinition,
   importCodexDefinition,
