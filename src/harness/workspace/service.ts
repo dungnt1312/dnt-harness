@@ -420,6 +420,15 @@ export class WorkspaceService {
     return updated
   }
 
+  /** Persist whether the project's own git configuration may run. */
+  async setProjectGitTrusted(id: ProjectId, workspaceId: WorkspaceId, trusted: boolean): Promise<ProjectRecord> {
+    const record = this.getProject(id, workspaceId)
+    const updated: ProjectRecord = { ...record, gitTrusted: trusted }
+    this.projects.set(id, updated)
+    await writeJson(this.projectPath(record.workspaceId, id), updated)
+    return updated
+  }
+
   /** Rename is display metadata only; ids and folders stay stable. */
   async renameProject(id: ProjectId, workspaceId: WorkspaceId, name: string): Promise<ProjectRecord> {
     const record = this.getProject(id, workspaceId)

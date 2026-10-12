@@ -69,4 +69,17 @@ describe('gitDiff of a file without a HEAD record', () => {
     expect(diff.lines.some((line) => line.kind === 'del' && line.text === 'a')).toBe(true)
     expect(diff.lines.some((line) => line.kind === 'add' && line.text === 'b')).toBe(true)
   })
+
+  it('a trusted diff of the same file is identical: trust only changes what repository config may run', async () => {
+    const untrusted = await gitDiff(repo, 'tracked.txt')
+    const trusted = await gitDiff(repo, 'tracked.txt', undefined, true)
+    expect(trusted).toEqual(untrusted)
+  })
+
+  it('a path that looks like an option or holds spaces stays a path after --', async () => {
+    await fs.writeFile(path.join(repo, '-rf'), 'dash\n')
+    await fs.writeFile(path.join(repo, 'a b.txt'), 'space\n')
+    expect((await gitDiff(repo, '-rf')).lines.some((line) => line.kind === 'add' && line.text === 'dash')).toBe(true)
+    expect((await gitDiff(repo, 'a b.txt')).lines.some((line) => line.kind === 'add' && line.text === 'space')).toBe(true)
+  })
 })

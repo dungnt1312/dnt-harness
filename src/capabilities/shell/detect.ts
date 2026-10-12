@@ -105,6 +105,46 @@ function detectZsh(): ShellDetection {
 }
 
 /**
+ * The account's login shell — what a terminal opened on this machine would
+ * run — used to capture a project directory's environment.
+ *
+ * Order: `$SHELL`, then on macOS the Directory Services record (`$SHELL` is
+ * unset under launchd), then `/bin/sh`. Windows has no login-shell concept, so
+ * it is PowerShell. Not memoized: `$SHELL` is read at call time, and the
+ * caller caches whatever it derives from the result.
+ */
+export function detectLoginShell(): ShellDetection {
+  if (process.platform === 'win32') {
+    const system = process.env['SystemRoot'] ?? 'C:\\Windows'
+    const powershell = path.join(system, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    return existsSync(powershell)
+      ? { executable: powershell, hint: powershell }
+      : { executable: 'powershell.exe', hint: 'powershell.exe on PATH' }
+  }
+  const fromEnv = process.env['SHELL']?.trim()
+  if (fromEnv !== undefined && fromEnv !== '' && existsSync(fromEnv)) return { executable: fromEnv, hint: fromEnv }
+  if (process.platform === 'darwin') {
+    const lookup = spawnSync('dscl', ['.', '-read', `/Users/${process.env['USER'] ?? ''}`, 'UserShell'], { encoding: 'utf8' })
+    if (lookup.status === 0) {
+      const login = /UserShell:\s*(\S+)/.exec(lookup.stdout)?.[1]
+      if (login !== undefined && existsSync(login)) return { executable: login, hint: login }
+    }
+  }
+  return { executable: '/bin/sh', hint: '/bin/sh' }
+}
+
+/**
+ * Arguments that make `shell` run one `command` the way a terminal session
+ * would have set up its environment: login and interactive, so both the
+ * profile and the rc files are read. PowerShell has neither flag; its profile
+ * is read by default.
+ */
+export function loginShellArgs(shell: string, command: string): string[] {
+  if (/(^|[\\/])(powershell|pwsh)(\.exe)?$/i.test(shell)) return ['-NoLogo', '-Command', command]
+  return ['-l', '-i', '-c', command]
+}
+
+/**
  * The shells that exist on this host, for a terminal client's picker.
  *
  * Only resolvable shells are listed: a picker that offers `powershell` on

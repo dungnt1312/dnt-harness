@@ -27,6 +27,12 @@ export interface ProjectRecord {
    * Absent on records that never granted any.
    */
   additionalDirectories?: readonly AdditionalDirectory[]
+  /**
+   * The user trusts this folder's own git configuration (hooks, credential
+   * helper, ssh command, external diff). Absent — every record written before
+   * this field existed — means untrusted.
+   */
+  gitTrusted?: boolean
   readonly createdAt: number
 }
 
