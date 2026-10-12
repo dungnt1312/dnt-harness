@@ -5,6 +5,7 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
+import type { TokenEndpointAuth } from './config.ts'
 
 export type OAuthPhase = 'active' | 'refresh_in_progress' | 'replacement_persisted' | 'auth_required' | 'local_revoked'
 
@@ -18,6 +19,29 @@ export interface OAuthTokens {
   readonly resource: string
   readonly workspaceId?: string
   readonly server?: string
+  /** How refresh authenticates; absent means `none` (public client). The secret itself is never stored here. */
+  readonly tokenEndpointAuth?: TokenEndpointAuth
+  /** Set by an `insufficient_scope` answer: the scope the next sign-in must request. */
+  readonly missingScope?: string
+}
+
+/**
+ * What discovery found for one server, plus the client the host registered.
+ * Host-owned: request bodies never supply these endpoints.
+ */
+export interface OAuthServerRecord {
+  /** The `mcp.json` URL this record was discovered for. A different URL invalidates it. */
+  readonly serverUrl: string
+  readonly resource: string
+  readonly issuer: string
+  readonly authorizationEndpoint: string
+  readonly tokenEndpoint: string
+  readonly revocationEndpoint?: string
+  /** Scopes requested at the last connect. */
+  readonly scopes: readonly string[]
+  /** Present only for a client the host registered (RFC 7591). */
+  readonly registration?: { readonly clientId: string; readonly redirectUri: string; readonly issuedAt: number }
+  readonly discoveredAt: number
 }
 
 export interface OAuthTransaction {
@@ -34,6 +58,7 @@ export interface OAuthTransaction {
   readonly scopes: readonly string[]
   readonly expiresAt: number
   readonly code: string | undefined
+  readonly tokenEndpointAuth?: TokenEndpointAuth
 }
 
 export class OAuthStore {
@@ -81,6 +106,20 @@ export class OAuthStore {
 
   async readTokens(workspaceId: string, server: string): Promise<OAuthTokens | undefined> {
     return this.read(tokenName(workspaceId, server))
+  }
+
+  async saveServerRecord(workspaceId: string, server: string, record: OAuthServerRecord): Promise<void> {
+    await this.write(recordName(workspaceId, server), record)
+  }
+
+  async readServerRecord(workspaceId: string, server: string): Promise<OAuthServerRecord | undefined> {
+    return this.read(recordName(workspaceId, server))
+  }
+
+  /** The server left the config: forget its discovery, registration, and tokens. */
+  async deleteServer(workspaceId: string, server: string): Promise<void> {
+    await fs.rm(path.join(this.directory, recordName(workspaceId, server)), { force: true })
+    await fs.rm(path.join(this.directory, tokenName(workspaceId, server)), { force: true })
   }
 
   private async withStateLock<T>(state: string, body: () => Promise<T>): Promise<T> {
@@ -138,4 +177,8 @@ export class OAuthStore {
 
 function tokenName(workspaceId: string, server: string): string {
   return `tokens-${encodeURIComponent(workspaceId)}-${encodeURIComponent(server)}.json`
+}
+
+function recordName(workspaceId: string, server: string): string {
+  return `server-${encodeURIComponent(workspaceId)}-${encodeURIComponent(server)}.json`
 }

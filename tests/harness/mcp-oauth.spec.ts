@@ -222,6 +222,94 @@ describe('managed oauth profile', () => {
   })
 })
 
+describe('managed oauth client authentication and server records', () => {
+  async function withStore<T>(body: (store: OAuthStore) => Promise<T>): Promise<T> {
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-oauth-'))
+    try { return await body(new OAuthStore(home, randomBytes(32))) } finally { await fs.rm(home, { recursive: true, force: true }) }
+  }
+  type Seen = { body: URLSearchParams; authorization: string | null }
+  function recorder(seen: Seen[]): typeof fetch {
+    return (async (_url: unknown, init?: RequestInit) => {
+      seen.push({ body: new URLSearchParams(String(init?.body)), authorization: new Headers(init?.headers).get('authorization') })
+      return Response.json({ access_token: 'access-new', refresh_token: 'refresh-new', expires_in: 3600 })
+    }) as typeof fetch
+  }
+  async function confidentialComplete(store: OAuthStore, method: 'client_secret_post' | 'client_secret_basic', seen: Seen[]) {
+    const oauth = new ManagedOAuth(store, recorder(seen), undefined, async () => 'shh-secret')
+    const { state } = await oauth.begin({
+      workspaceId: 'ws', server: 'remote', principalId: 'p', resource: 'http://127.0.0.1/mcp',
+      authorizationEndpoint: 'http://127.0.0.1/authorize', tokenEndpoint: 'http://127.0.0.1/token', clientId: 'client',
+      redirectUri: 'http://127.0.0.1/callback', scopes: [], tokenEndpointAuth: method,
+    })
+    await oauth.deposit(state, 'code')
+    await oauth.complete({ state, principalId: 'p', workspaceId: 'ws', server: 'remote' })
+    return oauth
+  }
+
+  it('sends the client secret in the body for client_secret_post, and never stores it', async () => {
+    await withStore(async (store) => {
+      const seen: Seen[] = []
+      await confidentialComplete(store, 'client_secret_post', seen)
+      expect(seen[0]?.body.get('client_secret')).toBe('shh-secret')
+      expect(seen[0]?.body.get('client_id')).toBe('client')
+      expect(seen[0]?.authorization).toBeNull()
+      const tokens = await store.readTokens('ws', 'remote')
+      expect(tokens?.tokenEndpointAuth).toBe('client_secret_post')
+      expect(JSON.stringify(tokens)).not.toContain('shh-secret')
+    })
+  })
+
+  it('sends HTTP Basic for client_secret_basic, on the exchange and on refresh', async () => {
+    await withStore(async (store) => {
+      const seen: Seen[] = []
+      const oauth = await confidentialComplete(store, 'client_secret_basic', seen)
+      await oauth.refresh('ws', 'remote', 'access-new')
+      const expected = `Basic ${Buffer.from('client:shh-secret').toString('base64')}`
+      expect(seen.map((entry) => entry.authorization)).toEqual([expected, expected])
+      expect(seen.every((entry) => !entry.body.has('client_secret') && !entry.body.has('client_id'))).toBe(true)
+    })
+  })
+
+  it('refuses a confidential exchange when the secret is not available', async () => {
+    await withStore(async (store) => {
+      const oauth = new ManagedOAuth(store, recorder([]), undefined, async () => undefined)
+      const { state } = await oauth.begin({
+        workspaceId: 'ws', server: 'remote', principalId: 'p', resource: 'http://127.0.0.1/mcp',
+        authorizationEndpoint: 'http://127.0.0.1/authorize', tokenEndpoint: 'http://127.0.0.1/token', clientId: 'client',
+        redirectUri: 'http://127.0.0.1/callback', scopes: [], tokenEndpointAuth: 'client_secret_post',
+      })
+      await oauth.deposit(state, 'code')
+      await expect(oauth.complete({ state, principalId: 'p', workspaceId: 'ws', server: 'remote' })).rejects.toThrow(/client secret is not available/)
+    })
+  })
+
+  it('marks a grant as needing sign-in with the missing scope', async () => {
+    await withStore(async (store) => {
+      await store.saveTokens('ws', 'remote', { ...expiredTokens(), expiresAt: Date.now() + 3_600_000 })
+      const oauth = new ManagedOAuth(store)
+      await oauth.markScopeRequired('ws', 'remote', 'write')
+      await expect(oauth.accessToken('ws', 'remote')).resolves.toBeUndefined()
+      expect(await oauth.tokenState('ws', 'remote')).toMatchObject({ phase: 'auth_required', missingScope: 'write' })
+    })
+  })
+
+  it('stores a server record encrypted and deletes it with the tokens', async () => {
+    await withStore(async (store) => {
+      const record = {
+        serverUrl: 'https://mcp.example.com/mcp', resource: 'https://mcp.example.com/mcp', issuer: 'https://mcp.example.com',
+        authorizationEndpoint: 'https://mcp.example.com/authorize', tokenEndpoint: 'https://mcp.example.com/token',
+        scopes: ['read'], registration: { clientId: 'reg-1', redirectUri: 'http://127.0.0.1:1/api/mcp/oauth/callback', issuedAt: 1 }, discoveredAt: 1,
+      }
+      await store.saveServerRecord('ws', 'remote', record)
+      await store.saveTokens('ws', 'remote', expiredTokens())
+      expect(await store.readServerRecord('ws', 'remote')).toEqual(record)
+      await store.deleteServer('ws', 'remote')
+      expect(await store.readServerRecord('ws', 'remote')).toBeUndefined()
+      expect(await store.readTokens('ws', 'remote')).toBeUndefined()
+    })
+  })
+})
+
 async function depositedAuthorization(oauth: ManagedOAuth) {
   const { state } = await oauth.begin({
     workspaceId: 'ws', server: 'remote', principalId: 'person-a',

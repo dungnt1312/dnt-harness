@@ -4,11 +4,25 @@
  * local session. The browser session that started the flow completes the
  * token exchange.
  *
- * Dynamic client registration is not implemented.
+ * Discovery and client registration live in `oauth-discovery.ts` and
+ * `oauth-registration.ts`; this class only runs the grant once the
+ * endpoints and client are known. Confidential clients authenticate with
+ * `client_secret_post` or `client_secret_basic`; the secret is resolved per
+ * exchange through `secretFor` and never stored with the tokens.
  */
 import { createHash, randomBytes } from 'node:crypto'
+import type { TokenEndpointAuth } from './config.ts'
 import { assertOutboundUrl, OutboundPolicyError } from './outbound-policy.ts'
 import { OAuthStore, type OAuthTokens } from './oauth-store.ts'
+
+/** Resolves a confidential client's secret for one server, at the moment it is needed. */
+export type ClientSecretSource = (workspaceId: string, server: string) => Promise<string | undefined>
+
+interface ClientAuth {
+  readonly clientId: string
+  readonly method: TokenEndpointAuth
+  readonly secret: string | undefined
+}
 
 const SKEW_MS = 30_000
 
@@ -49,6 +63,8 @@ export interface OAuthBegin {
   readonly clientId: string
   readonly redirectUri: string
   readonly scopes: readonly string[]
+  /** Defaults to `none` (public client with PKCE). */
+  readonly tokenEndpointAuth?: TokenEndpointAuth
 }
 
 export class OAuthFlowError extends Error {
@@ -71,7 +87,38 @@ export class ManagedOAuth {
     private readonly store: OAuthStore,
     private readonly fetchImpl: typeof fetch = fetch,
     private readonly now: () => number = () => Date.now(),
+    private readonly secretFor: ClientSecretSource = async () => undefined,
   ) {}
+
+  /** Read-only view of the stored grant (phase, missing scope); never sent to a browser as is. */
+  async tokenState(workspaceId: string, server: string): Promise<OAuthTokens | undefined> {
+    return this.store.readTokens(workspaceId, server)
+  }
+
+  /**
+   * The server answered `insufficient_scope`. Refreshing cannot add scope,
+   * so the grant waits for a person to sign in again with `scope` added.
+   */
+  async markScopeRequired(workspaceId: string, server: string, scope: string | undefined): Promise<void> {
+    const fence = grantFence(this.store, workspaceId, server)
+    await serializeWrite(fence, async () => {
+      const current = await this.store.readTokens(workspaceId, server)
+      if (current === undefined || current.phase === 'local_revoked') return
+      await this.store.saveTokens(workspaceId, server, {
+        ...current,
+        phase: 'auth_required',
+        ...(scope !== undefined && scope !== '' ? { missingScope: scope } : {}),
+      })
+    })
+  }
+
+  private async clientAuth(workspaceId: string, server: string, clientId: string, method: TokenEndpointAuth | undefined): Promise<ClientAuth> {
+    const resolved = method ?? 'none'
+    if (resolved === 'none') return { clientId, method: resolved, secret: undefined }
+    const secret = await this.secretFor(workspaceId, server)
+    if (secret === undefined || secret === '') throw new OAuthFlowError('client secret is not available; add it in Settings → Secrets')
+    return { clientId, method: resolved, secret }
+  }
 
   async begin(input: OAuthBegin): Promise<{ readonly authorizationUrl: string; readonly state: string }> {
     assertOauthUrl(input.authorizationEndpoint)
@@ -94,6 +141,7 @@ export class ManagedOAuth {
       scopes: input.scopes,
       expiresAt: this.now() + 5 * 60_000,
       code: undefined,
+      ...(input.tokenEndpointAuth !== undefined ? { tokenEndpointAuth: input.tokenEndpointAuth } : {}),
     })
     const url = new URL(input.authorizationEndpoint)
     url.searchParams.set('response_type', 'code')
@@ -125,14 +173,14 @@ export class ManagedOAuth {
     }
     const fence = grantFence(this.store, tx.workspaceId, tx.server)
     const generation = fence.generation
+    const client = await this.clientAuth(tx.workspaceId, tx.server, tx.clientId, tx.tokenEndpointAuth)
     const tokens = await this.exchange(tx.tokenEndpoint, new URLSearchParams({
       grant_type: 'authorization_code',
       code: tx.code,
       code_verifier: tx.verifier,
       redirect_uri: tx.redirectUri,
-      client_id: tx.clientId,
       resource: tx.resource,
-    }))
+    }), client)
     await serializeWrite(fence, async () => {
       if (fence.generation !== generation) throw new OAuthFlowError('authorization was locally revoked or replaced')
       await this.store.saveTokens(tx.workspaceId, tx.server, { ...tokens, phase: 'active', resource: tx.resource })
@@ -207,12 +255,12 @@ export class ManagedOAuth {
       if (!await save({ ...current, phase: 'refresh_in_progress' })) return undefined
       let next: OAuthTokens
       try {
+        const client = await this.clientAuth(workspaceId, server, current.clientId, current.tokenEndpointAuth)
         next = await this.exchange(current.tokenEndpoint, new URLSearchParams({
           grant_type: 'refresh_token',
           refresh_token: current.refreshToken,
-          client_id: current.clientId,
           resource: current.resource,
-        }))
+        }), client)
       } catch (error) {
         if (fenced()) return undefined
         if (error instanceof OAuthTemporaryError) {
@@ -246,29 +294,34 @@ export class ManagedOAuth {
         : { ...stored, phase: 'local_revoked', accessToken: '', refreshToken: '' })
       return stored
     })
-    if (revocationEndpoint === undefined || current === undefined) return { local: 'revoked', remote: 'unavailable' }
+    if (revocationEndpoint === undefined || current === undefined || current.accessToken === '') return { local: 'revoked', remote: 'unavailable' }
     try {
       assertOauthUrl(revocationEndpoint)
+      const client = await this.clientAuth(workspaceId, server, current.clientId, current.tokenEndpointAuth)
+      const { headers, body } = authenticated(new URLSearchParams({ token: current.accessToken }), client)
       const response = await this.fetchImpl(revocationEndpoint, {
         method: 'POST',
         redirect: 'manual',
-        headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ token: current.accessToken, client_id: current.clientId }),
+        headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers },
+        body,
+        signal: AbortSignal.timeout(15_000),
       })
+      await response.body?.cancel().catch(() => undefined)
       return { local: 'revoked', remote: response.ok ? 'succeeded' : 'failed' }
     } catch {
       return { local: 'revoked', remote: 'failed' }
     }
   }
 
-  private async exchange(endpoint: string, body: URLSearchParams): Promise<OAuthTokens> {
+  private async exchange(endpoint: string, grant: URLSearchParams, client: ClientAuth): Promise<OAuthTokens> {
     assertOauthUrl(endpoint)
+    const { headers, body } = authenticated(grant, client)
     let response: Response
     try {
       response = await this.fetchImpl(endpoint, {
         method: 'POST',
         redirect: 'manual',
-        headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+        headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json', ...headers },
         body,
         signal: AbortSignal.timeout(15_000),
       })
@@ -289,14 +342,32 @@ export class ManagedOAuth {
     const expiresIn = typeof parsed.expires_in === 'number' ? parsed.expires_in : 3600
     return {
       accessToken: parsed.access_token,
-      refreshToken: typeof parsed.refresh_token === 'string' ? parsed.refresh_token : (body.get('refresh_token') ?? ''),
+      refreshToken: typeof parsed.refresh_token === 'string' ? parsed.refresh_token : (grant.get('refresh_token') ?? ''),
       expiresAt: this.now() + expiresIn * 1000,
       tokenEndpoint: endpoint,
-      clientId: body.get('client_id') ?? '',
+      clientId: client.clientId,
       phase: 'active',
-      resource: body.get('resource') ?? '',
+      resource: grant.get('resource') ?? '',
+      ...(client.method !== 'none' ? { tokenEndpointAuth: client.method } : {}),
     }
   }
+}
+
+/**
+ * Apply the client's token-endpoint authentication (RFC 6749 §2.3.1).
+ * Public clients send `client_id` in the body. Basic encodes id and secret
+ * form-urlencoded first, as the RFC requires.
+ */
+function authenticated(grant: URLSearchParams, client: ClientAuth): { readonly headers: Record<string, string>; readonly body: URLSearchParams } {
+  const body = new URLSearchParams(grant)
+  if (client.method === 'client_secret_basic') {
+    const user = encodeURIComponent(client.clientId)
+    const password = encodeURIComponent(client.secret ?? '')
+    return { headers: { authorization: `Basic ${Buffer.from(`${user}:${password}`).toString('base64')}` }, body }
+  }
+  body.set('client_id', client.clientId)
+  if (client.method === 'client_secret_post') body.set('client_secret', client.secret ?? '')
+  return { headers: {}, body }
 }
 
 function assertOauthUrl(raw: string): void {
