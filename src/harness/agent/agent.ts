@@ -106,6 +106,11 @@ export class Agent {
   set status(value: AgentStatus) { this.currentStatus = value }
   /** What the driver is currently busy with (transient, for status UIs). */
   activity: 'model' | 'tool' | null = null
+  /**
+   * Last stream progress the request watchdog would count, tool-call argument
+   * fragments included (they never reach the log). Transient, for liveness.
+   */
+  modelProgressAt: number | undefined
 
   private inbox: InboxItem[] = []
   /** Accepted inputs removed from the inbox but not yet durably settled. */
@@ -725,6 +730,9 @@ export class Agent {
             }
             // Accounting alone is not model progress. Tool argument fragments
             // are progress, but never become transcript entries or executable calls.
+            if (event.type === 'toolCallProgress' || (event.type === 'delta' && event.delta !== '') || (event.type === 'toolCalls' && event.calls.length > 0)) {
+              this.modelProgressAt = Date.now()
+            }
             if (event.type === 'delta') {
               if (event.delta === '') continue
               outputBytes += encodedBytes(event.delta)

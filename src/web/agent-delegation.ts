@@ -493,17 +493,31 @@ const minutes = (ms: number): string => `${Math.max(1, Math.round(ms / 60_000))}
  * advisory health: a healthy child is told apart from a stuck one, so the
  * model stops cancelling work that is merely slow.
  */
-export function runningNote(running: readonly ChildHandle[]): string {
-  if (running.some((child) => child.awaitingApproval === true)) {
-    return 'a child is waiting for the user to answer an approval; wait again or cancel it'
+export function runningNote(unsettled: readonly ChildHandle[]): string {
+  const parts: string[] = []
+  if (unsettled.some((child) => child.awaitingApproval === true)) {
+    parts.push('a child is waiting for the user to answer an approval; wait again or cancel it')
   }
-  const stalled = running.flatMap((child) => child.progress?.health === 'stalled' ? [{ id: child.childSessionId, activity: child.progress.lastActivity }] : [])
-  if (stalled.length > 0) {
-    return stalled
-      .map(({ id, activity }) => `${id} shows no progress for ${minutes(activity.sinceMs)} (${activity.name ?? activity.kind})${activity.kind === 'model' ? '; the host aborts a stalled model request and retries on its own' : ''}`)
-      .join('; ') + '. Wait once more; cancel only if it is still stalled or no longer needed.'
+  const queued = unsettled.filter((child) => child.status === 'queued' || child.status === 'dispatching')
+  if (queued.length > 0) parts.push(`${queued.map((child) => child.childSessionId).join(', ')} has not started yet (waiting for a run slot)`)
+  const stalled: string[] = []
+  const slow: string[] = []
+  for (const child of unsettled) {
+    const progress = child.progress
+    if (progress === undefined || child.awaitingApproval === true) continue
+    const what = progress.lastActivity.name ?? progress.lastActivity.kind
+    if (progress.health === 'stalled') {
+      stalled.push(`${child.childSessionId} shows no progress for ${minutes(progress.lastActivity.sinceMs)} (${what})${progress.lastActivity.kind === 'model' ? '; the host aborts a stalled model request and retries on its own' : ''}`)
+    } else if (progress.health === 'slow') {
+      slow.push(`${child.childSessionId} quiet for ${minutes(progress.lastActivity.sinceMs)} (${what}), within limits`)
+    }
   }
-  return 'still running and making progress; this is normal for long tasks. Do not cancel: wait again with a longer timeoutMs, or keep working and the reports will arrive when your turn would close.'
+  if (stalled.length > 0) parts.push(stalled.join('; ') + '. Wait once more; cancel only if it is still stalled or no longer needed')
+  if (slow.length > 0) parts.push(slow.join('; ') + '. Keep waiting')
+  if (parts.length === 0) {
+    return 'still running and making progress; this is normal for long tasks. Do not cancel: wait again with a longer timeoutMs, or keep working and the reports will arrive when your turn would close.'
+  }
+  return parts.join('. ') + '.'
 }
 
 async function wait(
@@ -534,10 +548,10 @@ async function wait(
   // What this wait handed the model is reported: closing the turn will not
   // repeat it as a continuation.
   deps.executor.markReported?.(handles.filter((child) => child.status !== 'running' && child.status !== 'queued' && child.status !== 'dispatching').map((child) => child.childSessionId))
-  const running = handles.filter((child) => child.status === 'running')
+  const unsettled = handles.filter((child) => child.status === 'running' || child.status === 'queued' || child.status === 'dispatching')
   return JSON.stringify({
     children: handles,
-    ...(running.length > 0 ? { note: runningNote(running) } : {}),
+    ...(unsettled.length > 0 ? { note: runningNote(unsettled) } : {}),
   })
 }
 

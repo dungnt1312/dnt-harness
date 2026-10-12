@@ -62,4 +62,25 @@ describe('running child handles carry progress', () => {
     expect(cancelled?.progress).toBeUndefined()
     await h.kernel.stop()
   }, 15_000)
+
+  it('a long wait returns early when a child starts waiting on an approval', async () => {
+    const h = await boot()
+    const worker = bundledDefinition('worker')
+    const spawned = await h.executor.spawn({
+      workspaceId: h.workspaceId, parentSessionId: h.rootSessionId, parentTurnId: 'turn-1',
+      definition: worker, exposureCeiling: worker.tools,
+      packet: { prompt: 'Inspect the repository.', requiredResult: 'a short answer' },
+    })
+    const started = Date.now()
+    const waiting = h.executor.wait(h.workspaceId, [spawned.childSessionId], { timeoutMs: 10_000 })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    // Approvals expire in minutes; a 30 min wait must not sit on one.
+    h.kernel.ctx.sessions.get(spawned.childSessionId as never).append({ type: 'approval/request', approvalId: 'a1', call: { id: 'c1', name: 'Bash', args: {} } } as never)
+    const [handle] = await waiting
+    expect(Date.now() - started).toBeLessThan(5_000)
+    expect(handle?.status).toBe('running')
+    expect(handle?.progress?.health).toBe('awaiting-approval')
+    await h.executor.cancel(h.workspaceId, spawned.childSessionId)
+    await h.kernel.stop()
+  }, 15_000)
 })

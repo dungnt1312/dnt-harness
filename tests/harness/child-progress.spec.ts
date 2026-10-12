@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { describeProgress } from '../../src/harness/agents/child-progress.ts'
 
-const limits = { streamFirstEventMs: 600_000, streamIdleMs: 300_000, bashMaxWaitMs: 600_000 }
+const limits = { streamFirstEventMs: 600_000, streamIdleMs: 300_000, bashMaxWaitMs: 600_000, logicalRequestMs: 1_800_000, questionExpiryMs: 1_800_000 }
 const MIN = 60_000
 let seq = 0
 const ev = (timestamp: number, body: Record<string, unknown>) => ({ v: 1, seq: ++seq, timestamp, ...body }) as never
@@ -51,6 +51,30 @@ describe('describeProgress', () => {
       ev(MIN, { type: 'model/attempt', fact: { state: 'end' } }),
     ]
     expect(describeProgress(events, 0, 2 * MIN, limits).lastActivity).toEqual({ kind: 'start', sinceMs: MIN })
+  })
+
+  it('a step waiting for a provider slot is judged against the logical request limit, not the idle limit', () => {
+    // Admission (4 attempts per provider) runs before model/attempt is logged.
+    const events = [ev(0, { type: 'step/start', turnId: 't', stepId: 's1' })]
+    expect(describeProgress(events, 0, 10 * MIN, limits)).toMatchObject({ lastActivity: { kind: 'start', sinceMs: 10 * MIN }, health: 'active' })
+    expect(describeProgress(events, 0, 16 * MIN, limits).health).toBe('slow')
+    expect(describeProgress(events, 0, 31 * MIN, limits).health).toBe('stalled')
+  })
+
+  it('live model progress that never reaches the log (tool-call fragments) still counts', () => {
+    const events = [
+      ev(0, { type: 'model/attempt', fact: { state: 'start' } }),
+      ev(MIN, { type: 'assistant/chunk', stepId: 's', delta: 'thinking', thinking: true }),
+    ]
+    expect(describeProgress(events, 0, 11 * MIN, limits, { modelProgressAt: 10 * MIN })).toMatchObject({ lastActivity: { kind: 'model', sinceMs: MIN }, health: 'active' })
+    // Live progress from an earlier attempt never vouches for the current one.
+    expect(describeProgress(events, 0, 7 * MIN, limits, { modelProgressAt: -1 }).lastActivity.sinceMs).toBe(6 * MIN)
+  })
+
+  it('a child asking the user a question is waiting on a person, judged against the question expiry', () => {
+    const events = [ev(0, { type: 'tool/call', stepId: 's', call: { id: 'q', name: 'AskUserQuestion', args: {} } })]
+    expect(describeProgress(events, 0, 12 * MIN, limits)).toMatchObject({ lastActivity: { kind: 'tool', name: 'AskUserQuestion' }, health: 'active' })
+    expect(describeProgress(events, 0, 31 * MIN, limits).health).toBe('stalled')
   })
 
   it('an undecided approval wins over everything else', () => {

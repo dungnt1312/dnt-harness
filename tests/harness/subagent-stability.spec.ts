@@ -538,6 +538,38 @@ describe('the Agent tool wait', () => {
     expect(out.note).not.toMatch(/retries on its own/)
   })
 
+  it('reports a quiet but within-limits child as slow, not as making progress', async () => {
+    const tool = toolWith({
+      runningChildrenOfRoot: () => ['child-1'],
+      wait: async () => [running({ elapsedMs: 12 * 60_000, steps: 4, toolCalls: 3, lastActivity: { kind: 'tool', name: 'Bash', sinceMs: 6 * 60_000 }, health: 'slow' })],
+    })
+    const out = JSON.parse(String(await inTurn(() => tool.execute({ action: 'wait' }, {} as never))))
+    expect(out.note).toMatch(/child-1 quiet for 6m \(Bash\), within limits/)
+    expect(out.note).not.toMatch(/making progress/)
+  })
+
+  it('names a stalled child even when another waits on an approval', async () => {
+    const tool = toolWith({
+      runningChildrenOfRoot: () => ['child-1', 'child-2'],
+      wait: async () => [
+        { ...running({ elapsedMs: 0, steps: 1, toolCalls: 1, lastActivity: { kind: 'approval', name: 'Bash', sinceMs: 0 }, health: 'awaiting-approval' }), awaitingApproval: true },
+        { ...running({ elapsedMs: 30 * 60_000, steps: 3, toolCalls: 2, lastActivity: { kind: 'model', sinceMs: 9 * 60_000 }, health: 'stalled' }), childSessionId: 'child-2' },
+      ],
+    })
+    const out = JSON.parse(String(await inTurn(() => tool.execute({ action: 'wait' }, {} as never))))
+    expect(out.note).toMatch(/waiting for the user to answer an approval/)
+    expect(out.note).toMatch(/child-2 shows no progress for 9m/)
+  })
+
+  it('says a queued child has not started yet', async () => {
+    const tool = toolWith({
+      runningChildrenOfRoot: () => ['child-1'],
+      wait: async () => [{ ...done, status: 'queued', result: undefined }],
+    })
+    const out = JSON.parse(String(await inTurn(() => tool.execute({ action: 'wait' }, {} as never))))
+    expect(out.note).toMatch(/child-1 has not started yet/)
+  })
+
   it('keeps the approval note when a child is parked on an approval', async () => {
     const tool = toolWith({
       runningChildrenOfRoot: () => ['child-1'],

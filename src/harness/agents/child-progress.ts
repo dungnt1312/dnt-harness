@@ -17,9 +17,18 @@ export interface ChildProgress {
   readonly lastActivity: ChildActivity
   readonly health: ChildHealth
 }
-export type ProgressLimits = Pick<HarnessLimits, 'streamFirstEventMs' | 'streamIdleMs' | 'bashMaxWaitMs'>
+export type ProgressLimits = Pick<HarnessLimits, 'streamFirstEventMs' | 'streamIdleMs' | 'bashMaxWaitMs' | 'logicalRequestMs' | 'questionExpiryMs'>
+/**
+ * Runtime facts the log does not carry. `modelProgressAt` is the agent's last
+ * stream progress — including tool-call argument fragments, which the request
+ * watchdog counts but the transcript never records.
+ */
+export interface LiveProgress { readonly modelProgressAt?: number }
 
-export function describeProgress(events: readonly SessionEvent[], startedAt: number, now: number, limits: ProgressLimits): ChildProgress {
+/** Tools that wait on a person: bounded by the question expiry, not a command's. */
+const HUMAN_WAIT_TOOLS = new Set(['AskUserQuestion'])
+
+export function describeProgress(events: readonly SessionEvent[], startedAt: number, now: number, limits: ProgressLimits, live: LiveProgress = {}): ChildProgress {
   let steps = 0
   let toolCalls = 0
   let lastAt = startedAt
@@ -39,6 +48,10 @@ export function describeProgress(events: readonly SessionEvent[], startedAt: num
       default: break
     }
   }
+  // Live progress only vouches for the attempt it happened in.
+  if (model !== undefined && live.modelProgressAt !== undefined && live.modelProgressAt >= model.startedAt) {
+    model.progressAt = Math.max(model.progressAt ?? live.modelProgressAt, live.modelProgressAt)
+  }
   const base = { elapsedMs: Math.max(0, now - startedAt), steps, toolCalls }
   const approval = [...pendingApprovals.values()].at(-1)
   if (approval !== undefined) {
@@ -50,13 +63,15 @@ export function describeProgress(events: readonly SessionEvent[], startedAt: num
   if (tool !== undefined) {
     // A tool is bounded by its own limits, not the model stream's.
     lastActivity = { kind: 'tool', name: tool.name, sinceMs: Math.max(0, now - tool.at) }
-    threshold = limits.bashMaxWaitMs
+    threshold = HUMAN_WAIT_TOOLS.has(tool.name) ? limits.questionExpiryMs : limits.bashMaxWaitMs
   } else if (model !== undefined) {
     lastActivity = { kind: 'model', sinceMs: Math.max(0, now - (model.progressAt ?? model.startedAt)) }
     threshold = model.progressAt === undefined ? limits.streamFirstEventMs : limits.streamIdleMs
   } else {
+    // Between steps, or queued for a provider slot (admission precedes the
+    // logged attempt) or a retry backoff: only the logical request bounds it.
     lastActivity = { kind: 'start', sinceMs: Math.max(0, now - lastAt) }
-    threshold = limits.streamIdleMs
+    threshold = limits.logicalRequestMs
   }
   const health: ChildHealth = lastActivity.sinceMs >= threshold ? 'stalled' : lastActivity.sinceMs >= threshold / 2 ? 'slow' : 'active'
   return { ...base, lastActivity, health }

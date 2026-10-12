@@ -190,7 +190,7 @@ classifier and no auto-load:
 `Agent` delegates a bounded task to a child agent and collects its result. One
 tool, six actions — `spawn` (returns a handle at once), `wait` (blocks on
 several children, default 5 min and capped at 30 min, returns early when they
-settle, honours Stop; a running child reports `progress` with an advisory
+settle or one starts waiting on an approval, honours Stop; a running child reports `progress` with an advisory
 `health` of `active`, `slow`, `stalled` or `awaiting-approval`; the HTTP
 lifecycle route keeps a 120 s cap), `list`, `cancel`, `reconcile`, `catalog`:
 

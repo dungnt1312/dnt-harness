@@ -901,11 +901,22 @@ export class ChildExecutor {
       onAbort = (): void => { resolve() }
       signal.addEventListener('abort', onAbort, { once: true })
     })
+    // A child that starts waiting on an approval ends the wait at once:
+    // approvals expire in minutes, a long wait must not sit on one.
+    const watched = new Set(targets.filter(isLive).map((child) => child.childSessionId as string))
+    let stopWatching: (() => boolean) | undefined
+    const approval = new Promise<void>((resolve) => {
+      if (watched.size === 0) return
+      stopWatching = this.ctx.on('session/event', (session, event) => {
+        if (event.type === 'approval/request' && watched.has(session.id)) resolve()
+      })
+    })
     try {
-      await Promise.race<unknown>([settled, deadline, aborted])
+      await Promise.race<unknown>([settled, deadline, aborted, approval])
     } finally {
       if (timer !== undefined) clearTimeout(timer)
       if (onAbort !== undefined) signal?.removeEventListener('abort', onAbort)
+      stopWatching?.()
     }
     return targets.map((child) => (isLive(child) ? this.withResult(child) : child.handle))
   }
@@ -1516,7 +1527,9 @@ export class ChildExecutor {
       ...(child.partial !== undefined ? { partial: child.partial } : {}),
       ...(child.error !== undefined ? { error: child.error } : {}),
       ...(child.status === 'running' && awaitsApproval(child.events) ? { awaitingApproval: true } : {}),
-      ...(child.status === 'running' ? { progress: describeProgress(child.events, child.startedAt, Date.now(), this.limits()) } : {}),
+      ...(child.status === 'running'
+        ? { progress: describeProgress(child.events, child.startedAt, Date.now(), this.limits(), child.agent?.modelProgressAt !== undefined ? { modelProgressAt: child.agent.modelProgressAt } : {}) }
+        : {}),
     }
   }
 }
