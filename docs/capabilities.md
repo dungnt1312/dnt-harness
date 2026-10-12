@@ -46,8 +46,11 @@ absolute existing directories only; never a drive root, the home folder
 itself, a network/device path, anything overlapping app storage, the user or
 bundled skills folder, or any enabled absolute skill-rule folder of ANY
 workspace (recomputed from every workspace's rules at startup and after each
-rules save), or anything overlapping the project's own folder (so a
-relative path can never bypass a read-only grant).
+rules save), or the project's own folder or anything inside it (already
+granted read-write). An ancestor of the project folder, such as `~/workspace`
+for `~/workspace/projectA`, is allowed: the longest containing root wins, so
+the project keeps read-write inside itself and the ancestor's access applies
+only to the rest.
 
 The model is told the granted folders in its system block; Glob/Grep print
 paths relative to the project folder inside it and absolute paths elsewhere,

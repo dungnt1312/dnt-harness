@@ -217,6 +217,37 @@ describe('folder grants', () => {
     expect(system).toContain(`Granted folder (read-write, use absolute paths): ${shared}`)
   }, 20_000)
 
+  it('an ancestor of the project folder can be granted; the project stays read-write inside itself', async () => {
+    const { url: base } = await start()
+    const { wsId } = await setup(base)
+    const parent = path.join(path.dirname(home), 'parent')
+    const projectA = path.join(parent, 'projectA')
+    const sibling = path.join(parent, 'sibling')
+    await fs.mkdir(projectA, { recursive: true })
+    await fs.mkdir(sibling)
+    const projectId = String((await json(await send('POST', `${base}/api/workspaces/${wsId}/projects`, { name: 'A', path: projectA }))).id)
+    const sessionId = String((await json(await send('POST', `${base}/api/workspaces/${wsId}/sessions`, { projectId }))).id)
+    const grantsUrl = `${base}/api/workspaces/${wsId}/sessions/${sessionId}/grants`
+
+    // The project's own folder and anything inside it stay refused.
+    await fs.mkdir(path.join(projectA, 'sub'))
+    expect((await send('PUT', grantsUrl, { expectedRevision: 0, roots: [{ path: projectA, access: 'read' }] })).status).toBe(400)
+    expect((await send('PUT', grantsUrl, { expectedRevision: 0, roots: [{ path: path.join(projectA, 'sub'), access: 'read' }] })).status).toBe(400)
+
+    const put = await send('PUT', grantsUrl, { expectedRevision: 0, roots: [{ path: parent, access: 'read' }] })
+    expect(put.status).toBe(200)
+    expect((await json(put)).effective).toEqual([{ path: parent, access: 'read' }])
+
+    expect((await send('PUT', `${base}/api/workspaces/${wsId}/sessions/${sessionId}/mode`, { modeId: 'full-access' })).status).toBe(200)
+    // Inside the project the primary's read-write wins over the read-only ancestor.
+    await send('POST', `${base}/api/workspaces/${wsId}/sessions/${sessionId}/messages`, { content: `write ${path.join(projectA, 'inside.txt')}` })
+    expect(await waitFor(() => fs.readFile(path.join(projectA, 'inside.txt'), 'utf8').catch(() => undefined), 'write inside project')).toBe('granted')
+    // A write to a sibling is refused by the read-only ancestor grant.
+    await send('POST', `${base}/api/workspaces/${wsId}/sessions/${sessionId}/messages`, { content: `write ${path.join(sibling, 'blocked.txt')}` })
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    await expect(fs.readFile(path.join(sibling, 'blocked.txt'), 'utf8')).rejects.toThrow()
+  }, 20_000)
+
   it('a refused folder leaves the rest of a project update unapplied', async () => {
     const { url: base } = await start()
     const { wsId, projectId } = await setup(base)

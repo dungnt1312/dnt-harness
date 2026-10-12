@@ -34,8 +34,8 @@ function overlaps(a: string, b: string): boolean {
  * Validate one folder for granting and return its real path. Refuses
  * relative, UNC/device, missing, and non-directory paths, volume roots, the
  * home directory itself, anything overlapping protected app folders, and
- * anything overlapping the session's primary root (a grant nested in the
- * primary would let a relative path bypass its access level).
+ * the session's primary root itself or any folder inside it (already
+ * granted read-write). An ANCESTOR of the primary is allowed.
  */
 export async function validateGrantFolder(raw: unknown, primary: string | undefined, policy: GrantPolicy): Promise<string> {
   if (typeof raw !== 'string' || raw.trim() === '') throw new ScopeError('root-invalid', 'a folder path is required')
@@ -62,8 +62,12 @@ export async function validateGrantFolder(raw: unknown, primary: string | undefi
       throw new ScopeError('root-invalid', 'this folder overlaps application storage and cannot be granted')
     }
   }
-  if (primary !== undefined && primary !== '' && (overlaps(real, primary) || overlaps(resolved, primary))) {
-    throw new ScopeError('root-invalid', "this folder overlaps the project's own folder, which is already granted")
+  // Only the project's own folder and folders inside it are refused. An
+  // ancestor (e.g. `~/workspace` for `~/workspace/projectA`) is fine: the
+  // longest containing root wins, so the project keeps its read-write access
+  // inside itself and the ancestor's access applies only outside it.
+  if (primary !== undefined && primary !== '' && (within(primary, real) || within(primary, resolved))) {
+    throw new ScopeError('root-invalid', "this folder is the project's own folder or inside it, which is already granted")
   }
   return real
 }
@@ -77,13 +81,13 @@ export function parseAccess(raw: unknown): 'read' | 'write' {
 /**
  * Resolve a project's `additionalDirectories` to folders. Project
  * references follow the referenced project's CURRENT folder; references to
- * removed projects, and entries that now overlap the primary, are skipped.
+ * removed projects, and entries that now sit inside the primary, are skipped.
  */
 export function projectGrants(record: ProjectRecord, lookup: (projectId: ProjectId) => ProjectRecord | undefined): GrantedRoot[] {
   const roots: GrantedRoot[] = []
   for (const entry of record.additionalDirectories ?? []) {
     const folder = entry.kind === 'path' ? entry.path : lookup(entry.projectId)?.path
-    if (folder === undefined || overlaps(folder, record.path)) continue
+    if (folder === undefined || within(record.path, folder)) continue
     roots.push({ path: folder, access: entry.access })
   }
   return roots
