@@ -557,6 +557,15 @@ export interface McpServerRow {
   readonly unusableTools?: readonly string[]
   /** Recent server stderr, secrets masked. */
   readonly stderrTail?: string
+  /** Present for HTTP servers set to OAuth. */
+  readonly oauth?: McpOAuthState
+}
+
+export interface McpOAuthState {
+  readonly state: 'connected' | 'needs_sign_in' | 'not_connected'
+  /** The scope an `insufficient_scope` answer asked for; Reconnect requests it. */
+  readonly missingScope?: string
+  readonly clientSource?: 'registered' | 'manual'
 }
 
 /** One Claude Code hook command (`settings.json` → hooks → Event → group → hooks[]). */

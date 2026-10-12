@@ -8,8 +8,8 @@ import { IconButton } from '../ui/IconButton.tsx'
 import { Segmented } from '../ui/Segmented.tsx'
 
 import { TextInput } from '../ui/TextInput.tsx'
-import { deleteMcpServer, getMcpServer, importMcpServers, listMcpServers, setMcpServerAction, upsertMcpServer } from '../../lib/api.ts'
-import type { McpServerRow } from '../../lib/types.ts'
+import { beginMcpOAuth, completeMcpOAuth, deleteMcpServer, getMcpServer, importMcpServers, listMcpServers, McpOAuthError, revokeMcpOAuth, setMcpServerAction, upsertMcpServer } from '../../lib/api.ts'
+import type { McpOAuthState, McpServerRow } from '../../lib/types.ts'
 import {
   CodeArea,
   Disclosure,
@@ -52,13 +52,26 @@ const STATUS_META: Readonly<Record<McpServerRow['status'], string | undefined>> 
   disabled: 'Not running. Enable it to start the server.',
 }
 
+/** How an HTTP server authenticates. OAuth is discovered and signed into from the list. */
+type AuthMode = 'none' | 'bearer' | 'oauth'
+type ClientAuthMethod = 'client_secret_post' | 'client_secret_basic'
+
+/** Shared with the callback page the host serves (`src/web/mcp-oauth-connect.ts`). */
+const OAUTH_CHANNEL = 'dnt-harness-mcp-oauth'
+const SECRET_REF = /^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/
+
 interface ServerForm {
   readonly name: string
   readonly transport: 'stdio' | 'http'
   readonly command: string
   readonly args: string
   readonly url: string
+  readonly authMode: AuthMode
   readonly tokenRef: string
+  /** OAuth: optional client the user created at a provider without registration. */
+  readonly clientId: string
+  readonly clientSecretRef: string
+  readonly clientAuthMethod: ClientAuthMethod
   readonly allowedTools: string
   readonly timeoutMs: string
   readonly memoryMb: string
@@ -67,8 +80,21 @@ interface ServerForm {
 }
 
 const BLANK_FORM: ServerForm = {
-  name: '', transport: 'stdio', command: '', args: '', url: '', tokenRef: '${MCP_TOKEN}',
+  name: '', transport: 'stdio', command: '', args: '', url: '', authMode: 'bearer', tokenRef: '${MCP_TOKEN}',
+  clientId: '', clientSecretRef: '', clientAuthMethod: 'client_secret_post',
   allowedTools: '', timeoutMs: String(DEFAULT_TIMEOUT_MS), memoryMb: '', cpuPercent: '', enabled: false,
+}
+
+const OAUTH_BADGE: Readonly<Record<McpOAuthState['state'], { readonly label: string; readonly tone: 'green' | 'amber' | 'gray' }>> = {
+  connected: { label: 'Connected', tone: 'green' },
+  needs_sign_in: { label: 'Needs sign-in', tone: 'amber' },
+  not_connected: { label: 'Not connected', tone: 'gray' },
+}
+
+/** A pending sign-in: the state the callback page will report back. */
+interface PendingSignIn {
+  readonly server: string
+  readonly state: string
 }
 
 const linesToArray = (raw: string): string[] => raw.split('\n').map((line) => line.trim()).filter((line) => line !== '')
@@ -80,13 +106,18 @@ const asRecord = (value: unknown): Record<string, unknown> => (typeof value === 
 function formOf(name: string, stored: Record<string, unknown>): ServerForm {
   const auth = asRecord(stored['auth'])
   const limits = asRecord(stored['resourceLimits'])
+  const authMode: AuthMode = auth['type'] === 'managed_oauth' ? 'oauth' : auth['type'] === 'bearer' ? 'bearer' : stored['transport'] === 'http' ? 'none' : 'bearer'
   return {
     name,
     transport: stored['transport'] === 'http' ? 'http' : 'stdio',
     command: asString(stored['command']),
     args: asLines(stored['args']),
     url: asString(stored['url']),
+    authMode,
     tokenRef: auth['type'] === 'bearer' ? asString(auth['token']) : '',
+    clientId: auth['type'] === 'managed_oauth' ? asString(auth['clientId']) : '',
+    clientSecretRef: auth['type'] === 'managed_oauth' ? asString(auth['clientSecret']) : '',
+    clientAuthMethod: auth['tokenEndpointAuth'] === 'client_secret_basic' ? 'client_secret_basic' : 'client_secret_post',
     allowedTools: asLines(stored['allowedTools']),
     timeoutMs: typeof stored['timeoutMs'] === 'number' ? String(stored['timeoutMs']) : String(DEFAULT_TIMEOUT_MS),
     memoryMb: typeof limits['memoryMb'] === 'number' ? String(limits['memoryMb']) : '',
@@ -100,7 +131,11 @@ function formError(form: ServerForm): string | null {
   if (!SERVER_NAME.test(form.name.trim())) return 'Enter a server name using letters, numbers, underscores, or hyphens.'
   if (form.transport === 'stdio' && form.command.trim() === '') return 'Enter the command that starts the server.'
   if (form.transport === 'http' && !/^https?:\/\//.test(form.url.trim())) return 'Enter an HTTP or HTTPS URL.'
-  if (form.transport === 'http' && form.tokenRef.trim() !== '' && !/^\$\{[A-Za-z_][A-Za-z0-9_]*\}$/.test(form.tokenRef.trim())) return 'The bearer token must be a ${SECRET_NAME} reference.'
+  if (form.transport === 'http' && form.authMode === 'bearer' && form.tokenRef.trim() !== '' && !SECRET_REF.test(form.tokenRef.trim())) return 'The bearer token must be a ${SECRET_NAME} reference.'
+  if (form.transport === 'http' && form.authMode === 'oauth') {
+    if (form.clientSecretRef.trim() !== '' && !SECRET_REF.test(form.clientSecretRef.trim())) return 'The client secret must be a ${SECRET_NAME} reference.'
+    if (form.clientSecretRef.trim() !== '' && form.clientId.trim() === '') return 'Enter the client ID that goes with the client secret.'
+  }
   if (parsePositiveInt(form.timeoutMs) === null) return 'Timeout must be a positive whole number of milliseconds.'
   if (form.memoryMb.trim() !== '' && parsePositiveInt(form.memoryMb) === null) return 'Memory limit must be a positive whole number of MB, or blank.'
   const cpu = parsePositiveInt(form.cpuPercent)
@@ -118,9 +153,7 @@ function configOf(form: ServerForm, stored: Record<string, unknown>): Record<str
   const memoryMb = parsePositiveInt(form.memoryMb)
   const cpuPercent = parsePositiveInt(form.cpuPercent)
   const storedAuth = asRecord(auth)
-  const nextAuth = form.tokenRef.trim() !== ''
-    ? { type: 'bearer', token: form.tokenRef.trim() }
-    : storedAuth['type'] !== undefined && storedAuth['type'] !== 'bearer' ? storedAuth : undefined
+  const nextAuth = authOf(form, storedAuth)
   return {
     ...rest,
     transport: form.transport,
@@ -133,6 +166,31 @@ function configOf(form: ServerForm, stored: Record<string, unknown>): Record<str
       ? { resourceLimits: { ...(memoryMb !== null ? { memoryMb } : {}), ...(cpuPercent !== null ? { cpuPercent } : {}) } }
       : {}),
   }
+}
+
+/**
+ * The `auth` block the form stands for. Bearer and OAuth are rebuilt from
+ * the form; "None" keeps only an auth type the form cannot show (legacy
+ * external tokens), so switching away from OAuth really drops it.
+ */
+function authOf(form: ServerForm, stored: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (form.authMode === 'bearer') return form.tokenRef.trim() !== '' ? { type: 'bearer', token: form.tokenRef.trim() } : undefined
+  if (form.authMode === 'oauth') {
+    const url = form.url.trim()
+    let provider = url
+    try { provider = new URL(url).host } catch { /* formError reports the URL */ }
+    const clientId = form.clientId.trim()
+    const secret = form.clientSecretRef.trim()
+    return {
+      type: 'managed_oauth',
+      provider,
+      resource: url,
+      ...(clientId !== '' ? { clientId } : {}),
+      ...(clientId !== '' && secret !== '' ? { clientSecret: secret, tokenEndpointAuth: form.clientAuthMethod } : {}),
+      ...(stored['type'] === 'managed_oauth' && Array.isArray(stored['scopes']) ? { scopes: stored['scopes'] } : {}),
+    }
+  }
+  return stored['type'] === 'oauth' || stored['type'] === 'external_token' ? stored : undefined
 }
 
 function toolExposed(allowed: readonly string[] | undefined, server: string, name: string): boolean {
@@ -236,6 +294,11 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
   const editorRef = useRef<HTMLElement | null>(null)
   const nameRef = useRef<HTMLInputElement | null>(null)
 
+  /** A sign-in tab is open; the callback page reports its state on {@link OAUTH_CHANNEL}. */
+  const [pendingSignIn, setPendingSignIn] = useScopedState<PendingSignIn | null>(null)
+  /** Why Connect needs a client, shown above the editor's client section. */
+  const [clientNeeded, setClientNeeded] = useScopedState<string | null>(null)
+
   const refresh = useCallback(async () => {
     if (workspaceId === null) return
     try { setRows(await listMcpServers(workspaceId)) }
@@ -243,6 +306,32 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
   }, [workspaceId])
 
   useEffect(() => { void refresh() }, [refresh])
+
+  const finishSignIn = useCallback(async (pending: PendingSignIn): Promise<void> => {
+    if (workspaceId === null) return
+    setPendingSignIn(null)
+    try {
+      const result = await completeMcpOAuth(workspaceId, pending.server, pending.state)
+      setNotice(result.status === 'failed'
+        ? { kind: 'bad', text: `${pending.server} is signed in, but the server did not start. Check its status below.` }
+        : { kind: 'ok', text: `${pending.server} is connected.` })
+    } catch (cause) {
+      setNotice({ kind: 'bad', text: `Sign-in for ${pending.server} did not finish: ${cause instanceof Error ? cause.message : String(cause)}` })
+    } finally {
+      await refresh()
+    }
+  }, [workspaceId, refresh])
+
+  // The callback page is same-origin, so it reaches this tab over BroadcastChannel.
+  useEffect(() => {
+    if (pendingSignIn === null || typeof BroadcastChannel === 'undefined') return undefined
+    const channel = new BroadcastChannel(OAUTH_CHANNEL)
+    channel.onmessage = (event: MessageEvent) => {
+      const data = event.data as { type?: unknown; state?: unknown } | null
+      if (data?.type === 'mcp-oauth' && data.state === pendingSignIn.state) void finishSignIn(pendingSignIn)
+    }
+    return () => channel.close()
+  }, [pendingSignIn, finishSignIn])
 
   const formBaseline = editing === null ? BLANK_FORM : formOf(editing.name, editing.stored)
   const guardDiscard = useUnsavedChanges(
@@ -278,7 +367,53 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
     })
   }
 
+  /**
+   * Open a blank tab inside the click (popup blockers allow that), then point
+   * it at the provider once the host has discovered and registered.
+   */
+  const connect = (row: McpServerRow): Promise<void> => run(`oauth:${row.name}`, async () => {
+    const tab = window.open('', '_blank')
+    const scopes = row.oauth?.missingScope !== undefined ? row.oauth.missingScope.split(/\s+/).filter((scope) => scope !== '') : []
+    let started: { readonly authorizationUrl: string; readonly state: string }
+    try {
+      started = await beginMcpOAuth(workspaceId, row.name, scopes)
+    } catch (cause) {
+      tab?.close()
+      if (cause instanceof McpOAuthError && cause.code === 'client_required') {
+        setClientNeeded(cause.message)
+        await beginEditNow(row.name)
+        return
+      }
+      setNotice({ kind: 'bad', text: `${row.name}: ${cause instanceof Error ? cause.message : String(cause)}` })
+      return
+    }
+    if (tab !== null) tab.location.href = started.authorizationUrl
+    else window.open(started.authorizationUrl, '_blank')
+    setPendingSignIn({ server: row.name, state: started.state })
+    setNotice({ kind: 'ok', text: `Waiting for sign-in to ${row.name} in the new tab…` })
+  })
+
+  const disconnect = (server: string): Promise<void> => run(`oauth:${server}`, async () => {
+    try {
+      const result = await revokeMcpOAuth(workspaceId, server)
+      setNotice({ kind: 'ok', text: result.remote === 'failed' ? `${server} is disconnected here; the provider did not confirm revoking the token.` : `${server} is disconnected.` })
+    } finally {
+      await refresh()
+    }
+  })
+
+  const beginEditNow = async (server: string): Promise<void> => {
+    const stored = await getMcpServer(workspaceId, server)
+    setEditing({ name: server, stored })
+    setForm(formOf(server, stored))
+    setImporting(false)
+    setEditorOpen(true)
+    setNotice(null)
+    revealEditor()
+  }
+
   const beginEdit = (server: string): Promise<void> => run(`edit:${server}`, async () => {
+    setClientNeeded(null)
     const stored = await getMcpServer(workspaceId, server)
     setEditing({ name: server, stored })
     setForm(formOf(server, stored))
@@ -289,6 +424,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
   })
 
   const beginAdd = (): void => {
+    setClientNeeded(null)
     setEditing(null)
     setForm(BLANK_FORM)
     setImporting(false)
@@ -297,7 +433,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
     revealEditor()
   }
 
-  const resetForm = (): void => { setEditing(null); setForm(BLANK_FORM); setEditorOpen(false) }
+  const resetForm = (): void => { setEditing(null); setForm(BLANK_FORM); setEditorOpen(false); setClientNeeded(null) }
 
   const beginImport = (): void => {
     resetForm()
@@ -323,7 +459,12 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
       }
       throw cause
     }
-    setNotice({ kind: 'ok', text: editing !== null && rows.find((row) => row.name === name)?.enabled === true ? `Saved ${name}.` : `Saved ${name}. It is not running yet — use Enable to start it.` })
+    setNotice({
+      kind: 'ok',
+      text: form.transport === 'http' && form.authMode === 'oauth' && rows.find((row) => row.name === name)?.oauth?.state !== 'connected'
+        ? `Saved ${name}. Use Connect to sign in, then Enable to start it.`
+        : editing !== null && rows.find((row) => row.name === name)?.enabled === true ? `Saved ${name}.` : `Saved ${name}. It is not running yet — use Enable to start it.`,
+    })
     resetForm()
     await refresh()
   })
@@ -381,14 +522,30 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
                   {row.breakerOpenUntil !== null ? <Badge tone="amber">breaker open</Badge> : null}
                   {row.auditFault === true ? <Badge tone="amber">audit fault</Badge> : null}
                   {row.stale === true ? <Badge tone="amber">stale file</Badge> : null}
+                  {row.oauth !== undefined ? <Badge tone={OAUTH_BADGE[row.oauth.state].tone} title="OAuth">{OAUTH_BADGE[row.oauth.state].label}</Badge> : null}
                 </>
               }
               meta={[
                 row.transport === 'http' ? 'Streamable HTTP' : 'stdio',
-                STATUS_META[row.status],
+                row.oauth?.state === 'needs_sign_in' && row.oauth.missingScope !== undefined
+                  ? `OAuth: needs scope ${row.oauth.missingScope} — use Reconnect to grant it.`
+                  : row.oauth !== undefined && row.oauth.state !== 'connected'
+                    ? 'OAuth: sign in with Connect before the server can start.'
+                    : STATUS_META[row.status],
               ].filter((line): line is string => line !== undefined && line !== '').join(' · ')}
               actions={
                 <>
+                  {row.oauth !== undefined && row.oauth.state !== 'connected' ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      aria-label={`${row.oauth.state === 'needs_sign_in' ? 'Reconnect' : 'Connect'} ${row.name}`}
+                      disabled={busy !== null}
+                      onClick={() => void connect(row)}
+                    >
+                      {busy === `oauth:${row.name}` ? 'Opening…' : row.oauth.state === 'needs_sign_in' ? 'Reconnect' : 'Connect'}
+                    </Button>
+                  ) : null}
                   {row.enabled ? (
                     <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void act(row.name, 'disable')}>{busy === `disable:${row.name}` ? 'Disabling…' : 'Disable'}</Button>
                   ) : (
@@ -401,6 +558,9 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
                     actions={[
                       { label: busy === `test:${row.name}` ? 'Testing…' : 'Test connection', icon: 'zap', onSelect: () => void act(row.name, 'test') },
                       { label: 'Reconnect', icon: 'refresh', disabled: !row.enabled, onSelect: () => void act(row.name, 'reconnect') },
+                      ...(row.oauth !== undefined && row.oauth.state !== 'not_connected'
+                        ? [{ label: 'Disconnect OAuth', icon: 'lock' as const, onSelect: () => void disconnect(row.name) }]
+                        : []),
                       { label: 'Delete server', icon: 'trash', danger: true, onSelect: () => setConfirmDelete(row.name) },
                     ]}
                   />
@@ -451,6 +611,13 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
             </PanelIntro>
             <IsolationSummary />
           </div>
+          {pendingSignIn !== null ? (
+            <div role="status" className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted px-3 py-2 text-[13px]">
+              <span className="mr-auto">Waiting for sign-in to {pendingSignIn.server}. Finish it in the tab that opened; this completes on its own.</span>
+              <Button variant="primary" size="sm" disabled={busy !== null} onClick={() => void finishSignIn(pendingSignIn)}>Finish sign-in</Button>
+              <Button variant="ghost" size="sm" onClick={() => setPendingSignIn(null)}>Cancel</Button>
+            </div>
+          ) : null}
           {serverList}
         </>
       ) : backToList}
@@ -491,12 +658,50 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
                 <Field label="URL">
                   <TextInput mono value={form.url} placeholder="https://mcp.example.com/mcp" onChange={(e) => patch({ url: e.target.value })} />
                 </Field>
-                <Field label="Bearer token reference" hint="Only a ${SECRET_NAME} reference; store the value in the Secrets tab. Leave blank for no bearer token.">
-                  <TextInput mono value={form.tokenRef} placeholder="${MCP_TOKEN}" onChange={(e) => patch({ tokenRef: e.target.value })} />
-                </Field>
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-[13px] font-medium">Authentication</span>
+                  <Segmented
+                    label="Authentication"
+                    value={form.authMode}
+                    options={[{ value: 'none', label: 'None' }, { value: 'bearer', label: 'Bearer token' }, { value: 'oauth', label: 'OAuth' }]}
+                    onChange={(authMode) => patch({ authMode })}
+                  />
+                </div>
+                {form.authMode === 'bearer' ? (
+                  <Field label="Bearer token reference" hint="Only a ${SECRET_NAME} reference; store the value in the Secrets tab. Leave blank for no bearer token.">
+                    <TextInput mono value={form.tokenRef} placeholder="${MCP_TOKEN}" onChange={(e) => patch({ tokenRef: e.target.value })} />
+                  </Field>
+                ) : form.authMode === 'oauth' ? (
+                  <p className="m-0 self-end text-xs text-fg-faint">
+                    After saving, use Connect on the list. dnt-harness finds the provider's sign-in and registers itself where the provider allows it.
+                  </p>
+                ) : null}
               </>
             )}
           </div>
+
+          {form.transport === 'http' && form.authMode === 'oauth' ? (
+            <Disclosure summary="OAuth client · only for providers without registration" defaultOpen={clientNeeded !== null || form.clientId !== ''}>
+              {clientNeeded !== null ? <p className="m-0 text-xs text-warn">{clientNeeded}</p> : null}
+              <div className="grid gap-4 md:grid-cols-3">
+                <Field label="Client ID" hint="From the OAuth app you created. Leave blank to let dnt-harness register.">
+                  <TextInput mono value={form.clientId} onChange={(e) => patch({ clientId: e.target.value })} />
+                </Field>
+                <Field label="Client secret reference" hint="A ${SECRET_NAME} reference to the Secrets tab. Blank for a public client.">
+                  <TextInput mono value={form.clientSecretRef} placeholder="${OAUTH_CLIENT_SECRET}" onChange={(e) => patch({ clientSecretRef: e.target.value })} />
+                </Field>
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-[13px] font-medium">Secret sent as</span>
+                  <Segmented
+                    label="Secret sent as"
+                    value={form.clientAuthMethod}
+                    options={[{ value: 'client_secret_post', label: 'Form body' }, { value: 'client_secret_basic', label: 'HTTP Basic' }]}
+                    onChange={(clientAuthMethod) => patch({ clientAuthMethod })}
+                  />
+                </div>
+              </div>
+            </Disclosure>
+          ) : null}
 
           {/* Exposure and resource caps: rarely changed, so they start folded. */}
           <Disclosure summary="Advanced · tool exposure and resource limits" defaultOpen={advancedInUse}>

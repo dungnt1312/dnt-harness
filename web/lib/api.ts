@@ -1333,6 +1333,44 @@ export function setMcpServerAction(workspaceId: string, name: string, action: 'e
   )
 }
 
+/** Why Connect could not start; `client_required` means the user must enter an OAuth app. */
+export type McpOAuthErrorCode = 'loopback_required' | 'discovery_failed' | 'client_required' | 'registration_failed'
+
+export class McpOAuthError extends Error {
+  constructor(readonly code: McpOAuthErrorCode | undefined, message: string) {
+    super(message)
+    this.name = 'McpOAuthError'
+  }
+}
+
+async function oauthCall<T>(workspaceId: string, name: string, action: 'begin' | 'complete' | 'revoke', body: unknown): Promise<T> {
+  const response = await apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/mcp/${encodeURIComponent(name)}/oauth/${action}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    let parsed: { code?: McpOAuthErrorCode; error?: string } = {}
+    try { parsed = JSON.parse(text) as typeof parsed } catch { /* plain-text error */ }
+    throw new McpOAuthError(parsed.code, parsed.error ?? `HTTP ${response.status}`)
+  }
+  return (await response.json()) as T
+}
+
+/** Discover, register if needed, and get the provider's sign-in URL. `scopes` adds scopes on Reconnect. */
+export function beginMcpOAuth(workspaceId: string, name: string, scopes: readonly string[] = []): Promise<{ readonly authorizationUrl: string; readonly state: string }> {
+  return oauthCall(workspaceId, name, 'begin', scopes.length > 0 ? { scopes } : {})
+}
+
+export function completeMcpOAuth(workspaceId: string, name: string, state: string): Promise<{ readonly connected: true; readonly status?: string }> {
+  return oauthCall(workspaceId, name, 'complete', { state })
+}
+
+export function revokeMcpOAuth(workspaceId: string, name: string): Promise<{ readonly local: 'revoked'; readonly remote: 'succeeded' | 'failed' | 'unavailable' }> {
+  return oauthCall(workspaceId, name, 'revoke', {})
+}
+
 export function importMcpServers(workspaceId: string, input: ImportAgentInput): Promise<ImportResult> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/mcp/import`, {
     method: 'POST',
