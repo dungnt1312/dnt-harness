@@ -9,6 +9,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { answerGitAskpass, promptRegistrySize, type AskpassFrame, type AskpassSession } from '../../src/web/git-askpass.ts'
 import {
   gitExecutable,
   gitStatus,
@@ -20,12 +21,14 @@ import {
   listProjectGitRemotes,
   pushedTo,
   runProjectGitOperation,
+  sessionEnvironment,
   trashInvocation,
   type GitOperationRequest,
 } from '../../src/web/project-git-ops.ts'
 
 let scratch = ''
 let home = ''
+let gpgBin = ''
 const saved: Record<string, string | undefined> = {}
 let counter = 0
 
@@ -39,7 +42,11 @@ beforeAll(async () => {
   await fs.mkdir(home)
   // A hermetic login shell, as in the trust spec: the project environment is
   // loaded from this HOME, never from the developer's own rc files.
-  await fs.writeFile(path.join(home, '.bash_profile'), '')
+  // A stub gpg on the project PATH, so a session exposes a gpg wrapper deterministically.
+  gpgBin = path.join(scratch, 'gpgbin')
+  await fs.mkdir(gpgBin)
+  await fs.writeFile(path.join(gpgBin, 'gpg'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  await fs.writeFile(path.join(home, '.bash_profile'), `export PATH='${gpgBin}':"$PATH"\n`)
   for (const key of ['HOME', 'SHELL']) saved[key] = process.env[key]
   process.env['HOME'] = home
   process.env['SHELL'] = '/bin/bash'
@@ -671,5 +678,213 @@ describe('remotes', () => {
     repo.git('add', '.')
     repo.git('commit', '-qm', 'not pushed')
     expect(await pushedTo(repo.dir, true)).toEqual([])
+  })
+})
+
+// ── askpass integration (fake git that asks for a password) ──────
+
+describe.runIf(process.platform !== 'win32')('askpass integration', () => {
+  const owner = { workspaceId: 'ws-1', projectId: 'proj-1' }
+
+  /** A fake `git` that asks `$GIT_ASKPASS "Password:"` and succeeds only for `secret`. */
+  const FAKE_GIT = `#!/bin/sh
+echo $$ > "$FAKE_DIR/git.pid"
+in=$(cat)
+[ -z "$in" ] || { echo "stdin was not closed" >&2; exit 3; }
+echo "$GIT_CONFIG_COUNT|$GIT_CONFIG_KEY_0|$GIT_CONFIG_VALUE_0" > "$FAKE_DIR/config"
+[ -z "$FAKE_IGNORE_TERM" ] || trap '' TERM
+sleep 60 > /dev/null 2>&1 &
+echo $! > "$FAKE_DIR/sleep.pid"
+trap 'kill $(cat "$FAKE_DIR/sleep.pid") 2> /dev/null' EXIT
+password=$("$GIT_ASKPASS" "Password:")
+echo "$password" > "$FAKE_DIR/got"
+if [ "$password" = secret ]; then echo pushed; exit 0; fi
+echo "fatal: Authentication failed" >&2
+exit 1
+`
+
+  async function fakeDir(): Promise<string> {
+    const dir = await fs.mkdtemp(path.join(scratch, 'fake-'))
+    await fs.mkdir(path.join(dir, 'bin'))
+    await fs.writeFile(path.join(dir, 'bin', 'git'), FAKE_GIT, { mode: 0o755 })
+    return dir
+  }
+
+  /** Runs prompting commands through the fake git; everything else (checks, status) is real git. */
+  function fakeRunner(dir: string): GitRunner {
+    return (root, args, options) => {
+      if (!['push', 'pull', 'fetch', 'commit'].includes(args[0] as string)) return runGitCommand(root, args, options)
+      const env: Record<string, string> = { ...(options.env as Record<string, string>), FAKE_DIR: dir, ...(process.env['FAKE_IGNORE_TERM'] === undefined ? {} : { FAKE_IGNORE_TERM: '1' }) }
+      env['PATH'] = `${path.join(dir, 'bin')}:${env['PATH'] ?? ''}`
+      return runGitCommand(root, args, { ...options, env })
+    }
+  }
+
+  const pushRequest: GitOperationRequest = { type: 'push', remote: 'origin', branch: 'main', upstreamBranch: 'main', setUpstream: false, force: false }
+
+  async function pushRepo(): Promise<Repo> {
+    const repo = await makeRepo()
+    addRemote(repo, 'origin')
+    return repo
+  }
+
+  const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true } catch { return false } }
+  async function waitDead(pid: number): Promise<boolean> {
+    for (let i = 0; i < 100; i += 1) {
+      if (!alive(pid)) return true
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    return false
+  }
+  const readPid = async (dir: string, name: string): Promise<number> => Number((await fs.readFile(path.join(dir, name), 'utf8')).trim())
+  const exists = (file: string): Promise<boolean> => fs.access(file).then(() => true, () => false)
+
+  /** Wires askpass callbacks and exposes the next frame and the session. */
+  function wire() {
+    const frames: AskpassFrame[] = []
+    const waiters: ((frame: AskpassFrame) => void)[] = []
+    let session: AskpassSession | undefined
+    return {
+      askpass: {
+        operation: 'push',
+        owner,
+        onPrompt: (frame: AskpassFrame) => { const waiter = waiters.shift(); if (waiter) waiter(frame); else frames.push(frame) },
+        onSession: (created: AskpassSession) => { session = created },
+      },
+      next: (): Promise<AskpassFrame> => { const frame = frames.shift(); return frame ? Promise.resolve(frame) : new Promise((resolve) => waiters.push(resolve)) },
+      session: (): AskpassSession => session as AskpassSession,
+    }
+  }
+
+  it('prompt → answer → successful push, then the session is disposed', async () => {
+    const repo = await pushRepo()
+    const dir = await fakeDir()
+    const hooks = wire()
+    const done = runProjectGitOperation(repo.dir, true, pushRequest, hooks.askpass, { run: fakeRunner(dir) })
+    const frame = await hooks.next()
+    expect(frame).toMatchObject({ type: 'askpass', operation: 'push', prompt: 'Password:' })
+    const tempDir = hooks.session().tempDir
+    expect(existsSync(tempDir)).toBe(true)
+    expect(answerGitAskpass(frame.promptId, { password: 'secret' }, { workspaceId: 'other', projectId: 'proj-1' })).toBe(false)
+    expect(answerGitAskpass(frame.promptId, { password: 'secret' }, owner)).toBe(true)
+    const result = await done
+    expect(result).toMatchObject({ ok: true, stdout: 'pushed\n', stderr: '' })
+    expect(result.cancelled).toBeUndefined()
+    expect(existsSync(tempDir)).toBe(false)
+    expect(promptRegistrySize()).toBe(0)
+    // stdin was /dev/null, and the project PATH carried a gpg so the wrapper was wired through git config.
+    const [count, key, value] = (await fs.readFile(path.join(dir, 'config'), 'utf8')).trim().split('|')
+    expect(count).toBe('1')
+    expect(key).toBe('gpg.program')
+    expect(value).toBe(path.join(tempDir, 'gpg-wrapper.sh'))
+  })
+
+  it('a wrong password is a git failure and still disposes the session', async () => {
+    const repo = await pushRepo()
+    const dir = await fakeDir()
+    const hooks = wire()
+    const done = runProjectGitOperation(repo.dir, true, pushRequest, hooks.askpass, { run: fakeRunner(dir) })
+    const frame = await hooks.next()
+    const tempDir = hooks.session().tempDir
+    expect(answerGitAskpass(frame.promptId, { password: 'wrong' }, owner)).toBe(true)
+    const result = await done
+    expect(result.ok).toBe(false)
+    expect(result.cancelled).toBeUndefined()
+    expect(result.stderr).toContain('Authentication failed')
+    expect(existsSync(tempDir)).toBe(false)
+  })
+
+  it('cancel kills the git process tree and returns a cancelled result', async () => {
+    const repo = await pushRepo()
+    const dir = await fakeDir()
+    const hooks = wire()
+    const done = runProjectGitOperation(repo.dir, true, pushRequest, hooks.askpass, { run: fakeRunner(dir) })
+    const frame = await hooks.next()
+    const tempDir = hooks.session().tempDir
+    const gitPid = await readPid(dir, 'git.pid')
+    const sleepPid = await readPid(dir, 'sleep.pid')
+    expect(alive(gitPid) && alive(sleepPid)).toBe(true)
+    expect(answerGitAskpass(frame.promptId, { cancel: true }, owner)).toBe(true)
+    const result = await done
+    expect(result).toMatchObject({ ok: false, stdout: '', stderr: '', cancelled: true })
+    expect(result.status).toBeDefined()
+    expect(await waitDead(gitPid)).toBe(true)
+    // The background child is in git's process group and died with it.
+    expect(await waitDead(sleepPid)).toBe(true)
+    // git never saw the empty answer, so it could not retry with empty credentials.
+    expect(await exists(path.join(dir, 'got'))).toBe(false)
+    expect(existsSync(tempDir)).toBe(false)
+    expect(promptRegistrySize()).toBe(0)
+  })
+
+  it('falls back to SIGKILL when git ignores SIGTERM', async () => {
+    process.env['FAKE_IGNORE_TERM'] = '1'
+    try {
+      const repo = await pushRepo()
+      const dir = await fakeDir()
+      const hooks = wire()
+      const done = runProjectGitOperation(repo.dir, true, pushRequest, hooks.askpass, { run: fakeRunner(dir), killGraceMs: 150 })
+      const frame = await hooks.next()
+      const gitPid = await readPid(dir, 'git.pid')
+      const sleepPid = await readPid(dir, 'sleep.pid')
+      expect(answerGitAskpass(frame.promptId, { cancel: true }, owner)).toBe(true)
+      const result = await done
+      expect(result).toMatchObject({ ok: false, cancelled: true })
+      expect(await waitDead(gitPid)).toBe(true)
+      expect(await waitDead(sleepPid)).toBe(true)
+    } finally {
+      delete process.env['FAKE_IGNORE_TERM']
+    }
+  })
+
+  it('cancelAll on the session cancels the operation too', async () => {
+    const repo = await pushRepo()
+    const dir = await fakeDir()
+    const hooks = wire()
+    const done = runProjectGitOperation(repo.dir, true, pushRequest, hooks.askpass, { run: fakeRunner(dir) })
+    await hooks.next()
+    const gitPid = await readPid(dir, 'git.pid')
+    hooks.session().cancelAll()
+    expect(await done).toMatchObject({ ok: false, cancelled: true })
+    expect(await waitDead(gitPid)).toBe(true)
+  })
+
+  it('disposes the session when the request is rejected', async () => {
+    const repo = await pushRepo()
+    const dir = await fakeDir()
+    const hooks = wire()
+    await expect(
+      runProjectGitOperation(repo.dir, true, { ...pushRequest, remote: 'nowhere' }, hooks.askpass, { run: fakeRunner(dir) }),
+    ).rejects.toThrow(/not a remote/)
+    expect(existsSync(hooks.session().tempDir)).toBe(false)
+    expect(promptRegistrySize()).toBe(0)
+  })
+
+  it('does not create a session for operations that never prompt', async () => {
+    const repo = await makeRepo()
+    await repo.write('n.txt', 'n\n')
+    let created = 0
+    const result = await runProjectGitOperation(repo.dir, true, { type: 'stage', paths: ['n.txt'] }, {
+      operation: 'stage',
+      onPrompt: () => {},
+      onSession: () => { created += 1 },
+    })
+    expect(result.ok).toBe(true)
+    expect(created).toBe(0)
+  })
+
+  it('sessionEnvironment leaves an existing GIT_CONFIG_COUNT alone', () => {
+    const session = { env: { GIT_ASKPASS: '/s/askpass.sh', SSH_ASKPASS: '/s/askpass.sh', SSH_ASKPASS_REQUIRE: 'force' }, gpgWrapperPath: '/s/gpg-wrapper.sh' } as unknown as AskpassSession
+    expect(sessionEnvironment({}, session)).toEqual({
+      GIT_ASKPASS: '/s/askpass.sh',
+      SSH_ASKPASS: '/s/askpass.sh',
+      SSH_ASKPASS_REQUIRE: 'force',
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'gpg.program',
+      GIT_CONFIG_VALUE_0: '/s/gpg-wrapper.sh',
+    })
+    expect(sessionEnvironment({ GIT_CONFIG_COUNT: '2' }, session)).not.toHaveProperty('GIT_CONFIG_COUNT')
+    const noGpg = { env: session.env } as unknown as AskpassSession
+    expect(sessionEnvironment({}, noGpg)).not.toHaveProperty('GIT_CONFIG_COUNT')
   })
 })

@@ -210,6 +210,188 @@ describe.runIf(unix)('askpass session (Unix)', () => {
   })
 })
 
+describe.runIf(unix)('askpass session lifecycle (Unix)', () => {
+  it('creates the socket with mode 0600 inside a 0700 directory', async () => {
+    const session = await open('push', () => {})
+    expect(session.endpoint).toBe(socketOf(session))
+    expect((await fs.stat(socketOf(session))).mode & 0o777).toBe(0o600)
+    expect((await fs.stat(session.tempDir)).mode & 0o777).toBe(0o700)
+  })
+
+  it('drops the prompt of a client that disconnects and serves the next connection', async () => {
+    const queue = frameQueue()
+    const session = await open('push', queue.onPrompt)
+    const first = spawn(process.execPath, [CLIENT, `--askpass=${socketOf(session)}`, 'Username:'], { stdio: 'ignore' })
+    const firstFrame = await queue.next()
+    expect(promptRegistrySize()).toBe(1)
+    // A second client is queued behind the first.
+    const second = run(process.execPath, [CLIENT, `--askpass=${socketOf(session)}`, 'Password:'])
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    first.kill('SIGKILL')
+    const secondFrame = await queue.next()
+    expect(secondFrame.prompt).toBe('Password:')
+    expect(promptRegistrySize()).toBe(1)
+    // The vanished client's prompt is gone and can no longer be answered.
+    expect(answerGitAskpass(firstFrame.promptId, { password: 'late' })).toBe(false)
+    expect(session.cancelled).toBe(false)
+    expect(answerGitAskpass(secondFrame.promptId, { password: 'next' })).toBe(true)
+    expect(await second).toMatchObject({ code: 0, stdout: 'next' })
+    expect(promptRegistrySize()).toBe(0)
+  })
+
+  it('drops a queued client that disconnects before its turn', async () => {
+    const queue = frameQueue()
+    const session = await open('push', queue.onPrompt)
+    const first = run(process.execPath, [CLIENT, `--askpass=${socketOf(session)}`, 'Username:'])
+    const firstFrame = await queue.next()
+    const queued = spawn(process.execPath, [CLIENT, `--askpass=${socketOf(session)}`, 'Skipped:'], { stdio: 'ignore' })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    queued.kill('SIGKILL')
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    const third = run(process.execPath, [CLIENT, `--askpass=${socketOf(session)}`, 'Password:'])
+    expect(answerGitAskpass(firstFrame.promptId, { password: 'u' })).toBe(true)
+    await first
+    const frame = await queue.next()
+    expect(frame.prompt).toBe('Password:')
+    expect(answerGitAskpass(frame.promptId, { password: 'p' })).toBe(true)
+    expect((await third).stdout).toBe('p')
+  })
+
+  it('signals the operation synchronously when a prompt is cancelled, once', async () => {
+    const queue = frameQueue()
+    let cancels = 0
+    const session = await createAskpassSession('push', queue.onPrompt, { onCancel: () => { cancels += 1 } })
+    sessions.push(session)
+    const client = run(process.execPath, [CLIENT, `--askpass=${socketOf(session)}`, 'Password:'])
+    const frame = await queue.next()
+    expect(answerGitAskpass(frame.promptId, { cancel: true })).toBe(true)
+    // Before the client could even see the closed connection.
+    expect(cancels).toBe(1)
+    expect((await client).stdout).toBe('')
+    session.cancelAll()
+    expect(cancels).toBe(1)
+  })
+
+  it('answers only a strict { password: string } or { cancel: true }', async () => {
+    const queue = frameQueue()
+    const session = await open('push', queue.onPrompt)
+    const client = run(process.execPath, [CLIENT, `--askpass=${socketOf(session)}`, 'Password:'])
+    const frame = await queue.next()
+    const malformed: unknown[] = [
+      undefined, null, 'secret', 42, [], {}, { cancel: false }, { cancel: 'true' }, { cancel: 1 },
+      { password: 1 }, { password: null }, { password: 'x', cancel: true }, { password: 'x', extra: 1 }, { cancel: true, extra: 1 },
+    ]
+    for (const answer of malformed) {
+      expect(answerGitAskpass(frame.promptId, answer as { password: string })).toBe(false)
+    }
+    expect(answerGitAskpass(42 as unknown as string, { cancel: true })).toBe(false)
+    expect(promptRegistrySize()).toBe(1)
+    expect(session.cancelled).toBe(false)
+    expect(answerGitAskpass(frame.promptId, { password: '' })).toBe(true)
+    expect((await client).code).toBe(0)
+  })
+
+  it('requires the supplied owner to match the session owner', async () => {
+    const queue = frameQueue()
+    const owner = { workspaceId: 'w1', projectId: 'p1' }
+    const session = await createAskpassSession('push', queue.onPrompt, { owner })
+    sessions.push(session)
+    expect(session.owner).toEqual(owner)
+    const client = run(process.execPath, [CLIENT, `--askpass=${socketOf(session)}`, 'Password:'])
+    const frame = await queue.next()
+    for (const other of [{ workspaceId: 'w2', projectId: 'p1' }, { workspaceId: 'w1', projectId: 'p2' }]) {
+      expect(answerGitAskpass(frame.promptId, { password: 'secret' }, other)).toBe(false)
+      expect(answerGitAskpass(frame.promptId, { cancel: true }, other)).toBe(false)
+    }
+    expect(session.cancelled).toBe(false)
+    expect(promptRegistrySize()).toBe(1)
+    expect(answerGitAskpass(frame.promptId, { password: 'secret' }, { ...owner })).toBe(true)
+    expect((await client).stdout).toBe('secret')
+  })
+
+  it('refuses an owner-scoped answer for a session that has no owner', async () => {
+    const queue = frameQueue()
+    const session = await open('push', queue.onPrompt)
+    const client = run(process.execPath, [CLIENT, `--askpass=${socketOf(session)}`, 'Password:'])
+    const frame = await queue.next()
+    expect(answerGitAskpass(frame.promptId, { password: 'secret' }, { workspaceId: 'w', projectId: 'p' })).toBe(false)
+    expect(answerGitAskpass(frame.promptId, { password: 'secret' })).toBe(true)
+    await client
+  })
+
+  it('ignores gpg that is not executable or only found through a relative PATH entry', async () => {
+    const root = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-askpass-gpg2-')))
+    try {
+      const plain = path.join(root, 'plain')
+      const exec = path.join(root, 'exec')
+      await fs.mkdir(plain)
+      await fs.mkdir(exec)
+      await fs.writeFile(path.join(plain, 'gpg'), '#!/bin/sh\nexit 0\n', { mode: 0o644 })
+      await fs.chmod(path.join(plain, 'gpg'), 0o644)
+      const notExecutable = await createAskpassSession('commit', () => {}, { path: plain })
+      sessions.push(notExecutable)
+      expect(notExecutable.gpgWrapperPath).toBeUndefined()
+
+      await fs.writeFile(path.join(exec, 'gpg2'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+      const relative = path.relative(process.cwd(), exec)
+      expect(path.isAbsolute(relative)).toBe(false)
+      const viaRelative = await createAskpassSession('commit', () => {}, { path: relative })
+      sessions.push(viaRelative)
+      expect(viaRelative.gpgWrapperPath).toBeUndefined()
+
+      // An unusable earlier entry does not hide a usable later one; gpg2 is the fallback name.
+      const both = await createAskpassSession('commit', () => {}, { path: [plain, exec].join(path.delimiter) })
+      sessions.push(both)
+      expect(await fs.readFile(both.gpgWrapperPath as string, 'utf8')).toContain(`exec '${path.join(exec, 'gpg2')}' "$@"`)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('initialises is_signing in the gpg wrapper so an inherited value cannot force signing', async () => {
+    const bin = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-askpass-gpg3-')))
+    try {
+      const marker = path.join(bin, 'ran')
+      await fs.writeFile(path.join(bin, 'gpg'), `#!/bin/sh\necho "$@" > '${marker}'\n`, { mode: 0o755 })
+      const session = await createAskpassSession('commit', () => {}, { path: bin })
+      sessions.push(session)
+      const wrapper = await fs.readFile(session.gpgWrapperPath as string, 'utf8')
+      expect(wrapper).toContain('\nis_signing=\nfor arg in "$@"; do')
+      const result = await run(session.gpgWrapperPath as string, ['--version'], { ...process.env, is_signing: '1' })
+      expect(result.code).toBe(0)
+      expect(await fs.readFile(marker, 'utf8')).toBe('--version\n')
+    } finally {
+      await fs.rm(bin, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('Windows askpass endpoint and script', () => {
+  it('uses a random named pipe', async () => {
+    const { windowsPipeName } = await import('../../src/web/git-askpass.ts')
+    const a = windowsPipeName()
+    expect(a).toMatch(/^\\\\\.\\pipe\\dnt-harness-askpass-[0-9a-f]{32}$/)
+    expect(windowsPipeName()).not.toBe(a)
+  })
+
+  it('generates a .cmd that runs the Node client with the pipe and the git arguments', async () => {
+    const { generateWindowsAskpassScript } = await import('../../src/web/git-askpass.ts')
+    const script = generateWindowsAskpassScript('C:\\Program Files\\nodejs\\node.exe', 'C:\\dnt\\git-askpass-client.mjs', '\\\\.\\pipe\\dnt-harness-askpass-abc')
+    expect(script).toBe(
+      '@echo off\r\n"C:\\Program Files\\nodejs\\node.exe" "C:\\dnt\\git-askpass-client.mjs" --askpass=\\\\.\\pipe\\dnt-harness-askpass-abc %*\r\n',
+    )
+    expect(generateWindowsAskpassScript('n', 'c%x', '\\\\.\\pipe\\p')).toContain('"c%%x"')
+  })
+
+  it.runIf(process.platform === 'win32')('a session listens on the pipe and writes askpass.cmd', async () => {
+    const session = await open('push', () => {})
+    expect(session.endpoint).toMatch(/^\\\\\.\\pipe\\dnt-harness-askpass-/)
+    expect(session.env.GIT_ASKPASS).toBe(path.join(session.tempDir, 'askpass.cmd'))
+    expect(session.gpgWrapperPath).toBeUndefined()
+  })
+})
+
 describe('generateGpgWrapperScript', () => {
   const script = generateGpgWrapperScript('/usr/bin/gpg', '/opt/x y/client.mjs', "/tmp/a'b/askpass.sock")
 

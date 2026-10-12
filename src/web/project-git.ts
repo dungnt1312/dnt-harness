@@ -289,6 +289,10 @@ export interface GitCommandOptions {
   readonly stdin?: 'pipe' | 'ignore'
   /** Replaces the project environment, e.g. when the caller adds askpass variables to it. */
   readonly env?: Readonly<Record<string, string>>
+  /** Start git as its own process group leader (not on Windows), so the whole tree can be killed. */
+  readonly detached?: boolean
+  /** Called synchronously with the child right after it starts. */
+  readonly onSpawn?: (child: ChildProcessWithoutNullStreams) => void
 }
 
 /**
@@ -302,12 +306,15 @@ export async function buildGitCommand(
   options: GitCommandOptions,
 ): Promise<ChildProcessWithoutNullStreams> {
   const env = options.env ?? await projectGitEnvironment(root)
-  return spawn(gitOnPath(env), gitCommandArgs(args, options.trusted), {
+  const child = spawn(gitOnPath(env), gitCommandArgs(args, options.trusted), {
     cwd: root,
     env: { ...env },
     stdio: [options.stdin ?? 'pipe', 'pipe', 'pipe'],
     windowsHide: true,
+    detached: options.detached === true && process.platform !== 'win32',
   }) as ChildProcessWithoutNullStreams
+  options.onSpawn?.(child)
+  return child
 }
 
 /** One finished git query. `code` is git's own exit code, never a launch failure. */

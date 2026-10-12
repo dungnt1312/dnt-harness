@@ -9,9 +9,10 @@
  * `--`; client-supplied remote and branch names are checked against Git before
  * they can appear in an argument list, so none of them can become an option.
  */
-import { execFile } from 'node:child_process'
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { existsSync, realpathSync } from 'node:fs'
 import path from 'node:path'
+import { createAskpassSession, type AskpassFrame, type AskpassOwner, type AskpassSession } from './git-askpass.ts'
 import {
   contain,
   gitStatus,
@@ -41,9 +42,17 @@ export interface GitOperationResult {
   readonly cancelled?: true
 }
 
-/** What an askpass session contributes: the variables that route prompts to the browser. */
+/**
+ * How a prompting operation (commit, fetch, pull, push) reaches the browser.
+ * The session is created inside the operation's queue slot and disposed when
+ * the operation ends, however it ends. `onSession` hands the caller the session
+ * so it can `cancelAll()`; answering goes through `answerGitAskpass`.
+ */
 export interface GitOperationAskpass {
-  readonly env: Readonly<Record<string, string>>
+  readonly operation: string
+  readonly owner?: AskpassOwner
+  readonly onPrompt: (frame: AskpassFrame) => void
+  readonly onSession?: (session: AskpassSession) => void
 }
 
 /** Seams for tests; production passes none. */
@@ -51,6 +60,8 @@ export interface GitOperationDeps {
   readonly run?: GitRunner
   readonly trashPath?: (abs: string) => Promise<void>
   readonly deniedRoots?: readonly string[]
+  /** Milliseconds between SIGTERM and SIGKILL on cancel (default 2000). */
+  readonly killGraceMs?: number
 }
 
 // ── per-repository serial queue (Zed `send_job`) ────────────────
@@ -92,6 +103,8 @@ interface Context {
   readonly run: GitRunner
   readonly env: Readonly<Record<string, string>>
   readonly deniedRoots: readonly string[] | undefined
+  /** Present only for prompting operations with askpass; lets a cancel kill the running git. */
+  readonly control: OperationControl | undefined
 }
 
 const DONE: Step = { ok: true, stdout: '', stderr: '' }
@@ -99,15 +112,101 @@ const DONE: Step = { ok: true, stdout: '', stderr: '' }
 /** Treat every path argument as a literal file name, never as a glob or `:(magic)` pathspec. */
 const LITERAL_PATHSPECS = { GIT_LITERAL_PATHSPECS: '1' } as const
 
-async function makeContext(root: string, trusted: boolean, run: GitRunner | undefined, extraEnv: Readonly<Record<string, string>> | undefined, deniedRoots: readonly string[] | undefined): Promise<Context> {
+async function makeContext(
+  root: string,
+  trusted: boolean,
+  run: GitRunner | undefined,
+  extraEnv: Readonly<Record<string, string>> | undefined,
+  deniedRoots: readonly string[] | undefined,
+  control?: OperationControl,
+): Promise<Context> {
   const base = await projectGitEnvironment(root)
-  return { root, trusted, run: run ?? runGitCommand, env: { ...base, ...extraEnv }, deniedRoots }
+  return { root, trusted, run: run ?? runGitCommand, env: { ...base, ...extraEnv }, deniedRoots, control }
+}
+
+// ── cancellation (kills the whole git process tree) ─────────────
+
+/** Thrown inside an operation once it was cancelled; becomes `{ cancelled: true }`. */
+class OperationCancelled extends Error {}
+
+const DEFAULT_KILL_GRACE_MS = 2000
+
+/** Signal a process and everything it started: its group on Unix (git is spawned detached), `taskkill /T /F` on Windows. */
+function killTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
+  const pid = child.pid
+  if (pid === undefined) return
+  if (process.platform === 'win32') {
+    spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }).on('error', () => {})
+    return
+  }
+  try {
+    process.kill(-pid, signal)
+  } catch {
+    // not a group leader (a runner that did not detach), or already gone
+    try { child.kill(signal) } catch { /* already gone */ }
+  }
+}
+
+/** Cancellation state of one operation; follows whichever git process is running. */
+class OperationControl {
+  cancelled = false
+  #child: ChildProcessWithoutNullStreams | undefined
+
+  constructor(private readonly graceMs: number) {}
+
+  attach(child: ChildProcessWithoutNullStreams): void {
+    this.#child = child
+    if (this.cancelled) this.#kill(child)
+  }
+
+  detach(): void {
+    this.#child = undefined
+  }
+
+  /** Idempotent. Synchronous, so it can run before the askpass connection is closed. */
+  cancel(): void {
+    if (this.cancelled) return
+    this.cancelled = true
+    if (this.#child !== undefined) this.#kill(this.#child)
+  }
+
+  #kill(child: ChildProcessWithoutNullStreams): void {
+    killTree(child, 'SIGTERM')
+    if (process.platform === 'win32') return
+    // Fallback for a git (or hook, or ssh) that ignores SIGTERM.
+    const timer = setTimeout(() => killTree(child, 'SIGKILL'), this.graceMs)
+    timer.unref()
+    // Once git is gone nothing waits for the grace period, but a member of its
+    // group may have outlived it (it ignored SIGTERM, or closed its pipes): it
+    // is killed now, while the group id still cannot belong to anyone else.
+    child.once('close', () => {
+      clearTimeout(timer)
+      killTree(child, 'SIGKILL')
+    })
+  }
 }
 
 /** One git command; stdin is always closed so nothing can wait on it (no timeout exists). */
 async function git(ctx: Context, args: readonly string[]): Promise<Step> {
-  const result = await ctx.run(ctx.root, args, { trusted: ctx.trusted, stdin: 'ignore', env: ctx.env })
-  return { ok: result.code === 0, stdout: result.stdout.toString('utf8'), stderr: result.stderr.toString('utf8') }
+  const { control } = ctx
+  if (control?.cancelled) throw new OperationCancelled()
+  try {
+    const result = await ctx.run(ctx.root, args, {
+      trusted: ctx.trusted,
+      stdin: 'ignore',
+      env: ctx.env,
+      ...(control === undefined ? {} : { detached: true, onSpawn: (child: ChildProcessWithoutNullStreams) => control.attach(child) }),
+    })
+    // A git that finished successfully stays a success even if a cancel raced it.
+    if (control?.cancelled && result.code !== 0) throw new OperationCancelled()
+    return { ok: result.code === 0, stdout: result.stdout.toString('utf8'), stderr: result.stderr.toString('utf8') }
+  } catch (error) {
+    // A killed git rejects ("killed by SIGTERM"); that is the cancel, not a failure.
+    if (control?.cancelled) throw new OperationCancelled()
+    throw error
+  } finally {
+    control?.detach()
+  }
 }
 
 /** Run steps in order, concatenating their output, and stop at the first failure. */
@@ -386,12 +485,59 @@ export function runProjectGitOperation(
   deps: GitOperationDeps = {},
 ): Promise<GitOperationResult> {
   return enqueue(queueKey(root), async () => {
-    // Path operations get literal pathspecs; the prompting ones run hooks and
-    // child git processes, which keep the environment a terminal would give them.
-    const extraEnv = PROMPTING.has(request.type) ? askpass?.env : LITERAL_PATHSPECS
-    const ctx = await makeContext(root, trusted, deps.run, extraEnv, deps.deniedRoots)
-    const step = await dispatch(ctx, request, deps.trashPath ?? trashPath)
-    const status = await gitStatus(root, deps.deniedRoots, trusted)
-    return { ok: step.ok, stdout: step.stdout, stderr: step.stderr, status }
+    const prompting = askpass !== undefined && PROMPTING.has(request.type)
+    const control = prompting ? new OperationControl(deps.killGraceMs ?? DEFAULT_KILL_GRACE_MS) : undefined
+    let session: AskpassSession | undefined
+    try {
+      // Path operations get literal pathspecs; the prompting ones run hooks and
+      // child git processes, which keep the environment a terminal would give them.
+      let extraEnv: Readonly<Record<string, string>> | undefined = PROMPTING.has(request.type) ? undefined : LITERAL_PATHSPECS
+      if (askpass !== undefined && control !== undefined) {
+        const base = await projectGitEnvironment(root)
+        const searchPath = pathOf(base)
+        session = await createAskpassSession(askpass.operation, askpass.onPrompt, {
+          ...(searchPath === undefined ? {} : { path: searchPath }),
+          ...(askpass.owner === undefined ? {} : { owner: askpass.owner }),
+          onCancel: () => control.cancel(),
+        })
+        extraEnv = sessionEnvironment(base, session)
+        askpass.onSession?.(session)
+      }
+      const ctx = await makeContext(root, trusted, deps.run, extraEnv, deps.deniedRoots, control)
+      let step: Step
+      try {
+        step = await dispatch(ctx, request, deps.trashPath ?? trashPath)
+      } catch (error) {
+        if (!(error instanceof OperationCancelled)) throw error
+        const status = await gitStatus(root, deps.deniedRoots, trusted)
+        return { ok: false, stdout: '', stderr: '', status, cancelled: true }
+      }
+      const status = await gitStatus(root, deps.deniedRoots, trusted)
+      return { ok: step.ok, stdout: step.stdout, stderr: step.stderr, status }
+    } finally {
+      // Success, git failure, rejection or cancel: the socket, script and temp dir always go.
+      await session?.dispose()
+    }
   })
+}
+
+/** The `PATH` of a project environment (any case on Windows). */
+function pathOf(env: Readonly<Record<string, string>>): string | undefined {
+  const key = Object.keys(env).find((name) => name.toUpperCase() === 'PATH')
+  return key === undefined ? undefined : env[key]
+}
+
+/**
+ * Variables that route prompts to the session. Git config from the environment
+ * is only added when the project environment has none of its own, so a user's
+ * `GIT_CONFIG_*` is never overwritten or renumbered.
+ */
+export function sessionEnvironment(base: Readonly<Record<string, string>>, session: AskpassSession): Record<string, string> {
+  const env: Record<string, string> = { ...session.env }
+  if (base['GIT_CONFIG_COUNT'] === undefined && session.gpgWrapperPath !== undefined) {
+    env['GIT_CONFIG_COUNT'] = '1'
+    env['GIT_CONFIG_KEY_0'] = 'gpg.program'
+    env['GIT_CONFIG_VALUE_0'] = session.gpgWrapperPath
+  }
+  return env
 }
