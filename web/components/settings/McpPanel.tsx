@@ -97,6 +97,8 @@ const OAUTH_BADGE: Readonly<Record<McpOAuthState['state'], { readonly label: str
 interface PendingSignIn {
   readonly server: string
   readonly state: string
+  /** `paste`: the provider returns the browser somewhere this tab cannot reach; the person pastes that address. */
+  readonly paste: boolean
 }
 
 const linesToArray = (raw: string): string[] => raw.split('\n').map((line) => line.trim()).filter((line) => line !== '')
@@ -304,6 +306,8 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
   const [pendingSignIn, setPendingSignIn] = useScopedState<PendingSignIn | null>(null)
   /** Why Connect needs a client, shown above the editor's client section. */
   const [clientNeeded, setClientNeeded] = useScopedState<string | null>(null)
+  /** The address pasted back after sign-in from another machine. Held only until it is used. */
+  const [pastedAddress, setPastedAddress] = useScopedState('')
 
   const refresh = useCallback(async () => {
     if (workspaceId === null) return
@@ -313,11 +317,18 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
 
   useEffect(() => { void refresh() }, [refresh])
 
-  const finishSignIn = useCallback(async (pending: PendingSignIn): Promise<void> => {
+  /**
+   * Finish a sign-in with its state (the callback page reported back), or with
+   * the address pasted back. A rejected pasted address keeps the sign-in open
+   * so it can be corrected; every other outcome ends it.
+   */
+  const finishSignIn = useCallback(async (pending: PendingSignIn, address?: string): Promise<void> => {
     if (workspaceId === null) return
-    setPendingSignIn(null)
+    if (address === undefined) setPendingSignIn(null)
     try {
-      const result = await completeMcpOAuth(workspaceId, pending.server, pending.state)
+      const result = await completeMcpOAuth(workspaceId, pending.server, address === undefined ? pending.state : { callbackUrl: address.trim() })
+      setPendingSignIn(null)
+      setPastedAddress('')
       setNotice(result.status === 'failed'
         ? { kind: 'bad', text: `${pending.server} is signed in, but the server did not start. Check its status below.` }
         : { kind: 'ok', text: `${pending.server} is connected.` })
@@ -380,7 +391,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
   const connect = (row: McpServerRow): Promise<void> => run(`oauth:${row.name}`, async () => {
     const tab = window.open('', '_blank')
     const scopes = row.oauth?.missingScope !== undefined ? row.oauth.missingScope.split(/\s+/).filter((scope) => scope !== '') : []
-    let started: { readonly authorizationUrl: string; readonly state: string }
+    let started: { readonly authorizationUrl: string; readonly state: string; readonly redirectMode?: string }
     try {
       started = await beginMcpOAuth(workspaceId, row.name, scopes)
     } catch (cause) {
@@ -395,7 +406,8 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
     }
     if (tab !== null) tab.location.href = started.authorizationUrl
     else window.open(started.authorizationUrl, '_blank')
-    setPendingSignIn({ server: row.name, state: started.state })
+    setPastedAddress('')
+    setPendingSignIn({ server: row.name, state: started.state, paste: started.redirectMode === 'paste' })
     setNotice({ kind: 'ok', text: `Waiting for sign-in to ${row.name} in the new tab…` })
   })
 
@@ -657,11 +669,25 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
             </PanelIntro>
             <IsolationSummary />
           </div>
-          {pendingSignIn !== null ? (
+          {pendingSignIn !== null && !pendingSignIn.paste ? (
             <div role="status" className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted px-3 py-2 text-[13px]">
               <span className="mr-auto">Waiting for sign-in to {pendingSignIn.server}. Finish it in the tab that opened; this completes on its own.</span>
               <Button variant="primary" size="sm" disabled={busy !== null} onClick={() => void finishSignIn(pendingSignIn)}>Finish sign-in</Button>
               <Button variant="ghost" size="sm" onClick={() => setPendingSignIn(null)}>Cancel</Button>
+            </div>
+          ) : null}
+          {pendingSignIn !== null && pendingSignIn.paste ? (
+            <div role="status" className="flex flex-col gap-3 rounded-md border border-border bg-muted px-3 py-3 text-[13px]">
+              <p className="m-0">
+                Sign in to {pendingSignIn.server} in the new tab. After you approve, the browser lands on an address on your own computer that this page can't be reached from, and shows a connection error. That is expected: copy the full address from the browser's address bar and paste it here.
+              </p>
+              <Field label="Address the browser ended on" hint="Looks like http://127.0.0.1:…/api/mcp/oauth/callback?code=…&state=…. It is used once to finish the sign-in and is not kept.">
+                <TextInput mono autoComplete="off" value={pastedAddress} placeholder="http://127.0.0.1:3082/api/mcp/oauth/callback?code=…" onChange={(event) => setPastedAddress(event.target.value)} />
+              </Field>
+              <div className="flex justify-end gap-2">
+                <Button variant="ghost" size="sm" onClick={() => { setPendingSignIn(null); setPastedAddress('') }}>Cancel</Button>
+                <Button variant="primary" size="sm" disabled={busy !== null || pastedAddress.trim() === ''} onClick={() => void finishSignIn(pendingSignIn, pastedAddress)}>Complete sign-in</Button>
+              </div>
             </div>
           ) : null}
           {serverList}

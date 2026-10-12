@@ -8,7 +8,13 @@
  * Serve the built client first:
  *
  *   npm run build:web
- *   npm run web [-- --port 3082 --root . --yolo --auth --allowed-host <name,ip>]
+ *   npm run web [-- --port 3082 --root . --yolo --auth --allowed-host <name,ip>
+ *                  --oauth-origin <https://host[,https://host2]>]
+ *
+ * `--oauth-origin` states the https origin the app is reached at, so MCP OAuth
+ * sign-in from another machine redirects back to it and finishes on its own.
+ * Without it, sign-in from a non-loopback name asks you to paste back the
+ * address the browser ended on.
  *
  * The listener is loopback-only, so control-plane pairing stays off unless
  * `--auth` (or `DNT_HARNESS_AUTH=1`) asks for it.
@@ -34,6 +40,7 @@ interface CliOptions {
   readonly yolo: boolean
   readonly auth: boolean
   readonly allowedHosts: readonly string[]
+  readonly oauthOrigins: readonly string[]
 }
 
 function parseArgs(argv: readonly string[]): CliOptions {
@@ -48,6 +55,8 @@ function parseArgs(argv: readonly string[]): CliOptions {
   // Extra names the Host allowlist should answer to — a reverse proxy's
   // hostname or the tailnet IP when served through `tailscale serve`.
   const allowedHosts: string[] = []
+  // https origins the app is reached at, for MCP OAuth redirects (see createWebServer).
+  const oauthOrigins: string[] = []
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (arg === '--port') port = Number(argv[i + 1] ?? port) || port
@@ -61,13 +70,18 @@ function parseArgs(argv: readonly string[]): CliOptions {
         const trimmed = host.trim().toLowerCase()
         if (trimmed !== '') allowedHosts.push(trimmed)
       }
+    } else if (arg === '--oauth-origin') {
+      for (const origin of (argv[i + 1] ?? '').split(',')) {
+        const trimmed = origin.trim()
+        if (trimmed !== '') oauthOrigins.push(trimmed)
+      }
     }
   }
-  return { port, root, dataDir, yolo, auth, allowedHosts }
+  return { port, root, dataDir, yolo, auth, allowedHosts, oauthOrigins }
 }
 
 async function main(): Promise<void> {
-  const { port, root, dataDir, yolo, auth, allowedHosts } = parseArgs(process.argv.slice(2))
+  const { port, root, dataDir, yolo, auth, allowedHosts, oauthOrigins } = parseArgs(process.argv.slice(2))
   await assertSchemaFloor(dataDir)
 
   const server = await createWebServer({
@@ -94,6 +108,7 @@ async function main(): Promise<void> {
     port,
     controlPlaneAuth: auth,
     ...(allowedHosts.length > 0 ? { allowedHosts } : {}),
+    ...(oauthOrigins.length > 0 ? { oauthOrigins } : {}),
   })
 
   process.stdout.write(`dnt-harness web: ${server.url}\n`)

@@ -165,6 +165,40 @@ export class ManagedOAuth {
     await this.store.saveTransaction({ ...tx, code })
   }
 
+  /**
+   * The person signed in on a machine whose browser could not reach this
+   * host's callback, and pasted the address it ended on. Read `state` and
+   * `code` from it and deposit them, exactly as the callback page would.
+   *
+   * The address must belong to this person's own pending sign-in for this
+   * server, and must be that sign-in's redirect address: a code is accepted
+   * only for the transaction that asked for it, and the PKCE verifier never
+   * leaves the host. Errors name what is wrong without echoing the code.
+   * A callback the browser already deposited counts as done.
+   */
+  async acceptCallbackUrl(address: string, expected: { readonly workspaceId: string; readonly server: string; readonly principalId: string }): Promise<string> {
+    const text = address.trim()
+    if (!/^(https?:\/\/|\/)/i.test(text)) throw new OAuthFlowError('that is not an address; paste the full address from the browser\'s address bar')
+    let pasted: URL
+    try { pasted = new URL(text, 'http://paste.invalid') } catch { throw new OAuthFlowError('that is not an address; paste the full address from the browser\'s address bar') }
+    const providerError = pasted.searchParams.get('error')
+    if (providerError !== null) throw new OAuthFlowError(`the provider did not grant access (${providerError.slice(0, 80)})`)
+    const state = pasted.searchParams.get('state') ?? ''
+    const tx = state === '' ? undefined : await this.store.readTransaction(state)
+    if (tx === undefined || tx.expiresAt <= this.now()) throw new OAuthFlowError('callback state is unknown, expired, or already used')
+    if (tx.principalId !== expected.principalId || tx.workspaceId !== expected.workspaceId || tx.server !== expected.server) {
+      throw new OAuthFlowError('callback does not belong to this principal, workspace, and server')
+    }
+    const redirect = new URL(tx.redirectUri)
+    const sameOrigin = text.startsWith('/') || pasted.origin === redirect.origin
+    if (!sameOrigin || pasted.pathname !== redirect.pathname) throw new OAuthFlowError('the address is not this sign-in\'s redirect address; paste the one the browser ended on after you signed in')
+    if (tx.code !== undefined) return state
+    const code = pasted.searchParams.get('code') ?? ''
+    if (code === '') throw new OAuthFlowError('the address has no authorization code; paste the address the browser ended on after you signed in')
+    await this.deposit(state, code)
+    return state
+  }
+
   async complete(input: { readonly state: string; readonly principalId: string; readonly workspaceId: string; readonly server: string }): Promise<OAuthTokens> {
     const tx = await this.store.readTransaction(input.state)
     if (tx === undefined || tx.code === undefined) throw new OAuthFlowError('authorization has not been deposited')

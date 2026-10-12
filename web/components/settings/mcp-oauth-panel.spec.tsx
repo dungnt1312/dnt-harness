@@ -186,6 +186,59 @@ describe('MCP panel OAuth', () => {
     expect(document.body.textContent).toContain('remote is connected')
   })
 
+  describe('signing in from another machine', () => {
+    const pasteRow = () => vi.mocked(listMcpServers).mockResolvedValue([oauthRow('not_connected')] as never)
+    const startPaste = async (): Promise<void> => {
+      pasteRow()
+      vi.mocked(beginMcpOAuth).mockResolvedValueOnce({ authorizationUrl: 'https://provider.example/authorize?x=1', state: 'state-1', redirectMode: 'paste' } as never)
+      await render()
+      await act(async () => button('Connect remote').click())
+      await settle()
+    }
+
+    it('asks for the final address only when the host said the sign-in has to be pasted back', async () => {
+      pasteRow()
+      await render()
+      await act(async () => button('Connect remote').click())
+      await settle()
+      expect(() => input('Address the browser ended on')).toThrow()
+
+      await act(async () => button('Cancel').click())
+      await startPaste()
+      expect(input('Address the browser ended on')).toBeTruthy()
+      expect(document.body.textContent).toContain("can't be reached")
+    })
+
+    it('sends the pasted address to the host instead of the state', async () => {
+      await startPaste()
+      const address = 'http://127.0.0.1:3082/api/mcp/oauth/callback?code=abc&state=state-1'
+      await act(async () => type(input('Address the browser ended on'), `  ${address}  `))
+      await act(async () => button('Complete sign-in').click())
+      await settle()
+      expect(completeMcpOAuth).toHaveBeenCalledWith('ws', 'remote', { callbackUrl: address })
+      expect(document.body.textContent).toContain('remote is connected')
+    })
+
+    it('does not finish with an empty address, and keeps the field after a rejection', async () => {
+      await startPaste()
+      expect(button('Complete sign-in').disabled).toBe(true)
+      vi.mocked(completeMcpOAuth).mockRejectedValueOnce(new Error('the address is not this sign-in\'s redirect address'))
+      await act(async () => type(input('Address the browser ended on'), 'http://127.0.0.1:3082/wrong'))
+      await act(async () => button('Complete sign-in').click())
+      await settle()
+      expect(document.body.textContent).toContain("redirect address")
+      expect(input('Address the browser ended on').value).toBe('http://127.0.0.1:3082/wrong')
+    })
+
+    it('never shows the pasted address back once it has been used', async () => {
+      await startPaste()
+      await act(async () => type(input('Address the browser ended on'), 'http://127.0.0.1:3082/api/mcp/oauth/callback?code=secret-code&state=state-1'))
+      await act(async () => button('Complete sign-in').click())
+      await settle()
+      expect(document.body.textContent).not.toContain('secret-code')
+    })
+  })
+
   it('finishes by hand when the channel message never arrives', async () => {
     vi.mocked(listMcpServers).mockResolvedValue([oauthRow('not_connected')] as never)
     await render()

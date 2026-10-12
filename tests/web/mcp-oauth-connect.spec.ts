@@ -129,14 +129,16 @@ describe('MCP OAuth Connect', () => {
     expect(url.searchParams.get('redirect_uri')).toBe(`${ctx.base}/api/mcp/oauth/callback`)
   })
 
-  it('refuses to connect through a non-loopback host name', async () => {
+  it('never puts a non-loopback host name into the redirect: it falls back to the loopback port', async () => {
     const ctx = await boot({}, { allowedHosts: ['dev.internal'] })
     await addOAuthServer(ctx.api, ctx.f.mcpUrl)
     const port = new URL(ctx.base).port
     const answer = await postWithHost(ctx.base, `/api/workspaces/${ctx.wsId}/mcp/remote/oauth/begin`, `dev.internal:${port}`, {})
-    expect(answer.status).toBe(400)
-    expect(JSON.parse(answer.body)).toMatchObject({ code: 'loopback_required' })
-    expect(ctx.f.registrations).toEqual([])
+    expect(answer.status).toBe(200)
+    const body = JSON.parse(answer.body) as { authorizationUrl: string; redirectMode: string }
+    expect(body.redirectMode).toBe('paste')
+    expect(new URL(body.authorizationUrl).searchParams.get('redirect_uri')).toBe(`http://127.0.0.1:${port}/api/mcp/oauth/callback`)
+    expect(ctx.f.registrations[0]?.['redirect_uris']).toEqual([`http://127.0.0.1:${port}/api/mcp/oauth/callback`])
   })
 
   it('asks for a client when the provider cannot register one', async () => {

@@ -310,6 +310,78 @@ describe('managed oauth client authentication and server records', () => {
   })
 })
 
+describe('pasting the final redirect address', () => {
+  const callback = 'http://127.0.0.1:3082/api/mcp/oauth/callback'
+  const who = { workspaceId: 'ws', server: 'remote', principalId: 'p' }
+  async function began(oauth: ManagedOAuth, redirectUri = callback) {
+    const { state } = await oauth.begin({
+      workspaceId: 'ws', server: 'remote', principalId: 'p', resource: 'http://127.0.0.1/mcp',
+      authorizationEndpoint: 'http://127.0.0.1/authorize', tokenEndpoint: 'http://127.0.0.1/token', clientId: 'client',
+      redirectUri, scopes: [],
+    })
+    return state
+  }
+  async function withOAuth<T>(body: (oauth: ManagedOAuth) => Promise<T>): Promise<T> {
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-oauth-'))
+    try {
+      const store = new OAuthStore(home, randomBytes(32))
+      return await body(new ManagedOAuth(store, (async () => Response.json({ access_token: 'a', refresh_token: 'r', expires_in: 3600 })) as typeof fetch))
+    } finally { await fs.rm(home, { recursive: true, force: true }) }
+  }
+
+  it('reads state and code from the address, deposits them, and returns the state', async () => {
+    await withOAuth(async (oauth) => {
+      const state = await began(oauth)
+      await expect(oauth.acceptCallbackUrl(`${callback}?code=the-code&state=${state}`, who)).resolves.toBe(state)
+      await expect(oauth.complete({ state, principalId: 'p', workspaceId: 'ws', server: 'remote' })).resolves.toMatchObject({ accessToken: 'a' })
+    })
+  })
+
+  it('accepts an address from a browser that kept only the path and query', async () => {
+    await withOAuth(async (oauth) => {
+      const state = await began(oauth)
+      await expect(oauth.acceptCallbackUrl(`/api/mcp/oauth/callback?code=c&state=${state}`, who)).resolves.toBe(state)
+    })
+  })
+
+  it('refuses an address for another server, another person, or another redirect URI', async () => {
+    await withOAuth(async (oauth) => {
+      const state = await began(oauth)
+      const url = `${callback}?code=c&state=${state}`
+      await expect(oauth.acceptCallbackUrl(url, { ...who, server: 'other' })).rejects.toThrow(/does not belong/)
+      await expect(oauth.acceptCallbackUrl(url, { ...who, principalId: 'someone-else' })).rejects.toThrow(/does not belong/)
+      await expect(oauth.acceptCallbackUrl(`http://evil.example/api/mcp/oauth/callback?code=c&state=${state}`, who)).rejects.toThrow(/redirect address/)
+      await expect(oauth.acceptCallbackUrl(`http://127.0.0.1:3082/elsewhere?code=c&state=${state}`, who)).rejects.toThrow(/redirect address/)
+    })
+  })
+
+  it('refuses a provider error, a missing code, an unknown state, and text that is not an address', async () => {
+    await withOAuth(async (oauth) => {
+      const state = await began(oauth)
+      await expect(oauth.acceptCallbackUrl(`${callback}?error=access_denied&state=${state}`, who)).rejects.toThrow(/access_denied/)
+      await expect(oauth.acceptCallbackUrl(`${callback}?state=${state}`, who)).rejects.toThrow(/no authorization code/)
+      await expect(oauth.acceptCallbackUrl(`${callback}?code=c&state=unknown`, who)).rejects.toThrow(/unknown, expired, or already used/)
+      await expect(oauth.acceptCallbackUrl('this is not a url', who)).rejects.toThrow(/not an address/)
+    })
+  })
+
+  it('does not echo the code in errors', async () => {
+    await withOAuth(async (oauth) => {
+      const message = await oauth.acceptCallbackUrl(`${callback}?code=secret-code-123&state=unknown`, who).catch((error: unknown) => (error as Error).message)
+      expect(message).not.toContain('secret-code-123')
+    })
+  })
+
+  it('treats a callback the browser already deposited as done, keeping the first code', async () => {
+    await withOAuth(async (oauth) => {
+      const state = await began(oauth)
+      await oauth.deposit(state, 'from-browser')
+      await expect(oauth.acceptCallbackUrl(`${callback}?code=pasted&state=${state}`, who)).resolves.toBe(state)
+      await expect(oauth.complete({ state, principalId: 'p', workspaceId: 'ws', server: 'remote' })).resolves.toMatchObject({ accessToken: 'a' })
+    })
+  })
+})
+
 async function depositedAuthorization(oauth: ManagedOAuth) {
   const { state } = await oauth.begin({
     workspaceId: 'ws', server: 'remote', principalId: 'person-a',

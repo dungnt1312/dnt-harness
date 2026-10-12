@@ -15,7 +15,7 @@
 import { MCP_ACCEPTED_PROTOCOL_VERSION as MCP_PROTOCOL_VERSION } from './boundaries.ts'
 import { assertOutboundUrl, OutboundPolicyError } from './outbound-policy.ts'
 
-export type OAuthConnectCode = 'loopback_required' | 'discovery_failed' | 'client_required' | 'registration_failed'
+export type OAuthConnectCode = 'discovery_failed' | 'client_required' | 'registration_failed'
 
 export class OAuthConnectError extends Error {
   constructor(readonly code: OAuthConnectCode, message: string) {

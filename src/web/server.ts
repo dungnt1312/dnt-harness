@@ -127,7 +127,7 @@ import { MutationStore, readFileIfPresent } from '../harness/mcp/mutation-store.
 import { recoverMigrations } from '../harness/mcp/migration.ts'
 import { DataHomeLock } from '../harness/mcp/ownership-lock.ts'
 import { ManagedOAuth } from '../harness/mcp/oauth.ts'
-import { beginConnect, callbackPage, grantMatchesServer, managedAuthOf, OAuthConnectError, oauthRowState } from './mcp-oauth-connect.ts'
+import { beginConnect, callbackPage, grantMatchesServer, managedAuthOf, OAuthConnectError, oauthRowState, parseOAuthOrigins } from './mcp-oauth-connect.ts'
 import { OAuthStore } from '../harness/mcp/oauth-store.ts'
 import { containmentCapability, resolveCanonicalExecutable } from '../harness/mcp/process-controller.ts'
 import { stageMcpOutcome } from '../harness/mcp/staged-outcome.ts'
@@ -376,6 +376,16 @@ export interface WebServerOptions {
    */
   readonly allowedHosts?: readonly string[]
   /**
+   * https origins this host is reached at (`https://harness.example.com`), for
+   * MCP OAuth sign-in from another machine. A request whose `Host` matches one
+   * gets that origin as its OAuth redirect, so the provider returns the browser
+   * to this host and sign-in finishes on its own. Any other non-loopback name
+   * falls back to this host's loopback redirect and the person pastes the final
+   * address back. The scheme cannot be read from a proxied request, so the
+   * operator states it. Each must be an origin only and use https.
+   */
+  readonly oauthOrigins?: readonly string[]
+  /**
    * Interactive Workbench terminals. Enabled by default, and served only on a
    * loopback bind: a terminal reachable from the network is remote code
    * execution for anyone who can open the page. `spawner` is a test seam.
@@ -616,6 +626,9 @@ function publicProvider(entry: ProviderConfig): PublicProvider {
 
 /** Boot the harness on a kernel and expose it over HTTP. */
 export async function createWebServer(options: WebServerOptions): Promise<WebServer> {
+  // Validated before anything is built: a typo here would otherwise only show
+  // up as a provider rejecting the redirect.
+  const oauthOrigins = parseOAuthOrigins(options.oauthOrigins ?? [])
   const boundHost = options.host ?? '127.0.0.1'
   const loopbackBind = boundHost === '127.0.0.1' || boundHost === '::1' || boundHost === 'localhost'
   // Refused before anything is constructed: an unauthenticated API on a
@@ -3880,6 +3893,7 @@ ${entry.description}`.toLowerCase().includes(query))
     sessionPrincipals,
     oauth,
     oauthStore,
+    oauthOrigins,
     generationOf,
     fenceWorkspace,
     closeStreamsFor,
@@ -4173,6 +4187,8 @@ interface HandlerDeps {
   readonly sessionPrincipals: Map<string, string>
   readonly oauth: ManagedOAuth
   readonly oauthStore: OAuthStore
+  /** Validated `oauthOrigins`: https origins this host may use as an OAuth redirect. */
+  readonly oauthOrigins: readonly string[]
   readonly generationOf: (workspaceId: string) => number
   readonly fenceWorkspace: (workspaceId: WorkspaceId) => Promise<void>
   readonly closeStreamsFor: (principalId: string) => void
@@ -5202,14 +5218,22 @@ async function handleApi(
             config,
             principalId,
             hostHeader: req.headers.host,
+            boundPort: req.socket.localPort ?? 0,
+            oauthOrigins: deps.oauthOrigins,
             extraScopes,
           })
-          send(200, { authorizationUrl: started.authorizationUrl, state: started.state })
+          send(200, { authorizationUrl: started.authorizationUrl, state: started.state, redirectMode: started.redirectMode })
           return
         }
         if (action === 'complete') {
+          // Sign-in from a machine whose browser could not reach the callback:
+          // the person pastes the address it ended on. Only that address is read.
+          const pastedAddress = typeof body['callbackUrl'] === 'string' ? body['callbackUrl'] : undefined
+          const state = pastedAddress !== undefined
+            ? await deps.oauth.acceptCallbackUrl(pastedAddress, { workspaceId: wsId, server: serverName, principalId })
+            : String(body['state'] ?? '')
           await deps.oauth.complete({
-            state: String(body['state'] ?? ''),
+            state,
             principalId,
             workspaceId: wsId,
             server: serverName,

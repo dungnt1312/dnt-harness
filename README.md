@@ -44,7 +44,7 @@ to the underlying bin (see [docs/guides.md](docs/guides.md) for flags):
 
 | Command | Does |
 |---|---|
-| `dnt-harness [web] [--port N --root DIR --yolo --auth --allowed-host H --data-dir DIR]` | serve the web UI (default) |
+| `dnt-harness [web] [--port N --root DIR --yolo --auth --allowed-host H --oauth-origin https://H --data-dir DIR]` | serve the web UI (default) |
 | `dnt-harness chat [--message "hi"]` | headless REPL or one-shot |
 | `dnt-harness pair [--data-dir DIR]` | mint a pairing code for a running `--auth` server |
 | `dnt-harness start pm2 [--name N] [web flags]` | run the web server under pm2 (needs `npm i -g pm2`) |

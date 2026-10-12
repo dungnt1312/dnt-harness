@@ -1,7 +1,31 @@
 # MCP OAuth: discovery, client registration, and Connect
 
-Status: draft for review, 2026-10-12. Analysis and probes:
+Status: implemented 2026-10-12, then extended the same day (see "Revision:
+other machines"). Analysis and probes:
 `plans/reports/analysis-261012-1716-mcp-oauth-dcr.md`.
+
+## Revision: other machines (user request, 2026-10-12)
+
+The first version refused to start unless the app was open at a loopback
+name. The user wanted OAuth to work from other machines too, so the
+"Loopback only" decision below is replaced by three modes, chosen from the
+request's `Host`:
+
+| Mode | When | Redirect URI | Finishes |
+|---|---|---|---|
+| `loopback` | `127.0.0.1`, `localhost`, `[::1]` | `http://<host>:<port>/api/mcp/oauth/callback` | on its own |
+| `origin` | `Host` matches a `--oauth-origin` (https origin; `DNT_HARNESS_OAUTH_ORIGINS` for pm2) | `<origin>/api/mcp/oauth/callback` | on its own |
+| `paste` | any other name | `http://127.0.0.1:<bound port>/api/mcp/oauth/callback` | the person pastes the final address into the panel |
+
+Consequences: `loopback_required` is gone; `begin` also returns
+`redirectMode`; `complete` accepts `{ callbackUrl }` as an alternative to
+`{ state }`. `ManagedOAuth.acceptCallbackUrl` reads `state` and `code` from the
+pasted address and deposits them, and only for the pending sign-in of the same
+person, workspace, and server, at its exact redirect address. The redirect is
+built from the declared origin or the bound port, never from the text of the
+`Host` header. An origin that is not an https origin with no path fails the
+host's start. The sections below still describe the loopback mode; read
+"Loopback only" as "loopback needs no declaration".
 
 ## Goal
 

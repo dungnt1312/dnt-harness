@@ -471,10 +471,23 @@ Servers from a workspace's `mcp.json` register dynamically as
   Providers without registration (GitHub, Slack) or with confidential-only
   registration (GitLab) need an OAuth app the user creates: `clientId`, a
   `clientSecret` `${SECRET}` reference, and `tokenEndpointAuth`
-  (`client_secret_post` or `client_secret_basic`). The redirect URI is
-  `http://<loopback host>:<port>/api/mcp/oauth/callback`, built by the host;
-  Connect is refused (`loopback_required`) unless the app is open at
-  `127.0.0.1`, `localhost`, or `[::1]`. Request bodies never supply
+  (`client_secret_post` or `client_secret_basic`). The redirect URI is built
+  by the host, never taken from a request body, and depends on how the app is
+  opened. At `127.0.0.1`, `localhost`, or `[::1]` it is
+  `http://<that host>:<port>/api/mcp/oauth/callback` and sign-in finishes on
+  its own. At a name declared with `--oauth-origin https://host[,…]` (or
+  `DNT_HARNESS_OAUTH_ORIGINS` for pm2) it is
+  `https://host/api/mcp/oauth/callback`, again finishing on its own; the
+  origin is stated because a proxied request does not show its scheme, and
+  MCP requires a redirect to be localhost or HTTPS. At any other name (a
+  tailnet IP, a LAN name, an HTTP proxy) it falls back to the host's own
+  loopback address, which the person's browser cannot reach: it ends on a
+  connection error, and the person pastes that address into the field the
+  panel shows. The host reads only `state` and `code` from it, accepts it
+  only for that person's own pending sign-in and its exact redirect address,
+  uses it once, and never logs or echoes it. Providers that register clients
+  see a different redirect per mode, so the first connect after a change
+  registers a new client. Request bodies never supply
   endpoints, client ids, or redirect URIs. Discovery records, registrations,
   and tokens are encrypted under `oauth/`; a grant is only used for the URL
   it was obtained for, and deleting the server revokes and forgets it. A

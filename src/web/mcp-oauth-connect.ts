@@ -1,8 +1,9 @@
 /**
- * Host-side OAuth Connect for one MCP server: loopback-only redirect URI,
- * discovery, client resolution, the per-server record, the row state, and
- * the HTML callback page. Endpoints, client ids, and redirect URIs never
- * come from a request body; they come from discovery or `mcp.json`.
+ * Host-side OAuth Connect for one MCP server: the redirect URI, discovery,
+ * client resolution, the per-server record, the row state, and the HTML
+ * callback page. Endpoints, client ids, and redirect URIs never come from a
+ * request body; they come from discovery, `mcp.json`, or the host's own
+ * configuration (`--oauth-origin`).
  */
 import { randomBytes } from 'node:crypto'
 import type { McpServerConfig } from '../harness/mcp/config.ts'
@@ -23,24 +24,63 @@ export function managedAuthOf(server: McpServerConfig | undefined): ManagedAuth 
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1'])
 
 /**
- * The redirect URI for a connect started by this request. The request's own
- * `Host` keeps the callback page same-origin with the app tab, so the
- * BroadcastChannel reaches it. Anything but loopback is refused.
+ * Validate the origins `--oauth-origin` declares. Each must be an https
+ * origin (scheme, host, optional port): MCP requires an OAuth redirect to be
+ * localhost or HTTPS, and loopback needs no declaration. The host cannot see
+ * a proxy's scheme, so the operator states the whole origin.
  */
-export function loopbackRedirectUri(hostHeader: string | undefined): string {
+export function parseOAuthOrigins(values: readonly string[]): string[] {
+  const out: string[] = []
+  for (const raw of values) {
+    const text = raw.trim()
+    if (text === '') continue
+    let url: URL
+    try { url = new URL(text) } catch { throw new Error(`oauth origin '${text}' is not a URL; use https://host[:port]`) }
+    if (url.protocol !== 'https:') throw new Error(`oauth origin '${text}' must use https (loopback needs no declaration)`)
+    if (url.username !== '' || url.password !== '') throw new Error(`oauth origin '${text}' must not carry credentials (userinfo)`)
+    if ((url.pathname !== '/' && url.pathname !== '') || url.search !== '' || url.hash !== '') throw new Error(`oauth origin '${text}' must be an origin only, with no path, query, or fragment`)
+    if (!out.includes(url.origin)) out.push(url.origin)
+  }
+  return out
+}
+
+/**
+ * How a sign-in started by this request returns:
+ * - `loopback`: the app is open at a loopback name; the callback page is
+ *   same-origin with the app tab and completes on its own.
+ * - `origin`: the app is open at a declared https origin; same, over HTTPS.
+ * - `paste`: any other name. The redirect is the host's own loopback port,
+ *   the provider's final redirect lands on the person's machine (usually an
+ *   error page), and they paste that address back into the app.
+ * The redirect is built from the declared origin or the bound port, never
+ * from the `Host` header's text.
+ */
+export type RedirectMode = 'loopback' | 'origin' | 'paste'
+
+export function resolveRedirect(hostHeader: string | undefined, boundPort: number, origins: readonly string[]): { readonly mode: RedirectMode; readonly redirectUri: string } {
   const raw = (hostHeader ?? '').trim().toLowerCase()
   let parsed: URL | undefined
-  try { parsed = raw === '' ? undefined : new URL(`http://${raw}`) } catch { parsed = undefined }
+  try { parsed = raw === '' || /[\s/\\@?#]/.test(raw) ? undefined : new URL(`http://${raw}`) } catch { parsed = undefined }
   const hostname = parsed?.hostname.replace(/^\[|\]$/g, '')
-  if (parsed === undefined || hostname === undefined || !LOOPBACK.has(hostname)) {
-    throw new OAuthConnectError('loopback_required', 'OAuth sign-in works only when dnt-harness is opened at http://127.0.0.1 or http://localhost on this machine. Open it there and connect again.')
+  if (parsed !== undefined && hostname !== undefined && LOOPBACK.has(hostname)) {
+    return { mode: 'loopback', redirectUri: `http://${parsed.host}${OAUTH_CALLBACK_PATH}` }
   }
-  return `http://${parsed.host}${OAUTH_CALLBACK_PATH}`
+  if (parsed !== undefined) {
+    // `Host` has no scheme; a declared origin matches by host and port, with 443 implied.
+    const match = origins.find((origin) => {
+      const declared = new URL(origin)
+      return declared.hostname === parsed.hostname && (declared.port === '' ? '443' : declared.port) === (parsed.port === '' ? '443' : parsed.port)
+    })
+    if (match !== undefined) return { mode: 'origin', redirectUri: `${match}${OAUTH_CALLBACK_PATH}` }
+  }
+  return { mode: 'paste', redirectUri: `http://127.0.0.1:${boundPort}${OAUTH_CALLBACK_PATH}` }
 }
 
 export interface BeginConnectResult {
   readonly authorizationUrl: string
   readonly state: string
+  /** `paste`: the person must paste the final address back; see {@link RedirectMode}. */
+  readonly redirectMode: RedirectMode
 }
 
 /**
@@ -56,6 +96,10 @@ export async function beginConnect(input: {
   readonly config: McpServerConfig
   readonly principalId: string
   readonly hostHeader: string | undefined
+  /** The port this host is bound to, for the paste-back redirect. */
+  readonly boundPort: number
+  /** Validated `--oauth-origin` values. */
+  readonly oauthOrigins: readonly string[]
   readonly extraScopes: readonly string[]
   readonly fetchImpl?: typeof fetch
 }): Promise<BeginConnectResult> {
@@ -64,7 +108,7 @@ export async function beginConnect(input: {
   if (auth === undefined || url === undefined) {
     throw new OAuthConnectError('discovery_failed', `server '${input.server}' is not an HTTP server set to OAuth`)
   }
-  const redirectUri = loopbackRedirectUri(input.hostHeader)
+  const { mode: redirectMode, redirectUri } = resolveRedirect(input.hostHeader, input.boundPort, input.oauthOrigins)
   const discovered = await discoverOAuth(url, {
     ...(input.fetchImpl !== undefined ? { fetchImpl: input.fetchImpl } : {}),
     ...(auth.scopes !== undefined && auth.scopes.length > 0 ? { scopes: auth.scopes } : {}),
@@ -98,7 +142,7 @@ export async function beginConnect(input: {
     discoveredAt: Date.now(),
   }
   await input.store.saveServerRecord(input.workspaceId, input.server, record)
-  return input.oauth.begin({
+  const started = await input.oauth.begin({
     workspaceId: input.workspaceId,
     server: input.server,
     principalId: input.principalId,
@@ -110,6 +154,7 @@ export async function beginConnect(input: {
     scopes,
     tokenEndpointAuth: client.tokenEndpointAuth,
   })
+  return { ...started, redirectMode }
 }
 
 function splitScopes(value: string | undefined): string[] {

@@ -1334,7 +1334,7 @@ export function setMcpServerAction(workspaceId: string, name: string, action: 'e
 }
 
 /** Why Connect could not start; `client_required` means the user must enter an OAuth app. */
-export type McpOAuthErrorCode = 'loopback_required' | 'discovery_failed' | 'client_required' | 'registration_failed'
+export type McpOAuthErrorCode = 'discovery_failed' | 'client_required' | 'registration_failed'
 
 export class McpOAuthError extends Error {
   constructor(readonly code: McpOAuthErrorCode | undefined, message: string) {
@@ -1359,12 +1359,21 @@ async function oauthCall<T>(workspaceId: string, name: string, action: 'begin' |
 }
 
 /** Discover, register if needed, and get the provider's sign-in URL. `scopes` adds scopes on Reconnect. */
-export function beginMcpOAuth(workspaceId: string, name: string, scopes: readonly string[] = []): Promise<{ readonly authorizationUrl: string; readonly state: string }> {
+export function beginMcpOAuth(workspaceId: string, name: string, scopes: readonly string[] = []): Promise<{ readonly authorizationUrl: string; readonly state: string; readonly redirectMode: McpOAuthRedirectMode }> {
   return oauthCall(workspaceId, name, 'begin', scopes.length > 0 ? { scopes } : {})
 }
 
-export function completeMcpOAuth(workspaceId: string, name: string, state: string): Promise<{ readonly connected: true; readonly status?: string }> {
-  return oauthCall(workspaceId, name, 'complete', { state })
+/**
+ * How the provider returns the browser:
+ * `loopback` / `origin`: to this app, and the sign-in finishes on its own;
+ * `paste`: to an address on the person's machine that this tab cannot reach,
+ * so they paste that address back.
+ */
+export type McpOAuthRedirectMode = 'loopback' | 'origin' | 'paste'
+
+/** Finish with the pending `state`, or with the address the browser ended on after sign-in. */
+export function completeMcpOAuth(workspaceId: string, name: string, proof: string | { readonly callbackUrl: string }): Promise<{ readonly connected: true; readonly status?: string }> {
+  return oauthCall(workspaceId, name, 'complete', typeof proof === 'string' ? { state: proof } : { callbackUrl: proof.callbackUrl })
 }
 
 export function revokeMcpOAuth(workspaceId: string, name: string): Promise<{ readonly local: 'revoked'; readonly remote: 'succeeded' | 'failed' | 'unavailable' }> {

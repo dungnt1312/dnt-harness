@@ -12,6 +12,12 @@
  *                              should answer to, e.g. a LAN IP or reverse-proxy
  *                              hostname. Loopback and the bind host are always
  *                              allowed.
+ *   DNT_HARNESS_OAUTH_ORIGINS  comma-separated https origins the app is reached
+ *                              at, e.g. https://harness.example.com. MCP OAuth
+ *                              sign-in from another machine then redirects back
+ *                              to it and finishes on its own; without it, the
+ *                              person pastes back the address the browser ended
+ *                              on. Loopback needs no entry.
  *
  * These may also live in a `.env` file next to this config (gitignored); real
  * environment variables win over values from the file.
@@ -21,6 +27,7 @@ if (require('node:fs').existsSync(envFile)) process.loadEnvFile(envFile)
 
 const port = process.env.PORT || '3082'
 const allowedHosts = (process.env.DNT_HARNESS_ALLOWED_HOSTS || '').trim()
+const oauthOrigins = (process.env.DNT_HARNESS_OAUTH_ORIGINS || '').trim()
 
 module.exports = {
   apps: [
@@ -28,7 +35,7 @@ module.exports = {
       name: 'dnt-harness',
       cwd: __dirname,
       script: 'node_modules/tsx/dist/cli.mjs',
-      args: `src/bins/web.ts --port ${port} --root .${allowedHosts ? ` --allowed-host ${allowedHosts}` : ''}`,
+      args: `src/bins/web.ts --port ${port} --root .${allowedHosts ? ` --allowed-host ${allowedHosts}` : ''}${oauthOrigins ? ` --oauth-origin ${oauthOrigins}` : ''}`,
       interpreter: 'node',
       exec_mode: 'fork',
       instances: 1,
