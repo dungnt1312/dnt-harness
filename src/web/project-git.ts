@@ -324,7 +324,15 @@ export interface GitResult {
  * differ, `status` exits 128 outside a work tree).
  */
 export async function runGitQuery(root: string, args: readonly string[], trusted: boolean): Promise<GitResult> {
-  const child = await buildGitCommand(root, args, { trusted, stdin: 'ignore' })
+  return runGitCommand(root, args, { trusted, stdin: 'ignore' })
+}
+
+/** Runs one git command to completion; the seam operations inject a runner through. */
+export type GitRunner = (root: string, args: readonly string[], options: GitCommandOptions) => Promise<GitResult>
+
+/** {@link runGitQuery} with the full command options (environment, stdin). */
+export const runGitCommand: GitRunner = async (root, args, options) => {
+  const child = await buildGitCommand(root, args, options)
   return new Promise((resolve, reject) => {
     const out: Buffer[] = []
     const err: Buffer[] = []
