@@ -2,6 +2,15 @@
 
 Status: design approved in brainstorming 2026-10-12, awaiting written-spec review.
 
+## Revision 2026-10-12 (user: "git tool nên làm theo hướng run command")
+
+Write actions run git **as a command, the way the user would type it in a
+terminal**. The user's and the repository's git config, hooks (pre-commit,
+commit-msg, pre-push), commit signing, credential helpers and `core.sshCommand`
+all work normally. The harness only builds the command, runs it, parses the
+result and shows it. The first draft disabled hooks and overrode config for
+write calls; that is dropped. Auth stays as it is for every other route.
+
 ## Goal
 
 The workbench Git panel (`web/components/workbench/GitPanel.tsx`) today only
@@ -21,9 +30,10 @@ asks first.
 | Scope | Stage/Unstage with grouped list, Commit, Push/Pull/Fetch, Discard/Restore |
 | Out of scope | History tab, branch switcher, project-wide "View Diff" multibuffer |
 | Permissions | Panel actions are the user's own clicks, so they run immediately in every session mode. Discard, Trash untracked, Push, Force push and Amend of a pushed commit ask for confirmation |
-| Architecture | Extend the server's git module with write operations behind POST routes; the UI never shells out |
-| Authentication | No credential prompt in the browser. Git runs with `GIT_TERMINAL_PROMPT=0`; an SSH key, agent or credential helper already configured on the host works, anything else fails with git's message |
-| Hooks | Stay disabled (`core.hooksPath=/dev/null`), as for the read-only queries. The commit box says so |
+| Architecture | A thin command runner: each POST action maps to one plain `git` command line run in the project root. The harness parses and displays; git does the work |
+| Git config and hooks | Untouched for write actions: no `-c` overrides, hooks run, signing and helpers apply. Hook output is shown in the panel |
+| Credentials | Whatever the host already has (SSH agent/key, credential helper, keychain). There is no terminal to type into, so `GIT_TERMINAL_PROMPT=0` makes a missing credential fail fast with git's message instead of hanging |
+| Route auth | Same as every other API route (session cookie + CSRF/origin); no extra gate |
 
 ## Layout
 
@@ -53,8 +63,8 @@ Top to bottom, matching the Zed screenshot the user supplied:
    "Commit Tracked" when nothing is (this stages every tracked change, like
    `git commit -a`). The button is disabled when the message is empty, or when
    nothing is staged and there are no tracked changes. The menu holds **Amend**: it fills the field with HEAD's
-   message and the button becomes "Amend". A one-line note under the field
-   reads "Git hooks are not run from this panel."
+   message and the button becomes "Amend". While a commit runs (hooks may take
+   a while) the button shows "Committing…".
 5. **Footer**: branch icon and name on the left. On the right is a split remote
    button whose main action follows Zed:
    - no remote: no button;
@@ -92,14 +102,21 @@ Y is blank gives staged; both set gives partial. Conflicts are unstaged.
   commit. `pushed` is true when an upstream exists and ahead is 0. Amend uses
   it to prefill the message and to decide whether to warn.
 
-The existing read path keeps its hardening unchanged.
+The read path (`git status`, `git diff` when the panel opens or refreshes) keeps
+its current hardening. Those queries run automatically, without a click, so
+opening the panel on a freshly cloned repository still cannot execute the
+repository's code. Only the explicit write actions below run git unmodified.
 
 ### Write operations (`src/web/project-git-write.ts`, new)
 
-One exported function per action. All run through the module's `git()` runner,
-which gains an options argument for a timeout, extra environment and a
-`network` flag. Every path from the client passes through `contain()`, so a
-path outside the project is refused before git sees it.
+One exported function per action. They share a small runner,
+`runGitCommand(root, args, { timeoutMs })`, separate from the hardened read
+runner. It spawns `git <args>` with `cwd` = project root, the host process
+environment plus `GIT_TERMINAL_PROMPT=0`, stdin closed, and **no** `-c`
+overrides or extra flags. It captures stdout and stderr together (in order)
+and the exit code. Every path from the client passes through `contain()` and
+is placed after `--`, so a path outside the project is refused before git runs
+and a path can never be read as an option.
 
 | Action | Body | Git |
 |---|---|---|
@@ -112,32 +129,37 @@ path outside the project is refused before git sees it.
 | `pull` | none | `pull --ff-only`. A diverged branch fails with "Branches have diverged; merge or rebase from the Terminal." |
 | `push` | `{ force?: 'with-lease' }` | `push`; `push -u <remote> <branch>` when there is no upstream; `--force-with-lease` when asked |
 
-Every successful action answers with a fresh `GitStatusReport`, so the panel
-updates without a second request.
+Every action answers `{ status: GitStatusReport, run: GitRun }`, where
+`GitRun = { command: string; output: string; exitCode: number }`. `command` is
+the display form (`git commit -m "…"`, message shortened), `output` is the
+combined stdout/stderr capped to its last 64 KB. The panel updates from
+`status` without a second request and shows `run` as described under Web
+client. A non-zero exit is still a 200-family answer carrying the run, except
+for the mapped cases in Errors below; the status is re-read either way, since
+a failed hook or a rejected push can leave the tree changed.
 
-**Safety configuration for write calls.** They keep `core.hooksPath=/dev/null`,
-`core.fsmonitor=false`, `core.pager=cat`, `diff.external=` and
-`core.quotepath=false`. Network calls (`fetch`, `pull`, `push`) replace
-`protocol.allow=never` with `protocol.ext.allow=never`, so https, ssh, git and
-file remotes work and `ext::` command remotes never do. The environment adds
-`GIT_TERMINAL_PROMPT=0` and `SSH_ASKPASS_REQUIRE=never`, and stdin is closed.
-Repository settings that run programs on the user's behalf (credential helper,
-commit signing, `core.sshCommand`) are honored, as they would be in the
-Terminal tab: these actions are the user's own clicks on their own checkout.
+**Environment.** The server process's environment is used as is. A hook that
+needs tools found only on the login shell's `PATH` (for example `pnpm` from a
+version manager) fails if the harness was started without that `PATH`; the
+hook's own output says so in the panel. The Terminal tab is the fallback.
 
-**Timeouts.** Local operations use the existing 20 s. Network operations use
-120 s, and a timeout reports "git did not finish in 120 s (is it waiting for a
-password?)".
+**Timeouts.** `stage`, `unstage`, `discard`, `trash`: 30 s. `commit`, `fetch`,
+`pull`, `push`: 10 min, because hooks may run tests or linters. A timeout kills
+the process and reports "git did not finish in N (a hook still running, or
+waiting for a password?)".
 
-**Serialization.** A per-project-root promise queue runs one write at a time.
-When the agent or a terminal holds `index.lock`, git's failure is mapped to 409
-"Another git process is using this repository; try again."
+**Serialization.** A per-project-root promise queue runs one panel action at a
+time. Git's own `index.lock` still guards against the agent or a terminal
+running git at the same moment (see Errors).
 
-**Errors.** A failed action raises `ProjectGitError` with git's stderr, trimmed
-to its last 2 KB. The route answers 400 for bad input, 409 for lock and
-diverged-branch conflicts, and 502 for remote failures (auth, network,
-rejected push). The panel shows the message in an `ErrorNotice` above the
-footer until the next action or a dismiss.
+**Errors.** Invalid input (bad body, path outside the project, empty message)
+answers 400 before git runs. When git runs and exits non-zero, the route answers
+200 with `run.exitCode ≠ 0` and the fresh status, so the UI always gets git's
+real output, hook output included. Two failures are recognised from git's text
+only to add a hint: `index.lock` ("another git process is using this
+repository; try again") and a non-fast-forward pull ("branches have diverged;
+merge or rebase from the Terminal"). Launch failures (git missing, timeout)
+answer 502.
 
 ### Route (`src/web/server.ts`)
 
@@ -150,8 +172,15 @@ other POST. Other methods answer 405 and an unknown action answers 404. The
 
 ## Web client
 
-- `web/lib/api.ts`: the new fields on `GitChange` and `GitStatusReport`, plus
-  `gitAction(workspaceId, projectId, action, body?) → Promise<GitStatusReport>`.
+- `web/lib/api.ts`: the new fields on `GitChange` and `GitStatusReport`, the
+  `GitRun` type, plus
+  `gitAction(workspaceId, projectId, action, body?) → Promise<{ status; run }>`.
+- **Command output.** After an action the footer shows a one-line result:
+  the command and a check or cross. A failed run (`exitCode ≠ 0`) expands
+  automatically into an output box above the footer with the full text (hook
+  messages, push rejection, author identity hints), monospace and scrollable,
+  with a dismiss button. A successful run with output (pre-commit summary, push
+  URL) can be expanded from the footer line. Only the last run is kept.
 - `GitPanel.tsx` stays the container (loading, focus, filter, report state) and
   is split so no file carries everything:
   - `GitChangeList.tsx`: groups, rows, checkboxes, row menu, inline diff;
@@ -181,12 +210,12 @@ other POST. Other methods answer 405 and an unknown action answers 404. The
 |---|---|
 | Path outside the project or denied | 400, nothing runs |
 | Empty commit message | 400; the button is also disabled client-side |
-| Nothing to commit | git's message, 400 |
-| Missing author identity | git's message, telling the user to set `user.name`/`user.email` |
-| `index.lock` held | 409, retry |
-| Diverged on pull | 409 with the Terminal hint |
-| Auth or network failure, rejected push | 502 with git's stderr |
-| Timeout | 502 with the password hint |
+| Pre-commit / commit-msg / pre-push hook fails | run with exit ≠ 0, hook output shown, message kept in the box |
+| Nothing to commit, missing author identity | run with git's own message |
+| `index.lock` held | run with git's message plus the retry hint |
+| Diverged on pull | run with git's message plus the Terminal hint |
+| Auth or network failure, rejected push | run with git's message |
+| git missing, timeout | 502 with the hint |
 
 ## Testing
 
@@ -194,12 +223,16 @@ other POST. Other methods answer 405 and an unknown action answers 404. The
   bare remote. It covers stage/unstage (paths and all, and a repository with
   no commit), partial staging in status, commit, Commit Tracked, amend,
   discard (modified, staged-new, renamed, all tracked), trash, path escape
-  refusal, the `index.lock` mapping to 409, fetch/pull/push/publish, pull
-  `--ff-only` divergence, and force-with-lease.
-- `tests/web/project-git-hardening.spec.ts` gains checks that write calls still
-  run no hooks and that network calls refuse an `ext::` remote.
+  refusal, a path that looks like an option (`-rf`) staying a path,
+  fetch/pull/push/publish, pull `--ff-only` divergence, and force-with-lease.
+- Hooks run: a failing `pre-commit` hook blocks the commit and its output
+  reaches `run.output`; a passing one lets it through; a `commit-msg` hook can
+  rewrite the message. Repository config applies (for example `user.name` from
+  the repo config appears on the commit).
+- `tests/web/project-git-hardening.spec.ts` keeps proving that the automatic
+  read path (status, diff) still runs no hooks, fsmonitor or textconv.
 - A server route test covers 405, 404 for an unknown action, 400 for a bad
-  body, and a successful POST returning a status report.
+  body, and a POST returning `{ status, run }` both for exit 0 and exit ≠ 0.
 - Web: `git-panel-model.spec.ts` for the pure helpers. The existing
   `git-panel-filter.spec.tsx` is extended for grouping, checkbox states,
   filtered-mode hiding of the commit box and footer, and confirmations.
@@ -210,7 +243,8 @@ other POST. Other methods answer 405 and an unknown action answers 404. The
 
 - `docs/web.md`: the route table row for git (line 187), the workbench
   component row (line 867), and the Git paragraph (line 931) no longer say
-  "read-only / never stages, commits, or discards".
+  "read-only / never stages, commits, or discards". The text explains the split:
+  automatic reads are hardened, explicit actions run git as typed, with hooks.
 - The header comment of `src/web/project-git.ts` points to the write module.
 
 ## Non-goals
@@ -218,6 +252,6 @@ other POST. Other methods answer 405 and an unknown action answers 404. The
 - History tab, commit details, branch switching or creation, stash.
 - Hunk- or line-level staging.
 - A project-wide combined diff view ("View Diff").
-- Interactive credential prompts, merge or rebase on pull, conflict resolution
-  editor.
+- Interactive credential or passphrase prompts in the browser, merge or rebase
+  on pull, conflict resolution editor.
 - Live file-watch refresh (refresh is on action, button and window focus).
