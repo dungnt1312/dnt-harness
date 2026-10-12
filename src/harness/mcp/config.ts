@@ -13,6 +13,10 @@ import { replaceFileAtomic } from '../storage/events-jsonl.ts'
 
 export type McpTransport = 'stdio' | 'http'
 
+/** How the client authenticates at the token endpoint. Registered clients are always `none`. */
+export type TokenEndpointAuth = 'none' | 'client_secret_post' | 'client_secret_basic'
+export const TOKEN_ENDPOINT_AUTH_METHODS: readonly TokenEndpointAuth[] = ['none', 'client_secret_post', 'client_secret_basic']
+
 export interface McpServerConfig {
   readonly name: string
   readonly transport: McpTransport
@@ -30,7 +34,18 @@ export interface McpServerConfig {
     | { readonly type: 'bearer'; readonly token: string }
     | { readonly type: 'oauth'; readonly provider: string; readonly accessToken: string }
     | { readonly type: 'external_token'; readonly provider: string; readonly accessToken: string }
-    | { readonly type: 'managed_oauth'; readonly provider: string; readonly resource: string; readonly clientId: string; readonly scopes?: readonly string[] }
+    | {
+        readonly type: 'managed_oauth'
+        readonly provider: string
+        readonly resource: string
+        /** Absent: the host registers a public client with the authorization server. */
+        readonly clientId?: string
+        /** `${SECRET}` reference, for a confidential client the user created. */
+        readonly clientSecret?: string
+        readonly tokenEndpointAuth?: TokenEndpointAuth
+        /** Overrides the discovered scopes. */
+        readonly scopes?: readonly string[]
+      }
   readonly enabled: boolean
   readonly timeoutMs?: number
   /** Subprocess resource watchdogs (stdio): hard kill on breach. */
@@ -256,13 +271,25 @@ function parseAuth(serverName: string, value: unknown): NonNullable<McpServerCon
   }
   if (auth['type'] === 'managed_oauth') {
     for (const key of Object.keys(auth)) {
-      if (!['type', 'provider', 'resource', 'clientId', 'scopes'].includes(key)) {
+      if (!['type', 'provider', 'resource', 'clientId', 'clientSecret', 'tokenEndpointAuth', 'scopes'].includes(key)) {
         throw new McpConfigError('invalid', `server '${serverName}': unknown managed_oauth auth key '${key}'`)
       }
     }
     if (typeof auth['provider'] !== 'string' || auth['provider'] === '') throw new McpConfigError('invalid', `server '${serverName}': managed_oauth.provider is required`)
     if (typeof auth['resource'] !== 'string' || !/^https?:\/\//.test(auth['resource'])) throw new McpConfigError('invalid', `server '${serverName}': managed_oauth.resource must be an absolute URL`)
-    if (typeof auth['clientId'] !== 'string' || auth['clientId'] === '') throw new McpConfigError('invalid', `server '${serverName}': managed_oauth.clientId is required`)
+    if (auth['clientId'] !== undefined && (typeof auth['clientId'] !== 'string' || auth['clientId'] === '')) {
+      throw new McpConfigError('invalid', `server '${serverName}': managed_oauth.clientId must be a non-empty string when set`)
+    }
+    if (auth['clientSecret'] !== undefined && (typeof auth['clientSecret'] !== 'string' || !/^\$\{[A-Za-z0-9_]+\}$/.test(auth['clientSecret']))) {
+      throw new McpConfigError('invalid', `server '${serverName}': managed_oauth.clientSecret must reference an encrypted secret as ${'${'}NAME}`)
+    }
+    const method = auth['tokenEndpointAuth']
+    if (method !== undefined && !TOKEN_ENDPOINT_AUTH_METHODS.includes(method as TokenEndpointAuth)) {
+      throw new McpConfigError('invalid', `server '${serverName}': managed_oauth.tokenEndpointAuth must be ${TOKEN_ENDPOINT_AUTH_METHODS.join('|')}`)
+    }
+    if (method !== undefined && method !== 'none' && (auth['clientId'] === undefined || auth['clientSecret'] === undefined)) {
+      throw new McpConfigError('invalid', `server '${serverName}': managed_oauth.tokenEndpointAuth '${String(method)}' needs clientId and clientSecret`)
+    }
     if (auth['scopes'] !== undefined && (!Array.isArray(auth['scopes']) || !(auth['scopes'] as unknown[]).every((item) => typeof item === 'string'))) {
       throw new McpConfigError('invalid', `server '${serverName}': managed_oauth.scopes must be an array of strings`)
     }
@@ -270,7 +297,9 @@ function parseAuth(serverName: string, value: unknown): NonNullable<McpServerCon
       type: 'managed_oauth',
       provider: auth['provider'],
       resource: auth['resource'],
-      clientId: auth['clientId'],
+      ...(typeof auth['clientId'] === 'string' ? { clientId: auth['clientId'] } : {}),
+      ...(typeof auth['clientSecret'] === 'string' ? { clientSecret: auth['clientSecret'] } : {}),
+      ...(method !== undefined ? { tokenEndpointAuth: method as TokenEndpointAuth } : {}),
       ...(Array.isArray(auth['scopes']) ? { scopes: auth['scopes'] as string[] } : {}),
     }
   }
