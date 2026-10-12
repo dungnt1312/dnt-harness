@@ -27,7 +27,7 @@ Tool names, descriptions, schemas, and annotations from a server are untrusted m
 
 ## What this milestone replaces
 
-Earlier MCP behavior that retried `tools/call` three times is withdrawn. A lost response stays `indeterminate`. Saving a server no longer means it is running. A legacy `oauth` block is an external token until a managed authorization-code session exists. Hard resource numbers are refused unless a tested Job Object or cgroup is actually applied; this build applies neither. A 24-hour canary and a named release signature are still required before a production claim.
+Earlier MCP behavior that retried `tools/call` three times is withdrawn. A lost response stays `indeterminate`. Saving a server no longer means it is running. A legacy `oauth` block is an external token; managed OAuth (`managed_oauth`) is the authorization-code + PKCE flow started by Connect, with endpoints from discovery and the redirect URI built by the host on loopback only (`docs/capabilities.md`, OAuth Connect). Hard resource numbers are refused unless a tested Job Object or cgroup is actually applied; this build applies neither. A 24-hour canary and a named release signature are still required before a production claim.
 
 ## Deployment
 

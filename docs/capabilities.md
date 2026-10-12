@@ -461,6 +461,26 @@ Servers from a workspace's `mcp.json` register dynamically as
   `docs/decisions/mcp-production-boundaries.md`. Filesystem encryption and
   local authentication do not protect against same-user malware or
   same-origin XSS.
+- **OAuth Connect**: an HTTP server whose authentication is **OAuth**
+  (`auth.type: managed_oauth`) is signed into from Settings → MCP with
+  **Connect**. The host discovers the authorization server from the server's
+  401 challenge (RFC 9728 protected-resource metadata, then RFC 8414 / OpenID
+  metadata, `issuer` checked, PKCE S256 required). It then uses, in order, the
+  client in `mcp.json`, a client it registered before for the same issuer and
+  redirect URI, or a new public client from dynamic registration (RFC 7591).
+  Providers without registration (GitHub, Slack) or with confidential-only
+  registration (GitLab) need an OAuth app the user creates: `clientId`, a
+  `clientSecret` `${SECRET}` reference, and `tokenEndpointAuth`
+  (`client_secret_post` or `client_secret_basic`). The redirect URI is
+  `http://<loopback host>:<port>/api/mcp/oauth/callback`, built by the host;
+  Connect is refused (`loopback_required`) unless the app is open at
+  `127.0.0.1`, `localhost`, or `[::1]`. Request bodies never supply
+  endpoints, client ids, or redirect URIs. Discovery records, registrations,
+  and tokens are encrypted under `oauth/`; a grant is only used for the URL
+  it was obtained for, and deleting the server revokes and forgets it. A
+  `403 insufficient_scope` does not refresh: the row shows **Needs sign-in**
+  with the scope, and **Reconnect** asks for it. Client ID Metadata
+  Documents and automatic step-up are not implemented.
 
 ## Mode permission defaults
 
