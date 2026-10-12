@@ -481,6 +481,20 @@ Servers from a workspace's `mcp.json` register dynamically as
   `403 insufficient_scope` does not refresh: the row shows **Needs sign-in**
   with the scope, and **Reconnect** asks for it. Client ID Metadata
   Documents and automatic step-up are not implemented.
+- **Catalog**: Settings → MCP → **Browse catalog** lists curated servers
+  (`MCP_CATALOG` in `src/harness/mcp/catalog.ts`), grouped by category, with a
+  search box. **Install** saves the entry as a disabled server under a free
+  name (`id`, then `id-2`, …). An entry that needs a key asks for it in the
+  same row and stores it in the workspace Secrets (encrypted, never echoed);
+  leaving it blank installs anyway and the notice names the missing secret.
+  An entry with a placeholder (`<DB_PATH>`, `<PROJECT_REF>`) will not install
+  until it is filled. OAuth entries (Notion, Linear, Atlassian, Sentry) are
+  saved as `managed_oauth`; the notice points to **Connect**. Installing never
+  starts a server; **Enable** does. "Official" and "Community" say who
+  maintains a server, not that it was reviewed. To add an entry, edit
+  `catalog.ts`; `tests/harness/mcp-catalog.spec.ts` checks that it parses,
+  keeps credentials as `${NAME}` references, and declares every secret and
+  placeholder it uses.
 
 ## Mode permission defaults
 

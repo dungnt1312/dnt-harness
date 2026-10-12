@@ -1,8 +1,30 @@
 # MCP catalog in Settings → MCP
 
-Status: draft for review, 2026-10-12. The decisions in the table below were
-chosen by the user during brainstorming. The review findings section records
-what changed after checking the design against the code and the live servers.
+Status: implemented 2026-10-12, with two changes made at the user's request
+after the first draft (see "Revision 2026-10-12"). The decisions in the table
+below were chosen by the user during brainstorming. The review findings
+section records what changed after checking the design against the code and
+the live servers.
+
+## Revision 2026-10-12 (user request: "phải có UI cho user install nhanh")
+
+1. **Install, not prefill.** The first draft opened the full server form
+   prefilled for review. The user wants quick installs, so each catalog row has
+   an **Install** button that saves the server (disabled) in one click. An entry
+   that needs a key or a value asks for just that, inline in its row, and
+   stores the key in the workspace Secrets before saving the server. The form
+   is still where a server is edited afterwards. Nothing is started by install:
+   **Enable** stays a separate, explicit action, which keeps the "Save must not
+   activate" contract.
+2. **OAuth entries are in.** OAuth Connect shipped first
+   (`2026-10-12-mcp-oauth-discovery-registration-design.md`), so Notion, Linear,
+   Atlassian, and Sentry are saved as `managed_oauth` and signed into with
+   **Connect**. GitHub stays a bearer-token entry because GitHub offers no
+   client registration. Linear and Notion use OAuth instead of API keys, and
+   Notion uses the hosted server instead of the stdio one.
+
+The sections below describe the design as built; where the first draft said
+"prefill the form", read "install in place".
 
 ## Goal
 

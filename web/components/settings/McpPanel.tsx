@@ -8,8 +8,10 @@ import { IconButton } from '../ui/IconButton.tsx'
 import { Segmented } from '../ui/Segmented.tsx'
 
 import { TextInput } from '../ui/TextInput.tsx'
-import { beginMcpOAuth, completeMcpOAuth, deleteMcpServer, getMcpServer, importMcpServers, listMcpServers, McpOAuthError, revokeMcpOAuth, setMcpServerAction, upsertMcpServer } from '../../lib/api.ts'
+import { beginMcpOAuth, completeMcpOAuth, deleteMcpServer, getMcpServer, importMcpServers, listMcpServers, listSecrets, McpOAuthError, revokeMcpOAuth, setMcpServerAction, setSecret, upsertMcpServer } from '../../lib/api.ts'
 import type { McpOAuthState, McpServerRow } from '../../lib/types.ts'
+import { catalogServerName, type CatalogEntry } from '../../../src/harness/mcp/catalog.ts'
+import { McpCatalogView } from './McpCatalogView.tsx'
 import {
   CodeArea,
   Disclosure,
@@ -283,6 +285,10 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
   const [editorOpen, setEditorOpen] = useScopedState(false)
   /** Import is its own view too, so the list is never buried under two forms. */
   const [importing, setImporting] = useScopedState(false)
+  /** The catalog is a third view; the list stays the tab's home. */
+  const [browsing, setBrowsing] = useScopedState(false)
+  /** Names of the workspace's secrets (never values), to skip asking for a key it already has. */
+  const [secretNames, setSecretNames] = useScopedState<ReadonlySet<string>>(new Set())
   const [confirmDelete, setConfirmDelete] = useScopedState<string | null>(null)
   const [confirmEnable, setConfirmEnable] = useScopedState<string | null>(null)
   /** "Add" with a taken name replaces a server: ask before doing that. */
@@ -340,7 +346,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
 
   if (workspaceId === null) return <WorkspaceRequired />
 
-  const view: 'list' | 'edit' | 'import' = editorOpen ? 'edit' : importing ? 'import' : 'list'
+  const view: 'list' | 'edit' | 'import' | 'catalog' = editorOpen ? 'edit' : importing ? 'import' : browsing ? 'catalog' : 'list'
 
   const patch = (next: Partial<ServerForm>): void => { setForm((current) => ({ ...current, ...next })) }
 
@@ -428,6 +434,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
     setEditing(null)
     setForm(BLANK_FORM)
     setImporting(false)
+    setBrowsing(false)
     setEditorOpen(true)
     setNotice(null)
     revealEditor()
@@ -438,7 +445,45 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
   const beginImport = (): void => {
     resetForm()
     setImporting(true)
+    setBrowsing(false)
     setNotice(null)
+  }
+
+  const beginBrowse = (): Promise<void> => run('catalog', async () => {
+    resetForm()
+    setImporting(false)
+    setNotice(null)
+    // Secret names only; a failure just means every key is asked for again.
+    try { setSecretNames(new Set((await listSecrets(workspaceId)).map((secret) => secret.name))) } catch { setSecretNames(new Set()) }
+    setBrowsing(true)
+  })
+
+  /**
+   * Install a catalog entry: store the key(s) the person typed, then save the
+   * server under a free name. Saving never starts it (Enable does), so a
+   * failed secret write stops before anything is saved.
+   */
+  const installFromCatalog = (entry: CatalogEntry, config: Record<string, unknown>, secrets: Readonly<Record<string, string>>): Promise<void> => {
+    let failed = false
+    return run(`install:${entry.id}`, async () => {
+      try {
+        for (const [name, value] of Object.entries(secrets)) await setSecret(workspaceId, name, value)
+        if (Object.keys(secrets).length > 0) setSecretNames((current) => new Set([...current, ...Object.keys(secrets)]))
+        const name = catalogServerName(entry.id, rows.map((row) => row.name))
+        await upsertMcpServer(workspaceId, name, config)
+        const missing = entry.secrets.filter((secret) => !secretNames.has(secret.name) && secrets[secret.name] === undefined).map((secret) => secret.name)
+        const next = entry.config['auth'] !== null && typeof entry.config['auth'] === 'object' && (entry.config['auth'] as { type?: unknown }).type === 'managed_oauth'
+          ? 'Use Connect to sign in, then Enable to start it.'
+          : missing.length > 0
+            ? `Add ${missing.join(', ')} in the Secrets tab, then Enable to start it.`
+            : 'Use Enable to start it.'
+        setNotice({ kind: 'ok', text: `Installed ${name}. ${next}` })
+        await refresh()
+      } catch (cause) {
+        failed = true
+        setNotice({ kind: 'bad', text: `Could not install ${entry.title}: ${cause instanceof Error ? cause.message : String(cause)}` })
+      }
+    }).then(() => { if (failed) throw new Error('install failed') })
   }
 
   const invalid = formError(form)
@@ -503,6 +548,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
         <>
           <IconButton label="Refresh servers" disabled={busy !== null} onClick={() => void refresh()}><Icon name="refresh" size={14} /></IconButton>
           <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => guardDiscard(beginImport)}>Import…</Button>
+          <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => guardDiscard(() => void beginBrowse())}>Browse catalog</Button>
           <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => guardDiscard(beginAdd)}><Icon name="plus" size={13} />Add server</Button>
         </>
       }
@@ -594,9 +640,9 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
     </Section>
   )
 
-  /** Return from the editor or import view to the list. */
+  /** Return from the editor, import, or catalog view to the list. */
   const backToList = (
-    <Button variant="ghost" size="sm" className="-ml-2 self-start" disabled={busy !== null} onClick={() => guardDiscard(() => { resetForm(); setImporting(false); setImportContent('') })}>
+    <Button variant="ghost" size="sm" className="-ml-2 self-start" disabled={busy !== null} onClick={() => guardDiscard(() => { resetForm(); setImporting(false); setBrowsing(false); setImportContent('') })}>
       <Icon name="chevronRight" size={13} className="rotate-180" />Back to servers
     </Button>
   )
@@ -739,6 +785,15 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
             </FormActions>
           )}
         </Section>
+      ) : null}
+
+      {view === 'catalog' ? (
+        <>
+          <PanelIntro>
+            Pick a server to add it. Installing saves it switched off, and stores a key in Secrets if you enter one; nothing runs until you press Enable. Anyone can publish an MCP server, so install only ones you trust.
+          </PanelIntro>
+          <McpCatalogView host={{ serverNames: new Set(rows.map((row) => row.name)), secretNames, busy: busy !== null, install: installFromCatalog }} />
+        </>
       ) : null}
 
       {view === 'import' ? (
