@@ -492,4 +492,65 @@ describe('the Agent tool wait', () => {
     await inTurn(() => tool.execute({ action: 'wait' }, { signal: controller.signal } as never))
     expect(seen).toBe(controller.signal)
   })
+
+  const running = (progress: Record<string, unknown>) => ({ ...done, status: 'running', result: undefined, progress })
+
+  it('uses a five minute default and a thirty minute ceiling', async () => {
+    const seen: number[] = []
+    const tool = toolWith({
+      runningChildrenOfRoot: () => ['child-1'],
+      wait: async (_ws: string, _ids: unknown[], options: { timeoutMs: number }) => { seen.push(options.timeoutMs); return [] },
+    })
+    await inTurn(() => tool.execute({ action: 'wait' }, {} as never))
+    await inTurn(() => tool.execute({ action: 'wait', timeoutMs: 99 * 60_000 }, {} as never))
+    expect(seen).toEqual([300_000, 1_800_000])
+  })
+
+  it('tells the model a healthy running child is normal and should be waited on', async () => {
+    const tool = toolWith({
+      runningChildrenOfRoot: () => ['child-1'],
+      wait: async () => [running({ elapsedMs: 14 * 60_000, steps: 9, toolCalls: 21, lastActivity: { kind: 'model', sinceMs: 40_000 }, health: 'active' })],
+    })
+    const out = JSON.parse(String(await inTurn(() => tool.execute({ action: 'wait' }, {} as never))))
+    expect(out.note).toMatch(/making progress/)
+    expect(out.note).toMatch(/do not cancel/i)
+    expect(out.children[0].progress.health).toBe('active')
+  })
+
+  it('names a stalled child and leaves the decision to the model', async () => {
+    const tool = toolWith({
+      runningChildrenOfRoot: () => ['child-1'],
+      wait: async () => [running({ elapsedMs: 30 * 60_000, steps: 3, toolCalls: 2, lastActivity: { kind: 'model', sinceMs: 9 * 60_000 }, health: 'stalled' })],
+    })
+    const out = JSON.parse(String(await inTurn(() => tool.execute({ action: 'wait' }, {} as never))))
+    expect(out.note).toMatch(/child-1/)
+    expect(out.note).toMatch(/no progress for 9m/)
+    expect(out.note).toMatch(/retries on its own/)
+  })
+
+  it('does not promise a model retry for a stalled tool', async () => {
+    const tool = toolWith({
+      runningChildrenOfRoot: () => ['child-1'],
+      wait: async () => [running({ elapsedMs: 20 * 60_000, steps: 2, toolCalls: 2, lastActivity: { kind: 'tool', name: 'Bash', sinceMs: 11 * 60_000 }, health: 'stalled' })],
+    })
+    const out = JSON.parse(String(await inTurn(() => tool.execute({ action: 'wait' }, {} as never))))
+    expect(out.note).toMatch(/no progress for 11m \(Bash\)/)
+    expect(out.note).not.toMatch(/retries on its own/)
+  })
+
+  it('keeps the approval note when a child is parked on an approval', async () => {
+    const tool = toolWith({
+      runningChildrenOfRoot: () => ['child-1'],
+      wait: async () => [{ ...running({ elapsedMs: 0, steps: 1, toolCalls: 1, lastActivity: { kind: 'approval', name: 'Bash', sinceMs: 0 }, health: 'awaiting-approval' }), awaitingApproval: true }],
+    })
+    const out = JSON.parse(String(await inTurn(() => tool.execute({ action: 'wait' }, {} as never))))
+    expect(out.note).toMatch(/waiting for the user to answer an approval/)
+  })
+
+  it('describes the real wait contract', () => {
+    const tool = toolWith({ runningChildrenOfRoot: () => [] })
+    const description = inTurn(() => tool.schema?.()?.description ?? '')
+    expect(description).not.toMatch(/blocks until they settle/)
+    expect(description).toMatch(/prefer long waits/i)
+  })
 })

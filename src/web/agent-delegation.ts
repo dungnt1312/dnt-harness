@@ -262,9 +262,14 @@ function withThinking(parent: ParentModel, thinkingLevel: string | null | undefi
 
 // ── the Agent tool ───────────────────────────────────────────
 
-/** Longest a single `wait` may block, mirroring the HTTP lifecycle route. */
-const MAX_WAIT_MS = 120_000
-const DEFAULT_WAIT_MS = 30_000
+/**
+ * Longest a single model-facing `wait` may block. Long on purpose (Codex
+ * allows an hour): a wait returns as soon as its children settle, and short
+ * caps teach the model to poll and then cancel healthy work. The HTTP
+ * lifecycle route keeps its own 120 s cap.
+ */
+const MAX_WAIT_MS = 30 * 60_000
+const DEFAULT_WAIT_MS = 5 * 60_000
 /** How long a role listing may serve the tool description before a refresh. */
 const ROLE_CACHE_MS = 5_000
 
@@ -332,7 +337,7 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
     const total = deps.providers().reduce((sum, provider) => sum + deps.modelsOf(provider).length, 0)
     return [
       'Delegate a bounded task to a child agent and collect its result.',
-      'spawn returns immediately, so several children run at the same time; wait blocks until they settle.',
+      'spawn returns immediately, so several children run at the same time. wait blocks until the named children settle or timeoutMs passes (default 5 min, max 30 min), whichever is first; prefer long waits over repeated short ones. A wait that times out only means the work is not finished: each running child reports progress (elapsed time, steps, last activity, health). Reviews and research often take 10 to 30 minutes. Cancel only a child whose health is "stalled" or whose work you no longer need; cancelling and respawning loses its context.',
       'One level only: a child can never delegate further.',
       'Children you leave running are joined when your turn would close: their reports come back to you as a message, and you get one more step to use them. Calling wait yourself is still the way to get a result earlier or to work on something else in between.',
       'Delegate when the work is separable and its result compresses — a search across many files, a review, a verification run. Do not delegate what you can do in two tool calls, and do not delegate work whose context you would have to retype.',
@@ -388,7 +393,7 @@ const PARAMETERS: ToolDefinition['parameters'] = {
     grantTools: { type: 'array', items: { type: 'string' }, description: 'spawn: narrows the role\'s tools; never widens them' },
     model: { type: 'string', description: 'spawn: a model alias, provider:model, or bare model name; omit to inherit this conversation\'s' },
     childIds: { type: 'array', items: { type: 'string' }, description: 'wait/cancel: child session ids; wait defaults to every running child' },
-    timeoutMs: { type: 'number', description: `wait: how long to block, capped at ${MAX_WAIT_MS}` },
+    timeoutMs: { type: 'number', description: `wait: longest to block in ms; returns early when the children settle. Default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}. Prefer minutes to avoid busy polling.` },
   },
   required: [],
 }
@@ -481,6 +486,26 @@ export function formatChildReports(handles: readonly ChildHandle[]): string {
   return formatChildReportsText(handles)
 }
 
+const minutes = (ms: number): string => `${Math.max(1, Math.round(ms / 60_000))}m`
+
+/**
+ * The note a wait returns while children are still running, read from their
+ * advisory health: a healthy child is told apart from a stuck one, so the
+ * model stops cancelling work that is merely slow.
+ */
+export function runningNote(running: readonly ChildHandle[]): string {
+  if (running.some((child) => child.awaitingApproval === true)) {
+    return 'a child is waiting for the user to answer an approval; wait again or cancel it'
+  }
+  const stalled = running.flatMap((child) => child.progress?.health === 'stalled' ? [{ id: child.childSessionId, activity: child.progress.lastActivity }] : [])
+  if (stalled.length > 0) {
+    return stalled
+      .map(({ id, activity }) => `${id} shows no progress for ${minutes(activity.sinceMs)} (${activity.name ?? activity.kind})${activity.kind === 'model' ? '; the host aborts a stalled model request and retries on its own' : ''}`)
+      .join('; ') + '. Wait once more; cancel only if it is still stalled or no longer needed.'
+  }
+  return 'still running and making progress; this is normal for long tasks. Do not cancel: wait again with a longer timeoutMs, or keep working and the reports will arrive when your turn would close.'
+}
+
 async function wait(
   deps: DelegationDeps,
   args: Record<string, unknown>,
@@ -512,13 +537,7 @@ async function wait(
   const running = handles.filter((child) => child.status === 'running')
   return JSON.stringify({
     children: handles,
-    ...(running.length > 0
-      ? {
-          note: running.some((child) => child.awaitingApproval === true)
-            ? 'a child is waiting for the user to answer an approval; wait again or cancel it'
-            : 'still running after the timeout; call wait again',
-        }
-      : {}),
+    ...(running.length > 0 ? { note: runningNote(running) } : {}),
   })
 }
 

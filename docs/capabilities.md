@@ -189,8 +189,10 @@ classifier and no auto-load:
 
 `Agent` delegates a bounded task to a child agent and collects its result. One
 tool, six actions — `spawn` (returns a handle at once), `wait` (blocks on
-several children, capped at 120 s, honours Stop), `list`, `cancel`, `reconcile`,
-`catalog`:
+several children, default 5 min and capped at 30 min, returns early when they
+settle, honours Stop; a running child reports `progress` with an advisory
+`health` of `active`, `slow`, `stalled` or `awaiting-approval`; the HTTP
+lifecycle route keeps a 120 s cap), `list`, `cancel`, `reconcile`, `catalog`:
 
 - **A prose brief**: `prompt` is the primary argument — written for a colleague
   who cannot see the conversation — plus `requiredResult`. The structured

@@ -876,7 +876,11 @@ child.
 
 The model drives this itself through the built-in **`Agent`** tool, whose
 actions mirror the executor: `spawn` returns a handle immediately, `wait` blocks
-on several children (capped at 120 s, and it honours a root Stop), `list`,
+on several children (default 5 min, capped at 30 min, returning early when they
+settle, and it honours a root Stop; each running child's handle carries
+`progress` — elapsed time, step and tool counts, last activity and an advisory
+`health` derived from the stream limits — and the wait's note tells a healthy
+child from a stalled one; the HTTP lifecycle route keeps a 120 s cap), `list`,
 `cancel`, `reconcile` (canonical settlement for `uncertain` children — a
 retained live entry or a restart-reconstructed one), and `catalog` (roles +
 `provider:model` ids). The tool is
