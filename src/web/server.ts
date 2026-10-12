@@ -127,6 +127,7 @@ import { MutationStore, readFileIfPresent } from '../harness/mcp/mutation-store.
 import { recoverMigrations } from '../harness/mcp/migration.ts'
 import { DataHomeLock } from '../harness/mcp/ownership-lock.ts'
 import { ManagedOAuth } from '../harness/mcp/oauth.ts'
+import { beginConnect, callbackPage, grantMatchesServer, managedAuthOf, OAuthConnectError, oauthRowState } from './mcp-oauth-connect.ts'
 import { OAuthStore } from '../harness/mcp/oauth-store.ts'
 import { containmentCapability, resolveCanonicalExecutable } from '../harness/mcp/process-controller.ts'
 import { stageMcpOutcome } from '../harness/mcp/staged-outcome.ts'
@@ -774,7 +775,15 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     oauthKey = randomBytes(32)
     await fs.writeFile(oauthKeyFile, oauthKey, { mode: 0o600 })
   }
-  const oauth = new ManagedOAuth(new OAuthStore(path.join(resourceHome, 'oauth'), oauthKey))
+  const oauthStore = new OAuthStore(path.join(resourceHome, 'oauth'), oauthKey)
+  // A confidential client's secret is resolved from the workspace secrets at
+  // each exchange; it never sits beside the tokens.
+  const oauth = new ManagedOAuth(oauthStore, fetch, () => Date.now(), async (workspaceId, serverName) => {
+    const config = await mcpStore.loadMcp(workspaceId)
+    const ref = managedAuthOf(config.servers[serverName])?.clientSecret
+    if (ref === undefined) return undefined
+    return resolveSecretRefs(ref, await mcpStore.loadSecrets(workspaceId), `mcp.json server '${serverName}' auth.clientSecret`)
+  })
   const sessionPrincipals = new Map<string, string>()
   const mcpClients = new Map<string, McpServerClient>() // `${wsId}:${server}`
   const mcpClientGeneration = new Map<string, number>()
@@ -2290,6 +2299,11 @@ ${entry.description}`.toLowerCase().includes(query))
         tokenSource: undefined,
       }
     }
+    // A grant obtained for another URL (the server was re-pointed) is not
+    // handed to this one; the user connects again.
+    if (!await grantMatchesServer(oauthStore, workspaceId, serverConfig)) {
+      throw new McpTransportError(`MCP server '${serverName}' auth_required: its URL changed since sign-in; connect again`)
+    }
     let lastToken: string | undefined
     const tokenSource = async (rejected?: string): Promise<string | undefined> => {
       const token = rejected !== undefined
@@ -2300,7 +2314,16 @@ ${entry.description}`.toLowerCase().includes(query))
       return token
     }
     await tokenSource()
-    return { bearerToken: undefined, tokenSource, replaceRejected: () => tokenSource(lastToken) }
+    return {
+      bearerToken: undefined,
+      tokenSource,
+      replaceRejected: () => tokenSource(lastToken),
+      onInsufficientScope: async (scope: string | undefined): Promise<void> => {
+        await oauth.markScopeRequired(workspaceId, serverName, scope).catch((error: unknown) => {
+          console.warn(`web: could not record missing OAuth scope for '${serverName}': ${error instanceof Error ? error.message : String(error)}`)
+        })
+      },
+    }
   }
 
   async function testMcpServer(workspaceId: WorkspaceId, serverName: string): Promise<readonly string[]> {
@@ -3856,6 +3879,7 @@ ${entry.description}`.toLowerCase().includes(query))
     updateMcpSecrets,
     sessionPrincipals,
     oauth,
+    oauthStore,
     generationOf,
     fenceWorkspace,
     closeStreamsFor,
@@ -4148,6 +4172,7 @@ interface HandlerDeps {
   readonly updateMcpSecrets: (workspaceId: WorkspaceId, transform: (secrets: Record<string, string>) => void) => Promise<void>
   readonly sessionPrincipals: Map<string, string>
   readonly oauth: ManagedOAuth
+  readonly oauthStore: OAuthStore
   readonly generationOf: (workspaceId: string) => number
   readonly fenceWorkspace: (workspaceId: WorkspaceId) => Promise<void>
   readonly closeStreamsFor: (principalId: string) => void
@@ -4362,9 +4387,33 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: HandlerDe
  * is not cacheable. A redeemed code sets the session cookie.
  */
 async function handleOAuthDeposit(req: IncomingMessage, res: ServerResponse, deps: HandlerDeps): Promise<void> {
+  // A browser lands here from the provider (GET): answer with a page that
+  // hands the state to the app tab. A POST deposit keeps the plain answer.
+  const browser = req.method === 'GET'
+  const page = (status: number, result: Parameters<typeof callbackPage>[0]): void => {
+    const { html, csp } = callbackPage(result)
+    res.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'content-security-policy': csp })
+    res.end(html)
+  }
   const send = (status: number, body: string): void => {
     res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
     res.end(body)
+  }
+  if (browser) {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+    const state = url.searchParams.get('state') ?? ''
+    const providerError = url.searchParams.get('error')
+    if (providerError !== null) {
+      page(400, { ok: false, reason: `The provider did not grant access (${providerError.slice(0, 80)}).` })
+      return
+    }
+    try {
+      await deps.oauth.deposit(state, url.searchParams.get('code') ?? '')
+      page(200, { ok: true, state })
+    } catch {
+      page(400, { ok: false, reason: 'This sign-in link is unknown, expired, or was already used.' })
+    }
+    return
   }
   try {
     let state = ''
@@ -5137,19 +5186,25 @@ async function handleApi(
       const body = await readJson(req)
       try {
         if (action === 'begin') {
-          const scopes = Array.isArray(body['scopes']) ? body['scopes'].filter((item): item is string => typeof item === 'string') : []
-          const started = await deps.oauth.begin({
+          // Only extra scopes are read from the body (Reconnect). Endpoints,
+          // client, and redirect URI come from discovery and mcp.json.
+          const config = (await deps.mcpStore.loadMcp(wsId)).servers[serverName]
+          if (config === undefined) {
+            send(404, { error: `no MCP server '${serverName}'` })
+            return
+          }
+          const extraScopes = Array.isArray(body['scopes']) ? body['scopes'].filter((item): item is string => typeof item === 'string' && /^[\x21-\x7e]+$/.test(item)) : []
+          const started = await beginConnect({
+            oauth: deps.oauth,
+            store: deps.oauthStore,
             workspaceId: wsId,
             server: serverName,
+            config,
             principalId,
-            resource: String(body['resource'] ?? ''),
-            authorizationEndpoint: String(body['authorizationEndpoint'] ?? ''),
-            tokenEndpoint: String(body['tokenEndpoint'] ?? ''),
-            clientId: String(body['clientId'] ?? ''),
-            redirectUri: String(body['redirectUri'] ?? ''),
-            scopes,
+            hostHeader: req.headers.host,
+            extraScopes,
           })
-          send(200, { authorizationUrl: started.authorizationUrl })
+          send(200, { authorizationUrl: started.authorizationUrl, state: started.state })
           return
         }
         if (action === 'complete') {
@@ -5159,13 +5214,30 @@ async function handleApi(
             workspaceId: wsId,
             server: serverName,
           })
+          // An enabled server picks the new grant up now, not at the next turn.
+          const current = (await deps.mcpStore.loadMcp(wsId)).servers[serverName]
+          if (current?.enabled === true) {
+            await deps.cancelMcpConnection(wsId, serverName)
+            deps.mcpCancelled.delete(`${wsId}:${serverName}`)
+            const client = await deps.ensureMcpServer(wsId, serverName).catch(() => undefined)
+            if (client === undefined) {
+              send(200, { connected: true, status: 'failed' })
+              return
+            }
+          }
           send(200, { connected: true })
           return
         }
         await deps.fenceWorkspace(wsId)
-        const revoked = await deps.oauth.revoke(wsId, serverName, typeof body['revocationEndpoint'] === 'string' ? body['revocationEndpoint'] : undefined)
+        const record = await deps.oauthStore.readServerRecord(wsId, serverName)
+        const revoked = await deps.oauth.revoke(wsId, serverName, record?.revocationEndpoint)
+        await deps.cancelMcpConnection(wsId, serverName)
         send(200, revoked)
       } catch (error) {
+        if (error instanceof OAuthConnectError) {
+          send(400, { code: error.code, error: error.message })
+          return
+        }
         send(400, { error: error instanceof Error ? error.message : String(error) })
       }
       return
@@ -5249,7 +5321,9 @@ async function handleApi(
             const unusableTools = discovered.filter((name) => !PROVIDER_TOOL_NAME.test(mcpToolName(server.name, name)) || name.includes('__'))
             const connectFailure = server.enabled ? deps.mcpConnectFailures.get(`${wsId}:${server.name}`) : undefined
             const stderr = client?.recentStderr() ?? ''
+            const oauthState = await oauthRowState(deps.oauth, deps.oauthStore, wsId, server)
             rows.push({
+              ...(oauthState !== undefined ? { oauth: oauthState } : {}),
               name: server.name,
               transport: server.transport,
               enabled: server.enabled,
@@ -5293,6 +5367,9 @@ async function handleApi(
           // Stop the process and drop its tool schemas before the config forgets it.
           await deps.cancelMcpConnection(wsId, serverName)
           await deps.updateMcpConfig(wsId, (current) => withoutServer(current, serverName))
+          // Revoke locally first so a racing refresh cannot write the grant back.
+          if (config.servers[serverName]?.auth?.type === 'managed_oauth') await deps.oauth.revoke(wsId, serverName)
+          await deps.oauthStore.deleteServer(wsId, serverName)
           send(200, { deleted: serverName })
           return
         }

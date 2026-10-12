@@ -74,8 +74,8 @@ interface TransportEvents {
   readonly onDead?: () => void
   /** Raw server stderr text, for the bounded diagnostic tail. */
   readonly onStderr?: (text: string) => void
-  /** HTTP 403 `insufficient_scope`, with the scope the server asked for. */
-  readonly onInsufficientScope?: (scope: string | undefined) => void
+  /** HTTP 403 `insufficient_scope`, with the scope the server asked for. Awaited before the call fails. */
+  readonly onInsufficientScope?: (scope: string | undefined) => Promise<void> | void
 }
 
 /** JSON-RPC framing over a request/response channel. */
@@ -547,7 +547,8 @@ class HttpTransport implements Transport {
         // A valid token without the scope: a refresh returns the same scopes,
         // so do not mark it rejected. A person has to grant the scope.
         await response.body?.cancel().catch(() => {})
-        this.events.onInsufficientScope?.(challenge.scope)
+        // Recorded before the failure surfaces, so whoever reads state next sees it.
+        await Promise.resolve(this.events.onInsufficientScope?.(challenge.scope)).catch(() => undefined)
         throw new McpDispatchError(
           `HTTP 403: the server needs scope ${challenge.scope !== undefined ? `'${challenge.scope}'` : 'that was not granted'}; reconnect to grant it`,
           receiptForTransportFailure(false, 'insufficient_scope'),
@@ -714,7 +715,7 @@ export class McpServerClient {
       /** Asked before every HTTP request; wins over the fixed `bearerToken`. */
       readonly tokenSource?: BearerTokenSource | undefined
       /** The server answered `insufficient_scope`; the host records it for Reconnect. */
-      readonly onInsufficientScope?: ((scope: string | undefined) => void) | undefined
+      readonly onInsufficientScope?: ((scope: string | undefined) => Promise<void> | void) | undefined
     },
     private readonly onAudit: (event: { readonly kind: 'call' | 'breaker' | 'reconnect'; readonly detail: string; readonly durationMs: number; readonly isError: boolean }) => void,
     private readonly runtime: { readonly breakerDurationMs?: number; readonly healthIntervalMs?: number; readonly reconnectJitterMs?: number } = {},
@@ -970,7 +971,7 @@ export class McpServerClient {
         if (this.state === 'ready') this.state = 'failed'
       },
       onStderr: (text: string): void => { this.appendStderr(text) },
-      onInsufficientScope: (scope: string | undefined): void => { this.resolved.onInsufficientScope?.(scope) },
+      onInsufficientScope: async (scope: string | undefined): Promise<void> => { await this.resolved.onInsufficientScope?.(scope) },
     }
     const fixedToken = this.resolved.bearerToken
     const tokens: BearerTokenSource = this.resolved.tokenSource ?? (async () => fixedToken)

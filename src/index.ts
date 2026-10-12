@@ -344,7 +344,12 @@ export { minimalStdioEnv, containmentCapability, assertHardContainmentAvailable 
 export { assertOutboundUrl, OutboundPolicyError } from './harness/mcp/outbound-policy.ts'
 export { SseParser } from './harness/mcp/sse-parser.ts'
 export { ManagedOAuth, OAuthFlowError, OAuthTemporaryError } from './harness/mcp/oauth.ts'
+export type { ClientSecretSource } from './harness/mcp/oauth.ts'
 export { OAuthStore } from './harness/mcp/oauth-store.ts'
+export type { OAuthServerRecord, OAuthTokens } from './harness/mcp/oauth-store.ts'
+export { discoverOAuth, OAuthConnectError, parseBearerChallenge, resourceCovers } from './harness/mcp/oauth-discovery.ts'
+export type { DiscoveredOAuth, OAuthConnectCode } from './harness/mcp/oauth-discovery.ts'
+export { resolveClient } from './harness/mcp/oauth-registration.ts'
 export { bearerAllows } from './web/control-plane-auth.ts'
 export {
   runHook,
