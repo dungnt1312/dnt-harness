@@ -69,8 +69,10 @@ export interface GitHeadReport {
 }
 
 export interface GitStatusReport {
-  /** Current branch and its upstream; `null` when detached or not a repository. */
-  readonly branch: GitBranchReport | null
+  /** Current branch name (compatibility with existing consumers); `null` when detached or not a repository. */
+  readonly branch: string | null
+  /** Current branch with its upstream and tracking; `null` when detached or not a repository. */
+  readonly branchInfo: GitBranchReport | null
   /** Latest commit; `null` when there is none. */
   readonly head: GitHeadReport | null
   readonly changes: readonly GitChange[]
@@ -452,7 +454,7 @@ async function headReport(root: string, trusted: boolean): Promise<GitHeadReport
  */
 export async function gitStatus(root: string, deniedRoots?: readonly string[], trusted = false): Promise<GitStatusReport> {
   const { stdout, code } = await runGitQuery(root, ['status', '--porcelain=v1', '--untracked-files=all', '--no-renames', '-z', '--', '.'], trusted)
-  if (code !== 0) return { branch: null, head: null, changes: [], truncated: false }
+  if (code !== 0) return { branch: null, branchInfo: null, head: null, changes: [], truncated: false }
   const changes: GitChange[] = []
   let truncated = false
   for (const record of records(stdout)) {
@@ -468,12 +470,13 @@ export async function gitStatus(root: string, deniedRoots?: readonly string[], t
   }
   const symbolic = await runGitQuery(root, ['symbolic-ref', '--short', '-q', 'HEAD'], trusted)
   const name = symbolic.code === 0 ? symbolic.stdout.toString('utf8').trim() : ''
-  const branch = name === '' ? null : await branchReport(root, trusted, name)
+  const branchInfo = name === '' ? null : await branchReport(root, trusted, name)
   const head = await headReport(root, trusted)
   const counted = await lineCounts(root, trusted)
-  const track = branch?.upstreamTrack
+  const track = branchInfo?.upstreamTrack
   return {
-    branch,
+    branch: branchInfo?.name ?? null,
+    branchInfo,
     head,
     truncated,
     ...(track?.kind === 'tracked' ? { ahead: track.ahead, behind: track.behind } : {}),

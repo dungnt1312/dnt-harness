@@ -153,11 +153,15 @@ describe('gitStatus over real repository states', () => {
   })
 
   it('reports the branch with its upstream and tracking', () => {
-    expect(report.branch).toMatchObject({
+    expect(report.branchInfo).toMatchObject({
       name: 'main',
       upstream: { remote: 'origin', branch: 'main' },
       upstreamTrack: { kind: 'tracked', ahead: 1, behind: 2 },
     })
+  })
+
+  it('keeps the top-level branch a plain string for existing consumers', () => {
+    expect(report.branch).toBe('main')
   })
 
   it('keeps top-level ahead and behind for the Environment panel', () => {
@@ -207,7 +211,8 @@ describe('gitStatus over real repository states', () => {
     git(lonely, 'config', 'user.email', 't@t')
     git(lonely, 'config', 'user.name', 't')
     expect((await gitStatus(lonely)).head).toBeNull()
-    expect((await gitStatus(lonely)).branch).toMatchObject({ name: 'main', upstreamTrack: { kind: 'none' } })
+    expect((await gitStatus(lonely)).branchInfo).toMatchObject({ name: 'main', upstreamTrack: { kind: 'none' } })
+    expect((await gitStatus(lonely)).branch).toBe('main')
     await fs.writeFile(path.join(lonely, 'x.txt'), 'x\n')
     git(lonely, 'add', '.')
     git(lonely, 'commit', '-qm', 'root')
@@ -221,16 +226,18 @@ describe('gitStatus over real repository states', () => {
     git(lonely, 'update-ref', 'refs/remotes/origin/deleted-upstream', 'HEAD')
     git(lonely, 'checkout', '-q', 'topic')
     git(lonely, 'update-ref', '-d', 'refs/remotes/origin/deleted-upstream')
-    expect((await gitStatus(lonely)).branch).toMatchObject({ name: 'topic', upstreamTrack: { kind: 'gone' } })
+    expect((await gitStatus(lonely)).branchInfo).toMatchObject({ name: 'topic', upstreamTrack: { kind: 'gone' } })
+    expect((await gitStatus(lonely)).branch).toBe('topic')
 
     git(lonely, 'checkout', '-q', '--detach')
     const detached = await gitStatus(lonely)
     expect(detached.branch).toBeNull()
+    expect(detached.branchInfo).toBeNull()
     expect(detached.head).toMatchObject({ subject: 'root' })
   })
 
   it('a folder that is not a repository is an empty report', async () => {
     const plain = await fs.mkdtemp(path.join(scratch, 'plain-'))
-    expect(await gitStatus(plain)).toEqual({ branch: null, head: null, changes: [], truncated: false })
+    expect(await gitStatus(plain)).toEqual({ branch: null, branchInfo: null, head: null, changes: [], truncated: false })
   })
 })
