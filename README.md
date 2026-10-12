@@ -48,6 +48,8 @@ to the underlying bin (see [docs/guides.md](docs/guides.md) for flags):
 | `dnt-harness chat [--message "hi"]` | headless REPL or one-shot |
 | `dnt-harness pair [--data-dir DIR]` | mint a pairing code for a running `--auth` server |
 | `dnt-harness start pm2 [--name N] [web flags]` | run the web server under pm2 (needs `npm i -g pm2`) |
+| `dnt-harness restart [--name N]` | restart the pm2 process, keeping the flags it was started with |
+| `dnt-harness upgrade [--name N]` | install the latest version from npm, then restart the pm2 process |
 
 `start pm2` registers the server with pm2 (default name `dnt-harness`, replacing
 an existing process of that name so new flags apply), runs `pm2 save`, and keeps

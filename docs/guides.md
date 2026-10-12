@@ -12,7 +12,19 @@ dnt-harness web --port 4000 --yolo
 dnt-harness chat --message "hello"
 dnt-harness pair                  # new pairing code for a running --auth server
 dnt-harness start pm2 --port 3082 # run the web server under pm2
+dnt-harness restart               # restart it, same flags
+dnt-harness upgrade               # npm i -g the latest, then restart
 ```
+
+`dnt-harness upgrade [--name N]` compares the installed version with
+`npm view dnt-harness version` and does nothing when it is not newer. Otherwise
+it stops the pm2 process (Windows locks files of a running process), runs
+`npm i -g dnt-harness@<latest>`, and restarts the process even if the install
+failed, so the server is never left down. Without a pm2 process it only
+upgrades the package. `dnt-harness --version` prints the installed version.
+
+On Windows `pm2` and `npm` are `.cmd` shims, so the launcher runs them through
+a shell with quoted arguments; the same commands work on macOS and Linux.
 
 `dnt-harness start pm2 [--name N] [web flags]` requires `pm2` on PATH (it prints
 `npm i -g pm2` otherwise). It deletes any pm2 process with the same name, starts
