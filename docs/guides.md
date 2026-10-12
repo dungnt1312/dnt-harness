@@ -3,7 +3,36 @@
 Practical walkthroughs: getting started, configuration, the CLI, writing a
 plugin, and testing.
 
-## Getting started
+## Installing the package
+
+```sh
+npm i -g dnt-harness
+dnt-harness                       # = dnt-harness web, http://127.0.0.1:3082
+dnt-harness web --port 4000 --yolo
+dnt-harness chat --message "hello"
+dnt-harness pair                  # new pairing code for a running --auth server
+dnt-harness start pm2 --port 3082 # run the web server under pm2
+```
+
+`dnt-harness start pm2 [--name N] [web flags]` requires `pm2` on PATH (it prints
+`npm i -g pm2` otherwise). It deletes any pm2 process with the same name, starts
+`bin/dnt-harness.mjs web <flags>` with `--time` log stamps, and runs `pm2 save`.
+The process keeps the cwd you ran the command in, which becomes the default
+`--root`. Use `pm2 logs|stop|restart <name>` afterwards, and `pm2 startup` once
+for start on boot. This is separate from the repo's `ecosystem.config.cjs`, which
+is for running from a source checkout.
+
+The `dnt-harness` bin is `bin/dnt-harness.mjs`. It registers `tsx` and imports
+`src/bins/{web,headless,pair}.ts`, because Node does not strip types for files
+inside `node_modules`. The published tarball (`files` in `package.json`) holds
+`bin`, `src`, `web-dist`, `skills`, `commands` and `README.md`; `prepack` runs
+`vite build`, so `web-dist/` is always fresh. Flags and behavior match the
+`npm run web` / `npm run chat` / `npm run pair` scripts below.
+
+Releasing: `npm version <patch|minor>`, then `npm publish` (needs npm login and
+2FA/OTP). Check the contents first with `npm pack --dry-run`.
+
+## Getting started (from source)
 
 ```sh
 npm install        # install dependencies (Node >= 22.19.0)

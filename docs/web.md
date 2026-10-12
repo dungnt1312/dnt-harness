@@ -74,6 +74,8 @@ UI from it at any time.
 ## Starting it
 
 ```sh
+dnt-harness web     # installed via `npm i -g dnt-harness`; client is prebuilt
+# from a source checkout:
 npm run build:web   # build the React client into web-dist/ (one time)
 npm run web         # serve at http://127.0.0.1:3082 (default port)
 ```

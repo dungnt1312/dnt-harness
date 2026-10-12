@@ -2,7 +2,21 @@
   "name": "dnt-harness",
   "version": "0.1.0",
   "license": "MIT",
-  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/dungnt1312/dnt-harness.git"
+  },
+  "bin": {
+    "dnt-harness": "bin/dnt-harness.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "web-dist",
+    "skills",
+    "commands",
+    "README.md"
+  ],
   "type": "module",
   "description": "A TypeScript agent harness with a Cordis-inspired plugin kernel: agent loop, tool pipeline, capability seams.",
   "engines": {
@@ -21,7 +35,8 @@
     "deploy": "npm run build:web && npm run restart",
     "test:browser": "playwright test",
     "test:browser:mcp": "vitest run tests/web/mcp-production-stack.spec.ts",
-    "test:live-ui": "node scripts/live-ui-smoke.mjs"
+    "test:live-ui": "node scripts/live-ui-smoke.mjs",
+    "prepack": "vite build"
   },
   "dependencies": {
     "@fontsource/instrument-sans": "^5.3.0",
@@ -47,6 +62,7 @@
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
     "tailwind-merge": "^3.7.0",
+    "tsx": "^4.20.3",
     "web-push": "^3.6.7"
   },
   "optionalDependencies": {
@@ -66,7 +82,6 @@
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "tailwindcss": "^4.3.3",
-    "tsx": "^4.20.3",
     "typescript": "^5.9.3",
     "vite": "^6.4.3",
     "vitest": "^3.2.4"

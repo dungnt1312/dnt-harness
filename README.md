@@ -32,7 +32,34 @@ Full docs live in [`docs/`](docs/README.md):
 - **Phase 9 — G5 MCP & hooks (done)**: workspace-owned strict `mcp.json`, Claude Code `settings.json` hooks (see docs/claude-format.md), AES-256-GCM `secrets.json` with masked management and rotation reconnect; MCP 2025-06-18 stdio (newline JSON-RPC subprocess) plus Streamable HTTP POST/SSE with session IDs and Bearer/OAuth access-token references; `mcp__server__tool` registration with workspace-isolated dynamic schemas, allowlist exposure, default-ask/wildcard policies, host `blockedTools`, Chat/Plan/Explorer/Worker ceilings, timeout/AbortSignal/cancel notification/process-tree cleanup, 3× retry, 5-failure circuit breaker and health reconnect, plus CPU/memory/lifetime watchdogs on stdio servers (application control, not OS controllers). Command hooks cover PreToolUse block/rewrite (final args re-bound before durable intent), PostToolUse flag, UserPromptSubmit inject, SessionStart/End audit and PreCompact gate, managed from the Settings → MCP/Hooks/Secrets panels. Audit events store hashed args/results, durations, identity — never raw secrets. Claude/Codex MCP imports record provenance, stay disabled, and never spawn. Browser-interactive OAuth authorization and pinned upstream compatibility fixtures remain explicit production follow-ups, not claimed complete; the plugin marketplace is G6.
 - Phase 10 (planned) — dynamic plugins: patch layers, hot (un)load, provider swap restarting dependents.
 
-## Getting started
+## Install
+
+```sh
+npm i -g dnt-harness     # Node >= 22.19.0
+dnt-harness              # web UI at http://127.0.0.1:3082
+```
+
+`dnt-harness` has three subcommands; everything after the subcommand is passed
+to the underlying bin (see [docs/guides.md](docs/guides.md) for flags):
+
+| Command | Does |
+|---|---|
+| `dnt-harness [web] [--port N --root DIR --yolo --auth --allowed-host H --data-dir DIR]` | serve the web UI (default) |
+| `dnt-harness chat [--message "hi"]` | headless REPL or one-shot |
+| `dnt-harness pair [--data-dir DIR]` | mint a pairing code for a running `--auth` server |
+| `dnt-harness start pm2 [--name N] [web flags]` | run the web server under pm2 (needs `npm i -g pm2`) |
+
+`start pm2` registers the server with pm2 (default name `dnt-harness`, replacing
+an existing process of that name so new flags apply), runs `pm2 save`, and keeps
+the folder you ran it from as the default `--root`. For start on boot, run
+`pm2 startup` once.
+
+Sessions and provider config live in `~/.dnt-harness/`. Add a provider in
+Settings, or set `DEEPSEEK_API_KEY` in the environment before the first start.
+The package ships TypeScript source and runs it through `tsx`; the web client
+is prebuilt, so no build step is needed after installing.
+
+## Getting started (from source)
 
 ```sh
 npm install
