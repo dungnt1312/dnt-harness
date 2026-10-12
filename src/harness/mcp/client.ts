@@ -13,6 +13,7 @@ import { StringDecoder } from 'node:string_decoder'
 import { McpDispatchError, receiptForTransportFailure, boundToolMetadata } from './boundaries.ts'
 import type { McpServerConfig } from './config.ts'
 import { MCP_LIMITS } from './limits.ts'
+import { parseBearerChallenge } from './oauth-discovery.ts'
 import { assertOutboundUrl, operatorHeaders } from './outbound-policy.ts'
 import { assertHardContainmentAvailable, minimalStdioEnv, resolveCanonicalExecutable } from './process-controller.ts'
 import { assertInitializeResult, assertCursor, assertSessionId } from './protocol.ts'
@@ -73,6 +74,8 @@ interface TransportEvents {
   readonly onDead?: () => void
   /** Raw server stderr text, for the bounded diagnostic tail. */
   readonly onStderr?: (text: string) => void
+  /** HTTP 403 `insufficient_scope`, with the scope the server asked for. */
+  readonly onInsufficientScope?: (scope: string | undefined) => void
 }
 
 /** JSON-RPC framing over a request/response channel. */
@@ -538,6 +541,19 @@ class HttpTransport implements Transport {
       await response.body?.cancel().catch(() => {})
       throw new McpDispatchError('HTTP redirect was not followed', receiptForTransportFailure(true, 'redirect_followed'))
     }
+    if (response.status === 403) {
+      const challenge = parseBearerChallenge(response.headers.get('www-authenticate'))
+      if (challenge?.error === 'insufficient_scope') {
+        // A valid token without the scope: a refresh returns the same scopes,
+        // so do not mark it rejected. A person has to grant the scope.
+        await response.body?.cancel().catch(() => {})
+        this.events.onInsufficientScope?.(challenge.scope)
+        throw new McpDispatchError(
+          `HTTP 403: the server needs scope ${challenge.scope !== undefined ? `'${challenge.scope}'` : 'that was not granted'}; reconnect to grant it`,
+          receiptForTransportFailure(false, 'insufficient_scope'),
+        )
+      }
+    }
     if (response.status === 401 || response.status === 403) {
       // The server refused the credentials before processing the request.
       await response.body?.cancel().catch(() => {})
@@ -697,6 +713,8 @@ export class McpServerClient {
       readonly headers?: Record<string, string> | undefined
       /** Asked before every HTTP request; wins over the fixed `bearerToken`. */
       readonly tokenSource?: BearerTokenSource | undefined
+      /** The server answered `insufficient_scope`; the host records it for Reconnect. */
+      readonly onInsufficientScope?: ((scope: string | undefined) => void) | undefined
     },
     private readonly onAudit: (event: { readonly kind: 'call' | 'breaker' | 'reconnect'; readonly detail: string; readonly durationMs: number; readonly isError: boolean }) => void,
     private readonly runtime: { readonly breakerDurationMs?: number; readonly healthIntervalMs?: number; readonly reconnectJitterMs?: number } = {},
@@ -952,6 +970,7 @@ export class McpServerClient {
         if (this.state === 'ready') this.state = 'failed'
       },
       onStderr: (text: string): void => { this.appendStderr(text) },
+      onInsufficientScope: (scope: string | undefined): void => { this.resolved.onInsufficientScope?.(scope) },
     }
     const fixedToken = this.resolved.bearerToken
     const tokens: BearerTokenSource = this.resolved.tokenSource ?? (async () => fixedToken)

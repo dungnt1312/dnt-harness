@@ -75,6 +75,8 @@ export type DispatchNotSentReason =
   | 'session_expired'
   /** HTTP 401/403: the server refused the credentials before processing. */
   | 'auth_rejected'
+  /** HTTP 403 `insufficient_scope`: the token is valid but lacks a scope; refreshing cannot fix it. */
+  | 'insufficient_scope'
 
 export type DispatchMaybeSentReason =
   | 'write_accepted_or_buffered'
