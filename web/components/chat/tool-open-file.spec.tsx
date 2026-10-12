@@ -45,24 +45,23 @@ it('a Read row: the file name opens the file at the window it read', async () =>
 it.each([
   ['Write', { path: 'plans/plan.md', content: 'a\nb\n' }],
   ['Edit', { path: 'src/a.ts', old: 'x', new: 'y' }],
-])('a landed %s row: the file name opens its diff, and does not toggle the row', async (name, args) => {
-  const diff = vi.fn()
+])('a landed %s row: the file name opens the file (its own diff is the row body), and does not toggle the row', async (name, args) => {
   const file = vi.fn()
-  const openDiff = vi.fn(() => diff)
-  await render(<ToolCard item={tool(name, args, { ok: true, output: 'ok' })} openPath={() => file} openDiff={openDiff} />)
+  const openPath = vi.fn((_path: string, _focus?: unknown) => file)
+  await render(<ToolCard item={tool(name, args, { ok: true, output: 'ok' })} openPath={openPath} />)
   const button = chip()!
-  expect(button.getAttribute('aria-label')).toContain('diff')
+  // Not the git diff: that mixes in every uncommitted change.
+  expect(button.getAttribute('aria-label')).not.toContain('diff')
   // Never a button inside a button.
   expect(button.parentElement!.closest('button')).toBeNull()
   await act(async () => button.click())
-  expect(openDiff).toHaveBeenCalledWith(args.path)
-  expect(diff).toHaveBeenCalledOnce()
-  expect(file).not.toHaveBeenCalled()
+  expect(openPath.mock.calls[0]?.[0]).toBe(args.path)
+  expect(file).toHaveBeenCalledOnce()
   expect(expander().getAttribute('aria-expanded')).toBe('false')
 })
 
 it('the rest of a chip row still toggles its diff, from the line or the chevron', async () => {
-  await render(<ToolCard item={tool('Edit', { path: 'src/a.ts', old: 'x', new: 'y' }, { ok: true, output: 'ok' })} openDiff={() => () => undefined} />)
+  await render(<ToolCard item={tool('Edit', { path: 'src/a.ts', old: 'x', new: 'y' }, { ok: true, output: 'ok' })} openPath={() => () => undefined} />)
   const line = expander().parentElement!
   await act(async () => line.click())
   expect(expander().getAttribute('aria-expanded')).toBe('true')
@@ -71,18 +70,13 @@ it('the rest of a chip row still toggles its diff, from the line or the chevron'
   expect(expander().getAttribute('aria-expanded')).toBe('false')
 })
 
-it('without git wiring a change opens the file; a failed, running or outside change offers nothing', async () => {
-  const file = vi.fn()
-  await render(<ToolCard item={tool('Write', { path: 'p.md', content: 'x' }, { ok: true, output: 'ok' })} openPath={() => file} />)
-  await act(async () => chip()!.click())
-  expect(file).toHaveBeenCalledOnce()
-
+it('a failed, running or unopenable change offers no file link', async () => {
   const any = () => () => undefined
-  await act(async () => root!.render(<ToolCard item={tool('Write', { path: 'p.md', content: 'x' }, { ok: false, output: 'boom' })} openPath={any} openDiff={any} />))
+  await render(<ToolCard item={tool('Write', { path: 'p.md', content: 'x' }, { ok: false, output: 'boom' })} openPath={any} />)
   expect(chip()).toBeUndefined()
-  await act(async () => root!.render(<ToolCard item={tool('Edit', { path: 'p.md', old: 'a', new: 'b' })} openPath={any} openDiff={any} />))
+  await act(async () => root!.render(<ToolCard item={tool('Edit', { path: 'p.md', old: 'a', new: 'b' })} openPath={any} />))
   expect(chip()).toBeUndefined()
-  await act(async () => root!.render(<ToolCard item={tool('Edit', { path: '/elsewhere/p.md', old: 'a', new: 'b' }, { ok: true, output: 'ok' })} openPath={() => null} openDiff={() => null} />))
+  await act(async () => root!.render(<ToolCard item={tool('Edit', { path: '/elsewhere/p.md', old: 'a', new: 'b' }, { ok: true, output: 'ok' })} openPath={() => null} />))
   expect(chip()).toBeUndefined()
 })
 
@@ -134,5 +128,27 @@ describe('files named inside a tool body open in the workbench', () => {
     expect(links()).toHaveLength(0)
     await act(async () => root!.render(<ToolCard item={tool('Glob', { pattern: '*' }, { ok: true, output: 'a.ts' })} />))
     expect(links()).toHaveLength(0)
+  })
+})
+
+describe('a Skill row', () => {
+  const loaded = { ok: true, output: "skill 'using-superpowers' loaded (hash 82c5c8866ad7); its instructions are included in context" }
+
+  it('a loaded skill: its name opens SKILL.md as a skill tab in the workbench', async () => {
+    const open = vi.fn()
+    const openPath = vi.fn(() => open)
+    await render(<ToolCard item={tool('Skill', { name: 'using-superpowers' }, loaded)} openPath={openPath} />)
+    await act(async () => chip()!.click())
+    expect(openPath).toHaveBeenCalledWith('skill://using-superpowers')
+    expect(open).toHaveBeenCalledOnce()
+  })
+
+  it('stays a plain row when the skill did not load or nothing can open it', async () => {
+    const openPath = vi.fn(() => vi.fn())
+    await render(<ToolCard item={tool('Skill', { name: 'nope' }, { ok: true, output: "skill 'nope' not found; use Skill action:\"catalog\"" })} openPath={openPath} />)
+    expect(chip()).toBeUndefined()
+    await act(async () => root!.render(<ToolCard item={tool('Skill', { name: 'using-superpowers' }, loaded)} openPath={() => null} />))
+    expect(chip()).toBeUndefined()
+    expect(host.textContent).toContain('using-superpowers')
   })
 })

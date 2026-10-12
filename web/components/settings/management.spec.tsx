@@ -48,11 +48,9 @@ describe('agent runs panel', () => {
     expect(renderToStaticMarkup(<AgentRunsPanel workspaceId={null} rootSessionId={null} />)).toContain('No conversation selected')
   })
 
-  it('offers manual delegation and follows runs once a conversation is open', () => {
+  it('follows runs once a conversation is open, without a manual spawn form', () => {
     const html = renderToStaticMarkup(<AgentRunsPanel workspaceId="ws-1" rootSessionId="root" />)
-    expect(html).toContain('Spawn subagent')
-    expect(html).toContain('Subagent role')
-    expect(html).toContain('Subagent brief')
+    expect(html).not.toContain('Spawn subagent')
     expect(html).toContain('Active · 0')
     expect(html).toContain('Ended · 0')
   })

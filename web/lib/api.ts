@@ -532,6 +532,12 @@ export function readProjectFile(workspaceId: string, projectId: string, path: st
   return apiFetch(`${projectBase(workspaceId, projectId)}/file?path=${encodeURIComponent(path)}`).then((r) => json<ProjectFileView>(r))
 }
 
+/** One raw file from a memory folder (the project tier with `projectId`, else the workspace tier). */
+export function readMemoryFile(workspaceId: string, path: string, projectId?: string): Promise<ProjectFileView> {
+  const project = projectId !== undefined ? `&projectId=${encodeURIComponent(projectId)}` : ''
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/memory-file?path=${encodeURIComponent(path)}${project}`).then((r) => json<ProjectFileView>(r))
+}
+
 /** The URL that streams one project file as image/audio/video media. */
 export function projectMediaUrl(workspaceId: string, projectId: string, path: string): string {
   return `${projectBase(workspaceId, projectId)}/media?path=${encodeURIComponent(path)}`
@@ -661,7 +667,7 @@ export function getSessionModel(workspaceId: string, sessionId: string): Promise
 export function setSessionModel(
   workspaceId: string,
   sessionId: string,
-  update: Partial<Pick<SessionModel, 'provider' | 'model' | 'thinkingLevel'>>,
+  update: Partial<Pick<SessionModel, 'provider' | 'model' | 'thinkingLevel' | 'alias'>>,
 ): Promise<SessionModel> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/model`, {
     method: 'PUT',
@@ -789,6 +795,26 @@ export function setImageUnderstandingSettings(update: ImageUnderstandingSettings
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(update),
   }).then((r) => json<ImageUnderstandingSettings>(r))
+}
+
+/** Settings → Providers & Models → Videos: the provider/model the GenerateVideo tool calls. */
+export type VideoGenerationSettings = ImageGenerationSettings
+
+export function getVideoGenerationSettings(): Promise<VideoGenerationSettings> {
+  return apiFetch('/api/video-generation').then((r) => json<VideoGenerationSettings>(r))
+}
+
+export function setVideoGenerationSettings(update: VideoGenerationSettings): Promise<VideoGenerationSettings> {
+  return apiFetch('/api/video-generation', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(update),
+  }).then((r) => json<VideoGenerationSettings>(r))
+}
+
+/** The URL that streams a generated video (Range-capable, so players can seek). */
+export function videoUrl(workspaceId: string, id: string): string {
+  return `/api/workspaces/${encodeURIComponent(workspaceId)}/videos/${encodeURIComponent(id)}`
 }
 
 /** The URL that serves a stored attachment's bytes (previews, transcript). */
@@ -949,10 +975,17 @@ export function fetchContextBody(workspaceId: string, sessionId: string, hash: s
   })
 }
 
+export interface CompactResult {
+  readonly coversSeq: number
+  readonly summaryChars: number
+  /** Context tokens before/after; absent when the run was not measured. */
+  readonly tokensBefore?: number
+  readonly tokensAfter?: number
+}
 /** Manual compaction: older turns become an immutable checkpoint. */
-export function compactSession(workspaceId: string, sessionId: string): Promise<{ readonly coversSeq: number; readonly summaryChars: number }> {
+export function compactSession(workspaceId: string, sessionId: string): Promise<CompactResult> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/compact`, { method: 'POST' }).then((r) =>
-    json<{ readonly coversSeq: number; readonly summaryChars: number }>(r),
+    json<CompactResult>(r),
   )
 }
 

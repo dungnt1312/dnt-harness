@@ -303,6 +303,16 @@ describe('transcript grouping: hidden spawns and open turns', () => {
     expect(shape(groupBlocks(items))).toEqual(['user', 'activity:1:open'])
     expect(shape(groupBlocks(items.map((item) => item.kind === 'assistant' ? step(false) : item)))).toEqual(['user', 'activity:1:closed'])
   })
+  it('keeps a call still running out of the open run until it settles', () => {
+    const done = (id: string) => ({ kind: 'tool' as const, call: { id, name: 'Bash', args: {} }, result: { ok: true, output: 'x' } })
+    const running = { kind: 'tool' as const, call: { id: 'r', name: 'Bash', args: {} } }
+    const items = [{ kind: 'user' as const, content: 'go' }, step(true), done('a'), done('b'), running, step(true)]
+    expect(shape(groupBlocks(items))).toEqual(['user', 'activity:2:open', 'tool'])
+    expect(shape(groupBlocks([items[0]!, step(true), done('a'), running, step(true)]))).toEqual(['user', 'activity:1:open', 'tool'])
+    expect(shape(groupBlocks([items[0]!, step(true), running, step(true)]))).toEqual(['user', 'tool'])
+    // Settled: it joins the run again.
+    expect(shape(groupBlocks([items[0]!, step(true), done('a'), done('b'), { ...running, result: { ok: true, output: 'y' } }, step(true)]))).toEqual(['user', 'activity:3:open'])
+  })
 })
 
 describe('activity block summary', () => {
@@ -870,6 +880,19 @@ describe('transcript truthfulness', () => {
       ['mention', 'api.ts', 'Project file: web/lib/api.ts'],
     ])
     expect(host.querySelector('p')?.textContent).toBe('review check api.ts now')
+  })
+  it('a skill chip opens its SKILL.md when the name is a skill; other chips stay labels', async () => {
+    const open = vi.fn()
+    const openSkill = vi.fn((name: string) => (name === 'review' ? open : null))
+    await mount(<UserBubble item={{ kind: 'user', content: '/review check @web/lib/api.ts now' }} openSkill={openSkill} />)
+    const button = host.querySelector<HTMLButtonElement>('button[data-chip-kind="command"]')!
+    expect(button.getAttribute('aria-label')).toBe('Open skill review in workbench')
+    await act(async () => button.click())
+    expect(open).toHaveBeenCalledOnce()
+    expect(host.querySelector('button[data-chip-kind="mention"]')).toBeNull()
+    await mount(<UserBubble item={{ kind: 'user', content: '/compact now' }} openSkill={() => null} />)
+    expect(host.querySelector('button[data-chip-kind]')).toBeNull()
+    expect(host.querySelector('span[data-chip-kind="command"]')).not.toBeNull()
   })
 })
 
@@ -1474,7 +1497,7 @@ describe('sidebar sections + live rows + workspace management', () => {
 describe('per-folder show more', () => {
   const project = { id: 'pf', name: 'Long folder', workspaceId: 'w1', path: 'C:/long', createdAt: 1 }
   const now = Date.now()
-  const many = Array.from({ length: 7 }, (_, index) => ({
+  const many = Array.from({ length: 17 }, (_, index) => ({
     id: `m${index + 1}`,
     title: `Topic ${index + 1}`,
     projectId: 'pf',
@@ -1485,54 +1508,72 @@ describe('per-folder show more', () => {
     folder: null,
   }))
   const props = { sessions: many, projects: [project], filter: '', liveRunning: false, onSelect: () => {}, onRename: () => {}, onDeleteRequest: () => {} }
-  it('keeps a long folder to five rows and reveals the rest on demand', async () => {
+  it('keeps a long folder to five rows and reveals one more page per click', async () => {
     await mount(<SessionList {...props} current={null} />)
     expect(host.textContent).toContain('Topic 5')
     expect(host.textContent).not.toContain('Topic 6')
-    expect(button('Show more').getAttribute('aria-expanded')).toBe('false')
-    await act(async () => button('Show more').click())
-    expect(host.textContent).toContain('Topic 6')
-    expect(host.textContent).toContain('Topic 7')
-    expect(button('Show less').getAttribute('aria-expanded')).toBe('true')
-    await act(async () => button('Show less').click())
+    await act(async () => button('More').click())
+    expect(host.textContent).toContain('Topic 10')
+    expect(host.textContent).not.toContain('Topic 11')
+    await act(async () => button('More').click())
+    expect(host.textContent).toContain('Topic 15')
+    expect(host.textContent).not.toContain('Topic 16')
+    await act(async () => button('More').click())
+    expect(host.textContent).toContain('Topic 17')
+    // Everything is visible, so "More" retires and "Less" alone remains.
+    expect(button('More')).toBeUndefined()
+    await act(async () => button('Less').click())
     expect(host.textContent).not.toContain('Topic 6')
     expect(host.textContent).toContain('Topic 5')
   })
+  it('offers Less from the first mid-paging state onward', async () => {
+    await mount(<SessionList {...props} current={null} />)
+    await act(async () => button('More').click())
+    expect(button('Less')).toBeTruthy()
+    await act(async () => button('Less').click())
+    expect(host.textContent).not.toContain('Topic 6')
+    expect(host.textContent).toContain('Topic 5')
+    expect(button('Less')).toBeUndefined()
+  })
   it('never hides search matches behind the toggle', async () => {
     await mount(<SessionList {...props} current={null} filter="Topic" />)
-    expect(host.textContent).toContain('Topic 7')
-    expect(host.textContent).not.toContain('Show more')
+    expect(host.textContent).toContain('Topic 17')
+    expect(button('More')).toBeUndefined()
   })
   it('shows the open conversation past the cut without spilling the rest of the folder', async () => {
     await mount(<SessionList {...props} current="m6" />)
     expect(host.textContent).toContain('Topic 6')
     // Grafted onto the preview, not a forced full expansion.
     expect(host.textContent).not.toContain('Topic 7')
-    expect(button('Show more')).toBeTruthy()
+    expect(button('More')).toBeTruthy()
   })
   it('keeps an explicit expansion sticky when the selection moves on', async () => {
     await mount(<SessionList {...props} current={null} />)
-    await act(async () => button('Show more').click())
+    await act(async () => button('More').click())
     await act(async () => root!.render(<SessionList {...props} current="m2" />))
-    expect(host.textContent).toContain('Topic 7')
+    expect(host.textContent).toContain('Topic 10')
+    expect(host.textContent).not.toContain('Topic 11')
   })
   it('keeps an explicit expansion after a search comes and goes', async () => {
     await mount(<SessionList {...props} current={null} />)
-    await act(async () => button('Show more').click())
-    await act(async () => root!.render(<SessionList {...props} current={null} filter="Topic 7" />))
-    expect(host.textContent).toContain('Topic 7')
+    await act(async () => button('More').click())
+    await act(async () => root!.render(<SessionList {...props} current={null} filter="Topic 17" />))
+    expect(host.textContent).toContain('Topic 17')
     await act(async () => root!.render(<SessionList {...props} current={null} filter="" />))
-    expect(host.textContent).toContain('Topic 7')
+    expect(host.textContent).toContain('Topic 10')
+    expect(host.textContent).not.toContain('Topic 11')
   })
   it('reports expansion upward so the app shell keeps it across remounts', async () => {
     const onExpandFolder = vi.fn()
     await mount(<SessionList {...props} current={null} expandedFolders={{}} onExpandFolder={onExpandFolder} />)
-    await act(async () => button('Show more').click())
-    expect(onExpandFolder).toHaveBeenCalledWith('pf', true)
+    await act(async () => button('More').click())
+    expect(onExpandFolder).toHaveBeenCalledWith('pf', 5)
     // Simulates the shell remounting the sidebar with its persisted map.
-    await mount(<SessionList {...props} current={null} expandedFolders={{ pf: true }} />)
-    expect(host.textContent).toContain('Topic 7')
-    expect(button('Show less')).toBeTruthy()
+    await mount(<SessionList {...props} current={null} expandedFolders={{ pf: 5 }} />)
+    expect(host.textContent).toContain('Topic 10')
+    // Ten of seventeen rows shown is still mid-paging, so "More" stays available.
+    expect(button('More')).toBeTruthy()
+    expect(button('Less')).toBeTruthy()
   })
 })
 

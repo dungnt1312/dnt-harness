@@ -25,7 +25,7 @@ describe('compaction lifecycle projection', () => {
     expect(running[0]?.trigger).toBe('manual')
     expect(running[0]?.model).toBe('GLM-x')
 
-    const end = event({ type: 'compaction/end', trigger: 'manual', model: 'GLM-x', coversSeq: 12, summaryChars: 525, durationMs: 3400, summary: 'THE SUMMARY' })
+    const end = event({ type: 'compaction/end', trigger: 'manual', model: 'GLM-x', coversSeq: 12, summaryChars: 525, durationMs: 3400, summary: 'THE SUMMARY', tokensBefore: 90_000, tokensAfter: 30_000 })
     const done = compactionItems([start, end])
     expect(done).toHaveLength(1)
     expect(done[0]?.status).toBe('completed')
@@ -33,6 +33,8 @@ describe('compaction lifecycle projection', () => {
     expect(done[0]?.summaryChars).toBe(525)
     expect(done[0]?.durationMs).toBe(3400)
     expect(done[0]?.summary).toBe('THE SUMMARY')
+    expect(done[0]?.tokensBefore).toBe(90_000)
+    expect(done[0]?.tokensAfter).toBe(30_000)
   })
 
   it('a dangling start with nothing after it stays running; log movement makes it interrupted', () => {

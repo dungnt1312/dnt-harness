@@ -8,7 +8,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
+import { createWebServer, withoutSentStamp, type LlmProvider, type WebServer } from 'dnt-harness'
 
 let root = ''
 let projA = ''
@@ -159,7 +159,7 @@ describe('workspace HTTP surface', () => {
       name: 'memory-reader', models: ['memory-reader'],
       async *stream(request) {
         if (!request.messages.some((message) => message.role === 'tool')) {
-          const target = request.messages.some((message) => message.role === 'user' && message.content === 'memory index') ? memoryPath : 'marker.txt'
+          const target = request.messages.some((message) => message.role === 'user' && typeof message.content === 'string' && withoutSentStamp(message.content) === 'memory index') ? memoryPath : 'marker.txt'
           yield { type: 'toolCalls', calls: [{ id: 'read-memory', name: 'Read', args: { path: target } }] }
           yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
           return

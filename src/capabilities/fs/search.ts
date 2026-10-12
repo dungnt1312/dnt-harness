@@ -155,10 +155,24 @@ export async function searchFiles(
   const checkAbort = (): void => { if (exec.signal?.aborted) throw new Error('cancelled: stop requested during search') }
   checkAbort()
   const patterns = options.patterns?.map(compile)
-  const grant = classifyGrantedRoots(grantedRoots(exec), base)
+  // An approved out-of-grant folder is this call's (read-only) search root.
+  const approvedRoots = (exec.approvedPaths ?? []).map((entry) => ({ path: entry.path, access: 'read' as const }))
+  const grant = classifyGrantedRoots([...grantedRoots(exec), ...approvedRoots], base)
   if (grant === undefined) throw new Error('search base is outside granted folders')
   const grantRoot = path.resolve(grant.path)
   if (!await noSymlinkPath(grantRoot, base, exec)) return result
+  // A base that is one file is that file: naming it explicitly overrides
+  // ignore rules, as an explicit file pattern does. Without this the walk
+  // below would look for `<file>/.gitignore` and read `<file>` as a folder.
+  if (patterns === undefined) {
+    let stat
+    try { stat = await fs.lstat(base) } catch { stat = undefined }
+    checkAbort()
+    if (stat?.isFile() === true) {
+      result.files.push(base)
+      return result
+    }
+  }
 
   async function loadRules(dir: string, layers: Layer[]): Promise<Layer[]> {
     if (options.includeIgnored || exec.memoryRoots?.some((root) => within(root, dir))) return layers

@@ -39,9 +39,9 @@ const STATUS_MARK: Readonly<Record<GitChangeStatus, string>> = {
  * open. It never stages, commits, or discards.
  *
  * `pathFilter` narrows the list to the files one turn's Write/Edit calls
- * recorded (project-relative, from the TurnChangesCard's Review all). The
- * rows are still git's own status rows — the filter only hides the rest,
- * and the header says so. `onShowAll` clears it.
+ * recorded (project-relative, from the TurnChangesCard's "Open in Git"). The
+ * rows are still git's own status rows — every uncommitted change in those
+ * files, not the turn's alone — and the banner says so. `onShowAll` clears it.
  *
  * `focusPath` opens with one row already expanded to its diff (a chat card's
  * file click); another click from chat moves the expansion, while toggling
@@ -138,7 +138,7 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
   const focusNote = focusPath !== undefined && focusPath !== null && focusPath !== '' && !loading && report !== null && !changes.some((change) => change.path === focusPath)
     ? (
       <p className="m-0 px-2.5 py-2 text-xs text-fg-faint" role="note">
-        {focusPath} no longer differs from HEAD — a later turn may have changed it back.
+        {focusPath} no longer differs from HEAD: it was committed, or a later change put it back. The chat card still shows what the turn did.
       </p>
     )
     : null
@@ -148,7 +148,9 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
       {pathFilter !== undefined && pathFilter.length > 0 ? (
         <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line bg-muted/40 px-2.5 text-[12px]">
           <Icon name="squarePen" size={13} className="shrink-0 text-fg-muted" />
-          <span className="min-w-0 flex-1 truncate text-fg-muted">Showing the files this turn's writes recorded</span>
+          <span className="min-w-0 flex-1 truncate text-fg-muted" title="Git compares the working tree with HEAD, so a file's lines include every uncommitted change, not only this turn's.">
+            This turn's files · git diff vs HEAD, all uncommitted changes
+          </span>
           {onShowAll !== undefined ? (
             <button
               type="button"
@@ -188,7 +190,7 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
               {report?.branch === null
                 ? 'This folder is not a git repository.'
                 : pathFilter !== undefined && pathFilter.length > 0
-                  ? 'None of the files this turn wrote differ from HEAD right now — later turns may have changed them back. Show all for the whole project.'
+                  ? 'None of the files this turn wrote differ from HEAD right now: they were committed, or later changes put them back. The chat card still shows what the turn did. Show all for the whole project.'
                   : 'The working tree matches HEAD.'}
             </p>
           </div>
@@ -240,14 +242,16 @@ function ChangeRow({ change, open, onToggle, onOpenFile, rowRef }: {
   const name = change.path.split('/').pop() ?? change.path
   const directory = change.path.slice(0, change.path.length - name.length).replace(/\/$/, '')
   return (
-    <div className="relative flex items-center gap-0.5 group/row">
+    // One hover surface for the whole line, opener included: the band never
+    // breaks where the overlaid button begins.
+    <div className={cn('relative flex items-center rounded-md transition-colors hover:bg-hover group/row', open && 'bg-hover')}>
       <button
         ref={rowRef}
         type="button"
         aria-expanded={open}
         title={change.previousPath !== undefined ? `${change.previousPath} → ${change.path}` : change.path}
         onClick={onToggle}
-        className={cn('flex min-h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px] hover:bg-hover', open && 'bg-hover')}
+        className="flex min-h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px]"
       >
         <Icon name="chevronRight" size={12} className={cn('shrink-0 text-fg-faint transition-transform', open && 'rotate-90')} />
         <span className={cn('w-3 shrink-0 text-center font-mono text-[11px] font-semibold', markColor(change.status))} aria-label={STATUS_LABEL[change.status]}>{STATUS_MARK[change.status]}</span>
@@ -259,7 +263,7 @@ function ChangeRow({ change, open, onToggle, onOpenFile, rowRef }: {
         <LineCount
           {...(change.added !== undefined ? { added: change.added } : {})}
           {...(change.removed !== undefined ? { removed: change.removed } : {})}
-          className={cn(onOpenFile !== undefined && 'transition-opacity group-hover/row:opacity-0 group-focus-within/row:opacity-0 [@media(pointer:coarse)]:opacity-100')}
+          className={cn(onOpenFile !== undefined && 'transition-opacity group-hover/row:opacity-0 group-has-[:focus-visible]/row:opacity-0 [@media(pointer:coarse)]:opacity-100')}
         />
       </button>
       {onOpenFile !== undefined ? (
@@ -270,9 +274,11 @@ function ChangeRow({ change, open, onToggle, onOpenFile, rowRef }: {
           // actions take no room and never push the line counts; the counts
           // themselves fade out underneath. `invisible` keeps the hidden
           // button from intercepting the row's clicks. Always on for touch.
-          className="mr-1 absolute right-0 bg-surface opacity-0 invisible transition-opacity group-hover/row:visible group-hover/row:opacity-100 group-focus-within/row:visible group-focus-within/row:opacity-100 focus-visible:visible focus-visible:opacity-100 [@media(pointer:coarse)]:visible [@media(pointer:coarse)]:opacity-100"
+          // Keyboard focus reveals it; a mouse click on the row (which keeps
+          // focus there) does not, or it would linger beside the diff's own.
+          className={OPENER_REVEAL_ROW}
         >
-          <Icon name="fileText" size={13} />
+          <Icon name="fileText" size={12} />
         </IconButton>
       ) : null}
     </div>
@@ -355,9 +361,15 @@ function DiffOpenFile({ name, onOpenFile }: { readonly name: string; readonly on
     <IconButton
       label={`Open ${name} in workbench`}
       onClick={onOpenFile}
-      className="absolute right-1 top-1 z-10 bg-surface opacity-0 invisible transition-opacity group-hover/diff:visible group-hover/diff:opacity-100 group-focus-within/diff:visible group-focus-within/diff:opacity-100 focus-visible:visible focus-visible:opacity-100 [@media(pointer:coarse)]:visible [@media(pointer:coarse)]:opacity-100"
+      className={OPENER_REVEAL_DIFF}
     >
-      <Icon name="fileText" size={13} />
+      <Icon name="fileText" size={12} />
     </IconButton>
   )
 }
+
+/** Quiet 24px opener: no fill of its own, only a text-color change on hover. */
+const OPENER_BASE = 'absolute size-6 rounded-md text-fg-faint hover:bg-transparent hover:text-fg opacity-0 invisible transition-opacity focus-visible:visible focus-visible:opacity-100 [@media(pointer:coarse)]:visible [@media(pointer:coarse)]:opacity-100'
+const OPENER_REVEAL_ROW = cn(OPENER_BASE, 'right-1 top-1/2 -translate-y-1/2 group-hover/row:visible group-hover/row:opacity-100 group-has-[:focus-visible]/row:visible group-has-[:focus-visible]/row:opacity-100')
+// Over diff lines the opener needs a backdrop, or the code shows through it.
+const OPENER_REVEAL_DIFF = cn(OPENER_BASE, 'right-1.5 top-1.5 z-10 border border-line bg-surface/90 backdrop-blur-sm hover:bg-surface/90 group-hover/diff:visible group-hover/diff:opacity-100 group-has-[:focus-visible]/diff:visible group-has-[:focus-visible]/diff:opacity-100')

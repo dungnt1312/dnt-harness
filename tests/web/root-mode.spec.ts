@@ -8,7 +8,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type ModelRequest, type WebServer } from 'dnt-harness'
+import { createWebServer, withoutSentStamp, type LlmProvider, type ModelRequest, type WebServer } from 'dnt-harness'
 
 const servers: WebServer[] = []
 const homes: string[] = []
@@ -66,7 +66,7 @@ describe('root-owned mode', () => {
       name: 'spy', models: ['spy'],
       async *stream(request: ModelRequest) {
         const first = request.messages.find((message) => message.role === 'user')
-        requests.push({ sid: typeof first?.content === 'string' ? first.content : undefined, tools: (request.tools ?? []).map((tool) => tool.name) })
+        requests.push({ sid: typeof first?.content === 'string' ? withoutSentStamp(first.content) : undefined, tools: (request.tools ?? []).map((tool) => tool.name) })
         yield { type: 'delta', delta: 'ok' }
       },
     }

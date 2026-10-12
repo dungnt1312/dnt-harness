@@ -94,6 +94,9 @@ export interface SseEvent {
   readonly matcher?: string
   readonly exitCode?: number | null
   readonly durationMs?: number
+  /** `hook/run` of an `async` / `asyncRewake` hook, and what its rewake did. */
+  readonly background?: true
+  readonly rewake?: 'woke' | 'dropped' | 'capped' | 'broken-install'
   /** MCP call audit trail. */
   readonly server?: string
   readonly tool?: string
@@ -111,7 +114,13 @@ export interface SseEvent {
   readonly model?: string
   readonly coversSeq?: number
   readonly summaryChars?: number
-  /** The stored summary itself; present on a successful compaction/end. */
+  /** Estimated context tokens before/after a successful compaction/end. */
+  readonly tokensBefore?: number
+  readonly tokensAfter?: number
+  /**
+   * The stored summary itself on a successful compaction/end; on a hook
+   * rewake (`origin: 'hook'`) the one line the user sees.
+   */
   readonly summary?: string
   /** Set on a failed compaction/end. */
   readonly error?: string
@@ -422,6 +431,8 @@ export interface ModelDefaults {
   readonly provider: string | null
   readonly model: string | null
   readonly thinkingLevel: string | null
+  /** Alias the pair was picked through; display-only, absent for a direct model pick. */
+  readonly alias?: string | null
 }
 
 /** Effective controls for one conversation. `source: 'global'` is a legacy log that follows live global defaults; session nulls are explicit blanks. */
@@ -587,12 +598,20 @@ export interface EffectiveHookRow {
   readonly matcher: string
   readonly command: string
   readonly timeout?: number
-  readonly layer: 'user' | 'workspace' | 'project' | 'local'
+  readonly layer: 'user' | 'plugin' | 'workspace' | 'project' | 'local'
   readonly source: string
   /** False when switched off for this workspace. */
   readonly active: boolean
   /** False for Claude events dnt-harness does not fire yet. */
   readonly supported: boolean
+  /** Claude `if` filter (permission-rule syntax). */
+  readonly if?: string
+  /** Runs in the background (`async`). */
+  readonly async?: true
+  /** Runs in the background and may wake the model on exit 2. */
+  readonly asyncRewake?: true
+  /** The plugin that contributes the hook. */
+  readonly plugin?: { readonly id: string }
 }
 
 /** GET /hooks: the workspace layer plus every layer that applies. */

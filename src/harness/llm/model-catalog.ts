@@ -267,8 +267,9 @@ const MODEL_CATALOG_PATTERNS: readonly ModelPattern<ModelMetadata>[] = [
 
 /**
  * Metadata family fallback for ids the anchored rules and exact catalog do
- * not know (a new GPT/Claude/Gemini release, a gateway alias). Vision only:
- * every documented model in these families accepts images (verified against
+ * not know (a new GPT/Claude/Gemini/GLM release, a gateway alias). Vision only:
+ * every documented GPT/Claude/Gemini model accepts images, while GLM chat
+ * models are text-only outside their `v` SKUs (verified against
  * vendor docs, 2026-09), and the context window still resolves through the
  * known-family rules — these families' windows vary by SKU, so guessing one
  * here would be worse than the heuristic.
@@ -277,6 +278,11 @@ const MODEL_METADATA_FALLBACK_PATTERNS: readonly ModelPattern<ModelMetadata>[] =
   { pattern: /gpt/, value: { kind: 'chat', vision: true } },
   { pattern: /claude/, value: { kind: 'chat', vision: true } },
   { pattern: /gemini/, value: { kind: 'chat', vision: true } },
+  // Zhipu ships vision only as separate `v` SKUs (glm-4v, glm-4.5v,
+  // glm-5v-turbo); every other GLM chat model is text-only. A new release
+  // must not receive image bytes it rejects with HTTP 400.
+  { pattern: /^glm-\d+(?:\.\d+)?v(?:[-:].*)?$/, value: { kind: 'chat', vision: true } },
+  { pattern: /^glm-/, value: { kind: 'chat', vision: false } },
 ]
 
 /** Returns verified catalog metadata and reasoning controls for an exact ID. */

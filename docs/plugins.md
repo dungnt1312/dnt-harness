@@ -12,10 +12,11 @@ Implementation: `src/harness/commands/`, `src/harness/plugins/`,
 
 Sources, lowest to highest precedence:
 
-1. `~/.claude/commands/`
-2. commands contributed by enabled plugins (namespaced `plugin:command`)
-3. `<workspace>/commands/`
-4. ancestor/project `.claude/commands/` folders, nearest project folder wins
+1. bundled: the app's own `commands/` folder (read-only, see below)
+2. `~/.claude/commands/`
+3. commands contributed by enabled plugins (namespaced `plugin:command`)
+4. `<workspace>/commands/`
+5. ancestor/project `.claude/commands/` folders, nearest project folder wins
 
 Every Markdown file is a command. Subfolders create `:` namespaces:
 `.claude/commands/git/commit.md` is `/git:commit`. A folder containing
@@ -53,6 +54,30 @@ well as skills unless `disable-model-invocation: true`. A command loaded by the
 model applies its `allowed-tools` and `model` to the rest of that turn, as a
 typed `/name` does.
 
+### Bundled commands: `/image` and `/video`
+
+The repository's `commands/` folder ships with the app. `src/bins/web.ts` passes
+it as `bundledCommandsDir`, as it does for the bundled skills. It is the lowest
+layer, so a user, plugin, workspace, or project command of the same name
+replaces it. It is read-only, and the file tools cannot reach it (it is a
+protected root). The `/` menu lists these commands with source `bundled`.
+
+- `/image <description>` asks the model to call `GenerateImage` with that
+  description. The command grants `allowed-tools: GenerateImage`.
+- `/video <description>` asks the model to call `GenerateVideo`. It animates an
+  image attached to the same message through that image's `attachmentId`, or
+  makes a text-to-video call without one. The command grants
+  `allowed-tools: GenerateVideo`.
+
+Typing the command is the decision to spend, so the Ask before changes and Edit
+automatically modes do not ask a second time. The grant is the command's own
+turn and one tool: it never lifts a deny, a guard question, or a model-initiated
+call. A model that calls `GenerateImage` on its own still asks. Both commands set
+`disable-model-invocation: true`, so the model cannot start them through the
+`Skill` tool. They need the tool to be exposed: in Plan, which exposes neither
+tool, the model is told what was asked but cannot generate. An empty `/image`
+tells the model to ask what to create rather than call the tool.
+
 ## Plugin format
 
 A plugin may contain:
@@ -80,10 +105,9 @@ allowed. Plugin components are namespaced:
 
 Plugin hooks merge with settings hooks. `${CLAUDE_PLUGIN_ROOT}` and
 `${CLAUDE_PLUGIN_DATA}` are substituted and exported to hook processes.
-Plugin hook fields dnt-harness cannot faithfully run (`if`, async hooks and
-`asyncRewake`) are skipped with diagnostics rather than run unconditionally.
-Unsupported plugin components (LSP, output styles, themes, `userConfig`, …)
-are reported as notes.
+Plugin hooks support Claude's `if`, `async` and `asyncRewake` fields; their
+semantics are in `claude-format.md` (Hooks). Unsupported plugin components
+(LSP, output styles, themes, `userConfig`, …) are reported as notes.
 
 ## Store and marketplaces
 

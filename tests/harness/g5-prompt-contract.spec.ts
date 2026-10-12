@@ -24,8 +24,11 @@ import {
   DEFAULT_BASE_SYSTEM,
   DEFAULT_CHILD_SYSTEM,
   DEFAULT_BUDGET,
+  formatSentStamp,
   messageText,
   renderEnvironmentContext,
+  SENT_STAMP_LINE,
+  withoutSentStamp,
   wrapUntrusted,
   type ActiveSkill,
   type MemorySnippet,
@@ -62,7 +65,7 @@ const ENV_BLOCK = renderEnvironmentContext({
   gitBranch: 'main',
 })!
 
-const contents = (messages: readonly ModelMessage[]): string[] => messages.map((message) => messageText(message.content))
+const contents = (messages: readonly ModelMessage[]): string[] => messages.map((message) => withoutSentStamp(messageText(message.content)))
 
 function baseRoot(overrides: Record<string, unknown> = {}) {
   return buildContext({
@@ -130,6 +133,33 @@ describe('root layout (golden)', () => {
     const texts = contents(nonSystem)
     expect(texts).toContain('hello')
     expect(texts).toContain('golden')
+  })
+
+  it('typed user messages carry their [sent …] time from the log; host-originated ones do not', () => {
+    const log = eventsOf([
+      { type: 'turn/start', turnId: 't1' },
+      { type: 'user/message', turnId: 't1', content: 'typed' },
+      { type: 'user/message', turnId: 't1', content: 'EXPANDED', origin: 'command' },
+      { type: 'user/message', turnId: 't1', content: 'HOOK-CONTEXT', origin: 'context' },
+    ]).map((event, index) => ({ ...event, timestamp: Date.UTC(2026, 9, 12, 5, 28) + index * 60_000 }) as SessionEvent)
+    const users = baseRoot({ events: log }).messages.filter((message) => message.role === 'user').map((message) => messageText(message.content))
+    expect(users[0]).toBe(`${formatSentStamp(Date.UTC(2026, 9, 12, 5, 29))}\ntyped`)
+    expect(users[0]).toMatch(SENT_STAMP_LINE)
+    expect(users.slice(1)).toEqual(['EXPANDED', 'HOOK-CONTEXT'])
+  })
+
+  it('the prefix ahead of history is byte-stable across minutes of one day', () => {
+    // Two requests of one conversation, minutes apart, the second after a
+    // further tool step: every message before history must match exactly so
+    // the provider's prompt cache survives the clock.
+    const at = (iso: string) => baseRoot({ environment: renderEnvironmentContext({ now: new Date(iso), platform: 'darwin', workspacePath: '/tmp/proj' })! })
+    const early = at('2026-10-06T09:01:00')
+    const late = at('2026-10-06T16:47:00')
+    const prefix = (assembled: ReturnType<typeof baseRoot>) => assembled.messages.filter((message) => message.role === 'system').map((message) => messageText(message.content))
+    expect(prefix(late)).toEqual(prefix(early))
+    // History renders identically too: the stamp is a log fact, not the clock.
+    const history = (assembled: ReturnType<typeof baseRoot>) => assembled.messages.filter((message) => message.role !== 'system').map((message) => messageText(message.content))
+    expect(history(late)).toEqual(history(early))
   })
 
   it('trusted prose never appears inside an envelope; untrusted bodies never appear outside one', () => {
@@ -299,7 +329,9 @@ describe('environment block rendering', () => {
     // The rendered LOCAL time depends on the host zone, so assert shape, not
     // the exact clock: the date line exists and is date + weekday + time.
     expect(block).toContain('<environment_context>')
-    expect(block).toMatch(/Today: 2026-10-0[56] (Monday|Tuesday) · \d{2}:\d{2} [+-]\d{2}:\d{2}|Z/)
+    // The DAY only: a time of day here would move the cached prefix every minute.
+    expect(block).toMatch(/Today: 2026-10-0[56] (Monday|Tuesday) \(timezone (?:[+-]\d{2}:\d{2}|Z)\)\n/)
+    expect(block).not.toMatch(/\d{2}:\d{2} [+-]/)
     expect(block).toContain('Platform: linux x64')
     expect(block).not.toContain('Workspace:')
     expect(block).toContain('</environment_context>')

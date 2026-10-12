@@ -254,6 +254,47 @@ describe('workspace session model controls', () => {
   })
 })
 
+describe('model alias label on the picked pair', () => {
+  it('stores the alias beside the pair, survives restart, follows thinking-only edits, and clears on a direct pick', async () => {
+    const seen: { model?: string; provider?: string; thinkingLevel?: string }[] = []
+    const { base, home } = await start([provider('alpha', ['a1', 'a2'], seen)])
+    const workspaceId = await firstWorkspace(base)
+    const { id } = (await (await post(base, `/api/workspaces/${workspaceId}/sessions`)).json()) as { id: string }
+    const route = `/api/workspaces/${workspaceId}/sessions/${id}/model`
+
+    const picked = await put(base, route, { provider: 'alpha', model: 'a2', alias: 'fast' })
+    expect(await picked.json()).toMatchObject({ provider: 'alpha', model: 'a2', alias: 'fast', source: 'session' })
+    // A pick through an alias is also what the next conversation opens on.
+    expect(await (await fetch(`${base}/api/model-defaults`)).json()).toMatchObject({ provider: 'alpha', model: 'a2', alias: 'fast' })
+
+    // A thinking-only edit is not a new pick: the label stays.
+    expect(await (await put(base, route, { thinkingLevel: 'high' })).json()).toMatchObject({ alias: 'fast', thinkingLevel: 'high' })
+
+    await servers.pop()!.close()
+    const restarted = await createWebServer({ home, providers: [provider('alpha', ['a1', 'a2'], seen)], configFile: path.join(home, 'providers.json') })
+    servers.push(restarted)
+    expect(await (await fetch(`${restarted.url}${route}`)).json()).toMatchObject({ provider: 'alpha', model: 'a2', alias: 'fast' })
+
+    // Picking the same model directly drops the label: it names how the pair was chosen.
+    const direct = (await (await put(restarted.url, route, { provider: 'alpha', model: 'a2' })).json()) as Record<string, unknown>
+    expect(direct['alias']).toBeUndefined()
+    expect(((await (await fetch(`${restarted.url}/api/model-defaults`)).json()) as Record<string, unknown>)['alias']).toBeUndefined()
+  })
+
+  it('snapshots the draft alias at creation and rejects a malformed alias', async () => {
+    const seen: { model?: string; provider?: string; thinkingLevel?: string }[] = []
+    const { base } = await start([provider('alpha', ['a1', 'a2'], seen)])
+    const workspaceId = await firstWorkspace(base)
+    const created = await post(base, `/api/workspaces/${workspaceId}/sessions`, { controls: { provider: 'alpha', model: 'a1', thinkingLevel: null, alias: 'quick' } })
+    const { id } = (await created.json()) as { id: string }
+    expect(await (await fetch(`${base}/api/workspaces/${workspaceId}/sessions/${id}/model`)).json()).toMatchObject({ model: 'a1', alias: 'quick' })
+
+    expect((await post(base, `/api/workspaces/${workspaceId}/sessions`, { controls: { provider: 'alpha', model: 'a1', thinkingLevel: null, alias: 5 } })).status).toBe(400)
+    expect((await put(base, `/api/workspaces/${workspaceId}/sessions/${id}/model`, { alias: '' })).status).toBe(400)
+    expect((await put(base, '/api/model-defaults', { provider: 'alpha', model: 'a1', alias: 7 })).status).toBe(400)
+  })
+})
+
 describe('global durable model defaults', () => {
   it('persists one global default across restart and every workspace while retaining old snapshots', async () => {
     const seen: { model?: string; provider?: string; thinkingLevel?: string }[] = []

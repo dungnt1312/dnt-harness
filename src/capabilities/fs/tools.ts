@@ -18,7 +18,7 @@ import { displayPath, resolveInGrants } from './grants.ts'
 import { expandGlob, searchFiles, searchOutput } from './search.ts'
 import { canonical, observe, replaceFile, requirementFor, withFileLock } from './observation.ts'
 import { findEditMatch, foldEol, formatLines, type MatchStrategy } from './edit-match.ts'
-import { GrepTimeoutError, runGrep } from './grep-worker.ts'
+import { GrepTimeoutError, runGrep, type GrepMode } from './grep-worker.ts'
 import {
   BinaryFileError,
   decodeDocument,
@@ -103,10 +103,10 @@ async function readBytes(abs: string, rel: string): Promise<Buffer | undefined> 
 function assertObserved(exec: ToolExecution, target: string, rel: string, currentHash: string, explicit: unknown, verb: string): void {
   const requirement = requirementFor(exec, target, explicit)
   if (requirement.kind === 'missing') {
-    throw new Error(`conflict: ${rel} was never read by this conversation; Read it before ${verb} it`)
+    throw new Error(`conflict: ${rel} was never read by this conversation; Read it before ${verb} it, using the Read tool (output from cat, sed or other Bash commands does not count)`)
   }
   if (requirement.kind === 'check' && currentHash !== requirement.hash) {
-    throw new Error(`conflict: ${rel} changed on disk since this conversation last read it (another session, a command, or the user); re-read it, then retry`)
+    throw new Error(`conflict: ${rel} changed on disk since this conversation last read it (another session, a command, or the user); re-read it with the Read tool, then retry`)
   }
 }
 
@@ -144,6 +144,7 @@ export function readTool(): ToolDefinition {
       'Reading records the file for a later Write/Edit by this conversation.',
     ].join(' '),
     requiresRoot: true,
+    readOnly: true,
     parameters: {
       type: 'object',
       properties: {
@@ -350,6 +351,7 @@ export function globTool(): ToolDefinition {
     description:
       'List files matching a glob pattern (`*` within a segment, `**` for zero or more segments, `{a,b}` for choices; at most 64 expansions, no nested braces). Project .gitignore rules and common generated folders are skipped by default. Explicit file/directory patterns or a path inside an ignored folder override ignores only for that scope; includeIgnored searches all. Incomplete searches carry an explicit warning, not an exhaustive no matches. Paths inside the workspace are shown relative to it; paths in other granted folders are absolute.',
     requiresRoot: true,
+    readOnly: true,
     parameters: {
       type: 'object',
       properties: {
@@ -370,35 +372,140 @@ export function globTool(): ToolDefinition {
   }
 }
 
-/** The `Grep` tool: regex search across workspace files, `path:line: text`. */
+/** Most context lines Grep shows on either side of a match. */
+const GREP_MAX_CONTEXT = 50
+
+/**
+ * File-type shorthands for Grep's `type` argument (ripgrep-style names),
+ * each a set of file-name extensions.
+ */
+const GREP_TYPES: Readonly<Record<string, readonly string[]>> = {
+  ts: ['.ts', '.tsx', '.mts', '.cts'],
+  js: ['.js', '.jsx', '.mjs', '.cjs'],
+  py: ['.py', '.pyi'],
+  go: ['.go'],
+  rust: ['.rs'],
+  java: ['.java'],
+  kotlin: ['.kt', '.kts'],
+  swift: ['.swift'],
+  c: ['.c', '.h'],
+  cpp: ['.cpp', '.cc', '.cxx', '.hpp', '.hh', '.hxx', '.h'],
+  cs: ['.cs'],
+  rb: ['.rb'],
+  php: ['.php'],
+  sh: ['.sh', '.bash', '.zsh'],
+  json: ['.json', '.jsonc'],
+  yaml: ['.yaml', '.yml'],
+  toml: ['.toml'],
+  md: ['.md', '.mdx'],
+  css: ['.css', '.scss', '.sass', '.less'],
+  html: ['.html', '.htm'],
+  sql: ['.sql'],
+  vue: ['.vue'],
+  svelte: ['.svelte'],
+}
+
+function grepInteger(args: Record<string, unknown>, key: string, max: number): number | undefined {
+  const value = positiveInteger(args, key)
+  return value === undefined ? undefined : Math.min(value, max)
+}
+
+function grepMode(args: Record<string, unknown>): GrepMode {
+  const value = args['output_mode']
+  if (value === undefined) return 'content'
+  if (value === 'content' || value === 'files_with_matches' || value === 'count') return value
+  throw new Error("argument 'output_mode' must be 'content', 'files_with_matches' or 'count'")
+}
+
+/** Narrow the candidate files by `glob` (file-name or relative-path glob) and `type`. */
+function grepFileFilter(args: Record<string, unknown>, base: string): ((full: string) => boolean) | undefined {
+  const globArg = args['glob']
+  const typeArg = args['type']
+  if (globArg !== undefined && typeof globArg !== 'string') throw new Error("argument 'glob' must be a string")
+  if (typeArg !== undefined && typeof typeArg !== 'string') throw new Error("argument 'type' must be a string")
+  let extensions: readonly string[] | undefined
+  if (typeArg !== undefined && typeArg !== '') {
+    extensions = GREP_TYPES[typeArg.toLowerCase()]
+    if (extensions === undefined) throw new Error(`unknown Grep type '${typeArg}'; known types: ${Object.keys(GREP_TYPES).join(', ')}`)
+  }
+  // `*.ts` matches a file name anywhere (as ripgrep's --glob does); a glob
+  // with a `/` matches the path relative to the search base.
+  const globs = globArg !== undefined && globArg !== '' ? expandGlob(globArg).map((choice) => ({ regex: globRegExp(choice), byPath: choice.includes('/') })) : undefined
+  if (extensions === undefined && globs === undefined) return undefined
+  return (full) => {
+    const name = path.basename(full)
+    if (extensions !== undefined && !extensions.some((ext) => name.toLowerCase().endsWith(ext))) return false
+    if (globs !== undefined) {
+      const relative = path.relative(base, full).split(path.sep).join('/')
+      if (!globs.some(({ regex, byPath }) => regex.test(byPath ? relative : name))) return false
+    }
+    return true
+  }
+}
+
+/** `*` stays inside a segment, `**` crosses segments; everything else is literal. */
+function globRegExp(glob: string): RegExp {
+  let source = ''
+  for (let index = 0; index < glob.length; index++) {
+    const char = glob[index] as string
+    if (char === '*' && glob[index + 1] === '*') {
+      // `**/` also matches zero folders.
+      if (glob[index + 2] === '/') { source += '(?:.*/)?'; index += 2 } else { source += '.*'; index += 1 }
+    } else if (char === '*') source += '[^/]*'
+    else if (char === '?') source += '[^/]'
+    else source += char.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+  }
+  return new RegExp(`^${source}$`)
+}
+
+/** The `Grep` tool: regex search across workspace files. */
 export function grepTool(): ToolDefinition {
   return {
     name: 'Grep',
     description:
-      'Search files with a regular expression; returns `path:line: text` matches. Project .gitignore rules and common generated folders are skipped; point path inside an ignored folder or set includeIgnored to search it. Incomplete searches carry an explicit warning, not an exhaustive no matches. Paths inside the workspace are shown relative to it; paths in other granted folders are absolute.',
+      'Search file contents with a JavaScript regular expression. Use this instead of grep/rg in Bash. output_mode `content` (default) returns `path:line: text` rows (context lines as `path-line- text`, groups split by `--`); `files_with_matches` lists matching files; `count` gives `path:N` per file. Narrow with `path` (a folder or one file), `glob` and `type`. Project .gitignore rules and common generated folders are skipped; point path inside an ignored folder or set includeIgnored to search it. Incomplete searches carry an explicit warning, not an exhaustive no matches. Paths inside the workspace are shown relative to it; paths in other granted folders are absolute.',
     requiresRoot: true,
+    readOnly: true,
     parameters: {
       type: 'object',
       properties: {
-        pattern: { type: 'string', description: 'regular expression to search for' },
-        path: { type: 'string', description: 'optional directory to search within; may be absolute inside a granted folder' },
+        pattern: { type: 'string', description: 'regular expression to search for (JavaScript syntax; escape literal braces/parens)' },
+        path: { type: 'string', description: 'optional folder or single file to search (default: the workspace root); may be absolute inside a granted folder' },
+        glob: { type: 'string', description: 'only search files matching this glob, e.g. `*.tsx`, `*.{ts,tsx}` or `src/**/*.ts` (a glob with `/` matches the path relative to `path`)' },
+        type: { type: 'string', description: `only search this file type: ${Object.keys(GREP_TYPES).join(', ')}` },
+        output_mode: { type: 'string', enum: ['content', 'files_with_matches', 'count'], description: 'content (default): matching lines; files_with_matches: file paths only; count: matches per file' },
+        '-i': { type: 'boolean', description: 'case-insensitive search' },
+        '-A': { type: 'number', description: `lines of context after each match (content mode, max ${GREP_MAX_CONTEXT})` },
+        '-B': { type: 'number', description: `lines of context before each match (content mode, max ${GREP_MAX_CONTEXT})` },
+        '-C': { type: 'number', description: `lines of context before and after each match (content mode, max ${GREP_MAX_CONTEXT})` },
+        head_limit: { type: 'number', description: `stop after this many matches (content) or files (other modes); default and max ${GREP_CAP}` },
         includeIgnored: { type: 'boolean', description: 'set true to bypass .gitignore and default generated-folder exclusions; an explicit path can enter an ignored folder' },
       },
       required: ['pattern'],
     },
     async execute(args, exec) {
       const pattern = argString(args, 'pattern')
+      const ignoreCase = optionalBoolean(args, '-i')
       // Validate here so a bad pattern fails as before, not inside the worker.
-      void new RegExp(pattern)
+      void new RegExp(pattern, ignoreCase ? 'i' : '')
+      const mode = grepMode(args)
+      const around = grepInteger(args, '-C', GREP_MAX_CONTEXT)
+      const before = grepInteger(args, '-B', GREP_MAX_CONTEXT) ?? around ?? 0
+      const after = grepInteger(args, '-A', GREP_MAX_CONTEXT) ?? around ?? 0
+      const limit = Math.max(1, grepInteger(args, 'head_limit', GREP_CAP) ?? GREP_CAP)
       const base = await searchBase(args, exec)
       const search = await searchFiles(base, exec, { includeIgnored: argBoolean(args, 'includeIgnored') === true })
-      const files = search.files
+      const filter = grepFileFilter(args, base)
+      const files = filter === undefined ? search.files : search.files.filter(filter)
       let run
       try {
         run = await runGrep(pattern, files.map((full) => ({ full })), {
-          maxHits: GREP_CAP,
+          maxHits: limit,
           maxFileBytes: GREP_MAX_FILE_BYTES,
           timeoutMs: GREP_TIMEOUT_MS,
+          mode,
+          ignoreCase,
+          ...(mode === 'content' ? { before, after } : {}),
           ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
         })
       } catch (error) {
@@ -407,12 +514,19 @@ export function grepTool(): ToolDefinition {
         }
         throw error
       }
-      const lines = run.hits.map((hit) => {
-        const text = hit.text.length > READ_MAX_LINE ? `${hit.text.slice(0, READ_MAX_LINE)}… [line truncated]` : hit.text
-        return `${displayPath(exec.root, files[hit.file] as string)}:${hit.line}: ${text}`
+      const shown = (file: number): string => displayPath(exec.root, files[file] as string)
+      const clip = (text: string): string => text.length > READ_MAX_LINE ? `${text.slice(0, READ_MAX_LINE)}… [line truncated]` : text
+      const lines = run.rows.map((row) => {
+        switch (row.kind) {
+          case 'match': return `${shown(row.file)}:${row.line}: ${clip(row.text)}`
+          case 'context': return `${shown(row.file)}-${row.line}- ${clip(row.text)}`
+          case 'separator': return '--'
+          case 'file': return shown(row.file)
+          case 'count': return `${shown(row.file)}:${row.count}`
+        }
       })
       const notes: string[] = []
-      if (run.truncated) notes.push('… [more matches truncated]')
+      if (run.truncated) notes.push(mode === 'content' ? '… [more matches truncated]' : '… [more files truncated]')
       if (run.skippedLarge > 0) notes.push(`… [${run.skippedLarge} file(s) over ${GREP_MAX_FILE_BYTES / (1024 * 1024)} MiB not searched]`)
       return searchOutput(lines, search.incomplete, limitOf(exec), { notes })
     },

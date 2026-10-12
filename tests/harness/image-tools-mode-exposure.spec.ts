@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { BUNDLED_MODES, KNOWN_MODE_TOOLS } from '../../src/harness/modes/bundled.ts'
 
-describe('image tool mode exposure', () => {
+describe('media tool mode exposure', () => {
   it('sits inside the exposure ceiling', () => {
-    expect(KNOWN_MODE_TOOLS).toEqual(expect.arrayContaining(['GenerateImage', 'EditImage', 'DescribeImage']))
+    expect(KNOWN_MODE_TOOLS).toEqual(expect.arrayContaining(['GenerateImage', 'EditImage', 'DescribeImage', 'GenerateVideo']))
   })
 
   it('exposes the read-like DescribeImage tool automatically in every bundled mode', () => {
@@ -20,8 +20,9 @@ describe('image tool mode exposure', () => {
       'full-access': 'allow',
       plan: undefined,
     }
+    // Image and video generation are paid external requests.
     for (const mode of BUNDLED_MODES) {
-      for (const tool of ['GenerateImage', 'EditImage']) {
+      for (const tool of ['GenerateImage', 'EditImage', 'GenerateVideo']) {
         expect(mode.permissionDefaults[tool], `${mode.id} ${tool}`).toBe(expected[mode.id])
         expect(mode.toolExposure.includes(tool), `${mode.id} ${tool}`).toBe(expected[mode.id] !== undefined)
       }

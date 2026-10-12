@@ -159,6 +159,28 @@ describe('multi-root file grants', () => {
     await expect(tool('Read').execute({ path: target }, exec({ approvedPaths: [{ path: target, intent: 'read' }] }))).rejects.toThrow(/resolves through a link/)
   })
 
+  it('a link path works when its real location is approved (macOS /tmp → /private/tmp)', async () => {
+    const linkDir = path.join(base, 'linked-real')
+    await fs.symlink(outside, linkDir, 'junction')
+    const approved = exec({ approvedPaths: [{ path: path.join(outside, 'secret.txt'), intent: 'read' }] })
+    expect(await tool('Read').execute({ path: path.join(linkDir, 'secret.txt') }, approved)).toContain('outside')
+  })
+
+  it('Grep and Glob search an approved out-of-grant folder, read-only and only below it', async () => {
+    await fs.mkdir(path.join(outside, 'deep'), { recursive: true })
+    await fs.writeFile(path.join(outside, 'deep', 'mod.ts'), 'const needle = 1\n', 'utf8')
+    const approved = exec({ approvedPaths: [{ path: outside, intent: 'read' }] })
+    const grep = await tool('Grep').execute({ pattern: 'needle', path: outside }, approved)
+    expect(grep).toContain(`${path.join(outside, 'deep', 'mod.ts')}:1: const needle = 1`)
+    const glob = await tool('Glob').execute({ pattern: '**/*.ts', path: outside }, approved)
+    expect(glob.split('\n')).toContain(path.join(outside, 'deep', 'mod.ts'))
+    // The folder approval is read-only and does not reach siblings.
+    await expect(tool('Write').execute({ path: path.join(outside, 'deep', 'mod.ts'), content: 'x' }, approved)).rejects.toBeInstanceOf(OutOfGrantError)
+    await expect(tool('Grep').execute({ pattern: 'needle', path: base }, approved)).rejects.toBeInstanceOf(OutOfGrantError)
+    // Without an approval the search is refused as before.
+    await expect(tool('Grep').execute({ pattern: 'needle', path: outside }, exec())).rejects.toBeInstanceOf(OutOfGrantError)
+  })
+
   it('Grep and Glob print absolute paths outside the primary that Read accepts back', async () => {
     const grep = await tool('Grep').execute({ pattern: 'needle', path: docs }, exec())
     const hit = grep.split('\n')[0] ?? ''

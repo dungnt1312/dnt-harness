@@ -10,7 +10,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
-import { createWebServer, ProviderError, type LlmProvider, type WebServer } from 'dnt-harness'
+import { createWebServer, ProviderError, withoutSentStamp, type LlmProvider, type WebServer } from 'dnt-harness'
 import type { ModelRequest, StreamEvent } from '../../src/harness/llm/types.ts'
 import type { HarnessLimits } from '../../src/harness/limits.ts'
 
@@ -299,7 +299,7 @@ describe('web compaction', () => {
     expect(await fs.readdir(checkpointsDir(home, id)).catch(() => [])).toEqual([])
   })
 
-  it('folds every long-source chunk and continues the same session with latest state and a raw tail', async () => {
+  it('folds every long-source chunk and continues the same session with latest state and retained messages', async () => {
     const longReply = 'synthetic historical detail\n'.repeat(9_000)
     const tailReply = `RECENT RAW TAIL\n${LATEST_STATE}`
     const chunks: string[] = []
@@ -312,7 +312,7 @@ describe('web compaction', () => {
         return `SOURCE ECHO\n${chunk.slice(-2_000)}`
       },
     })
-    const { home, base, wsId } = await start(provider, { compactionTailTurns: 1 })
+    const { home, base, wsId } = await start(provider)
     const created = await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })
     const { id } = await created.json() as { id: string }
     const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
@@ -335,9 +335,16 @@ describe('web compaction', () => {
     expect(system[0]!.content).toContain('This is the same conversation continuing after compaction, not a new session')
     expect(system[1]!.content).toContain(checkpoint.summary)
     expect(system[1]!.content).toContain('<untrusted kind="compacted-history"')
-    expect(nextRequest.messages).toContainEqual({ role: 'user', content: 'latest state request' })
-    expect(nextRequest.messages).toContainEqual({ role: 'assistant', content: tailReply })
-    expect(nextRequest.messages).toContainEqual({ role: 'user', content: 'Còn vấn đề gì không' })
+    // Covered user requests and the latest covered answer ride verbatim; the
+    // long covered answer is represented only by the summary.
+    // The summarizer source above carries no `[sent …]` line; the request does,
+    // on each typed message, so compare without it.
+    const sent = nextRequest.messages.map((message) => message.role === 'user' && typeof message.content === 'string' ? { ...message, content: withoutSentStamp(message.content) } : message)
+    expect(sent).toContainEqual({ role: 'user', content: 'synthetic history request' })
+    expect(sent).toContainEqual({ role: 'user', content: 'latest state request' })
+    expect(sent).toContainEqual({ role: 'assistant', content: tailReply })
+    expect(sent.some((message) => message.role === 'assistant' && message.content === longReply)).toBe(false)
+    expect(sent).toContainEqual({ role: 'user', content: 'Còn vấn đề gì không' })
     const sessions = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`)).json() as { id: string }[]
     expect(sessions.map((session) => session.id)).toEqual([id])
     expect((await fs.readFile(logPath)).subarray(0, original.length)).toEqual(original)
@@ -393,12 +400,21 @@ describe('web compaction', () => {
     const created = await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })
     expect(created.status).toBe(201)
     const { id } = (await created.json()) as { id: string }
+    const memoryRows = (request: ModelRequest | undefined): string => (request?.messages ?? [])
+      .filter((message) => typeof message.content === 'string' && message.content.includes('<untrusted kind="memory"'))
+      .map((message) => String(message.content)).join('\n')
+    expect((await fetch(`${base}/api/workspaces/${wsId}/memory`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'before-note', title: 'Before note', body: 'x' }) })).status).toBe(201)
 
     await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ content: 'first message' }),
     })
+    await until(async () => (requests.length > 0 ? true : undefined))
+    // A memory write after the first request does not reach this session's
+    // copy until the prefix moves anyway — at the new checkpoint below.
+    expect(memoryRows(requests[0])).toContain('before-note')
+    expect((await fetch(`${base}/api/workspaces/${wsId}/memory`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: 'after-note', title: 'After note', body: 'y' }) })).status).toBe(201)
 
     // Compaction refuses an open turn; retry until the turn settles.
     const compacted = await until(async () => {
@@ -409,6 +425,18 @@ describe('web compaction', () => {
       throw new Error(`compact failed: ${response.status} ${body.error ?? ''}`)
     })
     expect(compacted.summaryChars).toBe(SUMMARY_TEXT.length)
+
+    // The response and the durable end event both carry the before/after
+    // context size, and the meter's manifest already reflects the new size
+    // without waiting for another request.
+    const sized = compacted as { tokensBefore?: number; tokensAfter?: number }
+    expect(sized.tokensBefore).toBeGreaterThan(0)
+    expect(sized.tokensAfter).toBeGreaterThanOrEqual(0)
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    const log = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { type: string })
+    expect(log.findLast((event) => event.type === 'compaction/end')).toMatchObject({ tokensBefore: sized.tokensBefore, tokensAfter: sized.tokensAfter })
+    const meter = (await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/manifest`)).json()) as ManifestView & { budget: { usedTokens: number } }
+    expect(meter.budget.usedTokens).toBe(sized.tokensAfter)
 
     const checkpoint = JSON.parse(
       await fs.readFile(path.join(checkpointsDir(home, id), `${compacted.coversSeq}.json`), 'utf8'),
@@ -443,11 +471,13 @@ describe('web compaction', () => {
     const sent = nextRequest.messages.map((message) => (typeof message.content === 'string' ? message.content : '')).join('\n')
     expect(sent).toContain(SUMMARY_TEXT)
     expect(sent).toContain('second message')
+    // The checkpoint moved the prefix, so the session re-read its memory index.
+    expect(memoryRows(nextRequest)).toContain('after-note')
   })
 
   it('the automatic pressure trigger compacts at the settled boundary', async () => {
     const { provider, requests } = summarizingProvider()
-    const { home, base, wsId } = await start(provider, { automaticCompactionPressure: 0.00001, compactionTailTurns: 2 })
+    const { home, base, wsId } = await start(provider, { automaticCompactionPressure: 0.00001 })
 
     const created = await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })
     const { id } = (await created.json()) as { id: string }

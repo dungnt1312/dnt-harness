@@ -10,6 +10,7 @@
  */
 import { formatBytes, pathBasename, shortCommand, shortPath, toolTarget } from './format.ts'
 import type { ToolCall } from './types.ts'
+import { editLineCounts, editOccurrences } from './line-diff.ts'
 
 /** The recorded outcome a digest is read from. */
 export interface ToolResultView {
@@ -151,11 +152,13 @@ function writeDigest(output: string): string {
 }
 
 /** `Edit` reports its own size: the replacement is in the arguments, exactly. */
-function editLines(args: Record<string, unknown>): { added: number; removed: number } | undefined {
+function editLines(args: Record<string, unknown>, output?: string): { added: number; removed: number } | undefined {
   const removed = str(args, 'old')
   const added = str(args, 'new')
   if (removed === undefined && added === undefined) return undefined
-  return { added: countLines(added ?? ''), removed: countLines(removed ?? '') }
+  const lines = editLineCounts(removed ?? '', added ?? '')
+  const times = editOccurrences(output)
+  return { added: lines.added * times, removed: lines.removed * times }
 }
 
 /** A directory longer than this elides its head: past it the row cannot show it whole anyway. */
@@ -207,21 +210,32 @@ function globDigest(output: string): string {
   return `${count}${incomplete ? ' · search incomplete' : TRUNCATION.test(output) ? ' · truncated' : ''}`
 }
 
-function grepDigest(output: string): string {
+function grepDigest(output: string, mode: string | undefined): string {
   const incomplete = SEARCH_INCOMPLETE.test(output)
   if (output.startsWith('no matches')) return incomplete ? 'search incomplete' : 'no matches'
   const lines = listLines(output)
-  const hits = lines.filter((line) => !NOTE_LINE.test(line))
-  if (incomplete && hits.length === 0) return 'search incomplete'
-  const files = new Set<string>()
-  for (const line of hits) {
-    const match = /^(.*?):\d+: /.exec(line)
-    if (match?.[1] !== undefined) files.add(match[1])
+  const rows = lines.filter((line) => !NOTE_LINE.test(line))
+  if (incomplete && rows.length === 0) return 'search incomplete'
+  const truncated = rows.length < lines.length || TRUNCATION.test(output)
+  const tail = incomplete ? ' · search incomplete' : truncated ? ' · truncated' : ''
+  // `files_with_matches` lists one path per row; `count` writes `path:N`.
+  if (mode === 'files_with_matches') return `${plural(rows.length, 'file')}${tail}`
+  if (mode === 'count') {
+    const total = rows.reduce((sum, line) => sum + Number(/:(\d+)$/.exec(line)?.[1] ?? 0), 0)
+    return `${plural(total, 'match', 'matches')} · ${plural(rows.length, 'file')}${tail}`
   }
-  const truncated = hits.length < lines.length || TRUNCATION.test(output)
-  const matches = plural(hits.length, 'match', 'matches')
+  // Content rows: matches are `path:line: text`; context rows (`path-line- text`)
+  // and `--` group separators are not matches.
+  const files = new Set<string>()
+  let hits = 0
+  for (const line of rows) {
+    const match = /^(.*?):\d+: /.exec(line)
+    if (match?.[1] === undefined) continue
+    hits += 1
+    files.add(match[1])
+  }
   const where = files.size > 1 ? ` · ${plural(files.size, 'file')}` : ''
-  return `${matches}${where}${incomplete ? ' · search incomplete' : truncated ? ' · truncated' : ''}`
+  return `${plural(hits, 'match', 'matches')}${where}${tail}`
 }
 
 /** What `Bash` writes when it cut its own output. */
@@ -422,7 +436,7 @@ export function toolFacts(call: ToolCall, result?: ToolResultView): ToolFacts {
       fullTarget = path ?? ''
       target = path !== undefined ? shortPath(path) : ''
       if (path !== undefined) file = fileParts(path)
-      if (builtin === 'edit') lines = editLines(args)
+      if (builtin === 'edit') lines = editLines(args, result?.output)
       digest = result === undefined
         ? undefined
         : failed
@@ -475,7 +489,7 @@ export function toolFacts(call: ToolCall, result?: ToolResultView): ToolFacts {
       target = `${shortCommand(pattern, 40)}${scope !== undefined ? ` in ${shortPath(scope)}` : ''}`
       // A Grep's `path` scopes the search; it is not a file to open.
       path = undefined
-      digest = result === undefined ? undefined : failed ? excerpt(result.output) : grepDigest(result.output)
+      digest = result === undefined ? undefined : failed ? excerpt(result.output) : grepDigest(result.output, str(args, 'output_mode'))
       break
     }
     case 'bash': {

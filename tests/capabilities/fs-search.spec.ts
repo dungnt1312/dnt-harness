@@ -240,3 +240,53 @@ describe('search reliability', () => {
     } finally { await fs.rm(outside, { recursive: true, force: true }) }
   })
 })
+
+describe('Grep options', () => {
+  beforeEach(async () => {
+    await put('.gitignore', 'dist/\n')
+    await put('src/a.ts', 'one\nalpha\ntwo\nthree\nalpha\nfour\n')
+    await put('src/b.tsx', 'Alpha\n')
+    await put('docs/c.md', 'alpha\n')
+    await put('dist/d.ts', 'alpha\n')
+  })
+
+  it('searches one file named as path, and an ignored file named explicitly', async () => {
+    expect(await grep('alpha', { path: 'src/a.ts' })).toBe('src/a.ts:2: alpha\nsrc/a.ts:5: alpha')
+    expect(await grep('alpha', { path: 'dist/d.ts' })).toBe('dist/d.ts:1: alpha')
+  })
+
+  it('filters by glob and type', async () => {
+    expect(await grep('alpha', { glob: '*.md' })).toBe('docs/c.md:1: alpha')
+    expect(await grep('lpha', { glob: '*.{ts,tsx}' })).toBe('src/a.ts:2: alpha\nsrc/a.ts:5: alpha\nsrc/b.tsx:1: Alpha')
+    expect(await grep('alpha', { glob: 'docs/**/*.md' })).toBe('docs/c.md:1: alpha')
+    expect(await grep('lpha', { type: 'ts' })).toBe('src/a.ts:2: alpha\nsrc/a.ts:5: alpha\nsrc/b.tsx:1: Alpha')
+    await expect(grep('x', { type: 'cobol' })).rejects.toThrow(/unknown Grep type/)
+  })
+
+  it('matches case-insensitively with -i', async () => {
+    expect(await grep('^alpha$', { path: 'src/b.tsx' })).toBe('no matches')
+    expect(await grep('^alpha$', { path: 'src/b.tsx', '-i': true })).toBe('src/b.tsx:1: Alpha')
+  })
+
+  it('shows context lines, merging overlaps and separating groups', async () => {
+    // Lines 3 and 4 touch, so the two groups print as one block, as grep does.
+    expect(await grep('alpha', { path: 'src/a.ts', '-C': 1 })).toBe([
+      'src/a.ts-1- one', 'src/a.ts:2: alpha', 'src/a.ts-3- two',
+      'src/a.ts-4- three', 'src/a.ts:5: alpha', 'src/a.ts-6- four',
+    ].join('\n'))
+    expect(await grep('alpha', { path: 'src/a.ts', '-A': 1 })).toBe([
+      'src/a.ts:2: alpha', 'src/a.ts-3- two', '--', 'src/a.ts:5: alpha', 'src/a.ts-6- four',
+    ].join('\n'))
+    expect(await grep('alpha', { path: 'src/a.ts', '-B': 2 })).toBe([
+      'src/a.ts-1- one', 'src/a.ts:2: alpha', 'src/a.ts-3- two', 'src/a.ts-4- three', 'src/a.ts:5: alpha',
+    ].join('\n'))
+    expect(await grep('alpha', { path: 'src/a.ts', '-A': 1, head_limit: 1 })).toBe('src/a.ts:2: alpha\nsrc/a.ts-3- two\n… [more matches truncated]')
+  })
+
+  it('lists files or counts per file', async () => {
+    expect(await grep('lpha', { output_mode: 'files_with_matches' })).toBe('docs/c.md\nsrc/a.ts\nsrc/b.tsx')
+    expect(await grep('alpha', { output_mode: 'count' })).toBe('docs/c.md:1\nsrc/a.ts:2')
+    expect(await grep('lpha', { output_mode: 'files_with_matches', head_limit: 1 })).toBe('docs/c.md\n… [more files truncated]')
+    await expect(grep('x', { output_mode: 'lines' })).rejects.toThrow(/output_mode/)
+  })
+})

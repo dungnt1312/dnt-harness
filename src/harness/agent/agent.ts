@@ -12,16 +12,33 @@ import type { Session } from '../session/session.ts'
 import { agentScope, type AgentScope } from './scope.ts'
 import type { AgentStatus, InboxItem, PreStepDecision } from './types.ts'
 
+/** One durably accepted input (`input/queued`) the driver adopts. */
+export interface AcceptedInput {
+  readonly content: string
+  readonly inputId: InputId
+  readonly attachments?: readonly AttachmentRef[]
+  readonly origin?: 'hook'
+  readonly summary?: string
+}
+
 /** The tools surface the loop consumes; optional, structurally typed. */
 interface ToolRuntime {
   schemas(): ToolSchema[]
   prepare?(call: ToolCall, options?: { signal?: AbortSignal; executionId?: ExecutionId }): Promise<{
     call: ToolCall
+    concurrent?: boolean
     execute(): Promise<ToolResult>
   }>
   execute(call: ToolCall, options?: { signal?: AbortSignal }): Promise<ToolResult>
   /** The live permission-policy revision (a value or an accessor). */
   policyRevision?: number | (() => number)
+}
+
+/** A call that passed every gate and waits for its group to run. */
+interface ReadyCall {
+  readonly executionId: ExecutionId
+  readonly prepared: { readonly call: ToolCall; readonly concurrent?: boolean; execute(): Promise<ToolResult> }
+  readonly revision: number | undefined
 }
 
 function revisionOf(runtime: ToolRuntime | undefined): number | undefined {
@@ -126,7 +143,7 @@ export class Agent {
    * call this on acceptance and after restarts to restore pending inputs —
    * restored inputs wait for the next user-triggered run, never auto-run.
    */
-  enqueueAccepted(item: { content: string; inputId: InputId; attachments?: readonly AttachmentRef[] }): void {
+  enqueueAccepted(item: AcceptedInput): void {
     if (this.claimedInputIds.has(item.inputId)) return
     if (this.inbox.some((existing) => existing.kind === 'user' && existing.inputId === item.inputId)) return
     this.inbox.push({
@@ -134,6 +151,8 @@ export class Agent {
       content: item.content,
       inputId: item.inputId,
       ...(item.attachments !== undefined && item.attachments.length > 0 ? { attachments: item.attachments } : {}),
+      ...(item.origin !== undefined ? { origin: item.origin } : {}),
+      ...(item.summary !== undefined ? { summary: item.summary } : {}),
     })
   }
 
@@ -143,7 +162,7 @@ export class Agent {
    * one that a failed turn handed back cannot end up behind newer input.
    * Injected context and claimed inputs are untouched.
    */
-  adoptPending(pending: readonly { content: string; inputId: InputId; attachments?: readonly AttachmentRef[] }[]): void {
+  adoptPending(pending: readonly AcceptedInput[]): void {
     const pendingIds = new Set(pending.map((item) => item.inputId))
     // Accepted inputs the log no longer lists as pending stay where they are.
     const kept = this.inbox.filter((item) => item.kind !== 'user' || item.inputId === undefined || !pendingIds.has(item.inputId))
@@ -333,9 +352,14 @@ export class Agent {
         if (item.kind === 'user' && item.inputId !== undefined) this.claimedInputIds.add(item.inputId)
       }
       const contents = claimed.map((item) => item.content)
+      const origins = claimed.map((item) => item.origin)
       const decision = await this.ctx.waterfall(
         'agent/pre-step',
-        { contents, ...(controller?.signal !== undefined ? { signal: controller.signal } : {}) },
+        {
+          contents,
+          ...(origins.some((origin) => origin !== undefined) ? { origins } : {}),
+          ...(controller?.signal !== undefined ? { signal: controller.signal } : {}),
+        },
         (replacement) =>
           Promise.resolve({
             kind: 'enter',
@@ -373,7 +397,7 @@ export class Agent {
               content: item.content,
               ...(item.inputId !== undefined ? { inputId: item.inputId } : {}),
               ...(item.attachments !== undefined && item.attachments.length > 0 ? { attachments: item.attachments } : {}),
-              ...(item.kind === 'injected' ? { origin: 'context' as const } : {}),
+              ...inputOrigin(item),
             })
           }
           this.settleClaimedInputs(claimed, 'admitted')
@@ -553,8 +577,9 @@ export class Agent {
         content,
         ...(item?.inputId !== undefined ? { inputId: item.inputId } : {}),
         ...(item?.attachments !== undefined && item.attachments.length > 0 ? { attachments: item.attachments } : {}),
-        // Injected host context (SessionStart hooks) is context, not user text.
-        ...(origin !== undefined ? { origin } : item?.kind === 'injected' ? { origin: 'context' as const } : {}),
+        // Injected host context (SessionStart hooks) is context, and a hook
+        // rewake is hook data — neither is something the user typed.
+        ...(origin !== undefined ? { origin } : item !== undefined ? inputOrigin(item) : {}),
       })
       const expansion = expansions?.[index]
       if (expansion !== undefined) this.session.append({ type: 'user/message', turnId, content: expansion, origin: 'command' })
@@ -755,13 +780,29 @@ export class Agent {
         : {}),
     })
 
+    // Consecutive read-only calls form one group that runs concurrently; any
+    // other call is a group of its own, so a write never overlaps a read and
+    // reads after a write see it. Every call is prepared (hooks, approval) in
+    // order first; each group then records its intents, runs, and records its
+    // results in the model's original order.
+    const concurrency = Math.max(1, this.limits().readOnlyToolConcurrency)
+    let group: ReadyCall[] = []
+    const runPending = async (): Promise<void> => {
+      if (group.length === 0) return
+      const ready = group
+      group = []
+      await this.runToolGroup(stepId, ready, concurrency)
+    }
     for (let i = 0; i < calls.length; i++) {
       const call = calls[i]
       if (call === undefined) continue
       const executionId = newExecutionId()
       // Stop between batch calls: the rest never started, and the log says
-      // exactly that instead of leaving declared calls unanswered.
+      // exactly that instead of leaving declared calls unanswered. Calls
+      // already prepared still run: their execute() sees the stop and answers
+      // as cancelled, releasing any authority they hold.
       if (signal?.aborted === true) {
+        await runPending()
         for (let j = i; j < calls.length; j++) {
           const skipped = calls[j]
           if (skipped === undefined) continue
@@ -782,7 +823,7 @@ export class Agent {
       // Prepare every gate FIRST: hooks may rewrite args and approvals bind
       // to those exact final args. Only then record the durable intent; the
       // returned execute() is the side-effect boundary.
-      let prepared: { call: ToolCall; execute(): Promise<ToolResult> }
+      let prepared: { call: ToolCall; concurrent?: boolean; execute(): Promise<ToolResult> }
       try {
         prepared = tools?.prepare !== undefined
           ? await tools.prepare(call, { ...(signal !== undefined ? { signal } : {}), executionId })
@@ -793,6 +834,7 @@ export class Agent {
                 : { ok: false, output: `unknown tool '${call.name}' (no tools service mounted)` },
             }
       } catch (error) {
+        await runPending()
         this.session.append({ type: 'tool/call', stepId, executionId, call })
         this.session.append({
           type: 'tool/result',
@@ -805,7 +847,30 @@ export class Agent {
         await this.flushOrHalt()
         continue
       }
-      const revision = revisionOf(tools)
+      const ready: ReadyCall = { executionId, prepared, revision: revisionOf(tools) }
+      if (prepared.concurrent === true) {
+        group.push(ready)
+        continue
+      }
+      await runPending()
+      group = [ready]
+      await runPending()
+    }
+    await runPending()
+
+    this.session.append({ type: 'step/end', turnId, stepId })
+    await this.flushOrHalt()
+    return { stepId, toolCalls: calls }
+  }
+
+  /**
+   * Run one group of prepared calls: record every intent durably, execute at
+   * most `concurrency` at once, and record each result in call order as soon
+   * as it and every earlier call have settled. A single call is the old
+   * sequential path exactly. A failing call never cancels its siblings.
+   */
+  private async runToolGroup(stepId: StepId, group: readonly ReadyCall[], concurrency: number): Promise<void> {
+    for (const { executionId, prepared, revision } of group) {
       this.session.append({
         type: 'tool/call',
         stepId,
@@ -813,33 +878,51 @@ export class Agent {
         call: prepared.call,
         ...(revision !== undefined ? { policyRevision: revision } : {}),
       })
-      // Durable FINAL intent before side effects.
-      await this.flushOrHalt()
-      this.activity = 'tool'
-      let result: ToolResult
-      try {
-        result = await prepared.execute()
-      } catch (error) {
-        result = { ok: false, output: `error: tool pipeline failed: ${String(error instanceof Error ? error.message : error)}` }
-      } finally {
-        this.activity = null
-      }
-      this.session.append({
-        type: 'tool/result',
-        stepId,
-        executionId,
-        callId: prepared.call.id,
-        ok: result.ok,
-        output: result.output,
-        ...(result.outcome !== undefined ? { outcome: result.outcome } : {}),
-        ...(result.invocationId !== undefined ? { invocationId: result.invocationId } : {}),
-      })
-      await this.flushOrHalt()
     }
-
-    this.session.append({ type: 'step/end', turnId, stepId })
+    // Durable FINAL intent before side effects.
     await this.flushOrHalt()
-    return { stepId, toolCalls: calls }
+    const run = async ({ prepared }: ReadyCall): Promise<ToolResult> => {
+      try {
+        return await prepared.execute()
+      } catch (error) {
+        return { ok: false, output: `error: tool pipeline failed: ${String(error instanceof Error ? error.message : error)}` }
+      }
+    }
+    const results: Promise<ToolResult>[] = []
+    let next = 0
+    const lanes: Promise<void>[] = []
+    const settled: ((result: ToolResult) => void)[] = []
+    for (let index = 0; index < group.length; index++) {
+      results.push(new Promise((resolve) => { settled[index] = resolve }))
+    }
+    const lane = async (): Promise<void> => {
+      while (next < group.length) {
+        const index = next++
+        settled[index]!(await run(group[index]!))
+      }
+    }
+    this.activity = 'tool'
+    try {
+      for (let count = 0; count < Math.min(concurrency, group.length); count++) lanes.push(lane())
+      for (let index = 0; index < group.length; index++) {
+        const result = await results[index]!
+        const { executionId, prepared } = group[index]!
+        this.session.append({
+          type: 'tool/result',
+          stepId,
+          executionId,
+          callId: prepared.call.id,
+          ok: result.ok,
+          output: result.output,
+          ...(result.outcome !== undefined ? { outcome: result.outcome } : {}),
+          ...(result.invocationId !== undefined ? { invocationId: result.invocationId } : {}),
+        })
+      }
+      await Promise.all(lanes)
+    } finally {
+      this.activity = null
+    }
+    await this.flushOrHalt()
   }
 
   /** Flush the durability barrier; a storage failure halts the run. */
@@ -865,6 +948,13 @@ export class Agent {
     const shared = (this.ctx.get('limits') ?? {}) as Partial<HarnessLimits>
     return resolveLimits(shared)
   }
+}
+
+/** How an admitted inbox item is labeled in the log: context, a hook rewake, or (nothing) user text. */
+function inputOrigin(item: InboxItem): { origin?: 'context' | 'hook'; summary?: string } {
+  if (item.kind === 'injected') return { origin: 'context' }
+  if (item.origin === 'hook') return { origin: 'hook', ...(item.summary !== undefined ? { summary: item.summary } : {}) }
+  return {}
 }
 
 /**

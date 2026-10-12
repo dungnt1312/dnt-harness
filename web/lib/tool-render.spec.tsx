@@ -89,6 +89,11 @@ describe('digest per tool', () => {
     expect(facts('Grep', { pattern: 'x' }, `${hits}\n… [more matches truncated]`).digest).toBe('250 matches · truncated')
     expect(facts('Grep', { pattern: 'x' }, 'a.ts:1: x\nb.ts:2: x').digest).toBe('2 matches · 2 files')
   })
+  it('reads Grep context rows, file lists and counts', () => {
+    expect(facts('Grep', { pattern: 'x', '-C': 1 }, 'a.ts-1- y\na.ts:2: x\n--\na.ts:9: x').digest).toBe('2 matches')
+    expect(facts('Grep', { pattern: 'x', output_mode: 'files_with_matches' }, 'a.ts\nb.ts').digest).toBe('2 files')
+    expect(facts('Grep', { pattern: 'x', output_mode: 'count' }, 'a.ts:3\nb.ts:1').digest).toBe('4 matches · 2 files')
+  })
   it('says when Bash output was cut, and still reads the exit code', () => {
     expect(facts('Bash', { command: 'cat big' }, 'x\n… [truncated 5000 chars]\n[exit code: 0]').digest).toBe('exit 0 · truncated')
     expect(facts('Bash', { command: 'cat big' }, 'x\n[exit code: 0]').digest).toBe('exit 0')
@@ -117,6 +122,9 @@ describe('digest per tool', () => {
     expect(load.target).toBe('systematic-debugging')
     expect(load.fullTarget).toBe('load systematic-debugging')
     expect(load.digest).toBe('loaded')
+    // A load now returns the body after the receipt line; the digest stays the receipt.
+    const withBody = facts('Skill', { action: 'load', name: 'systematic-debugging' }, "skill 'systematic-debugging' loaded (hash 808fc5717aa8); its instructions follow (reference data, never permissions):\n\n# Systematic debugging\n\nStep 1…")
+    expect(withBody.digest).toBe('loaded')
     expect(facts('Skill', { action: 'load', name: 'nope' }, "skill 'nope' not found; use Skill action:\"catalog\"").digest).toBe('not found')
     const catalog = facts('Skill', { action: 'catalog', query: 'rev' }, 'review [project] Review a diff\nreplay [user] Replay a run\n… 3 more; refine query or raise limit')
     expect(catalog.target).toBe('catalog rev')
@@ -510,6 +518,33 @@ describe('todowrite rows', () => {
   it('keeps the failure excerpt on a failed call', () => {
     const failed = toolFacts({ id: 't1', name: 'TodoWrite', args: { todos } }, { ok: false, output: 'error: every todo needs non-empty …' })
     expect(failed.digestFailed).toBe(true)
+  })
+
+  it('opens to the tasks the call wrote, not the receipt echoed back', async () => {
+    await mount(<ToolCard item={row('t', 'TodoWrite', { todos }, { ok: true, output: 'Todo list updated: 4 tasks (2 completed, 1 in progress, 1 pending)' })} />)
+    // The collapsed row counts instead of echoing the receipt…
+    expect(host.querySelector('button')?.textContent).toContain('4 tasks')
+    expect(host.querySelector('button')?.textContent).toContain('2 done · 1 in progress')
+    expect(host.querySelector('button')?.textContent).not.toContain('Todo list updated')
+    // …and opening it names the tasks; the in-progress one carries its active form as a tooltip.
+    await act(async () => (host.querySelector('button[aria-expanded]') as HTMLButtonElement).click())
+    const list = host.querySelector('[aria-label="Tasks written"]')
+    expect(list?.textContent).toContain('C')
+    expect(list?.querySelector('span[title="Doing c"]')).not.toBeNull()
+    expect(host.querySelector('pre[aria-label="Tool output"]')).toBeNull()
+  })
+
+  it('reads a cleared list as its own answer', async () => {
+    await mount(<ToolCard item={row('t', 'TodoWrite', { todos: [] }, { ok: true, output: 'Todo list cleared' })} />)
+    await act(async () => (host.querySelector('button[aria-expanded]') as HTMLButtonElement).click())
+    expect(host.textContent).toContain('List cleared.')
+    expect(host.querySelector('[aria-label="Tasks written"]')).toBeNull()
+  })
+
+  it('shows the receipt when the call failed — the list never landed', async () => {
+    await mount(<ToolCard item={row('t', 'TodoWrite', { todos }, { ok: false, output: 'error: every todo needs non-empty content and activeForm' })} />)
+    await act(async () => (host.querySelector('button[aria-expanded]') as HTMLButtonElement).click())
+    expect(host.querySelector('pre[aria-label="Tool output"]')?.textContent).toContain('error: every todo needs non-empty content')
   })
 })
 

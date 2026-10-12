@@ -155,9 +155,10 @@ supplementing the defaults), `hooks` (path or inline object), `mcpServers`
 - Plugin layers sit between user and workspace for every part. Settings
   layers own the name space first: a workspace or project file with the same
   name wins over a plugin.
-- Hook fields dnt-harness cannot run (`if`, `async`, `asyncRewake`, prompt or
-  agent hook types) are parsed, kept and shown as "not run", like unsupported
-  events today.
+- Hook `if`, `async` and `asyncRewake` run as in Claude (see
+  `2026-10-12-hook-if-async-rewake-design.md`). Prompt, agent, MCP-tool and
+  HTTP hook types are still parsed, kept and shown as "not run", like
+  unsupported events.
 - MCP is workspace-scoped in dnt-harness. Enabling a plugin anywhere in a
   workspace (user, workspace, or one of its projects) materializes its
   servers into that workspace's `mcp.json` with `provenance.plugin`, enabled.

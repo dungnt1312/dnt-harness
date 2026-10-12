@@ -9,7 +9,7 @@ import { processRows, type ProcessRow } from '../../lib/processes-view.ts'
 import { hiddenSpawnCalls } from '../../lib/spawn-merge.ts'
 import { turnTimings, type TurnTiming } from '../../lib/turn-timing.ts'
 import { useSessionDerivedGates } from '../../lib/session-derived.ts'
-import { ActivityBlock, AssistantMessage, AuditLine, CommandExpansionMarker, CompactionMarker, ContinuationMarker, ContextMarker, HookContextMarker, DelegationCard, JumpToBottom, ProcessLinkContext, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
+import { ActivityBlock, AssistantMessage, AuditLine, CommandExpansionMarker, CompactionMarker, ContinuationMarker, ContextMarker, HookContextMarker, HookRewakeMarker, DelegationCard, JumpToBottom, ProcessLinkContext, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
 import { TurnChangesCard } from './TurnChangesCard.tsx'
 import type { WorkbenchProject } from '../workbench/Workbench.tsx'
 import { ConversationMinimap } from './ConversationMinimap.tsx'
@@ -187,9 +187,24 @@ export function groupBlocks(items: readonly ViewItem[], hidden?: ReadonlySet<str
   // gap between two steps when no call is running. Every step of a turn —
   // tool-only ones included — carries `turnOpen`; the newest step decides.
   const tail = blocks.at(-1)
-  if (tail?.kind === 'activity' && latestStepOpen(items)) (tail as { turnOpen: boolean }).turnOpen = true
+  if (tail?.kind === 'activity' && latestStepOpen(items)) {
+    (tail as { turnOpen: boolean }).turnOpen = true
+    // A call still running is not part of the run's history yet: it stands on
+    // its own below the run, so the run only holds what has settled. Once the
+    // call lands it joins the run in its place.
+    const running = tail.rows.filter((row) => isRunningCall(row.item))
+    if (running.length > 0) {
+      const settled = tail.rows.filter((row) => !isRunningCall(row.item))
+      blocks.pop()
+      if (settled.length > 0) blocks.push({ kind: 'activity', rows: settled, turnOpen: true })
+      for (const row of running) blocks.push({ kind: 'row', row })
+    }
+  }
   return blocks
 }
+
+/** A tool call that has been issued and has no recorded result yet. */
+const isRunningCall = (item: ViewItem): boolean => item.kind === 'tool' && item.result === undefined
 
 /** The newest assistant step belongs to a turn still open, and no newer message followed it. */
 function latestStepOpen(items: readonly ViewItem[]): boolean {
@@ -209,7 +224,7 @@ function latestStepOpen(items: readonly ViewItem[]): boolean {
  * Memoized: the app re-renders on every composer keystroke, and a long
  * transcript must not re-render with it while its own props are unchanged.
  */
-export const Transcript = memo(function Transcript({ items, events, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, openPath, project, onReviewFile, onReviewChanges, onOpenProcess }: {
+export const Transcript = memo(function Transcript({ items, events, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, openPath, openSkill, project, onReviewFile, onReviewChanges, onOpenProcess }: {
   readonly items: readonly ViewItem[]
   /** The raw log behind `items`; per-turn changes project from it. */
   readonly events?: readonly SseEvent[]
@@ -221,6 +236,8 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   /** Resends one failed turn's own inputs. */
   readonly onRetry?: (target: RetryTarget) => void
   readonly openPath?: OpenPathResolver
+  /** Opens a skill chip's SKILL.md in the workbench; null when the name is no skill. */
+  readonly openSkill?: (name: string) => (() => void) | null
   /** The conversation's project, for the per-turn change card's git chips. */
   readonly project?: WorkbenchProject | null
   /** Reviews one file of a turn: the Git view focused on that diff. */
@@ -276,23 +293,55 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   // blocks remain in the lightweight projection and can be mounted on demand.
   const [visibleLimit, setVisibleLimit] = useState(TRANSCRIPT_WINDOW)
   const visibleStart = Math.max(0, blocks.length - visibleLimit)
-  const visibleBlocks = blocks.slice(visibleStart)
-  // A Write/Edit row's file opens its diff the way the turn card's file row
-  // does: the Git view focused on that path. Stable across renders so the
-  // memoized tool cards keep their props.
-  const projectRoot = project?.path
-  const openDiff = useMemo<OpenPathResolver | undefined>(() => {
-    if (onReviewFile === undefined || projectRoot === undefined) return undefined
-    return (reference) => {
-      const relative = toProjectRelative(projectRoot, reference)
-      return relative === null ? null : () => onReviewFile(relative)
+  const visibleBlocks = useMemo(() => blocks.slice(visibleStart), [blocks, visibleStart])
+  // Reviews exactly the given turn's files in the Git view, in the
+  // project-relative form git status reports. Paths that resolve outside the
+  // project are dropped: git cannot see them anyway, and the card's own list
+  // still shows them.
+  const reviewAllOf = (changes: TurnChanges): (() => void) | undefined => {
+    if (onReviewChanges === undefined || project == null) return undefined
+    return () => {
+      const root = project.path
+      onReviewChanges(changes.files
+        .map((file) => toProjectRelative(root, file.path))
+        .filter((path): path is string => path !== null))
     }
-  }, [onReviewFile, projectRoot])
-  const turnChangeFooter = (turnId?: string): TurnChanges | undefined => {
-    if (turnId === undefined) return undefined
-    const changes = turnChangeMap.get(turnId)
-    return changes !== undefined && (changes.files.length > 0 || changes.uncertain.length > 0) ? changes : undefined
   }
+  // Each turn's change card sits at the END of that turn — after its last
+  // row, whether or not the turn wrote any answer text — and the open turn's
+  // card is the same element, live, growing as edits land.
+  const changeAnchors = useMemo(() => turnChangeAnchors(items, turnChangeMap), [items, turnChangeMap])
+  const changeCard = (anchor: TurnChangeAnchor): ReactNode => {
+    const review = reviewAllOf(anchor.changes)
+    return (
+      <div key={`turn-changes-${anchor.turnId}`} className="mt-1.5">
+        <TurnChangesCard
+          turnId={anchor.turnId}
+          changes={anchor.changes}
+          project={project ?? null}
+          live={anchor.live}
+          {...(openPath !== undefined ? { onOpenPath: openPath } : {})}
+          {...(onReviewFile !== undefined ? { onReviewFile } : {})}
+          {...(review !== undefined ? { onReviewAll: review } : {})}
+        />
+      </div>
+    )
+  }
+  // Each card follows the last mounted block that starts at or before its
+  // turn's final item. A turn older than the mounted window has no block here
+  // and its card stays unmounted with it.
+  const cardsAfter = useMemo(() => {
+    const placed = new Map<number, TurnChangeAnchor[]>()
+    if (visibleBlocks.length === 0) return placed
+    const firstStart = blockStart(visibleBlocks[0]!)
+    for (const anchor of changeAnchors) {
+      if (anchor.index < firstStart) continue
+      let position = visibleBlocks.length - 1
+      while (position > 0 && blockStart(visibleBlocks[position]!) > anchor.index) position -= 1
+      placed.set(position, [...(placed.get(position) ?? []), anchor])
+    }
+    return placed
+  }, [visibleBlocks, changeAnchors])
   const { scrollRef, contentRef, atBottom, onScroll, scrollToBottom, holdPosition } = useStickToBottom(conversationId)
 
   // Rows that arrived while the reader was away from the tail. Streaming into
@@ -314,28 +363,12 @@ export const Transcript = memo(function Transcript({ items, events, conversation
             item={item}
             workspaceId={workspaceId ?? null}
             {...(onReuse !== undefined ? { onReuse } : {})}
+            {...(openSkill !== undefined ? { openSkill } : {})}
           />
         )
       case 'assistant': {
         const turn = footers.get(index)
         const timing: TurnTiming | undefined = item.turnId !== undefined ? turnTimingMap.get(item.turnId) : undefined
-        // The card rides the same anchor row as the footer: the last answer
-        // of a CLOSED turn. An open turn's card would render mid-work and
-        // then never leave.
-        const changes = turn !== undefined ? turnChangeFooter(item.turnId) : undefined
-        // Review all narrows the Git view to exactly this turn's files, in
-        // the project-relative form git status reports. Paths that resolve
-        // outside the project are dropped: git cannot see them anyway, and
-        // the card's own list still shows them.
-        const review = changes !== undefined && onReviewChanges !== undefined && project != null
-          ? () => {
-              const root = project.path
-              const paths = changes.files
-                .map((file) => toProjectRelative(root, file.path))
-                .filter((path): path is string => path !== null)
-              onReviewChanges(paths)
-            }
-          : undefined
         return (
           <AssistantMessage
             key={`assistant-${index}`}
@@ -343,19 +376,13 @@ export const Transcript = memo(function Transcript({ items, events, conversation
             {...(modelLabel !== undefined ? { modelLabel } : {})}
             {...(turn !== undefined ? { turn } : {})}
             {...(timing !== undefined ? { timing } : {})}
-            {...(changes !== undefined ? { changes } : {})}
-            {...(changes !== undefined && project !== undefined ? { changesProject: project } : {})}
-            {...(changes !== undefined ? { changesWorkspaceId: workspaceId ?? null } : {})}
-            {...(changes !== undefined && openPath !== undefined ? { changesOpenPath: openPath } : {})}
-            {...(changes !== undefined && onReviewFile !== undefined ? { changesReviewFile: onReviewFile } : {})}
-            {...(review !== undefined ? { changesReviewAll: review } : {})}
           />
         )
       }
       case 'tool':
         // A folded run of waits keys on its first wait, so the row keeps its
         // identity (and an opened body) while newer waits replace it.
-        return <ToolCard key={folded?.[0]?.kind === 'tool' ? folded[0].call.id : item.call.id} item={item} {...(folded !== undefined ? { repeats: folded.length + 1 } : {})} hidden={hiddenSpawns.has(item.call.id)} workspaceId={workspaceId ?? null} {...(openPath !== undefined ? { openPath } : {})} {...(openDiff !== undefined ? { openDiff } : {})} />
+        return <ToolCard key={folded?.[0]?.kind === 'tool' ? folded[0].call.id : item.call.id} item={item} {...(folded !== undefined ? { repeats: folded.length + 1 } : {})} hidden={hiddenSpawns.has(item.call.id)} workspaceId={workspaceId ?? null} {...(openPath !== undefined ? { openPath } : {})} />
       case 'delegation':
         return <DelegationCard key={item.childSessionId} item={item} {...(onOpenChild !== undefined ? { onOpen: onOpenChild } : {})} />
       case 'audit':
@@ -370,6 +397,8 @@ export const Transcript = memo(function Transcript({ items, events, conversation
         return <HookContextMarker key={`hook-context-${index}`} item={item} />
       case 'command-expansion':
         return <CommandExpansionMarker key={`command-expansion-${index}`} item={item} />
+      case 'hook-rewake':
+        return <HookRewakeMarker key={`hook-rewake-${index}`} item={item} />
       case 'status':
         {
           // Retry exists only where the log names what to resend: the failed
@@ -416,7 +445,23 @@ export const Transcript = memo(function Transcript({ items, events, conversation
                   Load {Math.min(TRANSCRIPT_WINDOW, visibleStart)} earlier items
                 </button>
               ) : null}
-              {visibleBlocks.map((block) => {
+              {visibleBlocks.map((block, position) => {
+                const cards = cardsAfter.get(position)
+                const body = renderBlock(block)
+                return cards === undefined ? body : [body, ...cards.map(changeCard)]
+              })}
+            </div>
+          </div>
+        </div>
+        <ConversationMinimap items={items} scrollRef={scrollRef} contentRef={contentRef} />
+        {!atBottom ? <JumpToBottom unseen={unseen} onClick={scrollToBottom} /> : null}
+      </div>
+      </MarkdownFileLinkContext.Provider>
+      </ProcessLinkContext.Provider>
+    </HoldScrollProvider>
+  )
+
+  function renderBlock(block: Block): ReactNode {
                 // A spawn call its delegation row absorbed renders nothing —
                 // not even its spacing wrapper.
                 if (block.kind === 'row' && block.row.item.kind === 'tool' && hiddenSpawns.has(block.row.item.call.id)) return null
@@ -433,15 +478,60 @@ export const Transcript = memo(function Transcript({ items, events, conversation
                   )
                 }
                 return <div key={`row-${block.row.index}`} {...(isUserRow ? { 'data-minimap-index': block.row.index } : {})} className={spacing}>{render(block.row)}</div>
-              })}
-            </div>
-          </div>
-        </div>
-        <ConversationMinimap items={items} scrollRef={scrollRef} contentRef={contentRef} />
-        {!atBottom ? <JumpToBottom unseen={unseen} onClick={scrollToBottom} /> : null}
-      </div>
-      </MarkdownFileLinkContext.Provider>
-      </ProcessLinkContext.Provider>
-    </HoldScrollProvider>
-  )
+  }
 })
+
+/** The first item index a block renders. */
+const blockStart = (block: Block): number =>
+  block.kind === 'row' ? block.row.index : block.rows[0]?.index ?? 0
+
+/** Where one turn's change card goes: after item `index`, the turn's last. */
+export interface TurnChangeAnchor {
+  readonly turnId: string
+  readonly index: number
+  readonly changes: TurnChanges
+  /** The turn is still open: the card grows as edits land. */
+  readonly live: boolean
+}
+
+/**
+ * One anchor per turn that changed files (or tried to): the last item of the
+ * turn, so the card closes the turn whether its final row is an answer, a
+ * tool, or an error. A turn spans from its first assistant step to the next
+ * delivered user message; tool rows carry no turn of their own, so the span
+ * is read positionally, like the transcript itself.
+ */
+export function turnChangeAnchors(items: readonly ViewItem[], changes: ReadonlyMap<string, TurnChanges>): readonly TurnChangeAnchor[] {
+  const anchors: TurnChangeAnchor[] = []
+  let current: { turnId: string; live: boolean } | undefined
+  let last = -1
+  const close = (): void => {
+    if (current === undefined) return
+    const found = changes.get(current.turnId)
+    if (found !== undefined && (found.files.length > 0 || found.uncertain.length > 0)) {
+      anchors.push({ turnId: current.turnId, index: last, changes: found, live: current.live })
+    }
+    current = undefined
+  }
+  items.forEach((item, index) => {
+    if (item.kind === 'user') {
+      // Queued or withdrawn input is not in the column; it starts nothing.
+      if (item.queued === true || item.withdrawn === true) return
+      close()
+      return
+    }
+    if (item.kind === 'assistant' && item.turnId !== undefined) {
+      if (current?.turnId !== item.turnId) {
+        close()
+        current = { turnId: item.turnId, live: item.turnOpen === true }
+      } else if (item.turnOpen === true) {
+        current.live = true
+      } else {
+        current.live = false
+      }
+    }
+    if (current !== undefined) last = index
+  })
+  close()
+  return anchors
+}

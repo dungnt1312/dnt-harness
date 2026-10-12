@@ -80,6 +80,8 @@ async function main(): Promise<void> {
     userClaudeDir: path.join(homedir(), '.claude'),
     // Skills shipped with the app land in the read-only bundled layer.
     bundledSkillsDir: path.join(repoRoot(), 'skills'),
+    // Slash commands shipped with the app (/image, /video, …): the lowest command layer.
+    bundledCommandsDir: path.join(repoRoot(), 'commands'),
     // Credential folders stay off-limits to file tools in every mode.
     secretRoots: defaultSecretRoots(homedir()),
     seedDeepseekFromEnv: true,

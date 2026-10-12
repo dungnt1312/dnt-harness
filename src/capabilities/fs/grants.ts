@@ -69,7 +69,7 @@ async function deepestExisting(abs: string): Promise<string> {
 }
 
 /** The real location of `abs`, following links in its existing portion. */
-async function realTargetOf(abs: string): Promise<string> {
+export async function realTargetOf(abs: string): Promise<string> {
   const existing = await deepestExisting(abs)
   const realExisting = await realpathSafe(existing)
   return existing === abs ? realExisting : path.join(realExisting, path.relative(existing, abs))
@@ -230,9 +230,16 @@ export class OutOfGrantError extends Error {
   }
 }
 
+/**
+ * Whether an approval covers `abs`. A write approval covers reading and
+ * writing exactly its path. A read approval covers reading its path and
+ * everything under it: approvals are per call, and only Glob/Grep (whose
+ * approved target is the folder they search) descend below the named path.
+ */
 function approvedFor(approved: readonly ApprovedPath[] | undefined, abs: string, intent: PathIntent): boolean {
-  // A write approval covers reading the same path; a read approval never covers a write.
-  return approved?.some((entry) => samePath(entry.path, abs) && (entry.intent === 'write' || intent === 'read')) === true
+  return approved?.some((entry) => entry.intent === 'write'
+    ? samePath(entry.path, abs)
+    : intent === 'read' && within(entry.path, abs)) === true
 }
 
 /**
@@ -273,17 +280,22 @@ export async function resolveInGrants(exec: ToolExecution, target: string, inten
       return abs
     }
     case 'out-of-grant': {
-      if (!approvedFor(exec.approvedPaths, classified.abs, intent)) {
+      // The host approves the REAL location (links resolved, e.g. macOS
+      // `/tmp` → `/private/tmp`), and access goes to that real location, so
+      // a link swapped in after the approval cannot redirect it.
+      // Without any approval nothing is touched on disk before refusing.
+      if (exec.approvedPaths === undefined || exec.approvedPaths.length === 0) {
         throw new OutOfGrantError(target, classified.abs, intent)
       }
-      // The approver saw the lexical path. A link anywhere along it would
-      // redirect the approved access somewhere else, so refuse instead.
       const realTarget = await realTargetOf(classified.abs)
-      if (!samePath(realTarget, classified.abs)) {
-        throw new Error(`path '${target}' resolves through a link to '${realTarget}'; approve the real path instead`)
+      if (!approvedFor(exec.approvedPaths, realTarget, intent)) {
+        if (!samePath(realTarget, classified.abs) && approvedFor(exec.approvedPaths, classified.abs, intent)) {
+          throw new Error(`path '${target}' resolves through a link to '${realTarget}'; approve the real path instead`)
+        }
+        throw new OutOfGrantError(target, classified.abs, intent)
       }
       await assertNotDenied(target, classified.abs, realTarget, denied)
-      return classified.abs
+      return realTarget
     }
   }
 }
@@ -301,8 +313,10 @@ const PATH_ARGS: Readonly<Record<string, { readonly arg: string; readonly intent
   Edit: { arg: 'path', intent: 'write' },
   Glob: { arg: 'path', intent: 'read', optional: true },
   Grep: { arg: 'path', intent: 'read', optional: true },
-  // An image edit may read its source from a file; an attachment source has no path.
+  // An image edit or an image-to-video call may read its source from a file;
+  // an attachment source has no path.
   EditImage: { arg: 'path', intent: 'read' },
+  GenerateVideo: { arg: 'path', intent: 'read' },
 }
 
 /** One path a tool call targets, with the access it needs. */

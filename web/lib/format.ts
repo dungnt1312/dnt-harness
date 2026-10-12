@@ -124,6 +124,12 @@ export function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
+/** `139k → 42k tokens`, or `undefined` when the compaction was not measured. */
+export function compactionTokenChange(change: { readonly tokensBefore?: number; readonly tokensAfter?: number }): string | undefined {
+  if (change.tokensBefore === undefined || change.tokensAfter === undefined) return undefined
+  return `${formatTokenCount(change.tokensBefore)} → ${formatTokenCount(change.tokensAfter)} tokens`
+}
+
 /** Compact token count for chips: 940, 18.4k, 65k, 256k, 1M, 1.5M. */
 export function formatTokenCount(tokens: number): string {
   if (tokens < 1000) return String(Math.round(tokens))

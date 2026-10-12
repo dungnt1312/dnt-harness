@@ -1,6 +1,6 @@
 /**
  * Layered custom slash commands for one workspace (and its bound project):
- * `~/.claude/commands` < plugin command folders < `<ws>/commands` <
+ * bundled < `~/.claude/commands` < plugin command folders < `<ws>/commands` <
  * `<project>/.claude/commands` (ancestors first, nearest wins). Read fresh on
  * every call — command files are user-edited and small; the catalog is the
  * source of truth for the `/` menu, invocation and the model's catalog.
@@ -9,6 +9,8 @@ import path from 'node:path'
 import { commandKey, loadCommandLayers, projectCommandDirs, type CommandDefinition, type CommandLayer } from './catalog.ts'
 
 export interface CommandsServiceOptions {
+  /** Read-only commands shipped with the app; the lowest layer, so every other layer overrides it by name. */
+  readonly bundledDir?: string
   /** `~/.claude`; omitted skips the user layer. */
   readonly userClaudeDir?: string
   readonly projectRootOf?: (workspaceId: string, projectId: string) => string | undefined
@@ -30,6 +32,7 @@ export class CommandsService {
     const projectRoot = projectId !== undefined ? this.options.projectRootOf?.(workspaceId, projectId) : undefined
     const plugins = await this.options.pluginLayers?.(workspaceId, projectId).catch(() => []) ?? []
     return [
+      ...(this.options.bundledDir !== undefined ? [{ source: 'bundled' as const, dir: this.options.bundledDir }] : []),
       ...(this.options.userClaudeDir !== undefined ? [{ source: 'user' as const, dir: path.join(this.options.userClaudeDir, 'commands') }] : []),
       ...plugins,
       { source: 'workspace' as const, dir: this.workspaceCommandsDir(workspaceId) },

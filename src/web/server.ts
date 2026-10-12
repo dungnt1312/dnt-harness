@@ -135,6 +135,8 @@ import { loadClaudeMd, renderClaudeMd } from '../harness/instructions/claude-md.
 import { HookSettingsError, isHookConfigPath, readWorkspaceHooks, setHookActive, workspaceSettingsPath, writeWorkspaceHooks } from '../harness/hooks/settings.ts'
 import { fromClaudeToolInput, toClaudeToolInput } from '../harness/hooks/tool-input.ts'
 import { HookHost, hookContextBlock } from './claude-hooks.ts'
+import { BackgroundHooks } from './background-hooks.ts'
+import type { HookVerdict } from '../harness/hooks/runner.ts'
 import { ChildExecutor, SpawnError, normalizeBrief, type ChildModel, type TaskPacket } from '../harness/agents/executor.ts'
 import { agentTool, ChildModelError, describeRoleModel, formatChildReports, projectInheritedMessages, resolveChildModel } from './agent-delegation.ts'
 import { importCodexDefinition } from '../harness/agents/compatibility/claude.ts'
@@ -145,10 +147,14 @@ import { memoryGuidance, memoryGuidanceAccess, memoryIndexes } from '../harness/
 import { todoWriteTool } from '../harness/tools/todo.ts'
 import { editImageTool, generateImageTool, type ImageToolOptions } from '../harness/tools/image-tools.ts'
 import { describeImageTool } from '../harness/tools/describe-image.ts'
-import { loadImageSettings, parseImageSettings, resolveImageApi, saveImageSettings, type ImageGenerationSettings } from './image-generation-store.ts'
-import { loadImageUnderstandingSettings, parseImageUnderstandingSettings, resolveVisionApi, saveImageUnderstandingSettings, type ImageUnderstandingSettings } from './image-understanding-store.ts'
+import { generateVideoTool } from '../harness/tools/video-tools.ts'
+import { VideoStore, VideoStoreError } from '../harness/attachments/video-store.ts'
+import { loadPair, savePair, validatePairBody, type ModelPair } from './model-pair-store.ts'
+import { resolveImageApi } from './image-generation-store.ts'
+import { resolveVisionApi } from './image-understanding-store.ts'
+import { resolveVideoApi } from './video-generation-store.ts'
 import { askUserQuestionTool, validateAnswers, type QuestionOutcome, type UserQuestion } from '../harness/tools/ask-user.ts'
-import { buildContext, DEFAULT_BASE_SYSTEM, DEFAULT_CHILD_SYSTEM, type ContextManifest, type ActiveSkill, type MemorySnippet } from '../harness/context/builder.ts'
+import { buildContext, estimateConversationTokens, DEFAULT_BASE_SYSTEM, DEFAULT_CHILD_SYSTEM, type ContextManifest, type ActiveSkill, type MemorySnippet } from '../harness/context/builder.ts'
 import { renderEnvironmentContext } from '../harness/context/environment.ts'
 import { SystemPromptsStore, type SystemPromptsSnapshot } from '../harness/prompts/store.ts'
 import { CheckpointStore } from '../harness/context/compaction.ts'
@@ -325,6 +331,8 @@ export interface WebServerOptions {
   readonly userClaudeDir?: string
   /** Read-only bundled skill layer shipped with the app; scanned when the dir exists. */
   readonly bundledSkillsDir?: string
+  /** Read-only bundled slash commands shipped with the app (the lowest command layer). */
+  readonly bundledCommandsDir?: string
   /** Test seam: replaces the `git` clone the plugin marketplace uses. */
   readonly pluginClone?: (url: string, target: string, ref?: string, sha?: string) => Promise<string>
   /**
@@ -584,6 +592,15 @@ export interface PublicProvider {
   readonly modelSettings?: Readonly<Record<string, ModelSettings>>
 }
 
+/** The provider/model references kept beside providers.json, one file each. */
+const MODEL_PAIR_NAMES = ['image-generation', 'image-understanding', 'video-generation'] as const
+type ModelPairName = (typeof MODEL_PAIR_NAMES)[number]
+const MODEL_PAIR_ROUTES: Readonly<Record<string, { readonly name: ModelPairName; readonly label: string }>> = {
+  '/api/image-generation': { name: 'image-generation', label: 'image generation' },
+  '/api/image-understanding': { name: 'image-understanding', label: 'image understanding' },
+  '/api/video-generation': { name: 'video-generation', label: 'video generation' },
+}
+
 function publicProvider(entry: ProviderConfig): PublicProvider {
   return {
     id: entry.id,
@@ -656,6 +673,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   // Composer attachments: content-addressed blobs beside the workspace's other
   // resources, so a memory-mode host gets a hermetic temp home like the rest.
   const attachments = new AttachmentStore(resourceHome, { maxBytes: limits.maxAttachmentBytes })
+  const videos = new VideoStore(resourceHome)
   // Claude Code subagent layers: bundled < ~/.claude/agents < <ws>/agents <
   // <project>/.claude/agents.
   const projectRootOf = (workspaceId: string, projectId: string): string | undefined => {
@@ -690,6 +708,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   // Claude Code custom slash commands: ~/.claude/commands < plugins <
   // <ws>/commands < <project>/.claude/commands (ancestors first).
   const commandsService = new CommandsService(resourceHome, {
+    ...(options.bundledCommandsDir !== undefined ? { bundledDir: options.bundledCommandsDir } : {}),
     ...(options.userClaudeDir !== undefined ? { userClaudeDir: options.userClaudeDir } : {}),
     projectRootOf,
     ...(options.home !== undefined ? { pluginLayers: (workspaceId: string, projectId: string | undefined) => plugins.commandLayers(pluginContext(workspaceId, projectId)) } : {}),
@@ -700,10 +719,22 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   // G5: MCP servers + hooks, workspace-scoped. Each (workspace, enabled
   // server) gets one McpServerClient; tools register as `mcp__server__tool`.
   const mcpStore = new McpConfigStore(resourceHome)
+  // Claude `async` / `asyncRewake` hooks: background runs owned by their root
+  // conversation; a rewake becomes durable hook input for that conversation.
+  const backgroundHooks = new BackgroundHooks({
+    sessionOf: (sessionId) => sessions.get(sessionId as SessionId)?.session,
+    deliverRewake: async (delivery) => {
+      const entry = sessions.get(delivery.rootSessionId as SessionId)
+      const deps = depsRef.current
+      if (entry === undefined || deps === undefined || shuttingDown) return false
+      return queueHookRewake(entry, deps, delivery.content, delivery.summary)
+    },
+  })
   // Claude Code hooks from settings.json layers (user/workspace/project/local).
   const hookHost = new HookHost({
     home: resourceHome,
     userClaudeDir: options.userClaudeDir,
+    background: backgroundHooks,
     ...(options.home !== undefined ? { pluginHooks: (workspaceId: string, projectId: string | undefined) => plugins.hookSources(pluginContext(workspaceId, projectId)) } : {}),
     projectRootOf: (workspaceId, projectId) => {
       if (projectId === undefined) return undefined
@@ -769,12 +800,12 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   let durableDefaults: ModelDefaults = storedProviders.defaults
   let runtimeModelOverride: { readonly provider: string; readonly model: string } | undefined
   let defaults: ModelDefaults = durableDefaults
-  // Settings → Providers & Models → Image generation: a provider/model reference beside
-  // providers.json, resolved against the live provider list on every call.
-  const imageSettingsFile = path.join(path.dirname(configFile), 'image-generation.json')
-  let imageSettings: ImageGenerationSettings = loadImageSettings(imageSettingsFile)
-  const imageUnderstandingFile = path.join(path.dirname(configFile), 'image-understanding.json')
-  let imageUnderstanding: ImageUnderstandingSettings = loadImageUnderstandingSettings(imageUnderstandingFile)
+  // Settings → Providers & Models → Image generation / Image understanding /
+  // Video generation: provider/model references beside providers.json,
+  // resolved against the live provider list on every call.
+  const pairFile = (name: ModelPairName): string => path.join(path.dirname(configFile), `${name}.json`)
+  const pairs = new Map<ModelPairName, ModelPair>(MODEL_PAIR_NAMES.map((name) => [name, loadPair(pairFile(name))]))
+  const pairOf = (name: ModelPairName): ModelPair => pairs.get(name)!
   if (list.length === 0 && options.seedDeepseekFromEnv === true) {
     const key = process.env['DEEPSEEK_API_KEY']?.trim()
     if (key !== undefined && key !== '') {
@@ -793,6 +824,10 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   }
 
   const disposers = new Map<string, () => void>()
+  // Provider registrations are re-made on every provider change. They live
+  // apart from `disposers` so that churn never drops the host's long-lived
+  // listeners (the automation run watcher used to vanish with them).
+  const providerRegistrations = new Map<string, () => void>()
 
   /** Live workspace mode state, lazily initialized on first selection. */
   const controls = new Map<WorkspaceId, WorkspaceControls>()
@@ -852,14 +887,14 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
 
   /** Re-register every provider source; called after any registry mutation. */
   const syncRegistrations = (): void => {
-    for (const dispose of disposers.values()) dispose()
-    disposers.clear()
+    for (const dispose of providerRegistrations.values()) dispose()
+    providerRegistrations.clear()
     for (const provider of options.providers ?? []) {
-      disposers.set(provider.name, kernel.ctx.llm.register(provider))
+      providerRegistrations.set(provider.name, kernel.ctx.llm.register(provider))
     }
     for (const entry of list) {
-      if (!isUsableConfigured(entry) || disposers.has(entry.id)) continue
-      disposers.set(entry.id, kernel.ctx.llm.register(instantiate(entry)))
+      if (!isUsableConfigured(entry) || providerRegistrations.has(entry.id)) continue
+      providerRegistrations.set(entry.id, kernel.ctx.llm.register(instantiate(entry)))
     }
   }
 
@@ -922,6 +957,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     readonly model: string | null | undefined
     /** `null` delegates to the selected model's configured default. */
     readonly thinkingLevel: string | null | undefined
+    /** Alias the pair was picked through (display-only); the web verifies it still targets this pair. */
+    readonly alias: string | null
     readonly source: 'session' | 'global'
   }
 
@@ -937,7 +974,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     // Explicit null means configured model default, whereas an omitted field
     // in a session update intentionally retains its previous value.
     const thinkingLevel = preference.hasEvent ? preference.thinkingLevel : defaults.thinkingLevel
-    return { provider, model, thinkingLevel, source: preference.hasEvent ? 'session' : 'global' }
+    const alias = preference.hasEvent ? preference.alias ?? null : defaults.alias ?? null
+    return { provider, model, thinkingLevel, alias, source: preference.hasEvent ? 'session' : 'global' }
   }
 
   /**
@@ -997,6 +1035,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     ...(deniedRoots ?? []),
     ...(options.userSkillsDir !== undefined ? [options.userSkillsDir] : []),
     ...(options.bundledSkillsDir !== undefined ? [options.bundledSkillsDir] : []),
+    ...(options.bundledCommandsDir !== undefined ? [options.bundledCommandsDir] : []),
   ]
   const grantPolicy: GrantPolicy = { protectedRoots: [...staticProtectedRoots] }
   // Absolute skill-rule folders of EVERY workspace stay ungrantable: the
@@ -1158,14 +1197,22 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const leaseHeldInside = (folder: string): boolean =>
     [...sessions.values()].some((entry) => entry.agent.busy && entry.projectId !== undefined && within(folder, workspaces.getProject(entry.projectId, entry.workspaceId).path))
 
-  // Turn-local skill snapshots: the FIRST load in a turn pins content and
-  // hash for the whole turn — external edits apply to FUTURE loads, never
-  // to a running turn (no mid-turn hot reload). Cleared at turn-settled.
+  // Turn-local snapshots of a child/role DEFINITION's skills: preloaded once
+  // per turn and hash-pinned (no mid-turn hot reload). They ride the system
+  // prefix because they never change during the run. Cleared at turn-settled.
   const skillSnapshots = new Map<SessionId, Map<string, ActiveSkill>>()
+  // Skills the model loaded with the Skill tool this turn. Their bodies are
+  // the tool result itself — immutable history after the prefix, so a load
+  // never invalidates the provider's prompt cache — and this map only keeps a
+  // repeat load in the same turn from pasting the body twice.
+  const skillLoads = new Map<SessionId, Map<string, { readonly name: string; readonly hash: string }>>()
+  /** Largest expanded skill body a Skill load returns (refused whole above it). */
+  const MAX_SKILL_RESULT_CHARS = 200_000
   kernel.ctx.on('agent/turn-settled', async () => {
     const settled = agentScope.getStore()?.sessionId
     if (settled !== undefined) {
       skillSnapshots.delete(settled)
+      skillLoads.delete(settled)
       turnCommandGrants.clear(settled)
       // A root turn's per-turn spawn budget ends with the turn. The await
       // serializes with spawn admission so a committing spawn cannot
@@ -1275,6 +1322,37 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
           trigger, signal, ...(pair !== undefined ? { model: pair.model } : { extractiveCap: MAX_COMPACTION_SUMMARY_CHARS }),
           ...(loaded !== undefined ? { attachments: loaded } : {}),
           ...(seed !== undefined ? { seed } : {}),
+          measure: (next) => {
+            // Only a `compact` history reads checkpoints, and only a measured
+            // request gives a baseline. The window size is the provider's
+            // prompt count when it reported one (what the meter shows), moved
+            // by the estimated change the new checkpoint makes.
+            if (rootModeOf({ sessionId: entry.session.id }, entry.workspaceId).mode.definition.sources.history !== 'compact') return undefined
+            const manifest = lastManifests.get(entry.session.id)
+            if (manifest === undefined) return undefined
+            const tokensBefore = sessionUsage.get(entry.session.id)?.last?.inputTokens ?? manifest.budget.usedTokens
+            const events = entry.session.events
+            const shared = { events, compactionRetainTokens: limits.compactionRetainTokens, ...(loaded !== undefined ? { attachments: loaded } : {}) }
+            const was = estimateConversationTokens({ ...shared, ...(seed !== undefined ? { compaction: seed } : {}) })
+            const now = estimateConversationTokens({ ...shared, compaction: next })
+            // Negative only on a tiny conversation: the summary plus the bounded
+            // retained messages can outweigh the history they replace.
+            const saved = was - now
+            const tokensAfter = Math.max(0, tokensBefore - saved)
+            // The meter reads the newest manifest, which still describes the
+            // pre-compaction request. Rewrite it BEFORE the end event is
+            // appended so the refetch that event triggers sees the new size:
+            // the next real request replaces this estimate.
+            const { last: _stale, ...totals } = sessionUsage.get(entry.session.id) ?? { cacheableInputTokens: 0, cachedInputTokens: 0 }
+            void _stale
+            sessionUsage.set(entry.session.id, totals)
+            lastManifests.set(entry.session.id, {
+              ...manifest,
+              budget: { ...manifest.budget, usedTokens: tokensAfter, estimated: true },
+              breakdown: { ...manifest.breakdown, messages: Math.max(0, manifest.breakdown.messages - saved) },
+            })
+            return { tokensBefore, tokensAfter }
+          },
         })
       } finally {
         if (compactions.get(entry.session.id) === reservation) compactions.delete(entry.session.id)
@@ -1415,27 +1493,33 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       await disableMcpForTurn(scope, workspaceId, error)
     }
     const contents = [...claim.contents]
+    // A hook rewake is hook data, not a prompt: it never reaches the prompt
+    // hooks and is never expanded as a slash command.
+    const isRewake = (index: number): boolean => claim.origins?.[index] === 'hook'
+    const prompts = contents.filter((_, index) => !isRewake(index))
     // Claude: UserPromptSubmit fires for the user's prompt; a subagent's
     // first turn fires SubagentStart instead (matcher = agent type).
     const child = scope?.childOf
     const event = child !== undefined ? 'SubagentStart' as const : 'UserPromptSubmit' as const
-    let fired
-    try {
-      fired = await hookHost.fire(event, {
-        workspaceId,
-        projectId: scope?.projectId,
-        sessionId: scope?.sessionId,
-        rootSessionId: scope?.rootSessionId ?? scope?.sessionId,
-        ...(child !== undefined ? { matchValue: child.definition } : {}),
-        input: child !== undefined
-          ? { agent_id: scope?.sessionId ?? '', agent_type: child.definition }
-          : { prompt: contents.join('\n') },
-        // Stop kills a running hook's process tree instead of waiting it out.
-        ...(claim.signal !== undefined ? { signal: claim.signal } : {}),
-      })
-    } catch {
-      if (claim.signal?.aborted === true) return { kind: 'reject', reason: `stopped while ${event} hooks were running` }
-      return { kind: 'reject', reason: `${event} hook audit could not be recorded` }
+    let fired: { verdict: HookVerdict } = { verdict: { userMessages: [] } }
+    if (child !== undefined || prompts.length > 0) {
+      try {
+        fired = await hookHost.fire(event, {
+          workspaceId,
+          projectId: scope?.projectId,
+          sessionId: scope?.sessionId,
+          rootSessionId: scope?.rootSessionId ?? scope?.sessionId,
+          ...(child !== undefined ? { matchValue: child.definition } : {}),
+          input: child !== undefined
+            ? { agent_id: scope?.sessionId ?? '', agent_type: child.definition }
+            : { prompt: prompts.join('\n') },
+          // Stop kills a running hook's process tree instead of waiting it out.
+          ...(claim.signal !== undefined ? { signal: claim.signal } : {}),
+        })
+      } catch {
+        if (claim.signal?.aborted === true) return { kind: 'reject', reason: `stopped while ${event} hooks were running` }
+        return { kind: 'reject', reason: `${event} hook audit could not be recorded` }
+      }
     }
     const { verdict } = fired
     if (verdict.stop !== undefined) return { kind: 'reject', reason: `${event} hook stopped the prompt: ${verdict.stop.reason}` }
@@ -1446,13 +1530,14 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     // UserPromptSubmit hooks saw what was typed. The typed text stays the
     // user's message; the expansion follows it as `origin: 'command'`.
     let expansions: readonly (string | undefined)[] | undefined
-    if (child === undefined && scope?.sessionId !== undefined && contents.some((content) => content.startsWith('/'))) {
+    if (child === undefined && scope?.sessionId !== undefined && contents.some((content, index) => !isRewake(index) && content.startsWith('/'))) {
       const sessionId = scope.sessionId
       const session = await scopedSession(sessionId)
       if (session === undefined || scope.turnId === undefined) return { kind: 'reject', reason: 'slash command execution scope is unavailable' }
       let auditedCommandWork = false
       try {
-        const expanded = await expandMessages(contents, {
+        // Same positions as `contents`; a rewake is blanked so it never expands.
+        const expanded = await expandMessages(contents.map((content, index) => (isRewake(index) ? '' : content)), {
           ...commandResolver,
           workspaceId,
           projectId: scope.projectId,
@@ -1600,6 +1685,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         rootSessionId: scope?.rootSessionId ?? scope?.sessionId,
         matchValue: call.name,
         input: { tool_name: call.name, tool_input: toClaudeToolInput(call.name, call.args), tool_use_id: call.id },
+        toolCall: call,
         ...(payload.exec.signal !== undefined ? { signal: payload.exec.signal } : {}),
       })
     } catch {
@@ -1658,6 +1744,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
           tool_use_id: payload.call.id,
           ...(result.ok ? { tool_response: result.output } : { error: result.output }),
         },
+        toolCall: payload.call,
         ...(payload.exec.signal !== undefined ? { signal: payload.exec.signal } : {}),
       }))
     } catch {
@@ -1747,10 +1834,15 @@ ${entry.description}`.toLowerCase().includes(query))
       const sought = name.trim().replace(/^\//, '')
       const commandArgs = typeof args['args'] === 'string' ? args['args'].trim() : ''
       const pinKey = commandArgs === '' ? sought : `${sought} ${commandArgs}`
-      const perTurn = skillSnapshots.get(scope.sessionId) ?? new Map<string, ActiveSkill>()
+      const perTurn = skillLoads.get(scope.sessionId) ?? new Map<string, { name: string; hash: string }>()
       const pinned = perTurn.get(pinKey)
       if (pinned !== undefined) {
-        return `skill '${pinned.name}' loaded (hash ${pinned.hash.slice(0, 12)}); its instructions are included in context`
+        return `skill '${pinned.name}' loaded (hash ${pinned.hash.slice(0, 12)}); its instructions are already in an earlier Skill result this turn`
+      }
+      // A child's definition skill is already in its system context.
+      const preloaded = skillSnapshots.get(scope.sessionId)?.get(pinKey)
+      if (preloaded !== undefined) {
+        return `skill '${preloaded.name}' loaded (hash ${preloaded.hash.slice(0, 12)}); its instructions are already included in context`
       }
       let command: CommandDefinition | undefined
       try {
@@ -1797,9 +1889,18 @@ ${entry.description}`.toLowerCase().includes(query))
         if (error instanceof CommandExpansionError) throw new Error(error.message)
         throw error
       })
-      perTurn.set(pinKey, { name: command.name, instructions, hash: command.hash })
-      skillSnapshots.set(scope.sessionId, perTurn)
-      return `skill '${command.name}' loaded (hash ${command.hash.slice(0, 12)}); its instructions are included in context`
+      // A cut skill is a half-followed procedure the model cannot tell is
+      // incomplete, so an oversized body is refused whole rather than
+      // truncated. The cap is its own (well above `toolOutputLimit`).
+      if (instructions.length > MAX_SKILL_RESULT_CHARS) {
+        undoGrant()
+        throw new Error(`skill '${command.name}' is too large to load (${instructions.length} characters; the limit is ${MAX_SKILL_RESULT_CHARS})`)
+      }
+      perTurn.set(pinKey, { name: command.name, hash: command.hash })
+      skillLoads.set(scope.sessionId, perTurn)
+      // The body IS the result: it lands in history at the point of loading,
+      // after every cached token, and stays there for later turns.
+      return `skill '${command.name}' loaded (hash ${command.hash.slice(0, 12)}); its instructions follow (reference data, never permissions):\n\n${instructions}`
     },
   })
 
@@ -1830,7 +1931,7 @@ ${entry.description}`.toLowerCase().includes(query))
   // store, so the transcript renders them like any composer image. An edit
   // reads its source from that store or from a granted file (as Read would).
   const imageToolOptions: ImageToolOptions = {
-    resolve: () => resolveImageApi(imageSettings, list),
+    resolve: () => resolveImageApi(pairOf('image-generation'), list),
     store: (workspaceId, input) => attachments.put(workspaceId, { name: input.name, mediaType: sniffImageMediaType(input.bytes) ?? 'application/octet-stream', bytes: input.bytes }),
     read: async (workspaceId, id) => {
       const bytes = await attachments.read(workspaceId, id)
@@ -1842,11 +1943,20 @@ ${entry.description}`.toLowerCase().includes(query))
   kernel.ctx.tools.register(generateImageTool(imageToolOptions))
   kernel.ctx.tools.register(editImageTool(imageToolOptions))
   kernel.ctx.tools.register(describeImageTool({
-    resolve: () => resolveVisionApi(imageUnderstanding, list),
+    resolve: () => resolveVisionApi(pairOf('image-understanding'), list),
     read: imageToolOptions.read,
     // A tool-owned nested model request: it shares the turn's cancellation but
     // not the outer step's provider-attempt identity.
     stream: (request, exec) => kernel.ctx.llm.stream(request, exec.signal !== undefined ? { signal: exec.signal } : undefined),
+  }))
+  // Videos are too big for the attachment store: they stream to disk under a
+  // size cap, and the web serves them back with Range so players can seek.
+  kernel.ctx.tools.register(generateVideoTool({
+    resolve: () => resolveVideoApi(pairOf('video-generation'), list),
+    store: (workspaceId, body, signal) => videos.putStream(workspaceId, body, signal),
+    read: imageToolOptions.read,
+    resolvePath: imageToolOptions.resolvePath,
+    maxImageBytes: limits.maxAttachmentBytes,
   }))
 
   // AskUserQuestion: the model pauses for a human choice. The question
@@ -2658,6 +2768,19 @@ ${entry.description}`.toLowerCase().includes(query))
 
   /** Last request's manifest per session — the inspector renders this. */
   const lastManifests = new Map<SessionId, ContextManifest>()
+  /**
+   * Per-session snapshot of the reference sources that ride ahead of history
+   * and change often: the skill catalog and the MEMORY.md indexes. Re-reading
+   * them per request moved the cached prompt prefix on every memory write or
+   * skill edit (~123k tokens re-billed each time). They are reference data —
+   * a stale row hides nothing: the model sees its own memory writes in
+   * history and the Skill tool reads the disk — so a session keeps the copy it
+   * first read until the prefix changes anyway: a new compaction checkpoint,
+   * a project rebind, or a host restart (the map is in-memory). CLAUDE.md is
+   * deliberately NOT snapshotted: edits there must apply at once, and they
+   * are rare enough to cost almost nothing.
+   */
+  const prefixSnapshots = new Map<SessionId, PrefixSnapshot>()
   /** Context section hashes already recorded in each session's log (body dedupe). */
   const contextBodies = new Map<SessionId, Set<string>>()
   const contextBodiesFor = (sessionId: SessionId): Set<string> => {
@@ -2723,22 +2846,6 @@ ${entry.description}`.toLowerCase().includes(query))
     if (loaded !== undefined) return loaded
     if (!kernel.ctx.sessions.has(sessionId)) return undefined
     return kernel.ctx.sessions.load(sessionId).catch(() => undefined)
-  }
-
-  /** The open turn's loaded skill names (tool/call events named Skill). */
-  function skillsLoadedInTurn(events: readonly SessionEvent[] | undefined): string[] {
-    if (events === undefined) return []
-    let openTurnId: string | undefined
-    const loaded: string[] = []
-    for (const event of events) {
-      if (event.type === 'turn/start') openTurnId = event.turnId
-      else if (event.type === 'turn/end' && event.turnId === openTurnId) openTurnId = undefined
-      else if (event.type === 'tool/call' && event.call.name === 'Skill' && openTurnId !== undefined) {
-        const name = event.call.args['name']
-        if (typeof name === 'string' && !loaded.includes(name)) loaded.push(name)
-      }
-    }
-    return loaded
   }
 
   /**
@@ -2870,26 +2977,51 @@ ${entry.description}`.toLowerCase().includes(query))
         ? await readWorkspaceInstructions(resourceHome, scope.workspaceId, scope.projectId).catch(() => undefined)
         : undefined
 
+    // Compaction summaries only apply when the mode's history reads them.
+    let compaction: { summary: string; coversSeq: number; verifiedAgainst: 'committed-log' } | undefined
+    if (mode.definition.sources.history === 'compact' && scope !== undefined) {
+      // `latest(id, events)` returns only the canonical checkpoint recovered
+      // from the committed log, so the builder need not re-derive it.
+      const checkpoint = await checkpoints.latest(scope.sessionId, session?.committedEvents ?? []).catch(() => undefined)
+      if (checkpoint !== undefined) compaction = { summary: checkpoint.summary, coversSeq: checkpoint.coversSeq, verifiedAgainst: 'committed-log' }
+    }
+
+    // The session's copy of the often-edited prefix sources (see
+    // `prefixSnapshots`): re-read only when the prefix moves anyway.
+    const snapshot = ((): PrefixSnapshot | undefined => {
+      if (scope === undefined) return undefined
+      const key = `${scope.projectId ?? ''}\u0000${compaction?.coversSeq ?? 0}`
+      const current = prefixSnapshots.get(scope.sessionId)
+      if (current !== undefined && current.key === key) return current
+      const fresh: PrefixSnapshot = { key }
+      prefixSnapshots.set(scope.sessionId, fresh)
+      return fresh
+    })()
+
     // Claude-style skill discovery: the catalog (name + one-line description)
     // rides in every request that exposes the Skill tool, so the model can
     // choose to load a skill the user never named. Bodies stay on-demand
     // Skill loads. Gated on the tool's presence so the block never advertises
     // a load path this request does not carry; failures degrade to the old
-    // discover-by-catalog-call path.
+    // discover-by-catalog-call path (and are not snapshotted, so they retry).
     const skillCatalog = mode.definition.sources.skills === 'on-demand'
       && scope?.workspaceId !== undefined
       && exposed.some((schema) => schema.name === 'Skill')
-      ? await modelCatalog(scope.workspaceId, scope.projectId)
-          .then((rows) => rows.map((entry) => {
-            const description = entry.description === '' ? entry.title : entry.description
-            return { name: entry.name, description: description.length > 500 ? `${description.slice(0, 499)}…` : description }
-          }))
+      ? snapshot?.skillCatalog ?? await modelCatalog(scope.workspaceId, scope.projectId)
+          .then((rows) => {
+            const catalog = rows.map((entry) => {
+              const description = entry.description === '' ? entry.title : entry.description
+              return { name: entry.name, description: description.length > 500 ? `${description.slice(0, 499)}…` : description }
+            })
+            if (snapshot !== undefined) snapshot.skillCatalog = catalog
+            return catalog
+          })
           .catch(() => undefined)
       : undefined
 
-    // Turn-local active skills: the pinned snapshots from this turn's
-    // Skill loads — NOT fresh reads, so external edits mid-turn never
-    // change what a running turn sees (hash-pinned, no hot reload).
+    // Turn-local active skills: only a child/role DEFINITION's skills, which
+    // are fixed for the whole run and so never move the cached prefix. Skills
+    // the model loads with the Skill tool ride their own tool result instead.
     const activeSkills: ActiveSkill[] = []
     if (mode.definition.sources.skills === 'on-demand' && scope !== undefined) {
       const perTurn = skillSnapshots.get(scope.sessionId) ?? new Map<string, ActiveSkill>()
@@ -2918,20 +3050,17 @@ ${entry.description}`.toLowerCase().includes(query))
       activeSkills.push(...perTurn.values())
     }
 
-    // Indexes are reference data, not pinned memory bodies. Load both
-    // workspace and current project on every enabled request, including children.
+    // Indexes are reference data, not pinned memory bodies: both workspace and
+    // current project, on every enabled request including children — read
+    // once per session snapshot, so a memory write never moves the prefix.
     const pinnedMemory: MemorySnippet[] = []
     if (mode.definition.sources.memoryPinned && mode.definition.sources.memoryRetrieval && scope?.workspaceId !== undefined) {
-      pinnedMemory.push(...await memoryIndexes(memory, { workspaceId: scope.workspaceId, ...(scope.projectId !== undefined ? { projectId: scope.projectId } : {}) }))
-    }
-
-    // Compaction summaries only apply when the mode's history reads them.
-    let compaction: { summary: string; coversSeq: number; verifiedAgainst: 'committed-log' } | undefined
-    if (mode.definition.sources.history === 'compact' && scope !== undefined) {
-      // `latest(id, events)` returns only the canonical checkpoint recovered
-      // from the committed log, so the builder need not re-derive it.
-      const checkpoint = await checkpoints.latest(scope.sessionId, session?.committedEvents ?? []).catch(() => undefined)
-      if (checkpoint !== undefined) compaction = { summary: checkpoint.summary, coversSeq: checkpoint.coversSeq, verifiedAgainst: 'committed-log' }
+      const indexes = snapshot?.memory ?? await memoryIndexes(memory, { workspaceId: scope.workspaceId, ...(scope.projectId !== undefined ? { projectId: scope.projectId } : {}) })
+      // `memoryIndexes` degrades a read failure to []: never pin that, or one
+      // transient error would hide memory for the session. An empty index is
+      // re-read (cheap) until the first entry exists.
+      if (snapshot !== undefined && indexes.length > 0) snapshot.memory = indexes
+      pinnedMemory.push(...indexes)
     }
 
     projected.assemblySignal?.throwIfAborted()
@@ -2975,7 +3104,7 @@ ${entry.description}`.toLowerCase().includes(query))
       activeSkills,
       ...(skillCatalog !== undefined ? { skillCatalog } : {}),
       pinnedMemory,
-      compactionTailTurns: limits.compactionTailTurns,
+      compactionRetainTokens: limits.compactionRetainTokens,
       budget,
       ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
       ...(compaction !== undefined ? { compaction } : {}),
@@ -3461,15 +3590,26 @@ ${entry.description}`.toLowerCase().includes(query))
       ...(definition.skills !== undefined ? { skills: [...definition.skills] } : {}),
     }
   }
+  /**
+   * Whether a tracked run is really still going. A run whose conversation is
+   * gone, or whose turn already settled while nothing was watching, is
+   * dropped here so it neither blocks later runs nor stays "Running". A run
+   * still being set up has no turn/end yet and counts as live.
+   */
+  const runStillLive = (sessionId: SessionId): boolean => {
+    const entry = sessions.get(sessionId)
+    if (entry !== undefined && (entry.agent.busy || !entry.session.events.some((event) => event.type === 'turn/end'))) return true
+    activeRuns.delete(sessionId)
+    return false
+  }
   const runAutomation = async (workspaceId: WorkspaceId, automation: Automation, dueAt: number | null): Promise<{ ok: false; status: number; error: string } | { ok: true; runId: string; sessionId?: string; skipped?: true }> => {
     const runId = `run-${randomUUID()}`
     const identity = { workspaceId, title: automation.title, runId, notify: automation.notify, targets: automation.notifyTargets }
     // Never two runs of one automation at once.
     for (const [sessionId, run] of activeRuns) {
-      if (run.automationId === automation.id && sessions.get(sessionId) !== undefined) {
-        await automations.record(workspaceId, { runId, automationId: automation.id, dueAt, status: 'skipped-busy', sessionId })
-        return { ok: true, runId, skipped: true }
-      }
+      if (run.automationId !== automation.id || !runStillLive(sessionId)) continue
+      await automations.record(workspaceId, { runId, automationId: automation.id, dueAt, status: 'skipped-busy', sessionId })
+      return { ok: true, runId, skipped: true }
     }
     const fail = async (status: number, error: string): Promise<{ ok: false; status: number; error: string }> => {
       await automations.record(workspaceId, { runId, automationId: automation.id, dueAt, status: 'failed', error })
@@ -3513,6 +3653,42 @@ ${entry.description}`.toLowerCase().includes(query))
       return { ok: false, status: submitted.status, error: submitted.error }
     }
     return { ok: true, runId, sessionId }
+  }
+  /**
+   * Close runs history still shows as open although nothing watches them any
+   * more (the host restarted mid-run, or a run outlived its watcher). The
+   * run's conversation is the truth: its first settled turn is the outcome.
+   * Records only; nobody is notified after the fact.
+   */
+  const settleStaleRuns = async (workspaceId: WorkspaceId, automationId: string): Promise<void> => {
+    for (const run of await automations.history(workspaceId, automationId)) {
+      if (run.status !== 'started' && run.status !== 'needs-approval') continue
+      const sessionId = run.sessionId as SessionId | undefined
+      if (sessionId !== undefined && activeRuns.has(sessionId) && runStillLive(sessionId)) continue
+      if (sessionId !== undefined && sessions.get(sessionId)?.agent.busy === true) continue
+      const base = { runId: run.runId, automationId, dueAt: run.dueAt, ...(sessionId !== undefined ? { sessionId } : {}) }
+      const events = sessionId === undefined
+        ? undefined
+        : sessions.get(sessionId)?.session.events ?? await kernel.ctx.sessions.readCanonicalEvents(sessionId).catch(() => undefined)
+      if (events === undefined) {
+        await automations.record(workspaceId, { ...base, status: 'failed', error: 'the run\'s conversation no longer exists' })
+        continue
+      }
+      const end = events.findIndex((event) => event.type === 'turn/end')
+      if (end === -1) {
+        // No settled turn and no live watcher: the host stopped mid-run.
+        await automations.record(workspaceId, { ...base, status: 'failed', error: 'interrupted before it finished (host restarted)' })
+        continue
+      }
+      const ended = events[end] as Extract<SessionEvent, { type: 'turn/end' }>
+      if (ended.reason === 'completed') {
+        const reply = events.slice(0, end).reverse().find((event): event is Extract<SessionEvent, { type: 'assistant/message' }> => event.type === 'assistant/message' && event.content.trim() !== '')
+        await automations.record(workspaceId, { ...base, status: 'done', summary: excerpt(reply?.content ?? '') || 'Done.', at: ended.timestamp })
+      } else {
+        const error = events.slice(0, end).reverse().find((event): event is Extract<SessionEvent, { type: 'turn/error' }> => event.type === 'turn/error')
+        await automations.record(workspaceId, { ...base, status: 'failed', error: error?.message ?? `run ended: ${ended.reason}`, at: ended.timestamp })
+      }
+    }
   }
   // Run watcher: the first settled turn ends the run; a waiting approval or
   // question pings the user once.
@@ -3578,6 +3754,7 @@ ${entry.description}`.toLowerCase().includes(query))
     channels,
     pokeScheduler: () => { void scheduler.poke() },
     runAutomation,
+    settleStaleRuns,
     kernel,
     sessions,
     processes,
@@ -3614,18 +3791,15 @@ ${entry.description}`.toLowerCase().includes(query))
     addSkillProtectedRoots,
     memory,
     attachments,
-    imageSettings: () => imageSettings,
-    setImageSettings: async (next: ImageGenerationSettings) => {
-      await saveImageSettings(imageSettingsFile, next)
-      imageSettings = next
-    },
-    imageUnderstanding: () => imageUnderstanding,
-    setImageUnderstanding: async (next: ImageUnderstandingSettings) => {
-      await saveImageUnderstandingSettings(imageUnderstandingFile, next)
-      imageUnderstanding = next
+    videos,
+    modelPair: pairOf,
+    setModelPair: async (name: ModelPairName, next: ModelPair) => {
+      await savePair(pairFile(name), next)
+      pairs.set(name, next)
     },
     checkpoints,
     lastManifests,
+    prefixSnapshots,
     contextBodies,
     sessionUsage,
     usageLog,
@@ -3640,6 +3814,7 @@ ${entry.description}`.toLowerCase().includes(query))
     summarizerModelOf,
     runPreCompactHooks,
     hookHost,
+    backgroundHooks,
     runCompaction,
     cancelCompaction,
     compactionPending: (sessionId) => compactions.has(sessionId),
@@ -3762,8 +3937,9 @@ ${entry.description}`.toLowerCase().includes(query))
   const address = server.address()
   if (address === null || typeof address === 'string') {
     await new Promise<void>((resolve) => server.close(() => resolve()))
-    for (const dispose of disposers.values()) dispose()
+    for (const dispose of [...disposers.values(), ...providerRegistrations.values()]) dispose()
     disposers.clear()
+    providerRegistrations.clear()
     await kernel.stop()
     await ownerLock.release()
     throw new Error('web: unexpected listen address')
@@ -3803,6 +3979,7 @@ ${entry.description}`.toLowerCase().includes(query))
         },
         () => { server.closeAllConnections(); terminals.disposeAll() },
         () => agentDrivers.stopAll(),
+        async () => { await boundedCleanup(() => backgroundHooks.closeAll()) },
         async () => { await boundedCleanup(async () => { await Promise.allSettled([...compactions.values()].flatMap((reservation) => reservation.done === undefined ? [] : [reservation.done])) }) },
         () => processes.disposeAll(),
         async () => { try { await boundedCleanup(() => checkpoints.close()) } catch (error) { teardownSafe = false; throw error } },
@@ -3818,8 +3995,9 @@ ${entry.description}`.toLowerCase().includes(query))
         },
         () => {
           const errors: unknown[] = []
-          for (const dispose of disposers.values()) { try { dispose() } catch (error) { errors.push(error) } }
+          for (const dispose of [...disposers.values(), ...providerRegistrations.values()]) { try { dispose() } catch (error) { errors.push(error) } }
           disposers.clear()
+          providerRegistrations.clear()
           if (errors.length) throw new AggregateError(errors, 'listener teardown failed')
         },
         async () => { try { await boundedCleanup(() => kernel.stop()) } catch (error) { teardownSafe = false; throw error } },
@@ -3860,6 +4038,7 @@ interface HandlerDeps {
     provider: string | null | undefined
     model: string | null | undefined
     thinkingLevel: string | null | undefined
+    alias: string | null
     source: 'session' | 'global'
   }
   readonly validateProviderModel: (providerId: string, model?: string) => { provider: string; model: string | undefined }
@@ -3901,6 +4080,8 @@ interface HandlerDeps {
   readonly attachments: AttachmentStore
   readonly checkpoints: CheckpointStore
   readonly lastManifests: Map<SessionId, ContextManifest>
+  /** Per-session copy of the skill catalog and memory indexes (prefix stability). */
+  readonly prefixSnapshots: Map<SessionId, PrefixSnapshot>
   /** Context section hashes already recorded per session's log (body dedupe). */
   readonly contextBodies: Map<SessionId, Set<string>>
   readonly sessionUsage: Map<SessionId, SessionUsage>
@@ -3924,16 +4105,16 @@ interface HandlerDeps {
   /** The (provider, model) pair host-side maintenance calls run on; undefined → extractive compaction fallback. */
   /** Durable token accounting behind GET /api/usage. */
   readonly usageLog: UsageLog
-  /** Settings → Providers & Models → Image generation (app-wide provider/model reference). */
-  readonly imageSettings: () => ImageGenerationSettings
-  readonly setImageSettings: (next: ImageGenerationSettings) => Promise<void>
-  /** Settings → Providers & Models → Image understanding (DescribeImage model). */
-  readonly imageUnderstanding: () => ImageUnderstandingSettings
-  readonly setImageUnderstanding: (next: ImageUnderstandingSettings) => Promise<void>
+  /** Generated-video storage (streamed to disk, served with Range). */
+  readonly videos: VideoStore
+  /** Settings → Providers & Models → Image generation / Image understanding / Video generation. */
+  readonly modelPair: (name: ModelPairName) => ModelPair
+  readonly setModelPair: (name: ModelPairName, next: ModelPair) => Promise<void>
   readonly summarizerModelOf: (session: Session) => { readonly providerName: string; readonly model: string } | undefined
   /** Runs PreCompact hooks (durable hook/run events); returns the blocking reason, or undefined to proceed. */
   readonly runPreCompactHooks: (session: Session, workspaceId: WorkspaceId) => Promise<string | undefined>
   readonly hookHost: HookHost
+  readonly backgroundHooks: BackgroundHooks
   readonly runCompaction: (entry: SessionEntry, trigger: 'manual' | 'automatic') => Promise<{ coversSeq: number; summary: string }>
   readonly cancelCompaction: (sessionId: SessionId) => void
   readonly compactionPending: (sessionId: SessionId) => boolean
@@ -3985,6 +4166,8 @@ interface HandlerDeps {
   readonly pokeScheduler: () => void
   /** Start one automation run now (`dueAt` null = Run now). */
   readonly runAutomation: (workspaceId: WorkspaceId, automation: Automation, dueAt: number | null) => Promise<{ ok: false; status: number; error: string } | { ok: true; runId: string; sessionId?: string; skipped?: true }>
+  /** Close open runs nothing watches any more, from their conversation's log. */
+  readonly settleStaleRuns: (workspaceId: WorkspaceId, automationId: string) => Promise<void>
 }
 
 /**
@@ -4565,6 +4748,7 @@ async function handleApi(
           // Background processes die the same way — silently, because the
           // session's log (their only reader) is being deleted.
           await deps.processes.dispose(entry.session.id)
+          await deps.backgroundHooks.forgetRoot(entry.session.id)
           await deps.childExecutor.cancelAllOfRoot(entry.session.id)
           for (const child of await deps.childExecutor.childrenOfRoot(entry.session.id, wsId)) {
             await deps.childExecutor.cancel(wsId, child.childSessionId)
@@ -4601,6 +4785,8 @@ async function handleApi(
         deps.cancelCompaction(entry.session.id)
         entry.agent.stop()
         const cleaned = await deps.childExecutor.cancelAllOfRoot(entry.session.id)
+        // A user Stop also ends the conversation's background hooks.
+        await deps.backgroundHooks.killRoot(entry.session.id)
         send(202, { stopped: true, ...(cleaned > 0 ? { childrenCancelled: cleaned } : {}) })
         return
       }
@@ -5553,62 +5739,27 @@ async function handleApi(
       return
     }
 
-    // Settings → Providers & Models → Image generation: which provider/model GenerateImage calls.
-    if (pathname === '/api/image-generation') {
+    // Settings → Providers & Models → Image generation / Image understanding /
+    // Video generation: one provider/model reference each, same contract.
+    const pairRoute = MODEL_PAIR_ROUTES[pathname]
+    if (pairRoute !== undefined) {
       if (req.method === 'GET') {
-        send(200, deps.imageSettings())
+        send(200, deps.modelPair(pairRoute.name))
         return
       }
       if (req.method === 'PUT') {
-        const body = await readJson(req)
-        const next = parseImageSettings(body)
-        const blankRequested = body['provider'] === null || body['provider'] === '' || body['model'] === null || body['model'] === ''
-        if (next.provider === null && !blankRequested) {
-          send(400, { error: "body needs 'provider' and 'model' strings, or null to clear" })
-          return
-        }
-        if (next.provider !== null && !deps.providers().some((entry) => entry.id === next.provider)) {
-          send(400, { error: `unknown provider '${next.provider}'` })
+        const checked = validatePairBody(await readJson(req), (id) => deps.providers().some((entry) => entry.id === id))
+        if (!checked.ok) {
+          send(400, { error: checked.error })
           return
         }
         try {
-          await deps.setImageSettings(next)
+          await deps.setModelPair(pairRoute.name, checked.pair)
         } catch (error) {
-          send(500, { error: `image generation settings could not be saved: ${String(error instanceof Error ? error.message : error)}` })
+          send(500, { error: `${pairRoute.label} settings could not be saved: ${String(error instanceof Error ? error.message : error)}` })
           return
         }
-        send(200, deps.imageSettings())
-        return
-      }
-      send(405, { error: 'method not allowed' })
-      return
-    }
-
-    // Settings → Providers & Models → Image understanding: DescribeImage model.
-    if (pathname === '/api/image-understanding') {
-      if (req.method === 'GET') {
-        send(200, deps.imageUnderstanding())
-        return
-      }
-      if (req.method === 'PUT') {
-        const body = await readJson(req)
-        const next = parseImageUnderstandingSettings(body)
-        const blankRequested = body['provider'] === null || body['provider'] === '' || body['model'] === null || body['model'] === ''
-        if (next.provider === null && !blankRequested) {
-          send(400, { error: "body needs 'provider' and 'model' strings, or null to clear" })
-          return
-        }
-        if (next.provider !== null && !deps.providers().some((entry) => entry.id === next.provider)) {
-          send(400, { error: `unknown provider '${next.provider}'` })
-          return
-        }
-        try {
-          await deps.setImageUnderstanding(next)
-        } catch (error) {
-          send(500, { error: `image understanding settings could not be saved: ${String(error instanceof Error ? error.message : error)}` })
-          return
-        }
-        send(200, deps.imageUnderstanding())
+        send(200, deps.modelPair(pairRoute.name))
         return
       }
       send(405, { error: 'method not allowed' })
@@ -6158,6 +6309,36 @@ async function handleApi(
     }
 
     // ── G3 memory ────────────────────────────────────────────
+    // A raw, read-only view of one file under a memory folder, for the
+    // workbench when a tool row names a memory file (MEMORY.md has no entry id).
+    // Contained to that folder, symlinks included; nothing here writes.
+    const wsMemoryFile = /^\/api\/workspaces\/([^/]+)\/memory-file$/.exec(pathname)
+    if (wsMemoryFile !== null) {
+      const wsId = decodeURIComponent(wsMemoryFile[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, false)
+      if (req.method !== 'GET') {
+        send(405, { error: 'method not allowed' })
+        return
+      }
+      const rawProject = query.get('projectId')
+      let fileProject: ProjectId | undefined
+      if (rawProject !== null && rawProject !== '') {
+        try {
+          deps.workspaces.getProject(rawProject as ProjectId, wsId)
+        } catch (error) {
+          fail(error)
+          return
+        }
+        fileProject = rawProject as ProjectId
+      }
+      try {
+        send(200, await readProjectFile(deps.memory.root({ workspaceId: wsId, ...(fileProject !== undefined ? { projectId: fileProject } : {}) }), query.get('path') ?? ''))
+      } catch (error) {
+        if (!(error instanceof ProjectFileError)) throw error
+        send(400, { error: error.message })
+      }
+      return
+    }
     const wsMemoryMatch = /^\/api\/workspaces\/([^/]+)\/memory(?:\/([^/]+))?$/.exec(pathname)
     if (wsMemoryMatch !== null) {
       const wsId = decodeURIComponent(wsMemoryMatch[1] ?? '') as WorkspaceId
@@ -6276,6 +6457,7 @@ async function handleApi(
           provider: effective.provider ?? null,
           model: effective.model ?? null,
           thinkingLevel: effective.thinkingLevel ?? null,
+          ...(effective.alias !== null ? { alias: effective.alias } : {}),
           source: effective.source,
         })
         return
@@ -6292,6 +6474,7 @@ async function handleApi(
           provider: effective.provider ?? null,
           model: effective.model ?? null,
           thinkingLevel: effective.thinkingLevel ?? null,
+          ...(effective.alias !== null ? { alias: effective.alias } : {}),
           source: 'session',
         })
         return
@@ -6445,8 +6628,14 @@ async function handleApi(
         return
       }
       try {
+        const lastSeqBefore = entry.session.events.at(-1)?.seq ?? 0
         const checkpoint = await deps.runCompaction(entry, 'manual')
-        send(200, { coversSeq: checkpoint.coversSeq, summaryChars: checkpoint.summary.length })
+        // An unchanged boundary is a no-op with no new end event: report no figures.
+        const end = entry.session.events.findLast((event) => event.type === 'compaction/end' && event.seq > lastSeqBefore)
+        const measured = end?.type === 'compaction/end' && end.tokensBefore !== undefined && end.tokensAfter !== undefined
+          ? { tokensBefore: end.tokensBefore, tokensAfter: end.tokensAfter }
+          : {}
+        send(200, { coversSeq: checkpoint.coversSeq, summaryChars: checkpoint.summary.length, ...measured })
       } catch (error) {
         send(409, { error: String(error instanceof Error ? error.message : error) })
       }
@@ -6540,6 +6729,22 @@ async function handleApi(
         if (!(error instanceof AttachmentError)) throw error
         send(400, { error: error.message })
       }
+      return
+    }
+
+    // ── generated videos ──────────────────────────────────────
+    // Read-only: videos are written only by the GenerateVideo tool. The id is
+    // a sha256 of the bytes, so the response is immutable and cacheable; the
+    // type is sniffed from the stored bytes, never taken from a caller.
+    const wsVideoMatch = /^\/api\/workspaces\/([^/]+)\/videos\/([^/]+)$/.exec(pathname)
+    if (wsVideoMatch !== null) {
+      const wsId = decodeURIComponent(wsVideoMatch[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, false)
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        send(405, { error: 'method not allowed' })
+        return
+      }
+      await serveStoredVideo(deps.videos, wsId, decodeURIComponent(wsVideoMatch[2] ?? ''), req, res, send)
       return
     }
 
@@ -7443,6 +7648,7 @@ async function handleAutomations(req: IncomingMessage, pathname: string, deps: H
     if (action === 'runs') {
       if (req.method !== 'GET') { send(405, { error: 'method not allowed' }); return }
       await deps.automations.get(wsId, id)
+      await deps.settleStaleRuns(wsId, id)
       send(200, await deps.automations.history(wsId, id))
       return
     }
@@ -7586,7 +7792,10 @@ async function createRootSession(
     if (submitted === null || typeof submitted !== 'object' || Array.isArray(submitted)) {
       return { ok: false, status: 400, error: "'controls' must contain provider, model, and thinkingLevel" }
     }
-    const { provider, model, thinkingLevel } = submitted as Record<string, unknown>
+    const { provider, model, thinkingLevel, alias } = submitted as Record<string, unknown>
+    if (alias !== undefined && alias !== null && (typeof alias !== 'string' || alias === '')) {
+      return { ok: false, status: 400, error: "'controls.alias' must be a non-empty string or null" }
+    }
     if ((provider !== null && typeof provider !== 'string')
       || (model !== null && typeof model !== 'string')
       || (thinkingLevel !== null && !isThinkingLevel(thinkingLevel))
@@ -7600,7 +7809,7 @@ async function createRootSession(
         return { ok: false, status: 400, error: String(error instanceof Error ? error.message : error) }
       }
     }
-    defaults = { provider, model, thinkingLevel }
+    defaults = { provider, model, thinkingLevel, ...(typeof alias === 'string' && provider !== null ? { alias } : {}) }
   }
   // An explicit mode (automations) resolves before anything is created.
   let mode = deps.controlsFor(wsId).modeDefinition
@@ -7624,6 +7833,8 @@ async function createRootSession(
     // Null is an intentional snapshot: use the selected model default,
     // even if the global default gains a thinking override later.
     thinkingLevel: defaults.thinkingLevel,
+    // The alias is a display label for the pair above; null when picked directly.
+    alias: defaults.alias ?? null,
   })
   // The workspace's selected mode is only the DEFAULT for new roots: the
   // root owns its own live mode from here on.
@@ -7699,6 +7910,40 @@ async function acceptMessage(
   const body = await readJson(req)
   const principalId = (req as IncomingMessage & { dntHarnessPrincipalId?: string }).dntHarnessPrincipalId
   return submitMessage(entry, deps, body, principalId)
+}
+
+/**
+ * Queue an `asyncRewake` hook's result for a root conversation: durable
+ * `input/queued` with `origin: 'hook'`, then the same drain a queued message
+ * uses — an idle conversation wakes, a running turn keeps it queued behind
+ * it, nothing is ever steered. False when the conversation cannot take it
+ * (child, closed, unavailable, no model, queue full).
+ */
+async function queueHookRewake(entry: SessionEntry, deps: HandlerDeps, content: string, summary: string): Promise<boolean> {
+  if (entry.closed || deps.unavailableSessions.has(entry.session.id)) return false
+  if (entry.session.events.some((event) => event.type === 'session/child-meta')) return false
+  const effectiveModel = deps.resolveEffectiveModel(entry.session, entry.workspaceId)
+  if (effectiveModel.model === undefined || effectiveModel.model === null || effectiveModel.provider === undefined || effectiveModel.provider === null) return false
+  const stillPending = deps.kernel.ctx.sessions.pendingInputs(entry.session)
+  if (stillPending.length >= deps.limits.maxPendingInputs) return false
+  const inputId = newInputId()
+  const runsNow = !entry.agent.busy
+    && !deps.childExecutor.delegationPending(entry.session.id)
+    && !deps.compactionPending(entry.session.id)
+    && !deps.kernel.ctx.llm.sessionUncertain(entry.session.id)
+  entry.session.append({
+    type: 'input/queued',
+    inputId,
+    content,
+    origin: 'hook',
+    summary,
+    ...(runsNow ? { runsNow: true as const } : {}),
+  })
+  await entry.session.durable()
+  entry.agent.adoptPending(stillPending)
+  entry.agent.enqueueAccepted({ content, inputId, origin: 'hook', summary })
+  if (!deps.compactionPending(entry.session.id)) await dispatchInbox(entry, deps, 'queue')
+  return true
 }
 
 /**
@@ -7978,9 +8223,13 @@ async function putSessionModel(
   const provider = body['provider']
   const model = body['model']
   const thinkingLevel = body['thinkingLevel']
+  const alias = body['alias']
   if ((provider !== undefined && provider !== null && typeof provider !== 'string')
     || (model !== undefined && model !== null && typeof model !== 'string')) {
     return { ok: false, status: 400, error: "body accepts optional string|null 'provider' and 'model'" }
+  }
+  if (alias !== undefined && alias !== null && (typeof alias !== 'string' || alias === '')) {
+    return { ok: false, status: 400, error: "'alias' must be a non-empty string or null" }
   }
   if (thinkingLevel !== undefined && thinkingLevel !== null && !isThinkingLevel(thinkingLevel)) {
     return { ok: false, status: 400, error: "'thinkingLevel' must be off|minimal|low|medium|high|xhigh|max, or null" }
@@ -8009,11 +8258,15 @@ async function putSessionModel(
       return { ok: false, status: 400, error: String(error instanceof Error ? error.message : error) }
     }
   }
+  // The alias names how the pair was picked, so it follows the pair: a pick
+  // without one clears it, and a thinking-only edit leaves it alone.
+  const pairChanged = provider !== undefined || model !== undefined
   entry.session.append({
     type: 'session/model',
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
+    ...(alias !== undefined ? { alias } : pairChanged ? { alias: null } : {}),
   })
   try {
     await entry.session.durable()
@@ -8031,10 +8284,11 @@ async function putSessionModel(
   // that already committed durably to this session.
   if ((provider !== undefined || model !== undefined) && hasProvider && hasModel) {
     const steady = deps.defaults()
-    if (steady.provider !== resultingProvider || steady.model !== resultingModel) {
+    const pickedAlias = typeof alias === 'string' ? alias : null
+    if (steady.provider !== resultingProvider || steady.model !== resultingModel || (steady.alias ?? null) !== pickedAlias) {
       await deps.mutateProviderStore(({ providers, defaults }) => ({
         providers,
-        defaults: { provider: resultingProvider, model: resultingModel, thinkingLevel: defaults.thinkingLevel },
+        defaults: { provider: resultingProvider, model: resultingModel, thinkingLevel: defaults.thinkingLevel, ...(typeof alias === 'string' ? { alias } : {}) },
         result: undefined,
       }), { clearRuntimeModelOverride: true }).catch((error: unknown) => {
         console.error(`web: global default could not follow session ${entry.session.id}: ${String(error instanceof Error ? error.message : error)}`)
@@ -8078,20 +8332,21 @@ async function putModel(
 
 async function putModelDefaults(req: IncomingMessage, deps: HandlerDeps): Promise<{ ok: false; status: number; error: string } | { ok: true }> {
   const body = await readJson(req)
-  const provider = body['provider']; const model = body['model']; const thinkingLevel = body['thinkingLevel']
+  const provider = body['provider']; const model = body['model']; const thinkingLevel = body['thinkingLevel']; const alias = body['alias']
+  if (alias !== undefined && alias !== null && (typeof alias !== 'string' || alias === '')) return { ok: false, status: 400, error: "'alias' must be a non-empty string or null" }
   if (!Object.hasOwn(body, 'provider') || !Object.hasOwn(body, 'model')) return { ok: false, status: 400, error: "body needs complete 'provider' and 'model' pair" }
   if ((provider !== null && typeof provider !== 'string') || (model !== null && typeof model !== 'string') || (thinkingLevel !== undefined && thinkingLevel !== null && !isThinkingLevel(thinkingLevel))) {
     return { ok: false, status: 400, error: "body needs provider/model strings or null, plus documented thinkingLevel or null" }
   }
   if ((provider === null) !== (model === null) || (provider === '' || model === '')) return { ok: false, status: 400, error: 'provider and model must both be configured or both be blank' }
-  const next: ModelDefaults = { provider, model, thinkingLevel: thinkingLevel === undefined ? deps.defaults().thinkingLevel : thinkingLevel }
+  const next: ModelDefaults = { provider, model, thinkingLevel: thinkingLevel === undefined ? deps.defaults().thinkingLevel : thinkingLevel, ...(typeof alias === 'string' && provider !== null ? { alias } : {}) }
   if (provider !== null && model !== null) {
     try { deps.validateProviderModel(provider, model) } catch (error) { return { ok: false, status: 400, error: String(error instanceof Error ? error.message : error) } }
   }
   try {
     await deps.mutateProviderStore(({ providers, defaults }) => ({
       providers,
-      defaults: { provider: next.provider, model: next.model, thinkingLevel: thinkingLevel === undefined ? defaults.thinkingLevel : next.thinkingLevel },
+      defaults: { provider: next.provider, model: next.model, thinkingLevel: thinkingLevel === undefined ? defaults.thinkingLevel : next.thinkingLevel, ...(next.alias !== undefined && next.alias !== null ? { alias: next.alias } : {}) },
       result: undefined,
     })), { clearRuntimeModelOverride: true }
     return { ok: true }
@@ -8224,11 +8479,25 @@ async function forgetSessionState(sessionId: SessionId, deps: HandlerDeps): Prom
   deps.lastManifests.delete(sessionId)
   deps.contextBodies.delete(sessionId)
   deps.sessionUsage.delete(sessionId)
+  deps.prefixSnapshots.delete(sessionId)
   for (const childId of await deps.childExecutor.forgetRoot(sessionId)) {
     deps.lastManifests.delete(childId)
     deps.contextBodies.delete(childId)
     deps.sessionUsage.delete(childId)
+    deps.prefixSnapshots.delete(childId)
   }
+}
+
+/**
+ * One session's snapshot of the frequently-edited prefix sources. `key`
+ * names what the copy was read under (project + compaction boundary); any
+ * change to it means the prefix moves anyway, so the copy is re-read then.
+ * A field is absent until a request first needs it.
+ */
+interface PrefixSnapshot {
+  readonly key: string
+  skillCatalog?: readonly { readonly name: string; readonly description: string }[]
+  memory?: readonly MemorySnippet[]
 }
 
 /** Token usage the provider reported for one session since this host started. */
@@ -8966,6 +9235,59 @@ async function serveProjectMedia(root: string, rawPath: string, req: IncomingMes
   const stream = createReadStream(resolved.abs, { start, end })
   stream.on('error', () => { res.destroy() })
   await new Promise<void>((resolve) => stream.pipe(res).on('close', resolve))
+}
+
+/**
+ * Serve one stored video with `Range` support (players seek and probe with
+ * ranges). A single `bytes=first-last` is honored; anything else is refused
+ * with 416 rather than silently ignored.
+ */
+async function serveStoredVideo(store: VideoStore, workspaceId: string, id: string, req: IncomingMessage, res: ServerResponse, send: (status: number, body: unknown) => void): Promise<void> {
+  let info: Awaited<ReturnType<VideoStore['stat']>>
+  try {
+    info = await store.stat(workspaceId, id)
+  } catch (error) {
+    if (!(error instanceof VideoStoreError)) throw error
+    send(404, { error: error.message })
+    return
+  }
+  const headers: Record<string, string | number> = {
+    'content-type': info.mediaType,
+    'accept-ranges': 'bytes',
+    'cache-control': 'private, max-age=31536000, immutable',
+    'x-content-type-options': 'nosniff',
+  }
+  const pipe = async (range?: { start: number; end: number }): Promise<void> => {
+    const stream = store.stream(workspaceId, id, range)
+    stream.on('error', () => { res.destroy() })
+    await new Promise<void>((resolve) => stream.pipe(res).on('close', resolve))
+  }
+  const range = req.headers.range
+  if (range === undefined) {
+    res.writeHead(200, { ...headers, 'content-length': info.bytes })
+    if (req.method === 'HEAD') { res.end(); return }
+    await pipe()
+    return
+  }
+  const match = /^bytes=(\d*)-(\d*)$/.exec(range.trim())
+  const first = match === null || match[1] === '' ? undefined : Number(match[1])
+  const last = match === null || match[2] === '' ? undefined : Number(match[2])
+  const unsatisfiable = match === null || (first === undefined && last === undefined) || (first !== undefined && first >= info.bytes) || (first === undefined && last === 0)
+  if (unsatisfiable) {
+    res.writeHead(416, { 'content-range': `bytes */${info.bytes}` })
+    res.end()
+    return
+  }
+  const start = first ?? Math.max(0, info.bytes - (last ?? 0))
+  const end = first !== undefined && last !== undefined ? Math.min(last, info.bytes - 1) : info.bytes - 1
+  if (end < start) {
+    res.writeHead(416, { 'content-range': `bytes */${info.bytes}` })
+    res.end()
+    return
+  }
+  res.writeHead(206, { ...headers, 'content-range': `bytes ${start}-${end}/${info.bytes}`, 'content-length': end - start + 1 })
+  if (req.method === 'HEAD') { res.end(); return }
+  await pipe({ start, end })
 }
 
 /** Hashed asset paths are safe to cache forever; everything else revalidates per request. */

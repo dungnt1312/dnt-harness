@@ -154,6 +154,39 @@ describe('automations API', () => {
     expect(messages.indexOf(context!)).toBeLessThan(messages.findIndex((event) => event.content === 'remind me'))
   })
 
+  it('still records the outcome after a provider change re-registers providers', async () => {
+    const { url, ws } = await boot()
+    // Any provider mutation re-syncs registrations; it used to drop the run watcher too.
+    expect((await fetch(`${url}/api/providers`, json('POST', { name: 'Other', baseUrl: 'http://127.0.0.1:9/v1', apiKey: '', models: ['o1'] }))).status).toBe(201)
+    const row = await (await fetch(`${url}/api/workspaces/${ws}/automations`, json('POST', { title: 'After', prompt: 'x', schedules: [{ cron: '0 7 * * *' }] }))).json() as { id: string }
+    const runs = async (): Promise<{ status: string }[]> => await (await fetch(`${url}/api/workspaces/${ws}/automations/${row.id}/runs`)).json() as { status: string }[]
+    await fetch(`${url}/api/workspaces/${ws}/automations/${row.id}/run`, { method: 'POST' })
+    expect((await until(runs, (rows) => rows[0]?.status === 'done'))[0]?.status).toBe('done')
+    // A second run starts instead of being skipped as still busy.
+    const second = await (await fetch(`${url}/api/workspaces/${ws}/automations/${row.id}/run`, { method: 'POST' })).json() as { skipped?: boolean; sessionId?: string }
+    expect(second.skipped).toBeUndefined()
+    expect(second.sessionId).toBeDefined()
+  })
+
+  it('settles a run left open by an earlier host from its conversation log', async () => {
+    const { url, ws } = await boot()
+    const row = await (await fetch(`${url}/api/workspaces/${ws}/automations`, json('POST', { title: 'Old', prompt: 'x', schedules: [{ cron: '0 7 * * *' }] }))).json() as { id: string }
+    const { sessionId } = await (await fetch(`${url}/api/workspaces/${ws}/automations/${row.id}/run`, { method: 'POST' })).json() as { sessionId: string }
+    const runsUrl = `${url}/api/workspaces/${ws}/automations/${row.id}/runs`
+    await until(async () => (await (await fetch(runsUrl)).json() as { status: string }[])[0]?.status, (status) => status === 'done')
+    await server!.close()
+    // Simulate the old host dying before it wrote the outcome, plus a run whose conversation is gone.
+    const file = path.join(home, 'workspaces', ws, 'automation-runs.jsonl')
+    const lines = (await fs.readFile(file, 'utf8')).trim().split('\n').filter((line) => !line.includes('"status":"done"'))
+    lines.push(JSON.stringify({ v: 1, runId: 'run-ghost', automationId: row.id, dueAt: 1, status: 'started', sessionId: 'session-gone', at: 1 }))
+    await fs.writeFile(file, `${lines.join('\n')}\n`)
+
+    const { url: next } = await boot()
+    const history = await (await fetch(`${next}/api/workspaces/${ws}/automations/${row.id}/runs`)).json() as { runId: string; status: string; sessionId?: string; summary?: string; error?: string }[]
+    expect(history.find((run) => run.sessionId === sessionId)).toMatchObject({ status: 'done', summary: 'Reminder Take your pills now.' })
+    expect(history.find((run) => run.runId === 'run-ghost')).toMatchObject({ status: 'failed' })
+  })
+
   it('stays quiet on success when notify is off', async () => {
     const { url, ws } = await boot()
     await fetch(`${url}/api/push/subscriptions`, json('POST', { subscription: { endpoint: 'https://push.example/1', keys: { p256dh: 'p', auth: 'a' } } }))

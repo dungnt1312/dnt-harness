@@ -22,10 +22,11 @@ export function ModelAliasesPanel({ providers }: { readonly providers: readonly 
   const provider = providers.find((entry) => entry.id === draft.provider)
   const thinkingLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].filter((level) => expressibleThinkingLevel(draft.model, level) === level)
   const changeModel = (model: string) => setDraft({ ...draft, model, thinkingLevel: draft.thinkingLevel !== null && expressibleThinkingLevel(model, draft.thinkingLevel) !== draft.thinkingLevel ? null : draft.thinkingLevel })
-  const nameError = draft.name.trim() === '' || /[\s:@\u0000-\u001f\u007f]/.test(draft.name.trim()) || draft.name.trim() === 'inherit'
-    ? 'Use a non-empty name without whitespace, colon, @, controls, or “inherit”.' : null
+  // An empty name blocks Save but is not an error yet: a pristine form must not open in red.
+  const nameInvalid = draft.name.trim() === '' || /[\s:@\u0000-\u001f\u007f]/.test(draft.name.trim()) || draft.name.trim() === 'inherit'
+  const nameError = nameInvalid && draft.name !== '' ? 'Use a name without whitespace, colon, @, controls, or “inherit”.' : null
   const save = async () => {
-    if (nameError !== null) return
+    if (nameInvalid) return
     try {
       const input = { ...draft, name: draft.name.trim() }
       const row = selected === null ? await createModelAlias(input) : await updateModelAlias(selected.name, { ...input, expectedRevision: selected.revision })
@@ -51,7 +52,7 @@ export function ModelAliasesPanel({ providers }: { readonly providers: readonly 
       {selected?.status === 'invalid' ? <p role="alert" className="text-sm text-bad">Unusable: {selected.message}. Repair the target or delete this alias.</p> : null}
       {selected?.warnings.map((warning) => <p key={warning} className="text-sm text-warn">Warning: {warning}</p>)}
       {error !== null ? <p role="alert" className="text-sm text-bad">{error}</p> : null}
-      <div className="flex gap-2"><Button disabled={nameError !== null || draft.provider === '' || draft.model === ''} onClick={() => void save()}>Save alias</Button>{selected !== null ? <Button onClick={() => guardDiscard(() => { void deleteModelAlias(selected.name, selected.revision).then(() => { setSelected(null); setDraft(EMPTY); return refresh() }).catch((cause) => setError(String(cause))) })}>Delete alias</Button> : null}</div>
+      <div className="flex gap-2"><Button disabled={nameInvalid || draft.provider === '' || draft.model === ''} onClick={() => void save()}>Save alias</Button>{selected !== null ? <Button onClick={() => guardDiscard(() => { void deleteModelAlias(selected.name, selected.revision).then(() => { setSelected(null); setDraft(EMPTY); return refresh() }).catch((cause) => setError(String(cause))) })}>Delete alias</Button> : null}</div>
     </section>
   </div>
 }

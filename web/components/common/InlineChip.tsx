@@ -48,10 +48,17 @@ export function chipAriaLabel(segment: ChipSegment): string {
   return isBuiltinCommand(segment.name) ? `Command ${segment.name}` : `Skill command ${segment.name}`
 }
 
-/** A read-only chip for rendered messages. */
-export function InlineChip({ segment }: { readonly segment: ChipSegment }) {
-  return (
-    <span className={cn(CHIP_CLASS, CHIP_TONE.bubble)} title={chipTitle(segment)} aria-label={chipAriaLabel(segment)} data-chip-kind={segment.kind}>
+/**
+ * A chip for rendered messages. Read-only unless `onOpen` is given, in which
+ * case the chip is a button that opens what it names (a skill's SKILL.md).
+ */
+export function InlineChip({ segment, onOpen, openLabel }: {
+  readonly segment: ChipSegment
+  readonly onOpen?: () => void
+  readonly openLabel?: string
+}) {
+  const content = (
+    <>
       {segment.kind === 'mention'
         ? <FileTypeIcon path={segment.path} size={CHIP_ICON_SIZE} />
         : (
@@ -71,6 +78,26 @@ export function InlineChip({ segment }: { readonly segment: ChipSegment }) {
           </svg>
         )}
       <span className={CHIP_LABEL_CLASS}>{chipLabel(segment)}</span>
-    </span>
+    </>
+  )
+  if (onOpen === undefined) {
+    return (
+      <span className={cn(CHIP_CLASS, CHIP_TONE.bubble)} title={chipTitle(segment)} aria-label={chipAriaLabel(segment)} data-chip-kind={segment.kind}>
+        {content}
+      </span>
+    )
+  }
+  const label = openLabel ?? chipAriaLabel(segment)
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className={cn(CHIP_CLASS, CHIP_TONE.bubble, 'cursor-pointer hover:bg-hover')}
+      title={label}
+      aria-label={label}
+      data-chip-kind={segment.kind}
+    >
+      {content}
+    </button>
   )
 }

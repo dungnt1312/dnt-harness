@@ -58,10 +58,14 @@ export function ScheduleEditor({ rules, onRules, end, onEnd }: {
       {rules.map((rule, index) => (
         <RuleCard key={index} rule={rule} onChange={(next) => update(index, next)} onRemove={() => onRules(rules.filter((_, i) => i !== index))} />
       ))}
+      <div className={cn('flex flex-wrap items-center gap-2', rules.length > 0 && 'justify-between')}>
       <Menu
         label={rules.length === 0 ? 'Add schedule' : 'Add another time'}
         panelClassName="w-52"
-        triggerClassName="flex h-10 w-full items-center gap-2 rounded-xl border border-line bg-surface px-3 text-sm text-fg-muted transition-colors hover:bg-hover hover:text-fg"
+        triggerClassName={cn(
+          'flex items-center gap-1.5 text-[13px] text-fg-muted transition-colors hover:text-fg',
+          rules.length === 0 ? 'h-10 w-full rounded-xl border border-dashed border-line px-3' : 'h-8 w-fit rounded-lg px-2 hover:bg-hover',
+        )}
         trigger={() => (<><Icon name="plus" size={15} />{rules.length === 0 ? 'Add schedule' : 'Add another time'}</>)}
       >
         {(close) => (
@@ -75,6 +79,7 @@ export function ScheduleEditor({ rules, onRules, end, onEnd }: {
         )}
       </Menu>
       {recurring ? <EndControl end={end} onEnd={onEnd} /> : null}
+      </div>
     </div>
   )
 }
@@ -244,32 +249,32 @@ function DayChips({ days, onChange }: { readonly days: readonly number[]; readon
     if (next.length > 0) onChange([...next].sort((a, b) => a - b))
   }
   const shortcut = (label: string, value: readonly number[]) => (
-    <button type="button" aria-pressed={same(value)} className={cn(chipClass, same(value) ? 'border-fg-faint bg-hover text-fg' : 'border-line text-fg-muted hover:text-fg')} onClick={() => onChange(value)}>{label}</button>
+    <button type="button" aria-pressed={same(value)} className={cn('h-7 rounded-md px-1.5 text-xs transition-colors', same(value) ? 'font-medium text-fg' : 'text-fg-faint hover:text-fg')} onClick={() => onChange(value)}>{label}</button>
   )
   return (
     <span role="group" aria-label="Days" className="flex flex-wrap items-center gap-1">
-      {shortcut('Every day', ALL_DAYS)}
-      {shortcut('Weekdays', WEEKDAYS)}
-      <span className="mx-0.5 h-4 w-px bg-line" />
       {[1, 2, 3, 4, 5, 6, 0].map((day) => (
         <button
           key={day}
           type="button"
           aria-pressed={set.has(day)}
           aria-label={WEEKDAY_SHORT[day]}
-          className={cn(chipClass, set.has(day) ? 'border-primary bg-primary text-primary-fg' : 'border-line text-fg-muted hover:text-fg')}
+          className={cn(chipClass, set.has(day) ? 'border-fg-muted bg-hover font-semibold text-fg' : 'border-line text-fg-faint hover:text-fg')}
           onClick={() => toggle(day)}
         >
           {WEEKDAY_SHORT[day]!.slice(0, 2)}
         </button>
       ))}
+      <span className="mx-1 h-4 w-px bg-line" />
+      {shortcut('Every day', ALL_DAYS)}
+      {shortcut('Weekdays', WEEKDAYS)}
     </span>
   )
 }
 
 function EndControl({ end, onEnd }: { readonly end: EndRule; readonly onEnd: (next: EndRule) => void }) {
   return (
-    <div className="flex flex-wrap items-center gap-2 px-1 text-[13px] text-fg-muted">
+    <div className="flex flex-wrap items-center gap-2 text-[13px] text-fg-muted">
       <span>Ends</span>
       <select
         aria-label="Ends"

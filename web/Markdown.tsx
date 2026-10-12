@@ -110,9 +110,9 @@ function urlTransform(value: string): string {
  * costliest render in the app, and unrelated state (composer keystrokes, a
  * streaming reply) must not redo it for messages that did not change.
  */
-export const Markdown = memo(function Markdown({ content }: { readonly content: string }) {
+export const Markdown = memo(function Markdown({ content, compact = false }: { readonly content: string; readonly compact?: boolean }) {
   return (
-    <div className="md">
+    <div className={compact ? 'md md-compact' : 'md'}>
       <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={COMPONENTS} urlTransform={urlTransform}>
         {content}
       </ReactMarkdown>

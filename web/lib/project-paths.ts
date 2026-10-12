@@ -76,7 +76,65 @@ export function parseFileHref(href: string | undefined): FileHref | null {
   return value === '' ? null : { path: value, ...(focus !== undefined ? { focus } : {}) }
 }
 
-/** Last path segment, used for tab titles. */
+const SKILL_TAB_PREFIX = 'skill://'
+
+/**
+ * The workbench path of a skill's SKILL.md. A skill can live outside the
+ * project (user, workspace and bundled layers), so it is a virtual tab the
+ * viewer reads through the skill API rather than a project-relative file.
+ */
+export function skillTabPath(name: string): string {
+  return `${SKILL_TAB_PREFIX}${name}`
+}
+
+/** The skill a virtual tab path names, or null for an ordinary project file. */
+export function skillTabName(path: string): string | null {
+  if (!path.startsWith(SKILL_TAB_PREFIX)) return null
+  const name = path.slice(SKILL_TAB_PREFIX.length)
+  return name === '' ? null : name
+}
+
+const MEMORY_TAB_PREFIX = 'memory://'
+
+/** A memory file a workbench tab names: the project tier when `projectId` is set, else the workspace tier. */
+export interface MemoryTab {
+  readonly projectId?: string
+  /** Path inside the tier's memory folder, `/`-separated (e.g. `MEMORY.md`). */
+  readonly file: string
+}
+
+/**
+ * The workbench path of a memory file. Memory lives under the host's data
+ * folder, outside every project, so like a skill it is a virtual tab the
+ * viewer reads through the memory API.
+ */
+export function memoryTabPath(tab: MemoryTab): string {
+  return `${MEMORY_TAB_PREFIX}${tab.projectId !== undefined ? `projects/${tab.projectId}` : 'workspace'}/${tab.file}`
+}
+
+/** The memory file a virtual tab path names, or null for anything else. */
+export function memoryTabOf(path: string): MemoryTab | null {
+  if (!path.startsWith(MEMORY_TAB_PREFIX)) return null
+  const match = /^(?:workspace|projects\/([^/]+))\/(.+)$/.exec(path.slice(MEMORY_TAB_PREFIX.length))
+  if (match === null) return null
+  return { ...(match[1] !== undefined ? { projectId: match[1] } : {}), file: match[2] ?? '' }
+}
+
+/**
+ * Read a path a tool recorded as a file in this workspace's memory folders
+ * (`…/workspaces/<ws>/memory/workspace/…` or `…/memory/projects/<id>/…`).
+ * Another workspace's memory, and any `..` escape, return null.
+ */
+export function memoryTabForReference(reference: string, workspaceId: string): string | null {
+  const match = /(?:^|\/)workspaces\/([^/]+)\/memory\/(?:workspace|projects\/([^/]+))\/(.+)$/.exec(reference.trim().replaceAll('\\', '/'))
+  if (match === null || match[1] !== workspaceId) return null
+  const file = (match[3] ?? '').split('/').filter((segment) => segment !== '' && segment !== '.')
+  if (file.length === 0 || file.includes('..')) return null
+  return memoryTabPath({ ...(match[2] !== undefined ? { projectId: match[2] } : {}), file: file.join('/') })
+}
+
+/** Last path segment, used for tab titles (a skill tab is titled by the skill). */
 export function baseName(path: string): string {
-  return path.split('/').at(-1) ?? path
+  const memory = memoryTabOf(path)
+  return skillTabName(path) ?? (memory !== null ? memory.file : path).split('/').at(-1) ?? path
 }

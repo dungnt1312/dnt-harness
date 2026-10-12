@@ -14,6 +14,7 @@ const tool = (name: string): ToolSchema => ({ name, description: name, parameter
 describe('adaptive vision', () => {
   it('uses operator override first and treats unknown models as native vision', () => {
     expect(supportsNativeVision('glm-4.7')).toBe(false)
+    expect(supportsNativeVision('glm-5.3')).toBe(false)
     expect(supportsNativeVision('gpt-5.6')).toBe(true)
     expect(supportsNativeVision('unknown-future-model')).toBe(true)
     expect(supportsNativeVision('gpt-5.6', false)).toBe(false)

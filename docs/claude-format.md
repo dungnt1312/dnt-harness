@@ -74,6 +74,38 @@ everything. Identical commands run once per event; matching hooks run in
 parallel. Other Claude events (`PermissionRequest`, …) parse, are kept on
 save, and are listed as not run.
 
+**`if`, `async`, `asyncRewake`** (Claude command-hook fields; design:
+`superpowers/specs/2026-10-12-hook-if-async-rewake-design.md`).
+
+- `if` is a permission rule (`Bash(git commit:*)`, `Edit(src/**)`) matched
+  against the tool call of `PreToolUse`, `PostToolUse` and
+  `PostToolUseFailure`. It is a diagnostic on any other event.
+  - It errs toward running the hook: any part of a compound command may
+    match.
+  - A command with substitutions or redirects matches when the rule's
+    literal head occurs in it.
+  - Hooks that share one command and differ only in `if` have separate ids
+    and switches.
+- `async: true` runs the hook in the background. It never blocks, decides
+  or adds context, and its `hook/run` (`background: true`) lands when it
+  finishes.
+- `asyncRewake: true` (implies `async`): when the hook exits 2, its output
+  is queued for the root conversation as lower-trust input
+  (`origin: 'hook'`).
+  - `rewakeMessage` is the prefix the model reads; `rewakeSummary` is the
+    line the user sees.
+  - An idle conversation wakes; a running turn is never interrupted, so the
+    input waits behind it.
+  - The rewake skips `UserPromptSubmit` and slash expansion.
+  - An identical finding is dropped.
+  - At most 4 rewakes per conversation per 10 minutes.
+  - A hook whose interpreter cannot open its script is reported once as a
+    broken installation and never wakes the model.
+- Limits: 8 background hooks per conversation and 32 per host. A launch
+  over a limit is audited as `skipped:cap`.
+- A user Stop, deleting the conversation, or host shutdown kills them; a
+  killed hook never rewakes.
+
 **Execution.** `command` runs through the shell (`/bin/sh -c`, `cmd.exe` on
 Windows) in the project folder (else the workspace folder) with
 `CLAUDE_PROJECT_DIR` set; credential-looking environment variables are

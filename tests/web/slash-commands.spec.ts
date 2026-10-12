@@ -8,7 +8,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type ModelRequest, type WebServer } from 'dnt-harness'
+import { createWebServer, SENT_STAMP_LINE as SENT_STAMP, withoutSentStamp, type LlmProvider, type ModelRequest, type WebServer } from 'dnt-harness'
 
 const servers: WebServer[] = []
 const dirs: string[] = []
@@ -76,8 +76,11 @@ async function turnEnd(home: string, wsId: string, sessionId: string, count = 1)
   return latest
 }
 
-const userTexts = (request: ModelRequest | undefined): string[] =>
+const rawUserTexts = (request: ModelRequest | undefined): string[] =>
   (request?.messages ?? []).filter((message) => message.role === 'user').map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content))
+
+/** The host's `[sent …]` line on a typed message is not part of what the user wrote. */
+const userTexts = (request: ModelRequest | undefined): string[] => rawUserTexts(request).map(withoutSentStamp)
 
 describe('slash commands over the web host', () => {
   it('expands a workspace command after the typed text and keeps the typed text as the user message', async () => {
@@ -92,6 +95,10 @@ describe('slash commands over the web host', () => {
       ['Say hello to Ada politely.', 'command'],
     ])
     expect(userTexts(s.requests[0])).toEqual(['/greet Ada', 'Say hello to Ada politely.'])
+    // Only what the user typed carries the host's send time; the expansion does not.
+    const raw = rawUserTexts(s.requests[0])
+    expect(raw[0]).toMatch(SENT_STAMP)
+    expect(raw[1]).toBe('Say hello to Ada politely.')
   })
 
   it('project commands win over workspace and user ones; the route lists every layer', async () => {
@@ -194,8 +201,22 @@ describe('slash commands over the web host', () => {
     const results = log.filter((event) => event.type === 'tool/result').map((event) => String(event['output']))
     expect(results[0]).toMatch(/can only be run by the user/)
     expect(results[1]).toMatch(/^skill 'review' loaded/)
+    // The expanded body IS the tool result, in history at the load point —
+    // never a system block ahead of the cached prefix.
+    expect(results[1]).toContain('Review PR #42 carefully.')
     const systems = (s.requests[1]?.messages ?? []).filter((message) => message.role === 'system').map((message) => String(message.content)).join('\n')
-    expect(systems).toContain('Review PR #42 carefully.')
+    expect(systems).not.toContain('Review PR #42 carefully.')
+    const tools = (s.requests[1]?.messages ?? []).filter((message) => message.role === 'tool').map((message) => String(message.content))
+    expect(tools.some((text) => text.includes('Review PR #42 carefully.'))).toBe(true)
+    // Loading a skill leaves every message ahead of history byte-identical, so
+    // the provider's cached prefix survives the load.
+    const prefix = (request: ModelRequest | undefined) => (request?.messages ?? []).filter((message) => message.role === 'system').map((message) => String(message.content))
+    expect(prefix(s.requests[1])).toEqual(prefix(s.requests[0]))
+    // The next turn still carries the body where it was loaded.
+    await post(s.base, `/api/workspaces/${s.wsId}/sessions/${id}/messages`, { content: 'again' })
+    await turnEnd(s.home, s.wsId, id, 2)
+    const later = s.requests.at(-1)
+    expect((later?.messages ?? []).some((message) => message.role === 'tool' && String(message.content).includes('Review PR #42 carefully.'))).toBe(true)
     // The catalog the model sees leaves the user-only command out.
     const first = (s.requests[0]?.messages ?? []).filter((message) => message.role === 'system').map((message) => String(message.content)).join('\n')
     expect(first).toContain('review')

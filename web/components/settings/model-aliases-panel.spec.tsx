@@ -41,6 +41,14 @@ beforeEach(() => {
 afterEach(() => { act(() => root.unmount()); host.remove() })
 
 describe('ModelAliasesPanel mounted CRUD', () => {
+  it('opens a new alias form without an error, and flags a bad name only once typed', async () => {
+    await act(async () => root.render(<ModelAliasesPanel providers={providers} />)); await settle()
+    expect(host.textContent).not.toContain('Use a name without whitespace')
+    expect(button('Save alias').disabled).toBe(true)
+    await act(async () => set(input('Alias name'), 'bad name'))
+    expect(host.textContent).toContain('Use a name without whitespace')
+  })
+
   it('creates, edits/renames and deletes aliases with accessible controls and collision warning', async () => {
     vi.mocked(api.createModelAlias).mockResolvedValue({ ...valid, name: 'new-one' } as never)
     vi.mocked(api.updateModelAlias).mockResolvedValue({ ...valid, name: 'quick', revision: 2 } as never)

@@ -23,6 +23,8 @@ vi.mock('../../lib/api.ts', () => ({
   setImageGenerationSettings: vi.fn(async (value: unknown) => value),
   getImageUnderstandingSettings: vi.fn(async () => ({ provider: null, model: null })),
   setImageUnderstandingSettings: vi.fn(async (value: unknown) => value),
+  getVideoGenerationSettings: vi.fn(async () => ({ provider: null, model: null })),
+  setVideoGenerationSettings: vi.fn(async (value: unknown) => value),
   listMcpServers: vi.fn(async () => [{
     name: 'fs', transport: 'stdio', enabled: true, status: 'ready', breakerOpenUntil: null,
     discoveredTools: ['query', 'explode'], allowedTools: ['query'], unmatchedAllowlist: ['missing'],
@@ -581,7 +583,7 @@ describe('settings dialog', () => {
     const sections = [...document.body.querySelectorAll('[aria-label="Settings sections"] [role="tab"]')]
     expect(sections).toHaveLength(12)
     const sub = [...document.body.querySelectorAll('[aria-label="Providers & Models"] [role="tab"]')]
-    expect(sub.map((tab) => tab.textContent)).toEqual(['Providers', 'Model aliases', 'Images'])
+    expect(sub.map((tab) => tab.textContent)).toEqual(['Providers', 'Model aliases', 'Images', 'Videos'])
     for (const tab of [...sections, ...sub]) expect(tab.querySelector('svg')).not.toBeNull()
   })
 
@@ -597,6 +599,11 @@ describe('settings dialog', () => {
     expect(document.body.querySelector('[aria-label="Image settings"]')).not.toBeNull()
     expect(document.body.querySelector('[aria-label="Image generation"]')).not.toBeNull()
     expect(document.body.querySelector('[aria-label="Image understanding"]')).not.toBeNull()
+    expect([...document.body.querySelectorAll('button')].some((node) => node.textContent === 'Save changes')).toBe(false)
+    await act(async () => subTab('Videos').click())
+    expect(subTab('Videos').getAttribute('aria-selected')).toBe('true')
+    expect(document.body.querySelector('[aria-label="Video generation"]')).not.toBeNull()
+    expect(document.body.querySelector('[aria-label="Image generation"]')).toBeNull()
     expect([...document.body.querySelectorAll('button')].some((node) => node.textContent === 'Save changes')).toBe(false)
     await act(async () => subTab('Model aliases').click())
     expect(document.body.querySelector('[aria-label="Model alias editor"]')).not.toBeNull()

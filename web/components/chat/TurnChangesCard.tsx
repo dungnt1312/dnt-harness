@@ -1,225 +1,215 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import Icon from '../common/Icon.tsx'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
-import { LineCount } from '../common/DiffLines.tsx'
+import { DiffLines, LineCount, diffRowsFromEdit, diffRowsFromWrite, type DiffRow } from '../common/DiffLines.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { cn } from '../../lib/cn.ts'
-import type { GitStatusReport } from '../../lib/api.ts'
-import { fetchGitStatus } from '../../lib/api.ts'
-import { overlayTurnChanges, type TurnChangeOverlay } from '../../lib/turn-git.ts'
-import type { TurnChanges } from '../../lib/turn-changes.ts'
+import type { TurnChanges, TurnChangeFile } from '../../lib/turn-changes.ts'
 import type { OpenPathResolver } from '../../lib/project-paths.ts'
 import { toProjectRelative } from '../../lib/project-paths.ts'
 import type { WorkbenchProject } from '../workbench/Workbench.tsx'
-
-/** Copy label per file status — never color alone. */
-const STATUS_TEXT: Readonly<Record<'modified' | 'created', string>> = {
-  modified: 'Modified',
-  created: 'Created',
-}
-
-/** One-letter mark, the same codes a git UI prints. */
-const STATUS_MARK: Readonly<Record<'modified' | 'created', string>> = {
-  modified: 'M',
-  created: 'A',
-}
-
-const markColor = (status: 'modified' | 'created'): string => (status === 'created' ? 'text-ok' : 'text-warn')
 
 function turnChangesLabel(count: number): string {
   return `${count} ${count === 1 ? 'file' : 'files'} changed`
 }
 
+/** Hover-revealed without taking room: see GitPanel's ChangeRow for the contract. */
+const REVEAL_ON_ROW = 'absolute right-1 top-0 flex h-8 items-center opacity-0 invisible transition-opacity group-hover/file:visible group-hover/file:opacity-100 group-has-[:focus-visible]/file:visible group-has-[:focus-visible]/file:opacity-100 [@media(pointer:coarse)]:visible [@media(pointer:coarse)]:opacity-100'
+const QUIET_ICON = 'size-6 rounded-md text-fg-faint hover:bg-transparent hover:text-fg'
+
+/** The git surface is labelled as git everywhere: it is not this turn's diff. */
+const GIT_HINT = 'All uncommitted changes (git diff vs HEAD), not only this turn'
+
 /**
- * The per-turn change card: one collapsible row under a closed turn's last
- * answer, naming the files that turn's Write/Edit calls landed. The collapsed
- * row counts lines from the log alone — the exact `old`/`new` an Edit
- * recorded, attributed to this turn and no other. Expanding loads the
- * project's read-only git view (lazily: nothing is fetched while collapsed)
- * and marks each file with git's current whole-worktree numbers, which other
- * turns sharing the file also contributed to — the note says so rather than
- * implying attribution.
+ * The per-turn change card: the files a turn's Write/Edit calls landed. It
+ * shows the TURN's change and nothing else — every number and every diff line
+ * comes from the calls the log recorded for this turn (see `turnChanges`).
+ * A file row expands in place to that turn-only diff; the header total is the
+ * sum of the rows. Because nothing is fetched, the card appears the moment the
+ * first edit lands and, while the turn runs (`live`), grows file by file.
  *
- * The projection never invents effects: Bash edits and child writes are
- * invisible here, and the expanded list points at the Git view for the full
- * picture.
+ * Git is a different question — what differs from HEAD now, across every
+ * turn, session and hand edit — so it is reached only through actions that
+ * say so: "Open in Git" for the turn's files, and a git icon per file.
+ *
+ * Bash edits and child writes are not in this turn's log and so not here.
  */
-export function TurnChangesCard({ turnId, changes, project, workspaceId, onOpenPath, onReviewFile, onReviewAll }: {
+export function TurnChangesCard({ turnId, changes, project, live = false, onOpenPath, onReviewFile, onReviewAll }: {
   readonly turnId: string
   readonly changes: TurnChanges
   readonly project: WorkbenchProject | null
-  readonly workspaceId: string | null
+  /** The turn is still running: files stream in, and the header says "Editing". The list stays closed until opened. */
+  readonly live?: boolean
   /** Resolves a recorded path to an opener, exactly like a tool row. */
   readonly onOpenPath?: OpenPathResolver
-  /** Opens the Git view in the workbench narrowed to this one file. */
+  /** Opens the Git view focused on this file's git diff. */
   readonly onReviewFile?: (path: string) => void
-  /** Opens the Git view over the whole project; offered with a project. */
+  /** Opens the Git view narrowed to this turn's files. */
   readonly onReviewAll?: () => void
 }) {
+  // Closed by default, live or not: a long list must not push the running
+  // work off screen. The header still counts files and lines as they land.
   const [open, setOpen] = useState(false)
-  // Collapsed costs nothing: git is a view over live state, loaded once, only
-  // while the list is open — never as a side effect of rendering the row.
-  const report = useGitReport(workspaceId, project?.id ?? null, open)
-
-  const rows = useMemo(
-    () => (open ? overlayTurnChanges(changes, project?.path ?? '', report) : []),
-    [open, changes, project?.path, report],
-  )
-  const outsideCount = rows.filter((row) => row.outside === true).length
-  const logTotals = changes.files.reduce((sum, file) => ({
+  const totals = changes.files.reduce((sum, file) => ({
     added: sum.added + (file.lines?.added ?? 0),
     removed: sum.removed + (file.lines?.removed ?? 0),
   }), { added: 0, removed: 0 })
+  const outsideCount = project === null
+    ? 0
+    : changes.files.filter((file) => toProjectRelative(project.path, file.path) === null).length
 
   return (
-    <div className="-ml-2 mt-0.5">
-      <div className="flex min-h-7 items-center gap-1.5 pr-1.5 text-[13px]">
+    <section
+      aria-label={`Changes of turn ${turnId}`}
+      className="mt-1 rounded-xl border border-line bg-muted/40 p-1"
+    >
+      {/* Each line is ONE hover surface: the whole line lights as a single
+          rounded band, its inner buttons included. Inner buttons only change
+          text color. */}
+      <div className="flex h-8 items-center gap-1 rounded-lg pr-1 transition-colors hover:bg-hover">
         <button
           type="button"
           aria-expanded={open}
           onClick={() => setOpen((value) => !value)}
-          className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 py-0.5 text-left text-fg-muted transition-colors hover:bg-hover hover:text-fg"
+          className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-lg px-2 text-left text-[13px] text-fg"
         >
           <Icon name="chevronRight" size={12} className={cn('shrink-0 text-fg-faint transition-transform', open && 'rotate-90')} />
-          <Icon name="gitBranch" size={14} className="shrink-0 text-fg-faint" />
           <span className="shrink-0 font-medium">{turnChangesLabel(changes.files.length)}</span>
-          {logTotals.added > 0 ? <span className="shrink-0 font-mono text-xs text-ok">+{logTotals.added}</span> : null}
-          {logTotals.removed > 0 ? <span className="shrink-0 font-mono text-xs text-bad">−{logTotals.removed}</span> : null}
+          <LineCount added={totals.added} removed={totals.removed} />
           {changes.files.length === 0 && changes.uncertain.length > 0 ? (
             <span className="shrink-0 rounded bg-warn-soft px-1.5 text-[11px] text-warn">outcome unconfirmed</span>
+          ) : null}
+          {live ? (
+            <span className="flex shrink-0 items-center gap-1.5 text-[11px] text-fg-faint">
+              <span className="size-1.5 rounded-full bg-ok animate-dot" aria-hidden="true" />
+              Editing
+            </span>
           ) : null}
         </button>
         {onReviewAll !== undefined ? (
           <button
             type="button"
             onClick={onReviewAll}
-            className="shrink-0 rounded-md px-1.5 py-0.5 text-[12px] text-link underline-offset-2 transition-colors hover:bg-hover hover:underline"
+            title={GIT_HINT}
+            className="flex h-full shrink-0 items-center gap-1.5 rounded-lg px-1.5 text-[12px] text-fg-muted transition-colors hover:text-fg"
           >
-            Review all
+            <Icon name="gitBranch" size={12} className="shrink-0" />
+            Open in Git
           </button>
         ) : null}
       </div>
       {open ? (
-        <div className="ml-[26px] border-l border-line pl-2">
-          {report === null && project !== null ? (
-            <p className="m-0 flex items-center gap-2 px-1 py-1 text-[12px] text-fg-muted" role="status">
-              Loading git view…<span className="sr-only">Loading git status</span>
-            </p>
-          ) : null}
+        <div className="mt-0.5">
           {changes.files.length > 0 ? (
-            <ul aria-label={`Files changed by turn ${turnId}`} className="m-0 list-none p-0">
-              {rows.map((row) => {
-                return (
-                  <ChangeFileRow
-                    key={row.path}
-                    row={row}
-                    {...(project !== null ? { project } : {})}
-                    {...(onReviewFile !== undefined ? { onReviewFile } : {})}
-                    {...(onOpenPath !== undefined ? { onOpenPath } : {})}
-                  />
-                )
-              })}
+            <ul aria-label={`Files changed by turn ${turnId}`} className="m-0 flex list-none flex-col gap-0.5 p-0">
+              {changes.files.map((file) => (
+                <ChangeFileRow
+                  key={file.path}
+                  file={file}
+                  {...(project !== null ? { project } : {})}
+                  {...(onReviewFile !== undefined ? { onReviewFile } : {})}
+                  {...(onOpenPath !== undefined ? { onOpenPath } : {})}
+                />
+              ))}
             </ul>
           ) : (
-            <p className="m-0 px-1 py-1 text-[12px] text-fg-muted" role="note">
-              {changes.uncertain.length} {changes.uncertain.length === 1 ? 'write did not report its outcome' : 'writes did not report their outcomes'} — the log cannot say whether the {changes.uncertain.length === 1 ? 'file was' : 'files were'} changed. Git view shows what actually differs.
+            <p className="m-0 px-2 py-1.5 text-[12px] text-fg-muted" role="note">
+              {changes.uncertain.length} {changes.uncertain.length === 1 ? 'write did not report its outcome' : 'writes did not report their outcomes'} — the log cannot say whether the {changes.uncertain.length === 1 ? 'file was' : 'files were'} changed. The Git view shows what actually differs.
             </p>
           )}
           {outsideCount > 0 ? (
-            <p className="m-0 px-1 py-1 text-[12px] text-fg-faint" role="note">
-              {outsideCount === 1 ? 'One file sits' : `${outsideCount} files sit`} outside the project folder — git does not count {outsideCount === 1 ? 'it' : 'them'} here.
+            <p className="m-0 px-2 py-1.5 text-[12px] text-fg-faint" role="note">
+              {outsideCount === 1 ? 'One file sits' : `${outsideCount} files sit`} outside the project folder; the Git view cannot show {outsideCount === 1 ? 'it' : 'them'}.
             </p>
           ) : null}
         </div>
       ) : null}
-    </div>
+    </section>
   )
 }
 
+/** The turn-only diff of one file: every landed call on it, in call order. */
+export function turnFileDiffRows(file: TurnChangeFile): readonly DiffRow[] {
+  const rows: DiffRow[] = []
+  file.edits.forEach((edit, index) => {
+    if (file.edits.length > 1) {
+      rows.push({ kind: 'meta', text: `${edit.kind === 'write' ? 'Write' : 'Edit'} ${index + 1} of ${file.edits.length}`, old: null, new: null })
+    }
+    if (edit.kind === 'write') {
+      if (!edit.created) rows.push({ kind: 'meta', text: 'Replaced the whole file; what it held before is not recorded.', old: null, new: null })
+      rows.push(...diffRowsFromWrite(edit.content))
+    } else {
+      rows.push(...diffRowsFromEdit(edit.old, edit.new, edit.output))
+    }
+  })
+  return rows
+}
+
 /**
- * One file of the expanded list: a row (mark, icon, name, directory, git
- * chips) whose click opens the Git view in the workbench with that file's
- * diff open — the review lives at review scale, beside every other change,
- * instead of a diff drawn inline here. A quiet button at the row's end opens
- * the file itself for full context. A file whose path git cannot resolve has
- * no row to focus, so the row stays put and only the file opener remains.
+ * One file of the list: icon, name, directory, a "New"/"Rewritten" tag, and
+ * this turn's line counts. Clicking expands the turn-only diff right here.
+ * Quiet buttons over the row's right edge — shown on hover, keyboard focus or
+ * touch, never taking room — open the file, and its git diff (labelled so).
  */
-function ChangeFileRow({ row, project, onReviewFile, onOpenPath }: {
-  readonly row: TurnChangeOverlay
+function ChangeFileRow({ file, project, onReviewFile, onOpenPath }: {
+  readonly file: TurnChangeFile
   readonly project?: WorkbenchProject
   readonly onReviewFile?: (path: string) => void
   readonly onOpenPath?: OpenPathResolver
 }) {
-  const open = onOpenPath?.(row.path) ?? null
-  const name = row.path.split(/[\\/]/).pop() ?? row.path
-  const directory = row.path.slice(0, row.path.length - name.length).replace(/[\\/]+$/, '')
-  const relative = project !== undefined ? toProjectRelative(project.path, row.path) : null
-  // The Git view focuses project-relative paths; an unresolvable path leaves
-  // the row informational.
-  const review = onReviewFile !== undefined && relative !== null && relative !== ''
-    ? () => onReviewFile(relative)
-    : null
-  const body = (
-    <>
-      <span
-        className={cn('flex w-3 shrink-0 justify-center font-mono text-[11px] font-semibold', markColor(row.status))}
-        title={STATUS_TEXT[row.status]}
-      >
-        <span aria-hidden="true">{STATUS_MARK[row.status]}</span>
-        <span className="sr-only">{STATUS_TEXT[row.status]}</span>
-      </span>
-      <FileTypeIcon path={row.path} size={16} />
-      <span className="min-w-0 flex-1 truncate">
-        <span className={cn(row.status === 'created' && 'font-medium')}>{name}</span>
-        {directory !== '' ? <span className="ml-1.5 text-fg-faint">{directory}</span> : null}
-      </span>
-      {row.git !== undefined
-        ? <LineCount {...(row.git.added !== undefined ? { added: row.git.added } : {})} {...(row.git.removed !== undefined ? { removed: row.git.removed } : {})} />
-        : null}
-      {row.outside === true ? <span className="shrink-0 text-[11px] text-fg-faint">outside project</span> : null}
-    </>
-  )
+  const [expanded, setExpanded] = useState(false)
+  const rows = useMemo(() => (expanded ? turnFileDiffRows(file) : []), [expanded, file])
+  const open = onOpenPath?.(file.path) ?? null
+  const name = file.path.split(/[\\/]/).pop() ?? file.path
+  const directory = file.path.slice(0, file.path.length - name.length).replace(/[\\/]+$/, '')
+  const relative = project !== undefined ? toProjectRelative(project.path, file.path) : null
+  const gitDiff = onReviewFile !== undefined && relative !== null && relative !== '' ? () => onReviewFile(relative) : null
+  const hasActions = open !== null || gitDiff !== null
   return (
-    <li className="m-0">
-      <div className="flex items-center gap-0.5">
-        {review !== null ? (
-          <button
-            type="button"
-            title={`${row.path} — show the diff in the Git view`}
-            onClick={review}
-            className="flex min-h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px] transition-colors hover:bg-hover"
-          >
-            {body}
-          </button>
-        ) : (
-          <div title={row.path} className="flex min-h-8 min-w-0 flex-1 items-center gap-1.5 px-1.5 text-[13px]">
-            {body}
-          </div>
-        )}
-        {open !== null ? (
-          <IconButton label={`Open ${name} in workbench`} onClick={open} className="mr-0.5">
-            <Icon name="fileText" size={13} />
-          </IconButton>
-        ) : null}
-      </div>
+    <li className="group/file relative m-0">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        title={file.path}
+        onClick={() => setExpanded((value) => !value)}
+        className={cn('flex min-h-8 w-full min-w-0 items-center gap-2 rounded-lg px-2 text-left text-[13px] transition-colors hover:bg-hover', expanded && 'bg-hover')}
+      >
+        <FileTypeIcon path={file.path} size={16} />
+        <span className="min-w-0 flex-1 truncate">
+          <span className="font-medium text-fg">{name}</span>
+          {directory !== '' ? <span className="ml-2 text-[12px] text-fg-faint">{directory}</span> : null}
+        </span>
+        <span className={cn('flex shrink-0 items-center gap-2', hasActions && 'transition-opacity group-hover/file:opacity-0 group-has-[:focus-visible]/file:opacity-0 [@media(pointer:coarse)]:opacity-100')}>
+          {file.status === 'created'
+            ? <span className="rounded bg-ok-soft px-1.5 text-[10px] font-medium uppercase leading-[16px] tracking-wide text-ok">New</span>
+            : file.overwrote === true
+              ? <span className="rounded bg-muted px-1.5 text-[10px] font-medium uppercase leading-[16px] tracking-wide text-fg-muted" title="Rewrote the whole file; the replaced content is not recorded">Rewritten</span>
+              : <span className="sr-only">Modified</span>}
+          <LineCount
+            {...(file.lines?.added !== undefined ? { added: file.lines.added } : {})}
+            {...(file.lines?.removed !== undefined ? { removed: file.lines.removed } : {})}
+          />
+        </span>
+      </button>
+      {hasActions ? (
+        <span className={REVEAL_ON_ROW}>
+          {gitDiff !== null ? (
+            <IconButton label={`Show git diff of ${name} (all uncommitted changes)`} onClick={gitDiff} className={QUIET_ICON}>
+              <Icon name="gitBranch" size={12} />
+            </IconButton>
+          ) : null}
+          {open !== null ? (
+            <IconButton label={`Open ${name} in workbench`} onClick={open} className={QUIET_ICON}>
+              <Icon name="fileText" size={12} />
+            </IconButton>
+          ) : null}
+        </span>
+      ) : null}
+      {expanded ? (
+        <div className="mx-1 mb-1 mt-0.5 max-h-80 overflow-auto rounded-lg border border-line bg-surface" role="region" aria-label={`This turn's diff of ${file.path}`} tabIndex={0}>
+          {rows.length > 0 ? <DiffLines rows={rows} /> : <p className="m-0 px-3 py-2 text-xs text-fg-muted">No textual change recorded.</p>}
+        </div>
+      ) : null}
     </li>
   )
-}
-
-/** Git report for the conversation project; loads only while `enabled`. */
-function useGitReport(workspaceId: string | null, projectId: string | null, enabled: boolean): GitStatusReport | null {
-  const [report, setReport] = useState<GitStatusReport | null>(null)
-  useEffect(() => {
-    if (!enabled || workspaceId === null || projectId === null) return
-    let cancelled = false
-    fetchGitStatus(workspaceId, projectId)
-      .then((next) => { if (!cancelled) setReport(next) })
-      .catch(() => {
-        // No numbers is a display outcome, not an error surface: the card
-        // already words itself for a missing git view.
-        if (!cancelled) setReport(null)
-      })
-    return () => { cancelled = true }
-  }, [workspaceId, projectId, enabled])
-  return report
 }

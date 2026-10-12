@@ -119,30 +119,62 @@ function relativeTarget(target: string, baseDir: string | undefined): string | u
   return posix.replace(/^\.\//, '')
 }
 
+/** The literal head of a Bash specifier: everything before its first wildcard. */
+function literalPrefix(specifier: string): string {
+  const head = specifier.endsWith(':*') ? specifier.slice(0, -2) : specifier
+  const star = head.indexOf('*')
+  return (star === -1 ? head : head.slice(0, star)).replace(/\s+/g, ' ').trim()
+}
+
+export interface RuleCall {
+  readonly name: string
+  readonly args: Readonly<Record<string, unknown>>
+}
+
 /**
- * Whether one call is covered by the rules. `args` uses dnt-harness argument
- * names; `baseDir` (the project folder) relativizes absolute file paths.
+ * One rule against one call, in one of two directions:
+ *
+ * - `grant` (`allowed-tools`): a match lifts an ask, so it must be proven.
+ *   Shell syntax the prefix does not name never matches, and a compound
+ *   command matches only when every part does.
+ * - `filter` (a hook's `if`): a non-match skips a hook — possibly a security
+ *   review — so only a proven non-match skips. Any matching compound part
+ *   matches, shell syntax a prefix cannot reason about matches when the
+ *   rule's literal head occurs anywhere, and an unsafe file target matches.
  */
-export function allowedByRules(rules: readonly string[], call: { readonly name: string; readonly args: Readonly<Record<string, unknown>> }, baseDir?: string): boolean {
+export function ruleMatchesCall(rule: AllowRule, call: RuleCall, mode: 'grant' | 'filter', baseDir?: string): boolean {
+  if (rule.tool === '*') return true
+  if (rule.tool !== call.name) return false
+  if (rule.specifier === undefined) return true
+  const specifier = rule.specifier
+  if (call.name === 'Bash') {
+    const command = typeof call.args['command'] === 'string' ? call.args['command'] : ''
+    const parts = splitCompound(command)
+    if (mode === 'grant') {
+      return !hasUncoveredShellSyntax(command) && parts.length > 0 && parts.every((part) => bashPartMatches(part, specifier))
+    }
+    if (parts.some((part) => bashPartMatches(part, specifier))) return true
+    const head = literalPrefix(specifier)
+    return hasUncoveredShellSyntax(command) && (head === '' || command.replace(/\s+/g, ' ').includes(head))
+  }
+  const target = ['path', 'file_path', 'pattern', 'url']
+    .map((key) => call.args[key])
+    .find((value): value is string => typeof value === 'string')
+  if (target === undefined) return mode === 'filter'
+  const relative = relativeTarget(target, baseDir)
+  if (relative === undefined) return mode === 'filter'
+  return pathGlobToRegExp(specifier.replace(/^\.\//, '')).test(relative)
+}
+
+/**
+ * Whether one call is covered by the rules (`grant` direction). `args` uses
+ * dnt-harness argument names; `baseDir` (the project folder) relativizes
+ * absolute file paths.
+ */
+export function allowedByRules(rules: readonly string[], call: RuleCall, baseDir?: string): boolean {
   for (const raw of rules) {
     const rule = parseAllowRule(raw)
-    if (rule === undefined) continue
-    if (rule.tool === '*') return true
-    if (rule.tool !== call.name) continue
-    if (rule.specifier === undefined) return true
-    if (call.name === 'Bash') {
-      const command = typeof call.args['command'] === 'string' ? call.args['command'] : ''
-      if (hasUncoveredShellSyntax(command)) continue
-      const parts = splitCompound(command)
-      if (parts.length > 0 && parts.every((part) => bashPartMatches(part, rule.specifier as string))) return true
-      continue
-    }
-    const target = ['path', 'file_path', 'pattern', 'url']
-      .map((key) => call.args[key])
-      .find((value): value is string => typeof value === 'string')
-    if (target === undefined) continue
-    const relative = relativeTarget(target, baseDir)
-    if (relative !== undefined && pathGlobToRegExp(rule.specifier.replace(/^\.\//, '')).test(relative)) return true
+    if (rule !== undefined && ruleMatchesCall(rule, call, 'grant', baseDir)) return true
   }
   return false
 }

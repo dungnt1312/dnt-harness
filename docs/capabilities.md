@@ -173,10 +173,12 @@ classifier and no auto-load:
 - **Mode-gated**: the tool resolves the current mode through the ambient agent
   scope and refuses when the mode turns skills off; a live mode switch means
   the next call gates fresh.
-- **Turn-local**: a loaded skill is pinned per session turn with a content
-  hash; the context builder injects the pinned snapshot exactly once (no
-  duplicate full-body injection), and the tool result is only a compact
-  acknowledgement.
+- **Body as tool result**: a load returns a receipt line plus the expanded
+  instructions; the body stays in history at the load point (later turns
+  included), so a load never moves the cached prompt prefix. A repeat load in
+  the same turn returns only a receipt; a body over 200 000 characters is
+  refused whole. Agent-definition `skills:` preloads are the exception: they
+  ride the system prefix, hash-pinned for the child's run.
 - **Content is data, never permissions**: skill text cannot grant capabilities
   or widen the permission policy — the mode's tool exposure stays the ceiling.
 
@@ -361,6 +363,55 @@ deleted, or disabled provider fails the call with the Settings fix it needs.
   `allow` in Full access and are not exposed in Plan. DescribeImage is a
   read-like `allow` tool exposed in every bundled mode, including Plan.
 
+## Video tool (`src/harness/tools/video-tools.ts`)
+
+`GenerateVideo { prompt, attachmentId | path, seconds?, size? }` runs an
+asynchronous Videos API job and blocks until the file is stored, because the
+video is the turn's product. The provider and model come from **Settings →
+Providers & Models → Videos**: a `{ provider, model }` reference in
+`video-generation.json` (see `src/web/model-pair-store.ts`, shared with the
+image settings), resolved against the live provider list on every call. The API
+is the CLIProxy / xAI native shape:
+
+- `POST {baseUrl}/videos` returns `{ request_id }` (or `{ id }`). The body is
+  `{ model, prompt, seconds?, size?, image?: { url } }`; a reference image is
+  sent as a data URL. At most one image source is allowed, and the rules are
+  EditImage's: `attachmentId` names a stored image, `path` names a file under
+  the run's grants. `path` is listed in `targetPaths`, so it is classified,
+  approved, and refused exactly as a `Read` of that path would be. Omit both
+  for text-to-video.
+- `GET {baseUrl}/videos/{id}` is polled every 2 seconds. `done`, `completed`,
+  `succeeded`, and `success` finish the job. `failed`, `error`, `expired`, and
+  `cancelled` fail it. An `error` string or `error.message` is terminal
+  whatever the status says. Anything else keeps polling. Every failure message
+  carries the `request_id`.
+- The bytes come from `video.url` (or `video_url`) when it is http(s), else
+  from `GET {baseUrl}/videos/{id}/content`. Provider credentials go only to the
+  provider's own host, never to a CDN URL.
+- The whole call has a 10-minute budget, with 60 seconds per create or poll
+  request. The turn's stop signal cancels the call between polls and during
+  the download.
+
+Videos do not use `AttachmentStore`: it reads whole files into memory under a
+10 MiB cap. `VideoStore` (`src/harness/attachments/video-store.ts`) streams the
+download to disk under a 200 MiB cap and hashes it while it streams. It stores
+the video content-addressed under `workspaces/<ws>/videos/<sha256>`, and it
+accepts only MP4, MOV, and WebM (checked from the leading bytes). A provider
+that answers with an HTML error page is refused instead of becoming an
+unplayable "video". An aborted or oversize download leaves no file behind.
+
+`GET|HEAD /api/workspaces/:wid/videos/:id` serves a stored video, read-only.
+The type is sniffed from the bytes. A single `Range` (`bytes=a-b`, `a-`, or
+`-n`) is honored with 206 so players can seek, and an unsatisfiable range is
+416. The response is immutable, because the id is the content hash.
+
+The tool returns `{ videoId, mediaType, bytes, model, requestId, duration,
+progress, sourceAttachmentId? }`. The transcript row (`GeneratedVideoCard`)
+shows a labelled placeholder while the job runs and a `<video controls>` player
+once it is stored. Its mode defaults match the image generators: `ask` in Ask
+before changes and Edit automatically, `allow` in Full access, and not exposed
+in Plan.
+
 ## MCP tools (`src/harness/mcp/`)
 
 Servers from a workspace's `mcp.json` register dynamically as
@@ -432,7 +483,8 @@ mode cannot widen them.
   reading the ambient agent scope — a session bound to a project gets that
   project's folder; a workspace-mode session with no project has **no
   filesystem grant** except enabled memory roots. `Skill`, `TodoWrite`,
-  `GenerateImage`, and `EditImage` register with the harness; MCP tools
+  `GenerateImage`, `EditImage`, `DescribeImage`, and `GenerateVideo` register
+  with the harness; MCP tools
   register per workspace as its servers connect.
 
 ## Reading further
@@ -446,10 +498,15 @@ mode cannot widen them.
   `web/lib/todos-view.spec.ts`, `web/components/chat/environment-panel.spec.tsx`.
 - Image tools: `tests/harness/image-tools.spec.ts`,
   `tests/harness/image-tools-mode-exposure.spec.ts`,
-  `tests/web/image-generation-store.spec.ts`,
+  `tests/web/model-pair-store.spec.ts`,
   `tests/web/server-generate-image.spec.ts`,
   `tests/harness/describe-image.spec.ts`,
   `tests/harness/adaptive-vision.spec.ts`,
   `tests/web/server-adaptive-vision.spec.ts`, and
   `tests/web/server-native-vision.spec.ts`; row rendering:
   `web/lib/generated-image.spec.tsx`.
+- Bundled `/image` and `/video` commands: `tests/harness/commands-bundled.spec.ts`,
+  `tests/web/bundled-media-commands.spec.ts` (see `docs/plugins.md`).
+- Video tool: `tests/harness/video-store.spec.ts`,
+  `tests/harness/video-tools.spec.ts`, `tests/web/server-generate-video.spec.ts`;
+  row rendering: `web/lib/generated-video.spec.tsx`.

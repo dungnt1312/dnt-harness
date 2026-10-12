@@ -5,7 +5,8 @@ import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
-import { readProjectFile, type ProjectFileView } from '../../lib/api.ts'
+import { getSkillFile, readMemoryFile, readProjectFile, type ProjectFileView } from '../../lib/api.ts'
+import { memoryTabOf, skillTabName } from '../../lib/project-paths.ts'
 import type { ViewerFocus } from '../../hooks/useWorkbenchFiles.ts'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
 import { MediaPreview } from '../common/MediaPreview.tsx'
@@ -13,6 +14,12 @@ import { escapeHtml, ensureLanguage, highlight, languageOfFile } from '../../lib
 
 /** Above this size files render as plain escaped text to keep the viewer responsive. */
 const HIGHLIGHT_LIMIT = 200_000
+
+/** A skill's SKILL.md in the shape the viewer renders a project file. */
+async function readSkillMd(workspaceId: string, projectId: string, name: string): Promise<ProjectFileView> {
+  const file = await getSkillFile(workspaceId, name, 'SKILL.md', projectId)
+  return { path: file.path, size: file.bytes, binary: false, truncated: false, content: file.content }
+}
 
 /** Read-only file view: path bar, language, copy, and line-numbered highlighted content. */
 export function FileViewer({ workspaceId, projectId, projectPath, path, focus = null }: {
@@ -27,6 +34,11 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const generation = useRef(0)
+  // A skill tab reads SKILL.md from whichever layer owns the skill, which may
+  // be outside the project folder.
+  const skill = skillTabName(path)
+  // A memory tab reads from the workspace's memory folders, also outside the project.
+  const memory = memoryTabOf(path)
   const scrollRef = useRef<HTMLDivElement>(null)
   const numbersRef = useRef<HTMLPreElement>(null)
   // Measured, never assumed: the gutter shares the content's line grid, and a
@@ -38,18 +50,22 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
     setLoading(true)
     setError(null)
     try {
-      const next = await readProjectFile(workspaceId, projectId, path)
+      const next = skill !== null
+        ? await readSkillMd(workspaceId, projectId, skill)
+        : memory !== null
+          ? await readMemoryFile(workspaceId, memory.file, memory.projectId)
+          : await readProjectFile(workspaceId, projectId, path)
       if (generation.current === request) setFile(next)
     } catch (cause) {
       if (generation.current === request) setError(String(cause))
     } finally {
       if (generation.current === request) setLoading(false)
     }
-  }, [workspaceId, projectId, path])
+  }, [workspaceId, projectId, path, skill, memory?.file, memory?.projectId])
 
   useEffect(() => { void load() }, [load])
 
-  const language = languageOfFile(path)
+  const language = languageOfFile(skill !== null ? 'SKILL.md' : memory !== null ? memory.file : path)
   // The grammar loads after first paint: big files never wait on it, and the
   // escaped text is already correct before the highlighted pass re-renders.
   const [grammarReady, setGrammarReady] = useState(language === 'text')
@@ -96,12 +112,17 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
       }
     : null
   const separator = projectPath.includes('\\') ? '\\' : '/'
-  const fullPath = `${projectPath.replace(/[\\/]+$/, '')}${separator}${path.split('/').join(separator)}`
+  const fullPath = skill !== null
+    ? `Skill · ${skill}/SKILL.md`
+    : memory !== null
+      ? `Memory · ${memory.projectId !== undefined ? 'project' : 'workspace'} · ${memory.file}`
+      : `${projectPath.replace(/[\\/]+$/, '')}${separator}${path.split('/').join(separator)}`
+  const iconPath = skill !== null ? 'SKILL.md' : memory !== null ? memory.file : path
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3 text-[13px]">
-        <FileTypeIcon path={path} size={16} />
+        <FileTypeIcon path={iconPath} size={16} />
         <span className="min-w-0 flex-1 truncate text-fg-muted" title={fullPath}>{fullPath}</span>
         <IconButton label="Reload file" onClick={() => void load()}><Icon name="refresh" size={15} /></IconButton>
       </div>

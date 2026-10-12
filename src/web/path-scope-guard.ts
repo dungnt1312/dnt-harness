@@ -1,7 +1,8 @@
 /**
  * Path-scope guard for the file tools: classifies every path a
  * `Read/Write/Edit/Glob/Grep` call targets against the run's grants BEFORE
- * authorization, without touching the filesystem.
+ * authorization. Classification is lexical; only an out-of-grant local path
+ * is resolved on disk (links followed) so the approval names its real location.
  *
  * - network/device paths, app storage, and writes into a read-only granted
  *   folder are denied outright (never askable);
@@ -20,7 +21,7 @@ import type { Context } from '../kernel/index.ts'
 import { agentScope } from '../harness/agent/scope.ts'
 import type { ToolCall } from '../harness/llm/types.ts'
 import type { ApprovedPath, PathIntent, PreExecuteDecision, ToolExecution } from '../harness/tools/types.ts'
-import { classifyTarget, targetPaths } from '../capabilities/fs/grants.ts'
+import { classifyTarget, realTargetOf, targetPaths } from '../capabilities/fs/grants.ts'
 import { currentToolExecution } from '../harness/tools/execution-scope.ts'
 
 /** One out-of-grant path a pending call targets. */
@@ -109,9 +110,26 @@ export function attachPathScopeGuard(ctx: Context, options: PathScopeOptions): P
           return { kind: 'deny', reason: `path '${target.target}' is in a read-only granted folder (${classified.root.path})` }
         case 'in-grant':
           break
-        case 'out-of-grant':
-          outside = { path: classified.abs, intent: target.intent }
+        case 'out-of-grant': {
+          // Approve the real location (e.g. macOS `/tmp` → `/private/tmp`):
+          // the file tools resolve links and check the approval against it.
+          // Blocked (UNC/device) paths were refused above without any IO.
+          const real = await realTargetOf(classified.abs)
+          if (real !== classified.abs) {
+            const realClass = classifyTarget(grant, real, target.intent)
+            if (realClass.kind === 'denied' || realClass.kind === 'blocked') {
+              return { kind: 'deny', reason: `path '${target.target}' resolves into application-internal storage or a protected credential folder and is not accessible to tools` }
+            }
+            if (realClass.kind === 'read-only') {
+              return { kind: 'deny', reason: `path '${target.target}' resolves into a read-only granted folder (${realClass.root.path})` }
+            }
+            // A link into a writable grant is still recorded: the tool needs
+            // the real path approved, and the host asks nothing because that
+            // real path classifies as in-grant.
+          }
+          outside = { path: real, intent: target.intent }
           break
+        }
       }
     }
     if (outside === undefined) return next()

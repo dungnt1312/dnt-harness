@@ -11,7 +11,7 @@ import { GitPanel } from './GitPanel.tsx'
 import { ProcessPanel } from './ProcessPanel.tsx'
 
 const TerminalPanel = lazy(async () => import('./TerminalPanel.tsx'))
-import { baseName } from '../../lib/project-paths.ts'
+import { baseName, memoryTabOf, skillTabName } from '../../lib/project-paths.ts'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
 import { cn } from '../../lib/cn.ts'
 import type { WorkbenchFiles } from '../../hooks/useWorkbenchFiles.ts'
@@ -90,12 +90,10 @@ function ViewTab({ view, active, onClick, onClose }: {
  * tab strip. (`events`/`agentEvents` are new arrays per frame by design; the
  * views that read them re-render on their own `useMemo` deps instead.)
  */
-export const Workbench = memo(function Workbench({ workspaceId, project, agentsProjectId = null, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, agentFocus = null, onAgentFocus, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, gitFocusPath = null, onClearGitFilter, processFocus = null }: {
+export const Workbench = memo(function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, agentFocus = null, onAgentFocus, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, gitFocusPath = null, onClearGitFilter, processFocus = null }: {
   readonly workspaceId: string | null
   /** The project whose files are browsable; null for chat-only conversations. */
   readonly project: WorkbenchProject | null
-  /** Project binding of the root delegation session, not necessarily the viewed child. */
-  readonly agentsProjectId?: string | null
   readonly view: WorkbenchView
   readonly onView: (view: WorkbenchView) => void
   /**
@@ -238,7 +236,6 @@ export const Workbench = memo(function Workbench({ workspaceId, project, agentsP
       <AgentRunsPanel
         workspaceId={workspaceId}
         rootSessionId={agentsSessionId ?? sessionId}
-        rootProjectId={agentsProjectId}
         briefs={delegation.briefs}
         refreshSignal={delegation.count}
         focusChildId={agentFocus}
@@ -323,8 +320,8 @@ export const Workbench = memo(function Workbench({ workspaceId, project, agentsP
             const active = files.activeFile === path
             return (
               <span key={path} className={cn('group relative flex h-full shrink-0 items-center border-r border-line', active ? 'bg-bg' : 'bg-muted/40 hover:bg-hover')}>
-                <button type="button" aria-pressed={active} title={path} onClick={() => files.openFile(path)} className={cn('flex h-full items-center gap-1.5 pl-3 pr-1 text-[13px]', active ? 'text-fg' : 'text-fg-muted hover:text-fg')}>
-                  <FileTypeIcon path={path} size={14} />
+                <button type="button" aria-pressed={active} title={skillTabName(path) !== null ? `Skill ${baseName(path)}` : memoryTabOf(path) !== null ? `Memory ${memoryTabOf(path)?.file ?? ''}` : path} onClick={() => files.openFile(path)} className={cn('flex h-full items-center gap-1.5 pl-3 pr-1 text-[13px]', active ? 'text-fg' : 'text-fg-muted hover:text-fg')}>
+                  <FileTypeIcon path={skillTabName(path) !== null ? 'SKILL.md' : memoryTabOf(path) !== null ? baseName(path) : path} size={14} />
                   <span className="max-w-[12rem] truncate">{baseName(path)}</span>
                 </button>
                 <button type="button" aria-label={`Close ${path}`} title="Close" onClick={() => files.closeFile(path)} className={cn('mr-1 flex size-5 items-center justify-center rounded text-fg-faint hover:bg-hover hover:text-fg [@media(pointer:coarse)]:size-7', active ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100 [@media(pointer:coarse)]:opacity-100')}>
@@ -346,7 +343,6 @@ export const Workbench = memo(function Workbench({ workspaceId, project, agentsP
   if (logReads && (previous.events !== next.events || previous.agentEvents !== next.agentEvents)) return false
   return previous.workspaceId === next.workspaceId
     && previous.project === next.project
-    && previous.agentsProjectId === next.agentsProjectId
     && previous.view === next.view
     && previous.views === next.views
     && previous.files === next.files

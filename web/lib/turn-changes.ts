@@ -10,39 +10,64 @@
  * the turn boundary.
  *
  * A turn's changes are the `Write`/`Edit` calls whose result recorded
- * success. Reads never change a file, a failed or refused call did not land,
- * and a recovered record says the real outcome is unknown — none of the
- * three may be counted as a change, but a non-landing outcome is kept as
- * `uncertain` so a hidden failure cannot read as "no changes". Bash effects
- * are invisible here by design: the log does not record what a command
- * touched, and the panel never claims it did. A child's writes live in the
- * child's own log; the parent's panel cannot see them.
+ * success, merged per file in call order: three edits to one file are one
+ * file whose counts add up and whose diff lists all three. A file the turn
+ * created stays "created" however often the turn edits it afterwards.
+ *
+ * This is the TURN's change, never git's: git compares the whole working tree
+ * with HEAD, which mixes in every other turn, session and hand edit. The
+ * card shows this projection; the Git view is a separate, labelled surface.
+ *
+ * Reads never change a file, a failed or refused call did not land, and a
+ * recovered record says the real outcome is unknown — none of the three may
+ * be counted as a change, but a non-landing outcome is kept as `uncertain`
+ * so a hidden failure cannot read as "no changes". Bash effects are invisible
+ * here by design: the log does not record what a command touched. A child's
+ * writes live in the child's own log.
  */
+import { editLineCounts, editOccurrences, splitLines } from './line-diff.ts'
 import type { SseEvent } from './types.ts'
 
-/** One file a closed turn changed, in the shape a change row reads. */
+/** One landed call on a file, as recorded — what the turn's diff is drawn from. */
+export type TurnEdit =
+  | {
+      readonly kind: 'edit'
+      readonly old: string
+      readonly new: string
+      /** The tool's receipt: carries the numbered snippet and replaceAll count. */
+      readonly output: string
+    }
+  | {
+      readonly kind: 'write'
+      readonly content: string
+      /** The file did not exist before this write. */
+      readonly created: boolean
+    }
+
+/** One file a turn changed, in the shape a change row reads. */
 export interface TurnChangeFile {
   /**
    * The path exactly as the call recorded it (root-relative or absolute,
-   * separators verbatim). Display only; opening the file goes through the
-   * same path resolver a tool row uses.
+   * separators verbatim). Opening the file goes through the same path
+   * resolver a tool row uses.
    */
   readonly path: string
-  /** `created` when the Write result said `created …`; else modified. */
+  /** `created` when one of the turn's calls created the file; else modified. */
   readonly status: 'modified' | 'created'
   /**
-   * Lines counted from the recorded arguments, the way a tool row counts
-   * them: an Edit contributes its `old`/`new` lines, a Write the lines it
-   * wrote (nothing removed is knowable — what it replaced is not in the
-   * call). Absent when the arguments say nothing countable.
+   * Lines this turn added and removed, from the recorded arguments: an Edit
+   * contributes its line diff (context it carried excluded, times the places
+   * a replaceAll changed). For a created file, the net lines it now holds.
+   * Absent when nothing countable was recorded, and for an overwritten file.
    */
   readonly lines?: { readonly added: number; readonly removed?: number }
   /**
-   * The recorded arguments, kept so an expanded row can draw the change from
-   * the log when git cannot see the file (outside every project folder):
-   * an Edit's `old`/`new`, a Write's `content`. Display only.
+   * A Write replaced an existing file whole: what it replaced is not in the
+   * log, so the removed side is unknown and the added side is the full file.
    */
-  readonly args?: Record<string, unknown>
+  readonly overwrote?: true
+  /** Every landed call on the file, in call order. */
+  readonly edits: readonly TurnEdit[]
 }
 
 /** The files one recorded turn changed. */
@@ -58,41 +83,69 @@ export interface TurnChanges {
   readonly ts?: number
 }
 
-/** Lines in a recorded argument, ignoring one trailing newline. */
-function countLines(value: unknown): number {
-  if (typeof value !== 'string' || value === '') return 0
-  return value.replace(/\n$/, '').split('\n').length
-}
-
-/** The call-derived line counts for one mutating call, when countable. */
-function callLines(name: string, args: Record<string, unknown>): TurnChangeFile['lines'] {
-  if (name.toLowerCase() === 'edit') {
-    const added = countLines(args['new'])
-    const removed = countLines(args['old'])
-    if (added === 0 && removed === 0) return undefined
-    return { added, ...(removed > 0 ? { removed } : {}) }
-  }
-  const added = countLines(args['content'])
-  if (added === 0) return undefined
-  return { added }
-}
-
 /** Tool names whose success means a file changed. Case-insensitive. */
 const MUTATING_TOOLS = new Set(['write', 'edit'])
 
 const mutating = (name: string): boolean => MUTATING_TOOLS.has(name.toLowerCase())
 
+const text = (args: Record<string, unknown>, key: string): string => (typeof args[key] === 'string' ? args[key] as string : '')
+
+/** Both tools answer `created <path> …` when the file did not exist. */
+const CREATED = /^created /
+
+interface FileDraft {
+  readonly path: string
+  created: boolean
+  overwrote: boolean
+  added: number
+  removed: number
+  readonly edits: TurnEdit[]
+}
+
+function landEdit(file: FileDraft, edit: TurnEdit): void {
+  file.edits.push(edit)
+  if (edit.kind === 'write') {
+    if (edit.created) file.created = true
+    else if (!file.created) file.overwrote = true
+    file.added += splitLines(edit.content).length
+    return
+  }
+  // An Edit with an empty `old` that answered `created` made the file.
+  if (CREATED.test(edit.output)) file.created = true
+  const lines = editLineCounts(edit.old, edit.new)
+  const times = editOccurrences(edit.output)
+  file.added += lines.added * times
+  file.removed += lines.removed * times
+}
+
+function finish(file: FileDraft): TurnChangeFile {
+  // A file the turn created had nothing before it: its size is the net of
+  // what the turn put in and took back out, never "removed" lines.
+  // An overwritten file states no counts at all: the side it replaced is not
+  // in the log, and "+300" for a one-line rewrite would be a made-up size.
+  const added = file.created ? Math.max(0, file.added - file.removed) : file.added
+  const removed = file.created ? 0 : file.removed
+  const overwrote = file.overwrote && !file.created
+  const countable = !overwrote && (added > 0 || removed > 0)
+  return {
+    path: file.path,
+    status: file.created ? 'created' : 'modified',
+    ...(countable ? { lines: { added, ...(removed > 0 ? { removed } : {}) } } : {}),
+    ...(overwrote ? { overwrote: true as const } : {}),
+    edits: file.edits,
+  }
+}
+
 /**
- * The files each turn changed, keyed by turn id, in call order. Only turns
- * with at least one recorded mutation attempt appear. A call recorded
+ * The files each turn changed, keyed by turn id, in first-touch order. Only
+ * turns with at least one recorded mutation attempt appear. A call recorded
  * outside any open turn is skipped rather than mis-attributed — the panel
  * never guesses turn membership the log did not state.
  */
 export function turnChanges(events: readonly SseEvent[]): ReadonlyMap<string, TurnChanges> {
-  type Draft = { files: Map<string, TurnChangeFile>; uncertain: string[]; ts?: number }
+  type Draft = { files: Map<string, FileDraft>; uncertain: string[]; ts?: number }
   const drafts = new Map<string, Draft>()
   // callId → the turn and target the call named; its result lands there.
-  // Args are kept too: the line counts come from the call's own arguments.
   const pending = new Map<string, { turn: string; path: string; write: boolean; args: Record<string, unknown> }>()
   let openTurnId: string | undefined
 
@@ -135,24 +188,22 @@ export function turnChanges(events: readonly SseEvent[]): ReadonlyMap<string, Tu
       continue
     }
     if (draft.ts === undefined && event.timestamp !== undefined) draft.ts = event.timestamp
-    // Last landing wins per path: a turn that edits a file twice lists it
-    // once. `created <path>` is the Write tool's own receipt for a fresh
-    // file; anything else it landed is an overwrite of what was there.
-    const created = call.write && /^created /.test(event.output ?? '')
-    const lines = callLines(call.write ? 'write' : 'edit', call.args)
-    draft.files.set(call.path, {
-      path: call.path,
-      status: created ? 'created' : 'modified',
-      ...(lines !== undefined ? { lines } : {}),
-      args: call.args,
-    })
+    const output = event.output ?? ''
+    let file = draft.files.get(call.path)
+    if (file === undefined) {
+      file = { path: call.path, created: false, overwrote: false, added: 0, removed: 0, edits: [] }
+      draft.files.set(call.path, file)
+    }
+    landEdit(file, call.write
+      ? { kind: 'write', content: text(call.args, 'content'), created: CREATED.test(output) }
+      : { kind: 'edit', old: text(call.args, 'old'), new: text(call.args, 'new'), output })
   }
 
   const out = new Map<string, TurnChanges>()
   for (const [turnId, draft] of drafts) {
     if (draft.files.size === 0 && draft.uncertain.length === 0) continue
     out.set(turnId, {
-      files: [...draft.files.values()],
+      files: [...draft.files.values()].map(finish),
       uncertain: draft.uncertain,
       ...(draft.ts !== undefined ? { ts: draft.ts } : {}),
     })

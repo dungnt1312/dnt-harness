@@ -13,8 +13,10 @@ import {
   loadCommandLayers,
   parseAllowedTools,
   parseCommand,
+  parseAllowRule,
   parseSlashInvocation,
   projectCommandDirs,
+  ruleMatchesCall,
   splitArguments,
   splitCompound,
   substituteArguments,
@@ -158,6 +160,24 @@ describe('allowedByRules', () => {
     expect(allowedByRules(['Edit(src/**)'], { name: 'Edit', args: { path: '/other/src/a.ts' } }, '/proj')).toBe(false)
     expect(allowedByRules(['Edit(src/*.ts)'], { name: 'Edit', args: { path: 'src/deep/a.ts' } })).toBe(false)
     expect(allowedByRules(['Edit(./src/*.ts)'], { name: 'Edit', args: { path: './src/a.ts' } })).toBe(true)
+  })
+
+  it('filter mode (a hook if) runs on any matching part and on shell syntax it cannot rule out', () => {
+    const matches = (rule: string, command: string, mode: 'grant' | 'filter') => ruleMatchesCall(parseAllowRule(rule)!, bash(command), mode)
+    // Any compound part: the commit review must see `cd repo && git commit`.
+    expect(matches('Bash(git commit:*)', 'cd repo && git commit -m x', 'filter')).toBe(true)
+    expect(matches('Bash(git commit:*)', 'cd repo && git commit -m x', 'grant')).toBe(false)
+    // Substitution, backticks, redirects: run when the literal head occurs.
+    expect(matches('Bash(git commit:*)', 'echo `git commit -m x`', 'filter')).toBe(true)
+    expect(matches('Bash(git push:*)', 'git push origin "$(git branch --show-current)"', 'filter')).toBe(true)
+    expect(matches('Bash(git commit:*)', 'git status > out.txt', 'filter')).toBe(false)
+    expect(matches('Bash(git -C * commit *)', 'git -C ../repo commit -m x', 'filter')).toBe(true)
+    // A plain non-match never runs the hook.
+    expect(matches('Bash(git commit:*)', 'git status', 'filter')).toBe(false)
+    // A file target that cannot be relativized safely runs the hook.
+    const edit = (target: string) => ruleMatchesCall(parseAllowRule('Edit(src/**)')!, { name: 'Edit', args: { path: target } }, 'filter', '/proj')
+    expect(edit('/other/src/a.ts')).toBe(true)
+    expect(edit('/proj/lib/a.ts')).toBe(false)
   })
 
   it('matches globs, bare tools and mapped Claude names', () => {

@@ -31,6 +31,9 @@ export interface PendingInput {
   readonly clientRequestId?: string
   readonly content: string
   readonly attachments?: readonly AttachmentRef[]
+  /** `hook`: an `asyncRewake` result, not something the user typed. */
+  readonly origin?: 'hook'
+  readonly summary?: string
 }
 
 /**
@@ -412,6 +415,8 @@ export class SessionsService extends Service {
           ...(event.clientRequestId !== undefined ? { clientRequestId: event.clientRequestId } : {}),
           content: event.content,
           ...(event.attachments !== undefined ? { attachments: event.attachments } : {}),
+          ...(event.origin !== undefined ? { origin: event.origin } : {}),
+          ...(event.summary !== undefined ? { summary: event.summary } : {}),
         })
       } else if (event.type === 'input/revised') {
         const index = queued.findIndex((item) => item.inputId === event.inputId)

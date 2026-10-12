@@ -38,6 +38,8 @@ export interface HarnessLimits {
   readonly questionExpiryMs: number
   /** Model-visible cap for one tool result. */
   readonly toolOutputLimit: number
+  /** Most read-only tool calls (Read/Grep/Glob) of one batch running at once. */
+  readonly readOnlyToolConcurrency: number
   /** Bound on durably queued pending inputs per session. */
   readonly maxPendingInputs: number
   /**
@@ -46,8 +48,12 @@ export interface HarnessLimits {
    * compaction at a completed boundary; 0 disables.
    */
   readonly automaticCompactionPressure: number
-  /** Latest covered completed turns duplicated raw beside the summary; uncovered history remains eligible for budget trimming. */
-  readonly compactionTailTurns: number
+  /**
+   * Estimated-token cap on covered messages kept verbatim beside the summary
+   * (typed user messages plus the latest covered final answer, newest first);
+   * 0 keeps none. Uncovered history remains eligible for budget trimming.
+   */
+  readonly compactionRetainTokens: number
   /** Largest single composer attachment accepted for storage. */
   readonly maxAttachmentBytes: number
   /** Attachments one message may carry. */
@@ -69,9 +75,10 @@ export const DEFAULT_LIMITS: HarnessLimits = {
   approvalExpiryMs: 5 * 60_000,
   questionExpiryMs: 30 * 60_000,
   toolOutputLimit: 60_000,
+  readOnlyToolConcurrency: 10,
   maxPendingInputs: 100,
   automaticCompactionPressure: 0,
-  compactionTailTurns: 4,
+  compactionRetainTokens: 20_000,
   maxAttachmentBytes: 10 * 1024 * 1024,
   maxAttachmentsPerMessage: 10,
   attachmentTextLimit: 60_000,
@@ -83,8 +90,8 @@ export function resolveLimits(partial?: Partial<HarnessLimits>): HarnessLimits {
   const merged = { ...DEFAULT_LIMITS }
   for (const key of Object.keys(merged) as (keyof HarnessLimits)[]) {
     const value = partial[key]
-    const integerRequestLimit = ['streamFirstEventMs', 'streamIdleMs', 'logicalRequestMs', 'stepRetries', 'stepRetryBaseMs', 'compactionTailTurns'].includes(key)
-    const zeroCapable = key === 'compactionTailTurns' || key === 'automaticCompactionPressure'
+    const integerRequestLimit = ['streamFirstEventMs', 'streamIdleMs', 'logicalRequestMs', 'stepRetries', 'stepRetryBaseMs', 'compactionRetainTokens', 'readOnlyToolConcurrency'].includes(key)
+    const zeroCapable = key === 'compactionRetainTokens' || key === 'automaticCompactionPressure'
     if (typeof value === 'number' && Number.isFinite(value) && (!integerRequestLimit || Number.isSafeInteger(value)) && (zeroCapable ? value >= 0 : value > 0) && value <= MAX_TIMER_MS) {
       merged[key] = value
     }

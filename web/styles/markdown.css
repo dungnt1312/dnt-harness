@@ -21,6 +21,15 @@
 .md th, .md td { border-bottom: 1px solid var(--line); padding: 6px 12px; text-align: left; }
 .md th { font-weight: 600; border-bottom-color: var(--line-strong); }
 .md code.md-inline { font-size: 0.875em; background: var(--muted); border-radius: 6px; padding: 0.15em 0.4em; }
+/* Markdown that is tool output, not the assistant's voice: smaller and muted so it reads as a quoted result. */
+.md-compact { font-size: 13px; line-height: 1.55; color: var(--fg-muted); }
+.md-compact h1, .md-compact h2, .md-compact h3, .md-compact h4 { font-size: 13px; font-weight: 600; color: var(--fg); margin: 1em 0 0.3em; }
+.md-compact p { margin: 0.5em 0; }
+.md-compact ul, .md-compact ol { margin: 0.4em 0; padding-left: 1.25em; }
+.md-compact li { margin: 0.15em 0; }
+.md-compact li > p { margin: 0.15em 0; }
+.md-compact strong { color: var(--fg); }
+.md-compact table { font-size: 12px; }
 .codeblock { margin: 0.9em 0; border-radius: 12px; overflow: hidden; background: var(--muted); border: 1px solid var(--line); }
 .codeblock-head { display: flex; align-items: center; justify-content: space-between; padding: 6px 12px; font-size: 12px; color: var(--fg-muted); }
 .codeblock-lang { font-family: var(--font-mono); }

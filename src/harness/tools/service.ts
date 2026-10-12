@@ -218,6 +218,7 @@ export class ToolsService extends Service {
     return Object.freeze({
       call: prepared.call,
       ...(prepared.executionId !== undefined ? { executionId: prepared.executionId } : {}),
+      ...(prepared.concurrent === true ? { concurrent: true } : {}),
       execute: () => {
         if (used) return Promise.resolve({ ok: false, output: 'denied: prepared tool call has already been executed' })
         used = true
@@ -343,6 +344,10 @@ export class ToolsService extends Service {
     return {
       call: preparedCall,
       executionId,
+      // Decided on the FINAL tool: a hook that rewrote Read into Bash runs alone.
+      // An approved out-of-grant path also runs alone: a session-wide answer is
+      // recorded at its final gate, and the next call must be gated after that.
+      ...(tool.readOnly === true && (approvedPaths === undefined || approvedPaths.length === 0) ? { concurrent: true } : {}),
       execute: async () => {
         // Stop before dispatch prevents a body that has not started yet.
         if (exec.signal?.aborted) {

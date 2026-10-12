@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   fromClaudeToolInput,
+  hookId,
   hookMatches,
   interpretHooks,
   loadHooks,
@@ -86,6 +87,48 @@ describe('settings.json hooks section', () => {
     await setHookActive(ws, before.all[0]!.id, true)
     expect((await loadHooks({ workspaceDir: ws })).hooks).toHaveLength(2)
     await expect(setHookActive(ws, '../x', false)).rejects.toThrow(/invalid hook id/)
+  })
+
+  it('parses if / async / asyncRewake and rejects them where they cannot apply', () => {
+    const parsed = parseHooksSection({
+      PostToolUse: [{ matcher: 'Bash', hooks: [
+        { type: 'command', command: 'review', if: 'Bash(git commit:*)', asyncRewake: true, rewakeMessage: 'Review:', rewakeSummary: 'Commit review found issues' },
+        { type: 'command', command: 'bg', async: true },
+        { type: 'command', command: 'bad-if', if: 'Unknown(x)' },
+        { type: 'command', command: 'bad-async', async: 'yes' },
+      ] }],
+      Stop: [{ hooks: [{ type: 'command', command: 'stop-if', if: 'Bash(git *)' }, { type: 'command', command: 'stop-rewake', asyncRewake: true }] }],
+    })
+    expect(parsed.hooks.PostToolUse?.[0]?.hooks).toEqual([
+      { type: 'command', command: 'review', if: 'Bash(git commit:*)', asyncRewake: true, rewakeMessage: 'Review:', rewakeSummary: 'Commit review found issues' },
+      { type: 'command', command: 'bg', async: true },
+    ])
+    expect(parsed.hooks.Stop?.[0]?.hooks).toEqual([{ type: 'command', command: 'stop-rewake', asyncRewake: true }])
+    const problems = parsed.diagnostics.join('\n')
+    expect(problems).toMatch(/'if' rule 'Unknown\(x\)' names no tool/)
+    expect(problems).toMatch(/async must be a boolean/)
+    expect(problems).toMatch(/'if' only applies to tool events.*never runs on Stop/)
+    expect(problems).not.toMatch(/not run by dnt-harness/)
+    expect(() => parseHooksSection({ Stop: [{ hooks: [{ type: 'command', command: 'x', if: 'Bash(x)' }] }] }, { strict: true })).toThrow(/only applies to tool events/)
+  })
+
+  it('hooks sharing one command but differing in if get separate ids, and if filters before de-duplication', async () => {
+    const ws = path.join(dir, 'ws-if')
+    await fs.mkdir(ws, { recursive: true })
+    await fs.writeFile(path.join(ws, 'settings.json'), JSON.stringify({ hooks: { PostToolUse: [{ matcher: 'Bash', hooks: [
+      { type: 'command', command: 'review', if: 'Bash(git commit:*)' },
+      { type: 'command', command: 'review', if: 'Bash(git push:*)' },
+      { type: 'command', command: 'plain' },
+    ] }] } }))
+    const resolved = await loadHooks({ workspaceDir: ws })
+    expect(new Set(resolved.all.map((h) => h.id)).size).toBe(3)
+    const pick = (command: string) => selectHooks(resolved, 'PostToolUse', 'Bash', { name: 'Bash', args: { command } }).map((h) => `${h.command}${h.if !== undefined ? `@${h.if}` : ''}`)
+    expect(pick('git push origin main')).toEqual(['review@Bash(git push:*)', 'plain'])
+    expect(pick('git status')).toEqual(['plain'])
+    // Without a tool call an `if` hook never runs.
+    expect(selectHooks(resolved, 'PostToolUse', 'Bash').map((h) => h.command)).toEqual(['plain'])
+    // A hook without `if` keeps its id from before `if` existed.
+    expect(resolved.all[2]!.id).toBe(hookId('workspace', 'PostToolUse', 'Bash', 'plain'))
   })
 
   it('workspace writes preserve other settings keys; legacy hooks.json migrates once', async () => {

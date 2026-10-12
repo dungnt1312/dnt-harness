@@ -303,6 +303,17 @@ describe('out-of-grant approvals', () => {
     await f.say(`read ${path.join(outside, 'b.txt')}`)
     expect((await f.toolResult(mark)).event?.output).toContain('secret b')
     expect(f.stream.frames.slice(mark).some((frame) => frame.kind === 'approval')).toBe(false)
+
+    // Grep searches an outside folder, also through a link (macOS /tmp → /private/tmp).
+    const link = path.join(base, 'outside-link')
+    await fs.symlink(outside, link, 'junction')
+    for (const target of [outside, link]) {
+      mark = f.stream.frames.length
+      await f.say(`grep ${target}`)
+      const result = await f.toolResult(mark)
+      expect(result.event?.ok).toBe(true)
+      expect(result.event?.output).toContain(`${path.join(outside, 'a.txt')}:1: secret a`)
+    }
   }, 20_000)
 
   it('--yolo runs out-of-grant paths without a question', async () => {

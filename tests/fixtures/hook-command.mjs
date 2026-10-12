@@ -43,6 +43,28 @@ switch (mode) {
   case 'hang':
     await new Promise(() => { setInterval(() => {}, 1_000) })
     break
+  case 'mark': {
+    // Appends one line (the tool command, or the event) to the file in argv[3].
+    const { appendFileSync } = await import('node:fs')
+    appendFileSync(process.argv[3], `${input.tool_input?.command ?? input.hook_event_name}\n`)
+    break
+  }
+  case 'slow-mark': {
+    // Waits argv[4] ms, then marks argv[3]; a killed hook never marks.
+    await new Promise((resolve) => setTimeout(resolve, Number(process.argv[4] ?? 1000)))
+    const { appendFileSync } = await import('node:fs')
+    appendFileSync(process.argv[3], `${input.hook_event_name}\n`)
+    out({ decision: 'block', reason: 'background must not decide' })
+    break
+  }
+  case 'rewake':
+    // Exit 2 after argv[3] ms with feedback (argv[4] or a fixed text).
+    await new Promise((resolve) => setTimeout(resolve, Number(process.argv[3] ?? 0)))
+    process.stderr.write(`${process.argv[4] ?? 'fixture rewake feedback'}\n`)
+    process.exit(2)
+  case 'missing-script':
+    process.stderr.write("python3: can't open file '/nonexistent/hook.py': [Errno 2] No such file or directory\n")
+    process.exit(2)
   default:
     break
 }

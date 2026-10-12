@@ -3,7 +3,7 @@ import ConfirmDialog from '../common/ConfirmDialog.tsx'
 import { useToast } from '../common/Toast.tsx'
 import { Button } from '../ui/Button.tsx'
 import { compactSession, type ContextManifestView, type StreamState } from '../../lib/api.ts'
-import { budgetTone, contextFill } from '../../lib/format.ts'
+import { budgetTone, compactionTokenChange, contextFill } from '../../lib/format.ts'
 import { cn } from '../../lib/cn.ts'
 import type { Meta, SessionModel, WorkspaceMeta } from '../../lib/types.ts'
 
@@ -77,7 +77,8 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
     setBusy(true)
     try {
       const result = await compactSession(workspaceId, sessionId)
-      toast.notify(`Compacted — ${result.summaryChars} chars summarized through seq ${result.coversSeq}.`, 'ok')
+      const change = compactionTokenChange(result)
+      toast.notify(`Compacted${change !== undefined ? ` — ${change}` : ''} (${result.summaryChars} chars summarized through seq ${result.coversSeq}).`, 'ok')
       setConfirming(false)
       onCompacted?.()
     } catch (cause) {

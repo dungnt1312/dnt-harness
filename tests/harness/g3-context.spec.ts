@@ -5,7 +5,7 @@
  * failure, and the truthful manifest.
  */
 import { describe, expect, it } from 'vitest'
-import { buildContext, ContextBudgetError, DEFAULT_BUDGET, messageText, type ActiveSkill, type MemorySnippet, type ModeDefinition } from 'dnt-harness'
+import { buildContext, ContextBudgetError, DEFAULT_BUDGET, messageText, withoutSentStamp, type ActiveSkill, type MemorySnippet, type ModeDefinition } from 'dnt-harness'
 import { BUNDLED_MODES, DEFAULT_MODE_ID } from 'dnt-harness'
 import type { SessionEvent } from 'dnt-harness'
 
@@ -162,7 +162,7 @@ describe('mode-driven assembly', () => {
     const assembled = buildContext(base({
       activeSkills: [{ name: 'big', instructions: skillBody, hash: 'b'.repeat(64) }],
       skillCatalog: [{ name: 'listed', description: 'y'.repeat(2_800) }],
-      budget: { ...DEFAULT_BUDGET, contextLimitTokens: 3_400, outputReserveTokens: 512, marginTokens: 256 },
+      budget: { ...DEFAULT_BUDGET, contextLimitTokens: 3_500, outputReserveTokens: 512, marginTokens: 256 },
     }))
     expect(assembled.manifest.omissions.some((line) => line.startsWith('skill-catalog:'))).toBe(true)
     expect(assembled.manifest.omissions.some((line) => line.startsWith('skills:'))).toBe(false)
@@ -186,7 +186,7 @@ describe('mode-driven assembly', () => {
       events: log,
       mode: { ...mode('plan'), definition: { ...mode('plan').definition, sources: { ...mode('plan').definition.sources, history: 'none' } } },
     }))
-    const contents = assembled.messages.filter((message) => message.role !== 'system').map((message) => message.content)
+    const contents = assembled.messages.filter((message) => message.role !== 'system').map((message) => withoutSentStamp(messageText(message.content)))
     expect(contents).toContain('current')
     expect(contents).toContain('result body')
     expect(contents).not.toContain('earlier turn')
@@ -212,7 +212,7 @@ describe('mode-driven assembly', () => {
     expect(assembled.manifest.omissions.some((line) => line.startsWith('skills:'))).toBe(true)
     expect(assembled.manifest.omissions.some((line) => line.startsWith('memory:'))).toBe(true)
     expect(assembled.manifest.omissions.some((line) => line.startsWith('history:'))).toBe(true)
-    const contents = assembled.messages.map((message) => message.content)
+    const contents = assembled.messages.map((message) => withoutSentStamp(messageText(message.content)))
     expect(contents).toContain('keep me')
     expect(assembled.manifest.budget.usedTokens).toBeLessThanOrEqual(assembled.manifest.budget.availableTokens)
   })

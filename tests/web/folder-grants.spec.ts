@@ -9,7 +9,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type ModelRequest, type WebServer } from 'dnt-harness'
+import { createWebServer, withoutSentStamp, type LlmProvider, type ModelRequest, type WebServer } from 'dnt-harness'
 
 let home = ''
 let primary = ''
@@ -47,7 +47,7 @@ const writer: LlmProvider = {
       return
     }
     const lastUser = [...request.messages].reverse().find((message) => message.role === 'user')
-    const text = typeof lastUser?.content === 'string' ? lastUser.content : ''
+    const text = typeof lastUser?.content === 'string' ? withoutSentStamp(lastUser.content) : ''
     if (text.startsWith('write ') && !request.messages.some((message) => message.role === 'tool')) {
       const target = text.slice('write '.length)
       yield { type: 'toolCalls', calls: [{ id: `w-${Math.random()}`, name: 'Write', args: { path: target, content: 'granted' } }] }

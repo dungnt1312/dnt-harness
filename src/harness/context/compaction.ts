@@ -134,14 +134,19 @@ export const COMPACT_SUMMARY_PROMPT = [
   'You are compacting an earlier portion of a coding-assistant conversation.',
   'The summary you write will REPLACE the covered conversation entirely in a fresh context window: anything you omit is forgotten, so be complete and concrete.',
   '',
-  'Summarize the conversation inside <conversation> under these headings, keeping the headings:',
+  'Only a bounded set of the user\'s own messages and the final answer of the last covered turn survive verbatim beside your summary; every other assistant reply, tool call and tool result in the covered conversation is gone.',
   '',
-  'Primary Request and Intent — what the user asked for, with their key constraints and preferences, in their words where it matters.',
-  'Key Decisions and Context — decisions made, requirements agreed, project constraints, and user corrections.',
-  'Work Done — what was actually done: tool calls run, files created or changed (exact paths), commands executed, and their outcomes.',
-  'Errors and Fixes — problems hit and how each was resolved; unresolved problems go under Current State.',
-  'Current State — where things stand at the end of the covered conversation.',
-  'Next Steps — outstanding work and the explicit next actions, if any.',
+  'Summarize the conversation inside <conversation> under these numbered headings, keeping the headings:',
+  '',
+  '1. Primary Request and Intent — every explicit request and intent of the user, with their constraints and preferences, in their words where it matters.',
+  '2. Key Technical Concepts — technologies, frameworks, conventions and architecture that matter for continuing.',
+  '3. Files and Code Sections — files examined, created or changed (exact paths), why each matters, what changed, and short code snippets or signatures where they are needed to continue.',
+  '4. Errors and Fixes — problems hit and how each was resolved, including user feedback on them; unresolved problems go under Current Work.',
+  '5. Problem Solving — problems solved and troubleshooting still in progress.',
+  '6. All User Messages — every message the user typed (not tool results), condensed but faithful, in order. Keep security-relevant instructions and constraints (files or data to avoid, forbidden operations, secret handling) verbatim.',
+  '7. Pending Tasks — work the user explicitly asked for that is not done yet.',
+  '8. Current Work — precisely what was being worked on at the end of the covered conversation: files, commands, latest verified outcomes and their state.',
+  '9. Next Step — the next action in line with the user\'s most recent explicit request, quoting that request verbatim; omit it when the last task was concluded and nothing new was asked.',
   '',
   'Rules:',
   '- If an <earlier-summary> reference is provided, it summarizes all earlier chunks of this same conversation. Merge it with the newer <conversation> chunk into one complete accumulated summary; do not summarize only the new chunk.',
@@ -168,6 +173,11 @@ export interface CompactionOptions {
    * instead of appending a failed transaction on every attempt.
    */
   readonly extractiveCap?: number
+  /**
+   * Estimates the context size before and after the new checkpoint, for the
+   * success event. Advisory: a throw or `undefined` just omits the figures.
+   */
+  readonly measure?: (checkpoint: { readonly summary: string; readonly coversSeq: number }) => { readonly tokensBefore: number; readonly tokensAfter: number } | undefined
 }
 const inFlight = new Set<string>()
 
@@ -236,8 +246,11 @@ export async function compactSession(session: Session, checkpoints: CheckpointSt
     check()
     if (!validSummary(summary)) throw new Error('compaction summary must be nonempty and at most 24000 characters')
     if (session.events.some(event => event.seq > lastEnd && event.type === 'turn/start')) throw new Error('compaction boundary changed during summary')
+    let measured: ReturnType<NonNullable<CompactionOptions['measure']>>
+    try { measured = options.measure?.({ summary, coversSeq: lastEnd }) } catch { measured = undefined }
     const end = session.append({ type: 'compaction/end', trigger: options.trigger, ...(options.model !== undefined ? { model: options.model } : {}),
-      coversSeq: lastEnd, summaryChars: summary.length, durationMs: Date.now() - startedAt, summary })
+      coversSeq: lastEnd, summaryChars: summary.length, durationMs: Date.now() - startedAt, summary,
+      ...(measured !== undefined ? { tokensBefore: measured.tokensBefore, tokensAfter: measured.tokensAfter } : {}) })
     // Success append is the irreversible commit point: cancellation before it
     // fails, but a late Stop cannot revoke canonical success without a revocation
     // event. Retain ownership until durability settles, and report success if it

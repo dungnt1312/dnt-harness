@@ -49,10 +49,11 @@ describe('Write and Edit facts', () => {
     expect(toolFacts(call('Write', { path: 'a.md', content: 'x' }), ok('created a.md')).digest).toBe('created')
     expect(toolFacts(call('Write', { path: 'a.md', content: 'x' }), ok('overwrote a.md (2048 bytes written)')).digest).toBe('overwrote · 2 KB')
   })
-  it('sizes an edit from the exact replacement it recorded', () => {
+  it('sizes an edit by the line diff of what it recorded, context excluded', () => {
     const facts = toolFacts(call('Edit', { path: 'web/lib/format.ts', old: 'a\nb\nc', new: 'a\nb\nc\nd\ne\nf\ng' }), ok('edited web/lib/format.ts'))
     expect(facts.digest).toBeUndefined()
-    expect(facts.lines).toEqual({ removed: 3, added: 7 })
+    // a, b, c were context the edit carried; it only added four lines.
+    expect(facts.lines).toEqual({ removed: 0, added: 4 })
     expect(facts.path).toBe('web/lib/format.ts')
   })
   it('keeps the path as the target even when the model sent the text first', () => {

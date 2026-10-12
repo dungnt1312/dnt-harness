@@ -255,9 +255,14 @@ export function generateImageTool(options: ImageToolOptions): ToolDefinition {
   }
 }
 
-/** The edit's source: a stored attachment (id) or a granted file (path). */
-async function loadSource(
-  runtime: ImageRuntime,
+/** An image source: a stored attachment (id) or a granted file (path). Shared by EditImage and GenerateVideo. */
+export interface ImageSourceContext {
+  readonly maxBytes: number
+  readonly options: Pick<ImageToolOptions, 'read' | 'resolvePath'>
+}
+
+export async function loadImageSource(
+  runtime: ImageSourceContext,
   args: Record<string, unknown>,
   exec: ToolExecution,
   workspaceId: string,
@@ -311,7 +316,7 @@ export function editImageTool(options: ImageToolOptions): ToolDefinition {
       const prompt = parsePrompt(args)
       const size = parseSize(args)
       const { workspaceId, config, signal } = runtime.begin(EDIT_IMAGE_TOOL, exec)
-      const source = await loadSource(runtime, args, exec, workspaceId)
+      const source = await loadImageSource(runtime, args, exec, workspaceId)
       const url = runtime.url(config, 'images/edits')
 
       const form = new FormData()

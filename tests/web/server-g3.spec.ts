@@ -113,6 +113,21 @@ it('HTTP memory supports encoded nested ids, underscore files and exact pointer 
   }
 })
 
+it('HTTP memory-file is a contained, read-only raw view of a memory folder file', async () => {
+  const server = await start([])
+  const base = server.url
+  const ws = await (await post(base, '/api/workspaces', { name: 'Raw memory' })).json() as { id: string }
+  expect((await post(base, `/api/workspaces/${ws.id}/memory`, { id: 'note', title: 'Note', body: 'remember this' })).status).toBe(201)
+  const raw = (query: string): Promise<Response> => fetch(`${base}/api/workspaces/${ws.id}/memory-file?path=${encodeURIComponent(query)}`)
+  const index = await raw('MEMORY.md')
+  expect(index.status).toBe(200)
+  expect((await index.json() as { content: string }).content).toContain('(note.md)')
+  expect((await (await raw('note.md')).json() as { content: string }).content).toContain('remember this')
+  for (const escape of ['../../../../etc/passwd', '/etc/passwd', 'missing.md']) expect((await raw(escape)).status).toBe(400)
+  expect((await fetch(`${base}/api/workspaces/${ws.id}/memory-file?path=MEMORY.md&projectId=nope`)).status).toBeGreaterThanOrEqual(400)
+  expect((await fetch(`${base}/api/workspaces/${ws.id}/memory-file?path=MEMORY.md`, { method: 'PUT', body: 'x' })).status).toBe(405)
+})
+
 it('HTTP memory serves the project tier through ?projectId= and keeps it apart from the workspace tier', async () => {
   const server = await start([])
   const base = server.url
@@ -207,6 +222,69 @@ describe('memory guidance follows the mode', () => {
     expect(systems[0]).not.toMatch(/Write\/Edit Markdown files/)
     expect(systems[1]).toMatch(/Write\/Edit Markdown files/)
     expect(systems[1]).not.toMatch(/This mode cannot write memory/)
+  })
+})
+
+describe('prefix snapshot: memory index and skill catalog', () => {
+  it('a session keeps the copy it first read; CLAUDE.md edits and new sessions see the disk at once', async () => {
+    const requests: { sessionText: string; systems: string[] }[] = []
+    const spy: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream(request) {
+        requests.push({
+          sessionText: request.messages.filter((message) => message.role === 'user').map((message) => String(message.content)).join('\n'),
+          systems: request.messages.filter((message) => message.role === 'system').map((message) => String(message.content)),
+        })
+        yield { type: 'delta', delta: 'ok' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const server = await start([spy])
+    const base = server.url
+    const home = serverHomes.get(server)!
+    const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
+    const wsDir = path.join(home, 'workspaces', wsId)
+    const writeSkill = async (name: string): Promise<void> => {
+      await fs.mkdir(path.join(wsDir, 'skills', name), { recursive: true })
+      await fs.writeFile(path.join(wsDir, 'skills', name, 'SKILL.md'), `---\nname: ${name}\ndescription: ${name} fixture\n---\n\nSteps.`, 'utf8')
+    }
+    await writeSkill('first-skill')
+    expect((await post(base, `/api/workspaces/${wsId}/memory`, { id: 'first-note', title: 'First note', body: 'one' })).status).toBe(201)
+    await fs.writeFile(path.join(wsDir, 'CLAUDE.md'), 'RULE-ONE', 'utf8')
+
+    const turn = async (sessionId: string, content: string, count: number): Promise<{ systems: string[] }> => {
+      await post(base, `/api/workspaces/${wsId}/sessions/${sessionId}/messages`, { content })
+      await expect.poll(() => requests.length, { timeout: 6_000 }).toBe(count)
+      // Wait for the turn to settle before the next message, so it does not queue.
+      await expect.poll(async () => {
+        const rows = (await (await fetch(`${base}/api/workspaces/${wsId}/sessions`)).json()) as { id: string; status: string }[]
+        return rows.find((row) => row.id === sessionId)?.status
+      }, { timeout: 6_000 }).toBe('idle')
+      return requests[count - 1]!
+    }
+    const kinds = (systems: string[], kind: string): string[] => systems.filter((text) => text.includes(`<untrusted kind="${kind}"`))
+
+    const { id } = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    const first = await turn(id, 'one', 1)
+    expect(kinds(first.systems, 'skill-catalog').join()).toContain('first-skill')
+    expect(kinds(first.systems, 'memory').join()).toContain('first-note')
+
+    // Edit all three sources between two requests of the same session.
+    await writeSkill('second-skill')
+    expect((await post(base, `/api/workspaces/${wsId}/memory`, { id: 'second-note', title: 'Second note', body: 'two' })).status).toBe(201)
+    await fs.writeFile(path.join(wsDir, 'CLAUDE.md'), 'RULE-TWO', 'utf8')
+    const second = await turn(id, 'two', 2)
+    // Catalog and memory keep the session's copy, byte for byte…
+    expect(kinds(second.systems, 'skill-catalog')).toEqual(kinds(first.systems, 'skill-catalog'))
+    expect(kinds(second.systems, 'memory')).toEqual(kinds(first.systems, 'memory'))
+    // …while CLAUDE.md applies at once.
+    expect(kinds(second.systems, 'workspace-instructions').join()).toContain('RULE-TWO')
+
+    // A new session reads the current disk.
+    const other = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    const fresh = await turn(other.id, 'three', 3)
+    expect(kinds(fresh.systems, 'skill-catalog').join()).toContain('second-skill')
+    expect(kinds(fresh.systems, 'memory').join()).toContain('second-note')
   })
 })
 

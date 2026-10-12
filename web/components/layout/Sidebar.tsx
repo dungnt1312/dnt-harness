@@ -58,8 +58,8 @@ export interface SidebarProps {
   readonly onReorderProjects?: (orderedIds: readonly string[]) => void
   readonly collapsedFolders?: Readonly<Record<string, boolean>>
   readonly onToggleFolderCollapsed?: (projectId: string, collapsed: boolean) => void
-  readonly expandedFolders?: Readonly<Record<string, boolean>>
-  readonly onExpandFolder?: (projectId: string, expanded: boolean) => void
+  readonly expandedFolders?: Readonly<Record<string, number>>
+  readonly onExpandFolder?: (projectId: string, extraRows: number) => void
   /** Project ids with a live terminal shell; the folder header marks them. */
   readonly terminalProjects?: ReadonlySet<string>
   readonly onRename: (id: string, title: string) => void

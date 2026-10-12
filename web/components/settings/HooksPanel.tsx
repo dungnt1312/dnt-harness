@@ -387,7 +387,7 @@ function HookRow({ row, matcherLabel, busy, onToggle }: {
   const name = script.split(/[\\/]/).pop() ?? script
   return (
     <li className={cn('hooks-row flex min-w-0 items-center gap-2 py-1.5', !row.active && 'opacity-55')}>
-      <Badge tone={row.layer === 'user' ? 'green' : 'amber'}>{row.layer === 'user' ? '~/.claude' : row.layer}</Badge>
+      <Badge tone={row.layer === 'user' ? 'green' : 'amber'}>{row.layer === 'user' ? '~/.claude' : row.layer === 'plugin' && row.plugin !== undefined ? row.plugin.id : row.layer}</Badge>
       {matcherLabel !== undefined ? (
         <code className="w-40 shrink-0 truncate font-mono text-xs text-fg-muted" title={row.matcher === '' ? 'matches everything' : row.matcher}>{row.matcher === '' ? '*' : row.matcher}</code>
       ) : null}
@@ -395,6 +395,10 @@ function HookRow({ row, matcherLabel, busy, onToggle }: {
         <span className="truncate text-[13px]">{name}</span>
         <code className="truncate font-mono text-[11px] text-fg-faint" title={`${row.command}\n${row.source}`}>{row.command}</code>
       </span>
+      {row.if !== undefined ? <Badge tone="blue" className="max-w-48 truncate" title="Runs only when the tool call matches this permission rule">if {row.if}</Badge> : null}
+      {row.asyncRewake === true
+        ? <Badge tone="blue" title="Runs in the background; exit 2 wakes the model">rewake</Badge>
+        : row.async === true ? <Badge tone="blue" title="Runs in the background without blocking">async</Badge> : null}
       {!row.supported ? <Badge>not run</Badge> : null}
       <ActiveSwitch label={`${row.event} ${name}`} checked={row.active} disabled={busy} onChange={onToggle} />
     </li>

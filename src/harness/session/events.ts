@@ -32,7 +32,7 @@ export type SessionEvent =
   | ({ readonly type: 'model/attempt' | 'execution/uncertain' | 'execution/reconciled'; readonly fact: import('../llm/request-lifecycle.ts').AttemptFact } & SessionEventStamp)
   | ({ readonly type: 'turn/start'; readonly turnId: TurnId; readonly kind?: 'conversation' | 'delegation' } & SessionEventStamp)
   | ({ readonly type: 'turn/closing'; readonly turnId: TurnId } & SessionEventStamp)
-  | ({ readonly type: 'user/message'; readonly turnId: TurnId; readonly content: string; readonly inputId?: string; readonly attachments?: readonly AttachmentRef[]; readonly origin?: 'continuation' | 'context' | 'command' } & SessionEventStamp)
+  | ({ readonly type: 'user/message'; readonly turnId: TurnId; readonly content: string; readonly inputId?: string; readonly attachments?: readonly AttachmentRef[]; readonly origin?: 'continuation' | 'context' | 'command' | 'hook'; readonly summary?: string } & SessionEventStamp)
   | ({ readonly type: 'step/start'; readonly turnId: TurnId; readonly stepId: StepId } & SessionEventStamp)
   | ({ readonly type: 'assistant/chunk'; readonly stepId: StepId; readonly delta: string; readonly thinking?: boolean } & SessionEventStamp)
   | ({ readonly type: 'assistant/message'; readonly stepId: StepId; readonly content: string; readonly toolCalls?: readonly ToolCall[]; readonly controls?: RequestControls } & SessionEventStamp)
@@ -84,7 +84,10 @@ export type SessionEvent =
       readonly proposedAccess?: 'read' | 'write'
     } & SessionEventStamp)
   | ({ readonly type: 'approval/decision'; readonly approvalId: string; readonly executionId?: ExecutionId; readonly decision: ApprovalDecision; readonly reason?: string } & SessionEventStamp)
-  | ({ readonly type: 'input/queued'; readonly inputId: string; readonly clientRequestId?: string; readonly content: string; readonly attachments?: readonly AttachmentRef[]; readonly delivery?: 'steer'; readonly runsNow?: true } & SessionEventStamp)
+  | ({ readonly type: 'input/queued'; readonly inputId: string; readonly clientRequestId?: string; readonly content: string; readonly attachments?: readonly AttachmentRef[]; readonly delivery?: 'steer'; readonly runsNow?: true; readonly origin?: 'hook'; readonly summary?: string } & SessionEventStamp)
+  // `origin: 'hook'`: an `asyncRewake` hook's result the host queued for the
+  // model (lower-trust data, never something the user typed); `summary` is the
+  // one line the user sees for it.
   // `runsNow`: the host found the session idle at acceptance and dispatches a
   // turn for it at once — the UI shows it as a sent message, not a queued one.
   // The user edited a still-waiting input: later readers take this content.
@@ -96,7 +99,7 @@ export type SessionEvent =
   | ({ readonly type: 'session/title'; readonly title: string | null } & SessionEventStamp)
   | ({ readonly type: 'session/pinned'; readonly pinned: boolean } & SessionEventStamp)
   | ({ readonly type: 'session/project'; readonly projectId: string | null } & SessionEventStamp)
-  | ({ readonly type: 'session/model'; readonly provider?: string | null; readonly model?: string | null; readonly thinkingLevel?: string | null } & SessionEventStamp)
+  | ({ readonly type: 'session/model'; readonly provider?: string | null; readonly model?: string | null; readonly thinkingLevel?: string | null; readonly alias?: string | null } & SessionEventStamp)
   // The root's own live mode: a normalized snapshot, so a restart never
   // depends on the mode file still existing or holding the same content.
   // Last wins; `revision` increases per selection. Children resolve their
@@ -136,7 +139,7 @@ export type SessionEvent =
   | ({ readonly type: 'mcp/call'; readonly server: string; readonly tool: string; readonly argsHash: string; readonly resultHash: string; readonly durationMs: number; readonly isError: boolean } & SessionEventStamp)
   // `message` (optional, capped): the hook's user-facing text — systemMessage,
   // stopReason, or stderr of a failing/blocking hook — shown in the timeline.
-  | ({ readonly type: 'hook/run'; readonly event: string; readonly matcher: string; readonly exitCode: number | null; readonly durationMs: number; readonly decision: string; readonly message?: string } & SessionEventStamp)
+  | ({ readonly type: 'hook/run'; readonly event: string; readonly matcher: string; readonly exitCode: number | null; readonly durationMs: number; readonly decision: string; readonly message?: string; readonly background?: true; readonly rewake?: 'woke' | 'dropped' | 'capped' | 'broken-install' } & SessionEventStamp)
   // Observability, not model content: the context manifest of the request this
   // step is about to send, recorded between `step/start` and the step's
   // answer. The trajectory reads it as "what this request carried"; model
@@ -159,6 +162,14 @@ export type SessionEvent =
       readonly coversSeq: number
       readonly summaryChars: number
       readonly durationMs: number
+      /**
+       * Estimated context-window tokens of the next request before and after
+       * this compaction (`tokensBefore` is the provider's prompt count when
+       * one was reported). Absent on failure, or when the history setting
+       * ignores checkpoints or no request has been measured yet.
+       */
+      readonly tokensBefore?: number
+      readonly tokensAfter?: number
       /** The full summary exactly as stored in the checkpoint; absent on failure. */
       readonly summary?: string
       /** Set on a failed attempt; no checkpoint was written. */
@@ -260,6 +271,8 @@ export interface SessionModel {
   readonly provider?: string | null
   readonly model?: string | null
   readonly thinkingLevel?: string | null
+  /** Name of the model alias the pair was picked through; display-only, never resolved. */
+  readonly alias?: string | null
 }
 
 /**
@@ -274,18 +287,21 @@ export function deriveSessionModel(events: readonly SessionEvent[]): SessionMode
   let provider: string | null | undefined
   let model: string | null | undefined
   let thinkingLevel: string | null | undefined
+  let alias: string | null | undefined
   for (const event of events) {
     if (event.type !== 'session/model') continue
     hasEvent = true
     if (event.provider !== undefined) provider = event.provider
     if (event.model !== undefined) model = event.model
     if (event.thinkingLevel !== undefined) thinkingLevel = event.thinkingLevel
+    if (event.alias !== undefined) alias = event.alias
   }
   return {
     hasEvent,
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
+    ...(alias !== undefined ? { alias } : {}),
   }
 }
 

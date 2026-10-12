@@ -36,6 +36,20 @@ describe('composer skill catalog scope', () => {
     const fallback = await composerSkillRows(skillsList, 'ws', null, async () => { throw new Error('down') })
     expect(fallback.map((row) => row.name)).toEqual(['review', 'lint'])
   })
+
+  it('lists bundled commands (/image, /video) in the menu with their hint, until a skill of the same name shadows one', async () => {
+    const commands = async () => ({ commands: [
+      { name: 'image', description: 'Generate an image from a description', source: 'bundled' as const, path: '/app/commands/image.md', argumentHint: '<describe the image>', disableModelInvocation: true as const },
+      { name: 'video', description: 'Generate a video', source: 'bundled' as const, path: '/app/commands/video.md', argumentHint: '<describe the video>', disableModelInvocation: true as const },
+    ] })
+    const rows = await composerSkillRows(async () => [], 'ws', null, commands)
+    expect(rows.map((row) => [row.name, row.source, row.argumentHint])).toEqual([
+      ['image', 'bundled', '<describe the image>'],
+      ['video', 'bundled', '<describe the video>'],
+    ])
+    const shadowed = await composerSkillRows(async () => [{ name: 'image', title: 'image', description: 'mine', source: 'workspace' as const, hash: 'h' }], 'ws', null, commands)
+    expect(shadowed.map((row) => [row.name, row.source])).toEqual([['video', 'bundled'], ['image', 'workspace']])
+  })
 })
 
 describe('per-session model cache coordination', () => {
@@ -50,6 +64,15 @@ describe('per-session model cache coordination', () => {
     expect(sessionEffectiveControls('one', workspace, { status: 'error', error: 'offline' })).toEqual({ provider: null, model: null, thinkingLevel: null })
     expect(sessionEffectiveControls('one', workspace, { status: 'ready', model: { provider: null, model: null, thinkingLevel: null, source: 'session' } })).toEqual({ provider: null, model: null, thinkingLevel: null })
     expect(sessionEffectiveControls(null, workspace, undefined)).toEqual(workspace)
+  })
+
+  it('carries the picked alias with a conversation or draft, and omits it when absent', () => {
+    const aliased = { status: 'ready' as const, model: { provider: 'p', model: 'm', thinkingLevel: null, alias: 'fast', source: 'session' as const } }
+    expect(sessionEffectiveControls('one', null, aliased)).toEqual({ provider: 'p', model: 'm', thinkingLevel: null, alias: 'fast' })
+    const direct = { status: 'ready' as const, model: { provider: 'p', model: 'm', thinkingLevel: null, alias: null, source: 'session' as const } }
+    expect(sessionEffectiveControls('one', null, direct)).toEqual({ provider: 'p', model: 'm', thinkingLevel: null })
+    const draft = { provider: 'p', model: 'm', thinkingLevel: null, alias: 'fast' }
+    expect(sessionEffectiveControls(null, draft, undefined)).toEqual(draft)
   })
 
   it('derives cached legacy controls from the current global default', () => {

@@ -22,7 +22,7 @@ export interface TodoView {
 const STATUSES: ReadonlySet<string> = new Set(['pending', 'in_progress', 'completed'])
 
 /** Tolerant client-side shape check: garbage items drop, never crash. */
-function parseTodos(args: unknown): readonly TodoItem[] {
+export function parseTodos(args: unknown): readonly TodoItem[] {
   if (!Array.isArray(args)) return []
   const todos: TodoItem[] = []
   for (const entry of args) {

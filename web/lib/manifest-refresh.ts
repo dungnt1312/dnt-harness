@@ -5,9 +5,10 @@ import type { SseEvent } from './types.ts'
  * recorded the moment a request is assembled, before the model answers, so the
  * meter fills as soon as the user sends. `step/end`/`step/abandoned` mark the
  * point where the provider has reported that request's real prompt count, and
- * `turn/end` closes the turn. Streaming chunks never change the key.
+ * `turn/end` closes the turn. `compaction/end` shrinks the window without any
+ * request, so automatic compaction refreshes the meter too. Streaming chunks never change the key.
  */
-const REFRESH_TYPES: ReadonlySet<string> = new Set(['context/manifest', 'step/end', 'step/abandoned', 'turn/end'])
+const REFRESH_TYPES: ReadonlySet<string> = new Set(['context/manifest', 'step/end', 'step/abandoned', 'turn/end', 'compaction/end'])
 
 /** Last request/step/turn boundary plus explicit compaction, not streaming token count. */
 export function manifestRefreshKey(events: readonly Pick<SseEvent, 'seq' | 'type'>[], compactNonce: number): string {

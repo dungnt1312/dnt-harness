@@ -7,7 +7,26 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type ModelMessage, type WebServer } from 'dnt-harness'
+import { createWebServer, SENT_STAMP_LINE, withoutSentStamp, type LlmProvider, type ModelMessage, type WebServer } from 'dnt-harness'
+
+/**
+ * A typed message's content without the host's leading `[sent …]` line (in
+ * the string, or in the first text part), checking the line is really there.
+ */
+function stripStamp(content: ModelMessage['content'] | undefined): ModelMessage['content'] | undefined {
+  if (content === undefined) return undefined
+  if (typeof content === 'string') {
+    expect(content).toMatch(SENT_STAMP_LINE)
+    return withoutSentStamp(content)
+  }
+  const [first, ...rest] = content
+  expect(first?.type).toBe('text')
+  if (first?.type !== 'text') return content
+  expect(first.text).toMatch(SENT_STAMP_LINE)
+  // A message with no typed text gets the stamp as its own text part.
+  const text = withoutSentStamp(first.text)
+  return text === '' ? rest : [{ ...first, text }, ...rest]
+}
 
 /** A one-pixel-ish PNG: a real signature is enough for the sniffer. */
 const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('pixels')])
@@ -118,8 +137,9 @@ describe('attachments on a message', () => {
 
     const user = lastMessages.find((message) => message.role === 'user')
     expect(Array.isArray(user?.content)).toBe(true)
-    // The text names the image's id so EditImage can use it as a source.
-    expect(user?.content).toEqual([
+    // The text names the image's id so EditImage can use it as a source; the
+    // host's [sent …] line leads the text part, never displacing the image.
+    expect(stripStamp(user?.content)).toEqual([
       { type: 'text', text: `what is this?\n\n[image attachment "shot.png" attachmentId=${ref.id}]` },
       { type: 'image', mediaType: 'image/png', base64: PNG.toString('base64'), name: 'shot.png' },
     ])
@@ -132,14 +152,14 @@ describe('attachments on a message', () => {
 
     const user = lastMessages.find((message) => message.role === 'user')
     expect(typeof user?.content).toBe('string')
-    expect(user?.content).toBe('read this\n\nattachment "notes.md":\n```\n# Plan\nship it\n```')
+    expect(stripStamp(user?.content)).toBe('read this\n\nattachment "notes.md":\n```\n# Plan\nship it\n```')
   })
 
   it('accepts an attachment with no text, since the file is the message', async () => {
     lastMessages = []
     const ref = await uploaded('shot.png', 'image/png', PNG)
     expect((await send('', [ref])).status).toBe(202)
-    expect(lastMessages.find((message) => message.role === 'user')?.content).toEqual([
+    expect(stripStamp(lastMessages.find((message) => message.role === 'user')?.content)).toEqual([
       { type: 'text', text: `[image attachment "shot.png" attachmentId=${ref.id}]` },
       { type: 'image', mediaType: 'image/png', base64: PNG.toString('base64'), name: 'shot.png' },
     ])

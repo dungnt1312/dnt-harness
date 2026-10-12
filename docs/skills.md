@@ -49,10 +49,15 @@ layers admit.
 - `catalog` — re-lists the visible catalog (name, source, one-line
   description) with an optional query filter. Empty result says
   `no skills available`.
-- `load` — loads one skill by name. The body enters context for the rest of
-  the turn (turn-local snapshot: the first load in a turn pins the content
-  and hash; later loads of the same name in the same turn return the pinned
-  copy). Unknown names suggest the closest catalog names.
+- `load` — loads one skill by name. The expanded body IS the tool result: a
+  receipt line (`skill 'x' loaded (hash …)`) followed by the instructions.
+  It enters history at the point of loading and stays there for later turns,
+  like Claude Code — so loading never changes any message ahead of history
+  and the provider's prompt cache survives. A repeat load of the same name
+  and args in the same turn answers with a short receipt instead of pasting
+  the body twice. A body over 200 000 characters is refused whole, never
+  truncated: a cut procedure is worse than none. Unknown names suggest the
+  closest catalog names.
 
 Loading is mode-gated: only modes whose `sources.skills` is `on-demand` can
 load; otherwise the tool errors and the model should switch modes.
@@ -61,10 +66,11 @@ When `sources.skills` is `on-demand`, the context builder also injects the
 catalog block (name — description rows) so the model can choose to load a
 skill the user never named. Bodies never enter context un-loaded.
 
-Budget interaction: when the context budget is exceeded, skills are trimmed
-FIRST (before memory, before oldest completed turns) — keep skill bodies
-small enough to survive, or accept that a large skill may be dropped under
-pressure.
+Budget interaction: a loaded skill is history, so it leaves context the way
+any tool result does — with its whole turn under budget trimming, or into the
+summary at compaction. Only an agent definition's `skills:` preloads ride the
+system prefix as wrapped `skill` blocks (fixed for the child's run), and those
+are trimmed FIRST under pressure (before memory, before oldest turns).
 
 ## SKILL.md format
 

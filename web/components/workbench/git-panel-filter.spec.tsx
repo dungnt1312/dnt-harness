@@ -65,7 +65,9 @@ it('a turn filter lists only the turn files, with a Show all escape', async () =
   await act(async () => { await vi.waitFor(() => expect(rows(view)).toHaveLength(2)) })
   expect(rows(view).join(' ')).toContain('a.ts')
   expect(rows(view).join(' ')).not.toContain('other.ts')
-  expect(view.textContent).toContain("this turn's writes")
+  // The banner says these are git's numbers, not the turn's own.
+  expect(view.textContent).toContain("This turn's files")
+  expect(view.textContent).toContain('all uncommitted changes')
   const showAll = [...view.querySelectorAll('button')].find((button) => button.textContent === 'Show all')
   await act(async () => showAll!.click())
   expect(onShowAll).toHaveBeenCalledOnce()

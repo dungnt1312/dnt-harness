@@ -5,6 +5,7 @@
  * wherever it shows.
  */
 import { cn } from '../../lib/cn.ts'
+import { lineDiff, splitLines } from '../../lib/line-diff.ts'
 
 export type DiffRowKind = 'add' | 'del' | 'context' | 'meta'
 
@@ -47,11 +48,6 @@ export function diffRowsFromUnified(lines: readonly RawDiffLine[]): readonly Dif
   return rows
 }
 
-function splitLines(text: string): string[] {
-  if (text === '') return []
-  return text.replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n')
-}
-
 /** `  12\tconst a = 2` — the numbered snippet `Edit` appends to its receipt. */
 const NUMBERED = /^\s*(\d+)\t(.*)$/
 
@@ -61,25 +57,31 @@ const NUMBERED = /^\s*(\d+)\t(.*)$/
  * snippet cannot be lined up with the replacement — a re-indented match, a
  * multi-occurrence edit, a pure deletion, a legacy receipt — the change is
  * still shown, with empty gutters and no context.
+ *
+ * The rows are a line diff of `old` against `new`: lines the edit only carried
+ * as context read as context, not as one removed and one re-added.
  */
 export function diffRowsFromEdit(oldText: string, newText: string, receipt = ''): readonly DiffRow[] {
   const removed = splitLines(oldText)
   const added = splitLines(newText)
+  const ops = lineDiff(oldText, newText)
   const snippet = receipt.split('\n').slice(1).map((line) => NUMBERED.exec(line)).filter((match) => match !== null)
     .map((match) => ({ n: Number(match[1]), text: match[2] ?? '' }))
   const at = added.length === 0 ? -1 : snippet.findIndex((_, index) => added.every((line, offset) => snippet[index + offset]?.text === line))
   if (at === -1) {
-    return [
-      ...removed.map((text): DiffRow => ({ kind: 'del', text, old: null, new: null })),
-      ...added.map((text): DiffRow => ({ kind: 'add', text, old: null, new: null })),
-    ]
+    return ops.map((op): DiffRow => ({ kind: op.kind === 'same' ? 'context' : op.kind, text: op.text, old: null, new: null }))
   }
   const start = snippet[at]!.n
   const shift = removed.length - added.length
+  let oldNo = start
+  let newNo = start
   return [
     ...snippet.slice(0, at).map((line): DiffRow => ({ kind: 'context', text: line.text, old: line.n, new: line.n })),
-    ...removed.map((text, index): DiffRow => ({ kind: 'del', text, old: start + index, new: null })),
-    ...added.map((text, index): DiffRow => ({ kind: 'add', text, old: null, new: start + index })),
+    ...ops.map((op): DiffRow => op.kind === 'same'
+      ? { kind: 'context', text: op.text, old: oldNo++, new: newNo++ }
+      : op.kind === 'del'
+        ? { kind: 'del', text: op.text, old: oldNo++, new: null }
+        : { kind: 'add', text: op.text, old: null, new: newNo++ }),
     ...snippet.slice(at + added.length).map((line): DiffRow => ({ kind: 'context', text: line.text, old: line.n + shift, new: line.n })),
   ]
 }

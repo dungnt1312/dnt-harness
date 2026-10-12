@@ -251,13 +251,13 @@ The response is `{ days: [{ date, model, input, cached, output, requests }], lon
 - a 53-week heatmap with Sunday-first columns in Daily, Weekly, or Cumulative mode, coloured by quantile levels;
 - a 7- or 30-day trend with one monotone curve per model (top 7 plus "Other").
 
-### `GET/PUT /api/image-generation`
+### `GET/PUT /api/image-generation`, `/api/image-understanding`, `/api/video-generation`
 
-The provider/model pair behind **Settings → Providers & Models → Image generation**, used by the `GenerateImage` and `EditImage` tools (see `docs/capabilities.md`). The body and response are `{ provider, model }`, both strings, or both `null` when the feature is off. `PUT` answers `400` for an unknown provider id or a half-filled pair. The pair is stored in `image-generation.json` beside `providers.json`; the key and base URL stay on the provider entry.
+Three provider/model references behind **Settings → Providers & Models** (the **Images** sub-tab holds the first two, **Videos** the third), all with one contract (`src/web/model-pair-store.ts`). `image-generation` serves the `GenerateImage` and `EditImage` tools, `video-generation` serves `GenerateVideo` (see `docs/capabilities.md`). The body and response are `{ provider, model }`, both strings, or both `null` when the feature is off. `PUT` answers `400` for an unknown provider id or a half-filled pair. Each pair is stored in its own file (`image-generation.json`, `image-understanding.json`, `video-generation.json`) beside `providers.json`; the key and base URL stay on the provider entry. `image-understanding` serves `DescribeImage` when the active chat model has effective `vision: false`; unlike the other two, its model must accept image input through chat completions rather than an Images or Videos endpoint.
 
-### `GET/PUT /api/image-understanding`
+### `GET|HEAD /api/workspaces/:wid/videos/:id`
 
-The dedicated multimodal chat pair behind **Settings → Providers & Models → Image understanding**. `DescribeImage` uses it when the active chat model has effective `vision: false`. Body, validation, persistence, and provider references match `/api/image-generation`, but this model must accept image input through chat completions rather than an Images generation endpoint. It is stored in `image-understanding.json` beside `providers.json`.
+Streams a video stored by `GenerateVideo`. It is read-only, and there is no upload route. The id is the sha256 of the bytes, and the type is sniffed from them. A single `Range` is honored with `206` and an unsatisfiable one answers `416`. An unknown id or an id that is not a digest answers `404`. The response is immutable and cacheable.
 
 ### `GET /api/providers`
 

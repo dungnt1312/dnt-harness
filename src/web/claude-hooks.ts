@@ -7,7 +7,9 @@
 import path from 'node:path'
 import type { Session } from '../harness/session/session.ts'
 import { auditDecision, interpretHooks, outcomeMessage, runHooks, type HookVerdict } from '../harness/hooks/runner.ts'
-import { loadHooks, selectHooks, type ClaudeHookEvent, type ResolvedHooks } from '../harness/hooks/settings.ts'
+import { isBackgroundHook, loadHooks, selectHooks, type ClaudeHookEvent, type ResolvedHooks } from '../harness/hooks/settings.ts'
+import type { RuleCall } from '../harness/commands/allowed-tools.ts'
+import type { BackgroundHooks } from './background-hooks.ts'
 
 export interface HookHostDeps {
   /** Data home (`<home>/workspaces/<ws>/…`); undefined for memory-only servers. */
@@ -20,6 +22,8 @@ export interface HookHostDeps {
   readonly modeIdOf: (sessionId: string, workspaceId: string) => string | undefined
   /** Hooks of the plugins enabled for a workspace/project. */
   readonly pluginHooks?: (workspaceId: string, projectId: string | undefined) => Promise<readonly { id: string; root: string; data: string; hooks: unknown; label: string }[]>
+  /** Runs `async` / `asyncRewake` hooks; without it they run in the foreground. */
+  readonly background?: BackgroundHooks
 }
 
 export interface HookFire {
@@ -33,13 +37,17 @@ export interface HookFire {
   readonly matchValue?: string
   /** Event-specific Claude input fields (`tool_name`, `prompt`, …). */
   readonly input: Record<string, unknown>
+  /** The tool call of a tool event, which a hook's `if` filter is matched against. */
+  readonly toolCall?: RuleCall
   readonly signal?: AbortSignal
 }
 
 export interface HookFireResult {
   readonly verdict: HookVerdict
-  /** How many hooks ran (0 = nothing configured/matched). */
+  /** How many foreground hooks ran (0 = nothing configured/matched). */
   readonly ran: number
+  /** How many background (`async` / `asyncRewake`) hooks were started. */
+  readonly launched?: number
 }
 
 /** Bundled dnt-harness modes → Claude `permission_mode`. */
@@ -124,9 +132,12 @@ export class HookHost {
    */
   async fire(event: ClaudeHookEvent, fire: HookFire): Promise<HookFireResult> {
     const resolved = await this.hooksFor(fire)
-    const hooks = selectHooks(resolved, event, fire.matchValue)
-    if (hooks.length === 0) return { verdict: { userMessages: [] }, ran: 0 }
     const projectRoot = this.deps.projectRootOf(fire.workspaceId, fire.projectId)
+    const selected = selectHooks(resolved, event, fire.matchValue, fire.toolCall, projectRoot)
+    if (selected.length === 0) return { verdict: { userMessages: [] }, ran: 0 }
+    const background = this.deps.background
+    const hooks = background === undefined ? selected : selected.filter((hook) => !isBackgroundHook(hook))
+    const later = background === undefined ? [] : selected.filter(isBackgroundHook)
     const cwd = projectRoot ?? this.workspaceDir(fire.workspaceId) ?? process.cwd()
     const input: Record<string, unknown> = {
       session_id: fire.sessionId ?? '',
@@ -138,11 +149,15 @@ export class HookHost {
       hook_event_name: event,
       ...fire.input,
     }
-    const outcomes = await runHooks(hooks, input, {
-      cwd,
-      ...(projectRoot !== undefined ? { projectDir: projectRoot } : {}),
-      ...(fire.signal !== undefined ? { signal: fire.signal } : {}),
-    })
+    const runOptions = { cwd, ...(projectRoot !== undefined ? { projectDir: projectRoot } : {}) }
+    // Background hooks start first and are not awaited: they never decide
+    // anything for this turn, and their audit lands when they finish.
+    let launched = 0
+    for (const hook of later) {
+      if (background?.launch({ event, hook, input, options: runOptions, sessionId: fire.sessionId, rootSessionId: fire.rootSessionId ?? fire.sessionId }) === true) launched += 1
+    }
+    if (hooks.length === 0) return { verdict: { userMessages: [] }, ran: 0, launched }
+    const outcomes = await runHooks(hooks, input, { ...runOptions, ...(fire.signal !== undefined ? { signal: fire.signal } : {}) })
     fire.signal?.throwIfAborted()
     const session = fire.sessionId !== undefined ? this.deps.sessionOf(fire.sessionId) : undefined
     if (session !== undefined) {
@@ -162,7 +177,7 @@ export class HookHost {
       })
       await session.durable()
     }
-    return { verdict: interpretHooks(event, outcomes), ran: outcomes.length }
+    return { verdict: interpretHooks(event, outcomes), ran: outcomes.length, ...(launched > 0 ? { launched } : {}) }
   }
 }
 

@@ -184,6 +184,36 @@ function GroupHead({ children }: { readonly children: ReactNode }) {
   return <div className="px-2.5 pb-1 pt-3 text-xs font-medium text-fg-faint">{children}</div>
 }
 
+/** Paging toggles under a group: chevron + word, "Less" only once expanded past the preview. */
+function PagingToggles({ total, extra, onMore, onLess }: {
+  readonly total: number
+  readonly extra: number
+  readonly onMore: () => void
+  readonly onLess: () => void
+}) {
+  if (total <= FOLDER_PREVIEW_COUNT) return null
+  const allShown = FOLDER_PREVIEW_COUNT + extra >= total
+  const toggleClass = 'flex items-center gap-0.5 rounded-lg px-1.5 py-1 text-xs text-fg-faint hover:bg-hover hover:text-fg'
+  // "Less" sits left of "More": collapsing reads right-to-left as undoing an
+  // expansion, and the pair stays put instead of swapping sides mid-paging.
+  return (
+    <div className="mt-0.5 flex items-center gap-1">
+      {extra > 0 ? (
+        <button type="button" className={toggleClass} onClick={onLess}>
+          <Icon name="chevron" size={12} className="shrink-0 rotate-180" />
+          <span>Less</span>
+        </button>
+      ) : null}
+      {!allShown ? (
+        <button type="button" className={toggleClass} onClick={onMore}>
+          <Icon name="chevron" size={12} className="shrink-0" />
+          <span>More</span>
+        </button>
+      ) : null}
+    </div>
+  )
+}
+
 export function SessionList({ sessions, projects, current, filter, liveRunning, onSelect, onRename, onDeleteRequest, onTogglePinned, onNewInProject, sort = 'recent', emptyLabel, onReorder, collapsedFolders, onToggleFolderCollapsed, expandedFolders, onExpandFolder, terminalProjects, automations }: {
   readonly sessions: readonly SessionListing[]
   readonly projects: readonly ProjectRow[]
@@ -205,10 +235,10 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
   readonly collapsedFolders?: Readonly<Record<string, boolean>>
   /** Reports folder collapse changes when controlled from the app shell. */
   readonly onToggleFolderCollapsed?: (projectId: string, collapsed: boolean) => void
-  /** Controlled per-folder "Show more" map; absent falls back to UI-local state. */
-  readonly expandedFolders?: Readonly<Record<string, boolean>>
+  /** Controlled per-folder "Show more" map (extra rows past the preview); absent falls back to UI-local state. */
+  readonly expandedFolders?: Readonly<Record<string, number>>
   /** Reports "Show more/less" changes when controlled from the app shell. */
-  readonly onExpandFolder?: (projectId: string, expanded: boolean) => void
+  readonly onExpandFolder?: (projectId: string, extraRows: number) => void
   /** Project ids with a live terminal shell in this workspace. */
   readonly terminalProjects?: ReadonlySet<string>
   /** The Automations folder's header actions; when set the folder always shows (it is the way in). */
@@ -217,19 +247,28 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
   // Folder collapse and per-folder "Show more" are controlled from the app
   // shell when wired up — so they survive the sidebar unmounting on close —
   // and fall back to UI-local state otherwise. Collapse is honored for every
-  // group including the open one.
+  // group including the open one. "Show more" reveals one more page of rows
+  // per click; "Show less" resets to the preview.
   const [localCollapsed, setLocalCollapsed] = useState<Record<string, boolean>>({})
-  const [localExpanded, setLocalExpanded] = useState<Record<string, boolean>>({})
+  const [localExpanded, setLocalExpanded] = useState<Record<string, number>>({})
   const collapsedState = collapsedFolders ?? localCollapsed
   const expandedState = expandedFolders ?? localExpanded
   const setFolderCollapsed = (projectId: string, value: boolean): void => {
     if (onToggleFolderCollapsed !== undefined) onToggleFolderCollapsed(projectId, value)
     else setLocalCollapsed((prev) => ({ ...prev, [projectId]: value }))
   }
-  const setFolderExpanded = (projectId: string, value: boolean): void => {
-    if (onExpandFolder !== undefined) onExpandFolder(projectId, value)
-    else setLocalExpanded((prev) => ({ ...prev, [projectId]: value }))
+  const setFolderExpanded = (projectId: string, extraRows: number): void => {
+    if (onExpandFolder !== undefined) onExpandFolder(projectId, extraRows)
+    else setLocalExpanded((prev) => ({ ...prev, [projectId]: extraRows }))
   }
+  // "Show more" reveals one more page of rows per click; "Show less" resets
+  // to the preview. They are separate buttons so "Show less" is reachable as
+  // soon as anything past the preview is visible — no need to expand first.
+  const expandPage = (key: string, total: number): void => {
+    const extra = expandedState[key] ?? 0
+    setFolderExpanded(key, Math.min(total - FOLDER_PREVIEW_COUNT, extra + FOLDER_PREVIEW_COUNT))
+  }
+  const collapseToPreview = (key: string): void => setFolderExpanded(key, 0)
   // Drag-to-reorder: the hovered target edge shows an insertion line; rows
   // never move mid-drag because relocating the dragged node cancels native
   // browser drag-and-drop.
@@ -308,8 +347,8 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
   const rest = automationRuns.length > 0 ? unpinned.filter((session) => session.automationId === undefined) : unpinned
   const automationsBlock = automationRuns.length > 0 || (automations !== undefined && query === '') ? (() => {
     const isCollapsed = collapsedState[AUTOMATIONS_GROUP] === true
-    const expanded = expandedState[AUTOMATIONS_GROUP] === true || query !== ''
-    const cut = expanded ? automationRuns.length : FOLDER_PREVIEW_COUNT
+    const extra = expandedState[AUTOMATIONS_GROUP] ?? 0
+    const cut = query !== '' ? automationRuns.length : FOLDER_PREVIEW_COUNT + extra
     const openAt = current !== null ? automationRuns.findIndex((session) => session.id === current) : -1
     const visible = openAt >= cut ? [...automationRuns.slice(0, cut), automationRuns[openAt]!] : automationRuns.slice(0, cut)
     const running = automationRuns.some((session) => (session.status ?? 'idle') === 'running')
@@ -344,14 +383,12 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
             ? { icon: 'folder', text: projects.find((project) => project.id === session.projectId)?.name ?? 'Removed project' }
             : { icon: 'messageSquare', text: 'Chat only' })}
           {automationRuns.length > FOLDER_PREVIEW_COUNT && query === '' ? (
-            <button
-              type="button"
-              aria-expanded={expanded}
-              onClick={() => setFolderExpanded(AUTOMATIONS_GROUP, !expanded)}
-              className="mt-0.5 rounded-lg px-2.5 py-1 text-xs text-fg-faint hover:bg-hover hover:text-fg"
-            >
-              {expanded ? 'Show less' : 'Show more'}
-            </button>
+            <PagingToggles
+              total={automationRuns.length}
+              extra={extra}
+              onMore={() => expandPage(AUTOMATIONS_GROUP, automationRuns.length)}
+              onLess={() => collapseToPreview(AUTOMATIONS_GROUP)}
+            />
           ) : null}
         </Collapsible.Content>
       </Collapsible.Root>
@@ -418,8 +455,8 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
         // The open conversation must never hide behind the cut, and search
         // results are never hidden either; both graft onto the preview rather
         // than force the folder open, so an explicit "Show more" stays sticky.
-        const expanded = expandedState[project.id] === true || query !== ''
-        const cut = expanded ? projectSessions.length : FOLDER_PREVIEW_COUNT
+        const extra = expandedState[project.id] ?? 0
+        const cut = query !== '' ? projectSessions.length : FOLDER_PREVIEW_COUNT + extra
         // Only a top-level row can sit past the cut: the open conversation
         // when it is one, or the parent of the open subagent. Grafting appends
         // rather than swaps so nothing already on screen vanishes, and a
@@ -458,14 +495,12 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
             <Collapsible.Content className="mt-0.5 ml-3 pl-1.5">
               {rows(visible)}
               {showToggle ? (
-                <button
-                  type="button"
-                  aria-expanded={expanded}
-                  onClick={() => setFolderExpanded(project.id, !expanded)}
-                  className="mt-0.5 rounded-lg px-2.5 py-1 text-xs text-fg-faint hover:bg-hover hover:text-fg"
-                >
-                  {expanded ? 'Show less' : 'Show more'}
-                </button>
+                <PagingToggles
+                  total={projectSessions.length}
+                  extra={extra}
+                  onMore={() => expandPage(project.id, projectSessions.length)}
+                  onLess={() => collapseToPreview(project.id)}
+                />
               ) : null}
             </Collapsible.Content>
           </Collapsible.Root>

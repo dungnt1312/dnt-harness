@@ -27,6 +27,8 @@ export interface ModelDefaults {
   readonly model: string | null
   /** Null delegates to the selected model's configured default. */
   readonly thinkingLevel: string | null
+  /** Alias the pair was picked through (display-only); absent/null for a direct model pick. */
+  readonly alias?: string | null
 }
 
 export interface ModelAlias {
@@ -143,7 +145,10 @@ function parseDefaults(candidate: Record<string, unknown>): ModelDefaults {
   const thinkingLevel = candidate['thinkingLevel'] === null || isThinkingLevel(candidate['thinkingLevel'])
     ? candidate['thinkingLevel'] as string | null
     : null
-  return provider === null || model === null ? { provider: null, model: null, thinkingLevel } : { provider, model, thinkingLevel }
+  const alias = typeof candidate['alias'] === 'string' && candidate['alias'] !== '' ? candidate['alias'] : null
+  return provider === null || model === null
+    ? { provider: null, model: null, thinkingLevel }
+    : { provider, model, thinkingLevel, ...(alias !== null ? { alias } : {}) }
 }
 
 function parseModelAliases(entries: readonly unknown[]): ModelAlias[] {

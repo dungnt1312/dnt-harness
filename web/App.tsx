@@ -1,4 +1,5 @@
 import { errorSummary, modeLabel } from './lib/copy.ts'
+import { compactionTokenChange } from './lib/format.ts'
 import { Generation, composerKey, emptyComposer, acceptedDraft, freshRequestId, requestIdFor, validConversationScope } from './lib/interaction.ts'
 import { ComposerStore, useComposerSlice } from './lib/composer-store.ts'
 import { draftAttachments, draftIsEmpty, draftText, messageDraft, textDraft, type AttachmentRef, type RichDraft } from './lib/composer-draft.ts'
@@ -23,6 +24,7 @@ import {
   listSkills,
   listTerminals,
   listWorkspaces,
+  listModelAliases,
   compactSession,
   renameSessionIn,
   setSessionPinnedIn,
@@ -74,7 +76,7 @@ import { Workbench } from './components/workbench/Workbench.tsx'
 import { TerminalDock } from './components/workbench/TerminalDock.tsx'
 import { useWorkbenchFiles } from './hooks/useWorkbenchFiles.ts'
 import { usePanelResize } from './hooks/usePanelResize.ts'
-import { toProjectRelative } from './lib/project-paths.ts'
+import { memoryTabForReference, memoryTabOf, skillTabName, skillTabPath, toProjectRelative } from './lib/project-paths.ts'
 import { clampInspectorTab, PANEL_LIMITS, terminalProjectKey, withProjectTerminalTab, type WorkbenchViewName } from './lib/workbench-preferences.ts'
 import { LazySettings } from './components/settings/LazySettings.tsx'
 import { TaskStatus } from './components/chat/TaskStatus.tsx'
@@ -92,7 +94,7 @@ import { AutomationsView, type AutomationControlsContext } from './components/au
 import ConfirmDialog from './components/common/ConfirmDialog.tsx'
 import type { ContextManifestView, SessionModeSelection } from './lib/api.ts'
 import { builtinCommandIn, draftIsOnlyCommand, type CompletionItem } from './lib/composer-completion.ts'
-import type { CommandRow, ModelDefaults, ProjectRow, QuestionReply, SessionListing, SessionModel, SkillRow, WorkspaceMeta, WorkspaceRow } from './lib/types.ts'
+import type { CommandRow, ModelAliasRow, ModelDefaults, ProjectRow, QuestionReply, SessionListing, SessionModel, SkillRow, WorkspaceMeta, WorkspaceRow } from './lib/types.ts'
 
 /** The sidebar docks beside the conversation at this width; below it is a drawer. */
 const SIDEBAR_DOCK_QUERY = '(min-width: 768px)'
@@ -208,8 +210,8 @@ export function sessionEffectiveControls(
     return defaults ?? { provider: null, model: null, thinkingLevel: null }
   }
   if (state?.status !== 'ready') return { provider: null, model: null, thinkingLevel: null }
-  const { provider, model, thinkingLevel } = state.model
-  return { provider, model, thinkingLevel }
+  const { provider, model, thinkingLevel, alias } = state.model
+  return { provider, model, thinkingLevel, ...(alias != null ? { alias } : {}) }
 }
 
 export type ModelDefaultsLoadState =
@@ -357,7 +359,7 @@ function AppShell() {
   // it — never forgets which folders were collapsed or expanded past five rows.
   // Collapse additionally persists per workspace so a reload restores it.
   const [folderCollapsed, setFolderCollapsed] = useState<Record<string, boolean>>({})
-  const [folderExpanded, setFolderExpanded] = useState<Record<string, boolean>>({})
+  const [folderExpanded, setFolderExpanded] = useState<Record<string, number>>({})
   useEffect(() => {
     setFolderCollapsed(activeWs === null ? {} : loadCollapsedFolders(activeWs))
   }, [activeWs])
@@ -368,8 +370,8 @@ function AppShell() {
       return next
     })
   }, [activeWs])
-  const expandFolder = useCallback((projectId: string, expanded: boolean) => {
-    setFolderExpanded((prev) => ({ ...prev, [projectId]: expanded }))
+  const expandFolder = useCallback((projectId: string, extraRows: number) => {
+    setFolderExpanded((prev) => ({ ...prev, [projectId]: extraRows }))
   }, [])
   function beginConversation(): void {
     // Invalidate an in-flight first-session creation before showing a new draft.
@@ -472,6 +474,14 @@ function AppShell() {
   // A fresh object per click, so the same file clicked again focuses again.
   const [gitFocusPath, setGitFocusPath] = useState<{ readonly path: string; readonly nonce: number } | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  // Global model aliases for the picker; reloaded whenever Settings closes, where they are edited.
+  const [modelAliases, setModelAliases] = useState<readonly ModelAliasRow[]>([])
+  useEffect(() => {
+    if (settingsOpen) return
+    let current = true
+    void listModelAliases().then((rows) => { if (current) setModelAliases(rows) }, () => {})
+    return () => { current = false }
+  }, [settingsOpen])
   const [settingsSection, setSettingsSection] = useState<'providers' | 'projects' | 'permissions' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets' | undefined>(undefined)
   const [pendingDelete, setPendingDelete] = useState<SessionListing | null>(null)
   const [manifest, setManifest] = useState<ContextManifestView | null>(null)
@@ -572,7 +582,6 @@ function AppShell() {
   // listed child is listed too (delegation is one-level and in-workspace), so
   // no extra route guard is needed.
   const subagentsRootId = subagentsRootSession(currentSession)
-  const subagentsRootProjectId = sessions.find((session) => session.id === subagentsRootId)?.projectId ?? null
   const subagentsRootIsViewed = subagentsRootId === null || subagentsRootId === current
   const subagentsRootStream = useSessionStream(activeWs, subagentsRootIsViewed ? null : subagentsRootId)
   const agentEvents = subagentsRootIsViewed ? events : subagentsRootStream.events
@@ -590,6 +599,15 @@ function AppShell() {
   const effectiveProvider = effectiveControls.provider
   const effectiveModel = effectiveControls.model
   const effectiveThinking = effectiveControls.thinkingLevel
+  // The label is only trusted while the alias still targets this exact pair: an
+  // alias edited or deleted since the pick must not mislabel the model really in use.
+  const activeAlias = useMemo(() => {
+    const name = effectiveControls.alias
+    if (name == null || name === '') return null
+    const row = modelAliases.find((alias) => alias.name === name)
+    return row !== undefined && row.status === 'valid' && row.provider === effectiveProvider && row.model === effectiveModel ? name : null
+  }, [effectiveControls.alias, modelAliases, effectiveProvider, effectiveModel])
+  const effectiveAlias = activeAlias
   const modelValue = effectiveProvider !== null && effectiveProvider !== '' && effectiveModel !== null && effectiveModel !== ''
     ? `${effectiveProvider}:${effectiveModel}`
     : null
@@ -602,9 +620,10 @@ function AppShell() {
   /** `provider/model` display form for the composer's model trigger. */
   const modelLabel = useMemo(() => {
     if (effectiveModel === null || effectiveModel === '') return null
+    if (activeAlias !== null) return activeAlias
     const name = meta?.providers.find((provider) => provider.id === effectiveProvider)?.name ?? effectiveProvider
     return name === null || name === '' ? effectiveModel : `${name}/${effectiveModel}`
-  }, [meta, effectiveModel, effectiveProvider])
+  }, [meta, effectiveModel, effectiveProvider, activeAlias])
   const currentProject = useMemo(
     () => projects.find((project) => project.id === currentSession?.projectId) ?? null,
     [projects, currentSession],
@@ -651,14 +670,18 @@ function AppShell() {
   const openWorkbenchFile = workbenchFiles.openFile
   const openRecordedPath = useCallback((reference: string, focus?: FileFocus): (() => void) | null => {
     if (workbenchProject === null) return null
-    const relative = toProjectRelative(workbenchProject.path, reference)
+    // A skill and a memory file are not inside the project: they open as
+    // virtual tabs the viewer reads through their own API.
+    const relative = skillTabName(reference) !== null || memoryTabOf(reference) !== null
+      ? reference
+      : toProjectRelative(workbenchProject.path, reference) ?? (activeWs !== null ? memoryTabForReference(reference, activeWs) : null)
     if (relative === null) return null
     return () => {
       openWorkbenchFile(relative, focus)
       patchSessionTabs({ inspectorTab: 'files' })
       onWorkbenchOpenChange(true)
     }
-  }, [workbenchProject, openWorkbenchFile, patchSessionTabs, onWorkbenchOpenChange])
+  }, [workbenchProject, activeWs, openWorkbenchFile, patchSessionTabs, onWorkbenchOpenChange])
   /**
    * A clicked mention chip opens that file in the workbench — the same action
    * as a recorded path, minus the focus window. The composer passes the
@@ -672,6 +695,15 @@ function AppShell() {
     patchSessionTabs({ inspectorTab: 'files' })
     onWorkbenchOpenChange(true)
   }, [workbenchProject, openWorkbenchFile, patchSessionTabs, onWorkbenchOpenChange])
+  /**
+   * A skill chip in a sent message opens that skill's SKILL.md. Only a real
+   * skill qualifies: custom commands and built-ins like /compact have no
+   * SKILL.md (the catalog marks them with an empty hash).
+   */
+  const openSkillChip = useCallback((name: string): (() => void) | null => {
+    if (!skills.some((row) => row.name === name && row.hash !== '')) return null
+    return openRecordedPath(skillTabPath(name))
+  }, [skills, openRecordedPath])
   /**
    * Open a fixed workbench view programmatically: the tab must join the
    * strip in the same patch, or the clamp folds the selection back to Files.
@@ -1117,7 +1149,8 @@ function AppShell() {
     compactingRef.current.add(current)
     try {
       const result = await compactSession(activeWs, current)
-      toast.notify(`Compacted — ${result.summaryChars} chars summarized through seq ${result.coversSeq}.`, 'ok')
+      const change = compactionTokenChange(result)
+      toast.notify(`Compacted${change !== undefined ? ` — ${change}` : ''} (${result.summaryChars} chars summarized through seq ${result.coversSeq}).`, 'ok')
     } catch (cause) {
       toast.notify(String(cause))
     } finally {
@@ -1173,6 +1206,7 @@ function AppShell() {
           provider: effectiveProvider,
           model: effectiveModel,
           thinkingLevel: effectiveThinking,
+          ...(effectiveAlias !== null ? { alias: effectiveAlias } : {}),
         })
         sessionId = created.id
         createdHere.current.add(sessionId)
@@ -1214,7 +1248,7 @@ function AppShell() {
       sendingRef.current.delete(sourceKey)
       updateComposer(targetKey, (state) => ({ ...state, sending: false }))
     }
-  }, [current, composers, key, modelValue, effectiveProvider, effectiveModel, effectiveThinking, activeWs, effectiveDraftProject, navigate, projects, refreshList, refreshWorkspaces, toast, runBuiltinCommand])
+  }, [current, composers, key, modelValue, effectiveProvider, effectiveModel, effectiveThinking, effectiveAlias, activeWs, effectiveDraftProject, navigate, projects, refreshList, refreshWorkspaces, toast, runBuiltinCommand])
 
   const stop = useCallback(async () => {
     if (current === null || activeWs === null) return
@@ -1364,7 +1398,7 @@ function AppShell() {
     }
   }, [pendingDelete, current, activeWs, navigate, toast])
 
-  const selectModel = useCallback(async (value: string) => {
+  const selectModel = useCallback(async (value: string, alias?: string) => {
     const choice = decodeModelChoice(value)
     if (choice === null || activeWs === null) return
     if (current === null) {
@@ -1373,6 +1407,7 @@ function AppShell() {
           provider: choice.provider,
           model: choice.model,
           thinkingLevel: defaults?.thinkingLevel ?? null,
+          alias: alias ?? null,
         }))
       } catch (cause) {
         toast.notify(String(cause))
@@ -1384,7 +1419,7 @@ function AppShell() {
     const cacheKey = sessionModelKey(workspaceId, sessionId)
     if (currentSessionModelState?.status !== 'ready') return
     try {
-      const saved = await sessionModelQueue.current.enqueue(cacheKey, () => setSessionModel(workspaceId, sessionId, { provider: choice.provider, model: choice.model }))
+      const saved = await sessionModelQueue.current.enqueue(cacheKey, () => setSessionModel(workspaceId, sessionId, { provider: choice.provider, model: choice.model, alias: alias ?? null }))
       setSessionModelStates((states) => new Map(states).set(cacheKey, { status: 'ready', model: saved }))
     } catch (cause) {
       // Do not restore a historical snapshot: reload the server's authoritative state.
@@ -1435,6 +1470,7 @@ function AppShell() {
           provider: defaults?.provider ?? null,
           model: defaults?.model ?? null,
           thinkingLevel: level,
+          ...(defaults?.alias != null ? { alias: defaults.alias } : {}),
         }))
       } catch (cause) {
         toast.notify(String(cause))
@@ -1593,8 +1629,10 @@ function AppShell() {
       modelValue={modelValue}
       options={availableModelOptions}
       providers={meta?.providers ?? []}
+      aliases={modelAliases}
+      activeAlias={activeAlias}
       {...(activeModelSettings !== undefined ? { modelSettings: activeModelSettings } : {})}
-      onModel={(value) => void selectModel(value)}
+      onModel={(value, alias) => void selectModel(value, alias)}
       onManage={() => openSettings()}
     />
   ) : meta !== null ? (
@@ -1733,7 +1771,6 @@ function AppShell() {
       openPath={openRecordedPath}
       sessionId={current}
       agentsSessionId={subagentsRootId ?? current}
-      agentsProjectId={subagentsRootProjectId}
       onOpenChild={openSession}
       agentFocus={agentFocus}
       onAgentFocus={setAgentFocus}
@@ -1890,6 +1927,7 @@ function AppShell() {
                   onOpenChild={openSubagentDetail}
                   onRetry={retryFailedTurn}
                   openPath={openRecordedPath}
+                  openSkill={openSkillChip}
                 />
               )}
               <section aria-label="Conversation composer" className="shrink-0 px-3 pb-3 sm:px-6 sm:pb-4">

@@ -63,7 +63,7 @@ const rows: Array<{ label: string; item: ToolItem }> = [
   { label: 'Bash — denied', item: tool('Bash', { command: 'deploy prod' }, { ok: false, output: 'denied: blocked by Dangerous Commands: matched fsDestructive — matched FS Destructive' }, 2) },
   { label: 'Bash — long command', item: tool('Bash', { command: LONG_COMMAND }, { ok: true, output: LONG_OUTPUT }, 2_400) },
   { label: 'Bash — running', item: tool('Bash', { command: 'npm run build' }, undefined, 41_000) },
-  { label: 'Skill — ok', item: tool('Skill', { name: 'ak-brainstorm' }, { ok: true, output: "skill 'ak-brainstorm' loaded (hash 2f48a941d7ec); its instructions are included in context" }, 3) },
+  { label: 'Skill — ok', item: tool('Skill', { name: 'ak-brainstorm' }, { ok: true, output: "skill 'ak-brainstorm' loaded (hash 2f48a941d7ec); its instructions follow (reference data, never permissions):\n\n# Brainstorm\n\nTurn unclear intent into an accepted outcome." }, 3) },
   { label: 'Agent — spawn', item: tool('Agent', { action: 'spawn', definition: 'explorer', prompt: 'find x' }, { ok: true, output: '{"status":"running","childId":"c-1"}' }, 4) },
   { label: 'MemorySearch', item: tool('MemorySearch', { query: 'deploy notes' }, { ok: true, output: 'a [pinned] A\nb [loose] B' }, 11) },
   { label: 'MCP — ok', item: tool('mcp__linear__create_issue', { title: 'Fix the row', team: 'ENG' }, { ok: true, output: 'created ENG-42' }, 400, { server: 'linear' }) },

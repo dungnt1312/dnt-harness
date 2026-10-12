@@ -171,6 +171,10 @@ export {
 export {
   renderEnvironmentContext,
   formatEnvironmentDate,
+  formatEnvironmentDay,
+  formatSentStamp,
+  withoutSentStamp,
+  SENT_STAMP_LINE,
   type EnvironmentFacts,
 } from './harness/context/environment.ts'
 export {
@@ -201,7 +205,7 @@ export {
   MAX_COMMAND_BYTES, commandKey, frontmatterBoolean, loadCommandLayers, parseAllowedTools, parseCommand, projectCommandDirs,
   scanCommandsDir, splitFrontmatter, type CommandDefinition, type CommandLayer, type CommandSource,
 } from './harness/commands/catalog.ts'
-export { allowedByRules, parseAllowRule, splitCompound, type AllowRule } from './harness/commands/allowed-tools.ts'
+export { allowedByRules, parseAllowRule, ruleMatchesCall, splitCompound, type AllowRule, type RuleCall } from './harness/commands/allowed-tools.ts'
 export { COMMAND_NAME, CommandExpansionError, expandCommand, parseSlashInvocation, type ExpansionContext, type SlashInvocation } from './harness/commands/invoke.ts'
 export { CommandsService, type CommandsServiceOptions } from './harness/commands/service.ts'
 

@@ -100,6 +100,13 @@ export type ViewItem =
       readonly content: string
     }
   | {
+      /** An `asyncRewake` hook's finding the model woke up for: summary line, framed content. */
+      readonly kind: 'hook-rewake'
+      readonly ts?: number
+      readonly summary: string
+      readonly content: string
+    }
+  | {
       readonly kind: 'compaction'
       readonly ts?: number
       /** running: start without end yet; completed/failed: end recorded; interrupted: dangling start the log moved past. */
@@ -108,6 +115,9 @@ export type ViewItem =
       model?: string
       coversSeq?: number
       summaryChars?: number
+      /** Context tokens before/after (absent on legacy or unmeasured runs). */
+      tokensBefore?: number
+      tokensAfter?: number
       durationMs?: number
       /** The stored summary, carried by a successful compaction/end. */
       summary?: string
@@ -288,6 +298,12 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
             add({ kind: 'command-expansion', content: event.content, ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}) })
             break
           }
+          if (event.origin === 'hook') {
+            // An asyncRewake finding: hook data, never a user bubble (and,
+            // while it waits, never a queued user row either).
+            add({ kind: 'hook-rewake', summary: event.summary ?? 'Background hook feedback', content: event.content, ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}) })
+            break
+          }
           if (event.origin === 'context' || HOOK_CONTEXT_PREFIX.test(event.content)) {
             // Host-injected context (hook additionalContext): the model reads
             // it; the transcript shows one collapsed line, never a user bubble.
@@ -336,6 +352,9 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
         }
         case 'input/queued': {
           if (event.inputId === undefined || event.inputId === '' || event.content === undefined) break
+          // A queued hook rewake is not the user's input to edit, retry or
+          // show as theirs; it appears once the turn admits it.
+          if (event.origin === 'hook') break
           const item: Extract<ViewItem, { kind: 'user' }> = {
             kind: 'user',
             content: event.content,
@@ -530,6 +549,16 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
             ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
             ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
           }
+          if (event.background === true) {
+            // A background (async / asyncRewake) hook decides nothing for the
+            // turn: show what it did, never "blocked".
+            if (event.rewake === 'woke') add({ kind: 'audit', icon: 'allow', text: `background hook woke the model · ${where}`, ...stamp })
+            else if (event.rewake === 'capped') add({ kind: 'audit', icon: 'block', text: `background hook rewake skipped (rewake limit) · ${where}${said}`, ...stamp })
+            else if (event.rewake === 'broken-install') add({ kind: 'audit', icon: 'fail', text: `background hook · ${where}${said}`, ...stamp })
+            else if (decision === 'skipped:cap') add({ kind: 'audit', icon: 'block', text: `background hook not run · ${where}${said}`, ...stamp })
+            else if (decision === 'timeout' || decision.startsWith('error:')) add({ kind: 'audit', icon: 'fail', text: `background hook failed · ${where} (${decision})${said}`, ...stamp })
+            break
+          }
           if (decision === 'block' || decision === 'deny' || decision.startsWith('deny+')) {
             add({ kind: 'audit', icon: 'block', text: `hook blocked · ${where}${said}`, ...stamp })
           } else if (decision === 'stop') {
@@ -622,6 +651,8 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
             if (event.model !== undefined) item.model = event.model
             if (event.coversSeq !== undefined) item.coversSeq = event.coversSeq
             if (event.summaryChars !== undefined) item.summaryChars = event.summaryChars
+            if (event.tokensBefore !== undefined) item.tokensBefore = event.tokensBefore
+            if (event.tokensAfter !== undefined) item.tokensAfter = event.tokensAfter
             if (event.durationMs !== undefined) item.durationMs = event.durationMs
             if (event.summary !== undefined) item.summary = event.summary
             if (event.error !== undefined) item.error = event.error

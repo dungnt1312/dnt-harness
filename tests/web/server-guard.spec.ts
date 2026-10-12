@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
+import { createWebServer, withoutSentStamp, type LlmProvider, type WebServer } from 'dnt-harness'
 import { DEFAULT_CONFIG } from '../../src/harness/guard/defaults.ts'
 import type { DangerousCommandsConfig } from '../../src/harness/guard/types.ts'
 import type { ToolDefinition } from '../../src/harness/tools/types.ts'
@@ -304,7 +304,7 @@ const scripted: LlmProvider = {
   async *stream(request) {
     const lastUserIndex = request.messages.map((message) => message.role).lastIndexOf('user')
     const last = request.messages[lastUserIndex]
-    const text = typeof last?.content === 'string' ? last.content : ''
+    const text = typeof last?.content === 'string' ? withoutSentStamp(last.content) : ''
     const answered = request.messages.slice(lastUserIndex).some((message) => message.role === 'tool')
     const command = /^run: ([\s\S]+)$/.exec(text)
     if (!answered && command !== null) {

@@ -34,6 +34,7 @@ import { SystemPromptsPanel } from './SystemPromptsPanel.tsx'
 import { UsagePanel } from './UsagePanel.tsx'
 import { ModelAliasesPanel } from './ModelAliasesPanel.tsx'
 import { ImagesPanel } from './ImagesPanel.tsx'
+import { VideoGenerationPanel } from './VideoGenerationPanel.tsx'
 import { modelOptions } from '../../lib/providers.ts'
 import type { ModelSettings, ProjectRow, ProviderSummary } from '../../lib/types.ts'
 
@@ -47,22 +48,25 @@ const LEGACY_TAB_REDIRECT: Readonly<Record<string, SettingsTab>> = {
   'model-aliases': 'providers',
   'image-generation': 'providers',
   'image-understanding': 'providers',
+  'video-generation': 'providers',
 }
 
 /** Sub-tabs of Providers & Models: everything that picks an endpoint or a model. */
-type ModelsSubTab = 'providers' | 'model-aliases' | 'images'
-type LegacyModelsSubTab = 'image-generation' | 'image-understanding'
+type ModelsSubTab = 'providers' | 'model-aliases' | 'images' | 'videos'
+type LegacyModelsSubTab = 'image-generation' | 'image-understanding' | 'video-generation'
 
 const MODELS_SUB_TABS: readonly { readonly value: ModelsSubTab; readonly label: string; readonly hint: string; readonly icon: IconName }[] = [
   { value: 'providers', label: 'Providers', hint: 'Model endpoints and keys', icon: 'globe' },
   { value: 'model-aliases', label: 'Model aliases', hint: 'Global subagent model mappings', icon: 'gitBranch' },
   { value: 'images', label: 'Images', hint: 'Models for image generation and understanding', icon: 'fileImage' },
+  { value: 'videos', label: 'Videos', hint: 'Model for the GenerateVideo tool', icon: 'fileVideo' },
 ]
 
 /** Legacy tab ids that named a Providers & Models sub-pane directly. */
 function modelsSubOf(raw: string | undefined): ModelsSubTab | undefined {
   if (raw === 'image-generation' || raw === 'image-understanding') return 'images'
-  return raw === 'model-aliases' || raw === 'images' ? raw : undefined
+  if (raw === 'video-generation') return 'videos'
+  return raw === 'model-aliases' || raw === 'images' || raw === 'videos' ? raw : undefined
 }
 
 /** Legacy links that named a Permissions sub-pane directly. */
@@ -619,6 +623,7 @@ export function SettingsModal({
               <UnsavedChangesContext.Provider value={unsavedApi}>
                 {tab === 'providers' && modelsSub === 'model-aliases' ? <ModelAliasesPanel providers={providers} /> : null}
                 {tab === 'providers' && modelsSub === 'images' ? <ImagesPanel providers={providers} /> : null}
+                {tab === 'providers' && modelsSub === 'videos' ? <VideoGenerationPanel providers={providers} /> : null}
                 {tab === 'projects' ? <ProjectsPanel workspaceId={workspaceId} projects={projects} onChanged={onProjectsChanged} sessionCounts={sessionCounts} /> : null}
                 {tab === 'permissions' ? <PermissionsPanel workspaceId={workspaceId} onChanged={onRefresh} initialSub={permissionsSubOf(initialTab)} /> : null}
                 {tab === 'prompts' ? <SystemPromptsPanel workspaceId={workspaceId} /> : null}

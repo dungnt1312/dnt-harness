@@ -8,6 +8,7 @@ import { isCompletedCompactionBoundary, MAX_COMPACTION_SUMMARY_CHARS, recoverCan
 import type { ResolvedMode } from '../modes/types.ts'
 import type { GrantedRoot } from '../tools/types.ts'
 import { estimateTokens, estimateContentTokens, schemaCost, budgetFor, squeezeBudget, ContextBudgetError, type BudgetConfig } from './budget.ts'
+import { formatSentStamp } from './environment.ts'
 
 export { ContextBudgetError }
 export type { BudgetConfig }
@@ -74,11 +75,12 @@ export interface BuildContextInput {
     readonly verifiedAgainst?: 'committed-log'
   }
   /**
-   * Latest covered completed turns duplicated raw alongside the summary.
-   * Defaults to {@link DEFAULT_COMPACTION_TAIL_TURNS}; 0 disables covered
-   * duplication. All uncovered history remains eligible until budget trimming.
+   * Token budget for covered messages retained verbatim beside the summary:
+   * the user's typed messages plus the latest covered turn's final answer,
+   * newest first. Defaults to {@link DEFAULT_COMPACTION_RETAIN_TOKENS}; 0
+   * retains none. All uncovered history remains eligible until budget trimming.
    */
-  readonly compactionTailTurns?: number
+  readonly compactionRetainTokens?: number
   /**
    * Attachment bytes the host already read, by id. Whatever is missing is
    * reported to the model as unavailable rather than dropped.
@@ -309,9 +311,10 @@ ${safe}
 /** The default base prompt for root conversations; a workspace may replace it. */
 export const DEFAULT_BASE_SYSTEM = [
   'You are dnt-harness, a local coding assistant. Answer helpfully and precisely.',
-  'An <environment_context> block in this message states the current date, platform, and workspace: treat it as ground truth for time and platform questions instead of guessing.',
+  'An <environment_context> block in this message states the current date, platform, and workspace: treat it as ground truth for date and platform questions instead of guessing. Each message the user typed starts with a [sent YYYY-MM-DD HH:MM zone] line: the time it was sent, added by the host, not text the user wrote. For the exact current time later in a long task, check the clock with a tool.',
   'Ground every claim in what you actually observed: files you read, commands you ran, or results a tool returned. When you are unsure or lack a fact, say so plainly rather than inventing it; verify with a tool when verification is cheap.',
   'Prefer the narrowest tool for a question: Read a known file, Grep to locate, Glob to enumerate, and only then broader steps. Restate exact paths, identifiers, and errors in your answers so they stay actionable.',
+  'When searching, issue independent Read/Grep/Glob calls together in one response rather than one per step — they run in parallel. Start broad questions with Grep output_mode "files_with_matches" or a glob/type filter, then Read only the files that matter, and scope path to the folder you already know instead of the whole workspace.',
   'Reply in the user\'s language; keep code, identifiers, and file paths verbatim.',
   'For complex multi-step work (three or more distinct steps), maintain a task list with the TodoWrite tool — it keeps progress visible to the user.',
 ].join(' ')
@@ -322,6 +325,7 @@ export const DEFAULT_CHILD_SYSTEM = [
   'Your FINAL message is the entire deliverable: it is the only thing your caller receives.',
   'Nobody reads your intermediate messages or your tool output, so restate in your final message anything that matters, including the file paths you found.',
   'Do not narrate your progress. Investigate, then answer.',
+  'Issue independent Read/Grep/Glob calls together in one response — they run in parallel — and narrow searches with Grep output_mode "files_with_matches", glob/type filters and a scoped path before reading whole files.',
   'You cannot delegate: there is no subagent available to you.',
 ].join(' ')
 
@@ -500,19 +504,13 @@ export function buildContext(input: BuildContextInput): AssembledContext {
   const lowerTrustMessages: ModelMessage[] = []
   if (instructionsMessage !== undefined) lowerTrustMessages.push(instructionsMessage)
   if (mode.definition.sources.history === 'compact' && compaction !== undefined) {
-    lowerTrustMessages.push({
-      role: 'system',
-      content: wrapUntrusted(
-        'compacted-history',
-        { 'through-seq': String(compaction.coversSeq) },
-        `Summary of earlier conversation (the original session log is preserved unchanged):\n${compaction.summary}`,
-      ),
-    })
+    lowerTrustMessages.push(compactedHistoryMessage(compaction))
   }
 
   // ── history window per setting ─────────────────────────────
-  const window = historyWindow(input.events, mode.definition.sources.history, compaction, input.compactionTailTurns)
-  let dated = deriveDatedMessages(input.events, input.attachments).filter(entry => entry.seq >= window.startSeq)
+  const window = historyWindow(input.events, mode.definition.sources.history, compaction)
+  const history = historyMessages(input.events, window, mode.definition.sources.history === 'compact' ? compaction : undefined, input.compactionRetainTokens, input.attachments)
+  let dated = history.dated
   const totalTurns = countTurns(input.events)
 
   // ── optional sources (droppable) ───────────────────────────
@@ -593,12 +591,7 @@ export function buildContext(input: BuildContextInput): AssembledContext {
     if (cached !== undefined) return cached[from] ?? 0
     const suffix = new Array<number>(list.length + 1).fill(0)
     for (let index = list.length - 1; index >= 0; index--) {
-      const dated_message = list[index]!
-      // History is the only place images appear, so it is the only cost that
-      // cannot be measured as a plain string.
-      let cost = estimateContentTokens(dated_message.message.content)
-      if (dated_message.message.toolCalls !== undefined) cost += estimateTokens(JSON.stringify(dated_message.message.toolCalls))
-      suffix[index] = suffix[index + 1]! + cost
+      suffix[index] = suffix[index + 1]! + historyMessageCost(list[index]!.message)
     }
     historyCostCache.set(list, suffix)
     return suffix[from] ?? 0
@@ -716,7 +709,8 @@ export function buildContext(input: BuildContextInput): AssembledContext {
 
   // The final effective window start: the first message that survived
   // trimming (budget drops advance historyStart).
-  const effectiveStartSeq = historyStart > 0 ? (dated[historyStart]?.seq ?? (input.events[input.events.length - 1]?.seq ?? 0) + 1) : window.startSeq
+  // Retained covered messages sit before the window and never widen it.
+  const effectiveStartSeq = historyStart > 0 ? Math.max(window.startSeq, dated[historyStart]?.seq ?? (input.events[input.events.length - 1]?.seq ?? 0) + 1) : window.startSeq
   const finalIncludedTurns = countTurnsFrom(input.events, effectiveStartSeq)
   const manifest: Omit<ContextManifest, 'sections'> = {
     modeId: mode.definition.id,
@@ -824,8 +818,167 @@ interface HistoryWindow {
   readonly omittedTurns: number
 }
 
-/** Latest covered completed turns duplicated raw beside the checkpoint summary. */
-const DEFAULT_COMPACTION_TAIL_TURNS = 4
+/**
+ * Covered messages kept verbatim beside the checkpoint summary, in estimated
+ * tokens. Like Codex's retained user messages: a hard cap, so what survives a
+ * compaction is bounded by design however long the covered turns were.
+ */
+export const DEFAULT_COMPACTION_RETAIN_TOKENS = 20_000
+const RETAIN_TRUNCATION_MARK = '\n[… truncated at compaction …]\n'
+
+/** A user message the user typed (not host context, command expansion, hook or child reports). */
+function isTypedUserMessage(event: SessionEvent): event is Extract<SessionEvent, { type: 'user/message' }> {
+  return event.type === 'user/message' && event.origin === undefined
+}
+
+/** Keep the head and tail of a too-long text within roughly `tokens`. */
+function truncateToTokens(text: string, tokens: number): string {
+  const chars = Math.max(0, tokens * 4 - RETAIN_TRUNCATION_MARK.length)
+  if (text.length <= chars) return text
+  const head = Math.ceil(chars / 2)
+  return `${text.slice(0, head)}${RETAIN_TRUNCATION_MARK}${text.slice(text.length - (chars - head))}`
+}
+
+/**
+ * Covered messages retained verbatim, chronological: every typed user message
+ * plus the final answer of the latest covered turn, selected newest first
+ * within `budget` tokens. The first message that does not fit is truncated
+ * (text only) to the remainder and selection stops. Assistant tool calls and
+ * tool results are never retained — the summary carries that work.
+ */
+function retainedCoveredMessages(
+  events: readonly SessionEvent[],
+  dated: readonly DatedMessage[],
+  coversSeq: number,
+  budget: number,
+): DatedMessage[] {
+  if (budget <= 0) return []
+  const bySeq = new Map(dated.map((entry) => [entry.seq, entry]))
+  const candidates: DatedMessage[] = []
+  // The latest covered turn's last answer: the assistant text closest to the boundary.
+  let finalAnswer: DatedMessage | undefined
+  for (const event of events) {
+    if (event.seq > coversSeq) break
+    if (event.type === 'turn/start') finalAnswer = undefined
+    else if (event.type === 'assistant/message' && event.toolCalls === undefined && event.content.trim() !== '') finalAnswer = bySeq.get(event.seq)
+    if (isTypedUserMessage(event)) {
+      const entry = bySeq.get(event.seq)
+      if (entry !== undefined) candidates.push(entry)
+    }
+  }
+  if (finalAnswer !== undefined) candidates.push(finalAnswer)
+  const kept: DatedMessage[] = []
+  let remaining = budget
+  for (let index = candidates.length - 1; index >= 0 && remaining > 0; index--) {
+    const entry = candidates[index]!
+    const cost = historyMessageCost(entry.message)
+    if (cost <= remaining) {
+      kept.push(entry)
+      remaining -= cost
+      continue
+    }
+    const text = messageTextOf(entry.message.content)
+    if (text.trim() !== '') kept.push({ seq: entry.seq, message: { role: entry.message.role, content: truncateToTokens(text, remaining) } as ModelMessage })
+    break
+  }
+  kept.sort((a, b) => a.seq - b.seq)
+  // History opens on the user's words: a lone answer without its request is noise.
+  while (kept[0]?.message.role === 'assistant') kept.shift()
+  return kept
+}
+
+/**
+ * Prefix each typed user message with when it was sent (`[sent …]`), from its
+ * durable event timestamp. The time of day lives here, not in the system
+ * block: an immutable log fact renders identically in every later request, so
+ * the provider's cached prefix survives the clock. Host-originated messages
+ * (context, command expansions, hooks, continuations) carry no stamp — they
+ * are not something the user said. Model requests only; the log, the UI and
+ * the summarizer source never see it.
+ */
+function stampTypedUserMessages(events: readonly SessionEvent[], dated: DatedMessage[]): DatedMessage[] {
+  const sentAt = new Map<number, number>()
+  for (const event of events) {
+    if (isTypedUserMessage(event) && Number.isFinite(event.timestamp)) sentAt.set(event.seq, event.timestamp)
+  }
+  if (sentAt.size === 0) return dated
+  return dated.map((entry) => {
+    const timestamp = entry.message.role === 'user' ? sentAt.get(entry.seq) : undefined
+    if (timestamp === undefined) return entry
+    const stamp = formatSentStamp(timestamp)
+    const { content } = entry.message
+    const stamped = typeof content === 'string'
+      ? `${stamp}\n${content}`
+      : content[0]?.type === 'text'
+        ? [{ ...content[0], text: `${stamp}\n${content[0].text}` }, ...content.slice(1)]
+        : [{ type: 'text' as const, text: `${stamp}\n` }, ...content]
+    return { seq: entry.seq, message: { ...entry.message, content: stamped } as ModelMessage }
+  })
+}
+
+function messageTextOf(content: string | readonly ContentPart[]): string {
+  return typeof content === 'string' ? content : content.flatMap((part) => (part.type === 'text' ? [part.text] : [])).join('\n')
+}
+
+/**
+ * The history messages a request carries: the window, preceded under a
+ * `compact` checkpoint by the covered messages retained verbatim.
+ */
+function historyMessages(
+  events: readonly SessionEvent[],
+  window: HistoryWindow,
+  compaction: { readonly coversSeq: number } | undefined,
+  retainTokens: number | undefined,
+  attachments: AttachmentLookup | undefined,
+): { readonly dated: DatedMessage[] } {
+  const all = stampTypedUserMessages(events, deriveDatedMessages(events, attachments))
+  const inWindow = all.filter((entry) => entry.seq >= window.startSeq)
+  if (compaction === undefined || compaction.coversSeq <= 0) return { dated: inWindow }
+  const budget = retainTokens !== undefined && Number.isSafeInteger(retainTokens) && retainTokens >= 0 ? retainTokens : DEFAULT_COMPACTION_RETAIN_TOKENS
+  const retained = retainedCoveredMessages(events, all.filter((entry) => entry.seq <= compaction.coversSeq && entry.seq < window.startSeq), compaction.coversSeq, budget)
+  return { dated: [...retained, ...inWindow] }
+}
+
+/** The lower-trust message that carries a compaction summary into a request. */
+function compactedHistoryMessage(compaction: { readonly summary: string; readonly coversSeq: number }): ModelMessage {
+  return {
+    role: 'system',
+    content: wrapUntrusted(
+      'compacted-history',
+      { 'through-seq': String(compaction.coversSeq) },
+      `Summary of earlier conversation (the original session log is preserved unchanged):\n${compaction.summary}`,
+    ),
+  }
+}
+
+/**
+ * Estimated tokens of one history message. History is the only place images
+ * appear, so it is the only cost that cannot be measured as a plain string.
+ */
+function historyMessageCost(message: ModelMessage): number {
+  let cost = estimateContentTokens(message.content)
+  if (message.toolCalls !== undefined) cost += estimateTokens(JSON.stringify(message.toolCalls))
+  return cost
+}
+
+/**
+ * Estimated tokens the conversation (compaction summary + history window) adds
+ * to a `compact`-history request — the only part compaction changes. Same
+ * window and cost rules as {@link buildContext}, before budget trimming.
+ */
+export function estimateConversationTokens(input: {
+  readonly events: readonly SessionEvent[]
+  readonly compaction?: { readonly summary: string; readonly coversSeq: number }
+  readonly compactionRetainTokens?: number
+  readonly attachments?: AttachmentLookup
+}): number {
+  const window = historyWindow(input.events, 'compact', input.compaction)
+  let total = input.compaction !== undefined ? estimateContentTokens(compactedHistoryMessage(input.compaction).content) : 0
+  for (const entry of historyMessages(input.events, window, input.compaction, input.compactionRetainTokens, input.attachments).dated) {
+    total += historyMessageCost(entry.message)
+  }
+  return total
+}
 
 /** Defense in depth for callers passing unchecked checkpoint data. */
 function validCompactionCoverage(events: readonly SessionEvent[], checkpoint: NonNullable<BuildContextInput['compaction']>): boolean {
@@ -842,7 +995,6 @@ function historyWindow(
   events: readonly SessionEvent[],
   setting: 'none' | 'recent' | 'compact',
   compaction?: { readonly coversSeq: number },
-  tailTurns: number = DEFAULT_COMPACTION_TAIL_TURNS,
 ): HistoryWindow {
   const total = countTurns(events)
   const lastSeq = events[events.length - 1]?.seq ?? 0
@@ -853,42 +1005,19 @@ function historyWindow(
     if (open === undefined) return { startSeq: lastSeq + 1, openTurnStartSeq: undefined, omittedTurns: total }
     return { startSeq: open, openTurnStartSeq: open, omittedTurns: total - 1 }
   }
-  // `compact`: only covered history may be replaced by the summary. Keep
-  // the latest `tailTurns` covered completed turns raw as optional duplication,
-  // plus ALL uncovered history. Only the budget trimmer may drop uncovered
-  // completed turns, explicitly; without a checkpoint the full log is eligible.
+  // `compact`: the summary replaces the whole covered range (only bounded
+  // retained messages ride beside it, see historyMessages); ALL uncovered
+  // history stays. Only the budget trimmer may drop uncovered completed turns,
+  // explicitly; without a checkpoint the full log is eligible.
   const covered = compaction?.coversSeq ?? 0
   if (covered <= 0) return { startSeq: 1, openTurnStartSeq: open, omittedTurns: 0 }
-  const starts = completedTurnStarts(events, covered)
-  const tail = Number.isSafeInteger(tailTurns) && tailTurns >= 0 ? tailTurns : DEFAULT_COMPACTION_TAIL_TURNS
   let startSeq = covered + 1
-  if (tail > 0 && starts.length > 0) {
-    startSeq = starts[Math.max(0, starts.length - tail)]!
-  }
   if (open !== undefined && startSeq > open) startSeq = open // defensive: the open turn is never dropped
   return {
     startSeq,
     openTurnStartSeq: open,
     omittedTurns: total - countTurnsFrom(events, startSeq),
   }
-}
-
-/** Start seqs of completed turns covered by the checkpoint boundary. */
-function completedTurnStarts(events: readonly SessionEvent[], coversSeq: number): number[] {
-  const starts: number[] = []
-  let openTurnId: string | undefined
-  let pendingStart: number | undefined
-  for (const event of events) {
-    if (event.type === 'turn/start') {
-      openTurnId = event.turnId
-      pendingStart = event.seq
-    } else if (event.type === 'turn/end' && event.turnId === openTurnId) {
-      if (pendingStart !== undefined && event.seq <= coversSeq) starts.push(pendingStart)
-      openTurnId = undefined
-      pendingStart = undefined
-    }
-  }
-  return starts
 }
 
 function countTurns(events: readonly SessionEvent[]): number {

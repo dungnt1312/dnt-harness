@@ -72,6 +72,57 @@ describe('session control labels', () => {
     expect(rows[0]?.getAttribute('aria-checked')).toBe('true')
   })
 
+  it('lists usable model aliases as an Aliases column that selects the alias target', () => {
+    const picked: [string, string | undefined][] = []
+    const alias = (name: string, provider: string, model: string, status: 'valid' | 'invalid') =>
+      ({ name, provider, model, thinkingLevel: null, revision: 1, status, warnings: [] })
+    act(() => root.render(<ModelMenu
+      menuLabel="Conversation model (next request)"
+      modelLabel="cliproxy / gpt-6-luna"
+      modelValue="cliproxy:gpt-6-luna"
+      options={[{ value: 'cliproxy:gpt-6-luna', label: 'cliproxy / gpt-6-luna', provider: 'cliproxy', model: 'gpt-6-luna' }]}
+      providers={[{ id: 'cliproxy', name: 'cliproxy', baseUrl: '', enabled: true, keyMasked: '', models: ['gpt-6-luna'] }]}
+      aliases={[alias('fast', 'cliproxy', 'gpt-6-luna', 'valid'), alias('broken', 'cliproxy', 'gone', 'invalid'), alias('orphan', 'missing', 'x', 'valid')]}
+      onModel={(value, aliasName) => picked.push([value, aliasName])}
+      onManage={() => {}}
+    />))
+    act(() => (host.querySelector('button') as HTMLButtonElement).click())
+    const column = [...document.querySelectorAll('[aria-label="Providers"] [role="option"]')].find((node) => node.textContent === 'Aliases') as HTMLButtonElement
+    expect(column).toBeDefined()
+    act(() => column.click())
+    const rows = [...document.querySelectorAll('[aria-label="Models"] [role="option"]')]
+    // Only the usable alias on an enabled provider is offered.
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.textContent).toContain('fast')
+    expect(rows[0]?.textContent).toContain('cliproxy:gpt-6-luna')
+    act(() => (rows[0] as HTMLButtonElement).click())
+    // The pick reports the alias name too, so the conversation can show it instead of the model.
+    expect(picked).toEqual([['cliproxy:gpt-6-luna', 'fast']])
+  })
+
+  it('opens on the Aliases column and marks only the alias row while an alias is the active pick', () => {
+    const alias = { name: 'fast', provider: 'cliproxy', model: 'gpt-6-luna', thinkingLevel: null, revision: 1, status: 'valid' as const, warnings: [] }
+    act(() => root.render(<ModelMenu
+      menuLabel="Conversation model (next request)"
+      modelLabel="fast"
+      modelValue="cliproxy:gpt-6-luna"
+      activeAlias="fast"
+      options={[{ value: 'cliproxy:gpt-6-luna', label: 'cliproxy / gpt-6-luna', provider: 'cliproxy', model: 'gpt-6-luna' }]}
+      providers={[{ id: 'cliproxy', name: 'cliproxy', baseUrl: '', enabled: true, keyMasked: '', models: ['gpt-6-luna'] }]}
+      aliases={[alias]}
+      onModel={() => {}}
+      onManage={() => {}}
+    />))
+    expect(host.querySelector('button')?.textContent).toContain('fast')
+    act(() => (host.querySelector('button') as HTMLButtonElement).click())
+    const selected = document.querySelector('[aria-label="Models"] [role="option"][aria-selected="true"]')
+    expect(selected?.textContent).toContain('fast')
+    // The same model under its own provider is not marked: the alias is the pick.
+    const providerRow = [...document.querySelectorAll('[aria-label="Providers"] [role="option"]')].find((node) => node.textContent?.startsWith('cliproxy')) as HTMLButtonElement
+    act(() => providerRow.click())
+    expect(document.querySelector('[aria-label="Models"] [role="option"][aria-selected="true"]')).toBeNull()
+  })
+
   it('marks the active model row and lands the open panel on it', () => {
     const options = [
       { value: 'cliproxy:gpt-6-luna', label: 'cliproxy / gpt-6-luna', provider: 'cliproxy', model: 'gpt-6-luna' },

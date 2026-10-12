@@ -20,6 +20,7 @@ import { createHash } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
+import { parseAllowRule, ruleMatchesCall, type RuleCall } from '../commands/allowed-tools.ts'
 
 /** Every hook event name Claude Code documents. */
 export const CLAUDE_HOOK_EVENTS = [
@@ -36,12 +37,29 @@ export const SUPPORTED_HOOK_EVENTS: ReadonlySet<ClaudeHookEvent> = new Set<Claud
 
 export type HookLayer = 'user' | 'plugin' | 'workspace' | 'project' | 'local'
 
-export interface HookCommand {
+/** Claude's background and filter fields of a command hook. */
+export interface HookModifiers {
+  /** Permission-rule filter (`Bash(git commit:*)`); tool events only. */
+  readonly if?: string
+  /** Runs in the background; never affects the turn. */
+  readonly async?: true
+  /** Background, and exit 2 wakes the model (implies `async`). */
+  readonly asyncRewake?: true
+  /** Prefix of the rewake text the model reads. */
+  readonly rewakeMessage?: string
+  /** One-line summary the user sees for a rewake. */
+  readonly rewakeSummary?: string
+}
+
+export interface HookCommand extends HookModifiers {
   readonly type: 'command'
   readonly command: string
   /** Seconds (Claude); default {@link DEFAULT_HOOK_TIMEOUT_SECONDS}. */
   readonly timeout?: number
 }
+
+/** Events whose input carries a tool call, the only ones an `if` filter can see. */
+export const TOOL_CALL_HOOK_EVENTS: ReadonlySet<ClaudeHookEvent> = new Set<ClaudeHookEvent>(['PreToolUse', 'PostToolUse', 'PostToolUseFailure'])
 
 export interface HookMatcherGroup {
   readonly matcher?: string
@@ -51,7 +69,7 @@ export interface HookMatcherGroup {
 export type HooksSection = Partial<Record<string, readonly HookMatcherGroup[]>>
 
 /** One runnable hook, flattened from a source file. */
-export interface ResolvedHook {
+export interface ResolvedHook extends HookModifiers {
   /** Stable identity: sha256 of layer, event, matcher and command (see {@link hookId}). */
   readonly id: string
   readonly event: ClaudeHookEvent
@@ -90,6 +108,35 @@ export class HookSettingsError extends Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/**
+ * Claude's `if` / `async` / `asyncRewake` / `rewakeMessage` / `rewakeSummary`,
+ * validated. Returns the problem (a suffix after the hook's location) when a
+ * field is malformed or an `if` cannot apply to this event.
+ */
+function parseModifiers(raw: Record<string, unknown>, event: ClaudeHookEvent): HookModifiers | string {
+  const out: { -readonly [K in keyof HookModifiers]: HookModifiers[K] } = {}
+  const condition = raw['if']
+  if (condition !== undefined) {
+    if (typeof condition !== 'string' || condition.trim() === '') return '.if must be a non-empty permission rule'
+    if (!TOOL_CALL_HOOK_EVENTS.has(event)) return `: 'if' only applies to tool events (PreToolUse, PostToolUse, PostToolUseFailure), so this hook never runs on ${event}`
+    if (parseAllowRule(condition) === undefined) return `: 'if' rule '${condition}' names no tool dnt-harness runs, so this hook never runs`
+    out.if = condition.trim()
+  }
+  for (const key of ['async', 'asyncRewake'] as const) {
+    const value = raw[key]
+    if (value === undefined) continue
+    if (typeof value !== 'boolean') return `.${key} must be a boolean`
+    if (value) out[key] = true
+  }
+  for (const key of ['rewakeMessage', 'rewakeSummary'] as const) {
+    const value = raw[key]
+    if (value === undefined) continue
+    if (typeof value !== 'string' || value.trim() === '') return `.${key} must be a non-empty string`
+    out[key] = value
+  }
+  return out
 }
 
 /**
@@ -138,18 +185,12 @@ export function parseHooksSection(value: unknown, options: { strict?: boolean; l
         const where = `${event}[${index}].hooks[${hookIndex}]`
         if (!isRecord(hookRaw)) { problem(`${where} must be an object`); continue }
         if (hookRaw['type'] !== 'command') { problem(`${where}: only type "command" hooks run in dnt-harness (got ${JSON.stringify(hookRaw['type'])})`); continue }
-        // Claude fields dnt-harness cannot faithfully execute yet: `if`
-        // predicates, background/async hooks and async rewake. Never run them
-        // unconditionally — report them as "not run" instead.
-        if (hookRaw['if'] !== undefined || hookRaw['asyncRewake'] === true || hookRaw['async'] === true) {
-          const fields = ['if', hookRaw['asyncRewake'] === true ? 'asyncRewake' : undefined, hookRaw['async'] === true ? 'async' : undefined].filter(Boolean).join(', ')
-          problem(`${where}: ${fields} is valid Claude plugin hook configuration but is not run by dnt-harness`)
-          continue
-        }
         if (typeof hookRaw['command'] !== 'string' || hookRaw['command'].trim() === '') { problem(`${where}.command must be a non-empty string`); continue }
         const timeout = hookRaw['timeout']
         if (timeout !== undefined && (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout <= 0)) { problem(`${where}.timeout must be a positive number of seconds`); continue }
-        commands.push({ type: 'command', command: hookRaw['command'], ...(typeof timeout === 'number' ? { timeout } : {}) })
+        const modifiers = parseModifiers(hookRaw, event as ClaudeHookEvent)
+        if (typeof modifiers === 'string') { problem(`${where}${modifiers}`); continue }
+        commands.push({ type: 'command', command: hookRaw['command'], ...(typeof timeout === 'number' ? { timeout } : {}), ...modifiers })
       }
       groups.push({ ...(typeof groupRaw['matcher'] === 'string' ? { matcher: groupRaw['matcher'] } : {}), hooks: commands })
     }
@@ -202,10 +243,13 @@ export function hookSourceFiles(dirs: HookSourceDirs): { layer: HookLayer; path:
 /**
  * Stable hook identity for the on/off switch: the same command under the
  * same event, matcher and layer is the same hook across reloads and edits
- * elsewhere in the file.
+ * elsewhere in the file. An `if` filter is part of the identity (hooks that
+ * share a command and differ only in `if` switch separately); a hook without
+ * one keeps the id it always had.
  */
-export function hookId(layer: HookLayer, event: string, matcher: string, command: string): string {
-  return createHash('sha256').update(JSON.stringify([layer, event, matcher, command])).digest('hex').slice(0, 16)
+export function hookId(layer: HookLayer, event: string, matcher: string, command: string, condition?: string): string {
+  const key = condition === undefined ? [layer, event, matcher, command] : [layer, event, matcher, command, condition]
+  return createHash('sha256').update(JSON.stringify(key)).digest('hex').slice(0, 16)
 }
 
 /**
@@ -264,13 +308,18 @@ export async function loadHooks(dirs: HookSourceDirs): Promise<ResolvedHooks> {
           const text = plugin !== undefined
             ? command.command.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, () => plugin.root).replace(/\$\{CLAUDE_PLUGIN_DATA\}/g, () => plugin.data)
             : command.command
-          const id = hookId(layer, event, matcher, plugin !== undefined ? `${plugin.id}\u0000${command.command}` : command.command)
+          const id = hookId(layer, event, matcher, plugin !== undefined ? `${plugin.id}\u0000${command.command}` : command.command, command.if)
           all.push({
             id,
             event: event as ClaudeHookEvent,
             matcher,
             command: text,
             ...(command.timeout !== undefined ? { timeout: command.timeout } : {}),
+            ...(command.if !== undefined ? { if: command.if } : {}),
+            ...(command.async === true ? { async: true as const } : {}),
+            ...(command.asyncRewake === true ? { asyncRewake: true as const } : {}),
+            ...(command.rewakeMessage !== undefined ? { rewakeMessage: command.rewakeMessage } : {}),
+            ...(command.rewakeSummary !== undefined ? { rewakeSummary: command.rewakeSummary } : {}),
             layer,
             source: sourcePath,
             ...(plugin !== undefined ? { plugin } : {}),
@@ -313,16 +362,32 @@ export function hookMatches(matcher: string, value: string | undefined): boolean
   }
 }
 
-/** Hooks of one event that match `value` (tool name, source, trigger…), identical commands once. */
-export function selectHooks(resolved: ResolvedHooks, event: ClaudeHookEvent, value?: string): ResolvedHook[] {
+/** True when a hook runs in the background (`async`, or `asyncRewake` which implies it). */
+export function isBackgroundHook(hook: HookModifiers): boolean {
+  return hook.async === true || hook.asyncRewake === true
+}
+
+/**
+ * Hooks of one event that match `value` (tool name, source, trigger…) and,
+ * for a hook with `if`, the tool call. Identical commands run once — the
+ * `if` filter applies first, since hooks often share one command and differ
+ * only in `if`. `baseDir` relativizes file paths for file-tool rules.
+ */
+export function selectHooks(resolved: ResolvedHooks, event: ClaudeHookEvent, value?: string, toolCall?: RuleCall, baseDir?: string): ResolvedHook[] {
   const seen = new Set<string>()
   const out: ResolvedHook[] = []
   for (const hook of resolved.hooks) {
     if (hook.event !== event) continue
     // Events without a matcher dimension ignore the matcher (Claude).
     if (value !== undefined && !hookMatches(hook.matcher, value)) continue
-    if (seen.has(hook.command)) continue
-    seen.add(hook.command)
+    if (hook.if !== undefined) {
+      const rule = parseAllowRule(hook.if)
+      if (rule === undefined || toolCall === undefined || !ruleMatchesCall(rule, toolCall, 'filter', baseDir)) continue
+    }
+    // A foreground and a background copy of one command are different runs.
+    const key = `${isBackgroundHook(hook) ? 'bg' : 'fg'}\u0000${hook.command}`
+    if (seen.has(key)) continue
+    seen.add(key)
     out.push(hook)
   }
   return out

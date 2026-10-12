@@ -256,6 +256,14 @@ Details worth knowing:
 - **Unbounded tool continuation.** The turn keeps spending steps while tools owe
   the model their results; there is no step bound — the model decides when it is
   done (`toolCalls.length === 0` ends the loop).
+- **Read-only calls run in parallel.** Every call of a batch is prepared (hooks,
+  policy, approval) in order. Consecutive calls whose final tool is
+  `readOnly` (Read, Grep, Glob) and that need no out-of-grant approval form a
+  group: all their `tool/call` intents are recorded and flushed, the bodies run
+  at most `readOnlyToolConcurrency` at once, and the `tool/result` events are
+  appended in the model's original call order. Any other call runs alone and
+  separates groups, so a write never overlaps a read. A stop answers every
+  declared call.
 - **`agent/pre-step`** (waterfall) admits a claim. `enter(contents)` runs a step
   with the (possibly rewritten) contents; `reject` closes the turn with reason
   `rejected`. A first `enter` rewritten to empty closes it with reason `empty`.
@@ -547,11 +555,13 @@ fails *transiently before producing any output* — `ProviderError.transient`,
 e.g. a stream that closed empty — is asked again with exponential backoff, 3
 extra attempts by default; a stop cancels the wait, and a failure after output
 started is never retried), `toolTimeoutMs`, `approvalExpiryMs`, `toolOutputLimit`,
+`readOnlyToolConcurrency` (read-only calls of one batch running at once, default 10),
 `maxPendingInputs`, `automaticCompactionPressure` (estimated pre-trim tokens/availableTokens
 ratio from the settled turn's fresh context manifest that triggers automatic
-compaction at a completed boundary; 0 disables), `compactionTailTurns`
-(latest covered completed turns duplicated raw beside the summary,
-default 4; 0 disables covered duplication, not uncovered history), plus composer-attachment limits
+compaction at a completed boundary; 0 disables), `compactionRetainTokens`
+(estimated-token cap on covered messages kept verbatim beside the summary —
+typed user messages plus the latest covered final answer — default 20 000;
+0 keeps none, never affects uncovered history), plus composer-attachment limits
 `maxAttachmentBytes`, `maxAttachmentsPerMessage`, and `attachmentTextLimit`
 (model-visible cap for inlined text attachments; images travel as `ContentPart`
 image parts with a flat `IMAGE_TOKEN_ESTIMATE` so multi-image turns do not
@@ -566,12 +576,15 @@ block, and trim order are normative in `docs/prompt-contract.md` and locked
 by `tests/harness/g5-prompt-contract.spec.ts`. In short: one trusted system
 message (base prompt or child preamble + capability line + role body, mode
 instructions, the `<environment_context>` date/platform/workspace/git
-block, file scope, compaction continuation note), then wrapped lower-trust
+block — date only, never the time of day, so the cached prefix survives the
+clock — file scope, compaction continuation note), then wrapped lower-trust
 system messages for workspace/project
 instructions, history per the mode's history setting (`none`/`recent`/
 `compact` — `none` still keeps the current turn's tool loop; `compact` reads
 a compaction checkpoint when one exists and equals `recent` when none does —
-nothing is dropped without a summary covering it), active skills,
+nothing is dropped without a summary covering it; each typed user message
+leads with a host-added `[sent …]` time from its event timestamp), agent-
+definition skills (a skill the model loads arrives as its `Skill` tool result),
 bounded MEMORY.md indexes (never pinned topic bodies), tool results and the schemas the mode's exposure
 ceiling allows. The budget is `context window − output reserve − safety
 margin` — the window is the operator's per-model override when set
@@ -589,10 +602,14 @@ never shed; as a last resort before `ContextBudgetError` it keeps only the
 newest result. Disabled loaders contribute nothing. Compaction (`context/compaction.ts`)
 writes immutable checkpoints with range/provenance at completed boundaries and
 never mutates the original JSONL. A checkpoint replaces only the covered range:
-the covered events ride in the summary (a lower-trust wrapped block), with the
-latest `compactionTailTurns` covered completed turns optionally duplicated raw
-(default four; zero disables duplication). **All uncovered history** remains
-eligible, regardless of the tail count. Existing budget trimming may still drop
+the covered events ride in the summary (a lower-trust wrapped block). Beside it,
+only the covered messages the user typed (not host context, command expansions,
+hook or child reports) and the latest covered turn's final text answer ride
+verbatim, selected newest first within `compactionRetainTokens` (default 20 000;
+the message at the boundary is truncated, older ones are dropped). Covered
+assistant tool calls and tool results are never retained, so the size after a
+compaction is bounded by design — as in Codex, whose retained user messages are
+capped the same way. **All uncovered history** remains eligible. Existing budget trimming may still drop
 oldest completed turns as whole units, preserving tool-call/result pairing and
 the open task; those budget omissions are explicitly recorded in the manifest.
 Trusted context frames this as the same conversation continuing after compaction,

@@ -110,6 +110,13 @@ export interface ToolDefinition {
   readonly schema?: () => { readonly description: string; readonly parameters: ToolSchema['parameters'] } | undefined
   /** True when the tool cannot run without a granted workspace root. */
   readonly requiresRoot?: boolean
+  /**
+   * True when the tool only observes state (no writes, no processes, no
+   * user interaction). Consecutive read-only calls in one model batch run
+   * concurrently; anything else runs alone. Host-declared only — never set
+   * from a remote server's own annotations.
+   */
+  readonly readOnly?: boolean
   execute(args: Record<string, unknown>, exec: ToolExecution): Promise<string>
 }
 
@@ -134,6 +141,11 @@ export type PreExecuteDecision =
 export interface PreparedToolCall {
   readonly call: ToolCall
   readonly executionId?: ExecutionId
+  /**
+   * True when the final (post-rewrite) call is an allowed read-only tool, so
+   * it may run alongside its read-only neighbours in the batch.
+   */
+  readonly concurrent?: boolean
   execute(): Promise<ToolResult>
 }
 

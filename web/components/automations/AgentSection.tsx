@@ -50,7 +50,6 @@ export function AgentSection({ workspaceId, projectId, value, onChange }: {
 
   return (
     <div className="flex flex-col gap-1.5">
-      <span className="text-[13px] text-fg-muted">Agent</span>
       <div className="flex flex-col gap-3 rounded-xl border border-line bg-surface p-3">
         <Select
           label="Agent that runs each run"

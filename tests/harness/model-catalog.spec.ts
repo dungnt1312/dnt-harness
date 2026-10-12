@@ -51,9 +51,14 @@ describe('model catalog metadata', () => {
     // The one Claude SKU with the 200k window.
     expect(getModelInfo('claude-haiku-4.5')?.contextTokens).toBe(200_000)
     expect(getModelInfo('claude-haiku-4.5-20251001')?.vision).toBe(true)
-    // GLM is not in the vision fallback — an unknown GLM stays honestly
-    // 'unknown' rather than claiming (or denying) image input.
-    expect(getModelInfo('glm-5.3-when-it-ships')?.vision).toBe('unknown')
+  })
+
+  it('unknown GLM releases are text-only unless they are a `v` vision SKU', () => {
+    // Sending image parts to a text-only GLM fails the whole turn (HTTP 400).
+    expect(getModelInfo('glm-5.3')?.vision).toBe(false)
+    expect(getModelInfo('zai/glm-5.3-flash')?.vision).toBe(false)
+    expect(getModelInfo('glm-5v-turbo')?.vision).toBe(true)
+    expect(getModelInfo('glm-4.5v')?.vision).toBe(true)
   })
 })
 

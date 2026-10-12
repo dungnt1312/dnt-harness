@@ -19,13 +19,40 @@ change and is reviewed as one. Assembly happens in exactly one place:
 [2]   system   wrapped   compacted-history         (fixed cost)
 [3]   system   wrapped   parent-context            (droppable)
 [4]   system   wrapped   skill-catalog             (droppable)
-[5+]  system   wrapped   one per active skill      (droppable as a group)
+[5+]  system   wrapped   one per agent-definition skill (droppable as a group)
 [..]  system   wrapped   memory entries (guidance + MEMORY.md indexes)
 [..]  user/assistant/tool — conversation history (turn-windowed)
 ```
 
 Attachments inline into their user message (`userMessageContent`); tool
 schemas travel in `tools`, never in a message.
+
+**Prefix stability.** Everything before history must render byte-identically
+from one request to the next unless a real source changed (mode, tools,
+instructions, compaction). Providers cache by prefix, so a change at
+position N re-bills every token after it. These rules follow:
+
+- The system block carries the **date only** (see below); the time of day
+  rides each typed user message as a host-added first line
+  `[sent YYYY-MM-DD HH:MM zone]`, rendered from the message's durable event
+  timestamp. Messages with an `origin` (command expansion, hook context,
+  continuation) carry none. The line exists only in model requests — never
+  in the log, the UI, or the summarizer's source.
+- A skill the model loads with `Skill` arrives as that tool's **result**, in
+  history at the load point, and stays for later turns. Only an agent
+  definition's `skills:` preloads use the `[5+]` blocks, because they are
+  fixed for the child's whole run.
+- The **skill catalog** `[4]` and the **MEMORY.md indexes** are read once per
+  session and kept (`prefixSnapshots` in `src/web/server.ts`): a memory write
+  or a skill edit no longer re-bills the whole request. The copy is re-read
+  only when the prefix moves anyway — a new compaction checkpoint, a project
+  rebind, a host restart — and a new session always reads the disk. A stale
+  row hides nothing: the model sees its own memory writes in history, and
+  the `Skill` tool's `catalog`/`load` read the disk. An empty memory index or
+  a failed read is not kept, so it retries.
+- **CLAUDE.md** (`[1]`) is deliberately re-read every request: an edit there
+  must apply to the running session at once, and edits are rare (one change
+  in ~20k measured request pairs).
 
 ## Trust model
 
@@ -47,7 +74,7 @@ gates are the enforcement.
 
 ```
 <environment_context>
-Today: 2026-10-06 Monday · 14:30 +07:00
+Today: 2026-10-06 Monday (timezone +07:00)
 Platform: darwin arm64 · Node v22.9.0
 Workspace: /abs/project (git branch: feat/x)
 </environment_context>
@@ -55,8 +82,11 @@ Workspace: /abs/project (git branch: feat/x)
 
 - Rendered by `renderEnvironmentContext` from host facts; the builder embeds
   the pre-rendered block (tests stay clock-free).
-- Minute granularity and a fixed position keep provider prompt-cache
-  prefixes stable across steps.
+- Day granularity and a fixed position keep the provider prompt-cache prefix
+  stable for the whole day. (The former minute-granularity line changed the
+  first message every minute; usage logs showed ~83% of uncached input tokens
+  lost exactly at minute boundaries.) The time of day travels with each typed
+  user message instead — see *Prefix stability* above.
 - The git branch is cached per project root for the server's lifetime
   (read-only hardened invocation, 2s timeout, silent omit). The Git view is
   the source of truth; a stale branch is the documented trade-off.
@@ -101,9 +131,11 @@ inherited parent-context → drop memory → drop oldest completed turns
 ## History
 
 Per mode setting: `none` (current turn only), `recent` (full log),
-`compact` (checkpoint summary replaces the covered range; the latest
-`compactionTailTurns` covered turns stay raw). Nothing is ever dropped
-without a summary covering it.
+`compact` (checkpoint summary replaces the whole covered range; beside it ride
+only the covered messages the user typed plus the latest covered turn's final
+answer, verbatim, newest first within `compactionRetainTokens` — default
+20 000 estimated tokens, the boundary message truncated, covered tool calls and
+results never retained). Nothing is ever dropped without a summary covering it.
 
 ## Child differences
 

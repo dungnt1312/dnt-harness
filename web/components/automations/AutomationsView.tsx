@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import Icon from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { Badge } from '../ui/Badge.tsx'
@@ -374,22 +374,30 @@ function AutomationEditor({ workspaceId, row, context, onBack, onSaved, onOpenSe
   const modelLabel = context.modelOptions.find((option) => option.value === modelValue)?.label ?? controls?.model ?? 'Default model'
 
   const noFutureRuns = preview !== null && 'next' in preview && preview.next.length === 0
-  const canSave = title.trim() !== '' && prompt.trim() !== '' && rules.length > 0 && !(preview !== null && 'error' in preview) && !noFutureRuns && !saving
+  const saveBlocker = title.trim() === '' ? 'Add a title'
+    : prompt.trim() === '' ? 'Add instructions'
+      : rules.length === 0 ? 'Add a schedule'
+        : (preview !== null && 'error' in preview) || noFutureRuns ? 'Fix the schedule'
+          : null
+  const canSave = saveBlocker === null && !saving
+  const input: AutomationInput = {
+    title: title.trim(),
+    prompt,
+    ...plan,
+    projectId,
+    modeId,
+    controls: controls ?? null,
+    agent,
+    notify: notifyMe,
+    notifyTargets: targets,
+    // Saving a plan with runs ahead turns a paused or finished task back on.
+    enabled: true,
+  }
+  // Baseline = the form as first rendered; any field edit makes it dirty.
+  const [baseline] = useState(() => JSON.stringify(input))
+  const dirty = JSON.stringify(input) !== baseline
   const save = async (): Promise<void> => {
     setSaving(true)
-    const input: AutomationInput = {
-      title: title.trim(),
-      prompt,
-      ...plan,
-      projectId,
-      modeId,
-      controls: controls ?? null,
-      agent,
-      notify: notifyMe,
-      notifyTargets: targets,
-      // Saving a plan with runs ahead turns a paused or finished task back on.
-      enabled: true,
-    }
     try {
       const saved = row === null ? await createAutomation(workspaceId, input) : await updateAutomation(workspaceId, row.id, input)
       notify(row === null ? 'Scheduled task created' : 'Saved', 'ok')
@@ -402,55 +410,52 @@ function AutomationEditor({ workspaceId, row, context, onBack, onSaved, onOpenSe
   }
 
   const projectName = context.projects.find((project) => project.id === projectId)?.name ?? 'Chat only'
+  const runNow = async (): Promise<void> => {
+    if (row === null) return
+    try {
+      const started = await runAutomationNow(workspaceId, row.id)
+      if (started.skipped === true) notify('Still running from the last time; skipped.')
+      else { notify('Run started', 'ok'); setTab('history') }
+    } catch (cause) {
+      notify(errorText(cause))
+    }
+  }
 
   return (
     <>
-      <div className="flex flex-col gap-1">
+      <div className="flex flex-col gap-3">
         <button type="button" className="flex w-fit items-center gap-1 text-[13px] text-fg-muted hover:text-fg" onClick={onBack}>
           <Icon name="chevron" size={14} className="rotate-90" />Automations
         </button>
-        <h1 className="m-0 text-xl font-semibold tracking-tight">{row === null ? 'New scheduled task' : row.title}</h1>
-        <p className="m-0 text-sm text-fg-muted">Configure when this task runs, what it does, and how it works.</p>
-      </div>
-
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <Segmented
-          label="Automation view"
-          value={tab}
-          options={[{ value: 'settings', label: 'Settings' }, { value: 'history', label: 'History' }]}
-          onChange={setTab}
-        />
-        {tab === 'settings' ? (
-          <Button variant="primary" size="sm" disabled={!canSave} onClick={() => void save()}>
-            {saving ? <Spinner size={13} /> : null}{row === null ? 'Create scheduled task' : 'Save'}
-          </Button>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="flex min-w-0 flex-col gap-1">
+            <h1 className="m-0 truncate text-xl font-semibold tracking-tight">{row === null ? 'New scheduled task' : row.title}</h1>
+            {row !== null ? <EditorStatus row={row} /> : <p className="m-0 text-sm text-fg-muted">Say what the agent should do and when. Each run opens a new conversation.</p>}
+          </div>
+          {row !== null ? (
+            <Button size="sm" onClick={() => void runNow()}><Icon name="zap" size={14} />Run now</Button>
+          ) : null}
+        </div>
+        {row !== null ? (
+          <Segmented
+            label="Automation view"
+            value={tab}
+            options={[{ value: 'settings', label: 'Settings' }, { value: 'history', label: 'History' }]}
+            onChange={setTab}
+          />
         ) : null}
       </div>
 
-      {tab === 'history' ? (
-        row === null
-          ? <EmptyState>History appears after the task is created.</EmptyState>
-          : <RunHistory workspaceId={workspaceId} automation={row} onOpenSession={onOpenSession} notify={notify} />
+      {tab === 'history' && row !== null ? (
+        <RunHistory workspaceId={workspaceId} automation={row} onOpenSession={onOpenSession} />
       ) : (
-        <div className="flex flex-col gap-4">
-          <label className="flex flex-col gap-1.5">
-            <span className="text-[13px] text-fg-muted">Task title</span>
-            <TextInput value={title} maxLength={120} onChange={(event) => setTitle(event.target.value)} />
-          </label>
-
-          <div className="flex flex-col gap-1.5">
-            <span className="text-[13px] text-fg-muted">Schedule</span>
-            <ScheduleEditor rules={rules} onRules={setRules} end={end} onEnd={setEnd} />
-            {preview !== null ? (
-              'error' in preview
-                ? <p className="m-0 text-[13px] text-bad">{preview.error}</p>
-                : preview.next.length === 0
-                  ? <p className="m-0 text-[13px] text-warn">This schedule has no runs left. Pick a later time or change when it ends.</p>
-                  : <p className="m-0 text-[13px] text-fg-faint">Next: {preview.next.map(formatRunTime).join(', ')}</p>
-            ) : null}
-          </div>
-
-          <div className="flex flex-col gap-1.5">
+        <div className="flex flex-col gap-6">
+          <EditorSection icon="fileText" title="Task" hint="What the agent does on every run.">
+            <label className="flex flex-col gap-1.5">
+              <span className="text-[13px] text-fg-muted">Title</span>
+              <TextInput value={title} maxLength={120} onChange={(event) => setTitle(event.target.value)} />
+            </label>
+            <div className="flex flex-col gap-1.5">
             <span className="text-[13px] text-fg-muted">Instructions</span>
             <div className="flex flex-col rounded-xl border border-line bg-surface focus-within:border-fg-faint">
               <textarea
@@ -514,27 +519,95 @@ function AutomationEditor({ workspaceId, row, context, onBack, onSaved, onOpenSe
                 </div>
               </div>
             </div>
+            </div>
+          </EditorSection>
+
+          <EditorSection icon="calendarClock" title="Schedule" hint="When it runs. Runs need this host to be up.">
+            <ScheduleEditor rules={rules} onRules={setRules} end={end} onEnd={setEnd} />
+            {preview !== null ? (
+              'error' in preview
+                ? <p className="m-0 text-[13px] text-bad">{preview.error}</p>
+                : preview.next.length === 0
+                  ? <p className="m-0 text-[13px] text-warn">This schedule has no runs left. Pick a later time or change when it ends.</p>
+                  : (
+                    <p className="m-0 flex flex-wrap items-baseline gap-x-2 text-[13px] text-fg-muted">
+                      <span>Next run <span className="font-medium text-fg">{formatRunTime(preview.next[0]!)}</span></span>
+                      {preview.next.length > 1 ? <span className="text-xs text-fg-faint">then {preview.next.slice(1).map(formatRunTime).join(', ')}</span> : null}
+                    </p>
+                  )
+            ) : null}
+          </EditorSection>
+
+          <EditorSection icon="bot" title="Agent" hint="Who runs the task.">
+            <AgentSection workspaceId={workspaceId} projectId={projectId} value={agent} onChange={setAgent} />
+          </EditorSection>
+
+          <EditorSection icon="bell" title="Notifications" hint="Where the result goes.">
+            <NotifyTargets enabled={notifyMe} onEnabled={setNotifyMe} targets={targets} onTargets={setTargets} errorText={errorText} />
+          </EditorSection>
+
+          <div className="sticky bottom-0 z-10 -mx-3 flex flex-wrap items-center justify-end gap-2 border-t border-line bg-bg/95 px-3 py-3 backdrop-blur sm:-mx-6 sm:px-6">
+            <span className={cn('mr-auto flex items-center gap-2 text-[13px]', dirty ? 'text-warn' : 'text-fg-faint')} role="status">
+              <span className={cn('size-1.5 rounded-full', dirty ? 'bg-warn' : 'bg-line-strong')} aria-hidden="true" />
+              {saveBlocker ?? (row === null ? 'Not created yet' : dirty ? 'Unsaved changes' : !row.enabled ? 'Paused. Save to turn it back on.' : 'All changes saved')}
+            </span>
+            <Button variant="ghost" size="sm" onClick={onBack}>Cancel</Button>
+            <Button variant="primary" size="sm" disabled={!canSave || (row !== null && row.enabled && !dirty)} onClick={() => void save()}>
+              {saving ? <Spinner size={13} /> : null}{row === null ? 'Create scheduled task' : 'Save'}
+            </Button>
           </div>
-
-          <AgentSection workspaceId={workspaceId} projectId={projectId} value={agent} onChange={setAgent} />
-
-          <NotifyTargets enabled={notifyMe} onEnabled={setNotifyMe} targets={targets} onTargets={setTargets} errorText={errorText} />
         </div>
       )}
     </>
   )
 }
 
-function RunHistory({ workspaceId, automation, onOpenSession, notify }: {
+/** One titled block of the editor: icon + title + one-line hint, then its controls. */
+function EditorSection({ icon, title, hint, children }: {
+  readonly icon: 'fileText' | 'calendarClock' | 'bot' | 'bell'
+  readonly title: string
+  readonly hint: string
+  readonly children: ReactNode
+}) {
+  return (
+    <section aria-label={title} className="flex flex-col gap-3">
+      <div className="flex items-baseline gap-2">
+        <Icon name={icon} size={15} className="shrink-0 translate-y-0.5 text-fg-muted" />
+        <h2 className="m-0 text-sm font-semibold">{title}</h2>
+        <span className="truncate text-[13px] text-fg-faint">{hint}</span>
+      </div>
+      {children}
+    </section>
+  )
+}
+
+/** Under the title: on/paused, the plan in words, and when it runs next. */
+function EditorStatus({ row }: { readonly row: AutomationRow }) {
+  const state = row.finished ? { label: 'Finished', tone: 'gray' as const } : row.enabled ? { label: 'On', tone: 'green' as const } : { label: 'Paused', tone: 'gray' as const }
+  return (
+    <p className="m-0 flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px] text-fg-muted">
+      <Badge tone={state.tone}>{state.label}</Badge>
+      <span>{describePlan(row.schedules, row.endsAt, row.maxRuns)}</span>
+      {row.enabled && row.nextRuns[0] !== undefined ? <span className="text-fg-faint">· next {formatRunTime(row.nextRuns[0])}</span> : null}
+    </p>
+  )
+}
+
+function RunHistory({ workspaceId, automation, onOpenSession }: {
   readonly workspaceId: string
   readonly automation: AutomationRow
   readonly onOpenSession: (sessionId: string) => void
-  readonly notify: (text: string, tone?: 'ok') => void
 }) {
   const [runs, setRuns] = useState<readonly AutomationRun[] | null>(null)
-  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const load = useCallback(async () => {
-    setRuns(await listAutomationRuns(workspaceId, automation.id).catch(() => []))
+    try {
+      setRuns(await listAutomationRuns(workspaceId, automation.id))
+      setError(null)
+    } catch (cause) {
+      setError(errorText(cause))
+      setRuns((current) => current ?? [])
+    }
   }, [workspaceId, automation.id])
   useEffect(() => { void load() }, [load])
   // Live-ish: poll while a run is still open.
@@ -544,53 +617,34 @@ function RunHistory({ workspaceId, automation, onOpenSession, notify }: {
     return () => clearInterval(timer)
   }, [runs, load])
 
-  const runNow = async (): Promise<void> => {
-    setBusy(true)
-    try {
-      const started = await runAutomationNow(workspaceId, automation.id)
-      notify(started.skipped === true ? 'Still running from the last time; skipped.' : 'Run started', started.skipped === true ? undefined : 'ok')
-      await load()
-    } catch (cause) {
-      notify(errorText(cause))
-    } finally {
-      setBusy(false)
-    }
+  if (runs === null) return <div className="flex items-center gap-2 text-sm text-fg-muted"><Spinner size={14} />Loading history…</div>
+  if (error !== null && runs.length === 0) {
+    return <EmptyState>History could not be loaded: {error}. <button type="button" className="text-link underline" onClick={() => void load()}>Retry</button></EmptyState>
   }
-
+  if (runs.length === 0) return <EmptyState>No runs yet. Use Run now to try it.</EmptyState>
   return (
-    <div className="flex flex-col gap-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-[13px] text-fg-muted">
-          {automation.enabled && automation.nextRuns[0] !== undefined ? `Next run ${formatRunTime(automation.nextRuns[0])}` : 'Paused'}
-        </span>
-        <Button size="sm" disabled={busy} onClick={() => void runNow()}><Icon name="zap" size={14} />Run now</Button>
-      </div>
-      {runs === null ? (
-        <div className="flex items-center gap-2 text-sm text-fg-muted"><Spinner size={14} />Loading history…</div>
-      ) : runs.length === 0 ? (
-        <EmptyState>No runs yet.</EmptyState>
-      ) : (
-        <ItemList label="Run history">
-          {runs.map((run) => {
-            const status = STATUS[run.status]
-            const quiet = run.status === 'missed' || run.status === 'skipped-busy'
-            return (
-              <ItemRow
-                key={run.runId}
-                title={(
-                  <span className={cn('flex items-center gap-2', quiet && 'text-fg-muted')}>
-                    {formatRunTime(run.dueAt ?? run.at)}
-                    {run.dueAt === null ? <span className="text-xs font-normal text-fg-faint">manual</span> : null}
-                    <Badge tone={status.tone}>{status.label}</Badge>
-                  </span>
-                )}
-                {...(run.summary !== undefined || run.error !== undefined ? { meta: run.error ?? run.summary } : {})}
-                {...(run.sessionId !== undefined ? { actions: <Button size="sm" variant="ghost" onClick={() => onOpenSession(run.sessionId!)}>Open</Button> } : {})}
-              />
-            )
-          })}
-        </ItemList>
-      )}
-    </div>
+    <ItemList label="Run history">
+      {runs.map((run) => {
+        const status = STATUS[run.status]
+        // Skipped and missed runs never opened a conversation of their own;
+        // a skipped run's session id is the run that was still busy.
+        const own = run.sessionId !== undefined && run.status !== 'skipped-busy' && run.status !== 'missed'
+        const detail = run.error ?? run.summary ?? (run.status === 'skipped-busy' ? 'The previous run was still going.' : run.status === 'missed' ? 'The host was not running at that time.' : undefined)
+        return (
+          <ItemRow
+            key={run.runId}
+            title={(
+              <span className={cn('flex items-center gap-2', !own && 'text-fg-muted')}>
+                <Badge tone={status.tone}>{status.label}</Badge>
+                {formatRunTime(run.dueAt ?? run.at)}
+                {run.dueAt === null ? <span className="text-xs font-normal text-fg-faint">Run now</span> : null}
+              </span>
+            )}
+            {...(detail !== undefined ? { meta: <span className={cn('line-clamp-2', run.error !== undefined && 'text-bad')}>{detail}</span> } : {})}
+            {...(own ? { actions: <Button size="sm" variant="ghost" onClick={() => onOpenSession(run.sessionId!)}>Open<Icon name="chevron" size={13} className="-rotate-90" /></Button> } : {})}
+          />
+        )
+      })}
+    </ItemList>
   )
 }
