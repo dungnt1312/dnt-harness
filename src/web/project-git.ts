@@ -457,12 +457,19 @@ async function headReport(root: string, trusted: boolean): Promise<GitHeadReport
 }
 
 /**
- * `git status` for a project root. Not a git checkout is an empty report, not
- * an error: a project folder simply may not be one.
+ * The porcelain walk behind {@link gitStatus}: same command, same
+ * classification, and `limit` entries at most (default none). Null when the
+ * root is not a git checkout. The panel list passes {@link MAX_CHANGES}; an
+ * explicit operation must read every entry and so passes no limit.
  */
-export async function gitStatus(root: string, deniedRoots?: readonly string[], trusted = false): Promise<GitStatusReport> {
+export async function readStatusChanges(
+  root: string,
+  deniedRoots?: readonly string[],
+  trusted = false,
+  limit: number = Number.POSITIVE_INFINITY,
+): Promise<{ changes: GitChange[]; truncated: boolean } | null> {
   const { stdout, code } = await runGitQuery(root, ['status', '--porcelain=v1', '--untracked-files=all', '--no-renames', '-z', '--', '.'], trusted)
-  if (code !== 0) return { branch: null, branchInfo: null, head: null, changes: [], truncated: false }
+  if (code !== 0) return null
   const changes: GitChange[] = []
   let truncated = false
   for (const record of records(stdout)) {
@@ -471,11 +478,22 @@ export async function gitStatus(root: string, deniedRoots?: readonly string[], t
     const indexStatus = record[0] ?? ' '
     const worktreeStatus = record[1] ?? ' '
     if (indexStatus === '!' && worktreeStatus === '!') continue
-    if (changes.length >= MAX_CHANGES) { truncated = true; break }
+    if (changes.length >= limit) { truncated = true; break }
     const rel = await contain(root, record.slice(3), deniedRoots)
     if (rel === null) continue
     changes.push({ path: rel, indexStatus, worktreeStatus, ...classifyStatus(record.slice(0, 2)) })
   }
+  return { changes, truncated }
+}
+
+/**
+ * `git status` for a project root. Not a git checkout is an empty report, not
+ * an error: a project folder simply may not be one.
+ */
+export async function gitStatus(root: string, deniedRoots?: readonly string[], trusted = false): Promise<GitStatusReport> {
+  const read = await readStatusChanges(root, deniedRoots, trusted, MAX_CHANGES)
+  if (read === null) return { branch: null, branchInfo: null, head: null, changes: [], truncated: false }
+  const { changes, truncated } = read
   const symbolic = await runGitQuery(root, ['symbolic-ref', '--short', '-q', 'HEAD'], trusted)
   const name = symbolic.code === 0 ? symbolic.stdout.toString('utf8').trim() : ''
   const branchInfo = name === '' ? null : await branchReport(root, trusted, name)

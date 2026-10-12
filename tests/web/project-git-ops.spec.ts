@@ -313,6 +313,74 @@ describe('discard and trash', () => {
   })
 })
 
+describe('operations beyond the 500-entry panel cap', () => {
+  const COUNT = 520
+  const name = (index: number, ext: string): string => `f${String(index).padStart(4, '0')}.${ext}`
+  /** Write COUNT files into `repo` in one go. */
+  const writeMany = (repo: Repo, ext: string, body: string): Promise<unknown> =>
+    Promise.all(Array.from({ length: COUNT }, (_, index) => repo.write(name(index, ext), body)))
+  const stagedCount = (repo: Repo): number => repo.git('diff', '--cached', '--name-only').split('\n').filter(Boolean).length
+
+  it('the panel status is capped but stage-all and unstage-all cover every entry', async () => {
+    const repo = await makeRepo()
+    await writeMany(repo, 'txt', 'new\n')
+    const capped = await statusOf(repo)
+    expect(capped.truncated).toBe(true)
+    expect(capped.changes).toHaveLength(500)
+
+    const staged = await operate(repo, { type: 'stage-all' })
+    expect(staged.ok).toBe(true)
+    expect(stagedCount(repo)).toBe(COUNT)
+    expect(repo.git('status', '--porcelain', '--untracked-files=all')).not.toContain('??')
+
+    const unstaged = await operate(repo, { type: 'unstage-all' })
+    expect(unstaged.ok).toBe(true)
+    expect(stagedCount(repo)).toBe(0)
+  })
+
+  it('Commit Tracked commits every tracked change, not the first 500', async () => {
+    const repo = await makeRepo()
+    await writeMany(repo, 'txt', 'one\n')
+    repo.git('add', '.')
+    repo.git('commit', '-qm', 'many')
+    await writeMany(repo, 'txt', 'two\n')
+    await repo.write('untracked.txt', 'u\n')
+    const result = await operate(repo, { type: 'commit', message: 'tracked', amend: false, signoff: false, noVerify: true, tracked: true })
+    expect(result.ok).toBe(true)
+    expect(repo.git('show', '--name-only', '--format=', 'HEAD').split('\n').filter(Boolean)).toHaveLength(COUNT)
+    expect(repo.git('status', '--porcelain', '--untracked-files=all').trim()).toBe('?? untracked.txt')
+  })
+
+  it('discards and trashes an explicitly requested path that sorts after the 500th entry', async () => {
+    const repo = await makeRepo()
+    await writeMany(repo, 'txt', 'one\n')
+    repo.git('add', '.')
+    repo.git('commit', '-qm', 'many')
+    await writeMany(repo, 'txt', 'two\n')
+    await writeMany(repo, 'new', 'new\n')
+    const last = name(COUNT - 1, 'txt')
+    const lastNew = name(COUNT - 1, 'new')
+    expect((await statusOf(repo)).changes.some((change) => change.path === last || change.path === lastNew)).toBe(false)
+
+    const discarded = await operate(repo, { type: 'discard', paths: [last] })
+    expect(discarded.ok).toBe(true)
+    expect(await fs.readFile(path.join(repo.dir, last), 'utf8')).toBe('one\n')
+
+    const bin = path.join(scratch, `trash-many-${counter}`)
+    await fs.mkdir(bin)
+    const moved: string[] = []
+    const trashPath = async (abs: string): Promise<void> => {
+      moved.push(abs)
+      await fs.rename(abs, path.join(bin, path.basename(abs)))
+    }
+    const trashed = await operate(repo, { type: 'trash', paths: [lastNew] }, { trashPath })
+    expect(trashed.ok).toBe(true)
+    expect(moved).toEqual([path.join(repo.dir, lastNew)])
+    expect(existsSync(path.join(repo.dir, lastNew))).toBe(false)
+    expect(existsSync(path.join(bin, lastNew))).toBe(true)
+  })
+})
+
 describe('OS trash invocation', () => {
   it('passes the path as one argument on every platform', () => {
     const abs = "/tmp/it's $(touch pwned) \"x\".txt"
@@ -491,6 +559,30 @@ describe('remotes', () => {
     await expect(operate(repo, push({ branch: '--delete' }), { run })).rejects.toThrow(/not a valid branch/)
     await expect(operate(repo, { type: 'pull', remote: 'origin', branch: '-x', rebase: false }, { run })).rejects.toThrow(/not a valid branch/)
     expect(calls.some((args) => ['push', 'fetch', 'pull'].includes(args[0] ?? ''))).toBe(false)
+  })
+
+  it('can never force: a +-prefixed branch or upstream is refused when force is false', async () => {
+    const { repo, origin } = await published()
+    repo.git('commit', '-q', '--amend', '-m', 'rewritten')
+    const remoteHead = git(origin, 'rev-parse', 'main')
+    const { run, calls } = spy()
+    await expect(operate(repo, push({ branch: '+main', upstreamBranch: 'main', force: false }), { run })).rejects.toThrow(/not a valid branch/)
+    await expect(operate(repo, push({ branch: 'main', upstreamBranch: '+main', force: false }), { run })).rejects.toThrow(/not a valid branch/)
+    await expect(operate(repo, push({ branch: '+main', upstreamBranch: '', force: false }), { run })).rejects.toThrow(/not a valid branch/)
+    expect(calls.some((args) => args[0] === 'push')).toBe(false)
+    expect(git(origin, 'rev-parse', 'main')).toBe(remoteHead)
+    // Listing remotes goes through the same check.
+    await expect(listProjectGitRemotes(repo.dir, true, '+main', true)).rejects.toThrow(/not a valid branch/)
+  })
+
+  it('pushes only a branch that exists under refs/heads', async () => {
+    const { repo } = await published()
+    repo.git('tag', 'v1')
+    const { run, calls } = spy()
+    await expect(operate(repo, push({ branch: 'v1', upstreamBranch: 'v1' }), { run })).rejects.toThrow(/not a local branch/)
+    await expect(operate(repo, push({ branch: 'HEAD', upstreamBranch: 'main' }), { run })).rejects.toThrow(/not a local branch/)
+    await expect(operate(repo, push({ branch: 'nonexistent', upstreamBranch: 'main' }), { run })).rejects.toThrow(/not a local branch/)
+    expect(calls.some((args) => args[0] === 'push')).toBe(false)
   })
 
   /** Push one more commit to `origin` from a second clone; returns that clone. */

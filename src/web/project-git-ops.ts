@@ -17,6 +17,7 @@ import {
   gitStatus,
   projectGitEnvironment,
   ProjectGitError,
+  readStatusChanges,
   runGitCommand,
   type GitChange,
   type GitRunner,
@@ -135,11 +136,20 @@ async function relativePaths(ctx: Context, paths: readonly string[]): Promise<st
   return rels
 }
 
+/**
+ * Every status entry, however many there are. The panel list is capped at
+ * MAX_CHANGES; an explicit operation (Stage All, Commit Tracked, a requested
+ * path) must never act on only the first 500, so it reads without that cap.
+ */
+async function operationChanges(ctx: Context): Promise<GitChange[]> {
+  return (await readStatusChanges(ctx.root, ctx.deniedRoots, ctx.trusted))?.changes ?? []
+}
+
 /** The status entries for the requested paths, in request order; unknown (clean or ignored) paths are dropped. */
 async function entriesFor(ctx: Context, paths: readonly string[]): Promise<GitChange[]> {
   const rels = await relativePaths(ctx, paths)
   if (rels.length === 0) return []
-  const { changes } = await gitStatus(ctx.root, ctx.deniedRoots, ctx.trusted)
+  const changes = await operationChanges(ctx)
   const byPath = new Map(changes.map((change) => [change.path, change]))
   return rels.flatMap((rel) => byPath.get(rel) ?? [])
 }
@@ -174,9 +184,12 @@ async function checkedRemote(ctx: Context, remote: string): Promise<string> {
   return remote
 }
 
-/** A syntactically valid branch name that cannot be read as an option. */
+/**
+ * A syntactically valid branch name that cannot be read as an option or as a
+ * forced refspec (`+main` would force-update the destination, whatever `force` says).
+ */
 async function checkedBranch(ctx: Context, name: string): Promise<string> {
-  if (name === '' || name.startsWith('-') || !(await git(ctx, ['check-ref-format', `refs/heads/${name}`])).ok) {
+  if (name === '' || name.startsWith('-') || name.startsWith('+') || !(await git(ctx, ['check-ref-format', `refs/heads/${name}`])).ok) {
     throw new ProjectGitError(`'${name}' is not a valid branch name`)
   }
   return name
@@ -299,14 +312,18 @@ async function commit(ctx: Context, request: Extract<GitOperationRequest, { type
   if (!request.tracked) return run()
   // Commit Tracked: stage every tracked change that is not fully staged. An
   // unmerged file stays out so Git itself refuses the commit.
-  const { changes } = await gitStatus(ctx.root, ctx.deniedRoots, ctx.trusted)
-  const tracked = changes.filter((change) => !change.created && !change.conflicted && change.staging !== 'staged')
+  const tracked = (await operationChanges(ctx)).filter((change) => !change.created && !change.conflicted && change.staging !== 'staged')
   return sequence(() => stageRels(ctx, paths(tracked)), run)
 }
 
 async function push(ctx: Context, request: Extract<GitOperationRequest, { type: 'push' }>): Promise<Step> {
   const remote = await checkedRemote(ctx, request.remote)
   const branch = await checkedBranch(ctx, request.branch)
+  // The source must be a local branch: a name that resolves to a tag, a SHA or
+  // a revision expression would push something other than what the panel shows.
+  if (!(await git(ctx, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`])).ok) {
+    throw new ProjectGitError(`'${branch}' is not a local branch`)
+  }
   const upstream = await checkedBranch(ctx, request.upstreamBranch === '' ? request.branch : request.upstreamBranch)
   return git(ctx, [
     'push',
@@ -330,9 +347,9 @@ async function dispatch(ctx: Context, request: GitOperationRequest, move: (abs: 
     case 'unstage':
       return unstageRels(ctx, await relativePaths(ctx, request.paths))
     case 'stage-all':
-      return stageRels(ctx, paths((await gitStatus(ctx.root, ctx.deniedRoots, ctx.trusted)).changes.filter((change) => change.staging !== 'staged')))
+      return stageRels(ctx, paths((await operationChanges(ctx)).filter((change) => change.staging !== 'staged')))
     case 'unstage-all':
-      return unstageRels(ctx, paths((await gitStatus(ctx.root, ctx.deniedRoots, ctx.trusted)).changes.filter((change) => change.staging !== 'unstaged')))
+      return unstageRels(ctx, paths((await operationChanges(ctx)).filter((change) => change.staging !== 'unstaged')))
     case 'discard':
       return discard(ctx, request.paths)
     case 'trash':
