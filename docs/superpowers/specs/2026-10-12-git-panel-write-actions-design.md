@@ -1,257 +1,391 @@
-# Git panel: stage, commit, sync and discard (Zed-style)
+# Git panel: 1:1 port of Zed's Git panel
 
-Status: design approved in brainstorming 2026-10-12, awaiting written-spec review.
+Status: revision 3, awaiting written-spec review.
 
-## Revision 2026-10-12 (user: "git tool nên làm theo hướng run command")
+## Decision
 
-Write actions run git **as a command, the way the user would type it in a
-terminal**. The user's and the repository's git config, hooks (pre-commit,
-commit-msg, pre-push), commit signing, credential helpers and `core.sshCommand`
-all work normally. The harness only builds the command, runs it, parses the
-result and shows it. The first draft disabled hooks and overrode config for
-write calls; that is dropped. Auth stays as it is for every other route.
+The user asked for a **1:1 port of Zed's Git panel, no invention**
+(2026-10-12 23:30). Every behaviour below is taken from Zed's source at
+`zed-industries/zed@c66312b`; each section names the Zed file and line it
+ports. The research notes are in
+`plans/reports/research-261012-2326-zed-git-panel.md`.
 
-## Goal
+Revisions 1 and 2 of this spec, which had their own hardening split, timeouts,
+`--ff-only` pull, `git clean` and push confirmation, are replaced entirely.
 
-The workbench Git panel (`web/components/workbench/GitPanel.tsx`) today only
-lists changed files and shows their diff against HEAD. It should become a
-working source-control panel modelled on Zed's Git panel: the user stages
-files, writes a commit message, commits, and syncs with the remote without
-leaving the workbench.
+Zed reference paths (abbreviated below):
 
-Success means a user can go from "the agent changed 12 files" to "committed and
-pushed" in the panel alone, and every action that can lose work or publish it
-asks first.
+- `repo.rs` = `crates/git/src/repository.rs`
+- `store.rs` = `crates/project/src/git_store.rs`
+- `panel.rs` = `crates/git_ui/src/git_panel.rs`
+- `ui.rs` = `crates/git_ui/src/git_ui.rs`
+- `out.rs` = `crates/git_ui/src/remote_output.rs`
+- `askpass.rs` = `crates/askpass/src/askpass.rs`
 
-## Decisions (chosen by the user)
+## Scope
 
-| Topic | Decision |
+**In:**
+
+- the change list with Conflicts / Tracked / Untracked sections;
+- stage and unstage, per file, per section, and all;
+- discard, restore and trash;
+- commit with Commit Tracked, Amend, Signoff and Skip Hooks;
+- Uncommit;
+- Fetch, Fetch From, Pull, Pull (Rebase), Push, Push To, Force Push, Publish
+  and Republish;
+- askpass prompts (SSH, HTTPS and GPG passphrases);
+- project trust (Restricted Mode for git);
+- remote output toasts with the pull-request link.
+
+**Out:**
+
+- stash;
+- branch picker;
+- History / Git Graph / commit view;
+- View Diff multibuffer;
+- tree view and sorting options;
+- co-authors;
+- AI commit message;
+- add to `.gitignore`;
+- `git init` / clone.
+
+These are separate Zed features that the user did not pick in the scope
+question. The existing turn filter (`pathFilter`) and inline diff of
+`GitPanel.tsx` stay.
+
+## 1. Git command builder (`repo.rs:3994`)
+
+Every git call, reads included, goes through one builder:
+`buildGitCommand(project, args)` in `src/web/project-git.ts`. It replaces
+today's `SAFE_CONFIG` and `hardenSubcommand`.
+
+**Always added:**
+
+```
+-c core.fsmonitor=false -c log.showSignature=false --no-optional-locks --no-pager
+```
+
+**Added only when the project is not trusted:**
+
+```
+-c core.hooksPath=/dev/null -c core.sshCommand=ssh -c credential.helper=
+-c protocol.ext.allow=never -c diff.external=
+```
+
+When the project is not trusted, `--no-ext-diff` is also inserted right after a
+`diff` subcommand.
+
+**Process:** `cwd` is the project root and `env` is the project environment
+(section 2). Git is resolved on that environment's `PATH` (`store.rs:788`).
+
+**Lifetime:** no timeout. A command ends when the git process exits, as in
+`run_askpass_command` (`repo.rs:4089`).
+
+## 2. Project environment (`store.rs:774`, `project/src/environment.rs:195`)
+
+The environment is the user's login shell environment for the project
+directory, as if they had `cd`'d there in a terminal. It is cached per
+(shell, directory) for the server's lifetime. The steps:
+
+1. Spawn the user's login shell (`$SHELL`, falling back to the platform default
+   from `src/capabilities/shell/detect.ts`) as a login, interactive shell in
+   the directory.
+2. In that shell, `cd` into the directory and print `env -0`.
+3. Parse the output.
+
+If loading fails, log the error and use an empty map, which means the server
+process environment (Zed logs and uses the default).
+
+## 3. Trust (Zed Restricted Mode)
+
+Zed trusts nothing by default. The user grants trust per directory, persisted
+(`project/src/trusted_worktrees.rs`).
+
+**Port:**
+
+- `ProjectRecord` gains `gitTrusted?: boolean`. It is absent (untrusted) for
+  every existing and new project.
+- `PATCH /api/workspaces/:wid/projects/:pid { gitTrusted: true|false }` sets it.
+  Like folder grants, this is only accepted from the owning browser session.
+- An untrusted project shows a one-line "Restricted Mode" banner at the top of
+  the panel, with **Trust**. The panel otherwise works, with the untrusted
+  flags from section 1. That means no hooks, no credential helper, and no
+  custom `sshCommand`, as in Zed.
+
+## 4. Status (`repo.rs:3767`)
+
+```
+git status --porcelain=v1 --untracked-files=all --no-renames -z -- .
+```
+
+`-b` is not used. Branch, upstream and ahead/behind come from:
+
+```
+git for-each-ref --format=… refs/heads/<HEAD branch>
+```
+
+This gives `branch`, `upstream` and `upstreamTrack`. `upstreamTrack` is one of
+`tracked {ahead, behind}`, `gone`, or none. The latest commit (sha, subject,
+has-parent) comes from `git log -1`.
+
+Each entry has a status and a staging state: staged, unstaged, or partially
+staged (from the XY code).
+
+Diff line counts stay as they are today (`diff --numstat HEAD`).
+
+### Sections (`panel.rs:602`)
+
+| Section | Contains |
 |---|---|
-| Scope | Stage/Unstage with grouped list, Commit, Push/Pull/Fetch, Discard/Restore |
-| Out of scope | History tab, branch switcher, project-wide "View Diff" multibuffer |
-| Permissions | Panel actions are the user's own clicks, so they run immediately in every session mode. Discard, Trash untracked, Push, Force push and Amend of a pushed commit ask for confirmation |
-| Architecture | A thin command runner: each POST action maps to one plain `git` command line run in the project root. The harness parses and displays; git does the work |
-| Git config and hooks | Untouched for write actions: no `-c` overrides, hooks run, signing and helpers apply. Hook output is shown in the panel |
-| Credentials | Whatever the host already has (SSH agent/key, credential helper, keychain). There is no terminal to type into, so `GIT_TERMINAL_PROMPT=0` makes a missing credential fail fast with git's message instead of hanging |
-| Route auth | Same as every other API route (session cookie + CSRF/origin); no extra gate |
+| Conflicts | conflicted entries only |
+| Tracked | everything not created |
+| Untracked | created (untracked) entries |
 
-## Layout
+## 5. Operations
 
-Top to bottom, matching the Zed screenshot the user supplied:
+Each operation runs through a per-repository serial job queue (`store.rs`
+`send_job`). The panel marks staging changes optimistically: the checkbox
+flips at once and reverts if the job fails (`store.rs:8094`
+`spawn_job_with_tracking`).
 
-1. **Filter banner** (unchanged) when the panel was opened from a turn card with
-   `pathFilter`.
-2. **Header row**: `Changes (N)`, the total `+added −removed`, a refresh button,
-   and a split button. Its main action is **Stage All**, or **Unstage All** when
-   every change is staged. Its menu holds Stage All, Unstage All, Discard
-   Tracked Changes, and Trash Untracked Files.
-3. **Change list** in up to three groups, each with a collapsible header and a
-   group checkbox:
-   - **Conflicts** (only when present). Staging a conflicted file marks it
-     resolved (`git add`).
-   - **Tracked**: modified, added, deleted, renamed and copied files.
-   - **Untracked**.
-
-   Each row keeps today's chevron, status mark, file icon, name, directory,
-   line counts, hover-revealed opener and inline diff. It gains a checkbox on
-   the right edge with three states: staged, unstaged, and partially staged
-   (index and worktree both differ). Clicking a partial checkbox stages the
-   whole file. The row's hover menu (same hover-reveal contract as the opener)
-   adds **Discard changes** or, for an untracked file, **Trash file**.
-4. **Commit box**: a multi-line message field (Cmd/Ctrl+Enter commits) and a
-   split **Commit** button. The label is "Commit" when something is staged and
-   "Commit Tracked" when nothing is (this stages every tracked change, like
-   `git commit -a`). The button is disabled when the message is empty, or when
-   nothing is staged and there are no tracked changes. The menu holds **Amend**: it fills the field with HEAD's
-   message and the button becomes "Amend". While a commit runs (hooks may take
-   a while) the button shows "Committing…".
-5. **Footer**: branch icon and name on the left. On the right is a split remote
-   button whose main action follows Zed:
-   - no remote: no button;
-   - no upstream: **Publish** (`push -u <remote> <branch>`);
-   - behind > 0: **Pull ↓n** (also when ahead);
-   - ahead > 0: **Push ↑n**;
-   - otherwise **Fetch**.
-
-   Its menu always lists Fetch, Pull, Push, and Force Push (with lease).
-
-**Filtered mode** (`pathFilter` set): rows and group checkboxes act on the shown
-files only. The header action reads "Stage shown". The commit box and footer are
-hidden, because a commit takes the whole index and not only the shown files.
-**Show all** brings them back.
-
-A detached HEAD shows the short SHA in the footer and disables Publish and Push.
-A folder that is not a repository keeps today's empty state with no controls.
-
-## Server
-
-### Status report additions (`src/web/project-git.ts`)
-
-`GitChange` gains `staging: 'staged' | 'unstaged' | 'partial'`, read from the
-porcelain v1 XY code. The rules: X is blank or `?` gives unstaged; X is set and
-Y is blank gives staged; both set gives partial. Conflicts are unstaged.
-
-`GitStatusReport` gains:
-
-- `upstream?: string`, from the `## branch...remote/branch` header;
-- `remote?: string`, which is `origin` when present and otherwise the first
-  entry of `git remote` (absent when there is none);
-- `detached: boolean`;
-- `head?: { sha: string; message: string; pushed: boolean }`. It comes from
-  `git log -1 --format=%H%x00%B`, and is absent in a repository with no
-  commit. `pushed` is true when an upstream exists and ahead is 0. Amend uses
-  it to prefill the message and to decide whether to warn.
-
-The read path (`git status`, `git diff` when the panel opens or refreshes) keeps
-its current hardening. Those queries run automatically, without a click, so
-opening the panel on a freshly cloned repository still cannot execute the
-repository's code. Only the explicit write actions below run git unmodified.
-
-### Write operations (`src/web/project-git-write.ts`, new)
-
-One exported function per action. They share a small runner,
-`runGitCommand(root, args, { timeoutMs })`, separate from the hardened read
-runner. It spawns `git <args>` with `cwd` = project root, the host process
-environment plus `GIT_TERMINAL_PROMPT=0`, stdin closed, and **no** `-c`
-overrides or extra flags. It captures stdout and stderr together (in order)
-and the exit code. Every path from the client passes through `contain()` and
-is placed after `--`, so a path outside the project is refused before git runs
-and a path can never be read as an option.
-
-| Action | Body | Git |
+| Operation | Command | Zed |
 |---|---|---|
-| `stage` | `{ paths }` or `{ all: true }` | `add -- <paths>` / `add -A` |
-| `unstage` | `{ paths }` or `{ all: true }` | `restore --staged -- <paths>`; with no HEAD, `rm --cached -r -- <paths>`; `all` uses `.` |
-| `discard` | `{ paths }` or `{ all: true }` | tracked: `restore --source=HEAD --staged --worktree -- <paths>`; a file added in the index with no HEAD version: `rm -f -- <path>`; a rename restores both paths. `all` covers tracked files only |
-| `trash` | `{ paths }` or `{ all: true }` | `clean -f -- <paths>` (untracked files only; `all` means every untracked file) |
-| `commit` | `{ message, amend?, tracked? }` | `commit -m <message>` plus `--amend` and/or `-a`. An empty or whitespace-only message is refused with 400 |
-| `fetch` | none | `fetch --prune <remote>` |
-| `pull` | none | `pull --ff-only`. A diverged branch fails with "Branches have diverged; merge or rebase from the Terminal." |
-| `push` | `{ force?: 'with-lease' }` | `push`; `push -u <remote> <branch>` when there is no upstream; `--force-with-lease` when asked |
+| Stage paths | `git update-index --add --remove -- <paths>` | `repo.rs:2569` |
+| Unstage paths | `git reset --quiet -- <paths>` | `repo.rs:2596` |
+| Stage All | stage every entry not fully staged | `store.rs:8234` |
+| Unstage All | unstage every entry not fully unstaged | `store.rs:8268` |
+| Discard (tracked) | unstage the staged ones, then `git checkout HEAD -- <paths>` | `panel.rs:2899`, `:3036`, `repo.rs:1602` |
+| Trash (untracked) | move each file to the OS trash | `panel.rs:3011`, `:3162` |
+| Commit | `git commit --quiet -m <msg> --cleanup=strip [--amend] [--signoff] [--no-verify]` | `repo.rs:2759` |
+| Commit Tracked | stage all tracked (non-created) entries, then Commit | `panel.rs:3915` |
+| Uncommit | `git reset --soft HEAD^`; the old message returns to the editor | `panel.rs:3963`, `repo.rs:1573` |
+| Fetch | `git fetch --all` | `ui.rs:196`, `repo.rs:2917` |
+| Fetch From | remote picker (adds "--all" when more than one), then `git fetch <remote>` | `panel.rs:4460` |
+| Pull | `git pull <remote> [<branch> if no upstream]` | `panel.rs:4653`, `repo.rs:2874` |
+| Pull (Rebase) | same with `--rebase` | same |
+| Push | `git push [--set-upstream] <remote> <branch>:<upstream-branch or branch>` | `panel.rs:4717`, `repo.rs:2830` |
+| Push To | remote picker, then Push | `ui.rs:220` |
+| Force Push | `git push --force-with-lease …` | same |
 
-Every action answers `{ status: GitStatusReport, run: GitRun }`, where
-`GitRun = { command: string; output: string; exitCode: number }`. `command` is
-the display form (`git commit -m "…"`, message shortened), `output` is the
-combined stdout/stderr capped to its last 64 KB. The panel updates from
-`status` without a second request and shows `run` as described under Web
-client. A non-zero exit is still a 200-family answer carrying the run, except
-for the mapped cases in Errors below; the status is re-read either way, since
-a failed hook or a rejected push can leave the tree changed.
+**Remote resolution** (`store.rs:9134`):
 
-**Environment.** The server process's environment is used as is. A hook that
-needs tools found only on the login shell's `PATH` (for example `pnpm` from a
-version manager) fails if the harness was started without that `PATH`; the
-hook's own output says so in the panel. The Terminal tab is the fallback.
+- Push uses `git rev-parse --abbrev-ref <branch>@{push}`.
+- Pull uses `git config --get branch.<branch>.remote`.
+- If neither gives a remote, list all remotes (`git remote -v`) and show the
+  picker. A picker with one option picks it without showing.
+- `--set-upstream` is used when there is no upstream or the upstream is gone.
 
-**Timeouts.** `stage`, `unstage`, `discard`, `trash`: 30 s. `commit`, `fetch`,
-`pull`, `push`: 10 min, because hooks may run tests or linters. A timeout kills
-the process and reports "git did not finish in N (a hook still running, or
-waiting for a password?)".
+**OS trash** (Zed `fs.trash`): Node has no built-in, so a small
+`trashPath(path)` per platform:
 
-**Serialization.** A per-project-root promise queue runs one panel action at a
-time. Git's own `index.lock` still guards against the agent or a terminal
-running git at the same moment (see Errors).
+- macOS: Finder `delete` via `osascript`;
+- Linux: `gio trash`;
+- Windows: `Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile` with
+  `SendToRecycleBin`.
 
-**Errors.** Invalid input (bad body, path outside the project, empty message)
-answers 400 before git runs. When git runs and exits non-zero, the route answers
-200 with `run.exitCode ≠ 0` and the fresh status, so the UI always gets git's
-real output, hook output included. Two failures are recognised from git's text
-only to add a hint: `index.lock` ("another git process is using this
-repository; try again") and a non-fast-forward pull ("branches have diverged;
-merge or rebase from the Terminal"). Launch failures (git missing, timeout)
-answer 502.
+## 6. Askpass (`repo.rs:4047`, `askpass.rs`)
 
-### Route (`src/web/server.ts`)
+Commit, Fetch, Pull and Push run with askpass. For each operation the server:
 
-`POST /api/workspaces/:wid/projects/:pid/git/:action`, where `:action` is one of
-`stage|unstage|discard|trash|commit|fetch|pull|push` and the body is JSON. It
-sits next to the existing read-only route, uses `requireWorkspace(…, true)`
-(active workspace), and goes through the same CSRF and origin checks as every
-other POST. Other methods answer 405 and an unknown action answers 404. The
-`GET …/git` route is unchanged.
+1. Creates a temporary directory with a Unix socket (a named pipe on Windows)
+   and an executable `askpass.sh`. The script is
+   `printf '%s\0' "$@" | <node> <askpass-client> --askpass=<socket>`, the same
+   shape as `generate_askpass_script` (`askpass.rs:480`). The client sends the
+   prompt over the socket and prints the answer.
+2. Sets `GIT_ASKPASS` and `SSH_ASKPASS` to the script and
+   `SSH_ASKPASS_REQUIRE=force`.
+3. If `GIT_CONFIG_COUNT` is not already in the environment, sets
+   `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=gpg.program` and
+   `GIT_CONFIG_VALUE_0=<gpg-wrapper.sh>`. The wrapper is a port of
+   `generate_gpg_wrapper_script` (`askpass.rs:505`): only signing calls are
+   intercepted. It tries `--pinentry-mode error`, then the default pinentry,
+   then loopback with the passphrase from askpass.
+4. Push runs with stdin closed.
 
-## Web client
+**Prompts reach the browser through the action's response.** The POST
+answers `application/x-ndjson`:
 
-- `web/lib/api.ts`: the new fields on `GitChange` and `GitStatusReport`, the
-  `GitRun` type, plus
-  `gitAction(workspaceId, projectId, action, body?) → Promise<{ status; run }>`.
-- **Command output.** After an action the footer shows a one-line result:
-  the command and a check or cross. A failed run (`exitCode ≠ 0`) expands
-  automatically into an output box above the footer with the full text (hook
-  messages, push rejection, author identity hints), monospace and scrollable,
-  with a dismiss button. A successful run with output (pre-commit summary, push
-  URL) can be expanded from the footer line. Only the last run is kept.
-- `GitPanel.tsx` stays the container (loading, focus, filter, report state) and
-  is split so no file carries everything:
-  - `GitChangeList.tsx`: groups, rows, checkboxes, row menu, inline diff;
-  - `GitCommitBox.tsx`: message, Commit/Commit Tracked/Amend;
-  - `GitRemoteBar.tsx`: branch and the remote split button;
-  - `git-panel-model.ts`: pure helpers (grouping, the header action label, the
-    footer primary action, checkbox state) with unit tests.
-- **Busy state.** One action at a time from the panel. While it runs, controls
-  are disabled and the clicked button shows a spinner. A network action also
-  shows "Pushing…", "Pulling…" or "Fetching…" in the footer.
-- **Confirmations** use `ConfirmDialog`:
-  - Discard: "Discard changes to N files? This cannot be undone." with the
-    file names when there are 5 or fewer;
-  - Trash: "Permanently delete N untracked files?";
-  - Push: "Push N commits to `<upstream>`?", or "Publish `<branch>` to
-    `<remote>`?";
-  - Force push: danger tone, naming the branch;
-  - Amend when `head.pushed`: "The last commit is already pushed. Amending
-    rewrites it and the next push will need Force Push."
-- **Refresh.** After every action (from its response), on the refresh button,
-  and when the window regains focus while the panel is mounted. The commit
-  message survives refreshes and is cleared only after a successful commit.
+```
+{"type":"askpass","promptId":"…","operation":"git push origin","prompt":"Password for 'https://…':"}
+{"type":"done","ok":true,"stdout":"…","stderr":"…","status":{…}}
+```
 
-## Error handling summary
+The panel shows an askpass modal (Zed `AskPassModal`): the operation name, the
+prompt and a password field. The answer goes to
+`POST …/git/askpass/:promptId { password }`. **Cancel** sends `{ cancel: true }`,
+which kills git and ends the stream with `{"type":"done","ok":false,"cancelled":true}`
+(Zed `REMOTE_CANCELLED_BY_USER`). The password is never logged or stored.
 
-| Case | Result |
+## 7. HTTP API
+
+```
+POST /api/workspaces/:wid/projects/:pid/git/:op            (NDJSON response)
+POST /api/workspaces/:wid/projects/:pid/git/askpass/:promptId
+```
+
+`:op` is one of `stage`, `unstage`, `stage-all`, `unstage-all`, `discard`,
+`trash`, `commit`, `uncommit`, `fetch`, `pull`, `push`, `remotes`, `pushed-to`.
+
+- `remotes` lists the remotes for a picker.
+- `pushed-to` lists the remote refs that contain HEAD:
+  `git for-each-ref --format=%(refname) --contains HEAD refs/remotes/`,
+  dropping `*/HEAD` (`repo.rs:3055`).
+
+Bodies carry `paths`, `message`, `amend`, `signoff`, `noVerify`, `remote`,
+`rebase`, `force`, `all`. Paths pass through `contain()`. Auth and CSRF are the
+same as every other POST. The final `done` frame carries a fresh status report.
+
+`GET …/git` and `GET …/git?path=` (status and diff) stay. They now use the
+section 1 builder and the section 4 status shape.
+
+## 8. Panel UI
+
+**Header** (`panel.rs:6670`, `:6637`):
+
+- `Changes (N)` and the total `+added −removed`.
+- A split button. Its main action is **Stage All**, or **Unstage All** when
+  nothing is unstaged (`primary_changes_action_stages`, `panel.rs:6031`). It is
+  disabled with no entries.
+- Its menu (`panel.rs:301`, stash entries omitted): Stage All, Unstage All,
+  Restore All Changes, then a separator, then Discard Tracked Changes and
+  Trash Untracked Files. Each entry is disabled when it does not apply.
+
+**List:**
+
+- Section headers carry a checkbox that stages or unstages the section
+  (`panel.rs:3389`).
+- Rows have a checkbox with three states. Toggle rules follow
+  `toggle_staged_for_entry` (`panel.rs:3355`).
+- Rows have a context menu: Stage/Unstage, Discard Changes / Restore File /
+  Trash, and Open File.
+- The existing inline diff on click stays.
+
+**Commit area** (`panel.rs:6765`):
+
+- A multi-line message editor.
+- A split **Commit** button. Its title and disabled reasons are ported as is
+  (`configure_commit_button`, `panel.rs:6501`):
+  - "You must resolve conflicts before committing";
+  - "No changes to commit";
+  - "Commit in progress";
+  - "No commit message".
+
+  The title is Commit / Commit Tracked / Amend / Amend Tracked
+  (`panel.rs:6519`).
+- Its menu (`panel.rs:6423`) has three toggles: **Amend** (shown only with a
+  previous commit), **Signoff** (remembered for the panel), and **Skip Hooks**
+  (`git commit --no-verify`, reset after each successful commit).
+- Amend on: the editor's text is saved, and HEAD's message is loaded.
+  Amend off: the saved text returns (`panel.rs:9099`, `:9234`).
+- After a successful commit the editor is cleared. After an amend, amend
+  mode is turned off.
+- Commit with unstaged conflicts shows "There are still conflicts. You must
+  stage these before committing".
+- Below the editor: the last commit's subject, plus an **Uncommit** icon when
+  the commit has a parent (`panel.rs:7080`). If `pushed-to` is not empty, it
+  asks "Are you sure?" with "This commit was already pushed to …"
+  (`panel.rs:4007`).
+
+**Footer:**
+
+- Branch name.
+- The remote split button (`ui.rs:944`):
+
+  | Upstream | Button |
+  |---|---|
+  | tracked, 0/0 | Fetch |
+  | tracked, ahead only | Push ↑n |
+  | tracked, behind (any ahead) | Pull ↑n ↓m |
+  | gone | Republish |
+  | none | Publish |
+
+- The menu (`ui.rs:1186`): Fetch, Fetch From, Pull, Pull (Rebase), then a
+  separator, then Push, Push To, Force Push.
+- While a remote operation runs, the button shows a spinner with "Fetch / Pull
+  / Push in Progress…". Only one remote operation runs at a time
+  (`panel.rs:4944`).
+
+**Confirmations.** Only these, as Zed (`panel.rs:2899`, `:3111`, `:3162`):
+
+- A single file:
+  - "Are you sure you want to discard changes to `x`?" with Discard Changes;
+  - "Are you sure you want to restore `x`?" with Restore File (for a deleted
+    file);
+  - "Trash `x`?" with Trash.
+- Several files:
+  - "Discard changes to N files?";
+  - "Trash N files?";
+  - "Discard changes to N files and trash M files?";
+  - for the menu actions, "Discard changes to these files?" and "Trash these
+    files?" with up to 5 names and "and N more…".
+- Uncommit of a pushed commit.
+
+Push and Force Push do **not** ask.
+
+**Output** (`out.rs`, `panel.rs:6155`):
+
+- A failed operation shows an error toast with git's stderr.
+- A successful remote operation shows a toast. The texts are ported verbatim:
+  - "Fetch: Already up to date" / "Synchronized with remotes";
+  - "Pull: Already up to date" / "Received N file changes from X" /
+    "Fast forwarded from X" / "Merged …" / "Successfully rebased from X";
+  - "Push: Everything is up-to-date" / "Pushed B to X".
+- A toast "with log" offers **View Log**, which shows stdout and stderr in a
+  dialog.
+- After a push, a `remote:` line with a GitHub, GitLab or Bitbucket PR/MR URL
+  becomes a **Create Pull Request** / **Create Merge Request** /
+  **View Merge Request** button in the toast (`extract_pull_request_link`).
+
+## 9. Files
+
+| File | Change |
 |---|---|
-| Path outside the project or denied | 400, nothing runs |
-| Empty commit message | 400; the button is also disabled client-side |
-| Pre-commit / commit-msg / pre-push hook fails | run with exit ≠ 0, hook output shown, message kept in the box |
-| Nothing to commit, missing author identity | run with git's own message |
-| `index.lock` held | run with git's message plus the retry hint |
-| Diverged on pull | run with git's message plus the Terminal hint |
-| Auth or network failure, rejected push | run with git's message |
-| git missing, timeout | 502 with the hint |
+| `src/web/project-git.ts` | builder (section 1), env loader (section 2), status (section 4) |
+| `src/web/project-git-ops.ts` (new) | operations, job queue, remote resolution, trash |
+| `src/web/git-askpass.ts` + `src/web/git-askpass-client.mjs` (new) | socket, scripts, gpg wrapper, prompt registry |
+| `src/harness/workspace/types.ts` | `gitTrusted?` on `ProjectRecord` |
+| `src/web/server.ts` | POST routes, NDJSON streaming, PATCH `gitTrusted` |
+| `web/lib/api.ts` | types, `gitOperation()` NDJSON reader, `answerAskpass()` |
+| `web/lib/git-remote-output.ts` (new) | port of `out.rs` |
+| `web/components/workbench/GitPanel.tsx` + `GitChangeList.tsx`, `GitCommitArea.tsx`, `GitRemoteButton.tsx`, `GitAskpassModal.tsx`, `git-panel-model.ts` (new) | UI |
+| `docs/web.md` | Git route rows and the Git paragraph |
 
-## Testing
+## 10. Testing
 
-- `tests/web/project-git-write.spec.ts` uses temporary repositories and a local
-  bare remote. It covers stage/unstage (paths and all, and a repository with
-  no commit), partial staging in status, commit, Commit Tracked, amend,
-  discard (modified, staged-new, renamed, all tracked), trash, path escape
-  refusal, a path that looks like an option (`-rf`) staying a path,
-  fetch/pull/push/publish, pull `--ff-only` divergence, and force-with-lease.
-- Hooks run: a failing `pre-commit` hook blocks the commit and its output
-  reaches `run.output`; a passing one lets it through; a `commit-msg` hook can
-  rewrite the message. Repository config applies (for example `user.name` from
-  the repo config appears on the commit).
-- `tests/web/project-git-hardening.spec.ts` keeps proving that the automatic
-  read path (status, diff) still runs no hooks, fsmonitor or textconv.
-- A server route test covers 405, 404 for an unknown action, 400 for a bad
-  body, and a POST returning `{ status, run }` both for exit 0 and exit ≠ 0.
-- Web: `git-panel-model.spec.ts` for the pure helpers. The existing
-  `git-panel-filter.spec.tsx` is extended for grouping, checkbox states,
-  filtered-mode hiding of the commit box and footer, and confirmations.
-- Verification: affected tests, `pnpm test`, `pnpm run typecheck`,
-  `pnpm run build:web`, and a manual pass in the browser on this repository.
+- **`project-git-ops.spec.ts`** uses temporary repositories and a local bare
+  remote. It covers:
+  - every operation in the section 5 table;
+  - optimistic revert on failure;
+  - remote resolution (push remote, branch remote, picker);
+  - Publish and Republish;
+  - `--force-with-lease`;
+  - trash moving a file out of the tree.
+- **Trust tests:**
+  - An untrusted project runs no `pre-commit` hook and ignores
+    `credential.helper`.
+  - A trusted project runs the hook, and the hook's failure output reaches the
+    error.
+- **Askpass test:** a fake `GIT_ASKPASS`-driven remote (an HTTP remote served
+  by a test server requiring basic auth). It covers prompt, answer, and
+  cancel killing git.
+- **Environment test:** a login-shell variable is visible to a hook.
+- **`git-remote-output.spec.ts`:** the Zed `out.rs` test cases ported
+  verbatim.
+- **`git-panel-model.spec.ts`:**
+  - commit button title and disabled reasons;
+  - remote button choice;
+  - primary changes action;
+  - section membership;
+  - confirmation texts.
+- **Existing hardening tests** are rewritten against the untrusted builder.
+- **Verification:** affected tests, `pnpm test`, `pnpm run typecheck`,
+  `pnpm run build:web`, and a manual pass on this repository.
 
-## Documentation
+## Known behaviour changes from today
 
-- `docs/web.md`: the route table row for git (line 187), the workbench
-  component row (line 867), and the Git paragraph (line 931) no longer say
-  "read-only / never stages, commits, or discards". The text explains the split:
-  automatic reads are hardened, explicit actions run git as typed, with hooks.
-- The header comment of `src/web/project-git.ts` points to the write module.
-
-## Non-goals
-
-- History tab, commit details, branch switching or creation, stash.
-- Hunk- or line-level staging.
-- A project-wide combined diff view ("View Diff").
-- Interactive credential or passphrase prompts in the browser, merge or rebase
-  on pull, conflict resolution editor.
-- Live file-watch refresh (refresh is on action, button and window focus).
+- Trusted projects run git with no hardening beyond fsmonitor, the pager and
+  optional locks. Hooks, credential helpers and custom diff tools run, as in a
+  terminal.
+- Untrusted diffs no longer pass `--no-textconv`; Zed does not. A
+  repository's `textconv` driver could run on diff in an untrusted project.
+  This is a Zed parity gap that we inherit.
