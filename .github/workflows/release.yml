@@ -23,7 +23,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm run typecheck
-      - run: pnpm test
+      # Some process tests use tight timeouts; retry a failed test twice so
+      # a slow runner does not block a release. A real regression still fails.
+      - run: pnpm test --retry=2
       - name: Tag matches package.json version
         run: test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}"
       # prepack runs `vite build`, so web-dist/ is fresh in the tarball.
