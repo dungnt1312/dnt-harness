@@ -22,6 +22,9 @@ import { isBundledExplorer, isMcpSelector, matchesMcpEntry } from '../harness/ag
 /** Plan-mode read-safe name prefix heuristic (not a side-effect guarantee). */
 export const READ_SAFE_TOOL_NAME = /^(read|get|list|search|query|fetch|inspect|describe)/i
 
+/** Longest a spawn admission waits for a workspace MCP connect. */
+export const ADMISSION_MCP_WAIT_MS = 5_000
+
 /** Bound on versioned-snapshot retries before failing closed. */
 export const EXPOSURE_SNAPSHOT_ATTEMPTS = 3
 
@@ -85,7 +88,15 @@ export interface ExposureDeps {
    * Live MCP tool names for selector expansion at spawn admission. Absent:
    * selectors expand to nothing (fail-closed).
    */
-  readonly mcpToolNames?: (workspaceId: string) => Promise<readonly string[]>
+  readonly mcpToolNames?: (workspaceId: string) => readonly string[] | Promise<readonly string[]>
+  /**
+   * Start or join this workspace's MCP connect before reading live tools.
+   * Admission waits at most {@link admissionMcpWaitMs}; a slower server's
+   * tools are left out of that child rather than stalling the spawn.
+   */
+  readonly connectMcp?: (workspaceId: string) => Promise<void>
+  /** Bound on the admission wait for `connectMcp` (default {@link ADMISSION_MCP_WAIT_MS}). */
+  readonly admissionMcpWaitMs?: number
 }
 
 export interface ParsedMcpName {
@@ -251,11 +262,25 @@ export function createExecutionAuthority(deps: ExposureDeps): ExecutionAuthority
     },
     async admissionCeiling({ workspaceId, rootSessionId, definition, definitionSource, candidates }) {
       const scope: ExposureScope = { workspaceId, sessionId: rootSessionId, rootSessionId, childOf: { definition, definitionSource } }
-      const selectors = candidates.filter(isMcpSelector)
-      const live = selectors.length > 0 && deps.mcpToolNames !== undefined ? await deps.mcpToolNames(workspaceId) : []
+      // Every MCP entry (selector or concrete name) resolves against the live
+      // tool list, so a disconnected server's tools are never pinned. Without
+      // a live source, selectors expand to nothing and concrete names pass on
+      // to the predicate (hermetic callers).
+      const mcpEntries = candidates.filter((name) => name.startsWith('mcp__'))
+      if (mcpEntries.length > 0 && deps.connectMcp !== undefined) {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        await Promise.race([
+          deps.connectMcp(workspaceId).catch(() => {}),
+          new Promise<void>((resolve) => { timer = setTimeout(resolve, deps.admissionMcpWaitMs ?? ADMISSION_MCP_WAIT_MS) }),
+        ])
+        clearTimeout(timer)
+      }
+      const live = mcpEntries.length > 0 && deps.mcpToolNames !== undefined ? await deps.mcpToolNames(workspaceId) : undefined
       const expanded = [...new Set([
-        ...candidates.filter((name) => !isMcpSelector(name)),
-        ...live.filter((name) => selectors.some((selector) => matchesMcpEntry(selector, name))),
+        ...candidates.filter((name) => !name.startsWith('mcp__')),
+        ...(live !== undefined
+          ? live.filter((name) => mcpEntries.some((entry) => matchesMcpEntry(entry, name)))
+          : mcpEntries.filter((name) => !isMcpSelector(name))),
       ])]
       if (!expanded.some((name) => name.startsWith('mcp__'))) {
         const resolved = await snapshot(scope, workspaceId, false)

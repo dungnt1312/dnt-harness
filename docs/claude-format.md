@@ -173,8 +173,9 @@ Format: Claude Code subagent Markdown with YAML frontmatter.
 - `tools` / `disallowedTools`: comma string or list. **Omitted `tools` inherits
   every tool** the conversation exposes (never `Agent`: children do not
   delegate); such a role also inherits the parent's MCP tools (`mcpServers`
-  limits them to named servers). Explicit `tools` may list
-  `mcp__server__tool` or `mcp__server__*`. Claude names map (`Task`→`Agent`,
+  limits them to named servers; `tools: "*, mcp__x__*"` keeps every built-in
+  but only the listed MCP). Explicit `tools` may list `mcp__server__tool`,
+  `mcp__server__*` or `mcp__*`. Claude names map (`Task`→`Agent`,
   `MultiEdit`→`Edit`, `LS`→`Glob`, `Bash(git:*)`→`Bash`); names dnt-harness lacks (`WebFetch`, `WebSearch`,
   `NotebookEdit`, team tools…) are dropped with a warning — narrowing only.
 - `model`: `inherit`, an alias (`sonnet` / `opus` / `haiku` → the first served

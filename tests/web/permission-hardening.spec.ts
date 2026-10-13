@@ -198,6 +198,44 @@ describe('resolver contract (hermetic; wiring is covered by the real-host suites
       .toEqual(['Read'])
   })
 
+  it('admissionCeiling drops concrete MCP names that are not live (server down or tool gone)', async () => {
+    const authority = createExecutionAuthority({
+      blockedTools: [],
+      modeOf: () => ({ mode: FULL, revision: 1 }),
+      loadMcp: async () => config([server('s', true)]),
+      mcpToolNames: async () => ['mcp__s__get_item'],
+    })
+    expect(await authority.admissionCeiling({ workspaceId: 'w', rootSessionId: 'r', definition: 'worker', definitionSource: 'workspace', candidates: ['Read', 'mcp__s__get_item', 'mcp__s__delete_item'] }))
+      .toEqual(['Read', 'mcp__s__get_item'])
+  })
+
+  it('admissionCeiling waits for the MCP connect only up to its bound, then uses the tools already live', async () => {
+    let live = ['mcp__s__get_item']
+    const authority = createExecutionAuthority({
+      blockedTools: [],
+      modeOf: () => ({ mode: FULL, revision: 1 }),
+      loadMcp: async () => config([server('s', true), server('slow', true)]),
+      connectMcp: () => new Promise<void>(() => {}),
+      mcpToolNames: () => live,
+      admissionMcpWaitMs: 50,
+    })
+    const started = Date.now()
+    expect(await authority.admissionCeiling({ workspaceId: 'w', rootSessionId: 'r', definition: 'scout', definitionSource: 'workspace', candidates: ['Read', 'mcp__*'] }))
+      .toEqual(['Read', 'mcp__s__get_item'])
+    expect(Date.now() - started).toBeLessThan(1_000)
+    // A connect that settles inside the bound is waited for.
+    const settles = createExecutionAuthority({
+      blockedTools: [],
+      modeOf: () => ({ mode: FULL, revision: 1 }),
+      loadMcp: async () => config([server('s', true), server('slow', true)]),
+      connectMcp: async () => { live = [...live, 'mcp__slow__get_item'] },
+      mcpToolNames: () => live,
+      admissionMcpWaitMs: 1_000,
+    })
+    expect(await settles.admissionCeiling({ workspaceId: 'w', rootSessionId: 'r', definition: 'scout', definitionSource: 'workspace', candidates: ['mcp__*'] }))
+      .toEqual(['mcp__s__get_item', 'mcp__slow__get_item'])
+  })
+
   it('admissionCeiling under Plan keeps only read-safe allowlisted MCP', async () => {
     const authority = createExecutionAuthority({
       blockedTools: [],
@@ -679,7 +717,38 @@ describe('real host spawn-admission ceiling (executor admissionResolver -> share
     expect(worker.error).toMatch(/granted MCP tools are not available to 'mcp-worker': mcp__fixture__explode/)
     const explorer = await runChild({ rootMode: 'full-access', role: 'explorer', grantTools: ['Read', 'mcp__fixture__query'], calls: [] })
     expect(explorer.status).toBe(400)
+    const typo = await runChild({ rootMode: 'full-access', role: 'scout', grantTools: ['Read', 'mcp__fixtrue__*'], calls: [] })
+    expect(typo.status).toBe(400)
+    expect(typo.error).toMatch(/mcp__fixtrue__\*/)
   }, 60_000)
+
+  it('a granted MCP tool of a server that failed to connect fails the spawn with 400', async () => {
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() {
+        yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const { base, wsId } = await bootPlan(provider, undefined, { modeId: 'full-access' })
+    expect((await post(base, `/api/workspaces/${wsId}/mcp/dead`, {
+      transport: 'stdio', command: process.execPath, args: ['-e', 'process.exit(1)'], enabled: true,
+    })).status).toBe(201)
+    // Enabling commits the config; the connect itself fails (502).
+    expect((await post(base, `/api/workspaces/${wsId}/mcp/dead/enable`)).status).toBe(502)
+    const rows = (await (await fetch(`${base}/api/workspaces/${wsId}/mcp`)).json()) as { name: string; enabled: boolean }[]
+    expect(rows.find((row) => row.name === 'dead')?.enabled).toBe(true)
+    expect((await post(base, `/api/workspaces/${wsId}/agents/dead-worker/import`, {
+      dialect: 'dnt-harness', content: ['---', 'description: "lists a dead server tool"', 'tools: Read, mcp__dead__query, mcp__fixture__query', '---', 'Go.'].join('\n'),
+    })).status).toBe(201)
+    const root = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    const spawned = await post(base, `/api/workspaces/${wsId}/agents/dead-worker`, { rootSessionId: root.id, task: { prompt: 'Go.' }, grantTools: ['Read', 'mcp__dead__query'] })
+    expect(spawned.status).toBe(400)
+    expect(((await spawned.json()) as { error: string }).error).toMatch(/mcp__dead__query/)
+    // Without the grant the role spawns; the dead server's tool is simply absent.
+    const ok = await post(base, `/api/workspaces/${wsId}/agents/dead-worker`, { rootSessionId: root.id, task: { prompt: 'Go.' } })
+    expect(ok.status).toBe(202)
+  }, 40_000)
 
   it('a malformed MCP config degrades an inheriting role to no MCP instead of failing the spawn', async () => {
     const provider: LlmProvider = {

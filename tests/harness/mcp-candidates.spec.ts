@@ -38,6 +38,11 @@ describe('roleCandidates', () => {
     expect(roleCandidates(def({ inheritsTools: true, mcpServers: ['a', 'b'] }), 'workspace'))
       .toEqual(['Read', 'Grep', 'mcp__a__*', 'mcp__b__*'])
   })
+  it('inherit role that also lists MCP entries (tools: *, mcp__x__*) gets only those, plus mcpServers', () => {
+    expect(roleCandidates(def({ inheritsTools: true, tools: ['Read', 'mcp__x__*'] }), 'workspace')).toEqual(['Read', 'mcp__x__*'])
+    expect(roleCandidates(def({ inheritsTools: true, tools: ['Read', 'mcp__x__get'], mcpServers: ['y'] }), 'workspace'))
+      .toEqual(['Read', 'mcp__x__get', 'mcp__y__*'])
+  })
   it('explicit role keeps only what it lists', () => {
     expect(roleCandidates(def({ tools: ['Read', 'mcp__s__*', 'mcp__t__get'] }), 'project'))
       .toEqual(['Read', 'mcp__s__*', 'mcp__t__get'])
@@ -70,8 +75,10 @@ describe('narrowCeiling', () => {
 })
 
 describe('missingGrantedMcp', () => {
-  it('lists concrete granted MCP names absent from the ceiling; selectors never fail', () => {
-    expect(missingGrantedMcp(['Read', 'mcp__s__get', 'mcp__x__y', 'mcp__z__*'], ['Read', 'mcp__s__get'])).toEqual(['mcp__x__y'])
+  it('lists granted MCP names absent from the ceiling and granted selectors that match nothing', () => {
+    expect(missingGrantedMcp(['Read', 'mcp__s__get', 'mcp__x__y', 'mcp__z__*', 'mcp__s__*'], ['Read', 'mcp__s__get'])).toEqual(['mcp__x__y', 'mcp__z__*'])
+    expect(missingGrantedMcp(['mcp__*'], ['Read'])).toEqual(['mcp__*'])
+    expect(missingGrantedMcp(['mcp__*'], ['mcp__s__get'])).toEqual([])
     expect(missingGrantedMcp(undefined, [])).toEqual([])
   })
 })

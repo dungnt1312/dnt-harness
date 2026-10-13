@@ -195,7 +195,11 @@ export function parseAgentDefinition(fallbackName: string, raw: string): AgentDe
   // Omitted (or `*`) = inherit all tools, as in Claude Code. A child never
   // delegates further, so `Agent` is never part of an inherited set.
   const inherits = declaredTools === undefined || toolList(frontmatter['tools'], 'tools', [])?.includes('*') === true
-  const tools = inherits ? KNOWN_MODE_TOOLS.filter((tool) => tool !== 'Agent') : declaredTools
+  // `tools: *, mcp__x__*` inherits every built-in but keeps the listed MCP
+  // entries, which then restrict the inherited MCP to exactly those.
+  const tools = inherits
+    ? [...KNOWN_MODE_TOOLS.filter((tool) => tool !== 'Agent'), ...(declaredTools ?? []).filter((tool) => tool.startsWith('mcp__'))]
+    : declaredTools
 
   const skills = toolList(frontmatter['skills'], 'skills', invalid)
   const mcpServers = toolList(frontmatter['mcpServers'], 'mcpServers', invalid)
@@ -514,7 +518,12 @@ export function serializeAgentDefinition(definition: Pick<AgentDefinition, 'name
     `name: ${quote(definition.name)}`,
     `description: ${quote(definition.description)}`,
     // Omitted = inherit all; an explicit empty ceiling must stay explicit.
-    ...(definition.inheritsTools === true ? [] : [`tools: ${definition.tools.length > 0 ? definition.tools.join(', ') : '[]'}`]),
+    ...(definition.inheritsTools === true
+      ? (() => {
+          const mcp = definition.tools.filter((tool) => tool.startsWith('mcp__'))
+          return mcp.length > 0 ? [`tools: ${quote(['*', ...mcp].join(', '))}`] : []
+        })()
+      : [`tools: ${definition.tools.length > 0 ? definition.tools.join(', ') : '[]'}`]),
     ...(definition.disallowedTools.length > 0 ? [`disallowedTools: ${definition.disallowedTools.join(', ')}`] : []),
     ...(definition.skills !== undefined && definition.skills.length > 0 ? [`skills: ${definition.skills.join(', ')}`] : []),
     ...(definition.mcpServers !== undefined && definition.mcpServers.length > 0 ? [`mcpServers: ${definition.mcpServers.join(', ')}`] : []),

@@ -180,6 +180,13 @@ describe('agent definitions', () => {
     })
     const explicit = parseAgentDefinition('explorer', '---\ndescription: e\ntools: Read, Grep, mcp__codebase-retrieval__*\n---\nGo.')
     expect(explicit.tools).toEqual(['Read', 'Grep', 'mcp__codebase-retrieval__*'])
+    const star = parseAgentDefinition('star', '---\ndescription: s\ntools: "*, mcp__context7__*"\n---\nGo.')
+    expect(star.inheritsTools).toBe(true)
+    expect(star.tools).toContain('Write')
+    expect(star.tools).toContain('mcp__context7__*')
+    const again = parseAgentDefinition('star', serializeAgentDefinition(star))
+    expect(again.inheritsTools).toBe(true)
+    expect(again.tools).toEqual(star.tools)
   })
 
   it('cleans a stripped Examples tail and reports dropped tools as a list', async () => {

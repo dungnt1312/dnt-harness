@@ -2693,11 +2693,11 @@ ${entry.description}`.toLowerCase().includes(query))
       return { mode: mode.definition, revision }
     },
     loadMcp: (workspaceId) => mcpStore.loadMcp(workspaceId),
-    mcpToolNames: async (workspaceId) => {
-      // Admission waits for this workspace's MCP connect, like a root turn's
-      // pre-step: a child must not pin an empty MCP set because the servers
-      // were still starting. A failed connect leaves that server's tools out.
-      await connectWorkspaceMcp(workspaceId as WorkspaceId).catch(() => {})
+    // Admission joins this workspace's MCP connect (bounded), like a root
+    // turn's pre-step: a child must not pin an empty MCP set because the
+    // servers were still starting. A failed or slow server's tools are left out.
+    connectMcp: (workspaceId) => connectWorkspaceMcp(workspaceId as WorkspaceId),
+    mcpToolNames: (workspaceId) => {
       const prefix = `${workspaceId}:`
       return [...mcpDescriptors.keys()].filter((key) => key.startsWith(prefix)).map((key) => key.slice(prefix.length))
     },

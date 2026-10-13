@@ -34,16 +34,19 @@ export function isBundledExplorer(name: string, source: AgentSource | undefined)
 
 /**
  * Built-ins plus MCP entries a role can ever hold (selectors unexpanded).
- * An inheriting role (Claude: `tools` omitted) gets every MCP tool, or only
- * its `mcpServers`' tools; an explicit role keeps exactly what it lists.
+ * An inheriting role (Claude: `tools` omitted or `*`) gets every MCP tool,
+ * unless it names MCP entries in `tools` or `mcpServers` — then exactly
+ * those. An explicit role keeps exactly what it lists.
  */
 export function roleCandidates(definition: AgentDefinition, source: AgentSource | undefined): readonly string[] {
   const builtIns = definition.tools.filter((tool) => !isMcp(tool))
   if (isBundledExplorer(definition.name, source)) return builtIns
   if (definition.inheritsTools !== true) return [...definition.tools]
-  const servers = definition.mcpServers
-  const mcp = servers !== undefined && servers.length > 0 ? servers.map((server) => `mcp__${server}__*`) : ['mcp__*']
-  return [...builtIns, ...mcp]
+  const named = [
+    ...definition.tools.filter(isMcp),
+    ...(definition.mcpServers ?? []).map((server) => `mcp__${server}__*`),
+  ]
+  return [...builtIns, ...(named.length > 0 ? [...new Set(named)] : ['mcp__*'])]
 }
 
 /**
@@ -61,7 +64,11 @@ export function narrowCeiling(admitted: readonly string[], grant: readonly strin
     !disallowed.some((entry) => entry === tool || matchesMcpEntry(entry, tool)))
 }
 
-/** Concrete `mcp__server__tool` names the grant asked for that the ceiling lacks. */
+/**
+ * MCP entries the grant asked for that the ceiling cannot honor: a concrete
+ * name absent from it, or a selector matching none of its tools (a typo'd
+ * selector would otherwise silently strip every MCP tool).
+ */
 export function missingGrantedMcp(grant: readonly string[] | undefined, ceiling: readonly string[]): string[] {
-  return (grant ?? []).filter((tool) => isMcp(tool) && !isMcpSelector(tool) && !ceiling.includes(tool))
+  return (grant ?? []).filter((entry) => isMcp(entry) && !ceiling.some((tool) => matchesMcpEntry(entry, tool)))
 }
