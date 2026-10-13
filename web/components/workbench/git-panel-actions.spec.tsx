@@ -452,6 +452,23 @@ describe('askpass modal', () => {
     expect(prompt.answers).toEqual([{ cancel: true }])
   })
 
+  it('cancels a prompt that arrives after the panel unmounted, so git is not left waiting', async () => {
+    let askLater!: OnAskpass
+    let finish!: (done: GitOperationDone) => void
+    gitOperation.mockImplementationOnce((_ws, _project, _input, onAskpass) => new Promise<GitOperationDone>((resolve) => {
+      askLater = onAskpass
+      finish = resolve
+    }))
+    await mount()
+    await stageFirst()
+    await act(async () => hidePanel!())
+    expect(host.querySelector('section')).toBeNull()
+    const answer = await askLater({ type: 'askpass', promptId: 'late', operation: 'push', prompt: 'Password:' }, new AbortController().signal)
+    expect(answer).toEqual({ cancel: true })
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    await act(async () => finish({ type: 'done', ok: false, stdout: '', stderr: '', cancelled: true }))
+  })
+
   it('closes itself when the operation ends without an answer', async () => {
     const prompt = promptingOperation('Password:')
     await mount()
@@ -558,14 +575,27 @@ describe('trust banner', () => {
     expect([...document.querySelectorAll('[role="menuitem"]')].map((entry) => entry.textContent)).not.toContain('Restrict Git')
   })
 
-  it('Trust PATCHes the project and drops the banner without a reload', async () => {
+  it('Trust PATCHes the project, drops the banner and reloads the status', async () => {
     const onGitTrustChange = vi.fn()
     await mount({ onGitTrustChange })
+    expect(fetchGitStatus).toHaveBeenCalledTimes(1)
     await click(button('Trust'))
     expect(updateProjectGitTrust).toHaveBeenCalledWith('ws1', 'p1', true)
     expect(document.body.textContent).not.toContain('Restricted Mode')
     expect(onGitTrustChange).toHaveBeenCalledWith(true)
+    expect(fetchGitStatus).toHaveBeenCalledTimes(2)
+  })
+
+  it('Restrict Git reloads the status too, and a failed change does not', async () => {
+    await mount({ project: { id: 'p1', name: 'proj', path: '/proj', gitTrusted: true } })
     expect(fetchGitStatus).toHaveBeenCalledTimes(1)
+    updateProjectGitTrust.mockRejectedValueOnce(new Error('nope'))
+    await click(document.querySelector<HTMLButtonElement>('button[aria-label="Git options"]')!)
+    await click([...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((entry) => entry.textContent === 'Restrict Git')!)
+    expect(fetchGitStatus).toHaveBeenCalledTimes(1)
+    await click(document.querySelector<HTMLButtonElement>('button[aria-label="Git options"]')!)
+    await click([...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((entry) => entry.textContent === 'Restrict Git')!)
+    expect(fetchGitStatus).toHaveBeenCalledTimes(2)
   })
 
   it('a failed Trust keeps the banner and says why', async () => {

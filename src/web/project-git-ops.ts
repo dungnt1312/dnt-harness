@@ -10,7 +10,7 @@
  * they can appear in an argument list, so none of them can become an option.
  */
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { existsSync, realpathSync } from 'node:fs'
+import { existsSync, promises as fsPromises, realpathSync } from 'node:fs'
 import path from 'node:path'
 import { createAskpassSession, type AskpassFrame, type AskpassOwner, type AskpassSession } from './git-askpass.ts'
 import {
@@ -394,8 +394,15 @@ async function trash(ctx: Context, requested: readonly string[], move: (abs: str
   const unstaged = await unstageRels(ctx, paths(entries.filter((entry) => entry.staging !== 'unstaged')))
   if (!unstaged.ok) return unstaged
   for (const entry of entries) {
+    const abs = path.join(ctx.root, entry.path)
+    // An added file deleted from disk (`AD`) is already gone: nothing to move, and the rest still is.
     try {
-      await move(path.join(ctx.root, entry.path))
+      await fsPromises.lstat(abs)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+    }
+    try {
+      await move(abs)
     } catch (error) {
       return { ok: false, stdout: '', stderr: `could not move '${entry.path}' to the trash: ${error instanceof Error ? error.message : String(error)}` }
     }

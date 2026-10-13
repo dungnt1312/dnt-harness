@@ -151,12 +151,14 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
       await updateProjectGitTrust(workspaceId, project.id, next)
       setTrusted(next)
       onGitTrustChange?.(next)
+      // Trust changes how git reads the repository (hooks, config), so the list may differ.
+      void load()
     } catch (cause) {
       toast.notify(failureText(cause), 'bad')
     } finally {
       setTrustBusy(false)
     }
-  }, [workspaceId, project.id, toast, onGitTrustChange])
+  }, [workspaceId, project.id, toast, onGitTrustChange, load])
 
   const enqueue = useCallback((task: () => Promise<void>): void => {
     setRunning((count) => count + 1)

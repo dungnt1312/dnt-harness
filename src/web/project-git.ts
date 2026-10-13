@@ -12,7 +12,7 @@
  * outside it.
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { existsSync, promises as fs } from 'node:fs'
+import { accessSync, constants as fsConstants, existsSync, promises as fs, statSync } from 'node:fs'
 import path from 'node:path'
 import { detectLoginShell, loginShellArgs } from '../capabilities/shell/detect.ts'
 import { resolveGrantedPath } from '../capabilities/fs/tools.ts'
@@ -148,16 +148,24 @@ let gitCache: string | undefined
 /**
  * Git on the project environment's `PATH` (Zed `store.rs:788`), so a git the
  * user's shell profile puts first is the one that runs. Falls back to the
- * host-wide lookup when the captured `PATH` has none.
+ * host-wide lookup when the captured `PATH` has none. Only an executable
+ * regular file in an absolute directory counts: a relative entry would make
+ * the choice depend on the server's working directory.
  */
 function gitOnPath(env: Readonly<Record<string, string>>): string {
   const key = Object.keys(env).find((name) => name.toUpperCase() === 'PATH')
   const names = process.platform === 'win32' ? ['git.exe', 'git.cmd'] : ['git']
   for (const dir of (key === undefined ? '' : env[key] ?? '').split(path.delimiter)) {
-    if (dir === '') continue
+    if (dir === '' || !path.isAbsolute(dir)) continue
     for (const name of names) {
       const candidate = path.join(dir, name)
-      if (existsSync(candidate)) return candidate
+      try {
+        if (!statSync(candidate).isFile()) continue
+        accessSync(candidate, fsConstants.X_OK)
+        return candidate
+      } catch {
+        // missing, unreadable or not executable: keep looking
+      }
     }
   }
   return gitExecutable() ?? 'git'
@@ -232,6 +240,22 @@ async function loadLoginShellEnvironment(root: string, shell: string): Promise<R
 const environments = new Map<string, Promise<Readonly<Record<string, string>>>>()
 
 /**
+ * The detected login shell, kept for the server's lifetime: on macOS an unset
+ * `$SHELL` makes the detector spawn `dscl`, which every git command would pay.
+ * The result is tied to the `$SHELL` it was detected under, so changing `$SHELL`
+ * detects again.
+ */
+let shellMemo: { readonly shellVariable: string | undefined; readonly detection: ReturnType<typeof detectLoginShell> } | undefined
+
+function loginShell(): ReturnType<typeof detectLoginShell> {
+  const shellVariable = process.env['SHELL']
+  if (shellMemo === undefined || shellMemo.shellVariable !== shellVariable) {
+    shellMemo = { shellVariable, detection: detectLoginShell() }
+  }
+  return shellMemo.detection
+}
+
+/**
  * The environment a terminal opened in `root` would have: the account's login
  * shell, started as a login and interactive shell, `cd`'d into the directory.
  * Cached per (shell, real directory) for the server's lifetime. When the shell
@@ -239,7 +263,7 @@ const environments = new Map<string, Promise<Readonly<Record<string, string>>>>(
  * (Zed logs and uses the default).
  */
 export function projectGitEnvironment(root: string): Promise<Readonly<Record<string, string>>> {
-  const shell = detectLoginShell().executable ?? '/bin/sh'
+  const shell = loginShell().executable ?? '/bin/sh'
   const keyed = fs.realpath(root).catch(() => path.resolve(root))
   return keyed.then((real) => {
     const key = `${shell}\0${real}`

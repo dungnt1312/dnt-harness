@@ -311,6 +311,20 @@ describe('discard and trash', () => {
     expect(repo.git('ls-files', '--', 'staged-new.txt')).toBe('')
   })
 
+  it('skips a path that is already gone from disk (an added file deleted: AD) and trashes the rest', async () => {
+    const repo = await fixture()
+    await repo.write('gone.txt', 'x\n')
+    repo.git('add', 'gone.txt')
+    await fs.rm(path.join(repo.dir, 'gone.txt'))
+    expect(repo.git('status', '--porcelain', '--', 'gone.txt').trim()).toBe('AD gone.txt')
+    const moved: string[] = []
+    const trashPath = async (abs: string): Promise<void> => { moved.push(abs) }
+    const result = await operate(repo, { type: 'trash', paths: ['gone.txt', 'staged-new.txt'] }, { trashPath })
+    expect(result.ok).toBe(true)
+    expect(moved).toEqual([path.join(repo.dir, 'staged-new.txt')])
+    expect(repo.git('ls-files', '--', 'gone.txt')).toBe('')
+  })
+
   it('reports a trash failure as a failed operation', async () => {
     const repo = await fixture()
     const result = await operate(repo, { type: 'trash', paths: ['-rf'] }, { trashPath: () => Promise.reject(new Error('no trash here')) })

@@ -337,7 +337,7 @@ class NetAskpassSession implements AskpassSession {
     try {
       this.onCancel?.()
     } catch {
-      // the hook is best-effort; the connection is closed regardless
+      // the hook is best-effort; a failure in it must not stop the cancel (the connection stays open and silent until the process dies or dispose)
     }
   }
 

@@ -59,10 +59,23 @@ export function useGitOperation(workspaceId: string, projectId: string): {
   live.current = prompts
 
   // Leaving with a prompt open answers it as a cancel, so Git is not left waiting.
-  useEffect(() => () => { for (const prompt of live.current) prompt.settle({ cancel: true }) }, [])
+  // A prompt that arrives after leaving has no modal to show in: it is cancelled
+  // on arrival, or git and the repository queue would wait for it forever.
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+      for (const prompt of live.current) prompt.settle({ cancel: true })
+    }
+  }, [])
 
   const askpass = useCallback((frame: GitAskpassFrame, signal: AbortSignal): Promise<GitAskpassAnswer> => (
     new Promise<GitAskpassAnswer>((resolve) => {
+      if (!mounted.current) {
+        resolve({ cancel: true })
+        return
+      }
       const settle = (answer: GitAskpassAnswer): void => {
         signal.removeEventListener('abort', onAbort)
         setPrompts((previous) => previous.filter((candidate) => candidate !== entry))
