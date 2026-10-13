@@ -7762,11 +7762,13 @@ async function handleProjectGitAction(
   const principalId = (req as IncomingMessage & { dntHarnessPrincipalId?: string }).dntHarnessPrincipalId
   const owner = { workspaceId: wsId as string, projectId: pid as string }
 
+  // A fixed message: a parse error would quote the offending text, and this
+  // body can carry a password or a commit message.
   let body: GitBody
   try {
     body = await readJson(req)
-  } catch (error) {
-    json(400, { error: error instanceof Error ? error.message : 'invalid request body' })
+  } catch {
+    json(400, { error: 'invalid request body' })
     return
   }
 
@@ -7871,7 +7873,10 @@ async function handleProjectGitAction(
       if (error instanceof ProjectGitError) json(400, { error: message })
       else throw error
     } else {
-      frame({ type: 'done', ok: false, stdout: '', stderr: message })
+      // Git may have changed the repository before failing: offer the current
+      // status when it can be read, otherwise leave it out.
+      const status = res.destroyed ? undefined : await gitStatus(project.path, deps.deniedRoots, trusted).catch(() => undefined)
+      frame({ type: 'done', ok: false, stdout: '', stderr: message, ...(status === undefined ? {} : { status }) })
     }
   } finally {
     res.off('close', onClose)

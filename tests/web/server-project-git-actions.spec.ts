@@ -67,7 +67,7 @@ interface Reply { status: number; headers: Record<string, string | string[] | un
 
 function raw(method: string, pathname: string, headers: Headers = {}, body?: unknown): Promise<Reply> {
   const target = new URL(server!.url)
-  const payload = body === undefined ? undefined : JSON.stringify(body)
+  const payload = body === undefined ? undefined : typeof body === 'string' ? body : JSON.stringify(body)
   return new Promise((resolve, reject) => {
     const client = httpRequest({
       host: target.hostname,
@@ -250,6 +250,25 @@ describe('PATCH gitTrusted', () => {
     expect(listed.find((row) => row.id === ctx.projectId)?.name).toBe('Git')
   })
 
+  it('retargeting the folder clears trust unless the same PATCH sets it', async () => {
+    const ctx = await plainContext()
+    const other = await makeRepo()
+    const third = await makeRepo()
+    expect(JSON.parse((await raw('PATCH', ctx.project, {}, { gitTrusted: true })).body)).toMatchObject({ gitTrusted: true })
+
+    const moved = await raw('PATCH', ctx.project, {}, { path: other })
+    expect(moved.status).toBe(200)
+    expect(JSON.parse(moved.body).gitTrusted).not.toBe(true)
+    const listed = JSON.parse((await raw('GET', `/api/workspaces/${ctx.wsId}/projects`)).body) as { id: string; gitTrusted?: boolean }[]
+    expect(listed.find((row) => row.id === ctx.projectId)?.gitTrusted).not.toBe(true)
+
+    // Re-targeting to the same folder keeps what was granted for it.
+    await raw('PATCH', ctx.project, {}, { gitTrusted: true })
+    expect(JSON.parse((await raw('PATCH', ctx.project, {}, { path: other })).body)).toMatchObject({ gitTrusted: true })
+    // An explicit decision in the same PATCH wins.
+    expect(JSON.parse((await raw('PATCH', ctx.project, {}, { path: third, gitTrusted: true })).body)).toMatchObject({ path: third, gitTrusted: true })
+  })
+
   it('status and diff run hooks-aware git only for a trusted project', async () => {
     const ctx = await plainContext()
     await fs.writeFile(path.join(ctx.root, 'a.txt'), 'changed\n')
@@ -288,6 +307,21 @@ describe('git action routes', () => {
       expect(reply.status, `${action} ${JSON.stringify(body)}`).toBe(400)
       expect(reply.headers['content-type']).toContain('application/json')
       expect(JSON.parse(reply.body)).toHaveProperty('error')
+    }
+  })
+
+  it('never echoes a malformed request body, for askpass answers or operations', async () => {
+    const ctx = await plainContext()
+    for (const [action, body, secret] of [
+      ['askpass/abc', '{"password":s3cret}', 's3cret'],
+      ['askpass/abc', '{"password":"s3cret"', 's3cret'],
+      ['commit', '{"message":s3cret}', 's3cret'],
+      ['commit', '["s3cret"]', 's3cret'],
+    ] as const) {
+      const reply = await raw('POST', `${ctx.actions}/${action}`, {}, body)
+      expect(reply.status, `${action} ${body}`).toBe(400)
+      expect(reply.body).not.toContain(secret)
+      expect(JSON.parse(reply.body)).toEqual({ error: 'invalid request body' })
     }
   })
 
