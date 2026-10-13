@@ -106,24 +106,31 @@ Hunks come from git with zero context so ranges are exact:
 - unstaged hunks W: `git diff -U0 … -- <path>` (index↔worktree),
 - staged hunks S: `git diff -U0 … --cached HEAD -- <path>` (HEAD↔index).
 
-(No HEAD: U and S are taken against the empty tree; untracked files: U = one
-all-additions hunk, S empty, W = U.)
+Hunk controls are offered only for a tracked, non-conflicted, text file in a
+repository that has a HEAD. Untracked and newly added files, conflicted files,
+binaries and no-HEAD repositories stage per file (their checkbox), as today.
 
-The diff pane keeps rendering the existing context diff (`--unified=3`, HEAD↔worktree)
-for reading. Each displayed hunk carries the U hunks it covers. Zed's
-`secondary_status` per U hunk (`project_diff.rs:354-366`):
+The unit a button acts on is a **displayed hunk** H: one `@@` block of the existing
+reading diff (`gitDiff`, `--unified=3`, HEAD↔worktree). Its HEAD range is
+`[oldStart, oldStart+oldLines)` and its worktree range `[newStart, newStart+newLines)`.
+Zed's `secondary_status` per hunk (`project_diff.rs:354-366`), computed with the
+zero-context W and S hunks above:
 
-- `unstaged` — some W hunk intersects its worktree range and no S hunk intersects its HEAD range,
-- `staged` — no W hunk intersects its worktree range,
-- `partial` — both.
+- `staged` — no W hunk overlaps H's worktree range,
+- `unstaged` — no S hunk overlaps H's HEAD range,
+- `partial` — both overlap.
 
-`GitDiffReport` gains `hunks: GitHunk[]`:
-`{ oldStart, oldLines, newStart, newLines, status, fingerprint }`, `fingerprint` =
-sha1 of the hunk's removed+added lines, in display order, aligned to the U hunks.
+A zero-length git range `start,0` means "between line `start` and `start+1`"; it
+overlaps a range `[s, e)` when `s <= start+1 <= e`.
+
+`GitDiffReport` gains `hunks: GitHunk[]` (empty when hunk controls are not offered):
+`{ oldStart, oldLines, newStart, newLines, status, fingerprint }`, one per `@@`
+block in display order; `fingerprint` = sha1 (hex) of the block's `-`/`+` lines
+joined with `\n`, each prefixed by its marker.
 
 ### Operations (queued; body `{ path, hunk: { oldStart, oldLines, newStart, newLines, fingerprint } }`)
 
-The server recomputes U and refuses unless a U hunk matches all five fields
+The server recomputes the displayed hunks and refuses unless one matches all five fields
 (`ProjectGitError('The file changed since the diff was shown. Refresh and try again.')`).
 
 - `stage-hunk`: new index text = index text with every W hunk whose worktree range
@@ -176,7 +183,8 @@ Diff input (Zed `git_panel.rs:4303-4348`, `4114-4183`): `git diff --staged` if
 anything is staged, else `git diff` (untracked excluded). Cap `MAX_DIFF_BYTES = 20_000`:
 first cut every line longer than 256 bytes to its first 256 bytes + `...[truncated]`;
 if still too big, repeatedly drop the last hunk of the file with the most hunks
-(keeping ≥ 1 per file) until it fits, then hard-cut.
+(keeping ≥ 1 per file), appending `[...skipped N hunks...]`; no hard cut (Zed
+`compress_commit_diff`, `git_panel.rs:4155`).
 
 Prompt: one user message, no tools, no thinking:
 the verbatim text of `/tmp/zed-src/crates/git_ui/src/commit_message_prompt.txt`
@@ -228,7 +236,7 @@ blocked while conflicts are unstaged (existing rule).
 ### 5.1 Split diff pane
 
 - `GitPanel` body becomes list | diff. Width ≥ 720 px (container query on the panel):
-  side by side, list default 40 %; narrower: stacked, list on top, default 45 %.
+  side by side, list default 40 %; narrower: stacked, list on top; one stored ratio serves both.
   A drag handle resizes (keyboard: focus the handle, ←/→ or ↑/↓ by 5 %).
 - A toggle button (`Hide Diff` / `Show Diff`, icon) collapses the pane; the list then
   takes the full height. Ratio and collapsed state persist per project in
