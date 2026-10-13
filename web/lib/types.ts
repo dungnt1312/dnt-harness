@@ -559,6 +559,8 @@ export interface McpServerRow {
   readonly lastError?: string
   /** Discovered tools whose public name LLM providers reject; never sent to the model. */
   readonly unusableTools?: readonly string[]
+  /** Estimated tokens (chars/4) the exposed tool schemas add to each model request; present when ready with tools. */
+  readonly toolSchemaTokens?: number
   /** Recent server stderr, secrets masked. */
   readonly stderrTail?: string
   /** Present for HTTP servers set to OAuth. */

@@ -165,7 +165,7 @@ import { renderEnvironmentContext } from '../harness/context/environment.ts'
 import { SystemPromptsStore, type SystemPromptsSnapshot } from '../harness/prompts/store.ts'
 import { CheckpointStore } from '../harness/context/compaction.ts'
 import { CacheAwareCompactionFallback, createCacheAwareCompactionSummarizer, createCompactionSummarizer } from './llm-summarizer.ts'
-import { DEFAULT_BUDGET, type ResolvedBudget } from '../harness/context/budget.ts'
+import { DEFAULT_BUDGET, schemaCost, type ResolvedBudget } from '../harness/context/budget.ts'
 import { CommandsService } from '../harness/commands/service.ts'
 import { PluginService } from '../harness/plugins/service.ts'
 import { PluginError } from '../harness/plugins/manifest.ts'
@@ -2480,8 +2480,7 @@ ${entry.description}`.toLowerCase().includes(query))
     return connecting
   }
 
-  
-/** Register `mcp__server__tool` tools through the effect-disposed seam. */
+  /** Register `mcp__server__tool` tools through the effect-disposed seam. */
   async function reconcileMcpTools(workspaceId: WorkspaceId, serverName: string, client: McpServerClient): Promise<void> {
     const config = await mcpStore.loadMcp(workspaceId)
     const serverConfig: McpServerConfig | undefined = config.servers[serverName]
@@ -4603,6 +4602,45 @@ async function handleAuth(req: IncomingMessage, res: ServerResponse, pathname: s
   send(404, { error: 'no such auth route' })
 }
 
+/**
+ * The schema a model request actually carries for one MCP tool — the same
+ * wording `reconcileMcpTools` registers — or `undefined` when the provider
+ * would reject the name and the tool never reaches the model.
+ */
+function mcpModelSchema(serverName: string, descriptor: McpToolDescriptor): { name: string; description: string; parameters: unknown } | undefined {
+  if (descriptor.name.trim() === '' || descriptor.name.includes('__')) return undefined
+  const fullName = mcpToolName(serverName, descriptor.name)
+  if (!PROVIDER_TOOL_NAME.test(fullName)) return undefined
+  return {
+    name: fullName,
+    description: `[MCP:${serverName}] ${descriptor.description ?? descriptor.name}${descriptor.requiresUserInteraction === true ? ' (interactive — always asks)' : ''}`,
+    parameters: descriptor.inputSchema as { type: 'object'; properties: Record<string, unknown> },
+  }
+}
+
+/**
+ * Estimated tokens (chars/4, the same `schemaCost` the context builder
+ * charges to `breakdown.mcpTools`) for the schemas this workspace would
+ * carry for one server: provider-valid, allowlist-exposed descriptors.
+ * Pure so the API row route can call it against the live descriptor map.
+ */
+function mcpSchemaTokenEstimate(
+  workspaceId: string,
+  serverName: string,
+  allowed: readonly string[] | undefined,
+  descriptors: ReadonlyMap<string, McpToolDescriptor>,
+): number {
+  const schemas: { name: string; description: string; parameters: unknown }[] = []
+  for (const [key, descriptor] of descriptors) {
+    if (!key.startsWith(`${workspaceId}:mcp__${serverName}__`)) continue
+    const fullName = mcpToolName(serverName, descriptor.name)
+    if (!mcpToolExposed(allowed, descriptor.name, fullName)) continue
+    const schema = mcpModelSchema(serverName, descriptor)
+    if (schema !== undefined) schemas.push(schema)
+  }
+  return schemaCost(schemas)
+}
+
 async function handleApi(
   req: IncomingMessage,
   res: ServerResponse,
@@ -5414,6 +5452,9 @@ async function handleApi(
             const connectFailure = server.enabled ? deps.mcpConnectFailures.get(`${wsId}:${server.name}`) : undefined
             const stderr = client?.recentStderr() ?? ''
             const oauthState = await oauthRowState(deps.oauth, deps.oauthStore, wsId, server)
+            const toolSchemaTokens = server.enabled && client !== undefined && client.state === 'ready'
+              ? mcpSchemaTokenEstimate(wsId, server.name, server.allowedTools, deps.mcpDescriptors)
+              : 0
             rows.push({
               ...(oauthState !== undefined ? { oauth: oauthState } : {}),
               name: server.name,
@@ -5423,6 +5464,7 @@ async function handleApi(
               ...(connectFailure !== undefined ? { lastError: connectFailure.message } : {}),
               ...(unusableTools.length > 0 ? { unusableTools } : {}),
               ...(stderr !== '' ? { stderrTail: stderr.slice(-2_000) } : {}),
+              ...(toolSchemaTokens > 0 ? { toolSchemaTokens } : {}),
               breakerOpenUntil: client !== undefined && client.breakerOpenUntil > Date.now() ? client.breakerOpenUntil : null,
               containment: deps.containmentDetail,
               generation: deps.generationOf(wsId),

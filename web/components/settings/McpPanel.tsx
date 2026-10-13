@@ -223,6 +223,14 @@ function DiscoveredTools({ row }: { readonly row: McpServerRow }) {
             <span className="text-xs font-normal text-fg-faint">
               {restricted ? `${exposedCount} exposed by the allowlist · ${tools.length - exposedCount} hidden` : 'all exposed'}
             </span>
+            {row.toolSchemaTokens !== undefined && row.toolSchemaTokens > 0 ? (
+              <span
+                className="text-xs font-normal text-fg-faint"
+                title={`Estimated context cost (chars/4) of the exposed tool schemas in every model request; matches the MCP segment of the context meter. A real tokenizer can differ.`}
+              >
+                · ~{row.toolSchemaTokens.toLocaleString()} tok/request
+              </span>
+            ) : null}
           </p>
           <ul aria-label={`Tools from ${row.name}`} className="m-0 flex list-none flex-wrap gap-1 p-0">
             {tools.map((name) => {

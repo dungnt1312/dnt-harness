@@ -28,6 +28,7 @@ vi.mock('../../lib/api.ts', () => ({
   listMcpServers: vi.fn(async () => [{
     name: 'fs', transport: 'stdio', enabled: true, status: 'ready', breakerOpenUntil: null,
     discoveredTools: ['query', 'explode'], allowedTools: ['query'], unmatchedAllowlist: ['missing'],
+    toolSchemaTokens: 1234,
   }]),
   getMcpServer: vi.fn(async () => ({ name: 'fs', transport: 'stdio', command: 'npx', args: ['-y', 'fs-mcp'], env: { API_KEY: '${API_KEY}' }, enabled: false, timeoutMs: 5000 })),
   upsertMcpServer: vi.fn(async () => ({ saved: 'fs', enabled: false })),
@@ -128,6 +129,7 @@ describe('MCP panel', () => {
     await settle()
     // Tools are listed flat — no disclosure to open first.
     expect(document.body.textContent).toContain('1 exposed by the allowlist · 1 hidden')
+    expect(document.body.textContent).toContain('~1,234 tok/request')
     const list = document.querySelector('[aria-label="Tools from fs"]')
     expect(list?.textContent).toContain('query')
     expect(list?.textContent).toContain('explode hidden')

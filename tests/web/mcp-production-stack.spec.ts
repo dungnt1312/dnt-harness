@@ -88,6 +88,20 @@ describe('mcp production stack', () => {
     expect(current[0]?.revision).not.toBe(revision)
     const enabled = await raw(server.url, 'POST', `/api/workspaces/${wsId}/mcp/fixture/enable`, headers, '{}')
     expect(enabled.status).toBe(200)
+    // Enable starts the connection in the background; poll until the tools have
+    // been listed and reconciled, then read the row's own estimate back.
+    let live: { status?: string; toolSchemaTokens?: number } | undefined
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const listedAfter = JSON.parse((await raw(server.url, 'GET', `/api/workspaces/${wsId}/mcp`, { cookie })).body) as { name: string; status: string; toolSchemaTokens?: number }[] | { error: string }
+      const rows = Array.isArray(listedAfter) ? listedAfter : []
+      const row = rows.find((entry) => entry.name === 'fixture')
+      if (row?.status === 'ready' && (row.toolSchemaTokens ?? 0) > 0) { live = row; break }
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    // Chars/4 over the exposed schemas the model actually receives — the same
+    // measure the context builder charges to `breakdown.mcpTools`.
+    expect(live?.status).toBe('ready')
+    expect(live?.toolSchemaTokens ?? 0).toBeGreaterThan(0)
     await server.close()
     server = undefined
   }, 30_000)
