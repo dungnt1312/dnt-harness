@@ -522,6 +522,10 @@ export interface ProjectFileView {
   readonly binary: boolean
   readonly truncated: boolean
   readonly content: string
+  /** Project files only: the viewer may edit and save this file. */
+  readonly editable?: boolean
+  /** Project files only: sha256 of the stored bytes, sent back on save. */
+  readonly hash?: string
 }
 
 const projectBase = (workspaceId: string, projectId: string): string =>
@@ -557,6 +561,29 @@ export function renameProjectEntry(workspaceId: string, projectId: string, path:
 export function deleteProjectEntry(workspaceId: string, projectId: string, path: string): Promise<{ deleted: true; path: string }> {
   return apiFetch(`${projectBase(workspaceId, projectId)}/files?path=${encodeURIComponent(path)}`, { method: 'DELETE' })
     .then((r) => json<{ deleted: true; path: string }>(r))
+}
+
+/** The file changed on disk since it was opened; `currentHash` is what is there now. */
+export class SaveConflictError extends Error {
+  constructor(readonly currentHash: string) {
+    super('The file changed on disk since it was opened.')
+    this.name = 'SaveConflictError'
+  }
+}
+
+/** Save the viewer's text; refuses (SaveConflictError) when the file no longer hashes to `expectedHash`. */
+export async function saveProjectFile(workspaceId: string, projectId: string, path: string, content: string, expectedHash: string): Promise<{ path: string; size: number; hash: string }> {
+  const response = await apiFetch(`${projectBase(workspaceId, projectId)}/file`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path, content, expectedHash }),
+  })
+  if (response.status === 409) {
+    // Clone so a 409 without a hash still reaches json() as an HttpError with its body.
+    const body = (await response.clone().json().catch(() => ({}))) as { currentHash?: unknown }
+    if (typeof body.currentHash === 'string') throw new SaveConflictError(body.currentHash)
+  }
+  return json<{ path: string; size: number; hash: string }>(response)
 }
 
 /** One raw file from a memory folder (the project tier with `projectId`, else the workspace tier). */

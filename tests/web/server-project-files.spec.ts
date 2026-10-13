@@ -136,7 +136,7 @@ describe('project file browsing', () => {
 
   it('fails closed for unknown projects and rejects writes', async () => {
     expect((await fetch(`${server.url}/api/workspaces/${wsId}/projects/nope/files`)).status).toBe(404)
-    expect((await fetch(`${server.url}/api/workspaces/${wsId}/projects/${projectId}/file?path=README.md`, { method: 'PUT', body: 'x' })).status).toBe(405)
+    expect((await fetch(`${server.url}/api/workspaces/${wsId}/projects/${projectId}/file?path=README.md`, { method: 'PUT', body: 'x' })).status).toBe(400)
   })
 })
 
@@ -347,9 +347,85 @@ describe('explorer writes in an archived workspace', () => {
       const filesUrl = `${server.url}/api/workspaces/${ws.id}/projects/${project.id}/files`
       expect((await fetch(`${filesUrl}?path=`)).status).toBe(200)
       expect((await fetch(`${filesUrl}?path=README.md`, { method: 'DELETE' })).status).toBe(404)
+      const read = (await (await fetch(`${server.url}/api/workspaces/${ws.id}/projects/${project.id}/file?path=README.md`)).json()) as { hash: string }
+      expect((await fetch(`${server.url}/api/workspaces/${ws.id}/projects/${project.id}/file`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ path: 'README.md', content: 'x', expectedHash: read.hash }),
+      })).status).toBe(404)
       expect(await fs.readFile(path.join(archivedRoot, 'README.md'), 'utf8')).toBe('r\n')
     } finally {
       await fs.rm(archivedRoot, { recursive: true, force: true })
     }
+  })
+})
+
+describe('saving a file from the viewer', () => {
+  let saveRoot = ''
+  let saveProjectId = ''
+  const fileUrl = (rel = '') => `${server.url}/api/workspaces/${wsId}/projects/${saveProjectId}/file${rel === '' ? '' : `?path=${encodeURIComponent(rel)}`}`
+  const put = (body: unknown, headers: Record<string, string> = {}) =>
+    fetch(fileUrl(), { method: 'PUT', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) })
+  const read = async (rel: string) => (await (await fetch(fileUrl(rel))).json()) as { content: string; editable: boolean; hash?: string }
+
+  beforeAll(async () => {
+    saveRoot = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-files-save-'))
+    await fs.writeFile(path.join(saveRoot, 'note.md'), 'old\n', 'utf8')
+    const created = await fetch(`${server.url}/api/workspaces/${wsId}/projects`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Saves', path: saveRoot }),
+    })
+    saveProjectId = ((await created.json()) as { id: string }).id
+  })
+
+  afterAll(async () => { await fs.rm(saveRoot, { recursive: true, force: true }) })
+
+  it('reads report editable and hash, and a PUT with that hash saves', async () => {
+    const before = await read('note.md')
+    expect(before.editable).toBe(true)
+    expect(typeof before.hash).toBe('string')
+    const saved = await put({ path: 'note.md', content: 'new\n', expectedHash: before.hash })
+    expect(saved.status).toBe(200)
+    const body = (await saved.json()) as { path: string; size: number; hash: string }
+    expect(body).toMatchObject({ path: 'note.md', size: 4 })
+    expect((await read('note.md')).hash).toBe(body.hash)
+    expect(await fs.readFile(path.join(saveRoot, 'note.md'), 'utf8')).toBe('new\n')
+  })
+
+  it('answers 409 with currentHash for a stale hash', async () => {
+    const stale = (await read('note.md')).hash
+    await fs.writeFile(path.join(saveRoot, 'note.md'), 'agent\n', 'utf8')
+    const response = await put({ path: 'note.md', content: 'mine\n', expectedHash: stale })
+    expect(response.status).toBe(409)
+    const body = (await response.json()) as { error: string; currentHash: string }
+    expect(body.currentHash).toBe((await read('note.md')).hash)
+    expect(await fs.readFile(path.join(saveRoot, 'note.md'), 'utf8')).toBe('agent\n')
+  })
+
+  it('validates the body', async () => {
+    const hash = (await read('note.md')).hash
+    expect((await put({ content: 'x', expectedHash: hash })).status).toBe(400)
+    expect((await put({ path: 'note.md', expectedHash: hash })).status).toBe(400)
+    expect((await put({ path: 'note.md', content: 'x' })).status).toBe(400)
+    expect((await put({ path: 'missing.md', content: 'x', expectedHash: hash })).status).toBe(404)
+  })
+
+  it('accepts a body above the general JSON limit for a large file', async () => {
+    const hash = (await read('note.md')).hash
+    const content = `${'"\\'.repeat(300_000)}\n`
+    const response = await put({ path: 'note.md', content, expectedHash: hash })
+    expect(response.status).toBe(200)
+    expect((await fs.readFile(path.join(saveRoot, 'note.md'), 'utf8')).length).toBe(content.length)
+  })
+
+  it('refuses a cross-site save', async () => {
+    const hash = (await read('note.md')).hash
+    expect((await put({ path: 'note.md', content: 'evil\n', expectedHash: hash }, { origin: 'http://evil.example' })).status).toBe(403)
+  })
+
+  it('keeps other methods on file refused', async () => {
+    expect((await fetch(fileUrl('note.md'), { method: 'POST' })).status).toBe(405)
+    expect((await fetch(fileUrl('note.md'), { method: 'DELETE' })).status).toBe(405)
   })
 })
