@@ -423,6 +423,8 @@ export interface ProjectRow {
   readonly order?: number
   /** Extra folders this project's conversations may use. */
   readonly additionalDirectories?: readonly AdditionalDirectory[]
+  /** The user trusts this folder's repository config and hooks, so Git runs them. Off unless set. */
+  readonly gitTrusted?: boolean
   readonly createdAt: number
 }
 

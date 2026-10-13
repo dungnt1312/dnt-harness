@@ -7,13 +7,18 @@ import type { GitDiffReport, GitStatusReport } from '../../lib/api.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
+/** The Zed-shaped fields the server adds to every change (unstaged worktree edit by default). */
+const raw = { indexStatus: ' ', worktreeStatus: 'M', created: false, deleted: false, conflicted: false, staging: 'unstaged' } as const
+
 const REPORT: GitStatusReport = {
   branch: 'main',
+  branchInfo: { name: 'main', upstream: { remote: 'origin', branch: 'main' }, upstreamTrack: { kind: 'tracked', ahead: 0, behind: 0 } },
+  head: { sha: 'abc1234', subject: 'init', hasParent: false },
   truncated: false,
   changes: [
-    { path: 'src/a.ts', status: 'modified', added: 7, removed: 2 },
-    { path: 'notes.md', status: 'added', added: 12 },
-    { path: 'src/other.ts', status: 'modified', added: 1, removed: 1 },
+    { ...raw, path: 'src/a.ts', status: 'modified', added: 7, removed: 2 },
+    { ...raw, path: 'notes.md', status: 'added', indexStatus: 'A', worktreeStatus: ' ', created: true, staging: 'staged', added: 12 },
+    { ...raw, path: 'src/other.ts', status: 'modified', added: 1, removed: 1 },
   ],
 }
 
@@ -82,8 +87,10 @@ it('a filter matching nothing says so instead of reading as a clean tree', async
 it('an opened binary media row previews the media instead of a diff', async () => {
   const binaryReport: GitStatusReport = {
     branch: 'main',
+    branchInfo: null,
+    head: null,
     truncated: false,
-    changes: [{ path: 'shots/01.png', status: 'untracked' }],
+    changes: [{ ...raw, path: 'shots/01.png', status: 'untracked', indexStatus: '?', worktreeStatus: '?', created: true }],
   }
   fetchGitStatus.mockResolvedValueOnce(binaryReport)
   const view = await mount()

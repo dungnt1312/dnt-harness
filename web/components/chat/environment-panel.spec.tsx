@@ -56,7 +56,15 @@ async function render(props: Base): Promise<void> {
 const startEvents = [ev('process/start', { processId: 'p1', command: 'dev', cwd: 'x' })]
 
 it('renders the collapsed branch line without diff noise', async () => {
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ branch: 'main', changes: [{ path: 'a.ts', status: 'modified', added: 2173, removed: 628 }], truncated: false, ahead: 70, behind: 0 }), { status: 200 })))
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+    branch: 'main',
+    branchInfo: { name: 'main', upstream: { remote: 'origin', branch: 'main' }, upstreamTrack: { kind: 'tracked', ahead: 70, behind: 0 } },
+    head: { sha: 'abc1234', subject: 'wip', hasParent: true },
+    changes: [{ path: 'a.ts', status: 'modified', indexStatus: ' ', worktreeStatus: 'M', created: false, deleted: false, conflicted: false, staging: 'unstaged', added: 2173, removed: 628 }],
+    truncated: false,
+    ahead: 70,
+    behind: 0,
+  }), { status: 200 })))
   await render({ ...base, events: [] })
   // The capsule carries the branch only: diff counts and sync arrows wait
   // for the expanded panel (and the git workbench view).
