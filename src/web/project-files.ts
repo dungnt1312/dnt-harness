@@ -6,7 +6,8 @@ import { resolveGrantedPath } from '../capabilities/fs/tools.ts'
  * Read-only project browsing for the web workbench. Every path is relative to
  * a registered project root and resolved with the same containment rules as
  * the file tools: lexical and realpath (symlink/junction) escapes and
- * application-internal storage are refused. Nothing here writes.
+ * application-internal storage are refused. Nothing here writes; creating,
+ * renaming and deleting live in `project-files-write.ts`.
  */
 
 /** Largest file body returned; longer files are cut and flagged `truncated`. */
@@ -57,7 +58,7 @@ export interface ProjectFile {
 export class ProjectFileError extends Error {}
 
 /** Normalize client input to a root-relative `/` path ('' is the root). */
-function normalizeRelative(raw: string): string {
+export function normalizeRelative(raw: string): string {
   const trimmed = raw.trim().replaceAll('\\', '/').replace(/\/{2,}/g, '/').replace(/^\/+|\/+$/g, '')
   return trimmed === '.' ? '' : trimmed
 }
