@@ -39,8 +39,12 @@ export function FileNameInput({ initial, label, selectStem, onSubmit, onCancel }
     if (problem === null) return
     setBusy(false)
     setError(problem)
-    ref.current?.focus()
   }
+
+  // Focus only works once the input is re-enabled, so wait for the render.
+  useEffect(() => {
+    if (!busy && error !== null) ref.current?.focus()
+  }, [busy, error])
 
   const onKeyDown = (event: KeyboardEvent<HTMLInputElement>): void => {
     if (event.key === 'Enter') { event.preventDefault(); void submit() }

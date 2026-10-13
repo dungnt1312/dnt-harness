@@ -69,13 +69,21 @@ it('sends one request when Enter is pressed twice while pending', async () => {
 })
 
 it('shows a server error and stays open for another try', async () => {
-  const onSubmit = vi.fn(async () => "'a.ts' already exists")
-  const { input } = await mount({ onSubmit })
+  let field: HTMLInputElement | undefined
+  // Browsers may drop focus when the input is disabled; simulate that while pending.
+  const onSubmit = vi.fn(async () => {
+    field?.blur()
+    return "'a.ts' already exists"
+  })
+  const { input, onCancel } = await mount({ onSubmit })
+  field = input
   await type(input, 'a.ts')
   await key(input, 'Enter')
   expect(host.querySelector('[role="alert"]')?.textContent).toBe("'a.ts' already exists")
   expect(input.disabled).toBe(false)
   expect(input.getAttribute('aria-invalid')).toBe('true')
+  expect(document.activeElement).toBe(input)
+  expect(onCancel).not.toHaveBeenCalled()
 })
 
 it('cancels on Escape, on blur and on an empty Enter', async () => {
