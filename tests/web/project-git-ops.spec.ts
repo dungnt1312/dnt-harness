@@ -334,7 +334,9 @@ describe('discard and trash', () => {
   })
 })
 
-describe('operations beyond the 500-entry panel cap', () => {
+// 520 real files through git take several seconds; under full-suite load
+// they can pass the default 10 s, so this group gets its own budget.
+describe('operations beyond the 500-entry panel cap', { timeout: 60_000 }, () => {
   const COUNT = 520
   const name = (index: number, ext: string): string => `f${String(index).padStart(4, '0')}.${ext}`
   /** Write COUNT files into `repo` in one go. */
