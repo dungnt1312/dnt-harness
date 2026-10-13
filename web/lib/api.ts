@@ -1797,6 +1797,8 @@ export interface DangerousCommandsConfig {
   readonly v: 1
   readonly presets: Record<string, GuardAction>
   readonly customRules: readonly CustomRule[]
+  /** Per-preset allowed path prefixes (e.g. `tmp`, `.worktrees`). */
+  readonly exceptions?: Partial<Record<string, readonly string[]>>
 }
 export interface GuardConfigResponse {
   readonly config: DangerousCommandsConfig

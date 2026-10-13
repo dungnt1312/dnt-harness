@@ -12,6 +12,13 @@ export interface DangerousCommandsConfig {
   readonly v: 1
   readonly presets: Record<PresetId, GuardAction>
   readonly customRules: readonly CustomRule[]
+  /**
+   * Per-preset allowed path prefixes (`tmp`, `.worktrees`, `/tmp`): a preset
+   * match is skipped when every command it matched targets only paths under
+   * one of them. Relative prefixes match relative operands (the project
+   * folder); absolute ones match absolute operands. Absent → no exemption.
+   */
+  readonly exceptions?: Partial<Record<PresetId, readonly string[]>>
 }
 export interface GuardMatch {
   readonly presetId?: PresetId

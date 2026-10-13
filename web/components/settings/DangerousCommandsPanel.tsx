@@ -27,6 +27,7 @@ import {
   SaveBar,
   ConflictBanner,
   RowMenu,
+  CodeArea,
 } from './settings-kit.tsx'
 import { useUnsavedChanges } from './unsaved-changes.tsx'
 import { matchCommand } from '../../../src/harness/guard/matcher.ts'
@@ -85,6 +86,8 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
   const [testInput, setTestInput] = useScopedState('')
   const [testResult, setTestResult] = useScopedState<string | null>(null)
   const [expandedPresets, setExpandedPresets] = useState<ReadonlySet<string>>(() => new Set())
+  /** Raw textarea text per preset, so typing a newline is not normalized away mid-edit. */
+  const [exceptionDrafts, setExceptionDrafts] = useScopedState<Readonly<Record<string, string>>>({})
   const togglePreset = (id: string): void => {
     setExpandedPresets((prev) => {
       const next = new Set(prev)
@@ -108,10 +111,12 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
         v: 1,
         presets: { ...DEFAULT_CONFIG.presets, ...cfg.presets } as DangerousCommandsConfig['presets'],
         customRules: [...cfg.customRules],
+        ...(cfg.exceptions !== undefined ? { exceptions: cfg.exceptions } : {}),
       }
       setConfig(merged)
       setHash(result.hash)
       setBaseline(serializeConfig(merged))
+      setExceptionDrafts({})
       setConflict(false)
       if (result.warning !== undefined) {
         setNotice({ kind: 'info', text: result.warning })
@@ -151,6 +156,21 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
     setConfig((prev) => {
       if (prev === null) return prev
       return { ...prev, presets: { ...prev.presets, [id]: action } }
+    })
+    setNotice(null)
+    setConflict(false)
+  }
+
+  const setExceptions = (id: string, raw: string): void => {
+    // Kept as typed (one prefix per line or comma); the server normalizes on save.
+    const list = raw.split(/[\n,]/).map((entry) => entry.trim()).filter((entry) => entry !== '')
+    setConfig((prev) => {
+      if (prev === null) return prev
+      const next = { ...(prev.exceptions ?? {}) }
+      if (list.length > 0) next[id] = list
+      else delete next[id]
+      const { exceptions: _omit, ...rest } = prev
+      return Object.keys(next).length > 0 ? { ...rest, exceptions: next } : rest
     })
     setNotice(null)
     setConflict(false)
@@ -256,6 +276,7 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
       const result = await putGuardConfig(workspaceId, config, hash ?? undefined)
       setHash(result.hash)
       setBaseline(serializeConfig(result.config as DangerousCommandsConfig))
+      setExceptionDrafts({})
       setConfig(result.config as DangerousCommandsConfig)
       setConflict(false)
       setNotice({ kind: 'ok', text: 'Saved dangerous commands configuration.' })
@@ -277,6 +298,7 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
     const result = await putGuardConfig(workspaceId, config, fresh.hash)
     setHash(result.hash)
     setBaseline(serializeConfig(result.config as DangerousCommandsConfig))
+    setExceptionDrafts({})
     setConfig(result.config as DangerousCommandsConfig)
     setConflict(false)
     setNotice({ kind: 'ok', text: 'Saved (overwrote server version).' })
@@ -287,6 +309,7 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
       try {
         const parsed = JSON.parse(baseline) as DangerousCommandsConfig
         setConfig(cloneConfig(parsed))
+        setExceptionDrafts({})
       } catch { /* ignore */ }
     }
     setConflict(false)
@@ -310,6 +333,7 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
             const value = (config.presets as Record<string, GuardAction>)[id] ?? 'off'
             const toneClass = value === 'deny' ? 'text-bad' : value === 'ask' ? 'text-warn' : 'text-fg-faint'
             const expanded = expandedPresets.has(id)
+            const allowed = config.exceptions?.[id] ?? []
             return (
               <ItemRow
                 key={id}
@@ -317,6 +341,7 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
                   <>
                     <span className={toneClass}>{info.name}</span>
                     <Badge tone={actionTone(value)}>{value}</Badge>
+                    {allowed.length > 0 ? <Badge tone="green">{`${allowed.length} allowed path${allowed.length === 1 ? '' : 's'}`}</Badge> : null}
                     <button
                       type="button"
                       className="inline-flex h-6 items-center gap-1 rounded-full border border-line px-2 text-[11px] font-medium text-fg-muted transition-colors hover:bg-hover hover:text-fg"
@@ -340,14 +365,32 @@ function DangerousCommandsPanelContent({ workspaceId }: { readonly workspaceId: 
                 )}
               >
                 {expanded ? (
-                  <ul className="m-0 flex list-none flex-col gap-1 rounded-lg bg-muted px-3 py-2">
-                    {rules.map((rule) => (
-                      <li key={rule} className="flex items-start gap-2 text-xs leading-5">
-                        <span className="mt-1.5 size-1 shrink-0 rounded-full bg-fg-faint" aria-hidden />
-                        <code className="min-w-0 break-all font-mono text-fg">{rule}</code>
-                      </li>
-                    ))}
-                  </ul>
+                  <div className="flex flex-col gap-2">
+                    <ul className="m-0 flex list-none flex-col gap-1 rounded-lg bg-muted px-3 py-2">
+                      {rules.map((rule) => (
+                        <li key={rule} className="flex items-start gap-2 text-xs leading-5">
+                          <span className="mt-1.5 size-1 shrink-0 rounded-full bg-fg-faint" aria-hidden />
+                          <code className="min-w-0 break-all font-mono text-fg">{rule}</code>
+                        </li>
+                      ))}
+                    </ul>
+                    <Field
+                      label="Allowed paths"
+                      hint="One prefix per line. A command this preset matches still runs when every path it names is under one of these (relative = inside the project, e.g. tmp or .worktrees; absolute, e.g. /tmp). Commands with $VAR, $(…), cd or ../ never qualify."
+                    >
+                      <CodeArea
+                        aria-label={`Allowed paths for ${info.name}`}
+                        rows={3}
+                        placeholder={'tmp\n.worktrees\n/tmp'}
+                        value={exceptionDrafts[id] ?? allowed.join('\n')}
+                        onChange={(e) => {
+                          const text = e.target.value
+                          setExceptionDrafts((prev) => ({ ...prev, [id]: text }))
+                          setExceptions(id, text)
+                        }}
+                      />
+                    </Field>
+                  </div>
                 ) : null}
               </ItemRow>
             )

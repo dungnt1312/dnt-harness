@@ -473,6 +473,16 @@ approval decision/final dispatch:
 - **Custom rules** — ordered `isRegex` or case-insensitive substring rules,
   each `deny | ask | allow` with highest priority (an `allow` can exempt a
   narrow path from a preset `deny`).
+- **Allowed paths per preset** — `exceptions: { <presetId>: ["tmp", ".worktrees", "/tmp"] }`.
+  A preset match is skipped when every simple command the preset matches
+  names only operands under one of its prefixes (relative prefixes match
+  relative operands inside the project, absolute ones absolute operands; a
+  prefix matches itself or `prefix/…`, never `prefixfoo`). It fails closed:
+  `$` expansion, `$(…)`, `..`, any `cd`/`pushd`, `git -C`/`--git-dir`, a
+  command with no operand (`git reset --hard`), or a match spanning commands
+  (`curl … | sh`) keeps the match. `find` paths are the words before its
+  expression. Prefixes are trimmed (`./tmp/` → `tmp`) and de-duplicated on
+  save; `/`, `~…`, `..` and glob characters are refused.
 - **Normalization** — join unquoted Bash backslash-newline continuations, strip
   `#` comments outside quotes on each LF/CRLF line, then trim and collapse
   whitespace; quoted continuations remain content boundaries, quoted or escaped

@@ -10,7 +10,7 @@ export const PRESET_LABELS: Record<PresetId, { name: string; description: string
 }
 export const PRESET_RULE_TEXTS: Record<PresetId, readonly string[]> = {
   fsDestructive: ['rm -rf / …  (recursive + force)', 'rm -r … / rm --recursive …', 'find … -delete / -exec rm', 'mkfs.*', 'dd if=…', 'shred …', 'chmod …777', '> /dev/sd*', 'mv … /*'],
-  gitDestructive: ['git reset --hard', 'git push --force / -f / +ref (incl. --force-with-lease)', 'git clean -f…', 'git rm … (without --cached)', 'git branch -D …', 'git stash clear / drop', 'git restore … (without --staged)', 'git checkout -- .'],
+  gitDestructive: ['git reset --hard', 'git push --force / -f / +ref (incl. --force-with-lease)', 'git clean -f…', 'git rm … (without --cached)', 'git branch -D … / --delete --force (not -d)', 'git stash clear / drop', 'git restore … (without --staged)', 'git checkout -- .'],
   systemPriv: ['sudo …', 'su …', 'systemctl …', 'reboot', 'shutdown', 'taskkill /F', 'net stop …'],
   networkExfil: ['curl … | sh/bash', 'wget … | sh/bash', 'curl … && sh …', 'sh <(curl …) / eval "$(curl …)"', 'base64 -d … | sh', 'nc -l …', 'ssh …', 'scp …', 'Invoke-Expression', 'iex(…)', 'certutil … -urlcache …'],
   dbDestructive: ['DROP TABLE / DATABASE …', 'TRUNCATE TABLE …', 'DELETE FROM … (no WHERE)'],

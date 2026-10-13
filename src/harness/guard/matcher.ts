@@ -1,6 +1,7 @@
 import type { DangerousCommandsConfig, GuardMatch, PresetId } from './types.ts'
 import { PRESET_REGEXES } from './presets.ts'
 import { PRESET_LABELS } from './defaults.ts'
+import { parseShell } from './shell-parse.ts'
 
 /**
  * `lineSeparator` replaces an unquoted line break. The default `' '` keeps
@@ -90,6 +91,69 @@ function classifyGitRm(commands: string): string {
     .join('')
 }
 
+/** `./tmp/` → `tmp`; `/tmp/` → `/tmp`. Empty means "no usable prefix". */
+export function normalizeExceptionPrefix(prefix: string): string {
+  let value = prefix.trim()
+  while (value.startsWith('./')) value = value.slice(2)
+  while (value.length > 1 && value.endsWith('/')) value = value.slice(0, -1)
+  return value === '.' ? '' : value
+}
+
+/** Git subcommands whose next word is a verb, not an operand. */
+const GIT_NESTED = new Set(['worktree', 'stash', 'remote', 'submodule'])
+
+/** The path-like operands of one simple command, or undefined when unknowable. */
+function commandOperands(segment: string): string[] | undefined {
+  const parsed = parseShell(segment)
+  if (parsed.unsupported || parsed.commands.length !== 1) return undefined
+  const [command] = parsed.commands
+  if (command === undefined || command.assignments.length > 0) return undefined
+  const [program, ...args] = command.words
+  if (program === undefined) return undefined
+  // A changed working directory makes relative operands mean something else.
+  if (args.some((word) => word.value === '-C' || word.value.startsWith('--git-dir') || word.value.startsWith('--work-tree'))) return undefined
+  // `find`: the paths come before the expression; option values (`-name x`)
+  // are not paths.
+  const firstExpression = program.value === 'find'
+    ? args.findIndex((word) => word.value.startsWith('-') || word.value === '(' || word.value === '!')
+    : -1
+  const pathWords = firstExpression === -1 ? args : args.slice(0, firstExpression)
+  let operands = pathWords.filter((word) => !word.value.startsWith('-') || word.value === '-')
+  if (operands.some((word) => word.expands)) return undefined
+  if (program.value === 'git') {
+    const skip = operands[0] !== undefined && GIT_NESTED.has(operands[0].value) ? 2 : 1
+    operands = operands.slice(skip)
+  }
+  return operands.map((word) => word.value)
+}
+
+function underPrefix(operand: string, prefixes: readonly string[]): boolean {
+  let value = operand
+  while (value.startsWith('./')) value = value.slice(2)
+  if (value === '' || /(^|\/)\.\.(\/|$)/.test(value)) return false
+  return prefixes.some((prefix) => value === prefix || value.startsWith(`${prefix}/`))
+}
+
+/**
+ * True when a preset match should be skipped because every simple command
+ * the preset matches targets only paths under an allowed prefix. Fails
+ * closed: a match that spans commands (`curl … | sh`), an unparsable
+ * command, an expansion, a `cd` anywhere in the line, or a command without
+ * operands keeps the match.
+ */
+function exemptByPaths(commands: string, regexes: readonly RegExp[], rawPrefixes: readonly string[] | undefined): boolean {
+  const prefixes = (rawPrefixes ?? []).map(normalizeExceptionPrefix).filter((prefix) => prefix !== '')
+  if (prefixes.length === 0) return false
+  const segments = commands.split(/\s*(?:;|&&|\|\||\||&)\s*/).filter((segment) => segment.trim() !== '')
+  if (segments.some((segment) => /^(?:cd|pushd|popd)\b/.test(segment.trim()))) return false
+  const hits = segments.filter((segment) => regexes.some((rx) => rx.test(segment)))
+  if (hits.length === 0) return false
+  return hits.every((segment) => {
+    const operands = commandOperands(segment)
+    return operands !== undefined && operands.length > 0 && operands.every((operand) => underPrefix(operand, prefixes))
+  })
+}
+
 const PRESET_PRIORITY: PresetId[] = [
   'fsDestructive',
   'networkExfil',
@@ -130,7 +194,7 @@ export function matchCommand(command: string, config: DangerousCommandsConfig): 
     if (config.presets[id] === 'off') continue
     const regexes = PRESET_REGEXES[id]
     const matched = regexes.find((rx) => rx.test(commands))
-    if (matched) {
+    if (matched && !exemptByPaths(commands, regexes, config.exceptions?.[id])) {
       return {
         presetId: id,
         action: config.presets[id],

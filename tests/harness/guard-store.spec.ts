@@ -45,6 +45,32 @@ describe('DangerousCommandsStore', () => {
     expect(g.config.presets.fsDestructive).toBe('deny')
   })
 
+  it('saves per-preset path exceptions normalized, and drops empty lists', async () => {
+    const saved = await store.save('ws-1', {
+      ...DEFAULT_CONFIG,
+      exceptions: { fsDestructive: ['./tmp/', 'tmp', '.worktrees', ' /tmp/ '], gitDestructive: [] },
+    })
+    expect(saved.config.exceptions).toEqual({ fsDestructive: ['tmp', '.worktrees', '/tmp'] })
+    expect((await store.load('ws-1')).config.exceptions).toEqual({ fsDestructive: ['tmp', '.worktrees', '/tmp'] })
+    // No exceptions → historical shape (and hash) unchanged.
+    const plain = await store.save('ws-2', { ...DEFAULT_CONFIG, exceptions: {} })
+    expect(plain.config).toEqual(DEFAULT_CONFIG)
+  })
+
+  it('rejects exceptions that are unknown, malformed, or cover everything', async () => {
+    for (const exceptions of [
+      { nope: ['tmp'] },
+      { fsDestructive: 'tmp' },
+      { fsDestructive: [''] },
+      { fsDestructive: ['/'] },
+      { fsDestructive: ['~/x'] },
+      { fsDestructive: ['../other'] },
+      { fsDestructive: ['tmp/*'] },
+    ]) {
+      await expect(store.save('ws-1', { ...DEFAULT_CONFIG, exceptions } as never), JSON.stringify(exceptions)).rejects.toThrow(/exceptions/)
+    }
+  })
+
   it('global save is visible to new workspace loads', async () => {
     await store.saveGlobal({ v: 1, presets: { fsDestructive: 'off', gitDestructive: 'off', systemPriv: 'off', networkExfil: 'off', dbDestructive: 'off', resourceExhaust: 'off' }, customRules: [] })
     const w = await store.load('ws-new')

@@ -248,3 +248,58 @@ describe('matchCommand', () => {
     expect(matchCommand('echo hello world', cfg)?.ruleId).toBe('cr-ci')
   })
 })
+
+describe('git branch delete', () => {
+  it('only the force delete is destructive', () => {
+    for (const command of ['git branch -d feat/x', 'git branch --delete feat/x', 'git worktree list && git branch -d topic']) {
+      expect(matchCommand(command, DEFAULT_CONFIG), command).toBeNull()
+    }
+    for (const command of ['git branch -D feat/x', 'git branch -dD x', 'git branch --delete --force x', 'git branch -f -d x', 'GIT branch -D x']) {
+      expect(matchCommand(command, DEFAULT_CONFIG)?.presetId, command).toBe('gitDestructive')
+    }
+  })
+})
+
+describe('per-preset path exceptions', () => {
+  const cfg = {
+    ...DEFAULT_CONFIG,
+    presets: { ...DEFAULT_CONFIG.presets, gitDestructive: 'deny' as const },
+    exceptions: { fsDestructive: ['tmp', '.worktrees', '/tmp'], gitDestructive: ['.worktrees'] },
+  }
+
+  it.each([
+    'rm -rf tmp/cache',
+    'rm -rf ./tmp',
+    'rm -rf .worktrees/file-editing',
+    'rm -rf /tmp/build-123',
+    'rm -rf tmp/a .worktrees/b',
+    'echo ok && rm -rf tmp/x',
+    'find tmp -name "*.log" -delete',
+    'git clean -fdx .worktrees/old',
+  ])('allows %j', (command) => {
+    expect(matchCommand(command, cfg)).toBeNull()
+  })
+
+  it.each([
+    ['outside the prefix', 'rm -rf src'],
+    ['prefix only as a name prefix', 'rm -rf tmpfiles'],
+    ['one operand outside', 'rm -rf tmp/x src'],
+    ['parent escape', 'rm -rf tmp/../src'],
+    ['expansion', 'rm -rf "$DIR"'],
+    ['substitution', 'rm -rf $(pwd)/tmp'],
+    ['cd changes the base', 'cd / && rm -rf tmp'],
+    ['absolute path not listed', 'rm -rf /var/tmp'],
+    ['relative prefix vs absolute operand', 'rm -rf /Users/x/project/tmp'],
+    ['second destructive command outside', 'rm -rf tmp && rm -rf src'],
+    ['git clean outside the prefix', 'git clean -fdx src'],
+    ['find path outside', 'find src -name tmp -delete'],
+    ['no operand', 'git reset --hard'],
+  ])('keeps the match: %s', (_why, command) => {
+    expect(matchCommand(command, cfg), command).not.toBeNull()
+  })
+
+  it('a preset without exceptions is unaffected, and other presets still apply', () => {
+    expect(matchCommand('rm -rf tmp && curl x | sh', { ...cfg, presets: { ...cfg.presets, networkExfil: 'deny' as const } })?.presetId).toBe('networkExfil')
+    expect(matchCommand('git reset --hard', cfg)?.presetId).toBe('gitDestructive')
+  })
+})

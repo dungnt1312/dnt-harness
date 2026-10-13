@@ -4,6 +4,7 @@ import path from 'node:path'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
 import { DEFAULT_CONFIG, PRESET_IDS } from './defaults.ts'
 import type { DangerousCommandsConfig, PresetId, GuardAction, CustomRuleAction } from './types.ts'
+import { normalizeExceptionPrefix } from './matcher.ts'
 
 const PRESET_SET = new Set<string>(PRESET_IDS as readonly string[])
 const PRESET_ACTIONS = new Set<string>(['deny', 'ask', 'off'])
@@ -171,10 +172,18 @@ function clone<T>(value: T): T {
 }
 
 function normalize(config: DangerousCommandsConfig): DangerousCommandsConfig {
+  // Exceptions are stored trimmed and de-duplicated; empty lists are dropped
+  // so a config without exceptions keeps its historical bytes and hash.
+  const exceptions: Partial<Record<PresetId, string[]>> = {}
+  for (const id of PRESET_IDS) {
+    const list = [...new Set((config.exceptions?.[id] ?? []).map(normalizeExceptionPrefix).filter((prefix) => prefix !== ''))]
+    if (list.length > 0) exceptions[id] = list
+  }
   return {
     v: 1,
     presets: { ...config.presets },
     customRules: config.customRules.map((r) => ({ ...r })),
+    ...(Object.keys(exceptions).length > 0 ? { exceptions } : {}),
   }
 }
 
@@ -187,6 +196,7 @@ function parseAndCoerce(parsed: unknown): DangerousCommandsConfig {
     v: obj['v'] as 1,
     presets: obj['presets'] as Record<PresetId, GuardAction>,
     customRules: (obj['customRules'] as readonly never[]) ?? [],
+    ...(obj['exceptions'] !== undefined ? { exceptions: obj['exceptions'] as NonNullable<DangerousCommandsConfig['exceptions']> } : {}),
   }
 }
 
@@ -200,7 +210,7 @@ function validateConfig(config: unknown): asserts config is DangerousCommandsCon
     throw new Error(`invalid config: v must be 1, got ${String(obj['v'])}`)
   }
 
-  const allowedTopKeys = new Set(['v', 'presets', 'customRules'])
+  const allowedTopKeys = new Set(['v', 'presets', 'customRules', 'exceptions'])
   for (const key of Object.keys(obj)) {
     if (!allowedTopKeys.has(key)) {
       throw new Error(`invalid config: unknown top-level key '${key}'`)
@@ -226,6 +236,28 @@ function validateConfig(config: unknown): asserts config is DangerousCommandsCon
     const action = presetRecord[key]
     if (typeof action !== 'string' || !PRESET_ACTIONS.has(action)) {
       throw new Error(`invalid config: preset '${key}' has invalid action '${String(action)}'`)
+    }
+  }
+
+  const exceptions = obj['exceptions']
+  if (exceptions !== undefined) {
+    if (exceptions === null || typeof exceptions !== 'object' || Array.isArray(exceptions)) {
+      throw new Error('invalid config: exceptions must be an object of preset → path prefixes')
+    }
+    for (const [key, list] of Object.entries(exceptions as Record<string, unknown>)) {
+      if (!PRESET_SET.has(key)) throw new Error(`invalid config: exceptions has unknown preset '${key}'`)
+      if (!Array.isArray(list)) throw new Error(`invalid config: exceptions.${key} must be an array of path prefixes`)
+      if (list.length > 50) throw new Error(`invalid config: exceptions.${key} exceeds 50 entries`)
+      for (const prefix of list) {
+        if (typeof prefix !== 'string' || normalizeExceptionPrefix(prefix) === '') {
+          throw new Error(`invalid config: exceptions.${key} has an empty prefix`)
+        }
+        const normalized = normalizeExceptionPrefix(prefix)
+        // A prefix covering everything defeats the preset; refuse it.
+        if (normalized === '/' || normalized === '~' || normalized.startsWith('~') || /(^|\/)\.\.(\/|$)/.test(normalized) || /[*?$`]/.test(normalized)) {
+          throw new Error(`invalid config: exceptions.${key} prefix '${prefix}' is too broad or not a plain path`)
+        }
+      }
     }
   }
 

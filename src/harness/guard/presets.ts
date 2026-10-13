@@ -26,7 +26,10 @@ export const PRESET_REGEXES: Record<PresetId, RegExp[]> = {
     // `git rm` without --cached deletes working-tree files (the matcher
     // rewrites its verb to `gitrm`; `--cached` only untracks and is not matched).
     /\bgitrm\b/i,
-    /\bgit\s+branch\s+-D\b/i,
+    // Force delete only: `-D` (alone or combined) or `--delete --force`.
+    // Case-sensitive on the flag: `-d` is the safe, merged-only delete.
+    /\b[Gg][Ii][Tt]\s+branch\b[^|;&]*\s-[a-zA-Z]*D\b/,
+    /\bgit\s+branch\b[^|;&]*\s(?:--delete\b[^|;&]*\s(?:--force|-f)\b|(?:--force|-f)\b[^|;&]*\s(?:--delete|-d)\b)/i,
     /\bgit\s+stash\s+(clear|drop)\b/i,
     /\bgit\s+restore\b(?![^|]*--staged)/i,
     /\bgit\s+checkout\s+--\s+\./i,
