@@ -110,6 +110,21 @@ describe('toast action', () => {
     expect(fresh).toHaveBeenCalledOnce()
   })
 
+  it('stays reachable while a modal dialog hides the rest of the page', async () => {
+    const { hideOthers } = await import('aria-hidden')
+    const dialog = document.createElement('div')
+    document.body.append(dialog)
+    const undo = hideOthers(dialog)
+    try {
+      act(() => { api.notify('git commit failed', 'bad', { plain: true, persistent: true }) })
+      const toast = toasts()[0]!
+      expect(toast.closest('[aria-hidden="true"]')).toBeNull()
+      expect(toast.closest('[inert]')).toBeNull()
+    } finally {
+      undo()
+    }
+  })
+
   it('a toast without options renders no action button', () => {
     act(() => { api.notify('plain', 'info') })
     expect([...document.querySelectorAll('button')].map((candidate) => candidate.getAttribute('aria-label'))).toEqual(['Dismiss notification'])

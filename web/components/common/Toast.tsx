@@ -124,7 +124,10 @@ export function ToastHost({ children }: { readonly children: ReactNode }) {
   return (
     <ToastContext.Provider value={api}>
       {children}
-      <div className="pointer-events-none fixed inset-x-0 top-[calc(0.75rem+env(safe-area-inset-top))] z-[60] flex flex-col items-center gap-2 px-4">
+      {/* A live region: modal dialogs (Radix `hideOthers`) leave `[aria-live]`
+          nodes visible to assistive tech, so toasts raised from inside a dialog
+          — the Workbench, a Git failure — are still announced and reachable. */}
+      <div aria-live="polite" className="pointer-events-none fixed inset-x-0 top-[calc(0.75rem+env(safe-area-inset-top))] z-[60] flex flex-col items-center gap-2 px-4">
         {items.map((item) => (
           <div
             key={item.id}
