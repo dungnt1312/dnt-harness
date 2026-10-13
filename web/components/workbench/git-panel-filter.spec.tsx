@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { GitPanel } from './GitPanel.tsx'
+import { ToastHost } from '../common/Toast.tsx'
 import type { GitDiffReport, GitStatusReport } from '../../lib/api.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
@@ -27,6 +28,8 @@ const fetchGitDiff = vi.fn(async (_ws: string, _project: string, path: string): 
   ({ path, lines: [], truncated: false, binary: path.endsWith('.png') }))
 
 vi.mock('../../lib/api.ts', () => ({
+  gitOperation: vi.fn(),
+  HttpError: class HttpError extends Error {},
   fetchGitStatus: () => fetchGitStatus(),
   fetchGitDiff: (_ws: string, _project: string, path: string) => fetchGitDiff(_ws, _project, path),
   mediaKindOf: (path: string) => (path.endsWith('.png') ? 'image' : path.endsWith('.mp3') ? 'audio' : path.endsWith('.mp4') ? 'video' : null),
@@ -50,7 +53,7 @@ async function mount(props: Partial<Parameters<typeof GitPanel>[0]> = {}): Promi
   host = document.createElement('div')
   document.body.append(host)
   root = createRoot(host)
-  await act(async () => root!.render(<GitPanel workspaceId="ws1" project={PROJECT} {...props} />))
+  await act(async () => root!.render(<ToastHost><GitPanel workspaceId="ws1" project={PROJECT} {...props} /></ToastHost>))
   return host
 }
 
@@ -113,18 +116,18 @@ it('focusPath scrolls its row to the top of the list once the diff loads, and ag
   const rect = (top: number) => ({ top, bottom: top + 20, left: 0, right: 0, width: 0, height: 20, x: 0, y: top, toJSON: () => ({}) })
   const spy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
     if (this.tagName !== 'BUTTON') return rect(0)
-    const list = this.closest('ul')?.parentElement
+    const list = this.closest('[role="group"]')?.parentElement
     return rect(300 - (list?.scrollTop ?? 0))
   })
   try {
     const view = await mount({ focusPath: 'notes.md', focusNonce: 1 })
     await act(async () => { await vi.waitFor(() => expect(view.textContent).toContain('No textual diff.')) })
-    const list = view.querySelector('ul[aria-label="Changed files"]')!.parentElement!
+    const list = view.querySelector('[role="group"][aria-label="Changed files"]')!.parentElement!
     expect(list.scrollTop).toBe(296)
 
     // The reader scrolls away; clicking the same file in chat brings it back.
     list.scrollTop = 0
-    await act(async () => root!.render(<GitPanel workspaceId="ws1" project={PROJECT} focusPath="notes.md" focusNonce={2} />))
+    await act(async () => root!.render(<ToastHost><GitPanel workspaceId="ws1" project={PROJECT} focusPath="notes.md" focusNonce={2} /></ToastHost>))
     expect(list.scrollTop).toBe(296)
   } finally {
     spy.mockRestore()
