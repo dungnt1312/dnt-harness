@@ -20,6 +20,7 @@ import { newTurnId, type SessionId, type WorkspaceId, type ProjectId } from '../
 import type { Agent } from '../agent/agent.ts'
 import { agentScope, type AgentScope } from '../agent/scope.ts'
 import type { AgentDefinition, AgentSource } from './definition-service.ts'
+import { matchesMcpEntry, missingGrantedMcp, narrowCeiling, roleCandidates } from './mcp-candidates.ts'
 import type { SessionEvent, TurnEndReason } from '../session/events.ts'
 import type { GrantedRoot } from '../tools/types.ts'
 import { describeProgress, type ChildProgress } from './child-progress.ts'
@@ -67,6 +68,9 @@ export interface SpawnAdmissionInput {
   readonly parentSessionId: SessionId
   /** The child definition being admitted (Explorer-class rules key on it). */
   readonly definition: string
+  /** Provenance of the definition: only the bundled explorer is MCP-free. */
+  readonly definitionSource?: AgentSource | undefined
+  /** Role tools; MCP entries may be selectors (`mcp__*`, `mcp__server__*`). */
   readonly candidates: readonly string[]
 }
 
@@ -161,23 +165,12 @@ const FILE_ARG_TOOLS = new Set(['Read', 'Write', 'Edit'])
 
 export class SpawnError extends Error {
   constructor(
-    readonly code: 'capacity' | 'depth' | 'packet' | 'inherit' | 'ownership',
+    readonly code: 'capacity' | 'depth' | 'packet' | 'inherit' | 'ownership' | 'mcp',
     message: string,
   ) {
     super(message)
     this.name = 'SpawnError'
   }
-}
-
-/**
- * The tools a role can ever hold. A role that omitted `tools` (Claude:
- * inherit everything) also admits MCP tools — but only those an explicit
- * spawn grant names, so MCP still always requires a grant.
- */
-function roleCandidates(definition: AgentDefinition, grant: readonly string[] | undefined): readonly string[] {
-  if (definition.inheritsTools !== true || grant === undefined) return definition.tools
-  const extra = grant.filter((tool) => tool.startsWith('mcp__') && !definition.tools.includes(tool))
-  return extra.length === 0 ? definition.tools : [...definition.tools, ...extra]
 }
 
 function snapshotSpawnRequest<T extends SpawnRequest | Omit<SpawnRequest, 'parentTurnId'>>(request: T): T {
@@ -658,13 +651,24 @@ export class ChildExecutor {
           workspaceId: request.workspaceId,
           parentSessionId: request.parentSessionId,
           definition: request.definition.name,
-          candidates: roleCandidates(request.definition, request.grantTools),
+          ...(request.definitionSource !== undefined ? { definitionSource: request.definitionSource } : {}),
+          candidates: roleCandidates(request.definition, request.definitionSource),
         })
       : request.exposureCeiling
     if (exposureCeiling === undefined) {
       throw new SpawnError('ownership', 'trusted spawn admission authority is required')
     }
-    const pinnedExposureCeiling = [...exposureCeiling]
+    // Ceiling = admission exposure ∩ role candidates (MCP selectors expanded by
+    // the host), narrowed by the grant − disallowed. Admission is host-resolved
+    // and pinned here, before any durable state, so a missing explicitly
+    // granted MCP tool fails cleanly and later widening adds nothing.
+    const candidates = roleCandidates(request.definition, request.definitionSource)
+    const admitted = exposureCeiling.filter((tool) => candidates.some((entry) => entry === tool || matchesMcpEntry(entry, tool)))
+    const toolCeiling = narrowCeiling(admitted, request.grantTools, request.definition.disallowedTools)
+    const missing = missingGrantedMcp(request.grantTools, toolCeiling)
+    if (missing.length > 0) {
+      throw new SpawnError('mcp', `granted MCP tools are not available to '${request.definition.name}': ${missing.join(', ')} (the role does not list them, the mode does not expose them, or the server is disabled, disconnected or allowlisted out)`)
+    }
 
     // Durable closing/end facts refuse a late spawn whether or not the
     // turn's start is still in the log, and whatever the in-memory guard
@@ -789,19 +793,6 @@ export class ChildExecutor {
     if (child.status === 'uncertain') return this.withResult(child)
 
     try {
-      // Ceiling = admission exposure ∩ definition ∩ explicit grant − disallowed.
-      // Admission exposure is host-resolved and pinned before durable spawn;
-      // a grant only narrows it. MCP always requires an explicit spawn grant.
-      const disallowed = new Set(request.definition.disallowedTools)
-      const eligible = new Set(pinnedExposureCeiling)
-      const grant = request.grantTools ?? undefined
-      const base = roleCandidates(request.definition, grant).filter((tool) => {
-        if (!eligible.has(tool)) return false
-        if (tool.startsWith('mcp__')) return grant?.includes(tool) === true
-        return grant !== undefined ? grant.includes(tool) : true
-      })
-      const toolCeiling = [...new Set(base)].filter((tool) => !disallowed.has(tool))
-
       // The COMPLETE child scope (childOf included) is the agent's immutable
       // identity: Agent.run() re-enters agentScope with it, so the exposure
       // gate sees the definition ceiling on every child tool start and the

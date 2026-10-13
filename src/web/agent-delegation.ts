@@ -346,7 +346,7 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
       `Roles: ${roles.map((role) => `${role.name} (${role.description})`).join('; ') || 'none'}.`,
       `Models as provider:model — ${models.join(', ') || 'none'}${total > models.length ? `, +${total - models.length} more, use action:"catalog"` : ''}.`,
       `Model aliases — ${aliases.map((alias) => alias.valid ? `${alias.name} (${alias.provider}:${alias.model}, thinking ${alias.thinkingLevel ?? 'model default'})` : `${alias.name} (unusable: ${alias.error ?? 'invalid target'})`).join('; ') || 'none'}.`,
-      'Omit model to inherit this conversation\'s model; model accepts a plain alias or provider:model; grantTools only narrows the role, never widens it.',
+      'Omit model to inherit this conversation\'s model; model accepts a plain alias or provider:model; grantTools only narrows the role, never widens it. Roles that inherit tools also get this conversation\'s MCP tools unless grantTools names specific MCP tools.',
     ].join(' ')
   }
 
@@ -390,7 +390,7 @@ const PARAMETERS: ToolDefinition['parameters'] = {
     objective: { type: 'string', description: 'spawn: alternative structured form — what the child must accomplish (use prompt instead)' },
     constraints: { type: 'array', items: { type: 'string' }, description: 'spawn: limits the child must respect' },
     references: { type: 'array', items: { type: 'string' }, description: 'spawn: files or facts the child should start from' },
-    grantTools: { type: 'array', items: { type: 'string' }, description: 'spawn: narrows the role\'s tools; never widens them' },
+    grantTools: { type: 'array', items: { type: 'string' }, description: 'spawn: narrows the role\'s tools; never widens them. Naming any mcp__ tool limits MCP to those names' },
     model: { type: 'string', description: 'spawn: a model alias, provider:model, or bare model name; omit to inherit this conversation\'s' },
     childIds: { type: 'array', items: { type: 'string' }, description: 'wait/cancel: child session ids; wait defaults to every running child' },
     timeoutMs: { type: 'number', description: `wait: longest to block in ms; returns early when the children settle. Default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}. Prefer minutes to avoid busy polling.` },
@@ -453,12 +453,10 @@ async function spawn(
     ...(inheritedContext !== undefined ? { inherit: 'brief' as const, inheritedContext } : {}),
     ...(deps.grantsOf !== undefined ? { grants: deps.grantsOf(parentSessionId) } : {}),
   })
-  // A grant that asked for something the role lacks is reported, never
-  // silently dropped: the model would otherwise plan around a missing tool.
-  const dropped = grantTools?.filter((tool) =>
-    !resolved.definition.tools.includes(tool)
-    // A role that inherits every tool admits granted MCP tools.
-    && !(resolved.definition.inheritsTools === true && tool.startsWith('mcp__'))) ?? []
+  // A built-in grant the role lacks is reported, never silently dropped: the
+  // model would otherwise plan around a missing tool. MCP names are checked
+  // at admission (a missing concrete one fails the spawn).
+  const dropped = grantTools?.filter((tool) => !tool.startsWith('mcp__') && !resolved.definition.tools.includes(tool)) ?? []
   const notes = [
     ...(dropped.length > 0 ? [`role '${handle.definitionName}' does not expose ${dropped.join(', ')}`] : []),
     ...(both ? ["both 'prompt' and 'objective' were given; the prompt is the brief"] : []),

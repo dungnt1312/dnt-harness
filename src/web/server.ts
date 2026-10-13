@@ -107,7 +107,8 @@ import {
 import { ScopeError, WorkspaceService, type AdditionalDirectory, type ProjectRecord, type WorkspaceRecord } from '../harness/workspace/service.ts'
 import { ModesService, ModeError, DEFAULT_MODE_ID, BUNDLED_MODES, type ResolvedMode } from '../harness/modes/service.ts'
 import { migrateRootModes } from '../harness/modes/root-migration.ts'
-import { AgentDefinitionService, AgentDefinitionError, serializeAgentDefinition } from '../harness/agents/definition-service.ts'
+import { AgentDefinitionService, AgentDefinitionError, serializeAgentDefinition, type AgentSource } from '../harness/agents/definition-service.ts'
+import { narrowCeiling, roleCandidates } from '../harness/agents/mcp-candidates.ts'
 import {
   McpConfigStore,
   McpConfigError,
@@ -2090,7 +2091,7 @@ ${entry.description}`.toLowerCase().includes(query))
         return { ...alias, valid: true }
       } catch (error) { return { ...alias, valid: false, error: String(error instanceof Error ? error.message : error) } }
     }),
-    admissionResolver: ({ parentSessionId, workspaceId, definition, candidates }) => admissionExposureCeiling(parentSessionId, workspaceId, definition, candidates),
+    admissionResolver: ({ parentSessionId, workspaceId, definition, definitionSource, candidates }) => admissionExposureCeiling(parentSessionId, workspaceId, definition, candidates, definitionSource),
     grantsOf: (parentSessionId) => {
       const entry = sessions.get(parentSessionId)
       return entry === undefined ? [] : effectiveGrants(parentSessionId, entry.projectId, entry.workspaceId)
@@ -2692,11 +2693,19 @@ ${entry.description}`.toLowerCase().includes(query))
       return { mode: mode.definition, revision }
     },
     loadMcp: (workspaceId) => mcpStore.loadMcp(workspaceId),
+    mcpToolNames: async (workspaceId) => {
+      // Admission waits for this workspace's MCP connect, like a root turn's
+      // pre-step: a child must not pin an empty MCP set because the servers
+      // were still starting. A failed connect leaves that server's tools out.
+      await connectWorkspaceMcp(workspaceId as WorkspaceId).catch(() => {})
+      const prefix = `${workspaceId}:`
+      return [...mcpDescriptors.keys()].filter((key) => key.startsWith(prefix)).map((key) => key.slice(prefix.length))
+    },
   })
 
   /** Spawn admission ceiling; called by the executor at its admission linearization point. */
-  async function admissionExposureCeiling(rootSessionId: SessionId, workspaceId: WorkspaceId, definition: string, candidates: readonly string[]): Promise<readonly string[]> {
-    return executionAuthority.admissionCeiling({ workspaceId, rootSessionId, definition, candidates })
+  async function admissionExposureCeiling(rootSessionId: SessionId, workspaceId: WorkspaceId, definition: string, candidates: readonly string[], definitionSource?: AgentSource): Promise<readonly string[]> {
+    return executionAuthority.admissionCeiling({ workspaceId, rootSessionId, definition, ...(definitionSource !== undefined ? { definitionSource } : {}), candidates })
   }
 
   /**
@@ -3677,12 +3686,10 @@ ${entry.description}`.toLowerCase().includes(query))
       throw error
     }
     const { definition } = resolved
-    // MCP tools need an explicit grant on a spawn; a role run has none, so it
-    // gets MCP tools only when the role names them itself.
-    const candidates = definition.tools
-    const exposed = new Set(await admissionExposureCeiling(rootId, workspaceId, definition.name, candidates))
-    const disallowed = new Set(definition.disallowedTools)
-    const toolCeiling = [...new Set(candidates)].filter((tool) => exposed.has(tool) && !disallowed.has(tool) && tool !== 'Agent')
+    // A role run has no spawn grant: its ceiling is admission ∩ role
+    // candidates − disallowed, the rule a spawn without a grant gets.
+    const exposed = await admissionExposureCeiling(rootId, workspaceId, definition.name, roleCandidates(definition, resolved.source), resolved.source)
+    const toolCeiling = narrowCeiling(exposed, undefined, definition.disallowedTools).filter((tool) => tool !== 'Agent')
     return {
       definition: definition.name,
       instructions: definition.instructions,
@@ -4193,7 +4200,7 @@ interface HandlerDeps {
   readonly adoptMode: (workspaceId: WorkspaceId, modeId: string) => Promise<ResolvedMode>
   readonly stampRootMode: (session: Session, resolved: ResolvedMode) => Extract<SessionEvent, { type: 'session/mode' }>
   readonly rootModeOf: (scope: { readonly sessionId: SessionId; readonly rootSessionId?: SessionId }, workspaceId: WorkspaceId) => { mode: ResolvedMode; revision: number }
-  readonly admissionExposureCeiling: (rootSessionId: SessionId, workspaceId: WorkspaceId, definition: string, candidates: readonly string[]) => Promise<readonly string[]>
+  readonly admissionExposureCeiling: (rootSessionId: SessionId, workspaceId: WorkspaceId, definition: string, candidates: readonly string[], definitionSource?: AgentSource) => Promise<readonly string[]>
   /** Whether the root's latest durable turn is terminal; admission reads this because `agent.busy` lags the durable append. */
   readonly turnTerminal: (session: Session) => boolean
   readonly agentDefinitions: AgentDefinitionService
@@ -5068,7 +5075,7 @@ async function handleApi(
             parentSessionId: parent.session.id,
             definition: resolved.definition,
             ...(resolved.source !== undefined ? { definitionSource: resolved.source } : {}),
-            admissionResolver: ({ parentSessionId, workspaceId, definition, candidates }) => deps.admissionExposureCeiling(parentSessionId, workspaceId, definition, candidates),
+            admissionResolver: ({ parentSessionId, workspaceId, definition, definitionSource, candidates }) => deps.admissionExposureCeiling(parentSessionId, workspaceId, definition, candidates, definitionSource),
             packet: task,
             ...(inheritedContext !== undefined ? { inherit: 'brief' as const, inheritedContext } : {}),
             ...(parent.projectId !== undefined ? { projectId: parent.projectId } : {}),
@@ -5092,7 +5099,7 @@ async function handleApi(
           })
         } catch (error) {
           if (error instanceof SpawnError) {
-            send(error.code === 'capacity' ? 429 : error.code === 'packet' || error.code === 'inherit' ? 400 : 404, { error: error.message })
+            send(error.code === 'capacity' ? 429 : error.code === 'packet' || error.code === 'inherit' || error.code === 'mcp' ? 400 : 404, { error: error.message })
             return
           }
           if (error instanceof ChildModelError) {

@@ -143,6 +143,31 @@ describe('child identity and admission ceiling', () => {
     await harness.kernel.stop()
   })
 
+  it('inherit role keeps admitted MCP under a built-in-only grant; a missing granted MCP name fails before commit', async () => {
+    const harness = await boot(['done'])
+    let captured: readonly string[] | undefined
+    const service = harness.kernel.ctx.agents
+    const create = service.create.bind(service)
+    service.create = ((session, identity) => {
+      captured = (identity as { childOf?: { toolCeiling?: readonly string[] } } | undefined)?.childOf?.toolCeiling
+      return create(session, identity)
+    }) as typeof service.create
+    const inherit: AgentDefinition = { ...worker, name: 'scout', tools: ['Read', 'Grep'], inheritsTools: true }
+    const seen: string[][] = []
+    const resolver = async (input: { candidates: readonly string[] }) => {
+      seen.push([...input.candidates])
+      return ['Read', 'Grep', 'mcp__s__get']
+    }
+    const handle = await harness.executor.spawn(request(harness, inherit, { exposureCeiling: undefined, admissionResolver: resolver, grantTools: ['Read'] }))
+    await settle(harness, handle.childSessionId)
+    expect(seen[0]).toEqual(['Read', 'Grep', 'mcp__*'])
+    expect(captured).toEqual(['Read', 'mcp__s__get'])
+
+    await expect(harness.executor.spawn(request(harness, inherit, { exposureCeiling: undefined, admissionResolver: resolver, grantTools: ['mcp__x__y'] })))
+      .rejects.toMatchObject({ name: 'SpawnError', code: 'mcp' })
+    await harness.kernel.stop()
+  })
+
   it('a child keeps its admitted ceiling while authority widens before it launches', async () => {
     const harness = await boot([])
     const ceilings = new Map<string, readonly string[] | undefined>()
