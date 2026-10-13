@@ -683,6 +683,10 @@ export interface GitStatusReport {
   readonly ahead?: number
   /** Commits behind the upstream, when the branch tracks one. */
   readonly behind?: number
+  /** A merge, cherry-pick, rebase, revert or apply is in progress. */
+  readonly mergeHeads?: boolean
+  /** `MERGE_MSG` (comment lines stripped), the suggested commit message while merging. */
+  readonly mergeMessage?: string
 }
 
 export interface GitDiffLine {
@@ -690,11 +694,53 @@ export interface GitDiffLine {
   readonly text: string
 }
 
+/** Zed `secondary_status` of one displayed hunk. */
+export type GitHunkStatus = 'staged' | 'unstaged' | 'partial'
+
+/** The identity of one displayed hunk; the server refuses a stale one. */
+export interface GitHunkRef {
+  readonly oldStart: number
+  readonly oldLines: number
+  readonly newStart: number
+  readonly newLines: number
+  readonly fingerprint: string
+}
+
+export interface GitHunk extends GitHunkRef {
+  readonly status: GitHunkStatus
+}
+
+/** One conflict region of a conflicted file (Zed `conflict_set.rs`). */
+export interface GitConflict {
+  readonly index: number
+  readonly startLine: number
+  readonly endLine: number
+  readonly ours: string
+  readonly theirs: string
+  readonly oursName: string
+  readonly theirsName: string
+  readonly fingerprint: string
+}
+
 export interface GitDiffReport {
   readonly path: string
   readonly lines: readonly GitDiffLine[]
   readonly truncated: boolean
   readonly binary: boolean
+  /** The displayed hunks; empty when hunk controls are not offered for this file. */
+  readonly hunks?: readonly GitHunk[]
+  /** Conflict regions of a conflicted file. */
+  readonly conflicts?: readonly GitConflict[]
+}
+
+/** One branch from `for-each-ref` (Zed `Branch`). `name` is short: `main`, `origin/main`. */
+export interface GitBranch {
+  readonly name: string
+  readonly remote: boolean
+  readonly current: boolean
+  readonly upstream?: string
+  readonly unixTime?: number
+  readonly subject?: string
 }
 
 /** Read-only git status for a project. An empty `changes` is a clean tree or no repository. */
@@ -752,6 +798,14 @@ export type GitOperationInput =
   | { readonly type: 'remotes'; readonly branch: string; readonly push?: boolean; readonly all?: boolean }
   /** Query: the remote refs containing HEAD; answered in `done.pushedTo`. */
   | { readonly type: 'pushed-to' }
+  /** Query: local and remote branches; answered in `done.branches`, `done.defaultBranch` and `done.error`. */
+  | { readonly type: 'branches' }
+  | { readonly type: 'switch-branch'; readonly name: string }
+  | { readonly type: 'create-branch'; readonly name: string; readonly base?: string }
+  | { readonly type: 'delete-branch'; readonly name: string; readonly remote?: boolean; readonly force?: boolean }
+  | { readonly type: 'stage-hunk' | 'unstage-hunk' | 'restore-hunk'; readonly path: string; readonly hunk: GitHunkRef }
+  | { readonly type: 'resolve-conflict'; readonly path: string; readonly index: number; readonly fingerprint: string; readonly choice: 'ours' | 'theirs' | 'both' }
+  | { readonly type: 'ignore'; readonly paths: readonly string[] }
 
 /** A credential prompt Git raised while the operation runs. */
 export interface GitAskpassFrame {
@@ -772,6 +826,12 @@ export interface GitOperationDone {
   readonly cancelled?: boolean
   readonly remotes?: readonly string[]
   readonly pushedTo?: readonly string[]
+  /** The `branches` query's answer. */
+  readonly branches?: readonly GitBranch[]
+  /** The repository's default branch, when one resolves (Zed `default_branch`). */
+  readonly defaultBranch?: string
+  /** Why the branch list is partial (Zed `branch_list_error`). */
+  readonly error?: string
 }
 
 export type GitOperationFrame = GitAskpassFrame | GitOperationDone
@@ -894,6 +954,82 @@ export async function gitOperation(
     streamEnded.abort()
     reader.cancel().catch(() => {})
   }
+}
+
+/**
+ * Stream a generated commit message (`POST …/git/commit-message`, NDJSON):
+ * `onText` gets each delta as it arrives. Rejects with the server's own words
+ * (no model configured, a provider error) and when the stream ends without a
+ * `done`. Aborting `signal` cancels the model request on the server.
+ */
+export async function streamCommitMessage(
+  workspaceId: string,
+  projectId: string,
+  subject: string | undefined,
+  onText: (text: string) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  const response = await apiFetch(`${projectBase(workspaceId, projectId)}/git/commit-message`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(subject !== undefined && subject !== '' ? { subject } : {}),
+    signal,
+  })
+  if (!response.ok) {
+    const text = await response.text()
+    let message = text
+    try {
+      const parsed = (JSON.parse(text) as { readonly error?: unknown }).error
+      if (typeof parsed === 'string' && parsed !== '') message = parsed
+    } catch { /* not JSON: the body is the message */ }
+    throw new HttpError(response.status, message)
+  }
+  if (response.body === null) throw new Error('Commit message answered without a stream')
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let pending = ''
+  const take = (line: string): boolean => {
+    if (line.trim() === '') return false
+    const frame = JSON.parse(line) as { readonly type?: string; readonly text?: string; readonly ok?: boolean; readonly error?: string }
+    if (frame.type === 'delta' && typeof frame.text === 'string') onText(frame.text)
+    if (frame.type === 'done') {
+      if (frame.ok !== true) throw new Error(frame.error ?? 'Commit message generation failed')
+      return true
+    }
+    return false
+  }
+  try {
+    for (;;) {
+      const chunk = await reader.read()
+      if (chunk.done) break
+      pending += decoder.decode(chunk.value, { stream: true })
+      for (let newline = pending.indexOf('\n'); newline >= 0; newline = pending.indexOf('\n')) {
+        const line = pending.slice(0, newline)
+        pending = pending.slice(newline + 1)
+        if (take(line)) return
+      }
+    }
+    pending += decoder.decode()
+    if (take(pending)) return
+    throw new Error('Commit message ended without a result')
+  } finally {
+    reader.cancel().catch(() => {})
+  }
+}
+
+/** Settings → Providers & Models → Git: the commit-message model (empty uses the `fast` alias). */
+export type CommitMessageSettings = ImageGenerationSettings
+
+export function getCommitMessageSettings(): Promise<CommitMessageSettings> {
+  return apiFetch('/api/commit-message').then((r) => json<CommitMessageSettings>(r))
+}
+
+export function setCommitMessageSettings(update: CommitMessageSettings): Promise<CommitMessageSettings> {
+  return apiFetch('/api/commit-message', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(update),
+  }).then((r) => json<CommitMessageSettings>(r))
 }
 
 /** Bounded file-name search under a project root (composer mentions). */

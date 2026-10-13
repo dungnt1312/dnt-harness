@@ -123,11 +123,18 @@ describe('commit button', () => {
     await mount()
     expect(commitButton('Commit Tracked').title).toBe('No changes to commit')
 
+    // Two staged files suggest nothing, so an empty editor has no message to commit.
     await act(async () => root!.unmount())
-    current = report([STAGED])
+    current = report([STAGED, { ...STAGED, path: 'src/other.ts' }])
     await mount()
     expect(commitButton('Commit').disabled).toBe(true)
     expect(commitButton('Commit').title).toBe('No commit message')
+  })
+
+  it('one staged file suggests its message, so an empty editor can commit (Zed has_commit_message)', async () => {
+    current = report([STAGED])
+    await mount()
+    expect(commitButton('Commit').disabled).toBe(false)
   })
 
   it('reads Commit with staged changes, Commit Tracked with only unstaged tracked ones, and shows the command', async () => {

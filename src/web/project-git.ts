@@ -16,6 +16,8 @@ import { accessSync, constants as fsConstants, existsSync, promises as fs, statS
 import path from 'node:path'
 import { detectLoginShell, loginShellArgs } from '../capabilities/shell/detect.ts'
 import { resolveGrantedPath } from '../capabilities/fs/tools.ts'
+import { hunksFor } from './project-git-hunks.ts'
+import { parseConflicts, type GitConflict } from './project-git-conflicts.ts'
 
 /** One changed path, in the shape the Git view lists. */
 export interface GitChange {
@@ -84,6 +86,10 @@ export interface GitStatusReport {
   readonly ahead?: number
   /** Commits behind the upstream, when the branch tracks one (compatibility with the Environment panel). */
   readonly behind?: number
+  /** A merge/cherry-pick/rebase/revert/apply is in progress (any `*_HEAD` file resolves). */
+  readonly mergeHeads?: boolean
+  /** `MERGE_MSG` (comment lines stripped) while a merge message exists. */
+  readonly mergeMessage?: string
 }
 
 /** Ahead/behind from a `git status -b` header; absent when there is no upstream. */
@@ -110,6 +116,10 @@ export interface GitDiffReport {
   readonly truncated: boolean
   /** No textual diff: a binary, or a change git can name but not print. */
   readonly binary: boolean
+  /** The displayed hunks with their staging status; empty when hunk controls are not offered. */
+  readonly hunks?: readonly import('./project-git-hunks.ts').GitHunk[]
+  /** Conflict blocks of a conflicted file; always present (empty) for a clean shape. */
+  readonly conflicts?: readonly GitConflict[]
 }
 
 export class ProjectGitError extends Error {}
@@ -311,8 +321,8 @@ export function gitCommandArgs(args: readonly string[], trusted: boolean): strin
 
 export interface GitCommandOptions {
   readonly trusted: boolean
-  /** `'ignore'` closes stdin (a push must never wait on it); default `'pipe'`. */
-  readonly stdin?: 'pipe' | 'ignore'
+  /** `'ignore'` closes stdin (a push must never wait on it); default `'pipe'`. A Buffer is written, then closed. */
+  readonly stdin?: 'pipe' | 'ignore' | Buffer
   /** Replaces the project environment, e.g. when the caller adds askpass variables to it. */
   readonly env?: Readonly<Record<string, string>>
   /** Start git as its own process group leader (not on Windows), so the whole tree can be killed. */
@@ -332,10 +342,12 @@ export async function buildGitCommand(
   options: GitCommandOptions,
 ): Promise<ChildProcessWithoutNullStreams> {
   const env = options.env ?? await projectGitEnvironment(root)
+  // A Buffer stdin means "pipe and feed it"; anything else names the stdio itself.
+  const stdioIn: 'pipe' | 'ignore' = options.stdin === undefined || Buffer.isBuffer(options.stdin) ? 'pipe' : options.stdin
   const child = spawn(gitOnPath(env), gitCommandArgs(args, options.trusted), {
     cwd: root,
     env: { ...env },
-    stdio: [options.stdin ?? 'pipe', 'pipe', 'pipe'],
+    stdio: [stdioIn, 'pipe', 'pipe'],
     windowsHide: true,
     detached: options.detached === true && process.platform !== 'win32',
   }) as ChildProcessWithoutNullStreams
@@ -366,6 +378,13 @@ export type GitRunner = (root: string, args: readonly string[], options: GitComm
 /** {@link runGitQuery} with the full command options (environment, stdin). */
 export const runGitCommand: GitRunner = async (root, args, options) => {
   const child = await buildGitCommand(root, args, options)
+  // A Buffer stdin is written once and closed; a plain 'pipe' (no data) is
+  // closed empty as soon as git reads, and 'ignore' never had one.
+  if (options.stdin !== undefined && options.stdin !== 'pipe' && options.stdin !== 'ignore') {
+    child.stdin.end(options.stdin)
+  } else if (options.stdin === 'pipe') {
+    child.stdin.end()
+  }
   return new Promise((resolve, reject) => {
     const out: Buffer[] = []
     const err: Buffer[] = []
@@ -532,6 +551,7 @@ export async function gitStatus(root: string, deniedRoots?: readonly string[], t
   const branchInfo = name === '' ? null : await branchReport(root, trusted, name)
   const head = await headReport(root, trusted)
   const counted = await lineCounts(root, trusted)
+  const merge = await mergeState(root, trusted)
   const track = branchInfo?.upstreamTrack
   return {
     branch: branchInfo?.name ?? null,
@@ -539,11 +559,39 @@ export async function gitStatus(root: string, deniedRoots?: readonly string[], t
     head,
     truncated,
     ...(track?.kind === 'tracked' ? { ahead: track.ahead, behind: track.behind } : {}),
+    ...(merge.heads ? { mergeHeads: true } : { mergeHeads: false }),
+    ...(merge.message !== undefined ? { mergeMessage: merge.message } : {}),
     changes: changes.map((change) => {
       const count = counted.get(change.path)
       return count === undefined ? change : { ...change, ...count }
     }),
   }
+}
+
+/** The `*_HEAD` sentinel files and `MERGE_MSG` of an in-progress sequence, in one git call. */
+async function mergeState(root: string, trusted: boolean): Promise<{ heads: boolean; message?: string }> {
+  const names = ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REBASE_HEAD', 'REVERT_HEAD', 'APPLY_HEAD', 'MERGE_MSG']
+  const { stdout, code } = await runGitQuery(root, ['rev-parse', ...names.flatMap((name) => ['--git-path', name])], trusted)
+  if (code !== 0) return { heads: false }
+  const paths = stdout.toString('utf8').split('\n').filter((line) => line !== '')
+  let heads = false
+  for (const gitPath of paths.slice(0, 5)) {
+    try {
+      await fs.access(path.resolve(root, gitPath))
+      heads = true
+      break
+    } catch { /* not present */ }
+  }
+  let message: string | undefined
+  const mergeMsg = paths[5]
+  if (mergeMsg !== undefined) {
+    try {
+      const raw = await fs.readFile(path.resolve(root, mergeMsg), 'utf8')
+      const stripped = raw.split('\n').filter((line) => !line.startsWith('#')).join('\n').replace(/\s+$/, '')
+      if (stripped !== '') message = stripped
+    } catch { /* no merge message */ }
+  }
+  return { heads, ...(message !== undefined ? { message } : {}) }
 }
 
 /**
@@ -605,7 +653,20 @@ export async function gitDiff(root: string, rawPath: string, deniedRoots?: reado
   const truncated = Buffer.byteLength(text) > MAX_DIFF_BYTES
   if (truncated) text = text.slice(0, MAX_DIFF_BYTES)
   const binary = text.includes('Binary files ') || text.includes('GIT binary patch')
-  return { path: rel, lines: binary ? [] : parseDiff(text), truncated, binary }
+  if (binary || truncated) return { path: rel, lines: binary ? [] : parseDiff(text), truncated, binary, hunks: [] }
+  // A conflicted file shows its conflict blocks instead of hunks: the markers
+  // live in the worktree file, not in any git diff of it.
+  const change = (await readStatusChanges(root, deniedRoots, trusted))?.changes.find((entry) => entry.path === rel)
+  if (change?.conflicted === true) {
+    let conflicts: GitConflict[] = []
+    try {
+      conflicts = parseConflicts(await fs.readFile(path.join(root, rel), 'utf8'))
+    } catch { /* unreadable: no blocks */ }
+    return { path: rel, lines: parseDiff(text), truncated, binary, hunks: [], conflicts }
+  }
+  const hunks = await hunksFor(root, rel, trusted, text,
+    (args) => runGitQuery(root, args, trusted), hasHead, false)
+  return { path: rel, lines: parseDiff(text), truncated, binary, hunks }
 }
 
 /** Turn unified diff text into rows. The `diff --git` header is dropped. */

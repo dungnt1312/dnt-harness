@@ -73,6 +73,9 @@ import { createProjectEntry, deleteProjectEntry, ProjectWriteError, renameProjec
 import { gitDiff, gitStatus, ProjectGitError } from './project-git.ts'
 import { answerGitAskpass, type AskpassSession } from './git-askpass.ts'
 import { listProjectGitRemotes, pushedTo, runProjectGitOperation, type GitOperationRequest } from './project-git-ops.ts'
+import { listProjectGitBranches } from './project-git-branches.ts'
+import { commitMessageDiff, commitMessagePrompt, streamCommitMessage } from './git-commit-message.ts'
+import type { GitHunkRef } from './project-git-hunks.ts'
 import {
   AttachmentError,
   AttachmentStore,
@@ -609,11 +612,12 @@ export interface PublicProvider {
 }
 
 /** The provider/model references kept beside providers.json, one file each. */
-const MODEL_PAIR_NAMES = ['image-generation', 'image-understanding', 'video-generation'] as const
+const MODEL_PAIR_NAMES = ['image-generation', 'image-understanding', 'video-generation', 'commit-message'] as const
 type ModelPairName = (typeof MODEL_PAIR_NAMES)[number]
 const MODEL_PAIR_ROUTES: Readonly<Record<string, { readonly name: ModelPairName; readonly label: string }>> = {
   '/api/image-generation': { name: 'image-generation', label: 'image generation' },
   '/api/image-understanding': { name: 'image-understanding', label: 'image understanding' },
+  '/api/commit-message': { name: 'commit-message', label: 'commit message' },
   '/api/video-generation': { name: 'video-generation', label: 'video generation' },
 }
 
@@ -934,6 +938,33 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       throw new Error(`unknown model '${model}' for provider '${id}'; available: ${available.join(', ')}`)
     }
     return { provider: id, model }
+  }
+
+  /**
+   * The model behind the Git panel's Generate Commit Message button: the
+   * `commit-message` pair when one is set, else the alias named `fast`. No
+   * silent fallback: a set-but-unusable pair returns its own error.
+   */
+  const commitMessageModel = (): { providerName: string; model: string } | { error: string } => {
+    const pair = pairs.get('commit-message')!
+    if (pair.provider !== null && pair.model !== null) {
+      try {
+        validateProviderModel(pair.provider, pair.model)
+        return { providerName: pair.provider, model: pair.model }
+      } catch (error) {
+        return { error: `commit message model: ${error instanceof Error ? error.message : String(error)}` }
+      }
+    }
+    const fast = aliases.find((alias) => alias.name === 'fast')
+    if (fast !== undefined) {
+      try {
+        validateProviderModel(fast.provider, fast.model)
+        return { providerName: fast.provider, model: fast.model }
+      } catch (error) {
+        return { error: `commit message model: ${error instanceof Error ? error.message : String(error)}` }
+      }
+    }
+    return { error: 'No commit message model is configured.' }
   }
 
   syncRegistrations()
@@ -3898,6 +3929,9 @@ ${entry.description}`.toLowerCase().includes(query))
       await savePair(pairFile(name), next)
       pairs.set(name, next)
     },
+    commitMessageModel,
+    commitMessageStream: (request, signal) => agentScope.exit(() => kernel.ctx.llm.stream(request, { signal })),
+    recordUsage: (record) => usageLog.record(record),
     checkpoints,
     lastManifests,
     prefixSnapshots,
@@ -4212,9 +4246,15 @@ interface HandlerDeps {
   readonly usageLog: UsageLog
   /** Generated-video storage (streamed to disk, served with Range). */
   readonly videos: VideoStore
-  /** Settings → Providers & Models → Image generation / Image understanding / Video generation. */
+  /** Settings → Providers & Models → Image generation / Image understanding / Video generation / Commit message. */
   readonly modelPair: (name: ModelPairName) => ModelPair
   readonly setModelPair: (name: ModelPairName, next: ModelPair) => Promise<void>
+  /** The model the Git panel's Generate Commit Message button runs on; `{ error }` when none resolves. */
+  readonly commitMessageModel: () => { providerName: string; model: string } | { error: string }
+  /** One model stream outside any session (the commit-message generator). */
+  readonly commitMessageStream: (request: import('../harness/llm/types.ts').ModelRequest, signal: AbortSignal) => AsyncIterable<import('../harness/llm/types.ts').StreamEvent>
+  /** Records one usage row for a non-session model call. */
+  readonly recordUsage: (record: import('./usage-log.ts').UsageRecord) => void
   readonly summarizerModelOf: (session: Session) => { readonly providerName: string; readonly model: string } | undefined
   /** Runs PreCompact hooks (durable hook/run events); returns the blocking reason, or undefined to proceed. */
   readonly runPreCompactHooks: (session: Session, workspaceId: WorkspaceId) => Promise<string | undefined>
@@ -7761,11 +7801,15 @@ function browserPrincipal(req: IncomingMessage, deps: HandlerDeps, method: strin
 
 // ── Git panel actions ──────────────────────────────────────────
 
-/** Operations of `POST …/projects/:pid/git/:op`; `remotes` and `pushed-to` are queries answered in the done frame. */
+/** Operations of `POST …/projects/:pid/git/:op`; the queries are answered in the done frame. */
 const GIT_OPERATIONS: ReadonlySet<string> = new Set([
   'stage', 'unstage', 'discard', 'trash', 'stage-all', 'unstage-all', 'commit', 'uncommit', 'fetch', 'fetch-all', 'pull', 'push',
+  'switch-branch', 'create-branch', 'delete-branch',
+  'stage-hunk', 'unstage-hunk', 'restore-hunk', 'resolve-conflict', 'ignore',
 ])
-const GIT_QUERIES: ReadonlySet<string> = new Set(['remotes', 'pushed-to'])
+const GIT_QUERIES: ReadonlySet<string> = new Set(['remotes', 'pushed-to', 'branches'])
+/** Streamed like an operation, but produced by the model layer, not git. */
+const GIT_STREAMS: ReadonlySet<string> = new Set(['commit-message'])
 
 /**
  * Which principal's operation raised a prompt, so another browser session
@@ -7832,7 +7876,7 @@ function parseGitOperation(op: string, body: GitBody): GitOperationRequest | str
       if (typeof f === 'string') return f
       return { type: 'pull', remote, ...(branch === '' ? {} : { branch }), rebase: f['rebase'] === true }
     }
-    default: {
+    case 'push': {
       const remote = gitText(body, 'remote')
       const branch = gitText(body, 'branch')
       const upstreamBranch = gitText(body, 'upstreamBranch', true)
@@ -7843,7 +7887,64 @@ function parseGitOperation(op: string, body: GitBody): GitOperationRequest | str
       if (typeof f === 'string') return f
       return { type: 'push', remote, branch, upstreamBranch, setUpstream: f['setUpstream'] === true, force: f['force'] === true }
     }
+    case 'switch-branch': {
+      const name = gitText(body, 'name')
+      return name === undefined ? 'name must be a string' : { type: 'switch-branch', name }
+    }
+    case 'create-branch': {
+      const name = gitText(body, 'name')
+      const base = gitText(body, 'base', true)
+      if (name === undefined) return 'name must be a string'
+      if (base === undefined) return 'base must be a string'
+      return { type: 'create-branch', name, ...(base === '' ? {} : { base }) }
+    }
+    case 'delete-branch': {
+      const name = gitText(body, 'name')
+      if (name === undefined) return 'name must be a string'
+      const f = flags('remote', 'force')
+      if (typeof f === 'string') return f
+      return { type: 'delete-branch', name, remote: f['remote'] === true, force: f['force'] === true }
+    }
+    case 'stage-hunk':
+    case 'unstage-hunk':
+    case 'restore-hunk': {
+      const path = gitText(body, 'path')
+      const hunk = parseGitHunk(body['hunk'])
+      if (path === undefined) return 'path must be a string'
+      if (typeof hunk === 'string') return hunk
+      return { type: op, path, hunk }
+    }
+    case 'resolve-conflict': {
+      const path = gitText(body, 'path')
+      const index = body['index']
+      const fingerprint = gitText(body, 'fingerprint')
+      const choice = body['choice']
+      if (path === undefined) return 'path must be a string'
+      if (typeof index !== 'number' || !Number.isInteger(index) || index < 0) return 'index must be a non-negative integer'
+      if (fingerprint === undefined) return 'fingerprint must be a string'
+      if (choice !== 'ours' && choice !== 'theirs' && choice !== 'both') return 'choice must be ours, theirs or both'
+      return { type: 'resolve-conflict', path, index, fingerprint, choice }
+    }
+    case 'ignore': {
+      const list = body['paths']
+      if (!Array.isArray(list) || !list.every((entry) => typeof entry === 'string')) return 'paths must be an array of strings'
+      return { type: 'ignore', paths: list as string[] }
+    }
+    default:
+      return `unknown git action '${op}'`
   }
+}
+
+/** A `hunk` body value: five exact fields, four non-negative integers and a string. */
+function parseGitHunk(value: unknown): GitHunkRef | string {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return 'hunk must be { oldStart, oldLines, newStart, newLines, fingerprint }'
+  const row = value as Record<string, unknown>
+  const numbers = ['oldStart', 'oldLines', 'newStart', 'newLines'].map((key) => row[key])
+  if (!numbers.every((entry) => typeof entry === 'number' && Number.isInteger(entry) && entry >= 0)) {
+    return 'hunk must be { oldStart, oldLines, newStart, newLines, fingerprint }'
+  }
+  if (typeof row['fingerprint'] !== 'string') return 'hunk must be { oldStart, oldLines, newStart, newLines, fingerprint }'
+  return { oldStart: row['oldStart'] as number, oldLines: row['oldLines'] as number, newStart: row['newStart'] as number, newLines: row['newLines'] as number, fingerprint: row['fingerprint'] as string }
 }
 
 /**
@@ -7868,7 +7969,7 @@ async function handleProjectGitAction(
   requireWorkspace(deps, wsId, false)
   const project = deps.workspaces.getProject(pid, wsId)
   const promptId = /^askpass\/([^/]+)$/.exec(action)?.[1]
-  if (promptId === undefined && !GIT_OPERATIONS.has(action) && !GIT_QUERIES.has(action)) {
+  if (promptId === undefined && !GIT_OPERATIONS.has(action) && !GIT_QUERIES.has(action) && !GIT_STREAMS.has(action)) {
     json(404, { error: `unknown git action '${action}'` })
     return
   }
@@ -7951,6 +8052,48 @@ async function handleProjectGitAction(
   }
   res.once('close', onClose)
   try {
+    if (GIT_STREAMS.has(action)) {
+      if (action === 'commit-message') {
+        const subject = body['subject']
+        if (subject !== undefined && typeof subject !== 'string') {
+          json(400, { error: 'subject must be a string' })
+          return
+        }
+        const model = deps.commitMessageModel()
+        if ('error' in model) {
+          json(400, { error: model.error })
+          return
+        }
+        const diff = await commitMessageDiff(project.path, trusted)
+        const prompt = commitMessagePrompt(diff, subject === undefined ? undefined : subject)
+        const controller = new AbortController()
+        const onClose = (): void => { if (!res.writableFinished) controller.abort() }
+        res.once('close', onClose)
+        try {
+          frame({ type: 'start' })
+          for await (const text of streamCommitMessage(
+            { stream: (request, signal) => deps.commitMessageStream(request, signal) },
+            { providerName: model.providerName, model: model.model, prompt },
+            controller.signal,
+            (usage) => {
+              deps.recordUsage({
+                v: 1, at: Date.now(), startedAt: Date.now(), workspaceId: wsId as string,
+                sessionId: `git:${pid as string}`, rootSessionId: `git:${pid as string}`,
+                kind: 'commit-message', provider: model.providerName, model: model.model,
+                input: usage.inputTokens, cached: usage.cachedInputTokens ?? 0,
+                cacheReported: usage.cachedInputTokens !== undefined, output: usage.outputTokens ?? 0,
+              })
+            },
+          )) {
+            frame({ type: 'delta', text })
+          }
+          frame({ type: 'done', ok: true })
+        } finally {
+          res.off('close', onClose)
+        }
+      }
+      return
+    }
     if (request === undefined) {
       if (action === 'remotes') {
         const branch = gitText(body, 'branch')
@@ -7959,6 +8102,8 @@ async function handleProjectGitAction(
           return
         }
         frame({ type: 'done', ok: true, stdout: '', stderr: '', remotes: await listProjectGitRemotes(project.path, trusted, branch, body['push'] === true, body['all'] === true) })
+      } else if (action === 'branches') {
+        frame({ type: 'done', ok: true, stdout: '', stderr: '', ...(await listProjectGitBranches(project.path, trusted)) })
       } else {
         frame({ type: 'done', ok: true, stdout: '', stderr: '', pushedTo: await pushedTo(project.path, trusted) })
       }
@@ -7996,6 +8141,9 @@ async function handleProjectGitAction(
     if (!started && !res.headersSent) {
       if (error instanceof ProjectGitError) json(400, { error: message })
       else throw error
+    } else if (GIT_STREAMS.has(action)) {
+      // A model stream has no repository status to offer: its client reads `error`.
+      frame({ type: 'done', ok: false, error: message })
     } else {
       // Git may have changed the repository before failing: offer the current
       // status when it can be read, otherwise leave it out.

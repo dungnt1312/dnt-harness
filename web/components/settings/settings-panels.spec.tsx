@@ -593,7 +593,7 @@ describe('settings dialog', () => {
     const sections = [...document.body.querySelectorAll('[aria-label="Settings sections"] [role="tab"]')]
     expect(sections).toHaveLength(12)
     const sub = [...document.body.querySelectorAll('[aria-label="Providers & Models"] [role="tab"]')]
-    expect(sub.map((tab) => tab.textContent)).toEqual(['Providers', 'Model aliases', 'Images', 'Videos'])
+    expect(sub.map((tab) => tab.textContent)).toEqual(['Providers', 'Model aliases', 'Images', 'Videos', 'Git'])
     for (const tab of [...sections, ...sub]) expect(tab.querySelector('svg')).not.toBeNull()
   })
 

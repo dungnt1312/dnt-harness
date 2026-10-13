@@ -1,12 +1,14 @@
-import { useRef, useState, type KeyboardEvent } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import Icon from '../common/Icon.tsx'
 import ConfirmDialog from '../common/ConfirmDialog.tsx'
 import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import { Modal } from '../ui/Modal.tsx'
-import type { GitChange, GitOperationDone, GitOperationInput, GitStatusReport } from '../../lib/api.ts'
-import { changeCounts, commitButton, commitButtonTitle } from './git-panel-model.ts'
+import { useToast } from '../common/Toast.tsx'
+import { streamCommitMessage, type GitChange, type GitOperationDone, type GitOperationInput, type GitStatusReport } from '../../lib/api.ts'
+import { changeCounts, commitButton, commitButtonTitle, suggestCommitMessage } from './git-panel-model.ts'
+import { failureText } from './use-git-operation.tsx'
 import type { GitRun } from './use-git-operation.tsx'
 
 const signoffKey = (projectId: string): string => `dnt-harness.git.signoff.${projectId}`
@@ -30,7 +32,8 @@ const remoteRefName = (ref: string): string => ref.replace(/^refs\/remotes\//, '
  * `uncommit` and `set_amend_pending`. State lives here, so the owner mounts one
  * per project (`key`). `onDone` receives each mutating operation's answer.
  */
-export function GitCommitArea({ projectId, report, changes, run, enqueue, onDone }: {
+export function GitCommitArea({ workspaceId, projectId, report, changes, run, enqueue, onDone }: {
+  readonly workspaceId: string
   readonly projectId: string
   readonly report: GitStatusReport
   /** The changes as the reader sees them (a queued staging click already applied). */
@@ -50,16 +53,25 @@ export function GitCommitArea({ projectId, report, changes, run, enqueue, onDone
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [pushed, setPushed] = useState<{ readonly refs: readonly string[]; readonly prior: string } | null>(null)
+  const toast = useToast()
+  // Zed `generate_commit_message`: one generation at a time; its signal is the stop button.
+  const [generating, setGenerating] = useState(false)
+  const generation = useRef<AbortController | null>(null)
+  const [expanded, setExpanded] = useState(false)
+  // Leaving mid-generation cancels the model request on the server.
+  useEffect(() => () => generation.current?.abort(), [])
 
   const head = report.head
   const counts = changeCounts(changes)
+  const suggestion = suggestCommitMessage(changes, report.mergeMessage)
   const button = commitButton({
     conflicts: counts.hasUnstagedConflicts,
     staged: counts.hasStaged,
     tracked: counts.hasTracked,
     amend,
     pending: busy,
-    message: text.trim() !== '',
+    // Zed `has_commit_message`: text, or an empty editor with a suggestion to commit.
+    message: text.trim() !== '' || (text === '' && suggestion !== undefined),
   })
   const label = commitButtonTitle({ amend, staged: counts.hasStaged, tracked: counts.hasTracked })
   const command = `git commit${amend ? ' --amend' : ''}${signoff ? ' --signoff' : ''}${skipHooks ? ' --no-verify' : ''}`
@@ -95,14 +107,16 @@ export function GitCommitArea({ projectId, report, changes, run, enqueue, onDone
       setNotice('There are still conflicts. You must stage these before committing')
       return
     }
-    if (text.trim() === '') return
+    // Zed `commit_changes`: an empty editor commits the suggestion; whitespace alone commits nothing.
+    const message = text === '' ? suggestion : text.trim() === '' ? undefined : text
+    if (message === undefined) return
     if (!counts.hasStaged && !counts.hasTracked && !amend) {
       setNotice('No changes to commit')
       return
     }
     // Everything the commit needs is read now: the click's view (a queued staging click already applied).
     const amending = amend
-    const input: GitOperationInput = { type: 'commit', message: text, amend: amending, signoff, noVerify: skipHooks, tracked: !counts.hasStaged }
+    const input: GitOperationInput = { type: 'commit', message, amend: amending, signoff, noVerify: skipHooks, tracked: !counts.hasStaged }
     // Busy from the click: Amend and Cancel stay off until the answer, so a draft restored meanwhile cannot be wiped.
     setBusy(true)
     // Behind the panel's pending stage, discard and trash clicks, in click order.
@@ -122,6 +136,31 @@ export function GitCommitArea({ projectId, report, changes, run, enqueue, onDone
         original.current = null
       }
     })
+  }
+
+  /** Zed `generate_commit_message`: stream the model's message to the end of the draft. */
+  const generate = (): void => {
+    if (generating) return
+    const subject = text.split('\n')[0] ?? ''
+    // A non-empty draft keeps its text; the message starts on the next line.
+    let started = text === ''
+    const controller = new AbortController()
+    generation.current = controller
+    setGenerating(true)
+    void streamCommitMessage(workspaceId, projectId, subject.trim() === '' ? undefined : subject, (chunk) => {
+      setText((previous) => {
+        const prefix = started ? '' : '\n'
+        started = true
+        return `${previous}${prefix}${chunk}`
+      })
+    }, controller.signal)
+      .catch((cause: unknown) => {
+        if (!controller.signal.aborted) toast.notify(failureText(cause), 'bad', { persistent: true, plain: true })
+      })
+      .finally(() => {
+        if (generation.current === controller) generation.current = null
+        setGenerating(false)
+      })
   }
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>): void => {
@@ -194,8 +233,9 @@ export function GitCommitArea({ projectId, report, changes, run, enqueue, onDone
       <div className="p-2 pb-1.5">
         <textarea
           aria-label="Commit message"
-          placeholder="Enter commit message"
-          rows={3}
+          placeholder={generating ? 'Generating Commit…' : suggestion ?? 'Enter commit message'}
+          // Two lines, growing with the text to six (Zed's panel editor), then it scrolls.
+          rows={Math.min(6, Math.max(2, text.split('\n').length))}
           value={text}
           spellCheck
           onChange={(event) => setText(event.target.value)}
@@ -203,7 +243,22 @@ export function GitCommitArea({ projectId, report, changes, run, enqueue, onDone
           className="block w-full resize-none rounded-lg border border-line bg-bg px-2.5 py-1.5 font-mono text-[13px] text-fg outline-none placeholder:text-fg-faint focus:border-fg-faint"
         />
       </div>
-      <div className="flex items-center justify-end px-2 pb-2">
+      <div className="flex items-center gap-1 px-2 pb-2">
+        {generating ? (
+          <IconButton label="Cancel Commit Message Generation" onClick={() => generation.current?.abort()}>
+            <Icon name="stop" size={14} />
+          </IconButton>
+        ) : (
+          <IconButton
+            label={counts.hasStaged || counts.hasTracked ? 'Generate Commit Message' : 'No Changes to Commit'}
+            disabled={!counts.hasStaged && !counts.hasTracked}
+            onClick={generate}
+          >
+            <Icon name="sparkles" size={14} />
+          </IconButton>
+        )}
+        <span className="flex-1" />
+        <IconButton label="Expand Commit Editor" onClick={() => setExpanded(true)}><Icon name="maximize" size={14} /></IconButton>
         <span className="inline-flex" title={tooltip}>
           <Button
             size="sm"
@@ -233,8 +288,8 @@ export function GitCommitArea({ projectId, report, changes, run, enqueue, onDone
         </Menu>
       </div>
       {head !== null ? (
-        <div className="flex items-center justify-between gap-1.5 border-t border-line px-2 py-1">
-          <span className="min-w-0 flex-1 truncate px-1 text-xs text-fg-muted" title={head.message || head.subject}>{head.subject}</span>
+        <div data-last-commit className="flex items-center justify-between gap-1.5 border-t border-line px-2 py-0.5">
+          <span className="min-w-0 flex-1 truncate px-1 text-xs text-fg-faint" title={head.message || head.subject}>{head.subject}</span>
           {head.hasParent ? (
             <IconButton label="Uncommit" title={'Uncommit\ngit reset HEAD^ --soft'} disabled={busy} onClick={() => void uncommit()}>
               <Icon name="undo" size={14} />
@@ -242,6 +297,54 @@ export function GitCommitArea({ projectId, report, changes, run, enqueue, onDone
           ) : null}
         </div>
       ) : null}
+      <Modal open={expanded} onDismiss={() => setExpanded(false)} label="Commit message" width="lg">
+        <textarea
+          aria-label="Commit message (expanded)"
+          placeholder={generating ? 'Generating Commit…' : suggestion ?? 'Enter commit message'}
+          rows={18}
+          value={text}
+          autoFocus
+          spellCheck
+          onChange={(event) => setText(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+              event.preventDefault()
+              setExpanded(false)
+              void commit()
+            }
+          }}
+          className="block w-full resize-none rounded-lg border border-line bg-bg px-3 py-2 font-mono text-[13px] text-fg outline-none placeholder:text-fg-faint focus:border-fg-faint"
+        />
+        <div className="mt-3 flex items-center justify-end">
+          <span className="inline-flex" title={tooltip}>
+            <Button
+              size="sm"
+              variant="outline"
+              className="rounded-r-none border-r-0 px-3"
+              disabled={!button.enabled}
+              title={tooltip}
+              onClick={() => { setExpanded(false); void commit() }}
+            >
+              {label}
+            </Button>
+          </span>
+          <Menu
+            label="Commit options"
+            side="top"
+            align="end"
+            triggerClassName="inline-flex h-8 w-7 shrink-0 items-center justify-center rounded-l-none rounded-r-full border border-line-strong text-fg hover:bg-hover"
+            trigger={() => <Icon name="chevron" size={12} />}
+          >
+            {(close) => (
+              <>
+                {head !== null ? toggleItem('Amend', amend, toggleAmend, close, undefined, busy) : null}
+                {toggleItem('Signoff', signoff, toggleSignoff, close)}
+                {toggleItem('Skip Hooks', skipHooks, () => setSkipHooks((value) => !value), close, 'git commit --no-verify')}
+              </>
+            )}
+          </Menu>
+        </div>
+      </Modal>
       <Modal open={notice !== null} onDismiss={() => setNotice(null)} label={notice ?? ''} width="sm">
         <p className="m-0 text-sm font-medium">{notice}</p>
         <div className="mt-5 flex justify-end">

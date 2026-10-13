@@ -1,20 +1,15 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode, type Ref } from 'react'
+import { useRef, useState, type KeyboardEvent, type ReactNode, type Ref } from 'react'
 import Icon from '../common/Icon.tsx'
-import { Spinner } from '../common/Spinner.tsx'
-import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
-import { Menu, menuItemClass } from '../ui/Menu.tsx'
+import { Menu } from '../ui/Menu.tsx'
 import {
-  fetchGitDiff,
   type GitChange,
   type GitChangeStatus,
-  type GitDiffReport,
   type GitStaging,
   type GitStatusReport,
 } from '../../lib/api.ts'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
-import { DiffLines, LineCount, diffRowsFromUnified } from '../common/DiffLines.tsx'
-import { MediaPreview } from '../common/MediaPreview.tsx'
+import { LineCount } from '../common/DiffLines.tsx'
 import { cn } from '../../lib/cn.ts'
 import {
   groupChanges,
@@ -24,6 +19,8 @@ import {
   type GitChangeGroup,
   type GitToggleState,
 } from './git-panel-model.ts'
+import { buildTree, folderStageTargets, folderToggleState, visibleNodes, type GitTreeNode } from './git-tree.ts'
+import { ContextMenuPanel, GitEntryMenuItems, useContextMenu, type GitEntryActions } from './GitEntryMenu.tsx'
 
 const STATUS_LABEL: Readonly<Record<GitChangeStatus, string>> = {
   modified: 'Modified',
@@ -50,8 +47,6 @@ export function withPendingStages(changes: readonly GitChange[], pending: Readon
 }
 
 export interface GitChangeListProps {
-  readonly workspaceId: string
-  readonly projectId: string
   readonly report: GitStatusReport
   /** The rows to list (the report's changes, or the turn filter's subset). */
   readonly visibleChanges: readonly GitChange[]
@@ -65,54 +60,99 @@ export interface GitChangeListProps {
   readonly onTrash: (entries: readonly GitChange[]) => void
   /** Opens a changed file itself in the workbench, when a resolver is wired. */
   readonly onOpenFile?: (path: string) => void
-  readonly openPath: string | null
-  readonly onToggleDiff: (path: string) => void
-  /** A chat card's file click: that row is expanded and scrolled to the top. */
+  /** Add these untracked paths to the root .gitignore. */
+  readonly onIgnore: (paths: readonly string[]) => void
+  /** Absolute project folder, for Copy Path. */
+  readonly projectPath: string
+  /** List (flat sections) or Tree (folders inside each section). */
+  readonly view: 'list' | 'tree'
+  /** The row whose diff the pane shows. */
+  readonly selectedPath: string | null
+  readonly onSelect: (path: string) => void
+  /** A chat card's file click: that row is scrolled to the top. */
   readonly focusPath?: string
   readonly focusRowRef?: Ref<HTMLButtonElement>
-  readonly onFocusedDiffReady?: () => void
 }
 
 /**
  * The change list in Zed's sections (Conflicts, Tracked, Untracked), each with
  * a tri-state checkbox, and rows with their own checkbox in the right-hand
- * control slot, a hover-revealed discard/trash menu and the file opener.
+ * control slot, a hover-revealed discard/trash menu and the file opener. A row
+ * selects (its diff shows in the pane beside the list); the arrow keys move
+ * the selection, Space stages or unstages it and Enter opens the file.
  */
 export function GitChangeList({
-  workspaceId, projectId, report, visibleChanges, pendingStages, onStage, onDiscard, onTrash, onOpenFile,
-  openPath, onToggleDiff, focusPath, focusRowRef, onFocusedDiffReady,
+  report, visibleChanges, pendingStages, onStage, onDiscard, onTrash, onOpenFile, onIgnore, projectPath, view,
+  selectedPath, onSelect, focusPath, focusRowRef,
 }: GitChangeListProps) {
   const groups = groupChanges(withPendingStages(visibleChanges, pendingStages))
+  // Tree mode collapses folders in memory only; a reload expands them again.
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set())
+  const toggleFolder = (key: string): void => setCollapsed((current) => {
+    const next = new Set(current)
+    if (!next.delete(key)) next.add(key)
+    return next
+  })
+  const nodesOf = (group: GitChangeGroup): readonly GitTreeNode[] =>
+    view === 'tree' ? visibleNodes(buildTree(group.entries), collapsed) : group.entries.map((change): GitTreeNode => ({ kind: 'file', key: change.path, change, depth: 0 }))
+  // Arrow keys walk the files as drawn: a collapsed folder's files are skipped.
+  const order = groups.flatMap((group) => nodesOf(group).flatMap((node) => node.kind === 'file' ? [node.change] : []))
+  const box = useRef<HTMLDivElement | null>(null)
+  const actionsFor = (change: GitChange): GitEntryActions => ({
+    onStage, onDiscard, onTrash, onIgnore,
+    onOpenDiff: () => onSelect(change.path),
+    ...(onOpenFile !== undefined ? { onViewFile: () => onOpenFile(change.path) } : {}),
+  })
+
+  const move = (from: GitChange, step: 1 | -1): void => {
+    const index = order.findIndex((entry) => entry.path === from.path)
+    const next = order[index + step]
+    if (next === undefined) return
+    onSelect(next.path)
+    box.current?.querySelector<HTMLElement>(`[data-row-path="${CSS.escape(next.path)}"] [data-row-main]`)?.focus()
+  }
+
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>, change: GitChange): void => {
+    // Only the row's own button drives the list: a key typed in its checkbox,
+    // opener, ⋯ button or a menu (which React still bubbles through the row
+    // even though it renders in a portal) belongs to that control.
+    if (!(event.target instanceof HTMLElement) || !event.target.hasAttribute('data-row-main')) return
+    if (event.key === 'ArrowDown') { event.preventDefault(); move(change, 1) }
+    else if (event.key === 'ArrowUp') { event.preventDefault(); move(change, -1) }
+    else if (event.key === ' ') { event.preventDefault(); onStage([change.path], stageIntent(change.staging)) }
+    else if (event.key === 'Enter' && onOpenFile !== undefined) { event.preventDefault(); onOpenFile(change.path) }
+  }
+
   return (
-    <div role="group" aria-label="Changed files" className="flex flex-col p-1">
+    <div ref={box} role="group" aria-label="Changed files" className="flex flex-col p-1">
       {groups.map((group) => (
         <Section
           key={group.section}
           group={group}
           onStage={onStage}
         >
-          {group.entries.map((change) => (
-            <li key={change.path}>
-              <ChangeRow
-                change={change}
-                open={openPath === change.path}
-                onToggle={() => onToggleDiff(change.path)}
-                onStage={() => onStage([change.path], stageIntent(change.staging))}
-                onDiscard={() => onDiscard([change])}
-                onTrash={() => onTrash([change])}
-                {...(focusPath === change.path && focusRowRef !== undefined ? { rowRef: focusRowRef } : {})}
-                {...(onOpenFile !== undefined ? { onOpenFile: () => onOpenFile(change.path) } : {})}
+          {nodesOf(group).map((node) => node.kind === 'dir' ? (
+            <li key={`dir:${node.key}`} data-tree-dir={node.path}>
+              <FolderRow
+                node={node}
+                collapsed={collapsed.has(node.key)}
+                onToggle={() => toggleFolder(node.key)}
+                onStage={onStage}
               />
-              {openPath === change.path ? (
-                <DiffView
-                  key={change.path}
-                  workspaceId={workspaceId}
-                  projectId={projectId}
-                  path={change.path}
-                  {...(focusPath === change.path && onFocusedDiffReady !== undefined ? { onReady: onFocusedDiffReady } : {})}
-                  {...(onOpenFile !== undefined ? { onOpenFile: () => onOpenFile(change.path) } : {})}
-                />
-              ) : null}
+            </li>
+          ) : (
+            <li key={node.change.path} data-row-path={node.change.path} style={node.depth > 0 ? { paddingLeft: `${node.depth * 12}px` } : undefined}>
+              <ChangeRow
+                change={node.change}
+                selected={selectedPath === node.change.path}
+                projectPath={projectPath}
+                actions={actionsFor(node.change)}
+                onSelect={() => onSelect(node.change.path)}
+                onKeyDown={(event) => onKeyDown(event, node.change)}
+                onStage={() => onStage([node.change.path], stageIntent(node.change.staging))}
+                {...(focusPath === node.change.path && focusRowRef !== undefined ? { rowRef: focusRowRef } : {})}
+                {...(onOpenFile !== undefined ? { onOpenFile: () => onOpenFile(node.change.path) } : {})}
+              />
             </li>
           ))}
         </Section>
@@ -144,7 +184,12 @@ function Section({ group, onStage, children }: {
       <div className="flex h-8 items-center gap-1.5 pl-2 text-[11px] font-medium uppercase tracking-wide text-fg-faint">
         <span className="min-w-0 flex-1 truncate">{group.title}</span>
         <span className="font-mono normal-case tabular-nums">{group.entries.length}</span>
-        <StageCheckbox state={state} label={`${state === 'selected' ? 'Unstage' : 'Stage'} all ${group.title.toLowerCase()}`} onToggle={toggle} />
+        <StageCheckbox
+          state={state}
+          label={`${state === 'selected' ? 'Unstage' : 'Stage'} all ${group.title.toLowerCase()}`}
+          onToggle={toggle}
+          {...(group.section === 'conflict' && state === 'selected' ? { lockedTitle: 'All conflicts marked as resolved' } : {})}
+        />
       </div>
       <ul aria-label={`${group.title} files`} className="m-0 flex list-none flex-col p-0">{children}</ul>
     </section>
@@ -152,10 +197,12 @@ function Section({ group, onStage, children }: {
 }
 
 /** The tri-state control of a row or a section header: filled when staged, a bar when partly. */
-function StageCheckbox({ state, label, onToggle }: {
+function StageCheckbox({ state, label, onToggle, lockedTitle }: {
   readonly state: GitToggleState
   readonly label: string
   readonly onToggle: () => void
+  /** Set when the control cannot be used (a resolved conflict): disabled, with this as the reason. */
+  readonly lockedTitle?: string
 }) {
   return (
     <button
@@ -163,7 +210,8 @@ function StageCheckbox({ state, label, onToggle }: {
       role="checkbox"
       aria-checked={state === 'indeterminate' ? 'mixed' : state === 'selected'}
       aria-label={label}
-      title={label}
+      title={lockedTitle ?? label}
+      disabled={lockedTitle !== undefined}
       onClick={onToggle}
       // Exempt from the 44px coarse-pointer floor: the row reserves exactly this 32px slot.
       data-compact-control
@@ -177,13 +225,14 @@ function StageCheckbox({ state, label, onToggle }: {
   )
 }
 
-function ChangeRow({ change, open, onToggle, onStage, onDiscard, onTrash, onOpenFile, rowRef }: {
+function ChangeRow({ change, selected, projectPath, actions, onSelect, onKeyDown, onStage, onOpenFile, rowRef }: {
   readonly change: GitChange
-  readonly open: boolean
-  readonly onToggle: () => void
+  readonly selected: boolean
+  readonly projectPath: string
+  readonly actions: GitEntryActions
+  readonly onSelect: () => void
+  readonly onKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void
   readonly onStage: () => void
-  readonly onDiscard: () => void
-  readonly onTrash: () => void
   /** Opens the file itself in the workbench; absent without an opener. */
   readonly onOpenFile?: () => void
   /** The focused row (a chat card's file click), for a scroll into view. */
@@ -191,27 +240,28 @@ function ChangeRow({ change, open, onToggle, onStage, onDiscard, onTrash, onOpen
 }) {
   const name = change.path.split('/').pop() ?? change.path
   const directory = change.path.slice(0, change.path.length - name.length).replace(/\/$/, '')
-  // Zed `build_context_menu`: a new file is "Trash File", a deleted one "Restore File", the rest "Discard Changes".
-  const revert = change.created
-    ? { label: 'Trash File', icon: 'trash' as const, run: onTrash }
-    : { label: change.deleted ? 'Restore File' : 'Discard Changes', icon: 'refresh' as const, run: onDiscard }
+  const menu = useContextMenu()
   return (
     // One hover surface for the whole line, openers included: the band never
     // breaks where an overlaid button begins.
-    <div className={cn('relative flex items-center rounded-md transition-colors hover:bg-hover group/row', open && 'bg-hover')}>
+    <div
+      onKeyDown={onKeyDown}
+      {...menu.bind}
+      className={cn('relative flex items-center rounded-md transition-colors hover:bg-hover group/row', selected && 'bg-hover')}
+    >
       <button
         ref={rowRef}
+        data-row-main
         type="button"
-        aria-expanded={open}
+        aria-current={selected ? 'true' : undefined}
         title={change.previousPath !== undefined ? `${change.previousPath} → ${change.path}` : change.path}
-        onClick={onToggle}
+        onClick={onSelect}
         // Touch shows the overlays all the time, so only there the row makes room for them.
         className={cn(
           'flex min-h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px]',
           onOpenFile !== undefined ? '[@media(pointer:coarse)]:pr-14' : '[@media(pointer:coarse)]:pr-8',
         )}
       >
-        <Icon name="chevronRight" size={12} className={cn('shrink-0 text-fg-faint transition-transform', open && 'rotate-90')} />
         <span className={cn('w-3 shrink-0 text-center font-mono text-[11px] font-semibold', markColor(change.status))} aria-label={STATUS_LABEL[change.status]}>{STATUS_MARK[change.status]}</span>
         <FileTypeIcon path={change.path} size={16} />
         <span className="min-w-0 flex-1 truncate">
@@ -221,7 +271,7 @@ function ChangeRow({ change, open, onToggle, onStage, onDiscard, onTrash, onOpen
         <LineCount
           {...(change.added !== undefined ? { added: change.added } : {})}
           {...(change.removed !== undefined ? { removed: change.removed } : {})}
-          className="transition-opacity group-hover/row:opacity-0 group-has-[:focus-visible]/row:opacity-0 [@media(pointer:coarse)]:opacity-100"
+          className={cn('transition-opacity group-hover/row:opacity-0 group-has-[:focus-visible]/row:opacity-0 [@media(pointer:coarse)]:opacity-100', selected && 'opacity-0')}
         />
       </button>
       {onOpenFile !== undefined ? (
@@ -231,10 +281,9 @@ function ChangeRow({ change, open, onToggle, onStage, onDiscard, onTrash, onOpen
           // Hover-revealed and overlaid beside the checkbox slot, so the
           // actions take no room and never push the line counts; the counts
           // themselves fade out underneath. `invisible` keeps the hidden
-          // button from intercepting the row's clicks. Always on for touch.
-          // Keyboard focus reveals it; a mouse click on the row (which keeps
-          // focus there) does not, or it would linger beside the diff's own.
-          className={OPENER_REVEAL_ROW}
+          // button from intercepting the row's clicks. Always on for touch,
+          // and for the selected row, which the pane is showing.
+          className={cn(OPENER_REVEAL_ROW, selected && SELECTED_REVEAL)}
           // Keeps its 24px size on touch; the 44px floor would overlap the neighbours.
           data-compact-control
         >
@@ -245,17 +294,20 @@ function ChangeRow({ change, open, onToggle, onStage, onDiscard, onTrash, onOpen
         label={`Actions for ${name}`}
         align="end"
         compact
-        triggerClassName={onOpenFile !== undefined ? MENU_REVEAL_ROW_BESIDE_OPENER : MENU_REVEAL_ROW}
+        triggerClassName={cn(onOpenFile !== undefined ? MENU_REVEAL_ROW_BESIDE_OPENER : MENU_REVEAL_ROW, selected && SELECTED_REVEAL)}
         trigger={() => <Icon name="dots" size={12} />}
       >
-        {(close) => (
-          <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); revert.run() }}>
-            <Icon name={revert.icon} size={14} className="shrink-0 text-fg-muted" />
-            {revert.label}
-          </button>
-        )}
+        {(close) => <GitEntryMenuItems entries={[change]} projectPath={projectPath} close={close} actions={actions} />}
       </Menu>
-      <StageCheckbox state={toggleStateOf(change.staging)} label={`${change.staging === 'staged' ? 'Unstage' : 'Stage'} ${change.path}`} onToggle={onStage} />
+      <StageCheckbox
+        state={toggleStateOf(change.staging)}
+        label={`${change.staging === 'staged' ? 'Unstage' : 'Stage'} ${change.path}`}
+        onToggle={onStage}
+        {...(change.conflicted && change.staging === 'staged' ? { lockedTitle: 'Conflicts marked as resolved' } : {})}
+      />
+      <ContextMenuPanel at={menu.at} label={`Actions for ${name}`} onClose={menu.close}>
+        <GitEntryMenuItems entries={[change]} projectPath={projectPath} close={menu.close} actions={actions} />
+      </ContextMenuPanel>
     </div>
   )
 }
@@ -266,90 +318,49 @@ function markColor(status: GitChangeStatus): string {
   return 'text-warn'
 }
 
-/** The unified diff of one changed file, loaded when its row opens. */
-function DiffView({ workspaceId, projectId, path, onReady, onOpenFile }: {
-  readonly workspaceId: string
-  readonly projectId: string
-  readonly path: string
-  /** Called once the diff (or its error) has rendered — the focused row's cue to scroll. */
-  readonly onReady?: () => void
-  /** Opens the file itself in the workbench; offered with an opener. */
-  readonly onOpenFile?: () => void
-}) {
-  const [diff, setDiff] = useState<GitDiffReport | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const name = path.split('/').pop() ?? path
-  const generation = useRef(0)
-  useEffect(() => {
-    if (diff !== null || error !== null) onReady?.()
-  }, [diff, error, onReady])
-
-  const load = useCallback(async () => {
-    const request = ++generation.current
-    setError(null)
-    try {
-      const next = await fetchGitDiff(workspaceId, projectId, path)
-      if (generation.current === request) setDiff(next)
-    } catch (cause) {
-      if (generation.current === request) setError(String(cause))
-    }
-  }, [workspaceId, projectId, path])
-
-  useEffect(() => { void load() }, [load])
-
-  if (error !== null) {
-    return (
-      <div className="flex items-center gap-2 py-1.5 pl-7 pr-2">
-        <span className="text-xs text-bad">Could not load diff</span>
-        <Button size="sm" variant="outline" onClick={() => void load()}>Retry</Button>
-      </div>
-    )
-  }
-  if (diff === null) return <div className="flex items-center gap-2 py-1.5 pl-7 text-xs text-fg-muted" role="status"><Spinner size={12} />Loading diff…</div>
-  // A binary the browser can render shows the media itself; the rest say so.
-  if (diff.binary) return <div className="relative py-1 pl-5 pr-2 group/diff"><MediaPreview workspaceId={workspaceId} projectId={projectId} path={path} /><DiffOpenFile name={name} {...(onOpenFile !== undefined ? { onOpenFile } : {})} /></div>
-  if (diff.lines.length === 0) return <p className="m-0 py-1.5 pl-7 pr-2 text-xs text-fg-muted">No textual diff.</p>
-  // The file header rows repeat the name the change row already shows and the
-  // hunk header is noise; row numbers are read from the hunk instead. The
-  // scroller keeps the focusable region — arrow keys scroll what holds focus —
-  // while the hover-revealed opener stays pinned to the frame's corner.
-  return (
-    <div className="relative border-y border-line bg-muted/40 group/diff">
-      <div className="overflow-x-auto" role="region" aria-label={`Diff of ${path}`} tabIndex={0}>
-        {diff.truncated ? <p className="m-0 border-b border-line bg-warn-soft px-3 py-1 text-xs text-warn">Diff is larger than 1 MB; only the beginning is shown.</p> : null}
-        <DiffLines rows={diffRowsFromUnified(diff.lines)} />
-      </div>
-      <DiffOpenFile name={name} {...(onOpenFile !== undefined ? { onOpenFile } : {})} />
-    </div>
-  )
-}
-
-/**
- * The diff frame's own file opener: hover-revealed, absolutely placed in the
- * frame's top-right corner so it takes no room in the scrolling body. `invisible`
- * keeps the hidden button from stealing clicks meant for the diff. It keeps the
- * surface background so the diff lines scroll beneath it, not through it.
- */
-function DiffOpenFile({ name, onOpenFile }: { readonly name: string; readonly onOpenFile?: () => void }) {
-  if (onOpenFile === undefined) return null
-  return (
-    <IconButton
-      label={`Open ${name} in workbench`}
-      onClick={onOpenFile}
-      className={OPENER_REVEAL_DIFF}
-    >
-      <Icon name="fileText" size={12} />
-    </IconButton>
-  )
-}
-
 /** Quiet 24px opener: no fill of its own, only a text-color change on hover. */
 const OPENER_BASE = 'absolute size-6 rounded-md text-fg-faint hover:bg-transparent hover:text-fg opacity-0 invisible transition-opacity focus-visible:visible focus-visible:opacity-100 [@media(pointer:coarse)]:visible [@media(pointer:coarse)]:opacity-100'
 const ROW_REVEAL = 'top-1/2 -translate-y-1/2 group-hover/row:visible group-hover/row:opacity-100 group-has-[:focus-visible]/row:visible group-has-[:focus-visible]/row:opacity-100'
+/** The selected row keeps its actions in view: the pane is showing that file. */
+const SELECTED_REVEAL = 'visible opacity-100'
 // The checkbox slot (size-8) sits at the row's right edge; the overlays stack left of it.
 const OPENER_REVEAL_ROW = cn(OPENER_BASE, 'right-9', ROW_REVEAL)
 // The menu trigger stays shown while its menu is open, or the menu would lose its anchor.
 const MENU_REVEAL_ROW = cn(OPENER_BASE, 'inline-flex items-center justify-center right-9', ROW_REVEAL, 'data-[state=open]:visible data-[state=open]:opacity-100')
 const MENU_REVEAL_ROW_BESIDE_OPENER = cn(MENU_REVEAL_ROW, 'right-16')
-// Over diff lines the opener needs a backdrop, or the code shows through it.
-const OPENER_REVEAL_DIFF = cn(OPENER_BASE, 'right-1.5 top-1.5 z-10 border border-line bg-surface/90 backdrop-blur-sm hover:bg-surface/90 group-hover/diff:visible group-hover/diff:opacity-100 group-has-[:focus-visible]/diff:visible group-has-[:focus-visible]/diff:opacity-100')
+
+/** A directory of the tree: chevron, name, count and a tri-state checkbox over every change beneath it. */
+function FolderRow({ node, collapsed, onToggle, onStage }: {
+  readonly node: Extract<GitTreeNode, { kind: 'dir' }>
+  readonly collapsed: boolean
+  readonly onToggle: () => void
+  readonly onStage: GitChangeListProps['onStage']
+}) {
+  const state = folderToggleState(node.entries)
+  const label = `${state === 'selected' ? 'Unstage' : 'Stage'} Folder ${node.path}`
+  return (
+    <div className="flex items-center rounded-md hover:bg-hover" style={{ paddingLeft: `${node.depth * 12}px` }}>
+      <button
+        type="button"
+        data-dir-toggle
+        aria-expanded={!collapsed}
+        title={node.path}
+        onClick={onToggle}
+        className="flex min-h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px]"
+      >
+        <Icon name="chevronRight" size={12} className={cn('shrink-0 text-fg-faint transition-transform', !collapsed && 'rotate-90')} />
+        <Icon name={collapsed ? 'folder' : 'folderOpen'} size={14} className="shrink-0 text-fg-muted" />
+        <span className="min-w-0 flex-1 truncate">{node.name}</span>
+        <span className="font-mono text-[11px] tabular-nums text-fg-faint">{node.entries.length}</span>
+      </button>
+      <StageCheckbox
+        state={state}
+        label={label}
+        onToggle={() => {
+          const { paths, intent } = folderStageTargets(node.entries, state)
+          onStage(paths, intent)
+        }}
+      />
+    </div>
+  )
+}
