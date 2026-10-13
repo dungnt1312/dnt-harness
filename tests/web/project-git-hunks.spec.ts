@@ -100,7 +100,7 @@ function spy(): { run: GitRunner; calls: string[][] } {
   return { calls, run: (root, args, options) => { calls.push([...args]); return runGitCommand(root, args, options) } }
 }
 
-const statuses = async (repo: Repo, file = 'f.txt') => (await gitDiff(repo.dir, file, undefined, true)).hunks.map((hunk) => hunk.status)
+const statuses = async (repo: Repo, file = 'f.txt') => (await gitDiff(repo.dir, file, undefined, true)).hunks?.map((hunk) => hunk.status)
 
 /** A committed 30-line `f.txt` with lines 3 and 20 edited in the worktree: two display hunks. */
 async function twoHunks(): Promise<Repo> {
@@ -192,7 +192,7 @@ describe('hunk status in the diff', () => {
     expect(await statuses(repo)).toEqual(['unstaged'])
     repo.stageText('f.txt', lines(30).replace('l3\n', 'L3a\nL3b\n'))
     const partial = await gitDiff(repo.dir, 'f.txt', undefined, true)
-    expect(partial.hunks.map((hunk) => hunk.status)).toEqual(['partial'])
+    expect(partial.hunks?.map((hunk) => hunk.status)).toEqual(['partial'])
 
     const staged = await operate(repo, { type: 'stage-hunk', path: 'f.txt', hunk: partial.hunks?.[0]! })
     expect(staged.ok).toBe(true)
@@ -212,7 +212,7 @@ describe('hunk operations', () => {
   it('reports two unstaged hunks, then one staged after stage-hunk', async () => {
     const repo = await twoHunks()
     const before = await gitDiff(repo.dir, 'f.txt', undefined, true)
-    expect(before.hunks.map((h) => h.status)).toEqual(['unstaged', 'unstaged'])
+    expect(before.hunks?.map((h) => h.status)).toEqual(['unstaged', 'unstaged'])
     const { run, calls } = spy()
     const done = await operate(repo, { type: 'stage-hunk', path: 'f.txt', hunk: before.hunks?.[0]! }, { run })
     expect(done.ok).toBe(true)
@@ -220,7 +220,7 @@ describe('hunk operations', () => {
     expect(calls.some((a) => a[0] === 'update-index' && a[1] === '--add' && a[2] === '--cacheinfo')).toBe(true)
     expect(repo.git('diff', '--cached', '--name-only').trim()).toBe('f.txt')
     expect(repo.git('show', ':f.txt')).toBe(lines(30).replace('l3\n', 'L3\n'))
-    expect((await gitDiff(repo.dir, 'f.txt', undefined, true)).hunks.map((h) => h.status)).toEqual(['staged', 'unstaged'])
+    expect((await gitDiff(repo.dir, 'f.txt', undefined, true)).hunks?.map((h) => h.status)).toEqual(['staged', 'unstaged'])
     expect(done.status.changes.find((c) => c.path === 'f.txt')?.staging).toBe('partial')
   })
 
@@ -228,7 +228,7 @@ describe('hunk operations', () => {
     const repo = await twoHunks()
     repo.git('add', 'f.txt')
     const before = await gitDiff(repo.dir, 'f.txt', undefined, true)
-    expect(before.hunks.map((h) => h.status)).toEqual(['staged', 'staged'])
+    expect(before.hunks?.map((h) => h.status)).toEqual(['staged', 'staged'])
     const done = await operate(repo, { type: 'unstage-hunk', path: 'f.txt', hunk: before.hunks?.[1]! })
     expect(done.ok).toBe(true)
     expect(repo.git('show', ':f.txt')).toBe(lines(30).replace('l3\n', 'L3\n'))
@@ -252,7 +252,7 @@ describe('hunk operations', () => {
     await repo.write('f.txt', lines(3)); repo.git('add', '.'); repo.git('commit', '-qm', 'f')
     await fs.rm(path.join(repo.dir, 'f.txt'))
     const before = await gitDiff(repo.dir, 'f.txt', undefined, true)
-    expect(before.hunks.map((h) => h.status)).toEqual(['unstaged'])
+    expect(before.hunks?.map((h) => h.status)).toEqual(['unstaged'])
     expect((await operate(repo, { type: 'restore-hunk', path: 'f.txt', hunk: before.hunks?.[0]! })).ok).toBe(true)
     expect(await repo.read('f.txt')).toBe(lines(3))
     expect(repo.git('status', '--porcelain')).toBe('')
