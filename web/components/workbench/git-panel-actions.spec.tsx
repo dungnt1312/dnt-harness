@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act } from 'react'
+import { act, useState } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { GitPanel } from './GitPanel.tsx'
+import { GitOutputHost } from './GitOutputHost.tsx'
 import { ToastHost } from '../common/Toast.tsx'
 import type { GitAskpassAnswer, GitAskpassFrame, GitChange, GitDiffReport, GitOperationDone, GitOperationInput, GitStatusReport } from '../../lib/api.ts'
 
@@ -63,11 +64,19 @@ afterEach(async () => {
   updateProjectGitTrust.mockClear()
 })
 
+/** The panel can be unmounted on its own, as when the user leaves the Git tab. */
+let hidePanel: (() => void) | undefined
+function GitPanelSlot({ props }: { readonly props: Partial<Parameters<typeof GitPanel>[0]> }) {
+  const [shown, setShown] = useState(true)
+  hidePanel = () => setShown(false)
+  return shown ? <GitPanel workspaceId="ws1" project={{ id: 'p1', name: 'proj', path: '/proj' }} {...props} /> : null
+}
+
 async function mount(props: Partial<Parameters<typeof GitPanel>[0]> = {}): Promise<HTMLDivElement> {
   host = document.createElement('div')
   document.body.append(host)
   root = createRoot(host)
-  await act(async () => root!.render(<ToastHost><GitPanel workspaceId="ws1" project={{ id: 'p1', name: 'proj', path: '/proj' }} {...props} /></ToastHost>))
+  await act(async () => root!.render(<ToastHost><GitPanelSlot props={props} /><GitOutputHost /></ToastHost>))
   await act(async () => { await vi.waitFor(() => expect(host.querySelector('section')).not.toBeNull()) })
   return host
 }
@@ -500,6 +509,28 @@ describe('operation toasts', () => {
     }
   })
 
+  it('the toast headline reads `git <action> failed`, not an error-category summary', async () => {
+    gitOperation.mockResolvedValueOnce({ type: 'done', ok: false, stdout: '', stderr: 'fatal: Authentication failed for https://x' })
+    await mount()
+    await stage()
+    const headline = document.querySelector('[role="alert"] p')
+    expect(headline?.textContent).toBe('git stage failed')
+  })
+
+  it('View Log still opens the stderr after the panel that raised the toast unmounted', async () => {
+    gitOperation.mockResolvedValueOnce({ type: 'done', ok: false, stdout: '', stderr: 'fatal: lock held' })
+    await mount()
+    await stage()
+    await act(async () => hidePanel!())
+    expect(host.querySelector('section')).toBeNull()
+    expect(alerts()).toContain('git stage failed')
+    await click(button('View Log'))
+    expect(dialogText()).toContain('stage output')
+    expect(dialogText()).toContain('fatal: lock held')
+    await click(button('Close'))
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+  })
+
   it('a refused request (thrown) opens the same log with the server\'s error text', async () => {
     gitOperation.mockRejectedValueOnce(new Error('network down'))
     await mount()
@@ -548,7 +579,21 @@ describe('trust banner', () => {
   it('a trusted project has no banner; Restrict Git in the menu PATCHes false and brings it back', async () => {
     await mount({ project: { id: 'p1', name: 'proj', path: '/proj', gitTrusted: true } })
     expect(document.body.textContent).not.toContain('Restricted Mode')
-    await openHeaderMenu()
+    await click(document.querySelector<HTMLButtonElement>('button[aria-label="Git options"]')!)
+    await click([...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((entry) => entry.textContent === 'Restrict Git')!)
+    expect(updateProjectGitTrust).toHaveBeenCalledWith('ws1', 'p1', false)
+    expect(document.body.textContent).toContain('Restricted Mode')
+  })
+
+  it('Restrict Git is reachable when the working tree is clean', async () => {
+    fetchGitStatus.mockImplementation(async () => report([]))
+    host = document.createElement('div')
+    document.body.append(host)
+    root = createRoot(host)
+    await act(async () => root!.render(<ToastHost><GitPanelSlot props={{ project: { id: 'p1', name: 'proj', path: '/proj', gitTrusted: true } }} /></ToastHost>))
+    await act(async () => { await vi.waitFor(() => expect(document.body.textContent).toContain('No changes')) })
+    expect(document.querySelector('button[aria-label="More changes actions"]')).toBeNull()
+    await click(document.querySelector<HTMLButtonElement>('button[aria-label="Git options"]')!)
     await click([...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((entry) => entry.textContent === 'Restrict Git')!)
     expect(updateProjectGitTrust).toHaveBeenCalledWith('ws1', 'p1', false)
     expect(document.body.textContent).toContain('Restricted Mode')

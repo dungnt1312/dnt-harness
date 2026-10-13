@@ -17,6 +17,8 @@ export interface ToastItem {
   readonly action?: ToastAction
   /** No auto-dismiss timer: the toast stays until dismissed. */
   readonly persistent?: boolean
+  /** A 'bad' toast shows its text as the headline instead of the ErrorNotice summary. */
+  readonly plain?: boolean
 }
 
 export interface ToastAction {
@@ -27,6 +29,8 @@ export interface ToastAction {
 export interface ToastOptions {
   readonly action?: ToastAction
   readonly persistent?: boolean
+  /** The text is already the message to read (e.g. `git push failed`): skip the error summary. */
+  readonly plain?: boolean
 }
 
 /** Identity used to collapse repeats: a recognised error category collapses by
@@ -83,7 +87,8 @@ export function ToastHost({ children }: { readonly children: ReactNode }) {
     // Errors compare by their rendered summary: a burst of failures whose raw
     // text differs (URL, status) still reads as one message to the user.
     const key = toastKey(kind, text)
-    const existing = prev.find((item) => item.kind === kind && toastKey(item.kind, item.text) === key)
+    const plain = options.plain === true
+    const existing = prev.find((item) => item.kind === kind && (item.plain === true) === plain && toastKey(item.kind, item.text) === key)
     if (existing !== undefined) {
       clearTimer(existing.id)
       const persistent = existing.persistent === true || options.persistent === true
@@ -103,6 +108,7 @@ export function ToastHost({ children }: { readonly children: ReactNode }) {
     const item: ToastItem = {
       id, kind, text,
       ...(options.persistent === true ? { persistent: true } : {}),
+      ...(plain ? { plain: true } : {}),
       ...(options.action !== undefined ? { action: options.action } : {}),
     }
     commit([...prev.slice(overflow.length), item])
@@ -127,7 +133,7 @@ export function ToastHost({ children }: { readonly children: ReactNode }) {
           >
             {item.kind === 'ok' ? <Icon name="check" size={16} className="mt-2 text-ok" /> : null}
             {item.kind === 'bad' ? <Icon name="alertTriangle" size={16} className="mt-2 text-bad" /> : null}
-            <div className="min-w-0 flex-1 py-1.5">{item.kind === 'bad' ? <ErrorNotice raw={item.text} announce={false} /> : <p className="m-0">{item.text}</p>}</div>
+            <div className="min-w-0 flex-1 py-1.5">{item.kind === 'bad' && item.plain !== true ? <ErrorNotice raw={item.text} announce={false} /> : <p className="m-0">{item.text}</p>}</div>
             {item.action !== undefined ? (
               <Button size="sm" variant="outline" className="mt-1 shrink-0" onClick={() => { item.action?.onClick(); dispose(item.id) }}>{item.action.label}</Button>
             ) : null}

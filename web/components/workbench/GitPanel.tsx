@@ -296,11 +296,23 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
                   <button type="button" role="menuitem" className={menuItemClass} disabled={!counts.hasStaged} onClick={() => { close(); stageHeader('unstage') }}>Unstage All</button>
                   <button type="button" role="menuitem" className={menuItemClass} disabled={trackedEntries.length === 0} onClick={() => { close(); requestRevert(trackedEntries, 'tracked') }}>Discard Tracked Changes</button>
                   <button type="button" role="menuitem" className={menuItemClass} disabled={untrackedEntries.length === 0} onClick={() => { close(); requestRevert(untrackedEntries, 'untracked') }}>Trash Untracked Files</button>
-                  {trusted ? <button type="button" role="menuitem" className={menuItemClass} disabled={trustBusy} onClick={() => { close(); void changeTrust(false) }}>Restrict Git</button> : null}
                 </>
               )}
             </Menu>
           </div>
+        ) : null}
+        {/* Not tied to the change list: a clean, trusted project can still be restricted again. */}
+        {trusted ? (
+          <Menu
+            label="Git options"
+            align="end"
+            triggerClassName="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-fg-muted hover:bg-hover hover:text-fg"
+            trigger={() => <Icon name="dots" size={14} />}
+          >
+            {(close) => (
+              <button type="button" role="menuitem" className={menuItemClass} disabled={trustBusy} onClick={() => { close(); void changeTrust(false) }}>Restrict Git</button>
+            )}
+          </Menu>
         ) : null}
         <IconButton label="Refresh git status" onClick={() => void load()}><Icon name="refresh" size={14} /></IconButton>
       </div>

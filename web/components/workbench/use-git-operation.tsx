@@ -10,7 +10,7 @@ import {
 } from '../../lib/api.ts'
 import { formatRemoteOutput, type GitRemoteAction } from '../../lib/git-remote-output.ts'
 import { GitAskpassModal } from './GitAskpassModal.tsx'
-import { GitOutputDialog, type GitOutput } from './GitOutputDialog.tsx'
+import { showGitOutput } from './GitOutputHost.tsx'
 
 /** Git's own words for a refused request: the server's `{"error":…}` body, else the error text. */
 export function failureText(cause: unknown): string {
@@ -43,7 +43,8 @@ export interface GitOperationOptions {
  * the pull-request link (Zed `show_remote_output`). `run` never throws: it
  * resolves with the `done` frame, or `undefined` when the request itself failed.
  *
- * Render `dialogs` once, anywhere in the component tree.
+ * Render `dialogs` once, anywhere in the component tree. The output dialog is
+ * not part of it: `GitOutputHost` (mounted beside `ToastHost`) owns that.
  */
 export function useGitOperation(workspaceId: string, projectId: string): {
   readonly run: (input: GitOperationInput, options?: GitOperationOptions) => Promise<GitOperationDone | undefined>
@@ -51,7 +52,6 @@ export function useGitOperation(workspaceId: string, projectId: string): {
 } {
   const toast = useToast()
   const [prompts, setPrompts] = useState<readonly PendingPrompt[]>([])
-  const [output, setOutput] = useState<GitOutput | null>(null)
   const live = useRef<readonly PendingPrompt[]>([])
   live.current = prompts
 
@@ -81,7 +81,10 @@ export function useGitOperation(workspaceId: string, projectId: string): {
     const reportFailure = (log: string): void => {
       toast.notify(`git ${action} failed`, 'bad', {
         persistent: true,
-        action: { label: 'View Log', onClick: () => setOutput({ action, stdout: '', stderr: log }) },
+        // The headline is the message itself, not an error-category summary.
+        plain: true,
+        // The log travels in the closure: the toast outlives this panel.
+        action: { label: 'View Log', onClick: () => showGitOutput({ action, stdout: '', stderr: log }) },
       })
     }
     let done: GitOperationDone
@@ -104,7 +107,7 @@ export function useGitOperation(workspaceId: string, projectId: string): {
         ...(link !== undefined
           ? { action: { label: link.label, onClick: () => { window.open(link.url, '_blank', 'noopener,noreferrer') } } }
           : log !== undefined
-            ? { action: { label: 'View Log', onClick: () => setOutput({ action, stdout: log.stdout, stderr: log.stderr }) } }
+            ? { action: { label: 'View Log', onClick: () => showGitOutput({ action, stdout: log.stdout, stderr: log.stderr }) } }
             : {}),
       })
     }
@@ -123,7 +126,6 @@ export function useGitOperation(workspaceId: string, projectId: string): {
           onCancel={() => first.settle({ cancel: true })}
         />
       ) : null}
-      <GitOutputDialog output={output} onClose={() => setOutput(null)} />
     </>
   )
   return { run, dialogs }

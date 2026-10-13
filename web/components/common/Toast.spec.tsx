@@ -79,6 +79,15 @@ describe('toast lifetime', () => {
   })
 })
 
+describe('plain toast', () => {
+  it('a plain bad toast shows its own text as the headline; a bad toast without it keeps the error summary', () => {
+    act(() => { api.notify('git push failed', 'bad', { plain: true }) })
+    expect(document.querySelector('[role="alert"] p')?.textContent).toBe('git push failed')
+    act(() => { api.notify('git push failed', 'bad') })
+    expect(toasts()).toHaveLength(2)
+  })
+})
+
 describe('toast action', () => {
   it('renders the action as a button; clicking runs it and closes the toast', async () => {
     const onClick = vi.fn()
