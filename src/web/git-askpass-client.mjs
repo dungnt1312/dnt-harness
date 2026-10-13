@@ -43,8 +43,18 @@ const stream = net.createConnection(socket)
 stream.on('error', (error) => fail(`socket ${socket}: ${error.message}`))
 stream.on('connect', () => stream.write(prompt))
 stream.on('data', (chunk) => response.push(chunk))
-stream.on('end', () => {
-  process.stdout.write(Buffer.concat(response), (error) => {
+let answered = false
+// A connection that ends having delivered zero bytes was cancelled or dropped
+// (an empty password is indistinguishable): exit non-zero and print nothing, so
+// git never reads an empty answer as a credential.
+function finish() {
+  if (answered) return
+  answered = true
+  const bytes = Buffer.concat(response)
+  if (bytes.length === 0) fail('no answer')
+  process.stdout.write(bytes, (error) => {
     if (error) fail('error writing to stdout')
   })
-})
+}
+stream.on('end', finish)
+stream.on('close', finish)

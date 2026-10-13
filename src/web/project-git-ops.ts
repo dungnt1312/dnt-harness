@@ -516,7 +516,8 @@ export function runProjectGitOperation(
       return { ok: step.ok, stdout: step.stdout, stderr: step.stderr, status }
     } finally {
       // Success, git failure, rejection or cancel: the socket, script and temp dir always go.
-      await session?.dispose()
+      // A cleanup failure must not turn the operation's result (or its own error) into a rejection.
+      try { await session?.dispose() } catch { /* the temp dir is private and the OS reclaims it */ }
     }
   })
 }

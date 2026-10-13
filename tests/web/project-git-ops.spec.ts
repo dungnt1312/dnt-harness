@@ -696,7 +696,7 @@ echo "$GIT_CONFIG_COUNT|$GIT_CONFIG_KEY_0|$GIT_CONFIG_VALUE_0" > "$FAKE_DIR/conf
 sleep 60 > /dev/null 2>&1 &
 echo $! > "$FAKE_DIR/sleep.pid"
 trap 'kill $(cat "$FAKE_DIR/sleep.pid") 2> /dev/null' EXIT
-password=$("$GIT_ASKPASS" "Password:")
+password=$("$GIT_ASKPASS" "Password:") || { echo "fatal: could not read Password" >&2; exit 128; }
 echo "$password" > "$FAKE_DIR/got"
 if [ "$password" = secret ]; then echo pushed; exit 0; fi
 echo "fatal: Authentication failed" >&2
@@ -832,6 +832,9 @@ exit 1
       expect(result).toMatchObject({ ok: false, cancelled: true })
       expect(await waitDead(gitPid)).toBe(true)
       expect(await waitDead(sleepPid)).toBe(true)
+      // The cancelled connection stayed silent while git (and its askpass client) ignored
+      // SIGTERM, so git never read an empty answer; SIGKILL ended it first.
+      expect(await exists(path.join(dir, 'got'))).toBe(false)
     } finally {
       delete process.env['FAKE_IGNORE_TERM']
     }
@@ -858,6 +861,41 @@ exit 1
     ).rejects.toThrow(/not a remote/)
     expect(existsSync(hooks.session().tempDir)).toBe(false)
     expect(promptRegistrySize()).toBe(0)
+  })
+
+  /** Makes the session's dispose clean up for real, then fail. */
+  function failingDispose(onSession: (session: AskpassSession) => void) {
+    return (session: AskpassSession): void => {
+      onSession(session)
+      const real = session.dispose.bind(session)
+      ;(session as { dispose: () => Promise<void> }).dispose = async () => {
+        await real()
+        throw new Error('rm failed')
+      }
+    }
+  }
+
+  it('a failing session dispose does not turn a result into a rejection', async () => {
+    const repo = await pushRepo()
+    const dir = await fakeDir()
+    const hooks = wire()
+    const done = runProjectGitOperation(repo.dir, true, pushRequest, { ...hooks.askpass, onSession: failingDispose(hooks.askpass.onSession) }, { run: fakeRunner(dir) })
+    const frame = await hooks.next()
+    expect(answerGitAskpass(frame.promptId, { password: 'secret' }, owner)).toBe(true)
+    await expect(done).resolves.toMatchObject({ ok: true, stdout: 'pushed\n' })
+  })
+
+  it('a failing session dispose keeps the cancelled result and the request error', async () => {
+    const repo = await pushRepo()
+    const dir = await fakeDir()
+    const hooks = wire()
+    const cancelled = runProjectGitOperation(repo.dir, true, pushRequest, { ...hooks.askpass, onSession: failingDispose(hooks.askpass.onSession) }, { run: fakeRunner(dir) })
+    const frame = await hooks.next()
+    expect(answerGitAskpass(frame.promptId, { cancel: true }, owner)).toBe(true)
+    await expect(cancelled).resolves.toMatchObject({ ok: false, cancelled: true })
+
+    const rejected = runProjectGitOperation(repo.dir, true, { ...pushRequest, remote: 'nowhere' }, { ...hooks.askpass, onSession: failingDispose(hooks.askpass.onSession) }, { run: fakeRunner(dir) })
+    await expect(rejected).rejects.toThrow(/not a remote/)
   })
 
   it('does not create a session for operations that never prompt', async () => {

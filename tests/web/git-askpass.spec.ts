@@ -124,23 +124,32 @@ describe.runIf(unix)('askpass session (Unix)', () => {
     expect(promptRegistrySize()).toBe(0)
   })
 
-  it('cancel closes the prompt without an answer and marks the session cancelled', async () => {
+  /** Whether a promise is still pending after `ms`. */
+  async function stillPending(promise: Promise<unknown>, ms = 300): Promise<boolean> {
+    const marker = Symbol('pending')
+    return (await Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(marker), ms))])) === marker
+  }
+
+  it('cancel leaves the connection open and silent until dispose, then the client fails with no output', async () => {
     const queue = frameQueue()
     const session = await open('push', queue.onPrompt)
     const client = run(process.execPath, [CLIENT, `--askpass=${socketOf(session)}`, 'Password:'])
     const frame = await queue.next()
     expect(answerGitAskpass(frame.promptId, { cancel: true })).toBe(true)
-    const result = await client
-    expect(result.stdout).toBe('')
     expect(session.cancelled).toBe(true)
     expect(session.answer(frame.promptId, 'secret')).toBe(false)
+    // No byte, no close: the client (and so git) keeps waiting instead of reading an empty answer.
+    expect(await stillPending(client)).toBe(true)
 
     await session.dispose()
+    const result = await client
+    expect(result.code).not.toBe(0)
+    expect(result.stdout).toBe('')
     expect(promptRegistrySize()).toBe(0)
     expect(existsSync(session.tempDir)).toBe(false)
   })
 
-  it('cancelAll cancels the pending prompt and refuses the ones queued behind it', async () => {
+  it('cancelAll keeps the pending prompt open and drops the ones queued behind it', async () => {
     const frames: AskpassFrame[] = []
     const queue = frameQueue()
     const session = await open('pull', (frame) => { frames.push(frame); queue.onPrompt(frame) })
@@ -152,8 +161,14 @@ describe.runIf(unix)('askpass session (Unix)', () => {
     expect(promptRegistrySize()).toBe(1)
     session.cancelAll()
     expect(promptRegistrySize()).toBe(0)
-    expect((await a).stdout).toBe('')
-    expect((await b).stdout).toBe('')
+    const droppedB = await b
+    expect(droppedB.code).not.toBe(0)
+    expect(droppedB.stdout).toBe('')
+    expect(await stillPending(a)).toBe(true)
+    await session.dispose()
+    const endedA = await a
+    expect(endedA.code).not.toBe(0)
+    expect(endedA.stdout).toBe('')
     expect(frames).toHaveLength(1)
     expect(session.cancelled).toBe(true)
   })
@@ -167,6 +182,7 @@ describe.runIf(unix)('askpass session (Unix)', () => {
     await session.dispose()
     const result = await client
     expect(result.stdout).toBe('')
+    expect(result.code).not.toBe(0)
     expect(promptRegistrySize()).toBe(0)
     expect(existsSync(session.tempDir)).toBe(false)
     expect(answerGitAskpass(frame.promptId, { password: 'secret' })).toBe(false)
@@ -266,11 +282,33 @@ describe.runIf(unix)('askpass session lifecycle (Unix)', () => {
     const client = run(process.execPath, [CLIENT, `--askpass=${socketOf(session)}`, 'Password:'])
     const frame = await queue.next()
     expect(answerGitAskpass(frame.promptId, { cancel: true })).toBe(true)
-    // Before the client could even see the closed connection.
     expect(cancels).toBe(1)
-    expect((await client).stdout).toBe('')
     session.cancelAll()
     expect(cancels).toBe(1)
+    await session.dispose()
+    expect((await client).stdout).toBe('')
+  })
+
+  it('the client exits non-zero, printing nothing, when the connection ends with zero bytes', async () => {
+    const dir = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-askpass-eof-')))
+    const endpoint = path.join(dir, 'eof.sock')
+    const net = await import('node:net')
+    let reply: Buffer | undefined
+    const server = net.createServer((socket) => {
+      socket.once('data', () => { if (reply) socket.end(reply); else socket.end() })
+    })
+    await new Promise<void>((resolve) => server.listen(endpoint, resolve))
+    try {
+      const empty = await run(process.execPath, [CLIENT, `--askpass=${endpoint}`, 'Password:'])
+      expect(empty.code).not.toBe(0)
+      expect(empty.stdout).toBe('')
+      reply = Buffer.from('hunter2')
+      const answered = await run(process.execPath, [CLIENT, `--askpass=${endpoint}`, 'Password:'])
+      expect(answered).toMatchObject({ code: 0, stdout: 'hunter2' })
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+      await fs.rm(dir, { recursive: true, force: true })
+    }
   })
 
   it('answers only a strict { password: string } or { cancel: true }', async () => {
@@ -288,7 +326,7 @@ describe.runIf(unix)('askpass session lifecycle (Unix)', () => {
     expect(answerGitAskpass(42 as unknown as string, { cancel: true })).toBe(false)
     expect(promptRegistrySize()).toBe(1)
     expect(session.cancelled).toBe(false)
-    expect(answerGitAskpass(frame.promptId, { password: '' })).toBe(true)
+    expect(answerGitAskpass(frame.promptId, { password: 'x' })).toBe(true)
     expect((await client).code).toBe(0)
   })
 
@@ -304,6 +342,10 @@ describe.runIf(unix)('askpass session lifecycle (Unix)', () => {
       expect(answerGitAskpass(frame.promptId, { password: 'secret' }, other)).toBe(false)
       expect(answerGitAskpass(frame.promptId, { cancel: true }, other)).toBe(false)
     }
+    // A session with an owner refuses answers that name no owner at all.
+    expect(answerGitAskpass(frame.promptId, { password: 'secret' })).toBe(false)
+    expect(answerGitAskpass(frame.promptId, { cancel: true })).toBe(false)
+    expect(answerGitAskpass(frame.promptId, { password: 'secret' }, undefined)).toBe(false)
     expect(session.cancelled).toBe(false)
     expect(promptRegistrySize()).toBe(1)
     expect(answerGitAskpass(frame.promptId, { password: 'secret' }, { ...owner })).toBe(true)

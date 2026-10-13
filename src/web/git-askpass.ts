@@ -8,8 +8,10 @@
  * directory, or a random named pipe on Windows) and prints whatever comes back.
  * Each connection becomes one prompt: registered under a random id, announced
  * through `onPrompt`, then answered (password bytes written, connection closed)
- * or cancelled (the operation is killed first, then the connection is closed
- * with no answer). Passwords are written to the connection and nowhere else.
+ * or cancelled (the operation is killed and the connection is left open and
+ * silent until git's process dies or the session is disposed; the client exits
+ * non-zero if the connection ends without any byte). Passwords are written to the
+ * connection and nowhere else.
  */
 import { randomBytes } from 'node:crypto'
 import { accessSync, constants as fsConstants, promises as fs, statSync } from 'node:fs'
@@ -54,8 +56,9 @@ export interface AskpassSessionOptions {
   readonly owner?: AskpassOwner
   /**
    * Called synchronously, once, when the user cancels a prompt or the session is
-   * cancelled — before the connection is closed, so the operation can be killed
-   * before the empty answer reaches git (which would retry with empty credentials).
+   * cancelled. The cancelled connection stays open with no bytes (Zed) until the
+   * operation's process dies or the session is disposed, so git never receives
+   * an answer it could retry with.
    */
   readonly onCancel?: () => void
 }
@@ -90,20 +93,24 @@ function isAnswer(value: unknown): value is AskpassAnswer {
   return false
 }
 
-function sameOwner(a: AskpassOwner | undefined, b: AskpassOwner): boolean {
-  return a !== undefined && a.workspaceId === b.workspaceId && a.projectId === b.projectId
+function sameOwner(a: AskpassOwner | undefined, b: AskpassOwner | undefined): boolean {
+  return a !== undefined && b !== undefined && a.workspaceId === b.workspaceId && a.projectId === b.projectId
 }
 
 /**
- * Answer or cancel a pending prompt by id, whichever session owns it. When
- * `owner` is given the prompt's session must belong to it, otherwise the call
- * is refused. A malformed answer is refused too — it never cancels or throws.
+ * Answer or cancel a pending prompt by id, whichever session owns it. When the
+ * prompt's session has an owner, `owner` must be given and equal it; when
+ * `owner` is given the session must have that owner. Anything else is refused,
+ * and so is a malformed answer — it never cancels or throws.
  */
 export function answerGitAskpass(promptId: string, answer: AskpassAnswer, owner?: AskpassOwner): boolean {
   if (typeof promptId !== 'string' || !isAnswer(answer)) return false
   const pending = registry.get(promptId)
   if (pending === undefined) return false
-  if (owner !== undefined && !sameOwner(pending.session.owner, owner)) return false
+  // A session with an owner answers only its owner; a caller that names an owner
+  // reaches only a session that has that same owner.
+  const sessionOwner = pending.session.owner
+  if ((sessionOwner !== undefined || owner !== undefined) && !sameOwner(sessionOwner, owner)) return false
   return 'password' in answer ? pending.session.answer(promptId, answer.password) : pending.session.cancel(promptId)
 }
 
@@ -344,10 +351,12 @@ class NetAskpassSession implements AskpassSession {
   cancel(promptId: string): boolean {
     const socket = this.#take(promptId)
     if (socket === undefined) return false
-    // Kill the operation before the connection closes: the client's empty
-    // answer must not reach a git that would retry with empty credentials.
+    // Zed: signal the kill but leave the connection open and silent. It closes
+    // when the operation's process dies (the client is in its group) or on
+    // dispose, so no empty answer can reach a git that would retry with it.
     this.#signalCancel()
-    socket.end()
+    // Nothing is served after a cancel; waiting clients get no answer either.
+    for (const other of this.#sockets) if (other !== socket) other.destroy()
     return true
   }
 
@@ -362,7 +371,8 @@ class NetAskpassSession implements AskpassSession {
       for (const socket of this.#sockets) socket.destroy()
       this.#sockets.clear()
       await new Promise<void>((resolve) => this.server.close(() => resolve()))
-      await fs.rm(this.tempDir, { recursive: true, force: true })
+      // A just-closed socket or a busy file system can fail the first attempt.
+      await fs.rm(this.tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
     })()
     return this.#disposed
   }
