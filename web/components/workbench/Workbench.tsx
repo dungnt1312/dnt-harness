@@ -328,6 +328,7 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
                 <button type="button" aria-pressed={active} title={skillTabName(path) !== null ? `Skill ${baseName(path)}` : memoryTabOf(path) !== null ? `Memory ${memoryTabOf(path)?.file ?? ''}` : path} onClick={() => files.openFile(path)} className={cn('flex h-full items-center gap-1.5 pl-3 pr-1 text-[13px]', active ? 'text-fg' : 'text-fg-muted hover:text-fg')}>
                   <FileTypeIcon path={skillTabName(path) !== null ? 'SKILL.md' : memoryTabOf(path) !== null ? baseName(path) : path} size={14} />
                   <span className="max-w-[12rem] truncate">{baseName(path)}</span>
+                  {files.drafts?.[path]?.dirty === true ? <span aria-label="Unsaved changes" className="size-1.5 shrink-0 rounded-full bg-fg-muted" /> : null}
                 </button>
                 <button type="button" aria-label={`Close ${path}`} title="Close" onClick={() => files.closeFile(path)} className={cn('mr-1 flex size-5 items-center justify-center rounded text-fg-faint hover:bg-hover hover:text-fg [@media(pointer:coarse)]:size-7', active ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100 [@media(pointer:coarse)]:opacity-100')}>
                   <Icon name="close" size={12} />

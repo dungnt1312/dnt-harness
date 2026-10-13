@@ -5,9 +5,11 @@ import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
-import { getSkillFile, readMemoryFile, readProjectFile, type ProjectFileView } from '../../lib/api.ts'
+import { getSkillFile, readMemoryFile, readProjectFile, saveProjectFile, SaveConflictError, type ProjectFileView } from '../../lib/api.ts'
 import { memoryTabOf, skillTabName } from '../../lib/project-paths.ts'
-import type { ViewerFocus } from '../../hooks/useWorkbenchFiles.ts'
+import { writeErrorText } from '../../lib/file-tree.ts'
+import type { FileDraft, ViewerFocus } from '../../hooks/useWorkbenchFiles.ts'
+import { FileEditor } from './FileEditor.tsx'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
 import { MediaPreview } from '../common/MediaPreview.tsx'
 import { escapeHtml, ensureLanguage, highlight, languageOfFile } from '../../lib/highlight.ts'
@@ -21,19 +23,34 @@ async function readSkillMd(workspaceId: string, projectId: string, name: string)
   return { path: file.path, size: file.bytes, binary: false, truncated: false, content: file.content }
 }
 
-/** Read-only file view: path bar, language, copy, and line-numbered highlighted content. */
-export function FileViewer({ workspaceId, projectId, projectPath, path, focus = null }: {
+/** File view: path bar, language, copy, and line-numbered highlighted content; project files can be edited in place. */
+export function FileViewer({ workspaceId, projectId, projectPath, path, focus = null, draft, onDraft }: {
   readonly workspaceId: string
   readonly projectId: string
   readonly projectPath: string
   readonly path: string
   /** The window the caller opened this file at; null lands at the top. */
   readonly focus?: ViewerFocus | null
+  /** The unsaved edit for this tab, owned by the caller so it survives tab switches. */
+  readonly draft: FileDraft | null
+  readonly onDraft: (draft: FileDraft | null) => void
 }) {
   const [file, setFile] = useState<ProjectFileView | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const generation = useRef(0)
+  // Edit-flow state is local: the viewer remounts per tab, only the draft survives.
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  /** The disk hash reported by a refused save; non-null shows the conflict banner. */
+  const [conflict, setConflict] = useState<string | null>(null)
+  const savingRef = useRef(false)
+  // A save outlives a tab switch; its result must not touch the draft of a viewer that is gone.
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
   // A skill tab reads SKILL.md from whichever layer owns the skill, which may
   // be outside the project folder.
   const skill = skillTabName(path)
@@ -64,6 +81,56 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
   }, [workspaceId, projectId, path, skill, memory?.file, memory?.projectId])
 
   useEffect(() => { void load() }, [load])
+
+  const clearEditState = (): void => { setSaveError(null); setConflict(null) }
+
+  /** Writes the draft; `expectedHash` is the draft's base unless Overwrite supplies the current disk hash. */
+  const save = async (expectedHash: string): Promise<void> => {
+    if (draft === null || file === null || !draft.dirty || savingRef.current) return
+    savingRef.current = true
+    setSaving(true)
+    setSaveError(null)
+    try {
+      const result = await saveProjectFile(workspaceId, projectId, path, draft.text, expectedHash)
+      if (!mounted.current) return
+      setFile({ ...file, content: draft.text, size: result.size, hash: result.hash })
+      clearEditState()
+      onDraft(null)
+    } catch (cause) {
+      if (!mounted.current) return
+      if (cause instanceof SaveConflictError) {
+        setSaveError(null)
+        setConflict(cause.currentHash)
+      } else {
+        setConflict(null)
+        setSaveError(writeErrorText(cause))
+      }
+    } finally {
+      savingRef.current = false
+      if (mounted.current) setSaving(false)
+    }
+  }
+
+  const cancelEdit = (): void => {
+    if (savingRef.current) return
+    if (draft?.dirty === true && !window.confirm('Discard unsaved changes?')) return
+    clearEditState()
+    onDraft(null)
+  }
+
+  /** Drops the draft and re-reads the file; asks first when there is something to lose. */
+  const reloadFromDisk = (): void => {
+    if (savingRef.current) return
+    if ((draft?.dirty === true || conflict !== null) && !window.confirm('Discard your changes and load the file from disk?')) return
+    clearEditState()
+    if (draft !== null) onDraft(null)
+    void load()
+  }
+
+  const overwrite = (): void => {
+    if (conflict === null || !window.confirm('Overwrite the file on disk with your changes?')) return
+    void save(conflict)
+  }
 
   const language = languageOfFile(skill !== null ? 'SKILL.md' : memory !== null ? memory.file : path)
   // The grammar loads after first paint: big files never wait on it, and the
@@ -124,7 +191,10 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
       <div className="flex h-10 shrink-0 items-center gap-2 border-b border-line px-3 text-[13px]">
         <FileTypeIcon path={iconPath} size={16} />
         <span className="min-w-0 flex-1 truncate text-fg-muted" title={fullPath}>{fullPath}</span>
-        <IconButton label="Reload file" onClick={() => void load()}><Icon name="refresh" size={15} /></IconButton>
+        {skill === null && memory === null && file?.editable === true && file.hash !== undefined && draft === null ? (
+          <IconButton label="Edit file" onClick={() => onDraft({ text: file.content, baseHash: file.hash!, dirty: false })}><Icon name="pencil" size={15} /></IconButton>
+        ) : null}
+        <IconButton label="Reload file" onClick={reloadFromDisk}><Icon name="refresh" size={15} /></IconButton>
       </div>
       {error !== null ? (
         <div className="flex flex-col items-start gap-2 p-3">
@@ -143,6 +213,20 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
             <div className="min-h-0 flex-1 overflow-auto" role="region" aria-label={`Preview of ${path}`}>
               <MediaPreview workspaceId={workspaceId} projectId={projectId} path={path} layout="full" />
             </div>
+          ) : draft !== null ? (
+            <FileEditor
+              path={path}
+              text={draft.text}
+              dirty={draft.dirty}
+              saving={saving}
+              error={saveError}
+              conflict={conflict !== null}
+              onChange={(text) => onDraft({ ...draft, text, dirty: text !== file.content || draft.baseHash !== file.hash })}
+              onSave={() => void save(draft.baseHash)}
+              onCancel={cancelEdit}
+              onReload={reloadFromDisk}
+              onOverwrite={overwrite}
+            />
           ) : (
             <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto" role="region" aria-label={`Contents of ${path}`} tabIndex={0}>
               {file.truncated ? <p className="m-0 border-b border-line bg-warn-soft px-3 py-1.5 text-xs text-warn">File is larger than 1 MB; only the beginning is shown.</p> : null}

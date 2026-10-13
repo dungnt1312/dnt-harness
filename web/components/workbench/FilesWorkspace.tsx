@@ -48,11 +48,12 @@ export function FilesWorkspace({ workspaceId, project, files, treeVisible, treeF
     onTreeFraction(fraction.current)
   }
 
+  const activeFile = files.activeFile
   return (
     <div className="flex min-h-0 flex-1">
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        {files.activeFile !== null
-          ? <FileViewer key={`${project.id}:${files.activeFile}`} workspaceId={workspaceId} projectId={project.id} projectPath={project.path} path={files.activeFile} focus={files.focus} />
+        {activeFile !== null
+          ? <FileViewer key={`${project.id}:${activeFile}`} workspaceId={workspaceId} projectId={project.id} projectPath={project.path} path={activeFile} focus={files.focus} draft={files.drafts?.[activeFile] ?? null} onDraft={(draft) => files.setDraft(activeFile, draft)} />
           : <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center"><Icon name="fileText" size={22} className="text-fg-faint" /><p className="m-0 text-sm text-fg-muted">Open a file from the tree.</p></div>}
       </div>
       <div
