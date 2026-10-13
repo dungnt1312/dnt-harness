@@ -143,6 +143,33 @@ describe('refusals', () => {
     expect(await exists('README.md')).toBe(true)
   })
 
+  it('refuses dot segments that resolve to the root or an ancestor', async () => {
+    for (const raw of ['./.', '././', 'src/.', './src', 'src/./index.ts']) {
+      expect(await status(deleteProjectEntry(root, raw)), raw).toBe(400)
+      expect(await status(renameProjectEntry(root, raw, 'x'))).toBe(400)
+      expect(await status(createProjectEntry(root, raw, 'dir'))).toBe(400)
+    }
+    expect(await exists('README.md')).toBe(true)
+    expect(await exists('src/index.ts')).toBe(true)
+  })
+
+  it('refuses case variants of .git', async () => {
+    expect(await status(deleteProjectEntry(root, '.GIT'))).toBe(400)
+    expect(await status(renameProjectEntry(root, '.Git', 'x'))).toBe(400)
+    expect(await status(createProjectEntry(root, '.GIT/hooks', 'dir'))).toBe(400)
+    expect(await status(renameProjectEntry(root, 'README.md', '.GIT'))).toBe(400)
+    expect(await exists('.git')).toBe(true)
+    expect(await exists('README.md')).toBe(true)
+  })
+
+  it('refuses an ancestor of a denied root', async () => {
+    const denied = [path.join(root, 'src', 'nested')]
+    expect(await status(deleteProjectEntry(root, 'src', denied))).toBe(400)
+    expect(await status(renameProjectEntry(root, 'src', 'lib', denied))).toBe(400)
+    expect(await exists('src/nested')).toBe(true)
+    expect(await exists('lib')).toBe(false)
+  })
+
   it('refuses .git and anything under it', async () => {
     expect(await status(deleteProjectEntry(root, '.git'))).toBe(400)
     expect(await status(createProjectEntry(root, '.git/hooks', 'dir'))).toBe(400)

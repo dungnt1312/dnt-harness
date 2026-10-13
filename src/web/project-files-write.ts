@@ -28,8 +28,13 @@ function nameProblem(name: string): string | undefined {
   if (/[/\\\0]/.test(name)) return 'name must not contain /, \\ or NUL'
   if (name !== name.trim()) return 'name must not start or end with whitespace'
   if (Buffer.byteLength(name, 'utf8') > MAX_NAME_BYTES) return `name must be at most ${MAX_NAME_BYTES} bytes`
-  if (name === '.git') return "'.git' is protected"
+  if (isGitName(name)) return "'.git' is protected"
   return blockedReason(name, name)
+}
+
+/** `.git` in any letter case, so `.GIT` cannot reach it on a case-insensitive volume. */
+function isGitName(segment: string): boolean {
+  return segment.normalize('NFC').toLowerCase() === '.git'
 }
 
 interface Target {
@@ -55,7 +60,8 @@ async function target(root: string, raw: string, deniedRoots: readonly string[] 
   if (rel === '') refuse('the project root itself cannot be changed')
   const segments = rel.split('/')
   if (segments.includes('..')) refuse(`path '${rel}' escapes the project root`)
-  if (segments.includes('.git')) refuse("'.git' is protected")
+  if (segments.includes('.')) refuse(`path '${rel}' must not contain '.' segments`)
+  if (segments.some(isGitName)) refuse("'.git' is protected")
   const name = segments[segments.length - 1] as string
   const parentRel = segments.slice(0, -1).join('/')
   let parentAbs: string
@@ -65,10 +71,19 @@ async function target(root: string, raw: string, deniedRoots: readonly string[] 
     refuse(error instanceof Error ? error.message : String(error))
   }
   const abs = path.join(parentAbs, name)
+  if (path.resolve(abs) === path.resolve(root)) refuse('the project root itself cannot be changed')
   for (const denied of deniedRoots ?? []) {
     if (within(denied, abs)) refuse(`path '${rel}' is inside protected storage`)
   }
   return { rel, parentAbs, parentRel, name, abs }
+}
+
+/** Refuse removing or moving `abs` when a protected root lies at or under it. */
+async function refuseProtectedDescendant(abs: string, rel: string, deniedRoots: readonly string[] | undefined): Promise<void> {
+  for (const denied of deniedRoots ?? []) {
+    const deniedReal = await fs.realpath(denied).catch(() => denied)
+    if (within(abs, denied) || within(abs, deniedReal)) refuse(`path '${rel}' contains protected storage`)
+  }
 }
 
 async function requireFolder(abs: string, rel: string): Promise<void> {
@@ -101,6 +116,7 @@ export async function renameProjectEntry(root: string, rawPath: string, newName:
   const problem = nameProblem(newName)
   if (problem !== undefined) refuse(problem)
   if (newName === t.name) refuse('the new name is the same as the current one')
+  await refuseProtectedDescendant(t.abs, t.rel, deniedRoots)
   const source = await fs.lstat(t.abs).catch(() => null)
   if (source === null) throw new ProjectWriteError(404, `'${t.rel}' does not exist`)
   const destAbs = path.join(t.parentAbs, newName)
@@ -121,6 +137,7 @@ export async function renameProjectEntry(root: string, rawPath: string, newName:
 
 export async function deleteProjectEntry(root: string, rawPath: string, deniedRoots?: readonly string[]): Promise<{ path: string }> {
   const t = await target(root, rawPath, deniedRoots)
+  await refuseProtectedDescendant(t.abs, t.rel, deniedRoots)
   const source = await fs.lstat(t.abs).catch(() => null)
   if (source === null) throw new ProjectWriteError(404, `'${t.rel}' does not exist`)
   // `rm` removes a link itself and never descends into its target.
