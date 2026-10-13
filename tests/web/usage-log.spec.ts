@@ -4,7 +4,7 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { localDate, longestMergedSpan, openUsageLog, parseUsageLine, SESSION_GAP_MS } from '../../src/web/usage-log.ts'
 
-const base = { sessionId: 's1', rootSessionId: 's1', kind: 'turn' as const, model: 'm1', input: 100, cached: 40, output: 10 }
+const base = { sessionId: 's1', rootSessionId: 's1', kind: 'turn' as const, model: 'm1', input: 100, cached: 40, cacheReported: true, output: 10 }
 
 describe('usage log', () => {
   let dir: string
@@ -22,9 +22,9 @@ describe('usage log', () => {
     const reopened = await openUsageLog(file, { now: () => now })
     expect(reopened.daily()).toEqual(log.daily())
     const rows = reopened.daily().days
-    expect(rows).toContainEqual({ date: '2026-10-08', model: 'm1', input: 100, cached: 40, output: 10, requests: 1 })
-    expect(rows).toContainEqual({ date: '2026-10-08', model: 'm2', input: 100, cached: 40, output: 5, requests: 1 })
-    expect(rows).toContainEqual({ date: '2026-10-07', model: 'm1', input: 100, cached: 40, output: 10, requests: 1 })
+    expect(rows).toContainEqual({ date: '2026-10-08', model: 'm1', input: 100, cached: 40, cacheableInput: 100, cacheReportedRequests: 1, unreportedRequests: 0, output: 10, requests: 1 })
+    expect(rows).toContainEqual({ date: '2026-10-08', model: 'm2', input: 100, cached: 40, cacheableInput: 100, cacheReportedRequests: 1, unreportedRequests: 0, output: 5, requests: 1 })
+    expect(rows).toContainEqual({ date: '2026-10-07', model: 'm1', input: 100, cached: 40, cacheableInput: 100, cacheReportedRequests: 1, unreportedRequests: 0, output: 10, requests: 1 })
     expect(reopened.daily().today).toBe('2026-10-08')
   })
 
@@ -34,7 +34,29 @@ describe('usage log', () => {
     const good = JSON.stringify({ v: 1, ...base, at, startedAt: at })
     await fs.writeFile(file, `${good}\n{"v":1,"at":12\nnot json\n${JSON.stringify({ v: 2, ...base, at, startedAt: at })}\n\n${good}\n`)
     const log = await openUsageLog(file, { now: () => at })
-    expect(log.daily().days).toEqual([{ date: '2026-10-08', model: 'm1', input: 200, cached: 80, output: 20, requests: 2 }])
+    expect(log.daily().days).toEqual([{
+      date: '2026-10-08', model: 'm1', input: 200, cached: 80, cacheableInput: 200,
+      cacheReportedRequests: 2, unreportedRequests: 0, output: 20, requests: 2,
+    }])
+  })
+
+  it('excludes requests without cache telemetry from the cache-hit denominator', async () => {
+    const file = path.join(dir, 'usage.jsonl')
+    const now = new Date(2026, 9, 8, 12).getTime()
+    const log = await openUsageLog(file, { now: () => now })
+    log.record({ ...base, at: now - 2, startedAt: now - 3, input: 100, cached: 0, cacheReported: true })
+    log.record({ ...base, at: now - 1, startedAt: now - 2, input: 300, cached: 0, cacheReported: false })
+    await log.flush()
+    expect(log.daily().days).toEqual([{
+      date: '2026-10-08', model: 'm1', input: 400, cached: 0, cacheableInput: 100,
+      cacheReportedRequests: 1, unreportedRequests: 1, output: 20, requests: 2,
+    }])
+  })
+
+  it('treats legacy positive cached values as reported and legacy zero as unknown', () => {
+    const at = new Date(2026, 9, 8, 12).getTime()
+    expect(parseUsageLine(JSON.stringify({ v: 1, ...base, at, startedAt: at, cacheReported: undefined, cached: 40 }))?.cacheReported).toBe(true)
+    expect(parseUsageLine(JSON.stringify({ v: 1, ...base, at, startedAt: at, cacheReported: undefined, cached: 0 }))?.cacheReported).toBe(false)
   })
 
   it('drops days outside the 371-day window', async () => {

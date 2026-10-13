@@ -40,6 +40,71 @@ export function extractiveSummary(text: string): string {
   return text
 }
 
+export class CacheAwareCompactionFallback extends Error {
+  readonly fallback = true
+  constructor(message: string) {
+    super(message)
+    this.name = 'CacheAwareCompactionFallback'
+  }
+}
+
+/**
+ * Summarize by preserving the last completed model request as an exact prefix.
+ * The returned function takes no source because the prefix already carries the
+ * conversation; callers fall back to the transcript chunker on this class.
+ */
+export function createCacheAwareCompactionSummarizer(
+  stream: StreamFn,
+  previous: ModelRequest,
+  finalAnswer: string,
+  streamOptions?: StreamOptions,
+): () => Promise<string> {
+  return async () => {
+    // COMPACT_SUMMARY_PROMPT names a <conversation> envelope and <earlier-summary>;
+    // here the source is the request itself, so map those terms explicitly.
+    const instruction = [
+      'Stop the task. Do not call tools. Write a compaction summary instead.',
+      'In the instructions below, <conversation> means the whole conversation above through the final assistant answer, and <earlier-summary> means any compacted-history block above.',
+      '',
+      COMPACT_SUMMARY_PROMPT,
+    ].join('\n')
+    const request: ModelRequest = {
+      ...(previous.model !== undefined ? { model: previous.model } : {}),
+      ...(previous.providerName !== undefined ? { providerName: previous.providerName } : {}),
+      ...(previous.thinkingLevel !== undefined ? { thinkingLevel: previous.thinkingLevel } : {}),
+      messages: [
+        ...previous.messages,
+        ...(finalAnswer.trim() !== '' ? [{ role: 'assistant' as const, content: finalAnswer }] : []),
+        { role: 'user', content: instruction },
+      ],
+      ...(previous.tools !== undefined ? { tools: previous.tools } : {}),
+    }
+    let summary = ''
+    let completed = false
+    for await (const event of stream(request, streamOptions)) {
+      streamOptions?.signal?.throwIfAborted()
+      if (completed && event.type !== 'usage') throw new CacheAwareCompactionFallback('cache-aware compaction output after completion')
+      if (event.type === 'toolCalls' || event.type === 'toolCallProgress') {
+        throw new CacheAwareCompactionFallback('cache-aware compaction requested a tool')
+      }
+      if (event.type === 'completion') {
+        try { validateCompletion(event) } catch { throw new CacheAwareCompactionFallback('cache-aware compaction did not stop cleanly') }
+        if (event.finishReason !== 'stop') throw new CacheAwareCompactionFallback(`cache-aware compaction finished with ${event.finishReason}`)
+        completed = true
+      }
+      if (event.type === 'delta' && event.thinking !== true) {
+        if (summary.length + event.delta.length > MAX_SUMMARY_CHARS) {
+          throw new CacheAwareCompactionFallback('cache-aware compaction summary exceeds 24000 characters')
+        }
+        summary += event.delta
+      }
+    }
+    streamOptions?.signal?.throwIfAborted()
+    if (!completed || summary.trim() === '') throw new CacheAwareCompactionFallback('cache-aware compaction returned no complete summary')
+    return summary.trim()
+  }
+}
+
 /** Prefer complete lines; a single oversized line still makes progress. */
 function chunkEnd(text: string, start: number, capacity: number): number {
   let end = Math.min(text.length, start + capacity)

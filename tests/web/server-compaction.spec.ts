@@ -21,6 +21,8 @@ const COMPACT_MARK = 'Primary Request and Intent'
 function summarizingProvider(options: {
   replies?: readonly string[]
   summarize?: (request: ModelRequest) => string
+  /** Answer a cache-aware summary request with a tool call, forcing the chunk path. */
+  chunkOnly?: boolean
 } = {}): { provider: LlmProvider; requests: ModelRequest[] } {
   const requests: ModelRequest[] = []
   let turn = 0
@@ -31,6 +33,12 @@ function summarizingProvider(options: {
       requests.push(request)
       const isSummaryCall = request.messages.some((message) => typeof message.content === 'string' && message.content.includes(COMPACT_MARK))
       const reply = isSummaryCall ? undefined : (options.replies?.[turn++] ?? 'turn reply')
+      if (isSummaryCall && options.chunkOnly === true && request.messages.length > 1) {
+        return (async function* (): AsyncIterable<StreamEvent> {
+          yield { type: 'toolCalls', calls: [{ id: 'refuse', name: 'Read', args: {} }] }
+          yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+        })()
+      }
       return (async function* (): AsyncIterable<StreamEvent> {
         const text = isSummaryCall ? (options.summarize?.(request) ?? SUMMARY_TEXT) : reply!
         yield { type: 'delta', delta: text }
@@ -213,7 +221,7 @@ describe('web compaction', () => {
 
   it('passes text attachment content and image references, then rebuilds a missing checkpoint cache', async () => {
     const chunks: string[] = []
-    const { provider, requests } = summarizingProvider({ summarize(request) { chunks.push(conversationChunk(request)); return SUMMARY_TEXT } })
+    const { provider, requests } = summarizingProvider({ chunkOnly: true, summarize(request) { chunks.push(conversationChunk(request)); return SUMMARY_TEXT } })
     const { home, base, wsId } = await start(provider)
     const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
     const route = `${base}/api/workspaces/${wsId}/sessions/${id}`
@@ -282,7 +290,10 @@ describe('web compaction', () => {
     expect(log.filter((e) => e.type === 'compaction/start')).toHaveLength(1)
     const summaries = requests.filter((r) => r.messages.some((m) => typeof m.content === 'string' && m.content.includes(COMPACT_MARK)))
     expect(summaries.length).toBeGreaterThan(0)
+    // The pressured request was trimmed, so it cannot stand for the whole
+    // covered history: compaction must take the full-transcript chunk path.
     expect(summaries.every((r) => r.tools === undefined || r.tools.length === 0)).toBe(true)
+    expect(conversationChunk(summaries[0]!)).toContain('first')
     server.kernel.ctx.on('agent/pre-step', () => ({ kind: 'reject', reason: 'synthetic rejection' }), true)
     await completedMessage(base, wsId, id, logPath, 'rejected', 3)
     expect(requests).toHaveLength(2 + summaries.length)
@@ -355,6 +366,7 @@ describe('web compaction', () => {
     let chunkCalls = 0
     const chunks: string[] = []
     const { provider } = summarizingProvider({
+      chunkOnly: true,
       replies: ['previous state', 'synthetic long output\n'.repeat(11_000)],
       summarize(request) {
         if (!failing) return SUMMARY_TEXT
@@ -425,6 +437,11 @@ describe('web compaction', () => {
       throw new Error(`compact failed: ${response.status} ${body.error ?? ''}`)
     })
     expect(compacted.summaryChars).toBe(SUMMARY_TEXT.length)
+    const firstRequest = requests[0]!
+    const summaryRequest = requests.find((request, index) => index > 0 && request.messages.some((message) => typeof message.content === 'string' && message.content.includes(COMPACT_MARK)))!
+    expect(summaryRequest.messages.slice(0, firstRequest.messages.length)).toEqual(firstRequest.messages)
+    expect(summaryRequest.tools).toEqual(firstRequest.tools)
+    expect(summaryRequest.messages.at(-2)).toEqual({ role: 'assistant', content: 'turn reply' })
 
     // The response and the durable end event both carry the before/after
     // context size, and the meter's manifest already reflects the new size
@@ -556,6 +573,34 @@ describe('web compaction', () => {
     expect(checkpoint.summary).toBe(SUMMARY_TEXT)
   })
 
+  it('a later failed turn retires the cache prefix so compaction folds the full transcript', async () => {
+    let turn = 0
+    const requests: ModelRequest[] = []
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      stream(request) {
+        requests.push(request)
+        const isSummaryCall = request.messages.some((m) => typeof m.content === 'string' && m.content.includes(COMPACT_MARK))
+        const index = isSummaryCall ? -1 : turn++
+        return (async function* (): AsyncIterable<StreamEvent> {
+          if (index === 1) throw new ProviderError('hard failure after partial work', { status: 400 })
+          yield { type: 'delta', delta: isSummaryCall ? SUMMARY_TEXT : 'turn reply' }
+          yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+        })()
+      },
+    }
+    const { home, base, wsId } = await start(provider, { stepRetryBaseMs: 1 })
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    await completedMessage(base, wsId, id, logPath, 'FIRST TURN', 1)
+    await completedMessage(base, wsId, id, logPath, 'FAILED TURN', 2)
+    const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })
+    expect(response.status).toBe(200)
+    const summary = requests.find((r) => r.messages.some((m) => typeof m.content === 'string' && m.content.includes(COMPACT_MARK)))!
+    expect(summary.messages).toHaveLength(1)
+    expect(conversationChunk(summary)).toContain('FAILED TURN')
+  })
+
   it('re-compacts incrementally: only the delta beyond the prior checkpoint is summarized', async () => {
     const { provider, requests } = summarizingProvider()
     const { home, base, wsId } = await start(provider)
@@ -571,12 +616,10 @@ describe('web compaction', () => {
     // Exactly one summarizer call: no re-folding of the covered prefix.
     const summaryCalls = requests.slice(before).filter((request) => request.messages.some((message) => typeof message.content === 'string' && message.content.includes(COMPACT_MARK)))
     expect(summaryCalls).toHaveLength(1)
-    // The delta chunk contains only the new exchange, seeded by the prior summary.
-    const chunk = conversationChunk(summaryCalls[0]!)
-    expect(chunk).toContain('SECOND EXCHANGE')
-    expect(chunk).not.toContain('FIRST EXCHANGE')
-    const prompt = summaryCalls[0]!.messages[0]!.content as string
-    expect(prompt).toContain('<earlier-summary>')
+    // The request reuses the last post-checkpoint request, whose compacted-history
+    // block contains the prior summary while uncovered history contains only the delta.
+    const prompt = summaryCalls[0]!.messages.map((message) => typeof message.content === 'string' ? message.content : '').join('\n')
+    expect(prompt).toContain('SECOND EXCHANGE')
     expect(prompt).toContain('CHECKPOINT SUMMARY TEXT')
     // The next request consumes the new checkpoint.
     await completedMessage(base, wsId, id, logPath, 'third', 3)
@@ -610,7 +653,9 @@ describe('web compaction', () => {
     const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })
     expect(response.status).toBe(409)
     expect((await response.json() as { error: string }).error).toContain('too long for window')
-    expect(summaryCalls).toBe(1)
+    // One cache-aware attempt plus one bounded fallback; neither path retries a
+    // context-exceeded request with identical input.
+    expect(summaryCalls).toBe(2)
     const log = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { type: string; error?: string })
     expect(log.at(-1)).toMatchObject({ type: 'compaction/end' })
     expect(log.at(-1)?.error).toBeDefined()

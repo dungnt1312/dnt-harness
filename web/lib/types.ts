@@ -746,6 +746,9 @@ export interface UsageDayRow {
   /** Prompt tokens, cached ones included. */
   readonly input: number
   readonly cached: number
+  readonly cacheableInput: number
+  readonly cacheReportedRequests: number
+  readonly unreportedRequests: number
   readonly output: number
   readonly requests: number
 }

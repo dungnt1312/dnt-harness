@@ -22,7 +22,7 @@ class UsageLlm implements LlmProvider {
 }
 
 interface UsageBody {
-  days: { date: string; model: string; input: number; cached: number; output: number; requests: number }[]
+  days: { date: string; model: string; input: number; cached: number; cacheableInput: number; cacheReportedRequests: number; unreportedRequests: number; output: number; requests: number }[]
   longestSessionMs: number
   today: string
 }
@@ -64,12 +64,15 @@ describe('GET /api/usage', () => {
 
     const body = await waitForUsage(first.url)
     expect(body.days).toHaveLength(1)
-    expect(body.days[0]).toMatchObject({ date: body.today, input: 1200, cached: 800, output: 34, requests: 1 })
+    expect(body.days[0]).toMatchObject({
+      date: body.today, input: 1200, cached: 800, cacheableInput: 1200,
+      cacheReportedRequests: 1, unreportedRequests: 0, output: 34, requests: 1,
+    })
 
     await first.close()
     server = undefined
     const raw = await fs.readFile(path.join(home, 'usage.jsonl'), 'utf8')
-    expect(JSON.parse(raw.trim())).toMatchObject({ v: 1, kind: 'turn', sessionId: id, rootSessionId: id, input: 1200 })
+    expect(JSON.parse(raw.trim())).toMatchObject({ v: 1, kind: 'turn', sessionId: id, rootSessionId: id, input: 1200, cacheReported: true })
 
     const second = await boot()
     const again = await (await fetch(`${second.url}/api/usage`)).json() as UsageBody

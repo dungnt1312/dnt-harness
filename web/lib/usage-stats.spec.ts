@@ -4,7 +4,9 @@ import {
   addDays, buildHeatmap, buildTrend, formatDuration, formatTokens, levelFor, monotonePath, niceMax, quantileThresholds, summarize, OTHER_SERIES,
 } from './usage-stats.ts'
 
-const row = (date: string, model: string, input: number, output = 0): UsageDayRow => ({ date, model, input, cached: 0, output, requests: 1 })
+const row = (date: string, model: string, input: number, output = 0): UsageDayRow => ({
+  date, model, input, cached: 0, cacheableInput: input, cacheReportedRequests: 1, unreportedRequests: 0, output, requests: 1,
+})
 const data = (days: UsageDayRow[], today = '2026-10-08', longestSessionMs = 0): UsageDailyResponse => ({ days, today, longestSessionMs })
 
 describe('summarize', () => {

@@ -27,6 +27,8 @@ export interface UsageRecord {
   /** Prompt tokens, cached ones included. */
   readonly input: number
   readonly cached: number
+  /** Whether the provider explicitly reported a cached share, including zero. */
+  readonly cacheReported: boolean
   readonly output: number
 }
 
@@ -36,6 +38,10 @@ export interface UsageDayRow {
   readonly model: string
   readonly input: number
   readonly cached: number
+  /** Prompt input from requests whose provider reported a cached share. */
+  readonly cacheableInput: number
+  readonly cacheReportedRequests: number
+  readonly unreportedRequests: number
   readonly output: number
   readonly requests: number
 }
@@ -112,11 +118,20 @@ export function parseUsageLine(line: string): UsageRecord | undefined {
     model: r.model,
     input: count(r.input),
     cached: count(r.cached),
+    cacheReported: typeof r.cacheReported === 'boolean' ? r.cacheReported : count(r.cached) > 0,
     output: count(r.output),
   }
 }
 
-interface Bucket { input: number; cached: number; output: number; requests: number }
+interface Bucket {
+  input: number
+  cached: number
+  cacheableInput: number
+  cacheReportedRequests: number
+  unreportedRequests: number
+  output: number
+  requests: number
+}
 
 class UsageIndex {
   readonly byDay = new Map<string, Map<string, Bucket>>()
@@ -127,9 +142,17 @@ class UsageIndex {
     const date = localDate(record.at)
     let models = this.byDay.get(date)
     if (models === undefined) this.byDay.set(date, (models = new Map()))
-    const bucket = models.get(record.model) ?? { input: 0, cached: 0, output: 0, requests: 0 }
+    const bucket = models.get(record.model) ?? {
+      input: 0, cached: 0, cacheableInput: 0, cacheReportedRequests: 0, unreportedRequests: 0, output: 0, requests: 0,
+    }
     bucket.input += record.input
     bucket.cached += record.cached
+    if (record.cacheReported) {
+      bucket.cacheableInput += record.input
+      bucket.cacheReportedRequests += 1
+    } else {
+      bucket.unreportedRequests += 1
+    }
     bucket.output += record.output
     bucket.requests += 1
     models.set(record.model, bucket)

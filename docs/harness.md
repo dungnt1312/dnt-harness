@@ -616,7 +616,16 @@ Trusted context frames this as the same conversation continuing after compaction
 not a new session, and recent raw conversation may supersede the summary.
 The summary itself remains lower-trust reference data, never authoritative instructions.
 The host summarizer uses the session's effective (provider, model) pair with a
-structured-section prompt (`COMPACT_SUMMARY_PROMPT`). Folding is incremental:
+structured-section prompt (`COMPACT_SUMMARY_PROMPT`). Cache-aware path: when the
+newest turn ended `completed` and its last model request was lossless (a root
+step whose manifest has no omissions, so nothing was trimmed, cleared or
+dropped) and stopped cleanly, compaction reuses that request's messages and
+tool schemas byte-for-byte, appends the turn's final answer and the summary
+instruction, and lets the provider reuse its cached prefix. Any later root
+request retires the stored prefix. A restart, a failed or cancelled later turn,
+a trimmed request, an oversized prefix (over 200,000 characters), a tool-call
+response, a non-`stop` or malformed completion, or a context-exceeded refusal
+falls back to the bounded transcript chunker below. Folding is incremental:
 when a valid canonical checkpoint exists, it seeds the accumulated summary and
 only the uncovered delta beyond `coversSeq` is projected and folded — a repeat
 attempt never re-summarizes already-covered history, and an unchanged boundary

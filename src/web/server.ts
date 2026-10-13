@@ -53,7 +53,7 @@ import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
 import { expressibleThinkingLevel, isThinkingLevel, resolveContextLimit } from '../harness/llm/model-catalog.ts'
 import { adaptRequestVision, supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
 import { ProviderError } from '../harness/llm/types.ts'
-import type { LlmProvider, StreamEvent, TokenUsage, ToolCall } from '../harness/llm/types.ts'
+import type { LlmProvider, ModelRequest, StreamEvent, TokenUsage, ToolCall } from '../harness/llm/types.ts'
 import type { ToolResult } from '../harness/tools/types.ts'
 import { fileSessions, SessionsService } from '../harness/session/service.ts'
 import type { Session } from '../harness/session/session.ts'
@@ -159,7 +159,7 @@ import { buildContext, estimateConversationTokens, DEFAULT_BASE_SYSTEM, DEFAULT_
 import { renderEnvironmentContext } from '../harness/context/environment.ts'
 import { SystemPromptsStore, type SystemPromptsSnapshot } from '../harness/prompts/store.ts'
 import { CheckpointStore } from '../harness/context/compaction.ts'
-import { createCompactionSummarizer } from './llm-summarizer.ts'
+import { CacheAwareCompactionFallback, createCacheAwareCompactionSummarizer, createCompactionSummarizer } from './llm-summarizer.ts'
 import { DEFAULT_BUDGET, type ResolvedBudget } from '../harness/context/budget.ts'
 import { CommandsService } from '../harness/commands/service.ts'
 import { PluginService } from '../harness/plugins/service.ts'
@@ -1298,7 +1298,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         const loaded = refs.length > 0 ? await attachments.load(entry.workspaceId, refs, { textLimit: limits.attachmentTextLimit }) : undefined
         signal.throwIfAborted()
         const pair = summarizerModelOf(entry.session)
-        const summarizer = createCompactionSummarizer((request) => (async function* () {
+        const compactionStream = (request: ModelRequest) => (async function* () {
           // Each summarizer chunk is idempotent from the caller's view: a failed
           // attempt's partial output is discarded (buffered, never yielded), so a
           // transient transport failure may re-ask the same chunk — bounded like
@@ -1324,7 +1324,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
                     kind: 'compaction',
                     ...(request.providerName !== undefined ? { provider: request.providerName } : {}),
                     model: request.model ?? 'unknown',
-                    input: usage.usage.inputTokens, cached: usage.usage.cachedInputTokens ?? 0, output: usage.usage.outputTokens ?? 0,
+                    input: usage.usage.inputTokens, cached: usage.usage.cachedInputTokens ?? 0,
+                    cacheReported: usage.usage.cachedInputTokens !== undefined, output: usage.usage.outputTokens ?? 0,
                   })
                 }
                 yield* buffered
@@ -1338,7 +1339,29 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
               }
             }
           } finally { owner.dispose() }
-        })(), pair)
+        })()
+        const fallback = createCompactionSummarizer(compactionStream, pair)
+        // Cache-aware only when the stored prefix is the lossless last request of
+        // the newest completed turn and its answer closes that turn; otherwise
+        // the prefix could miss facts the new checkpoint claims to cover.
+        const stored = completedRequests.get(entry.session.id)
+        const finalAnswer = stored !== undefined ? compactionAnswerFor(entry.session.events, stored) : undefined
+        const previous = finalAnswer !== undefined ? stored?.request : undefined
+        // Keep the optimized path conservative: a very large previous request
+        // still uses the proven bounded chunker until token-aware preflight can
+        // demonstrate room for both the summary instruction and its output.
+        const cachePrefixFits = previous !== undefined && JSON.stringify({ messages: previous.messages, tools: previous.tools }).length <= 200_000
+        const cached = pair !== undefined && finalAnswer !== undefined && cachePrefixFits && previous?.providerName === pair.providerName && previous.model === pair.model
+          ? createCacheAwareCompactionSummarizer(compactionStream, previous, finalAnswer, { signal })
+          : undefined
+        const summarizer = cached === undefined ? fallback : async (input: Parameters<typeof fallback>[0]) => {
+          try { return await cached() } catch (error) {
+            const providerFallback = error instanceof ProviderError
+              && (error.contextExceeded || error.reason === 'malformed_protocol' || error.reason === 'incomplete_completion')
+            if (!(error instanceof CacheAwareCompactionFallback) && !providerFallback) throw error
+            return await fallback(input)
+          }
+        }
         const { compactSession, MAX_COMPACTION_SUMMARY_CHARS } = await import('../harness/context/compaction.ts')
         return await compactSession(entry.session, checkpoints, summarizer, {
           trigger, signal, ...(pair !== undefined ? { model: pair.model } : { extractiveCap: MAX_COMPACTION_SUMMARY_CHARS }),
@@ -2829,6 +2852,13 @@ ${entry.description}`.toLowerCase().includes(query))
   }
   /** Provider-reported token usage per session (last request + running cache totals). */
   const sessionUsage = new Map<SessionId, SessionUsage>()
+  /**
+   * The newest root model request that may seed cache-aware compaction. It is
+   * armed when the builder assembles a lossless request, cleared by the next
+   * root assembly, and kept only after that exact request stops cleanly.
+   */
+  const pendingCompactionPrefixes = new Map<SessionId, TurnId>()
+  const completedRequests = new Map<SessionId, CompactionPrefix>()
 
   // Tap every scoped completion for its `usage` event: the context meter
   // shows the provider's real prompt size and cache hits, not only the
@@ -2844,18 +2874,28 @@ ${entry.description}`.toLowerCase().includes(query))
     const upstream = next(request)
     if (sessionId === undefined) return upstream
     const startedAt = Date.now()
+    // Only the first stream after a lossless root assembly is that step's model
+    // request; tool-internal model calls in the same turn never claim it.
+    const armed = pendingCompactionPrefixes.get(sessionId)
+    if (armed !== undefined) pendingCompactionPrefixes.delete(sessionId)
+    const prefix = armed !== undefined && scope?.childOf === undefined && scope?.turnId === armed
+      ? { turnId: armed, request: compactionRequestOf(request) }
+      : undefined
     return (async function* tap() {
       // Some providers report usage more than once; the last report wins.
       let reported: TokenUsage | undefined
+      let completed = false
       try {
         for await (const event of upstream) {
           if (event.type === 'usage') {
             recordUsage(sessionUsage, sessionId, event.usage)
             reported = event.usage
           }
+          if (event.type === 'completion' && event.finishReason === 'stop' && event.transportSettled) completed = true
           yield event
         }
       } finally {
+        if (completed && prefix !== undefined) completedRequests.set(sessionId, prefix)
         if (reported !== undefined) {
           usageLog.record({
             at: Date.now(), startedAt,
@@ -2864,7 +2904,8 @@ ${entry.description}`.toLowerCase().includes(query))
             kind: scope?.childOf !== undefined ? 'child' : 'turn',
             ...(request.providerName !== undefined ? { provider: request.providerName } : {}),
             model: request.model ?? 'unknown',
-            input: reported.inputTokens, cached: reported.cachedInputTokens ?? 0, output: reported.outputTokens ?? 0,
+            input: reported.inputTokens, cached: reported.cachedInputTokens ?? 0,
+            cacheReported: reported.cachedInputTokens !== undefined, output: reported.outputTokens ?? 0,
           })
         }
       }
@@ -3161,6 +3202,17 @@ ${entry.description}`.toLowerCase().includes(query))
     if (scope !== undefined) {
       lastManifests.set(scope.sessionId, assembled.manifest)
       if (scope.turnId !== undefined) manifestTurns.set(scope.sessionId, scope.turnId)
+      // Any new root request supersedes the previous cache prefix until this
+      // one completes. Only a request that carried every conversation fact
+      // (no trimming, cleared tool results or dropped sources) may seed it.
+      if (scope.childOf === undefined) {
+        completedRequests.delete(scope.sessionId)
+        pendingCompactionPrefixes.delete(scope.sessionId)
+        const history = assembled.manifest.history.setting
+        if (scope.turnId !== undefined && history !== 'none' && assembled.manifest.omissions.length === 0) {
+          pendingCompactionPrefixes.set(scope.sessionId, scope.turnId)
+        }
+      }
       // This manifest describes the request about to run, not the previous
       // one. Drop its prompt count until `llm/stream` reports the new usage;
       // the running cache totals stay, because they are session-scoped.
@@ -3838,6 +3890,7 @@ ${entry.description}`.toLowerCase().includes(query))
     prefixSnapshots,
     contextBodies,
     sessionUsage,
+    completedRequests,
     usageLog,
     adoptMode,
     stampRootMode,
@@ -4123,6 +4176,7 @@ interface HandlerDeps {
   /** Context section hashes already recorded per session's log (body dedupe). */
   readonly contextBodies: Map<SessionId, Set<string>>
   readonly sessionUsage: Map<SessionId, SessionUsage>
+  readonly completedRequests: Map<SessionId, CompactionPrefix>
   readonly adoptMode: (workspaceId: WorkspaceId, modeId: string) => Promise<ResolvedMode>
   readonly stampRootMode: (session: Session, resolved: ResolvedMode) => Extract<SessionEvent, { type: 'session/mode' }>
   readonly rootModeOf: (scope: { readonly sessionId: SessionId; readonly rootSessionId?: SessionId }, workspaceId: WorkspaceId) => { mode: ResolvedMode; revision: number }
@@ -8589,11 +8643,13 @@ async function forgetSessionState(sessionId: SessionId, deps: HandlerDeps): Prom
   deps.lastManifests.delete(sessionId)
   deps.contextBodies.delete(sessionId)
   deps.sessionUsage.delete(sessionId)
+  deps.completedRequests.delete(sessionId)
   deps.prefixSnapshots.delete(sessionId)
   for (const childId of await deps.childExecutor.forgetRoot(sessionId)) {
     deps.lastManifests.delete(childId)
     deps.contextBodies.delete(childId)
     deps.sessionUsage.delete(childId)
+    deps.completedRequests.delete(childId)
     deps.prefixSnapshots.delete(childId)
   }
 }
@@ -8608,6 +8664,38 @@ interface PrefixSnapshot {
   readonly key: string
   skillCatalog?: readonly { readonly name: string; readonly description: string }[]
   memory?: readonly MemorySnippet[]
+}
+
+/** A completed root request that can seed cache-aware compaction for its turn. */
+interface CompactionPrefix {
+  readonly turnId: TurnId
+  readonly request: ModelRequest
+}
+
+/** Keep only the fields that shape the provider wire prefix; drop host-only handles. */
+function compactionRequestOf(request: ModelRequest): ModelRequest {
+  return {
+    ...(request.model !== undefined ? { model: request.model } : {}),
+    ...(request.providerName !== undefined ? { providerName: request.providerName } : {}),
+    ...(request.thinkingLevel !== undefined ? { thinkingLevel: request.thinkingLevel } : {}),
+    messages: request.messages,
+    ...(request.tools !== undefined ? { tools: request.tools } : {}),
+  }
+}
+
+/**
+ * The final answer of the newest completed turn, when the stored prefix is
+ * exactly that turn's last model request. Anything else (a failed or
+ * cancelled later turn, a different turn, no text answer) returns undefined.
+ */
+function compactionAnswerFor(events: readonly SessionEvent[], prefix: CompactionPrefix): string | undefined {
+  const end = events.findLast((event) => event.type === 'turn/end')
+  if (end?.type !== 'turn/end' || end.turnId !== prefix.turnId || end.reason !== 'completed') return undefined
+  const start = events.findLast((event) => event.type === 'turn/start' && event.turnId === prefix.turnId)
+  if (start === undefined) return undefined
+  const answer = events.findLast((event) => event.seq > start.seq && event.seq < end.seq && event.type === 'assistant/message')
+  if (answer?.type !== 'assistant/message' || answer.toolCalls !== undefined || answer.content.trim() === '') return undefined
+  return answer.content
 }
 
 /** Token usage the provider reported for one session since this host started. */

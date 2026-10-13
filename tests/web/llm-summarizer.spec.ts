@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest'
 import { COMPACT_SUMMARY_PROMPT } from '../../src/harness/context/compaction.ts'
 import type { ModelRequest, StreamEvent } from '../../src/harness/llm/types.ts'
-import { createCompactionSummarizer, extractiveSummary, MAX_SUMMARY_CHARS, REASK_RESERVE } from '../../src/web/llm-summarizer.ts'
+import { createCacheAwareCompactionSummarizer, createCompactionSummarizer, extractiveSummary, MAX_SUMMARY_CHARS, REASK_RESERVE } from '../../src/web/llm-summarizer.ts'
 
 function scriptedStream(events: readonly StreamEvent[], seen: ModelRequest[]): (request: ModelRequest) => AsyncIterable<StreamEvent> {
   return (request) => {
@@ -37,6 +37,34 @@ const STOP: StreamEvent = { type: 'completion', finishReason: 'stop', transport:
   ] as StreamEvent[][])('rejects invalid termination %j', async (...tail: StreamEvent[]) => {
     const summarize = createCompactionSummarizer(scriptedStream([{ type: 'delta', delta: 'summary' }, ...tail], []), PAIR)
     await expect(summarize({ text: 'source' })).rejects.toThrow()
+  })
+})
+
+describe('cache-aware compaction summarizer', () => {
+  const previous: ModelRequest = {
+    providerName: 'prov', model: 'model-1', thinkingLevel: 'high',
+    messages: [{ role: 'system', content: 'stable prefix' }, { role: 'user', content: 'question' }],
+    tools: [{ name: 'Read', description: 'read', parameters: { type: 'object', properties: {} } }],
+  }
+
+  it('keeps the previous request byte-for-byte as prefix before the final answer and summary instruction', async () => {
+    const seen: ModelRequest[] = []
+    const summarize = createCacheAwareCompactionSummarizer(scriptedStream([
+      { type: 'delta', delta: 'cached summary' }, STOP,
+    ], seen), previous, 'final answer')
+    await expect(summarize()).resolves.toBe('cached summary')
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({ providerName: 'prov', model: 'model-1', thinkingLevel: 'high', tools: previous.tools })
+    expect(seen[0]!.messages.slice(0, previous.messages.length)).toEqual(previous.messages)
+    expect(seen[0]!.messages.at(-2)).toEqual({ role: 'assistant', content: 'final answer' })
+    expect(seen[0]!.messages.at(-1)?.content).toContain(COMPACT_SUMMARY_PROMPT)
+  })
+
+  it('signals fallback without executing tools when the cache-aware completion requests one', async () => {
+    const summarize = createCacheAwareCompactionSummarizer(scriptedStream([
+      { type: 'toolCalls', calls: [{ id: 'c1', name: 'Read', args: {} }] }, STOP,
+    ], []), previous, 'answer')
+    await expect(summarize()).rejects.toMatchObject({ fallback: true })
   })
 })
 

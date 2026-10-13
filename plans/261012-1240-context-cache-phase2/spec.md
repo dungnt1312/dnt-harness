@@ -1,71 +1,180 @@
-# Spec: Skill thành tool result và summarizer dùng lại prompt cache
+# Spec: Cache-aware compaction và cache telemetry chính xác
 
-Status: **Phần A implemented** (2026-10-12, cùng đợt 1 với spec `261012-1228`); **Phần B draft**, làm plan riêng sau khi đo lại `usage.jsonl`. Đã chốt: skill ở lại history các turn sau; body không bị `toolOutputLimit` cắt mà có trần riêng 200 000 ký tự, vượt thì từ chối nguyên khối.
-Nguồn: `plans/reports/research-261012-1240-deepseek-harness-context-cache.md`.
+Status: **Phần A implemented** (2026-10-12); **Phần B approved in chat, written design pending final review** (2026-10-13).
+Nguồn: `plans/reports/research-261012-1240-deepseek-harness-context-cache.md` và số liệu `GET /api/usage` ngày 2026-10-13.
 
-## 1. Vấn đề
+## 1. Mục tiêu
 
-Sau khi bỏ giờ khỏi system prefix, còn hai nguồn làm mất prompt cache đáng kể:
+Tiếp tục tối ưu sau đợt giữ prompt prefix ổn định:
 
-1. **Skill load giữa turn.** Khi model gọi `Skill`, body được đưa vào khối `skill` đứng **trước history** (`src/harness/context/builder.ts`, thứ tự message `[5+]`). Request ngay sau đó phải đọc lại toàn bộ history. Khi turn kết thúc, `skillSnapshots` bị xoá (`src/web/server.ts:1189`), nên request đầu của turn sau lại đổi lần nữa. Trên log thật: 246 lần đổi, khoảng 30M token phải đọc lại. Request có skill mang trung bình khoảng 8 900 token skill.
-2. **Summarizer không dùng được cache.** `createCompactionSummarizer` (`src/web/llm-summarizer.ts:76-133`) làm phẳng transcript thành text, chia chunk 200 000 ký tự rồi fold tuần tự. Toàn bộ input là token mới, và session dài cần nhiều lượt nối tiếp (lần đo trước: 313 giây).
+1. Compaction ưu tiên tái sử dụng nguyên prefix của model request vừa hoàn tất, thay vì luôn gửi transcript phẳng như input mới.
+2. Usage log phân biệt rõ provider báo cache hit bằng `0` với provider không gửi cache telemetry.
+3. Giữ nguyên đường compaction hiện tại làm fallback an toàn; không thay đổi tính đúng đắn của checkpoint, retry, cancellation hoặc incremental fold.
 
-DSH xử lý cả hai bằng cùng nguyên tắc: nội dung mới luôn đi sau prefix đã cache.
+Không tối ưu lại turn thông thường: số liệu ngày 2026-10-13 đã đạt khoảng 94–98% theo các model chính, và request được kiểm tra gần nhất đạt 99,13%.
 
-## 2. Phần A: Skill body thành tool result
+## 2. Phần A đã hoàn tất: Skill body nằm trong tool result
 
-### Thiết kế
+- `Skill` trả instructions đã expand trong tool result, kèm name và hash.
+- Skill do model load nằm sau prefix và ở lại history; definition skills của agent vẫn được pin trước history.
+- Skill result có trần riêng 200.000 ký tự và không bị microcompact.
 
-- `Skill` load trả **chính instructions đã expand** làm tool result, như DSH (`skill/tool-skill`) và Claude Code. Dòng đầu ghi tên và hash: `skill 'x' loaded (hash …)`.
-- Khối `skill` ở đầu request chỉ còn cho **definition skills của agent con**. Chúng được nạp một lần khi spawn và không đổi trong suốt lượt chạy của child, nên không làm vỡ cache.
-- `skillSnapshots` chỉ còn giữ definition skills. Phần pin theo turn của skill do model load không cần nữa, vì tool result trong log vốn đã bất biến.
-- `Skill` vẫn không bị microcompact (đã có trong danh sách loại trừ của `isCompactableTool`).
-- Grant `allowed-tools` của command vẫn cài như hiện tại; chỉ vị trí của body thay đổi.
+Phần này giữ nguyên, không thuộc thay đổi mới.
 
-### Đánh đổi
+## 3. Phần B1: Cache-aware compaction
 
-- Skill **ở lại trong history các turn sau** thay vì bị xoá khi turn kết thúc. Tốn token hơn nhưng đã nằm trong prefix được cache. Claude Code và DSH đều làm vậy. Khi cần, budget trimming và compaction xử lý như mọi tool result khác.
-- Skill body không còn là nguồn "droppable" riêng trong budget. Nó chỉ bị bỏ khi bỏ nguyên turn chứa nó.
-- Manifest không còn liệt kê skill do model load ở `sources.skills`. Cần thêm cách hiển thị khác, ví dụ đọc từ `tool/call` của `Skill` trong turn.
-- `toolOutputLimit` (60 000) giờ áp dụng cho skill body. Cần kiểm tra: skill lớn nhất trong catalog hiện tại phải nằm dưới giới hạn, hoặc Skill được miễn giới hạn này.
+### 3.1. Nguồn prefix chính xác
 
-## 3. Phần B: Summarizer dùng lại prefix
+Manifest và `context/body` không đủ để dựng lại chính xác `ModelRequest`: manifest chỉ có hash/count và không giữ tool schemas hay toàn bộ ordered messages. Vì vậy host giữ một snapshot in-memory của **request cuối đã thực sự gửi provider** cho mỗi session.
 
-### Thiết kế
+Snapshot được lấy tại `llm/stream`, nơi request đã đi qua `agent/context` và `agent/request`, gồm:
 
-- Đường mặc định: dựng lại request bằng **cùng `buildContext`** với input của request gần nhất, tính đến `lastEnd`, rồi append chỉ thị compaction làm user message cuối. Giữ nguyên system, tools và history để provider dùng lại cache; chỉ phần chỉ thị là token mới.
-- Chỉ thị yêu cầu không gọi tool. Summarizer hiện đã từ chối output có tool call; trường hợp đó chuyển sang đường dự phòng.
-- Nếu request + chỉ thị + output tối đa (24 000 ký tự, khoảng 6 000 token) **vượt budget**, hoặc provider báo vượt context, thì dùng **đường hiện tại** (transcript làm phẳng, chunk, fold). Không bỏ đường cũ.
-- Checkpoint trước đó đã có trong khối `compacted-history` của request, nên fold incremental vẫn đúng. Prompt chỉ thị giữ cấu trúc 9 mục của `COMPACT_SUMMARY_PROMPT`.
-- Không có model (extractive) thì giữ nguyên hành vi hiện tại.
+- ordered `messages`;
+- ordered `tools` nếu có;
+- `model` và `providerName`;
+- các execution options ảnh hưởng wire shape cần giữ để prefix giống từng byte.
 
-### Điểm cần xác minh khi plan
+Snapshot chỉ được đánh dấu reusable khi stream kết thúc hợp lệ và thuộc turn đã hoàn tất. Request lỗi, bị abandon, còn đang chạy hoặc thuộc child khác không được dùng làm compaction prefix. Snapshot là cache trong RAM, bị xoá khi session bị xoá hoặc host restart; không persist vì provider cache sau restart cũng không đáng tin và persist toàn request sẽ nhân đôi dữ liệu nhạy cảm trong log.
 
-- Assembly đang nằm trong middleware `agent/context` và phụ thuộc `agentScope`. Cần tách phần chuẩn bị input thành hàm dùng được ngoài turn, nhưng không được để usage/context middleware ghi nhận nhầm request compaction (bối cảnh của `agentScope.exit` ở `src/web/server.ts:1263`).
-- Output reserve hiện là 4 096 token, thấp hơn mức output summary cho phép. Request compaction cần reserve riêng.
-- Mức tiết kiệm phụ thuộc request compaction có chạy trong thời gian cache của provider sau turn cuối hay không. Auto compaction chạy ngay khi turn xong nên thuận lợi; manual compaction sau thời gian dài thì không.
+### 3.2. Request compaction ưu tiên
 
-## 4. Không thuộc phạm vi
+Khi compact một completed root turn và có snapshot phù hợp với effective `(provider, model)` hiện tại:
 
-- Memory và skill catalog đổi giữa session: khoảng 4,7M token trên 43 lần đổi, quá nhỏ so với độ phức tạp của cơ chế append thông báo.
-- Microcompact: chưa kích hoạt lần nào trong 20 865 request.
-- Tokenizer thật hoặc neo ước lượng vào usage của provider như `token-meter` của DSH. Hữu ích cho độ chính xác của meter nhưng không ảnh hưởng chi phí.
+1. Clone nguyên messages và tools của snapshot.
+2. Append final assistant answer của turn vừa hoàn tất nếu answer đó chưa nằm trong request snapshot.
+3. Append một user message chứa `COMPACT_SUMMARY_PROMPT`, yêu cầu tóm tắt toàn bộ conversation prefix theo 9 heading hiện có, không gọi tool và output tối đa 24.000 ký tự.
+4. Gửi trực tiếp qua `kernel.ctx.llm.stream` ngoài `agentScope`, như compaction hiện tại, để không chạy lại context middleware hoặc ghi nhầm manifest/session usage.
 
-## 5. Kiểm thử
+Toàn bộ request cũ đứng trước nội dung mới, nên provider có thể reuse prefix đã cache. Tool schemas vẫn được giữ để wire prefix giống request trước; nếu model gọi tool thì output bị từ chối và chuyển fallback, không thực thi tool.
 
-- Prompt contract: load skill giữa turn thì mọi message trước history của request tiếp theo giống hệt request trước từng byte; body xuất hiện ở đúng tool result.
-- Child có definition skills vẫn nhận skill ở khối đầu như hiện tại.
-- `allowed-tools` grant và rollback khi expand lỗi vẫn đúng.
-- Summarizer: request compaction có prefix trùng request cuối; tool call hoặc vượt budget thì chuyển sang chunk path; incremental seed vẫn đúng.
-- `tests/web/server-compaction.spec.ts` và `tests/web/llm-summarizer.spec.ts` pass; sau đó `pnpm test`, `pnpm run typecheck`, và `pnpm run build:web` nếu manifest UI đổi.
+Với checkpoint incremental đã có, request snapshot đã chứa wrapped `compacted-history` của checkpoint trước. Instruction yêu cầu tạo summary hoàn chỉnh cho boundary mới; không chèn seed lần hai.
 
-### Tiêu chí sau khi chạy thật
+### 3.3. Điều kiện dùng và fallback
 
-- Request ngay sau Skill load có cached token gần bằng input của request trước.
-- Request compaction có tỷ lệ cached token cao và thời gian chạy giảm rõ so với hiện tại.
+Dùng cache-aware path chỉ khi tất cả điều kiện đúng:
 
-## 6. Câu hỏi cần anh chốt
+- Có request snapshot đã hoàn tất cho đúng root session.
+- Snapshot thuộc completed boundary mới nhất được compact.
+- Provider và model vẫn trùng effective pair hiện tại.
+- Request cộng assistant answer, instruction và output reserve riêng cho summary nằm trong context budget.
+- Không có thay đổi authority làm request snapshot không còn hợp lệ cho việc gửi lại.
 
-1. Anh chấp nhận skill ở lại history các turn sau như Claude Code không, hay vẫn muốn skill chỉ có hiệu lực trong turn đã load?
-2. Skill body có được miễn `toolOutputLimit` không?
-3. Làm Phần A và B trong cùng một plan, hay tách riêng để A đi trước? A nhỏ và có số đo rõ; B động tới compaction và cần thiết kế kỹ hơn.
+Fallback về `createCompactionSummarizer` hiện tại khi:
+
+- thiếu snapshot, host vừa restart hoặc manual compaction diễn ra mà không còn prefix hợp lệ;
+- request dự kiến vượt context hoặc provider trả `contextExceeded`;
+- completion có tool call, finish reason khác `stop`, output rỗng hoặc vượt 24.000 ký tự.
+
+Lỗi transport tạm thời vẫn retry cùng cache-aware request theo `LogicalRequest`. Sau khi hết retry, compaction thất bại như hiện tại; không âm thầm chuyển sang fallback và phát sinh một logical request khác, trừ các trường hợp fallback xác định ở trên.
+
+### 3.4. Tính đúng đắn giữ nguyên
+
+- `compactSession` vẫn là nơi xác định completed boundary, append `compaction/start`, validate summary, append durable `compaction/end` và lưu checkpoint.
+- Cancellation, PreCompact hooks, idempotent no-op, canonical recovery và boundary-change checks giữ nguyên.
+- Usage của compaction vẫn được ghi riêng với `kind: 'compaction'`.
+- Extractive fallback khi không có model giữ nguyên.
+
+## 4. Phần B2: Cache telemetry chính xác
+
+### 4.1. Vấn đề
+
+`TokenUsage.cachedInputTokens` là optional. Hiện hai call site ghi:
+
+```ts
+cached: usage.cachedInputTokens ?? 0
+```
+
+Do đó persisted usage không phân biệt:
+
+- provider có telemetry và báo cache hit bằng 0;
+- provider không gửi cache field.
+
+Context meter nội bộ đã phân biệt đúng bằng `cachedInputTokens !== undefined`; durable usage/API phải dùng cùng semantics.
+
+### 4.2. Record và backward compatibility
+
+Giữ `UsageRecord.v = 1` và thêm field bắt buộc cho record mới:
+
+```ts
+cacheReported: boolean
+```
+
+`cached` vẫn là number để giữ tương thích đọc và tổng token cũ.
+
+Khi parse log cũ không có `cacheReported`:
+
+- `cached > 0` được xem là `cacheReported: true`, vì giá trị dương chứng minh provider đã báo cache;
+- `cached === 0` được xem là unknown/unreported, vì không thể phân biệt zero hit với thiếu telemetry.
+
+Không rewrite `usage.jsonl` cũ.
+
+### 4.3. Daily aggregation và API
+
+Mỗi `UsageDayRow` giữ các field hiện tại và thêm:
+
+```ts
+cacheableInput: number
+cacheReportedRequests: number
+unreportedRequests: number
+```
+
+Aggregation:
+
+- `input`: toàn bộ prompt input như hiện tại;
+- `cached`: chỉ tổng cached token đã được provider báo;
+- `cacheableInput`: input của request có `cacheReported: true`;
+- cache hit chuẩn: `cached / cacheableInput`;
+- request không telemetry không bị tính thành 0%.
+
+Các client cũ vẫn đọc được `input`, `cached`, `output`, `requests`. Web types và test fixtures được cập nhật; Usage UI hiện tại không bắt buộc thêm card mới trong scope này.
+
+## 5. Thay đổi dự kiến
+
+- `src/web/usage-log.ts`: record schema, parser tương thích log cũ, daily buckets/API fields.
+- `src/web/server.ts`: ghi `cacheReported`, giữ/retire last completed request snapshot, chọn cache-aware/fallback compaction.
+- `src/web/llm-summarizer.ts`: tách validator/chunk fallback để cache-aware path dùng chung completion contract mà không nhân đôi logic.
+- `web/lib/types.ts`: thêm daily telemetry fields.
+- `tests/web/server-usage.spec.ts`: persisted telemetry, restart và legacy parsing.
+- `tests/web/llm-summarizer.spec.ts`, `tests/web/server-compaction.spec.ts`: prefix reuse, assistant answer, tool-call/context-overflow fallback, restart/no-snapshot fallback, usage accounting.
+- `docs/harness.md`: mô tả cache-aware compaction và fallback.
+
+## 6. Kiểm thử và acceptance
+
+### Automated
+
+1. Record mới có `cacheReported: true` kể cả khi cached bằng 0.
+2. Record mới không có provider cache field ghi `cacheReported: false`.
+3. Log cũ cached dương được tính vào `cacheableInput`; legacy zero không bị tính thành zero-hit chắc chắn.
+4. Cache-aware compaction giữ toàn bộ previous request làm byte-identical prefix và chỉ append assistant answer + instruction.
+5. Compaction không thực thi tool; tool-call output chuyển sang chunk fallback.
+6. `contextExceeded` chuyển sang chunk fallback; transport retry không tạo checkpoint kép.
+7. Sau restart hoặc thiếu snapshot, đường chunk hiện tại vẫn hoạt động.
+8. Incremental checkpoint, cancellation, durable lifecycle và no-op tests vẫn pass.
+9. Chạy affected tests, sau đó `pnpm test` và `pnpm run typecheck`; `pnpm run build:web` chỉ khi web implementation ngoài type contract thay đổi.
+
+### Runtime
+
+Sau ít nhất một ngày chạy thật, báo cáo riêng:
+
+- normal turn cache hit;
+- child cache hit;
+- compaction cache hit;
+- unreported request count;
+- cache hit chỉ trên `cacheableInput`.
+
+Kỳ vọng: turn thường giữ mức hiện tại; cache-aware compaction có cached prefix gần request cuối và thời gian compaction giảm rõ rệt so với chunk-only path.
+
+## 7. Ngoài phạm vi
+
+- Giảm số MCP tool schemas hoặc đổi tool discovery architecture.
+- Snapshot `CLAUDE.md`/workspace instructions.
+- Persist full request snapshot qua restart.
+- Thay provider cache policy hoặc thêm provider-specific `cache_control`.
+- Thay đổi compaction trigger pressure.
+
+## 8. Quyết định đã chốt
+
+- Giữ chunk summarizer làm fallback, không thay thế hoàn toàn.
+- Không tính request thiếu cache telemetry như 0% hit.
+- Không rewrite historical usage log.
+- Không mở rộng scope sang MCP schema reduction hay Usage UI redesign.

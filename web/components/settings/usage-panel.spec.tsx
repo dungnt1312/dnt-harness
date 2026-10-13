@@ -9,7 +9,9 @@ import { UsagePanel } from './UsagePanel.tsx'
 vi.mock('../../lib/api.ts', () => ({ fetchUsage: vi.fn() }))
 const mocked = vi.mocked(fetchUsage)
 
-const row = (date: string, model: string, input: number, output = 0) => ({ date, model, input, cached: 0, output, requests: 1 })
+const row = (date: string, model: string, input: number, output = 0) => ({
+  date, model, input, cached: 0, cacheableInput: input, cacheReportedRequests: 1, unreportedRequests: 0, output, requests: 1,
+})
 const FIXTURE: UsageDailyResponse = {
   today: '2026-10-08',
   longestSessionMs: (6 * 60 + 57) * 60_000,
