@@ -9,7 +9,7 @@ import { createInterface } from 'node:readline'
  * streaming the file at boot, so the Settings → Usage tab survives restarts.
  */
 
-export type UsageKind = 'turn' | 'child' | 'compaction'
+export type UsageKind = 'turn' | 'child' | 'compaction' | 'commit-message'
 
 export interface UsageRecord {
   readonly v: 1
