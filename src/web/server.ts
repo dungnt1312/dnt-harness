@@ -7830,11 +7830,11 @@ async function handleProjectGitAction(
     if (request === undefined) {
       if (action === 'remotes') {
         const branch = gitText(body, 'branch')
-        if (branch === undefined || (body['push'] !== undefined && typeof body['push'] !== 'boolean')) {
-          json(400, { error: 'branch must be a string and push a boolean' })
+        if (branch === undefined || (body['push'] !== undefined && typeof body['push'] !== 'boolean') || (body['all'] !== undefined && typeof body['all'] !== 'boolean')) {
+          json(400, { error: 'branch must be a string, push and all booleans' })
           return
         }
-        frame({ type: 'done', ok: true, stdout: '', stderr: '', remotes: await listProjectGitRemotes(project.path, trusted, branch, body['push'] === true) })
+        frame({ type: 'done', ok: true, stdout: '', stderr: '', remotes: await listProjectGitRemotes(project.path, trusted, branch, body['push'] === true, body['all'] === true) })
       } else {
         frame({ type: 'done', ok: true, stdout: '', stderr: '', pushedTo: await pushedTo(project.path, trusted) })
       }

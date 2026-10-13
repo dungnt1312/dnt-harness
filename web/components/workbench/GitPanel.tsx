@@ -17,6 +17,8 @@ import {
   type GitStatusReport,
 } from '../../lib/api.ts'
 import { GitChangeList, withPendingStages } from './GitChangeList.tsx'
+import { GitCommitArea } from './GitCommitArea.tsx'
+import { GitRemoteButton } from './GitRemoteButton.tsx'
 import { failureText, useGitOperation } from './use-git-operation.tsx'
 import { changeCounts, confirmationForEntries, primaryChangesActionStages, type GitConfirmation } from './git-panel-model.ts'
 import type { WorkbenchProject } from './Workbench.tsx'
@@ -212,6 +214,12 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
     })
   }, [enqueue, run, applyReport, load])
 
+  /** A commit, uncommit or remote operation answered: its status is the new report. */
+  const settleOperation = useCallback((done: GitOperationDone | undefined): void => {
+    if (done?.status !== undefined) applyReport(done.status)
+    else if (done?.ok === true) void load()
+  }, [applyReport, load])
+
   const all = report?.changes ?? []
   const filtered = pathFilter !== undefined && pathFilter.length > 0 ? all.filter((change) => pathFilter.includes(change.path)) : all
   const changes = filtered
@@ -358,6 +366,24 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
         )}
         {focusNote}
       </div>
+      {/* The whole-project view only: a turn filter shows a subset, which is not what a commit would take. */}
+      {report !== null && !filteredView && (report.branch !== null || report.head !== null) ? (
+        <>
+          <GitCommitArea key={project.id} projectId={project.id} report={report} changes={shown} run={run} onDone={settleOperation} />
+          <div role="group" aria-label="Branch" className="flex h-11 shrink-0 items-center gap-1.5 border-t border-line px-2.5 text-[13px]">
+            <Icon name="gitBranch" size={13} className="shrink-0 text-fg-muted" />
+            {report.branchInfo !== null ? (
+              <>
+                <span className="min-w-0 flex-1 truncate font-medium" title={report.branchInfo.name}>{report.branchInfo.name}</span>
+                <GitRemoteButton key={project.id} branchInfo={report.branchInfo} run={run} onDone={settleOperation} />
+              </>
+            ) : (
+              // Detached HEAD: there is no branch to push, so only the commit is named.
+              <span className="min-w-0 flex-1 truncate font-mono text-fg-muted" title="HEAD is detached">{report.head?.sha.slice(0, 7) ?? ''}</span>
+            )}
+          </div>
+        </>
+      ) : null}
       <ConfirmDialog
         open={confirm !== null}
         title={confirm?.confirmation.title ?? ''}

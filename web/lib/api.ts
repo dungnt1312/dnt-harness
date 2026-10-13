@@ -611,6 +611,8 @@ export interface GitBranchInfo {
 export interface GitHead {
   readonly sha: string
   readonly subject: string
+  /** The full commit message (subject and body), for Amend and Uncommit. */
+  readonly message: string
   /** False for a root commit: there is nothing to uncommit to. */
   readonly hasParent: boolean
 }
@@ -692,8 +694,8 @@ export type GitOperationInput =
   | { readonly type: 'fetch'; readonly remote: string }
   | { readonly type: 'pull'; readonly remote: string; readonly branch?: string; readonly rebase?: boolean }
   | { readonly type: 'push'; readonly remote: string; readonly branch: string; readonly upstreamBranch?: string; readonly setUpstream?: boolean; readonly force?: boolean }
-  /** Query: the remotes of a branch (`push` asks for the push remote); answered in `done.remotes`. */
-  | { readonly type: 'remotes'; readonly branch: string; readonly push?: boolean }
+  /** Query: the remotes of a branch (`push` asks for the push remote; `all` lists every remote, as Push To and Fetch From do); answered in `done.remotes`. */
+  | { readonly type: 'remotes'; readonly branch: string; readonly push?: boolean; readonly all?: boolean }
   /** Query: the remote refs containing HEAD; answered in `done.pushedTo`. */
   | { readonly type: 'pushed-to' }
 

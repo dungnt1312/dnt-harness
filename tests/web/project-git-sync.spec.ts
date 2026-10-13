@@ -174,6 +174,19 @@ describe('gitStatus over real repository states', () => {
     expect(report.head?.sha).toMatch(/^[0-9a-f]{40}$/)
   })
 
+  it('reports the full message of the latest commit, body included', async () => {
+    expect(report.head?.message).toBe('latest')
+    const multi = path.join(scratch, 'multi')
+    await fs.mkdir(multi)
+    git(multi, 'init', '-q', '-b', 'main')
+    git(multi, 'config', 'user.email', 't@t')
+    git(multi, 'config', 'user.name', 't')
+    await fs.writeFile(path.join(multi, 'x.txt'), 'x\n')
+    git(multi, 'add', '.')
+    git(multi, 'commit', '-q', '-m', 'subject line', '-m', 'body line one\nbody line two')
+    expect((await gitStatus(multi)).head).toMatchObject({ subject: 'subject line', message: 'subject line\n\nbody line one\nbody line two' })
+  })
+
   it('keeps line counts against HEAD', () => {
     expect(change('unstaged.txt')).toMatchObject({ added: 1, removed: 1 })
   })

@@ -669,6 +669,15 @@ describe('remotes', () => {
     await expect(listProjectGitRemotes(repo.dir, true, '--all', true)).rejects.toThrow(/not a valid branch/)
   })
 
+  it('lists every remote when asked for all, even for a branch bound to one (Push To, Fetch From)', async () => {
+    const { repo } = await published()
+    addRemote(repo, 'backup')
+    expect(await listProjectGitRemotes(repo.dir, true, 'main', true)).toEqual(['origin'])
+    expect((await listProjectGitRemotes(repo.dir, true, 'main', true, true)).sort()).toEqual(['backup', 'origin'])
+    expect((await listProjectGitRemotes(repo.dir, true, 'main', false, true)).sort()).toEqual(['backup', 'origin'])
+    await expect(listProjectGitRemotes(repo.dir, true, '--all', true, true)).rejects.toThrow(/not a valid branch/)
+  })
+
   it('pushedTo lists remote refs containing HEAD without origin/HEAD', async () => {
     const { repo } = await published()
     repo.git('remote', 'set-head', 'origin', 'main')

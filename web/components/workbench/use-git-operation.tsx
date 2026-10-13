@@ -34,6 +34,9 @@ export interface GitOperationOptions {
   readonly remote?: GitRemoteAction
 }
 
+/** One Git operation as the panel components start it: resolves with the `done` frame, `undefined` when the request itself failed. */
+export type GitRun = (input: GitOperationInput, options?: GitOperationOptions) => Promise<GitOperationDone | undefined>
+
 /**
  * Runs Git operations the way Zed's panel reports them. A credential prompt
  * opens the askpass modal and closes again if the operation ends by itself;
@@ -47,7 +50,7 @@ export interface GitOperationOptions {
  * not part of it: `GitOutputHost` (mounted beside `ToastHost`) owns that.
  */
 export function useGitOperation(workspaceId: string, projectId: string): {
-  readonly run: (input: GitOperationInput, options?: GitOperationOptions) => Promise<GitOperationDone | undefined>
+  readonly run: GitRun
   readonly dialogs: ReactNode
 } {
   const toast = useToast()

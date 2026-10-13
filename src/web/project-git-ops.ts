@@ -296,12 +296,14 @@ async function checkedBranch(ctx: Context, name: string): Promise<string> {
 
 /**
  * Remotes to offer for `branch` (Zed `store.rs:9134`): the one its push or
- * pull is already bound to, else every remote.
+ * pull is already bound to, else every remote. `every` skips the binding: Zed
+ * lists every remote for Push To (`get_remote(always_select)`) and Fetch From.
  */
-export async function listProjectGitRemotes(root: string, trusted: boolean, branch: string, push: boolean): Promise<string[]> {
+export async function listProjectGitRemotes(root: string, trusted: boolean, branch: string, push: boolean, every = false): Promise<string[]> {
   const ctx = await makeContext(root, trusted, undefined, undefined, undefined)
   const all = await remoteNames(ctx)
   const name = await checkedBranch(ctx, branch)
+  if (every) return all
   if (push) {
     const { ok, stdout } = await git(ctx, ['rev-parse', '--abbrev-ref', `${name}@{push}`])
     const ref = stdout.trim()

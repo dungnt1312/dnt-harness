@@ -21,7 +21,7 @@ function report(changes: readonly GitChange[]): GitStatusReport {
   return {
     branch: 'main',
     branchInfo: { name: 'main', upstream: { remote: 'origin', branch: 'main' }, upstreamTrack: { kind: 'tracked', ahead: 0, behind: 0 } },
-    head: { sha: 'abc1234', subject: 'init', hasParent: true },
+    head: { sha: 'abc1234', subject: 'init', message: 'init', hasParent: true },
     truncated: false,
     changes,
   }

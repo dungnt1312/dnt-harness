@@ -64,6 +64,8 @@ export interface GitBranchReport {
 export interface GitHeadReport {
   readonly sha: string
   readonly subject: string
+  /** The full commit message (subject and body), for Amend and Uncommit. */
+  readonly message: string
   /** False for a root commit: there is nothing to uncommit to. */
   readonly hasParent: boolean
 }
@@ -456,11 +458,11 @@ export function parseUpstreamTrack(track: string): GitUpstreamTrack {
 
 /** Latest commit via `git log -1`; null when the repository has none. */
 async function headReport(root: string, trusted: boolean): Promise<GitHeadReport | null> {
-  const { stdout, code } = await runGitQuery(root, ['log', '-1', '--format=%H%x00%s%x00%P'], trusted)
+  const { stdout, code } = await runGitQuery(root, ['log', '-1', '--format=%H%x00%s%x00%P%x00%B'], trusted)
   if (code !== 0) return null
-  const [sha, subject, parents] = stdout.toString('utf8').replace(/\n$/, '').split('\0')
+  const [sha, subject, parents, message] = stdout.toString('utf8').split('\0')
   if (sha === undefined || sha === '') return null
-  return { sha, subject: subject ?? '', hasParent: (parents ?? '').trim() !== '' }
+  return { sha, subject: subject ?? '', message: (message ?? subject ?? '').replace(/\s+$/, ''), hasParent: (parents ?? '').trim() !== '' }
 }
 
 /**

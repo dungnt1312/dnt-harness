@@ -390,6 +390,11 @@ describe('git action routes', () => {
     git(ctx.root, 'remote', 'add', 'origin', bare)
     const remotes = (await openStream(`${ctx.actions}/remotes`, {}, { branch: 'main', push: true }).finished).at(-1)!
     expect(remotes).toMatchObject({ type: 'done', ok: true, remotes: ['origin'] })
+    git(ctx.root, 'remote', 'add', 'backup', bare)
+    const bound = (await openStream(`${ctx.actions}/remotes`, {}, { branch: 'main', push: true, all: true }).finished).at(-1)!
+    expect((bound as { remotes: string[] }).remotes.sort()).toEqual(['backup', 'origin'])
+    expect((await raw('POST', `${ctx.actions}/remotes`, {}, { branch: 'main', all: 'yes' })).status).toBe(400)
+    git(ctx.root, 'remote', 'remove', 'backup')
 
     expect((await openStream(`${ctx.actions}/pushed-to`, {}, {}).finished).at(-1)).toMatchObject({ ok: true, pushedTo: [] })
     const pushed = (await openStream(`${ctx.actions}/push`, {}, { remote: 'origin', branch: 'main', upstreamBranch: 'main', setUpstream: true, force: false }).finished).at(-1)!

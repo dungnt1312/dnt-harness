@@ -14,7 +14,7 @@ const raw = { indexStatus: ' ', worktreeStatus: 'M', created: false, deleted: fa
 const REPORT: GitStatusReport = {
   branch: 'main',
   branchInfo: { name: 'main', upstream: { remote: 'origin', branch: 'main' }, upstreamTrack: { kind: 'tracked', ahead: 0, behind: 0 } },
-  head: { sha: 'abc1234', subject: 'init', hasParent: false },
+  head: { sha: 'abc1234', subject: 'init', message: 'init', hasParent: false },
   truncated: false,
   changes: [
     { ...raw, path: 'src/a.ts', status: 'modified', added: 7, removed: 2 },

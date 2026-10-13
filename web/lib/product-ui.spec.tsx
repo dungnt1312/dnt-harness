@@ -58,7 +58,7 @@ vi.mock('./api.ts', () => ({
   fetchGitStatus: vi.fn(async () => ({
     branch: "main",
     branchInfo: { name: "main", upstreamTrack: { kind: "none" } },
-    head: { sha: "abc1234", subject: "init", hasParent: false },
+    head: { sha: "abc1234", subject: "init", message: "init", hasParent: false },
     truncated: false,
     changes: [{ path: "docs/README.md", status: "modified", indexStatus: " ", worktreeStatus: "M", created: false, deleted: false, conflicted: false, staging: "unstaged", added: 1, removed: 2 }],
   })),
