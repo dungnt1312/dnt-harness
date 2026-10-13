@@ -103,10 +103,11 @@ it('an opened binary media row previews the media instead of a diff', async () =
   expect(view.textContent).not.toContain('No textual diff')
 })
 
-it('focusPath opens with that diff already expanded', async () => {
+it('focusPath selects that row and shows its diff in the pane', async () => {
   const view = await mount({ focusPath: 'notes.md' })
   await act(async () => { await vi.waitFor(() => expect(fetchGitStatus).toHaveBeenCalledOnce()) })
-  expect(view.querySelector('button[aria-expanded="true"]')?.textContent).toContain('notes.md')
+  expect(view.querySelector('button[aria-current="true"]')?.textContent).toContain('notes.md')
+  await act(async () => { await vi.waitFor(() => expect(view.querySelector('[data-diff-pane="notes.md"]')).not.toBeNull()) })
   expect(view.textContent).toContain('No textual diff.')
 })
 
@@ -143,13 +144,17 @@ it('a focused file row can open the file itself in the workbench', async () => {
   await act(async () => openFirst!.click())
   expect(onOpenFile).toHaveBeenCalledWith('src/a.ts')
 
-  // The diff frame carries its own opener: one click on the row's diff body
-  // expands it, and the frame's corner button opens the same file.
-  fetchGitDiff.mockResolvedValueOnce({ path: 'src/a.ts', lines: [{ kind: 'context' as const, text: 'const a = 1' }], truncated: false, binary: false })
-  await act(async () => view.querySelector<HTMLButtonElement>('ul li button[aria-expanded]')!.click())
+  // The diff pane carries its own opener in its header: selecting the row
+  // shows its diff there, and that button opens the same file.
+  fetchGitDiff.mockResolvedValue({ path: 'src/a.ts', lines: [{ kind: 'context' as const, text: 'const a = 1' }], truncated: false, binary: false })
+  // a.ts is selected from the start with its (empty) diff already read; leave
+  // it and come back so the pane reads the diff the mock now answers with.
+  const rowMain = [...view.querySelectorAll<HTMLButtonElement>('ul li [data-row-main]')]
+  await act(async () => rowMain.find((button) => button.textContent?.includes('other.ts'))!.click())
+  await act(async () => rowMain.find((button) => button.textContent?.includes('a.ts') && !button.textContent.includes('other'))!.click())
   await act(async () => { await vi.waitFor(() => expect(view.querySelector('[aria-label="Diff of src/a.ts"]')).not.toBeNull()) })
-  const frameOpener = view.querySelector<HTMLButtonElement>('[aria-label="Diff of src/a.ts"] ~ button[aria-label="Open a.ts in workbench"]')
-  expect(frameOpener).not.toBeNull()
-  await act(async () => frameOpener!.click())
+  const paneOpener = view.querySelector<HTMLButtonElement>('[data-diff-pane="src/a.ts"] button[aria-label="Open a.ts in workbench"]')
+  expect(paneOpener).not.toBeNull()
+  await act(async () => paneOpener!.click())
   expect(onOpenFile).toHaveBeenLastCalledWith('src/a.ts')
 })

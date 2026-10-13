@@ -4,10 +4,11 @@
  * Edit/Write tool row both render through here, so a change reads the same
  * wherever it shows.
  */
+import type { ReactNode } from 'react'
 import { cn } from '../../lib/cn.ts'
 import { lineDiff, splitLines } from '../../lib/line-diff.ts'
 
-export type DiffRowKind = 'add' | 'del' | 'context' | 'meta'
+export type DiffRowKind = 'add' | 'del' | 'context' | 'meta' | 'hunk'
 
 /** One printed diff row; a null side means that side has no line here. */
 export interface DiffRow {
@@ -23,8 +24,12 @@ export interface RawDiffLine {
   readonly text: string
 }
 
-/** Numbered rows from a unified diff: hunk headers set the counters and are not printed. */
-export function diffRowsFromUnified(lines: readonly RawDiffLine[]): readonly DiffRow[] {
+/**
+ * Numbered rows from a unified diff: hunk headers set the counters and are
+ * not printed — unless `keepHunks` asks for them as `hunk` rows (the Git
+ * panel hangs its Stage/Restore buttons on them).
+ */
+export function diffRowsFromUnified(lines: readonly RawDiffLine[], options: { readonly keepHunks?: boolean } = {}): readonly DiffRow[] {
   const rows: DiffRow[] = []
   let oldNo = 0
   let newNo = 0
@@ -35,6 +40,7 @@ export function diffRowsFromUnified(lines: readonly RawDiffLine[]): readonly Dif
         oldNo = Number(hunk[1])
         newNo = Number(hunk[2])
       }
+      if (options.keepHunks === true) rows.push({ kind: 'hunk', text: line.text, old: null, new: null })
       continue
     }
     // The file header repeats the name the row already shows.
@@ -94,21 +100,32 @@ export function diffRowsFromWrite(content: string): readonly DiffRow[] {
 function lineClass(kind: DiffRowKind): string {
   if (kind === 'add') return 'bg-ok-soft text-ok'
   if (kind === 'del') return 'bg-bad-soft text-bad'
-  if (kind === 'meta') return 'text-fg-faint'
+  if (kind === 'meta' || kind === 'hunk') return 'text-fg-faint'
   return 'text-fg'
 }
 
-/** The rows themselves, exactly as the Git panel draws them. The caller owns the frame and the scrolling. */
-export function DiffLines({ rows }: { readonly rows: readonly DiffRow[] }) {
+/**
+ * The rows themselves, exactly as the Git panel draws them. The caller owns
+ * the frame and the scrolling. A `hunk` row is drawn by `renderHunk` (its
+ * 0-based index among the hunks and its header text), or not at all.
+ */
+export function DiffLines({ rows, renderHunk }: { readonly rows: readonly DiffRow[]; readonly renderHunk?: (index: number, header: string) => ReactNode }) {
+  let hunkIndex = -1
   return (
     <pre className="m-0 px-3 py-1.5 font-mono text-[12px] leading-5">
-      {rows.map((row, index) => (
+      {rows.map((row, index) => {
+        if (row.kind === 'hunk') {
+          hunkIndex++
+          return renderHunk === undefined ? null : <div key={index} data-kind="hunk" data-hunk-index={hunkIndex}>{renderHunk(hunkIndex, row.text)}</div>
+        }
+        return (
         <div key={index} data-kind={row.kind} className={cn('whitespace-pre', lineClass(row.kind))}>
           <span aria-hidden="true" className="inline-block w-9 select-none pr-2 text-right text-fg-faint">{row.old === null ? '' : row.old}</span>
           <span aria-hidden="true" className="inline-block w-9 select-none pr-2 text-right text-fg-faint">{row.new === null ? '' : row.new}</span>
           {row.text === '' ? ' ' : row.text}
         </div>
-      ))}
+        )
+      })}
     </pre>
   )
 }

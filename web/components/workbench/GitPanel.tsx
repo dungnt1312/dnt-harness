@@ -18,9 +18,11 @@ import {
 } from '../../lib/api.ts'
 import { GitChangeList, withPendingStages } from './GitChangeList.tsx'
 import { GitCommitArea } from './GitCommitArea.tsx'
+import { GitDiffPane } from './GitDiffPane.tsx'
 import { GitRemoteButton } from './GitRemoteButton.tsx'
+import { GitSplit, readSplit, writeSplit, type GitSplitState } from './GitSplit.tsx'
 import { failureText, useGitOperation } from './use-git-operation.tsx'
-import { changeCounts, confirmationForEntries, primaryChangesActionStages, type GitConfirmation } from './git-panel-model.ts'
+import { changeCounts, confirmationForEntries, groupChanges, primaryChangesActionStages, type GitConfirmation } from './git-panel-model.ts'
 import type { WorkbenchProject } from './Workbench.tsx'
 
 /**
@@ -56,7 +58,12 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
   const [report, setReport] = useState<GitStatusReport | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
-  const [openPath, setOpenPath] = useState<string | null>(focusPath ?? null)
+  // The row whose diff the pane shows; the first row until the reader picks one.
+  const [selectedPath, setSelectedPath] = useState<string | null>(focusPath ?? null)
+  // Bumped whenever the status moved, so the pane reads its diff again.
+  const [reloadKey, setReloadKey] = useState(0)
+  const [split, setSplit] = useState<GitSplitState>(() => readSplit(project.id))
+  useEffect(() => { setSplit(readSplit(project.id)) }, [project.id])
   const generation = useRef(0)
   const toast = useToast()
   const git = useGitOperation(workspaceId, project.id)
@@ -72,10 +79,10 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
   // Every Git action waits for the one before it, so the repository sees them in click order.
   const queue = useRef<Promise<void>>(Promise.resolve())
 
-  // The focused row lands at the top of the list with its diff below it — a
-  // `nearest` scroll left it on the bottom edge and the diff out of view. The
-  // row may render only once the status report lands and the diff only after
-  // its own fetch, so the focus stays pending until the diff has settled.
+  // The focused row lands at the top of the list — a `nearest` scroll left it
+  // on the bottom edge. The row may render only once the status report lands
+  // and the diff only after its own fetch, so the focus stays pending until
+  // the diff has settled.
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const focusRowRef = useRef<HTMLButtonElement | null>(null)
   const pendingFocus = useRef(false)
@@ -86,9 +93,9 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
     box.scrollTop += row.getBoundingClientRect().top - box.getBoundingClientRect().top - 4
   }, [])
 
-  // A new focus from the chat card moves the open row; `null` — Review all —
+  // A new focus from the chat card moves the selection; `null` — Review all —
   // leaves the reader's state alone. The pending flag is armed during render:
-  // child effects run before this component's, and an already-open diff
+  // child effects run before this component's, and an already-shown diff
   // reports ready from its own effect in the same commit.
   const hasFocus = focusPath !== undefined && focusPath !== null && focusPath !== ''
   const focusKey = hasFocus ? `${focusPath}\u0000${focusNonce ?? 0}` : null
@@ -98,7 +105,7 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
     pendingFocus.current = true
   }
   useEffect(() => {
-    if (hasFocus) setOpenPath(focusPath)
+    if (hasFocus) setSelectedPath(focusPath)
   }, [hasFocus, focusPath, focusNonce])
 
   useEffect(() => {
@@ -119,7 +126,8 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
     generation.current++
     setReport(next)
     setLoading(false)
-    setOpenPath((current) => current !== null && next.changes.some((change) => change.path === current) ? current : null)
+    setReloadKey((key) => key + 1)
+    setSelectedPath((current) => current !== null && next.changes.some((change) => change.path === current) ? current : null)
   }, [])
 
   const load = useCallback(async () => {
@@ -130,7 +138,8 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
       const next = await fetchGitStatus(workspaceId, project.id)
       if (generation.current !== request) return
       setReport(next)
-      setOpenPath((current) => current !== null && next.changes.some((change) => change.path === current) ? current : null)
+      setReloadKey((key) => key + 1)
+      setSelectedPath((current) => current !== null && next.changes.some((change) => change.path === current) ? current : null)
     } catch (cause) {
       if (generation.current !== request) return
       setError(String(cause))
@@ -238,6 +247,9 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
     const paths = shown.filter((change) => intent === 'stage' ? change.staging !== 'staged' : change.staging !== 'unstaged').map((change) => change.path)
     stage(paths, intent, !filteredView)
   }
+  // The pane shows the picked row, or the list's first one until a pick is made.
+  const firstShown = groupChanges(shown).flatMap((group) => group.entries)[0]
+  const current = shown.find((change) => change.path === selectedPath) ?? firstShown
   const totals = changes.reduce((sum, change) => ({
     added: sum.added + (change.added ?? 0),
     removed: sum.removed + (change.removed ?? 0),
@@ -324,50 +336,80 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
             )}
           </Menu>
         ) : null}
+        {report !== null && changes.length > 0 ? (
+          <IconButton
+            label={split.collapsed ? 'Show Diff' : 'Hide Diff'}
+            onClick={() => {
+              const next = { ratio: split.ratio, collapsed: !split.collapsed }
+              writeSplit(project.id, next)
+              setSplit(next)
+            }}
+          >
+            <Icon name="panelRight" size={14} />
+          </IconButton>
+        ) : null}
         <IconButton label="Refresh git status" onClick={() => void load()}><Icon name="refresh" size={14} /></IconButton>
       </div>
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto">
-        {error !== null && report === null ? (
-          <div className="flex flex-col items-start gap-2 p-3">
-            <ErrorNotice raw={error} />
-            <Button size="sm" variant="outline" onClick={() => void load()}>Retry</Button>
+      <GitSplit
+        projectId={project.id}
+        state={split}
+        onChange={setSplit}
+        diff={report !== null && current !== undefined
+          ? (
+            <GitDiffPane
+              workspaceId={workspaceId}
+              projectId={project.id}
+              change={current}
+              reloadKey={reloadKey}
+              onStage={(paths, intent) => stage(paths, intent)}
+              onReady={onFocusedDiffReady}
+              {...(onOpenFile !== undefined ? { onOpenFile: () => onOpenFile(current.path) } : {})}
+            />
+          )
+          : null}
+        list={(
+          <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto">
+            {error !== null && report === null ? (
+              <div className="flex flex-col items-start gap-2 p-3">
+                <ErrorNotice raw={error} />
+                <Button size="sm" variant="outline" onClick={() => void load()}>Retry</Button>
+              </div>
+            ) : loading && report === null ? (
+              <div className="flex items-center gap-2 px-2.5 py-2 text-sm text-fg-muted" role="status"><Spinner size={13} />Checking git…</div>
+            ) : changes.length === 0 ? (
+              <div className="flex flex-col items-center justify-center gap-2 p-6 text-center">
+                <Icon name="check" size={20} className="text-fg-faint" />
+                <p className="m-0 text-sm font-medium">No changes</p>
+                <p className="m-0 max-w-xs text-[13px] text-fg-muted">
+                  {report?.branch === null
+                    ? 'This folder is not a git repository.'
+                    : pathFilter !== undefined && pathFilter.length > 0
+                      ? 'None of the files this turn wrote differ from HEAD right now: they were committed, or later changes put them back. The chat card still shows what the turn did. Show all for the whole project.'
+                      : 'The working tree matches HEAD.'}
+                </p>
+              </div>
+            ) : (
+              <GitChangeList
+                report={report!}
+                visibleChanges={changes}
+                pendingStages={pendingStages}
+                onStage={(paths, intent) => stage(paths, intent)}
+                onDiscard={(entries) => requestRevert(entries)}
+                onTrash={(entries) => requestRevert(entries)}
+                selectedPath={current?.path ?? null}
+                onSelect={(path) => {
+                  // The reader took over: a late diff must not yank the list back.
+                  pendingFocus.current = false
+                  setSelectedPath(path)
+                }}
+                {...(focusPath !== undefined ? { focusPath, focusRowRef } : {})}
+                {...(onOpenFile !== undefined ? { onOpenFile } : {})}
+              />
+            )}
+            {focusNote}
           </div>
-        ) : loading && report === null ? (
-          <div className="flex items-center gap-2 px-2.5 py-2 text-sm text-fg-muted" role="status"><Spinner size={13} />Checking git…</div>
-        ) : changes.length === 0 ? (
-          <div className="flex flex-col items-center justify-center gap-2 p-6 text-center">
-            <Icon name="check" size={20} className="text-fg-faint" />
-            <p className="m-0 text-sm font-medium">No changes</p>
-            <p className="m-0 max-w-xs text-[13px] text-fg-muted">
-              {report?.branch === null
-                ? 'This folder is not a git repository.'
-                : pathFilter !== undefined && pathFilter.length > 0
-                  ? 'None of the files this turn wrote differ from HEAD right now: they were committed, or later changes put them back. The chat card still shows what the turn did. Show all for the whole project.'
-                  : 'The working tree matches HEAD.'}
-            </p>
-          </div>
-        ) : (
-          <GitChangeList
-            workspaceId={workspaceId}
-            projectId={project.id}
-            report={report!}
-            visibleChanges={changes}
-            pendingStages={pendingStages}
-            onStage={(paths, intent) => stage(paths, intent)}
-            onDiscard={(entries) => requestRevert(entries)}
-            onTrash={(entries) => requestRevert(entries)}
-            openPath={openPath}
-            onToggleDiff={(path) => {
-              // The reader took over: a late diff must not yank the list back.
-              pendingFocus.current = false
-              setOpenPath((current) => current === path ? null : path)
-            }}
-            {...(focusPath !== undefined ? { focusPath, focusRowRef, onFocusedDiffReady } : {})}
-            {...(onOpenFile !== undefined ? { onOpenFile } : {})}
-          />
         )}
-        {focusNote}
-      </div>
+      />
       {/* The whole-project view only: a turn filter shows a subset, which is not what a commit would take. */}
       {report !== null && !filteredView && (report.branch !== null || report.head !== null) ? (
         <>
