@@ -7,7 +7,8 @@
  * the caller then asks as before. This is approval UX, not a sandbox.
  *
  * Path containment: arguments may not be absolute (except `/dev/null`),
- * start with `~`, or contain a `..` segment, so an auto-allowed command
+ * start with `~`, contain a `..` segment, a backslash, or a Windows drive
+ * prefix (`C:`), so an auto-allowed command
  * cannot read outside the folder Bash starts in. Symlinks inside the project
  * are not resolved (Bash never was confined by folder grants).
  */
@@ -47,6 +48,10 @@ const GIT_FORBIDDEN_LETTERS = 'O'
 
 function isContainedPath(word: ShellWord): boolean {
   if (word.expands) return false
+  // Windows forms Git Bash resolves outside the project: a backslash
+  // separator (`..\x`, `C:\x`, `\\server\share`) or a drive prefix (`C:x`).
+  if (word.value.includes('\\')) return false
+  if (word.value.split(/[=,]/).some((part) => /^[A-Za-z]:/.test(part))) return false
   for (const part of word.value.split(/[=:,]/)) {
     if (part === '/dev/null') continue
     if (part.startsWith('/') || part.startsWith('~')) return false
