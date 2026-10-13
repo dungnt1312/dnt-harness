@@ -199,7 +199,7 @@ export async function hunksFor(
   rel: string,
   trusted: boolean,
   displayText: string,
-  read: (args: readonly string[]) => Promise<{ ok: boolean; stdout: Buffer; code: number }>,
+  read: (args: readonly string[]) => Promise<{ stdout: Buffer; code: number }>,
   hasHead: boolean,
   conflicted: boolean,
 ): Promise<GitHunk[]> {
