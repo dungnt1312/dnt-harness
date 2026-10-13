@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import type { GitChange, GitStaging } from '../../lib/api.ts'
+import type { GitBranch, GitChange, GitStaging } from '../../lib/api.ts'
 import {
   changeCounts,
   commitButton,
   commitButtonTitle,
   confirmationForEntries,
+  fuzzyMatch,
   groupChanges,
   headerToggleState,
+  normalizeBranchName,
+  orderBranches,
   primaryChangesActionStages,
   remoteButton,
   sectionContains,
@@ -309,5 +312,48 @@ describe('suggestCommitMessage (Zed suggest_commit_message, git_panel.rs:4047-40
 
   it('a partly staged file counts as staged', () => {
     expect(suggestCommitMessage([change({ path: 'a.ts', staging: 'partial' })])).toBe('Update a.ts')
+  })
+})
+
+describe('branch picker rules (Zed branch_picker.rs:931-993, 1452-1476)', () => {
+  const branch = (name: string, over: Partial<GitBranch> = {}): GitBranch => ({ name, remote: false, current: false, ...over })
+
+  it('hides a remote branch that a local branch tracks', () => {
+    const list = [
+      branch('main', { current: true, upstream: 'origin/main', unixTime: 300 }),
+      branch('origin/main', { remote: true, unixTime: 300 }),
+      branch('origin/topic', { remote: true, unixTime: 100 }),
+    ]
+    expect(orderBranches(list, 'all').map((entry) => entry.name)).toEqual(['main', 'origin/topic'])
+  })
+
+  it('orders the current branch first, then newest commit first, locals before remotes', () => {
+    const list = [
+      branch('old', { unixTime: 100 }),
+      branch('origin/newest', { remote: true, unixTime: 900 }),
+      branch('recent', { unixTime: 500 }),
+      branch('main', { current: true, unixTime: 50 }),
+      branch('undated'),
+    ]
+    expect(orderBranches(list, 'all').map((entry) => entry.name)).toEqual(['main', 'recent', 'old', 'undated', 'origin/newest'])
+  })
+
+  it('filters to local or remote branches', () => {
+    const list = [branch('main', { current: true }), branch('origin/x', { remote: true })]
+    expect(orderBranches(list, 'local').map((entry) => entry.name)).toEqual(['main'])
+    expect(orderBranches(list, 'remote').map((entry) => entry.name)).toEqual(['origin/x'])
+  })
+
+  it('fuzzy-matches a subsequence, smart-case: an uppercase letter makes it case-sensitive', () => {
+    expect(fuzzyMatch('fb', 'feature/bar')).toEqual([0, 8])
+    expect(fuzzyMatch('FB', 'feature/bar')).toBeNull()
+    expect(fuzzyMatch('Fb', 'Feature/bar')).toEqual([0, 8])
+    expect(fuzzyMatch('zz', 'feature/bar')).toBeNull()
+    expect(fuzzyMatch('', 'anything')).toEqual([])
+  })
+
+  it('normalizes a typed name: trimmed, spaces become dashes', () => {
+    expect(normalizeBranchName('  my new branch ')).toBe('my-new-branch')
+    expect(normalizeBranchName('   ')).toBe('')
   })
 })

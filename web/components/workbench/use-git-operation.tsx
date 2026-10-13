@@ -32,6 +32,12 @@ interface PendingPrompt {
 export interface GitOperationOptions {
   /** A remote action (fetch, pull, push): its success is reported with `formatRemoteOutput`. */
   readonly remote?: GitRemoteAction
+  /**
+   * A refusal the caller handles itself (Zed asks "Force delete it?" for an
+   * unmerged branch): when this answers true for a failed `done`, no failure
+   * toast is raised. `done` is still returned.
+   */
+  readonly quietFailure?: (done: GitOperationDone) => boolean
 }
 
 /** One Git operation as the panel components start it: resolves with the `done` frame, `undefined` when the request itself failed. */
@@ -112,7 +118,7 @@ export function useGitOperation(workspaceId: string, projectId: string): {
     }
     if (done.cancelled === true) return done
     if (!done.ok) {
-      reportFailure(done.stderr.trim() || done.stdout.trim())
+      if (options.quietFailure?.(done) !== true) reportFailure(done.stderr.trim() || done.stdout.trim())
       return done
     }
     if (options.remote !== undefined) {

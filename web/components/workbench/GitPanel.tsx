@@ -16,6 +16,7 @@ import {
   type GitStaging,
   type GitStatusReport,
 } from '../../lib/api.ts'
+import { GitBranchPicker } from './GitBranchPicker.tsx'
 import { GitChangeList, withPendingStages } from './GitChangeList.tsx'
 import { GitCommitArea } from './GitCommitArea.tsx'
 import { GitDiffPane } from './GitDiffPane.tsx'
@@ -462,15 +463,17 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
         <>
           <GitCommitArea key={project.id} workspaceId={workspaceId} projectId={project.id} report={report} changes={shown} run={run} enqueue={enqueue} onDone={settleOperation} />
           <div role="group" aria-label="Branch" className="flex h-11 shrink-0 items-center gap-1.5 border-t border-line px-2.5 text-[13px]">
-            <Icon name="gitBranch" size={13} className="shrink-0 text-fg-muted" />
             {report.branchInfo !== null ? (
               <>
-                <span className="min-w-0 flex-1 truncate font-medium" title={report.branchInfo.name}>{report.branchInfo.name}</span>
+                <GitBranchPicker current={report.branchInfo.name} run={run} onDone={settleOperation} />
                 <GitRemoteButton key={project.id} branchInfo={report.branchInfo} run={run} onDone={settleOperation} />
               </>
             ) : (
               // Detached HEAD: there is no branch to push, so only the commit is named.
-              <span className="min-w-0 flex-1 truncate font-mono text-fg-muted" title="HEAD is detached">{report.head?.sha.slice(0, 7) ?? ''}</span>
+              <>
+                <Icon name="gitBranch" size={13} className="shrink-0 text-fg-muted" />
+                <span className="min-w-0 flex-1 truncate font-mono text-fg-muted" title="HEAD is detached">{report.head?.sha.slice(0, 7) ?? ''}</span>
+              </>
             )}
           </div>
         </>

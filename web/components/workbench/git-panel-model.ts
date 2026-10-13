@@ -3,7 +3,7 @@
  * `git_ui.rs`). Pure functions over the server's status report: no React and
  * no network, so the rules can be pinned by tests and shared by the components.
  */
-import type { GitChange, GitStaging, GitUpstreamTrack } from '../../lib/api.ts'
+import type { GitBranch, GitChange, GitStaging, GitUpstreamTrack } from '../../lib/api.ts'
 
 /** Zed `Section`. */
 export type GitSection = 'conflict' | 'tracked' | 'new' | 'staged' | 'unstaged'
@@ -316,4 +316,54 @@ export function suggestCommitMessage(changes: readonly GitChange[], mergeMessage
   if (entry === undefined) return undefined
   const action = entry.deleted ? 'Delete' : entry.created ? 'Create' : 'Update'
   return `${action} ${fileName(entry.path)}`
+}
+
+// ── branch picker (Zed branch_picker.rs) ────────────────────────
+
+export type BranchFilter = 'all' | 'local' | 'remote'
+
+/**
+ * The branches the picker lists (Zed `branch_picker.rs:960-993`): in checkout
+ * mode a remote branch that a local branch already tracks is hidden; then the
+ * filter; then the current branch first, newest commit next (a branch with no
+ * date last), and local branches before remote ones.
+ */
+export function orderBranches(branches: readonly GitBranch[], filter: BranchFilter): GitBranch[] {
+  const tracked = new Set(branches.flatMap((branch) => (!branch.remote && branch.upstream !== undefined ? [branch.upstream] : [])))
+  return branches
+    .filter((branch) => !(branch.remote && tracked.has(branch.name)))
+    .filter((branch) => filter === 'all' || (filter === 'remote') === branch.remote)
+    .map((branch, index) => ({ branch, index }))
+    .sort((a, b) =>
+      Number(b.branch.current) - Number(a.branch.current)
+      || Number(a.branch.remote) - Number(b.branch.remote)
+      || (b.branch.unixTime ?? -1) - (a.branch.unixTime ?? -1)
+      || a.index - b.index)
+    .map(({ branch }) => branch)
+}
+
+/**
+ * The indices of `text` matched by `query` as a subsequence, or null. Smart
+ * case (Zed's fuzzy matcher): case-insensitive until the query has an
+ * uppercase letter. An empty query matches everything with no highlight.
+ */
+export function fuzzyMatch(query: string, text: string): number[] | null {
+  if (query === '') return []
+  const sensitive = query !== query.toLowerCase()
+  const haystack = sensitive ? text : text.toLowerCase()
+  const needle = sensitive ? query : query.toLowerCase()
+  const indices: number[] = []
+  let from = 0
+  for (const char of needle) {
+    const at = haystack.indexOf(char, from)
+    if (at < 0) return null
+    indices.push(at)
+    from = at + 1
+  }
+  return indices
+}
+
+/** Zed `branch_picker.rs:918`: the typed name is trimmed and spaces become dashes. */
+export function normalizeBranchName(query: string): string {
+  return query.trim().replaceAll(' ', '-')
 }
