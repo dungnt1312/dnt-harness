@@ -1,7 +1,7 @@
-import { useRef, type KeyboardEvent, type ReactNode, type Ref } from 'react'
+import { useRef, useState, type KeyboardEvent, type ReactNode, type Ref } from 'react'
 import Icon from '../common/Icon.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
-import { Menu, menuItemClass } from '../ui/Menu.tsx'
+import { Menu } from '../ui/Menu.tsx'
 import {
   type GitChange,
   type GitChangeStatus,
@@ -19,6 +19,8 @@ import {
   type GitChangeGroup,
   type GitToggleState,
 } from './git-panel-model.ts'
+import { buildTree, folderStageTargets, folderToggleState, visibleNodes, type GitTreeNode } from './git-tree.ts'
+import { ContextMenuPanel, GitEntryMenuItems, useContextMenu, type GitEntryActions } from './GitEntryMenu.tsx'
 
 const STATUS_LABEL: Readonly<Record<GitChangeStatus, string>> = {
   modified: 'Modified',
@@ -58,6 +60,12 @@ export interface GitChangeListProps {
   readonly onTrash: (entries: readonly GitChange[]) => void
   /** Opens a changed file itself in the workbench, when a resolver is wired. */
   readonly onOpenFile?: (path: string) => void
+  /** Add these untracked paths to the root .gitignore. */
+  readonly onIgnore: (paths: readonly string[]) => void
+  /** Absolute project folder, for Copy Path. */
+  readonly projectPath: string
+  /** List (flat sections) or Tree (folders inside each section). */
+  readonly view: 'list' | 'tree'
   /** The row whose diff the pane shows. */
   readonly selectedPath: string | null
   readonly onSelect: (path: string) => void
@@ -74,12 +82,27 @@ export interface GitChangeListProps {
  * the selection, Space stages or unstages it and Enter opens the file.
  */
 export function GitChangeList({
-  report, visibleChanges, pendingStages, onStage, onDiscard, onTrash, onOpenFile,
+  report, visibleChanges, pendingStages, onStage, onDiscard, onTrash, onOpenFile, onIgnore, projectPath, view,
   selectedPath, onSelect, focusPath, focusRowRef,
 }: GitChangeListProps) {
   const groups = groupChanges(withPendingStages(visibleChanges, pendingStages))
-  const order = groups.flatMap((group) => group.entries)
+  // Tree mode collapses folders in memory only; a reload expands them again.
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set())
+  const toggleFolder = (key: string): void => setCollapsed((current) => {
+    const next = new Set(current)
+    if (!next.delete(key)) next.add(key)
+    return next
+  })
+  const nodesOf = (group: GitChangeGroup): readonly GitTreeNode[] =>
+    view === 'tree' ? visibleNodes(buildTree(group.entries), collapsed) : group.entries.map((change): GitTreeNode => ({ kind: 'file', key: change.path, change, depth: 0 }))
+  // Arrow keys walk the files as drawn: a collapsed folder's files are skipped.
+  const order = groups.flatMap((group) => nodesOf(group).flatMap((node) => node.kind === 'file' ? [node.change] : []))
   const box = useRef<HTMLDivElement | null>(null)
+  const actionsFor = (change: GitChange): GitEntryActions => ({
+    onStage, onDiscard, onTrash, onIgnore,
+    onOpenDiff: () => onSelect(change.path),
+    ...(onOpenFile !== undefined ? { onViewFile: () => onOpenFile(change.path) } : {}),
+  })
 
   const move = (from: GitChange, step: 1 | -1): void => {
     const index = order.findIndex((entry) => entry.path === from.path)
@@ -104,18 +127,27 @@ export function GitChangeList({
           group={group}
           onStage={onStage}
         >
-          {group.entries.map((change) => (
-            <li key={change.path} data-row-path={change.path}>
+          {nodesOf(group).map((node) => node.kind === 'dir' ? (
+            <li key={`dir:${node.key}`} data-tree-dir={node.path}>
+              <FolderRow
+                node={node}
+                collapsed={collapsed.has(node.key)}
+                onToggle={() => toggleFolder(node.key)}
+                onStage={onStage}
+              />
+            </li>
+          ) : (
+            <li key={node.change.path} data-row-path={node.change.path} style={node.depth > 0 ? { paddingLeft: `${node.depth * 12}px` } : undefined}>
               <ChangeRow
-                change={change}
-                selected={selectedPath === change.path}
-                onSelect={() => onSelect(change.path)}
-                onKeyDown={(event) => onKeyDown(event, change)}
-                onStage={() => onStage([change.path], stageIntent(change.staging))}
-                onDiscard={() => onDiscard([change])}
-                onTrash={() => onTrash([change])}
-                {...(focusPath === change.path && focusRowRef !== undefined ? { rowRef: focusRowRef } : {})}
-                {...(onOpenFile !== undefined ? { onOpenFile: () => onOpenFile(change.path) } : {})}
+                change={node.change}
+                selected={selectedPath === node.change.path}
+                projectPath={projectPath}
+                actions={actionsFor(node.change)}
+                onSelect={() => onSelect(node.change.path)}
+                onKeyDown={(event) => onKeyDown(event, node.change)}
+                onStage={() => onStage([node.change.path], stageIntent(node.change.staging))}
+                {...(focusPath === node.change.path && focusRowRef !== undefined ? { rowRef: focusRowRef } : {})}
+                {...(onOpenFile !== undefined ? { onOpenFile: () => onOpenFile(node.change.path) } : {})}
               />
             </li>
           ))}
@@ -181,14 +213,14 @@ function StageCheckbox({ state, label, onToggle }: {
   )
 }
 
-function ChangeRow({ change, selected, onSelect, onKeyDown, onStage, onDiscard, onTrash, onOpenFile, rowRef }: {
+function ChangeRow({ change, selected, projectPath, actions, onSelect, onKeyDown, onStage, onOpenFile, rowRef }: {
   readonly change: GitChange
   readonly selected: boolean
+  readonly projectPath: string
+  readonly actions: GitEntryActions
   readonly onSelect: () => void
   readonly onKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void
   readonly onStage: () => void
-  readonly onDiscard: () => void
-  readonly onTrash: () => void
   /** Opens the file itself in the workbench; absent without an opener. */
   readonly onOpenFile?: () => void
   /** The focused row (a chat card's file click), for a scroll into view. */
@@ -196,15 +228,13 @@ function ChangeRow({ change, selected, onSelect, onKeyDown, onStage, onDiscard, 
 }) {
   const name = change.path.split('/').pop() ?? change.path
   const directory = change.path.slice(0, change.path.length - name.length).replace(/\/$/, '')
-  // Zed `build_context_menu`: a new file is "Trash File", a deleted one "Restore File", the rest "Discard Changes".
-  const revert = change.created
-    ? { label: 'Trash File', icon: 'trash' as const, run: onTrash }
-    : { label: change.deleted ? 'Restore File' : 'Discard Changes', icon: 'refresh' as const, run: onDiscard }
+  const menu = useContextMenu()
   return (
     // One hover surface for the whole line, openers included: the band never
     // breaks where an overlaid button begins.
     <div
       onKeyDown={onKeyDown}
+      {...menu.bind}
       className={cn('relative flex items-center rounded-md transition-colors hover:bg-hover group/row', selected && 'bg-hover')}
     >
       <button
@@ -255,14 +285,12 @@ function ChangeRow({ change, selected, onSelect, onKeyDown, onStage, onDiscard, 
         triggerClassName={cn(onOpenFile !== undefined ? MENU_REVEAL_ROW_BESIDE_OPENER : MENU_REVEAL_ROW, selected && SELECTED_REVEAL)}
         trigger={() => <Icon name="dots" size={12} />}
       >
-        {(close) => (
-          <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); revert.run() }}>
-            <Icon name={revert.icon} size={14} className="shrink-0 text-fg-muted" />
-            {revert.label}
-          </button>
-        )}
+        {(close) => <GitEntryMenuItems entries={[change]} projectPath={projectPath} close={close} actions={actions} />}
       </Menu>
       <StageCheckbox state={toggleStateOf(change.staging)} label={`${change.staging === 'staged' ? 'Unstage' : 'Stage'} ${change.path}`} onToggle={onStage} />
+      <ContextMenuPanel at={menu.at} label={`Actions for ${name}`} onClose={menu.close}>
+        <GitEntryMenuItems entries={[change]} projectPath={projectPath} close={menu.close} actions={actions} />
+      </ContextMenuPanel>
     </div>
   )
 }
@@ -283,3 +311,39 @@ const OPENER_REVEAL_ROW = cn(OPENER_BASE, 'right-9', ROW_REVEAL)
 // The menu trigger stays shown while its menu is open, or the menu would lose its anchor.
 const MENU_REVEAL_ROW = cn(OPENER_BASE, 'inline-flex items-center justify-center right-9', ROW_REVEAL, 'data-[state=open]:visible data-[state=open]:opacity-100')
 const MENU_REVEAL_ROW_BESIDE_OPENER = cn(MENU_REVEAL_ROW, 'right-16')
+
+/** A directory of the tree: chevron, name, count and a tri-state checkbox over every change beneath it. */
+function FolderRow({ node, collapsed, onToggle, onStage }: {
+  readonly node: Extract<GitTreeNode, { kind: 'dir' }>
+  readonly collapsed: boolean
+  readonly onToggle: () => void
+  readonly onStage: GitChangeListProps['onStage']
+}) {
+  const state = folderToggleState(node.entries)
+  const label = `${state === 'selected' ? 'Unstage' : 'Stage'} Folder ${node.path}`
+  return (
+    <div className="flex items-center rounded-md hover:bg-hover" style={{ paddingLeft: `${node.depth * 12}px` }}>
+      <button
+        type="button"
+        data-dir-toggle
+        aria-expanded={!collapsed}
+        title={node.path}
+        onClick={onToggle}
+        className="flex min-h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px]"
+      >
+        <Icon name="chevronRight" size={12} className={cn('shrink-0 text-fg-faint transition-transform', !collapsed && 'rotate-90')} />
+        <Icon name={collapsed ? 'folder' : 'folderOpen'} size={14} className="shrink-0 text-fg-muted" />
+        <span className="min-w-0 flex-1 truncate">{node.name}</span>
+        <span className="font-mono text-[11px] tabular-nums text-fg-faint">{node.entries.length}</span>
+      </button>
+      <StageCheckbox
+        state={state}
+        label={label}
+        onToggle={() => {
+          const { paths, intent } = folderStageTargets(node.entries, state)
+          onStage(paths, intent)
+        }}
+      />
+    </div>
+  )
+}

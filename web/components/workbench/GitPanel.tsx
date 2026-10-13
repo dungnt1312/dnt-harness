@@ -21,6 +21,7 @@ import { GitCommitArea } from './GitCommitArea.tsx'
 import { GitDiffPane } from './GitDiffPane.tsx'
 import { GitRemoteButton } from './GitRemoteButton.tsx'
 import { GitSplit, readSplit, writeSplit, type GitSplitState } from './GitSplit.tsx'
+import { readView, writeView, type GitListView } from './git-view.ts'
 import { failureText, useGitOperation } from './use-git-operation.tsx'
 import { changeCounts, confirmationForEntries, groupChanges, primaryChangesActionStages, type GitConfirmation } from './git-panel-model.ts'
 import type { WorkbenchProject } from './Workbench.tsx'
@@ -63,6 +64,11 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
   // Bumped whenever the status moved, so the pane reads its diff again.
   const [reloadKey, setReloadKey] = useState(0)
   const [split, setSplit] = useState<GitSplitState>(() => readSplit(project.id))
+  const [view, setViewState] = useState<GitListView>(readView)
+  const setView = (next: GitListView): void => {
+    writeView(next)
+    setViewState(next)
+  }
   useEffect(() => { setSplit(readSplit(project.id)) }, [project.id])
   const generation = useRef(0)
   const toast = useToast()
@@ -196,6 +202,15 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
         for (const path of settled) next.delete(path)
         return next
       })
+      if (done?.status !== undefined) applyReport(done.status)
+      else if (done?.ok === true) void load()
+    })
+  }, [enqueue, run, applyReport, load])
+
+  /** Zed "Add to .gitignore": append untracked paths to the root .gitignore, in click order. */
+  const ignore = useCallback((paths: readonly string[]): void => {
+    enqueue(async () => {
+      const done = await run({ type: 'ignore', paths })
       if (done?.status !== undefined) applyReport(done.status)
       else if (done?.ok === true) void load()
     })
@@ -337,6 +352,32 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
           </Menu>
         ) : null}
         {report !== null && changes.length > 0 ? (
+          <Menu
+            label="View options"
+            align="end"
+            triggerClassName="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-fg-muted hover:bg-hover hover:text-fg"
+            trigger={() => <Icon name={view === 'tree' ? 'listTree' : 'list'} size={14} />}
+          >
+            {(close) => (
+              <>
+                {(['list', 'tree'] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={view === mode}
+                    className={menuItemClass}
+                    onClick={() => { close(); setView(mode) }}
+                  >
+                    <span className="inline-flex w-4 shrink-0 justify-center">{view === mode ? <Icon name="check" size={13} /> : null}</span>
+                    {mode === 'list' ? 'List' : 'Tree'}
+                  </button>
+                ))}
+              </>
+            )}
+          </Menu>
+        ) : null}
+        {report !== null && changes.length > 0 ? (
           <IconButton
             label={split.collapsed ? 'Show Diff' : 'Hide Diff'}
             onClick={() => {
@@ -399,6 +440,9 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
                 onStage={(paths, intent) => stage(paths, intent)}
                 onDiscard={(entries) => requestRevert(entries)}
                 onTrash={(entries) => requestRevert(entries)}
+                onIgnore={ignore}
+                projectPath={project.path}
+                view={view}
                 selectedPath={current?.path ?? null}
                 onSelect={(path) => {
                   // The reader took over: a late diff must not yank the list back.
