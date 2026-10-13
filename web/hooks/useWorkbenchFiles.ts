@@ -43,8 +43,10 @@ export interface WorkbenchFiles extends FilesState {
   readonly removePath: (path: string) => void
   /** Store (or with null, clear) the unsaved text of an open file. */
   readonly setDraft: (path: string, draft: FileDraft | null) => void
-  /** A save of `savedText` finished: drop the draft unless it has newer text (see {@link settleSavedDraft}). */
-  readonly settleDraft: (path: string, savedText: string, newHash: string) => void
+  /** A save of `savedText` in `projectKey` finished: drop that project's draft unless it has newer text (see {@link settleInProject}). */
+  readonly settleDraft: (projectKey: string | null, path: string, savedText: string, newHash: string) => void
+  /** The project this state belongs to; bind it when a save starts and pass it back to `settleDraft`. */
+  readonly projectKey: string | null
 }
 
 const EMPTY: FilesState = { folder: '', openFiles: [], activeFile: null, focus: null, drafts: {} }
@@ -119,6 +121,32 @@ export function removeFileTabs(state: FilesState, path: string): FilesState {
 const hasDirtyDraft = (state: FilesState): boolean => Object.values(state.drafts).some((draft) => draft.dirty)
 
 /**
+ * A save started in `projectKey` landed. It settles in the project it belongs
+ * to: the live state when that project is showing, else its stashed entry
+ * (dropped once no dirty draft is left), else nowhere. Unchanged parts are
+ * returned as the same objects; `stash` is not mutated.
+ */
+export function settleInProject(
+  live: FilesState,
+  liveKey: string | null,
+  stash: ReadonlyMap<string, FilesState>,
+  projectKey: string | null,
+  path: string,
+  savedText: string,
+  newHash: string,
+): { live: FilesState; stash: ReadonlyMap<string, FilesState> } {
+  if (projectKey === liveKey) return { live: settleSavedDraft(live, path, savedText, newHash), stash }
+  const entry = projectKey === null ? undefined : stash.get(projectKey)
+  if (projectKey === null || entry === undefined) return { live, stash }
+  const settled = settleSavedDraft(entry, path, savedText, newHash)
+  if (settled === entry) return { live, stash }
+  const next = new Map(stash)
+  if (hasDirtyDraft(settled)) next.set(projectKey, settled)
+  else next.delete(projectKey)
+  return { live, stash: next }
+}
+
+/**
  * Moving from one project to another: the state being left is kept in the
  * stash only when it holds an unsaved draft (otherwise any older stash of that
  * project is dropped), and the entered project gets its stash back, else an
@@ -183,7 +211,17 @@ export function useWorkbenchFiles(projectKey: string | null): WorkbenchFiles {
     }
     return { ...current, drafts: { ...current.drafts, [path]: draft } }
   }), [])
-  const settleDraft = useCallback((path: string, savedText: string, newHash: string) => setState((current) => settleSavedDraft(current, path, savedText, newHash)), [])
+  const settleDraft = useCallback((savingKey: string | null, path: string, savedText: string, newHash: string) => {
+    if (savingKey === keyRef.current) {
+      // Functional update: concurrent edits to the live state must not be lost.
+      setState((current) => settleInProject(current, savingKey, stash.current, savingKey, path, savedText, newHash).live)
+      return
+    }
+    const next = settleInProject(latest.current, keyRef.current, stash.current, savingKey, path, savedText, newHash)
+    if (next.stash === stash.current) return
+    stash.current = next.stash
+    setAnyStashed(next.stash.size > 0)
+  }, [])
   // Only dirty states are stashed, so any stash means unsaved work.
   const anyDirty = hasDirtyDraft(state) || anyStashed
   useEffect(() => {
@@ -197,5 +235,6 @@ export function useWorkbenchFiles(projectKey: string | null): WorkbenchFiles {
   const renamePath = useCallback((from: string, to: string) => setState((current) => renameFileTabs(current, from, to)), [])
   const removePath = useCallback((path: string) => setState((current) => removeFileTabs(current, path)), [])
 
-  return { ...state, setFolder, openFile, closeFile, showFixedView, renamePath, removePath, setDraft, settleDraft }
+  // keyRef moves in the same effect that swaps `state`, so it always names the project `state` belongs to.
+  return { ...state, projectKey: keyRef.current, setFolder, openFile, closeFile, showFixedView, renamePath, removePath, setDraft, settleDraft }
 }

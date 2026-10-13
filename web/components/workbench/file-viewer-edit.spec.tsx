@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, it, vi, type MockInstance } from 'vitest
 import { act, useState } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { FileViewer } from './FileViewer.tsx'
-import { settleSavedDraft, type FileDraft, type FilesState } from '../../hooks/useWorkbenchFiles.ts'
+import { settleInProject, type FileDraft, type FilesState } from '../../hooks/useWorkbenchFiles.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -50,7 +50,7 @@ function Harness({ path, viewerKey, showViewer = true }: { path: string; viewerK
   })
   return showViewer
     ? <FileViewer key={viewerKey} workspaceId="w1" projectId="p1" projectPath="/proj" path={path} draft={state.drafts[path] ?? null} onDraft={setDraft}
-        onSaved={(text, hash) => setState((current) => settleSavedDraft(current, path, text, hash))} />
+        onSaved={(text, hash) => setState((current) => settleInProject(current, 'p1', new Map(), 'p1', path, text, hash).live)} />
     : null
 }
 

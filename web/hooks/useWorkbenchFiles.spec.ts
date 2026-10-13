@@ -2,7 +2,7 @@
 import { createElement, act, type ReactElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it } from 'vitest'
-import { closeFileWithDraft, removeFileTabs, renameFileTabs, settleSavedDraft, switchProject, useWorkbenchFiles, type FilesState, type WorkbenchFiles } from './useWorkbenchFiles.ts'
+import { closeFileWithDraft, removeFileTabs, renameFileTabs, settleInProject, settleSavedDraft, switchProject, useWorkbenchFiles, type FilesState, type WorkbenchFiles } from './useWorkbenchFiles.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -174,6 +174,52 @@ describe('switchProject', () => {
   })
 })
 
+describe('settleInProject', () => {
+  const file = (text: string, hash = 'h'): FilesState => ({
+    folder: '', openFiles: ['README.md'], activeFile: 'README.md', focus: null,
+    drafts: { 'README.md': { text, baseHash: hash, dirty: true } },
+  })
+  const live = file('b-live', 'hb')
+  const stashedA = file('a2', 'ha')
+
+  it('settles the stashed entry of a non-live project and leaves the live state alone', () => {
+    const stash = new Map([['A', stashedA]])
+    const next = settleInProject(live, 'B', stash, 'A', 'README.md', 'a2', 'ha2')
+    expect(next.live).toBe(live)
+    expect(next.stash.has('A')).toBe(false)
+    expect(stash.get('A')).toBe(stashedA)
+  })
+
+  it('keeps a stashed entry that holds newer text, rebased on the saved hash', () => {
+    const next = settleInProject(live, 'B', new Map([['A', stashedA]]), 'A', 'README.md', 'older', 'ha2')
+    expect(next.live).toBe(live)
+    expect(next.stash.get('A')?.drafts['README.md']).toEqual({ text: 'a2', baseHash: 'ha2', dirty: true })
+  })
+
+  it('settles the live state for the live key and leaves the stash alone', () => {
+    const stash = new Map([['A', stashedA]])
+    const next = settleInProject(live, 'B', stash, 'B', 'README.md', 'b-live', 'hb2')
+    expect(next.live.drafts).toEqual({})
+    expect(next.stash).toBe(stash)
+    const newer = settleInProject(live, 'B', stash, 'B', 'README.md', 'older', 'hb2')
+    expect(newer.live.drafts['README.md']).toEqual({ text: 'b-live', baseHash: 'hb2', dirty: true })
+  })
+
+  it('changes nothing for an unknown key', () => {
+    const stash = new Map([['A', stashedA]])
+    const next = settleInProject(live, 'B', stash, 'C', 'README.md', 'a2', 'x')
+    expect(next.live).toBe(live)
+    expect(next.stash).toBe(stash)
+  })
+
+  it('changes nothing when the stashed entry has no draft at the path', () => {
+    const stash = new Map([['A', stashedA]])
+    const next = settleInProject(live, 'B', stash, 'A', 'other.md', 'a2', 'x')
+    expect(next.live).toBe(live)
+    expect(next.stash).toBe(stash)
+  })
+})
+
 describe('useWorkbenchFiles across projects', () => {
   let root: Root | undefined
   let host: HTMLDivElement
@@ -193,5 +239,23 @@ describe('useWorkbenchFiles across projects', () => {
     expect(files.openFiles).toEqual(['a.ts'])
     expect(files.activeFile).toBe('a.ts')
     expect(files.drafts['a.ts']).toEqual({ text: 'mine', baseHash: 'h', dirty: true })
+  })
+
+  it('settles a save that returns after a project switch in the project it started in', async () => {
+    let files!: WorkbenchFiles
+    const Probe = ({ projectKey }: { projectKey: string }): null => { files = useWorkbenchFiles(projectKey); return null }
+    const show = (key: string): ReactElement => createElement(Probe, { projectKey: key })
+    host = document.createElement('div'); document.body.append(host); root = createRoot(host)
+    await act(async () => root!.render(show('A')))
+    await act(async () => { files.openFile('README.md'); files.setDraft('README.md', { text: 'a2', baseHash: 'ha', dirty: true }) })
+    const savingKey = files.projectKey
+    expect(savingKey).toBe('A')
+    await act(async () => root!.render(show('B')))
+    await act(async () => { files.openFile('README.md'); files.setDraft('README.md', { text: 'a2', baseHash: 'hb', dirty: true }) })
+    // The PUT for A returns while B is showing.
+    await act(async () => files.settleDraft(savingKey, 'README.md', 'a2', 'ha2'))
+    expect(files.drafts['README.md']).toEqual({ text: 'a2', baseHash: 'hb', dirty: true })
+    await act(async () => root!.render(show('A')))
+    expect(files.drafts['README.md']).toBeUndefined()
   })
 })

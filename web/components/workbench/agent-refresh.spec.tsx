@@ -15,7 +15,7 @@ it('counts child events only when a new event array arrives', async () => {
   host = document.createElement('div')
   document.body.append(host)
   root = createRoot(host)
-  const files = { activeFile: null, openFiles: [], folder: '', showFixedView: vi.fn(), setFolder: vi.fn(), openFile: vi.fn(), closeFile: vi.fn(), focus: null, drafts: {}, setDraft: () => {}, settleDraft: () => {} }
+  const files = { activeFile: null, openFiles: [], folder: '', showFixedView: vi.fn(), setFolder: vi.fn(), openFile: vi.fn(), closeFile: vi.fn(), focus: null, drafts: {}, projectKey: null, setDraft: () => {}, settleDraft: (_projectKey: string | null, _path: string, _text: string, _hash: string) => {} }
   const render = (expanded: boolean) => <Workbench workspaceId="w" project={null} view="agents" onView={() => {}} views={['files', 'agents']} onViews={() => {}} files={files as never} context={{ meta: null, stream: 'open', sessionId: 's', sessionFolder: null, eventCount: events.length }} events={events} expanded={expanded} onClose={() => {}} />
   const filter = vi.spyOn(events, 'filter')
   await act(async () => root!.render(render(false)))
