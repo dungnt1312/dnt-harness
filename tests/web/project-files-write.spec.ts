@@ -99,6 +99,20 @@ describe('renameProjectEntry', () => {
     expect(await fs.readdir(root)).toContain('Readme.md')
   })
 
+  it('renames an existing entry whose name ends in whitespace', async () => {
+    await fs.writeFile(path.join(root, 'trail '), 't\n', 'utf8')
+    expect(await renameProjectEntry(root, 'trail ', 'trail.txt')).toEqual({ path: 'trail.txt', kind: 'file' })
+    expect(await exists('trail.txt')).toBe(true)
+    expect(await exists('trail ')).toBe(false)
+  })
+
+  it('answers 409 when renaming onto a hard link of the same file', async () => {
+    await fs.link(path.join(root, 'README.md'), path.join(root, 'b.md'))
+    expect(await status(renameProjectEntry(root, 'README.md', 'b.md'))).toBe(409)
+    expect(await exists('README.md')).toBe(true)
+    expect(await exists('b.md')).toBe(true)
+  })
+
   it('renames a symlink itself, not its target', async () => {
     await fs.symlink(path.join(outside, 'secret.txt'), path.join(root, 'link.txt'))
     expect(await renameProjectEntry(root, 'link.txt', 'moved.txt')).toEqual({ path: 'moved.txt', kind: 'file' })
@@ -120,6 +134,13 @@ describe('deleteProjectEntry', () => {
     expect(await deleteProjectEntry(root, 'out-link')).toEqual({ path: 'out-link' })
     expect(await exists('out-link')).toBe(false)
     expect(await fs.readFile(path.join(outside, 'secret.txt'), 'utf8')).toBe('outside\n')
+  })
+
+  it('deletes an existing entry whose name starts with whitespace', async () => {
+    await fs.writeFile(path.join(root, ' lead'), 'l\n', 'utf8')
+    expect(await deleteProjectEntry(root, ' lead')).toEqual({ path: ' lead' })
+    expect(await exists(' lead')).toBe(false)
+    expect(await exists('README.md')).toBe(true)
   })
 
   it('deletes a broken symlink', async () => {
@@ -168,6 +189,34 @@ describe('refusals', () => {
     expect(await status(renameProjectEntry(root, 'src', 'lib', denied))).toBe(400)
     expect(await exists('src/nested')).toBe(true)
     expect(await exists('lib')).toBe(false)
+  })
+
+  it('refuses case variants of a denied root and its ancestors on a case-insensitive volume', async () => {
+    const insensitive = await fs.stat(path.join(root, 'readme.md')).then(() => true, () => false)
+    if (!insensitive) return
+    const denied = [path.join(root, 'src', 'nested')]
+    expect(await status(deleteProjectEntry(root, 'SRC', denied))).toBe(400)
+    expect(await status(deleteProjectEntry(root, 'src/NESTED', denied))).toBe(400)
+    expect(await status(renameProjectEntry(root, 'SRC', 'lib', denied))).toBe(400)
+    expect(await status(renameProjectEntry(root, 'src/NESTED', 'other', denied))).toBe(400)
+    expect(await status(createProjectEntry(root, 'src/NESTED/x.ts', 'file', denied))).toBe(400)
+    expect(await status(renameProjectEntry(root, 'src/index.ts', 'NESTED', denied))).toBe(400)
+    expect(await exists('src/nested')).toBe(true)
+    expect(await exists('src/index.ts')).toBe(true)
+    expect(await exists('lib')).toBe(false)
+    expect(await exists('src/other')).toBe(false)
+  })
+
+  it('refuses a case variant of a denied root that is a direct child of the project', async () => {
+    const insensitive = await fs.stat(path.join(root, 'readme.md')).then(() => true, () => false)
+    if (!insensitive) return
+    await fs.mkdir(path.join(root, '.ssh'))
+    await fs.writeFile(path.join(root, '.ssh', 'id'), 'k\n', 'utf8')
+    const denied = [path.join(root, '.ssh')]
+    expect(await status(deleteProjectEntry(root, '.SSH', denied))).toBe(400)
+    expect(await status(renameProjectEntry(root, '.SSH', 'x', denied))).toBe(400)
+    expect(await status(renameProjectEntry(root, 'README.md', '.SSH', denied))).toBe(400)
+    expect(await exists('.ssh/id')).toBe(true)
   })
 
   it('refuses .git and anything under it', async () => {

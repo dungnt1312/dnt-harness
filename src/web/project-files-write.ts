@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { blockedReason, resolveGrantedPath, within } from '../capabilities/fs/grants.ts'
-import { normalizeRelative, type ProjectEntry } from './project-files.ts'
+import type { ProjectEntry } from './project-files.ts'
 
 /**
  * Explorer writes for the web workbench: create a file or folder, rename in
@@ -52,10 +52,75 @@ function refuse(message: string): never {
   throw new ProjectWriteError(400, message)
 }
 
+/**
+ * Like `normalizeRelative` but without trimming: an existing entry may be named
+ * with leading or trailing whitespace. Names being created are checked by
+ * `nameProblem`; a blank path still counts as the project root.
+ */
+function normalizeExisting(raw: string): string {
+  if (raw.trim() === '') return ''
+  const rel = raw.replaceAll('\\', '/').replace(/\/{2,}/g, '/').replace(/^\/+|\/+$/g, '')
+  return rel === '.' ? '' : rel
+}
+
+/** Letter case and Unicode form are not significant on macOS and Windows volumes. */
+function fold(p: string): string {
+  return process.platform === 'darwin' || process.platform === 'win32' ? p.normalize('NFC').toLowerCase() : p
+}
+
+const withinFolded = (parent: string, child: string): boolean => within(fold(parent), fold(child))
+
+interface Protection {
+  /** `abs` is a protected root or lies inside one. */
+  readonly inside: boolean
+  /** `abs` is an ancestor of a protected root. */
+  readonly contains: boolean
+}
+
+/**
+ * Whether `abs` is protected storage: compared with case and normalization
+ * folded, and — when `abs` exists — by file identity, so a spelling the volume
+ * accepts but the lexical comparison misses (`.SSH`, `library`) is still caught.
+ */
+async function protection(root: string, abs: string, deniedRoots: readonly string[] | undefined): Promise<Protection> {
+  let inside = false
+  let contains = false
+  if (deniedRoots === undefined || deniedRoots.length === 0) return { inside, contains }
+  const stat = await fs.lstat(abs).catch(() => null)
+  const rootReal = await fs.realpath(root).catch(() => root)
+  const inProject = (p: string): boolean => withinFolded(root, p) || withinFolded(rootReal, p)
+  const atRoot = (p: string): boolean => fold(path.resolve(p)) === fold(path.resolve(root)) || fold(path.resolve(p)) === fold(path.resolve(rootReal))
+  for (const denied of deniedRoots) {
+    const deniedReal = await fs.realpath(denied).catch(() => denied)
+    for (const d of [denied, deniedReal]) {
+      if (withinFolded(d, abs)) inside = true
+      if (withinFolded(abs, d)) contains = true
+    }
+    if (stat === null) continue
+    // Walk from the denied root (or its nearest existing ancestor) up to the project root.
+    let cur = deniedReal
+    while (!(await fs.lstat(cur).then(() => true, () => false))) {
+      const parent = path.dirname(cur)
+      if (parent === cur) break
+      cur = parent
+    }
+    const isDenied = cur === deniedReal
+    for (let depth = 0; inProject(cur) && !atRoot(cur); depth += 1) {
+      const s = await fs.lstat(cur).catch(() => null)
+      if (s !== null && s.dev === stat.dev && s.ino === stat.ino) {
+        if (depth === 0 && isDenied) inside = true
+        else contains = true
+      }
+      const parent = path.dirname(cur)
+      if (parent === cur) break
+      cur = parent
+    }
+  }
+  return { inside, contains }
+}
+
 async function target(root: string, raw: string, deniedRoots: readonly string[] | undefined): Promise<Target> {
-  // The normalizer trims; refuse instead so a name is never silently changed.
-  if (raw !== raw.trim()) refuse('path must not start or end with whitespace')
-  const rel = normalizeRelative(raw)
+  const rel = normalizeExisting(raw)
   if (path.isAbsolute(raw.trim()) || /^[a-zA-Z]:/.test(rel)) refuse('path must be relative to the project root')
   if (rel === '') refuse('the project root itself cannot be changed')
   const segments = rel.split('/')
@@ -72,18 +137,15 @@ async function target(root: string, raw: string, deniedRoots: readonly string[] 
   }
   const abs = path.join(parentAbs, name)
   if (path.resolve(abs) === path.resolve(root)) refuse('the project root itself cannot be changed')
-  for (const denied of deniedRoots ?? []) {
-    if (within(denied, abs)) refuse(`path '${rel}' is inside protected storage`)
-  }
+  if ((await protection(root, abs, deniedRoots)).inside) refuse(`path '${rel}' is inside protected storage`)
   return { rel, parentAbs, parentRel, name, abs }
 }
 
 /** Refuse removing or moving `abs` when a protected root lies at or under it. */
-async function refuseProtectedDescendant(abs: string, rel: string, deniedRoots: readonly string[] | undefined): Promise<void> {
-  for (const denied of deniedRoots ?? []) {
-    const deniedReal = await fs.realpath(denied).catch(() => denied)
-    if (within(abs, denied) || within(abs, deniedReal)) refuse(`path '${rel}' contains protected storage`)
-  }
+async function refuseProtectedDescendant(root: string, abs: string, rel: string, deniedRoots: readonly string[] | undefined): Promise<void> {
+  const p = await protection(root, abs, deniedRoots)
+  if (p.inside) refuse(`path '${rel}' is inside protected storage`)
+  if (p.contains) refuse(`path '${rel}' contains protected storage`)
 }
 
 async function requireFolder(abs: string, rel: string): Promise<void> {
@@ -116,16 +178,16 @@ export async function renameProjectEntry(root: string, rawPath: string, newName:
   const problem = nameProblem(newName)
   if (problem !== undefined) refuse(problem)
   if (newName === t.name) refuse('the new name is the same as the current one')
-  await refuseProtectedDescendant(t.abs, t.rel, deniedRoots)
+  await refuseProtectedDescendant(root, t.abs, t.rel, deniedRoots)
   const source = await fs.lstat(t.abs).catch(() => null)
   if (source === null) throw new ProjectWriteError(404, `'${t.rel}' does not exist`)
   const destAbs = path.join(t.parentAbs, newName)
-  for (const denied of deniedRoots ?? []) {
-    if (within(denied, destAbs)) refuse(`'${newName}' is inside protected storage`)
-  }
+  if ((await protection(root, destAbs, deniedRoots)).inside) refuse(`'${newName}' is inside protected storage`)
   const existing = await fs.lstat(destAbs).catch(() => null)
-  // Same inode means a case-only rename on a case-insensitive volume.
-  if (existing !== null && !(existing.ino === source.ino && existing.dev === source.dev)) {
+  // The same inode is fine only for a case or normalization rename of one entry;
+  // a hard link of the file would turn the POSIX rename into a silent no-op.
+  const sameEntry = existing !== null && existing.ino === source.ino && existing.dev === source.dev && fold(newName) === fold(t.name)
+  if (existing !== null && !sameEntry) {
     throw new ProjectWriteError(409, `'${newName}' already exists`)
   }
   await fs.rename(t.abs, destAbs)
@@ -137,7 +199,7 @@ export async function renameProjectEntry(root: string, rawPath: string, newName:
 
 export async function deleteProjectEntry(root: string, rawPath: string, deniedRoots?: readonly string[]): Promise<{ path: string }> {
   const t = await target(root, rawPath, deniedRoots)
-  await refuseProtectedDescendant(t.abs, t.rel, deniedRoots)
+  await refuseProtectedDescendant(root, t.abs, t.rel, deniedRoots)
   const source = await fs.lstat(t.abs).catch(() => null)
   if (source === null) throw new ProjectWriteError(404, `'${t.rel}' does not exist`)
   // `rm` removes a link itself and never descends into its target.
