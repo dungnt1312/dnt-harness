@@ -145,11 +145,15 @@ describe('Plan MCP exposure (concrete allowlist + read-safe name)', () => {
     })
   })
 
-  it('Explorer children get no MCP even when the ceiling lists it', () => {
-    const scope: ExposureScope = { ...ROOT, sessionId: 'c', childOf: { definition: 'explorer', toolCeiling: ['Read', 'mcp__s__get_item'] } }
+  it('bundled Explorer gets no MCP even when the ceiling lists it; an override explorer is an ordinary role', () => {
     const state = snap(FULL, [server('s', true, ['get_item'])])
-    expect(exposureRefusal(state, scope, 'mcp__s__get_item')).toMatch(/Explorer/)
-    expect(isToolExposed(state, scope, 'Read')).toBe(true)
+    for (const definitionSource of ['bundled', undefined] as const) {
+      const scope: ExposureScope = { ...ROOT, sessionId: 'c', childOf: { definition: 'explorer', definitionSource, toolCeiling: ['Read', 'mcp__s__get_item'] } }
+      expect(exposureRefusal(state, scope, 'mcp__s__get_item')).toMatch(/Explorer/)
+      expect(isToolExposed(state, scope, 'Read')).toBe(true)
+    }
+    const override: ExposureScope = { ...ROOT, sessionId: 'c', childOf: { definition: 'explorer', definitionSource: 'workspace', toolCeiling: ['Read', 'mcp__s__get_item'] } }
+    expect(exposureRefusal(state, override, 'mcp__s__get_item')).toBeUndefined()
   })
 
   it('host blockedTools globs win first, and a child cannot call Agent', () => {
@@ -176,6 +180,33 @@ describe('resolver contract (hermetic; wiring is covered by the real-host suites
     expect(await authority.refusal(undefined, 'Bash')).toMatch(/host blockedTools/)
     // A complete host scope is evaluated normally.
     expect(await authority.refusal(ROOT, 'Read')).toBeUndefined()
+  })
+
+  it('admissionCeiling expands MCP selectors against live tools, then applies the shared predicate', async () => {
+    const authority = createExecutionAuthority({
+      blockedTools: [],
+      modeOf: () => ({ mode: FULL, revision: 1 }),
+      loadMcp: async () => config([server('s', true), server('off', false)]),
+      mcpToolNames: async () => ['mcp__s__get_item', 'mcp__s__delete_item', 'mcp__off__get_item'],
+    })
+    const input = { workspaceId: 'w', rootSessionId: 'r', definition: 'worker', definitionSource: 'workspace' as const }
+    expect(await authority.admissionCeiling({ ...input, candidates: ['Read', 'mcp__*'] }))
+      .toEqual(['Read', 'mcp__s__get_item', 'mcp__s__delete_item'])
+    expect(await authority.admissionCeiling({ ...input, candidates: ['mcp__s__*'] }))
+      .toEqual(['mcp__s__get_item', 'mcp__s__delete_item'])
+    expect(await authority.admissionCeiling({ ...input, definition: 'explorer', definitionSource: 'bundled', candidates: ['Read', 'mcp__*'] }))
+      .toEqual(['Read'])
+  })
+
+  it('admissionCeiling under Plan keeps only read-safe allowlisted MCP', async () => {
+    const authority = createExecutionAuthority({
+      blockedTools: [],
+      modeOf: () => ({ mode: PLAN, revision: 1 }),
+      loadMcp: async () => config([server('s', true, ['get_item', 'delete_item'])]),
+      mcpToolNames: async () => ['mcp__s__get_item', 'mcp__s__delete_item'],
+    })
+    expect(await authority.admissionCeiling({ workspaceId: 'w', rootSessionId: 'r', definition: 'scout', definitionSource: 'workspace', candidates: ['Read', 'mcp__*'] }))
+      .toEqual(['Read', 'mcp__s__get_item'])
   })
 
   it('stale fabricated call: the live gate reads current authority, not a prior projection', async () => {

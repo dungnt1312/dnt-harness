@@ -16,6 +16,8 @@
 import type { McpExposure, ModeDefinition } from '../harness/modes/types.ts'
 import type { McpConfig } from '../harness/mcp/config.ts'
 import { configRevision } from '../harness/mcp/config-v2.ts'
+import type { AgentSource } from '../harness/agents/definition-service.ts'
+import { isBundledExplorer, isMcpSelector, matchesMcpEntry } from '../harness/agents/mcp-candidates.ts'
 
 /** Plan-mode read-safe name prefix heuristic (not a side-effect guarantee). */
 export const READ_SAFE_TOOL_NAME = /^(read|get|list|search|query|fetch|inspect|describe)/i
@@ -34,6 +36,8 @@ export interface ExposureScope {
   readonly rootSessionId?: string | undefined
   readonly childOf?: {
     readonly definition: string
+    /** Provenance; only the bundled explorer is MCP-free. Unknown = bundled. */
+    readonly definitionSource?: AgentSource | undefined
     readonly toolCeiling?: readonly string[] | undefined
   } | undefined
   /** A root running as an agent role: its pinned ceiling narrows exposure like a child's. */
@@ -77,6 +81,11 @@ export interface ExposureDeps {
   /** Owning-root mode for the scope (sync, durable-log backed). */
   readonly modeOf: (scope: ExposureScope, workspaceId: string) => { readonly mode: ExposureMode; readonly revision: number }
   readonly loadMcp: (workspaceId: string) => Promise<McpConfig>
+  /**
+   * Live MCP tool names for selector expansion at spawn admission. Absent:
+   * selectors expand to nothing (fail-closed).
+   */
+  readonly mcpToolNames?: (workspaceId: string) => Promise<readonly string[]>
 }
 
 export interface ParsedMcpName {
@@ -128,7 +137,7 @@ export function exposureRefusal(snapshot: ExposureSnapshot, scope: ExposureScope
     // the only honest ceiling). Explorer sees none regardless of grant/mode.
     const mcpExposure = effectiveMcpExposure(mode)
     if (mcpExposure === 'none') return `mode '${mode.name}' exposes no MCP tools`
-    if (scope?.childOf?.definition === 'explorer') return 'Explorer exposes zero MCP tools'
+    if (scope?.childOf !== undefined && isBundledExplorer(scope.childOf.definition, scope.childOf.definitionSource)) return 'Explorer exposes zero MCP tools'
     const { server: serverName, tool: toolName } = parseMcpName(name)
     const server = snapshot.mcp?.servers[serverName]
     if (server === undefined || !server.enabled) return `MCP server '${serverName}' is not enabled in this workspace`
@@ -184,13 +193,16 @@ export interface ExecutionAuthority {
   readonly refusal: (scope: ExposureScope | undefined, name: string) => Promise<string | undefined>
   /**
    * Spawn admission ceiling for a child of `definition`: candidates exposed
-   * under the owning root's current authority. Called only at the executor's
+   * under the owning root's current authority. MCP selectors in `candidates`
+   * (`mcp__*`, `mcp__server__*`) expand against the live tool names first;
+   * the result holds concrete names only. Called only at the executor's
    * admission linearization point; the result is an immutable pinned maximum.
    */
   readonly admissionCeiling: (input: {
     readonly workspaceId: string
     readonly rootSessionId: string
     readonly definition: string
+    readonly definitionSource?: AgentSource | undefined
     readonly candidates: readonly string[]
   }) => Promise<readonly string[]>
 }
@@ -237,10 +249,16 @@ export function createExecutionAuthority(deps: ExposureDeps): ExecutionAuthority
         return error instanceof Error ? error.message : String(error)
       }
     },
-    async admissionCeiling({ workspaceId, rootSessionId, definition, candidates }) {
-      const scope: ExposureScope = { workspaceId, sessionId: rootSessionId, rootSessionId, childOf: { definition } }
-      const resolved = await snapshot(scope, workspaceId, candidates.some((name) => name.startsWith('mcp__')))
-      return candidates.filter((name) => isToolExposed(resolved, scope, name))
+    async admissionCeiling({ workspaceId, rootSessionId, definition, definitionSource, candidates }) {
+      const scope: ExposureScope = { workspaceId, sessionId: rootSessionId, rootSessionId, childOf: { definition, definitionSource } }
+      const selectors = candidates.filter(isMcpSelector)
+      const live = selectors.length > 0 && deps.mcpToolNames !== undefined ? await deps.mcpToolNames(workspaceId) : []
+      const expanded = [...new Set([
+        ...candidates.filter((name) => !isMcpSelector(name)),
+        ...live.filter((name) => selectors.some((selector) => matchesMcpEntry(selector, name))),
+      ])]
+      const resolved = await snapshot(scope, workspaceId, expanded.some((name) => name.startsWith('mcp__')))
+      return expanded.filter((name) => isToolExposed(resolved, scope, name))
     },
   }
 }
