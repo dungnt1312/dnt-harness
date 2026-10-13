@@ -681,6 +681,29 @@ describe('real host spawn-admission ceiling (executor admissionResolver -> share
     expect(explorer.status).toBe(400)
   }, 60_000)
 
+  it('a malformed MCP config degrades an inheriting role to no MCP instead of failing the spawn', async () => {
+    const provider: LlmProvider = {
+      name: 'scripted', models: ['scripted'],
+      async *stream() {
+        yield { type: 'delta', delta: 'done' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const { base, wsId } = await bootPlan(provider, undefined, { modeId: 'full-access' })
+    expect((await post(base, `/api/workspaces/${wsId}/agents/scout/import`, { dialect: 'dnt-harness', content: SCOUT_ROLE })).status).toBe(201)
+    const root = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+    const first = await post(base, `/api/workspaces/${wsId}/agents/scout`, { rootSessionId: root.id, task: { prompt: 'One.' } })
+    expect(first.status).toBe(202)
+    const child = (await first.json()) as { childSessionId: string }
+    await fetch(`${base}/api/workspaces/${wsId}/sessions/${root.id}/children/${child.childSessionId}?waitMs=10000`)
+    const configFile = (await fs.readdir(homes.at(-1)!, { recursive: true }))
+      .map(String).find((entry) => entry.endsWith(path.join(wsId, 'mcp.json')))
+    expect(configFile).toBeDefined()
+    await fs.writeFile(path.join(homes.at(-1)!, configFile!), '{ not json')
+    const second = await post(base, `/api/workspaces/${wsId}/agents/scout`, { rootSessionId: root.id, task: { prompt: 'Two.' } })
+    expect(second.status).toBe(202)
+  }, 40_000)
+
   it('an Explorer child excludes everything beyond its role under full-access', async () => {
     const run = await runChild({
       rootMode: 'full-access', role: 'explorer', grantTools: ['Read', 'Write', 'Bash'],

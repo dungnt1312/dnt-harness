@@ -257,8 +257,21 @@ export function createExecutionAuthority(deps: ExposureDeps): ExecutionAuthority
         ...candidates.filter((name) => !isMcpSelector(name)),
         ...live.filter((name) => selectors.some((selector) => matchesMcpEntry(selector, name))),
       ])]
-      const resolved = await snapshot(scope, workspaceId, expanded.some((name) => name.startsWith('mcp__')))
-      return expanded.filter((name) => isToolExposed(resolved, scope, name))
+      if (!expanded.some((name) => name.startsWith('mcp__'))) {
+        const resolved = await snapshot(scope, workspaceId, false)
+        return expanded.filter((name) => isToolExposed(resolved, scope, name))
+      }
+      // Like a root turn's pre-step, an unreadable MCP config degrades the
+      // child to no MCP rather than failing the spawn (fail-closed for MCP).
+      let resolved: ExposureSnapshot
+      let names = expanded
+      try {
+        resolved = await snapshot(scope, workspaceId, true)
+      } catch {
+        names = expanded.filter((name) => !name.startsWith('mcp__'))
+        resolved = await snapshot(scope, workspaceId, false)
+      }
+      return names.filter((name) => isToolExposed(resolved, scope, name))
     },
   }
 }

@@ -22,6 +22,12 @@ describe('mcp selectors', () => {
     expect(matchesMcpEntry('mcp__*', 'mcp__any__thing')).toBe(true)
     expect(matchesMcpEntry('mcp__*', 'Read')).toBe(false)
   })
+  it('a server selector never matches a server whose name extends it with __ (tool names never contain __)', () => {
+    expect(matchesMcpEntry('mcp__s__*', 'mcp__s__x__get')).toBe(false)
+    expect(isMcpSelector('mcp__a__b__*')).toBe(true)
+    expect(matchesMcpEntry('mcp__a__b__*', 'mcp__a__b__get')).toBe(true)
+    expect(matchesMcpEntry('mcp__a__b__*', 'mcp__a__get')).toBe(false)
+  })
 })
 
 describe('roleCandidates', () => {

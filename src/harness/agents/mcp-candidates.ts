@@ -9,13 +9,21 @@ import type { AgentDefinition, AgentSource } from './definition-service.ts'
 const isMcp = (name: string): boolean => name.startsWith('mcp__')
 
 export function isMcpSelector(name: string): boolean {
-  return name === 'mcp__*' || (isMcp(name) && name.endsWith('__*') && name.split('__').length === 3)
+  return name === 'mcp__*' || (isMcp(name) && name.endsWith('__*') && name.length > 'mcp____*'.length)
 }
 
+/**
+ * Server names may contain `__` but tool names never do (the host skips
+ * them), so `mcp__s__*` matches `mcp__s__<tool>` only when the remainder
+ * has no `__` — server `s` never captures server `s__x`'s tools.
+ */
 export function matchesMcpEntry(entry: string, tool: string): boolean {
   if (!isMcp(tool)) return false
   if (entry === 'mcp__*') return true
-  if (isMcpSelector(entry)) return tool.startsWith(entry.slice(0, -1))
+  if (isMcpSelector(entry)) {
+    const prefix = entry.slice(0, -1)
+    return tool.startsWith(prefix) && tool.length > prefix.length && !tool.slice(prefix.length).includes('__')
+  }
   return entry === tool
 }
 
