@@ -1,42 +1,34 @@
-import { useCallback, useEffect, useRef, useState, type Ref } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Icon from '../common/Icon.tsx'
+import ConfirmDialog from '../common/ConfirmDialog.tsx'
 import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import { Spinner } from '../common/Spinner.tsx'
+import { useToast } from '../common/Toast.tsx'
 import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
+import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import {
-  fetchGitDiff,
   fetchGitStatus,
+  updateProjectGitTrust,
   type GitChange,
-  type GitChangeStatus,
-  type GitDiffReport,
+  type GitOperationDone,
+  type GitOperationInput,
+  type GitStaging,
   type GitStatusReport,
 } from '../../lib/api.ts'
-import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
-import { DiffLines, LineCount, diffRowsFromUnified } from '../common/DiffLines.tsx'
-import { MediaPreview } from '../common/MediaPreview.tsx'
-import { cn } from '../../lib/cn.ts'
+import { GitChangeList, withPendingStages } from './GitChangeList.tsx'
+import { GitCommitArea } from './GitCommitArea.tsx'
+import { GitRemoteButton } from './GitRemoteButton.tsx'
+import { failureText, useGitOperation } from './use-git-operation.tsx'
+import { changeCounts, confirmationForEntries, primaryChangesActionStages, type GitConfirmation } from './git-panel-model.ts'
 import type { WorkbenchProject } from './Workbench.tsx'
 
-const STATUS_LABEL: Readonly<Record<GitChangeStatus, string>> = {
-  modified: 'Modified',
-  added: 'Added',
-  deleted: 'Deleted',
-  renamed: 'Renamed',
-  copied: 'Copied',
-  untracked: 'Untracked',
-  conflict: 'Conflict',
-}
-
-/** Letter shown before the file name, the same codes a git UI prints. */
-const STATUS_MARK: Readonly<Record<GitChangeStatus, string>> = {
-  modified: 'M', added: 'A', deleted: 'D', renamed: 'R', copied: 'C', untracked: 'U', conflict: '!',
-}
-
 /**
- * Read-only source control for the conversation's project: the changed files
- * with their added and removed line counts, and the diff of the one that is
- * open. It never stages, commits, or discards.
+ * Source control for the conversation's project: the changed files in Zed's
+ * sections with their added and removed line counts, the diff of the one that
+ * is open, and the staging, discard and trash actions. Every action goes
+ * through one queue, so operations on the repository never overlap; a staging
+ * click shows its result at once and rolls back if Git refuses.
  *
  * `pathFilter` narrows the list to the files one turn's Write/Edit calls
  * recorded (project-relative, from the TurnChangesCard's "Open in Git"). The
@@ -48,7 +40,7 @@ const STATUS_MARK: Readonly<Record<GitChangeStatus, string>> = {
  * rows here stays the user's own. When the focused file no longer differs
  * from HEAD, a note says so instead of an unexplained quiet list.
  */
-export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNonce, onOpenFile, onShowAll }: {
+export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNonce, onOpenFile, onShowAll, onGitTrustChange }: {
   readonly workspaceId: string
   readonly project: WorkbenchProject
   readonly pathFilter?: readonly string[]
@@ -58,12 +50,27 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
   /** Opens a changed file itself in the workbench, when a resolver is wired. */
   readonly onOpenFile?: (path: string) => void
   readonly onShowAll?: () => void
+  /** Tells the owner of the project list that the trust flag changed, so a remount does not show a stale banner. */
+  readonly onGitTrustChange?: (trusted: boolean) => void
 }) {
   const [report, setReport] = useState<GitStatusReport | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [openPath, setOpenPath] = useState<string | null>(focusPath ?? null)
   const generation = useRef(0)
+  const toast = useToast()
+  const git = useGitOperation(workspaceId, project.id)
+  // Git runs a repository's config and hooks only for a trusted project (off unless set).
+  const [trusted, setTrusted] = useState(project.gitTrusted === true)
+  const [trustBusy, setTrustBusy] = useState(false)
+  useEffect(() => { setTrusted(project.gitTrusted === true) }, [project.id, project.gitTrusted])
+  // Optimistic staging: a clicked control shows its result before Git answers.
+  const [pendingStages, setPendingStages] = useState<ReadonlyMap<string, GitStaging>>(() => new Map())
+  const inflight = useRef(new Map<string, number>())
+  const [running, setRunning] = useState(0)
+  const [confirm, setConfirm] = useState<PendingRevert | null>(null)
+  // Every Git action waits for the one before it, so the repository sees them in click order.
+  const queue = useRef<Promise<void>>(Promise.resolve())
 
   // The focused row lands at the top of the list with its diff below it — a
   // `nearest` scroll left it on the bottom edge and the diff out of view. The
@@ -107,6 +114,14 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
     // eslint-disable-next-line react-hooks/exhaustive-deps -- focus identity is the point
   }, [scrollFocusToTop, focusPath, focusNonce])
 
+  const applyReport = useCallback((next: GitStatusReport) => {
+    // A newer report than any status read still in flight.
+    generation.current++
+    setReport(next)
+    setLoading(false)
+    setOpenPath((current) => current !== null && next.changes.some((change) => change.path === current) ? current : null)
+  }, [])
+
   const load = useCallback(async () => {
     const request = ++generation.current
     setLoading(true)
@@ -126,9 +141,103 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
 
   useEffect(() => { void load() }, [load])
 
+  /** Run one Git operation; a failure is a toast with a View Log. Nothing is thrown. */
+  const run = git.run
+
+  /** Trust or restrict the project's Git config and hooks; the panel follows at once. */
+  const changeTrust = useCallback(async (next: boolean): Promise<void> => {
+    setTrustBusy(true)
+    try {
+      await updateProjectGitTrust(workspaceId, project.id, next)
+      setTrusted(next)
+      onGitTrustChange?.(next)
+      // Trust changes how git reads the repository (hooks, config), so the list may differ.
+      void load()
+    } catch (cause) {
+      toast.notify(failureText(cause), 'bad')
+    } finally {
+      setTrustBusy(false)
+    }
+  }, [workspaceId, project.id, toast, onGitTrustChange, load])
+
+  const enqueue = useCallback((task: () => Promise<void>): void => {
+    setRunning((count) => count + 1)
+    queue.current = queue.current.then(task).catch(() => {}).finally(() => setRunning((count) => count - 1))
+  }, [])
+
+  /** Stage or unstage; `all` uses the dedicated stage-all / unstage-all operations. */
+  const stage = useCallback((paths: readonly string[], intent: 'stage' | 'unstage', all = false): void => {
+    if (paths.length === 0) return
+    const target: GitStaging = intent === 'stage' ? 'staged' : 'unstaged'
+    setPendingStages((previous) => {
+      const next = new Map(previous)
+      for (const path of paths) next.set(path, target)
+      return next
+    })
+    for (const path of paths) inflight.current.set(path, (inflight.current.get(path) ?? 0) + 1)
+    const input: GitOperationInput = all ? { type: intent === 'stage' ? 'stage-all' : 'unstage-all' } : { type: intent, paths }
+    enqueue(async () => {
+      const done = await run(input)
+      // One commit: the answer replaces the report as the override goes away.
+      for (const path of paths) inflight.current.set(path, (inflight.current.get(path) ?? 1) - 1)
+      const settled = paths.filter((path) => inflight.current.get(path) === 0)
+      for (const path of settled) inflight.current.delete(path)
+      setPendingStages((previous) => {
+        const next = new Map(previous)
+        for (const path of settled) next.delete(path)
+        return next
+      })
+      if (done?.status !== undefined) applyReport(done.status)
+      else if (done?.ok === true) void load()
+    })
+  }, [enqueue, run, applyReport, load])
+
+  /** Ask before discarding or trashing; `menu` names a header menu action. */
+  const requestRevert = useCallback((entries: readonly GitChange[], menu?: 'tracked' | 'untracked'): void => {
+    const confirmation = confirmationForEntries(entries, menu)
+    if (confirmation !== null) setConfirm({ confirmation, entries })
+  }, [])
+
+  /** Tracked files are discarded, then untracked ones trashed, each as its own queued operation. */
+  const confirmRevert = useCallback((entries: readonly GitChange[]): void => {
+    setConfirm(null)
+    const tracked = entries.filter((entry) => !entry.created).map((entry) => entry.path)
+    const untracked = entries.filter((entry) => entry.created).map((entry) => entry.path)
+    enqueue(async () => {
+      for (const input of [
+        ...(tracked.length > 0 ? [{ type: 'discard', paths: tracked } as const] : []),
+        ...(untracked.length > 0 ? [{ type: 'trash', paths: untracked } as const] : []),
+      ]) {
+        const done = await run(input)
+        if (done?.status !== undefined) applyReport(done.status)
+        else if (done?.ok === true) void load()
+        if (done?.ok !== true) return
+      }
+    })
+  }, [enqueue, run, applyReport, load])
+
+  /** A commit, uncommit or remote operation answered: its status is the new report. */
+  const settleOperation = useCallback((done: GitOperationDone | undefined): void => {
+    if (done?.status !== undefined) applyReport(done.status)
+    else if (done?.ok === true) void load()
+  }, [applyReport, load])
+
   const all = report?.changes ?? []
   const filtered = pathFilter !== undefined && pathFilter.length > 0 ? all.filter((change) => pathFilter.includes(change.path)) : all
   const changes = filtered
+  // What the reader sees: a staging click already applied.
+  const shown = withPendingStages(changes, pendingStages)
+  const counts = changeCounts(shown)
+  const stages = primaryChangesActionStages(shown)
+  // Zed `staged_tracked_entries` (`is_staged_tracked`): "Discard Tracked Changes" acts on tracked files with something staged.
+  const trackedEntries = shown.filter((change) => !change.created && change.staging !== 'unstaged')
+  const untrackedEntries = shown.filter((change) => change.created)
+  const filteredView = pathFilter !== undefined && pathFilter.length > 0
+  // Zed `stage_all` / `unstage_all`; a turn filter keeps them to the files shown.
+  const stageHeader = (intent: 'stage' | 'unstage'): void => {
+    const paths = shown.filter((change) => intent === 'stage' ? change.staging !== 'staged' : change.staging !== 'unstaged').map((change) => change.path)
+    stage(paths, intent, !filteredView)
+  }
   const totals = changes.reduce((sum, change) => ({
     added: sum.added + (change.added ?? 0),
     removed: sum.removed + (change.removed ?? 0),
@@ -145,6 +254,13 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      {!trusted ? (
+        <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line bg-muted/40 px-2.5 text-[12px]">
+          <Icon name="lock" size={13} className="shrink-0 text-fg-muted" />
+          <span className="min-w-0 flex-1 truncate font-medium text-fg-muted" title="Git does not run this repository's config or hooks until you trust the folder.">Restricted Mode</span>
+          <Button size="sm" variant="outline" className="h-7 px-2.5" disabled={trustBusy} onClick={() => void changeTrust(true)}>Trust</Button>
+        </div>
+      ) : null}
       {pathFilter !== undefined && pathFilter.length > 0 ? (
         <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line bg-muted/40 px-2.5 text-[12px]">
           <Icon name="squarePen" size={13} className="shrink-0 text-fg-muted" />
@@ -172,6 +288,42 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
             {totals.removed > 0 ? <span className="text-bad">−{totals.removed}</span> : null}
           </span>
         ) : null}
+        {running > 0 ? <span role="status" aria-label="Running git operation" className="shrink-0"><Spinner size={12} /></span> : null}
+        {report !== null && changes.length > 0 ? (
+          <div className="flex shrink-0 items-center">
+            <Button size="sm" variant="outline" className="rounded-r-none border-r-0 px-2.5" onClick={() => stageHeader(stages ? 'stage' : 'unstage')}>
+              {stages ? 'Stage All' : 'Unstage All'}
+            </Button>
+            <Menu
+              label="More changes actions"
+              align="end"
+              triggerClassName="inline-flex h-8 w-7 shrink-0 items-center justify-center rounded-l-none rounded-r-full border border-line-strong text-fg hover:bg-hover"
+              trigger={() => <Icon name="chevron" size={12} />}
+            >
+              {(close) => (
+                <>
+                  <button type="button" role="menuitem" className={menuItemClass} disabled={!counts.hasUnstaged} onClick={() => { close(); stageHeader('stage') }}>Stage All</button>
+                  <button type="button" role="menuitem" className={menuItemClass} disabled={!counts.hasStaged} onClick={() => { close(); stageHeader('unstage') }}>Unstage All</button>
+                  <button type="button" role="menuitem" className={menuItemClass} disabled={trackedEntries.length === 0} onClick={() => { close(); requestRevert(trackedEntries, 'tracked') }}>Discard Tracked Changes</button>
+                  <button type="button" role="menuitem" className={menuItemClass} disabled={untrackedEntries.length === 0} onClick={() => { close(); requestRevert(untrackedEntries, 'untracked') }}>Trash Untracked Files</button>
+                </>
+              )}
+            </Menu>
+          </div>
+        ) : null}
+        {/* Not tied to the change list: a clean, trusted project can still be restricted again. */}
+        {trusted ? (
+          <Menu
+            label="Git options"
+            align="end"
+            triggerClassName="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-fg-muted hover:bg-hover hover:text-fg"
+            trigger={() => <Icon name="dots" size={14} />}
+          >
+            {(close) => (
+              <button type="button" role="menuitem" className={menuItemClass} disabled={trustBusy} onClick={() => { close(); void changeTrust(false) }}>Restrict Git</button>
+            )}
+          </Menu>
+        ) : null}
         <IconButton label="Refresh git status" onClick={() => void load()}><Icon name="refresh" size={14} /></IconButton>
       </div>
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto">
@@ -195,181 +347,59 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
             </p>
           </div>
         ) : (
-          <ul aria-label="Changed files" className="m-0 flex list-none flex-col p-1">
-            {changes.map((change) => (
-              <li key={change.path}>
-                <ChangeRow
-                  change={change}
-                  open={openPath === change.path}
-                  onToggle={() => {
-                    // The reader took over: a late diff must not yank the list back.
-                    pendingFocus.current = false
-                    setOpenPath((current) => current === change.path ? null : change.path)
-                  }}
-                  {...(focusPath === change.path ? { rowRef: focusRowRef } : {})}
-                  {...(onOpenFile !== undefined ? { onOpenFile: () => onOpenFile(change.path) } : {})}
-                />
-                {openPath === change.path ? (
-                  <DiffView
-                    key={change.path}
-                    workspaceId={workspaceId}
-                    projectId={project.id}
-                    path={change.path}
-                    {...(focusPath === change.path ? { onReady: onFocusedDiffReady } : {})}
-                    {...(onOpenFile !== undefined ? { onOpenFile: () => onOpenFile(change.path) } : {})}
-                  />
-                ) : null}
-              </li>
-            ))}
-          </ul>
+          <GitChangeList
+            workspaceId={workspaceId}
+            projectId={project.id}
+            report={report!}
+            visibleChanges={changes}
+            pendingStages={pendingStages}
+            onStage={(paths, intent) => stage(paths, intent)}
+            onDiscard={(entries) => requestRevert(entries)}
+            onTrash={(entries) => requestRevert(entries)}
+            openPath={openPath}
+            onToggleDiff={(path) => {
+              // The reader took over: a late diff must not yank the list back.
+              pendingFocus.current = false
+              setOpenPath((current) => current === path ? null : path)
+            }}
+            {...(focusPath !== undefined ? { focusPath, focusRowRef, onFocusedDiffReady } : {})}
+            {...(onOpenFile !== undefined ? { onOpenFile } : {})}
+          />
         )}
         {focusNote}
-        {report?.truncated === true ? <p className="m-0 px-3 py-2 text-xs text-fg-faint">Showing the first {changes.length} changed files.</p> : null}
       </div>
-    </div>
-  )
-}
-
-function ChangeRow({ change, open, onToggle, onOpenFile, rowRef }: {
-  readonly change: GitChange
-  readonly open: boolean
-  readonly onToggle: () => void
-  /** Opens the file itself in the workbench; absent without an opener. */
-  readonly onOpenFile?: () => void
-  /** The focused row (a chat card's file click), for a scroll into view. */
-  readonly rowRef?: Ref<HTMLButtonElement>
-}) {
-  const name = change.path.split('/').pop() ?? change.path
-  const directory = change.path.slice(0, change.path.length - name.length).replace(/\/$/, '')
-  return (
-    // One hover surface for the whole line, opener included: the band never
-    // breaks where the overlaid button begins.
-    <div className={cn('relative flex items-center rounded-md transition-colors hover:bg-hover group/row', open && 'bg-hover')}>
-      <button
-        ref={rowRef}
-        type="button"
-        aria-expanded={open}
-        title={change.previousPath !== undefined ? `${change.previousPath} → ${change.path}` : change.path}
-        onClick={onToggle}
-        className="flex min-h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px]"
-      >
-        <Icon name="chevronRight" size={12} className={cn('shrink-0 text-fg-faint transition-transform', open && 'rotate-90')} />
-        <span className={cn('w-3 shrink-0 text-center font-mono text-[11px] font-semibold', markColor(change.status))} aria-label={STATUS_LABEL[change.status]}>{STATUS_MARK[change.status]}</span>
-        <FileTypeIcon path={change.path} size={16} />
-        <span className="min-w-0 flex-1 truncate">
-          <span className={cn(change.status === 'deleted' && 'line-through')}>{name}</span>
-          {directory !== '' ? <span className="ml-1.5 text-fg-faint">{directory}</span> : null}
-        </span>
-        <LineCount
-          {...(change.added !== undefined ? { added: change.added } : {})}
-          {...(change.removed !== undefined ? { removed: change.removed } : {})}
-          className={cn(onOpenFile !== undefined && 'transition-opacity group-hover/row:opacity-0 group-has-[:focus-visible]/row:opacity-0 [@media(pointer:coarse)]:opacity-100')}
-        />
-      </button>
-      {onOpenFile !== undefined ? (
-        <IconButton
-          label={`Open ${name} in workbench`}
-          onClick={onOpenFile}
-          // Hover-revealed and overlaid on the row's right edge, so the
-          // actions take no room and never push the line counts; the counts
-          // themselves fade out underneath. `invisible` keeps the hidden
-          // button from intercepting the row's clicks. Always on for touch.
-          // Keyboard focus reveals it; a mouse click on the row (which keeps
-          // focus there) does not, or it would linger beside the diff's own.
-          className={OPENER_REVEAL_ROW}
-        >
-          <Icon name="fileText" size={12} />
-        </IconButton>
+      {/* The whole-project view only: a turn filter shows a subset, which is not what a commit would take. */}
+      {report !== null && !filteredView && (report.branch !== null || report.head !== null) ? (
+        <>
+          <GitCommitArea key={project.id} projectId={project.id} report={report} changes={shown} run={run} enqueue={enqueue} onDone={settleOperation} />
+          <div role="group" aria-label="Branch" className="flex h-11 shrink-0 items-center gap-1.5 border-t border-line px-2.5 text-[13px]">
+            <Icon name="gitBranch" size={13} className="shrink-0 text-fg-muted" />
+            {report.branchInfo !== null ? (
+              <>
+                <span className="min-w-0 flex-1 truncate font-medium" title={report.branchInfo.name}>{report.branchInfo.name}</span>
+                <GitRemoteButton key={project.id} branchInfo={report.branchInfo} run={run} onDone={settleOperation} />
+              </>
+            ) : (
+              // Detached HEAD: there is no branch to push, so only the commit is named.
+              <span className="min-w-0 flex-1 truncate font-mono text-fg-muted" title="HEAD is detached">{report.head?.sha.slice(0, 7) ?? ''}</span>
+            )}
+          </div>
+        </>
       ) : null}
+      <ConfirmDialog
+        open={confirm !== null}
+        title={confirm?.confirmation.title ?? ''}
+        confirmLabel={confirm?.confirmation.confirmLabel ?? ''}
+        {...(confirm?.confirmation.details !== undefined ? { body: <p className="m-0 whitespace-pre-line break-words">{confirm.confirmation.details}</p> } : {})}
+        onDismiss={() => setConfirm(null)}
+        onConfirm={() => { if (confirm !== null) confirmRevert(confirm.entries) }}
+      />
+      {git.dialogs}
     </div>
   )
 }
 
-function markColor(status: GitChangeStatus): string {
-  if (status === 'deleted' || status === 'conflict') return 'text-bad'
-  if (status === 'added' || status === 'untracked') return 'text-ok'
-  return 'text-warn'
+interface PendingRevert {
+  readonly confirmation: GitConfirmation
+  readonly entries: readonly GitChange[]
 }
-
-/** The unified diff of one changed file, loaded when its row opens. */
-function DiffView({ workspaceId, projectId, path, onReady, onOpenFile }: {
-  readonly workspaceId: string
-  readonly projectId: string
-  readonly path: string
-  /** Called once the diff (or its error) has rendered — the focused row's cue to scroll. */
-  readonly onReady?: () => void
-  /** Opens the file itself in the workbench; offered with an opener. */
-  readonly onOpenFile?: () => void
-}) {
-  const [diff, setDiff] = useState<GitDiffReport | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const name = path.split('/').pop() ?? path
-  const generation = useRef(0)
-  useEffect(() => {
-    if (diff !== null || error !== null) onReady?.()
-  }, [diff, error, onReady])
-
-  const load = useCallback(async () => {
-    const request = ++generation.current
-    setError(null)
-    try {
-      const next = await fetchGitDiff(workspaceId, projectId, path)
-      if (generation.current === request) setDiff(next)
-    } catch (cause) {
-      if (generation.current === request) setError(String(cause))
-    }
-  }, [workspaceId, projectId, path])
-
-  useEffect(() => { void load() }, [load])
-
-  if (error !== null) {
-    return (
-      <div className="flex items-center gap-2 py-1.5 pl-7 pr-2">
-        <span className="text-xs text-bad">Could not load diff</span>
-        <Button size="sm" variant="outline" onClick={() => void load()}>Retry</Button>
-      </div>
-    )
-  }
-  if (diff === null) return <div className="flex items-center gap-2 py-1.5 pl-7 text-xs text-fg-muted" role="status"><Spinner size={12} />Loading diff…</div>
-  // A binary the browser can render shows the media itself; the rest say so.
-  if (diff.binary) return <div className="relative py-1 pl-5 pr-2 group/diff"><MediaPreview workspaceId={workspaceId} projectId={projectId} path={path} /><DiffOpenFile name={name} {...(onOpenFile !== undefined ? { onOpenFile } : {})} /></div>
-  if (diff.lines.length === 0) return <p className="m-0 py-1.5 pl-7 pr-2 text-xs text-fg-muted">No textual diff.</p>
-  // The file header rows repeat the name the change row already shows and the
-  // hunk header is noise; row numbers are read from the hunk instead. The
-  // scroller keeps the focusable region — arrow keys scroll what holds focus —
-  // while the hover-revealed opener stays pinned to the frame's corner.
-  return (
-    <div className="relative border-y border-line bg-muted/40 group/diff">
-      <div className="overflow-x-auto" role="region" aria-label={`Diff of ${path}`} tabIndex={0}>
-        {diff.truncated ? <p className="m-0 border-b border-line bg-warn-soft px-3 py-1 text-xs text-warn">Diff is larger than 1 MB; only the beginning is shown.</p> : null}
-        <DiffLines rows={diffRowsFromUnified(diff.lines)} />
-      </div>
-      <DiffOpenFile name={name} {...(onOpenFile !== undefined ? { onOpenFile } : {})} />
-    </div>
-  )
-}
-
-/**
- * The diff frame's own file opener: hover-revealed, absolutely placed in the
- * frame's top-right corner so it takes no room in the scrolling body. `invisible`
- * keeps the hidden button from stealing clicks meant for the diff. It keeps the
- * surface background so the diff lines scroll beneath it, not through it.
- */
-function DiffOpenFile({ name, onOpenFile }: { readonly name: string; readonly onOpenFile?: () => void }) {
-  if (onOpenFile === undefined) return null
-  return (
-    <IconButton
-      label={`Open ${name} in workbench`}
-      onClick={onOpenFile}
-      className={OPENER_REVEAL_DIFF}
-    >
-      <Icon name="fileText" size={12} />
-    </IconButton>
-  )
-}
-
-/** Quiet 24px opener: no fill of its own, only a text-color change on hover. */
-const OPENER_BASE = 'absolute size-6 rounded-md text-fg-faint hover:bg-transparent hover:text-fg opacity-0 invisible transition-opacity focus-visible:visible focus-visible:opacity-100 [@media(pointer:coarse)]:visible [@media(pointer:coarse)]:opacity-100'
-const OPENER_REVEAL_ROW = cn(OPENER_BASE, 'right-1 top-1/2 -translate-y-1/2 group-hover/row:visible group-hover/row:opacity-100 group-has-[:focus-visible]/row:visible group-has-[:focus-visible]/row:opacity-100')
-// Over diff lines the opener needs a backdrop, or the code shows through it.
-const OPENER_REVEAL_DIFF = cn(OPENER_BASE, 'right-1.5 top-1.5 z-10 border border-line bg-surface/90 backdrop-blur-sm hover:bg-surface/90 group-hover/diff:visible group-hover/diff:opacity-100 group-has-[:focus-visible]/diff:visible group-has-[:focus-visible]/diff:opacity-100')

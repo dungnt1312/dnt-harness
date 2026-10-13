@@ -55,7 +55,13 @@ vi.mock('./api.ts', () => ({
     ? { path: '', entries: [{ name: 'src', path: 'src', kind: 'dir' }, { name: 'README.md', path: 'README.md', kind: 'file', size: 12 }] }
     : { path: folder, entries: [{ name: 'index.ts', path: 'src/index.ts', kind: 'file', size: 26 }] }),
   readProjectFile: vi.fn(async (_ws: string, _project: string, path: string) => ({path, size: 26, binary: false, truncated: false, content: "export const answer = 42\n<raw>\n" })),
-  fetchGitStatus: vi.fn(async () => ({ branch: "main", truncated: false, changes: [{ path: "docs/README.md", status: "modified", added: 1, removed: 2 }] })),
+  fetchGitStatus: vi.fn(async () => ({
+    branch: "main",
+    branchInfo: { name: "main", upstreamTrack: { kind: "none" } },
+    head: { sha: "abc1234", subject: "init", message: "init", hasParent: false },
+    truncated: false,
+    changes: [{ path: "docs/README.md", status: "modified", indexStatus: " ", worktreeStatus: "M", created: false, deleted: false, conflicted: false, staging: "unstaged", added: 1, removed: 2 }],
+  })),
   fetchGitDiff: vi.fn(async () => ({ path: "docs/README.md", binary: false, truncated: false, lines: [{ kind: "del", text: "npm run chat:mock" }, { kind: "add", text: "npm run chat" }] })),
 }))
 

@@ -830,6 +830,11 @@ function AppShell() {
     void refreshTerminalProjects()
   }, [activeWs, refreshTerminalProjects])
 
+  /** The Git view changed a project's trust: keep the listing current without waiting for a refresh. */
+  const recordGitTrust = useCallback((projectId: string, gitTrusted: boolean) => {
+    setProjects((previous) => previous.map((row) => (row.id === projectId ? { ...row, gitTrusted } : row)))
+  }, [])
+
   /** Drag-to-reorder sidebar folders: apply at once, then let the server confirm. */
   const reorderProjectFolders = useCallback(async (orderedIds: readonly string[]) => {
     if (activeWs === null || workspaceRef.current !== activeWs) return
@@ -1781,6 +1786,7 @@ function AppShell() {
       gitPathFilter={gitPathFilter}
       gitFocusPath={gitFocusPath}
       onClearGitFilter={clearGitPathFilter}
+      onGitTrustChange={recordGitTrust}
       context={{ meta, ...(modelDefaults !== null ? { globalDefaults: modelDefaults } : {}), ...(currentSessionModel !== undefined ? { sessionModel: currentSessionModel } : {}), ...(current !== null && currentSessionModelState?.status === 'loading' ? { sessionControlsStatus: 'loading' as const } : {}), ...(current !== null && currentSessionModelState?.status === 'error' ? { sessionControlsStatus: 'unavailable' as const } : {}), stream, sessionId: current, sessionFolder: currentProject?.path ?? null, eventCount: events.length, manifest, workspaceId: activeWs, running, modeLabel: envModeLabel, onCompacted: () => setCompactNonce((nonce) => nonce + 1), onOpenSettingsTab: (tab) => openSettings(tab) }}
     />
   )

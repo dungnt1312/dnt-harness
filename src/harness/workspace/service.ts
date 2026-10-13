@@ -395,7 +395,9 @@ export class WorkspaceService {
       throw new ScopeError('root-invalid', `'${rawPath}' is not a directory`)
     }
     const canonical = await fs.realpath(abs)
-    const updated: ProjectRecord = { ...record, path: canonical }
+    // Trust belongs to the folder it was granted for: a different folder starts untrusted.
+    const { gitTrusted: _trust, ...rest } = record
+    const updated: ProjectRecord = canonical === record.path ? { ...record, path: canonical } : { ...rest, path: canonical }
     this.projects.set(id, updated)
     await writeJson(this.projectPath(record.workspaceId, id), updated)
     return updated
@@ -415,6 +417,15 @@ export class WorkspaceService {
     }
     const { additionalDirectories: _previous, ...rest } = record
     const updated: ProjectRecord = directories.length > 0 ? { ...rest, additionalDirectories: [...directories] } : rest
+    this.projects.set(id, updated)
+    await writeJson(this.projectPath(record.workspaceId, id), updated)
+    return updated
+  }
+
+  /** Persist whether the project's own git configuration may run. */
+  async setProjectGitTrusted(id: ProjectId, workspaceId: WorkspaceId, trusted: boolean): Promise<ProjectRecord> {
+    const record = this.getProject(id, workspaceId)
+    const updated: ProjectRecord = { ...record, gitTrusted: trusted }
     this.projects.set(id, updated)
     await writeJson(this.projectPath(record.workspaceId, id), updated)
     return updated

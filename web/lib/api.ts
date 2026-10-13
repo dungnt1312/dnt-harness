@@ -600,17 +600,56 @@ export interface ProjectSearchResult {
 
 export type GitChangeStatus = 'modified' | 'added' | 'deleted' | 'renamed' | 'copied' | 'untracked' | 'conflict'
 
-/** One changed path from a read-only `git status`. */
+/** Zed `StageStatus`. */
+export type GitStaging = 'staged' | 'unstaged' | 'partial'
+
+/** One changed path from `git status` (mirrors `src/web/project-git.ts`). */
 export interface GitChange {
   readonly path: string
   readonly previousPath?: string
   readonly status: GitChangeStatus
+  /** Raw index (X) column of the porcelain code; `' '` when unmodified, `'?'` when untracked. */
+  readonly indexStatus: string
+  /** Raw worktree (Y) column of the porcelain code. */
+  readonly worktreeStatus: string
+  /** Zed `FileStatus::is_created`: added to the index or the worktree, or untracked. */
+  readonly created: boolean
+  readonly deleted: boolean
+  /** Unmerged. */
+  readonly conflicted: boolean
+  readonly staging: GitStaging
   readonly added?: number
   readonly removed?: number
 }
 
+/** How the current branch relates to its upstream (Zed `UpstreamTracking`). */
+export type GitUpstreamTrack =
+  | { readonly kind: 'tracked'; readonly ahead: number; readonly behind: number }
+  | { readonly kind: 'gone' }
+  | { readonly kind: 'none' }
+
+export interface GitBranchInfo {
+  readonly name: string
+  readonly upstream?: { readonly remote: string; readonly branch: string }
+  readonly upstreamTrack: GitUpstreamTrack
+}
+
+/** The latest commit on HEAD. */
+export interface GitHead {
+  readonly sha: string
+  readonly subject: string
+  /** The full commit message (subject and body), for Amend and Uncommit. */
+  readonly message: string
+  /** False for a root commit: there is nothing to uncommit to. */
+  readonly hasParent: boolean
+}
+
 export interface GitStatusReport {
   readonly branch: string | null
+  /** Current branch with its upstream; `null` when detached or not a repository. */
+  readonly branchInfo: GitBranchInfo | null
+  /** Latest commit; `null` when there is none. */
+  readonly head: GitHead | null
   readonly changes: readonly GitChange[]
   readonly truncated: boolean
   /** Commits ahead of the upstream, when the branch tracks one. */
@@ -672,6 +711,162 @@ export function stopSessionProcess(workspaceId: string, sessionId: string, proce
 /** Read-only unified diff of one root-relative path against HEAD. */
 export function fetchGitDiff(workspaceId: string, projectId: string, path: string): Promise<GitDiffReport> {
   return apiFetch(`${projectBase(workspaceId, projectId)}/git?path=${encodeURIComponent(path)}`).then((r) => json<GitDiffReport>(r))
+}
+
+/** The body of `POST …/git/:op`; `type` is the route's `:op`. Mirrors `parseGitOperation` in `src/web/server.ts`. */
+export type GitOperationInput =
+  | { readonly type: 'stage' | 'unstage' | 'discard' | 'trash'; readonly paths: readonly string[] }
+  | { readonly type: 'stage-all' | 'unstage-all' | 'uncommit' | 'fetch-all' }
+  | { readonly type: 'commit'; readonly message: string; readonly amend?: boolean; readonly signoff?: boolean; readonly noVerify?: boolean; readonly tracked?: boolean }
+  | { readonly type: 'fetch'; readonly remote: string }
+  | { readonly type: 'pull'; readonly remote: string; readonly branch?: string; readonly rebase?: boolean }
+  | { readonly type: 'push'; readonly remote: string; readonly branch: string; readonly upstreamBranch?: string; readonly setUpstream?: boolean; readonly force?: boolean }
+  /** Query: the remotes of a branch (`push` asks for the push remote; `all` lists every remote, as Push To and Fetch From do); answered in `done.remotes`. */
+  | { readonly type: 'remotes'; readonly branch: string; readonly push?: boolean; readonly all?: boolean }
+  /** Query: the remote refs containing HEAD; answered in `done.pushedTo`. */
+  | { readonly type: 'pushed-to' }
+
+/** A credential prompt Git raised while the operation runs. */
+export interface GitAskpassFrame {
+  readonly type: 'askpass'
+  readonly promptId: string
+  readonly operation: string
+  readonly prompt: string
+}
+
+/** The last frame of an operation. `status` can be absent (a failure before Git could report it). */
+export interface GitOperationDone {
+  readonly type: 'done'
+  readonly ok: boolean
+  readonly stdout: string
+  readonly stderr: string
+  readonly status?: GitStatusReport
+  /** The user cancelled a prompt, so Git was stopped. */
+  readonly cancelled?: boolean
+  readonly remotes?: readonly string[]
+  readonly pushedTo?: readonly string[]
+}
+
+export type GitOperationFrame = GitAskpassFrame | GitOperationDone
+
+/** The answer to a prompt: the password, or a cancel that stops Git. */
+export type GitAskpassAnswer = { readonly password: string } | { readonly cancel: true }
+
+/** Answer one prompt of a running operation (`POST …/git/askpass/:promptId`). The password is not echoed back. */
+export function answerGitAskpass(workspaceId: string, projectId: string, promptId: string, answer: GitAskpassAnswer): Promise<void> {
+  return apiFetch(`${projectBase(workspaceId, projectId)}/git/askpass/${encodeURIComponent(promptId)}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(answer),
+  }).then((r) => json<{ readonly answered: boolean }>(r)).then(() => undefined)
+}
+
+/** Trust (or stop trusting) a project's repository config and hooks for Git. */
+export function updateProjectGitTrust(workspaceId: string, projectId: string, gitTrusted: boolean): Promise<ProjectRow> {
+  return apiFetch(projectBase(workspaceId, projectId), {
+    method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ gitTrusted }),
+  }).then((r) => json<ProjectRow>(r))
+}
+
+function parseGitFrame(line: string): GitOperationFrame {
+  let frame: unknown
+  try {
+    frame = JSON.parse(line)
+  } catch {
+    throw new Error('Git operation stream carried a malformed frame')
+  }
+  const type = (frame as { readonly type?: unknown } | null)?.type
+  if (type !== 'askpass' && type !== 'done') throw new Error('Git operation stream carried an unknown frame')
+  return frame as GitOperationFrame
+}
+
+/** How long the stream is still read after an answer could not be delivered, before the request is aborted. */
+const GIT_ANSWER_GRACE_MS = 1_500
+
+/**
+ * Run one Git operation (`POST …/git/:op`). The response is NDJSON read as it
+ * arrives: each `askpass` frame goes to `onAskpass` straight away, and what it
+ * resolves to is posted back (a rejection cancels the prompt); the promise
+ * resolves with the `done` frame. The `signal` handed to `onAskpass` aborts when
+ * the stream finishes or fails, so a prompt dialog can close itself. A request
+ * refused before the stream starts is an `HttpError`. If the answer cannot be
+ * delivered, the stream is still read: a `done` frame that arrives resolves the
+ * promise (the operation ended on its own); if none arrives within
+ * `GIT_ANSWER_GRACE_MS`, the request is aborted, which cancels Git on the
+ * server, and the promise rejects with the delivery error.
+ */
+export async function gitOperation(
+  workspaceId: string,
+  projectId: string,
+  input: GitOperationInput,
+  onAskpass: (prompt: GitAskpassFrame, signal: AbortSignal) => Promise<GitAskpassAnswer>,
+): Promise<GitOperationDone> {
+  const { type, ...body } = input
+  const abort = new AbortController()
+  const streamEnded = new AbortController()
+  let graceTimer: ReturnType<typeof setTimeout> | undefined
+  const response = await apiFetch(`${projectBase(workspaceId, projectId)}/git/${type}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: abort.signal,
+  })
+  if (!response.ok) throw new HttpError(response.status, await response.text())
+  if (response.body === null) throw new Error('Git operation answered without a stream')
+
+  let failure: unknown
+  let finished = false
+  const answer = (prompt: GitAskpassFrame): void => {
+    void (async () => {
+      let reply: GitAskpassAnswer
+      try {
+        reply = await onAskpass(prompt, streamEnded.signal)
+      } catch {
+        reply = { cancel: true }
+      }
+      if (finished) return
+      await answerGitAskpass(workspaceId, projectId, prompt.promptId, reply)
+    })().catch((error: unknown) => {
+      if (finished) return
+      failure = error
+      // Git may still end by itself (the prompt was already cancelled there):
+      // keep reading for a short while before giving up on the operation.
+      graceTimer ??= setTimeout(() => { if (!finished) abort.abort() }, GIT_ANSWER_GRACE_MS)
+    })
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let pending = ''
+  const take = (line: string): GitOperationDone | undefined => {
+    if (line.trim() === '') return undefined
+    const frame = parseGitFrame(line)
+    if (frame.type === 'done') return frame
+    answer(frame)
+    return undefined
+  }
+  try {
+    for (;;) {
+      let chunk: ReadableStreamReadResult<Uint8Array>
+      try {
+        chunk = await reader.read()
+      } catch (error) {
+        throw failure ?? error
+      }
+      if (chunk.done) break
+      pending += decoder.decode(chunk.value, { stream: true })
+      for (let newline = pending.indexOf('\n'); newline >= 0; newline = pending.indexOf('\n')) {
+        const line = pending.slice(0, newline)
+        pending = pending.slice(newline + 1)
+        const done = take(line)
+        if (done !== undefined) return done
+      }
+    }
+    pending += decoder.decode()
+    const done = take(pending)
+    if (done !== undefined) return done
+    throw failure ?? new Error('Git operation ended without a result')
+  } finally {
+    finished = true
+    if (graceTimer !== undefined) clearTimeout(graceTimer)
+    streamEnded.abort()
+    reader.cancel().catch(() => {})
+  }
 }
 
 /** Bounded file-name search under a project root (composer mentions). */

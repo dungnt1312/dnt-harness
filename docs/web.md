@@ -182,11 +182,13 @@ tool root. The families, at a glance:
 | `PUT …/:wid/model`, `PUT …/:wid/thinking` | compatibility proxies: they verify workspace ownership, then mutate the **global** default above; new clients use `/api/model-defaults` |
 | `PUT …/:wid/mode`, `GET …/:wid/meta` | workspace-local default mode control for new conversations and draft UI. Existing roots keep their own selected mode. The `GET …/mode` catalog lists **enabled modes only** (a disabled mode refused for selection answers `400`); `GET …/meta` returns the workspace default's `permissionDefaults`, `mode`, and `yolo` when enabled; it does not return a policy or effective-policy overlay. |
 | `GET …/:wid/modes`, `GET/PUT/DELETE …/:wid/modes/:mid`, `POST …/:wid/modes/:mid/duplicate`, `PUT …/:wid/modes/:mid/enabled` | mode **authoring**, separate from workspace-default and conversation selection. The catalog carries each mode's `enabled` flag, `toolExposure`, and `permissionDefaults`; the single-mode read returns raw Markdown plus a hash, and `PUT` takes `{ content, expectedHash? }` (required when replacing an existing file). Bundled modes are read-only (`400`), a stale or missing update hash is `409`, and invalid content is rejected before anything is written. `PUT …/enabled` takes `{ enabled: boolean }`: it shows or hides a mode in this workspace's picker — bundled modes may be hidden too, disabling the workspace default is `409` (select another first), the disabled set persists beside the mode files, and saving a mode always re-enables it. `edit-automatically` starts hidden from the picker (`DEFAULT_HIDDEN_MODE_IDS`) unless the workspace already selected it, yet stays selectable by id; enabling it records an explicit show. The `GET …/mode` picker rows carry each mode's `description` when it has one. `GET/PUT …/:wid/sessions/:id/mode` reads or switches one root's live mode; the switch is durable and governs its next model request or unstarted tool gate, including its children, without affecting sibling roots. |
-| `…/:wid/projects` (+ `/projects/:pid`) | project binding: working folder, ownership, overlap rejection. `PATCH` also takes `additionalDirectories: [{ kind: "path", path, access } \| { kind: "project", projectId, access }]` (browser principal only, every folder validated); retargeting is `409` while any turn — this project's or another's through a grant — holds a write lease inside it |
+| `…/:wid/projects` (+ `/projects/:pid`) | project binding: working folder, ownership, overlap rejection. `PATCH` also takes `additionalDirectories: [{ kind: "path", path, access } \| { kind: "project", projectId, access }]` (browser principal only, every folder validated) and `gitTrusted: boolean` (browser principal only; lifts Git's Restricted Mode, cleared when the folder is retargeted unless the same request sets it); retargeting is `409` while any turn — this project's or another's through a grant — holds a write lease inside it |
 | `GET …/:wid/projects/:pid/(files\|file\|search)` | project browsing: one directory listing, one file body, and a bounded file-name search (composer mentions and the explorer search box) |
 | `POST\|PATCH\|DELETE …/:wid/projects/:pid/files` | explorer writes, a direct user action independent of any session mode: `POST {path, kind: 'file'\|'dir'}` creates (201), `PATCH {path, name}` renames in the same folder, `DELETE ?path=` deletes permanently (folders recursively). Never overwrites (409), refuses the project root, `.git`, traversal, links out of the root in a parent folder and protected storage (400); a link in the last segment is renamed or removed itself, never followed. Archived workspaces refuse writes |
 | `GET …/:wid/projects/:pid/media(?path=)` | stream one project file as renderable media for previews: images by magic bytes, audio/video by extension; anything else is 404. Honours single byte `Range` requests (seeking) and `HEAD`; capped at 64 MB; traversal refused |
-| `GET …/:wid/projects/:pid/git(?path=)` | read-only git: status (branch, changed paths, added/removed counts) with no `path`, or one file's unified diff against HEAD (untracked files diff as all additions; a repository with no commit diffs the staged index). Not a repository answers an empty status; traversal is refused. Nothing is staged or written |
+| `GET …/:wid/projects/:pid/git(?path=)` | git reads: status with no `path` (`branch` name, structured `branchInfo` with upstream and ahead/behind track, `head`, per-path `staging`/`created`/`deleted`/`conflicted`, `ahead`/`behind`, `truncated`), or one file's unified diff against HEAD (untracked files diff as all additions; a repository with no commit diffs the staged index). Not a repository answers an empty status; traversal is refused. Reads never write, but they are **trust-aware**: an untrusted project (the default) runs git with hooks, external diff drivers, `core.sshCommand`, credential helpers and `ext::` transports disabled |
+| `POST …/:wid/projects/:pid/git/:op` | writable Git panel actions: `stage`, `unstage`, `discard`, `trash`, `stage-all`, `unstage-all`, `commit` (wire fields `message`, `amend`, `signoff`, `noVerify`, `tracked`; the UI labels `noVerify` "Skip Hooks"), `uncommit`, `fetch`, `fetch-all`, `pull`, `push`, plus the queries `remotes` and `pushed-to`. The response is **NDJSON** (`application/x-ndjson`): zero or more `askpass` frames while git waits for a credential, one passphrase or GPG pin, then a single `done { ok, stdout, stderr, status?, cancelled? }`; `status` is the fresh report, but is **optional** — it is absent when re-reading the status fails after the operation (a late failure), so a client must not assume it. The queries answer in the same frame: `remotes` in `done.remotes`, `pushed-to` in `done.pushedTo`. A malformed request is `400` before the stream starts; git's own failure is a normal stream with `done.ok === false`; a client that disconnects cancels the operation. Browser principal only (bearer tokens and unpaired callers are `401`), archived workspaces refuse, and the existing auth and CSRF checks apply unchanged. Every path is contained in the project and follows `--`; remote and branch names are validated before any network call. Operations on one repository run through a **single queue** (keyed by real path), and status is re-read inside the queue slot |
+| `POST …/:wid/projects/:pid/git/askpass/:promptId` | answers one askpass prompt with exactly `{ password: string }` or `{ cancel: true }`; only the browser session that started the operation may answer (another paired browser is `401`), an unknown or expired prompt is `404`, and a malformed body is a fixed `400` that never echoes the text. Passwords are never logged or echoed |
 | `…/:wid/terminals` (+ `/events` SSE, `/:tid` DELETE, `/:tid/(input\|resize)`) | interactive Workbench terminals: PTY lifecycle, one multiplexed output stream per workspace — see the terminal section |
 | `POST …/:wid/attachments`, `GET …/:wid/attachments/:id` | composer attachments: upload (content-addressed by sha256, verified media type) and serve (immutable, workspace-scoped) |
 | `…/:wid/agents/:name` (GET resolve / DELETE), `POST …/:wid/agents/:name` | agent definitions; POST spawns a bounded child from `task: { prompt, requiredResult }` or the four-field `task: { objective, constraints, references, requiredResult }`, optionally `inherit: "brief"`, `model` (`provider:model`) and `grantTools`. 202 with the handle (+ `inheritedChars`, `note`); an empty brief, a bad `inherit`, or a role that refuses inheritance is 400 |
@@ -866,7 +868,7 @@ graceful close and a second to an immediate exit.
 | `components/session` | project-grouped and time-bucketed conversation list |
 | `components/chat` | `Transcript`, message/tool/delegation rows, thinking, work status, approvals |
 | `components/composer` | `Composer` with attach/mode/thinking/permission chips, `ModelMenu` beside Send, `@`/`/` completion popover, attachment tray, folder picker |
-| `components/workbench` | Files browser/viewer with create/rename/delete, Git (read-only status and diff), Trajectory (`projectTrajectory`, step slots), Subagents, and the lazily-loaded xterm `TerminalPanel` |
+| `components/workbench` | Files browser/viewer with create/rename/delete, Git (Zed-style writable change list, commit box, remote buttons, askpass modal, output log and Restricted Mode banner), Trajectory (`projectTrajectory`, step slots), Subagents, and the lazily-loaded xterm `TerminalPanel` |
 | `components/settings` | Settings dialog and provider editor; one module per workspace panel (Projects, Skills, Memory, Agents, MCP, Hooks, Secrets) built on the shared `settings-kit` |
 | `components/ui` | Tailwind/CVA primitives with Radix interaction mechanics |
 | `components/common` | icons, copy, confirmation, error, spinner, and toast surfaces |
@@ -931,8 +933,8 @@ rest are opened on demand from the nav's `+` picker and closed again from their
 tab, so the strip keeps room for opened file tabs. A stored strip that still names
 the retired Artifacts view drops it on load. Files browses and also creates, renames
 and deletes files and folders — a direct user action independent of the session mode;
-delete is permanent after confirmation. Git and Trajectory are read-only
-projections; Git asks the host for `git status` and one file's diff and never stages, commits, or discards; Context is read-only apart from its confirmed Compact. Subagents only
+delete is permanent after confirmation. Git is writable too (below). Trajectory is a
+read-only projection; Context is read-only apart from its confirmed Compact. Subagents only
 follows the open conversation's children — delegating is the model's job through
 its `Agent` tool, and roles live in Settings → Agents. It groups them into
 **Running** and **Ended** (newest first); a row is titled by the first line of the
@@ -959,6 +961,41 @@ written); appearance (System/Light/Dark) is stored under
 `dnt-harness.drafts.v1` (text only — never `sending` or an error, which describe a
 request that no longer exists). None of these are server settings. See
 [design guidelines](design-guidelines.md) and [design system](design-system.md).
+
+The **Git** view is a port of Zed's Git panel and is the one writable Workbench
+view. Its actions (stage/unstage per file or section, Discard, Trash, Commit with
+Amend/Signoff/Skip Hooks, Uncommit, Fetch, Pull, Push) are direct user UI actions:
+each is a click that POSTs to the Git action route, never a model tool call, and the
+route keeps the existing browser-principal auth and CSRF checks. Git runs in the
+user's **login-shell environment** (`$SHELL -l -i`, captured once per folder for the
+server's lifetime, falling back to the server environment), so `PATH`, `ssh-agent`
+and credential helpers match the user's terminal. A project starts in **Restricted
+Mode**: hooks, external diff, `core.sshCommand`, credential helpers and `ext::`
+transports are disabled, a banner says so, and **Trust** (`PATCH …/projects/:pid
+{ gitTrusted: true }`, persisted on the project and cleared when the folder is
+retargeted) lifts the limits; **Restrict Git** reverses it. Commit hooks therefore run
+only for a trusted project, and Skip Hooks adds `--no-verify`.
+
+*Restricted Mode limits.* Like Zed, untrusted mode disables hooks, the credential
+helper, `core.sshCommand`, the `ext::` protocol and external diff drivers. Other
+repository config is not overridden — `textconv`, `gpg.program`, clean/smudge
+filters and `uploadpack` still apply — so an explicit write action in an untrusted
+repository can still run a program the repository configured. Opening the panel
+does not run hooks.
+
+Commit, fetch, pull
+and push prompt through **askpass**: git's `GIT_ASKPASS` (and a `gpg.program`
+wrapper for signing passphrases and PINs) talks to a per-operation Unix socket
+(a named pipe on Windows), the server streams an `askpass` NDJSON frame, and the
+panel shows a modal with the exact prompt (masked unless it asks for a username or a
+yes/no answer) whose answer goes to the askpass route; Cancel or a closed stream
+kills git's process group. Discard restores tracked files from `HEAD`; Trash moves
+untracked files to the **OS trash** (macOS Trash, `gio trash`, Windows Recycle Bin),
+never deleting them. All actions of a repository share one **queue**, and rapid
+stage clicks are applied optimistically and sent in order. A failure shows a
+persistent toast with **View Log**; a successful remote action toasts Zed's summary
+and, when the remote prints one, a pull-request link. Stash, branch picker, history,
+multi-file diff, AI messages and clone/init are not part of this port.
 
 Context manifest loading is lazy and uses the existing endpoint only while the
 sheet is open, Context is selected, a valid conversation exists, and the turn is
