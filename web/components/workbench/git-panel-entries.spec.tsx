@@ -211,3 +211,44 @@ describe('conflicts marked as resolved (Zed git_panel.rs:5947-5965, 8212-8286)',
     expect(header!.title).toBe('All conflicts marked as resolved')
   })
 })
+
+describe('keys typed inside a row\'s own controls and its menus do not act on the row', () => {
+  const key = async (target: Element, name: string): Promise<void> => {
+    await act(async () => { target.dispatchEvent(new KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true })) })
+  }
+
+  it('Space on a menu item (rendered in a portal, but inside the row in the React tree) does not stage the file', async () => {
+    await mount()
+    await contextMenu(row('a.ts'))
+    await key(menuItem('Copy Path'), ' ')
+    await key(menuItem('Copy Path'), 'ArrowDown')
+    expect(gitOperation).not.toHaveBeenCalled()
+    // the menu keeps its own arrow handling: the selection did not move to another row
+    expect(row('a.ts').getAttribute('aria-current')).toBe('true')
+  })
+
+  it('Space on the row\'s stage checkbox and on its ⋯ button does not also stage through the row handler', async () => {
+    await mount()
+    await key(document.querySelector('button[role="checkbox"][aria-label="Stage src/a.ts"]')!, ' ')
+    await key(document.querySelector('button[aria-label="Actions for a.ts"]')!, ' ')
+    expect(gitOperation).not.toHaveBeenCalled()
+  })
+
+  it('Enter on the row\'s opener button does not open the file a second time', async () => {
+    const onOpenFile = vi.fn()
+    await mount({ onOpenFile })
+    await key(document.querySelector('button[aria-label="Open a.ts in workbench"]')!, 'Enter')
+    expect(onOpenFile).not.toHaveBeenCalled()
+  })
+
+  it('the row\'s own button still handles Space, ArrowDown and Enter', async () => {
+    const onOpenFile = vi.fn()
+    await mount({ onOpenFile })
+    await key(row('a.ts'), ' ')
+    await act(async () => { await vi.waitFor(() => expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'stage', paths: ['src/a.ts'] })) })
+    await key(row('a.ts'), 'Enter')
+    expect(onOpenFile).toHaveBeenCalledWith('src/a.ts')
+    await key(row('a.ts'), 'ArrowDown')
+    expect([...document.querySelectorAll('[data-row-main]')].filter((button) => button.getAttribute('aria-current') === 'true')).toHaveLength(1)
+  })
+})

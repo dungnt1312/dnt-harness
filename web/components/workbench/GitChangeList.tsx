@@ -113,6 +113,10 @@ export function GitChangeList({
   }
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>, change: GitChange): void => {
+    // Only the row's own button drives the list: a key typed in its checkbox,
+    // opener, ⋯ button or a menu (which React still bubbles through the row
+    // even though it renders in a portal) belongs to that control.
+    if (!(event.target instanceof HTMLElement) || !event.target.hasAttribute('data-row-main')) return
     if (event.key === 'ArrowDown') { event.preventDefault(); move(change, 1) }
     else if (event.key === 'ArrowUp') { event.preventDefault(); move(change, -1) }
     else if (event.key === ' ') { event.preventDefault(); onStage([change.path], stageIntent(change.staging)) }
