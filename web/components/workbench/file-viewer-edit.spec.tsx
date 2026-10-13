@@ -40,10 +40,10 @@ beforeEach(() => {
 afterEach(async () => { if (root) await act(async () => root!.unmount()); root = undefined; host?.remove(); vi.clearAllMocks(); confirmSpy.mockRestore() })
 
 /** Owns the draft like useWorkbenchFiles, so remounting the viewer keeps it. */
-function Harness({ path, viewerKey }: { path: string; viewerKey: number }) {
+function Harness({ path, viewerKey, showViewer = true }: { path: string; viewerKey: number; showViewer?: boolean }) {
   const [draft, setDraft] = useState<FileDraft | null>(null)
   ;(globalThis as { __draft?: FileDraft | null }).__draft = draft
-  return <FileViewer key={viewerKey} workspaceId="w1" projectId="p1" projectPath="/proj" path={path} draft={draft} onDraft={setDraft} />
+  return showViewer ? <FileViewer key={viewerKey} workspaceId="w1" projectId="p1" projectPath="/proj" path={path} draft={draft} onDraft={setDraft} /> : null
 }
 
 async function mount(path = 'src/a.ts', viewerKey = 1) {
@@ -116,6 +116,41 @@ it('keeps the draft when the viewer remounts (tab switch)', async () => {
   await act(async () => root!.render(<Harness path="src/a.ts" viewerKey={2} />))
   await act(async () => { await vi.waitFor(() => expect(host.querySelector('textarea')).not.toBeNull()) })
   expect(area().value).toBe('draft\n')
+})
+
+it('clears the draft when a save resolves after the viewer unmounted', async () => {
+  await mount()
+  await act(async () => byLabel('Edit file')!.click())
+  await type('two\n')
+  let finish!: (value: { path: string; size: number; hash: string }) => void
+  saveProjectFile.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+  await save()
+  await act(async () => root!.render(<Harness path="src/b.ts" viewerKey={2} showViewer={false} />))
+  expect((globalThis as { __draft?: FileDraft | null }).__draft?.dirty).toBe(true)
+  await act(async () => finish({ path: 'src/a.ts', size: 4, hash: 'h-4' }))
+  expect((globalThis as { __draft?: FileDraft | null }).__draft).toBeNull()
+})
+
+it('Overwrite saves even when the draft was edited back to the disk content', async () => {
+  await mount()
+  await act(async () => byLabel('Edit file')!.click())
+  await type('mine\n')
+  disk = { ...disk, content: 'agent\n', hash: 'h-agent' }
+  await save()
+  await type('one\n')
+  await act(async () => button('Overwrite').click())
+  expect(saveProjectFile).toHaveBeenLastCalledWith('w1', 'p1', 'src/a.ts', 'one\n', 'h-agent')
+})
+
+it('drops a clean draft restored after the disk changed', async () => {
+  await mount()
+  await act(async () => byLabel('Edit file')!.click())
+  expect(area().value).toBe('one\n')
+  disk = { ...disk, content: 'agent\n', hash: 'h-agent' }
+  await act(async () => root!.render(<Harness path="src/a.ts" viewerKey={2} />))
+  await act(async () => { await vi.waitFor(() => expect(host.textContent).toContain('agent')) })
+  expect(host.querySelector('textarea')).toBeNull()
+  expect((globalThis as { __draft?: FileDraft | null }).__draft).toBeNull()
 })
 
 it('offers no Edit for memory, skill, binary or non-editable files', async () => {

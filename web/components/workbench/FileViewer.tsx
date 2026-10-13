@@ -47,6 +47,11 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
   const savingRef = useRef(false)
   // A save outlives a tab switch; its result must not touch the draft of a viewer that is gone.
   const mounted = useRef(true)
+  // load() outlives the render that started it, so it reads the draft through refs.
+  const draftRef = useRef(draft)
+  const onDraftRef = useRef(onDraft)
+  draftRef.current = draft
+  onDraftRef.current = onDraft
   useEffect(() => {
     mounted.current = true
     return () => { mounted.current = false }
@@ -72,7 +77,12 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
         : memory !== null
           ? await readMemoryFile(workspaceId, memory.file, memory.projectId)
           : await readProjectFile(workspaceId, projectId, path)
-      if (generation.current === request) setFile(next)
+      if (generation.current === request) {
+        setFile(next)
+        // A clean draft is only a copy of the old disk text; showing it would hide the newer file.
+        const kept = draftRef.current
+        if (kept !== null && !kept.dirty && kept.baseHash !== next.hash && mounted.current) onDraftRef.current(null)
+      }
     } catch (cause) {
       if (generation.current === request) setError(String(cause))
     } finally {
@@ -85,17 +95,18 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
   const clearEditState = (): void => { setSaveError(null); setConflict(null) }
 
   /** Writes the draft; `expectedHash` is the draft's base unless Overwrite supplies the current disk hash. */
-  const save = async (expectedHash: string): Promise<void> => {
-    if (draft === null || file === null || !draft.dirty || savingRef.current) return
+  const save = async (expectedHash: string, force = false): Promise<void> => {
+    if (draft === null || file === null || (!draft.dirty && !force) || savingRef.current) return
     savingRef.current = true
     setSaving(true)
     setSaveError(null)
     try {
       const result = await saveProjectFile(workspaceId, projectId, path, draft.text, expectedHash)
+      // The file is written whether or not this viewer is still around, so the draft goes either way.
+      onDraft(null)
       if (!mounted.current) return
       setFile({ ...file, content: draft.text, size: result.size, hash: result.hash })
       clearEditState()
-      onDraft(null)
     } catch (cause) {
       if (!mounted.current) return
       if (cause instanceof SaveConflictError) {
@@ -129,7 +140,7 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
 
   const overwrite = (): void => {
     if (conflict === null || !window.confirm('Overwrite the file on disk with your changes?')) return
-    void save(conflict)
+    void save(conflict, true)
   }
 
   const language = languageOfFile(skill !== null ? 'SKILL.md' : memory !== null ? memory.file : path)
