@@ -361,6 +361,9 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
               projectId={project.id}
               change={current}
               reloadKey={reloadKey}
+              run={run}
+              enqueue={enqueue}
+              onDone={settleOperation}
               onStage={(paths, intent) => stage(paths, intent)}
               onReady={onFocusedDiffReady}
               {...(onOpenFile !== undefined ? { onOpenFile: () => onOpenFile(current.path) } : {})}
