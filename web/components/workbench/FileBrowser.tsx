@@ -30,6 +30,10 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRe
   const [editor, setEditor] = useState<TreeEditor | null>(null)
   const [deleting, setDeleting] = useState<DeleteRequest | null>(null)
   const generation = useRef(new Map<string, number>())
+  const nextEditorId = useRef(0)
+  /** Latest `open`, for async handlers that must not read the value captured before an await. */
+  const openNow = useRef(open)
+  openNow.current = open
 
   const load = useCallback(async (folder: string) => {
     const request = (generation.current.get(folder) ?? 0) + 1
@@ -72,7 +76,7 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRe
     const chain = ancestorsOf(folder)
     if (chain.length > 0) setOpen((current) => new Set([...current, ...chain]))
     for (const ancestor of chain) if (nodes[ancestor] === undefined) void load(ancestor)
-    setEditor({ mode: 'create', folder, kind })
+    setEditor({ id: nextEditorId.current++, mode: 'create', folder, kind })
   }
 
   // Both submit handlers resolve (never reject) and unmount their editor on
@@ -101,14 +105,14 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRe
     } catch (cause) {
       return writeErrorText(cause)
     }
-    const wasOpen = entry.kind === 'dir' && open.has(entry.path)
+    const wasOpen = entry.kind === 'dir' && openNow.current.has(entry.path)
     if (current !== null) closeEditor(current)
     forget(entry.path)
     if (wasOpen) setOpen((now) => new Set(now).add(renamed))
     setSelected((now) => now !== null && isAtOrUnder(now.path, entry.path) ? { ...now, path: `${renamed}${now.path.slice(entry.path.length)}` } : now)
+    onRenamed(entry.path, renamed)
     await load(parentOf(entry.path))
     if (wasOpen) await load(renamed)
-    onRenamed(entry.path, renamed)
     return null
   }
 
@@ -126,8 +130,8 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRe
     forget(entry.path)
     setSelected((now) => now !== null && isAtOrUnder(now.path, entry.path) ? null : now)
     setEditor((now) => now !== null && isAtOrUnder(now.mode === 'create' ? now.folder : now.path, entry.path) ? null : now)
-    await load(parentOf(entry.path))
     onRemoved(entry.path)
+    await load(parentOf(entry.path))
   }
 
   const actions: TreeActions = {
@@ -142,7 +146,7 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRe
       else onOpenFile(entry.path)
     },
     retry: (folder) => void load(folder),
-    beginRename: (entry) => setEditor({ mode: 'rename', path: entry.path }),
+    beginRename: (entry) => setEditor({ id: nextEditorId.current++, mode: 'rename', path: entry.path }),
     beginDelete: (entry) => setDeleting({ entry, busy: false, error: null }),
     submitCreate,
     submitRename,

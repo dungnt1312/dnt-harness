@@ -15,10 +15,10 @@ export interface FolderNode {
   readonly error: string | null
 }
 
-/** The one inline editor the tree shows at a time. */
+/** The one inline editor the tree shows at a time; `id` is unique per started editor so each gets a fresh input. */
 export type TreeEditor =
-  | { readonly mode: 'create'; readonly folder: string; readonly kind: 'file' | 'dir' }
-  | { readonly mode: 'rename'; readonly path: string }
+  | { readonly id: number; readonly mode: 'create'; readonly folder: string; readonly kind: 'file' | 'dir' }
+  | { readonly id: number; readonly mode: 'rename'; readonly path: string }
 
 /** Everything the rows read and call; threaded as one object so the recursion stays narrow. */
 export interface TreeActions {
@@ -53,7 +53,7 @@ export function FolderRows({ folder, entries, depth, actions }: {
   if (entries.length === 0 && draft === null) return <p className="m-0 px-2.5 py-2 text-[13px] text-fg-faint" style={{ paddingLeft: 10 + depth * 14 }}>Empty folder</p>
   return (
     <ul aria-label={depth === 0 ? 'Project files' : undefined} className="m-0 flex list-none flex-col p-0">
-      {draft !== null ? <li><DraftRow kind={draft.kind} depth={depth} actions={actions} /></li> : null}
+      {draft !== null ? <li><DraftRow key={draft.id} kind={draft.kind} depth={depth} actions={actions} /></li> : null}
       {entries.map((entry) => {
         const expanded = entry.kind === 'dir' && open.has(entry.path)
         const node = nodes[entry.path]
@@ -92,6 +92,7 @@ function FileRow({ entry, depth, expanded, actions }: {
     return (
       <EditorShell depth={depth} icon={<FileTypeIcon path={entry.name} kind={isDir ? 'folder' : 'file'} open={expanded} size={16} />}>
         <FileNameInput
+          key={editor.id}
           initial={entry.name}
           label={`New name for ${entry.name}`}
           selectStem={!isDir}

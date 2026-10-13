@@ -126,6 +126,20 @@ it('keeps the draft open with the server error when the name exists', async () =
   expect(byLabel('New file name')).toBeTruthy()
 })
 
+it('mounts a fresh, enabled name input when a new draft starts while a create is in flight', async () => {
+  createProjectEntry.mockImplementationOnce(() => new Promise(() => {}))
+  await mount()
+  await click(byLabel('New file'))
+  const first = byLabel('New file name') as HTMLInputElement
+  await typeInto(first, 'a.ts')
+  await enter(first)
+  expect(first.disabled).toBe(true)
+  await click(byLabel('New file'))
+  const second = byLabel('New file name') as HTMLInputElement
+  expect(second.disabled).toBe(false)
+  expect(second.value).toBe('')
+})
+
 it('renames a folder, reloads its parent and reports the move', async () => {
   await mount()
   await click(row('src'))
