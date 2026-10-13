@@ -517,6 +517,12 @@ const MCP_WORKER_ROLE = [
   '---',
   'Implement exactly the brief.',
 ].join('\n')
+const SCOUT_ROLE = ['---', 'description: "Inherits every tool"', '---', 'Find things.'].join('\n')
+const EXPLORER_OVERRIDE_ROLE = ['---', 'description: "Explorer with the fixture MCP"', 'tools: Read, Glob, Grep, mcp__fixture__*', '---', 'Explore.'].join('\n')
+const NO_MCP_ROLE = ['---', 'description: "Inherits but refuses MCP"', 'disallowedTools: mcp__*', '---', 'Work.'].join('\n')
+const ROLE_FILES: Record<string, string> = {
+  'mcp-worker': MCP_WORKER_ROLE, scout: SCOUT_ROLE, explorer: EXPLORER_OVERRIDE_ROLE, 'no-mcp': NO_MCP_ROLE,
+}
 
 const systemText = (request: ModelRequest): string => {
   const first = request.messages[0]
@@ -538,11 +544,15 @@ interface ChildRun {
  */
 async function runChild(options: {
   rootMode: string
-  role: 'mcp-worker' | 'explorer'
-  grantTools: string[]
+  role: 'mcp-worker' | 'explorer' | 'scout' | 'no-mcp'
+  /** Import the explorer override instead of using the bundled role. */
+  overrideExplorer?: boolean
+  grantTools?: string[]
   calls: { id: string; name: string; args: Record<string, unknown> }[]
   switchRootTo?: string
-}): Promise<ChildRun> {
+  /** The fixture server's allowlist (Plan needs one to expose any MCP). */
+  allowedTools?: string[]
+}): Promise<ChildRun & { status: number; error?: string }> {
   const effects = await effectFile()
   const schemas: string[] = []
   let step = 0
@@ -571,15 +581,18 @@ async function runChild(options: {
       yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
     },
   }
-  const { base, wsId } = await bootPlan(provider, undefined, { modeId: options.rootMode, env: { SIDE_EFFECT_FILE: effects } })
-  if (options.role === 'mcp-worker') {
-    expect((await post(base, `/api/workspaces/${wsId}/agents/mcp-worker/import`, { dialect: 'dnt-harness', content: MCP_WORKER_ROLE })).status).toBe(201)
+  const { base, wsId } = await bootPlan(provider, options.allowedTools, { modeId: options.rootMode, env: { SIDE_EFFECT_FILE: effects } })
+  if (options.role !== 'explorer' || options.overrideExplorer === true) {
+    expect((await post(base, `/api/workspaces/${wsId}/agents/${options.role}/import`, { dialect: 'dnt-harness', content: ROLE_FILES[options.role] })).status).toBe(201)
   }
   const root = (await (await post(base, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
   const spawned = await post(base, `/api/workspaces/${wsId}/agents/${options.role}`, {
-    rootSessionId: root.id, task: { prompt: 'Query it.' }, grantTools: options.grantTools,
+    rootSessionId: root.id, task: { prompt: 'Query it.' },
+    ...(options.grantTools !== undefined ? { grantTools: options.grantTools } : {}),
   })
-  expect(spawned.status).toBe(202)
+  if (spawned.status !== 202) {
+    return { schemas: [], outputs: {}, effects: '', status: spawned.status, error: ((await spawned.json()) as { error?: string }).error ?? '' }
+  }
   const child = (await spawned.json()) as { childSessionId: string }
   await started
   if (options.switchRootTo !== undefined) {
@@ -595,7 +608,7 @@ async function runChild(options: {
     }
     if (Object.keys(outputs).length < options.calls.length) await new Promise((resolve) => setTimeout(resolve, 150))
   }
-  return { schemas, outputs, effects: await readEffects(effects) }
+  return { schemas, outputs, effects: await readEffects(effects), status: spawned.status }
 }
 
 const QUERY_CALL = { id: 'fab-mcp', name: 'mcp__fixture__query', args: { q: 'x' } }
@@ -608,21 +621,69 @@ describe('real host spawn-admission ceiling (executor admissionResolver -> share
     expect(run.effects).toContain('query')
   }, 40_000)
 
-  it('Plan root spawns a worker with an explicit MCP grant for an enabled tool: admission pins a ceiling without it, even after the root widens', async () => {
-    const run = await runChild({
-      rootMode: 'plan', role: 'mcp-worker', grantTools: ['Read', 'mcp__fixture__query'],
-      calls: [QUERY_CALL], switchRootTo: 'full-access',
-    })
-    expect(run.schemas).not.toContain('mcp__fixture__query')
-    // The root is now full-access, whose live gate would expose the tool; only
-    // the pinned admission ceiling can refuse it, with the ceiling's own reason.
-    expect(run.outputs['fab-mcp']).toMatch(/^denied: agent 'mcp-worker' does not expose 'mcp__fixture__query' \(definition ceiling\)/)
+  it('Plan root: an explicit MCP grant the mode does not expose fails the spawn instead of pinning a ceiling without it', async () => {
+    const run = await runChild({ rootMode: 'plan', role: 'mcp-worker', grantTools: ['Read', 'mcp__fixture__query'], calls: [QUERY_CALL] })
+    expect(run.status).toBe(400)
+    expect(run.error).toMatch(/granted MCP tools are not available to 'mcp-worker': mcp__fixture__query/)
     expect(run.effects).toBe('')
   }, 40_000)
 
-  it('an Explorer child excludes everything beyond its role, even with an explicit MCP grant under full-access', async () => {
+  it('Plan root: an inheriting role spawns with only read-safe allowlisted MCP, and widening the root adds nothing', async () => {
     const run = await runChild({
-      rootMode: 'full-access', role: 'explorer', grantTools: ['Read', 'mcp__fixture__query', 'Write', 'Bash'],
+      rootMode: 'plan', role: 'scout', allowedTools: ['query', 'explode'],
+      calls: [{ id: 'fab-explode', name: 'mcp__fixture__explode', args: {} }], switchRootTo: 'full-access',
+    })
+    expect(run.status).toBe(202)
+    expect(run.schemas).toContain('mcp__fixture__query')
+    expect(run.schemas).not.toContain('mcp__fixture__explode')
+    // The root is now full-access, whose live gate would expose the tool; only
+    // the pinned admission ceiling can refuse it, with the ceiling's own reason.
+    expect(run.outputs['fab-explode']).toMatch(/^denied: agent 'scout' does not expose 'mcp__fixture__explode' \(definition ceiling\)/)
+    expect(run.effects).toBe('')
+  }, 40_000)
+
+  it('an inheriting role with no grant sees and runs the parent MCP tool', async () => {
+    const run = await runChild({ rootMode: 'full-access', role: 'scout', calls: [QUERY_CALL] })
+    expect(run.schemas).toContain('mcp__fixture__query')
+    expect(run.outputs['fab-mcp']).toMatch(/result:x/)
+    expect(run.effects).toContain('query')
+  }, 40_000)
+
+  it('a built-in-only grant keeps an inheriting role\'s MCP', async () => {
+    const run = await runChild({ rootMode: 'full-access', role: 'scout', grantTools: ['Read'], calls: [] })
+    expect(run.schemas).toContain('mcp__fixture__query')
+    expect(run.schemas).not.toContain('Write')
+  }, 40_000)
+
+  it('a grant naming one MCP tool keeps only that MCP tool', async () => {
+    const run = await runChild({ rootMode: 'full-access', role: 'scout', grantTools: ['Read', 'mcp__fixture__explode'], calls: [QUERY_CALL] })
+    expect(run.schemas).toContain('mcp__fixture__explode')
+    expect(run.schemas).not.toContain('mcp__fixture__query')
+    expect(run.outputs['fab-mcp']).toMatch(/^denied: agent 'scout' does not expose 'mcp__fixture__query' \(definition ceiling\)/)
+    expect(run.effects).toBe('')
+  }, 40_000)
+
+  it('an explorer override listing mcp__fixture__* gets MCP; disallowedTools mcp__* strips it', async () => {
+    const override = await runChild({ rootMode: 'full-access', role: 'explorer', overrideExplorer: true, calls: [QUERY_CALL] })
+    expect(override.schemas).toContain('mcp__fixture__query')
+    expect(override.schemas).not.toContain('Write')
+    expect(override.outputs['fab-mcp']).toMatch(/result:x/)
+    const refused = await runChild({ rootMode: 'full-access', role: 'no-mcp', calls: [] })
+    expect(refused.schemas.some((name) => name.startsWith('mcp__'))).toBe(false)
+    expect(refused.schemas).toContain('Read')
+  }, 60_000)
+
+  it('a granted MCP name the role cannot hold fails the spawn with 400 (bundled explorer included)', async () => {
+    const worker = await runChild({ rootMode: 'full-access', role: 'mcp-worker', grantTools: ['Read', 'mcp__fixture__explode'], calls: [] })
+    expect(worker.status).toBe(400)
+    expect(worker.error).toMatch(/granted MCP tools are not available to 'mcp-worker': mcp__fixture__explode/)
+    const explorer = await runChild({ rootMode: 'full-access', role: 'explorer', grantTools: ['Read', 'mcp__fixture__query'], calls: [] })
+    expect(explorer.status).toBe(400)
+  }, 60_000)
+
+  it('an Explorer child excludes everything beyond its role under full-access', async () => {
+    const run = await runChild({
+      rootMode: 'full-access', role: 'explorer', grantTools: ['Read', 'Write', 'Bash'],
       calls: [QUERY_CALL, { id: 'fab-write', name: 'Write', args: { path: 'x.txt', content: 'x' } }, { id: 'fab-bash', name: 'Bash', args: { command: 'echo x' } }],
     })
     for (const hidden of ['mcp__fixture__query', 'Write', 'Bash', 'Agent']) expect(run.schemas).not.toContain(hidden)
