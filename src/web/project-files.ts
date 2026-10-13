@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
+import { BinaryFileError, decodeDocument, hashBytes } from '../capabilities/fs/text-document.ts'
 import { resolveGrantedPath } from '../capabilities/fs/tools.ts'
 
 /**
@@ -53,6 +54,10 @@ export interface ProjectFile {
   readonly truncated: boolean
   /** UTF-8 text; empty for binary files. */
   readonly content: string
+  /** True when the viewer may edit and save this file: whole, text, valid UTF-8. */
+  readonly editable: boolean
+  /** sha256 of the stored bytes; present only when the whole file was read. */
+  readonly hash?: string
 }
 
 export class ProjectFileError extends Error {}
@@ -166,6 +171,17 @@ export async function searchProjectFiles(
   return { query: rawQuery.trim(), matches: matches.sort(byScoreThenPath).slice(0, capped), truncated }
 }
 
+/** Whether whole-file bytes can round-trip through the viewer's editor. */
+function editableBytes(bytes: Buffer): boolean {
+  try {
+    const doc = decodeDocument(bytes, 'file')
+    return doc.writable && doc.encoding === 'utf8'
+  } catch (error) {
+    if (error instanceof BinaryFileError) return false
+    throw error
+  }
+}
+
 export async function readProjectFile(root: string, raw: string, deniedRoots?: readonly string[]): Promise<ProjectFile> {
   const { abs, rel } = await resolve(root, raw, deniedRoots)
   const stat = await fs.stat(abs).catch(() => null)
@@ -177,12 +193,16 @@ export async function readProjectFile(root: string, raw: string, deniedRoots?: r
     const { bytesRead } = length > 0 ? await handle.read(buffer, 0, length, 0) : { bytesRead: 0 }
     const body = buffer.subarray(0, bytesRead)
     const binary = body.subarray(0, BINARY_SNIFF_BYTES).includes(0)
+    const truncated = stat.size > MAX_FILE_BYTES
+    const whole = !truncated && bytesRead === stat.size
     return {
       path: rel,
       size: stat.size,
       binary,
-      truncated: stat.size > MAX_FILE_BYTES,
+      truncated,
       content: binary ? '' : body.toString('utf8'),
+      editable: whole && !binary && editableBytes(body),
+      ...(whole ? { hash: hashBytes(body) } : {}),
     }
   } finally {
     await handle.close()
