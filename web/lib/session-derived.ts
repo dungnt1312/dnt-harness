@@ -5,40 +5,14 @@
  * AppShell re-renders with it. Several surfaces below the shell only read a
  * handful of event types (turn boundaries, process traffic, agent traffic,
  * tool traffic) yet re-scanned the whole log each frame. Each derivation here
- * keeps the count of the event types it reads and rescans only when one of
- * those counts changed — the same policy Transcript already applies to its
- * process map (processEventCount). Streaming chunks and unrelated traffic
- * never invalidate them.
+ * tracks revisions of the event groups it reads. Reference comparisons also
+ * detect replacement snapshots with identical counts. Streaming chunks and
+ * unrelated traffic never invalidate these derivations.
  */
 import { useMemo, useRef } from 'react'
 import type { SseEvent } from './types.ts'
 import { isTurnRunning, taskPhase, type TaskPhase } from './project.ts'
 import { todosFromEvents, type TodoView } from './todos-view.ts'
-
-interface TypeCounts {
-  readonly byType: Readonly<Record<string, number>>
-  /** Events flagged `recovery === true` (any type): the recovery note's gate. */
-  readonly recovery: number
-}
-
-/** How many events of each type the array holds, in one pass. */
-function typeCounts(events: readonly SseEvent[]): TypeCounts {
-  const byType: Record<string, number> = {}
-  let recovery = 0
-  for (const event of events) {
-    const type = event.type
-    byType[type] = (byType[type] ?? 0) + 1
-    if (event.recovery === true) recovery += 1
-  }
-  return { byType, recovery }
-}
-
-/** Count only the types a derivation reads; a change there forces a rescan. */
-function countOf(counts: TypeCounts, types: readonly string[]): number {
-  let total = 0
-  for (const type of types) total += counts.byType[type] ?? 0
-  return total
-}
 
 const TURN_BOUNDARY_TYPES = ['turn/start', 'turn/end'] as const
 const TASK_TYPES = ['tool/call', 'tool/result'] as const
@@ -46,9 +20,8 @@ const PROCESS_TYPES = ['process/start', 'process/exit'] as const
 const AGENT_TYPES = ['agent/child-spawn', 'agent/child-result'] as const
 
 /**
- * One typeCounts pass per events reference, shared by every gate below. When
- * TaskStatus, the Environment panel, and the shell each gate on different
- * type groups, the scan happens once per frame instead of once per gate.
+ * One grouping pass per events reference in this hook, shared by its gates.
+ * The legacy *Count field names carry revisions, not absolute event counts.
  */
 export interface SessionDerivedGates {
   readonly turnCount: number
@@ -56,18 +29,30 @@ export interface SessionDerivedGates {
   readonly processCount: number
   readonly agentCount: number
   readonly recoveryCount: number
+  readonly inputRevision: number
 }
 
 export function useSessionDerivedGates(events: readonly SseEvent[]): SessionDerivedGates {
+  const previous = useRef<{ groups: readonly (readonly SseEvent[])[]; revisions: number[] }>({ groups: [[], [], [], [], [], []], revisions: [0, 0, 0, 0, 0, 0] })
   return useMemo(() => {
-    const counts = typeCounts(events)
-    return {
-      turnCount: countOf(counts, TURN_BOUNDARY_TYPES),
-      taskCount: countOf(counts, TASK_TYPES),
-      processCount: countOf(counts, PROCESS_TYPES),
-      agentCount: countOf(counts, AGENT_TYPES),
-      recoveryCount: counts.recovery,
+    const groups: SseEvent[][] = [[], [], [], [], [], []]
+    for (const event of events) {
+      if ((TURN_BOUNDARY_TYPES as readonly string[]).includes(event.type)) groups[0]!.push(event)
+      if ((TASK_TYPES as readonly string[]).includes(event.type)) groups[1]!.push(event)
+      if ((PROCESS_TYPES as readonly string[]).includes(event.type)) groups[2]!.push(event)
+      if ((AGENT_TYPES as readonly string[]).includes(event.type)) groups[3]!.push(event)
+      if (event.type === 'input/queued' || event.type === 'input/settled' || event.type === 'user/message') groups[5]!.push(event)
+      // Recovery is relative to the open turn, so boundaries invalidate it too.
+      if (event.recovery === true || (TURN_BOUNDARY_TYPES as readonly string[]).includes(event.type)) groups[4]!.push(event)
     }
+    const old = previous.current
+    const revisions = groups.map((group, index) => {
+      const before = old.groups[index]!
+      const same = group.length === before.length && group.every((event, at) => event === before[at])
+      return same ? old.revisions[index]! : old.revisions[index]! + 1
+    })
+    previous.current = { groups, revisions }
+    return { turnCount: revisions[0]!, taskCount: revisions[1]!, processCount: revisions[2]!, agentCount: revisions[3]!, recoveryCount: revisions[4]!, inputRevision: revisions[5]! }
   }, [events])
 }
 
@@ -78,7 +63,7 @@ export function useSessionDerivedGates(events: readonly SseEvent[]): SessionDeri
  * array each flushed frame — so both hide behind refs and the memo stays
  * keyed on the gate alone, or it would rerun per frame and gate nothing.
  */
-function useGated<T>(gate: number, derive: () => T, extraDeps: readonly unknown[]): T {
+export function useGated<T>(gate: number, derive: () => T, extraDeps: readonly unknown[]): T {
   const deriveRef = useRef(derive)
   deriveRef.current = derive
   // eslint-disable-next-line react-hooks/exhaustive-deps -- the gate IS the dependency; extraDeps are explicit re-run inputs
@@ -137,9 +122,9 @@ export function useSessionDerivedValues(events: readonly SseEvent[], pending: nu
   const gates = useSessionDerivedGates(events)
   const eventsRef = useRef(events)
   eventsRef.current = events
-  const phase = useGated(gates.turnCount, () => taskPhase(eventsRef.current, pending, sending), [pending, sending])
+  const phase = useGated(gates.turnCount, () => taskPhase(eventsRef.current, pending, sending), [pending, sending, gates.inputRevision])
   const running = useGated(gates.turnCount, () => isTurnRunning(eventsRef.current), [])
-  const todos = useGated(gates.taskCount, () => (gates.taskCount === 0 ? EMPTY_TODOS : todosFromEvents(eventsRef.current)), [])
+  const todos = useGated(gates.taskCount, () => todosFromEvents(eventsRef.current), [])
   const workingSince = useGated(gates.turnCount, () => workingSinceOf(eventsRef.current), [])
   const recovered = useGated(gates.recoveryCount, () => recoveredOf(eventsRef.current), [])
   return { phase, running, todos, workingSince, recovered }

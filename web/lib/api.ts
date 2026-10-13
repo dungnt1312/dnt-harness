@@ -403,16 +403,18 @@ export function subscribeEvents(
 export function subscribeEventsIn(
   workspaceId: string,
   sessionId: string,
-  onEnvelope: (envelope: Envelope) => void,
+  onEnvelope: (envelope: Envelope, cursor?: number) => void,
   onState?: (state: StreamState) => void,
+  cursor?: number,
 ): () => void {
-  const source = new EventSource(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/events`)
+  const suffix = cursor !== undefined && Number.isSafeInteger(cursor) && cursor >= 0 ? `?cursor=${cursor}` : ''
+  const source = new EventSource(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/events${suffix}`)
   return wire(source, onEnvelope, onState)
 }
 
 function wire(
   source: EventSource,
-  onEnvelope: (envelope: Envelope) => void,
+  onEnvelope: (envelope: Envelope, cursor?: number) => void,
   onState?: (state: StreamState) => void,
 ): () => void {
   source.onopen = () => onState?.('open')
@@ -420,7 +422,8 @@ function wire(
     onState?.(source.readyState === EventSource.CONNECTING ? 'reconnecting' : 'connecting')
   }
   source.onmessage = (message: MessageEvent<string>) => {
-    onEnvelope(JSON.parse(message.data) as Envelope)
+    const cursor = /^\d+$/.test(message.lastEventId ?? '') ? Number(message.lastEventId) : undefined
+    onEnvelope(JSON.parse(message.data) as Envelope, cursor !== undefined && Number.isSafeInteger(cursor) ? cursor : undefined)
   }
   return () => {
     source.close()
@@ -869,11 +872,11 @@ export function withdrawQueuedInputIn(workspaceId: string, sessionId: string, in
 export interface ModeRow {
   readonly id: string
   readonly name: string
+  /** One-line summary shown under the name in the picker. */
+  readonly description?: string
   readonly source: 'bundled' | 'workspace'
 }
 
-  /** One-line summary shown under the name in the picker. */
-  readonly description?: string
 export interface ModeSelection {
   readonly modes: readonly ModeRow[]
   readonly selected: string

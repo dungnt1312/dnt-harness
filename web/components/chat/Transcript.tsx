@@ -8,7 +8,7 @@ import { toProjectRelative } from '../../lib/project-paths.ts'
 import { processRows, type ProcessRow } from '../../lib/processes-view.ts'
 import { hiddenSpawnCalls } from '../../lib/spawn-merge.ts'
 import { turnTimings, type TurnTiming } from '../../lib/turn-timing.ts'
-import { useSessionDerivedGates } from '../../lib/session-derived.ts'
+import { useGated, useSessionDerivedGates } from '../../lib/session-derived.ts'
 import { ActivityBlock, AssistantMessage, AuditLine, CommandExpansionMarker, CompactionMarker, ContinuationMarker, ContextMarker, HookContextMarker, HookRewakeMarker, DelegationCard, JumpToBottom, ProcessLinkContext, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
 import { TurnChangesCard } from './TurnChangesCard.tsx'
 import type { WorkbenchProject } from '../workbench/Workbench.tsx'
@@ -256,42 +256,30 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   // of chunks leaves every map untouched, and the memoized cards above keep
   // their references.
   const gates = useSessionDerivedGates(events ?? [])
-  const turnChangeMap = useMemo(
-    () => turnChanges(events ?? []),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on tool traffic, not array identity (a new array lands every streamed frame)
-    [gates.taskCount, events],
-  )
+  const turnChangeMap = useGated(gates.taskCount, () => turnChanges(events ?? []), [gates.turnCount, conversationId])
   // Wall-clock boundaries per turn: the user row renders the start, the turn
   // footer the end and the span. Rebuilt only when turn traffic arrived.
-  const turnTimingMap = useMemo(
-    () => turnTimings(events ?? []),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on turn-boundary traffic
-    [gates.turnCount, events],
-  )
+  const turnTimingMap = useGated(gates.turnCount, () => turnTimings(events ?? []), [conversationId])
   // Live background-process state for the tool rows, keyed off the process
   // events only so unrelated log traffic does not rebuild the map (and
   // re-render every memoized card) with it.
-  const processStatuses = useMemo(
-    () => new Map<string, ProcessRow>(processRows(events ?? []).map((row) => [row.id, row])),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on process traffic
-    [gates.processCount, events],
-  )
+  const processStatuses = useGated(gates.processCount,
+    () => new Map<string, ProcessRow>(processRows(events ?? []).map((row) => [row.id, row])), [conversationId])
   const processLink = useMemo<ProcessLink | null>(
     () => onOpenProcess === undefined ? null : { statuses: processStatuses, open: onOpenProcess },
     [onOpenProcess, processStatuses],
   )
   // Spawn calls the delegation row absorbs: one delegation, one row.
-  const hiddenSpawns = useMemo(
-    () => hiddenSpawnCalls(events ?? []),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on tool + agent traffic
-    [gates.taskCount, gates.agentCount, events],
-  )
+  const hiddenSpawns = useGated(gates.taskCount, () => hiddenSpawnCalls(events ?? []), [gates.agentCount, conversationId])
   // Grouping skips the spawn calls their delegation rows absorbed, so a run's
   // summary counts one delegation once.
   const blocks = useMemo(() => groupBlocks(items, hiddenSpawns), [items, hiddenSpawns])
   // Keep browser DOM/layout memory bounded for long conversations. Older
   // blocks remain in the lightweight projection and can be mounted on demand.
-  const [visibleLimit, setVisibleLimit] = useState(TRANSCRIPT_WINDOW)
+  // Mount a small viewport-sized tail first; older content remains available
+  // through the existing load action, without parsing 300 blocks on each switch.
+  const [visibleLimit, setVisibleLimit] = useState(() => Math.min(100, Math.max(30,
+    Math.ceil((typeof window === 'undefined' ? 900 : window.innerHeight) / 24))))
   const visibleStart = Math.max(0, blocks.length - visibleLimit)
   const visibleBlocks = useMemo(() => blocks.slice(visibleStart), [blocks, visibleStart])
   // Reviews exactly the given turn's files in the Git view, in the

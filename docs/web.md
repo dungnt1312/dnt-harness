@@ -42,6 +42,29 @@ and answers go back over one POST. This is the "render from `session/event`"
 principle: the log is the single source of truth, and any client can rebuild the
 UI from it at any time.
 
+### Switching conversations
+
+The session stream hook fences its returned data by workspace/session before
+rendering, so a newly selected transcript never mounts the previous history.
+Each hook retains at most four recently viewed conversations under a conservative
+16 MB payload budget. It caches compacted events, the incremental projector and
+the SSE cursor in memory only; oversized histories are not retained. Pending
+animation-frame events are projected before caching, so the cursor never skips
+unpublished rows. Switching back paints cached rows immediately while opening
+`events?cursor=N` for delta replay. Native `Last-Event-ID` reconnect headers take
+precedence; invalid/out-of-range cursors fall back to a replacement snapshot.
+The frame id is retained even when replay compaction removes the last raw event.
+Approvals and interactive questions are never restored from this navigation
+cache: the server re-sends currently pending actions. Cache lifetime ends with
+the owning hook, including App unmount on authentication loss.
+
+Transcript mounting starts with a viewport-sized tail (30–100 blocks). The
+existing “Load earlier items” action adds up to 300 older blocks per click.
+This is bounded initial mounting, not variable-height viewport virtualization;
+all history remains available. Transcript maps derive only when their relevant
+event groups change; replacement histories invalidate those groups even when
+they contain the same number of events.
+
 ## Workspace interaction
 
 - An empty workspace offers **New conversation**. Until a session is selected, its connection state is idle, not connecting.
@@ -66,6 +89,7 @@ UI from it at any time.
 - Approval review exposes tool name, target, full escaped JSON arguments, call ID, conversation project and the window the request cancels itself in. **Allow once** and **Deny** answer only that pending request. It does not widen host `blockedTools`, mode exposure, or project root. A file path outside the granted folders shows `Outside granted folders: …`; on a root conversation the card may also offer **Allow `<folder>` for this session**, naming exactly the folder it grants.
 - The composer's folder chip (`+N`) lists the extra folders the conversation's file tools can use — from project settings (Settings → Projects → **Extra folders**, read-only or read & write, other projects or any folder) and the conversation's own, which it can add or remove. Shell commands are not confined by these folders. Interactive MCP tools keep asking. Child-agent questions relay onto the parent conversation, labelled with the child's agent name and id. Buttons lock while submitting; failed submissions remain visible. Durable decisions remain in transcript history, including expiry/invalidation.
 - The selected mode is the workspace's permission truth. Its `permissionDefaults` decide each tool; `--yolo` is stated on the trigger and maps asks to allows, but never lifts an explicit deny.
+- The mode picker shows each mode with an icon, its name and a one-line hint (bundled copy, otherwise the mode's `description`). Plan sits above a separator, then the permission ladder Ask before changes → Autonomous → Full access, plus any shown custom modes. Edit automatically is hidden in a new workspace's picker until turned on in Settings → Modes. An Autonomous risky-command question shows `Risky command: <label>` in the same warning slot as Dangerous Commands.
 - Failed, cancelled, limited and interrupted work offers inspection-first recovery guidance. Unknown recovered tool results are explicitly called out. There is no automatic retry or replay control: inspect actual effects, then submit new instructions limited to remaining work.
 - The Providers pane states each fact once. The provider name is its editable title (rename in place) with enablement as a state pill plus the opposite verb, and delete lives on that title row; the rail carries the name, the `default` marker and the enabled dot. A model row is one pill — id, `Vision` when it accepts images, its context window — with the provider-default radio and the global-default, edit and remove actions beside it. Per-model overrides open in **Edit model settings**, committed or abandoned as one decision: id (renaming carries its overrides), context window, input types — text is shown locked because every model takes it, image is a checkbox whose state is the effective one, with a link back to the catalog default once it is overridden — and thinking default. **Sync from /models** probes the endpoint and opens a selection: checked models are kept, unchecking one removes it, models the endpoint does not offer are left alone, and nothing is stored until Save.
 - Settings distinguish global provider storage plus the global default model from workspace services. **Modes** sits after Projects in the Workspace group: its structured editor loads a workspace file into a form (name, optional description, instructions, context sources, the out-of-grant and two shell-command switches — read-only commands run without asking, risky commands ask each time — tool exposure, the MCP tools ceiling — Default/None/Read-safe/All — and per-key permissions; the tool list is the harness's own `KNOWN_MODE_TOOLS`, and every server-valid field round-trips byte-for-byte), saves existing files with `expectedHash`, and offers Reload or an overwrite that first reloads the fresh hash after a conflict. Its catalog puts bundled read-only modes first (Duplicate only), then workspace modes (Edit/Delete); every row has an **In picker** switch that hides the mode from the composer picker until re-enabled, except the workspace's selected mode, whose switch is locked on (the server answers `409` to hiding it). It plainly lists each `permissionDefaults` key including `*` and MCP patterns. Mode authoring does not switch an existing conversation: each root owns its live selected mode, and a conversation mode switch applies at its next model request or unstarted tool gate. Workspace mode selection seeds new conversations and draft UI. Agent definitions are workspace-scoped; child listings are current-session-scoped. Saving configuration is not evidence of connectivity; provider connection checks use saved configuration rather than unsaved drafts.
@@ -89,7 +113,6 @@ The web bin (`src/bins/web.ts`) accepts:
 | `--yolo` | map selected-mode `ask` permissions to `allow`, while preserving explicit `deny` (host `blockedTools`, exposure, child ceilings, and interactive MCP still apply) | off |
 | `--auth` | require control-plane pairing; the startup line then prints a single-use code (`DNT_HARNESS_AUTH=1` does the same, `--no-auth` overrides it) | off |
 
-- The mode picker shows each mode with an icon, its name and a one-line hint (bundled copy, otherwise the mode's `description`). Plan sits above a separator, then the permission ladder Ask before changes → Autonomous → Full access, plus any shown custom modes. Edit automatically is hidden in a new workspace's picker until turned on in Settings → Modes. An Autonomous risky-command question shows `Risky command: <label>` in the same warning slot as Dangerous Commands.
 The server always boots even with no provider configured, so the Settings panel
 can add one. A non-blank `DEEPSEEK_API_KEY` seeds a `deepseek` entry on first
 boot when the provider config is empty; a blank or absent key does not. The

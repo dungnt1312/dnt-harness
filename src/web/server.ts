@@ -9270,7 +9270,8 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   // are not re-adopted — KillShell/BashOutput answer unknown truthfully).
   reconcileInterruptedProcesses(entry, deps)
 
-  const rawCursor = req.headers['last-event-id']
+  // Native reconnect headers supersede the initial cached-navigation cursor.
+  const rawCursor = req.headers['last-event-id'] ?? new URL(req.url ?? '/', 'http://localhost').searchParams.get('cursor')
   const cursor = typeof rawCursor === 'string' && /^\d+$/.test(rawCursor) ? Number(rawCursor) : NaN
   const latest = session.events.at(-1)?.seq ?? 0
   const earliest = session.events[0]?.seq ?? 1

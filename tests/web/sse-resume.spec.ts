@@ -57,9 +57,9 @@ it('emits an SSE id and replays only events after a valid Last-Event-ID', async 
   const created = await fetch(`${server.url}/api/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
   const session = await created.json() as { id: string }
   await fetch(`${server.url}/api/sessions/${session.id}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'hello' }) })
-  const readFirst = async (cursor?: string) => {
+  const readFirst = async (cursor?: string, query?: string) => {
     const abort = new AbortController()
-    const response = await fetch(`${server!.url}/api/sessions/${session.id}/events`, { signal: abort.signal, ...(cursor !== undefined ? { headers: { 'Last-Event-ID': cursor } } : {}) })
+    const response = await fetch(`${server!.url}/api/sessions/${session.id}/events${query !== undefined ? `?cursor=${encodeURIComponent(query)}` : ''}`, { signal: abort.signal, ...(cursor !== undefined ? { headers: { 'Last-Event-ID': cursor } } : {}) })
     const reader = response.body!.getReader()
     let text = ''
     while (!text.includes('\n\n')) text += new TextDecoder().decode((await reader.read()).value)
@@ -76,4 +76,10 @@ it('emits an SSE id and replays only events after a valid Last-Event-ID', async 
   expect(resumed.envelope.events.every((event: { seq: number }) => event.seq > cursor)).toBe(true)
   expect((await readFirst('99999999')).envelope.kind).toBe('snapshot')
   expect((await readFirst('invalid')).envelope.kind).toBe('snapshot')
+  const cached = await readFirst(undefined, String(cursor))
+  expect(cached.envelope.kind).toBe('resume')
+  expect(cached.envelope.events.every((event: { seq: number }) => event.seq > cursor)).toBe(true)
+  expect((await readFirst(undefined, '99999999')).envelope.kind).toBe('snapshot')
+  expect((await readFirst(undefined, '-1')).envelope.kind).toBe('snapshot')
+  expect((await readFirst('invalid', String(cursor))).envelope.kind).toBe('snapshot')
 })

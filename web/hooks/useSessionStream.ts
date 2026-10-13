@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { subscribeEventsIn, type StreamState } from '../lib/api.ts'
 import type { PendingApproval, PendingQuestion, SseEvent } from '../lib/types.ts'
 import { createProjector, type ViewItem } from '../lib/project.ts'
@@ -114,7 +114,26 @@ export function createEventCompactor(): (batch: readonly SseEvent[]) => readonly
   }
 }
 
+/** Inactive navigation cache bounds: entry count and conservative payload weight. */
+const MAX_CACHE_ENTRIES = 4
+const MAX_CACHE_WEIGHT = 16_000_000
+const EMPTY_EVENTS: readonly SseEvent[] = []
+const EMPTY_ITEMS: readonly ViewItem[] = []
+interface CachedStream {
+  projector: ReturnType<typeof createProjector>
+  compact: ReturnType<typeof createEventCompactor>
+  events: readonly SseEvent[]
+  items: readonly ViewItem[]
+  cursor: number
+  ready: boolean
+  weight: number
+}
+
 export function useSessionStream(workspaceId: string | null, sessionId: string | null) {
+  // Hook-owned memory only: no history persists across logout/App unmount.
+  const cache = useRef(new Map<string, CachedStream>())
+  const scope = workspaceId !== null && sessionId !== null ? JSON.stringify([workspaceId, sessionId]) : null
+  const [loadedScope, setLoadedScope] = useState<string | null>(null)
   const [events, setEvents] = useState<readonly SseEvent[]>([])
   const [items, setItems] = useState<readonly ViewItem[]>([])
   const [approvals, setApprovals] = useState<readonly PendingApproval[]>([])
@@ -126,6 +145,12 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
   const [settled, setSettled] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const seenSeq = useRef(0)
+  // Scope of the latest *committed* render. A layout effect runs in the commit,
+  // before the previous scope's passive cleanup, so that cleanup can tell which
+  // cached entry the render just painted without any render-time mutation
+  // (discarded concurrent renders and StrictMode replays never touch it).
+  const committedScope = useRef<string | null>(null)
+  useLayoutEffect(() => { committedScope.current = scope }, [scope])
   const dismissApproval = useCallback((id: string) => {
     setApprovals((prev) => prev.filter((row) => row.approvalId !== id))
   }, [])
@@ -134,14 +159,14 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
   }, [])
 
   useEffect(() => {
-    seenSeq.current = 0
-    setEvents([])
-    setItems([])
+    const cached = scope !== null ? cache.current.get(scope) : undefined
+    let record: CachedStream = cached ?? { projector: createProjector(), compact: createEventCompactor(), events: EMPTY_EVENTS, items: EMPTY_ITEMS, cursor: 0, ready: false, weight: 0 }
+    if (scope !== null) cache.current.delete(scope)
+    seenSeq.current = record.cursor
+    setLoadedScope(scope)
+    setEvents(record.events)
+    setItems(record.items)
     setSettled(false)
-    let projector = createProjector()
-    // The compactor owns the kept-event list across the whole stream: batches
-    // fold in place, snapshots replace it wholesale.
-    const compact = createEventCompactor()
     setApprovals([])
     setQuestions([])
     setError(null)
@@ -150,20 +175,30 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
     let disposed = false
     let frame = 0
     let pending: SseEvent[] = []
-    const flush = (): void => {
-      frame = 0
-      if (disposed || pending.length === 0) return
+    const applyPending = (): void => {
+      if (pending.length === 0) return
       const batch = pending
       pending = []
-      setItems(projector.apply(batch))
-      setEvents(compact(batch))
+      record.items = record.projector.apply(batch)
+      record.events = record.compact(batch)
+      record.cursor = seenSeq.current
+      // Conservative payload budget, including projector/event copies. Counting
+      // only new batches avoids serializing the whole history on navigation.
+      record.weight += JSON.stringify(batch).length * 4
+    }
+    const flush = (): void => {
+      frame = 0
+      if (disposed) return
+      applyPending()
+      setItems(record.items)
+      setEvents(record.events)
     }
     const discardPending = (): void => {
       if (frame !== 0) cancelAnimationFrame(frame)
       frame = 0
       pending = []
     }
-    const dispose = subscribeEventsIn(workspaceId, sessionId, (envelope) => {
+    const dispose = subscribeEventsIn(workspaceId, sessionId, (envelope, frameCursor) => {
       if (disposed) return
       if (envelope.kind === 'question') {
         const { kind: _kind, ...row } = envelope
@@ -180,11 +215,15 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
         discardPending()
         // A fresh snapshot precedes the server's re-sent open questions.
         setQuestions([])
-        projector = createProjector()
-        setItems(projector.apply(envelope.events))
-        setEvents(compact(envelope.events))
+        record = { projector: createProjector(), compact: createEventCompactor(), events: EMPTY_EVENTS, items: EMPTY_ITEMS, cursor: 0, ready: true, weight: 0 }
+        record.items = record.projector.apply(envelope.events)
+        record.events = record.compact(envelope.events)
+        record.weight = JSON.stringify(envelope.events).length * 4
+        seenSeq.current = frameCursor ?? envelope.events.at(-1)?.seq ?? 0
+        record.cursor = seenSeq.current
+        setItems(record.items)
+        setEvents(record.events)
         setApprovals(reconcileApprovals([], envelope.events))
-        seenSeq.current = envelope.events.at(-1)?.seq ?? 0
         setSettled(true)
       } else if (envelope.kind === 'resume') {
         const unseen = envelope.events.filter((event) => event.seq > seenSeq.current)
@@ -192,6 +231,9 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
           seenSeq.current = event.seq
           pending.push(event)
         }
+        seenSeq.current = Math.max(seenSeq.current, frameCursor ?? 0)
+        record.ready = true
+        record.cursor = seenSeq.current
         setApprovals((prev) => reconcileApprovals(prev, unseen))
         setSettled(true)
         if (pending.length > 0 && frame === 0) frame = requestAnimationFrame(flush)
@@ -241,9 +283,42 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
           return [...prev, next]
         })
       }
-    }, (state) => { if (!disposed) setStream(state) })
-    return () => { disposed = true; discardPending(); dispose() }
-  }, [workspaceId, sessionId])
+    }, (state) => { if (!disposed) setStream(state) }, cached?.ready ? cached.cursor : undefined)
+    return () => {
+      disposed = true
+      dispose()
+      applyPending()
+      discardPending()
+      if (scope !== null && record.ready && record.weight <= MAX_CACHE_WEIGHT) {
+        cache.current.set(scope, record)
+        // The committed target scope was already painted from its cached entry
+        // and its new effect is about to claim (and remove) it, so it is a
+        // handoff, not an inactive entry: it neither counts toward the limits
+        // nor can be evicted by this insertion.
+        const handoff = committedScope.current
+        const inactive = [...cache.current].filter(([key]) => key !== handoff)
+        let weight = inactive.reduce((total, [, row]) => total + row.weight, 0)
+        let count = inactive.length
+        for (const [key, row] of inactive) {
+          if (count <= MAX_CACHE_ENTRIES && weight <= MAX_CACHE_WEIGHT) break
+          cache.current.delete(key)
+          count -= 1
+          weight -= row.weight
+        }
+      }
+    }
+  }, [workspaceId, sessionId, scope])
 
-  return { events, items, approvals, questions, stream, error, dismissApproval, dismissQuestion, settled }
+  // Effects reset state after render. Fence synchronously so a new keyed
+  // Transcript never mounts the previous conversation's expensive Markdown.
+  const matches = loadedScope === scope
+  const cached = scope !== null ? cache.current.get(scope) : undefined
+  return {
+    events: matches ? events : cached?.events ?? EMPTY_EVENTS,
+    items: matches ? items : cached?.items ?? EMPTY_ITEMS,
+    approvals: matches ? approvals : [], questions: matches ? questions : [],
+    stream: matches ? stream : scope === null ? 'idle' as const : 'connecting' as const,
+    error: matches ? error : null, dismissApproval, dismissQuestion,
+    settled: matches && settled,
+  }
 }
