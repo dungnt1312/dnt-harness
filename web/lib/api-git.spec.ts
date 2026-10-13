@@ -172,6 +172,82 @@ describe('gitOperation NDJSON client', () => {
     expect(aborted).toBe(true)
   })
 
+  it('resolves with a done frame that arrives after the answer POST failed', async () => {
+    let failed!: () => void
+    const gate = new Promise<void>((resolve) => { failed = resolve })
+    let aborted = false
+    stubFetch(({ url, init }) => {
+      if (url.includes('/git/askpass/')) {
+        failed()
+        return new Response('{"error":"no such prompt"}', { status: 404 })
+      }
+      init.signal?.addEventListener('abort', () => { aborted = true })
+      let step = 0
+      return new Response(new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          if (step++ === 0) {
+            controller.enqueue(encoder.encode(`${JSON.stringify(ASKPASS)}\n`))
+            return
+          }
+          await gate
+          await new Promise((resolve) => setTimeout(resolve, 20))
+          controller.enqueue(encoder.encode(`${JSON.stringify({ type: 'done', ok: false, stdout: '', stderr: 'fatal: gone', cancelled: true })}\n`))
+          controller.close()
+        },
+      }), { status: 200 })
+    })
+    const done = await gitOperation('w', 'p', { type: 'push', remote: 'o', branch: 'b' }, async () => ({ password: 'x' }))
+    expect(done).toMatchObject({ ok: false, stderr: 'fatal: gone', cancelled: true })
+    expect(aborted).toBe(false)
+  })
+
+  it('aborts the signal given to onAskpass when the stream finishes', async () => {
+    const seen: AbortSignal[] = []
+    let answerDelivered!: () => void
+    const gate = new Promise<void>((resolve) => { answerDelivered = resolve })
+    stubFetch(({ url }) => {
+      if (url.includes('/git/askpass/')) return new Response('{"answered":true}', { status: 200 })
+      let step = 0
+      return new Response(new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          if (step++ === 0) {
+            controller.enqueue(encoder.encode(`${JSON.stringify(ASKPASS)}\n`))
+            return
+          }
+          await gate
+          controller.enqueue(encoder.encode(`${JSON.stringify(DONE)}\n`))
+          controller.close()
+        },
+      }), { status: 200 })
+    })
+    // The dialog is still open when git ends on its own (e.g. the remote gave up).
+    const pending = gitOperation('w', 'p', { type: 'push', remote: 'o', branch: 'b' }, (_prompt, signal) => {
+      seen.push(signal)
+      return new Promise((resolve) => signal.addEventListener('abort', () => resolve({ cancel: true })))
+    })
+    await vi.waitFor(() => expect(seen).toHaveLength(1))
+    expect(seen[0]!.aborted).toBe(false)
+    answerDelivered()
+    expect(await pending).toEqual(DONE)
+    expect(seen[0]!.aborted).toBe(true)
+  })
+
+  it('aborts the signal given to onAskpass when the stream fails', async () => {
+    const seen: AbortSignal[] = []
+    stubFetch(() => new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(encoder.encode(`${JSON.stringify(ASKPASS)}\nnot json\n`))
+        controller.close()
+      },
+    }), { status: 200 }))
+    await expect(gitOperation('w', 'p', { type: 'push', remote: 'o', branch: 'b' }, (_prompt, signal) => {
+      seen.push(signal)
+      return new Promise(() => {})
+    })).rejects.toThrow('malformed frame')
+    expect(seen).toHaveLength(1)
+    expect(seen[0]!.aborted).toBe(true)
+  })
+
   it('accepts a done frame without status and keeps query results', async () => {
     stubFetch(() => streamOf([encoder.encode('{"type":"done","ok":true,"stdout":"","stderr":"","remotes":["origin"]}\n')]))
     const done = await gitOperation('w', 'p', { type: 'remotes', branch: 'main' }, async () => ({ cancel: true }))

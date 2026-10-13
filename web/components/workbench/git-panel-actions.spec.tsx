@@ -4,7 +4,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { GitPanel } from './GitPanel.tsx'
 import { ToastHost } from '../common/Toast.tsx'
-import type { GitChange, GitDiffReport, GitOperationDone, GitOperationInput, GitStatusReport } from '../../lib/api.ts'
+import type { GitAskpassAnswer, GitAskpassFrame, GitChange, GitDiffReport, GitOperationDone, GitOperationInput, GitStatusReport } from '../../lib/api.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -29,12 +29,15 @@ function report(changes: readonly GitChange[]): GitStatusReport {
 const MIXED = report([FRESH, UNSTAGED, STAGED, PARTIAL, CONFLICT])
 
 const fetchGitStatus = vi.fn(async (): Promise<GitStatusReport> => MIXED)
-const gitOperation = vi.fn(async (_ws: string, _project: string, _input: GitOperationInput): Promise<GitOperationDone> => ({ type: 'done', ok: true, stdout: '', stderr: '' }))
+type OnAskpass = (prompt: GitAskpassFrame, signal: AbortSignal) => Promise<GitAskpassAnswer>
+const gitOperation = vi.fn(async (_ws: string, _project: string, _input: GitOperationInput, _onAskpass: OnAskpass): Promise<GitOperationDone> => ({ type: 'done', ok: true, stdout: '', stderr: '' }))
+const updateProjectGitTrust = vi.fn(async (_ws: string, _project: string, _trusted: boolean) => ({}))
 
 vi.mock('../../lib/api.ts', () => ({
   fetchGitStatus: () => fetchGitStatus(),
   fetchGitDiff: async (_ws: string, _project: string, path: string): Promise<GitDiffReport> => ({ path, lines: [], truncated: false, binary: false }),
-  gitOperation: (ws: string, project: string, input: GitOperationInput) => gitOperation(ws, project, input),
+  gitOperation: (ws: string, project: string, input: GitOperationInput, onAskpass: OnAskpass) => gitOperation(ws, project, input, onAskpass),
+  updateProjectGitTrust: (ws: string, project: string, trusted: boolean) => updateProjectGitTrust(ws, project, trusted),
   HttpError: class HttpError extends Error {
     constructor(readonly status: number, readonly body: string) { super(`HTTP ${status}: ${body}`) }
   },
@@ -57,6 +60,7 @@ afterEach(async () => {
   fetchGitStatus.mockReset()
   gitOperation.mockReset()
   gitOperation.mockImplementation(async () => ({ type: 'done', ok: true, stdout: '', stderr: '' }))
+  updateProjectGitTrust.mockClear()
 })
 
 async function mount(props: Partial<Parameters<typeof GitPanel>[0]> = {}): Promise<HTMLDivElement> {
@@ -125,7 +129,7 @@ describe('sections and tri-state checkboxes', () => {
   it('a section checkbox stages only its own entries that are not staged yet', async () => {
     await mount()
     await click(checkbox('Stage all tracked'))
-    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'stage', paths: ['src/a.ts', 'src/partial.ts'] })
+    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'stage', paths: ['src/a.ts', 'src/partial.ts'] }, expect.any(Function))
   })
 
   it('a fully staged section checkbox unstages its entries', async () => {
@@ -133,7 +137,7 @@ describe('sections and tri-state checkboxes', () => {
     await mount()
     expect(checkbox('Unstage all tracked').getAttribute('aria-checked')).toBe('true')
     await click(checkbox('Unstage all tracked'))
-    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'unstage', paths: ['src/b.ts', 'src/staged.ts'] })
+    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'unstage', paths: ['src/b.ts', 'src/staged.ts'] }, expect.any(Function))
   })
 
   it('the row hover controls keep the no-layout-cost contract', async () => {
@@ -161,7 +165,7 @@ describe('optimistic staging', () => {
     gitOperation.mockImplementationOnce(() => new Promise<GitOperationDone>((resolve) => { finish = resolve }))
     await mount()
     await click(checkbox('Stage src/partial.ts'))
-    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'stage', paths: ['src/partial.ts'] })
+    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'stage', paths: ['src/partial.ts'] }, expect.any(Function))
     // Now fully staged, so the control offers Unstage.
     expect(checkbox('Unstage src/partial.ts').getAttribute('aria-checked')).toBe('true')
 
@@ -180,7 +184,9 @@ describe('optimistic staging', () => {
     expect(checkbox('Unstage src/partial.ts').getAttribute('aria-checked')).toBe('true')
     await act(async () => fail(new Error('boom')))
     expect(checkbox('Stage src/partial.ts').getAttribute('aria-checked')).toBe('mixed')
-    expect(document.querySelector('[role="alert"]')?.textContent).toContain('boom')
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain('git stage failed')
+    await click(button('View Log'))
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('boom')
   })
 
   it('a done frame with ok false rolls back and toasts its stderr', async () => {
@@ -188,7 +194,9 @@ describe('optimistic staging', () => {
     await mount()
     await click(checkbox('Stage src/partial.ts'))
     expect(checkbox('Stage src/partial.ts').getAttribute('aria-checked')).toBe('mixed')
-    expect(document.querySelector('[role="alert"]')?.textContent).toContain('fatal: index.lock exists')
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain('git stage failed')
+    await click(button('View Log'))
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('fatal: index.lock exists')
   })
 
   it('runs queued actions one after the other', async () => {
@@ -218,7 +226,7 @@ describe('header split button', () => {
     await mount()
     expect(button('Stage All')).toBeDefined()
     await click(button('Stage All'))
-    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'stage-all' })
+    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'stage-all' }, expect.any(Function))
   })
 
   it('reads Unstage All, and unstages everything, when nothing is left unstaged', async () => {
@@ -226,7 +234,7 @@ describe('header split button', () => {
     await mount()
     expect(() => button('Stage All')).toThrow()
     await click(button('Unstage All'))
-    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'unstage-all' })
+    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'unstage-all' }, expect.any(Function))
   })
 
   it('disables the menu items that have nothing to act on', async () => {
@@ -255,13 +263,13 @@ describe('header split button', () => {
     await click([...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((entry) => entry.textContent === 'Discard Tracked Changes')!)
     expect(document.querySelector('[role="dialog"]')?.textContent).toContain('Discard changes to these files?')
     await click(button('Restore Tracked Files'))
-    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'discard', paths: ['src/staged.ts', 'src/partial.ts'] })
+    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'discard', paths: ['src/staged.ts', 'src/partial.ts'] }, expect.any(Function))
   })
 
   it('keeps Stage All to the visible files in a turn filter', async () => {
     await mount({ pathFilter: ['src/a.ts', 'src/partial.ts'] })
     await click(button('Stage All'))
-    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'stage', paths: ['src/a.ts', 'src/partial.ts'] })
+    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'stage', paths: ['src/a.ts', 'src/partial.ts'] }, expect.any(Function))
   })
 })
 
@@ -286,7 +294,7 @@ describe('discard and trash confirmations', () => {
     await mount()
     await rowMenu('a.ts', 'Discard Changes')
     await click(button('Discard Changes'))
-    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'discard', paths: ['src/a.ts'] })
+    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'discard', paths: ['src/a.ts'] }, expect.any(Function))
   })
 
   it('asks before trashing an untracked file and sends the exact path', async () => {
@@ -294,7 +302,7 @@ describe('discard and trash confirmations', () => {
     await rowMenu('new.md', 'Trash File')
     expect(dialog()?.textContent).toContain('Trash `new.md`?')
     await click(button('Trash'))
-    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'trash', paths: ['docs/new.md'] })
+    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'trash', paths: ['docs/new.md'] }, expect.any(Function))
   })
 
   it('reloads the status after a discard or trash that answers ok without a status', async () => {
@@ -321,7 +329,7 @@ describe('discard and trash confirmations', () => {
     expect(text).not.toContain('f.ts')
     expect(text).toContain('and 2 more…')
     await click(button('Restore Tracked Files'))
-    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'discard', paths: many.map((change) => change.path) })
+    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'discard', paths: many.map((change) => change.path) }, expect.any(Function))
   })
 
   it('trashes every untracked file from the header menu', async () => {
@@ -333,6 +341,216 @@ describe('discard and trash confirmations', () => {
     expect(dialog()?.textContent).toContain('Trash these files?')
     await click(button('Trash'))
     expect(gitOperation).toHaveBeenCalledOnce()
-    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'trash', paths: ['tmp/x.txt', 'tmp/y.txt'] })
+    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'trash', paths: ['tmp/x.txt', 'tmp/y.txt'] }, expect.any(Function))
+  })
+})
+
+/** Make the next operation raise one prompt, and settle with `done` once it is answered or its signal aborts. */
+function promptingOperation(prompt: string, finish: (answer: GitAskpassAnswer) => GitOperationDone = () => ({ type: 'done', ok: true, stdout: '', stderr: '' })): { readonly answers: GitAskpassAnswer[]; readonly end: (done: GitOperationDone) => void } {
+  const answers: GitAskpassAnswer[] = []
+  let end!: (done: GitOperationDone) => void
+  gitOperation.mockImplementationOnce((_ws, _project, _input, onAskpass) => new Promise<GitOperationDone>((resolve) => {
+    end = resolve
+    const controller = new AbortController()
+    void onAskpass({ type: 'askpass', promptId: 'q1', operation: 'push', prompt }, controller.signal).then((answer) => {
+      answers.push(answer)
+      resolve(finish(answer))
+    })
+    // The caller ends the operation by itself: abort the prompt first, as `gitOperation` does.
+    end = (done) => { controller.abort(); resolve(done) }
+  }))
+  return { answers, end: (done) => end(done) }
+}
+
+const dialogText = (): string => document.querySelector('[role="dialog"]')?.textContent ?? ''
+const passwordInput = (): HTMLInputElement | null => document.querySelector<HTMLInputElement>('[role="dialog"] input')
+const type = async (input: HTMLInputElement, value: string): Promise<void> => {
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value)
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+}
+
+describe('askpass modal', () => {
+  const stageFirst = async (): Promise<void> => { await click(checkbox('Stage src/a.ts')) }
+
+  it('shows the operation, the exact prompt and a masked single-line input', async () => {
+    promptingOperation("Password for 'https://user@example.com': ")
+    await mount()
+    await stageFirst()
+    expect(dialogText()).toContain('push')
+    expect(dialogText()).toContain("Password for 'https://user@example.com': ")
+    expect(dialogText()).not.toContain('You may need to configure git for Github.')
+    const input = passwordInput()!
+    expect(input.type).toBe('password')
+    expect(input.tagName).toBe('INPUT')
+    expect(document.querySelector('[role="dialog"] textarea')).toBeNull()
+  })
+
+  it('does not mask a username prompt', async () => {
+    promptingOperation("Username for 'https://example.com': ")
+    await mount()
+    await stageFirst()
+    expect(passwordInput()!.type).toBe('text')
+  })
+
+  it('keeps Confirm disabled while the input is empty', async () => {
+    promptingOperation('Password:')
+    await mount()
+    await stageFirst()
+    expect(button('Confirm').disabled).toBe(true)
+    await type(passwordInput()!, 'x')
+    expect(button('Confirm').disabled).toBe(false)
+    await type(passwordInput()!, '')
+    expect(button('Confirm').disabled).toBe(true)
+  })
+
+  it('Confirm answers with the password and closes the modal', async () => {
+    const prompt = promptingOperation('Password:')
+    await mount()
+    await stageFirst()
+    await type(passwordInput()!, 's3cret')
+    await click(button('Confirm'))
+    expect(prompt.answers).toEqual([{ password: 's3cret' }])
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    expect(document.body.innerHTML).not.toContain('s3cret')
+  })
+
+  it('Enter in the input confirms', async () => {
+    const prompt = promptingOperation('Password:')
+    await mount()
+    await stageFirst()
+    await type(passwordInput()!, 'pw')
+    await act(async () => { passwordInput()!.form!.requestSubmit() })
+    expect(prompt.answers).toEqual([{ password: 'pw' }])
+  })
+
+  it('Cancel answers with a cancel and stays silent', async () => {
+    const prompt = promptingOperation('Password:', () => ({ type: 'done', ok: false, stdout: '', stderr: 'fatal: could not read Password', cancelled: true }))
+    await mount()
+    await stageFirst()
+    await click(button('Cancel'))
+    expect(prompt.answers).toEqual([{ cancel: true }])
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    expect(document.querySelector('[role="alert"]')).toBeNull()
+  })
+
+  it('Escape cancels the prompt', async () => {
+    const prompt = promptingOperation('Password:')
+    await mount()
+    await stageFirst()
+    await act(async () => { document.querySelector('[role="dialog"]')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })) })
+    expect(prompt.answers).toEqual([{ cancel: true }])
+  })
+
+  it('closes itself when the operation ends without an answer', async () => {
+    const prompt = promptingOperation('Password:')
+    await mount()
+    await stageFirst()
+    expect(dialogText()).toContain('Password:')
+    await act(async () => prompt.end({ type: 'done', ok: true, stdout: '', stderr: '' }))
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+  })
+
+  it('shows the Github hint with a Learn more link', async () => {
+    promptingOperation("Password for 'https://github.com': ")
+    await mount()
+    await stageFirst()
+    expect(dialogText()).toContain('You may need to configure git for Github.')
+    const link = [...document.querySelectorAll<HTMLAnchorElement>('[role="dialog"] a')].find((anchor) => anchor.textContent === 'Learn more')!
+    expect(link.href).toBe('https://docs.github.com/en/get-started/git-basics/set-up-git#authenticating-with-github-from-git')
+    expect(link.target).toBe('_blank')
+  })
+
+  it('shows the Github hint for a Username prompt, and not for yes/no', async () => {
+    promptingOperation("Username for 'https://github.com': ")
+    await mount()
+    await stageFirst()
+    expect(dialogText()).toContain('Learn more')
+    await click(button('Cancel'))
+    promptingOperation('Are you sure you want to continue connecting (yes/no)? github.com')
+    await click(checkbox('Stage src/a.ts'))
+    expect(dialogText()).not.toContain('Learn more')
+  })
+})
+
+describe('operation toasts', () => {
+  const stage = async (): Promise<void> => { await click(checkbox('Stage src/a.ts')) }
+  const alerts = (): string => document.querySelector('[role="alert"]')?.textContent ?? ''
+
+  it('a failed operation is a persistent `git <action> failed` toast; View Log shows stderr in the output dialog', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      gitOperation.mockResolvedValueOnce({ type: 'done', ok: false, stdout: 'some stdout', stderr: 'fatal: nope' })
+      await mount()
+      await stage()
+      expect(alerts()).toContain('git stage failed')
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(alerts()).toContain('git stage failed')
+      await click(button('View Log'))
+      expect(dialogText()).toContain('stage output')
+      expect(dialogText()).toContain('fatal: nope')
+      expect(dialogText()).not.toContain('some stdout')
+      // The toast action closes the toast; the dialog closes with Close.
+      expect(document.querySelector('[role="alert"]')).toBeNull()
+      await click(button('Close'))
+      expect(document.querySelector('[role="dialog"]')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a refused request (thrown) opens the same log with the server\'s error text', async () => {
+    gitOperation.mockRejectedValueOnce(new Error('network down'))
+    await mount()
+    await stage()
+    expect(alerts()).toContain('git stage failed')
+    await click(button('View Log'))
+    expect(dialogText()).toContain('network down')
+  })
+
+  it('a cancelled operation is silent', async () => {
+    gitOperation.mockResolvedValueOnce({ type: 'done', ok: false, stdout: '', stderr: 'fatal: could not read Password', cancelled: true })
+    await mount()
+    await stage()
+    expect(document.querySelector('[role="alert"]')).toBeNull()
+    expect(document.querySelector('[role="status"][class*="animate"]')).toBeNull()
+    expect(document.body.textContent).not.toContain('failed')
+  })
+})
+
+describe('trust banner', () => {
+  it('an untrusted project shows Restricted Mode with a Trust button and no Restrict Git item', async () => {
+    await mount()
+    expect(document.body.textContent).toContain('Restricted Mode')
+    await openHeaderMenu()
+    expect([...document.querySelectorAll('[role="menuitem"]')].map((entry) => entry.textContent)).not.toContain('Restrict Git')
+  })
+
+  it('Trust PATCHes the project and drops the banner without a reload', async () => {
+    const onGitTrustChange = vi.fn()
+    await mount({ onGitTrustChange })
+    await click(button('Trust'))
+    expect(updateProjectGitTrust).toHaveBeenCalledWith('ws1', 'p1', true)
+    expect(document.body.textContent).not.toContain('Restricted Mode')
+    expect(onGitTrustChange).toHaveBeenCalledWith(true)
+    expect(fetchGitStatus).toHaveBeenCalledTimes(1)
+  })
+
+  it('a failed Trust keeps the banner and says why', async () => {
+    updateProjectGitTrust.mockRejectedValueOnce(new Error('nope'))
+    await mount()
+    await click(button('Trust'))
+    expect(document.body.textContent).toContain('Restricted Mode')
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain('nope')
+  })
+
+  it('a trusted project has no banner; Restrict Git in the menu PATCHes false and brings it back', async () => {
+    await mount({ project: { id: 'p1', name: 'proj', path: '/proj', gitTrusted: true } })
+    expect(document.body.textContent).not.toContain('Restricted Mode')
+    await openHeaderMenu()
+    await click([...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((entry) => entry.textContent === 'Restrict Git')!)
+    expect(updateProjectGitTrust).toHaveBeenCalledWith('ws1', 'p1', false)
+    expect(document.body.textContent).toContain('Restricted Mode')
   })
 })

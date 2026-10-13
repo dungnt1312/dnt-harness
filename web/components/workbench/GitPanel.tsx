@@ -9,8 +9,7 @@ import { IconButton } from '../ui/IconButton.tsx'
 import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import {
   fetchGitStatus,
-  gitOperation,
-  HttpError,
+  updateProjectGitTrust,
   type GitChange,
   type GitOperationDone,
   type GitOperationInput,
@@ -18,6 +17,7 @@ import {
   type GitStatusReport,
 } from '../../lib/api.ts'
 import { GitChangeList, withPendingStages } from './GitChangeList.tsx'
+import { failureText, useGitOperation } from './use-git-operation.tsx'
 import { changeCounts, confirmationForEntries, primaryChangesActionStages, type GitConfirmation } from './git-panel-model.ts'
 import type { WorkbenchProject } from './Workbench.tsx'
 
@@ -38,7 +38,7 @@ import type { WorkbenchProject } from './Workbench.tsx'
  * rows here stays the user's own. When the focused file no longer differs
  * from HEAD, a note says so instead of an unexplained quiet list.
  */
-export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNonce, onOpenFile, onShowAll }: {
+export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNonce, onOpenFile, onShowAll, onGitTrustChange }: {
   readonly workspaceId: string
   readonly project: WorkbenchProject
   readonly pathFilter?: readonly string[]
@@ -48,6 +48,8 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
   /** Opens a changed file itself in the workbench, when a resolver is wired. */
   readonly onOpenFile?: (path: string) => void
   readonly onShowAll?: () => void
+  /** Tells the owner of the project list that the trust flag changed, so a remount does not show a stale banner. */
+  readonly onGitTrustChange?: (trusted: boolean) => void
 }) {
   const [report, setReport] = useState<GitStatusReport | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -55,6 +57,11 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
   const [openPath, setOpenPath] = useState<string | null>(focusPath ?? null)
   const generation = useRef(0)
   const toast = useToast()
+  const git = useGitOperation(workspaceId, project.id)
+  // Git runs a repository's config and hooks only for a trusted project (off unless set).
+  const [trusted, setTrusted] = useState(project.gitTrusted === true)
+  const [trustBusy, setTrustBusy] = useState(false)
+  useEffect(() => { setTrusted(project.gitTrusted === true) }, [project.id, project.gitTrusted])
   // Optimistic staging: a clicked control shows its result before Git answers.
   const [pendingStages, setPendingStages] = useState<ReadonlyMap<string, GitStaging>>(() => new Map())
   const inflight = useRef(new Map<string, number>())
@@ -132,18 +139,22 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
 
   useEffect(() => { void load() }, [load])
 
-  /** Run one Git operation; a failure is a toast with Git's own words. Nothing is thrown. */
-  const run = useCallback(async (input: GitOperationInput): Promise<GitOperationDone | undefined> => {
+  /** Run one Git operation; a failure is a toast with a View Log. Nothing is thrown. */
+  const run = git.run
+
+  /** Trust or restrict the project's Git config and hooks; the panel follows at once. */
+  const changeTrust = useCallback(async (next: boolean): Promise<void> => {
+    setTrustBusy(true)
     try {
-      // Staging, discarding and trashing never ask for credentials; the credential prompt is the remote actions' concern.
-      const done = await gitOperation(workspaceId, project.id, input, () => Promise.resolve({ cancel: true }))
-      if (!done.ok) toast.notify(done.stderr.trim() || done.stdout.trim() || `git ${input.type} failed`, 'bad')
-      return done
+      await updateProjectGitTrust(workspaceId, project.id, next)
+      setTrusted(next)
+      onGitTrustChange?.(next)
     } catch (cause) {
       toast.notify(failureText(cause), 'bad')
-      return undefined
+    } finally {
+      setTrustBusy(false)
     }
-  }, [workspaceId, project.id, toast])
+  }, [workspaceId, project.id, toast, onGitTrustChange])
 
   const enqueue = useCallback((task: () => Promise<void>): void => {
     setRunning((count) => count + 1)
@@ -233,6 +244,13 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      {!trusted ? (
+        <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line bg-muted/40 px-2.5 text-[12px]">
+          <Icon name="lock" size={13} className="shrink-0 text-fg-muted" />
+          <span className="min-w-0 flex-1 truncate font-medium text-fg-muted" title="Git does not run this repository's config or hooks until you trust the folder.">Restricted Mode</span>
+          <Button size="sm" variant="outline" className="h-7 px-2.5" disabled={trustBusy} onClick={() => void changeTrust(true)}>Trust</Button>
+        </div>
+      ) : null}
       {pathFilter !== undefined && pathFilter.length > 0 ? (
         <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line bg-muted/40 px-2.5 text-[12px]">
           <Icon name="squarePen" size={13} className="shrink-0 text-fg-muted" />
@@ -278,6 +296,7 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
                   <button type="button" role="menuitem" className={menuItemClass} disabled={!counts.hasStaged} onClick={() => { close(); stageHeader('unstage') }}>Unstage All</button>
                   <button type="button" role="menuitem" className={menuItemClass} disabled={trackedEntries.length === 0} onClick={() => { close(); requestRevert(trackedEntries, 'tracked') }}>Discard Tracked Changes</button>
                   <button type="button" role="menuitem" className={menuItemClass} disabled={untrackedEntries.length === 0} onClick={() => { close(); requestRevert(untrackedEntries, 'untracked') }}>Trash Untracked Files</button>
+                  {trusted ? <button type="button" role="menuitem" className={menuItemClass} disabled={trustBusy} onClick={() => { close(); void changeTrust(false) }}>Restrict Git</button> : null}
                 </>
               )}
             </Menu>
@@ -335,6 +354,7 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
         onDismiss={() => setConfirm(null)}
         onConfirm={() => { if (confirm !== null) confirmRevert(confirm.entries) }}
       />
+      {git.dialogs}
     </div>
   )
 }
@@ -342,16 +362,4 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
 interface PendingRevert {
   readonly confirmation: GitConfirmation
   readonly entries: readonly GitChange[]
-}
-
-/** Git's own words for a refused request: the server's `{"error":…}` body, else the error text. */
-function failureText(cause: unknown): string {
-  if (cause instanceof HttpError) {
-    try {
-      const message = (JSON.parse(cause.body) as { readonly error?: unknown }).error
-      if (typeof message === 'string' && message !== '') return message
-    } catch { /* not JSON: the body is the message */ }
-    return cause.body || cause.message
-  }
-  return cause instanceof Error ? cause.message : String(cause)
 }

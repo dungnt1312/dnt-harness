@@ -749,22 +749,31 @@ function parseGitFrame(line: string): GitOperationFrame {
   return frame as GitOperationFrame
 }
 
+/** How long the stream is still read after an answer could not be delivered, before the request is aborted. */
+const GIT_ANSWER_GRACE_MS = 1_500
+
 /**
  * Run one Git operation (`POST …/git/:op`). The response is NDJSON read as it
  * arrives: each `askpass` frame goes to `onAskpass` straight away, and what it
  * resolves to is posted back (a rejection cancels the prompt); the promise
- * resolves with the `done` frame. A request refused before the stream starts
- * is an `HttpError`. If the answer cannot be delivered, the request is aborted,
- * which cancels Git on the server, and the promise rejects.
+ * resolves with the `done` frame. The `signal` handed to `onAskpass` aborts when
+ * the stream finishes or fails, so a prompt dialog can close itself. A request
+ * refused before the stream starts is an `HttpError`. If the answer cannot be
+ * delivered, the stream is still read: a `done` frame that arrives resolves the
+ * promise (the operation ended on its own); if none arrives within
+ * `GIT_ANSWER_GRACE_MS`, the request is aborted, which cancels Git on the
+ * server, and the promise rejects with the delivery error.
  */
 export async function gitOperation(
   workspaceId: string,
   projectId: string,
   input: GitOperationInput,
-  onAskpass: (prompt: GitAskpassFrame) => Promise<GitAskpassAnswer>,
+  onAskpass: (prompt: GitAskpassFrame, signal: AbortSignal) => Promise<GitAskpassAnswer>,
 ): Promise<GitOperationDone> {
   const { type, ...body } = input
   const abort = new AbortController()
+  const streamEnded = new AbortController()
+  let graceTimer: ReturnType<typeof setTimeout> | undefined
   const response = await apiFetch(`${projectBase(workspaceId, projectId)}/git/${type}`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: abort.signal,
   })
@@ -777,7 +786,7 @@ export async function gitOperation(
     void (async () => {
       let reply: GitAskpassAnswer
       try {
-        reply = await onAskpass(prompt)
+        reply = await onAskpass(prompt, streamEnded.signal)
       } catch {
         reply = { cancel: true }
       }
@@ -786,7 +795,9 @@ export async function gitOperation(
     })().catch((error: unknown) => {
       if (finished) return
       failure = error
-      abort.abort()
+      // Git may still end by itself (the prompt was already cancelled there):
+      // keep reading for a short while before giving up on the operation.
+      graceTimer ??= setTimeout(() => { if (!finished) abort.abort() }, GIT_ANSWER_GRACE_MS)
     })
   }
 
@@ -823,6 +834,8 @@ export async function gitOperation(
     throw failure ?? new Error('Git operation ended without a result')
   } finally {
     finished = true
+    if (graceTimer !== undefined) clearTimeout(graceTimer)
+    streamEnded.abort()
     reader.cancel().catch(() => {})
   }
 }

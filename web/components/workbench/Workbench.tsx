@@ -39,6 +39,8 @@ export interface WorkbenchProject {
   readonly id: string
   readonly name: string
   readonly path: string
+  /** The user trusts this folder's repository config and hooks, so Git runs them. Off unless set. */
+  readonly gitTrusted?: boolean
 }
 
 const tabClass = 'flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-[13px] text-fg-muted transition-colors hover:bg-hover hover:text-fg'
@@ -90,7 +92,7 @@ function ViewTab({ view, active, onClick, onClose }: {
  * tab strip. (`events`/`agentEvents` are new arrays per frame by design; the
  * views that read them re-render on their own `useMemo` deps instead.)
  */
-export const Workbench = memo(function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, agentFocus = null, onAgentFocus, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, gitFocusPath = null, onClearGitFilter, processFocus = null }: {
+export const Workbench = memo(function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, agentFocus = null, onAgentFocus, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, gitFocusPath = null, onClearGitFilter, onGitTrustChange, processFocus = null }: {
   readonly workspaceId: string | null
   /** The project whose files are browsable; null for chat-only conversations. */
   readonly project: WorkbenchProject | null
@@ -149,6 +151,8 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
   readonly gitFocusPath?: { readonly path: string; readonly nonce: number } | null
   /** Clears the turn filter (the banner's Show all). */
   readonly onClearGitFilter?: () => void
+  /** The Git view trusted or restricted the project: the owner of the project list records it. */
+  readonly onGitTrustChange?: (projectId: string, trusted: boolean) => void
 }) {
   // The file tree defaults off on touch: a 380px sheet gives it ~130px, too
   // narrow to browse and too narrow to leave for the file the reader opened.
@@ -223,6 +227,7 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
           {...(gitFocusPath !== null ? { focusPath: gitFocusPath.path, focusNonce: gitFocusPath.nonce } : {})}
           {...(openPath !== undefined ? { onOpenFile: (path: string) => { openPath(`${project.path}/${path}`)?.() } } : {})}
           {...(onClearGitFilter !== undefined ? { onShowAll: onClearGitFilter } : {})}
+          {...(onGitTrustChange !== undefined ? { onGitTrustChange: (trusted: boolean) => onGitTrustChange(project.id, trusted) } : {})}
         />
       : (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
@@ -363,4 +368,5 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
     && previous.gitPathFilter === next.gitPathFilter
     && previous.gitFocusPath === next.gitFocusPath
     && previous.onClearGitFilter === next.onClearGitFilter
+    && previous.onGitTrustChange === next.onGitTrustChange
 })
