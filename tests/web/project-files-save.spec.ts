@@ -156,6 +156,19 @@ describe('saveProjectFile', () => {
     expect(await fs.readFile(path.join(root, 'src', 'a.ts'), 'utf8')).toBe('upper\n')
   })
 
+  it('refuses a read-only file and leaves it unchanged', async () => {
+    const file = path.join(root, 'src', 'a.ts')
+    await fs.chmod(file, 0o444)
+    try {
+      const error = await failure(saveProjectFile(root, 'src/a.ts', 'changed\n', await hashOf('src/a.ts')))
+      expect(error.status).toBe(400)
+      expect(error.message).toBe("'src/a.ts' is read-only")
+      expect(await fs.readFile(file, 'utf8')).toBe('export const a = 1\n')
+    } finally {
+      await fs.chmod(file, 0o644)
+    }
+  })
+
   it('leaves no temporary file behind', async () => {
     await saveProjectFile(root, 'src/a.ts', 'b\n', await hashOf('src/a.ts'))
     expect((await fs.readdir(path.join(root, 'src'))).sort()).toEqual(['a.ts'])

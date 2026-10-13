@@ -185,3 +185,13 @@ it('offers no Edit for memory, skill, binary or non-editable files', async () =>
   await mount('src/b.ts')
   expect(byLabel('Edit file')).toBeNull()
 })
+
+it('does not mark a CRLF file dirty once a typed character is deleted again', async () => {
+  disk = { content: 'one\r\ntwo\r\n', hash: 'h1', editable: true }
+  await mount()
+  await act(async () => byLabel('Edit file')!.click())
+  await type('one\ntwo\nx')
+  expect(host.textContent).toContain('Unsaved')
+  await type('one\ntwo\n')
+  expect(host.textContent).not.toContain('Unsaved')
+})

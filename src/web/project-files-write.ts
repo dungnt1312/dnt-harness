@@ -266,6 +266,10 @@ export async function saveProjectFile(
     if (current !== expectedHash.toLowerCase()) {
       throw new ProjectWriteError(409, `'${t.rel}' changed on disk since it was opened`, current)
     }
+    // replaceFile keeps the mode, so without this a read-only file would be overwritten silently.
+    const mode = await fs.stat(file).then((s) => s.mode, () => null)
+    if (mode === null) throw new ProjectWriteError(404, `'${t.rel}' does not exist`)
+    if ((mode & 0o222) === 0) refuse(`'${t.rel}' is read-only`)
     let doc
     try {
       doc = decodeDocument(bytes, t.rel)

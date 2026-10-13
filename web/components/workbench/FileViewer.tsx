@@ -163,6 +163,8 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
     if (file.content.length > HIGHLIGHT_LIMIT || !grammarReady) return escapeHtml(file.content)
     return highlight(file.content, language)
   }, [file, language, grammarReady])
+  // The textarea holds LF text, so a CRLF file is compared in that form.
+  const editorBase = useMemo(() => file?.content.replace(/\r\n?/g, '\n') ?? '', [file])
   const lineCount = file === null || file.binary ? 0 : file.content.replace(/\n$/, '').split('\n').length
 
   useLayoutEffect(() => {
@@ -235,7 +237,7 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
               saving={saving}
               error={saveError}
               conflict={conflict !== null}
-              onChange={(text) => onDraft({ ...draft, text, dirty: text !== file.content || draft.baseHash !== file.hash })}
+              onChange={(text) => onDraft({ ...draft, text, dirty: text !== editorBase || draft.baseHash !== file.hash })}
               onSave={() => void save(draft.baseHash)}
               onCancel={cancelEdit}
               onReload={reloadFromDisk}
