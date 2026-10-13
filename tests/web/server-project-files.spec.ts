@@ -218,7 +218,7 @@ describe('project git (read-only)', () => {
 
   it('answers an empty status for a folder that is not a repository', async () => {
     const report = (await (await fetch(`${server.url}/api/workspaces/${wsId}/projects/${projectId}/git`)).json()) as { branch: string | null; changes: unknown[] }
-    expect(report).toEqual({ branch: null, changes: [], truncated: false })
+    expect(report).toEqual({ branch: null, branchInfo: null, head: null, changes: [], truncated: false })
   })
 })
 

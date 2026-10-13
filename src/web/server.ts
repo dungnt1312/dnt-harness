@@ -69,6 +69,8 @@ import { ProcessRegistry } from '../harness/processes/registry.ts'
 import { fsTools } from '../capabilities/fs/tools.ts'
 import { listProjectEntries, readProjectFile, searchProjectFiles, ProjectFileError, classifyProjectMedia, resolveProjectMediaPath, MAX_MEDIA_BYTES } from './project-files.ts'
 import { gitDiff, gitStatus, ProjectGitError } from './project-git.ts'
+import { answerGitAskpass, type AskpassSession } from './git-askpass.ts'
+import { listProjectGitRemotes, pushedTo, runProjectGitOperation, type GitOperationRequest } from './project-git-ops.ts'
 import {
   AttachmentError,
   AttachmentStore,
@@ -6973,8 +6975,23 @@ async function handleApi(
       return
     }
 
+    // ── Git panel actions (NDJSON stream) and askpass answers ──
+    // Matched before the read route below, which only knows `…/git` itself.
+    const wsProjectGitActionMatch = /^\/api\/workspaces\/([^/]+)\/projects\/([^/]+)\/git\/(.+)$/.exec(pathname)
+    if (wsProjectGitActionMatch !== null) {
+      await handleProjectGitAction(
+        req,
+        res,
+        deps,
+        decodeURIComponent(wsProjectGitActionMatch[1] ?? '') as WorkspaceId,
+        decodeURIComponent(wsProjectGitActionMatch[2] ?? '') as ProjectId,
+        wsProjectGitActionMatch[3] ?? '',
+      )
+      return
+    }
+
     // ── read-only project browsing (workbench Files) ───────────
-    // Git is read-only status and diff for the workbench Git view.
+    // `git` here is read-only status and diff for the workbench Git view.
     const wsProjectFilesMatch = /^\/api\/workspaces\/([^/]+)\/projects\/([^/]+)\/(files|file|search|git|media)$/.exec(pathname)
     if (wsProjectFilesMatch !== null) {
       const wsId = decodeURIComponent(wsProjectFilesMatch[1] ?? '') as WorkspaceId
@@ -6989,9 +7006,10 @@ async function handleApi(
         const target = query.get('path') ?? ''
         const kind = wsProjectFilesMatch[3]
         if (kind === 'git') {
+          const trusted = project.gitTrusted === true
           send(200, target === ''
-            ? await gitStatus(project.path, deps.deniedRoots)
-            : await gitDiff(project.path, target, deps.deniedRoots))
+            ? await gitStatus(project.path, deps.deniedRoots, trusted)
+            : await gitDiff(project.path, target, deps.deniedRoots, trusted))
           return
         }
         if (kind === 'media') {
@@ -7031,6 +7049,20 @@ async function handleApi(
         // so a refused grant never leaves a half-applied rename or retarget.
         // They are checked against the folder the project will have.
         let directories: AdditionalDirectory[] | undefined
+        // Trusting a project lets its own git configuration and hooks run, so
+        // like a folder grant it is a browser-only decision.
+        let gitTrusted: boolean | undefined
+        if (body['gitTrusted'] !== undefined) {
+          if (!browserPrincipal(req, deps, 'PATCH')) {
+            send(401, { error: 'git trust can only be changed from the browser session that owns the workspace' })
+            return
+          }
+          if (typeof body['gitTrusted'] !== 'boolean') {
+            send(400, { error: 'gitTrusted must be a boolean' })
+            return
+          }
+          gitTrusted = body['gitTrusted']
+        }
         if (body['additionalDirectories'] !== undefined) {
           if (!browserPrincipal(req, deps, 'PATCH')) {
             send(401, { error: 'folder grants can only be changed from the browser session that owns the workspace' })
@@ -7074,6 +7106,9 @@ async function handleApi(
         }
         if (directories !== undefined) {
           updated = await deps.workspaces.setAdditionalDirectories(pid, wsId, directories)
+        }
+        if (gitTrusted !== undefined) {
+          updated = await deps.workspaces.setProjectGitTrusted(pid, wsId, gitTrusted)
         }
         send(200, updated)
         return
@@ -7598,6 +7633,251 @@ function browserPrincipal(req: IncomingMessage, deps: HandlerDeps, method: strin
   if (!deps.auth.enabled) return true
   const decision = deps.auth.authenticate(req.headers, method)
   return decision.ok && decision.principal.kind === 'browser'
+}
+
+// ── Git panel actions ──────────────────────────────────────────
+
+/** Operations of `POST …/projects/:pid/git/:op`; `remotes` and `pushed-to` are queries answered in the done frame. */
+const GIT_OPERATIONS: ReadonlySet<string> = new Set([
+  'stage', 'unstage', 'discard', 'trash', 'stage-all', 'unstage-all', 'commit', 'uncommit', 'fetch', 'fetch-all', 'pull', 'push',
+])
+const GIT_QUERIES: ReadonlySet<string> = new Set(['remotes', 'pushed-to'])
+
+/**
+ * Which principal's operation raised a prompt, so another browser session
+ * cannot answer it. Entries live exactly as long as the operation that owns them.
+ */
+const promptPrincipals = new Map<string, string | undefined>()
+
+type GitBody = Record<string, unknown>
+
+function gitFlag(body: GitBody, key: string): boolean | string {
+  const value = body[key]
+  if (value === undefined) return false
+  return typeof value === 'boolean' ? value : `${key} must be a boolean`
+}
+
+function gitText(body: GitBody, key: string, optional = false): string | undefined {
+  const value = body[key]
+  if (value === undefined && optional) return ''
+  return typeof value === 'string' ? value : undefined
+}
+
+/** A client body as the operation union; the string is the 400 message. */
+function parseGitOperation(op: string, body: GitBody): GitOperationRequest | string {
+  const flags = (...keys: string[]): Record<string, boolean> | string => {
+    const out: Record<string, boolean> = {}
+    for (const key of keys) {
+      const value = gitFlag(body, key)
+      if (typeof value === 'string') return value
+      out[key] = value
+    }
+    return out
+  }
+  switch (op) {
+    case 'stage':
+    case 'unstage':
+    case 'discard':
+    case 'trash': {
+      const list = body['paths']
+      if (!Array.isArray(list) || !list.every((entry) => typeof entry === 'string')) return 'paths must be an array of strings'
+      return { type: op, paths: list as string[] }
+    }
+    case 'stage-all':
+    case 'unstage-all':
+    case 'uncommit':
+    case 'fetch-all':
+      return { type: op }
+    case 'commit': {
+      const message = gitText(body, 'message')
+      if (message === undefined) return 'message must be a string'
+      const f = flags('amend', 'signoff', 'noVerify', 'tracked')
+      if (typeof f === 'string') return f
+      return { type: 'commit', message, amend: f['amend'] === true, signoff: f['signoff'] === true, noVerify: f['noVerify'] === true, tracked: f['tracked'] === true }
+    }
+    case 'fetch': {
+      const remote = gitText(body, 'remote')
+      return remote === undefined ? 'remote must be a string' : { type: 'fetch', remote }
+    }
+    case 'pull': {
+      const remote = gitText(body, 'remote')
+      const branch = gitText(body, 'branch', true)
+      if (remote === undefined) return 'remote must be a string'
+      if (branch === undefined) return 'branch must be a string'
+      const f = flags('rebase')
+      if (typeof f === 'string') return f
+      return { type: 'pull', remote, ...(branch === '' ? {} : { branch }), rebase: f['rebase'] === true }
+    }
+    default: {
+      const remote = gitText(body, 'remote')
+      const branch = gitText(body, 'branch')
+      const upstreamBranch = gitText(body, 'upstreamBranch', true)
+      if (remote === undefined) return 'remote must be a string'
+      if (branch === undefined) return 'branch must be a string'
+      if (upstreamBranch === undefined) return 'upstreamBranch must be a string'
+      const f = flags('setUpstream', 'force')
+      if (typeof f === 'string') return f
+      return { type: 'push', remote, branch, upstreamBranch, setUpstream: f['setUpstream'] === true, force: f['force'] === true }
+    }
+  }
+}
+
+/**
+ * `POST …/projects/:pid/git/:op` streams one JSON frame per line: `askpass`
+ * prompts while Git runs, then a single `done`. A request that is invalid
+ * before Git runs answers 400 JSON (the stream starts with the first frame);
+ * Git's own failure is a normal stream with `done.ok === false`. A client that
+ * goes away cancels the operation. `POST …/git/askpass/:promptId` answers a prompt.
+ */
+async function handleProjectGitAction(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: HandlerDeps,
+  wsId: WorkspaceId,
+  pid: ProjectId,
+  action: string,
+): Promise<void> {
+  const json = (status: number, body: unknown): void => {
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    res.end(JSON.stringify(body))
+  }
+  requireWorkspace(deps, wsId, false)
+  const project = deps.workspaces.getProject(pid, wsId)
+  const promptId = /^askpass\/([^/]+)$/.exec(action)?.[1]
+  if (promptId === undefined && !GIT_OPERATIONS.has(action) && !GIT_QUERIES.has(action)) {
+    json(404, { error: `unknown git action '${action}'` })
+    return
+  }
+  if (req.method !== 'POST') {
+    json(405, { error: 'method not allowed' })
+    return
+  }
+  // Git here can run hooks, push and discard work: like approvals, only the
+  // paired browser may drive it.
+  if (!browserPrincipal(req, deps, 'POST')) {
+    json(401, { error: 'git actions require the browser session that owns the workspace' })
+    return
+  }
+  requireWorkspace(deps, wsId, true) // archived: no Git mutation
+  const principalId = (req as IncomingMessage & { dntHarnessPrincipalId?: string }).dntHarnessPrincipalId
+  const owner = { workspaceId: wsId as string, projectId: pid as string }
+
+  let body: GitBody
+  try {
+    body = await readJson(req)
+  } catch (error) {
+    json(400, { error: error instanceof Error ? error.message : 'invalid request body' })
+    return
+  }
+
+  if (promptId !== undefined) {
+    const id = decodeURIComponent(promptId)
+    const keys = Object.keys(body)
+    const password = body['password']
+    const answer = keys.length === 1 && typeof password === 'string' ? { password }
+      : keys.length === 1 && body['cancel'] === true ? { cancel: true as const }
+        : undefined
+    if (answer === undefined) {
+      json(400, { error: 'body must be exactly { password: string } or { cancel: true }' })
+      return
+    }
+    const asker = promptPrincipals.get(id)
+    if (principalId !== undefined && asker !== undefined && asker !== principalId) {
+      json(401, { error: 'prompt belongs to a different browser session' })
+      return
+    }
+    if (!answerGitAskpass(id, answer, owner)) {
+      json(404, { error: 'no such prompt' })
+      return
+    }
+    json(200, { answered: true })
+    return
+  }
+
+  const trusted = project.gitTrusted === true
+  let request: GitOperationRequest | undefined
+  if (GIT_OPERATIONS.has(action)) {
+    const parsed = parseGitOperation(action, body)
+    if (typeof parsed === 'string') {
+      json(400, { error: parsed })
+      return
+    }
+    request = parsed
+  }
+
+  let started = false
+  let aborted = false
+  let session: AskpassSession | undefined
+  const raised = new Set<string>()
+  const frame = (value: unknown): void => {
+    if (res.destroyed || res.writableEnded) return
+    if (!started) {
+      started = true
+      res.writeHead(200, { 'content-type': 'application/x-ndjson; charset=utf-8', 'cache-control': 'no-store' })
+    }
+    res.write(`${JSON.stringify(value)}\n`)
+  }
+  // `res` closes without having ended only when the client went away.
+  const onClose = (): void => {
+    if (res.writableFinished) return
+    aborted = true
+    session?.cancelAll()
+  }
+  res.once('close', onClose)
+  try {
+    if (request === undefined) {
+      if (action === 'remotes') {
+        const branch = gitText(body, 'branch')
+        if (branch === undefined || (body['push'] !== undefined && typeof body['push'] !== 'boolean')) {
+          json(400, { error: 'branch must be a string and push a boolean' })
+          return
+        }
+        frame({ type: 'done', ok: true, stdout: '', stderr: '', remotes: await listProjectGitRemotes(project.path, trusted, branch, body['push'] === true) })
+      } else {
+        frame({ type: 'done', ok: true, stdout: '', stderr: '', pushedTo: await pushedTo(project.path, trusted) })
+      }
+    } else {
+      const result = await runProjectGitOperation(
+        project.path,
+        trusted,
+        request,
+        {
+          operation: action,
+          owner,
+          onPrompt: (prompt) => {
+            raised.add(prompt.promptId)
+            promptPrincipals.set(prompt.promptId, principalId)
+            frame(prompt)
+          },
+          onSession: (live) => {
+            session = live
+            if (aborted) live.cancelAll()
+          },
+        },
+        deps.deniedRoots === undefined ? {} : { deniedRoots: deps.deniedRoots },
+      )
+      frame({
+        type: 'done',
+        ok: result.ok,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        status: result.status,
+        ...(result.cancelled === true ? { cancelled: true } : {}),
+      })
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (!started && !res.headersSent) {
+      if (error instanceof ProjectGitError) json(400, { error: message })
+      else throw error
+    } else {
+      frame({ type: 'done', ok: false, stdout: '', stderr: message })
+    }
+  } finally {
+    res.off('close', onClose)
+    for (const id of raised) promptPrincipals.delete(id)
+    if (started && !res.writableEnded) res.end()
+  }
 }
 
 // ── session operation helpers ──────────────────────────────────
