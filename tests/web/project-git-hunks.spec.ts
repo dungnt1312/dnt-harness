@@ -194,12 +194,12 @@ describe('hunk status in the diff', () => {
     const partial = await gitDiff(repo.dir, 'f.txt', undefined, true)
     expect(partial.hunks.map((hunk) => hunk.status)).toEqual(['partial'])
 
-    const staged = await operate(repo, { type: 'stage-hunk', path: 'f.txt', hunk: partial.hunks[0]! })
+    const staged = await operate(repo, { type: 'stage-hunk', path: 'f.txt', hunk: partial.hunks?.[0]! })
     expect(staged.ok).toBe(true)
     expect(repo.git('show', ':f.txt')).toBe(worktree)
     expect(await statuses(repo)).toEqual(['staged'])
 
-    const shown = (await gitDiff(repo.dir, 'f.txt', undefined, true)).hunks[0]!
+    const shown = (await gitDiff(repo.dir, 'f.txt', undefined, true)).hunks?.[0]!
     const unstaged = await operate(repo, { type: 'unstage-hunk', path: 'f.txt', hunk: shown })
     expect(unstaged.ok).toBe(true)
     expect(repo.git('show', ':f.txt')).toBe(lines(30))
@@ -214,7 +214,7 @@ describe('hunk operations', () => {
     const before = await gitDiff(repo.dir, 'f.txt', undefined, true)
     expect(before.hunks.map((h) => h.status)).toEqual(['unstaged', 'unstaged'])
     const { run, calls } = spy()
-    const done = await operate(repo, { type: 'stage-hunk', path: 'f.txt', hunk: before.hunks[0]! }, { run })
+    const done = await operate(repo, { type: 'stage-hunk', path: 'f.txt', hunk: before.hunks?.[0]! }, { run })
     expect(done.ok).toBe(true)
     expect(calls.some((a) => a[0] === 'hash-object' && a.includes('--stdin'))).toBe(true)
     expect(calls.some((a) => a[0] === 'update-index' && a[1] === '--add' && a[2] === '--cacheinfo')).toBe(true)
@@ -229,7 +229,7 @@ describe('hunk operations', () => {
     repo.git('add', 'f.txt')
     const before = await gitDiff(repo.dir, 'f.txt', undefined, true)
     expect(before.hunks.map((h) => h.status)).toEqual(['staged', 'staged'])
-    const done = await operate(repo, { type: 'unstage-hunk', path: 'f.txt', hunk: before.hunks[1]! })
+    const done = await operate(repo, { type: 'unstage-hunk', path: 'f.txt', hunk: before.hunks?.[1]! })
     expect(done.ok).toBe(true)
     expect(repo.git('show', ':f.txt')).toBe(lines(30).replace('l3\n', 'L3\n'))
     expect(await repo.read('f.txt')).toBe(lines(30).replace('l3\n', 'L3\n').replace('l20\n', 'L20\n'))
@@ -239,7 +239,7 @@ describe('hunk operations', () => {
   it('restores one hunk in the worktree and leaves the other', async () => {
     const repo = await twoHunks()
     const before = await gitDiff(repo.dir, 'f.txt', undefined, true)
-    const done = await operate(repo, { type: 'restore-hunk', path: 'f.txt', hunk: before.hunks[0]! })
+    const done = await operate(repo, { type: 'restore-hunk', path: 'f.txt', hunk: before.hunks?.[0]! })
     expect(done.ok).toBe(true)
     expect(await repo.read('f.txt')).toBe(lines(30).replace('l20\n', 'L20\n'))
     expect(repo.git('diff', '--cached', '--name-only')).toBe('')
@@ -253,7 +253,7 @@ describe('hunk operations', () => {
     await fs.rm(path.join(repo.dir, 'f.txt'))
     const before = await gitDiff(repo.dir, 'f.txt', undefined, true)
     expect(before.hunks.map((h) => h.status)).toEqual(['unstaged'])
-    expect((await operate(repo, { type: 'restore-hunk', path: 'f.txt', hunk: before.hunks[0]! })).ok).toBe(true)
+    expect((await operate(repo, { type: 'restore-hunk', path: 'f.txt', hunk: before.hunks?.[0]! })).ok).toBe(true)
     expect(await repo.read('f.txt')).toBe(lines(3))
     expect(repo.git('status', '--porcelain')).toBe('')
   })
@@ -263,14 +263,14 @@ describe('hunk operations', () => {
     await repo.write('f.txt', lines(3)); repo.git('add', '.'); repo.git('commit', '-qm', 'f')
     await fs.rm(path.join(repo.dir, 'f.txt'))
     const before = await gitDiff(repo.dir, 'f.txt', undefined, true)
-    const done = await operate(repo, { type: 'stage-hunk', path: 'f.txt', hunk: before.hunks[0]! })
+    const done = await operate(repo, { type: 'stage-hunk', path: 'f.txt', hunk: before.hunks?.[0]! })
     expect(done.ok).toBe(true)
     expect(repo.git('status', '--porcelain')).toBe('D  f.txt\n')
   })
 
   it('refuses a stale hunk', async () => {
     const repo = await twoHunks()
-    const old = (await gitDiff(repo.dir, 'f.txt', undefined, true)).hunks[0]!
+    const old = (await gitDiff(repo.dir, 'f.txt', undefined, true)).hunks?.[0]!
     await repo.write('f.txt', lines(30).replace('l3\n', 'X3\n').replace('l20\n', 'L20\n'))
     await expect(operate(repo, { type: 'stage-hunk', path: 'f.txt', hunk: old })).rejects.toThrow(STALE)
     await expect(operate(repo, { type: 'restore-hunk', path: 'f.txt', hunk: old })).rejects.toThrow(STALE)
@@ -283,20 +283,20 @@ describe('hunk operations', () => {
     await repo.write('f.txt', 'a\r\nb\r\nc'); repo.git('add', '.'); repo.git('commit', '-qm', 'f')
     await repo.write('f.txt', 'a\r\nB\r\nc')
     const first = await gitDiff(repo.dir, 'f.txt', undefined, true)
-    expect((await operate(repo, { type: 'stage-hunk', path: 'f.txt', hunk: first.hunks[0]! })).ok).toBe(true)
+    expect((await operate(repo, { type: 'stage-hunk', path: 'f.txt', hunk: first.hunks?.[0]! })).ok).toBe(true)
     expect(repo.git('show', ':f.txt')).toBe('a\r\nB\r\nc')
     repo.git('commit', '-qm', 'B')
 
     // The last line gains a newline and a new unterminated line follows it.
     await repo.write('f.txt', 'a\r\nB\r\nc\r\nd')
     const second = await gitDiff(repo.dir, 'f.txt', undefined, true)
-    expect((await operate(repo, { type: 'stage-hunk', path: 'f.txt', hunk: second.hunks[0]! })).ok).toBe(true)
+    expect((await operate(repo, { type: 'stage-hunk', path: 'f.txt', hunk: second.hunks?.[0]! })).ok).toBe(true)
     expect(repo.git('show', ':f.txt')).toBe('a\r\nB\r\nc\r\nd')
     const staged = await gitDiff(repo.dir, 'f.txt', undefined, true)
-    expect((await operate(repo, { type: 'unstage-hunk', path: 'f.txt', hunk: staged.hunks[0]! })).ok).toBe(true)
+    expect((await operate(repo, { type: 'unstage-hunk', path: 'f.txt', hunk: staged.hunks?.[0]! })).ok).toBe(true)
     expect(repo.git('show', ':f.txt')).toBe('a\r\nB\r\nc')
     const again = await gitDiff(repo.dir, 'f.txt', undefined, true)
-    expect((await operate(repo, { type: 'restore-hunk', path: 'f.txt', hunk: again.hunks[0]! })).ok).toBe(true)
+    expect((await operate(repo, { type: 'restore-hunk', path: 'f.txt', hunk: again.hunks?.[0]! })).ok).toBe(true)
     expect(await repo.read('f.txt')).toBe('a\r\nB\r\nc')
   })
 
