@@ -409,6 +409,8 @@ function ModeView({ draft, onEdit }: { readonly draft: ModeForm; readonly onEdit
           <span>Pinned memory <Badge tone={draft.memoryPinned ? 'green' : 'gray'}>{draft.memoryPinned ? 'On' : 'Off'}</Badge></span>
           <span>Memory retrieval <Badge tone={draft.memoryRetrieval ? 'green' : 'gray'}>{draft.memoryRetrieval ? 'On' : 'Off'}</Badge></span>
           <span>Paths outside granted folders <Badge tone={draft.outOfGrant === 'allow' ? 'green' : 'gray'}>{draft.outOfGrant === 'allow' ? 'Allowed' : 'Ask'}</Badge></span>
+          <span>Read-only shell commands <Badge tone={draft.readOnlyBash === 'allow' ? 'green' : 'gray'}>{draft.readOnlyBash === 'allow' ? 'Run without asking' : 'Follow Bash'}</Badge></span>
+          <span>Risky shell commands <Badge tone={draft.riskyBash === 'ask' ? 'amber' : 'gray'}>{draft.riskyBash === 'ask' ? 'Ask each time' : 'Follow Bash'}</Badge></span>
           <span>MCP tools <Badge tone="gray">{MCP_EXPOSURE_LABELS[draft.mcpExposure ?? 'default']}</Badge></span>
         </div>
       </div>
@@ -549,6 +551,14 @@ function ModeEditor({ draft, onDraft, disabled, isNew, newId, onNewId }: {
         <Switch label="Memory indexes" hint="Load bounded MEMORY.md pointers (not topic bodies). Both memory switches must be on." checked={draft.memoryPinned} disabled={disabled} onChange={(next) => patch({ memoryPinned: next })} />
         <Switch label="Memory retrieval" hint="Permit ordinary file tools to browse scoped Markdown memory. Both memory switches must be on." checked={draft.memoryRetrieval} disabled={disabled} onChange={(next) => patch({ memoryRetrieval: next })} />
         <Switch label="Allow paths outside granted folders" hint="File tools may use other folders without an extra approval. Network, device, and app-storage paths stay refused." checked={draft.outOfGrant === 'allow'} disabled={disabled} onChange={(next) => patch({ outOfGrant: next ? 'allow' : 'ask' })} />
+        <Switch label="Run read-only shell commands without asking" hint="When Bash asks, commands such as ls, git status, or rg that only read inside the project run anyway. Anything the host cannot prove read-only still asks; a deny stays a deny." checked={draft.readOnlyBash === 'allow'} disabled={disabled} onChange={(next) => {
+          const { readOnlyBash: _omit, ...rest } = draft
+          onDraft(next ? { ...rest, readOnlyBash: 'allow' } : rest)
+        }} />
+        <Switch label="Ask before risky shell commands" hint="Even when Bash is allowed, recursive deletes, git reset --hard, forced pushes, and disk tools ask each time. Dangerous Commands still apply on top." checked={draft.riskyBash === 'ask'} disabled={disabled} onChange={(next) => {
+          const { riskyBash: _omit, ...rest } = draft
+          onDraft(next ? { ...rest, riskyBash: 'ask' } : rest)
+        }} />
       </div>
 
       <div className="flex flex-col gap-2.5">

@@ -140,7 +140,7 @@ describe('Plan MCP exposure (concrete allowlist + read-safe name)', () => {
     it('effective values for bundled modes are unchanged', async () => {
       const { BUNDLED_MODES } = await import('../../src/harness/modes/bundled.ts')
       expect(Object.fromEntries(BUNDLED_MODES.map((mode) => [mode.id, effectiveMcpExposure(mode)]))).toEqual({
-        'ask-before-changes': 'all', 'edit-automatically': 'all', plan: 'read-safe', 'full-access': 'all',
+        'ask-before-changes': 'all', 'edit-automatically': 'all', plan: 'read-safe', autonomous: 'all', 'full-access': 'all',
       })
     })
   })

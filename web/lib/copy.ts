@@ -1,7 +1,24 @@
 /** Presentation-only labels. Never translate stored names, messages, paths, or output. */
-const BUILTIN_MODES: Readonly<Record<string, string>> = { 'ask-before-changes': 'Ask before changes', 'edit-automatically': 'Edit automatically', 'full-access': 'Full access', chat: 'Chat', ask: 'Ask', plan: 'Plan', build: 'Build', code: 'Code', review: 'Review', explore: 'Explore' }
+const BUILTIN_MODES: Readonly<Record<string, string>> = { 'ask-before-changes': 'Ask before changes', 'edit-automatically': 'Edit automatically', autonomous: 'Autonomous', 'full-access': 'Full access', chat: 'Chat', ask: 'Ask', plan: 'Plan', build: 'Build', code: 'Code', review: 'Review', explore: 'Explore' }
+const BUILTIN_MODE_HINTS: Readonly<Record<string, string>> = {
+  plan: 'Plan before editing.',
+  'ask-before-changes': 'Ask before file changes.',
+  'edit-automatically': 'Edit files automatically.',
+  autonomous: 'Ask when there’s risk.',
+  'full-access': 'Run with fewer confirmations.',
+}
 export function modeLabel(row: { id: string; name: string; source?: string }): string {
   return row.source === 'bundled' ? (BUILTIN_MODES[row.id] ?? row.name) : row.name
+}
+/** The picker's second line: bundled copy, else the mode's own description. */
+export function modeHint(row: { id: string; description?: string; source?: string }): string | undefined {
+  return row.source === 'bundled' ? (BUILTIN_MODE_HINTS[row.id] ?? row.description) : row.description
+}
+/** One mode picker entry. */
+export interface ModeOption { readonly value: string; readonly label: string; readonly hint?: string }
+export function modeOption(row: { id: string; name: string; description?: string; source?: string }): ModeOption {
+  const hint = modeHint(row)
+  return { value: row.id, label: modeLabel(row), ...(hint !== undefined ? { hint } : {}) }
 }
 export function errorSummary(raw: string): string {
   if (/approval.*(404|not found|resolved)|404.*approval/i.test(raw)) return 'This approval is no longer pending. Check the conversation for its decision.'

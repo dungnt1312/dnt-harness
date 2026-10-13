@@ -35,6 +35,20 @@ export interface ModeDefinition {
    */
   readonly outOfGrant?: 'allow' | 'ask'
   /**
+   * `allow`: a Bash call whose permission resolves to `ask` runs without a
+   * question when the whole command line is provably read-only and stays in
+   * the project folder (`ls`, `git status`, `rg …`; see
+   * `guard/bash-readonly.ts`). It never lifts a `deny`, and Dangerous
+   * Commands still apply. Absent: every such call asks.
+   */
+  readonly readOnlyBash?: 'allow'
+  /**
+   * `ask`: a Bash call that destroys data in bulk (recursive `rm`, `git
+   * reset --hard`, forced push, `mkfs`, …; see `guard/bash-risky.ts`) needs a
+   * per-call approval even when Bash itself is allowed. Absent: no extra ask.
+   */
+  readonly riskyBash?: 'ask'
+  /**
    * Which MCP tools this mode may expose (a ceiling, never a permission):
    * `none`; `read-safe` — only tools named by an explicit server allowlist
    * entry AND carrying a read-safe name prefix; `all` — every enabled,
@@ -73,6 +87,8 @@ export interface ModeFrontmatter {
   /** Keys: a canonical known tool, `mcp__<server>__<tool>`, `mcp__<server>__*`, or `*`. */
   readonly permissionDefaults?: Readonly<Record<string, string>>
   readonly outOfGrant?: string
+  readonly readOnlyBash?: string
+  readonly riskyBash?: string
   readonly mcpExposure?: string
 }
 

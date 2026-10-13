@@ -128,7 +128,7 @@ export function Composer({
   readonly controlsUnavailable?: boolean
   readonly controlsUnavailableMessage?: string
   readonly onRetryControls?: () => void
-  readonly modes: readonly { readonly value: string; readonly label: string }[]
+  readonly modes: readonly { readonly value: string; readonly label: string; readonly hint?: string }[]
   readonly modeValue: string | null
   /** What the picker edits here: a draft's workspace default or the conversation's own live mode. */
   readonly modeMenuLabel?: string

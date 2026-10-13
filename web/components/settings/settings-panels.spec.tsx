@@ -460,6 +460,14 @@ describe('modes panel', () => {
     expect(parseModeForm(raw)).toEqual(form)
   })
 
+  it('round-trips the shell-command properties in the server field order', () => {
+    const form = { ...emptyModeForm(), name: 'Guarded', instructions: 'Go.', outOfGrant: 'ask' as const, readOnlyBash: 'allow' as const, riskyBash: 'ask' as const, mcpExposure: 'all' as const }
+    const raw = serializeModeForm(form)
+    // Same order as serializeModeFile: outOfGrant, readOnlyBash, riskyBash, mcpExposure.
+    expect(raw).toContain('\noutOfGrant: ask\nreadOnlyBash: allow\nriskyBash: ask\nmcpExposure: all\n---')
+    expect(parseModeForm(raw)).toEqual(form)
+  })
+
   it('rejects a permission key the gate would never consult', () => {
     expect(permissionKeyError('Read')).toBeNull()
     expect(permissionKeyError('*')).toBeNull()

@@ -388,7 +388,8 @@ describe('live guard authority on a real host (fake Bash)', () => {
     const host = await bootGuardHost()
     await setWorkspaceMode(host, host.wsId, 'full-access')
     const root = await openSession(host, host.wsId, 'ask-before-changes')
-    await root.run('echo innocuous')
+    // Not read-only (read-only commands no longer ask in this mode), not dangerous.
+    await root.run('npm run lint')
     const question = await root.stream.wait(isApproval, 'approval')
     expect(question.guardWarning).toBeUndefined()
 
@@ -400,7 +401,7 @@ describe('live guard authority on a real host (fake Bash)', () => {
     // 200 (not 404) proves the question was still pending and answerable.
     expect((await answer(host, question.approvalId, true)).status).toBe(200)
     expect((await root.toolResult(0)).event?.ok).toBe(true)
-    expect(host.executed).toEqual(['echo innocuous'])
+    expect(host.executed).toEqual(['npm run lint'])
     expect(decisions(root).map((frame) => frame.event?.decision)).toEqual(['allow'])
   }, 20_000)
 
@@ -556,5 +557,54 @@ describe('live guard authority on a real host (fake Bash)', () => {
     expect(result.event?.ok).toBe(false)
     expect(result.event?.output).toMatch(/^denied: current authority requires fresh approval for 'Bash'/)
     expect(host.executed).toEqual([])
+  }, 20_000)
+})
+
+describe('mode Bash properties on a real host (fake Bash)', () => {
+  it('Ask before changes runs a read-only, contained command without a question', async () => {
+    const host = await bootGuardHost()
+    const root = await openSession(host, host.wsId, 'ask-before-changes')
+    await root.run('git status && ls -la')
+    expect((await root.toolResult(0)).event?.ok).toBe(true)
+    expect(host.executed).toEqual(['git status && ls -la'])
+    expect(requests(root)).toEqual([])
+  }, 20_000)
+
+  it('Ask before changes still asks for a write or an out-of-project read', async () => {
+    const host = await bootGuardHost()
+    const root = await openSession(host, host.wsId, 'ask-before-changes')
+    await root.run('cat /etc/hosts')
+    const question = await root.stream.wait(isApproval, 'approval')
+    expect(question.guardWarning).toBeUndefined()
+    expect((await answer(host, question.approvalId, false)).status).toBe(200)
+    expect((await root.toolResult(0)).event?.ok).toBe(false)
+    expect(host.executed).toEqual([])
+  }, 20_000)
+
+  it('Autonomous runs ordinary commands and asks before a risky one, naming the risk', async () => {
+    const host = await bootGuardHost()
+    // Dangerous Commands off for git so only the mode's risky ask is in play.
+    expect(await saveGuard(host, host.wsId, setPreset('gitDestructive', 'off'))).toBe(200)
+    const root = await openSession(host, host.wsId, 'autonomous')
+    await root.run('npm install && echo ok')
+    expect((await root.toolResult(0)).event?.ok).toBe(true)
+    expect(requests(root)).toEqual([])
+
+    const from = root.stream.frames.length
+    await root.run(DANGEROUS_ASK)
+    const question = await root.stream.wait(isApproval, 'risky approval', from)
+    expect(question.guardWarning).toMatch(/Risky command: git reset --hard/)
+    expect((await answer(host, question.approvalId, true)).status).toBe(200)
+    expect((await root.toolResult(from)).event?.ok).toBe(true)
+    expect(host.executed).toEqual(['npm install && echo ok', DANGEROUS_ASK])
+  }, 20_000)
+
+  it('Full access does not add the risky ask', async () => {
+    const host = await bootGuardHost()
+    expect(await saveGuard(host, host.wsId, setPreset('gitDestructive', 'off'))).toBe(200)
+    const root = await openSession(host, host.wsId, 'full-access')
+    await root.run(DANGEROUS_ASK)
+    expect((await root.toolResult(0)).event?.ok).toBe(true)
+    expect(requests(root)).toEqual([])
   }, 20_000)
 })

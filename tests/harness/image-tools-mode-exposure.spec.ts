@@ -17,6 +17,7 @@ describe('media tool mode exposure', () => {
     const expected: Record<string, string | undefined> = {
       'ask-before-changes': 'ask',
       'edit-automatically': 'ask',
+      autonomous: 'ask',
       'full-access': 'allow',
       plan: undefined,
     }

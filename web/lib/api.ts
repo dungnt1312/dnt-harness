@@ -872,6 +872,8 @@ export interface ModeRow {
   readonly source: 'bundled' | 'workspace'
 }
 
+  /** One-line summary shown under the name in the picker. */
+  readonly description?: string
 export interface ModeSelection {
   readonly modes: readonly ModeRow[]
   readonly selected: string

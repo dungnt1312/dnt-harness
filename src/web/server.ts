@@ -45,6 +45,7 @@ import { approvalCallFingerprint, attachApproval, createApprovalReceiptRegistry,
 import { resolvePermission } from '../harness/approval/resolution.ts'
 import { composeAuthority, type AskRequirement, type AuthorityDecision } from '../harness/tools/authority.ts'
 import { DangerousCommandsStore } from '../harness/guard/store.ts'
+import { liftsReadOnlyBash, riskyBashMatch, riskyBashWarning } from '../harness/modes/bash-policy.ts'
 import { attachDangerousCommandGuard, guardMatchFingerprint } from '../harness/guard/guard.ts'
 import { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from '../harness/limits.ts'
 import { LlmService } from '../harness/llm/service.ts'
@@ -3392,9 +3393,16 @@ ${entry.description}`.toLowerCase().includes(query))
         // Root sessions only: a child never inherits or creates a command grant.
         const commandAllowed = normalPermission === 'ask' && sessionId === rootSessionId && agentScope.getStore()?.childOf === undefined
           && turnCommandGrants.allows(sessionId, call, grant?.root)
-        const permission = (memoryWrite || commandAllowed) && normalPermission === 'ask' ? 'allow' : normalPermission
+        // A mode with `readOnlyBash: allow` lifts a Bash `ask` (never a deny)
+        // for a provably read-only, project-contained command line.
+        const readOnlyBash = normalPermission === 'ask' && liftsReadOnlyBash(mode, call)
+        const permission = (memoryWrite || commandAllowed || readOnlyBash) && normalPermission === 'ask' ? 'allow' : normalPermission
         const requirements: AskRequirement[] = []
         if (permission === 'ask') requirements.push({ kind: 'tool-policy', subjectFingerprint: createHash('sha256').update(`${call.name}:ask`).digest('hex') })
+        // `riskyBash: ask` (Autonomous): a bulk-destructive command asks per
+        // call even though Bash is allowed. `--yolo` maps mode asks away.
+        const risky = options.yolo === true ? null : riskyBashMatch(mode, call)
+        if (risky !== null) requirements.push({ kind: 'risky-command', subjectFingerprint: createHash('sha256').update(`risky:${risky.ruleId}`).digest('hex') })
         const outside = pathScope.get(executionId, call)
         if (outside !== undefined && currentOutsideRequirement(outside, mode.outOfGrant)) requirements.push({ kind: 'outside-path', subjectFingerprint: createHash('sha256').update(`${outside.path}:${outside.intent}`).digest('hex') })
         const guardEvaluation = await dangerousGuard.evaluate(call, workspaceId, {
@@ -3481,9 +3489,10 @@ ${entry.description}`.toLowerCase().includes(query))
         // must agree, or log-derived questions POST 404s.
         const approvalId = lifecycle.approvalId
         const guardMatch = dangerousGuard.getMatch(call, lifecycle.executionId)
+        const riskyMatch = options.yolo === true ? null : riskyBashMatch(executingMode().mode.definition, call)
         const guardWarning = guardMatch?.action === 'ask'
           ? `Dangerous Commands: matched ${guardMatch.presetId ?? guardMatch.ruleId ?? 'rule'} — ${guardMatch.reason}`
-          : undefined
+          : riskyMatch !== null ? riskyBashWarning(riskyMatch) : undefined
         const workspaceId = (scope.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)) as WorkspaceId
         const interactive = toolRequiresInteraction(call, scope.workspaceId, mcpDescriptors)
         const parentSessionId = scope.childOf?.parentSessionId
@@ -6013,9 +6022,14 @@ async function handleApi(
         const state = deps.controlsFor(wsId)
         // The picker lists enabled modes only; the authoring catalog below is
         // where a mode is disabled and re-enabled.
-        const disabled = new Set(await deps.modes.disabledIds(wsId))
+        const hidden = new Set(await deps.modes.hiddenIds(wsId))
         send(200, {
-          modes: rows.filter((row) => !disabled.has(row.definition.id)).map((row) => ({ id: row.definition.id, name: row.definition.name, source: row.source })),
+          modes: rows.filter((row) => !hidden.has(row.definition.id)).map((row) => ({
+            id: row.definition.id,
+            name: row.definition.name,
+            ...(row.definition.description !== undefined ? { description: row.definition.description } : {}),
+            source: row.source,
+          })),
           selected: state.modeId,
           revision: state.modeRevision,
         })
@@ -6112,10 +6126,10 @@ async function handleApi(
       const modeId = wsModesMatch[2] !== undefined ? decodeURIComponent(wsModesMatch[2]) : undefined
       if (req.method === 'GET' && modeId === undefined) {
         const rows = await deps.modes.list(wsId)
-        const disabled = new Set(await deps.modes.disabledIds(wsId))
+        const disabled = new Set(await deps.modes.hiddenIds(wsId))
         // Permissions and exposure travel with the catalog: the settings list
         // states what each mode grants without a read per row. `enabled`
-        // marks what the composer picker offers.
+        // marks what the composer picker offers (default-hidden modes included).
         send(200, rows.map((row) => ({
           id: row.definition.id,
           name: row.definition.name,

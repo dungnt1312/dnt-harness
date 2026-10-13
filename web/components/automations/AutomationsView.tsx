@@ -41,7 +41,7 @@ import { currentEndpoint, enablePush, pushSupport } from '../../pwa/push-client.
 /** What the editor needs from the shell to render the composer-style chips. */
 export interface AutomationControlsContext {
   readonly projects: readonly ProjectRow[]
-  readonly modes: readonly { readonly value: string; readonly label: string }[]
+  readonly modes: readonly { readonly value: string; readonly label: string; readonly hint?: string }[]
   readonly defaultModeId: string | null
   readonly modelOptions: readonly ModelOption[]
   readonly providers: readonly ProviderSummary[]

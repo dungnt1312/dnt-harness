@@ -12,7 +12,7 @@ import { ToolCard, ActivityBlock, AssistantMessage, DelegationCard, AuditLine, S
 import { QueuedBar } from '../components/chat/QueuedBar.tsx'
 import { groupBlocks, rowItems, turnFooters } from '../components/chat/Transcript.tsx'
 import { activeMinimapIndex, minimapEntries, minimapPreview, minimapScrollTarget } from '../components/chat/ConversationMinimap.tsx'
-import { modeLabel, errorSummary } from './copy.ts'
+import { modeLabel, modeOption, errorSummary } from './copy.ts'
 import { emptyDraft, textDraft } from './composer-draft.ts'
 import { budgetTone, formatTime } from './format.ts'
 import { hiddenSpawnCalls } from './spawn-merge.ts'
@@ -609,6 +609,11 @@ describe('presentation ownership', () => {
     expect(modeLabel({ id: 'plan', name: 'Kế hoạch', source: 'bundled' })).toBe('Plan')
     expect(modeLabel({ id: 'plan', name: 'Kế hoạch riêng', source: 'workspace' })).toBe('Kế hoạch riêng')
   })
+  it('gives bundled modes the picker hint and custom modes their own description', () => {
+    expect(modeOption({ id: 'autonomous', name: 'Autonomous', source: 'bundled' })).toEqual({ value: 'autonomous', label: 'Autonomous', hint: 'Ask when there’s risk.' })
+    expect(modeOption({ id: 'review', name: 'Review', description: 'Read-only review', source: 'workspace' }).hint).toBe('Read-only review')
+    expect(modeOption({ id: 'bare', name: 'Bare', source: 'workspace' })).toEqual({ value: 'bare', label: 'Bare' })
+  })
   it('formats only verified dates in explicit English', () => {
     expect(formatTime()).toBe('')
     expect(formatTime(1789120800000)).toMatch(/AM|PM/)
@@ -631,6 +636,21 @@ describe('mode menu', () => {
     const items = [...panel.querySelectorAll('[role="menuitemradio"]')]
     expect(items).toHaveLength(2)
     await act(async () => (items[0] as HTMLButtonElement).click())
+  })
+  it('shows each mode with its one-line hint and separates Plan from the ladder', async () => {
+    const modes = [
+      { value: 'plan', label: 'Plan', hint: 'Plan before editing.' },
+      { value: 'ask-before-changes', label: 'Ask before changes', hint: 'Ask before file changes.' },
+      { value: 'autonomous', label: 'Autonomous', hint: 'Ask when there’s risk.' },
+      { value: 'full-access', label: 'Full access', hint: 'Run with fewer confirmations.' },
+    ]
+    await mount(<ModeMenu modes={modes} value="full-access" onChange={() => {}} />)
+    await act(async () => trigger().click())
+    const panel = document.body.querySelector<HTMLElement>('[role="menu"]')!
+    expect(panel.textContent).toContain('Ask when there’s risk.')
+    expect(panel.querySelectorAll('[role="menuitemradio"]')).toHaveLength(4)
+    expect(panel.querySelectorAll('[role="separator"]')).toHaveLength(1)
+    expect(panel.querySelector('[aria-checked="true"]')?.textContent).toContain('Full access')
   })
 })
 

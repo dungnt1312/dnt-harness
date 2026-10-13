@@ -43,7 +43,7 @@ export interface ExposureScope {
   } | undefined
 }
 
-export type ExposureMode = Pick<ModeDefinition, 'id' | 'name' | 'toolExposure'> & Pick<Partial<ModeDefinition>, 'permissionDefaults' | 'outOfGrant' | 'mcpExposure'>
+export type ExposureMode = Pick<ModeDefinition, 'id' | 'name' | 'toolExposure'> & Pick<Partial<ModeDefinition>, 'permissionDefaults' | 'outOfGrant' | 'readOnlyBash' | 'riskyBash' | 'mcpExposure'>
 
 /** Tools whose exposure means a mode can change the workspace. */
 const MUTATING_BUILTINS = ['Write', 'Edit', 'Bash']

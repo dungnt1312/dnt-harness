@@ -21,11 +21,57 @@ afterAll(async () => {
 const WS = 'ws-modes' as never
 
 describe('bundled modes', () => {
-  it('exactly four bundled modes exist and replace the generic Agent preset', () => {
+  it('exactly five bundled modes exist, in the picker ladder order', () => {
     expect(BUNDLED_MODES.map((mode) => mode.id)).toEqual([
-      'ask-before-changes', 'edit-automatically', 'plan', 'full-access',
+      'plan', 'ask-before-changes', 'edit-automatically', 'autonomous', 'full-access',
     ])
-    expect(BUNDLED_MODES).toHaveLength(4)
+    expect(BUNDLED_MODES).toHaveLength(5)
+  })
+
+  it('Bash properties: read-only lift for the ask modes, risky ask for Autonomous only', () => {
+    const byId = Object.fromEntries(BUNDLED_MODES.map((mode) => [mode.id, mode]))
+    expect(byId['ask-before-changes']!.readOnlyBash).toBe('allow')
+    expect(byId['edit-automatically']!.readOnlyBash).toBe('allow')
+    expect(byId['autonomous']!.riskyBash).toBe('ask')
+    expect(byId['autonomous']!.permissionDefaults.Bash).toBe('allow')
+    // Autonomous keeps the out-of-grant question; Full access drops it.
+    expect(byId['autonomous']!.outOfGrant).toBeUndefined()
+    expect(byId['full-access']!.outOfGrant).toBe('allow')
+    expect(byId['full-access']!.riskyBash).toBeUndefined()
+    expect(byId['plan']!.readOnlyBash).toBeUndefined()
+  })
+
+  it('parses, rejects, and round-trips the Bash properties', () => {
+    const parsed = parseModeFile('x', '---\noutOfGrant: ask\nreadOnlyBash: allow\nriskyBash: ask\nmcpExposure: all\n---\n\nbody')
+    expect(parsed.readOnlyBash).toBe('allow')
+    expect(parsed.riskyBash).toBe('ask')
+    expect(parseModeFile('x', serializeModeFile(parsed))).toEqual(parsed)
+    // The web editor writes the same field order (settings-panels.spec).
+    expect(serializeModeFile(parsed)).toContain('\noutOfGrant: ask\nreadOnlyBash: allow\nriskyBash: ask\nmcpExposure: all\n---')
+    expect(() => parseModeFile('x', '---\nreadOnlyBash: ask\n---\n\nbody')).toThrow(/readOnlyBash/)
+    expect(() => parseModeFile('x', '---\nriskyBash: allow\n---\n\nbody')).toThrow(/riskyBash/)
+    for (const mode of BUNDLED_MODES) expect(parseModeFile(mode.id, serializeModeFile(mode))).toEqual(mode)
+  })
+
+  it('hides Edit automatically from a new workspace picker until shown, and never hides a selected one', async () => {
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-modes-hidden-'))
+    try {
+      const modes = new ModesService(dir)
+      expect(await modes.hiddenIds('w1')).toEqual(['edit-automatically'])
+      // Hidden from the menu, still selectable (not disabled).
+      expect(await modes.disabledIds('w1')).toEqual([])
+      await modes.setEnabled('w1', 'edit-automatically', true)
+      expect(await modes.hiddenIds('w1')).toEqual([])
+      await modes.setEnabled('w1', 'edit-automatically', false)
+      expect(await modes.hiddenIds('w1')).toEqual(['edit-automatically'])
+      expect(await modes.disabledIds('w1')).toEqual(['edit-automatically'])
+      // A workspace that already selected it keeps it visible and selected.
+      await modes.setSelected('w2', 'edit-automatically')
+      expect(await modes.hiddenIds('w2')).toEqual([])
+      expect(await modes.selectedId('w2')).toBe('edit-automatically')
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
   })
 
   it('a custom mode can expose no tools and disable every context loader', async () => {
@@ -53,7 +99,7 @@ describe('bundled modes', () => {
 
   it('every mode has exactly the four fields with distinct defaults vs exposure', async () => {
     const modes = new ModesService(home)
-    for (const id of ['ask-before-changes', 'edit-automatically', 'plan', 'full-access']) {
+    for (const id of ['ask-before-changes', 'edit-automatically', 'plan', 'autonomous', 'full-access']) {
       const mode = await modes.resolve(WS, id)
       expect(mode.definition.instructions.length).toBeGreaterThan(0)
       expect(mode.definition.sources.history).toBeTruthy()

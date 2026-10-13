@@ -14,7 +14,7 @@ export interface AuthorityFacts {
 }
 
 export interface AskRequirement {
-  readonly kind: 'tool-policy' | 'dangerous-command' | 'outside-path' | 'interaction'
+  readonly kind: 'tool-policy' | 'dangerous-command' | 'risky-command' | 'outside-path' | 'interaction'
   readonly subjectFingerprint?: string
   readonly version?: string | number
 }

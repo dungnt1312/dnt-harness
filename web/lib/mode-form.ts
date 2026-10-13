@@ -27,6 +27,10 @@ export interface ModeForm {
    * extra approval. Absent means the default (`ask`) and is not written.
    */
   readonly outOfGrant?: 'allow' | 'ask'
+  /** `allow`: read-only, project-contained Bash commands skip a Bash `ask`. */
+  readonly readOnlyBash?: 'allow'
+  /** `ask`: bulk-destructive Bash commands ask even when Bash is allowed. */
+  readonly riskyBash?: 'ask'
   /** MCP ceiling; absent means derived by the server (read-only modes → read-safe). */
   readonly mcpExposure?: McpExposureChoice
 }
@@ -56,6 +60,8 @@ type LooseFrontmatter = {
   toolExposure?: unknown
   permissionDefaults?: unknown
   outOfGrant?: unknown
+  readOnlyBash?: unknown
+  riskyBash?: unknown
 }
 
 /**
@@ -85,6 +91,8 @@ export function parseModeForm(raw: string): ModeForm {
     form.permissions = permissions
   }
   if (frontmatter.outOfGrant === 'allow' || frontmatter.outOfGrant === 'ask') form.outOfGrant = frontmatter.outOfGrant
+  if (frontmatter.readOnlyBash === 'allow') form.readOnlyBash = 'allow'
+  if (frontmatter.riskyBash === 'ask') form.riskyBash = 'ask'
   if (typeof frontmatter.description === 'string' && frontmatter.description.trim() !== '') form.description = frontmatter.description.trim()
   if (frontmatter.mcpExposure === 'none' || frontmatter.mcpExposure === 'read-safe' || frontmatter.mcpExposure === 'all') form.mcpExposure = frontmatter.mcpExposure
   return form
@@ -120,6 +128,8 @@ export function serializeModeForm(form: ModeForm): string {
     `toolExposure: ${JSON.stringify(form.exposure)}`,
     `permissionDefaults: ${JSON.stringify(form.permissions)}`,
     ...(form.outOfGrant !== undefined ? [`outOfGrant: ${form.outOfGrant}`] : []),
+    ...(form.readOnlyBash !== undefined ? [`readOnlyBash: ${form.readOnlyBash}`] : []),
+    ...(form.riskyBash !== undefined ? [`riskyBash: ${form.riskyBash}`] : []),
     ...(form.mcpExposure !== undefined ? [`mcpExposure: ${form.mcpExposure}`] : []),
   ]
   return `---\n${fm.join('\n')}\n---\n\n${form.instructions.trim()}\n`

@@ -15,7 +15,7 @@ src/harness/
 ├── approval/  Policy riding tools/pre-execute: allow | ask | deny
 ├── guard/     Dangerous command guard riding tools/rewrite: preset deny/ask on Bash content
 ├── workspace/ Workspace registry, project binding, ownership, writer leases
-├── modes/     Four bundled + custom file modes (instructions, sources, exposure, permissions)
+├── modes/     Five bundled + custom file modes (instructions, sources, exposure, permissions, Bash properties)
 ├── context/   Mode-driven builder: budget, trim order, compaction, per-request manifest
 ├── skills/    Workspace skill files + on-demand, mode-gated loading
 ├── memory/    Workspace/project Markdown topic files + MEMORY.md indexes
@@ -424,8 +424,17 @@ permission layer; workspace overrides and policy routes do not exist. Web
 `--yolo` maps every `ask` in that map to `allow`, while preserving every
 explicit `deny`; unnamed tools still use the unchanged `defaultMode` fallback.
 Headless uses its explicit map. Interactive MCP (`requiresUserInteraction`)
-still force-asks. Bundled Full access carries a `'*': 'allow'` catch-all, so
-MCP tools run there without asking.
+still force-asks. Bundled Autonomous and Full access carry a `'*': 'allow'`
+catch-all, so MCP tools run there without asking.
+
+Bundled modes, in picker order: **Plan** (read-only tools), **Ask before
+changes** (writes, Bash and delegation ask; read-only Bash runs),
+**Edit automatically** (edits run; Bash asks unless read-only — hidden from a
+new workspace's picker, see `DEFAULT_HIDDEN_MODE_IDS`; a workspace that
+already selected it keeps it), **Autonomous** (everything runs except risky
+Bash, paid media generation, and paths outside the granted folders), and
+**Full access** (everything runs, including out-of-grant paths). Every mode
+still passes Dangerous Commands, host `blockedTools` and interactive MCP.
 
 On re-evaluation (a mode switch while a call waits), the exposure check
 matches the host gate: built-ins must be listed by name, while `mcp__*` calls
@@ -492,6 +501,38 @@ The guard never widens a Mode denial (`toolExposure` or
 approvals the same way they always have. It is advisory application-level
 matching, not shell confinement: Bash still has the OS user's reach, and the
 known parser/obfuscation gaps above remain outside this non-sandbox guard.
+
+### Mode Bash properties (`guard/shell-parse.ts`, `bash-readonly.ts`, `bash-risky.ts`)
+
+Two optional mode fields change how one Bash call is gated, modelled on
+ZCode's `build`/`guarded` modes. Both read the command through a small POSIX
+word splitter that refuses (`unsupported`) anything it cannot analyze
+statically: `$(…)`, backticks, subshells and groups, background `&`, heredocs,
+process substitution and unterminated quotes.
+
+- **`readOnlyBash: allow`** (Ask before changes, Edit automatically): a Bash
+  call whose permission resolves to `ask` runs without a question when every
+  simple command is an allowlisted inspection program (`ls`, `cat`, `rg`,
+  `grep`, `wc`, `find` without `-exec`/`-delete`, read-only `git`
+  subcommands without global options, …), no word expands (`$`), the only
+  redirects are `2>/dev/null`/`2>&1`-style discards or contained input, and
+  no argument is absolute, `~`-relative or contains `..`. Unknown programs,
+  unknown shapes and write options (`sort -o`, `rg --pre`, `git diff
+  --ext-diff`) stay `ask`. It never lifts a `deny`.
+- **`riskyBash: ask`** (Autonomous): even with `Bash: allow`, a call adds a
+  `risky-command` requirement when a parsed invocation — after unwrapping
+  `env`/`sudo`/`time`/`nice`/`nohup`/`command`/`xargs` and one or more
+  `sh -c '<literal>'` payloads — is a recursive or multi-target `rm`, `dd`,
+  `mkfs*`, `mount`/`umount`/`diskutil`/`shred`/`wipefs`, `rsync --delete`,
+  `find -delete`/`-exec rm`, or a destructive git form (`reset --hard`,
+  `clean -f`, forced push incl. `+ref`/`--force-with-lease`, `checkout -f|.`,
+  `restore .`, `stash clear`, `worktree remove --force`, `branch -D`). A line
+  the parser refuses still asks when it mentions `rm`/`dd`/`shred`/`mkfs`/`eval`.
+  The approval card shows `Risky command: <label>` in the guard-warning slot.
+  `--yolo` drops it, like every other mode ask.
+
+Dangerous Commands keeps applying on top of both. Like the guard, these are
+approval UX, not confinement.
 
 ## Path-scope guard (`src/web/path-scope-guard.ts`)
 

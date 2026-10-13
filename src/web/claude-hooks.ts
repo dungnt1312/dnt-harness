@@ -56,6 +56,8 @@ export function claudePermissionMode(modeId: string | undefined): string {
     case 'edit-automatically': return 'acceptEdits'
     case 'plan': return 'plan'
     case 'full-access': return 'bypassPermissions'
+    // Claude has no "ask only on risk" value; edits run without asking.
+    case 'autonomous': return 'acceptEdits'
     default: return 'default'
   }
 }

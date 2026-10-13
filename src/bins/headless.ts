@@ -57,6 +57,7 @@ import { DEFAULT_BUDGET } from '../harness/context/budget.ts'
 import { resolvePermission } from '../harness/approval/resolution.ts'
 import { attachDangerousCommandGuard } from '../harness/guard/guard.ts'
 import { DangerousCommandsStore } from '../harness/guard/store.ts'
+import { liftsReadOnlyBash, riskyBashMatch } from '../harness/modes/bash-policy.ts'
 import { defaultSecretRoots } from '../capabilities/fs/secret-roots.ts'
 import { homedir } from 'node:os'
 
@@ -198,10 +199,20 @@ async function main(): Promise<void> {
       return { config, hash, revision: hash }
     },
   })
+  const policy: Record<string, 'allow' | 'ask' | 'deny'> = Object.fromEntries(Object.entries(mode.definition.permissionDefaults).map(([name, permission]) => [name, yolo && permission !== 'deny' ? 'allow' : permission]))
   const options: ApprovalOptions = {
     defaultMode: yolo ? 'allow' : 'ask', askUser,
-    forceAsk: (call, approvalScope) => dangerousGuard.getMatch(call, approvalScope.executionId)?.action === 'ask',
-    policy: Object.fromEntries(Object.entries(mode.definition.permissionDefaults).map(([name, permission]) => [name, yolo && permission !== 'deny' ? 'allow' : permission])),
+    // Same Bash mode properties as the web host: read-only commands lift an
+    // ask, risky ones (Autonomous) force one.
+    authorityResolver: (call) => {
+      const permission = resolvePermission(policy, call.name, { defaultMode: yolo ? 'allow' : 'ask' })
+      if (permission === 'deny') return { kind: 'deny', reason: `policy denies '${call.name}'` }
+      if (permission === 'ask' && !liftsReadOnlyBash(mode.definition, call)) return { kind: 'ask', requirements: [{ kind: 'tool-policy' }] }
+      return { kind: 'allow' }
+    },
+    forceAsk: (call, approvalScope) => dangerousGuard.getMatch(call, approvalScope.executionId)?.action === 'ask'
+      || (!yolo && riskyBashMatch(mode.definition, call) !== null),
+    policy,
   }
   attachApproval(kernel.ctx, options)
   for (const tool of fsTools()) {

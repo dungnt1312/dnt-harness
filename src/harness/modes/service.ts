@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
-import { BUNDLED_MODES, DEFAULT_MODE_ID, KNOWN_MODE_TOOLS } from './bundled.ts'
+import { BUNDLED_MODES, DEFAULT_HIDDEN_MODE_IDS, DEFAULT_MODE_ID, KNOWN_MODE_TOOLS } from './bundled.ts'
 import { ModeError, type McpExposure, type ModeDefinition, type ModeFrontmatter, type ModeSources, type ResolvedMode } from './types.ts'
 
 export { BUNDLED_MODES, DEFAULT_MODE_ID }
@@ -155,10 +155,10 @@ export class ModesService {
       // A saved mode is an enabled mode: a recreated id must not inherit the
       // old entry's hidden state.
       await this.withMutationLock(workspaceId, '.disabled', async () => {
-        const disabled = new Set(await this.disabledIds(workspaceId))
+        const state = await this.pickerState(workspaceId)
+        const disabled = new Set(state.disabled)
         if (!disabled.delete(id)) return
-        const stateFile = this.disabledPath(workspaceId)
-        await replaceFileAtomic(stateFile, `${JSON.stringify({ disabled: [...disabled] }, null, 2)}\n`)
+        await this.writePickerState(workspaceId, [...disabled], state.enabled)
       })
       return { definition, source: 'workspace', hash: sha256(raw) }
     })
@@ -247,21 +247,53 @@ export class ModesService {
     return path.join(this.dir(workspaceId), '.disabled.json')
   }
 
-  /** Ids this workspace has hidden from its mode picker. Absent file → none. */
-  async disabledIds(workspaceId: string): Promise<readonly string[]> {
+  /** The stored picker state: explicit hides and explicit shows of default-hidden modes. */
+  private async pickerState(workspaceId: string): Promise<{ disabled: string[]; enabled: string[] }> {
     let raw: string
     try {
       raw = await fs.readFile(this.disabledPath(workspaceId), 'utf8')
     } catch {
-      return []
+      return { disabled: [], enabled: [] }
     }
     try {
-      const parsed = JSON.parse(raw) as { disabled?: unknown }
-      if (!Array.isArray(parsed.disabled)) return []
-      return parsed.disabled.filter((id): id is string => typeof id === 'string')
+      const parsed = JSON.parse(raw) as { disabled?: unknown; enabled?: unknown }
+      const strings = (value: unknown): string[] => Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : []
+      return { disabled: strings(parsed.disabled), enabled: strings(parsed.enabled) }
     } catch {
-      return []
+      return { disabled: [], enabled: [] }
     }
+  }
+
+  /** The raw persisted selection, without validation (avoids recursion). */
+  private async rawSelected(workspaceId: string): Promise<string | undefined> {
+    try {
+      const parsed = JSON.parse(await fs.readFile(this.selectedPath(workspaceId), 'utf8')) as { selected?: unknown; modeId?: unknown }
+      const candidate = parsed.selected ?? parsed.modeId
+      return typeof candidate === 'string' ? candidate.trim() : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** Ids this workspace explicitly disabled: refused for selection. Absent file → none. */
+  async disabledIds(workspaceId: string): Promise<readonly string[]> {
+    return (await this.pickerState(workspaceId)).disabled
+  }
+
+  /**
+   * Ids the mode picker hides: the disabled set, plus `DEFAULT_HIDDEN_MODE_IDS`
+   * the workspace has not turned on. A default-hidden mode stays selectable
+   * (only the menu omits it), and one the workspace already selected stays
+   * visible, so an upgrade never silently changes a workspace's mode.
+   */
+  async hiddenIds(workspaceId: string): Promise<readonly string[]> {
+    const state = await this.pickerState(workspaceId)
+    const selected = await this.rawSelected(workspaceId)
+    const hidden = new Set(state.disabled)
+    for (const id of DEFAULT_HIDDEN_MODE_IDS) {
+      if (!state.enabled.includes(id) && id !== selected) hidden.add(id)
+    }
+    return [...hidden]
   }
 
   /**
@@ -272,20 +304,32 @@ export class ModesService {
   async setEnabled(workspaceId: string, id: string, enabled: boolean): Promise<void> {
     await this.resolve(workspaceId, id) // not-found / invalid surfaces here
     await this.withMutationLock(workspaceId, '.disabled', async () => {
-      const current = new Set(await this.disabledIds(workspaceId))
-      if (enabled) current.delete(id)
-      else current.add(id)
-      const file = this.disabledPath(workspaceId)
-      await fs.mkdir(path.dirname(file), { recursive: true })
-      await replaceFileAtomic(file, `${JSON.stringify({ disabled: [...current] }, null, 2)}\n`)
+      const state = await this.pickerState(workspaceId)
+      const disabled = new Set(state.disabled)
+      const shown = new Set(state.enabled)
+      if (enabled) {
+        disabled.delete(id)
+        if (DEFAULT_HIDDEN_MODE_IDS.includes(id)) shown.add(id)
+      } else {
+        disabled.add(id)
+        shown.delete(id)
+      }
+      await this.writePickerState(workspaceId, [...disabled], [...shown])
     })
+  }
+
+  private async writePickerState(workspaceId: string, disabled: readonly string[], enabled: readonly string[]): Promise<void> {
+    const file = this.disabledPath(workspaceId)
+    await fs.mkdir(path.dirname(file), { recursive: true })
+    const body = enabled.length > 0 ? { disabled, enabled } : { disabled }
+    await replaceFileAtomic(file, `${JSON.stringify(body, null, 2)}\n`)
   }
 }
 
 /** The exact frontmatter keys a mode file may carry. */
 const KNOWN_FRONTMATTER_KEYS = new Set([
   'name', 'description', 'history', 'workspaceInstructions', 'skills',
-  'memoryPinned', 'memoryRetrieval', 'toolExposure', 'permissionDefaults', 'outOfGrant', 'mcpExposure',
+  'memoryPinned', 'memoryRetrieval', 'toolExposure', 'permissionDefaults', 'outOfGrant', 'readOnlyBash', 'riskyBash', 'mcpExposure',
 ])
 
 /**
@@ -401,6 +445,17 @@ export function parseModeFile(id: string, raw: string): ModeDefinition {
     else invalid.push(`'outOfGrant' must be allow|ask, got ${JSON.stringify(frontmatter.outOfGrant)}`)
   }
 
+  let readOnlyBash: 'allow' | undefined
+  if (frontmatter.readOnlyBash !== undefined) {
+    if (frontmatter.readOnlyBash === 'allow') readOnlyBash = 'allow'
+    else invalid.push(`'readOnlyBash' must be allow (or omitted), got ${JSON.stringify(frontmatter.readOnlyBash)}`)
+  }
+  let riskyBash: 'ask' | undefined
+  if (frontmatter.riskyBash !== undefined) {
+    if (frontmatter.riskyBash === 'ask') riskyBash = 'ask'
+    else invalid.push(`'riskyBash' must be ask (or omitted), got ${JSON.stringify(frontmatter.riskyBash)}`)
+  }
+
   let mcpExposure: McpExposure | undefined
   if (frontmatter.mcpExposure !== undefined) {
     if (frontmatter.mcpExposure === 'none' || frontmatter.mcpExposure === 'read-safe' || frontmatter.mcpExposure === 'all') mcpExposure = frontmatter.mcpExposure
@@ -419,6 +474,8 @@ export function parseModeFile(id: string, raw: string): ModeDefinition {
     toolExposure,
     permissionDefaults,
     ...(outOfGrant !== undefined ? { outOfGrant } : {}),
+    ...(readOnlyBash !== undefined ? { readOnlyBash } : {}),
+    ...(riskyBash !== undefined ? { riskyBash } : {}),
     ...(mcpExposure !== undefined ? { mcpExposure } : {}),
   }
 }
@@ -451,6 +508,8 @@ export function serializeModeFile(definition: ModeDefinition): string {
     `toolExposure: ${JSON.stringify(definition.toolExposure)}`,
     `permissionDefaults: ${JSON.stringify(definition.permissionDefaults)}`,
     ...(definition.outOfGrant !== undefined ? [`outOfGrant: ${definition.outOfGrant}`] : []),
+    ...(definition.readOnlyBash !== undefined ? [`readOnlyBash: ${definition.readOnlyBash}`] : []),
+    ...(definition.riskyBash !== undefined ? [`riskyBash: ${definition.riskyBash}`] : []),
     ...(definition.mcpExposure !== undefined ? [`mcpExposure: ${definition.mcpExposure}`] : [])]
   return `---\n${fm.join('\n')}\n---\n\n${definition.instructions.trim()}\n`
 }

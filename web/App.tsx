@@ -1,4 +1,4 @@
-import { errorSummary, modeLabel } from './lib/copy.ts'
+import { errorSummary, modeOption, type ModeOption } from './lib/copy.ts'
 import { compactionTokenChange } from './lib/format.ts'
 import { Generation, composerKey, emptyComposer, acceptedDraft, freshRequestId, requestIdFor, validConversationScope } from './lib/interaction.ts'
 import { ComposerStore, useComposerSlice } from './lib/composer-store.ts'
@@ -459,7 +459,7 @@ function AppShell() {
   // empty — it never interrupts a conversation.
   const [skills, setSkills] = useState<readonly SkillRow[]>([])
   const [skillsRevision, setSkillsRevision] = useState(0)
-  const [modeSelection, setModeSelection] = useState<{ modes: readonly { value: string; label: string }[]; selected: string | null }>({ modes: [], selected: null })
+  const [modeSelection, setModeSelection] = useState<{ modes: readonly ModeOption[]; selected: string | null }>({ modes: [], selected: null })
   const { preferences, patchPreferences } = useWorkbenchPreferences()
   const sidebarDocked = useMediaQuery(SIDEBAR_DOCK_QUERY)
   const [sidebarOpen, setSidebarOpen] = useState(() => sidebarDocked && !preferences.leftCollapsed)
@@ -784,7 +784,7 @@ function AppShell() {
       if (workspaceRef.current !== activeWs || !navigation.current.matches(nav) || !metadata.current.matches(request)) return
       setMeta(wsMeta)
       setModeSelection({
-        modes: modeRows.modes.map((row) => ({ value: row.id, label: modeLabel(row) })),
+        modes: modeRows.modes.map(modeOption),
         selected: modeRows.selected,
       })
     } catch (cause) {
@@ -992,7 +992,7 @@ function AppShell() {
         ])
         if (cancelled || !navigation.current.matches(nav)) return
         if (metadata.current.matches(metaToken)) {
-          setModeSelection({ modes: modeRows.modes.map((row) => ({ value: row.id, label: modeLabel(row) })), selected: modeRows.selected })
+          setModeSelection({ modes: modeRows.modes.map(modeOption), selected: modeRows.selected })
           setMeta(wsMeta)
         }
         if (!lists.current.matches(listingToken)) return
