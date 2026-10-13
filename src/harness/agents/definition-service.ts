@@ -41,9 +41,12 @@ export interface AgentDefinition {
   readonly tools: readonly string[]
   /**
    * `tools` was omitted (Claude: inherit every tool). `tools` then lists the
-   * built-ins, and MCP tools named in a spawn grant are also admitted.
+   * built-ins; the child also inherits every MCP tool the parent sees at
+   * spawn (only `mcpServers`' tools when that is set).
    */
   readonly inheritsTools?: boolean
+  /** Claude `mcpServers`: limits an inheriting role's MCP to these servers. */
+  readonly mcpServers?: readonly string[]
   /** Tools the definition explicitly refuses even if the grant allows. */
   readonly disallowedTools: readonly string[]
   /** Skills preloaded into the child Turn (loaded once and hash-pinned). */
@@ -80,10 +83,10 @@ export class AgentDefinitionError extends Error {
 }
 
 /** Claude subagent frontmatter keys dnt-harness enforces. */
-const ENFORCED_KEYS = new Set(['name', 'description', 'tools', 'disallowedTools', 'skills', 'model'])
+const ENFORCED_KEYS = new Set(['name', 'description', 'tools', 'disallowedTools', 'skills', 'model', 'mcpServers'])
 /** Claude keys recognized but not enforced: accepted, reported as warnings. */
 const UNSUPPORTED_KEYS = new Set([
-  'permissionMode', 'hooks', 'mcpServers', 'memory', 'color', 'effort', 'isolation', 'background', 'maxTurns',
+  'permissionMode', 'hooks', 'memory', 'color', 'effort', 'isolation', 'background', 'maxTurns',
 ])
 
 /** Claude Code tool names → dnt-harness tools. `null` = no equivalent. */
@@ -195,6 +198,7 @@ export function parseAgentDefinition(fallbackName: string, raw: string): AgentDe
   const tools = inherits ? KNOWN_MODE_TOOLS.filter((tool) => tool !== 'Agent') : declaredTools
 
   const skills = toolList(frontmatter['skills'], 'skills', invalid)
+  const mcpServers = toolList(frontmatter['mcpServers'], 'mcpServers', invalid)
 
   let model: string | undefined
   const rawModel = frontmatter['model']
@@ -218,6 +222,7 @@ export function parseAgentDefinition(fallbackName: string, raw: string): AgentDe
     ...(inherits ? { inheritsTools: true } : {}),
     disallowedTools,
     ...(skills !== undefined ? { skills } : {}),
+    ...(mcpServers !== undefined && mcpServers.length > 0 ? { mcpServers } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(unsupported.length > 0 ? { unsupported } : {}),
     ...(dropped.length > 0 ? { droppedTools: dropped } : {}),
@@ -502,7 +507,7 @@ export class AgentDefinitionService {
 }
 
 /** Claude Code subagent document for a definition (used by the app's create/copy form). */
-export function serializeAgentDefinition(definition: Pick<AgentDefinition, 'name' | 'description' | 'instructions' | 'tools' | 'disallowedTools' | 'skills' | 'model' | 'inheritsTools'>): string {
+export function serializeAgentDefinition(definition: Pick<AgentDefinition, 'name' | 'description' | 'instructions' | 'tools' | 'disallowedTools' | 'skills' | 'model' | 'inheritsTools' | 'mcpServers'>): string {
   const quote = (value: string): string => JSON.stringify(value)
   const lines = [
     '---',
@@ -512,6 +517,7 @@ export function serializeAgentDefinition(definition: Pick<AgentDefinition, 'name
     ...(definition.inheritsTools === true ? [] : [`tools: ${definition.tools.length > 0 ? definition.tools.join(', ') : '[]'}`]),
     ...(definition.disallowedTools.length > 0 ? [`disallowedTools: ${definition.disallowedTools.join(', ')}`] : []),
     ...(definition.skills !== undefined && definition.skills.length > 0 ? [`skills: ${definition.skills.join(', ')}`] : []),
+    ...(definition.mcpServers !== undefined && definition.mcpServers.length > 0 ? [`mcpServers: ${definition.mcpServers.join(', ')}`] : []),
     ...(definition.model !== undefined ? [`model: ${definition.model}`] : []),
     '---',
     '',

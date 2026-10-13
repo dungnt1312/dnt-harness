@@ -186,6 +186,7 @@ function snapshotSpawnRequest<T extends SpawnRequest | Omit<SpawnRequest, 'paren
     tools: [...request.definition.tools],
     disallowedTools: [...request.definition.disallowedTools],
     ...(request.definition.skills !== undefined ? { skills: [...request.definition.skills] } : {}),
+    ...(request.definition.mcpServers !== undefined ? { mcpServers: [...request.definition.mcpServers] } : {}),
   }
   const packet: TaskPacket = {
     ...request.packet,
