@@ -3045,8 +3045,8 @@ ${entry.description}`.toLowerCase().includes(query))
 
     // Exposure-filtered schemas: static mode ceiling + G5 dynamic MCP
     // config/allowlist ceiling (zero-exposure modes none; Plan read-safe
-    // allowlist only; Explorer none; other children require explicit spawn
-    // grant).
+    // allowlist only; bundled Explorer none; children limited to their pinned
+    // ceiling).
     const exposureScope = { ...(scope ?? { sessionId: undefined }), workspaceId }
     let projectedTools = mcpDisabledForTurn(scope)
       ? (projected.tools ?? []).filter((schema) => !schema.name.startsWith('mcp__'))

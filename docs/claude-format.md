@@ -172,9 +172,10 @@ Format: Claude Code subagent Markdown with YAML frontmatter.
   non-empty body.
 - `tools` / `disallowedTools`: comma string or list. **Omitted `tools` inherits
   every tool** the conversation exposes (never `Agent`: children do not
-  delegate); MCP tools still need an explicit spawn grant, which such a role
-  accepts. Claude names map (`Task`→`Agent`, `MultiEdit`→`Edit`, `LS`→`Glob`,
-  `Bash(git:*)`→`Bash`); names dnt-harness lacks (`WebFetch`, `WebSearch`,
+  delegate); such a role also inherits the parent's MCP tools (`mcpServers`
+  limits them to named servers). Explicit `tools` may list
+  `mcp__server__tool` or `mcp__server__*`. Claude names map (`Task`→`Agent`,
+  `MultiEdit`→`Edit`, `LS`→`Glob`, `Bash(git:*)`→`Bash`); names dnt-harness lacks (`WebFetch`, `WebSearch`,
   `NotebookEdit`, team tools…) are dropped with a warning — narrowing only.
 - `model`: `inherit`, an alias (`sonnet` / `opus` / `haiku` → the first served
   model whose id contains it, preferring the conversation's provider), a
@@ -182,8 +183,10 @@ Format: Claude Code subagent Markdown with YAML frontmatter.
   falls back to the conversation's model; an explicit spawn `model` still fails
   loudly.
 - `skills`: comma string or list; preloaded into the child.
+- `mcpServers`: comma string or list of server names; limits an inheriting
+  role's MCP tools to those servers.
 - Recognized, not enforced, reported as notes: `permissionMode`, `hooks`,
-  `mcpServers`, `memory`, `color`, `effort`, `isolation`, `background`,
+  `memory`, `color`, `effort`, `isolation`, `background`,
   `maxTurns`. Unknown keys are ignored with a note.
 
 Settings → Agents lists every layer with its source and path; create/paste

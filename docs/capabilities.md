@@ -253,10 +253,22 @@ lifecycle route keeps a 120 s cap), `list`, `cancel`, `reconcile`, `catalog`:
   [the harness notes](harness.md#which-model-a-child-runs-on).
 - **No authority gained**: a child's own calls re-enter the owning root's live
   mode exposure and approval policy. Its immutable admission ceiling is pinned
-  at spawn as admission exposure ∩ role tools ∩ explicit grant; later mode
-  widening cannot add tools, while later narrowing denies unstarted calls.
+  at spawn as admission exposure ∩ role tools − `disallowedTools`, narrowed by
+  the spawn grant; later mode widening cannot add tools, while later narrowing
+  denies unstarted calls.
   `Agent` is `ask` only in *Ask before changes* and `allow` in Plan, *Edit
   automatically*, and *Full access*. Chat exposes it nowhere.
+- **MCP in children** (Claude/ZCode parity): a role that omits `tools` (or uses
+  `*`) inherits every MCP tool the parent sees at spawn, limited to the
+  servers in `mcpServers` when that is set. A role with explicit `tools` gets
+  only the `mcp__server__tool` / `mcp__server__*` entries it lists. Mode
+  exposure still applies (Plan keeps only read-safe allowlisted tools).
+  `grantTools` narrows MCP only when it names an MCP tool; a concrete granted
+  MCP name the child cannot get fails the spawn (HTTP 400). `disallowedTools`
+  accepts `mcp__server__*` and `mcp__*`. MCP servers that connect after the
+  spawn are not added. The bundled Explorer has no MCP; override it with an
+  `explorer.md` that lists the tools it may use, for example
+  `tools: Read, Glob, Grep, mcp__codebase-retrieval__*`.
 - **MCP exposure is a mode property** (`mcpExposure: none | read-safe | all`),
   so a duplicated Plan keeps it. `read-safe` exposes an MCP tool only when the
   server has a non-empty explicit allowlist entry for it AND its name matches
