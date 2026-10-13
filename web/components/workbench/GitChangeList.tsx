@@ -144,7 +144,7 @@ function Section({ group, onStage, children }: {
       <div className="flex h-8 items-center gap-1.5 pl-2 text-[11px] font-medium uppercase tracking-wide text-fg-faint">
         <span className="min-w-0 flex-1 truncate">{group.title}</span>
         <span className="font-mono normal-case tabular-nums">{group.entries.length}</span>
-        <StageCheckbox state={state} label={`Stage all ${group.title.toLowerCase()}`} onToggle={toggle} />
+        <StageCheckbox state={state} label={`${state === 'selected' ? 'Unstage' : 'Stage'} all ${group.title.toLowerCase()}`} onToggle={toggle} />
       </div>
       <ul aria-label={`${group.title} files`} className="m-0 flex list-none flex-col p-0">{children}</ul>
     </section>
@@ -165,6 +165,8 @@ function StageCheckbox({ state, label, onToggle }: {
       aria-label={label}
       title={label}
       onClick={onToggle}
+      // Exempt from the 44px coarse-pointer floor: the row reserves exactly this 32px slot.
+      data-compact-control
       className="flex size-8 shrink-0 items-center justify-center rounded-md"
     >
       <span className={cn('flex size-4 items-center justify-center rounded border', state === 'unselected' ? 'border-line-strong' : 'border-primary bg-primary text-primary-fg')}>
@@ -189,9 +191,9 @@ function ChangeRow({ change, open, onToggle, onStage, onDiscard, onTrash, onOpen
 }) {
   const name = change.path.split('/').pop() ?? change.path
   const directory = change.path.slice(0, change.path.length - name.length).replace(/\/$/, '')
-  // Zed `revert_entries`: a new file is trashed, a deleted one restored, the rest discarded.
+  // Zed `build_context_menu`: a new file is "Trash File", a deleted one "Restore File", the rest "Discard Changes".
   const revert = change.created
-    ? { label: 'Trash', icon: 'trash' as const, run: onTrash }
+    ? { label: 'Trash File', icon: 'trash' as const, run: onTrash }
     : { label: change.deleted ? 'Restore File' : 'Discard Changes', icon: 'refresh' as const, run: onDiscard }
   return (
     // One hover surface for the whole line, openers included: the band never
@@ -233,6 +235,8 @@ function ChangeRow({ change, open, onToggle, onStage, onDiscard, onTrash, onOpen
           // Keyboard focus reveals it; a mouse click on the row (which keeps
           // focus there) does not, or it would linger beside the diff's own.
           className={OPENER_REVEAL_ROW}
+          // Keeps its 24px size on touch; the 44px floor would overlap the neighbours.
+          data-compact-control
         >
           <Icon name="fileText" size={12} />
         </IconButton>
@@ -240,6 +244,7 @@ function ChangeRow({ change, open, onToggle, onStage, onDiscard, onTrash, onOpen
       <Menu
         label={`Actions for ${name}`}
         align="end"
+        compact
         triggerClassName={onOpenFile !== undefined ? MENU_REVEAL_ROW_BESIDE_OPENER : MENU_REVEAL_ROW}
         trigger={() => <Icon name="dots" size={12} />}
       >
@@ -250,7 +255,7 @@ function ChangeRow({ change, open, onToggle, onStage, onDiscard, onTrash, onOpen
           </button>
         )}
       </Menu>
-      <StageCheckbox state={toggleStateOf(change.staging)} label={`Stage ${change.path}`} onToggle={onStage} />
+      <StageCheckbox state={toggleStateOf(change.staging)} label={`${change.staging === 'staged' ? 'Unstage' : 'Stage'} ${change.path}`} onToggle={onStage} />
     </div>
   )
 }

@@ -100,9 +100,18 @@ describe('sections and tri-state checkboxes', () => {
   it('labels each row checkbox and marks a partly staged row mixed', async () => {
     await mount()
     expect(checkbox('Stage src/partial.ts').getAttribute('aria-checked')).toBe('mixed')
-    expect(checkbox('Stage src/staged.ts').getAttribute('aria-checked')).toBe('true')
+    expect(checkbox('Unstage src/staged.ts').getAttribute('aria-checked')).toBe('true')
     expect(checkbox('Stage src/a.ts').getAttribute('aria-checked')).toBe('false')
     expect(checkbox('Stage docs/new.md').getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('names the checkbox for what the click does: Unstage only when fully staged', async () => {
+    await mount()
+    // A partly staged row stages; the fully staged one unstages.
+    expect(checkbox('Stage src/partial.ts')).toBeDefined()
+    expect(checkbox('Unstage src/staged.ts')).toBeDefined()
+    // The Tracked section is mixed (an unstaged file), so its click stages.
+    expect(checkbox('Stage all tracked')).toBeDefined()
   })
 
   it('derives each section checkbox from its own entries', async () => {
@@ -122,8 +131,8 @@ describe('sections and tri-state checkboxes', () => {
   it('a fully staged section checkbox unstages its entries', async () => {
     fetchGitStatus.mockImplementation(async () => report([STAGED, { ...STAGED, path: 'src/b.ts' }]))
     await mount()
-    expect(checkbox('Stage all tracked').getAttribute('aria-checked')).toBe('true')
-    await click(checkbox('Stage all tracked'))
+    expect(checkbox('Unstage all tracked').getAttribute('aria-checked')).toBe('true')
+    await click(checkbox('Unstage all tracked'))
     expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'unstage', paths: ['src/b.ts', 'src/staged.ts'] })
   })
 
@@ -137,6 +146,13 @@ describe('sections and tri-state checkboxes', () => {
       }
     }
   })
+
+  it('exempts the three row controls from the 44px touch floor so they keep their slots', async () => {
+    const view = await mount({ onOpenFile: () => {} })
+    for (const label of ['Open a.ts in workbench', 'Actions for a.ts', 'Stage src/a.ts']) {
+      expect(view.querySelector(`button[aria-label="${label}"]`)?.hasAttribute('data-compact-control')).toBe(true)
+    }
+  })
 })
 
 describe('optimistic staging', () => {
@@ -146,11 +162,12 @@ describe('optimistic staging', () => {
     await mount()
     await click(checkbox('Stage src/partial.ts'))
     expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'stage', paths: ['src/partial.ts'] })
-    expect(checkbox('Stage src/partial.ts').getAttribute('aria-checked')).toBe('true')
+    // Now fully staged, so the control offers Unstage.
+    expect(checkbox('Unstage src/partial.ts').getAttribute('aria-checked')).toBe('true')
 
     const staged = { ...PARTIAL, staging: 'staged' as const, worktreeStatus: ' ' }
     await act(async () => finish({ type: 'done', ok: true, stdout: '', stderr: '', status: report([FRESH, UNSTAGED, STAGED, staged, CONFLICT]) }))
-    expect(checkbox('Stage src/partial.ts').getAttribute('aria-checked')).toBe('true')
+    expect(checkbox('Unstage src/partial.ts').getAttribute('aria-checked')).toBe('true')
     // The answer is the report now: the override is gone, so a later report moves the row.
     expect(fetchGitStatus).toHaveBeenCalledTimes(1)
   })
@@ -160,7 +177,7 @@ describe('optimistic staging', () => {
     gitOperation.mockImplementationOnce(() => new Promise<GitOperationDone>((_resolve, reject) => { fail = reject }))
     await mount()
     await click(checkbox('Stage src/partial.ts'))
-    expect(checkbox('Stage src/partial.ts').getAttribute('aria-checked')).toBe('true')
+    expect(checkbox('Unstage src/partial.ts').getAttribute('aria-checked')).toBe('true')
     await act(async () => fail(new Error('boom')))
     expect(checkbox('Stage src/partial.ts').getAttribute('aria-checked')).toBe('mixed')
     expect(document.querySelector('[role="alert"]')?.textContent).toContain('boom')
@@ -219,8 +236,26 @@ describe('header split button', () => {
     const item = (name: string): HTMLButtonElement => [...document.querySelectorAll<HTMLButtonElement>('[role="menu"] [role="menuitem"]')].find((entry) => entry.textContent === name)!
     expect(item('Stage All').disabled).toBe(false)
     expect(item('Unstage All').disabled).toBe(true)
-    expect(item('Discard Tracked Changes').disabled).toBe(false)
+    // Zed `staged_tracked_entries`: an unstaged-only report has nothing to discard.
+    expect(item('Discard Tracked Changes').disabled).toBe(true)
     expect(item('Trash Untracked Files').disabled).toBe(true)
+  })
+
+  it('Discard Tracked Changes is disabled when no tracked file has anything staged', async () => {
+    fetchGitStatus.mockImplementation(async () => report([UNSTAGED, FRESH]))
+    await mount()
+    await openHeaderMenu()
+    const item = [...document.querySelectorAll<HTMLButtonElement>('[role="menu"] [role="menuitem"]')].find((entry) => entry.textContent === 'Discard Tracked Changes')!
+    expect(item.disabled).toBe(true)
+  })
+
+  it('Discard Tracked Changes sends only the staged and partly staged tracked files', async () => {
+    await mount()
+    await openHeaderMenu()
+    await click([...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((entry) => entry.textContent === 'Discard Tracked Changes')!)
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('Discard changes to these files?')
+    await click(button('Restore Tracked Files'))
+    expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'discard', paths: ['src/staged.ts', 'src/partial.ts'] })
   })
 
   it('keeps Stage All to the visible files in a turn filter', async () => {
@@ -256,14 +291,25 @@ describe('discard and trash confirmations', () => {
 
   it('asks before trashing an untracked file and sends the exact path', async () => {
     await mount()
-    await rowMenu('new.md', 'Trash')
+    await rowMenu('new.md', 'Trash File')
     expect(dialog()?.textContent).toContain('Trash `new.md`?')
     await click(button('Trash'))
     expect(gitOperation).toHaveBeenCalledWith('ws1', 'p1', { type: 'trash', paths: ['docs/new.md'] })
   })
 
+  it('reloads the status after a discard or trash that answers ok without a status', async () => {
+    await mount()
+    expect(fetchGitStatus).toHaveBeenCalledTimes(1)
+    await rowMenu('a.ts', 'Discard Changes')
+    await click(button('Discard Changes'))
+    await act(async () => { await vi.waitFor(() => expect(fetchGitStatus).toHaveBeenCalledTimes(2)) })
+    await rowMenu('new.md', 'Trash File')
+    await click(button('Trash'))
+    await act(async () => { await vi.waitFor(() => expect(fetchGitStatus).toHaveBeenCalledTimes(3)) })
+  })
+
   it('lists at most five names for the header Discard Tracked Changes action', async () => {
-    const many = ['a', 'b', 'c', 'd', 'e', 'f', 'g'].map((name): GitChange => ({ ...raw, path: `src/${name}.ts`, status: 'modified' }))
+    const many = ['a', 'b', 'c', 'd', 'e', 'f', 'g'].map((name): GitChange => ({ ...STAGED, path: `src/${name}.ts` }))
     fetchGitStatus.mockImplementation(async () => report(many))
     await mount()
     await openHeaderMenu()

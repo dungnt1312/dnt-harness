@@ -195,10 +195,11 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
       ]) {
         const done = await run(input)
         if (done?.status !== undefined) applyReport(done.status)
+        else if (done?.ok === true) void load()
         if (done?.ok !== true) return
       }
     })
-  }, [enqueue, run, applyReport])
+  }, [enqueue, run, applyReport, load])
 
   const all = report?.changes ?? []
   const filtered = pathFilter !== undefined && pathFilter.length > 0 ? all.filter((change) => pathFilter.includes(change.path)) : all
@@ -207,7 +208,8 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
   const shown = withPendingStages(changes, pendingStages)
   const counts = changeCounts(shown)
   const stages = primaryChangesActionStages(shown)
-  const trackedEntries = shown.filter((change) => !change.created)
+  // Zed `staged_tracked_entries` (`is_staged_tracked`): "Discard Tracked Changes" acts on tracked files with something staged.
+  const trackedEntries = shown.filter((change) => !change.created && change.staging !== 'unstaged')
   const untrackedEntries = shown.filter((change) => change.created)
   const filteredView = pathFilter !== undefined && pathFilter.length > 0
   // Zed `stage_all` / `unstage_all`; a turn filter keeps them to the files shown.
