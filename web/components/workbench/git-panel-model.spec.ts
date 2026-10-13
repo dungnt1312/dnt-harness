@@ -12,6 +12,7 @@ import {
   sectionContains,
   stageIntent,
   stageIntentForSection,
+  suggestCommitMessage,
   type CommitButtonInput,
 } from './git-panel-model.ts'
 
@@ -279,5 +280,34 @@ describe('confirmationForEntries (Zed revert_entries / restore_tracked_files / c
 
   it('a menu action on one file asks the single-file question', () => {
     expect(confirmationForEntries([modified('a.ts')], 'tracked')?.title).toBe('Are you sure you want to discard changes to `a.ts`?')
+  })
+})
+
+describe('suggestCommitMessage (Zed suggest_commit_message, git_panel.rs:4047-4083)', () => {
+  it('a merge message wins over everything', () => {
+    expect(suggestCommitMessage([change({ path: 'a.ts', staging: 'staged' })], "Merge branch 'feature'")).toBe("Merge branch 'feature'")
+  })
+
+  it('one staged file names its action and base name', () => {
+    expect(suggestCommitMessage([change({ path: 'src/a.ts', staging: 'staged' })])).toBe('Update a.ts')
+    expect(suggestCommitMessage([change({ path: 'src/new.ts', staging: 'staged', created: true })])).toBe('Create new.ts')
+    expect(suggestCommitMessage([change({ path: 'src/old.ts', staging: 'staged', deleted: true })])).toBe('Delete old.ts')
+  })
+
+  it('with nothing staged, exactly one tracked file is suggested', () => {
+    expect(suggestCommitMessage([change({ path: 'src/a.ts' })])).toBe('Update a.ts')
+    expect(suggestCommitMessage([change({ path: 'src/a.ts' }), change({ path: 'src/b.ts' })])).toBeUndefined()
+  })
+
+  it('an untracked file is not tracked, so it alone suggests nothing', () => {
+    expect(suggestCommitMessage([change({ path: 'new.txt', created: true })])).toBeUndefined()
+  })
+
+  it('two staged files, or a staged file next to others, suggest nothing', () => {
+    expect(suggestCommitMessage([change({ path: 'a', staging: 'staged' }), change({ path: 'b', staging: 'staged' })])).toBeUndefined()
+  })
+
+  it('a partly staged file counts as staged', () => {
+    expect(suggestCommitMessage([change({ path: 'a.ts', staging: 'partial' })])).toBe('Update a.ts')
   })
 })

@@ -460,7 +460,7 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
       {/* The whole-project view only: a turn filter shows a subset, which is not what a commit would take. */}
       {report !== null && !filteredView && (report.branch !== null || report.head !== null) ? (
         <>
-          <GitCommitArea key={project.id} projectId={project.id} report={report} changes={shown} run={run} enqueue={enqueue} onDone={settleOperation} />
+          <GitCommitArea key={project.id} workspaceId={workspaceId} projectId={project.id} report={report} changes={shown} run={run} enqueue={enqueue} onDone={settleOperation} />
           <div role="group" aria-label="Branch" className="flex h-11 shrink-0 items-center gap-1.5 border-t border-line px-2.5 text-[13px]">
             <Icon name="gitBranch" size={13} className="shrink-0 text-fg-muted" />
             {report.branchInfo !== null ? (

@@ -296,3 +296,24 @@ export function confirmationForEntries(entries: readonly GitChange[], menu?: 'tr
   if (tracked === 0) return { title: `Trash ${untracked} files?`, confirmLabel: 'Trash' }
   return { title: `Discard changes to ${tracked} files and trash ${untracked} files?`, confirmLabel: 'Discard and Trash' }
 }
+
+/**
+ * Zed `suggest_commit_message` (`git_panel.rs:4047-4083`): what the commit
+ * editor offers as its placeholder, and what an empty editor commits. A merge
+ * message wins; else the single staged entry; else, with nothing staged, the
+ * single tracked entry — named by what it is (Delete, Create or Update) and
+ * its file name. Anything else suggests nothing.
+ */
+export function suggestCommitMessage(changes: readonly GitChange[], mergeMessage?: string): string | undefined {
+  if (mergeMessage !== undefined && mergeMessage !== '') return mergeMessage
+  const staged = changes.filter((change) => hasStaged(change.staging))
+  const tracked = changes.filter((change) => !change.created && !change.conflicted)
+  const entry = staged.length === 1
+    ? staged[0]
+    : staged.length === 0 && tracked.length === 1
+      ? tracked[0]
+      : undefined
+  if (entry === undefined) return undefined
+  const action = entry.deleted ? 'Delete' : entry.created ? 'Create' : 'Update'
+  return `${action} ${fileName(entry.path)}`
+}
