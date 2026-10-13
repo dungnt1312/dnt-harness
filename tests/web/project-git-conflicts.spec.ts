@@ -172,3 +172,16 @@ describe('resolveConflict helper', () => {
     expect(repo.git('status', '--porcelain', '--', 'f.txt')).toBe('UU f.txt\n')
   })
 })
+
+describe('direct file writes stay inside the project', () => {
+  it('resolve-conflict refuses a traversal path and a symlink that leaves the project', async () => {
+    const repo = await conflictedRepo()
+    const outside = path.join(scratch, `outside-${counter}.txt`)
+    await fs.writeFile(outside, 'a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> t\n')
+    await expect(operate(repo, { type: 'resolve-conflict', path: '../outside.txt', index: 0, fingerprint: 'f', choice: 'ours' })).rejects.toThrow(/not a file inside this project/)
+    // A tracked-looking symlink to a file outside the project: the write must not follow it.
+    await fs.symlink(outside, path.join(repo.dir, 'link.txt'))
+    await expect(operate(repo, { type: 'resolve-conflict', path: 'link.txt', index: 0, fingerprint: 'f', choice: 'ours' })).rejects.toThrow()
+    expect(await fs.readFile(outside, 'utf8')).toBe('a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> t\n')
+  })
+})

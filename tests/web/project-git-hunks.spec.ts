@@ -324,3 +324,18 @@ describe('hunk operations', () => {
     expect(repo.git('ls-files')).toBe('sub/f.txt\n')
   })
 })
+
+describe('direct file writes stay inside the project', () => {
+  it('restore-hunk and stage-hunk refuse a path that leaves the project, and never write through a symlink', async () => {
+    const repo = await twoHunks()
+    const outside = path.join(scratch, `outside-hunk-${counter}.txt`)
+    await fs.writeFile(outside, lines(30).replace('l3\n', 'L3\n'))
+    const before = await fs.readFile(outside, 'utf8')
+    const ref = { oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, fingerprint: 'x' }
+    await expect(operate(repo, { type: 'restore-hunk', path: '../escape.txt', hunk: ref })).rejects.toThrow(/not a file inside this project/)
+    await fs.symlink(outside, path.join(repo.dir, 'link.txt'))
+    await expect(operate(repo, { type: 'restore-hunk', path: 'link.txt', hunk: ref })).rejects.toThrow()
+    await expect(operate(repo, { type: 'stage-hunk', path: 'link.txt', hunk: ref })).rejects.toThrow()
+    expect(await fs.readFile(outside, 'utf8')).toBe(before)
+  })
+})
