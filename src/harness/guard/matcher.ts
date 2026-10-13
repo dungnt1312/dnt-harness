@@ -2,6 +2,7 @@ import type { DangerousCommandsConfig, GuardMatch, PresetId } from './types.ts'
 import { PRESET_REGEXES } from './presets.ts'
 import { PRESET_LABELS } from './defaults.ts'
 import { parseShell } from './shell-parse.ts'
+import { maskDataText } from './data-text.ts'
 
 /**
  * `lineSeparator` replaces an unquoted line break. The default `' '` keeps
@@ -188,8 +189,9 @@ export function matchCommand(command: string, config: DangerousCommandsConfig): 
   }
 
   // Presets see line breaks as command separators (custom rules keep the
-  // historical single-space form they were authored against).
-  const commands = classifyGitRm(normalizeCommand(command, ' ; '))
+  // historical single-space form they were authored against), and skip text
+  // that is only data: commit messages and heredocs fed to `cat`/`git`/`gh`.
+  const commands = classifyGitRm(normalizeCommand(maskDataText(command), ' ; '))
   for (const id of PRESET_PRIORITY) {
     if (config.presets[id] === 'off') continue
     const regexes = PRESET_REGEXES[id]

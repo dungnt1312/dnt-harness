@@ -12,6 +12,7 @@
  * unknowable here.
  */
 import { parseShell, type ShellWord } from './shell-parse.ts'
+import { maskDataText } from './data-text.ts'
 
 export interface RiskyMatch {
   /** Stable rule id, e.g. `git-reset-hard`. */
@@ -169,7 +170,9 @@ function invocationMatch(input: Words, depth: number): string | undefined {
   }
 }
 
-function lineMatch(command: string, depth: number): RiskyMatch | null {
+function lineMatch(rawCommand: string, depth: number): RiskyMatch | null {
+  // Commit messages and data heredocs are not commands (see data-text.ts).
+  const command = maskDataText(rawCommand)
   const parsed = parseShell(command)
   if (parsed.unsupported) {
     // Substitutions, subshells, heredocs: arguments unknowable. Ask only when

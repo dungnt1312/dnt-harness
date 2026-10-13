@@ -489,6 +489,16 @@ approval decision/final dispatch:
   hashes are preserved, and matching is case-insensitive. This prevents a
   comment on one line from hiding executable text on a later line without
   manufacturing tokens inside quotes.
+- **Data text** (`guard/data-text.ts`) — before preset and risky-Bash
+  matching (custom rules still see the raw command), text the command only
+  carries as data is masked: heredoc bodies fed to a data program (`cat`,
+  `tee`, `git`, `gh`, `glab`, `grep`, `jq`, …) and the quoted values of
+  `git commit|tag|notes|merge|revert|stash -m/--message` and `gh
+  --title/--body/--notes`. So a commit message that mentions `git branch -D`
+  no longer blocks the commit. Fails closed: a heredoc fed to a shell,
+  interpreter, `ssh` or unknown program, piped onward (`cat <<EOF | sh`), or
+  unterminated is kept; a double-quoted message containing `$(` or a
+  backtick is kept.
 - **Limitations** — this is regex matching, not a shell AST. Documented
   non-matching fixtures include quoted executable names, command substitutions
   (`$(...)`), heredocs, commands delegated through interpreters, and Windows-shell
