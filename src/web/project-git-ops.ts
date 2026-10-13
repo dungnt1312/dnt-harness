@@ -24,6 +24,7 @@ import {
   type GitRunner,
   type GitStatusReport,
 } from './project-git.ts'
+import { createBranch, deleteBranch, switchBranch } from './project-git-branches.ts'
 
 export type GitOperationRequest =
   | { type: 'stage' | 'unstage' | 'discard' | 'trash'; paths: readonly string[] }
@@ -32,6 +33,9 @@ export type GitOperationRequest =
   | { type: 'fetch'; remote: string }
   | { type: 'pull'; remote: string; branch?: string; rebase: boolean }
   | { type: 'push'; remote: string; branch: string; upstreamBranch: string; setUpstream: boolean; force: boolean }
+  | { type: 'switch-branch'; name: string }
+  | { type: 'create-branch'; name: string; base?: string }
+  | { type: 'delete-branch'; name: string; remote: boolean; force: boolean }
 
 export interface GitOperationResult {
   readonly ok: boolean
@@ -91,13 +95,13 @@ function enqueue<T>(key: string, job: () => Promise<T>): Promise<T> {
 
 // ── execution context ───────────────────────────────────────────
 
-interface Step {
+export interface Step {
   readonly ok: boolean
   readonly stdout: string
   readonly stderr: string
 }
 
-interface Context {
+export interface Context {
   readonly root: string
   readonly trusted: boolean
   readonly run: GitRunner
@@ -107,7 +111,7 @@ interface Context {
   readonly control: OperationControl | undefined
 }
 
-const DONE: Step = { ok: true, stdout: '', stderr: '' }
+export const DONE: Step = { ok: true, stdout: '', stderr: '' }
 
 /** Treat every path argument as a literal file name, never as a glob or `:(magic)` pathspec. */
 const LITERAL_PATHSPECS = { GIT_LITERAL_PATHSPECS: '1' } as const
@@ -187,7 +191,7 @@ class OperationControl {
 }
 
 /** One git command; stdin is always closed so nothing can wait on it (no timeout exists). */
-async function git(ctx: Context, args: readonly string[]): Promise<Step> {
+export async function git(ctx: Context, args: readonly string[]): Promise<Step> {
   const { control } = ctx
   if (control?.cancelled) throw new OperationCancelled()
   try {
@@ -210,7 +214,7 @@ async function git(ctx: Context, args: readonly string[]): Promise<Step> {
 }
 
 /** Run steps in order, concatenating their output, and stop at the first failure. */
-async function sequence(...steps: ReadonlyArray<() => Promise<Step>>): Promise<Step> {
+export async function sequence(...steps: ReadonlyArray<() => Promise<Step>>): Promise<Step> {
   let stdout = ''
   let stderr = ''
   for (const step of steps) {
@@ -287,7 +291,7 @@ async function checkedRemote(ctx: Context, remote: string): Promise<string> {
  * A syntactically valid branch name that cannot be read as an option or as a
  * forced refspec (`+main` would force-update the destination, whatever `force` says).
  */
-async function checkedBranch(ctx: Context, name: string): Promise<string> {
+export async function checkedBranch(ctx: Context, name: string): Promise<string> {
   if (name === '' || name.startsWith('-') || name.startsWith('+') || !(await git(ctx, ['check-ref-format', `refs/heads/${name}`])).ok) {
     throw new ProjectGitError(`'${name}' is not a valid branch name`)
   }
@@ -474,6 +478,12 @@ async function dispatch(ctx: Context, request: GitOperationRequest, move: (abs: 
       return pull(ctx, request)
     case 'push':
       return push(ctx, request)
+    case 'switch-branch':
+      return switchBranch(ctx, request.name)
+    case 'create-branch':
+      return createBranch(ctx, request.name, request.base)
+    case 'delete-branch':
+      return deleteBranch(ctx, request.name, request.remote, request.force)
   }
 }
 
