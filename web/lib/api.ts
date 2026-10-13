@@ -535,6 +535,30 @@ export function readProjectFile(workspaceId: string, projectId: string, path: st
   return apiFetch(`${projectBase(workspaceId, projectId)}/file?path=${encodeURIComponent(path)}`).then((r) => json<ProjectFileView>(r))
 }
 
+/** Explorer writes; the server never overwrites (409) and refuses the root and `.git` (400). */
+export function createProjectEntry(workspaceId: string, projectId: string, path: string, kind: 'file' | 'dir'): Promise<ProjectEntry> {
+  return apiFetch(`${projectBase(workspaceId, projectId)}/files`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path, kind }),
+  }).then((r) => json<ProjectEntry>(r))
+}
+
+/** Rename in the same folder; resolves with the entry's new root-relative path. */
+export function renameProjectEntry(workspaceId: string, projectId: string, path: string, name: string): Promise<{ path: string; kind: 'file' | 'dir' }> {
+  return apiFetch(`${projectBase(workspaceId, projectId)}/files`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path, name }),
+  }).then((r) => json<{ path: string; kind: 'file' | 'dir' }>(r))
+}
+
+/** Permanent delete; a folder goes with everything inside it. */
+export function deleteProjectEntry(workspaceId: string, projectId: string, path: string): Promise<{ deleted: true; path: string }> {
+  return apiFetch(`${projectBase(workspaceId, projectId)}/files?path=${encodeURIComponent(path)}`, { method: 'DELETE' })
+    .then((r) => json<{ deleted: true; path: string }>(r))
+}
+
 /** One raw file from a memory folder (the project tier with `projectId`, else the workspace tier). */
 export function readMemoryFile(workspaceId: string, path: string, projectId?: string): Promise<ProjectFileView> {
   const project = projectId !== undefined ? `&projectId=${encodeURIComponent(projectId)}` : ''

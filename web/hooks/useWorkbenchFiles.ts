@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 
+import { isAtOrUnder } from '../lib/file-tree.ts'
 import type { FileFocus } from '../lib/tool-facts.ts'
 
 /**
@@ -10,7 +11,7 @@ export interface ViewerFocus extends FileFocus {
   readonly seq: number
 }
 
-interface FilesState {
+export interface FilesState {
   /** Folder shown by the Files view (root-relative, '' = root). */
   readonly folder: string
   /** Opened file tabs in opening order. */
@@ -26,6 +27,10 @@ export interface WorkbenchFiles extends FilesState {
   readonly openFile: (path: string, focus?: FileFocus) => void
   readonly closeFile: (path: string) => void
   readonly showFixedView: () => void
+  /** A file or folder was renamed in the explorer: rewrite its open tabs. */
+  readonly renamePath: (from: string, to: string) => void
+  /** A file or folder was deleted in the explorer: close its open tabs. */
+  readonly removePath: (path: string) => void
 }
 
 const EMPTY: FilesState = { folder: '', openFiles: [], activeFile: null, focus: null }
@@ -38,6 +43,35 @@ export function closeFileTab(state: FilesState, path: string): FilesState {
   const activeFile = state.activeFile !== path ? state.activeFile : openFiles[Math.min(index, openFiles.length - 1)] ?? null
   // The window belonged to the tab being closed, not to whatever it reveals.
   return { ...state, openFiles, activeFile, focus: null }
+}
+
+const moved = (path: string, from: string, to: string): string => isAtOrUnder(path, from) ? `${to}${path.slice(from.length)}` : path
+
+/** Rewrites every tab, the front tab and the shown folder at or under `from`. */
+export function renameFileTabs(state: FilesState, from: string, to: string): FilesState {
+  const touched = state.openFiles.some((file) => isAtOrUnder(file, from)) || isAtOrUnder(state.folder, from)
+  if (!touched) return state
+  return {
+    ...state,
+    folder: moved(state.folder, from, to),
+    openFiles: state.openFiles.map((file) => moved(file, from, to)),
+    activeFile: state.activeFile === null ? null : moved(state.activeFile, from, to),
+  }
+}
+
+/** Closes every tab at or under `path`, revealing a neighbour like {@link closeFileTab}. */
+export function removeFileTabs(state: FilesState, path: string): FilesState {
+  const doomed = state.openFiles.filter((file) => isAtOrUnder(file, path))
+  const folderGone = state.folder !== '' && isAtOrUnder(state.folder, path)
+  if (doomed.length === 0 && !folderGone) return state
+  let next: FilesState = folderGone ? { ...state, folder: '' } : state
+  const frontGone = next.activeFile !== null && isAtOrUnder(next.activeFile, path)
+  if (!frontGone) {
+    return { ...next, openFiles: next.openFiles.filter((file) => !isAtOrUnder(file, path)) }
+  }
+  // Close the front tab last so the neighbour it reveals is a survivor.
+  for (const file of doomed) if (file !== next.activeFile) next = { ...next, openFiles: next.openFiles.filter((open) => open !== file) }
+  return closeFileTab(next, next.activeFile as string)
 }
 
 /**
@@ -60,5 +94,8 @@ export function useWorkbenchFiles(projectKey: string | null): WorkbenchFiles {
   const closeFile = useCallback((path: string) => setState((current) => closeFileTab(current, path)), [])
   const showFixedView = useCallback(() => setState((current) => ({ ...current, activeFile: null })), [])
 
-  return { ...state, setFolder, openFile, closeFile, showFixedView }
+  const renamePath = useCallback((from: string, to: string) => setState((current) => renameFileTabs(current, from, to)), [])
+  const removePath = useCallback((path: string) => setState((current) => removeFileTabs(current, path)), [])
+
+  return { ...state, setFolder, openFile, closeFile, showFixedView, renamePath, removePath }
 }

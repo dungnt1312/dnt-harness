@@ -251,3 +251,105 @@ describe('project file search (composer mentions)', () => {
     expect((await fetch(`${server.url}/api/workspaces/${wsId}/projects/${searchProjectId}/search?q=a`, { method: 'POST' })).status).toBe(405)
   })
 })
+
+describe('explorer writes', () => {
+  let writeRoot = ''
+  let writeProjectId = ''
+  const base = () => `${server.url}/api/workspaces/${wsId}/projects/${writeProjectId}/files`
+  const json = (method: string, body: unknown, headers: Record<string, string> = {}) =>
+    fetch(base(), { method, headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) })
+  const remove = (rel: string) => fetch(`${base()}?path=${encodeURIComponent(rel)}`, { method: 'DELETE' })
+
+  beforeAll(async () => {
+    writeRoot = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-files-write-'))
+    await fs.writeFile(path.join(writeRoot, 'README.md'), 'r\n', 'utf8')
+    await fs.mkdir(path.join(writeRoot, '.git'))
+    const created = await fetch(`${server.url}/api/workspaces/${wsId}/projects`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Writes', path: writeRoot }),
+    })
+    writeProjectId = ((await created.json()) as { id: string }).id
+  })
+
+  afterAll(async () => {
+    await fs.rm(writeRoot, { recursive: true, force: true })
+  })
+
+  it('creates, renames and deletes through the files route', async () => {
+    const made = await json('POST', { path: 'notes', kind: 'dir' })
+    expect(made.status).toBe(201)
+    expect(await made.json()).toEqual({ name: 'notes', path: 'notes', kind: 'dir' })
+    expect((await json('POST', { path: 'notes/a.md', kind: 'file' })).status).toBe(201)
+
+    const renamed = await json('PATCH', { path: 'notes/a.md', name: 'b.md' })
+    expect(renamed.status).toBe(200)
+    expect(await renamed.json()).toEqual({ path: 'notes/b.md', kind: 'file' })
+
+    const deleted = await remove('notes')
+    expect(deleted.status).toBe(200)
+    expect(await deleted.json()).toEqual({ deleted: true, path: 'notes' })
+    expect(await fs.stat(path.join(writeRoot, 'notes')).then(() => true, () => false)).toBe(false)
+  })
+
+  it('maps write errors to 400, 404 and 409', async () => {
+    expect((await json('POST', { path: 'README.md', kind: 'file' })).status).toBe(409)
+    expect((await json('POST', { path: 'missing/a.md', kind: 'file' })).status).toBe(404)
+    expect((await remove('nope.md')).status).toBe(404)
+    expect((await remove('')).status).toBe(400)
+    expect((await remove('.git')).status).toBe(400)
+    expect((await remove('../x')).status).toBe(400)
+    expect((await json('PATCH', { path: 'README.md', name: 'a/b' })).status).toBe(400)
+  })
+
+  it('validates request bodies', async () => {
+    expect((await json('POST', { path: 'x', kind: 'link' })).status).toBe(400)
+    expect((await json('POST', { kind: 'file' })).status).toBe(400)
+    expect((await json('PATCH', { path: 'README.md' })).status).toBe(400)
+    expect((await json('PATCH', { path: 'README.md', name: 3 })).status).toBe(400)
+  })
+
+  it('refuses a cross-site write', async () => {
+    expect((await json('POST', { path: 'evil.txt', kind: 'file' }, { origin: 'http://evil.example' })).status).toBe(403)
+    expect(await fs.stat(path.join(writeRoot, 'evil.txt')).then(() => true, () => false)).toBe(false)
+  })
+
+  it('keeps every other kind read-only', async () => {
+    for (const kind of ['file', 'search', 'git', 'media']) {
+      const response = await fetch(`${server.url}/api/workspaces/${wsId}/projects/${writeProjectId}/${kind}?path=README.md`, { method: 'DELETE' })
+      expect(response.status, kind).toBe(405)
+    }
+    expect(await fs.readFile(path.join(writeRoot, 'README.md'), 'utf8')).toBe('r\n')
+  })
+})
+
+describe('explorer writes in an archived workspace', () => {
+  it('refuses writes but still serves reads', async () => {
+    const archivedRoot = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-files-archived-'))
+    try {
+      await fs.writeFile(path.join(archivedRoot, 'README.md'), 'r\n', 'utf8')
+      const ws = (await (await fetch(`${server.url}/api/workspaces`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'Archived explorer' }),
+      })).json()) as { id: string }
+      const project = (await (await fetch(`${server.url}/api/workspaces/${ws.id}/projects`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'Archived', path: archivedRoot }),
+      })).json()) as { id: string }
+      expect((await fetch(`${server.url}/api/workspaces/${ws.id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ archived: true }),
+      })).status).toBe(200)
+
+      const filesUrl = `${server.url}/api/workspaces/${ws.id}/projects/${project.id}/files`
+      expect((await fetch(`${filesUrl}?path=`)).status).toBe(200)
+      expect((await fetch(`${filesUrl}?path=README.md`, { method: 'DELETE' })).status).toBe(404)
+      expect(await fs.readFile(path.join(archivedRoot, 'README.md'), 'utf8')).toBe('r\n')
+    } finally {
+      await fs.rm(archivedRoot, { recursive: true, force: true })
+    }
+  })
+})

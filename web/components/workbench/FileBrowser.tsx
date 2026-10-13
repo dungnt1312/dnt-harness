@@ -1,29 +1,44 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Icon from '../common/Icon.tsx'
+import ConfirmDialog from '../common/ConfirmDialog.tsx'
 import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
-import { listProjectFiles, type ProjectEntry, type ProjectListing } from '../../lib/api.ts'
-import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
+import { TextInput } from '../ui/TextInput.tsx'
 import { cn } from '../../lib/cn.ts'
+import { createProjectEntry, deleteProjectEntry, listProjectFiles, renameProjectEntry, type ProjectEntry } from '../../lib/api.ts'
+import { ancestorsOf, dropKeysUnder, dropUnderSet, isAtOrUnder, joinPath, parentOf, targetFolder, writeErrorText, type Selection } from '../../lib/file-tree.ts'
+import { FileSearchResults } from './FileSearchResults.tsx'
+import { FolderRows, type FolderNode, type TreeActions, type TreeEditor } from './FileTreeRows.tsx'
+import { useFileSearch } from './useFileSearch.ts'
 
-interface FolderNode {
-  readonly status: 'loading' | 'ready' | 'error'
-  readonly listing: ProjectListing | null
+interface DeleteRequest {
+  readonly entry: ProjectEntry
+  readonly busy: boolean
   readonly error: string | null
 }
 
-/** A collapsible project tree. Folders load one level at a time; files open as tabs. */
-export function FileBrowser({ workspaceId, project, activeFile, onOpenFile }: {
+/** A collapsible project tree. Folders load one level at a time; files open as tabs; rows create, rename and delete. */
+export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRenamed, onRemoved }: {
   readonly workspaceId: string
   readonly project: { readonly id: string; readonly name: string; readonly path: string }
   readonly activeFile: string | null
   readonly onOpenFile: (path: string) => void
+  readonly onRenamed: (from: string, to: string) => void
+  readonly onRemoved: (path: string) => void
 }) {
   const [nodes, setNodes] = useState<Readonly<Record<string, FolderNode>>>({})
   const [open, setOpen] = useState<ReadonlySet<string>>(() => new Set())
+  const [selected, setSelected] = useState<Selection | null>(null)
+  const [editor, setEditor] = useState<TreeEditor | null>(null)
+  const [deleting, setDeleting] = useState<DeleteRequest | null>(null)
+  const search = useFileSearch(workspaceId, project.id)
   const generation = useRef(new Map<string, number>())
+  const nextEditorId = useRef(0)
+  /** Latest `open`, for async handlers that must not read the value captured before an await. */
+  const openNow = useRef(open)
+  openNow.current = open
 
   const load = useCallback(async (folder: string) => {
     const request = (generation.current.get(folder) ?? 0) + 1
@@ -41,6 +56,16 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile }: {
 
   useEffect(() => { void load('') }, [load])
 
+  /** Forget everything cached at or under `path`; listings still in flight for it are ignored. */
+  const forget = (path: string): void => {
+    for (const [folder, request] of generation.current) if (isAtOrUnder(folder, path)) generation.current.set(folder, request + 1)
+    setNodes((current) => dropKeysUnder(current, path))
+    setOpen((current) => dropUnderSet(current, path))
+  }
+
+  /** Close the editor, unless a newer one already replaced it. */
+  const closeEditor = (finished: TreeEditor): void => setEditor((current) => current === finished ? null : current)
+
   const toggle = (folder: string): void => {
     setOpen((current) => {
       const next = new Set(current)
@@ -51,6 +76,89 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile }: {
     if (nodes[folder] === undefined) void load(folder)
   }
 
+  const startCreate = (kind: 'file' | 'dir'): void => {
+    search.setQuery('') // the draft lives in the tree, which is hidden while searching
+    const folder = targetFolder(selected)
+    const chain = ancestorsOf(folder)
+    if (chain.length > 0) setOpen((current) => new Set([...current, ...chain]))
+    for (const ancestor of chain) if (nodes[ancestor] === undefined) void load(ancestor)
+    setEditor({ id: nextEditorId.current++, mode: 'create', folder, kind })
+  }
+
+  // Both submit handlers resolve (never reject) and unmount their editor on
+  // success before reloading, so the input is never left disabled.
+  const submitCreate = async (name: string): Promise<string | null> => {
+    if (editor?.mode !== 'create') return null
+    const { folder, kind } = editor
+    const path = joinPath(folder, name)
+    try {
+      await createProjectEntry(workspaceId, project.id, path, kind)
+    } catch (cause) {
+      return writeErrorText(cause)
+    }
+    closeEditor(editor)
+    setSelected({ path, kind })
+    await load(folder)
+    if (kind === 'file') onOpenFile(path)
+    return null
+  }
+
+  const submitRename = async (entry: ProjectEntry, name: string): Promise<string | null> => {
+    const current = editor
+    let renamed: string
+    try {
+      renamed = (await renameProjectEntry(workspaceId, project.id, entry.path, name)).path
+    } catch (cause) {
+      return writeErrorText(cause)
+    }
+    const wasOpen = entry.kind === 'dir' && openNow.current.has(entry.path)
+    if (current !== null) closeEditor(current)
+    forget(entry.path)
+    if (wasOpen) setOpen((now) => new Set(now).add(renamed))
+    setSelected((now) => now !== null && isAtOrUnder(now.path, entry.path) ? { ...now, path: `${renamed}${now.path.slice(entry.path.length)}` } : now)
+    onRenamed(entry.path, renamed)
+    await load(parentOf(entry.path))
+    if (wasOpen) await load(renamed)
+    return null
+  }
+
+  const confirmDelete = async (): Promise<void> => {
+    if (deleting === null || deleting.busy) return
+    const { entry } = deleting
+    setDeleting({ entry, busy: true, error: null })
+    try {
+      await deleteProjectEntry(workspaceId, project.id, entry.path)
+    } catch (cause) {
+      setDeleting({ entry, busy: false, error: writeErrorText(cause) })
+      return
+    }
+    setDeleting(null)
+    forget(entry.path)
+    setSelected((now) => now !== null && isAtOrUnder(now.path, entry.path) ? null : now)
+    setEditor((now) => now !== null && isAtOrUnder(now.mode === 'create' ? now.folder : now.path, entry.path) ? null : now)
+    onRemoved(entry.path)
+    await load(parentOf(entry.path))
+  }
+
+  const actions: TreeActions = {
+    nodes,
+    open,
+    activeFile,
+    selected,
+    editor,
+    activate: (entry) => {
+      setSelected({ path: entry.path, kind: entry.kind })
+      if (entry.kind === 'dir') toggle(entry.path)
+      else onOpenFile(entry.path)
+    },
+    retry: (folder) => void load(folder),
+    beginRename: (entry) => setEditor({ id: nextEditorId.current++, mode: 'rename', path: entry.path }),
+    beginDelete: (entry) => setDeleting({ entry, busy: false, error: null }),
+    submitCreate,
+    submitRename,
+    cancelEdit: () => setEditor(null),
+  }
+
   const root = nodes['']
 
   return (
@@ -58,9 +166,29 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile }: {
       <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line px-2.5 text-[13px]">
         <Icon name="folder" size={14} className="shrink-0 text-fg-muted" />
         <span className="min-w-0 flex-1 truncate font-medium" title={project.path}>{project.name}</span>
+        <IconButton label="New file" onClick={() => startCreate('file')}><Icon name="plus" size={14} /></IconButton>
+        <IconButton label="New folder" onClick={() => startCreate('dir')}><Icon name="folder" size={14} /></IconButton>
         <IconButton label="Refresh files" onClick={() => void load('')}><Icon name="refresh" size={14} /></IconButton>
       </div>
-      <div className="min-h-0 flex-1 overflow-auto py-1">
+      <div className="shrink-0 border-b border-line p-2">
+        <TextInput
+          aria-label="Search files"
+          placeholder="Search files"
+          value={search.query}
+          onChange={(event) => search.setQuery(event.target.value)}
+          onKeyDown={(event) => { if (event.key === 'Escape') search.setQuery('') }}
+          leading={<Icon name="search" size={13} />}
+          trailing={search.query !== '' ? <IconButton label="Clear search" size="sm" onClick={() => search.setQuery('')}><Icon name="close" size={13} /></IconButton> : undefined}
+          className="h-8"
+        />
+      </div>
+      {search.searching ? (
+        <div className="min-h-0 flex-1 overflow-auto py-1">
+          <FileSearchResults status={search.status} result={search.result} error={search.error} activeFile={activeFile} onOpen={onOpenFile} />
+        </div>
+      ) : null}
+      {/* Hidden, not unmounted, while searching: the expanded folders and cache survive. */}
+      <div className={cn('min-h-0 flex-1 overflow-auto py-1', search.searching && 'hidden')}>
         {root?.status === 'error' && root.listing === null ? (
           <div className="flex flex-col items-start gap-2 p-2">
             <ErrorNotice raw={root.error ?? ''} />
@@ -69,78 +197,26 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile }: {
         ) : root === undefined || (root.status === 'loading' && root.listing === null) ? (
           <div className="flex items-center gap-2 px-2.5 py-2 text-sm text-fg-muted" role="status"><Spinner size={13} />Loading files…</div>
         ) : (
-          <FolderRows
-            entries={root.listing?.entries ?? []}
-            depth={0}
-            nodes={nodes}
-            open={open}
-            activeFile={activeFile}
-            onToggle={toggle}
-            onOpenFile={onOpenFile}
-            onRetry={load}
-          />
+          <FolderRows folder="" entries={root.listing?.entries ?? []} depth={0} actions={actions} />
         )}
       </div>
+      {deleting !== null ? (
+        <ConfirmDialog
+          open
+          title={`Delete ${deleting.entry.name}?`}
+          confirmLabel="Delete"
+          tone="danger"
+          busy={deleting.busy}
+          onConfirm={() => void confirmDelete()}
+          onDismiss={() => { if (!deleting.busy) setDeleting(null) }}
+          body={(
+            <>
+              <p className="m-0">{deleting.entry.kind === 'dir' ? 'This folder and everything inside it will be deleted permanently.' : 'This file will be deleted permanently.'}</p>
+              {deleting.error !== null ? <ErrorNotice raw={deleting.error} /> : null}
+            </>
+          )}
+        />
+      ) : null}
     </div>
-  )
-}
-
-function FolderRows({ entries, depth, nodes, open, activeFile, onToggle, onOpenFile, onRetry }: {
-  readonly entries: readonly ProjectEntry[]
-  readonly depth: number
-  readonly nodes: Readonly<Record<string, FolderNode>>
-  readonly open: ReadonlySet<string>
-  readonly activeFile: string | null
-  readonly onToggle: (folder: string) => void
-  readonly onOpenFile: (path: string) => void
-  readonly onRetry: (folder: string) => void
-}) {
-  if (entries.length === 0) return <p className="m-0 px-2.5 py-2 text-[13px] text-fg-faint" style={{ paddingLeft: 10 + depth * 14 }}>Empty folder</p>
-  return (
-    <ul aria-label={depth === 0 ? 'Project files' : undefined} className="m-0 flex list-none flex-col p-0">
-      {entries.map((entry) => {
-        const expanded = entry.kind === 'dir' && open.has(entry.path)
-        const node = nodes[entry.path]
-        return (
-          <li key={entry.path}>
-            <button
-              type="button"
-              title={entry.path}
-              aria-expanded={entry.kind === 'dir' ? expanded : undefined}
-              onClick={() => entry.kind === 'dir' ? onToggle(entry.path) : onOpenFile(entry.path)}
-              style={{ paddingLeft: 6 + depth * 14 }}
-              className={cn('flex min-h-7 w-full items-center gap-1.5 rounded-md pr-2 text-left text-[13px] hover:bg-hover', entry.path === activeFile && 'bg-hover text-fg')}
-            >
-              {entry.kind === 'dir'
-                ? <Icon name="chevronRight" size={12} className={cn('shrink-0 text-fg-faint transition-transform', expanded && 'rotate-90')} />
-                : <span aria-hidden="true" className="w-3 shrink-0" />}
-              <FileTypeIcon path={entry.name} kind={entry.kind === 'dir' ? 'folder' : 'file'} open={expanded} size={16} />
-              <span className="min-w-0 flex-1 truncate">{entry.name}</span>
-            </button>
-            {expanded ? (
-              node?.status === 'error' && node.listing === null ? (
-                <div className="flex items-center gap-2 py-1 pr-2" style={{ paddingLeft: 24 + depth * 14 }}>
-                  <span className="text-xs text-bad">Could not load</span>
-                  <Button size="sm" variant="outline" onClick={() => onRetry(entry.path)}>Retry</Button>
-                </div>
-              ) : node === undefined || (node.status === 'loading' && node.listing === null) ? (
-                <div className="flex items-center gap-2 py-1 text-xs text-fg-muted" style={{ paddingLeft: 24 + depth * 14 }} role="status"><Spinner size={12} />Loading…</div>
-              ) : (
-                <FolderRows
-                  entries={node.listing?.entries ?? []}
-                  depth={depth + 1}
-                  nodes={nodes}
-                  open={open}
-                  activeFile={activeFile}
-                  onToggle={onToggle}
-                  onOpenFile={onOpenFile}
-                  onRetry={onRetry}
-                />
-              )
-            ) : null}
-          </li>
-        )
-      })}
-    </ul>
   )
 }
