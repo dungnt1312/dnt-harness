@@ -8,7 +8,7 @@
  * `ProjectGitError`, while Git's own refusal (an unmerged branch) comes back
  * as a failed step with Git's stderr.
  */
-import { ProjectGitError, runGitQuery } from './project-git.ts'
+import { ProjectGitError, runGitCommand, type GitRunner } from './project-git.ts'
 import { checkedBranch, git, sequence, type Context, type Step } from './project-git-ops.ts'
 
 export interface GitBranch {
@@ -23,6 +23,8 @@ export interface GitBranch {
 export interface GitBranchList {
   readonly branches: readonly GitBranch[]
   readonly defaultBranch?: string
+  /** Git's stderr when listing failed (Zed `branch_list_error`); `branches` holds whatever parsed. */
+  readonly error?: string
 }
 
 const FORMAT = '%(HEAD)%00%(objectname)%00%(parent)%00%(refname)%00%(upstream)%00%(upstream:track)%00%(committerdate:unix)%00%(authorname)%00%(contents:subject)'
@@ -51,33 +53,48 @@ export function parseBranchRecords(stdout: string): GitBranch[] {
   return out
 }
 
-/** Local and remote-tracking branches, and the remote's default branch when `HEAD` of `upstream`/`origin` is known. */
-export async function listProjectGitBranches(root: string, trusted: boolean): Promise<GitBranchList> {
+/**
+ * Zed `default_branch`: the `upstream` remote's HEAD, then `origin`'s, then a
+ * local `init.defaultBranch`, `main` or `master` that exists as a branch.
+ */
+async function defaultBranchOf(root: string, trusted: boolean, run: GitRunner): Promise<string | undefined> {
+  const query = (args: readonly string[]) => run(root, args, { trusted, stdin: 'ignore' })
+  const listed = await query(['for-each-ref', '--format=%(refname)%09%(symref)', 'refs/remotes/upstream/HEAD', 'refs/remotes/origin/HEAD', 'refs/heads/'])
+  const refs = new Map<string, string>()
+  if (listed.code === 0) {
+    for (const line of listed.stdout.toString('utf8').split('\n')) {
+      const tab = line.indexOf('\t')
+      if (tab >= 0) refs.set(line.slice(0, tab), line.slice(tab + 1))
+    }
+  }
+  for (const remote of ['upstream', 'origin']) {
+    const prefix = `refs/remotes/${remote}/`
+    const target = refs.get(`${prefix}HEAD`)
+    if (target?.startsWith(prefix) === true) return target.slice(prefix.length)
+  }
+  const localExists = (branch: string): boolean => branch !== '' && refs.has(`refs/heads/${branch}`)
+  const configured = await query(['config', 'init.defaultBranch'])
+  if (configured.code === 0) {
+    const name = configured.stdout.toString('utf8').trim()
+    if (localExists(name)) return name
+  }
+  return ['main', 'master'].find(localExists)
+}
+
+/** Local and remote-tracking branches, and the default branch. A failed listing is reported in `error` next to whatever parsed. */
+export async function listProjectGitBranches(root: string, trusted: boolean, run: GitRunner = runGitCommand): Promise<GitBranchList> {
   // Zed passes the patterns before `--format`.
-  const listed = await runGitQuery(root, ['for-each-ref', 'refs/heads/**/*', 'refs/remotes/**/*', `--format=${FORMAT}`], trusted)
-  let branches = listed.code === 0 ? parseBranchRecords(listed.stdout.toString('utf8')) : []
+  const listed = await run(root, ['for-each-ref', 'refs/heads/**/*', 'refs/remotes/**/*', `--format=${FORMAT}`], { trusted, stdin: 'ignore' })
+  let branches = parseBranchRecords(listed.stdout.toString('utf8'))
+  const error = listed.code === 0 ? undefined : listed.stderr.toString('utf8').trim() || `git for-each-ref exited with code ${listed.code}`
   if (branches.length === 0) {
     // An unborn branch has no ref yet; HEAD still names it.
-    const head = await runGitQuery(root, ['symbolic-ref', '--quiet', 'HEAD'], trusted)
+    const head = await run(root, ['symbolic-ref', '--quiet', 'HEAD'], { trusted, stdin: 'ignore' })
     const ref = head.code === 0 ? head.stdout.toString('utf8').trim() : ''
     if (ref.startsWith('refs/heads/')) branches = [{ name: ref.slice('refs/heads/'.length), remote: false, current: true }]
   }
-  const defaults = await runGitQuery(
-    root,
-    ['for-each-ref', '--format=%(refname)%09%(symref)', 'refs/remotes/upstream/HEAD', 'refs/remotes/origin/HEAD'],
-    trusted,
-  )
-  let defaultBranch: string | undefined
-  if (defaults.code === 0) {
-    for (const line of defaults.stdout.toString('utf8').split('\n')) {
-      const [refname = '', symref = ''] = line.split('\t')
-      const remote = /^refs\/remotes\/([^/]+)\/HEAD$/.exec(refname)?.[1]
-      if (remote === undefined || symref === '') continue
-      defaultBranch = symref.replace(`refs/remotes/${remote}/`, '')
-      break
-    }
-  }
-  return { branches, ...(defaultBranch === undefined ? {} : { defaultBranch }) }
+  const defaultBranch = await defaultBranchOf(root, trusted, run)
+  return { branches, ...(defaultBranch === undefined ? {} : { defaultBranch }), ...(error === undefined ? {} : { error }) }
 }
 
 const exists = async (ctx: Context, ref: string): Promise<boolean> => (await git(ctx, ['show-ref', '--verify', '--quiet', ref])).ok
@@ -87,12 +104,16 @@ export async function switchBranch(ctx: Context, name: string): Promise<Step> {
   if (name.startsWith('-')) throw new ProjectGitError(`Branch '${name}' not found`)
   if (await exists(ctx, `refs/heads/${name}`)) return git(ctx, ['checkout', name])
   if (await exists(ctx, `refs/remotes/${name}`)) {
-    const slash = name.indexOf('/')
-    const remote = name.slice(0, slash)
-    const branch = name.slice(slash + 1)
+    // A remote symref such as `origin/HEAD` follows to the branch it points at.
+    const resolved = await git(ctx, ['symbolic-ref', `refs/remotes/${name}`])
+    const target = resolved.ok ? resolved.stdout.trim() : ''
+    const full = target.startsWith('refs/remotes/') ? target.slice('refs/remotes/'.length) : name
+    const slash = full.indexOf('/')
+    if (slash <= 0) throw new ProjectGitError(`Unexpected branch format: ${full}`)
+    const branch = full.slice(slash + 1)
     const link = (await exists(ctx, `refs/heads/${branch}`))
-      ? ['branch', '--set-upstream-to', `${remote}/${branch}`, branch]
-      : ['branch', '--track', branch, `${remote}/${branch}`]
+      ? ['branch', '--set-upstream-to', full, branch]
+      : ['branch', '--track', branch, full]
     return sequence(() => git(ctx, link), () => git(ctx, ['checkout', branch]))
   }
   throw new ProjectGitError(`Branch '${name}' not found`)

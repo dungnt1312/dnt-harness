@@ -105,6 +105,40 @@ describe('branch list', () => {
     const list = await listProjectGitBranches(repo.dir, true)
     expect(list.branches.map((b) => b.name).sort()).toEqual(['feature', 'main', 'origin/main'])
     expect(list.defaultBranch).toBe('main'); void bare
+    expect(list.error).toBeUndefined()
+  })
+
+  it('prefers the upstream remote HEAD over origin HEAD', async () => {
+    const repo = await makeRepo()
+    for (const [remote, branch] of [['origin', 'main'], ['upstream', 'dev']] as const) {
+      repo.git('update-ref', `refs/remotes/${remote}/${branch}`, 'HEAD')
+      repo.git('symbolic-ref', `refs/remotes/${remote}/HEAD`, `refs/remotes/${remote}/${branch}`)
+    }
+    expect((await listProjectGitBranches(repo.dir, true)).defaultBranch).toBe('dev')
+  })
+
+  it('without a remote HEAD falls back to init.defaultBranch, main, master, then nothing', async () => {
+    const repo = await makeRepo()
+    expect((await listProjectGitBranches(repo.dir, true)).defaultBranch).toBe('main')
+    repo.git('branch', 'trunk'); repo.git('config', 'init.defaultBranch', 'trunk')
+    expect((await listProjectGitBranches(repo.dir, true)).defaultBranch).toBe('trunk')
+    repo.git('config', 'init.defaultBranch', 'absent')
+    expect((await listProjectGitBranches(repo.dir, true)).defaultBranch).toBe('main')
+    repo.git('branch', '-m', 'main', 'master')
+    expect((await listProjectGitBranches(repo.dir, true)).defaultBranch).toBe('master')
+    repo.git('branch', '-m', 'master', 'other'); repo.git('branch', '-D', 'trunk')
+    expect((await listProjectGitBranches(repo.dir, true)).defaultBranch).toBeUndefined()
+  })
+
+  it('reports a failed listing in error and keeps what parsed', async () => {
+    const repo = await makeRepo()
+    const failing: GitRunner = async (root, args, options) => {
+      const result = await runGitCommand(root, args, options)
+      return args.some((a) => a.startsWith('--format=%(HEAD)')) ? { ...result, code: 128, stderr: Buffer.from('fatal: broken ref\n') } : result
+    }
+    const list = await listProjectGitBranches(repo.dir, true, failing)
+    expect(list.error).toBe('fatal: broken ref')
+    expect(list.branches.map((b) => b.name)).toEqual(['main'])
   })
 })
 
@@ -129,8 +163,23 @@ describe('switch branch', () => {
     const repo = await makeRepo(); addRemote(repo, 'origin')
     repo.git('push', '-q', 'origin', 'main:topic'); repo.git('fetch', '-q', 'origin'); repo.git('branch', 'topic')
     const { run, calls } = spy()
-    await operate(repo, { type: 'switch-branch', name: 'origin/topic' }, { run })
+    const done = await operate(repo, { type: 'switch-branch', name: 'origin/topic' }, { run })
+    expect(done.ok).toBe(true); expect(done.status.branch).toBe('topic')
     expect(calls).toContainEqual(['branch', '--set-upstream-to', 'origin/topic', 'topic'])
+  })
+
+  it('follows a remote symref such as origin/HEAD to its target', async () => {
+    const repo = await makeRepo(); addRemote(repo, 'origin')
+    repo.git('push', '-q', 'origin', 'main:topic'); repo.git('fetch', '-q', 'origin'); repo.git('remote', 'set-head', 'origin', 'topic')
+    const { run, calls } = spy()
+    const done = await operate(repo, { type: 'switch-branch', name: 'origin/HEAD' }, { run })
+    expect(done.ok).toBe(true); expect(done.status.branch).toBe('topic')
+    expect(calls).toContainEqual(['branch', '--track', 'topic', 'origin/topic'])
+  })
+
+  it('refuses a remote ref without a remote name', async () => {
+    const repo = await makeRepo(); repo.git('update-ref', 'refs/remotes/weird', 'HEAD')
+    await expect(operate(repo, { type: 'switch-branch', name: 'weird' })).rejects.toThrow('Unexpected branch format: weird')
   })
 
   it('refuses an unknown branch', async () => {
@@ -166,5 +215,13 @@ describe('delete branch', () => {
     const { run, calls } = spy()
     expect((await operate(repo, { type: 'delete-branch', name: 'side', remote: false, force: true }, { run })).ok).toBe(true)
     expect(calls).toContainEqual(['branch', '-D', 'side'])
+  })
+
+  it('deletes a remote-tracking branch with -dr', async () => {
+    const repo = await makeRepo(); addRemote(repo, 'origin')
+    repo.git('push', '-q', 'origin', 'main:topic'); repo.git('fetch', '-q', 'origin'); const { run, calls } = spy()
+    expect((await operate(repo, { type: 'delete-branch', name: 'origin/topic', remote: true, force: false }, { run })).ok).toBe(true)
+    expect(calls).toContainEqual(['branch', '-dr', 'origin/topic'])
+    expect(repo.git('branch', '-r')).not.toMatch(/origin\/topic/)
   })
 })
