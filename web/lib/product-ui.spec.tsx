@@ -1761,11 +1761,11 @@ describe('mounted clipboard recovery', () => {
 describe('workbench files', () => {
   const project = { id: 'p1', name: 'Acme', path: 'C:/acme' }
   it('closing the front tab reveals its neighbour, then the fixed view', () => {
-    const state = { folder: '', openFiles: ['a.ts', 'b.ts', 'c.ts'], activeFile: 'b.ts', focus: null }
+    const state = { folder: '', openFiles: ['a.ts', 'b.ts', 'c.ts'], activeFile: 'b.ts', focus: null, drafts: {} }
     expect(closeFileTab(state, 'b.ts')).toMatchObject({ openFiles: ['a.ts', 'c.ts'], activeFile: 'c.ts' })
     expect(closeFileTab({ ...state, activeFile: 'c.ts' }, 'c.ts')).toMatchObject({ activeFile: 'b.ts' })
     expect(closeFileTab({ ...state, activeFile: 'a.ts' }, 'c.ts')).toMatchObject({ activeFile: 'a.ts' })
-    expect(closeFileTab({ folder: '', openFiles: ['a.ts'], activeFile: 'a.ts', focus: null }, 'a.ts')).toMatchObject({ openFiles: [], activeFile: null })
+    expect(closeFileTab({ folder: '', openFiles: ['a.ts'], activeFile: 'a.ts', focus: null, drafts: {} }, 'a.ts')).toMatchObject({ openFiles: [], activeFile: null })
     // A closed tab takes its window with it; the revealed file lands at its top.
     expect(closeFileTab({ ...state, focus: { line: 40, seq: 1 } }, 'b.ts')).toMatchObject({ focus: null })
   })

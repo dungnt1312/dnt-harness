@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { isAtOrUnder } from '../lib/file-tree.ts'
 import type { FileFocus } from '../lib/tool-facts.ts'
@@ -11,6 +11,14 @@ export interface ViewerFocus extends FileFocus {
   readonly seq: number
 }
 
+/** Unsaved editor text for one open file, kept while its tab is open. */
+export interface FileDraft {
+  readonly text: string
+  /** Hash of the file the edit started from; the save sends it back. */
+  readonly baseHash: string
+  readonly dirty: boolean
+}
+
 export interface FilesState {
   /** Folder shown by the Files view (root-relative, '' = root). */
   readonly folder: string
@@ -20,6 +28,8 @@ export interface FilesState {
   readonly activeFile: string | null
   /** Where the front tab should land, when it was opened at a window. */
   readonly focus: ViewerFocus | null
+  /** Unsaved editor text by path; survives tab switches, dropped when the tab closes. */
+  readonly drafts: Readonly<Record<string, FileDraft>>
 }
 
 export interface WorkbenchFiles extends FilesState {
@@ -31,9 +41,14 @@ export interface WorkbenchFiles extends FilesState {
   readonly renamePath: (from: string, to: string) => void
   /** A file or folder was deleted in the explorer: close its open tabs. */
   readonly removePath: (path: string) => void
+  /** Store (or with null, clear) the unsaved text of an open file. */
+  readonly setDraft: (path: string, draft: FileDraft | null) => void
 }
 
-const EMPTY: FilesState = { folder: '', openFiles: [], activeFile: null, focus: null }
+const EMPTY: FilesState = { folder: '', openFiles: [], activeFile: null, focus: null, drafts: {} }
+
+const withoutDraft = (drafts: FilesState['drafts'], keep: (path: string) => boolean): FilesState['drafts'] =>
+  Object.fromEntries(Object.entries(drafts).filter(([path]) => keep(path)))
 
 /** Closing the front tab reveals its right neighbour, else its left one, else the fixed view. */
 export function closeFileTab(state: FilesState, path: string): FilesState {
@@ -41,8 +56,17 @@ export function closeFileTab(state: FilesState, path: string): FilesState {
   if (index === -1) return state
   const openFiles = state.openFiles.filter((file) => file !== path)
   const activeFile = state.activeFile !== path ? state.activeFile : openFiles[Math.min(index, openFiles.length - 1)] ?? null
+  const drafts = state.drafts[path] === undefined ? state.drafts : withoutDraft(state.drafts, (key) => key !== path)
   // The window belonged to the tab being closed, not to whatever it reveals.
-  return { ...state, openFiles, activeFile, focus: null }
+  return { ...state, openFiles, activeFile, focus: null, drafts }
+}
+
+const baseName = (path: string): string => path.slice(path.lastIndexOf('/') + 1)
+
+/** Close a tab, asking first when it holds unsaved changes; a refusal keeps everything. */
+export function closeFileWithDraft(state: FilesState, path: string, confirm: (message: string) => boolean): FilesState {
+  if (state.drafts[path]?.dirty === true && !confirm(`Discard unsaved changes to ${baseName(path)}?`)) return state
+  return closeFileTab(state, path)
 }
 
 const moved = (path: string, from: string, to: string): string => isAtOrUnder(path, from) ? `${to}${path.slice(from.length)}` : path
@@ -50,12 +74,14 @@ const moved = (path: string, from: string, to: string): string => isAtOrUnder(pa
 /** Rewrites every tab, the front tab and the shown folder at or under `from`. */
 export function renameFileTabs(state: FilesState, from: string, to: string): FilesState {
   const touched = state.openFiles.some((file) => isAtOrUnder(file, from)) || isAtOrUnder(state.folder, from)
+    || Object.keys(state.drafts).some((file) => isAtOrUnder(file, from))
   if (!touched) return state
   return {
     ...state,
     folder: moved(state.folder, from, to),
     openFiles: state.openFiles.map((file) => moved(file, from, to)),
     activeFile: state.activeFile === null ? null : moved(state.activeFile, from, to),
+    drafts: Object.fromEntries(Object.entries(state.drafts).map(([file, draft]) => [moved(file, from, to), draft])),
   }
 }
 
@@ -63,8 +89,10 @@ export function renameFileTabs(state: FilesState, from: string, to: string): Fil
 export function removeFileTabs(state: FilesState, path: string): FilesState {
   const doomed = state.openFiles.filter((file) => isAtOrUnder(file, path))
   const folderGone = state.folder !== '' && isAtOrUnder(state.folder, path)
-  if (doomed.length === 0 && !folderGone) return state
+  const draftsGone = Object.keys(state.drafts).some((file) => isAtOrUnder(file, path))
+  if (doomed.length === 0 && !folderGone && !draftsGone) return state
   let next: FilesState = folderGone ? { ...state, folder: '' } : state
+  if (draftsGone) next = { ...next, drafts: withoutDraft(next.drafts, (file) => !isAtOrUnder(file, path)) }
   const frontGone = next.activeFile !== null && isAtOrUnder(next.activeFile, path)
   if (!frontGone) {
     return { ...next, openFiles: next.openFiles.filter((file) => !isAtOrUnder(file, path)) }
@@ -91,11 +119,32 @@ export function useWorkbenchFiles(projectKey: string | null): WorkbenchFiles {
     activeFile: path,
     focus: focus === undefined ? null : { ...focus, seq: (current.focus?.seq ?? 0) + 1 },
   })), [])
-  const closeFile = useCallback((path: string) => setState((current) => closeFileTab(current, path)), [])
+  // The confirm dialog must not run inside a state updater (React may call updaters twice).
+  const latest = useRef(state)
+  latest.current = state
+  const closeFile = useCallback((path: string) => {
+    if (closeFileWithDraft(latest.current, path, (message) => window.confirm(message)) === latest.current) return
+    setState((current) => closeFileTab(current, path))
+  }, [])
+  const setDraft = useCallback((path: string, draft: FileDraft | null) => setState((current) => {
+    if (draft === null) {
+      if (current.drafts[path] === undefined) return current
+      const { [path]: _gone, ...rest } = current.drafts
+      return { ...current, drafts: rest }
+    }
+    return { ...current, drafts: { ...current.drafts, [path]: draft } }
+  }), [])
+  const anyDirty = Object.values(state.drafts).some((draft) => draft.dirty)
+  useEffect(() => {
+    if (!anyDirty) return
+    const warn = (event: BeforeUnloadEvent): void => { event.preventDefault(); event.returnValue = '' }
+    window.addEventListener('beforeunload', warn)
+    return () => window.removeEventListener('beforeunload', warn)
+  }, [anyDirty])
   const showFixedView = useCallback(() => setState((current) => ({ ...current, activeFile: null })), [])
 
   const renamePath = useCallback((from: string, to: string) => setState((current) => renameFileTabs(current, from, to)), [])
   const removePath = useCallback((path: string) => setState((current) => removeFileTabs(current, path)), [])
 
-  return { ...state, setFolder, openFile, closeFile, showFixedView, renamePath, removePath }
+  return { ...state, setFolder, openFile, closeFile, showFixedView, renamePath, removePath, setDraft }
 }
