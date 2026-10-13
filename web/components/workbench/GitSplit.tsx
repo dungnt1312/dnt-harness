@@ -84,28 +84,32 @@ export function GitSplit({ projectId, list, diff, state, onChange }: {
   if (state.collapsed || diff === null) {
     return <div className="flex min-h-0 flex-1 flex-col" data-split="collapsed">{list}</div>
   }
+  // A container query answers for the container's DESCENDANTS only, so the
+  // `@container` wrapper is one element and the row/column flex is its child.
   return (
-    <div ref={box} className="@container flex min-h-0 flex-1 flex-col @[720px]:flex-row" data-split="open">
-      <div className="flex min-h-0 min-w-0 flex-col overflow-hidden" style={{ flexBasis: `${percent}%`, flexGrow: 0, flexShrink: 0 }}>{list}</div>
-      <div
-        role="separator"
-        aria-label="Resize the diff pane"
-        aria-orientation="vertical"
-        aria-valuemin={20}
-        aria-valuemax={80}
-        aria-valuenow={percent}
-        tabIndex={0}
-        onKeyDown={onKeyDown}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        className={cn(
-          'shrink-0 bg-line outline-none transition-colors hover:bg-fg-faint focus-visible:bg-fg-faint',
-          'h-1.5 cursor-row-resize @[720px]:h-auto @[720px]:w-1.5 @[720px]:cursor-col-resize',
-          dragging && 'bg-fg-faint',
-        )}
-      />
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">{diff}</div>
+    <div className="@container flex min-h-0 flex-1 flex-col" data-split="open">
+      <div ref={box} className="flex min-h-0 flex-1 flex-col @[720px]:flex-row">
+        <div className="flex min-h-0 min-w-0 flex-col overflow-hidden" style={{ flexBasis: `${percent}%`, flexGrow: 0, flexShrink: 0 }}>{list}</div>
+        <div
+          role="separator"
+          aria-label="Resize the diff pane"
+          aria-orientation="vertical"
+          aria-valuemin={20}
+          aria-valuemax={80}
+          aria-valuenow={percent}
+          tabIndex={0}
+          onKeyDown={onKeyDown}
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp}
+          className={cn(
+            'shrink-0 bg-line outline-none transition-colors hover:bg-fg-faint focus-visible:bg-fg-faint',
+            'h-1.5 cursor-row-resize @[720px]:h-auto @[720px]:w-1.5 @[720px]:cursor-col-resize',
+            dragging && 'bg-fg-faint',
+          )}
+        />
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">{diff}</div>
+      </div>
     </div>
   )
 }
