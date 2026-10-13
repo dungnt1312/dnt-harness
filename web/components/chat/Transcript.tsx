@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { HoldScrollProvider, useStickToBottom } from '../../hooks/useStickToBottom.ts'
 import type { RetryTarget, ViewItem } from '../../lib/project.ts'
 import { turnChanges, type TurnChanges } from '../../lib/turn-changes.ts'
@@ -9,7 +9,7 @@ import { processRows, type ProcessRow } from '../../lib/processes-view.ts'
 import { hiddenSpawnCalls } from '../../lib/spawn-merge.ts'
 import { turnTimings, type TurnTiming } from '../../lib/turn-timing.ts'
 import { useGated, useSessionDerivedGates } from '../../lib/session-derived.ts'
-import { ActivityBlock, AssistantMessage, AuditLine, CommandExpansionMarker, CompactionMarker, ContinuationMarker, ContextMarker, HookContextMarker, HookRewakeMarker, DelegationCard, JumpToBottom, ProcessLinkContext, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
+import { ActivityBlock, AssistantMessage, AuditLine, CommandExpansionMarker, CompactionMarker, ContinuationMarker, ContextMarker, HookContextMarker, HookRewakeMarker, DelegationCard, JumpToBottom, ProcessLinkContext, RetryLine, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
 import { TurnChangesCard } from './TurnChangesCard.tsx'
 import type { WorkbenchProject } from '../workbench/Workbench.tsx'
 import { ConversationMinimap } from './ConversationMinimap.tsx'
@@ -38,8 +38,10 @@ type Block =
       readonly turnOpen: boolean
     }
 
-const ACTIVITY_KINDS: ReadonlySet<ViewItem['kind']> = new Set(['tool', 'delegation', 'audit'])
+const ACTIVITY_KINDS: ReadonlySet<ViewItem['kind']> = new Set(['tool', 'delegation', 'audit', 'retry'])
 const TRANSCRIPT_WINDOW = 300
+/** Scrolling closer than this (px) to the top of the column loads older blocks. */
+const LOAD_EARLIER_DISTANCE = 400
 
 /** Copy payload carried by the last answer of a closed turn. */
 export interface TurnFooter { readonly parts: readonly string[]; readonly text: string }
@@ -332,6 +334,35 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   }, [visibleBlocks, changeAnchors])
   const { scrollRef, contentRef, atBottom, onScroll, scrollToBottom, holdPosition } = useStickToBottom(conversationId)
 
+  // Older blocks load by themselves when the reader scrolls near the top (the
+  // button stays as a fallback). Prepending moves everything down, so the
+  // topmost block that was on screen is measured before the load and put back
+  // at the same offset after it — independent of the browser's own scroll
+  // anchoring, which Safari lacks and Chrome would otherwise double-apply.
+  const columnRef = useRef<HTMLDivElement | null>(null)
+  const anchorRef = useRef<{ readonly element: Element; readonly top: number } | null>(null)
+  const loadEarlier = (): void => {
+    const scroller = scrollRef.current
+    const first = columnRef.current?.querySelector(':scope > div')
+    if (scroller !== null && first != null) anchorRef.current = { element: first, top: first.getBoundingClientRect().top }
+    holdPosition()
+    setVisibleLimit((current) => current + TRANSCRIPT_WINDOW)
+  }
+  const onTranscriptScroll = (): void => {
+    onScroll()
+    const scroller = scrollRef.current
+    if (scroller === null || visibleStart === 0 || anchorRef.current !== null) return
+    if (scroller.scrollTop < LOAD_EARLIER_DISTANCE) loadEarlier()
+  }
+  useLayoutEffect(() => {
+    const anchor = anchorRef.current
+    const scroller = scrollRef.current
+    if (anchor === null || scroller === null) return
+    anchorRef.current = null
+    const shift = anchor.element.getBoundingClientRect().top - anchor.top
+    if (shift !== 0) scroller.scrollTop += shift
+  }, [visibleStart, scrollRef])
+
   // Rows that arrived while the reader was away from the tail. Streaming into
   // an existing answer does not count — only rows nobody has seen yet.
   const [seen, setSeen] = useState(items.length)
@@ -375,6 +406,8 @@ export const Transcript = memo(function Transcript({ items, events, conversation
         return <DelegationCard key={item.childSessionId} item={item} {...(onOpenChild !== undefined ? { onOpen: onOpenChild } : {})} />
       case 'audit':
         return <AuditLine key={`audit-${index}`} item={item} />
+      case 'retry':
+        return <RetryLine key={`retry-${index}`} item={item} />
       case 'context':
         return <ContextMarker key={`context-${index}`} item={item} workspaceId={workspaceId ?? null} sessionId={conversationId} />
       case 'compaction':
@@ -412,7 +445,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
       <div className="relative min-h-0 flex-1">
         <div
           ref={scrollRef}
-          onScroll={onScroll}
+          onScroll={onTranscriptScroll}
           tabIndex={0}
           role="region"
           aria-label="Conversation transcript"
@@ -423,12 +456,12 @@ export const Transcript = memo(function Transcript({ items, events, conversation
                 and a standalone tool row are both work items, so they share the
                 same gap instead of a run's vertical margin stacking on the
                 next row's. */}
-            <div className="mx-auto flex w-full max-w-3xl flex-col px-1">
+            <div ref={columnRef} className="mx-auto flex w-full max-w-3xl flex-col px-1">
               {visibleStart > 0 ? (
                 <button
                   type="button"
                   className="mx-auto mb-3 rounded-lg border border-line px-3 py-1.5 text-xs text-fg-muted hover:bg-hover hover:text-fg"
-                  onClick={() => { holdPosition(); setVisibleLimit((current) => current + TRANSCRIPT_WINDOW) }}
+                  onClick={loadEarlier}
                 >
                   Load {Math.min(TRANSCRIPT_WINDOW, visibleStart)} earlier items
                 </button>

@@ -26,3 +26,21 @@ it('mounts only the recent transcript window and loads older rows on demand', as
   await act(async () => load!.click())
   expect(host.textContent).toContain('message 0')
 })
+
+it('loads older rows by itself when the reader scrolls near the top', async () => {
+  const items: ViewItem[] = Array.from({ length: 320 }, (_, index) => ({ kind: 'user', content: `message ${index}` }))
+  host = document.createElement('div')
+  document.body.append(host)
+  root = createRoot(host)
+  await act(async () => root!.render(<Transcript items={items} conversationId="s" />))
+  const scroller = host.querySelector<HTMLElement>('[aria-label="Conversation transcript"]')!
+  expect(host.textContent).not.toContain('message 0')
+  // Far from the top: nothing loads.
+  scroller.scrollTop = 5000
+  await act(async () => { scroller.dispatchEvent(new Event('scroll', { bubbles: true })) })
+  expect(host.textContent).not.toContain('message 0')
+  // Near the top: the older window mounts without a click.
+  scroller.scrollTop = 100
+  await act(async () => { scroller.dispatchEvent(new Event('scroll', { bubbles: true })) })
+  expect(host.textContent).toContain('message 0')
+})

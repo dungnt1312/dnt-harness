@@ -8,7 +8,7 @@ import { Composer } from '../components/composer/Composer.tsx'
 import { ScopeControl } from '../components/layout/ScopeControl.tsx'
 import { ModeMenu } from '../components/composer/ComposerControls.tsx'
 import { ToastHost, useToast } from '../components/common/Toast.tsx'
-import { ToolCard, ActivityBlock, AssistantMessage, DelegationCard, AuditLine, StatusLine, UserBubble, summarizeActivity } from '../components/chat/MessageParts.tsx'
+import { ToolCard, ActivityBlock, AssistantMessage, DelegationCard, AuditLine, RetryLine, StatusLine, UserBubble, summarizeActivity } from '../components/chat/MessageParts.tsx'
 import { QueuedBar } from '../components/chat/QueuedBar.tsx'
 import { groupBlocks, rowItems, turnFooters } from '../components/chat/Transcript.tsx'
 import { activeMinimapIndex, minimapEntries, minimapPreview, minimapScrollTarget } from '../components/chat/ConversationMinimap.tsx'
@@ -888,6 +888,16 @@ describe('transcript truthfulness', () => {
     expect(note.querySelector('svg')).not.toBeNull()
     expect(note.textContent).toContain('hook blocked · PreToolUse · Bash*')
     expect(note.textContent).toContain('120ms')
+  })
+  it('renders a live retry notice with the attempt count and why it dropped', async () => {
+    await mount(<RetryLine item={{ kind: 'retry', attempt: 2, reason: 'reset', live: true }} />)
+    const note = host.querySelector('[role="note"]')!
+    expect(note.querySelector('svg')).not.toBeNull()
+    expect(note.textContent).toBe('Retrying · attempt 2 — connection reset')
+    expect(note.querySelector('.animate-spin')).not.toBeNull()
+    // A settled notice keeps the fact without pretending work is in flight.
+    await mount(<RetryLine item={{ kind: 'retry', attempt: 2, reason: 'reset', live: false }} />)
+    expect(host.querySelector('[role="note"]')?.querySelector('.animate-spin')).toBeNull()
   })
   it('renders nothing for a queued twin — it lives on the composer strip', async () => {
     const onReuse = vi.fn()

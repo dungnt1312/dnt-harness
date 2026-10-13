@@ -72,6 +72,16 @@ export type ViewItem =
     }
   | { readonly kind: 'audit'; readonly ts?: number; readonly icon: 'block' | 'fail' | 'allow' | 'deny' | 'expired'; readonly text: string; readonly durationMs?: number }
   | {
+      readonly kind: 'retry'
+      ts?: number
+      /** The failed physical attempt this notice stands for; 1 = the first retry. */
+      attempt: number
+      /** Why the transport dropped, when the attempt fact carried a reason. */
+      reason?: string
+      /** True while the owning turn is still working on the retry. */
+      live: boolean
+    }
+  | {
       readonly kind: 'status'
       readonly reason: string
       /**
@@ -169,6 +179,15 @@ const DECISION_LABELS: Readonly<Record<string, string>> = {
   invalidated: 'Invalidated · no decision recorded',
 }
 
+/**
+ * Attempt-failure reasons the host rides out with another physical attempt.
+ * These alone are user-visible as a retry: anything else (policy, protocol,
+ * output limits) is terminal or already told its own story elsewhere.
+ */
+const RETRYABLE_ATTEMPT_REASONS: ReadonlySet<string> = new Set([
+  'connect', 'read', 'reset', 'rate_limit', 'server_error', 'first_progress_timeout', 'idle_timeout',
+])
+
 function sameValue(left: unknown, right: unknown): boolean {
   if (Object.is(left, right)) return true
   if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false
@@ -216,6 +235,8 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
   const turnContexts = new Map<string, Extract<ViewItem, { kind: 'context' }>>()
   /** The compaction awaiting its end event; null while none is open. */
   let openCompaction: Extract<ViewItem, { kind: 'compaction' }> | null = null
+  /** The live retry notice of the open turn, replaced in place per failed attempt. */
+  let retryNotice: Extract<ViewItem, { kind: 'retry' }> | null = null
   /** Every accepted input by id, so a turn that never logs user/message can still be retried. */
   const acceptedInputs = new Map<string, RetryInput>()
   /** The open turn's own inputs and whether it recorded a tool call. */
@@ -271,9 +292,41 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
         openCompaction.status = 'interrupted'
       }
       switch (event.type) {
-        case 'model/attempt':
-          // Physical accounting is not a message or turn-terminal fact.
+        case 'model/attempt': {
+          // Physical accounting is not a message or turn-terminal fact — but a
+          // failed physical attempt the turn survives is user-visible: the
+          // request died mid-flight and the host is asking again. One notice
+          // for the open turn, updated in place; success clears it.
+          const fact = event.fact
+          if (fact?.state !== 'end' || fact.reason === undefined || fact.finish !== undefined) {
+            // A completed attempt (or one still starting) clears any standing
+            // notice: the retry landed, nothing is in flight.
+            if (retryNotice !== null && fact?.state === 'end' && fact.finish !== undefined) {
+              touch(retryNotice)
+              retryNotice.live = false
+              retryNotice = null
+            }
+            break
+          }
+          if (RETRYABLE_ATTEMPT_REASONS.has(fact.reason)) {
+            if (retryNotice !== null) {
+              touch(retryNotice)
+              retryNotice.attempt = fact.attempt
+              retryNotice.reason = fact.reason
+              if (event.timestamp !== undefined) retryNotice.ts = event.timestamp
+            } else {
+              retryNotice = {
+                kind: 'retry',
+                ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
+                attempt: fact.attempt,
+                reason: fact.reason,
+                live: true,
+              }
+              add(retryNotice)
+            }
+          }
           break
+        }
         case 'execution/uncertain':
         case 'execution/reconciled':
           if (event.fact !== undefined) add({
@@ -674,6 +727,7 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
           break
         }
         case 'turn/error':
+          if (retryNotice !== null) { touch(retryNotice); retryNotice.live = false; retryNotice = null }
           if (event.message !== undefined) {
             const inputs = turnInputs.length > 0 ? turnInputs : turnLegacyInputs
             add({
@@ -689,6 +743,8 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
           break
         case 'turn/end':
           if (draft !== null) { touch(draft); draft.live = false; draft.thinkingLive = false; draft = null }
+          // The turn settled: whatever the last retry was doing, it is over.
+          if (retryNotice !== null) { touch(retryNotice); retryNotice.live = false; retryNotice = null }
           {
             const closedId = event.turnId !== undefined && event.turnId !== '' ? event.turnId : openTurnId
             if (closedId !== undefined) {

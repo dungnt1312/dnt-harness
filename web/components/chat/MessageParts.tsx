@@ -1620,6 +1620,29 @@ export const AuditLine = memo(function AuditLine({ item }: { readonly item: Extr
   )
 })
 
+/** A transport failure the host rode out — the request died and was asked again. */
+const RETRY_REASONS: Readonly<Record<string, string>> = {
+  connect: 'connection failed',
+  read: 'connection dropped',
+  reset: 'connection reset',
+  rate_limit: 'rate limited',
+  server_error: 'server error',
+  first_progress_timeout: 'no response in time',
+  idle_timeout: 'stream went idle',
+}
+
+export const RetryLine = memo(function RetryLine({ item }: { readonly item: Extract<ViewItem, { kind: 'retry' }> }) {
+  const why = RETRY_REASONS[item.reason ?? ''] ?? 'transport failure'
+  return (
+    <div className="flex min-h-6 min-w-0 items-center gap-2 text-xs text-fg-muted" role="note">
+      <Icon name="refresh" size={13} className={cn('shrink-0', item.live ? 'animate-spin text-warn' : 'text-fg-faint')} />
+      <span className="min-w-0 break-words">
+        Retrying · attempt {item.attempt} — {why}
+      </span>
+    </div>
+  )
+})
+
 /** `name@<full sha>` → `name@<12 chars>`, for skill/memory source labels. */
 function shortSource(source: string): string {
   const at = source.lastIndexOf('@')

@@ -65,6 +65,14 @@ all history remains available. Transcript maps derive only when their relevant
 event groups change; replacement histories invalidate those groups even when
 they contain the same number of events.
 
+A failed physical model attempt (`model/attempt` ending in a retryable reason:
+connection reset/drop, rate limit, server error, first-progress or idle
+timeout) is user-visible while it happens: one `retry` row per turn, updated in
+place as attempts fail (`Retrying · attempt N — connection reset`), spinning
+while the retry is in flight. The row settles quietly when a later attempt
+completes or the turn ends; it never appears for a turn whose first attempt
+succeeds.
+
 ## Workspace interaction
 
 - An empty workspace offers **New conversation**. Until a session is selected, its connection state is idle, not connecting.
