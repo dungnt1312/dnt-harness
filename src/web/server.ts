@@ -68,8 +68,8 @@ import { createProcessSessionEventBridge } from '../harness/processes/session-ev
 import { runCleanup, boundedCleanup } from '../harness/processes/shutdown.ts'
 import { ProcessRegistry } from '../harness/processes/registry.ts'
 import { fsTools } from '../capabilities/fs/tools.ts'
-import { listProjectEntries, readProjectFile, searchProjectFiles, ProjectFileError, classifyProjectMedia, resolveProjectMediaPath, MAX_MEDIA_BYTES } from './project-files.ts'
-import { createProjectEntry, deleteProjectEntry, ProjectWriteError, renameProjectEntry } from './project-files-write.ts'
+import { listProjectEntries, readProjectFile, searchProjectFiles, ProjectFileError, classifyProjectMedia, resolveProjectMediaPath, MAX_MEDIA_BYTES, MAX_FILE_BYTES } from './project-files.ts'
+import { createProjectEntry, deleteProjectEntry, ProjectWriteError, renameProjectEntry, saveProjectFile } from './project-files-write.ts'
 import { gitDiff, gitStatus, ProjectGitError } from './project-git.ts'
 import { answerGitAskpass, type AskpassSession } from './git-askpass.ts'
 import { listProjectGitRemotes, pushedTo, runProjectGitOperation, type GitOperationRequest } from './project-git-ops.ts'
@@ -7063,17 +7063,21 @@ async function handleApi(
 
     // ── project browsing and explorer writes (workbench Files) ──
     // Reads serve browsing; POST/PATCH/DELETE on `files` go to
-    // `handleProjectFileWrite`. `git` here is trust-aware status and diff;
+    // `handleProjectFileWrite`; PUT on `file` saves an edited file
+    // (`handleProjectFileSave`). `git` here is trust-aware status and diff;
     // Git writes are the `…/git/:op` route above.
     const wsProjectFilesMatch = /^\/api\/workspaces\/([^/]+)\/projects\/([^/]+)\/(files|file|search|git|media)$/.exec(pathname)
     if (wsProjectFilesMatch !== null) {
       const wsId = decodeURIComponent(wsProjectFilesMatch[1] ?? '') as WorkspaceId
-      const writing = wsProjectFilesMatch[3] === 'files' && (req.method === 'POST' || req.method === 'PATCH' || req.method === 'DELETE')
+      const kind = wsProjectFilesMatch[3]
+      const writing = (kind === 'files' && (req.method === 'POST' || req.method === 'PATCH' || req.method === 'DELETE'))
+        || (kind === 'file' && req.method === 'PUT')
       // Writes need a live workspace; an archived one stays browsable.
       requireWorkspace(deps, wsId, writing)
       const project = deps.workspaces.getProject(decodeURIComponent(wsProjectFilesMatch[2] ?? '') as ProjectId, wsId)
       if (writing) {
-        await handleProjectFileWrite(req, query, project.path, deps.deniedRoots, send)
+        if (kind === 'file') await handleProjectFileSave(req, project.path, deps.deniedRoots, send)
+        else await handleProjectFileWrite(req, query, project.path, deps.deniedRoots, send)
         return
       }
       // HEAD joins GET: a media element asks for headers before it streams.
@@ -7083,7 +7087,6 @@ async function handleApi(
       }
       try {
         const target = query.get('path') ?? ''
-        const kind = wsProjectFilesMatch[3]
         if (kind === 'git') {
           const trusted = project.gitTrusted === true
           send(200, target === ''
@@ -8019,6 +8022,39 @@ async function handleProjectFileWrite(
   } catch (error) {
     if (!(error instanceof ProjectWriteError)) throw error
     send(error.status, { error: error.message })
+  }
+}
+
+/**
+ * Viewer saves on `…/projects/:pid/file`: PUT `{path, content, expectedHash}`.
+ * A stale hash answers 409 with `currentHash`; containment, encoding and the
+ * atomic write live in `saveProjectFile`.
+ */
+async function handleProjectFileSave(
+  req: IncomingMessage,
+  root: string,
+  deniedRoots: readonly string[] | undefined,
+  send: (status: number, body: unknown) => void,
+): Promise<void> {
+  let body: Record<string, unknown>
+  try {
+    // JSON escaping can double a file, so the body may exceed the general cap.
+    body = await readJson(req, 4 * MAX_FILE_BYTES)
+  } catch (error) {
+    send(400, { error: error instanceof Error ? error.message : String(error) })
+    return
+  }
+  const rawPath = body['path']
+  const content = body['content']
+  const expectedHash = body['expectedHash']
+  if (typeof rawPath !== 'string') { send(400, { error: "'path' must be a string" }); return }
+  if (typeof content !== 'string') { send(400, { error: "'content' must be a string" }); return }
+  if (typeof expectedHash !== 'string' || expectedHash === '') { send(400, { error: "'expectedHash' must be a non-empty string" }); return }
+  try {
+    send(200, await saveProjectFile(root, rawPath, content, expectedHash, deniedRoots))
+  } catch (error) {
+    if (!(error instanceof ProjectWriteError)) throw error
+    send(error.status, error.currentHash !== undefined ? { error: error.message, currentHash: error.currentHash } : { error: error.message })
   }
 }
 
@@ -9353,12 +9389,12 @@ export function extractModelIds(parsed: unknown): string[] {
 
 const MAX_BODY_BYTES = 1_000_000
 
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+async function readJson(req: IncomingMessage, limit = MAX_BODY_BYTES): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = []
   let total = 0
   for await (const chunk of req) {
     total += (chunk as Buffer).length
-    if (total > MAX_BODY_BYTES) {
+    if (total > limit) {
       req.destroy()
       throw new Error('request body too large')
     }
