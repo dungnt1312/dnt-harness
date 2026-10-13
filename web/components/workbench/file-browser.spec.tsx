@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { FileBrowser } from './FileBrowser.tsx'
@@ -185,4 +185,70 @@ it('cancelling the delete dialog deletes nothing', async () => {
   await click([...dialog.querySelectorAll('button')].find((button) => button.textContent === 'Cancel')!)
   expect(deleteProjectEntry).not.toHaveBeenCalled()
   expect(rowNames()).toContain('README.md')
+})
+
+describe('explorer search', () => {
+  beforeEach(() => { vi.useFakeTimers({ shouldAdvanceTime: true }) })
+  afterEach(() => { vi.useRealTimers() })
+
+  const search = () => byLabel('Search files') as HTMLInputElement
+  const settle = async (ms = 250) => act(async () => { await vi.advanceTimersByTimeAsync(ms) })
+
+  it('debounces, lists matches with their folder, and opens a result', async () => {
+    searchProjectFiles.mockResolvedValueOnce({ query: 'ind', truncated: false, matches: [{ name: 'index.ts', path: 'src/index.ts', score: 3 }] } as never)
+    await mount()
+    await typeInto(search(), 'ind')
+    expect(searchProjectFiles).not.toHaveBeenCalled()
+    await settle()
+    expect(searchProjectFiles).toHaveBeenCalledWith('ws1', 'p1', 'ind', 50)
+    const results = host.querySelector('[aria-label="Search results"]')!
+    expect(results.textContent).toContain('index.ts')
+    expect(results.textContent).toContain('src')
+    await click(results.querySelector<HTMLButtonElement>('button[title="src/index.ts"]')!)
+    expect(onOpenFile).toHaveBeenCalledWith('src/index.ts')
+  })
+
+  it('says when nothing matches and when results may be incomplete', async () => {
+    searchProjectFiles.mockResolvedValueOnce({ query: 'zzz', truncated: true, matches: [] } as never)
+    await mount()
+    await typeInto(search(), 'zzz')
+    await settle()
+    expect(host.textContent).toContain('No matching files')
+    expect(host.textContent).toContain('Results may be incomplete.')
+  })
+
+  it('ignores a slow response for an older query', async () => {
+    let releaseOld: (value: unknown) => void = () => {}
+    searchProjectFiles
+      .mockImplementationOnce(() => new Promise((resolve) => { releaseOld = resolve }) as never)
+      .mockResolvedValueOnce({ query: 'new', truncated: false, matches: [{ name: 'new.ts', path: 'new.ts', score: 3 }] } as never)
+    await mount()
+    await typeInto(search(), 'old')
+    await settle()
+    await typeInto(search(), 'new')
+    await settle()
+    await act(async () => releaseOld({ query: 'old', truncated: false, matches: [{ name: 'old.ts', path: 'old.ts', score: 3 }] }))
+    const results = host.querySelector('[aria-label="Search results"]')!
+    expect(results.textContent).toContain('new.ts')
+    expect(results.textContent).not.toContain('old.ts')
+  })
+
+  it('returns to the tree with its folders still open on Escape', async () => {
+    await mount()
+    await click(row('src'))
+    expect(rowNames()).toContain('index.ts')
+    await typeInto(search(), 'x')
+    await settle()
+    await act(async () => search().dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+    expect(search().value).toBe('')
+    expect(host.querySelector('[aria-label="Search results"]')).toBeNull()
+    expect(rowNames()).toContain('index.ts')
+  })
+
+  it('never searches a blank query', async () => {
+    await mount()
+    await typeInto(search(), '   ')
+    await settle()
+    expect(searchProjectFiles).not.toHaveBeenCalled()
+  })
 })

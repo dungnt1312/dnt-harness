@@ -5,9 +5,13 @@ import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
+import { TextInput } from '../ui/TextInput.tsx'
+import { cn } from '../../lib/cn.ts'
 import { createProjectEntry, deleteProjectEntry, listProjectFiles, renameProjectEntry, type ProjectEntry } from '../../lib/api.ts'
 import { ancestorsOf, dropKeysUnder, dropUnderSet, isAtOrUnder, joinPath, parentOf, targetFolder, writeErrorText, type Selection } from '../../lib/file-tree.ts'
+import { FileSearchResults } from './FileSearchResults.tsx'
 import { FolderRows, type FolderNode, type TreeActions, type TreeEditor } from './FileTreeRows.tsx'
+import { useFileSearch } from './useFileSearch.ts'
 
 interface DeleteRequest {
   readonly entry: ProjectEntry
@@ -29,6 +33,7 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRe
   const [selected, setSelected] = useState<Selection | null>(null)
   const [editor, setEditor] = useState<TreeEditor | null>(null)
   const [deleting, setDeleting] = useState<DeleteRequest | null>(null)
+  const search = useFileSearch(workspaceId, project.id)
   const generation = useRef(new Map<string, number>())
   const nextEditorId = useRef(0)
   /** Latest `open`, for async handlers that must not read the value captured before an await. */
@@ -164,8 +169,25 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRe
         <IconButton label="New folder" onClick={() => startCreate('dir')}><Icon name="folder" size={14} /></IconButton>
         <IconButton label="Refresh files" onClick={() => void load('')}><Icon name="refresh" size={14} /></IconButton>
       </div>
-      {/* Task 7 places the file search box here, between the header and the tree. */}
-      <div className="min-h-0 flex-1 overflow-auto py-1">
+      <div className="shrink-0 border-b border-line p-2">
+        <TextInput
+          aria-label="Search files"
+          placeholder="Search files"
+          value={search.query}
+          onChange={(event) => search.setQuery(event.target.value)}
+          onKeyDown={(event) => { if (event.key === 'Escape') search.setQuery('') }}
+          leading={<Icon name="search" size={13} />}
+          trailing={search.query !== '' ? <IconButton label="Clear search" size="sm" onClick={() => search.setQuery('')}><Icon name="close" size={13} /></IconButton> : undefined}
+          className="h-8"
+        />
+      </div>
+      {search.searching ? (
+        <div className="min-h-0 flex-1 overflow-auto py-1">
+          <FileSearchResults status={search.status} result={search.result} error={search.error} activeFile={activeFile} onOpen={onOpenFile} />
+        </div>
+      ) : null}
+      {/* Hidden, not unmounted, while searching: the expanded folders and cache survive. */}
+      <div className={cn('min-h-0 flex-1 overflow-auto py-1', search.searching && 'hidden')}>
         {root?.status === 'error' && root.listing === null ? (
           <div className="flex flex-col items-start gap-2 p-2">
             <ErrorNotice raw={root.error ?? ''} />
