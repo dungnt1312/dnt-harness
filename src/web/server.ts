@@ -68,6 +68,7 @@ import { runCleanup, boundedCleanup } from '../harness/processes/shutdown.ts'
 import { ProcessRegistry } from '../harness/processes/registry.ts'
 import { fsTools } from '../capabilities/fs/tools.ts'
 import { listProjectEntries, readProjectFile, searchProjectFiles, ProjectFileError, classifyProjectMedia, resolveProjectMediaPath, MAX_MEDIA_BYTES } from './project-files.ts'
+import { createProjectEntry, deleteProjectEntry, ProjectWriteError, renameProjectEntry } from './project-files-write.ts'
 import { gitDiff, gitStatus, ProjectGitError } from './project-git.ts'
 import {
   AttachmentError,
@@ -6978,8 +6979,14 @@ async function handleApi(
     const wsProjectFilesMatch = /^\/api\/workspaces\/([^/]+)\/projects\/([^/]+)\/(files|file|search|git|media)$/.exec(pathname)
     if (wsProjectFilesMatch !== null) {
       const wsId = decodeURIComponent(wsProjectFilesMatch[1] ?? '') as WorkspaceId
-      requireWorkspace(deps, wsId, false)
+      const writing = wsProjectFilesMatch[3] === 'files' && (req.method === 'POST' || req.method === 'PATCH' || req.method === 'DELETE')
+      // Writes need a live workspace; an archived one stays browsable.
+      requireWorkspace(deps, wsId, writing)
       const project = deps.workspaces.getProject(decodeURIComponent(wsProjectFilesMatch[2] ?? '') as ProjectId, wsId)
+      if (writing) {
+        await handleProjectFileWrite(req, query, project.path, deps.deniedRoots, send)
+        return
+      }
       // HEAD joins GET: a media element asks for headers before it streams.
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         send(405, { error: 'method not allowed' })
@@ -7605,6 +7612,57 @@ function browserPrincipal(req: IncomingMessage, deps: HandlerDeps, method: strin
 /** The workspace owning sessions when the caller does not address one. */
 function implicitWorkspace(deps: HandlerDeps): WorkspaceId {
   return deps.deniedRoots !== undefined ? defaultWorkspaceId(deps) : MEMORY_WORKSPACE
+}
+
+/**
+ * Explorer writes on `…/projects/:pid/files`: POST creates, PATCH renames in
+ * place, DELETE removes. A direct user action like the workbench terminal, so
+ * no session mode applies; containment lives in `project-files-write.ts`.
+ */
+async function handleProjectFileWrite(
+  req: IncomingMessage,
+  query: URLSearchParams,
+  root: string,
+  deniedRoots: readonly string[] | undefined,
+  send: (status: number, body: unknown) => void,
+): Promise<void> {
+  try {
+    if (req.method === 'DELETE') {
+      const removed = await deleteProjectEntry(root, query.get('path') ?? '', deniedRoots)
+      send(200, { deleted: true, path: removed.path })
+      return
+    }
+    let body: Record<string, unknown>
+    try {
+      body = await readJson(req)
+    } catch (error) {
+      send(400, { error: error instanceof Error ? error.message : String(error) })
+      return
+    }
+    const rawPath = body['path']
+    if (typeof rawPath !== 'string') {
+      send(400, { error: "'path' must be a string" })
+      return
+    }
+    if (req.method === 'POST') {
+      const kind = body['kind']
+      if (kind !== 'file' && kind !== 'dir') {
+        send(400, { error: "'kind' must be 'file' or 'dir'" })
+        return
+      }
+      send(201, await createProjectEntry(root, rawPath, kind, deniedRoots))
+      return
+    }
+    const name = body['name']
+    if (typeof name !== 'string') {
+      send(400, { error: "'name' must be a string" })
+      return
+    }
+    send(200, await renameProjectEntry(root, rawPath, name, deniedRoots))
+  } catch (error) {
+    if (!(error instanceof ProjectWriteError)) throw error
+    send(error.status, { error: error.message })
+  }
 }
 
 /** Operational lookup: the synthetic memory workspace bypasses the registry. */
