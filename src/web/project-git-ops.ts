@@ -25,6 +25,7 @@ import {
   type GitStatusReport,
 } from './project-git.ts'
 import { createBranch, deleteBranch, switchBranch } from './project-git-branches.ts'
+import { restoreHunk, stageHunk, unstageHunk, type GitHunkRef } from './project-git-hunks.ts'
 
 export type GitOperationRequest =
   | { type: 'stage' | 'unstage' | 'discard' | 'trash'; paths: readonly string[] }
@@ -36,6 +37,7 @@ export type GitOperationRequest =
   | { type: 'switch-branch'; name: string }
   | { type: 'create-branch'; name: string; base?: string }
   | { type: 'delete-branch'; name: string; remote: boolean; force: boolean }
+  | { type: 'stage-hunk' | 'unstage-hunk' | 'restore-hunk'; path: string; hunk: GitHunkRef }
 
 export interface GitOperationResult {
   readonly ok: boolean
@@ -484,6 +486,12 @@ async function dispatch(ctx: Context, request: GitOperationRequest, move: (abs: 
       return createBranch(ctx, request.name, request.base)
     case 'delete-branch':
       return deleteBranch(ctx, request.name, request.remote, request.force)
+    case 'stage-hunk':
+      return stageHunk(ctx, await relativePaths(ctx, [request.path]).then((rels) => rels[0] ?? ''), request.hunk)
+    case 'unstage-hunk':
+      return unstageHunk(ctx, await relativePaths(ctx, [request.path]).then((rels) => rels[0] ?? ''), request.hunk)
+    case 'restore-hunk':
+      return restoreHunk(ctx, await relativePaths(ctx, [request.path]).then((rels) => rels[0] ?? ''), request.hunk)
   }
 }
 

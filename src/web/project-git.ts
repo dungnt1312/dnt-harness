@@ -16,6 +16,7 @@ import { accessSync, constants as fsConstants, existsSync, promises as fs, statS
 import path from 'node:path'
 import { detectLoginShell, loginShellArgs } from '../capabilities/shell/detect.ts'
 import { resolveGrantedPath } from '../capabilities/fs/tools.ts'
+import { hunksFor } from './project-git-hunks.ts'
 
 /** One changed path, in the shape the Git view lists. */
 export interface GitChange {
@@ -110,6 +111,8 @@ export interface GitDiffReport {
   readonly truncated: boolean
   /** No textual diff: a binary, or a change git can name but not print. */
   readonly binary: boolean
+  /** The displayed hunks with their staging status; empty when hunk controls are not offered. */
+  readonly hunks?: readonly import('./project-git-hunks.ts').GitHunk[]
 }
 
 export class ProjectGitError extends Error {}
@@ -311,8 +314,8 @@ export function gitCommandArgs(args: readonly string[], trusted: boolean): strin
 
 export interface GitCommandOptions {
   readonly trusted: boolean
-  /** `'ignore'` closes stdin (a push must never wait on it); default `'pipe'`. */
-  readonly stdin?: 'pipe' | 'ignore'
+  /** `'ignore'` closes stdin (a push must never wait on it); default `'pipe'`. A Buffer is written, then closed. */
+  readonly stdin?: 'pipe' | 'ignore' | Buffer
   /** Replaces the project environment, e.g. when the caller adds askpass variables to it. */
   readonly env?: Readonly<Record<string, string>>
   /** Start git as its own process group leader (not on Windows), so the whole tree can be killed. */
@@ -332,10 +335,12 @@ export async function buildGitCommand(
   options: GitCommandOptions,
 ): Promise<ChildProcessWithoutNullStreams> {
   const env = options.env ?? await projectGitEnvironment(root)
+  // A Buffer stdin means "pipe and feed it"; anything else names the stdio itself.
+  const stdioIn: 'pipe' | 'ignore' = options.stdin === undefined || Buffer.isBuffer(options.stdin) ? 'pipe' : options.stdin
   const child = spawn(gitOnPath(env), gitCommandArgs(args, options.trusted), {
     cwd: root,
     env: { ...env },
-    stdio: [options.stdin ?? 'pipe', 'pipe', 'pipe'],
+    stdio: [stdioIn, 'pipe', 'pipe'],
     windowsHide: true,
     detached: options.detached === true && process.platform !== 'win32',
   }) as ChildProcessWithoutNullStreams
@@ -366,6 +371,13 @@ export type GitRunner = (root: string, args: readonly string[], options: GitComm
 /** {@link runGitQuery} with the full command options (environment, stdin). */
 export const runGitCommand: GitRunner = async (root, args, options) => {
   const child = await buildGitCommand(root, args, options)
+  // A Buffer stdin is written once and closed; a plain 'pipe' (no data) is
+  // closed empty as soon as git reads, and 'ignore' never had one.
+  if (options.stdin !== undefined && options.stdin !== 'pipe' && options.stdin !== 'ignore') {
+    child.stdin.end(options.stdin)
+  } else if (options.stdin === 'pipe') {
+    child.stdin.end()
+  }
   return new Promise((resolve, reject) => {
     const out: Buffer[] = []
     const err: Buffer[] = []
@@ -605,7 +617,14 @@ export async function gitDiff(root: string, rawPath: string, deniedRoots?: reado
   const truncated = Buffer.byteLength(text) > MAX_DIFF_BYTES
   if (truncated) text = text.slice(0, MAX_DIFF_BYTES)
   const binary = text.includes('Binary files ') || text.includes('GIT binary patch')
-  return { path: rel, lines: binary ? [] : parseDiff(text), truncated, binary }
+  if (binary || truncated) return { path: rel, lines: binary ? [] : parseDiff(text), truncated, binary, hunks: [] }
+  // Hunk controls need the file's status entry (conflicted files show
+  // conflict blocks instead) and the zero-context staged/unstaged diffs.
+  const conflicted = (await readStatusChanges(root, deniedRoots, trusted))?.changes
+    .some((change) => change.path === rel && change.conflicted) ?? false
+  const hunks = await hunksFor(root, rel, trusted, text,
+    (args) => runGitQuery(root, args, trusted), hasHead, conflicted)
+  return { path: rel, lines: parseDiff(text), truncated, binary, hunks }
 }
 
 /** Turn unified diff text into rows. The `diff --git` header is dropped. */
