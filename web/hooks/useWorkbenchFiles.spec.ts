@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { closeFileWithDraft, removeFileTabs, renameFileTabs } from './useWorkbenchFiles.ts'
+import { closeFileWithDraft, removeFileTabs, renameFileTabs, settleSavedDraft } from './useWorkbenchFiles.ts'
 
 const state = {
   folder: 'src',
@@ -99,6 +99,21 @@ describe('drafts', () => {
     const next = closeFileWithDraft(withDrafts, 'src/b.ts', () => true)
     expect(next.openFiles).toEqual(['a.ts', 'src/deep/c.ts'])
     expect(next.drafts['src/b.ts']).toBeUndefined()
+  })
+
+  it('settleSavedDraft drops the draft when it still equals the saved text', () => {
+    const next = settleSavedDraft(withDrafts, 'src/b.ts', 'B', 'h2')
+    expect(next.drafts['src/b.ts']).toBeUndefined()
+    expect(next.drafts['a.ts']).toEqual(draft('A', false))
+  })
+
+  it('settleSavedDraft keeps newer text and rebases it on the saved hash', () => {
+    const next = settleSavedDraft(withDrafts, 'src/b.ts', 'older', 'h2')
+    expect(next.drafts['src/b.ts']).toEqual({ text: 'B', baseHash: 'h2', dirty: true })
+  })
+
+  it('settleSavedDraft returns the same state when there is no draft', () => {
+    expect(settleSavedDraft(withDrafts, 'missing.ts', 'x', 'h2')).toBe(withDrafts)
   })
 
   it('closes a clean draft without asking', () => {

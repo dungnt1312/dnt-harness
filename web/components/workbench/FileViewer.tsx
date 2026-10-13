@@ -24,7 +24,7 @@ async function readSkillMd(workspaceId: string, projectId: string, name: string)
 }
 
 /** File view: path bar, language, copy, and line-numbered highlighted content; project files can be edited in place. */
-export function FileViewer({ workspaceId, projectId, projectPath, path, focus = null, draft, onDraft }: {
+export function FileViewer({ workspaceId, projectId, projectPath, path, focus = null, draft, onDraft, onSaved }: {
   readonly workspaceId: string
   readonly projectId: string
   readonly projectPath: string
@@ -34,6 +34,8 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
   /** The unsaved edit for this tab, owned by the caller so it survives tab switches. */
   readonly draft: FileDraft | null
   readonly onDraft: (draft: FileDraft | null) => void
+  /** A save of `text` reached disk as `hash`; may arrive after this viewer unmounted. */
+  readonly onSaved: (text: string, hash: string) => void
 }) {
   const [file, setFile] = useState<ProjectFileView | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -102,8 +104,9 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
     setSaveError(null)
     try {
       const result = await saveProjectFile(workspaceId, projectId, path, draft.text, expectedHash)
-      // The file is written whether or not this viewer is still around, so the draft goes either way.
-      onDraft(null)
+      // The file is written whether or not this viewer is still around; the owner drops the
+      // draft only if nothing newer was typed meanwhile.
+      onSaved(draft.text, result.hash)
       if (!mounted.current) return
       setFile({ ...file, content: draft.text, size: result.size, hash: result.hash })
       clearEditState()

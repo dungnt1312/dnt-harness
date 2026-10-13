@@ -43,6 +43,8 @@ export interface WorkbenchFiles extends FilesState {
   readonly removePath: (path: string) => void
   /** Store (or with null, clear) the unsaved text of an open file. */
   readonly setDraft: (path: string, draft: FileDraft | null) => void
+  /** A save of `savedText` finished: drop the draft unless it has newer text (see {@link settleSavedDraft}). */
+  readonly settleDraft: (path: string, savedText: string, newHash: string) => void
 }
 
 const EMPTY: FilesState = { folder: '', openFiles: [], activeFile: null, focus: null, drafts: {} }
@@ -59,6 +61,18 @@ export function closeFileTab(state: FilesState, path: string): FilesState {
   const drafts = state.drafts[path] === undefined ? state.drafts : withoutDraft(state.drafts, (key) => key !== path)
   // The window belonged to the tab being closed, not to whatever it reveals.
   return { ...state, openFiles, activeFile, focus: null, drafts }
+}
+
+/**
+ * A save of `savedText` landed on disk as `newHash`. The draft goes only if it
+ * still holds that text; text typed while the save was in flight stays, now
+ * based on the saved file.
+ */
+export function settleSavedDraft(state: FilesState, path: string, savedText: string, newHash: string): FilesState {
+  const draft = state.drafts[path]
+  if (draft === undefined) return state
+  if (draft.text === savedText) return { ...state, drafts: withoutDraft(state.drafts, (key) => key !== path) }
+  return { ...state, drafts: { ...state.drafts, [path]: { text: draft.text, baseHash: newHash, dirty: true } } }
 }
 
 const baseName = (path: string): string => path.slice(path.lastIndexOf('/') + 1)
@@ -134,6 +148,7 @@ export function useWorkbenchFiles(projectKey: string | null): WorkbenchFiles {
     }
     return { ...current, drafts: { ...current.drafts, [path]: draft } }
   }), [])
+  const settleDraft = useCallback((path: string, savedText: string, newHash: string) => setState((current) => settleSavedDraft(current, path, savedText, newHash)), [])
   const anyDirty = Object.values(state.drafts).some((draft) => draft.dirty)
   useEffect(() => {
     if (!anyDirty) return
@@ -146,5 +161,5 @@ export function useWorkbenchFiles(projectKey: string | null): WorkbenchFiles {
   const renamePath = useCallback((from: string, to: string) => setState((current) => renameFileTabs(current, from, to)), [])
   const removePath = useCallback((path: string) => setState((current) => removeFileTabs(current, path)), [])
 
-  return { ...state, setFolder, openFile, closeFile, showFixedView, renamePath, removePath, setDraft }
+  return { ...state, setFolder, openFile, closeFile, showFixedView, renamePath, removePath, setDraft, settleDraft }
 }

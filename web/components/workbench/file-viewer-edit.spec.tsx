@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, it, vi, type MockInstance } from 'vitest
 import { act, useState } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { FileViewer } from './FileViewer.tsx'
-import type { FileDraft } from '../../hooks/useWorkbenchFiles.ts'
+import { settleSavedDraft, type FileDraft, type FilesState } from '../../hooks/useWorkbenchFiles.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -41,9 +41,17 @@ afterEach(async () => { if (root) await act(async () => root!.unmount()); root =
 
 /** Owns the draft like useWorkbenchFiles, so remounting the viewer keeps it. */
 function Harness({ path, viewerKey, showViewer = true }: { path: string; viewerKey: number; showViewer?: boolean }) {
-  const [draft, setDraft] = useState<FileDraft | null>(null)
-  ;(globalThis as { __draft?: FileDraft | null }).__draft = draft
-  return showViewer ? <FileViewer key={viewerKey} workspaceId="w1" projectId="p1" projectPath="/proj" path={path} draft={draft} onDraft={setDraft} /> : null
+  const [state, setState] = useState<FilesState>({ folder: '', openFiles: [], activeFile: null, focus: null, drafts: {} })
+  // Observed under the first test path, so a harness showing another path still reports that tab's draft.
+  ;(globalThis as { __draft?: FileDraft | null }).__draft = state.drafts['src/a.ts'] ?? null
+  const setDraft = (next: FileDraft | null): void => setState((current) => {
+    const { [path]: _gone, ...rest } = current.drafts
+    return { ...current, drafts: next === null ? rest : { ...rest, [path]: next } }
+  })
+  return showViewer
+    ? <FileViewer key={viewerKey} workspaceId="w1" projectId="p1" projectPath="/proj" path={path} draft={state.drafts[path] ?? null} onDraft={setDraft}
+        onSaved={(text, hash) => setState((current) => settleSavedDraft(current, path, text, hash))} />
+    : null
 }
 
 async function mount(path = 'src/a.ts', viewerKey = 1) {
@@ -129,6 +137,22 @@ it('clears the draft when a save resolves after the viewer unmounted', async () 
   expect((globalThis as { __draft?: FileDraft | null }).__draft?.dirty).toBe(true)
   await act(async () => finish({ path: 'src/a.ts', size: 4, hash: 'h-4' }))
   expect((globalThis as { __draft?: FileDraft | null }).__draft).toBeNull()
+})
+
+it('keeps text typed after a save began when that save resolves on a remounted viewer', async () => {
+  await mount()
+  await act(async () => byLabel('Edit file')!.click())
+  await type('two\n')
+  let finish!: (value: { path: string; size: number; hash: string }) => void
+  saveProjectFile.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }))
+  await save()
+  await act(async () => root!.render(<Harness path="src/a.ts" viewerKey={2} showViewer={false} />))
+  await act(async () => root!.render(<Harness path="src/a.ts" viewerKey={3} />))
+  await act(async () => { await vi.waitFor(() => expect(host.querySelector('textarea')).not.toBeNull()) })
+  expect(area().value).toBe('two\n')
+  await type('three\n')
+  await act(async () => finish({ path: 'src/a.ts', size: 4, hash: 'h-4' }))
+  expect((globalThis as { __draft?: FileDraft | null }).__draft).toEqual({ text: 'three\n', baseHash: 'h-4', dirty: true })
 })
 
 it('Overwrite saves even when the draft was edited back to the disk content', async () => {

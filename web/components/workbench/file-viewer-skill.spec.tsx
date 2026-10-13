@@ -25,7 +25,7 @@ it('a skill tab reads SKILL.md through the skill API, not the project file API',
   host = document.createElement('div')
   document.body.append(host)
   root = createRoot(host)
-  await act(async () => root!.render(<FileViewer workspaceId="w" projectId="p" projectPath="/repo" path="skill://using-superpowers" draft={null} onDraft={() => {}} />))
+  await act(async () => root!.render(<FileViewer workspaceId="w" projectId="p" projectPath="/repo" path="skill://using-superpowers" draft={null} onDraft={() => {}} onSaved={() => {}} />))
   expect(getSkillFile).toHaveBeenCalledWith('w', 'using-superpowers', 'SKILL.md', 'p')
   expect(readProjectFile).not.toHaveBeenCalled()
   expect(host.textContent).toContain('Skill · using-superpowers/SKILL.md')
