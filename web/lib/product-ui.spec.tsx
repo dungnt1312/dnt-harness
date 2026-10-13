@@ -678,7 +678,7 @@ describe('approval card actions', () => {
     const expiresAt = Date.now() + 90_000
     await mount(<ApprovalBar approvals={[{ approvalId: 'a', call: { id: 'c', name: 'Bash', args: {} }, expiresAt, childSessionId: 'session-abcdefgh1234', definitionName: 'explorer' }]} onAnswer={vi.fn()} />)
     expect(host.textContent).toMatch(/Cancels itself in 1:3\d/)
-    expect(host.textContent).toContain('Asked by child agent')
+    expect(host.textContent).toContain('asked by child agent')
     expect(host.textContent).toContain('explorer')
   })
   it('says a passed deadline cancelled the request instead of letting the card go quiet', async () => {

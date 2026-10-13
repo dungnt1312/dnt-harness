@@ -222,7 +222,21 @@ describe('approval card', () => {
   it('keeps a short call folded, as before', async () => {
     await mount(<ApprovalBar approvals={approval({ name: 'Read', args: { path: 'src/a.ts' } })} onAnswer={() => {}} />)
     expect(host.querySelector('details')!.hasAttribute('open')).toBe(false)
-    expect(host.textContent).toContain('Exact arguments')
+    expect(host.querySelector('summary')?.textContent).toBe('Details')
+    // The target stays readable without opening the details.
+    expect(host.querySelector('code[aria-label="Target"]')?.textContent).toContain('src/a.ts')
+  })
+  it('does not repeat a multi-line command as a one-line target', async () => {
+    await mount(<ApprovalBar approvals={approval({ name: 'Bash', args: { command: 'cd build\nmake' } })} onAnswer={() => {}} />)
+    expect(host.querySelectorAll('pre[aria-label="Command"]')).toHaveLength(1)
+    expect(host.querySelector('code[aria-label="Target"]')).toBeNull()
+  })
+  it('keeps the countdown beside the buttons and hides a lone count line visually', async () => {
+    await mount(<ApprovalBar approvals={[{ approvalId: 'a', call: { id: 'c', name: 'Read', args: { path: 'a' } }, expiresAt: Date.now() + 60_000 }]} scope="/Users/x/workspace/dnt-harness" onAnswer={() => {}} />)
+    const actions = [...host.querySelectorAll('button')].find((b) => b.textContent === 'Deny')!.parentElement!
+    expect(actions.textContent).toMatch(/Cancels itself in \d/)
+    expect(host.querySelector('[role="status"]')!.className).toContain('sr-only')
+    expect(host.textContent).toContain('in …/dnt-harness')
   })
   it('clips only what it draws; copy still takes the whole payload', async () => {
     const huge = 'x'.repeat(5_000)

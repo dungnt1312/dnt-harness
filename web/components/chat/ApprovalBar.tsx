@@ -8,6 +8,7 @@ import { ToolArguments, hasProseArgs } from './ToolArguments.tsx'
 import type { PendingApproval } from '../../lib/types.ts'
 
 const ARGS_DISPLAY_LIMIT = 4000
+const NO_PROJECT = 'No project attached'
 
 /**
  * A long folder keeps its END visible (`…\parent\folder`): a start-truncated
@@ -28,7 +29,7 @@ export function shortFolder(folder: string, keep = 2): string {
  * child) may be granted exactly the folder the card names.
  */
 export function ApprovalBar({
-  approvals, onAnswer, scope = 'No project attached',
+  approvals, onAnswer, scope = NO_PROJECT,
 }: {
   readonly approvals: readonly PendingApproval[]
   readonly onAnswer: (approvalId: string, allow: boolean, scope?: 'once' | 'session') => void | Promise<void>
@@ -70,7 +71,10 @@ export function ApprovalBar({
     // The live region is the count line alone: announcing a whole card would
     // read its safety note aloud on every new request.
     <section aria-label="Pending approvals" className="flex max-h-[min(45dvh,22rem)] flex-col gap-2 overflow-y-auto">
-      <div role="status" aria-live="polite" className="px-1 text-xs font-medium text-fg-muted">
+      {/* The task status above already says an approval is required; the count
+          is shown only when it adds something (several requests), but screen
+          readers always hear it. */}
+      <div role="status" aria-live="polite" className={approvals.length === 1 ? 'sr-only' : 'px-1 text-xs font-medium text-fg-muted'}>
         {approvals.length === 1 ? '1 request' : `${approvals.length} requests`} awaiting a decision
       </div>
       {visible.map(({ approvalId, call, interactive, childSessionId, definitionName, expiresAt, guardWarning, scopeWarning, proposedGrant, proposedAccess }) => {
@@ -79,27 +83,29 @@ export function ApprovalBar({
         // The same reading the transcript gives a call: a Read's window and a
         // command's verb belong in the decision, not only in the payload.
         const target = toolFacts(call).fullTarget
+        const expired = expiresAt !== undefined && expiresAt - now <= 0
         return (
           <article key={approvalId} aria-busy={submittingRow} className="flex flex-col gap-3 rounded-2xl border border-line bg-surface p-4 shadow-composer">
             <div className="flex items-start gap-3">
               <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-warn-soft text-warn"><Icon name="shield" size={16} /></span>
-              <div className="min-w-0 flex-1">
-                <p className="m-0 text-sm">Allow <strong className="font-semibold">{call.name}</strong>?</p>
-                <p className="m-0 truncate font-mono text-xs text-fg-muted" title={target}>Target: {target || 'See exact arguments below'}</p>
-                <p className="m-0 truncate text-xs text-fg-faint" title={scope}>Conversation project: <code>{scope}</code></p>
-                {childSessionId !== undefined ? (
-                  <p className="m-0 truncate text-xs text-fg-faint" title={childSessionId}>
-                    Asked by child agent {definitionName !== undefined ? <strong className="font-semibold">{definitionName}</strong> : null} <code>{childSessionId.slice(0, 14)}</code>
+              <div className="flex min-w-0 flex-1 flex-col gap-2">
+                <div className="min-w-0">
+                  <p className="m-0 text-sm">Allow <strong className="font-semibold">{call.name}</strong>?</p>
+                  <p className="m-0 truncate text-xs text-fg-faint" title={scope}>
+                    {scope === NO_PROJECT ? scope : <>in <span className="font-medium text-fg-muted">{shortFolder(scope, 1)}</span></>}
+                    {childSessionId !== undefined ? (
+                      <span title={childSessionId}>
+                        {' · '}asked by child agent {definitionName !== undefined ? <strong className="font-semibold">{definitionName}</strong> : <code>{childSessionId.slice(0, 14)}</code>}
+                      </span>
+                    ) : null}
+                    {interactive === true ? ' · requires a decision every time' : null}
                   </p>
+                </div>
+                {/* A prose argument (multi-line command, file content) opens in the
+                    details below, so the one-line target would only repeat it. */}
+                {target !== '' && !(typeof call.args['command'] === 'string' && hasProseArgs({ command: call.args['command'] })) ? (
+                  <code aria-label="Target" className="block truncate rounded-lg bg-muted px-2.5 py-1.5 font-mono text-xs text-fg" title={target}>{target}</code>
                 ) : null}
-                {expiresAt !== undefined ? (
-                  <p className="m-0 text-xs text-fg-faint">
-                    {expiresAt - now > 0
-                      ? <>Cancels itself in <span className="font-mono">{formatCountdown(expiresAt, now)}</span> if nobody decides.</>
-                      : 'Expired — this request was cancelled and the tool did not run.'}
-                  </p>
-                ) : null}
-                {interactive === true ? <p className="m-0 text-xs text-fg-faint">This tool requires a decision every time.</p> : null}
                 {guardWarning !== undefined ? (
                   <p className="m-0 rounded-lg bg-bad-soft px-2 py-1.5 text-xs font-medium text-bad" role="alert">
                     <Icon name="alertTriangle" size={12} className="mr-1 inline" />{guardWarning}
@@ -110,24 +116,32 @@ export function ApprovalBar({
                     <Icon name="alertTriangle" size={12} className="mr-1 inline" />{scopeWarning}
                   </p>
                 ) : null}
+                {/* A multi-line command or a file's new content cannot be judged from
+                    the one-line target above, so those requests open already showing
+                    it — the decision is made on the text, not on its first line. */}
+                <details className="text-xs text-fg-muted" open={hasProseArgs(call.args)}>
+                  <summary className="cursor-pointer select-none" title={call.id}>Details</summary>
+                  <div className="mt-2 flex flex-col gap-2">
+                    <ToolArguments call={call} limit={ARGS_DISPLAY_LIMIT} />
+                    <p className="m-0 text-fg-faint">
+                      Allow once and Deny apply to this request only, not the project or future requests. Standing permission is set by the workspace&apos;s mode in Settings → Modes.
+                      {sessionGrant !== undefined ? <>{' '}Allowing the folder for this session lets this conversation use it without asking again.</> : null}
+                      {' '}Arguments may target systems outside the project; server policy still applies. Call <code>{call.id}</code>.
+                    </p>
+                  </div>
+                </details>
               </div>
             </div>
-            {/* A multi-line command or a file's new content cannot be judged from
-                the one-line target above, so those requests open already showing
-                it — the decision is made on the text, not on its first line. */}
-            <details className="text-xs text-fg-muted" open={hasProseArgs(call.args)}>
-              <summary>Exact arguments · {call.id}</summary>
-              <div className="mt-2 flex flex-col gap-2">
-                <ToolArguments call={call} limit={ARGS_DISPLAY_LIMIT} />
-              </div>
-            </details>
-            <p className="m-0 text-xs text-fg-faint">
-              Allow once and Deny apply to this request only, not the project or future requests. Standing permission is set by the workspace&apos;s mode in Settings → Modes.
-              {sessionGrant !== undefined ? <>{' '}Allowing the folder for this session lets this conversation use it without asking again.</> : null}
-              {' '}Arguments may target systems outside the project; server policy still applies.
-            </p>
             {errors[approvalId] ? <ErrorNotice raw={errors[approvalId]!} announce={false} /> : null}
             <div className="flex flex-wrap items-center justify-end gap-2">
+              {expiresAt !== undefined ? (
+                <span className="mr-auto flex items-center gap-1 text-xs text-fg-faint" title={expired ? undefined : 'An undecided request is cancelled when this runs out'}>
+                  <Icon name="clock" size={12} />
+                  {expired
+                    ? 'Expired — this request was cancelled and the tool did not run.'
+                    : <>Cancels itself in <span className="font-mono">{formatCountdown(expiresAt, now)}</span></>}
+                </span>
+              ) : null}
               <Button variant="outline" size="sm" disabled={submittingRow} onClick={() => void answer(approvalId, false)}>Deny</Button>
               {sessionGrant !== undefined ? (
                 <Button variant="outline" size="sm" disabled={submittingRow} title={sessionGrant} onClick={() => void answer(approvalId, true, 'session')}>

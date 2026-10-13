@@ -202,7 +202,7 @@ describe('chat surfaces', () => {
   it('ApprovalBar shows one card per pending call', () => {
     const html = renderToStaticMarkup(<ApprovalBar approvals={[{ approvalId: 'a1', call: { id: 't', name: 'edit', args: { path: 'web/App.tsx' } } }]} onAnswer={async () => undefined} />)
     expect(html).toContain('web/App.tsx')
-    expect(html).toContain('Exact arguments')
+    expect(html).toContain('Details')
     expect(html).toContain('Allow once')
     expect(html).toContain('Deny')
   })

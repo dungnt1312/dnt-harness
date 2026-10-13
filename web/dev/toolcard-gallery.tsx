@@ -14,6 +14,7 @@ import '../styles/app.css'
 import '../styles/markdown.css'
 import '../styles/motion.css'
 import { ActivityBlock, DelegationCard, StatusLine, ToolCard } from '../components/chat/MessageParts.tsx'
+import { ApprovalBar } from '../components/chat/ApprovalBar.tsx'
 import type { ViewItem } from '../lib/project.ts'
 
 type ToolItem = Extract<ViewItem, { kind: 'tool' }>
@@ -106,6 +107,11 @@ function Gallery() {
           <StatusLine reason="provider: zcode: gateway error: The operation was aborted due to timeout" onRetry={() => {}} />
           <StatusLine reason="provider: cliproxy: gateway error: upstream stream stayed inactive for 120s mid-reasoning; the harness recorded no content for this turn and the request was not billed" onRetry={() => {}} />
         </div>
+      </Block>
+      <Block id="approvals" title="Approval cards">
+        <ApprovalBar scope="/Users/dungnt/workspace/dnt-harness" onAnswer={() => {}} approvals={[{ approvalId: 'a1', call: { id: 'toolu_01NEJfe4mdtTQo7w73saBmhh', name: 'Bash', args: { command: 'pnpm run typecheck 2>&1 | tail -40' } }, expiresAt: NOW + 313_000 }]} />
+        <ApprovalBar scope="/Users/dungnt/workspace/dnt-harness" onAnswer={() => {}} approvals={[{ approvalId: 'a2', call: { id: 'toolu_02', name: 'Bash', args: { command: 'cd build\nrm -rf dist\npnpm run build' } }, expiresAt: NOW + 90_000, childSessionId: 'session-abcdefgh1234', definitionName: 'worker', guardWarning: 'Risky command: rm -r — this mode asks before each one' }]} />
+        <ApprovalBar scope="/Users/dungnt/workspace/dnt-harness" onAnswer={() => {}} approvals={[{ approvalId: 'a3', call: { id: 'toolu_03', name: 'Read', args: { path: '/tmp/other/notes.md' } }, scopeWarning: 'Outside granted folders: /private/tmp/other/notes.md (read)', proposedGrant: '/private/tmp/other', proposedAccess: 'read' }]} />
       </Block>
       {(['Bash — exit 1', 'Bash — long command', 'Read — ok', 'Edit — ok', 'Grep — ok', 'Bash — running', 'Bash — recovered'] as const).map((label) => {
         const found = rows.find((row) => row.label === label)!
