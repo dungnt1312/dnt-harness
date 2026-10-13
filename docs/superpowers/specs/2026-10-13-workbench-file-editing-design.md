@@ -88,6 +88,10 @@ saveProjectFile(root, rawPath, content: string, expectedHash: string, deniedRoot
    - read the bytes; `hashBytes(bytes) !== expectedHash` →
      `ProjectWriteError(409)` carrying `currentHash`;
    - `decodeDocument` (binary → 400; `!writable` or not UTF-8 → 400);
+   - a file without a write bit is refused (400, `'<rel>' is read-only`);
+   - line endings: the textarea turns CRLF and lone CR into LF, and the save
+     re-applies the file's dominant line ending, so a mixed-EOL file is
+     normalised and a lone CR becomes the dominant line ending;
    - drop one leading `\uFEFF` from `content` when the document has a BOM
      (the read path returns it inside `content`);
    - `encodeForWrite(text, doc)`; encoded size over `MAX_FILE_BYTES` → 413;
