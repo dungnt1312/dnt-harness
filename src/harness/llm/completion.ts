@@ -9,9 +9,17 @@ export function protocolError(reason: 'malformed_protocol' | 'invalid_tool_input
 export function normalizeFinishReason(raw: unknown): ModelFinishReason {
   return raw === 'stop' || raw === 'tool_calls' || raw === 'length' || raw === 'content_filter' || raw === 'error' ? raw : 'unknown'
 }
-export function validateCompletion(completion: ModelCompletion): void {
+/**
+ * Accept only a settled, explicitly finished completion. `allowLength` admits
+ * a completion the model ended at its output-token limit: the agent loop
+ * recovers from it (the partial text is kept, a cut-off tool call is dropped
+ * unrun, and the model is told to continue in smaller pieces). Callers that
+ * need a whole answer, such as compaction, keep the strict default.
+ */
+export function validateCompletion(completion: ModelCompletion, options?: { readonly allowLength?: boolean }): void {
   if (!completion.transportSettled) throw new ProviderError('provider transport cleanup is unresolved', { reason: 'incomplete_completion', phase: 'cleanup' })
-  if (completion.finishReason !== 'stop' && completion.finishReason !== 'tool_calls') {
+  const accepted = completion.finishReason === 'stop' || completion.finishReason === 'tool_calls' || (options?.allowLength === true && completion.finishReason === 'length')
+  if (!accepted) {
     throw new ProviderError(`provider completion rejected: ${completion.finishReason}`, { reason: completion.finishReason === 'length' || completion.finishReason === 'content_filter' ? completion.finishReason : 'unknown', phase: 'completion' })
   }
   if (!((completion.transport === 'done' && completion.policy === 'strict') || (completion.transport === 'eof' && completion.policy === 'finish-eof') || (completion.transport === 'legacy' && completion.policy === 'legacy-iterable'))) {

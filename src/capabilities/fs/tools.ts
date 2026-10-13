@@ -200,7 +200,7 @@ export function writeTool(): ToolDefinition {
   return {
     name: 'Write',
     description:
-      'Create a file, or replace an existing file completely, inside the workspace or a read-write granted folder. Overwriting requires that this conversation Read the file first and that it has not changed since; prefer Edit for partial changes. An existing file keeps its encoding, BOM, and line-ending style.',
+      'Create a file, or replace an existing file completely, inside the workspace or a read-write granted folder. Overwriting requires that this conversation Read the file first and that it has not changed since; prefer Edit for partial changes. An existing file keeps its encoding, BOM, and line-ending style. For a long file (more than about 400 lines, such as a plan or spec), Write a short skeleton first and then add one section per Edit call: a single huge call can exceed the model output limit and is then lost unrun.',
     requiresRoot: true,
     parameters: {
       type: 'object',

@@ -1,4 +1,4 @@
-import { applyThinkingOverride } from './model-catalog.ts'
+import { applyThinkingOverride, getModelInfo } from './model-catalog.ts'
 import { classifyTransport } from './request-lifecycle.ts'
 import { cancelReader, encodedBytes, normalizeFinishReason, protocolError, readBoundedError, readSse, validateCompletion, validateToolBatch, WIRE_LIMITS } from './completion.ts'
 import type { ModelCompletion, ModelFinishReason } from './types.ts'
@@ -99,6 +99,20 @@ export interface OpenAiCompletionsOptions {
   readonly retryBaseMs?: number
   /** Explicit gateway profile; default requires choice finish plus DONE. */
   readonly completionPolicy?: 'strict' | 'finish-eof'
+  /** Operator per-model output-token caps; they win over the catalog value. */
+  readonly maxOutputTokens?: Readonly<Record<string, number>>
+}
+
+/**
+ * The output-token cap sent as `max_tokens`: an operator override, else the
+ * catalog's documented maximum. Without one the gateway applies its own
+ * default, which can be far below what the model supports and cuts long
+ * replies off with finish `length`. Unknown models send nothing.
+ */
+export function outputTokenCap(model: string, overrides?: Readonly<Record<string, number>>): number | undefined {
+  const override = overrides?.[model]
+  if (override !== undefined && Number.isSafeInteger(override) && override > 0) return override
+  return getModelInfo(model)?.maxOutputTokens
 }
 
 const DEFAULT_MAX_RETRIES = 3
@@ -202,6 +216,8 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       // which the context meter shows instead of a chars/4 estimate.
       stream_options: { include_usage: true },
     }
+    const maxTokens = outputTokenCap(model, this.options.maxOutputTokens)
+    if (maxTokens !== undefined) body['max_tokens'] = maxTokens
     applyThinkingOverride(body, model, request.thinkingLevel)
     const payload = JSON.stringify(body)
     const signal = options?.signal
@@ -341,8 +357,11 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       }
       if (finishReason === undefined || (boundary === 'eof' && this.options.completionPolicy !== 'finish-eof')) throw protocolError('incomplete_completion', `${this.name}: stream ended without completion proof`)
       const completion: ModelCompletion = { type: 'completion', finishReason, transport: boundary, policy: boundary === 'done' ? 'strict' : 'finish-eof', transportSettled: true }
-      validateCompletion(completion)
-      const batch = [...finishCalls(this.name, calls)]
+      // A `length` finish reaches the agent loop, which recovers in-turn. Tool
+      // calls of a cut-off reply are incomplete by definition (their JSON may
+      // even parse) and are never handed out for execution.
+      validateCompletion(completion, { allowLength: true })
+      const batch = finishReason === 'length' ? [] : [...finishCalls(this.name, calls)]
       cleanupAttempted = true
       settled = await cancelReader(reader, options?.onTransportSettled)
       if (!settled) throw new ProviderError('transport cleanup unresolved', { reason: 'incomplete_completion', phase: 'cleanup' })

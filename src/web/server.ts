@@ -98,6 +98,7 @@ import {
   type ModelAlias,
   type ModelSettings,
   type ProviderConfig,
+  maxOutputTokenOverrides,
   validateModelAliasName,
 } from './provider-store.ts'
 import { ScopeError, WorkspaceService, type AdditionalDirectory, type ProjectRecord, type WorkspaceRecord } from '../harness/workspace/service.ts'
@@ -874,6 +875,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       apiKey: entry.apiKey,
       baseUrl: entry.baseUrl,
       ...(entry.models.length > 0 ? { models: entry.models } : {}),
+      maxOutputTokens: maxOutputTokenOverrides(entry),
     })
 
   const injectionNames = (): readonly string[] =>
@@ -8914,6 +8916,9 @@ function sanitizeModelSettings(raw: unknown): Record<string, ModelSettings> | un
     const settings: ModelSettings = {
       ...(typeof entry['contextTokens'] === 'number' && Number.isInteger(entry['contextTokens']) && entry['contextTokens'] > 0
         ? { contextTokens: entry['contextTokens'] }
+        : {}),
+      ...(typeof entry['maxOutputTokens'] === 'number' && Number.isSafeInteger(entry['maxOutputTokens']) && entry['maxOutputTokens'] > 0
+        ? { maxOutputTokens: entry['maxOutputTokens'] }
         : {}),
       ...(typeof entry['vision'] === 'boolean' ? { vision: entry['vision'] } : {}),
       ...(isThinkingLevel(entry['thinkingLevel']) ? { thinkingLevel: entry['thinkingLevel'] } : {}),

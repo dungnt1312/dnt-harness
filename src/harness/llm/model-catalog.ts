@@ -65,6 +65,7 @@ const TEXT_VISION_1M: ModelMetadata = {
   contextTokens: CATALOG_CONTEXT_1M,
   maxOutputTokens: OUTPUT_128K,
 }
+const CLAUDE_5: ModelMetadata = { ...TEXT_VISION_1M, maxOutputTokens: 128_000 }
 
 /**
  * Verified capabilities for exact registry IDs. Unknown fields are
@@ -94,9 +95,10 @@ const MODEL_CATALOG: Readonly<Record<string, ModelMetadata>> = {
   'gemini-3.1-pro-preview': { ...TEXT_VISION_1M, maxOutputTokens: OUTPUT_64K, status: 'preview' },
   'gemini-3-flash-preview': { ...TEXT_VISION_1M, maxOutputTokens: OUTPUT_64K, status: 'preview' },
   'gemini-3-pro-preview': { ...TEXT_VISION_1M, maxOutputTokens: OUTPUT_64K, status: 'shut_down' },
-  'claude-fable-5': TEXT_VISION_1M,
-  'claude-opus-5': TEXT_VISION_1M,
-  'claude-sonnet-5': TEXT_VISION_1M,
+  // The API rejects max_tokens above 128,000 for the Claude 5 family.
+  'claude-fable-5': CLAUDE_5,
+  'claude-opus-5': CLAUDE_5,
+  'claude-sonnet-5': CLAUDE_5,
   // The one current Claude whose window differs from the family 1M.
   'claude-haiku-4.5': { kind: 'chat', vision: true, contextTokens: 200_000, maxOutputTokens: OUTPUT_64K },
 
@@ -255,7 +257,7 @@ const MODEL_CATALOG_PATTERNS: readonly ModelPattern<ModelMetadata>[] = [
   { pattern: /^grok-4\.3(?:[-:].*)?$/, value: { kind: 'chat', vision: true, contextTokens: 1_000_000 } },
   { pattern: /^grok-4\.5(?:[-:].*)?$/, value: { kind: 'chat', vision: true, contextTokens: 500_000 } },
   { pattern: /^gemini-2\.5-(?:pro|flash|flash-lite)(?:[-:].*)?$/, value: { ...TEXT_VISION_1M, maxOutputTokens: OUTPUT_64K } },
-  { pattern: /^claude-(?:fable-5|opus-5|sonnet-5)(?:[-:].*)?$/, value: TEXT_VISION_1M },
+  { pattern: /^claude-(?:fable-5|opus-5|sonnet-5)(?:[-:].*)?$/, value: CLAUDE_5 },
   { pattern: /^claude-haiku-4\.5(?:[-:].*)?$/, value: MODEL_CATALOG['claude-haiku-4.5']! },
   { pattern: /^glm-5\.2(?:[-:].*)?$/, value: MODEL_CATALOG['glm-5.2']! },
   { pattern: /^glm-5\.1(?:[-:].*)?$/, value: MODEL_CATALOG['glm-5.1']! },

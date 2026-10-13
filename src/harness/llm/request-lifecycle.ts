@@ -122,6 +122,24 @@ function raceSignal<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   })
 }
 
+/** Silence after which a dropped connection reads as a gateway idle cutoff. */
+export const GATEWAY_IDLE_CUT_MS = 60_000
+
+/**
+ * A reset after a long silence is almost always a proxy or CDN in front of
+ * the provider dropping an idle connection, typically while the model writes
+ * one large tool call the gateway buffers whole. Say so in the message: a
+ * bare "transport interrupted" sends diagnosis down the wrong path.
+ */
+export function gatewayIdleCut(error: ProviderError, lastActivityAt: number | undefined, now = Date.now()): ProviderError {
+  if (error.reason !== 'reset' || lastActivityAt === undefined) return error
+  const silentMs = now - lastActivityAt
+  if (silentMs < GATEWAY_IDLE_CUT_MS) return error
+  const annotated = new ProviderError(`provider transport interrupted after ${Math.round(silentMs / 1000)}s without output (likely a gateway idle cutoff)`, { reason: 'reset', phase: error.phase, transient: error.retryable })
+  annotated.transportSettled = error.transportSettled
+  return annotated
+}
+
 export async function* runAttempt(provider: { stream(request: ModelRequest, options?: import('./types.ts').StreamOptions): AsyncIterable<StreamEvent> }, request: ModelRequest, options: { owner: LogicalRequest; admission: AttemptAdmission; signal?: AbortSignal; observer?: AttemptObserver; attribution?: AttemptAttribution; provider?: string; recordAttempt?: (fact: AttemptFact) => Promise<void> }): AsyncIterable<StreamEvent> {
   const { owner, admission, observer } = options
   const controller = new AbortController()
@@ -179,7 +197,7 @@ export async function* runAttempt(provider: { stream(request: ModelRequest, opti
     await notify('end')
   } catch (caught) {
     attemptFailed = true
-    const error = controller.signal.aborted ? controller.signal.reason as ProviderError : caught instanceof ProviderError ? caught : classifyTransport(caught, 'stream')
+    const error = gatewayIdleCut(controller.signal.aborted ? controller.signal.reason as ProviderError : caught instanceof ProviderError ? caught : classifyTransport(caught, 'stream'), lastProgressAt ?? fact?.startedAt)
     cleanupUnknown = caught instanceof ProviderError && !caught.transportSettled
     // A timed-out read is not settled merely because return() resolves.
     if (!controller.signal.aborted && error.transportSettled) onTransportSettled()

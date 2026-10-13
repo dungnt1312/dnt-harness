@@ -46,6 +46,21 @@ function revisionOf(runtime: ToolRuntime | undefined): number | undefined {
   return typeof runtime.policyRevision === 'function' ? runtime.policyRevision() : runtime.policyRevision
 }
 
+/** How many output-token cutoffs (finish `length`) one turn may recover from. */
+export const MAX_TRUNCATION_RECOVERIES = 2
+
+/**
+ * Host notice after a reply hit the model's output-token limit. It rides a
+ * user message marked `origin: 'context'`: model-visible, never shown as
+ * something the user typed.
+ */
+export const TRUNCATION_NOTICE = [
+  'Host notice (not from the user): your previous reply hit the model output-token limit and was cut off.',
+  'Text already streamed was kept; any tool call you were writing was incomplete and was NOT executed.',
+  'Continue the task in smaller pieces: write a large file as a short skeleton first, then add sections with Edit,',
+  'one section per call, and keep each reply well under the limit. Do not restart work that already succeeded.',
+].join(' ')
+
 /** Thrown inside a step when the user asks the loop to stop; closes the turn, not a failure. */
 class StopRequested extends Error {
   constructor() {
@@ -419,11 +434,15 @@ export class Agent {
       let nextContext: readonly string[] | undefined = decision.context
       let nextExpansions: readonly (string | undefined)[] | undefined = decision.expansions
       let nextClaimed: readonly InboxItem[] = claimed
-      let nextOrigin: 'continuation' | undefined
+      let nextOrigin: 'continuation' | 'context' | undefined
+      // Replies cut off at the output-token limit this turn. Each one is
+      // answered with a host notice and another step; past the budget the
+      // model is evidently not splitting its output, and the turn fails.
+      let truncations = 0
       // A turn keeps spending steps while tools owe the model their results —
       // and while delegated work it left running still owes it a report.
       for (;;) {
-        let step: { stepId: StepId; toolCalls: readonly ToolCall[] }
+        let step: { stepId: StepId; toolCalls: readonly ToolCall[]; truncated?: true }
         try {
           step = await this.step(turnId, nextContents, nextClaimed, nextOrigin, nextContext, nextExpansions)
         } catch (error) {
@@ -443,6 +462,16 @@ export class Agent {
         nextExpansions = undefined
         nextClaimed = []
         nextOrigin = undefined
+        if (step.truncated === true) {
+          truncations += 1
+          if (truncations > MAX_TRUNCATION_RECOVERIES) {
+            throw new ProviderError('provider completion rejected: length (the model kept exceeding its output-token limit)', { reason: 'length', phase: 'completion' })
+          }
+          if (stopRequested()) break
+          nextContents = [TRUNCATION_NOTICE]
+          nextOrigin = 'context'
+          continue
+        }
         if (step.toolCalls.length > 0) continue
         // The model is done asking. Work it delegated and left running would be
         // cancelled by closing the turn, and everything the children did lost:
@@ -548,10 +577,10 @@ export class Agent {
     turnId: TurnId,
     contents: readonly string[] | undefined,
     claimed: readonly InboxItem[],
-    origin?: 'continuation',
+    origin?: 'continuation' | 'context',
     context?: readonly string[],
     expansions?: readonly (string | undefined)[],
-  ): Promise<{ stepId: StepId; toolCalls: readonly ToolCall[] }> {
+  ): Promise<{ stepId: StepId; toolCalls: readonly ToolCall[]; truncated?: true }> {
     const signal = this.abortController?.signal
     const assertLive = (): void => {
       if (signal?.aborted === true) throw this.abortError()
@@ -606,6 +635,8 @@ export class Agent {
     // request as too large would be sent the identical request forever.
     let full = ''
     let calls: readonly ToolCall[] = []
+    // The reply ended at the model's output-token limit (finish `length`).
+    let truncated = false
     let request: ModelRequest = { messages: [] }
     let squeeze = 0
     // A discarded attempt's chunks never became an assistant/message, so no
@@ -645,6 +676,7 @@ export class Agent {
       owner.assertLive(); assertLive()
       full = ''
       calls = []
+      truncated = false
 
       const attemptController = new AbortController()
       const relayStop = (): void => attemptController.abort()
@@ -678,7 +710,14 @@ export class Agent {
             assertLive()
             if (completed) throw protocolError('malformed_protocol', 'provider emitted events after completion')
             if (event.type === 'completion') {
-              validateCompletion(event)
+              validateCompletion(event, { allowLength: true })
+              // Output-token limit: whatever tool call the reply was writing is
+              // incomplete, so none of it may run. The turn loop tells the
+              // model and lets it continue in smaller pieces.
+              if (event.finishReason === 'length') {
+                truncated = true
+                calls = []
+              }
               validateToolBatch(calls)
               completed = true
               if (calls.length > 0) emitted = true
@@ -722,7 +761,7 @@ export class Agent {
         // outcome and must not allow tool preparation to begin.
         assertLive()
         if (!completed) throw protocolError('incomplete_completion', 'provider iterable ended without explicit completion')
-        if (full === '' && calls.length === 0) {
+        if (full === '' && calls.length === 0 && !truncated) {
           throw new ProviderError('provider returned an empty response', { transient: !emitted })
         }
       } catch (caught) {
@@ -736,8 +775,10 @@ export class Agent {
         // again anyway — the chunks never joined model history (only
         // assistant/message does) and no tool ran under this step id — so the
         // step is abandoned as consumed and a fresh one re-asks wholesale.
-        // One discard per step keeps the spent transcript bounded.
-        if (emitted && discardBudget > 0 && error instanceof ProviderError && error.transient && contents !== undefined) {
+        // One discard per step keeps the spent transcript bounded. This holds
+        // for tool-result steps too: their input (the logged tool results) is
+        // re-derived, so the re-ask repeats no tool.
+        if (emitted && discardBudget > 0 && error instanceof ProviderError && error.transient) {
           discardBudget -= 1
           this.session.append({ type: 'step/abandoned', turnId, stepId, reason: error.message.slice(0, 200) })
           await this.flushOrHalt()
@@ -770,15 +811,20 @@ export class Agent {
     // model normalize once, here, so permission rules and results match.
     calls = calls.map((call) => canonicalCall(call))
     const provider = (request as { providerName?: string }).providerName ?? safeProviderName(this.ctx)
-    this.session.append({
-      type: 'assistant/message',
-      stepId,
-      content: full,
-      ...(calls.length > 0 ? { toolCalls: calls } : {}),
-      ...(request.model !== undefined || provider !== undefined
-        ? { controls: { ...(request.model !== undefined ? { model: request.model } : {}), ...(provider !== undefined ? { provider } : {}) } }
-        : {}),
-    })
+    // A reply cut off before any answer text (it was all thinking or a tool
+    // call) leaves nothing for history; an empty assistant turn would only
+    // trip strict gateways. The truncation notice that follows carries it.
+    if (!(truncated && full === '')) {
+      this.session.append({
+        type: 'assistant/message',
+        stepId,
+        content: full,
+        ...(calls.length > 0 ? { toolCalls: calls } : {}),
+        ...(request.model !== undefined || provider !== undefined
+          ? { controls: { ...(request.model !== undefined ? { model: request.model } : {}), ...(provider !== undefined ? { provider } : {}) } }
+          : {}),
+      })
+    }
 
     // Consecutive read-only calls form one group that runs concurrently; any
     // other call is a group of its own, so a write never overlaps a read and
@@ -860,7 +906,7 @@ export class Agent {
 
     this.session.append({ type: 'step/end', turnId, stepId })
     await this.flushOrHalt()
-    return { stepId, toolCalls: calls }
+    return { stepId, toolCalls: calls, ...(truncated ? { truncated: true } : {}) }
   }
 
   /**

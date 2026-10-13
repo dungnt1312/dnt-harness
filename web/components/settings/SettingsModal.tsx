@@ -150,6 +150,7 @@ function pruneSettings(models: readonly string[], settings: Record<string, Model
     if (entry === undefined) continue
     const clean: ModelSettings = {
       ...(entry.contextTokens !== undefined && entry.contextTokens > 0 ? { contextTokens: entry.contextTokens } : {}),
+      ...(entry.maxOutputTokens !== undefined && entry.maxOutputTokens > 0 ? { maxOutputTokens: entry.maxOutputTokens } : {}),
       ...(entry.vision !== undefined ? { vision: entry.vision } : {}),
       ...(entry.thinkingLevel !== undefined && entry.thinkingLevel in THINKING_LABELS ? { thinkingLevel: entry.thinkingLevel } : {}),
     }

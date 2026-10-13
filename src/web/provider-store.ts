@@ -7,8 +7,21 @@ import { isThinkingLevel, type ThinkingLevel } from '../harness/llm/model-catalo
 /** Per-model operator overrides stored on one provider entry. */
 export interface ModelSettings {
   readonly contextTokens?: number
+  /** Output-token cap sent as `max_tokens`; absent = catalog maximum. */
+  readonly maxOutputTokens?: number
   readonly vision?: boolean
   readonly thinkingLevel?: string
+}
+
+const positiveInt = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+
+/** The per-model `max_tokens` overrides of one provider entry. */
+export function maxOutputTokenOverrides(entry: ProviderConfig): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const [model, settings] of Object.entries(entry.modelSettings ?? {})) {
+    if (positiveInt(settings.maxOutputTokens)) out[model] = settings.maxOutputTokens
+  }
+  return out
 }
 
 /** One configured OpenAI-completions provider, persisted as JSON. */
@@ -192,6 +205,7 @@ function parseProviderEntries(entries: readonly unknown[]): ProviderConfig[] {
         const settings = raw as Record<string, unknown>
         const value: ModelSettings = {
           ...(typeof settings['contextTokens'] === 'number' && Number.isInteger(settings['contextTokens']) && settings['contextTokens'] > 0 ? { contextTokens: settings['contextTokens'] } : {}),
+          ...(positiveInt(settings['maxOutputTokens']) ? { maxOutputTokens: settings['maxOutputTokens'] } : {}),
           ...(typeof settings['vision'] === 'boolean' ? { vision: settings['vision'] } : {}),
           ...(isThinkingLevel(settings['thinkingLevel']) ? { thinkingLevel: settings['thinkingLevel'] } : {}),
         }

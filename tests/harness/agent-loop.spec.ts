@@ -469,7 +469,7 @@ describe('agent loop', () => {
       void kernel.stop()
     })
 
-    it('a failure after output started in a later step is never retried, so output cannot be duplicated', async () => {
+    it('a transient mid-stream failure in a later (tool-result) step abandons that step and re-asks too', async () => {
       const kernel = new Kernel()
       kernel.ctx.plugin(SessionsService)
       kernel.ctx.plugin(LlmService)
@@ -489,24 +489,37 @@ describe('agent loop', () => {
             yield { type: 'completion' as const, finishReason: 'tool_calls' as const, transport: 'done' as const, policy: 'strict' as const, transportSettled: true }
             return
           }
-          yield { type: 'delta' as const, delta: 'partial ' }
-          throw transient()
+          if (requests === 2) {
+            yield { type: 'delta' as const, delta: 'partial ' }
+            throw transient()
+          }
+          yield { type: 'delta' as const, delta: 'recovered' }
+          yield { type: 'completion' as const, finishReason: 'stop' as const, transport: 'done' as const, policy: 'strict' as const, transportSettled: true }
         },
       })
       kernel.ctx.llm.use('midstream')
+      let executions = 0
       kernel.ctx.tools.register({
         name: 'noop',
         description: 'answers ok',
         parameters: { type: 'object', properties: {}, required: [] },
-        execute: async () => 'ok',
+        execute: async () => { executions += 1; return 'ok' },
       })
 
       agent.send('hello')
       await agent.run()
 
-      expect(requests).toBe(2)
-      expect(session.events.filter((event) => event.type === 'step/abandoned')).toHaveLength(0)
-      expect(session.events.find((event) => event.type === 'turn/error')).toMatchObject({ kind: 'provider' })
+      expect(requests).toBe(3)
+      // The tool ran once: the re-ask replays its logged result, never the call.
+      expect(executions).toBe(1)
+      expect(session.events.filter((event) => event.type === 'step/abandoned')).toHaveLength(1)
+      expect(session.events.some((event) => event.type === 'turn/error')).toBe(false)
+      const last = session.events[session.events.length - 1]
+      expect(last?.type === 'turn/end' && last.reason).toBe('completed')
+      // Model history holds the recovered answer once, not the spent partial.
+      const messages = session.deriveMessages()
+      expect(messages[messages.length - 1]).toEqual({ role: 'assistant', content: 'recovered' })
+      expect(messages.filter((message) => message.role === 'assistant' && typeof message.content === 'string' && message.content.includes('partial'))).toHaveLength(0)
       void kernel.stop()
     })
 

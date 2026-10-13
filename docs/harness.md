@@ -758,10 +758,24 @@ root stops waiting:
   joined model history (only `assistant/message` does) and no tool ran under
   that step id, so re-asking duplicates nothing. The loop appends
   `step/abandoned` for the spent step, mints a fresh step id, and re-asks
-  wholesale — once per step; a second failure is final, and later steps of the
-  same turn (whose input was tool output, not user input) still fail at once.
+  wholesale — once per step; a second failure is final. Later steps of the same
+  turn (whose input is logged tool output) get the same single re-ask: their
+  tool results are re-derived from the log, so no tool runs again.
   Projections fold the abandoned step's chunks behind a discarded-attempt
-  disclosure instead of duplicating them.
+  disclosure instead of duplicating them. A reset after at least 60s of
+  silence is reported as `provider transport interrupted after Ns without
+  output (likely a gateway idle cutoff)`: a proxy in front of the provider
+  dropped the connection while the model wrote one large buffered tool call.
+- *Hit the output-token limit.* The OpenAI adapter sends `max_tokens` from the
+  model catalog (`maxOutputTokens`, overridable per model in a provider's
+  `modelSettings`), so the gateway's own default does not cap the reply. A
+  reply that still ends with finish `length` is not a failure: its streamed
+  text is kept as the `assistant/message` (none when it was empty), any tool
+  call it was writing is dropped unrun, and the loop appends a host notice
+  (`TRUNCATION_NOTICE`, `origin: 'context'`) asking the model to continue in
+  smaller pieces, then runs another step. After `MAX_TRUNCATION_RECOVERIES`
+  (2) cutoffs in one turn the turn fails with `provider completion rejected:
+  length`. Compaction still requires a `stop` finish.
 - *The root stops calling tools while children run.* Closing the turn would
   cancel them and lose their work. Instead the `agent/turn-continuation` serial
   event lets the host join the turn's unreported children

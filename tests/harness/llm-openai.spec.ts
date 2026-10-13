@@ -69,6 +69,15 @@ describe('openai completions adapter: thinking + wire shape', () => {
     ])
   })
 
+  it('sends the catalog output cap as max_tokens, an operator override wins, unknown models send none', async () => {
+    const captured = stubFetch()
+    await run({ model: 'claude-opus-5-5', messages: [] })
+    await run({ model: 'gpt-5.6-sol', messages: [] })
+    await run({ model: 'some-unknown-model', messages: [] })
+    for await (const _ of new OpenAiCompletionsProvider({ name: 't', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', maxOutputTokens: { 'claude-opus-5-5': 32_000 } }).stream({ model: 'claude-opus-5-5', messages: [] })) void _
+    expect(captured.map(c => c.body['max_tokens'])).toEqual([128_000, 131_072, undefined, 32_000])
+  })
+
   it('carries bounded Retry-After and safe HTTP metadata to the harness coordinator', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('SECRET', { status: 503, headers: { 'retry-after': '99' } })))
     const owner = new LogicalRequest()

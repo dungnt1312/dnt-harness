@@ -295,6 +295,8 @@ export interface SessionListing {
 export interface ModelSettings {
   /** Context-window override in tokens; absent = catalog default. */
   readonly contextTokens?: number
+  /** Output-token cap sent as `max_tokens`; absent = catalog maximum. */
+  readonly maxOutputTokens?: number
   /** Vision capability override; absent = catalog value. */
   readonly vision?: boolean
   /** Default thinking level for this model; absent = catalog default. */

@@ -25,7 +25,7 @@ describe('explicit stream completion', () => {
     expect(read).toBe(16384)
     expect(cancelled).toBe(true)
   })
-  it.each(['text', 'calls', 'length', 'unsettled', 'batch-error', 'aggregate', 'legacy-aggregate'] as const)('A01/A03/A05 Agent rejects %s without side effects or model history', async kind => {
+  it.each(['text', 'calls', 'unsettled', 'batch-error', 'aggregate', 'legacy-aggregate'] as const)('A01/A03/A05 Agent rejects %s without side effects or model history', async kind => {
     const kernel = new Kernel()
     kernel.ctx.plugin(SessionsService)
     kernel.ctx.plugin(LlmService)
@@ -45,7 +45,7 @@ describe('explicit stream completion', () => {
       if (kind !== 'calls' && kind !== 'batch-error') yield { type: 'delta', delta: aggregate ? 'x'.repeat(7 * 1024 * 1024) : 'partial' }
       if (kind !== 'text') yield { type: 'toolCalls', calls: [{ id: 'c', name: 'Glob', args: aggregate ? { value: 'x'.repeat(2 * 1024 * 1024 - 20) } : {} }] }
       if (kind === 'batch-error') throw new ProviderError('temporary failure', { transient: true })
-      if (kind === 'length' || kind === 'unsettled' || kind === 'aggregate') yield { type: 'completion', finishReason: kind === 'length' ? 'length' : 'stop', transport: 'done', policy: 'strict', transportSettled: kind !== 'unsettled' }
+      if (kind === 'unsettled' || kind === 'aggregate') yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: kind !== 'unsettled' }
     } }
     kernel.ctx.llm.register(kind === 'legacy-aggregate' ? withLegacyCompletion(provider) : provider)
     const session = kernel.ctx.sessions.create()
@@ -83,8 +83,14 @@ describe('explicit stream completion', () => {
     await expect(collect(text + finish('stop'))).rejects.toMatchObject({ reason: 'incomplete_completion' })
     expect(await collect(text + finish('stop'), 'finish-eof')).toContainEqual({ type: 'completion', finishReason: 'stop', transport: 'eof', policy: 'finish-eof', transportSettled: true })
   })
-  it.each(['length', 'content_filter', 'unexpected'])('A03 rejects %s', async reason => {
+  it.each(['content_filter', 'unexpected'])('A03 rejects %s', async reason => {
     await expect(collect(call() + finish(reason) + 'data: [DONE]\n\n')).rejects.toBeInstanceOf(Error)
+  })
+  it('A03 passes a length finish through but never hands out its cut-off tool calls', async () => {
+    const events = await collect(text + call() + finish('length') + 'data: [DONE]\n\n')
+    expect(events).toContainEqual({ type: 'delta', delta: 'partial' })
+    expect(events.some(e => e.type === 'toolCalls')).toBe(false)
+    expect(events.at(-1)).toMatchObject({ type: 'completion', finishReason: 'length' })
   })
   it('A03 rejects conflicting finish', async () => {
     await expect(collect(text + finish('stop') + finish('tool_calls') + 'data: [DONE]\n\n')).rejects.toBeInstanceOf(Error)

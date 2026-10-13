@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Kernel, LlmService } from '../../src/index.ts'
-import { AttemptAdmission, LogicalRequest, classifyTransport, runAttempt } from '../../src/harness/llm/request-lifecycle.ts'
+import { AttemptAdmission, GATEWAY_IDLE_CUT_MS, LogicalRequest, classifyTransport, gatewayIdleCut, runAttempt } from '../../src/harness/llm/request-lifecycle.ts'
 import { ProviderError, type StreamEvent, type StreamOptions } from '../../src/harness/llm/types.ts'
 import { resolveLimits, DEFAULT_LIMITS } from '../../src/harness/limits.ts'
 
@@ -8,6 +8,20 @@ const request = { messages: [] }
 const completion: StreamEvent = { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
 const collect = async (stream: AsyncIterable<StreamEvent>) => { const result = []; for await (const e of stream) result.push(e); return result }
 afterEach(() => vi.useRealTimers())
+describe('gateway idle cutoff', () => {
+  const reset = (): ProviderError => classifyTransport({ code: 'ECONNRESET' }, 'stream')
+  it('names a reset after long silence as a likely gateway idle cutoff, keeping reason and retryability', () => {
+    const annotated = gatewayIdleCut(reset(), 0, 125_000)
+    expect(annotated.message).toBe('provider transport interrupted after 125s without output (likely a gateway idle cutoff)')
+    expect(annotated).toMatchObject({ reason: 'reset', retryable: true, phase: 'stream' })
+  })
+  it('leaves a quick reset and non-reset failures untouched', () => {
+    const quick = reset()
+    expect(gatewayIdleCut(quick, 0, GATEWAY_IDLE_CUT_MS - 1)).toBe(quick)
+    const other = new ProviderError('x', { reason: 'server_error' })
+    expect(gatewayIdleCut(other, 0, 10 * GATEWAY_IDLE_CUT_MS)).toBe(other)
+  })
+})
 describe('aggregate request lifecycle', () => {
   it('fences a retained session across reload even with spare provider capacity', async () => {
     const kernel = new Kernel()
