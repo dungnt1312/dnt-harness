@@ -1,4 +1,4 @@
-import { useEffect, useRef, type KeyboardEvent } from 'react'
+import { useEffect, useLayoutEffect, useRef, type KeyboardEvent } from 'react'
 import { Button } from '../ui/Button.tsx'
 import { ErrorNotice } from '../common/ErrorNotice.tsx'
 
@@ -22,10 +22,20 @@ export function FileEditor({ path, text, dirty, saving, error, conflict, onChang
   readonly onOverwrite: () => void
 }) {
   const areaRef = useRef<HTMLTextAreaElement>(null)
+  const pendingCaret = useRef<number | null>(null)
   useEffect(() => { areaRef.current?.focus() }, [])
+  // Restore the caret only once the parent has committed the inserted indent.
+  useLayoutEffect(() => {
+    const area = areaRef.current
+    const caret = pendingCaret.current
+    if (area === null || caret === null || area.value !== text) return
+    area.setSelectionRange(caret, caret)
+    pendingCaret.current = null
+  }, [text])
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 's') {
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 's') {
       e.preventDefault()
       onSave()
     } else if (e.key === 'Escape') {
@@ -37,8 +47,8 @@ export function FileEditor({ path, text, dirty, saving, error, conflict, onChang
       const { selectionStart: start, selectionEnd: end, value } = area
       const unit = indentUnit(text)
       const caret = start + unit.length
+      pendingCaret.current = caret
       onChange(value.slice(0, start) + unit + value.slice(end))
-      requestAnimationFrame(() => area.setSelectionRange(caret, caret))
     }
   }
 

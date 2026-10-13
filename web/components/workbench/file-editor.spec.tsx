@@ -59,6 +59,37 @@ it('inserts two spaces on Tab, or a tab when the file is tab-indented', async ()
   expect(tabs.onChange).toHaveBeenLastCalledWith('\tx\na\t')
 })
 
+it('keeps the caret after the indent once the parent commits the new text', async () => {
+  const p = props({ text: 'ab' })
+  const area = await mount(p)
+  area.setSelectionRange(1, 1)
+  await key(area, { key: 'Tab' })
+  expect(p.onChange).toHaveBeenLastCalledWith('a  b')
+  await act(async () => root!.render(<FileEditor {...p} text="a  b" />))
+  expect(area.value).toBe('a  b')
+  expect(area.selectionStart).toBe(3)
+  expect(area.selectionEnd).toBe(3)
+})
+
+it('ignores Escape, Cmd+S and Tab while an IME composition is active', async () => {
+  const p = props({ text: 'ab', dirty: true })
+  const area = await mount(p)
+  await key(area, { key: 'Escape', isComposing: true })
+  await key(area, { key: 's', metaKey: true, isComposing: true })
+  await key(area, { key: 'Tab', isComposing: true })
+  await key(area, { key: 'Escape', keyCode: 229 })
+  expect(p.onCancel).not.toHaveBeenCalled()
+  expect(p.onSave).not.toHaveBeenCalled()
+  expect(p.onChange).not.toHaveBeenCalled()
+})
+
+it('does not treat Cmd+Shift+S as save', async () => {
+  const p = props({ dirty: true })
+  const area = await mount(p)
+  await key(area, { key: 'S', metaKey: true, shiftKey: true })
+  expect(p.onSave).not.toHaveBeenCalled()
+})
+
 it('shows Unsaved only when dirty and disables Save when clean or saving', async () => {
   await mount(props())
   expect(host.textContent).not.toContain('Unsaved')
