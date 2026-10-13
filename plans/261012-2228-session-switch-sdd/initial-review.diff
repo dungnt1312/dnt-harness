@@ -1,0 +1,591 @@
+diff --git a/docs/web.md b/docs/web.md
+index d6884d5..706aba4 100644
+--- a/docs/web.md
++++ b/docs/web.md
+@@ -37,16 +37,39 @@ projected from the durable session events streamed over SSE — a fresh connecti
+ first receives a **snapshot** of the whole log (server-compacted: raw content
+ chunks of finalized steps and `context/body` payloads never ship; reasoning
+ folds to one event per step), then live `session/event`
+ frames. Approval questions arrive on the same stream as `approval` envelopes,
+ and answers go back over one POST. This is the "render from `session/event`"
+ principle: the log is the single source of truth, and any client can rebuild the
+ UI from it at any time.
+ 
++### Switching conversations
++
++The session stream hook fences its returned data by workspace/session before
++rendering, so a newly selected transcript never mounts the previous history.
++Each hook retains at most four recently viewed conversations under a conservative
++16 MB payload budget. It caches compacted events, the incremental projector and
++the SSE cursor in memory only; oversized histories are not retained. Pending
++animation-frame events are projected before caching, so the cursor never skips
++unpublished rows. Switching back paints cached rows immediately while opening
++`events?cursor=N` for delta replay. Native `Last-Event-ID` reconnect headers take
++precedence; invalid/out-of-range cursors fall back to a replacement snapshot.
++The frame id is retained even when replay compaction removes the last raw event.
++Approvals and interactive questions are never restored from this navigation
++cache: the server re-sends currently pending actions. Cache lifetime ends with
++the owning hook, including App unmount on authentication loss.
++
++Transcript mounting starts with a viewport-sized tail (30–100 blocks). The
++existing “Load earlier items” action adds up to 300 older blocks per click.
++This is bounded initial mounting, not variable-height viewport virtualization;
++all history remains available. Transcript maps derive only when their relevant
++event groups change; replacement histories invalidate those groups even when
++they contain the same number of events.
++
+ ## Workspace interaction
+ 
+ - An empty workspace offers **New conversation**. Until a session is selected, its connection state is idle, not connecting.
+ - Project binding is fixed when creating a session. Project registration is in Workspace settings, reached through New Conversation → Manage projects. Unbound sessions explain that file/shell work needs a project-bound new session.
+ - Modes load with the initial workspace metadata and on workspace switches. Navigation generations and request tokens reject obsolete initial loads, mutation completions, lists and model/mode refreshes, including workspace A → B → A transitions.
+ - Drafts, pending-send flags and send errors are keyed by workspace/session in memory. A submitted draft clears only after the server accepts the POST and only if its edit revision is unchanged. Failures remain inline with details and provider guidance; automatic resend is deliberately avoided because a lost response does not prove the request was rejected.
+ - Approval questions are deduplicated and reconciled against durable request, decision, tool-result and turn-end events on replay, and removed after a successful answer.
+ - Model menus offer search for larger lists, provider grouping, keyboard navigation and full wrapping option labels. Popups portal into document.body with viewport-clamped positioning and scroll/resize updates; Escape belongs to the popup before a drawer or modal.
+diff --git a/src/web/server.ts b/src/web/server.ts
+index 2c48714..1629978 100644
+--- a/src/web/server.ts
++++ b/src/web/server.ts
+@@ -9158,17 +9158,18 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
+   })
+   const { session } = entry
+ 
+   // First read of this session since boot: close process/start events a
+   // restart left open before any client can see them (orphaned OS processes
+   // are not re-adopted — KillShell/BashOutput answer unknown truthfully).
+   reconcileInterruptedProcesses(entry, deps)
+ 
+-  const rawCursor = req.headers['last-event-id']
++  // Native reconnect headers supersede the initial cached-navigation cursor.
++  const rawCursor = req.headers['last-event-id'] ?? new URL(req.url ?? '/', 'http://localhost').searchParams.get('cursor')
+   const cursor = typeof rawCursor === 'string' && /^\d+$/.test(rawCursor) ? Number(rawCursor) : NaN
+   const latest = session.events.at(-1)?.seq ?? 0
+   const earliest = session.events[0]?.seq ?? 1
+   const resumable = Number.isSafeInteger(cursor) && cursor >= earliest - 1 && cursor <= latest
+   // Both replay shapes are compacted: a fresh snapshot otherwise ships every
+   // raw chunk of the session's history, and a long-disconnect resume replays
+   // the same bulk. Sequence numbers stay untouched so the client's seen-cursor
+   // filtering and its own compaction keep working unchanged.
+diff --git a/tests/web/sse-resume.spec.ts b/tests/web/sse-resume.spec.ts
+index 247bc6c..f8a4d39 100644
+--- a/tests/web/sse-resume.spec.ts
++++ b/tests/web/sse-resume.spec.ts
+@@ -52,28 +52,34 @@ it('compacts the snapshot: finalized content chunks and raw context bodies never
+ })
+ 
+ it('emits an SSE id and replays only events after a valid Last-Event-ID', async () => {
+   root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-resume-'))
+   server = await createWebServer({ root, configFile: path.join(root, 'providers.json'), providers: [new FakeScriptedLlm(['done'])] })
+   const created = await fetch(`${server.url}/api/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+   const session = await created.json() as { id: string }
+   await fetch(`${server.url}/api/sessions/${session.id}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'hello' }) })
+-  const readFirst = async (cursor?: string) => {
++  const readFirst = async (cursor?: string, query?: string) => {
+     const abort = new AbortController()
+-    const response = await fetch(`${server!.url}/api/sessions/${session.id}/events`, { signal: abort.signal, ...(cursor !== undefined ? { headers: { 'Last-Event-ID': cursor } } : {}) })
++    const response = await fetch(`${server!.url}/api/sessions/${session.id}/events${query !== undefined ? `?cursor=${encodeURIComponent(query)}` : ''}`, { signal: abort.signal, ...(cursor !== undefined ? { headers: { 'Last-Event-ID': cursor } } : {}) })
+     const reader = response.body!.getReader()
+     let text = ''
+     while (!text.includes('\n\n')) text += new TextDecoder().decode((await reader.read()).value)
+     abort.abort()
+     const frame = text.split('\n\n')[0]!
+     const envelope = JSON.parse(frame.split('\n').find((line) => line.startsWith('data: '))!.slice(6))
+     return { frame, envelope }
+   }
+   const first = await readFirst()
+   expect(first.frame).toMatch(/^id: \d+\ndata: /)
+   const cursor = first.envelope.events[0].seq as number
+   const resumed = await readFirst(String(cursor))
+   expect(resumed.envelope.kind).toBe('resume')
+   expect(resumed.envelope.events.every((event: { seq: number }) => event.seq > cursor)).toBe(true)
+   expect((await readFirst('99999999')).envelope.kind).toBe('snapshot')
+   expect((await readFirst('invalid')).envelope.kind).toBe('snapshot')
++  const cached = await readFirst(undefined, String(cursor))
++  expect(cached.envelope.kind).toBe('resume')
++  expect(cached.envelope.events.every((event: { seq: number }) => event.seq > cursor)).toBe(true)
++  expect((await readFirst(undefined, '99999999')).envelope.kind).toBe('snapshot')
++  expect((await readFirst(undefined, '-1')).envelope.kind).toBe('snapshot')
++  expect((await readFirst('invalid', String(cursor))).envelope.kind).toBe('snapshot')
+ })
+diff --git a/web/components/chat/Transcript.tsx b/web/components/chat/Transcript.tsx
+index e352c52..5d61e80 100644
+--- a/web/components/chat/Transcript.tsx
++++ b/web/components/chat/Transcript.tsx
+@@ -3,17 +3,17 @@ import { HoldScrollProvider, useStickToBottom } from '../../hooks/useStickToBott
+ import type { RetryTarget, ViewItem } from '../../lib/project.ts'
+ import { turnChanges, type TurnChanges } from '../../lib/turn-changes.ts'
+ import type { SseEvent } from '../../lib/types.ts'
+ import type { OpenPathResolver } from '../../lib/project-paths.ts'
+ import { toProjectRelative } from '../../lib/project-paths.ts'
+ import { processRows, type ProcessRow } from '../../lib/processes-view.ts'
+ import { hiddenSpawnCalls } from '../../lib/spawn-merge.ts'
+ import { turnTimings, type TurnTiming } from '../../lib/turn-timing.ts'
+-import { useSessionDerivedGates } from '../../lib/session-derived.ts'
++import { useGated, useSessionDerivedGates } from '../../lib/session-derived.ts'
+ import { ActivityBlock, AssistantMessage, AuditLine, CommandExpansionMarker, CompactionMarker, ContinuationMarker, ContextMarker, HookContextMarker, HookRewakeMarker, DelegationCard, JumpToBottom, ProcessLinkContext, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
+ import { TurnChangesCard } from './TurnChangesCard.tsx'
+ import type { WorkbenchProject } from '../workbench/Workbench.tsx'
+ import { ConversationMinimap } from './ConversationMinimap.tsx'
+ import { MarkdownFileLinkContext } from '../../Markdown.tsx'
+ 
+ interface Indexed {
+   readonly item: ViewItem
+@@ -251,52 +251,40 @@ export const Transcript = memo(function Transcript({ items, events, conversation
+   // Files each closed turn's Write/Edit calls landed, projected once per
+   // event revision from the raw log (tool traffic carries only a stepId —
+   // the projection attributes positionally, like the transcript itself).
+   // Gated: these four maps re-derive from whole-log scans, so each recomputes
+   // only when traffic of the event types it reads arrived. A streaming frame
+   // of chunks leaves every map untouched, and the memoized cards above keep
+   // their references.
+   const gates = useSessionDerivedGates(events ?? [])
+-  const turnChangeMap = useMemo(
+-    () => turnChanges(events ?? []),
+-    // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on tool traffic, not array identity (a new array lands every streamed frame)
+-    [gates.taskCount, events],
+-  )
++  const turnChangeMap = useGated(gates.taskCount, () => turnChanges(events ?? []), [gates.turnCount, conversationId])
+   // Wall-clock boundaries per turn: the user row renders the start, the turn
+   // footer the end and the span. Rebuilt only when turn traffic arrived.
+-  const turnTimingMap = useMemo(
+-    () => turnTimings(events ?? []),
+-    // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on turn-boundary traffic
+-    [gates.turnCount, events],
+-  )
++  const turnTimingMap = useGated(gates.turnCount, () => turnTimings(events ?? []), [conversationId])
+   // Live background-process state for the tool rows, keyed off the process
+   // events only so unrelated log traffic does not rebuild the map (and
+   // re-render every memoized card) with it.
+-  const processStatuses = useMemo(
+-    () => new Map<string, ProcessRow>(processRows(events ?? []).map((row) => [row.id, row])),
+-    // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on process traffic
+-    [gates.processCount, events],
+-  )
++  const processStatuses = useGated(gates.processCount,
++    () => new Map<string, ProcessRow>(processRows(events ?? []).map((row) => [row.id, row])), [conversationId])
+   const processLink = useMemo<ProcessLink | null>(
+     () => onOpenProcess === undefined ? null : { statuses: processStatuses, open: onOpenProcess },
+     [onOpenProcess, processStatuses],
+   )
+   // Spawn calls the delegation row absorbs: one delegation, one row.
+-  const hiddenSpawns = useMemo(
+-    () => hiddenSpawnCalls(events ?? []),
+-    // eslint-disable-next-line react-hooks/exhaustive-deps -- gated on tool + agent traffic
+-    [gates.taskCount, gates.agentCount, events],
+-  )
++  const hiddenSpawns = useGated(gates.taskCount, () => hiddenSpawnCalls(events ?? []), [gates.agentCount, conversationId])
+   // Grouping skips the spawn calls their delegation rows absorbed, so a run's
+   // summary counts one delegation once.
+   const blocks = useMemo(() => groupBlocks(items, hiddenSpawns), [items, hiddenSpawns])
+   // Keep browser DOM/layout memory bounded for long conversations. Older
+   // blocks remain in the lightweight projection and can be mounted on demand.
+-  const [visibleLimit, setVisibleLimit] = useState(TRANSCRIPT_WINDOW)
++  // Mount a small viewport-sized tail first; older content remains available
++  // through the existing load action, without parsing 300 blocks on each switch.
++  const [visibleLimit, setVisibleLimit] = useState(() => Math.min(100, Math.max(30,
++    Math.ceil((typeof window === 'undefined' ? 900 : window.innerHeight) / 24))))
+   const visibleStart = Math.max(0, blocks.length - visibleLimit)
+   const visibleBlocks = useMemo(() => blocks.slice(visibleStart), [blocks, visibleStart])
+   // Reviews exactly the given turn's files in the Git view, in the
+   // project-relative form git status reports. Paths that resolve outside the
+   // project are dropped: git cannot see them anyway, and the card's own list
+   // still shows them.
+   const reviewAllOf = (changes: TurnChanges): (() => void) | undefined => {
+     if (onReviewChanges === undefined || project == null) return undefined
+diff --git a/web/components/chat/transcript-window.spec.tsx b/web/components/chat/transcript-window.spec.tsx
+index acd5022..66d626e 100644
+--- a/web/components/chat/transcript-window.spec.tsx
++++ b/web/components/chat/transcript-window.spec.tsx
+@@ -14,13 +14,15 @@ afterEach(async () => { if (root) await act(async () => root!.unmount()); root =
+ 
+ it('mounts only the recent transcript window and loads older rows on demand', async () => {
+   const items: ViewItem[] = Array.from({ length: 320 }, (_, index) => ({ kind: 'user', content: `message ${index}` }))
+   host = document.createElement('div')
+   document.body.append(host)
+   root = createRoot(host)
+   await act(async () => root!.render(<Transcript items={items} conversationId="s" />))
+   expect(host.textContent).not.toContain('message 0')
+-  const load = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('Load 20 earlier items'))
++  expect(host.textContent).not.toContain('message 200')
++  expect(host.textContent).toContain('message 319')
++  const load = [...host.querySelectorAll('button')].find((button) => button.textContent?.includes('earlier items'))
+   expect(load).toBeDefined()
+   await act(async () => load!.click())
+   expect(host.textContent).toContain('message 0')
+ })
+diff --git a/web/hooks/useSessionStream.ts b/web/hooks/useSessionStream.ts
+index c3191bc..2c42198 100644
+--- a/web/hooks/useSessionStream.ts
++++ b/web/hooks/useSessionStream.ts
+@@ -109,17 +109,33 @@ export function createEventCompactor(): (batch: readonly SseEvent[]) => readonly
+       events.forEach((event, index) => {
+         if (event.type === 'assistant/chunk' && event.thinking === true && event.stepId !== undefined) thinkingAt.set(event.stepId, index)
+       })
+     }
+     return events
+   }
+ }
+ 
++const EMPTY_EVENTS: readonly SseEvent[] = []
++const EMPTY_ITEMS: readonly ViewItem[] = []
++interface CachedStream {
++  projector: ReturnType<typeof createProjector>
++  compact: ReturnType<typeof createEventCompactor>
++  events: readonly SseEvent[]
++  items: readonly ViewItem[]
++  cursor: number
++  ready: boolean
++  weight: number
++}
++
+ export function useSessionStream(workspaceId: string | null, sessionId: string | null) {
++  // Hook-owned memory only: no history persists across logout/App unmount.
++  const cache = useRef(new Map<string, CachedStream>())
++  const scope = workspaceId !== null && sessionId !== null ? JSON.stringify([workspaceId, sessionId]) : null
++  const [loadedScope, setLoadedScope] = useState<string | null>(null)
+   const [events, setEvents] = useState<readonly SseEvent[]>([])
+   const [items, setItems] = useState<readonly ViewItem[]>([])
+   const [approvals, setApprovals] = useState<readonly PendingApproval[]>([])
+   // Live-only: the server re-sends every still-open question on (re)connect.
+   const [questions, setQuestions] = useState<readonly PendingQuestion[]>([])
+   const [stream, setStream] = useState<StreamState>('idle')
+   // True once this conversation's first snapshot/resume frame landed: before
+   // that, `events` reflects nothing and "is it running?" is unknown, not no.
+@@ -129,74 +145,91 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
+   const dismissApproval = useCallback((id: string) => {
+     setApprovals((prev) => prev.filter((row) => row.approvalId !== id))
+   }, [])
+   const dismissQuestion = useCallback((id: string) => {
+     setQuestions((prev) => prev.filter((row) => row.questionId !== id))
+   }, [])
+ 
+   useEffect(() => {
+-    seenSeq.current = 0
+-    setEvents([])
+-    setItems([])
++    const cached = scope !== null ? cache.current.get(scope) : undefined
++    let record: CachedStream = cached ?? { projector: createProjector(), compact: createEventCompactor(), events: EMPTY_EVENTS, items: EMPTY_ITEMS, cursor: 0, ready: false, weight: 0 }
++    if (scope !== null) cache.current.delete(scope)
++    seenSeq.current = record.cursor
++    setLoadedScope(scope)
++    setEvents(record.events)
++    setItems(record.items)
+     setSettled(false)
+-    let projector = createProjector()
+-    // The compactor owns the kept-event list across the whole stream: batches
+-    // fold in place, snapshots replace it wholesale.
+-    const compact = createEventCompactor()
+     setApprovals([])
+     setQuestions([])
+     setError(null)
+     setStream(sessionId === null || workspaceId === null ? 'idle' : 'connecting')
+     if (sessionId === null || workspaceId === null) return
+     let disposed = false
+     let frame = 0
+     let pending: SseEvent[] = []
+-    const flush = (): void => {
+-      frame = 0
+-      if (disposed || pending.length === 0) return
++    const applyPending = (): void => {
++      if (pending.length === 0) return
+       const batch = pending
+       pending = []
+-      setItems(projector.apply(batch))
+-      setEvents(compact(batch))
++      record.items = record.projector.apply(batch)
++      record.events = record.compact(batch)
++      record.cursor = seenSeq.current
++      // Conservative payload budget, including projector/event copies. Counting
++      // only new batches avoids serializing the whole history on navigation.
++      record.weight += JSON.stringify(batch).length * 4
++    }
++    const flush = (): void => {
++      frame = 0
++      if (disposed) return
++      applyPending()
++      setItems(record.items)
++      setEvents(record.events)
+     }
+     const discardPending = (): void => {
+       if (frame !== 0) cancelAnimationFrame(frame)
+       frame = 0
+       pending = []
+     }
+-    const dispose = subscribeEventsIn(workspaceId, sessionId, (envelope) => {
++    const dispose = subscribeEventsIn(workspaceId, sessionId, (envelope, frameCursor) => {
+       if (disposed) return
+       if (envelope.kind === 'question') {
+         const { kind: _kind, ...row } = envelope
+         setQuestions((prev) => prev.some((q) => q.questionId === row.questionId)
+           ? prev.map((q) => q.questionId === row.questionId ? row : q)
+           : [...prev, row])
+         return
+       }
+       if (envelope.kind === 'question-settled') {
+         setQuestions((prev) => prev.filter((q) => q.questionId !== envelope.questionId))
+         return
+       }
+       if (envelope.kind === 'snapshot') {
+         discardPending()
+         // A fresh snapshot precedes the server's re-sent open questions.
+         setQuestions([])
+-        projector = createProjector()
+-        setItems(projector.apply(envelope.events))
+-        setEvents(compact(envelope.events))
++        record = { projector: createProjector(), compact: createEventCompactor(), events: EMPTY_EVENTS, items: EMPTY_ITEMS, cursor: 0, ready: true, weight: 0 }
++        record.items = record.projector.apply(envelope.events)
++        record.events = record.compact(envelope.events)
++        record.weight = JSON.stringify(envelope.events).length * 4
++        seenSeq.current = frameCursor ?? envelope.events.at(-1)?.seq ?? 0
++        record.cursor = seenSeq.current
++        setItems(record.items)
++        setEvents(record.events)
+         setApprovals(reconcileApprovals([], envelope.events))
+-        seenSeq.current = envelope.events.at(-1)?.seq ?? 0
+         setSettled(true)
+       } else if (envelope.kind === 'resume') {
+         const unseen = envelope.events.filter((event) => event.seq > seenSeq.current)
+         for (const event of unseen) {
+           seenSeq.current = event.seq
+           pending.push(event)
+         }
++        seenSeq.current = Math.max(seenSeq.current, frameCursor ?? 0)
++        record.ready = true
++        record.cursor = seenSeq.current
+         setApprovals((prev) => reconcileApprovals(prev, unseen))
+         setSettled(true)
+         if (pending.length > 0 && frame === 0) frame = requestAnimationFrame(flush)
+       } else if (envelope.kind === 'session') {
+         const { event } = envelope
+         if (event.seq <= seenSeq.current) return
+         seenSeq.current = event.seq
+         pending.push(event)
+@@ -236,14 +269,39 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
+             ...(envelope.proposedAccess !== undefined ? { proposedAccess: envelope.proposedAccess } : {}),
+           }
+           if (prev.some((row) => row.approvalId === envelope.approvalId)) {
+             return prev.map((row) => row.approvalId === envelope.approvalId ? { ...row, ...next } : row)
+           }
+           return [...prev, next]
+         })
+       }
+-    }, (state) => { if (!disposed) setStream(state) })
+-    return () => { disposed = true; discardPending(); dispose() }
+-  }, [workspaceId, sessionId])
++    }, (state) => { if (!disposed) setStream(state) }, cached?.ready ? cached.cursor : undefined)
++    return () => {
++      disposed = true
++      dispose()
++      applyPending()
++      discardPending()
++      if (scope !== null && record.ready && record.weight <= 16_000_000) {
++        cache.current.set(scope, record)
++        let weight = [...cache.current.values()].reduce((total, row) => total + row.weight, 0)
++        while (cache.current.size > 4 || weight > 16_000_000) {
++          const oldest = cache.current.keys().next().value!
++          weight -= cache.current.get(oldest)!.weight
++          cache.current.delete(oldest)
++        }
++      }
++    }
++  }, [workspaceId, sessionId, scope])
+ 
+-  return { events, items, approvals, questions, stream, error, dismissApproval, dismissQuestion, settled }
++  // Effects reset state after render. Fence synchronously so a new keyed
++  // Transcript never mounts the previous conversation's expensive Markdown.
++  const matches = loadedScope === scope
++  const cached = scope !== null ? cache.current.get(scope) : undefined
++  return {
++    events: matches ? events : cached?.events ?? EMPTY_EVENTS,
++    items: matches ? items : cached?.items ?? EMPTY_ITEMS,
++    approvals: matches ? approvals : [], questions: matches ? questions : [],
++    stream: matches ? stream : scope === null ? 'idle' as const : 'connecting' as const,
++    error: matches ? error : null, dismissApproval, dismissQuestion,
++    settled: matches && settled,
++  }
+ }
+diff --git a/web/lib/api.ts b/web/lib/api.ts
+index 770f64a..2716cd9 100644
+--- a/web/lib/api.ts
++++ b/web/lib/api.ts
+@@ -398,34 +398,37 @@ export function subscribeEvents(
+   const source = new EventSource(`/api/sessions/${encodeURIComponent(sessionId)}/events`)
+   return wire(source, onEnvelope, onState)
+ }
+ 
+ /** Workspace-scoped subscription (G2): the session's owning workspace is part of the address. */
+ export function subscribeEventsIn(
+   workspaceId: string,
+   sessionId: string,
+-  onEnvelope: (envelope: Envelope) => void,
++  onEnvelope: (envelope: Envelope, cursor?: number) => void,
+   onState?: (state: StreamState) => void,
++  cursor?: number,
+ ): () => void {
+-  const source = new EventSource(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/events`)
++  const suffix = cursor !== undefined && Number.isSafeInteger(cursor) && cursor >= 0 ? `?cursor=${cursor}` : ''
++  const source = new EventSource(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/events${suffix}`)
+   return wire(source, onEnvelope, onState)
+ }
+ 
+ function wire(
+   source: EventSource,
+-  onEnvelope: (envelope: Envelope) => void,
++  onEnvelope: (envelope: Envelope, cursor?: number) => void,
+   onState?: (state: StreamState) => void,
+ ): () => void {
+   source.onopen = () => onState?.('open')
+   source.onerror = () => {
+     onState?.(source.readyState === EventSource.CONNECTING ? 'reconnecting' : 'connecting')
+   }
+   source.onmessage = (message: MessageEvent<string>) => {
+-    onEnvelope(JSON.parse(message.data) as Envelope)
++    const cursor = /^\d+$/.test(message.lastEventId ?? '') ? Number(message.lastEventId) : undefined
++    onEnvelope(JSON.parse(message.data) as Envelope, cursor !== undefined && Number.isSafeInteger(cursor) ? cursor : undefined)
+   }
+   return () => {
+     source.close()
+   }
+ }
+ 
+ 
+ // ── G2: workspaces & projects ───────────────────────────────────────────────
+diff --git a/web/lib/session-derived.ts b/web/lib/session-derived.ts
+index 55ed9f0..5a14897 100644
+--- a/web/lib/session-derived.ts
++++ b/web/lib/session-derived.ts
+@@ -1,89 +1,74 @@
+ /**
+  * Derived values computed once per event arrival, not once per frame.
+  *
+  * The streaming flush lands every rAF while a model is streaming, and the
+  * AppShell re-renders with it. Several surfaces below the shell only read a
+  * handful of event types (turn boundaries, process traffic, agent traffic,
+  * tool traffic) yet re-scanned the whole log each frame. Each derivation here
+- * keeps the count of the event types it reads and rescans only when one of
+- * those counts changed — the same policy Transcript already applies to its
+- * process map (processEventCount). Streaming chunks and unrelated traffic
+- * never invalidate them.
++ * tracks revisions of the event groups it reads. Reference comparisons also
++ * detect replacement snapshots with identical counts. Streaming chunks and
++ * unrelated traffic never invalidate these derivations.
+  */
+ import { useMemo, useRef } from 'react'
+ import type { SseEvent } from './types.ts'
+ import { isTurnRunning, taskPhase, type TaskPhase } from './project.ts'
+ import { todosFromEvents, type TodoView } from './todos-view.ts'
+ 
+-interface TypeCounts {
+-  readonly byType: Readonly<Record<string, number>>
+-  /** Events flagged `recovery === true` (any type): the recovery note's gate. */
+-  readonly recovery: number
+-}
+-
+-/** How many events of each type the array holds, in one pass. */
+-function typeCounts(events: readonly SseEvent[]): TypeCounts {
+-  const byType: Record<string, number> = {}
+-  let recovery = 0
+-  for (const event of events) {
+-    const type = event.type
+-    byType[type] = (byType[type] ?? 0) + 1
+-    if (event.recovery === true) recovery += 1
+-  }
+-  return { byType, recovery }
+-}
+-
+-/** Count only the types a derivation reads; a change there forces a rescan. */
+-function countOf(counts: TypeCounts, types: readonly string[]): number {
+-  let total = 0
+-  for (const type of types) total += counts.byType[type] ?? 0
+-  return total
+-}
+-
+ const TURN_BOUNDARY_TYPES = ['turn/start', 'turn/end'] as const
+ const TASK_TYPES = ['tool/call', 'tool/result'] as const
+ const PROCESS_TYPES = ['process/start', 'process/exit'] as const
+ const AGENT_TYPES = ['agent/child-spawn', 'agent/child-result'] as const
+ 
+ /**
+- * One typeCounts pass per events reference, shared by every gate below. When
+- * TaskStatus, the Environment panel, and the shell each gate on different
+- * type groups, the scan happens once per frame instead of once per gate.
++ * One grouping pass per events reference in this hook, shared by its gates.
++ * The legacy *Count field names carry revisions, not absolute event counts.
+  */
+ export interface SessionDerivedGates {
+   readonly turnCount: number
+   readonly taskCount: number
+   readonly processCount: number
+   readonly agentCount: number
+   readonly recoveryCount: number
++  readonly inputRevision: number
+ }
+ 
+ export function useSessionDerivedGates(events: readonly SseEvent[]): SessionDerivedGates {
++  const previous = useRef<{ groups: readonly (readonly SseEvent[])[]; revisions: number[] }>({ groups: [[], [], [], [], [], []], revisions: [0, 0, 0, 0, 0, 0] })
+   return useMemo(() => {
+-    const counts = typeCounts(events)
+-    return {
+-      turnCount: countOf(counts, TURN_BOUNDARY_TYPES),
+-      taskCount: countOf(counts, TASK_TYPES),
+-      processCount: countOf(counts, PROCESS_TYPES),
+-      agentCount: countOf(counts, AGENT_TYPES),
+-      recoveryCount: counts.recovery,
++    const groups: SseEvent[][] = [[], [], [], [], [], []]
++    for (const event of events) {
++      if ((TURN_BOUNDARY_TYPES as readonly string[]).includes(event.type)) groups[0]!.push(event)
++      if ((TASK_TYPES as readonly string[]).includes(event.type)) groups[1]!.push(event)
++      if ((PROCESS_TYPES as readonly string[]).includes(event.type)) groups[2]!.push(event)
++      if ((AGENT_TYPES as readonly string[]).includes(event.type)) groups[3]!.push(event)
++      if (event.type === 'input/queued' || event.type === 'input/settled' || event.type === 'user/message') groups[5]!.push(event)
++      // Recovery is relative to the open turn, so boundaries invalidate it too.
++      if (event.recovery === true || (TURN_BOUNDARY_TYPES as readonly string[]).includes(event.type)) groups[4]!.push(event)
+     }
++    const old = previous.current
++    const revisions = groups.map((group, index) => {
++      const before = old.groups[index]!
++      const same = group.length === before.length && group.every((event, at) => event === before[at])
++      return same ? old.revisions[index]! : old.revisions[index]! + 1
++    })
++    previous.current = { groups, revisions }
++    return { turnCount: revisions[0]!, taskCount: revisions[1]!, processCount: revisions[2]!, agentCount: revisions[3]!, recoveryCount: revisions[4]!, inputRevision: revisions[5]! }
+   }, [events])
+ }
+ 
+ /**
+  * Gated re-derivation: recompute only when `gate` moved (an event type the
+  * derivation reads arrived) or an extra dep changed. The derive closure and
+  * the event array it closes over change every render — the stream lands a new
+  * array each flushed frame — so both hide behind refs and the memo stays
+  * keyed on the gate alone, or it would rerun per frame and gate nothing.
+  */
+-function useGated<T>(gate: number, derive: () => T, extraDeps: readonly unknown[]): T {
++export function useGated<T>(gate: number, derive: () => T, extraDeps: readonly unknown[]): T {
+   const deriveRef = useRef(derive)
+   deriveRef.current = derive
+   // eslint-disable-next-line react-hooks/exhaustive-deps -- the gate IS the dependency; extraDeps are explicit re-run inputs
+   return useMemo(() => deriveRef.current(), [gate, ...extraDeps])
+ }
+ 
+ /**
+  * Everything the shell and its panels read from the log each render, with
+@@ -132,17 +117,17 @@ function recoveredOf(events: readonly SseEvent[]): boolean {
+  * `sending` shape the phase, so they are explicit re-run inputs alongside the
+  * turn-boundary gate; everything else derives from the event array alone and
+  * survives unrelated renders unchanged.
+  */
+ export function useSessionDerivedValues(events: readonly SseEvent[], pending: number, sending: boolean): SessionDerived {
+   const gates = useSessionDerivedGates(events)
+   const eventsRef = useRef(events)
+   eventsRef.current = events
+-  const phase = useGated(gates.turnCount, () => taskPhase(eventsRef.current, pending, sending), [pending, sending])
++  const phase = useGated(gates.turnCount, () => taskPhase(eventsRef.current, pending, sending), [pending, sending, gates.inputRevision])
+   const running = useGated(gates.turnCount, () => isTurnRunning(eventsRef.current), [])
+-  const todos = useGated(gates.taskCount, () => (gates.taskCount === 0 ? EMPTY_TODOS : todosFromEvents(eventsRef.current)), [])
++  const todos = useGated(gates.taskCount, () => todosFromEvents(eventsRef.current), [])
+   const workingSince = useGated(gates.turnCount, () => workingSinceOf(eventsRef.current), [])
+   const recovered = useGated(gates.recoveryCount, () => recoveredOf(eventsRef.current), [])
+   return { phase, running, todos, workingSince, recovered }
+ }
+ 
+ export { EMPTY_TODOS }
