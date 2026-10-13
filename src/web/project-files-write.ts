@@ -1,7 +1,9 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { blockedReason, resolveGrantedPath, within } from '../capabilities/fs/grants.ts'
-import type { ProjectEntry } from './project-files.ts'
+import { canonical, replaceFile, withFileLock } from '../capabilities/fs/observation.ts'
+import { BinaryFileError, decodeDocument, encodeForWrite, hashBytes } from '../capabilities/fs/text-document.ts'
+import { MAX_FILE_BYTES, type ProjectEntry } from './project-files.ts'
 
 /**
  * Explorer writes for the web workbench: create a file or folder, rename in
@@ -13,7 +15,7 @@ import type { ProjectEntry } from './project-files.ts'
  */
 
 export class ProjectWriteError extends Error {
-  constructor(readonly status: 400 | 404 | 409, message: string) {
+  constructor(readonly status: 400 | 404 | 409 | 413, message: string, readonly currentHash?: string) {
     super(message)
     this.name = 'ProjectWriteError'
   }
@@ -205,4 +207,59 @@ export async function deleteProjectEntry(root: string, rawPath: string, deniedRo
   // `rm` removes a link itself and never descends into its target.
   await fs.rm(t.abs, { recursive: source.isDirectory(), force: false })
   return { path: t.rel }
+}
+
+/**
+ * Save the viewer's edited text over an existing project file. Refuses when
+ * the stored bytes no longer hash to `expectedHash` (409, with the current
+ * hash), so a change the agent or another tab made is never overwritten
+ * silently. Keeps the file's encoding, BOM and dominant line ending, writes
+ * atomically, and serialises with the agent's file tools on the same lock.
+ */
+export async function saveProjectFile(
+  root: string,
+  rawPath: string,
+  content: string,
+  expectedHash: string,
+  deniedRoots?: readonly string[],
+): Promise<{ path: string; size: number; hash: string }> {
+  const t = await target(root, rawPath, deniedRoots)
+  let resolved: string
+  try {
+    resolved = await resolveGrantedPath(root, t.rel, deniedRoots)
+  } catch (error) {
+    refuse(error instanceof Error ? error.message : String(error))
+  }
+  const stat = await fs.stat(resolved).catch(() => null)
+  if (stat === null) throw new ProjectWriteError(404, `'${t.rel}' does not exist`)
+  if (!stat.isFile()) refuse(`'${t.rel}' is not a file`)
+  const file = await canonical(resolved)
+  // A link inside the project may point into `.git` or protected storage.
+  const rootReal = await fs.realpath(root).catch(() => root)
+  const relReal = path.relative(rootReal, file).split(path.sep)
+  if (relReal.some(isGitName)) refuse("'.git' is protected")
+  if ((await protection(root, file, deniedRoots)).inside) refuse(`path '${t.rel}' is inside protected storage`)
+  return withFileLock(file, undefined, async () => {
+    const bytes = await fs.readFile(file)
+    const current = hashBytes(bytes)
+    if (current !== expectedHash) {
+      throw new ProjectWriteError(409, `'${t.rel}' changed on disk since it was opened`, current)
+    }
+    let doc
+    try {
+      doc = decodeDocument(bytes, t.rel)
+    } catch (error) {
+      if (error instanceof BinaryFileError) refuse(`'${t.rel}' is a binary file`)
+      throw error
+    }
+    if (!doc.writable || doc.encoding !== 'utf8') refuse(`'${t.rel}' is not UTF-8 text and cannot be edited here`)
+    // The read path hands the BOM back as a leading U+FEFF; encodeForWrite adds it again.
+    const text = doc.bom && content.startsWith('\uFEFF') ? content.slice(1) : content
+    const next = encodeForWrite(text, doc)
+    if (next.length > MAX_FILE_BYTES) {
+      throw new ProjectWriteError(413, `'${t.rel}' would be larger than ${MAX_FILE_BYTES / (1024 * 1024)} MiB`)
+    }
+    await replaceFile(file, next)
+    return { path: t.rel, size: next.length, hash: hashBytes(next) }
+  })
 }
