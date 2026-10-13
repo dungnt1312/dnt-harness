@@ -116,15 +116,53 @@ export function removeFileTabs(state: FilesState, path: string): FilesState {
   return closeFileTab(next, next.activeFile as string)
 }
 
+const hasDirtyDraft = (state: FilesState): boolean => Object.values(state.drafts).some((draft) => draft.dirty)
+
+/**
+ * Moving from one project to another: the state being left is kept in the
+ * stash only when it holds an unsaved draft (otherwise any older stash of that
+ * project is dropped), and the entered project gets its stash back, else an
+ * empty state. A `null` key (no project) never stashes. `stash` is not mutated.
+ */
+export function switchProject(
+  stash: ReadonlyMap<string, FilesState>,
+  leavingKey: string | null,
+  leaving: FilesState,
+  enteringKey: string | null,
+): { state: FilesState; stash: Map<string, FilesState> } {
+  const next = new Map(stash)
+  if (leavingKey !== null) {
+    if (hasDirtyDraft(leaving)) next.set(leavingKey, leaving)
+    else next.delete(leavingKey)
+  }
+  const restored = enteringKey === null ? undefined : next.get(enteringKey)
+  if (enteringKey !== null) next.delete(enteringKey)
+  return { state: restored ?? EMPTY, stash: next }
+}
+
 /**
  * Transient file-browsing state for one project. Switching the project (or
  * to no project) resets the folder and closes its file tabs, so paths from
- * one root are never read against another.
+ * one root are never read against another. A project left with unsaved
+ * drafts keeps its state aside and gets it back on return.
  */
 export function useWorkbenchFiles(projectKey: string | null): WorkbenchFiles {
   const [state, setState] = useState<FilesState>(EMPTY)
+  const stash = useRef<ReadonlyMap<string, FilesState>>(new Map())
+  const [anyStashed, setAnyStashed] = useState(false)
+  const keyRef = useRef(projectKey)
+  // The confirm dialog must not run inside a state updater (React may call updaters twice).
+  const latest = useRef(state)
+  latest.current = state
 
-  useEffect(() => { setState(EMPTY) }, [projectKey])
+  useEffect(() => {
+    if (keyRef.current === projectKey) return
+    const next = switchProject(stash.current, keyRef.current, latest.current, projectKey)
+    keyRef.current = projectKey
+    stash.current = next.stash
+    setAnyStashed(next.stash.size > 0)
+    setState(next.state)
+  }, [projectKey])
 
   const setFolder = useCallback((folder: string) => setState((current) => ({ ...current, folder })), [])
   const openFile = useCallback((path: string, focus?: FileFocus) => setState((current) => ({
@@ -133,9 +171,6 @@ export function useWorkbenchFiles(projectKey: string | null): WorkbenchFiles {
     activeFile: path,
     focus: focus === undefined ? null : { ...focus, seq: (current.focus?.seq ?? 0) + 1 },
   })), [])
-  // The confirm dialog must not run inside a state updater (React may call updaters twice).
-  const latest = useRef(state)
-  latest.current = state
   const closeFile = useCallback((path: string) => {
     if (closeFileWithDraft(latest.current, path, (message) => window.confirm(message)) === latest.current) return
     setState((current) => closeFileTab(current, path))
@@ -149,7 +184,8 @@ export function useWorkbenchFiles(projectKey: string | null): WorkbenchFiles {
     return { ...current, drafts: { ...current.drafts, [path]: draft } }
   }), [])
   const settleDraft = useCallback((path: string, savedText: string, newHash: string) => setState((current) => settleSavedDraft(current, path, savedText, newHash)), [])
-  const anyDirty = Object.values(state.drafts).some((draft) => draft.dirty)
+  // Only dirty states are stashed, so any stash means unsaved work.
+  const anyDirty = hasDirtyDraft(state) || anyStashed
   useEffect(() => {
     if (!anyDirty) return
     const warn = (event: BeforeUnloadEvent): void => { event.preventDefault(); event.returnValue = '' }
