@@ -6974,8 +6974,9 @@ async function handleApi(
       return
     }
 
-    // ── read-only project browsing (workbench Files) ───────────
-    // Git is read-only status and diff for the workbench Git view.
+    // ── project browsing and explorer writes (workbench Files) ──
+    // Reads serve browsing; POST/PATCH/DELETE on `files` go to
+    // `handleProjectFileWrite`. Git is read-only status and diff for the Git view.
     const wsProjectFilesMatch = /^\/api\/workspaces\/([^/]+)\/projects\/([^/]+)\/(files|file|search|git|media)$/.exec(pathname)
     if (wsProjectFilesMatch !== null) {
       const wsId = decodeURIComponent(wsProjectFilesMatch[1] ?? '') as WorkspaceId

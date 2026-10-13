@@ -842,7 +842,7 @@ graceful close and a second to an immediate exit.
 | `components/session` | project-grouped and time-bucketed conversation list |
 | `components/chat` | `Transcript`, message/tool/delegation rows, thinking, work status, approvals |
 | `components/composer` | `Composer` with attach/mode/thinking/permission chips, `ModelMenu` beside Send, `@`/`/` completion popover, attachment tray, folder picker |
-| `components/workbench` | Files browser/viewer, Git (read-only status and diff), Trajectory (`projectTrajectory`, step slots), Subagents, and the lazily-loaded xterm `TerminalPanel` |
+| `components/workbench` | Files browser/viewer with create/rename/delete, Git (read-only status and diff), Trajectory (`projectTrajectory`, step slots), Subagents, and the lazily-loaded xterm `TerminalPanel` |
 | `components/settings` | Settings dialog and provider editor; one module per workspace panel (Projects, Skills, Memory, Agents, MCP, Hooks, Secrets) built on the shared `settings-kit` |
 | `components/ui` | Tailwind/CVA primitives with Radix interaction mechanics |
 | `components/common` | icons, copy, confirmation, error, spinner, and toast surfaces |
@@ -905,7 +905,9 @@ bottom, a composer section in normal flow below it, and a Workbench whose views
 are Files, Git, Context, Trajectory, Subagents and Terminal. Files is the anchor tab; the
 rest are opened on demand from the nav's `+` picker and closed again from their
 tab, so the strip keeps room for opened file tabs. A stored strip that still names
-the retired Artifacts view drops it on load. Files, Git and Trajectory are read-only
+the retired Artifacts view drops it on load. Files browses and also creates, renames
+and deletes files and folders — a direct user action independent of the session mode;
+delete is permanent after confirmation. Git and Trajectory are read-only
 projections; Git asks the host for `git status` and one file's diff and never stages, commits, or discards; Context is read-only apart from its confirmed Compact. Subagents only
 follows the open conversation's children — delegating is the model's job through
 its `Agent` tool, and roles live in Settings → Agents. It groups them into
