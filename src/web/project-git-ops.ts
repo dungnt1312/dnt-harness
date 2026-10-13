@@ -26,6 +26,7 @@ import {
 } from './project-git.ts'
 import { createBranch, deleteBranch, switchBranch } from './project-git-branches.ts'
 import { restoreHunk, stageHunk, unstageHunk, type GitHunkRef } from './project-git-hunks.ts'
+import { resolveConflict } from './project-git-conflicts.ts'
 
 export type GitOperationRequest =
   | { type: 'stage' | 'unstage' | 'discard' | 'trash'; paths: readonly string[] }
@@ -38,6 +39,8 @@ export type GitOperationRequest =
   | { type: 'create-branch'; name: string; base?: string }
   | { type: 'delete-branch'; name: string; remote: boolean; force: boolean }
   | { type: 'stage-hunk' | 'unstage-hunk' | 'restore-hunk'; path: string; hunk: GitHunkRef }
+  | { type: 'resolve-conflict'; path: string; index: number; fingerprint: string; choice: 'ours' | 'theirs' | 'both' }
+  | { type: 'ignore'; paths: readonly string[] }
 
 export interface GitOperationResult {
   readonly ok: boolean
@@ -492,7 +495,41 @@ async function dispatch(ctx: Context, request: GitOperationRequest, move: (abs: 
       return unstageHunk(ctx, await relativePaths(ctx, [request.path]).then((rels) => rels[0] ?? ''), request.hunk)
     case 'restore-hunk':
       return restoreHunk(ctx, await relativePaths(ctx, [request.path]).then((rels) => rels[0] ?? ''), request.hunk)
+    case 'resolve-conflict': {
+      if (request.choice !== 'ours' && request.choice !== 'theirs' && request.choice !== 'both') {
+        throw new ProjectGitError('choice must be ours, theirs or both')
+      }
+      const rel = (await relativePaths(ctx, [request.path]))[0] ?? ''
+      await resolveConflict(ctx.root, rel, request.index, request.fingerprint, request.choice)
+      return DONE
+    }
+    case 'ignore':
+      return ignore(ctx, request.paths)
   }
+}
+
+// ── .gitignore (Zed git_panel.rs:8384-8420) ────────────────────
+
+/** Append `/<path>` lines for untracked paths to the root `.gitignore`. */
+async function ignore(ctx: Context, requested: readonly string[]): Promise<Step> {
+  const rels = await relativePaths(ctx, requested)
+  const byPath = new Map((await operationChanges(ctx)).map((change) => [change.path, change]))
+  for (const rel of rels) {
+    const entry = byPath.get(rel)
+    if (entry === undefined || !entry.created || entry.indexStatus !== '?') {
+      throw new ProjectGitError(`'${rel}' is not an untracked file`)
+    }
+  }
+  if (rels.length === 0) return DONE
+  const file = path.join(ctx.root, '.gitignore')
+  let current = ''
+  try {
+    current = await fsPromises.readFile(file, 'utf8')
+  } catch { /* absent: created below */ }
+  const addition = `${rels.map((rel) => `/${rel}`).join('\n')}\n`
+  const prefix = current === '' ? '' : current.endsWith('\n') ? current : `${current}\n`
+  await fsPromises.writeFile(file, prefix + addition)
+  return DONE
 }
 
 /** The operations whose Git process may ask for a password, a passphrase or a signing key. */

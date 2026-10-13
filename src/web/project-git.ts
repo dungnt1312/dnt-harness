@@ -17,6 +17,7 @@ import path from 'node:path'
 import { detectLoginShell, loginShellArgs } from '../capabilities/shell/detect.ts'
 import { resolveGrantedPath } from '../capabilities/fs/tools.ts'
 import { hunksFor } from './project-git-hunks.ts'
+import { parseConflicts, type GitConflict } from './project-git-conflicts.ts'
 
 /** One changed path, in the shape the Git view lists. */
 export interface GitChange {
@@ -85,6 +86,10 @@ export interface GitStatusReport {
   readonly ahead?: number
   /** Commits behind the upstream, when the branch tracks one (compatibility with the Environment panel). */
   readonly behind?: number
+  /** A merge/cherry-pick/rebase/revert/apply is in progress (any `*_HEAD` file resolves). */
+  readonly mergeHeads?: boolean
+  /** `MERGE_MSG` (comment lines stripped) while a merge message exists. */
+  readonly mergeMessage?: string
 }
 
 /** Ahead/behind from a `git status -b` header; absent when there is no upstream. */
@@ -113,6 +118,8 @@ export interface GitDiffReport {
   readonly binary: boolean
   /** The displayed hunks with their staging status; empty when hunk controls are not offered. */
   readonly hunks?: readonly import('./project-git-hunks.ts').GitHunk[]
+  /** Conflict blocks of a conflicted file; always present (empty) for a clean shape. */
+  readonly conflicts?: readonly GitConflict[]
 }
 
 export class ProjectGitError extends Error {}
@@ -544,6 +551,7 @@ export async function gitStatus(root: string, deniedRoots?: readonly string[], t
   const branchInfo = name === '' ? null : await branchReport(root, trusted, name)
   const head = await headReport(root, trusted)
   const counted = await lineCounts(root, trusted)
+  const merge = await mergeState(root, trusted)
   const track = branchInfo?.upstreamTrack
   return {
     branch: branchInfo?.name ?? null,
@@ -551,11 +559,39 @@ export async function gitStatus(root: string, deniedRoots?: readonly string[], t
     head,
     truncated,
     ...(track?.kind === 'tracked' ? { ahead: track.ahead, behind: track.behind } : {}),
+    ...(merge.heads ? { mergeHeads: true } : { mergeHeads: false }),
+    ...(merge.message !== undefined ? { mergeMessage: merge.message } : {}),
     changes: changes.map((change) => {
       const count = counted.get(change.path)
       return count === undefined ? change : { ...change, ...count }
     }),
   }
+}
+
+/** The `*_HEAD` sentinel files and `MERGE_MSG` of an in-progress sequence, in one git call. */
+async function mergeState(root: string, trusted: boolean): Promise<{ heads: boolean; message?: string }> {
+  const names = ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REBASE_HEAD', 'REVERT_HEAD', 'APPLY_HEAD', 'MERGE_MSG']
+  const { stdout, code } = await runGitQuery(root, ['rev-parse', ...names.flatMap((name) => ['--git-path', name])], trusted)
+  if (code !== 0) return { heads: false }
+  const paths = stdout.toString('utf8').split('\n').filter((line) => line !== '')
+  let heads = false
+  for (const gitPath of paths.slice(0, 5)) {
+    try {
+      await fs.access(path.resolve(root, gitPath))
+      heads = true
+      break
+    } catch { /* not present */ }
+  }
+  let message: string | undefined
+  const mergeMsg = paths[5]
+  if (mergeMsg !== undefined) {
+    try {
+      const raw = await fs.readFile(path.resolve(root, mergeMsg), 'utf8')
+      const stripped = raw.split('\n').filter((line) => !line.startsWith('#')).join('\n').replace(/\s+$/, '')
+      if (stripped !== '') message = stripped
+    } catch { /* no merge message */ }
+  }
+  return { heads, ...(message !== undefined ? { message } : {}) }
 }
 
 /**
@@ -618,12 +654,18 @@ export async function gitDiff(root: string, rawPath: string, deniedRoots?: reado
   if (truncated) text = text.slice(0, MAX_DIFF_BYTES)
   const binary = text.includes('Binary files ') || text.includes('GIT binary patch')
   if (binary || truncated) return { path: rel, lines: binary ? [] : parseDiff(text), truncated, binary, hunks: [] }
-  // Hunk controls need the file's status entry (conflicted files show
-  // conflict blocks instead) and the zero-context staged/unstaged diffs.
-  const conflicted = (await readStatusChanges(root, deniedRoots, trusted))?.changes
-    .some((change) => change.path === rel && change.conflicted) ?? false
+  // A conflicted file shows its conflict blocks instead of hunks: the markers
+  // live in the worktree file, not in any git diff of it.
+  const change = (await readStatusChanges(root, deniedRoots, trusted))?.changes.find((entry) => entry.path === rel)
+  if (change?.conflicted === true) {
+    let conflicts: GitConflict[] = []
+    try {
+      conflicts = parseConflicts(await fs.readFile(path.join(root, rel), 'utf8'))
+    } catch { /* unreadable: no blocks */ }
+    return { path: rel, lines: parseDiff(text), truncated, binary, hunks: [], conflicts }
+  }
   const hunks = await hunksFor(root, rel, trusted, text,
-    (args) => runGitQuery(root, args, trusted), hasHead, conflicted)
+    (args) => runGitQuery(root, args, trusted), hasHead, false)
   return { path: rel, lines: parseDiff(text), truncated, binary, hunks }
 }
 
