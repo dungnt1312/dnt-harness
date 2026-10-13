@@ -83,7 +83,7 @@ export function FilesWorkspace({ workspaceId, project, files, treeVisible, treeF
         <span aria-hidden="true" className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-line group-focus-visible:bg-link" />
       </div>
       <div ref={treeRef} className={cn('min-h-0 min-w-0 shrink-0 flex-col', treeVisible ? 'flex' : 'hidden')} style={{ width: `${treeFraction * 100}%` }}>
-        <FileBrowser key={project.id} workspaceId={workspaceId} project={project} activeFile={files.activeFile} onOpenFile={files.openFile} />
+        <FileBrowser key={project.id} workspaceId={workspaceId} project={project} activeFile={files.activeFile} onOpenFile={files.openFile} onRenamed={files.renamePath} onRemoved={files.removePath} />
       </div>
     </div>
   )
