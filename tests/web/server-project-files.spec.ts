@@ -413,7 +413,7 @@ describe('saving a file from the viewer', () => {
 
   it('accepts a body above the general JSON limit for a large file', async () => {
     const hash = (await read('note.md')).hash
-    const content = `${'"\\'.repeat(200_000)}\n`
+    const content = `${'"\\'.repeat(300_000)}\n`
     const response = await put({ path: 'note.md', content, expectedHash: hash })
     expect(response.status).toBe(200)
     expect((await fs.readFile(path.join(saveRoot, 'note.md'), 'utf8')).length).toBe(content.length)
