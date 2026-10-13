@@ -210,6 +210,29 @@ export async function deleteProjectEntry(root: string, rawPath: string, deniedRo
 }
 
 /**
+ * Resolve `rel` to the file a save would write: granted-path rules, then the
+ * canonical path, then the `.git` and protected-storage checks on that real path
+ * (a link inside the project may point into either). Run before taking the file
+ * lock, to pick its key, and again inside it.
+ */
+async function resolveSaveTarget(root: string, rel: string, deniedRoots: readonly string[] | undefined): Promise<{ resolved: string; file: string }> {
+  let resolved: string
+  try {
+    resolved = await resolveGrantedPath(root, rel, deniedRoots)
+  } catch (error) {
+    refuse(error instanceof Error ? error.message : String(error))
+  }
+  const file = await canonical(resolved).catch((error: unknown) => {
+    if (codeOf(error) === 'ENOENT') throw new ProjectWriteError(404, `'${rel}' does not exist`)
+    throw error
+  })
+  const rootReal = await fs.realpath(root).catch(() => root)
+  if (path.relative(rootReal, file).split(path.sep).some(isGitName)) refuse("'.git' is protected")
+  if ((await protection(root, file, deniedRoots)).inside) refuse(`path '${rel}' is inside protected storage`)
+  return { resolved, file }
+}
+
+/**
  * Save the viewer's edited text over an existing project file. Refuses when
  * the stored bytes no longer hash to `expectedHash` (409, with the current
  * hash), so a change the agent or another tab made is never overwritten
@@ -224,25 +247,23 @@ export async function saveProjectFile(
   deniedRoots?: readonly string[],
 ): Promise<{ path: string; size: number; hash: string }> {
   const t = await target(root, rawPath, deniedRoots)
-  let resolved: string
-  try {
-    resolved = await resolveGrantedPath(root, t.rel, deniedRoots)
-  } catch (error) {
-    refuse(error instanceof Error ? error.message : String(error))
-  }
+  const { resolved, file } = await resolveSaveTarget(root, t.rel, deniedRoots)
   const stat = await fs.stat(resolved).catch(() => null)
   if (stat === null) throw new ProjectWriteError(404, `'${t.rel}' does not exist`)
   if (!stat.isFile()) refuse(`'${t.rel}' is not a file`)
-  const file = await canonical(resolved)
-  // A link inside the project may point into `.git` or protected storage.
-  const rootReal = await fs.realpath(root).catch(() => root)
-  const relReal = path.relative(rootReal, file).split(path.sep)
-  if (relReal.some(isGitName)) refuse("'.git' is protected")
-  if ((await protection(root, file, deniedRoots)).inside) refuse(`path '${t.rel}' is inside protected storage`)
   return withFileLock(file, undefined, async () => {
-    const bytes = await fs.readFile(file)
+    // Revalidate containment after waiting: a folder or link swapped while this
+    // save was queued must not redirect the write (as the agent's Write/Edit do).
+    const now = await resolveSaveTarget(root, t.rel, deniedRoots)
+    if (fold(now.file) !== fold(file)) {
+      throw new ProjectWriteError(409, `'${t.rel}' moved while the save was waiting; reload and try again`)
+    }
+    const bytes = await fs.readFile(file).catch((error: unknown) => {
+      if (codeOf(error) === 'ENOENT') throw new ProjectWriteError(404, `'${t.rel}' does not exist`)
+      throw error
+    })
     const current = hashBytes(bytes)
-    if (current !== expectedHash) {
+    if (current !== expectedHash.toLowerCase()) {
       throw new ProjectWriteError(409, `'${t.rel}' changed on disk since it was opened`, current)
     }
     let doc

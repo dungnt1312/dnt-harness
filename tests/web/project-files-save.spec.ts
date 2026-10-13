@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { withFileLock } from '../../src/capabilities/fs/observation.ts'
 import { ProjectWriteError, saveProjectFile } from '../../src/web/project-files-write.ts'
 import { MAX_FILE_BYTES } from '../../src/web/project-files.ts'
 
@@ -114,6 +115,45 @@ describe('saveProjectFile', () => {
   it('refuses protected storage', async () => {
     const denied = [path.join(root, 'src')]
     expect((await failure(saveProjectFile(root, 'src/a.ts', 'x', await hashOf('src/a.ts'), denied))).status).toBe(400)
+  })
+
+  it('refuses when a parent folder is swapped for a link out of the project while the save waits on the lock', async () => {
+    const original = 'export const a = 1\n'
+    await fs.writeFile(path.join(outside, 'a.ts'), original)
+    const expected = await hashOf('src/a.ts')
+    const key = await fs.realpath(path.join(root, 'src', 'a.ts'))
+    let saving: Promise<unknown> = Promise.resolve()
+    await withFileLock(key, undefined, async () => {
+      saving = saveProjectFile(root, 'src/a.ts', 'pwned\n', expected).then(() => undefined, (error: unknown) => error)
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      await fs.rename(path.join(root, 'src'), path.join(root, 'src-old'))
+      await fs.symlink(outside, path.join(root, 'src'))
+    })
+    const error = await saving
+    expect(error).toBeInstanceOf(ProjectWriteError)
+    expect([400, 409]).toContain((error as ProjectWriteError).status)
+    expect(await fs.readFile(path.join(outside, 'a.ts'), 'utf8')).toBe(original)
+    expect(await fs.readFile(path.join(root, 'src-old', 'a.ts'), 'utf8')).toBe(original)
+  })
+
+  it('answers 404 when the file is deleted while the save waits on the lock', async () => {
+    const expected = await hashOf('src/a.ts')
+    const key = await fs.realpath(path.join(root, 'src', 'a.ts'))
+    let saving: Promise<unknown> = Promise.resolve()
+    await withFileLock(key, undefined, async () => {
+      saving = saveProjectFile(root, 'src/a.ts', 'x\n', expected).then(() => undefined, (error: unknown) => error)
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      await fs.rm(path.join(root, 'src', 'a.ts'))
+    })
+    const error = await saving
+    expect(error).toBeInstanceOf(ProjectWriteError)
+    expect((error as ProjectWriteError).status).toBe(404)
+  })
+
+  it('accepts an uppercase expected hash', async () => {
+    const result = await saveProjectFile(root, 'src/a.ts', 'upper\n', (await hashOf('src/a.ts')).toUpperCase())
+    expect(result.path).toBe('src/a.ts')
+    expect(await fs.readFile(path.join(root, 'src', 'a.ts'), 'utf8')).toBe('upper\n')
   })
 
   it('leaves no temporary file behind', async () => {
