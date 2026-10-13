@@ -1,6 +1,8 @@
 # File tools upgrade: dedupe, pagination, ApplyPatch, spill, images
 
-Date: 2026-10-13. Status: draft for review.
+Date: 2026-10-13. Status: draft for review, revised against `main` @ `ab454a9`
+(Autonomous mode, `readOnlyBash`/`riskyBash` mode properties, `finish: length`
+recovery, explorer write API).
 Source: comparison with ZCode v3.15.1 (`zai-org/ZCode` @ `aac4755`,
 `apps/zcode-cli/packages/core/src/tool/handlers/`).
 
@@ -42,6 +44,9 @@ contracts.
 - Read-only tools stay `readOnly: true`, so they keep running concurrently.
 - Tool failures still surface as a failed `ToolResult`, never an exception into
   the agent loop.
+- The web host (`src/web/server.ts` `hostAuthority`) and the headless bin
+  (`src/bins/headless.ts` `authorityResolver`/`forceAsk`) apply the same mode
+  rules; every new rule below lands in both.
 
 ---
 
@@ -67,6 +72,10 @@ Subagents in long runs do this often.
 - The record lives in memory only. A host restart forgets it, so the next
   Read returns full content.
 - `exec.toolCallId` supplies `callId`. With no call id, no record is stored.
+- Changes made outside the tools (Bash, the user's editor, the Files explorer's
+  create/rename/delete in `src/web/project-files-write.ts`) need no hook: a
+  changed file no longer matches the recorded hash, and a renamed file is a new
+  canonical path with no record.
 
 **Context builder.** `microcompactToolResults` (`src/harness/context/builder.ts`)
 must not clear a `Read` result that a later stub in the same request
@@ -256,21 +265,45 @@ tools must learn it:
 | `server.ts` `writesHookConfig` | true when any patch path is a hook config path |
 | `server.ts` memory auto-allow (`memoryWrite`) | stays Write/Edit only; an ApplyPatch into memory still asks |
 | `web/execution-authority.ts` `MUTATING_BUILTINS` | add `ApplyPatch` |
-| `modes/bundled.ts`, `modes/known-tools.ts` | expose wherever `Edit` is exposed |
-| `agents/definition-service.ts` | add to `READ_ONLY_DISALLOWED` and the read-only role's `disallowedTools`; add to the full built-in role tools |
+| `modes/bundled.ts` | add `ApplyPatch` to `WORKSPACE_TOOLS` (shared by Ask before changes, Edit automatically, Autonomous, Full access); never to Plan. `permissionDefaults` mirror `Edit`: `ask` in Ask before changes, `allow` in Edit automatically, Autonomous and Full access |
+| `modes/known-tools.ts` | add `ApplyPatch` |
+| `agents/definition-service.ts` | add to `READ_ONLY_DISALLOWED` (explorer, reviewer) and to the verifier's `disallowedTools`; add to the worker's `tools` |
+| `agents/compatibility/claude.ts` | add to the Claude general-purpose tool list beside `Edit` |
 | `agents/executor.ts` `filesTouched` | collect every patch path |
 | `context/builder.ts` `FILE_TOOLS`, `COMPACTABLE_TOOLS` | add `ApplyPatch` |
 | `mcp/config.ts` reserved names | add `ApplyPatch` |
 | writer lease (`server.ts`) | lease the project folder of every target |
 | `web/lib/turn-changes.ts`, tool card | show per-file changes from the parsed patch |
 
-Approval uses the normal per-tool policy (`ApplyPatch` defaults like `Edit`).
+Approval uses the normal per-tool policy (`ApplyPatch` defaults like `Edit`),
+plus one rule for deletions:
+
+- **Patch deletions.** A patch with a `Delete File` section or a `Move to`
+  (which removes its source) adds an ask requirement of a new kind
+  `patch-delete` (`AskRequirement.kind` in `src/harness/tools/authority.ts`)
+  unless the executing mode's resolved `Bash` permission is `allow`. The rule
+  follows the mode's existing stance on deletions: Edit automatically ("shell
+  commands … and deletions still require approval") asks, Autonomous and Full
+  access do not, Ask before changes already asks for every patch. It is a
+  property of the policy, not a mode-id check, so custom modes follow it.
+  `--yolo` maps it away like other mode asks. The approval card says
+  `Patch deletes or renames: <paths>`.
+- **Autonomous `riskyBash`** stays Bash-only. Patch deletions name each file
+  explicitly, which is the opposite of the unanalyzable bulk deletes
+  `riskyBash` targets.
+- **Output limit.** A model reply cut off at its output-token limit drops its
+  tool calls unrun (`finish: length` recovery in `agent.ts`). The tool
+  description therefore tells the model to keep one patch moderate and to
+  split a large change into several calls, as the `Write` description does for
+  long files.
 
 **Tests.** Parser cases and errors; multi-file success; a failing hunk leaves
 every file unchanged; rollback after an injected write failure; unobserved
 update refused; Add over an existing file refused; move; delete; out-of-grant
 single path asks, two paths denied; hook-config path detected; child read-only
-role cannot call it; turn-changes card renders it.
+role cannot call it; turn-changes card renders it; a delete asks in Edit
+automatically and runs in Autonomous, in both the web host and the headless
+bin; Plan does not expose the tool.
 
 ## 8. Read: images
 
@@ -282,7 +315,9 @@ role cannot call it; turn-changes card renders it.
 - The image is stored through a host callback `ToolExecution.storeImage?(bytes, name, mediaType) → AttachmentRef`
   that the web host wires to `AttachmentStore.put`. It reuses the sha256 id
   and the existing size limit. Without the callback, or over the limit, `Read`
-  fails with a message naming the limit.
+  fails with a message naming the limit. The headless bin has no attachment
+  store today, so it does not wire the callback and image reads fail there
+  with that message.
 - **Result shape.** `ToolDefinition.execute` may return
   `string | { text: string; attachments?: AttachmentRef[] }`. `ToolResult` and
   the `tool/result` session event gain `attachments?: AttachmentRef[]`. Text
