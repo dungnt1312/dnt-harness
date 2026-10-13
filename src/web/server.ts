@@ -8096,6 +8096,9 @@ async function handleProjectGitAction(
     if (!started && !res.headersSent) {
       if (error instanceof ProjectGitError) json(400, { error: message })
       else throw error
+    } else if (GIT_STREAMS.has(action)) {
+      // A model stream has no repository status to offer: its client reads `error`.
+      frame({ type: 'done', ok: false, error: message })
     } else {
       // Git may have changed the repository before failing: offer the current
       // status when it can be read, otherwise leave it out.

@@ -186,6 +186,35 @@ describe('commit-message', () => {
     expect(answer.frames.at(-1)).toMatchObject({ type: 'done', ok: true })
   })
 
+  it('a provider failure mid-stream ends with done { ok: false, error } the client can show', async () => {
+    const failing: LlmProvider = {
+      name: 'fake',
+      models: ['m'],
+      stream: async function* (): AsyncGenerator<StreamEvent> {
+        yield { type: 'delta', delta: 'Add' }
+        throw new Error('upstream exploded')
+      },
+    }
+    const home = path.join(scratch, `home-fail-${++counter}`)
+    await fs.mkdir(home)
+    await fs.writeFile(path.join(home, 'commit-message.json'), JSON.stringify({ provider: 'fake', model: 'm' }))
+    server = await createWebServer({ home, configFile: path.join(home, 'providers.json'), controlPlaneAuth: true, providers: [failing] })
+    const browser = await pairBrowser(server)
+    const wsId = ((await (await fetch(`${server.url}/api/workspaces`, { headers: browser })).json()) as { id: string }[])[0]!.id
+    const root = await makeRepo()
+    const created = await raw('POST', `${server.url}/api/workspaces/${wsId}/projects`, { name: 'Git', path: root }, browser)
+    const projectId = (JSON.parse(created.body) as { id: string }).id
+    const answer = await post(`${server.url}/api/workspaces/${wsId}/projects/${projectId}/git/commit-message`, {}, browser)
+    expect(answer.status).toBe(200)
+    expect(answer.frames.map((frame) => frame['type'])).toEqual(['start', 'delta', 'done'])
+    const done = answer.frames.at(-1)!
+    expect(done['ok']).toBe(false)
+    // The LLM layer words the failure (it normalises transport errors); the
+    // point is that `error` is a real string, not undefined.
+    expect(typeof done['error']).toBe('string')
+    expect(String(done['error']).length).toBeGreaterThan(0)
+  })
+
   it('refuses a bearer-token caller', async () => {
     const home = path.join(scratch, `home-auth-${++counter}`)
     await fs.mkdir(home)
