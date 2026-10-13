@@ -5,7 +5,7 @@ import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import { Modal } from '../ui/Modal.tsx'
-import type { GitChange, GitOperationDone, GitStatusReport } from '../../lib/api.ts'
+import type { GitChange, GitOperationDone, GitOperationInput, GitStatusReport } from '../../lib/api.ts'
 import { changeCounts, commitButton, commitButtonTitle } from './git-panel-model.ts'
 import type { GitRun } from './use-git-operation.tsx'
 
@@ -30,12 +30,14 @@ const remoteRefName = (ref: string): string => ref.replace(/^refs\/remotes\//, '
  * `uncommit` and `set_amend_pending`. State lives here, so the owner mounts one
  * per project (`key`). `onDone` receives each mutating operation's answer.
  */
-export function GitCommitArea({ projectId, report, changes, run, onDone }: {
+export function GitCommitArea({ projectId, report, changes, run, enqueue, onDone }: {
   readonly projectId: string
   readonly report: GitStatusReport
   /** The changes as the reader sees them (a queued staging click already applied). */
   readonly changes: readonly GitChange[]
   readonly run: GitRun
+  /** The panel's queue: a commit or uncommit runs after the stage, discard and trash clicks before it. */
+  readonly enqueue: (task: () => Promise<void>) => void
   readonly onDone: (done: GitOperationDone | undefined) => void
 }) {
   const [text, setText] = useState('')
@@ -98,18 +100,28 @@ export function GitCommitArea({ projectId, report, changes, run, onDone }: {
       setNotice('No changes to commit')
       return
     }
+    // Everything the commit needs is read now: the click's view (a queued staging click already applied).
     const amending = amend
+    const input: GitOperationInput = { type: 'commit', message: text, amend: amending, signoff, noVerify: skipHooks, tracked: !counts.hasStaged }
+    // Busy from the click: Amend and Cancel stay off until the answer, so a draft restored meanwhile cannot be wiped.
     setBusy(true)
-    const done = await run({ type: 'commit', message: text, amend: amending, signoff, noVerify: skipHooks, tracked: !counts.hasStaged })
-    setBusy(false)
-    onDone(done)
-    if (done?.ok !== true) return
-    setSkipHooks(false)
-    if (amending) setAmendPending(false)
-    else {
-      setText('')
-      original.current = null
-    }
+    // Behind the panel's pending stage, discard and trash clicks, in click order.
+    enqueue(async () => {
+      let done: GitOperationDone | undefined
+      try {
+        done = await run(input)
+      } finally {
+        setBusy(false)
+      }
+      onDone(done)
+      if (done?.ok !== true) return
+      setSkipHooks(false)
+      if (amending) setAmendPending(false)
+      else {
+        setText('')
+        original.current = null
+      }
+    })
   }
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>): void => {
@@ -120,32 +132,48 @@ export function GitCommitArea({ projectId, report, changes, run, onDone }: {
   }
 
   const performUncommit = async (prior: string): Promise<void> => {
-    const done = await run({ type: 'uncommit' })
-    setBusy(false)
+    let done: GitOperationDone | undefined
+    try {
+      done = await run({ type: 'uncommit' })
+    } finally {
+      setBusy(false)
+    }
     onDone(done)
     if (done?.ok === true) setText(prior)
   }
 
-  /** Zed `uncommit`, with `check_for_pushed_commits` asking first when the commit left this machine. */
-  const uncommit = async (): Promise<void> => {
+  /**
+   * Zed `uncommit`, with `check_for_pushed_commits` asking first when the commit left this machine.
+   * Both the query and the uncommit wait their turn in the panel's queue; the dialog does not hold it.
+   */
+  const uncommit = (): void => {
     if (busy || head === null) return
     const prior = head.message || head.subject
     setBusy(true)
-    const found = await run({ type: 'pushed-to' })
-    if (found?.ok !== true) {
-      setBusy(false)
-      return
-    }
-    const refs = (found.pushedTo ?? []).map(remoteRefName)
-    if (refs.length > 0) setPushed({ refs, prior })
-    else await performUncommit(prior)
+    enqueue(async () => {
+      let found: GitOperationDone | undefined
+      try {
+        found = await run({ type: 'pushed-to' })
+      } catch (cause) {
+        setBusy(false)
+        throw cause
+      }
+      if (found?.ok !== true) {
+        setBusy(false)
+        return
+      }
+      const refs = (found.pushedTo ?? []).map(remoteRefName)
+      if (refs.length > 0) setPushed({ refs, prior })
+      else await performUncommit(prior)
+    })
   }
 
-  const toggleItem = (name: string, checked: boolean, onSelect: () => void, close: () => void, hint?: string) => (
+  const toggleItem = (name: string, checked: boolean, onSelect: () => void, close: () => void, hint?: string, disabled = false) => (
     <button
       type="button"
       role="menuitemcheckbox"
       aria-checked={checked}
+      disabled={disabled}
       className={menuItemClass}
       {...(hint !== undefined ? { title: hint } : {})}
       onClick={() => { close(); onSelect() }}
@@ -160,7 +188,7 @@ export function GitCommitArea({ projectId, report, changes, run, onDone }: {
       {amend ? (
         <div className="flex items-center justify-between gap-1.5 border-b border-line px-2 py-1.5">
           <span className="min-w-0 truncate text-xs text-fg-muted">This will update your most recent commit.</span>
-          <Button size="sm" variant="outline" className="h-7 px-2.5" onClick={() => setAmendPending(false)}>Cancel</Button>
+          <Button size="sm" variant="outline" className="h-7 px-2.5" disabled={busy} onClick={() => setAmendPending(false)}>Cancel</Button>
         </div>
       ) : null}
       <div className="p-2 pb-1.5">
@@ -197,7 +225,7 @@ export function GitCommitArea({ projectId, report, changes, run, onDone }: {
         >
           {(close) => (
             <>
-              {head !== null ? toggleItem('Amend', amend, toggleAmend, close) : null}
+              {head !== null ? toggleItem('Amend', amend, toggleAmend, close, undefined, busy) : null}
               {toggleItem('Signoff', signoff, toggleSignoff, close)}
               {toggleItem('Skip Hooks', skipHooks, () => setSkipHooks((value) => !value), close, 'git commit --no-verify')}
             </>
@@ -229,7 +257,7 @@ export function GitCommitArea({ projectId, report, changes, run, onDone }: {
         onConfirm={() => {
           const prior = pushed?.prior ?? ''
           setPushed(null)
-          void performUncommit(prior)
+          enqueue(() => performUncommit(prior))
         }}
       />
     </div>

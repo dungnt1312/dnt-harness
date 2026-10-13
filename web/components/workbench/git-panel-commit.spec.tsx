@@ -194,7 +194,78 @@ describe('commit button', () => {
   })
 })
 
+const gate = () => {
+  let release!: () => void
+  const opened = new Promise<void>((resolve) => { release = resolve })
+  return { opened, release }
+}
+
+describe('commit and the operation queue', () => {
+  const SECOND: GitChange = { ...raw, path: 'src/b.ts', status: 'modified' }
+
+  it('runs a commit after the stage clicks before it resolve, and counts them as staged', async () => {
+    current = report([UNSTAGED, SECOND])
+    await mount()
+    await type('queued')
+    const gates = [gate(), gate()]
+    let stages = 0
+    gitOperation.mockImplementation(async (_ws, _project, input) => {
+      if (input.type === 'stage') await gates[stages++]!.opened
+      return defaultOp(input)
+    })
+    await click(document.querySelector('button[role="checkbox"][aria-label="Stage src/a.ts"]')!)
+    await click(document.querySelector('button[role="checkbox"][aria-label="Stage src/b.ts"]')!)
+    expect(sent('stage')).toHaveLength(1)
+    await press({ key: 'Enter', metaKey: true })
+    expect(sent('commit')).toHaveLength(0)
+    await act(async () => { gates[0]!.release() })
+    await flush()
+    expect(sent('stage')).toHaveLength(2)
+    expect(sent('commit')).toHaveLength(0)
+    await act(async () => { gates[1]!.release() })
+    await act(async () => { await vi.waitFor(() => expect(sent('commit')).toHaveLength(1)) })
+    expect(gitOperation.mock.calls.map((call) => call[2].type).filter((kind) => kind === 'stage' || kind === 'commit')).toEqual(['stage', 'stage', 'commit'])
+    expect(sent('commit')[0]).toMatchObject({ tracked: false, message: 'queued' })
+  })
+
+  it('queues the uncommit and its pushed-to query behind a pending stage', async () => {
+    current = report([UNSTAGED])
+    await mount()
+    const stageGate = gate()
+    gitOperation.mockImplementation(async (_ws, _project, input) => {
+      if (input.type === 'stage') await stageGate.opened
+      return defaultOp(input)
+    })
+    await click(document.querySelector('button[role="checkbox"][aria-label="Stage src/a.ts"]')!)
+    await click(document.querySelector('button[aria-label="Uncommit"]')!)
+    expect(sent('pushed-to')).toHaveLength(0)
+    await act(async () => { stageGate.release() })
+    await act(async () => { await vi.waitFor(() => expect(sent('uncommit')).toHaveLength(1)) })
+    expect(gitOperation.mock.calls.map((call) => call[2].type)).toEqual(['stage', 'pushed-to', 'uncommit'])
+  })
+})
+
 describe('commit menu', () => {
+  it('does not wipe a draft restored during an amend: Cancel and Amend wait for the answer', async () => {
+    await mount()
+    await type('draft')
+    await openMenu('Commit options')
+    await click(menuItem('Amend'))
+    const answer = gate()
+    gitOperation.mockImplementationOnce(async () => { await answer.opened; return done() })
+    await click(commitButton('Amend'))
+    expect(button('Cancel').disabled).toBe(true)
+    await click(button('Cancel'))
+    expect(textarea().value).toBe('init\n\nbody line')
+    await openMenu('Commit options')
+    expect(menuItem('Amend').disabled).toBe(true)
+    await click(menuItem('Amend'))
+    expect(textarea().value).toBe('init\n\nbody line')
+    await act(async () => { answer.release() })
+    await act(async () => { await vi.waitFor(() => expect(document.body.textContent).not.toContain('This will update your most recent commit.')) })
+    expect(textarea().value).toBe('draft')
+  })
+
   it('offers Amend only when there is a commit to amend', async () => {
     await mount()
     await openMenu('Commit options')
