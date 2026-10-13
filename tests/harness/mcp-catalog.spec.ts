@@ -81,7 +81,7 @@ describe('MCP catalog data', () => {
 
   it('covers every category and the OAuth servers the host can connect to', () => {
     for (const category of CATALOG_CATEGORIES) expect(MCP_CATALOG.some((entry) => entry.category === category.id), category.id).toBe(true)
-    expect(MCP_CATALOG.filter((entry) => catalogAuth(entry) === 'oauth').map((entry) => entry.id).sort()).toEqual(['atlassian', 'linear', 'notion', 'sentry'])
+    expect(MCP_CATALOG.filter((entry) => catalogAuth(entry) === 'oauth').map((entry) => entry.id).sort()).toEqual(['atlassian', 'clickup', 'linear', 'notion', 'sentry'])
   })
 })
 

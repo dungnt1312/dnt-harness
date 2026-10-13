@@ -222,6 +222,18 @@ export const MCP_CATALOG: readonly CatalogEntry[] = [
     docsUrl: 'https://linear.app/docs/mcp',
   },
   {
+    id: 'clickup',
+    title: 'ClickUp',
+    category: 'productivity',
+    description: 'Search, create, and update ClickUp tasks, docs, and chat messages.',
+    maintainer: 'official',
+    config: oauthConfig('https://mcp.clickup.com/mcp'),
+    secrets: [],
+    placeholders: [],
+    requires: [],
+    docsUrl: 'https://developer.clickup.com/docs/connect-an-ai-assistant-to-clickups-mcp-server',
+  },
+  {
     id: 'atlassian',
     title: 'Atlassian (Jira & Confluence)',
     category: 'productivity',
