@@ -77,6 +77,7 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRe
   }
 
   const startCreate = (kind: 'file' | 'dir'): void => {
+    search.setQuery('') // the draft lives in the tree, which is hidden while searching
     const folder = targetFolder(selected)
     const chain = ancestorsOf(folder)
     if (chain.length > 0) setOpen((current) => new Set([...current, ...chain]))

@@ -251,4 +251,18 @@ describe('explorer search', () => {
     await settle()
     expect(searchProjectFiles).not.toHaveBeenCalled()
   })
+
+  it('leaves search mode when New file is clicked, so the focused draft is visible', async () => {
+    searchProjectFiles.mockResolvedValueOnce({ query: 'ind', truncated: false, matches: [{ name: 'index.ts', path: 'src/index.ts', score: 3 }] } as never)
+    await mount()
+    await typeInto(search(), 'ind')
+    await settle()
+    expect(host.querySelector('[aria-label="Search results"]')).not.toBeNull()
+    await click(byLabel('New file'))
+    expect(search().value).toBe('')
+    expect(host.querySelector('[aria-label="Search results"]')).toBeNull()
+    const input = byLabel('New file name')
+    expect(input).toBeTruthy()
+    expect(document.activeElement).toBe(input)
+  })
 })
