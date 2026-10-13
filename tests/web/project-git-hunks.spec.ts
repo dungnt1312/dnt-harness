@@ -307,7 +307,7 @@ describe('hunk operations', () => {
     expect(repo.git('ls-files', '-s', 'run.sh')).toMatch(/^100755 /)
     await repo.write('run.sh', lines(30).replace('l3\n', 'L3\n'))
     const before = await gitDiff(repo.dir, 'run.sh', undefined, true)
-    expect((await operate(repo, { type: 'stage-hunk', path: 'run.sh', hunk: before.hunks[0]! })).ok).toBe(true)
+    expect((await operate(repo, { type: 'stage-hunk', path: 'run.sh', hunk: before.hunks?.[0]! })).ok).toBe(true)
     expect(repo.git('ls-files', '-s', 'run.sh')).toMatch(/^100755 /)
     expect(repo.git('show', ':run.sh')).toBe(lines(30).replace('l3\n', 'L3\n'))
   })
