@@ -179,3 +179,35 @@ describe('the tree view', () => {
     expect(document.querySelector('[data-row-path="src/a.ts"]')).not.toBeNull()
   })
 })
+
+describe('conflicts marked as resolved (Zed git_panel.rs:5947-5965, 8212-8286)', () => {
+  const CONFLICT: GitChange = { ...raw, path: 'src/merge.ts', status: 'conflict', indexStatus: 'U', worktreeStatus: 'U', conflicted: true }
+  const RESOLVED: GitChange = { ...CONFLICT, path: 'src/done.ts', staging: 'staged' }
+  const checkbox = (label: string): HTMLButtonElement | null => document.querySelector<HTMLButtonElement>(`button[role="checkbox"][aria-label="${label}"]`)
+
+  it('an unresolved conflict row stages normally', async () => {
+    fetchGitStatus.mockImplementation(async () => status([CONFLICT]))
+    await mount()
+    const box = checkbox('Stage src/merge.ts')
+    expect(box).not.toBeNull()
+    expect(box!.disabled).toBe(false)
+  })
+
+  it('a staged (resolved) conflict row has its checkbox disabled and says why', async () => {
+    fetchGitStatus.mockImplementation(async () => status([CONFLICT, RESOLVED]))
+    await mount()
+    const box = checkbox('Unstage src/done.ts')
+    expect(box).not.toBeNull()
+    expect(box!.disabled).toBe(true)
+    expect(box!.title).toBe('Conflicts marked as resolved')
+  })
+
+  it('the Conflicts header reads "All conflicts marked as resolved" once every conflict is staged, and is disabled', async () => {
+    fetchGitStatus.mockImplementation(async () => status([RESOLVED]))
+    await mount()
+    const header = document.querySelector<HTMLButtonElement>('section[aria-label="Conflicts"] button[role="checkbox"]')
+    expect(header).not.toBeNull()
+    expect(header!.disabled).toBe(true)
+    expect(header!.title).toBe('All conflicts marked as resolved')
+  })
+})

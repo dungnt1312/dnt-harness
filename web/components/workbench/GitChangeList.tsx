@@ -180,7 +180,12 @@ function Section({ group, onStage, children }: {
       <div className="flex h-8 items-center gap-1.5 pl-2 text-[11px] font-medium uppercase tracking-wide text-fg-faint">
         <span className="min-w-0 flex-1 truncate">{group.title}</span>
         <span className="font-mono normal-case tabular-nums">{group.entries.length}</span>
-        <StageCheckbox state={state} label={`${state === 'selected' ? 'Unstage' : 'Stage'} all ${group.title.toLowerCase()}`} onToggle={toggle} />
+        <StageCheckbox
+          state={state}
+          label={`${state === 'selected' ? 'Unstage' : 'Stage'} all ${group.title.toLowerCase()}`}
+          onToggle={toggle}
+          {...(group.section === 'conflict' && state === 'selected' ? { lockedTitle: 'All conflicts marked as resolved' } : {})}
+        />
       </div>
       <ul aria-label={`${group.title} files`} className="m-0 flex list-none flex-col p-0">{children}</ul>
     </section>
@@ -188,10 +193,12 @@ function Section({ group, onStage, children }: {
 }
 
 /** The tri-state control of a row or a section header: filled when staged, a bar when partly. */
-function StageCheckbox({ state, label, onToggle }: {
+function StageCheckbox({ state, label, onToggle, lockedTitle }: {
   readonly state: GitToggleState
   readonly label: string
   readonly onToggle: () => void
+  /** Set when the control cannot be used (a resolved conflict): disabled, with this as the reason. */
+  readonly lockedTitle?: string
 }) {
   return (
     <button
@@ -199,7 +206,8 @@ function StageCheckbox({ state, label, onToggle }: {
       role="checkbox"
       aria-checked={state === 'indeterminate' ? 'mixed' : state === 'selected'}
       aria-label={label}
-      title={label}
+      title={lockedTitle ?? label}
+      disabled={lockedTitle !== undefined}
       onClick={onToggle}
       // Exempt from the 44px coarse-pointer floor: the row reserves exactly this 32px slot.
       data-compact-control
@@ -287,7 +295,12 @@ function ChangeRow({ change, selected, projectPath, actions, onSelect, onKeyDown
       >
         {(close) => <GitEntryMenuItems entries={[change]} projectPath={projectPath} close={close} actions={actions} />}
       </Menu>
-      <StageCheckbox state={toggleStateOf(change.staging)} label={`${change.staging === 'staged' ? 'Unstage' : 'Stage'} ${change.path}`} onToggle={onStage} />
+      <StageCheckbox
+        state={toggleStateOf(change.staging)}
+        label={`${change.staging === 'staged' ? 'Unstage' : 'Stage'} ${change.path}`}
+        onToggle={onStage}
+        {...(change.conflicted && change.staging === 'staged' ? { lockedTitle: 'Conflicts marked as resolved' } : {})}
+      />
       <ContextMenuPanel at={menu.at} label={`Actions for ${name}`} onClose={menu.close}>
         <GitEntryMenuItems entries={[change]} projectPath={projectPath} close={menu.close} actions={actions} />
       </ContextMenuPanel>
