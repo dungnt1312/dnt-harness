@@ -59,8 +59,11 @@ export interface HostDeps {
   readonly stream: (request: ModelRequest, options?: StreamOptions) => AsyncIterable<StreamEvent>
   /** The newest captured, persisted snapshot for this session, if the host still holds one. */
   readonly exactSnapshot: () => EffectiveCompactionSnapshot | undefined
-  /** A snapshot rebuilt from the committed log with the ordinary context builder, if possible. */
-  readonly reconstruct: () => EffectiveCompactionSnapshot | undefined
+  /**
+   * A snapshot rebuilt from the committed log with the ordinary context builder, if possible.
+   * Asked only when the exact snapshot cannot be used; must have no side effects.
+   */
+  readonly reconstruct: () => Promise<EffectiveCompactionSnapshot | undefined>
   /** What a snapshot must have been built for right now: provider, model, mode, grants, policy. */
   readonly identity: () => SnapshotIdentity
   /** False when no model resolves: only the bounded extractive summary is possible. */
@@ -147,7 +150,14 @@ export class CompactionHost {
     if (!deps.limits.compactionEffectiveEnabled || !deps.hasModel()) return this.legacy(request, signal, 'legacy')
 
     const now = deps.identity()
-    const choice = chooseCompactionSource({ events, exact: deps.exactSnapshot(), reconstructed: deps.reconstruct(), identity: now })
+    const exact = deps.exactSnapshot()
+    let choice = chooseCompactionSource({ events, exact, identity: now })
+    // Rebuilding the request costs a full context assembly: only when the exact snapshot cannot serve.
+    if (choice.kind === 'fold') {
+      const reconstructed = await deps.reconstruct().catch(() => undefined)
+      signal.throwIfAborted()
+      choice = chooseCompactionSource({ events, exact, reconstructed, identity: now })
+    }
     if (choice.kind === 'unavailable') {
       throw new CompactionRefused(choice.reason === 'open-turn' ? 'compaction requires a completed exchange boundary (no open turn)' : 'nothing to compact yet', choice.reason)
     }

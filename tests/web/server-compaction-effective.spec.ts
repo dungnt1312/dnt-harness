@@ -248,11 +248,11 @@ describe('effective compaction through the web server', () => {
     expect(await lifecycle()).toBe(events)
   })
 
-  it('a session whose turns were never captured just compacts: the fold runs on the first /compact, no confirmation', async () => {
-    const { provider: llm, requests } = provider()
+  it('a session whose turns were never captured is rebuilt from the log: ONE handoff request, no fold, no trace', async () => {
+    const { provider: llm, requests } = provider({ replies: ['old answer'] })
     // First server writes a real session, then goes away. The turns were produced by an older
-    // host: nothing was captured and no snapshot exists. A second server over the same home must
-    // ask for recovery rather than fold on its own.
+    // host: nothing was captured and no snapshot exists. A second server over the same home
+    // rebuilds the request from the log instead of folding the transcript.
     const first = await start(llm, {})
     const { id } = await (await fetch(`${first.base}/api/workspaces/${first.wsId}/sessions`, { method: 'POST' })).json() as { id: string }
     const logPath = path.join(first.home, 'workspaces', first.wsId, 'sessions', id, 'events.jsonl')
@@ -263,13 +263,87 @@ describe('effective compaction through the web server', () => {
     servers.push(server)
     homes.set(server, first.home)
     const route = `${server.url}/api/workspaces/${first.wsId}/sessions/${id}`
+    const before = await readLog(logPath)
     const calls = requests.length
     const response = await fetch(`${route}/compact`, { method: 'POST' })
     expect(response.status).toBe(200)
-    expect((await response.json() as { path?: string }).path).toBe('recovery')
-    expect(requests.slice(calls).some((r) => r.messages.some((m) => typeof m.content === 'string' && m.content.includes(LEGACY_MARK)))).toBe(true)
-    const job = (await readLog(path.join(first.home, 'workspaces', first.wsId, 'sessions', id, 'events.jsonl'))).findLast((event) => event.type === 'compaction/job')
-    expect(job).toMatchObject({ stage: 'ended', outcome: 'compacted', path: 'recovery' })
+    expect((await response.json() as { path?: string }).path).toBe('reconstructed')
+    const sent = requests.slice(calls)
+    expect(sent).toHaveLength(1)
+    expect(String(sent[0]!.messages.at(-1)!.content)).toContain(COMPACTION_HANDOFF_MARKER)
+    expect(sent.some((r) => r.messages.some((m) => typeof m.content === 'string' && m.content.includes(LEGACY_MARK)))).toBe(false)
+    expect(sent[0]!.messages.some((m) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('old question'))).toBe(true)
+    // The final answer rides once, as the answer, never also as history.
+    expect(sent[0]!.messages.filter((m) => m.role === 'assistant' && m.content === 'old answer')).toHaveLength(1)
+    const after = await readLog(logPath)
+    const job = after.findLast((event) => event.type === 'compaction/job')
+    expect(job).toMatchObject({ stage: 'ended', outcome: 'compacted', path: 'reconstructed' })
+    // Rebuilding the request leaves no trace: no manifest, no body, only the compaction's own events.
+    const count = (log: Record<string, unknown>[], type: string): number => log.filter((event) => event.type === type).length
+    expect(count(after, 'context/manifest')).toBe(count(before, 'context/manifest'))
+    expect(count(after, 'context/body')).toBe(count(before, 'context/body'))
+    expect(after.slice(before.length).every((event) => String(event.type).startsWith('compaction/'))).toBe(true)
+  })
+
+  it('a stopped last turn does not force a fold: the completed turn before it is summarized, the stopped one stays verbatim', async () => {
+    const requests: ModelRequest[] = []
+    let turn = 0
+    const llm: LlmProvider = {
+      name: 'scripted',
+      models: ['scripted'],
+      stream(request, options) {
+        requests.push(request)
+        const text = request.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('\n')
+        const handoff = text.includes(COMPACTION_HANDOFF_MARKER)
+        const call = handoff ? -1 : turn++
+        return (async function* (): AsyncIterable<StreamEvent> {
+          if (call === 1) {
+            // The second turn hangs until the user presses Stop.
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+            })
+          }
+          yield { type: 'delta', delta: handoff ? SUMMARY : call === 0 ? 'answer one' : 'turn reply' }
+          yield { type: 'usage', usage: { inputTokens: 1_000, outputTokens: 20 } }
+          yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+        })()
+      },
+    }
+    const first = await start(llm, {})
+    const { id } = await (await fetch(`${first.base}/api/workspaces/${first.wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const firstRoute = `${first.base}/api/workspaces/${first.wsId}/sessions/${id}`
+    const logPath = path.join(first.home, 'workspaces', first.wsId, 'sessions', id, 'events.jsonl')
+    await completedMessage(first.base, first.wsId, id, logPath, 'first question', 1)
+    expect((await fetch(`${firstRoute}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'second question STOPPED' }) })).ok).toBe(true)
+    await until(async () => (requests.length >= 2 ? true : undefined))
+    await fetch(`${firstRoute}/stop`, { method: 'POST' })
+    await until(async () => {
+      const log = await readLog(logPath)
+      const ends = log.filter((event) => event.type === 'turn/end')
+      const sessions = await (await fetch(`${first.base}/api/workspaces/${first.wsId}/sessions`)).json() as { id: string; status: string }[]
+      return ends.length === 2 && sessions.find((session) => session.id === id)?.status === 'idle' ? true : undefined
+    })
+    await first.server.close()
+    homes.delete(first.server)
+    const server = await createWebServer({ home: first.home, providers: [llm], configFile: path.join(first.home, 'p.json'), limits: { compactionEffectiveEnabled: true } })
+    servers.push(server)
+    homes.set(server, first.home)
+
+    const log = await readLog(logPath)
+    const ends = log.filter((event) => event.type === 'turn/end') as { seq: number; reason: string }[]
+    expect(ends.map((end) => end.reason)).toEqual(['completed', 'cancelled'])
+    const calls = requests.length
+    const response = await fetch(`${server.url}/api/workspaces/${first.wsId}/sessions/${id}/compact`, { method: 'POST' })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ path: 'reconstructed', coversSeq: ends[0]!.seq })
+    const sent = requests.slice(calls)
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.messages.some((m) => typeof m.content === 'string' && m.content.includes('second question STOPPED'))).toBe(false)
+
+    await completedMessage(server.url, first.wsId, id, logPath, 'third question', 3)
+    const joined = requests.at(-1)!.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('\n')
+    expect(joined).toContain(SUMMARY)
+    expect(joined).toContain('second question STOPPED')
   })
 
   it('an older client that still posts a recovery echo is served the same way: the body changes nothing', async () => {
@@ -286,7 +360,7 @@ describe('effective compaction through the web server', () => {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ recovery: { cutoff: 1, sourceDigest: 'stale', estimatedCalls: 6 } }),
     })
     expect(response.status).toBe(200)
-    expect(await response.json()).toMatchObject({ path: 'recovery' })
+    expect(await response.json()).toMatchObject({ path: 'reconstructed' })
   })
 
   it('after a RESTART the snapshot is reloaded from its sidecar: one handoff request, no recovery prompt', async () => {
@@ -310,7 +384,7 @@ describe('effective compaction through the web server', () => {
     expect(String(summaryCalls[0]!.messages.at(-1)!.content)).toContain(COMPACTION_HANDOFF_MARKER)
   })
 
-  it('after a restart with the sidecar GONE it folds from the log instead of asking', async () => {
+  it('after a restart with the sidecar GONE it rebuilds the request from the log: one handoff request', async () => {
     const { provider: llm, requests } = provider({ replies: ['answer one'] })
     const first = await start(llm, { compactionEffectiveEnabled: true })
     const { id } = await (await fetch(`${first.base}/api/workspaces/${first.wsId}/sessions`, { method: 'POST' })).json() as { id: string }
@@ -325,8 +399,10 @@ describe('effective compaction through the web server', () => {
     const calls = requests.length
     const response = await fetch(`${server.url}/api/workspaces/${first.wsId}/sessions/${id}/compact`, { method: 'POST' })
     expect(response.status).toBe(200)
-    expect(await response.json()).toMatchObject({ path: 'recovery' })
-    expect(requests.length).toBeGreaterThan(calls)
+    expect(await response.json()).toMatchObject({ path: 'reconstructed' })
+    const summaryCalls = requests.slice(calls)
+    expect(summaryCalls).toHaveLength(1)
+    expect(String(summaryCalls[0]!.messages.at(-1)!.content)).toContain(COMPACTION_HANDOFF_MARKER)
   })
 
   it('with the rollout switch OFF it behaves exactly as before: the legacy fold, no snapshot', async () => {

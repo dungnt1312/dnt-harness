@@ -81,6 +81,7 @@ interface Rig {
   usage: TokenUsage[]
   setExact(snapshot: EffectiveCompactionSnapshot | undefined): void
   setReconstructed(snapshot: EffectiveCompactionSnapshot | undefined): void
+  reconstruct: ReturnType<typeof vi.fn>
 }
 
 async function rig(options: { summary?: string; stream?: (request: ModelRequest, options?: { signal?: AbortSignal }) => AsyncIterable<StreamEvent>; effective?: boolean; model?: boolean } = {}): Promise<Rig> {
@@ -94,6 +95,7 @@ async function rig(options: { summary?: string; stream?: (request: ModelRequest,
   let exact: EffectiveCompactionSnapshot | undefined = snapshotFor(session, 4)
   let reconstructed: EffectiveCompactionSnapshot | undefined
   const hooks = vi.fn(async (): Promise<string | undefined> => undefined)
+  const reconstruct = vi.fn(async (): Promise<EffectiveCompactionSnapshot | undefined> => reconstructed)
   const checkpoints = new CheckpointStore(home)
   // The proven fold, as the server owns it (seed, attachments, extractive cap). The host must call
   // it as-is rather than build a summarizer of its own.
@@ -121,7 +123,7 @@ async function rig(options: { summary?: string; stream?: (request: ModelRequest,
       })()
     },
     exactSnapshot: () => exact,
-    reconstruct: () => reconstructed,
+    reconstruct,
     identity: () => identity,
     hasModel: () => options.model ?? true,
     preCompact: hooks,
@@ -132,7 +134,7 @@ async function rig(options: { summary?: string; stream?: (request: ModelRequest,
     recordUsage: (u) => usage.push(u),
   }
   const host = new CompactionHost(deps)
-  return { session, host, requests, checkpoints, hooks, legacy, usage, setExact: (s) => { exact = s }, setReconstructed: (s) => { reconstructed = s } }
+  return { session, host, requests, checkpoints, hooks, legacy, usage, reconstruct, setExact: (s) => { exact = s }, setReconstructed: (s) => { reconstructed = s } }
 }
 
 describe('CompactionHost.compact: the effective path', () => {
@@ -153,6 +155,23 @@ describe('CompactionHost.compact: the effective path', () => {
     r.setExact(undefined)
     r.setReconstructed(snapshotFor(r.session, 4, { id: 'rec' }))
     expect(await r.host.compact({ trigger: 'manual' })).toMatchObject({ kind: 'compacted', path: 'reconstructed' })
+    expect(r.reconstruct).toHaveBeenCalledTimes(1)
+    expect(r.legacy).not.toHaveBeenCalled()
+  })
+
+  it('never rebuilds from the log while the exact snapshot is usable', async () => {
+    const r = await rig()
+    r.setReconstructed(snapshotFor(r.session, 4, { id: 'rec' }))
+    expect(await r.host.compact({ trigger: 'manual' })).toMatchObject({ kind: 'compacted', path: 'exact' })
+    expect(r.reconstruct).not.toHaveBeenCalled()
+  })
+
+  it('folds when the log cannot be rebuilt into a snapshot either', async () => {
+    const r = await rig()
+    r.setExact(undefined)
+    expect(await r.host.compact({ trigger: 'manual' })).toMatchObject({ kind: 'compacted', path: 'recovery' })
+    expect(r.reconstruct).toHaveBeenCalledTimes(1)
+    expect(r.legacy).toHaveBeenCalledTimes(1)
   })
 
   it('runs PreCompact once, before generation, and a block stops everything', async () => {

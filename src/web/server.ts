@@ -171,7 +171,7 @@ import { SystemPromptsStore, type SystemPromptsSnapshot } from '../harness/promp
 import { CheckpointStore, recoverCanonicalCheckpoint, type CompactionCheckpoint } from '../harness/context/compaction.ts'
 import { compactionSeedHash, sourceDigest } from '../harness/context/compaction-digest.ts'
 import { CompactionSnapshotStore } from '../harness/storage/compaction-snapshot-store.ts'
-import { promoteCapture } from './compaction-capture.ts'
+import { promoteCapture, reconstructionCutoff, reconstructSnapshot } from './compaction-capture.ts'
 import { CompactionHost } from './compaction-host.ts'
 import { CompactionPrecompute, candidateOwner } from './compaction-precompute.ts'
 import { buildRestoration } from './compaction-restoration.ts'
@@ -1530,6 +1530,46 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   }
 
   /**
+   * A snapshot rebuilt from the committed log with the ordinary request assembly, for a session
+   * with no usable capture (older than the feature, sidecar lost, last turn stopped, mode or
+   * grants changed). The request is the one the builder would send after the newest clean
+   * completed turn, without its final answer, which the snapshot carries on its own. No side
+   * effects; anything that does not fit — a dropped uncovered turn, an unsafe loss, a budget
+   * error — yields undefined and the host folds.
+   */
+  const reconstructFromLog = async (entry: SessionEntry): Promise<EffectiveCompactionSnapshot | undefined> => {
+    try {
+      const sessionId = entry.session.id
+      const events = entry.session.committedEvents
+      const found = reconstructionCutoff(events, recoverCanonicalCheckpoint(events)?.coversSeq ?? 0)
+      if (found === undefined) return undefined
+      const prefix = events.filter((event) => event.seq <= found.cutoff)
+      const schemas = kernel.ctx.tools.schemas()
+      const { assembled, request } = await assembleRequest({
+        scope: { sessionId, rootSessionId: sessionId, workspaceId: entry.workspaceId, ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}), ...roleIdentityOf(entry.session) },
+        projected: { messages: [], ...(schemas.length > 0 ? { tools: schemas } : {}) },
+        events: prefix,
+        sideEffects: false,
+      })
+      // The final answer is the last history message; the snapshot adds it back as `finalAnswer`.
+      const last = assembled.compactionProjection.sources.at(-1)
+      if (last === undefined || last.seq !== found.answer.seq || last.messageIndex !== request.messages.length - 1) return undefined
+      const withoutAnswer: ModelRequest = { ...request, messages: request.messages.slice(0, -1) }
+      return reconstructSnapshot({
+        sessionId,
+        events,
+        turnId: found.turnId,
+        request: withoutAnswer,
+        projection: { ...assembled.compactionProjection, sources: assembled.compactionProjection.sources.slice(0, -1) },
+        finalAnswer: { role: 'assistant', content: found.answer.content },
+        identity: compactionIdentity(entry, requestPrefixHash(withoutAnswer)),
+      })
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
    * Foreground effective compaction for one session. The host decides the source
    * and runs the single handoff request; this wires it to what only the server
    * knows (providers, grants, hooks, the proven legacy fold, usage and meter).
@@ -1548,7 +1588,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
           attribution: { sessionId, turnId: `compaction:${sessionId}`, stepId: randomUUID() },
         })),
         exactSnapshot: () => captures.snapshotOf(sessionId),
-        reconstruct: () => undefined,
+        reconstruct: () => reconstructFromLog(entry),
         identity: () => compactionIdentity(entry, captures.snapshotOf(sessionId)?.identity.prefixHash ?? ''),
         hasModel: () => summarizerModelOf(entry.session) !== undefined,
         preCompact: (hookTrigger, hookSignal) => runPreCompactHooks(entry.session, entry.workspaceId, hookSignal, hookTrigger),
@@ -3453,7 +3493,24 @@ ${entry.description}`.toLowerCase().includes(query))
   // request wholesale. Effective permission is the selected mode's map; host
   // restrictions stay above it.
   kernel.ctx.on('agent/context', async (projected, next) => {
-    const scope = agentScope.getStore()
+    const { request } = await assembleRequest({ scope: agentScope.getStore(), projected, sideEffects: true })
+    return next(request)
+  }, true)
+
+  /**
+   * The one request assembly: what the `agent/context` interceptor sends, and what a compaction
+   * rebuilds from the log. `projected` carries the tool schemas, the abort signal and any squeeze.
+   * `events` replaces the session's log (a reconstruction passes the prefix through its cutoff).
+   * With `sideEffects: false` nothing outside the result changes: no manifest, no log append, no
+   * meter reset, no capture, no session cache, and an MCP failure throws instead of fencing.
+   */
+  async function assembleRequest(input: {
+    readonly scope: AgentScope | undefined
+    readonly projected: ModelRequest
+    readonly events?: readonly SessionEvent[]
+    readonly sideEffects: boolean
+  }): Promise<{ assembled: ReturnType<typeof buildContext>; request: ModelRequest }> {
+    const { scope, projected, sideEffects } = input
     const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
     const session = await scopedSession(scope?.sessionId)
     const effective = session === undefined
@@ -3494,7 +3551,7 @@ ${entry.description}`.toLowerCase().includes(query))
     try {
       exposureSnapshot = await executionAuthority.snapshot(exposureScope, workspaceId, projectedTools.some((schema) => schema.name.startsWith('mcp__')))
     } catch (error) {
-      if (!projectedTools.some((schema) => schema.name.startsWith('mcp__'))) throw error
+      if (!sideEffects || !projectedTools.some((schema) => schema.name.startsWith('mcp__'))) throw error
       await disableMcpForTurn(scope, workspaceId, error)
       projectedTools = projectedTools.filter((schema) => !schema.name.startsWith('mcp__'))
       exposureSnapshot = await executionAuthority.snapshot(exposureScope, workspaceId, false)
@@ -3512,7 +3569,7 @@ ${entry.description}`.toLowerCase().includes(query))
     if (mode.definition.sources.history === 'compact' && scope !== undefined) {
       // `latest(id, events)` returns only the canonical checkpoint recovered
       // from the committed log, so the builder need not re-derive it.
-      const checkpoint = await checkpoints.latest(scope.sessionId, session?.committedEvents ?? []).catch(() => undefined)
+      const checkpoint = await checkpoints.latest(scope.sessionId, input.events ?? session?.committedEvents ?? []).catch(() => undefined)
       if (checkpoint !== undefined) compaction = { summary: checkpoint.summary, coversSeq: checkpoint.coversSeq, verifiedAgainst: 'committed-log' }
     }
 
@@ -3526,6 +3583,8 @@ ${entry.description}`.toLowerCase().includes(query))
       const key = `${scope.projectId ?? ''}\u0000${compaction?.coversSeq ?? 0}\u0000${sourcesRevision}`
       const current = prefixSnapshots.get(scope.sessionId)
       if (current !== undefined && current.key === key) return current
+      // A reconstruction reads the session's copy when it matches, but never replaces it.
+      if (!sideEffects) return undefined
       const fresh: PrefixSnapshot = { key }
       prefixSnapshots.set(scope.sessionId, fresh)
       return fresh
@@ -3546,7 +3605,7 @@ ${entry.description}`.toLowerCase().includes(query))
               const description = entry.description === '' ? entry.title : entry.description
               return { name: entry.name, description: description.length > 500 ? `${description.slice(0, 499)}…` : description }
             })
-            if (snapshot !== undefined) snapshot.skillCatalog = catalog
+            if (sideEffects && snapshot !== undefined) snapshot.skillCatalog = catalog
             return catalog
           })
           .catch(() => undefined)
@@ -3557,7 +3616,9 @@ ${entry.description}`.toLowerCase().includes(query))
     // the model loads with the Skill tool ride their own tool result instead.
     const activeSkills: ActiveSkill[] = []
     if (mode.definition.sources.skills === 'on-demand' && scope !== undefined) {
-      const perTurn = skillSnapshots.get(scope.sessionId) ?? new Map<string, ActiveSkill>()
+      const pinned = skillSnapshots.get(scope.sessionId)
+      // Without side effects, loads below must not reach the session's own map.
+      const perTurn = sideEffects ? pinned ?? new Map<string, ActiveSkill>() : new Map(pinned ?? [])
       // Definition skills preload ONCE for this child Turn, then remain
       // hash-pinned like explicit Skill loads (no mid-turn file reload).
       // They resolve through the SAME rule layers as the Skill tool (project
@@ -3579,7 +3640,7 @@ ${entry.description}`.toLowerCase().includes(query))
         }
       }
       projected.assemblySignal?.throwIfAborted()
-      if (perTurn.size > 0) skillSnapshots.set(scope.sessionId, perTurn)
+      if (sideEffects && perTurn.size > 0) skillSnapshots.set(scope.sessionId, perTurn)
       activeSkills.push(...perTurn.values())
     }
 
@@ -3592,12 +3653,12 @@ ${entry.description}`.toLowerCase().includes(query))
       // `memoryIndexes` degrades a read failure to []: never pin that, or one
       // transient error would hide memory for the session. An empty index is
       // re-read (cheap) until the first entry exists.
-      if (snapshot !== undefined && indexes.length > 0) snapshot.memory = indexes
+      if (sideEffects && snapshot !== undefined && indexes.length > 0) snapshot.memory = indexes
       pinnedMemory.push(...indexes)
     }
 
     projected.assemblySignal?.throwIfAborted()
-    const events = session?.events ?? []
+    const events = input.events ?? session?.events ?? []
     // Attachment bytes are read once per request and cached by the store: the
     // log holds references, and the model needs the content itself.
     const referenced = events.flatMap((event) => (event.type === 'user/message' ? [...(event.attachments ?? [])] : []))
@@ -3655,7 +3716,7 @@ ${entry.description}`.toLowerCase().includes(query))
         ? { rootRole: { definition: scope.role.definition, instructions: scope.role.instructions, ...(scope.role.definitionSource !== undefined ? { source: scope.role.definitionSource } : {}) } }
         : {}),
     })
-    if (scope !== undefined) {
+    if (sideEffects && scope !== undefined) {
       lastManifests.set(scope.sessionId, assembled.manifest)
       if (scope.turnId !== undefined) manifestTurns.set(scope.sessionId, scope.turnId)
       // Any new root request supersedes the previous cache prefix until this
@@ -3703,19 +3764,17 @@ ${entry.description}`.toLowerCase().includes(query))
       }
     }
     // Arm the effective capture with the request EXACTLY as assembled (root steps only).
-    if (limits.compactionEffectiveEnabled && scope !== undefined && scope.childOf === undefined && scope.turnId !== undefined) {
+    if (sideEffects && limits.compactionEffectiveEnabled && scope !== undefined && scope.childOf === undefined && scope.turnId !== undefined) {
       captures.arm(scope.sessionId, scope.turnId, { ...projected, messages: assembled.messages, ...(assembled.tools !== undefined ? { tools: assembled.tools } : {}) }, assembled.compactionProjection)
     }
     // Replace wholesale: when the mode exposes nothing, tools must LEAVE the
     // request — a spread of `projected` would resurrect the full schema list.
-    const replacement: typeof projected = { ...projected, messages: assembled.messages }
-    if (assembled.tools !== undefined) {
-      return next({ ...replacement, tools: assembled.tools })
-    }
+    const replacement: ModelRequest = { ...projected, messages: assembled.messages }
+    if (assembled.tools !== undefined) return { assembled, request: { ...replacement, tools: assembled.tools } }
     const { tools: _dropped, ...withoutTools } = replacement
     void _dropped
-    return next(withoutTools)
-  }, true)
+    return { assembled, request: withoutTools }
+  }
 
   // Live model + provider control, scoped to the executing turn's
   // workspace: every step's request is stamped with that workspace's pair.
