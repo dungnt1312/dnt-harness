@@ -6,9 +6,8 @@ import {
 import { defaultKeymap, history, historyKeymap, indentLess, indentMore } from '@codemirror/commands'
 import { bracketMatching, foldGutter, foldKeymap, indentOnInput, indentUnit, syntaxHighlighting } from '@codemirror/language'
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete'
-import { closeSearchPanel, highlightSelectionMatches, search, searchKeymap, searchPanelOpen } from '@codemirror/search'
+import { highlightSelectionMatches, search, searchKeymap } from '@codemirror/search'
 import { unifiedMergeView } from '@codemirror/merge'
-import { cn } from '../../lib/cn.ts'
 import { loadCodeLanguage } from '../../lib/code-languages.ts'
 import { indentUnitOf, type IndentStyle } from '../../lib/code-text.ts'
 import { codeHighlight, codeTheme } from './code-theme.ts'
@@ -30,25 +29,16 @@ export interface CodePaneProps {
   readonly value: string
   readonly editable: boolean
   readonly indent: IndentStyle
-  /** The lines a tool call read; highlighted and scrolled to while the pane is read-only. */
+  /** The lines a tool call read; highlighted and scrolled to unless a comparison is showing. The caller drops it once the text is edited. */
   readonly focus?: { readonly line: number; readonly lines?: number; readonly seq: number } | null
   readonly compare?: CodePaneCompare | null
   readonly ariaLabel: string
-  /** Facts the status bar states on the right (encoding, line endings, size, …). */
+  /** Facts the status bar states on the right (language, encoding, line endings, size, …). */
   readonly facts?: readonly string[]
+  /** Soft-wrap long lines; the caller owns the choice (it lives in the viewer's ⋯ menu). */
+  readonly wrap?: boolean
   readonly onChange?: (text: string) => void
   readonly onSave?: () => void
-  readonly onCancel?: () => void
-}
-
-const WRAP_KEY = 'dnt.editor.wrap'
-
-function readWrap(): boolean {
-  try { return window.localStorage.getItem(WRAP_KEY) === '1' } catch { return false }
-}
-
-function writeWrap(on: boolean): void {
-  try { window.localStorage.setItem(WRAP_KEY, on ? '1' : '0') } catch { /* private mode: the choice just does not persist */ }
 }
 
 const isDark = (): boolean => document.documentElement.dataset['theme'] === 'dark'
@@ -107,14 +97,13 @@ function compareExtension(compare: CodePaneCompare): Extension {
  * the document; React only hands it text (`value`) and hears about typing
  * (`onChange`). Imported lazily by the viewer, so none of this is in the main bundle.
  */
-export default function CodePane({ fileName, value, editable, indent, focus = null, compare = null, ariaLabel, facts = [], onChange, onSave, onCancel }: CodePaneProps) {
+export default function CodePane({ fileName, value, editable, indent, focus = null, compare = null, ariaLabel, facts = [], wrap = false, onChange, onSave }: CodePaneProps) {
   const hostRef = useRef<HTMLDivElement>(null)
   const viewRef = useRef<EditorView | null>(null)
   /** What the editor holds, as a string, so a prop that merely echoes typing costs no document scan. */
   const docRef = useRef(value)
-  const handlers = useRef({ onChange, onSave, onCancel })
-  handlers.current = { onChange, onSave, onCancel }
-  const [wrap, setWrap] = useState(readWrap)
+  const handlers = useRef({ onChange, onSave })
+  handlers.current = { onChange, onSave }
   const [cursor, setCursor] = useState({ line: 1, column: 1, selected: 0 })
   // One compartment per concern that changes while the view lives.
   const parts = useRef({
@@ -139,16 +128,7 @@ export default function CodePane({ fileName, value, editable, indent, focus = nu
       closeBrackets(),
       Prec.high(keymap.of([
         { key: 'Mod-s', preventDefault: true, run: (view) => { if (inIme(view)) return false; handlers.current.onSave?.(); return true } },
-        {
-          key: 'Escape',
-          run: (view) => {
-            if (inIme(view)) return false
-            // The search panel owns the first Escape.
-            if (searchPanelOpen(view.state)) return closeSearchPanel(view)
-            handlers.current.onCancel?.()
-            return true
-          },
-        },
+        // Escape is left to the search panel: with editing in place, a stray Escape must never throw work away.
         {
           key: 'Tab',
           run: (view) => {
@@ -215,7 +195,7 @@ export default function CodePane({ fileName, value, editable, indent, focus = nu
     })
     viewRef.current = view
     docRef.current = value
-    if (editable) view.focus()
+    // No focus on mount: opening a file must not pull the keyboard away from the chat composer.
     // The theme follows <html data-theme>; the colours are variables, only the light/dark hint needs telling.
     const observer = new MutationObserver(() => view.dispatch({ effects: c.theme.reconfigure(codeTheme(isDark())) }))
     observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] })
@@ -239,7 +219,6 @@ export default function CodePane({ fileName, value, editable, indent, focus = nu
     const view = viewRef.current
     if (view === null) return
     view.dispatch({ effects: parts.current.editing.reconfigure(editingExtension(editable, ariaLabel)) })
-    if (editable) view.focus()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editable, ariaLabel])
 
@@ -266,7 +245,7 @@ export default function CodePane({ fileName, value, editable, indent, focus = nu
     return () => { live = false }
   }, [fileName])
 
-  const banded = !editable && compare === null && focus !== null
+  const banded = compare === null && focus !== null
   useEffect(() => {
     const view = viewRef.current
     if (view === null) return
@@ -283,32 +262,14 @@ export default function CodePane({ fileName, value, editable, indent, focus = nu
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [banded, focus?.seq, focus?.line])
 
-  const toggleWrap = (): void => {
-    setWrap((current) => {
-      writeWrap(!current)
-      return !current
-    })
-  }
-
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div ref={hostRef} className="min-h-0 flex-1 overflow-hidden" />
-      <div className="flex h-8 shrink-0 items-center justify-between gap-3 border-t border-line px-3 text-xs tabular-nums text-fg-muted">
-        <span className="truncate" aria-label="Cursor position">
+      <div className="flex h-7 shrink-0 items-center justify-between gap-3 border-t border-line px-3 text-xs tabular-nums text-fg-muted">
+        <span className="shrink-0" aria-label="Cursor position">
           Ln {cursor.line}, Col {cursor.column}{cursor.selected > 0 ? ` · ${cursor.selected} selected` : ''}
         </span>
-        <span className="flex min-w-0 items-center gap-3">
-          {facts.length > 0 ? <span className="truncate">{facts.join(' · ')}</span> : null}
-          <button
-            type="button"
-            aria-pressed={wrap}
-            title="Wrap long lines"
-            onClick={toggleWrap}
-            className={cn('shrink-0 rounded px-1.5 py-0.5 hover:bg-hover hover:text-fg', wrap && 'bg-hover text-fg')}
-          >
-            Wrap
-          </button>
-        </span>
+        {facts.length > 0 ? <span className="min-w-0 truncate">{facts.join(' · ')}</span> : null}
       </div>
     </div>
   )

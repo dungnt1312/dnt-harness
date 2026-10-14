@@ -3,6 +3,7 @@ import { afterEach, beforeAll, expect, it, vi } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { FileViewer } from './FileViewer.tsx'
+import { ToastHost } from '../common/Toast.tsx'
 import { editorText, polyfillLayout, settled } from './cm-test.ts'
 import type { ViewMode } from '../../hooks/useWorkbenchFiles.ts'
 
@@ -30,7 +31,7 @@ async function render(path: string, extra: { viewMode?: ViewMode; onViewMode?: (
   host = document.createElement('div')
   document.body.append(host)
   root = createRoot(host)
-  await act(async () => root!.render(<FileViewer workspaceId="w" projectId="p" projectPath="/repo" path={path} draft={null} onDraft={() => {}} onSaved={() => {}} {...extra} />))
+  await act(async () => root!.render(<ToastHost><FileViewer workspaceId="w" projectId="p" projectPath="/repo" path={path} draft={null} onDraft={() => {}} onSaved={() => {}} {...extra} /></ToastHost>))
   await settled(host)
 }
 
@@ -92,12 +93,32 @@ it('an html file previews in a sandboxed iframe without scripts', async () => {
   expect(frame!.getAttribute('sandbox')).toBe('')
 })
 
-it('a ts file has no view toggle at all and reads in the editor', async () => {
-  readProjectFile.mockResolvedValue({ path: 'main.ts', size: 12, binary: false, truncated: false, content: 'const a = 1\n', editable: true, hash: 'h1' })
-  await render('main.ts')
+it('a ts file has no view toggle at all and opens in the editor, ready to type', async () => {
+  readProjectFile.mockResolvedValue({ path: 'src/main.ts', size: 12, binary: false, truncated: false, content: 'const a = 1\n', editable: true, hash: 'h1' })
+  await render('src/main.ts')
   expect(host.querySelector('[aria-label="View mode"]')).toBeNull()
   expect(editorText(host)).toBe('const a = 1\n')
-  expect(host.querySelector('.cm-content')!.getAttribute('aria-readonly')).toBe('true')
+  expect(host.querySelector('.cm-content')!.getAttribute('aria-readonly')).toBeNull()
+})
+
+it('keeps the file to one toolbar: its folder, a view switch when it has one, and ⋯', async () => {
+  readProjectFile.mockResolvedValue({ path: 'src/main.ts', size: 12, binary: false, truncated: false, content: 'const a = 1\n', editable: true, hash: 'h1' })
+  await render('src/main.ts')
+  const bars = host.querySelectorAll('.border-b')
+  // One bar above the editor; the language moved down to the status bar.
+  expect(bars.length).toBe(1)
+  expect(bars[0]!.textContent).toBe('src')
+  expect(bars[0]!.querySelector('[title="/repo/src/main.ts"]')).not.toBeNull()
+  expect(host.querySelector('[aria-label="More file actions"]')).not.toBeNull()
+  expect(host.querySelector('[aria-label="Reload file"]')).toBeNull()
+  expect(host.querySelector('[aria-label="Copy file contents"]')).toBeNull()
+  expect(host.textContent).toContain('typescript')
+})
+
+it('a file at the project root names the project folder, not a bare slash', async () => {
+  readProjectFile.mockResolvedValue({ path: 'main.ts', size: 12, binary: false, truncated: false, content: 'const a = 1\n', editable: true, hash: 'h1' })
+  await render('main.ts')
+  expect(host.querySelector('[title="/repo/main.ts"]')?.textContent).toBe('repo')
 })
 
 it('a skill tab previews its SKILL.md and is marked read-only', async () => {
@@ -114,7 +135,7 @@ it('says why a file cannot be edited instead of hiding the pencil', async () => 
   await render('big.ts')
   const badge = [...host.querySelectorAll('span')].find((node) => node.textContent === 'Read-only')
   expect(badge?.getAttribute('title')).toContain('1 MB')
-  expect(host.querySelector('[aria-label="Edit file"]')).toBeNull()
+  expect(host.querySelector('.cm-content')!.getAttribute('aria-readonly')).toBe('true')
   expect(host.textContent).toContain('File is larger than 1 MB; only the beginning is shown.')
 })
 

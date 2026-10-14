@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { FileViewer } from './FileViewer.tsx'
+import { ToastHost } from '../common/Toast.tsx'
 
 const getSkillFile = vi.fn(async () => ({ path: 'SKILL.md', bytes: 20, content: '# Using superpowers\nbody\n' }))
 const readProjectFile = vi.fn()
@@ -25,9 +26,11 @@ it('a skill tab reads SKILL.md through the skill API, not the project file API',
   host = document.createElement('div')
   document.body.append(host)
   root = createRoot(host)
-  await act(async () => root!.render(<FileViewer workspaceId="w" projectId="p" projectPath="/repo" path="skill://using-superpowers" draft={null} onDraft={() => {}} onSaved={() => {}} />))
+  await act(async () => root!.render(<ToastHost><FileViewer workspaceId="w" projectId="p" projectPath="/repo" path="skill://using-superpowers" draft={null} onDraft={() => {}} onSaved={() => {}} /></ToastHost>))
   expect(getSkillFile).toHaveBeenCalledWith('w', 'using-superpowers', 'SKILL.md', 'p')
   expect(readProjectFile).not.toHaveBeenCalled()
-  expect(host.textContent).toContain('Skill · using-superpowers/SKILL.md')
+  // The bar names where it lives; the full location is its tooltip.
+  expect(host.textContent).toContain('Skill · using-superpowers')
+  expect(host.querySelector('[title="Skill · using-superpowers/SKILL.md"]')).not.toBeNull()
   expect(host.textContent).toContain('Using superpowers')
 })

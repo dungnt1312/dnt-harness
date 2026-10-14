@@ -1,21 +1,21 @@
 import { lazy, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import Icon from '../common/Icon.tsx'
-import CopyButton from '../common/CopyButton.tsx'
 import ConfirmDialog from '../common/ConfirmDialog.tsx'
 import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import { Spinner } from '../common/Spinner.tsx'
+import { useToast } from '../common/Toast.tsx'
 import { Badge } from '../ui/Badge.tsx'
 import { Button } from '../ui/Button.tsx'
-import { IconButton } from '../ui/IconButton.tsx'
+import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import { Segmented } from '../ui/Segmented.tsx'
 import { getSkillFile, readMemoryFile, readProjectFile, saveProjectFile, SaveConflictError, type ProjectFileView } from '../../lib/api.ts'
 import { memoryTabOf, skillTabName } from '../../lib/project-paths.ts'
 import { writeErrorText } from '../../lib/file-tree.ts'
 import type { FileDraft, ViewMode, ViewerFocus } from '../../hooks/useWorkbenchFiles.ts'
-import { ConflictBanner, EditBar } from './EditBar.tsx'
+import { ConflictBanner } from './EditBar.tsx'
 import { FilePreview } from './FilePreview.tsx'
 import { TruncationNotice } from './TruncationNotice.tsx'
-import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
+import { readWrap, writeWrap } from './code-wrap.ts'
 import { MediaPreview } from '../common/MediaPreview.tsx'
 import { cn } from '../../lib/cn.ts'
 import { formatBytes } from '../../lib/format.ts'
@@ -37,6 +37,8 @@ function sameDisk(a: ProjectFileView, b: ProjectFileView): boolean {
   if (a.hash !== undefined && b.hash !== undefined) return a.hash === b.hash
   return a.size === b.size && a.content === b.content
 }
+
+const MORE_TRIGGER = 'flex size-8 shrink-0 items-center justify-center rounded-lg text-fg-muted transition-colors hover:bg-hover hover:text-fg'
 
 type Ask = 'discard' | 'reload' | 'overwrite'
 
@@ -77,9 +79,12 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
   /** The disk text the editor is compared against while the reader inspects a conflict. */
   const [disk, setDisk] = useState<{ readonly text: string } | null>(null)
   const [comparing, setComparing] = useState(false)
-  const [review, setReview] = useState<'edit' | 'changes'>('edit')
+  /** The editor shows the unsaved edit against the text it started from. */
+  const [reviewing, setReviewing] = useState(false)
   const [ask, setAsk] = useState<Ask | null>(null)
   const [localMode, setLocalMode] = useState<ViewMode | undefined>(undefined)
+  const [wrap, setWrap] = useState(readWrap)
+  const toast = useToast()
   const savingRef = useRef(false)
   // A save outlives a tab switch; its result must not touch the draft of a viewer that is gone.
   const mounted = useRef(true)
@@ -153,8 +158,8 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
   }, [writeSeq, read])
 
   const clearEditState = (): void => { setSaveError(null); setConflict(null); setComparing(false); setDisk(null) }
-  // Leaving the edit also leaves its review of changes.
-  useEffect(() => { if (draft === null) setReview('edit') }, [draft === null])
+  // With nothing left to review (saved, discarded), the Changes view closes by itself.
+  useEffect(() => { if (draft === null || !draft.dirty) setReviewing(false) }, [draft === null || !draft.dirty])
 
   /** Writes the draft; `expectedHash` is the draft's base unless Overwrite supplies the current disk hash. */
   const save = async (expectedHash: string, force = false): Promise<void> => {
@@ -233,15 +238,25 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
     else if (answered === 'overwrite' && conflict !== null) void save(conflict, true)
   }
 
+  const copy = (text: string, what: string): void => {
+    void navigator.clipboard.writeText(text).then(
+      () => toast.notify(`Copied ${what}`, 'ok'),
+      () => toast.notify('Could not copy. Select the text and copy it manually.', 'bad', { plain: true }),
+    )
+  }
+  const toggleWrap = (): void => {
+    writeWrap(!wrap)
+    setWrap(!wrap)
+  }
+
   const nameForKind = skill !== null ? 'SKILL.md' : memory !== null ? memory.file : path
   const language = languageOfFile(nameForKind)
   // Preview is pure client-side rendering of the already-read text, so it is
   // available on every tab: project files, skills and memory alike.
   const previewKind = previewKindOf(nameForKind)
   const chosen = viewMode ?? localMode
-  const baseMode: ViewMode = chosen ?? (previewKind === 'markdown' ? 'preview' : 'code')
-  // While editing, the rendered document sits beside the text rather than replacing it.
-  const mode: ViewMode = previewKind === null ? 'code' : draft !== null && baseMode === 'preview' ? 'split' : baseMode
+  // A markdown document opens rendered; everything else opens as code.
+  const mode: ViewMode = previewKind === null ? 'code' : chosen ?? (previewKind === 'markdown' ? 'preview' : 'code')
   const chooseMode = (next: ViewMode): void => {
     setLocalMode(next)
     onViewMode?.(next)
@@ -253,8 +268,14 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
   const eol = file === null ? null : eolOf(file.content)
   const encoding = file?.editable === true ? (hasBom(file.content) ? 'UTF-8 with BOM' : 'UTF-8') : null
   const facts = useMemo(
-    () => [indentLabel(indent), ...(eol !== null ? [eol] : []), ...(encoding !== null ? [encoding] : []), ...(file !== null ? [formatBytes(file.size)] : [])],
-    [indent, eol, encoding, file],
+    () => [
+      language === 'text' ? 'Plain text' : language,
+      indentLabel(indent),
+      ...(eol !== null ? [eol] : []),
+      ...(encoding !== null ? [encoding] : []),
+      ...(file !== null ? [file.truncated ? `first ${formatBytes(file.content.length)} of ${formatBytes(file.size)}` : formatBytes(file.size)] : []),
+    ],
+    [language, indent, eol, encoding, file],
   )
   const shownText = draft !== null ? draft.text : editorBase
   // The preview trails typing by a frame, so a big document never makes the editor lag.
@@ -276,34 +297,96 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
 
   const compare = comparing && disk !== null
     ? { original: disk.text, revertLabel: 'Use disk' }
-    : draft !== null && review === 'changes'
+    : draft !== null && reviewing
       ? { original: editorBase, revertLabel: 'Revert' }
       : null
   const showCode = mode !== 'preview'
   const showPreview = previewKind !== null && mode !== 'code'
-  const modeOptions: { value: ViewMode; label: string }[] = draft !== null
-    ? [{ value: 'code', label: 'Code' }, { value: 'split', label: 'Split' }]
-    : [{ value: 'code', label: 'Code' }, { value: 'split', label: 'Split' }, { value: 'preview', label: 'Preview' }]
+  const dirty = draft?.dirty === true
+  // The window a tool read belongs to the file as read; once it is edited, those lines may have moved.
+  const shownFocus = dirty ? null : focus
 
-  // The editor's own keymap saves while it has focus. Focus often sits on a button instead (the
-  // Edit/Changes switch, Cancel), and ⌘S there must still save rather than open the browser's own dialog.
+  // Typing starts the edit: the first change becomes a draft, based on the text that was on screen.
+  const onType = (text: string): void => {
+    if (file === null || file.hash === undefined) return
+    const baseHash = draft?.baseHash ?? file.hash
+    onDraft({ text, baseHash, dirty: text !== editorBase || baseHash !== file.hash })
+  }
+
+  // The editor's own keymap saves while it has focus. Focus often sits on a button instead (Save,
+  // Changes, a menu), and ⌘S there must still save rather than open the browser's own dialog.
   const saveFromAnywhere = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
-    if (draft === null || event.defaultPrevented || event.nativeEvent.isComposing) return
+    if (!dirty || draft === null || event.defaultPrevented || event.nativeEvent.isComposing) return
     if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey || event.key.toLowerCase() !== 's') return
     event.preventDefault()
     void save(draft.baseHash)
   }
 
+  const text = file !== null && !file.binary
+  // The tab already names the file; the bar shows where it lives. The full path is its tooltip.
+  // A file at the root shows the project's folder name, never a bare "/".
+  const rootName = projectPath.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? ''
+  const location = skill !== null ? `Skill · ${skill}` : memory !== null ? fullPath : path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : rootName
+
   return (
     <div className="flex min-h-0 flex-1 flex-col" onKeyDown={saveFromAnywhere}>
-      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line px-3 text-[13px]">
-        <FileTypeIcon path={nameForKind} size={16} />
-        <span className="min-w-0 flex-1 truncate text-fg-muted" title={fullPath}>{fullPath}</span>
+      {/* One toolbar per file: where it is, its state, then the actions — the frequent ones out, the rest under ⋯. */}
+      <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line pl-3 pr-1.5 text-[13px]">
+        <span className="min-w-0 flex-1 truncate text-fg-muted" title={fullPath}>{location}</span>
         {readOnlyReason !== null ? <Badge tone="gray" title={readOnlyReason}>Read-only</Badge> : null}
-        {editable && draft === null && file !== null ? (
-          <IconButton label="Edit file" onClick={() => onDraft({ text: editorBase, baseHash: file.hash!, dirty: false })}><Icon name="pencil" size={15} /></IconButton>
+        {text && previewKind !== null ? (
+          <Segmented<ViewMode>
+            label="View mode"
+            size="compact"
+            value={mode}
+            options={[{ value: 'code', label: 'Code' }, { value: 'split', label: 'Split' }, { value: 'preview', label: 'Preview' }]}
+            onChange={chooseMode}
+          />
         ) : null}
-        <IconButton label="Reload file" disabled={saving} onClick={reloadFromDisk}><Icon name="refresh" size={15} /></IconButton>
+        {dirty ? (
+          <>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-7 px-2.5"
+              aria-pressed={reviewing && !comparing}
+              disabled={saving}
+              onClick={() => { setComparing(false); setReviewing((on) => !on) }}
+            >
+              Changes
+            </Button>
+            <Button size="sm" variant="primary" className="h-7 px-3" disabled={saving} onClick={() => void save(draft.baseHash)}>{saving ? 'Saving…' : 'Save'}</Button>
+          </>
+        ) : null}
+        {file !== null ? (
+          <Menu label="More file actions" align="end" triggerClassName={MORE_TRIGGER} trigger={() => <Icon name="dots" size={15} />}>
+            {(close) => (
+              <>
+                {dirty ? (
+                  <button type="button" role="menuitem" className={cn(menuItemClass, 'text-bad')} onClick={() => { close(); cancelEdit() }}>
+                    <Icon name="undo" size={14} />Discard changes
+                  </button>
+                ) : null}
+                <button type="button" role="menuitem" className={menuItemClass} disabled={saving} onClick={() => { close(); reloadFromDisk() }}>
+                  <Icon name="refresh" size={14} />Reload from disk
+                </button>
+                {text ? (
+                  <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); copy(draft?.text ?? file.content, 'file contents') }}>
+                    <Icon name="copy" size={14} />Copy contents
+                  </button>
+                ) : null}
+                <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); copy(fullPath, 'path') }}>
+                  <Icon name="copy" size={14} />Copy path
+                </button>
+                {text && showCode ? (
+                  <button type="button" role="menuitemcheckbox" aria-checked={wrap} className={menuItemClass} onClick={() => { close(); toggleWrap() }}>
+                    <Icon name={wrap ? 'check' : 'square'} size={14} className={wrap ? undefined : 'invisible'} />Wrap long lines
+                  </button>
+                ) : null}
+              </>
+            )}
+          </Menu>
+        ) : null}
       </div>
       {error !== null ? (
         <div className="flex flex-col items-start gap-2 p-3">
@@ -314,25 +397,7 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
         <div className="flex items-center gap-2 p-3 text-sm text-fg-muted" role="status"><Spinner size={13} />Loading file…</div>
       ) : file !== null ? (
         <>
-          <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-line px-3 text-xs text-fg-muted">
-            <span className="font-mono">{file.binary ? 'binary' : language}{file.truncated && !file.binary ? ` · first ${Math.round(file.content.length / 1024)} KB of ${Math.round(file.size / 1024)} KB` : ''}</span>
-            <span className="flex items-center gap-2">
-              {!file.binary && previewKind !== null ? (
-                <Segmented<ViewMode> label="View mode" size="compact" value={mode} options={modeOptions} onChange={chooseMode} />
-              ) : null}
-              {!file.binary ? <CopyButton text={draft?.text ?? file.content} label="Copy file contents" /> : null}
-            </span>
-          </div>
-          {draft !== null && !file.binary ? (
-            <EditBar
-              dirty={draft.dirty}
-              saving={saving}
-              review={comparing ? null : review}
-              onReview={(next) => { setComparing(false); setReview(next) }}
-              onCancel={cancelEdit}
-              onSave={() => void save(draft.baseHash)}
-            />
-          ) : null}
+          {/* Shown while any edit is open, even one typed back to the opened text: the disk still differs. */}
           {conflict !== null && draft !== null ? (
             <ConflictBanner busy={saving} comparing={comparing} onCompare={() => void toggleCompare()} onReload={reloadFromDisk} onOverwrite={() => setAsk('overwrite')} />
           ) : null}
@@ -351,15 +416,15 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
                       <CodePane
                         fileName={nameForKind}
                         value={shownText}
-                        editable={draft !== null && !saving}
+                        editable={editable && !saving}
                         indent={indent}
-                        focus={focus}
+                        focus={shownFocus}
                         compare={compare}
-                        ariaLabel={draft !== null ? `Edit ${path}` : `Contents of ${path}`}
+                        ariaLabel={editable ? `Edit ${path}` : `Contents of ${path}`}
                         facts={facts}
-                        onChange={(text) => { if (draft !== null) onDraft({ ...draft, text, dirty: text !== editorBase || draft.baseHash !== file.hash }) }}
-                        onSave={() => { if (draft !== null) void save(draft.baseHash) }}
-                        onCancel={cancelEdit}
+                        wrap={wrap}
+                        onChange={onType}
+                        onSave={() => { if (draft !== null && dirty) void save(draft.baseHash) }}
                       />
                     </Suspense>
                   </div>
