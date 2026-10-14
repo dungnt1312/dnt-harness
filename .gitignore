@@ -24,3 +24,6 @@ web-dist/
 *.tsxn
 *.cssn
 shots/
+
+# playwright MCP browser output (screenshots/snapshots from ad-hoc sessions)
+.playwright-mcp/
