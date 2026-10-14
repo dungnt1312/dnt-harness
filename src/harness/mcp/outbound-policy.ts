@@ -66,6 +66,11 @@ export function operatorHeaders(headers: Readonly<Record<string, string>> | unde
 }
 
 function isLoopback(hostname: string): boolean {
+  const bare = hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  // NAT64 names a translator, not a local interface. Only mapped/compatible
+  // IPv4 literals may inherit the direct-loopback fixture exception.
+  const words = isIP(bare) === 6 ? ipv6Words(bare) : undefined
+  if (words?.[0] === 0x64 && words[1] === 0xff9b) return false
   const host = unwrapIp(hostname)
   return host === 'localhost' || host === '127.0.0.1' || host === '::1'
 }
@@ -137,7 +142,9 @@ function prohibitedV4(ip: string): boolean {
 function prohibitedV6(ip: string): boolean {
   const lower = ip.toLowerCase()
   if (lower === '::' || lower === '::1') return true
-  if (lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('fe80')) return true
+  const first = ipv6Words(ip)?.[0]
+  if (first === undefined) return true
+  if ((first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80) return true
   if (lower.startsWith('ff')) return true
   return false
 }

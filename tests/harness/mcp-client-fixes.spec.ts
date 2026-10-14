@@ -46,7 +46,156 @@ async function stdioClient(resourceLimits?: { maxLifetimeMs: number; enforcement
   return client
 }
 
+function barrier<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
 describe('MCP client audit regressions', () => {
+  it('rejects the entire IPv6 link-local /10 but not adjacent ranges', () => {
+    for (const host of ['fe80::1', 'fe90::1', 'fea0::1', 'febf:ffff::1']) {
+      expect(() => assertOutboundUrl(`https://[${host}]/`)).toThrow(/prohibited/)
+    }
+    for (const host of ['fe7f::1', 'fec0::1']) expect(assertOutboundUrl(`https://[${host}]/`).protocol).toBe('https:')
+  })
+
+  it('does not treat NAT64 embedded loopback as direct loopback', () => {
+    expect(() => assertOutboundUrl('https://[64:ff9b::7f00:1]/')).toThrow(/prohibited/)
+    expect(() => assertOutboundUrl('http://[64:ff9b::7f00:1]/', { allowLoopbackHttp: true })).toThrow()
+    expect(assertOutboundUrl('http://[::1]/', { allowLoopbackHttp: true }).protocol).toBe('http:')
+  })
+
+  it('consumes a rejected token promise when its source aborts synchronously', async () => {
+    const fetch = mockHttp()
+    const abort = new AbortController()
+    let abortInSource = false
+    const rejected = Promise.reject(new Error('token failed'))
+    // Keep the RED run contained; observe whether the client attaches its own consumer.
+    await rejected.catch(() => {})
+    const consume = vi.spyOn(rejected, 'then')
+    const client = httpClient(() => {
+      if (!abortInSource) return Promise.resolve(undefined)
+      abortInSource = false
+      abort.abort()
+      return rejected
+    })
+    await client.listTools()
+    abortInSource = true
+    fetch.mockClear()
+    await expect(client.callTool('query', {}, 1_000, abort.signal)).rejects.toMatchObject({ receipt: { kind: 'not_dispatched' } })
+    expect(consume).toHaveBeenCalled()
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('aborts after entering token resolution without sending a cancellation or resolving another token', async () => {
+    const fetch = mockHttp()
+    const entered = barrier()
+    const token = barrier<string | undefined>()
+    let waiting = false
+    const source = vi.fn(() => {
+      if (!waiting) return Promise.resolve(undefined)
+      entered.resolve()
+      return token.promise
+    })
+    const client = httpClient(source)
+    await client.listTools()
+    waiting = true
+    source.mockClear()
+    fetch.mockClear()
+    const abort = new AbortController()
+    const call = client.callTool('query', {}, 1_000, abort.signal).catch((error: unknown) => error)
+    await entered.promise
+    abort.abort()
+    expect(await call).toMatchObject({ receipt: { kind: 'not_dispatched' } })
+    token.resolve('late-token')
+    await Promise.resolve()
+    expect(source).toHaveBeenCalledTimes(1)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('cancels a dispatched request with its original id and token without resolving tokens again', async () => {
+    const fetch = mockHttp()
+    const source = vi.fn(async () => 'original-token')
+    const client = httpClient(source)
+    await client.listTools()
+    const entered = barrier()
+    let requestId: number | undefined
+    fetch.mockImplementation(async (_url, init) => {
+      const rpc = JSON.parse(String(init?.body)) as { id?: number; method: string }
+      if (rpc.method !== 'tools/call') return new Response(null, { status: 202 })
+      requestId = rpc.id
+      entered.resolve()
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+      })
+    })
+    source.mockClear()
+    fetch.mockClear()
+    const abort = new AbortController()
+    const call = client.callTool('query', {}, 1_000, abort.signal).catch((error: unknown) => error)
+    await entered.promise
+    abort.abort()
+    expect(await call).toMatchObject({ receipt: { kind: 'possibly_dispatched' } })
+    await expect.poll(() => fetch.mock.calls.length).toBe(2)
+    const cancellation = fetch.mock.calls[1]![1]!
+    expect(JSON.parse(String(cancellation.body))).toMatchObject({ method: 'notifications/cancelled', params: { requestId } })
+    expect(new Headers(cancellation.headers).get('authorization')).toBe('Bearer original-token')
+    expect(source).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a caller transport connected while recovery teardown is suspended', async () => {
+    mockHttp()
+    const client = httpClient(undefined, { breakerDurationMs: 10, reconnectJitterMs: 0 })
+    await client.listTools()
+    const old = internal(client).transport!
+    internal(client).openBreaker(async () => {})
+    // Model the transport still awaiting teardown when the recovery callback captures it.
+    internal(client).transport = old
+    const entered = barrier()
+    const release = barrier()
+    vi.spyOn(old, 'stop').mockImplementation(() => { entered.resolve(); return release.promise })
+    await entered.promise
+    const call = client.callTool('query', {}, 1_000)
+    const outcome = await Promise.race([call.then(() => 'connected'), new Promise<string>((resolve) => setTimeout(() => resolve('blocked'), 100))])
+    const current = internal(client).transport
+    const started = client.transportsStarted
+    release.resolve()
+    await call
+    await expect.poll(() => internal(client).recoveryRunning).toBe(false)
+    expect(outcome).toBe('connected')
+    expect(current).not.toBe(old)
+    expect(internal(client).transport).toBe(current)
+    expect(client.transportsStarted).toBe(started)
+  })
+
+  it.each(['retired', 'noncurrent', 'dead'] as const)('late success on a %s transport does not close the breaker or revive state', async (mode) => {
+    const fetch = mockHttp()
+    const client = httpClient(undefined, { breakerDurationMs: 60_000 })
+    await client.listTools()
+    const entered = barrier()
+    const response = barrier<Response>()
+    fetch.mockImplementationOnce(async (_url, init) => {
+      const rpc = JSON.parse(String(init?.body)) as { id: number }
+      entered.resolve()
+      const result = await response.promise
+      return new Response(JSON.stringify({ id: rpc.id, result: { content: [] } }), { headers: result.headers })
+    })
+    const call = client.callTool('query', {}, 1_000)
+    await entered.promise
+    if (mode === 'retired') await client.disconnect()
+    else if (mode === 'noncurrent') internal(client).openBreaker()
+    else {
+      internal(client).transport!.state = 'failed'
+      client.state = 'failed'
+    }
+    const state = client.state
+    const until = client.breakerOpenUntil
+    response.resolve(new Response(null, { headers: { 'content-type': 'application/json' } }))
+    await call
+    expect(client.state).toBe(state)
+    expect(client.breakerOpenUntil).toBe(until)
+  })
   it('#5 rejects private IPv4 embedded in normalized IPv6', () => {
     for (const host of ['::ffff:10.0.0.1', '::ffff:a00:1', '::a00:1', '64:ff9b::a00:1', '::ffff:169.254.169.254']) {
       expect(() => assertOutboundUrl(`https://[${host}]/`)).toThrow(/prohibited/)

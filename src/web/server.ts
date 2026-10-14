@@ -133,7 +133,7 @@ import { MutationStore, readFileIfPresent } from '../harness/mcp/mutation-store.
 import { recoverMigrations } from '../harness/mcp/migration.ts'
 import { DataHomeLock } from '../harness/mcp/ownership-lock.ts'
 import { ManagedOAuth } from '../harness/mcp/oauth.ts'
-import { beginConnect, callbackPage, grantMatchesServer, managedAuthOf, OAuthConnectError, oauthRowState, parseOAuthOrigins } from './mcp-oauth-connect.ts'
+import { beginConnect, callbackPage, grantMatchesServer, managedAuthOf, OAuthConnectError, oauthConfigIdentity, oauthRowState, parseOAuthOrigins } from './mcp-oauth-connect.ts'
 import { OAuthStore } from '../harness/mcp/oauth-store.ts'
 import { containmentCapability, resolveCanonicalExecutable } from '../harness/mcp/process-controller.ts'
 import { stageMcpOutcome } from '../harness/mcp/staged-outcome.ts'
@@ -806,7 +806,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     const ref = managedAuthOf(config.servers[serverName])?.clientSecret
     if (ref === undefined) return undefined
     return resolveSecretRefs(ref, await mcpStore.loadSecrets(workspaceId), `mcp.json server '${serverName}' auth.clientSecret`)
-  })
+  }, async (workspaceId, serverName) => oauthConfigIdentity((await mcpStore.loadMcp(workspaceId)).servers[serverName]))
   const sessionPrincipals = new Map<string, string>()
   const mcpClients = new Map<string, McpServerClient>() // `${wsId}:${server}`
   const mcpClientGeneration = new Map<string, number>()
@@ -2139,7 +2139,13 @@ ${entry.description}`.toLowerCase().includes(query))
       }
     }
     const removed: string[] = []
-    const wanted = new Map(drafts.filter((draft) => draft.body['transport'] !== 'stdio' || pins.has(draft.name)).map((draft) => [draft.name, draft]))
+    // Normalization is compatible with existing names, but is not injective.
+    // Never silently choose the last of two colliding plugin server drafts.
+    const counts = new Map<string, number>()
+    for (const draft of drafts) counts.set(draft.name, (counts.get(draft.name) ?? 0) + 1)
+    const collisions = new Set([...counts].filter(([, count]) => count > 1).map(([name]) => name))
+    for (const name of collisions) problems.push(`${name}: generated MCP name collision; all conflicting servers are skipped`)
+    const wanted = new Map(drafts.filter((draft) => !collisions.has(draft.name) && (draft.body['transport'] !== 'stdio' || pins.has(draft.name))).map((draft) => [draft.name, draft]))
     let changed = false
     await updateMcpConfig(workspaceId, (current) => {
       let next = current
@@ -2154,6 +2160,16 @@ ${entry.description}`.toLowerCase().includes(query))
         const existing = next.servers[name]
         if (existing !== undefined && existing.provenance?.plugin === undefined) {
           problems.push(`${name}: a server you added has this name; the plugin's server is skipped`)
+          continue
+        }
+        const provenance = draft.body['provenance'] as { plugin?: string } | undefined
+        if (existing !== undefined && existing.provenance?.plugin !== provenance?.plugin) {
+          problems.push(`${name}: owned by '${existing.provenance?.plugin}'; the colliding plugin's server is skipped`)
+          // The owner is no longer the requested plugin. Neither leave its
+          // connection running nor silently transfer ownership to the new one.
+          next = withoutServer(next, name)
+          removed.push(name)
+          changed = true
           continue
         }
         const { enabled: _e, executable: _x, name: _n, ...previous } = (existing ?? {}) as unknown as Record<string, unknown>
@@ -2177,6 +2193,9 @@ ${entry.description}`.toLowerCase().includes(query))
         // the removals or the other plugins' servers in the same reconcile.
         try {
           next = withServerActivated(upsertServer(next, name, draft.body), name, pins.get(name))
+          // This is a fresh activation, not the user's Disable of an existing
+          // server. Clear its old removal marker before yielding the write turn.
+          mcpCancelled.delete(`${workspaceId}:${name}`)
           changed = true
         } catch (error) {
           problems.push(`${name}: ${String(error instanceof Error ? error.message : error)}`)
@@ -2308,8 +2327,21 @@ ${entry.description}`.toLowerCase().includes(query))
   /** Apply `transform` to the CURRENT config; it may throw to refuse (stale revision, missing server). */
   function updateMcpConfig(workspaceId: WorkspaceId, transform: (current: McpConfig) => McpConfig): Promise<McpConfig> {
     return serializeMcpMutation(workspaceId, async () => {
-      const next = transform(await mcpStore.loadMcp(workspaceId))
-      await writeDesiredState(workspaceId, 'config', mcpStore.mcpPath(workspaceId), () => mcpStore.saveMcp(workspaceId, next))
+      const current = await mcpStore.loadMcp(workspaceId)
+      const next = transform(current)
+      // Serialize OAuth publication with config writes, never with the network exchange.
+      const changed = Object.keys(current.servers).filter((name) => oauthConfigIdentity(current.servers[name]) !== oauthConfigIdentity(next.servers[name]))
+      const save = async (index: number): Promise<void> => {
+        if (index === changed.length) {
+          await writeDesiredState(workspaceId, 'config', mcpStore.mcpPath(workspaceId), () => mcpStore.saveMcp(workspaceId, next))
+          return
+        }
+        await oauthStore.withPublicationLock(workspaceId, changed[index]!, async () => {
+          await save(index + 1)
+          await oauthStore.invalidate(workspaceId, changed[index]!)
+        })
+      }
+      await save(0)
       configWatch.set(workspaceId, await fileDigest(workspaceId))
       drifted.delete(workspaceId)
       return next
@@ -5627,6 +5659,7 @@ async function handleApi(
           const revocationEndpoint = managed ? (await deps.oauthStore.readServerRecord(wsId, serverName))?.revocationEndpoint : undefined
           // Stop the process and drop its tool schemas before the config forgets it.
           await deps.cancelMcpConnection(wsId, serverName)
+          await deps.oauthStore.invalidate(wsId, serverName)
           await deps.updateMcpConfig(wsId, (current) => withoutServer(current, serverName))
           // Revoke locally first so a racing refresh cannot write the grant back;
           // the same call also asks the provider to void the token.

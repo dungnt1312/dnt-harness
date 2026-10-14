@@ -67,6 +67,7 @@ export interface OAuthBegin {
   readonly tokenEndpointAuth?: TokenEndpointAuth
   /** Discovery for a pending Connect; promoted with its tokens only on completion. */
   readonly serverRecord?: OAuthServerRecord
+  readonly configIdentity?: string
 }
 
 export class OAuthFlowError extends Error {
@@ -90,6 +91,7 @@ export class ManagedOAuth {
     private readonly fetchImpl: typeof fetch = fetch,
     private readonly now: () => number = () => Date.now(),
     private readonly secretFor: ClientSecretSource = async () => undefined,
+    private readonly currentConfig?: (workspaceId: string, server: string) => Promise<string | undefined>,
   ) {}
 
   /** Read-only view of the stored grant (phase, missing scope); never sent to a browser as is. */
@@ -152,6 +154,8 @@ export class ManagedOAuth {
       scopes: input.scopes,
       expiresAt: this.now() + 5 * 60_000,
       code: undefined,
+      incarnation: await this.store.incarnation(input.workspaceId, input.server),
+      ...(input.configIdentity !== undefined ? { configIdentity: input.configIdentity } : {}),
       ...(input.tokenEndpointAuth !== undefined ? { tokenEndpointAuth: input.tokenEndpointAuth } : {}),
       ...(input.serverRecord !== undefined ? { serverRecord: input.serverRecord } : {}),
     })
@@ -214,9 +218,11 @@ export class ManagedOAuth {
   async complete(input: { readonly state: string; readonly principalId: string; readonly workspaceId: string; readonly server: string }): Promise<OAuthTokens> {
     const tx = await this.store.readTransaction(input.state)
     if (tx === undefined || tx.code === undefined) throw new OAuthFlowError('authorization has not been deposited')
+    if (tx.expiresAt <= this.now()) throw new OAuthFlowError('authorization has expired; start Connect again')
     if (tx.principalId !== input.principalId || tx.workspaceId !== input.workspaceId || tx.server !== input.server) {
       throw new OAuthFlowError('callback does not belong to this principal, workspace, and server')
     }
+    if (tx.incarnation !== await this.store.incarnation(tx.workspaceId, tx.server)) throw new OAuthFlowError('authorization was locally revoked or replaced')
     const fence = grantFence(this.store, tx.workspaceId, tx.server)
     const generation = fence.generation
     const client = await this.clientAuth(tx.workspaceId, tx.server, tx.clientId, tx.tokenEndpointAuth)
@@ -227,17 +233,22 @@ export class ManagedOAuth {
       redirect_uri: tx.redirectUri,
       resource: tx.resource,
     }), client)
-    await serializeWrite(fence, async () => {
-      if (fence.generation !== generation) throw new OAuthFlowError('authorization was locally revoked or replaced')
-      await this.store.saveTokens(tx.workspaceId, tx.server, { ...tokens, phase: 'active', resource: tx.resource })
-      if (tx.serverRecord !== undefined) await this.store.saveServerRecord(tx.workspaceId, tx.server, tx.serverRecord)
+    await this.store.withPublicationLock(tx.workspaceId, tx.server, () => serializeWrite(fence, async () => {
+      if (fence.generation !== generation || tx.incarnation !== await this.store.incarnationUnlocked(tx.workspaceId, tx.server)) throw new OAuthFlowError('authorization was locally revoked or replaced')
+      if (tx.expiresAt <= this.now()) throw new OAuthFlowError('authorization has expired; start Connect again')
+      if (tx.configIdentity !== undefined && await this.currentConfig?.(tx.workspaceId, tx.server) !== tx.configIdentity) {
+        throw new OAuthFlowError('server OAuth configuration changed; start Connect again')
+      }
+      const active = { ...tokens, phase: 'active' as const, resource: tx.resource }
+      if (tx.serverRecord !== undefined) await this.store.publishGrant(tx.workspaceId, tx.server, active, tx.serverRecord)
+      else await this.store.saveTokens(tx.workspaceId, tx.server, active)
       if (fence.generation !== generation) throw new OAuthFlowError('authorization was locally revoked or replaced')
       // Linearize replacement after persistence, without an intervening await.
       // Refreshes started even during this write belong to the previous grant;
       // queued completes must not overwrite it, and an in-write revoke wins.
       fence.generation += 1
       fence.revoked = false
-    })
+    }))
     await this.store.deleteTransaction(input.state)
     return tokens
   }
@@ -334,13 +345,14 @@ export class ManagedOAuth {
     const fence = grantFence(this.store, workspaceId, server)
     fence.generation += 1
     fence.revoked = true // Fence callers synchronously, before any disk/network await.
-    const current = await serializeWrite(fence, async () => {
+    const current = await this.store.withPublicationLock(workspaceId, server, () => serializeWrite(fence, async () => {
+      await this.store.invalidateUnlocked(workspaceId, server)
       const stored = await this.store.readTokens(workspaceId, server)
       await this.store.saveTokens(workspaceId, server, stored === undefined
         ? tombstone(workspaceId, server)
         : { ...stored, phase: 'local_revoked', accessToken: '', refreshToken: '' })
       return stored
-    })
+    }))
     if (revocationEndpoint === undefined || current === undefined || current.accessToken === '') return { local: 'revoked', remote: 'unavailable' }
     try {
       assertOauthUrl(revocationEndpoint)
