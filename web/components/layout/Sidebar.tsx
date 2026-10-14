@@ -9,6 +9,7 @@ import { SessionList } from '../session/SessionList.tsx'
 import { WorkspacePopover } from './WorkspacePopover.tsx'
 import { useHotkeys } from '../../hooks/useHotkeys.ts'
 import { cn } from '../../lib/cn.ts'
+import { activityAt } from '../../lib/format.ts'
 import type { ThemePreference } from '../../lib/theme.ts'
 import type { ProjectRow, SessionListing, SessionSort, WorkspaceRow } from '../../lib/types.ts'
 
@@ -30,7 +31,7 @@ const MOD = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator
 /** A sidebar action row: same height, padding and icon column as a conversation row. */
 const navRowClass = 'group flex h-9 w-full items-center gap-2 rounded-lg px-2.5 text-sm text-fg transition-colors hover:bg-hover disabled:pointer-events-none disabled:opacity-40'
 
-/** Recency default keeps the server's listing order; the rest sort explicitly. */
+/** Recency means the user's last touch (`activityAt`), never an agent's background logging; the rest sort explicitly. */
 function orderedSessions(sessions: readonly SessionListing[], sort: SessionSort, runningOnly: boolean, current: string | null, liveRunning: boolean): readonly SessionListing[] {
   const visible = runningOnly
     ? sessions.filter((session) => (session.status ?? 'idle') === 'running' || (session.id === current && liveRunning))
@@ -38,8 +39,8 @@ function orderedSessions(sessions: readonly SessionListing[], sort: SessionSort,
   const sorted = [...visible]
   sorted.sort((a, b) => {
     if (sort === 'title') return (a.title || 'New conversation').localeCompare(b.title || 'New conversation')
-    const ta = a.updatedAt ?? 0
-    const tb = b.updatedAt ?? 0
+    const ta = activityAt(a) ?? 0
+    const tb = activityAt(b) ?? 0
     return sort === 'oldest' ? ta - tb : tb - ta
   })
   return sorted

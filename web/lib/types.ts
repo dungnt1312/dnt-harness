@@ -269,6 +269,11 @@ export type SessionSort = 'recent' | 'oldest' | 'title'
 export interface SessionListing {
   readonly createdAt?: number
   readonly updatedAt?: number
+  /**
+   * When the user last typed into the conversation. Orders the sidebar and
+   * feeds its age column; `updatedAt` also moves while an agent streams.
+   */
+  readonly lastUserActivityAt?: number
   readonly id: string
   readonly title: string
   readonly eventCount: number

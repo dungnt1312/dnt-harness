@@ -21,6 +21,14 @@ export function formatTime(ts?: number): string {
   return new Date(ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
 }
 
+/**
+ * The instant the sidebar orders and dates a conversation by: when the user
+ * last typed into it. Older servers omit the mark, so `updatedAt` stands in.
+ */
+export function activityAt(session: { readonly lastUserActivityAt?: number; readonly updatedAt?: number }): number | undefined {
+  return session.lastUserActivityAt ?? session.updatedAt
+}
+
 /** Compact sidebar age: now, 5m, 3h, 2d, 1w — coarser buckets only. */
 export function formatAge(ts: number | undefined, now = Date.now()): string {
   if (ts === undefined) return ''

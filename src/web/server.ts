@@ -9236,7 +9236,9 @@ function listSessions(workspaceId: WorkspaceId, deps: HandlerDeps, automationRun
       // straight from storage shows the same title it shows once loaded.
       title: summary.title ?? summary.derivedTitle ?? (entry !== undefined ? deriveTitle(entry.session.events) : null) ?? 'New conversation',
       // Empty summaries use a current-time fallback, not a durable fact.
-      ...(summary.eventCount > 0 ? { createdAt: summary.createdAt, updatedAt: summary.updatedAt } : {}),
+      ...(summary.eventCount > 0
+        ? { createdAt: summary.createdAt, updatedAt: summary.updatedAt, lastUserActivityAt: summary.lastUserActivityAt ?? summary.updatedAt }
+        : {}),
       eventCount: summary.eventCount,
       folder: entry !== undefined ? (deps.legacyFolders.get(summary.id) ?? null) : null,
       projectId: entry?.projectId ?? summary.projectId ?? null,
