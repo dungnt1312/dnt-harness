@@ -149,7 +149,7 @@ describe('production conversation workflows', () => {
     expect(html).toContain('123')
     expect(html).toContain('exact')
     expect(html).toContain('C:/code')
-    expect(html).toContain('not the project or future requests')
+    expect(html).toContain('apply to this request only')
     expect(html).not.toContain('<script>')
     expect(html).toContain('Allow once')
   })

@@ -740,6 +740,12 @@ describe('approval card actions', () => {
     await mount(<ApprovalBar approvals={[{ approvalId: 'a', call: { id: 'c', name: 'Bash', args: {} }, expiresAt: Date.now() - 1_000 }]} onAnswer={vi.fn()} />)
     expect(host.textContent).toContain('Expired')
   })
+  it('waits quietly when a host configured no expiry: no countdown, answerable', async () => {
+    await mount(<ApprovalBar approvals={[{ approvalId: 'a', call: { id: 'c', name: 'Bash', args: {} } }]} onAnswer={vi.fn()} />)
+    expect(host.textContent).not.toContain('Cancels itself')
+    expect(host.textContent).not.toContain('Expired')
+    expect(button('Allow once')).not.toBeNull()
+  })
 })
 
 describe('queued input projection', () => {

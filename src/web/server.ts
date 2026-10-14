@@ -212,8 +212,8 @@ declare module 'dnt-harness' {
       readonly definitionName?: string
       /** MCP (or other) tools annotated as requiring a human each call. */
       readonly interactive?: boolean
-      /** Epoch ms when this question expires undecided. */
-      readonly expiresAt: number
+      /** Epoch ms when this question expires undecided; absent when the host set no expiry. */
+      readonly expiresAt?: number
     }): void
     /** A pending question was settled (answer, expiry, stop, or policy). */
     'web/approval-settled'(payload: {
@@ -503,8 +503,8 @@ interface PendingApproval {
   /** The asking child's agent definition, when this is a child's question. */
   readonly definitionName?: string
   readonly interactive: boolean
-  /** Epoch ms from the policy's own timer — the one deadline the UI shows. */
-  readonly expiresAt: number
+  /** Epoch ms from the policy's own timer — the one deadline the UI shows; absent when set to wait forever. */
+  readonly expiresAt?: number
   /** Dangerous-command guard note, replayed on every (re)connect. */
   readonly guardWarning?: string
   /** Out-of-grant note, replayed on every (re)connect. */
@@ -590,7 +590,7 @@ function approvalEnvelope(approvalId: string, waiting: PendingApproval, viewerSe
     kind: 'approval',
     approvalId,
     call: waiting.call,
-    expiresAt: waiting.expiresAt,
+    ...(waiting.expiresAt !== undefined ? { expiresAt: waiting.expiresAt } : {}),
     ...(waiting.interactive ? { interactive: true } : {}),
     ...(waiting.guardWarning !== undefined ? { guardWarning: waiting.guardWarning } : {}),
     ...(waiting.scopeWarning !== undefined ? { scopeWarning: waiting.scopeWarning } : {}),
@@ -3979,7 +3979,7 @@ ${entry.description}`.toLowerCase().includes(query))
           ...(principalId !== undefined ? { principalId } : {}),
           call,
           interactive,
-          expiresAt: lifecycle.expiresAt,
+          ...(lifecycle.expiresAt !== undefined ? { expiresAt: lifecycle.expiresAt } : {}),
           ...(parentSessionId !== undefined ? { parentSessionId } : {}),
           ...(definitionName !== undefined ? { definitionName } : {}),
           ...(guardWarning !== undefined ? { guardWarning } : {}),
@@ -4003,7 +4003,7 @@ ${entry.description}`.toLowerCase().includes(query))
           sessionId: scope.sessionId,
           approvalId,
           call,
-          expiresAt: lifecycle.expiresAt,
+          ...(lifecycle.expiresAt !== undefined ? { expiresAt: lifecycle.expiresAt } : {}),
           ...(parentSessionId !== undefined ? { parentSessionId } : {}),
           ...(definitionName !== undefined ? { definitionName } : {}),
           ...(interactive ? { interactive: true } : {}),
@@ -10504,7 +10504,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
         kind: 'approval',
         approvalId: payload.approvalId,
         call: payload.call,
-        expiresAt: payload.expiresAt,
+        ...(payload.expiresAt !== undefined ? { expiresAt: payload.expiresAt } : {}),
         ...(payload.interactive === true ? { interactive: true } : {}),
         ...(payload.guardWarning !== undefined ? { guardWarning: payload.guardWarning } : {}),
         ...(payload.scopeWarning !== undefined ? { scopeWarning: payload.scopeWarning } : {}),

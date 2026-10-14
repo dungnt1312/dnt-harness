@@ -360,6 +360,7 @@ describe('aggregate request lifecycle', () => {
     expect(resolveLimits({ compactionDeadlineMs: -1 }).compactionDeadlineMs).toBe(DEFAULT_LIMITS.compactionDeadlineMs)
     expect(resolveLimits({ compactionOutputTokens: 4_000 }).compactionOutputTokens).toBe(4_000)
     expect(resolveLimits({ compactionCandidateWaitMs: 0 }).compactionCandidateWaitMs).toBe(0)
+    expect(resolveLimits({ approvalExpiryMs: 0 }).approvalExpiryMs).toBe(0)
   })
   it('commitment prohibits retry and stop wins transport races', () => {
     const owner = new LogicalRequest()

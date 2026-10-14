@@ -57,16 +57,16 @@ function isProse(key: string, value: unknown): value is string {
  * `limit` bounds what is drawn, never what is copied: a surface that must stay
  * small (an approval card) can clip a huge payload and still hand over all of it.
  */
-export function ToolArguments({ call, limit }: { readonly call: ToolCall; readonly limit?: number }) {
+export function ToolArguments({ call, limit, part = 'all' }: { readonly call: ToolCall; readonly limit?: number; readonly part?: 'all' | 'prose' }) {
   const complete = JSON.stringify(call.args, null, 2)
   const entries = Object.entries(call.args)
   const prose = entries.filter(([key, value]) => isProse(key, value)) as [string, string][]
   const rest = Object.fromEntries(entries.filter(([key, value]) => !isProse(key, value)))
   const restText = JSON.stringify(rest, null, 2)
   const clip = (text: string): string => (limit === undefined || text.length <= limit ? text : `${text.slice(0, limit)}\n…`)
-  const clipped = limit !== undefined && (restText.length > limit || prose.some(([, value]) => value.length > limit))
+  const clipped = limit !== undefined && ((part !== 'prose' && restText.length > limit) || prose.some(([, value]) => value.length > limit))
   // When every argument is a prose block, a lone `{}` above them says nothing.
-  const showJson = Object.keys(rest).length > 0 || prose.length === 0
+  const showJson = part !== 'prose' && (Object.keys(rest).length > 0 || prose.length === 0)
   return (
     <>
       {showJson ? (
@@ -83,6 +83,7 @@ export function ToolArguments({ call, limit }: { readonly call: ToolCall; readon
     </>
   )
 }
+
 
 /** Whether any argument is a block of text a one-line target cannot show. */
 export function hasProseArgs(args: Record<string, unknown>): boolean {

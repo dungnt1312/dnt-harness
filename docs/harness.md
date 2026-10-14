@@ -406,7 +406,7 @@ interface ApprovalOptions {
 interface ApprovalLifecycle {
   approvalId: string      // the id in the log and the id a bridge answers with
   done: Promise<void>     // settled without an answer: retire the question
-  expiresAt: number       // epoch ms; transports show the decision window
+  expiresAt?: number      // epoch ms; transports show the decision window. Absent when expiryMs is 0 (no deadline)
 }
 ```
 
@@ -449,7 +449,8 @@ for another workspace. `requestDetails(call)` adds facts (such as the
 out-of-grant warning) to the durable `approval/request`.
 
 An approval is bound to the exact call it names: it carries an expiry
-(undecided requests settle as `expired` — never an implicit approval), and a
+(undecided requests settle as `expired` — never an implicit approval; a host
+may set `approvalExpiryMs: 0` to wait forever instead), and a
 stop/cancel or a policy change settles it as `cancelled`/`invalidated` before
 it can be answered. Every settlement is a durable `approval/decision` event,
 and late answers to a settled approval are refused rather than replayed.

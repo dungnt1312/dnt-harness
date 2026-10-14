@@ -524,7 +524,7 @@ describe('approval lifecycle', () => {
     const session = kernel.ctx.sessions.create()
     kernel.ctx.tools.register(echoTool)
     const before = Date.now()
-    let deadline = 0
+    let deadline: number | undefined
     attachApproval(kernel.ctx, {
       policy: { Echo: 'ask' },
       expiryMs: 60_000,
@@ -539,6 +539,36 @@ describe('approval lifecycle', () => {
     // A transport has to show the window it is asking inside, so the
     // deadline comes from the policy's own timer, not a second estimate.
     expect(deadline).toBeGreaterThanOrEqual(before + 60_000)
+    void kernel.stop()
+  })
+
+  it('expiryMs 0 never settles an ask: it waits until answered or the turn stops', async () => {
+    const kernel = new Kernel()
+    kernel.ctx.plugin(SessionsService)
+    kernel.ctx.plugin(LlmService)
+    kernel.ctx.plugin(ToolsService)
+    kernel.ctx.plugin(AgentsService)
+    const session = kernel.ctx.sessions.create()
+    kernel.ctx.tools.register(echoTool)
+    let asking!: () => void
+    const asked = new Promise<void>((resolve) => { asking = resolve })
+    let deadline: number | undefined
+    attachApproval(kernel.ctx, {
+      policy: { Echo: 'ask' },
+      expiryMs: 0,
+      askUser: (_call, lifecycle) => {
+        deadline = lifecycle.expiresAt
+        asking()
+        return new Promise<boolean>(() => {})
+      },
+    })
+    const pending = agentScope.run({ sessionId: session.id }, () => kernel.ctx.tools.execute(call('Echo')))
+    await asked
+    // No deadline is surfaced and no timer settles it, ever.
+    expect(deadline).toBeUndefined()
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    const stillOpen = await Promise.race([pending.then(() => 'closed'), new Promise((resolve) => setTimeout(() => resolve('open'), 0))])
+    expect(stillOpen).toBe('open')
     void kernel.stop()
   })
 

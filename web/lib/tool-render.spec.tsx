@@ -208,9 +208,9 @@ describe('a run keeps what the reader opened', () => {
 
 describe('approval card', () => {
   const approval = (call: { name: string; args: Record<string, unknown> }) => [{ approvalId: 'a', call: { id: 'c', ...call } }]
-  it('opens a multi-line command already showing it, so the decision is made on the text', async () => {
+  it('previews a multi-line command without a fold, so the decision is made on the text', async () => {
     await mount(<ApprovalBar approvals={approval({ name: 'Bash', args: { command: 'cd build\nrm -rf *\necho done' } })} onAnswer={() => {}} />)
-    expect(host.querySelector('details')!.hasAttribute('open')).toBe(true)
+    expect(host.querySelector('details')).toBeNull()
     const command = host.querySelector('pre[aria-label="Command"]')!
     expect(command.textContent).toBe('cd build\nrm -rf *\necho done')
   })
