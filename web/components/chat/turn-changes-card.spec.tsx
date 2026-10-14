@@ -154,6 +154,9 @@ it('the Git actions are labelled as git and offered only with their callbacks', 
   // The Git view narrows to project-relative paths, the form git reports.
   expect(onReviewFile).toHaveBeenCalledWith('src/a.ts')
   expect(view.querySelector('button[aria-label="Open a.ts in workbench"]')).not.toBeNull()
+  // A file the turn created has no HEAD to diff: only the file opener.
+  expect(view.querySelector('button[aria-label^="Show git diff of notes.md"]')).toBeNull()
+  expect(view.querySelector('button[aria-label="Open notes.md in workbench"]')).not.toBeNull()
 
   const plain = await mount(CHANGES)
   expect([...plain.querySelectorAll('button')].some((button) => button.textContent === 'Open in Git')).toBe(false)

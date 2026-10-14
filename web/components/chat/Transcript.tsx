@@ -301,10 +301,14 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   // row, whether or not the turn wrote any answer text — and the open turn's
   // card is the same element, live, growing as edits land.
   const changeAnchors = useMemo(() => turnChangeAnchors(items, turnChangeMap), [items, turnChangeMap])
-  const changeCard = (anchor: TurnChangeAnchor): ReactNode => {
+  // The card closing the whole transcript pulls toward the footer (status line
+  // and composer) by eating into the column's bottom padding; a card with more
+  // transcript after it keeps its normal beat above the next block. Either way
+  // it sits further from the tool row above it than the old 6px.
+  const changeCard = (anchor: TurnChangeAnchor, atTail: boolean): ReactNode => {
     const review = reviewAllOf(anchor.changes)
     return (
-      <div key={`turn-changes-${anchor.turnId}`} className="mt-1.5">
+      <div key={`turn-changes-${anchor.turnId}`} className={atTail ? 'mt-3 -mb-4' : 'mt-3'}>
         <TurnChangesCard
           turnId={anchor.turnId}
           changes={anchor.changes}
@@ -469,7 +473,8 @@ export const Transcript = memo(function Transcript({ items, events, conversation
               {visibleBlocks.map((block, position) => {
                 const cards = cardsAfter.get(position)
                 const body = renderBlock(block)
-                return cards === undefined ? body : [body, ...cards.map(changeCard)]
+                const lastBlock = position === visibleBlocks.length - 1
+                return cards === undefined ? body : [body, ...cards.map((anchor, at) => changeCard(anchor, lastBlock && at === cards.length - 1))]
               })}
             </div>
           </div>

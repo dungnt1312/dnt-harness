@@ -1,6 +1,7 @@
 import * as Popover from '@radix-ui/react-popover'
 import { memo, useEffect, useRef, useState } from 'react'
 import Icon from '../common/Icon.tsx'
+import { Logo } from '../common/Logo.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Kbd } from '../ui/Kbd.tsx'
 import { Menu, menuItemClass } from '../ui/Menu.tsx'
@@ -22,6 +23,12 @@ const SORT_OPTIONS: readonly { readonly value: SessionSort; readonly label: stri
   { value: 'oldest', label: 'Oldest activity' },
   { value: 'title', label: 'Title A–Z' },
 ]
+
+/** The shortcut modifier as the platform names it. */
+const MOD = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl'
+
+/** A sidebar action row: same height, padding and icon column as a conversation row. */
+const navRowClass = 'group flex h-9 w-full items-center gap-2 rounded-lg px-2.5 text-sm text-fg transition-colors hover:bg-hover disabled:pointer-events-none disabled:opacity-40'
 
 /** Recency default keeps the server's listing order; the rest sort explicitly. */
 function orderedSessions(sessions: readonly SessionListing[], sort: SessionSort, runningOnly: boolean, current: string | null, liveRunning: boolean): readonly SessionListing[] {
@@ -103,54 +110,86 @@ export const Sidebar = memo(function Sidebar(props: SidebarProps) {
   const listed = orderedSessions(sessions, sort, runningOnly, current, running)
   const sortAdjusted = runningOnly || sort !== 'recent'
 
+  const closeSearch = (): void => { onFilter(''); setSearchOpen(false) }
+
   useHotkeys([{ key: 'k', mod: true, onPress: () => setSearchOpen(true) }])
   // Focus follows the field into existence, so Ctrl+K types straight into it.
   useEffect(() => { if (showSearch) searchRef.current?.focus() }, [showSearch])
 
   return (
     <nav aria-label="Conversations and projects" className="flex h-full min-h-0 w-full flex-col bg-sidebar text-fg">
-      <div className="flex h-14 shrink-0 items-center justify-between px-3">
-        <span className="px-1.5 text-[15px] font-semibold tracking-tight">dnt-harness</span>
-        <IconButton label="Close sidebar" size="md" onClick={onClose}><Icon name="panelLeft" size={18} /></IconButton>
+      {/* Brand row: the 24px mark is centred on the 16px icon column of every
+          row below (px-2 shell + pl-1.5), the collapse control on the right edge. */}
+      <div className="flex h-14 shrink-0 items-center gap-2 px-2">
+        <span className="flex min-w-0 flex-1 items-center gap-2 pl-1.5">
+          <Logo size={24} />
+          <span className="truncate text-[15px] font-semibold tracking-tight">DntHarness</span>
+        </span>
+        <IconButton label="Close sidebar" onClick={onClose}><Icon name="panelLeft" size={17} /></IconButton>
       </div>
 
-      <div className="flex shrink-0 flex-col px-2">
-        {/* One raised primary action, then a caption row that owns search and
-            filter as icons: neither deserves a permanent row of its own. */}
+      <div className="flex shrink-0 flex-col gap-px px-2">
+        {/* Primary actions are nav rows, shaped exactly like the conversation
+            rows below: icon column, label, and the shortcut as a quiet hint. */}
         <button
           type="button"
-          className="flex min-h-10 w-full items-center justify-center gap-2 rounded-xl bg-muted text-sm font-medium text-fg transition-colors hover:bg-hover disabled:pointer-events-none disabled:opacity-40"
+          className={navRowClass}
           onClick={onNew}
           disabled={archived}
-          title={archived ? 'Workspace is archived' : 'New conversation (Ctrl N)'}
+          title={archived ? 'Workspace is archived' : `New conversation (${MOD} N)`}
         >
-          <Icon name="squarePen" size={16} className="shrink-0" />
-          New conversation
+          <Icon name="squarePen" size={16} className="shrink-0 text-fg-muted group-hover:text-fg" />
+          <span className="flex-1 truncate text-left">New conversation</span>
+          <span className="hidden gap-0.5 group-hover:flex [@media(pointer:coarse)]:!hidden"><Kbd>{MOD}</Kbd><Kbd>N</Kbd></span>
         </button>
-        <div className="mt-2 flex items-center gap-0.5 pl-2.5">
-          <span className="flex-1 truncate text-xs font-medium text-fg-faint">Conversations</span>
-          <IconButton
-            label="Search conversations and folders (Ctrl K)"
-            aria-expanded={showSearch}
-            className={showSearch ? 'text-fg' : ''}
-            onClick={() => { if (showSearch) { onFilter(''); setSearchOpen(false) } else setSearchOpen(true) }}
+        {showSearch ? (
+          <label className="flex h-9 cursor-text items-center gap-2 rounded-lg bg-muted pl-2.5 pr-1.5 text-sm text-fg ring-1 ring-line-strong">
+            <Icon name="search" size={16} className="shrink-0 text-fg-muted" />
+            <input
+              ref={searchRef}
+              value={filter}
+              aria-label="Search conversations and folders"
+              placeholder="Search conversations"
+              onChange={(event) => onFilter(event.target.value)}
+              onKeyDown={(event) => { if (event.key === 'Escape') closeSearch() }}
+              className="h-9 min-w-0 flex-1 bg-transparent outline-none placeholder:text-fg-faint"
+            />
+            <button type="button" aria-label="Close search" title="Close search (Esc)" data-compact-control className="flex size-6 shrink-0 items-center justify-center rounded-md text-fg-faint hover:bg-hover hover:text-fg" onClick={closeSearch}>
+              <Icon name="close" size={14} />
+            </button>
+          </label>
+        ) : (
+          <button
+            type="button"
+            className={navRowClass}
+            aria-label={`Search conversations and folders (${MOD} K)`}
+            aria-expanded={false}
+            onClick={() => setSearchOpen(true)}
           >
-            <Icon name="search" size={15} />
-          </IconButton>
+            <Icon name="search" size={16} className="shrink-0 text-fg-muted group-hover:text-fg" />
+            <span className="flex-1 truncate text-left">Search</span>
+            <span className="hidden gap-0.5 group-hover:flex [@media(pointer:coarse)]:!hidden"><Kbd>{MOD}</Kbd><Kbd>K</Kbd></span>
+          </button>
+        )}
+        {/* Section caption: small label, the sort/filter control is a 24px
+            ghost that only shows on hover or once something is adjusted. */}
+        <div className="group/caption mt-4 flex h-7 items-center pl-2.5 pr-1.5">
+          <span className="flex-1 truncate text-xs font-medium text-fg-faint">Conversations</span>
           <Menu
             label="Sort and filter conversations"
             side="bottom"
             align="end"
             panelClassName="w-60"
+            compact
             triggerClassName={cn(
-              'relative flex size-9 shrink-0 items-center justify-center rounded-lg transition-colors hover:bg-hover',
-              sortAdjusted ? 'text-fg' : 'text-fg-muted hover:text-fg',
+              'relative flex size-6 shrink-0 items-center justify-center rounded-md transition-[opacity,color,background-color] hover:bg-hover focus-visible:opacity-100 data-[state=open]:opacity-100 data-[state=open]:bg-hover',
+              sortAdjusted ? 'text-fg' : 'text-fg-faint opacity-0 hover:text-fg group-hover/caption:opacity-100 [@media(pointer:coarse)]:opacity-100',
             )}
             trigger={() => (
               <>
-                <Icon name="funnel" size={15} />
+                <Icon name="sliders" size={14} />
                 {/* Not colour alone: the menu itself names what is adjusted. */}
-                {sortAdjusted ? <span className="absolute right-1.5 top-1.5 size-1.5 rounded-full bg-primary" aria-label="Sort or filter adjusted" /> : null}
+                {sortAdjusted ? <span className="absolute -right-0.5 -top-0.5 size-1.5 rounded-full bg-primary" aria-label="Sort or filter adjusted" /> : null}
               </>
             )}
           >
@@ -176,25 +215,6 @@ export const Sidebar = memo(function Sidebar(props: SidebarProps) {
             )}
           </Menu>
         </div>
-        {showSearch ? (
-          <label className="mt-1 flex min-h-9 cursor-text items-center gap-2 rounded-lg bg-muted px-2.5 text-sm text-fg transition-colors focus-within:bg-hover">
-            <Icon name="search" size={15} className="shrink-0 text-fg-muted" />
-            <input
-              ref={searchRef}
-              value={filter}
-              aria-label="Search conversations and folders"
-              placeholder="Conversation or folder name"
-              onChange={(event) => onFilter(event.target.value)}
-              onKeyDown={(event) => { if (event.key === 'Escape') { onFilter(''); setSearchOpen(false) } }}
-              className="h-9 min-w-0 flex-1 bg-transparent outline-none placeholder:text-fg-faint"
-            />
-            {filter !== '' ? (
-              <button type="button" aria-label="Clear search" className="shrink-0 text-fg-faint hover:text-fg" onClick={() => { onFilter(''); searchRef.current?.focus() }}>
-                <Icon name="close" size={14} />
-              </button>
-            ) : <Kbd>Esc</Kbd>}
-          </label>
-        ) : null}
         {archived ? (
           <p className="m-0 mt-1 flex items-start gap-2 rounded-lg bg-warn-soft px-2.5 py-2 text-xs text-warn" role="note">
             <Icon name="archive" size={14} className="mt-px" />

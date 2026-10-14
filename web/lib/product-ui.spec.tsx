@@ -1415,9 +1415,9 @@ describe('sidebar sections + live rows + workspace management', () => {
     expect(host.querySelector('input[aria-label="Search conversations and folders"]')).toBeNull()
     await act(async () => search().click())
     expect(host.querySelector('input[aria-label="Search conversations and folders"]')).not.toBeNull()
-    expect(search().getAttribute('aria-expanded')).toBe('true')
-    await act(async () => search().click())
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Close search"]')!.click())
     expect(host.querySelector('input[aria-label="Search conversations and folders"]')).toBeNull()
+    expect(search()).not.toBeNull()
     expect(onFilter).toHaveBeenCalledWith('')
   })
   it('filters to running conversations and notes when none remain', async () => {

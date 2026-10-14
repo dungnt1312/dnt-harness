@@ -8,7 +8,7 @@ function installHost(): string | undefined {
 
 /** Host first: window lists truncate the tail, and the host is what differs between installs. */
 export function documentTitle(name: string | undefined, host: string | undefined): string {
-  const base = name ?? 'dnt-harness'
+  const base = name ?? 'DntHarness'
   return host === undefined ? base : `${host} · ${base}`
 }
 

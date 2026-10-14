@@ -13,7 +13,7 @@ afterEach(async () => {
   host?.remove()
   root = undefined
   host = undefined
-  document.title = 'dnt-harness'
+  document.title = 'DntHarness'
 })
 
 it('tracks the opened profile and its renamed title, falling back while none is selected', async () => {
@@ -25,7 +25,7 @@ it('tracks the opened profile and its renamed title, falling back while none is 
   }
 
   await render(undefined)
-  expect(document.title).toBe('dnt-harness')
+  expect(document.title).toBe('DntHarness')
   await render('Personal')
   expect(document.title).toBe('Personal')
   await render('Work')
@@ -33,11 +33,11 @@ it('tracks the opened profile and its renamed title, falling back while none is 
   await render('Renamed Work')
   expect(document.title).toBe('Renamed Work')
   await render(undefined)
-  expect(document.title).toBe('dnt-harness')
+  expect(document.title).toBe('DntHarness')
 })
 
 it('puts the host first on a non-loopback domain so installs on different domains stay distinguishable', () => {
-  expect(documentTitle(undefined, 'harness.example.com')).toBe('harness.example.com · dnt-harness')
+  expect(documentTitle(undefined, 'harness.example.com')).toBe('harness.example.com · DntHarness')
   expect(documentTitle('Work', 'harness.example.com')).toBe('harness.example.com · Work')
   expect(documentTitle('Work', undefined)).toBe('Work')
 })

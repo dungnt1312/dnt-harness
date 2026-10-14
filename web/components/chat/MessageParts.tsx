@@ -298,7 +298,7 @@ const rowClass = 'inline-flex min-h-6 max-w-full items-center gap-2 self-start t
 /** Built-in tools only. An MCP tool called `read` is not the built-in and does not borrow its icon. */
 const TOOL_ICON: Readonly<Record<string, IconName>> = {
   read: 'eye',
-  write: 'squarePen',
+  write: 'pencil',
   edit: 'pencil',
   glob: 'search',
   grep: 'search',
