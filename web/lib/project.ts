@@ -126,6 +126,10 @@ export type ViewItem =
       status: 'running' | 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'noop' | 'needs-recovery'
       /** While running, where the operation is. Absent on legacy logs, which only have start/end. */
       stage?: 'preparing' | 'generating' | 'applying'
+      /** While generating a multi-chunk fold: chunk summaries finished of the total. */
+      progress?: { readonly done: number; readonly total: number }
+      /** Model requests the job sent, once it ended. */
+      requests?: number
       /** When the operation began (its first `compaction/job`), for a live elapsed time. */
       startedAt?: number
       /** How the summary was made, once it was. */
@@ -716,6 +720,7 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
             touch(openCompaction)
             openCompaction.status = 'interrupted'
             delete openCompaction.stage
+            delete openCompaction.progress
             openCompaction = null
           }
           if (event.stage === 'preparing' || openCompaction === null) {
@@ -736,6 +741,7 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
           touch(row)
           if (event.stage === 'generating' || event.stage === 'applying') {
             row.stage = event.stage
+            if (event.progress !== undefined) row.progress = event.progress
           } else if (event.stage === 'ended') {
             // A canonical end already settled the row with the real facts; only a job that ended
             // without one needs to say how.
@@ -748,6 +754,8 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
                       : 'completed'
             }
             delete row.stage
+            delete row.progress
+            if (event.requests !== undefined) row.requests = event.requests
             if (event.path !== undefined) row.path = event.path
             // The reason belongs to the row only while the row has no outcome of its own.
             if (unsettled && event.error !== undefined && row.error === undefined) row.error = event.error
@@ -792,6 +800,7 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
             const jobOwned = openCompaction.stage !== undefined
             patch(openCompaction)
             delete openCompaction.stage
+            delete openCompaction.progress
             // A row a job opened stays reachable until the job's own end, which still has to say how
             // the summary was made; a legacy row has nothing more to wait for.
             if (!jobOwned) openCompaction = null

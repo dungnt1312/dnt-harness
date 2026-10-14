@@ -183,6 +183,7 @@ export function createCompactionSummarizer(stream: StreamFn, pair: SummarizerPai
       const singleCapacity = MAX_INPUT_CHARS - singlePrefix.length - suffix.length - REASK_RESERVE
       if (singleCapacity <= 0) throw new Error('compaction request has no room for source')
       if (text.length <= singleCapacity) {
+        onProgress?.(0, 1)
         const summary = await summarizeBody(`${singlePrefix}${text}${suffix}`)
         onProgress?.(1, 1)
         return summary
@@ -199,6 +200,7 @@ export function createCompactionSummarizer(stream: StreamFn, pair: SummarizerPai
         start = end
       }
       let done = 0
+      onProgress?.(0, bounds.length)
       const summaries = await mapLimit(bounds, async ([start, end], index) => {
         const summary = await summarizeBody(`${COMPACT_SUMMARY_PROMPT}\n\n${partLine(index + 1, bounds.length)}<conversation>\n${text.slice(start, end)}${suffix}`)
         onProgress?.(++done, bounds.length)

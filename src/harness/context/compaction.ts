@@ -211,6 +211,8 @@ export interface CompactionOptions {
    * success event. Advisory: a throw or `undefined` just omits the figures.
    */
   readonly measure?: (checkpoint: { readonly summary: string; readonly coversSeq: number }) => { readonly tokensBefore: number; readonly tokensAfter: number } | undefined
+  /** Forwarded to the summarizer: fold progress, `done` of `total` chunk summaries. */
+  readonly onProgress?: (done: number, total: number) => void
 }
 const inFlight = new Set<string>()
 
@@ -275,7 +277,8 @@ export async function compactSession(session: Session, checkpoints: CheckpointSt
       throw new Error(`compaction source (${text.length} characters) exceeds or has invalid maxChars (${options.maxChars})`)
     }
     const summary = await summarizer({ text, ...(options.model !== undefined ? { model: options.model } : {}), ...(options.signal !== undefined ? { signal: options.signal } : {}),
-      ...(options.seed !== undefined ? { seed: { summary: options.seed.summary, coversSeq: options.seed.coversSeq } } : {}) })
+      ...(options.seed !== undefined ? { seed: { summary: options.seed.summary, coversSeq: options.seed.coversSeq } } : {}),
+      ...(options.onProgress !== undefined ? { onProgress: options.onProgress } : {}) })
     check()
     if (!validSummary(summary)) throw new Error('compaction summary must be nonempty and at most 24000 characters')
     if (session.events.some(event => event.seq > lastEnd && event.type === 'turn/start')) throw new Error('compaction boundary changed during summary')

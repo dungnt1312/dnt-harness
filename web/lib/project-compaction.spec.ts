@@ -151,6 +151,17 @@ describe('compaction lifecycle projection', () => {
       expect(rows[0]).toMatchObject({ status: 'failed', error: 'model changed' })
     })
 
+    it('carries fold progress while it runs and the request count after it ends; old events without them still project', () => {
+      const running = compactionItems([job('preparing'), job('generating', { progress: { done: 2, total: 4 } })])
+      expect(running[0]).toMatchObject({ status: 'running', stage: 'generating', progress: { done: 2, total: 4 } })
+      const done = compactionItems([job('preparing'), job('generating', { progress: { done: 4, total: 4 } }), job('ended', { outcome: 'failed', error: 'x', requests: 3, usage: { input: 1, cached: 0, output: 2 } })])
+      expect(done[0]).toMatchObject({ status: 'failed', requests: 3 })
+      expect(done[0]).not.toHaveProperty('progress')
+      const old = compactionItems([job('preparing'), job('generating'), job('ended', { outcome: 'compacted' })])
+      expect(old[0]).not.toHaveProperty('requests')
+      expect(old[0]).not.toHaveProperty('progress')
+    })
+
     it('a failure carries its reason onto the row', () => {
       const rows = compactionItems([job('preparing'), job('ended', { outcome: 'failed', error: 'provider transport failure' })])
       expect(rows[0]?.error).toBe('provider transport failure')

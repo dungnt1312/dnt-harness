@@ -140,6 +140,37 @@ describe('compaction progress and cancel', () => {
     expect((await jobs(s)).at(-1)).toMatchObject({ stage: 'ended', outcome: 'compacted', trigger: 'manual', path: 'exact' })
   })
 
+  it('the end counts the one handoff request and its usage', async () => {
+    const p = provider()
+    const s = await start(p.llm, EFFECTIVE)
+    await chat(s, 'first question', 1)
+    expect((await compact(s)).status).toBe(200)
+    expect((await jobs(s)).at(-1)).toMatchObject({ stage: 'ended', outcome: 'compacted', requests: 1, usage: { input: 800, cached: 0, output: 25 } })
+  })
+
+  it('a cancelled compaction that already sent its request still reports it', async () => {
+    const p = provider({ hold: true })
+    const s = await start(p.llm, EFFECTIVE)
+    await chat(s, 'first question', 1)
+    const pending = compact(s)
+    await until(() => (p.handoffs.length === 1 ? true : undefined))
+    await stop(s)
+    await pending
+    await until(async () => ((await stages(s)).at(-1) === 'ended:cancelled' ? true : undefined))
+    expect((await jobs(s)).at(-1)).toMatchObject({ requests: 1 })
+  })
+
+  it('a job that sent no request carries no request count', async () => {
+    const p = provider()
+    const s = await start(p.llm, EFFECTIVE)
+    await chat(s, 'only exchange', 1)
+    await compact(s)
+    await compact(s)
+    const last = (await jobs(s)).at(-1)!
+    expect(last).toMatchObject({ stage: 'ended', outcome: 'noop' })
+    expect(last).not.toHaveProperty('requests')
+  })
+
   it('a cancelled compaction ends as cancelled, not as a failure', async () => {
     const p = provider({ hold: true })
     const s = await start(p.llm, EFFECTIVE)

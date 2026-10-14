@@ -1337,20 +1337,33 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   }
   /** The trigger of the compaction that owns each session right now; its stage reports need it. */
   const jobTriggers = new Map<SessionId, 'manual' | 'automatic'>()
+  /** Model requests and reported usage of the running compaction, one counter per session (one job at a time). */
+  const jobStats = new Map<SessionId, { requests: number; input: number; cached: number; output: number }>()
+  const countJobRequest = (sessionId: SessionId): void => { const stats = jobStats.get(sessionId); if (stats !== undefined) stats.requests++ }
+  const countJobUsage = (sessionId: SessionId, usage: TokenUsage): void => {
+    const stats = jobStats.get(sessionId)
+    if (stats === undefined) return
+    stats.input += usage.inputTokens
+    stats.cached += usage.cachedInputTokens ?? 0
+    stats.output += usage.outputTokens ?? 0
+  }
   /**
    * Record one stage of the running compaction as a durable `compaction/job` event, so every
    * client — and a reload — sees where it is. Telemetry: a session that is going away just
-   * has nowhere to write it.
+   * has nowhere to write it. `ended` also carries the job's request/usage totals.
    */
-  const appendJob = async (entry: SessionEntry, job: { readonly stage: 'preparing' | 'generating' | 'applying' | 'ended'; readonly outcome?: 'compacted' | 'noop' | 'cancelled' | 'failed'; readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'; readonly error?: string }): Promise<void> => {
+  const appendJob = async (entry: SessionEntry, job: { readonly stage: 'preparing' | 'generating' | 'applying' | 'ended'; readonly outcome?: 'compacted' | 'noop' | 'cancelled' | 'failed'; readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'; readonly error?: string; readonly progress?: { readonly done: number; readonly total: number } }): Promise<void> => {
     const trigger = jobTriggers.get(entry.session.id)
     if (trigger === undefined || entry.closed) return
+    const stats = job.stage === 'ended' ? jobStats.get(entry.session.id) : undefined
     try {
       entry.session.append({
         type: 'compaction/job', stage: job.stage, trigger,
         ...(job.outcome !== undefined ? { outcome: job.outcome } : {}),
         ...(job.path !== undefined ? { path: job.path } : {}),
         ...(job.error !== undefined ? { error: job.error.slice(0, 500) } : {}),
+        ...(job.progress !== undefined ? { progress: job.progress } : {}),
+        ...(stats !== undefined && stats.requests > 0 ? { requests: stats.requests, usage: { input: stats.input, cached: stats.cached, output: stats.output } } : {}),
       })
       // The end is what a reload and the next request rely on, and a no-op, a failure or a cancel
       // has nothing else that waits for the log: let it reach the disk before the caller is told.
@@ -1366,6 +1379,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     const reservation = { controller: new AbortController(), done: undefined as Promise<unknown> | undefined }
     compactions.set(entry.session.id, reservation)
     jobTriggers.set(entry.session.id, trigger)
+    jobStats.set(entry.session.id, { requests: 0, input: 0, cached: 0, output: 0 })
     const signal = reservation.controller.signal
     const done = agentScope.exit(async () => {
       const startedAfter = entry.session.events.at(-1)?.seq ?? 0
@@ -1396,6 +1410,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         throw error
       } finally {
         jobTriggers.delete(entry.session.id)
+        jobStats.delete(entry.session.id)
         if (compactions.get(entry.session.id) === reservation) compactions.delete(entry.session.id)
         if (!signal.aborted && !compactionClosing && !entry.closed && depsRef.current !== undefined) {
           // Automatic runs are awaited by the driver, which drains its own inbox.
@@ -1583,10 +1598,13 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         session: () => entry.session,
         checkpoints,
         snapshotStore,
-        stream: (modelRequest, streamOptions) => agentScope.exit(() => kernel.ctx.llm.stream(modelRequest, {
-          ...streamOptions,
-          attribution: { sessionId, turnId: `compaction:${sessionId}`, stepId: randomUUID() },
-        })),
+        stream: (modelRequest, streamOptions) => {
+          countJobRequest(sessionId)
+          return agentScope.exit(() => kernel.ctx.llm.stream(modelRequest, {
+            ...streamOptions,
+            attribution: { sessionId, turnId: `compaction:${sessionId}`, stepId: randomUUID() },
+          }))
+        },
         exactSnapshot: () => captures.snapshotOf(sessionId),
         reconstruct: () => reconstructFromLog(entry),
         identity: () => compactionIdentity(entry, captures.snapshotOf(sessionId)?.identity.prefixHash ?? ''),
@@ -1615,6 +1633,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         },
         progress: (stage) => { void appendJob(entry, { stage }) },
         recordUsage: (usage) => {
+          countJobUsage(sessionId, usage)
           const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
           usageLog.record({
             at: Date.now(), startedAt: Date.now(), workspaceId: entry.workspaceId, sessionId, rootSessionId: sessionId, kind: 'compaction',
@@ -1678,6 +1697,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
                 // context/usage middleware must not replace or account this prompt.
                 // The usage tap therefore cannot see it; record its tokens here.
                 const startedAt = Date.now()
+                countJobRequest(entry.session.id)
                 for await (const event of agentScope.exit(() => kernel.ctx.llm.stream(request, {
                   signal: streamSignal, requestOwner: owner,
                   ...(streamOptions?.shareSessionOwnership !== undefined ? { shareSessionOwnership: streamOptions.shareSessionOwnership } : {}),
@@ -1685,6 +1705,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
                 }))) buffered.push(event)
                 const usage = buffered.findLast((event) => event.type === 'usage')
                 if (usage?.type === 'usage') {
+                  countJobUsage(entry.session.id, usage.usage)
                   usageLog.record({
                     at: Date.now(), startedAt, workspaceId: entry.workspaceId,
                     sessionId: entry.session.id, rootSessionId: entry.session.id,
@@ -1737,6 +1758,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
           trigger, signal, ...(pair !== undefined ? { model: pair.model } : { extractiveCap: MAX_COMPACTION_SUMMARY_CHARS }),
           ...(loaded !== undefined ? { attachments: loaded } : {}),
           ...(seed !== undefined ? { seed } : {}),
+          onProgress: (done, total) => { void appendJob(entry, { stage: 'generating', progress: { done, total } }) },
           measure: (next) => measureCheckpoint(entry, next, seed, loaded),
         })
       }

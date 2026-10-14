@@ -166,7 +166,7 @@ describe('parallel fold + merge', () => {
     expect(await summarize({ text: 'user: hi', onProgress: (done, total) => progress.push([done, total]) })).toBe('only')
     expect(seen).toHaveLength(1)
     expect(PART.test(content(seen[0]!))).toBe(false)
-    expect(progress).toEqual([[1, 1]])
+    expect(progress).toEqual([[0, 1], [1, 1]])
   })
 
   it('aborts every open stream and rejects when the caller aborts', async () => {
@@ -216,7 +216,7 @@ describe('parallel fold + merge', () => {
       yield STOP
     })(), PAIR)
     await summarize({ text: text(3), onProgress: (done, total) => progress.push([done, total]) })
-    expect(progress).toEqual([[1, 3], [2, 3], [3, 3]])
+    expect(progress).toEqual([[0, 3], [1, 3], [2, 3], [3, 3]])
   })
 
   it('merges in consecutive groups when the summaries exceed the input limit, keeping order', async () => {

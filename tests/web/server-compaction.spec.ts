@@ -412,11 +412,13 @@ describe('web compaction', () => {
     const PART = /This is part (\d+) of (\d+) of one conversation/
     /** One long reply, so the fold needs `chunks` parts; `onChunk` runs a chunk request, the rest answer instantly. */
     async function foldSession(onChunk: (request: ModelRequest, signal: AbortSignal | undefined) => AsyncIterable<StreamEvent>, capacity?: number) {
+      const summaryRequests = { count: 0, withUsage: 0 }
       const provider: LlmProvider = {
         name: 'scripted', models: ['scripted'],
         stream(request, options) {
           const body = String(request.messages[0]?.content)
           const isSummaryCall = request.messages.some((m) => typeof m.content === 'string' && m.content.includes(COMPACT_MARK))
+          if (isSummaryCall) summaryRequests.count++
           if (isSummaryCall && request.messages.length > 1) {
             return (async function* (): AsyncIterable<StreamEvent> {
               yield { type: 'toolCalls', calls: [{ id: 'refuse', name: 'Read', args: {} }] }
@@ -426,6 +428,7 @@ describe('web compaction', () => {
           if (isSummaryCall && PART.test(body)) return onChunk(request, options?.signal)
           return (async function* (): AsyncIterable<StreamEvent> {
             yield { type: 'delta', delta: isSummaryCall ? SUMMARY_TEXT : 'synthetic historical detail\n'.repeat(30_000) }
+            if (isSummaryCall) { summaryRequests.withUsage++; yield { type: 'usage', usage: FOLD_USAGE } }
             yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
           })()
         },
@@ -433,14 +436,39 @@ describe('web compaction', () => {
       const started = await start(provider)
       if (capacity !== undefined) started.server.kernel.ctx.llm.configureAdmission('scripted', new AttemptAdmission(capacity))
       const { id } = await (await fetch(`${started.base}/api/workspaces/${started.wsId}/sessions`, { method: 'POST' })).json() as { id: string }
-      await completedMessage(started.base, started.wsId, id, path.join(started.home, 'workspaces', started.wsId, 'sessions', id, 'events.jsonl'), 'long history', 1)
-      return { ...started, compact: () => fetch(`${started.base}/api/workspaces/${started.wsId}/sessions/${id}/compact`, { method: 'POST' }) }
+      const logPath = path.join(started.home, 'workspaces', started.wsId, 'sessions', id, 'events.jsonl')
+      await completedMessage(started.base, started.wsId, id, logPath, 'long history', 1)
+      return { ...started, logPath, summaryRequests, compact: () => fetch(`${started.base}/api/workspaces/${started.wsId}/sessions/${id}/compact`, { method: 'POST' }) }
     }
-    const answered = (): AsyncIterable<StreamEvent> => (async function* () {
+    const FOLD_USAGE = { inputTokens: 100, cachedInputTokens: 40, outputTokens: 10 }
+    const answered = (summaryRequests?: { withUsage: number }): AsyncIterable<StreamEvent> => (async function* () {
       await new Promise((resolve) => setTimeout(resolve, 20))
       yield { type: 'delta', delta: 'part summary' }
+      if (summaryRequests !== undefined) { summaryRequests.withUsage++; yield { type: 'usage', usage: FOLD_USAGE } }
       yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
     })()
+
+    it('reports fold progress up to the chunk total, and the ended job counts every request and sums their usage', async () => {
+      const counters: { withUsage: number }[] = []
+      const { compact, logPath, summaryRequests } = await foldSession(() => answered(counters[0]))
+      counters[0] = summaryRequests
+      expect((await compact()).status).toBe(200)
+      const jobs = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as Record<string, any>).filter((event) => event.type === 'compaction/job')
+      const progress = jobs.filter((job) => job.stage === 'generating').map((job) => job.progress as { done: number; total: number })
+      expect(progress.length).toBeGreaterThan(2)
+      expect(progress[0]!.done).toBe(0)
+      const total = progress[0]!.total
+      expect(total).toBeGreaterThan(1)
+      expect(progress.every((p) => p.total === total)).toBe(true)
+      expect(progress.map((p) => p.done)).toEqual([...progress.map((p) => p.done)].sort((a, b) => a - b))
+      expect(progress.at(-1)!.done).toBe(total)
+      const ended = jobs.at(-1)!
+      expect(ended).toMatchObject({ stage: 'ended', outcome: 'compacted' })
+      // Every request the provider got for the compaction: cache-aware try, chunks, merge.
+      expect(ended.requests).toBe(summaryRequests.count)
+      const n = summaryRequests.withUsage
+      expect(ended.usage).toEqual({ input: 100 * n, cached: 40 * n, output: 10 * n })
+    })
 
     it('a failing chunk aborts the sibling chunk streams and the compaction fails promptly', async () => {
       let arrived = 0
