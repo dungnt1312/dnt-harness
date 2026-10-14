@@ -27,10 +27,11 @@ export class CompactionRefused extends Error {
 /**
  * The snapshot addressed to the model selected now. Its messages and tools stay exactly as
  * captured; only who answers changes. A switched model just misses the prompt cache.
+ * Always stamped, even when nothing switched: a captured or rebuilt request may carry no
+ * provider/model at all, and an unstamped request would go to the global default.
  */
 function retarget(snapshot: EffectiveCompactionSnapshot, now: SnapshotIdentity): EffectiveCompactionSnapshot {
   const was = snapshot.identity
-  if (was.provider === now.provider && was.model === now.model && was.thinkingLevel === now.thinkingLevel) return snapshot
   const { thinkingLevel: _thinking, ...request } = snapshot.request
   void _thinking
   const { thinkingLevel: _wasThinking, ...identity } = was
@@ -188,7 +189,7 @@ export class CompactionHost {
     // smaller model, a request that grew to the limit) is folded in pieces instead of failing.
     const window = deps.contextWindowTokens()
     try {
-      assertFitsWindow(snapshot, { ...(window !== undefined ? { contextWindowTokens: window } : {}), outputTokens: deps.limits.compactionOutputTokens })
+      assertFitsWindow(snapshot, { ...(window !== undefined ? { contextWindowTokens: window } : {}), outputTokens: deps.limits.compactionOutputTokens }, path)
     } catch {
       return this.legacy(request, signal, 'recovery')
     }

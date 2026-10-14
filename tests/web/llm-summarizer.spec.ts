@@ -141,6 +141,25 @@ describe('parallel fold + merge', () => {
     expect(max).toBe(2)
   })
 
+  it('at parallelism 1 it accumulates chunk after chunk like before: no merge, each later chunk carries the summary so far', async () => {
+    const seen: ModelRequest[] = []
+    const progress: Array<[number, number]> = []
+    let call = 0
+    const summarize = createCompactionSummarizer((request) => (async function* () {
+      seen.push(request)
+      yield { type: 'delta', delta: `ACC${++call}` }
+      yield STOP
+    })(), PAIR, undefined, 1)
+    expect(await summarize({ text: text(3), seed: { summary: 'SEED-XYZ', coversSeq: 3 }, onProgress: (done, total) => progress.push([done, total]) })).toBe('ACC3')
+    expect(seen).toHaveLength(3)
+    expect(content(seen[0]!)).toContain('<earlier-summary>\nSEED-XYZ\n</earlier-summary>')
+    expect(content(seen[1]!)).toContain('<earlier-summary>\nACC1\n</earlier-summary>')
+    expect(content(seen[2]!)).toContain('<earlier-summary>\nACC2\n</earlier-summary>')
+    expect(seen.every((request) => !content(request).includes('[part '))).toBe(true)
+    expect(progress.at(-1)).toEqual([3, 3])
+    expect(progress.map(([done]) => done)).toEqual([0, 1, 2, 3])
+  })
+
   it('puts the seed only in the merge request', async () => {
     const seen: ModelRequest[] = []
     const merges = { n: 0 }

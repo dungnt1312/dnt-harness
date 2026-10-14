@@ -189,6 +189,26 @@ export function createCompactionSummarizer(stream: StreamFn, pair: SummarizerPai
         return summary
       }
 
+      // One request at a time: independent chunks plus a merge would be N + 1 sequential requests,
+      // so keep the old accumulate path (N requests, each carrying the summary so far).
+      if (maxParallel <= 1) {
+        let accumulated = seed?.summary ?? ''
+        let done = 0
+        for (let offset = 0; offset < text.length;) {
+          const prefix = `${COMPACT_SUMMARY_PROMPT}\n\n${reference(accumulated)}<conversation>\n`
+          const room = MAX_INPUT_CHARS - prefix.length - suffix.length - REASK_RESERVE
+          if (room <= 0) throw new Error('compaction request has no room for source')
+          const end = chunkEnd(text, offset, room)
+          // The chunk size depends on the summary so far, so the total is an estimate that can move.
+          if (done === 0) onProgress?.(0, Math.ceil(text.length / room))
+          accumulated = await summarizeBody(`${prefix}${text.slice(offset, end)}${suffix}`)
+          offset = end
+          done++
+          onProgress?.(done, done + Math.ceil((text.length - offset) / room))
+        }
+        return accumulated
+      }
+
       // Several chunks: no seed here (it joins at the merge); capacity reserves the widest part line.
       const chunkPrefix = `${COMPACT_SUMMARY_PROMPT}\n\n${partLine(99_999, 99_999)}<conversation>\n`
       const capacity = MAX_INPUT_CHARS - chunkPrefix.length - suffix.length - REASK_RESERVE

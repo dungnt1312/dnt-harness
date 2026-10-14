@@ -778,9 +778,15 @@ runs and the behavior above is unchanged.
   covering the whole operation. A complete draft of up to 96 000 characters is
   accepted; one over 24 000 is condensed by up to two independent requests (targets
   12 000, then 8 000 characters; `condenseDraft` in `compaction-condense.ts`, shared
-  with the fold), and a `length` finish gets a single re-ask. A request that cannot
-  fit its own answer is refused before any hook or model call
-  (`compaction-input-too-large`).
+  with the fold), and a `length` finish gets a single re-ask, read and condensed the
+  same way. The request is always addressed to the session's current provider, model
+  and thinking level. A transient provider error before any output is retried with
+  the fold's bounded backoff (`stepRetries`), one logical request on the session. A
+  request that cannot fit its own answer is not sent: the host folds the transcript
+  instead (`path: "recovery"`). The size is the provider-reported input of the captured
+  request plus a 20% margin on what is appended; an unmeasured capture is estimated at
+  chars/4 + 20%, and a request rebuilt from the log with the context builder's own
+  estimate (no margin — the builder already fitted that request to the budget).
 - **Adoption.** `adoptPreparedCompaction` commits the summary under the same
   per-session transaction as the fold, but its cutoff may be *older* than the newest
   closed turn: turns that closed after the cutoff stay verbatim. The proof
@@ -800,7 +806,10 @@ runs and the behavior above is unchanged.
   error) does the host fall back to the transcript fold (`path: "recovery"`).
   The fold summarizes more than one chunk in parallel (at most
   `max(1, min(4, provider admission capacity − 1))` at once), then merges once — in
-  consecutive groups if the summaries exceed 200 000 characters. The first failing
+  consecutive groups if the summaries exceed 200 000 characters. At parallelism 1
+  (capacity ≤ 2) it keeps the sequential accumulate path instead — each chunk carries
+  the summary so far in `<earlier-summary>`, no merge — so it never costs a request
+  more than before. The first failing
   chunk aborts its siblings. Parallel chunks share provider-session ownership only
   through the per-fold `shareSessionOwnership` scope on `StreamOptions`
   (`llm/service.ts`); every other request stays exclusive. Manual and automatic compactions
@@ -814,11 +823,12 @@ runs and the behavior above is unchanged.
   `path`, and a failure's reason. `generating` may carry `progress {done, total}`
   (fold chunks summarized) and `ended` carries `requests` and `usage {input, cached,
   output}` totals for the job, whatever the outcome; the row shows "Summarizing i/n"
-  and "N requests".
+  (only when n > 1; a single request reads "Summarizing") and "N requests".
   `generating` is reported just before the model is asked and `applying` just before the
-  adoption, so a hook block, a no-op or a refused request reports neither. They bracket
-  the canonical `compaction/start`/`end` pair and are not the authority for a
-  checkpoint. The transcript shows one row per operation with the stage and a live
+  adoption, so a hook block, a no-op or a refused request reports neither. On the
+  one-request path they fall outside the canonical `compaction/start`/`end` pair; on
+  the fold, `generating` progress events fall between `compaction/start` and
+  `compaction/end`. They are telemetry, never the authority for a checkpoint. The transcript shows one row per operation with the stage and a live
   elapsed time. `POST …/stop` (and delete, and shutdown) aborts the running compaction,
   including the in-flight model request, writes no checkpoint, and the compact request
   answers `409 {cancelled: true}`; the UI says "cancelled", not "failed". While a

@@ -490,15 +490,24 @@ describe('web compaction', () => {
       await until(async () => aborted === 2 ? true : undefined)
     })
 
-    it.each([[4, 3], [2, 1]])('provider capacity %i folds at most %i chunks at once', async (capacity, expected) => {
+    it('provider capacity 4 folds at most 3 chunks at once', async () => {
       let open = 0
       let max = 0
-      const { compact } = await foldSession((request, signal) => (async function* () {
+      const { compact } = await foldSession(() => (async function* () {
         max = Math.max(max, ++open)
         try { yield* answered() } finally { open-- }
-      })(), capacity)
+      })(), 4)
       expect((await compact()).status).toBe(200)
-      expect(max).toBe(expected)
+      expect(max).toBe(3)
+    })
+
+    it('provider capacity 2 (parallelism 1) folds sequentially with the accumulated summary: no part chunks, no merge', async () => {
+      let parts = 0
+      const { compact, summaryRequests } = await foldSession(() => { parts++; return answered() }, 2)
+      expect((await compact()).status).toBe(200)
+      expect(parts).toBe(0)
+      // The cache-aware try, then one request per chunk; nothing extra for a merge.
+      expect(summaryRequests.count).toBeGreaterThan(2)
     })
   })
 

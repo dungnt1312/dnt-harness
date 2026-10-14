@@ -181,6 +181,14 @@ describe('generateCompaction: size cap, re-ask and condensing', () => {
     expect(requests).toHaveLength(2)
   })
 
+  it('a re-ask that answers above 24000 characters is condensed like a first draft, not refused', async () => {
+    const { stream, requests } = scripted([CUT, answer('r'.repeat(30_000)), answer('CONDENSED')])
+    const prepared = await generateCompaction(snapshot, options({ stream }))
+    expect(prepared.summary).toBe('CONDENSED')
+    expect(requests).toHaveLength(3)
+    expect(requests[2]!.messages).toHaveLength(1)
+  })
+
   it('condenses an oversized draft with one independent request and uses its output', async () => {
     const draft = 'd'.repeat(30_000)
     const { stream, requests } = scripted([answer(draft), answer('CONDENSED')])
@@ -345,6 +353,15 @@ describe('input fit', () => {
     // reported baseline + the final answer + the instruction, with the 20% margin on the unmeasured increment only
     expect(estimate.tokens).toBeGreaterThanOrEqual(50_000)
     expect(estimate.tokens).toBeLessThan(55_000)
+  })
+
+  it('sizes a reconstructed request with the builder estimate and no margin, an unmeasured capture with the margin', () => {
+    const exact = estimateSnapshotTokens(big(40_000))
+    const rebuilt = estimateSnapshotTokens(big(40_000), 'reconstructed')
+    expect(rebuilt.basis).toBe('estimated')
+    expect(rebuilt.tokens).toBeGreaterThanOrEqual(10_000)
+    expect(rebuilt.tokens).toBeLessThan(exact.tokens)
+    expect(exact.tokens).toBeGreaterThanOrEqual(Math.floor(rebuilt.tokens * 1.15))
   })
 
   it('falls back to a conservative chars/4 estimate when nothing was reported', () => {

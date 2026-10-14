@@ -9,12 +9,14 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
-import type { ModelRequest, StreamEvent } from '../../src/harness/llm/types.ts'
+import { ProviderError, type ModelCompletion, type ModelRequest, type StreamEvent } from '../../src/harness/llm/types.ts'
 import type { HarnessLimits } from '../../src/harness/limits.ts'
 import { COMPACTION_HANDOFF_MARKER } from '../../src/web/compaction-generator.ts'
 
 const SUMMARY = 'EFFECTIVE HANDOFF SUMMARY'
 const LEGACY_MARK = 'Primary Request and Intent'
+const STOP: ModelCompletion = { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+const joined = (request: ModelRequest): string => request.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('\n')
 
 function provider(options: { replies?: readonly string[]; tool?: boolean } = {}): { provider: LlmProvider; requests: ModelRequest[] } {
   const requests: ModelRequest[] = []
@@ -47,9 +49,9 @@ afterAll(async () => {
   }
 })
 
-async function start(llm: LlmProvider, limits: Partial<HarnessLimits>): Promise<{ server: WebServer; home: string; base: string; wsId: string }> {
-  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-effective-'))
-  const server = await createWebServer({ home, providers: [llm], configFile: path.join(home, 'p.json'), limits })
+async function start(llm: LlmProvider | readonly LlmProvider[], limits: Partial<HarnessLimits>, home?: string): Promise<{ server: WebServer; home: string; base: string; wsId: string }> {
+  home ??= await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-effective-'))
+  const server = await createWebServer({ home, providers: [llm].flat(), configFile: path.join(home, 'p.json'), limits })
   servers.push(server)
   homes.set(server, home)
   const wsId = (await (await fetch(`${server.url}/api/workspaces`)).json() as { id: string }[])[0]!.id
@@ -403,6 +405,127 @@ describe('effective compaction through the web server', () => {
     const summaryCalls = requests.slice(calls)
     expect(summaryCalls).toHaveLength(1)
     expect(String(summaryCalls[0]!.messages.at(-1)!.content)).toContain(COMPACTION_HANDOFF_MARKER)
+  })
+
+  it('the handoff and its condense request go to the SESSION\'s provider and model, not the global default', async () => {
+    const seen: { name: string; request: ModelRequest }[] = []
+    const make = (name: string, model: string): LlmProvider => ({
+      name,
+      models: [model],
+      stream(request) {
+        seen.push({ name, request })
+        const text = joined(request)
+        const reply = text.includes(COMPACTION_HANDOFF_MARKER) ? 'h'.repeat(30_000) : text.includes('Compress this coding-session handoff') ? SUMMARY : 'turn reply'
+        return (async function* (): AsyncIterable<StreamEvent> {
+          yield { type: 'delta', delta: reply }
+          yield { type: 'usage', usage: { inputTokens: 1_000, outputTokens: 20 } }
+          yield STOP
+        })()
+      },
+    })
+    // alpha/a1 is the global default; the session picks beta/b1.
+    const { home, base, wsId } = await start([make('alpha', 'a1'), make('beta', 'b1')], { compactionEffectiveEnabled: true })
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const route = `${base}/api/workspaces/${wsId}/sessions/${id}`
+    expect((await fetch(`${route}/model`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ provider: 'beta', model: 'b1' }) })).status).toBe(200)
+    await completedMessage(base, wsId, id, path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl'), 'first question', 1)
+    const before = seen.length
+    const response = await fetch(`${route}/compact`, { method: 'POST' })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ path: 'exact', summaryChars: SUMMARY.length })
+    const sent = seen.slice(before)
+    expect(sent).toHaveLength(2)
+    for (const { name, request } of sent) {
+      expect(name).toBe('beta')
+      expect(request).toMatchObject({ providerName: 'beta', model: 'b1' })
+    }
+  })
+
+  it('a transient provider error before any output is retried: the handoff still takes one logical request', async () => {
+    let failures = 1
+    let handoffs = 0
+    const llm: LlmProvider = {
+      name: 'scripted',
+      models: ['scripted'],
+      stream(request) {
+        const handoff = joined(request).includes(COMPACTION_HANDOFF_MARKER)
+        if (handoff) handoffs++
+        return (async function* (): AsyncIterable<StreamEvent> {
+          if (handoff && failures-- > 0) throw new ProviderError('gateway reset', { transient: true })
+          yield { type: 'delta', delta: handoff ? SUMMARY : 'turn reply' }
+          yield STOP
+        })()
+      },
+    }
+    const { home, base, wsId } = await start(llm, { compactionEffectiveEnabled: true, stepRetryBaseMs: 1 })
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    await completedMessage(base, wsId, id, logPath, 'first question', 1)
+    const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ path: 'exact' })
+    expect(handoffs).toBe(2)
+    expect((await readLog(logPath)).findLast((event) => event.type === 'compaction/job')).toMatchObject({ stage: 'ended', outcome: 'compacted', requests: 2 })
+  })
+
+  it('a non-retryable provider error fails the handoff at once, without a retry or a fold', async () => {
+    let handoffs = 0
+    const llm: LlmProvider = {
+      name: 'scripted',
+      models: ['scripted'],
+      stream(request) {
+        const handoff = joined(request).includes(COMPACTION_HANDOFF_MARKER)
+        if (handoff) handoffs++
+        return (async function* (): AsyncIterable<StreamEvent> {
+          if (handoff) throw new ProviderError('bad request', { status: 400 })
+          yield { type: 'delta', delta: 'turn reply' }
+          yield STOP
+        })()
+      },
+    }
+    const { home, base, wsId } = await start(llm, { compactionEffectiveEnabled: true, stepRetryBaseMs: 1 })
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    await completedMessage(base, wsId, id, path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl'), 'first question', 1)
+    expect((await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })).status).toBe(409)
+    expect(handoffs).toBe(1)
+  })
+
+  it('a session near the auto-compact threshold with no capture is rebuilt and summarized in ONE request, not folded', async () => {
+    const WINDOW = 60_000
+    const { provider: llm, requests } = provider({ replies: ['short answer', 'long answer'] })
+    // An operator context override on the scripted provider makes the window small.
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-effective-'))
+    await fs.writeFile(path.join(home, 'p.json'), JSON.stringify({
+      version: 2,
+      defaults: { provider: 'scripted', model: 'scripted', thinkingLevel: null },
+      providers: [{ id: 'scripted', name: 'scripted', baseUrl: 'http://127.0.0.1:9/v1', apiKey: '', models: ['scripted'], enabled: true, modelSettings: { scripted: { contextTokens: WINDOW } } }],
+      aliases: [], aliasGeneration: 0,
+    }))
+    const first = await start(llm, {}, home)
+    const { id } = await (await fetch(`${first.base}/api/workspaces/${first.wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const route = `${first.base}/api/workspaces/${first.wsId}/sessions/${id}`
+    const logPath = path.join(home, 'workspaces', first.wsId, 'sessions', id, 'events.jsonl')
+    await completedMessage(first.base, first.wsId, id, logPath, 'hello', 1)
+    const budget = async (): Promise<{ usedTokens: number; availableTokens: number }> => ((await (await fetch(`${route}/manifest`)).json()) as { budget: { usedTokens: number; availableTokens: number } }).budget
+    const baseline = await budget()
+    expect(baseline.availableTokens).toBe(WINDOW - 4_096 - 1_024)
+    // Fill the conversation to ~85% of the window, as the automatic trigger would see it.
+    const fill = Math.floor(0.85 * baseline.availableTokens) - baseline.usedTokens
+    await completedMessage(first.base, first.wsId, id, logPath, 'w'.repeat(fill * 4), 2)
+    const pressure = (await budget()).usedTokens / baseline.availableTokens
+    expect(pressure).toBeGreaterThan(0.8)
+    expect(pressure).toBeLessThan(0.9)
+    await first.server.close()
+    homes.delete(first.server)
+
+    const second = await start(llm, { compactionEffectiveEnabled: true }, home)
+    const calls = requests.length
+    const response = await fetch(`${second.base}/api/workspaces/${second.wsId}/sessions/${id}/compact`, { method: 'POST' })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ path: 'reconstructed' })
+    const sent = requests.slice(calls)
+    expect(sent).toHaveLength(1)
+    expect(String(sent[0]!.messages.at(-1)!.content)).toContain(COMPACTION_HANDOFF_MARKER)
   })
 
   it('with the rollout switch OFF it behaves exactly as before: the legacy fold, no snapshot', async () => {

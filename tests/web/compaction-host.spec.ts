@@ -221,6 +221,33 @@ describe('CompactionHost.compact: the effective path', () => {
     expect(r.requests[0]).toMatchObject({ model: 'm2', providerName: 'p2', thinkingLevel: 'high' })
   })
 
+  it('stamps an unstamped snapshot request with the current identity even when nothing switched', async () => {
+    const r = await rig()
+    const now = { ...identity, thinkingLevel: 'low' }
+    r.setExact(snapshotFor(r.session, 4, { identity: now, request: { messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'first' }] } }))
+    r.host.deps = { ...r.host.deps, identity: () => now }
+    await r.host.compact({ trigger: 'manual' })
+    expect(r.requests).toHaveLength(1)
+    expect(r.requests[0]).toMatchObject({ model: 'm', providerName: 'p', thinkingLevel: 'low' })
+  })
+
+  it('a reconstructed snapshot is sized with the builder estimate, without the unmeasured margin', async () => {
+    // ~45k tokens of prefix: with the 1.2 margin it would not fit a 60k window beside 8k of output.
+    const big = (session: Session, id: string): EffectiveCompactionSnapshot => snapshotFor(session, 4, { id, request: { model: 'm', providerName: 'p', messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'u'.repeat(180_000) }] } })
+    const r = await rig()
+    r.host.deps = { ...r.host.deps, contextWindowTokens: () => 60_000 }
+    r.setExact(undefined)
+    r.setReconstructed(big(r.session, 'rec'))
+    expect(await r.host.compact({ trigger: 'manual' })).toMatchObject({ kind: 'compacted', path: 'reconstructed' })
+    expect(r.legacy).not.toHaveBeenCalled()
+
+    // An exact capture without a provider report keeps the margin: the same size is folded.
+    const exact = await rig()
+    exact.host.deps = { ...exact.host.deps, contextWindowTokens: () => 60_000 }
+    exact.setExact(big(exact.session, 'snap-1'))
+    expect(await exact.host.compact({ trigger: 'manual' })).toMatchObject({ kind: 'compacted', path: 'recovery' })
+  })
+
   it('a snapshot too large for the current window is never sent: the transcript is folded in pieces instead', async () => {
     const r = await rig()
     r.setExact(snapshotFor(r.session, 4, { inputEvidence: { inputTokens: 199_000 } }))

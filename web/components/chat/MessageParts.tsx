@@ -1790,7 +1790,7 @@ export const CompactionMarker = memo(function CompactionMarker({ item }: {
 
   if (item.status === 'running') {
     const stage = item.stage === 'preparing' ? 'Preparing'
-      : item.stage === 'generating' ? (item.progress !== undefined ? `Summarizing ${item.progress.done}/${item.progress.total}` : 'Summarizing')
+      : item.stage === 'generating' ? (item.progress !== undefined && item.progress.total > 1 ? `Summarizing ${item.progress.done}/${item.progress.total}` : 'Summarizing')
         : item.stage === 'applying' ? 'Applying' : undefined
     return (
       <div className="flex min-w-0 items-center gap-2 py-0.5 text-xs text-fg-muted" role="status" aria-live="polite">

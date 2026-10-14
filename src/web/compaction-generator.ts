@@ -1,3 +1,4 @@
+import { estimateContentTokens, estimateTokens, schemaCost } from '../harness/context/budget.ts'
 import { MAX_COMPACTION_SUMMARY_CHARS } from '../harness/context/compaction.ts'
 import type { EffectiveCompactionSnapshot, SnapshotIdentity } from '../harness/context/compaction-snapshot.ts'
 import { validateCompletion } from '../harness/llm/completion.ts'
@@ -128,7 +129,8 @@ export async function generateCompaction(snapshot: EffectiveCompactionSnapshot, 
     if (attempt.finish === 'length') {
       // One re-ask, same prefix, explicit hard limit. A second cut-off is final.
       const retryInstruction = `${HANDOFF_INSTRUCTION}\n\nHARD CONSTRAINT: your previous answer was cut off by the output limit. Rewrite it in at most ${MAX_COMPACTION_SUMMARY_CHARS} characters. Drop detail in this order: completed work older than the earliest still-relevant item, then verbose command-output descriptions. Never drop the user's constraints, the current task, latest verified outcomes, or pending work.`
-      attempt = await runAttempt(options.stream, requestFor(snapshot, retryInstruction, options.maxOutputTokens), signal, options.recordUsage, MAX_COMPACTION_SUMMARY_CHARS, `compaction summarizer output exceeds ${MAX_COMPACTION_SUMMARY_CHARS} characters`, false)
+      // Read like the first draft: a complete answer over 24 000 is condensed below, not refused.
+      attempt = await runAttempt(options.stream, requestFor(snapshot, retryInstruction, options.maxOutputTokens), signal, options.recordUsage, MAX_DRAFT_CHARS, DRAFT_TOO_LONG, false)
     }
     const { request } = snapshot
     const summary = attempt.text.length <= MAX_COMPACTION_SUMMARY_CHARS
@@ -181,19 +183,26 @@ function messageChars(message: ModelMessage): number {
  * instruction — is estimated, with a 20% margin. Without a report the whole
  * request is estimated conservatively. Always labelled, never a verified count.
  */
-export function estimateSnapshotTokens(snapshot: EffectiveCompactionSnapshot): TokenEstimate {
+export function estimateSnapshotTokens(snapshot: EffectiveCompactionSnapshot, path: SummaryPath = 'exact'): TokenEstimate {
   const added = charsToTokens(messageChars(snapshot.finalAnswer) + HANDOFF_INSTRUCTION.length)
   if (snapshot.inputEvidence !== undefined) {
     return { tokens: snapshot.inputEvidence.inputTokens + Math.ceil(added * UNMEASURED_MARGIN), basis: 'reported' }
+  }
+  if (path === 'reconstructed') {
+    // The context builder just sized this very request with its own estimator and fitted it to
+    // the budget; a margin on top would refuse what the builder itself accepted.
+    const history = [...snapshot.request.messages, snapshot.finalAnswer]
+      .reduce((total, message) => total + estimateContentTokens(message.content) + (message.toolCalls !== undefined ? estimateTokens(JSON.stringify(message.toolCalls)) : 0), 0)
+    return { tokens: history + schemaCost(snapshot.request.tools ?? []) + estimateTokens(HANDOFF_INSTRUCTION), basis: 'estimated' }
   }
   const prefix = snapshot.request.messages.reduce((total, message) => total + messageChars(message), 0) + JSON.stringify(snapshot.request.tools ?? []).length
   return { tokens: Math.ceil((charsToTokens(prefix) + added) * UNMEASURED_MARGIN), basis: 'estimated' }
 }
 
 /** Refuse a summary request that cannot leave room for its own answer. An unknown window is left to the provider. */
-export function assertFitsWindow(snapshot: EffectiveCompactionSnapshot, limits: { readonly contextWindowTokens?: number; readonly outputTokens: number }): void {
+export function assertFitsWindow(snapshot: EffectiveCompactionSnapshot, limits: { readonly contextWindowTokens?: number; readonly outputTokens: number }, path: SummaryPath = 'exact'): void {
   if (limits.contextWindowTokens === undefined) return
-  const estimate = estimateSnapshotTokens(snapshot)
+  const estimate = estimateSnapshotTokens(snapshot, path)
   if (estimate.tokens + limits.outputTokens > limits.contextWindowTokens) {
     throw new Error(`compaction-input-too-large: ~${estimate.tokens} input tokens (${estimate.basis}) plus ${limits.outputTokens} output exceed the ${limits.contextWindowTokens}-token window`)
   }
