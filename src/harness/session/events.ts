@@ -187,7 +187,7 @@ export type SessionEvent =
       readonly type: 'compaction/job'
       readonly stage: 'preparing' | 'generating' | 'applying' | 'ended'
       readonly trigger: 'manual' | 'automatic'
-      /** Only on `ended`. `needs-recovery`: nothing ran, the user must confirm a slow recovery. */
+      /** Only on `ended`. `needs-recovery` is historical: older hosts wrote it when they asked before folding; nothing ran. */
       readonly outcome?: 'compacted' | 'noop' | 'needs-recovery' | 'cancelled' | 'failed'
       /** Only on `ended` after a success: how the summary was made. */
       readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'

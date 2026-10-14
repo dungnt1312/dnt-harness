@@ -18,7 +18,7 @@ import type { ChipSegment } from './inline-chips.ts'
 import { budgetTone, formatTime } from './format.ts'
 import { hiddenSpawnCalls } from './spawn-merge.ts'
 import { createProjector, projectItems } from './project.ts'
-import { compactSession, CompactionCancelled, CompactionRecoveryNeeded, fetchHooks, saveHooks, setHookActive, renameWorkspace, listProjectFiles, readProjectFile } from './api.ts'
+import { compactSession, CompactionCancelled, fetchHooks, saveHooks, setHookActive, renameWorkspace, listProjectFiles, readProjectFile } from './api.ts'
 import { ContextPanel } from '../components/layout/ContextPanel.tsx'
 import { Workbench, type WorkbenchView } from '../components/workbench/Workbench.tsx'
 import { closeFileTab, useWorkbenchFiles } from '../hooks/useWorkbenchFiles.ts'
@@ -43,9 +43,6 @@ vi.mock('./api.ts', () => ({
   compactSession: vi.fn(async () => ({ coversSeq: 42, summaryChars: 900 })),
   CompactionCancelled: class CompactionCancelled extends Error {
     constructor() { super('Compaction was cancelled.'); this.name = 'CompactionCancelled' }
-  },
-  CompactionRecoveryNeeded: class CompactionRecoveryNeeded extends Error {
-    constructor(readonly recovery: { cutoff: number; sourceDigest: string; estimatedCalls: number }) { super('needs recovery'); this.name = 'CompactionRecoveryNeeded' }
   },
   listSkills: vi.fn(async () => []),
   saveSkill: vi.fn(async () => ({ name: 's', hash: 'h' })),
@@ -1160,7 +1157,7 @@ describe('context compaction + budget bar', () => {
     it.each([
       ['cancelled', 'Compaction cancelled'],
       ['noop', 'Already compacted'],
-      ['needs-recovery', 'Needs a slow recovery'],
+      ['needs-recovery', 'Not compacted'],
     ] as const)('a row that ended as %s says so, and is not shown as a failure', async (status, label) => {
       await mount(<CompactionMarker item={row({ status })} />)
       expect(host.textContent).toContain(label)
@@ -1177,14 +1174,14 @@ describe('context compaction + budget bar', () => {
 
     it('a finished row shows how the summary was made', async () => {
       await mount(<CompactionMarker item={row({ status: 'completed', path: 'recovery', coversSeq: 9, summary: 'S' })} />)
-      expect(host.textContent).toContain('slow recovery')
+      expect(host.textContent).toContain('full transcript')
+      expect(host.textContent).not.toContain('recovery')
       await mount(<CompactionMarker item={row({ status: 'completed', path: 'exact', coversSeq: 9, summary: 'S' })} />)
-      expect(host.textContent).not.toContain('slow recovery')
+      expect(host.textContent).not.toContain('full transcript')
     })
   })
 
-  describe('slow recovery confirmation', () => {
-    const recovery = { cutoff: 42, sourceDigest: 'abc123', estimatedCalls: 9 }
+  describe('compacting from the Context panel', () => {
     const compactMock = compactSession as unknown as ReturnType<typeof vi.fn>
     const open = async (): Promise<void> => {
       await mount(<ToastHost><ContextPanel meta={null} stream="open" sessionId="s1" sessionFolder={null} eventCount={0} manifest={manifest} workspaceId="w1" running={false} /></ToastHost>)
@@ -1192,70 +1189,28 @@ describe('context compaction + budget bar', () => {
       await act(async () => bodyButton('Compact').click())
     }
 
-    it('asks before running the slow raw fold, says how many model calls it is, and has run nothing yet', async () => {
-      compactMock.mockRejectedValueOnce(new CompactionRecoveryNeeded(recovery))
-      await open()
-      expect(compactSession).toHaveBeenCalledTimes(1)
-      expect(document.body.textContent).toContain('Slow compaction needed')
-      expect(document.body.textContent).toContain('about 9 model calls')
-      expect(bodyButton('Run slow compaction')).toBeDefined()
-    })
-
-    it('Cancel never confirms: the server is not called again', async () => {
-      compactMock.mockRejectedValueOnce(new CompactionRecoveryNeeded(recovery))
-      await open()
-      await act(async () => bodyButton('Cancel').click())
-      expect(compactSession).toHaveBeenCalledTimes(1)
-      expect(document.body.textContent).not.toContain('Slow compaction needed')
-    })
-
-    it('confirming echoes the exact fingerprint the server showed, and reports the result', async () => {
-      compactMock.mockRejectedValueOnce(new CompactionRecoveryNeeded(recovery))
+    it('one confirmation runs it: a slow fold is the server\'s choice, never a second question', async () => {
       compactMock.mockResolvedValueOnce({ coversSeq: 42, summaryChars: 700, path: 'recovery' })
       await open()
-      await act(async () => bodyButton('Run slow compaction').click())
-      expect(compactSession).toHaveBeenCalledTimes(2)
-      expect(compactMock.mock.calls[1]).toEqual(['w1', 's1', recovery])
-      expect(document.body.textContent).not.toContain('Slow compaction needed')
-    })
-
-    it('a turn that starts while the question is open withdraws it without confirming', async () => {
-      function Probe() {
-        const [running, setRunning] = useState(false)
-        return (
-          <ToastHost>
-            <button type="button" onClick={() => setRunning(true)}>Start running</button>
-            <button type="button" onClick={() => setRunning(false)}>Stop running</button>
-            <ContextPanel meta={null} stream="open" sessionId="s1" sessionFolder={null} eventCount={0} manifest={manifest} workspaceId="w1" running={running} />
-          </ToastHost>
-        )
-      }
-      compactMock.mockRejectedValueOnce(new CompactionRecoveryNeeded(recovery))
-      await mount(<Probe />)
-      await act(async () => button('Compact…').click())
-      await act(async () => bodyButton('Compact').click())
-      expect(document.body.textContent).toContain('Slow compaction needed')
-      await act(async () => button('Start running').click())
-      expect(document.body.textContent).not.toContain('Slow compaction needed')
-      // The question was about a source that has since changed: it must not come back when the turn ends.
-      await act(async () => button('Stop running').click())
-      expect(document.body.textContent).not.toContain('Slow compaction needed')
       expect(compactSession).toHaveBeenCalledTimes(1)
+      expect(compactMock.mock.calls[0]).toEqual(['w1', 's1'])
+      expect(document.body.textContent).not.toContain('Slow compaction needed')
+      expect(document.body.textContent).toContain('Compacted')
     })
 
     it('a compaction the user stopped is reported as cancelled, not as a failure', async () => {
       compactMock.mockRejectedValueOnce(new CompactionCancelled())
       await open()
       expect(document.body.textContent).toContain('Compaction cancelled')
-      expect(document.body.textContent).not.toContain('Slow compaction needed')
       expect(document.body.textContent).not.toContain('HTTP')
       expect(document.body.textContent).not.toContain('Error')
     })
 
-    it('an ordinary failure is still just a message, never a slow-compaction question', async () => {
+    it('an ordinary failure is just a message', async () => {
       compactMock.mockRejectedValueOnce(new Error('HTTP 409: no'))
       await open()
-      expect(document.body.textContent).not.toContain('Slow compaction needed')
+      expect(document.body.textContent).toContain('HTTP 409: no')
+      expect(compactSession).toHaveBeenCalledTimes(1)
     })
   })
   it('shows a child request’s role and inherited parent context, or why it was dropped', async () => {

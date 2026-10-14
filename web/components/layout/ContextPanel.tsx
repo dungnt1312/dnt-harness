@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react'
 import ConfirmDialog from '../common/ConfirmDialog.tsx'
 import { useToast } from '../common/Toast.tsx'
 import { Button } from '../ui/Button.tsx'
-import { compactSession, CompactionCancelled, CompactionRecoveryNeeded, type CompactionRecovery, type ContextManifestView, type StreamState } from '../../lib/api.ts'
+import { compactSession, CompactionCancelled, type ContextManifestView, type StreamState } from '../../lib/api.ts'
 import { budgetTone, compactionTokenChange, contextFill } from '../../lib/format.ts'
 import { cn } from '../../lib/cn.ts'
 import type { Meta, SessionModel, WorkspaceMeta } from '../../lib/types.ts'
@@ -67,33 +67,25 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
   const folder = sessionFolder ?? (('folder' in (meta ?? {}) ? String((meta as { folder?: string }).folder ?? '') : '') || '—')
   const [confirming, setConfirming] = useState(false)
   const [busy, setBusy] = useState(false)
-  /** Set when the server can only compact by the slow raw fold; nothing has run yet. */
-  const [recovery, setRecovery] = useState<CompactionRecovery | null>(null)
 
   useEffect(() => {
-    if (running && !busy) { setConfirming(false); setRecovery(null) }
+    if (running && !busy) setConfirming(false)
   }, [busy, running])
 
-  const compact = async (confirmed?: CompactionRecovery): Promise<void> => {
+  const compact = async (): Promise<void> => {
     if (workspaceId === null || workspaceId === undefined || sessionId === null || running || busy) return
     setBusy(true)
     try {
-      const result = await (confirmed !== undefined ? compactSession(workspaceId, sessionId, confirmed) : compactSession(workspaceId, sessionId))
+      const result = await compactSession(workspaceId, sessionId)
       const change = compactionTokenChange(result)
       toast.notify(`Compacted${change !== undefined ? ` — ${change}` : ''} (${result.summaryChars} chars summarized through seq ${result.coversSeq}).`, 'ok')
       setConfirming(false)
-      setRecovery(null)
       onCompacted?.()
     } catch (cause) {
       if (cause instanceof CompactionCancelled) {
         // The user stopped it: say so, do not show a failure.
         setConfirming(false)
-        setRecovery(null)
         toast.notify('Compaction cancelled.')
-      } else if (cause instanceof CompactionRecoveryNeeded) {
-        // Ask, never assume: the fold is many model calls and only the user can approve that spend.
-        setConfirming(false)
-        setRecovery(cause.recovery)
       } else {
         toast.notify(String(cause))
       }
@@ -210,17 +202,6 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
         onConfirm={() => void compact()}
         onDismiss={() => { if (!busy) setConfirming(false) }}
         body={<p className="m-0">Older turns will be summarized into a checkpoint and omitted from future requests. The full log stays on disk; compaction cannot be undone in the live context.</p>}
-      />
-
-      <ConfirmDialog
-        open={recovery !== null && !running}
-        title="Slow compaction needed"
-        confirmLabel="Run slow compaction"
-        tone="success"
-        busy={busy || running}
-        onConfirm={() => { if (recovery !== null) void compact(recovery) }}
-        onDismiss={() => { if (!busy) setRecovery(null) }}
-        body={recovery === null ? undefined : <p className="m-0">This conversation has no saved request to summarize from, so it has to be summarized in pieces: about {recovery.estimatedCalls} model calls. Nothing has run yet. Cancel to leave the conversation as it is.</p>}
       />
     </section>
   )

@@ -1,30 +1,18 @@
-import { isCompletedCompactionBoundary, projectForSummary, recoverCanonicalCheckpoint } from '../harness/context/compaction.ts'
-import { sourceDigest } from '../harness/context/compaction-digest.ts'
+import { isCompletedCompactionBoundary, recoverCanonicalCheckpoint } from '../harness/context/compaction.ts'
 import { validateSnapshot, type EffectiveCompactionSnapshot, type SnapshotIdentity } from '../harness/context/compaction-snapshot.ts'
 import type { SessionEvent } from '../harness/session/events.ts'
 
 /**
  * Which source a compaction summarizes from. Pure: it reads the durable log and
- * the candidates it is handed, and returns exactly one decision. There is no
- * "fold the raw transcript" outcome here — that is a slow recovery that must
- * be confirmed against the fingerprint this module computes.
+ * the candidates it is handed, and returns exactly one decision. With no usable
+ * snapshot the decision is to fold the shortened transcript: slower, never asked.
  */
-
-/** The legacy folder sends requests of about this many characters each. */
-export const RAW_RECOVERY_CALL_ESTIMATE_CHARS = 200_000
-
-/** What a caller must echo back to run the slow raw fold: bound to the exact source it was shown. */
-export interface RecoveryConfirmation {
-  readonly cutoff: number
-  readonly sourceDigest: string
-  readonly estimatedCalls: number
-}
 
 export type SourceChoice =
   | { readonly kind: 'snapshot'; readonly snapshot: EffectiveCompactionSnapshot; readonly path: 'exact' | 'reconstructed' }
   /** The newest closed turn is already covered by the checkpoint that stands. */
   | { readonly kind: 'noop'; readonly reason: 'already-compacted'; readonly cutoff: number }
-  | { readonly kind: 'recovery-required'; readonly reason: 'no-eligible-snapshot'; readonly confirmation: RecoveryConfirmation }
+  | { readonly kind: 'fold'; readonly reason: 'no-eligible-snapshot'; readonly cutoff: number }
   | { readonly kind: 'unavailable'; readonly reason: 'open-turn' | 'no-completed-turn' }
 
 export interface ChooseInput {
@@ -51,10 +39,14 @@ function newestClosedCutoff(events: readonly SessionEvent[]): { cutoff: number }
   return { cutoff }
 }
 
-/** Identity fields that decide whether a request prefix could be reused as-is. */
+/**
+ * Identity fields that decide whether a snapshot still describes what the session may see.
+ * Provider, model and thinking level are not among them: they change who writes the summary
+ * and what the prompt cache holds, not what is summarized, so the host sends the snapshot to
+ * the model selected now.
+ */
 function sameIdentity(a: SnapshotIdentity, b: SnapshotIdentity): boolean {
-  return a.provider === b.provider && a.model === b.model && a.thinkingLevel === b.thinkingLevel
-    && a.modeHash === b.modeHash && a.grantsHash === b.grantsHash && a.policyVersion === b.policyVersion
+  return a.modeHash === b.modeHash && a.grantsHash === b.grantsHash && a.policyVersion === b.policyVersion
 }
 
 function usable(snapshot: EffectiveCompactionSnapshot | undefined, events: readonly SessionEvent[], standing: number, identity: SnapshotIdentity): snapshot is EffectiveCompactionSnapshot {
@@ -65,14 +57,6 @@ function usable(snapshot: EffectiveCompactionSnapshot | undefined, events: reado
   return validateSnapshot(snapshot, events).ok
 }
 
-export function recoveryConfirmationFor(events: readonly SessionEvent[], cutoff: number): RecoveryConfirmation {
-  const standing = recoverCanonicalCheckpoint(events.filter((event) => event.seq <= cutoff))?.coversSeq ?? 0
-  // What the folder will read, not the raw log: the same projection it sends, so the count
-  // the user is asked to approve is the count that runs.
-  const chars = projectForSummary(events, cutoff, undefined, standing).length
-  return { cutoff, sourceDigest: sourceDigest(events, cutoff), estimatedCalls: Math.max(1, Math.ceil(chars / RAW_RECOVERY_CALL_ESTIMATE_CHARS)) }
-}
-
 export function chooseCompactionSource(input: ChooseInput): SourceChoice {
   const newest = newestClosedCutoff(input.events)
   if ('reason' in newest) return { kind: 'unavailable', reason: newest.reason }
@@ -80,5 +64,5 @@ export function chooseCompactionSource(input: ChooseInput): SourceChoice {
   if (standing >= newest.cutoff) return { kind: 'noop', reason: 'already-compacted', cutoff: standing }
   if (usable(input.exact, input.events, standing, input.identity)) return { kind: 'snapshot', snapshot: input.exact, path: 'exact' }
   if (usable(input.reconstructed, input.events, standing, input.identity)) return { kind: 'snapshot', snapshot: input.reconstructed, path: 'reconstructed' }
-  return { kind: 'recovery-required', reason: 'no-eligible-snapshot', confirmation: recoveryConfirmationFor(input.events, newest.cutoff) }
+  return { kind: 'fold', reason: 'no-eligible-snapshot', cutoff: newest.cutoff }
 }

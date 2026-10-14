@@ -180,7 +180,6 @@ import { assertFitsWindow } from './compaction-generator.ts'
 import { CaptureRegistry, identityOf, requestPrefixHash } from './compaction-wiring.ts'
 import { loadReferencedSnapshot } from './compaction-restart.ts'
 import { snapshotHash } from '../harness/context/compaction-snapshot.ts'
-import type { RecoveryConfirmation } from './compaction-source.ts'
 import { CacheAwareCompactionFallback, createCacheAwareCompactionSummarizer, createCompactionSummarizer } from './llm-summarizer.ts'
 import { DEFAULT_BUDGET, schemaCost, type ResolvedBudget } from '../harness/context/budget.ts'
 import { CommandsService } from '../harness/commands/service.ts'
@@ -453,14 +452,6 @@ export type TerminalEnvelope =
 export interface TerminalSnapshot extends TerminalInfo {
   /** Base64 of the retained scrollback. */
   readonly scrollback: string
-}
-
-/** A compaction that needs the caller's confirmation before the slow raw fold. */
-class CompactionRecoveryRequired extends Error {
-  constructor(readonly confirmation: RecoveryConfirmation) {
-    super('compaction needs a confirmed recovery: no eligible snapshot covers the newest exchange')
-    this.name = 'CompactionRecoveryRequired'
-  }
 }
 
 /** The user (Stop), a delete or a shutdown ended a compaction: not a failure, nothing was written. */
@@ -1351,7 +1342,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
    * client — and a reload — sees where it is. Telemetry: a session that is going away just
    * has nowhere to write it.
    */
-  const appendJob = async (entry: SessionEntry, job: { readonly stage: 'preparing' | 'generating' | 'applying' | 'ended'; readonly outcome?: 'compacted' | 'noop' | 'needs-recovery' | 'cancelled' | 'failed'; readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'; readonly error?: string }): Promise<void> => {
+  const appendJob = async (entry: SessionEntry, job: { readonly stage: 'preparing' | 'generating' | 'applying' | 'ended'; readonly outcome?: 'compacted' | 'noop' | 'cancelled' | 'failed'; readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'; readonly error?: string }): Promise<void> => {
     const trigger = jobTriggers.get(entry.session.id)
     if (trigger === undefined || entry.closed) return
     try {
@@ -1366,7 +1357,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       if (job.stage === 'ended') await entry.session.durable()
     } catch { /* poisoned or deleted sessions cannot take it */ }
   }
-  const runCompaction = (entry: SessionEntry, trigger: 'manual' | 'automatic', request?: { readonly recovery?: RecoveryConfirmation }): Promise<{ coversSeq: number; summary: string; path?: string; recovery?: RecoveryConfirmation }> => {
+  const runCompaction = (entry: SessionEntry, trigger: 'manual' | 'automatic'): Promise<{ coversSeq: number; summary: string; path?: string }> => {
     if (compactionClosing || entry.closed || compactions.has(entry.session.id)
       || (trigger === 'manual' && entry.agent.busy)
       || kernel.ctx.llm.sessionUncertain(entry.session.id)) {
@@ -1380,8 +1371,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       const startedAfter = entry.session.events.at(-1)?.seq ?? 0
       void appendJob(entry, { stage: 'preparing' })
       try {
-        let result: { coversSeq: number; summary: string; path?: string; recovery?: RecoveryConfirmation }
-        if (limits.compactionEffectiveEnabled) result = await effectiveCompaction(entry, trigger, signal, request)
+        let result: { coversSeq: number; summary: string; path?: string }
+        if (limits.compactionEffectiveEnabled) result = await effectiveCompaction(entry, trigger, signal)
         else {
           const blocked = await runPreCompactHooks(entry.session, entry.workspaceId, signal, trigger === 'automatic' ? 'auto' : 'manual')
           signal.throwIfAborted()
@@ -1397,8 +1388,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         return result
       } catch (error) {
         const message = String(error instanceof Error ? error.message : error)
-        if (error instanceof CompactionRecoveryRequired) await appendJob(entry, { stage: 'ended', outcome: 'needs-recovery' })
-        else if (signal.aborted) {
+        if (signal.aborted) {
           await appendJob(entry, { stage: 'ended', outcome: 'cancelled' })
           // Say so: a user who pressed Stop is not shown a failure.
           throw new CompactionCancelled(message)
@@ -1544,7 +1534,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
    * and runs the single handoff request; this wires it to what only the server
    * knows (providers, grants, hooks, the proven legacy fold, usage and meter).
    */
-  const effectiveCompaction = async (entry: SessionEntry, trigger: 'manual' | 'automatic', signal: AbortSignal, request?: { readonly recovery?: RecoveryConfirmation }): Promise<{ coversSeq: number; summary: string; path?: string; recovery?: RecoveryConfirmation }> => {
+  const effectiveCompaction = async (entry: SessionEntry, trigger: 'manual' | 'automatic', signal: AbortSignal): Promise<{ coversSeq: number; summary: string; path?: string }> => {
     const sessionId = entry.session.id
     let host = compactionHosts.get(sessionId)
     if (host === undefined) {
@@ -1599,19 +1589,18 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     }
     // After a restart the in-memory capture is gone. Reload the snapshot the log's newest
     // reference names; the store re-checks its hash and re-validates it against the log, and
-    // a missing or stale one simply leaves the host to ask for recovery.
+    // a missing or stale one simply leaves the host to fold the transcript.
     if (captures.snapshotOf(sessionId) === undefined) {
       const reloaded = await loadReferencedSnapshot(snapshotStore, sessionId, entry.session.committedEvents).catch(() => undefined)
       if (reloaded !== undefined) captures.keep(sessionId, reloaded)
     }
     signal.throwIfAborted()
-    const outcome = await host.compact({ trigger, signal, ...(request?.recovery !== undefined ? { recovery: request.recovery } : {}) })
+    const outcome = await host.compact({ trigger, signal })
     if (outcome.kind === 'noop') {
       const standing = await checkpoints.latest(sessionId, entry.session.committedEvents)
       if (standing === undefined) throw new Error('nothing to compact')
       return { coversSeq: standing.coversSeq, summary: standing.summary }
     }
-    if (outcome.kind === 'recovery-required') throw new CompactionRecoveryRequired(outcome.confirmation)
     return { coversSeq: outcome.coversSeq, summary: outcome.summary, path: outcome.path }
   }
 
@@ -1767,7 +1756,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       await snapshotStore.prune(scope.sessionId, new Set([snapshot.id]))
       startCandidate(entry, snapshot)
     } catch (error) {
-      // A failed promotion only means compaction will ask for recovery; it never breaks the turn.
+      // A failed promotion only means the next compaction folds the transcript; it never breaks the turn.
       console.error(`web: snapshot promotion failed for ${scope.sessionId}: ${String(error instanceof Error ? error.message : error)}`)
     }
   })
@@ -4710,7 +4699,7 @@ interface HandlerDeps {
   readonly runPreCompactHooks: (session: Session, workspaceId: WorkspaceId) => Promise<string | undefined>
   readonly hookHost: HookHost
   readonly backgroundHooks: BackgroundHooks
-  readonly runCompaction: (entry: SessionEntry, trigger: 'manual' | 'automatic', request?: { readonly recovery?: RecoveryConfirmation }) => Promise<{ coversSeq: number; summary: string; path?: string }>
+  readonly runCompaction: (entry: SessionEntry, trigger: 'manual' | 'automatic') => Promise<{ coversSeq: number; summary: string; path?: string }>
   readonly cancelCompaction: (sessionId: SessionId) => void
   readonly compactionPending: (sessionId: SessionId) => boolean
   readonly settleCompaction: (sessionId: SessionId) => Promise<void>
@@ -7464,19 +7453,10 @@ async function handleApi(
         return
       }
       try {
-        // An optional body carries the fingerprint of a confirmed recovery; an empty POST is the plain request.
-        let recovery: RecoveryConfirmation | undefined
-        const body = await readJson(req).catch(() => ({} as Record<string, unknown>))
-        const echoed = body['recovery'] as Partial<RecoveryConfirmation> | undefined
-        if (echoed !== undefined && echoed !== null && typeof echoed === 'object') {
-          if (!Number.isSafeInteger(echoed.cutoff) || typeof echoed.sourceDigest !== 'string' || !Number.isSafeInteger(echoed.estimatedCalls)) {
-            send(400, { error: 'recovery must carry cutoff, sourceDigest and estimatedCalls' })
-            return
-          }
-          recovery = { cutoff: echoed.cutoff!, sourceDigest: echoed.sourceDigest, estimatedCalls: echoed.estimatedCalls! }
-        }
+        // The server picks the path; a body (an older client's recovery echo) changes nothing.
+        await readJson(req).catch(() => undefined)
         const lastSeqBefore = entry.session.events.at(-1)?.seq ?? 0
-        const checkpoint = await deps.runCompaction(entry, 'manual', recovery !== undefined ? { recovery } : undefined)
+        const checkpoint = await deps.runCompaction(entry, 'manual')
         // An unchanged boundary is a no-op with no new end event: report no figures.
         const end = entry.session.events.findLast((event) => event.type === 'compaction/end' && event.seq > lastSeqBefore)
         const measured = end?.type === 'compaction/end' && end.tokensBefore !== undefined && end.tokensAfter !== undefined
@@ -7484,10 +7464,6 @@ async function handleApi(
           : {}
         send(200, { coversSeq: checkpoint.coversSeq, summaryChars: checkpoint.summary.length, ...measured, ...(checkpoint.path !== undefined ? { path: checkpoint.path } : {}) })
       } catch (error) {
-        if (error instanceof CompactionRecoveryRequired) {
-          send(409, { error: error.message, recovery: error.confirmation })
-          return
-        }
         if (error instanceof CompactionCancelled) {
           send(409, { error: 'compaction was cancelled', cancelled: true })
           return

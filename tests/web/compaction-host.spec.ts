@@ -191,12 +191,24 @@ describe('CompactionHost.compact: the effective path', () => {
     expect(r.requests).toHaveLength(0)
   })
 
-  it('does not call the model when the request cannot fit its own answer', async () => {
+  it('after a model or thinking switch it still uses the snapshot, summarizing with the model selected now', async () => {
+    const r = await rig()
+    const now = { ...identity, provider: 'p2', model: 'm2', thinkingLevel: 'high' }
+    r.host.deps = { ...r.host.deps, identity: () => now }
+    const result = await r.host.compact({ trigger: 'manual' })
+    expect(result).toMatchObject({ kind: 'compacted', path: 'exact' })
+    expect(r.legacy).not.toHaveBeenCalled()
+    expect(r.requests).toHaveLength(1)
+    expect(r.requests[0]).toMatchObject({ model: 'm2', providerName: 'p2', thinkingLevel: 'high' })
+  })
+
+  it('a snapshot too large for the current window is never sent: the transcript is folded in pieces instead', async () => {
     const r = await rig()
     r.setExact(snapshotFor(r.session, 4, { inputEvidence: { inputTokens: 199_000 } }))
-    await expect(r.host.compact({ trigger: 'manual' })).rejects.toThrow(/compaction-input-too-large/)
-    expect(r.requests).toHaveLength(0)
-    expect(r.session.events.some((event) => event.type === 'compaction/start')).toBe(false)
+    const result = await r.host.compact({ trigger: 'manual' })
+    expect(result).toMatchObject({ kind: 'compacted', path: 'recovery' })
+    expect(r.legacy).toHaveBeenCalledTimes(1)
+    expect(r.requests.every((request) => !String(request.messages.at(-1)!.content).includes(COMPACTION_HANDOFF_MARKER))).toBe(true)
   })
 })
 
@@ -383,15 +395,13 @@ describe('CompactionHost.compact: a precomputed candidate', () => {
     expect(r.candidates.waitPending).not.toHaveBeenCalled()
   })
 
-  it('a confirmed slow recovery ignores candidates: the user asked for the raw fold', async () => {
+  it('with no candidate and no snapshot it folds after asking the candidates once', async () => {
     const r = await withCandidate()
     r.setExact(undefined)
     r.candidates.waitPending.mockResolvedValue(undefined)
-    const need = await r.host.compact({ trigger: 'manual' })
-    if (need.kind !== 'recovery-required') throw new Error('expected recovery-required')
-    r.candidates.waitPending.mockClear()
-    await r.host.compact({ trigger: 'manual', recovery: need.confirmation })
-    expect(r.candidates.waitPending).not.toHaveBeenCalled()
+    expect(await r.host.compact({ trigger: 'manual' })).toMatchObject({ kind: 'compacted', path: 'recovery' })
+    expect(r.candidates.waitPending).toHaveBeenCalledTimes(1)
+    expect(r.legacy).toHaveBeenCalledTimes(1)
   })
 
   it('whatever committed, other candidates of the session are dropped afterwards', async () => {
@@ -408,45 +418,29 @@ describe('CompactionHost.compact: a precomputed candidate', () => {
 })
 
 describe('CompactionHost.compact: when the effective path cannot run', () => {
-  it('returns recovery-required with a fingerprint and calls nothing — it never folds the raw transcript on its own', async () => {
+  it('with no usable snapshot a manual compaction just runs the fold — it never asks the user first', async () => {
     const r = await rig()
     r.setExact(undefined)
     const result = await r.host.compact({ trigger: 'manual' })
-    expect(result).toMatchObject({ kind: 'recovery-required', confirmation: { cutoff: 4, sourceDigest: sourceDigest(r.session.committedEvents, 4) } })
-    expect(r.requests).toHaveLength(0)
-    expect(r.hooks).not.toHaveBeenCalled()
-    expect(r.session.events.some((event) => event.type === 'compaction/start')).toBe(false)
-  })
-
-  it('an automatic trigger never starts a recovery, only reports that one is needed', async () => {
-    const r = await rig()
-    r.setExact(undefined)
-    const result = await r.host.compact({ trigger: 'automatic' })
-    expect(result.kind).toBe('recovery-required')
-    expect(r.requests).toHaveLength(0)
-  })
-
-  it('a confirmed recovery runs the legacy fold exactly when the fingerprint still matches', async () => {
-    const r = await rig()
-    r.setExact(undefined)
-    const need = await r.host.compact({ trigger: 'manual' })
-    if (need.kind !== 'recovery-required') throw new Error('expected recovery-required')
-    const result = await r.host.compact({ trigger: 'manual', recovery: need.confirmation })
-    expect(result).toMatchObject({ kind: 'compacted', path: 'recovery' })
+    expect(result).toMatchObject({ kind: 'compacted', path: 'recovery', coversSeq: 4 })
+    expect(r.legacy).toHaveBeenCalledTimes(1)
+    expect(r.hooks).toHaveBeenCalledTimes(1)
     // The legacy folder's own prompt, not the handoff.
-    expect(r.requests.length).toBeGreaterThanOrEqual(1)
     expect(String(r.requests[0]!.messages[0]!.content)).not.toContain(COMPACTION_HANDOFF_MARKER)
+    expect(recoverCanonicalCheckpoint(r.session.committedEvents)).toMatchObject({ coversSeq: 4 })
   })
 
-  it('refuses a stale or forged recovery confirmation and a recovery from an automatic trigger', async () => {
+  it('an automatic compaction with no usable snapshot runs the fold too', async () => {
     const r = await rig()
     r.setExact(undefined)
-    const need = await r.host.compact({ trigger: 'manual' })
-    if (need.kind !== 'recovery-required') throw new Error('expected recovery-required')
-    await expect(r.host.compact({ trigger: 'manual', recovery: { ...need.confirmation, sourceDigest: 'stale' } })).rejects.toThrow(/confirmation/)
-    await expect(r.host.compact({ trigger: 'manual', recovery: { ...need.confirmation, cutoff: 3 } })).rejects.toThrow(/confirmation/)
-    await expect(r.host.compact({ trigger: 'automatic', recovery: need.confirmation })).rejects.toThrow(/automatic|confirmation/)
-    expect(r.requests).toHaveLength(0)
+    expect(await r.host.compact({ trigger: 'automatic' })).toMatchObject({ kind: 'compacted', path: 'recovery' })
+    expect(r.legacy).toHaveBeenCalledWith('automatic', expect.any(AbortSignal))
+  })
+
+  it('a stale snapshot (the log changed under it) falls back to the fold instead of failing', async () => {
+    const r = await rig()
+    r.setExact(snapshotFor(r.session, 4, { sourceDigest: 'stale' }))
+    expect(await r.host.compact({ trigger: 'manual' })).toMatchObject({ kind: 'compacted', path: 'recovery' })
   })
 
   it('with the rollout switch off it keeps the legacy behavior: no snapshot is consulted', async () => {
@@ -465,16 +459,13 @@ describe('CompactionHost.compact: when the effective path cannot run', () => {
 })
 
 describe('CompactionHost: legacy delegation', () => {
-  it('a confirmed recovery calls the server legacy body once, with the hook run exactly once and before it', async () => {
+  it('a recovery calls the server legacy body once, with the hook run exactly once and before it', async () => {
     const r = await rig()
     r.setExact(undefined)
-    const need = await r.host.compact({ trigger: 'manual' })
-    if (need.kind !== 'recovery-required') throw new Error('expected recovery-required')
-    r.hooks.mockClear()
     const order: string[] = []
     r.hooks.mockImplementation(async () => { order.push('hook'); return undefined })
     r.legacy.mockImplementationOnce(async () => { order.push('legacy'); return { coversSeq: 4, summary: 'RECOVERED' } })
-    const result = await r.host.compact({ trigger: 'manual', recovery: need.confirmation })
+    const result = await r.host.compact({ trigger: 'manual' })
     expect(order).toEqual(['hook', 'legacy'])
     expect(r.legacy).toHaveBeenCalledTimes(1)
     expect(r.legacy.mock.calls[0]![0]).toBe('manual')

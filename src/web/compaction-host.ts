@@ -7,7 +7,7 @@ import type { Session } from '../harness/session/session.ts'
 import type { CompactionSnapshotStore } from '../harness/storage/compaction-snapshot-store.ts'
 import { assertFitsWindow, generateCompaction, type PreparedSummary } from './compaction-generator.ts'
 import type { CompactionPrecompute } from './compaction-precompute.ts'
-import { chooseCompactionSource, recoveryConfirmationFor, type RecoveryConfirmation } from './compaction-source.ts'
+import { chooseCompactionSource } from './compaction-source.ts'
 
 /**
  * Foreground compaction for one session: pick a source, summarize once, adopt.
@@ -21,6 +21,24 @@ export class CompactionRefused extends Error {
   constructor(message: string, readonly reason: 'open-turn' | 'no-completed-turn' | 'closing' | 'busy') {
     super(message)
     this.name = 'CompactionRefused'
+  }
+}
+
+/**
+ * The snapshot addressed to the model selected now. Its messages and tools stay exactly as
+ * captured; only who answers changes. A switched model just misses the prompt cache.
+ */
+function retarget(snapshot: EffectiveCompactionSnapshot, now: SnapshotIdentity): EffectiveCompactionSnapshot {
+  const was = snapshot.identity
+  if (was.provider === now.provider && was.model === now.model && was.thinkingLevel === now.thinkingLevel) return snapshot
+  const { thinkingLevel: _thinking, ...request } = snapshot.request
+  void _thinking
+  const { thinkingLevel: _wasThinking, ...identity } = was
+  void _wasThinking
+  return {
+    ...snapshot,
+    request: { ...request, model: now.model, providerName: now.provider, ...(now.thinkingLevel !== undefined ? { thinkingLevel: now.thinkingLevel } : {}) },
+    identity: { ...identity, provider: now.provider, model: now.model, ...(now.thinkingLevel !== undefined ? { thinkingLevel: now.thinkingLevel } : {}) },
   }
 }
 
@@ -50,7 +68,7 @@ export interface HostDeps {
   /**
    * The proven raw-transcript fold, exactly as the server runs it today (seed,
    * attachments, extractive cap, cache-aware prefix). Used for the rollout-off
-   * path, for a session with no model, and for a CONFIRMED recovery. The host
+   * path, for a session with no model, and when no snapshot can be used. The host
    * does not rebuild it: only the server knows those inputs.
    */
   readonly legacyCompact: (trigger: 'manual' | 'automatic', signal: AbortSignal) => Promise<{ readonly coversSeq: number; readonly summary: string }>
@@ -77,15 +95,12 @@ export interface HostDeps {
 
 export interface CompactRequest {
   readonly trigger: 'manual' | 'automatic'
-  /** Echo of the fingerprint a previous `recovery-required` answer returned. Manual only. */
-  readonly recovery?: RecoveryConfirmation
   readonly signal?: AbortSignal
 }
 
 export type CompactOutcome =
   | { readonly kind: 'compacted'; readonly coversSeq: number; readonly summary: string; readonly path: 'exact' | 'reconstructed' | 'recovery' | 'legacy'; readonly generationMs?: number; readonly reused?: true }
   | { readonly kind: 'noop'; readonly coversSeq: number }
-  | { readonly kind: 'recovery-required'; readonly confirmation: RecoveryConfirmation }
 
 export class CompactionHost {
   private running: AbortController | undefined
@@ -131,43 +146,42 @@ export class CompactionHost {
     const events = session.committedEvents
     if (!deps.limits.compactionEffectiveEnabled || !deps.hasModel()) return this.legacy(request, signal, 'legacy')
 
-    const choice = chooseCompactionSource({ events, exact: deps.exactSnapshot(), reconstructed: deps.reconstruct(), identity: deps.identity() })
+    const now = deps.identity()
+    const choice = chooseCompactionSource({ events, exact: deps.exactSnapshot(), reconstructed: deps.reconstruct(), identity: now })
     if (choice.kind === 'unavailable') {
       throw new CompactionRefused(choice.reason === 'open-turn' ? 'compaction requires a completed exchange boundary (no open turn)' : 'nothing to compact yet', choice.reason)
     }
     if (choice.kind === 'noop') return { kind: 'noop', coversSeq: choice.cutoff }
 
     // A candidate written in the background is the better source whenever there is one:
-    // it costs no model call now, and it can stand in for a snapshot a restart lost. A
-    // confirmed slow recovery is a different operation and never looks at candidates.
-    if (request.recovery === undefined) {
-      // An earlier candidate whose aborted transport has not settled still holds provider
-      // capacity. Starting another request now would overlap it, so refuse instead.
-      if (deps.candidates?.blocked(session.id) === true) throw new Error('compaction candidate transport has not settled; try again shortly')
-      const candidate = await this.candidate(session, signal)
+    // it costs no model call now, and it can stand in for a snapshot a restart lost.
+    // An earlier candidate whose aborted transport has not settled still holds provider
+    // capacity. Starting another request now would overlap it, so refuse instead.
+    if (deps.candidates?.blocked(session.id) === true) throw new Error('compaction candidate transport has not settled; try again shortly')
+    const candidate = await this.candidate(session, signal)
+    signal.throwIfAborted()
+    if (candidate !== undefined) {
+      const blocked = await deps.preCompact(request.trigger === 'automatic' ? 'auto' : 'manual', signal)
       signal.throwIfAborted()
-      if (candidate !== undefined) {
-        const blocked = await deps.preCompact(request.trigger === 'automatic' ? 'auto' : 'manual', signal)
-        signal.throwIfAborted()
-        if (blocked !== undefined) throw new Error(blocked)
-        return this.adopt(session, candidate, request, signal, true)
-      }
+      if (blocked !== undefined) throw new Error(blocked)
+      return this.adopt(session, candidate, request, signal, true)
     }
 
-    if (choice.kind === 'recovery-required') {
-      if (request.recovery === undefined) return { kind: 'recovery-required', confirmation: choice.confirmation }
-      if (request.trigger === 'automatic') throw new Error('an automatic compaction never runs a confirmed recovery')
-      const current = recoveryConfirmationFor(events, choice.confirmation.cutoff)
-      if (request.recovery.cutoff !== current.cutoff || request.recovery.sourceDigest !== current.sourceDigest) {
-        throw new Error('recovery confirmation does not match the current source; ask again')
-      }
+    // No snapshot describes this log (written before capture existed, sidecar lost, mode or
+    // grants changed since): fold the shortened transcript. Slower, but /compact always runs;
+    // the user is never asked to pick a path.
+    if (choice.kind === 'fold') return this.legacy(request, signal, 'recovery')
+
+    const snapshot = retarget(choice.snapshot, now)
+    const { path } = choice
+    // A snapshot the current model's window cannot take with room for its answer (a switch to a
+    // smaller model, a request that grew to the limit) is folded in pieces instead of failing.
+    const window = deps.contextWindowTokens()
+    try {
+      assertFitsWindow(snapshot, { ...(window !== undefined ? { contextWindowTokens: window } : {}), outputTokens: deps.limits.compactionOutputTokens })
+    } catch {
       return this.legacy(request, signal, 'recovery')
     }
-
-    // A recovery confirmation is only meaningful when recovery was actually required.
-    if (request.recovery !== undefined && request.trigger === 'automatic') throw new Error('an automatic compaction never runs a confirmed recovery')
-    const { snapshot, path } = choice
-    assertFitsWindow(snapshot, { ...(deps.contextWindowTokens() !== undefined ? { contextWindowTokens: deps.contextWindowTokens()! } : {}), outputTokens: deps.limits.compactionOutputTokens })
 
     const blocked = await deps.preCompact(request.trigger === 'automatic' ? 'auto' : 'manual', signal)
     signal.throwIfAborted()

@@ -248,7 +248,7 @@ describe('effective compaction through the web server', () => {
     expect(await lifecycle()).toBe(events)
   })
 
-  it('a session whose turns were never captured answers 409 with a fingerprint, calls nothing, and a confirmed echo runs the recovery', async () => {
+  it('a session whose turns were never captured just compacts: the fold runs on the first /compact, no confirmation', async () => {
     const { provider: llm, requests } = provider()
     // First server writes a real session, then goes away. The turns were produced by an older
     // host: nothing was captured and no snapshot exists. A second server over the same home must
@@ -265,18 +265,28 @@ describe('effective compaction through the web server', () => {
     const route = `${server.url}/api/workspaces/${first.wsId}/sessions/${id}`
     const calls = requests.length
     const response = await fetch(`${route}/compact`, { method: 'POST' })
-    expect(response.status).toBe(409)
-    const body = await response.json() as { error?: string; recovery?: { cutoff: number; sourceDigest: string; estimatedCalls: number } }
-    expect(body.recovery).toMatchObject({ cutoff: expect.any(Number), sourceDigest: expect.any(String), estimatedCalls: expect.any(Number) })
-    expect(requests.length).toBe(calls)
-    // A stale echo is refused and calls nothing.
-    const stale = await fetch(`${route}/compact`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ recovery: { ...body.recovery, sourceDigest: 'stale' } }) })
-    expect(stale.status).toBe(409)
-    expect(requests.length).toBe(calls)
-    // The honest echo runs the proven fold.
-    const confirmed = await fetch(`${route}/compact`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ recovery: body.recovery }) })
-    expect(confirmed.status).toBe(200)
+    expect(response.status).toBe(200)
+    expect((await response.json() as { path?: string }).path).toBe('recovery')
     expect(requests.slice(calls).some((r) => r.messages.some((m) => typeof m.content === 'string' && m.content.includes(LEGACY_MARK)))).toBe(true)
+    const job = (await readLog(path.join(first.home, 'workspaces', first.wsId, 'sessions', id, 'events.jsonl'))).findLast((event) => event.type === 'compaction/job')
+    expect(job).toMatchObject({ stage: 'ended', outcome: 'compacted', path: 'recovery' })
+  })
+
+  it('an older client that still posts a recovery echo is served the same way: the body changes nothing', async () => {
+    const { provider: llm } = provider()
+    const first = await start(llm, {})
+    const { id } = await (await fetch(`${first.base}/api/workspaces/${first.wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    await completedMessage(first.base, first.wsId, id, path.join(first.home, 'workspaces', first.wsId, 'sessions', id, 'events.jsonl'), 'old question', 1)
+    await first.server.close()
+    homes.delete(first.server)
+    const server = await createWebServer({ home: first.home, providers: [llm], configFile: path.join(first.home, 'p.json'), limits: { compactionEffectiveEnabled: true } })
+    servers.push(server)
+    homes.set(server, first.home)
+    const response = await fetch(`${server.url}/api/workspaces/${first.wsId}/sessions/${id}/compact`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ recovery: { cutoff: 1, sourceDigest: 'stale', estimatedCalls: 6 } }),
+    })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ path: 'recovery' })
   })
 
   it('after a RESTART the snapshot is reloaded from its sidecar: one handoff request, no recovery prompt', async () => {
@@ -300,7 +310,7 @@ describe('effective compaction through the web server', () => {
     expect(String(summaryCalls[0]!.messages.at(-1)!.content)).toContain(COMPACTION_HANDOFF_MARKER)
   })
 
-  it('after a restart with the sidecar GONE it asks for recovery instead of guessing', async () => {
+  it('after a restart with the sidecar GONE it folds from the log instead of asking', async () => {
     const { provider: llm, requests } = provider({ replies: ['answer one'] })
     const first = await start(llm, { compactionEffectiveEnabled: true })
     const { id } = await (await fetch(`${first.base}/api/workspaces/${first.wsId}/sessions`, { method: 'POST' })).json() as { id: string }
@@ -314,9 +324,9 @@ describe('effective compaction through the web server', () => {
     homes.set(server, first.home)
     const calls = requests.length
     const response = await fetch(`${server.url}/api/workspaces/${first.wsId}/sessions/${id}/compact`, { method: 'POST' })
-    expect(response.status).toBe(409)
-    expect(await response.json()).toMatchObject({ recovery: { cutoff: expect.any(Number), sourceDigest: expect.any(String) } })
-    expect(requests.length).toBe(calls)
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ path: 'recovery' })
+    expect(requests.length).toBeGreaterThan(calls)
   })
 
   it('with the rollout switch OFF it behaves exactly as before: the legacy fold, no snapshot', async () => {

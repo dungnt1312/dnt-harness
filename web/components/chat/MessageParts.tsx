@@ -1783,7 +1783,7 @@ export const CompactionMarker = memo(function CompactionMarker({ item }: {
     item.summaryChars !== undefined ? `${formatBytes(item.summaryChars)} summarized` : undefined,
     item.model !== undefined ? item.model : undefined,
     item.trigger !== undefined ? item.trigger : undefined,
-    item.path === 'recovery' ? 'slow recovery' : undefined,
+    item.path === 'recovery' ? 'full transcript' : undefined,
     item.durationMs !== undefined && item.status !== 'running' ? `${(item.durationMs / 1000).toFixed(1)}s` : undefined,
   ].filter((fact) => fact !== undefined)
 
@@ -1810,7 +1810,8 @@ export const CompactionMarker = memo(function CompactionMarker({ item }: {
         : item.status === 'noop'
           ? 'Already compacted'
           : item.status === 'needs-recovery'
-            ? 'Needs a slow recovery'
+            // Written only by older hosts, which asked before folding; nothing ran.
+            ? 'Not compacted'
             : 'Compacted'
 
   return (

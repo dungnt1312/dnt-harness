@@ -785,16 +785,19 @@ runs and the behavior above is unchanged.
   events, so `recoverCanonicalCheckpoint` verifies an adoption from the log alone and
   still rejects a `turn/start` inside the transaction. A candidate built on a
   different checkpoint than the one that stands is refused.
-- **No silent slow path.** When there is no usable snapshot (an older host never
-  captured one, the sidecar is gone), `POST …/compact` answers `409` with
-  `{recovery: {cutoff, sourceDigest, estimatedCalls}}` and runs nothing. Echoing that
-  fingerprint back in the body runs the raw fold (`path: "recovery"`); a source that
-  changed since is refused. An automatic compaction never runs a recovery. The UI
-  shows a confirmation with the call count; Cancel does not confirm.
+- **`/compact` always runs; the user never picks a path.** The host chooses, in order:
+  a precomputed candidate (no model call), the newest snapshot (one request), or —
+  when no snapshot describes the log (an older host never captured one, the sidecar
+  is gone, the mode or grants changed since) — the shortened-transcript fold
+  (`path: "recovery"`, several sequential requests). Manual and automatic compactions
+  take the same path. A provider, model or thinking-level switch does not invalidate a
+  snapshot: the host sends it, unchanged, to the model selected now (only the prompt
+  cache misses). A request body (an older client's `{recovery: …}` echo) is ignored.
 - **Progress and Stop.** Every compaction — the old fold included — writes durable
   `compaction/job` events (`preparing → generating → applying → ended`), so every client
   and a reload see where it is; `ended` carries `outcome` (`compacted`, `noop`,
-  `needs-recovery`, `cancelled`, `failed`), the `path`, and a failure's reason.
+  `cancelled`, `failed`; `needs-recovery` appears only in logs of older hosts), the
+  `path`, and a failure's reason.
   `generating` is reported just before the model is asked and `applying` just before the
   adoption, so a hook block, a no-op or a refused request reports neither. They bracket
   the canonical `compaction/start`/`end` pair and are not the authority for a
