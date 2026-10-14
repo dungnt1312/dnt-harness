@@ -47,11 +47,24 @@ export function GitSplit({ projectId, list, diff, state, onChange }: {
 }) {
   const box = useRef<HTMLDivElement | null>(null)
   const [dragging, setDragging] = useState(false)
+  // While a finger or mouse drags, the ratio lives here only: persisting (and
+  // re-rendering the whole panel through onChange) on every pointermove would
+  // write storage dozens of times a second. It is saved once, on release.
+  const [live, setLive] = useState<number | null>(null)
+  const liveRef = useRef<number | null>(null)
   const commit = useCallback((ratio: number): void => {
     const next = { ratio: clampRatio(ratio), collapsed: state.collapsed }
     writeSplit(projectId, next)
     onChange(next)
   }, [projectId, state.collapsed, onChange])
+  /** The drag is over, however it ended: save the last ratio once and go back to the stored one. */
+  const endDrag = useCallback((): void => {
+    setDragging(false)
+    const last = liveRef.current
+    liveRef.current = null
+    setLive(null)
+    if (last !== null) commit(last)
+  }, [commit])
 
   const onKeyDown = (event: ReactKeyboardEvent<HTMLElement>): void => {
     const back = event.key === 'ArrowLeft' || event.key === 'ArrowUp'
@@ -73,14 +86,16 @@ export function GitSplit({ projectId, list, diff, state, onChange }: {
     const horizontal = getComputedStyle(box.current).flexDirection === 'row'
     const size = horizontal ? rect.width : rect.height
     if (size <= 0) return
-    commit(((horizontal ? event.clientX - rect.left : event.clientY - rect.top)) / size)
+    const next = clampRatio((horizontal ? event.clientX - rect.left : event.clientY - rect.top) / size)
+    liveRef.current = next
+    setLive(next)
   }
   const onPointerUp = (event: ReactPointerEvent<HTMLElement>): void => {
-    setDragging(false)
-    event.currentTarget.releasePointerCapture(event.pointerId)
+    try { event.currentTarget.releasePointerCapture(event.pointerId) } catch { /* already released */ }
+    endDrag()
   }
 
-  const percent = Math.round(state.ratio * 100)
+  const percent = Math.round((live ?? state.ratio) * 100)
   if (state.collapsed || diff === null) {
     return <div className="flex min-h-0 flex-1 flex-col" data-split="collapsed">{list}</div>
   }
@@ -102,8 +117,12 @@ export function GitSplit({ projectId, list, diff, state, onChange }: {
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
+          // A browser that takes the gesture for a scroll sends pointercancel; the drag then ends, it does not hang.
+          onPointerCancel={endDrag}
+          onLostPointerCapture={endDrag}
           className={cn(
-            'shrink-0 bg-line outline-none transition-colors hover:bg-fg-faint focus-visible:bg-fg-faint',
+            // `touch-none`: the browser must not claim a finger on the handle for scrolling.
+            'shrink-0 touch-none bg-line outline-none transition-colors hover:bg-fg-faint focus-visible:bg-fg-faint',
             'h-1.5 cursor-row-resize @[720px]:h-auto @[720px]:w-1.5 @[720px]:cursor-col-resize',
             dragging && 'bg-fg-faint',
           )}
