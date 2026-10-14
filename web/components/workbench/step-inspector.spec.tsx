@@ -103,6 +103,37 @@ it('the response tab shows the answer and the streamed thinking', async () => {
   expect(view.textContent).toContain('quiet reasoning')
 })
 
+it('the response tab shows how long each tool call took', async () => {
+  const withCall: readonly SseEvent[] = [
+    event({ type: 'turn/start', seq: 1, timestamp: 1_000, turnId: 't1' }),
+    event({ type: 'user/message', seq: 2, timestamp: 1_010, turnId: 't1', content: 'inspect me' }),
+    event({ type: 'step/start', seq: 3, timestamp: 1_100, turnId: 't1', stepId: 's1' }),
+    event({ type: 'assistant/message', seq: 4, timestamp: 1_400, stepId: 's1', content: '', toolCalls: [{ id: 'c1', name: 'Read', args: { path: 'README.md' } }], controls: { model: 'glm-5.3' } }),
+    event({ type: 'tool/call', seq: 5, timestamp: 1_420, call: { id: 'c1', name: 'Read', args: { path: 'README.md' } } }),
+    event({ type: 'tool/result', seq: 6, timestamp: 1_900, callId: 'c1', ok: true, output: '# README\n' }),
+    event({ type: 'step/start', seq: 7, timestamp: 1_900, turnId: 't1', stepId: 's2' }),
+    event({ type: 'assistant/message', seq: 8, timestamp: 2_200, stepId: 's2', content: 'done', controls: { model: 'glm-5.3' } }),
+    event({ type: 'turn/end', seq: 9, timestamp: 2_300, turnId: 't1', reason: 'completed' }),
+  ]
+  host = document.createElement('div')
+  document.body.append(host)
+  root = createRoot(host)
+  const trajectory = projectTrajectory(withCall)
+  const turn = trajectory.turns[0]!
+  const step = turn.steps[0]!
+  const trace = turn.traces?.find((candidate) => candidate.stepId === step.stepId)
+  await act(async () => root!.render(
+    <StepInspector turn={turn} step={step} trace={trace} calls={trajectory.calls} workspaceId="ws-1" sessionId="s-1" onBack={() => {}} />,
+  ))
+  await act(async () => {
+    host.querySelectorAll<HTMLButtonElement>('[role="group"] button').forEach((button) => {
+      if (button.textContent === 'Response') button.click()
+    })
+  })
+  // The call ran 1_420 → 1_900.
+  expect(host.textContent).toContain('480ms')
+})
+
 it('a legacy step with no trace still renders, with honest empty states', async () => {
   const legacy = EVENTS.filter((item) => item.type !== 'model/attempt' && item.type !== 'context/manifest' && item.type !== 'assistant/chunk')
   const view = await mountInspector(legacy)

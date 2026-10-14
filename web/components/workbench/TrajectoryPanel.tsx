@@ -215,7 +215,7 @@ function StepLog({ slots, selected, openPath, rowRefs, onOpenStep }: {
                 {slot.calls.map((call) => (
                   <li key={call.id} className="flex items-start gap-3">
                     <Badge kind="tools" />
-                    <div className="min-w-0 flex-1"><ToolCard item={toolItem(call)} {...(openPath !== undefined ? { openPath } : {})} /></div>
+                    <div className="min-w-0 flex-1"><ToolCard item={toolItem(call)} withDuration {...(openPath !== undefined ? { openPath } : {})} /></div>
                   </li>
                 ))}
               </ul>
@@ -377,7 +377,7 @@ export function TrajectoryPanel({ events, openPath, workspaceId = null, sessionI
             // own ToolCard, as in the Duration detail.
             <div className="relative min-h-0 flex-1 overflow-y-auto px-4 py-2">
               <ol aria-label="Calls" className="m-0 flex list-none flex-col gap-0.5 p-0">
-                {calls.map((call) => <li key={call.id}><ToolCard item={toolItem(call)} {...(openPath !== undefined ? { openPath } : {})} /></li>)}
+                {calls.map((call) => <li key={call.id}><ToolCard item={toolItem(call)} withDuration {...(openPath !== undefined ? { openPath } : {})} /></li>)}
               </ol>
             </div>
           )}

@@ -228,6 +228,17 @@ describe('chat surfaces', () => {
     expect(settled).not.toContain('text-shimmer')
   })
 
+  it('ToolCard shows the recorded duration only when the surface opts in', () => {
+    const settled = { kind: 'tool' as const, call: { id: 't1', name: 'bash', args: { command: 'slow' } }, ts: 1_000, doneAt: 3_400, result: { ok: true, output: 'x' } }
+    // Chat keeps the row quiet; a Trajectory surface passes withDuration.
+    expect(renderToStaticMarkup(<ToolCard item={settled} />)).not.toContain('Call duration')
+    expect(renderToStaticMarkup(<ToolCard item={settled} withDuration />)).toContain('Call duration')
+    expect(renderToStaticMarkup(<ToolCard item={settled} withDuration />)).toContain('2.4s')
+    // Nothing is invented for a call that has not settled or carries no stamps.
+    const pending = { kind: 'tool' as const, call: { id: 't2', name: 'bash', args: { command: 'x' } } }
+    expect(renderToStaticMarkup(<ToolCard item={pending} withDuration />)).not.toContain('Call duration')
+  })
+
   it('ApprovalBar shows one card per pending call', () => {
     const html = renderToStaticMarkup(<ApprovalBar approvals={[{ approvalId: 'a1', call: { id: 't', name: 'edit', args: { path: 'web/App.tsx' } } }]} onAnswer={async () => undefined} />)
     expect(html).toContain('web/App.tsx')
