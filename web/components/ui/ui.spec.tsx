@@ -127,6 +127,17 @@ describe('primitives', () => {
     expect(html).toContain('body')
   })
 
+  // The categorical tones reuse the theme's `tool-*` hues, which already have
+  // a light and a dark variant; a new raw colour here would skip that.
+  it('Badge has categorical tones that map onto the theme hues, each different', () => {
+    const classOf = (tone: 'violet' | 'pink' | 'cyan' | 'amber'): string =>
+      /class="([^"]*)"/.exec(renderToStaticMarkup(<Badge tone={tone}>x</Badge>))?.[1] ?? ''
+    expect(classOf('violet')).toContain('text-tool-search')
+    expect(classOf('pink')).toContain('text-tool-agent')
+    expect(classOf('cyan')).toContain('text-tool-ext')
+    expect(new Set([classOf('violet'), classOf('pink'), classOf('cyan'), classOf('amber')]).size).toBe(4)
+  })
+
   it('Modal renders nothing while closed and carries dialog semantics when open', () => {
     expect(renderToStaticMarkup(<Modal open={false} onDismiss={() => undefined} label="x"><p>body</p></Modal>)).toBe('')
     const html = renderToStaticMarkup(<Modal open onDismiss={() => undefined} label="Settings" width="md" header={<strong>Head</strong>}><p>body</p></Modal>)
