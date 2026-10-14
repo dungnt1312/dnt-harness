@@ -1,4 +1,4 @@
-import { isCompletedCompactionBoundary, recoverCanonicalCheckpoint } from '../harness/context/compaction.ts'
+import { isCompletedCompactionBoundary, projectForSummary, recoverCanonicalCheckpoint } from '../harness/context/compaction.ts'
 import { sourceDigest } from '../harness/context/compaction-digest.ts'
 import { validateSnapshot, type EffectiveCompactionSnapshot, type SnapshotIdentity } from '../harness/context/compaction-snapshot.ts'
 import type { SessionEvent } from '../harness/session/events.ts'
@@ -67,14 +67,9 @@ function usable(snapshot: EffectiveCompactionSnapshot | undefined, events: reado
 
 export function recoveryConfirmationFor(events: readonly SessionEvent[], cutoff: number): RecoveryConfirmation {
   const standing = recoverCanonicalCheckpoint(events.filter((event) => event.seq <= cutoff))?.coversSeq ?? 0
-  let chars = 0
-  for (const event of events) {
-    if (event.seq > cutoff) break
-    if (event.seq <= standing) continue
-    if (event.type === 'user/message' || event.type === 'assistant/message') chars += event.content.length
-    else if (event.type === 'tool/result') chars += event.output.length
-    else if (event.type === 'tool/call') chars += JSON.stringify(event.call.args).length
-  }
+  // What the folder will read, not the raw log: the same projection it sends, so the count
+  // the user is asked to approve is the count that runs.
+  const chars = projectForSummary(events, cutoff, undefined, standing).length
   return { cutoff, sourceDigest: sourceDigest(events, cutoff), estimatedCalls: Math.max(1, Math.ceil(chars / RAW_RECOVERY_CALL_ESTIMATE_CHARS)) }
 }
 

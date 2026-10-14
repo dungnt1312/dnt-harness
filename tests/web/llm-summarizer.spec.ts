@@ -149,10 +149,16 @@ describe('llm compaction summarizer', () => {
     expect(chunks[1]!.startsWith('😀')).toBe(true)
   })
 
-  it.each([[24_001], [12_000, 12_001]])('rejects overflowing deltas %j without consuming further output', async (...sizes: number[]) => {
+  it.each([[24_001], [12_000, 12_001]])('rejects repair overflowing deltas %j without consuming further output', async (...sizes: number[]) => {
     let consumed = 0
     let closed = false
+    let calls = 0
     const summarize = createCompactionSummarizer(() => (async function* () {
+      if (++calls < 3) {
+        yield { type: 'delta', delta: 'x'.repeat(24_001) }
+        yield STOP
+        return
+      }
       try {
         for (const size of sizes) {
           consumed++
@@ -163,9 +169,9 @@ describe('llm compaction summarizer', () => {
       } finally { closed = true }
     })(), PAIR)
     await expect(summarize({ text: 'user: hello' })).rejects.toThrow(/24,?000|24000/)
-    // Each attempt consumes exactly the overflowing deltas; nothing after them.
-    expect(consumed).toBe(sizes.length * 2)
+    expect(consumed).toBe(sizes.length)
     expect(closed).toBe(true)
+    expect(calls).toBe(3)
   })
 
   it('rejects a second-chunk exception rather than returning partial coverage', async () => {
@@ -177,6 +183,73 @@ describe('llm compaction summarizer', () => {
     })(), PAIR)
     await expect(summarize({ text: 'x'.repeat(300_000) })).rejects.toThrow('second chunk failed')
     expect(calls).toBe(2)
+  })
+
+  it('compresses the COMPLETE oversized draft rather than re-summarizing the raw chunk', async () => {
+    const seen: ModelRequest[] = []
+    const draft = `${'x'.repeat(24_001)}\nFINAL-DRAFT-FACT: pending migration; do not commit`
+    const summarize = createCompactionSummarizer(request => {
+      seen.push(request)
+      return (async function* () {
+        if (seen.length === 1) {
+          yield { type: 'delta', delta: draft.slice(0, 24_001) }
+          yield { type: 'delta', delta: draft.slice(24_001) }
+        } else {
+          const input = String(request.messages[0]!.content)
+          // The only place this fact exists is AFTER the overflow boundary.
+          if (!input.includes('FINAL-DRAFT-FACT')) throw new Error('draft was truncated')
+          yield { type: 'delta', delta: 'pending migration; do not commit' }
+        }
+        yield STOP
+      })()
+    }, PAIR)
+    expect(await summarize({ text: 'RAW-SOURCE-ONLY'.repeat(10_000) })).toBe('pending migration; do not commit')
+    expect(seen).toHaveLength(2)
+    const repair = String(seen[1]!.messages[0]!.content)
+    expect(repair).toContain(draft)
+    expect(repair).not.toContain('RAW-SOURCE-ONLY')
+    expect(repair).toContain('12000')
+    expect(repair.length).toBeLessThan(100_000)
+  })
+
+  it('uses a second smaller repair only when the first repair is still oversized', async () => {
+    const requests: ModelRequest[] = []
+    const summarize = createCompactionSummarizer(request => {
+      requests.push(request)
+      return (async function* () {
+        yield { type: 'delta', delta: requests.length < 3 ? 'x'.repeat(25_000) : 'constraints and pending work' }
+        yield STOP
+      })()
+    }, PAIR)
+    expect(await summarize({ text: 'source' })).toBe('constraints and pending work')
+    expect(requests).toHaveLength(3)
+    expect(String(requests[1]!.messages[0]!.content)).toContain('12000')
+    expect(String(requests[2]!.messages[0]!.content)).toContain('8000')
+    expect(String(requests[1]!.messages[0]!.content)).not.toContain('All User Messages')
+  })
+
+  it('does not repair an oversized draft without a valid stop completion', async () => {
+    let calls = 0
+    const summarize = createCompactionSummarizer(() => (async function* () {
+      calls++
+      yield { type: 'delta', delta: 'x'.repeat(24_001) }
+    })(), PAIR)
+    await expect(summarize({ text: 'source' })).rejects.toThrow(/missing completion/)
+    expect(calls).toBe(1)
+  })
+
+  it('refuses a draft over the 96000-character collection limit without reading unbounded output', async () => {
+    let calls = 0
+    let tail = false
+    const summarize = createCompactionSummarizer(() => (async function* () {
+      calls++
+      yield { type: 'delta', delta: 'x'.repeat(96_001) }
+      tail = true
+      yield STOP
+    })(), PAIR)
+    await expect(summarize({ text: 'source' })).rejects.toThrow(/draft.*96000/)
+    expect(calls).toBe(1)
+    expect(tail).toBe(false)
   })
 
   it('re-asks once with a hard length constraint when an answer overflows the cap', async () => {
@@ -196,15 +269,14 @@ describe('llm compaction summarizer', () => {
     expect(calls).toBe(2)
     const first = seen[0]!.messages[0]!.content as string
     const second = seen[1]!.messages[0]!.content as string
-    // The re-ask carries the same conversation chunk plus the hard constraint.
-    expect(second).toContain('<conversation>\nuser: hello\n</conversation>')
-    // The reported size is the true overflow, never a number within the cap.
-    const reported = /at least (\d+) characters/i.exec(second)
+    // The repair carries the settled draft, NOT the raw source again.
+    expect(second).toContain('x'.repeat(MAX_SUMMARY_CHARS + 1))
+    expect(second).not.toContain('user: hello')
+    const reported = /draft below contains (\d+) characters/i.exec(second)
     expect(reported).not.toBeNull()
-    expect(Number(reported![1])).toBeGreaterThan(MAX_SUMMARY_CHARS)
-    expect(second).toMatch(/at most \d+ characters/i)
-    expect(second.length).toBeGreaterThan(first.length)
-    expect(second.startsWith(first)).toBe(true)
+    expect(Number(reported![1])).toBe(MAX_SUMMARY_CHARS + 1)
+    expect(second).toMatch(/at most 12000 characters/i)
+    expect(second.startsWith(first)).toBe(false)
   })
 
   it('fails closed when the re-ask also overflows the cap', async () => {
@@ -215,7 +287,7 @@ describe('llm compaction summarizer', () => {
       yield STOP
     })(), PAIR)
     await expect(summarize({ text: 'user: hello' })).rejects.toThrow(/24,?000|24000/)
-    expect(calls).toBe(2)
+    expect(calls).toBe(3)
   })
 
   it('seeds the accumulated summary from a checkpoint for an incremental fold', async () => {
