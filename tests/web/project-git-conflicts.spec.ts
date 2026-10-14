@@ -185,3 +185,57 @@ describe('direct file writes stay inside the project', () => {
     expect(await fs.readFile(outside, 'utf8')).toBe('a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> t\n')
   })
 })
+
+describe('a conflicted file that is not UTF-8 keeps its bytes (final review C1)', () => {
+  it('Use Both rewrites only the region and leaves the é byte of the rest alone', async () => {
+    const repo = await makeRepo('latin1')
+    const withE = (middle: string): Buffer => Buffer.concat([Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x0a]), Buffer.from(middle)])
+    await fs.writeFile(path.join(repo.dir, 'f.txt'), withE('x\n')); repo.git('add', '.'); repo.git('commit', '-qm', 'base')
+    repo.git('switch', '-q', '-c', 'feature'); await fs.writeFile(path.join(repo.dir, 'f.txt'), withE('feature\n')); repo.git('commit', '-qam', 'feature')
+    repo.git('switch', '-q', 'main'); await fs.writeFile(path.join(repo.dir, 'f.txt'), withE('main\n')); repo.git('commit', '-qam', 'main')
+    git(repo.dir, ['merge', 'feature'], { allowFailure: true })
+
+    const diff = await gitDiff(repo.dir, 'f.txt', undefined, true)
+    expect(diff.conflicts).toHaveLength(1)
+    const done = await operate(repo, { type: 'resolve-conflict', path: 'f.txt', index: 0, fingerprint: (diff.conflicts ?? [])[0]!.fingerprint, choice: 'both' })
+    expect(done.ok).toBe(true)
+    const bytes = await fs.readFile(path.join(repo.dir, 'f.txt'))
+    expect([...bytes.subarray(0, 5)]).toEqual([0x63, 0x61, 0x66, 0xe9, 0x0a])
+    expect(bytes.includes(Buffer.from([0xef, 0xbf, 0xbd]))).toBe(false)
+    expect(bytes.subarray(5).toString('latin1')).toBe('main\nfeature\n')
+  })
+})
+
+describe('Add to .gitignore writes exactly one safe line per path (final review minor 2)', () => {
+  it('refuses a file name that contains a line break', async () => {
+    const repo = await makeRepo('ignore-nl')
+    await repo.write('seed.txt', 'seed\n'); repo.git('add', '.'); repo.git('commit', '-qm', 'seed')
+    await repo.write('a\nb', 'x\n')
+    await expect(operate(repo, { type: 'ignore', paths: ['a\nb'] })).rejects.toThrow(/line break/)
+    await expect(fs.readFile(path.join(repo.dir, '.gitignore'), 'utf8')).rejects.toThrow()
+  })
+
+  it('escapes glob characters and leading # or ! so the rule matches only that file', async () => {
+    const repo = await makeRepo('ignore-esc')
+    await repo.write('seed.txt', 'seed\n'); repo.git('add', '.'); repo.git('commit', '-qm', 'seed')
+    for (const name of ['a[1].log', '#note.txt', '!keep.txt', 'what?.txt', 'star*.txt', 'tail .txt']) await repo.write(name, 'x\n')
+    await operate(repo, { type: 'ignore', paths: ['a[1].log', '#note.txt', '!keep.txt', 'what?.txt', 'star*.txt'] })
+    expect(await repo.read('.gitignore')).toBe('/a\\[1\\].log\n/\\#note.txt\n/\\!keep.txt\n/what\\?.txt\n/star\\*.txt\n')
+    // git agrees: each of them is now ignored, and a sibling that only matches the unescaped glob is not.
+    await repo.write('a1.log', 'x\n')
+    const status = repo.git('status', '--porcelain', '--untracked-files=all')
+    expect(status).toContain('a1.log')
+    expect(status).not.toContain('a[1].log')
+  })
+
+  it('does not write through a symlinked .gitignore that leaves the project', async () => {
+    const repo = await makeRepo('ignore-link')
+    await repo.write('seed.txt', 'seed\n'); repo.git('add', '.'); repo.git('commit', '-qm', 'seed')
+    const outside = path.join(scratch, `outside-ignore-${counter}.txt`)
+    await fs.writeFile(outside, 'untouched\n')
+    await fs.symlink(outside, path.join(repo.dir, '.gitignore'))
+    await repo.write('junk.log', 'x\n')
+    await expect(operate(repo, { type: 'ignore', paths: ['junk.log'] })).rejects.toThrow()
+    expect(await fs.readFile(outside, 'utf8')).toBe('untouched\n')
+  })
+})

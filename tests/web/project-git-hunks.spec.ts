@@ -339,3 +339,97 @@ describe('direct file writes stay inside the project', () => {
     expect(await fs.readFile(outside, 'utf8')).toBe(before)
   })
 })
+
+describe('bytes outside UTF-8 survive every hunk operation (final review C1)', () => {
+  // Latin-1 'café' is 63 61 66 e9: not valid UTF-8, and git does not call the file binary.
+  const latin1 = (second: string, tail = 'y\n'): Buffer => Buffer.concat([Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x0a]), Buffer.from(`${second}\n${tail}`)])
+
+  async function latin1Repo(): Promise<Repo> {
+    const repo = await makeRepo()
+    await repo.write('f.txt', Buffer.concat([latin1('x'), Buffer.from(lines(30))]) as unknown as string)
+    repo.git('add', '.'); repo.git('commit', '-qm', 'latin1')
+    // Edit a line far from the first one so the hunk does not touch the é line.
+    const edited = Buffer.concat([latin1('x'), Buffer.from(lines(30).replace('l20\n', 'L20\n'))])
+    await repo.write('f.txt', edited)
+    return repo
+  }
+  const indexBytes = (repo: Repo): Buffer => execFileSync(gitExecutable() as string, ['show', ':f.txt'], { cwd: repo.dir })
+  const diskBytes = (repo: Repo): Promise<Buffer> => fs.readFile(path.join(repo.dir, 'f.txt'))
+
+  it('stage-hunk keeps the é byte in the index', async () => {
+    const repo = await latin1Repo()
+    const before = await gitDiff(repo.dir, 'f.txt', undefined, true)
+    expect(before.hunks?.length).toBe(1)
+    expect((await operate(repo, { type: 'stage-hunk', path: 'f.txt', hunk: before.hunks![0]! })).ok).toBe(true)
+    const staged = indexBytes(repo)
+    expect([...staged.subarray(0, 5)]).toEqual([0x63, 0x61, 0x66, 0xe9, 0x0a])
+    expect(staged.includes(Buffer.from([0xef, 0xbf, 0xbd]))).toBe(false)
+    expect(staged.toString('latin1')).toContain('L20\n')
+  })
+
+  it('unstage-hunk keeps the é byte in the index', async () => {
+    const repo = await latin1Repo()
+    repo.git('add', 'f.txt')
+    const staged = await gitDiff(repo.dir, 'f.txt', undefined, true)
+    expect((await operate(repo, { type: 'unstage-hunk', path: 'f.txt', hunk: staged.hunks![0]! })).ok).toBe(true)
+    const index = indexBytes(repo)
+    expect([...index.subarray(0, 5)]).toEqual([0x63, 0x61, 0x66, 0xe9, 0x0a])
+    expect(index.toString('latin1')).toContain('l20\n')
+    expect(index.toString('latin1')).not.toContain('L20')
+  })
+
+  it('restore-hunk keeps the é byte on disk, also when the whole file was deleted', async () => {
+    const repo = await latin1Repo()
+    const shown = await gitDiff(repo.dir, 'f.txt', undefined, true)
+    expect((await operate(repo, { type: 'restore-hunk', path: 'f.txt', hunk: shown.hunks![0]! })).ok).toBe(true)
+    const disk = await diskBytes(repo)
+    expect([...disk.subarray(0, 5)]).toEqual([0x63, 0x61, 0x66, 0xe9, 0x0a])
+    expect(disk.includes(Buffer.from([0xef, 0xbf, 0xbd]))).toBe(false)
+
+    await fs.rm(path.join(repo.dir, 'f.txt'))
+    const gone = await gitDiff(repo.dir, 'f.txt', undefined, true)
+    expect((await operate(repo, { type: 'restore-hunk', path: 'f.txt', hunk: gone.hunks![0]! })).ok).toBe(true)
+    expect([...(await diskBytes(repo)).subarray(0, 5)]).toEqual([0x63, 0x61, 0x66, 0xe9, 0x0a])
+  })
+})
+
+describe('a project rooted in a subdirectory uses the right path for every git call (final review I1)', () => {
+  async function subRepo(): Promise<{ repo: Repo; root: string }> {
+    const repo = await makeRepo()
+    await repo.write('sub/f.txt', lines(30)); repo.git('add', '.'); repo.git('commit', '-qm', 'f')
+    await repo.write('sub/f.txt', lines(30).replace('l3\n', 'L3\n').replace('l20\n', 'L20\n'))
+    return { repo, root: path.join(repo.dir, 'sub') }
+  }
+  const run = (root: string, request: GitOperationRequest) => runProjectGitOperation(root, true, request)
+
+  it('unstage-hunk really changes the index', async () => {
+    const { repo, root } = await subRepo()
+    repo.git('add', 'sub/f.txt')
+    const staged = await gitDiff(root, 'f.txt', undefined, true)
+    expect(staged.hunks?.map((h) => h.status)).toEqual(['staged', 'staged'])
+    expect((await run(root, { type: 'unstage-hunk', path: 'f.txt', hunk: staged.hunks![1]! })).ok).toBe(true)
+    expect(repo.git('show', ':sub/f.txt')).toBe(lines(30).replace('l3\n', 'L3\n'))
+    expect((await gitDiff(root, 'f.txt', undefined, true)).hunks?.map((h) => h.status)).toEqual(['staged', 'unstaged'])
+  })
+
+  it('the partial status shows when part of a hunk is staged', async () => {
+    const repo = await makeRepo()
+    await repo.write('sub/f.txt', lines(30)); repo.git('add', '.'); repo.git('commit', '-qm', 'f')
+    const worktree = lines(30).replace('l3\n', 'L3a\nL3b\n').replace('l5\n', '')
+    await repo.write('sub/f.txt', worktree)
+    const sha = repo.git('hash-object', '-w', '--stdin').length >= 0 ? '' : ''
+    void sha
+    const blob = execFileSync(gitExecutable() as string, ['hash-object', '-w', '--stdin'], { cwd: repo.dir, input: lines(30).replace('l3\n', 'L3a\nL3b\n') }).toString().trim()
+    repo.git('update-index', '--cacheinfo', `100644,${blob},sub/f.txt`)
+    const root = path.join(repo.dir, 'sub')
+    expect((await gitDiff(root, 'f.txt', undefined, true)).hunks?.map((h) => h.status)).toEqual(['partial'])
+  })
+
+  it('staging the deletion of a deleted file removes it from the index', async () => {
+    const { repo, root } = await subRepo()
+    await fs.rm(path.join(root, 'f.txt'))
+    const shown = await gitDiff(root, 'f.txt', undefined, true)
+    expect((await run(root, { type: 'stage-hunk', path: 'f.txt', hunk: shown.hunks![0]! })).ok).toBe(true)
+    expect(repo.git('status', '--porcelain')).toBe('D  sub/f.txt\n')
+  })
+})

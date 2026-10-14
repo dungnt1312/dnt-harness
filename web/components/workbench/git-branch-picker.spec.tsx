@@ -252,3 +252,65 @@ describe('failures', () => {
     await act(async () => { await vi.waitFor(() => expect(document.body.textContent).toContain('git switch-branch failed')) })
   })
 })
+
+describe('mutations keep the panel\'s click order (final review web I2)', () => {
+  it('a switch waits behind a staging click that is still pending, so the stage lands on the old branch', async () => {
+    let releaseStage: (() => void) | undefined
+    gitOperation.mockImplementation(async (_ws, _project, request) => {
+      if (request.type === 'stage') {
+        await new Promise<void>((resolve) => { releaseStage = resolve })
+        return { type: 'done', ok: true, stdout: '', stderr: '', status: status() }
+      }
+      return answer(request)
+    })
+    await mount()
+    // Click the row's stage checkbox: it is pending in the panel queue until released.
+    await act(async () => document.querySelector<HTMLButtonElement>('button[role="checkbox"][aria-label="Stage src/a.ts"]')!.click())
+    await open()
+    await act(async () => rowOf('feature').click())
+    // The switch must not have reached the server yet.
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 60)) })
+    expect(sent('switch-branch')).toHaveLength(0)
+    await act(async () => { releaseStage?.() })
+    await act(async () => { await vi.waitFor(() => expect(sent('switch-branch')).toEqual([{ type: 'switch-branch', name: 'feature' }])) })
+    const order = gitOperation.mock.calls.map((call) => call[2].type).filter((type) => type === 'stage' || type === 'switch-branch')
+    expect(order).toEqual(['stage', 'switch-branch'])
+  })
+
+  it('a double Enter sends one create request, not two', async () => {
+    let hold: (() => void) | undefined
+    gitOperation.mockImplementation(async (_ws, _project, request) => {
+      if (request.type === 'create-branch') {
+        await new Promise<void>((resolve) => { hold = resolve })
+        return { type: 'done', ok: true, stdout: '', stderr: '', status: status() }
+      }
+      return answer(request)
+    })
+    await mount()
+    await open()
+    await type('twice')
+    await key('Enter')
+    await key('Enter')
+    await act(async () => { hold?.() })
+    await act(async () => { await vi.waitFor(() => expect(document.querySelector('[data-branch-row]')).toBeNull()) })
+    expect(sent('create-branch')).toHaveLength(1)
+  })
+
+  it('a double click on a branch sends one switch', async () => {
+    let hold: (() => void) | undefined
+    gitOperation.mockImplementation(async (_ws, _project, request) => {
+      if (request.type === 'switch-branch') {
+        await new Promise<void>((resolve) => { hold = resolve })
+        return { type: 'done', ok: true, stdout: '', stderr: '', status: status() }
+      }
+      return answer(request)
+    })
+    await mount()
+    await open()
+    await act(async () => rowOf('feature').click())
+    await act(async () => rowOf('feature')?.click())
+    await act(async () => { hold?.() })
+    await act(async () => { await vi.waitFor(() => expect(sent('switch-branch').length).toBeGreaterThan(0)) })
+    expect(sent('switch-branch')).toHaveLength(1)
+  })
+})

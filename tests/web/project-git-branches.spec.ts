@@ -147,7 +147,7 @@ describe('switch branch', () => {
     const repo = await makeRepo(); repo.git('branch', 'feature'); const { run, calls } = spy()
     const done = await operate(repo, { type: 'switch-branch', name: 'feature' }, { run })
     expect(done.ok).toBe(true); expect(done.status.branch).toBe('feature')
-    expect(calls).toContainEqual(['checkout', 'feature'])
+    expect(calls).toContainEqual(['checkout', 'feature', '--'])
   })
 
   it('switches to a remote branch by creating a tracking branch', async () => {
@@ -223,5 +223,25 @@ describe('delete branch', () => {
     expect((await operate(repo, { type: 'delete-branch', name: 'origin/topic', remote: true, force: false }, { run })).ok).toBe(true)
     expect(calls).toContainEqual(['branch', '-dr', 'origin/topic'])
     expect(repo.git('branch', '-r')).not.toMatch(/origin\/topic/)
+  })
+})
+
+describe('names that come from a remote are not trusted (final review minor 1)', () => {
+  it('a remote branch whose name starts with "-" is refused, never reaching git as an option', async () => {
+    const repo = await makeRepo(); addRemote(repo, 'origin')
+    // `refs/remotes/origin/-D` exists as a ref; git itself allows it to be fetched.
+    repo.git('push', '-q', 'origin', 'main:refs/heads/ok'); repo.git('fetch', '-q', 'origin')
+    const sha = repo.git('rev-parse', 'HEAD').trim()
+    repo.git('update-ref', 'refs/remotes/origin/-D', sha)
+    const { run, calls } = spy()
+    await expect(operate(repo, { type: 'switch-branch', name: 'origin/-D' }, { run })).rejects.toThrow(/not a valid branch name/)
+    expect(calls.some((args) => args[0] === 'branch' && args.includes('--track'))).toBe(false)
+    expect(calls.some((args) => args[0] === 'checkout')).toBe(false)
+  })
+
+  it('checkout of a local branch ends its argv with `--` so the name can never be read as a path', async () => {
+    const repo = await makeRepo(); repo.git('branch', 'feature'); const { run, calls } = spy()
+    await operate(repo, { type: 'switch-branch', name: 'feature' }, { run })
+    expect(calls).toContainEqual(['checkout', 'feature', '--'])
   })
 })

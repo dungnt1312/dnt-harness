@@ -197,3 +197,32 @@ describe('the last commit row', () => {
     void B
   })
 })
+
+describe('committing while a message is generating (final review web I1)', () => {
+  it('the Commit button is off and Cmd+Enter does nothing until generation ends; the stream never lands in a cleared editor', async () => {
+    let push: ((text: string) => void) | undefined
+    let finish: (() => void) | undefined
+    generate.current = (_subject, onText) => new Promise<void>((resolve) => { push = onText; finish = resolve })
+    current = status([STAGED, { ...STAGED, path: 'src/other.ts' }])
+    await mount()
+    await setText('Fix')
+    await click(byLabel('Generate Commit Message')!)
+    await act(async () => { push?.('\nAdd') })
+
+    const commitBtn = [...document.querySelectorAll<HTMLButtonElement>('[role="group"][aria-label="Commit"] button')].find((button) => button.textContent?.trim() === 'Commit')!
+    expect(commitBtn.disabled).toBe(true)
+    expect(commitBtn.title).toBe('Generating commit message...')
+    await act(async () => { textarea().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', metaKey: true, bubbles: true, cancelable: true })) })
+    expect(gitOperation.mock.calls.filter((call) => call[2].type === 'commit')).toHaveLength(0)
+
+    await act(async () => { finish?.() })
+    await act(async () => { await vi.waitFor(() => expect(commitBtn.disabled).toBe(false)) })
+  })
+
+  it('the ✨ button is off while conflicts are unstaged (Zed can_commit)', async () => {
+    current = status([{ ...raw, path: 'src/merge.ts', status: 'conflict', indexStatus: 'U', worktreeStatus: 'U', conflicted: true }, STAGED])
+    await mount()
+    const generateButton = document.querySelector<HTMLButtonElement>('button[aria-label="Generate Commit Message"], button[aria-label="No Changes to Commit"]')!
+    expect(generateButton.disabled).toBe(true)
+  })
+})

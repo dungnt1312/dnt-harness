@@ -202,6 +202,8 @@ export interface CommitButtonInput {
   readonly pending: boolean
   /** The message editor has text. */
   readonly message: boolean
+  /** A commit message is being generated (Zed `generate_commit_message_task`). */
+  readonly generating?: boolean
 }
 
 /** Zed `commit_button_title`. */
@@ -212,6 +214,8 @@ export function commitButtonTitle(input: Pick<CommitButtonInput, 'amend' | 'stag
 
 /** Zed `configure_commit_button`: whether the button works and, when it does not, why. */
 export function commitButton(input: CommitButtonInput): { readonly enabled: boolean; readonly title: string } {
+  // Zed `configure_commit_button` asks this first: a half-written message must not be committed.
+  if (input.generating === true) return { enabled: false, title: 'Generating commit message...' }
   if (input.conflicts) return { enabled: false, title: 'You must resolve conflicts before committing' }
   if (!input.staged && !input.tracked && !input.amend) return { enabled: false, title: 'No changes to commit' }
   if (input.pending) return { enabled: false, title: 'Commit in progress' }

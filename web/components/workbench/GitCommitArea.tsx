@@ -70,6 +70,7 @@ export function GitCommitArea({ workspaceId, projectId, report, changes, run, en
     tracked: counts.hasTracked,
     amend,
     pending: busy,
+    generating,
     // Zed `has_commit_message`: text, or an empty editor with a suggestion to commit.
     message: text.trim() !== '' || (text === '' && suggestion !== undefined),
   })
@@ -102,7 +103,9 @@ export function GitCommitArea({ workspaceId, projectId, report, changes, run, en
 
   /** Zed `commit_changes`. */
   const commit = async (): Promise<void> => {
-    if (busy) return
+    // Zed disables Commit while a message is being generated: a partial message must not be committed,
+    // and the rest of the stream must not land in an editor a successful commit just cleared.
+    if (busy || generating) return
     if (counts.hasUnstagedConflicts) {
       setNotice('There are still conflicts. You must stage these before committing')
       return
@@ -251,7 +254,8 @@ export function GitCommitArea({ workspaceId, projectId, report, changes, run, en
         ) : (
           <IconButton
             label={counts.hasStaged || counts.hasTracked ? 'Generate Commit Message' : 'No Changes to Commit'}
-            disabled={!counts.hasStaged && !counts.hasTracked}
+            // Zed `can_commit`: nothing to commit, or conflicts still unstaged.
+            disabled={(!counts.hasStaged && !counts.hasTracked) || counts.hasUnstagedConflicts}
             onClick={generate}
           >
             <Icon name="sparkles" size={14} />

@@ -521,15 +521,33 @@ async function ignore(ctx: Context, requested: readonly string[]): Promise<Step>
     }
   }
   if (rels.length === 0) return DONE
+  // One line per path: a line break inside a name would add rules the user never asked for.
+  const broken = rels.find((rel) => /[\r\n]/.test(rel))
+  if (broken !== undefined) throw new ProjectGitError(`'${broken.replace(/[\r\n]/g, ' ')}' has a line break in its name and cannot be added to .gitignore`)
+  // A symlinked .gitignore must not be followed out of the project (a cloned
+  // repository could point it anywhere): the same containment as every path.
   const file = path.join(ctx.root, '.gitignore')
+  const linked = await fsPromises.lstat(file).then((stat) => stat.isSymbolicLink(), () => false)
+  if (linked && (await contain(ctx.root, '.gitignore', ctx.deniedRoots)) === null) {
+    throw new ProjectGitError('.gitignore is a link that leaves this project')
+  }
   let current = ''
   try {
     current = await fsPromises.readFile(file, 'utf8')
   } catch { /* absent: created below */ }
-  const addition = `${rels.map((rel) => `/${rel}`).join('\n')}\n`
+  const addition = `${rels.map((rel) => `/${gitignoreEscape(rel)}`).join('\n')}\n`
   const prefix = current === '' ? '' : current.endsWith('\n') ? current : `${current}\n`
   await fsPromises.writeFile(file, prefix + addition)
   return DONE
+}
+
+/**
+ * A literal path as a .gitignore pattern: the glob characters and a leading
+ * `#` or `!` are escaped, so the rule matches that one file and nothing else.
+ * (Trailing spaces are significant to git only when unescaped.)
+ */
+function gitignoreEscape(rel: string): string {
+  return rel.replace(/[\\[\]*?]/g, '\\$&').replace(/^([#!])/, '\\$1').replace(/ +$/, (spaces) => spaces.replaceAll(' ', '\\ '))
 }
 
 /** The operations whose Git process may ask for a password, a passphrase or a signing key. */

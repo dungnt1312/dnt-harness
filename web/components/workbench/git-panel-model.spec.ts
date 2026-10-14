@@ -357,3 +357,17 @@ describe('branch picker rules (Zed branch_picker.rs:931-993, 1452-1476)', () => 
     expect(normalizeBranchName('   ')).toBe('')
   })
 })
+
+describe('commitButton while a message is being generated (final review web I1)', () => {
+  const base: CommitButtonInput = { conflicts: false, staged: true, tracked: true, amend: false, pending: false, message: true }
+
+  it('is off with Zed\'s own words, ahead of every other reason (configure_commit_button checks it first)', () => {
+    expect(commitButton({ ...base, generating: true })).toEqual({ enabled: false, title: 'Generating commit message...' })
+    expect(commitButton({ ...base, generating: false }).enabled).toBe(true)
+  })
+
+  it('generating is reported even when a conflict is also in the way (Zed git_panel.rs:6502)', () => {
+    expect(commitButton({ ...base, conflicts: true, generating: true }).title).toBe('Generating commit message...')
+    expect(commitButton({ ...base, conflicts: true }).title).toBe('You must resolve conflicts before committing')
+  })
+})

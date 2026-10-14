@@ -102,9 +102,16 @@ export async function resolveConflict(
   choice: 'ours' | 'theirs' | 'both',
 ): Promise<void> {
   const abs = path.join(root, rel)
-  const text = await fsPromises.readFile(abs, 'utf8')
-  const conflicts = parseConflicts(text)
-  const conflict = conflicts.find((entry) => entry.index === index && entry.fingerprint === fingerprint)
-  if (conflict === undefined) throw new ProjectGitError(STALE_CONFLICT)
-  await fsPromises.writeFile(abs, resolveConflictText(text, conflict, choice))
+  const bytes = await fsPromises.readFile(abs)
+  // The fingerprint the client holds came from the UTF-8 reading (what the
+  // diff pane displays), so staleness is judged on that reading...
+  const shown = parseConflicts(bytes.toString('utf8')).find((entry) => entry.index === index && entry.fingerprint === fingerprint)
+  if (shown === undefined) throw new ProjectGitError(STALE_CONFLICT)
+  // ...but the rewrite works on latin1, which maps every byte to one character
+  // and back, so a Latin-1 or Shift-JIS file keeps every byte it had. Markers
+  // are ASCII, so region `index` is the same region in both readings.
+  const text = bytes.toString('latin1')
+  const exact = parseConflicts(text).find((entry) => entry.index === index)
+  if (exact === undefined) throw new ProjectGitError(STALE_CONFLICT)
+  await fsPromises.writeFile(abs, Buffer.from(resolveConflictText(text, exact, choice), 'latin1'))
 }

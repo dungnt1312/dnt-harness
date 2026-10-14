@@ -44,9 +44,11 @@ type Row =
  * tracking branch on the server), the trash deletes (Alt forces), failures are
  * the panel's usual toast. `onDone` receives each mutating answer.
  */
-export function GitBranchPicker({ current, run, onDone }: {
+export function GitBranchPicker({ current, run, enqueue, onDone }: {
   readonly current: string
   readonly run: GitRun
+  /** The panel's queue: a switch, create or delete runs after the staging, discard and commit clicks before it. */
+  readonly enqueue: (task: () => Promise<void>) => void
   readonly onDone: (done: GitOperationDone | undefined) => void
 }) {
   const [open, setOpen] = useState(false)
@@ -58,6 +60,8 @@ export function GitBranchPicker({ current, run, onDone }: {
   const [highlight, setHighlight] = useState(0)
   const [alt, setAlt] = useState(false)
   const [force, setForce] = useState<GitBranch | null>(null)
+  // One mutation at a time: a double Enter or a double click must not send two.
+  const [busy, setBusy] = useState(false)
   const input = useRef<HTMLInputElement | null>(null)
 
   // Branches are read each time the picker opens.
@@ -92,32 +96,46 @@ export function GitBranchPicker({ current, run, onDone }: {
     if (done?.ok === true) setOpen(false)
   }
 
-  const choose = async (row: Row | undefined, base?: string): Promise<void> => {
+  /**
+   * A mutation runs behind the panel's pending clicks (so a stage clicked a
+   * moment ago lands on the branch it was clicked on) and one at a time.
+   */
+  const mutate = (task: () => Promise<void>): void => {
+    if (busy) return
+    setBusy(true)
+    enqueue(async () => {
+      try { await task() } finally { setBusy(false) }
+    })
+  }
+
+  const choose = (row: Row | undefined, base?: string): void => {
     if (row === undefined) return
     if (row.kind === 'create') {
-      finish(await run({ type: 'create-branch', name: row.name, ...(base !== undefined ? { base } : {}) }))
+      mutate(async () => finish(await run({ type: 'create-branch', name: row.name, ...(base !== undefined ? { base } : {}) })))
       return
     }
     if (row.branch.current) { setOpen(false); return }
-    finish(await run({ type: 'switch-branch', name: row.branch.name }))
+    mutate(async () => finish(await run({ type: 'switch-branch', name: row.branch.name })))
   }
 
-  const remove = async (branch: GitBranch, forced: boolean): Promise<void> => {
-    const done = await run(
-      { type: 'delete-branch', name: branch.name, remote: branch.remote, force: forced },
-      // Zed asks "Force delete it?" for an unmerged branch instead of failing.
-      { quietFailure: (answer) => !forced && /not fully merged/i.test(answer.stderr) },
-    )
-    if (done === undefined) return
-    if (!done.ok && !forced && /not fully merged/i.test(done.stderr)) { setForce(branch); return }
-    onDone(done)
-    if (done.ok) setList((previous) => previous.filter((entry) => entry.name !== branch.name))
+  const remove = (branch: GitBranch, forced: boolean): void => {
+    mutate(async () => {
+      const done = await run(
+        { type: 'delete-branch', name: branch.name, remote: branch.remote, force: forced },
+        // Zed asks "Force delete it?" for an unmerged branch instead of failing.
+        { quietFailure: (answer) => !forced && /not fully merged/i.test(answer.stderr) },
+      )
+      if (done === undefined) return
+      if (!done.ok && !forced && /not fully merged/i.test(done.stderr)) { setForce(branch); return }
+      onDone(done)
+      if (done.ok) setList((previous) => previous.filter((entry) => entry.name !== branch.name))
+    })
   }
 
   const onKeyDown = (event: KeyboardEvent<HTMLInputElement>): void => {
     if (event.key === 'ArrowDown') { event.preventDefault(); setHighlight((index) => Math.min(index + 1, rows.length - 1)) }
     else if (event.key === 'ArrowUp') { event.preventDefault(); setHighlight((index) => Math.max(index - 1, 0)) }
-    else if (event.key === 'Enter') { event.preventDefault(); void choose(rows[Math.min(highlight, rows.length - 1)]) }
+    else if (event.key === 'Enter') { event.preventDefault(); choose(rows[Math.min(highlight, rows.length - 1)]) }
   }
 
   let lastSection: 'local' | 'remote' | null = null
@@ -206,7 +224,7 @@ export function GitBranchPicker({ current, run, onDone }: {
                         onMouseEnter={() => setHighlight(index)}
                         className={cn('flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-sm', on && 'bg-hover')}
                       >
-                        <button type="button" className="flex min-w-0 flex-1 flex-col text-left" onClick={() => void choose(row)}>
+                        <button type="button" className="flex min-w-0 flex-1 flex-col text-left" onClick={() => choose(row)}>
                           <span className="truncate font-medium">Create Branch: &quot;{row.name}&quot;…</span>
                           <span className="truncate text-xs text-fg-muted">Based off {current}</span>
                         </button>
@@ -214,7 +232,7 @@ export function GitBranchPicker({ current, run, onDone }: {
                           <button
                             type="button"
                             className="shrink-0 rounded-md border border-line px-2 py-1 text-xs hover:bg-hover"
-                            onClick={() => void choose(row, defaultBranch)}
+                            onClick={() => choose(row, defaultBranch)}
                           >
                             Create New From: {defaultBranch}
                           </button>
@@ -227,7 +245,7 @@ export function GitBranchPicker({ current, run, onDone }: {
                         aria-selected={on}
                         aria-current={row.branch.current ? 'true' : undefined}
                         onMouseEnter={() => setHighlight(index)}
-                        onClick={() => void choose(row)}
+                        onClick={() => choose(row)}
                         className={cn('group/branch flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-sm', on && 'bg-hover')}
                       >
                         <Icon
@@ -248,7 +266,7 @@ export function GitBranchPicker({ current, run, onDone }: {
                             type="button"
                             aria-label="Delete Branch"
                             title={alt ? 'Force Delete Branch' : 'Delete Branch'}
-                            onClick={(event) => { event.stopPropagation(); void remove(row.branch, event.altKey) }}
+                            onClick={(event) => { event.stopPropagation(); remove(row.branch, event.altKey) }}
                             className="invisible shrink-0 rounded p-1 text-fg-faint hover:text-bad group-hover/branch:visible focus-visible:visible [@media(pointer:coarse)]:visible"
                           >
                             <Icon name="trash" size={13} />
@@ -271,7 +289,7 @@ export function GitBranchPicker({ current, run, onDone }: {
         onConfirm={() => {
           const branch = force
           setForce(null)
-          if (branch !== null) void remove(branch, true)
+          if (branch !== null) remove(branch, true)
         }}
       />
     </>

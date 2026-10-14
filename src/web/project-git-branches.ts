@@ -102,7 +102,8 @@ const exists = async (ctx: Context, ref: string): Promise<boolean> => (await git
 /** Check out a local branch, or a remote one through a (new or re-pointed) tracking branch. */
 export async function switchBranch(ctx: Context, name: string): Promise<Step> {
   if (name.startsWith('-')) throw new ProjectGitError(`Branch '${name}' not found`)
-  if (await exists(ctx, `refs/heads/${name}`)) return git(ctx, ['checkout', name])
+  // The trailing `--` makes the name a revision, never a path.
+  if (await exists(ctx, `refs/heads/${name}`)) return git(ctx, ['checkout', name, '--'])
   if (await exists(ctx, `refs/remotes/${name}`)) {
     // A remote symref such as `origin/HEAD` follows to the branch it points at.
     const resolved = await git(ctx, ['symbolic-ref', `refs/remotes/${name}`])
@@ -110,11 +111,13 @@ export async function switchBranch(ctx: Context, name: string): Promise<Step> {
     const full = target.startsWith('refs/remotes/') ? target.slice('refs/remotes/'.length) : name
     const slash = full.indexOf('/')
     if (slash <= 0) throw new ProjectGitError(`Unexpected branch format: ${full}`)
-    const branch = full.slice(slash + 1)
+    // The local name is whatever the REMOTE calls its branch: a hostile remote
+    // can publish `-D`, so it passes the same check as a name typed by the user.
+    const branch = await checkedBranch(ctx, full.slice(slash + 1))
     const link = (await exists(ctx, `refs/heads/${branch}`))
       ? ['branch', '--set-upstream-to', full, branch]
       : ['branch', '--track', branch, full]
-    return sequence(() => git(ctx, link), () => git(ctx, ['checkout', branch]))
+    return sequence(() => git(ctx, link), () => git(ctx, ['checkout', branch, '--']))
   }
   throw new ProjectGitError(`Branch '${name}' not found`)
 }

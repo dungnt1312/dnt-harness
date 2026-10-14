@@ -171,3 +171,62 @@ describe('the split layout', () => {
     expect(separator.getAttribute('aria-valuenow')).toBe('80')
   })
 })
+
+describe('dragging the handle (final review web I3)', () => {
+  const sep = (): HTMLElement => document.querySelector<HTMLElement>('[role="separator"]')!
+  const pointer = async (type: string, init: { clientX?: number; clientY?: number; pointerId?: number } = {}): Promise<void> => {
+    await act(async () => {
+      const event = new Event(type, { bubbles: true, cancelable: true }) as Event & { clientX?: number; clientY?: number; pointerId?: number }
+      Object.assign(event, { clientX: init.clientX ?? 0, clientY: init.clientY ?? 0, pointerId: init.pointerId ?? 1, pointerType: 'touch' })
+      sep().dispatchEvent(event)
+    })
+  }
+  const withLayout = async (): Promise<void> => {
+    await mount()
+    await act(async () => { await vi.waitFor(() => expect(region('src/a.ts')).not.toBeNull()) })
+    // jsdom has no layout: give the split box a width so pointer positions mean something.
+    const box = document.querySelector<HTMLElement>('[data-split="open"] > div')!
+    box.getBoundingClientRect = () => ({ left: 0, top: 0, width: 1000, height: 600, right: 1000, bottom: 600, x: 0, y: 0, toJSON: () => ({}) })
+    Object.defineProperty(sep(), 'setPointerCapture', { value: () => {}, configurable: true })
+    Object.defineProperty(sep(), 'releasePointerCapture', { value: () => {}, configurable: true })
+  }
+
+  it('opts out of the browser\'s touch scrolling so a finger can drag it', async () => {
+    await withLayout()
+    expect(sep().className).toContain('touch-none')
+  })
+
+  it('a cancelled pointer ends the drag: later moves with no button down do not resize it', async () => {
+    await withLayout()
+    await pointer('pointerdown', { clientX: 400 })
+    await pointer('pointercancel')
+    await pointer('pointermove', { clientX: 900 })
+    expect(sep().getAttribute('aria-valuenow')).toBe('40')
+  })
+
+  it('losing the pointer capture ends the drag too', async () => {
+    await withLayout()
+    await pointer('pointerdown', { clientX: 400 })
+    await pointer('lostpointercapture')
+    await pointer('pointermove', { clientX: 900 })
+    expect(sep().getAttribute('aria-valuenow')).toBe('40')
+  })
+
+  it('dragging updates the ratio live but writes storage once, on release', async () => {
+    await withLayout()
+    const writes: string[] = []
+    const original = Storage.prototype.setItem
+    Storage.prototype.setItem = function (key: string, value: string) { if (key.startsWith('dnt-harness.git.split.')) writes.push(value); return original.call(this, key, value) }
+    try {
+      await pointer('pointerdown', { clientX: 400 })
+      await pointer('pointermove', { clientX: 500 })
+      await pointer('pointermove', { clientX: 600 })
+      expect(sep().getAttribute('aria-valuenow')).toBe('60')
+      expect(writes).toHaveLength(0)
+      await pointer('pointerup', { clientX: 600 })
+      expect(writes).toEqual(['{"ratio":0.6,"collapsed":false}'])
+    } finally {
+      Storage.prototype.setItem = original
+    }
+  })
+})
