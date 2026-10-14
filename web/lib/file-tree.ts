@@ -46,6 +46,46 @@ export function dropUnderSet(set: ReadonlySet<string>, path: string): ReadonlySe
   return kept.length === set.size ? set : new Set(kept)
 }
 
+/** The absolute path of an entry under this project root. */
+export function absoluteEntryPath(projectRoot: string, entryPath: string): string {
+  const root = projectRoot.endsWith('/') ? projectRoot.slice(0, -1) : projectRoot
+  return entryPath === '' ? root : `${root}/${entryPath}`
+}
+
+/**
+ * The drag type explorer rows write so the composer can turn a dropped row
+ * back into a project reference. A private MIME-like name: another app's
+ * payload can never be mistaken for one of ours.
+ */
+export const PROJECT_FILE_DRAG_TYPE = 'application/x-dnt-project-file'
+
+/** The subset of `DataTransfer` the drag helpers read and write. */
+export interface DragStore {
+  setData(type: string, value: string): void
+  getData(type: string): string
+}
+
+/** Write a row's drag payload: the typed reference plus a plain relative path, so dropping outside the composer still pastes a usable path. */
+export function writeProjectFileDrag(store: DragStore, entry: Selection): void {
+  store.setData(PROJECT_FILE_DRAG_TYPE, JSON.stringify({ path: entry.path, kind: entry.kind }))
+  store.setData('text/plain', entry.path)
+}
+
+/** Read a dragged project reference back; anything but the exact shape is not ours. */
+export function readProjectFileDrag(store: Pick<DragStore, 'getData'>): Selection | null {
+  const raw = store.getData(PROJECT_FILE_DRAG_TYPE)
+  if (raw === '') return null
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null) return null
+    const { path, kind } = parsed as { path?: unknown; kind?: unknown }
+    if (typeof path !== 'string' || path === '' || (kind !== 'file' && kind !== 'dir')) return null
+    return { path, kind }
+  } catch {
+    return null
+  }
+}
+
 /**
  * The message to show for a failed explorer write. An `HttpError` carries
  * the server's `{"error": "…"}` body; it is read structurally so callers that

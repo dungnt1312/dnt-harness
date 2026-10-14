@@ -684,17 +684,23 @@ function AppShell() {
   }, [workbenchProject, activeWs, openWorkbenchFile, patchSessionTabs, onWorkbenchOpenChange])
   /**
    * A clicked mention chip opens that file in the workbench — the same action
-   * as a recorded path, minus the focus window. The composer passes the
-   * chip's segment; the opener itself stays null without a project.
+   * as a recorded path, minus the focus window. Returns null when the chip is
+   * not a project-local file: the bubble then keeps it a plain label.
    */
-  const openMentionChip = useCallback((segment: ChipSegment): void => {
-    if (segment.kind !== 'mention' || workbenchProject === null) return
+  const openMentionChip = useCallback((segment: ChipSegment): (() => void) | null => {
+    if (segment.kind !== 'mention' || workbenchProject === null) return null
     const relative = toProjectRelative(workbenchProject.path, segment.path)
-    if (relative === null) return
-    openWorkbenchFile(relative)
-    patchSessionTabs({ inspectorTab: 'files' })
-    onWorkbenchOpenChange(true)
+    if (relative === null) return null
+    return () => {
+      openWorkbenchFile(relative)
+      patchSessionTabs({ inspectorTab: 'files' })
+      onWorkbenchOpenChange(true)
+    }
   }, [workbenchProject, openWorkbenchFile, patchSessionTabs, onWorkbenchOpenChange])
+  /** The composer reports clicks directly; a chip inside it is always live. */
+  const composerChipClick = useCallback((segment: ChipSegment) => {
+    openMentionChip(segment)?.()
+  }, [openMentionChip])
   /**
    * A skill chip in a sent message opens that skill's SKILL.md. Only a real
    * skill qualifies: custom commands and built-ins like /compact have no
@@ -1740,7 +1746,7 @@ function AppShell() {
       onMode={(value) => void selectMode(value)}
       {...(workbenchProject !== null ? { onSearchFiles: searchFiles } : {})}
       {...(activeWs !== null ? { onUploadFiles: uploadFiles } : {})}
-      onChipClick={openMentionChip}
+      onChipClick={composerChipClick}
       skills={skills}
       onRecallLast={recallLast}
       autoFocus={current === null}
@@ -1934,6 +1940,7 @@ function AppShell() {
                   onRetry={retryFailedTurn}
                   openPath={openRecordedPath}
                   openSkill={openSkillChip}
+                  openMention={openMentionChip}
                 />
               )}
               <section aria-label="Conversation composer" className="shrink-0 px-3 pb-3 sm:px-6 sm:pb-4">

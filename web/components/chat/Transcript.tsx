@@ -11,6 +11,7 @@ import { turnTimings, type TurnTiming } from '../../lib/turn-timing.ts'
 import { useGated, useSessionDerivedGates } from '../../lib/session-derived.ts'
 import { ActivityBlock, AssistantMessage, AuditLine, CommandExpansionMarker, CompactionMarker, ContinuationMarker, ContextMarker, HookContextMarker, HookRewakeMarker, DelegationCard, JumpToBottom, ProcessLinkContext, RetryLine, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
 import { TurnChangesCard } from './TurnChangesCard.tsx'
+import type { ChipSegment } from '../../lib/inline-chips.ts'
 import type { WorkbenchProject } from '../workbench/Workbench.tsx'
 import { ConversationMinimap } from './ConversationMinimap.tsx'
 import { MarkdownFileLinkContext } from '../../Markdown.tsx'
@@ -226,7 +227,7 @@ function latestStepOpen(items: readonly ViewItem[]): boolean {
  * Memoized: the app re-renders on every composer keystroke, and a long
  * transcript must not re-render with it while its own props are unchanged.
  */
-export const Transcript = memo(function Transcript({ items, events, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, openPath, openSkill, project, onReviewFile, onReviewChanges, onOpenProcess }: {
+export const Transcript = memo(function Transcript({ items, events, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, openPath, openSkill, openMention, project, onReviewFile, onReviewChanges, onOpenProcess }: {
   readonly items: readonly ViewItem[]
   /** The raw log behind `items`; per-turn changes project from it. */
   readonly events?: readonly SseEvent[]
@@ -240,6 +241,8 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   readonly openPath?: OpenPathResolver
   /** Opens a skill chip's SKILL.md in the workbench; null when the name is no skill. */
   readonly openSkill?: (name: string) => (() => void) | null
+  /** Opens a mention chip's file in the workbench; null when the path is not project-local. */
+  readonly openMention?: (segment: ChipSegment) => (() => void) | null
   /** The conversation's project, for the per-turn change card's git chips. */
   readonly project?: WorkbenchProject | null
   /** Reviews one file of a turn: the Git view focused on that diff. */
@@ -387,6 +390,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
             workspaceId={workspaceId ?? null}
             {...(onReuse !== undefined ? { onReuse } : {})}
             {...(openSkill !== undefined ? { openSkill } : {})}
+            {...(openMention !== undefined ? { openMention } : {})}
           />
         )
       case 'assistant': {

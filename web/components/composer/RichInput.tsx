@@ -1,6 +1,7 @@
 import { forwardRef, useImperativeHandle, useLayoutEffect, useRef } from 'react'
 import { normalizeDraft, type DraftSegment, type RichDraft } from '../../lib/composer-draft.ts'
 import { chipLabel, chipTitle, type ChipSegment } from '../../lib/inline-chips.ts'
+import { readProjectFileDrag } from '../../lib/file-tree.ts'
 import { CHIP_CLASS, CHIP_ICON_CLASS, CHIP_ICON_PATHS, CHIP_ICON_SIZE, CHIP_LABEL_CLASS, CHIP_TONE, MENTION_ICON_FALLBACK, chipAriaLabel, mentionIconSrc } from '../common/InlineChip.tsx'
 import { classifyPlainTextPaste, SAFE_MODEL_VISIBLE_BYTES, utf8Bytes } from './paste-classification.ts'
 
@@ -60,6 +61,8 @@ export interface RichInputProps {
   readonly onKeyDown: (event: React.KeyboardEvent<HTMLDivElement>) => void
   /** Files pasted or dropped onto the editor; the parent decides what to do. */
   readonly onFiles: (files: readonly File[]) => void
+  /** A project file dragged from the explorer; the parent turns it into a reference. */
+  readonly onProjectFileDrop?: (entry: { readonly path: string; readonly kind: 'file' | 'dir' }) => void
   /** Handles a long plain-text paste as a text attachment at its logical caret. */
   readonly onTextAttachment: (text: string, bookmark: CaretBookmark | null) => void
   /** Exposes an explicit conversion action for middle-band pasted text. */
@@ -194,7 +197,7 @@ function chipElement(segment: ChipSegment, document: Document): HTMLElement {
 }
 
 export const RichInput = forwardRef<RichInputHandle, RichInputProps>(function RichInput({
-  draft, onChange, onKeyDown, onFiles, onTextAttachment, onConvertibleText, onPasteError, onChipClick, placeholder, disabled, ariaLabel, ariaDescribedBy,
+  draft, onChange, onKeyDown, onFiles, onProjectFileDrop, onTextAttachment, onConvertibleText, onPasteError, onChipClick, placeholder, disabled, ariaLabel, ariaDescribedBy,
   autoFocus = false, listId, expanded, activeOptionId,
 }, ref) {
   const host = useRef<HTMLDivElement | null>(null)
@@ -548,6 +551,15 @@ export const RichInput = forwardRef<RichInputHandle, RichInputProps>(function Ri
       onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy' }}
       onDrop={(event) => {
         event.preventDefault()
+        // A row dragged from the explorer carries a typed payload; it becomes a
+        // project reference, not an upload. Anything else (files from the OS)
+        // uploads as before.
+        const drop = onProjectFileDrop
+        const projectFile = drop !== undefined ? readProjectFileDrag(event.dataTransfer) : null
+        if (drop !== undefined && projectFile !== null) {
+          drop(projectFile)
+          return
+        }
         const files = Array.from(event.dataTransfer.files)
         if (files.length > 0) onFiles(files)
       }}

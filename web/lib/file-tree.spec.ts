@@ -1,5 +1,18 @@
 import { describe, expect, it } from 'vitest'
-import { ancestorsOf, dropKeysUnder, dropUnderSet, isAtOrUnder, joinPath, parentOf, targetFolder, writeErrorText } from './file-tree.ts'
+import {
+  absoluteEntryPath, ancestorsOf, dropKeysUnder, dropUnderSet, isAtOrUnder, joinPath, parentOf,
+  PROJECT_FILE_DRAG_TYPE, readProjectFileDrag, targetFolder, writeErrorText, writeProjectFileDrag,
+} from './file-tree.ts'
+
+/** A minimal drag store capturing what rows write. */
+function dragStore(initial: Readonly<Record<string, string>> = {}): { setData: (type: string, value: string) => void; getData: (type: string) => string; written: Map<string, string> } {
+  const written = new Map(Object.entries(initial))
+  return {
+    written,
+    setData: (type, value) => { written.set(type, value) },
+    getData: (type) => written.get(type) ?? '',
+  }
+}
 
 describe('explorer path helpers', () => {
   it('matches a path itself and its descendants, not a sibling prefix', () => {
@@ -38,5 +51,29 @@ describe('explorer path helpers', () => {
     expect(writeErrorText({ status: 502, body: 'Bad gateway' })).toBe('Bad gateway')
     expect(writeErrorText(new Error('offline'))).toBe('offline')
     expect(writeErrorText('boom')).toBe('boom')
+  })
+
+  it('builds absolute paths from the project root, not from entry slashes', () => {
+    expect(absoluteEntryPath('/work/proj', 'src/a.ts')).toBe('/work/proj/src/a.ts')
+    expect(absoluteEntryPath('/work/proj/', 'src/a.ts')).toBe('/work/proj/src/a.ts')
+    expect(absoluteEntryPath('/work/proj', '')).toBe('/work/proj')
+  })
+
+  it('writes a project-file drag payload with a plain-path fallback, and reads it back strictly', () => {
+    expect(PROJECT_FILE_DRAG_TYPE).toBe('application/x-dnt-project-file')
+    const store = dragStore()
+    writeProjectFileDrag(store, { path: 'src/a b.ts', kind: 'file' })
+    expect(store.written.get(PROJECT_FILE_DRAG_TYPE)).toBe('{"path":"src/a b.ts","kind":"file"}')
+    expect(store.written.get('text/plain')).toBe('src/a b.ts')
+    // A folder writes its folder path, not a trailing slash.
+    const folder = dragStore()
+    writeProjectFileDrag(folder, { path: 'src', kind: 'dir' })
+    expect(folder.written.get('text/plain')).toBe('src')
+
+    expect(readProjectFileDrag({ getData: () => store.getData(PROJECT_FILE_DRAG_TYPE) })).toEqual({ path: 'src/a b.ts', kind: 'file' })
+    // Anything but the exact shape is not a project-file drag.
+    expect(readProjectFileDrag({ getData: () => '[]' })).toBeNull()
+    expect(readProjectFileDrag({ getData: () => '{"path":"a.ts"}' })).toBeNull()
+    expect(readProjectFileDrag({ getData: () => '' })).toBeNull()
   })
 })

@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { FileBrowser } from './FileBrowser.tsx'
+import { ToastHost } from '../common/Toast.tsx'
+import { PROJECT_FILE_DRAG_TYPE } from '../../lib/file-tree.ts'
 import type { ProjectListing } from '../../lib/api.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
@@ -73,7 +75,9 @@ async function mount() {
   document.body.append(host)
   root = createRoot(host)
   await act(async () => root!.render(
-    <FileBrowser workspaceId="ws1" project={{ id: 'p1', name: 'proj', path: '/proj' }} activeFile={null} onOpenFile={onOpenFile} onRenamed={onRenamed} onRemoved={onRemoved} />,
+    <ToastHost>
+      <FileBrowser workspaceId="ws1" project={{ id: 'p1', name: 'proj', path: '/proj' }} activeFile={null} onOpenFile={onOpenFile} onRenamed={onRenamed} onRemoved={onRemoved} />
+    </ToastHost>,
   ))
 }
 
@@ -91,6 +95,37 @@ const enter = async (input: HTMLInputElement) => act(async () => {
   input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
 })
 const menuItem = (text: string) => [...document.body.querySelectorAll<HTMLButtonElement>('[role="menu"] button')].find((button) => button.textContent?.includes(text))!
+
+/** A clipboard double so copy actions can be asserted; jsdom has none. Runs (and clicks) inside the install window. */
+async function copyThrough(run: () => void | Promise<void>): Promise<string[]> {
+  const writes: string[] = []
+  const original = Object.getOwnPropertyDescriptor(navigator, 'clipboard')?.value
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: { writeText: (text: string) => { writes.push(text); return Promise.resolve() } },
+  })
+  try {
+    await act(async () => { await run() })
+    return writes
+  } finally {
+    if (original !== undefined) Object.defineProperty(navigator, 'clipboard', { configurable: true, value: original })
+    else Reflect.deleteProperty(navigator, 'clipboard')
+  }
+}
+
+/** Dispatch dragstart on a row and capture the store it filled. */
+function dragStart(button: HTMLButtonElement): Map<string, string> {
+  const written = new Map<string, string>()
+  const event = new Event('dragstart', { bubbles: true, cancelable: true }) as Event & { dataTransfer: unknown }
+  Object.defineProperty(event, 'dataTransfer', {
+    value: {
+      setData: (type: string, value: string) => { written.set(type, value) },
+      getData: (type: string) => written.get(type) ?? '',
+    },
+  })
+  button.dispatchEvent(event)
+  return written
+}
 
 it('creates a file inside the selected folder and opens it', async () => {
   await mount()
@@ -185,6 +220,62 @@ it('cancelling the delete dialog deletes nothing', async () => {
   await click([...dialog.querySelectorAll('button')].find((button) => button.textContent === 'Cancel')!)
   expect(deleteProjectEntry).not.toHaveBeenCalled()
   expect(rowNames()).toContain('README.md')
+})
+
+describe('copy path', () => {
+  it('copies a file path relative and absolute from the row menu', async () => {
+    await mount()
+    await click(byLabel('Actions for README.md'))
+    expect(await copyThrough(() => menuItem('Copy relative path').click())).toEqual(['README.md'])
+    await click(byLabel('Actions for README.md'))
+    expect(await copyThrough(() => menuItem('Copy absolute path').click())).toEqual(['/proj/README.md'])
+  })
+
+  it('copies a folder path absolute too', async () => {
+    await mount()
+    await click(byLabel('Actions for src'))
+    expect(await copyThrough(() => menuItem('Copy absolute path').click())).toEqual(['/proj/src'])
+  })
+})
+
+describe('drag rows', () => {
+  it('writes the project-file payload and the relative path on dragstart', async () => {
+    await mount()
+    const written = dragStart(row('README.md'))
+    expect(written.get(PROJECT_FILE_DRAG_TYPE)).toBe('{"path":"README.md","kind":"file"}')
+    expect(written.get('text/plain')).toBe('README.md')
+  })
+
+  it('drags a folder row as the folder, and a search result like a tree row', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      await mount()
+      expect(dragStart(row('src')).get(PROJECT_FILE_DRAG_TYPE)).toBe('{"path":"src","kind":"dir"}')
+      searchProjectFiles.mockResolvedValueOnce({ query: 'ind', truncated: false, matches: [{ name: 'index.ts', path: 'src/index.ts', score: 3 }] } as never)
+      await typeInto(byLabel('Search files') as HTMLInputElement, 'ind')
+      await act(async () => { await vi.advanceTimersByTimeAsync(250) })
+      const results = host.querySelector('[aria-label="Search results"]')!
+      const written = dragStart(results.querySelector<HTMLButtonElement>('button[title="src/index.ts"]')!)
+      expect(written.get(PROJECT_FILE_DRAG_TYPE)).toBe('{"path":"src/index.ts","kind":"file"}')
+      expect(written.get('text/plain')).toBe('src/index.ts')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('offers copy actions on search result rows too', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      searchProjectFiles.mockResolvedValueOnce({ query: 'ind', truncated: false, matches: [{ name: 'index.ts', path: 'src/index.ts', score: 3 }] } as never)
+      await mount()
+      await typeInto(byLabel('Search files') as HTMLInputElement, 'ind')
+      await act(async () => { await vi.advanceTimersByTimeAsync(250) })
+      await click(byLabel('Actions for index.ts'))
+      expect(await copyThrough(() => menuItem('Copy absolute path').click())).toEqual(['/proj/src/index.ts'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
 
 describe('explorer search', () => {

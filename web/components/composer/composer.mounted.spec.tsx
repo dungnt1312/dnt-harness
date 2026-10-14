@@ -84,6 +84,20 @@ function paste(text: string, files: readonly File[] = []): void {
   })
 }
 
+/** Drop a payload onto the editor the way a dragged explorer row would. */
+function drop(data: Readonly<Record<string, string>>): void {
+  act(() => {
+    const store = new Map(Object.entries(data))
+    const event = new Event('drop', { bubbles: true, cancelable: true }) as Event & { dataTransfer: unknown }
+    Object.defineProperty(event, 'dataTransfer', {
+      value: { files: [], getData: (type: string) => store.get(type) ?? '' },
+    })
+    input().dispatchEvent(event)
+  })
+}
+
+const PROJECT_DRAG = 'application/x-dnt-project-file'
+
 const settle = async (): Promise<void> => { await act(async () => { await new Promise((resolve) => setTimeout(resolve, 200)) }) }
 
 describe('composer placeholder', () => {
@@ -711,6 +725,54 @@ describe('chip-aware bookmarks', () => {
     await act(async () => { reject(new Error('failed')); await Promise.resolve() })
     expect(current.segments).toEqual([{ kind: 'mention', path: 'src/a.ts' }, { kind: 'text', text: long }, { kind: 'command', name: 'review' }])
     void editor
+  })
+})
+
+describe('explorer drop', () => {
+  it('turns a dropped project file into a mention chip at the caret', () => {
+    render()
+    type('see ')
+    drop({ [PROJECT_DRAG]: '{"path":"src/a.ts","kind":"file"}' })
+    expect(current.segments).toEqual([
+      { kind: 'text', text: 'see ' },
+      { kind: 'mention', path: 'src/a.ts' },
+      { kind: 'text', text: ' ' },
+    ])
+    expect(chips()[0]?.textContent).toContain('a.ts')
+  })
+
+  it('mentions a dragged folder too', () => {
+    render()
+    drop({ [PROJECT_DRAG]: '{"path":"src","kind":"dir"}' })
+    expect(current.segments).toEqual([
+      { kind: 'mention', path: 'src' },
+      { kind: 'text', text: ' ' },
+    ])
+  })
+
+  it('falls back to uploading when the drop carries only files', async () => {
+    const onUploadFiles = vi.fn(async () => [PNG_REF])
+    render({ onUploadFiles })
+    const file = new File([new Uint8Array([1])], 'shot.png', { type: 'image/png' })
+    await act(async () => {
+      const event = new Event('drop', { bubbles: true, cancelable: true }) as Event & { dataTransfer: unknown }
+      Object.defineProperty(event, 'dataTransfer', { value: { files: [file], getData: () => '' } })
+      input().dispatchEvent(event)
+      await Promise.resolve()
+    })
+    await settle()
+    expect(onUploadFiles).toHaveBeenCalledTimes(1)
+    expect(current.attachments).toEqual([PNG_REF])
+    expect(current.segments).toEqual([])
+  })
+
+  it('ignores a malformed project-file payload and uploads nothing', async () => {
+    const onUploadFiles = vi.fn(async () => [PNG_REF])
+    render({ onUploadFiles })
+    drop({ [PROJECT_DRAG]: 'not json' })
+    await settle()
+    expect(onUploadFiles).not.toHaveBeenCalled()
+    expect(current.segments).toEqual([])
   })
 })
 

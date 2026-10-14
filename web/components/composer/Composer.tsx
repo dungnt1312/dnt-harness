@@ -304,6 +304,15 @@ export function Composer({
     syncCompletion()
   }
 
+  /**
+   * A project file or folder dropped from the explorer: the same reference the
+   * `@` picker inserts, placed at the caret — or at the editor's end when the
+   * caret sits elsewhere, which is where a drop lands anyway.
+   */
+  const dropProjectFile = (entry: { readonly path: string; readonly kind: 'file' | 'dir' }): void => {
+    editor.current?.insertAtCaret({ kind: 'mention', path: entry.path })
+  }
+
   // ── Attachments ────────────────────────────────────────────────────────
 
   const uploadFiles = (files: readonly File[]): void => {
@@ -524,6 +533,7 @@ export function Composer({
         onChange={(next) => { emit(next); syncCompletion() }}
         onKeyDown={handleKeyDown}
         onFiles={uploadFiles}
+        onProjectFileDrop={dropProjectFile}
         onTextAttachment={uploadPastedText}
         onConvertibleText={(text, bookmark) => setConversion({ text, bookmark })}
         {...(onChipClick !== undefined ? { onChipClick } : {})}
