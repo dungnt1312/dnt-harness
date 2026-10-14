@@ -15,6 +15,7 @@ import { Select } from './Select.tsx'
 import { Modal } from './Modal.tsx'
 import { Field } from './Field.tsx'
 import { Switch } from './Switch.tsx'
+import { InlineSwitch } from '../settings/settings-kit.tsx'
 import { ToolCard } from '../chat/MessageParts.tsx'
 import { ApprovalBar } from '../chat/ApprovalBar.tsx'
 
@@ -165,6 +166,23 @@ describe('primitives', () => {
     expect(html).toContain('role="switch"')
     expect(html).toContain('aria-checked="true"')
     expect(html).toContain('Hidden from the picker when off.')
+  })
+
+  // On touch screens a global rule forces every <button> to 44x44. A switch
+  // track is a button of 36x20, so without the opt-out it became a 44px
+  // circle with the thumb stranded in its middle. Every switch must opt out
+  // and keep its 44px touch area on a pseudo-element instead.
+  it('every switch track opts out of the 44px touch floor and keeps a 44px hit area', () => {
+    const tracks = [
+      renderToStaticMarkup(<Switch checked label="Enabled" onChange={() => undefined} />),
+      renderToStaticMarkup(<InlineSwitch ariaLabel="Enable x" checked onChange={() => undefined} />),
+    ].map((html) => /<button[^>]*role="switch"[^>]*>/.exec(html)?.[0] ?? '')
+    for (const tag of tracks) {
+      expect(tag).toContain('data-compact-control')
+      expect(tag).toContain('h-5')
+      expect(tag).toContain('w-9')
+      expect(tag).toContain('before:-inset-y-3')
+    }
   })
 
   it('TextInput renders leading content and a monospace variant', () => {

@@ -9,7 +9,7 @@ import { Switch } from '../ui/Switch.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
 import { fetchHooks, saveHooks, setHookActive } from '../../lib/api.ts'
 import { cn } from '../../lib/cn.ts'
-import * as RadixSwitch from '@radix-ui/react-switch'
+import { SwitchTrack } from '../ui/Switch.tsx'
 import type { EffectiveHookRow, HookCommandRow, HookEvent, HookMatcherGroupRow, HooksConfigRow, HooksSectionRow } from '../../lib/types.ts'
 import { CodeArea, Disclosure, InlineConfirm, IsolationNote, LoadFailed, Notice, SaveBar, PanelBody, PanelIntro, Section, WorkspaceRequired, useActionRunner, type NoticeState } from './settings-kit.tsx'
 import { useUnsavedChanges } from './unsaved-changes.tsx'
@@ -362,16 +362,13 @@ function HooksPanelContent({ workspaceId, projectId }: { readonly workspaceId: s
 /** A small labelled on/off switch for one hook. */
 function ActiveSwitch({ label, checked, disabled, onChange }: { readonly label: string; readonly checked: boolean; readonly disabled: boolean; readonly onChange: (next: boolean) => void }) {
   return (
-    <RadixSwitch.Root
+    <SwitchTrack
       checked={checked}
       disabled={disabled}
       onCheckedChange={onChange}
       aria-label={`${checked ? 'Deactivate' : 'Activate'} hook ${label}`}
       title={checked ? 'Active — click to switch off in this workspace' : 'Inactive in this workspace — click to switch on'}
-      className="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full bg-line-strong transition-colors disabled:opacity-50 data-[state=checked]:bg-primary"
-    >
-      <RadixSwitch.Thumb className="block size-4 translate-x-0.5 rounded-full bg-bg shadow transition-transform data-[state=checked]:translate-x-[18px]" />
-    </RadixSwitch.Root>
+    />
   )
 }
 
