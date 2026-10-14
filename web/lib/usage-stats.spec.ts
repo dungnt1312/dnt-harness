@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { UsageDailyResponse, UsageDayRow } from './types.ts'
 import {
-  addDays, buildHeatmap, buildTrend, formatDuration, formatTokens, levelFor, monotonePath, niceMax, quantileThresholds, summarize, OTHER_SERIES,
+  addDays, buildCacheStats, buildHeatmap, buildTrend, formatDuration, formatTokens, levelFor, monotonePath, niceMax, quantileThresholds, summarize, OTHER_SERIES,
 } from './usage-stats.ts'
 
 const row = (date: string, model: string, input: number, output = 0): UsageDayRow => ({
@@ -108,6 +108,55 @@ describe('trend', () => {
     const trend = buildTrend(data(days), 7)
     expect(trend.series).toHaveLength(8)
     expect(trend.series.at(-1)).toMatchObject({ model: OTHER_SERIES, total: 93 + 92 + 91 })
+  })
+})
+
+describe('cache stats', () => {
+  const crow = (date: string, model: string, over: Partial<UsageDayRow>): UsageDayRow => ({
+    date, model, input: 100, cached: 0, cacheableInput: 100, cacheReportedRequests: 1, unreportedRequests: 0, output: 0, requests: 1, ...over,
+  })
+
+  it('measures the hit rate only over requests whose provider reported a cached share', () => {
+    const stats = buildCacheStats(data([
+      crow('2026-10-08', 'a', { input: 1000, cached: 900, cacheableInput: 1000, cacheReportedRequests: 2, requests: 2 }),
+      crow('2026-10-08', 'b', { input: 500, cached: 0, cacheableInput: 0, cacheReportedRequests: 0, unreportedRequests: 3, requests: 3 }),
+    ]), 7)
+    expect(stats.total).toMatchObject({ requests: 5, cached: 900, cacheableInput: 1000, freshInput: 100, unreportedRequests: 3 })
+    expect(stats.total.hit).toBeCloseTo(0.9)
+    const a = stats.models.find((m) => m.model === 'a')!
+    expect(a.hit).toBeCloseTo(0.9)
+    expect(a.freshPerRequest).toBe(50)
+    // A provider that never reports caching has no rate rather than a false 0%.
+    expect(stats.models.find((m) => m.model === 'b')!.hit).toBeUndefined()
+    expect(stats.models.map((m) => m.model)).toEqual(['a', 'b'])
+  })
+
+  it('keeps only the range, lists every date and leaves days without telemetry empty', () => {
+    const stats = buildCacheStats(data([
+      crow('2026-10-08', 'a', { input: 200, cached: 150, cacheableInput: 200 }),
+      crow('2026-10-05', 'a', { input: 100, cached: 0, cacheableInput: 100 }),
+      crow('2026-09-01', 'a', { input: 999, cached: 999, cacheableInput: 999 }),
+    ]), 7)
+    expect(stats.days).toHaveLength(7)
+    expect(stats.days.at(-1)).toMatchObject({ date: '2026-10-08', hit: 0.75 })
+    // An explicit 0% differs from a day with no data at all.
+    expect(stats.days.find((d) => d.date === '2026-10-05')!.hit).toBe(0)
+    expect(stats.days.find((d) => d.date === '2026-10-06')!.hit).toBeUndefined()
+    expect(stats.total.requests).toBe(2)
+  })
+
+  it('lists every model, ranked by prompt volume, without folding the tail', () => {
+    const days = Array.from({ length: 10 }, (_, i) => crow('2026-10-08', `m${i}`, { input: 100 - i, cached: 10, cacheableInput: 100 - i }))
+    const stats = buildCacheStats(data(days), 7)
+    expect(stats.models.map((m) => m.model)).toEqual(Array.from({ length: 10 }, (_, i) => `m${i}`))
+    expect(stats.models.reduce((acc, m) => acc + m.requests, 0)).toBe(stats.total.requests)
+  })
+
+  it('is empty without rows', () => {
+    const stats = buildCacheStats(data([]), 7)
+    expect(stats.total).toMatchObject({ requests: 0, hit: undefined })
+    expect(stats.models).toEqual([])
+    expect(stats.days).toHaveLength(7)
   })
 })
 

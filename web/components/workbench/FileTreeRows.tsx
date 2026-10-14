@@ -7,6 +7,7 @@ import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
 import { FileNameInput } from './FileNameInput.tsx'
 import type { ProjectEntry, ProjectListing } from '../../lib/api.ts'
 import type { Selection } from '../../lib/file-tree.ts'
+import { writeProjectFileDrag } from '../../lib/file-tree.ts'
 import { cn } from '../../lib/cn.ts'
 
 export interface FolderNode {
@@ -32,6 +33,8 @@ export interface TreeActions {
   readonly retry: (folder: string) => void
   readonly beginRename: (entry: ProjectEntry) => void
   readonly beginDelete: (entry: ProjectEntry) => void
+  /** Copy the entry's path (relative or absolute) to the clipboard. */
+  readonly copyPath: (path: string, absolute: boolean) => void
   readonly submitCreate: (name: string) => Promise<string | null>
   readonly submitRename: (entry: ProjectEntry, name: string) => Promise<string | null>
   readonly cancelEdit: () => void
@@ -109,6 +112,8 @@ function FileRow({ entry, depth, expanded, actions }: {
         title={entry.path}
         aria-expanded={isDir ? expanded : undefined}
         onClick={() => actions.activate(entry)}
+        onDragStart={(event) => writeProjectFileDrag(event.dataTransfer, entry)}
+        draggable
         style={{ paddingLeft: indent(depth) }}
         className={cn('flex min-h-7 w-full items-center gap-1.5 rounded-md pr-8 text-left text-[13px] hover:bg-hover', (entry.path === activeFile || entry.path === selected?.path) && 'bg-hover', entry.path === activeFile && 'text-fg')}
       >
@@ -121,6 +126,12 @@ function FileRow({ entry, depth, expanded, actions }: {
       <Menu label={`Actions for ${entry.name}`} align="end" triggerClassName={MENU_TRIGGER} trigger={() => <Icon name="dots" size={14} />}>
         {(close) => (
           <>
+            <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); actions.copyPath(entry.path, false) }}>
+              <Icon name="copy" size={14} />Copy relative path
+            </button>
+            <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); actions.copyPath(entry.path, true) }}>
+              <Icon name="copy" size={14} />Copy absolute path
+            </button>
             <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); actions.beginRename(entry) }}>
               <Icon name="pencil" size={14} />Rename
             </button>

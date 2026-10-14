@@ -14,6 +14,7 @@ import { groupBlocks, rowItems, turnFooters } from '../components/chat/Transcrip
 import { activeMinimapIndex, minimapEntries, minimapPreview, minimapScrollTarget } from '../components/chat/ConversationMinimap.tsx'
 import { modeLabel, modeOption, errorSummary } from './copy.ts'
 import { emptyDraft, textDraft } from './composer-draft.ts'
+import type { ChipSegment } from './inline-chips.ts'
 import { budgetTone, formatTime } from './format.ts'
 import { hiddenSpawnCalls } from './spawn-merge.ts'
 import { createProjector, projectItems } from './project.ts'
@@ -930,6 +931,22 @@ describe('transcript truthfulness', () => {
     expect(host.querySelector('button[data-chip-kind]')).toBeNull()
     expect(host.querySelector('span[data-chip-kind="command"]')).not.toBeNull()
   })
+  it('a mention chip opens its file when the opener resolves; otherwise it stays a label', async () => {
+    const open = vi.fn()
+    const openMention = vi.fn((segment: ChipSegment) => (segment.kind === 'mention' && segment.path === 'web/lib/api.ts' ? open : null))
+    await mount(<UserBubble item={{ kind: 'user', content: 'check @web/lib/api.ts and @../outside.md' }} openMention={openMention} />)
+    const button = host.querySelector<HTMLButtonElement>('button[data-chip-kind="mention"]')!
+    expect(button.getAttribute('aria-label')).toBe('Open api.ts in workbench')
+    await act(async () => button.click())
+    expect(open).toHaveBeenCalledOnce()
+    expect(openMention).toHaveBeenCalledWith({ kind: 'mention', path: 'web/lib/api.ts' })
+    expect(host.querySelector('button[data-chip-kind="mention"]')).not.toBeNull()
+    expect(host.querySelector('span[data-chip-kind="mention"]')).not.toBeNull()
+    // No opener at all: every mention stays a label.
+    await mount(<UserBubble item={{ kind: 'user', content: 'check @web/lib/api.ts' }} />)
+    expect(host.querySelector('button[data-chip-kind="mention"]')).toBeNull()
+    expect(host.querySelector('span[data-chip-kind="mention"]')).not.toBeNull()
+  })
 })
 
 describe('projection of delegation, hook and approval events', () => {
@@ -1407,6 +1424,33 @@ describe('sidebar sections + live rows + workspace management', () => {
     expect(text.indexOf('Alpha spec')).toBeLessThan(text.indexOf('Beta build'))
     expect(text.indexOf('Beta build')).toBeLessThan(text.indexOf('Gamma notes'))
   })
+  it('orders by when the user last typed, so a streaming conversation does not jump the list', async () => {
+    const now = Date.now()
+    const base = { eventCount: 3, folder: null, status: 'idle' as const, pendingInputs: 0 }
+    // `Streaming` logged an event a second ago but was last typed into an hour ago.
+    const list = [
+      { id: 'a1', title: 'Streaming', updatedAt: now - 1_000, lastUserActivityAt: now - 3_600_000, ...base },
+      { id: 'a2', title: 'Typed lately', updatedAt: now - 120_000, lastUserActivityAt: now - 120_000, ...base },
+    ]
+    await mount(<ToastHost><Sidebar {...sidebarProps([{ id: 'w1', name: 'Acme', archived: false, createdAt: 1 }], 'w1')} sessions={list} /></ToastHost>)
+    const text = host.textContent ?? ''
+    expect(text.indexOf('Typed lately')).toBeLessThan(text.indexOf('Streaming'))
+    // The age column follows the same mark: the streaming row reads 1h, not "now".
+    const row = [...host.querySelectorAll('span.font-medium')].find((span) => span.textContent === 'Streaming')!
+    expect(row.closest('button')?.textContent).toContain('1h')
+    expect(row.closest('button')?.textContent).not.toContain('now')
+  })
+  it('falls back to updatedAt for a listing without a user-activity mark', async () => {
+    const now = Date.now()
+    const base = { eventCount: 3, folder: null, status: 'idle' as const, pendingInputs: 0 }
+    const list = [
+      { id: 'b1', title: 'Older', updatedAt: now - 3_600_000, ...base },
+      { id: 'b2', title: 'Newer', updatedAt: now - 60_000, ...base },
+    ]
+    await mount(<ToastHost><Sidebar {...sidebarProps([{ id: 'w1', name: 'Acme', archived: false, createdAt: 1 }], 'w1')} sessions={list} /></ToastHost>)
+    const text = host.textContent ?? ''
+    expect(text.indexOf('Newer')).toBeLessThan(text.indexOf('Older'))
+  })
   it('opens the search field on demand and closes it again, clearing the query', async () => {
     const onFilter = vi.fn()
     const props = sidebarProps([{ id: 'w1', name: 'Acme', archived: false, createdAt: 1 }], 'w1')
@@ -1415,9 +1459,9 @@ describe('sidebar sections + live rows + workspace management', () => {
     expect(host.querySelector('input[aria-label="Search conversations and folders"]')).toBeNull()
     await act(async () => search().click())
     expect(host.querySelector('input[aria-label="Search conversations and folders"]')).not.toBeNull()
-    expect(search().getAttribute('aria-expanded')).toBe('true')
-    await act(async () => search().click())
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Close search"]')!.click())
     expect(host.querySelector('input[aria-label="Search conversations and folders"]')).toBeNull()
+    expect(search()).not.toBeNull()
     expect(onFilter).toHaveBeenCalledWith('')
   })
   it('filters to running conversations and notes when none remain', async () => {

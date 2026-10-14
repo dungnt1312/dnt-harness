@@ -225,9 +225,15 @@ export interface HookSourceDirs {
   readonly projectRoot?: string
   /** Hooks of the enabled plugins (raw `hooks` sections, merged as Claude does). */
   readonly plugins?: readonly { readonly id: string; readonly root: string; readonly data: string; readonly hooks: unknown; readonly label: string }[]
+  /** Layers the workspace's Sources policy switched off: never read, never merged, never counted for `disableAllHooks`. */
+  readonly disabledLayers?: ReadonlySet<string>
 }
 
 export function hookSourceFiles(dirs: HookSourceDirs): { layer: HookLayer; path: string }[] {
+  return hookSourceFilesAll(dirs).filter((source) => dirs.disabledLayers?.has(source.layer) !== true)
+}
+
+function hookSourceFilesAll(dirs: HookSourceDirs): { layer: HookLayer; path: string }[] {
   return [
     ...(dirs.userDir !== undefined ? [{ layer: 'user' as const, path: path.join(dirs.userDir, 'settings.json') }] : []),
     ...(dirs.workspaceDir !== undefined ? [{ layer: 'workspace' as const, path: path.join(dirs.workspaceDir, 'settings.json') }] : []),
@@ -340,8 +346,10 @@ export async function loadHooks(dirs: HookSourceDirs): Promise<ResolvedHooks> {
   }
   // Plugin hooks merge with the settings hooks; as everywhere in Claude, all
   // matching hooks run (order does not decide anything).
-  for (const plugin of dirs.plugins ?? []) {
-    collect(plugin.hooks, 'plugin', plugin.label, { id: plugin.id, root: plugin.root, data: plugin.data })
+  if (dirs.disabledLayers?.has('plugin') !== true) {
+    for (const plugin of dirs.plugins ?? []) {
+      collect(plugin.hooks, 'plugin', plugin.label, { id: plugin.id, root: plugin.root, data: plugin.data })
+    }
   }
   const hooks = disabled ? [] : all.filter((hook) => hook.active && hook.supported)
   return { all, hooks, disabled, sources, diagnostics }

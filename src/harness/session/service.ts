@@ -213,6 +213,7 @@ export class SessionsService extends Service {
           summary.projectId === undefined ||
           summary.derivedTitle === undefined ||
           summary.parentSessionId === undefined ||
+          summary.lastUserActivityAt === undefined ||
           (tail !== undefined && summary.lastSeq !== tail)
         ) {
           // Deleting derived state must never hide a canonical session:
@@ -336,7 +337,9 @@ export class SessionsService extends Service {
     const all = new Map<SessionId, SessionSummary>()
     for (const [id, summary] of this.known) all.set(id, summary)
     for (const session of this.loaded.values()) all.set(session.id, this.cachedSummarize(session))
-    return [...all.values()].sort((a, b) => b.updatedAt - a.updatedAt)
+    // Ordered by when the user last touched a conversation, not by its last
+    // logged event: an agent streaming in the background must not reshuffle the list.
+    return [...all.values()].sort((a, b) => (b.lastUserActivityAt ?? b.updatedAt) - (a.lastUserActivityAt ?? a.updatedAt))
   }
 
   /** Fork a session; the child stays in the source session's workspace. */
@@ -573,6 +576,7 @@ export class SessionsService extends Service {
         projectId: lastRecorded(events, projectOf, null),
         pinned: lastRecorded(events, (event) => (event.type === 'session/pinned' ? event.pinned : undefined), false),
         parentSessionId: lastRecorded(events, parentOf, null),
+        lastUserActivityAt: lastRecorded(events, userActivityOf, first?.timestamp ?? 0),
       }
       await store.writeSummary(id, summary)
       return summary
@@ -682,6 +686,7 @@ export class SessionsService extends Service {
       projectId: lastRecorded(events, projectOf, null),
       pinned: lastRecorded(events, (event) => (event.type === 'session/pinned' ? event.pinned : undefined), false),
       parentSessionId: lastRecorded(events, parentOf, null),
+      lastUserActivityAt: lastRecorded(events, userActivityOf, first?.timestamp ?? this.now()),
     }
   }
 }
@@ -704,6 +709,17 @@ function lastRecorded<T>(events: readonly SessionEvent[], pick: (event: SessionE
 function projectOf(event: SessionEvent): string | null | undefined {
   if (event.type === 'session/project') return event.projectId
   if (event.type === 'session/child-meta') return event.projectId ?? undefined
+  return undefined
+}
+
+/**
+ * The time of an event the user typed: a plain `user/message`, or an input
+ * queued while a turn runs. Host context, hook wake-ups, commands' expansions
+ * and joined reports carry an `origin` and are not the user acting.
+ */
+function userActivityOf(event: SessionEvent): number | undefined {
+  if (event.type === 'user/message') return event.origin === undefined ? event.timestamp : undefined
+  if (event.type === 'input/queued') return event.origin === undefined ? event.timestamp : undefined
   return undefined
 }
 

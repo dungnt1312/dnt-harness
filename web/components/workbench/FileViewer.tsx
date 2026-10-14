@@ -5,14 +5,17 @@ import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
+import { Segmented } from '../ui/Segmented.tsx'
 import { getSkillFile, readMemoryFile, readProjectFile, saveProjectFile, SaveConflictError, type ProjectFileView } from '../../lib/api.ts'
 import { memoryTabOf, skillTabName } from '../../lib/project-paths.ts'
 import { writeErrorText } from '../../lib/file-tree.ts'
 import type { FileDraft, ViewerFocus } from '../../hooks/useWorkbenchFiles.ts'
 import { FileEditor } from './FileEditor.tsx'
+import { FilePreview } from './FilePreview.tsx'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
 import { MediaPreview } from '../common/MediaPreview.tsx'
 import { escapeHtml, ensureLanguage, highlight, languageOfFile } from '../../lib/highlight.ts'
+import { previewKindOf } from '../../lib/preview.ts'
 
 /** Above this size files render as plain escaped text to keep the viewer responsive. */
 const HIGHLIGHT_LIMIT = 200_000
@@ -147,6 +150,11 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
   }
 
   const language = languageOfFile(skill !== null ? 'SKILL.md' : memory !== null ? memory.file : path)
+  // Preview is pure client-side rendering of the already-read text, so it is
+  // available on every tab: project files, skills and memory alike.
+  const previewKind = previewKindOf(skill !== null ? 'SKILL.md' : memory !== null ? memory.file : path)
+  // A markdown document opens rendered; everything else starts in the code view.
+  const [mode, setMode] = useState<'code' | 'preview'>(previewKind === 'markdown' ? 'preview' : 'code')
   // The grammar loads after first paint: big files never wait on it, and the
   // escaped text is already correct before the highlighted pass re-renders.
   const [grammarReady, setGrammarReady] = useState(language === 'text')
@@ -223,7 +231,18 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
         <>
           <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-line px-3 text-xs text-fg-muted">
             <span className="font-mono">{file.binary ? 'binary' : language}{file.truncated && !file.binary ? ` · first ${Math.round(file.content.length / 1024)} KB of ${Math.round(file.size / 1024)} KB` : ''}</span>
-            {!file.binary ? <CopyButton text={file.content} label="Copy file contents" className="size-7" /> : null}
+            <span className="flex items-center gap-2">
+              {!file.binary && previewKind !== null && draft === null ? (
+                <Segmented<'code' | 'preview'>
+                  label="View mode"
+                  size="compact"
+                  value={mode}
+                  options={[{ value: 'code', label: 'Code' }, { value: 'preview', label: 'Preview' }]}
+                  onChange={setMode}
+                />
+              ) : null}
+              {!file.binary ? <CopyButton text={file.content} label="Copy file contents" className="size-7" /> : null}
+            </span>
           </div>
           {file.binary ? (
             <div className="min-h-0 flex-1 overflow-auto" role="region" aria-label={`Preview of ${path}`}>
@@ -243,6 +262,8 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
               onReload={reloadFromDisk}
               onOverwrite={overwrite}
             />
+          ) : mode === 'preview' && previewKind !== null ? (
+            <FilePreview kind={previewKind} path={iconPath} content={file.content} truncated={file.truncated} />
           ) : (
             <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto" role="region" aria-label={`Contents of ${path}`} tabIndex={0}>
               {file.truncated ? <p className="m-0 border-b border-line bg-warn-soft px-3 py-1.5 text-xs text-warn">File is larger than 1 MB; only the beginning is shown.</p> : null}

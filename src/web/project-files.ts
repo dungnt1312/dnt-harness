@@ -106,8 +106,13 @@ export async function listProjectEntries(root: string, raw: string, deniedRoots?
 export const MAX_SEARCH_ENTRIES = 20_000
 /** Hard ceiling on returned matches, whatever the caller asks for. */
 export const MAX_SEARCH_RESULTS = 50
-/** Directories never walked: heavy or hidden trees nobody mentions by name. */
-const SKIPPED_DIRS = new Set(['node_modules'])
+/**
+ * Directories never walked: heavy trees nobody mentions by name. Other dot
+ * folders (`.claude`, `.github`, …) are searchable on purpose.
+ */
+const SKIPPED_DIRS = new Set(['node_modules', '.git'])
+/** OS metadata files that would only add noise to a bare `@`. */
+const SKIPPED_FILES = new Set(['.DS_Store'])
 
 /** Highest for a file name that starts with the query, lowest for a path hit. */
 function score(relativePath: string, name: string, needle: string): number {
@@ -128,7 +133,8 @@ const byScoreThenPath = (a: ProjectMatch, b: ProjectMatch): number =>
 /**
  * Bounded breadth-first file search under a project root, for the composer's
  * `@` mention picker. Names only — no file content is read. Symlinks are never
- * followed, hidden and `node_modules` trees are skipped, and the walk gives up
+ * followed, `.git` and `node_modules` trees are skipped (other dot folders are
+ * searched), and the walk gives up
  * after {@link MAX_SEARCH_ENTRIES} entries rather than traversing forever. An
  * empty query lists the shallowest files, which makes a bare `@` useful.
  */
@@ -155,7 +161,7 @@ export async function searchProjectFiles(
       visited += 1
       // A link can point anywhere; refusing to follow it keeps every reported
       // path lexically inside the root without a second containment check.
-      if (dirent.isSymbolicLink() || dirent.name.startsWith('.')) continue
+      if (dirent.isSymbolicLink() || SKIPPED_FILES.has(dirent.name)) continue
       const entryPath = folder.rel === '' ? dirent.name : `${folder.rel}/${dirent.name}`
       if (dirent.isDirectory()) {
         if (!SKIPPED_DIRS.has(dirent.name)) queue.push({ abs: path.join(folder.abs, dirent.name), rel: entryPath })

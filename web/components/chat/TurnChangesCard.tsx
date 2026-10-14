@@ -163,7 +163,9 @@ function ChangeFileRow({ file, project, onReviewFile, onOpenPath }: {
   const name = file.path.split(/[\\/]/).pop() ?? file.path
   const directory = file.path.slice(0, file.path.length - name.length).replace(/[\\/]+$/, '')
   const relative = project !== undefined ? toProjectRelative(project.path, file.path) : null
-  const gitDiff = onReviewFile !== undefined && relative !== null && relative !== '' ? () => onReviewFile(relative) : null
+  // A file the turn created has no HEAD to diff against: its row offers only
+  // "open file".
+  const gitDiff = file.status !== 'created' && onReviewFile !== undefined && relative !== null && relative !== '' ? () => onReviewFile(relative) : null
   const hasActions = open !== null || gitDiff !== null
   return (
     <li className="group/file relative m-0">

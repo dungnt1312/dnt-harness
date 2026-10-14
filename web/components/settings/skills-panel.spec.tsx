@@ -2,7 +2,7 @@
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { deleteSkill, getSkill, getSkillFile, getSkillFiles, getSkillSources, listProjects, listSkills, putSkillSources, saveSkill, setSkillHidden } from '../../lib/api.ts'
+import { deleteSkill, getSkill, getSkillFile, getSkillFiles, getSkillSources, listProjects, listSkills, saveSkill, setSkillHidden } from '../../lib/api.ts'
 import { SkillsPanel } from './SkillsPanel.tsx'
 
 vi.mock('../../lib/api.ts', () => ({
@@ -12,13 +12,12 @@ vi.mock('../../lib/api.ts', () => ({
   deleteSkill: vi.fn(),
   setSkillHidden: vi.fn(),
   getSkillSources: vi.fn(),
-  putSkillSources: vi.fn(),
   listProjects: vi.fn(),
   getSkillFiles: vi.fn(),
   getSkillFile: vi.fn(),
 }))
 
-const mocked = vi.mocked({ listSkills, getSkill, saveSkill, deleteSkill, setSkillHidden, getSkillSources, putSkillSources, listProjects, getSkillFiles, getSkillFile })
+const mocked = vi.mocked({ listSkills, getSkill, saveSkill, deleteSkill, setSkillHidden, getSkillSources, listProjects, getSkillFiles, getSkillFile })
 
 const row = (name: string, source: 'project' | 'workspace' | 'user', extra: Record<string, unknown> = {}) =>
   ({ name, title: name, description: `${name} does things`, source, hash: `hash-${name}`, ...extra })
@@ -63,7 +62,6 @@ afterEach(() => {
 })
 
 const buttons = (): HTMLButtonElement[] => [...document.body.querySelectorAll<HTMLButtonElement>('button')]
-const menuItem = (name: string): HTMLButtonElement => [...document.body.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find((node) => node.textContent === name)!
 const button = (name: string): HTMLButtonElement => {
   const found = buttons().find((node) => node.textContent === name || node.getAttribute('aria-label') === name)
   if (found === undefined) throw new Error(`no button "${name}"`)
@@ -223,72 +221,18 @@ describe('SkillsPanel skills tab', () => {
   })
 })
 
-describe('SkillsPanel source folders tab', () => {
-  beforeEach(() => {
-    mocked.putSkillSources.mockReset()
-    mocked.putSkillSources.mockResolvedValue({ rules: [] })
-  })
-
-  const openFolders = async (): Promise<void> => {
+describe('SkillsPanel and Sources', () => {
+  it('no longer carries its own folder-rule editor', async () => {
     await renderPanel()
-    const tab = [...document.body.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find((node) => node.textContent?.startsWith('Source folders'))!
-    await act(async () => tab.click())
-    await settle()
-  }
-
-  it('renders rule rows with kind badges and a locked workspace row', async () => {
-    await openFolders()
-    expect(document.body.textContent).toContain('.claude/skills')
-    expect(document.body.textContent).toContain('.agents/skills')
-    expect(document.body.textContent).toContain('Workspace skills')
-    await act(async () => button('More actions for Workspace skills').click())
-    expect([...document.body.querySelectorAll('[role="menuitem"]')].some((node) => node.textContent === 'Remove folder')).toBe(false)
+    expect([...document.body.querySelectorAll('[role="tab"]')].some((node) => node.textContent?.startsWith('Source folders'))).toBe(false)
+    expect(document.body.querySelector('input[aria-label="New rule path"]')).toBeNull()
   })
 
-  it('toggling a rule persists immediately and notifies catalog consumers', async () => {
-    const onChanged = vi.fn()
-    await act(async () => root!.render(<SkillsPanel workspaceId="ws-1" onChanged={onChanged} />))
+  it('points to Sources and jumps there on request', async () => {
+    const onOpenSources = vi.fn()
+    await act(async () => root!.render(<SkillsPanel workspaceId="ws-1" onOpenSources={onOpenSources} />))
     await settle()
-    const tab = [...document.body.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find((node) => node.textContent?.startsWith('Source folders'))!
-    await act(async () => tab.click())
-    const box = document.body.querySelector<HTMLButtonElement>('[role="switch"][aria-label="Enable .agents/skills"]')!
-    await act(async () => box.click())
-    await settle()
-    expect(mocked.putSkillSources).toHaveBeenCalledTimes(1)
-    const rules = mocked.putSkillSources.mock.calls[0]?.[1] as readonly { id: string; enabled: boolean }[]
-    expect(rules.find((rule) => rule.id === 'project-agents')?.enabled).toBe(false)
-    expect(onChanged).toHaveBeenCalledTimes(1)
-  })
-
-  it('reorder buttons move a rule up and persist the swapped order', async () => {
-    await openFolders()
-    await act(async () => button('More actions for .agents/skills').click())
-    await act(async () => menuItem('Move up').click())
-    await settle()
-    const rules = mocked.putSkillSources.mock.calls[0]?.[1] as readonly { id: string }[]
-    expect(rules.map((rule) => rule.id)).toEqual(['project-agents', 'project-claude', 'workspace', 'user'])
-  })
-
-  it('remove deletes a rule and add appends a new one', async () => {
-    await openFolders()
-    // Remove is in the row menu and asks first: nothing saved until confirmed.
-    await act(async () => button('More actions for .agents/skills').click())
-    await act(async () => menuItem('Remove folder').click())
-    expect(mocked.putSkillSources).not.toHaveBeenCalled()
-    await act(async () => buttons().filter((node) => node.textContent === 'Remove folder').at(-1)!.click())
-    await settle()
-    let rules = mocked.putSkillSources.mock.calls[0]?.[1] as readonly { id: string }[]
-    expect(rules.some((rule) => rule.id === 'project-agents')).toBe(false)
-    await act(async () => button('New rule kind').click())
-    await settle()
-    const option = [...document.body.querySelectorAll<HTMLElement>('[role="option"]')].find((node) => node.textContent === 'Absolute path')!
-    await act(async () => option.click())
-    await settle()
-    const pathInput = document.body.querySelector<HTMLInputElement>('input[aria-label="New rule path"]')!
-    await act(async () => type(pathInput, 'D:/shared-skills'))
-    await act(async () => button('Add rule').click())
-    await settle()
-    rules = mocked.putSkillSources.mock.calls[1]?.[1] as readonly { id: string }[]
-    expect(rules[rules.length - 1]).toMatchObject({ kind: 'absolute', path: 'D:/shared-skills', enabled: true })
+    await act(async () => button('Sources').click())
+    expect(onOpenSources).toHaveBeenCalledTimes(1)
   })
 })

@@ -15,6 +15,7 @@ import { Select } from './Select.tsx'
 import { Modal } from './Modal.tsx'
 import { Field } from './Field.tsx'
 import { Switch } from './Switch.tsx'
+import { InlineSwitch } from '../settings/settings-kit.tsx'
 import { ToolCard } from '../chat/MessageParts.tsx'
 import { ApprovalBar } from '../chat/ApprovalBar.tsx'
 
@@ -63,23 +64,23 @@ describe('runtime provider UI helpers', () => {
     expect(activeModelValue(meta)).toBe('cliproxy1:gpt-5.6-sol')
   })
 
-  it('settings dialog exposes all eleven sections as linked tabs and lists providers', () => {
+  it('settings dialog exposes all thirteen sections as linked tabs and lists providers', () => {
     const html = renderToStaticMarkup(
       <SettingsModal open workspaceId="ws-1" providers={meta.providers} activeProvider="cliproxy1" activeModel="gpt-5.6-sol" onDismiss={() => undefined} onRefresh={async () => undefined} />,
     )
     expect(html).toContain('aria-modal="true"')
     expect(html).toContain('aria-label="Settings"')
-    // Twelve sections (including Plugins), plus the three Providers & Models sub-tabs on the open pane.
+    // Thirteen sections (including Plugins and Sources), plus the three Providers & Models sub-tabs on the open pane.
     const sections = html.match(/<div[^>]*aria-label="Settings sections"[\s\S]*?<\/div><\/aside>/)?.[0] ?? ''
-    expect((sections.match(/role="tab"/g) ?? []).length).toBe(12)
+    expect((sections.match(/role="tab"/g) ?? []).length).toBe(13)
     // Radix mounts the active panel only; each tab still owns a controls link.
     expect((html.match(/role="tabpanel"/g) ?? []).length).toBe(1)
-    expect((sections.match(/aria-controls=/g) ?? []).length).toBe(12)
+    expect((sections.match(/aria-controls=/g) ?? []).length).toBe(13)
     const tabTags = sections.match(/<[a-z]+[^>]*role="tab"[^>]*>/g) ?? []
     expect(tabTags.filter((tag) => tag.includes('aria-selected="true"')).length).toBe(1)
     const labels = [...sections.matchAll(/<button(?=[^>]*role="tab")[\s\S]*?<\/button>/g)]
       .map((match) => match[0].replace(/<[^>]+>/g, ''))
-    expect(labels).toEqual(['Providers &amp; Models', 'Usage', 'Projects', 'Permissions', 'System Prompts', 'Skills', 'Plugins', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets'])
+    expect(labels).toEqual(['Providers &amp; Models', 'Usage', 'Projects', 'Permissions', 'System Prompts', 'Sources', 'Skills', 'Plugins', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets'])
     const subTabs = html.match(/<div role="tablist" aria-label="Providers &amp; Models"[\s\S]*?<\/div>/)?.[0] ?? ''
     expect([...subTabs.matchAll(/<button[\s\S]*?<\/button>/g)].map((match) => match[0].replace(/<[^>]+>/g, ''))).toEqual(['Providers', 'Model aliases', 'Images', 'Videos', 'Git'])
     expect(html).toContain('cliproxy1')
@@ -126,6 +127,17 @@ describe('primitives', () => {
     expect(html).toContain('body')
   })
 
+  // The categorical tones reuse the theme's `tool-*` hues, which already have
+  // a light and a dark variant; a new raw colour here would skip that.
+  it('Badge has categorical tones that map onto the theme hues, each different', () => {
+    const classOf = (tone: 'violet' | 'pink' | 'cyan' | 'amber'): string =>
+      /class="([^"]*)"/.exec(renderToStaticMarkup(<Badge tone={tone}>x</Badge>))?.[1] ?? ''
+    expect(classOf('violet')).toContain('text-tool-search')
+    expect(classOf('pink')).toContain('text-tool-agent')
+    expect(classOf('cyan')).toContain('text-tool-ext')
+    expect(new Set([classOf('violet'), classOf('pink'), classOf('cyan'), classOf('amber')]).size).toBe(4)
+  })
+
   it('Modal renders nothing while closed and carries dialog semantics when open', () => {
     expect(renderToStaticMarkup(<Modal open={false} onDismiss={() => undefined} label="x"><p>body</p></Modal>)).toBe('')
     const html = renderToStaticMarkup(<Modal open onDismiss={() => undefined} label="Settings" width="md" header={<strong>Head</strong>}><p>body</p></Modal>)
@@ -167,6 +179,23 @@ describe('primitives', () => {
     expect(html).toContain('Hidden from the picker when off.')
   })
 
+  // On touch screens a global rule forces every <button> to 44x44. A switch
+  // track is a button of 36x20, so without the opt-out it became a 44px
+  // circle with the thumb stranded in its middle. Every switch must opt out
+  // and keep its 44px touch area on a pseudo-element instead.
+  it('every switch track opts out of the 44px touch floor and keeps a 44px hit area', () => {
+    const tracks = [
+      renderToStaticMarkup(<Switch checked label="Enabled" onChange={() => undefined} />),
+      renderToStaticMarkup(<InlineSwitch ariaLabel="Enable x" checked onChange={() => undefined} />),
+    ].map((html) => /<button[^>]*role="switch"[^>]*>/.exec(html)?.[0] ?? '')
+    for (const tag of tracks) {
+      expect(tag).toContain('data-compact-control')
+      expect(tag).toContain('h-5')
+      expect(tag).toContain('w-9')
+      expect(tag).toContain('before:-inset-y-3')
+    }
+  })
+
   it('TextInput renders leading content and a monospace variant', () => {
     const html = renderToStaticMarkup(<TextInput mono leading={<b>i</b>} placeholder="Search…" readOnly />)
     expect(html).toContain('<b>i</b>')
@@ -197,6 +226,17 @@ describe('chat surfaces', () => {
     const settled = renderToStaticMarkup(<ToolCard item={{ kind: 'tool', call: { id: 't1', name: 'read', args: { path: 'src/x.ts', limit: 5 } }, result: { ok: true, output: 'x' } }} />)
     expect(settled).toContain('>Read<')
     expect(settled).not.toContain('text-shimmer')
+  })
+
+  it('ToolCard shows the recorded duration only when the surface opts in', () => {
+    const settled = { kind: 'tool' as const, call: { id: 't1', name: 'bash', args: { command: 'slow' } }, ts: 1_000, doneAt: 3_400, result: { ok: true, output: 'x' } }
+    // Chat keeps the row quiet; a Trajectory surface passes withDuration.
+    expect(renderToStaticMarkup(<ToolCard item={settled} />)).not.toContain('Call duration')
+    expect(renderToStaticMarkup(<ToolCard item={settled} withDuration />)).toContain('Call duration')
+    expect(renderToStaticMarkup(<ToolCard item={settled} withDuration />)).toContain('2.4s')
+    // Nothing is invented for a call that has not settled or carries no stamps.
+    const pending = { kind: 'tool' as const, call: { id: 't2', name: 'bash', args: { command: 'x' } } }
+    expect(renderToStaticMarkup(<ToolCard item={pending} withDuration />)).not.toContain('Call duration')
   })
 
   it('ApprovalBar shows one card per pending call', () => {

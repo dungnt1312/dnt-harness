@@ -1,5 +1,4 @@
 import * as Collapsible from '@radix-ui/react-collapsible'
-import * as RadixSwitch from '@radix-ui/react-switch'
 import { forwardRef, useRef, type ReactNode, type TextareaHTMLAttributes } from 'react'
 import { useScopedState } from '../../hooks/useScopedState.ts'
 import Icon, { type IconName } from '../common/Icon.tsx'
@@ -7,6 +6,7 @@ import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import { Badge } from '../ui/Badge.tsx'
 import { Button } from '../ui/Button.tsx'
+import { SwitchTrack } from '../ui/Switch.tsx'
 import { cn } from '../../lib/cn.ts'
 
 /**
@@ -247,15 +247,7 @@ export function InlineSwitch({ label, ariaLabel, checked, disabled = false, titl
   return (
     <label title={title} className={cn('flex cursor-pointer items-center gap-2 text-[13px] text-fg-muted', disabled && 'cursor-default opacity-60')}>
       {label}
-      <RadixSwitch.Root
-        aria-label={ariaLabel}
-        checked={checked}
-        disabled={disabled}
-        onCheckedChange={onChange}
-        className="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full bg-line-strong transition-colors data-[state=checked]:bg-primary"
-      >
-        <RadixSwitch.Thumb className="block size-4 translate-x-0.5 rounded-full bg-bg shadow transition-transform data-[state=checked]:translate-x-[18px]" />
-      </RadixSwitch.Root>
+      <SwitchTrack aria-label={ariaLabel} checked={checked} disabled={disabled} onCheckedChange={onChange} />
     </label>
   )
 }

@@ -3,12 +3,13 @@ import Icon from '../common/Icon.tsx'
 import ConfirmDialog from '../common/ConfirmDialog.tsx'
 import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import { Spinner } from '../common/Spinner.tsx'
+import { useToast } from '../common/Toast.tsx'
 import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
 import { cn } from '../../lib/cn.ts'
 import { createProjectEntry, deleteProjectEntry, listProjectFiles, renameProjectEntry, type ProjectEntry } from '../../lib/api.ts'
-import { ancestorsOf, dropKeysUnder, dropUnderSet, isAtOrUnder, joinPath, parentOf, targetFolder, writeErrorText, type Selection } from '../../lib/file-tree.ts'
+import { absoluteEntryPath, ancestorsOf, dropKeysUnder, dropUnderSet, isAtOrUnder, joinPath, parentOf, targetFolder, writeErrorText, type Selection } from '../../lib/file-tree.ts'
 import { FileSearchResults } from './FileSearchResults.tsx'
 import { FolderRows, type FolderNode, type TreeActions, type TreeEditor } from './FileTreeRows.tsx'
 import { useFileSearch } from './useFileSearch.ts'
@@ -34,6 +35,7 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRe
   const [editor, setEditor] = useState<TreeEditor | null>(null)
   const [deleting, setDeleting] = useState<DeleteRequest | null>(null)
   const search = useFileSearch(workspaceId, project.id)
+  const toast = useToast()
   const generation = useRef(new Map<string, number>())
   const nextEditorId = useRef(0)
   /** Latest `open`, for async handlers that must not read the value captured before an await. */
@@ -140,6 +142,15 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRe
     await load(parentOf(entry.path))
   }
 
+  /** Copy an entry's path; the toast says which form landed on the clipboard. */
+  const copyPath = (path: string, absolute: boolean): void => {
+    const text = absolute ? absoluteEntryPath(project.path, path) : path
+    void navigator.clipboard.writeText(text).then(
+      () => toast.notify(`Copied ${absolute ? 'absolute' : 'relative'} path: ${text}`, 'ok'),
+      () => toast.notify('Could not copy the path. Select it from the tooltip and copy manually.', 'bad'),
+    )
+  }
+
   const actions: TreeActions = {
     nodes,
     open,
@@ -154,6 +165,7 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRe
     retry: (folder) => void load(folder),
     beginRename: (entry) => setEditor({ id: nextEditorId.current++, mode: 'rename', path: entry.path }),
     beginDelete: (entry) => setDeleting({ entry, busy: false, error: null }),
+    copyPath,
     submitCreate,
     submitRename,
     cancelEdit: () => setEditor(null),
@@ -184,7 +196,7 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRe
       </div>
       {search.searching ? (
         <div className="min-h-0 flex-1 overflow-auto py-1">
-          <FileSearchResults status={search.status} result={search.result} error={search.error} activeFile={activeFile} onOpen={onOpenFile} />
+          <FileSearchResults status={search.status} result={search.result} error={search.error} activeFile={activeFile} onOpen={onOpenFile} projectPath={project.path} onCopyPath={copyPath} />
         </div>
       ) : null}
       {/* Hidden, not unmounted, while searching: the expanded folders and cache survive. */}

@@ -211,6 +211,24 @@ describe('MCP OAuth Connect', () => {
     expect((await ctx.row())?.oauth).toEqual({ state: 'not_connected' })
   })
 
+  it('keeps the old grant bound to its URL while a new URL sign-in is pending', async () => {
+    const ctx = await boot()
+    await addOAuthServer(ctx.api, ctx.f.mcpUrl)
+    await connect(ctx)
+    const newUrl = `${ctx.f.mcpUrl}?v=2`
+    await addOAuthServer(ctx.api, newUrl)
+    const begun = await ctx.api('/mcp/remote/oauth/begin', {})
+    expect(begun.status).toBe(200)
+    const { authorizationUrl, state } = await begun.json() as { authorizationUrl: string; state: string }
+    expect((await ctx.row())?.oauth?.state).toBe('not_connected')
+    const enabled = await ctx.api('/mcp/remote/enable')
+    expect(enabled.ok).toBe(false)
+    expect(await enabled.text()).toContain('auth_required')
+    await fetch(await ctx.f.authorize(authorizationUrl))
+    expect((await ctx.api('/mcp/remote/oauth/complete', { state })).status).toBe(200)
+    expect((await ctx.row())?.oauth?.state).toBe('connected')
+  })
+
   it('does not hand a grant to a server whose URL changed', async () => {
     const ctx = await boot()
     await addOAuthServer(ctx.api, ctx.f.mcpUrl)

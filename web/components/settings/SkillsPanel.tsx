@@ -8,25 +8,18 @@ import { Field } from '../ui/Field.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Select } from '../ui/Select.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
-import { deleteSkill, getSkill, getSkillFile, getSkillFiles, getSkillSources, listProjects, listSkills, putSkillSources, saveSkill, setSkillHidden } from '../../lib/api.ts'
+import { deleteSkill, getSkill, getSkillFile, getSkillFiles, getSkillSources, listProjects, listSkills, saveSkill, setSkillHidden } from '../../lib/api.ts'
 import type { ProjectRow, SkillFileRow, SkillRow, SkillRuleRow } from '../../lib/types.ts'
 import {
   CodeArea,
-  EmptyState,
   InlineConfirm,
-  ItemList,
-  ItemRow,
   Notice,
   PanelBody,
   PanelIntro,
-  Section,
   WorkspaceRequired,
   useActionRunner,
   type NoticeState,
   ConflictBanner,
-  InlineSwitch,
-  RowMenu,
-  SubTabs,
 } from './settings-kit.tsx'
 import { useUnsavedChanges } from './unsaved-changes.tsx'
 
@@ -42,7 +35,6 @@ const savedNotice = (saved: { readonly name: string; readonly hash: string; read
     : { kind: 'ok', text: `Saved ${saved.name} (${saved.hash.slice(0, 8)}).` }
 /** One tree row: fixed height, full-width hover; callers add the indent. */
 const TREE_ROW = 'flex h-7 w-full min-w-0 items-center pr-3 text-left text-[13px] outline-none hover:bg-hover focus-visible:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-link'
-type PanelTab = 'skills' | 'folders'
 
 interface SkillGroup {
   readonly key: string
@@ -58,18 +50,17 @@ interface ProjectSkillRows {
 }
 
 /**
- * Skills settings, two tabs: "Skills" is a layer-grouped catalog (project x
- * rule groups, then workspace/user/bundled) with a detail pane — preview for
- * every layer, raw editing and delete only for workspace rows; "Source
- * folders" is the rule editor ({@link FoldersEditor}). Grouping scans ALL
+ * Skills settings: a layer-grouped catalog (project x rule groups, then
+ * workspace/user/bundled) with a detail pane — preview for every layer, raw
+ * editing and delete only for workspace rows. Which folders are scanned lives
+ * in Settings → Sources (`onOpenSources` jumps there). Grouping scans ALL
  * projects of the workspace: rules apply to every project, so no selector.
  */
-export function SkillsPanel(props: { readonly workspaceId: string | null; readonly onChanged?: () => void }) {
+export function SkillsPanel(props: { readonly workspaceId: string | null; readonly onChanged?: () => void; readonly onOpenSources?: () => void }) {
   return <SkillsPanelContent key={props.workspaceId} {...props} />
 }
 
-function SkillsPanelContent({ workspaceId, onChanged = () => {} }: { readonly workspaceId: string | null; readonly onChanged?: () => void }) {
-  const [tab, setTab] = useScopedState<PanelTab>('skills')
+function SkillsPanelContent({ workspaceId, onChanged = () => {}, onOpenSources }: { readonly workspaceId: string | null; readonly onChanged?: () => void; readonly onOpenSources?: () => void }) {
   const [notice, setNotice] = useScopedState<NoticeState>(null)
   const [rules, setRules] = useScopedState<readonly SkillRuleRow[]>([])
   const [projects, setProjects] = useScopedState<readonly ProjectRow[]>([])
@@ -442,18 +433,15 @@ function SkillsPanelContent({ workspaceId, onChanged = () => {} }: { readonly wo
 
   return (
     <PanelBody>
-      <PanelIntro>Skills are SKILL.md instruction packages the model loads by name. Project folders (.claude/skills, .agents/skills) follow the rule list in “Source folders” — precedence is list order, first match wins.</PanelIntro>
+      <PanelIntro>
+        Skills are SKILL.md instruction packages the model loads by name. Which folders are scanned, and in what order, is set in{' '}
+        {onOpenSources !== undefined
+          ? <button type="button" className="cursor-pointer border-0 bg-transparent p-0 text-link underline" onClick={() => guardDiscard(onOpenSources)}>Sources</button>
+          : 'Sources'}
+        {' '}— precedence is list order, first match wins.
+      </PanelIntro>
       {notice !== null ? <Notice kind={notice.kind} text={notice.text} /> : null}
-      <SubTabs
-        label="Skills view"
-        value={tab}
-        onChange={setTab}
-        tabs={[
-          { value: 'skills', label: 'Skills', icon: 'zap', count: totalSkills },
-          { value: 'folders', label: 'Source folders', icon: 'folder', count: rules.length },
-        ]}
-      />
-      {tab === 'skills' ? (
+      {(
         <div className="grid h-[min(560px,calc(100vh-460px))] min-h-[360px] overflow-hidden rounded-xl border border-line md:grid-cols-[minmax(260px,320px)_1fr]">
           <div className="flex min-h-0 flex-col border-b border-line md:border-r md:border-b-0">
             <div className="flex h-12 shrink-0 items-center gap-1 border-b border-line pr-2 pl-4">
@@ -585,138 +573,8 @@ function SkillsPanelContent({ workspaceId, onChanged = () => {} }: { readonly wo
           </div>
           <div className="flex min-h-0 min-w-0 flex-col">{detailBody()}</div>
         </div>
-      ) : (
-        <Section title="Source folders" count={rules.length}>
-          <FoldersEditor
-            workspaceId={workspaceId}
-            rules={rules}
-            onSaved={(saved) => { setRules(saved.rules); void refresh(); onChanged() }}
-            setNotice={setNotice}
-          />
-        </Section>
       )}
     </PanelBody>
   )
 }
 
-/** The ordered rule list; every mutation persists immediately (last-write-wins). */
-function FoldersEditor(props: {
-  readonly workspaceId: string
-  readonly rules: readonly SkillRuleRow[]
-  readonly onSaved: (saved: { readonly rules: readonly SkillRuleRow[] }) => void
-  readonly setNotice: (notice: NoticeState) => void
-}): ReactNode {
-  const [newKind, setNewKind] = useScopedState<'project' | 'absolute'>('project')
-  const [newPath, setNewPath] = useScopedState('')
-  /** Rule awaiting a remove confirmation: removing saves immediately. */
-  const [removing, setRemoving] = useScopedState<string | null>(null)
-  const { busy, run } = useActionRunner((text) => props.setNotice({ kind: 'bad', text }))
-
-  const persist = (next: readonly SkillRuleRow[]): Promise<void> => run('sources', async () => {
-    try {
-      props.onSaved(await putSkillSources(props.workspaceId, next))
-      props.setNotice({ kind: 'ok', text: 'Source folders saved.' })
-    } catch (cause) {
-      props.setNotice({ kind: 'bad', text: cause instanceof Error ? cause.message : String(cause) })
-    }
-  })
-
-  const kindLabel = (kind: SkillRuleRow['kind']): string => (kind === 'project' ? 'Project' : kind === 'absolute' ? 'Absolute' : 'Workspace')
-  const rowLabel = (rule: SkillRuleRow): string => (rule.kind === 'workspace' ? 'Workspace skills' : rule.path ?? rule.id)
-  const rowHint = (rule: SkillRuleRow): string =>
-    rule.kind === 'workspace'
-      ? "The workspace's own skill folder — path is fixed."
-      : rule.kind === 'project'
-        ? "Relative to the bound project's folder."
-        : 'Absolute folder on this host.'
-
-  const move = (index: number, delta: -1 | 1): void => {
-    const next = [...props.rules]
-    const [row] = next.splice(index, 1)
-    if (row === undefined) return
-    next.splice(index + delta, 0, row)
-    void persist(next)
-  }
-
-  return (
-    <div className="space-y-2">
-      <ItemList label="Source folders">
-        {props.rules.map((rule, index) => (
-          <ItemRow
-            key={rule.id}
-            title={(
-              <>
-                <Badge tone={rule.kind === 'project' ? 'green' : rule.kind === 'absolute' ? 'gray' : 'blue'}>{kindLabel(rule.kind)}</Badge>
-                <span className="break-all font-mono text-[13px]">{rowLabel(rule)}</span>
-              </>
-            )}
-            meta={rowHint(rule)}
-            actions={(
-              <>
-                <InlineSwitch
-                  label="Enabled"
-                  ariaLabel={`Enable ${rowLabel(rule)}`}
-                  checked={rule.enabled}
-                  disabled={busy !== null}
-                  onChange={() => void persist(props.rules.map((candidate) => (candidate.id === rule.id ? { ...candidate, enabled: !candidate.enabled } : candidate)))}
-                />
-                <RowMenu
-                  label={`More actions for ${rowLabel(rule)}`}
-                  disabled={busy !== null}
-                  actions={[
-                    { label: 'Move up', icon: 'arrowUp', disabled: index === 0, onSelect: () => move(index, -1) },
-                    { label: 'Move down', icon: 'arrowDown', disabled: index === props.rules.length - 1, onSelect: () => move(index, 1) },
-                    ...(rule.kind !== 'workspace'
-                      ? [{ label: 'Remove folder', icon: 'trash' as const, danger: true, onSelect: () => setRemoving(rule.id) }]
-                      : []),
-                  ]}
-                />
-              </>
-            )}
-          >
-            {removing === rule.id ? (
-              <InlineConfirm
-                message={`Stop loading skills from ${rowLabel(rule)}? Files stay on disk.`}
-                confirmLabel="Remove folder"
-                busy={busy !== null}
-                onConfirm={() => { setRemoving(null); void persist(props.rules.filter((candidate) => candidate.id !== rule.id)) }}
-                onCancel={() => setRemoving(null)}
-              />
-            ) : null}
-          </ItemRow>
-        ))}
-      </ItemList>
-      <div className="flex flex-wrap items-center gap-2 rounded-xl border border-dashed border-line p-3">
-        <div className="w-[150px] shrink-0">
-          <Select
-            label="New rule kind"
-            triggerClassName="h-8 px-2.5 text-[13px]"
-            value={newKind}
-            onChange={(value) => setNewKind(value as 'project' | 'absolute')}
-            options={[
-              { value: 'project', label: 'Project folder' },
-              { value: 'absolute', label: 'Absolute path' },
-            ]}
-          />
-        </div>
-        <div className="min-w-[200px] flex-1">
-          <TextInput className="h-8" mono aria-label="New rule path" value={newPath} placeholder={newKind === 'project' ? 'Relative, e.g. .team/skills' : 'Absolute, e.g. D:/shared-skills'} onChange={(e) => setNewPath(e.target.value)} />
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={busy !== null || newPath.trim() === ''}
-          onClick={() => {
-            const path = newPath.trim()
-            if (path === '') return
-            void persist([...props.rules, { id: `rule-${Math.random().toString(36).slice(2, 8)}`, kind: newKind, path, enabled: true }])
-            setNewPath('')
-          }}
-        >
-          <Icon name="plus" size={13} />Add rule
-        </Button>
-      </div>
-      <p className="text-xs text-fg-faint">New rules join at the end — the lowest precedence; raise one with the up arrow. List order is precedence: the first folder holding a skill name wins. Absolute folders are protected from file-tool grants.</p>
-    </div>
-  )
-}

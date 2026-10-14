@@ -283,7 +283,7 @@ function ResponseTab({ turn, step, trace, calls }: {
       ) : null}
       {calls.length > 0 ? (
         <ul aria-label="Tool calls" className="m-0 flex list-none flex-col gap-0.5 p-0">
-          {calls.map((call) => <li key={call.id}><ToolCard item={toolItem(call)} /></li>)}
+          {calls.map((call) => <li key={call.id}><ToolCard item={toolItem(call)} withDuration /></li>)}
         </ul>
       ) : null}
     </div>

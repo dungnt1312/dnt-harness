@@ -269,6 +269,11 @@ export type SessionSort = 'recent' | 'oldest' | 'title'
 export interface SessionListing {
   readonly createdAt?: number
   readonly updatedAt?: number
+  /**
+   * When the user last typed into the conversation. Orders the sidebar and
+   * feeds its age column; `updatedAt` also moves while an agent streams.
+   */
+  readonly lastUserActivityAt?: number
   readonly id: string
   readonly title: string
   readonly eventCount: number
@@ -542,7 +547,7 @@ export interface McpServerRow {
   readonly name: string
   readonly transport: 'stdio' | 'http'
   readonly enabled: boolean
-  readonly status: 'connecting' | 'ready' | 'failed' | 'disabled'
+  readonly status: 'connecting' | 'ready' | 'failed' | 'disabled' | 'idle'
   readonly breakerOpenUntil: number | null
   /** Host containment wording. This is not a sandbox claim. */
   readonly containment?: string
@@ -688,6 +693,34 @@ export interface SkillRuleRow {
   readonly kind: 'project' | 'workspace' | 'absolute'
   readonly path?: string
   readonly enabled: boolean
+}
+
+/** The resource kinds whose folder layers Settings → Sources controls. */
+export type ResourceKindRow = 'skills' | 'agents' | 'hooks' | 'commands'
+
+/** The workspace's `resource-sources.json`: skill rules plus the fixed layers switched off per kind. */
+export interface ResourceSourcesDoc {
+  readonly v: 1
+  readonly skills: { readonly rules: readonly SkillRuleRow[] }
+  readonly disabled: Readonly<Record<ResourceKindRow, readonly string[]>>
+}
+
+/** One switchable layer and where it reads from (host-described). */
+export interface SourceLayerRow {
+  readonly id: string
+  readonly label: string
+  readonly path: string
+  /** False when this host has no such layer (e.g. no `~/.claude` configured). */
+  readonly available: boolean
+}
+
+/** `GET/PUT /api/workspaces/:wid/sources`. */
+export interface WorkspaceSourcesRow {
+  readonly doc: ResourceSourcesDoc
+  readonly hash: string
+  /** The stored file is unusable; `doc` is then the fail-closed policy the server applies. */
+  readonly error?: string
+  readonly layers: Readonly<Record<ResourceKindRow, readonly SourceLayerRow[]>>
 }
 
 /** One file inside a skill folder (SKILL.md plus resource files). */

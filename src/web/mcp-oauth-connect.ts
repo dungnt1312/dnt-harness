@@ -84,7 +84,7 @@ export interface BeginConnectResult {
 }
 
 /**
- * Discover, resolve the client, save the record, and start the grant.
+ * Discover, resolve the client, and stage the record with the pending grant.
  * `extraScopes` comes from Reconnect; the stored missing scope and the
  * previous scopes are added so a reconnect never asks for less.
  */
@@ -141,8 +141,8 @@ export async function beginConnect(input: {
     ...(client.registration !== undefined ? { registration: client.registration } : {}),
     discoveredAt: Date.now(),
   }
-  await input.store.saveServerRecord(input.workspaceId, input.server, record)
   const started = await input.oauth.begin({
+    serverRecord: record,
     workspaceId: input.workspaceId,
     server: input.server,
     principalId: input.principalId,
@@ -153,8 +153,14 @@ export async function beginConnect(input: {
     redirectUri,
     scopes,
     tokenEndpointAuth: client.tokenEndpointAuth,
+    configIdentity: oauthConfigIdentity(input.config)!, // managedAuthOf was validated above
   })
   return { ...started, redirectMode }
+}
+
+export function oauthConfigIdentity(server: McpServerConfig | undefined): string | undefined {
+  if (managedAuthOf(server) === undefined) return undefined
+  return JSON.stringify({ url: server?.url, auth: server?.auth })
 }
 
 function splitScopes(value: string | undefined): string[] {
@@ -182,7 +188,7 @@ export async function oauthRowState(oauth: ManagedOAuth, store: OAuthStore, work
     store.readServerRecord(workspaceId, server.name),
     oauth.tokenState(workspaceId, server.name),
   ])
-  if (record === undefined || record.serverUrl !== server.url || tokens === undefined || tokens.phase === 'local_revoked') {
+  if (record === undefined || record.serverUrl !== server.url || tokens === undefined || tokens.resource !== record.resource || tokens.phase === 'local_revoked') {
     return { state: 'not_connected' }
   }
   const clientSource = auth.clientId !== undefined ? 'manual' as const : 'registered' as const
@@ -195,8 +201,14 @@ export async function oauthRowState(oauth: ManagedOAuth, store: OAuthStore, work
 /** Whether the stored grant may be used for this server's current URL. */
 export async function grantMatchesServer(store: OAuthStore, workspaceId: string, server: McpServerConfig): Promise<boolean> {
   const record = await store.readServerRecord(workspaceId, server.name)
-  // Grants from before records existed (fixture profile) have no record and stay usable.
-  return record === undefined || record.serverUrl === server.url
+  // Only explicitly seeded legacy fixture tokens bypass the record requirement.
+  if (record === undefined) {
+    const tokens = await store.readTokens(workspaceId, server.name)
+    return tokens !== undefined && tokens.resource === server.url && await store.isLegacyFixtureGrant(workspaceId, server.name)
+  }
+  if (record.serverUrl !== server.url) return false
+  const tokens = await store.readTokens(workspaceId, server.name)
+  return tokens !== undefined && tokens.resource === record.resource
 }
 
 function escapeHtml(text: string): string {

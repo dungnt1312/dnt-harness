@@ -330,6 +330,60 @@ describe('Claude Code plugins over the web host', () => {
     expect(await readServers()).toEqual(['plugin_broken_good'])
   })
 
+  it('reports generated MCP name collisions instead of keeping the last draft', async () => {
+    const s = await start()
+    const market = await marketplace()
+    await write(path.join(market, 'plugins', 'toolkit', '.mcp.json'), json({ mcpServers: {
+      docs: { type: 'http', url: 'https://first.example/mcp' },
+      'docs.': { type: 'http', url: 'https://second.example/mcp' },
+    } }))
+    await post(s.base, '/api/plugins/marketplaces', { source: market })
+    const answer = await (await post(s.base, `/api/workspaces/${s.wsId}/plugins/toolkit@local-market/install`, {})).json() as { notes?: string[] }
+    expect(answer.notes?.some((note) => note.includes('collision') && note.includes('plugin_toolkit_docs'))).toBe(true)
+    const rows = await (await fetch(`${s.base}/api/workspaces/${s.wsId}/mcp`)).json() as { name: string }[]
+    expect(rows.some((row) => row.name === 'plugin_toolkit_docs')).toBe(false)
+  })
+
+  it('a colliding plugin cannot overwrite another plugin owner after normalization', async () => {
+    const s = await start()
+    const market = await marketplace()
+    await write(path.join(market, '.claude-plugin', 'marketplace.json'), json({
+      name: 'local-market', plugins: [
+        { name: 'toolkit', source: './plugins/toolkit' },
+        { name: 'toolkit_', source: './plugins/other' },
+      ],
+    }))
+    await write(path.join(market, 'plugins', 'other', '.claude-plugin', 'plugin.json'), json({ name: 'toolkit_', version: '1.0.0' }))
+    await write(path.join(market, 'plugins', 'other', '.mcp.json'), json({ mcpServers: { docs: { type: 'http', url: 'https://other.example/mcp' } } }))
+    await post(s.base, '/api/plugins/marketplaces', { source: market })
+    await post(s.base, `/api/workspaces/${s.wsId}/plugins/toolkit@local-market/install`, {})
+    // The first plugin is removed from desired state, but the old entry still
+    // belongs to it when the replacement draft is examined in this write.
+    await write(path.join(s.home, 'workspaces', s.wsId, 'settings.json'), json({ enabledPlugins: { 'toolkit@local-market': false } }))
+    const answer = await (await post(s.base, `/api/workspaces/${s.wsId}/plugins/toolkit_@local-market/install`, {})).json() as { notes?: string[] }
+    expect(answer.notes?.some((note) => note.includes('owned by') && note.includes('toolkit@local-market'))).toBe(true)
+    const stored = JSON.parse(await fs.readFile(path.join(s.home, 'workspaces', s.wsId, 'mcp.json'), 'utf8')) as { servers: Record<string, { provenance: { plugin: string } }> }
+    expect(stored.servers['plugin_toolkit_docs']).toBeUndefined()
+  })
+
+  it('a removed and re-enabled plugin MCP server reconnects on the next turn', async () => {
+    const s = await start()
+    const market = await marketplace()
+    const fixture = path.resolve('tests/fixtures/mcp-stdio-server.mjs')
+    await write(path.join(market, 'plugins', 'toolkit', '.mcp.json'), json({ mcpServers: {
+      docs: { command: process.execPath, args: [fixture] },
+    } }))
+    await post(s.base, '/api/plugins/marketplaces', { source: market })
+    const route = `/api/workspaces/${s.wsId}/plugins/toolkit@local-market`
+    await post(s.base, `${route}/install`, {})
+    await post(s.base, `${route}/disable`, {})
+    await post(s.base, `${route}/enable`, {})
+    const { id } = await (await post(s.base, `/api/workspaces/${s.wsId}/sessions`)).json() as { id: string }
+    await post(s.base, `/api/workspaces/${s.wsId}/sessions/${id}/messages`, { content: 'hello' })
+    await turnEnd(s.home, s.wsId, id)
+    expect(s.requests.at(-1)?.tools?.some((tool) => tool.name === 'mcp__plugin_toolkit_docs__query')).toBe(true)
+  })
+
   it('reloads plugin components when hooks.json or .mcp.json change on disk', async () => {
     const s = await start()
     const market = await marketplace()

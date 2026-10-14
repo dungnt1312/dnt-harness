@@ -26,7 +26,7 @@ import {
   modelVision,
 } from '../../lib/model-info.ts'
 import { ModelSettingsDialog, SyncModelsDialog } from './model-dialogs.tsx'
-import { AgentsPanel, HooksPanel, McpPanel, MemoryPanel, PluginsPanel, SecretsPanel, SkillsPanel } from './ManagementPanels.tsx'
+import { AgentsPanel, HooksPanel, McpPanel, MemoryPanel, PluginsPanel, SecretsPanel, SkillsPanel, SourcesPanel } from './ManagementPanels.tsx'
 import { PermissionsPanel, type PermissionsSubTab } from './PermissionsPanel.tsx'
 import { UnsavedChangesContext, type UnsavedChangesApi } from './unsaved-changes.tsx'
 import { SubTabs } from './settings-kit.tsx'
@@ -40,7 +40,7 @@ import { modelOptions } from '../../lib/providers.ts'
 import type { ModelSettings, ProjectRow, ProviderSummary } from '../../lib/types.ts'
 
 /** Settings are grouped per concern; providers keep their own full editor. */
-type SettingsTab = 'providers' | 'usage' | 'projects' | 'permissions' | 'prompts' | 'skills' | 'plugins' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'
+type SettingsTab = 'providers' | 'usage' | 'projects' | 'permissions' | 'prompts' | 'sources' | 'skills' | 'plugins' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets'
 
 const LEGACY_TAB_REDIRECT: Readonly<Record<string, SettingsTab>> = {
   modes: 'permissions',
@@ -104,6 +104,7 @@ const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonl
   { id: 'projects', label: 'Projects', hint: 'Folders conversations in this workspace can work in', icon: 'folder' },
   { id: 'permissions', label: 'Permissions', hint: 'Modes & dangerous command guard', icon: 'shield' },
   { id: 'prompts', label: 'System Prompts', hint: 'Replace the fixed base & subagent prompts for this workspace', icon: 'fileText' },
+  { id: 'sources', label: 'Sources', hint: 'Which folder layers skills, agents, hooks and commands load from', icon: 'folder' },
   { id: 'skills', label: 'Skills', hint: 'SKILL.md instruction packages', icon: 'zap' },
   { id: 'plugins', label: 'Plugins', hint: 'Claude Code plugins and marketplaces', icon: 'layers' },
   { id: 'memory', label: 'Memory', hint: 'Notes the model recalls in this workspace', icon: 'lightbulb' },
@@ -116,7 +117,7 @@ const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonl
 /** Nav groups: global settings first, then the active workspace's. */
 const TAB_GROUPS: readonly { readonly label: string; readonly ids: readonly SettingsTab[] }[] = [
   { label: 'Global', ids: ['providers', 'usage'] },
-  { label: 'Workspace', ids: ['projects', 'permissions', 'prompts', 'skills', 'plugins', 'memory', 'agents', 'mcp', 'hooks', 'secrets'] },
+  { label: 'Workspace', ids: ['projects', 'permissions', 'prompts', 'sources', 'skills', 'plugins', 'memory', 'agents', 'mcp', 'hooks', 'secrets'] },
 ]
 
 interface Draft {
@@ -631,7 +632,8 @@ export function SettingsModal({
                 {tab === 'projects' ? <ProjectsPanel workspaceId={workspaceId} projects={projects} onChanged={onProjectsChanged} sessionCounts={sessionCounts} /> : null}
                 {tab === 'permissions' ? <PermissionsPanel workspaceId={workspaceId} onChanged={onRefresh} initialSub={permissionsSubOf(initialTab)} /> : null}
                 {tab === 'prompts' ? <SystemPromptsPanel workspaceId={workspaceId} /> : null}
-                {tab === 'skills' ? <SkillsPanel workspaceId={workspaceId} onChanged={onSkillsChanged} /> : null}
+                {tab === 'sources' ? <SourcesPanel workspaceId={workspaceId} onChanged={onSkillsChanged} /> : null}
+                {tab === 'skills' ? <SkillsPanel workspaceId={workspaceId} onChanged={onSkillsChanged} onOpenSources={() => setTab('sources')} /> : null}
                 {tab === 'memory' ? <MemoryPanel workspaceId={workspaceId} projects={projects} /> : null}
                 {tab === 'agents' ? <AgentsPanel workspaceId={workspaceId} projectId={activeProjectId} modelOptions={roleModelOptions} /> : null}
                 {tab === 'mcp' ? <McpPanel workspaceId={workspaceId} /> : null}

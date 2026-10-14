@@ -369,8 +369,18 @@ describe('skills + memory units', () => {
     const saved = await skills.setSources(ws, { rules: [{ id: 'claude', kind: 'project', path: '.claude/skills', enabled: true }] })
     expect(saved).toHaveLength(1)
     expect((await skills.sources(ws)).map((rule) => rule.id)).toEqual(['claude'])
+    // Once the shared document exists it is the source of truth: a broken
+    // copy keeps the last valid rules applying (it never re-enables defaults)…
+    await fs.writeFile(path.join(home, 'workspaces', ws as string, 'resource-sources.json'), '{broken', 'utf8')
+    expect((await skills.sources(ws)).map((rule) => rule.id)).toEqual(['claude'])
+    expect((await skills.sourcesStore.read(ws)).error).toMatch(/unusable/)
+    // …and with no valid copy at all (fresh process) every rule fails closed.
+    const cold = new SkillsService(home, undefined, 'C:/Users/x/.claude/skills')
+    expect((await cold.sources(ws)).every((rule) => !rule.enabled)).toBe(true)
+    // A broken LEGACY file (no shared document yet) still degrades to the defaults.
+    await fs.rm(path.join(home, 'workspaces', ws as string, 'resource-sources.json'))
     await fs.writeFile(path.join(home, 'workspaces', ws as string, 'skills', 'sources.json'), '{broken', 'utf8')
-    expect((await skills.sources(ws)).map((rule) => rule.id)).toEqual(['project-claude', 'project-agents', 'workspace', 'user'])
+    expect((await new SkillsService(home, undefined, 'C:/Users/x/.claude/skills').sources(ws)).map((rule) => rule.id)).toEqual(['project-claude', 'project-agents', 'workspace', 'user'])
 
     // The legacy workspace-only signatures still work (default layers).
     expect(await skills.list(ws)).toEqual([])

@@ -99,6 +99,21 @@ export function validateServerName(name: string): void {
   }
 }
 
+/**
+ * Stricter than {@link validateServerName}, for names being WRITTEN (save,
+ * import, plugin sync). `mcp__<server>__<tool>` is split on `__`, so a server
+ * containing it, or an underscore at either end, lets two different
+ * (server, tool) pairs share one public name (`a` + `_b` and `a_` + `b` are
+ * both `mcp__a___b`). Reading stays lenient: a config written before this rule
+ * must still load.
+ */
+export function validateNewServerName(name: string): void {
+  validateServerName(name)
+  if (name.includes('__') || name.startsWith('_') || name.endsWith('_')) {
+    throw new McpConfigError('bad-name', `server name '${name}' must not contain '__' or start or end with '_'`)
+  }
+}
+
 /** v1 stays on {@link parseMcpConfig}. v2 is the migrated envelope. */
 export async function readMcpDocument(raw: string): Promise<McpConfig> {
   let version: unknown

@@ -110,7 +110,8 @@ import {
 import { ScopeError, WorkspaceService, type AdditionalDirectory, type ProjectRecord, type WorkspaceRecord } from '../harness/workspace/service.ts'
 import { ModesService, ModeError, DEFAULT_MODE_ID, BUNDLED_MODES, type ResolvedMode } from '../harness/modes/service.ts'
 import { migrateRootModes } from '../harness/modes/root-migration.ts'
-import { AgentDefinitionService, AgentDefinitionError, serializeAgentDefinition } from '../harness/agents/definition-service.ts'
+import { AgentDefinitionService, AgentDefinitionError, serializeAgentDefinition, type AgentSource } from '../harness/agents/definition-service.ts'
+import { narrowCeiling, roleCandidates } from '../harness/agents/mcp-candidates.ts'
 import {
   McpConfigStore,
   McpConfigError,
@@ -135,7 +136,7 @@ import { MutationStore, readFileIfPresent } from '../harness/mcp/mutation-store.
 import { recoverMigrations } from '../harness/mcp/migration.ts'
 import { DataHomeLock } from '../harness/mcp/ownership-lock.ts'
 import { ManagedOAuth } from '../harness/mcp/oauth.ts'
-import { beginConnect, callbackPage, grantMatchesServer, managedAuthOf, OAuthConnectError, oauthRowState, parseOAuthOrigins } from './mcp-oauth-connect.ts'
+import { beginConnect, callbackPage, grantMatchesServer, managedAuthOf, OAuthConnectError, oauthConfigIdentity, oauthRowState, parseOAuthOrigins } from './mcp-oauth-connect.ts'
 import { OAuthStore } from '../harness/mcp/oauth-store.ts'
 import { containmentCapability, resolveCanonicalExecutable } from '../harness/mcp/process-controller.ts'
 import { stageMcpOutcome } from '../harness/mcp/staged-outcome.ts'
@@ -151,6 +152,7 @@ import { agentTool, ChildModelError, describeRoleModel, formatChildReports, proj
 import { importCodexDefinition } from '../harness/agents/compatibility/claude.ts'
 import { SkillsService, SkillError } from '../harness/skills/service.ts'
 import { protectedRootsForRules, resolveSkillLayers, type SkillLayer } from '../harness/skills/layers.ts'
+import { ResourceSourcesError, describeSourceLayers, validateSourcesInput } from '../harness/sources/resource-sources.ts'
 import { MemoryService, MemoryError } from '../harness/memory/service.ts'
 import { memoryGuidance, memoryGuidanceAccess, memoryIndexes } from '../harness/memory/context.ts'
 import { todoWriteTool } from '../harness/tools/todo.ts'
@@ -717,6 +719,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     ...(options.userClaudeDir !== undefined ? { userClaudeDir: options.userClaudeDir } : {}),
     projectRootOf,
     ...(options.home !== undefined ? { pluginLayers: (workspaceId: string, projectId: string | undefined) => plugins.agentLayers(pluginContext(workspaceId, projectId)) } : {}),
+    disabledLayers: (workspaceId: string) => skills.sourcesStore.disabled(workspaceId, 'agents'),
   })
   const childExecutor = new ChildExecutor(kernel.ctx, (root) => {
     const entry = sessions.get(root)
@@ -735,6 +738,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     ...(options.userClaudeDir !== undefined ? { userClaudeDir: options.userClaudeDir } : {}),
     projectRootOf,
     ...(options.home !== undefined ? { pluginLayers: (workspaceId: string, projectId: string | undefined) => plugins.commandLayers(pluginContext(workspaceId, projectId)) } : {}),
+    disabledLayers: (workspaceId: string) => skills.sourcesStore.disabled(workspaceId, 'commands'),
   })
   // What the running turn's slash command granted (allowed-tools, model).
   const turnCommandGrants = new TurnCommandGrants()
@@ -758,6 +762,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     home: resourceHome,
     userClaudeDir: options.userClaudeDir,
     background: backgroundHooks,
+    disabledLayers: (workspaceId) => skills.sourcesStore.disabled(workspaceId, 'hooks'),
     ...(options.home !== undefined ? { pluginHooks: (workspaceId: string, projectId: string | undefined) => plugins.hookSources(pluginContext(workspaceId, projectId)) } : {}),
     projectRootOf: (workspaceId, projectId) => {
       if (projectId === undefined) return undefined
@@ -805,7 +810,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     const ref = managedAuthOf(config.servers[serverName])?.clientSecret
     if (ref === undefined) return undefined
     return resolveSecretRefs(ref, await mcpStore.loadSecrets(workspaceId), `mcp.json server '${serverName}' auth.clientSecret`)
-  })
+  }, async (workspaceId, serverName) => oauthConfigIdentity((await mcpStore.loadMcp(workspaceId)).servers[serverName]))
   const sessionPrincipals = new Map<string, string>()
   const mcpClients = new Map<string, McpServerClient>() // `${wsId}:${server}`
   const mcpClientGeneration = new Map<string, number>()
@@ -2121,7 +2126,7 @@ ${entry.description}`.toLowerCase().includes(query))
         return { ...alias, valid: true }
       } catch (error) { return { ...alias, valid: false, error: String(error instanceof Error ? error.message : error) } }
     }),
-    admissionResolver: ({ parentSessionId, workspaceId, definition, candidates }) => admissionExposureCeiling(parentSessionId, workspaceId, definition, candidates),
+    admissionResolver: ({ parentSessionId, workspaceId, definition, definitionSource, candidates }) => admissionExposureCeiling(parentSessionId, workspaceId, definition, candidates, definitionSource),
     grantsOf: (parentSessionId) => {
       const entry = sessions.get(parentSessionId)
       return entry === undefined ? [] : effectiveGrants(parentSessionId, entry.projectId, entry.workspaceId)
@@ -2165,7 +2170,13 @@ ${entry.description}`.toLowerCase().includes(query))
       }
     }
     const removed: string[] = []
-    const wanted = new Map(drafts.filter((draft) => draft.body['transport'] !== 'stdio' || pins.has(draft.name)).map((draft) => [draft.name, draft]))
+    // Normalization is compatible with existing names, but is not injective.
+    // Never silently choose the last of two colliding plugin server drafts.
+    const counts = new Map<string, number>()
+    for (const draft of drafts) counts.set(draft.name, (counts.get(draft.name) ?? 0) + 1)
+    const collisions = new Set([...counts].filter(([, count]) => count > 1).map(([name]) => name))
+    for (const name of collisions) problems.push(`${name}: generated MCP name collision; all conflicting servers are skipped`)
+    const wanted = new Map(drafts.filter((draft) => !collisions.has(draft.name) && (draft.body['transport'] !== 'stdio' || pins.has(draft.name))).map((draft) => [draft.name, draft]))
     let changed = false
     await updateMcpConfig(workspaceId, (current) => {
       let next = current
@@ -2182,14 +2193,40 @@ ${entry.description}`.toLowerCase().includes(query))
           problems.push(`${name}: a server you added has this name; the plugin's server is skipped`)
           continue
         }
+        const provenance = draft.body['provenance'] as { plugin?: string } | undefined
+        if (existing !== undefined && existing.provenance?.plugin !== provenance?.plugin) {
+          problems.push(`${name}: owned by '${existing.provenance?.plugin}'; the colliding plugin's server is skipped`)
+          // The owner is no longer the requested plugin. Neither leave its
+          // connection running nor silently transfer ownership to the new one.
+          next = withoutServer(next, name)
+          removed.push(name)
+          changed = true
+          continue
+        }
         const { enabled: _e, executable: _x, name: _n, ...previous } = (existing ?? {}) as unknown as Record<string, unknown>
         void _e; void _x; void _n
-        if (existing !== undefined && JSON.stringify(previous) === JSON.stringify(draft.body) && existing.enabled
-          && JSON.stringify(existing.executable) === JSON.stringify(pins.get(name))) continue
+        const sameBody = existing !== undefined && JSON.stringify(previous) === JSON.stringify(draft.body)
+        if (sameBody && existing.enabled && JSON.stringify(existing.executable) === JSON.stringify(pins.get(name))) continue
+        // A server the user switched off stays off: enabling the PLUGIN authorized
+        // it once, and the user's later Disable is a newer decision. Only a changed
+        // definition is written through, still disabled; Enable re-authorizes it.
+        if (existing !== undefined && !existing.enabled) {
+          if (sameBody) continue
+          try {
+            next = upsertServer(next, name, draft.body)
+            changed = true
+          } catch (error) {
+            problems.push(`${name}: ${String(error instanceof Error ? error.message : error)}`)
+          }
+          continue
+        }
         // One invalid plugin server is skipped and reported; it never blocks
         // the removals or the other plugins' servers in the same reconcile.
         try {
           next = withServerActivated(upsertServer(next, name, draft.body), name, pins.get(name))
+          // This is a fresh activation, not the user's Disable of an existing
+          // server. Clear its old removal marker before yielding the write turn.
+          mcpCancelled.delete(`${workspaceId}:${name}`)
           changed = true
         } catch (error) {
           problems.push(`${name}: ${String(error instanceof Error ? error.message : error)}`)
@@ -2251,15 +2288,37 @@ ${entry.description}`.toLowerCase().includes(query))
     }
   }
 
+  /** Remember why a server could not start, for Settings and the pre-step backoff. */
+  function recordMcpConnectFailure(workspaceId: string, serverName: string, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error)
+    mcpConnectFailures.set(`${workspaceId}:${serverName}`, { at: Date.now(), message: message.slice(0, 500) })
+  }
+
+  /** Drop every model-visible tool schema of one server (`serverName` omitted: of the whole workspace). */
+  function dropMcpDescriptors(workspaceId: string, serverName?: string): void {
+    const prefix = serverName === undefined ? `${workspaceId}:mcp__` : `${workspaceId}:mcp__${serverName}__`
+    for (const key of [...mcpDescriptors.keys()]) {
+      if (key.startsWith(prefix)) mcpDescriptors.delete(key)
+    }
+  }
+
+  /**
+   * A fence retires the runtime built from the old config. It works through
+   * the generation counter alone: a connect that started before the fence sees
+   * the new generation before it publishes and discards itself. It must NOT
+   * touch `mcpCancelled` — that set means "disabled, deleted or closing", and
+   * a fence-cancelled server would otherwise stay refused until someone pressed
+   * Enable.
+   */
   async function fenceWorkspace(workspaceId: WorkspaceId): Promise<void> {
     mcpGeneration.set(workspaceId, generationOf(workspaceId) + 1)
-    for (const key of mcpConnecting.keys()) {
-      if (key.startsWith(`${workspaceId}:`)) mcpCancelled.add(key)
-    }
     // A config or secret change may be the fix: try failed servers again now.
     for (const key of [...mcpConnectFailures.keys()]) {
       if (key.startsWith(`${workspaceId}:`)) mcpConnectFailures.delete(key)
     }
+    // The retired runtime's tools must not outlive it: if the server does not
+    // come back, the model must not keep being offered them.
+    dropMcpDescriptors(workspaceId)
     for (const [key, client] of [...mcpClients]) {
       if (!key.startsWith(`${workspaceId}:`)) continue
       client.retire()
@@ -2299,8 +2358,21 @@ ${entry.description}`.toLowerCase().includes(query))
   /** Apply `transform` to the CURRENT config; it may throw to refuse (stale revision, missing server). */
   function updateMcpConfig(workspaceId: WorkspaceId, transform: (current: McpConfig) => McpConfig): Promise<McpConfig> {
     return serializeMcpMutation(workspaceId, async () => {
-      const next = transform(await mcpStore.loadMcp(workspaceId))
-      await writeDesiredState(workspaceId, 'config', mcpStore.mcpPath(workspaceId), () => mcpStore.saveMcp(workspaceId, next))
+      const current = await mcpStore.loadMcp(workspaceId)
+      const next = transform(current)
+      // Serialize OAuth publication with config writes, never with the network exchange.
+      const changed = Object.keys(current.servers).filter((name) => oauthConfigIdentity(current.servers[name]) !== oauthConfigIdentity(next.servers[name]))
+      const save = async (index: number): Promise<void> => {
+        if (index === changed.length) {
+          await writeDesiredState(workspaceId, 'config', mcpStore.mcpPath(workspaceId), () => mcpStore.saveMcp(workspaceId, next))
+          return
+        }
+        await oauthStore.withPublicationLock(workspaceId, changed[index]!, async () => {
+          await save(index + 1)
+          await oauthStore.invalidate(workspaceId, changed[index]!)
+        })
+      }
+      await save(0)
       configWatch.set(workspaceId, await fileDigest(workspaceId))
       drifted.delete(workspaceId)
       return next
@@ -2447,7 +2519,10 @@ ${entry.description}`.toLowerCase().includes(query))
       void existing.disconnect()
       mcpClients.delete(key)
       mcpClientGeneration.delete(key)
-    } else if (existing !== undefined && existing.state !== 'disabled') return existing
+    } else if (existing !== undefined && existing.state !== 'disabled' && !mcpConnecting.has(key)) return existing
+    // The client is published before its first tools/list, so a caller arriving
+    // mid-connect would otherwise get a half-started client back and run its turn
+    // before the server's tools are registered. Join the connect instead.
     const inFlight = mcpConnecting.get(key)
     if (inFlight !== undefined) return inFlight
     if (mcpHostClosing || mcpCancelled.has(key)) throw new McpTransportError(`MCP server '${serverName}' connection is cancelled`)
@@ -2502,6 +2577,9 @@ ${entry.description}`.toLowerCase().includes(query))
           mcpClients.delete(key)
           mcpClientGeneration.delete(key)
         }
+        // A server that did not come up offers the model nothing: tools listed
+        // before the failure (or by an earlier runtime) must not stay callable.
+        dropMcpDescriptors(workspaceId, serverName)
         throw error
       } finally {
         mcpConnecting.delete(key)
@@ -2514,15 +2592,15 @@ ${entry.description}`.toLowerCase().includes(query))
   /** Register `mcp__server__tool` tools through the effect-disposed seam. */
   async function reconcileMcpTools(workspaceId: WorkspaceId, serverName: string, client: McpServerClient): Promise<void> {
     const config = await mcpStore.loadMcp(workspaceId)
+    // A client that has been replaced, fenced or removed (a late
+    // `tools/list_changed` refresh, a health check) must not write descriptors
+    // for a server that is no longer running under it.
+    if (mcpClients.get(`${workspaceId}:${serverName}`) !== client) return
     const serverConfig: McpServerConfig | undefined = config.servers[serverName]
     const allowed = serverConfig?.allowedTools
-    const currentFullNames = new Set(client.cachedTools().map((tool) => mcpToolName(serverName, tool.name)))
-    // Remove tools that disappeared from the latest tools/list snapshot.
-    for (const key of mcpDescriptors.keys()) {
-      if (!key.startsWith(`${workspaceId}:mcp__${serverName}__`)) continue
-      const fullName = key.slice(`${workspaceId}:`.length)
-      if (!currentFullNames.has(fullName)) mcpDescriptors.delete(key)
-    }
+    // Validate the whole snapshot before touching any state, so a bad tool in
+    // the middle cannot leave the first half of the list exposed.
+    const exposed: McpToolDescriptor[] = []
     const seenNames = new Set<string>()
     for (const tool of client.cachedTools()) {
       if (tool.name.trim() === '' || seenNames.has(tool.name)) {
@@ -2536,6 +2614,17 @@ ${entry.description}`.toLowerCase().includes(query))
       // Skip, never send: providers reject the whole request for one bad name.
       if (!PROVIDER_TOOL_NAME.test(fullName) || tool.name.includes('__')) continue
       if (!mcpToolExposed(allowed, tool.name, fullName)) continue
+      exposed.push(tool)
+    }
+    // Remove tools that disappeared from the latest tools/list snapshot.
+    const currentFullNames = new Set(client.cachedTools().map((tool) => mcpToolName(serverName, tool.name)))
+    for (const key of [...mcpDescriptors.keys()]) {
+      if (!key.startsWith(`${workspaceId}:mcp__${serverName}__`)) continue
+      const fullName = key.slice(`${workspaceId}:`.length)
+      if (!currentFullNames.has(fullName)) mcpDescriptors.delete(key)
+    }
+    for (const tool of exposed) {
+      const fullName = mcpToolName(serverName, tool.name)
       // Server annotation: interaction always asks via forceAsk; readOnlyHint
       // is display only and NEVER drives auto-allow. Do not write into the
       // workspace override map — that would fight Always-allow and persist.
@@ -2544,7 +2633,7 @@ ${entry.description}`.toLowerCase().includes(query))
       mcpRegistered.add(fullName)
       kernel.ctx.tools.register({
         name: fullName,
-        description: `[MCP:${serverName}] ${tool.description ?? tool.name}${tool.requiresUserInteraction === true ? ' (interactive — always asks)' : ''}`,
+        description: mcpToolDescription(serverName, tool),
         requiresRoot: false,
         parameters: tool.inputSchema as { type: 'object'; properties: Record<string, unknown> },
         schema: () => {
@@ -2553,7 +2642,7 @@ ${entry.description}`.toLowerCase().includes(query))
           const descriptor = mcpDescriptors.get(`${scope.workspaceId}:${fullName}`)
           if (descriptor === undefined) return undefined
           return {
-            description: `[MCP:${serverName}] ${descriptor.description ?? descriptor.name}`,
+            description: mcpToolDescription(serverName, descriptor),
             parameters: descriptor.inputSchema as { type: 'object'; properties: Record<string, unknown> },
           }
         },
@@ -2655,14 +2744,16 @@ ${entry.description}`.toLowerCase().includes(query))
       })
       .map(async (server) => {
         const key = `${workspaceId}:${server.name}`
+        const generationAtStart = generationOf(workspaceId)
         try {
           await ensureMcpServer(workspaceId, server.name)
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          // A disable/close that cancelled this connect is not a failure.
-          if (mcpHostClosing || mcpCancelled.has(key)) return
-          mcpConnectFailures.set(key, { at: Date.now(), message: message.slice(0, 500) })
-          console.warn(`web: MCP server '${server.name}' unavailable in ${workspaceId}; its tools are skipped this turn: ${message}`)
+          // A disable/close that cancelled this connect is not a failure, and
+          // neither is a connect a config/secret change fenced off: it is simply
+          // retried with the new settings by the next turn.
+          if (mcpHostClosing || mcpCancelled.has(key) || generationAtStart !== generationOf(workspaceId)) return
+          recordMcpConnectFailure(workspaceId, server.name, error)
+          console.warn(`web: MCP server '${server.name}' unavailable in ${workspaceId}; its tools are skipped this turn: ${error instanceof Error ? error.message : String(error)}`)
         }
       })
     await Promise.all(attempts)
@@ -2723,11 +2814,19 @@ ${entry.description}`.toLowerCase().includes(query))
       return { mode: mode.definition, revision }
     },
     loadMcp: (workspaceId) => mcpStore.loadMcp(workspaceId),
+    // Admission joins this workspace's MCP connect (bounded), like a root
+    // turn's pre-step: a child must not pin an empty MCP set because the
+    // servers were still starting. A failed or slow server's tools are left out.
+    connectMcp: (workspaceId) => connectWorkspaceMcp(workspaceId as WorkspaceId),
+    mcpToolNames: (workspaceId) => {
+      const prefix = `${workspaceId}:`
+      return [...mcpDescriptors.keys()].filter((key) => key.startsWith(prefix)).map((key) => key.slice(prefix.length))
+    },
   })
 
   /** Spawn admission ceiling; called by the executor at its admission linearization point. */
-  async function admissionExposureCeiling(rootSessionId: SessionId, workspaceId: WorkspaceId, definition: string, candidates: readonly string[]): Promise<readonly string[]> {
-    return executionAuthority.admissionCeiling({ workspaceId, rootSessionId, definition, candidates })
+  async function admissionExposureCeiling(rootSessionId: SessionId, workspaceId: WorkspaceId, definition: string, candidates: readonly string[], definitionSource?: AgentSource): Promise<readonly string[]> {
+    return executionAuthority.admissionCeiling({ workspaceId, rootSessionId, definition, ...(definitionSource !== undefined ? { definitionSource } : {}), candidates })
   }
 
   /**
@@ -3067,8 +3166,8 @@ ${entry.description}`.toLowerCase().includes(query))
 
     // Exposure-filtered schemas: static mode ceiling + G5 dynamic MCP
     // config/allowlist ceiling (zero-exposure modes none; Plan read-safe
-    // allowlist only; Explorer none; other children require explicit spawn
-    // grant).
+    // allowlist only; bundled Explorer none; children limited to their pinned
+    // ceiling).
     const exposureScope = { ...(scope ?? { sessionId: undefined }), workspaceId }
     let projectedTools = mcpDisabledForTurn(scope)
       ? (projected.tools ?? []).filter((schema) => !schema.name.startsWith('mcp__'))
@@ -3103,7 +3202,10 @@ ${entry.description}`.toLowerCase().includes(query))
     // `prefixSnapshots`): re-read only when the prefix moves anyway.
     const snapshot = ((): PrefixSnapshot | undefined => {
       if (scope === undefined) return undefined
-      const key = `${scope.projectId ?? ''}\u0000${compaction?.coversSeq ?? 0}`
+      // The Sources revision rides in the key: switching a layer on or off
+      // re-reads the catalog at the next request, never mid-request.
+      const sourcesRevision = scope.workspaceId !== undefined ? skills.sourcesStore.revision(scope.workspaceId) : 0
+      const key = `${scope.projectId ?? ''}\u0000${compaction?.coversSeq ?? 0}\u0000${sourcesRevision}`
       const current = prefixSnapshots.get(scope.sessionId)
       if (current !== undefined && current.key === key) return current
       const fresh: PrefixSnapshot = { key }
@@ -3708,12 +3810,10 @@ ${entry.description}`.toLowerCase().includes(query))
       throw error
     }
     const { definition } = resolved
-    // MCP tools need an explicit grant on a spawn; a role run has none, so it
-    // gets MCP tools only when the role names them itself.
-    const candidates = definition.tools
-    const exposed = new Set(await admissionExposureCeiling(rootId, workspaceId, definition.name, candidates))
-    const disallowed = new Set(definition.disallowedTools)
-    const toolCeiling = [...new Set(candidates)].filter((tool) => exposed.has(tool) && !disallowed.has(tool) && tool !== 'Agent')
+    // A role run has no spawn grant: its ceiling is admission ∩ role
+    // candidates − disallowed, the rule a spawn without a grant gets.
+    const exposed = await admissionExposureCeiling(rootId, workspaceId, definition.name, roleCandidates(definition, resolved.source), resolved.source)
+    const toolCeiling = narrowCeiling(exposed, undefined, definition.disallowedTools).filter((tool) => tool !== 'Agent')
     return {
       definition: definition.name,
       instructions: definition.instructions,
@@ -3919,6 +4019,8 @@ ${entry.description}`.toLowerCase().includes(query))
     pluginsEnabled: options.home !== undefined,
     ...(options.userSkillsDir !== undefined ? { userSkillsDir: options.userSkillsDir } : {}),
     ...(options.bundledSkillsDir !== undefined ? { bundledSkillsDir: options.bundledSkillsDir } : {}),
+    ...(options.userClaudeDir !== undefined ? { userClaudeDir: options.userClaudeDir } : {}),
+    ...(options.bundledCommandsDir !== undefined ? { bundledCommandsDir: options.bundledCommandsDir } : {}),
     refreshSkillProtectedRoots,
     addSkillProtectedRoots,
     memory,
@@ -3956,6 +4058,7 @@ ${entry.description}`.toLowerCase().includes(query))
     compactionPending: (sessionId) => compactions.has(sessionId),
     settleCompaction: async (sessionId) => { await compactions.get(sessionId)?.done?.catch(() => {}) },
     mcpStore,
+    recordMcpConnectFailure,
     mcpClients,
     mcpDescriptors,
     mcpConnecting,
@@ -4210,6 +4313,9 @@ interface HandlerDeps {
   readonly userSkillsDir?: string
   /** Read-only bundled skill layer, for protected-root refresh. */
   readonly bundledSkillsDir?: string
+  /** Claude user folder and bundled commands, only to describe layers in Settings → Sources. */
+  readonly userClaudeDir?: string
+  readonly bundledCommandsDir?: string
   /** Recompute grant-protected roots from every workspace's skill rules. */
   readonly refreshSkillProtectedRoots: () => Promise<void>
   /** Fail-closed fallback when a recompute fails: add roots, never drop any. */
@@ -4227,7 +4333,7 @@ interface HandlerDeps {
   readonly adoptMode: (workspaceId: WorkspaceId, modeId: string) => Promise<ResolvedMode>
   readonly stampRootMode: (session: Session, resolved: ResolvedMode) => Extract<SessionEvent, { type: 'session/mode' }>
   readonly rootModeOf: (scope: { readonly sessionId: SessionId; readonly rootSessionId?: SessionId }, workspaceId: WorkspaceId) => { mode: ResolvedMode; revision: number }
-  readonly admissionExposureCeiling: (rootSessionId: SessionId, workspaceId: WorkspaceId, definition: string, candidates: readonly string[]) => Promise<readonly string[]>
+  readonly admissionExposureCeiling: (rootSessionId: SessionId, workspaceId: WorkspaceId, definition: string, candidates: readonly string[], definitionSource?: AgentSource) => Promise<readonly string[]>
   /** Whether the root's latest durable turn is terminal; admission reads this because `agent.busy` lags the durable append. */
   readonly turnTerminal: (session: Session) => boolean
   readonly agentDefinitions: AgentDefinitionService
@@ -4265,6 +4371,8 @@ interface HandlerDeps {
   readonly compactionPending: (sessionId: SessionId) => boolean
   readonly settleCompaction: (sessionId: SessionId) => Promise<void>
   readonly mcpStore: McpConfigStore
+  /** Why a server could not start; Settings shows it and the pre-step backs off. */
+  readonly recordMcpConnectFailure: (workspaceId: string, serverName: string, error: unknown) => void
   readonly mcpClients: Map<string, McpServerClient>
   readonly mcpDescriptors: Map<string, McpToolDescriptor>
   readonly mcpConnecting: Map<string, Promise<McpServerClient>>
@@ -4371,8 +4479,11 @@ async function skillLayers(
   // name reaches one only when no plain layer has it. Bundled rides last:
   // every rule layer shadows it, and it stays scannable even under a custom
   // rule list (which never names it).
-  const plugins = await skills.pluginLayers(workspaceId, projectId).catch(() => [] as SkillLayer[])
-  const bundled = skills.bundledLayer()
+  // Plugin and bundled are fixed layers: the workspace's Sources policy can
+  // switch either off, and every surface resolves through this function.
+  const off = await skills.disabledLayers(workspaceId)
+  const plugins = off.has('plugin') ? [] : await skills.pluginLayers(workspaceId, projectId).catch(() => [] as SkillLayer[])
+  const bundled = off.has('bundled') ? undefined : skills.bundledLayer()
   // SkillService resolves first-hit wins. Keep all project/workspace rule
   // layers above plugins and every absolute/user layer below them:
   // project > workspace > plugin > user > bundled.
@@ -4407,7 +4518,7 @@ async function workspaceSaveWarnings(deps: Pick<HandlerDeps, 'skills' | 'workspa
   const warnings: string[] = []
   const rules = await deps.skills.sources(wsId)
   if (!rules.some((rule) => rule.kind === 'workspace' && rule.enabled)) {
-    warnings.push('The workspace skill folder is disabled in Source folders, so sessions will not see this skill.')
+    warnings.push('The workspace skill folder is disabled in Settings → Sources, so sessions will not see this skill.')
     return warnings
   }
   const owner = await deps.skills.ownerLayer(await skillLayers(deps.skills, deps.workspaces, wsId, undefined), name)
@@ -4653,9 +4764,14 @@ function mcpModelSchema(serverName: string, descriptor: McpToolDescriptor): { na
   if (!PROVIDER_TOOL_NAME.test(fullName)) return undefined
   return {
     name: fullName,
-    description: `[MCP:${serverName}] ${descriptor.description ?? descriptor.name}${descriptor.requiresUserInteraction === true ? ' (interactive — always asks)' : ''}`,
+    description: mcpToolDescription(serverName, descriptor),
     parameters: descriptor.inputSchema as { type: 'object'; properties: Record<string, unknown> },
   }
+}
+
+/** The one wording a model sees for an MCP tool: registration, live schema and the token estimate all use it. */
+function mcpToolDescription(serverName: string, descriptor: McpToolDescriptor): string {
+  return `[MCP:${serverName}] ${descriptor.description ?? descriptor.name}${descriptor.requiresUserInteraction === true ? ' (interactive — always asks)' : ''}`
 }
 
 /**
@@ -5108,7 +5224,7 @@ async function handleApi(
             parentSessionId: parent.session.id,
             definition: resolved.definition,
             ...(resolved.source !== undefined ? { definitionSource: resolved.source } : {}),
-            admissionResolver: ({ parentSessionId, workspaceId, definition, candidates }) => deps.admissionExposureCeiling(parentSessionId, workspaceId, definition, candidates),
+            admissionResolver: ({ parentSessionId, workspaceId, definition, definitionSource, candidates }) => deps.admissionExposureCeiling(parentSessionId, workspaceId, definition, candidates, definitionSource),
             packet: task,
             ...(inheritedContext !== undefined ? { inherit: 'brief' as const, inheritedContext } : {}),
             ...(parent.projectId !== undefined ? { projectId: parent.projectId } : {}),
@@ -5132,7 +5248,7 @@ async function handleApi(
           })
         } catch (error) {
           if (error instanceof SpawnError) {
-            send(error.code === 'capacity' ? 429 : error.code === 'packet' || error.code === 'inherit' ? 400 : 404, { error: error.message })
+            send(error.code === 'capacity' ? 429 : error.code === 'packet' || error.code === 'inherit' || error.code === 'mcp' ? 400 : 404, { error: error.message })
             return
           }
           if (error instanceof ChildModelError) {
@@ -5378,6 +5494,19 @@ async function handleApi(
           const state = pastedAddress !== undefined
             ? await deps.oauth.acceptCallbackUrl(pastedAddress, { workspaceId: wsId, server: serverName, principalId })
             : String(body['state'] ?? '')
+          // The sign-in was started for one URL. If the server has since been
+          // deleted, renamed or pointed elsewhere, finishing it would store a
+          // grant for the old URL under the new server's name.
+          const target = (await deps.mcpStore.loadMcp(wsId)).servers[serverName]
+          const pending = await deps.oauth.pendingServer(state)
+          if (target?.transport !== 'http' || target.url === undefined) {
+            send(400, { error: `server '${serverName}' no longer exists or is not an HTTP server; start Connect again` })
+            return
+          }
+          if (pending !== undefined && pending.serverUrl !== target.url) {
+            send(400, { error: `server '${serverName}' now points at a different URL than this sign-in was started for; start Connect again` })
+            return
+          }
           await deps.oauth.complete({
             state,
             principalId,
@@ -5389,7 +5518,10 @@ async function handleApi(
           if (current?.enabled === true) {
             await deps.cancelMcpConnection(wsId, serverName)
             deps.mcpCancelled.delete(`${wsId}:${serverName}`)
-            const client = await deps.ensureMcpServer(wsId, serverName).catch(() => undefined)
+            const client = await deps.ensureMcpServer(wsId, serverName).catch((error: unknown) => {
+              deps.recordMcpConnectFailure(wsId, serverName, error)
+              return undefined
+            })
             if (client === undefined) {
               send(200, { connected: true, status: 'failed' })
               return
@@ -5398,10 +5530,13 @@ async function handleApi(
           send(200, { connected: true })
           return
         }
-        await deps.fenceWorkspace(wsId)
+        // Only this server's connection used the grant: stop it, revoke, then let
+        // the next turn try again (it fails with auth_required, which Settings
+        // shows) instead of fencing every healthy server in the workspace.
+        await deps.cancelMcpConnection(wsId, serverName)
         const record = await deps.oauthStore.readServerRecord(wsId, serverName)
         const revoked = await deps.oauth.revoke(wsId, serverName, record?.revocationEndpoint)
-        await deps.cancelMcpConnection(wsId, serverName)
+        deps.mcpCancelled.delete(`${wsId}:${serverName}`)
         send(200, revoked)
       } catch (error) {
         if (error instanceof OAuthConnectError) {
@@ -5428,13 +5563,27 @@ async function handleApi(
         const imported = dialect === 'codex'
           ? importCodexMcp(content, typeof body['sourceVersion'] === 'string' ? body['sourceVersion'] : '')
           : importClaudeMcp(content)
+        let taken: string[] = []
         await deps.updateMcpConfig(wsId, (existing) => {
+          // An import adds servers. A name that already exists (possibly running,
+          // possibly owned by a plugin) would be silently re-pointed while staying
+          // enabled, so the whole import is refused and nothing is written.
+          taken = Object.keys(imported.servers).filter((name) => existing.servers[name] !== undefined)
+          if (taken.length > 0) throw new McpRevisionConflict()
           let merged = existing
           for (const [name, server] of Object.entries(imported.servers)) {
             merged = upsertServer(merged, name, { ...server, enabled: false })
           }
           return merged
+        }).catch((error: unknown) => {
+          if (error instanceof McpRevisionConflict && taken.length > 0) return undefined
+          throw error
+        }).then((saved) => {
+          if (saved === undefined) {
+            send(409, { error: `already configured: ${taken.join(', ')}; delete or rename them, or import only new servers` })
+          }
         })
+        if (taken.length > 0) return
         send(201, {
           imported: Object.keys(imported.servers),
           enabled: [],
@@ -5500,7 +5649,14 @@ async function handleApi(
               name: server.name,
               transport: server.transport,
               enabled: server.enabled,
-              status: !server.enabled ? 'disabled' : client?.state ?? (connectFailure !== undefined ? 'failed' : 'connecting'),
+              // `connecting` means a connect is actually in flight. An enabled
+              // server with no client, no failure and nothing connecting (a fence
+              // dropped it) is `idle`: the next turn starts it.
+              status: !server.enabled
+                ? 'disabled'
+                : client?.state ?? (connectFailure !== undefined
+                  ? 'failed'
+                  : deps.mcpConnecting.has(`${wsId}:${server.name}`) ? 'connecting' : 'idle'),
               ...(connectFailure !== undefined ? { lastError: connectFailure.message } : {}),
               ...(unusableTools.length > 0 ? { unusableTools } : {}),
               ...(stderr !== '' ? { stderrTail: stderr.slice(-2_000) } : {}),
@@ -5538,11 +5694,16 @@ async function handleApi(
             send(404, { error: `no MCP server '${serverName}'` })
             return
           }
+          const managed = config.servers[serverName]?.auth?.type === 'managed_oauth'
+          // Read the provider's revocation endpoint now: the record goes away with the server.
+          const revocationEndpoint = managed ? (await deps.oauthStore.readServerRecord(wsId, serverName))?.revocationEndpoint : undefined
           // Stop the process and drop its tool schemas before the config forgets it.
           await deps.cancelMcpConnection(wsId, serverName)
+          await deps.oauthStore.invalidate(wsId, serverName)
           await deps.updateMcpConfig(wsId, (current) => withoutServer(current, serverName))
-          // Revoke locally first so a racing refresh cannot write the grant back.
-          if (config.servers[serverName]?.auth?.type === 'managed_oauth') await deps.oauth.revoke(wsId, serverName)
+          // Revoke locally first so a racing refresh cannot write the grant back;
+          // the same call also asks the provider to void the token.
+          if (managed) await deps.oauth.revoke(wsId, serverName, revocationEndpoint)
           await deps.oauthStore.deleteServer(wsId, serverName)
           send(200, { deleted: serverName })
           return
@@ -5607,7 +5768,18 @@ async function handleApi(
               return
             }
           }
-          const expectedGeneration = deps.generationOf(wsId)
+          // Reconnect restarts a server whose executable was already authorized.
+          // A stdio server with no pin (imported, never enabled) must go through
+          // Enable, which is what authorizes the file; otherwise Reconnect would
+          // start it unpinned and a later edit of `command` would run unchecked.
+          if (action === 'reconnect' && serverConfig.transport === 'stdio' && serverConfig.executable === undefined) {
+            send(409, { error: `'${serverName}' has not been authorized to run; use Enable` })
+            return
+          }
+          // The conflict check is about THIS server: an unrelated save fences
+          // the workspace but must not fail an Enable of another server.
+          const configOfServer = (config: McpConfig): string => JSON.stringify(config.servers[serverName] ?? null)
+          const expectedServer = configOfServer(config)
           let committedGeneration: number
           if (action === 'enable') {
             // Activation authorizes the canonical file the command resolves to
@@ -5618,7 +5790,7 @@ async function handleApi(
               })
               : undefined
             const enabled = await deps.updateMcpConfig(wsId, (current) => {
-              if (deps.generationOf(wsId) !== expectedGeneration) throw new McpRevisionConflict()
+              if (configOfServer(current) !== expectedServer) throw new McpRevisionConflict()
               return withServerActivated(current, serverName, executable)
             }).catch((error: unknown) => error instanceof McpRevisionConflict ? undefined : Promise.reject(error))
             if (enabled === undefined) {
@@ -5629,7 +5801,7 @@ async function handleApi(
           } else {
             // Reconnect never re-authorizes: a changed executable stays refused.
             const reconnected = await deps.updateMcpConfig(wsId, (current) => {
-              if (deps.generationOf(wsId) !== expectedGeneration) throw new McpRevisionConflict()
+              if (configOfServer(current) !== expectedServer) throw new McpRevisionConflict()
               return withServerEnabled(current, serverName, true)
             }).catch((error: unknown) => error instanceof McpRevisionConflict ? undefined : Promise.reject(error))
             if (reconnected === undefined) {
@@ -5649,7 +5821,13 @@ async function handleApi(
           }
           deps.mcpCancelled.delete(`${wsId}:${serverName}`)
           // Fresh/singleton connect; ensureMcpServer lists + reconciles tools.
-          const client = await deps.ensureMcpServer(wsId, serverName)
+          // A failure is remembered so the row says why instead of "connecting".
+          const client = await deps.ensureMcpServer(wsId, serverName).catch((error: unknown) => {
+            if (deps.generationOf(wsId) === committedGeneration && !deps.mcpCancelled.has(`${wsId}:${serverName}`)) {
+              deps.recordMcpConnectFailure(wsId, serverName, error)
+            }
+            throw error
+          })
           send(200, { status: client.state })
           return
         }
@@ -6305,6 +6483,55 @@ async function handleApi(
       }
       return
     }
+    // Workspace Sources: which folder layers skills, agents, hooks and
+    // commands may be discovered from. One document, one hash: PUT replaces it
+    // whole and refuses a stale `expectedHash`.
+    const wsSources = /^\/api\/workspaces\/([^/]+)\/sources$/.exec(pathname)
+    if (wsSources !== null && (req.method === 'GET' || req.method === 'PUT')) {
+      const wsId = decodeURIComponent(wsSources[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, req.method === 'PUT')
+      const store = deps.skills.sourcesStore
+      const view = (state: Awaited<ReturnType<typeof store.read>>) => ({
+        doc: state.doc,
+        hash: state.hash,
+        ...(state.error !== undefined ? { error: state.error } : {}),
+        layers: describeSourceLayers({
+          workspaceDir: path.dirname(store.file(wsId)),
+          ...(deps.userClaudeDir !== undefined ? { userClaudeDir: deps.userClaudeDir } : {}),
+          ...(deps.bundledSkillsDir !== undefined ? { bundledSkillsDir: deps.bundledSkillsDir } : {}),
+          ...(deps.bundledCommandsDir !== undefined ? { bundledCommandsDir: deps.bundledCommandsDir } : {}),
+        }),
+      })
+      if (req.method === 'GET') {
+        send(200, view(await store.read(wsId)))
+        return
+      }
+      if (!browserPrincipal(req, deps, 'PUT')) {
+        send(401, { error: 'sources can only be changed from the browser session that owns the workspace' })
+        return
+      }
+      const body = await readJson(req)
+      try {
+        const saved = await store.write(wsId, validateSourcesInput(body['doc']), typeof body['expectedHash'] === 'string' ? body['expectedHash'] : undefined)
+        // Switches take effect at the next request/operation: hook snapshots
+        // are re-read, and the catalog snapshot key carries the revision.
+        deps.hookHost.invalidateWorkspace(wsId)
+        try {
+          await deps.refreshSkillProtectedRoots()
+        } catch {
+          deps.addSkillProtectedRoots(protectedRootsForRules(saved.doc.skills.rules))
+        }
+        send(200, view(saved))
+      } catch (error) {
+        if (error instanceof ResourceSourcesError) {
+          send(error.code === 'conflict' ? 409 : 400, { error: error.message })
+          return
+        }
+        fail(error)
+      }
+      return
+    }
+
     // Skill source rules (before /skills/:name, which has no room for the
     // extra segment). PUT also refreshes the grant-protected roots so the
     // absolute rule folders are never grantable to file tools.
@@ -9164,7 +9391,9 @@ function listSessions(workspaceId: WorkspaceId, deps: HandlerDeps, automationRun
       // straight from storage shows the same title it shows once loaded.
       title: summary.title ?? summary.derivedTitle ?? (entry !== undefined ? deriveTitle(entry.session.events) : null) ?? 'New conversation',
       // Empty summaries use a current-time fallback, not a durable fact.
-      ...(summary.eventCount > 0 ? { createdAt: summary.createdAt, updatedAt: summary.updatedAt } : {}),
+      ...(summary.eventCount > 0
+        ? { createdAt: summary.createdAt, updatedAt: summary.updatedAt, lastUserActivityAt: summary.lastUserActivityAt ?? summary.updatedAt }
+        : {}),
       eventCount: summary.eventCount,
       folder: entry !== undefined ? (deps.legacyFolders.get(summary.id) ?? null) : null,
       projectId: entry?.projectId ?? summary.projectId ?? null,

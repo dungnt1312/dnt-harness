@@ -91,6 +91,28 @@ describe('discoverOAuth', () => {
     expect((await discoverOAuth(f.mcpUrl, { scopes: ['configured'] })).scopes).toEqual(['configured'])
   })
 
+  it('tries advertised issuers in order and aggregates failures when none works', async () => {
+    const f = await start()
+    const bad = 'https://bad.example'
+    const fetchImpl = (async (url: URL | RequestInfo, init?: RequestInit) => {
+      const target = String(url)
+      if (target.includes('oauth-protected-resource')) {
+        return Response.json({ resource: f.mcpUrl, authorization_servers: [bad, f.origin] })
+      }
+      if (target.startsWith(bad)) return Response.json({ issuer: 'https://wrong.example' })
+      return fetch(url, init)
+    }) as typeof fetch
+    expect((await discoverOAuth(f.mcpUrl, { fetchImpl })).issuer).toBe(f.origin)
+    const none = (async (url: URL | RequestInfo, init?: RequestInit) => {
+      if (String(url).includes('oauth-protected-resource')) return Response.json({ resource: f.mcpUrl, authorization_servers: [bad, 'https://also-bad.example'] })
+      if (String(url).includes('.well-known/oauth-authorization-server')) return Response.json({ issuer: 'https://wrong.example' })
+      return fetch(url, init)
+    }) as typeof fetch
+    const error = await failure(discoverOAuth(f.mcpUrl, { fetchImpl: none }))
+    expect(error.message).toContain(bad)
+    expect(error.message).toContain('https://also-bad.example')
+  })
+
   it('refuses an issuer that does not match the metadata it came from', async () => {
     const f = await start({ issuerOverride: 'https://other.example' })
     const error = await failure(discoverOAuth(f.mcpUrl))

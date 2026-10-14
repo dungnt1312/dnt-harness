@@ -41,9 +41,12 @@ export interface AgentDefinition {
   readonly tools: readonly string[]
   /**
    * `tools` was omitted (Claude: inherit every tool). `tools` then lists the
-   * built-ins, and MCP tools named in a spawn grant are also admitted.
+   * built-ins; the child also inherits every MCP tool the parent sees at
+   * spawn (only `mcpServers`' tools when that is set).
    */
   readonly inheritsTools?: boolean
+  /** Claude `mcpServers`: limits an inheriting role's MCP to these servers. */
+  readonly mcpServers?: readonly string[]
   /** Tools the definition explicitly refuses even if the grant allows. */
   readonly disallowedTools: readonly string[]
   /** Skills preloaded into the child Turn (loaded once and hash-pinned). */
@@ -80,10 +83,10 @@ export class AgentDefinitionError extends Error {
 }
 
 /** Claude subagent frontmatter keys dnt-harness enforces. */
-const ENFORCED_KEYS = new Set(['name', 'description', 'tools', 'disallowedTools', 'skills', 'model'])
+const ENFORCED_KEYS = new Set(['name', 'description', 'tools', 'disallowedTools', 'skills', 'model', 'mcpServers'])
 /** Claude keys recognized but not enforced: accepted, reported as warnings. */
 const UNSUPPORTED_KEYS = new Set([
-  'permissionMode', 'hooks', 'mcpServers', 'memory', 'color', 'effort', 'isolation', 'background', 'maxTurns',
+  'permissionMode', 'hooks', 'memory', 'color', 'effort', 'isolation', 'background', 'maxTurns',
 ])
 
 /** Claude Code tool names → dnt-harness tools. `null` = no equivalent. */
@@ -192,9 +195,14 @@ export function parseAgentDefinition(fallbackName: string, raw: string): AgentDe
   // Omitted (or `*`) = inherit all tools, as in Claude Code. A child never
   // delegates further, so `Agent` is never part of an inherited set.
   const inherits = declaredTools === undefined || toolList(frontmatter['tools'], 'tools', [])?.includes('*') === true
-  const tools = inherits ? KNOWN_MODE_TOOLS.filter((tool) => tool !== 'Agent') : declaredTools
+  // `tools: *, mcp__x__*` inherits every built-in but keeps the listed MCP
+  // entries, which then restrict the inherited MCP to exactly those.
+  const tools = inherits
+    ? [...KNOWN_MODE_TOOLS.filter((tool) => tool !== 'Agent'), ...(declaredTools ?? []).filter((tool) => tool.startsWith('mcp__'))]
+    : declaredTools
 
   const skills = toolList(frontmatter['skills'], 'skills', invalid)
+  const mcpServers = toolList(frontmatter['mcpServers'], 'mcpServers', invalid)
 
   let model: string | undefined
   const rawModel = frontmatter['model']
@@ -218,6 +226,7 @@ export function parseAgentDefinition(fallbackName: string, raw: string): AgentDe
     ...(inherits ? { inheritsTools: true } : {}),
     disallowedTools,
     ...(skills !== undefined ? { skills } : {}),
+    ...(mcpServers !== undefined && mcpServers.length > 0 ? { mcpServers } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(unsupported.length > 0 ? { unsupported } : {}),
     ...(dropped.length > 0 ? { droppedTools: dropped } : {}),
@@ -319,6 +328,8 @@ export class AgentDefinitionService {
       readonly projectRootOf?: (workspaceId: string, projectId: string) => string | undefined
       /** Agent folders of the plugins enabled for this workspace/project. */
       readonly pluginLayers?: (workspaceId: string, projectId: string | undefined) => Promise<readonly PluginAgentLayer[]>
+      /** Layers the workspace's Sources policy switched off (`bundled`, `user`, `plugin`, `workspace`, `project`). */
+      readonly disabledLayers?: (workspaceId: string) => Promise<ReadonlySet<string>>
     } = {},
   ) {}
 
@@ -393,10 +404,13 @@ export class AgentDefinitionService {
 
   /** Every effective definition (highest layer wins per name) plus invalid files. */
   async catalog(workspaceId: string, projectId?: string): Promise<{ rows: ResolvedAgentDefinition[]; errors: { path: string; message: string }[] }> {
+    const off = await this.options.disabledLayers?.(workspaceId).catch(() => undefined) ?? new Set<string>()
     const byKey = new Map<string, ResolvedAgentDefinition>()
-    for (const name of BUNDLED_AGENT_ROLES) byKey.set(name, { definition: bundledDefinition(name), source: 'bundled' })
+    if (!off.has('bundled')) {
+      for (const name of BUNDLED_AGENT_ROLES) byKey.set(name, { definition: bundledDefinition(name), source: 'bundled' })
+    }
     const errors: { path: string; message: string }[] = []
-    const plugins = await this.readPluginLayers(workspaceId, projectId)
+    const plugins = off.has('plugin') ? { rows: [] as ResolvedAgentDefinition[], errors: [] as { path: string; message: string }[] } : await this.readPluginLayers(workspaceId, projectId)
     errors.push(...plugins.errors)
     for (const layer of this.layers(workspaceId, projectId)) {
       // Plugin agents sit between the user layer and the workspace layer.
@@ -407,6 +421,7 @@ export class AgentDefinitionService {
           byKey.set(key, lower === undefined ? row : { ...row, overrides: [...(lower.overrides ?? []), lower.source] })
         }
       }
+      if (off.has(layer.source)) continue
       const read = await this.readLayer(layer.source, layer.dir)
       errors.push(...read.errors)
       for (const row of read.rows) {
@@ -502,16 +517,22 @@ export class AgentDefinitionService {
 }
 
 /** Claude Code subagent document for a definition (used by the app's create/copy form). */
-export function serializeAgentDefinition(definition: Pick<AgentDefinition, 'name' | 'description' | 'instructions' | 'tools' | 'disallowedTools' | 'skills' | 'model' | 'inheritsTools'>): string {
+export function serializeAgentDefinition(definition: Pick<AgentDefinition, 'name' | 'description' | 'instructions' | 'tools' | 'disallowedTools' | 'skills' | 'model' | 'inheritsTools' | 'mcpServers'>): string {
   const quote = (value: string): string => JSON.stringify(value)
   const lines = [
     '---',
     `name: ${quote(definition.name)}`,
     `description: ${quote(definition.description)}`,
     // Omitted = inherit all; an explicit empty ceiling must stay explicit.
-    ...(definition.inheritsTools === true ? [] : [`tools: ${definition.tools.length > 0 ? definition.tools.join(', ') : '[]'}`]),
+    ...(definition.inheritsTools === true
+      ? (() => {
+          const mcp = definition.tools.filter((tool) => tool.startsWith('mcp__'))
+          return mcp.length > 0 ? [`tools: ${quote(['*', ...mcp].join(', '))}`] : []
+        })()
+      : [`tools: ${definition.tools.length > 0 ? definition.tools.join(', ') : '[]'}`]),
     ...(definition.disallowedTools.length > 0 ? [`disallowedTools: ${definition.disallowedTools.join(', ')}`] : []),
     ...(definition.skills !== undefined && definition.skills.length > 0 ? [`skills: ${definition.skills.join(', ')}`] : []),
+    ...(definition.mcpServers !== undefined && definition.mcpServers.length > 0 ? [`mcpServers: ${definition.mcpServers.join(', ')}`] : []),
     ...(definition.model !== undefined ? [`model: ${definition.model}`] : []),
     '---',
     '',

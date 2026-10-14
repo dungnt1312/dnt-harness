@@ -41,7 +41,7 @@ export interface AgentScope {
     readonly instructions: string
     /** Provenance of the pinned definition (bundled role vs workspace file). */
     readonly definitionSource?: 'bundled' | 'user' | 'plugin' | 'workspace' | 'project'
-    /** Hard ceiling: admission exposure ∩ definition ∩ spawn grant (MCP explicit). */
+    /** Hard ceiling: admission exposure ∩ role candidates − disallowed, narrowed by the spawn grant. */
     readonly toolCeiling: readonly string[]
     /**
      * The parent's additional file-tool folders, snapshotted AT SPAWN. Like

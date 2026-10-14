@@ -245,7 +245,7 @@ export async function discoverOAuth(serverUrl: string, options: { readonly fetch
   const prm = await protectedResource(server, bearer.resourceMetadata, fetchImpl)
 
   let resource = serverUrl
-  let issuer = server.origin
+  let issuers = [server.origin]
   let prmScopes: string[] = []
   if (prm !== undefined) {
     if (typeof prm['resource'] !== 'string' || !resourceCovers(serverUrl, prm['resource'])) {
@@ -254,30 +254,38 @@ export async function discoverOAuth(serverUrl: string, options: { readonly fetch
     resource = prm['resource']
     const servers = strings(prm['authorization_servers'])
     if (servers.length === 0) throw new OAuthConnectError('discovery_failed', 'protected resource metadata lists no authorization server')
-    issuer = servers[0] ?? issuer
+    issuers = servers
     prmScopes = strings(prm['scopes_supported'])
   }
 
-  const metadata = await authorizationServer(issuer, fetchImpl)
-  if (!strings(metadata['code_challenge_methods_supported']).includes('S256')) {
-    throw new OAuthConnectError('discovery_failed', 'the authorization server does not support PKCE S256')
+  const failures: string[] = []
+  for (const issuer of issuers) {
+    try {
+      const metadata = await authorizationServer(issuer, fetchImpl)
+      if (!strings(metadata['code_challenge_methods_supported']).includes('S256')) {
+        throw new OAuthConnectError('discovery_failed', 'the authorization server does not support PKCE S256')
+      }
+      const configured = options.scopes ?? []
+      const challenged = (bearer.scope ?? '').split(/\s+/).filter((scope) => scope !== '')
+      const scopes = configured.length > 0 ? [...configured] : challenged.length > 0 ? challenged : prmScopes
+      const revocation = endpoint(metadata, 'revocation_endpoint', false)
+      const registration = endpoint(metadata, 'registration_endpoint', false)
+      return {
+        resource,
+        issuer: typeof metadata['issuer'] === 'string' ? metadata['issuer'] : issuer,
+        authorizationEndpoint: endpoint(metadata, 'authorization_endpoint', true),
+        tokenEndpoint: endpoint(metadata, 'token_endpoint', true),
+        ...(revocation !== undefined ? { revocationEndpoint: revocation } : {}),
+        ...(registration !== undefined ? { registrationEndpoint: registration } : {}),
+        // RFC 8414 §2: the default when omitted is client_secret_basic.
+        tokenEndpointAuthMethods: metadata['token_endpoint_auth_methods_supported'] === undefined
+          ? ['client_secret_basic']
+          : strings(metadata['token_endpoint_auth_methods_supported']),
+        scopes,
+      }
+    } catch (error) {
+      failures.push(`${issuer}: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
-  const configured = options.scopes ?? []
-  const challenged = (bearer.scope ?? '').split(/\s+/).filter((scope) => scope !== '')
-  const scopes = configured.length > 0 ? [...configured] : challenged.length > 0 ? challenged : prmScopes
-  const revocation = endpoint(metadata, 'revocation_endpoint', false)
-  const registration = endpoint(metadata, 'registration_endpoint', false)
-  return {
-    resource,
-    issuer: typeof metadata['issuer'] === 'string' ? metadata['issuer'] : issuer,
-    authorizationEndpoint: endpoint(metadata, 'authorization_endpoint', true),
-    tokenEndpoint: endpoint(metadata, 'token_endpoint', true),
-    ...(revocation !== undefined ? { revocationEndpoint: revocation } : {}),
-    ...(registration !== undefined ? { registrationEndpoint: registration } : {}),
-    // RFC 8414 §2: the default when omitted is client_secret_basic.
-    tokenEndpointAuthMethods: metadata['token_endpoint_auth_methods_supported'] === undefined
-      ? ['client_secret_basic']
-      : strings(metadata['token_endpoint_auth_methods_supported']),
-    scopes,
-  }
+  throw new OAuthConnectError('discovery_failed', `no advertised authorization server worked: ${failures.join('; ')}`)
 }

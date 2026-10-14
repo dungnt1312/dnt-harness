@@ -39,6 +39,7 @@ const STATUS_TONE: Readonly<Record<McpServerRow['status'], 'green' | 'amber' | '
   ready: 'green',
   failed: 'amber',
   connecting: 'blue',
+  idle: 'gray',
   disabled: 'gray',
 }
 
@@ -50,6 +51,7 @@ const STATUS_TONE: Readonly<Record<McpServerRow['status'], 'green' | 'amber' | '
 const STATUS_META: Readonly<Record<McpServerRow['status'], string | undefined>> = {
   ready: undefined,
   connecting: 'Starting up — tools appear once the handshake completes.',
+  idle: 'Enabled. Starts on the next request.',
   failed: 'The connection failed. Check the command and arguments, then reconnect.',
   disabled: 'Not running. Enable it to start the server.',
 }
@@ -327,12 +329,11 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
 
   /**
    * Finish a sign-in with its state (the callback page reported back), or with
-   * the address pasted back. A rejected pasted address keeps the sign-in open
-   * so it can be corrected; every other outcome ends it.
+   * the address pasted back. Failed completion keeps the sign-in open for retry
+   * or cancellation; only successful completion clears it.
    */
   const finishSignIn = useCallback(async (pending: PendingSignIn, address?: string): Promise<void> => {
     if (workspaceId === null) return
-    if (address === undefined) setPendingSignIn(null)
     try {
       const result = await completeMcpOAuth(workspaceId, pending.server, address === undefined ? pending.state : { callbackUrl: address.trim() })
       setPendingSignIn(null)

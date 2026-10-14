@@ -1,5 +1,5 @@
 import type { AttachmentRef } from './composer-draft.ts'
-import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, CommandRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, HooksSectionRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelAliasInput, ModelAliasRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, SkillFileRow, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, UsageDailyResponse, UserQuestionAnswer, WorkspaceMeta, WorkspaceRow } from './types.ts'
+import type { AdditionalDirectory, AgentDefinitionRow, ChildRow, CommandRow, ContextManifestView, Envelope, FolderGrant, HooksConfigRow, HooksSectionRow, SessionGrantsView, McpServerRow, MemoryEntryRow, Meta, ModeCatalogRow, ModeFileRow, ModelAliasInput, ModelAliasRow, ModelDefaults, ProjectRow, ProviderInput, ProviderSummary, SecretRow, SessionListing, SessionModel, ResourceSourcesDoc, SkillFileRow, SkillRow, SkillRuleRow, TerminalFrame, TerminalListing, TerminalRow, UsageDailyResponse, UserQuestionAnswer, WorkspaceMeta, WorkspaceRow, WorkspaceSourcesRow } from './types.ts'
 
 const CSRF_HEADER = 'x-dnt-harness-csrf'
 let csrfToken: string | undefined
@@ -1498,6 +1498,20 @@ export function getSkillFile(workspaceId: string, name: string, filePath: string
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills/${encodeURIComponent(name)}/file?path=${encodeURIComponent(filePath)}${projectId !== undefined ? `&projectId=${encodeURIComponent(projectId)}` : ''}`).then((r) =>
     json<SkillFileRow & { readonly content: string }>(r),
   )
+}
+
+/** The workspace's folder-layer policy for skills, agents, hooks and commands. */
+export function getWorkspaceSources(workspaceId: string): Promise<WorkspaceSourcesRow> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sources`).then((r) => json<WorkspaceSourcesRow>(r))
+}
+
+/** Replace the whole document; a stale `expectedHash` is refused with 409. */
+export function putWorkspaceSources(workspaceId: string, doc: ResourceSourcesDoc, expectedHash: string): Promise<WorkspaceSourcesRow> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sources`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ doc, expectedHash }),
+  }).then((r) => json<WorkspaceSourcesRow>(r))
 }
 
 /** Replace the skill source rules (validated server-side, last-write-wins). */

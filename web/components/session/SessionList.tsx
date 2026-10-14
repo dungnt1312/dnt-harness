@@ -5,7 +5,7 @@ import { Spinner } from '../common/Spinner.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import { cn } from '../../lib/cn.ts'
-import { formatAge } from '../../lib/format.ts'
+import { activityAt, formatAge } from '../../lib/format.ts'
 import type { ProjectRow, SessionListing, SessionSort } from '../../lib/types.ts'
 
 /** Insert `dragId` before/after `overId`; input unchanged when either id is absent. */
@@ -87,12 +87,12 @@ function SessionRow({ session, active, liveRunning, onSelect, onRename, onDelete
         )}
         {queued > 0 ? <span className="shrink-0 text-[11px] text-fg-faint">{queued} queued</span> : null}
         {cancelling ? <span className="shrink-0 text-[11px] text-fg-faint">stopping…</span> : null}
-        {session.updatedAt !== undefined ? (
+        {activityAt(session) !== undefined ? (
           <span
             className="shrink-0 text-[11px] tabular-nums text-fg-faint transition-opacity group-hover:opacity-0 group-focus-within:opacity-0 group-has-[[data-state=open]]:opacity-0 [@media(pointer:coarse)]:opacity-0"
-            title={new Date(session.updatedAt).toLocaleString()}
+            title={new Date(activityAt(session)!).toLocaleString()}
           >
-            {formatAge(session.updatedAt)}
+            {formatAge(activityAt(session))}
           </span>
         ) : null}
       </button>
@@ -174,7 +174,7 @@ const AUTOMATIONS_GROUP = '__automations__'
 function bucketed(sessions: readonly SessionListing[]): readonly (readonly [typeof BUCKET_ORDER[number], readonly SessionListing[]])[] {
   const buckets = new Map<typeof BUCKET_ORDER[number], SessionListing[]>()
   for (const session of sessions) {
-    const bucket = dayBucket(session.updatedAt)
+    const bucket = dayBucket(activityAt(session))
     buckets.set(bucket, [...(buckets.get(bucket) ?? []), session])
   }
   return BUCKET_ORDER.filter((bucket) => (buckets.get(bucket)?.length ?? 0) > 0).map((bucket) => [bucket, buckets.get(bucket) ?? []] as const)

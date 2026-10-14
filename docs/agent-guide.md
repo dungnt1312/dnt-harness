@@ -32,10 +32,12 @@ a target, use Settings or request authorized access; do not bypass the boundary
 with Bash. Read-only modes and restricted children must not attempt writes.
 
 Project skills also support `.agents/skills/` by default. Skill scan folders,
-enabled rules and precedence are configurable in Settings → Skills → Source
-folders. The default order is `.claude/skills` → `.agents/skills` → workspace →
-user → bundled. Agent precedence is project → workspace → user → bundled.
-A higher layer shadows a lower resource of the same name; confirm which one resolves.
+enabled rules and precedence are configurable in Settings → Sources, which also
+switches the fixed layers of agents, hooks and commands on or off per workspace
+([Sources](sources.md)). The default order is `.claude/skills` → `.agents/skills` →
+workspace → user → bundled. Agent precedence is project → workspace → user → bundled.
+A higher layer shadows a lower resource of the same name; confirm which one
+resolves, and that its layer is not switched off in Sources.
 
 ## Create a skill
 

@@ -7,6 +7,126 @@ import { describe, expect, it, vi } from 'vitest'
 import { ManagedOAuth, OAuthStore } from 'dnt-harness'
 
 describe('managed oauth profile', () => {
+  it('does not let first Begin overwrite a Revoke epoch', async () => {
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-oauth-first-revoke-'))
+    const read = fs.readFile.bind(fs)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let entered!: () => void
+    const paused = new Promise<void>((resolve) => { entered = resolve })
+    try {
+      const store = new OAuthStore(home, randomBytes(32))
+      const oauth = new ManagedOAuth(store, (async () => Response.json({ access_token: 'stale' })) as typeof fetch)
+      // Pause after the first read has observed ENOENT, before incarnation can write.
+      let first = true
+      vi.spyOn(fs, 'readFile').mockImplementation(async (...args: Parameters<typeof fs.readFile>) => {
+        if (first && String(args[0]).includes('epoch-ws-remote.json')) {
+          first = false
+          try { return await read(...args) }
+          catch (error) { entered(); await gate; throw error }
+        }
+        return read(...args)
+      })
+      const pending = depositedAuthorization(oauth)
+      await paused
+      const revoking = oauth.revoke('ws', 'remote')
+      release()
+      const tx = await pending
+      await revoking
+      await expect(oauth.complete(tx)).rejects.toThrow(/revoked|replaced/)
+      expect((await store.readTokens('ws', 'remote'))?.phase).toBe('local_revoked')
+    } finally { release(); vi.restoreAllMocks(); await fs.rm(home, { recursive: true, force: true }) }
+  })
+
+  it('returns one durable epoch to concurrent first incarnations', async () => {
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-oauth-first-concurrent-'))
+    const read = fs.readFile.bind(fs)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    let entered!: () => void
+    const paused = new Promise<void>((resolve) => { entered = resolve })
+    try {
+      const store = new OAuthStore(home, randomBytes(32))
+      let first = true
+      vi.spyOn(fs, 'readFile').mockImplementation(async (...args: Parameters<typeof fs.readFile>) => {
+        if (first && String(args[0]).includes('epoch-ws-remote.json')) {
+          first = false
+          try { return await read(...args) }
+          catch (error) { entered(); await gate; throw error }
+        }
+        return read(...args)
+      })
+      const a = store.incarnation('ws', 'remote')
+      await paused
+      const b = store.incarnation('ws', 'remote')
+      // Let the second caller reach the missing-file read in the old implementation.
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      release()
+      const [firstEpoch, secondEpoch] = await Promise.all([a, b])
+      expect(firstEpoch).toBe(secondEpoch)
+      expect(await store.incarnation('ws', 'remote')).toBe(firstEpoch)
+    } finally { release(); vi.restoreAllMocks(); await fs.rm(home, { recursive: true, force: true }) }
+  })
+  it('rejects completion of a deposited transaction after expiry', async () => {
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-oauth-expiry-'))
+    try {
+      let clock = 1_000
+      const store = new OAuthStore(home, randomBytes(32))
+      const oauth = new ManagedOAuth(store, (async () => Response.json({ access_token: 'late' })) as typeof fetch, () => clock)
+      const input = await depositedAuthorization(oauth)
+      clock += 300_001
+      await expect(oauth.complete(input)).rejects.toThrow(/expired/)
+      expect(await store.readTokens('ws', 'remote')).toBeUndefined()
+    } finally { await fs.rm(home, { recursive: true, force: true }) }
+  })
+
+  it('does not publish after revoke, even when the old transaction was deposited first', async () => {
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-oauth-revoke-'))
+    try {
+      const store = new OAuthStore(home, randomBytes(32))
+      const oauth = new ManagedOAuth(store, (async () => Response.json({ access_token: 'late' })) as typeof fetch)
+      const input = await depositedAuthorization(oauth)
+      await oauth.revoke('ws', 'remote')
+      await expect(oauth.complete(input)).rejects.toThrow(/revoked|replaced/)
+      expect((await store.readTokens('ws', 'remote'))?.phase).toBe('local_revoked')
+    } finally { await fs.rm(home, { recursive: true, force: true }) }
+  })
+
+  it('rejects a changed configuration during a held exchange before publication', async () => {
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-oauth-config-'))
+    let release!: (response: Response) => void
+    const gate = new Promise<Response>((resolve) => { release = resolve })
+    let entered!: () => void
+    const started = new Promise<void>((resolve) => { entered = resolve })
+    try {
+      const store = new OAuthStore(home, randomBytes(32))
+      let config = 'original'
+      const oauth = new ManagedOAuth(store, (async () => { entered(); return gate }) as typeof fetch, undefined, undefined, async () => config)
+      const { state } = await oauth.begin({ workspaceId: 'ws', server: 'remote', principalId: 'p', resource: 'http://127.0.0.1/mcp', authorizationEndpoint: 'http://127.0.0.1/authorize', tokenEndpoint: 'http://127.0.0.1/token', redirectUri: 'http://127.0.0.1/callback', clientId: 'client', scopes: [], configIdentity: config })
+      await oauth.deposit(state, 'code')
+      const pending = oauth.complete({ state, workspaceId: 'ws', server: 'remote', principalId: 'p' })
+      await started
+      config = 'changed'
+      release(Response.json({ access_token: 'stale' }))
+      await expect(pending).rejects.toThrow(/configuration changed/)
+      expect(await store.readTokens('ws', 'remote')).toBeUndefined()
+    } finally { release(Response.json({ access_token: 'stale' })); await fs.rm(home, { recursive: true, force: true }) }
+  })
+
+  it('fails closed if the atomic grant write is interrupted', async () => {
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-oauth-atomic-'))
+    try {
+      const store = new OAuthStore(home, randomBytes(32))
+      const oauth = new ManagedOAuth(store, (async () => Response.json({ access_token: 'new' })) as typeof fetch)
+      const record = { serverUrl: 'http://127.0.0.1/mcp', resource: 'http://127.0.0.1/mcp', issuer: 'http://127.0.0.1', authorizationEndpoint: 'http://127.0.0.1/authorize', tokenEndpoint: 'http://127.0.0.1/token', scopes: [], discoveredAt: 1 }
+      const { state } = await oauth.begin({ workspaceId: 'ws', server: 'remote', principalId: 'p', resource: record.resource, authorizationEndpoint: record.authorizationEndpoint, tokenEndpoint: record.tokenEndpoint, redirectUri: 'http://127.0.0.1/callback', clientId: 'client', scopes: [], serverRecord: record })
+      await oauth.deposit(state, 'code')
+      vi.spyOn(store, 'publishGrant').mockRejectedValueOnce(new Error('disk full'))
+      await expect(oauth.complete({ state, workspaceId: 'ws', server: 'remote', principalId: 'p' })).rejects.toThrow('disk full')
+      expect(await store.readTokens('ws', 'remote')).toBeUndefined()
+      expect(await store.readServerRecord('ws', 'remote')).toBeUndefined()
+    } finally { await fs.rm(home, { recursive: true, force: true }) }
+  })
   it('retains the previous refresh token when the endpoint omits refresh_token', async () => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-oauth-'))
     try {
@@ -94,8 +214,6 @@ describe('managed oauth profile', () => {
     const gate = new Promise<void>((resolve) => { release = resolve })
     let entered!: () => void
     const writing = new Promise<void>((resolve) => { entered = resolve })
-    let exchanged!: () => void
-    const secondExchange = new Promise<void>((resolve) => { exchanged = resolve })
     const operations: Promise<unknown>[] = []
     try {
       const store = new OAuthStore(home, randomBytes(32))
@@ -107,7 +225,6 @@ describe('managed oauth profile', () => {
       let exchanges = 0
       const oauth = new ManagedOAuth(store, (async () => {
         exchanges += 1
-        if (exchanges === 2) exchanged()
         return Response.json({ access_token: exchanges === 1 ? 'authorized-first' : 'authorized-second' })
       }) as typeof fetch)
       const firstInput = await depositedAuthorization(oauth)
@@ -119,12 +236,12 @@ describe('managed oauth profile', () => {
         ? oauth.complete(secondInput).catch((error: unknown) => error)
         : oauth.revoke('ws', 'remote')
       operations.push(second)
-      if (operation === 'complete') await secondExchange
+      // A second completion can wait for the publication lock before its exchange.
       release()
       if (operation === 'complete') {
         await expect(first).resolves.toMatchObject({ accessToken: 'authorized-first' })
-        await expect(second).resolves.toBeInstanceOf(Error)
-        expect(await store.readTokens('ws', 'remote')).toMatchObject({ phase: 'active', accessToken: 'authorized-first' })
+        await expect(second).resolves.toMatchObject({ accessToken: 'authorized-second' })
+        expect(await store.readTokens('ws', 'remote')).toMatchObject({ phase: 'active', accessToken: 'authorized-second' })
       } else {
         await expect(first).resolves.toBeInstanceOf(Error)
         await second
@@ -280,6 +397,37 @@ describe('managed oauth client authentication and server records', () => {
       })
       await oauth.deposit(state, 'code')
       await expect(oauth.complete({ state, principalId: 'p', workspaceId: 'ws', server: 'remote' })).rejects.toThrow(/client secret is not available/)
+    })
+  })
+
+  it('keeps insufficient_scope auth_required when an in-flight refresh succeeds', async () => {
+    await withStore(async (store) => {
+      await store.saveTokens('ws', 'remote', expiredTokens())
+      let release!: (response: Response) => void
+      const gate = new Promise<Response>((resolve) => { release = resolve })
+      let entered!: () => void
+      const started = new Promise<void>((resolve) => { entered = resolve })
+      const oauth = new ManagedOAuth(store, (async () => { entered(); return gate }) as typeof fetch)
+      const pending = oauth.refresh('ws', 'remote')
+      await started
+      try {
+        await oauth.markScopeRequired('ws', 'remote', 'write')
+        release(Response.json({ access_token: 'new' }))
+        await expect(pending).resolves.toBeUndefined()
+        expect(await store.readTokens('ws', 'remote')).toMatchObject({ phase: 'auth_required', missingScope: 'write' })
+      } finally { release(Response.json({ access_token: 'new' })); await pending }
+    })
+  })
+
+  it.each(['missing', 'unloadable'] as const)('keeps an active grant when its client secret is %s during refresh', async (kind) => {
+    await withStore(async (store) => {
+      await store.saveTokens('ws', 'remote', { ...expiredTokens(), tokenEndpointAuth: 'client_secret_post' })
+      const oauth = new ManagedOAuth(store, recorder([]), undefined, async () => {
+        if (kind === 'unloadable') throw new Error('secret vault unavailable')
+        return undefined
+      })
+      await expect(oauth.refresh('ws', 'remote')).rejects.toThrow(/secret|vault/)
+      expect(await store.readTokens('ws', 'remote')).toMatchObject({ phase: 'active', accessToken: 'access-old' })
     })
   })
 

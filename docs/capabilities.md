@@ -149,8 +149,8 @@ custom patterns; per-command exception handling is deferred.
 classifier and no auto-load:
 
 - **Layered catalog**: each workspace keeps an ordered list of source rules
-  (`<data-dir>/workspaces/<id>/skills/sources.json`; Settings → Skills →
-  Source folders). Rule kinds: `project` (a folder relative to the session's
+  (`<data-dir>/workspaces/<id>/resource-sources.json`; Settings → Sources;
+  see [sources.md](sources.md)). Rule kinds: `project` (a folder relative to the session's
   bound project, contained inside it), `workspace`
   (`<data-dir>/workspaces/<id>/skills`), and `absolute` (an absolute folder;
   `~` expands; saving an ENABLED rule that is a drive root, the home
@@ -253,10 +253,26 @@ lifecycle route keeps a 120 s cap), `list`, `cancel`, `reconcile`, `catalog`:
   [the harness notes](harness.md#which-model-a-child-runs-on).
 - **No authority gained**: a child's own calls re-enter the owning root's live
   mode exposure and approval policy. Its immutable admission ceiling is pinned
-  at spawn as admission exposure ∩ role tools ∩ explicit grant; later mode
-  widening cannot add tools, while later narrowing denies unstarted calls.
+  at spawn as admission exposure ∩ role tools − `disallowedTools`, narrowed by
+  the spawn grant; later mode widening cannot add tools, while later narrowing
+  denies unstarted calls.
   `Agent` is `ask` only in *Ask before changes* and `allow` in Plan, *Edit
   automatically*, and *Full access*. Chat exposes it nowhere.
+- **MCP in children** (Claude/ZCode parity): a role that omits `tools` (or uses
+  `*`) inherits every MCP tool the parent sees at spawn. Naming MCP entries
+  restricts that: `mcpServers` and any MCP entries in `tools` (e.g.
+  `tools: "*, mcp__context7__*"`) leave only those. A role with explicit
+  `tools` gets only the MCP entries it lists: `mcp__server__tool`,
+  `mcp__server__*`, or `mcp__*` for every server. Only tools that are live at
+  spawn are pinned — a disconnected server's tools are absent, and admission
+  waits at most 5 s for servers still connecting. Mode exposure still applies
+  (Plan keeps only read-safe allowlisted tools). `grantTools` narrows MCP only
+  when it names an MCP entry; a granted MCP name or selector the child cannot
+  get fails the spawn (HTTP 400). `disallowedTools` accepts `mcp__server__*`
+  and `mcp__*`. MCP servers that connect after the spawn are not added. An
+  unreadable `mcp.json` spawns the child without MCP. The bundled Explorer has
+  no MCP; override it with an `explorer.md` that lists the tools it may use,
+  for example `tools: Read, Glob, Grep, mcp__codebase-retrieval__*`.
 - **MCP exposure is a mode property** (`mcpExposure: none | read-safe | all`),
   so a duplicated Plan keeps it. `read-safe` exposes an MCP tool only when the
   server has a non-empty explicit allowlist entry for it AND its name matches

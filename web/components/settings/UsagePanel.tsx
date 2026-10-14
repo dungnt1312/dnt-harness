@@ -6,6 +6,7 @@ import { fetchUsage } from '../../lib/api.ts'
 import { cn } from '../../lib/cn.ts'
 import type { UsageDailyResponse } from '../../lib/types.ts'
 import {
+  buildCacheStats,
   buildHeatmap,
   buildTrend,
   formatDuration,
@@ -14,6 +15,7 @@ import {
   niceMax,
   shortDate,
   summarize,
+  type CacheDayStats,
   type HeatmapMode,
   type TrendModel,
 } from '../../lib/usage-stats.ts'
@@ -78,6 +80,9 @@ export function UsagePanel() {
       <Section title="Time range" actions={<Segmented label="Time range" value={range} options={RANGES} onChange={setRange} />}>
         <TrendChart data={data} rangeDays={Number(range)} />
       </Section>
+      <Section title="Prompt cache">
+        <CacheSection data={data} rangeDays={Number(range)} />
+      </Section>
     </PanelBody>
   )
 }
@@ -104,6 +109,112 @@ function StatStrip({ data }: { readonly data: UsageDailyResponse }) {
         </div>
       ))}
     </dl>
+  )
+}
+
+const percent = (hit: number | undefined): string => (hit === undefined ? 'No data' : `${(hit * 100).toFixed(1)}%`)
+
+/** Cache hit over the range chosen for the trend chart above it. */
+function CacheSection({ data, rangeDays }: { readonly data: UsageDailyResponse; readonly rangeDays: number }) {
+  const stats = useMemo(() => buildCacheStats(data, rangeDays), [data, rangeDays])
+  const { total } = stats
+  const summary = [
+    { label: 'Cache hit', value: total.hit === undefined ? '—' : percent(total.hit), title: 'Cached prompt tokens divided by the prompt tokens of requests whose provider reported a cache share' },
+    { label: 'Cached tokens', value: formatTokens(total.cached) },
+    { label: 'Fresh tokens', value: formatTokens(total.freshInput), title: 'Prompt tokens that were not served from the cache' },
+    { label: 'No cache data', value: `${total.unreportedRequests} ${total.unreportedRequests === 1 ? 'request' : 'requests'}`, title: 'Requests whose provider sent no cache information; they are left out of the hit rate' },
+  ]
+  return (
+    <div className="flex min-w-0 flex-col gap-3">
+      <dl className="m-0 grid min-w-0 grid-cols-2 gap-y-3 rounded-xl border border-line bg-surface px-2 py-3 lg:grid-cols-4" aria-label="Cache summary">
+        {summary.map((stat, index) => (
+          <div key={stat.label} title={stat.title} className={cn('flex min-w-0 flex-col-reverse items-center gap-0.5 px-2 text-center', index > 0 && 'lg:border-l lg:border-line')}>
+            <dt className="m-0 truncate text-xs text-fg-muted">{stat.label}</dt>
+            <dd className="m-0 text-lg font-semibold tabular-nums">{stat.value}</dd>
+          </div>
+        ))}
+      </dl>
+      <CacheDailyChart days={stats.days} rangeDays={rangeDays} />
+      {stats.models.length === 0 ? (
+        <p className="m-0 text-[13px] text-fg-muted">No requests in the last {rangeDays} days.</p>
+      ) : (
+        <div className="min-w-0 overflow-x-auto rounded-xl border border-line bg-surface">
+          <table className="w-full min-w-[420px] border-collapse text-left text-[13px]">
+            <thead>
+              <tr className="border-b border-line text-xs text-fg-muted">
+                <th scope="col" className="px-3 py-2 font-medium">Model</th>
+                <th scope="col" className="px-3 py-2 text-right font-medium">Requests</th>
+                <th scope="col" className="px-3 py-2 text-right font-medium">Cache hit</th>
+                <th scope="col" className="px-3 py-2 text-right font-medium" title="Average prompt tokens per request that were not cached">Fresh per request</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stats.models.map((row) => (
+                <tr key={row.model} data-testid="cache-model-row" className="border-b border-line last:border-b-0">
+                  <th scope="row" className="max-w-[16rem] truncate px-3 py-2 font-normal">{row.model}</th>
+                  <td className="px-3 py-2 text-right tabular-nums">{row.requests}</td>
+                  <td className={cn('px-3 py-2 text-right tabular-nums', row.hit === undefined && 'text-fg-faint')}>{percent(row.hit)}</td>
+                  <td className={cn('px-3 py-2 text-right tabular-nums', row.freshPerRequest === undefined && 'text-fg-faint')}>
+                    {row.freshPerRequest === undefined ? '—' : formatTokens(row.freshPerRequest)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+const CACHE_W = 720
+const CACHE_H = 120
+const CACHE_PAD = { top: 8, right: 16, bottom: 24, left: 40 }
+
+/** One bar per day: height is that day's hit rate; a day with no cache data is a faint stub. */
+function CacheDailyChart({ days, rangeDays }: { readonly days: readonly CacheDayStats[]; readonly rangeDays: number }) {
+  const innerW = CACHE_W - CACHE_PAD.left - CACHE_PAD.right
+  const innerH = CACHE_H - CACHE_PAD.top - CACHE_PAD.bottom
+  const slot = innerW / days.length
+  const barW = Math.max(2, slot * 0.7)
+  const tickEvery = rangeDays <= 7 ? 1 : 5
+  return (
+    <div className="min-w-0 rounded-xl border border-line bg-surface p-4">
+      <h4 className="m-0 mb-2 text-[13px] font-semibold">Daily cache hit</h4>
+      <svg viewBox={`0 0 ${CACHE_W} ${CACHE_H}`} className="block h-auto w-full" role="img" aria-label={`Daily cache hit rate, last ${rangeDays} days`}>
+        {[0, 0.5, 1].map((f) => {
+          const y = CACHE_PAD.top + innerH - f * innerH
+          return (
+            <g key={f}>
+              <line x1={CACHE_PAD.left} x2={CACHE_W - CACHE_PAD.right} y1={y} y2={y} className="stroke-line" strokeDasharray={f === 0 ? undefined : '3 4'} />
+              <text x={CACHE_PAD.left - 8} y={y + 3} textAnchor="end" className="fill-fg-faint text-[10px]">{`${f * 100}%`}</text>
+            </g>
+          )
+        })}
+        {days.map((day, i) => {
+          const x = CACHE_PAD.left + i * slot + (slot - barW) / 2
+          const height = day.hit === undefined ? 2 : Math.max(2, day.hit * innerH)
+          return (
+            <g key={day.date}>
+              <rect
+                data-testid="cache-bar"
+                x={x}
+                y={CACHE_PAD.top + innerH - height}
+                width={barW}
+                height={height}
+                rx={1.5}
+                className={day.hit === undefined ? 'fill-muted' : 'fill-link'}
+              >
+                <title>{`${shortDate(day.date, true)} · ${day.hit === undefined ? 'no cache data' : `${percent(day.hit)} cache hit`}`}</title>
+              </rect>
+              {(days.length - 1 - i) % tickEvery === 0 ? (
+                <text x={x + barW / 2} y={CACHE_H - 6} textAnchor="middle" className="fill-fg-faint text-[10px]">{shortDate(day.date)}</text>
+              ) : null}
+            </g>
+          )
+        })}
+      </svg>
+    </div>
   )
 }
 

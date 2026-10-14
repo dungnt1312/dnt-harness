@@ -161,6 +161,34 @@ describe('agent definitions', () => {
     expect(claude.warnings?.join()).toMatch(/dropped: WebFetch/)
   })
 
+  it('parses mcpServers and MCP selectors, and round-trips them', async () => {
+    const { parseAgentDefinition, serializeAgentDefinition } = await import('dnt-harness')
+    const parsed = parseAgentDefinition('scout', [
+      '---',
+      'description: scout',
+      'mcpServers: codebase-retrieval, context7',
+      'disallowedTools: mcp__context7__*',
+      '---',
+      'Find things.',
+    ].join('\n'))
+    expect(parsed.inheritsTools).toBe(true)
+    expect(parsed.mcpServers).toEqual(['codebase-retrieval', 'context7'])
+    expect(parsed.disallowedTools).toEqual(['mcp__context7__*'])
+    expect(parsed.unsupported ?? []).not.toContain('mcpServers')
+    expect(parseAgentDefinition('scout', serializeAgentDefinition(parsed))).toMatchObject({
+      mcpServers: ['codebase-retrieval', 'context7'], disallowedTools: ['mcp__context7__*'], inheritsTools: true,
+    })
+    const explicit = parseAgentDefinition('explorer', '---\ndescription: e\ntools: Read, Grep, mcp__codebase-retrieval__*\n---\nGo.')
+    expect(explicit.tools).toEqual(['Read', 'Grep', 'mcp__codebase-retrieval__*'])
+    const star = parseAgentDefinition('star', '---\ndescription: s\ntools: "*, mcp__context7__*"\n---\nGo.')
+    expect(star.inheritsTools).toBe(true)
+    expect(star.tools).toContain('Write')
+    expect(star.tools).toContain('mcp__context7__*')
+    const again = parseAgentDefinition('star', serializeAgentDefinition(star))
+    expect(again.inheritsTools).toBe(true)
+    expect(again.tools).toEqual(star.tools)
+  })
+
   it('cleans a stripped Examples tail and reports dropped tools as a list', async () => {
     const { parseAgentDefinition } = await import('dnt-harness')
     const parsed = parseAgentDefinition('b', "---\ndescription: 'Brainstorm ideas.\n  Examples: - - -'\ntools: Read, WebFetch, SendMessage\n---\n\nbody")

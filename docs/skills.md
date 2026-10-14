@@ -23,12 +23,13 @@ in this order wins:
 | 3 | user | `~/.claude/skills/` | no (read-only layer) |
 | 4 | bundled | repo `skills/` (ship with the app) | no — copy into the workspace layer to customize |
 
-The project and user layers are configurable per workspace through
-`sources.json` (see below); the default rule list is
-project-claude, project-agents, workspace, user. The bundled layer is not a
-rule: it is appended last whenever the server was built with a bundled skills
-directory, so every rule layer shadows it and a custom rule list can never
-accidentally drop it.
+The project and user layers are configurable per workspace in Settings →
+Sources (stored in `resource-sources.json`, see [sources.md](sources.md)); the
+default rule list is project-claude, project-agents, workspace, user. The
+bundled layer is not a rule: it is appended last whenever the server was built
+with a bundled skills directory, so every rule layer shadows it and a custom
+rule list can never accidentally drop it. A workspace can switch the bundled
+and plugin layers off in Sources; the rule layers are switched individually.
 
 Bundled skills ship in the repository's `skills/` folder. The web bin passes
 it as `bundledSkillsDir`; a workspace skill with the same name shadows it,
@@ -124,9 +125,11 @@ Per workspace, under `<data-dir>/workspaces/<wid>/skills/`:
 - `<name>/SKILL.md` — the skill; writes are atomic
   (`replaceFileAtomic`), and saves can pass `expectedHash` to refuse
   clobbering an external edit (409 conflict).
-- `sources.json` — the ordered rule list; missing or corrupt degrades to the
-  defaults. Absolute rule folders join the file tools' protected roots, so
-  rules can never be granted to Read/Write/Edit.
+- The ordered rule list now lives in the workspace's shared
+  `<wid>/resource-sources.json` ([sources.md](sources.md)), not in this folder.
+  A legacy `skills/sources.json` is imported when no shared document exists yet
+  and is left untouched. Absolute rule folders join the file tools' protected
+  roots, so rules can never be granted to Read/Write/Edit.
 - `.hidden.json` — `{ "hidden": [names] }`; absent file means none hidden.
 
 HTTP surface (workspace-scoped, ownership-checked):
@@ -138,7 +141,7 @@ HTTP surface (workspace-scoped, ownership-checked):
 | `/api/workspaces/:wid/skills/:name` | PUT | Create/replace raw SKILL.md (400 invalid, 409 conflict) |
 | `/api/workspaces/:wid/skills/:name` | DELETE | Remove a workspace skill |
 | `/api/workspaces/:wid/skills/:name/hidden` | PUT | `{ "hidden": boolean }` — curation toggle |
-| `/api/workspaces/:wid/skills/sources` | GET/PUT | Read/replace the rule list (refreshes protected roots on PUT) |
+| `/api/workspaces/:wid/skills/sources` | GET/PUT | Compatibility adapter over the skills part of `/sources`: reads/replaces the rule list only, keeps the other kinds' switches (refreshes protected roots on PUT) |
 | `/api/workspaces/:wid/skills/:name/files` | GET | Recursive file tree of the skill folder |
 | `/api/workspaces/:wid/skills/:name/file?path=` | GET | One file's text content (contained, size-capped) |
 

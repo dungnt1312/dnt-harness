@@ -18,8 +18,9 @@ import { attachmentUrl, fetchContextBody, videoUrl } from '../../lib/api.ts'
 import { agentRoleIcon } from '../../lib/agent-icons.ts'
 import { cn } from '../../lib/cn.ts'
 import type { AttachmentRef } from '../../lib/composer-draft.ts'
-import { parseMessageText } from '../../lib/inline-chips.ts'
+import { chipLabel, parseMessageText } from '../../lib/inline-chips.ts'
 import { InlineChip } from '../common/InlineChip.tsx'
+import type { ChipSegment } from '../../lib/inline-chips.ts'
 import type { TurnTiming } from '../../lib/turn-timing.ts'
 import { ImageLightbox } from './ImageLightbox.tsx'
 import type { ContextManifestView, ToolCall } from '../../lib/types.ts'
@@ -58,13 +59,15 @@ const revealActions = 'opacity-0 transition-opacity group-hover:opacity-100 focu
  * strip above the composer (QueuedBar) until a turn consumes it, at which
  * point the projection flips the twin in place and this shows the message.
  */
-export const UserBubble = memo(function UserBubble({ item, workspaceId, onReuse, openSkill }: {
+export const UserBubble = memo(function UserBubble({ item, workspaceId, onReuse, openSkill, openMention }: {
   readonly item: Extract<ViewItem, { kind: 'user' }>
   /** Needed to fetch attachment bytes; without it they show as file chips. */
   readonly workspaceId?: string | null
   readonly onReuse?: (text: string) => void
   /** Opener for a skill chip's SKILL.md, or null when the name is not a skill. */
   readonly openSkill?: (name: string) => (() => void) | null
+  /** Opener for a mention chip's file, or null when the path is not project-local. */
+  readonly openMention?: (segment: ChipSegment) => (() => void) | null
 }) {
   const notSent = item.notSent
   const attachments = item.attachments ?? []
@@ -151,11 +154,15 @@ export const UserBubble = memo(function UserBubble({ item, workspaceId, onReuse,
               <p className="m-0 whitespace-pre-wrap break-words">
                 {parseMessageText(item.content).map((segment, index) => {
                   if (segment.kind === 'text') return segment.text
-                  // A skill chip opens its SKILL.md in the workbench; a command
-                  // or file chip stays a label.
-                  const open = segment.kind === 'command' ? openSkill?.(segment.name) ?? null : null
+                  // A skill chip opens its SKILL.md; a mention chip opens the
+                  // file; anything unresolvable stays a label.
+                  const open = segment.kind === 'command'
+                    ? openSkill?.(segment.name) ?? null
+                    : segment.kind === 'mention'
+                      ? openMention?.(segment) ?? null
+                      : null
                   return open !== null
-                    ? <InlineChip key={index} segment={segment} onOpen={open} openLabel={`Open skill ${segment.kind === 'command' ? segment.name : ''} in workbench`} />
+                    ? <InlineChip key={index} segment={segment} onOpen={open} openLabel={segment.kind === 'command' ? `Open skill ${segment.name} in workbench` : `Open ${chipLabel(segment)} in workbench`} />
                     : <InlineChip key={index} segment={segment} />
                 })}
               </p>
@@ -298,7 +305,7 @@ const rowClass = 'inline-flex min-h-6 max-w-full items-center gap-2 self-start t
 /** Built-in tools only. An MCP tool called `read` is not the built-in and does not borrow its icon. */
 const TOOL_ICON: Readonly<Record<string, IconName>> = {
   read: 'eye',
-  write: 'squarePen',
+  write: 'pencil',
   edit: 'pencil',
   glob: 'search',
   grep: 'search',
@@ -387,6 +394,8 @@ interface RowSpec {
   readonly title?: string
   readonly diff?: { readonly added: number; readonly removed: number }
   readonly status?: RowStatus
+  /** Recorded wall-clock span of the call, shown on Trajectory surfaces only. */
+  readonly duration?: string
 }
 
 const STATUS_TONE: Readonly<Record<StatusTone, string>> = {
@@ -463,6 +472,9 @@ function RowLine({ spec, state, showIcon }: { readonly spec: RowSpec; readonly s
             >
               {spec.status.text}
             </span>
+          ) : null}
+          {spec.duration !== undefined ? (
+            <span title="Call duration" aria-label="Call duration" className="shrink-0 whitespace-nowrap font-mono text-xs text-fg-faint">{spec.duration}</span>
           ) : null}
         </span>
       ) : null}
@@ -861,14 +873,25 @@ function excerptTail(output: string, max = 400): string {
   return trimmed.length <= max ? trimmed : `…${trimmed.slice(trimmed.length - max)}`
 }
 
+/**
+ * The call's recorded wall-clock span, from the stamps the log put on its
+ * own events. A call that never settled, or a log too old to stamp, shows
+ * nothing — a duration is never invented.
+ */
+function callDuration(item: Extract<ViewItem, { kind: 'tool' }>): string | undefined {
+  if (item.ts === undefined || item.doneAt === undefined || item.doneAt < item.ts) return undefined
+  return formatElapsed(item.doneAt - item.ts)
+}
+
 /** What one tool row draws. */
-function toolRowSpec(item: Extract<ViewItem, { kind: 'tool' }>, state: RowState, facts: ToolFacts, opener?: { readonly open: () => void; readonly label: string }, repeats = 1, skillName?: string): RowSpec {
+function toolRowSpec(item: Extract<ViewItem, { kind: 'tool' }>, state: RowState, facts: ToolFacts, opener?: { readonly open: () => void; readonly label: string }, repeats = 1, skillName?: string, withDuration = false): RowSpec {
   const { call, server } = item
   const builtin = mcpServerOf(call.name) === undefined ? call.name.toLowerCase() : ''
   const kindWords = KIND[builtin]
   const kind = kindWords === undefined ? undefined : state === 'running' ? kindWords.running : state === 'ok' ? kindWords.done : kindWords.otherwise
   const status = rowStatus(item, state, facts)
-  const base = { ...(status !== undefined ? { status } : {}), ...(facts.fullTarget !== '' ? { title: facts.fullTarget } : {}) }
+  const duration = withDuration ? callDuration(item) : undefined
+  const base = { ...(status !== undefined ? { status } : {}), ...(facts.fullTarget !== '' ? { title: facts.fullTarget } : {}), ...(duration !== undefined ? { duration } : {}) }
 
   if ((builtin === 'read' || builtin === 'write' || builtin === 'edit') && facts.file !== undefined && facts.path !== undefined) {
     // Only a change known to have landed has a size worth stating.
@@ -1245,11 +1268,12 @@ export function generatedImageOf(item: Extract<ViewItem, { kind: 'tool' }>): { r
  * A GenerateImage/EditImage call: the row names the prompt, and the image itself sits
  * under it, always visible — it is the turn's product, not a detail to open.
  */
-function GeneratedImageCard({ item, state, facts, workspaceId }: {
+function GeneratedImageCard({ item, state, facts, workspaceId, withDuration = false }: {
   readonly item: Extract<ViewItem, { kind: 'tool' }>
   readonly state: RowState
   readonly facts: ToolFacts
   readonly workspaceId: string | null
+  readonly withDuration?: boolean
 }) {
   const [zoomed, setZoomed] = useState(false)
   const image = generatedImageOf(item)
@@ -1262,12 +1286,14 @@ function GeneratedImageCard({ item, state, facts, workspaceId }: {
     .filter(([key, value]) => key !== 'prompt' && (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'))
     .map(([key, value]): [string, string] => [key, String(value)])
   const status = rowStatus(item, state, facts)
+  const duration = withDuration ? callDuration(item) : undefined
   const spec: RowSpec = {
     icon: 'fileImage',
     kind: state === 'running' ? words.running : words.done,
     separator: true,
     ...(prompt !== '' ? { primary: prompt, title: prompt } : {}),
     ...(status !== undefined ? { status } : {}),
+    ...(duration !== undefined ? { duration } : {}),
   }
   const src = image !== null && workspaceId !== null ? attachmentUrl(workspaceId, image.id) : null
   return (
@@ -1323,11 +1349,12 @@ export function generatedVideoOf(item: Extract<ViewItem, { kind: 'tool' }>): { r
  * Generation takes minutes, so a running call shows a labelled placeholder
  * rather than an empty gap, and the player only mounts once the file is stored.
  */
-function GeneratedVideoCard({ item, state, facts, workspaceId }: {
+function GeneratedVideoCard({ item, state, facts, workspaceId, withDuration = false }: {
   readonly item: Extract<ViewItem, { kind: 'tool' }>
   readonly state: RowState
   readonly facts: ToolFacts
   readonly workspaceId: string | null
+  readonly withDuration?: boolean
 }) {
   const [failed, setFailed] = useState(false)
   const video = generatedVideoOf(item)
@@ -1336,6 +1363,7 @@ function GeneratedVideoCard({ item, state, facts, workspaceId }: {
     .filter(([key, value]) => key !== 'prompt' && (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'))
     .map(([key, value]): [string, string] => [key, key === 'attachmentId' ? 'reference image' : String(value)])
   const status = rowStatus(item, state, facts)
+  const duration = withDuration ? callDuration(item) : undefined
   const spec: RowSpec = {
     icon: 'fileVideo',
     kind: state === 'running' ? 'Generating video' : 'Video',
@@ -1343,6 +1371,7 @@ function GeneratedVideoCard({ item, state, facts, workspaceId }: {
     ...(prompt !== '' ? { primary: prompt, title: prompt } : {}),
     ...(video?.duration != null ? { secondary: `${video.duration}s` } : {}),
     ...(status !== undefined ? { status } : {}),
+    ...(duration !== undefined ? { duration } : {}),
   }
   const src = video !== null && workspaceId !== null ? videoUrl(workspaceId, video.id) : null
   return (
@@ -1388,15 +1417,17 @@ export function describedImageOf(item: Extract<ViewItem, { kind: 'tool' }>): { r
   } catch { return null }
 }
 
-function DescribeImageCard({ item, state, facts }: {
+function DescribeImageCard({ item, state, facts, withDuration = false }: {
   readonly item: Extract<ViewItem, { kind: 'tool' }>
   readonly state: RowState
   readonly facts: ToolFacts
+  readonly withDuration?: boolean
 }) {
   const result = describedImageOf(item)
   const question = typeof item.call.args['question'] === 'string' ? item.call.args['question'].trim() : ''
   const status = rowStatus(item, state, facts)
-  return <ActivityRow state={state} spec={{ icon: 'eye', kind: state === 'running' ? 'Understanding image' : 'Describe image', separator: true, primary: question || 'General description', ...(status !== undefined ? { status } : {}) }}>
+  const duration = withDuration ? callDuration(item) : undefined
+  return <ActivityRow state={state} spec={{ icon: 'eye', kind: state === 'running' ? 'Understanding image' : 'Describe image', separator: true, primary: question || 'General description', ...(status !== undefined ? { status } : {}), ...(duration !== undefined ? { duration } : {}) }}>
     <OutcomeNotes item={item} />
     {item.result === undefined ? <RunningCall call={item.call} /> : (
       <>
@@ -1464,7 +1495,7 @@ function TodoCardBody({ item, state }: { readonly item: Extract<ViewItem, { kind
  * it is worth a look, how it ended. Opening it shows what the tool produced in
  * the shape that tool's output has — a terminal, a diff, a result.
  */
-export const ToolCard = memo(function ToolCard({ item, openPath, hidden, repeats, workspaceId }: {
+export const ToolCard = memo(function ToolCard({ item, openPath, hidden, repeats, workspaceId, withDuration = false }: {
   readonly item: Extract<ViewItem, { kind: 'tool' }>
   /** Consecutive identical waits this row stands for (itself included). */
   readonly repeats?: number
@@ -1472,6 +1503,8 @@ export const ToolCard = memo(function ToolCard({ item, openPath, hidden, repeats
   readonly hidden?: boolean
   /** Serves a generated image's stored bytes; without it the image row shows no preview. */
   readonly workspaceId?: string | null
+  /** Trajectory surfaces pass this to show the recorded call span; the chat keeps rows quiet. */
+  readonly withDuration?: boolean
 }) {
   const { call, result } = item
   const facts = toolFacts(call, result)
@@ -1485,11 +1518,11 @@ export const ToolCard = memo(function ToolCard({ item, openPath, hidden, repeats
   // tool call that only reports the same child id stays out of the transcript.
   if (hidden === true) return null
 
-  if (IMAGE_TOOL_KIND[call.name] !== undefined) return <GeneratedImageCard item={item} state={state} facts={facts} workspaceId={workspaceId ?? null} />
-  if (call.name === 'GenerateVideo') return <GeneratedVideoCard item={item} state={state} facts={facts} workspaceId={workspaceId ?? null} />
-  if (call.name === 'DescribeImage') return <DescribeImageCard item={item} state={state} facts={facts} />
+  if (IMAGE_TOOL_KIND[call.name] !== undefined) return <GeneratedImageCard item={item} state={state} facts={facts} workspaceId={workspaceId ?? null} withDuration={withDuration} />
+  if (call.name === 'GenerateVideo') return <GeneratedVideoCard item={item} state={state} facts={facts} workspaceId={workspaceId ?? null} withDuration={withDuration} />
+  if (call.name === 'DescribeImage') return <DescribeImageCard item={item} state={state} facts={facts} withDuration={withDuration} />
   if (builtin === 'todowrite') {
-    const spec = toolRowSpec(item, state, facts)
+    const spec = toolRowSpec(item, state, facts, undefined, 1, undefined, withDuration)
     return <ActivityRow spec={spec} state={state}><TodoCardBody item={item} state={state} /></ActivityRow>
   }
 
@@ -1497,7 +1530,7 @@ export const ToolCard = memo(function ToolCard({ item, openPath, hidden, repeats
   // file is the link. Anything that did not land opens to say why.
   if (builtin === 'read' && facts.file !== undefined) {
     const settledClean = state === 'ok'
-    const spec = toolRowSpec(item, state, facts, settledClean && open !== null ? { open, label: `Open ${facts.path ?? ''} in workbench` } : undefined)
+    const spec = toolRowSpec(item, state, facts, settledClean && open !== null ? { open, label: `Open ${facts.path ?? ''} in workbench` } : undefined, 1, undefined, withDuration)
     if (settledClean || state === 'running') return <ActivityRow spec={spec} state={state} expandable={false} />
     return (
       <ActivityRow spec={spec} state={state}>
@@ -1518,7 +1551,7 @@ export const ToolCard = memo(function ToolCard({ item, openPath, hidden, repeats
     // The Git view (every uncommitted change, not this call's) is reached
     // from the turn card, where it is labelled as such.
     const opener = state === 'ok' && open !== null ? { open, label: `Open ${facts.path} in workbench` } : undefined
-    const spec = toolRowSpec(item, state, facts, opener)
+    const spec = toolRowSpec(item, state, facts, opener, 1, undefined, withDuration)
     return (
       <ActivityRow spec={spec} state={state}>
         <OutcomeNotes item={item} />
@@ -1536,8 +1569,8 @@ export const ToolCard = memo(function ToolCard({ item, openPath, hidden, repeats
   const skillName = skillLoaded ? arg('name').trim().replace(/^\//, '') : ''
   const skillOpen = skillName !== '' ? openPath?.(skillTabPath(skillName)) ?? null : null
   const spec = skillOpen !== null
-    ? toolRowSpec(item, state, facts, { open: skillOpen, label: `Open skill ${skillName} in workbench` }, repeats, skillName)
-    : toolRowSpec(item, state, facts, undefined, repeats)
+    ? toolRowSpec(item, state, facts, { open: skillOpen, label: `Open skill ${skillName} in workbench` }, repeats, skillName, withDuration)
+    : toolRowSpec(item, state, facts, undefined, repeats, undefined, withDuration)
   if (builtin === 'bash') {
     return <BashCard item={item} spec={spec} state={state} command={arg('command')} {...(links !== undefined ? { links } : {})} />
   }

@@ -47,6 +47,14 @@ export interface SessionSummary {
    * written before subagent listing; those rebuild.
    */
   readonly parentSessionId?: string | null
+  /**
+   * When the user last typed into this conversation: the newest user-typed
+   * `user/message` or `input/queued` (host context, hook wake-ups and reports
+   * excluded), else the first event's time. Unlike `updatedAt` it does not move
+   * while an agent streams, renames or pins, so it is the stable listing order.
+   * Absent in summaries written before it was projected; those rebuild.
+   */
+  readonly lastUserActivityAt?: number
 }
 
 /** Storage seam behind `SessionsService`; file-backed in production. */
@@ -243,7 +251,8 @@ export class FileSessionStore implements SessionStore {
         (parsed['derivedTitle'] !== undefined && parsed['derivedTitle'] !== null && typeof parsed['derivedTitle'] !== 'string') ||
         (parsed['projectId'] !== undefined && parsed['projectId'] !== null && typeof parsed['projectId'] !== 'string') ||
         (parsed['pinned'] !== undefined && typeof parsed['pinned'] !== 'boolean') ||
-        (parsed['parentSessionId'] !== undefined && parsed['parentSessionId'] !== null && typeof parsed['parentSessionId'] !== 'string')
+        (parsed['parentSessionId'] !== undefined && parsed['parentSessionId'] !== null && typeof parsed['parentSessionId'] !== 'string') ||
+        (parsed['lastUserActivityAt'] !== undefined && !Number.isFinite(parsed['lastUserActivityAt']))
       ) return undefined
       return {
         id,
@@ -266,6 +275,10 @@ export class FileSessionStore implements SessionStore {
         // Absent means the summary predates subagent listing; boot rebuilds it.
         ...(parsed['parentSessionId'] !== undefined
           ? { parentSessionId: parsed['parentSessionId'] as string | null }
+          : {}),
+        // Absent means the summary predates the activity mark; boot rebuilds it.
+        ...(parsed['lastUserActivityAt'] !== undefined
+          ? { lastUserActivityAt: parsed['lastUserActivityAt'] as number }
           : {}),
       }
     } catch {

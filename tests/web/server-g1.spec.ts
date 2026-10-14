@@ -125,6 +125,12 @@ describe('input acceptance over REST', () => {
     try {
       const { id } = (await (await post(server.url, '/api/sessions')).json()) as { id: string }
       await post(server.url, `/api/sessions/${id}/messages`, { content: 'first' })
+      // Wait until the first turn has really admitted its input (its model
+      // request is parked on the hung provider). A 202 only means "accepted":
+      // the turn may not have started yet, and a Stop that lands first cancels
+      // it before admission, leaving BOTH inputs queued. That is correct
+      // behaviour, but not the scenario under test, so do not race it.
+      expect(await waitUntil(server, id, (event) => event.type === 'input/settled')).toBeDefined()
       // Accept a second input while the first turn hangs: it queues.
       const during = await post(server.url, `/api/sessions/${id}/messages`, { content: 'queued while hung' })
       expect(during.status).toBe(202)

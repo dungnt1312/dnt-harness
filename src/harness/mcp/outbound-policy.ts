@@ -66,6 +66,11 @@ export function operatorHeaders(headers: Readonly<Record<string, string>> | unde
 }
 
 function isLoopback(hostname: string): boolean {
+  const bare = hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  // NAT64 names a translator, not a local interface. Only mapped/compatible
+  // IPv4 literals may inherit the direct-loopback fixture exception.
+  const words = isIP(bare) === 6 ? ipv6Words(bare) : undefined
+  if (words?.[0] === 0x64 && words[1] === 0xff9b) return false
   const host = unwrapIp(hostname)
   return host === 'localhost' || host === '127.0.0.1' || host === '::1'
 }
@@ -79,10 +84,48 @@ function isProhibitedHost(hostname: string): boolean {
   return false
 }
 
+/**
+ * The address a host names, with an IPv4 address embedded in IPv6 brought
+ * out as dotted IPv4 so the IPv4 ranges apply to it. URL parsing writes
+ * `[::ffff:10.0.0.1]` as `[::ffff:a00:1]`, so the hex form matters most.
+ */
 function unwrapIp(hostname: string): string {
-  const bare = hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(bare)
-  return mapped?.[1] ?? bare.toLowerCase()
+  const bare = (hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname).toLowerCase()
+  if (isIP(bare) !== 6) return bare
+  return embeddedIpv4(bare) ?? bare
+}
+
+/** IPv4-mapped (`::ffff:0:0/96`), IPv4-compatible (`::/96`) or NAT64 (`64:ff9b::/96`). */
+function embeddedIpv4(ip: string): string | undefined {
+  const words = ipv6Words(ip)
+  if (words === undefined) return undefined
+  const high = words.slice(0, 6)
+  const zeroHigh = high.slice(0, 5).every((word) => word === 0)
+  const mapped = zeroHigh && high[5] === 0xffff
+  const compatible = zeroHigh && high[5] === 0 && !(words[6] === 0 && (words[7] ?? 0) <= 1)
+  const nat64 = words[0] === 0x64 && words[1] === 0xff9b && high.slice(2).every((word) => word === 0)
+  if (!mapped && !compatible && !nat64) return undefined
+  const [a = 0, b = 0] = [words[6], words[7]]
+  return `${a >> 8}.${a & 0xff}.${b >> 8}.${b & 0xff}`
+}
+
+/** Eight 16-bit words of a valid IPv6 literal (a dotted IPv4 tail is folded in). */
+function ipv6Words(ip: string): number[] | undefined {
+  let text = ip
+  const dotted = /(\d+\.\d+\.\d+\.\d+)$/.exec(text)
+  if (dotted?.[1] !== undefined) {
+    const value = ipv4Number(dotted[1])
+    if (value === undefined) return undefined
+    text = `${text.slice(0, -dotted[1].length)}${(value >>> 16).toString(16)}:${(value & 0xffff).toString(16)}`
+  }
+  const halves = text.split('::')
+  if (halves.length > 2) return undefined
+  const parse = (part: string | undefined): number[] => part === undefined || part === '' ? [] : part.split(':').map((word) => parseInt(word, 16))
+  const head = parse(halves[0])
+  const tail = parse(halves[1])
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0
+  const words = [...head, ...Array<number>(Math.max(fill, 0)).fill(0), ...tail]
+  return words.length === 8 && words.every((word) => Number.isInteger(word) && word >= 0 && word <= 0xffff) ? words : undefined
 }
 
 function prohibitedV4(ip: string): boolean {
@@ -99,7 +142,9 @@ function prohibitedV4(ip: string): boolean {
 function prohibitedV6(ip: string): boolean {
   const lower = ip.toLowerCase()
   if (lower === '::' || lower === '::1') return true
-  if (lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('fe80')) return true
+  const first = ipv6Words(ip)?.[0]
+  if (first === undefined) return true
+  if ((first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80) return true
   if (lower.startsWith('ff')) return true
   return false
 }

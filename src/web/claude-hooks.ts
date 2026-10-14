@@ -24,6 +24,8 @@ export interface HookHostDeps {
   readonly pluginHooks?: (workspaceId: string, projectId: string | undefined) => Promise<readonly { id: string; root: string; data: string; hooks: unknown; label: string }[]>
   /** Runs `async` / `asyncRewake` hooks; without it they run in the foreground. */
   readonly background?: BackgroundHooks
+  /** Layers the workspace's Sources policy switched off. */
+  readonly disabledLayers?: (workspaceId: string) => Promise<ReadonlySet<string>>
 }
 
 export interface HookFire {
@@ -118,12 +120,18 @@ export class HookHost {
   async resolve(workspaceId: string, projectId: string | undefined): Promise<ResolvedHooks> {
     const workspaceDir = this.workspaceDir(workspaceId)
     const projectRoot = this.deps.projectRootOf(workspaceId, projectId)
-    const plugins = await this.deps.pluginHooks?.(workspaceId, projectId).catch(() => []) ?? []
+    // Both lookups start together: the policy read must not add a serial hop
+    // to the prompt-admission path.
+    const [plugins, disabledLayers] = await Promise.all([
+      this.deps.pluginHooks?.(workspaceId, projectId).catch(() => []) ?? [],
+      this.deps.disabledLayers?.(workspaceId).catch(() => undefined),
+    ])
     return loadHooks({
       ...(this.deps.userClaudeDir !== undefined ? { userDir: this.deps.userClaudeDir } : {}),
       ...(workspaceDir !== undefined ? { workspaceDir } : {}),
       ...(projectRoot !== undefined ? { projectRoot } : {}),
       ...(plugins.length > 0 ? { plugins } : {}),
+      ...(disabledLayers !== undefined && disabledLayers.size > 0 ? { disabledLayers } : {}),
     })
   }
 

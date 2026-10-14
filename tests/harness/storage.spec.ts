@@ -397,6 +397,101 @@ describe('sessions service over files', () => {
     await third.kernel.stop()
   })
 
+  it('projects lastUserActivityAt from user-typed events only, not agent, rename, pin or injected ones', async () => {
+    const id = 'session-activity-a' as SessionId
+    const raw =
+      line(1, { type: 'turn/start', turnId: 't1' }) +
+      line(2, { type: 'user/message', turnId: 't1', content: 'hi' }) +
+      line(3, { type: 'assistant/message', stepId: 's1', content: 'done' }) +
+      line(4, { type: 'session/title', title: 'Renamed' }) +
+      line(5, { type: 'session/pinned', pinned: true }) +
+      line(6, { type: 'user/message', turnId: 't1', content: 'report', origin: 'continuation' }) +
+      line(7, { type: 'turn/end', turnId: 't1', reason: 'completed' })
+    await fs.mkdir(path.dirname(logPath(id)), { recursive: true })
+    await fs.writeFile(logPath(id), raw, 'utf8')
+
+    const { kernel, sessions } = await service(dataDir)
+    await sessions.boot()
+    const summary = sessions.summary(id)
+    // Every event moves `updatedAt`; only the typed message moves the activity mark.
+    expect(summary?.updatedAt).toBe(1_700_000_000_007)
+    expect(summary?.lastUserActivityAt).toBe(1_700_000_000_002)
+    await kernel.stop()
+  })
+
+  it('counts a message typed into a running turn but not a hook wake-up as user activity', async () => {
+    const id = 'session-activity-queued' as SessionId
+    const raw =
+      line(1, { type: 'turn/start', turnId: 't1' }) +
+      line(2, { type: 'user/message', turnId: 't1', content: 'hi' }) +
+      line(3, { type: 'assistant/message', stepId: 's1', content: 'working' }) +
+      line(4, { type: 'input/queued', inputId: 'i1', content: 'also this' }) +
+      line(5, { type: 'input/queued', inputId: 'i2', content: 'hook result', origin: 'hook' }) +
+      line(6, { type: 'turn/end', turnId: 't1', reason: 'completed' })
+    await fs.mkdir(path.dirname(logPath(id)), { recursive: true })
+    await fs.writeFile(logPath(id), raw, 'utf8')
+
+    const { kernel, sessions } = await service(dataDir)
+    await sessions.boot()
+    expect(sessions.summary(id)?.lastUserActivityAt).toBe(1_700_000_000_004)
+    await kernel.stop()
+  })
+
+  it('summaries() lists the conversation the user touched last first, even when another one logged later', async () => {
+    const quiet = 'session-activity-order-quiet' as SessionId
+    const busy = 'session-activity-order-busy' as SessionId
+    const at = (offset: number): number => 1_700_000_000_000 + offset
+    // `busy` was typed into at +2 but its agent kept logging until +9; `quiet`
+    // was typed into at +5 and has been silent since.
+    const busyLog =
+      line(1, { type: 'turn/start', turnId: 't1', timestamp: at(1) }) +
+      line(2, { type: 'user/message', turnId: 't1', content: 'start', timestamp: at(2) }) +
+      line(3, { type: 'assistant/message', stepId: 's1', content: 'still going', timestamp: at(9) })
+    const quietLog =
+      line(1, { type: 'turn/start', turnId: 't1', timestamp: at(1) }) +
+      line(2, { type: 'user/message', turnId: 't1', content: 'typed later', timestamp: at(5) })
+    for (const [id, raw] of [[busy, busyLog], [quiet, quietLog]] as const) {
+      await fs.mkdir(path.dirname(logPath(id)), { recursive: true })
+      await fs.writeFile(logPath(id), raw, 'utf8')
+    }
+
+    const { kernel, sessions } = await service(dataDir)
+    await sessions.boot()
+    const order = sessions.summaries().map((row) => row.id).filter((id) => id === busy || id === quiet)
+    expect(order).toEqual([quiet, busy])
+    await kernel.stop()
+  })
+
+  it('boot rebuilds a summary written before lastUserActivityAt existed', async () => {
+    const { kernel, sessions, dir } = await service()
+    await sessions.boot()
+    const session = sessions.create('ws-summary-activity' as never)
+    session.append({ type: 'user/message', turnId: 't1' as never, content: 'hi' })
+    await session.durable()
+    await sessions.flushSummary(session)
+    const typedAt = session.events[0]!.timestamp
+    const store = new FileSessionStore({ dir, workspaceId: 'ws-summary-activity' as never })
+    // Current in every other field and in its claimed prefix: only the new mark is missing.
+    await store.writeSummary(session.id, {
+      id: session.id,
+      createdAt: typedAt,
+      updatedAt: typedAt,
+      eventCount: 1,
+      lastSeq: 1,
+      title: null,
+      derivedTitle: 'hi',
+      projectId: null,
+      parentSessionId: null,
+    })
+    await kernel.stop()
+
+    const restarted = await service(dir)
+    await restarted.sessions.boot()
+    expect(restarted.sessions.summary(session.id)?.lastUserActivityAt).toBe(typedAt)
+    expect((await store.readSummary(session.id))?.lastUserActivityAt).toBe(typedAt)
+    await restarted.kernel.stop()
+  })
+
   it('boot lists stored sessions; load runs lazily and preserves history', async () => {
     const { kernel, sessions, dir: shared } = await service()
     await sessions.boot()
@@ -605,7 +700,7 @@ describe('sessions service over files', () => {
       },
       replace: async () => {},
       writeSummary: vi.fn(async () => {}),
-      readSummary: async () => ({ id, createdAt: 1, updatedAt: 1, eventCount: 0, lastSeq: 0, title: null, derivedTitle: null, projectId: null, parentSessionId: null }),
+      readSummary: async () => ({ id, createdAt: 1, updatedAt: 1, eventCount: 0, lastSeq: 0, title: null, derivedTitle: null, projectId: null, parentSessionId: null, lastUserActivityAt: 1 }),
       list: async () => [id],
       remove,
     }
