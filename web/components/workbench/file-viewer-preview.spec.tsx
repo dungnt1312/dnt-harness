@@ -115,10 +115,20 @@ it('keeps the file to one toolbar: its folder, a view switch when it has one, an
   expect(host.textContent).toContain('typescript')
 })
 
-it('a file at the project root names the project folder, not a bare slash', async () => {
+it('a file at the project root shows no folder name, only its full path on hover', async () => {
   readProjectFile.mockResolvedValue({ path: 'main.ts', size: 12, binary: false, truncated: false, content: 'const a = 1\n', editable: true, hash: 'h1' })
   await render('main.ts')
-  expect(host.querySelector('[title="/repo/main.ts"]')?.textContent).toBe('repo')
+  expect(host.querySelector('[title="/repo/main.ts"]')?.textContent).toBe('')
+  expect(host.textContent).not.toContain('repo')
+})
+
+it('puts the small view switch first, at the left of the toolbar', async () => {
+  readProjectFile.mockResolvedValue({ path: 'docs/README.md', size: 20, binary: false, truncated: false, content: '# Title\ntext', editable: true, hash: 'h1' })
+  await render('docs/README.md')
+  const bar = host.querySelector('[aria-label="View mode"]')!.parentElement!
+  expect(bar.firstElementChild?.getAttribute('aria-label')).toBe('View mode')
+  expect([...bar.querySelectorAll('[aria-label="View mode"] button')].every((b) => b.className.includes('h-5'))).toBe(true)
+  expect(bar.textContent).toContain('docs')
 })
 
 it('a skill tab previews its SKILL.md and is marked read-only', async () => {

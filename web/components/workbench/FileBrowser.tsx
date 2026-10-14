@@ -81,8 +81,15 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRe
     if (nodes[folder] === undefined) void load(folder)
   }
 
+  /** Search is a box that opens in the header row on demand, so it costs no row while unused. */
+  const [searchOpen, setSearchOpen] = useState(false)
+  const closeSearch = (): void => {
+    search.setQuery('')
+    setSearchOpen(false)
+  }
+
   const startCreate = (kind: 'file' | 'dir'): void => {
-    search.setQuery('') // the draft lives in the tree, which is hidden while searching
+    closeSearch() // the draft lives in the tree, which is hidden while searching
     const folder = targetFolder(selected)
     const chain = ancestorsOf(folder)
     if (chain.length > 0) setOpen((current) => new Set([...current, ...chain]))
@@ -178,37 +185,43 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRe
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-      <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line px-2.5 text-[13px]">
-        <Icon name="folder" size={14} className="shrink-0 text-fg-muted" />
-        <span className="min-w-0 flex-1 truncate font-medium" title={project.path}>{project.name}</span>
-        <IconButton label="New file" onClick={() => startCreate('file')}><Icon name="plus" size={15} /></IconButton>
-        <Menu label="More explorer actions" align="end" triggerClassName={MORE_TRIGGER} trigger={() => <Icon name="dots" size={15} />}>
-          {(close) => (
-            <>
-              <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); startCreate('dir') }}>
-                <Icon name="folder" size={14} />New folder
-              </button>
-              <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); void load('') }}>
-                <Icon name="refresh" size={14} />Refresh
-              </button>
-              <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); copyPath('', true) }}>
-                <Icon name="copy" size={14} />Copy project path
-              </button>
-            </>
-          )}
-        </Menu>
-      </div>
-      <div className="shrink-0 border-b border-line p-2">
-        <TextInput
-          aria-label="Search files"
-          placeholder="Search files"
-          value={search.query}
-          onChange={(event) => search.setQuery(event.target.value)}
-          onKeyDown={(event) => { if (event.key === 'Escape') search.setQuery('') }}
-          leading={<Icon name="search" size={13} />}
-          trailing={search.query !== '' ? <IconButton label="Clear search" size="sm" onClick={() => search.setQuery('')}><Icon name="close" size={13} /></IconButton> : undefined}
-          className="h-8"
-        />
+      {/* One header row: the actions, or — while searching — the search box in their place. */}
+      <div className="flex h-9 shrink-0 items-center gap-1 border-b border-line px-1.5 text-[13px]">
+        {searchOpen ? (
+          <TextInput
+            autoFocus
+            aria-label="Search files"
+            placeholder="Search files"
+            value={search.query}
+            onChange={(event) => search.setQuery(event.target.value)}
+            onKeyDown={(event) => { if (event.key === 'Escape') closeSearch() }}
+            onBlur={() => { if (search.query.trim() === '') setSearchOpen(false) }}
+            leading={<Icon name="search" size={13} />}
+            trailing={<IconButton label="Close search" size="sm" onMouseDown={(event) => event.preventDefault()} onClick={closeSearch}><Icon name="close" size={13} /></IconButton>}
+            className="h-7 flex-1"
+          />
+        ) : (
+          <>
+            <span aria-hidden="true" className="flex-1" />
+            <IconButton label="Open file search" onClick={() => setSearchOpen(true)}><Icon name="search" size={15} /></IconButton>
+            <IconButton label="New file" onClick={() => startCreate('file')}><Icon name="plus" size={15} /></IconButton>
+            <Menu label="More explorer actions" align="end" triggerClassName={MORE_TRIGGER} trigger={() => <Icon name="dots" size={15} />}>
+              {(close) => (
+                <>
+                  <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); startCreate('dir') }}>
+                    <Icon name="folder" size={14} />New folder
+                  </button>
+                  <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); void load('') }}>
+                    <Icon name="refresh" size={14} />Refresh
+                  </button>
+                  <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); copyPath('', true) }}>
+                    <Icon name="copy" size={14} />Copy project path
+                  </button>
+                </>
+              )}
+            </Menu>
+          </>
+        )}
       </div>
       {search.searching ? (
         <div className="min-h-0 flex-1 overflow-auto py-1">

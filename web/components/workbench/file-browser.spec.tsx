@@ -95,6 +95,11 @@ const enter = async (input: HTMLInputElement) => act(async () => {
   input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
 })
 const menuItem = (text: string) => [...document.body.querySelectorAll<HTMLButtonElement>('[role="menu"] button')].find((button) => button.textContent?.includes(text))!
+/** The search box opens in the header on demand; returns it, ready to type into. */
+async function openSearch(): Promise<HTMLInputElement> {
+  if (host.querySelector('input[aria-label="Search files"]') === null) await click(byLabel('Open file search'))
+  return byLabel('Search files') as HTMLInputElement
+}
 
 /** A clipboard double so copy actions can be asserted; jsdom has none. Runs (and clicks) inside the install window. */
 async function copyThrough(run: () => void | Promise<void>): Promise<string[]> {
@@ -267,7 +272,7 @@ describe('drag rows', () => {
       await mount()
       expect(dragStart(row('src')).get(PROJECT_FILE_DRAG_TYPE)).toBe('{"path":"src","kind":"dir"}')
       searchProjectFiles.mockResolvedValueOnce({ query: 'ind', truncated: false, matches: [{ name: 'index.ts', path: 'src/index.ts', score: 3 }] } as never)
-      await typeInto(byLabel('Search files') as HTMLInputElement, 'ind')
+      await typeInto(await openSearch(), 'ind')
       await act(async () => { await vi.advanceTimersByTimeAsync(250) })
       const results = host.querySelector('[aria-label="Search results"]')!
       const written = dragStart(results.querySelector<HTMLButtonElement>('button[title="src/index.ts"]')!)
@@ -283,7 +288,7 @@ describe('drag rows', () => {
     try {
       searchProjectFiles.mockResolvedValueOnce({ query: 'ind', truncated: false, matches: [{ name: 'index.ts', path: 'src/index.ts', score: 3 }] } as never)
       await mount()
-      await typeInto(byLabel('Search files') as HTMLInputElement, 'ind')
+      await typeInto(await openSearch(), 'ind')
       await act(async () => { await vi.advanceTimersByTimeAsync(250) })
       await click(byLabel('Actions for index.ts'))
       expect(await copyThrough(() => menuItem('Copy absolute path').click())).toEqual(['/proj/src/index.ts'])
@@ -300,10 +305,41 @@ describe('explorer search', () => {
   const search = () => byLabel('Search files') as HTMLInputElement
   const settle = async (ms = 250) => act(async () => { await vi.advanceTimersByTimeAsync(ms) })
 
+  it('takes no row of its own: the box opens in the header in place of the actions, and closes again', async () => {
+    await mount()
+    expect(host.querySelector('input[aria-label="Search files"]')).toBeNull()
+    expect(host.querySelector('[aria-label="New file"]')).not.toBeNull()
+    await click(byLabel('Open file search'))
+    expect(document.activeElement).toBe(search())
+    expect(host.querySelector('[aria-label="New file"]')).toBeNull()
+    await typeInto(search(), 'ind')
+    await click(byLabel('Close search'))
+    expect(host.querySelector('input[aria-label="Search files"]')).toBeNull()
+    expect(host.querySelector('[aria-label="New file"]')).not.toBeNull()
+    expect(host.querySelector('[aria-label="Search results"]')).toBeNull()
+  })
+
+  it('folds back by itself when focus leaves an empty box, and stays open while it holds a query', async () => {
+    await mount()
+    await openSearch()
+    await act(async () => { search().blur() })
+    expect(host.querySelector('input[aria-label="Search files"]')).toBeNull()
+    await openSearch()
+    await typeInto(search(), 'ind')
+    await act(async () => { search().blur() })
+    expect(search().value).toBe('ind')
+  })
+
+  it('no longer names the project in the explorer header', async () => {
+    await mount()
+    const header = byLabel('More explorer actions').parentElement!
+    expect(header.textContent).not.toContain('proj')
+  })
+
   it('debounces, lists matches with their folder, and opens a result', async () => {
     searchProjectFiles.mockResolvedValueOnce({ query: 'ind', truncated: false, matches: [{ name: 'index.ts', path: 'src/index.ts', score: 3 }] } as never)
     await mount()
-    await typeInto(search(), 'ind')
+    await typeInto(await openSearch(), 'ind')
     expect(searchProjectFiles).not.toHaveBeenCalled()
     await settle()
     expect(searchProjectFiles).toHaveBeenCalledWith('ws1', 'p1', 'ind', 50)
@@ -317,7 +353,7 @@ describe('explorer search', () => {
   it('says when nothing matches and when results may be incomplete', async () => {
     searchProjectFiles.mockResolvedValueOnce({ query: 'zzz', truncated: true, matches: [] } as never)
     await mount()
-    await typeInto(search(), 'zzz')
+    await typeInto(await openSearch(), 'zzz')
     await settle()
     expect(host.textContent).toContain('No matching files')
     expect(host.textContent).toContain('Results may be incomplete.')
@@ -329,7 +365,7 @@ describe('explorer search', () => {
       .mockImplementationOnce(() => new Promise((resolve) => { releaseOld = resolve }) as never)
       .mockResolvedValueOnce({ query: 'new', truncated: false, matches: [{ name: 'new.ts', path: 'new.ts', score: 3 }] } as never)
     await mount()
-    await typeInto(search(), 'old')
+    await typeInto(await openSearch(), 'old')
     await settle()
     await typeInto(search(), 'new')
     await settle()
@@ -339,33 +375,33 @@ describe('explorer search', () => {
     expect(results.textContent).not.toContain('old.ts')
   })
 
-  it('returns to the tree with its folders still open on Escape', async () => {
+  it('returns to the tree with its folders still open on Escape, and folds the box away', async () => {
     await mount()
     await click(row('src'))
     expect(rowNames()).toContain('index.ts')
-    await typeInto(search(), 'x')
+    await typeInto(await openSearch(), 'x')
     await settle()
     await act(async () => search().dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
-    expect(search().value).toBe('')
+    expect(host.querySelector('input[aria-label="Search files"]')).toBeNull()
     expect(host.querySelector('[aria-label="Search results"]')).toBeNull()
     expect(rowNames()).toContain('index.ts')
   })
 
   it('never searches a blank query', async () => {
     await mount()
-    await typeInto(search(), '   ')
+    await typeInto(await openSearch(), '   ')
     await settle()
     expect(searchProjectFiles).not.toHaveBeenCalled()
   })
 
-  it('leaves search mode when New file is clicked, so the focused draft is visible', async () => {
+  it('closing search brings the tree and its actions back, so New file shows its focused draft', async () => {
     searchProjectFiles.mockResolvedValueOnce({ query: 'ind', truncated: false, matches: [{ name: 'index.ts', path: 'src/index.ts', score: 3 }] } as never)
     await mount()
-    await typeInto(search(), 'ind')
+    await typeInto(await openSearch(), 'ind')
     await settle()
     expect(host.querySelector('[aria-label="Search results"]')).not.toBeNull()
+    await click(byLabel('Close search'))
     await click(byLabel('New file'))
-    expect(search().value).toBe('')
     expect(host.querySelector('[aria-label="Search results"]')).toBeNull()
     const input = byLabel('New file name')
     expect(input).toBeTruthy()

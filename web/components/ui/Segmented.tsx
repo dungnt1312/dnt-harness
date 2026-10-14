@@ -12,10 +12,11 @@ export function Segmented<V extends string>({ value, options, onChange, label, d
   readonly onChange: (value: V) => void
   readonly label: string
   readonly disabled?: boolean
-  readonly size?: 'default' | 'compact'
+  /** `mini` fits a 36px toolbar without leading it: a quiet view switch, not a primary control. */
+  readonly size?: 'default' | 'compact' | 'mini'
 }) {
   return (
-    <span className={cn('inline-flex shrink-0 rounded-lg bg-muted p-0.5', disabled && 'opacity-50')} role="group" aria-label={label}>
+    <span className={cn('inline-flex shrink-0 bg-muted p-0.5', size === 'mini' ? 'rounded-md' : 'rounded-lg', disabled && 'opacity-50')} role="group" aria-label={label}>
       {options.map((option) => (
         <button
           key={option.value}
@@ -25,7 +26,7 @@ export function Segmented<V extends string>({ value, options, onChange, label, d
           onClick={() => onChange(option.value)}
           className={cn(
             'inline-flex items-center gap-1 rounded-md font-medium text-fg-muted transition-colors hover:text-fg disabled:pointer-events-none',
-            size === 'compact' ? 'h-6 px-2 text-[11px]' : 'h-7 px-2.5 text-xs',
+            size === 'mini' ? 'h-5 rounded px-1.5 text-[11px] leading-none' : size === 'compact' ? 'h-6 px-2 text-[11px]' : 'h-7 px-2.5 text-xs',
             option.value === value && 'bg-surface text-fg shadow-sm dark:bg-hover',
           )}
         >
