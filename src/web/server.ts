@@ -8019,32 +8019,39 @@ async function handleProjectGitAction(
           json(400, { error: model.error })
           return
         }
+        // A client that leaves while the diff is still being read must stop the
+        // work before the model is asked: `aborted` is the outer close flag.
         const diff = await commitMessageDiff(project.path, trusted)
+        if (aborted || res.destroyed) return
         const prompt = commitMessagePrompt(diff, subject === undefined ? undefined : subject)
         const controller = new AbortController()
-        const onClose = (): void => { if (!res.writableFinished) controller.abort() }
-        res.once('close', onClose)
+        const onStreamClose = (): void => { if (!res.writableFinished) controller.abort() }
+        res.once('close', onStreamClose)
+        const startedAt = Date.now()
+        // Some providers report usage more than once; the last report wins (as the session tap does).
+        let lastUsage: { inputTokens: number; cachedInputTokens?: number; outputTokens?: number } | undefined
         try {
           frame({ type: 'start' })
           for await (const text of streamCommitMessage(
             { stream: (request, signal) => deps.commitMessageStream(request, signal) },
             { providerName: model.providerName, model: model.model, prompt },
             controller.signal,
-            (usage) => {
-              deps.recordUsage({
-                v: 1, at: Date.now(), startedAt: Date.now(), workspaceId: wsId as string,
-                sessionId: `git:${pid as string}`, rootSessionId: `git:${pid as string}`,
-                kind: 'commit-message', provider: model.providerName, model: model.model,
-                input: usage.inputTokens, cached: usage.cachedInputTokens ?? 0,
-                cacheReported: usage.cachedInputTokens !== undefined, output: usage.outputTokens ?? 0,
-              })
-            },
+            (usage) => { lastUsage = usage },
           )) {
             frame({ type: 'delta', text })
           }
           frame({ type: 'done', ok: true })
         } finally {
-          res.off('close', onClose)
+          res.off('close', onStreamClose)
+          if (lastUsage !== undefined) {
+            deps.recordUsage({
+              v: 1, at: Date.now(), startedAt, workspaceId: wsId as string,
+              sessionId: `git:${pid as string}`, rootSessionId: `git:${pid as string}`,
+              kind: 'commit-message', provider: model.providerName, model: model.model,
+              input: lastUsage.inputTokens, cached: lastUsage.cachedInputTokens ?? 0,
+              cacheReported: lastUsage.cachedInputTokens !== undefined, output: lastUsage.outputTokens ?? 0,
+            })
+          }
         }
       }
       return

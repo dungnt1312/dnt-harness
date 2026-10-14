@@ -235,3 +235,66 @@ describe('commit-message', () => {
     expect(ok.frames.at(-1)).toMatchObject({ type: 'done' })
   })
 })
+
+describe('commit-message lifecycle (final review I2, I3)', () => {
+  /** A control-plane server with a paired browser, one repository, and a provider scripted by the test. */
+  async function liveContext(provider: LlmProvider): Promise<{ actions: string; browser: Headers; usageUrl: string; base: string }> {
+    const home = path.join(scratch, `home-life-${++counter}`)
+    await fs.mkdir(home)
+    await fs.writeFile(path.join(home, 'commit-message.json'), JSON.stringify({ provider: provider.name, model: 'm' }))
+    server = await createWebServer({ home, configFile: path.join(home, 'providers.json'), controlPlaneAuth: true, providers: [provider] })
+    const browser = await pairBrowser(server)
+    const wsId = ((await (await fetch(`${server.url}/api/workspaces`, { headers: browser })).json()) as { id: string }[])[0]!.id
+    const root = await makeRepo()
+    await fs.writeFile(path.join(root, 'a.txt'), 'changed\n')
+    const created = await raw('POST', `${server.url}/api/workspaces/${wsId}/projects`, { name: 'Git', path: root }, browser)
+    const projectId = (JSON.parse(created.body) as { id: string }).id
+    return { actions: `${server.url}/api/workspaces/${wsId}/projects/${projectId}/git`, browser, usageUrl: `${server.url}/api/usage`, base: server.url }
+  }
+
+  it('records ONE usage row when the provider reports usage several times', async () => {
+    const reporting: LlmProvider = {
+      name: 'fake', models: ['m'],
+      stream: async function* (): AsyncGenerator<StreamEvent> {
+        yield { type: 'delta', delta: 'Add' }
+        yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 1 } }
+        yield { type: 'delta', delta: ' x' }
+        yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 4 } }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const ctx = await liveContext(reporting)
+    const answer = await post(`${ctx.actions}/commit-message`, {}, ctx.browser)
+    expect(answer.status).toBe(200)
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    const usage = await (await fetch(ctx.usageUrl, { headers: ctx.browser })).json() as { days?: readonly { model: string; requests: number; output: number }[] }
+    const rows = (usage.days ?? []).filter((row) => row.model === 'm')
+    expect(rows.reduce((sum, row) => sum + row.requests, 0)).toBe(1)
+    // The LAST report wins, as the session tap does.
+    expect(rows.reduce((sum, row) => sum + row.output, 0)).toBe(4)
+  })
+
+  it('a client that leaves while the diff is still being computed never starts the model request', async () => {
+    let started = 0
+    const watching: LlmProvider = {
+      name: 'fake', models: ['m'],
+      stream: async function* (): AsyncGenerator<StreamEvent> {
+        started += 1
+        yield { type: 'delta', delta: 'x' }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      },
+    }
+    const ctx = await liveContext(watching)
+    // Hang up the moment the request is sent, long before git has produced the diff.
+    await new Promise<void>((resolve) => {
+      const target = new URL(`${ctx.actions}/commit-message`)
+      const req = httpRequest({ host: target.hostname, port: target.port, path: target.pathname, method: 'POST', headers: { 'content-type': 'application/json', ...ctx.browser } })
+      req.on('error', () => resolve())
+      req.write('{}')
+      req.end()
+      setTimeout(() => { req.destroy(); resolve() }, 5)
+    })
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    expect(started).toBe(0)
+  })
+})
