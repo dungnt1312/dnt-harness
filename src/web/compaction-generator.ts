@@ -1,6 +1,8 @@
+import { estimateContentTokens, estimateTokens, schemaCost } from '../harness/context/budget.ts'
 import { MAX_COMPACTION_SUMMARY_CHARS } from '../harness/context/compaction.ts'
 import type { EffectiveCompactionSnapshot, SnapshotIdentity } from '../harness/context/compaction-snapshot.ts'
 import { validateCompletion } from '../harness/llm/completion.ts'
+import { DRAFT_TOO_LONG, MAX_DRAFT_CHARS, condenseDraft } from './compaction-condense.ts'
 import type { ModelMessage, ModelRequest, StreamEvent, StreamOptions, TokenUsage } from '../harness/llm/types.ts'
 
 /**
@@ -69,15 +71,20 @@ function requestFor(snapshot: EffectiveCompactionSnapshot, instruction: string, 
 }
 
 interface Attempt {
-  /** Trimmed answer text; undefined when the answer exceeded the cap. */
-  readonly text: string | undefined
+  /** Trimmed answer text; empty when the model was cut off by its output limit. */
+  readonly text: string
+  readonly finish: 'stop' | 'length'
   readonly usage?: TokenUsage
 }
 
-/** One attempt: exactly one settled stop, no tools, bounded text. Reported usage is recorded even on failure. */
-async function runAttempt(stream: GenerateOptions['stream'], request: ModelRequest, signal: AbortSignal, record: (usage: TokenUsage) => void): Promise<Attempt> {
+/**
+ * One attempt: exactly one settled completion, no tools, text up to `cap`
+ * (beyond it the attempt throws `overflow`). A `length` finish is returned, not
+ * thrown, when `allowLength`. Reported usage is recorded even on failure.
+ */
+async function runAttempt(stream: GenerateOptions['stream'], request: ModelRequest, signal: AbortSignal, record: (usage: TokenUsage) => void, cap: number, overflow: string, allowLength: boolean): Promise<Attempt> {
   let text = ''
-  let overflowed = false
+  let finish: 'stop' | 'length' = 'stop'
   let completions = 0
   let usage: TokenUsage | undefined
   try {
@@ -89,13 +96,14 @@ async function runAttempt(stream: GenerateOptions['stream'], request: ModelReque
       } else if (event.type === 'completion') {
         completions++
         if (completions > 1) throw new Error('compaction duplicate completion')
-        validateCompletion(event)
-        if (event.finishReason !== 'stop') throw new Error('compaction requires stop completion')
+        validateCompletion(event, { allowLength })
+        if (event.finishReason === 'length' && allowLength) finish = 'length'
+        else if (event.finishReason !== 'stop') throw new Error('compaction requires stop completion')
       } else if (event.type === 'toolCalls' || event.type === 'toolCallProgress') {
         throw new Error('compaction tool output rejected')
-      } else if (event.type === 'delta' && event.thinking !== true && !overflowed) {
-        if (text.length + event.delta.length > MAX_COMPACTION_SUMMARY_CHARS) overflowed = true
-        else text += event.delta
+      } else if (event.type === 'delta' && event.thinking !== true) {
+        if (text.length + event.delta.length > cap) throw new Error(overflow)
+        text += event.delta
       }
     }
     signal.throwIfAborted()
@@ -103,9 +111,9 @@ async function runAttempt(stream: GenerateOptions['stream'], request: ModelReque
   } finally {
     if (usage !== undefined) record(usage)
   }
-  if (overflowed) return { text: undefined, ...(usage !== undefined ? { usage } : {}) }
+  if (finish === 'length') return { text: '', finish, ...(usage !== undefined ? { usage } : {}) }
   if (text.trim() === '') throw new Error('compaction summarizer returned an empty summary')
-  return { text: text.trim(), ...(usage !== undefined ? { usage } : {}) }
+  return { text: text.trim(), finish, ...(usage !== undefined ? { usage } : {}) }
 }
 
 export async function generateCompaction(snapshot: EffectiveCompactionSnapshot, options: GenerateOptions): Promise<PreparedSummary> {
@@ -116,17 +124,27 @@ export async function generateCompaction(snapshot: EffectiveCompactionSnapshot, 
   const timer = setTimeout(() => deadline.abort(new Error('compaction deadline exceeded')), remaining)
   const signal = AbortSignal.any([options.signal, deadline.signal])
   try {
-    let attempt = await runAttempt(options.stream, requestFor(snapshot, HANDOFF_INSTRUCTION, options.maxOutputTokens), signal, options.recordUsage)
-    if (attempt.text === undefined) {
-      // One re-ask, same prefix, explicit hard limit. A second overflow is final.
-      const retryInstruction = `${HANDOFF_INSTRUCTION}\n\nHARD CONSTRAINT: your previous answer exceeded the limit. Rewrite it in at most ${MAX_COMPACTION_SUMMARY_CHARS} characters. Drop detail in this order: completed work older than the earliest still-relevant item, then verbose command-output descriptions. Never drop the user's constraints, the current task, latest verified outcomes, or pending work.`
-      attempt = await runAttempt(options.stream, requestFor(snapshot, retryInstruction, options.maxOutputTokens), signal, options.recordUsage)
-      if (attempt.text === undefined) throw new Error(`compaction summarizer output exceeds ${MAX_COMPACTION_SUMMARY_CHARS} characters`)
+    // A complete draft up to MAX_DRAFT_CHARS is accepted; a longer one is condensed below.
+    let attempt = await runAttempt(options.stream, requestFor(snapshot, HANDOFF_INSTRUCTION, options.maxOutputTokens), signal, options.recordUsage, MAX_DRAFT_CHARS, DRAFT_TOO_LONG, true)
+    if (attempt.finish === 'length') {
+      // One re-ask, same prefix, explicit hard limit. A second cut-off is final.
+      const retryInstruction = `${HANDOFF_INSTRUCTION}\n\nHARD CONSTRAINT: your previous answer was cut off by the output limit. Rewrite it in at most ${MAX_COMPACTION_SUMMARY_CHARS} characters. Drop detail in this order: completed work older than the earliest still-relevant item, then verbose command-output descriptions. Never drop the user's constraints, the current task, latest verified outcomes, or pending work.`
+      // Read like the first draft: a complete answer over 24 000 is condensed below, not refused.
+      attempt = await runAttempt(options.stream, requestFor(snapshot, retryInstruction, options.maxOutputTokens), signal, options.recordUsage, MAX_DRAFT_CHARS, DRAFT_TOO_LONG, false)
     }
+    const { request } = snapshot
+    const summary = attempt.text.length <= MAX_COMPACTION_SUMMARY_CHARS
+      ? attempt.text
+      : await condenseDraft(attempt.text, {
+        stream: options.stream,
+        pair: request.providerName !== undefined && request.model !== undefined ? { providerName: request.providerName, model: request.model } : undefined,
+        signal,
+        recordUsage: options.recordUsage,
+      })
     return {
       snapshotId: snapshot.id,
       cutoff: snapshot.cutoff,
-      summary: attempt.text,
+      summary,
       sourceDigest: snapshot.sourceDigest,
       identity: snapshot.identity,
       ...(snapshot.seedHash !== undefined ? { seedHash: snapshot.seedHash } : {}),
@@ -165,19 +183,26 @@ function messageChars(message: ModelMessage): number {
  * instruction — is estimated, with a 20% margin. Without a report the whole
  * request is estimated conservatively. Always labelled, never a verified count.
  */
-export function estimateSnapshotTokens(snapshot: EffectiveCompactionSnapshot): TokenEstimate {
+export function estimateSnapshotTokens(snapshot: EffectiveCompactionSnapshot, path: SummaryPath = 'exact'): TokenEstimate {
   const added = charsToTokens(messageChars(snapshot.finalAnswer) + HANDOFF_INSTRUCTION.length)
   if (snapshot.inputEvidence !== undefined) {
     return { tokens: snapshot.inputEvidence.inputTokens + Math.ceil(added * UNMEASURED_MARGIN), basis: 'reported' }
+  }
+  if (path === 'reconstructed') {
+    // The context builder just sized this very request with its own estimator and fitted it to
+    // the budget; a margin on top would refuse what the builder itself accepted.
+    const history = [...snapshot.request.messages, snapshot.finalAnswer]
+      .reduce((total, message) => total + estimateContentTokens(message.content) + (message.toolCalls !== undefined ? estimateTokens(JSON.stringify(message.toolCalls)) : 0), 0)
+    return { tokens: history + schemaCost(snapshot.request.tools ?? []) + estimateTokens(HANDOFF_INSTRUCTION), basis: 'estimated' }
   }
   const prefix = snapshot.request.messages.reduce((total, message) => total + messageChars(message), 0) + JSON.stringify(snapshot.request.tools ?? []).length
   return { tokens: Math.ceil((charsToTokens(prefix) + added) * UNMEASURED_MARGIN), basis: 'estimated' }
 }
 
 /** Refuse a summary request that cannot leave room for its own answer. An unknown window is left to the provider. */
-export function assertFitsWindow(snapshot: EffectiveCompactionSnapshot, limits: { readonly contextWindowTokens?: number; readonly outputTokens: number }): void {
+export function assertFitsWindow(snapshot: EffectiveCompactionSnapshot, limits: { readonly contextWindowTokens?: number; readonly outputTokens: number }, path: SummaryPath = 'exact'): void {
   if (limits.contextWindowTokens === undefined) return
-  const estimate = estimateSnapshotTokens(snapshot)
+  const estimate = estimateSnapshotTokens(snapshot, path)
   if (estimate.tokens + limits.outputTokens > limits.contextWindowTokens) {
     throw new Error(`compaction-input-too-large: ~${estimate.tokens} input tokens (${estimate.basis}) plus ${limits.outputTokens} output exceed the ${limits.contextWindowTokens}-token window`)
   }

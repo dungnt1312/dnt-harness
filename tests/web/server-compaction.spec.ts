@@ -10,7 +10,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
-import { createWebServer, ProviderError, withoutSentStamp, type LlmProvider, type WebServer } from 'dnt-harness'
+import { AttemptAdmission, createWebServer, ProviderError, withoutSentStamp, type LlmProvider, type WebServer } from 'dnt-harness'
 import type { ModelRequest, StreamEvent } from '../../src/harness/llm/types.ts'
 import type { HarnessLimits } from '../../src/harness/limits.ts'
 
@@ -318,7 +318,9 @@ describe('web compaction', () => {
       replies: [longReply, tailReply],
       summarize(request) {
         const chunk = conversationChunk(request)
-        chunks.push(chunk)
+        // Chunk requests run in parallel and may start in any order; the merge request is not a source chunk.
+        const part = /This is part (\d+) of \d+ of one conversation/.exec(String(request.messages[0]!.content))
+        if (part !== null) chunks[Number(part[1]) - 1] = chunk
         // A bounded source echo makes late state visible without exceeding the output cap.
         return `SOURCE ECHO\n${chunk.slice(-2_000)}`
       },
@@ -404,6 +406,109 @@ describe('web compaction', () => {
     expect(appended.map((event) => event.type)).toEqual(['compaction/start', 'compaction/end'])
     expect(appended[1]).toMatchObject({ error: 'provider transport failure', summaryChars: 0 })
     expect(appended[1].summary).toBeUndefined()
+  })
+
+  describe('parallel fold over the server', () => {
+    const PART = /This is part (\d+) of (\d+) of one conversation/
+    /** One long reply, so the fold needs `chunks` parts; `onChunk` runs a chunk request, the rest answer instantly. */
+    async function foldSession(onChunk: (request: ModelRequest, signal: AbortSignal | undefined) => AsyncIterable<StreamEvent>, capacity?: number) {
+      const summaryRequests = { count: 0, withUsage: 0 }
+      const provider: LlmProvider = {
+        name: 'scripted', models: ['scripted'],
+        stream(request, options) {
+          const body = String(request.messages[0]?.content)
+          const isSummaryCall = request.messages.some((m) => typeof m.content === 'string' && m.content.includes(COMPACT_MARK))
+          if (isSummaryCall) summaryRequests.count++
+          if (isSummaryCall && request.messages.length > 1) {
+            return (async function* (): AsyncIterable<StreamEvent> {
+              yield { type: 'toolCalls', calls: [{ id: 'refuse', name: 'Read', args: {} }] }
+              yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+            })()
+          }
+          if (isSummaryCall && PART.test(body)) return onChunk(request, options?.signal)
+          return (async function* (): AsyncIterable<StreamEvent> {
+            yield { type: 'delta', delta: isSummaryCall ? SUMMARY_TEXT : 'synthetic historical detail\n'.repeat(30_000) }
+            if (isSummaryCall) { summaryRequests.withUsage++; yield { type: 'usage', usage: FOLD_USAGE } }
+            yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+          })()
+        },
+      }
+      const started = await start(provider)
+      if (capacity !== undefined) started.server.kernel.ctx.llm.configureAdmission('scripted', new AttemptAdmission(capacity))
+      const { id } = await (await fetch(`${started.base}/api/workspaces/${started.wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+      const logPath = path.join(started.home, 'workspaces', started.wsId, 'sessions', id, 'events.jsonl')
+      await completedMessage(started.base, started.wsId, id, logPath, 'long history', 1)
+      return { ...started, logPath, summaryRequests, compact: () => fetch(`${started.base}/api/workspaces/${started.wsId}/sessions/${id}/compact`, { method: 'POST' }) }
+    }
+    const FOLD_USAGE = { inputTokens: 100, cachedInputTokens: 40, outputTokens: 10 }
+    const answered = (summaryRequests?: { withUsage: number }): AsyncIterable<StreamEvent> => (async function* () {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      yield { type: 'delta', delta: 'part summary' }
+      if (summaryRequests !== undefined) { summaryRequests.withUsage++; yield { type: 'usage', usage: FOLD_USAGE } }
+      yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+    })()
+
+    it('reports fold progress up to the chunk total, and the ended job counts every request and sums their usage', async () => {
+      const counters: { withUsage: number }[] = []
+      const { compact, logPath, summaryRequests } = await foldSession(() => answered(counters[0]))
+      counters[0] = summaryRequests
+      expect((await compact()).status).toBe(200)
+      const jobs = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as Record<string, any>).filter((event) => event.type === 'compaction/job')
+      const progress = jobs.filter((job) => job.stage === 'generating').map((job) => job.progress as { done: number; total: number })
+      expect(progress.length).toBeGreaterThan(2)
+      expect(progress[0]!.done).toBe(0)
+      const total = progress[0]!.total
+      expect(total).toBeGreaterThan(1)
+      expect(progress.every((p) => p.total === total)).toBe(true)
+      expect(progress.map((p) => p.done)).toEqual([...progress.map((p) => p.done)].sort((a, b) => a - b))
+      expect(progress.at(-1)!.done).toBe(total)
+      const ended = jobs.at(-1)!
+      expect(ended).toMatchObject({ stage: 'ended', outcome: 'compacted' })
+      // Every request the provider got for the compaction: cache-aware try, chunks, merge.
+      expect(ended.requests).toBe(summaryRequests.count)
+      const n = summaryRequests.withUsage
+      expect(ended.usage).toEqual({ input: 100 * n, cached: 40 * n, output: 10 * n })
+    })
+
+    it('a failing chunk aborts the sibling chunk streams and the compaction fails promptly', async () => {
+      let arrived = 0
+      let aborted = 0
+      let releaseGate!: () => void
+      const gate = new Promise<void>((resolve) => { releaseGate = resolve })
+      const { compact } = await foldSession((_request, signal) => (async function* () {
+        const mine = ++arrived
+        if (arrived === 3) releaseGate()
+        await gate
+        if (mine === 2) throw new Error('synthetic chunk failure')
+        // Ends only when the provider request is aborted.
+        await new Promise<void>((resolve) => signal!.addEventListener('abort', () => { aborted++; resolve() }, { once: true }))
+        yield { type: 'delta', delta: 'unreachable' }
+      })())
+      const response = await compact()
+      expect(response.status).toBe(409)
+      expect(arrived).toBe(3)
+      await until(async () => aborted === 2 ? true : undefined)
+    })
+
+    it('provider capacity 4 folds at most 3 chunks at once', async () => {
+      let open = 0
+      let max = 0
+      const { compact } = await foldSession(() => (async function* () {
+        max = Math.max(max, ++open)
+        try { yield* answered() } finally { open-- }
+      })(), 4)
+      expect((await compact()).status).toBe(200)
+      expect(max).toBe(3)
+    })
+
+    it('provider capacity 2 (parallelism 1) folds sequentially with the accumulated summary: no part chunks, no merge', async () => {
+      let parts = 0
+      const { compact, summaryRequests } = await foldSession(() => { parts++; return answered() }, 2)
+      expect((await compact()).status).toBe(200)
+      expect(parts).toBe(0)
+      // The cache-aware try, then one request per chunk; nothing extra for a merge.
+      expect(summaryRequests.count).toBeGreaterThan(2)
+    })
   })
 
   it('the manual route summarizes through the session pair and the next request reads the checkpoint', async () => {

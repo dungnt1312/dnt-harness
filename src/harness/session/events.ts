@@ -192,6 +192,11 @@ export type SessionEvent =
       /** Only on `ended` after a success: how the summary was made. */
       readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'
       readonly error?: string
+      /** Only on `generating`: chunk summaries finished of the fold's total. */
+      readonly progress?: { readonly done: number; readonly total: number }
+      /** Only on `ended`: model requests the job sent (any outcome), and their reported token usage. */
+      readonly requests?: number
+      readonly usage?: { readonly input: number; readonly cached: number; readonly output: number }
     } & SessionEventStamp)
   // The bounded state restored beside a compaction summary (task list, running
   // work, loaded skills, current file contents). Written inside the compaction

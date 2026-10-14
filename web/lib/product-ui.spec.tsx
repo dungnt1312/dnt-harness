@@ -1172,6 +1172,25 @@ describe('context compaction + budget bar', () => {
       expect(host.textContent).toContain('provider transport failure')
     })
 
+    it('while summarizing with progress it shows done/total', async () => {
+      await mount(<CompactionMarker item={row({ stage: 'generating', startedAt: Date.now(), progress: { done: 2, total: 4 } })} />)
+      expect(host.textContent).toContain('Summarizing 2/4')
+    })
+
+    it('a single request shows no count: "Summarizing", never "Summarizing 0/1"', async () => {
+      await mount(<CompactionMarker item={row({ stage: 'generating', startedAt: Date.now(), progress: { done: 0, total: 1 } })} />)
+      expect(host.textContent).toContain('Summarizing')
+      expect(host.textContent).not.toMatch(/Summarizing \d/)
+    })
+
+    it('a finished row shows how many requests it took', async () => {
+      await mount(<CompactionMarker item={row({ status: 'completed', coversSeq: 9, summary: 'S', requests: 3 })} />)
+      expect(host.textContent).toContain('3 requests')
+      await mount(<CompactionMarker item={row({ status: 'failed', requests: 1 })} />)
+      expect(host.textContent).toContain('1 request')
+      expect(host.textContent).not.toContain('1 requests')
+    })
+
     it('a finished row shows how the summary was made', async () => {
       await mount(<CompactionMarker item={row({ status: 'completed', path: 'recovery', coversSeq: 9, summary: 'S' })} />)
       expect(host.textContent).toContain('full transcript')

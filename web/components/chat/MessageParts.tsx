@@ -1785,10 +1785,13 @@ export const CompactionMarker = memo(function CompactionMarker({ item }: {
     item.trigger !== undefined ? item.trigger : undefined,
     item.path === 'recovery' ? 'full transcript' : undefined,
     item.durationMs !== undefined && item.status !== 'running' ? `${(item.durationMs / 1000).toFixed(1)}s` : undefined,
+    item.requests !== undefined ? `${item.requests} ${item.requests === 1 ? 'request' : 'requests'}` : undefined,
   ].filter((fact) => fact !== undefined)
 
   if (item.status === 'running') {
-    const stage = item.stage === 'preparing' ? 'Preparing' : item.stage === 'generating' ? 'Summarizing' : item.stage === 'applying' ? 'Applying' : undefined
+    const stage = item.stage === 'preparing' ? 'Preparing'
+      : item.stage === 'generating' ? (item.progress !== undefined && item.progress.total > 1 ? `Summarizing ${item.progress.done}/${item.progress.total}` : 'Summarizing')
+        : item.stage === 'applying' ? 'Applying' : undefined
     return (
       <div className="flex min-w-0 items-center gap-2 py-0.5 text-xs text-fg-muted" role="status" aria-live="polite">
         <Spinner size={12} className="shrink-0" />

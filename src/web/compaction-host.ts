@@ -27,10 +27,11 @@ export class CompactionRefused extends Error {
 /**
  * The snapshot addressed to the model selected now. Its messages and tools stay exactly as
  * captured; only who answers changes. A switched model just misses the prompt cache.
+ * Always stamped, even when nothing switched: a captured or rebuilt request may carry no
+ * provider/model at all, and an unstamped request would go to the global default.
  */
 function retarget(snapshot: EffectiveCompactionSnapshot, now: SnapshotIdentity): EffectiveCompactionSnapshot {
   const was = snapshot.identity
-  if (was.provider === now.provider && was.model === now.model && was.thinkingLevel === now.thinkingLevel) return snapshot
   const { thinkingLevel: _thinking, ...request } = snapshot.request
   void _thinking
   const { thinkingLevel: _wasThinking, ...identity } = was
@@ -59,8 +60,11 @@ export interface HostDeps {
   readonly stream: (request: ModelRequest, options?: StreamOptions) => AsyncIterable<StreamEvent>
   /** The newest captured, persisted snapshot for this session, if the host still holds one. */
   readonly exactSnapshot: () => EffectiveCompactionSnapshot | undefined
-  /** A snapshot rebuilt from the committed log with the ordinary context builder, if possible. */
-  readonly reconstruct: () => EffectiveCompactionSnapshot | undefined
+  /**
+   * A snapshot rebuilt from the committed log with the ordinary context builder, if possible.
+   * Asked only when the exact snapshot cannot be used; must have no side effects.
+   */
+  readonly reconstruct: () => Promise<EffectiveCompactionSnapshot | undefined>
   /** What a snapshot must have been built for right now: provider, model, mode, grants, policy. */
   readonly identity: () => SnapshotIdentity
   /** False when no model resolves: only the bounded extractive summary is possible. */
@@ -147,7 +151,14 @@ export class CompactionHost {
     if (!deps.limits.compactionEffectiveEnabled || !deps.hasModel()) return this.legacy(request, signal, 'legacy')
 
     const now = deps.identity()
-    const choice = chooseCompactionSource({ events, exact: deps.exactSnapshot(), reconstructed: deps.reconstruct(), identity: now })
+    const exact = deps.exactSnapshot()
+    let choice = chooseCompactionSource({ events, exact, identity: now })
+    // Rebuilding the request costs a full context assembly: only when the exact snapshot cannot serve.
+    if (choice.kind === 'fold') {
+      const reconstructed = await deps.reconstruct().catch(() => undefined)
+      signal.throwIfAborted()
+      choice = chooseCompactionSource({ events, exact, reconstructed, identity: now })
+    }
     if (choice.kind === 'unavailable') {
       throw new CompactionRefused(choice.reason === 'open-turn' ? 'compaction requires a completed exchange boundary (no open turn)' : 'nothing to compact yet', choice.reason)
     }
@@ -178,7 +189,7 @@ export class CompactionHost {
     // smaller model, a request that grew to the limit) is folded in pieces instead of failing.
     const window = deps.contextWindowTokens()
     try {
-      assertFitsWindow(snapshot, { ...(window !== undefined ? { contextWindowTokens: window } : {}), outputTokens: deps.limits.compactionOutputTokens })
+      assertFitsWindow(snapshot, { ...(window !== undefined ? { contextWindowTokens: window } : {}), outputTokens: deps.limits.compactionOutputTokens }, path)
     } catch {
       return this.legacy(request, signal, 'recovery')
     }

@@ -17,6 +17,7 @@ import { CompactionSnapshotStore } from '../../src/harness/storage/compaction-sn
 import {
   captureStream,
   promoteCapture,
+  reconstructionCutoff,
   reconstructSnapshot,
   type PendingCapture,
 } from '../../src/web/compaction-capture.ts'
@@ -196,6 +197,38 @@ describe('promoteCapture', () => {
     const pending = captureStream(request, { ...projectionFor(events), losses: [{ kind: 'uncovered-history-dropped', fromSeq: 1, throughSeq: CUTOFF }] })
     await drain(pending.tap(stream([{ type: 'delta', delta: 'done' }, STOP])))
     expect(await promoteCapture({ sessionId: 'session-a', events, turnId: 't1', pending, finalAnswer, identity, store, newId: () => 'snap-w' })).toBeUndefined()
+  })
+})
+
+describe('reconstructionCutoff', () => {
+  const clean = (id: string, answer = `answer ${id}`): Row[] => [
+    { type: 'turn/start', turnId: id },
+    { type: 'user/message', turnId: id, content: `q ${id}` },
+    { type: 'assistant/message', stepId: `s-${id}`, content: answer },
+    { type: 'turn/end', turnId: id, reason: 'completed' },
+  ]
+  const withInside = (id: string, inside: Row): Row[] => { const rows = clean(id); rows.splice(2, 0, inside); return rows }
+  const uncertain: Row = { type: 'execution/uncertain', fact: { requestId: 'r', attemptId: 'a', attempt: 1, state: 'uncertain', committed: false, transportSettled: false } }
+  const toolEnd: Row[] = [
+    { type: 'turn/start', turnId: 't2' },
+    { type: 'user/message', turnId: 't2', content: 'q' },
+    { type: 'assistant/message', stepId: 's', content: '', toolCalls: [{ id: 'c', name: 'Read', args: {} }] },
+    { type: 'turn/end', turnId: 't2', reason: 'completed' },
+  ]
+  const stopped: Row[] = [...clean('t2').slice(0, 3), { type: 'turn/end', turnId: 't2', reason: 'cancelled' }]
+
+  it.each<[string, Row[], number, { turnId: string; cutoff: number } | undefined]>([
+    ['the newest clean completed turn', [...clean('t1'), ...clean('t2')], 0, { turnId: 't2', cutoff: 8 }],
+    ['an abandoned step skips to the older turn', [...clean('t1'), ...withInside('t2', { type: 'step/abandoned', stepId: 'x' })], 0, { turnId: 't1', cutoff: 4 }],
+    ['an uncertain execution skips to the older turn', [...clean('t1'), ...withInside('t2', uncertain)], 0, { turnId: 't1', cutoff: 4 }],
+    ['a final assistant with tool calls is skipped', [...clean('t1'), ...toolEnd], 0, { turnId: 't1', cutoff: 4 }],
+    ['a stopped turn is skipped', [...clean('t1'), ...stopped], 0, { turnId: 't1', cutoff: 4 }],
+    ['nothing after the standing checkpoint', [...clean('t1'), ...stopped], 4, undefined],
+    ['a cutoff at the checkpoint itself', [...clean('t1')], 4, undefined],
+  ])('%s', (_name, rows, after, expected) => {
+    const found = reconstructionCutoff(log(rows), after)
+    if (expected === undefined) expect(found).toBeUndefined()
+    else expect(found).toMatchObject(expected)
   })
 })
 
