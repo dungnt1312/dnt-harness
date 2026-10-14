@@ -2158,8 +2158,21 @@ ${entry.description}`.toLowerCase().includes(query))
         }
         const { enabled: _e, executable: _x, name: _n, ...previous } = (existing ?? {}) as unknown as Record<string, unknown>
         void _e; void _x; void _n
-        if (existing !== undefined && JSON.stringify(previous) === JSON.stringify(draft.body) && existing.enabled
-          && JSON.stringify(existing.executable) === JSON.stringify(pins.get(name))) continue
+        const sameBody = existing !== undefined && JSON.stringify(previous) === JSON.stringify(draft.body)
+        if (sameBody && existing.enabled && JSON.stringify(existing.executable) === JSON.stringify(pins.get(name))) continue
+        // A server the user switched off stays off: enabling the PLUGIN authorized
+        // it once, and the user's later Disable is a newer decision. Only a changed
+        // definition is written through, still disabled; Enable re-authorizes it.
+        if (existing !== undefined && !existing.enabled) {
+          if (sameBody) continue
+          try {
+            next = upsertServer(next, name, draft.body)
+            changed = true
+          } catch (error) {
+            problems.push(`${name}: ${String(error instanceof Error ? error.message : error)}`)
+          }
+          continue
+        }
         // One invalid plugin server is skipped and reported; it never blocks
         // the removals or the other plugins' servers in the same reconcile.
         try {
@@ -2225,15 +2238,37 @@ ${entry.description}`.toLowerCase().includes(query))
     }
   }
 
+  /** Remember why a server could not start, for Settings and the pre-step backoff. */
+  function recordMcpConnectFailure(workspaceId: string, serverName: string, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error)
+    mcpConnectFailures.set(`${workspaceId}:${serverName}`, { at: Date.now(), message: message.slice(0, 500) })
+  }
+
+  /** Drop every model-visible tool schema of one server (`serverName` omitted: of the whole workspace). */
+  function dropMcpDescriptors(workspaceId: string, serverName?: string): void {
+    const prefix = serverName === undefined ? `${workspaceId}:mcp__` : `${workspaceId}:mcp__${serverName}__`
+    for (const key of [...mcpDescriptors.keys()]) {
+      if (key.startsWith(prefix)) mcpDescriptors.delete(key)
+    }
+  }
+
+  /**
+   * A fence retires the runtime built from the old config. It works through
+   * the generation counter alone: a connect that started before the fence sees
+   * the new generation before it publishes and discards itself. It must NOT
+   * touch `mcpCancelled` — that set means "disabled, deleted or closing", and
+   * a fence-cancelled server would otherwise stay refused until someone pressed
+   * Enable.
+   */
   async function fenceWorkspace(workspaceId: WorkspaceId): Promise<void> {
     mcpGeneration.set(workspaceId, generationOf(workspaceId) + 1)
-    for (const key of mcpConnecting.keys()) {
-      if (key.startsWith(`${workspaceId}:`)) mcpCancelled.add(key)
-    }
     // A config or secret change may be the fix: try failed servers again now.
     for (const key of [...mcpConnectFailures.keys()]) {
       if (key.startsWith(`${workspaceId}:`)) mcpConnectFailures.delete(key)
     }
+    // The retired runtime's tools must not outlive it: if the server does not
+    // come back, the model must not keep being offered them.
+    dropMcpDescriptors(workspaceId)
     for (const [key, client] of [...mcpClients]) {
       if (!key.startsWith(`${workspaceId}:`)) continue
       client.retire()
@@ -2421,7 +2456,10 @@ ${entry.description}`.toLowerCase().includes(query))
       void existing.disconnect()
       mcpClients.delete(key)
       mcpClientGeneration.delete(key)
-    } else if (existing !== undefined && existing.state !== 'disabled') return existing
+    } else if (existing !== undefined && existing.state !== 'disabled' && !mcpConnecting.has(key)) return existing
+    // The client is published before its first tools/list, so a caller arriving
+    // mid-connect would otherwise get a half-started client back and run its turn
+    // before the server's tools are registered. Join the connect instead.
     const inFlight = mcpConnecting.get(key)
     if (inFlight !== undefined) return inFlight
     if (mcpHostClosing || mcpCancelled.has(key)) throw new McpTransportError(`MCP server '${serverName}' connection is cancelled`)
@@ -2476,6 +2514,9 @@ ${entry.description}`.toLowerCase().includes(query))
           mcpClients.delete(key)
           mcpClientGeneration.delete(key)
         }
+        // A server that did not come up offers the model nothing: tools listed
+        // before the failure (or by an earlier runtime) must not stay callable.
+        dropMcpDescriptors(workspaceId, serverName)
         throw error
       } finally {
         mcpConnecting.delete(key)
@@ -2488,15 +2529,15 @@ ${entry.description}`.toLowerCase().includes(query))
   /** Register `mcp__server__tool` tools through the effect-disposed seam. */
   async function reconcileMcpTools(workspaceId: WorkspaceId, serverName: string, client: McpServerClient): Promise<void> {
     const config = await mcpStore.loadMcp(workspaceId)
+    // A client that has been replaced, fenced or removed (a late
+    // `tools/list_changed` refresh, a health check) must not write descriptors
+    // for a server that is no longer running under it.
+    if (mcpClients.get(`${workspaceId}:${serverName}`) !== client) return
     const serverConfig: McpServerConfig | undefined = config.servers[serverName]
     const allowed = serverConfig?.allowedTools
-    const currentFullNames = new Set(client.cachedTools().map((tool) => mcpToolName(serverName, tool.name)))
-    // Remove tools that disappeared from the latest tools/list snapshot.
-    for (const key of mcpDescriptors.keys()) {
-      if (!key.startsWith(`${workspaceId}:mcp__${serverName}__`)) continue
-      const fullName = key.slice(`${workspaceId}:`.length)
-      if (!currentFullNames.has(fullName)) mcpDescriptors.delete(key)
-    }
+    // Validate the whole snapshot before touching any state, so a bad tool in
+    // the middle cannot leave the first half of the list exposed.
+    const exposed: McpToolDescriptor[] = []
     const seenNames = new Set<string>()
     for (const tool of client.cachedTools()) {
       if (tool.name.trim() === '' || seenNames.has(tool.name)) {
@@ -2510,6 +2551,17 @@ ${entry.description}`.toLowerCase().includes(query))
       // Skip, never send: providers reject the whole request for one bad name.
       if (!PROVIDER_TOOL_NAME.test(fullName) || tool.name.includes('__')) continue
       if (!mcpToolExposed(allowed, tool.name, fullName)) continue
+      exposed.push(tool)
+    }
+    // Remove tools that disappeared from the latest tools/list snapshot.
+    const currentFullNames = new Set(client.cachedTools().map((tool) => mcpToolName(serverName, tool.name)))
+    for (const key of [...mcpDescriptors.keys()]) {
+      if (!key.startsWith(`${workspaceId}:mcp__${serverName}__`)) continue
+      const fullName = key.slice(`${workspaceId}:`.length)
+      if (!currentFullNames.has(fullName)) mcpDescriptors.delete(key)
+    }
+    for (const tool of exposed) {
+      const fullName = mcpToolName(serverName, tool.name)
       // Server annotation: interaction always asks via forceAsk; readOnlyHint
       // is display only and NEVER drives auto-allow. Do not write into the
       // workspace override map — that would fight Always-allow and persist.
@@ -2518,7 +2570,7 @@ ${entry.description}`.toLowerCase().includes(query))
       mcpRegistered.add(fullName)
       kernel.ctx.tools.register({
         name: fullName,
-        description: `[MCP:${serverName}] ${tool.description ?? tool.name}${tool.requiresUserInteraction === true ? ' (interactive — always asks)' : ''}`,
+        description: mcpToolDescription(serverName, tool),
         requiresRoot: false,
         parameters: tool.inputSchema as { type: 'object'; properties: Record<string, unknown> },
         schema: () => {
@@ -2527,7 +2579,7 @@ ${entry.description}`.toLowerCase().includes(query))
           const descriptor = mcpDescriptors.get(`${scope.workspaceId}:${fullName}`)
           if (descriptor === undefined) return undefined
           return {
-            description: `[MCP:${serverName}] ${descriptor.description ?? descriptor.name}`,
+            description: mcpToolDescription(serverName, descriptor),
             parameters: descriptor.inputSchema as { type: 'object'; properties: Record<string, unknown> },
           }
         },
@@ -2629,14 +2681,16 @@ ${entry.description}`.toLowerCase().includes(query))
       })
       .map(async (server) => {
         const key = `${workspaceId}:${server.name}`
+        const generationAtStart = generationOf(workspaceId)
         try {
           await ensureMcpServer(workspaceId, server.name)
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          // A disable/close that cancelled this connect is not a failure.
-          if (mcpHostClosing || mcpCancelled.has(key)) return
-          mcpConnectFailures.set(key, { at: Date.now(), message: message.slice(0, 500) })
-          console.warn(`web: MCP server '${server.name}' unavailable in ${workspaceId}; its tools are skipped this turn: ${message}`)
+          // A disable/close that cancelled this connect is not a failure, and
+          // neither is a connect a config/secret change fenced off: it is simply
+          // retried with the new settings by the next turn.
+          if (mcpHostClosing || mcpCancelled.has(key) || generationAtStart !== generationOf(workspaceId)) return
+          recordMcpConnectFailure(workspaceId, server.name, error)
+          console.warn(`web: MCP server '${server.name}' unavailable in ${workspaceId}; its tools are skipped this turn: ${error instanceof Error ? error.message : String(error)}`)
         }
       })
     await Promise.all(attempts)
@@ -3938,6 +3992,7 @@ ${entry.description}`.toLowerCase().includes(query))
     compactionPending: (sessionId) => compactions.has(sessionId),
     settleCompaction: async (sessionId) => { await compactions.get(sessionId)?.done?.catch(() => {}) },
     mcpStore,
+    recordMcpConnectFailure,
     mcpClients,
     mcpDescriptors,
     mcpConnecting,
@@ -4244,6 +4299,8 @@ interface HandlerDeps {
   readonly compactionPending: (sessionId: SessionId) => boolean
   readonly settleCompaction: (sessionId: SessionId) => Promise<void>
   readonly mcpStore: McpConfigStore
+  /** Why a server could not start; Settings shows it and the pre-step backs off. */
+  readonly recordMcpConnectFailure: (workspaceId: string, serverName: string, error: unknown) => void
   readonly mcpClients: Map<string, McpServerClient>
   readonly mcpDescriptors: Map<string, McpToolDescriptor>
   readonly mcpConnecting: Map<string, Promise<McpServerClient>>
@@ -4635,9 +4692,14 @@ function mcpModelSchema(serverName: string, descriptor: McpToolDescriptor): { na
   if (!PROVIDER_TOOL_NAME.test(fullName)) return undefined
   return {
     name: fullName,
-    description: `[MCP:${serverName}] ${descriptor.description ?? descriptor.name}${descriptor.requiresUserInteraction === true ? ' (interactive — always asks)' : ''}`,
+    description: mcpToolDescription(serverName, descriptor),
     parameters: descriptor.inputSchema as { type: 'object'; properties: Record<string, unknown> },
   }
+}
+
+/** The one wording a model sees for an MCP tool: registration, live schema and the token estimate all use it. */
+function mcpToolDescription(serverName: string, descriptor: McpToolDescriptor): string {
+  return `[MCP:${serverName}] ${descriptor.description ?? descriptor.name}${descriptor.requiresUserInteraction === true ? ' (interactive — always asks)' : ''}`
 }
 
 /**
@@ -5360,6 +5422,19 @@ async function handleApi(
           const state = pastedAddress !== undefined
             ? await deps.oauth.acceptCallbackUrl(pastedAddress, { workspaceId: wsId, server: serverName, principalId })
             : String(body['state'] ?? '')
+          // The sign-in was started for one URL. If the server has since been
+          // deleted, renamed or pointed elsewhere, finishing it would store a
+          // grant for the old URL under the new server's name.
+          const target = (await deps.mcpStore.loadMcp(wsId)).servers[serverName]
+          const pending = await deps.oauth.pendingServer(state)
+          if (target?.transport !== 'http' || target.url === undefined) {
+            send(400, { error: `server '${serverName}' no longer exists or is not an HTTP server; start Connect again` })
+            return
+          }
+          if (pending !== undefined && pending.serverUrl !== target.url) {
+            send(400, { error: `server '${serverName}' now points at a different URL than this sign-in was started for; start Connect again` })
+            return
+          }
           await deps.oauth.complete({
             state,
             principalId,
@@ -5371,7 +5446,10 @@ async function handleApi(
           if (current?.enabled === true) {
             await deps.cancelMcpConnection(wsId, serverName)
             deps.mcpCancelled.delete(`${wsId}:${serverName}`)
-            const client = await deps.ensureMcpServer(wsId, serverName).catch(() => undefined)
+            const client = await deps.ensureMcpServer(wsId, serverName).catch((error: unknown) => {
+              deps.recordMcpConnectFailure(wsId, serverName, error)
+              return undefined
+            })
             if (client === undefined) {
               send(200, { connected: true, status: 'failed' })
               return
@@ -5380,10 +5458,13 @@ async function handleApi(
           send(200, { connected: true })
           return
         }
-        await deps.fenceWorkspace(wsId)
+        // Only this server's connection used the grant: stop it, revoke, then let
+        // the next turn try again (it fails with auth_required, which Settings
+        // shows) instead of fencing every healthy server in the workspace.
+        await deps.cancelMcpConnection(wsId, serverName)
         const record = await deps.oauthStore.readServerRecord(wsId, serverName)
         const revoked = await deps.oauth.revoke(wsId, serverName, record?.revocationEndpoint)
-        await deps.cancelMcpConnection(wsId, serverName)
+        deps.mcpCancelled.delete(`${wsId}:${serverName}`)
         send(200, revoked)
       } catch (error) {
         if (error instanceof OAuthConnectError) {
@@ -5410,13 +5491,27 @@ async function handleApi(
         const imported = dialect === 'codex'
           ? importCodexMcp(content, typeof body['sourceVersion'] === 'string' ? body['sourceVersion'] : '')
           : importClaudeMcp(content)
+        let taken: string[] = []
         await deps.updateMcpConfig(wsId, (existing) => {
+          // An import adds servers. A name that already exists (possibly running,
+          // possibly owned by a plugin) would be silently re-pointed while staying
+          // enabled, so the whole import is refused and nothing is written.
+          taken = Object.keys(imported.servers).filter((name) => existing.servers[name] !== undefined)
+          if (taken.length > 0) throw new McpRevisionConflict()
           let merged = existing
           for (const [name, server] of Object.entries(imported.servers)) {
             merged = upsertServer(merged, name, { ...server, enabled: false })
           }
           return merged
+        }).catch((error: unknown) => {
+          if (error instanceof McpRevisionConflict && taken.length > 0) return undefined
+          throw error
+        }).then((saved) => {
+          if (saved === undefined) {
+            send(409, { error: `already configured: ${taken.join(', ')}; delete or rename them, or import only new servers` })
+          }
         })
+        if (taken.length > 0) return
         send(201, {
           imported: Object.keys(imported.servers),
           enabled: [],
@@ -5482,7 +5577,14 @@ async function handleApi(
               name: server.name,
               transport: server.transport,
               enabled: server.enabled,
-              status: !server.enabled ? 'disabled' : client?.state ?? (connectFailure !== undefined ? 'failed' : 'connecting'),
+              // `connecting` means a connect is actually in flight. An enabled
+              // server with no client, no failure and nothing connecting (a fence
+              // dropped it) is `idle`: the next turn starts it.
+              status: !server.enabled
+                ? 'disabled'
+                : client?.state ?? (connectFailure !== undefined
+                  ? 'failed'
+                  : deps.mcpConnecting.has(`${wsId}:${server.name}`) ? 'connecting' : 'idle'),
               ...(connectFailure !== undefined ? { lastError: connectFailure.message } : {}),
               ...(unusableTools.length > 0 ? { unusableTools } : {}),
               ...(stderr !== '' ? { stderrTail: stderr.slice(-2_000) } : {}),
@@ -5520,11 +5622,15 @@ async function handleApi(
             send(404, { error: `no MCP server '${serverName}'` })
             return
           }
+          const managed = config.servers[serverName]?.auth?.type === 'managed_oauth'
+          // Read the provider's revocation endpoint now: the record goes away with the server.
+          const revocationEndpoint = managed ? (await deps.oauthStore.readServerRecord(wsId, serverName))?.revocationEndpoint : undefined
           // Stop the process and drop its tool schemas before the config forgets it.
           await deps.cancelMcpConnection(wsId, serverName)
           await deps.updateMcpConfig(wsId, (current) => withoutServer(current, serverName))
-          // Revoke locally first so a racing refresh cannot write the grant back.
-          if (config.servers[serverName]?.auth?.type === 'managed_oauth') await deps.oauth.revoke(wsId, serverName)
+          // Revoke locally first so a racing refresh cannot write the grant back;
+          // the same call also asks the provider to void the token.
+          if (managed) await deps.oauth.revoke(wsId, serverName, revocationEndpoint)
           await deps.oauthStore.deleteServer(wsId, serverName)
           send(200, { deleted: serverName })
           return
@@ -5589,7 +5695,18 @@ async function handleApi(
               return
             }
           }
-          const expectedGeneration = deps.generationOf(wsId)
+          // Reconnect restarts a server whose executable was already authorized.
+          // A stdio server with no pin (imported, never enabled) must go through
+          // Enable, which is what authorizes the file; otherwise Reconnect would
+          // start it unpinned and a later edit of `command` would run unchecked.
+          if (action === 'reconnect' && serverConfig.transport === 'stdio' && serverConfig.executable === undefined) {
+            send(409, { error: `'${serverName}' has not been authorized to run; use Enable` })
+            return
+          }
+          // The conflict check is about THIS server: an unrelated save fences
+          // the workspace but must not fail an Enable of another server.
+          const configOfServer = (config: McpConfig): string => JSON.stringify(config.servers[serverName] ?? null)
+          const expectedServer = configOfServer(config)
           let committedGeneration: number
           if (action === 'enable') {
             // Activation authorizes the canonical file the command resolves to
@@ -5600,7 +5717,7 @@ async function handleApi(
               })
               : undefined
             const enabled = await deps.updateMcpConfig(wsId, (current) => {
-              if (deps.generationOf(wsId) !== expectedGeneration) throw new McpRevisionConflict()
+              if (configOfServer(current) !== expectedServer) throw new McpRevisionConflict()
               return withServerActivated(current, serverName, executable)
             }).catch((error: unknown) => error instanceof McpRevisionConflict ? undefined : Promise.reject(error))
             if (enabled === undefined) {
@@ -5611,7 +5728,7 @@ async function handleApi(
           } else {
             // Reconnect never re-authorizes: a changed executable stays refused.
             const reconnected = await deps.updateMcpConfig(wsId, (current) => {
-              if (deps.generationOf(wsId) !== expectedGeneration) throw new McpRevisionConflict()
+              if (configOfServer(current) !== expectedServer) throw new McpRevisionConflict()
               return withServerEnabled(current, serverName, true)
             }).catch((error: unknown) => error instanceof McpRevisionConflict ? undefined : Promise.reject(error))
             if (reconnected === undefined) {
@@ -5631,7 +5748,13 @@ async function handleApi(
           }
           deps.mcpCancelled.delete(`${wsId}:${serverName}`)
           // Fresh/singleton connect; ensureMcpServer lists + reconciles tools.
-          const client = await deps.ensureMcpServer(wsId, serverName)
+          // A failure is remembered so the row says why instead of "connecting".
+          const client = await deps.ensureMcpServer(wsId, serverName).catch((error: unknown) => {
+            if (deps.generationOf(wsId) === committedGeneration && !deps.mcpCancelled.has(`${wsId}:${serverName}`)) {
+              deps.recordMcpConnectFailure(wsId, serverName, error)
+            }
+            throw error
+          })
           send(200, { status: client.state })
           return
         }

@@ -5,7 +5,7 @@
  * reinterpreted until migration quarantines it.
  */
 import { createHash } from 'node:crypto'
-import { McpConfigError, parseMcpConfig, type McpConfig, type McpServerConfig } from './config.ts'
+import { McpConfigError, parseMcpConfig, validateNewServerName, type McpConfig, type McpServerConfig } from './config.ts'
 
 export interface V2Server extends McpServerConfig {
   readonly enabled: boolean
@@ -59,6 +59,8 @@ export function parseV2McpConfig(raw: string): McpConfig {
  */
 export function upsertServer(config: McpConfig, name: string, body: Record<string, unknown>): McpConfig {
   const previous = config.servers[name]
+  // A name that already exists keeps working; only a new name must be collision-free.
+  if (previous === undefined) validateNewServerName(name)
   // A save never changes activation: `enabled` and the authorized executable
   // pin come from the stored server, whatever the body says.
   const { enabled: _ignored, executable: _pin, ...rest } = body

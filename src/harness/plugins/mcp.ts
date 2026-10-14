@@ -12,7 +12,13 @@
 import { substituteDeep } from './manifest.ts'
 
 export function pluginServerName(plugin: string, server: string): string {
-  return `plugin_${plugin}_${server}`.replace(/[^A-Za-z0-9_-]/g, '_')
+  // Sanitizing can leave `__` (from `a.` + `b`) or a trailing `_` (from `docs.`);
+  // a server name may have neither, because `mcp__<server>__<tool>` is split on
+  // `__`. Collapsing keeps every ordinary name exactly as Claude spells it.
+  return `plugin_${plugin}_${server}`
+    .replace(/[^A-Za-z0-9_-]/g, '_')
+    .replace(/_{2,}/g, '_')
+    .replace(/_+$/, '')
 }
 
 export interface PluginServerDraft {
