@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import Icon from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
+import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import { Button } from '../ui/Button.tsx'
 import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
@@ -65,8 +66,8 @@ export function FolderRows({ folder, entries, depth, actions }: {
             <FileRow entry={entry} depth={depth} expanded={expanded} actions={actions} />
             {expanded ? (
               node?.status === 'error' && node.listing === null ? (
-                <div className="flex items-center gap-2 py-1 pr-2" style={{ paddingLeft: 24 + depth * 14 }}>
-                  <span className="text-xs text-bad">Could not load</span>
+                <div className="flex flex-col items-start gap-2 py-1 pr-2" style={{ paddingLeft: 24 + depth * 14 }}>
+                  <ErrorNotice raw={node.error ?? ''} />
                   <Button size="sm" variant="outline" onClick={() => actions.retry(entry.path)}>Retry</Button>
                 </div>
               ) : node === undefined || (node.status === 'loading' && node.listing === null) ? (

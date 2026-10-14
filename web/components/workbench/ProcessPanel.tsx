@@ -113,7 +113,7 @@ export function ProcessPanel({ workspaceId, sessionId, processId }: {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex h-10 shrink-0 items-center gap-2 px-4">
+      <div className="flex h-9 shrink-0 items-center gap-2 px-4">
         <span className="text-[13px] font-medium text-fg">Background tasks</span>
         {running.length > 0 ? <span className="text-[12px] tabular-nums text-warn">{running.length} running</span> : null}
         <span className="flex-1" />
