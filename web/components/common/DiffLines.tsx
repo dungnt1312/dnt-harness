@@ -112,7 +112,7 @@ function lineClass(kind: DiffRowKind): string {
 export function DiffLines({ rows, renderHunk }: { readonly rows: readonly DiffRow[]; readonly renderHunk?: (index: number, header: string) => ReactNode }) {
   let hunkIndex = -1
   return (
-    <pre className="m-0 px-3 py-1.5 font-mono text-[12px] leading-5">
+    <pre className="m-0 px-3 py-1.5 font-mono text-[12.5px] leading-5">
       {rows.map((row, index) => {
         if (row.kind === 'hunk') {
           hunkIndex++

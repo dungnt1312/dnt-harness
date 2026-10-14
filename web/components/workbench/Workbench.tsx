@@ -1,4 +1,4 @@
-﻿import { lazy, memo, Suspense, useMemo, useState, type ReactNode } from 'react'
+﻿import { lazy, memo, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import Icon from '../common/Icon.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { Menu, menuItemClass } from '../ui/Menu.tsx'
@@ -9,6 +9,8 @@ import { TrajectoryPanel } from './TrajectoryPanel.tsx'
 import { FilesWorkspace } from './FilesWorkspace.tsx'
 import { GitPanel } from './GitPanel.tsx'
 import { ProcessPanel } from './ProcessPanel.tsx'
+import { QuickOpen } from './QuickOpen.tsx'
+import ConfirmDialog from '../common/ConfirmDialog.tsx'
 
 const TerminalPanel = lazy(async () => import('./TerminalPanel.tsx'))
 import { baseName, memoryTabOf, skillTabName } from '../../lib/project-paths.ts'
@@ -92,7 +94,7 @@ function ViewTab({ view, active, onClick, onClose }: {
  * tab strip. (`events`/`agentEvents` are new arrays per frame by design; the
  * views that read them re-render on their own `useMemo` deps instead.)
  */
-export const Workbench = memo(function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, agentFocus = null, onAgentFocus, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, gitFocusPath = null, onClearGitFilter, onGitTrustChange, processFocus = null }: {
+export const Workbench = memo(function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, agentFocus = null, onAgentFocus, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, gitFocusPath = null, onClearGitFilter, onGitTrustChange, processFocus = null, agentWrites }: {
   readonly workspaceId: string | null
   /** The project whose files are browsable; null for chat-only conversations. */
   readonly project: WorkbenchProject | null
@@ -153,11 +155,15 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
   readonly onClearGitFilter?: () => void
   /** The Git view trusted or restricted the project: the owner of the project list records it. */
   readonly onGitTrustChange?: (projectId: string, trusted: boolean) => void
+  /** Project-relative path → seq of the agent's latest landed Edit/Write; an open file re-reads when its entry moves. */
+  readonly agentWrites?: Readonly<Record<string, number>>
 }) {
   // The file tree defaults off on touch: a 380px sheet gives it ~130px, too
   // narrow to browse and too narrow to leave for the file the reader opened.
   const [treeVisible, setTreeVisible] = useState(() => typeof window.matchMedia !== 'function' || !window.matchMedia('(pointer: coarse)').matches)
   const [treeFraction, setTreeFraction] = useState(0.34)
+  const [quickOpen, setQuickOpen] = useState(false)
+  const panelRef = useRef<HTMLElement>(null)
   // One pass: the strip decides, and the selection follows it. Deriving the
   // active view here (rather than asserting `view` into the strip) is what
   // makes a single close click work — see closeView below.
@@ -202,10 +208,26 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
     if (activeView === target) onView(remaining[Math.min(index, remaining.length - 1)] ?? ANCHOR_VIEW)
   }
 
+  // Cmd/Ctrl+P finds a file by name, while the Files view is the one showing.
+  const filesShowing = activeView === 'files' && project !== null && workspaceId !== null
+  useEffect(() => {
+    if (!filesShowing) return
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key.toLowerCase() !== 'p' || event.shiftKey || event.altKey || !(event.metaKey || event.ctrlKey)) return
+      // Only when the key was pressed inside this panel: elsewhere the browser's own Print stays.
+      if (!(event.target instanceof Node) || !panelRef.current?.contains(event.target)) return
+      event.preventDefault()
+      setQuickOpen(true)
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [filesShowing])
+  useEffect(() => { if (!filesShowing) setQuickOpen(false) }, [filesShowing])
+
   let body: ReactNode = null
   if (activeView === 'files') {
     body = project !== null && workspaceId !== null ? (
-      <FilesWorkspace key={project.id} workspaceId={workspaceId} project={project} files={files} treeVisible={treeVisible} treeFraction={treeFraction} onTreeFraction={setTreeFraction} />
+      <FilesWorkspace key={project.id} workspaceId={workspaceId} project={project} files={files} treeVisible={treeVisible} treeFraction={treeFraction} onTreeFraction={setTreeFraction} {...(agentWrites !== undefined ? { agentWrites } : {})} />
     ) : (
       <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
         <Icon name="folder" size={22} className="text-fg-faint" />
@@ -274,7 +296,7 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
   }
 
   return (
-    <section aria-label="Workbench" className="flex h-full min-h-0 w-full flex-col bg-bg text-fg">
+    <section ref={panelRef} aria-label="Workbench" className="flex h-full min-h-0 w-full flex-col bg-bg text-fg">
       <div className="flex h-12 shrink-0 items-center gap-1 border-b border-line pl-2 pr-1.5">
         <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto" role="toolbar" aria-label="Workbench views">
           {openViews.map((openView) => (
@@ -307,6 +329,11 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
             </Menu>
           ) : null}
         </div>
+        {filesShowing ? (
+          <IconButton label="Open file by name" onClick={() => setQuickOpen(true)}>
+            <Icon name="search" size={16} />
+          </IconButton>
+        ) : null}
         {activeView === 'files' && project !== null ? (
           <IconButton label={treeVisible ? 'Hide file tree' : 'Show file tree'} aria-pressed={treeVisible} onClick={() => setTreeVisible((visible) => !visible)}>
             <Icon name="folder" size={16} />
@@ -328,7 +355,7 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
                 <button type="button" aria-pressed={active} title={skillTabName(path) !== null ? `Skill ${baseName(path)}` : memoryTabOf(path) !== null ? `Memory ${memoryTabOf(path)?.file ?? ''}` : path} onClick={() => files.openFile(path)} className={cn('flex h-full items-center gap-1.5 pl-3 pr-1 text-[13px]', active ? 'text-fg' : 'text-fg-muted hover:text-fg')}>
                   <FileTypeIcon path={skillTabName(path) !== null ? 'SKILL.md' : memoryTabOf(path) !== null ? baseName(path) : path} size={14} />
                   <span className="max-w-[12rem] truncate">{baseName(path)}</span>
-                  {files.drafts?.[path]?.dirty === true ? <span role="img" aria-label="Unsaved changes" className="size-1.5 shrink-0 rounded-full bg-fg-muted" /> : null}
+                  {files.drafts?.[path]?.dirty === true ? <span role="img" aria-label="Unsaved changes" className="size-1.5 shrink-0 rounded-full bg-warn" /> : null}
                 </button>
                 <button type="button" aria-label={`Close ${path}`} title="Close" onClick={() => files.closeFile(path)} className={cn('mr-1 flex size-5 items-center justify-center rounded text-fg-faint hover:bg-hover hover:text-fg [@media(pointer:coarse)]:size-7', active ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100 [@media(pointer:coarse)]:opacity-100')}>
                   <Icon name="close" size={12} />
@@ -340,6 +367,26 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
         </div>
       ) : null}
       <div className="flex min-h-0 flex-1 flex-col">{body}</div>
+      {filesShowing ? (
+        <QuickOpen
+          open={quickOpen}
+          workspaceId={workspaceId}
+          projectId={project.id}
+          onOpen={(path) => files.openFile(path)}
+          onDismiss={() => setQuickOpen(false)}
+        />
+      ) : null}
+      {files.closeRequest !== null ? (
+        <ConfirmDialog
+          open
+          title="Discard unsaved changes?"
+          confirmLabel="Discard"
+          tone="danger"
+          onConfirm={files.confirmClose}
+          onDismiss={files.cancelClose}
+          body={<p className="m-0">{`Your edits to ${baseName(files.closeRequest)} will be lost.`}</p>}
+        />
+      ) : null}
     </section>
   )
 }, (previous, next) => {
@@ -370,4 +417,5 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
     && previous.gitFocusPath === next.gitFocusPath
     && previous.onClearGitFilter === next.onClearGitFilter
     && previous.onGitTrustChange === next.onGitTrustChange
+    && previous.agentWrites === next.agentWrites
 })

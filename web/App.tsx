@@ -77,6 +77,7 @@ import { composerChipClass } from './components/composer/composer-chip.ts'
 import { Workbench } from './components/workbench/Workbench.tsx'
 import { TerminalDock } from './components/workbench/TerminalDock.tsx'
 import { useWorkbenchFiles } from './hooks/useWorkbenchFiles.ts'
+import { NO_AGENT_WRITES, trackAgentWrites } from './lib/agent-writes.ts'
 import { usePanelResize } from './hooks/usePanelResize.ts'
 import { memoryTabForReference, memoryTabOf, skillTabName, skillTabPath, toProjectRelative } from './lib/project-paths.ts'
 import { clampInspectorTab, PANEL_LIMITS, terminalProjectKey, withProjectTerminalTab, type WorkbenchViewName } from './lib/workbench-preferences.ts'
@@ -670,6 +671,11 @@ function AppShell() {
   }, [storedSessionTabs.inspectorViews, patchSessionTabs])
   const workbenchFiles = useWorkbenchFiles(activeWs !== null && workbenchProject !== null ? `${activeWs}:${workbenchProject.id}` : null)
   const openWorkbenchFile = workbenchFiles.openFile
+  // Which project files the agent's Edit/Write calls changed, so an open file re-reads itself.
+  // Scanned incrementally from the log; the same object comes back until a write lands.
+  const agentWritesRef = useRef(NO_AGENT_WRITES)
+  agentWritesRef.current = trackAgentWrites(agentWritesRef.current, events, validatedCurrent, workbenchProject?.path ?? null)
+  const agentWrites = agentWritesRef.current.writes
   const openRecordedPath = useCallback((reference: string, focus?: FileFocus): (() => void) | null => {
     if (workbenchProject === null) return null
     // A skill and a memory file are not inside the project: they open as
@@ -1783,6 +1789,7 @@ function AppShell() {
       views={sessionTabs.inspectorViews}
       onViews={setInspectorViews}
       files={workbenchFiles}
+      agentWrites={agentWrites}
       events={events}
       agentEvents={agentEvents}
       expanded={workbenchExpanded}
