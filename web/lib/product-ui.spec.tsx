@@ -2027,7 +2027,8 @@ describe('workbench files', () => {
     expect(contents.textContent).toContain('export const answer = 42')
     expect(contents.textContent).toContain('<raw>')
     expect(contents.querySelector('raw')).toBeNull()
-    expect(host.textContent).toContain('C:/acme/src/index.ts')
+    // The file's bar names its folder; the full path is the tooltip.
+    expect(host.querySelector('[title="C:/acme/src/index.ts"]')?.textContent).toBe('src')
     const tree = host.querySelector('[aria-label="Project files"]')!
     expect(contents.compareDocumentPosition(tree) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     const resize = host.querySelector<HTMLElement>('[aria-label="Resize file tree"]')!

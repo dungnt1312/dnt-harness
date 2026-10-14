@@ -139,9 +139,24 @@ it('creates a file inside the selected folder and opens it', async () => {
   expect(onOpenFile).toHaveBeenCalledWith('src/util.ts')
 })
 
+it('keeps New file in the header and puts the rarer actions under ⋯', async () => {
+  await mount()
+  expect(host.querySelector('[aria-label="New file"]')).not.toBeNull()
+  expect(host.querySelector('[aria-label="New folder"]')).toBeNull()
+  expect(host.querySelector('[aria-label="Refresh files"]')).toBeNull()
+  await click(byLabel('More explorer actions'))
+  expect([...document.body.querySelectorAll('[role="menu"] button')].map((b) => b.textContent)).toEqual(['New folder', 'Refresh', 'Copy project path'])
+  const writes = await copyThrough(() => menuItem('Copy project path').click())
+  expect(writes).toEqual(['/proj'])
+  await click(byLabel('More explorer actions'))
+  await click(menuItem('Refresh'))
+  expect(listProjectFiles).toHaveBeenLastCalledWith('ws1', 'p1', '')
+})
+
 it('creates a folder at the root when nothing is selected', async () => {
   await mount()
-  await click(byLabel('New folder'))
+  await click(byLabel('More explorer actions'))
+  await click(menuItem('New folder'))
   const input = byLabel('New folder name') as HTMLInputElement
   await typeInto(input, 'docs')
   await enter(input)

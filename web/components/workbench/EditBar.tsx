@@ -1,40 +1,10 @@
-import { Badge } from '../ui/Badge.tsx'
 import { Button } from '../ui/Button.tsx'
-import { Segmented } from '../ui/Segmented.tsx'
 
-/** The strip shown only while a file is being edited: state on the left, the way out on the right. */
-export function EditBar({ dirty, saving, review, onReview, onCancel, onSave }: {
-  readonly dirty: boolean
-  readonly saving: boolean
-  /** Whether the editor shows the edit against the text it started from. */
-  readonly review: 'edit' | 'changes' | null
-  readonly onReview: (next: 'edit' | 'changes') => void
-  readonly onCancel: () => void
-  readonly onSave: () => void
-}) {
-  return (
-    <div className="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-line px-3">
-      <div className="flex min-w-0 items-center gap-2 text-xs text-fg-muted">
-        <span>Editing</span>
-        {dirty ? <Badge tone="amber">Unsaved</Badge> : null}
-      </div>
-      <div className="flex shrink-0 items-center gap-2">
-        <Segmented<'edit' | 'changes'>
-          label="Editor view"
-          size="compact"
-          value={review}
-          disabled={saving}
-          options={[{ value: 'edit', label: 'Edit' }, { value: 'changes', label: 'Changes' }]}
-          onChange={onReview}
-        />
-        <Button size="sm" variant="outline" onClick={onCancel}>Cancel</Button>
-        <Button size="sm" variant="primary" disabled={saving || !dirty} onClick={onSave}>{saving ? 'Saving…' : 'Save'}</Button>
-      </div>
-    </div>
-  )
-}
-
-/** The file moved on disk under the editor: compare, take the disk version, or keep going and overwrite. */
+/**
+ * The file moved on disk under an unsaved edit: look at the difference, take
+ * the disk version, or keep going and overwrite it. The one strip that
+ * appears above the editor, and only while there is something to decide.
+ */
 export function ConflictBanner({ comparing, busy, onCompare, onReload, onOverwrite }: {
   readonly comparing: boolean
   readonly busy: boolean

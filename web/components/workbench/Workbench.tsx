@@ -297,7 +297,7 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
 
   return (
     <section ref={panelRef} aria-label="Workbench" className="flex h-full min-h-0 w-full flex-col bg-bg text-fg">
-      <div className="flex h-12 shrink-0 items-center gap-1 border-b border-line pl-2 pr-1.5">
+      <div className="flex h-10 shrink-0 items-center gap-1 border-b border-line pl-2 pr-1.5">
         <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto" role="toolbar" aria-label="Workbench views">
           {openViews.map((openView) => (
             <ViewTab
@@ -336,7 +336,7 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
         ) : null}
         {activeView === 'files' && project !== null ? (
           <IconButton label={treeVisible ? 'Hide file tree' : 'Show file tree'} aria-pressed={treeVisible} onClick={() => setTreeVisible((visible) => !visible)}>
-            <Icon name="folder" size={16} />
+            <Icon name="panelRight" size={16} />
           </IconButton>
         ) : null}
         {onToggleExpand !== undefined ? (

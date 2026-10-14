@@ -16,7 +16,7 @@ afterEach(async () => { if (root) await act(async () => root!.unmount()); root =
 function props(over: Partial<CodePaneProps> = {}): CodePaneProps {
   return {
     fileName: 'src/a.ts', value: 'ab', editable: true, indent: { kind: 'spaces', width: 2 }, ariaLabel: 'Edit src/a.ts',
-    onChange: vi.fn(), onSave: vi.fn(), onCancel: vi.fn(),
+    onChange: vi.fn(), onSave: vi.fn(),
     ...over,
   }
 }
@@ -28,11 +28,15 @@ async function mount(p: CodePaneProps): Promise<void> {
 const rerender = (p: CodePaneProps) => act(async () => root!.render(<CodePane {...p} />))
 const select = async (anchor: number, head = anchor) => { await act(async () => editorOf(host).dispatch({ selection: { anchor, head } })) }
 
-it('focuses an editable pane and labels it with the path', async () => {
+it('labels an editable pane with the path and leaves focus where it was', async () => {
+  const composer = document.createElement('textarea'); document.body.append(composer); composer.focus()
   await mount(props())
-  expect(document.activeElement).toBe(host.querySelector('.cm-content'))
+  // Opening a file must not pull the keyboard away from whatever the reader was typing in.
+  expect(document.activeElement).toBe(composer)
   expect(host.querySelector('.cm-content')!.getAttribute('aria-label')).toBe('Edit src/a.ts')
+  expect(host.querySelector('.cm-content')!.getAttribute('aria-readonly')).toBeNull()
   expect(editorText(host)).toBe('ab')
+  composer.remove()
 })
 
 it('a read-only pane stays reachable by keyboard but refuses input', async () => {
@@ -47,13 +51,14 @@ it('a read-only pane stays reachable by keyboard but refuses input', async () =>
   expect(editorText(host)).toBe('zz')
 })
 
-it('saves on Mod-S and cancels on Escape', async () => {
+it('saves on Mod-S, and Escape never throws the text away', async () => {
   const p = props()
   await mount(p)
+  await typeAll(host, 'abc')
   await pressKey(host, { key: 's', ctrlKey: true })
   await pressKey(host, { key: 'Escape' })
   expect(p.onSave).toHaveBeenCalledTimes(1)
-  expect(p.onCancel).toHaveBeenCalledTimes(1)
+  expect(editorText(host)).toBe('abc')
 })
 
 it('does not treat Mod-Shift-S as save', async () => {
@@ -63,16 +68,14 @@ it('does not treat Mod-Shift-S as save', async () => {
   expect(p.onSave).not.toHaveBeenCalled()
 })
 
-it('the first Escape closes the search panel instead of leaving the edit', async () => {
-  const p = props()
-  await mount(p)
+it('Escape closes the search panel', async () => {
+  await mount(props())
   await act(async () => { openSearchPanel(editorOf(host)) })
   expect(host.querySelector('.cm-search')).not.toBeNull()
-  await pressKey(host, { key: 'Escape' })
+  await act(async () => {
+    host.querySelector('.cm-search input')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+  })
   expect(host.querySelector('.cm-search')).toBeNull()
-  expect(p.onCancel).not.toHaveBeenCalled()
-  await pressKey(host, { key: 'Escape' })
-  expect(p.onCancel).toHaveBeenCalledTimes(1)
 })
 
 it('inserts the indent unit on Tab, and a tab for a tab-indented file', async () => {
@@ -108,14 +111,12 @@ it('keeps the caret after the indent', async () => {
   expect(editorOf(host).state.selection.main.head).toBe(3)
 })
 
-it('ignores Escape, Mod-S and Tab while an IME composition is active', async () => {
+it('ignores Mod-S and Tab while an IME composition is active', async () => {
   const p = props({ value: 'ab' })
   await mount(p)
   Object.defineProperty(editorOf(host), 'composing', { value: true, configurable: true })
-  await pressKey(host, { key: 'Escape' })
   await pressKey(host, { key: 's', ctrlKey: true })
   await pressKey(host, { key: 'Tab' })
-  expect(p.onCancel).not.toHaveBeenCalled()
   expect(p.onSave).not.toHaveBeenCalled()
   expect(p.onChange).not.toHaveBeenCalled()
 })
@@ -140,11 +141,13 @@ it('follows a new value by changing only what differs, so the caret and undo his
   expect(editorOf(host).state.selection.main.head).toBe(5)
 })
 
-it('highlights and shows the lines a tool read while read-only', async () => {
-  const p = props({ editable: false, value: 'a\nb\nc\nd\n', focus: { line: 2, lines: 2, seq: 1 } })
+it('highlights the lines a tool read until the caller drops the window, and never over a comparison', async () => {
+  const p = props({ value: 'a\nb\nc\nd\n', focus: { line: 2, lines: 2, seq: 1 } })
   await mount(p)
   expect(host.querySelectorAll('.cm-focus-band').length).toBe(2)
-  await rerender({ ...p, editable: true })
+  await rerender({ ...p, compare: { original: 'a\n', revertLabel: 'Revert' } })
+  expect(host.querySelectorAll('.cm-focus-band').length).toBe(0)
+  await rerender({ ...p, focus: null })
   expect(host.querySelectorAll('.cm-focus-band').length).toBe(0)
 })
 
@@ -157,17 +160,16 @@ it('states the cursor position and any selection', async () => {
   expect(host.textContent).toContain('4 selected')
 })
 
-it('wraps long lines on demand and remembers the choice', async () => {
-  await mount(props())
-  const toggle = [...host.querySelectorAll('button')].find((b) => b.textContent === 'Wrap')!
-  expect(toggle.getAttribute('aria-pressed')).toBe('false')
+it('wraps long lines when asked, in place', async () => {
+  const p = props()
+  await mount(p)
+  const before = editorOf(host)
   expect(host.querySelector('.cm-lineWrapping')).toBeNull()
-  await act(async () => toggle.click())
-  expect(toggle.getAttribute('aria-pressed')).toBe('true')
+  await rerender({ ...p, wrap: true })
   expect(host.querySelector('.cm-lineWrapping')).not.toBeNull()
-  expect(window.localStorage.getItem('dnt.editor.wrap')).toBe('1')
-  await act(async () => toggle.click())
-  expect(window.localStorage.getItem('dnt.editor.wrap')).toBe('0')
+  await rerender({ ...p, wrap: false })
+  expect(host.querySelector('.cm-lineWrapping')).toBeNull()
+  expect(editorOf(host)).toBe(before)
 })
 
 it('restyles with the page theme without rebuilding the editor', async () => {
