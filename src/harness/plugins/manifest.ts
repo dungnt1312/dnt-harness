@@ -200,6 +200,29 @@ export function serverMap(value: unknown): Record<string, unknown> | undefined {
 }
 
 /**
+ * One convention-or-declared JSON component (`hooks/hooks.json`,
+ * `.mcp.json`) located inside the plugin. `absent` is the normal case — most
+ * plugins have neither; `escape` is the security-relevant symlink case; the
+ * declared variants distinguish an author typo from plain absence.
+ */
+type JsonComponent =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'escape' }
+  | { readonly kind: 'not-file' }
+  | { readonly kind: 'file'; readonly file: string }
+
+async function resolveJsonComponent(root: string, rel: string): Promise<JsonComponent> {
+  const lexical = resolveInside(root, rel)
+  if (lexical === undefined) return { kind: 'escape' }
+  if (!(await isFile(lexical))) {
+    const stat = await fs.stat(lexical).catch(() => undefined)
+    return stat === undefined ? { kind: 'absent' } : { kind: 'not-file' }
+  }
+  const file = await resolveExistingInside(root, rel)
+  return file === undefined ? { kind: 'escape' } : { kind: 'file', file }
+}
+
+/**
  * Resolve every component of the plugin at `root`. `extra` carries a
  * marketplace entry's component fields, which supplement the manifest's.
  */
@@ -247,16 +270,17 @@ export async function resolveComponents(root: string, manifest: PluginManifest, 
     hooks = (hooksField as Record<string, unknown>)['hooks'] ?? hooksField
   } else {
     const rel = typeof hooksField === 'string' ? hooksField : './hooks/hooks.json'
-    const file = await resolveExistingInside(root, rel)
-    if (file === undefined) notes.push(`hooks: '${rel}' is missing or outside the plugin after symlink resolution; ignored`)
-    else if (await isFile(file)) {
+    const component = await resolveJsonComponent(root, rel)
+    if (component.kind === 'file') {
       try {
-        const doc = await readJson(file) as Record<string, unknown>
+        const doc = await readJson(component.file) as Record<string, unknown>
         hooks = doc !== null && typeof doc === 'object' ? doc['hooks'] ?? doc : undefined
       } catch (error) {
-        notes.push(`hooks: ${path.relative(root, file)} is not valid JSON (${String(error instanceof Error ? error.message : error)})`)
+        notes.push(`hooks: ${path.relative(root, component.file)} is not valid JSON (${String(error instanceof Error ? error.message : error)})`)
       }
-    } else if (typeof hooksField === 'string') notes.push(`hooks: '${rel}' does not exist`)
+    } else if (component.kind === 'escape' || typeof hooksField === 'string') {
+      notes.push(`hooks: '${rel}' ${component.kind === 'escape' ? 'is missing or outside the plugin after symlink resolution; ignored' : 'does not exist'}`)
+    }
   }
 
   let mcpServers: Record<string, unknown> | undefined
@@ -265,15 +289,16 @@ export async function resolveComponents(root: string, manifest: PluginManifest, 
     mcpServers = serverMap(mcpField)
   } else {
     const rel = typeof mcpField === 'string' ? mcpField : './.mcp.json'
-    const file = await resolveExistingInside(root, rel)
-    if (file === undefined) notes.push(`mcpServers: '${rel}' is missing or outside the plugin after symlink resolution; ignored`)
-    else if (await isFile(file)) {
+    const component = await resolveJsonComponent(root, rel)
+    if (component.kind === 'file') {
       try {
-        mcpServers = serverMap(await readJson(file))
+        mcpServers = serverMap(await readJson(component.file))
       } catch (error) {
-        notes.push(`mcpServers: ${path.relative(root, file)} is not valid JSON (${String(error instanceof Error ? error.message : error)})`)
+        notes.push(`mcpServers: ${path.relative(root, component.file)} is not valid JSON (${String(error instanceof Error ? error.message : error)})`)
       }
-    } else if (typeof mcpField === 'string') notes.push(`mcpServers: '${rel}' does not exist`)
+    } else if (component.kind === 'escape' || typeof mcpField === 'string') {
+      notes.push(`mcpServers: '${rel}' ${component.kind === 'escape' ? 'is missing or outside the plugin after symlink resolution; ignored' : 'does not exist'}`)
+    }
   }
 
   return {

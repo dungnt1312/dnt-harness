@@ -42,6 +42,26 @@ describe('plugin component containment', () => {
     expect(components.notes.join('\n')).toMatch(/outside the plugin after symlink resolution/)
   })
 
+  it('stays silent when a plugin simply has no default hooks or MCP file', async () => {
+    const plugin = await temp('plugin-quiet-')
+    await fs.mkdir(path.join(plugin, '.claude-plugin'), { recursive: true })
+    await fs.writeFile(path.join(plugin, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'quiet', description: 'no hooks, no mcp' }))
+
+    const manifest = parseManifest({ name: 'quiet' })
+    const components = await resolveComponents(plugin, manifest)
+    expect(components.hooks).toBeUndefined()
+    expect(components.mcpServers).toBeUndefined()
+    expect(components.notes).toEqual([])
+  })
+
+  it('still reports a declared hooks or mcpServers path that does not exist', async () => {
+    const plugin = await temp('plugin-declared-')
+    const manifest = parseManifest({ name: 'declared', hooks: './hooks/other.json', mcpServers: './tooling/.mcp.json' })
+    const components = await resolveComponents(plugin, manifest)
+    expect(components.notes.join('\n')).toMatch(/hooks: '\.\/hooks\/other\.json' does not exist/)
+    expect(components.notes.join('\n')).toMatch(/mcpServers: '\.\/tooling\/\.mcp\.json' does not exist/)
+  })
+
   it('refuses a plugin tree with a nested symlink that escapes, and allows internal ones', async () => {
     if (process.platform === 'win32') return
     const plugin = await temp('plugin-tree-')
