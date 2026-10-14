@@ -465,7 +465,7 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
           <div role="group" aria-label="Branch" className="flex h-11 shrink-0 items-center gap-1.5 border-t border-line px-2.5 text-[13px]">
             {report.branchInfo !== null ? (
               <>
-                <GitBranchPicker current={report.branchInfo.name} run={run} onDone={settleOperation} />
+                <GitBranchPicker current={report.branchInfo.name} run={run} enqueue={enqueue} onDone={settleOperation} />
                 <GitRemoteButton key={project.id} branchInfo={report.branchInfo} run={run} onDone={settleOperation} />
               </>
             ) : (
