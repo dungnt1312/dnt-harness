@@ -185,3 +185,23 @@ describe('direct file writes stay inside the project', () => {
     expect(await fs.readFile(outside, 'utf8')).toBe('a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> t\n')
   })
 })
+
+describe('a conflicted file that is not UTF-8 keeps its bytes (final review C1)', () => {
+  it('Use Both rewrites only the region and leaves the é byte of the rest alone', async () => {
+    const repo = await makeRepo('latin1')
+    const withE = (middle: string): Buffer => Buffer.concat([Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x0a]), Buffer.from(middle)])
+    await fs.writeFile(path.join(repo.dir, 'f.txt'), withE('x\n')); repo.git('add', '.'); repo.git('commit', '-qm', 'base')
+    repo.git('switch', '-q', '-c', 'feature'); await fs.writeFile(path.join(repo.dir, 'f.txt'), withE('feature\n')); repo.git('commit', '-qam', 'feature')
+    repo.git('switch', '-q', 'main'); await fs.writeFile(path.join(repo.dir, 'f.txt'), withE('main\n')); repo.git('commit', '-qam', 'main')
+    git(repo.dir, ['merge', 'feature'], { allowFailure: true })
+
+    const diff = await gitDiff(repo.dir, 'f.txt', undefined, true)
+    expect(diff.conflicts).toHaveLength(1)
+    const done = await operate(repo, { type: 'resolve-conflict', path: 'f.txt', index: 0, fingerprint: (diff.conflicts ?? [])[0]!.fingerprint, choice: 'both' })
+    expect(done.ok).toBe(true)
+    const bytes = await fs.readFile(path.join(repo.dir, 'f.txt'))
+    expect([...bytes.subarray(0, 5)]).toEqual([0x63, 0x61, 0x66, 0xe9, 0x0a])
+    expect(bytes.includes(Buffer.from([0xef, 0xbf, 0xbd]))).toBe(false)
+    expect(bytes.subarray(5).toString('latin1')).toBe('main\nfeature\n')
+  })
+})

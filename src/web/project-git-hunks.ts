@@ -216,7 +216,7 @@ export async function hunksFor(
   // The index must have the path; a clean file has no hunks anyway.
   const [unstagedDiff, stagedDiff] = await Promise.all([
     read(['diff', '--no-color', '-U0', '--no-ext-diff', '--', rel]),
-    read(['diff', '--no-color', '-U0', '--no-ext-diff', '--cached', 'HEAD', '--', repoRel]),
+    read(['diff', '--no-color', '-U0', '--no-ext-diff', '--cached', 'HEAD', '--', rel]),
   ])
   if (unstagedDiff.code !== 0 || stagedDiff.code !== 0) return []
   return hunksFrom({ hasHead: true, trackedInHead: true, conflicted: false, created: false },
@@ -240,10 +240,14 @@ async function repoRelOf(ctx: Context, rel: string): Promise<string> {
   return trim === '' ? rel : `${trim}${rel}`
 }
 
-/** The lines of one side, as raw bytes. */
+/**
+ * One side of the file as raw bytes. The bytes never pass through a string: a
+ * Latin-1 or Shift-JIS file would otherwise come back with every invalid
+ * byte replaced, and a hunk operation would silently rewrite the whole file.
+ */
 async function sideText(ctx: Context, spec: string): Promise<Buffer | null> {
-  const result = await git(ctx, ['show', spec])
-  return result.ok ? Buffer.from(result.stdout, 'utf8') : null
+  const result = await ctx.run(ctx.root, ['show', spec], { trusted: ctx.trusted, stdin: 'ignore', env: ctx.env })
+  return result.code === 0 ? result.stdout : null
 }
 
 /**
@@ -253,8 +257,8 @@ async function sideText(ctx: Context, spec: string): Promise<Buffer | null> {
  */
 async function setIndexText(ctx: Context, rel: string, text: Buffer | null): Promise<Step> {
   const repoRel = await repoRelOf(ctx, rel)
-  if (text === null) return git(ctx, ['update-index', '--force-remove', '--', repoRel])
-  const hashed = await gitWithStdin(ctx, ['hash-object', '-w', '--stdin', '--path', repoRel], text)
+  if (text === null) return git(ctx, ['update-index', '--force-remove', '--', rel])
+  const hashed = await gitWithStdin(ctx, ['hash-object', '-w', '--stdin', '--path', rel], text)
   if (!hashed.ok) return { ok: false, stdout: hashed.stdout, stderr: `Failed to stage:\n${hashed.stderr}` }
   const sha = hashed.stdout.trim()
   const mode = await indexModeOf(ctx, rel)
@@ -282,7 +286,8 @@ async function unstagedZero(ctx: Context, rel: string, range: readonly [number, 
 
 /** The zero-context HEAD↔index hunks whose HEAD range overlaps `range`. */
 async function stagedZero(ctx: Context, rel: string, range: readonly [number, number]): Promise<RawHunk[]> {
-  const diff = await git(ctx, ['diff', '--no-color', '-U0', '--no-ext-diff', '--cached', 'HEAD', '--', await repoRelOf(ctx, rel)])
+  // A pathspec is relative to the git cwd (the project root); only `show` specs and `--cacheinfo` name repo-root paths.
+  const diff = await git(ctx, ['diff', '--no-color', '-U0', '--no-ext-diff', '--cached', 'HEAD', '--', rel])
   return parseHunks(diff.stdout).filter((hunk) => rangesOverlap(rangeOf(hunk.oldStart, hunk.oldLines), range))
 }
 
@@ -353,8 +358,6 @@ async function worktreeText(ctx: Context, rel: string): Promise<Buffer | null> {
 
 /** One git command with `input` on stdin (`hash-object --stdin`). */
 async function gitWithStdin(ctx: Context, args: readonly string[], input: Buffer): Promise<Step> {
-  const { runGitCommand } = await import('./project-git.ts')
   const result = await ctx.run(ctx.root, args, { trusted: ctx.trusted, stdin: input, env: ctx.env })
   return { ok: result.code === 0, stdout: result.stdout.toString('utf8'), stderr: result.stderr.toString('utf8') }
 }
-void git
