@@ -703,10 +703,15 @@ at most 24,000 characters. An invalid seed (unproven boundary, empty or
 oversized summary) fails closed rather than silently folding from scratch.
 A transient provider failure re-asks the same chunk with agent-loop retry
 policy (`stepRetries`, exponential backoff); each attempt's partial output is
-discarded, so a retry never duplicates text. When one chunk's answer would
-exceed the cap, it is re-asked once with an explicit hard-length constraint;
-still-oversized, failed, empty output prevents publication
-of a new checkpoint rather than silently claiming partial coverage. An explicit
+discarded, so a retry never duplicates text. If a chunk's answer exceeds 24,000
+characters, the legacy fold collects the complete draft up to 96,000 characters
+and requires a settled stop before attempting repair. It compresses that draft
+rather than sending the original raw chunk again, targeting 12,000 characters;
+if still oversized, one final draft compression targets 8,000. Repair does not
+repeat the exhaustive nine-heading prompt. The final accepted summary remains
+capped at 24,000 characters: oversized, incomplete, failed or empty output
+prevents publication rather than silently clipping or claiming partial coverage.
+This repair applies to the legacy fold only, not the effective generator. An explicit
 `maxChars` source cap rejects insufficient bounds instead of slicing the source.
 With no model pair, the extractive fallback preserves the exact source only if
 it fits within 24,000 characters, otherwise it fails explicitly.

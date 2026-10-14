@@ -139,6 +139,21 @@ describe('recoveryConfirmationFor', () => {
     expect(recoveryConfirmationFor(big, 4).estimatedCalls).toBeGreaterThanOrEqual(3)
   })
 
+  it('estimates from what the folder will actually read: bulk tool arguments and results are shortened first', () => {
+    const body = 'x'.repeat(RAW_RECOVERY_CALL_ESTIMATE_CHARS * 3)
+    const bulky = log([
+      { type: 'turn/start', turnId: 't1' },
+      { type: 'user/message', turnId: 't1', content: 'q' },
+      { type: 'assistant/message', stepId: 's', content: '', toolCalls: [{ id: 'c', name: 'Write', args: { path: 'a.ts', content: body } }] },
+      { type: 'tool/call', stepId: 's', call: { id: 'c', name: 'Write', args: { path: 'a.ts', content: body } } },
+      { type: 'tool/result', stepId: 's', callId: 'c', ok: true, output: body },
+      { type: 'assistant/message', stepId: 's2', content: 'done' },
+      { type: 'turn/end', turnId: 't1', reason: 'completed' },
+    ])
+    // 600k characters of raw log would be 3 calls; the folder reads a few thousand.
+    expect(recoveryConfirmationFor(bulky, 7).estimatedCalls).toBe(1)
+  })
+
   it('changes when the covered source changes, so a stale confirmation cannot be replayed', () => {
     const edited = log([...turnRows('t1', 'FIRST EDITED', 'a1'), ...turnRows('t2', 'second', 'a2')])
     expect(recoveryConfirmationFor(edited, 8).sourceDigest).not.toBe(recoveryConfirmationFor(events, 8).sourceDigest)

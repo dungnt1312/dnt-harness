@@ -25,6 +25,7 @@ import { assertSchemaFloor } from '../harness/mcp/migration.ts'
 import { createWebServer } from '../web/server.ts'
 import { defaultSecretRoots } from '../capabilities/fs/secret-roots.ts'
 import { loadRepoEnv, repoRoot, resolveAppHome } from './env.ts'
+import { WEB_BIN_LIMITS } from './web-limits.ts'
 
 // `~/.dnt-harness`, or the pre-rename `~/.mini-dsh` while only that exists.
 const appHome = resolveAppHome()
@@ -99,7 +100,7 @@ async function main(): Promise<void> {
     // Credential folders stay off-limits to file tools in every mode.
     secretRoots: defaultSecretRoots(homedir()),
     seedDeepseekFromEnv: true,
-    limits: { automaticCompactionPressure: 0.85, approvalExpiryMs: 0 },
+    limits: WEB_BIN_LIMITS,
     ...(yolo ? { yolo: true, defaultMode: 'allow' as const } : { defaultMode: 'ask' as const }),
     // `--root` picks where an unbound Workbench terminal opens. It is not
     // passed as `root`: that would widen the file tools' legacy grant, which
