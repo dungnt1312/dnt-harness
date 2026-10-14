@@ -525,7 +525,7 @@ export interface TurnChangeAnchor {
 }
 
 /**
- * One anchor per turn that changed files (or tried to): the last item of the
+ * One anchor per turn that changed files: the last item of the
  * turn, so the card closes the turn whether its final row is an answer, a
  * tool, or an error. A turn spans from its first assistant step to the next
  * delivered user message; tool rows carry no turn of their own, so the span
@@ -538,7 +538,7 @@ export function turnChangeAnchors(items: readonly ViewItem[], changes: ReadonlyM
   const close = (): void => {
     if (current === undefined) return
     const found = changes.get(current.turnId)
-    if (found !== undefined && (found.files.length > 0 || found.uncertain.length > 0)) {
+    if (found !== undefined && found.files.length > 0) {
       anchors.push({ turnId: current.turnId, index: last, changes: found, live: current.live })
     }
     current = undefined

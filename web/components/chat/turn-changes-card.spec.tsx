@@ -30,9 +30,7 @@ const CHANGES: TurnChanges = {
     { path: 'src/a.ts', status: 'modified', lines: { added: 1, removed: 1 }, edits: [{ kind: 'edit', old: 'a\nb', new: 'a\nc', output: 'edited src/a.ts' }] },
     { path: 'notes.md', status: 'created', lines: { added: 2 }, edits: [{ kind: 'write', content: 'hello\nworld', created: true }] },
   ],
-  uncertain: [],
 }
-
 const PROJECT = { id: 'p1', name: 'proj', path: 'C:/proj' }
 
 async function mount(changes: TurnChanges, props: Partial<Parameters<typeof TurnChangesCard>[0]> = {}): Promise<HTMLDivElement> {
@@ -102,7 +100,6 @@ it('a file edited several times lists every call in order', async () => {
         { kind: 'edit', old: 'two', new: 'three', output: 'edited src/a.ts' },
       ],
     }],
-    uncertain: [],
   })
   await act(async () => header(view).click())
   await act(async () => fileRows(view)[0]!.querySelector<HTMLButtonElement>('button[aria-expanded]')!.click())
@@ -113,7 +110,6 @@ it('a file edited several times lists every call in order', async () => {
 it('an overwritten file is tagged and states no invented counts', async () => {
   const view = await mount({
     files: [{ path: 'src/a.ts', status: 'modified', overwrote: true, edits: [{ kind: 'write', content: 'x\ny', created: false }] }],
-    uncertain: [],
   })
   await act(async () => header(view).click())
   const row = fileRows(view)[0]!
@@ -131,13 +127,6 @@ it('a live card says the turn is still editing, and starts closed like any other
   expect(fileRows(view)).toHaveLength(2)
   const closed = await mount(CHANGES)
   expect(closed.textContent).not.toContain('Editing')
-})
-
-it('a write whose result never landed reads as unconfirmed, not clean', async () => {
-  const view = await mount({ files: [], uncertain: ['c9'] })
-  expect(view.textContent).toContain('outcome unconfirmed')
-  await act(async () => header(view).click())
-  expect(view.textContent).toContain('did not report')
 })
 
 it('the Git actions are labelled as git and offered only with their callbacks', async () => {
@@ -166,7 +155,6 @@ it('a file outside the project has no git action; the file opener stays', async 
   const onReviewFile = vi.fn()
   const OUTSIDE: TurnChanges = {
     files: [{ path: 'C:/elsewhere/x.md', status: 'modified', lines: { added: 1, removed: 1 }, edits: [{ kind: 'edit', old: 'before', new: 'after', output: 'edited x.md' }] }],
-    uncertain: [],
   }
   const view = await mount(OUTSIDE, { onReviewFile, onOpenPath: () => () => {} })
   await act(async () => header(view).click())

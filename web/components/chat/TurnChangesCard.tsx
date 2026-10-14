@@ -76,9 +76,6 @@ export function TurnChangesCard({ turnId, changes, project, live = false, onOpen
           <Icon name="chevronRight" size={12} className={cn('shrink-0 text-fg-faint transition-transform', open && 'rotate-90')} />
           <span className="shrink-0 font-medium">{turnChangesLabel(changes.files.length)}</span>
           <LineCount added={totals.added} removed={totals.removed} />
-          {changes.files.length === 0 && changes.uncertain.length > 0 ? (
-            <span className="shrink-0 rounded bg-warn-soft px-1.5 text-[11px] text-warn">outcome unconfirmed</span>
-          ) : null}
           {live ? (
             <span className="flex shrink-0 items-center gap-1.5 text-[11px] text-fg-faint">
               <span className="size-1.5 rounded-full bg-ok animate-dot" aria-hidden="true" />
@@ -100,23 +97,17 @@ export function TurnChangesCard({ turnId, changes, project, live = false, onOpen
       </div>
       {open ? (
         <div className="mt-0.5">
-          {changes.files.length > 0 ? (
-            <ul aria-label={`Files changed by turn ${turnId}`} className="m-0 flex list-none flex-col gap-0.5 p-0">
-              {changes.files.map((file) => (
-                <ChangeFileRow
-                  key={file.path}
-                  file={file}
-                  {...(project !== null ? { project } : {})}
-                  {...(onReviewFile !== undefined ? { onReviewFile } : {})}
-                  {...(onOpenPath !== undefined ? { onOpenPath } : {})}
-                />
-              ))}
-            </ul>
-          ) : (
-            <p className="m-0 px-2 py-1.5 text-[12px] text-fg-muted" role="note">
-              {changes.uncertain.length} {changes.uncertain.length === 1 ? 'write did not report its outcome' : 'writes did not report their outcomes'} — the log cannot say whether the {changes.uncertain.length === 1 ? 'file was' : 'files were'} changed. The Git view shows what actually differs.
-            </p>
-          )}
+          <ul aria-label={`Files changed by turn ${turnId}`} className="m-0 flex list-none flex-col gap-0.5 p-0">
+            {changes.files.map((file) => (
+              <ChangeFileRow
+                key={file.path}
+                file={file}
+                {...(project !== null ? { project } : {})}
+                {...(onReviewFile !== undefined ? { onReviewFile } : {})}
+                {...(onOpenPath !== undefined ? { onOpenPath } : {})}
+              />
+            ))}
+          </ul>
           {outsideCount > 0 ? (
             <p className="m-0 px-2 py-1.5 text-[12px] text-fg-faint" role="note">
               {outsideCount === 1 ? 'One file sits' : `${outsideCount} files sit`} outside the project folder; the Git view cannot show {outsideCount === 1 ? 'it' : 'them'}.

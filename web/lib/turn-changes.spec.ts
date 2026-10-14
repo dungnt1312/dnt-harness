@@ -99,15 +99,13 @@ describe('turnChanges', () => {
     expect(map.has('t2')).toBe(false)
   })
 
-  it('drops failed, denied and recovered results from files, keeping them uncertain', () => {
+  it('drops failed, denied and recovered results: a turn whose writes never landed has no entry', () => {
     const events = [
       ...callPair('c1', 'Write', { path: 'a.ts', content: 'x' }, 't1', { ok: false, output: 'conflict: a.ts changed after it was observed' }),
       ...callPair('c2', 'Edit', { path: 'b.ts', old: 'a', new: 'b' }, 't1', { ok: false, output: 'denied: not allowed by the mode' }),
       ...callPair('c3', 'Write', { path: 'c.ts', content: 'x' }, 't1', { ok: true, output: 'whatever', recovery: true }),
     ]
-    const turn = turnChanges(events).get('t1')
-    expect(turn?.files).toEqual([])
-    expect(turn?.uncertain).toEqual(['c1', 'c2', 'c3'])
+    expect(turnChanges(events).has('t1')).toBe(false)
   })
 
   it('never counts Read calls, and ignores calls outside any turn', () => {
