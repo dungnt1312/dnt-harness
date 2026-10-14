@@ -90,6 +90,37 @@ describe('UsagePanel', () => {
     expect(host.querySelectorAll('[data-testid="trend-series"]')).toHaveLength(4)
   })
 
+  it('shows cache hit totals, a per-model table and the daily trend for the chosen range', async () => {
+    mocked.mockResolvedValue({
+      today: '2026-10-08',
+      longestSessionMs: 0,
+      days: [
+        { date: '2026-10-08', model: 'claude-opus-5-5', input: 1000, cached: 900, cacheableInput: 1000, cacheReportedRequests: 2, unreportedRequests: 0, output: 5, requests: 2 },
+        { date: '2026-10-07', model: 'claude-opus-5-5', input: 1000, cached: 500, cacheableInput: 1000, cacheReportedRequests: 2, unreportedRequests: 0, output: 5, requests: 2 },
+        { date: '2026-10-08', model: 'no-telemetry', input: 400, cached: 0, cacheableInput: 0, cacheReportedRequests: 0, unreportedRequests: 4, output: 5, requests: 4 },
+        { date: '2026-09-20', model: 'old-model', input: 100, cached: 100, cacheableInput: 100, cacheReportedRequests: 1, unreportedRequests: 0, output: 0, requests: 1 },
+      ],
+    })
+    await mount()
+    const summary = host.querySelector('[aria-label="Cache summary"]')!.textContent
+    expect(summary).toContain('Cache hit70.0%')
+    expect(summary).toContain('Cached tokens1.4K')
+    expect(summary).toContain('Fresh tokens600')
+    expect(summary).toContain('No cache data4 requests')
+    const rows = [...host.querySelectorAll('[data-testid="cache-model-row"]')].map((row) => row.textContent)
+    expect(rows).toHaveLength(2)
+    expect(rows[0]).toContain('claude-opus-5-5')
+    expect(rows[0]).toContain('70.0%')
+    expect(rows[0]).toContain('150')
+    // A provider that never reported caching has no rate, not a false 0%.
+    expect(rows[1]).toContain('no-telemetry')
+    expect(rows[1]).toContain('No data')
+    expect(host.querySelectorAll('[data-testid="cache-bar"]')).toHaveLength(7)
+    await click('Last 30 days')
+    expect(host.querySelectorAll('[data-testid="cache-bar"]')).toHaveLength(30)
+    expect(host.querySelectorAll('[data-testid="cache-model-row"]')).toHaveLength(3)
+  })
+
   it('shows the empty state when nothing was recorded', async () => {
     mocked.mockResolvedValue({ today: '2026-10-08', longestSessionMs: 0, days: [] })
     await mount()

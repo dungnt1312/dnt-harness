@@ -222,6 +222,97 @@ export function buildTrend(data: UsageDailyResponse, rangeDays: number): TrendMo
   return { dates, series, max }
 }
 
+export interface CacheTotals {
+  readonly requests: number
+  /** Prompt tokens served from the provider's cache. */
+  readonly cached: number
+  /** Prompt tokens of the requests whose provider reported a cached share. */
+  readonly cacheableInput: number
+  /** Reported prompt tokens that were not cached. */
+  readonly freshInput: number
+  /** Requests whose provider sent no cache telemetry (not counted as 0%). */
+  readonly unreportedRequests: number
+  /** `cached / cacheableInput`; undefined when no request reported a cached share. */
+  readonly hit: number | undefined
+}
+
+export interface CacheModelStats extends CacheTotals {
+  readonly model: string
+  /** Average uncached prompt tokens per reporting request; undefined without telemetry. */
+  readonly freshPerRequest: number | undefined
+}
+
+export interface CacheDayStats {
+  readonly date: string
+  readonly hit: number | undefined
+}
+
+export interface CacheStats {
+  readonly total: CacheTotals
+  /** Ranked by prompt volume. */
+  readonly models: readonly CacheModelStats[]
+  /** One entry per day of the range, ending today. */
+  readonly days: readonly CacheDayStats[]
+}
+
+interface CacheSum { requests: number; cached: number; cacheableInput: number; reported: number; unreported: number; input: number }
+
+const emptySum = (): CacheSum => ({ requests: 0, cached: 0, cacheableInput: 0, reported: 0, unreported: 0, input: 0 })
+
+function addRow(sum: CacheSum, row: UsageDayRow): void {
+  sum.requests += row.requests
+  sum.cached += row.cached
+  sum.cacheableInput += row.cacheableInput
+  sum.reported += row.cacheReportedRequests
+  sum.unreported += row.unreportedRequests
+  sum.input += row.input
+}
+
+const hitOf = (sum: CacheSum): number | undefined => (sum.cacheableInput > 0 ? sum.cached / sum.cacheableInput : undefined)
+
+const totalsOf = (sum: CacheSum): CacheTotals => ({
+  requests: sum.requests,
+  cached: sum.cached,
+  cacheableInput: sum.cacheableInput,
+  freshInput: sum.cacheableInput - sum.cached,
+  unreportedRequests: sum.unreported,
+  hit: hitOf(sum),
+})
+
+/**
+ * Cache hit over the last `rangeDays` days ending today. The rate divides by
+ * the prompt tokens of requests that reported a cached share, so a provider
+ * without cache telemetry never reads as a 0% hit.
+ */
+export function buildCacheStats(data: UsageDailyResponse, rangeDays: number): CacheStats {
+  const dates = Array.from({ length: rangeDays }, (_, i) => addDays(data.today, i - rangeDays + 1))
+  const inRange = new Set(dates)
+  const total = emptySum()
+  const perModel = new Map<string, CacheSum>()
+  const perDay = new Map<string, CacheSum>()
+  for (const row of data.days) {
+    if (!inRange.has(row.date)) continue
+    addRow(total, row)
+    let model = perModel.get(row.model)
+    if (model === undefined) perModel.set(row.model, (model = emptySum()))
+    addRow(model, row)
+    let day = perDay.get(row.date)
+    if (day === undefined) perDay.set(row.date, (day = emptySum()))
+    addRow(day, row)
+  }
+  // Unlike the trend chart there is no colour budget here, so every model gets a row.
+  const models = [...perModel].sort((a, b) => b[1].input - a[1].input || a[0].localeCompare(b[0])).map(([model, sum]): CacheModelStats => ({
+    model,
+    ...totalsOf(sum),
+    freshPerRequest: sum.reported > 0 ? (sum.cacheableInput - sum.cached) / sum.reported : undefined,
+  }))
+  return {
+    total: totalsOf(total),
+    models,
+    days: dates.map((date) => ({ date, hit: perDay.has(date) ? hitOf(perDay.get(date)!) : undefined })),
+  }
+}
+
 /** Smallest 1/2/4/5/10 * 10^n at or above `value`, so 4 gridlines read cleanly; 4 when empty. */
 export function niceMax(value: number): number {
   if (!(value > 0)) return 4
