@@ -5,7 +5,7 @@
  * error.
  */
 import { describe, expect, it } from 'vitest'
-import { projectItems, shareProjectedItems, type ViewItem } from './project.ts'
+import { isCompactionRunning, projectItems, shareProjectedItems, type ViewItem } from './project.ts'
 import type { SseEvent } from './types.ts'
 
 let seq = 0
@@ -68,6 +68,142 @@ describe('compaction lifecycle projection', () => {
     expect(items[0]?.status).toBe('interrupted')
     expect(items[1]?.status).toBe('completed')
     expect(items[1]?.model).toBe('m2')
+  })
+
+  describe('job progress (compaction/job)', () => {
+    const job = (stage: string, extra: Record<string, unknown> = {}, timestamp?: number): SseEvent =>
+      event({ type: 'compaction/job', stage, trigger: 'manual', ...(timestamp !== undefined ? { timestamp } : {}), ...extra } as Omit<SseEvent, 'seq'>)
+
+    it('is ONE row from preparing to the end: the stage advances in place and the canonical start/end attach to it', () => {
+      const events = [
+        job('preparing', {}, 1_000),
+        job('generating', {}, 1_200),
+        job('applying', {}, 9_000),
+        event({ type: 'compaction/start', trigger: 'manual', model: 'm' }),
+        event({ type: 'compaction/restoration', coversSeq: 4, sections: [] }),
+        event({ type: 'compaction/end', trigger: 'manual', model: 'm', coversSeq: 4, summaryChars: 10, durationMs: 8_000, summary: 'S', tokensBefore: 9_000, tokensAfter: 2_000 }),
+        job('ended', { outcome: 'compacted', path: 'exact' }),
+      ]
+      const rows = compactionItems(events)
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({ status: 'completed', coversSeq: 4, summary: 'S', tokensAfter: 2_000, model: 'm', path: 'exact' })
+    })
+
+    it('while it runs, the row says which stage it is in and when it began', () => {
+      const rows = compactionItems([job('preparing', {}, 1_000), job('generating', {}, 1_200)])
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({ status: 'running', stage: 'generating', startedAt: 1_000, trigger: 'manual' })
+    })
+
+    it('the time before any summary exists shows as running too, not as nothing', () => {
+      const rows = compactionItems([job('preparing', {}, 5_000)])
+      expect(rows[0]).toMatchObject({ status: 'running', stage: 'preparing', startedAt: 5_000 })
+    })
+
+    it('events that happen DURING a compaction do not make it look interrupted', () => {
+      const rows = compactionItems([
+        job('preparing'),
+        event({ type: 'hook/run', event: 'PreCompact', matcher: '', exitCode: 0, durationMs: 5, decision: 'allow' } as Omit<SseEvent, 'seq'>),
+        job('generating'),
+        event({ type: 'model/attempt', fact: { state: 'start' } } as unknown as Omit<SseEvent, 'seq'>),
+        event({ type: 'input/queued', inputId: 'i1' } as Omit<SseEvent, 'seq'>),
+        event({ type: 'context/snapshot', snapshotId: 's', hash: 'h', cutoff: 3 } as Omit<SseEvent, 'seq'>),
+      ])
+      expect(rows[0]?.status).toBe('running')
+    })
+
+    it('a turn that starts while the row is still running means it never finished', () => {
+      const rows = compactionItems([job('preparing'), job('generating'), event({ type: 'turn/start', turnId: 't-next' })])
+      expect(rows[0]?.status).toBe('interrupted')
+    })
+
+    it.each([
+      ['cancelled', { outcome: 'cancelled' }, 'cancelled'],
+      ['failed', { outcome: 'failed', error: 'provider transport failure' }, 'failed'],
+      ['noop', { outcome: 'noop' }, 'noop'],
+      ['needs-recovery', { outcome: 'needs-recovery' }, 'needs-recovery'],
+    ])('ending as %s closes the row with that status when no canonical end was written', (_name, extra, status) => {
+      const rows = compactionItems([job('preparing'), job('generating'), job('ended', extra)])
+      expect(rows).toHaveLength(1)
+      expect(rows[0]?.status).toBe(status)
+    })
+
+    it('a job end never overwrites what the canonical end already settled: a completed row stays completed with its facts', () => {
+      const rows = compactionItems([
+        job('preparing', {}, 1_000),
+        event({ type: 'compaction/start', trigger: 'manual', model: 'm' }),
+        event({ type: 'compaction/end', trigger: 'manual', model: 'm', coversSeq: 7, summaryChars: 3, durationMs: 50, summary: 'S' }),
+        // A (contradictory) job end must not turn a settled success into something else.
+        job('ended', { outcome: 'failed', error: 'late' }),
+      ])
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({ status: 'completed', coversSeq: 7, summary: 'S' })
+      expect(rows[0]?.error).toBeUndefined()
+    })
+
+    it('a failed canonical end keeps its own error when the job end reports another', () => {
+      const rows = compactionItems([
+        job('preparing'),
+        event({ type: 'compaction/start', trigger: 'manual' }),
+        event({ type: 'compaction/end', trigger: 'manual', coversSeq: 7, summaryChars: 0, durationMs: 5, error: 'model changed' }),
+        job('ended', { outcome: 'failed', error: 'a different message' }),
+      ])
+      expect(rows[0]).toMatchObject({ status: 'failed', error: 'model changed' })
+    })
+
+    it('a failure carries its reason onto the row', () => {
+      const rows = compactionItems([job('preparing'), job('ended', { outcome: 'failed', error: 'provider transport failure' })])
+      expect(rows[0]?.error).toBe('provider transport failure')
+    })
+
+    it('a second compaction starts a second row, after the first one ended', () => {
+      const rows = compactionItems([
+        job('preparing'), job('ended', { outcome: 'cancelled' }),
+        job('preparing'), job('generating'),
+      ])
+      expect(rows.map((row) => row.status)).toEqual(['cancelled', 'running'])
+    })
+
+    it('a legacy log with no job events still projects exactly as before', () => {
+      const rows = compactionItems([
+        event({ type: 'compaction/start', trigger: 'manual' }),
+        event({ type: 'compaction/end', trigger: 'manual', coversSeq: 3, summaryChars: 4, durationMs: 9, summary: 'old' }),
+      ])
+      expect(rows).toHaveLength(1)
+      expect(rows[0]).toMatchObject({ status: 'completed', summary: 'old' })
+      expect(rows[0]?.stage).toBeUndefined()
+    })
+
+    it('a row ended by a job is projection-stable across re-renders', () => {
+      const events = [job('preparing'), job('generating'), job('ended', { outcome: 'cancelled' })]
+      const first = projectItems([base, ...events])
+      const second = projectItems([base, ...events])
+      expect(shareProjectedItems(first, second)).toBe(first)
+    })
+  })
+
+  describe('isCompactionRunning', () => {
+    const job = (stage: string): SseEvent => event({ type: 'compaction/job', stage, trigger: 'manual' } as Omit<SseEvent, 'seq'>)
+
+    it('is true from the first stage until the job ends', () => {
+      expect(isCompactionRunning([base, job('preparing')])).toBe(true)
+      expect(isCompactionRunning([base, job('preparing'), job('generating'), job('applying')])).toBe(true)
+      expect(isCompactionRunning([base, job('preparing'), job('generating'), job('ended')])).toBe(false)
+    })
+
+    it('is false for a session that never compacted, and for a legacy compaction that has no job events', () => {
+      expect(isCompactionRunning([base])).toBe(false)
+      expect(isCompactionRunning([base, event({ type: 'compaction/start', trigger: 'manual' })])).toBe(false)
+    })
+
+    it('only the newest job counts: an old ended one does not hide a new running one, nor the reverse', () => {
+      expect(isCompactionRunning([base, job('preparing'), job('ended'), job('preparing')])).toBe(true)
+      expect(isCompactionRunning([base, job('preparing'), job('preparing'), job('ended')])).toBe(false)
+    })
+
+    it('a turn that started after the job means it is not running any more (a crash left it dangling)', () => {
+      expect(isCompactionRunning([base, job('preparing'), event({ type: 'turn/start', turnId: 't2' })])).toBe(false)
+    })
   })
 
   it('a settled compaction row is projection-stable across re-renders', () => {

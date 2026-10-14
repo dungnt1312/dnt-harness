@@ -154,11 +154,13 @@ export type SessionEvent =
   // Compaction lifecycle, log-only: a durable successful end is authoritative;
   // checkpoint JSON is an atomic, rebuildable cache. A dangling start never
   // authorizes history replacement. Model projection ignores both.
-  | ({ readonly type: 'compaction/start'; readonly trigger: 'manual' | 'automatic'; readonly model?: string } & SessionEventStamp)
+  | ({ readonly type: 'compaction/start'; readonly trigger: 'manual' | 'automatic'; readonly model?: string; readonly adoption?: CompactionAdoptionStart } & SessionEventStamp)
   | ({
       readonly type: 'compaction/end'
       readonly trigger: 'manual' | 'automatic'
       readonly model?: string
+      /** Present when a summary prepared earlier was adopted; absent on legacy and failed ends. */
+      readonly adoption?: CompactionAdoptionEnd
       readonly coversSeq: number
       readonly summaryChars: number
       readonly durationMs: number
@@ -175,11 +177,60 @@ export type SessionEvent =
       /** Set on a failed attempt; no checkpoint was written. */
       readonly error?: string
     } & SessionEventStamp)
+  // Progress of one compaction operation, for every client and for a reload: it
+  // brackets the canonical `compaction/start`/`end` pair (preparing → generating →
+  // applying → ended) and also covers what those cannot show — the time spent
+  // before a summary exists, and operations that never write a lifecycle at all
+  // (a no-op, a cancel, a refusal). Bookkeeping, not model content; never the
+  // authority for a checkpoint.
+  | ({
+      readonly type: 'compaction/job'
+      readonly stage: 'preparing' | 'generating' | 'applying' | 'ended'
+      readonly trigger: 'manual' | 'automatic'
+      /** Only on `ended`. `needs-recovery`: nothing ran, the user must confirm a slow recovery. */
+      readonly outcome?: 'compacted' | 'noop' | 'needs-recovery' | 'cancelled' | 'failed'
+      /** Only on `ended` after a success: how the summary was made. */
+      readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'
+      readonly error?: string
+    } & SessionEventStamp)
+  // The bounded state restored beside a compaction summary (task list, running
+  // work, loaded skills, current file contents). Written inside the compaction
+  // transaction, BEFORE its successful end, so the log alone reproduces what the
+  // model saw. It only counts when that end succeeds at the same `coversSeq`;
+  // a failed attempt's copy is ignored. `sections` is typed provenance for the UI.
+  | ({
+      readonly type: 'compaction/restoration'
+      readonly coversSeq: number
+      readonly body: string
+      readonly sections: readonly { readonly kind: 'todo' | 'runtime' | 'skill' | 'file'; readonly name: string; readonly status: 'included' | 'truncated' | 'reference' | 'missing' | 'denied'; readonly tokens: number }[]
+    } & SessionEventStamp)
+  // Durable reference to an effective-compaction snapshot sidecar: id + hash +
+  // cutoff only, never the request itself. Bookkeeping, not model content —
+  // the sidecar is a cache, the log stays the authority.
+  | ({ readonly type: 'context/snapshot'; readonly snapshotId: string; readonly hash: string; readonly cutoff: number; readonly schema: 1 } & SessionEventStamp)
   // Background-process lifecycle, log-only (model projection ignores it):
   // a `Bash run_in_background` registration and its settled outcome. Pairs
   // are per process id; `interrupted` closes ids a restart left open.
   | ({ readonly type: 'process/start'; readonly processId: string; readonly command: string; readonly cwd: string; readonly turnId?: TurnId } & SessionEventStamp)
   | ({ readonly type: 'process/exit'; readonly processId: string; readonly exitCode: number | null; readonly termination: 'exited' | 'killed' | 'failed' | 'interrupted'; readonly durationMs: number } & SessionEventStamp)
+
+/**
+ * Proof, written into the log itself, that a compaction adopted a summary
+ * prepared against an OLDER closed cutoff. Recovery trusts only this — never a
+ * sidecar or in-memory state — and it lets turns that closed between the
+ * cutoff and the transaction stay verbatim in context.
+ */
+export interface CompactionAdoptionStart {
+  readonly v: 1
+  readonly transactionId: string
+  readonly cutoff: number
+}
+export interface CompactionAdoptionEnd extends CompactionAdoptionStart {
+  /** Digest of what the model could have seen through `cutoff` (see `sourceDigest`). */
+  readonly sourceDigest: string
+  /** sha256 of the checkpoint summary this adoption was prepared on top of; absent for none. */
+  readonly seedHash?: string
+}
 
 /** Why a turn closed. */
 export type TurnEndReason =
@@ -424,6 +475,9 @@ function projectMessages(events: readonly SessionEvent[], attachments?: Attachme
       case 'context/body':
       case 'compaction/start':
       case 'compaction/end':
+      case 'context/snapshot':
+      case 'compaction/restoration':
+      case 'compaction/job':
       case 'process/start':
       case 'process/exit':
         break

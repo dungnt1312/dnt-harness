@@ -11,13 +11,15 @@
  */
 import { useMemo, useRef } from 'react'
 import type { SseEvent } from './types.ts'
-import { isTurnRunning, taskPhase, type TaskPhase } from './project.ts'
+import { isCompactionRunning, isTurnRunning, taskPhase, type TaskPhase } from './project.ts'
 import { todosFromEvents, type TodoView } from './todos-view.ts'
 
 const TURN_BOUNDARY_TYPES = ['turn/start', 'turn/end'] as const
 const TASK_TYPES = ['tool/call', 'tool/result'] as const
 const PROCESS_TYPES = ['process/start', 'process/exit'] as const
 const AGENT_TYPES = ['agent/child-spawn', 'agent/child-result'] as const
+/** A compaction's progress; a turn start also settles it (a job a crash left dangling is not running). */
+const COMPACTION_TYPES = ['compaction/job', 'turn/start'] as const
 
 /**
  * One grouping pass per events reference in this hook, shared by its gates.
@@ -30,18 +32,20 @@ export interface SessionDerivedGates {
   readonly agentCount: number
   readonly recoveryCount: number
   readonly inputRevision: number
+  readonly compactionRevision: number
 }
 
 export function useSessionDerivedGates(events: readonly SseEvent[]): SessionDerivedGates {
-  const previous = useRef<{ groups: readonly (readonly SseEvent[])[]; revisions: number[] }>({ groups: [[], [], [], [], [], []], revisions: [0, 0, 0, 0, 0, 0] })
+  const previous = useRef<{ groups: readonly (readonly SseEvent[])[]; revisions: number[] }>({ groups: [[], [], [], [], [], [], []], revisions: [0, 0, 0, 0, 0, 0, 0] })
   return useMemo(() => {
-    const groups: SseEvent[][] = [[], [], [], [], [], []]
+    const groups: SseEvent[][] = [[], [], [], [], [], [], []]
     for (const event of events) {
       if ((TURN_BOUNDARY_TYPES as readonly string[]).includes(event.type)) groups[0]!.push(event)
       if ((TASK_TYPES as readonly string[]).includes(event.type)) groups[1]!.push(event)
       if ((PROCESS_TYPES as readonly string[]).includes(event.type)) groups[2]!.push(event)
       if ((AGENT_TYPES as readonly string[]).includes(event.type)) groups[3]!.push(event)
       if (event.type === 'input/queued' || event.type === 'input/settled' || event.type === 'user/message') groups[5]!.push(event)
+      if ((COMPACTION_TYPES as readonly string[]).includes(event.type)) groups[6]!.push(event)
       // Recovery is relative to the open turn, so boundaries invalidate it too.
       if (event.recovery === true || (TURN_BOUNDARY_TYPES as readonly string[]).includes(event.type)) groups[4]!.push(event)
     }
@@ -52,7 +56,7 @@ export function useSessionDerivedGates(events: readonly SseEvent[]): SessionDeri
       return same ? old.revisions[index]! : old.revisions[index]! + 1
     })
     previous.current = { groups, revisions }
-    return { turnCount: revisions[0]!, taskCount: revisions[1]!, processCount: revisions[2]!, agentCount: revisions[3]!, recoveryCount: revisions[4]!, inputRevision: revisions[5]! }
+    return { turnCount: revisions[0]!, taskCount: revisions[1]!, processCount: revisions[2]!, agentCount: revisions[3]!, recoveryCount: revisions[4]!, inputRevision: revisions[5]!, compactionRevision: revisions[6]! }
   }, [events])
 }
 
@@ -86,6 +90,8 @@ export interface SessionDerived {
   readonly workingSince: number | null
   /** The TaskStatus recovery note (a recovery record inside the open turn). */
   readonly recovered: boolean
+  /** A compaction is in progress. It is not a turn, so `running` stays false; the composer offers Stop for it. */
+  readonly compacting: boolean
 }
 
 const EMPTY_TODOS: TodoView = { todos: [] }
@@ -127,7 +133,8 @@ export function useSessionDerivedValues(events: readonly SseEvent[], pending: nu
   const todos = useGated(gates.taskCount, () => todosFromEvents(eventsRef.current), [])
   const workingSince = useGated(gates.turnCount, () => workingSinceOf(eventsRef.current), [])
   const recovered = useGated(gates.recoveryCount, () => recoveredOf(eventsRef.current), [])
-  return { phase, running, todos, workingSince, recovered }
+  const compacting = useGated(gates.compactionRevision, () => isCompactionRunning(eventsRef.current), [])
+  return { phase, running, todos, workingSince, recovered, compacting }
 }
 
 export { EMPTY_TODOS }

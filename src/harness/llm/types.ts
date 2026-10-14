@@ -133,6 +133,12 @@ export interface ModelRequest {
    * level (see `squeezeBudget`) so a retry actually sends less.
    */
   readonly squeeze?: number
+  /**
+   * Output-token budget this request asks for. It can only LOWER the cap an
+   * adapter would send (catalog or operator value); it never raises one.
+   * Absent keeps ordinary behavior. Invalid values are ignored.
+   */
+  readonly maxOutputTokens?: number
 }
 
 export type ModelFinishReason = 'stop' | 'tool_calls' | 'length' | 'content_filter' | 'error' | 'unknown'
@@ -185,6 +191,8 @@ export interface StreamOptions {
   readonly recordAttempt?: (fact: import('./request-lifecycle.ts').AttemptFact) => Promise<void>
   /** Fires when the owning turn stops or its provider stream becomes inactive. */
   readonly signal?: AbortSignal
+  /** `'low'`: speculative background work that must never take the last provider slot. Omitted is ordinary. */
+  readonly admissionPriority?: 'low'
   /** Present under harness ownership: built-in adapters perform exactly one physical attempt. */
   readonly requestOwner?: import('./request-lifecycle.ts').LogicalRequest
   /** Adapter calls only after verified local transport settlement, including late cleanup. */

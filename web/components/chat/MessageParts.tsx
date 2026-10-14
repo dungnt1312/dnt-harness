@@ -1735,30 +1735,50 @@ export const CompactionMarker = memo(function CompactionMarker({ item }: {
   readonly item: Extract<ViewItem, { kind: 'compaction' }>
 }) {
   const [open, setOpen] = useState(false)
+  // A live clock only while a row that knows when it began is running; a legacy row has no start to count from.
+  const ticking = item.status === 'running' && item.startedAt !== undefined
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!ticking) return
+    setNow(Date.now())
+    const id = window.setInterval(() => setNow(Date.now()), 1_000)
+    return () => window.clearInterval(id)
+  }, [ticking])
   const facts = [
     item.status === 'completed' ? compactionTokenChange(item) : undefined,
     item.coversSeq !== undefined ? `through seq ${item.coversSeq}` : undefined,
     item.summaryChars !== undefined ? `${formatBytes(item.summaryChars)} summarized` : undefined,
     item.model !== undefined ? item.model : undefined,
     item.trigger !== undefined ? item.trigger : undefined,
+    item.path === 'recovery' ? 'slow recovery' : undefined,
     item.durationMs !== undefined && item.status !== 'running' ? `${(item.durationMs / 1000).toFixed(1)}s` : undefined,
   ].filter((fact) => fact !== undefined)
 
   if (item.status === 'running') {
+    const stage = item.stage === 'preparing' ? 'Preparing' : item.stage === 'generating' ? 'Summarizing' : item.stage === 'applying' ? 'Applying' : undefined
     return (
       <div className="flex min-w-0 items-center gap-2 py-0.5 text-xs text-fg-muted" role="status" aria-live="polite">
         <Spinner size={12} className="shrink-0" />
         <span className="shrink-0">Compacting conversation…</span>
+        {stage !== undefined ? <span className="shrink-0 text-fg">{stage}</span> : null}
+        {ticking ? <span className="shrink-0 font-mono text-fg-faint">{formatElapsed(now - item.startedAt!)}</span> : null}
         {item.trigger !== undefined ? <span className="shrink-0 font-mono text-fg-faint">{item.trigger}</span> : null}
       </div>
     )
   }
 
+  // Ended without a checkpoint on purpose: not a failure, so nothing here says "failed".
   const label = item.status === 'failed'
     ? 'Compaction failed'
     : item.status === 'interrupted'
       ? 'Compaction interrupted'
-      : 'Compacted'
+      : item.status === 'cancelled'
+        ? 'Compaction cancelled'
+        : item.status === 'noop'
+          ? 'Already compacted'
+          : item.status === 'needs-recovery'
+            ? 'Needs a slow recovery'
+            : 'Compacted'
 
   return (
     <div className="min-w-0">

@@ -78,6 +78,17 @@ describe('openai completions adapter: thinking + wire shape', () => {
     expect(captured.map(c => c.body['max_tokens'])).toEqual([128_000, 131_072, undefined, 32_000])
   })
 
+  it('a request maxOutputTokens only LOWERS the cap; it never raises it above the catalog or operator value, and is never serialized as a field of its own', async () => {
+    const captured = stubFetch()
+    await run({ model: 'claude-opus-5-5', messages: [], maxOutputTokens: 8_000 }) // lowers the 128k catalog cap
+    await run({ model: 'claude-opus-5-5', messages: [], maxOutputTokens: 500_000 }) // cannot exceed the catalog
+    await run({ model: 'some-unknown-model', messages: [], maxOutputTokens: 8_000 }) // no known cap: the request value is the cap
+    for await (const _ of new OpenAiCompletionsProvider({ name: 't', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', maxOutputTokens: { 'claude-opus-5-5': 4_000 } }).stream({ model: 'claude-opus-5-5', messages: [], maxOutputTokens: 8_000 })) void _ // operator cap is lower
+    for (const bad of [0, -1, 1.5, Number.NaN]) await run({ model: 'claude-opus-5-5', messages: [], maxOutputTokens: bad }) // invalid: ignored
+    expect(captured.map(c => c.body['max_tokens'])).toEqual([8_000, 128_000, 8_000, 4_000, 128_000, 128_000, 128_000, 128_000])
+    expect(captured.every(c => !('maxOutputTokens' in c.body))).toBe(true)
+  })
+
   it('carries bounded Retry-After and safe HTTP metadata to the harness coordinator', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('SECRET', { status: 503, headers: { 'retry-after': '99' } })))
     const owner = new LogicalRequest()

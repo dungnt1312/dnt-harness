@@ -399,7 +399,8 @@ describe('web compaction', () => {
     expect(await fs.readFile(path.join(dir, names[0]!))).toEqual(previousBytes)
     const after = await fs.readFile(logPath)
     expect(after.subarray(0, original.length)).toEqual(original)
-    const appended = after.subarray(original.length).toString('utf8').trim().split('\n').map((line) => JSON.parse(line))
+    // `compaction/job` is progress telemetry around the operation; the canonical lifecycle is start then end.
+    const appended = after.subarray(original.length).toString('utf8').trim().split('\n').map((line) => JSON.parse(line)).filter((event) => event.type !== 'compaction/job')
     expect(appended.map((event) => event.type)).toEqual(['compaction/start', 'compaction/end'])
     expect(appended[1]).toMatchObject({ error: 'provider transport failure', summaryChars: 0 })
     expect(appended[1].summary).toBeUndefined()
@@ -656,7 +657,7 @@ describe('web compaction', () => {
     // One cache-aware attempt plus one bounded fallback; neither path retries a
     // context-exceeded request with identical input.
     expect(summaryCalls).toBe(2)
-    const log = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { type: string; error?: string })
+    const log = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { type: string; error?: string }).filter((event) => event.type !== 'compaction/job')
     expect(log.at(-1)).toMatchObject({ type: 'compaction/end' })
     expect(log.at(-1)?.error).toBeDefined()
   })
@@ -677,7 +678,8 @@ describe('web compaction', () => {
     expect(response.status).toBe(409)
     expect((await response.json() as { error: string }).error).toMatch(/extractive capacity/)
     const after = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { type: string })
-    expect(after.slice(before).filter((event) => event.type.startsWith('compaction/'))).toHaveLength(0)
+    // No canonical lifecycle. The progress events (`compaction/job`) do appear, and say it ended as failed.
+    expect(after.slice(before).filter((event) => event.type.startsWith('compaction/') && event.type !== 'compaction/job')).toHaveLength(0)
   })
 
   it('an incremental compaction loads only attachments beyond the seed', async () => {

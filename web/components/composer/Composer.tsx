@@ -94,7 +94,7 @@ const pastedTextFile = (text: string, date = new Date()): File => {
  * be put back inline; ArrowUp on an empty draft recalls the last message.
  */
 export function Composer({
-  workspaceId = null, modelControl, contextControl, connected, sending = false, running,
+  workspaceId = null, modelControl, contextControl, connected, sending = false, running, compacting = false,
   draft, onDraft, onSend, onStop, onCommand,
   modelValue, thinkingValue = null, modelSettings, onThinking, thinkingMenuLabel, thinkingDisabled = false,
   controlsUnavailable = false, controlsUnavailableMessage, onRetryControls,
@@ -109,6 +109,11 @@ export function Composer({
   readonly sending?: boolean
   readonly connected: boolean
   readonly running: boolean
+  /**
+   * A compaction is in progress. It is not a turn (`running` stays false, so there is nothing to
+   * steer), but the user must be able to stop it, and a message sent meanwhile waits for it.
+   */
+  readonly compacting?: boolean
   readonly draft: RichDraft
   readonly onDraft: (draft: RichDraft) => void
   /** `steer` stops the running turn and runs the queue now (Ctrl/Cmd+Enter while running). */
@@ -470,7 +475,9 @@ export function Composer({
     ? 'Draft now — configure a provider in Settings to send…'
     : running
       ? 'Queue a follow-up…'
-      : !connected
+      : compacting
+        ? 'Your message will be sent after the compaction…'
+        : !connected
         ? 'Reconnecting — your draft is kept…'
         : 'Ask anything'
   const modelId = modelValue !== null ? decodeModelChoice(modelValue)?.model ?? null : null
@@ -588,6 +595,18 @@ export function Composer({
               data-compact-control
               aria-label="Stop work"
               title="Stop"
+              onClick={onStop}
+              className="flex size-9 shrink-0 items-center justify-center rounded-full border border-line-strong text-fg hover:bg-hover"
+            >
+              <Icon name="square" size={16} />
+            </button>
+          ) : null}
+          {compacting && !running ? (
+            <button
+              type="button"
+              data-compact-control
+              aria-label="Stop compaction"
+              title="Stop compaction"
               onClick={onStop}
               className="flex size-9 shrink-0 items-center justify-center rounded-full border border-line-strong text-fg hover:bg-hover"
             >

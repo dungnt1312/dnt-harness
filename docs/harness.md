@@ -622,7 +622,11 @@ ratio from the settled turn's fresh context manifest that triggers automatic
 compaction at a completed boundary; 0 disables), `compactionRetainTokens`
 (estimated-token cap on covered messages kept verbatim beside the summary —
 typed user messages plus the latest covered final answer — default 20 000;
-0 keeps none, never affects uncovered history), plus composer-attachment limits
+0 keeps none, never affects uncovered history), the effective-compaction rollout
+(`compactionEffectiveEnabled`, `compactionPrecomputeEnabled`, both off by default;
+`compactionPrecomputePressure` 0.65, `compactionDeadlineMs` 180 000,
+`compactionOutputTokens` 8 000, `compactionCandidateWaitMs` 15 000 — see *Effective
+compaction*), plus composer-attachment limits
 `maxAttachmentBytes`, `maxAttachmentsPerMessage`, and `attachmentTextLimit`
 (model-visible cap for inlined text attachments; images travel as `ContentPart`
 image parts with a flat `IMAGE_TOKEN_ESTIMATE` so multi-image turns do not
@@ -740,6 +744,99 @@ lifecycle live (Compacting… → Compacted, summary expandable) from the SSE
 stream without any new endpoint. Each request carries a truthful **manifest**
 (mode/model revisions, source hashes, ranges, budget, omission decisions) that
 the UI's inspector renders as-is.
+
+### Effective compaction (`compactionEffectiveEnabled`, default off)
+
+The fold above sends the whole log as text, in 200 000-character chunks, one
+request after another. On sessions whose log is mostly tool output that was
+measured at 7–9 sequential requests and 436–768 s per compaction with no cache
+hit. Effective compaction replaces it, behind a rollout switch, with **one**
+ordinary request over what the model last saw. With the switch off nothing below
+runs and the behavior above is unchanged.
+
+- **Source.** The exact request of the last completed turn is captured from the
+  `llm/stream` seam while the turn runs and promoted at `agent/turn-settled`,
+  once `turn/end` is durable, only if it was lossless: the typed projection
+  (`context/compaction-projection.ts`) must account for every message the turn
+  needed, and tool results cleared from the request must be of a kind that is safe
+  to lose (`Read`/`Glob`/`Grep`/`Bash`/`BashOutput`, successful and already read;
+  `Write`/`Edit`/MCP/`Agent`/`Skill`/`AskUserQuestion`/`TodoWrite` and every error
+  result are `unknown`). It is stored as a sidecar under
+  `<home>/workspaces/<sessionId>/snapshots/` and named by a durable
+  `context/snapshot {snapshotId, hash, cutoff}` event. The sidecar is a cache: the
+  hash and the source digest are re-verified against the log on every load, and
+  after a restart the newest reference in the log is reloaded.
+- **One request.** `compaction-generator.ts` appends the final answer and a handoff
+  instruction (`[compaction-handoff]`) to that exact request, with a hard output cap
+  (`compactionOutputTokens`, 8 000) and one deadline (`compactionDeadlineMs`, 180 s)
+  covering the whole operation including a single re-ask when the answer is too
+  long. A request that cannot fit its own answer is refused before any hook or model
+  call (`compaction-input-too-large`).
+- **Adoption.** `adoptPreparedCompaction` commits the summary under the same
+  per-session transaction as the fold, but its cutoff may be *older* than the newest
+  closed turn: turns that closed after the cutoff stay verbatim. The proof
+  (transaction id, cutoff, source digest, seed hash) is written into both lifecycle
+  events, so `recoverCanonicalCheckpoint` verifies an adoption from the log alone and
+  still rejects a `turn/start` inside the transaction. A candidate built on a
+  different checkpoint than the one that stands is refused.
+- **No silent slow path.** When there is no usable snapshot (an older host never
+  captured one, the sidecar is gone), `POST …/compact` answers `409` with
+  `{recovery: {cutoff, sourceDigest, estimatedCalls}}` and runs nothing. Echoing that
+  fingerprint back in the body runs the raw fold (`path: "recovery"`); a source that
+  changed since is refused. An automatic compaction never runs a recovery. The UI
+  shows a confirmation with the call count; Cancel does not confirm.
+- **Progress and Stop.** Every compaction — the old fold included — writes durable
+  `compaction/job` events (`preparing → generating → applying → ended`), so every client
+  and a reload see where it is; `ended` carries `outcome` (`compacted`, `noop`,
+  `needs-recovery`, `cancelled`, `failed`), the `path`, and a failure's reason.
+  `generating` is reported just before the model is asked and `applying` just before the
+  adoption, so a hook block, a no-op or a refused request reports neither. They bracket
+  the canonical `compaction/start`/`end` pair and are not the authority for a
+  checkpoint. The transcript shows one row per operation with the stage and a live
+  elapsed time. `POST …/stop` (and delete, and shutdown) aborts the running compaction,
+  including the in-flight model request, writes no checkpoint, and the compact request
+  answers `409 {cancelled: true}`; the UI says "cancelled", not "failed". While a
+  compaction runs the composer shows **Stop compaction** (it is not a turn, so there is
+  nothing to steer) and a message sent meanwhile waits until it ends.
+- **Restoration.** `compaction/restoration` is written inside the transaction, before
+  the success end, so the log alone reproduces what the model saw. It restores the
+  latest task list, agents and background processes still running at the cutoff, the
+  newest copy of each loaded skill (5 000 tokens each, 25 000 total) and the current
+  content of up to 5 recently used files (5 000 tokens each, 20 000 total), all within
+  25 000 tokens, required state first. A file over its cap is reduced to a path
+  reference; a file outside the *current* grants, denied, a link out, missing or
+  binary is reported with that status and never returned from memory. Reading it does
+  not authorize an Edit: the agent must `Read` first. If the required state alone
+  does not fit, the compaction is refused rather than shortened. The builder shows the
+  restoration only when it belongs to the successful end whose summary is in use, so a
+  failed attempt's copy never reaches the model. The browser receives each section's
+  status but not the restored text.
+- **Precompute** (`compactionPrecomputeEnabled`, default off). After a turn settles,
+  when the request has reached `compactionPrecomputePressure` (0.65) of the usable
+  budget and there is source beyond the standing checkpoint, one background summary is
+  written per session (`compaction-precompute.ts`) from the immutable snapshot, as a
+  low-priority request that never takes the last provider slot and runs under its own
+  ownership id so it cannot fence the next chat turn. It is not a turn, sets no
+  Working state and writes nothing to the log. A later compaction adopts it when the
+  covered source digest, the standing checkpoint and the model/mode/grants/provider/
+  policy identity still match and it still saves at least 256 estimated tokens and
+  fits; turns appended after the cutoff do not invalidate it. A pending candidate is
+  waited for up to `compactionCandidateWaitMs` (15 s), then aborted, and the
+  foreground request starts only after its stream has really ended; a transport that
+  did not settle blocks further speculation for the session instead of overlapping.
+  `PreCompact` runs once, when adoption begins; speculation never runs a hook.
+  Session delete and server close cancel it and wait for the stream.
+- **Measurement.** `compaction/end.tokensAfter` is the provider-reported size minus
+  the estimated saving of the new checkpoint, including the restoration that rides
+  beside it.
+- **Verifying.** Everything above is tested with a scripted provider. No live
+  benchmark has been run: the target (≥ 70 % median reduction of summary generation
+  time, ready-candidate blocking p95 ≤ 5 s excluding hooks and storage) is
+  unmeasured. To measure it, run the same fixed session cold (no snapshot), warm
+  (snapshot, no candidate), after a restart, and with a ready candidate, with the same
+  model and settings on an approved provider, and compare `compaction/end.durationMs`
+  and the usage records of kind `compaction`. Until that has been done, the live gate
+  is pending, not passing.
 
 ## Delegation (`agents/`, tool in `src/web/agent-delegation.ts`)
 
