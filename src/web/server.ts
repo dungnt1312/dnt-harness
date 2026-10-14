@@ -149,6 +149,7 @@ import { agentTool, ChildModelError, describeRoleModel, formatChildReports, proj
 import { importCodexDefinition } from '../harness/agents/compatibility/claude.ts'
 import { SkillsService, SkillError } from '../harness/skills/service.ts'
 import { protectedRootsForRules, resolveSkillLayers, type SkillLayer } from '../harness/skills/layers.ts'
+import { ResourceSourcesError, describeSourceLayers, validateSourcesInput } from '../harness/sources/resource-sources.ts'
 import { MemoryService, MemoryError } from '../harness/memory/service.ts'
 import { memoryGuidance, memoryGuidanceAccess, memoryIndexes } from '../harness/memory/context.ts'
 import { todoWriteTool } from '../harness/tools/todo.ts'
@@ -714,6 +715,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     ...(options.userClaudeDir !== undefined ? { userClaudeDir: options.userClaudeDir } : {}),
     projectRootOf,
     ...(options.home !== undefined ? { pluginLayers: (workspaceId: string, projectId: string | undefined) => plugins.agentLayers(pluginContext(workspaceId, projectId)) } : {}),
+    disabledLayers: (workspaceId: string) => skills.sourcesStore.disabled(workspaceId, 'agents'),
   })
   const childExecutor = new ChildExecutor(kernel.ctx, (root) => {
     const entry = sessions.get(root)
@@ -732,6 +734,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     ...(options.userClaudeDir !== undefined ? { userClaudeDir: options.userClaudeDir } : {}),
     projectRootOf,
     ...(options.home !== undefined ? { pluginLayers: (workspaceId: string, projectId: string | undefined) => plugins.commandLayers(pluginContext(workspaceId, projectId)) } : {}),
+    disabledLayers: (workspaceId: string) => skills.sourcesStore.disabled(workspaceId, 'commands'),
   })
   // What the running turn's slash command granted (allowed-tools, model).
   const turnCommandGrants = new TurnCommandGrants()
@@ -755,6 +758,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     home: resourceHome,
     userClaudeDir: options.userClaudeDir,
     background: backgroundHooks,
+    disabledLayers: (workspaceId) => skills.sourcesStore.disabled(workspaceId, 'hooks'),
     ...(options.home !== undefined ? { pluginHooks: (workspaceId: string, projectId: string | undefined) => plugins.hookSources(pluginContext(workspaceId, projectId)) } : {}),
     projectRootOf: (workspaceId, projectId) => {
       if (projectId === undefined) return undefined
@@ -3081,7 +3085,10 @@ ${entry.description}`.toLowerCase().includes(query))
     // `prefixSnapshots`): re-read only when the prefix moves anyway.
     const snapshot = ((): PrefixSnapshot | undefined => {
       if (scope === undefined) return undefined
-      const key = `${scope.projectId ?? ''}\u0000${compaction?.coversSeq ?? 0}`
+      // The Sources revision rides in the key: switching a layer on or off
+      // re-reads the catalog at the next request, never mid-request.
+      const sourcesRevision = scope.workspaceId !== undefined ? skills.sourcesStore.revision(scope.workspaceId) : 0
+      const key = `${scope.projectId ?? ''}\u0000${compaction?.coversSeq ?? 0}\u0000${sourcesRevision}`
       const current = prefixSnapshots.get(scope.sessionId)
       if (current !== undefined && current.key === key) return current
       const fresh: PrefixSnapshot = { key }
@@ -3895,6 +3902,8 @@ ${entry.description}`.toLowerCase().includes(query))
     pluginsEnabled: options.home !== undefined,
     ...(options.userSkillsDir !== undefined ? { userSkillsDir: options.userSkillsDir } : {}),
     ...(options.bundledSkillsDir !== undefined ? { bundledSkillsDir: options.bundledSkillsDir } : {}),
+    ...(options.userClaudeDir !== undefined ? { userClaudeDir: options.userClaudeDir } : {}),
+    ...(options.bundledCommandsDir !== undefined ? { bundledCommandsDir: options.bundledCommandsDir } : {}),
     refreshSkillProtectedRoots,
     addSkillProtectedRoots,
     memory,
@@ -4183,6 +4192,9 @@ interface HandlerDeps {
   readonly userSkillsDir?: string
   /** Read-only bundled skill layer, for protected-root refresh. */
   readonly bundledSkillsDir?: string
+  /** Claude user folder and bundled commands, only to describe layers in Settings → Sources. */
+  readonly userClaudeDir?: string
+  readonly bundledCommandsDir?: string
   /** Recompute grant-protected roots from every workspace's skill rules. */
   readonly refreshSkillProtectedRoots: () => Promise<void>
   /** Fail-closed fallback when a recompute fails: add roots, never drop any. */
@@ -4338,8 +4350,11 @@ async function skillLayers(
   // name reaches one only when no plain layer has it. Bundled rides last:
   // every rule layer shadows it, and it stays scannable even under a custom
   // rule list (which never names it).
-  const plugins = await skills.pluginLayers(workspaceId, projectId).catch(() => [] as SkillLayer[])
-  const bundled = skills.bundledLayer()
+  // Plugin and bundled are fixed layers: the workspace's Sources policy can
+  // switch either off, and every surface resolves through this function.
+  const off = await skills.disabledLayers(workspaceId)
+  const plugins = off.has('plugin') ? [] : await skills.pluginLayers(workspaceId, projectId).catch(() => [] as SkillLayer[])
+  const bundled = off.has('bundled') ? undefined : skills.bundledLayer()
   // SkillService resolves first-hit wins. Keep all project/workspace rule
   // layers above plugins and every absolute/user layer below them:
   // project > workspace > plugin > user > bundled.
@@ -4374,7 +4389,7 @@ async function workspaceSaveWarnings(deps: Pick<HandlerDeps, 'skills' | 'workspa
   const warnings: string[] = []
   const rules = await deps.skills.sources(wsId)
   if (!rules.some((rule) => rule.kind === 'workspace' && rule.enabled)) {
-    warnings.push('The workspace skill folder is disabled in Source folders, so sessions will not see this skill.')
+    warnings.push('The workspace skill folder is disabled in Settings → Sources, so sessions will not see this skill.')
     return warnings
   }
   const owner = await deps.skills.ownerLayer(await skillLayers(deps.skills, deps.workspaces, wsId, undefined), name)
@@ -6272,6 +6287,55 @@ async function handleApi(
       }
       return
     }
+    // Workspace Sources: which folder layers skills, agents, hooks and
+    // commands may be discovered from. One document, one hash: PUT replaces it
+    // whole and refuses a stale `expectedHash`.
+    const wsSources = /^\/api\/workspaces\/([^/]+)\/sources$/.exec(pathname)
+    if (wsSources !== null && (req.method === 'GET' || req.method === 'PUT')) {
+      const wsId = decodeURIComponent(wsSources[1] ?? '') as WorkspaceId
+      requireWorkspace(deps, wsId, req.method === 'PUT')
+      const store = deps.skills.sourcesStore
+      const view = (state: Awaited<ReturnType<typeof store.read>>) => ({
+        doc: state.doc,
+        hash: state.hash,
+        ...(state.error !== undefined ? { error: state.error } : {}),
+        layers: describeSourceLayers({
+          workspaceDir: path.dirname(store.file(wsId)),
+          ...(deps.userClaudeDir !== undefined ? { userClaudeDir: deps.userClaudeDir } : {}),
+          ...(deps.bundledSkillsDir !== undefined ? { bundledSkillsDir: deps.bundledSkillsDir } : {}),
+          ...(deps.bundledCommandsDir !== undefined ? { bundledCommandsDir: deps.bundledCommandsDir } : {}),
+        }),
+      })
+      if (req.method === 'GET') {
+        send(200, view(await store.read(wsId)))
+        return
+      }
+      if (!browserPrincipal(req, deps, 'PUT')) {
+        send(401, { error: 'sources can only be changed from the browser session that owns the workspace' })
+        return
+      }
+      const body = await readJson(req)
+      try {
+        const saved = await store.write(wsId, validateSourcesInput(body['doc']), typeof body['expectedHash'] === 'string' ? body['expectedHash'] : undefined)
+        // Switches take effect at the next request/operation: hook snapshots
+        // are re-read, and the catalog snapshot key carries the revision.
+        deps.hookHost.invalidateWorkspace(wsId)
+        try {
+          await deps.refreshSkillProtectedRoots()
+        } catch {
+          deps.addSkillProtectedRoots(protectedRootsForRules(saved.doc.skills.rules))
+        }
+        send(200, view(saved))
+      } catch (error) {
+        if (error instanceof ResourceSourcesError) {
+          send(error.code === 'conflict' ? 409 : 400, { error: error.message })
+          return
+        }
+        fail(error)
+      }
+      return
+    }
+
     // Skill source rules (before /skills/:name, which has no room for the
     // extra segment). PUT also refreshes the grant-protected roots so the
     // absolute rule folders are never grantable to file tools.

@@ -3,7 +3,8 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
 import { frontmatterBoolean, hintText, parseCommand, splitFrontmatter, type CommandDefinition } from '../commands/catalog.ts'
-import { SKILL_NAME_PATTERN, SkillError, skillFolderIn, assertSkillName, assertWritableSkillName, defaultSkillRules, validateSkillRules, validateSkillRulesForWrite, type SkillLayer, type SkillRule, type SkillSource } from './layers.ts'
+import { SKILL_NAME_PATTERN, SkillError, skillFolderIn, assertSkillName, assertWritableSkillName, validateSkillRulesForWrite, type SkillLayer, type SkillRule, type SkillSource } from './layers.ts'
+import { ResourceSourcesError, ResourceSourcesStore } from '../sources/resource-sources.ts'
 
 export { SkillError } from './layers.ts'
 export type { SkillSource } from './layers.ts'
@@ -48,11 +49,14 @@ export class SkillsService {
   private readonly bundledDir: string | undefined
   private readonly userDir: string | undefined
   private readonly mutationTails = new Map<string, Promise<unknown>>()
+  /** Shared per-workspace source policy (skill rules + which fixed layers are off). */
+  readonly sourcesStore: ResourceSourcesStore
 
-  constructor(home: string, bundledDir?: string, userDir?: string) {
+  constructor(home: string, bundledDir?: string, userDir?: string, sourcesStore?: ResourceSourcesStore) {
     this.home = home
     this.bundledDir = bundledDir
     this.userDir = userDir
+    this.sourcesStore = sourcesStore ?? new ResourceSourcesStore(home, userDir)
   }
 
   private dir(workspaceId: string): string {
@@ -88,39 +92,32 @@ export class SkillsService {
     return layers
   }
 
-  // ── Source rules (sources.json beside .hidden.json) ─────────────────────
+  // ── Source rules ─────────────────────────────────────────────────────────
   // The ordered rule list decides which folders the catalog scans and in what
-  // precedence; see layers.ts for the pure model. Missing or corrupt file
-  // degrades to the defaults, like the hidden sidecar degrades to empty.
+  // precedence; see layers.ts for the pure model. It lives in the workspace's
+  // shared `resource-sources.json` (see sources/resource-sources.ts), which
+  // imports the legacy `skills/sources.json` until the first save.
 
-  private sourcesPath(workspaceId: string): string {
-    return path.join(this.dir(workspaceId), 'sources.json')
-  }
-
-  /** The effective rule list; a missing or corrupt file degrades to the defaults. */
+  /** The effective rule list (defaults, the legacy file, or the shared document). */
   async sources(workspaceId: string): Promise<SkillRule[]> {
-    let raw: string
-    try {
-      raw = await fs.readFile(this.sourcesPath(workspaceId), 'utf8')
-    } catch {
-      return defaultSkillRules(this.userDir)
-    }
-    try {
-      return validateSkillRules(JSON.parse(raw) as unknown)
-    } catch {
-      return defaultSkillRules(this.userDir)
-    }
+    return [...(await this.sourcesStore.read(workspaceId)).doc.skills.rules]
   }
 
-  /** Replace the rule list; validated, atomic; returns what was stored. */
+  /** Replace the rule list; validated, atomic; returns what was stored. Other kinds' switches are kept. */
   async setSources(workspaceId: string, raw: unknown): Promise<SkillRule[]> {
     const rules = validateSkillRulesForWrite(raw)
-    await this.withMutationLock(workspaceId, 'sources', async () => {
-      const file = this.sourcesPath(workspaceId)
-      await fs.mkdir(path.dirname(file), { recursive: true })
-      await replaceFileAtomic(file, `${JSON.stringify({ rules }, null, 2)}\n`)
-    })
+    try {
+      await this.sourcesStore.update(workspaceId, (doc) => ({ ...doc, skills: { rules } }))
+    } catch (error) {
+      if (error instanceof ResourceSourcesError) throw new SkillError('invalid', error.message)
+      throw error
+    }
     return rules
+  }
+
+  /** Fixed skill layers (`plugin`, `bundled`) this workspace switched off. */
+  async disabledLayers(workspaceId: string): Promise<ReadonlySet<string>> {
+    return this.sourcesStore.disabled(workspaceId, 'skills')
   }
 
   /** Catalog: one row per name, the highest-precedence layer wins. */

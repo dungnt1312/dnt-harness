@@ -18,6 +18,8 @@ export interface CommandsServiceOptions {
   readonly pluginLayers?: (workspaceId: string, projectId: string | undefined) => Promise<readonly CommandLayer[]>
   /** Home folder bounding the project ancestor walk (tests override). */
   readonly homeDir?: string
+  /** Layers the workspace's Sources policy switched off (`bundled`, `user`, `plugin`, `workspace`, `project`). */
+  readonly disabledLayers?: (workspaceId: string) => Promise<ReadonlySet<string>>
 }
 
 export class CommandsService {
@@ -29,14 +31,15 @@ export class CommandsService {
   }
 
   async layers(workspaceId: string, projectId?: string): Promise<CommandLayer[]> {
+    const off = await this.options.disabledLayers?.(workspaceId).catch(() => undefined) ?? new Set<string>()
     const projectRoot = projectId !== undefined ? this.options.projectRootOf?.(workspaceId, projectId) : undefined
-    const plugins = await this.options.pluginLayers?.(workspaceId, projectId).catch(() => []) ?? []
+    const plugins = off.has('plugin') ? [] : await this.options.pluginLayers?.(workspaceId, projectId).catch(() => []) ?? []
     return [
-      ...(this.options.bundledDir !== undefined ? [{ source: 'bundled' as const, dir: this.options.bundledDir }] : []),
-      ...(this.options.userClaudeDir !== undefined ? [{ source: 'user' as const, dir: path.join(this.options.userClaudeDir, 'commands') }] : []),
+      ...(this.options.bundledDir !== undefined && !off.has('bundled') ? [{ source: 'bundled' as const, dir: this.options.bundledDir }] : []),
+      ...(this.options.userClaudeDir !== undefined && !off.has('user') ? [{ source: 'user' as const, dir: path.join(this.options.userClaudeDir, 'commands') }] : []),
       ...plugins,
-      { source: 'workspace' as const, dir: this.workspaceCommandsDir(workspaceId) },
-      ...(projectRoot !== undefined
+      ...(off.has('workspace') ? [] : [{ source: 'workspace' as const, dir: this.workspaceCommandsDir(workspaceId) }]),
+      ...(projectRoot !== undefined && !off.has('project')
         ? projectCommandDirs(projectRoot, this.options.homeDir).map((dir) => ({ source: 'project' as const, dir }))
         : []),
     ]

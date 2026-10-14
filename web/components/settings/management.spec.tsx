@@ -163,7 +163,9 @@ describe('skills + memory tabs', () => {
   it('skills list offers a create form with layer guidance', () => {
     const html = renderToStaticMarkup(<SkillsPanel workspaceId="ws-1" />)
     expect(html).toContain('New skill')
-    expect(html).toContain('Source folders')
+    // Folder rules moved to Settings → Sources; Skills only points there.
+    expect(html).not.toContain('Source folders')
+    expect(html).toContain('Sources')
     expect(html).toContain('first match wins')
   })
 })

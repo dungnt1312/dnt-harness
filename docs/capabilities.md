@@ -149,8 +149,8 @@ custom patterns; per-command exception handling is deferred.
 classifier and no auto-load:
 
 - **Layered catalog**: each workspace keeps an ordered list of source rules
-  (`<data-dir>/workspaces/<id>/skills/sources.json`; Settings → Skills →
-  Source folders). Rule kinds: `project` (a folder relative to the session's
+  (`<data-dir>/workspaces/<id>/resource-sources.json`; Settings → Sources;
+  see [sources.md](sources.md)). Rule kinds: `project` (a folder relative to the session's
   bound project, contained inside it), `workspace`
   (`<data-dir>/workspaces/<id>/skills`), and `absolute` (an absolute folder;
   `~` expands; saving an ENABLED rule that is a drive root, the home

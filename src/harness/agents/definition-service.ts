@@ -328,6 +328,8 @@ export class AgentDefinitionService {
       readonly projectRootOf?: (workspaceId: string, projectId: string) => string | undefined
       /** Agent folders of the plugins enabled for this workspace/project. */
       readonly pluginLayers?: (workspaceId: string, projectId: string | undefined) => Promise<readonly PluginAgentLayer[]>
+      /** Layers the workspace's Sources policy switched off (`bundled`, `user`, `plugin`, `workspace`, `project`). */
+      readonly disabledLayers?: (workspaceId: string) => Promise<ReadonlySet<string>>
     } = {},
   ) {}
 
@@ -402,10 +404,13 @@ export class AgentDefinitionService {
 
   /** Every effective definition (highest layer wins per name) plus invalid files. */
   async catalog(workspaceId: string, projectId?: string): Promise<{ rows: ResolvedAgentDefinition[]; errors: { path: string; message: string }[] }> {
+    const off = await this.options.disabledLayers?.(workspaceId).catch(() => undefined) ?? new Set<string>()
     const byKey = new Map<string, ResolvedAgentDefinition>()
-    for (const name of BUNDLED_AGENT_ROLES) byKey.set(name, { definition: bundledDefinition(name), source: 'bundled' })
+    if (!off.has('bundled')) {
+      for (const name of BUNDLED_AGENT_ROLES) byKey.set(name, { definition: bundledDefinition(name), source: 'bundled' })
+    }
     const errors: { path: string; message: string }[] = []
-    const plugins = await this.readPluginLayers(workspaceId, projectId)
+    const plugins = off.has('plugin') ? { rows: [] as ResolvedAgentDefinition[], errors: [] as { path: string; message: string }[] } : await this.readPluginLayers(workspaceId, projectId)
     errors.push(...plugins.errors)
     for (const layer of this.layers(workspaceId, projectId)) {
       // Plugin agents sit between the user layer and the workspace layer.
@@ -416,6 +421,7 @@ export class AgentDefinitionService {
           byKey.set(key, lower === undefined ? row : { ...row, overrides: [...(lower.overrides ?? []), lower.source] })
         }
       }
+      if (off.has(layer.source)) continue
       const read = await this.readLayer(layer.source, layer.dir)
       errors.push(...read.errors)
       for (const row of read.rows) {

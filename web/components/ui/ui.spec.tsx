@@ -63,23 +63,23 @@ describe('runtime provider UI helpers', () => {
     expect(activeModelValue(meta)).toBe('cliproxy1:gpt-5.6-sol')
   })
 
-  it('settings dialog exposes all eleven sections as linked tabs and lists providers', () => {
+  it('settings dialog exposes all thirteen sections as linked tabs and lists providers', () => {
     const html = renderToStaticMarkup(
       <SettingsModal open workspaceId="ws-1" providers={meta.providers} activeProvider="cliproxy1" activeModel="gpt-5.6-sol" onDismiss={() => undefined} onRefresh={async () => undefined} />,
     )
     expect(html).toContain('aria-modal="true"')
     expect(html).toContain('aria-label="Settings"')
-    // Twelve sections (including Plugins), plus the three Providers & Models sub-tabs on the open pane.
+    // Thirteen sections (including Plugins and Sources), plus the three Providers & Models sub-tabs on the open pane.
     const sections = html.match(/<div[^>]*aria-label="Settings sections"[\s\S]*?<\/div><\/aside>/)?.[0] ?? ''
-    expect((sections.match(/role="tab"/g) ?? []).length).toBe(12)
+    expect((sections.match(/role="tab"/g) ?? []).length).toBe(13)
     // Radix mounts the active panel only; each tab still owns a controls link.
     expect((html.match(/role="tabpanel"/g) ?? []).length).toBe(1)
-    expect((sections.match(/aria-controls=/g) ?? []).length).toBe(12)
+    expect((sections.match(/aria-controls=/g) ?? []).length).toBe(13)
     const tabTags = sections.match(/<[a-z]+[^>]*role="tab"[^>]*>/g) ?? []
     expect(tabTags.filter((tag) => tag.includes('aria-selected="true"')).length).toBe(1)
     const labels = [...sections.matchAll(/<button(?=[^>]*role="tab")[\s\S]*?<\/button>/g)]
       .map((match) => match[0].replace(/<[^>]+>/g, ''))
-    expect(labels).toEqual(['Providers &amp; Models', 'Usage', 'Projects', 'Permissions', 'System Prompts', 'Skills', 'Plugins', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets'])
+    expect(labels).toEqual(['Providers &amp; Models', 'Usage', 'Projects', 'Permissions', 'System Prompts', 'Sources', 'Skills', 'Plugins', 'Memory', 'Agents', 'MCP', 'Hooks', 'Secrets'])
     const subTabs = html.match(/<div role="tablist" aria-label="Providers &amp; Models"[\s\S]*?<\/div>/)?.[0] ?? ''
     expect([...subTabs.matchAll(/<button[\s\S]*?<\/button>/g)].map((match) => match[0].replace(/<[^>]+>/g, ''))).toEqual(['Providers', 'Model aliases', 'Images', 'Videos'])
     expect(html).toContain('cliproxy1')

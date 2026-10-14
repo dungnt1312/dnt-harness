@@ -21,6 +21,7 @@ This documentation is organized so each layer can be read independently:
 | [capabilities.md](capabilities.md) | The built-in tools: filesystem and bash |
 | [web.md](web.md) | The web host: REST + SSE API and the React client |
 | [skills.md](skills.md) | Skills: layers, SKILL.md format, the Skill tool, the skills API |
+| [sources.md](sources.md) | Workspace Sources: which folder layers skills, agents, hooks and commands load from |
 | [plugins.md](plugins.md) | Claude Code slash commands, plugins, marketplaces and enable scopes |
 | [guides.md](guides.md) | Getting started, configuration, CLI, plugin authoring, testing |
 | [decisions/plugin-platform.md](decisions/plugin-platform.md) | Plugin platform spec: composition loading, route seam, SDK surface policy (proposed) |

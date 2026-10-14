@@ -690,6 +690,34 @@ export interface SkillRuleRow {
   readonly enabled: boolean
 }
 
+/** The resource kinds whose folder layers Settings → Sources controls. */
+export type ResourceKindRow = 'skills' | 'agents' | 'hooks' | 'commands'
+
+/** The workspace's `resource-sources.json`: skill rules plus the fixed layers switched off per kind. */
+export interface ResourceSourcesDoc {
+  readonly v: 1
+  readonly skills: { readonly rules: readonly SkillRuleRow[] }
+  readonly disabled: Readonly<Record<ResourceKindRow, readonly string[]>>
+}
+
+/** One switchable layer and where it reads from (host-described). */
+export interface SourceLayerRow {
+  readonly id: string
+  readonly label: string
+  readonly path: string
+  /** False when this host has no such layer (e.g. no `~/.claude` configured). */
+  readonly available: boolean
+}
+
+/** `GET/PUT /api/workspaces/:wid/sources`. */
+export interface WorkspaceSourcesRow {
+  readonly doc: ResourceSourcesDoc
+  readonly hash: string
+  /** The stored file is unusable; `doc` is then the fail-closed policy the server applies. */
+  readonly error?: string
+  readonly layers: Readonly<Record<ResourceKindRow, readonly SourceLayerRow[]>>
+}
+
 /** One file inside a skill folder (SKILL.md plus resource files). */
 export interface SkillFileRow {
   /** `/`-separated path relative to the skill folder. */
