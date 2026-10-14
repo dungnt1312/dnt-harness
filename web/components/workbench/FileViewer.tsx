@@ -323,26 +323,25 @@ export function FileViewer({ workspaceId, projectId, projectPath, path, focus = 
   }
 
   const text = file !== null && !file.binary
-  // The tab already names the file; the bar shows where it lives. The full path is its tooltip.
-  // A file at the root shows the project's folder name, never a bare "/".
-  const rootName = projectPath.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? ''
-  const location = skill !== null ? `Skill · ${skill}` : memory !== null ? fullPath : path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : rootName
+  // The tab already names the file; the bar shows the folder it lives in, the full path on hover.
+  // A file at the project root needs no folder: the tree header already names the project.
+  const location = skill !== null ? `Skill · ${skill}` : memory !== null ? fullPath : path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ''
 
   return (
     <div className="flex min-h-0 flex-1 flex-col" onKeyDown={saveFromAnywhere}>
-      {/* One toolbar per file: where it is, its state, then the actions — the frequent ones out, the rest under ⋯. */}
-      <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line pl-3 pr-1.5 text-[13px]">
-        <span className="min-w-0 flex-1 truncate text-fg-muted" title={fullPath}>{location}</span>
-        {readOnlyReason !== null ? <Badge tone="gray" title={readOnlyReason}>Read-only</Badge> : null}
+      {/* One toolbar per file: how to look at it on the left, where it is, then its actions — frequent out, the rest under ⋯. */}
+      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-line pl-2 pr-1.5 text-[13px]">
         {text && previewKind !== null ? (
           <Segmented<ViewMode>
             label="View mode"
-            size="compact"
+            size="mini"
             value={mode}
             options={[{ value: 'code', label: 'Code' }, { value: 'split', label: 'Split' }, { value: 'preview', label: 'Preview' }]}
             onChange={chooseMode}
           />
         ) : null}
+        <span className={cn('min-w-0 flex-1 truncate text-xs text-fg-muted', previewKind === null && 'pl-1')} title={fullPath}>{location}</span>
+        {readOnlyReason !== null ? <Badge tone="gray" title={readOnlyReason}>Read-only</Badge> : null}
         {dirty ? (
           <>
             <Button
