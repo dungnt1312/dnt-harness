@@ -46,3 +46,33 @@ it('skips chunk-only derivations but invalidates same-count replacement historie
     host.remove()
   }
 })
+
+it('derives whether a compaction is in progress, from the job events alone', async () => {
+  const host = document.body.appendChild(document.createElement('div'))
+  const root = createRoot(host)
+  let compacting: boolean | undefined
+  let running = true
+  function Probe({ events }: { events: readonly SseEvent[] }) {
+    const values = useSessionDerivedValues(events, 0, false)
+    compacting = values.compacting
+    running = values.running
+    return null
+  }
+  const done: SseEvent = { seq: 1, type: 'turn/end', turnId: 'a' }
+  const job = (seq: number, stage: 'preparing' | 'generating' | 'applying' | 'ended'): SseEvent => ({ seq, type: 'compaction/job', stage, trigger: 'manual' })
+  try {
+    await act(async () => root.render(<Probe events={[done]} />))
+    expect(compacting).toBe(false)
+    await act(async () => root.render(<Probe events={[done, job(2, 'preparing')]} />))
+    expect(compacting).toBe(true)
+    // It is not a turn: the conversation is not "running", so queued input still shows as queued.
+    expect(running).toBe(false)
+    await act(async () => root.render(<Probe events={[done, job(2, 'preparing'), job(3, 'generating'), { seq: 4, type: 'assistant/chunk', delta: 'x' }]} />))
+    expect(compacting).toBe(true)
+    await act(async () => root.render(<Probe events={[done, job(2, 'preparing'), job(3, 'generating'), job(4, 'ended')]} />))
+    expect(compacting).toBe(false)
+  } finally {
+    await act(async () => root.unmount())
+    host.remove()
+  }
+})

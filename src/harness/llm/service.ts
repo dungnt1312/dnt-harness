@@ -60,7 +60,7 @@ export class LlmService extends Service {
     if (sessionId) this.sessionsInFlight.add(sessionId)
     const owner = options?.requestOwner ?? new LogicalRequest()
     try {
-      yield* runAttempt(provider, request, { owner, admission: this.admission(provider.name), provider: provider.name, ...(options?.attribution ? { attribution: options.attribution } : {}), ...(options?.recordAttempt ? { recordAttempt: options.recordAttempt } : {}), ...(options?.signal ? { signal: options.signal } : {}), ...(this.observer ? { observer: this.observer } : {}) })
+      yield* runAttempt(provider, request, { owner, admission: this.admission(provider.name), ...(options?.admissionPriority ? { priority: options.admissionPriority } : {}), provider: provider.name, ...(options?.attribution ? { attribution: options.attribution } : {}), ...(options?.recordAttempt ? { recordAttempt: options.recordAttempt } : {}), ...(options?.signal ? { signal: options.signal } : {}), ...(this.observer ? { observer: this.observer } : {}) })
     } finally {
       if (sessionId) this.sessionsInFlight.delete(sessionId)
       if (!options?.requestOwner) owner.dispose()

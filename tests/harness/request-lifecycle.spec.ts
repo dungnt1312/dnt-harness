@@ -94,6 +94,108 @@ describe('aggregate request lifecycle', () => {
     ticket.release(); ticket.release()
     expect(admission.active).toBe(0)
   })
+  describe('low-priority admission (background compaction candidates)', () => {
+    const signal = (): AbortSignal => new AbortController().signal
+
+    it('never takes the last free slot, so a foreground request is never blocked behind it', async () => {
+      const admission = new AttemptAdmission(2)
+      const low = await admission.acquire(signal(), { priority: 'low' })
+      expect(admission.active).toBe(1)
+      // The last slot stays free for the foreground.
+      const foreground = await admission.acquire(signal())
+      expect(admission.active).toBe(2)
+      low.release(); foreground.release()
+      expect(admission.active).toBe(0)
+    })
+
+    it('a low request that would take the last slot waits, and is admitted once a slot frees', async () => {
+      const admission = new AttemptAdmission(2)
+      const a = await admission.acquire(signal())
+      let admitted = false
+      const low = admission.acquire(signal(), { priority: 'low' }).then((ticket) => { admitted = true; return ticket })
+      await Promise.resolve(); await Promise.resolve()
+      expect(admitted).toBe(false)
+      expect(admission.active).toBe(1)
+      a.release()
+      const ticket = await low
+      expect(admitted).toBe(true)
+      ticket.release()
+    })
+
+    it('a queued foreground request is admitted before an earlier queued low one', async () => {
+      const admission = new AttemptAdmission(2)
+      const a = await admission.acquire(signal())
+      const b = await admission.acquire(signal())
+      const order: string[] = []
+      const low = admission.acquire(signal(), { priority: 'low' }).then((t) => { order.push('low'); return t })
+      const foreground = admission.acquire(signal()).then((t) => { order.push('foreground'); return t })
+      a.release()
+      const first = await foreground
+      expect(order).toEqual(['foreground'])
+      first.release(); b.release()
+      ;(await low).release()
+      expect(order).toEqual(['foreground', 'low'])
+      expect(admission.active).toBe(0)
+    })
+
+    it('with a single slot a low request never runs: the only slot is the foreground one', async () => {
+      const admission = new AttemptAdmission(1)
+      const controller = new AbortController()
+      const low = admission.acquire(controller.signal, { priority: 'low' })
+      let settled = false
+      void low.then(() => { settled = true }, () => { settled = true })
+      await Promise.resolve(); await Promise.resolve()
+      expect(settled).toBe(false)
+      expect(admission.active).toBe(0)
+      const foreground = await admission.acquire(signal())
+      expect(admission.active).toBe(1)
+      foreground.release()
+      controller.abort()
+      await expect(low).rejects.toThrow()
+    })
+
+    it('a cancelled queued low request leaves the queue without holding a slot', async () => {
+      const admission = new AttemptAdmission(2)
+      const a = await admission.acquire(signal())
+      const controller = new AbortController()
+      const low = admission.acquire(controller.signal, { priority: 'low' })
+      controller.abort()
+      await expect(low).rejects.toThrow()
+      a.release()
+      expect(admission.active).toBe(0)
+      const next = await admission.acquire(signal(), { priority: 'low' })
+      expect(admission.active).toBe(1)
+      next.release()
+    })
+
+    it('ordinary admission is unchanged: it can use every slot', async () => {
+      const admission = new AttemptAdmission(2)
+      const a = await admission.acquire(signal())
+      const b = await admission.acquire(signal())
+      expect(admission.active).toBe(2)
+      a.release(); b.release()
+    })
+
+    it('LlmService forwards the stream option to the provider admission; an ordinary stream stays ordinary', async () => {
+      const kernel = new Kernel()
+      kernel.ctx.plugin(LlmService)
+      const seen: unknown[] = []
+      kernel.ctx.llm.configureAdmission('p', { async acquire(_signal: AbortSignal, options?: unknown) { seen.push(options); return { release() {} } } })
+      kernel.ctx.llm.register({ name: 'p', models: ['m'], async *stream() { yield completion } })
+      await collect(kernel.ctx.llm.stream({ messages: [], providerName: 'p' }, { admissionPriority: 'low' }))
+      await collect(kernel.ctx.llm.stream({ messages: [], providerName: 'p' }))
+      expect(seen).toEqual([{ priority: 'low' }, undefined])
+    })
+
+    it('a delegate admission still owns the decision: low priority is forwarded, not interpreted', async () => {
+      const seen: unknown[] = []
+      const delegate = { async acquire(_signal: AbortSignal, options?: unknown) { seen.push(options); return { release() {} } } }
+      const admission = new AttemptAdmission(4, delegate)
+      ;(await admission.acquire(signal(), { priority: 'low' })).release()
+      expect(seen).toEqual([{ priority: 'low' }])
+    })
+  })
+
   it('observer exceptions do not change success or leak admission', async () => {
     const admission = new AttemptAdmission(1)
     const owner = new LogicalRequest()
@@ -236,6 +338,28 @@ describe('aggregate request lifecycle', () => {
   })
   it('rejects fractional request limits centrally using documented defaults', () => {
     expect(resolveLimits({ streamIdleMs: 1.5, logicalRequestMs: 2.5, stepRetries: 1.5, stepRetryBaseMs: 1.5 })).toMatchObject({ streamIdleMs: DEFAULT_LIMITS.streamIdleMs, logicalRequestMs: DEFAULT_LIMITS.logicalRequestMs, stepRetries: DEFAULT_LIMITS.stepRetries, stepRetryBaseMs: DEFAULT_LIMITS.stepRetryBaseMs })
+  })
+  it('ships effective compaction off by default with the approved precompute numbers', () => {
+    expect(DEFAULT_LIMITS).toMatchObject({
+      compactionEffectiveEnabled: false,
+      compactionPrecomputeEnabled: false,
+      compactionPrecomputePressure: 0.65,
+      compactionDeadlineMs: 180_000,
+      compactionOutputTokens: 8_000,
+      compactionCandidateWaitMs: 15_000,
+    })
+  })
+  it('validates the compaction rollout limits instead of trusting any value', () => {
+    expect(resolveLimits({ compactionEffectiveEnabled: true, compactionPrecomputeEnabled: true })).toMatchObject({ compactionEffectiveEnabled: true, compactionPrecomputeEnabled: true })
+    // Booleans must be booleans; numbers must be positive integers within range.
+    expect(resolveLimits({ compactionEffectiveEnabled: 'yes' as unknown as boolean }).compactionEffectiveEnabled).toBe(false)
+    expect(resolveLimits({ compactionPrecomputePressure: 0 }).compactionPrecomputePressure).toBe(DEFAULT_LIMITS.compactionPrecomputePressure)
+    expect(resolveLimits({ compactionPrecomputePressure: 1.5 }).compactionPrecomputePressure).toBe(DEFAULT_LIMITS.compactionPrecomputePressure)
+    expect(resolveLimits({ compactionPrecomputePressure: 0.5 }).compactionPrecomputePressure).toBe(0.5)
+    expect(resolveLimits({ compactionDeadlineMs: 1.5 }).compactionDeadlineMs).toBe(DEFAULT_LIMITS.compactionDeadlineMs)
+    expect(resolveLimits({ compactionDeadlineMs: -1 }).compactionDeadlineMs).toBe(DEFAULT_LIMITS.compactionDeadlineMs)
+    expect(resolveLimits({ compactionOutputTokens: 4_000 }).compactionOutputTokens).toBe(4_000)
+    expect(resolveLimits({ compactionCandidateWaitMs: 0 }).compactionCandidateWaitMs).toBe(0)
   })
   it('commitment prohibits retry and stop wins transport races', () => {
     const owner = new LogicalRequest()

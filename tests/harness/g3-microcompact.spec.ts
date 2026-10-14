@@ -108,3 +108,132 @@ describe('microcompact', () => {
     expect(JSON.stringify(events)).toBe(before)
   })
 })
+
+describe('typed compaction projection from the builder', () => {
+  const clearedLosses = (assembled: ReturnType<typeof build>) => assembled.compactionProjection.losses.filter((loss) => loss.kind === 'tool-result-cleared')
+
+  it('maps every history source to its actual message index, after section drops and trims', () => {
+    const assembled = build(longRun(12, 400), 200_000)
+    const { sources } = assembled.compactionProjection
+    expect(sources.length).toBeGreaterThan(0)
+    // Index 0 is the system message; history follows lower-trust blocks, so the
+    // mapping must point at the real positions, not at history-relative ones.
+    expect(sources[0]!.messageIndex).toBeGreaterThan(0)
+    for (const source of sources) {
+      const message = assembled.messages[source.messageIndex]!
+      const event = eventsOfLongRun().find((candidate) => candidate.seq === source.seq)!
+      expect(message.role).toBe(event.type === 'user/message' ? 'user' : event.type === 'tool/result' ? 'tool' : 'assistant')
+      expect(source.turnId).toBe('t')
+    }
+    expect(sources.map((source) => source.messageIndex)).toEqual(sources.map((_, index) => sources[0]!.messageIndex + index))
+    expect(assembled.compactionProjection.history).toBe('compact')
+    expect(assembled.compactionProjection.losses).toEqual([])
+  })
+
+  it('records one typed clear per cleared Read result, with call id, seq and policy version', () => {
+    const events = longRun(7, 16_000)
+    const assembled = build(events, 30_000)
+    const cleared = clearedLosses(assembled)
+    expect(cleared).toHaveLength(7 - MICROCOMPACT_KEEP_RECENT)
+    const clearedIds = assembled.messages.flatMap((message) => (message.role === 'tool' && message.content === CLEARED_TOOL_RESULT ? [message.toolCallId] : []))
+    expect(cleared.map((loss) => (loss as { callId: string }).callId)).toEqual(clearedIds)
+    for (const loss of cleared) {
+      const { seq, callId } = loss as { seq: number; callId: string }
+      expect(events.find((event) => event.seq === seq)).toMatchObject({ type: 'tool/result', callId })
+      expect(loss).toMatchObject({ policyVersion: 1 })
+    }
+    // The old display string stays for UI compatibility.
+    expect(assembled.manifest.omissions.some((line) => line.startsWith('tool-results:'))).toBe(true)
+  })
+
+  it('types a successful, already-read Bash or BashOutput clear as safe (its output is a report, not a deliverable)', () => {
+    for (const tool of ['Bash', 'BashOutput']) {
+      const assembled = build(longRun(7, 16_000, tool), 30_000)
+      expect(clearedLosses(assembled)).toHaveLength(7 - MICROCOMPACT_KEEP_RECENT)
+      expect(assembled.compactionProjection.losses.filter((loss) => loss.kind === 'unknown')).toEqual([])
+    }
+  })
+
+  it('never types a Write, Edit, MCP or errored clear as a safe clear: unknown loss instead', () => {
+    for (const tool of ['Write', 'Edit', 'mcp__srv__lookup']) {
+      const assembled = build(longRun(7, 16_000, tool), 30_000)
+      expect(clearedLosses(assembled)).toEqual([])
+      expect(assembled.compactionProjection.losses.filter((loss) => loss.kind === 'unknown')).toHaveLength(7 - MICROCOMPACT_KEEP_RECENT)
+    }
+    // A failed Bash is still evidence of a problem, never a safe clear.
+    const failedBash = longRun(7, 16_000, 'Bash').map((event) => (event.type === 'tool/result' && event.callId === 'c0' ? { ...event, ok: false } : event)) as SessionEvent[]
+    expect(clearedLosses(build(failedBash, 30_000))).toHaveLength(7 - MICROCOMPACT_KEEP_RECENT - 1)
+    // Event metadata, not message text: a failed Read stays unknown even though its text looks fine.
+    const failing = longRun(7, 16_000).map((event) => (event.type === 'tool/result' && event.callId === 'c0' ? { ...event, ok: false } : event)) as SessionEvent[]
+    const assembled = build(failing, 30_000)
+    expect(clearedLosses(assembled)).toHaveLength(7 - MICROCOMPACT_KEEP_RECENT - 1)
+    expect(assembled.compactionProjection.losses.filter((loss) => loss.kind === 'unknown')).toHaveLength(1)
+  })
+
+  it('never clears the unread batch, so it never appears among the losses', () => {
+    const assembled = build(longRun(12, 16_000, 'Read', 'unanswered'), 40_000)
+    const lastSeq = assembled.compactionProjection.sources.at(-1)!.seq
+    expect(clearedLosses(assembled).every((loss) => (loss as { seq: number }).seq < lastSeq)).toBe(true)
+    expect(assembled.compactionProjection.losses.filter((loss) => loss.kind === 'unknown')).toEqual([])
+  })
+
+  it('types a dropped completed uncovered turn and the regenerable sections dropped for budget', () => {
+    const rows: EventRow[] = []
+    for (let turn = 1; turn <= 3; turn++) {
+      rows.push({ type: 'turn/start', turnId: `t${turn}` }, { type: 'user/message', turnId: `t${turn}`, content: `q${turn} `.padEnd(8_000, 'x') })
+      rows.push({ type: 'assistant/message', stepId: `s${turn}`, content: 'a' }, { type: 'turn/end', turnId: `t${turn}`, reason: 'completed' })
+    }
+    rows.push({ type: 'turn/start', turnId: 't4' }, { type: 'user/message', turnId: 't4', content: 'now' })
+    const assembled = buildContext({
+      events: eventsOf(rows),
+      mode: MODE,
+      modeRevision: 1,
+      model: undefined,
+      providerName: undefined,
+      schemas: [],
+      activeSkills: [{ name: 'review', instructions: 'S'.repeat(2_000), hash: 'h1' }],
+      skillCatalog: [{ name: 'review', description: 'review code' }],
+      pinnedMemory: [{ id: 'm1', title: 'm', body: 'M'.repeat(2_000), hash: 'h2' }],
+      budget: { ...DEFAULT_BUDGET, contextLimitTokens: 3_000, outputReserveTokens: 256, marginTokens: 128 },
+    })
+    const { losses, sources } = assembled.compactionProjection
+    expect(losses.filter((loss) => loss.kind === 'regenerable-section').map((loss) => (loss as { source: string }).source).sort()).toEqual(['memory:m1', 'skill-catalog', 'skill:review'])
+    const dropped = losses.filter((loss) => loss.kind === 'uncovered-history-dropped') as { fromSeq: number; throughSeq: number }[]
+    expect(dropped.length).toBeGreaterThan(0)
+    expect(dropped[0]!.fromSeq).toBe(1)
+    // What the request lost is exactly what the sources no longer carry.
+    expect(sources.every((source) => source.seq > dropped.at(-1)!.throughSeq)).toBe(true)
+    expect(assembled.manifest.omissions.some((line) => line.startsWith('history: dropped oldest'))).toBe(true)
+  })
+
+  it('carries the seed identity (structural hash) beside covered retained messages', () => {
+    const rows: EventRow[] = [
+      { type: 'turn/start', turnId: 't1' }, { type: 'user/message', turnId: 't1', content: 'q1' },
+      { type: 'assistant/message', stepId: 's1', content: 'a1' }, { type: 'turn/end', turnId: 't1', reason: 'completed' },
+      { type: 'turn/start', turnId: 't2' }, { type: 'user/message', turnId: 't2', content: 'q2' },
+    ]
+    const assembled = buildContext({
+      events: eventsOf(rows), mode: MODE, modeRevision: 1, model: undefined, providerName: undefined, schemas: [], activeSkills: [], pinnedMemory: [],
+      budget: DEFAULT_BUDGET, compaction: { summary: 'SEED', coversSeq: 4 },
+    })
+    // Not canonical in the log, so the builder ignores it: no seed claimed.
+    expect(assembled.compactionProjection.seed).toBeUndefined()
+    const canonicalRows = [
+      ...rows.slice(0, 4),
+      { type: 'compaction/start', trigger: 'manual' }, { type: 'compaction/end', trigger: 'manual', coversSeq: 4, summaryChars: 4, durationMs: 1, summary: 'SEED' },
+      ...rows.slice(4),
+    ]
+    const seeded = buildContext({
+      events: eventsOf(canonicalRows), mode: MODE, modeRevision: 1, model: undefined, providerName: undefined, schemas: [], activeSkills: [], pinnedMemory: [],
+      budget: DEFAULT_BUDGET, compaction: { summary: 'SEED', coversSeq: 4 },
+    })
+    expect(seeded.compactionProjection.seed).toEqual({ coversSeq: 4, hash: seeded.manifest.history.checkpointHash })
+    // Retained covered messages (typed user words + the covered turn's final answer) map to their real seq/turn.
+    expect(seeded.compactionProjection.sources.map((source) => [source.seq, source.turnId])).toEqual([[2, 't1'], [3, 't1'], [8, 't2']])
+    expect(seeded.compactionProjection.sources.map((source) => seeded.messages[source.messageIndex]!.role)).toEqual(['user', 'assistant', 'user'])
+  })
+})
+
+function eventsOfLongRun(): SessionEvent[] {
+  return longRun(12, 400)
+}

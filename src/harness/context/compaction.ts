@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { deriveDatedMessages, type SessionEvent } from '../session/events.ts'
 import type { Session } from '../session/session.ts'
 import type { AttachmentLookup } from '../attachments/store.ts'
+import { compactionSeedHash, sourceDigest } from './compaction-digest.ts'
 
 export { ContextBudgetError } from './budget.ts'
 
@@ -50,6 +51,31 @@ export function isCompletedCompactionBoundary(events: readonly SessionEvent[], c
   return false
 }
 
+/**
+ * Whether a proven adoption is internally consistent with the log. The proof
+ * must name the same transaction at start and end, the cutoff the end claims,
+ * the digest of the source through that cutoff, and the seed (checkpoint) that
+ * stood at the cutoff. Turns that CLOSED after the cutoff are allowed — that is
+ * the point of adopting an older summary — but no turn may START inside the
+ * transaction itself (between its start and end events).
+ */
+function adoptionProven(
+  events: readonly SessionEvent[],
+  owner: Extract<SessionEvent, { type: 'compaction/start' }>,
+  end: Extract<SessionEvent, { type: 'compaction/end' }>,
+): boolean {
+  const start = owner.adoption
+  const proof = end.adoption
+  if (start === undefined || proof === undefined) return false
+  if (start.v !== 1 || proof.v !== 1 || start.transactionId !== proof.transactionId || typeof proof.transactionId !== 'string' || proof.transactionId === '') return false
+  if (start.cutoff !== end.coversSeq || proof.cutoff !== end.coversSeq) return false
+  if (proof.sourceDigest !== sourceDigest(events, end.coversSeq)) return false
+  // The seed must be exactly the checkpoint that stood at the cutoff.
+  const seed = recoverCanonicalCheckpoint(events.filter((event) => event.seq <= end.coversSeq))
+  if ((seed === undefined ? undefined : compactionSeedHash(seed.summary)) !== proof.seedHash) return false
+  return !events.some((e) => e.seq > owner.seq && e.seq < end.seq && e.type === 'turn/start')
+}
+
 /** Rebuild only from a qualifying committed end; legacy records need all facts. */
 export function recoverCanonicalCheckpoint(events: readonly SessionEvent[]): CompactionCheckpoint | undefined {
   let start: Extract<SessionEvent, { type: 'compaction/start' }> | undefined
@@ -62,8 +88,13 @@ export function recoverCanonicalCheckpoint(events: readonly SessionEvent[]): Com
     if (owner === undefined || event.error !== undefined || !validSummary(event.summary) || event.summaryChars !== event.summary.length ||
       owner.trigger !== event.trigger || owner.model !== event.model || event.coversSeq >= owner.seq ||
       !Number.isFinite(event.durationMs) || event.durationMs < 0 || !isCompletedCompactionBoundary(events, event.coversSeq)) continue
-    // A turn admitted between the covered boundary and the transaction end invalidates snapshot ownership.
-    if (events.some(e => e.seq > event.coversSeq && e.seq < event.seq && e.type === 'turn/start')) continue
+    if (event.adoption !== undefined || owner.adoption !== undefined) {
+      // A proven adoption replaces the legacy "no turn after the cutoff" rule with its own.
+      if (!adoptionProven(events, owner, event)) continue
+    } else if (events.some(e => e.seq > event.coversSeq && e.seq < event.seq && e.type === 'turn/start')) {
+      // Legacy: a turn admitted between the covered boundary and the transaction end invalidates ownership.
+      continue
+    }
     const candidate: CompactionCheckpoint = {
       v: 1, coversSeq: event.coversSeq, summary: event.summary,
       provenance: { createdAt: event.timestamp, trigger: event.trigger, ...(event.model !== undefined ? { model: event.model } : {}) },
@@ -266,6 +297,143 @@ export async function compactSession(session: Session, checkpoints: CheckpointSt
       try {
         session.append({ type: 'compaction/end', trigger: options.trigger, ...(options.model !== undefined ? { model: options.model } : {}),
           coversSeq: lastEnd, summaryChars: 0, durationMs: Date.now() - startedAt, error: String(cause instanceof Error ? cause.message : cause) })
+        await session.durable().catch(() => {})
+      } catch { /* poisoned/deleted sessions cannot accept a failed end */ }
+    }
+    throw cause
+  } finally { inFlight.delete(session.id) }
+}
+
+/** What a caller supplies to adopt a summary that was prepared earlier. */
+export interface PreparedForAdoption {
+  readonly summary: string
+  /** The closed turn the summary covers; later closed turns stay verbatim. */
+  readonly cutoff: number
+  readonly sourceDigest: string
+  /**
+   * sha256 of the checkpoint summary the candidate was built on top of
+   * (`compactionSeedHash`); absent when it was built from the whole conversation.
+   * A summary that did not see the current checkpoint would silently drop what
+   * that checkpoint covered, so a mismatch is refused.
+   */
+  readonly seedHash?: string
+  /** Model that wrote it, for provenance. */
+  readonly model?: string
+  /** Wall time spent generating it; reported as the duration of the checkpoint. */
+  readonly generationMs?: number
+}
+
+export interface AdoptionOptions {
+  readonly trigger: 'manual' | 'automatic'
+  readonly signal: AbortSignal
+  /**
+   * Last-moment host checks (model, mode, grants, hooks, fit) run after the
+   * transaction owns the session and before anything is appended as success.
+   * A throw becomes a failed end; nothing is adopted.
+   */
+  readonly validate: () => Promise<void>
+  /** Given the checkpoint being adopted and the one standing now, the window sizes it changes. */
+  readonly measure?: (next: { readonly summary: string; readonly coversSeq: number }, standing: { readonly summary: string; readonly coversSeq: number } | undefined, restoredTokens: number) => { readonly tokensBefore: number; readonly tokensAfter: number } | undefined
+  /**
+   * Builds the bounded state to restore beside the summary, for the cutoff being
+   * adopted. Runs inside the transaction (after the start barrier, before the
+   * final validation) so the source is the durable log. A throw refuses the
+   * adoption — required state is never silently shortened. The result is written
+   * as a `compaction/restoration` event before the success end.
+   */
+  readonly restore?: (cutoff: number) => Promise<Restored | undefined>
+}
+
+export interface Restored {
+  readonly body: string
+  readonly tokens: number
+  readonly sections: Extract<SessionEvent, { type: 'compaction/restoration' }>['sections']
+}
+
+/**
+ * Adopt a summary prepared against an older closed cutoff A as the checkpoint.
+ *
+ * Unlike `compactSession`, this does not summarize and does not require the
+ * newest closed turn to be the cutoff: turns that closed after A are kept
+ * verbatim by the history window. What it does require, under the same
+ * per-session exclusion:
+ *  - no turn is open (a summary may be adopted only between exchanges);
+ *  - A is a closed turn boundary and the source digest through A still matches;
+ *  - the seed the summary was built on is exactly the current canonical one.
+ * The proof (transaction id, cutoff, digest, seed hash) is written into both
+ * lifecycle events, so recovery verifies the adoption from the log alone.
+ */
+export async function adoptPreparedCompaction(session: Session, checkpoints: CheckpointStore, prepared: PreparedForAdoption,
+  options: AdoptionOptions): Promise<CompactionCheckpoint> {
+  if (inFlight.has(session.id)) throw new Error('compaction already in progress')
+  inFlight.add(session.id)
+  let started = false
+  let canonicalAppended = false
+  const startedAt = Date.now()
+  const transactionId = randomUUID()
+  const check = (): void => {
+    options.signal.throwIfAborted()
+    if (session.closing) throw new Error('session closing; compaction checkpoint refused')
+  }
+  try {
+    check()
+    if (!validSummary(prepared.summary)) throw new Error('compaction summary must be nonempty and at most 24000 characters')
+    const events = [...session.events]
+    let open: string | undefined
+    for (const event of events) {
+      if (event.type === 'turn/start') open = event.turnId
+      else if (event.type === 'turn/end' && event.turnId === open) open = undefined
+    }
+    if (open !== undefined) throw new Error('compaction requires a completed exchange boundary (no open turn)')
+    if (!isCompletedCompactionBoundary(events, prepared.cutoff)) throw new Error(`compaction cutoff ${prepared.cutoff} is not a completed exchange boundary`)
+    if (prepared.sourceDigest !== sourceDigest(events, prepared.cutoff)) throw new Error('compaction source digest changed since the summary was prepared')
+    const current = recoverCanonicalCheckpoint(events)
+    // Same cutoff as the checkpoint that already stands: nothing to adopt.
+    if (current !== undefined && current.coversSeq === prepared.cutoff) {
+      await checkpoints.save(session.id, current).catch(() => {})
+      return current
+    }
+    if (current !== undefined && current.coversSeq > prepared.cutoff) throw new Error('compaction seed is newer than the prepared summary')
+    // The candidate must have been built on exactly the checkpoint that stands now.
+    // Comparing against "the seed at the cutoff" would not do: that IS the current
+    // one, so a candidate that never saw it would pass and hide what it covers.
+    const seedHash = current === undefined ? undefined : compactionSeedHash(current.summary)
+    if (prepared.seedHash !== seedHash) throw new Error('compaction seed changed since the summary was prepared')
+    session.append({ type: 'compaction/start', trigger: options.trigger, ...(prepared.model !== undefined ? { model: prepared.model } : {}),
+      adoption: { v: 1, transactionId, cutoff: prepared.cutoff } })
+    started = true
+    await session.durable()
+    check()
+    const restored = await options.restore?.(prepared.cutoff)
+    check()
+    if (restored !== undefined) {
+      session.append({ type: 'compaction/restoration', coversSeq: prepared.cutoff, body: restored.body, sections: restored.sections })
+    }
+    await options.validate()
+    check()
+    // The start barrier made the source durable; nothing may have started a turn inside the transaction.
+    if (session.events.some((event) => event.type === 'turn/start' && event.seq > (session.events.findLast((e) => e.type === 'compaction/start')?.seq ?? 0))) {
+      throw new Error('compaction boundary changed during adoption')
+    }
+    let measured: ReturnType<NonNullable<AdoptionOptions['measure']>>
+    try { measured = options.measure?.({ summary: prepared.summary, coversSeq: prepared.cutoff }, current, restored?.tokens ?? 0) } catch { measured = undefined }
+    const end = session.append({ type: 'compaction/end', trigger: options.trigger, ...(prepared.model !== undefined ? { model: prepared.model } : {}),
+      coversSeq: prepared.cutoff, summaryChars: prepared.summary.length, durationMs: prepared.generationMs ?? Date.now() - startedAt, summary: prepared.summary,
+      ...(measured !== undefined ? { tokensBefore: measured.tokensBefore, tokensAfter: measured.tokensAfter } : {}),
+      adoption: { v: 1, transactionId, cutoff: prepared.cutoff, sourceDigest: prepared.sourceDigest, ...(seedHash !== undefined ? { seedHash } : {}) } })
+    // Same commit rule as compactSession: the success append is irreversible, a late
+    // Stop only suppresses the derived cache, and ownership lasts until it is durable.
+    canonicalAppended = true
+    await session.durable()
+    const checkpoint: CompactionCheckpoint = { v: 1, coversSeq: prepared.cutoff, summary: prepared.summary,
+      provenance: { createdAt: end.timestamp, trigger: options.trigger, ...(prepared.model !== undefined ? { model: prepared.model } : {}) } }
+    if (!options.signal.aborted && !session.closing) await checkpoints.save(session.id, checkpoint).catch(() => {})
+    return checkpoint
+  } catch (cause) {
+    if (started && !canonicalAppended && !session.closing) {
+      try {
+        session.append({ type: 'compaction/end', trigger: options.trigger, ...(prepared.model !== undefined ? { model: prepared.model } : {}),
+          coversSeq: prepared.cutoff, summaryChars: 0, durationMs: Date.now() - startedAt, error: String(cause instanceof Error ? cause.message : cause) })
         await session.durable().catch(() => {})
       } catch { /* poisoned/deleted sessions cannot accept a failed end */ }
     }

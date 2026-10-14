@@ -8,7 +8,7 @@ import { Composer } from '../components/composer/Composer.tsx'
 import { ScopeControl } from '../components/layout/ScopeControl.tsx'
 import { ModeMenu } from '../components/composer/ComposerControls.tsx'
 import { ToastHost, useToast } from '../components/common/Toast.tsx'
-import { ToolCard, ActivityBlock, AssistantMessage, DelegationCard, AuditLine, RetryLine, StatusLine, UserBubble, summarizeActivity } from '../components/chat/MessageParts.tsx'
+import { CompactionMarker, ToolCard, ActivityBlock, AssistantMessage, DelegationCard, AuditLine, RetryLine, StatusLine, UserBubble, summarizeActivity } from '../components/chat/MessageParts.tsx'
 import { QueuedBar } from '../components/chat/QueuedBar.tsx'
 import { groupBlocks, rowItems, turnFooters } from '../components/chat/Transcript.tsx'
 import { activeMinimapIndex, minimapEntries, minimapPreview, minimapScrollTarget } from '../components/chat/ConversationMinimap.tsx'
@@ -18,7 +18,7 @@ import type { ChipSegment } from './inline-chips.ts'
 import { budgetTone, formatTime } from './format.ts'
 import { hiddenSpawnCalls } from './spawn-merge.ts'
 import { createProjector, projectItems } from './project.ts'
-import { compactSession, fetchHooks, saveHooks, setHookActive, renameWorkspace, listProjectFiles, readProjectFile } from './api.ts'
+import { compactSession, CompactionCancelled, CompactionRecoveryNeeded, fetchHooks, saveHooks, setHookActive, renameWorkspace, listProjectFiles, readProjectFile } from './api.ts'
 import { ContextPanel } from '../components/layout/ContextPanel.tsx'
 import { Workbench, type WorkbenchView } from '../components/workbench/Workbench.tsx'
 import { closeFileTab, useWorkbenchFiles } from '../hooks/useWorkbenchFiles.ts'
@@ -40,6 +40,12 @@ vi.mock('./api.ts', () => ({
   setWorkspaceArchived: vi.fn(async () => ({ id: 'w1', name: 'W', archived: true, createdAt: 0 })),
   deleteWorkspace: vi.fn(async () => ({ deleted: true })),
   compactSession: vi.fn(async () => ({ coversSeq: 42, summaryChars: 900 })),
+  CompactionCancelled: class CompactionCancelled extends Error {
+    constructor() { super('Compaction was cancelled.'); this.name = 'CompactionCancelled' }
+  },
+  CompactionRecoveryNeeded: class CompactionRecoveryNeeded extends Error {
+    constructor(readonly recovery: { cutoff: number; sourceDigest: string; estimatedCalls: number }) { super('needs recovery'); this.name = 'CompactionRecoveryNeeded' }
+  },
   listSkills: vi.fn(async () => []),
   saveSkill: vi.fn(async () => ({ name: 's', hash: 'h' })),
   getSkill: vi.fn(async () => ({ name: 's', title: 's', description: '', source: 'workspace' as const, hash: 'h', instructions: 'body' })),
@@ -141,6 +147,53 @@ describe('mounted production controls', () => {
     expect(send).toHaveBeenCalledTimes(1)
     expect(input.textContent).toBe('Dữ liệu giữ nguyên')
   })
+  describe('while a compaction runs', () => {
+    it('offers Stop, which stops the compaction, even though no turn is running', async () => {
+      const stop = vi.fn()
+      await mount(<ToastHost><Composer {...composerBase} connected running={false} compacting onStop={stop} draft={textDraft('')} /></ToastHost>)
+      const button = host.querySelector<HTMLButtonElement>('button[aria-label="Stop compaction"]')
+      expect(button).not.toBeNull()
+      await act(async () => button!.click())
+      expect(stop).toHaveBeenCalledTimes(1)
+      // It says what it stops: this is not the ordinary Stop work button.
+      expect(host.querySelector('button[aria-label="Stop work"]')).toBeNull()
+    })
+
+    it('does not offer Steer: there is no turn to interrupt, so a message queues until the compaction ends', async () => {
+      await mount(<ToastHost><Composer {...composerBase} connected running={false} compacting draft={textDraft('next thing')} /></ToastHost>)
+      expect(host.querySelector('button[aria-label*="Steer"]')).toBeNull()
+      expect(host.querySelector<HTMLElement>('[data-composer-input]')!.dataset['placeholder']).toMatch(/after (the )?compaction/i)
+    })
+
+    it('Enter queues instead of sending, and the draft is not lost', async () => {
+      const send = vi.fn()
+      await mount(<ToastHost><Composer {...composerBase} connected running={false} compacting draft={textDraft('next thing')} onSend={send} /></ToastHost>)
+      const input = host.querySelector<HTMLElement>('[data-composer-input]')!
+      await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+      expect(send).toHaveBeenCalledTimes(1)
+      expect(send).toHaveBeenCalledWith('queue')
+    })
+
+    it('nothing changes when no compaction runs: no Stop, ordinary send', async () => {
+      await mount(<ToastHost><Composer {...composerBase} connected running={false} draft={textDraft('hi')} /></ToastHost>)
+      expect(host.querySelector('button[aria-label="Stop compaction"]')).toBeNull()
+      expect(host.querySelector('button[aria-label="Stop work"]')).toBeNull()
+      expect(host.querySelector('button[aria-label="Send"]')).not.toBeNull()
+    })
+
+    it('a running turn keeps the ordinary Stop work button', async () => {
+      await mount(<ToastHost><Composer {...composerBase} connected running compacting={false} draft={textDraft('')} /></ToastHost>)
+      expect(host.querySelector('button[aria-label="Stop work"]')).not.toBeNull()
+      expect(host.querySelector('button[aria-label="Stop compaction"]')).toBeNull()
+    })
+
+    it('never shows two Stop buttons: if a turn is somehow running too, only the ordinary one is offered', async () => {
+      await mount(<ToastHost><Composer {...composerBase} connected running compacting draft={textDraft('')} /></ToastHost>)
+      expect(host.querySelectorAll('button[aria-label^="Stop"]')).toHaveLength(1)
+      expect(host.querySelector('button[aria-label="Stop work"]')).not.toBeNull()
+    })
+  })
+
   it('while running with a draft the send becomes Queue next to Stop and Enter still submits', async () => {
     const send = vi.fn()
     await mount(<ToastHost><Composer {...composerBase} connected running draft={textDraft('follow-up')} onSend={send} /></ToastHost>)
@@ -1064,6 +1117,139 @@ describe('context compaction + budget bar', () => {
     await act(async () => bodyButton('Compact').click())
     expect(compactSession).toHaveBeenCalledWith('w1', 's1')
     expect(document.body.textContent).not.toContain('Compact this conversation?')
+  })
+  describe('compaction progress row', () => {
+    type Row = Extract<ViewItem, { kind: 'compaction' }>
+    const row = (over: Partial<Row>): Row => ({ kind: 'compaction', status: 'running', trigger: 'manual', ...over })
+
+    it('while running it names the stage and counts the elapsed time up', async () => {
+      vi.useFakeTimers()
+      try {
+        vi.setSystemTime(10_000)
+        await mount(<CompactionMarker item={row({ stage: 'generating', startedAt: 4_000 })} />)
+        expect(host.textContent).toContain('Compacting conversation')
+        expect(host.textContent).toContain('Summarizing')
+        expect(host.textContent).toContain('6.0s')
+        await act(async () => { vi.advanceTimersByTime(3_000) })
+        expect(host.textContent).toContain('9.0s')
+      } finally { vi.useRealTimers() }
+    })
+
+    it.each([
+      ['preparing', 'Preparing'],
+      ['generating', 'Summarizing'],
+      ['applying', 'Applying'],
+    ] as const)('says what the %s stage is', async (stage, label) => {
+      await mount(<CompactionMarker item={row({ stage, startedAt: Date.now() })} />)
+      expect(host.textContent).toContain(label)
+    })
+
+    it('a legacy row with no stage still shows the plain running line and no clock', async () => {
+      await mount(<CompactionMarker item={row({})} />)
+      expect(host.textContent).toContain('Compacting conversation')
+      expect(host.textContent).not.toMatch(/\d\.\ds/)
+    })
+
+    it.each([
+      ['cancelled', 'Compaction cancelled'],
+      ['noop', 'Already compacted'],
+      ['needs-recovery', 'Needs a slow recovery'],
+    ] as const)('a row that ended as %s says so, and is not shown as a failure', async (status, label) => {
+      await mount(<CompactionMarker item={row({ status })} />)
+      expect(host.textContent).toContain(label)
+      expect(host.textContent).not.toContain('failed')
+      expect(host.textContent).not.toContain('Compacting conversation')
+    })
+
+    it('a failed row still shows its reason on expand', async () => {
+      await mount(<CompactionMarker item={row({ status: 'failed', error: 'provider transport failure' })} />)
+      expect(host.textContent).toContain('Compaction failed')
+      await act(async () => button('Compaction failed').click())
+      expect(host.textContent).toContain('provider transport failure')
+    })
+
+    it('a finished row shows how the summary was made', async () => {
+      await mount(<CompactionMarker item={row({ status: 'completed', path: 'recovery', coversSeq: 9, summary: 'S' })} />)
+      expect(host.textContent).toContain('slow recovery')
+      await mount(<CompactionMarker item={row({ status: 'completed', path: 'exact', coversSeq: 9, summary: 'S' })} />)
+      expect(host.textContent).not.toContain('slow recovery')
+    })
+  })
+
+  describe('slow recovery confirmation', () => {
+    const recovery = { cutoff: 42, sourceDigest: 'abc123', estimatedCalls: 9 }
+    const compactMock = compactSession as unknown as ReturnType<typeof vi.fn>
+    const open = async (): Promise<void> => {
+      await mount(<ToastHost><ContextPanel meta={null} stream="open" sessionId="s1" sessionFolder={null} eventCount={0} manifest={manifest} workspaceId="w1" running={false} /></ToastHost>)
+      await act(async () => button('Compact…').click())
+      await act(async () => bodyButton('Compact').click())
+    }
+
+    it('asks before running the slow raw fold, says how many model calls it is, and has run nothing yet', async () => {
+      compactMock.mockRejectedValueOnce(new CompactionRecoveryNeeded(recovery))
+      await open()
+      expect(compactSession).toHaveBeenCalledTimes(1)
+      expect(document.body.textContent).toContain('Slow compaction needed')
+      expect(document.body.textContent).toContain('about 9 model calls')
+      expect(bodyButton('Run slow compaction')).toBeDefined()
+    })
+
+    it('Cancel never confirms: the server is not called again', async () => {
+      compactMock.mockRejectedValueOnce(new CompactionRecoveryNeeded(recovery))
+      await open()
+      await act(async () => bodyButton('Cancel').click())
+      expect(compactSession).toHaveBeenCalledTimes(1)
+      expect(document.body.textContent).not.toContain('Slow compaction needed')
+    })
+
+    it('confirming echoes the exact fingerprint the server showed, and reports the result', async () => {
+      compactMock.mockRejectedValueOnce(new CompactionRecoveryNeeded(recovery))
+      compactMock.mockResolvedValueOnce({ coversSeq: 42, summaryChars: 700, path: 'recovery' })
+      await open()
+      await act(async () => bodyButton('Run slow compaction').click())
+      expect(compactSession).toHaveBeenCalledTimes(2)
+      expect(compactMock.mock.calls[1]).toEqual(['w1', 's1', recovery])
+      expect(document.body.textContent).not.toContain('Slow compaction needed')
+    })
+
+    it('a turn that starts while the question is open withdraws it without confirming', async () => {
+      function Probe() {
+        const [running, setRunning] = useState(false)
+        return (
+          <ToastHost>
+            <button type="button" onClick={() => setRunning(true)}>Start running</button>
+            <button type="button" onClick={() => setRunning(false)}>Stop running</button>
+            <ContextPanel meta={null} stream="open" sessionId="s1" sessionFolder={null} eventCount={0} manifest={manifest} workspaceId="w1" running={running} />
+          </ToastHost>
+        )
+      }
+      compactMock.mockRejectedValueOnce(new CompactionRecoveryNeeded(recovery))
+      await mount(<Probe />)
+      await act(async () => button('Compact…').click())
+      await act(async () => bodyButton('Compact').click())
+      expect(document.body.textContent).toContain('Slow compaction needed')
+      await act(async () => button('Start running').click())
+      expect(document.body.textContent).not.toContain('Slow compaction needed')
+      // The question was about a source that has since changed: it must not come back when the turn ends.
+      await act(async () => button('Stop running').click())
+      expect(document.body.textContent).not.toContain('Slow compaction needed')
+      expect(compactSession).toHaveBeenCalledTimes(1)
+    })
+
+    it('a compaction the user stopped is reported as cancelled, not as a failure', async () => {
+      compactMock.mockRejectedValueOnce(new CompactionCancelled())
+      await open()
+      expect(document.body.textContent).toContain('Compaction cancelled')
+      expect(document.body.textContent).not.toContain('Slow compaction needed')
+      expect(document.body.textContent).not.toContain('HTTP')
+      expect(document.body.textContent).not.toContain('Error')
+    })
+
+    it('an ordinary failure is still just a message, never a slow-compaction question', async () => {
+      compactMock.mockRejectedValueOnce(new Error('HTTP 409: no'))
+      await open()
+      expect(document.body.textContent).not.toContain('Slow compaction needed')
+    })
   })
   it('shows a child request’s role and inherited parent context, or why it was dropped', async () => {
     const hash = 'c'.repeat(64)

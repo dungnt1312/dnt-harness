@@ -2,7 +2,13 @@ import { randomUUID } from 'node:crypto'
 import { ProviderError, type ModelRequest, type ProviderErrorPhase, type StreamEvent } from './types.ts'
 
 export interface AttemptTicket { release(): void }
-export interface PhysicalAdmission { acquire(signal: AbortSignal): Promise<AttemptTicket> }
+/**
+ * `priority: 'low'` marks speculative background work (a compaction candidate).
+ * It may use spare capacity but never the last free slot, and queued foreground
+ * requests are always admitted first. Omitted means ordinary admission.
+ */
+export interface AdmissionOptions { readonly priority?: 'low' }
+export interface PhysicalAdmission { acquire(signal: AbortSignal, options?: AdmissionOptions): Promise<AttemptTicket> }
 export interface AttemptAttribution { readonly sessionId: string; readonly turnId: string; readonly stepId: string }
 export interface AttemptFact {
   readonly attribution?: AttemptAttribution
@@ -29,33 +35,45 @@ const failure = (reason: ProviderError['reason'], retryable = false): ProviderEr
 export class AttemptAdmission implements PhysicalAdmission {
   active = 0
   readonly uncertain = new Map<string, AttemptFact>()
-  private waiters: (() => void)[] = []
+  private waiters: { readonly admit: () => boolean }[] = []
   constructor(readonly capacity = 4, private readonly delegate?: PhysicalAdmission) {
     if (!Number.isSafeInteger(capacity) || capacity <= 0) throw new Error('invalid provider capacity')
   }
-  acquire(signal: AbortSignal): Promise<AttemptTicket> {
-    if (this.delegate) return this.delegate.acquire(signal).then(ticket => {
+  /**
+   * Offer free capacity to the queue in arrival order. No separate foreground-first
+   * pass is needed: a foreground request only queues when every slot is taken, and
+   * a low-priority one cannot take the last slot, so they are never both admissible.
+   */
+  private pump(): void {
+    for (const waiter of [...this.waiters]) waiter.admit()
+  }
+  acquire(signal: AbortSignal, options?: AdmissionOptions): Promise<AttemptTicket> {
+    if (this.delegate) return this.delegate.acquire(signal, options).then(ticket => {
       if (signal.aborted) { ticket.release(); throw signal.reason }
       this.active++
       let released = false
       return { release: () => { if (released) return; released = true; this.active--; ticket.release() } }
     })
+    const low = options?.priority === 'low'
     return new Promise((resolve, reject) => {
-      const remove = (): void => { this.waiters = this.waiters.filter(w => w !== admit); signal.removeEventListener('abort', abort) }
+      const remove = (): void => { this.waiters = this.waiters.filter(w => w !== waiter); signal.removeEventListener('abort', abort) }
       const abort = (): void => { remove(); reject(signal.reason instanceof ProviderError ? signal.reason : failure('cancelled')) }
-      const admit = (): void => {
-        if (signal.aborted) { abort(); return }
-        if (this.active >= this.capacity) return
+      const admit = (): boolean => {
+        if (signal.aborted) { abort(); return false }
+        // A low-priority request leaves one slot for the foreground, so with a single slot it never runs.
+        if (this.active >= (low ? this.capacity - 1 : this.capacity)) return false
         remove(); this.active++
         let released = false
         resolve({ release: () => {
           if (released) return
           released = true; this.active--
-          this.waiters[0]?.()
+          this.pump()
         } })
+        return true
       }
+      const waiter = { admit }
       if (signal.aborted) { abort(); return }
-      this.waiters.push(admit)
+      this.waiters.push(waiter)
       signal.addEventListener('abort', abort, { once: true })
       admit()
     })
@@ -140,7 +158,7 @@ export function gatewayIdleCut(error: ProviderError, lastActivityAt: number | un
   return annotated
 }
 
-export async function* runAttempt(provider: { stream(request: ModelRequest, options?: import('./types.ts').StreamOptions): AsyncIterable<StreamEvent> }, request: ModelRequest, options: { owner: LogicalRequest; admission: AttemptAdmission; signal?: AbortSignal; observer?: AttemptObserver; attribution?: AttemptAttribution; provider?: string; recordAttempt?: (fact: AttemptFact) => Promise<void> }): AsyncIterable<StreamEvent> {
+export async function* runAttempt(provider: { stream(request: ModelRequest, options?: import('./types.ts').StreamOptions): AsyncIterable<StreamEvent> }, request: ModelRequest, options: { owner: LogicalRequest; admission: AttemptAdmission; priority?: 'low'; signal?: AbortSignal; observer?: AttemptObserver; attribution?: AttemptAttribution; provider?: string; recordAttempt?: (fact: AttemptFact) => Promise<void> }): AsyncIterable<StreamEvent> {
   const { owner, admission, observer } = options
   const controller = new AbortController()
   const abort = (): void => controller.abort(options.signal?.aborted ? failure('cancelled') : owner.signal.reason)
@@ -170,7 +188,7 @@ export async function* runAttempt(provider: { stream(request: ModelRequest, opti
     await options.recordAttempt?.(next)
   }
   try {
-    ticket = await admission.acquire(controller.signal)
+    ticket = await admission.acquire(controller.signal, options.priority !== undefined ? { priority: options.priority } : undefined)
     const attempt = owner.consume()
     fact = { requestId: owner.id, attemptId: randomUUID(), attempt, state: 'start', committed, transportSettled: false, queuedAt, startedAt: Date.now(), ...(options.attribution ? { attribution: options.attribution } : {}), ...(options.provider ? { provider: options.provider.slice(0, 128) } : {}), ...(request.model ? { model: request.model.slice(0, 128) } : {}) }
     await notify('start')

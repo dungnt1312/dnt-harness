@@ -62,7 +62,7 @@ src/
 │   ├── approval/       Policy riding tools/pre-execute: allow | ask | deny
 │   ├── workspace/      Workspace registry, project binding, ownership
 │   ├── modes/          Five bundled + custom file modes
-│   ├── context/        Mode-driven builder: budget, compaction, manifest
+│   ├── context/        Mode-driven builder: budget, compaction (fold + effective one-request path), manifest
 │   ├── skills/         Workspace/plugin skills + on-demand Skill tool
 │   ├── commands/       Claude Code custom slash command loading + expansion
 │   ├── plugins/        Claude plugin manifests, store, marketplaces, MCP bridge

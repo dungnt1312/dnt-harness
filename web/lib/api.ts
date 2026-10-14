@@ -1368,12 +1368,64 @@ export interface CompactResult {
   /** Context tokens before/after; absent when the run was not measured. */
   readonly tokensBefore?: number
   readonly tokensAfter?: number
+  /** How the summary was produced: `exact` and `reconstructed` are one request; `recovery` is the slow raw fold. */
+  readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'
 }
-/** Manual compaction: older turns become an immutable checkpoint. */
-export function compactSession(workspaceId: string, sessionId: string): Promise<CompactResult> {
-  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/compact`, { method: 'POST' }).then((r) =>
-    json<CompactResult>(r),
-  )
+
+/**
+ * What the server needs echoed back to run the slow raw fold: bound to the exact
+ * source the user was shown, so a source that changed since is refused.
+ */
+export interface CompactionRecovery {
+  readonly cutoff: number
+  readonly sourceDigest: string
+  readonly estimatedCalls: number
+}
+
+/** The server cannot compact from a saved request and offers a slow recovery; nothing ran. */
+export class CompactionRecoveryNeeded extends Error {
+  constructor(readonly recovery: CompactionRecovery) {
+    super(`Compaction needs a slow recovery of about ${recovery.estimatedCalls} model calls.`)
+    this.name = 'CompactionRecoveryNeeded'
+  }
+}
+
+/** Stop, a delete or a shutdown ended the compaction. Not a failure: nothing was written. */
+export class CompactionCancelled extends Error {
+  constructor() {
+    super('Compaction was cancelled.')
+    this.name = 'CompactionCancelled'
+  }
+}
+
+function recoveryOf(value: unknown): CompactionRecovery | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const { cutoff, sourceDigest, estimatedCalls } = value as Record<string, unknown>
+  return Number.isSafeInteger(cutoff) && typeof sourceDigest === 'string' && Number.isSafeInteger(estimatedCalls)
+    ? { cutoff: cutoff as number, sourceDigest, estimatedCalls: estimatedCalls as number }
+    : undefined
+}
+
+/**
+ * Manual compaction: older turns become an immutable checkpoint. A plain call is an
+ * empty POST. When it needs the slow recovery it throws {@link CompactionRecoveryNeeded}
+ * instead of running it; pass that error's `recovery` back to confirm.
+ */
+export async function compactSession(workspaceId: string, sessionId: string, confirm?: CompactionRecovery): Promise<CompactResult> {
+  const response = await apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/compact`, {
+    method: 'POST',
+    ...(confirm !== undefined ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify({ recovery: confirm }) } : {}),
+  })
+  if (response.status === 409) {
+    const text = await response.text()
+    let parsed: { recovery?: unknown; cancelled?: unknown } = {}
+    try { parsed = JSON.parse(text) as typeof parsed } catch { /* plain-text refusal */ }
+    if (parsed.cancelled === true) throw new CompactionCancelled()
+    const recovery = recoveryOf(parsed.recovery)
+    if (recovery !== undefined) throw new CompactionRecoveryNeeded(recovery)
+    throw new HttpError(409, text)
+  }
+  return json<CompactResult>(response)
 }
 
 // ── G3 skills ───────────────────────────────────────────────────────────────

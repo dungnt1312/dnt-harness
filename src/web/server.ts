@@ -168,7 +168,19 @@ import { askUserQuestionTool, validateAnswers, type QuestionOutcome, type UserQu
 import { buildContext, estimateConversationTokens, DEFAULT_BASE_SYSTEM, DEFAULT_CHILD_SYSTEM, type ContextManifest, type ActiveSkill, type MemorySnippet } from '../harness/context/builder.ts'
 import { renderEnvironmentContext } from '../harness/context/environment.ts'
 import { SystemPromptsStore, type SystemPromptsSnapshot } from '../harness/prompts/store.ts'
-import { CheckpointStore } from '../harness/context/compaction.ts'
+import { CheckpointStore, recoverCanonicalCheckpoint, type CompactionCheckpoint } from '../harness/context/compaction.ts'
+import { compactionSeedHash, sourceDigest } from '../harness/context/compaction-digest.ts'
+import { CompactionSnapshotStore } from '../harness/storage/compaction-snapshot-store.ts'
+import { promoteCapture } from './compaction-capture.ts'
+import { CompactionHost } from './compaction-host.ts'
+import { CompactionPrecompute, candidateOwner } from './compaction-precompute.ts'
+import { buildRestoration } from './compaction-restoration.ts'
+import type { EffectiveCompactionSnapshot, SnapshotIdentity } from '../harness/context/compaction-snapshot.ts'
+import { assertFitsWindow } from './compaction-generator.ts'
+import { CaptureRegistry, identityOf, requestPrefixHash } from './compaction-wiring.ts'
+import { loadReferencedSnapshot } from './compaction-restart.ts'
+import { snapshotHash } from '../harness/context/compaction-snapshot.ts'
+import type { RecoveryConfirmation } from './compaction-source.ts'
 import { CacheAwareCompactionFallback, createCacheAwareCompactionSummarizer, createCompactionSummarizer } from './llm-summarizer.ts'
 import { DEFAULT_BUDGET, schemaCost, type ResolvedBudget } from '../harness/context/budget.ts'
 import { CommandsService } from '../harness/commands/service.ts'
@@ -441,6 +453,22 @@ export type TerminalEnvelope =
 export interface TerminalSnapshot extends TerminalInfo {
   /** Base64 of the retained scrollback. */
   readonly scrollback: string
+}
+
+/** A compaction that needs the caller's confirmation before the slow raw fold. */
+class CompactionRecoveryRequired extends Error {
+  constructor(readonly confirmation: RecoveryConfirmation) {
+    super('compaction needs a confirmed recovery: no eligible snapshot covers the newest exchange')
+    this.name = 'CompactionRecoveryRequired'
+  }
+}
+
+/** The user (Stop), a delete or a shutdown ended a compaction: not a failure, nothing was written. */
+class CompactionCancelled extends Error {
+  constructor(reason: string) {
+    super(reason)
+    this.name = 'CompactionCancelled'
+  }
 }
 
 /** A running web server: its URL plus a graceful shutdown. */
@@ -1316,7 +1344,29 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const cancelCompaction = (sessionId: SessionId): void => {
     compactions.get(sessionId)?.controller.abort(new Error('compaction cancelled'))
   }
-  const runCompaction = (entry: SessionEntry, trigger: 'manual' | 'automatic') => {
+  /** The trigger of the compaction that owns each session right now; its stage reports need it. */
+  const jobTriggers = new Map<SessionId, 'manual' | 'automatic'>()
+  /**
+   * Record one stage of the running compaction as a durable `compaction/job` event, so every
+   * client — and a reload — sees where it is. Telemetry: a session that is going away just
+   * has nowhere to write it.
+   */
+  const appendJob = async (entry: SessionEntry, job: { readonly stage: 'preparing' | 'generating' | 'applying' | 'ended'; readonly outcome?: 'compacted' | 'noop' | 'needs-recovery' | 'cancelled' | 'failed'; readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'; readonly error?: string }): Promise<void> => {
+    const trigger = jobTriggers.get(entry.session.id)
+    if (trigger === undefined || entry.closed) return
+    try {
+      entry.session.append({
+        type: 'compaction/job', stage: job.stage, trigger,
+        ...(job.outcome !== undefined ? { outcome: job.outcome } : {}),
+        ...(job.path !== undefined ? { path: job.path } : {}),
+        ...(job.error !== undefined ? { error: job.error.slice(0, 500) } : {}),
+      })
+      // The end is what a reload and the next request rely on, and a no-op, a failure or a cancel
+      // has nothing else that waits for the log: let it reach the disk before the caller is told.
+      if (job.stage === 'ended') await entry.session.durable()
+    } catch { /* poisoned or deleted sessions cannot take it */ }
+  }
+  const runCompaction = (entry: SessionEntry, trigger: 'manual' | 'automatic', request?: { readonly recovery?: RecoveryConfirmation }): Promise<{ coversSeq: number; summary: string; path?: string; recovery?: RecoveryConfirmation }> => {
     if (compactionClosing || entry.closed || compactions.has(entry.session.id)
       || (trigger === 'manual' && entry.agent.busy)
       || kernel.ctx.llm.sessionUncertain(entry.session.id)) {
@@ -1324,12 +1374,255 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     }
     const reservation = { controller: new AbortController(), done: undefined as Promise<unknown> | undefined }
     compactions.set(entry.session.id, reservation)
+    jobTriggers.set(entry.session.id, trigger)
     const signal = reservation.controller.signal
     const done = agentScope.exit(async () => {
+      const startedAfter = entry.session.events.at(-1)?.seq ?? 0
+      void appendJob(entry, { stage: 'preparing' })
       try {
-        const blocked = await runPreCompactHooks(entry.session, entry.workspaceId, signal, trigger === 'automatic' ? 'auto' : 'manual')
-        signal.throwIfAborted()
-        if (blocked !== undefined) throw new Error(blocked)
+        let result: { coversSeq: number; summary: string; path?: string; recovery?: RecoveryConfirmation }
+        if (limits.compactionEffectiveEnabled) result = await effectiveCompaction(entry, trigger, signal, request)
+        else {
+          const blocked = await runPreCompactHooks(entry.session, entry.workspaceId, signal, trigger === 'automatic' ? 'auto' : 'manual')
+          signal.throwIfAborted()
+          if (blocked !== undefined) throw new Error(blocked)
+          result = await legacyBody(entry, trigger, signal)
+        }
+        // A new successful end after the job began means a checkpoint was written; otherwise the boundary was already compacted.
+        const wrote = entry.session.events.some((event) => event.seq > startedAfter && event.type === 'compaction/end' && event.error === undefined)
+        const path = result.path ?? 'legacy'
+        await appendJob(entry, wrote
+          ? { stage: 'ended', outcome: 'compacted', path: path as 'exact' | 'reconstructed' | 'recovery' | 'legacy' }
+          : { stage: 'ended', outcome: 'noop' })
+        return result
+      } catch (error) {
+        const message = String(error instanceof Error ? error.message : error)
+        if (error instanceof CompactionRecoveryRequired) await appendJob(entry, { stage: 'ended', outcome: 'needs-recovery' })
+        else if (signal.aborted) {
+          await appendJob(entry, { stage: 'ended', outcome: 'cancelled' })
+          // Say so: a user who pressed Stop is not shown a failure.
+          throw new CompactionCancelled(message)
+        } else await appendJob(entry, { stage: 'ended', outcome: 'failed', error: message })
+        throw error
+      } finally {
+        jobTriggers.delete(entry.session.id)
+        if (compactions.get(entry.session.id) === reservation) compactions.delete(entry.session.id)
+        if (!signal.aborted && !compactionClosing && !entry.closed && depsRef.current !== undefined) {
+          // Automatic runs are awaited by the driver, which drains its own inbox.
+          if (!entry.agent.busy && kernel.ctx.sessions.pendingInputs(entry.session).length > 0) await dispatchInbox(entry, depsRef.current, 'queue')
+        }
+      }
+    })
+    reservation.done = done
+    return done
+  }
+
+  const snapshotStore = new CompactionSnapshotStore((sessionId) => path.join(resourceHome, 'workspaces', sessionId, 'snapshots'))
+  /** Per-session host: one owner of an effective compaction. Created lazily, cancelled with the session. */
+  const compactionHosts = new Map<SessionId, CompactionHost>()
+
+  /** Smallest saving, in estimated tokens, that makes a precomputed summary worth a checkpoint. */
+  const MIN_CANDIDATE_GAIN_TOKENS = 256
+
+  /**
+   * Background candidates. Created only when precompute is on; every dependency reads the
+   * live session, so a candidate is judged against the conversation as it is when someone
+   * asks for it, not as it was when the summary started.
+   */
+  const candidates: CompactionPrecompute | undefined = limits.compactionEffectiveEnabled && limits.compactionPrecomputeEnabled
+    ? new CompactionPrecompute({
+      stream: (modelRequest, streamOptions) => agentScope.exit(() => kernel.ctx.llm.stream(modelRequest, streamOptions)),
+      identity: (sessionId) => {
+        const entry = sessions.get(sessionId as SessionId)
+        return entry === undefined
+          ? (() => { throw new Error('session is gone') })()
+          : compactionIdentity(entry, captures.snapshotOf(entry.session.id)?.identity.prefixHash ?? '')
+      },
+      seedHash: (sessionId) => {
+        const entry = sessions.get(sessionId as SessionId)
+        const standing = entry === undefined ? undefined : recoverCanonicalCheckpoint(entry.session.committedEvents)
+        return standing === undefined ? undefined : compactionSeedHash(standing.summary)
+      },
+      digestAt: (sessionId, cutoff) => {
+        const entry = sessions.get(sessionId as SessionId)
+        return entry === undefined ? '' : sourceDigest(entry.session.committedEvents, cutoff)
+      },
+      // The candidate runs under its own provider-ownership id; the service tells us if it is stuck.
+      transportUncertain: (sessionId) => kernel.ctx.llm.sessionUncertain(candidateOwner(sessionId)),
+      assess: (sessionId, prepared) => {
+        const entry = sessions.get(sessionId as SessionId)
+        if (entry === undefined) return 'no-fit'
+        const events = entry.session.committedEvents
+        const standing = recoverCanonicalCheckpoint(events)
+        const shared = { events, compactionRetainTokens: limits.compactionRetainTokens }
+        const was = estimateConversationTokens({ ...shared, ...(standing !== undefined ? { compaction: standing } : {}) })
+        const now = estimateConversationTokens({ ...shared, compaction: { summary: prepared.summary, coversSeq: prepared.cutoff } })
+        // The tail that closed after the cutoff stays verbatim, so it is part of `now`: a
+        // candidate whose result is not smaller by the minimum is not worth a checkpoint.
+        if (was - now < MIN_CANDIDATE_GAIN_TOKENS) return 'no-gain'
+        const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
+        const window = effective.model === null || effective.model === undefined ? undefined : resolveContextLimit(effective.model)
+        if (window !== undefined && now > window - limits.compactionOutputTokens) return 'no-fit'
+        return undefined
+      },
+      limits,
+      recordUsage: (sessionId, usage) => {
+        const entry = sessions.get(sessionId as SessionId)
+        if (entry === undefined) return
+        const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
+        usageLog.record({
+          at: Date.now(), startedAt: Date.now(), workspaceId: entry.workspaceId, sessionId: entry.session.id, rootSessionId: entry.session.id, kind: 'compaction',
+          ...(effective.provider !== null && effective.provider !== undefined ? { provider: effective.provider } : {}),
+          model: effective.model ?? 'unknown',
+          input: usage.inputTokens, cached: usage.cachedInputTokens ?? 0, cacheReported: usage.cachedInputTokens !== undefined, output: usage.outputTokens ?? 0,
+        })
+      },
+      report: (report) => {
+        if (report.kind === 'failed') console.error(`web: compaction candidate failed for ${report.sessionId}: ${report.reason}`)
+      },
+    })
+    : undefined
+
+  /** The identity a snapshot must have been built for, from what the server holds right now. */
+  const compactionIdentity = (entry: SessionEntry, prefixHash: string): SnapshotIdentity => {
+    const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
+    const { mode, revision } = rootModeOf({ sessionId: entry.session.id }, entry.workspaceId)
+    return identityOf({
+      provider: effective.provider ?? '',
+      model: effective.model ?? '',
+      thinkingLevel: effective.thinkingLevel ?? undefined,
+      modeId: mode.definition.id,
+      modeRevision: revision,
+      grants: effectiveGrants(entry.session.id, entry.projectId, entry.workspaceId),
+      providerGeneration: 1,
+    }, prefixHash)
+  }
+
+  /**
+   * The window a checkpoint is about to leave. Only a `compact` history reads
+   * checkpoints, and only a measured request gives a baseline. The window size is
+   * the provider's prompt count when it reported one (what the meter shows), moved
+   * by the estimated change the new checkpoint makes against the one standing now.
+   */
+  const measureCheckpoint = (
+    entry: SessionEntry,
+    next: { readonly summary: string; readonly coversSeq: number },
+    standing: { readonly summary: string; readonly coversSeq: number } | undefined,
+    loaded?: Parameters<typeof estimateConversationTokens>[0]['attachments'],
+    restoredTokens = 0,
+  ): { tokensBefore: number; tokensAfter: number } | undefined => {
+    if (rootModeOf({ sessionId: entry.session.id }, entry.workspaceId).mode.definition.sources.history !== 'compact') return undefined
+    const manifest = lastManifests.get(entry.session.id)
+    if (manifest === undefined) return undefined
+    const tokensBefore = sessionUsage.get(entry.session.id)?.last?.inputTokens ?? manifest.budget.usedTokens
+    const shared = { events: entry.session.events, compactionRetainTokens: limits.compactionRetainTokens, ...(loaded !== undefined ? { attachments: loaded } : {}) }
+    const was = estimateConversationTokens({ ...shared, ...(standing !== undefined ? { compaction: standing } : {}) })
+    const now = estimateConversationTokens({ ...shared, compaction: next })
+    // Negative only on a tiny conversation: the summary plus the bounded
+    // retained messages can outweigh the history they replace.
+    // The restoration rides in the next request beside the summary, so the window
+    // it leaves includes it.
+    const saved = was - now - restoredTokens
+    const tokensAfter = Math.max(0, tokensBefore - saved)
+    // The meter reads the newest manifest, which still describes the
+    // pre-compaction request. Rewrite it BEFORE the end event is
+    // appended so the refetch that event triggers sees the new size:
+    // the next real request replaces this estimate.
+    const { last: _stale, ...totals } = sessionUsage.get(entry.session.id) ?? { cacheableInputTokens: 0, cachedInputTokens: 0 }
+    void _stale
+    sessionUsage.set(entry.session.id, totals)
+    lastManifests.set(entry.session.id, {
+      ...manifest,
+      budget: { ...manifest.budget, usedTokens: tokensAfter, estimated: true },
+      breakdown: { ...manifest.breakdown, messages: Math.max(0, manifest.breakdown.messages - saved) },
+    })
+    return { tokensBefore, tokensAfter }
+  }
+
+  /**
+   * Foreground effective compaction for one session. The host decides the source
+   * and runs the single handoff request; this wires it to what only the server
+   * knows (providers, grants, hooks, the proven legacy fold, usage and meter).
+   */
+  const effectiveCompaction = async (entry: SessionEntry, trigger: 'manual' | 'automatic', signal: AbortSignal, request?: { readonly recovery?: RecoveryConfirmation }): Promise<{ coversSeq: number; summary: string; path?: string; recovery?: RecoveryConfirmation }> => {
+    const sessionId = entry.session.id
+    let host = compactionHosts.get(sessionId)
+    if (host === undefined) {
+      const hostRef: { current?: CompactionHost } = {}
+      host = new CompactionHost({
+        session: () => entry.session,
+        checkpoints,
+        snapshotStore,
+        stream: (modelRequest, streamOptions) => agentScope.exit(() => kernel.ctx.llm.stream(modelRequest, {
+          ...streamOptions,
+          attribution: { sessionId, turnId: `compaction:${sessionId}`, stepId: randomUUID() },
+        })),
+        exactSnapshot: () => captures.snapshotOf(sessionId),
+        reconstruct: () => undefined,
+        identity: () => compactionIdentity(entry, captures.snapshotOf(sessionId)?.identity.prefixHash ?? ''),
+        hasModel: () => summarizerModelOf(entry.session) !== undefined,
+        preCompact: (hookTrigger, hookSignal) => runPreCompactHooks(entry.session, entry.workspaceId, hookSignal, hookTrigger),
+        legacyCompact: async (legacyTrigger, legacySignal) => {
+          const checkpoint = await legacyBody(entry, legacyTrigger, legacySignal)
+          return { coversSeq: checkpoint.coversSeq, summary: checkpoint.summary }
+        },
+        limits,
+        ...(candidates !== undefined ? { candidates } : {}),
+        contextWindowTokens: () => {
+          const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
+          return effective.model === null || effective.model === undefined ? undefined : resolveContextLimit(effective.model)
+        },
+        measure: (next, standing, restoredTokens) => measureCheckpoint(entry, next, standing, undefined, restoredTokens),
+        // The session's folder grant as it is NOW (not when the work was done), so a folder
+        // revoked since is never read back into context.
+        restore: async (cutoff, restoreSignal) => {
+          const grant = agentScope.run(
+            { sessionId, rootSessionId: sessionId, workspaceId: entry.workspaceId, ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}) },
+            () => kernel.ctx.tools.currentGrant(),
+          )
+          const restored = await buildRestoration({ events: entry.session.committedEvents, cutoff, exec: grant, signal: restoreSignal })
+          return restored === undefined ? undefined : { body: restored.text, tokens: restored.tokens, sections: restored.sections }
+        },
+        progress: (stage) => { void appendJob(entry, { stage }) },
+        recordUsage: (usage) => {
+          const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
+          usageLog.record({
+            at: Date.now(), startedAt: Date.now(), workspaceId: entry.workspaceId, sessionId, rootSessionId: sessionId, kind: 'compaction',
+            ...(effective.provider !== null && effective.provider !== undefined ? { provider: effective.provider } : {}),
+            model: effective.model ?? 'unknown',
+            input: usage.inputTokens, cached: usage.cachedInputTokens ?? 0, cacheReported: usage.cachedInputTokens !== undefined, output: usage.outputTokens ?? 0,
+          })
+        },
+      })
+      hostRef.current = host
+      compactionHosts.set(sessionId, host)
+    }
+    // After a restart the in-memory capture is gone. Reload the snapshot the log's newest
+    // reference names; the store re-checks its hash and re-validates it against the log, and
+    // a missing or stale one simply leaves the host to ask for recovery.
+    if (captures.snapshotOf(sessionId) === undefined) {
+      const reloaded = await loadReferencedSnapshot(snapshotStore, sessionId, entry.session.committedEvents).catch(() => undefined)
+      if (reloaded !== undefined) captures.keep(sessionId, reloaded)
+    }
+    signal.throwIfAborted()
+    const outcome = await host.compact({ trigger, signal, ...(request?.recovery !== undefined ? { recovery: request.recovery } : {}) })
+    if (outcome.kind === 'noop') {
+      const standing = await checkpoints.latest(sessionId, entry.session.committedEvents)
+      if (standing === undefined) throw new Error('nothing to compact')
+      return { coversSeq: standing.coversSeq, summary: standing.summary }
+    }
+    if (outcome.kind === 'recovery-required') throw new CompactionRecoveryRequired(outcome.confirmation)
+    return { coversSeq: outcome.coversSeq, summary: outcome.summary, path: outcome.path }
+  }
+
+  /**
+   * The proven raw-transcript fold, unchanged: seed from the latest canonical
+   * checkpoint, delta attachments, bounded per-chunk retry, cache-aware prefix,
+   * extractive fallback. The caller has already run PreCompact.
+   */
+  const legacyBody = async (entry: SessionEntry, trigger: 'manual' | 'automatic', signal: AbortSignal): Promise<CompactionCheckpoint> => {
+    {
+      {
         // Incremental fold: seed from the latest valid canonical checkpoint so
         // only the uncovered delta is summarized, never the covered prefix —
         // and only the delta's attachments need loading.
@@ -1409,49 +1702,75 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
           trigger, signal, ...(pair !== undefined ? { model: pair.model } : { extractiveCap: MAX_COMPACTION_SUMMARY_CHARS }),
           ...(loaded !== undefined ? { attachments: loaded } : {}),
           ...(seed !== undefined ? { seed } : {}),
-          measure: (next) => {
-            // Only a `compact` history reads checkpoints, and only a measured
-            // request gives a baseline. The window size is the provider's
-            // prompt count when it reported one (what the meter shows), moved
-            // by the estimated change the new checkpoint makes.
-            if (rootModeOf({ sessionId: entry.session.id }, entry.workspaceId).mode.definition.sources.history !== 'compact') return undefined
-            const manifest = lastManifests.get(entry.session.id)
-            if (manifest === undefined) return undefined
-            const tokensBefore = sessionUsage.get(entry.session.id)?.last?.inputTokens ?? manifest.budget.usedTokens
-            const events = entry.session.events
-            const shared = { events, compactionRetainTokens: limits.compactionRetainTokens, ...(loaded !== undefined ? { attachments: loaded } : {}) }
-            const was = estimateConversationTokens({ ...shared, ...(seed !== undefined ? { compaction: seed } : {}) })
-            const now = estimateConversationTokens({ ...shared, compaction: next })
-            // Negative only on a tiny conversation: the summary plus the bounded
-            // retained messages can outweigh the history they replace.
-            const saved = was - now
-            const tokensAfter = Math.max(0, tokensBefore - saved)
-            // The meter reads the newest manifest, which still describes the
-            // pre-compaction request. Rewrite it BEFORE the end event is
-            // appended so the refetch that event triggers sees the new size:
-            // the next real request replaces this estimate.
-            const { last: _stale, ...totals } = sessionUsage.get(entry.session.id) ?? { cacheableInputTokens: 0, cachedInputTokens: 0 }
-            void _stale
-            sessionUsage.set(entry.session.id, totals)
-            lastManifests.set(entry.session.id, {
-              ...manifest,
-              budget: { ...manifest.budget, usedTokens: tokensAfter, estimated: true },
-              breakdown: { ...manifest.breakdown, messages: Math.max(0, manifest.breakdown.messages - saved) },
-            })
-            return { tokensBefore, tokensAfter }
-          },
+          measure: (next) => measureCheckpoint(entry, next, seed, loaded),
         })
-      } finally {
-        if (compactions.get(entry.session.id) === reservation) compactions.delete(entry.session.id)
-        if (!signal.aborted && !compactionClosing && !entry.closed && depsRef.current !== undefined) {
-          // Automatic runs are awaited by the driver, which drains its own inbox.
-          if (!entry.agent.busy && kernel.ctx.sessions.pendingInputs(entry.session).length > 0) await dispatchInbox(entry, depsRef.current, 'queue')
-        }
       }
-    })
-    reservation.done = done
-    return done
+    }
   }
+
+  /** Aborted when the server closes: a background summary never outlives it. */
+  const candidateLifetime = new AbortController()
+
+  /**
+   * Start a background summary for a freshly promoted snapshot, when precompute is on and it
+   * is worth it: the conversation is under real pressure, there is source beyond the
+   * checkpoint that stands, and the request leaves room for its own answer. Never throws and
+   * never waits; a refusal just means the next compaction summarizes on demand.
+   */
+  const startCandidate = (entry: SessionEntry, snapshot: EffectiveCompactionSnapshot): void => {
+    if (candidates === undefined || compactionClosing || entry.closed) return
+    try {
+      if (rootModeOf({ sessionId: entry.session.id }, entry.workspaceId).mode.definition.sources.history !== 'compact') return
+      const manifest = lastManifests.get(entry.session.id)
+      if (manifest === undefined || manifest.budget.availableTokens <= 0) return
+      const pressure = (manifest.budget.preTrimTokens ?? manifest.budget.usedTokens) / manifest.budget.availableTokens
+      if (pressure < limits.compactionPrecomputePressure) return
+      const standing = recoverCanonicalCheckpoint(entry.session.committedEvents)
+      if (standing !== undefined && standing.coversSeq >= snapshot.cutoff) return
+      const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
+      const window = effective.model === null || effective.model === undefined ? undefined : resolveContextLimit(effective.model)
+      assertFitsWindow(snapshot, { ...(window !== undefined ? { contextWindowTokens: window } : {}), outputTokens: limits.compactionOutputTokens })
+      candidates.start(snapshot, candidateLifetime.signal)
+    } catch {
+      // Too large to summarize in one request, or the session is going away: not a candidate.
+    }
+  }
+
+  // A completed turn's last clean request becomes a persisted snapshot. This runs
+  // after `turn/end` is durable (agent/turn-settled), never on stream EOF.
+  kernel.ctx.on('agent/turn-settled', async ({ turnId, reason }) => {
+    if (!limits.compactionEffectiveEnabled || reason !== 'completed' || compactionClosing) return
+    const scope = agentScope.getStore()
+    if (scope?.sessionId === undefined || scope.childOf !== undefined) return
+    const entry = sessions.get(scope.sessionId)
+    if (entry === undefined || entry.closed) return
+    const pending = captures.cleanFor(scope.sessionId, turnId)
+    if (pending === undefined) return
+    try {
+      const events = entry.session.committedEvents
+      const answer = events.findLast((event) => event.type === 'assistant/message' && event.toolCalls === undefined)
+      if (answer?.type !== 'assistant/message') return
+      const snapshot = await promoteCapture({
+        sessionId: scope.sessionId,
+        events,
+        turnId,
+        pending,
+        finalAnswer: { role: 'assistant', content: answer.content },
+        identity: compactionIdentity(entry, requestPrefixHash({ messages: pending.request.messages, ...(pending.request.tools !== undefined ? { tools: pending.request.tools } : {}) })),
+        store: snapshotStore,
+      })
+      if (snapshot === undefined) return
+      // The reference is appended only after the sidecar is on disk.
+      entry.session.append({ type: 'context/snapshot', snapshotId: snapshot.id, hash: snapshotHash(snapshot), cutoff: snapshot.cutoff, schema: 1 })
+      await entry.session.durable()
+      captures.keep(scope.sessionId, snapshot)
+      await snapshotStore.prune(scope.sessionId, new Set([snapshot.id]))
+      startCandidate(entry, snapshot)
+    } catch (error) {
+      // A failed promotion only means compaction will ask for recovery; it never breaks the turn.
+      console.error(`web: snapshot promotion failed for ${scope.sessionId}: ${String(error instanceof Error ? error.message : error)}`)
+    }
+  })
 
   kernel.ctx.on('agent/turn-settled', async ({ turnId, reason }) => {
     if (limits.automaticCompactionPressure <= 0 || reason !== 'completed' || compactionClosing) return
@@ -2994,6 +3313,12 @@ ${entry.description}`.toLowerCase().includes(query))
    */
   const pendingCompactionPrefixes = new Map<SessionId, TurnId>()
   const completedRequests = new Map<SessionId, CompactionPrefix>()
+  /**
+   * Effective compaction (rollout-gated): the exact request of each root step is
+   * captured, and the last clean one of a completed turn becomes a persisted
+   * snapshot. Independent of the legacy `completedRequests` above.
+   */
+  const captures = new CaptureRegistry()
 
   // Tap every scoped completion for its `usage` event: the context meter
   // shows the provider's real prompt size and cache hits, not only the
@@ -3016,12 +3341,16 @@ ${entry.description}`.toLowerCase().includes(query))
     const prefix = armed !== undefined && scope?.childOf === undefined && scope?.turnId === armed
       ? { turnId: armed, request: compactionRequestOf(request) }
       : undefined
+    // Effective capture rides the same stream, but only for a root step that was armed at assembly.
+    const observed = limits.compactionEffectiveEnabled && scope?.childOf === undefined && scope?.turnId !== undefined
+      ? captures.tap(sessionId, scope.turnId, upstream)
+      : upstream
     return (async function* tap() {
       // Some providers report usage more than once; the last report wins.
       let reported: TokenUsage | undefined
       let completed = false
       try {
-        for await (const event of upstream) {
+        for await (const event of observed) {
           if (event.type === 'usage') {
             recordUsage(sessionUsage, sessionId, event.usage)
             reported = event.usage
@@ -3383,6 +3712,10 @@ ${entry.description}`.toLowerCase().includes(query))
         }
         session.append({ type: 'context/manifest', turnId: scope.turnId, manifest: assembled.manifest })
       }
+    }
+    // Arm the effective capture with the request EXACTLY as assembled (root steps only).
+    if (limits.compactionEffectiveEnabled && scope !== undefined && scope.childOf === undefined && scope.turnId !== undefined) {
+      captures.arm(scope.sessionId, scope.turnId, { ...projected, messages: assembled.messages, ...(assembled.tools !== undefined ? { tools: assembled.tools } : {}) }, assembled.compactionProjection)
     }
     // Replace wholesale: when the mode exposes nothing, tools must LEAVE the
     // request — a spread of `projected` would resurrect the full schema list.
@@ -4040,6 +4373,13 @@ ${entry.description}`.toLowerCase().includes(query))
     contextBodies,
     sessionUsage,
     completedRequests,
+    forgetCompactionCapture: async (sessionId) => {
+      captures.forget(sessionId)
+      compactionHosts.get(sessionId)?.cancel()
+      compactionHosts.delete(sessionId)
+      // Abort the background summary and wait until its stream has really ended.
+      await candidates?.invalidate(sessionId, 'session-deleted')
+    },
     usageLog,
     adoptMode,
     stampRootMode,
@@ -4205,6 +4545,7 @@ ${entry.description}`.toLowerCase().includes(query))
       shuttingDown = true
       scheduler.stop()
       compactionClosing = true
+      candidateLifetime.abort(new Error('server closing'))
       for (const sessionId of compactions.keys()) cancelCompaction(sessionId)
       processes.closeAdmission()
       kernel.ctx.agents.closeAdmission()
@@ -4222,6 +4563,7 @@ ${entry.description}`.toLowerCase().includes(query))
         () => agentDrivers.stopAll(),
         async () => { await boundedCleanup(() => backgroundHooks.closeAll()) },
         async () => { await boundedCleanup(async () => { await Promise.allSettled([...compactions.values()].flatMap((reservation) => reservation.done === undefined ? [] : [reservation.done])) }) },
+        async () => { await boundedCleanup(() => candidates?.close() ?? Promise.resolve()) },
         () => processes.disposeAll(),
         async () => { try { await boundedCleanup(() => checkpoints.close()) } catch (error) { teardownSafe = false; throw error } },
         async () => { try { await boundedCleanup(() => processEvents.flushAll()) } catch (error) { teardownSafe = false; throw error } },
@@ -4330,6 +4672,8 @@ interface HandlerDeps {
   readonly contextBodies: Map<SessionId, Set<string>>
   readonly sessionUsage: Map<SessionId, SessionUsage>
   readonly completedRequests: Map<SessionId, CompactionPrefix>
+  /** Drop the effective-compaction capture and host of a deleted session. */
+  readonly forgetCompactionCapture: (sessionId: SessionId) => Promise<void>
   readonly adoptMode: (workspaceId: WorkspaceId, modeId: string) => Promise<ResolvedMode>
   readonly stampRootMode: (session: Session, resolved: ResolvedMode) => Extract<SessionEvent, { type: 'session/mode' }>
   readonly rootModeOf: (scope: { readonly sessionId: SessionId; readonly rootSessionId?: SessionId }, workspaceId: WorkspaceId) => { mode: ResolvedMode; revision: number }
@@ -4366,7 +4710,7 @@ interface HandlerDeps {
   readonly runPreCompactHooks: (session: Session, workspaceId: WorkspaceId) => Promise<string | undefined>
   readonly hookHost: HookHost
   readonly backgroundHooks: BackgroundHooks
-  readonly runCompaction: (entry: SessionEntry, trigger: 'manual' | 'automatic') => Promise<{ coversSeq: number; summary: string }>
+  readonly runCompaction: (entry: SessionEntry, trigger: 'manual' | 'automatic', request?: { readonly recovery?: RecoveryConfirmation }) => Promise<{ coversSeq: number; summary: string; path?: string }>
   readonly cancelCompaction: (sessionId: SessionId) => void
   readonly compactionPending: (sessionId: SessionId) => boolean
   readonly settleCompaction: (sessionId: SessionId) => Promise<void>
@@ -7120,15 +7464,34 @@ async function handleApi(
         return
       }
       try {
+        // An optional body carries the fingerprint of a confirmed recovery; an empty POST is the plain request.
+        let recovery: RecoveryConfirmation | undefined
+        const body = await readJson(req).catch(() => ({} as Record<string, unknown>))
+        const echoed = body['recovery'] as Partial<RecoveryConfirmation> | undefined
+        if (echoed !== undefined && echoed !== null && typeof echoed === 'object') {
+          if (!Number.isSafeInteger(echoed.cutoff) || typeof echoed.sourceDigest !== 'string' || !Number.isSafeInteger(echoed.estimatedCalls)) {
+            send(400, { error: 'recovery must carry cutoff, sourceDigest and estimatedCalls' })
+            return
+          }
+          recovery = { cutoff: echoed.cutoff!, sourceDigest: echoed.sourceDigest, estimatedCalls: echoed.estimatedCalls! }
+        }
         const lastSeqBefore = entry.session.events.at(-1)?.seq ?? 0
-        const checkpoint = await deps.runCompaction(entry, 'manual')
+        const checkpoint = await deps.runCompaction(entry, 'manual', recovery !== undefined ? { recovery } : undefined)
         // An unchanged boundary is a no-op with no new end event: report no figures.
         const end = entry.session.events.findLast((event) => event.type === 'compaction/end' && event.seq > lastSeqBefore)
         const measured = end?.type === 'compaction/end' && end.tokensBefore !== undefined && end.tokensAfter !== undefined
           ? { tokensBefore: end.tokensBefore, tokensAfter: end.tokensAfter }
           : {}
-        send(200, { coversSeq: checkpoint.coversSeq, summaryChars: checkpoint.summary.length, ...measured })
+        send(200, { coversSeq: checkpoint.coversSeq, summaryChars: checkpoint.summary.length, ...measured, ...(checkpoint.path !== undefined ? { path: checkpoint.path } : {}) })
       } catch (error) {
+        if (error instanceof CompactionRecoveryRequired) {
+          send(409, { error: error.message, recovery: error.confirmation })
+          return
+        }
+        if (error instanceof CompactionCancelled) {
+          send(409, { error: 'compaction was cancelled', cancelled: true })
+          return
+        }
         send(409, { error: String(error instanceof Error ? error.message : error) })
       }
       return
@@ -9467,6 +9830,7 @@ async function forgetSessionState(sessionId: SessionId, deps: HandlerDeps): Prom
   deps.contextBodies.delete(sessionId)
   deps.sessionUsage.delete(sessionId)
   deps.completedRequests.delete(sessionId)
+  await deps.forgetCompactionCapture(sessionId)
   deps.prefixSnapshots.delete(sessionId)
   for (const childId of await deps.childExecutor.forgetRoot(sessionId)) {
     deps.lastManifests.delete(childId)
@@ -9854,6 +10218,18 @@ async function readBytes(req: IncomingMessage, maxBytes: number): Promise<Buffer
 }
 
 /**
+ * What a browser needs from a restoration is what happened to each piece of state
+ * (`sections`), not the restored text: that is up to 25k tokens of file and skill
+ * contents the log already holds for the model, and a fresh connection would
+ * otherwise replay it in full.
+ */
+function withoutRestorationText(event: Extract<SessionEvent, { type: 'compaction/restoration' }>): SessionEvent {
+  const { body: _body, ...rest } = event
+  void _body
+  return rest as unknown as SessionEvent
+}
+
+/**
  * The replay profile a fresh SSE client needs: `context/body` payloads (fetched
  * on demand by hash) are dropped, content chunks of steps that later carry a
  * durable `assistant/message` are dropped, and reasoning chunks fold to one
@@ -9873,6 +10249,10 @@ function compactReplayEvents(events: readonly SessionEvent[]): SessionEvent[] {
   const folded = new Map<string, number>()
   for (const event of events) {
     if (event.type === 'context/body') continue
+    if (event.type === 'compaction/restoration') {
+      compacted.push(withoutRestorationText(event))
+      continue
+    }
     if (event.type === 'assistant/chunk' && event.stepId !== undefined) {
       if (event.thinking !== true && (finalizedSteps.has(event.stepId) || abandonedSteps.has(event.stepId))) continue
       if (event.thinking === true) {
@@ -10111,7 +10491,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   })
 
   const disposeSession = deps.kernel.ctx.on('session/event', (emitter, event) => {
-    if (emitter.id === session.id && event.type !== 'context/body') streamFrame({ kind: 'session', event }, event.seq)
+    if (emitter.id === session.id && event.type !== 'context/body') streamFrame({ kind: 'session', event: event.type === 'compaction/restoration' ? withoutRestorationText(event) : event }, event.seq)
   })
   const disposeApproval = deps.kernel.ctx.on('web/approval', (payload) => {
     if (payload.sessionId === session.id || payload.parentSessionId === session.id) {

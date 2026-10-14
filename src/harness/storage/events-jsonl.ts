@@ -68,7 +68,18 @@ function validateRecord(parsed: unknown, filePath: string, lineNumber: number): 
       throw new SessionLogError('schema', `line ${lineNumber} has an invalid attempt fact`, filePath, lineNumber)
     }
   }
+  if (record['type'] === 'context/snapshot' && !validSnapshotReference(record)) {
+    throw new SessionLogError('schema', `line ${lineNumber} has an invalid snapshot reference`, filePath, lineNumber)
+  }
   return record as unknown as SessionEvent
+}
+
+/** The reference names a sidecar file, so the id must be a plain token and the hash a sha256. */
+function validSnapshotReference(record: Record<string, unknown>): boolean {
+  return typeof record['snapshotId'] === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(record['snapshotId'])
+    && typeof record['hash'] === 'string' && /^[0-9a-f]{64}$/.test(record['hash'])
+    && Number.isSafeInteger(record['cutoff']) && (record['cutoff'] as number) > 0
+    && record['schema'] === 1
 }
 
 /** Validate only the new vocabulary; historical event payloads keep their reader contract. */

@@ -11,6 +11,8 @@ export interface ToolCall {
 
 export type McpOutcome = 'success' | 'error' | 'indeterminate' | 'audit_fault'
 export type InputOutcome = 'admitted' | 'rejected' | 'empty' | 'withdrawn'
+/** How a `compaction/job` ended (the same `outcome` key, on that event type only). */
+export type CompactionOutcome = 'compacted' | 'noop' | 'needs-recovery' | 'cancelled' | 'failed'
 
 const MCP_OUTCOMES: ReadonlySet<string> = new Set<McpOutcome>(['success', 'error', 'indeterminate', 'audit_fault'])
 /** Narrows the shared `outcome` key to a tool-result outcome. */
@@ -50,7 +52,7 @@ export interface SseEvent {
    * `admitted`, or `rejected`/`empty` (never logged as a user/message), or
    * `withdrawn` (the user deleted it from the queue).
    */
-  readonly outcome?: McpOutcome | InputOutcome
+  readonly outcome?: McpOutcome | InputOutcome | CompactionOutcome
   /** MCP invocation id. A manual repeat is a new invocation. */
   readonly invocationId?: string
   /** Durable input acceptance. */
@@ -124,6 +126,12 @@ export interface SseEvent {
   readonly summary?: string
   /** Set on a failed compaction/end. */
   readonly error?: string
+  /** Compaction progress (compaction/job): where the operation is; how it ended is `outcome`. */
+  readonly stage?: 'preparing' | 'generating' | 'applying' | 'ended'
+  /** compaction/job: how the summary was made. */
+  readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'
+  /** compaction/restoration: what happened to each restored item (never the restored text). */
+  readonly sections?: readonly { readonly kind: 'todo' | 'runtime' | 'skill' | 'file'; readonly name: string; readonly status: 'included' | 'truncated' | 'reference' | 'missing' | 'denied'; readonly tokens: number }[]
   /** Background-process lifecycle (process/start, process/exit). */
   readonly processId?: string
   readonly command?: string

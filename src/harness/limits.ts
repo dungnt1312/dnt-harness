@@ -60,6 +60,21 @@ export interface HarnessLimits {
   readonly maxAttachmentsPerMessage: number
   /** Model-visible cap for one inlined text attachment. */
   readonly attachmentTextLimit: number
+  /**
+   * Rollout switch: compact the effective context (one structured summary)
+   * instead of folding the raw transcript. Off keeps the legacy path.
+   */
+  readonly compactionEffectiveEnabled: boolean
+  /** Rollout switch: summarize in the background and adopt the result later. Needs the effective path. */
+  readonly compactionPrecomputeEnabled: boolean
+  /** Fraction of the USABLE request budget at which background compaction starts (0 < x ≤ 1). */
+  readonly compactionPrecomputePressure: number
+  /** One deadline for a whole compaction summary operation: queue, transport, backoff, re-ask. */
+  readonly compactionDeadlineMs: number
+  /** Output-token budget asked for a compaction summary; the 24k-character cap stays authoritative. */
+  readonly compactionOutputTokens: number
+  /** How long an explicit compaction waits for a pending background summary before taking over; 0 never waits. */
+  readonly compactionCandidateWaitMs: number
 }
 
 export const DEFAULT_LIMITS: HarnessLimits = {
@@ -82,19 +97,39 @@ export const DEFAULT_LIMITS: HarnessLimits = {
   maxAttachmentBytes: 10 * 1024 * 1024,
   maxAttachmentsPerMessage: 10,
   attachmentTextLimit: 60_000,
+  compactionEffectiveEnabled: false,
+  compactionPrecomputeEnabled: false,
+  compactionPrecomputePressure: 0.65,
+  compactionDeadlineMs: 180_000,
+  compactionOutputTokens: 8_000,
+  compactionCandidateWaitMs: 15_000,
 }
+
+const BOOLEAN_LIMITS: ReadonlySet<keyof HarnessLimits> = new Set(['compactionEffectiveEnabled', 'compactionPrecomputeEnabled'])
+const INTEGER_LIMITS: ReadonlySet<string> = new Set([
+  'streamFirstEventMs', 'streamIdleMs', 'logicalRequestMs', 'stepRetries', 'stepRetryBaseMs', 'compactionRetainTokens', 'readOnlyToolConcurrency',
+  'compactionDeadlineMs', 'compactionOutputTokens', 'compactionCandidateWaitMs',
+])
+const ZERO_CAPABLE_LIMITS: ReadonlySet<string> = new Set(['compactionRetainTokens', 'automaticCompactionPressure', 'compactionCandidateWaitMs'])
 
 /** Merge overrides; invalid request durations/counts (including fractions) use defaults. */
 export function resolveLimits(partial?: Partial<HarnessLimits>): HarnessLimits {
   if (partial === undefined) return DEFAULT_LIMITS
-  const merged = { ...DEFAULT_LIMITS }
-  for (const key of Object.keys(merged) as (keyof HarnessLimits)[]) {
+  const merged: Record<string, number | boolean> = { ...DEFAULT_LIMITS }
+  for (const key of Object.keys(DEFAULT_LIMITS) as (keyof HarnessLimits)[]) {
     const value = partial[key]
-    const integerRequestLimit = ['streamFirstEventMs', 'streamIdleMs', 'logicalRequestMs', 'stepRetries', 'stepRetryBaseMs', 'compactionRetainTokens', 'readOnlyToolConcurrency'].includes(key)
-    const zeroCapable = key === 'compactionRetainTokens' || key === 'automaticCompactionPressure'
-    if (typeof value === 'number' && Number.isFinite(value) && (!integerRequestLimit || Number.isSafeInteger(value)) && (zeroCapable ? value >= 0 : value > 0) && value <= MAX_TIMER_MS) {
+    if (BOOLEAN_LIMITS.has(key)) {
+      if (typeof value === 'boolean') merged[key] = value
+      continue
+    }
+    if (key === 'compactionPrecomputePressure') {
+      if (typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1) merged[key] = value
+      continue
+    }
+    const zeroCapable = ZERO_CAPABLE_LIMITS.has(key)
+    if (typeof value === 'number' && Number.isFinite(value) && (!INTEGER_LIMITS.has(key) || Number.isSafeInteger(value)) && (zeroCapable ? value >= 0 : value > 0) && value <= MAX_TIMER_MS) {
       merged[key] = value
     }
   }
-  return merged
+  return merged as unknown as HarnessLimits
 }

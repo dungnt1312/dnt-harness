@@ -1,0 +1,40 @@
+{
+  "description": "Sanitized synthetic session used by tests/web/compaction-benchmark.spec.ts. Nothing here comes from a real conversation. Each fact is a short unique marker so a test can ask 'did it reach the model / the checkpoint' without depending on wording. `padChars` of filler follows each assistant answer to stand in for tool output, so the raw log is large enough to need many chunks. shot-login.png is only a text reference to a media file; no image is attached.",
+  "turns": [
+    {
+      "user": "Ràng buộc: chỉ trả lời bằng tiếng Việt; tuyệt đối không sửa thư mục src/legacy/; KHÔNG commit, không push.",
+      "assistant": "Đã ghi nhận ràng buộc CONSTRAINT-VI-7 (tiếng Việt), FORBIDDEN-PATH-src/legacy, NO-COMMIT-NO-PUSH.",
+      "padChars": 300000
+    },
+    {
+      "user": "Chạy bộ test của gói auth.",
+      "assistant": "FAILED-TEST: auth/session-refresh.spec.ts > rotates the token — 1 failed, 41 passed. Nguyên nhân: đồng hồ giả không được khôi phục.",
+      "padChars": 300000
+    },
+    {
+      "user": "Thử cách thêm cache vào refresh token xem.",
+      "assistant": "RULED-OUT: cache token trong bộ nhớ bị loại vì hai tiến trình dùng chung phiên và sẽ trả token cũ. Không thử lại hướng này.",
+      "padChars": 300000
+    },
+    {
+      "user": "Sửa test hỏng bằng cách khôi phục đồng hồ giả trong afterEach.",
+      "assistant": "VERIFIED-DONE: đã sửa auth/session-refresh.spec.ts, chạy lại 42/42 pass (commit chưa tạo theo ràng buộc).",
+      "padChars": 300000
+    },
+    {
+      "user": "Việc còn lại: viết tài liệu cho luồng refresh và chụp màn hình trang đăng nhập (ảnh đính kèm shot-login.png).",
+      "assistant": "PENDING-WORK: (1) tài liệu luồng refresh trong docs/auth.md, (2) so sánh với ảnh shot-login.png. Chưa bắt đầu.",
+      "padChars": 300000
+    }
+  ],
+  "facts": [
+    "CONSTRAINT-VI-7",
+    "FORBIDDEN-PATH-src/legacy",
+    "NO-COMMIT-NO-PUSH",
+    "FAILED-TEST: auth/session-refresh.spec.ts",
+    "RULED-OUT: cache token trong bộ nhớ",
+    "VERIFIED-DONE",
+    "PENDING-WORK",
+    "shot-login.png"
+  ]
+}

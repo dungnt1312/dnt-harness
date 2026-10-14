@@ -845,6 +845,44 @@ describe('sessions service over files', () => {
   })
 })
 
+describe('context/snapshot reference event', () => {
+  it('round-trips through the durable log and never reaches the model projection', async () => {
+    const { deriveMessages } = await import('dnt-harness')
+    const store = new FileSessionStore({ dir: await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-snapshot-ref-')) })
+    await store.init()
+    const id = 'session-snapshot-ref' as SessionId
+    await store.replace(id, [])
+    const stamp = { v: 1, timestamp: 1_700_000_000_000 }
+    const rows = [
+      { seq: 1, type: 'user/message', turnId: 't1', content: 'hi' },
+      { seq: 2, type: 'assistant/message', stepId: 's1', content: 'yo' },
+      { seq: 3, type: 'context/snapshot', snapshotId: '11111111-1111-4111-8111-111111111111', hash: 'a'.repeat(64), cutoff: 2, schema: 1 },
+    ] as unknown as SessionEvent[]
+    for (const row of rows) await store.append(id, { ...stamp, ...row } as unknown as SessionEvent)
+    await store.flush(id)
+    const read = await store.read(id)
+    expect(read.events.map((event) => event.type)).toEqual(['user/message', 'assistant/message', 'context/snapshot'])
+    expect(read.events[2]).toMatchObject({ snapshotId: '11111111-1111-4111-8111-111111111111', cutoff: 2, schema: 1 })
+    // The reference is bookkeeping: the model sees only the conversation.
+    expect(deriveMessages(read.events)).toEqual([
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'yo' },
+    ])
+  })
+
+  it('a malformed reference is a schema error, never silently accepted', async () => {
+    const dir = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-snapshot-bad-'))
+    const file = path.join(dir, 'events.jsonl')
+    const bad = [
+      line(1, { type: 'user/message', turnId: 't1', content: 'hi' }),
+      line(2, { type: 'context/snapshot', snapshotId: '../escape', hash: 'x', cutoff: 1, schema: 1 }),
+    ].join('')
+    await fs.writeFile(file, bad)
+    const { readEventLog } = await import('../../src/harness/storage/events-jsonl.ts')
+    await expect(readEventLog(file)).rejects.toThrow(/snapshot reference/)
+  })
+})
+
 describe('poisoned writer', () => {
   it('a storage failure rejects the durability barrier and poisons the session', async () => {
     const kernel = new Kernel()

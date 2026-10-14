@@ -26,6 +26,8 @@ import {
   listWorkspaces,
   listModelAliases,
   compactSession,
+  CompactionCancelled,
+  CompactionRecoveryNeeded,
   renameSessionIn,
   setSessionPinnedIn,
   searchProjectFiles,
@@ -1163,7 +1165,13 @@ function AppShell() {
       const change = compactionTokenChange(result)
       toast.notify(`Compacted${change !== undefined ? ` — ${change}` : ''} (${result.summaryChars} chars summarized through seq ${result.coversSeq}).`, 'ok')
     } catch (cause) {
-      toast.notify(String(cause))
+      // A slow recovery is many model calls: the composer command never confirms it for the
+      // user. The Context panel asks, with the number of calls, and runs it only on approval.
+      // A cancelled compaction is what the user asked for, not an error.
+      if (cause instanceof CompactionCancelled) toast.notify('Compaction cancelled.')
+      else toast.notify(cause instanceof CompactionRecoveryNeeded
+        ? `Compaction needs a slow recovery (about ${cause.recovery.estimatedCalls} model calls). Open the Context panel and choose Compact… to review and approve it.`
+        : String(cause))
     } finally {
       compactingRef.current.delete(current)
     }
@@ -1724,6 +1732,7 @@ function AppShell() {
       sending={sending}
       connected={stream === 'open' || current === null}
       running={running}
+      compacting={derived.compacting}
       onSend={(delivery) => void send(delivery)}
       onCommand={(name) => void runBuiltinCommand(name)}
       onStop={() => void stop()}

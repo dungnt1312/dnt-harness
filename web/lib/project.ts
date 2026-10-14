@@ -119,8 +119,17 @@ export type ViewItem =
   | {
       readonly kind: 'compaction'
       readonly ts?: number
-      /** running: start without end yet; completed/failed: end recorded; interrupted: dangling start the log moved past. */
-      status: 'running' | 'completed' | 'failed' | 'interrupted'
+      /**
+       * running: in progress; completed/failed: canonical end recorded; interrupted: dangling start the log moved past.
+       * cancelled / noop / needs-recovery: the job ended without writing a checkpoint (only a `compaction/job` can say so).
+       */
+      status: 'running' | 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'noop' | 'needs-recovery'
+      /** While running, where the operation is. Absent on legacy logs, which only have start/end. */
+      stage?: 'preparing' | 'generating' | 'applying'
+      /** When the operation began (its first `compaction/job`), for a live elapsed time. */
+      startedAt?: number
+      /** How the summary was made, once it was. */
+      path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'
       trigger?: 'manual' | 'automatic'
       model?: string
       coversSeq?: number
@@ -217,6 +226,19 @@ function retryInputOf(event: SseEvent): RetryInput {
   }
 }
 
+/**
+ * Events that legitimately appear while a compaction runs and say nothing about whether it
+ * finished: its own lifecycle, its hook, its model request, the bookkeeping around the snapshot,
+ * and input the user queues meanwhile. Anything else (a turn, a message) means the log moved on
+ * without the compaction's end.
+ */
+const DURING_COMPACTION: ReadonlySet<string> = new Set([
+  'compaction/job', 'compaction/start', 'compaction/end', 'compaction/restoration',
+  'hook/run', 'model/attempt', 'execution/uncertain', 'execution/reconciled',
+  'context/snapshot', 'context/body', 'context/manifest',
+  'input/queued', 'input/revised', 'input/settled',
+])
+
 /** Project durable events into messages, tool rows, delegations, and status. */
 export function projectItems(events: readonly SseEvent[]): ViewItem[] {
   return [...createProjector().apply(events)]
@@ -287,9 +309,11 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
       // A log that moves on without the open compaction's end means the
       // compaction never finished (crash mid-summarizer); the interrupted
       // label stays honest until a real end corrects it in place.
-      if (openCompaction !== null && openCompaction.status === 'running' && event.type !== 'compaction/end') {
+      if (openCompaction !== null && openCompaction.status === 'running'
+        && (!DURING_COMPACTION.has(event.type) || (event.type === 'compaction/start' && openCompaction.stage === undefined))) {
         touch(openCompaction)
         openCompaction.status = 'interrupted'
+        openCompaction = null
       }
       switch (event.type) {
         case 'model/attempt': {
@@ -684,7 +708,61 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
           add(item)
           break
         }
+        case 'compaction/job': {
+          // One row per operation, from its first stage to its end. The canonical start/end
+          // below attach to it instead of opening a second row.
+          if (event.stage === 'preparing' && openCompaction !== null && openCompaction.status === 'running') {
+            // A new operation began while the last one never ended (a crash left it dangling).
+            touch(openCompaction)
+            openCompaction.status = 'interrupted'
+            delete openCompaction.stage
+            openCompaction = null
+          }
+          if (event.stage === 'preparing' || openCompaction === null) {
+            if (event.stage === 'ended' && openCompaction === null) break
+            const item: Extract<ViewItem, { kind: 'compaction' }> = {
+              kind: 'compaction',
+              ...(event.timestamp !== undefined ? { ts: event.timestamp, startedAt: event.timestamp } : {}),
+              status: 'running',
+              stage: 'preparing',
+              ...(event.trigger !== undefined ? { trigger: event.trigger } : {}),
+            }
+            openCompaction = item
+            add(item)
+            if (event.stage === 'preparing') break
+          }
+          const row = openCompaction
+          if (row === null) break
+          touch(row)
+          if (event.stage === 'generating' || event.stage === 'applying') {
+            row.stage = event.stage
+          } else if (event.stage === 'ended') {
+            // A canonical end already settled the row with the real facts; only a job that ended
+            // without one needs to say how.
+            const unsettled = row.status === 'running'
+            if (unsettled) {
+              row.status = event.outcome === 'failed' ? 'failed'
+                : event.outcome === 'cancelled' ? 'cancelled'
+                  : event.outcome === 'noop' ? 'noop'
+                    : event.outcome === 'needs-recovery' ? 'needs-recovery'
+                      : 'completed'
+            }
+            delete row.stage
+            if (event.path !== undefined) row.path = event.path
+            // The reason belongs to the row only while the row has no outcome of its own.
+            if (unsettled && event.error !== undefined && row.error === undefined) row.error = event.error
+            openCompaction = null
+          }
+          break
+        }
         case 'compaction/start': {
+          // Part of an operation the job already opened: the same row, now with its model.
+          if (openCompaction !== null && openCompaction.status === 'running' && openCompaction.stage !== undefined) {
+            touch(openCompaction)
+            if (event.model !== undefined) openCompaction.model = event.model
+            if (event.trigger !== undefined) openCompaction.trigger = event.trigger
+            break
+          }
           const item: Extract<ViewItem, { kind: 'compaction' }> = {
             kind: 'compaction',
             ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
@@ -710,9 +788,13 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
             if (event.summary !== undefined) item.summary = event.summary
             if (event.error !== undefined) item.error = event.error
           }
-          if (openCompaction !== null) {
+          if (openCompaction !== null && openCompaction.status === 'running') {
+            const jobOwned = openCompaction.stage !== undefined
             patch(openCompaction)
-            openCompaction = null
+            delete openCompaction.stage
+            // A row a job opened stays reachable until the job's own end, which still has to say how
+            // the summary was made; a legacy row has nothing more to wait for.
+            if (!jobOwned) openCompaction = null
             break
           }
           // An end without a surviving start (truncated replay): still the
@@ -812,6 +894,21 @@ export function taskPhase(events: readonly SseEvent[], pendingApprovals = 0, sen
   // a resting state ("held"), not work in progress — no spinner.
   if (queued.size > 0) return phase === 'cancelled' || phase === 'interrupted' ? 'held' : 'preparing'
   return phase
+}
+
+/**
+ * Whether a compaction is in progress: the newest `compaction/job` has not ended and no turn has
+ * begun since (a turn can only start once a compaction is over, so one that did means the job was
+ * left dangling by a crash). A log with no job events — a legacy one — reports false.
+ */
+export function isCompactionRunning(events: readonly SseEvent[]): boolean {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event === undefined) continue
+    if (event.type === 'turn/start') return false
+    if (event.type === 'compaction/job') return event.stage !== 'ended'
+  }
+  return false
 }
 
 export function isTurnRunning(events: readonly SseEvent[]): boolean {
