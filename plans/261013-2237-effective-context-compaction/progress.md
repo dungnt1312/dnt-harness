@@ -49,7 +49,26 @@ Ruling: assessProjection receives final completed-turn assistant evidence at pro
 | 4,6,8 | limits/request lifecycle | optional fields ordinary behavior unchanged |
 | 6,10 | web API | additive success fields, typed failure confirmation |
 
+## Execution change
+
+2026-10-13 23:16 the user stopped SDD and asked for TDD. From then on every task was done inline by the
+controller with `superpowers:test-driven-development` (RED for the right reason, minimal GREEN, mutation
+check). No subagent was dispatched, so the "implement Sonnet 5.5 / hard tasks GPT 6.1 Sol or Opus 5.5" routing
+above never applied to any task.
+
+## Later rulings
+
+Ruling: Bash/BashOutput that succeeded and were read are safe to clear; Write/Edit/MCP/Agent/Skill/AskUserQuestion/TodoWrite and every error result are `unknown` — a lost result of those cannot be recovered from the log alone — costs: a long session that cleared many of them asks for slow recovery. Narrow `SAFE_CLEAR_TOOLS` if wrong.
+Ruling: effective compaction is gated by `compactionEffectiveEnabled` (default false) and precompute by `compactionPrecomputeEnabled` (default false) — rollback is the old fold — costs: the feature does nothing until switched on.
+Ruling: adoption requires the candidate's `seedHash` to equal the standing checkpoint — a summary that never saw the checkpoint would drop what it covers — costs: regenerating a candidate.
+Ruling: after a restart the newest `context/snapshot` reference is reloaded and re-verified; a missing or altered sidecar asks for recovery instead of rebuilding — costs: slow recovery after losing the sidecar; `reconstruct` from the log is not implemented.
+Ruling: `compaction/restoration` is written inside the adoption transaction before the success end and counts only for that end's cutoff and summary — a failed attempt's copy must never reach the model — costs: one more event per compaction.
+Ruling: the browser gets restoration `sections`, never `body` — up to 25k tokens of file text per compaction on every fresh SSE connect — costs: the UI cannot show restored text.
+Ruling: a background candidate runs under its own provider-ownership id (`<session>#candidate`) with `admissionPriority: 'low'` — the LLM service fences a session while one of its requests runs, and a background summary must not block the next chat turn — costs: its transport uncertainty is tracked separately.
+Ruling: a ready candidate that is no longer adoptable (stale or no longer worth it) is replaced by a newer snapshot; a usable one is kept — otherwise it holds the slot forever — costs: at most one summary per session in flight.
+Ruling: `measure`'s `tokensAfter` = provider-reported size − estimated saving of the new checkpoint + restoration; the old flat 20% is gone — costs: still an estimate (the next real request replaces it).
+Ruling: `providerGeneration` is the constant 1 — the provider layer exposes no generation counter — costs: a provider reconfiguration does not invalidate a candidate by itself (model/mode/grants changes do).
+
 ## Tasks
 
-Task 1: in progress — implementer dispatch pending; source policy/projection.
-Tasks 2–10: pending.
+Tasks 1–10: done in the worktree, nothing committed. Evidence and open items: `plans/reports/verification-261014-0821-effective-context-compaction.md`.
