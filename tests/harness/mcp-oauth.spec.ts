@@ -283,6 +283,37 @@ describe('managed oauth client authentication and server records', () => {
     })
   })
 
+  it('keeps insufficient_scope auth_required when an in-flight refresh succeeds', async () => {
+    await withStore(async (store) => {
+      await store.saveTokens('ws', 'remote', expiredTokens())
+      let release!: (response: Response) => void
+      const gate = new Promise<Response>((resolve) => { release = resolve })
+      let entered!: () => void
+      const started = new Promise<void>((resolve) => { entered = resolve })
+      const oauth = new ManagedOAuth(store, (async () => { entered(); return gate }) as typeof fetch)
+      const pending = oauth.refresh('ws', 'remote')
+      await started
+      try {
+        await oauth.markScopeRequired('ws', 'remote', 'write')
+        release(Response.json({ access_token: 'new' }))
+        await expect(pending).resolves.toBeUndefined()
+        expect(await store.readTokens('ws', 'remote')).toMatchObject({ phase: 'auth_required', missingScope: 'write' })
+      } finally { release(Response.json({ access_token: 'new' })); await pending }
+    })
+  })
+
+  it.each(['missing', 'unloadable'] as const)('keeps an active grant when its client secret is %s during refresh', async (kind) => {
+    await withStore(async (store) => {
+      await store.saveTokens('ws', 'remote', { ...expiredTokens(), tokenEndpointAuth: 'client_secret_post' })
+      const oauth = new ManagedOAuth(store, recorder([]), undefined, async () => {
+        if (kind === 'unloadable') throw new Error('secret vault unavailable')
+        return undefined
+      })
+      await expect(oauth.refresh('ws', 'remote')).rejects.toThrow(/secret|vault/)
+      expect(await store.readTokens('ws', 'remote')).toMatchObject({ phase: 'active', accessToken: 'access-old' })
+    })
+  })
+
   it('marks a grant as needing sign-in with the missing scope', async () => {
     await withStore(async (store) => {
       await store.saveTokens('ws', 'remote', { ...expiredTokens(), expiresAt: Date.now() + 3_600_000 })

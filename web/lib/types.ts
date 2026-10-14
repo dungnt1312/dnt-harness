@@ -542,7 +542,7 @@ export interface McpServerRow {
   readonly name: string
   readonly transport: 'stdio' | 'http'
   readonly enabled: boolean
-  readonly status: 'connecting' | 'ready' | 'failed' | 'disabled'
+  readonly status: 'connecting' | 'ready' | 'failed' | 'disabled' | 'idle'
   readonly breakerOpenUntil: number | null
   /** Host containment wording. This is not a sandbox claim. */
   readonly containment?: string

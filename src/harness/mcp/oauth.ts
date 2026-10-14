@@ -13,7 +13,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import type { TokenEndpointAuth } from './config.ts'
 import { assertOutboundUrl, OutboundPolicyError } from './outbound-policy.ts'
-import { OAuthStore, type OAuthTokens } from './oauth-store.ts'
+import { OAuthStore, type OAuthTokens, type OAuthServerRecord } from './oauth-store.ts'
 
 /** Resolves a confidential client's secret for one server, at the moment it is needed. */
 export type ClientSecretSource = (workspaceId: string, server: string) => Promise<string | undefined>
@@ -65,6 +65,8 @@ export interface OAuthBegin {
   readonly scopes: readonly string[]
   /** Defaults to `none` (public client with PKCE). */
   readonly tokenEndpointAuth?: TokenEndpointAuth
+  /** Discovery for a pending Connect; promoted with its tokens only on completion. */
+  readonly serverRecord?: OAuthServerRecord
 }
 
 export class OAuthFlowError extends Error {
@@ -95,6 +97,12 @@ export class ManagedOAuth {
     return this.store.readTokens(workspaceId, server)
   }
 
+  /** Pending transaction identity for a host route validating the current config. */
+  async pendingServer(state: string): Promise<{ readonly serverUrl: string; readonly resource: string } | undefined> {
+    const tx = await this.store.readTransaction(state)
+    return tx?.serverRecord === undefined ? undefined : { serverUrl: tx.serverRecord.serverUrl, resource: tx.resource }
+  }
+
   /**
    * The server answered `insufficient_scope`. Refreshing cannot add scope,
    * so the grant waits for a person to sign in again with `scope` added.
@@ -109,14 +117,17 @@ export class ManagedOAuth {
         phase: 'auth_required',
         ...(scope !== undefined && scope !== '' ? { missingScope: scope } : {}),
       })
+      fence.generation += 1
     })
   }
 
   private async clientAuth(workspaceId: string, server: string, clientId: string, method: TokenEndpointAuth | undefined): Promise<ClientAuth> {
     const resolved = method ?? 'none'
     if (resolved === 'none') return { clientId, method: resolved, secret: undefined }
-    const secret = await this.secretFor(workspaceId, server)
-    if (secret === undefined || secret === '') throw new OAuthFlowError('client secret is not available; add it in Settings → Secrets')
+    let secret: string | undefined
+    try { secret = await this.secretFor(workspaceId, server) }
+    catch (error) { throw new OAuthTemporaryError(`client secret could not be loaded: ${error instanceof Error ? error.message : String(error)}`) }
+    if (secret === undefined || secret === '') throw new OAuthTemporaryError('client secret is not available; add it in Settings → Secrets')
     return { clientId, method: resolved, secret }
   }
 
@@ -142,6 +153,7 @@ export class ManagedOAuth {
       expiresAt: this.now() + 5 * 60_000,
       code: undefined,
       ...(input.tokenEndpointAuth !== undefined ? { tokenEndpointAuth: input.tokenEndpointAuth } : {}),
+      ...(input.serverRecord !== undefined ? { serverRecord: input.serverRecord } : {}),
     })
     const url = new URL(input.authorizationEndpoint)
     url.searchParams.set('response_type', 'code')
@@ -218,6 +230,7 @@ export class ManagedOAuth {
     await serializeWrite(fence, async () => {
       if (fence.generation !== generation) throw new OAuthFlowError('authorization was locally revoked or replaced')
       await this.store.saveTokens(tx.workspaceId, tx.server, { ...tokens, phase: 'active', resource: tx.resource })
+      if (tx.serverRecord !== undefined) await this.store.saveServerRecord(tx.workspaceId, tx.server, tx.serverRecord)
       if (fence.generation !== generation) throw new OAuthFlowError('authorization was locally revoked or replaced')
       // Linearize replacement after persistence, without an intervening await.
       // Refreshes started even during this write belong to the previous grant;

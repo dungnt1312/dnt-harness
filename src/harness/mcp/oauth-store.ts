@@ -59,6 +59,8 @@ export interface OAuthTransaction {
   readonly expiresAt: number
   readonly code: string | undefined
   readonly tokenEndpointAuth?: TokenEndpointAuth
+  /** Discovery awaiting a successful token exchange. */
+  readonly serverRecord?: OAuthServerRecord
 }
 
 export class OAuthStore {

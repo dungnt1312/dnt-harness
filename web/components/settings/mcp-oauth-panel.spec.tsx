@@ -239,6 +239,23 @@ describe('MCP panel OAuth', () => {
     })
   })
 
+  it('keeps Finish sign-in and Cancel after completion fails, then retries', async () => {
+    vi.mocked(listMcpServers).mockResolvedValue([oauthRow('not_connected')] as never)
+    vi.mocked(completeMcpOAuth).mockRejectedValueOnce(new Error('try again'))
+    await render()
+    await act(async () => button('Connect remote').click())
+    await settle()
+    await act(async () => button('Finish sign-in').click())
+    await settle()
+    expect(button('Finish sign-in')).toBeTruthy()
+    expect(button('Cancel')).toBeTruthy()
+    expect(document.body.textContent).toContain('try again')
+    await act(async () => button('Finish sign-in').click())
+    await settle()
+    expect(completeMcpOAuth).toHaveBeenCalledTimes(2)
+    expect(document.body.textContent).toContain('remote is connected')
+  })
+
   it('finishes by hand when the channel message never arrives', async () => {
     vi.mocked(listMcpServers).mockResolvedValue([oauthRow('not_connected')] as never)
     await render()
