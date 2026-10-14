@@ -16,12 +16,14 @@ import {
   type GitStaging,
   type GitStatusReport,
 } from '../../lib/api.ts'
+import { cn } from '../../lib/cn.ts'
 import { GitBranchPicker } from './GitBranchPicker.tsx'
 import { GitChangeList, withPendingStages } from './GitChangeList.tsx'
 import { GitCommitArea } from './GitCommitArea.tsx'
 import { GitDiffPane } from './GitDiffPane.tsx'
 import { GitRemoteButton } from './GitRemoteButton.tsx'
 import { GitSplit, readSplit, writeSplit, type GitSplitState } from './GitSplit.tsx'
+import { GIT_BAR, GIT_BUTTON, GIT_BUTTON_LEFT, GIT_CHEVRON, GIT_ICON, GIT_ICON_TRIGGER } from './git-controls.ts'
 import { readView, writeView, type GitListView } from './git-view.ts'
 import { failureText, useGitOperation } from './use-git-operation.tsx'
 import { changeCounts, confirmationForEntries, groupChanges, primaryChangesActionStages, type GitConfirmation } from './git-panel-model.ts'
@@ -44,7 +46,9 @@ import type { WorkbenchProject } from './Workbench.tsx'
  * rows here stays the user's own. When the focused file no longer differs
  * from HEAD, a note says so instead of an unexplained quiet list.
  */
-export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNonce, onOpenFile, onShowAll, onGitTrustChange }: {
+export function GitPanel({ active = true, workspaceId, project, pathFilter, focusPath, focusNonce, onOpenFile, onShowAll, onGitTrustChange }: {
+  /** False while the view is hidden but kept mounted; showing it again re-reads the status. */
+  readonly active?: boolean
   readonly workspaceId: string
   readonly project: WorkbenchProject
   readonly pathFilter?: readonly string[]
@@ -155,7 +159,8 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
     }
   }, [workspaceId, project.id])
 
-  useEffect(() => { void load() }, [load])
+  // Re-read when the view is shown again; the report stays on screen meanwhile (the spinner is only for the first read).
+  useEffect(() => { if (active) void load() }, [active, load])
 
   /** Run one Git operation; a failure is a toast with a View Log. Nothing is thrown. */
   const run = git.run
@@ -280,17 +285,58 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
     )
     : null
 
+  // How the list is drawn; it sits in the first section's header, on the list it changes.
+  const viewActions = (
+    <>
+      <Menu
+        label="View options"
+        align="end"
+        triggerClassName={GIT_ICON_TRIGGER}
+        trigger={() => <Icon name={view === 'tree' ? 'listTree' : 'list'} size={14} />}
+      >
+        {(close) => (
+          <>
+            {(['list', 'tree'] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                role="menuitemradio"
+                aria-checked={view === mode}
+                className={menuItemClass}
+                onClick={() => { close(); setView(mode) }}
+              >
+                <span className="inline-flex w-4 shrink-0 justify-center">{view === mode ? <Icon name="check" size={13} /> : null}</span>
+                {mode === 'list' ? 'List' : 'Tree'}
+              </button>
+            ))}
+          </>
+        )}
+      </Menu>
+      <IconButton
+        label={split.collapsed ? 'Show Diff' : 'Hide Diff'}
+        className={GIT_ICON}
+        onClick={() => {
+          const next = { ratio: split.ratio, collapsed: !split.collapsed }
+          writeSplit(project.id, next)
+          setSplit(next)
+        }}
+      >
+        <Icon name="panelRight" size={14} />
+      </IconButton>
+    </>
+  )
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       {!trusted ? (
-        <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line bg-muted/40 px-2.5 text-[12px]">
+        <div className={cn(GIT_BAR, 'flex shrink-0 items-center gap-1.5 border-b border-line bg-muted/40 px-2.5 text-[12px]')}>
           <Icon name="lock" size={13} className="shrink-0 text-fg-muted" />
           <span className="min-w-0 flex-1 truncate font-medium text-fg-muted" title="Git does not run this repository's config or hooks until you trust the folder.">Restricted Mode</span>
-          <Button size="sm" variant="outline" className="h-7 px-2.5" disabled={trustBusy} onClick={() => void changeTrust(true)}>Trust</Button>
+          <Button size="sm" variant="outline" className={GIT_BUTTON} disabled={trustBusy} onClick={() => void changeTrust(true)}>Trust</Button>
         </div>
       ) : null}
       {pathFilter !== undefined && pathFilter.length > 0 ? (
-        <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line bg-muted/40 px-2.5 text-[12px]">
+        <div className={cn(GIT_BAR, 'flex shrink-0 items-center gap-1.5 border-b border-line bg-muted/40 px-2.5 text-[12px]')}>
           <Icon name="squarePen" size={13} className="shrink-0 text-fg-muted" />
           <span className="min-w-0 flex-1 truncate text-fg-muted" title="Git compares the working tree with HEAD, so a file's lines include every uncommitted change, not only this turn's.">
             This turn's files · git diff vs HEAD, all uncommitted changes
@@ -306,26 +352,31 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
           ) : null}
         </div>
       ) : null}
-      <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line px-2.5 text-[13px]">
-        <Icon name="gitBranch" size={14} className="shrink-0 text-fg-muted" />
-        <span className="min-w-0 flex-1 truncate font-medium" title={report?.branch ?? project.path}>{report?.branch ?? project.name}</span>
-        {changes.length > 0 ? (
-          <span className="flex shrink-0 items-center gap-1.5 font-mono text-xs">
-            <span className="text-fg-faint">{changes.length}</span>
-            {totals.added > 0 ? <span className="text-ok">+{totals.added}</span> : null}
-            {totals.removed > 0 ? <span className="text-bad">−{totals.removed}</span> : null}
-          </span>
-        ) : null}
-        {running > 0 ? <span role="status" aria-label="Running git operation" className="shrink-0"><Spinner size={12} /></span> : null}
+      <div className={cn(GIT_BAR, 'flex shrink-0 items-center justify-between gap-2 border-b border-line px-2.5 text-[13px]')}>
+        {/* Left: what this is — the branch and its change counts, kept together. */}
+        <div className="flex min-w-0 items-center gap-1.5">
+          <Icon name="gitBranch" size={14} className="shrink-0 text-fg-muted" />
+          <span className="min-w-0 truncate font-medium" title={report?.branch ?? project.path}>{report?.branch ?? project.name}</span>
+          {changes.length > 0 ? (
+            <span className="flex shrink-0 items-center gap-1 font-mono text-xs">
+              <span className="text-fg-faint">{changes.length}</span>
+              {totals.added > 0 ? <span className="text-ok">+{totals.added}</span> : null}
+              {totals.removed > 0 ? <span className="text-bad">−{totals.removed}</span> : null}
+            </span>
+          ) : null}
+          {running > 0 ? <span role="status" aria-label="Running git operation" className="shrink-0"><Spinner size={12} /></span> : null}
+        </div>
+        {/* Right: what can be done — the primary button, then one run of icon controls. */}
+        <div className="flex min-w-0 shrink-0 items-center justify-end gap-1">
         {report !== null && changes.length > 0 ? (
           <div className="flex shrink-0 items-center">
-            <Button size="sm" variant="outline" className="rounded-r-none border-r-0 px-2.5" onClick={() => stageHeader(stages ? 'stage' : 'unstage')}>
+            <Button size="sm" variant="outline" className={GIT_BUTTON_LEFT} onClick={() => stageHeader(stages ? 'stage' : 'unstage')}>
               {stages ? 'Stage All' : 'Unstage All'}
             </Button>
             <Menu
               label="More changes actions"
               align="end"
-              triggerClassName="inline-flex h-8 w-7 shrink-0 items-center justify-center rounded-l-none rounded-r-full border border-line-strong text-fg hover:bg-hover"
+              triggerClassName={GIT_CHEVRON}
               trigger={() => <Icon name="chevron" size={12} />}
             >
               {(close) => (
@@ -339,12 +390,13 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
             </Menu>
           </div>
         ) : null}
+        <IconButton label="Refresh git status" className={GIT_ICON} onClick={() => void load()}><Icon name="refresh" size={14} /></IconButton>
         {/* Not tied to the change list: a clean, trusted project can still be restricted again. */}
         {trusted ? (
           <Menu
             label="Git options"
             align="end"
-            triggerClassName="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-fg-muted hover:bg-hover hover:text-fg"
+            triggerClassName={GIT_ICON_TRIGGER}
             trigger={() => <Icon name="dots" size={14} />}
           >
             {(close) => (
@@ -352,45 +404,7 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
             )}
           </Menu>
         ) : null}
-        {report !== null && changes.length > 0 ? (
-          <Menu
-            label="View options"
-            align="end"
-            triggerClassName="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-fg-muted hover:bg-hover hover:text-fg"
-            trigger={() => <Icon name={view === 'tree' ? 'listTree' : 'list'} size={14} />}
-          >
-            {(close) => (
-              <>
-                {(['list', 'tree'] as const).map((mode) => (
-                  <button
-                    key={mode}
-                    type="button"
-                    role="menuitemradio"
-                    aria-checked={view === mode}
-                    className={menuItemClass}
-                    onClick={() => { close(); setView(mode) }}
-                  >
-                    <span className="inline-flex w-4 shrink-0 justify-center">{view === mode ? <Icon name="check" size={13} /> : null}</span>
-                    {mode === 'list' ? 'List' : 'Tree'}
-                  </button>
-                ))}
-              </>
-            )}
-          </Menu>
-        ) : null}
-        {report !== null && changes.length > 0 ? (
-          <IconButton
-            label={split.collapsed ? 'Show Diff' : 'Hide Diff'}
-            onClick={() => {
-              const next = { ratio: split.ratio, collapsed: !split.collapsed }
-              writeSplit(project.id, next)
-              setSplit(next)
-            }}
-          >
-            <Icon name="panelRight" size={14} />
-          </IconButton>
-        ) : null}
-        <IconButton label="Refresh git status" onClick={() => void load()}><Icon name="refresh" size={14} /></IconButton>
+        </div>
       </div>
       <GitSplit
         projectId={project.id}
@@ -406,7 +420,6 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
               run={run}
               enqueue={enqueue}
               onDone={settleOperation}
-              onStage={(paths, intent) => stage(paths, intent)}
               onReady={onFocusedDiffReady}
               {...(onOpenFile !== undefined ? { onOpenFile: () => onOpenFile(current.path) } : {})}
             />
@@ -437,6 +450,7 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
               <GitChangeList
                 report={report!}
                 visibleChanges={changes}
+                headerActions={viewActions}
                 pendingStages={pendingStages}
                 onStage={(paths, intent) => stage(paths, intent)}
                 onDiscard={(entries) => requestRevert(entries)}
@@ -462,7 +476,7 @@ export function GitPanel({ workspaceId, project, pathFilter, focusPath, focusNon
       {report !== null && !filteredView && (report.branch !== null || report.head !== null) ? (
         <>
           <GitCommitArea key={project.id} workspaceId={workspaceId} projectId={project.id} report={report} changes={shown} run={run} enqueue={enqueue} onDone={settleOperation} />
-          <div role="group" aria-label="Branch" className="flex h-11 shrink-0 items-center gap-1.5 border-t border-line px-2.5 text-[13px]">
+          <div role="group" aria-label="Branch" className="flex h-9 shrink-0 items-center gap-1.5 border-t border-line px-2.5 text-[13px]">
             {report.branchInfo !== null ? (
               <>
                 <GitBranchPicker current={report.branchInfo.name} run={run} enqueue={enqueue} onDone={settleOperation} />

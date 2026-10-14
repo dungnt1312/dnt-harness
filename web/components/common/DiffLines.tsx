@@ -97,6 +97,26 @@ export function diffRowsFromWrite(content: string): readonly DiffRow[] {
   return splitLines(content).map((text, index) => ({ kind: 'add', text, old: null, new: index + 1 }))
 }
 
+export type DiffLayout = 'unified' | 'split'
+
+type SplitEntry = { readonly full: DiffRow } | { readonly left: DiffRow | null; readonly right: DiffRow | null }
+
+/** Side-by-side entries: context on both sides, a removed run paired index-wise with the added run after it. */
+function splitPairs(rows: readonly DiffRow[]): readonly SplitEntry[] {
+  const entries: SplitEntry[] = []
+  for (let i = 0; i < rows.length;) {
+    const row = rows[i]!
+    if (row.kind === 'meta' || row.kind === 'hunk') { entries.push({ full: row }); i++; continue }
+    if (row.kind === 'context') { entries.push({ left: row, right: row }); i++; continue }
+    const dels: DiffRow[] = []
+    const adds: DiffRow[] = []
+    while (rows[i]?.kind === 'del') dels.push(rows[i++]!)
+    while (rows[i]?.kind === 'add') adds.push(rows[i++]!)
+    for (let n = 0; n < Math.max(dels.length, adds.length); n++) entries.push({ left: dels[n] ?? null, right: adds[n] ?? null })
+  }
+  return entries
+}
+
 function lineClass(kind: DiffRowKind): string {
   if (kind === 'add') return 'bg-ok-soft text-ok'
   if (kind === 'del') return 'bg-bad-soft text-bad'
@@ -109,8 +129,34 @@ function lineClass(kind: DiffRowKind): string {
  * the frame and the scrolling. A `hunk` row is drawn by `renderHunk` (its
  * 0-based index among the hunks and its header text), or not at all.
  */
-export function DiffLines({ rows, renderHunk }: { readonly rows: readonly DiffRow[]; readonly renderHunk?: (index: number, header: string) => ReactNode }) {
+export function DiffLines({ rows, renderHunk, layout = 'unified' }: {
+  readonly rows: readonly DiffRow[]
+  readonly renderHunk?: (index: number, header: string) => ReactNode
+  /** `split` puts the old file left and the new one right, a removed run beside the lines that replaced it. */
+  readonly layout?: DiffLayout
+}) {
   let hunkIndex = -1
+  if (layout === 'split') {
+    const cell = (row: DiffRow | null, side: 'old' | 'new', key: string) => (
+      <div key={key} data-kind={row?.kind ?? 'empty'} data-side={side} className={cn('flex min-w-0', side === 'new' && 'border-l border-line', row === null ? 'bg-muted/40' : lineClass(row.kind))}>
+        <span aria-hidden="true" className="w-9 shrink-0 select-none pr-2 text-right text-fg-faint">{row === null ? '' : (side === 'old' ? row.old : row.new) ?? ''}</span>
+        <span className="min-w-0 flex-1 whitespace-pre-wrap break-words pr-2">{row === null || row.text === '' ? ' ' : row.text}</span>
+      </div>
+    )
+    return (
+      // Two equal columns that wrap long lines: the pane never scrolls sideways.
+      <pre className="m-0 grid grid-cols-2 px-0 py-1.5 font-mono text-[12.5px] leading-5">
+        {splitPairs(rows).map((entry, index) => {
+          if ('full' in entry) {
+            if (entry.full.kind !== 'hunk') return <div key={index} data-kind={entry.full.kind} className={cn('col-span-2 whitespace-pre-wrap break-words px-3', lineClass(entry.full.kind))}>{entry.full.text === '' ? ' ' : entry.full.text}</div>
+            hunkIndex++
+            return renderHunk === undefined ? null : <div key={index} data-kind="hunk" data-hunk-index={hunkIndex} className="col-span-2">{renderHunk(hunkIndex, entry.full.text)}</div>
+          }
+          return [cell(entry.left, 'old', `${index}o`), cell(entry.right, 'new', `${index}n`)]
+        })}
+      </pre>
+    )
+  }
   return (
     <pre className="m-0 px-3 py-1.5 font-mono text-[12.5px] leading-5">
       {rows.map((row, index) => {

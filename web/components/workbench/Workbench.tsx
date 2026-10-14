@@ -170,6 +170,10 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
   const openViews = useMemo(() => normalizeInspectorViews(views), [views])
   const activeView = clampInspectorTab(view, openViews)
   const closedViews = VIEW_ORDER.filter((candidate) => !openViews.includes(candidate))
+  // Set during render (not in an effect) so the first Git visit mounts the panel in the same commit.
+  const [gitVisited, setGitVisited] = useState(false)
+  if (activeView === 'git' && !gitVisited) setGitVisited(true)
+  const gitKept = gitVisited && openViews.includes('git')
   // Delegation lands in the root's own log, whether the user or the model
   // started it: the Subagents view refreshes off that traffic and reads each
   // child's brief from it. While a child is open that log is the parent's,
@@ -239,25 +243,14 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
     body = <div className="min-h-0 flex-1 overflow-y-auto p-4"><ContextPanel {...context} /></div>
   } else if (activeView === 'trajectory') {
     body = <TrajectoryPanel events={events} workspaceId={workspaceId} sessionId={sessionId} {...(openPath !== undefined ? { openPath } : {})} />
-  } else if (activeView === 'git') {
-    body = project !== null && workspaceId !== null
-      ? <GitPanel
-          key={project.id}
-          workspaceId={workspaceId}
-          project={project}
-          {...(gitPathFilter !== null && gitPathFilter.length > 0 ? { pathFilter: gitPathFilter } : {})}
-          {...(gitFocusPath !== null ? { focusPath: gitFocusPath.path, focusNonce: gitFocusPath.nonce } : {})}
-          {...(openPath !== undefined ? { onOpenFile: (path: string) => { openPath(`${project.path}/${path}`)?.() } } : {})}
-          {...(onClearGitFilter !== undefined ? { onShowAll: onClearGitFilter } : {})}
-          {...(onGitTrustChange !== undefined ? { onGitTrustChange: (trusted: boolean) => onGitTrustChange(project.id, trusted) } : {})}
-        />
-      : (
-        <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
-          <Icon name="gitBranch" size={22} className="text-fg-faint" />
-          <p className="m-0 text-sm font-medium">No project folder for this conversation</p>
-          <p className="m-0 max-w-xs text-[13px] text-fg-muted">Start a conversation in a project to see its git changes here.</p>
-        </div>
-      )
+  } else if (activeView === 'git' && (project === null || workspaceId === null)) {
+    body = (
+      <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
+        <Icon name="gitBranch" size={22} className="text-fg-faint" />
+        <p className="m-0 text-sm font-medium">No project folder for this conversation</p>
+        <p className="m-0 max-w-xs text-[13px] text-fg-muted">Start a conversation in a project to see its git changes here.</p>
+      </div>
+    )
   } else if (activeView === 'agents') {
     body = (
       <AgentRunsPanel
@@ -366,7 +359,25 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
           })}
         </div>
       ) : null}
-      <div className="flex min-h-0 flex-1 flex-col">{body}</div>
+      <div className="flex min-h-0 flex-1 flex-col">
+        {body}
+        {/* Stays mounted (hidden) once opened, so leaving for a file and coming back keeps the review position. */}
+        {gitKept && project !== null && workspaceId !== null ? (
+          <div className={cn('min-h-0 flex-1 flex-col', activeView === 'git' ? 'flex' : 'hidden')}>
+            <GitPanel
+              key={project.id}
+              active={activeView === 'git'}
+              workspaceId={workspaceId}
+              project={project}
+              {...(gitPathFilter !== null && gitPathFilter.length > 0 ? { pathFilter: gitPathFilter } : {})}
+              {...(gitFocusPath !== null ? { focusPath: gitFocusPath.path, focusNonce: gitFocusPath.nonce } : {})}
+              {...(openPath !== undefined ? { onOpenFile: (path: string) => { openPath(`${project.path}/${path}`)?.() } } : {})}
+              {...(onClearGitFilter !== undefined ? { onShowAll: onClearGitFilter } : {})}
+              {...(onGitTrustChange !== undefined ? { onGitTrustChange: (trusted: boolean) => onGitTrustChange(project.id, trusted) } : {})}
+            />
+          </div>
+        ) : null}
+      </div>
       {filesShowing ? (
         <QuickOpen
           open={quickOpen}

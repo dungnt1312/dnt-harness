@@ -6,6 +6,8 @@ import { Button } from '../ui/Button.tsx'
 import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import { Modal } from '../ui/Modal.tsx'
 import type { GitBranchInfo, GitOperationDone } from '../../lib/api.ts'
+import { cn } from '../../lib/cn.ts'
+import { GIT_BUTTON_LEFT, GIT_CHEVRON } from './git-controls.ts'
 import { remoteButton } from './git-panel-model.ts'
 import type { GitRun } from './use-git-operation.tsx'
 
@@ -154,7 +156,7 @@ export function GitRemoteButton({ branchInfo, run, onDone }: {
           <Button
             size="sm"
             variant="outline"
-            className="rounded-r-none border-r-0 px-2.5"
+            className={GIT_BUTTON_LEFT}
             disabled={pending !== null}
             title={tooltip}
             onClick={mainClick}
@@ -170,7 +172,7 @@ export function GitRemoteButton({ branchInfo, run, onDone }: {
           side="top"
           align="end"
           disabled={pending !== null}
-          triggerClassName="inline-flex h-8 w-7 shrink-0 items-center justify-center rounded-l-none rounded-r-full border border-line-strong text-fg hover:bg-hover disabled:pointer-events-none disabled:opacity-40"
+          triggerClassName={cn(GIT_CHEVRON, 'disabled:pointer-events-none disabled:opacity-40')}
           trigger={() => <Icon name="chevron" size={12} />}
         >
           {(close) => (
