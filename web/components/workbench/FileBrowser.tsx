@@ -6,6 +6,7 @@ import { Spinner } from '../common/Spinner.tsx'
 import { useToast } from '../common/Toast.tsx'
 import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
+import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
 import { cn } from '../../lib/cn.ts'
 import { createProjectEntry, deleteProjectEntry, listProjectFiles, renameProjectEntry, type ProjectEntry } from '../../lib/api.ts'
@@ -13,6 +14,8 @@ import { absoluteEntryPath, ancestorsOf, dropKeysUnder, dropUnderSet, isAtOrUnde
 import { FileSearchResults } from './FileSearchResults.tsx'
 import { FolderRows, type FolderNode, type TreeActions, type TreeEditor } from './FileTreeRows.tsx'
 import { useFileSearch } from './useFileSearch.ts'
+
+const MORE_TRIGGER = 'flex size-8 shrink-0 items-center justify-center rounded-lg text-fg-muted transition-colors hover:bg-hover hover:text-fg'
 
 interface DeleteRequest {
   readonly entry: ProjectEntry
@@ -178,9 +181,22 @@ export function FileBrowser({ workspaceId, project, activeFile, onOpenFile, onRe
       <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line px-2.5 text-[13px]">
         <Icon name="folder" size={14} className="shrink-0 text-fg-muted" />
         <span className="min-w-0 flex-1 truncate font-medium" title={project.path}>{project.name}</span>
-        <IconButton label="New file" onClick={() => startCreate('file')}><Icon name="plus" size={14} /></IconButton>
-        <IconButton label="New folder" onClick={() => startCreate('dir')}><Icon name="folder" size={14} /></IconButton>
-        <IconButton label="Refresh files" onClick={() => void load('')}><Icon name="refresh" size={14} /></IconButton>
+        <IconButton label="New file" onClick={() => startCreate('file')}><Icon name="plus" size={15} /></IconButton>
+        <Menu label="More explorer actions" align="end" triggerClassName={MORE_TRIGGER} trigger={() => <Icon name="dots" size={15} />}>
+          {(close) => (
+            <>
+              <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); startCreate('dir') }}>
+                <Icon name="folder" size={14} />New folder
+              </button>
+              <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); void load('') }}>
+                <Icon name="refresh" size={14} />Refresh
+              </button>
+              <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); copyPath('', true) }}>
+                <Icon name="copy" size={14} />Copy project path
+              </button>
+            </>
+          )}
+        </Menu>
       </div>
       <div className="shrink-0 border-b border-line p-2">
         <TextInput
