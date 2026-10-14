@@ -753,11 +753,11 @@ the UI's inspector renders as-is.
 
 ### Effective compaction (`compactionEffectiveEnabled`, default off)
 
-The fold above sends the whole log as text, in 200 000-character chunks, one
-request after another. On sessions whose log is mostly tool output that was
-measured at 7–9 sequential requests and 436–768 s per compaction with no cache
-hit. Effective compaction replaces it, behind a rollout switch, with **one**
-ordinary request over what the model last saw. With the switch off nothing below
+The fold above sends the whole log as text, in 200 000-character chunks (one
+request after another, before the parallel fold below). On sessions whose log is
+mostly tool output that was measured at 7–9 sequential requests and 436–768 s per
+compaction with no cache hit. Effective compaction replaces it, behind a rollout
+switch, with **one** ordinary request over what the model last saw. With the switch off nothing below
 runs and the behavior above is unchanged.
 
 - **Source.** The exact request of the last completed turn is captured from the
@@ -775,9 +775,12 @@ runs and the behavior above is unchanged.
 - **One request.** `compaction-generator.ts` appends the final answer and a handoff
   instruction (`[compaction-handoff]`) to that exact request, with a hard output cap
   (`compactionOutputTokens`, 8 000) and one deadline (`compactionDeadlineMs`, 180 s)
-  covering the whole operation including a single re-ask when the answer is too
-  long. A request that cannot fit its own answer is refused before any hook or model
-  call (`compaction-input-too-large`).
+  covering the whole operation. A complete draft of up to 96 000 characters is
+  accepted; one over 24 000 is condensed by up to two independent requests (targets
+  12 000, then 8 000 characters; `condenseDraft` in `compaction-condense.ts`, shared
+  with the fold), and a `length` finish gets a single re-ask. A request that cannot
+  fit its own answer is refused before any hook or model call
+  (`compaction-input-too-large`).
 - **Adoption.** `adoptPreparedCompaction` commits the summary under the same
   per-session transaction as the fold, but its cutoff may be *older* than the newest
   closed turn: turns that closed after the cutoff stay verbatim. The proof
@@ -786,10 +789,21 @@ runs and the behavior above is unchanged.
   still rejects a `turn/start` inside the transaction. A candidate built on a
   different checkpoint than the one that stands is refused.
 - **`/compact` always runs; the user never picks a path.** The host chooses, in order:
-  a precomputed candidate (no model call), the newest snapshot (one request), or —
-  when no snapshot describes the log (an older host never captured one, the sidecar
-  is gone, the mode or grants changed since) — the shortened-transcript fold
-  (`path: "recovery"`, several sequential requests). Manual and automatic compactions
+  a precomputed candidate (no model call), the newest captured snapshot (one request),
+  or — when none is usable (an older host never captured one, the sidecar is gone, the
+  last turn was stopped, the mode or grants changed since) — a snapshot **rebuilt from
+  the committed log** (`path: "reconstructed"`, one request). The rebuild runs the
+  ordinary request assembly with `sideEffects: false` (`reconstructFromLog` in
+  `server.ts`); its cutoff is the newest clean `completed` turn after the standing
+  checkpoint (`reconstructionCutoff`), so later turns, e.g. a stopped one, stay
+  verbatim. Only if that fails (a dropped uncovered turn, an unsafe loss, a budget
+  error) does the host fall back to the transcript fold (`path: "recovery"`).
+  The fold summarizes more than one chunk in parallel (at most
+  `max(1, min(4, provider admission capacity − 1))` at once), then merges once — in
+  consecutive groups if the summaries exceed 200 000 characters. The first failing
+  chunk aborts its siblings. Parallel chunks share provider-session ownership only
+  through the per-fold `shareSessionOwnership` scope on `StreamOptions`
+  (`llm/service.ts`); every other request stays exclusive. Manual and automatic compactions
   take the same path. A provider, model or thinking-level switch does not invalidate a
   snapshot: the host sends it, unchanged, to the model selected now (only the prompt
   cache misses). A request body (an older client's `{recovery: …}` echo) is ignored.
@@ -797,7 +811,10 @@ runs and the behavior above is unchanged.
   `compaction/job` events (`preparing → generating → applying → ended`), so every client
   and a reload see where it is; `ended` carries `outcome` (`compacted`, `noop`,
   `cancelled`, `failed`; `needs-recovery` appears only in logs of older hosts), the
-  `path`, and a failure's reason.
+  `path`, and a failure's reason. `generating` may carry `progress {done, total}`
+  (fold chunks summarized) and `ended` carries `requests` and `usage {input, cached,
+  output}` totals for the job, whatever the outcome; the row shows "Summarizing i/n"
+  and "N requests".
   `generating` is reported just before the model is asked and `applying` just before the
   adoption, so a hook block, a no-op or a refused request reports neither. They bracket
   the canonical `compaction/start`/`end` pair and are not the authority for a
