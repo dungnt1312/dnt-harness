@@ -318,7 +318,9 @@ describe('web compaction', () => {
       replies: [longReply, tailReply],
       summarize(request) {
         const chunk = conversationChunk(request)
-        chunks.push(chunk)
+        // Chunk requests run in parallel and may start in any order; the merge request is not a source chunk.
+        const part = /This is part (\d+) of \d+ of one conversation/.exec(String(request.messages[0]!.content))
+        if (part !== null) chunks[Number(part[1]) - 1] = chunk
         // A bounded source echo makes late state visible without exceeding the output cap.
         return `SOURCE ECHO\n${chunk.slice(-2_000)}`
       },

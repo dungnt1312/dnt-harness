@@ -44,7 +44,7 @@ export class LlmService extends Service {
     return admission
   }
 
-  private readonly sessionsInFlight = new Set<string>()
+  private readonly sessionsInFlight = new Map<string, { readonly turnId: string | undefined; readonly count: number }>()
 
   sessionUncertain(sessionId: string): boolean {
     return [...this.admissions.values()].some(admission => [...admission.uncertain.values()].some(fact => fact.attribution?.sessionId === sessionId))
@@ -52,17 +52,24 @@ export class LlmService extends Service {
 
   private async *admitted(provider: LlmProvider, request: ModelRequest, options?: StreamOptions): AsyncIterable<StreamEvent> {
     const sessionId = options?.attribution?.sessionId
-    if (sessionId && (this.sessionsInFlight.has(sessionId) || this.sessionUncertain(sessionId))) {
+    const turnId = options?.attribution?.turnId
+    // Same turn may overlap (parallel compaction chunks); a different turn is still fenced.
+    const live = sessionId ? this.sessionsInFlight.get(sessionId) : undefined
+    if (sessionId && ((live !== undefined && live.turnId !== turnId) || this.sessionUncertain(sessionId))) {
       const error = new ProviderError('session retains provider request ownership')
       error.transportSettled = false
       throw error
     }
-    if (sessionId) this.sessionsInFlight.add(sessionId)
+    if (sessionId) this.sessionsInFlight.set(sessionId, { turnId, count: (live?.count ?? 0) + 1 })
     const owner = options?.requestOwner ?? new LogicalRequest()
     try {
       yield* runAttempt(provider, request, { owner, admission: this.admission(provider.name), ...(options?.admissionPriority ? { priority: options.admissionPriority } : {}), provider: provider.name, ...(options?.attribution ? { attribution: options.attribution } : {}), ...(options?.recordAttempt ? { recordAttempt: options.recordAttempt } : {}), ...(options?.signal ? { signal: options.signal } : {}), ...(this.observer ? { observer: this.observer } : {}) })
     } finally {
-      if (sessionId) this.sessionsInFlight.delete(sessionId)
+      const left = sessionId ? this.sessionsInFlight.get(sessionId) : undefined
+      if (sessionId && left !== undefined) {
+        if (left.count <= 1) this.sessionsInFlight.delete(sessionId)
+        else this.sessionsInFlight.set(sessionId, { turnId: left.turnId, count: left.count - 1 })
+      }
       if (!options?.requestOwner) owner.dispose()
     }
   }

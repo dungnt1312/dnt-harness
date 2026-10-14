@@ -145,7 +145,8 @@ describe('compaction', () => {
         yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
       })(), { providerName: 'test', model: 'test' })
       await expect(compactSession(session, checkpoints, summarize)).rejects.toThrow('second chunk failed')
-      expect(calls).toBe(2)
+      // Chunks now run in parallel: all 3 start together, and the failure means no merge request follows.
+      expect(calls).toBe(3)
       expect(await checkpoints.latest(sessionId)).toEqual(previous)
       expect(await fs.readdir(checkpointDir)).toEqual(namesBefore)
       expect((await fs.readFile(path.join(checkpointDir, `${previous.coversSeq}.json`))).equals(checkpointBefore)).toBe(true)

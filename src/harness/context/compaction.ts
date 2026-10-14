@@ -158,6 +158,8 @@ export type SummarizerInput = {
   readonly signal?: AbortSignal
   /** Prior canonical checkpoint summary seeding an incremental fold. */
   readonly seed?: { readonly summary: string; readonly coversSeq: number }
+  /** Fold progress: `done` of `total` chunk summaries finished. */
+  readonly onProgress?: (done: number, total: number) => void
 }
 export type Summarizer = (input: SummarizerInput) => Promise<string>
 
