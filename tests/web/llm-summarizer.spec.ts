@@ -127,6 +127,20 @@ describe('parallel fold + merge', () => {
     expect(max).toBe(4)
   })
 
+  it('honors maxParallel: never more than 2 chunk requests open', async () => {
+    let open = 0
+    let max = 0
+    const merges = { n: 0 }
+    const summarize = createCompactionSummarizer((request) => (async function* () {
+      const isChunk = PART.test(content(request))
+      if (isChunk) { max = Math.max(max, ++open); await tick(); open-- }
+      yield { type: 'delta', delta: answer(request, merges) }
+      yield STOP
+    })(), PAIR, undefined, 2)
+    await summarize({ text: text(6) })
+    expect(max).toBe(2)
+  })
+
   it('puts the seed only in the merge request', async () => {
     const seen: ModelRequest[] = []
     const merges = { n: 0 }

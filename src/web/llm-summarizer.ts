@@ -25,8 +25,8 @@ export const MAX_SUMMARY_CHARS = 24_000
 /** Room kept free in every chunk for the cap-aware re-ask instruction. */
 export const REASK_RESERVE = 600
 
-/** Chunk summaries in flight at once. */
-const MAX_PARALLEL = 4
+/** Default chunk summaries in flight at once. */
+export const MAX_PARALLEL = 4
 const partLine = (index: number, total: number) => `This is part ${index} of ${total} of one conversation; summarize only this part.\n\n`
 const MERGE_NOTE = 'The conversation section below holds ordered partial summaries of one conversation, each marked [part i/n]. Merge them into one summary that follows the instructions above.'
 /** Widest `[part i/n]` label plus the blank line joining two parts. */
@@ -120,7 +120,7 @@ function chunkEnd(text: string, start: number, capacity: number): number {
   return end
 }
 
-export function createCompactionSummarizer(stream: StreamFn, pair: SummarizerPair | undefined, streamOptions?: StreamOptions): Summarizer {
+export function createCompactionSummarizer(stream: StreamFn, pair: SummarizerPair | undefined, streamOptions?: StreamOptions, maxParallel = MAX_PARALLEL): Summarizer {
   if (pair === undefined) return async ({ text, signal, seed }) => {
     signal?.throwIfAborted()
     if (text.trim() === '') throw new Error('extractive summary source is empty')
@@ -153,7 +153,7 @@ export function createCompactionSummarizer(stream: StreamFn, pair: SummarizerPai
         return summary
       }
 
-      /** Ordered results, at most MAX_PARALLEL in flight; the first failure aborts the rest and is the error thrown. */
+      /** Ordered results, at most `maxParallel` in flight; the first failure aborts the rest and is the error thrown. */
       const mapLimit = async <T, R>(items: readonly T[], run: (item: T, index: number) => Promise<R>): Promise<R[]> => {
         const results = new Array<R>(items.length)
         let next = 0
@@ -171,7 +171,7 @@ export function createCompactionSummarizer(stream: StreamFn, pair: SummarizerPai
             throw error
           }
         }
-        await Promise.allSettled(Array.from({ length: Math.min(MAX_PARALLEL, items.length) }, worker))
+        await Promise.allSettled(Array.from({ length: Math.min(maxParallel, items.length) }, worker))
         if (failure !== undefined) throw failure.error
         return results
       }

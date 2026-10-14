@@ -193,6 +193,8 @@ export interface StreamOptions {
   readonly signal?: AbortSignal
   /** `'low'`: speculative background work that must never take the last provider slot. Omitted is ordinary. */
   readonly admissionPriority?: 'low'
+  /** Per-operation scope key: requests of one session overlap only when both carry the same defined key. Omitted is exclusive. */
+  readonly shareSessionOwnership?: string
   /** Present under harness ownership: built-in adapters perform exactly one physical attempt. */
   readonly requestOwner?: import('./request-lifecycle.ts').LogicalRequest
   /** Adapter calls only after verified local transport settlement, including late cleanup. */

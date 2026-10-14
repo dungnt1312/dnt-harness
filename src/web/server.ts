@@ -54,7 +54,7 @@ import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
 import { expressibleThinkingLevel, isThinkingLevel, resolveContextLimit } from '../harness/llm/model-catalog.ts'
 import { adaptRequestVision, supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
 import { ProviderError } from '../harness/llm/types.ts'
-import type { LlmProvider, ModelRequest, StreamEvent, TokenUsage, ToolCall } from '../harness/llm/types.ts'
+import type { LlmProvider, ModelRequest, StreamEvent, StreamOptions, TokenUsage, ToolCall } from '../harness/llm/types.ts'
 import type { ToolResult } from '../harness/tools/types.ts'
 import { fileSessions, SessionsService } from '../harness/session/service.ts'
 import type { Session } from '../harness/session/session.ts'
@@ -180,7 +180,7 @@ import { assertFitsWindow } from './compaction-generator.ts'
 import { CaptureRegistry, identityOf, requestPrefixHash } from './compaction-wiring.ts'
 import { loadReferencedSnapshot } from './compaction-restart.ts'
 import { snapshotHash } from '../harness/context/compaction-snapshot.ts'
-import { CacheAwareCompactionFallback, createCacheAwareCompactionSummarizer, createCompactionSummarizer } from './llm-summarizer.ts'
+import { CacheAwareCompactionFallback, createCacheAwareCompactionSummarizer, createCompactionSummarizer, MAX_PARALLEL } from './llm-summarizer.ts'
 import { DEFAULT_BUDGET, schemaCost, type ResolvedBudget } from '../harness/context/budget.ts'
 import { CommandsService } from '../harness/commands/service.ts'
 import { PluginService } from '../harness/plugins/service.ts'
@@ -1662,7 +1662,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         const loaded = refs.length > 0 ? await attachments.load(entry.workspaceId, refs, { textLimit: limits.attachmentTextLimit }) : undefined
         signal.throwIfAborted()
         const pair = summarizerModelOf(entry.session)
-        const compactionStream = (request: ModelRequest) => (async function* () {
+        const compactionStream = (request: ModelRequest, streamOptions?: StreamOptions) => (async function* () {
+          // The fold's own signal (first failing sibling aborts the rest) rides with the job's.
+          const streamSignal = streamOptions?.signal === undefined ? signal : AbortSignal.any([signal, streamOptions.signal])
           // Each summarizer chunk is idempotent from the caller's view: a failed
           // attempt's partial output is discarded (buffered, never yielded), so a
           // transient transport failure may re-ask the same chunk — bounded like
@@ -1677,7 +1679,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
                 // The usage tap therefore cannot see it; record its tokens here.
                 const startedAt = Date.now()
                 for await (const event of agentScope.exit(() => kernel.ctx.llm.stream(request, {
-                  signal, requestOwner: owner,
+                  signal: streamSignal, requestOwner: owner,
+                  ...(streamOptions?.shareSessionOwnership !== undefined ? { shareSessionOwnership: streamOptions.shareSessionOwnership } : {}),
                   attribution: { sessionId: entry.session.id, turnId: `compaction:${entry.session.id}`, stepId: randomUUID() },
                 }))) buffered.push(event)
                 const usage = buffered.findLast((event) => event.type === 'usage')
@@ -1699,12 +1702,15 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
                 // A context overflow re-sent with identical input can only fail
                 // again; the agent loop squeezes, the summarizer cannot.
                 if (error.contextExceeded || !owner.canRetry(error, false)) throw error
-                await owner.backoff(signal, error.retryAfterMs)
+                await owner.backoff(streamSignal, error.retryAfterMs)
               }
             }
           } finally { owner.dispose() }
         })()
-        const fallback = createCompactionSummarizer(compactionStream, pair)
+        // One scope per fold: its chunk/merge requests may overlap on the session, nothing else may.
+        // One provider slot stays free so a fold never starves other sessions' foreground turns.
+        const foldParallel = pair === undefined ? 1 : Math.max(1, Math.min(MAX_PARALLEL, kernel.ctx.llm.admission(pair.providerName).capacity - 1))
+        const fallback = createCompactionSummarizer(compactionStream, pair, { shareSessionOwnership: randomUUID() }, foldParallel)
         // Cache-aware only when the stored prefix is the lossless last request of
         // the newest completed turn and its answer closes that turn; otherwise
         // the prefix could miss facts the new checkpoint claims to cover.

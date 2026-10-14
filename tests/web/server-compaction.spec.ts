@@ -10,7 +10,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
-import { createWebServer, ProviderError, withoutSentStamp, type LlmProvider, type WebServer } from 'dnt-harness'
+import { AttemptAdmission, createWebServer, ProviderError, withoutSentStamp, type LlmProvider, type WebServer } from 'dnt-harness'
 import type { ModelRequest, StreamEvent } from '../../src/harness/llm/types.ts'
 import type { HarnessLimits } from '../../src/harness/limits.ts'
 
@@ -406,6 +406,72 @@ describe('web compaction', () => {
     expect(appended.map((event) => event.type)).toEqual(['compaction/start', 'compaction/end'])
     expect(appended[1]).toMatchObject({ error: 'provider transport failure', summaryChars: 0 })
     expect(appended[1].summary).toBeUndefined()
+  })
+
+  describe('parallel fold over the server', () => {
+    const PART = /This is part (\d+) of (\d+) of one conversation/
+    /** One long reply, so the fold needs `chunks` parts; `onChunk` runs a chunk request, the rest answer instantly. */
+    async function foldSession(onChunk: (request: ModelRequest, signal: AbortSignal | undefined) => AsyncIterable<StreamEvent>, capacity?: number) {
+      const provider: LlmProvider = {
+        name: 'scripted', models: ['scripted'],
+        stream(request, options) {
+          const body = String(request.messages[0]?.content)
+          const isSummaryCall = request.messages.some((m) => typeof m.content === 'string' && m.content.includes(COMPACT_MARK))
+          if (isSummaryCall && request.messages.length > 1) {
+            return (async function* (): AsyncIterable<StreamEvent> {
+              yield { type: 'toolCalls', calls: [{ id: 'refuse', name: 'Read', args: {} }] }
+              yield { type: 'completion', finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+            })()
+          }
+          if (isSummaryCall && PART.test(body)) return onChunk(request, options?.signal)
+          return (async function* (): AsyncIterable<StreamEvent> {
+            yield { type: 'delta', delta: isSummaryCall ? SUMMARY_TEXT : 'synthetic historical detail\n'.repeat(30_000) }
+            yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+          })()
+        },
+      }
+      const started = await start(provider)
+      if (capacity !== undefined) started.server.kernel.ctx.llm.configureAdmission('scripted', new AttemptAdmission(capacity))
+      const { id } = await (await fetch(`${started.base}/api/workspaces/${started.wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+      await completedMessage(started.base, started.wsId, id, path.join(started.home, 'workspaces', started.wsId, 'sessions', id, 'events.jsonl'), 'long history', 1)
+      return { ...started, compact: () => fetch(`${started.base}/api/workspaces/${started.wsId}/sessions/${id}/compact`, { method: 'POST' }) }
+    }
+    const answered = (): AsyncIterable<StreamEvent> => (async function* () {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      yield { type: 'delta', delta: 'part summary' }
+      yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+    })()
+
+    it('a failing chunk aborts the sibling chunk streams and the compaction fails promptly', async () => {
+      let arrived = 0
+      let aborted = 0
+      let releaseGate!: () => void
+      const gate = new Promise<void>((resolve) => { releaseGate = resolve })
+      const { compact } = await foldSession((_request, signal) => (async function* () {
+        const mine = ++arrived
+        if (arrived === 3) releaseGate()
+        await gate
+        if (mine === 2) throw new Error('synthetic chunk failure')
+        // Ends only when the provider request is aborted.
+        await new Promise<void>((resolve) => signal!.addEventListener('abort', () => { aborted++; resolve() }, { once: true }))
+        yield { type: 'delta', delta: 'unreachable' }
+      })())
+      const response = await compact()
+      expect(response.status).toBe(409)
+      expect(arrived).toBe(3)
+      await until(async () => aborted === 2 ? true : undefined)
+    })
+
+    it.each([[4, 3], [2, 1]])('provider capacity %i folds at most %i chunks at once', async (capacity, expected) => {
+      let open = 0
+      let max = 0
+      const { compact } = await foldSession((request, signal) => (async function* () {
+        max = Math.max(max, ++open)
+        try { yield* answered() } finally { open-- }
+      })(), capacity)
+      expect((await compact()).status).toBe(200)
+      expect(max).toBe(expected)
+    })
   })
 
   it('the manual route summarizes through the session pair and the next request reads the checkpoint', async () => {
