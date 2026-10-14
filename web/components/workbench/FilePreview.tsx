@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { Markdown } from '../../Markdown.tsx'
 import { csvDelimiterOf, csvRows, type PreviewKind } from '../../lib/preview.ts'
+import { TruncationNotice } from './TruncationNotice.tsx'
 
 /**
  * Above this many rendered rows the CSV table is cut: rendering a whole large
@@ -8,7 +9,7 @@ import { csvDelimiterOf, csvRows, type PreviewKind } from '../../lib/preview.ts'
  */
 const CSV_ROW_LIMIT = 200
 
-/** The rendered side of the viewer's Code | Preview toggle: Markdown document, sandboxed HTML, or a delimited table. */
+/** The rendered side of the viewer's Code | Split | Preview toggle: Markdown document, sandboxed HTML, or a delimited table. */
 export function FilePreview({ kind, path, content, truncated }: {
   readonly kind: PreviewKind
   readonly path: string
@@ -19,7 +20,7 @@ export function FilePreview({ kind, path, content, truncated }: {
   if (kind === 'markdown') {
     return (
       <div className="min-h-0 flex-1 overflow-auto" role="region" aria-label={`Preview of ${path}`}>
-        {truncated ? <p className="m-0 border-b border-line bg-warn-soft px-3 py-1.5 text-xs text-warn">File is larger than 1 MB; only the beginning is shown.</p> : null}
+        {truncated ? <TruncationNotice /> : null}
         <div className="mx-auto max-w-3xl px-6 py-4">
           <Markdown content={content} />
         </div>
@@ -52,23 +53,22 @@ function CsvTable({ path, content, truncated }: {
   const hidden = rows.length - visible.length
   return (
     <div className="min-h-0 flex-1 overflow-auto" role="region" aria-label={`Preview of ${path}`}>
-      {truncated ? <p className="m-0 border-b border-line bg-warn-soft px-3 py-1.5 text-xs text-warn">File is larger than 1 MB; only the beginning is shown.</p> : null}
+      {truncated ? <TruncationNotice /> : null}
       <table className="border-collapse text-[12.5px]">
         <tbody>
           {visible.map((row, rowIndex) => (
             <tr key={rowIndex} className={rowIndex === 0 ? 'bg-muted font-medium' : 'odd:bg-surface'}>
               {row.map((cell, cellIndex) => (
-                <td key={cellIndex} className="max-w-64 truncate border border-line px-2 py-1 align-top">{cell}</td>
+                <td key={cellIndex} title={cell} className="max-w-64 truncate border border-line px-2 py-1 align-top">{cell}</td>
               ))}
             </tr>
           ))}
         </tbody>
       </table>
-      {hidden > 0 || truncated ? (
+      {hidden > 0 ? (
         <p className="m-0 border-t border-line bg-warn-soft px-3 py-1.5 text-xs text-warn">
-          {hidden > 0 ? `Showing the first ${visible.length} of ${rows.length} rows.` : ''}
-          {truncated ? ' File is larger than 1 MB; only the beginning is shown.' : ''}
-          {hidden > 0 && !truncated ? <button type="button" className="ml-2 cursor-pointer underline" onClick={() => setShowAll(true)}>Show all rows</button> : null}
+          {`Showing the first ${visible.length} of ${rows.length} rows.`}
+          {!truncated ? <button type="button" className="ml-2 cursor-pointer underline" onClick={() => setShowAll(true)}>Show all rows</button> : null}
         </p>
       ) : null}
     </div>

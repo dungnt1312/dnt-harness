@@ -2,7 +2,7 @@
 import { createElement, act, type ReactElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it } from 'vitest'
-import { closeFileWithDraft, removeFileTabs, renameFileTabs, settleInProject, settleSavedDraft, switchProject, useWorkbenchFiles, type FilesState, type WorkbenchFiles } from './useWorkbenchFiles.ts'
+import { closeFileTab, removeFileTabs, renameFileTabs, settleInProject, settleSavedDraft, switchProject, useWorkbenchFiles, type FilesState, type WorkbenchFiles } from './useWorkbenchFiles.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -93,17 +93,17 @@ describe('drafts', () => {
     expect(removeFileTabs(withDrafts, 'src').drafts).toEqual({ 'a.ts': draft('A', false) })
   })
 
-  it('asks before closing a tab with unsaved changes and keeps it when refused', () => {
-    const asked: string[] = []
-    const kept = closeFileWithDraft(withDrafts, 'src/b.ts', (message) => { asked.push(message); return false })
-    expect(kept).toBe(withDrafts)
-    expect(asked).toEqual(['Discard unsaved changes to b.ts?'])
-  })
-
-  it('closes and drops the draft when confirmed', () => {
-    const next = closeFileWithDraft(withDrafts, 'src/b.ts', () => true)
+  it('closing a tab drops its draft and its chosen view mode', () => {
+    const next = closeFileTab({ ...withDrafts, modes: { 'src/b.ts': 'split', 'a.ts': 'code' } }, 'src/b.ts')
     expect(next.openFiles).toEqual(['a.ts', 'src/deep/c.ts'])
     expect(next.drafts['src/b.ts']).toBeUndefined()
+    expect(next.modes).toEqual({ 'a.ts': 'code' })
+  })
+
+  it('moves view modes with a renamed folder and drops them under a deleted one', () => {
+    const modes = { 'src/b.ts': 'split', 'src/deep/c.ts': 'preview', 'a.ts': 'code' } as const
+    expect(renameFileTabs({ ...withDrafts, modes }, 'src', 'lib').modes).toEqual({ 'lib/b.ts': 'split', 'lib/deep/c.ts': 'preview', 'a.ts': 'code' })
+    expect(removeFileTabs({ ...withDrafts, modes }, 'src').modes).toEqual({ 'a.ts': 'code' })
   })
 
   it('settleSavedDraft drops the draft when it still equals the saved text', () => {
@@ -121,11 +121,6 @@ describe('drafts', () => {
     expect(settleSavedDraft(withDrafts, 'missing.ts', 'x', 'h2')).toBe(withDrafts)
   })
 
-  it('closes a clean draft without asking', () => {
-    const next = closeFileWithDraft(withDrafts, 'a.ts', () => { throw new Error('must not ask') })
-    expect(next.openFiles).toEqual(['src/b.ts', 'src/deep/c.ts'])
-    expect(next.drafts['a.ts']).toBeUndefined()
-  })
 })
 
 describe('switchProject', () => {
@@ -224,6 +219,45 @@ describe('useWorkbenchFiles across projects', () => {
   let root: Root | undefined
   let host: HTMLDivElement
   afterEach(async () => { if (root) await act(async () => root!.unmount()); root = undefined; host?.remove() })
+
+  const mountProbe = async (): Promise<() => WorkbenchFiles> => {
+    let files!: WorkbenchFiles
+    const Probe = (): null => { files = useWorkbenchFiles('A'); return null }
+    host = document.createElement('div'); document.body.append(host); root = createRoot(host)
+    await act(async () => root!.render(createElement(Probe)))
+    return () => files
+  }
+
+  it('closes a clean tab at once and asks before closing one with unsaved changes', async () => {
+    const files = await mountProbe()
+    await act(async () => { files().openFile('clean.ts'); files().openFile('dirty.ts'); files().setDraft('dirty.ts', { text: 'x', baseHash: 'h', dirty: true }) })
+    await act(async () => files().closeFile('clean.ts'))
+    expect(files().openFiles).toEqual(['dirty.ts'])
+    expect(files().closeRequest).toBeNull()
+
+    await act(async () => files().closeFile('dirty.ts'))
+    expect(files().closeRequest).toBe('dirty.ts')
+    expect(files().openFiles).toEqual(['dirty.ts'])
+
+    await act(async () => files().cancelClose())
+    expect(files().closeRequest).toBeNull()
+    expect(files().openFiles).toEqual(['dirty.ts'])
+    expect(files().drafts['dirty.ts']?.text).toBe('x')
+
+    await act(async () => files().closeFile('dirty.ts'))
+    await act(async () => files().confirmClose())
+    expect(files().closeRequest).toBeNull()
+    expect(files().openFiles).toEqual([])
+    expect(files().drafts).toEqual({})
+  })
+
+  it('remembers the view mode per tab', async () => {
+    const files = await mountProbe()
+    await act(async () => { files().openFile('README.md'); files().setMode('README.md', 'split') })
+    expect(files().modes).toEqual({ 'README.md': 'split' })
+    await act(async () => files().closeFile('README.md'))
+    expect(files().modes).toBeUndefined()
+  })
 
   it('shows an unsaved draft again after switching away and back', async () => {
     let files!: WorkbenchFiles

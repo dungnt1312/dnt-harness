@@ -11,6 +11,9 @@ export interface ViewerFocus extends FileFocus {
   readonly seq: number
 }
 
+/** How a file tab shows its text: the code, the rendered document, or both side by side. */
+export type ViewMode = 'code' | 'preview' | 'split'
+
 /** Unsaved editor text for one open file, kept while its tab is open. */
 export interface FileDraft {
   readonly text: string
@@ -30,6 +33,8 @@ export interface FilesState {
   readonly focus: ViewerFocus | null
   /** Unsaved editor text by path; survives tab switches, dropped when the tab closes. */
   readonly drafts: Readonly<Record<string, FileDraft>>
+  /** The view mode the reader chose per tab; a tab with no entry opens in its kind's default. */
+  readonly modes?: Readonly<Record<string, ViewMode>>
 }
 
 export interface WorkbenchFiles extends FilesState {
@@ -47,12 +52,30 @@ export interface WorkbenchFiles extends FilesState {
   readonly settleDraft: (projectKey: string | null, path: string, savedText: string, newHash: string) => void
   /** The project this state belongs to; bind it when a save starts and pass it back to `settleDraft`. */
   readonly projectKey: string | null
+  /** Choose how one tab shows its text; the choice stays with the tab until it closes. */
+  readonly setMode: (path: string, mode: ViewMode) => void
+  /**
+   * The tab whose close is waiting for the reader's answer (it holds unsaved
+   * changes), or null. The shell asks with a dialog and calls one of the two below.
+   */
+  readonly closeRequest: string | null
+  readonly confirmClose: () => void
+  readonly cancelClose: () => void
 }
 
 const EMPTY: FilesState = { folder: '', openFiles: [], activeFile: null, focus: null, drafts: {} }
 
 const withoutDraft = (drafts: FilesState['drafts'], keep: (path: string) => boolean): FilesState['drafts'] =>
   Object.fromEntries(Object.entries(drafts).filter(([path]) => keep(path)))
+
+/** The state with `modes` replaced; an empty record is left out so a state without choices stays unchanged in shape. */
+function withModes(state: FilesState, modes: Readonly<Record<string, ViewMode>>): FilesState {
+  const { modes: _previous, ...rest } = state
+  return Object.keys(modes).length === 0 ? rest : { ...rest, modes }
+}
+
+const modesWithout = (state: FilesState, keep: (path: string) => boolean): Readonly<Record<string, ViewMode>> =>
+  Object.fromEntries(Object.entries(state.modes ?? {}).filter(([path]) => keep(path)))
 
 /** Closing the front tab reveals its right neighbour, else its left one, else the fixed view. */
 export function closeFileTab(state: FilesState, path: string): FilesState {
@@ -62,7 +85,8 @@ export function closeFileTab(state: FilesState, path: string): FilesState {
   const activeFile = state.activeFile !== path ? state.activeFile : openFiles[Math.min(index, openFiles.length - 1)] ?? null
   const drafts = state.drafts[path] === undefined ? state.drafts : withoutDraft(state.drafts, (key) => key !== path)
   // The window belonged to the tab being closed, not to whatever it reveals.
-  return { ...state, openFiles, activeFile, focus: null, drafts }
+  const closed: FilesState = { ...state, openFiles, activeFile, focus: null, drafts }
+  return state.modes?.[path] === undefined ? closed : withModes(closed, modesWithout(state, (key) => key !== path))
 }
 
 /**
@@ -77,28 +101,24 @@ export function settleSavedDraft(state: FilesState, path: string, savedText: str
   return { ...state, drafts: { ...state.drafts, [path]: { text: draft.text, baseHash: newHash, dirty: true } } }
 }
 
-const baseName = (path: string): string => path.slice(path.lastIndexOf('/') + 1)
-
-/** Close a tab, asking first when it holds unsaved changes; a refusal keeps everything. */
-export function closeFileWithDraft(state: FilesState, path: string, confirm: (message: string) => boolean): FilesState {
-  if (state.drafts[path]?.dirty === true && !confirm(`Discard unsaved changes to ${baseName(path)}?`)) return state
-  return closeFileTab(state, path)
-}
-
 const moved = (path: string, from: string, to: string): string => isAtOrUnder(path, from) ? `${to}${path.slice(from.length)}` : path
 
 /** Rewrites every tab, the front tab and the shown folder at or under `from`. */
 export function renameFileTabs(state: FilesState, from: string, to: string): FilesState {
   const touched = state.openFiles.some((file) => isAtOrUnder(file, from)) || isAtOrUnder(state.folder, from)
     || Object.keys(state.drafts).some((file) => isAtOrUnder(file, from))
-  if (!touched) return state
-  return {
+  const modesTouched = Object.keys(state.modes ?? {}).some((file) => isAtOrUnder(file, from))
+  if (!touched && !modesTouched) return state
+  const renamed: FilesState = {
     ...state,
     folder: moved(state.folder, from, to),
     openFiles: state.openFiles.map((file) => moved(file, from, to)),
     activeFile: state.activeFile === null ? null : moved(state.activeFile, from, to),
     drafts: Object.fromEntries(Object.entries(state.drafts).map(([file, draft]) => [moved(file, from, to), draft])),
   }
+  return state.modes === undefined
+    ? renamed
+    : withModes(renamed, Object.fromEntries(Object.entries(state.modes).map(([file, mode]) => [moved(file, from, to), mode])))
 }
 
 /** Closes every tab at or under `path`, revealing a neighbour like {@link closeFileTab}. */
@@ -106,9 +126,11 @@ export function removeFileTabs(state: FilesState, path: string): FilesState {
   const doomed = state.openFiles.filter((file) => isAtOrUnder(file, path))
   const folderGone = state.folder !== '' && isAtOrUnder(state.folder, path)
   const draftsGone = Object.keys(state.drafts).some((file) => isAtOrUnder(file, path))
-  if (doomed.length === 0 && !folderGone && !draftsGone) return state
+  const modesGone = Object.keys(state.modes ?? {}).some((file) => isAtOrUnder(file, path))
+  if (doomed.length === 0 && !folderGone && !draftsGone && !modesGone) return state
   let next: FilesState = folderGone ? { ...state, folder: '' } : state
   if (draftsGone) next = { ...next, drafts: withoutDraft(next.drafts, (file) => !isAtOrUnder(file, path)) }
+  if (modesGone) next = withModes(next, modesWithout(next, (file) => !isAtOrUnder(file, path)))
   const frontGone = next.activeFile !== null && isAtOrUnder(next.activeFile, path)
   if (!frontGone) {
     return { ...next, openFiles: next.openFiles.filter((file) => !isAtOrUnder(file, path)) }
@@ -199,10 +221,28 @@ export function useWorkbenchFiles(projectKey: string | null): WorkbenchFiles {
     activeFile: path,
     focus: focus === undefined ? null : { ...focus, seq: (current.focus?.seq ?? 0) + 1 },
   })), [])
+  const [closeRequest, setCloseRequest] = useState<string | null>(null)
   const closeFile = useCallback((path: string) => {
-    if (closeFileWithDraft(latest.current, path, (message) => window.confirm(message)) === latest.current) return
+    // Unsaved work is never dropped silently: the shell asks, then confirms or cancels.
+    if (latest.current.drafts[path]?.dirty === true) {
+      setCloseRequest(path)
+      return
+    }
     setState((current) => closeFileTab(current, path))
   }, [])
+  // Read by confirmClose: a state updater may run twice, so it must not carry the close itself.
+  const closeRequestRef = useRef<string | null>(null)
+  closeRequestRef.current = closeRequest
+  const confirmClose = useCallback(() => {
+    const path = closeRequestRef.current
+    setCloseRequest(null)
+    if (path !== null) setState((current) => closeFileTab(current, path))
+  }, [])
+  const cancelClose = useCallback(() => setCloseRequest(null), [])
+  const setMode = useCallback((path: string, mode: ViewMode) => setState((current) => {
+    if (current.modes?.[path] === mode) return current
+    return withModes(current, { ...(current.modes ?? {}), [path]: mode })
+  }), [])
   const setDraft = useCallback((path: string, draft: FileDraft | null) => setState((current) => {
     if (draft === null) {
       if (current.drafts[path] === undefined) return current
@@ -236,5 +276,5 @@ export function useWorkbenchFiles(projectKey: string | null): WorkbenchFiles {
   const removePath = useCallback((path: string) => setState((current) => removeFileTabs(current, path)), [])
 
   // keyRef moves in the same effect that swaps `state`, so it always names the project `state` belongs to.
-  return { ...state, projectKey: keyRef.current, setFolder, openFile, closeFile, showFixedView, renamePath, removePath, setDraft, settleDraft }
+  return { ...state, projectKey: keyRef.current, setFolder, openFile, closeFile, showFixedView, renamePath, removePath, setDraft, settleDraft, setMode, closeRequest, confirmClose, cancelClose }
 }

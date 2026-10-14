@@ -9,13 +9,15 @@ import type { WorkbenchProject } from './Workbench.tsx'
 const TREE_LIMITS = { min: 0.18, max: 0.6, default: 0.34 } as const
 
 /** File viewer on the left and a collapsible, resizable tree on the right. */
-export function FilesWorkspace({ workspaceId, project, files, treeVisible, treeFraction, onTreeFraction }: {
+export function FilesWorkspace({ workspaceId, project, files, treeVisible, treeFraction, onTreeFraction, agentWrites }: {
   readonly workspaceId: string
   readonly project: WorkbenchProject
   readonly files: WorkbenchFiles
   readonly treeVisible: boolean
   readonly treeFraction: number
   readonly onTreeFraction: (value: number) => void
+  /** Project-relative path → seq of the agent's latest landed Edit/Write; an open viewer re-reads when its entry moves. */
+  readonly agentWrites?: Readonly<Record<string, number>>
 }) {
   const fraction = useRef(treeFraction)
   const treeRef = useRef<HTMLDivElement>(null)
@@ -56,8 +58,14 @@ export function FilesWorkspace({ workspaceId, project, files, treeVisible, treeF
     <div className="flex min-h-0 flex-1">
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         {activeFile !== null
-          ? <FileViewer key={`${project.id}:${activeFile}`} workspaceId={workspaceId} projectId={project.id} projectPath={project.path} path={activeFile} focus={files.focus} draft={files.drafts?.[activeFile] ?? null} onDraft={(draft) => files.setDraft(activeFile, draft)} onSaved={(text, hash) => files.settleDraft(savingKey, activeFile, text, hash)} />
-          : <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center"><Icon name="fileText" size={22} className="text-fg-faint" /><p className="m-0 text-sm text-fg-muted">Open a file from the tree.</p></div>}
+          ? <FileViewer key={`${project.id}:${activeFile}`} workspaceId={workspaceId} projectId={project.id} projectPath={project.path} path={activeFile} focus={files.focus} draft={files.drafts?.[activeFile] ?? null} onDraft={(draft) => files.setDraft(activeFile, draft)} onSaved={(text, hash) => files.settleDraft(savingKey, activeFile, text, hash)} viewMode={files.modes?.[activeFile]} onViewMode={(mode) => files.setMode(activeFile, mode)} writeSeq={agentWrites?.[activeFile]} />
+          : (
+            <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
+              <Icon name="fileText" size={22} className="text-fg-faint" />
+              <p className="m-0 text-sm font-medium">No file open</p>
+              <p className="m-0 max-w-xs text-[13px] text-fg-muted">Open a file from the tree, or press <kbd className="rounded border border-line bg-muted px-1 font-mono text-[12px]">{navigator.platform.toLowerCase().includes('mac') ? '⌘' : 'Ctrl'} P</kbd> to find one by name.</p>
+            </div>
+          )}
       </div>
       <div
         ref={handleRef}

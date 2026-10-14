@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { act, useState, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import CopyButton from '../components/common/CopyButton.tsx'
@@ -22,6 +22,7 @@ import { compactSession, CompactionCancelled, CompactionRecoveryNeeded, fetchHoo
 import { ContextPanel } from '../components/layout/ContextPanel.tsx'
 import { Workbench, type WorkbenchView } from '../components/workbench/Workbench.tsx'
 import { closeFileTab, useWorkbenchFiles } from '../hooks/useWorkbenchFiles.ts'
+import { polyfillLayout } from '../components/workbench/cm-test.ts'
 import { useWorkbenchTabs } from '../hooks/useWorkbenchTabs.ts'
 import { WORKBENCH_TABS_STORAGE_KEY } from './workbench-preferences.ts'
 import { Sidebar, type SidebarProps } from '../components/layout/Sidebar.tsx'
@@ -2000,6 +2001,7 @@ describe('mounted clipboard recovery', () => {
 
 describe('workbench files', () => {
   const project = { id: 'p1', name: 'Acme', path: 'C:/acme' }
+  beforeAll(polyfillLayout)
   it('closing the front tab reveals its neighbour, then the fixed view', () => {
     const state = { folder: '', openFiles: ['a.ts', 'b.ts', 'c.ts'], activeFile: 'b.ts', focus: null, drafts: {} }
     expect(closeFileTab(state, 'b.ts')).toMatchObject({ openFiles: ['a.ts', 'c.ts'], activeFile: 'c.ts' })
@@ -2019,9 +2021,12 @@ describe('workbench files', () => {
     expect(readProjectFile).toHaveBeenCalledWith('w1', 'p1', 'src/index.ts')
     const tab = host.querySelector<HTMLButtonElement>('[aria-label="Open files"] button[title="src/index.ts"][aria-pressed="true"]')
     expect(tab?.textContent).toContain('index.ts')
+    // The file opens in the CodeMirror pane (a lazy chunk), as text: markup in it is shown, never run.
+    await vi.waitFor(async () => { await act(async () => {}); expect(host.querySelector('.cm-content')).not.toBeNull() }, { timeout: 8_000, interval: 20 })
     const contents = host.querySelector('[aria-label="Contents of src/index.ts"]')!
     expect(contents.textContent).toContain('export const answer = 42')
-    expect(contents.querySelector('code')?.innerHTML).toContain('&lt;raw&gt;')
+    expect(contents.textContent).toContain('<raw>')
+    expect(contents.querySelector('raw')).toBeNull()
     expect(host.textContent).toContain('C:/acme/src/index.ts')
     const tree = host.querySelector('[aria-label="Project files"]')!
     expect(contents.compareDocumentPosition(tree) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
@@ -2049,7 +2054,8 @@ describe('workbench files', () => {
     await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Close src/index.ts"]')!.click())
     expect(host.querySelector('[aria-label="Open files"] button[title="src/index.ts"]')).toBeNull()
     expect(host.querySelector('[aria-label="Project files"]')).not.toBeNull()
-    expect(host.textContent).toContain('Open a file from the tree.')
+    expect(host.textContent).toContain('No file open')
+    expect(host.textContent).toContain('Open a file from the tree')
   })
   it('lists changed files with line counts and opens a read-only diff', async () => {
     await mount(<ToastHost><WorkbenchProbe view="git" events={[]} project={project} /></ToastHost>)
