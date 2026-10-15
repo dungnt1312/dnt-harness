@@ -64,6 +64,16 @@ it('says loading or unavailable instead of "no request" or a zero count', async 
   expect(failed.textContent).not.toContain('100K / 1M')
 })
 
+it('names the trigger for assistive tech while loading or failed', async () => {
+  for (const [status, label] of [['loading', 'Context window, loading'], ['error', 'Context window unavailable']] as const) {
+    await openMeter(null, status)
+    expect(host.querySelector('button')!.getAttribute('aria-label')).toBe(label)
+    await act(async () => root!.unmount())
+    root = undefined
+    host.remove()
+  }
+})
+
 it('shows the measured request: its model, basis and estimate total beside the reported one', async () => {
   const panel = await openMeter({ ...MANIFEST, model: 'glm-measured', usage: { last: { inputTokens: 139_100 }, cacheableInputTokens: 0, cachedInputTokens: 0 } })
   expect(panel.textContent).toContain('Last requestreported')

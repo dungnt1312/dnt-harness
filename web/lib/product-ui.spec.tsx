@@ -1147,7 +1147,7 @@ describe('context compaction + budget bar', () => {
     const reported = { ...manifest, model: 'glm-measured', budget: { ...manifest.budget, preTrimTokens: 108_800 }, usage: { last: { inputTokens: 50_000 }, cacheableInputTokens: 0, cachedInputTokens: 0 }, policy: { automaticCompactionPressure: 0.85 } }
     await mount(panel({ manifest: reported, manifestStatus: 'ready' }))
     expect(host.textContent).toContain('reported · glm-measured')
-    expect(host.textContent).toContain('trigger: 85% of input budget · auto-compacts at 85%')
+    expect(host.textContent).toContain('85% of input budget · auto-compacts at 85%')
     await mount(panel({ manifest: manifest, manifestStatus: 'ready' }))
     expect(host.textContent).not.toContain('auto-compacts')
   })

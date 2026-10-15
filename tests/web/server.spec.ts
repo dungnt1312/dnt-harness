@@ -133,7 +133,7 @@ describe('web server', () => {
     expect(meta.folder).toBe(root)
   })
 
-  it('switching the model stamps every request through agent/request', async () => {
+  it('switching the model is stamped in agent/context for the next request', async () => {
     const seen: ModelRequest[] = []
     const recorder: LlmProvider = {
       name: 'recorder',

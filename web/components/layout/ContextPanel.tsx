@@ -164,7 +164,7 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
                 {available.model !== undefined ? ` · ${available.model}` : ''}
               </Row>
             ) : null}
-            {pressure !== undefined ? <Row term="auto-compact"><span title="Calibrated pre-trim count over the usable input budget; not the window bar.">trigger: {formatPolicyPressure(pressure)}</span></Row> : null}
+            {pressure !== undefined ? <Row term="auto-compact"><span title="Calibrated pre-trim count over the usable input budget; not the window bar.">{formatPolicyPressure(pressure)}</span></Row> : null}
             <Row term="mode">{available.modeId} · rev {available.modeRevision}{available.sources.modeSource !== undefined ? ` · ${available.sources.modeSource}` : ''}</Row>
             {available.sources.environment !== undefined ? (
               <Row term="environment">

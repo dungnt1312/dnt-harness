@@ -15,6 +15,12 @@ async function startBackground(registry: ProcessRegistry, command: string, sessi
 }
 
 describe('BashOutput', () => {
+  it('describes processId like KillShell, including auto-backgrounded commands', () => {
+    const param = (tool: { parameters: any }): string => tool.parameters.properties.processId.description
+    const registry = new ProcessRegistry({})
+    expect(param(bashOutputTool({ processes: registry }))).toBe(param(killShellTool({ processes: registry })))
+  })
+
   it('reads captured output and status while running, then the final exit', async () => {
     const registry = new ProcessRegistry({})
     const output = bashOutputTool({ processes: registry })
