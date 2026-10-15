@@ -83,6 +83,22 @@ describe('request-scoped context state', () => {
       expect(warn).toHaveBeenCalledTimes(1)
     } finally { warn.mockRestore() }
   })
+  it('incremental application over any split equals replay from scratch', () => {
+    const events = [assembled(1, 'a'), attempt(2, 'a', 'p1', usage), assembled(3, 'b'), compact(4),
+      attempt(5, 'b', 'p2', { inputTokens: 40_000, cachedInputTokens: 0 }), assembled(6, 'c'),
+      attempt(7, 'c', 'p3', { inputTokens: 9, cachedInputTokens: 3 }), attempt(8, 'c', 'p3', { inputTokens: 9, cachedInputTokens: 3 }, 'reconciled')]
+    for (let end = 1; end <= events.length; end++) {
+      const prefix = events.slice(0, end)
+      const fresh = accounting.deriveContextState(prefix, 's')
+      for (let split = 0; split <= end; split++) {
+        const r = accounting.createContextReducer<ContextManifest>('s')
+        r.apply(prefix.slice(0, split))
+        // Re-applying the already-seen prefix with the suffix must be a no-op for the prefix.
+        r.apply(prefix)
+        expect(r.current()).toEqual(fresh)
+      }
+    }
+  })
   it('pins optional session identity and keeps legacy manifests estimated', () => {
     const r = accounting.createContextReducer<ContextManifest>()
     r.apply([assembled(1, 'a'), attempt(2, 'a', 'p1', usage)])

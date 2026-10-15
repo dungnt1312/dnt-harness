@@ -186,7 +186,7 @@ import { DEFAULT_BUDGET, resolveModelBudget, schemaCost, type ResolvedBudget } f
 import type { BuildContextInput, PreviewCompaction } from '../harness/context/builder.ts'
 import type { CompactionMeasurement } from '../harness/session/events.ts'
 import type { Restored } from '../harness/context/compaction.ts'
-import { deriveContextState, isAvailableContext } from '../harness/context/context-state.ts'
+import { createContextReducer, deriveContextState, isAvailableContext, type ContextReducer, type ContextResponse } from '../harness/context/context-state.ts'
 import { isValidTokenUsage } from '../harness/context/context-metrics.ts'
 import { CommandsService } from '../harness/commands/service.ts'
 import { PluginService } from '../harness/plugins/service.ts'
@@ -3457,6 +3457,7 @@ ${entry.description}`.toLowerCase().includes(query))
 
   /** Last request's manifest per session — the inspector renders this. */
   const lastManifests = new Map<SessionId, ContextManifest>()
+  const contextReducers = new Map<SessionId, ContextReducerCache>()
   /**
    * Per-session snapshot of the reference sources that ride ahead of history
    * and change often: the skill catalog and the MEMORY.md indexes. Re-reading
@@ -4546,6 +4547,7 @@ ${entry.description}`.toLowerCase().includes(query))
     recordUsage: (record) => usageLog.record(record),
     checkpoints,
     lastManifests,
+    contextReducers,
     prefixSnapshots,
     contextBodies,
     sessionUsage,
@@ -4843,6 +4845,8 @@ interface HandlerDeps {
   readonly attachments: AttachmentStore
   readonly checkpoints: CheckpointStore
   readonly lastManifests: Map<SessionId, ContextManifest>
+  /** Incremental committed-context state per session for GET /manifest. */
+  readonly contextReducers: Map<SessionId, ContextReducerCache>
   /** Per-session copy of the skill catalog and memory indexes (prefix stability). */
   readonly prefixSnapshots: Map<SessionId, PrefixSnapshot>
   /** Context section hashes already recorded per session's log (body dedupe). */
@@ -7566,7 +7570,7 @@ async function handleApi(
         send(404, { error: 'no such session' })
         return
       }
-      const committedView = deriveContextState(entry.session.committedEvents, entry.session.id)
+      const committedView = committedContextView(entry.session, deps.contextReducers)
       const live = deps.lastManifests.get(entry.session.id)
       // A request assembled but not yet reported: show its fresh estimate and
       // pre-trim pressure, never an older request's numbers over this assembly.
@@ -10005,9 +10009,38 @@ async function removeSession(entry: SessionEntry, wsId: WorkspaceId, deps: Handl
   return undefined
 }
 
+interface ContextReducerCache {
+  readonly session: Session
+  readonly reducer: ContextReducer<ContextManifest>
+  last?: { readonly seq: number; readonly type: string }
+}
+
+/**
+ * The committed context view, applying only the committed suffix since the
+ * last GET. A new session instance or a replaced prefix (the remembered last
+ * event no longer sits at its seq with its type) starts a fresh reducer.
+ */
+function committedContextView(session: Session, cache: Map<SessionId, ContextReducerCache>): ContextResponse<ContextManifest> | null {
+  const events = session.committedEvents
+  let cached = cache.get(session.id)
+  // Seqs are 1-based positions in the log, so the remembered event sits at seq - 1.
+  const at = cached?.last === undefined ? undefined : events[cached.last.seq - 1]
+  if (cached === undefined || cached.session !== session
+    || (cached.last !== undefined && (at?.seq !== cached.last.seq || at.type !== cached.last.type))) {
+    cached = { session, reducer: createContextReducer<ContextManifest>(session.id) }
+    cache.set(session.id, cached)
+  }
+  const suffix = events.slice(cached.last?.seq ?? 0)
+  cached.reducer.apply(suffix)
+  const tail = events.at(-1)
+  if (tail !== undefined) cached.last = { seq: tail.seq, type: tail.type }
+  return cached.reducer.current()
+}
+
 /** A deleted session leaves no per-session index behind (manifest, child indexes). */
 async function forgetSessionState(sessionId: SessionId, deps: HandlerDeps): Promise<void> {
   deps.lastManifests.delete(sessionId)
+  deps.contextReducers.delete(sessionId)
   deps.contextBodies.delete(sessionId)
   deps.sessionUsage.delete(sessionId)
   deps.completedRequests.delete(sessionId)
@@ -10015,6 +10048,7 @@ async function forgetSessionState(sessionId: SessionId, deps: HandlerDeps): Prom
   deps.prefixSnapshots.delete(sessionId)
   for (const childId of await deps.childExecutor.forgetRoot(sessionId)) {
     deps.lastManifests.delete(childId)
+    deps.contextReducers.delete(childId)
     deps.contextBodies.delete(childId)
     deps.sessionUsage.delete(childId)
     deps.completedRequests.delete(childId)

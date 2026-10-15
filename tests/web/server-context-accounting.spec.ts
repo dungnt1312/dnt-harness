@@ -52,13 +52,44 @@ describe('durable context accounting through HTTP',()=>{
     }finally{await server?.close();await fs.rm(home,{recursive:true,force:true})}
   })
 
+  it('GETs around a new terminal fact equal a fresh server reading the same home',async()=>{
+    const home=await fs.mkdtemp(path.join(tmpdir(),'context-accounting-incremental-'))
+    let server:WebServer|undefined
+    const boot=async()=>{server=await createWebServer({home,providers:[provider],configFile:path.join(home,'p.json'),limits:{automaticCompactionPressure:0}})}
+    try {
+      await boot()
+      const ws=(await(await fetch(`${server!.url}/api/workspaces`)).json())[0].id
+      const {id}=await(await fetch(`${server!.url}/api/workspaces/${ws}/sessions`,{method:'POST'})).json()
+      const endpoint=()=>`${server!.url}/api/workspaces/${ws}/sessions/${id}`
+      const logFile=path.join(home,'workspaces',ws,'sessions',id,'events.jsonl')
+      const turn=async(content:string,ends:number)=>{
+        await fetch(`${endpoint()}/messages`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({content})})
+        const deadline=Date.now()+5000
+        while(Date.now()<deadline){
+          const log=await fs.readFile(logFile,'utf8').catch(()=>'')
+          if(log.split('"type":"turn/end"').length>ends)break
+          await new Promise(r=>setTimeout(r,20))
+        }
+        await new Promise(r=>setTimeout(r,200))
+      }
+      await turn('a',1)
+      const first=await(await fetch(`${endpoint()}/manifest`)).json()
+      await turn('b',2)
+      const second=await(await fetch(`${endpoint()}/manifest`)).json()
+      expect(second.contextId).not.toBe(first.contextId)
+      expect(second.usage).toMatchObject({last:{inputTokens:120_000},cacheableInputTokens:240_000,cachedInputTokens:220_000})
+      await server!.close();server=undefined;await boot()
+      expect(await(await fetch(`${endpoint()}/manifest`)).json()).toEqual(second)
+    }finally{await server?.close();await fs.rm(home,{recursive:true,force:true})}
+  })
+
   it('a new assembly held before its barrier never shows the previous assembly usage.last',async()=>{
     const home=await fs.mkdtemp(path.join(tmpdir(),'context-accounting-pair-'))
     const server=await createWebServer({home,providers:[provider],configFile:path.join(home,'p.json'),limits:{automaticCompactionPressure:0}})
     let release!:()=>void
     const parked=new Promise<void>(r=>{release=r})
     const flush=FileSessionStore.prototype.flush
-    let spy:ReturnType<typeof vi.spyOn>|undefined
+    let spy:{mockRestore():void}|undefined
     try {
       const ws=(await(await fetch(`${server.url}/api/workspaces`)).json())[0].id
       const {id}=await(await fetch(`${server.url}/api/workspaces/${ws}/sessions`,{method:'POST'})).json()
