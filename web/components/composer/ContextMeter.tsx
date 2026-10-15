@@ -1,6 +1,6 @@
 import { Menu } from '../ui/Menu.tsx'
 import { cn } from '../../lib/cn.ts'
-import { budgetTone, contextFill, formatPolicyPressure, policyPressure } from '../../lib/format.ts'
+import { budgetTone, contextFill, fillBasisTitle, formatPolicyPressure, policyPressure } from '../../lib/format.ts'
 import { isAvailableContext } from '../../../src/harness/context/context-state.ts'
 import type { ContextBreakdownView, ContextStatus, ContextView } from '../../lib/api.ts'
 import { composerFocusClass } from './composer-chip.ts'
@@ -86,7 +86,7 @@ export function ContextMeter({ manifest, status = manifest === null ? 'none' : '
           <div className="flex items-baseline justify-between gap-3">
             <span className="font-semibold">Context window</span>
             {summary !== null ? (
-              <span className="font-mono text-xs text-fg-muted" title={fill?.estimated === true ? 'Estimated (chars/4); the provider did not report usage' : 'Prompt tokens reported by the provider'}>
+              <span className="font-mono text-xs text-fg-muted" title={fill !== null ? fillBasisTitle(fill) : undefined}>
                 {summary}
               </span>
             ) : null}
@@ -105,15 +105,15 @@ export function ContextMeter({ manifest, status = manifest === null ? 'none' : '
               {postCompact ? <p className="m-0 text-xs text-fg-faint">After compaction · estimated — the next request replaces this preview.</p> : null}
               {!postCompact ? (
                 <dl className="m-0 flex flex-col gap-1 text-xs">
-                  <div className="flex items-center justify-between gap-3"><dt className="text-fg-muted">Last request</dt><dd className="m-0 font-mono">{fill.estimated ? 'estimated' : 'reported'}</dd></div>
+                  <div className="flex items-center justify-between gap-3"><dt className="text-fg-muted">Last request</dt><dd className="m-0 font-mono" title={fillBasisTitle(fill)}>{fill.basis}</dd></div>
                   {available?.model !== undefined ? <div className="flex items-center justify-between gap-3"><dt className="text-fg-muted">Model</dt><dd className="m-0 truncate font-mono">{available.model}</dd></div> : null}
-                  {!fill.estimated && available !== null && available.budget.usedTokens !== fill.used ? (
+                  {fill.basis !== 'estimated' && available !== null && available.budget.usedTokens !== fill.used ? (
                     <div className="flex items-center justify-between gap-3"><dt className="text-fg-muted">Estimate total</dt><dd className="m-0 font-mono">{formatTokens(available.budget.usedTokens)}</dd></div>
                   ) : null}
                 </dl>
               ) : null}
               {pressure !== undefined ? (
-                <p className="m-0 text-xs text-fg-muted" title="Auto-compact trigger: pre-trim estimate over the usable input budget. Not the window ring.">Auto-compact trigger: {formatPolicyPressure(pressure)}</p>
+                <p className="m-0 text-xs text-fg-muted" title="Auto-compact trigger: calibrated pre-trim count over the usable input budget. Not the window ring.">Auto-compact trigger: {formatPolicyPressure(pressure)}</p>
               ) : null}
               {/* The filled share of the window, split by source in proportion. */}
               <div className="flex h-2 overflow-hidden rounded-full bg-muted" role="presentation">
@@ -129,13 +129,13 @@ export function ContextMeter({ manifest, status = manifest === null ? 'none' : '
               {breakdown !== undefined && breakdownTotal > 0 ? (
                 <ul className="flex flex-col gap-2">
                   {CATEGORIES.map((category) => (
-                    <li key={category.key} className="flex items-center gap-2.5" title={`${breakdown[category.key].toLocaleString()} tokens, estimated (chars/4)`}>
+                    <li key={category.key} className="flex items-center gap-2.5" title={`${breakdown[category.key].toLocaleString()} tokens, estimated (chars/3)`}>
                       <span className={cn('size-2 shrink-0 rounded-full', category.shade)} aria-hidden="true" />
                       <span className="flex-1 text-fg-muted">{category.label}</span>
                       <span className="font-mono text-xs">{formatTokens(breakdown[category.key])}</span>
                     </li>
                   ))}
-                  <li className="text-xs text-fg-faint">Estimated source tokens (chars/4). The total above is the provider count when it reported one.</li>
+                  <li className="text-xs text-fg-faint">Estimated source tokens (chars/3). The total above follows the provider count when one was reported.</li>
                 </ul>
               ) : null}
 

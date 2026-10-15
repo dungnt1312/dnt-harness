@@ -8,7 +8,7 @@
 import { useState } from 'react'
 import Icon from '../common/Icon.tsx'
 import { cn } from '../../lib/cn.ts'
-import { budgetTone, formatDuration, formatTime, formatTokenCount } from '../../lib/format.ts'
+import { budgetTone, contextFill, fillBasisTitle, formatDuration, formatTime, formatTokenCount } from '../../lib/format.ts'
 import { fetchContextBody } from '../../lib/api.ts'
 import type { ContextManifestView } from '../../lib/types.ts'
 import type { TrajectoryAttempt, TrajectoryCall, TrajectoryStep, TrajectoryTurn, StepTrace } from './trajectory.ts'
@@ -154,10 +154,8 @@ function ManifestView({ manifest, workspaceId, sessionId }: {
   readonly workspaceId?: string | null | undefined
   readonly sessionId?: string | null | undefined
 }) {
-  const limit = manifest.budget.contextLimitTokens ?? manifest.budget.availableTokens
-  const reported = manifest.usage?.last?.inputTokens
-  const used = reported ?? manifest.budget.usedTokens
-  const estimated = reported === undefined
+  const fill = contextFill(manifest)
+  const { used, limit } = fill
   const percent = limit > 0 ? Math.round((used / limit) * 100) : 0
   const tone = budgetTone(used, limit)
   const breakdown = manifest.breakdown
@@ -175,8 +173,8 @@ function ManifestView({ manifest, workspaceId, sessionId }: {
       <Fact term="Window">
         <span className="flex flex-wrap items-baseline gap-x-2 font-mono">
           <span className="font-semibold text-fg">{formatTokenCount(used)}/{formatTokenCount(limit)} tok</span>
-          <span className={cn('rounded-full px-1.5 py-px text-[10px] font-semibold', estimated ? 'bg-muted text-fg-faint' : 'bg-ok-soft text-ok')}>
-            {estimated ? 'est' : 'reported'}
+          <span title={fillBasisTitle(fill)} className={cn('rounded-full px-1.5 py-px text-[10px] font-semibold', fill.basis === 'estimated' ? 'bg-muted text-fg-faint' : 'bg-ok-soft text-ok')}>
+            {fill.basis === 'estimated' ? 'est' : fill.basis}
           </span>
           <span className={cn('text-[11px] font-semibold', tone === 'ok' ? 'text-fg-faint' : tone === 'warn' ? 'text-warn' : 'text-bad')}>{percent}%</span>
         </span>

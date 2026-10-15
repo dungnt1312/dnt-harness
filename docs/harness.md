@@ -619,7 +619,7 @@ e.g. a stream that closed empty — is asked again with exponential backoff, 3
 extra attempts by default; a stop cancels the wait, and a failure after output
 started is never retried), `toolTimeoutMs`, `approvalExpiryMs`, `toolOutputLimit`,
 `readOnlyToolConcurrency` (read-only calls of one batch running at once, default 10),
-`maxPendingInputs`, `automaticCompactionPressure` (estimated pre-trim tokens/availableTokens
+`maxPendingInputs`, `automaticCompactionPressure` (calibrated pre-trim tokens/availableTokens
 ratio from the settled turn's fresh context manifest that triggers automatic
 compaction at a completed boundary; 0 disables), `compactionRetainTokens`
 (estimated-token cap on covered messages kept verbatim beside the summary —
@@ -717,9 +717,11 @@ This repair applies to the legacy fold only, not the effective generator. An exp
 With no model pair, the extractive fallback preserves the exact source only if
 it fits within 24,000 characters, otherwise it fails explicitly.
 Automatic compaction triggers only for compact-history mode after a completed
-turn, using that turn's fresh estimated `preTrimTokens/availableTokens` pressure
-(falling back to `usedTokens` for older manifests). This measures pressure before
-microcompaction and budget trimming, not provider-measured token usage. Attempts
+turn, using that turn's last request pre-trim count over `availableTokens`
+(`settledPressureTokens`): scaled by the request's own reported/estimated ratio
+when the provider measured it, otherwise `budget.measured.preTrimTokens`, and on
+older manifests `preTrimTokens`, then `usedTokens`. This measures pressure before
+microcompaction and budget trimming. Attempts
 are deduplicated by completed boundary; rejected, empty, failed and cancelled
 turns never reuse stale pressure. The standard web bin enables 0.85; embedded
 hosts default to disabled and explicit zero disables it. Headless integration
@@ -786,7 +788,7 @@ runs and the behavior above is unchanged.
   request that cannot fit its own answer is not sent: the host folds the transcript
   instead (`path: "recovery"`). The size is the provider-reported input of the captured
   request plus a 20% margin on what is appended; an unmeasured capture is estimated at
-  chars/4 + 20%, and a request rebuilt from the log with the context builder's own
+  chars/3 + 20%, and a request rebuilt from the log with the context builder's own
   estimate (no margin — the builder already fitted that request to the budget).
 - **Adoption.** `adoptPreparedCompaction` commits the summary under the same
   per-session transaction as the fold, but its cutoff may be *older* than the newest
@@ -907,8 +909,9 @@ root stops waiting:
   wordings OpenAI-compatible gateways use) is not final: the loop assembles the
   request again with `ModelRequest.squeeze` raised, and `squeezeBudget` shrinks
   the builder's budget by level (×0.7, ×0.45, ×0.25) so microcompact and the
-  other trims actually send less. The chars/4 estimate runs low on non-English
-  text and code; this is the correction. Only after the last level is the
+  other trims actually send less. The builder already calibrates against the
+  previous request's provider count; squeeze covers what calibration cannot
+  see (a first request, or a jump in new content). Only after the last level is the
   failure final.
 - *Stalled or empty.* Every attempt streams under its own abort controller, so a
   timeout before first model progress (`streamFirstEventMs`) aborts that attempt,

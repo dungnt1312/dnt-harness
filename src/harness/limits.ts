@@ -46,8 +46,9 @@ export interface HarnessLimits {
   /** Bound on durably queued pending inputs per session. */
   readonly maxPendingInputs: number
   /**
-   * Estimated pre-trim context pressure (preTrimTokens/availableTokens from
-   * the settled turn's fresh context manifest) that triggers automatic
+   * Pre-trim context pressure (preTrimTokens/availableTokens from the settled
+   * turn's fresh context manifest, calibrated by the provider's reported count
+   * when one exists — see `settledPressureTokens`) that triggers automatic
    * compaction at a completed boundary; 0 disables.
    */
   readonly automaticCompactionPressure: number

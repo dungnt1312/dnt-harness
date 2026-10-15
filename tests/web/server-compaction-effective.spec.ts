@@ -684,7 +684,7 @@ describe('effective compaction through the web server', () => {
     expect(baseline.availableTokens).toBe(WINDOW - 4_096 - 1_024)
     // Fill the conversation to ~85% of the window, as the automatic trigger would see it.
     const fill = Math.floor(0.85 * baseline.availableTokens) - baseline.usedTokens
-    await completedMessage(first.base, first.wsId, id, logPath, 'w'.repeat(fill * 4), 2)
+    await completedMessage(first.base, first.wsId, id, logPath, 'w'.repeat(fill * 3), 2)
     const pressure = (await budget()).usedTokens / baseline.availableTokens
     expect(pressure).toBeGreaterThan(0.8)
     expect(pressure).toBeLessThan(0.9)

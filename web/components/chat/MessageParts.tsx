@@ -11,7 +11,7 @@ import { IconButton } from '../ui/IconButton.tsx'
 import { Markdown } from '../../Markdown.tsx'
 import { ThinkingPanel } from './ThinkingPanel.tsx'
 import { useHoldScroll } from '../../hooks/useStickToBottom.ts'
-import { budgetTone, compactionTokenChange, contextFill, formatBytes, formatElapsed, formatTime, formatTokenCount } from '../../lib/format.ts'
+import { budgetTone, compactionTokenChange, contextFill, fillBasisTitle, formatBytes, formatElapsed, formatTime, formatTokenCount } from '../../lib/format.ts'
 import { agentAction, exitIsAnswer, isDenied, mcpServerOf, readImageOf, toolFacts, type ToolFacts } from '../../lib/tool-facts.ts'
 import { PATH_LINK_ATTR, ansiToHtml } from '../../lib/ansi.ts'
 import { commandBase, freeTextLinker, rebase, searchLinker, type LineLinker, type PathRef } from '../../lib/path-links.ts'
@@ -2121,7 +2121,7 @@ export const ContextMarker = memo(function ContextMarker({ item, workspaceId, se
     ? 'none'
     : toolNames.length <= 8 ? toolNames.join(', ') : `${toolNames.slice(0, 8).join(', ')} +${toolNames.length - 8} more`
   const collapsedFacts = [
-    `${formatTokenCount(fill.used)} tok${fill.estimated ? ' est' : ''}`,
+    `${formatTokenCount(fill.used)} tok${fill.basis === 'estimated' ? ' est' : fill.basis === 'calibrated' ? ' cal' : ''}`,
     history.includedTurns > 0 ? `${history.includedTurns} turn${history.includedTurns === 1 ? '' : 's'}` : undefined,
     (item.requests ?? 1) > 1 ? `${item.requests} requests` : undefined,
     sources.skills.length > 0 ? `${sources.skills.length} skill${sources.skills.length === 1 ? '' : 's'}` : undefined,
@@ -2163,7 +2163,7 @@ export const ContextMarker = memo(function ContextMarker({ item, workspaceId, se
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
-        title={`${formatTokenCount(fill.used)}${fill.estimated ? ' estimated' : ' reported'} of ${formatTokenCount(fill.limit)} context used${item.ts !== undefined ? ` · ${formatTime(item.ts)}` : ''}`}
+        title={`${formatTokenCount(fill.used)}${` ${fill.basis}`} of ${formatTokenCount(fill.limit)} context used${item.ts !== undefined ? ` · ${formatTime(item.ts)}` : ''}`}
         className="group -ml-1.5 flex min-w-0 items-center gap-2 rounded-lg px-1.5 py-1 text-left text-xs text-fg-muted transition-colors hover:bg-hover hover:text-fg"
       >
         <Icon name="layers" size={13} className="shrink-0 text-fg-faint" />
@@ -2202,9 +2202,9 @@ export const ContextMarker = memo(function ContextMarker({ item, workspaceId, se
                 <span className="font-mono text-[13px] font-semibold text-fg">{formatTokenCount(fill.used)}/{formatTokenCount(fill.limit)} tok</span>
                 <span className={cn(
                   'rounded-full px-1.5 py-px font-mono text-[10px] font-semibold',
-                  fill.estimated ? 'bg-muted text-fg-faint' : 'bg-ok-soft text-ok',
-                )} title={fill.estimated ? 'Estimated (chars/4); the provider did not report usage' : 'Prompt tokens reported by the provider'}>
-                  {fill.estimated ? 'est' : 'reported'}
+                  fill.basis === 'estimated' ? 'bg-muted text-fg-faint' : 'bg-ok-soft text-ok',
+                )} title={fillBasisTitle(fill)}>
+                  {fill.basis === 'estimated' ? 'est' : fill.basis}
                 </span>
                 <span className={cn(
                   'font-mono text-[11px] font-semibold',

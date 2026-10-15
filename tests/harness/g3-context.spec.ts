@@ -281,11 +281,11 @@ describe('mode-driven assembly', () => {
   })
 
   it('budget trims the catalog before loaded skills — discovery yields to in-use content', () => {
-    const skillBody = 'x'.repeat(8_400)
+    const skillBody = 'x'.repeat(6_300)
     const assembled = buildContext(base({
       activeSkills: [{ name: 'big', instructions: skillBody, hash: 'b'.repeat(64) }],
-      skillCatalog: [{ name: 'listed', description: 'y'.repeat(2_800) }],
-      budget: { ...DEFAULT_BUDGET, contextLimitTokens: 3_500, outputReserveTokens: 512, marginTokens: 256 },
+      skillCatalog: [{ name: 'listed', description: 'y'.repeat(2_100) }],
+      budget: { ...DEFAULT_BUDGET, contextLimitTokens: 3_900, outputReserveTokens: 512, marginTokens: 256 },
     }))
     expect(assembled.manifest.omissions.some((line) => line.startsWith('skill-catalog:'))).toBe(true)
     expect(assembled.manifest.omissions.some((line) => line.startsWith('skills:'))).toBe(false)

@@ -202,7 +202,7 @@ export async function buildRestoration(input: BuildInput): Promise<Restoration |
   for (const candidate of skillCandidates(used)) {
     input.signal.throwIfAborted()
     const full = estimateTokens(candidate.body)
-    const body = full > RESTORATION_SKILL_TOKENS ? candidate.body.slice(0, RESTORATION_SKILL_TOKENS * 4) : candidate.body
+    const body = full > RESTORATION_SKILL_TOKENS ? candidate.body.slice(0, RESTORATION_SKILL_TOKENS * 3) : candidate.body
     const tokens = estimateTokens(body)
     if (skillTokens + tokens > RESTORATION_SKILLS_TOTAL_TOKENS) {
       add(reference('skill', candidate.name, 'reference', 'not restored — skill budget exhausted; load it again if needed'))

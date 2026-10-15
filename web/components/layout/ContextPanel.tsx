@@ -3,7 +3,7 @@ import ConfirmDialog from '../common/ConfirmDialog.tsx'
 import { useToast } from '../common/Toast.tsx'
 import { Button } from '../ui/Button.tsx'
 import { compactSession, CompactionCancelled, type ContextStatus, type ContextView, type StreamState } from '../../lib/api.ts'
-import { budgetTone, compactionTokenChange, contextFill, formatPolicyPressure, policyPressure } from '../../lib/format.ts'
+import { budgetTone, compactionTokenChange, contextFill, fillBasisTitle, formatPolicyPressure, policyPressure } from '../../lib/format.ts'
 import { isAvailableContext } from '../../../src/harness/context/context-state.ts'
 import { cn } from '../../lib/cn.ts'
 import type { Meta, SessionModel, WorkspaceMeta } from '../../lib/types.ts'
@@ -160,11 +160,11 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
             ) : null}
             {available.display?.kind !== 'post-compaction' ? (
               <Row term="request">
-                {fill?.estimated === true ? 'estimated' : 'reported'}
+                {fill?.basis ?? 'estimated'}
                 {available.model !== undefined ? ` · ${available.model}` : ''}
               </Row>
             ) : null}
-            {pressure !== undefined ? <Row term="auto-compact"><span title="Pre-trim estimate over the usable input budget; not the window bar.">trigger: {formatPolicyPressure(pressure)}</span></Row> : null}
+            {pressure !== undefined ? <Row term="auto-compact"><span title="Calibrated pre-trim count over the usable input budget; not the window bar.">trigger: {formatPolicyPressure(pressure)}</span></Row> : null}
             <Row term="mode">{available.modeId} · rev {available.modeRevision}{available.sources.modeSource !== undefined ? ` · ${available.sources.modeSource}` : ''}</Row>
             {available.sources.environment !== undefined ? (
               <Row term="environment">
@@ -180,8 +180,8 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
                   <span className="h-1.5 overflow-hidden rounded-full bg-muted" role="presentation">
                     <span className={cn('block h-full rounded-full', TONE_BAR[tone])} style={{ width: `${percent}%` }} />
                   </span>
-                  <span title={fill.estimated ? 'Estimated (chars/4); the provider did not report usage. Denominator is the model context window.' : 'Prompt tokens reported by the provider, over the model context window.'}>
-                    {fill.used}/{fill.limit} tok {fill.estimated ? '(est)' : '(reported)'}
+                  <span title={`${fillBasisTitle(fill)}. Denominator is the model context window.`}>
+                    {fill.used}/{fill.limit} tok ({fill.basis === 'estimated' ? 'est' : fill.basis})
                   </span>
                 </span>
               ) : '—'}

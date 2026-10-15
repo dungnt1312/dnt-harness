@@ -242,7 +242,7 @@ function DiscoveredTools({ row }: { readonly row: McpServerRow }) {
             {row.toolSchemaTokens !== undefined && row.toolSchemaTokens > 0 ? (
               <span
                 className="text-xs font-normal text-fg-faint"
-                title={`Estimated context cost (chars/4) of the exposed tool schemas in every model request; matches the MCP segment of the context meter. A real tokenizer can differ.`}
+                title={`Estimated context cost (chars/3) of the exposed tool schemas in every model request; matches the MCP segment of the context meter. A real tokenizer can differ.`}
               >
                 · ~{row.toolSchemaTokens.toLocaleString()} tok/request
               </span>

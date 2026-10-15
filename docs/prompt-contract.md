@@ -160,6 +160,24 @@ usage and compaction effects — is replayed by one browser-safe reducer
 `tests/harness/context-state.spec.ts`) shared by the manifest API, the
 trajectory projector and the web UI.
 
+Token counts use one estimator, `estimateTokens` in
+`src/harness/context/calibration.ts`: chars/3 rounded up, CJK ideographs
+counted twice (`budget.estimator: 'c3'`). Budget decisions follow the
+provider's count, as ZCode does: `latestCalibration` finds the newest request
+the provider measured (terminal attempt with usage, paired with its manifest by
+`contextId`, same estimator, base estimate of at least 1 000 tokens, no
+successful compaction since; a measurement of another model or provider stops
+the search), and the builder scales every comparison (microcompact threshold,
+each trim step, `ContextBudgetError`) by that request's reported/estimated
+ratio, clamped to [1, 3] (calibration only tightens). A ratio rather than an absolute offset: the
+estimator's error grows with the content, so it stays right when the next
+request trims, drops or squeezes differently. `usedTokens`, `preTrimTokens`
+and `breakdown` stay pure estimates; `budget.measured` carries the calibrated
+`tokens`/`preTrimTokens`, the `ratio` and `source: 'provider_usage' |
+'estimate'`. After a turn settles, automatic compaction uses the last
+request's own report when the provider measured it (`settledPressureTokens`).
+Compaction previews never calibrate: they describe a different history.
+
 ## History
 
 Per mode setting: `none` (current turn only), `recent` (full log),

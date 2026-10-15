@@ -188,6 +188,7 @@ import type { BuildContextInput, PreviewCompaction } from '../harness/context/bu
 import type { CompactionMeasurement } from '../harness/session/events.ts'
 import type { Restored } from '../harness/context/compaction.ts'
 import { createContextReducer, deriveContextState, isAvailableContext, type ContextReducer, type ContextResponse } from '../harness/context/context-state.ts'
+import { latestCalibration, pressureTokensOf, settledPressureTokens } from '../harness/context/calibration.ts'
 import { isValidTokenUsage } from '../harness/context/context-metrics.ts'
 import { CommandsService } from '../harness/commands/service.ts'
 import { PluginService } from '../harness/plugins/service.ts'
@@ -1629,7 +1630,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     const previous = deriveContextState(entry.session.committedEvents, entry.session.id)
     const before = previous !== null && isAvailableContext(previous) ? previous : undefined
     const reported = before?.usage?.last?.inputTokens
-    const tokensBefore = reported ?? before?.budget.usedTokens
+    const tokensBefore = reported ?? before?.budget.measured?.tokens ?? before?.budget.usedTokens
     const tokensAfter = contextAfter.budget.usedTokens
     return { contextEffect: 'replaced', contextAfter, tokensAfter,
       ...(tokensBefore !== undefined ? { tokensBefore } : {}),
@@ -1893,7 +1894,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       if (rootModeOf({ sessionId: entry.session.id }, entry.workspaceId).mode.definition.sources.history !== 'compact') return
       const manifest = lastManifests.get(entry.session.id)
       if (manifest === undefined || manifest.budget.availableTokens <= 0) return
-      const pressure = (manifest.budget.preTrimTokens ?? manifest.budget.usedTokens) / manifest.budget.availableTokens
+      const pressure = pressureTokensOf(manifest.budget) / manifest.budget.availableTokens
       if (pressure < limits.compactionPrecomputePressure) return
       const standing = recoverCanonicalCheckpoint(entry.session.committedEvents)
       if (standing !== undefined && standing.coversSeq >= snapshot.cutoff) return
@@ -1951,8 +1952,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     if (rootModeOf(scope, scope.workspaceId).mode.definition.sources.history !== 'compact') return
     const manifest = lastManifests.get(scope.sessionId)
     if (manifest === undefined) return
-    const { usedTokens, availableTokens, preTrimTokens } = manifest.budget
-    if (availableTokens <= 0 || (preTrimTokens ?? usedTokens) / availableTokens < limits.automaticCompactionPressure) return
+    const { availableTokens } = manifest.budget
+    const latest = latestCalibration(entry.session.committedEvents, { model: manifest.model, provider: manifest.provider })
+    if (availableTokens <= 0 || settledPressureTokens(manifest, latest) / availableTokens < limits.automaticCompactionPressure) return
     const boundary = entry.session.events.findLast((event) => event.type === 'turn/end' && event.turnId === turnId)
     if (boundary === undefined || automaticBoundaries.get(scope.sessionId) === boundary.seq) return
     automaticBoundaries.set(scope.sessionId, boundary.seq)
@@ -3498,7 +3500,7 @@ ${entry.description}`.toLowerCase().includes(query))
 
   // Tap every scoped completion for its `usage` event: the context meter
   // shows the provider's real prompt size and cache hits, not only the
-  // builder's chars/4 estimate. Events pass through untouched.
+  // builder's chars/3 estimate. Events pass through untouched.
   //
   // `last` is cleared when the NEXT request is assembled and only rewritten
   // once THIS stream reports usage. Otherwise a manifest fetched between
@@ -3835,6 +3837,7 @@ ${entry.description}`.toLowerCase().includes(query))
       pinnedMemory.unshift(memoryGuidance(fileScope.memoryRoots, guidanceAccess))
     }
     const environment = await environmentBlockFor(scope, fileScope).catch(() => undefined)
+    const calibration = preview === undefined ? latestCalibration(events, { model: effective.model, provider: effective.provider }) : undefined
     const buildInput: BuildContextInput = {
       nativeVision,
       ...(fileScope !== undefined
@@ -3861,6 +3864,8 @@ ${entry.description}`.toLowerCase().includes(query))
       compactionRetainTokens: limits.compactionRetainTokens,
       budget,
       ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
+      // The provider's last report calibrates this assembly's budget (ZCode parity).
+      ...(calibration !== undefined ? { calibration } : {}),
       ...(compaction !== undefined ? { compaction } : {}),
       ...(loadedAttachments !== undefined ? { attachments: loadedAttachments } : {}),
       ...(promptOverrides?.base.overridden === true ? { baseSystemOverride: promptOverrides.base.text } : {}),
@@ -5289,7 +5294,7 @@ function mcpToolDescription(serverName: string, descriptor: McpToolDescriptor): 
 }
 
 /**
- * Estimated tokens (chars/4, the same `schemaCost` the context builder
+ * Estimated tokens (chars/3, the same `schemaCost` the context builder
  * charges to `breakdown.mcpTools`) for the schemas this workspace would
  * carry for one server: provider-valid, allowlist-exposed descriptors.
  * Pure so the API row route can call it against the live descriptor map.

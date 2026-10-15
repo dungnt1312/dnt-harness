@@ -169,7 +169,7 @@ export interface TokenEstimate {
   readonly basis: 'reported' | 'estimated'
 }
 
-const charsToTokens = (chars: number): number => Math.ceil(chars / 4)
+const charsToTokens = (chars: number): number => Math.ceil(chars / 3)
 
 function messageChars(message: ModelMessage): number {
   const content = typeof message.content === 'string' ? message.content : JSON.stringify(message.content)

@@ -10,6 +10,7 @@ import { isCompletedCompactionBoundary, MAX_COMPACTION_SUMMARY_CHARS, recoverCan
 import type { ResolvedMode } from '../modes/types.ts'
 import type { GrantedRoot } from '../tools/types.ts'
 import { estimateTokens, estimateContentTokens, schemaCost, budgetFor, squeezeBudget, ContextBudgetError, type BudgetConfig, type ResolvedBudget, type WindowSource } from './budget.ts'
+import { TOKEN_ESTIMATOR, calibrated, calibrationRatio, type ContextCalibration } from './calibration.ts'
 import { formatSentStamp } from './environment.ts'
 import {
   COMPACTION_POLICY_VERSION,
@@ -70,6 +71,13 @@ export interface BuildContextInput {
    * (`ModelRequest.squeeze`): the budget shrinks by level so a retry sends less.
    */
   readonly squeeze?: number
+  /**
+   * The latest provider-measured request (`latestCalibration`). Its
+   * reported/estimated ratio scales every budget comparison, so
+   * trimming and the compaction pressure follow the provider's count, not the
+   * estimate alone. Previews ignore it: they describe a different history.
+   */
+  readonly calibration?: ContextCalibration
   /**
    * Latest compaction checkpoint, when the history setting is `compact`.
    */
@@ -191,6 +199,13 @@ export interface ContextManifest {
     /** Token costs always remain estimates, independently of window provenance. */
     readonly estimated: boolean
     readonly windowSource?: WindowSource
+    /** Which estimator produced the counts above; calibration only pairs within one. */
+    readonly estimator?: string
+    /**
+     * The count budget decisions used: the estimate plus the latest provider
+     * ratio (`provider_usage`), or the estimate alone (`estimate`).
+     */
+    readonly measured?: ContextMeasured
   }
   /** Where `usedTokens` went, per source, measured on the final request. */
   readonly breakdown: ContextBreakdown
@@ -234,6 +249,19 @@ export interface ContextManifest {
     readonly hash: string
     readonly chars: number
   }[]
+}
+
+/** The budget's decision count: the estimate, calibrated by the provider's last report when one stands. */
+export interface ContextMeasured {
+  readonly source: 'provider_usage' | 'estimate'
+  /** Expected input tokens of this request (`usedTokens` × ratio). */
+  readonly tokens: number
+  /** Pre-trim count the compaction pressure reads (`preTrimTokens` × ratio). */
+  readonly preTrimTokens: number
+  /** The measured request the ratio came from (`provider_usage` only). */
+  readonly baseContextId?: string
+  /** Reported over estimated tokens of that request, clamped (`provider_usage` only). */
+  readonly ratio?: number
 }
 
 /** Estimated tokens per request source; the fields sum to `usedTokens`. */
@@ -496,6 +524,14 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
     omissions.push('compaction: invalid checkpoint ignored; canonical history retained')
   }
   const available = budgetFor(squeezeBudget(input.budget, input.squeeze))
+  // Provider calibration (ZCode parity): the last measured request's
+  // reported/estimated ratio scales every budget comparison below, so
+  // decisions follow the provider's count. A preview describes another
+  // history and never calibrates.
+  const calibration = preview === undefined ? input.calibration : undefined
+  const ratio = calibration !== undefined ? calibrationRatio(calibration) : 1
+  /** Whether `tokens` of estimate, calibrated, exceed `limit`. */
+  const exceeds = (tokens: number, limit: number): boolean => calibrated(tokens, ratio) > limit
 
   // Chat sends no tool schemas — the builder enforces the ceiling too. (The
   // omission is recorded below, in its established manifest position.)
@@ -713,7 +749,7 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
   const losses: ProjectionLoss[] = []
   const resultBySeq = new Map<number, Extract<SessionEvent, { type: 'tool/result' }>>()
   for (const event of input.events) if (event.type === 'tool/result') resultBySeq.set(event.seq, event)
-  if (used > available * MICROCOMPACT_PRESSURE) {
+  if (exceeds(used, available * MICROCOMPACT_PRESSURE)) {
     const compacted = microcompactToolResults(dated, resultBySeq)
     if (compacted !== undefined) {
       const after = fixedCost() + historyCostOf(compacted.dated, historyStart)
@@ -725,7 +761,7 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
       }
     }
   }
-  if (used > available && catalogMessage !== undefined) {
+  if (exceeds(used, available) && catalogMessage !== undefined) {
     // Discovery goes before loaded skills: the catalog serves future choices,
     // an active skill's body is already in use by this request.
     omissions.push('skill-catalog: dropped for budget')
@@ -733,7 +769,7 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
     catalogMessage = undefined
     used = fixedCost() + historyCost(historyStart)
   }
-  if (used > available && skills.length > 0) {
+  if (exceeds(used, available) && skills.length > 0) {
     omissions.push(`skills: dropped for budget`)
     skills.forEach((skill, index) => {
       losses.push({ kind: 'regenerable-section', source: `skill:${skill.name}`, hash: sha256Text(asPlainText(skillMessages[index]?.content ?? skill.instructions)) })
@@ -742,14 +778,14 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
     skillMessages.length = 0 // the measured texts leave with the source
     used = fixedCost() + historyCost(historyStart)
   }
-  if (used > available && inheritedMessage !== undefined && input.inheritedContext !== undefined) {
+  if (exceeds(used, available) && inheritedMessage !== undefined && input.inheritedContext !== undefined) {
     omissions.push(`parent-context: dropped for budget (${input.inheritedContext.length} chars)`)
     // Not a restorable section (it is the parent's bounded projection): never eligible.
     losses.push({ kind: 'unknown', reason: 'parent-context-dropped' })
     inheritedMessage = undefined
     used = fixedCost() + historyCost(historyStart)
   }
-  if (used > available && memory.length > 0) {
+  if (exceeds(used, available) && memory.length > 0) {
     omissions.push('memory: dropped for budget')
     memory.forEach((entry, index) => {
       losses.push({ kind: 'regenerable-section', source: `memory:${entry.id}`, hash: sha256Text(asPlainText(memoryMessages[index]?.content ?? entry.body)) })
@@ -758,14 +794,14 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
     memoryMessages.length = 0
     used = fixedCost() + historyCost(historyStart)
   }
-  if (used > available) {
+  if (exceeds(used, available)) {
     // Drop whole COMPLETED turns, oldest first, until it fits or only the
     // open turn remains. Boundaries are computed in seq space so a
     // tool-call/result pair can never split.
     const boundaries = completedTurnBoundaries(input.events, window.openTurnStartSeq ?? Number.POSITIVE_INFINITY)
     let droppedFrom = 1
     for (const boundary of boundaries) {
-      if (used <= available) break
+      if (!exceeds(used, available)) break
       const turnFrom = droppedFrom
       droppedFrom = boundary
       let next = historyStart
@@ -784,7 +820,7 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
       used = fixedCost() + historyCost(historyStart)
     }
   }
-  if (used > available) {
+  if (exceeds(used, available)) {
     // Last resort before failing loudly: nothing else can shrink an open turn,
     // so clear every old tool result but the newest one. Estimates can run low,
     // and a failed request is worse than a model that must re-run a tool.
@@ -796,8 +832,8 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
       omissions.push(`tool-results: cleared ${aggressive.cleared} more old result(s), last resort before failing`)
     }
   }
-  if (used > available) {
-    throw new ContextBudgetError(used, available)
+  if (exceeds(used, available)) {
+    throw new ContextBudgetError(calibrated(used, ratio), available)
   }
 
   // Split the surviving cost by source, from the same measured texts, so
@@ -868,6 +904,10 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
       contextLimitTokens: input.budget.contextLimitTokens,
       estimated: true,
       ...(input.budget.windowSource !== undefined ? { windowSource: input.budget.windowSource } : {}),
+      estimator: TOKEN_ESTIMATOR,
+      measured: calibration !== undefined
+        ? { source: 'provider_usage', tokens: calibrated(used, ratio), preTrimTokens: calibrated(preTrimTokens, ratio), baseContextId: calibration.contextId, ratio }
+        : { source: 'estimate', tokens: used, preTrimTokens },
     },
     breakdown,
     history: {

@@ -218,7 +218,7 @@ export class OpenAiCompletionsProvider implements LlmProvider {
         : {}),
       stream: true,
       // The final chunk then carries `usage` (real prompt/cached counts),
-      // which the context meter shows instead of a chars/4 estimate.
+      // which the context meter shows instead of a raw estimate.
       stream_options: { include_usage: true },
     }
     const maxTokens = outputTokenCap(model, this.options.maxOutputTokens, request.maxOutputTokens)

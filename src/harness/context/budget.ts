@@ -1,11 +1,15 @@
 /**
  * Budget arithmetic for context assembly. Token counts are ESTIMATES
- * (chars/4) — honest, labeled as such, and configurable per model. The
+ * (chars/3, CJK counted twice) — honest, labeled as such. The provider's
+ * reported count calibrates them per request (see calibration.ts). The
  * budget is the context window minus the output reserve and a safety
  * margin; tool schemas are part of the cost.
  */
 import type { ContentPart } from '../llm/types.ts'
 import { resolveContextWindow } from '../llm/model-catalog.ts'
+import { estimateTokens } from './calibration.ts'
+
+export { estimateTokens }
 
 export interface BudgetConfig {
   /** The model's context window (an estimate unless verified). */
@@ -43,7 +47,7 @@ export function resolveModelBudget(input: { readonly model?: string; readonly co
 
 /**
  * Budget fractions for a request the provider already rejected as too large.
- * The estimate is chars/4, so a real tokenizer (non-English text, code) can
+ * The estimate is chars/3, so a real tokenizer (non-English text, code) can
  * run well above it; each level assumes the window is that much smaller.
  */
 const SQUEEZE_FACTORS: readonly number[] = [1, 0.7, 0.45, 0.25]
@@ -54,11 +58,6 @@ export const MAX_SQUEEZE_LEVEL = SQUEEZE_FACTORS.length - 1
 export function squeezeBudget<T extends BudgetConfig>(budget: T, level: number | undefined): T {
   const factor = SQUEEZE_FACTORS[Math.min(Math.max(Math.floor(level ?? 0), 0), MAX_SQUEEZE_LEVEL)] ?? 1
   return factor === 1 ? budget : { ...budget, contextLimitTokens: Math.floor(budget.contextLimitTokens * factor) }
-}
-
-/** Estimate one string's token cost (chars/4, rounded up). */
-export function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4)
 }
 
 /**

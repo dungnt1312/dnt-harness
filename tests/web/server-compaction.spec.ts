@@ -330,6 +330,52 @@ describe('web compaction', () => {
     expect(later.filter((e) => e.type === 'compaction/start')).toHaveLength(1)
   })
 
+  describe('automatic pressure follows the provider-measured count (AC-5)', () => {
+    /** Every chat reply reports `ratio` × the chars/3 size of what it received; summary calls report none. */
+    function reportingProvider(ratio: number): LlmProvider {
+      return { name: 'scripted', models: ['scripted'], async *stream(request) {
+        const summary = request.messages.some((m) => typeof m.content === 'string' && m.content.includes(COMPACT_MARK))
+        yield { type: 'delta', delta: summary ? SUMMARY_TEXT : 'short reply' }
+        const chars = request.messages.reduce((total, m) => total + (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)).length, 0) + JSON.stringify(request.tools ?? []).length
+        if (!summary) yield { type: 'usage', usage: { inputTokens: Math.ceil((chars / 3) * ratio), cachedInputTokens: 0 } }
+        yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+      } }
+    }
+    // ~133k estimated tokens: about half of the 250 880 budget, so only the provider ratio decides.
+    const LARGE = 'x'.repeat(400_000)
+    async function twoTurns(ratio: number, expectCompaction: boolean) {
+      const { home, base, wsId } = await start(reportingProvider(ratio), { automaticCompactionPressure: 0.85 })
+      const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+      const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+      await completedMessage(base, wsId, id, logPath, LARGE, 1)
+      await completedMessage(base, wsId, id, logPath, 'second', 2)
+      const read = async (): Promise<{ type: string; manifest?: unknown }[]> => (await fs.readFile(logPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+      // The trigger runs at the settled boundary, just after turn/end is logged.
+      const log = expectCompaction ? await until(async () => { const rows = await read(); return rows.some((e) => e.type === 'compaction/start') ? rows : undefined }) : await read()
+      type Budget = { usedTokens: number; preTrimTokens: number; availableTokens: number; measured: { source: string; preTrimTokens: number } }
+      const budgets = log.filter((e) => e.type === 'context/manifest').map((e) => (e.manifest as { budget: Budget }).budget)
+      return { log, first: budgets[0]!, budget: budgets.at(-1)! }
+    }
+
+    it("compacts after the turn whose own report crosses the threshold although the estimate does not", async () => {
+      const { log, first, budget } = await twoTurns(2.2, true)
+      // The first request had nothing to calibrate against; its own report (×2.2) decides at turn end.
+      expect(first.measured.source).toBe('estimate')
+      expect(first.preTrimTokens / first.availableTokens).toBeLessThan(0.85)
+      expect(first.preTrimTokens * 2.2 / first.availableTokens).toBeGreaterThanOrEqual(0.85)
+      expect(log.filter((e) => e.type === 'compaction/start')).toHaveLength(1)
+      // After the compaction nothing calibrates across it.
+      expect(budget.measured.source).toBe('estimate')
+    })
+
+    it('does not compact while the measured count stays under the threshold', async () => {
+      const { log, budget } = await twoTurns(1, false)
+      expect(budget.measured.source).toBe('provider_usage')
+      expect(budget.measured.preTrimTokens / budget.availableTokens).toBeLessThan(0.85)
+      expect(log.filter((e) => e.type === 'compaction/start')).toHaveLength(0)
+    })
+  })
+
   it('explicit zero disables automatic compaction', async () => {
     const { provider, requests } = summarizingProvider()
     const { home, base, wsId } = await start(provider, { automaticCompactionPressure: 0 })

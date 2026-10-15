@@ -33,7 +33,7 @@ function used(rows: Row[], name: string, args: Record<string, unknown>, output =
 
 const open: Row[] = [{ type: 'turn/start', turnId: 't' }, { type: 'user/message', turnId: 't', content: 'work' }]
 const closed: Row[] = [{ type: 'turn/end', turnId: 't', reason: 'completed' }]
-const tokens = (text: string): number => Math.ceil(text.length / 4)
+const tokens = (text: string): number => Math.ceil(text.length / 3)
 
 let home: string
 let project: string
@@ -106,8 +106,8 @@ describe('buildRestoration', () => {
   })
 
   it('a file over the 5k-token cap becomes a path reference with no content (spec §10)', async () => {
-    await fs.writeFile(path.join(project, 'big.ts'), `BIGCONTENT${'x'.repeat(RESTORATION_FILE_TOKENS * 4)}`)
-    await fs.writeFile(path.join(project, 'edge.ts'), 'e'.repeat(RESTORATION_FILE_TOKENS * 4))
+    await fs.writeFile(path.join(project, 'big.ts'), `BIGCONTENT${'x'.repeat(RESTORATION_FILE_TOKENS * 3)}`)
+    await fs.writeFile(path.join(project, 'edge.ts'), 'e'.repeat(RESTORATION_FILE_TOKENS * 3))
     const rows: Row[] = []
     used(rows, 'Read', { path: 'big.ts' })
     used(rows, 'Read', { path: 'edge.ts' })
@@ -122,7 +122,7 @@ describe('buildRestoration', () => {
   it('keeps the file total inside 20k tokens: the files that do not fit become path references without content', async () => {
     const rows: Row[] = []
     for (let i = 0; i < RESTORATION_MAX_FILES; i++) {
-      await fs.writeFile(path.join(project, `big${i}.ts`), `${i}`.repeat(RESTORATION_FILE_TOKENS * 4))
+      await fs.writeFile(path.join(project, `big${i}.ts`), `${i}`.repeat(RESTORATION_FILE_TOKENS * 3))
       used(rows, 'Read', { path: `big${i}.ts` })
     }
     const restored = (await run(rows))!
@@ -188,7 +188,7 @@ describe('buildRestoration', () => {
     const rows: Row[] = []
     used(rows, 'Skill', { name: 'review' }, 'OLD review body')
     used(rows, 'Skill', { name: 'review' }, 'NEW review body')
-    used(rows, 'Skill', { name: 'long' }, 'y'.repeat(RESTORATION_SKILL_TOKENS * 4 * 2))
+    used(rows, 'Skill', { name: 'long' }, 'y'.repeat(RESTORATION_SKILL_TOKENS * 3 * 2))
     used(rows, 'Skill', { action: 'catalog' }, 'a catalog, not a skill')
     const restored = (await run(rows))!
     expect(restored.text).toContain('NEW review body')
@@ -202,9 +202,9 @@ describe('buildRestoration', () => {
   it('stays under the aggregate 25k cap and gives the task list priority over skills and files', async () => {
     const rows: Row[] = []
     used(rows, 'TodoWrite', { todos: [{ content: 'MUST SURVIVE', status: 'in_progress', activeForm: 'Surviving' }] })
-    for (let i = 0; i < 7; i++) used(rows, 'Skill', { name: `skill-${i}` }, `${i}`.repeat(RESTORATION_SKILL_TOKENS * 4))
+    for (let i = 0; i < 7; i++) used(rows, 'Skill', { name: `skill-${i}` }, `${i}`.repeat(RESTORATION_SKILL_TOKENS * 3))
     for (let i = 0; i < RESTORATION_MAX_FILES; i++) {
-      await fs.writeFile(path.join(project, `f${i}.ts`), `${i}`.repeat(RESTORATION_FILE_TOKENS * 4))
+      await fs.writeFile(path.join(project, `f${i}.ts`), `${i}`.repeat(RESTORATION_FILE_TOKENS * 3))
       used(rows, 'Read', { path: `f${i}.ts` })
     }
     const restored = (await run(rows))!

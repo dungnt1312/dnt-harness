@@ -234,7 +234,7 @@ describe('CompactionHost.compact: the effective path', () => {
 
   it('a reconstructed snapshot is sized with the builder estimate, without the unmeasured margin', async () => {
     // ~45k tokens of prefix: with the 1.2 margin it would not fit a 60k window beside 8k of output.
-    const big = (session: Session, id: string): EffectiveCompactionSnapshot => snapshotFor(session, 4, { id, request: { model: 'm', providerName: 'p', messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'u'.repeat(180_000) }] } })
+    const big = (session: Session, id: string): EffectiveCompactionSnapshot => snapshotFor(session, 4, { id, request: { model: 'm', providerName: 'p', messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: 'u'.repeat(135_000) }] } })
     const r = await rig()
     r.host.deps = { ...r.host.deps, contextWindowTokens: () => 60_000 }
     r.setExact(undefined)

@@ -187,7 +187,13 @@ export interface ContextManifestView {
   readonly modeRevision: number
   readonly model?: string
   readonly provider?: string
-  readonly budget: { readonly availableTokens: number; readonly usedTokens: number; readonly preTrimTokens?: number; readonly contextLimitTokens?: number; readonly estimated: boolean; readonly windowSource?: 'override'|'catalog'|'family'|'fallback' }
+  readonly budget: {
+    readonly availableTokens: number; readonly usedTokens: number; readonly preTrimTokens?: number; readonly contextLimitTokens?: number; readonly estimated: boolean; readonly windowSource?: 'override'|'catalog'|'family'|'fallback'
+    /** Estimator id (`c3` = chars/3); absent on legacy manifests (chars/4). */
+    readonly estimator?: string
+    /** The count budget decisions used: estimate times the last provider ratio, or the estimate alone. */
+    readonly measured?: { readonly source: 'provider_usage' | 'estimate'; readonly tokens: number; readonly preTrimTokens: number; readonly baseContextId?: string; readonly ratio?: number }
+  }
   /** Estimated tokens per source of the last request; sums to `usedTokens`. */
   readonly breakdown?: ContextBreakdownView
   /** Provider-reported usage, when the provider streams it. */
@@ -600,7 +606,7 @@ export interface McpServerRow {
   readonly lastError?: string
   /** Discovered tools whose public name LLM providers reject; never sent to the model. */
   readonly unusableTools?: readonly string[]
-  /** Estimated tokens (chars/4) the exposed tool schemas add to each model request; present when ready with tools. */
+  /** Estimated tokens (chars/3) the exposed tool schemas add to each model request; present when ready with tools. */
   readonly toolSchemaTokens?: number
   /** Recent server stderr, secrets masked. */
   readonly stderrTail?: string
