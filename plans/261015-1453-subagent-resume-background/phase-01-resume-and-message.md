@@ -1,7 +1,7 @@
 ---
 phase: 1
 title: Resume and message
-status: in-progress
+status: completed
 ---
 
 # Phase 1: Resume and message

@@ -186,8 +186,10 @@ Format: Claude Code subagent Markdown with YAML frontmatter.
 - `skills`: comma string or list; preloaded into the child.
 - `mcpServers`: comma string or list of server names; limits an inheriting
   role's MCP tools to those servers.
+- `background`: `true` or `false`; `true` makes the role's children outlive the
+  spawning turn and report back on their own (a spawn's `background` wins).
 - Recognized, not enforced, reported as notes: `permissionMode`, `hooks`,
-  `memory`, `color`, `effort`, `isolation`, `background`,
+  `memory`, `color`, `effort`, `isolation`,
   `maxTurns`. Unknown keys are ignored with a note.
 
 Settings → Agents lists every layer with its source and path; create/paste

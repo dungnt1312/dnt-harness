@@ -1,7 +1,7 @@
 ---
 phase: 2
 title: Background children
-status: pending
+status: completed
 ---
 
 # Phase 2: Background children

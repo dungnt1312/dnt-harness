@@ -1,6 +1,6 @@
 ---
 title: Subagent resume/steer and background children
-status: in-progress
+status: completed
 branch: feat/subagent-resume-background
 created: 2026-10-15
 ---
@@ -47,8 +47,8 @@ re-queuing undelivered notifications after restart.
 ## Phases
 | # | Phase | Status |
 |---|---|---|
-| 1 | [Resume and message](phase-01-resume-and-message.md) | in-progress |
-| 2 | [Background children](phase-02-background-children.md) | pending |
+| 1 | [Resume and message](phase-01-resume-and-message.md) | completed (5d5cf90, fda347d) |
+| 2 | [Background children](phase-02-background-children.md) | completed (8936bbf, fda347d) |
 
 ## Acceptance criteria
 - AC1 `message` to a running child with `queue` is answered in a later child turn; with `steer` the current turn ends `steered`.
@@ -62,3 +62,14 @@ re-queuing undelivered notifications after restart.
   delivered by `wait` only; an undeliverable report is handed back at the next turn join.
 - AC8 Frontmatter `background: true` is enforced (no longer an unsupported warning); spawn `background:false` overrides it.
 - `pnpm test`, `pnpm run typecheck`, `pnpm run build:web` pass (pre-existing flaky tests reported separately).
+
+## Result (2026-10-15)
+All AC1–AC8 covered by tests/harness/subagent-resume.spec.ts, tests/harness/subagent-background.spec.ts,
+tests/web/agent-background-wake.spec.ts and web projection specs. Typecheck and build:web clean; full suite
+4346/4349 with one known-flaky test per run (server-g1 steer / cross-root-lease), green in isolation.
+GPT-6.1-sol reviewed design and code; code findings fixed in fda347d.
+
+## Known limits (accepted)
+- Owed background reports live in memory: after a restart an undelivered report is not re-offered by join/wait
+  without ids (still readable via list/wait by id). Persist delivery per run if this matters.
+- A notification already queued is not withdrawn if a later `wait` by id also returns the same report.
