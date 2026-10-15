@@ -4,7 +4,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { contextFill } from '../../lib/format.ts'
 import { ContextMeter, formatTokens } from './ContextMeter.tsx'
-import type { ContextManifestView, ContextView } from '../../lib/api.ts'
+import type { ContextManifestView, ContextStatus, ContextView } from '../../lib/api.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 let root: Root | undefined
@@ -26,11 +26,11 @@ const MANIFEST: ContextManifestView = {
   omissions: [],
 }
 
-async function openMeter(manifest: ContextView | null): Promise<HTMLElement> {
+async function openMeter(manifest: ContextView | null, status?: ContextStatus): Promise<HTMLElement> {
   host = document.createElement('div')
   document.body.append(host)
   root = createRoot(host)
-  await act(async () => root!.render(<ContextMeter manifest={manifest} />))
+  await act(async () => root!.render(<ContextMeter manifest={manifest} {...(status !== undefined ? { status } : {})} />))
   const trigger = host.querySelector<HTMLButtonElement>('button')!
   await act(async () => {
     trigger.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0 }))
@@ -49,6 +49,42 @@ it('does not show a zero count when the current context is unavailable', async (
   const panel = await openMeter({ display: { kind: 'unavailable', reason: 'legacy-compaction' }, usage: { cacheableInputTokens: 0, cachedInputTokens: 0 } })
   expect(panel.textContent).toContain('Context estimate unavailable')
   expect(panel.textContent).not.toContain('0 /')
+})
+
+it('says loading or unavailable instead of "no request" or a zero count', async () => {
+  const loading = await openMeter(null, 'loading')
+  expect(loading.textContent).toContain('Loading context')
+  expect(loading.textContent).not.toContain('No recorded request')
+  await act(async () => root!.unmount())
+  root = undefined
+  host.remove()
+  // A stale value never shows through a non-ready status.
+  const failed = await openMeter(MANIFEST, 'error')
+  expect(failed.textContent).toContain('Context unavailable')
+  expect(failed.textContent).not.toContain('100K / 1M')
+})
+
+it('shows the measured request: its model, basis and estimate total beside the reported one', async () => {
+  const panel = await openMeter({ ...MANIFEST, model: 'glm-measured', usage: { last: { inputTokens: 139_100 }, cacheableInputTokens: 0, cachedInputTokens: 0 } })
+  expect(panel.textContent).toContain('Last requestreported')
+  expect(panel.textContent).toContain('Modelglm-measured')
+  expect(panel.textContent).toContain('Estimate total100K')
+  await act(async () => root!.unmount())
+  root = undefined
+  host.remove()
+  const estimated = await openMeter(MANIFEST)
+  expect(estimated.textContent).toContain('Last requestestimated')
+  expect(estimated.textContent).not.toContain('Estimate total')
+})
+
+it('shows the auto-compact trigger only when the host reports a policy', async () => {
+  const withPolicy = await openMeter({ ...MANIFEST, budget: { ...MANIFEST.budget, preTrimTokens: 850_000 }, policy: { automaticCompactionPressure: 0.85 } })
+  expect(withPolicy.textContent).toContain('Auto-compact trigger: 85% of input budget · auto-compacts at 85%')
+  await act(async () => root!.unmount())
+  root = undefined
+  host.remove()
+  const without = await openMeter(MANIFEST)
+  expect(without.textContent).not.toContain('Auto-compact')
 })
 
 it('formats token counts compactly', () => {

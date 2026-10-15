@@ -2,8 +2,8 @@ import { useEffect, useState, type ReactNode } from 'react'
 import ConfirmDialog from '../common/ConfirmDialog.tsx'
 import { useToast } from '../common/Toast.tsx'
 import { Button } from '../ui/Button.tsx'
-import { compactSession, CompactionCancelled, type ContextView, type StreamState } from '../../lib/api.ts'
-import { budgetTone, compactionTokenChange, contextFill } from '../../lib/format.ts'
+import { compactSession, CompactionCancelled, type ContextStatus, type ContextView, type StreamState } from '../../lib/api.ts'
+import { budgetTone, compactionTokenChange, contextFill, formatPolicyPressure, policyPressure } from '../../lib/format.ts'
 import { isAvailableContext } from '../../../src/harness/context/context-state.ts'
 import { cn } from '../../lib/cn.ts'
 import type { Meta, SessionModel, WorkspaceMeta } from '../../lib/types.ts'
@@ -53,6 +53,8 @@ export interface ContextPanelProps {
   readonly sessionFolder: string | null
   readonly eventCount: number
   readonly manifest?: ContextView | null
+  /** Ownership/fetch state of `manifest`; omitted means "whatever `manifest` shows". */
+  readonly manifestStatus?: ContextStatus
   readonly workspaceId?: string | null
   readonly running?: boolean
   readonly modeLabel?: string | null
@@ -60,8 +62,10 @@ export interface ContextPanelProps {
   readonly onOpenSettingsTab?: (tab: 'skills' | 'memory') => void
 }
 
-export function ContextPanel({ meta, sessionModel, globalDefaults, sessionControlsStatus, stream, sessionId, sessionFolder, eventCount, manifest, workspaceId, running = false, modeLabel, onCompacted, onOpenSettingsTab }: ContextPanelProps) {
+export function ContextPanel({ meta, sessionModel, globalDefaults, sessionControlsStatus, stream, sessionId, sessionFolder, eventCount, manifest: fetched, manifestStatus, workspaceId, running = false, modeLabel, onCompacted, onOpenSettingsTab }: ContextPanelProps) {
   const toast = useToast()
+  const status = manifestStatus ?? (fetched === undefined || fetched === null ? 'none' : 'ready')
+  const manifest = status === 'ready' ? fetched : null
   const controls = sessionModel?.source === 'global'
     ? globalDefaults ?? { provider: null, model: null }
     : sessionModel ?? { provider: meta?.provider ?? null, model: meta?.model ?? null }
@@ -99,6 +103,7 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
   const available = manifest !== undefined && manifest !== null && isAvailableContext(manifest) ? manifest : null
   const fill = available !== null ? contextFill(available) : undefined
   const tone = fill !== undefined ? budgetTone(fill.used, fill.limit) : 'ok'
+  const pressure = available !== null ? policyPressure(available) : undefined
   const percent = fill === undefined ? 0 : Math.round(fill.ratio * 100)
   const settingsLink = (tab: 'skills' | 'memory', names: readonly string[]): ReactNode => onOpenSettingsTab !== undefined
     ? <button type="button" className="text-left text-link hover:underline" onClick={() => onOpenSettingsTab(tab)}>{names.join(', ')}</button>
@@ -133,7 +138,17 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
           </Button>
         )}
       >
-        {manifest !== undefined && manifest !== null && !isAvailableContext(manifest) ? (
+        {status === 'loading' ? (
+          <div className="px-3 py-3 text-[13px] text-fg-muted">
+            <dt className="sr-only">Manifest</dt>
+            <dd className="m-0">Loading context…</dd>
+          </div>
+        ) : status === 'error' ? (
+          <div className="px-3 py-3 text-[13px] text-fg-muted">
+            <dt className="sr-only">Manifest</dt>
+            <dd className="m-0">Context unavailable</dd>
+          </div>
+        ) : manifest !== undefined && manifest !== null && !isAvailableContext(manifest) ? (
           <div className="px-3 py-3 text-[13px] text-fg-muted">
             <dt className="sr-only">Manifest</dt>
             <dd className="m-0">Context estimate unavailable until the next request{manifest.display.reason === 'preview-failed' ? ' (compaction preview failed)' : ''}.</dd>
@@ -143,6 +158,13 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
             {available.display?.kind === 'post-compaction' ? (
               <Row term="basis"><span title="Estimate rebuilt after compaction; the next request replaces it.">After compaction · estimated</span></Row>
             ) : null}
+            {available.display?.kind !== 'post-compaction' ? (
+              <Row term="request">
+                {fill?.estimated === true ? 'estimated' : 'reported'}
+                {available.model !== undefined ? ` · ${available.model}` : ''}
+              </Row>
+            ) : null}
+            {pressure !== undefined ? <Row term="auto-compact"><span title="Pre-trim estimate over the usable input budget; not the window bar.">trigger: {formatPolicyPressure(pressure)}</span></Row> : null}
             <Row term="mode">{available.modeId} · rev {available.modeRevision}{available.sources.modeSource !== undefined ? ` · ${available.sources.modeSource}` : ''}</Row>
             {available.sources.environment !== undefined ? (
               <Row term="environment">

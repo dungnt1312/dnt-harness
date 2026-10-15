@@ -37,3 +37,13 @@ it('formats the before/after token change only when it was measured', () => {
   expect(compactionTokenChange({})).toBeUndefined()
   expect(compactionTokenChange({ tokensBefore: 10 })).toBeUndefined()
 })
+
+it('labels both figures when the compaction compares a reported count with an estimate', () => {
+  const change = { tokensBefore: 120_000, tokensAfter: 30_000 }
+  expect(compactionTokenChange({ ...change, measurement: { before: { tokens: 120_000, basis: 'reported' }, after: { tokens: 30_000, basis: 'estimated' } } }))
+    .toBe('120k reported → 30k estimated tokens')
+  expect(compactionTokenChange({ ...change, measurement: { before: { tokens: 120_000, basis: 'estimated' }, after: { tokens: 30_000, basis: 'estimated' } } }))
+    .toBe('120k → 30k tokens')
+  // A scalar-only (older) event is an estimate on both sides, never "reported".
+  expect(compactionTokenChange(change)).not.toContain('reported')
+})
