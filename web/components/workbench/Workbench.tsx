@@ -13,7 +13,8 @@ import { QuickOpen } from './QuickOpen.tsx'
 import ConfirmDialog from '../common/ConfirmDialog.tsx'
 
 const TerminalPanel = lazy(async () => import('./TerminalPanel.tsx'))
-import { baseName, memoryTabOf, skillTabName } from '../../lib/project-paths.ts'
+import { baseName, memoryTabOf, skillTabName, turnTabId } from '../../lib/project-paths.ts'
+import { TurnChangesView } from './TurnChangesView.tsx'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
 import { cn } from '../../lib/cn.ts'
 import type { WorkbenchFiles } from '../../hooks/useWorkbenchFiles.ts'
@@ -94,7 +95,7 @@ function ViewTab({ view, active, onClick, onClose }: {
  * tab strip. (`events`/`agentEvents` are new arrays per frame by design; the
  * views that read them re-render on their own `useMemo` deps instead.)
  */
-export const Workbench = memo(function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, agentFocus = null, onAgentFocus, terminalShell = null, onTerminalShell, bindingReady = true, gitPathFilter = null, gitFocusPath = null, onClearGitFilter, onGitTrustChange, processFocus = null, agentWrites }: {
+export const Workbench = memo(function Workbench({ workspaceId, project, view, onView, views, onViews, files, context, events, agentEvents, expanded, onToggleExpand, onClose, openPath, sessionId = null, agentsSessionId = null, onOpenChild, agentFocus = null, onAgentFocus, terminalShell = null, onTerminalShell, bindingReady = true, onGitTrustChange, processFocus = null, agentWrites }: {
   readonly workspaceId: string | null
   /** The project whose files are browsable; null for chat-only conversations. */
   readonly project: WorkbenchProject | null
@@ -144,15 +145,6 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
   readonly bindingReady?: boolean
   /** The background process the Environment panel focused, if any. */
   readonly processFocus?: string | null
-  /**
-   * Project-relative paths the Git view narrows to while reviewing one turn's
-   * recorded writes; null shows every change. Set by a card's Review all.
-   */
-  readonly gitPathFilter?: readonly string[] | null
-  /** The Git view row a card's file click opened, pre-expanded to its diff. */
-  readonly gitFocusPath?: { readonly path: string; readonly nonce: number } | null
-  /** Clears the turn filter (the banner's Show all). */
-  readonly onClearGitFilter?: () => void
   /** The Git view trusted or restricted the project: the owner of the project list records it. */
   readonly onGitTrustChange?: (projectId: string, trusted: boolean) => void
   /** Project-relative path → seq of the agent's latest landed Edit/Write; an open file re-reads when its entry moves. */
@@ -229,7 +221,11 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
   useEffect(() => { if (!filesShowing) setQuickOpen(false) }, [filesShowing])
 
   let body: ReactNode = null
-  if (activeView === 'files') {
+  const activeTurn = turnTabId(files.activeFile)
+  if (activeView === 'files' && activeTurn !== null) {
+    // A turn's changes come from the log alone: no project folder or git involved.
+    body = <TurnChangesView key={activeTurn} turnId={activeTurn} events={events} {...(openPath !== undefined ? { openPath } : {})} />
+  } else if (activeView === 'files') {
     body = project !== null && workspaceId !== null ? (
       <FilesWorkspace key={project.id} workspaceId={workspaceId} project={project} files={files} treeVisible={treeVisible} treeFraction={treeFraction} onTreeFraction={setTreeFraction} {...(agentWrites !== undefined ? { agentWrites } : {})} />
     ) : (
@@ -343,11 +339,12 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
         <div className="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-line bg-bg" role="group" aria-label="Open files">
           {files.openFiles.map((path) => {
             const active = files.activeFile === path
+            const turn = turnTabId(path) !== null
             return (
               <span key={path} className={cn('group relative flex h-full shrink-0 items-center border-r border-line', active ? 'bg-bg' : 'bg-muted/40 hover:bg-hover')}>
-                <button type="button" aria-pressed={active} title={skillTabName(path) !== null ? `Skill ${baseName(path)}` : memoryTabOf(path) !== null ? `Memory ${memoryTabOf(path)?.file ?? ''}` : path} onClick={() => files.openFile(path)} className={cn('flex h-full items-center gap-1.5 pl-3 pr-1 text-[13px]', active ? 'text-fg' : 'text-fg-muted hover:text-fg')}>
-                  <FileTypeIcon path={skillTabName(path) !== null ? 'SKILL.md' : memoryTabOf(path) !== null ? baseName(path) : path} size={14} />
-                  <span className="max-w-[12rem] truncate">{baseName(path)}</span>
+                <button type="button" aria-pressed={active} title={turn ? 'Changes of one turn, from the conversation log' : skillTabName(path) !== null ? `Skill ${baseName(path)}` : memoryTabOf(path) !== null ? `Memory ${memoryTabOf(path)?.file ?? ''}` : path} onClick={() => files.openFile(path)} className={cn('flex h-full items-center gap-1.5 pl-3 pr-1 text-[13px]', active ? 'text-fg' : 'text-fg-muted hover:text-fg')}>
+                  {turn ? <Icon name="layers" size={14} /> : <FileTypeIcon path={skillTabName(path) !== null ? 'SKILL.md' : memoryTabOf(path) !== null ? baseName(path) : path} size={14} />}
+                  <span className="max-w-[12rem] truncate">{turn ? 'Turn changes' : baseName(path)}</span>
                   {files.drafts?.[path]?.dirty === true ? <span role="img" aria-label="Unsaved changes" className="size-1.5 shrink-0 rounded-full bg-warn" /> : null}
                 </button>
                 <button type="button" aria-label={`Close ${path}`} title="Close" onClick={() => files.closeFile(path)} className={cn('mr-1 flex size-5 items-center justify-center rounded text-fg-faint hover:bg-hover hover:text-fg [@media(pointer:coarse)]:size-7', active ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100 [@media(pointer:coarse)]:opacity-100')}>
@@ -369,10 +366,7 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
               active={activeView === 'git'}
               workspaceId={workspaceId}
               project={project}
-              {...(gitPathFilter !== null && gitPathFilter.length > 0 ? { pathFilter: gitPathFilter } : {})}
-              {...(gitFocusPath !== null ? { focusPath: gitFocusPath.path, focusNonce: gitFocusPath.nonce } : {})}
               {...(openPath !== undefined ? { onOpenFile: (path: string) => { openPath(`${project.path}/${path}`)?.() } } : {})}
-              {...(onClearGitFilter !== undefined ? { onShowAll: onClearGitFilter } : {})}
               {...(onGitTrustChange !== undefined ? { onGitTrustChange: (trusted: boolean) => onGitTrustChange(project.id, trusted) } : {})}
             />
           </div>
@@ -403,7 +397,7 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
 }, (previous, next) => {
   // Log props (events, agentEvents, context.eventCount) arrive fresh each
   // streamed frame; only the views that read the log re-render for them.
-  const logReads = next.view === 'trajectory' || next.view === 'agents'
+  const logReads = next.view === 'trajectory' || next.view === 'agents' || (next.view === 'files' && turnTabId(next.files.activeFile) !== null)
   if (logReads && (previous.events !== next.events || previous.agentEvents !== next.agentEvents)) return false
   return previous.workspaceId === next.workspaceId
     && previous.project === next.project
@@ -424,9 +418,6 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
     && previous.onTerminalShell === next.onTerminalShell
     && previous.bindingReady === next.bindingReady
     && previous.processFocus === next.processFocus
-    && previous.gitPathFilter === next.gitPathFilter
-    && previous.gitFocusPath === next.gitFocusPath
-    && previous.onClearGitFilter === next.onClearGitFilter
     && previous.onGitTrustChange === next.onGitTrustChange
     && previous.agentWrites === next.agentWrites
 })

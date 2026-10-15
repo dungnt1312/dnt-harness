@@ -63,6 +63,18 @@ it('shows token counts per source, not percentages', async () => {
   expect(panel.textContent).toContain('Average cache hit rate99%')
 })
 
+it('trigger draws a fill arc, and a dashed ring (no arc) before any request', async () => {
+  await openMeter(MANIFEST)
+  const filled = host.querySelector('button')!
+  expect(filled.querySelectorAll('circle')).toHaveLength(2)
+  await act(async () => root!.unmount())
+  host.remove()
+  await openMeter(null)
+  const empty = host.querySelector('button')!
+  expect(empty.querySelectorAll('circle')).toHaveLength(1)
+  expect(empty.querySelector('circle')!.getAttribute('stroke-dasharray')).not.toBeNull()
+})
+
 it('marks an estimate and says when no request has run yet', async () => {
   const estimated = await openMeter(MANIFEST)
   expect(estimated.textContent).toContain('100K / 1M')

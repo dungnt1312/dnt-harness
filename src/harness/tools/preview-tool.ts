@@ -40,7 +40,8 @@ export function sendPreviewTool(options: SendPreviewOptions): ToolDefinition {
     description: [
       'Show the user a preview in the chat: an image or a chart. It displays only; it creates nothing.',
       "Give exactly one of: 'attachmentId' (a stored image: a user attachment or a GenerateImage/EditImage result), 'path' (a png/jpeg/webp/gif file inside the granted folders, e.g. a screenshot), or 'chart'.",
-      "A chart is { type: 'bar'|'line', labels: string[], series: [{ name, values: number[] }] } with up to 8 series and 500 points; values.length must equal labels.length.",
+      "A chart is { type: 'bar'|'line', labels: string[], series: [{ name, values: number[], color? }], xLabel?, yLabel?, showValues? } with up to 8 series and 500 points; values.length must equal labels.length.",
+      "Optional: series color as hex (#rgb or #rrggbb; default palette otherwise), xLabel/yLabel axis titles (up to 60 characters), showValues to print each value (only drawn up to 40 values in total).",
       'For anything else (diagram, table), render it to an image first.',
       'The preview is shown inline automatically; after success reply briefly and do not repeat the data or tell the user any file path or id.',
     ].join(' '),
@@ -60,8 +61,15 @@ export function sendPreviewTool(options: SendPreviewOptions): ToolDefinition {
             labels: { type: 'array', items: { type: 'string' } },
             series: {
               type: 'array',
-              items: { type: 'object', properties: { name: { type: 'string' }, values: { type: 'array', items: { type: 'number' } } }, required: ['name', 'values'] },
+              items: {
+                type: 'object',
+                properties: { name: { type: 'string' }, values: { type: 'array', items: { type: 'number' } }, color: { type: 'string', description: 'Hex colour, e.g. #3b82f6.' } },
+                required: ['name', 'values'],
+              },
             },
+            xLabel: { type: 'string', description: 'X axis title.' },
+            yLabel: { type: 'string', description: 'Y axis title.' },
+            showValues: { type: 'boolean', description: 'Print each value on its bar or point.' },
           },
           required: ['type', 'labels', 'series'],
         },

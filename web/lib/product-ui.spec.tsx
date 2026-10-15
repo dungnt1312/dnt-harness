@@ -981,7 +981,7 @@ describe('transcript truthfulness', () => {
     expect(host.querySelector('button[aria-label="Reuse in composer"]')).toBeNull()
   })
   it('renders skill and file chips inline in a user message', async () => {
-    await mount(<UserBubble item={{ kind: 'user', content: '/review check @web/lib/api.ts now' }} />)
+    await mount(<UserBubble item={{ kind: 'user', content: '/review check [@api.ts](./web/lib/api.ts) now' }} />)
     const chips = Array.from(host.querySelectorAll('[data-chip-kind]'))
     expect(chips.map((chip) => [chip.getAttribute('data-chip-kind'), chip.textContent, chip.getAttribute('title')])).toEqual([
       ['command', 'review', 'Command: /review'],
@@ -992,7 +992,7 @@ describe('transcript truthfulness', () => {
   it('a skill chip opens its SKILL.md when the name is a skill; other chips stay labels', async () => {
     const open = vi.fn()
     const openSkill = vi.fn((name: string) => (name === 'review' ? open : null))
-    await mount(<UserBubble item={{ kind: 'user', content: '/review check @web/lib/api.ts now' }} openSkill={openSkill} />)
+    await mount(<UserBubble item={{ kind: 'user', content: '/review check [@api.ts](./web/lib/api.ts) now' }} openSkill={openSkill} />)
     const button = host.querySelector<HTMLButtonElement>('button[data-chip-kind="command"]')!
     expect(button.getAttribute('aria-label')).toBe('Open skill review in workbench')
     await act(async () => button.click())
@@ -1005,7 +1005,7 @@ describe('transcript truthfulness', () => {
   it('a mention chip opens its file when the opener resolves; otherwise it stays a label', async () => {
     const open = vi.fn()
     const openMention = vi.fn((segment: ChipSegment) => (segment.kind === 'mention' && segment.path === 'web/lib/api.ts' ? open : null))
-    await mount(<UserBubble item={{ kind: 'user', content: 'check @web/lib/api.ts and @../outside.md' }} openMention={openMention} />)
+    await mount(<UserBubble item={{ kind: 'user', content: 'check [@api.ts](./web/lib/api.ts) and [@outside.md](./../outside.md)' }} openMention={openMention} />)
     const button = host.querySelector<HTMLButtonElement>('button[data-chip-kind="mention"]')!
     expect(button.getAttribute('aria-label')).toBe('Open api.ts in workbench')
     await act(async () => button.click())
@@ -1014,7 +1014,7 @@ describe('transcript truthfulness', () => {
     expect(host.querySelector('button[data-chip-kind="mention"]')).not.toBeNull()
     expect(host.querySelector('span[data-chip-kind="mention"]')).not.toBeNull()
     // No opener at all: every mention stays a label.
-    await mount(<UserBubble item={{ kind: 'user', content: 'check @web/lib/api.ts' }} />)
+    await mount(<UserBubble item={{ kind: 'user', content: 'check [@api.ts](./web/lib/api.ts)' }} />)
     expect(host.querySelector('button[data-chip-kind="mention"]')).toBeNull()
     expect(host.querySelector('span[data-chip-kind="mention"]')).not.toBeNull()
   })

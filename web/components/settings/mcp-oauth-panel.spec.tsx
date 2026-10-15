@@ -159,7 +159,7 @@ describe('MCP panel OAuth', () => {
     ] as never)
     await render()
     const text = document.body.textContent ?? ''
-    expect(text).toContain('Connected')
+    expect(text).toContain('Signed in')
     expect(text).toContain('Needs sign-in')
     expect(text).toContain('needs scope write')
     expect(text).toContain('Not connected')

@@ -186,7 +186,9 @@
     top: 0;
     left: 0;
     right: 0;
-    padding: 14px 20px;
+    /* The editor's own padding: a fixed value drifts from the utilities and
+       makes the empty editor overflow into a scrollbar. */
+    padding: inherit;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;

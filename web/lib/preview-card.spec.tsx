@@ -62,6 +62,19 @@ describe('SendPreview row', () => {
     expect(host.querySelectorAll('svg polyline')).toHaveLength(2)
   })
 
+  it('uses a series colour, axis titles and value labels when given, and rejects non-hex colours', async () => {
+    const custom = { ...chart, xLabel: 'Day', yLabel: 'Requests', showValues: true, series: [{ name: 'hits', values: [3, 5], color: '#ff0000' }, { name: 'miss', values: [1, 0] }] }
+    await mount(item({ kind: 'chart', chart: custom }))
+    expect(host.querySelector('rect[data-bar]')?.getAttribute('fill')).toBe('#ff0000')
+    expect(host.querySelectorAll('rect[data-bar]')[2]?.getAttribute('fill')).not.toBe('#ff0000')
+    expect(host.querySelector('[data-axis-title="x"]')?.textContent).toBe('Day')
+    expect(host.querySelector('[data-axis-title="y"]')?.textContent).toBe('Requests')
+    expect(host.querySelectorAll('text[data-value]')).toHaveLength(4)
+    for (const bad of ['red', 'url(#x)', '#12', '#ggg', 5]) {
+      expect(previewOf(item({ kind: 'chart', chart: { ...chart, series: [{ name: 'x', values: [1, 2], color: bad }] } }))).toBeNull()
+    }
+  })
+
   it('never renders model text as markup', async () => {
     await mount(item({ kind: 'chart', chart: { ...chart, labels: ['<img src=x onerror=1>', 'b'] }, caption: '<b>bold</b>' }))
     expect(host.querySelector('img')).toBeNull()

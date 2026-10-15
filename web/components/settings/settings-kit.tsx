@@ -233,6 +233,31 @@ export function SubTabs<V extends string>({ label, value, onChange, tabs }: {
   )
 }
 
+/** One row of filter chips (category, marketplace) above a browse list. */
+export function FilterChips({ label, value, onChange, items }: {
+  readonly label: string
+  readonly value: string
+  readonly onChange: (value: string) => void
+  readonly items: readonly { readonly value: string; readonly label: string; readonly count: number }[]
+}) {
+  return (
+    <div role="group" aria-label={label} className="flex flex-wrap gap-1.5">
+      {items.map((item) => (
+        <button
+          key={item.value}
+          type="button"
+          aria-pressed={value === item.value}
+          onClick={() => onChange(item.value)}
+          className="inline-flex h-6 items-center gap-1 rounded-full border border-line px-2.5 text-xs text-fg-muted transition-colors hover:text-fg aria-pressed:border-fg-faint aria-pressed:bg-hover aria-pressed:text-fg"
+        >
+          {item.label}
+          <span className="text-fg-faint">{item.count}</span>
+        </button>
+      ))}
+    </div>
+  )
+}
+
 /** Compact labelled switch for list rows ("In picker", "Enabled"). */
 export function InlineSwitch({ label, ariaLabel, checked, disabled = false, title, onChange }: {
   /** Visible text before the switch; omit when the row already makes the meaning obvious. */

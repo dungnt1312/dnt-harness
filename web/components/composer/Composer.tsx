@@ -94,7 +94,7 @@ const pastedTextFile = (text: string, date = new Date()): File => {
  * be put back inline; ArrowUp on an empty draft recalls the last message.
  */
 export function Composer({
-  workspaceId = null, modelControl, contextControl, connected, sending = false, running, compacting = false,
+  workspaceId = null, modelControl, contextControl, folderControl, connected, sending = false, running, compacting = false,
   draft, onDraft, onSend, onStop, onCommand,
   modelValue, thinkingValue = null, modelSettings, onThinking, thinkingMenuLabel, thinkingDisabled = false,
   controlsUnavailable = false, controlsUnavailableMessage, onRetryControls,
@@ -106,6 +106,8 @@ export function Composer({
   readonly modelControl?: ReactNode
   /** Context-window meter, owned by the app; shown before the model picker. */
   readonly contextControl?: ReactNode
+  /** Extra-folders chip, owned by the app; shown beside the mode (both decide access). */
+  readonly folderControl?: ReactNode
   readonly sending?: boolean
   readonly connected: boolean
   readonly running: boolean
@@ -553,7 +555,7 @@ export function Composer({
           folders, context, model, thinking and the run cluster — shares a
           single line instead of stacking into two or three. Text survives in
           tooltips and menu panels; the row scrolls only as a last resort. */}
-      <div className="flex min-w-0 items-center gap-1 overflow-x-auto px-2.5 pb-2.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+      <div className="flex min-w-0 items-center gap-0.5 overflow-x-auto px-3 pb-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
         <div className="flex flex-none items-center gap-0.5">
           {onUploadFiles !== undefined || onSearchFiles !== undefined ? (
             <AttachMenu
@@ -563,6 +565,7 @@ export function Composer({
             />
           ) : null}
           {modeValue !== null && modes.length > 0 ? <ModeMenu modes={modes} value={modeValue} {...(modeMenuLabel !== undefined ? { label: modeMenuLabel } : {})} onChange={onMode} /> : null}
+          {folderControl}
           {controlsUnavailable && controlsUnavailableMessage !== undefined ? (
             <ControlsStatus message={controlsUnavailableMessage} onRetry={onRetryControls} />
           ) : null}
@@ -572,6 +575,7 @@ export function Composer({
             that model's capability, so the two belong side by side. */}
         <div className="flex min-w-0 flex-1 items-center justify-end gap-1">
           {contextControl}
+          {contextControl !== undefined && modelControl !== undefined ? <span aria-hidden="true" className="mx-1 h-4 w-px shrink-0 bg-line" /> : null}
           {modelControl}
           {modelId !== null && onThinking !== undefined ? (
             <ThinkingMenu
@@ -649,7 +653,9 @@ export function Composer({
               title={running ? 'Queue — runs after the current turn (Enter)' : 'Send (Enter) · Shift+Enter for a new line'}
               disabled={!eligible || sending}
               className={cn(
-                'flex min-h-9 shrink-0 items-center justify-center gap-1.5 rounded-full bg-primary text-primary-fg transition-opacity hover:opacity-85 disabled:opacity-30',
+                'flex min-h-9 shrink-0 items-center justify-center gap-1.5 rounded-full transition-colors',
+                // Muted until there is something to send, then the one bright control on the row.
+                eligible || sending ? 'bg-primary text-primary-fg hover:opacity-85' : 'bg-hover text-fg-faint',
                 running ? 'px-3' : 'size-9',
               )}
             >

@@ -2,6 +2,7 @@ import { Menu } from '../ui/Menu.tsx'
 import { cn } from '../../lib/cn.ts'
 import { budgetTone, contextFill } from '../../lib/format.ts'
 import type { ContextBreakdownView, ContextManifestView } from '../../lib/api.ts'
+import { composerFocusClass } from './composer-chip.ts'
 
 /** Breakdown rows in the order they render, each a deeper-to-lighter shade. */
 const CATEGORIES: readonly { readonly key: keyof ContextBreakdownView; readonly label: string; readonly shade: string }[] = [
@@ -23,14 +24,17 @@ export function formatTokens(tokens: number): string {
 
 const TONE_STROKE = { ok: 'stroke-link', warn: 'stroke-warn', bad: 'stroke-bad' } as const
 
-/** Small progress ring for the trigger chip. */
-function Ring({ ratio, tone }: { readonly ratio: number; readonly tone: keyof typeof TONE_STROKE }) {
+/**
+ * Small progress ring for the trigger chip. With no recorded request it is a
+ * faint dashed outline: a grey track with a short arc reads as a spinner.
+ */
+function Ring({ ratio, tone, empty }: { readonly ratio: number; readonly tone: keyof typeof TONE_STROKE; readonly empty: boolean }) {
   const radius = 6.5
   const circumference = 2 * Math.PI * radius
   return (
-    <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true" className="-rotate-90">
-      <circle cx="9" cy="9" r={radius} fill="none" strokeWidth="2.25" className="stroke-line-strong" />
-      {ratio > 0 ? (
+    <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true" className={cn('-rotate-90', empty && 'opacity-50')}>
+      <circle cx="9" cy="9" r={radius} fill="none" strokeWidth={empty ? 1.5 : 2.25} strokeDasharray={empty ? '2 2.5' : undefined} className="stroke-line-strong" />
+      {!empty && ratio > 0 ? (
         <circle
           cx="9"
           cy="9"
@@ -67,9 +71,9 @@ export function ContextMeter({ manifest }: { readonly manifest: ContextManifestV
       side="top"
       align="end"
       compact
-      triggerClassName="flex size-8 shrink-0 items-center justify-center rounded-full transition-colors hover:bg-hover [@media(pointer:coarse)]:size-9"
+      triggerClassName={cn('flex size-8 shrink-0 items-center justify-center rounded-full transition-colors hover:bg-hover [@media(pointer:coarse)]:size-9', composerFocusClass)}
       panelClassName="w-72 p-4"
-      trigger={() => <Ring ratio={fill?.ratio ?? 0} tone={tone} />}
+      trigger={() => <Ring ratio={fill?.ratio ?? 0} tone={tone} empty={fill === null} />}
     >
       {() => (
         <div className="flex flex-col gap-3 text-sm">

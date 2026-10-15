@@ -324,7 +324,7 @@ describe('$ skill menu', () => {
     expect(options().map((option) => option.textContent)).toEqual(['reviewCheck a diff'])
     key('Enter')
     expect(chips()).toHaveLength(1)
-    expect(draftText(current)).toBe('use Use the review skill: ')
+    expect(draftText(current)).toBe('use [$review](skill://review) ')
     expect(current.segments).toEqual([
       { kind: 'text', text: 'use ' },
       { kind: 'command', name: 'review' },

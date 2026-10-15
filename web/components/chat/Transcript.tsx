@@ -4,7 +4,6 @@ import type { RetryTarget, ViewItem } from '../../lib/project.ts'
 import { turnChanges, type TurnChanges } from '../../lib/turn-changes.ts'
 import type { SseEvent } from '../../lib/types.ts'
 import type { OpenPathResolver } from '../../lib/project-paths.ts'
-import { toProjectRelative } from '../../lib/project-paths.ts'
 import { processRows, type ProcessRow } from '../../lib/processes-view.ts'
 import { hiddenSpawnCalls } from '../../lib/spawn-merge.ts'
 import { turnTimings, type TurnTiming } from '../../lib/turn-timing.ts'
@@ -235,7 +234,7 @@ function latestStepOpen(items: readonly ViewItem[]): boolean {
  * Memoized: the app re-renders on every composer keystroke, and a long
  * transcript must not re-render with it while its own props are unchanged.
  */
-export const Transcript = memo(function Transcript({ items, events, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, openPath, openSkill, openMention, project, onReviewFile, onReviewChanges, onOpenProcess }: {
+export const Transcript = memo(function Transcript({ items, events, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, openPath, openSkill, openMention, onReviewTurn, onOpenProcess }: {
   readonly items: readonly ViewItem[]
   /** The raw log behind `items`; per-turn changes project from it. */
   readonly events?: readonly SseEvent[]
@@ -251,12 +250,8 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   readonly openSkill?: (name: string) => (() => void) | null
   /** Opens a mention chip's file in the workbench; null when the path is not project-local. */
   readonly openMention?: (segment: ChipSegment) => (() => void) | null
-  /** The conversation's project, for the per-turn change card's git chips. */
-  readonly project?: WorkbenchProject | null
-  /** Reviews one file of a turn: the Git view focused on that diff. */
-  readonly onReviewFile?: (path: string) => void
-  /** Reviews one turn: the Git view narrowed to the turn's recorded files. */
-  readonly onReviewChanges?: (paths: readonly string[]) => void
+  /** Reviews one turn: its recorded diff as a workbench tab (never git). */
+  readonly onReviewTurn?: (turnId: string) => void
   /** Opens a background process's live detail in the workbench. */
   readonly onOpenProcess?: (processId: string) => void
 }) {
@@ -295,19 +290,6 @@ export const Transcript = memo(function Transcript({ items, events, conversation
     Math.ceil((typeof window === 'undefined' ? 900 : window.innerHeight) / 24))))
   const visibleStart = Math.max(0, blocks.length - visibleLimit)
   const visibleBlocks = useMemo(() => blocks.slice(visibleStart), [blocks, visibleStart])
-  // Reviews exactly the given turn's files in the Git view, in the
-  // project-relative form git status reports. Paths that resolve outside the
-  // project are dropped: git cannot see them anyway, and the card's own list
-  // still shows them.
-  const reviewAllOf = (changes: TurnChanges): (() => void) | undefined => {
-    if (onReviewChanges === undefined || project == null) return undefined
-    return () => {
-      const root = project.path
-      onReviewChanges(changes.files
-        .map((file) => toProjectRelative(root, file.path))
-        .filter((path): path is string => path !== null))
-    }
-  }
   // Each turn's change card sits at the END of that turn — after its last
   // row, whether or not the turn wrote any answer text — and the open turn's
   // card is the same element, live, growing as edits land.
@@ -317,17 +299,14 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   // transcript after it keeps its normal beat above the next block. Either way
   // it sits further from the tool row above it than the old 6px.
   const changeCard = (anchor: TurnChangeAnchor, atTail: boolean): ReactNode => {
-    const review = reviewAllOf(anchor.changes)
     return (
       <div key={`turn-changes-${anchor.turnId}`} className={atTail ? 'mt-3 -mb-4' : 'mt-3'}>
         <TurnChangesCard
           turnId={anchor.turnId}
           changes={anchor.changes}
-          project={project ?? null}
           live={anchor.live}
           {...(openPath !== undefined ? { onOpenPath: openPath } : {})}
-          {...(onReviewFile !== undefined ? { onReviewFile } : {})}
-          {...(review !== undefined ? { onReviewAll: review } : {})}
+          {...(onReviewTurn !== undefined ? { onReviewAll: () => onReviewTurn(anchor.turnId) } : {})}
         />
       </div>
     )
@@ -472,7 +451,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
                 and a standalone tool row are both work items, so they share the
                 same gap instead of a run's vertical margin stacking on the
                 next row's. */}
-            <div ref={columnRef} className="mx-auto flex w-full max-w-3xl flex-col px-1">
+            <div ref={columnRef} className="mx-auto flex w-full max-w-3xl flex-col">
               {visibleStart > 0 ? (
                 <button
                   type="button"

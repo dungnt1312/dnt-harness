@@ -2,6 +2,7 @@ import { forwardRef, useImperativeHandle, useLayoutEffect, useRef } from 'react'
 import { normalizeDraft, type DraftSegment, type RichDraft } from '../../lib/composer-draft.ts'
 import { chipLabel, chipTitle, type ChipSegment } from '../../lib/inline-chips.ts'
 import { readProjectFileDrag } from '../../lib/file-tree.ts'
+import { cn } from '../../lib/cn.ts'
 import { CHIP_CLASS, CHIP_ICON_CLASS, CHIP_ICON_PATHS, CHIP_ICON_SIZE, CHIP_LABEL_CLASS, CHIP_TONE, MENTION_ICON_FALLBACK, chipAriaLabel, mentionIconSrc } from '../common/InlineChip.tsx'
 import { classifyPlainTextPaste, SAFE_MODEL_VISIBLE_BYTES, utf8Bytes } from './paste-classification.ts'
 
@@ -157,7 +158,8 @@ function chipElement(segment: ChipSegment, document: Document): HTMLElement {
   host.setAttribute(CHIP_ATTRIBUTE, JSON.stringify(segment))
   host.setAttribute('contenteditable', 'false')
   host.dataset['chipKind'] = segment.kind
-  host.className = `${CHIP_CLASS} ${CHIP_TONE.editor} select-none`
+  // cn, so the editor tone's max-w-full replaces the base 16rem cap instead of racing it.
+  host.className = cn(CHIP_CLASS, CHIP_TONE.editor, 'select-none')
   host.title = chipTitle(segment)
   host.setAttribute('aria-label', chipAriaLabel(segment))
   // Mentions carry the file's themed icon — the same glyph the `@` picker row
@@ -563,7 +565,10 @@ export const RichInput = forwardRef<RichInputHandle, RichInputProps>(function Ri
         const files = Array.from(event.dataTransfer.files)
         if (files.length > 0) onFiles(files)
       }}
-      className="composer-input max-h-[200px] min-h-[52px] w-full overflow-y-auto whitespace-pre-wrap break-words px-5 pb-1 pt-4 text-[15px] leading-6 outline-none focus-visible:outline-none"
+      // Grows with the draft up to ~40% of the screen, then scrolls on its own: the
+      // scrollbar sits inset from the rounded border (mr/mt) and the wheel never
+      // chains to the transcript behind it.
+      className="composer-input mr-1.5 mt-1 max-h-[min(40dvh,320px)] min-h-[44px] overflow-y-auto overscroll-contain whitespace-pre-wrap break-words pb-1.5 pl-5 pr-3.5 pt-2 text-[15px] [scrollbar-color:var(--line-strong)_transparent] [scrollbar-width:thin] leading-6 outline-none focus-visible:outline-none"
     />
   )
 })

@@ -33,7 +33,7 @@ describe('management scope isolation', () => {
         expect(host.querySelector<HTMLTextAreaElement>('textarea.manage-code-tall')?.value).not.toContain('node A.mjs')
       }
       else expect(host.textContent).toContain(kind === 'agents' ? 'B-agent' : kind === 'mcp' ? 'B-server' : 'B_SECRET')
-      const action = [...host.querySelectorAll('button')].find(b => b.textContent === 'Enable' || b.getAttribute('aria-label') === 'Delete B_SECRET')
+      const action = [...host.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'B-server enabled' || b.getAttribute('aria-label') === 'Delete B_SECRET')
       if (action) await act(async () => action.click())
       expect(calls.filter(url => url.includes('/B/')).every(url => !url.includes('A-server') && !url.includes('A_SECRET'))).toBe(true)
     } finally { await act(async () => root.unmount()); host.remove(); vi.unstubAllGlobals() }

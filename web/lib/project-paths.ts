@@ -133,6 +133,23 @@ export function memoryTabForReference(reference: string, workspaceId: string): s
   return memoryTabPath({ ...(match[2] !== undefined ? { projectId: match[2] } : {}), file: file.join('/') })
 }
 
+const TURN_TAB_PREFIX = 'turn://'
+
+/**
+ * The workbench tab of one turn's recorded changes. A turn's diff comes from
+ * the log, not from git or the project folder, so it is a virtual tab.
+ */
+export function turnTabPath(turnId: string): string {
+  return `${TURN_TAB_PREFIX}${turnId}`
+}
+
+/** The turn a virtual tab path names, or null for anything else. */
+export function turnTabId(path: string | null): string | null {
+  if (path === null || !path.startsWith(TURN_TAB_PREFIX)) return null
+  const id = path.slice(TURN_TAB_PREFIX.length)
+  return id === '' ? null : id
+}
+
 /** Last path segment, used for tab titles (a skill tab is titled by the skill). */
 export function baseName(path: string): string {
   const memory = memoryTabOf(path)

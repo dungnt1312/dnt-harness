@@ -56,27 +56,33 @@ function type(element: HTMLInputElement, value: string): void {
   Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(element, value)
   element.dispatchEvent(new Event('input', { bubbles: true }))
 }
+const search = (): HTMLInputElement => document.body.querySelector<HTMLInputElement>('[aria-label="Search the catalog"]')!
 const settle = async (): Promise<void> => { await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() }) }
 const text = (): string => document.body.textContent ?? ''
 
 async function openCatalog(): Promise<void> {
   await act(async () => root.render(<McpPanel workspaceId="ws" />))
   await settle()
-  await act(async () => button('Browse catalog').click())
+  await act(async () => [...document.body.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find((node) => node.textContent?.startsWith('Browse'))!.click())
   await settle()
 }
 
 describe('MCP catalog', () => {
-  it('opens grouped by category and filters by what you type', async () => {
+  it('opens with category chips and filters by what you type', async () => {
     await openCatalog()
-    for (const heading of ['Dev & Git', 'Docs & Search', 'Browser & Testing', 'Database', 'Productivity']) expect(text()).toContain(heading)
+    const chips = (): string => document.querySelector('[aria-label="Category"]')?.textContent ?? ''
+    for (const heading of ['Dev & Git', 'Docs & Search', 'Browser & Testing', 'Database', 'Productivity']) expect(chips()).toContain(heading)
     expect(button('Install GitHub')).toBeTruthy()
     expect(button('Install Linear')).toBeTruthy()
-    await act(async () => type(input('Search the catalog'), 'postgres'))
+    await act(async () => [...document.querySelectorAll<HTMLButtonElement>('[aria-label="Category"] button')].find((chip) => chip.textContent?.startsWith('Database'))!.click())
     expect(button('Install PostgreSQL')).toBeTruthy()
     expect(() => button('Install GitHub')).toThrow()
-    expect(text()).not.toContain('Browser & Testing')
-    await act(async () => type(input('Search the catalog'), 'zzz-no-match'))
+    await act(async () => [...document.querySelectorAll<HTMLButtonElement>('[aria-label="Category"] button')].find((chip) => chip.textContent?.startsWith('All'))!.click())
+    await act(async () => type(search(), 'postgres'))
+    expect(button('Install PostgreSQL')).toBeTruthy()
+    expect(() => button('Install GitHub')).toThrow()
+    expect(chips()).not.toContain('Browser & Testing')
+    await act(async () => type(search(), 'zzz-no-match'))
     expect(text()).toContain('Nothing in the catalog matches')
   })
 
@@ -92,7 +98,7 @@ describe('MCP catalog', () => {
     expect(body).toEqual({ transport: 'http', url: 'https://mcp.context7.com/mcp' })
     expect(body).not.toHaveProperty('enabled')
     expect(text()).toContain('Installed context7')
-    expect(text()).toContain('Enable')
+    expect(text()).toContain('Switch it on')
   })
 
   it('stores the key it asks for in Secrets before saving the server', async () => {
@@ -147,7 +153,7 @@ describe('MCP catalog', () => {
   it('picks a free name instead of replacing an existing server', async () => {
     vi.mocked(listMcpServers).mockResolvedValue([{ name: 'git', transport: 'stdio', enabled: true, status: 'ready', breakerOpenUntil: null }] as never)
     await openCatalog()
-    expect(text()).toContain('Added')
+    expect(text()).toContain('Installed')
     await act(async () => button('Install Git').click())
     await settle()
     expect(vi.mocked(upsertMcpServer).mock.calls[0]?.[1]).toBe('git-2')
@@ -168,9 +174,9 @@ describe('MCP catalog', () => {
     await openCatalog()
     expect(text()).toContain('uvx mcp-server-git')
     expect(text()).toContain('needs uvx')
-    await act(async () => button('Back to servers').click())
+    await act(async () => [...document.body.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find((node) => node.textContent?.startsWith('Installed'))!.click())
     expect(document.querySelector('[aria-label="MCP servers"]') ?? text().includes('No MCP servers yet')).toBeTruthy()
-    expect(() => input('Search the catalog')).toThrow()
+    expect(document.querySelector('[aria-label="Search the catalog"]')).toBeNull()
   })
 
   it('reports an install failure and leaves the catalog open', async () => {

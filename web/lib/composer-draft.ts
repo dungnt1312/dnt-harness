@@ -16,12 +16,8 @@ export interface AttachmentRef {
 export type DraftSegment =
   | { readonly kind: 'text'; readonly text: string }
   | { readonly kind: 'mention'; readonly path: string }
-  /**
-   * A slash command or skill; its wire text lives in `inline-chips.ts`.
-   * `legacy` marks a chip parsed from the retired `Use the X skill:` form,
-   * so a reused old message keeps its exact text.
-   */
-  | { readonly kind: 'command'; readonly name: string; readonly legacy?: true }
+  /** A slash command or skill; its wire text lives in `inline-chips.ts`. */
+  | { readonly kind: 'command'; readonly name: string }
 
 export interface RichDraft {
   readonly segments: readonly DraftSegment[]

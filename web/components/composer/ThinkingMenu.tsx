@@ -27,7 +27,7 @@ export function ThinkingMenu({ menuLabel = 'Default thinking level for new conve
   if (capability === null || effective === null) {
     return (
       <button type="button" className={composerChipClass} disabled aria-label="No reasoning capability for this model" title="No reasoning capability for this model">
-        <Icon name="lightbulb" size={15} />
+        <Icon name="sparkles" size={15} />
         <span className="max-sm:sr-only">Thinking</span>
       </button>
     )
@@ -62,7 +62,8 @@ export function ThinkingMenu({ menuLabel = 'Default thinking level for new conve
       triggerClassName={`${composerChipClass} shrink-0`}
       trigger={() => (
         <>
-          <Icon name="lightbulb" size={15} />
+          {/* Not `lightbulb`: that is the Plan mode's icon on the same row. */}
+          <Icon name="sparkles" size={15} />
           <span className="truncate @max-[30rem]:hidden">{shown}</span>
           <Icon name="chevron" size={13} className="@max-[30rem]:hidden" />
         </>

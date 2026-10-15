@@ -4,12 +4,14 @@ import {
   applyPlaceholders, catalogAuth, catalogPreview, CATALOG_CATEGORIES, MCP_CATALOG,
   type CatalogEntry,
 } from '../../../src/harness/mcp/catalog.ts'
+import Icon from '../common/Icon.tsx'
 import { Badge } from '../ui/Badge.tsx'
 import { Button } from '../ui/Button.tsx'
 import { Field } from '../ui/Field.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
-import { EmptyState, ItemList, ItemRow, Section } from './settings-kit.tsx'
+import { EmptyState, FilterChips, ItemList, ItemRow, PanelIntro, Section } from './settings-kit.tsx'
 
+const ALL = ' all'
 const AUTH_LABEL = { none: 'No sign-in', token: 'Needs a key', oauth: 'Sign in with OAuth' } as const
 
 /** What the catalog needs from the panel: which names and secrets exist, and how to install. */
@@ -81,7 +83,13 @@ export function McpCatalogView({ host }: { readonly host: CatalogHost }) {
   const [open, setOpen] = useScopedState<string | null>(null)
   const [values, setValues] = useScopedState<Readonly<Record<string, string>>>({})
 
-  const visible = useMemo(() => MCP_CATALOG.filter((entry) => matches(entry, query)), [query])
+  const [category, setCategory] = useScopedState<string>(ALL)
+  const matching = useMemo(() => MCP_CATALOG.filter((entry) => matches(entry, query)), [query])
+  const categories = CATALOG_CATEGORIES
+    .map((item) => ({ value: item.id, label: item.label, count: matching.filter((entry) => entry.category === item.id).length }))
+    .filter((item) => item.count > 0)
+  const activeCategory = categories.some((item) => item.value === category) ? category : ALL
+  const visible = matching.filter((entry) => activeCategory === ALL || entry.category === activeCategory)
 
   const installed = (entry: CatalogEntry): boolean => host.serverNames.has(entry.id) || [...host.serverNames].some((name) => new RegExp(`^${entry.id}-\\d+$`).test(name))
 
@@ -107,61 +115,57 @@ export function McpCatalogView({ host }: { readonly host: CatalogHost }) {
     setValues({})
   }
 
+  const categoryLabel = new Map(CATALOG_CATEGORIES.map((item) => [item.id, item.label]))
   return (
-    <div className="flex flex-col gap-4">
-      <Field label="Search the catalog">
-        <TextInput value={query} placeholder="github, database, docs…" onChange={(event) => setQuery(event.target.value)} />
-      </Field>
-      {visible.length === 0 ? <EmptyState>Nothing in the catalog matches “{query.trim()}”.</EmptyState> : null}
-      {CATALOG_CATEGORIES.map((category) => {
-        const entries = visible.filter((entry) => entry.category === category.id)
-        if (entries.length === 0) return null
-        return (
-          <Section key={category.id} title={category.label} count={entries.length}>
-            <ItemList label={category.label}>
-              {entries.map((entry) => (
-                <ItemRow
-                  key={entry.id}
-                  title={
-                    <>
-                      <span>{entry.title}</span>
-                      <Badge tone={entry.maintainer === 'official' ? 'blue' : 'gray'} title="Who maintains the server. Not a security review.">{entry.maintainer === 'official' ? 'Official' : 'Community'}</Badge>
-                      <Badge tone={catalogAuth(entry) === 'none' ? 'green' : 'amber'}>{AUTH_LABEL[catalogAuth(entry)]}</Badge>
-                      {installed(entry) ? <Badge tone="gray">Added</Badge> : null}
-                    </>
-                  }
-                  meta={
-                    <>
-                      <span className="block">{entry.description}</span>
-                      <span className="block font-mono">
-                        {catalogPreview(entry)}{entry.requires.length > 0 ? ` · needs ${entry.requires.join(', ')}` : ''}
-                      </span>
-                    </>
-                  }
-                  actions={
-                    open === entry.id ? undefined : (
-                      <Button variant="outline" size="sm" aria-label={`Install ${entry.title}`} disabled={host.busy} onClick={() => choose(entry)}>
-                        {needsSetup(entry) ? 'Set up…' : 'Install'}
-                      </Button>
-                    )
-                  }
-                >
-                  {open === entry.id ? (
-                    <InstallForm
-                      entry={entry}
-                      host={host}
-                      values={values}
-                      onChange={(key, value) => setValues((current) => ({ ...current, [key]: value }))}
-                      onCancel={() => { setOpen(null); setValues({}) }}
-                      onInstall={() => run(entry)}
-                    />
-                  ) : null}
-                </ItemRow>
-              ))}
-            </ItemList>
-          </Section>
-        )
-      })}
-    </div>
+    <Section title="Catalog" count={visible.length} actions={<TextInput value={query} placeholder="Search servers" aria-label="Search the catalog" onChange={(event) => setQuery(event.target.value)} />}>
+      <PanelIntro>Installing saves a server switched off; nothing runs until you switch it on. Anyone can publish an MCP server, so install only ones you trust.</PanelIntro>
+      {categories.length > 1 ? (
+        <FilterChips label="Category" value={activeCategory} onChange={setCategory} items={[{ value: ALL, label: 'All', count: matching.length }, ...categories]} />
+      ) : null}
+      {visible.length === 0 ? <EmptyState>Nothing in the catalog matches “{query.trim()}”.</EmptyState> : (
+        <ItemList label="Catalog servers">
+          {visible.map((entry) => (
+            <ItemRow
+              key={entry.id}
+              title={
+                <>
+                  <span>{entry.title}</span>
+                  {activeCategory === ALL ? <Badge>{categoryLabel.get(entry.category) ?? entry.category}</Badge> : null}
+                  {entry.maintainer === 'official' ? <Badge tone="blue" title="Maintained by the vendor. Not a security review.">Official</Badge> : null}
+                  {catalogAuth(entry) !== 'none' ? <Badge tone="amber">{AUTH_LABEL[catalogAuth(entry)]}</Badge> : null}
+                  {installed(entry) ? <Badge tone="green">Installed</Badge> : null}
+                </>
+              }
+              meta={
+                <>
+                  <span className="block">{entry.description}</span>
+                  <span className="block font-mono">
+                    {catalogPreview(entry)}{entry.requires.length > 0 ? ` · needs ${entry.requires.join(', ')}` : ''}
+                  </span>
+                </>
+              }
+              actions={
+                open === entry.id ? undefined : (
+                  <Button variant="outline" size="sm" aria-label={`Install ${entry.title}`} disabled={host.busy} onClick={() => choose(entry)}>
+                    <Icon name="arrowDown" size={13} />{needsSetup(entry) ? 'Set up…' : 'Install'}
+                  </Button>
+                )
+              }
+            >
+              {open === entry.id ? (
+                <InstallForm
+                  entry={entry}
+                  host={host}
+                  values={values}
+                  onChange={(key, value) => setValues((current) => ({ ...current, [key]: value }))}
+                  onCancel={() => { setOpen(null); setValues({}) }}
+                  onInstall={() => run(entry)}
+                />
+              ) : null}
+            </ItemRow>
+          ))}
+        </ItemList>
+      )}
+    </Section>
   )
 }

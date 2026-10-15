@@ -31,8 +31,6 @@ const CHANGES: TurnChanges = {
     { path: 'notes.md', status: 'created', lines: { added: 2 }, edits: [{ kind: 'write', content: 'hello\nworld', created: true }] },
   ],
 }
-const PROJECT = { id: 'p1', name: 'proj', path: 'C:/proj' }
-
 async function mount(changes: TurnChanges, props: Partial<Parameters<typeof TurnChangesCard>[0]> = {}): Promise<HTMLDivElement> {
   host = document.createElement('div')
   document.body.append(host)
@@ -41,12 +39,31 @@ async function mount(changes: TurnChanges, props: Partial<Parameters<typeof Turn
     <TurnChangesCard
       turnId="t1"
       changes={changes}
-      project={PROJECT}
       {...props}
     />,
   ))
   return host
 }
+
+it('the workbench turn view stacks every file\'s turn-only diff from the log alone', async () => {
+  const { TurnChangesView } = await import('../workbench/TurnChangesView.tsx')
+  const events = [
+    { type: 'turn/start', turnId: 't1' },
+    { type: 'tool/call', call: { id: 'c1', name: 'Edit', args: { path: 'C:/outside/a.ts', old: 'a\nb', new: 'a\nc' } } },
+    { type: 'tool/result', callId: 'c1', ok: true, output: 'edited C:/outside/a.ts' },
+    { type: 'tool/call', call: { id: 'c2', name: 'Write', args: { path: 'notes.md', content: 'hi' } } },
+    { type: 'tool/result', callId: 'c2', ok: true, output: 'created notes.md' },
+    { type: 'turn/end', turnId: 't1' },
+  ] as unknown as Parameters<typeof TurnChangesView>[0]['events']
+  host = document.createElement('div')
+  document.body.append(host)
+  root = createRoot(host)
+  await act(async () => root!.render(<TurnChangesView turnId="t1" events={events} />))
+  expect(host.textContent).toContain('2 files')
+  expect(host.querySelector('[aria-label="This turn\'s diff of C:/outside/a.ts"] [data-kind="add"]')?.textContent).toContain('c')
+  expect(host.querySelector('[aria-label="This turn\'s diff of notes.md"]')?.textContent).toContain('New')
+  expect(fetchGitStatus).not.toHaveBeenCalled()
+})
 
 const header = (view: HTMLElement): HTMLButtonElement => view.querySelector<HTMLButtonElement>('section > div > button[aria-expanded]')!
 const fileRows = (view: HTMLElement): HTMLLIElement[] => [...view.querySelectorAll<HTMLLIElement>('ul li')]
@@ -56,7 +73,7 @@ it('the collapsed row totals the turn\'s own lines and fetches nothing', async (
   expect(view.textContent).toContain('2 files changed')
   expect(view.textContent).toContain('+3')
   expect(view.textContent).toContain('−1')
-  expect(view.textContent).toContain('Open in Git')
+  expect(view.textContent).toContain('Review all')
   expect(view.querySelector('ul')).toBeNull()
   expect(fetchGitStatus).not.toHaveBeenCalled()
 })
@@ -75,9 +92,9 @@ it('expanding lists each file with this turn\'s counts and tags', async () => {
   expect(fetchGitStatus).not.toHaveBeenCalled()
 })
 
-it('clicking a file shows the turn-only diff inline, not the Git view', async () => {
-  const onReviewFile = vi.fn()
-  const view = await mount(CHANGES, { onReviewFile })
+it('clicking a file shows the turn-only diff inline', async () => {
+  const onReviewAll = vi.fn()
+  const view = await mount(CHANGES, { onReviewAll })
   await act(async () => header(view).click())
   const row = fileRows(view)[0]!
   await act(async () => row.querySelector<HTMLButtonElement>('button[aria-expanded]')!.click())
@@ -86,7 +103,7 @@ it('clicking a file shows the turn-only diff inline, not the Git view', async ()
   // `a` was context the edit carried: it reads as context, not as -a +a.
   const kinds = [...diff!.querySelectorAll('[data-kind]')].map((line) => `${line.getAttribute('data-kind')}:${line.textContent?.trim().slice(-1)}`)
   expect(kinds).toEqual(['context:a', 'del:b', 'add:c'])
-  expect(onReviewFile).not.toHaveBeenCalled()
+  expect(onReviewAll).not.toHaveBeenCalled()
 })
 
 it('a file edited several times lists every call in order', async () => {
@@ -129,36 +146,16 @@ it('a live card says the turn is still editing, and starts closed like any other
   expect(closed.textContent).not.toContain('Editing')
 })
 
-it('the Git actions are labelled as git and offered only with their callbacks', async () => {
+it('Review all opens the turn tab, and nothing on the card is git', async () => {
   const onReviewAll = vi.fn()
-  const onReviewFile = vi.fn()
-  const view = await mount(CHANGES, { onReviewAll, onReviewFile, onOpenPath: () => () => {} })
-  const all = [...view.querySelectorAll('button')].find((button) => button.textContent === 'Open in Git')!
-  expect(all.getAttribute('title')).toContain('not only this turn')
+  const view = await mount(CHANGES, { onReviewAll, onOpenPath: () => () => {} })
+  const all = [...view.querySelectorAll('button')].find((button) => button.textContent === 'Review all')!
   await act(async () => all.click())
   expect(onReviewAll).toHaveBeenCalledOnce()
   await act(async () => header(view).click())
-  const git = view.querySelector<HTMLButtonElement>('button[aria-label="Show git diff of a.ts (all uncommitted changes)"]')!
-  await act(async () => git.click())
-  // The Git view narrows to project-relative paths, the form git reports.
-  expect(onReviewFile).toHaveBeenCalledWith('src/a.ts')
   expect(view.querySelector('button[aria-label="Open a.ts in workbench"]')).not.toBeNull()
-  // A file the turn created has no HEAD to diff: only the file opener.
-  expect(view.querySelector('button[aria-label^="Show git diff of notes.md"]')).toBeNull()
-  expect(view.querySelector('button[aria-label="Open notes.md in workbench"]')).not.toBeNull()
+  expect(view.textContent).not.toMatch(/git/i)
 
   const plain = await mount(CHANGES)
-  expect([...plain.querySelectorAll('button')].some((button) => button.textContent === 'Open in Git')).toBe(false)
-})
-
-it('a file outside the project has no git action; the file opener stays', async () => {
-  const onReviewFile = vi.fn()
-  const OUTSIDE: TurnChanges = {
-    files: [{ path: 'C:/elsewhere/x.md', status: 'modified', lines: { added: 1, removed: 1 }, edits: [{ kind: 'edit', old: 'before', new: 'after', output: 'edited x.md' }] }],
-  }
-  const view = await mount(OUTSIDE, { onReviewFile, onOpenPath: () => () => {} })
-  await act(async () => header(view).click())
-  expect(view.querySelector('button[aria-label^="Show git diff"]')).toBeNull()
-  expect(view.querySelector('button[aria-label="Open x.md in workbench"]')).not.toBeNull()
-  expect(view.textContent).toContain('outside the project folder')
+  expect([...plain.querySelectorAll('button')].some((button) => button.textContent === 'Review all')).toBe(false)
 })
