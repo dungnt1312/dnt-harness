@@ -340,6 +340,7 @@ export function agentTool(deps: DelegationDeps): ToolDefinition {
       'spawn returns immediately, so several children run at the same time. wait blocks until the named children settle or timeoutMs passes (default 5 min, max 30 min), whichever is first; prefer long waits over repeated short ones. A wait that times out only means the work is not finished: each running child reports progress (elapsed time, steps, last activity, health). Reviews and research often take 10 to 30 minutes. Cancel only a child whose health is "stalled" or whose work you no longer need; cancelling and respawning loses its context.',
       'One level only: a child can never delegate further.',
       'Children you leave running are joined when your turn would close: their reports come back to you as a message, and you get one more step to use them. Calling wait yourself is still the way to get a result earlier or to work on something else in between.',
+      'background:true on spawn (or a role marked background) lets the child outlive your turn: closing the turn neither waits for nor cancels it, and its report arrives later as its own message that wakes this conversation. Use it for long work you do not need before replying; a user Stop still cancels it.',
       'message talks to a child you spawned (childIds names one, prompt is the text): a running child gets it as its next turn with delivery:"queue" (default), or at once with delivery:"steer", which ends its current turn. A finished child runs again with its whole history, the same role, tools and folders as at spawn; its new report arrives like a spawn\'s. Prefer message over a new spawn when the child already holds the context.',
       'Delegate when the work is separable and its result compresses — a search across many files, a review, a verification run. Do not delegate what you can do in two tool calls, and do not delegate work whose context you would have to retype.',
       'Write the prompt as you would brief a colleague who cannot see this conversation: name the files and the facts it needs, and say what the answer must contain. The child\'s final message is all you get back.',
@@ -394,6 +395,7 @@ const PARAMETERS: ToolDefinition['parameters'] = {
     references: { type: 'array', items: { type: 'string' }, description: 'spawn: files or facts the child should start from' },
     grantTools: { type: 'array', items: { type: 'string' }, description: 'spawn: narrows the role\'s tools; never widens them. Naming any mcp__ tool limits MCP to those names' },
     model: { type: 'string', description: 'spawn: a model alias, provider:model, or bare model name; omit to inherit this conversation\'s' },
+    background: { type: 'boolean', description: 'spawn: true to let the child outlive this turn and report back later on its own; omit to follow the role (default false)' },
     childIds: { type: 'array', items: { type: 'string' }, description: 'wait/cancel: child session ids; wait defaults to every running child. message: exactly one id' },
     delivery: { type: 'string', description: 'message to a running child: "queue" (default, its next turn) or "steer" (ends its current turn, runs now). A finished child always runs again' },
     timeoutMs: { type: 'number', description: `wait: longest to block in ms; returns early when the children settle. Default ${DEFAULT_WAIT_MS}, max ${MAX_WAIT_MS}. Prefer minutes to avoid busy polling.` },
@@ -434,6 +436,8 @@ async function spawn(
   }
   const both = (packet.prompt?.trim() ?? '') !== '' && (packet.objective?.trim() ?? '') !== ''
   const grantTools = Array.isArray(args['grantTools']) ? stringList(args['grantTools']) : undefined
+  const background = args['background']
+  if (background !== undefined && typeof background !== 'boolean') throw new Error("'background' must be true or false")
   const model = deps.childModelFor(
     parent,
     workspaceId,
@@ -455,6 +459,7 @@ async function spawn(
     ...(model !== undefined ? { model } : {}),
     ...(inheritedContext !== undefined ? { inherit: 'brief' as const, inheritedContext } : {}),
     ...(deps.grantsOf !== undefined ? { grants: deps.grantsOf(parentSessionId) } : {}),
+    background: background ?? resolved.definition.background ?? false,
   })
   // A built-in grant the role lacks is reported, never silently dropped: the
   // model would otherwise plan around a missing tool. MCP names are checked

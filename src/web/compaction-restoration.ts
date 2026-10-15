@@ -76,10 +76,15 @@ function todoBlock(used: readonly Used[]): Block | undefined {
 
 function runtimeBlock(events: readonly SessionEvent[], cutoff: number): Block | undefined {
   const agents = new Map<string, string>()
+  const spawned = new Map<string, string>()
   const processes = new Map<string, string>()
   for (const event of events) {
     if (event.seq > cutoff) break
-    if (event.type === 'agent/child-spawn') agents.set(event.childSessionId, `${event.definition}${event.objective !== undefined ? `: ${event.objective}` : ''}`)
+    if (event.type === 'agent/child-spawn') {
+      const what = `${event.definition}${event.objective !== undefined ? `: ${event.objective}` : ''}`
+      spawned.set(event.childSessionId, what)
+      agents.set(event.childSessionId, what)
+    } else if (event.type === 'agent/child-resume') agents.set(event.childSessionId, `${spawned.get(event.childSessionId) ?? 'agent'} (resumed)`)
     else if (event.type === 'agent/child-result') agents.delete(event.childSessionId)
     else if (event.type === 'process/start') processes.set(event.processId, `${event.command} (cwd ${event.cwd})`)
     else if (event.type === 'process/exit') processes.delete(event.processId)

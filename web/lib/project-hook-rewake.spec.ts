@@ -34,6 +34,19 @@ it('background hook runs never read as blocks; a rewake and a cap say what happe
   expect(texts.join('\n')).not.toMatch(/hook blocked/)
 })
 
+it('a background child report is a continuation row, never a user bubble or a queued row', () => {
+  const report = 'Delegated agents you left running have finished. Their reports follow; use them to complete the task.\n\n### worker (c1) — completed\nDone.'
+  const items = projectItems([
+    { seq: 1, type: 'input/queued', inputId: 'c', content: report, origin: 'child', summary: 'Background agent worker completed' },
+    { seq: 2, type: 'turn/start', turnId: 't' },
+    { seq: 3, type: 'user/message', turnId: 't', inputId: 'c', content: report, origin: 'continuation' },
+    { seq: 4, type: 'assistant/message', content: 'used it' },
+    { seq: 5, type: 'turn/end', turnId: 't', reason: 'completed' },
+  ])
+  expect(items.filter((item) => item.kind === 'user')).toHaveLength(0)
+  expect(items[0]).toMatchObject({ kind: 'continuation', content: report })
+})
+
 it('a queued rewake still counts as pending work for the task phase', () => {
   expect(taskPhase([
     { seq: 1, type: 'turn/start', turnId: 't' },

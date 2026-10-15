@@ -433,9 +433,10 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
         }
         case 'input/queued': {
           if (event.inputId === undefined || event.inputId === '' || event.content === undefined) break
-          // A queued hook rewake is not the user's input to edit, retry or
-          // show as theirs; it appears once the turn admits it.
-          if (event.origin === 'hook') break
+          // Queued host input (a hook rewake, a background child's report) is
+          // not the user's to edit, retry or show as theirs; it appears once
+          // the turn admits it.
+          if (event.origin === 'hook' || event.origin === 'child') break
           const item: Extract<ViewItem, { kind: 'user' }> = {
             kind: 'user',
             content: event.content,

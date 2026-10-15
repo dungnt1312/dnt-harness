@@ -84,10 +84,12 @@ export type SessionEvent =
       readonly proposedAccess?: 'read' | 'write'
     } & SessionEventStamp)
   | ({ readonly type: 'approval/decision'; readonly approvalId: string; readonly executionId?: ExecutionId; readonly decision: ApprovalDecision; readonly reason?: string } & SessionEventStamp)
-  | ({ readonly type: 'input/queued'; readonly inputId: string; readonly clientRequestId?: string; readonly content: string; readonly attachments?: readonly AttachmentRef[]; readonly delivery?: 'steer'; readonly runsNow?: true; readonly origin?: 'hook'; readonly summary?: string } & SessionEventStamp)
+  | ({ readonly type: 'input/queued'; readonly inputId: string; readonly clientRequestId?: string; readonly content: string; readonly attachments?: readonly AttachmentRef[]; readonly delivery?: 'steer'; readonly runsNow?: true; readonly origin?: 'hook' | 'child'; readonly summary?: string } & SessionEventStamp)
   // `origin: 'hook'`: an `asyncRewake` hook's result the host queued for the
   // model (lower-trust data, never something the user typed); `summary` is the
   // one line the user sees for it.
+  // `origin: 'child'`: a background child's report the host queued for its
+  // root; admitted as a `continuation` user message.
   // `runsNow`: the host found the session idle at acceptance and dispatches a
   // turn for it at once — the UI shows it as a sent message, not a queued one.
   // The user edited a still-waiting input: later readers take this content.
@@ -132,6 +134,8 @@ export type SessionEvent =
       readonly skills?: readonly string[]
       readonly grants?: readonly { readonly path: string; readonly access: 'read' | 'write' }[]
       readonly inheritedContext?: string
+      /** Outlives the spawning turn and reports by notification (every run). */
+      readonly background?: true
     } & SessionEventStamp)
   // A root running as an agent role (automations): the pinned role snapshot
   // its agent is rebuilt from. Written once, before the first turn.

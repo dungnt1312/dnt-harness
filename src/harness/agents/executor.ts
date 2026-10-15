@@ -107,6 +107,11 @@ export interface SpawnRequest {
   readonly inheritedContext?: string | undefined
   /** The parent's additional file-tool folders at spawn; the child never gains more. */
   readonly grants?: readonly GrantedRoot[] | undefined
+  /**
+   * Outlive the spawning turn: never joined or cancelled when it closes, and
+   * reported to the host when it settles. Fixed for the child's life.
+   */
+  readonly background?: boolean | undefined
 }
 
 /**
@@ -227,6 +232,8 @@ interface InternalChild {
   readonly projectId?: ProjectId
   readonly definitionName: string
   readonly model?: ChildModel
+  /** Pinned at spawn: the child (every run) outlives the turn that admitted it. */
+  readonly background: boolean
   agent?: Agent
   launch?: () => Promise<void>
   /** The child's durable log (live for an active child). */
@@ -262,6 +269,13 @@ interface SettledEntry {
 
 const MAX_SETTLED_HANDLES = 256
 
+/**
+ * The host's delivery of a settled background child's report to its root.
+ * `true` means the report reached the root durably (it will be handed to the
+ * model); `false` leaves it owed to the root's next join or wait.
+ */
+export type BackgroundSettledListener = (root: SessionId, handle: ChildHandle) => Promise<boolean>
+
 export class ChildExecutor {
   /** ACTIVE children only; settled entries are evicted once durable. */
   private readonly active = new Map<SessionId, InternalChild>()
@@ -278,6 +292,16 @@ export class ChildExecutor {
   private readonly spawnedPerTurn = new Map<string, number>()
   /** Children each root turn spawned (`root:turn` → ids), until the turn settles. */
   private readonly turnChildren = new Map<string, Set<SessionId>>()
+  /**
+   * Background children per root whose current run the model has not been
+   * handed yet. Unlike `turnChildren` this survives turn cleanup: the report
+   * is owed to the root, delivered by notification, a wait, or the next join.
+   */
+  private readonly owedBackground = new Map<SessionId, Set<SessionId>>()
+  /** Waits watching a child right now: a watched settle is the wait's to deliver. */
+  private readonly watchers = new Map<SessionId, number>()
+  /** Roots whose Stop is cancelling children: those settles never wake the root. */
+  private readonly stoppingRoots = new Map<SessionId, number>()
   /** Active reservations include spawns that have not launched yet. */
   private readonly reservedPerRoot = new Map<SessionId, number>()
   /** FIFO within each root; the root queue rotates after every dispatch. */
@@ -295,7 +319,11 @@ export class ChildExecutor {
   private readonly closingTurns = new Set<string>()
   private readonly stoppedManualTurns = new Set<string>()
 
-  constructor(private readonly ctx: Context, private readonly onManualTurnSettled?: (root: SessionId) => void) {}
+  constructor(
+    private readonly ctx: Context,
+    private readonly onManualTurnSettled?: (root: SessionId) => void,
+    private readonly onBackgroundSettled?: BackgroundSettledListener,
+  ) {}
 
   /** The host's resolved limits, read the same way the agent loop reads them. */
   private limits(): HarnessLimits {
@@ -714,6 +742,7 @@ export class ChildExecutor {
         ...(request.projectId !== undefined ? { projectId: request.projectId } : {}),
         definitionName: request.definition.name,
         ...(request.model !== undefined ? { model: request.model } : {}),
+        background: request.background === true,
         events: session.events,
         runStart: 0,
         status: 'queued',
@@ -724,9 +753,7 @@ export class ChildExecutor {
         settle,
       }
       this.active.set(child.childSessionId, child)
-      const siblings = this.turnChildren.get(turnKey) ?? new Set<SessionId>()
-      siblings.add(child.childSessionId)
-      this.turnChildren.set(turnKey, siblings)
+      this.owe(child, turnKey)
       // The model is a session-level ownership boundary, exactly as it is for
       // a user's own pick: stamping it in the child's log pins the pair for
       // the child's whole life, survives restart, and stops a child from
@@ -758,6 +785,7 @@ export class ChildExecutor {
         toolCeiling,
         ...(request.definition.skills !== undefined ? { skills: request.definition.skills } : {}),
         ...(request.grants !== undefined && request.grants.length > 0 ? { grants: request.grants } : {}),
+        ...(request.background === true ? { background: true } : {}),
       })
       await session.durable()
       const spawnRecord = {
@@ -786,6 +814,7 @@ export class ChildExecutor {
       if (child !== undefined) {
         this.active.delete(child.childSessionId)
         this.turnChildren.get(turnKey)?.delete(child.childSessionId)
+        this.owedBackground.get(root)?.delete(child.childSessionId)
         if (child.status === 'queued') {
           child.status = 'failed'
           child.failure = `spawn failed before it was recorded: ${errorText(error)}`
@@ -946,6 +975,7 @@ export class ChildExecutor {
         ...(target.projectId !== undefined ? { projectId: target.projectId } : {}),
         definitionName: target.definitionName,
         ...(target.model !== undefined ? { model: target.model } : {}),
+        background: meta.background === true,
         events: childSession.events,
         runStart: childSession.events.length,
         status: 'queued',
@@ -957,9 +987,7 @@ export class ChildExecutor {
       }
       this.settledHandles.delete(childSessionId)
       this.active.set(childSessionId, child)
-      const owed = this.turnChildren.get(turnKey) ?? new Set<SessionId>()
-      owed.add(childSessionId)
-      this.turnChildren.set(turnKey, owed)
+      this.owe(child, turnKey)
       this.indexChild(root, childSessionId)
       try {
         childSession.append({ type: 'input/queued', inputId, content })
@@ -974,6 +1002,32 @@ export class ChildExecutor {
         await this.finish(child)
       }
       return this.withResult(child)
+    })
+  }
+
+  /** Record that a run's report is owed: to its turn, or to the root when background. */
+  private owe(child: InternalChild, turnKey: string): void {
+    const owed = child.background
+      ? this.owedBackground.get(child.parentSessionId) ?? new Set<SessionId>()
+      : this.turnChildren.get(turnKey) ?? new Set<SessionId>()
+    owed.add(child.childSessionId)
+    if (child.background) this.owedBackground.set(child.parentSessionId, owed)
+    else this.turnChildren.set(turnKey, owed)
+  }
+
+  /**
+   * A background run settled durably. Its report goes to the host — unless a
+   * wait is watching it (the wait hands it over) or the root is being stopped
+   * (a Stop must not wake the conversation it is stopping). Anything not
+   * delivered stays owed to the root's next join or wait.
+   */
+  private notifyBackground(child: InternalChild, handle: ChildHandle): void {
+    const root = child.parentSessionId
+    if (this.onBackgroundSettled === undefined || (this.watchers.get(child.childSessionId) ?? 0) > 0 || (this.stoppingRoots.get(root) ?? 0) > 0) return
+    void this.onBackgroundSettled(root, handle).then((delivered) => {
+      if (delivered) this.owedBackground.get(root)?.delete(child.childSessionId)
+    }).catch((error: unknown) => {
+      console.error(`agents: background report for ${child.childSessionId} not delivered: ${errorText(error)}`)
     })
   }
 
@@ -1015,6 +1069,7 @@ export class ChildExecutor {
     // A child that starts waiting on an approval ends the wait at once:
     // approvals expire in minutes, a long wait must not sit on one.
     const watched = new Set(targets.filter(isLive).map((child) => child.childSessionId as string))
+    for (const id of watched) this.watchers.set(id as SessionId, (this.watchers.get(id as SessionId) ?? 0) + 1)
     let stopWatching: (() => boolean) | undefined
     const approval = new Promise<void>((resolve) => {
       if (watched.size === 0) return
@@ -1028,6 +1083,11 @@ export class ChildExecutor {
       if (timer !== undefined) clearTimeout(timer)
       if (onAbort !== undefined) signal?.removeEventListener('abort', onAbort)
       stopWatching?.()
+      for (const id of watched) {
+        const count = (this.watchers.get(id as SessionId) ?? 1) - 1
+        if (count > 0) this.watchers.set(id as SessionId, count)
+        else this.watchers.delete(id as SessionId)
+      }
     }
     return targets.map((child) => (isLive(child) ? this.withResult(child) : child.handle))
   }
@@ -1226,11 +1286,28 @@ export class ChildExecutor {
     for (const ids of this.turnChildren.values()) {
       for (const id of childSessionIds) ids.delete(id)
     }
+    for (const ids of this.owedBackground.values()) {
+      for (const id of childSessionIds) ids.delete(id)
+    }
   }
 
-  /** Children one root turn spawned whose outcome the model has not been handed yet. */
+  /**
+   * Children whose outcome the model has not been handed yet: the ones this
+   * root turn spawned (or resumed), plus settled background children of the root.
+   */
   owedChildrenOfTurn(root: SessionId, turnId: string): SessionId[] {
-    return [...(this.turnChildren.get(`${root}:${turnId}`) ?? [])]
+    return [...new Set([...(this.turnChildren.get(`${root}:${turnId}`) ?? []), ...this.owedBackgroundSettled(root)])]
+  }
+
+  /**
+   * Owed background children that have SETTLED: a running one is not joined —
+   * that would hold the turn open for work meant to outlive it.
+   */
+  private owedBackgroundSettled(root: SessionId): SessionId[] {
+    return [...(this.owedBackground.get(root) ?? [])].filter((id) => {
+      const live = this.active.get(id)
+      return live === undefined || live.finished
+    })
   }
 
   /**
@@ -1278,6 +1355,9 @@ export class ChildExecutor {
     // first and is then cancelled here. Settlement is awaited outside the
     // writer so child teardown never holds up admission.
     let delegation: { parent: StoredSession; turnId: string } | undefined
+    // Settles caused by this Stop never wake the root (notifyBackground).
+    this.stoppingRoots.set(parentSessionId, (this.stoppingRoots.get(parentSessionId) ?? 0) + 1)
+    try {
     const marked = await this.withAdmission(parentSessionId, async () => {
       const sessions = this.sessions()
       // Deleted roots have no Turn left to terminalize, but their live children
@@ -1298,11 +1378,16 @@ export class ChildExecutor {
     const count = await this.awaitCancelled(marked)
     if (delegation !== undefined) await this.terminalizeManualTurn(delegation.parent, delegation.turnId, 'cancelled')
     return count
+    } finally {
+      const stopping = (this.stoppingRoots.get(parentSessionId) ?? 1) - 1
+      if (stopping > 0) this.stoppingRoots.set(parentSessionId, stopping)
+      else this.stoppingRoots.delete(parentSessionId)
+    }
   }
 
-  /** Root turn completion cleans up only children of this Turn. */
+  /** Root turn completion cleans up only foreground children of this Turn. */
   async resolveForRootCompletion(parentSessionId: SessionId, parentTurnId: string): Promise<number> {
-    return this.cancelWhere((child) => child.parentSessionId === parentSessionId && child.parentTurnId === parentTurnId)
+    return this.cancelWhere((child) => child.parentSessionId === parentSessionId && child.parentTurnId === parentTurnId && !child.background)
   }
 
   private async cancelWhere(owns: (child: InternalChild) => boolean): Promise<number> {
@@ -1381,6 +1466,7 @@ export class ChildExecutor {
     await this.releaseTurns(parentSessionId, { forget: true })
     const ids = [...(this.childIdsByRoot.get(parentSessionId) ?? [])]
     this.childIdsByRoot.delete(parentSessionId)
+    this.owedBackground.delete(parentSessionId)
     for (const child of [...this.active.values()]) {
       if (child.parentSessionId !== parentSessionId) continue
       this.active.delete(child.childSessionId)
@@ -1520,6 +1606,7 @@ export class ChildExecutor {
     this.active.delete(child.childSessionId)
     // The finished agent is not needed again; its session log is canonical.
     ;(this.ctx.get('agents') as { forget?(id: SessionId): void } | undefined)?.forget?.(child.childSessionId)
+    if (child.background) this.notifyBackground(child, handle)
   }
 
   /** An active child, or a settled one from the cache or the durable logs. */
@@ -1595,6 +1682,7 @@ export class ChildExecutor {
       ...(meta.projectId !== undefined ? { projectId: meta.projectId as ProjectId } : {}),
       definitionName: meta.definition,
       ...(model !== undefined ? { model } : {}),
+      background: meta.background === true,
       events: loaded.events,
       runStart: run.start,
       status,

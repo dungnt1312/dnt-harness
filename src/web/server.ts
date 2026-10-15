@@ -750,6 +750,13 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         console.error(`web: delegation inbox drain failed for ${root}: ${String(error)}`)
       })
     }
+  }, async (root, handle) => {
+    // A background child settled: its report becomes durable host input for
+    // its root — an idle root wakes, a busy one gets it after its turn.
+    const entry = sessions.get(root)
+    const deps = depsRef.current
+    if (entry === undefined || deps === undefined || shuttingDown) return false
+    return queueHostInput(entry, deps, formatChildReports([handle]), 'child', `Background agent ${handle.definitionName} ${handle.status}`)
   })
   kernel.ctx.provide('agent-definitions', agentDefinitions)
   // Claude Code custom slash commands: ~/.claude/commands < plugins <
@@ -775,7 +782,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       const entry = sessions.get(delivery.rootSessionId as SessionId)
       const deps = depsRef.current
       if (entry === undefined || deps === undefined || shuttingDown) return false
-      return queueHookRewake(entry, deps, delivery.content, delivery.summary)
+      return queueHostInput(entry, deps, delivery.content, 'hook', delivery.summary)
     },
   })
   // Claude Code hooks from settings.json layers (user/workspace/project/local).
@@ -1981,9 +1988,10 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       await disableMcpForTurn(scope, workspaceId, error)
     }
     const contents = [...claim.contents]
-    // A hook rewake is hook data, not a prompt: it never reaches the prompt
-    // hooks and is never expanded as a slash command.
-    const isRewake = (index: number): boolean => claim.origins?.[index] === 'hook'
+    // Host input (a hook rewake, a background child's report) is data, not a
+    // prompt: it never reaches the prompt hooks and is never expanded as a
+    // slash command.
+    const isRewake = (index: number): boolean => claim.origins?.[index] !== undefined
     const prompts = contents.filter((_, index) => !isRewake(index))
     // Claude: UserPromptSubmit fires for the user's prompt; a subagent's
     // first turn fires SubagentStart instead (matcher = agent type).
@@ -9342,13 +9350,14 @@ async function acceptMessage(
 }
 
 /**
- * Queue an `asyncRewake` hook's result for a root conversation: durable
- * `input/queued` with `origin: 'hook'`, then the same drain a queued message
- * uses — an idle conversation wakes, a running turn keeps it queued behind
- * it, nothing is ever steered. False when the conversation cannot take it
- * (child, closed, unavailable, no model, queue full).
+ * Queue host input for a root conversation — an `asyncRewake` hook's result
+ * (`hook`) or a background child's report (`child`): durable `input/queued`
+ * with that origin, then the same drain a queued message uses — an idle
+ * conversation wakes, a running turn keeps it queued behind it, nothing is
+ * ever steered. False when the conversation cannot take it (child, closed,
+ * unavailable, no model, queue full).
  */
-async function queueHookRewake(entry: SessionEntry, deps: HandlerDeps, content: string, summary: string): Promise<boolean> {
+async function queueHostInput(entry: SessionEntry, deps: HandlerDeps, content: string, origin: 'hook' | 'child', summary: string): Promise<boolean> {
   if (entry.closed || deps.unavailableSessions.has(entry.session.id)) return false
   if (entry.session.events.some((event) => event.type === 'session/child-meta')) return false
   const effectiveModel = deps.resolveEffectiveModel(entry.session, entry.workspaceId)
@@ -9364,13 +9373,13 @@ async function queueHookRewake(entry: SessionEntry, deps: HandlerDeps, content: 
     type: 'input/queued',
     inputId,
     content,
-    origin: 'hook',
+    origin,
     summary,
     ...(runsNow ? { runsNow: true as const } : {}),
   })
   await entry.session.durable()
   entry.agent.adoptPending(stillPending)
-  entry.agent.enqueueAccepted({ content, inputId, origin: 'hook', summary })
+  entry.agent.enqueueAccepted({ content, inputId, origin, summary })
   if (!deps.compactionPending(entry.session.id)) await dispatchInbox(entry, deps, 'queue')
   return true
 }
