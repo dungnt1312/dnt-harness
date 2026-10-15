@@ -61,6 +61,7 @@ export interface HostDeps {
   readonly candidates?: Pick<CompactionPrecompute, 'waitPending' | 'invalidate' | 'blocked'>
   readonly contextWindowTokens: () => number | undefined
   readonly measure: NonNullable<AdoptionOptions['measure']>
+  readonly validateFit?: () => void | Promise<void>
   /**
    * Bounded state to restore beside an adopted summary (task list, running work,
    * skills, current files). Only the effective path uses it; the legacy and
@@ -200,6 +201,7 @@ export class CompactionHost {
       trigger: request.trigger,
       signal,
       validate: async () => {
+        await deps.validateFit?.()
         const now = deps.identity()
         const was = prepared.identity
         if (now.provider !== was.provider || now.model !== was.model || now.thinkingLevel !== was.thinkingLevel || now.modeHash !== was.modeHash || now.grantsHash !== was.grantsHash || now.policyVersion !== was.policyVersion) {

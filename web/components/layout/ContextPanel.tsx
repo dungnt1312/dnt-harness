@@ -2,8 +2,9 @@ import { useEffect, useState, type ReactNode } from 'react'
 import ConfirmDialog from '../common/ConfirmDialog.tsx'
 import { useToast } from '../common/Toast.tsx'
 import { Button } from '../ui/Button.tsx'
-import { compactSession, CompactionCancelled, CompactionRecoveryNeeded, type CompactionRecovery, type ContextManifestView, type StreamState } from '../../lib/api.ts'
+import { compactSession, CompactionCancelled, CompactionRecoveryNeeded, type CompactionRecovery, type ContextView, type StreamState } from '../../lib/api.ts'
 import { budgetTone, compactionTokenChange, contextFill } from '../../lib/format.ts'
+import { isAvailableContext } from '../../../src/harness/context/context-state.ts'
 import { cn } from '../../lib/cn.ts'
 import type { Meta, SessionModel, WorkspaceMeta } from '../../lib/types.ts'
 
@@ -51,7 +52,7 @@ export interface ContextPanelProps {
   readonly sessionId: string | null
   readonly sessionFolder: string | null
   readonly eventCount: number
-  readonly manifest?: ContextManifestView | null
+  readonly manifest?: ContextView | null
   readonly workspaceId?: string | null
   readonly running?: boolean
   readonly modeLabel?: string | null
@@ -103,7 +104,8 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
   }
 
   const canCompact = workspaceId !== null && workspaceId !== undefined && sessionId !== null
-  const fill = manifest !== undefined && manifest !== null ? contextFill(manifest) : undefined
+  const available = manifest !== undefined && manifest !== null && isAvailableContext(manifest) ? manifest : null
+  const fill = available !== null ? contextFill(available) : undefined
   const tone = fill !== undefined ? budgetTone(fill.used, fill.limit) : 'ok'
   const percent = fill === undefined ? 0 : Math.round(fill.ratio * 100)
   const settingsLink = (tab: 'skills' | 'memory', names: readonly string[]): ReactNode => onOpenSettingsTab !== undefined
@@ -126,7 +128,7 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
       </Card>
 
       <Card
-        title="Last request manifest"
+        title="Last request"
         action={(
           <Button
             size="sm"
@@ -139,14 +141,22 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
           </Button>
         )}
       >
-        {manifest !== undefined && manifest !== null ? (
+        {manifest !== undefined && manifest !== null && !isAvailableContext(manifest) ? (
+          <div className="px-3 py-3 text-[13px] text-fg-muted">
+            <dt className="sr-only">Manifest</dt>
+            <dd className="m-0">Context estimate unavailable until the next request{manifest.display.reason === 'preview-failed' ? ' (compaction preview failed)' : ''}.</dd>
+          </div>
+        ) : available !== null ? (
           <>
-            <Row term="mode">{manifest.modeId} · rev {manifest.modeRevision}{manifest.sources.modeSource !== undefined ? ` · ${manifest.sources.modeSource}` : ''}</Row>
-            {manifest.sources.environment !== undefined ? (
+            {available.display?.kind === 'post-compaction' ? (
+              <Row term="basis"><span title="Estimate rebuilt after compaction; the next request replaces it.">After compaction · estimated</span></Row>
+            ) : null}
+            <Row term="mode">{available.modeId} · rev {available.modeRevision}{available.sources.modeSource !== undefined ? ` · ${available.sources.modeSource}` : ''}</Row>
+            {available.sources.environment !== undefined ? (
               <Row term="environment">
-                <span title={[manifest.sources.environment.date, manifest.sources.environment.platform, manifest.sources.environment.workspacePath, manifest.sources.environment.gitBranch !== undefined ? `git ${manifest.sources.environment.gitBranch}` : undefined].filter(Boolean).join('\n') || 'environment facts'}>
-                  {manifest.sources.environment.date ?? '—'}
-                  {manifest.sources.environment.gitBranch !== undefined ? ` · git ${manifest.sources.environment.gitBranch}` : ''}
+                <span title={[available.sources.environment.date, available.sources.environment.platform, available.sources.environment.workspacePath, available.sources.environment.gitBranch !== undefined ? `git ${available.sources.environment.gitBranch}` : undefined].filter(Boolean).join('\n') || 'environment facts'}>
+                  {available.sources.environment.date ?? '—'}
+                  {available.sources.environment.gitBranch !== undefined ? ` · git ${available.sources.environment.gitBranch}` : ''}
                 </span>
               </Row>
             ) : null}
@@ -162,36 +172,36 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
                 </span>
               ) : '—'}
             </Row>
-            <Row term="history">{manifest.history.setting}: {manifest.history.includedTurns} turns{manifest.history.omittedTurns > 0 ? ` (${manifest.history.omittedTurns} omitted)` : ''}</Row>
-            <Row term="tools">{manifest.sources.toolNames !== undefined && manifest.sources.toolNames.length > 0 ? manifest.sources.toolNames.join(', ') : String(manifest.sources.toolSchemas)}</Row>
-            {manifest.sources.child !== undefined ? (
+            <Row term="history">{available.history.setting}: {available.history.includedTurns} turns{available.history.omittedTurns > 0 ? ` (${available.history.omittedTurns} omitted)` : ''}</Row>
+            <Row term="tools">{available.sources.toolNames !== undefined && available.sources.toolNames.length > 0 ? available.sources.toolNames.join(', ') : String(available.sources.toolSchemas)}</Row>
+            {available.sources.child !== undefined ? (
               <Row term="role">
-                <span title={`instructions sha256 ${manifest.sources.child.instructionsHash}`}>
-                  {manifest.sources.child.definition}
-                  {manifest.sources.child.source !== undefined ? ` · ${manifest.sources.child.source}` : ''}
-                  {` · ${manifest.sources.child.instructionsHash.slice(0, 12)}`}
+                <span title={`instructions sha256 ${available.sources.child.instructionsHash}`}>
+                  {available.sources.child.definition}
+                  {available.sources.child.source !== undefined ? ` · ${available.sources.child.source}` : ''}
+                  {` · ${available.sources.child.instructionsHash.slice(0, 12)}`}
                 </span>
               </Row>
             ) : null}
-            {manifest.sources.parentContext !== undefined ? (
+            {available.sources.parentContext !== undefined ? (
               <Row term="parent context">
-                <span title={`sha256 ${manifest.sources.parentContext.hash}`}>
-                  {manifest.sources.parentContext.chars.toLocaleString()} chars · {manifest.sources.parentContext.hash.slice(0, 12)}
+                <span title={`sha256 ${available.sources.parentContext.hash}`}>
+                  {available.sources.parentContext.chars.toLocaleString()} chars · {available.sources.parentContext.hash.slice(0, 12)}
                 </span>
               </Row>
-            ) : manifest.omissions.some((omission) => omission.startsWith('parent-context:')) ? (
-              <Row term="parent context">{manifest.omissions.find((omission) => omission.startsWith('parent-context:'))?.slice('parent-context: '.length)}</Row>
+            ) : available.omissions.some((omission) => omission.startsWith('parent-context:')) ? (
+              <Row term="parent context">{available.omissions.find((omission) => omission.startsWith('parent-context:'))?.slice('parent-context: '.length)}</Row>
             ) : null}
-            {manifest.sources.skills.length > 0 ? <Row term="skills">{settingsLink('skills', manifest.sources.skills)}</Row> : null}
-            {manifest.sources.skillCatalog !== undefined ? (
+            {available.sources.skills.length > 0 ? <Row term="skills">{settingsLink('skills', available.sources.skills)}</Row> : null}
+            {available.sources.skillCatalog !== undefined ? (
               <Row term="skill catalog">
-                <span title={`catalog sha256 ${manifest.sources.skillCatalog.hash} · ${manifest.sources.skillCatalog.names.join(', ')}`}>
-                  {manifest.sources.skillCatalog.names.length} listed for discovery
+                <span title={`catalog sha256 ${available.sources.skillCatalog.hash} · ${available.sources.skillCatalog.names.join(', ')}`}>
+                  {available.sources.skillCatalog.names.length} listed for discovery
                 </span>
               </Row>
             ) : null}
-            {manifest.sources.memory.length > 0 ? <Row term="memory">{settingsLink('memory', manifest.sources.memory)}</Row> : null}
-            {manifest.omissions.length > 0 ? <Row term="omitted"><span title={manifest.omissions.join('\n')}>{manifest.omissions.length} sources omitted</span></Row> : null}
+            {available.sources.memory.length > 0 ? <Row term="memory">{settingsLink('memory', available.sources.memory)}</Row> : null}
+            {available.omissions.length > 0 ? <Row term="omitted"><span title={available.omissions.join('\n')}>{available.omissions.length} sources omitted</span></Row> : null}
           </>
         ) : (
           <div className="px-3 py-3 text-[13px] text-fg-muted">

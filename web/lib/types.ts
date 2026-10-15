@@ -159,13 +159,19 @@ export interface ContextUsageView {
   readonly cachedInputTokens: number
 }
 
+export type ContextView = import('../../src/harness/context/context-state.ts').ContextResponse<ContextManifestView> & {
+  readonly policy?: { readonly automaticCompactionPressure: number }
+}
+
 /** What one assembled model request carried; the server's ContextManifest. */
 export interface ContextManifestView {
+  readonly contextId?: string
+  readonly display?: Exclude<import('../../src/harness/context/context-state.ts').ContextDisplayState, { kind: 'unavailable' }>
   readonly modeId: string
   readonly modeRevision: number
   readonly model?: string
   readonly provider?: string
-  readonly budget: { readonly availableTokens: number; readonly usedTokens: number; readonly contextLimitTokens?: number; readonly estimated: boolean }
+  readonly budget: { readonly availableTokens: number; readonly usedTokens: number; readonly preTrimTokens?: number; readonly contextLimitTokens?: number; readonly estimated: boolean; readonly windowSource?: 'override'|'catalog'|'family'|'fallback' }
   /** Estimated tokens per source of the last request; sums to `usedTokens`. */
   readonly breakdown?: ContextBreakdownView
   /** Provider-reported usage, when the provider streams it. */

@@ -1,7 +1,8 @@
 import { Menu } from '../ui/Menu.tsx'
 import { cn } from '../../lib/cn.ts'
 import { budgetTone, contextFill } from '../../lib/format.ts'
-import type { ContextBreakdownView, ContextManifestView } from '../../lib/api.ts'
+import { isAvailableContext } from '../../../src/harness/context/context-state.ts'
+import type { ContextBreakdownView, ContextView } from '../../lib/api.ts'
 
 /** Breakdown rows in the order they render, each a deeper-to-lighter shade. */
 const CATEGORIES: readonly { readonly key: keyof ContextBreakdownView; readonly label: string; readonly shade: string }[] = [
@@ -51,13 +52,15 @@ function Ring({ ratio, tone }: { readonly ratio: number; readonly tone: keyof ty
  * was on the last request, opening a token count per source. Counts are
  * tokens, never percentages. Before the first request it says so.
  */
-export function ContextMeter({ manifest }: { readonly manifest: ContextManifestView | null }) {
-  const fill = manifest !== null ? contextFill(manifest) : null
+export function ContextMeter({ manifest }: { readonly manifest: ContextView | null }) {
+  const available = manifest !== null && isAvailableContext(manifest) ? manifest : null
+  const postCompact = available?.display?.kind === 'post-compaction'
+  const fill = available !== null ? contextFill(available) : null
   const tone = fill !== null ? budgetTone(fill.used, fill.limit) : 'ok'
   const summary = fill !== null
     ? `${formatTokens(fill.used)} / ${formatTokens(fill.limit)}`
     : null
-  const breakdown = manifest?.breakdown
+  const breakdown = available?.breakdown
   const breakdownTotal = breakdown !== undefined ? CATEGORIES.reduce((total, category) => total + breakdown[category.key], 0) : 0
 
   return (
@@ -82,10 +85,13 @@ export function ContextMeter({ manifest }: { readonly manifest: ContextManifestV
             ) : null}
           </div>
 
-          {fill === null ? (
+          {manifest !== null && !isAvailableContext(manifest) ? (
+            <p className="text-fg-muted">Context estimate unavailable until the next request ({manifest.display.reason === 'preview-failed' ? 'compaction preview failed' : 'earlier compaction predates full estimates'}).</p>
+          ) : fill === null ? (
             <p className="text-fg-muted">No recorded request context for this conversation.</p>
           ) : (
             <>
+              {postCompact ? <p className="m-0 text-xs text-fg-faint">After compaction · estimated — the next request replaces this preview.</p> : null}
               {/* The filled share of the window, split by source in proportion. */}
               <div className="flex h-2 overflow-hidden rounded-full bg-muted" role="presentation">
                 <div className="flex h-full" style={{ width: `${fill.ratio * 100}%` }}>
@@ -106,12 +112,12 @@ export function ContextMeter({ manifest }: { readonly manifest: ContextManifestV
                       <span className="font-mono text-xs">{formatTokens(breakdown[category.key])}</span>
                     </li>
                   ))}
-                  <li className="text-xs text-fg-faint">Estimated tokens (chars/4). The total above is the provider count when it reported one.</li>
+                  <li className="text-xs text-fg-faint">Estimated source tokens (chars/4). The total above is the provider count when it reported one.</li>
                 </ul>
               ) : null}
 
               <div className="flex items-center justify-between gap-3 border-t border-line pt-3">
-                <span className="text-fg-muted">Average cache hit rate</span>
+                <span className="text-fg-muted">Session average cache hit rate</span>
                 <span className="font-mono text-xs">{fill.cacheHitRate !== undefined ? `${Math.round(fill.cacheHitRate * 100)}%` : '—'}</span>
               </div>
             </>

@@ -106,6 +106,8 @@ export interface ToolSchema {
 
 /** One model request, projected from the session log by `deriveMessages()`. */
 export interface ModelRequest {
+  /** Host-only identity of one assembled context; never serialized to the provider. */
+  readonly contextId?: string
   /** Host-only assembly scope; hooks must check after awaits before side effects. Never serialized. */
   readonly assemblySignal?: AbortSignal
   /** Provider-specific model name; providers apply their own default. */

@@ -172,6 +172,9 @@ export type SessionEvent =
        */
       readonly tokensBefore?: number
       readonly tokensAfter?: number
+      readonly contextEffect?: 'replaced'|'unchanged'
+      readonly contextAfter?: ContextManifest
+      readonly measurement?: NonNullable<CompactionMeasurement['measurement']>
       /** The full summary exactly as stored in the checkpoint; absent on failure. */
       readonly summary?: string
       /** Set on a failed attempt; no checkpoint was written. */
@@ -230,6 +233,19 @@ export interface CompactionAdoptionEnd extends CompactionAdoptionStart {
   readonly sourceDigest: string
   /** sha256 of the checkpoint summary this adoption was prepared on top of; absent for none. */
   readonly seedHash?: string
+}
+
+/** Accounting metadata never authorizes a compaction checkpoint. */
+export interface CompactionMeasurement {
+  readonly contextEffect?: 'replaced'|'unchanged'
+  readonly contextAfter?: ContextManifest
+  readonly measurement?: {
+    readonly before?: { readonly tokens: number; readonly basis: 'reported'|'estimated'; readonly contextId?: string }
+    readonly after?: { readonly tokens: number; readonly basis: 'estimated' }
+    readonly unavailableReason?: 'preview-failed'
+  }
+  readonly tokensBefore?: number
+  readonly tokensAfter?: number
 }
 
 /** Why a turn closed. */

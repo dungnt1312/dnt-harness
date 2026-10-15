@@ -128,6 +128,15 @@ inherited parent-context → drop memory → drop oldest completed turns
 (whole turns only) → aggressive microcompact → fail loud
 (`ContextBudgetError`). Every drop is recorded in `manifest.omissions`.
 
+The window itself resolves once, in `resolveContextWindow` (catalog → family →
+fallback) with the source recorded as `budget.windowSource`; an operator
+override is a verified *window*, while every token count stays an estimate
+(`budget.estimated: true` always). Context state — request manifests, provider
+usage and compaction effects — is replayed by one browser-safe reducer
+(`src/harness/context/context-state.ts`, tested in
+`tests/harness/context-state.spec.ts`) shared by the manifest API, the
+trajectory projector and the web UI.
+
 ## History
 
 Per mode setting: `none` (current turn only), `recent` (full log),

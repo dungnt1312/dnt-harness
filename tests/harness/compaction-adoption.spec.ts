@@ -73,6 +73,23 @@ const endEvents = (session: Session): Extract<SessionEvent, { type: 'compaction/
   session.events.filter((event): event is Extract<SessionEvent, { type: 'compaction/end' }> => event.type === 'compaction/end')
 
 describe('adoptPreparedCompaction', () => {
+  it('awaits measurement and revalidates before publishing a success', async () => {
+    const { session, checkpoints } = await setup()
+    let release!: () => void; let entered!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const measuring = new Promise<void>(resolve => { entered = resolve })
+    let valid = true
+    const pending = adoptPreparedCompaction(session, checkpoints, prepared(session), options({
+      measure: async () => { entered(); await gate; return { tokensBefore: 10, tokensAfter: 5 } },
+      validate: async () => { if (!valid) throw new Error('context revision changed') },
+    }))
+    const assertion = expect(pending).rejects.toThrow('context revision changed')
+    await measuring
+    expect(endEvents(session)).toHaveLength(0)
+    valid = false; release()
+    await assertion
+    expect(endEvents(session).some(e => e.error === undefined)).toBe(false)
+  })
   it('commits a checkpoint at the prepared cutoff, with a proof in both lifecycle events', async () => {
     const { session, checkpoints } = await setup()
     const checkpoint = await adoptPreparedCompaction(session, checkpoints, prepared(session), options())
@@ -229,11 +246,11 @@ describe('restoration inside the adoption transaction', () => {
     expect(session.events.some((event) => event.type === 'compaction/restoration')).toBe(false)
   })
 
-  it('tells the measurement how many tokens the restoration adds', async () => {
+  it('gives measurement the full wrapped-source restoration input', async () => {
     const { session, checkpoints } = await setup()
     const measure = vi.fn(() => ({ tokensBefore: 10, tokensAfter: 5 }))
     await adoptPreparedCompaction(session, checkpoints, prepared(session), options({ restore: async () => restoration, measure }))
-    expect(measure).toHaveBeenCalledWith({ summary: 'SUMMARY OF TURN ONE', coversSeq: CUTOFF_A }, undefined, 4)
+    expect(measure).toHaveBeenCalledWith({ summary: 'SUMMARY OF TURN ONE', coversSeq: CUTOFF_A }, undefined, restoration)
   })
 
   it('a cancelled adoption does not leave a restoration behind that a later success could pick up', async () => {

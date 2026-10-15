@@ -22,6 +22,65 @@ describe('gateway idle cutoff', () => {
     expect(gatewayIdleCut(other, 0, 10 * GATEWAY_IDLE_CUT_MS)).toBe(other)
   })
 })
+describe('context accounting attempt usage', () => {
+  it('records only the last valid cumulative report on the terminal fact', async () => {
+    const facts: import('../../src/harness/llm/request-lifecycle.ts').AttemptFact[] = []
+    const owner = new LogicalRequest()
+    const usage = { inputTokens: 120_000, cachedInputTokens: 110_000, outputTokens: 2 }
+    try {
+      await collect(runAttempt({ async *stream() {
+        yield { type: 'usage', usage: { inputTokens: 100_000, cachedInputTokens: 50_000 } } as const
+        yield { type: 'usage', usage } as const
+        yield completion
+      } }, { messages: [], contextId: 'ctx-1' }, {
+        owner, admission: new AttemptAdmission(),
+        attribution: { sessionId: 's', turnId: 't', stepId: 'step' },
+        recordAttempt: async fact => { facts.push(fact) },
+      }))
+      expect(facts.find(f => f.state === 'end')).toMatchObject({ contextId: 'ctx-1', usage })
+      expect(facts.find(f => f.state === 'start')).not.toHaveProperty('usage')
+    } finally { owner.dispose() }
+  })
+
+  it('keeps a valid report when the provider fails after malformed accounting', async () => {
+    const facts: import('../../src/harness/llm/request-lifecycle.ts').AttemptFact[] = []
+    const owner = new LogicalRequest()
+    const usage = { inputTokens: 10, cachedInputTokens: 5 }
+    try {
+      await expect(collect(runAttempt({ async *stream() {
+        yield { type: 'usage', usage } as const
+        yield { type: 'usage', usage: { inputTokens: -1 } } as const
+        throw new Error('transport stopped')
+      } }, { messages: [], contextId: 'ctx-failed' }, {
+        owner, admission: new AttemptAdmission(), recordAttempt: async fact => { facts.push(fact) },
+      }))).rejects.toThrow()
+      expect(facts.find(f => f.state === 'end')).toMatchObject({ contextId: 'ctx-failed', usage, reason: 'unknown' })
+    } finally { owner.dispose() }
+  })
+
+  it('retains usage through consumer return and reconciles the same physical attempt', async () => {
+    const facts: import('../../src/harness/llm/request-lifecycle.ts').AttemptFact[] = []
+    const owner = new LogicalRequest()
+    const admission = new AttemptAdmission(1)
+    const usage = { inputTokens: 12, cachedInputTokens: 0 }
+    const iterator = runAttempt({ async *stream() {
+      yield { type: 'usage', usage } as const
+      yield completion
+    } }, { messages: [], contextId: 'ctx-return' }, {
+      owner, admission, recordAttempt: async fact => { facts.push(fact) },
+    })[Symbol.asyncIterator]()
+    try {
+      await iterator.next()
+      await iterator.return?.()
+      await vi.waitFor(() => expect(admission.active).toBe(0))
+      const terminal = facts.filter(f => f.state !== 'start')
+      expect(terminal.map(f => f.state)).toEqual(['uncertain', 'reconciled'])
+      expect(new Set(terminal.map(f => f.attemptId)).size).toBe(1)
+      for (const fact of terminal) expect(fact).toMatchObject({ contextId: 'ctx-return', usage })
+    } finally { owner.dispose() }
+  })
+})
+
 describe('aggregate request lifecycle', () => {
   it('fences a retained session across reload even with spare provider capacity', async () => {
     const kernel = new Kernel()

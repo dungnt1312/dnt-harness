@@ -1344,13 +1344,13 @@ export function setModeEnabled(workspaceId: string, modeId: string, enabled: boo
   }).then((r) => json<{ readonly id: string; readonly enabled: boolean }>(r))
 }
 
-export type { ContextBreakdownView, ContextManifestView, ContextUsageView } from './types.ts'
+export type { ContextBreakdownView, ContextManifestView, ContextUsageView, ContextView } from './types.ts'
 
 /** `null` means the valid no-request-yet state (HTTP 204), not an error. */
-export function fetchManifest(workspaceId: string, sessionId: string): Promise<ContextManifestView | null> {
+export function fetchManifest(workspaceId: string, sessionId: string): Promise<import('./types.ts').ContextView | null> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/manifest`).then((r) => {
     if (r.status === 204) return null
-    return json<ContextManifestView>(r)
+    return json<import('./types.ts').ContextView>(r)
   })
 }
 

@@ -95,7 +95,7 @@ import { SessionFoldersChip } from './components/composer/SessionFoldersChip.tsx
 import { FolderPickerModal } from './components/composer/FolderPickerModal.tsx'
 import { AutomationsView, type AutomationControlsContext } from './components/automations/AutomationsView.tsx'
 import ConfirmDialog from './components/common/ConfirmDialog.tsx'
-import type { ContextManifestView, SessionModeSelection } from './lib/api.ts'
+import type { ContextView, SessionModeSelection } from './lib/api.ts'
 import { builtinCommandIn, draftIsOnlyCommand, type CompletionItem } from './lib/composer-completion.ts'
 import type { CommandRow, ModelAliasRow, ModelDefaults, ProjectRow, QuestionReply, SessionListing, SessionModel, SkillRow, WorkspaceMeta, WorkspaceRow } from './lib/types.ts'
 
@@ -487,7 +487,7 @@ function AppShell() {
   }, [settingsOpen])
   const [settingsSection, setSettingsSection] = useState<'providers' | 'projects' | 'permissions' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets' | undefined>(undefined)
   const [pendingDelete, setPendingDelete] = useState<SessionListing | null>(null)
-  const [manifest, setManifest] = useState<ContextManifestView | null>(null)
+  const [manifest, setManifest] = useState<ContextView | null>(null)
   const [compactNonce, setCompactNonce] = useState(0)
   const workspaceRef = useRef(activeWs)
   workspaceRef.current = activeWs
@@ -1099,13 +1099,14 @@ function AppShell() {
   // shortly after each request is assembled, each step ends, and the turn ends
   // — so the meter fills as soon as a message is sent, not only after the turn.
   const manifestSession = useRef<string | null>(null)
-  // Composer context meter + inspector. The previous figures stay up until
-  // the selected conversation's manifest arrives, so the meter never flashes
-  // empty.
+  // Composer context meter + inspector. On a session switch the stale figures
+  // clear at once — the previous conversation's count is never shown as the
+  // new one's — and the same session keeps its figures until the refresh lands.
   useEffect(() => {
     if (activeWs === null || current === null) return
     const switched = manifestSession.current !== `${activeWs}:${current}`
     manifestSession.current = `${activeWs}:${current}`
+    if (switched) setManifest(null)
     let cancelled = false
     const timer = setTimeout(() => {
       void fetchManifest(activeWs, current).then(

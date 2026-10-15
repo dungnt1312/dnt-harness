@@ -1,13 +1,14 @@
 import { createHash } from 'node:crypto'
 import path from 'node:path'
 import type { ModelMessage, ToolSchema, ContentPart } from '../llm/types.ts'
+import { textOnlyVisionFallback, withoutDescribeImage } from '../llm/adaptive-vision.ts'
 import type { AttachmentLookup } from '../attachments/store.ts'
 import { deriveDatedMessages, type SessionEvent } from '../session/events.ts'
 import type { Session } from '../session/session.ts'
 import { isCompletedCompactionBoundary, MAX_COMPACTION_SUMMARY_CHARS, recoverCanonicalCheckpoint } from './compaction.ts'
 import type { ResolvedMode } from '../modes/types.ts'
 import type { GrantedRoot } from '../tools/types.ts'
-import { estimateTokens, estimateContentTokens, schemaCost, budgetFor, squeezeBudget, ContextBudgetError, type BudgetConfig } from './budget.ts'
+import { estimateTokens, estimateContentTokens, schemaCost, budgetFor, squeezeBudget, ContextBudgetError, type BudgetConfig, type ResolvedBudget, type WindowSource } from './budget.ts'
 import { formatSentStamp } from './environment.ts'
 import {
   COMPACTION_POLICY_VERSION,
@@ -21,8 +22,7 @@ import {
 export { ContextBudgetError }
 export type { BudgetConfig }
 
-/** Budget config plus the honesty flag for the estimate. */
-export type ResolvedBudget = BudgetConfig & { readonly verified?: boolean }
+export type { ResolvedBudget } from './budget.ts'
 
 /** One active skill's loaded content (Turn-local, hash-pinned). */
 export interface ActiveSkill {
@@ -42,6 +42,8 @@ export interface MemorySnippet {
 
 /** Inputs for one context assembly. */
 export interface BuildContextInput {
+  /** Absent preserves legacy callers; hosts supply the pinned model capability. */
+  readonly nativeVision?: boolean
   readonly events: readonly SessionEvent[]
   readonly mode: ResolvedMode
   readonly modeRevision: number
@@ -164,6 +166,8 @@ function fileScopeText(scope: NonNullable<BuildContextInput['fileScope']>): stri
 
 /** The truthful record of what one request actually contained. */
 export interface ContextManifest {
+  /** One assembly, not a logical owner that may span retries. */
+  readonly contextId?: string
   readonly modeId: string
   readonly modeRevision: number
   readonly modeHash?: string
@@ -176,8 +180,9 @@ export interface ContextManifest {
     readonly preTrimTokens?: number
     /** The model's whole context window, before reserve and margin. */
     readonly contextLimitTokens: number
-    /** Token counts are estimates (chars/4) unless limits are verified. */
+    /** Token costs always remain estimates, independently of window provenance. */
     readonly estimated: boolean
+    readonly windowSource?: WindowSource
   }
   /** Where `usedTokens` went, per source, measured on the final request. */
   readonly breakdown: ContextBreakdown
@@ -453,10 +458,32 @@ function resolveSystemOverride(override: string | undefined, fallback: string): 
  * cannot fit, it fails loudly instead of truncating silently.
  */
 export function buildContext(input: BuildContextInput): AssembledContext {
+  return assembleContext(input)
+}
+
+export interface PreviewCompaction {
+  readonly checkpoint: { readonly summary: string; readonly coversSeq: number }
+  readonly restoration?: { readonly body: string; readonly tokens: number; readonly sections: readonly unknown[] }
+  readonly protectUncoveredHistory?: boolean
+}
+
+/** Internal host preview; never exported as a tool or canonical attestation. */
+export function buildContextPreview(input: BuildContextInput, preview: PreviewCompaction): AssembledContext {
+  if (input.mode.definition.sources.history !== 'compact' || !isCompletedCompactionBoundary(input.events, preview.checkpoint.coversSeq)) throw new Error('compaction preview requires a completed boundary')
+  if (preview.checkpoint.summary.trim() === '' || preview.checkpoint.summary.length > MAX_COMPACTION_SUMMARY_CHARS) throw new Error('invalid compaction preview summary')
+  let open = false
+  for (const event of input.events) { if (event.type === 'turn/start') open = true; else if (event.type === 'turn/end') open = false }
+  if (open) throw new Error('compaction preview requires a closed turn boundary')
+  const result = assembleContext(input, preview)
+  if (preview.protectUncoveredHistory && result.compactionProjection.losses.some(loss => loss.kind === 'uncovered-history-dropped' || loss.kind === 'unknown')) throw new Error('compaction-preview-no-fit')
+  return result
+}
+
+function assembleContext(input: BuildContextInput, preview?: PreviewCompaction): AssembledContext {
   const { mode } = input
   const omissions: string[] = []
-  const compaction = mode.definition.sources.history === 'compact' && input.compaction !== undefined
-    && validCompactionCoverage(input.events, input.compaction) ? input.compaction : undefined
+  const compaction = preview?.checkpoint ?? (mode.definition.sources.history === 'compact' && input.compaction !== undefined
+    && validCompactionCoverage(input.events, input.compaction) ? input.compaction : undefined)
   if (mode.definition.sources.history === 'compact' && input.compaction !== undefined && compaction === undefined) {
     omissions.push('compaction: invalid checkpoint ignored; canonical history retained')
   }
@@ -465,7 +492,7 @@ export function buildContext(input: BuildContextInput): AssembledContext {
   // Chat sends no tool schemas — the builder enforces the ceiling too. (The
   // omission is recorded below, in its established manifest position.)
   const schemasDisabled = mode.definition.toolExposure.length === 0
-  const schemas = schemasDisabled ? [] : input.schemas
+  const schemas = schemasDisabled ? [] : input.nativeVision === true ? withoutDescribeImage(input.schemas) ?? [] : input.schemas
 
   // ── system ─────────────────────────────────────────────────
   const systemParts: string[] = []
@@ -554,7 +581,7 @@ export function buildContext(input: BuildContextInput): AssembledContext {
   if (instructionsMessage !== undefined) lowerTrustMessages.push(instructionsMessage)
   if (mode.definition.sources.history === 'compact' && compaction !== undefined) {
     lowerTrustMessages.push(compactedHistoryMessage(compaction))
-    const restored = restoredStateOf(input.events, compaction)
+    const restored = preview !== undefined ? preview.restoration : restoredStateOf(input.events, compaction)
     if (restored !== undefined) {
       lowerTrustMessages.push({
         role: 'system',
@@ -570,7 +597,9 @@ export function buildContext(input: BuildContextInput): AssembledContext {
   // ── history window per setting ─────────────────────────────
   const window = historyWindow(input.events, mode.definition.sources.history, compaction)
   const history = historyMessages(input.events, window, mode.definition.sources.history === 'compact' ? compaction : undefined, input.compactionRetainTokens, input.attachments)
-  let dated = history.dated
+  let dated = input.nativeVision === false
+    ? history.dated.map(entry => ({ ...entry, message: textOnlyVisionFallback([entry.message])[0]! }))
+    : history.dated
   const totalTurns = countTurns(input.events)
 
   // ── optional sources (droppable) ───────────────────────────
@@ -824,7 +853,8 @@ export function buildContext(input: BuildContextInput): AssembledContext {
       usedTokens: used,
       preTrimTokens,
       contextLimitTokens: input.budget.contextLimitTokens,
-      estimated: input.budget.verified !== true,
+      estimated: true,
+      ...(input.budget.windowSource !== undefined ? { windowSource: input.budget.windowSource } : {}),
     },
     breakdown,
     history: {

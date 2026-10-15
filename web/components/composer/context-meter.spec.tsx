@@ -4,7 +4,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { contextFill } from '../../lib/format.ts'
 import { ContextMeter, formatTokens } from './ContextMeter.tsx'
-import type { ContextManifestView } from '../../lib/api.ts'
+import type { ContextManifestView, ContextView } from '../../lib/api.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 let root: Root | undefined
@@ -26,7 +26,7 @@ const MANIFEST: ContextManifestView = {
   omissions: [],
 }
 
-async function openMeter(manifest: ContextManifestView | null): Promise<HTMLElement> {
+async function openMeter(manifest: ContextView | null): Promise<HTMLElement> {
   host = document.createElement('div')
   document.body.append(host)
   root = createRoot(host)
@@ -38,6 +38,18 @@ async function openMeter(manifest: ContextManifestView | null): Promise<HTMLElem
   })
   return document.querySelector<HTMLElement>('[role="dialog"]')!
 }
+
+it('labels a post-compaction estimate independently from the last request', async () => {
+  const panel = await openMeter({ ...MANIFEST, display: { kind: 'post-compaction', compactionSeq: 40, coversSeq: 30 } })
+  expect(panel.textContent).toContain('After compaction')
+  expect(panel.textContent).toContain('estimated')
+})
+
+it('does not show a zero count when the current context is unavailable', async () => {
+  const panel = await openMeter({ display: { kind: 'unavailable', reason: 'legacy-compaction' }, usage: { cacheableInputTokens: 0, cachedInputTokens: 0 } })
+  expect(panel.textContent).toContain('Context estimate unavailable')
+  expect(panel.textContent).not.toContain('0 /')
+})
 
 it('formats token counts compactly', () => {
   expect(formatTokens(950)).toBe('950')
@@ -59,15 +71,15 @@ it('shows token counts per source, not percentages', async () => {
   expect(panel.textContent).toContain('Messages65K')
   expect(panel.textContent).toContain('Skills2K')
   expect(panel.textContent).toContain('MCP tools14K')
-  expect(panel.textContent).toContain('Estimated tokens (chars/4)')
-  expect(panel.textContent).toContain('Average cache hit rate99%')
+  expect(panel.textContent).toContain('Estimated source tokens (chars/4)')
+  expect(panel.textContent).toContain('Session average cache hit rate99%')
 })
 
 it('marks an estimate and says when no request has run yet', async () => {
   const estimated = await openMeter(MANIFEST)
   expect(estimated.textContent).toContain('100K / 1M')
   expect(estimated.textContent).not.toContain('~')
-  expect(estimated.textContent).toContain('Average cache hit rate—')
+  expect(estimated.textContent).toContain('Session average cache hit rate—')
   await act(async () => root!.unmount())
   root = undefined
   host.remove()

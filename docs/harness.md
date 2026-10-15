@@ -826,9 +826,20 @@ runs and the behavior above is unchanged.
   did not settle blocks further speculation for the session instead of overlapping.
   `PreCompact` runs once, when adoption begins; speculation never runs a hook.
   Session delete and server close cancel it and wait for the stream.
-- **Measurement.** `compaction/end.tokensAfter` is the provider-reported size minus
-  the estimated saving of the new checkpoint, including the restoration that rides
-  beside it.
+- **Measurement.** The post-compaction size (`compaction/end.tokensAfter`) is an
+  independent estimate rebuilt from the same builder the next request uses —
+  full context after the checkpoint, restoration included — committed atomically
+  on the success event with its own `basis: 'estimated'`. The pre-compaction
+  side (`tokensBefore`) carries the previous request's provider report when one
+  was attributed to the assembly being replaced (`basis: 'reported'`). The
+  post-compaction number is never `reportedBefore - rawSaving`: two different
+  bases subtracted across a replaced context would claim a precision no pair of
+  estimates has. A measurement that could not be computed is published as
+  `{ contextEffect: 'replaced', measurement: { unavailableReason: 'preview-failed' } }`
+  rather than a zero. A successful `compaction/end` becomes visible to browser
+  streams only once its durability barrier has committed — the server holds the
+  event and everything appended behind it, and a flush failure never publishes
+  the uncommitted success.
 - **Verifying.** Everything above is tested with a scripted provider. No live
   benchmark has been run: the target (≥ 70 % median reduction of summary generation
   time, ready-candidate blocking p95 ≤ 5 s excluding hooks and storage) is

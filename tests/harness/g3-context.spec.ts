@@ -57,6 +57,25 @@ function base(overrides: Partial<Parameters<typeof buildContext>[0]> = {}): Para
   }
 }
 
+describe('context estimate honesty', () => {
+  it('measures the same text-only image fallback the provider receives', () => {
+    const log = eventsOf([
+      { type: 'turn/start', turnId: 't' },
+      { type: 'user/message', turnId: 't', content: 'image', attachments: [{ id: 'img', name: 'x.png', mediaType: 'image/png', size: 1 }] },
+    ])
+    const attachments = new Map([['img', { mediaType: 'image/png', base64: 'eA==' }]])
+    const native = buildContext(base({ events: log, attachments }))
+    const fallback = buildContext(base({ events: log, attachments, nativeVision: false }))
+    expect(fallback.messages.every(m => typeof m.content === 'string')).toBe(true)
+    expect(fallback.manifest.budget.usedTokens).toBeLessThan(native.manifest.budget.usedTokens)
+    expect(String(fallback.messages.at(-1)?.content)).toContain('cannot see image pixels')
+  })
+  it('keeps token estimates labeled estimated even with a verified model window', () => {
+    const assembled = buildContext(base({ budget: { ...DEFAULT_BUDGET, verified: true } }))
+    expect(assembled.manifest.budget.estimated).toBe(true)
+  })
+})
+
 describe('harness authoring guidance', () => {
   const read = { name: 'Read', description: 'read', parameters: { type: 'object' as const, properties: {} } }
 
