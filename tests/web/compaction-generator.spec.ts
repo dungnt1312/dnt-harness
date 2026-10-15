@@ -364,7 +364,17 @@ describe('input fit', () => {
     expect(exact.tokens).toBeGreaterThanOrEqual(Math.floor(rebuilt.tokens * 1.15))
   })
 
-  it('falls back to a conservative chars/4 estimate when nothing was reported', () => {
+  it('scales a reconstructed estimate by the ratio the builder assembled it under, still labelled estimated', () => {
+    const plain = estimateSnapshotTokens(big(40_000), 'reconstructed')
+    const scaled = estimateSnapshotTokens({ ...big(40_000), estimateRatio: 1.3 }, 'reconstructed')
+    expect(scaled).toEqual({ tokens: Math.ceil(plain.tokens * 1.3), basis: 'estimated' })
+    // A window the pure estimate fits but the provider's count would not: refused.
+    const limits = { contextWindowTokens: plain.tokens + 8_000 + Math.floor(plain.tokens * 0.2), outputTokens: 8_000 }
+    expect(() => assertFitsWindow(big(40_000), limits, 'reconstructed')).not.toThrow()
+    expect(() => assertFitsWindow({ ...big(40_000), estimateRatio: 1.3 }, limits, 'reconstructed')).toThrow(/compaction-input-too-large/)
+  })
+
+  it('falls back to a conservative chars/3 estimate when nothing was reported', () => {
     const estimate = estimateSnapshotTokens(big(40_000))
     expect(estimate.basis).toBe('estimated')
     expect(estimate.tokens).toBeGreaterThanOrEqual(10_000)

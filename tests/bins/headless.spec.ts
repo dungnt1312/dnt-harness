@@ -3,7 +3,7 @@
  * because no provider is registered — it must not pretend a mock answered.
  */
 import { spawn } from 'node:child_process'
-import { mkdtemp, rm, readFile, mkdir, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, readFile, readdir, mkdir, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { WorkspaceService } from '../../src/harness/workspace/service.ts'
 import { tmpdir } from 'node:os'
@@ -88,6 +88,42 @@ describe('headless CLI', () => {
       expect(requests[2]!.messages.map((message) => message.content).join('\n')).not.toContain('CLI index marker')
       await expect(readFile(path.join(projectRoot, 'disabled.md'))).rejects.toThrow()
       expect(disabled.stdout).toContain('tool✗')
+    } finally {
+      await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()))
+    }
+  }, 30_000)
+
+  it('calibrates the next request by the provider-reported input of the previous one, like the web host', async () => {
+    dataDir = await mkdtemp(path.join(tmpdir(), 'cli-calibration-'))
+    const root = fileURLToPath(new URL('../../', import.meta.url))
+    let calls = 0
+    const provider = createServer(async (req, res) => {
+      for await (const _chunk of req) { /* drain */ }
+      calls += 1
+      const first = calls === 1
+      const delta = first
+        ? { tool_calls: [{ index: 0, id: 'glob-call', type: 'function', function: { name: 'Glob', arguments: JSON.stringify({ pattern: 'package.json' }) } }] }
+        : { content: 'done' }
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      // A report far above the estimate: the ratio clamps to its maximum.
+      const usage = { prompt_tokens: 10_000_000, completion_tokens: 5 }
+      res.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: first ? 'tool_calls' : 'stop' }] })}\n\ndata: ${JSON.stringify({ choices: [], usage })}\n\ndata: [DONE]\n\n`)
+    })
+    await new Promise<void>((resolve) => provider.listen(0, '127.0.0.1', resolve))
+    const address = provider.address() as { port: number }
+    try {
+      const result = await runCli(['--data-dir', dataDir, '--root', root, '--yolo', '--message', 'look'], {
+        DEEPSEEK_API_KEY: 'test-key', DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}`,
+      })
+      expect(result.code).toBe(0)
+      expect(calls).toBe(2)
+      const logs = (await readdir(dataDir, { recursive: true })).filter((file) => file.endsWith('events.jsonl') && file.includes(`${path.sep}sessions${path.sep}`))
+      expect(logs).toHaveLength(1)
+      const events = (await readFile(path.join(dataDir, logs[0]!), 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as Record<string, any>)
+      const manifests = events.filter((event) => event.type === 'context/manifest').map((event) => event.manifest)
+      expect(manifests).toHaveLength(2)
+      expect(manifests[0].budget.measured.source).toBe('estimate')
+      expect(manifests[1].budget.measured).toMatchObject({ source: 'provider_usage', baseContextId: manifests[0].contextId, ratio: 3 })
     } finally {
       await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()))
     }
