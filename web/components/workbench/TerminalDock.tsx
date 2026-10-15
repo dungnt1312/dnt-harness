@@ -47,11 +47,10 @@ export function TerminalDock({ workspaceId, projectId, height, resizeHandle, ope
       <div
         {...resizeHandle}
         aria-label="Resize terminal"
-        className="group relative h-3 shrink-0 cursor-row-resize outline-none hover:bg-line/60"
-      >
-        {/* The grip is the footer's only top rule; a border on the section would double it. */}
-        <span aria-hidden="true" className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-line group-focus-visible:bg-link" />
-      </div>
+        // The handle is the footer's only top rule: one hairline, with the
+        // grab area hanging off it, so the tab strip below stays centred.
+        className="relative z-10 h-px shrink-0 cursor-row-resize bg-line outline-none transition-colors before:absolute before:inset-x-0 before:-top-1.5 before:bottom-0 before:content-[''] hover:bg-link focus-visible:bg-link"
+      />
       <div className="flex min-h-0 flex-col overflow-hidden bg-bg" style={{ height }}>
         {body}
       </div>

@@ -23,6 +23,8 @@ import { InlineChip } from '../common/InlineChip.tsx'
 import type { ChipSegment } from '../../lib/inline-chips.ts'
 import type { TurnTiming } from '../../lib/turn-timing.ts'
 import { ImageLightbox } from './ImageLightbox.tsx'
+import { ChartPreview } from './ChartPreview.tsx'
+import { parseChart, type ChartSpec } from '../../../src/harness/tools/chart-spec.ts'
 import type { ContextManifestView, ToolCall } from '../../lib/types.ts'
 import type { ViewItem } from '../../lib/project.ts'
 import { skillTabPath, type OpenPathResolver } from '../../lib/project-paths.ts'
@@ -1331,6 +1333,78 @@ function GeneratedImageCard({ item, state, facts, workspaceId, withDuration = fa
   )
 }
 
+type Preview =
+  | { readonly kind: 'image'; readonly id: string; readonly title: string | null; readonly caption: string | null }
+  | { readonly kind: 'chart'; readonly chart: ChartSpec; readonly title: string | null; readonly caption: string | null }
+
+/** What a settled SendPreview call shows, or null when the result is not a well-formed preview. */
+export function previewOf(item: Extract<ViewItem, { kind: 'tool' }>): Preview | null {
+  if (item.call.name !== 'SendPreview' || item.result?.ok !== true) return null
+  try {
+    const parsed = JSON.parse(item.result.output) as Record<string, unknown>
+    const note = (key: string): string | null => (typeof parsed[key] === 'string' ? parsed[key] as string : null)
+    const meta = { title: note('title'), caption: note('caption') }
+    if (parsed['kind'] === 'image') {
+      const id = parsed['attachmentId']
+      return typeof id === 'string' && /^[0-9a-f]{64}$/.test(id) ? { kind: 'image', id, ...meta } : null
+    }
+    // The log is trusted less than it looks: re-validate before drawing.
+    if (parsed['kind'] === 'chart') return { kind: 'chart', chart: parseChart(parsed['chart']), ...meta }
+    return null
+  } catch {
+    return null
+  }
+}
+
+/** A SendPreview call: a quiet row, with the image or chart always visible under it. */
+function PreviewCard({ item, state, facts, workspaceId, withDuration = false }: {
+  readonly item: Extract<ViewItem, { kind: 'tool' }>
+  readonly state: RowState
+  readonly facts: ToolFacts
+  readonly workspaceId: string | null
+  readonly withDuration?: boolean
+}) {
+  const [zoomed, setZoomed] = useState(false)
+  const preview = previewOf(item)
+  const label = preview?.kind === 'chart' ? 'Chart' : 'Image'
+  const title = preview?.title ?? null
+  const alt = title ?? `${label} preview`
+  const status = rowStatus(item, state, facts)
+  const duration = withDuration ? callDuration(item) : undefined
+  const spec: RowSpec = {
+    icon: 'fileImage',
+    kind: 'Preview',
+    separator: true,
+    primary: title ?? label,
+    ...(status !== undefined ? { status } : {}),
+    ...(duration !== undefined ? { duration } : {}),
+  }
+  const src = preview?.kind === 'image' && workspaceId !== null ? attachmentUrl(workspaceId, preview.id) : null
+  return (
+    <div className="flex flex-col gap-2">
+      <ActivityRow spec={spec} state={state}>
+        <OutcomeNotes item={item} />
+        {preview === null && item.result !== undefined
+          ? <ResultPanel output={item.result.output} tone={state === 'failed' ? 'bad' : state === 'denied' ? 'quiet' : 'plain'} />
+          : null}
+      </ActivityRow>
+      {src !== null ? (
+        <button
+          type="button"
+          onClick={() => setZoomed(true)}
+          aria-label={`Preview ${alt.toLowerCase()}`}
+          className="block w-fit max-w-full cursor-zoom-in overflow-hidden rounded-2xl bg-muted outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-line-strong"
+        >
+          <img src={src} alt={alt} loading="lazy" className="block max-h-96 max-w-full object-contain" />
+        </button>
+      ) : null}
+      {preview?.kind === 'chart' ? <ChartPreview chart={preview.chart} title={alt} /> : null}
+      {preview?.caption != null ? <p className="m-0 text-[12px] text-fg-muted">{preview.caption}</p> : null}
+      <ImageLightbox src={zoomed ? src : null} alt={alt} onDismiss={() => setZoomed(false)} />
+    </div>
+  )
+}
+
 /** The stored video a settled GenerateVideo call produced, or null. */
 export function generatedVideoOf(item: Extract<ViewItem, { kind: 'tool' }>): { readonly id: string; readonly duration: number | null } | null {
   if (item.call.name !== 'GenerateVideo' || item.result?.ok !== true) return null
@@ -1519,6 +1593,7 @@ export const ToolCard = memo(function ToolCard({ item, openPath, hidden, repeats
   if (hidden === true) return null
 
   if (IMAGE_TOOL_KIND[call.name] !== undefined) return <GeneratedImageCard item={item} state={state} facts={facts} workspaceId={workspaceId ?? null} withDuration={withDuration} />
+  if (call.name === 'SendPreview') return <PreviewCard item={item} state={state} facts={facts} workspaceId={workspaceId ?? null} withDuration={withDuration} />
   if (call.name === 'GenerateVideo') return <GeneratedVideoCard item={item} state={state} facts={facts} workspaceId={workspaceId ?? null} withDuration={withDuration} />
   if (call.name === 'DescribeImage') return <DescribeImageCard item={item} state={state} facts={facts} withDuration={withDuration} />
   if (builtin === 'todowrite') {

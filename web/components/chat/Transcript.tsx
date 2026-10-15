@@ -9,7 +9,7 @@ import { processRows, type ProcessRow } from '../../lib/processes-view.ts'
 import { hiddenSpawnCalls } from '../../lib/spawn-merge.ts'
 import { turnTimings, type TurnTiming } from '../../lib/turn-timing.ts'
 import { useGated, useSessionDerivedGates } from '../../lib/session-derived.ts'
-import { ActivityBlock, AssistantMessage, AuditLine, CommandExpansionMarker, CompactionMarker, ContinuationMarker, ContextMarker, HookContextMarker, HookRewakeMarker, DelegationCard, JumpToBottom, ProcessLinkContext, RetryLine, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
+import { ActivityBlock, AssistantMessage, AuditLine, CommandExpansionMarker, CompactionMarker, ContinuationMarker, ContextMarker, HookContextMarker, HookRewakeMarker, DelegationCard, generatedImageOf, generatedVideoOf, JumpToBottom, previewOf, ProcessLinkContext, RetryLine, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
 import { TurnChangesCard } from './TurnChangesCard.tsx'
 import type { ChipSegment } from '../../lib/inline-chips.ts'
 import type { WorkbenchProject } from '../workbench/Workbench.tsx'
@@ -115,6 +115,14 @@ const isChange = (item: ViewItem): boolean => {
   return name === 'edit' || name === 'write'
 }
 
+/**
+ * A call whose landed result is media the reader came for (a preview, a
+ * generated image or video). It stands on its own row, never inside a run: a
+ * settled run of four steps folds, and would fold the media shut with it.
+ */
+const isMedia = (item: ViewItem): boolean =>
+  item.kind === 'tool' && (previewOf(item) !== null || generatedImageOf(item) !== null || generatedVideoOf(item) !== null)
+
 /** An `Agent` call that only waits on children already spawned. */
 const isWait = (item: ViewItem): boolean =>
   item.kind === 'tool' && item.call.name.toLowerCase() === 'agent' && item.call.args['action'] === 'wait'
@@ -168,7 +176,7 @@ export function groupBlocks(items: readonly ViewItem[], hidden?: ReadonlySet<str
     }
     const afterBreak = afterChange
     afterChange = false
-    if (isActivity(item)) {
+    if (isActivity(item) && !isMedia(item)) {
       // A wait right after a wait in the same run folds into it: the row now
       // shows the newest wait and counts the ones before.
       const last = blocks.at(-1)

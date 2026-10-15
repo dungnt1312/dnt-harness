@@ -393,7 +393,9 @@ describe('effective compaction through the web server', () => {
     const logPath = path.join(first.home, 'workspaces', first.wsId, 'sessions', id, 'events.jsonl')
     await completedMessage(first.base, first.wsId, id, logPath, 'before the restart', 1)
     await first.server.close()
-    await fs.rm(path.join(first.home, 'workspaces', id, 'snapshots'), { recursive: true, force: true })
+    // Regression: compaction sidecars must not land under workspaces/ (boot adopts them as workspaces).
+    expect((await fs.readdir(path.join(first.home, 'workspaces'))).filter((name) => name.startsWith('session-'))).toEqual([])
+    await fs.rm(path.join(first.home, 'compaction', id, 'snapshots'), { recursive: true, force: true })
 
     const server = await createWebServer({ home: first.home, providers: [llm], configFile: path.join(first.home, 'p.json'), limits: { compactionEffectiveEnabled: true } })
     servers.push(server)

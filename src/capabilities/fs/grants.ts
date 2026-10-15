@@ -317,6 +317,7 @@ const PATH_ARGS: Readonly<Record<string, { readonly arg: string; readonly intent
   // an attachment source has no path.
   EditImage: { arg: 'path', intent: 'read' },
   GenerateVideo: { arg: 'path', intent: 'read' },
+  SendPreview: { arg: 'path', intent: 'read' },
 }
 
 /** One path a tool call targets, with the access it needs. */

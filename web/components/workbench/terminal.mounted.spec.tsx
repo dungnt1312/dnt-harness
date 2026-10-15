@@ -227,6 +227,20 @@ describe('terminal panel', () => {
     expect(host.textContent).toContain('No terminal open')
   })
 
+  it('opens a shell when the view is mounted again over an emptied folder', async () => {
+    await mount()
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+    await act(async () => push({ kind: 'created', terminal: row('terminal-1') }))
+    await act(async () => push({ kind: 'exit', terminalId: 'terminal-1', exitCode: 0, reason: 'killed' }))
+    expect(api.createTerminal).toHaveBeenCalledTimes(1)
+
+    api.createTerminal.mockClear()
+    await unmount()
+    await mount()
+    await act(async () => push({ kind: 'snapshot', terminals: [] }))
+    expect(api.createTerminal).toHaveBeenCalledTimes(1)
+  })
+
   it('does not auto-open when the mount inherits a shell and it later exits', async () => {
     // Ctrl+` reopened over a live shell (a hidden footer kept it alive): this
     // mount adopted that shell instead of opening one, and when it exits the

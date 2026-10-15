@@ -83,9 +83,9 @@ interface ManifestView {
   readonly history: { readonly compactedThroughSeq?: number; readonly checkpointHash?: string }
 }
 
-/** The store keys checkpoints flat by session id under the workspaces root. */
+/** The store keys checkpoints flat by session id, outside workspaces/ (boot adopts every dir there). */
 function checkpointsDir(home: string, sessionId: string): string {
-  return path.join(home, 'workspaces', sessionId, 'checkpoints')
+  return path.join(home, 'compaction', sessionId, 'checkpoints')
 }
 
 const LATEST_STATE = [

@@ -463,6 +463,12 @@ export function GitPanel({ active = true, workspaceId, project, pathFilter, focu
                   // The reader took over: a late diff must not yank the list back.
                   pendingFocus.current = false
                   setSelectedPath(path)
+                  // Picking a file asks to see its diff, so a hidden pane opens.
+                  if (split.collapsed) {
+                    const next = { ratio: split.ratio, collapsed: false }
+                    writeSplit(project.id, next)
+                    setSplit(next)
+                  }
                 }}
                 {...(focusPath !== undefined ? { focusPath, focusRowRef } : {})}
                 {...(onOpenFile !== undefined ? { onOpenFile } : {})}

@@ -42,4 +42,24 @@ describe('useHotkeys', () => {
     act(() => root.unmount())
     host.remove()
   })
+
+  it('matches a ctrl binding on the physical Ctrl key only, never Cmd', () => {
+    const onPress = vi.fn()
+    function CtrlProbe() {
+      useHotkeys([{ key: 'ArrowRight', ctrl: true, onPress }])
+      return null
+    }
+    const host = document.createElement('div')
+    document.body.append(host)
+    const root = createRoot(host)
+    act(() => root.render(<CtrlProbe />))
+    const press = (init: KeyboardEventInit) => act(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', ...init })) })
+    press({ metaKey: true })
+    press({})
+    expect(onPress).not.toHaveBeenCalled()
+    press({ ctrlKey: true })
+    expect(onPress).toHaveBeenCalledTimes(1)
+    act(() => root.unmount())
+    host.remove()
+  })
 })

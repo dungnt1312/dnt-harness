@@ -147,6 +147,16 @@ describe('the split layout', () => {
     await act(async () => { await vi.waitFor(() => expect(region('src/a.ts')).not.toBeNull()) })
   })
 
+  it('clicking a file while the diff is hidden opens the pane on that file', async () => {
+    await mount()
+    await act(async () => { await vi.waitFor(() => expect(region('src/a.ts')).not.toBeNull()) })
+    await act(async () => document.querySelector<HTMLButtonElement>('button[aria-label="Hide Diff"]')!.click())
+    expect(region('src/a.ts')).toBeNull()
+    await act(async () => rowOf('b.ts').click())
+    await act(async () => { await vi.waitFor(() => expect(region('src/b.ts')).not.toBeNull()) })
+    expect(window.localStorage.getItem('dnt-harness.git.split.p1')).toBe('{"ratio":0.4,"collapsed":false}')
+  })
+
   it('the separator moves by 5% on the arrow keys and persists the ratio', async () => {
     await mount()
     await act(async () => { await vi.waitFor(() => expect(region('src/a.ts')).not.toBeNull()) })

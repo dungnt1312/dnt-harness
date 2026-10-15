@@ -157,6 +157,7 @@ import { MemoryService, MemoryError } from '../harness/memory/service.ts'
 import { memoryGuidance, memoryGuidanceAccess, memoryIndexes } from '../harness/memory/context.ts'
 import { todoWriteTool } from '../harness/tools/todo.ts'
 import { editImageTool, generateImageTool, type ImageToolOptions } from '../harness/tools/image-tools.ts'
+import { sendPreviewTool } from '../harness/tools/preview-tool.ts'
 import { describeImageTool } from '../harness/tools/describe-image.ts'
 import { generateVideoTool } from '../harness/tools/video-tools.ts'
 import { VideoStore, VideoStoreError } from '../harness/attachments/video-store.ts'
@@ -706,7 +707,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const modes = new ModesService(resourceHome)
   const skills = new SkillsService(resourceHome, options.bundledSkillsDir, options.userSkillsDir)
   const memory = new MemoryService(resourceHome)
-  const checkpoints = new CheckpointStore(path.join(resourceHome, 'workspaces'))
+  // Not under workspaces/: boot adopts every directory there as a workspace.
+  const checkpoints = new CheckpointStore(path.join(resourceHome, 'compaction'))
   // Settings → Usage: durable cross-workspace token accounting.
   const usageLog = options.home !== undefined ? await openUsageLog(path.join(options.home, 'usage.jsonl')) : memoryUsageLog()
   // Workspace-authored system prompt replacements (Settings → System Prompts).
@@ -1430,7 +1432,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     return done
   }
 
-  const snapshotStore = new CompactionSnapshotStore((sessionId) => path.join(resourceHome, 'workspaces', sessionId, 'snapshots'))
+  const snapshotStore = new CompactionSnapshotStore((sessionId) => path.join(resourceHome, 'compaction', sessionId, 'snapshots'))
   /** Per-session host: one owner of an effective compaction. Created lazily, cancelled with the session. */
   const compactionHosts = new Map<SessionId, CompactionHost>()
 
@@ -2419,6 +2421,7 @@ ${entry.description}`.toLowerCase().includes(query))
   }
   kernel.ctx.tools.register(generateImageTool(imageToolOptions))
   kernel.ctx.tools.register(editImageTool(imageToolOptions))
+  kernel.ctx.tools.register(sendPreviewTool(imageToolOptions))
   kernel.ctx.tools.register(describeImageTool({
     resolve: () => resolveVisionApi(pairOf('image-understanding'), list),
     read: imageToolOptions.read,
@@ -4241,14 +4244,13 @@ ${entry.description}`.toLowerCase().includes(query))
     }
   }
   /**
-   * Whether a tracked run is really still going. A run whose conversation is
-   * gone, or whose turn already settled while nothing was watching, is
-   * dropped here so it neither blocks later runs nor stays "Running". A run
-   * still being set up has no turn/end yet and counts as live.
+   * Whether a tracked run is really still going. Only a loaded session whose
+   * driver is in flight counts: a conversation with no `turn/end` whose driver
+   * already died must not block the next run forever. A run still being set
+   * up is busy and counts as live.
    */
   const runStillLive = (sessionId: SessionId): boolean => {
-    const entry = sessions.get(sessionId)
-    if (entry !== undefined && (entry.agent.busy || !entry.session.events.some((event) => event.type === 'turn/end'))) return true
+    if (sessions.get(sessionId)?.agent.busy === true) return true
     activeRuns.delete(sessionId)
     return false
   }
@@ -4314,8 +4316,7 @@ ${entry.description}`.toLowerCase().includes(query))
     for (const run of await automations.history(workspaceId, automationId)) {
       if (run.status !== 'started' && run.status !== 'needs-approval') continue
       const sessionId = run.sessionId as SessionId | undefined
-      if (sessionId !== undefined && activeRuns.has(sessionId) && runStillLive(sessionId)) continue
-      if (sessionId !== undefined && sessions.get(sessionId)?.agent.busy === true) continue
+      if (sessionId !== undefined && runStillLive(sessionId)) continue
       const base = { runId: run.runId, automationId, dueAt: run.dueAt, ...(sessionId !== undefined ? { sessionId } : {}) }
       const events = sessionId === undefined
         ? undefined

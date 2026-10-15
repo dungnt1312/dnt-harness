@@ -7,7 +7,6 @@ import { Kbd } from '../ui/Kbd.tsx'
 import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import { SessionList } from '../session/SessionList.tsx'
 import { WorkspacePopover } from './WorkspacePopover.tsx'
-import { useHotkeys } from '../../hooks/useHotkeys.ts'
 import { cn } from '../../lib/cn.ts'
 import { activityAt } from '../../lib/format.ts'
 import type { ThemePreference } from '../../lib/theme.ts'
@@ -113,8 +112,7 @@ export const Sidebar = memo(function Sidebar(props: SidebarProps) {
 
   const closeSearch = (): void => { onFilter(''); setSearchOpen(false) }
 
-  useHotkeys([{ key: 'k', mod: true, onPress: () => setSearchOpen(true) }])
-  // Focus follows the field into existence, so Ctrl+K types straight into it.
+  // Focus follows the field into existence, so a click types straight into it.
   useEffect(() => { if (showSearch) searchRef.current?.focus() }, [showSearch])
 
   return (
@@ -163,13 +161,13 @@ export const Sidebar = memo(function Sidebar(props: SidebarProps) {
           <button
             type="button"
             className={navRowClass}
-            aria-label={`Search conversations and folders (${MOD} K)`}
+            aria-label="Search conversations and folders"
+            title={`Filter this list. ${MOD} K opens quick switch.`}
             aria-expanded={false}
             onClick={() => setSearchOpen(true)}
           >
             <Icon name="search" size={16} className="shrink-0 text-fg-muted group-hover:text-fg" />
             <span className="flex-1 truncate text-left">Search</span>
-            <span className="hidden gap-0.5 group-hover:flex [@media(pointer:coarse)]:!hidden"><Kbd>{MOD}</Kbd><Kbd>K</Kbd></span>
           </button>
         )}
         {/* Section caption: small label, the sort/filter control is a 24px

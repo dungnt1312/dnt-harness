@@ -384,6 +384,31 @@ deleted, or disabled provider fails the call with the Settings fix it needs.
   `allow` in Full access and are not exposed in Plan. DescribeImage is a
   read-like `allow` tool exposed in every bundled mode, including Plan.
 
+## Preview tool (`src/harness/tools/preview-tool.ts`)
+
+`SendPreview { title?, caption?, attachmentId | path | chart }` lets the agent
+show the user something inline. It displays only; it creates nothing and calls
+no provider, so it is `allow` in every bundled mode, Plan included.
+
+- **Image**: `attachmentId` names a stored image (a user attachment or a
+  GenerateImage/EditImage result) and keeps its id. `path` names a
+  png/jpeg/webp/gif under the run's grants, resolved by `loadImageSource` like
+  EditImage; it is listed in `targetPaths`, so it is approved and refused as a
+  `Read` of that path would be, and the bytes are copied into the attachment
+  store. A screenshot is a `path`.
+- **Chart**: `chart: { type: 'bar' | 'line', labels, series: [{ name, values }] }`,
+  validated by `chart-spec.ts` (1–8 series, up to 500 points, one finite number
+  per label). The result carries the whole spec, so the log replays it.
+- **Exactly one** source is allowed; anything else fails with the reason.
+- **UI**: `PreviewCard` in `web/components/chat/MessageParts.tsx` shows the image
+  (with the lightbox) or `ChartPreview.tsx`, a plain SVG chart with a legend and
+  a collapsible data table. The web re-validates the logged chart with the same
+  `parseChart` before drawing, and model text only reaches the DOM as text.
+- **Adding a kind** (table, video, …): a branch in the tool and one in
+  `PreviewCard`; the existing kinds do not change.
+- Tests: `tests/harness/preview-tool.spec.ts`,
+  `tests/harness/image-tools-mode-exposure.spec.ts`, `web/lib/preview-card.spec.tsx`.
+
 ## Video tool (`src/harness/tools/video-tools.ts`)
 
 `GenerateVideo { prompt, attachmentId | path, seconds?, size? }` runs an

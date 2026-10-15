@@ -322,6 +322,20 @@ describe('transcript grouping', () => {
     expect(blocks.map((block) => block.kind === 'activity' ? `activity:${block.rows.length}` : block.row.item.kind))
       .toEqual(['user', 'activity:7'])
   })
+  it('keeps landed media (previews, generated images) out of runs so a fold never hides them', () => {
+    const chart = JSON.stringify({ kind: 'chart', chart: { type: 'bar', labels: ['a'], series: [{ name: 's', values: [1] }] } })
+    const blocks = groupBlocks([
+      { kind: 'user', content: 'go' },
+      { kind: 'tool', call: { id: 'a', name: 'SendPreview', args: {} }, result: { ok: true, output: chart } },
+      { kind: 'tool', call: { id: 'b', name: 'SendPreview', args: {} }, result: { ok: true, output: chart } },
+      { kind: 'tool', call: { id: 'c', name: 'SendPreview', args: {} }, result: { ok: false, output: 'error: bad' } },
+      { kind: 'tool', call: { id: 'd', name: 'Glob', args: {} }, result: { ok: true, output: 'x' } },
+      { kind: 'tool', call: { id: 'e', name: 'GenerateImage', args: {} }, result: { ok: true, output: JSON.stringify({ attachmentId: 'a'.repeat(64) }) } },
+    ])
+    // A failed preview showed nothing, so it is ordinary work and still groups.
+    expect(blocks.map((block) => block.kind === 'activity' ? `activity:${block.rows.length}` : block.row.item.kind))
+      .toEqual(['user', 'tool', 'tool', 'activity:2', 'tool'])
+  })
   it('merges tool rows across invisible tool-only assistant steps into one tight block', () => {
     const emptyStep = { kind: 'assistant' as const, content: '', live: false, thinking: [] as string[], thinkingLive: false }
     const blocks = groupBlocks([
@@ -1622,7 +1636,7 @@ describe('sidebar sections + live rows + workspace management', () => {
     const onFilter = vi.fn()
     const props = sidebarProps([{ id: 'w1', name: 'Acme', archived: false, createdAt: 1 }], 'w1')
     await mount(<ToastHost><Sidebar {...props} onFilter={onFilter} /></ToastHost>)
-    const search = () => host.querySelector<HTMLButtonElement>('button[aria-label="Search conversations and folders (Ctrl K)"]')!
+    const search = () => host.querySelector<HTMLButtonElement>('button[aria-label="Search conversations and folders"]')!
     expect(host.querySelector('input[aria-label="Search conversations and folders"]')).toBeNull()
     await act(async () => search().click())
     expect(host.querySelector('input[aria-label="Search conversations and folders"]')).not.toBeNull()

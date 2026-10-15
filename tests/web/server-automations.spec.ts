@@ -154,6 +154,31 @@ describe('automations API', () => {
     expect(messages.indexOf(context!)).toBeLessThan(messages.findIndex((event) => event.content === 'remind me'))
   })
 
+  it('a run whose driver died no longer blocks the next one', async () => {
+    const { url, ws } = await boot()
+    const row = await (await fetch(`${url}/api/workspaces/${ws}/automations`, json('POST', { title: 'Stuck', prompt: 'x', schedules: [{ cron: '0 7 * * *' }] }))).json() as { id: string }
+    const { sessionId } = await (await fetch(`${url}/api/workspaces/${ws}/automations/${row.id}/run`, { method: 'POST' })).json() as { sessionId: string }
+    const runsUrl = `${url}/api/workspaces/${ws}/automations/${row.id}/runs`
+    await until(async () => (await (await fetch(runsUrl)).json() as { status: string }[])[0]?.status, (status) => status === 'done')
+    await server!.close()
+    server = undefined
+    // The host died before writing the outcome, and the reloaded conversation
+    // has no settled turn: history used to show it Running and Run now skipped.
+    const file = path.join(home, 'workspaces', ws, 'automation-runs.jsonl')
+    const open = (await fs.readFile(file, 'utf8')).trim().split('\n').filter((line) => !line.includes('"status":"done"'))
+    await fs.writeFile(file, `${open.join('\n')}\n`)
+    const events = path.join(home, 'workspaces', ws, 'sessions', sessionId, 'events.jsonl')
+    const kept = (await fs.readFile(events, 'utf8')).trim().split('\n').filter((line) => !line.includes('"turn/end"'))
+    await fs.writeFile(events, `${kept.join('\n')}\n`)
+
+    const { url: next } = await boot()
+    const history = await (await fetch(`${next}/api/workspaces/${ws}/automations/${row.id}/runs`)).json() as { status: string; error?: string }[]
+    expect(history[0]).toMatchObject({ status: 'failed' })
+    const again = await (await fetch(`${next}/api/workspaces/${ws}/automations/${row.id}/run`, { method: 'POST' })).json() as { skipped?: boolean; sessionId?: string }
+    expect(again.skipped).toBeUndefined()
+    expect(again.sessionId).toBeDefined()
+  })
+
   it('still records the outcome after a provider change re-registers providers', async () => {
     const { url, ws } = await boot()
     // Any provider mutation re-syncs registrations; it used to drop the run watcher too.

@@ -372,8 +372,12 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
       const deliberate = frame.reason === 'killed'
       if (deliberate) detach(frame.terminalId)
       else window.setTimeout(() => detach(frame.terminalId), EXIT_NOTICE_MS)
+      const lastHere = exitedHere && !remaining.some((row) => (row.projectId ?? null) === projectId)
+      // The folder is empty again: the next view opened on it gets its one shell.
+      // This mount never re-opens (autoOpened), so closing the last tab stays final here.
+      if (lastHere) autoOpenClaims.delete(projectKey(workspaceId, projectId))
       if (!exitedHere || onHideRef.current === undefined) return
-      if (remaining.some((row) => (row.projectId ?? null) === projectId)) return
+      if (!lastHere) return
       if (surfaceCloseTimer.current !== undefined) clearTimeout(surfaceCloseTimer.current)
       if (deliberate) {
         surfaceCloseTimer.current = undefined
@@ -536,7 +540,7 @@ export function TerminalPanel({ workspaceId, projectId, defaultShell, onDefaultS
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex h-9 shrink-0 items-center gap-0.5 overflow-x-auto border-b border-line px-1.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" role="toolbar" aria-label="Terminals">
+      <div className="flex h-8 shrink-0 items-center gap-0.5 overflow-x-auto border-b border-line px-1.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" role="toolbar" aria-label="Terminals">
         {/* Only this view's project's shells: a terminal belongs to its
             folder, and another folder's shells keep running out of sight
             until a conversation in that folder is opened (the sidebar marks

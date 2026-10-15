@@ -60,6 +60,7 @@ import { useWorkbenchPreferences } from './hooks/useWorkbenchPreferences.ts'
 import { useWorkbenchTabs } from './hooks/useWorkbenchTabs.ts'
 import { useTerminalProjects } from './hooks/useTerminalProjects.ts'
 import { useHotkeys } from './hooks/useHotkeys.ts'
+import { QuickSwitch, type QuickSwitchItem } from './components/layout/QuickSwitch.tsx'
 import { useMediaQuery } from './hooks/useMediaQuery.ts'
 import { useKeyboardInset } from './hooks/useKeyboardInset.ts'
 import { useTheme } from './hooks/useTheme.ts'
@@ -352,6 +353,7 @@ function AppShell() {
   // a user shell belongs to the folder, not to one conversation.
   const [terminalProjects, setTerminalProjects] = useState<ReadonlySet<string>>(new Set())
   const [projects, setProjects] = useState<readonly ProjectRow[]>([])
+  const [quickSwitchOpen, setQuickSwitchOpen] = useState(false)
   // No-modal new-chat flow (spec: App shell): New conversation clears the
   // canvas; the composer's scope chip picks the project; the session is
   // created by the first sent message. The scope choice persists per
@@ -1547,9 +1549,27 @@ function AppShell() {
     patchTerminalProject({ footerOpen: !terminalProjectState.footerOpen })
   }, [terminalProjectState.footerOpen, patchTerminalProject])
 
+  /** Ctrl+←/→: the previous or next live workspace, wrapping around the list. */
+  const cycleWorkspace = (step: 1 | -1): void => {
+    const live = workspaces.filter((row) => !row.archived || row.id === activeWs)
+    if (live.length < 2) return
+    const at = live.findIndex((row) => row.id === activeWs)
+    switchWorkspace(live[(at + step + live.length) % live.length]!.id)
+  }
+
+  const chooseQuickSwitch = (item: QuickSwitchItem): void => {
+    if (item.kind === 'session') openSession(item.id)
+    else if (item.kind === 'project') newInProject(item.id)
+    else switchWorkspace(item.id)
+  }
+
   useHotkeys([
     { key: 'n', mod: true, onPress: beginConversation },
-    { key: 'k', mod: true, onPress: () => onLeftOpenChange(true) },
+    { key: 'k', mod: true, onPress: () => setQuickSwitchOpen(true) },
+    { key: 'b', mod: true, onPress: () => onLeftOpenChange(!sidebarOpen) },
+    // Physical Ctrl on every platform: Cmd+←/→ is the browser's Back/Forward on macOS.
+    { key: 'ArrowLeft', ctrl: true, onPress: () => cycleWorkspace(-1) },
+    { key: 'ArrowRight', ctrl: true, onPress: () => cycleWorkspace(1) },
     { key: ',', mod: true, onPress: () => openSettings() },
     // Editors open the terminal with Ctrl+`. It must work from the composer.
     { key: '`', mod: true, allowInEditable: true, onPress: toggleTerminal },
@@ -2019,6 +2039,15 @@ function AppShell() {
         confirmLabel="Delete"
         onConfirm={() => void confirmDelete()}
         onDismiss={() => setPendingDelete(null)}
+      />
+      <QuickSwitch
+        open={quickSwitchOpen}
+        sessions={sessions}
+        projects={projects}
+        workspaces={workspaces}
+        activeWorkspaceId={activeWs}
+        onChoose={chooseQuickSwitch}
+        onDismiss={() => setQuickSwitchOpen(false)}
       />
       <FolderPickerModal
         open={folderPickerOpen}
