@@ -52,6 +52,12 @@ export function subagentRows(events: readonly SseEvent[]): readonly SubagentRow[
       const row = rows.get(event.childSessionId)
       if (row === undefined) continue
       rows.set(event.childSessionId, { ...row, running: false, status: event.status ?? 'finished', ...(event.timestamp !== undefined ? { endedAt: event.timestamp } : {}) })
+    } else if (event.type === 'agent/child-resume' && event.childSessionId !== undefined) {
+      // A finished child running again: running from the resume on.
+      const row = rows.get(event.childSessionId)
+      if (row === undefined) continue
+      const { status: _status, endedAt: _endedAt, ...rest } = row
+      rows.set(event.childSessionId, { ...rest, running: true, dispatchedAt: event.timestamp ?? row.dispatchedAt })
     }
   }
   // Newest dispatch first: the child just sent out leads the list instead of

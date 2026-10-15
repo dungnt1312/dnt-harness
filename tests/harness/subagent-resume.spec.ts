@@ -172,6 +172,24 @@ describe('messaging a running child', () => {
     expect(ends).toEqual(['steered', 'completed'])
   })
 
+  it('a message racing the end of a run is never stranded: it runs, as this run or a resume', async () => {
+    const harness = await boot(home, ['Ends at once.', 'Handled the late message.'])
+    const spawned = await harness.executor.spawn(spawnRequest(harness))
+    // Poll until the run is past running but before (or during) settlement.
+    await new Promise<void>((resolve) => {
+      const tick = (): void => {
+        void harness.executor.childrenOfRoot(harness.rootSessionId, harness.workspaceId).then((children) => {
+          if (children[0]?.status !== 'running' && children[0]?.status !== 'queued' && children[0]?.status !== 'dispatching') resolve()
+          else setTimeout(tick, 1)
+        })
+      }
+      tick()
+    })
+    await harness.executor.message(harness.workspaceId, harness.rootSessionId, 'turn-2', spawned.childSessionId as never, 'Late.', 'queue')
+    const done = await settle(harness, spawned.childSessionId)
+    expect(done?.result?.report).toBe('Handled the late message.')
+  })
+
   it('the message is durable in the child log before it is delivered', async () => {
     const harness = await boot(home, [read('a.ts'), 'Done.', 'Follow-up done.'], { slowMs: 200 })
     const spawned = await harness.executor.spawn(spawnRequest(harness))

@@ -109,7 +109,8 @@ export interface SpawnRequest {
   readonly grants?: readonly GrantedRoot[] | undefined
   /**
    * Outlive the spawning turn: never joined or cancelled when it closes, and
-   * reported to the host when it settles. Fixed for the child's life.
+   * reported to the host when it settles. Fixed for the child's life; omitted
+   * follows the definition's `background`, then false.
    */
   readonly background?: boolean | undefined
 }
@@ -296,6 +297,9 @@ export class ChildExecutor {
    * Background children per root whose current run the model has not been
    * handed yet. Unlike `turnChildren` this survives turn cleanup: the report
    * is owed to the root, delivered by notification, a wait, or the next join.
+   * shortcut: in memory only — after a restart an undelivered report is not
+   * owed again (the model still sees it via list/wait by id); persist delivery
+   * per run if reports must survive a crash.
    */
   private readonly owedBackground = new Map<SessionId, Set<SessionId>>()
   /** Waits watching a child right now: a watched settle is the wait's to deliver. */
@@ -719,6 +723,7 @@ export class ChildExecutor {
     // same rollback/cleanup paths as before.
     const root = request.parentSessionId
     const turnKey = `${root}:${request.parentTurnId}`
+    const background = request.background ?? request.definition.background ?? false
     // Re-checked after the awaits above: closeTurn may have started while
     // this spawn waited on the parent load or the admission resolver.
     if (this.closingTurns.has(turnKey)) throw new SpawnError('ownership', 'turn is closing')
@@ -742,7 +747,7 @@ export class ChildExecutor {
         ...(request.projectId !== undefined ? { projectId: request.projectId } : {}),
         definitionName: request.definition.name,
         ...(request.model !== undefined ? { model: request.model } : {}),
-        background: request.background === true,
+        background,
         events: session.events,
         runStart: 0,
         status: 'queued',
@@ -785,7 +790,7 @@ export class ChildExecutor {
         toolCeiling,
         ...(request.definition.skills !== undefined ? { skills: request.definition.skills } : {}),
         ...(request.grants !== undefined && request.grants.length > 0 ? { grants: request.grants } : {}),
-        ...(request.background === true ? { background: true } : {}),
+        ...(background ? { background: true } : {}),
       })
       await session.durable()
       const spawnRecord = {
@@ -918,25 +923,37 @@ export class ChildExecutor {
       const sessions = this.sessions()
       const agents = this.ctx.get('agents') as { create(s: unknown, identity?: unknown): Agent; forget?(id: SessionId): void } | undefined
       if (sessions === undefined || agents === undefined) throw new SpawnError('depth', 'no sessions or agents service mounted')
-      const live = this.active.get(childSessionId)
-      const target = live ?? await this.reconstruct(childSessionId, workspaceId)
-      if (target === undefined || target.parentSessionId !== root || !await this.ownsChild(workspaceId, target)) {
+      const owner = this.active.get(childSessionId) ?? await this.reconstruct(childSessionId, workspaceId)
+      if (owner === undefined || owner.parentSessionId !== root || !await this.ownsChild(workspaceId, owner)) {
         throw new SpawnError('ownership', 'no such child of this conversation')
       }
       const childSession = await sessions.load(childSessionId)
       if (childSession.poisoned === true) throw new SpawnError('ownership', 'the child log cannot be written; reconcile it first')
 
+      // A run that just chose its terminal status is still persisting it: let
+      // it settle, then this message resumes the child instead of landing on
+      // an agent that will never run again.
+      let live = this.active.get(childSessionId)
+      if (live !== undefined && !live.finished && (live.status === 'completed' || live.status === 'failed')) {
+        await live.settled
+        live = this.active.get(childSessionId)
+      }
       if (live !== undefined && !live.finished) {
         if (live.status !== 'running' || live.agent === undefined) {
           throw new SpawnError('ownership', `the child is ${live.status === 'cancelled' ? 'stopping' : 'not running yet'}; message it once it is running or has finished`)
         }
+        // Same tick as the running check: the run loop either sees this input
+        // or has not decided to end yet. The child's next step flushes the
+        // record before any model request; we acknowledge only once durable.
         const inputId = newInputId()
         childSession.append({ type: 'input/queued', inputId, content })
-        await childSession.durable()
         live.agent.enqueueAccepted({ content, inputId })
         if (delivery === 'steer') live.agent.steer()
+        await childSession.durable()
         return this.withResult(live)
       }
+      const target = live ?? await this.reconstruct(childSessionId, workspaceId)
+      if (target === undefined) throw new SpawnError('ownership', 'no such child of this conversation')
       if (target.status === 'uncertain') throw new SpawnError('ownership', 'the child outcome is not durably known; reconcile it first')
 
       const parent = await sessions.load(root)
@@ -1024,9 +1041,21 @@ export class ChildExecutor {
   private notifyBackground(child: InternalChild, handle: ChildHandle): void {
     const root = child.parentSessionId
     if (this.onBackgroundSettled === undefined || (this.watchers.get(child.childSessionId) ?? 0) > 0 || (this.stoppingRoots.get(root) ?? 0) > 0) return
+    // Claimed before the host's await: a join or wait meanwhile must not hand
+    // the same report over a second time. A failed delivery gives it back —
+    // unless the child already runs again, whose report supersedes this one.
+    const owed = this.owedBackground.get(root)
+    if (owed?.delete(child.childSessionId) !== true) return
+    const giveBack = (): void => {
+      if (this.active.has(child.childSessionId) || !this.childIdsByRoot.has(root)) return
+      const current = this.owedBackground.get(root) ?? new Set<SessionId>()
+      current.add(child.childSessionId)
+      this.owedBackground.set(root, current)
+    }
     void this.onBackgroundSettled(root, handle).then((delivered) => {
-      if (delivered) this.owedBackground.get(root)?.delete(child.childSessionId)
+      if (!delivered) giveBack()
     }).catch((error: unknown) => {
+      giveBack()
       console.error(`agents: background report for ${child.childSessionId} not delivered: ${errorText(error)}`)
     })
   }

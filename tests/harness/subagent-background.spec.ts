@@ -140,6 +140,32 @@ describe('background children', () => {
     expect(harness.executor.owedChildrenOfTurn(harness.rootSessionId, 'turn-3')).toEqual([])
   })
 
+  it('a join while delivery is in flight does not hand the report over twice', async () => {
+    let release: (delivered: boolean) => void = () => {}
+    const harness = await boot(['Racing.'])
+    ;(harness.executor as unknown as { onBackgroundSettled: (root: unknown, handle: ChildHandle) => Promise<boolean> }).onBackgroundSettled = async (_root, handle) => {
+      harness.notified.push(handle)
+      return new Promise<boolean>((resolve) => { release = resolve })
+    }
+    const handle = await harness.executor.spawn(spawnRequest(harness, true))
+    await until(() => harness.notified.length > 0)
+    expect(harness.executor.owedChildrenOfTurn(harness.rootSessionId, 'turn-2')).toEqual([])
+    release(false)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    // Not delivered after all: owed again.
+    expect(harness.executor.owedChildrenOfTurn(harness.rootSessionId, 'turn-2')).toEqual([handle.childSessionId])
+  })
+
+  it('a role marked background runs in the background without the spawn saying so', async () => {
+    const harness = await boot([read, 'Role background.'], { slowMs: 200 })
+    const request = spawnRequest(harness, false)
+    const { background: _omit, ...withoutFlag } = request
+    await harness.executor.spawn({ ...withoutFlag, definition: { ...bundledDefinition('worker'), background: true } })
+    expect(await harness.executor.resolveForRootCompletion(harness.rootSessionId, 'turn-1')).toBe(0)
+    await until(() => harness.notified.length > 0)
+    expect(harness.notified[0]?.result?.report).toBe('Role background.')
+  })
+
   it('an undeliverable report stays owed to the next join', async () => {
     const harness = await boot(['Nobody heard.'], { deliver: false })
     const handle = await harness.executor.spawn(spawnRequest(harness, true))

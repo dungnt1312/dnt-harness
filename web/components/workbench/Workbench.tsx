@@ -174,7 +174,7 @@ export const Workbench = memo(function Workbench({ workspaceId, project, view, o
     let count = 0
     const briefs = new Map<string, string>()
     for (const event of agentEvents ?? events) {
-      if (event.type !== 'agent/child-spawn' && event.type !== 'agent/child-result') continue
+      if (event.type !== 'agent/child-spawn' && event.type !== 'agent/child-resume' && event.type !== 'agent/child-result') continue
       count += 1
       const brief = event.brief ?? event.objective
       if (event.type === 'agent/child-spawn' && event.childSessionId !== undefined && brief !== undefined) briefs.set(event.childSessionId, brief)

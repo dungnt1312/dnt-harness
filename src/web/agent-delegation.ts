@@ -459,7 +459,7 @@ async function spawn(
     ...(model !== undefined ? { model } : {}),
     ...(inheritedContext !== undefined ? { inherit: 'brief' as const, inheritedContext } : {}),
     ...(deps.grantsOf !== undefined ? { grants: deps.grantsOf(parentSessionId) } : {}),
-    background: background ?? resolved.definition.background ?? false,
+    ...(background !== undefined ? { background } : {}),
   })
   // A built-in grant the role lacks is reported, never silently dropped: the
   // model would otherwise plan around a missing tool. MCP names are checked

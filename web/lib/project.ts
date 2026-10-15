@@ -690,6 +690,14 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
           if (status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'interrupted') item.status = status
           break
         }
+        case 'agent/child-resume': {
+          // The same delegation card runs again; its next result settles it.
+          const item = event.childSessionId === undefined ? undefined : delegations.get(event.childSessionId)
+          if (item === undefined) break
+          touch(item)
+          item.status = 'running'
+          break
+        }
         case 'context/manifest': {
           if (event.manifest === undefined) break
           // A tool loop makes one request per step: folding into the turn's
