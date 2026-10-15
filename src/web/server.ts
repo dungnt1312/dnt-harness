@@ -7577,7 +7577,10 @@ async function handleApi(
       const liveIsNewer = live !== undefined && (compactionSeq === undefined
         || entry.session.events.some((event) => event.type === 'context/manifest' && event.seq > compactionSeq && event.manifest.contextId === live.contextId))
       const view = committedView !== null && isAvailableContext(committedView) && liveIsNewer
-        && live !== undefined && live.contextId !== committedView.contextId ? { ...live, usage: committedView.usage } : committedView ?? live ?? null
+        && live !== undefined && live.contextId !== committedView.contextId
+        // usage.last pairs only with its own contextId; session cache totals carry over.
+        ? { ...live, ...(committedView.usage !== undefined ? { usage: { cacheableInputTokens: committedView.usage.cacheableInputTokens, cachedInputTokens: committedView.usage.cachedInputTokens } } : {}) }
+        : committedView ?? live ?? null
       if (view === null) {
         res.writeHead(204); res.end(); return
       }
