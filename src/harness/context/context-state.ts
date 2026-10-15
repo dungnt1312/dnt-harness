@@ -94,7 +94,8 @@ export function createContextReducer<M extends ManifestShape>(initialSessionId?:
           if (f.attribution.sessionId !== sessionId) continue
           const seen = attempts.get(f.attemptId)
           if (seen !== undefined) {
-            if (JSON.stringify(seen) !== JSON.stringify(f.usage)) console.warn('conflicting usage for repeated attempt')
+            if (seen.inputTokens !== f.usage.inputTokens || seen.cachedInputTokens !== f.usage.cachedInputTokens
+              || seen.outputTokens !== f.usage.outputTokens) console.warn('conflicting usage for repeated attempt')
             continue
           }
           attempts.set(f.attemptId,{...f.usage})

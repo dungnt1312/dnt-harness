@@ -72,6 +72,17 @@ describe('request-scoped context state', () => {
       expect(warn).toHaveBeenCalledWith('conflicting usage for repeated attempt')
     } finally { warn.mockRestore() }
   })
+  it('does not warn when a repeated attemptId carries the same usage in a different key order', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const r = accounting.createContextReducer<ContextManifest>('s')
+      r.apply([assembled(1, 'a'), attempt(2, 'a', 'p1', { inputTokens: 10, cachedInputTokens: 4 }),
+        attempt(3, 'a', 'p1', { cachedInputTokens: 4, inputTokens: 10 }, 'reconciled')])
+      expect(warn).not.toHaveBeenCalled()
+      r.apply([attempt(4, 'a', 'p1', { inputTokens: 10, cachedInputTokens: 5 }, 'reconciled')])
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally { warn.mockRestore() }
+  })
   it('pins optional session identity and keeps legacy manifests estimated', () => {
     const r = accounting.createContextReducer<ContextManifest>()
     r.apply([assembled(1, 'a'), attempt(2, 'a', 'p1', usage)])
