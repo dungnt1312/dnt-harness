@@ -15,9 +15,14 @@ import path from 'node:path'
 import { expect, test } from '@playwright/test'
 import { createWebServer, type WebServer } from '../../src/web/server.ts'
 import type { LlmProvider } from '../../src/harness/llm/types.ts'
+import { selectWorkbenchView } from './workbench-nav.ts'
 
 const COMPACT_MARK = 'Primary Request and Intent'
 const SUMMARY_TEXT = 'CHECKPOINT SUMMARY TEXT'
+
+/** Holds the first answer's usage report until the test releases it, so the estimate stage is observable. */
+let releaseUsage: () => void = () => {}
+const usageGate = new Promise<void>((resolve) => { releaseUsage = resolve })
 
 /** Real (2 MB-scale) turn answers, so the conversation actually trims and compacts. */
 function scriptedProvider(): LlmProvider {
@@ -26,7 +31,9 @@ function scriptedProvider(): LlmProvider {
     name: 'scripted', models: ['scripted'],
     async *stream(request) {
       const isSummary = request.messages.some((m) => typeof m.content === 'string' && m.content.includes(COMPACT_MARK))
-      yield { type: 'delta', delta: isSummary ? SUMMARY_TEXT : (++chats === 1 ? 'x'.repeat(1_100_000) : 'small answer') }
+      const first = !isSummary && ++chats === 1
+      yield { type: 'delta', delta: isSummary ? SUMMARY_TEXT : (first ? 'x'.repeat(1_100_000) : 'small answer') }
+      if (first) await usageGate
       if (!isSummary) yield { type: 'usage', usage: { inputTokens: 120_000, cachedInputTokens: 110_000 } }
       yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
     },
@@ -100,20 +107,45 @@ test('request estimate becomes reported, matches the inspector, compacts into a 
   await page.locator('[data-composer-input]').fill('first')
   await page.locator('[data-composer-input]').press('Enter')
 
-  // The meter fills from the request manifest, then the provider report
-  // replaces the estimate: reported 120k over the resolved window, never the
-  // builder's estimate alone (the scripted model's window falls back to 256k).
+  // The meter fills from the request manifest while the provider's usage is
+  // still held back: an estimate, labeled so, and no reported count anywhere.
   const meter = openMeter(page)
-  await expect(meter).toBeVisible({ timeout: 30_000 })
+  try {
+    await expect(meter).toBeVisible({ timeout: 30_000 })
+    await expect(meter).toHaveAccessibleName(/^Context window \S+ \/ 256K$/, { timeout: 30_000 })
+    expect(await meter.getAttribute('aria-label')).not.toContain('120K')
+    const held = await manifest(route)
+    expect(held?.usage?.last).toBeUndefined()
+    expect(held?.budget.estimated).toBe(true)
+    expect(held?.budget.usedTokens).toBeGreaterThan(0)
+    await meter.click()
+    await expect(page.getByRole('dialog')).toContainText(/Last request\s*estimated/, { timeout: 20_000 })
+    await page.keyboard.press('Escape')
+  } finally {
+    // A failed assertion must not leave the turn held open (it would hang server.close()).
+    releaseUsage()
+  }
+
+  // Releasing the report replaces the estimate: reported 120k over the
+  // resolved window (the scripted model's window falls back to 256k).
   await expect(page.getByRole('button', { name: 'Context window 120K / 256K' })).toBeVisible({ timeout: 30_000 })
-  // The terminal usage lands on the log right after the answer; poll the API
-  // until the reported figure replaces the estimate.
   await expect.poll(async () => {
     const body = await manifest(route)
     return body?.usage?.last?.inputTokens
   }, { timeout: 30_000 }).toBe(120_000)
+  await meter.click()
+  await expect(page.getByRole('dialog')).toContainText(/Last request\s*reported/, { timeout: 20_000 })
+  await page.keyboard.press('Escape')
 
-  // The StepInspector for that step shows the same reported figure.
+  // The StepInspector for that request shows the same reported figure.
+  await page.setViewportSize({ width: 1440, height: 900 })
+  const workbench = await selectWorkbenchView(page, 'Trajectory')
+  await workbench.getByRole('list', { name: 'Steps' }).getByRole('button').filter({ hasText: 'xxxxxxxx' }).first().click()
+  const inspector = workbench.getByLabel('Request inspector: turn 1, request 1')
+  await expect(inspector).toBeVisible({ timeout: 20_000 })
+  await expect(inspector).toContainText('120k/256k tok')
+  await expect(inspector).toContainText('reported')
+
   await page.locator('[data-composer-input]').fill('second')
   await page.locator('[data-composer-input]').press('Enter')
   await expect(page.getByText('small answer').first()).toBeVisible({ timeout: 30_000 })

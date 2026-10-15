@@ -1,6 +1,6 @@
 /** Display helpers: times, durations, and compact argument summaries. */
 
-import type { ContextManifestView } from './api.ts'
+import type { CompactionMeasurementView, ContextManifestView } from './api.ts'
 
 /** Fill of the model's whole context window, shared by the meter and the panel. */
 export interface ContextFill {
@@ -132,10 +132,34 @@ export function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-/** `139k → 42k tokens`, or `undefined` when the compaction was not measured. */
-export function compactionTokenChange(change: { readonly tokensBefore?: number; readonly tokensAfter?: number }): string | undefined {
+/**
+ * `139k → 42k estimated tokens`, or `undefined` when the compaction was not
+ * measured. Equal bases are named once; a reported "before" and an estimated
+ * "after" are different tokenizers, so each side is labeled. Scalar-only
+ * (older) events carry no basis and count as estimates.
+ */
+export function compactionTokenChange(change: { readonly tokensBefore?: number; readonly tokensAfter?: number; readonly measurement?: CompactionMeasurementView }): string | undefined {
   if (change.tokensBefore === undefined || change.tokensAfter === undefined) return undefined
-  return `${formatTokenCount(change.tokensBefore)} → ${formatTokenCount(change.tokensAfter)} tokens`
+  const before = formatTokenCount(change.tokensBefore)
+  const after = formatTokenCount(change.tokensAfter)
+  const beforeBasis = change.measurement?.before?.basis ?? 'estimated'
+  const afterBasis = change.measurement?.after?.basis ?? 'estimated'
+  return beforeBasis === afterBasis ? `${before} → ${after} ${beforeBasis} tokens` : `${before} ${beforeBasis} → ${after} ${afterBasis} tokens`
+}
+
+/**
+ * How close the request was to the automatic-compaction trigger. This is the
+ * policy's own ratio (pre-trim estimate over the usable input budget), not the
+ * window ring. `undefined` when the host reported no policy.
+ */
+export function policyPressure(view: { readonly budget: ContextManifestView['budget']; readonly policy?: { readonly automaticCompactionPressure: number } }): { readonly ratio: number; readonly threshold: number } | undefined {
+  if (view.policy === undefined || view.budget.availableTokens <= 0) return undefined
+  return { ratio: (view.budget.preTrimTokens ?? view.budget.usedTokens) / view.budget.availableTokens, threshold: view.policy.automaticCompactionPressure }
+}
+
+/** `78% of input budget · auto-compacts at 85%`. */
+export function formatPolicyPressure(pressure: { readonly ratio: number; readonly threshold: number }): string {
+  return `${Math.round(pressure.ratio * 100)}% of input budget · auto-compacts at ${Math.round(pressure.threshold * 100)}%`
 }
 
 /** Compact token count for chips: 940, 18.4k, 65k, 256k, 1M, 1.5M. */

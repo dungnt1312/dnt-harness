@@ -7631,7 +7631,7 @@ async function handleApi(
         // An unchanged boundary is a no-op with no new end event: report no figures.
         const end = entry.session.events.findLast((event) => event.type === 'compaction/end' && event.seq > lastSeqBefore)
         const measured = end?.type === 'compaction/end' && end.tokensBefore !== undefined && end.tokensAfter !== undefined
-          ? { tokensBefore: end.tokensBefore, tokensAfter: end.tokensAfter }
+          ? { tokensBefore: end.tokensBefore, tokensAfter: end.tokensAfter, ...(end.measurement !== undefined ? { measurement: end.measurement } : {}) }
           : {}
         send(200, { coversSeq: checkpoint.coversSeq, summaryChars: checkpoint.summary.length, ...measured, ...(checkpoint.path !== undefined ? { path: checkpoint.path } : {}) })
       } catch (error) {

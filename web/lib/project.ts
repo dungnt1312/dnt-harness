@@ -1,4 +1,4 @@
-import { isMcpOutcome, type AttachmentRef, type ContextManifestView, type SseEvent, type ToolCall } from './types.ts'
+import { isMcpOutcome, type AttachmentRef, type CompactionMeasurementView, type ContextManifestView, type SseEvent, type ToolCall } from './types.ts'
 import { toolTarget } from './format.ts'
 import { mcpServerOf } from './tool-facts.ts'
 import { CHILD_REPORTS_HEADER } from '../../src/web/child-reports.ts'
@@ -142,6 +142,7 @@ export type ViewItem =
       /** Context tokens before/after (absent on legacy or unmeasured runs). */
       tokensBefore?: number
       tokensAfter?: number
+      measurement?: CompactionMeasurementView
       durationMs?: number
       /** The stored summary, carried by a successful compaction/end. */
       summary?: string
@@ -805,6 +806,7 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
             if (event.summaryChars !== undefined) item.summaryChars = event.summaryChars
             if (event.tokensBefore !== undefined) item.tokensBefore = event.tokensBefore
             if (event.tokensAfter !== undefined) item.tokensAfter = event.tokensAfter
+            if (event.measurement !== undefined) item.measurement = event.measurement
             if (event.durationMs !== undefined) item.durationMs = event.durationMs
             if (event.summary !== undefined) item.summary = event.summary
             if (event.error !== undefined) item.error = event.error
