@@ -11,6 +11,7 @@ import { Composer } from './Composer.tsx'
 import { ToastHost } from '../common/Toast.tsx'
 import { draftText, emptyDraft, type AttachmentRef, type RichDraft } from '../../lib/composer-draft.ts'
 import type { CompletionItem } from '../../lib/composer-completion.ts'
+import { selectionWireText } from '../../lib/chip-clipboard.ts'
 
 const files: readonly CompletionItem[] = [
   { id: 'web/composer.ts', insert: 'web/composer.ts', segment: { kind: 'mention', path: 'web/composer.ts' }, label: 'composer.ts', detail: 'web' },
@@ -709,6 +710,32 @@ describe('attachment tray and uploads', () => {
     })
     await act(async () => { resolveLate([PNG_REF]); await Promise.resolve() })
     lateHost.remove()
+  })
+})
+
+describe('chip copy and paste', () => {
+  it('copies selected chips as their wire links and pastes them back as chips', () => {
+    render({ draft: { segments: [{ kind: 'text', text: 'run ' }, { kind: 'command', name: 'image' }, { kind: 'text', text: ' on ' }, { kind: 'mention', path: 'web/a.ts' }], attachments: [] } })
+    const editor = input()
+    act(() => { const range = document.createRange(); range.selectNodeContents(editor); const selection = document.getSelection(); selection?.removeAllRanges(); selection?.addRange(range) })
+    const copied = selectionWireText(document.getSelection())
+    expect(copied).toBe('run [$image](skill://image) on [@a.ts](./web/a.ts)')
+
+    render({ draft: emptyDraft })
+    act(() => { const range = document.createRange(); range.selectNodeContents(input()); range.collapse(false); const selection = document.getSelection(); selection?.removeAllRanges(); selection?.addRange(range) })
+    paste(`/tmp ${copied}`)
+    expect(current.segments).toEqual([
+      { kind: 'text', text: '/tmp run ' },
+      { kind: 'command', name: 'image' },
+      { kind: 'text', text: ' on ' },
+      { kind: 'mention', path: 'web/a.ts' },
+    ])
+  })
+
+  it('leaves a chip-free selection to the browser', () => {
+    render({ draft: { segments: [{ kind: 'text', text: 'plain' }], attachments: [] } })
+    act(() => { const range = document.createRange(); range.selectNodeContents(input()); const selection = document.getSelection(); selection?.removeAllRanges(); selection?.addRange(range) })
+    expect(selectionWireText(document.getSelection())).toBeNull()
   })
 })
 

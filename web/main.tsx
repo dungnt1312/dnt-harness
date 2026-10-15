@@ -13,6 +13,7 @@ import { ErrorBoundary } from './components/common/ErrorBoundary.tsx'
 import { TooltipProvider } from './components/ui/TooltipProvider.tsx'
 import { registerServiceWorker } from './pwa/register-service-worker.ts'
 import { migrateLegacyStorage } from './lib/legacy-storage.ts'
+import { installChipClipboard } from './lib/chip-clipboard.ts'
 import './styles/app.css'
 import './styles/markdown.css'
 import './styles/motion.css'
@@ -21,6 +22,7 @@ import './styles/motion.css'
 try { migrateLegacyStorage(window.localStorage) } catch { /* storage may be unavailable */ }
 
 registerServiceWorker()
+installChipClipboard(document)
 
 // A tab opened before a redeploy asks for a lazy chunk whose hashed file no longer exists
 // (the server answers with index.html). Reload once to pick up the new build; the 1-minute
