@@ -1,0 +1,336 @@
+f525b88 fix(compaction): precompute summarises with the session pair and target vision
+
+ src/web/compaction-host.ts                    | 16 +++++++++++----
+ src/web/compaction-precompute.ts              |  7 ++++++-
+ src/web/server.ts                             |  4 ++++
+ tests/web/compaction-precompute.spec.ts       | 28 +++++++++++++++++++++++++++
+ tests/web/server-compaction-effective.spec.ts |  4 +++-
+ tests/web/server-session-model.spec.ts        |  4 ++++
+ 6 files changed, 57 insertions(+), 6 deletions(-)
+
+diff --git a/src/web/compaction-host.ts b/src/web/compaction-host.ts
+index 1e03cf5..8653774 100644
+--- a/src/web/compaction-host.ts
++++ b/src/web/compaction-host.ts
+@@ -37,20 +37,31 @@ function retarget(snapshot: EffectiveCompactionSnapshot, now: SnapshotIdentity):
+   void _thinking
+   const { thinkingLevel: _wasThinking, ...identity } = was
+   void _wasThinking
+   return {
+     ...snapshot,
+     request: { ...request, model: now.model, providerName: now.provider, ...(now.thinkingLevel !== undefined ? { thinkingLevel: now.thinkingLevel } : {}) },
+     identity: { ...identity, provider: now.provider, model: now.model, ...(now.thinkingLevel !== undefined ? { thinkingLevel: now.thinkingLevel } : {}) },
+   }
+ }
+ 
++/**
++ * The handoff as it is sent: retargeted to `now`, and without image parts for a text-only
++ * target (the handoff runs no tools, so the fallback must not point at one). The stored
++ * snapshot is untouched. Shared by the foreground host and the background candidates.
++ */
++export function handoffSnapshot(snapshot: EffectiveCompactionSnapshot, now: SnapshotIdentity, nativeVision: boolean): EffectiveCompactionSnapshot {
++  const retargeted = retarget(snapshot, now)
++  return nativeVision ? retargeted
++    : { ...retargeted, request: { ...retargeted.request, messages: textOnlyVisionFallback(retargeted.request.messages, false) } }
++}
++
+ function hasOpenTurn(events: readonly SessionEvent[]): boolean {
+   let open = false
+   for (const event of events) {
+     if (event.type === 'turn/start') open = true
+     else if (event.type === 'turn/end') open = false
+   }
+   return open
+ }
+ 
+ export interface HostDeps {
+@@ -180,24 +191,21 @@ export class CompactionHost {
+       signal.throwIfAborted()
+       if (blocked !== undefined) throw new Error(blocked)
+       return this.adopt(session, candidate, request, signal, true)
+     }
+ 
+     // No snapshot describes this log (written before capture existed, sidecar lost, mode or
+     // grants changed since): fold the shortened transcript. Slower, but /compact always runs;
+     // the user is never asked to pick a path.
+     if (choice.kind === 'fold') return this.legacy(request, signal, 'recovery')
+ 
+-    const retargeted = retarget(choice.snapshot, now)
+-    // The handoff runs no tools, so the fallback must not point at one. The stored snapshot is untouched.
+-    const snapshot = deps.nativeVision() ? retargeted
+-      : { ...retargeted, request: { ...retargeted.request, messages: textOnlyVisionFallback(retargeted.request.messages, false) } }
++    const snapshot = handoffSnapshot(choice.snapshot, now, deps.nativeVision())
+     const { path } = choice
+     // A snapshot the current model's window cannot take with room for its answer (a switch to a
+     // smaller model, a request that grew to the limit) is folded in pieces instead of failing.
+     const window = deps.contextWindowTokens()
+     try {
+       assertFitsWindow(snapshot, { ...(window !== undefined ? { contextWindowTokens: window } : {}), outputTokens: deps.limits.compactionOutputTokens }, path)
+     } catch {
+       return this.legacy(request, signal, 'recovery')
+     }
+ 
+diff --git a/src/web/compaction-precompute.ts b/src/web/compaction-precompute.ts
+index b7c8049..5e45ac1 100644
+--- a/src/web/compaction-precompute.ts
++++ b/src/web/compaction-precompute.ts
+@@ -14,20 +14,21 @@
+  * - cancelling means "abort, then wait for the stream to really end" — a caller
+  *   is never told the slot is free while the transport may still be running;
+  * - if the transport never settles, the session is `blocked` for new speculation
+  *   until the host says it has, instead of pretending the abort freed it.
+  */
+ import { randomUUID } from 'node:crypto'
+ import type { EffectiveCompactionSnapshot, SnapshotIdentity } from '../harness/context/compaction-snapshot.ts'
+ import type { HarnessLimits } from '../harness/limits.ts'
+ import { ProviderError, type ModelRequest, type StreamEvent, type StreamOptions, type TokenUsage } from '../harness/llm/types.ts'
+ import { generateCompaction, type PreparedSummary } from './compaction-generator.ts'
++import { handoffSnapshot } from './compaction-host.ts'
+ 
+ export type CandidateReport =
+   | { readonly kind: 'started'; readonly sessionId: string; readonly snapshotId: string; readonly cutoff: number }
+   | { readonly kind: 'ready'; readonly sessionId: string; readonly snapshotId: string; readonly cutoff: number; readonly generationMs: number }
+   | { readonly kind: 'reused'; readonly sessionId: string; readonly snapshotId: string; readonly cutoff: number }
+   | { readonly kind: 'discarded'; readonly sessionId: string; readonly snapshotId: string; readonly reason: string }
+   | { readonly kind: 'failed'; readonly sessionId: string; readonly snapshotId: string; readonly reason: string }
+ 
+ export interface PrecomputeDeps {
+   readonly stream: (request: ModelRequest, options?: StreamOptions) => AsyncIterable<StreamEvent>
+@@ -38,20 +39,22 @@ export interface PrecomputeDeps {
+   /** Digest of the committed source through `cutoff`, as it is now. */
+   readonly digestAt: (sessionId: string, cutoff: number) => string
+   /** True while the provider still holds an unsettled candidate request of this session. */
+   readonly transportUncertain: (sessionId: string) => boolean
+   /**
+    * Last-moment worth check on a still-valid candidate, against the conversation as it
+    * is NOW (the tail may have refilled since the summary was written): `no-fit` when the
+    * next request would not fit, `no-gain` when it saves less than the minimum.
+    */
+   readonly assess: (sessionId: string, prepared: PreparedSummary) => 'no-gain' | 'no-fit' | undefined
++  /** Whether the session's model sees image pixels; a text-only one gets the handoff without images. */
++  readonly nativeVision: (sessionId: string) => boolean
+   readonly limits: Pick<HarnessLimits, 'compactionDeadlineMs' | 'compactionOutputTokens'>
+   /** Usage the provider reported for one candidate attempt, attributed to the session it served. */
+   readonly recordUsage: (sessionId: string, usage: TokenUsage) => void
+   readonly report: (report: CandidateReport) => void
+ }
+ 
+ /**
+  * The provider-ownership id a candidate request runs under. It must differ from the
+  * session's own id: the LLM service fences a session while one of its requests is in
+  * flight, and a background summary may not block the user's next chat turn.
+@@ -130,21 +133,23 @@ export class CompactionPrecompute {
+     this.jobs.set(sessionId, job)
+     this.deps.report({ kind: 'started', sessionId, snapshotId: snapshot.id, cutoff: snapshot.cutoff })
+     void this.run(job, signal, parent).finally(finished)
+     return true
+   }
+ 
+   private async run(job: Job, signal: AbortSignal, parent: AbortSignal): Promise<void> {
+     const { snapshot } = job
+     const sessionId = snapshot.sessionId
+     try {
+-      const prepared = await generateCompaction(snapshot, {
++      // A capture from a slash-command turn names the command's model; the summary, its checkpoint,
++      // usage and fit check all belong to the session pair the identity names, as in the foreground.
++      const prepared = await generateCompaction(handoffSnapshot(snapshot, snapshot.identity, this.deps.nativeVision(sessionId)), {
+         stream: (request, options) => this.deps.stream(request, {
+           ...options,
+           admissionPriority: 'low',
+           attribution: { sessionId: candidateOwner(sessionId), turnId: `candidate:${snapshot.id}`, stepId: randomUUID() },
+         }),
+         signal,
+         deadlineAt: Date.now() + this.deps.limits.compactionDeadlineMs,
+         maxOutputTokens: this.deps.limits.compactionOutputTokens,
+         recordUsage: (usage) => this.deps.recordUsage(sessionId, usage),
+         path: 'exact',
+diff --git a/src/web/server.ts b/src/web/server.ts
+index 8791825..912e416 100644
+--- a/src/web/server.ts
++++ b/src/web/server.ts
+@@ -1484,20 +1484,24 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
+         const shared = { events, compactionRetainTokens: limits.compactionRetainTokens }
+         const was = estimateConversationTokens({ ...shared, ...(standing !== undefined ? { compaction: standing } : {}) })
+         const now = estimateConversationTokens({ ...shared, compaction: { summary: prepared.summary, coversSeq: prepared.cutoff } })
+         // The tail that closed after the cutoff stays verbatim, so it is part of `now`: a
+         // candidate whose result is not smaller by the minimum is not worth a checkpoint.
+         if (was - now < MIN_CANDIDATE_GAIN_TOKENS) return 'no-gain'
+         const window = compactionWindowOf(entry)
+         if (window !== undefined && now > window - limits.compactionOutputTokens) return 'no-fit'
+         return undefined
+       },
++      nativeVision: (sessionId) => {
++        const entry = sessions.get(sessionId as SessionId)
++        return entry === undefined ? false : compactionVisionOf(entry)
++      },
+       limits,
+       recordUsage: (sessionId, usage) => {
+         const entry = sessions.get(sessionId as SessionId)
+         if (entry === undefined) return
+         const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
+         usageLog.record({
+           at: Date.now(), startedAt: Date.now(), workspaceId: entry.workspaceId, sessionId: entry.session.id, rootSessionId: entry.session.id, kind: 'compaction',
+           ...(effective.provider !== null && effective.provider !== undefined ? { provider: effective.provider } : {}),
+           model: effective.model ?? 'unknown',
+           input: usage.inputTokens, cached: usage.cachedInputTokens ?? 0, cacheReported: usage.cachedInputTokens !== undefined, output: usage.outputTokens ?? 0,
+diff --git a/tests/web/compaction-precompute.spec.ts b/tests/web/compaction-precompute.spec.ts
+index b24f49e..ee954f5 100644
+--- a/tests/web/compaction-precompute.spec.ts
++++ b/tests/web/compaction-precompute.spec.ts
+@@ -74,20 +74,21 @@ function rig(mode: Parameters<typeof controlled>[0] = {}, over: Partial<Construc
+   const reports: CandidateReport[] = []
+   const usage: TokenUsage[] = []
+   const s = controlled(mode)
+   const manager = new CompactionPrecompute({
+     stream: s.stream,
+     identity: () => state.identity,
+     seedHash: () => state.seed,
+     digestAt: () => state.digest,
+     transportUncertain: () => state.stillUncertain,
+     assess: () => state.assessment,
++    nativeVision: () => true,
+     limits: { compactionDeadlineMs: 5_000, compactionOutputTokens: 8_000 },
+     recordUsage: (_sessionId, u) => usage.push(u),
+     report: (r) => reports.push(r),
+     ...over,
+   })
+   return { manager, state, reports, usage, s }
+ }
+ 
+ const signal = (): AbortSignal => new AbortController().signal
+ const flush = async (): Promise<void> => { for (let i = 0; i < 20; i++) await Promise.resolve() }
+@@ -146,20 +147,47 @@ describe('CompactionPrecompute: one job per session', () => {
+     const r = rig()
+     r.manager.start(snapshot(), signal())
+     await vi.waitFor(() => expect(r.s.calls).toHaveLength(1))
+     const call = r.s.calls[0]!
+     expect(String(call.request.messages.at(-1)!.content)).toContain(COMPACTION_HANDOFF_MARKER)
+     expect(call.options?.admissionPriority).toBe('low')
+     expect(call.request.maxOutputTokens).toBe(8_000)
+     call.finish()
+   })
+ 
++  it('summarises with the identity pair, not the model the capture was dispatched to (a slash-command turn)', async () => {
++    const r = rig()
++    const session = { ...identity, provider: 'alpha', model: 'gpt-5.6', thinkingLevel: 'high' }
++    r.manager.start(snapshot({ identity: session, request: { model: 'glm-4.7', providerName: 'alpha', thinkingLevel: 'low', messages: [{ role: 'user', content: 'first' }] } }), signal())
++    await vi.waitFor(() => expect(r.s.calls).toHaveLength(1))
++    expect(r.s.calls[0]!.request).toMatchObject({ providerName: 'alpha', model: 'gpt-5.6', thinkingLevel: 'high' })
++    r.s.calls[0]!.finish()
++  })
++
++  it('a non-native identity model receives no image parts; the stored snapshot is untouched', async () => {
++    const image = { role: 'user' as const, content: [{ type: 'text' as const, text: 'look' }, { type: 'image' as const, mediaType: 'image/png', base64: 'AAAA' }] }
++    const stored = snapshot({ request: { model: 'm', providerName: 'p', messages: [{ role: 'system', content: 'sys' }, image] } })
++    const text = rig({}, { nativeVision: () => false })
++    text.manager.start(stored, signal())
++    await vi.waitFor(() => expect(text.s.calls).toHaveLength(1))
++    const sent = JSON.stringify(text.s.calls[0]!.request.messages)
++    expect(sent).not.toContain('"type":"image"')
++    expect(sent).toContain('cannot see image pixels')
++    expect(stored.request.messages[1]).toBe(image)
++    text.s.calls[0]!.finish()
++    const native = rig({}, { nativeVision: () => true })
++    native.manager.start(stored, signal())
++    await vi.waitFor(() => expect(native.s.calls).toHaveLength(1))
++    expect(native.s.calls[0]!.request.messages[1]).toEqual(image)
++    native.s.calls[0]!.finish()
++  })
++
+   it('runs on an owner of its own: attributing it to the session would fence the very next chat turn', async () => {
+     const r = rig()
+     r.manager.start(snapshot(), signal())
+     await vi.waitFor(() => expect(r.s.calls).toHaveLength(1))
+     const attribution = r.s.calls[0]!.options?.attribution
+     expect(attribution?.sessionId).toBe(candidateOwner('s1'))
+     expect(attribution?.sessionId).not.toBe('s1')
+     r.s.calls[0]!.finish()
+   })
+ 
+diff --git a/tests/web/server-compaction-effective.spec.ts b/tests/web/server-compaction-effective.spec.ts
+index 0ef8b14..71522c3 100644
+--- a/tests/web/server-compaction-effective.spec.ts
++++ b/tests/web/server-compaction-effective.spec.ts
+@@ -540,32 +540,34 @@ describe('effective compaction through the web server', () => {
+         return (async function* (): AsyncIterable<StreamEvent> { yield { type: 'delta', delta: 'turn reply' }; yield STOP })()
+       },
+     })
+     // alpha/a1 is the global default; the session picks beta/b1.
+     const { home, base, wsId } = await start([make('alpha', 'a1'), make('beta', 'b1')], { compactionEffectiveEnabled: true })
+     const zero = ['---', 'name: Zero', 'history: compact', 'toolExposure: []', 'workspaceInstructions: false', 'skills: off', 'memoryPinned: false', 'memoryRetrieval: false', '---', '', 'No tools.'].join('\n')
+     expect((await fetch(`${base}/api/workspaces/${wsId}/modes/zero`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: zero }) })).status).toBe(200)
+     const snapshotOf = async (modeId?: string): Promise<{ request: ModelRequest }> => {
+       const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+       const route = `${base}/api/workspaces/${wsId}/sessions/${id}`
+-      expect((await fetch(`${route}/model`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ provider: 'beta', model: 'b1' }) })).status).toBe(200)
++      expect((await fetch(`${route}/model`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ provider: 'beta', model: 'b1', thinkingLevel: 'high' }) })).status).toBe(200)
+       if (modeId !== undefined) expect((await fetch(`${route}/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId }) })).status).toBe(200)
+       const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+       await completedMessage(base, wsId, id, logPath, 'question', 1)
+       await until(async () => ((await readLog(logPath)).some((event) => event.type === 'context/snapshot') ? true : undefined))
+       const dir = path.join(home, 'compaction', id, 'snapshots')
+       const file = (await fs.readdir(dir)).find((name) => name.endsWith('.json'))!
+       return JSON.parse(await fs.readFile(path.join(dir, file), 'utf8')) as { request: ModelRequest }
+     }
+     const tooled = await snapshotOf()
+     expect(tooled.request).toMatchObject({ model: 'b1', providerName: 'beta' })
+     expect(seen.at(-1)).toMatchObject({ model: 'b1', providerName: 'beta' })
++    expect(seen.at(-1)!.thinkingLevel).toBe('high')
++    expect(tooled.request.thinkingLevel).toBe(seen.at(-1)!.thinkingLevel)
+     expect(tooled.request.tools).toEqual(seen.at(-1)!.tools)
+     const bare = await snapshotOf('zero')
+     expect(bare.request).toMatchObject({ model: 'b1', providerName: 'beta' })
+     expect(bare.request.tools).toBeUndefined()
+     expect(seen.at(-1)!.tools).toBeUndefined()
+   })
+ 
+   it('a session with a model and no provider is budgeted on the same window compaction uses', async () => {
+     const { provider: llm } = provider()
+     const { server, home, base, wsId } = await start(llm, {})
+diff --git a/tests/web/server-session-model.spec.ts b/tests/web/server-session-model.spec.ts
+index d5e1366..17df8fc 100644
+--- a/tests/web/server-session-model.spec.ts
++++ b/tests/web/server-session-model.spec.ts
+@@ -79,38 +79,42 @@ describe('slash command model (AC-13, AC-20)', () => {
+     let file: string | undefined
+     await expect.poll(async () => (file = (await fs.readdir(dir).catch(() => [] as string[])).find((name) => name.endsWith('.json'))), { timeout: 5_000 }).toBeDefined()
+     return (JSON.parse(await fs.readFile(path.join(dir, file!), 'utf8')) as { request: ModelRequest }).request
+   }
+ 
+   it('a command model with a smaller window drives the budget, the dispatched request and the capture; an invalid one falls back', async () => {
+     const requests: ModelRequest[] = []
+     const { base, home } = await start([recorder(requests)], { compactionEffectiveEnabled: true })
+     const workspaceId = await firstWorkspace(base)
+     await put(base, `/api/workspaces/${workspaceId}/model`, { provider: 'alpha', model: 'gpt-5.6' })
++    expect((await put(base, `/api/workspaces/${workspaceId}/thinking`, { level: 'high' })).status).toBe(200)
+     await command(home, workspaceId, 'small', 'glm-4.7')
+     await command(home, workspaceId, 'broken', 'no-such-model')
+     const run = async (content: string): Promise<{ manifest: { model: string; provider: string; budget: { contextLimitTokens: number } }; capture: ModelRequest }> => {
+       const { id } = (await (await post(base, `/api/workspaces/${workspaceId}/sessions`)).json()) as { id: string }
+       expect((await post(base, `/api/workspaces/${workspaceId}/sessions/${id}/messages`, { content })).status).toBe(202)
+       await settle(base, workspaceId, id)
+       const manifest = (await (await fetch(`${base}/api/workspaces/${workspaceId}/sessions/${id}/manifest`)).json()) as { model: string; provider: string; budget: { contextLimitTokens: number } }
+       return { manifest, capture: await sidecarRequest(home, id) }
+     }
+     const small = await run('/small hi')
+     expect(requests.at(-1)).toMatchObject({ providerName: 'alpha', model: 'glm-4.7' })
+     expect(small.manifest).toMatchObject({ provider: 'alpha', model: 'glm-4.7', budget: { contextLimitTokens: 200_000 } })
+     expect(small.capture).toMatchObject({ providerName: 'alpha', model: 'glm-4.7' })
++    expect(requests.at(-1)!.thinkingLevel).toBe('high')
++    expect(small.capture.thinkingLevel).toBe(requests.at(-1)!.thinkingLevel)
+ 
+     const broken = await run('/broken hi')
+     expect(requests.at(-1)).toMatchObject({ providerName: 'alpha', model: 'gpt-5.6' })
+     expect(broken.manifest).toMatchObject({ provider: 'alpha', model: 'gpt-5.6', budget: { contextLimitTokens: 1_048_576 } })
+     expect(broken.capture).toMatchObject({ providerName: 'alpha', model: 'gpt-5.6' })
++    expect(broken.capture.thinkingLevel).toBe(requests.at(-1)!.thinkingLevel)
+   })
+ 
+   it('a reconstruction while a command grant is active builds for the session model, not the command model', async () => {
+     // Keep the command grant alive past its turn, so the rebuild runs while it is active.
+     vi.spyOn(TurnCommandGrants.prototype, 'clear').mockImplementation(() => undefined)
+     const requests: ModelRequest[] = []
+     const { base, home } = await start([recorder(requests)], { compactionEffectiveEnabled: true })
+     const workspaceId = await firstWorkspace(base)
+     await put(base, `/api/workspaces/${workspaceId}/model`, { provider: 'alpha', model: 'gpt-5.6' })
+     await command(home, workspaceId, 'small', 'glm-4.7')

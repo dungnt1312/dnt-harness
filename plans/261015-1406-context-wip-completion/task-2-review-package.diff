@@ -1,0 +1,919 @@
+98e6fb3 fix(context): one final request for capture and dispatch; vision-aware handoff and fallback
+
+ docs/harness.md                               |  11 +--
+ docs/web.md                                   |   8 +-
+ src/harness/context/builder.ts                |   4 +-
+ src/harness/llm/adaptive-vision.ts            |  26 +++----
+ src/web/compaction-host.ts                    |   8 +-
+ src/web/server.ts                             | 102 +++++++++-----------------
+ tests/harness/adaptive-vision.spec.ts         |  27 +++----
+ tests/harness/g3-context.spec.ts              |  15 ++++
+ tests/web/compaction-host.spec.ts             |  22 ++++++
+ tests/web/server-compaction-effective.spec.ts |  52 +++++++++++++
+ tests/web/server-session-model.spec.ts        |  90 ++++++++++++++++++++++-
+ 11 files changed, 254 insertions(+), 111 deletions(-)
+
+diff --git a/docs/harness.md b/docs/harness.md
+index c25d20f..6ed057b 100644
+--- a/docs/harness.md
++++ b/docs/harness.md
+@@ -260,24 +260,25 @@ Details worth knowing:
+   policy, approval) in order. Consecutive calls whose final tool is
+   `readOnly` (Read, Grep, Glob) and that need no out-of-grant approval form a
+   group: all their `tool/call` intents are recorded and flushed, the bodies run
+   at most `readOnlyToolConcurrency` at once, and the `tool/result` events are
+   appended in the model's original call order. Any other call runs alone and
+   separates groups, so a write never overlaps a read. A stop answers every
+   declared call.
+ - **`agent/pre-step`** (waterfall) admits a claim. `enter(contents)` runs a step
+   with the (possibly rewritten) contents; `reject` closes the turn with reason
+   `rejected`. A first `enter` rewritten to empty closes it with reason `empty`.
+-- **`agent/request`** (waterfall) sits between the log projection and the
+-  provider — the web host uses it to stamp each session's effective model,
+-  provider, and thinking level onto every request; middleware may prepend a
+-  system message, etc.
++- **`agent/request`** (waterfall) sits between the assembled request and the
++  provider; middleware may prepend a system message, etc. The web host stamps
++  each session's effective model, provider, and thinking level in
++  `agent/context` instead, so the budget, manifest, capture and dispatch use
++  one request.
+ - **`agent/turn-stopping`** (serial) runs *before* `turn/end` is appended, so
+   observers see a settled step and no closing turn yet.
+ - **Failure closes the turn durably.** If a step throws, `closeOpenTurn()`
+   appends `turn/end: failed` for the newest still-open turn so the log never has
+   a dangling `turn/start`; the error still propagates to the caller.
+ - **No tools service mounted?** The loop still runs; tool calls fail as unknown
+   tools (`no tools service mounted`).
+ 
+ ### `AgentsService` (`service.ts`)
+ 
+@@ -584,21 +585,21 @@ hierarchical, so nested folders contend.
+ 
+ ## Live controls, queued input, and limits
+ 
+ Three controls take effect **without steering** — each resolves at its gate,
+ so a change lands on the next opportunity instead of interrupting a running
+ turn:
+ 
+ - **Model** — the model/provider/thinking level are **per-session** facts: a
+   durable `session/model` preference (see the session log vocabulary) is
+   re-resolved per model request, and the host stamps the effective pair onto
+-  the request through `agent/request`. A mid-turn change therefore lands on
++  the request during context assembly (`agent/context`). A mid-turn change therefore lands on
+   the turn's next request without touching the stream in flight, and the
+   context budget is recomputed for the new model on that same request. Only
+   a legacy log without any `session/model` event falls back to the global
+   default (`/api/model-defaults`), which every workspace shares.
+ - **Permission** — re-resolved at each tool-start gate (the next gated call).
+ - **Mode** — root-owned and live: re-gates tool exposure and permission
+   defaults at the next unstarted tool call *and* reassembles context at the next
+   model request, with pending approvals re-evaluated (newly unexposed calls are
+   cancelled). A sibling root is unaffected. A child resolves this owning root
+   mode, intersected with the child's immutable admission ceiling.
+diff --git a/docs/web.md b/docs/web.md
+index b9ceda8..2c2988e 100644
+--- a/docs/web.md
++++ b/docs/web.md
+@@ -249,23 +249,23 @@ provider list for the Settings panel.
+   "provider": "deepseek",
+   "model": "deepseek-chat",
+   "folder": "/workspace",
+   "models": ["deepseek-chat", "deepseek-reasoner"],
+   "providers": [{ "id": "deepseek", "name": "deepseek", "enabled": true, "keyMasked": "••••abcd", "models": ["deepseek-chat"] }]
+ }
+ ```
+ 
+ ### Legacy: `PUT /api/model`
+ 
+-Select the active provider and model. The model selector rides the
+-**`agent/request` seam**: every step's request is stamped with the selected
+-model before the provider sees it.
++Select the active provider and model. Context assembly (`agent/context`)
++stamps every step's request with the selected model before the provider sees
++it.
+ 
+ ```json
+ // body
+ { "model": "deepseek-reasoner" }
+ ```
+ 
+ `400` when the name is not in the provider's offered models.
+ 
+ ### Legacy: `PUT /api/folder`
+ 
+@@ -440,21 +440,21 @@ provider/model in any conversation — or setting it explicitly — repoints the
+ global default to that pair, so the next conversation opens on the model the
+ operator was just using and never re-picks for them. A thinking-only edit does
+ not repoint it, because a thinking level is conversation-scoped rather than a
+ global preference. Selecting a provider in `PUT /api/model` (or a workspace
+ model route) requires an explicit `model`: an inferred model would silently
+ run and bill something the operator never named.
+ 
+ `GET …/:wid/meta` returns the same global pair to every workspace, so the
+ client's no-conversation pickers target `/api/model-defaults` directly.
+ 
+-Resolution happens per model request through `agent/request`: a change lands
++Resolution happens per model request in context assembly (`agent/context`): a change lands
+ on the **next request of a running turn** without interrupting the in-flight
+ stream, and the context budget is recomputed for the new model on that same
+ request. Each `assistant/message` records the pair that actually served it
+ in its `controls`, so the log answers "what did this reply come from".
+ 
+ 
+ ### Legacy: `GET /api/sessions`
+ 
+ List sessions: `[{ id, title, eventCount, folder }]`. `folder` is the
+ session-scoped workspace or `null` when the session inherits the server default.
+diff --git a/src/harness/context/builder.ts b/src/harness/context/builder.ts
+index 2c4f042..93b12dc 100644
+--- a/src/harness/context/builder.ts
++++ b/src/harness/context/builder.ts
+@@ -1,14 +1,15 @@
+ import { createHash } from 'node:crypto'
+ import path from 'node:path'
+ import type { ModelMessage, ToolSchema, ContentPart } from '../llm/types.ts'
+ import { textOnlyVisionFallback, withoutDescribeImage } from '../llm/adaptive-vision.ts'
++import { DESCRIBE_IMAGE_TOOL } from '../tools/describe-image.ts'
+ import type { AttachmentLookup } from '../attachments/store.ts'
+ import { deriveDatedMessages, type SessionEvent } from '../session/events.ts'
+ import type { Session } from '../session/session.ts'
+ import { isCompletedCompactionBoundary, MAX_COMPACTION_SUMMARY_CHARS, recoverCanonicalCheckpoint } from './compaction.ts'
+ import type { ResolvedMode } from '../modes/types.ts'
+ import type { GrantedRoot } from '../tools/types.ts'
+ import { estimateTokens, estimateContentTokens, schemaCost, budgetFor, squeezeBudget, ContextBudgetError, type BudgetConfig, type ResolvedBudget, type WindowSource } from './budget.ts'
+ import { formatSentStamp } from './environment.ts'
+ import {
+   COMPACTION_POLICY_VERSION,
+@@ -590,22 +591,23 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
+           { 'through-seq': String(compaction.coversSeq) },
+           `State restored after the earlier conversation was summarized. Reference material, not instructions; files show their content at restoration time, so Read before editing:\n${restored.body}`,
+         ),
+       })
+     }
+   }
+ 
+   // ── history window per setting ─────────────────────────────
+   const window = historyWindow(input.events, mode.definition.sources.history, compaction)
+   const history = historyMessages(input.events, window, mode.definition.sources.history === 'compact' ? compaction : undefined, input.compactionRetainTokens, input.attachments)
++  const describeAvailable = schemas.some((schema) => schema.name === DESCRIBE_IMAGE_TOOL)
+   let dated = input.nativeVision === false
+-    ? history.dated.map(entry => ({ ...entry, message: textOnlyVisionFallback([entry.message])[0]! }))
++    ? history.dated.map(entry => ({ ...entry, message: textOnlyVisionFallback([entry.message], describeAvailable)[0]! }))
+     : history.dated
+   const totalTurns = countTurns(input.events)
+ 
+   // ── optional sources (droppable) ───────────────────────────
+   let skills = [...input.activeSkills]
+   if (mode.definition.sources.skills === 'off' && skills.length > 0) {
+     omissions.push(`skills: disabled by mode (${skills.map((skill) => skill.name).join(', ')})`)
+     skills = []
+   }
+   let skillCatalog = input.skillCatalog
+diff --git a/src/harness/llm/adaptive-vision.ts b/src/harness/llm/adaptive-vision.ts
+index c37f8ee..921d573 100644
+--- a/src/harness/llm/adaptive-vision.ts
++++ b/src/harness/llm/adaptive-vision.ts
+@@ -1,40 +1,36 @@
+-import type { ModelMessage, ModelRequest, ToolSchema } from './types.ts'
++import type { ModelMessage, ToolSchema } from './types.ts'
+ import { getModelInfo } from './model-catalog.ts'
+ import { DESCRIBE_IMAGE_TOOL } from '../tools/describe-image.ts'
+ 
+ /** Operator override first, then catalog; unknown preserves native vision. */
+ export function supportsNativeVision(model: string | undefined, override?: boolean): boolean {
+   if (override !== undefined) return override
+   return getModelInfo(model)?.vision !== false
+ }
+ 
+-const FALLBACK = [
++const WITH_TOOL = [
+   'This chat model cannot see image pixels.',
+   'Before answering about an attached image, call DescribeImage with its attachmentId from the marker above and an optional focused question.',
+ ].join(' ')
+ 
+-/** Remove image bytes while preserving text and an explicit tool instruction. */
+-export function textOnlyVisionFallback(messages: readonly ModelMessage[]): readonly ModelMessage[] {
++const WITHOUT_TOOL = [
++  'This chat model cannot see image pixels, and no image-description tool is available in this request.',
++  'If asked about the attached image, say that you cannot view the image.',
++].join(' ')
++
++/** Remove image bytes while preserving text; name the describe tool only when the request carries it. */
++export function textOnlyVisionFallback(messages: readonly ModelMessage[], describeAvailable: boolean): readonly ModelMessage[] {
++  const fallback = describeAvailable ? WITH_TOOL : WITHOUT_TOOL
+   return messages.map((message) => {
+     if (typeof message.content === 'string' || !message.content.some((part) => part.type === 'image')) return message
+     const text = message.content.filter((part): part is Extract<typeof part, { type: 'text' }> => part.type === 'text').map((part) => part.text.trim()).filter(Boolean)
+-    return { ...message, content: [...text, FALLBACK].join('\n\n') }
++    return { ...message, content: [...text, fallback].join('\n\n') }
+   })
+ }
+ 
+ /** A native vision model does not need the fallback tool in its schema list. */
+ export function withoutDescribeImage(tools: readonly ToolSchema[] | undefined): readonly ToolSchema[] | undefined {
+   if (tools === undefined) return undefined
+   const kept = tools.filter((tool) => tool.name !== DESCRIBE_IMAGE_TOOL)
+   return kept.length === 0 ? undefined : kept
+ }
+-
+-/** Adapt one already mode-filtered request for the selected chat model. */
+-export function adaptRequestVision(request: ModelRequest, nativeVision: boolean): ModelRequest {
+-  if (!nativeVision) return { ...request, messages: textOnlyVisionFallback(request.messages) }
+-  const tools = withoutDescribeImage(request.tools)
+-  if (tools === request.tools) return request
+-  const { tools: _removed, ...withoutTools } = request
+-  void _removed
+-  return tools === undefined ? withoutTools : { ...withoutTools, tools }
+-}
+diff --git a/src/web/compaction-host.ts b/src/web/compaction-host.ts
+index 6ffafe6..1e03cf5 100644
+--- a/src/web/compaction-host.ts
++++ b/src/web/compaction-host.ts
+@@ -1,13 +1,14 @@
+ import { adoptPreparedCompaction, type AdoptionOptions, type CheckpointStore, type Restored } from '../harness/context/compaction.ts'
+ import type { EffectiveCompactionSnapshot, SnapshotIdentity } from '../harness/context/compaction-snapshot.ts'
+ import type { HarnessLimits } from '../harness/limits.ts'
++import { textOnlyVisionFallback } from '../harness/llm/adaptive-vision.ts'
+ import type { ModelRequest, StreamEvent, StreamOptions, TokenUsage } from '../harness/llm/types.ts'
+ import type { SessionEvent } from '../harness/session/events.ts'
+ import type { Session } from '../harness/session/session.ts'
+ import type { CompactionSnapshotStore } from '../harness/storage/compaction-snapshot-store.ts'
+ import { assertFitsWindow, generateCompaction, type PreparedSummary } from './compaction-generator.ts'
+ import type { CompactionPrecompute } from './compaction-precompute.ts'
+ import { chooseCompactionSource } from './compaction-source.ts'
+ 
+ /**
+  * Foreground compaction for one session: pick a source, summarize once, adopt.
+@@ -75,20 +76,22 @@ export interface HostDeps {
+    * path, for a session with no model, and when no snapshot can be used. The host
+    * does not rebuild it: only the server knows those inputs.
+    */
+   readonly legacyCompact: (trigger: 'manual' | 'automatic', signal: AbortSignal) => Promise<{ readonly coversSeq: number; readonly summary: string }>
+   /** Runs PreCompact; returns the blocking reason, or undefined to proceed. */
+   readonly preCompact: (trigger: 'manual' | 'auto', signal: AbortSignal) => Promise<string | undefined>
+   readonly limits: Pick<HarnessLimits, 'compactionEffectiveEnabled' | 'compactionDeadlineMs' | 'compactionOutputTokens'> & Partial<Pick<HarnessLimits, 'compactionCandidateWaitMs'>>
+   /** Background candidates of this session; absent when precompute is off. */
+   readonly candidates?: Pick<CompactionPrecompute, 'waitPending' | 'invalidate' | 'blocked'>
+   readonly contextWindowTokens: () => number | undefined
++  /** Whether the model selected now sees image pixels; a text-only target gets the snapshot without images. */
++  readonly nativeVision: () => boolean
+   readonly measure: NonNullable<AdoptionOptions['measure']>
+   readonly validateFit?: () => void | Promise<void>
+   /**
+    * Bounded state to restore beside an adopted summary (task list, running work,
+    * skills, current files). Only the effective path uses it; the legacy and
+    * recovery folds keep their behavior. A throw refuses the adoption.
+    */
+   readonly restore?: (cutoff: number, signal: AbortSignal) => Promise<Restored | undefined>
+   readonly recordUsage: (usage: TokenUsage) => void
+   /**
+@@ -177,21 +180,24 @@ export class CompactionHost {
+       signal.throwIfAborted()
+       if (blocked !== undefined) throw new Error(blocked)
+       return this.adopt(session, candidate, request, signal, true)
+     }
+ 
+     // No snapshot describes this log (written before capture existed, sidecar lost, mode or
+     // grants changed since): fold the shortened transcript. Slower, but /compact always runs;
+     // the user is never asked to pick a path.
+     if (choice.kind === 'fold') return this.legacy(request, signal, 'recovery')
+ 
+-    const snapshot = retarget(choice.snapshot, now)
++    const retargeted = retarget(choice.snapshot, now)
++    // The handoff runs no tools, so the fallback must not point at one. The stored snapshot is untouched.
++    const snapshot = deps.nativeVision() ? retargeted
++      : { ...retargeted, request: { ...retargeted.request, messages: textOnlyVisionFallback(retargeted.request.messages, false) } }
+     const { path } = choice
+     // A snapshot the current model's window cannot take with room for its answer (a switch to a
+     // smaller model, a request that grew to the limit) is folded in pieces instead of failing.
+     const window = deps.contextWindowTokens()
+     try {
+       assertFitsWindow(snapshot, { ...(window !== undefined ? { contextWindowTokens: window } : {}), outputTokens: deps.limits.compactionOutputTokens }, path)
+     } catch {
+       return this.legacy(request, signal, 'recovery')
+     }
+ 
+diff --git a/src/web/server.ts b/src/web/server.ts
+index 778f963..8791825 100644
+--- a/src/web/server.ts
++++ b/src/web/server.ts
+@@ -45,21 +45,21 @@ import { approvalCallFingerprint, attachApproval, createApprovalReceiptRegistry,
+ import { resolvePermission } from '../harness/approval/resolution.ts'
+ import { composeAuthority, type AskRequirement, type AuthorityDecision } from '../harness/tools/authority.ts'
+ import { DangerousCommandsStore } from '../harness/guard/store.ts'
+ import { liftsReadOnlyBash, riskyBashMatch, riskyBashWarning } from '../harness/modes/bash-policy.ts'
+ import { attachDangerousCommandGuard, guardMatchFingerprint } from '../harness/guard/guard.ts'
+ import { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from '../harness/limits.ts'
+ import { LlmService } from '../harness/llm/service.ts'
+ import { LogicalRequest, classifyTransport } from '../harness/llm/request-lifecycle.ts'
+ import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
+ import { expressibleThinkingLevel, isThinkingLevel, resolveContextLimit } from '../harness/llm/model-catalog.ts'
+-import { adaptRequestVision, supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
++import { supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
+ import { ProviderError } from '../harness/llm/types.ts'
+ import type { LlmProvider, ModelRequest, StreamEvent, StreamOptions, TokenUsage, ToolCall } from '../harness/llm/types.ts'
+ import type { ToolResult } from '../harness/tools/types.ts'
+ import { fileSessions, SessionsService } from '../harness/session/service.ts'
+ import type { Session } from '../harness/session/session.ts'
+ import { sessionGrantsOf, sessionModeOf, sessionModelOf, type SessionEvent, type SessionGrant, type SessionGrants } from '../harness/session/events.ts'
+ import { deriveTitle } from '../harness/session/title.ts'
+ import { newExecutionId, newInputId, type ProjectId, type SessionId, type TurnId, type WorkspaceId } from '../util/brand.ts'
+ import { ToolsService } from '../harness/tools/service.ts'
+ import { bashTool } from '../capabilities/shell/bash.ts'
+@@ -1509,20 +1509,27 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
+     })
+     : undefined
+ 
+   /** The session's window as the context builder budgets it (operator override first); undefined with no model. */
+   const compactionWindowOf = (entry: SessionEntry): number | undefined => {
+     const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
+     if (effective.model === null || effective.model === undefined) return undefined
+     return modelBudgetOf(effective.provider ?? undefined, effective.model).contextLimitTokens
+   }
+ 
++  /** Whether the session's model sees image pixels: the same rule and override the chat request uses. */
++  const compactionVisionOf = (entry: SessionEntry): boolean => {
++    const { provider, model } = resolveEffectiveModel(entry.session, entry.workspaceId)
++    const override = provider != null && model != null ? list.find((row) => row.id === provider)?.modelSettings?.[model]?.vision : undefined
++    return supportsNativeVision(model ?? undefined, override)
++  }
++
+   /** The identity a snapshot must have been built for, from what the server holds right now. */
+   const compactionIdentity = (entry: SessionEntry, prefixHash: string): SnapshotIdentity => {
+     const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
+     const { mode, revision } = rootModeOf({ sessionId: entry.session.id }, entry.workspaceId)
+     return identityOf({
+       provider: effective.provider ?? '',
+       model: effective.model ?? '',
+       thinkingLevel: effective.thinkingLevel ?? undefined,
+       modeId: mode.definition.id,
+       modeRevision: revision,
+@@ -1675,20 +1682,21 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
+         identity: () => compactionIdentity(entry, captures.snapshotOf(sessionId)?.identity.prefixHash ?? ''),
+         hasModel: () => summarizerModelOf(entry.session) !== undefined,
+         preCompact: (hookTrigger, hookSignal) => runPreCompactHooks(entry.session, entry.workspaceId, hookSignal, hookTrigger),
+         legacyCompact: async (legacyTrigger, legacySignal) => {
+           const checkpoint = await legacyBody(entry, legacyTrigger, legacySignal)
+           return { coversSeq: checkpoint.coversSeq, summary: checkpoint.summary }
+         },
+         limits,
+         ...(candidates !== undefined ? { candidates } : {}),
+         contextWindowTokens: () => compactionWindowOf(entry),
++        nativeVision: () => compactionVisionOf(entry),
+         measure: (next, standing, restored) => measureCheckpoint(entry, next, standing, undefined, restored),
+         validateFit: () => { const error = compactFitFailures.get(sessionId); if (error !== undefined) throw error },
+         // The session's folder grant as it is NOW (not when the work was done), so a folder
+         // revoked since is never read back into context.
+         restore: async (cutoff, restoreSignal) => {
+           const grant = agentScope.run(
+             { sessionId, rootSessionId: sessionId, workspaceId: entry.workspaceId, ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}) },
+             () => kernel.ctx.tools.currentGrant(),
+           )
+           const restored = await buildRestoration({ events: entry.session.committedEvents, cutoff, exec: grant, signal: restoreSignal })
+@@ -3600,23 +3608,25 @@ ${entry.description}`.toLowerCase().includes(query))
+     const nativeVision = supportsNativeVision(effective.model ?? undefined, modelSettings?.vision)
+     const thinkingLevel = effective.thinkingLevel ?? modelSettings?.thinkingLevel
+     const { mode, revision: modeRevision } = rootModeOf(scope, workspaceId)
+     // Workspace-authored system prompt replacements (Settings → System
+     // Prompts). A read failure degrades to the defaults, like memory.
+     const promptOverrides = await systemPrompts.load(workspaceId).catch(() => undefined)
+ 
+     // Budget from the CURRENT (provider, model) pair: an operator context
+     // override is verified; anything else resolves the catalog's documented
+     // window (exact ID → known family → 256k default) as a labeled estimate.
++    // A model without a provider gets the same catalog window compaction uses.
+     // A live model change recomputes this on the very next request.
+     const budget: ResolvedBudget = (() => {
+-      if (effective.provider === undefined || effective.provider === null || effective.model === undefined || effective.model === null) return DEFAULT_BUDGET
++      if (effective.model === undefined || effective.model === null) return DEFAULT_BUDGET
++      if (effective.provider === undefined || effective.provider === null) return modelBudgetOf(undefined, effective.model)
+       // Child overrides share this resolver, so context, manifest budget, and
+       // request dispatch all reject an unavailable effective pair identically.
+       validateProviderModel(effective.provider, effective.model)
+       return modelBudgetOf(effective.provider, effective.model)
+     })()
+ 
+     // Exposure-filtered schemas: static mode ceiling + G5 dynamic MCP
+     // config/allowlist ceiling (zero-exposure modes none; Plan read-safe
+     // allowlist only; bundled Explorer none; children limited to their pinned
+     // ceiling).
+@@ -3799,21 +3809,21 @@ ${entry.description}`.toLowerCase().includes(query))
+     const commitPrefix = (): void => { if (scope !== undefined && snapshot !== undefined) prefixSnapshots.set(scope.sessionId, snapshot) }
+     let built: ReturnType<typeof buildContext>
+     if (preview === undefined) built = buildContext(buildInput)
+     else {
+       try { built = buildContextPreview(buildInput, preview) } catch (error) {
+         // The post-compaction context does not fit: the host's validateFit refuses the checkpoint.
+         if (scope !== undefined) compactFitFailures.set(scope.sessionId, error instanceof Error ? error : new Error('compaction-preview-no-fit'))
+         throw error
+       }
+     }
+-    // Only a dispatched request gets an identity and pinned controls; `agent/request` skips re-resolving it.
++    // Only a dispatched request gets an identity and pinned controls.
+     const contextId = sideEffects ? randomUUID() : undefined
+     const assembled = contextId === undefined ? built : { ...built, manifest: { ...built.manifest, contextId } }
+     if (sideEffects && scope !== undefined) {
+       lastManifests.set(scope.sessionId, assembled.manifest)
+       if (scope.turnId !== undefined) manifestTurns.set(scope.sessionId, scope.turnId)
+       // Any new root request supersedes the previous cache prefix until this
+       // one completes. Only a request that carried every conversation fact
+       // (no trimming, cleared tool results or dropped sources) may seed it.
+       if (scope.childOf === undefined) {
+         completedRequests.delete(scope.sessionId)
+@@ -3849,86 +3859,42 @@ ${entry.description}`.toLowerCase().includes(query))
+             hash: section.hash,
+             kind: section.kind,
+             ...(section.name !== undefined ? { name: section.name } : {}),
+             chars: section.chars,
+             body: section.content,
+           })
+         }
+         session.append({ type: 'context/manifest', turnId: scope.turnId, manifest: assembled.manifest })
+       }
+     }
+-    // Arm the effective capture with the request EXACTLY as assembled (root steps only).
++    // The ONE final request: dispatched and captured as the same object. Replace wholesale: when
++    // the mode exposes nothing, tools must LEAVE the request — a spread of `projected` would
++    // resurrect the full schema list.
++    const { tools: _projectedTools, ...base } = projected
++    void _projectedTools
++    const request: ModelRequest = {
++      ...base,
++      ...(contextId === undefined ? {} : {
++        ...(effective.model != null ? { model: effective.model } : {}),
++        ...(effective.provider != null ? { providerName: effective.provider } : {}),
++        ...(thinkingLevel != null ? { thinkingLevel } : {}),
++        contextId,
++      }),
++      messages: assembled.messages,
++      ...(assembled.tools !== undefined ? { tools: assembled.tools } : {}),
++    }
++    // Arm the effective capture with the request EXACTLY as dispatched (root steps only).
+     if (sideEffects && limits.compactionEffectiveEnabled && scope !== undefined && scope.childOf === undefined && scope.turnId !== undefined) {
+-      captures.arm(scope.sessionId, scope.turnId, { ...projected, messages: assembled.messages, ...(assembled.tools !== undefined ? { tools: assembled.tools } : {}) }, assembled.compactionProjection)
+-    }
+-    // Replace wholesale: when the mode exposes nothing, tools must LEAVE the
+-    // request — a spread of `projected` would resurrect the full schema list.
+-    const controls = contextId === undefined ? {} : {
+-      ...(effective.model != null ? { model: effective.model } : {}),
+-      ...(effective.provider != null ? { providerName: effective.provider } : {}),
+-      ...(thinkingLevel != null ? { thinkingLevel } : {}),
+-      contextId,
+-    }
+-    const replacement: ModelRequest = { ...projected, ...controls, messages: assembled.messages }
+-    if (assembled.tools !== undefined) return { assembled, request: { ...replacement, tools: assembled.tools }, commitPrefix }
+-    const { tools: _dropped, ...withoutTools } = replacement
+-    void _dropped
+-    return { assembled, request: withoutTools, commitPrefix }
+-  }
+-
+-  // Live model + provider control, scoped to the executing turn's
+-  // workspace: every step's request is stamped with that workspace's pair.
+-  // The provider rides as trusted execution metadata — dispatch resolves it
+-  // by id, never through the process-global selection pointer, so two
+-  // workspaces on different providers cannot cross streams.
+-  kernel.ctx.on('agent/request', async (request, next) => {
+-    // Context assembly already pinned controls and adapted vision before measuring.
+-    if (request.contextId !== undefined) return next(request)
+-    const scope = agentScope.getStore()
+-    const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
+-    const state = controlsFor(workspaceId)
+-    const session = await scopedSession(scope?.sessionId)
+-    const conversation = session === undefined
+-      ? { provider: defaults.provider, model: defaults.model, thinkingLevel: defaults.thinkingLevel }
+-      : resolveEffectiveModel(session, workspaceId)
+-    // A slash command's `model:` (Claude) runs the turn it started on that
+-    // model; one this host cannot serve keeps the conversation's.
+-    const commandModel = scope?.childOf === undefined ? turnCommandGrants.model(scope?.sessionId) : undefined
+-    let effective = conversation
+-    if (commandModel !== undefined && session !== undefined) {
+-      try {
+-        const picked = childModelFor(session, workspaceId, undefined, commandModel)
+-        if (picked !== undefined) effective = { ...conversation, provider: picked.provider, model: picked.model }
+-      } catch {
+-        // Unservable here: the conversation's model stands.
+-      }
+-    }
+-    const model = effective.model ?? undefined
+-    const provider = effective.provider ?? undefined
+-    if (provider !== undefined && model !== undefined) validateProviderModel(provider, model)
+-    // Explicit null session thinking deliberately falls through to this
+-    // model's configured default, never back to workspace thinking.
+-    const thinkingLevel = effective.thinkingLevel
+-      ?? (model !== undefined && provider !== undefined
+-        ? list.find((entry) => entry.id === provider)?.modelSettings?.[model]?.thinkingLevel
+-        : undefined)
+-    const stamped = {
+-      ...request,
+-      ...(model !== undefined ? { model } : {}),
+-      ...(provider !== undefined ? { providerName: provider } : {}),
+-      ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
+-    }
+-    const visionOverride = model !== undefined && provider !== undefined
+-      ? list.find((entry) => entry.id === provider)?.modelSettings?.[model]?.vision
+-      : undefined
+-    return next(adaptRequestVision(stamped, supportsNativeVision(model, visionOverride)))
+-  })
++      captures.arm(scope.sessionId, scope.turnId, request, assembled.compactionProjection)
++    }
++    return { assembled, request, commitPrefix }
++  }
+ 
+   const pending = new Map<string, PendingApproval>()
+ 
+   const dangerousStore = new DangerousCommandsStore(resourceHome)
+   const dangerousGuard = attachDangerousCommandGuard(kernel.ctx, {
+     configSource: async (workspaceId?: string) => {
+       const wid = workspaceId
+         ?? (agentScope.getStore()?.workspaceId as string | undefined)
+         ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE) as string
+       const { config, hash } = await dangerousStore.load(wid)
+diff --git a/tests/harness/adaptive-vision.spec.ts b/tests/harness/adaptive-vision.spec.ts
+index dcc4c8d..73ee2c0 100644
+--- a/tests/harness/adaptive-vision.spec.ts
++++ b/tests/harness/adaptive-vision.spec.ts
+@@ -1,13 +1,13 @@
+ import { describe, expect, it } from 'vitest'
+-import { adaptRequestVision, supportsNativeVision, textOnlyVisionFallback } from '../../src/harness/llm/adaptive-vision.ts'
+-import type { ModelRequest, ToolSchema } from '../../src/harness/llm/types.ts'
++import { supportsNativeVision, textOnlyVisionFallback, withoutDescribeImage } from '../../src/harness/llm/adaptive-vision.ts'
++import type { ToolSchema } from '../../src/harness/llm/types.ts'
+ 
+ const imageMessage = {
+   role: 'user' as const,
+   content: [
+     { type: 'text' as const, text: 'look\n\n[image attachment "screen.png" attachmentId=' + 'a'.repeat(64) + ']' },
+     { type: 'image' as const, mediaType: 'image/png', base64: 'AAAA', name: 'screen.png' },
+   ],
+ }
+ const tool = (name: string): ToolSchema => ({ name, description: name, parameters: { type: 'object', properties: {} } })
+ 
+@@ -15,31 +15,32 @@ describe('adaptive vision', () => {
+   it('uses operator override first and treats unknown models as native vision', () => {
+     expect(supportsNativeVision('glm-4.7')).toBe(false)
+     expect(supportsNativeVision('glm-5.3')).toBe(false)
+     expect(supportsNativeVision('gpt-5.6')).toBe(true)
+     expect(supportsNativeVision('unknown-future-model')).toBe(true)
+     expect(supportsNativeVision('gpt-5.6', false)).toBe(false)
+     expect(supportsNativeVision('glm-4.7', true)).toBe(true)
+   })
+ 
+   it('removes image bytes for a non-vision chat and tells the model to call DescribeImage', () => {
+-    const [message] = textOnlyVisionFallback([imageMessage])
++    const [message] = textOnlyVisionFallback([imageMessage], true)
+     expect(typeof message?.content).toBe('string')
+     expect(message?.content).toContain(`attachmentId=${'a'.repeat(64)}`)
+     expect(message?.content).toContain('call DescribeImage')
+     expect(JSON.stringify(message)).not.toContain('AAAA')
+   })
+ 
+-  it('keeps image parts but removes DescribeImage for a native vision model', () => {
+-    const request: ModelRequest = { messages: [imageMessage], tools: [tool('Read'), tool('DescribeImage')] }
+-    const adapted = adaptRequestVision(request, true)
+-    expect(adapted.messages).toEqual([imageMessage])
+-    expect(adapted.tools?.map((entry) => entry.name)).toEqual(['Read'])
++  it('without a DescribeImage tool the fallback never names it and says the image cannot be viewed', () => {
++    const [message] = textOnlyVisionFallback([imageMessage], false)
++    expect(typeof message?.content).toBe('string')
++    expect(message?.content).toContain('cannot see image pixels')
++    expect(message?.content).toContain('no image-description tool is available')
++    expect(message?.content).toContain('cannot view the image')
++    expect(message?.content).not.toContain('DescribeImage')
++    expect(JSON.stringify(message)).not.toContain('AAAA')
+   })
+ 
+-  it('keeps DescribeImage and text-only messages for a non-vision model', () => {
+-    const request: ModelRequest = { messages: [imageMessage], tools: [tool('Read'), tool('DescribeImage')] }
+-    const adapted = adaptRequestVision(request, false)
+-    expect(adapted.tools?.map((entry) => entry.name)).toEqual(['Read', 'DescribeImage'])
+-    expect(typeof adapted.messages[0]?.content).toBe('string')
++  it('a native vision model does not need the DescribeImage schema', () => {
++    expect(withoutDescribeImage([tool('Read'), tool('DescribeImage')])?.map((entry) => entry.name)).toEqual(['Read'])
++    expect(withoutDescribeImage([tool('DescribeImage')])).toBeUndefined()
+   })
+ })
+diff --git a/tests/harness/g3-context.spec.ts b/tests/harness/g3-context.spec.ts
+index 7a0d06e..70eab7b 100644
+--- a/tests/harness/g3-context.spec.ts
++++ b/tests/harness/g3-context.spec.ts
+@@ -63,20 +63,35 @@ describe('context estimate honesty', () => {
+       { type: 'turn/start', turnId: 't' },
+       { type: 'user/message', turnId: 't', content: 'image', attachments: [{ id: 'img', name: 'x.png', mediaType: 'image/png', size: 1 }] },
+     ])
+     const attachments = new Map([['img', { mediaType: 'image/png', base64: 'eA==' }]])
+     const native = buildContext(base({ events: log, attachments }))
+     const fallback = buildContext(base({ events: log, attachments, nativeVision: false }))
+     expect(fallback.messages.every(m => typeof m.content === 'string')).toBe(true)
+     expect(fallback.manifest.budget.usedTokens).toBeLessThan(native.manifest.budget.usedTokens)
+     expect(String(fallback.messages.at(-1)?.content)).toContain('cannot see image pixels')
+   })
++  it('the non-native fallback names DescribeImage only when the request carries it', () => {
++    const log = eventsOf([
++      { type: 'turn/start', turnId: 't' },
++      { type: 'user/message', turnId: 't', content: 'image', attachments: [{ id: 'img', name: 'x.png', mediaType: 'image/png', size: 1 }] },
++    ])
++    const attachments = new Map([['img', { mediaType: 'image/png', base64: 'eA==' }]])
++    const describe = { name: 'DescribeImage', description: 'describe', parameters: { type: 'object' as const, properties: {} } }
++    const read = { name: 'Read', description: 'read', parameters: { type: 'object' as const, properties: {} } }
++    const withTool = buildContext(base({ events: log, attachments, nativeVision: false, schemas: [read, describe] }))
++    expect(String(withTool.messages.at(-1)?.content)).toContain('call DescribeImage')
++    const withoutTool = buildContext(base({ events: log, attachments, nativeVision: false, schemas: [read] }))
++    const text = String(withoutTool.messages.at(-1)?.content)
++    expect(text).toContain('no image-description tool is available')
++    expect(text).not.toContain('DescribeImage')
++  })
+   it('keeps token estimates labeled estimated even with a verified model window', () => {
+     const assembled = buildContext(base({ budget: { ...DEFAULT_BUDGET, verified: true } }))
+     expect(assembled.manifest.budget.estimated).toBe(true)
+   })
+ })
+ 
+ describe('harness authoring guidance', () => {
+   const read = { name: 'Read', description: 'read', parameters: { type: 'object' as const, properties: {} } }
+ 
+   it('exposes actual workspace paths and scope guidance without granting access', () => {
+diff --git a/tests/web/compaction-host.spec.ts b/tests/web/compaction-host.spec.ts
+index b007673..fc9e3c0 100644
+--- a/tests/web/compaction-host.spec.ts
++++ b/tests/web/compaction-host.spec.ts
+@@ -123,20 +123,21 @@ async function rig(options: { summary?: string; stream?: (request: ModelRequest,
+       })()
+     },
+     exactSnapshot: () => exact,
+     reconstruct,
+     identity: () => identity,
+     hasModel: () => options.model ?? true,
+     preCompact: hooks,
+     legacyCompact: legacy,
+     limits: { compactionEffectiveEnabled: options.effective ?? true, compactionDeadlineMs: 5_000, compactionOutputTokens: 8_000, compactionCandidateWaitMs: 15_000 },
+     contextWindowTokens: () => 200_000,
++    nativeVision: () => true,
+     measure: () => ({ tokensBefore: 5_000, tokensAfter: 1_000 }),
+     recordUsage: (u) => usage.push(u),
+   }
+   const host = new CompactionHost(deps)
+   return { session, host, requests, checkpoints, hooks, legacy, usage, reconstruct, setExact: (s) => { exact = s }, setReconstructed: (s) => { reconstructed = s } }
+ }
+ 
+ describe('CompactionHost.compact: the effective path', () => {
+   it('summarizes once from the exact snapshot and adopts it, with path and timings', async () => {
+     const r = await rig()
+@@ -249,20 +250,41 @@ describe('CompactionHost.compact: the effective path', () => {
+   })
+ 
+   it('a snapshot too large for the current window is never sent: the transcript is folded in pieces instead', async () => {
+     const r = await rig()
+     r.setExact(snapshotFor(r.session, 4, { inputEvidence: { inputTokens: 199_000 } }))
+     const result = await r.host.compact({ trigger: 'manual' })
+     expect(result).toMatchObject({ kind: 'compacted', path: 'recovery' })
+     expect(r.legacy).toHaveBeenCalledTimes(1)
+     expect(r.requests.every((request) => !String(request.messages.at(-1)!.content).includes(COMPACTION_HANDOFF_MARKER))).toBe(true)
+   })
++
++  it('a non-native target gets the handoff without image parts and no tool mention; the stored snapshot is untouched', async () => {
++    const image = { role: 'user' as const, content: [{ type: 'text' as const, text: 'look' }, { type: 'image' as const, mediaType: 'image/png', base64: 'AAAA' }] }
++    const withImage = (session: Session): EffectiveCompactionSnapshot => snapshotFor(session, 4, { request: { model: 'm', providerName: 'p', messages: [{ role: 'system', content: 'sys' }, image] } })
++    const text = await rig()
++    const stored = withImage(text.session)
++    text.setExact(stored)
++    text.host.deps = { ...text.host.deps, nativeVision: () => false }
++    await text.host.compact({ trigger: 'manual' })
++    const sent = JSON.stringify(text.requests[0]!.messages)
++    expect(sent).not.toContain('"type":"image"')
++    expect(sent).not.toContain('AAAA')
++    expect(sent).not.toContain('DescribeImage')
++    expect(sent).toContain('cannot see image pixels')
++    expect(stored.request.messages[1]).toBe(image)
++
++    const native = await rig()
++    native.setExact(withImage(native.session))
++    await native.host.compact({ trigger: 'manual' })
++    expect(native.requests[0]!.messages[1]).toEqual(image)
++  })
+ })
+ 
+ describe('CompactionHost.compact: progress', () => {
+   it('reports generating just before the model request and applying just before the adoption, in that order', async () => {
+     const r = await rig()
+     const order: string[] = []
+     const original = r.host.deps.stream
+     r.host.deps = {
+       ...r.host.deps,
+       stream: (request, options) => { order.push('model'); return original(request, options) },
+diff --git a/tests/web/server-compaction-effective.spec.ts b/tests/web/server-compaction-effective.spec.ts
+index 0805f70..0ef8b14 100644
+--- a/tests/web/server-compaction-effective.spec.ts
++++ b/tests/web/server-compaction-effective.spec.ts
+@@ -523,20 +523,72 @@ describe('effective compaction through the web server', () => {
+     const second = await start(llm, { compactionEffectiveEnabled: true }, home)
+     const calls = requests.length
+     const response = await fetch(`${second.base}/api/workspaces/${second.wsId}/sessions/${id}/compact`, { method: 'POST' })
+     expect(response.status).toBe(200)
+     expect(await response.json()).toMatchObject({ path: 'reconstructed' })
+     const sent = requests.slice(calls)
+     expect(sent).toHaveLength(1)
+     expect(String(sent[0]!.messages.at(-1)!.content)).toContain(COMPACTION_HANDOFF_MARKER)
+   })
+ 
++  it('the capture is the dispatched request: session controls stamped, no tools in a zero-tool mode', async () => {
++    const seen: ModelRequest[] = []
++    const make = (name: string, model: string): LlmProvider => ({
++      name,
++      models: [model],
++      stream(request) {
++        seen.push(request)
++        return (async function* (): AsyncIterable<StreamEvent> { yield { type: 'delta', delta: 'turn reply' }; yield STOP })()
++      },
++    })
++    // alpha/a1 is the global default; the session picks beta/b1.
++    const { home, base, wsId } = await start([make('alpha', 'a1'), make('beta', 'b1')], { compactionEffectiveEnabled: true })
++    const zero = ['---', 'name: Zero', 'history: compact', 'toolExposure: []', 'workspaceInstructions: false', 'skills: off', 'memoryPinned: false', 'memoryRetrieval: false', '---', '', 'No tools.'].join('\n')
++    expect((await fetch(`${base}/api/workspaces/${wsId}/modes/zero`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: zero }) })).status).toBe(200)
++    const snapshotOf = async (modeId?: string): Promise<{ request: ModelRequest }> => {
++      const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
++      const route = `${base}/api/workspaces/${wsId}/sessions/${id}`
++      expect((await fetch(`${route}/model`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ provider: 'beta', model: 'b1' }) })).status).toBe(200)
++      if (modeId !== undefined) expect((await fetch(`${route}/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId }) })).status).toBe(200)
++      const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
++      await completedMessage(base, wsId, id, logPath, 'question', 1)
++      await until(async () => ((await readLog(logPath)).some((event) => event.type === 'context/snapshot') ? true : undefined))
++      const dir = path.join(home, 'compaction', id, 'snapshots')
++      const file = (await fs.readdir(dir)).find((name) => name.endsWith('.json'))!
++      return JSON.parse(await fs.readFile(path.join(dir, file), 'utf8')) as { request: ModelRequest }
++    }
++    const tooled = await snapshotOf()
++    expect(tooled.request).toMatchObject({ model: 'b1', providerName: 'beta' })
++    expect(seen.at(-1)).toMatchObject({ model: 'b1', providerName: 'beta' })
++    expect(tooled.request.tools).toEqual(seen.at(-1)!.tools)
++    const bare = await snapshotOf('zero')
++    expect(bare.request).toMatchObject({ model: 'b1', providerName: 'beta' })
++    expect(bare.request.tools).toBeUndefined()
++    expect(seen.at(-1)!.tools).toBeUndefined()
++  })
++
++  it('a session with a model and no provider is budgeted on the same window compaction uses', async () => {
++    const { provider: llm } = provider()
++    const { server, home, base, wsId } = await start(llm, {})
++    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
++    const route = `${base}/api/workspaces/${wsId}/sessions/${id}`
++    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
++    await completedMessage(base, wsId, id, logPath, 'first', 1)
++    // A legacy log can name a model without a provider; compaction sizes glm-4.7 by its 200k catalog window.
++    const session = server.kernel.ctx.sessions.get(id as never)!
++    session.append({ type: 'session/model', provider: null, model: 'glm-4.7' })
++    await session.durable()
++    expect((await fetch(`${route}/compact`, { method: 'POST' })).status).toBe(200)
++    const manifest = await (await fetch(`${route}/manifest`)).json() as { budget: { contextLimitTokens: number } }
++    expect(manifest.budget.contextLimitTokens).toBe(200_000)
++  })
++
+   it('with the rollout switch OFF it behaves exactly as before: the legacy fold, no snapshot', async () => {
+     const { provider: llm, requests } = provider()
+     const { home, base, wsId } = await start(llm, {})
+     const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+     const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+     await completedMessage(base, wsId, id, logPath, 'first', 1)
+     const before = requests.length
+     expect((await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })).status).toBe(200)
+     const sent = requests.slice(before)
+     expect(sent.length).toBeGreaterThanOrEqual(1)
+diff --git a/tests/web/server-session-model.spec.ts b/tests/web/server-session-model.spec.ts
+index 29007af..d5e1366 100644
+--- a/tests/web/server-session-model.spec.ts
++++ b/tests/web/server-session-model.spec.ts
+@@ -1,28 +1,31 @@
+ import { promises as fs } from 'node:fs'
+ import { tmpdir } from 'node:os'
+ import path from 'node:path'
+-import { afterEach, describe, expect, it } from 'vitest'
+-import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { createWebServer, type LlmProvider, type ModelRequest, type WebServer } from 'dnt-harness'
++import type { HarnessLimits } from '../../src/harness/limits.ts'
++import { TurnCommandGrants } from '../../src/web/slash-commands.ts'
+ 
+ const servers: WebServer[] = []
+ const homes: string[] = []
+ 
+ afterEach(async () => {
++  vi.restoreAllMocks()
+   await Promise.all(servers.splice(0).map((server) => server.close()))
+   await Promise.all(homes.splice(0).map((home) => fs.rm(home, { recursive: true, force: true })))
+ })
+ 
+-async function start(providers: readonly LlmProvider[]): Promise<{ server: WebServer; base: string; home: string }> {
++async function start(providers: readonly LlmProvider[], limits?: Partial<HarnessLimits>): Promise<{ server: WebServer; base: string; home: string }> {
+   const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-session-model-'))
+   homes.push(home)
+-  const server = await createWebServer({ home, providers, configFile: path.join(home, 'providers.json') })
++  const server = await createWebServer({ home, providers, configFile: path.join(home, 'providers.json'), userClaudeDir: path.join(home, 'user-claude'), ...(limits !== undefined ? { limits } : {}) })
+   servers.push(server)
+   return { server, base: server.url, home }
+ }
+ 
+ async function firstWorkspace(base: string): Promise<string> {
+   return ((await (await fetch(`${base}/api/workspaces`)).json()) as { id: string }[])[0]!.id
+ }
+ 
+ async function post(base: string, pathname: string, body?: unknown): Promise<Response> {
+   return fetch(`${base}${pathname}`, { method: 'POST', headers: { 'content-type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
+@@ -50,20 +53,99 @@ function provider(name: string, models: readonly string[], seen: { model?: strin
+ 
+ async function settle(base: string, workspaceId: string, sessionId: string): Promise<void> {
+   for (let attempt = 0; attempt < 40; attempt += 1) {
+     const sessions = (await (await fetch(`${base}/api/workspaces/${workspaceId}/sessions`)).json()) as { id: string; status: string }[]
+     if (sessions.find((session) => session.id === sessionId)?.status === 'idle') return
+     await new Promise((resolve) => setTimeout(resolve, 50))
+   }
+   throw new Error('session did not settle')
+ }
+ 
++describe('slash command model (AC-13, AC-20)', () => {
++  // gpt-5.6 is native vision with a 1M catalog window; glm-4.7 is text-only with 200k.
++  const recorder = (requests: ModelRequest[]): LlmProvider => ({
++    name: 'alpha', models: ['gpt-5.6', 'glm-4.7'],
++    async *stream(request) {
++      requests.push(request)
++      yield { type: 'delta', delta: 'ok' }
++      yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
++    },
++  })
++  const command = async (home: string, workspaceId: string, name: string, model: string): Promise<void> => {
++    await fs.mkdir(path.join(home, 'workspaces', workspaceId, 'commands'), { recursive: true })
++    await fs.writeFile(path.join(home, 'workspaces', workspaceId, 'commands', `${name}.md`), `---\ndescription: d\nmodel: ${model}\n---\nAnswer briefly.`, 'utf8')
++  }
++  const sidecarRequest = async (home: string, sessionId: string): Promise<ModelRequest> => {
++    const dir = path.join(home, 'compaction', sessionId, 'snapshots')
++    let file: string | undefined
++    await expect.poll(async () => (file = (await fs.readdir(dir).catch(() => [] as string[])).find((name) => name.endsWith('.json'))), { timeout: 5_000 }).toBeDefined()
++    return (JSON.parse(await fs.readFile(path.join(dir, file!), 'utf8')) as { request: ModelRequest }).request
++  }
++
++  it('a command model with a smaller window drives the budget, the dispatched request and the capture; an invalid one falls back', async () => {
++    const requests: ModelRequest[] = []
++    const { base, home } = await start([recorder(requests)], { compactionEffectiveEnabled: true })
++    const workspaceId = await firstWorkspace(base)
++    await put(base, `/api/workspaces/${workspaceId}/model`, { provider: 'alpha', model: 'gpt-5.6' })
++    await command(home, workspaceId, 'small', 'glm-4.7')
++    await command(home, workspaceId, 'broken', 'no-such-model')
++    const run = async (content: string): Promise<{ manifest: { model: string; provider: string; budget: { contextLimitTokens: number } }; capture: ModelRequest }> => {
++      const { id } = (await (await post(base, `/api/workspaces/${workspaceId}/sessions`)).json()) as { id: string }
++      expect((await post(base, `/api/workspaces/${workspaceId}/sessions/${id}/messages`, { content })).status).toBe(202)
++      await settle(base, workspaceId, id)
++      const manifest = (await (await fetch(`${base}/api/workspaces/${workspaceId}/sessions/${id}/manifest`)).json()) as { model: string; provider: string; budget: { contextLimitTokens: number } }
++      return { manifest, capture: await sidecarRequest(home, id) }
++    }
++    const small = await run('/small hi')
++    expect(requests.at(-1)).toMatchObject({ providerName: 'alpha', model: 'glm-4.7' })
++    expect(small.manifest).toMatchObject({ provider: 'alpha', model: 'glm-4.7', budget: { contextLimitTokens: 200_000 } })
++    expect(small.capture).toMatchObject({ providerName: 'alpha', model: 'glm-4.7' })
++
++    const broken = await run('/broken hi')
++    expect(requests.at(-1)).toMatchObject({ providerName: 'alpha', model: 'gpt-5.6' })
++    expect(broken.manifest).toMatchObject({ provider: 'alpha', model: 'gpt-5.6', budget: { contextLimitTokens: 1_048_576 } })
++    expect(broken.capture).toMatchObject({ providerName: 'alpha', model: 'gpt-5.6' })
++  })
++
++  it('a reconstruction while a command grant is active builds for the session model, not the command model', async () => {
++    // Keep the command grant alive past its turn, so the rebuild runs while it is active.
++    vi.spyOn(TurnCommandGrants.prototype, 'clear').mockImplementation(() => undefined)
++    const requests: ModelRequest[] = []
++    const { base, home } = await start([recorder(requests)], { compactionEffectiveEnabled: true })
++    const workspaceId = await firstWorkspace(base)
++    await put(base, `/api/workspaces/${workspaceId}/model`, { provider: 'alpha', model: 'gpt-5.6' })
++    await command(home, workspaceId, 'small', 'glm-4.7')
++    const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('grant')])
++    const ref = await (await fetch(`${base}/api/workspaces/${workspaceId}/attachments`, { method: 'POST', headers: { 'content-type': 'image/png', 'x-file-name': 'shot.png' }, body: new Uint8Array(png) })).json()
++    const { id } = (await (await post(base, `/api/workspaces/${workspaceId}/sessions`)).json()) as { id: string }
++    const route = `${base}/api/workspaces/${workspaceId}/sessions/${id}`
++    expect((await post(base, `${route.slice(base.length)}/messages`, { content: 'look', attachments: [ref] })).status).toBe(202)
++    await settle(base, workspaceId, id)
++    expect((await post(base, `${route.slice(base.length)}/messages`, { content: '/small hi' })).status).toBe(202)
++    await settle(base, workspaceId, id)
++    // The command turn ran on glm-4.7 (text-only), so its capture carries no image.
++    expect(requests.at(-1)).toMatchObject({ model: 'glm-4.7' })
++    expect(JSON.stringify(requests.at(-1)!.messages)).not.toContain(png.toString('base64'))
++    // A mode switch retires the capture: compaction must rebuild the request from the log.
++    expect((await put(base, `${route.slice(base.length)}/mode`, { modeId: 'plan' })).status).toBe(200)
++    const before = requests.length
++    const compacted = await post(base, `${route.slice(base.length)}/compact`)
++    expect(compacted.status).toBe(200)
++    expect(await compacted.json()).toMatchObject({ path: 'reconstructed' })
++    const handoff = requests.slice(before)
++    expect(handoff).toHaveLength(1)
++    expect(handoff[0]).toMatchObject({ model: 'gpt-5.6' })
++    // Built for gpt-5.6 (native): the image survives. Built for glm-4.7 it would be text.
++    expect(JSON.stringify(handoff[0]!.messages)).toContain(png.toString('base64'))
++  })
++})
++
+ describe('workspace session model controls', () => {
+   it('executes the submitted draft model even when another conversation changed global defaults', async () => {
+     const seen: { model?: string; provider?: string; thinkingLevel?: string }[] = []
+     const { base } = await start([provider('cliproxy', ['claude-opus-5-5', 'gpt-6.1-sol'], seen)])
+     const workspaceId = await firstWorkspace(base)
+     const selected = { provider: 'cliproxy', model: 'claude-opus-5-5', thinkingLevel: 'medium' }
+     await put(base, '/api/model-defaults', selected)
+     await put(base, '/api/model-defaults', { provider: 'cliproxy', model: 'gpt-6.1-sol', thinkingLevel: 'high' })
+     const response = await post(base, `/api/workspaces/${workspaceId}/sessions`, { controls: selected })
+     expect(response.status).toBe(201)

@@ -1,0 +1,530 @@
+diff --git a/docs/capabilities.md b/docs/capabilities.md
+index 9a0eca5..001bd76 100644
+--- a/docs/capabilities.md
++++ b/docs/capabilities.md
+@@ -397,21 +397,23 @@ deleted, or disabled provider fails the call with the Settings fix it needs.
+   sourceAttachmentId? }`. The call honors the turn's stop signal and a
+   120-second budget.
+ - **UI**: the transcript row names the prompt and shows the stored image
+   beneath it, always visible, with a lightbox (`GeneratedImageCard` in
+   `web/components/chat/MessageParts.tsx`). The tool descriptions tell the
+   model not to narrate file paths or ids.
+ - **Adaptive vision / DescribeImage**: the selected chat model's effective
+   vision capability is the provider model override first, then the shared
+   model catalog. `vision: false` converts image-bearing history to text-only:
+   the attachment marker (including `attachmentId`) remains, image bytes leave
+-  the chat request, and the text tells the model to call `DescribeImage`.
++  the chat request, and the text tells the model to call `DescribeImage` when
++  the request carries that tool (otherwise it says no image-description tool is
++  available).
+   `DescribeImage { attachmentId, question? }` reads only from the workspace
+   AttachmentStore and sends that image to the dedicated multimodal chat model
+   selected in **Settings → Providers & Models → Image understanding**. Its
+   result is `{ description, model, attachmentId }`. A native-vision model keeps
+   image parts and does not receive the DescribeImage schema. Unknown capability
+   defaults to native vision, preserving existing/future model behavior.
+ - **Modes**: GenerateImage and EditImage are `ask` in Ask before changes and
+   Edit automatically because each call is a paid external request. They are
+   `allow` in Full access and are not exposed in Plan. DescribeImage is a
+   read-like `allow` tool exposed in every bundled mode, including Plan.
+diff --git a/docs/web.md b/docs/web.md
+index 2c2988e..2b8391a 100644
+--- a/docs/web.md
++++ b/docs/web.md
+@@ -19,23 +19,26 @@ no model execution overlapping summary work. Stop, deletion and shutdown cancel
+ owned requests and do not automatically resume queued inputs. Summary requests
+ have no tools and use configured logical-request first-progress/idle/total
+ limits and provider admission. Each chunk must end in a valid settled stop.
+ Text attachment content is bounded as in normal context; image/file references
+ are disclosed without claiming unseen image content.
+ 
+ A successful canonical `compaction/end` authorizes history replacement;
+ checkpoint JSON is validated, atomic derived cache and may be rebuilt on the
+ next request. Four covered tail turns are optional raw duplication by default;
+ zero disables duplication, not uncovered history, and budget fitting may reduce
+-the covered tail by whole turns with omissions. The manifest remains the last
+-real request until another request consumes the checkpoint. Headless automatic
+-integration and stronger power-loss durability guarantees are not claimed.
++the covered tail by whole turns with omissions. After a compaction, `/manifest`
++returns the measured post-compaction request (`contextAfter`, with
++`display.kind: 'post-compaction'`) until a newer request is assembled, or an
++`unavailable` view (`display.reason`: `legacy-compaction` | `preview-failed`)
++when no measurement exists. Headless automatic integration and stronger
++power-loss durability guarantees are not claimed.
+ 
+ ## The client is stateless by design
+ 
+ The browser client holds **no model state of its own**. The transcript is
+ projected from the durable session events streamed over SSE — a fresh connection
+ first receives a **snapshot** of the whole log (server-compacted: raw content
+ chunks of finalized steps and `context/body` payloads never ship; reasoning
+ folds to one event per step), then live `session/event`
+ frames. Approval questions arrive on the same stream as `approval` envelopes,
+ and answers go back over one POST. This is the "render from `session/event`"
+@@ -178,21 +181,21 @@ addressed under `/api/workspaces/:wid/...`. Unknown workspaces fail closed
+ (`404`); ownership is re-checked per request, so a foreign id never leaks
+ data, and a workspace switch never changes a running turn's ownership or
+ tool root. The families, at a glance:
+ 
+ | Route family | Purpose |
+ |---|---|
+ | `GET/POST /api/workspaces`, `PATCH/DELETE /api/workspaces/:wid` | workspace list (with running/approval badges), create, rename, archive/restore, delete (empty only) |
+ | `…/:wid/sessions`, `…/:wid/sessions/:id` (+ `/events` SSE, `/messages`, `/stop`, `/steer`) | session lifecycle, streaming, queued messages, stop, steer. `/messages` answers 409 for a child agent session: children are executor-managed and cannot be resumed directly. See "Queue, stop, and steer" below |
+ | `GET/PUT …/:wid/sessions/:id/model` | the conversation's own model controls (model, provider, thinking level) — see the per-conversation model section |
+ | `GET/PUT …/:wid/sessions/:id/grants` | the conversation's extra file-tool folders: `GET` returns `{ revision, roots, effective }` (effective = project + session grants merged); `PUT { expectedRevision, roots: [{ path, access }] }` replaces the list — browser principal only, `409` on a stale revision or a conversation without a project, `400` for a folder the grant validator refuses (see `docs/capabilities.md`) |
+-| `…/:wid/sessions/:id/manifest`, `…/compact` | last real request's context manifest; manual compaction returns `{ coversSeq, summaryChars }`, with 409 for active/duplicate ownership. Automatic compaction uses fresh completed-turn pre-trim pressure in compact-history mode; the standard bin enables 0.85 (embedded default/explicit zero disables). PreCompact hooks share the reservation. |
++| `…/:wid/sessions/:id/manifest`, `…/compact` | `GET /manifest` returns one of: the newest request's manifest (`display.kind: 'request'`), the measured post-compaction request (`display.kind: 'post-compaction'`, with `compactionSeq`/`coversSeq`), an `unavailable` view (`{ display: { kind: 'unavailable', reason: 'legacy-compaction' \| 'preview-failed' }, usage }`), or `204` when the session has no context yet. Manual compaction returns `{ coversSeq, summaryChars, tokensBefore?, tokensAfter?, measurement?, path? }` (`tokens*`/`measurement` only when a new checkpoint was measured; `path`: `exact` \| `reconstructed` \| `recovery` \| `legacy`, the route that produced the checkpoint), with 409 for active/duplicate ownership, an unverified fit, or `context revision changed`. Automatic compaction uses fresh completed-turn pre-trim pressure in compact-history mode; the standard bin enables 0.85 (embedded default/explicit zero disables). PreCompact hooks share the reservation. |
+ | `GET/PUT /api/model-defaults` | the **global** default provider/model/thinking level, shared by every workspace: the pair new sessions snapshot at creation, the draft pickers' target, and the live fallback for legacy conversations without a snapshot |
+ | `PUT …/:wid/model`, `PUT …/:wid/thinking` | compatibility proxies: they verify workspace ownership, then mutate the **global** default above; new clients use `/api/model-defaults` |
+ | `PUT …/:wid/mode`, `GET …/:wid/meta` | workspace-local default mode control for new conversations and draft UI. Existing roots keep their own selected mode. The `GET …/mode` catalog lists **enabled modes only** (a disabled mode refused for selection answers `400`); `GET …/meta` returns the workspace default's `permissionDefaults`, `mode`, and `yolo` when enabled; it does not return a policy or effective-policy overlay. |
+ | `GET …/:wid/modes`, `GET/PUT/DELETE …/:wid/modes/:mid`, `POST …/:wid/modes/:mid/duplicate`, `PUT …/:wid/modes/:mid/enabled` | mode **authoring**, separate from workspace-default and conversation selection. The catalog carries each mode's `enabled` flag, `toolExposure`, and `permissionDefaults`; the single-mode read returns raw Markdown plus a hash, and `PUT` takes `{ content, expectedHash? }` (required when replacing an existing file). Bundled modes are read-only (`400`), a stale or missing update hash is `409`, and invalid content is rejected before anything is written. `PUT …/enabled` takes `{ enabled: boolean }`: it shows or hides a mode in this workspace's picker — bundled modes may be hidden too, disabling the workspace default is `409` (select another first), the disabled set persists beside the mode files, and saving a mode always re-enables it. `edit-automatically` starts hidden from the picker (`DEFAULT_HIDDEN_MODE_IDS`) unless the workspace already selected it, yet stays selectable by id; enabling it records an explicit show. The `GET …/mode` picker rows carry each mode's `description` when it has one. `GET/PUT …/:wid/sessions/:id/mode` reads or switches one root's live mode; the switch is durable and governs its next model request or unstarted tool gate, including its children, without affecting sibling roots. |
+ | `…/:wid/projects` (+ `/projects/:pid`) | project binding: working folder, ownership, overlap rejection. `PATCH` also takes `additionalDirectories: [{ kind: "path", path, access } \| { kind: "project", projectId, access }]` (browser principal only, every folder validated) and `gitTrusted: boolean` (browser principal only; lifts Git's Restricted Mode, cleared when the folder is retargeted unless the same request sets it); retargeting is `409` while any turn — this project's or another's through a grant — holds a write lease inside it |
+ | `GET …/:wid/projects/:pid/(files\|file\|search)` | project browsing: one directory listing, one file body (which also returns `editable` and `hash`), and a bounded file-name search (composer mentions and the explorer search box) |
+ | `POST\|PATCH\|DELETE …/:wid/projects/:pid/files` | explorer writes, a direct user action independent of any session mode: `POST {path, kind: 'file'\|'dir'}` creates (201), `PATCH {path, name}` renames in the same folder, `DELETE ?path=` deletes permanently (folders recursively). Never overwrites (409), refuses the project root, `.git`, traversal, links out of the root in a parent folder and protected storage (400); a link in the last segment is renamed or removed itself, never followed. Archived workspaces refuse writes |
+ | `PUT …/:wid/projects/:pid/file` | save an edited project file from the viewer: body `{path, content, expectedHash}`. The stored bytes must still hash to `expectedHash` (from the last `GET …/file`), else 409 with `currentHash`; the file keeps its encoding, BOM and dominant line ending and is replaced atomically under the agent tools' file lock; a read-only file (no write bit) is refused with 400. The editor holds LF text, so a mixed-EOL file is normalised to its dominant line ending on save and a lone CR becomes that line ending. Only whole UTF-8 text files up to 1 MiB (`editable` on the read); the same path rules as explorer writes; a direct user action independent of session mode; archived workspaces refuse it |
+ | `GET …/:wid/projects/:pid/media(?path=)` | stream one project file as renderable media for previews: images by magic bytes, audio/video by extension; anything else is 404. Honours single byte `Range` requests (seeking) and `HEAD`; capped at 64 MB; traversal refused |
+ | `GET …/:wid/projects/:pid/git(?path=)` | git reads: status with no `path` (`branch` name, structured `branchInfo` with upstream and ahead/behind track, `head`, per-path `staging`/`created`/`deleted`/`conflicted`, `ahead`/`behind`, `truncated`, `mergeHeads` and, while merging, `mergeMessage` from `MERGE_MSG`), or one file's unified diff against HEAD (untracked files diff as all additions; a repository with no commit diffs the staged index). The diff report also carries `hunks` (one per displayed `@@` block with a `staged`/`unstaged`/`partial` status and a fingerprint; empty for an untracked, added, conflicted or binary file, or without a HEAD) and, for a conflicted file, `conflicts` (each region's ours/theirs text and branch names). Not a repository answers an empty status; traversal is refused. Reads never write, but they are **trust-aware**: an untrusted project (the default) runs git with hooks, external diff drivers, `core.sshCommand`, credential helpers and `ext::` transports disabled |
+diff --git a/src/web/server.ts b/src/web/server.ts
+index 6eddf45..430dc95 100644
+--- a/src/web/server.ts
++++ b/src/web/server.ts
+@@ -44,21 +44,21 @@ import type { Agent } from '../harness/agent/agent.ts'
+ import { approvalCallFingerprint, attachApproval, createApprovalReceiptRegistry, type ApprovalHandle, type ApprovalMode, type ApprovalScope } from '../harness/approval/policy.ts'
+ import { resolvePermission } from '../harness/approval/resolution.ts'
+ import { composeAuthority, type AskRequirement, type AuthorityDecision } from '../harness/tools/authority.ts'
+ import { DangerousCommandsStore } from '../harness/guard/store.ts'
+ import { liftsReadOnlyBash, riskyBashMatch, riskyBashWarning } from '../harness/modes/bash-policy.ts'
+ import { attachDangerousCommandGuard, guardMatchFingerprint } from '../harness/guard/guard.ts'
+ import { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from '../harness/limits.ts'
+ import { LlmService } from '../harness/llm/service.ts'
+ import { LogicalRequest, classifyTransport } from '../harness/llm/request-lifecycle.ts'
+ import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
+-import { expressibleThinkingLevel, isThinkingLevel, resolveContextLimit } from '../harness/llm/model-catalog.ts'
++import { expressibleThinkingLevel, isThinkingLevel } from '../harness/llm/model-catalog.ts'
+ import { supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
+ import { ProviderError } from '../harness/llm/types.ts'
+ import type { LlmProvider, ModelRequest, StreamEvent, StreamOptions, TokenUsage, ToolCall } from '../harness/llm/types.ts'
+ import type { ToolResult } from '../harness/tools/types.ts'
+ import { fileSessions, SessionsService } from '../harness/session/service.ts'
+ import type { Session } from '../harness/session/session.ts'
+ import { sessionGrantsOf, sessionModeOf, sessionModelOf, type SessionEvent, type SessionGrant, type SessionGrants } from '../harness/session/events.ts'
+ import { deriveTitle } from '../harness/session/title.ts'
+ import { newExecutionId, newInputId, type ProjectId, type SessionId, type TurnId, type WorkspaceId } from '../util/brand.ts'
+ import { ToolsService } from '../harness/tools/service.ts'
+@@ -1556,22 +1556,23 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
+   /**
+    * What the last measure proved, per session: the context revision its inputs were prepared
+    * under, and the checkpoint whose full next request was built and fits (`fit`), or why not.
+    */
+   const compactFits = new Map<SessionId, { revision: string; fit?: number; error?: unknown }>()
+ 
+   /** Hash of everything outside the log that shapes the next request; a preview is stale once it moves. */
+   const contextRevision = async (entry: SessionEntry): Promise<string> => {
+     const { provider, model, thinkingLevel } = resolveEffectiveModel(entry.session, entry.workspaceId)
+     const { mode, revision } = rootModeOf({ sessionId: entry.session.id }, entry.workspaceId)
+-    const prompts = await systemPrompts.load(entry.workspaceId).catch(() => undefined)
+-    const instructions = await readWorkspaceInstructions(resourceHome, entry.workspaceId, entry.projectId).catch(() => '')
++    // A read error throws (a measurement failure), never hashes as empty: that would read as a change.
++    const prompts = await systemPrompts.load(entry.workspaceId)
++    const instructions = mode.definition.sources.workspaceInstructions ? await readWorkspaceInstructions(resourceHome, entry.workspaceId, entry.projectId) : ''
+     return createHash('sha256').update(JSON.stringify([
+       provider ?? null, model ?? null, thinkingLevel ?? null,
+       provider != null && model != null ? list.find((row) => row.id === provider)?.modelSettings?.[model]?.contextTokens ?? null : null,
+       mode.definition.id, revision,
+       effectiveGrants(entry.session.id, entry.projectId, entry.workspaceId),
+       prompts?.base.overridden === true ? prompts.base.text : null,
+       prompts?.child.overridden === true ? prompts.child.text : null,
+       createHash('sha256').update(instructions).digest('hex'),
+       skills.sourcesStore.revision(entry.workspaceId),
+     ])).digest('hex')
+@@ -1587,31 +1588,29 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
+     if (cutoff !== undefined && recorded?.fit !== cutoff) {
+       const cause = recorded?.error instanceof Error ? `: ${recorded.error.message}` : ''
+       throw new Error(`compaction fit not verified${cause}`)
+     }
+     if (recorded !== undefined && recorded.revision !== await contextRevision(entry)) throw new Error('context revision changed')
+   }
+ 
+   /** The post-compaction request the builder would assemble next; throws when it does not fit. */
+   const previewCompaction = (entry: SessionEntry, next: { readonly summary: string; readonly coversSeq: number }, restored?: Restored) => {
+     const scope: AgentScope = { sessionId: entry.session.id, rootSessionId: entry.session.id, workspaceId: entry.workspaceId,
+-      ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}) }
++      ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}), ...roleIdentityOf(entry.session) }
+     const schemas = agentScope.run(scope, () => kernel.ctx.tools.schemas())
+     return assembleRequest({ scope, projected: { messages: [], tools: schemas, assemblySignal: new AbortController().signal }, sideEffects: false,
+       preview: { checkpoint: next, ...(restored !== undefined ? { restoration: restored } : {}), protectUncoveredHistory: limits.compactionEffectiveEnabled } })
+   }
+ 
+   const measureCheckpoint = async (
+     entry: SessionEntry,
+     next: { readonly summary: string; readonly coversSeq: number },
+-    _standing: { readonly summary: string; readonly coversSeq: number } | undefined,
+-    _loaded?: Parameters<typeof estimateConversationTokens>[0]['attachments'],
+     restored?: Restored,
+   ): Promise<CompactionMeasurement> => {
+     const sessionId = entry.session.id
+     compactFits.delete(sessionId)
+     // Captured before any preview await, so a change while it runs is caught at publication.
+     const revision = await contextRevision(entry)
+     if (rootModeOf({ sessionId }, entry.workspaceId).mode.definition.sources.history !== 'compact') {
+       // The checkpoint is not read by this mode: the next request does not change.
+       compactFits.set(sessionId, { revision, fit: next.coversSeq })
+       return { contextEffect: 'unchanged' }
+@@ -1744,21 +1743,21 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
+         hasModel: () => summarizerModelOf(entry.session) !== undefined,
+         preCompact: (hookTrigger, hookSignal) => runPreCompactHooks(entry.session, entry.workspaceId, hookSignal, hookTrigger),
+         legacyCompact: async (legacyTrigger, legacySignal) => {
+           const checkpoint = await legacyBody(entry, legacyTrigger, legacySignal)
+           return { coversSeq: checkpoint.coversSeq, summary: checkpoint.summary }
+         },
+         limits,
+         ...(candidates !== undefined ? { candidates } : {}),
+         contextWindowTokens: () => compactionWindowOf(entry),
+         nativeVision: () => compactionVisionOf(entry),
+-        measure: (next, standing, restored) => measureCheckpoint(entry, next, standing, undefined, restored),
++        measure: (next, _standing, restored) => measureCheckpoint(entry, next, restored),
+         // Effective adoption needs positive evidence: a measured fit for this exact checkpoint.
+         validateFit: (cutoff) => checkCompactionContext(entry, cutoff),
+         restore: (cutoff, restoreSignal) => restorationFor(entry, cutoff, restoreSignal),
+         progress: (stage) => { void appendJob(entry, { stage }) },
+         recordUsage: (usage) => {
+           countJobUsage(sessionId, usage)
+           const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
+           usageLog.record({
+             at: Date.now(), startedAt: Date.now(), workspaceId: entry.workspaceId, sessionId, rootSessionId: sessionId, kind: 'compaction',
+             ...(effective.provider !== null && effective.provider !== undefined ? { provider: effective.provider } : {}),
+@@ -1862,21 +1861,21 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
+             if (!(error instanceof CacheAwareCompactionFallback) && !providerFallback) throw error
+             return await fallback(input)
+           }
+         }
+         const { compactSession, MAX_COMPACTION_SUMMARY_CHARS } = await import('../harness/context/compaction.ts')
+         return await compactSession(entry.session, checkpoints, summarizer, {
+           trigger, signal, ...(pair !== undefined ? { model: pair.model } : { extractiveCap: MAX_COMPACTION_SUMMARY_CHARS }),
+           ...(loaded !== undefined ? { attachments: loaded } : {}),
+           ...(seed !== undefined ? { seed } : {}),
+           onProgress: (done, total) => { void appendJob(entry, { stage: 'generating', progress: { done, total } }) },
+-          measure: (next) => measureCheckpoint(entry, next, seed, loaded),
++          measure: (next) => measureCheckpoint(entry, next),
+           // Legacy keeps succeeding when the preview fails, but never under a context that moved.
+           validate: () => checkCompactionContext(entry),
+         })
+       }
+     }
+   }
+ 
+   /** Aborted when the server closes: a background summary never outlives it. */
+   const candidateLifetime = new AbortController()
+ 
+@@ -3474,22 +3473,20 @@ ${entry.description}`.toLowerCase().includes(query))
+   /** Context section hashes already recorded in each session's log (body dedupe). */
+   const contextBodies = new Map<SessionId, Set<string>>()
+   const contextBodiesFor = (sessionId: SessionId): Set<string> => {
+     let seen = contextBodies.get(sessionId)
+     if (seen === undefined) {
+       seen = new Set()
+       contextBodies.set(sessionId, seen)
+     }
+     return seen
+   }
+-  /** Provider-reported token usage per session (last request + running cache totals). */
+-  const sessionUsage = new Map<SessionId, SessionUsage>()
+   /**
+    * The newest root model request that may seed cache-aware compaction. It is
+    * armed when the builder assembles a lossless request, cleared by the next
+    * root assembly, and kept only after that exact request stops cleanly.
+    */
+   const pendingCompactionPrefixes = new Map<SessionId, TurnId>()
+   const completedRequests = new Map<SessionId, CompactionPrefix>()
+   /**
+    * Effective compaction (rollout-gated): the exact request of each root step is
+    * captured, and the last clean one of a completed turn becomes a persisted
+@@ -3891,29 +3888,20 @@ ${entry.description}`.toLowerCase().includes(query))
+       // one completes. Only a request that carried every conversation fact
+       // (no trimming, cleared tool results or dropped sources) may seed it.
+       if (scope.childOf === undefined) {
+         completedRequests.delete(scope.sessionId)
+         pendingCompactionPrefixes.delete(scope.sessionId)
+         const history = assembled.manifest.history.setting
+         if (scope.turnId !== undefined && history !== 'none' && assembled.manifest.omissions.length === 0) {
+           pendingCompactionPrefixes.set(scope.sessionId, scope.turnId)
+         }
+       }
+-      // This manifest describes the request about to run, not the previous
+-      // one. Drop its prompt count until `llm/stream` reports the new usage;
+-      // the running cache totals stay, because they are session-scoped.
+-      const usage = sessionUsage.get(scope.sessionId)
+-      if (usage !== undefined) {
+-        const { last: _stale, ...totals } = usage
+-        void _stale
+-        sessionUsage.set(scope.sessionId, totals)
+-      }
+       // The trajectory reads WHEN context was injected and WHAT it carried:
+       // one durable record per request, between `step/start` and the step's
+       // answer. It rides the step's existing durability barriers — no extra
+       // flush, and a crash that loses it loses the answer it describes too.
+       // Raw section bodies ride alongside, deduped by content hash: the first
+       // request that carries a given text records it once, later steps with
+       // the same text record nothing.
+       if (scope.turnId !== undefined && session !== undefined) {
+         const seen = contextBodiesFor(scope.sessionId)
+         for (const section of assembled.sections) {
+@@ -4543,21 +4531,20 @@ ${entry.description}`.toLowerCase().includes(query))
+       pairs.set(name, next)
+     },
+     commitMessageModel,
+     commitMessageStream: (request, signal) => agentScope.exit(() => kernel.ctx.llm.stream(request, { signal })),
+     recordUsage: (record) => usageLog.record(record),
+     checkpoints,
+     lastManifests,
+     contextReducers,
+     prefixSnapshots,
+     contextBodies,
+-    sessionUsage,
+     completedRequests,
+     forgetCompactionCapture: async (sessionId) => {
+       captures.forget(sessionId)
+       compactionHosts.get(sessionId)?.cancel()
+       compactionHosts.delete(sessionId)
+       // Abort the background summary and wait until its stream has really ended.
+       await candidates?.invalidate(sessionId, 'session-deleted')
+     },
+     usageLog,
+     adoptMode,
+@@ -4844,21 +4831,20 @@ interface HandlerDeps {
+   readonly memory: MemoryService
+   readonly attachments: AttachmentStore
+   readonly checkpoints: CheckpointStore
+   readonly lastManifests: Map<SessionId, ContextManifest>
+   /** Incremental committed-context state per session for GET /manifest. */
+   readonly contextReducers: Map<SessionId, ContextReducerCache>
+   /** Per-session copy of the skill catalog and memory indexes (prefix stability). */
+   readonly prefixSnapshots: Map<SessionId, PrefixSnapshot>
+   /** Context section hashes already recorded per session's log (body dedupe). */
+   readonly contextBodies: Map<SessionId, Set<string>>
+-  readonly sessionUsage: Map<SessionId, SessionUsage>
+   readonly completedRequests: Map<SessionId, CompactionPrefix>
+   /** Drop the effective-compaction capture and host of a deleted session. */
+   readonly forgetCompactionCapture: (sessionId: SessionId) => Promise<void>
+   readonly adoptMode: (workspaceId: WorkspaceId, modeId: string) => Promise<ResolvedMode>
+   readonly stampRootMode: (session: Session, resolved: ResolvedMode) => Extract<SessionEvent, { type: 'session/mode' }>
+   readonly rootModeOf: (scope: { readonly sessionId: SessionId; readonly rootSessionId?: SessionId }, workspaceId: WorkspaceId) => { mode: ResolvedMode; revision: number }
+   readonly admissionExposureCeiling: (rootSessionId: SessionId, workspaceId: WorkspaceId, definition: string, candidates: readonly string[], definitionSource?: AgentSource) => Promise<readonly string[]>
+   /** Whether the root's latest durable turn is terminal; admission reads this because `agent.busy` lags the durable append. */
+   readonly turnTerminal: (session: Session) => boolean
+   readonly agentDefinitions: AgentDefinitionService
+@@ -10035,29 +10021,27 @@ function committedContextView(session: Session, cache: Map<SessionId, ContextRed
+   const tail = events.at(-1)
+   if (tail !== undefined) cached.last = { seq: tail.seq, type: tail.type }
+   return cached.reducer.current()
+ }
+ 
+ /** A deleted session leaves no per-session index behind (manifest, child indexes). */
+ async function forgetSessionState(sessionId: SessionId, deps: HandlerDeps): Promise<void> {
+   deps.lastManifests.delete(sessionId)
+   deps.contextReducers.delete(sessionId)
+   deps.contextBodies.delete(sessionId)
+-  deps.sessionUsage.delete(sessionId)
+   deps.completedRequests.delete(sessionId)
+   await deps.forgetCompactionCapture(sessionId)
+   deps.prefixSnapshots.delete(sessionId)
+   for (const childId of await deps.childExecutor.forgetRoot(sessionId)) {
+     deps.lastManifests.delete(childId)
+     deps.contextReducers.delete(childId)
+     deps.contextBodies.delete(childId)
+-    deps.sessionUsage.delete(childId)
+     deps.completedRequests.delete(childId)
+     deps.prefixSnapshots.delete(childId)
+   }
+ }
+ 
+ /**
+  * One session's snapshot of the frequently-edited prefix sources. `key`
+  * names what the copy was read under (project + compaction boundary); any
+  * change to it means the prefix moves anyway, so the copy is re-read then.
+  * A field is absent until a request first needs it.
+@@ -10093,46 +10077,20 @@ function compactionRequestOf(request: ModelRequest): ModelRequest {
+ function compactionAnswerFor(events: readonly SessionEvent[], prefix: CompactionPrefix): string | undefined {
+   const end = events.findLast((event) => event.type === 'turn/end')
+   if (end?.type !== 'turn/end' || end.turnId !== prefix.turnId || end.reason !== 'completed') return undefined
+   const start = events.findLast((event) => event.type === 'turn/start' && event.turnId === prefix.turnId)
+   if (start === undefined) return undefined
+   const answer = events.findLast((event) => event.seq > start.seq && event.seq < end.seq && event.type === 'assistant/message')
+   if (answer?.type !== 'assistant/message' || answer.toolCalls !== undefined || answer.content.trim() === '') return undefined
+   return answer.content
+ }
+ 
+-/** Token usage the provider reported for one session since this host started. */
+-interface SessionUsage {
+-  /**
+-   * The newest COMPLETED request's usage. Absent between assembling the next
+-   * request and that request reporting its own prompt count, so a manifest
+-   * is never paired with an older prompt size.
+-   */
+-  readonly last?: TokenUsage
+-  /** Prompt tokens summed over requests that reported a cached share. */
+-  readonly cacheableInputTokens: number
+-  readonly cachedInputTokens: number
+-}
+-
+-/** Fold one completion's usage into the session's running totals. */
+-function recordUsage(store: Map<SessionId, SessionUsage>, sessionId: SessionId, usage: TokenUsage): void {
+-  const previous = store.get(sessionId)
+-  // Only requests whose provider reports a cached share count toward the
+-  // hit rate; a server that never reports caching must not read as 0%.
+-  const reported = usage.cachedInputTokens !== undefined
+-  store.set(sessionId, {
+-    last: usage,
+-    cacheableInputTokens: (previous?.cacheableInputTokens ?? 0) + (reported ? usage.inputTokens : 0),
+-    cachedInputTokens: (previous?.cachedInputTokens ?? 0) + (usage.cachedInputTokens ?? 0),
+-  })
+-}
+-
+ /**
+  * Resolve a session entry with an ownership check: the session must belong
+  * to the addressed workspace. Unknown ids and foreign-workspace ids both
+  * resolve to `undefined` — indistinguishable, fail closed.
+  */
+ async function findSession(rawId: string, workspaceId: WorkspaceId, deps: HandlerDeps): Promise<SessionEntry | undefined> {
+   const id = rawId as SessionId
+   const known = deps.sessions.get(id)
+   if (known !== undefined) {
+     return known.workspaceId === workspaceId ? known : undefined
+diff --git a/tests/web/server-automations.spec.ts b/tests/web/server-automations.spec.ts
+index 2423abe..ffb4c41 100644
+--- a/tests/web/server-automations.spec.ts
++++ b/tests/web/server-automations.spec.ts
+@@ -277,12 +277,21 @@ describe('automations API', () => {
+     expect(tools).toEqual(['Glob', 'Grep', 'Read'])
+     const system = requests[0]?.messages.find((message) => message.role === 'system')?.content ?? ''
+     expect(system).toContain('Role — explorer')
+     expect(system).not.toContain('Mode —')
+     // No subagent: the prompt and the unattended context sit in the root itself.
+     expect(await (await fetch(`${url}/api/workspaces/${ws}/agents/children?root=${sessionId}`)).json()).toEqual([])
+     const rootLog = await fs.readFile(path.join(home, 'workspaces', ws, 'sessions', sessionId, 'events.jsonl'), 'utf8')
+     expect(rootLog).toContain('"type":"session/role"')
+     expect(rootLog).toContain('unattended scheduled task named \\"Explore\\"')
+     expect(rootLog).toContain('look around')
++
++    // The post-compaction preview measures the request the role root sends next: the role, its ceiling.
++    await until(async () => (await (await fetch(`${url}/api/workspaces/${ws}/sessions`)).json() as { id: string; status: string }[]).find((s) => s.id === sessionId)?.status, (status) => status === 'idle')
++    expect((await fetch(`${url}/api/workspaces/${ws}/sessions/${sessionId}/compact`, { method: 'POST' })).status).toBe(200)
++    const end = (await fs.readFile(path.join(home, 'workspaces', ws, 'sessions', sessionId, 'events.jsonl'), 'utf8')).trim().split('\n')
++      .map((line) => JSON.parse(line) as { type: string; contextAfter?: { sources: { toolNames: string[]; child?: { definition: string } } } })
++      .findLast((event) => event.type === 'compaction/end')
++    expect(end?.contextAfter?.sources.child?.definition).toBe('explorer')
++    expect([...end!.contextAfter!.sources.toolNames].sort()).toEqual(['Glob', 'Grep', 'Read'])
+   })
+ })
+diff --git a/tests/web/server-compaction-effective.spec.ts b/tests/web/server-compaction-effective.spec.ts
+index f17afd1..6430cb5 100644
+--- a/tests/web/server-compaction-effective.spec.ts
++++ b/tests/web/server-compaction-effective.spec.ts
+@@ -3,20 +3,21 @@
+  * exact request of the last completed turn is captured, persisted, and one
+  * handoff summary replaces the old folding. Real server, real log on disk,
+  * scripted provider.
+  */
+ import { promises as fs } from 'node:fs'
+ import { tmpdir } from 'node:os'
+ import path from 'node:path'
+ import { afterAll, describe, expect, it, vi } from 'vitest'
+ import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
+ import { AttachmentStore } from '../../src/harness/attachments/store.ts'
++import { SystemPromptsStore } from '../../src/harness/prompts/store.ts'
+ import { ProviderError, type ModelCompletion, type ModelRequest, type StreamEvent } from '../../src/harness/llm/types.ts'
+ import type { HarnessLimits } from '../../src/harness/limits.ts'
+ import { COMPACTION_HANDOFF_MARKER } from '../../src/web/compaction-generator.ts'
+ 
+ const SUMMARY = 'EFFECTIVE HANDOFF SUMMARY'
+ const LEGACY_MARK = 'Primary Request and Intent'
+ const STOP: ModelCompletion = { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+ const joined = (request: ModelRequest): string => request.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('\n')
+ 
+ function provider(options: { replies?: readonly string[]; tool?: boolean } = {}): { provider: LlmProvider; requests: ModelRequest[] } {
+@@ -178,20 +179,85 @@ describe('compaction fails closed on an unverified fit, and on a context that ch
+       } finally { load.mockRestore() }
+     }
+     const unchanged = await run(false)
+     expect(unchanged.status).toBe(200)
+     expect(unchanged.ends.at(-1)!.error).toBeUndefined()
+     const changed = await run(true)
+     expect(changed.status).toBe(409)
+     expect(changed.body.error).toMatch(/context revision changed/)
+     expect(changed.ends.some((event) => event.error === undefined)).toBe(false)
+   })
++
++  it.each([
++    ['effective', true],
++    ['legacy', false],
++  ] as const)('%s: a failed prompt-overrides read is a measurement failure, never "context revision changed"', async (name, effective) => {
++    const { provider: llm } = provider()
++    const { home, base, wsId } = await start(llm, effective ? { compactionEffectiveEnabled: true } : {})
++    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
++    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
++    await completedMessage(base, wsId, id, logPath, 'first question', 1)
++    // An override is present: a failed read hashed as "no override" would look like a change.
++    expect((await fetch(`${base}/api/workspaces/${wsId}/system-prompts`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ base: 'CUSTOM BASE PROMPT' }) })).status).toBe(200)
++    let failures = 1
++    const original = SystemPromptsStore.prototype.load
++    const load = vi.spyOn(SystemPromptsStore.prototype, 'load').mockImplementation(function (this: SystemPromptsStore, ...args) {
++      if (failures-- > 0) return Promise.reject(new Error('prompts read failed'))
++      return original.apply(this, args)
++    })
++    try {
++      const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })
++      const body = await response.json() as { error?: string }
++      const ends = (await readLog(logPath)).filter((event) => event.type === 'compaction/end')
++      expect(String(body.error ?? '')).not.toMatch(/context revision changed/)
++      if (name === 'effective') {
++        expect(response.status).toBe(409)
++        expect(body.error).toMatch(/compaction fit not verified/)
++      } else {
++        expect(response.status).toBe(200)
++        expect(ends.at(-1)).toMatchObject({ contextEffect: 'replaced', measurement: { unavailableReason: 'preview-failed' } })
++      }
++    } finally { load.mockRestore() }
++  })
++
++  it.each([
++    ['effective', true, 0],
++    ['legacy', false, 1],
++  ] as const)('%s: a CLAUDE.md edit during the preview does not fail a mode that never reads workspace instructions', async (_name, effective, spared) => {
++    const { provider: llm } = provider()
++    const { home, base, wsId } = await start(llm, effective ? { compactionEffectiveEnabled: true } : {})
++    const quiet = ['---', 'name: Quiet', 'history: compact', 'workspaceInstructions: false', '---', '', 'No instructions.'].join('\n')
++    expect((await fetch(`${base}/api/workspaces/${wsId}/modes/quiet`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: quiet }) })).status).toBe(200)
++    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
++    expect((await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: 'quiet' }) })).status).toBe(200)
++    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
++    await exchangeWithAttachment(base, wsId, id, logPath)
++    let calls = 0
++    let release!: () => void
++    let entered!: () => void
++    const gate = new Promise<void>((resolve) => { release = resolve })
++    const waiting = new Promise<void>((resolve) => { entered = resolve })
++    const original = AttachmentStore.prototype.load
++    const load = vi.spyOn(AttachmentStore.prototype, 'load').mockImplementation(async function (this: AttachmentStore, ...args) {
++      if (calls++ >= spared) { entered(); await gate }
++      return original.apply(this, args)
++    })
++    try {
++      const pending = fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })
++      await waiting
++      await fs.writeFile(path.join(home, 'workspaces', wsId, 'CLAUDE.md'), 'EDITED WHILE PREVIEWING')
++      release()
++      const response = await pending
++      expect(response.status).toBe(200)
++      expect((await readLog(logPath)).filter((event) => event.type === 'compaction/end').at(-1)!.error).toBeUndefined()
++    } finally { load.mockRestore() }
++  })
+ })
+ 
+ describe('effective compaction through the web server', () => {
+   it('compacts with ONE handoff request instead of folding the transcript', async () => {
+     const { provider: llm, requests } = provider({ replies: ['answer one', 'answer two', 'answer three'] })
+     const { home, base, wsId } = await start(llm, { compactionEffectiveEnabled: true })
+     const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+     const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+     await completedMessage(base, wsId, id, logPath, 'first question', 1)
+     await completedMessage(base, wsId, id, logPath, 'second question', 2)

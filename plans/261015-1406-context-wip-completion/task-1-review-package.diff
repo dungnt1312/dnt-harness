@@ -1,0 +1,349 @@
+5b2f585 fix(context): persist settled usage, validate contextAfter, refresh on measurement
+
+ src/harness/context/context-state.ts    |  7 ++++++-
+ src/harness/llm/request-lifecycle.ts    |  9 +++++++--
+ src/harness/storage/events-jsonl.ts     |  5 +++++
+ tests/harness/attempt-events.spec.ts    | 11 +++++++++++
+ tests/harness/context-state.spec.ts     | 12 +++++++++++-
+ tests/harness/request-lifecycle.spec.ts | 23 +++++++++++++++++++++++
+ web/lib/manifest-refresh.spec.ts        | 16 ++++++++++++++++
+ web/lib/manifest-refresh.ts             | 15 ++++++++++++---
+ 8 files changed, 91 insertions(+), 7 deletions(-)
+
+diff --git a/src/harness/context/context-state.ts b/src/harness/context/context-state.ts
+index 6b062f8..556ed34 100644
+--- a/src/harness/context/context-state.ts
++++ b/src/harness/context/context-state.ts
+@@ -84,21 +84,26 @@ export function createContextReducer<M extends ManifestShape>(initialSessionId?:
+           continue
+         }
+         if (['model/attempt','execution/uncertain','execution/reconciled'].includes(event.type)) {
+           const f = event.fact
+           if (f === undefined || f.state === 'start' || !isValidContextId(f.contextId) || !isValidTokenUsage(f.usage) || f.attribution === undefined) continue
+           const entry = entries.get(f.contextId)
+           if (entry === undefined || (entry.turnId !== undefined && entry.turnId !== f.attribution.turnId)
+             || (entry.manifest.model !== undefined && f.model !== undefined && entry.manifest.model !== f.model)
+             || (entry.manifest.provider !== undefined && f.provider !== undefined && entry.manifest.provider !== f.provider)) continue
+           sessionId ??= f.attribution.sessionId
+-          if (f.attribution.sessionId !== sessionId || attempts.has(f.attemptId)) continue
++          if (f.attribution.sessionId !== sessionId) continue
++          const seen = attempts.get(f.attemptId)
++          if (seen !== undefined) {
++            if (JSON.stringify(seen) !== JSON.stringify(f.usage)) console.warn('conflicting usage for repeated attempt')
++            continue
++          }
+           attempts.set(f.attemptId,{...f.usage})
+           if (f.usage.cachedInputTokens !== undefined) {
+             cacheableInputTokens += f.usage.inputTokens; cachedInputTokens += f.usage.cachedInputTokens
+           }
+           entry.last = {...f.usage}; entry.view = requestView(entry); changed.add(f.contextId)
+           refreshCurrentTotals()
+           continue
+         }
+         if (event.type === 'compaction/end' && event.error === undefined && typeof event.summary === 'string' && event.summary.trim() !== ''
+           && event.coversSeq !== undefined && event.contextEffect !== 'unchanged'
+diff --git a/src/harness/llm/request-lifecycle.ts b/src/harness/llm/request-lifecycle.ts
+index 95eddb1..230c4e3 100644
+--- a/src/harness/llm/request-lifecycle.ts
++++ b/src/harness/llm/request-lifecycle.ts
+@@ -173,28 +173,30 @@ export async function* runAttempt(provider: { stream(request: ModelRequest, opti
+   let pending: Promise<IteratorResult<StreamEvent>> | undefined
+   let timer: ReturnType<typeof setTimeout> | undefined
+   let settled = false
+   let cleanupUnknown = false
+   let attemptFailed = false
+   let reconcile: (() => void) | undefined
+   let resolveSettlement!: () => void
+   const settlement = new Promise<void>(resolve => { resolveSettlement = resolve })
+   const onTransportSettled = (): void => { settled = true; resolveSettlement(); reconcile?.() }
+   let committed = false
++  let ended = false
+   let fact: AttemptFact | undefined
+   const queuedAt = Date.now()
+   let firstProgressAt: number | undefined
+   let lastProgressAt: number | undefined
+   let finish: AttemptFact['finish']
+   let usage: TokenUsage | undefined
+   const notify = async (state: AttemptFact['state'], reason?: ProviderError['reason']): Promise<void> => {
+     if (!fact) return
++    if (state === 'end') ended = true
+     const next: AttemptFact = { ...fact, state, committed, transportSettled: settled, ...(state !== 'start' ? { endedAt: Date.now(), ...(usage !== undefined ? { usage } : {}) } : {}), ...(firstProgressAt !== undefined ? { firstProgressAt } : {}), ...(lastProgressAt !== undefined ? { lastProgressAt } : {}), ...(finish ? { finish } : {}), ...(reason ? { reason } : {}) }
+     try { observer?.(next) } catch { /* optional telemetry cannot change execution */ }
+     await options.recordAttempt?.(next)
+   }
+   try {
+     ticket = await admission.acquire(controller.signal, options.priority !== undefined ? { priority: options.priority } : undefined)
+     const attempt = owner.consume()
+     fact = { ...(isValidContextId(request.contextId) ? { contextId: request.contextId } : {}), requestId: owner.id, attemptId: randomUUID(), attempt, state: 'start', committed, transportSettled: false, queuedAt, startedAt: Date.now(), ...(options.attribution ? { attribution: options.attribution } : {}), ...(options.provider ? { provider: options.provider.slice(0, 128) } : {}), ...(request.model ? { model: request.model.slice(0, 128) } : {}) }
+     await notify('start')
+     const arm = (ms: number, reason: 'first_progress_timeout' | 'idle_timeout'): void => {
+@@ -256,22 +258,25 @@ export async function* runAttempt(provider: { stream(request: ModelRequest, opti
+         await (options.signal ? raceSignal(waiting, options.signal) : waiting)
+       } catch { /* total deadline or Stop still prohibits retry */ }
+       finally { if (grace) clearTimeout(grace) }
+     }
+     error.transportSettled = settled
+     await notify('end', error.reason)
+     throw error
+   } finally {
+     if (timer) clearTimeout(timer)
+     owner.signal.removeEventListener('abort', abort); options.signal?.removeEventListener('abort', abort)
+-    if (settled || !iterator) ticket?.release()
+-    else if (fact && ticket) {
++    if (settled || !iterator) {
++      ticket?.release()
++      // Consumer return after the transport settled still owes the terminal fact (and its usage).
++      if (settled && iterator && !ended) await notify('end')
++    } else if (fact && ticket) {
+       controller.abort(failure('cancelled'))
+       const retained = { ...fact, ...(usage !== undefined ? { usage } : {}), state: 'uncertain' as const, committed, transportSettled: false }
+       admission.uncertain.set(fact.attemptId, retained)
+       // Callback ownership survives the driver and may reconcile exactly once.
+       const id = fact.attemptId
+       const ownedTicket = ticket
+       let released = false
+       reconcile = () => {
+         if (released) return
+         released = true; admission.uncertain.delete(id); ownedTicket.release()
+diff --git a/src/harness/storage/events-jsonl.ts b/src/harness/storage/events-jsonl.ts
+index b4f50d1..a6b476a 100644
+--- a/src/harness/storage/events-jsonl.ts
++++ b/src/harness/storage/events-jsonl.ts
+@@ -85,20 +85,25 @@ function validateRecord(parsed: unknown, filePath: string, lineNumber: number):
+ const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
+ const tokenCount = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0
+ 
+ /** Optional new metadata is strict; untouched legacy payloads retain their contract. */
+ function validCompactionMetrics(record: Record<string, unknown>): boolean {
+   const effect = record['contextEffect']
+   if (effect !== undefined && effect !== 'replaced' && effect !== 'unchanged') return false
+   const after = record['contextAfter']
+   if (after !== undefined) {
+     if (record['error'] !== undefined || effect === 'unchanged' || !object(after) || after['contextId'] !== undefined || after['usage'] !== undefined) return false
++    const strings = (v: unknown): boolean => Array.isArray(v) && v.every(item => typeof item === 'string')
++    const history = after['history']; const sources = after['sources']
++    if (typeof after['modeId'] !== 'string' || typeof after['modeRevision'] !== 'number'
++      || !object(history) || !['none', 'recent', 'compact'].includes(history['setting'] as string)
++      || !object(sources) || !strings(sources['toolNames']) || !strings(after['omissions'])) return false
+     const budget = after['budget']; const breakdown = after['breakdown']
+     if (!object(budget) || !object(breakdown) || budget['estimated'] !== true
+       || !tokenCount(budget['usedTokens']) || !tokenCount(budget['availableTokens'])
+       || !tokenCount(budget['contextLimitTokens']) || budget['contextLimitTokens'] === 0) return false
+     if (budget['preTrimTokens'] !== undefined && !tokenCount(budget['preTrimTokens'])) return false
+     const fields = ['systemPrompt','systemTools','mcpTools','metaContext','skills','messages']
+     if (!fields.every(key => tokenCount(breakdown[key]))) return false
+     if (fields.reduce((sum,key) => sum + (breakdown[key] as number),0) !== budget['usedTokens']) return false
+     if (record['tokensAfter'] !== undefined && record['tokensAfter'] !== budget['usedTokens']) return false
+   }
+diff --git a/tests/harness/attempt-events.spec.ts b/tests/harness/attempt-events.spec.ts
+index 7d26e9b..e61e54f 100644
+--- a/tests/harness/attempt-events.spec.ts
++++ b/tests/harness/attempt-events.spec.ts
+@@ -15,26 +15,37 @@ async function read(records: Record<string, unknown>[]) {
+     await fs.writeFile(file, records.map((record, index) => JSON.stringify({ v: 1, seq: index + 1, timestamp: 100 + index, ...record })).join('\n') + '\n')
+     return await readEventLog(file)
+   } finally { await fs.rm(dir, { recursive: true, force: true }) }
+ }
+ describe('canonical attempt event readers', () => {
+   it.each([
+     { ...manifest(), budget: { ...manifest().budget, usedTokens: -1 } },
+     { ...manifest(), breakdown: { ...manifest().breakdown, messages: 1 } },
+     { ...manifest('forbidden-request-id') },
+     { ...manifest(), usage: { last: { inputTokens: 1 } } },
++    (({ history: _history, ...rest }) => rest)(manifest()),
++    (({ sources: _sources, ...rest }) => rest)(manifest()),
++    { ...manifest(), history: { setting: 'bogus' } },
++    { ...manifest(), modeRevision: '1' },
++    { ...manifest(), omissions: [1] },
+   ])('rejects malformed post-compact estimates %#', async contextAfter => {
+     await expect(read([{ type: 'compaction/end', trigger: 'manual', coversSeq: 1,
+       summary: 'SUMMARY', summaryChars: 7, durationMs: 1, contextEffect: 'replaced', contextAfter,
+     }])).rejects.toMatchObject({ kind: 'schema' })
+   })
+ 
++  it('loads a full post-compact manifest and legacy compaction rows without one', async () => {
++    const base = { type: 'compaction/end', trigger: 'manual', coversSeq: 1, summary: 'SUMMARY', summaryChars: 7, durationMs: 1 }
++    expect((await read([{ ...base, contextEffect: 'replaced', contextAfter: manifest() }])).events).toHaveLength(1)
++    expect((await read([base])).events).toHaveLength(1)
++  })
++
+   it('rejects forged request context identities while preserving legacy manifest rows', async () => {
+     await expect(read([{ type: 'context/manifest', turnId: 't', manifest: { ...manifest(), contextId: '../bad' } }])).rejects.toMatchObject({ kind: 'schema' })
+     expect((await read([{ type: 'context/manifest', turnId: 't', manifest: manifest() }])).events).toHaveLength(1)
+   })
+ 
+   it('round-trips terminal context measurements without adding model history', async () => {
+     const usage = { inputTokens: 120_000, cachedInputTokens: 110_000, outputTokens: 2 }
+     const measured = { ...fact, state: 'end', transportSettled: true, contextId: 'ctx-1', usage }
+     const { events } = await read([{ type: 'model/attempt', fact: measured }])
+     expect(events[0]).toMatchObject({ fact: measured })
+diff --git a/tests/harness/context-state.spec.ts b/tests/harness/context-state.spec.ts
+index a79b35d..7011f78 100644
+--- a/tests/harness/context-state.spec.ts
++++ b/tests/harness/context-state.spec.ts
+@@ -1,11 +1,11 @@
+-import { describe, expect, it } from 'vitest'
++import { describe, expect, it, vi } from 'vitest'
+ import * as accounting from '../../src/harness/context/context-state.ts'
+ import type { ContextManifest } from '../../src/harness/context/builder.ts'
+ import { manifest, row, attempt } from '../fixtures/context-accounting.ts'
+ 
+ const assembled = (seq: number, id?: string) => row(seq, { type: 'context/manifest', turnId: 't', manifest: manifest(id) })
+ const compact = (seq: number, extra: Record<string, unknown> = {}) => row(seq, {
+   type: 'compaction/end', trigger: 'manual', coversSeq: 1, summary: 'SUMMARY', summaryChars: 7, durationMs: 1,
+   contextEffect: 'replaced', contextAfter: manifest(), ...extra,
+ })
+ const usage = { inputTokens: 120_000, cachedInputTokens: 110_000 }
+@@ -55,20 +55,30 @@ describe('request-scoped context state', () => {
+   })
+   it('handles unreported cache separately, retains identity on chunks and matches replay', () => {
+     const events = [assembled(1, 'a'), attempt(2, 'a', 'p1', { inputTokens: 500 })]
+     const r = accounting.createContextReducer<ContextManifest>('s')
+     r.apply(events); const before = r.current()
+     expect(before?.usage).toMatchObject({ last: { inputTokens: 500 }, cacheableInputTokens: 0, cachedInputTokens: 0 })
+     expect(r.apply([row(3, { type: 'assistant/chunk', delta: 'x' })])).toEqual([])
+     expect(r.current()).toBe(before)
+     expect(accounting.deriveContextState(events, 's')).toEqual(before)
+   })
++  it('keeps the first report for a repeated attemptId with different usage and warns statically', () => {
++    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
++    try {
++      const r = accounting.createContextReducer<ContextManifest>('s')
++      r.apply([assembled(1, 'a'), attempt(2, 'a', 'p1', usage), attempt(3, 'a', 'p1', { inputTokens: 1, cachedInputTokens: 0 }, 'reconciled')])
++      expect(r.current()?.usage).toMatchObject({ last: usage, cacheableInputTokens: 120_000, cachedInputTokens: 110_000 })
++      expect(warn).toHaveBeenCalledTimes(1)
++      expect(warn).toHaveBeenCalledWith('conflicting usage for repeated attempt')
++    } finally { warn.mockRestore() }
++  })
+   it('pins optional session identity and keeps legacy manifests estimated', () => {
+     const r = accounting.createContextReducer<ContextManifest>()
+     r.apply([assembled(1, 'a'), attempt(2, 'a', 'p1', usage)])
+     expect(r.request('a')?.usage?.last).toEqual(usage)
+     r.apply([assembled(3)])
+     const current = r.current()!
+     expect(accounting.isAvailableContext(current) && current.contextId).toBeUndefined()
+     expect(accounting.isAvailableContext(current) && current.usage?.last).toBeUndefined()
+   })
+ })
+diff --git a/tests/harness/request-lifecycle.spec.ts b/tests/harness/request-lifecycle.spec.ts
+index 2657368..c988bf5 100644
+--- a/tests/harness/request-lifecycle.spec.ts
++++ b/tests/harness/request-lifecycle.spec.ts
+@@ -72,20 +72,43 @@ describe('context accounting attempt usage', () => {
+     try {
+       await iterator.next()
+       await iterator.return?.()
+       await vi.waitFor(() => expect(admission.active).toBe(0))
+       const terminal = facts.filter(f => f.state !== 'start')
+       expect(terminal.map(f => f.state)).toEqual(['uncertain', 'reconciled'])
+       expect(new Set(terminal.map(f => f.attemptId)).size).toBe(1)
+       for (const fact of terminal) expect(fact).toMatchObject({ contextId: 'ctx-return', usage })
+     } finally { owner.dispose() }
+   })
++
++  it('records one terminal fact with usage when the consumer returns after transport settled', async () => {
++    const facts: import('../../src/harness/llm/request-lifecycle.ts').AttemptFact[] = []
++    const owner = new LogicalRequest()
++    const admission = new AttemptAdmission(1)
++    const usage = { inputTokens: 10, cachedInputTokens: 4 }
++    const iterator = runAttempt({ async *stream(_request: unknown, options?: StreamOptions) {
++      options?.onTransportSettled?.()
++      yield { type: 'usage', usage } as const
++      yield completion
++    } }, { messages: [], contextId: 'ctx-settled' }, {
++      owner, admission, recordAttempt: async fact => { facts.push(fact) },
++    })[Symbol.asyncIterator]()
++    try {
++      expect((await iterator.next()).value).toMatchObject({ type: 'usage' })
++      await iterator.return?.()
++      expect(admission.active).toBe(0)
++      const terminal = facts.filter(f => f.state !== 'start')
++      expect(terminal).toHaveLength(1)
++      expect(terminal[0]).toMatchObject({ state: 'end', contextId: 'ctx-settled', usage, transportSettled: true })
++      expect(facts.some(f => f.state === 'uncertain')).toBe(false)
++    } finally { owner.dispose() }
++  })
+ })
+ 
+ describe('aggregate request lifecycle', () => {
+   it('fences a retained session across reload even with spare provider capacity', async () => {
+     const kernel = new Kernel()
+     kernel.ctx.plugin(LlmService)
+     let settle!: (value: IteratorResult<StreamEvent>) => void
+     let starts = 0
+     kernel.ctx.llm.register({ name: 'shared', stream: () => {
+       starts++
+diff --git a/web/lib/manifest-refresh.spec.ts b/web/lib/manifest-refresh.spec.ts
+index 4ade7f3..03c454c 100644
+--- a/web/lib/manifest-refresh.spec.ts
++++ b/web/lib/manifest-refresh.spec.ts
+@@ -8,16 +8,32 @@ it('ignores streaming chunks but changes on request, step and turn boundaries or
+   // The manifest lands when the request is assembled, before any answer text.
+   expect(manifestRefreshKey([...running, { seq: 5, type: 'context/manifest' }], 0)).not.toBe(manifestRefreshKey(running, 0))
+   expect(manifestRefreshKey([...running, { seq: 5, type: 'step/end' }], 0)).not.toBe(manifestRefreshKey(running, 0))
+   expect(manifestRefreshKey([...running, { seq: 5, type: 'step/abandoned' }], 0)).not.toBe(manifestRefreshKey(running, 0))
+   expect(manifestRefreshKey([...running, { seq: 5, type: 'turn/end' }], 0)).not.toBe(manifestRefreshKey(running, 0))
+   // Automatic compaction shrinks the window with no request or turn boundary.
+   expect(manifestRefreshKey([...running, { seq: 5, type: 'compaction/end' }], 0)).not.toBe(manifestRefreshKey(running, 0))
+   expect(manifestRefreshKey(running, 1)).not.toBe(manifestRefreshKey(running, 0))
+ })
+ 
++it('advances on a terminal measured attempt but not on start, usage-less attempts or chunks', () => {
++  const fact = { requestId: 'r', attemptId: 'a', attempt: 1, committed: false, transportSettled: true, contextId: 'ctx-1' } as const
++  const usage = { inputTokens: 10, cachedInputTokens: 4 }
++  const manifestEvent = { seq: 1, type: 'context/manifest' }
++  const terminalWithUsage = { seq: 3, type: 'model/attempt', fact: { ...fact, state: 'end', usage } } as const
++  const attemptStart = { seq: 2, type: 'model/attempt', fact: { ...fact, state: 'start' } } as const
++  const assistantChunk = { seq: 4, type: 'assistant/chunk' }
++  expect(manifestRefreshKey([manifestEvent, terminalWithUsage], 0)).toBe(`${terminalWithUsage.seq}:0`)
++  expect(manifestRefreshKey([manifestEvent, attemptStart, assistantChunk], 0)).toBe(`${manifestEvent.seq}:0`)
++  expect(manifestRefreshKey([manifestEvent, { seq: 5, type: 'model/attempt', fact: { ...fact, state: 'end' } }], 0)).toBe(`1:0`)
++  for (const [type, state] of [['execution/uncertain', 'uncertain'], ['execution/reconciled', 'reconciled']] as const) {
++    expect(manifestRefreshKey([manifestEvent, { seq: 6, type, fact: { ...fact, state, usage } }], 0)).toBe('6:0')
++  }
++  expect(manifestRefreshKey([manifestEvent, { seq: 7, type: 'model/attempt', fact: { ...fact, state: 'end', usage: { inputTokens: -1 } } }], 0)).toBe('1:0')
++})
++
+ it('formats the before/after token change only when it was measured', () => {
+   expect(compactionTokenChange({ tokensBefore: 139_200, tokensAfter: 42_000 })).toBe('139k → 42k tokens')
+   expect(compactionTokenChange({ tokensBefore: 900, tokensAfter: 12_300 })).toBe('900 → 12.3k tokens')
+   expect(compactionTokenChange({})).toBeUndefined()
+   expect(compactionTokenChange({ tokensBefore: 10 })).toBeUndefined()
+ })
+diff --git a/web/lib/manifest-refresh.ts b/web/lib/manifest-refresh.ts
+index a3c9538..50b536f 100644
+--- a/web/lib/manifest-refresh.ts
++++ b/web/lib/manifest-refresh.ts
+@@ -1,20 +1,29 @@
++import { isValidContextId, isValidTokenUsage } from '../../src/harness/context/context-metrics.ts'
+ import type { SseEvent } from './types.ts'
+ 
+ /**
+  * Events that change what the context meter shows. `context/manifest` is
+  * recorded the moment a request is assembled, before the model answers, so the
+  * meter fills as soon as the user sends. `step/end`/`step/abandoned` mark the
+  * point where the provider has reported that request's real prompt count, and
+  * `turn/end` closes the turn. `compaction/end` shrinks the window without any
+  * request, so automatic compaction refreshes the meter too. Streaming chunks never change the key.
+  */
+ const REFRESH_TYPES: ReadonlySet<string> = new Set(['context/manifest', 'step/end', 'step/abandoned', 'turn/end', 'compaction/end'])
++const ATTEMPT_TYPES: ReadonlySet<string> = new Set(['model/attempt', 'execution/uncertain', 'execution/reconciled'])
+ 
+-/** Last request/step/turn boundary plus explicit compaction, not streaming token count. */
+-export function manifestRefreshKey(events: readonly Pick<SseEvent, 'seq' | 'type'>[], compactNonce: number): string {
++/** A terminal attempt fact that carries a valid measurement for a known request. */
++const isMeasurement = (event: Pick<SseEvent, 'type' | 'fact'>): boolean => {
++  const fact = event.fact
++  return ATTEMPT_TYPES.has(event.type) && fact !== undefined && fact.state !== 'start'
++    && isValidContextId(fact.contextId) && isValidTokenUsage(fact.usage)
++}
++
++/** Last request/step/turn boundary, measurement or explicit compaction, not streaming token count. */
++export function manifestRefreshKey(events: readonly Pick<SseEvent, 'seq' | 'type' | 'fact'>[], compactNonce: number): string {
+   for (let index = events.length - 1; index >= 0; index--) {
+     const event = events[index]
+-    if (event !== undefined && REFRESH_TYPES.has(event.type)) return `${event.seq}:${compactNonce}`
++    if (event !== undefined && (REFRESH_TYPES.has(event.type) || isMeasurement(event))) return `${event.seq}:${compactNonce}`
+   }
+   return `0:${compactNonce}`
+ }
