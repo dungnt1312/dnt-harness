@@ -1,4 +1,5 @@
 import { estimateContentTokens, estimateTokens, schemaCost } from '../harness/context/budget.ts'
+import { calibrated } from '../harness/context/calibration.ts'
 import { MAX_COMPACTION_SUMMARY_CHARS } from '../harness/context/compaction.ts'
 import type { EffectiveCompactionSnapshot, SnapshotIdentity } from '../harness/context/compaction-snapshot.ts'
 import { validateCompletion } from '../harness/llm/completion.ts'
@@ -190,10 +191,11 @@ export function estimateSnapshotTokens(snapshot: EffectiveCompactionSnapshot, pa
   }
   if (path === 'reconstructed') {
     // The context builder just sized this very request with its own estimator and fitted it to
-    // the budget; a margin on top would refuse what the builder itself accepted.
+    // the budget; a margin on top would refuse what the builder itself accepted. Its calibration
+    // ratio (the provider's count over the estimate) still applies, as it did in the builder.
     const history = [...snapshot.request.messages, snapshot.finalAnswer]
       .reduce((total, message) => total + estimateContentTokens(message.content) + (message.toolCalls !== undefined ? estimateTokens(JSON.stringify(message.toolCalls)) : 0), 0)
-    return { tokens: history + schemaCost(snapshot.request.tools ?? []) + estimateTokens(HANDOFF_INSTRUCTION), basis: 'estimated' }
+    return { tokens: calibrated(history + schemaCost(snapshot.request.tools ?? []) + estimateTokens(HANDOFF_INSTRUCTION), snapshot.estimateRatio ?? 1), basis: 'estimated' }
   }
   const prefix = snapshot.request.messages.reduce((total, message) => total + messageChars(message), 0) + JSON.stringify(snapshot.request.tools ?? []).length
   return { tokens: Math.ceil((charsToTokens(prefix) + added) * UNMEASURED_MARGIN), basis: 'estimated' }

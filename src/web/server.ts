@@ -1718,6 +1718,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         projection: { ...assembled.compactionProjection, sources: assembled.compactionProjection.sources.slice(0, -1) },
         finalAnswer: { role: 'assistant', content: found.answer.content },
         identity: compactionIdentity(entry, requestPrefixHash(withoutAnswer)),
+        // The prefix's newest provider measurement calibrated this assembly; the fit check reuses it.
+        ...(assembled.manifest.budget.measured?.ratio !== undefined ? { estimateRatio: assembled.manifest.budget.measured.ratio } : {}),
       })
     } catch {
       return undefined

@@ -753,7 +753,8 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
     const compacted = microcompactToolResults(dated, resultBySeq)
     if (compacted !== undefined) {
       const after = fixedCost() + historyCostOf(compacted.dated, historyStart)
-      if (used - after >= MICROCOMPACT_MIN_SAVINGS_TOKENS) {
+      // Savings at the same calibrated scale as the pressure that triggered the clear.
+      if (calibrated(used, ratio) - calibrated(after, ratio) >= MICROCOMPACT_MIN_SAVINGS_TOKENS) {
         dated = compacted.dated
         used = after
         losses.push(...compacted.losses)

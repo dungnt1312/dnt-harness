@@ -52,6 +52,9 @@ import { MemoryService } from '../harness/memory/service.ts'
 import { memoryRoots, memoryGuidance, memoryGuidanceAccess, memoryIndexes } from '../harness/memory/context.ts'
 import { ModesService, DEFAULT_MODE_ID } from '../harness/modes/service.ts'
 import { buildContext } from '../harness/context/builder.ts'
+import { latestCalibration } from '../harness/context/calibration.ts'
+import { agentScope } from '../harness/agent/scope.ts'
+import { randomUUID } from 'node:crypto'
 import { renderEnvironmentContext } from '../harness/context/environment.ts'
 import { DEFAULT_BUDGET } from '../harness/context/budget.ts'
 import { resolvePermission } from '../harness/approval/resolution.ts'
@@ -253,15 +256,22 @@ async function main(): Promise<void> {
       nodeVersion: process.version,
       workspacePath: canonicalRoot,
     })
+    // The provider's last report calibrates the budget, as in the web host.
+    const calibration = latestCalibration(session.events, { model: projected.model, provider: projected.providerName })
     const assembled = buildContext({
       events: session.events, mode, modeRevision: 0,
       model: projected.model, providerName: projected.providerName,
       schemas, activeSkills: [], pinnedMemory, budget: DEFAULT_BUDGET,
       ...(environment !== undefined ? { environment } : {}),
       ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
+      ...(calibration !== undefined ? { calibration } : {}),
       fileScope: { primary: canonicalRoot, additional: roots.map((folder) => ({ path: folder, access: memoryAccess })), outsideAsks: !yolo },
     })
-    return next({ ...projected, messages: assembled.messages, tools: schemas })
+    // Calibration pairs a provider report with its manifest by contextId, so the request carries one and its manifest is logged.
+    const contextId = randomUUID()
+    const turnId = agentScope.getStore()?.turnId
+    if (turnId !== undefined) session.append({ type: 'context/manifest', turnId, manifest: { ...assembled.manifest, contextId } })
+    return next({ ...projected, contextId, messages: assembled.messages, tools: schemas })
   }, true)
 
   /** Durably accept one input, adopt anything still pending, then run. */

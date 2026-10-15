@@ -157,6 +157,17 @@ describe('buildContext calibration (AC-3, AC-4)', () => {
     expect(next.manifest.omissions.some((line) => line.startsWith('tool-results:'))).toBe(true)
   })
 
+  it('microcompact weighs its savings at the calibrated size, like the pressure that triggered it', () => {
+    const events = longRun(builder.MICROCOMPACT_KEEP_RECENT + 1, 600) // one clearable result, ~170 estimated tokens
+    const used = builder.buildContext(inputOf(events)).manifest.budget.usedTokens
+    const limitFor = (available: number) => ({ ...DEFAULT_BUDGET, contextLimitTokens: Math.ceil(available) + DEFAULT_BUDGET.outputReserveTokens + DEFAULT_BUDGET.marginTokens })
+    const cleared = (built: ReturnType<typeof builder.buildContext>) => built.manifest.omissions.some((line) => line.startsWith('tool-results:'))
+    // Under pressure (used ≈ 0.9 × available) but the pure saving is below the minimum: kept.
+    expect(cleared(builder.buildContext(inputOf(events, { budget: limitFor(used / 0.9) })))).toBe(false)
+    // The same request at a 2.5× ratio: the same clear frees 2.5× the tokens, over the minimum.
+    expect(cleared(builder.buildContext(inputOf(events, { budget: limitFor(used * 2.5 / 0.9), calibration: calibrationOf(25_000, 10_000) })))).toBe(true)
+  })
+
   // Review I1: squeeze shrinks the window; a ratio shrinks with it, an absolute offset could exceed it outright.
   it('a squeezed retry still assembles under a large ratio', () => {
     const events = turns(4, 3_000)

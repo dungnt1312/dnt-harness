@@ -701,6 +701,43 @@ describe('effective compaction through the web server', () => {
     expect(String(sent[0]!.messages.at(-1)!.content)).toContain(COMPACTION_HANDOFF_MARKER)
   })
 
+  it('a rebuilt request is sized at the provider-calibrated count: one the window cannot take is folded, not sent', async () => {
+    const WINDOW = 60_000
+    const requests: ModelRequest[] = []
+    // Only the big request is measured, at well above its chars/3 estimate (~30k): the window minus room for the answer is 52k.
+    const llm: LlmProvider = {
+      name: 'scripted',
+      models: ['scripted'],
+      stream(request) {
+        requests.push(request)
+        const text = joined(request)
+        const reply = text.includes(COMPACTION_HANDOFF_MARKER) ? SUMMARY : text.includes(LEGACY_MARK) ? 'LEGACY SUMMARY' : 'answer'
+        return (async function* (): AsyncIterable<StreamEvent> {
+          yield { type: 'delta', delta: reply }
+          if (text.length > 60_000 && !text.includes(COMPACTION_HANDOFF_MARKER) && !text.includes(LEGACY_MARK)) yield { type: 'usage', usage: { inputTokens: 53_000, outputTokens: 5 } }
+          yield STOP
+        })()
+      },
+    }
+    const home = await configuredHome(WINDOW)
+    const first = await start(llm, {}, home)
+    const { id } = await (await fetch(`${first.base}/api/workspaces/${first.wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const logPath = path.join(home, 'workspaces', first.wsId, 'sessions', id, 'events.jsonl')
+    await completedMessage(first.base, first.wsId, id, logPath, 'hello', 1)
+    await completedMessage(first.base, first.wsId, id, logPath, 'w'.repeat(84_000), 2)
+    await first.server.close()
+    homes.delete(first.server)
+
+    // No capture exists (rollout switch was off): the request is rebuilt from the log. Its pure
+    // estimate fits the window with the answer's room; calibrated by the measured ratio it does not.
+    const second = await start(llm, { compactionEffectiveEnabled: true }, home)
+    const calls = requests.length
+    const response = await fetch(`${second.base}/api/workspaces/${second.wsId}/sessions/${id}/compact`, { method: 'POST' })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ path: 'recovery' })
+    expect(requests.slice(calls).some((request) => joined(request).includes(COMPACTION_HANDOFF_MARKER))).toBe(false)
+  })
+
   it('the capture is the dispatched request: session controls stamped, no tools in a zero-tool mode', async () => {
     const seen: ModelRequest[] = []
     const make = (name: string, model: string): LlmProvider => ({

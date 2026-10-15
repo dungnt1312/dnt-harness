@@ -803,7 +803,10 @@ runs and the behavior above is unchanged.
   last turn was stopped, the mode or grants changed since) — a snapshot **rebuilt from
   the committed log** (`path: "reconstructed"`, one request). The rebuild runs the
   ordinary request assembly with `sideEffects: false` (`reconstructFromLog` in
-  `server.ts`); its cutoff is the newest clean `completed` turn after the standing
+  `server.ts`), calibrated by the prefix's newest provider measurement; the snapshot
+  carries that ratio (`estimateRatio`) so the window fit check sizes the rebuilt
+  request at the provider's scale and folds one the window cannot take. Its cutoff
+  is the newest clean `completed` turn after the standing
   checkpoint (`reconstructionCutoff`), so later turns, e.g. a stopped one, stay
   verbatim. Only if that fails (a dropped uncovered turn, an unsafe loss, a budget
   error) does the host fall back to the transcript fold (`path: "recovery"`).
