@@ -1491,6 +1491,10 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         if (window !== undefined && now > window - limits.compactionOutputTokens) return 'no-fit'
         return undefined
       },
+      nativeVision: (sessionId) => {
+        const entry = sessions.get(sessionId as SessionId)
+        return entry === undefined ? false : compactionVisionOf(entry)
+      },
       limits,
       recordUsage: (sessionId, usage) => {
         const entry = sessions.get(sessionId as SessionId)

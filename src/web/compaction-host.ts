@@ -44,6 +44,17 @@ function retarget(snapshot: EffectiveCompactionSnapshot, now: SnapshotIdentity):
   }
 }
 
+/**
+ * The handoff as it is sent: retargeted to `now`, and without image parts for a text-only
+ * target (the handoff runs no tools, so the fallback must not point at one). The stored
+ * snapshot is untouched. Shared by the foreground host and the background candidates.
+ */
+export function handoffSnapshot(snapshot: EffectiveCompactionSnapshot, now: SnapshotIdentity, nativeVision: boolean): EffectiveCompactionSnapshot {
+  const retargeted = retarget(snapshot, now)
+  return nativeVision ? retargeted
+    : { ...retargeted, request: { ...retargeted.request, messages: textOnlyVisionFallback(retargeted.request.messages, false) } }
+}
+
 function hasOpenTurn(events: readonly SessionEvent[]): boolean {
   let open = false
   for (const event of events) {
@@ -187,10 +198,7 @@ export class CompactionHost {
     // the user is never asked to pick a path.
     if (choice.kind === 'fold') return this.legacy(request, signal, 'recovery')
 
-    const retargeted = retarget(choice.snapshot, now)
-    // The handoff runs no tools, so the fallback must not point at one. The stored snapshot is untouched.
-    const snapshot = deps.nativeVision() ? retargeted
-      : { ...retargeted, request: { ...retargeted.request, messages: textOnlyVisionFallback(retargeted.request.messages, false) } }
+    const snapshot = handoffSnapshot(choice.snapshot, now, deps.nativeVision())
     const { path } = choice
     // A snapshot the current model's window cannot take with room for its answer (a switch to a
     // smaller model, a request that grew to the limit) is folded in pieces instead of failing.

@@ -21,6 +21,7 @@ import type { EffectiveCompactionSnapshot, SnapshotIdentity } from '../harness/c
 import type { HarnessLimits } from '../harness/limits.ts'
 import { ProviderError, type ModelRequest, type StreamEvent, type StreamOptions, type TokenUsage } from '../harness/llm/types.ts'
 import { generateCompaction, type PreparedSummary } from './compaction-generator.ts'
+import { handoffSnapshot } from './compaction-host.ts'
 
 export type CandidateReport =
   | { readonly kind: 'started'; readonly sessionId: string; readonly snapshotId: string; readonly cutoff: number }
@@ -45,6 +46,8 @@ export interface PrecomputeDeps {
    * next request would not fit, `no-gain` when it saves less than the minimum.
    */
   readonly assess: (sessionId: string, prepared: PreparedSummary) => 'no-gain' | 'no-fit' | undefined
+  /** Whether the session's model sees image pixels; a text-only one gets the handoff without images. */
+  readonly nativeVision: (sessionId: string) => boolean
   readonly limits: Pick<HarnessLimits, 'compactionDeadlineMs' | 'compactionOutputTokens'>
   /** Usage the provider reported for one candidate attempt, attributed to the session it served. */
   readonly recordUsage: (sessionId: string, usage: TokenUsage) => void
@@ -137,7 +140,9 @@ export class CompactionPrecompute {
     const { snapshot } = job
     const sessionId = snapshot.sessionId
     try {
-      const prepared = await generateCompaction(snapshot, {
+      // A capture from a slash-command turn names the command's model; the summary, its checkpoint,
+      // usage and fit check all belong to the session pair the identity names, as in the foreground.
+      const prepared = await generateCompaction(handoffSnapshot(snapshot, snapshot.identity, this.deps.nativeVision(sessionId)), {
         stream: (request, options) => this.deps.stream(request, {
           ...options,
           admissionPriority: 'low',

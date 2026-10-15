@@ -86,6 +86,7 @@ describe('slash command model (AC-13, AC-20)', () => {
     const { base, home } = await start([recorder(requests)], { compactionEffectiveEnabled: true })
     const workspaceId = await firstWorkspace(base)
     await put(base, `/api/workspaces/${workspaceId}/model`, { provider: 'alpha', model: 'gpt-5.6' })
+    expect((await put(base, `/api/workspaces/${workspaceId}/thinking`, { level: 'high' })).status).toBe(200)
     await command(home, workspaceId, 'small', 'glm-4.7')
     await command(home, workspaceId, 'broken', 'no-such-model')
     const run = async (content: string): Promise<{ manifest: { model: string; provider: string; budget: { contextLimitTokens: number } }; capture: ModelRequest }> => {
@@ -99,11 +100,14 @@ describe('slash command model (AC-13, AC-20)', () => {
     expect(requests.at(-1)).toMatchObject({ providerName: 'alpha', model: 'glm-4.7' })
     expect(small.manifest).toMatchObject({ provider: 'alpha', model: 'glm-4.7', budget: { contextLimitTokens: 200_000 } })
     expect(small.capture).toMatchObject({ providerName: 'alpha', model: 'glm-4.7' })
+    expect(requests.at(-1)!.thinkingLevel).toBe('high')
+    expect(small.capture.thinkingLevel).toBe(requests.at(-1)!.thinkingLevel)
 
     const broken = await run('/broken hi')
     expect(requests.at(-1)).toMatchObject({ providerName: 'alpha', model: 'gpt-5.6' })
     expect(broken.manifest).toMatchObject({ provider: 'alpha', model: 'gpt-5.6', budget: { contextLimitTokens: 1_048_576 } })
     expect(broken.capture).toMatchObject({ providerName: 'alpha', model: 'gpt-5.6' })
+    expect(broken.capture.thinkingLevel).toBe(requests.at(-1)!.thinkingLevel)
   })
 
   it('a reconstruction while a command grant is active builds for the session model, not the command model', async () => {

@@ -547,7 +547,7 @@ describe('effective compaction through the web server', () => {
     const snapshotOf = async (modeId?: string): Promise<{ request: ModelRequest }> => {
       const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
       const route = `${base}/api/workspaces/${wsId}/sessions/${id}`
-      expect((await fetch(`${route}/model`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ provider: 'beta', model: 'b1' }) })).status).toBe(200)
+      expect((await fetch(`${route}/model`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ provider: 'beta', model: 'b1', thinkingLevel: 'high' }) })).status).toBe(200)
       if (modeId !== undefined) expect((await fetch(`${route}/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId }) })).status).toBe(200)
       const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
       await completedMessage(base, wsId, id, logPath, 'question', 1)
@@ -559,6 +559,8 @@ describe('effective compaction through the web server', () => {
     const tooled = await snapshotOf()
     expect(tooled.request).toMatchObject({ model: 'b1', providerName: 'beta' })
     expect(seen.at(-1)).toMatchObject({ model: 'b1', providerName: 'beta' })
+    expect(seen.at(-1)!.thinkingLevel).toBe('high')
+    expect(tooled.request.thinkingLevel).toBe(seen.at(-1)!.thinkingLevel)
     expect(tooled.request.tools).toEqual(seen.at(-1)!.tools)
     const bare = await snapshotOf('zero')
     expect(bare.request).toMatchObject({ model: 'b1', providerName: 'beta' })

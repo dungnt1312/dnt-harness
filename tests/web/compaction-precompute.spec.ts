@@ -81,6 +81,7 @@ function rig(mode: Parameters<typeof controlled>[0] = {}, over: Partial<Construc
     digestAt: () => state.digest,
     transportUncertain: () => state.stillUncertain,
     assess: () => state.assessment,
+    nativeVision: () => true,
     limits: { compactionDeadlineMs: 5_000, compactionOutputTokens: 8_000 },
     recordUsage: (_sessionId, u) => usage.push(u),
     report: (r) => reports.push(r),
@@ -151,6 +152,33 @@ describe('CompactionPrecompute: one job per session', () => {
     expect(call.options?.admissionPriority).toBe('low')
     expect(call.request.maxOutputTokens).toBe(8_000)
     call.finish()
+  })
+
+  it('summarises with the identity pair, not the model the capture was dispatched to (a slash-command turn)', async () => {
+    const r = rig()
+    const session = { ...identity, provider: 'alpha', model: 'gpt-5.6', thinkingLevel: 'high' }
+    r.manager.start(snapshot({ identity: session, request: { model: 'glm-4.7', providerName: 'alpha', thinkingLevel: 'low', messages: [{ role: 'user', content: 'first' }] } }), signal())
+    await vi.waitFor(() => expect(r.s.calls).toHaveLength(1))
+    expect(r.s.calls[0]!.request).toMatchObject({ providerName: 'alpha', model: 'gpt-5.6', thinkingLevel: 'high' })
+    r.s.calls[0]!.finish()
+  })
+
+  it('a non-native identity model receives no image parts; the stored snapshot is untouched', async () => {
+    const image = { role: 'user' as const, content: [{ type: 'text' as const, text: 'look' }, { type: 'image' as const, mediaType: 'image/png', base64: 'AAAA' }] }
+    const stored = snapshot({ request: { model: 'm', providerName: 'p', messages: [{ role: 'system', content: 'sys' }, image] } })
+    const text = rig({}, { nativeVision: () => false })
+    text.manager.start(stored, signal())
+    await vi.waitFor(() => expect(text.s.calls).toHaveLength(1))
+    const sent = JSON.stringify(text.s.calls[0]!.request.messages)
+    expect(sent).not.toContain('"type":"image"')
+    expect(sent).toContain('cannot see image pixels')
+    expect(stored.request.messages[1]).toBe(image)
+    text.s.calls[0]!.finish()
+    const native = rig({}, { nativeVision: () => true })
+    native.manager.start(stored, signal())
+    await vi.waitFor(() => expect(native.s.calls).toHaveLength(1))
+    expect(native.s.calls[0]!.request.messages[1]).toEqual(image)
+    native.s.calls[0]!.finish()
   })
 
   it('runs on an owner of its own: attributing it to the session would fence the very next chat turn', async () => {
