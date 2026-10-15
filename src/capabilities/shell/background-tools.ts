@@ -58,7 +58,7 @@ export function killShellTool(options: { readonly processes: ProcessRegistry }):
     parameters: {
       type: 'object',
       properties: {
-        processId: { type: 'string', description: 'the process id returned by Bash run_in_background' },
+        processId: { type: 'string', description: 'the process id returned by Bash, including a command that moved to the background automatically' },
       },
       required: ['processId'],
     },

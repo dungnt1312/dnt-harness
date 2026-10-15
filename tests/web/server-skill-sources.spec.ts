@@ -356,11 +356,13 @@ async function readAllEvents(base: string, wsId: string, sessionId: string): Pro
 describe('Skill tool with project layers', () => {
   it('catalog and load resolve project-layer skills for a bound session', async () => {
     const seen: string[] = []
+    const skillDescriptions: string[] = []
     let step = 0
     const provider: LlmProvider = {
       name: 'scripted', models: ['scripted'],
       async *stream(request) {
         seen.push(request.messages.map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content)).join('\n'))
+        skillDescriptions.push(request.tools?.find((tool) => tool.name === 'Skill')?.description ?? '')
         step += 1
         if (step === 1) {
           yield { type: 'toolCalls' as const, calls: [{ id: 'c1', name: 'Skill', args: { action: 'catalog' } }] }
@@ -396,6 +398,7 @@ describe('Skill tool with project layers', () => {
     expect(results[1]?.output).toContain("skill 'proj-skill' loaded")
     expect(seen[0]).toContain(path.join(home, 'workspaces', wsId, 'skills'))
     expect(seen[0]).toContain('These locations are not filesystem grants')
+    expect(skillDescriptions[0]).toContain("may already be listed in your context; if the list is missing or trimmed, call action:'catalog'")
   })
 
   it("a child definition's skills preload through the rule layers (project folder included)", async () => {
