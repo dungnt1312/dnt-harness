@@ -111,7 +111,10 @@ export type SessionEvent =
   | ({ readonly type: 'session/grants'; readonly revision: number; readonly roots: readonly SessionGrant[]; readonly approvalId?: string } & SessionEventStamp)
   // Child records: writers emit `brief`; `objective` is the legacy field older
   // logs carry, so readers take `brief ?? objective`. The inherit audit fields
-  // record how much parent context a child received — never the text itself.
+  // record how much parent context a child received.
+  // The pinned snapshot (`instructions` … `inheritedContext`) is what a resume
+  // rebuilds the child from — never the role file as it reads today. Logs
+  // written before it carry no `toolCeiling` and cannot be resumed.
   | ({
       readonly type: 'session/child-meta'
       readonly parentSessionId: string
@@ -123,6 +126,12 @@ export type SessionEvent =
       readonly inherit?: 'none' | 'brief'
       readonly inheritedHash?: string
       readonly inheritedChars?: number
+      readonly instructions?: string
+      readonly definitionSource?: 'bundled' | 'user' | 'plugin' | 'workspace' | 'project'
+      readonly toolCeiling?: readonly string[]
+      readonly skills?: readonly string[]
+      readonly grants?: readonly { readonly path: string; readonly access: 'read' | 'write' }[]
+      readonly inheritedContext?: string
     } & SessionEventStamp)
   // A root running as an agent role (automations): the pinned role snapshot
   // its agent is rebuilt from. Written once, before the first turn.
@@ -135,6 +144,11 @@ export type SessionEvent =
       readonly skills?: readonly string[]
     } & SessionEventStamp)
   | ({ readonly type: 'agent/child-spawn'; readonly childSessionId: string; readonly parentTurnId: string; readonly definition: string; readonly brief?: string; readonly objective?: string } & SessionEventStamp)
+  // A finished child run again for a later turn: the parent's commit point for
+  // that run. `inputId` names the child-log input the run opens with, where the
+  // run's own events start. A result counts only for the newest spawn/resume
+  // record before it.
+  | ({ readonly type: 'agent/child-resume'; readonly childSessionId: string; readonly parentTurnId: string; readonly inputId: string } & SessionEventStamp)
   | ({ readonly type: 'agent/child-result'; readonly childSessionId: string; readonly parentTurnId: string; readonly status: string; readonly error?: string } & SessionEventStamp)
   | ({ readonly type: 'mcp/call'; readonly server: string; readonly tool: string; readonly argsHash: string; readonly resultHash: string; readonly durationMs: number; readonly isError: boolean } & SessionEventStamp)
   // `message` (optional, capped): the hook's user-facing text — systemMessage,
@@ -473,6 +487,7 @@ function projectMessages(events: readonly SessionEvent[], attachments?: Attachme
       case 'session/child-meta':
       case 'session/role':
       case 'agent/child-spawn':
+      case 'agent/child-resume':
       case 'agent/child-result':
       case 'mcp/call':
       case 'hook/run':

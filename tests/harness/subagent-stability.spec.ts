@@ -586,3 +586,40 @@ describe('the Agent tool wait', () => {
     expect(description).toMatch(/prefer long waits/i)
   })
 })
+
+describe('the Agent tool message', () => {
+  const owned = { events: [{ type: 'session/child-meta', parentSessionId: 'root', seq: 1, timestamp: 1 }] }
+  function toolWith(message: (...args: unknown[]) => Promise<unknown>) {
+    const deps: DelegationDeps = {
+      definitions: new AgentDefinitionService(home),
+      executor: { message } as never,
+      session: async (id) => (id === 'child-1' ? owned : { events: [] }) as never,
+      childModelFor: () => undefined,
+      providers: () => [],
+      modelsOf: () => [],
+      admissionResolver: async ({ candidates }) => candidates,
+    }
+    return agentTool(deps)
+  }
+  const inTurn = <T>(fn: () => T): T => agentScope.run({ sessionId: 'root' as never, rootSessionId: 'root' as never, turnId: 'turn-7' as never, workspaceId: 'ws' as never }, fn)
+
+  it('routes to the executor with the calling turn and the chosen delivery', async () => {
+    const calls: unknown[][] = []
+    const tool = toolWith(async (...args) => { calls.push(args); return { childSessionId: 'child-1', definitionName: 'worker', status: 'running' } })
+    const out = JSON.parse(String(await inTurn(() => tool.execute({ action: 'message', childIds: ['child-1'], prompt: 'Also b.ts', delivery: 'steer' }, {} as never))))
+    expect(calls).toEqual([['ws', 'root', 'turn-7', 'child-1', 'Also b.ts', 'steer']])
+    expect(out.note).toMatch(/stops its current turn/)
+  })
+
+  it('defaults to queue and rejects bad arguments before touching the executor', async () => {
+    const calls: unknown[][] = []
+    const tool = toolWith(async (...args) => { calls.push(args); return { childSessionId: 'child-1', definitionName: 'worker', status: 'queued' } })
+    await inTurn(() => tool.execute({ action: 'message', childIds: ['child-1'], prompt: 'Go on' }, {} as never))
+    expect(calls[0]?.[5]).toBe('queue')
+    await expect(inTurn(() => tool.execute({ action: 'message', childIds: ['child-1', 'child-2'], prompt: 'x' }, {} as never))).rejects.toThrow(/exactly one/)
+    await expect(inTurn(() => tool.execute({ action: 'message', childIds: ['child-1'], prompt: ' ' }, {} as never))).rejects.toThrow(/prompt/)
+    await expect(inTurn(() => tool.execute({ action: 'message', childIds: ['child-1'], prompt: 'x', delivery: 'now' }, {} as never))).rejects.toThrow(/delivery/)
+    await expect(inTurn(() => tool.execute({ action: 'message', childIds: ['someone-else'], prompt: 'x' }, {} as never))).rejects.toThrow(/no such child/)
+    expect(calls).toHaveLength(1)
+  })
+})

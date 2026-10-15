@@ -16,7 +16,7 @@
  */
 import { createHash } from 'node:crypto'
 import type { Context } from '../../kernel/index.ts'
-import { newTurnId, type SessionId, type WorkspaceId, type ProjectId } from '../../util/brand.ts'
+import { newInputId, newTurnId, type SessionId, type WorkspaceId, type ProjectId } from '../../util/brand.ts'
 import type { Agent } from '../agent/agent.ts'
 import { agentScope, type AgentScope } from '../agent/scope.ts'
 import type { AgentDefinition, AgentSource } from './definition-service.ts'
@@ -231,6 +231,12 @@ interface InternalChild {
   launch?: () => Promise<void>
   /** The child's durable log (live for an active child). */
   events: readonly SessionEvent[]
+  /**
+   * Where this run's own events start in `events`: 0 for the spawn run, the
+   * opening input of a resumed run. Report, partial work, progress and the
+   * terminal turn are read from here on; the conversation keeps everything.
+   */
+  runStart: number
   status: ChildStatus
   readonly startedAt: number
   endedAt?: number
@@ -447,8 +453,9 @@ export class ChildExecutor {
       // untouched: it proves the child stopped, never that the parent
       // accepted its result, so that contract remains `uncertain`.
       if (parent !== undefined && sessions.readCanonicalEvents !== undefined) {
-        const prior = latestChildResult(parent.events, summary.id)
-        const terminal = terminalTurnReason(loaded.events)
+        const run = currentRun(parent.events, loaded.events, summary.id)
+        const prior = run.result
+        const terminal = terminalTurnReason(loaded.events.slice(run.start))
         if ((prior === undefined || !isTerminalStatus(prior.status)) && (terminal === undefined || terminal === 'interrupted')) {
           const workspace = sessions.workspaceOf(summary.id)
           if (workspace !== undefined) await this.reconcile(workspace, summary.id)
@@ -708,6 +715,7 @@ export class ChildExecutor {
         definitionName: request.definition.name,
         ...(request.model !== undefined ? { model: request.model } : {}),
         events: session.events,
+        runStart: 0,
         status: 'queued',
         startedAt: Date.now(),
         resultComputed: false,
@@ -732,8 +740,9 @@ export class ChildExecutor {
         })
       }
       // Durable spawn intent + parentage in the child's canonical log, with
-      // a REAL barrier: an unrecorded child never starts executing. The
-      // inherited text itself is runtime-only; its hash and size are audit.
+      // a REAL barrier: an unrecorded child never starts executing. The same
+      // record pins what a later resume rebuilds the child from — the role
+      // and ceiling as admitted now, never the role file as it reads then.
       session.append({
         type: 'session/child-meta',
         parentSessionId: root,
@@ -742,8 +751,13 @@ export class ChildExecutor {
         brief,
         ...(request.projectId !== undefined ? { projectId: request.projectId } : {}),
         ...(request.inheritedContext !== undefined
-          ? { inherit: 'brief', inheritedHash: sha256Text(request.inheritedContext), inheritedChars: request.inheritedContext.length }
+          ? { inherit: 'brief', inheritedHash: sha256Text(request.inheritedContext), inheritedChars: request.inheritedContext.length, inheritedContext: request.inheritedContext }
           : {}),
+        instructions: request.definition.instructions,
+        ...(request.definitionSource !== undefined ? { definitionSource: request.definitionSource } : {}),
+        toolCeiling,
+        ...(request.definition.skills !== undefined ? { skills: request.definition.skills } : {}),
+        ...(request.grants !== undefined && request.grants.length > 0 ? { grants: request.grants } : {}),
       })
       await session.durable()
       const spawnRecord = {
@@ -793,61 +807,10 @@ export class ChildExecutor {
     if (child.status === 'uncertain') return this.withResult(child)
 
     try {
-      // The COMPLETE child scope (childOf included) is the agent's immutable
-      // identity: Agent.run() re-enters agentScope with it, so the exposure
-      // gate sees the definition ceiling on every child tool start and the
-      // context builder sees the pinned role instructions on every request.
-      const identity: AgentScope = {
-        sessionId: childSession.id,
-        rootSessionId: root,
-        workspaceId: request.workspaceId,
-        ...(request.projectId !== undefined ? { projectId: request.projectId } : {}),
-        childOf: {
-          parentSessionId: root,
-          parentTurnId: request.parentTurnId,
-          definition: request.definition.name,
-          instructions: request.definition.instructions,
-          ...(request.definitionSource !== undefined ? { definitionSource: request.definitionSource } : {}),
-          toolCeiling,
-          ...(request.definition.skills !== undefined ? { skills: request.definition.skills } : {}),
-          ...(request.inheritedContext !== undefined ? { inheritedContext: request.inheritedContext } : {}),
-          ...(request.grants !== undefined && request.grants.length > 0 ? { grants: request.grants } : {}),
-        },
-      }
-      const agent = agents.create(childSession, identity)
-      child.agent = agent
-
-      child.launch = async () => {
-        // Run through the child's OWN identity (Agent.run re-stamps it): the
-        // outer agentScope.run satisfies listeners expecting a scope during
-        // setup. This starts only after fair dispatch claims the child.
-        await agentScope.run(identity, async () => {
-          try {
-            if (child.status === 'dispatching') {
-              child.status = 'running'
-              agent.send(renderPacket(request.packet, brief))
-              await agent.run()
-              if (child.status === 'running') {
-                const terminal = terminalTurnReason(child.events)
-                if (terminal === 'completed') child.status = 'completed'
-                else {
-                  child.status = 'failed'
-                  child.failure = terminal === undefined
-                    ? 'the child run returned without a terminal turn record'
-                    : `the child terminal turn ended ${terminal}`
-                }
-              }
-            }
-          } catch (error) {
-            if (child.status === 'running' || child.status === 'dispatching') {
-              child.status = 'failed'
-              child.failure = errorText(error)
-            }
-          }
-          await this.finish(child)
-        })
-      }
-      this.enqueue(child)
+      const meta = childMetaOf(childSession.events)
+      if (meta === undefined) throw new Error('the child metadata record is missing')
+      const agent = agents.create(childSession, childIdentity(childSession.id, root, request.workspaceId, request.projectId, request.parentTurnId, meta))
+      this.prepareLaunch(child, agent, (run) => { run.send(renderPacket(request.packet, brief)) })
     } catch (error) {
       // Launch failed after the relationship became durable: a failed child,
       // never an orphaned session.
@@ -856,6 +819,162 @@ export class ChildExecutor {
       await this.finish(child)
     }
     return this.withResult(child)
+  }
+
+  /**
+   * Arm a run's launch: dispatch flips it to running, `open` hands the agent
+   * its first input, and the agent keeps running while input is waiting — a
+   * message that landed as a turn closed still gets its turn. The terminal
+   * status comes from the run's own newest turn.
+   */
+  private prepareLaunch(child: InternalChild, agent: Agent, open: (agent: Agent) => void): void {
+    child.agent = agent
+    const identity = agent.identity
+    child.launch = async () => {
+      // Run through the child's OWN identity (Agent.run re-stamps it): the
+      // outer agentScope.run satisfies listeners expecting a scope during
+      // setup. This starts only after fair dispatch claims the child.
+      await agentScope.run(identity, async () => {
+        try {
+          if (child.status === 'dispatching') {
+            child.status = 'running'
+            open(agent)
+            do { await agent.run() } while (child.status === 'running' && agent.pendingCount > 0)
+            if (child.status === 'running') {
+              const terminal = terminalTurnReason(child.events.slice(child.runStart))
+              if (terminal === 'completed') child.status = 'completed'
+              else {
+                child.status = 'failed'
+                child.failure = terminal === undefined
+                  ? 'the child run returned without a terminal turn record'
+                  : `the child terminal turn ended ${terminal}`
+              }
+            }
+          }
+        } catch (error) {
+          if (child.status === 'running' || child.status === 'dispatching') {
+            child.status = 'failed'
+            child.failure = errorText(error)
+          }
+        }
+        await this.finish(child)
+      })
+    }
+    this.enqueue(child)
+  }
+
+  /**
+   * Send a child of this root a message. A running child takes it durably
+   * into its own log first, then as its next turn (`queue`) or at once,
+   * ending the current turn as steered (`steer`). A finished child runs
+   * again — a new run, charged to the calling turn exactly like a spawn and
+   * rebuilt only from the snapshot pinned at spawn, so it can never gain a
+   * tool or folder it did not have. Queued, stopping and uncertain children
+   * refuse: the brief runs first, a stop finishes first, reconcile first.
+   */
+  async message(
+    workspaceId: WorkspaceId,
+    root: SessionId,
+    parentTurnId: string,
+    childSessionId: SessionId,
+    prompt: string,
+    delivery: 'queue' | 'steer',
+  ): Promise<ChildHandle> {
+    const content = prompt.trim()
+    if (content === '') throw new SpawnError('packet', 'the message needs a non-empty prompt')
+    const turnKey = `${root}:${parentTurnId}`
+    if (this.closingTurns.has(turnKey)) throw new SpawnError('ownership', 'turn is closing')
+    return this.withAdmission(root, async () => {
+      if (this.closingTurns.has(turnKey)) throw new SpawnError('ownership', 'turn is closing')
+      const sessions = this.sessions()
+      const agents = this.ctx.get('agents') as { create(s: unknown, identity?: unknown): Agent; forget?(id: SessionId): void } | undefined
+      if (sessions === undefined || agents === undefined) throw new SpawnError('depth', 'no sessions or agents service mounted')
+      const live = this.active.get(childSessionId)
+      const target = live ?? await this.reconstruct(childSessionId, workspaceId)
+      if (target === undefined || target.parentSessionId !== root || !await this.ownsChild(workspaceId, target)) {
+        throw new SpawnError('ownership', 'no such child of this conversation')
+      }
+      const childSession = await sessions.load(childSessionId)
+      if (childSession.poisoned === true) throw new SpawnError('ownership', 'the child log cannot be written; reconcile it first')
+
+      if (live !== undefined && !live.finished) {
+        if (live.status !== 'running' || live.agent === undefined) {
+          throw new SpawnError('ownership', `the child is ${live.status === 'cancelled' ? 'stopping' : 'not running yet'}; message it once it is running or has finished`)
+        }
+        const inputId = newInputId()
+        childSession.append({ type: 'input/queued', inputId, content })
+        await childSession.durable()
+        live.agent.enqueueAccepted({ content, inputId })
+        if (delivery === 'steer') live.agent.steer()
+        return this.withResult(live)
+      }
+      if (target.status === 'uncertain') throw new SpawnError('ownership', 'the child outcome is not durably known; reconcile it first')
+
+      const parent = await sessions.load(root)
+      if (parent.events.some((event) => (event.type === 'turn/closing' || event.type === 'turn/end') && event.turnId === parentTurnId)) {
+        throw new SpawnError('ownership', 'turn is closing or already closed')
+      }
+      const meta = childMetaOf(childSession.events)
+      if (meta?.toolCeiling === undefined || meta.instructions === undefined) {
+        throw new SpawnError('packet', 'this child was spawned before resume support and cannot be resumed; spawn a new one')
+      }
+
+      this.spawnedPerTurn.set(turnKey, (this.spawnedPerTurn.get(turnKey) ?? 0) + 1)
+      this.reservedPerRoot.set(root, (this.reservedPerRoot.get(root) ?? 0) + 1)
+      const inputId = newInputId()
+      parent.append({ type: 'agent/child-resume', childSessionId, parentTurnId, inputId })
+      const outcome = await reconcileParentAppend(sessions, parent, (event) =>
+        event.type === 'agent/child-resume' && event.childSessionId === childSessionId && event.inputId === inputId).catch(() => 'missing' as const)
+      if (outcome !== 'committed') {
+        // Nothing ran. A record that did land unseen reads as a run with no
+        // opening input — interrupted — which reconcile settles.
+        this.releaseActive(root)
+        const remaining = (this.spawnedPerTurn.get(turnKey) ?? 1) - 1
+        if (remaining > 0) this.spawnedPerTurn.set(turnKey, remaining)
+        else this.spawnedPerTurn.delete(turnKey)
+        throw new SpawnError('ownership', 'the resume could not be recorded in this conversation')
+      }
+
+      // ── committed: from here the run settles as a durable child result ──
+      let settle: () => void = () => {}
+      const settled = new Promise<void>((resolve) => { settle = resolve })
+      const child: InternalChild = {
+        childSessionId,
+        workspaceId: target.workspaceId,
+        parentSessionId: root,
+        parentTurnId,
+        ...(target.projectId !== undefined ? { projectId: target.projectId } : {}),
+        definitionName: target.definitionName,
+        ...(target.model !== undefined ? { model: target.model } : {}),
+        events: childSession.events,
+        runStart: childSession.events.length,
+        status: 'queued',
+        startedAt: Date.now(),
+        resultComputed: false,
+        finished: false,
+        settled,
+        settle,
+      }
+      this.settledHandles.delete(childSessionId)
+      this.active.set(childSessionId, child)
+      const owed = this.turnChildren.get(turnKey) ?? new Set<SessionId>()
+      owed.add(childSessionId)
+      this.turnChildren.set(turnKey, owed)
+      this.indexChild(root, childSessionId)
+      try {
+        childSession.append({ type: 'input/queued', inputId, content })
+        await childSession.durable()
+        // A previous run's agent holds a stale identity (its turn, its scope).
+        agents.forget?.(childSessionId)
+        const agent = agents.create(childSession, childIdentity(childSessionId, root, target.workspaceId, target.projectId, parentTurnId, meta))
+        this.prepareLaunch(child, agent, (run) => { run.enqueueAccepted({ content, inputId }) })
+      } catch (error) {
+        child.status = 'failed'
+        child.failure = `resume failed before the run started: ${errorText(error)}`
+        await this.finish(child)
+      }
+      return this.withResult(child)
+    })
   }
 
   /**
@@ -1018,17 +1137,20 @@ export class ChildExecutor {
       }
       return this.withResult(child)
     }
+    // Only the current run's events and result decide anything below.
+    const run = currentRun(parentEvents, childEvents, childSessionId)
+    const runEvents = childEvents.slice(run.start)
     // A canonical cancelled turn is not proof that process cleanup succeeded.
-    if (terminalTurnReason(childEvents) === 'cancelled') {
+    if (terminalTurnReason(runEvents) === 'cancelled') {
       try { await this.cancelProcesses(childSessionId) } catch { return this.withResult(child) }
     }
-    let result = latestChildResult(parentEvents, childSessionId)
+    let result = run.result
     if (result === undefined || !isTerminalStatus(result.status)) {
       // A child no live runner owns can never come back: with no terminal turn
       // anywhere, the restart view reads `interrupted`, so the repair settles
       // to that same verdict instead of leaving the parent's spawn result-less
       // forever — every projection reads a result-less spawn as still running.
-      const terminal = terminalTurnReason(childEvents) ?? (live === undefined ? 'interrupted' : undefined)
+      const terminal = terminalTurnReason(runEvents) ?? (live === undefined ? 'interrupted' : undefined)
       if (terminal === undefined) {
         // A committed spawn that never launched can never settle by itself:
         // no runner owns it and the unreliable parent writer behind the
@@ -1061,7 +1183,7 @@ export class ChildExecutor {
       const record = {
         type: 'agent/child-result' as const,
         childSessionId,
-        parentTurnId: child.parentTurnId,
+        parentTurnId: run.parentTurnId ?? child.parentTurnId,
         status,
         ...(error !== undefined ? { error } : {}),
       }
@@ -1080,13 +1202,14 @@ export class ChildExecutor {
       } catch {
         return this.withResult(child)
       }
-      result = parentEvents === undefined ? undefined : latestChildResult(parentEvents, childSessionId)
+      result = parentEvents === undefined ? undefined : currentRun(parentEvents, childEvents, childSessionId).result
       if (result === undefined || !isTerminalStatus(result.status)) return this.withResult(child)
     }
     child.status = result.status
     if (result.error !== undefined) child.failure = result.error
     else delete child.failure
     child.events = childEvents
+    child.runStart = run.start
     child.endedAt ??= result.timestamp
     child.resultComputed = false
     delete child.result
@@ -1445,16 +1568,15 @@ export class ChildExecutor {
       ?? (sessions.has(parentId) ? (await sessions.load(parentId).catch(() => undefined))?.events : undefined)
       ?? []
     if (!spawnCommitted(recordsOf, childSessionId)) return undefined
-    let record: Extract<SessionEvent, { type: 'agent/child-result' }> | undefined
-    for (const event of recordsOf) {
-      if (event.type === 'agent/child-result' && event.childSessionId === childSessionId) record = event
-    }
+    // The current run: the newest spawn/resume admission and any result after it.
+    const run = currentRun(recordsOf, loaded.events, childSessionId)
+    const record = run.result
     // A terminal child turn proves only that the child stopped. It never proves
     // the parent accepted its result, so a completed child without a parent
     // result stays uncertain across process boundaries until settlement repairs
     // it. An open/incomplete child remains the existing interrupted recovery
     // fact: no terminal candidate exists to settle.
-    const terminal = terminalTurnReason(loaded.events)
+    const terminal = terminalTurnReason(loaded.events.slice(run.start))
     const status: ChildStatus = record !== undefined && isTerminalStatus(record.status)
       ? record.status
       : terminal === undefined || terminal === 'interrupted' ? 'interrupted' : 'uncertain'
@@ -1469,13 +1591,14 @@ export class ChildExecutor {
       childSessionId,
       workspaceId: owner,
       parentSessionId: parentId,
-      parentTurnId: meta.parentTurnId,
+      parentTurnId: run.parentTurnId ?? meta.parentTurnId,
       ...(meta.projectId !== undefined ? { projectId: meta.projectId as ProjectId } : {}),
       definitionName: meta.definition,
       ...(model !== undefined ? { model } : {}),
       events: loaded.events,
+      runStart: run.start,
       status,
-      startedAt: meta.timestamp,
+      startedAt: run.startedAt ?? meta.timestamp,
       endedAt: record?.timestamp ?? loaded.events[loaded.events.length - 1]?.timestamp ?? meta.timestamp,
       ...(record?.error !== undefined ? { failure: record.error } : {}),
       resultComputed: false,
@@ -1495,12 +1618,13 @@ export class ChildExecutor {
   private withResult(child: InternalChild): ChildHandle {
     if (!child.resultComputed && child.status !== 'running' && child.status !== 'queued' && child.status !== 'dispatching') {
       const logPointer = `its full log is session ${child.childSessionId}`
+      const runEvents = child.events.slice(child.runStart)
       if (child.status === 'completed') {
-        const result = digest(child.events)
+        const result = digest(runEvents)
         if (result !== undefined) child.result = result
         else child.error = `the child produced no final report; ${logPointer}`
       } else {
-        const partial = digestPartial(child.events)
+        const partial = digestPartial(runEvents)
         if (partial !== undefined) child.partial = partial
         child.error = child.failure !== undefined
           ? `${child.failure}; the child did not complete (${child.status}); ${logPointer}`
@@ -1518,9 +1642,9 @@ export class ChildExecutor {
       ...(child.result !== undefined ? { result: child.result } : {}),
       ...(child.partial !== undefined ? { partial: child.partial } : {}),
       ...(child.error !== undefined ? { error: child.error } : {}),
-      ...(child.status === 'running' && awaitsApproval(child.events) ? { awaitingApproval: true } : {}),
+      ...(child.status === 'running' && awaitsApproval(child.events.slice(child.runStart)) ? { awaitingApproval: true } : {}),
       ...(child.status === 'running'
-        ? { progress: describeProgress(child.events, child.startedAt, Date.now(), this.limits(), child.agent?.modelProgressAt !== undefined ? { modelProgressAt: child.agent.modelProgressAt } : {}) }
+        ? { progress: describeProgress(child.events.slice(child.runStart), child.startedAt, Date.now(), this.limits(), child.agent?.modelProgressAt !== undefined ? { modelProgressAt: child.agent.modelProgressAt } : {}) }
         : {}),
     }
   }
@@ -1605,16 +1729,68 @@ function isTerminalStatus(status: string): status is Exclude<ChildStatus, 'runni
   return status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'interrupted'
 }
 
-/** The last durable terminal result for one child; parent log is authoritative. */
-function latestChildResult(
-  events: readonly SessionEvent[],
+/**
+ * The child's current run, from the parent log (authoritative): the newest
+ * spawn/resume admission, the result recorded after it (none yet means the
+ * run never settled), and where the run starts in the child's own log — the
+ * resume's opening input, or the log's start for the spawn run. A resume
+ * whose opening input never landed starts at the log's end: an empty run.
+ */
+function currentRun(
+  parentEvents: readonly SessionEvent[],
+  childEvents: readonly SessionEvent[],
   childSessionId: SessionId,
-): Extract<SessionEvent, { type: 'agent/child-result' }> | undefined {
-  for (let i = events.length - 1; i >= 0; i--) {
-    const event = events[i]
-    if (event?.type === 'agent/child-result' && event.childSessionId === childSessionId) return event
+): { result?: Extract<SessionEvent, { type: 'agent/child-result' }>; start: number; parentTurnId?: string; startedAt?: number } {
+  let result: Extract<SessionEvent, { type: 'agent/child-result' }> | undefined
+  let resume: Extract<SessionEvent, { type: 'agent/child-resume' }> | undefined
+  for (let i = parentEvents.length - 1; i >= 0; i--) {
+    const event = parentEvents[i]
+    if (event?.type === 'agent/child-result' && event.childSessionId === childSessionId) result ??= event
+    else if (event?.type === 'agent/child-resume' && event.childSessionId === childSessionId) { resume = event; break }
+    else if (event?.type === 'agent/child-spawn' && event.childSessionId === childSessionId) break
   }
-  return undefined
+  if (resume === undefined) return { ...(result !== undefined ? { result } : {}), start: 0 }
+  const opening = childEvents.findIndex((event) => event.type === 'input/queued' && event.inputId === resume.inputId)
+  return {
+    ...(result !== undefined ? { result } : {}),
+    start: opening >= 0 ? opening : childEvents.length,
+    parentTurnId: resume.parentTurnId,
+    startedAt: resume.timestamp,
+  }
+}
+
+/**
+ * A child agent's complete identity, rebuilt from its pinned `session/child-meta`
+ * snapshot — the spawn run and every resume use this one path. Agent.run()
+ * re-enters agentScope with it, so the exposure gate sees the pinned ceiling
+ * on every child tool start and the context builder sees the pinned role
+ * instructions on every request. `parentTurnId` is the run's owning turn.
+ */
+function childIdentity(
+  childSessionId: SessionId,
+  root: SessionId,
+  workspaceId: WorkspaceId,
+  projectId: ProjectId | undefined,
+  parentTurnId: string,
+  meta: Extract<SessionEvent, { type: 'session/child-meta' }>,
+): AgentScope {
+  return {
+    sessionId: childSessionId,
+    rootSessionId: root,
+    workspaceId,
+    ...(projectId !== undefined ? { projectId } : {}),
+    childOf: {
+      parentSessionId: root,
+      parentTurnId,
+      definition: meta.definition,
+      instructions: meta.instructions ?? '',
+      ...(meta.definitionSource !== undefined ? { definitionSource: meta.definitionSource } : {}),
+      toolCeiling: meta.toolCeiling ?? [],
+      ...(meta.skills !== undefined ? { skills: meta.skills } : {}),
+      ...(meta.inheritedContext !== undefined ? { inheritedContext: meta.inheritedContext } : {}),
+      ...(meta.grants !== undefined && meta.grants.length > 0 ? { grants: meta.grants } : {}),
+    },
+  }
 }
 
 type ParentAppendOutcome = 'committed' | 'missing' | 'uncertain'
