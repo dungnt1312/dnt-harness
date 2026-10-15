@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import Icon from '../common/Icon.tsx'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
-import { DiffLines, LineCount, diffRowsFromEdit, diffRowsFromWrite, type DiffRow } from '../common/DiffLines.tsx'
+import { DiffLines, LineCount, diffRowsFromEdit, diffRowsFromWrite, type DiffLayout, type DiffRow } from '../common/DiffLines.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { cn } from '../../lib/cn.ts'
 import type { TurnChanges, TurnChangeFile } from '../../lib/turn-changes.ts'
@@ -10,10 +10,6 @@ import type { OpenPathResolver } from '../../lib/project-paths.ts'
 function turnChangesLabel(count: number): string {
   return `${count} ${count === 1 ? 'file' : 'files'} changed`
 }
-
-/** Hover-revealed without taking room: see GitPanel's ChangeRow for the contract. */
-const REVEAL_ON_ROW = 'absolute right-1 top-0 flex h-8 items-center opacity-0 invisible transition-opacity group-hover/file:visible group-hover/file:opacity-100 group-has-[:focus-visible]/file:visible group-has-[:focus-visible]/file:opacity-100 [@media(pointer:coarse)]:visible [@media(pointer:coarse)]:opacity-100'
-const QUIET_ICON = 'size-6 rounded-md text-fg-faint hover:bg-transparent hover:text-fg'
 
 /**
  * The per-turn change card: the files a turn's Write/Edit calls landed. It
@@ -41,6 +37,7 @@ export function TurnChangesCard({ turnId, changes, live = false, onOpenPath, onR
   // Closed by default, live or not: a long list must not push the running
   // work off screen. The header still counts files and lines as they land.
   const [open, setOpen] = useState(false)
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
   const totals = changes.files.reduce((sum, file) => ({
     added: sum.added + (file.lines?.added ?? 0),
     removed: sum.removed + (file.lines?.removed ?? 0),
@@ -87,11 +84,20 @@ export function TurnChangesCard({ turnId, changes, live = false, onOpenPath, onR
         <div className="mt-0.5">
           <ul aria-label={`Files changed by turn ${turnId}`} className="m-0 flex list-none flex-col gap-0.5 p-0">
             {changes.files.map((file) => (
-              <ChangeFileRow
-                key={file.path}
-                file={file}
-                {...(onOpenPath !== undefined ? { onOpenPath } : {})}
-              />
+              <li key={file.path} className="m-0">
+                <FileSection
+                  file={file}
+                  layout="unified"
+                  scroll
+                  open={expanded.has(file.path)}
+                  onToggle={() => setExpanded((current) => {
+                    const next = new Set(current)
+                    if (!next.delete(file.path)) next.add(file.path)
+                    return next
+                  })}
+                  onOpenFile={onOpenPath?.(file.path) ?? null}
+                />
+              </li>
             ))}
           </ul>
         </div>
@@ -122,59 +128,50 @@ export function turnFileDiffRows(file: TurnChangeFile): readonly DiffRow[] {
 }
 
 /**
- * One file of the list: icon, name, directory, a "New"/"Rewritten" tag, and
- * this turn's line counts. Clicking expands the turn-only diff right here.
- * Quiet buttons over the row's right edge — shown on hover, keyboard focus or
- * touch, never taking room — open the file.
+ * One file of a turn's change list: icon, name, directory, tag, line counts and
+ * a chevron that folds the turn-only diff. The chat card and the workbench tab
+ * both render this, so a file reads the same in either place.
  */
-function ChangeFileRow({ file, onOpenPath }: {
+export function FileSection({ file, layout, open, onToggle, onOpenFile, scroll = false }: {
   readonly file: TurnChangeFile
-  readonly onOpenPath?: OpenPathResolver
+  readonly layout: DiffLayout
+  readonly open: boolean
+  readonly onToggle: () => void
+  readonly onOpenFile: (() => void) | null
+  /** Cap the diff's height and scroll it: the chat must not grow without bound. */
+  readonly scroll?: boolean
 }) {
-  const [expanded, setExpanded] = useState(false)
-  const rows = useMemo(() => (expanded ? turnFileDiffRows(file) : []), [expanded, file])
-  const open = onOpenPath?.(file.path) ?? null
+  const rows = useMemo(() => (open ? turnFileDiffRows(file) : []), [open, file])
   const name = file.path.split(/[\\/]/).pop() ?? file.path
-  const directory = file.path.slice(0, file.path.length - name.length).replace(/[\\/]+$/, '')
-  const hasActions = open !== null
+  const directory = file.path.slice(0, file.path.length - name.length)
   return (
-    <li className="group/file relative m-0">
-      <button
-        type="button"
-        aria-expanded={expanded}
-        title={file.path}
-        onClick={() => setExpanded((value) => !value)}
-        className={cn('flex min-h-8 w-full min-w-0 items-center gap-2 rounded-lg px-2 text-left text-[13px] transition-colors hover:bg-hover', expanded && 'bg-hover')}
-      >
+    <section className="overflow-hidden rounded-lg border border-line" aria-label={`This turn's diff of ${file.path}`}>
+      {/* The whole header toggles; only the name opens the file. The chevron
+          button has no handler of its own: its click (and Enter/Space) bubbles here. */}
+      <div onClick={onToggle} className="flex h-8 cursor-pointer items-center gap-2 bg-muted/40 px-2 text-[13px]">
         <FileTypeIcon path={file.path} size={16} />
-        <span className="min-w-0 flex-1 truncate">
-          <span className="font-medium text-fg">{name}</span>
-          {directory !== '' ? <span className="ml-2 text-[12px] text-fg-faint">{directory}</span> : null}
-        </span>
-        <span className={cn('flex shrink-0 items-center gap-2', hasActions && 'transition-opacity group-hover/file:opacity-0 group-has-[:focus-visible]/file:opacity-0 [@media(pointer:coarse)]:opacity-100')}>
-          {file.status === 'created'
-            ? <span className="rounded bg-ok-soft px-1.5 text-[10px] font-medium uppercase leading-[16px] tracking-wide text-ok">New</span>
-            : file.overwrote === true
-              ? <span className="rounded bg-muted px-1.5 text-[10px] font-medium uppercase leading-[16px] tracking-wide text-fg-muted" title="Rewrote the whole file; the replaced content is not recorded">Rewritten</span>
-              : <span className="sr-only">Modified</span>}
-          <LineCount
-            {...(file.lines?.added !== undefined ? { added: file.lines.added } : {})}
-            {...(file.lines?.removed !== undefined ? { removed: file.lines.removed } : {})}
-          />
-        </span>
-      </button>
-      {open !== null ? (
-        <span className={REVEAL_ON_ROW}>
-          <IconButton label={`Open ${name} in workbench`} onClick={open} className={QUIET_ICON}>
-            <Icon name="fileText" size={12} />
-          </IconButton>
-        </span>
-      ) : null}
-      {expanded ? (
-        <div className="mx-1 mb-1 mt-0.5 max-h-80 overflow-auto rounded-lg border border-line bg-surface" role="region" aria-label={`This turn's diff of ${file.path}`} tabIndex={0}>
-          {rows.length > 0 ? <DiffLines rows={rows} /> : <p className="m-0 px-3 py-2 text-xs text-fg-muted">No textual change recorded.</p>}
+        {onOpenFile !== null
+          ? <button type="button" title={`Open ${file.path}`} onClick={(event) => { event.stopPropagation(); onOpenFile() }} className="shrink-0 font-medium text-fg hover:underline">{name}</button>
+          : <span className="shrink-0 font-medium text-fg">{name}</span>}
+        <span className="min-w-0 flex-1 truncate text-[12px] text-fg-faint" title={file.path}>{directory}</span>
+        {file.status === 'created'
+          ? <span className="rounded bg-ok-soft px-1.5 text-[10px] font-medium uppercase leading-[16px] tracking-wide text-ok">New</span>
+          : file.overwrote === true
+            ? <span className="rounded bg-muted px-1.5 text-[10px] font-medium uppercase leading-[16px] tracking-wide text-fg-muted" title="Rewrote the whole file; the replaced content is not recorded">Rewritten</span>
+            : null}
+        <LineCount
+          {...(file.lines?.added !== undefined ? { added: file.lines.added } : {})}
+          {...(file.lines?.removed !== undefined ? { removed: file.lines.removed } : {})}
+        />
+        <IconButton label={open ? `Collapse ${name}` : `Expand ${name}`} aria-expanded={open} className="size-6">
+          <Icon name="chevronRight" size={13} className={cn('transition-transform', open && 'rotate-90')} />
+        </IconButton>
+      </div>
+      {open ? (
+        <div className={cn('border-t border-line bg-surface', scroll ? 'max-h-80 overflow-auto' : 'overflow-x-auto')}>
+          {rows.length > 0 ? <DiffLines rows={rows} layout={layout} /> : <p className="m-0 px-3 py-2 text-xs text-fg-muted">No textual change recorded.</p>}
         </div>
       ) : null}
-    </li>
+    </section>
   )
 }

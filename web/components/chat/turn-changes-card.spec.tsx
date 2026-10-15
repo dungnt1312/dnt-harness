@@ -98,7 +98,7 @@ it('clicking a file shows the turn-only diff inline', async () => {
   await act(async () => header(view).click())
   const row = fileRows(view)[0]!
   await act(async () => row.querySelector<HTMLButtonElement>('button[aria-expanded]')!.click())
-  const diff = view.querySelector('[role="region"][aria-label="This turn\'s diff of src/a.ts"]')
+  const diff = view.querySelector('section[aria-label="This turn\'s diff of src/a.ts"] [data-kind]')?.parentElement
   expect(diff).not.toBeNull()
   // `a` was context the edit carried: it reads as context, not as -a +a.
   const kinds = [...diff!.querySelectorAll('[data-kind]')].map((line) => `${line.getAttribute('data-kind')}:${line.textContent?.trim().slice(-1)}`)
@@ -153,9 +153,24 @@ it('Review all opens the turn tab, and nothing on the card is git', async () => 
   await act(async () => all.click())
   expect(onReviewAll).toHaveBeenCalledOnce()
   await act(async () => header(view).click())
-  expect(view.querySelector('button[aria-label="Open a.ts in workbench"]')).not.toBeNull()
+  expect(view.querySelector('button[title="Open src/a.ts"]')).not.toBeNull()
   expect(view.textContent).not.toMatch(/git/i)
 
   const plain = await mount(CHANGES)
   expect([...plain.querySelectorAll('button')].some((button) => button.textContent === 'Review all')).toBe(false)
+})
+
+it('a file header toggles its diff from anywhere on the row, except the name, which opens the file', async () => {
+  const open = vi.fn()
+  const view = await mount(CHANGES, { onOpenPath: () => open })
+  await act(async () => header(view).click())
+  const section = (): Element => view.querySelector('section[aria-label="This turn\'s diff of src/a.ts"]')!
+  const bar = section().firstElementChild as HTMLElement
+  await act(async () => bar.click())
+  expect(section().querySelector('[data-kind]')).not.toBeNull()
+  await act(async () => section().querySelector<HTMLButtonElement>('button[title="Open src/a.ts"]')!.click())
+  expect(open).toHaveBeenCalledOnce()
+  expect(section().querySelector('[data-kind]')).not.toBeNull()
+  await act(async () => bar.click())
+  expect(section().querySelector('[data-kind]')).toBeNull()
 })
