@@ -129,7 +129,6 @@ describe('post-compaction preview equals canonical', () => {
     expectParity(preview, canonical)
     const cleared = (a: builder.AssembledContext) => a.messages.filter(m => m.role === 'tool' && m.content === CLEARED_TOOL_RESULT).length
     expect(cleared(preview)).toBe(12 - builder.MICROCOMPACT_KEEP_RECENT)
-    expect(cleared(canonical)).toBe(cleared(preview))
     expect(preview.manifest.budget.preTrimTokens!).toBeGreaterThan(preview.manifest.budget.availableTokens)
     expect(preview.manifest.omissions.some(line => line.startsWith('tool-results:'))).toBe(true)
   })
@@ -159,7 +158,8 @@ describe('post-compaction preview equals canonical', () => {
 
   it('replaces a previous restoration with the new one', async () => {
     const { session, checkpoints } = await setup(s => { turn(s, 't1', 'first request'); turn(s, 't2', 'second request') })
-    await previewThenCommit(session, checkpoints, endSeq(session.committedEvents, 't1'), 'SUMMARY ONE', restored('RESTORED_OLD'))
+    const first = await previewThenCommit(session, checkpoints, endSeq(session.committedEvents, 't1'), 'SUMMARY ONE', restored('RESTORED_OLD'))
+    expect(countText(first.canonical, 'RESTORED_OLD')).toBe(1)
     await session.durable()
     turn(session, 't3', 'third request'); turn(session, 't4', 'fourth request'); await session.durable()
     // Cutoff after the first compaction's events: recovery proves the seed at the cutoff (see report).
