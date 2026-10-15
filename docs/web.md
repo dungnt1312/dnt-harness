@@ -26,9 +26,12 @@ A successful canonical `compaction/end` authorizes history replacement;
 checkpoint JSON is validated, atomic derived cache and may be rebuilt on the
 next request. Four covered tail turns are optional raw duplication by default;
 zero disables duplication, not uncovered history, and budget fitting may reduce
-the covered tail by whole turns with omissions. The manifest remains the last
-real request until another request consumes the checkpoint. Headless automatic
-integration and stronger power-loss durability guarantees are not claimed.
+the covered tail by whole turns with omissions. After a compaction, `/manifest`
+returns the measured post-compaction request (`contextAfter`, with
+`display.kind: 'post-compaction'`) until a newer request is assembled, or an
+`unavailable` view (`display.reason`: `legacy-compaction` | `preview-failed`)
+when no measurement exists. Headless automatic integration and stronger
+power-loss durability guarantees are not claimed.
 
 ## The client is stateless by design
 
@@ -185,7 +188,7 @@ tool root. The families, at a glance:
 | `…/:wid/sessions`, `…/:wid/sessions/:id` (+ `/events` SSE, `/messages`, `/stop`, `/steer`) | session lifecycle, streaming, queued messages, stop, steer. `/messages` answers 409 for a child agent session: children are executor-managed and cannot be resumed directly. See "Queue, stop, and steer" below |
 | `GET/PUT …/:wid/sessions/:id/model` | the conversation's own model controls (model, provider, thinking level) — see the per-conversation model section |
 | `GET/PUT …/:wid/sessions/:id/grants` | the conversation's extra file-tool folders: `GET` returns `{ revision, roots, effective }` (effective = project + session grants merged); `PUT { expectedRevision, roots: [{ path, access }] }` replaces the list — browser principal only, `409` on a stale revision or a conversation without a project, `400` for a folder the grant validator refuses (see `docs/capabilities.md`) |
-| `…/:wid/sessions/:id/manifest`, `…/compact` | last real request's context manifest; manual compaction returns `{ coversSeq, summaryChars }`, with 409 for active/duplicate ownership. Automatic compaction uses fresh completed-turn pre-trim pressure in compact-history mode; the standard bin enables 0.85 (embedded default/explicit zero disables). PreCompact hooks share the reservation. |
+| `…/:wid/sessions/:id/manifest`, `…/compact` | `GET /manifest` returns one of: the newest request's manifest (`display.kind: 'request'`), the measured post-compaction request (`display.kind: 'post-compaction'`, with `compactionSeq`/`coversSeq`), an `unavailable` view (`{ display: { kind: 'unavailable', reason: 'legacy-compaction' \| 'preview-failed' }, usage }`), or `204` when the session has no context yet. Manual compaction returns `{ coversSeq, summaryChars, tokensBefore?, tokensAfter?, measurement?, path? }` (`tokens*`/`measurement` only when a new checkpoint was measured; `path`: `exact` \| `reconstructed` \| `recovery` \| `legacy`, the route that produced the checkpoint), with 409 for active/duplicate ownership, an unverified fit, or `context revision changed`. Automatic compaction uses fresh completed-turn pre-trim pressure in compact-history mode; the standard bin enables 0.85 (embedded default/explicit zero disables). PreCompact hooks share the reservation. |
 | `GET/PUT /api/model-defaults` | the **global** default provider/model/thinking level, shared by every workspace: the pair new sessions snapshot at creation, the draft pickers' target, and the live fallback for legacy conversations without a snapshot |
 | `PUT …/:wid/model`, `PUT …/:wid/thinking` | compatibility proxies: they verify workspace ownership, then mutate the **global** default above; new clients use `/api/model-defaults` |
 | `PUT …/:wid/mode`, `GET …/:wid/meta` | workspace-local default mode control for new conversations and draft UI. Existing roots keep their own selected mode. The `GET …/mode` catalog lists **enabled modes only** (a disabled mode refused for selection answers `400`); `GET …/meta` returns the workspace default's `permissionDefaults`, `mode`, and `yolo` when enabled; it does not return a policy or effective-policy overlay. |

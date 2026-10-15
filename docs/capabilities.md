@@ -404,7 +404,9 @@ deleted, or disabled provider fails the call with the Settings fix it needs.
   vision capability is the provider model override first, then the shared
   model catalog. `vision: false` converts image-bearing history to text-only:
   the attachment marker (including `attachmentId`) remains, image bytes leave
-  the chat request, and the text tells the model to call `DescribeImage`.
+  the chat request, and the text tells the model to call `DescribeImage` when
+  the request carries that tool (otherwise it says no image-description tool is
+  available).
   `DescribeImage { attachmentId, question? }` reads only from the workspace
   AttachmentStore and sends that image to the dedicated multimodal chat model
   selected in **Settings → Providers & Models → Image understanding**. Its

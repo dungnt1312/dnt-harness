@@ -51,7 +51,7 @@ import { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from '../harness/li
 import { LlmService } from '../harness/llm/service.ts'
 import { LogicalRequest, classifyTransport } from '../harness/llm/request-lifecycle.ts'
 import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
-import { expressibleThinkingLevel, isThinkingLevel, resolveContextLimit } from '../harness/llm/model-catalog.ts'
+import { expressibleThinkingLevel, isThinkingLevel } from '../harness/llm/model-catalog.ts'
 import { supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
 import { ProviderError } from '../harness/llm/types.ts'
 import type { LlmProvider, ModelRequest, StreamEvent, StreamOptions, TokenUsage, ToolCall } from '../harness/llm/types.ts'
@@ -1563,8 +1563,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const contextRevision = async (entry: SessionEntry): Promise<string> => {
     const { provider, model, thinkingLevel } = resolveEffectiveModel(entry.session, entry.workspaceId)
     const { mode, revision } = rootModeOf({ sessionId: entry.session.id }, entry.workspaceId)
-    const prompts = await systemPrompts.load(entry.workspaceId).catch(() => undefined)
-    const instructions = await readWorkspaceInstructions(resourceHome, entry.workspaceId, entry.projectId).catch(() => '')
+    // A read error throws (a measurement failure), never hashes as empty: that would read as a change.
+    const prompts = await systemPrompts.load(entry.workspaceId)
+    const instructions = mode.definition.sources.workspaceInstructions ? await readWorkspaceInstructions(resourceHome, entry.workspaceId, entry.projectId) : ''
     return createHash('sha256').update(JSON.stringify([
       provider ?? null, model ?? null, thinkingLevel ?? null,
       provider != null && model != null ? list.find((row) => row.id === provider)?.modelSettings?.[model]?.contextTokens ?? null : null,
@@ -1594,7 +1595,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   /** The post-compaction request the builder would assemble next; throws when it does not fit. */
   const previewCompaction = (entry: SessionEntry, next: { readonly summary: string; readonly coversSeq: number }, restored?: Restored) => {
     const scope: AgentScope = { sessionId: entry.session.id, rootSessionId: entry.session.id, workspaceId: entry.workspaceId,
-      ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}) }
+      ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}), ...roleIdentityOf(entry.session) }
     const schemas = agentScope.run(scope, () => kernel.ctx.tools.schemas())
     return assembleRequest({ scope, projected: { messages: [], tools: schemas, assemblySignal: new AbortController().signal }, sideEffects: false,
       preview: { checkpoint: next, ...(restored !== undefined ? { restoration: restored } : {}), protectUncoveredHistory: limits.compactionEffectiveEnabled } })
@@ -1603,8 +1604,6 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const measureCheckpoint = async (
     entry: SessionEntry,
     next: { readonly summary: string; readonly coversSeq: number },
-    _standing: { readonly summary: string; readonly coversSeq: number } | undefined,
-    _loaded?: Parameters<typeof estimateConversationTokens>[0]['attachments'],
     restored?: Restored,
   ): Promise<CompactionMeasurement> => {
     const sessionId = entry.session.id
@@ -1751,7 +1750,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         ...(candidates !== undefined ? { candidates } : {}),
         contextWindowTokens: () => compactionWindowOf(entry),
         nativeVision: () => compactionVisionOf(entry),
-        measure: (next, standing, restored) => measureCheckpoint(entry, next, standing, undefined, restored),
+        measure: (next, _standing, restored) => measureCheckpoint(entry, next, restored),
         // Effective adoption needs positive evidence: a measured fit for this exact checkpoint.
         validateFit: (cutoff) => checkCompactionContext(entry, cutoff),
         restore: (cutoff, restoreSignal) => restorationFor(entry, cutoff, restoreSignal),
@@ -1869,7 +1868,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
           ...(loaded !== undefined ? { attachments: loaded } : {}),
           ...(seed !== undefined ? { seed } : {}),
           onProgress: (done, total) => { void appendJob(entry, { stage: 'generating', progress: { done, total } }) },
-          measure: (next) => measureCheckpoint(entry, next, seed, loaded),
+          measure: (next) => measureCheckpoint(entry, next),
           // Legacy keeps succeeding when the preview fails, but never under a context that moved.
           validate: () => checkCompactionContext(entry),
         })
@@ -3481,8 +3480,6 @@ ${entry.description}`.toLowerCase().includes(query))
     }
     return seen
   }
-  /** Provider-reported token usage per session (last request + running cache totals). */
-  const sessionUsage = new Map<SessionId, SessionUsage>()
   /**
    * The newest root model request that may seed cache-aware compaction. It is
    * armed when the builder assembles a lossless request, cleared by the next
@@ -3897,15 +3894,6 @@ ${entry.description}`.toLowerCase().includes(query))
         if (scope.turnId !== undefined && history !== 'none' && assembled.manifest.omissions.length === 0) {
           pendingCompactionPrefixes.set(scope.sessionId, scope.turnId)
         }
-      }
-      // This manifest describes the request about to run, not the previous
-      // one. Drop its prompt count until `llm/stream` reports the new usage;
-      // the running cache totals stay, because they are session-scoped.
-      const usage = sessionUsage.get(scope.sessionId)
-      if (usage !== undefined) {
-        const { last: _stale, ...totals } = usage
-        void _stale
-        sessionUsage.set(scope.sessionId, totals)
       }
       // The trajectory reads WHEN context was injected and WHAT it carried:
       // one durable record per request, between `step/start` and the step's
@@ -4550,7 +4538,6 @@ ${entry.description}`.toLowerCase().includes(query))
     contextReducers,
     prefixSnapshots,
     contextBodies,
-    sessionUsage,
     completedRequests,
     forgetCompactionCapture: async (sessionId) => {
       captures.forget(sessionId)
@@ -4851,7 +4838,6 @@ interface HandlerDeps {
   readonly prefixSnapshots: Map<SessionId, PrefixSnapshot>
   /** Context section hashes already recorded per session's log (body dedupe). */
   readonly contextBodies: Map<SessionId, Set<string>>
-  readonly sessionUsage: Map<SessionId, SessionUsage>
   readonly completedRequests: Map<SessionId, CompactionPrefix>
   /** Drop the effective-compaction capture and host of a deleted session. */
   readonly forgetCompactionCapture: (sessionId: SessionId) => Promise<void>
@@ -10042,7 +10028,6 @@ async function forgetSessionState(sessionId: SessionId, deps: HandlerDeps): Prom
   deps.lastManifests.delete(sessionId)
   deps.contextReducers.delete(sessionId)
   deps.contextBodies.delete(sessionId)
-  deps.sessionUsage.delete(sessionId)
   deps.completedRequests.delete(sessionId)
   await deps.forgetCompactionCapture(sessionId)
   deps.prefixSnapshots.delete(sessionId)
@@ -10050,7 +10035,6 @@ async function forgetSessionState(sessionId: SessionId, deps: HandlerDeps): Prom
     deps.lastManifests.delete(childId)
     deps.contextReducers.delete(childId)
     deps.contextBodies.delete(childId)
-    deps.sessionUsage.delete(childId)
     deps.completedRequests.delete(childId)
     deps.prefixSnapshots.delete(childId)
   }
@@ -10098,32 +10082,6 @@ function compactionAnswerFor(events: readonly SessionEvent[], prefix: Compaction
   const answer = events.findLast((event) => event.seq > start.seq && event.seq < end.seq && event.type === 'assistant/message')
   if (answer?.type !== 'assistant/message' || answer.toolCalls !== undefined || answer.content.trim() === '') return undefined
   return answer.content
-}
-
-/** Token usage the provider reported for one session since this host started. */
-interface SessionUsage {
-  /**
-   * The newest COMPLETED request's usage. Absent between assembling the next
-   * request and that request reporting its own prompt count, so a manifest
-   * is never paired with an older prompt size.
-   */
-  readonly last?: TokenUsage
-  /** Prompt tokens summed over requests that reported a cached share. */
-  readonly cacheableInputTokens: number
-  readonly cachedInputTokens: number
-}
-
-/** Fold one completion's usage into the session's running totals. */
-function recordUsage(store: Map<SessionId, SessionUsage>, sessionId: SessionId, usage: TokenUsage): void {
-  const previous = store.get(sessionId)
-  // Only requests whose provider reports a cached share count toward the
-  // hit rate; a server that never reports caching must not read as 0%.
-  const reported = usage.cachedInputTokens !== undefined
-  store.set(sessionId, {
-    last: usage,
-    cacheableInputTokens: (previous?.cacheableInputTokens ?? 0) + (reported ? usage.inputTokens : 0),
-    cachedInputTokens: (previous?.cachedInputTokens ?? 0) + (usage.cachedInputTokens ?? 0),
-  })
 }
 
 /**

@@ -10,6 +10,7 @@ import path from 'node:path'
 import { afterAll, describe, expect, it, vi } from 'vitest'
 import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
 import { AttachmentStore } from '../../src/harness/attachments/store.ts'
+import { SystemPromptsStore } from '../../src/harness/prompts/store.ts'
 import { ProviderError, type ModelCompletion, type ModelRequest, type StreamEvent } from '../../src/harness/llm/types.ts'
 import type { HarnessLimits } from '../../src/harness/limits.ts'
 import { COMPACTION_HANDOFF_MARKER } from '../../src/web/compaction-generator.ts'
@@ -184,6 +185,71 @@ describe('compaction fails closed on an unverified fit, and on a context that ch
     expect(changed.status).toBe(409)
     expect(changed.body.error).toMatch(/context revision changed/)
     expect(changed.ends.some((event) => event.error === undefined)).toBe(false)
+  })
+
+  it.each([
+    ['effective', true],
+    ['legacy', false],
+  ] as const)('%s: a failed prompt-overrides read is a measurement failure, never "context revision changed"', async (name, effective) => {
+    const { provider: llm } = provider()
+    const { home, base, wsId } = await start(llm, effective ? { compactionEffectiveEnabled: true } : {})
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    await completedMessage(base, wsId, id, logPath, 'first question', 1)
+    // An override is present: a failed read hashed as "no override" would look like a change.
+    expect((await fetch(`${base}/api/workspaces/${wsId}/system-prompts`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ base: 'CUSTOM BASE PROMPT' }) })).status).toBe(200)
+    let failures = 1
+    const original = SystemPromptsStore.prototype.load
+    const load = vi.spyOn(SystemPromptsStore.prototype, 'load').mockImplementation(function (this: SystemPromptsStore, ...args) {
+      if (failures-- > 0) return Promise.reject(new Error('prompts read failed'))
+      return original.apply(this, args)
+    })
+    try {
+      const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })
+      const body = await response.json() as { error?: string }
+      const ends = (await readLog(logPath)).filter((event) => event.type === 'compaction/end')
+      expect(String(body.error ?? '')).not.toMatch(/context revision changed/)
+      if (name === 'effective') {
+        expect(response.status).toBe(409)
+        expect(body.error).toMatch(/compaction fit not verified/)
+      } else {
+        expect(response.status).toBe(200)
+        expect(ends.at(-1)).toMatchObject({ contextEffect: 'replaced', measurement: { unavailableReason: 'preview-failed' } })
+      }
+    } finally { load.mockRestore() }
+  })
+
+  it.each([
+    ['effective', true, 0],
+    ['legacy', false, 1],
+  ] as const)('%s: a CLAUDE.md edit during the preview does not fail a mode that never reads workspace instructions', async (_name, effective, spared) => {
+    const { provider: llm } = provider()
+    const { home, base, wsId } = await start(llm, effective ? { compactionEffectiveEnabled: true } : {})
+    const quiet = ['---', 'name: Quiet', 'history: compact', 'workspaceInstructions: false', '---', '', 'No instructions.'].join('\n')
+    expect((await fetch(`${base}/api/workspaces/${wsId}/modes/quiet`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: quiet }) })).status).toBe(200)
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    expect((await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId: 'quiet' }) })).status).toBe(200)
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    await exchangeWithAttachment(base, wsId, id, logPath)
+    let calls = 0
+    let release!: () => void
+    let entered!: () => void
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const waiting = new Promise<void>((resolve) => { entered = resolve })
+    const original = AttachmentStore.prototype.load
+    const load = vi.spyOn(AttachmentStore.prototype, 'load').mockImplementation(async function (this: AttachmentStore, ...args) {
+      if (calls++ >= spared) { entered(); await gate }
+      return original.apply(this, args)
+    })
+    try {
+      const pending = fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })
+      await waiting
+      await fs.writeFile(path.join(home, 'workspaces', wsId, 'CLAUDE.md'), 'EDITED WHILE PREVIEWING')
+      release()
+      const response = await pending
+      expect(response.status).toBe(200)
+      expect((await readLog(logPath)).filter((event) => event.type === 'compaction/end').at(-1)!.error).toBeUndefined()
+    } finally { load.mockRestore() }
   })
 })
 
