@@ -54,6 +54,15 @@ it('a fetch for the previous session resolving after a switch never reaches the 
   expect(seen.manifest).toMatchObject({ budget: { usedTokens: 222 } })
 })
 
+it('no workspace or session (home, unsent draft) is "none", never an endless "loading"', async () => {
+  await act(async () => root!.render(<Probe ws="w" session={null} refresh="0" />))
+  await act(async () => { await vi.advanceTimersByTimeAsync(200) })
+  expect(seen).toEqual({ manifest: null, status: 'none' })
+  expect(fetch).not.toHaveBeenCalled()
+  await act(async () => root!.render(<Probe ws={null} session="A" refresh="0" />))
+  expect(seen).toEqual({ manifest: null, status: 'none' })
+})
+
 it('204 is "none"; any other HTTP failure is "error", and the same session refreshes after 150 ms', async () => {
   await render('A')
   await act(async () => { await vi.advanceTimersByTimeAsync(0) })

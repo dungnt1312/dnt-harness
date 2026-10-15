@@ -133,9 +133,9 @@ export function formatBytes(bytes: number): string {
 }
 
 /**
- * `139k → 42k tokens`, or `undefined` when the compaction was not measured.
- * A reported "before" and an estimated "after" are different tokenizers, so
- * they are labeled instead of presented as one comparable pair. Scalar-only
+ * `139k → 42k estimated tokens`, or `undefined` when the compaction was not
+ * measured. Equal bases are named once; a reported "before" and an estimated
+ * "after" are different tokenizers, so each side is labeled. Scalar-only
  * (older) events carry no basis and count as estimates.
  */
 export function compactionTokenChange(change: { readonly tokensBefore?: number; readonly tokensAfter?: number; readonly measurement?: CompactionMeasurementView }): string | undefined {
@@ -144,7 +144,7 @@ export function compactionTokenChange(change: { readonly tokensBefore?: number; 
   const after = formatTokenCount(change.tokensAfter)
   const beforeBasis = change.measurement?.before?.basis ?? 'estimated'
   const afterBasis = change.measurement?.after?.basis ?? 'estimated'
-  return beforeBasis === afterBasis ? `${before} → ${after} tokens` : `${before} ${beforeBasis} → ${after} ${afterBasis} tokens`
+  return beforeBasis === afterBasis ? `${before} → ${after} ${beforeBasis} tokens` : `${before} ${beforeBasis} → ${after} ${afterBasis} tokens`
 }
 
 /**

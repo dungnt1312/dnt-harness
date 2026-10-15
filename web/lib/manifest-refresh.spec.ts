@@ -32,8 +32,8 @@ it('advances on a terminal measured attempt but not on start, usage-less attempt
 })
 
 it('formats the before/after token change only when it was measured', () => {
-  expect(compactionTokenChange({ tokensBefore: 139_200, tokensAfter: 42_000 })).toBe('139k → 42k tokens')
-  expect(compactionTokenChange({ tokensBefore: 900, tokensAfter: 12_300 })).toBe('900 → 12.3k tokens')
+  expect(compactionTokenChange({ tokensBefore: 139_200, tokensAfter: 42_000 })).toBe('139k → 42k estimated tokens')
+  expect(compactionTokenChange({ tokensBefore: 900, tokensAfter: 12_300 })).toBe('900 → 12.3k estimated tokens')
   expect(compactionTokenChange({})).toBeUndefined()
   expect(compactionTokenChange({ tokensBefore: 10 })).toBeUndefined()
 })
@@ -43,7 +43,9 @@ it('labels both figures when the compaction compares a reported count with an es
   expect(compactionTokenChange({ ...change, measurement: { before: { tokens: 120_000, basis: 'reported' }, after: { tokens: 30_000, basis: 'estimated' } } }))
     .toBe('120k reported → 30k estimated tokens')
   expect(compactionTokenChange({ ...change, measurement: { before: { tokens: 120_000, basis: 'estimated' }, after: { tokens: 30_000, basis: 'estimated' } } }))
-    .toBe('120k → 30k tokens')
+    .toBe('120k → 30k estimated tokens')
+  expect(compactionTokenChange({ ...change, measurement: { before: { tokens: 120_000, basis: 'reported' }, after: { tokens: 30_000, basis: 'reported' } } }))
+    .toBe('120k → 30k reported tokens')
   // A scalar-only (older) event is an estimate on both sides, never "reported".
-  expect(compactionTokenChange(change)).not.toContain('reported')
+  expect(compactionTokenChange(change)).toBe('120k → 30k estimated tokens')
 })

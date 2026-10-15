@@ -110,20 +110,24 @@ test('request estimate becomes reported, matches the inspector, compacts into a 
   // The meter fills from the request manifest while the provider's usage is
   // still held back: an estimate, labeled so, and no reported count anywhere.
   const meter = openMeter(page)
-  await expect(meter).toBeVisible({ timeout: 30_000 })
-  await expect(meter).toHaveAccessibleName(/^Context window \S+ \/ 256K$/, { timeout: 30_000 })
-  expect(await meter.getAttribute('aria-label')).not.toContain('120K')
-  const held = await manifest(route)
-  expect(held?.usage?.last).toBeUndefined()
-  expect(held?.budget.estimated).toBe(true)
-  expect(held?.budget.usedTokens).toBeGreaterThan(0)
-  await meter.click()
-  await expect(page.getByRole('dialog')).toContainText(/Last request\s*estimated/, { timeout: 20_000 })
-  await page.keyboard.press('Escape')
+  try {
+    await expect(meter).toBeVisible({ timeout: 30_000 })
+    await expect(meter).toHaveAccessibleName(/^Context window \S+ \/ 256K$/, { timeout: 30_000 })
+    expect(await meter.getAttribute('aria-label')).not.toContain('120K')
+    const held = await manifest(route)
+    expect(held?.usage?.last).toBeUndefined()
+    expect(held?.budget.estimated).toBe(true)
+    expect(held?.budget.usedTokens).toBeGreaterThan(0)
+    await meter.click()
+    await expect(page.getByRole('dialog')).toContainText(/Last request\s*estimated/, { timeout: 20_000 })
+    await page.keyboard.press('Escape')
+  } finally {
+    // A failed assertion must not leave the turn held open (it would hang server.close()).
+    releaseUsage()
+  }
 
   // Releasing the report replaces the estimate: reported 120k over the
   // resolved window (the scripted model's window falls back to 256k).
-  releaseUsage()
   await expect(page.getByRole('button', { name: 'Context window 120K / 256K' })).toBeVisible({ timeout: 30_000 })
   await expect.poll(async () => {
     const body = await manifest(route)

@@ -9,7 +9,7 @@ interface Owned { readonly owner: string; readonly status: ContextStatus; readon
  * on the very render the selection changes, so a previous conversation's count
  * (or a made-up zero) is never shown. `refreshKey` re-fetches the same
  * conversation after a 150 ms debounce; a switch fetches at once. HTTP 204 is
- * `none` (no request yet); any other failure is `error`.
+ * `none` (no request yet, or no conversation selected); any other failure is `error`.
  */
 export function useContextManifest(workspaceId: string | null, sessionId: string | null, refreshKey: string): { readonly manifest: ContextView | null; readonly status: ContextStatus } {
   const [state, setState] = useState<Owned | null>(null)
@@ -40,5 +40,6 @@ export function useContextManifest(workspaceId: string | null, sessionId: string
   }, [workspaceId, sessionId, refreshKey])
 
   const owned = owner !== null && state?.owner === owner
+  if (owner === null) return { manifest: null, status: 'none' } // home or an unsent draft: nothing to load
   return { manifest: owned ? state.view : null, status: owned ? state.status : 'loading' }
 }
