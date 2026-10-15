@@ -26,6 +26,7 @@
  * writes live in the child's own log.
  */
 import { editLineCounts, editOccurrences, splitLines } from './line-diff.ts'
+import { patchReceipt } from '../../src/capabilities/fs/patch.ts'
 import type { SseEvent } from './types.ts'
 
 /** One landed call on a file, as recorded — what the turn's diff is drawn from. */
@@ -36,6 +37,8 @@ export type TurnEdit =
       readonly new: string
       /** The tool's receipt: carries the numbered snippet and replaceAll count. */
       readonly output: string
+      readonly oldLine?: number
+      readonly newLine?: number
     }
   | {
       readonly kind: 'write'
@@ -78,7 +81,7 @@ export interface TurnChanges {
 }
 
 /** Tool names whose success means a file changed. Case-insensitive. */
-const MUTATING_TOOLS = new Set(['write', 'edit'])
+const MUTATING_TOOLS = new Set(['write', 'edit', 'applypatch'])
 
 const mutating = (name: string): boolean => MUTATING_TOOLS.has(name.toLowerCase())
 
@@ -164,8 +167,8 @@ export function turnChanges(events: readonly SseEvent[]): ReadonlyMap<string, Tu
     if (event.type === 'tool/call') {
       const call = event.call
       if (call === undefined || !mutating(call.name)) continue
-      const path = call.args['path']
-      if (typeof path !== 'string' || path === '') continue
+      const path = call.name.toLowerCase() === 'applypatch' ? '' : call.args['path']
+      if (typeof path !== 'string' || (path === '' && call.name.toLowerCase() !== 'applypatch')) continue
       if (openTurnId === undefined) continue
       pending.set(call.id, { turn: openTurnId, path, write: call.name.toLowerCase() === 'write', args: call.args })
       continue
@@ -176,8 +179,25 @@ export function turnChanges(events: readonly SseEvent[]): ReadonlyMap<string, Tu
     const call = pending.get(callId)
     if (call === undefined) continue
     pending.delete(callId)
-    // A failed, denied or recovered write did not land: not a change, and
-    // its own error tool row already tells the story.
+    if (call.path === '') {
+      if (event.recovery === true) continue
+      const receipt = patchReceipt(event.output)
+      if (receipt === undefined || receipt.files.length === 0) continue
+      const draft = draftFor(call.turn)
+      if (draft.ts === undefined && event.timestamp !== undefined) draft.ts = event.timestamp
+      for (const change of receipt.files) {
+        const path = change.movePath ?? change.path
+        let file = draft.files.get(path)
+        if (file === undefined) {
+          file = { path, created: change.type === 'add', overwrote: false, added: 0, removed: 0, edits: [] }
+          draft.files.set(path, file)
+        }
+        const label = change.type === 'move' ? `moved from ${change.path}` : change.type === 'delete' ? 'deleted file' : ''
+        for (const edit of change.edits) landEdit(file, { kind: 'edit', ...edit, output: label })
+      }
+      continue
+    }
+    // Patch receipts above also preserve known changes from partial failures.
     if (event.ok !== true || event.recovery === true) continue
     const draft = draftFor(call.turn)
     if (draft.ts === undefined && event.timestamp !== undefined) draft.ts = event.timestamp

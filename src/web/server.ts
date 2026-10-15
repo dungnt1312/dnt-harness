@@ -37,7 +37,7 @@ import { PushError, PushService, type PushSender } from './push.ts'
 import { ChannelError, NotifyChannels, type ChannelFetch } from './notify-channels.ts'
 import { agentScope, type AgentScope } from '../harness/agent/scope.ts'
 import type { GrantedRoot } from '../harness/tools/types.ts'
-import { classifyGrantedRoots, classifyTarget, resolveInGrants, within } from '../capabilities/fs/grants.ts'
+import { classifyGrantedRoots, classifyTarget, resolveInGrants, targetPaths, within } from '../capabilities/fs/grants.ts'
 import { mergeGrants, parseAccess, projectGrants, validateGrantFolder, type GrantPolicy } from './folder-grants.ts'
 import { approvedPathOf, attachPathScopeGuard, type PathScopeGuard, type PathScopeMatch } from './path-scope-guard.ts'
 import type { Agent } from '../harness/agent/agent.ts'
@@ -158,7 +158,7 @@ import { memoryGuidance, memoryGuidanceAccess, memoryIndexes } from '../harness/
 import { todoWriteTool } from '../harness/tools/todo.ts'
 import { editImageTool, generateImageTool, type ImageToolOptions } from '../harness/tools/image-tools.ts'
 import { sendPreviewTool } from '../harness/tools/preview-tool.ts'
-import { describeImageTool } from '../harness/tools/describe-image.ts'
+import { describeImageBytes, describeImageTool } from '../harness/tools/describe-image.ts'
 import { generateVideoTool } from '../harness/tools/video-tools.ts'
 import { VideoStore, VideoStoreError } from '../harness/attachments/video-store.ts'
 import { loadPair, savePair, validatePairBody, type ModelPair } from './model-pair-store.ts'
@@ -809,7 +809,11 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const mcpGeneration = new Map<string, number>()
   const configWatch = new Map<string, string>()
   const drifted = new Set<string>()
-  const generationOf = (workspaceId: string): number => mcpGeneration.get(workspaceId) ?? 1
+  /** Per-server fences, so a change to one server never retires the others. */
+  const mcpServerGeneration = new Map<string, number>()
+  // Sum of two monotonic counters: bumps on a workspace-wide fence or on a fence of this server.
+  const generationOf = (workspaceId: string, serverName: string): number =>
+    (mcpGeneration.get(workspaceId) ?? 1) + (mcpServerGeneration.get(`${workspaceId}:${serverName}`) ?? 0)
   const journals = new Map<string, McpExecutionJournal>()
   const journalsOpening = new Map<string, Promise<McpExecutionJournal>>()
   const auditFaultFile = path.join(resourceHome, 'mcp-audit-fault.json')
@@ -1244,7 +1248,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     const roots = memoryOn && scope?.workspaceId !== undefined
       ? [memory.root({ workspaceId: scope.workspaceId }), ...(scope.projectId !== undefined ? [memory.root({ workspaceId: scope.workspaceId, projectId: scope.projectId })] : [])]
       : []
-    const childCanWrite = scope?.childOf === undefined || (scope.childOf.toolCeiling.includes('Write') || scope.childOf.toolCeiling.includes('Edit'))
+    const childCanWrite = scope?.childOf === undefined || scope.childOf.toolCeiling.some((name) => ['Write', 'Edit', 'ApplyPatch'].includes(name))
     const memoryGrants = roots.map((root) => ({ path: root, access: childCanWrite ? 'write' as const : 'read' as const }))
     if (scope?.projectId !== undefined) {
       try {
@@ -1270,7 +1274,12 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     return undefined
   })
 
-  for (const tool of fsTools()) {
+  // Read on an image file goes through the same vision model as DescribeImage.
+  const readImageVision = {
+    resolve: () => resolveVisionApi(pairOf('image-understanding'), list),
+    stream: (request: ModelRequest, exec: { readonly signal?: AbortSignal }) => kernel.ctx.llm.stream(request, exec.signal !== undefined ? { signal: exec.signal } : undefined),
+  }
+  for (const tool of fsTools({ describeImage: async (image, exec) => (await describeImageBytes(readImageVision, image, '', exec)).description })) {
     kernel.ctx.tools.register(tool)
   }
   // Background-process registry: host-owned, per session. The bridge appends
@@ -2141,9 +2150,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const hookAskKey = (owner: string | undefined, call: ToolCall): string => `${owner ?? ''}:${approvalCallFingerprint(call)}`
   /** Write/Edit aimed at hook settings or hook scripts (see isHookConfigPath). */
   const writesHookConfig = (call: ToolCall): boolean => {
-    if (call.name !== 'Write' && call.name !== 'Edit') return false
-    const target = call.args['path']
-    return typeof target === 'string' && isHookConfigPath(target, options.userClaudeDir !== undefined ? [options.userClaudeDir] : [])
+    return targetPaths(call).some(({ target, intent }) => intent === 'write' && isHookConfigPath(target, options.userClaudeDir !== undefined ? [options.userClaudeDir] : []))
   }
 
   /**
@@ -2703,17 +2710,22 @@ ${entry.description}`.toLowerCase().includes(query))
    * a fence-cancelled server would otherwise stay refused until someone pressed
    * Enable.
    */
-  async function fenceWorkspace(workspaceId: WorkspaceId): Promise<void> {
-    mcpGeneration.set(workspaceId, generationOf(workspaceId) + 1)
+  async function fenceWorkspace(workspaceId: WorkspaceId, servers?: readonly string[]): Promise<void> {
+    const fenced = (key: string): boolean => servers === undefined
+      ? key.startsWith(`${workspaceId}:`)
+      : servers.some((name) => key === `${workspaceId}:${name}`)
+    if (servers === undefined) mcpGeneration.set(workspaceId, (mcpGeneration.get(workspaceId) ?? 1) + 1)
+    else for (const name of servers) mcpServerGeneration.set(`${workspaceId}:${name}`, (mcpServerGeneration.get(`${workspaceId}:${name}`) ?? 0) + 1)
     // A config or secret change may be the fix: try failed servers again now.
     for (const key of [...mcpConnectFailures.keys()]) {
-      if (key.startsWith(`${workspaceId}:`)) mcpConnectFailures.delete(key)
+      if (fenced(key)) mcpConnectFailures.delete(key)
     }
     // The retired runtime's tools must not outlive it: if the server does not
     // come back, the model must not keep being offered them.
-    dropMcpDescriptors(workspaceId)
+    if (servers === undefined) dropMcpDescriptors(workspaceId)
+    else for (const name of servers) dropMcpDescriptors(workspaceId, name)
     for (const [key, client] of [...mcpClients]) {
-      if (!key.startsWith(`${workspaceId}:`)) continue
+      if (!fenced(key)) continue
       client.retire()
       await client.disconnect().catch(() => {})
       mcpClients.delete(key)
@@ -2735,10 +2747,10 @@ ${entry.description}`.toLowerCase().includes(query))
   }
 
   /** Durable intent → fence → atomic save → commit, for one desired-state file. */
-  async function writeDesiredState(workspaceId: WorkspaceId, mutation: 'config' | 'secrets', target: string, save: () => Promise<void>): Promise<void> {
+  async function writeDesiredState(workspaceId: WorkspaceId, mutation: 'config' | 'secrets', target: string, save: () => Promise<void>, servers?: readonly string[]): Promise<void> {
     const backup = await readFileIfPresent(target)
     const id = await mutations.begin({ mutation, workspaceId, target, backup })
-    await fenceWorkspace(workspaceId)
+    await fenceWorkspace(workspaceId, servers)
     try {
       await save()
       await mutations.commit(id)
@@ -2755,9 +2767,12 @@ ${entry.description}`.toLowerCase().includes(query))
       const next = transform(current)
       // Serialize OAuth publication with config writes, never with the network exchange.
       const changed = Object.keys(current.servers).filter((name) => oauthConfigIdentity(current.servers[name]) !== oauthConfigIdentity(next.servers[name]))
+      // Only servers whose entry changed lose their runtime; the rest keep running.
+      const touched = [...new Set([...Object.keys(current.servers), ...Object.keys(next.servers)])]
+        .filter((name) => JSON.stringify(current.servers[name] ?? null) !== JSON.stringify(next.servers[name] ?? null))
       const save = async (index: number): Promise<void> => {
         if (index === changed.length) {
-          await writeDesiredState(workspaceId, 'config', mcpStore.mcpPath(workspaceId), () => mcpStore.saveMcp(workspaceId, next))
+          await writeDesiredState(workspaceId, 'config', mcpStore.mcpPath(workspaceId), () => mcpStore.saveMcp(workspaceId, next), touched)
           return
         }
         await oauthStore.withPublicationLock(workspaceId, changed[index]!, async () => {
@@ -2905,7 +2920,7 @@ ${entry.description}`.toLowerCase().includes(query))
    */
   async function ensureMcpServer(workspaceId: WorkspaceId, serverName: string): Promise<McpServerClient> {
     const key = `${workspaceId}:${serverName}`
-    const currentGeneration = generationOf(workspaceId)
+    const currentGeneration = generationOf(workspaceId, serverName)
     const existing = mcpClients.get(key)
     if (existing !== undefined && mcpClientGeneration.get(key) !== currentGeneration) {
       existing.retire()
@@ -2921,7 +2936,7 @@ ${entry.description}`.toLowerCase().includes(query))
     if (mcpHostClosing || mcpCancelled.has(key)) throw new McpTransportError(`MCP server '${serverName}' connection is cancelled`)
     // Publish the promise synchronously before the first await: exactly one
     // process/HTTP session exists per (workspace, server).
-    const generationAtStart = generationOf(workspaceId)
+    const generationAtStart = generationOf(workspaceId, serverName)
     const connecting = (async (): Promise<McpServerClient> => {
       let client: McpServerClient | undefined
       try {
@@ -2945,7 +2960,7 @@ ${entry.description}`.toLowerCase().includes(query))
           // raw error detail or secret-bearing payload.
           if (event.isError) console.warn(`mcp [${serverName}] ${event.kind}: operation failed`)
         })
-        if (mcpCancelled.has(key) || generationAtStart !== generationOf(workspaceId)) {
+        if (mcpCancelled.has(key) || generationAtStart !== generationOf(workspaceId, serverName)) {
           throw new McpTransportError(`MCP server '${serverName}' connection was cancelled before start`)
         }
         mcpClients.set(key, client)
@@ -2956,7 +2971,7 @@ ${entry.description}`.toLowerCase().includes(query))
           await reconcileMcpTools(workspaceId, serverName, client as McpServerClient)
         })
         const latest = await mcpStore.loadMcp(workspaceId)
-        if (mcpHostClosing || mcpCancelled.has(key) || generationAtStart !== generationOf(workspaceId) || latest.servers[serverName]?.enabled !== true) {
+        if (mcpHostClosing || mcpCancelled.has(key) || generationAtStart !== generationOf(workspaceId, serverName) || latest.servers[serverName]?.enabled !== true) {
           await client.disconnect()
           throw new McpTransportError(`MCP server '${serverName}' connection was cancelled before publication`)
         }
@@ -3075,7 +3090,7 @@ ${entry.description}`.toLowerCase().includes(query))
               server: serverName,
               tool: tool.name,
               argsHash: auditHash(args),
-              generation: generationOf(scope.workspaceId),
+              generation: generationOf(scope.workspaceId, serverName),
               epoch: ownerLock.epoch,
               configRevision: scopedConfig.revision ?? 1,
               secretRevision: 1,
@@ -3137,14 +3152,14 @@ ${entry.description}`.toLowerCase().includes(query))
       })
       .map(async (server) => {
         const key = `${workspaceId}:${server.name}`
-        const generationAtStart = generationOf(workspaceId)
+        const generationAtStart = generationOf(workspaceId, server.name)
         try {
           await ensureMcpServer(workspaceId, server.name)
         } catch (error) {
           // A disable/close that cancelled this connect is not a failure, and
           // neither is a connect a config/secret change fenced off: it is simply
           // retried with the new settings by the next turn.
-          if (mcpHostClosing || mcpCancelled.has(key) || generationAtStart !== generationOf(workspaceId)) return
+          if (mcpHostClosing || mcpCancelled.has(key) || generationAtStart !== generationOf(workspaceId, server.name)) return
           recordMcpConnectFailure(workspaceId, server.name, error)
           console.warn(`web: MCP server '${server.name}' unavailable in ${workspaceId}; its tools are skipped this turn: ${error instanceof Error ? error.message : String(error)}`)
         }
@@ -3897,14 +3912,14 @@ ${entry.description}`.toLowerCase().includes(query))
         match.grantSnapshot ?? [],
         effectiveGrants(match.parentSessionId as SessionId, match.projectId as ProjectId, match.workspaceId as WorkspaceId | undefined),
       )
-    return classifyTarget({
+    return (match.paths ?? [approvedPathOf(match)]).some((target) => classifyTarget({
       root: workspaces.getProject(match.projectId as ProjectId, match.workspaceId as WorkspaceId | undefined).path,
       ...(current.length > 0 ? { additionalRoots: current } : {}),
       ...(deniedRoots !== undefined ? { deniedRoots } : {}),
-    }, match.path, match.intent).kind === 'out-of-grant'
+    }, target.path, target.intent).kind === 'out-of-grant')
   }
   const scopeWarningOf = (match: PathScopeMatch): string =>
-    `Outside granted folders: ${match.path} (${match.intent === 'write' ? 'write' : 'read'})`
+    `Outside granted folders: ${(match.paths ?? [approvedPathOf(match)]).map((target) => `${target.path} (${target.intent})`).join(', ')}`
   kernel.ctx.tools.setAuthorityRetirer((executionId) => {
     approvalReceipts.retire(executionId)
     dangerousGuard.retire(executionId)
@@ -3917,7 +3932,7 @@ ${entry.description}`.toLowerCase().includes(query))
     const scope = agentScope.getStore()
     const match = pathScope.take(exec?.executionId ?? scope?.sessionId, call, allowed)
     if (match === undefined) return undefined
-    return [approvedPathOf(match)]
+    return match.paths ?? [approvedPathOf(match)]
   })
 
   const hostAuthority = async (call: ToolCall, scope: ApprovalScope): Promise<AuthorityDecision> => {
@@ -3937,9 +3952,9 @@ ${entry.description}`.toLowerCase().includes(query))
         const policy = effectivePolicy(mode.permissionDefaults ?? {}, options.yolo === true)
         const normalPermission = resolvePermission(policy, call.name, { defaultMode: options.defaultMode ?? 'ask' })
         const grant = agentScope.getStore() !== undefined ? kernel.ctx.tools.currentGrant() : undefined
-        const target = (call.name === 'Write' || call.name === 'Edit') && typeof call.args['path'] === 'string' ? call.args['path'] : undefined
-        const memoryWrite = target !== undefined && grant !== undefined && grant.memoryRoots?.some((root) => within(root, path.resolve(grant.root, target))) === true
-          && classifyTarget(grant, target, 'write').kind === 'in-grant'
+        const writeTargets = targetPaths(call).filter(({ intent }) => intent === 'write')
+        const memoryWrite = writeTargets.length > 0 && grant !== undefined && writeTargets.every(({ target }) => grant.memoryRoots?.some((root) => within(root, path.resolve(grant.root, target))) === true
+          && classifyTarget(grant, target, 'write').kind === 'in-grant')
         // Only an `ask` becomes allow for a memory path; `classifyTarget` +
         // `resolveInGrants` restrict that path to `.md` files outside
         // `.git`/`.env`/`secrets`/`skills`/`agents`/`commands`. A deny —
@@ -3962,7 +3977,7 @@ ${entry.description}`.toLowerCase().includes(query))
         const risky = options.yolo === true ? null : riskyBashMatch(mode, call)
         if (risky !== null) requirements.push({ kind: 'risky-command', subjectFingerprint: createHash('sha256').update(`risky:${risky.ruleId}`).digest('hex') })
         const outside = pathScope.get(executionId, call)
-        if (outside !== undefined && currentOutsideRequirement(outside, mode.outOfGrant)) requirements.push({ kind: 'outside-path', subjectFingerprint: createHash('sha256').update(`${outside.path}:${outside.intent}`).digest('hex') })
+        if (outside !== undefined && currentOutsideRequirement(outside, mode.outOfGrant)) requirements.push({ kind: 'outside-path', subjectFingerprint: createHash('sha256').update(JSON.stringify(outside.paths ?? [approvedPathOf(outside)])).digest('hex') })
         const guardEvaluation = await dangerousGuard.evaluate(call, workspaceId, {
           workspaceId,
           sessionId,
@@ -4834,8 +4849,8 @@ interface HandlerDeps {
   readonly oauthStore: OAuthStore
   /** Validated `oauthOrigins`: https origins this host may use as an OAuth redirect. */
   readonly oauthOrigins: readonly string[]
-  readonly generationOf: (workspaceId: string) => number
-  readonly fenceWorkspace: (workspaceId: WorkspaceId) => Promise<void>
+  readonly generationOf: (workspaceId: string, serverName: string) => number
+  readonly fenceWorkspace: (workspaceId: WorkspaceId, servers?: readonly string[]) => Promise<void>
   readonly closeStreamsFor: (principalId: string) => void
   readonly liveStreams: { principalId: string | undefined; close: () => void }[]
   readonly containmentDetail: string
@@ -6086,7 +6101,7 @@ async function handleApi(
               ...(toolSchemaTokens > 0 ? { toolSchemaTokens } : {}),
               breakerOpenUntil: client !== undefined && client.breakerOpenUntil > Date.now() ? client.breakerOpenUntil : null,
               containment: deps.containmentDetail,
-              generation: deps.generationOf(wsId),
+              generation: deps.generationOf(wsId, server.name),
               auditFault,
               revision,
               stale: deps.isDrifted(wsId),
@@ -6220,7 +6235,7 @@ async function handleApi(
               send(409, { error: 'MCP server changed while enable was preparing; retry against the current config' })
               return
             }
-            committedGeneration = deps.generationOf(wsId)
+            committedGeneration = deps.generationOf(wsId, serverName)
           } else {
             // Reconnect never re-authorizes: a changed executable stays refused.
             const reconnected = await deps.updateMcpConfig(wsId, (current) => {
@@ -6231,14 +6246,14 @@ async function handleApi(
               send(409, { error: 'MCP server changed while reconnect was preparing; retry against the current config' })
               return
             }
-            committedGeneration = deps.generationOf(wsId)
+            committedGeneration = deps.generationOf(wsId, serverName)
           }
           if (action === 'reconnect') await deps.cancelMcpConnection(wsId, serverName)
           // A newer disable/save may have landed after this request committed
           // but before it reached publication. Never let the stale request
           // clear that mutation's cancellation marker and resurrect a server.
           const publishConfig = await deps.mcpStore.loadMcp(wsId)
-          if (deps.generationOf(wsId) !== committedGeneration || publishConfig.servers[serverName]?.enabled !== true) {
+          if (deps.generationOf(wsId, serverName) !== committedGeneration || publishConfig.servers[serverName]?.enabled !== true) {
             send(409, { error: 'MCP server changed before connection publication; retry against the current config' })
             return
           }
@@ -6246,7 +6261,7 @@ async function handleApi(
           // Fresh/singleton connect; ensureMcpServer lists + reconciles tools.
           // A failure is remembered so the row says why instead of "connecting".
           const client = await deps.ensureMcpServer(wsId, serverName).catch((error: unknown) => {
-            if (deps.generationOf(wsId) === committedGeneration && !deps.mcpCancelled.has(`${wsId}:${serverName}`)) {
+            if (deps.generationOf(wsId, serverName) === committedGeneration && !deps.mcpCancelled.has(`${wsId}:${serverName}`)) {
               deps.recordMcpConnectFailure(wsId, serverName, error)
             }
             throw error

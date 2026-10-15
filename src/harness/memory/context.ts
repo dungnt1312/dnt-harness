@@ -14,7 +14,7 @@ export function memoryRoots(memory: MemoryService, scope: { workspaceId: Workspa
  * file tool can reach memory, so no guidance is injected).
  */
 export function memoryGuidanceAccess(exposed: readonly string[]): 'read' | 'write' | undefined {
-  if (exposed.includes('Write') || exposed.includes('Edit')) return 'write'
+  if (exposed.includes('Write') || exposed.includes('Edit') || exposed.includes('ApplyPatch')) return 'write'
   if (exposed.some((name) => name === 'Read' || name === 'Glob' || name === 'Grep')) return 'read'
   return undefined
 }

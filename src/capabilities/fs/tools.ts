@@ -12,6 +12,7 @@
  * a guarantee against hostile external filesystem races.
  */
 import { promises as fs } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import type { PathIntent, ToolDefinition, ToolExecution } from '../../harness/tools/types.ts'
 import { displayPath, resolveInGrants } from './grants.ts'
@@ -19,6 +20,9 @@ import { expandGlob, searchFiles, searchOutput } from './search.ts'
 import { canonical, observe, replaceFile, requirementFor, withFileLock } from './observation.ts'
 import { findEditMatch, foldEol, formatLines, type MatchStrategy } from './edit-match.ts'
 import { GrepTimeoutError, runGrep, type GrepMode } from './grep-worker.ts'
+import { sniffImage } from '../../harness/tools/image-tools.ts'
+import { parsePatch, type PatchFileReceipt, type PatchReceipt } from './patch.ts'
+import { patchSplices } from './patch-match.ts'
 import {
   BinaryFileError,
   decodeDocument,
@@ -132,12 +136,21 @@ async function createExclusive(file: string, bytes: Uint8Array): Promise<void> {
   }
 }
 
+/** Turns image bytes into text for `Read` (host-provided: a vision model). */
+export type DescribeImageFile = (image: { readonly bytes: Buffer; readonly mediaType: string }, exec: ToolExecution) => Promise<string>
+
+export interface FsToolsOptions {
+  /** When set, `Read` on a png/jpeg/gif/webp returns this description instead of refusing the binary. */
+  readonly describeImage?: DescribeImageFile
+}
+
 /** The `Read` tool: a numbered line window of a text file. */
-export function readTool(): ToolDefinition {
+export function readTool(options: FsToolsOptions = {}): ToolDefinition {
   return {
     name: 'Read',
     description: [
       'Read a text file inside the workspace or a granted folder.',
+      ...(options.describeImage !== undefined ? ['An image file (png, jpeg, gif, webp) returns a text description from the vision model instead; offset/limit do not apply.'] : []),
       "Output lines are \"<line number><TAB><text>\"; the number and tab are NOT part of the file, so never copy them into Edit's `old`.",
       `Returns up to ${READ_DEFAULT_LINES} lines from \`offset\` (1-based); a footer says when more lines remain and which offset continues.`,
       "Line endings are shown as plain newlines whatever the file uses; edits keep the file's own line endings.",
@@ -159,6 +172,8 @@ export function readTool(): ToolDefinition {
       const abs = await granted(exec, rel, 'read')
       const bytes = await readBytes(abs, rel)
       if (bytes === undefined) throw new Error(`no such file: ${rel}`)
+      const mediaType = options.describeImage !== undefined ? sniffImage(bytes) : null
+      if (mediaType !== null) return `[image ${rel} (${mediaType}), described by the vision model]\n${await options.describeImage!({ bytes, mediaType }, exec)}`
       const doc = decodeDocument(bytes, rel)
       observe(exec, await canonical(abs), doc.hash)
 
@@ -533,7 +548,131 @@ export function grepTool(): ToolDefinition {
   }
 }
 
+async function patchCanonical(file: string): Promise<string> {
+  try { return await fs.realpath(file) } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    const parent = path.dirname(file)
+    if (parent === file) throw error
+    return path.join(await patchCanonical(parent), path.basename(file))
+  }
+}
+
+/** Publish a complete new file without overwriting a racing creator. */
+async function createPatchFile(file: string, bytes: Buffer, mode?: number): Promise<void> {
+  const temporary = path.join(path.dirname(file), `.patch-${randomUUID()}`)
+  try {
+    await createExclusive(temporary, bytes)
+    if (mode !== undefined) await fs.chmod(temporary, mode)
+    await fs.link(temporary, file)
+  } finally {
+    await fs.unlink(temporary).catch(() => {})
+  }
+}
+
+/** Structured multi-region/file edits, fully verified before publication. */
+export function applyPatchTool(): ToolDefinition {
+  return {
+    name: 'ApplyPatch',
+    description: 'Apply multiple local diff hunks or file changes in one call. Prefer this over repeated Edit calls for distant regions. Input must start with *** Begin Patch and end with *** End Patch. Use *** Update File: path, then @@ (optionally followed by an exact context line), then lines prefixed with space (context), - (remove), + (add). Multiple @@ hunks use original-file order and exact unique context, not numeric git diff headers. *** End of File anchors a hunk to EOF. *** Add File: path uses + content lines; *** Delete File: path deletes a file; *** Move to: path immediately after Update moves it to a new, absent destination. Existing files must have been Read and unchanged since. Preserves encoding/BOM/EOL and final-newline state. All files are verified before writes; I/O failure can leave partial changes, recorded in the error receipt. Re-read before retrying a partial failure. Do not use shell scripts to bypass verification.',
+    requiresRoot: true,
+    parameters: { type: 'object', properties: { patch_text: { type: 'string', description: 'Complete structured patch text, including Begin/End Patch markers' } }, required: ['patch_text'] },
+    async execute(args, exec) {
+      const sections = parsePatch(argString(args, 'patch_text'))
+      const targets = new Map<string, string>()
+      for (const section of sections) {
+        for (const rel of [section.path, ...(section.movePath !== undefined ? [section.movePath] : [])]) {
+          const target = await patchCanonical(await granted(exec, rel, 'write'))
+          const key = process.platform === 'win32' ? target.toLowerCase() : target
+          if ([...targets.values()].some((value) => (process.platform === 'win32' ? value.toLowerCase() : value) === key)) throw new Error(`duplicate patch target: ${rel}`)
+          targets.set(rel, target)
+        }
+      }
+      const locks = [...targets.values()].sort()
+      const locked = async (index: number): Promise<string> => index < locks.length
+        ? withFileLock(locks[index]!, exec.signal, () => locked(index + 1))
+        : apply()
+      const apply = async (): Promise<string> => {
+        const checked = async (rel: string): Promise<string> => {
+          const now = await granted(exec, rel, 'write')
+          if (await patchCanonical(now) !== targets.get(rel)) throw new Error(`conflict: ${rel} changed path; Read it again`)
+          return now
+        }
+        const absent = async (rel: string): Promise<void> => {
+          try { await fs.lstat(await checked(rel)) } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+            throw error
+          }
+          throw new Error(`file already exists: ${rel}`)
+        }
+        const plans: { receipt: PatchFileReceipt; bytes?: Buffer; hash?: string }[] = []
+        for (const section of sections) {
+          const abs = await checked(section.path)
+          if (section.type === 'add') {
+            await absent(section.path)
+            const content = section.content ?? ''
+            plans.push({ receipt: { path: section.path, type: 'add', edits: [{ old: '', new: content, oldLine: 1, newLine: 1 }] }, bytes: encodeForWrite(content, undefined) })
+            continue
+          }
+          const current = await readBytes(abs, section.path)
+          if (current === undefined) throw new Error(`no such file: ${section.path}`)
+          const doc = decodeDocument(current, section.path)
+          assertObserved(exec, targets.get(section.path)!, section.path, doc.hash, undefined, 'patching')
+          if (!doc.writable) throw new Error(`${section.path} is not valid UTF-8; refusing to patch`)
+          if (section.type === 'delete') {
+            plans.push({ receipt: { path: section.path, type: 'delete', edits: [{ old: doc.text, new: '', oldLine: 1, newLine: 1 }] }, hash: doc.hash })
+            continue
+          }
+          const { splices, edits } = patchSplices(doc.text, section.hunks)
+          const bytes = encodeRaw(spliceDocument(doc, splices), doc)
+          if (section.movePath !== undefined) await absent(section.movePath)
+          else if (hashBytes(bytes) === doc.hash) throw new Error(`no change: ${section.path}`)
+          plans.push({ receipt: { path: section.path, type: section.movePath !== undefined ? 'move' : 'update', ...(section.movePath !== undefined ? { movePath: section.movePath } : {}), edits }, bytes, hash: doc.hash })
+        }
+        const landed: PatchFileReceipt[] = []
+        try {
+          for (const plan of plans) {
+            if (exec.signal?.aborted) throw new Error('cancelled: stop requested during patch')
+            const file = plan.receipt
+            const source = await checked(file.path)
+            if (plan.hash !== undefined) {
+              const current = await readBytes(source, file.path)
+              if (current === undefined || hashBytes(current) !== plan.hash) throw new Error(`conflict: ${file.path} changed during patch`)
+            }
+            if (file.type === 'delete') {
+              await fs.unlink(source)
+              landed.push(file)
+            } else {
+              const dest = file.movePath ?? file.path
+              if (file.type === 'add' || file.type === 'move') {
+                await absent(dest)
+                await fs.mkdir(path.dirname(await checked(dest)), { recursive: true })
+                await createPatchFile(await checked(dest), plan.bytes!, file.type === 'move' ? (await fs.stat(source)).mode & 0o7777 : undefined)
+                observe(exec, targets.get(dest)!, hashBytes(plan.bytes!))
+                if (file.type === 'move') {
+                  // Record the destination even if removing the source subsequently fails.
+                  landed.push({ path: dest, type: 'add', edits: [{ old: '', new: decodeDocument(plan.bytes!, dest).text, oldLine: 1, newLine: 1 }] })
+                  await fs.unlink(await checked(file.path))
+                  landed.pop()
+                }
+              } else {
+                await replaceFile(source, plan.bytes!)
+                observe(exec, targets.get(dest)!, hashBytes(plan.bytes!))
+              }
+              landed.push(file)
+            }
+          }
+        } catch (error) {
+          const receipt: PatchReceipt = { tool: 'ApplyPatch', files: landed, error: String(error) }
+          throw new Error(JSON.stringify(receipt))
+        }
+        return JSON.stringify({ tool: 'ApplyPatch', files: landed } satisfies PatchReceipt)
+      }
+      return locked(0)
+    },
+  }
+}
+
 /** All filesystem tools (root resolved per execution from the granted scope). */
-export function fsTools(): ToolDefinition[] {
-  return [readTool(), writeTool(), editTool(), globTool(), grepTool()]
+export function fsTools(options: FsToolsOptions = {}): ToolDefinition[] {
+  return [readTool(options), writeTool(), editTool(), applyPatchTool(), globTool(), grepTool()]
 }

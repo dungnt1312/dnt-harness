@@ -1,5 +1,7 @@
 import { createContext, memo, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 import Icon, { type IconName } from '../common/Icon.tsx'
+import { patchReceipt } from '../../../src/capabilities/fs/patch.ts'
+import { turnFileDiffRows } from './TurnChangesCard.tsx'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
 import { DiffLines, LineCount, diffRowsFromEdit, diffRowsFromWrite, type DiffRow } from '../common/DiffLines.tsx'
 import CopyButton from '../common/CopyButton.tsx'
@@ -10,7 +12,7 @@ import { Markdown } from '../../Markdown.tsx'
 import { ThinkingPanel } from './ThinkingPanel.tsx'
 import { useHoldScroll } from '../../hooks/useStickToBottom.ts'
 import { budgetTone, compactionTokenChange, contextFill, formatBytes, formatElapsed, formatTime, formatTokenCount } from '../../lib/format.ts'
-import { agentAction, exitIsAnswer, isDenied, mcpServerOf, toolFacts, type ToolFacts } from '../../lib/tool-facts.ts'
+import { agentAction, exitIsAnswer, isDenied, mcpServerOf, readImageOf, toolFacts, type ToolFacts } from '../../lib/tool-facts.ts'
 import { PATH_LINK_ATTR, ansiToHtml } from '../../lib/ansi.ts'
 import { commandBase, freeTextLinker, rebase, searchLinker, type LineLinker, type PathRef } from '../../lib/path-links.ts'
 import { Section, ToolArguments, preClass } from './ToolArguments.tsx'
@@ -622,6 +624,7 @@ function bucketOf(item: ViewItem): Bucket | null {
     case 'glob':
     case 'grep': return 'search'
     case 'bash': return 'command'
+    case 'applypatch':
     case 'edit':
     case 'write': return 'change'
     // Only a spawn starts an agent. A wait polls children already counted and
@@ -699,6 +702,7 @@ export function summarizeActivity(items: readonly ViewItem[], turnOpen = false):
       if (STATE_RANK.failed > STATE_RANK[state]) state = 'failed'
     }
     if (bucket === 'change' && facts.path !== undefined) changedPaths.add(facts.path)
+    if (item.call.name.toLowerCase() === 'applypatch') for (const file of patchReceipt(item.result?.output)?.files ?? []) changedPaths.add(file.movePath ?? file.path)
     if (bucket === 'file') {
       if (facts.path !== undefined) readPaths.add(facts.path)
       else unnamedReads += 1
@@ -830,6 +834,7 @@ function countLines(text: string): number {
 
 /** Lines an Edit replaced or a Write wrote, read from the call's own arguments. */
 function changeLines(item: Extract<ViewItem, { kind: 'tool' }>): { added: number; removed: number } {
+  if (item.call.name.toLowerCase() === 'applypatch') return toolFacts(item.call, item.result).lines ?? { added: 0, removed: 0 }
   const args = item.call.args
   const text = (key: string): string => (typeof args[key] === 'string' ? args[key] as string : '')
   if (item.call.name.toLowerCase() === 'write') return { added: countLines(text('content')), removed: 0 }
@@ -1606,6 +1611,16 @@ export const ToolCard = memo(function ToolCard({ item, openPath, hidden, repeats
   if (builtin === 'read' && facts.file !== undefined) {
     const settledClean = state === 'ok'
     const spec = toolRowSpec(item, state, facts, settledClean && open !== null ? { open, label: `Open ${facts.path ?? ''} in workbench` } : undefined, 1, undefined, withDuration)
+    // An image has no lines to open in the workbench's text view: what the
+    // vision model said about it is the only detail, so that row expands.
+    const image = settledClean ? readImageOf(result?.output) : null
+    if (image !== null) {
+      return (
+        <ActivityRow spec={spec} state={state}>
+          <Section label={`Description · ${image.mediaType}`}><div className="min-w-0 rounded-md border border-line border-l-2 border-l-line-strong bg-muted/40 px-3 py-2"><Markdown content={image.description} compact /></div></Section>
+        </ActivityRow>
+      )
+    }
     if (settledClean || state === 'running') return <ActivityRow spec={spec} state={state} expandable={false} />
     return (
       <ActivityRow spec={spec} state={state}>
@@ -1613,6 +1628,24 @@ export const ToolCard = memo(function ToolCard({ item, openPath, hidden, repeats
         {result === undefined
           ? <ResultPanel tone="plain" />
           : <ResultPanel output={result.output} tone={state === 'failed' ? 'bad' : state === 'denied' ? 'quiet' : 'plain'} />}
+      </ActivityRow>
+    )
+  }
+
+  if (builtin === 'applypatch') {
+    const receipt = patchReceipt(result?.output)
+    const spec: RowSpec = { icon: 'pencil', kind: state === 'running' ? 'Patching' : state === 'ok' ? 'Patched' : 'ApplyPatch', primary: facts.target, ...(facts.lines !== undefined ? { diff: facts.lines } : {}) }
+    return (
+      <ActivityRow spec={spec} state={state}>
+        <OutcomeNotes item={item} />
+        {receipt?.files.map((file) => {
+          const path = file.movePath ?? file.path
+          const label = file.type === 'delete' ? 'deleted file' : file.type === 'move' ? `moved from ${file.path}` : ''
+          const rows = turnFileDiffRows({ path, status: file.type === 'add' ? 'created' : 'modified', edits: file.edits.map((edit) => ({ kind: 'edit', ...edit, output: label })) })
+          const openFile = file.type === 'delete' ? null : openPath?.(path) ?? null
+          return <div key={path}><div className="mb-1 text-xs text-fg-muted">{openFile !== null ? <button type="button" className="hover:underline" onClick={openFile}>{path}</button> : path}</div><ChangePanel rows={rows} path={path} /></div>
+        })}
+        {receipt?.error !== undefined ? <ResultPanel output={receipt.error} tone="bad" /> : receipt === undefined ? <ResultPanel {...(result !== undefined ? { output: result.output } : {})} tone={state === 'failed' ? 'bad' : 'quiet'} /> : null}
       </ActivityRow>
     )
   }

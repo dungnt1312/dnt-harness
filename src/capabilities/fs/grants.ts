@@ -15,6 +15,7 @@
  * Still application-level containment, not an OS sandbox.
  */
 import { promises as fs } from 'node:fs'
+import { parsePatch } from './patch.ts'
 import path from 'node:path'
 import type { ToolCall } from '../../harness/llm/types.ts'
 import type { ApprovedPath, GrantedRoot, PathIntent, ToolExecution } from '../../harness/tools/types.ts'
@@ -332,6 +333,12 @@ export interface TargetPath {
  * tool itself reports bad arguments).
  */
 export function targetPaths(call: Pick<ToolCall, 'name' | 'args'>): TargetPath[] {
+  if (call.name === 'ApplyPatch') {
+    if (typeof call.args['patch_text'] !== 'string') return []
+    try {
+      return parsePatch(call.args['patch_text']).flatMap((section) => [section.path, ...(section.movePath !== undefined ? [section.movePath] : [])].map((target) => ({ target, intent: 'write' as const })))
+    } catch { return [] }
+  }
   const spec = PATH_ARGS[call.name]
   if (spec === undefined) return []
   const value = (call.args as Record<string, unknown>)[spec.arg]

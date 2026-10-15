@@ -81,7 +81,7 @@ export class McpConfigError extends Error {
 
 /** The reserved built-in tool identities (G4/G5 canonical list). */
 export const RESERVED_TOOL_NAMES = new Set([
-  'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'Skill',
+  'Read', 'Write', 'Edit', 'ApplyPatch', 'Glob', 'Grep', 'Bash', 'Skill',
   'MemorySearch', 'MemoryRead', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget', 'Agent',
 ])
 

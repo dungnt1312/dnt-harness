@@ -1,7 +1,7 @@
 import type { ModeDefinition } from './types.ts'
 
 /** Tool ceiling shared by every bundled mode that can change the workspace. */
-const WORKSPACE_TOOLS: readonly string[] = ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion', 'GenerateImage', 'EditImage', 'DescribeImage', 'GenerateVideo', 'SendPreview']
+const WORKSPACE_TOOLS: readonly string[] = ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'ApplyPatch', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion', 'GenerateImage', 'EditImage', 'DescribeImage', 'GenerateVideo', 'SendPreview']
 
 /**
  * The five bundled modes, in picker order (the ZCode ladder: Plan, Ask before
@@ -54,7 +54,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     toolExposure: WORKSPACE_TOOLS,
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow',
-      Write: 'ask', Edit: 'ask', Bash: 'ask',
+      Write: 'ask', Edit: 'ask', ApplyPatch: 'ask', Bash: 'ask',
       // Background-process control only touches processes the agent itself
       // spawned, so it stays allowed even where Bash asks.
       BashOutput: 'allow', KillShell: 'allow',
@@ -81,6 +81,8 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     toolExposure: WORKSPACE_TOOLS,
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow',
+      // ApplyPatch can delete files, unlike Edit/Write.
+      ApplyPatch: 'ask',
       // A child's own calls re-enter this same policy, so delegating cannot
       // widen what the conversation may already do.
       Bash: 'ask', BashOutput: 'allow', KillShell: 'allow', Skill: 'allow', Agent: 'allow',
@@ -101,7 +103,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
     toolExposure: WORKSPACE_TOOLS,
     permissionDefaults: {
-      Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow', Bash: 'allow',
+      Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow', ApplyPatch: 'allow', Bash: 'allow',
       BashOutput: 'allow', KillShell: 'allow',
       Skill: 'allow', Agent: 'allow',
       TodoWrite: 'allow',
@@ -123,7 +125,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
     toolExposure: WORKSPACE_TOOLS,
     permissionDefaults: {
-      Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow', Bash: 'allow',
+      Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow', ApplyPatch: 'allow', Bash: 'allow',
       BashOutput: 'allow', KillShell: 'allow',
       Skill: 'allow', Agent: 'allow',
       TodoWrite: 'allow',

@@ -4,7 +4,7 @@
  * legacy names arriving from a model (or an old permission map) normalize
  * to canonical identity at the boundary — never as exposed duplicates.
  */
-export const CANONICAL_TOOLS = ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash'] as const
+export const CANONICAL_TOOLS = ['Read', 'Write', 'Edit', 'ApplyPatch', 'Glob', 'Grep', 'Bash'] as const
 
 export type CanonicalTool = (typeof CANONICAL_TOOLS)[number]
 
@@ -12,6 +12,8 @@ const LEGACY_MAP: Readonly<Record<string, CanonicalTool>> = {
   read: 'Read',
   write: 'Write',
   edit: 'Edit',
+  applypatch: 'ApplyPatch',
+  apply_patch: 'ApplyPatch',
   glob: 'Glob',
   grep: 'Grep',
   bash: 'Bash',

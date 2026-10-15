@@ -150,7 +150,7 @@ export interface BuildContextInput {
   }
 }
 
-const FILE_TOOLS = new Set(['Read', 'Write', 'Edit', 'Glob', 'Grep'])
+const FILE_TOOLS = new Set(['Read', 'Write', 'Edit', 'ApplyPatch', 'Glob', 'Grep'])
 
 /** The system line describing which folders file tools may use. */
 function fileScopeText(scope: NonNullable<BuildContextInput['fileScope']>): string {
@@ -365,7 +365,7 @@ export const CLEARED_TOOL_RESULT = '[Old tool result cleared to save context; re
  * compaction summary is decided separately and stricter — see
  * {@link clearLossOf}.
  */
-const COMPACTABLE_TOOLS = new Set(['Read', 'Glob', 'Grep', 'Bash', 'BashOutput', 'Write', 'Edit'])
+const COMPACTABLE_TOOLS = new Set(['Read', 'Glob', 'Grep', 'Bash', 'BashOutput', 'Write', 'Edit', 'ApplyPatch'])
 
 function isCompactableTool(name: string): boolean {
   return COMPACTABLE_TOOLS.has(name) || name.startsWith('mcp__')
@@ -621,7 +621,7 @@ export function buildContext(input: BuildContextInput): AssembledContext {
         'skill-catalog',
         { skills: String(skillCatalog.length) },
         [
-          'Available skills (name — description). When the user\'s task matches one, load it with the Skill tool before proceeding:',
+          'Available skills (name — description). When the user\'s task matches one, load it with the Skill tool before proceeding. A `[$name](skill://name)` link in a user message means the user picked that skill: load it. A `[@file](./path)` link names a project file.',
           ...skillCatalog.map((skill) => `- ${skill.name}: ${skill.description}`),
         ].join('\n'),
       )
