@@ -408,8 +408,52 @@ export function subscribeEventsIn(
   cursor?: number,
 ): () => void {
   const suffix = cursor !== undefined && Number.isSafeInteger(cursor) && cursor >= 0 ? `?cursor=${cursor}` : ''
-  const source = new EventSource(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/events${suffix}`)
-  return wire(source, onEnvelope, onState)
+  const base = `/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/events`
+  let last: number | undefined
+  const track = (envelope: Envelope, frame?: number): void => {
+    if (frame !== undefined) last = frame
+    onEnvelope(envelope, frame)
+  }
+  return reviving(
+    () => new EventSource(last !== undefined ? `${base}?cursor=${last}` : `${base}${suffix}`),
+    (source) => wire(source, track, onState),
+    onState,
+  )
+}
+
+/** A hide this long may have left a source the browser silently stopped reconnecting. */
+const LONG_HIDE_MS = 30_000
+
+/**
+ * Keep one EventSource alive across sleep and network changes: after a long
+ * hide, or when the network comes back, replace it with a fresh one (`open`
+ * resumes from the last frame the caller saw). A short hide keeps a healthy source.
+ */
+function reviving(open: () => EventSource, attach: (source: EventSource) => () => void, onState?: (state: StreamState) => void): () => void {
+  let source = open()
+  let detach = attach(source)
+  let hiddenAt: number | undefined
+  const swap = (): void => {
+    detach()
+    onState?.('reconnecting')
+    source = open()
+    detach = attach(source)
+  }
+  const doc = typeof document === 'undefined' ? undefined : document
+  const win = typeof window === 'undefined' ? undefined : window
+  const onVisibility = (): void => {
+    if (doc?.visibilityState === 'hidden') { hiddenAt = Date.now(); return }
+    const away = hiddenAt === undefined ? 0 : Date.now() - hiddenAt
+    hiddenAt = undefined
+    if (away >= LONG_HIDE_MS || source.readyState === EventSource.CLOSED) swap()
+  }
+  doc?.addEventListener('visibilitychange', onVisibility)
+  win?.addEventListener('online', swap)
+  return () => {
+    doc?.removeEventListener('visibilitychange', onVisibility)
+    win?.removeEventListener('online', swap)
+    detach()
+  }
 }
 
 function wire(
@@ -1941,17 +1985,20 @@ export function subscribeTerminals(
   onFrame: (frame: TerminalFrame) => void,
   onState?: (state: StreamState) => void,
 ): () => void {
-  const source = new EventSource('/api/workspaces/' + encodeURIComponent(workspaceId) + '/terminals/events')
-  source.onopen = () => onState?.('open')
-  source.onerror = () => {
-    onState?.(source.readyState === EventSource.CONNECTING ? 'reconnecting' : 'connecting')
-  }
-  source.onmessage = (message: MessageEvent<string>) => {
-    onFrame(JSON.parse(message.data) as TerminalFrame)
-  }
-  return () => {
-    source.close()
-  }
+  return reviving(
+    () => new EventSource('/api/workspaces/' + encodeURIComponent(workspaceId) + '/terminals/events'),
+    (source) => {
+      source.onopen = () => onState?.('open')
+      source.onerror = () => {
+        onState?.(source.readyState === EventSource.CONNECTING ? 'reconnecting' : 'connecting')
+      }
+      source.onmessage = (message: MessageEvent<string>) => {
+        onFrame(JSON.parse(message.data) as TerminalFrame)
+      }
+      return () => source.close()
+    },
+    onState,
+  )
 }
 
 // ── Dangerous command guard ───────────────────────────────────────────────
