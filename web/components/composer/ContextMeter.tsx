@@ -72,7 +72,7 @@ export function ContextMeter({ manifest, status = manifest === null ? 'none' : '
 
   return (
     <Menu
-      label={summary !== null ? `Context window ${summary}` : 'Context window'}
+      label={summary !== null ? `Context window ${summary}` : status === 'loading' ? 'Context window, loading' : status === 'error' ? 'Context window unavailable' : 'Context window'}
       panelRole="dialog"
       side="top"
       align="end"

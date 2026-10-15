@@ -122,6 +122,7 @@ describe('durable context accounting through HTTP',()=>{
       }
       expect(b.contextId).not.toBe(a.contextId)
       expect(b.usage?.last).toBeUndefined()
+      expect(b.display).toEqual({kind:'request',contextId:b.contextId})
       expect(b.usage).toMatchObject({cacheableInputTokens:a.usage.cacheableInputTokens,cachedInputTokens:a.usage.cachedInputTokens})
     }finally{spy?.mockRestore();release();await server.close();await fs.rm(home,{recursive:true,force:true})}
   })

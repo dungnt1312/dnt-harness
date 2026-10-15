@@ -22,7 +22,7 @@ export function bashOutputTool(options: { readonly processes: ProcessRegistry })
     parameters: {
       type: 'object',
       properties: {
-        processId: { type: 'string', description: 'the process id returned by Bash' },
+        processId: { type: 'string', description: 'the process id returned by Bash, including a command that moved to the background automatically' },
         block: { type: 'boolean', description: 'wait for completion; default false' },
         timeoutMs: { type: 'number', description: 'wait budget, default 30000, max 600000; never kills the process' },
       },

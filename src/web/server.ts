@@ -187,6 +187,7 @@ import { DEFAULT_BUDGET, resolveModelBudget, schemaCost, type ResolvedBudget } f
 import type { BuildContextInput, PreviewCompaction } from '../harness/context/builder.ts'
 import type { CompactionMeasurement } from '../harness/session/events.ts'
 import type { Restored } from '../harness/context/compaction.ts'
+import { isValidContextId } from '../harness/context/context-metrics.ts'
 import { createContextReducer, deriveContextState, isAvailableContext, type ContextReducer, type ContextResponse } from '../harness/context/context-state.ts'
 import { latestCalibration, pressureTokensOf, settledPressureTokens } from '../harness/context/calibration.ts'
 import { isValidTokenUsage } from '../harness/context/context-metrics.ts'
@@ -7579,11 +7580,12 @@ async function handleApi(
       const compactionSeq = committedView !== null && isAvailableContext(committedView) && committedView.display?.kind === 'post-compaction' ? committedView.display.compactionSeq : undefined
       const liveIsNewer = live !== undefined && (compactionSeq === undefined
         || entry.session.events.some((event) => event.type === 'context/manifest' && event.seq > compactionSeq && event.manifest.contextId === live.contextId))
+      const liveShown = live === undefined ? undefined : { ...live, ...(isValidContextId(live.contextId) ? { display: { kind: 'request' as const, contextId: live.contextId } } : {}) }
       const view = committedView !== null && isAvailableContext(committedView) && liveIsNewer
-        && live !== undefined && live.contextId !== committedView.contextId
+        && liveShown !== undefined && live?.contextId !== committedView.contextId
         // usage.last pairs only with its own contextId; session cache totals carry over.
-        ? { ...live, ...(committedView.usage !== undefined ? { usage: { cacheableInputTokens: committedView.usage.cacheableInputTokens, cachedInputTokens: committedView.usage.cachedInputTokens } } : {}) }
-        : committedView ?? live ?? null
+        ? { ...liveShown, ...(committedView.usage !== undefined ? { usage: { cacheableInputTokens: committedView.usage.cacheableInputTokens, cachedInputTokens: committedView.usage.cachedInputTokens } } : {}) }
+        : committedView ?? liveShown ?? null
       if (view === null) {
         res.writeHead(204); res.end(); return
       }
