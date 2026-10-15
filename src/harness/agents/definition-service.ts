@@ -19,6 +19,7 @@ import path from 'node:path'
 import { load as loadYaml } from 'js-yaml'
 import { replaceFileAtomic } from '../storage/events-jsonl.ts'
 import { KNOWN_MODE_TOOLS } from '../modes/known-tools.ts'
+import { isThinkingLevel, type ThinkingLevel } from '../llm/model-catalog.ts'
 
 export const BUNDLED_AGENT_ROLES = ['explorer', 'worker', 'reviewer', 'verifier'] as const
 
@@ -53,6 +54,8 @@ export interface AgentDefinition {
   readonly skills?: readonly string[]
   /** `inherit`/omitted inherits the session's model; aliases resolve at spawn. */
   readonly model?: string
+  /** Claude `effort`: the child's thinking level, over the parent's and the alias's. */
+  readonly effort?: ThinkingLevel
   /** Claude fields recognized but not enforced by dnt-harness (shown as warnings). */
   readonly unsupported?: readonly string[]
   /** Tool names the file listed that dnt-harness does not have (dropped). */
@@ -83,10 +86,10 @@ export class AgentDefinitionError extends Error {
 }
 
 /** Claude subagent frontmatter keys dnt-harness enforces. */
-const ENFORCED_KEYS = new Set(['name', 'description', 'tools', 'disallowedTools', 'skills', 'model', 'mcpServers'])
+const ENFORCED_KEYS = new Set(['name', 'description', 'tools', 'disallowedTools', 'skills', 'model', 'effort', 'mcpServers'])
 /** Claude keys recognized but not enforced: accepted, reported as warnings. */
 const UNSUPPORTED_KEYS = new Set([
-  'permissionMode', 'hooks', 'memory', 'color', 'effort', 'isolation', 'background', 'maxTurns',
+  'permissionMode', 'hooks', 'memory', 'color', 'isolation', 'background', 'maxTurns',
 ])
 
 /** Claude Code tool names → dnt-harness tools. `null` = no equivalent. */
@@ -214,6 +217,13 @@ export function parseAgentDefinition(fallbackName: string, raw: string): AgentDe
     }
   }
 
+  const rawEffort = frontmatter['effort']
+  let effort: ThinkingLevel | undefined
+  if (rawEffort !== undefined && rawEffort !== null) {
+    if (isThinkingLevel(rawEffort)) effort = rawEffort
+    else invalid.push("'effort' must be off|minimal|low|medium|high|xhigh|max")
+  }
+
   if (body === '') invalid.push('instructions body must not be empty')
   if (invalid.length > 0) {
     throw new AgentDefinitionError('invalid', `agent definition '${name}' is invalid: ${invalid.join('; ')}`)
@@ -228,6 +238,7 @@ export function parseAgentDefinition(fallbackName: string, raw: string): AgentDe
     ...(skills !== undefined ? { skills } : {}),
     ...(mcpServers !== undefined && mcpServers.length > 0 ? { mcpServers } : {}),
     ...(model !== undefined ? { model } : {}),
+    ...(effort !== undefined ? { effort } : {}),
     ...(unsupported.length > 0 ? { unsupported } : {}),
     ...(dropped.length > 0 ? { droppedTools: dropped } : {}),
     ...(warnings.length > 0 ? { warnings } : {}),
@@ -254,6 +265,7 @@ export function bundledDefinition(name: string): AgentDefinition {
       ].join(' '),
       tools: ['Read', 'Glob', 'Grep'],
       disallowedTools: READ_ONLY_DISALLOWED,
+      effort: 'low',
     }
   }
   if (name === 'worker') {
@@ -268,6 +280,7 @@ export function bundledDefinition(name: string): AgentDefinition {
       ].join(' '),
       tools: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'ApplyPatch', 'Bash', 'BashOutput', 'KillShell'],
       disallowedTools: [],
+      effort: 'medium',
     }
   }
   if (name === 'reviewer') {
@@ -281,6 +294,7 @@ export function bundledDefinition(name: string): AgentDefinition {
       ].join(' '),
       tools: ['Read', 'Glob', 'Grep'],
       disallowedTools: READ_ONLY_DISALLOWED,
+      effort: 'high',
     }
   }
   if (name === 'verifier') {
@@ -294,6 +308,7 @@ export function bundledDefinition(name: string): AgentDefinition {
       ].join(' '),
       tools: ['Read', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell'],
       disallowedTools: ['Write', 'Edit', 'ApplyPatch', 'Skill', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget'],
+      effort: 'low',
     }
   }
   throw new AgentDefinitionError('not-found', `no bundled agent role '${name}'`)
@@ -517,7 +532,7 @@ export class AgentDefinitionService {
 }
 
 /** Claude Code subagent document for a definition (used by the app's create/copy form). */
-export function serializeAgentDefinition(definition: Pick<AgentDefinition, 'name' | 'description' | 'instructions' | 'tools' | 'disallowedTools' | 'skills' | 'model' | 'inheritsTools' | 'mcpServers'>): string {
+export function serializeAgentDefinition(definition: Pick<AgentDefinition, 'name' | 'description' | 'instructions' | 'tools' | 'disallowedTools' | 'skills' | 'model' | 'effort' | 'inheritsTools' | 'mcpServers'>): string {
   const quote = (value: string): string => JSON.stringify(value)
   const lines = [
     '---',
@@ -534,6 +549,7 @@ export function serializeAgentDefinition(definition: Pick<AgentDefinition, 'name
     ...(definition.skills !== undefined && definition.skills.length > 0 ? [`skills: ${definition.skills.join(', ')}`] : []),
     ...(definition.mcpServers !== undefined && definition.mcpServers.length > 0 ? [`mcpServers: ${definition.mcpServers.join(', ')}`] : []),
     ...(definition.model !== undefined ? [`model: ${definition.model}`] : []),
+    ...(definition.effort !== undefined ? [`effort: ${definition.effort}`] : []),
     '---',
     '',
     definition.instructions.trim(),
