@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { deleteWorkspace, renameWorkspace, setWorkspaceArchived } from '../../lib/api.ts'
+import { deleteWorkspace, HttpError, renameWorkspace, setWorkspaceArchived } from '../../lib/api.ts'
 import { useToast } from '../common/Toast.tsx'
 import { ErrorNotice } from '../common/ErrorNotice.tsx'
 import ConfirmDialog from '../common/ConfirmDialog.tsx'
@@ -10,7 +10,13 @@ import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import { cn } from '../../lib/cn.ts'
 import type { WorkspaceRow } from '../../lib/types.ts'
 
-type PendingAction = { readonly kind: 'archive' | 'delete'; readonly workspace: WorkspaceRow }
+/** `force-delete` is the second confirm, reached only after a plain delete answered `workspace-not-empty`. */
+type PendingAction = { readonly kind: 'archive' | 'delete' | 'force-delete'; readonly workspace: WorkspaceRow }
+
+function isNotEmpty(cause: unknown): boolean {
+  if (!(cause instanceof HttpError) || cause.status !== 409) return false
+  try { return (JSON.parse(cause.body) as { code?: unknown }).code === 'workspace-not-empty' } catch { return false }
+}
 
 /**
  * Workspace switch + manage list: rows with status badges and an action zone
@@ -65,12 +71,16 @@ export function WorkspacePopover({ workspaces, activeWorkspaceId, onSelect, onCh
         await setWorkspaceArchived(pending.workspace.id, next)
         toast.notify(next ? 'Workspace archived.' : 'Workspace restored.', 'ok')
       } else {
-        await deleteWorkspace(pending.workspace.id)
+        await deleteWorkspace(pending.workspace.id, pending.kind === 'force-delete')
         toast.notify('Workspace deleted.', 'ok')
       }
       await onChanged()
       setPending(null)
     } catch (cause) {
+      if (pending.kind === 'delete' && isNotEmpty(cause)) {
+        setPending({ kind: 'force-delete', workspace: pending.workspace })
+        return
+      }
       // Keep the dialog open: the server message is the decision context.
       setPendingError(String(cause))
     } finally {
@@ -149,8 +159,8 @@ export function WorkspacePopover({ workspaces, activeWorkspaceId, onSelect, onCh
       {pending !== null ? (
         <ConfirmDialog
           open
-          title={pending.kind === 'archive' ? `${pending.workspace.archived ? 'Restore' : 'Archive'} "${pending.workspace.name}"?` : `Delete "${pending.workspace.name}"?`}
-          confirmLabel={pending.kind === 'archive' ? (pending.workspace.archived ? 'Restore' : 'Archive') : 'Delete'}
+          title={pending.kind === 'archive' ? `${pending.workspace.archived ? 'Restore' : 'Archive'} "${pending.workspace.name}"?` : pending.kind === 'force-delete' ? `Delete non-empty "${pending.workspace.name}"?` : `Delete "${pending.workspace.name}"?`}
+          confirmLabel={pending.kind === 'archive' ? (pending.workspace.archived ? 'Restore' : 'Archive') : pending.kind === 'force-delete' ? 'Delete everything' : 'Delete'}
           busy={busy}
           onConfirm={() => void runPending()}
           onDismiss={() => { if (!busy) setPending(null) }}
@@ -158,7 +168,9 @@ export function WorkspacePopover({ workspaces, activeWorkspaceId, onSelect, onCh
             <>
               {pending.kind === 'archive'
                 ? <p className="m-0">Archived workspaces remain in the switcher but stop accepting new sessions and projects. Existing conversations are kept.</p>
-                : <p className="m-0">Only empty workspaces can be deleted. A workspace with conversations or projects answers with the reason below instead of deleting anything.</p>}
+                : pending.kind === 'force-delete'
+                  ? <p className="m-0">This workspace still has conversations or projects. Deleting it permanently removes all of them and cannot be undone. Project folders on disk are not touched.</p>
+                  : <p className="m-0">An empty workspace is deleted right away. If it still has conversations or projects, you will be asked once more before anything is removed.</p>}
               {pendingError !== null ? <ErrorNotice raw={pendingError} /> : null}
             </>
           )}

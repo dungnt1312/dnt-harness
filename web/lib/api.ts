@@ -463,9 +463,9 @@ export function setWorkspaceArchived(workspaceId: string, archived: boolean): Pr
   }).then((r) => json<WorkspaceRow>(r))
 }
 
-/** Delete an empty workspace; non-empty workspaces answer 409. */
-export function deleteWorkspace(workspaceId: string): Promise<{ readonly deleted: boolean }> {
-  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}`, { method: 'DELETE' }).then((r) =>
+/** Delete an empty workspace; a non-empty one answers 409 `workspace-not-empty` unless `force` removes its sessions and projects too. */
+export function deleteWorkspace(workspaceId: string, force = false): Promise<{ readonly deleted: boolean }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}${force ? '?force=true' : ''}`, { method: 'DELETE' }).then((r) =>
     json<{ readonly deleted: boolean }>(r),
   )
 }

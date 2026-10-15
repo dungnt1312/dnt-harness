@@ -252,18 +252,22 @@ export class WorkspaceService {
    * folders are never touched (their metadata dies with the record, the
    * user's repository does not).
    */
-  async delete(id: WorkspaceId): Promise<void> {
+  async delete(id: WorkspaceId, options: { readonly force?: boolean } = {}): Promise<void> {
     this.get(id)
     // The last workspace cannot go away: the host needs a live default.
     if (this.workspaces.size <= 1) {
       throw new ScopeError('last-workspace', 'cannot delete the last workspace')
     }
-    if ((await this.listSessionsDir(id)).length > 0) {
-      throw new ScopeError('workspace-not-empty', `workspace '${id}' still holds sessions`)
+    // `force`: the caller already tore down sessions/projects; whatever is left on disk goes too.
+    if (options.force !== true) {
+      if ((await this.listSessionsDir(id)).length > 0) {
+        throw new ScopeError('workspace-not-empty', `workspace '${id}' still holds sessions`)
+      }
+      if (this.listProjects(id).length > 0) {
+        throw new ScopeError('workspace-not-empty', `workspace '${id}' still holds projects`)
+      }
     }
-    if (this.listProjects(id).length > 0) {
-      throw new ScopeError('workspace-not-empty', `workspace '${id}' still holds projects`)
-    }
+    for (const project of this.listProjects(id)) this.projects.delete(project.id)
     if (this.app?.defaultWorkspace === id) {
       const next = this.list({ includeArchived: true }).find((ws) => ws.id !== id)
       if (next !== undefined) {

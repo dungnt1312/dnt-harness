@@ -357,6 +357,23 @@ describe('workspace HTTP surface', () => {
     expect((await fs.stat(projB)).isDirectory()).toBe(true)
     void wsId
   })
+
+  it('force delete removes a populated workspace with its sessions and projects, keeping the folder', async () => {
+    const server = await start()
+    const base = server.url
+    const target = (await (await post(base, '/api/workspaces', { name: 'Doomed' })).json()) as { id: string }
+    const project = (await (await post(base, `/api/workspaces/${target.id}/projects`, { name: 'P', path: projB })).json()) as { id: string }
+    await post(base, `/api/workspaces/${target.id}/sessions`, { projectId: project.id })
+
+    const plain = await fetch(`${base}/api/workspaces/${target.id}`, { method: 'DELETE' })
+    expect(plain.status).toBe(409)
+    expect(((await plain.json()) as { code: string }).code).toBe('workspace-not-empty')
+
+    expect((await fetch(`${base}/api/workspaces/${target.id}?force=true`, { method: 'DELETE' })).status).toBe(200)
+    const rows = (await (await fetch(`${base}/api/workspaces`)).json()) as { id: string }[]
+    expect(rows.some((row) => row.id === target.id)).toBe(false)
+    expect((await fs.stat(projB)).isDirectory()).toBe(true)
+  })
 })
 
 // ── helpers ────────────────────────────────────────────────────

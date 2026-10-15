@@ -5243,7 +5243,7 @@ async function handleApi(
       const status = error.code === 'workspace-not-empty' || error.code === 'project-active' || error.code === 'last-workspace' ? 409
         : error.code === 'root-invalid' ? 400
           : 404
-      send(status, { error: error.message })
+      send(status, { error: error.message, code: error.code })
       return
     }
     send(500, { error: String(error instanceof Error ? error.message : error) })
@@ -5306,7 +5306,32 @@ async function handleApi(
         return
       }
       if (req.method === 'DELETE') {
-        await deps.workspaces.delete(wsId)
+        const force = query.get('force') === 'true'
+        if (force) {
+          // Refuse before touching anything: unknown / last workspace, or a conversation still running.
+          deps.workspaces.get(wsId)
+          if (deps.workspaces.list({ includeArchived: true }).length <= 1) {
+            send(409, { error: 'cannot delete the last workspace' })
+            return
+          }
+          for (const entry of deps.sessions.values()) {
+            if (entry.workspaceId === wsId && entry.agent.busy) {
+              send(409, { error: 'workspace has running sessions; stop them before deleting' })
+              return
+            }
+          }
+          for (const summary of deps.kernel.ctx.sessions.summaries()) {
+            if (deps.kernel.ctx.sessions.workspaceOf(summary.id) !== wsId) continue
+            // A child may already be gone with its root: findSession then returns undefined.
+            const entry = await findSession(summary.id, wsId, deps)
+            const refused = entry === undefined ? undefined : await removeSession(entry, wsId, deps)
+            if (refused !== undefined) {
+              send(refused.status, { error: refused.error })
+              return
+            }
+          }
+        }
+        await deps.workspaces.delete(wsId, { force })
         send(200, { deleted: true })
         return
       }
@@ -5479,43 +5504,11 @@ async function handleApi(
           }
         }
         if (req.method === 'DELETE') {
-          deps.cancelCompaction(entry.session.id)
-          await deps.settleCompaction(entry.session.id)
-          if (entry.agent.busy) {
-            send(409, { error: 'session is running; stop it before deleting' })
+          const refused = await removeSession(entry, wsId, deps)
+          if (refused !== undefined) {
+            send(refused.status, { error: refused.error })
             return
           }
-          try {
-            // Claude SessionEnd (reason "clear" for a deleted conversation): observe-only.
-            await deps.hookHost.fire('SessionEnd', {
-              workspaceId: wsId,
-              projectId: entry.projectId,
-              sessionId: entry.session.id,
-              matchValue: 'clear',
-              input: { reason: 'clear' },
-            })
-            deps.hookHost.forgetSession(entry.session.id)
-            await entry.session.durable()
-          } catch (error) {
-            send(500, { error: `SessionEnd hook/audit failed; session kept: ${String(error instanceof Error ? error.message : error)}` })
-            return
-          }
-          // Children spawned over HTTP can outlive an idle root: stop them
-          // first, so none keeps running against a deleted conversation.
-          // Background processes die the same way — silently, because the
-          // session's log (their only reader) is being deleted.
-          await deps.processes.dispose(entry.session.id)
-          await deps.backgroundHooks.forgetRoot(entry.session.id)
-          await deps.childExecutor.cancelAllOfRoot(entry.session.id)
-          for (const child of await deps.childExecutor.childrenOfRoot(entry.session.id, wsId)) {
-            await deps.childExecutor.cancel(wsId, child.childSessionId)
-          }
-          deps.sessions.delete(entry.session.id)
-          deps.kernel.ctx.agents.forget(entry.session.id)
-          await deps.kernel.ctx.sessions.delete(entry.session.id)
-          await forgetSessionState(entry.session.id, deps)
-          deps.cancelCompaction(entry.session.id)
-          entry.closed = true
           send(200, { deleted: true })
           return
         }
@@ -9895,6 +9888,44 @@ function workspaceMeta(workspaceId: WorkspaceId, deps: HandlerDeps, folder?: str
     providers: deps.providers().map(publicProvider),
     ...(folder !== undefined ? { folder } : {}),
   }
+}
+
+/** Full teardown of one conversation; a refusal leaves it untouched. Shared by session DELETE and forced workspace DELETE. */
+async function removeSession(entry: SessionEntry, wsId: WorkspaceId, deps: HandlerDeps): Promise<{ status: number; error: string } | undefined> {
+  deps.cancelCompaction(entry.session.id)
+  await deps.settleCompaction(entry.session.id)
+  if (entry.agent.busy) return { status: 409, error: 'session is running; stop it before deleting' }
+  try {
+    // Claude SessionEnd (reason "clear" for a deleted conversation): observe-only.
+    await deps.hookHost.fire('SessionEnd', {
+      workspaceId: wsId,
+      projectId: entry.projectId,
+      sessionId: entry.session.id,
+      matchValue: 'clear',
+      input: { reason: 'clear' },
+    })
+    deps.hookHost.forgetSession(entry.session.id)
+    await entry.session.durable()
+  } catch (error) {
+    return { status: 500, error: `SessionEnd hook/audit failed; session kept: ${String(error instanceof Error ? error.message : error)}` }
+  }
+  // Children spawned over HTTP can outlive an idle root: stop them
+  // first, so none keeps running against a deleted conversation.
+  // Background processes die the same way — silently, because the
+  // session's log (their only reader) is being deleted.
+  await deps.processes.dispose(entry.session.id)
+  await deps.backgroundHooks.forgetRoot(entry.session.id)
+  await deps.childExecutor.cancelAllOfRoot(entry.session.id)
+  for (const child of await deps.childExecutor.childrenOfRoot(entry.session.id, wsId)) {
+    await deps.childExecutor.cancel(wsId, child.childSessionId)
+  }
+  deps.sessions.delete(entry.session.id)
+  deps.kernel.ctx.agents.forget(entry.session.id)
+  await deps.kernel.ctx.sessions.delete(entry.session.id)
+  await forgetSessionState(entry.session.id, deps)
+  deps.cancelCompaction(entry.session.id)
+  entry.closed = true
+  return undefined
 }
 
 /** A deleted session leaves no per-session index behind (manifest, child indexes). */
