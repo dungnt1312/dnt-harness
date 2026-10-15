@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { ProviderError, type ModelRequest, type ProviderErrorPhase, type StreamEvent } from './types.ts'
+import { ProviderError, type ModelRequest, type ProviderErrorPhase, type StreamEvent, type TokenUsage } from './types.ts'
+import { isValidContextId, isValidTokenUsage } from '../context/context-metrics.ts'
 
 export interface AttemptTicket { release(): void }
 /**
@@ -11,6 +12,9 @@ export interface AdmissionOptions { readonly priority?: 'low' }
 export interface PhysicalAdmission { acquire(signal: AbortSignal, options?: AdmissionOptions): Promise<AttemptTicket> }
 export interface AttemptAttribution { readonly sessionId: string; readonly turnId: string; readonly stepId: string }
 export interface AttemptFact {
+  readonly contextId?: string
+  /** Final valid cumulative report; only on terminal attempt facts. */
+  readonly usage?: TokenUsage
   readonly attribution?: AttemptAttribution
   readonly provider?: string
   readonly model?: string
@@ -176,21 +180,24 @@ export async function* runAttempt(provider: { stream(request: ModelRequest, opti
   const settlement = new Promise<void>(resolve => { resolveSettlement = resolve })
   const onTransportSettled = (): void => { settled = true; resolveSettlement(); reconcile?.() }
   let committed = false
+  let ended = false
   let fact: AttemptFact | undefined
   const queuedAt = Date.now()
   let firstProgressAt: number | undefined
   let lastProgressAt: number | undefined
   let finish: AttemptFact['finish']
+  let usage: TokenUsage | undefined
   const notify = async (state: AttemptFact['state'], reason?: ProviderError['reason']): Promise<void> => {
     if (!fact) return
-    const next: AttemptFact = { ...fact, state, committed, transportSettled: settled, ...(state !== 'start' ? { endedAt: Date.now() } : {}), ...(firstProgressAt !== undefined ? { firstProgressAt } : {}), ...(lastProgressAt !== undefined ? { lastProgressAt } : {}), ...(finish ? { finish } : {}), ...(reason ? { reason } : {}) }
+    if (state === 'end') ended = true
+    const next: AttemptFact = { ...fact, state, committed, transportSettled: settled, ...(state !== 'start' ? { endedAt: Date.now(), ...(usage !== undefined ? { usage } : {}) } : {}), ...(firstProgressAt !== undefined ? { firstProgressAt } : {}), ...(lastProgressAt !== undefined ? { lastProgressAt } : {}), ...(finish ? { finish } : {}), ...(reason ? { reason } : {}) }
     try { observer?.(next) } catch { /* optional telemetry cannot change execution */ }
     await options.recordAttempt?.(next)
   }
   try {
     ticket = await admission.acquire(controller.signal, options.priority !== undefined ? { priority: options.priority } : undefined)
     const attempt = owner.consume()
-    fact = { requestId: owner.id, attemptId: randomUUID(), attempt, state: 'start', committed, transportSettled: false, queuedAt, startedAt: Date.now(), ...(options.attribution ? { attribution: options.attribution } : {}), ...(options.provider ? { provider: options.provider.slice(0, 128) } : {}), ...(request.model ? { model: request.model.slice(0, 128) } : {}) }
+    fact = { ...(isValidContextId(request.contextId) ? { contextId: request.contextId } : {}), requestId: owner.id, attemptId: randomUUID(), attempt, state: 'start', committed, transportSettled: false, queuedAt, startedAt: Date.now(), ...(options.attribution ? { attribution: options.attribution } : {}), ...(options.provider ? { provider: options.provider.slice(0, 128) } : {}), ...(request.model ? { model: request.model.slice(0, 128) } : {}) }
     await notify('start')
     const arm = (ms: number, reason: 'first_progress_timeout' | 'idle_timeout'): void => {
       if (timer) clearTimeout(timer)
@@ -204,6 +211,10 @@ export async function* runAttempt(provider: { stream(request: ModelRequest, opti
       pending = undefined
       if (result.done) { settled = true; break }
       const event = result.value
+      if (event.type === 'usage') {
+        if (isValidTokenUsage(event.usage)) usage = { ...event.usage }
+        else console.warn('invalid provider token usage')
+      }
       if (event.type === 'completion') finish = event.finishReason
       if ((event.type === 'delta' && event.delta !== '') || event.type === 'toolCallProgress' || (event.type === 'toolCalls' && event.calls.length > 0)) {
         lastProgressAt = Date.now(); firstProgressAt ??= lastProgressAt
@@ -254,10 +265,13 @@ export async function* runAttempt(provider: { stream(request: ModelRequest, opti
   } finally {
     if (timer) clearTimeout(timer)
     owner.signal.removeEventListener('abort', abort); options.signal?.removeEventListener('abort', abort)
-    if (settled || !iterator) ticket?.release()
-    else if (fact && ticket) {
+    if (settled || !iterator) {
+      ticket?.release()
+      // Consumer return after the transport settled still owes the terminal fact (and its usage).
+      if (settled && iterator && !ended) await notify('end')
+    } else if (fact && ticket) {
       controller.abort(failure('cancelled'))
-      const retained = { ...fact, state: 'uncertain' as const, committed, transportSettled: false }
+      const retained = { ...fact, ...(usage !== undefined ? { usage } : {}), state: 'uncertain' as const, committed, transportSettled: false }
       admission.uncertain.set(fact.attemptId, retained)
       // Callback ownership survives the driver and may reconcile exactly once.
       const id = fact.attemptId

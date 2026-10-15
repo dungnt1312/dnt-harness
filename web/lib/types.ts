@@ -119,6 +119,8 @@ export interface SseEvent {
   /** Estimated context tokens before/after a successful compaction/end. */
   readonly tokensBefore?: number
   readonly tokensAfter?: number
+  /** What each scalar above measured; absent on events that predate basis labels (estimates). */
+  readonly measurement?: CompactionMeasurementView
   /**
    * The stored summary itself on a successful compaction/end; on a hook
    * rewake (`origin: 'hook'`) the one line the user sees.
@@ -143,6 +145,16 @@ export interface SseEvent {
   readonly termination?: string
 }
 
+/** Where the composer/panel context figures stand for the open conversation. */
+export type ContextStatus = 'loading' | 'ready' | 'none' | 'error'
+
+/** Basis of a compaction's before/after token figures (`compaction/end.measurement`). */
+export interface CompactionMeasurementView {
+  readonly before?: { readonly tokens: number; readonly basis: 'reported' | 'estimated' }
+  readonly after?: { readonly tokens: number; readonly basis: 'reported' | 'estimated' }
+  readonly unavailableReason?: 'preview-failed'
+}
+
 /** Estimated tokens per request source; the fields sum to `usedTokens`. */
 export interface ContextBreakdownView {
   readonly systemPrompt: number
@@ -163,13 +175,19 @@ export interface ContextUsageView {
   readonly cachedInputTokens: number
 }
 
+export type ContextView = import('../../src/harness/context/context-state.ts').ContextResponse<ContextManifestView> & {
+  readonly policy?: { readonly automaticCompactionPressure: number }
+}
+
 /** What one assembled model request carried; the server's ContextManifest. */
 export interface ContextManifestView {
+  readonly contextId?: string
+  readonly display?: Exclude<import('../../src/harness/context/context-state.ts').ContextDisplayState, { kind: 'unavailable' }>
   readonly modeId: string
   readonly modeRevision: number
   readonly model?: string
   readonly provider?: string
-  readonly budget: { readonly availableTokens: number; readonly usedTokens: number; readonly contextLimitTokens?: number; readonly estimated: boolean }
+  readonly budget: { readonly availableTokens: number; readonly usedTokens: number; readonly preTrimTokens?: number; readonly contextLimitTokens?: number; readonly estimated: boolean; readonly windowSource?: 'override'|'catalog'|'family'|'fallback' }
   /** Estimated tokens per source of the last request; sums to `usedTokens`. */
   readonly breakdown?: ContextBreakdownView
   /** Provider-reported usage, when the provider streams it. */

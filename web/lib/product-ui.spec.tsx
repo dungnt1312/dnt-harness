@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import { act, useState, type ReactNode } from 'react'
+import { act, useState, type ComponentProps, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import CopyButton from '../components/common/CopyButton.tsx'
 import { ApprovalBar } from '../components/chat/ApprovalBar.tsx'
@@ -1135,6 +1135,21 @@ describe('context compaction + budget bar', () => {
     await act(async () => bodyButton('Compact').click())
     expect(compactSession).toHaveBeenCalledWith('w1', 's1')
     expect(document.body.textContent).not.toContain('Compact this conversation?')
+  })
+  it('panel: loading and error states replace the figures, with policy pressure and request details when ready', async () => {
+    const panel = (props: Partial<ComponentProps<typeof ContextPanel>>) => <ToastHost><ContextPanel meta={null} stream="open" sessionId="s1" sessionFolder={null} eventCount={0} workspaceId="w1" running={false} {...props} /></ToastHost>
+    await mount(panel({ manifest: manifest, manifestStatus: 'loading' }))
+    expect(host.textContent).toContain('Loading context')
+    expect(host.textContent).not.toContain('48000/128000')
+    await mount(panel({ manifest: null, manifestStatus: 'error' }))
+    expect(host.textContent).toContain('Context unavailable')
+    expect(host.textContent).not.toContain('No request has been assembled')
+    const reported = { ...manifest, model: 'glm-measured', budget: { ...manifest.budget, preTrimTokens: 108_800 }, usage: { last: { inputTokens: 50_000 }, cacheableInputTokens: 0, cachedInputTokens: 0 }, policy: { automaticCompactionPressure: 0.85 } }
+    await mount(panel({ manifest: reported, manifestStatus: 'ready' }))
+    expect(host.textContent).toContain('reported · glm-measured')
+    expect(host.textContent).toContain('trigger: 85% of input budget · auto-compacts at 85%')
+    await mount(panel({ manifest: manifest, manifestStatus: 'ready' }))
+    expect(host.textContent).not.toContain('auto-compacts')
   })
   describe('compaction progress row', () => {
     type Row = Extract<ViewItem, { kind: 'compaction' }>

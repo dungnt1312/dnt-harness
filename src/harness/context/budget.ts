@@ -5,6 +5,7 @@
  * margin; tool schemas are part of the cost.
  */
 import type { ContentPart } from '../llm/types.ts'
+import { resolveContextWindow } from '../llm/model-catalog.ts'
 
 export interface BudgetConfig {
   /** The model's context window (an estimate unless verified). */
@@ -16,7 +17,8 @@ export interface BudgetConfig {
 }
 
 /** Budget config plus the honesty flag for the estimate. */
-export type ResolvedBudget = BudgetConfig & { readonly verified?: boolean }
+export type WindowSource = 'override'|'catalog'|'family'|'fallback'
+export type ResolvedBudget = BudgetConfig & { readonly verified?: boolean; readonly windowSource?: WindowSource }
 
 export const DEFAULT_BUDGET: ResolvedBudget = {
   // Matches the model catalog's DEFAULT_CONTEXT_LIMIT (256k): modern
@@ -26,6 +28,17 @@ export const DEFAULT_BUDGET: ResolvedBudget = {
   outputReserveTokens: 4_096,
   marginTokens: 1_024,
   verified: false,
+  windowSource: 'fallback',
+}
+
+/** One resolver for request assembly and compaction admission. */
+export function resolveModelBudget(input: { readonly model?: string; readonly contextTokens?: number }): ResolvedBudget {
+  if (input.contextTokens !== undefined && Number.isFinite(input.contextTokens) && input.contextTokens > 0) {
+    return { ...DEFAULT_BUDGET, contextLimitTokens: input.contextTokens, verified: true, windowSource: 'override' }
+  }
+  if (input.model === undefined) return DEFAULT_BUDGET
+  const window = resolveContextWindow(input.model)
+  return { ...DEFAULT_BUDGET, contextLimitTokens: window.tokens, windowSource: window.source }
 }
 
 /**

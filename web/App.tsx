@@ -13,7 +13,6 @@ import {
   createSessionIn,
   createWorkspace,
   deleteSessionIn,
-  fetchManifest,
   fetchWorkspaceMeta,
   getSessionModel,
   getModelDefaults,
@@ -55,6 +54,7 @@ import { manifestRefreshKey } from './lib/manifest-refresh.ts'
 import { loadCollapsedFolders, storeCollapsedFolders, loadExpandedFolders, storeExpandedFolders } from './lib/sidebar-folder-state.ts'
 import type { FileFocus } from './lib/tool-facts.ts'
 import { useSessionStream } from './hooks/useSessionStream.ts'
+import { useContextManifest } from './hooks/useContextManifest.ts'
 import { useApprovalNotify } from './hooks/useApprovalNotify.ts'
 import { useWorkbenchPreferences } from './hooks/useWorkbenchPreferences.ts'
 import { useWorkbenchTabs } from './hooks/useWorkbenchTabs.ts'
@@ -95,7 +95,7 @@ import { SessionFoldersChip } from './components/composer/SessionFoldersChip.tsx
 import { FolderPickerModal } from './components/composer/FolderPickerModal.tsx'
 import { AutomationsView, type AutomationControlsContext } from './components/automations/AutomationsView.tsx'
 import ConfirmDialog from './components/common/ConfirmDialog.tsx'
-import type { ContextManifestView, SessionModeSelection } from './lib/api.ts'
+import type { SessionModeSelection } from './lib/api.ts'
 import { builtinCommandIn, draftIsOnlyCommand, type CompletionItem } from './lib/composer-completion.ts'
 import type { CommandRow, ModelAliasRow, ModelDefaults, ProjectRow, QuestionReply, SessionListing, SessionModel, SkillRow, WorkspaceMeta, WorkspaceRow } from './lib/types.ts'
 
@@ -487,7 +487,6 @@ function AppShell() {
   }, [settingsOpen])
   const [settingsSection, setSettingsSection] = useState<'providers' | 'projects' | 'permissions' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets' | undefined>(undefined)
   const [pendingDelete, setPendingDelete] = useState<SessionListing | null>(null)
-  const [manifest, setManifest] = useState<ContextManifestView | null>(null)
   const [compactNonce, setCompactNonce] = useState(0)
   const workspaceRef = useRef(activeWs)
   workspaceRef.current = activeWs
@@ -578,6 +577,7 @@ function AppShell() {
     [projectedItems],
   )
   const manifestKey = useMemo(() => manifestRefreshKey(events, compactNonce), [events, compactNonce])
+  const { manifest, status: manifestStatus } = useContextManifest(activeWs, current, manifestKey)
   // A subagent conversation reads as parent → sub in the header trail.
   const currentParentSession = useMemo(
     () => (currentSession?.parentSessionId != null ? sessions.find((session) => session.id === currentSession.parentSessionId) ?? null : null),
@@ -993,7 +993,6 @@ function AppShell() {
     const listingToken = lists.current.next()
     const metaToken = metadata.current.next()
     setMeta(null)
-    setManifest(null)
     setSessions([])
     setListedWorkspace(null)
     setProjects([])
@@ -1090,35 +1089,6 @@ function AppShell() {
       .catch(() => { /* an unavailable catalog only closes the menu */ })
     return () => { cancelled = true }
   }, [activeWs, workbenchProject?.id, skillsRevision])
-
-  // Session whose manifest is currently on screen. A change means the user
-  // switched conversations, which fetches at once; the same session refreshes
-  // shortly after each request is assembled, each step ends, and the turn ends
-  // — so the meter fills as soon as a message is sent, not only after the turn.
-  const manifestSession = useRef<string | null>(null)
-  // Composer context meter + inspector. The previous figures stay up until
-  // the selected conversation's manifest arrives, so the meter never flashes
-  // empty.
-  useEffect(() => {
-    if (activeWs === null || current === null) return
-    const switched = manifestSession.current !== `${activeWs}:${current}`
-    manifestSession.current = `${activeWs}:${current}`
-    let cancelled = false
-    const timer = setTimeout(() => {
-      void fetchManifest(activeWs, current).then(
-        (view) => {
-          if (!cancelled && currentRef.current === current && workspaceRef.current === activeWs) setManifest(view)
-        },
-        () => {
-          if (!cancelled && currentRef.current === current && workspaceRef.current === activeWs) setManifest(null)
-        },
-      )
-    }, switched ? 0 : 150)
-    return () => {
-      cancelled = true
-      clearTimeout(timer)
-    }
-  }, [activeWs, current, manifestKey])
 
   useEffect(() => {
     if (streamError === null) return
@@ -1730,7 +1700,7 @@ function AppShell() {
     () => events.reduce((latest, event) => (event.type === 'session/grants' ? Math.max(latest, event.revision ?? 0) : latest), 0),
     [events],
   )
-  const contextControl = current !== null ? <ContextMeter manifest={manifest} /> : null
+  const contextControl = current !== null ? <ContextMeter manifest={manifest} status={manifestStatus} /> : null
   // Folders decide access, like the mode, so they sit on the left beside it.
   const folderControl = current !== null && activeWs !== null && currentProject !== null
     ? <SessionFoldersChip workspaceId={activeWs} sessionId={current} revision={grantsRevision} />
@@ -1817,7 +1787,7 @@ function AppShell() {
       onTerminalShell={(shellId) => patchPreferences({ terminalShell: shellId })}
       bindingReady={listedWorkspace === activeWs}
       onGitTrustChange={recordGitTrust}
-      context={{ meta, ...(modelDefaults !== null ? { globalDefaults: modelDefaults } : {}), ...(currentSessionModel !== undefined ? { sessionModel: currentSessionModel } : {}), ...(current !== null && currentSessionModelState?.status === 'loading' ? { sessionControlsStatus: 'loading' as const } : {}), ...(current !== null && currentSessionModelState?.status === 'error' ? { sessionControlsStatus: 'unavailable' as const } : {}), stream, sessionId: current, sessionFolder: currentProject?.path ?? null, eventCount: events.length, manifest, workspaceId: activeWs, running, modeLabel: envModeLabel, onCompacted: () => setCompactNonce((nonce) => nonce + 1), onOpenSettingsTab: (tab) => openSettings(tab) }}
+      context={{ meta, ...(modelDefaults !== null ? { globalDefaults: modelDefaults } : {}), ...(currentSessionModel !== undefined ? { sessionModel: currentSessionModel } : {}), ...(current !== null && currentSessionModelState?.status === 'loading' ? { sessionControlsStatus: 'loading' as const } : {}), ...(current !== null && currentSessionModelState?.status === 'error' ? { sessionControlsStatus: 'unavailable' as const } : {}), stream, sessionId: current, sessionFolder: currentProject?.path ?? null, eventCount: events.length, manifest, manifestStatus, workspaceId: activeWs, running, modeLabel: envModeLabel, onCompacted: () => setCompactNonce((nonce) => nonce + 1), onOpenSettingsTab: (tab) => openSettings(tab) }}
     />
   )
 

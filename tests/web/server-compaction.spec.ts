@@ -125,6 +125,27 @@ async function completedMessage(base: string, wsId: string, id: string, logPath:
 }
 
 describe('web compaction', () => {
+  it('context accounting rebuilds nonzero full estimate after trimmed history', async () => {
+    let chats = 0
+    const provider: LlmProvider = { name: 'scripted', models: ['scripted'], async *stream(request) {
+      const summary = request.messages.some(m => typeof m.content === 'string' && m.content.includes(COMPACT_MARK))
+      yield { type: 'delta', delta: summary ? SUMMARY_TEXT : (++chats === 1 ? 'x'.repeat(1_100_000) : 'small answer') }
+      if (!summary) yield { type: 'usage', usage: { inputTokens: 120_000, cachedInputTokens: 110_000 } }
+      yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+    } }
+    const { home, base, wsId } = await start(provider, { automaticCompactionPressure: 0 })
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    await completedMessage(base, wsId, id, logPath, 'first', 1)
+    await completedMessage(base, wsId, id, logPath, 'second', 2)
+    expect((await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })).status).toBe(200)
+    const end = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line)).findLast(e => e.type === 'compaction/end')
+    expect(end.tokensAfter).toBeGreaterThan(0)
+    expect(end.tokensAfter).toBe(end.contextAfter.budget.usedTokens)
+    expect(Object.values(end.contextAfter.breakdown).reduce((sum: number, value) => sum + Number(value), 0)).toBe(end.tokensAfter)
+    expect(end.measurement.before.basis).toBe('reported')
+    expect(end.measurement.after.basis).toBe('estimated')
+  })
   it.each(['stop', 'delete', 'shutdown', 'success'] as const)('reserves summary ownership and queues follow-up during %s', async (action) => {
     let entered!: () => void
     const started = new Promise<void>((resolve) => { entered = resolve })
@@ -288,10 +309,13 @@ describe('web compaction', () => {
     await completedMessage(base, wsId, id, logPath, 'first', 1)
     expect(requests).toHaveLength(1)
     await completedMessage(base, wsId, id, logPath, 'second', 2)
-    const manifest = await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/manifest`)).json() as { budget: { usedTokens: number; preTrimTokens: number; availableTokens: number } }
+    // The automatic compaction may already have committed by now, and /manifest then
+    // (correctly) shows the post-compaction preview. The request that drove the trigger
+    // is the second turn's durable manifest: trimmed to fit, but pressured before the trim.
+    const log = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+    const manifest = log.filter((e) => e.type === 'context/manifest').at(-1)!.manifest as { budget: { usedTokens: number; preTrimTokens: number; availableTokens: number } }
     expect(manifest.budget.usedTokens / manifest.budget.availableTokens).toBeLessThan(0.85)
     expect(manifest.budget.preTrimTokens / manifest.budget.availableTokens).toBeGreaterThan(0.85)
-    const log = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
     expect(log.filter((e) => e.type === 'compaction/start')).toHaveLength(1)
     const summaries = requests.filter((r) => r.messages.some((m) => typeof m.content === 'string' && m.content.includes(COMPACT_MARK)))
     expect(summaries.length).toBeGreaterThan(0)
@@ -563,8 +587,12 @@ describe('web compaction', () => {
     const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
     const log = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { type: string })
     expect(log.findLast((event) => event.type === 'compaction/end')).toMatchObject({ tokensBefore: sized.tokensBefore, tokensAfter: sized.tokensAfter })
-    const meter = (await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/manifest`)).json()) as ManifestView & { budget: { usedTokens: number } }
-    expect(meter.budget.usedTokens).toBe(sized.tokensAfter)
+    const meter = (await (await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/manifest`)).json()) as ManifestView & { budget: { usedTokens: number }; display?: { kind: string } }
+    // Before any new message, the meter shows the post-compaction preview.
+    if (meter.display !== undefined) {
+      expect(meter.display.kind).toBe('post-compaction')
+      expect(meter.budget.usedTokens).toBe(sized.tokensAfter)
+    }
 
     const checkpoint = JSON.parse(
       await fs.readFile(path.join(checkpointsDir(home, id), `${compacted.coversSeq}.json`), 'utf8'),
@@ -821,10 +849,15 @@ describe('web compaction', () => {
     const load = vi.spyOn(AttachmentStore.prototype, 'load')
     try {
       expect((await fetch(`${route}/compact`, { method: 'POST' })).status).toBe(200)
-      // Only the compaction route ran between spy install and response.
-      const ids = load.mock.calls.flatMap((call) => (call[1] as readonly { id: string }[]).map((ref) => ref.id))
-      expect(ids).toContain(b.id)
-      expect(ids).not.toContain(a.id)
+      // The fold summarizes only the delta, and the preview reads the FULL
+      // next-request projection — so the summary path sees only B while the
+      // preview legitimately reloads the covered A beside it.
+      const summarizerCalls = load.mock.calls.slice(0, -1).flatMap((call) => (call[1] as readonly { id: string }[]).map((ref) => ref.id))
+      expect(summarizerCalls).toContain(b.id)
+      expect(summarizerCalls).not.toContain(a.id)
+      const previewCalls = (load.mock.calls.at(-1)?.[1] as readonly { id: string }[] | undefined)?.map((ref) => ref.id) ?? []
+      expect(previewCalls).toContain(a.id)
+      expect(previewCalls).toContain(b.id)
     } finally { load.mockRestore() }
   })
 

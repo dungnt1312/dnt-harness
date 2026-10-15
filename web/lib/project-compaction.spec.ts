@@ -37,6 +37,12 @@ describe('compaction lifecycle projection', () => {
     expect(done[0]?.tokensAfter).toBe(30_000)
   })
 
+  it('carries the measurement basis of the end event into the row', () => {
+    const measurement = { before: { tokens: 90_000, basis: 'reported' as const }, after: { tokens: 30_000, basis: 'estimated' as const } }
+    const done = compactionItems([event({ type: 'compaction/end', trigger: 'manual', coversSeq: 12, tokensBefore: 90_000, tokensAfter: 30_000, measurement })])
+    expect(done[0]?.measurement).toEqual(measurement)
+  })
+
   it('a dangling start with nothing after it stays running; log movement makes it interrupted', () => {
     const dangling = compactionItems([event({ type: 'compaction/start', trigger: 'automatic' })])
     expect(dangling[0]?.status).toBe('running')

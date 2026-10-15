@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { deriveDatedMessages, type SessionEvent } from '../session/events.ts'
+import { deriveDatedMessages, type SessionEvent, type CompactionMeasurement } from '../session/events.ts'
 import type { Session } from '../session/session.ts'
 import type { AttachmentLookup } from '../attachments/store.ts'
 import { compactionSeedHash, sourceDigest } from './compaction-digest.ts'
@@ -210,7 +210,8 @@ export interface CompactionOptions {
    * Estimates the context size before and after the new checkpoint, for the
    * success event. Advisory: a throw or `undefined` just omits the figures.
    */
-  readonly measure?: (checkpoint: { readonly summary: string; readonly coversSeq: number }) => { readonly tokensBefore: number; readonly tokensAfter: number } | undefined
+  readonly measure?: (checkpoint: { readonly summary: string; readonly coversSeq: number }) => CompactionMeasurement | undefined | Promise<CompactionMeasurement | undefined>
+  readonly validate?: () => Promise<void>
   /** Forwarded to the summarizer: fold progress, `done` of `total` chunk summaries. */
   readonly onProgress?: (done: number, total: number) => void
 }
@@ -282,11 +283,14 @@ export async function compactSession(session: Session, checkpoints: CheckpointSt
     check()
     if (!validSummary(summary)) throw new Error('compaction summary must be nonempty and at most 24000 characters')
     if (session.events.some(event => event.seq > lastEnd && event.type === 'turn/start')) throw new Error('compaction boundary changed during summary')
-    let measured: ReturnType<NonNullable<CompactionOptions['measure']>>
-    try { measured = options.measure?.({ summary, coversSeq: lastEnd }) } catch { measured = undefined }
+    let measured: CompactionMeasurement | undefined
+    try { measured = await options.measure?.({ summary, coversSeq: lastEnd }) } catch { measured = { contextEffect: 'replaced', measurement: { unavailableReason: 'preview-failed' } } }
+    await options.validate?.()
+    check()
+    if (session.events.some(event => event.seq > lastEnd && event.type === 'turn/start')) throw new Error('compaction boundary changed during measurement')
     const end = session.append({ type: 'compaction/end', trigger: options.trigger, ...(options.model !== undefined ? { model: options.model } : {}),
       coversSeq: lastEnd, summaryChars: summary.length, durationMs: Date.now() - startedAt, summary,
-      ...(measured !== undefined ? { tokensBefore: measured.tokensBefore, tokensAfter: measured.tokensAfter } : {}) })
+      ...(measured ?? {}) })
     // Success append is the irreversible commit point: cancellation before it
     // fails, but a late Stop cannot revoke canonical success without a revocation
     // event. Retain ownership until durability settles, and report success if it
@@ -338,7 +342,7 @@ export interface AdoptionOptions {
    */
   readonly validate: () => Promise<void>
   /** Given the checkpoint being adopted and the one standing now, the window sizes it changes. */
-  readonly measure?: (next: { readonly summary: string; readonly coversSeq: number }, standing: { readonly summary: string; readonly coversSeq: number } | undefined, restoredTokens: number) => { readonly tokensBefore: number; readonly tokensAfter: number } | undefined
+  readonly measure?: (next: { readonly summary: string; readonly coversSeq: number }, standing: { readonly summary: string; readonly coversSeq: number } | undefined, restored: Restored | undefined) => CompactionMeasurement | undefined | Promise<CompactionMeasurement | undefined>
   /**
    * Builds the bounded state to restore beside the summary, for the cutoff being
    * adopted. Runs inside the transaction (after the start barrier, before the
@@ -414,17 +418,17 @@ export async function adoptPreparedCompaction(session: Session, checkpoints: Che
     if (restored !== undefined) {
       session.append({ type: 'compaction/restoration', coversSeq: prepared.cutoff, body: restored.body, sections: restored.sections })
     }
+    let measured: CompactionMeasurement | undefined
+    try { measured = await options.measure?.({ summary: prepared.summary, coversSeq: prepared.cutoff }, current, restored) } catch { measured = { contextEffect: 'replaced', measurement: { unavailableReason: 'preview-failed' } } }
     await options.validate()
     check()
     // The start barrier made the source durable; nothing may have started a turn inside the transaction.
     if (session.events.some((event) => event.type === 'turn/start' && event.seq > (session.events.findLast((e) => e.type === 'compaction/start')?.seq ?? 0))) {
       throw new Error('compaction boundary changed during adoption')
     }
-    let measured: ReturnType<NonNullable<AdoptionOptions['measure']>>
-    try { measured = options.measure?.({ summary: prepared.summary, coversSeq: prepared.cutoff }, current, restored?.tokens ?? 0) } catch { measured = undefined }
     const end = session.append({ type: 'compaction/end', trigger: options.trigger, ...(prepared.model !== undefined ? { model: prepared.model } : {}),
       coversSeq: prepared.cutoff, summaryChars: prepared.summary.length, durationMs: prepared.generationMs ?? Date.now() - startedAt, summary: prepared.summary,
-      ...(measured !== undefined ? { tokensBefore: measured.tokensBefore, tokensAfter: measured.tokensAfter } : {}),
+      ...(measured ?? {}),
       adoption: { v: 1, transactionId, cutoff: prepared.cutoff, sourceDigest: prepared.sourceDigest, ...(seedHash !== undefined ? { seedHash } : {}) } })
     // Same commit rule as compactSession: the success append is irreversible, a late
     // Stop only suppresses the derived cache, and ownership lasts until it is durable.

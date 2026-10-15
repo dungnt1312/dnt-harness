@@ -1,7 +1,8 @@
 import { Menu } from '../ui/Menu.tsx'
 import { cn } from '../../lib/cn.ts'
-import { budgetTone, contextFill } from '../../lib/format.ts'
-import type { ContextBreakdownView, ContextManifestView } from '../../lib/api.ts'
+import { budgetTone, contextFill, formatPolicyPressure, policyPressure } from '../../lib/format.ts'
+import { isAvailableContext } from '../../../src/harness/context/context-state.ts'
+import type { ContextBreakdownView, ContextStatus, ContextView } from '../../lib/api.ts'
 import { composerFocusClass } from './composer-chip.ts'
 
 /** Breakdown rows in the order they render, each a deeper-to-lighter shade. */
@@ -53,15 +54,20 @@ function Ring({ ratio, tone, empty }: { readonly ratio: number; readonly tone: k
 /**
  * Composer context meter: a ring showing how full the model's context window
  * was on the last request, opening a token count per source. Counts are
- * tokens, never percentages. Before the first request it says so.
+ * tokens, never percentages. Before the first request it says so; while the
+ * figures load, or when they could not be fetched, it says that instead.
  */
-export function ContextMeter({ manifest }: { readonly manifest: ContextManifestView | null }) {
-  const fill = manifest !== null ? contextFill(manifest) : null
+export function ContextMeter({ manifest, status = manifest === null ? 'none' : 'ready' }: { readonly manifest: ContextView | null; readonly status?: ContextStatus }) {
+  const shown = status === 'ready' ? manifest : null
+  const available = shown !== null && isAvailableContext(shown) ? shown : null
+  const postCompact = available?.display?.kind === 'post-compaction'
+  const fill = available !== null ? contextFill(available) : null
+  const pressure = available !== null ? policyPressure(available) : undefined
   const tone = fill !== null ? budgetTone(fill.used, fill.limit) : 'ok'
   const summary = fill !== null
     ? `${formatTokens(fill.used)} / ${formatTokens(fill.limit)}`
     : null
-  const breakdown = manifest?.breakdown
+  const breakdown = available?.breakdown
   const breakdownTotal = breakdown !== undefined ? CATEGORIES.reduce((total, category) => total + breakdown[category.key], 0) : 0
 
   return (
@@ -86,10 +92,29 @@ export function ContextMeter({ manifest }: { readonly manifest: ContextManifestV
             ) : null}
           </div>
 
-          {fill === null ? (
+          {status === 'loading' ? (
+            <p className="text-fg-muted">Loading context…</p>
+          ) : status === 'error' ? (
+            <p className="text-fg-muted">Context unavailable</p>
+          ) : shown !== null && !isAvailableContext(shown) ? (
+            <p className="text-fg-muted">Context estimate unavailable until the next request ({shown.display.reason === 'preview-failed' ? 'compaction preview failed' : 'earlier compaction predates full estimates'}).</p>
+          ) : fill === null ? (
             <p className="text-fg-muted">No recorded request context for this conversation.</p>
           ) : (
             <>
+              {postCompact ? <p className="m-0 text-xs text-fg-faint">After compaction · estimated — the next request replaces this preview.</p> : null}
+              {!postCompact ? (
+                <dl className="m-0 flex flex-col gap-1 text-xs">
+                  <div className="flex items-center justify-between gap-3"><dt className="text-fg-muted">Last request</dt><dd className="m-0 font-mono">{fill.estimated ? 'estimated' : 'reported'}</dd></div>
+                  {available?.model !== undefined ? <div className="flex items-center justify-between gap-3"><dt className="text-fg-muted">Model</dt><dd className="m-0 truncate font-mono">{available.model}</dd></div> : null}
+                  {!fill.estimated && available !== null && available.budget.usedTokens !== fill.used ? (
+                    <div className="flex items-center justify-between gap-3"><dt className="text-fg-muted">Estimate total</dt><dd className="m-0 font-mono">{formatTokens(available.budget.usedTokens)}</dd></div>
+                  ) : null}
+                </dl>
+              ) : null}
+              {pressure !== undefined ? (
+                <p className="m-0 text-xs text-fg-muted" title="Auto-compact trigger: pre-trim estimate over the usable input budget. Not the window ring.">Auto-compact trigger: {formatPolicyPressure(pressure)}</p>
+              ) : null}
               {/* The filled share of the window, split by source in proportion. */}
               <div className="flex h-2 overflow-hidden rounded-full bg-muted" role="presentation">
                 <div className="flex h-full" style={{ width: `${fill.ratio * 100}%` }}>
@@ -110,12 +135,12 @@ export function ContextMeter({ manifest }: { readonly manifest: ContextManifestV
                       <span className="font-mono text-xs">{formatTokens(breakdown[category.key])}</span>
                     </li>
                   ))}
-                  <li className="text-xs text-fg-faint">Estimated tokens (chars/4). The total above is the provider count when it reported one.</li>
+                  <li className="text-xs text-fg-faint">Estimated source tokens (chars/4). The total above is the provider count when it reported one.</li>
                 </ul>
               ) : null}
 
               <div className="flex items-center justify-between gap-3 border-t border-line pt-3">
-                <span className="text-fg-muted">Average cache hit rate</span>
+                <span className="text-fg-muted">Session average cache hit rate</span>
                 <span className="font-mono text-xs">{fill.cacheHitRate !== undefined ? `${Math.round(fill.cacheHitRate * 100)}%` : '—'}</span>
               </div>
             </>

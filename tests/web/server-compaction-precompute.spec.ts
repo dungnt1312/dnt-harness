@@ -210,6 +210,63 @@ describe('precomputed compaction through the web server', () => {
     expect(p.handoffs).toHaveLength(2)
   })
 
+  it('a candidate whose summary+tail passes the conversation-only check but whose full next request exceeds the budget is refused as no-fit', async () => {
+    // Window 100k: budget 100k − 4,096 − 1,024. A big workspace CLAUDE.md is fixed prompt the old
+    // conversation-only check never counted.
+    const WINDOW = 100_000
+    const BIG_SUMMARY = 'S'.repeat(20_000)
+    const requests: ModelRequest[] = []
+    const llm: LlmProvider = {
+      name: 'scripted',
+      models: ['scripted'],
+      stream(request) {
+        requests.push(request)
+        const handoff = joined(request).includes(COMPACTION_HANDOFF_MARKER)
+        const first = requests.filter((r) => !joined(r).includes(COMPACTION_HANDOFF_MARKER)).length === 1
+        return (async function* (): AsyncIterable<StreamEvent> {
+          yield { type: 'delta', delta: handoff ? BIG_SUMMARY : first ? `long answer ${'a'.repeat(32_000)}` : 'short answer' }
+          yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+        })()
+      },
+    }
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-precompute-'))
+    await fs.writeFile(path.join(home, 'p.json'), JSON.stringify({
+      version: 2,
+      defaults: { provider: 'scripted', model: 'scripted', thinkingLevel: null },
+      providers: [{ id: 'scripted', name: 'scripted', baseUrl: 'http://127.0.0.1:9/v1', apiKey: '', models: ['scripted'], enabled: true, modelSettings: { scripted: { contextTokens: WINDOW } } }],
+      aliases: [], aliasGeneration: 0,
+    }))
+    const server = await createWebServer({ home, providers: [llm], configFile: path.join(home, 'p.json'), limits: ON })
+    servers.push(server)
+    homes.set(server, home)
+    const wsId = (await (await fetch(`${server.url}/api/workspaces`)).json() as { id: string }[])[0]!.id
+    await fs.writeFile(path.join(home, 'workspaces', wsId, 'CLAUDE.md'), `# rules\n${'fixed instruction text '.repeat(1_800)}`)
+    const { id } = await (await fetch(`${server.url}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const s = { base: server.url, wsId, id, logPath: path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl') }
+    const manifest = async () => ((await (await fetch(`${s.base}/api/workspaces/${wsId}/sessions/${id}/manifest`)).json()) as { budget: { usedTokens: number; availableTokens: number } }).budget
+    await chat(s, 'first question', 1)
+    // The candidate over turn one finishes in the background.
+    await until(() => (requests.some((r) => joined(r).includes(COMPACTION_HANDOFF_MARKER)) ? true : undefined))
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    const after1 = await manifest()
+    // Fixed cost (system, CLAUDE.md, schemas) = turn one's request minus its ~8k-token answer.
+    const fixed = after1.usedTokens - 8_000
+    // Turn two leaves ~2.5k of room before the summary is added: the next request with the 5k-token
+    // summary does not fit, though summary + tail is far under window − compactionOutputTokens.
+    const tail = after1.availableTokens - fixed - 2_500
+    expect(BIG_SUMMARY.length / 4 + tail).toBeLessThan(WINDOW - 8_000)
+    await chat(s, 'w'.repeat(tail * 4), 2)
+    const handoffs = (): number => requests.filter((r) => joined(r).includes(COMPACTION_HANDOFF_MARKER)).length
+    const before = handoffs()
+    await compact(s)
+    const log = await readLog(s.logPath)
+    const turnEnds = log.filter((event) => event.type === 'turn/end').map((event) => event.seq as number)
+    // Refused: the compaction asked for a summary of its own instead of adopting the candidate,
+    // and nothing that covers only turn one was committed.
+    expect(handoffs()).toBeGreaterThan(before)
+    expect(log.some((event) => event.type === 'compaction/end' && event.error === undefined && event.coversSeq === turnEnds[0])).toBe(false)
+  })
+
   it('deleting the session cancels a pending candidate and waits for its stream to end', async () => {
     const p = gatedProvider({ holdFirstHandoff: true, longAnswers: true })
     const s = await start(p.llm, ON)

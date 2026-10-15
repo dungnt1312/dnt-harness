@@ -267,10 +267,11 @@ Details worth knowing:
 - **`agent/pre-step`** (waterfall) admits a claim. `enter(contents)` runs a step
   with the (possibly rewritten) contents; `reject` closes the turn with reason
   `rejected`. A first `enter` rewritten to empty closes it with reason `empty`.
-- **`agent/request`** (waterfall) sits between the log projection and the
-  provider — the web host uses it to stamp each session's effective model,
-  provider, and thinking level onto every request; middleware may prepend a
-  system message, etc.
+- **`agent/request`** (waterfall) sits between the assembled request and the
+  provider; middleware may prepend a system message, etc. The web host stamps
+  each session's effective model, provider, and thinking level in
+  `agent/context` instead, so the budget, manifest, capture and dispatch use
+  one request.
 - **`agent/turn-stopping`** (serial) runs *before* `turn/end` is appended, so
   observers see a settled step and no closing turn yet.
 - **Failure closes the turn durably.** If a step throws, `closeOpenTurn()`
@@ -591,7 +592,7 @@ turn:
 - **Model** — the model/provider/thinking level are **per-session** facts: a
   durable `session/model` preference (see the session log vocabulary) is
   re-resolved per model request, and the host stamps the effective pair onto
-  the request through `agent/request`. A mid-turn change therefore lands on
+  the request during context assembly (`agent/context`). A mid-turn change therefore lands on
   the turn's next request without touching the stream in flight, and the
   context budget is recomputed for the new model on that same request. Only
   a legacy log without any `session/model` event falls back to the global
@@ -862,9 +863,20 @@ runs and the behavior above is unchanged.
   did not settle blocks further speculation for the session instead of overlapping.
   `PreCompact` runs once, when adoption begins; speculation never runs a hook.
   Session delete and server close cancel it and wait for the stream.
-- **Measurement.** `compaction/end.tokensAfter` is the provider-reported size minus
-  the estimated saving of the new checkpoint, including the restoration that rides
-  beside it.
+- **Measurement.** The post-compaction size (`compaction/end.tokensAfter`) is an
+  independent estimate rebuilt from the same builder the next request uses —
+  full context after the checkpoint, restoration included — committed atomically
+  on the success event with its own `basis: 'estimated'`. The pre-compaction
+  side (`tokensBefore`) carries the previous request's provider report when one
+  was attributed to the assembly being replaced (`basis: 'reported'`). The
+  post-compaction number is never `reportedBefore - rawSaving`: two different
+  bases subtracted across a replaced context would claim a precision no pair of
+  estimates has. A measurement that could not be computed is published as
+  `{ contextEffect: 'replaced', measurement: { unavailableReason: 'preview-failed' } }`
+  rather than a zero. A successful `compaction/end` becomes visible to browser
+  streams only once its durability barrier has committed — the server holds the
+  event and everything appended behind it, and a flush failure never publishes
+  the uncommitted success.
 - **Verifying.** Everything above is tested with a scripted provider. No live
   benchmark has been run: the target (≥ 70 % median reduction of summary generation
   time, ready-candidate blocking p95 ≤ 5 s excluding hooks and storage) is

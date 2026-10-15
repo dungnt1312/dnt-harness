@@ -276,6 +276,58 @@ describe('file session store', () => {
     await second
     void kernel.stop()
   })
+
+  it('announces session/durable only after the barrier and never on a failed flush', async () => {
+    // The kernel event mirrors the service durableListener at the exact commit
+    // point: after the flush resolves (the prefix is committed), never while a
+    // flush is in flight, and never when the flush failed — a held consumer
+    // must not release what the canonical log may still lose.
+    const build = async (flush: () => Promise<void>) => {
+      const kernel = new Kernel()
+      const durable: { id: string; lastSeq: number }[] = []
+      kernel.ctx.on('session/durable', (session, lastSeq) => { durable.push({ id: session.id, lastSeq }) })
+      const store = {
+        append: async () => {},
+        flush,
+        read: async () => ({ events: [] as SessionEvent[], truncatedTail: false }),
+        replace: async () => {},
+        writeSummary: async () => {},
+        readSummary: async () => undefined,
+        list: async () => [] as SessionId[],
+        remove: async () => {},
+      }
+      kernel.ctx.plugin((ctx) => { new SessionsService(ctx, 'sessions', { store }) })
+      return { kernel, durable }
+    }
+    {
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => { release = resolve })
+      let gated = true
+      const { kernel, durable } = await build(async () => {
+        if (gated) { gated = false; await gate }
+      })
+      const session = kernel.ctx.sessions.create()
+      session.append({ type: 'compaction/end', trigger: 'manual', coversSeq: 0, summaryChars: 3, summary: 'abc' } as never)
+      const barrier = session.durable()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(durable).toEqual([])
+      expect(session.committedEvents).toHaveLength(0)
+      release()
+      await barrier
+      expect(durable).toEqual([{ id: session.id, lastSeq: 1 }])
+      expect(session.committedEvents).toHaveLength(1)
+      void kernel.stop()
+    }
+    {
+      const { kernel, durable } = await build(async () => { throw new Error('disk gone') })
+      const session = kernel.ctx.sessions.create()
+      session.append({ type: 'user/message', turnId: 't1' as never, content: 'one' })
+      await expect(session.durable()).rejects.toThrow('disk gone')
+      expect(durable).toEqual([])
+      expect(session.poisoned).toBe(true)
+      void kernel.stop()
+    }
+  })
 })
 
 describe('sessions service over files', () => {

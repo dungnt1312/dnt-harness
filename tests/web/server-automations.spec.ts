@@ -284,5 +284,14 @@ describe('automations API', () => {
     expect(rootLog).toContain('"type":"session/role"')
     expect(rootLog).toContain('unattended scheduled task named \\"Explore\\"')
     expect(rootLog).toContain('look around')
+
+    // The post-compaction preview measures the request the role root sends next: the role, its ceiling.
+    await until(async () => (await (await fetch(`${url}/api/workspaces/${ws}/sessions`)).json() as { id: string; status: string }[]).find((s) => s.id === sessionId)?.status, (status) => status === 'idle')
+    expect((await fetch(`${url}/api/workspaces/${ws}/sessions/${sessionId}/compact`, { method: 'POST' })).status).toBe(200)
+    const end = (await fs.readFile(path.join(home, 'workspaces', ws, 'sessions', sessionId, 'events.jsonl'), 'utf8')).trim().split('\n')
+      .map((line) => JSON.parse(line) as { type: string; contextAfter?: { sources: { toolNames: string[]; child?: { definition: string } } } })
+      .findLast((event) => event.type === 'compaction/end')
+    expect(end?.contextAfter?.sources.child?.definition).toBe('explorer')
+    expect([...end!.contextAfter!.sources.toolNames].sort()).toEqual(['Glob', 'Grep', 'Read'])
   })
 })

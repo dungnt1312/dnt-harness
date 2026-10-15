@@ -1344,13 +1344,13 @@ export function setModeEnabled(workspaceId: string, modeId: string, enabled: boo
   }).then((r) => json<{ readonly id: string; readonly enabled: boolean }>(r))
 }
 
-export type { ContextBreakdownView, ContextManifestView, ContextUsageView } from './types.ts'
+export type { CompactionMeasurementView, ContextStatus, ContextBreakdownView, ContextManifestView, ContextUsageView, ContextView } from './types.ts'
 
 /** `null` means the valid no-request-yet state (HTTP 204), not an error. */
-export function fetchManifest(workspaceId: string, sessionId: string): Promise<ContextManifestView | null> {
+export function fetchManifest(workspaceId: string, sessionId: string): Promise<import('./types.ts').ContextView | null> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/manifest`).then((r) => {
     if (r.status === 204) return null
-    return json<ContextManifestView>(r)
+    return json<import('./types.ts').ContextView>(r)
   })
 }
 
@@ -1368,6 +1368,8 @@ export interface CompactResult {
   /** Context tokens before/after; absent when the run was not measured. */
   readonly tokensBefore?: number
   readonly tokensAfter?: number
+  /** Basis of the two figures; absent on older hosts (then both are estimates). */
+  readonly measurement?: import('./types.ts').CompactionMeasurementView
   /** How the summary was produced: `exact` and `reconstructed` are one request; `recovery` folds the whole transcript. */
   readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'
 }

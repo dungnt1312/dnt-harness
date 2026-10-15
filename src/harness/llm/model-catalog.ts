@@ -470,13 +470,16 @@ export function bareModelId(modelId: string): string {
  * field empty: verified catalog value → known-family rule (bare segment
  * retry for namespaced ids) → the 256k default.
  */
+export function resolveContextWindow(modelId: string): { tokens: number; source: 'catalog'|'family'|'fallback' } {
+  const catalog = getModelInfo(modelId)?.contextTokens
+  if (catalog !== undefined) return { tokens: catalog, source: 'catalog' }
+  const family = knownModelLimit(modelId) ?? knownModelLimit(bareModelId(modelId))
+  if (family !== null) return { tokens: family, source: 'family' }
+  return { tokens: DEFAULT_CONTEXT_LIMIT, source: 'fallback' }
+}
+
 export function resolveContextLimit(modelId: string): number {
-  return (
-    getModelInfo(modelId)?.contextTokens
-    ?? knownModelLimit(modelId)
-    ?? knownModelLimit(bareModelId(modelId))
-    ?? DEFAULT_CONTEXT_LIMIT
-  )
+  return resolveContextWindow(modelId).tokens
 }
 
 // ── thinking overrides on the wire ────────────────────────────────

@@ -138,6 +138,10 @@ marker. Argument errors throw inside `execute` and surface as failed
   through the same module, so "which shell is this" has one answer no matter
   who is asking.
 - **Command**: `<bash> -lc <command>` (login shell, command string).
+- **No advisory hints**: results contain only program output, truncation
+  markers and the exit/termination suffix; a `[hint: …]` line is the program's
+  own. Use Read/Grep/Glob for contents and Edit/Write/ApplyPatch for changes;
+  reading through Bash creates no observation for later Edit/Write.
 - **Output**: stdout and stderr captured together; capture stops shortly past
   the execution's output limit so a firehose command cannot exhaust memory,
   and the model-visible result is truncated with an explicit marker.
@@ -400,7 +404,9 @@ deleted, or disabled provider fails the call with the Settings fix it needs.
   vision capability is the provider model override first, then the shared
   model catalog. `vision: false` converts image-bearing history to text-only:
   the attachment marker (including `attachmentId`) remains, image bytes leave
-  the chat request, and the text tells the model to call `DescribeImage`.
+  the chat request, and the text tells the model to call `DescribeImage` when
+  the request carries that tool (otherwise it says no image-description tool is
+  available).
   `DescribeImage { attachmentId, question? }` reads only from the workspace
   AttachmentStore and sends that image to the dedicated multimodal chat model
   selected in **Settings → Providers & Models → Image understanding**. Its
