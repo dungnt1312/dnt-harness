@@ -101,7 +101,8 @@ describe('background child over the web host', () => {
     const report = events.filter((event) => event.type === 'user/message' && String(event.content).includes('BACKGROUND-REPORT'))
     expect(report).toHaveLength(1)
     expect(report[0]).toMatchObject({ origin: 'continuation' })
-    expect(events.find((event) => event.type === 'input/queued' && event.origin === 'child')).toBeTruthy()
+    // Names the child, so a restart knows this report already reached the root.
+    expect(events.find((event) => event.type === 'input/queued' && event.origin === 'child')).toMatchObject({ childSessionId: expect.any(String) })
     expect(events.filter((event) => event.type === 'turn/end')).toHaveLength(2)
     expect(rootSeen.at(-1)).toContain('BACKGROUND-REPORT')
   }, 30_000)

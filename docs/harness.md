@@ -971,8 +971,11 @@ as durable `input/queued` with `origin: 'child'` — an idle root wakes, a busy
 one gets it after its turn, and the turn admits it as a `continuation` message.
 A `wait` watching the child delivers the report itself; a Stop never wakes the
 root; a report the host could not take stays owed to the root's next join or
-`wait`. That obligation is in memory only: after a restart an undelivered
-report is not re-queued (nothing auto-runs after a restart).
+`wait`. The obligation survives a restart without a new record: the queued
+report names its child (`input/queued` `childSessionId`), and recovery owes
+every settled background run that has no such input after its result. Nothing
+auto-runs; the report waits for the root's next join or `wait`. A report the
+model only got through `wait` before the crash is offered once more.
 
 **Lifecycle boundary.** `spawn` checks, in order: the brief and inherit fields
 (`SpawnError('packet' | 'inherit')`), that the parent is a root owned by the

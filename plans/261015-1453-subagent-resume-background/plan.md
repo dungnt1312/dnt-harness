@@ -70,6 +70,6 @@ tests/web/agent-background-wake.spec.ts and web projection specs. Typecheck and 
 GPT-6.1-sol reviewed design and code; code findings fixed in fda347d.
 
 ## Known limits (accepted)
-- Owed background reports live in memory: after a restart an undelivered report is not re-offered by join/wait
-  without ids (still readable via list/wait by id). Persist delivery per run if this matters.
+- Owed background reports are rebuilt on recovery from the parent log (no `input/queued origin:'child'` naming
+  the child after its result → owed). A report the model only got via `wait` before a crash is offered once more.
 - A notification already queued is not withdrawn if a later `wait` by id also returns the same report.

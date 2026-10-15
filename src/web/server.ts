@@ -756,7 +756,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     const entry = sessions.get(root)
     const deps = depsRef.current
     if (entry === undefined || deps === undefined || shuttingDown) return false
-    return queueHostInput(entry, deps, formatChildReports([handle]), 'child', `Background agent ${handle.definitionName} ${handle.status}`)
+    return queueHostInput(entry, deps, formatChildReports([handle]), 'child', `Background agent ${handle.definitionName} ${handle.status}`, handle.childSessionId)
   })
   kernel.ctx.provide('agent-definitions', agentDefinitions)
   // Claude Code custom slash commands: ~/.claude/commands < plugins <
@@ -9357,7 +9357,7 @@ async function acceptMessage(
  * ever steered. False when the conversation cannot take it (child, closed,
  * unavailable, no model, queue full).
  */
-async function queueHostInput(entry: SessionEntry, deps: HandlerDeps, content: string, origin: 'hook' | 'child', summary: string): Promise<boolean> {
+async function queueHostInput(entry: SessionEntry, deps: HandlerDeps, content: string, origin: 'hook' | 'child', summary: string, childSessionId?: string): Promise<boolean> {
   if (entry.closed || deps.unavailableSessions.has(entry.session.id)) return false
   if (entry.session.events.some((event) => event.type === 'session/child-meta')) return false
   const effectiveModel = deps.resolveEffectiveModel(entry.session, entry.workspaceId)
@@ -9375,6 +9375,7 @@ async function queueHostInput(entry: SessionEntry, deps: HandlerDeps, content: s
     content,
     origin,
     summary,
+    ...(childSessionId !== undefined ? { childSessionId } : {}),
     ...(runsNow ? { runsNow: true as const } : {}),
   })
   await entry.session.durable()

@@ -31,10 +31,11 @@ afterAll(async () => {
   await fs.rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
 })
 
-async function boot(script: readonly ScriptStep[], options: { readonly slowMs?: number; readonly deliver?: boolean } = {}) {
+async function boot(script: readonly ScriptStep[], options: { readonly slowMs?: number; readonly deliver?: boolean; readonly dir?: string; readonly rootSessionId?: string } = {}) {
+  const dir = options.dir ?? home
   const kernel = new Kernel()
-  kernel.ctx.plugin(fileSessions(home))
-  const ws = new WorkspaceService(home)
+  kernel.ctx.plugin(fileSessions(dir))
+  const ws = new WorkspaceService(dir)
   await ws.boot()
   await kernel.ctx.sessions.boot()
   kernel.ctx.plugin(LlmService)
@@ -54,14 +55,14 @@ async function boot(script: readonly ScriptStep[], options: { readonly slowMs?: 
       return 'Read ok'
     },
   })
-  const root = kernel.ctx.sessions.create(ws.defaultWorkspace)
+  const rootSessionId = options.rootSessionId ?? kernel.ctx.sessions.create(ws.defaultWorkspace).id
   kernels.push(kernel)
   const notified: ChildHandle[] = []
   const executor = new ChildExecutor(kernel.ctx, undefined, async (_root, handle) => {
     notified.push(handle)
     return options.deliver ?? true
   })
-  return { kernel, executor, notified, workspaceId: ws.defaultWorkspace as never, rootSessionId: root.id as never }
+  return { kernel, executor, notified, workspaceId: ws.defaultWorkspace as never, rootSessionId: rootSessionId as never }
 }
 
 type Harness = Awaited<ReturnType<typeof boot>>
@@ -172,6 +173,29 @@ describe('background children', () => {
     await until(() => harness.notified.length > 0)
     await new Promise((resolve) => setTimeout(resolve, 20))
     expect(harness.executor.owedChildrenOfTurn(harness.rootSessionId, 'turn-2')).toEqual([handle.childSessionId])
+  })
+
+  it('after a restart an undelivered report is owed again; a delivered one is not', async () => {
+    const dir = await fs.mkdtemp(path.join(home, 'restart-'))
+    const first = await boot(['Lost in the crash.'], { dir, deliver: false })
+    const lost = await first.executor.spawn(spawnRequest(first, true))
+    await until(() => first.notified.length === 1)
+    // A second child whose report the host did queue, the way queueHostInput records it.
+    const delivered = await first.executor.spawn(spawnRequest(first, true))
+    await until(() => first.notified.length === 2)
+    const root = await first.kernel.ctx.sessions.load(first.rootSessionId)
+    root.append({ type: 'input/queued', inputId: 'in-1', content: 'report', origin: 'child', childSessionId: delivered.childSessionId })
+    await root.durable()
+    await first.kernel.stop()
+
+    const second = await boot(['x'], { dir, rootSessionId: first.rootSessionId })
+    await second.executor.recoverFromStorage()
+    expect(second.executor.owedChildrenOfTurn(second.rootSessionId, 'turn-9')).toEqual([lost.childSessionId])
+    const joined = await second.executor.joinTurnChildren(second.workspaceId, second.rootSessionId, 'turn-9', { timeoutMs: 100 })
+    expect(joined.map((child) => child.result?.report)).toEqual(['Lost in the crash.'])
+    expect(second.executor.owedChildrenOfTurn(second.rootSessionId, 'turn-10')).toEqual([])
+    // The report the host had queued is already the root's: not offered again.
+    expect(joined.every((child) => child.childSessionId !== delivered.childSessionId)).toBe(true)
   })
 
   it('stays background when resumed', async () => {

@@ -297,9 +297,9 @@ export class ChildExecutor {
    * Background children per root whose current run the model has not been
    * handed yet. Unlike `turnChildren` this survives turn cleanup: the report
    * is owed to the root, delivered by notification, a wait, or the next join.
-   * shortcut: in memory only — after a restart an undelivered report is not
-   * owed again (the model still sees it via list/wait by id); persist delivery
-   * per run if reports must survive a crash.
+   * Rebuilt on recovery from the parent log: a settled background run with no
+   * `input/queued origin:'child'` after its result is owed again. A report the
+   * model only got through `wait` before a crash is therefore offered once more.
    */
   private readonly owedBackground = new Map<SessionId, Set<SessionId>>()
   /** Waits watching a child right now: a watched settle is the wait's to deliver. */
@@ -476,6 +476,16 @@ export class ChildExecutor {
       }
       this.indexChild(parentId, summary.id)
       recovered += 1
+      // A settled background run whose report never reached the root as queued
+      // input stays owed to its next join or wait, across the restart.
+      if (parent !== undefined && meta.background === true) {
+        const run = currentRun(parent.events, loaded.events, summary.id)
+        if (run.result !== undefined && isTerminalStatus(run.result.status) && !reportQueuedAfter(parent.events, summary.id, run.result.seq)) {
+          const owed = this.owedBackground.get(parentId) ?? new Set<SessionId>()
+          owed.add(summary.id)
+          this.owedBackground.set(parentId, owed)
+        }
+      }
       // A crash between the committed spawn and the child's settlement leaves
       // the parent's log result-less forever, and every projection reads that
       // as a child still running. Where the child's own log holds nothing but
@@ -1874,6 +1884,11 @@ function currentRun(
     parentTurnId: resume.parentTurnId,
     startedAt: resume.timestamp,
   }
+}
+
+/** Whether the host queued this child's report for its root after `seq` (its result). */
+function reportQueuedAfter(parentEvents: readonly SessionEvent[], childSessionId: string, seq: number): boolean {
+  return parentEvents.some((event) => event.type === 'input/queued' && event.origin === 'child' && event.childSessionId === childSessionId && event.seq > seq)
 }
 
 /**
