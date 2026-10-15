@@ -234,7 +234,7 @@ export function parseAgentDefinition(fallbackName: string, raw: string): AgentDe
   }
 }
 
-const READ_ONLY_DISALLOWED = ['Write', 'Edit', 'Bash', 'Skill', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget']
+const READ_ONLY_DISALLOWED = ['Write', 'Edit', 'ApplyPatch', 'Bash', 'Skill', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget']
 
 /**
  * Bundled role definitions (read-only; copied for customization). Each
@@ -266,7 +266,7 @@ export function bundledDefinition(name: string): AgentDefinition {
         'Use shell commands only to support the task: tests, typecheck, build, and inspecting diffs. Do not commit, push, run destructive commands, or change dependencies unless the brief explicitly requires it. Bash may return a running process ID after its foreground wait; watch the same execution with BashOutput (block:true for bounded waiting), never rerun it just because it is still running. Stop unneeded processes with KillShell.',
         'Your final message lists every file you changed as `path` — what changed, then each check you ran with its command and outcome. Clearly identify checks not run, incomplete verification, and anything blocked or unfinished and why. Never claim a check passed without its completed result.',
       ].join(' '),
-      tools: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell'],
+      tools: ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'ApplyPatch', 'Bash', 'BashOutput', 'KillShell'],
       disallowedTools: [],
     }
   }
@@ -293,7 +293,7 @@ export function bundledDefinition(name: string): AgentDefinition {
         'Your final message starts with PASS, FAIL, BLOCKED, or INCONCLUSIVE; never claim a still-running check passed, then one line per command: the command — its exit code — the failing cases, each with `path:line` and the assertion or error text.',
       ].join(' '),
       tools: ['Read', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell'],
-      disallowedTools: ['Write', 'Edit', 'Skill', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget'],
+      disallowedTools: ['Write', 'Edit', 'ApplyPatch', 'Skill', 'MemoryCreate', 'MemoryUpdate', 'MemoryForget'],
     }
   }
   throw new AgentDefinitionError('not-found', `no bundled agent role '${name}'`)

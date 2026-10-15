@@ -50,6 +50,8 @@ export interface GitChangeListProps {
   readonly report: GitStatusReport
   /** The rows to list (the report's changes, or the turn filter's subset). */
   readonly visibleChanges: readonly GitChange[]
+  /** Controls drawn in the first section's header, right-aligned before its checkbox. */
+  readonly headerActions?: ReactNode
   /** Optimistic staging per path, applied over the report until the operation settles. */
   readonly pendingStages: ReadonlyMap<string, GitStaging>
   /** A staging control: stage or unstage exactly these paths. */
@@ -82,7 +84,7 @@ export interface GitChangeListProps {
  * the selection, Space stages or unstages it and Enter opens the file.
  */
 export function GitChangeList({
-  report, visibleChanges, pendingStages, onStage, onDiscard, onTrash, onOpenFile, onIgnore, projectPath, view,
+  report, visibleChanges, headerActions, pendingStages, onStage, onDiscard, onTrash, onOpenFile, onIgnore, projectPath, view,
   selectedPath, onSelect, focusPath, focusRowRef,
 }: GitChangeListProps) {
   const groups = groupChanges(withPendingStages(visibleChanges, pendingStages))
@@ -125,11 +127,12 @@ export function GitChangeList({
 
   return (
     <div ref={box} role="group" aria-label="Changed files" className="flex flex-col p-1">
-      {groups.map((group) => (
+      {groups.map((group, index) => (
         <Section
           key={group.section}
           group={group}
           onStage={onStage}
+          {...(index === 0 && headerActions !== undefined ? { actions: headerActions } : {})}
         >
           {nodesOf(group).map((node) => node.kind === 'dir' ? (
             <li key={`dir:${node.key}`} data-tree-dir={node.path}>
@@ -166,8 +169,9 @@ function toggleStateOf(staging: GitStaging): GitToggleState {
   return staging === 'staged' ? 'selected' : staging === 'partial' ? 'indeterminate' : 'unselected'
 }
 
-function Section({ group, onStage, children }: {
+function Section({ group, onStage, actions, children }: {
   readonly group: GitChangeGroup
+  readonly actions?: ReactNode
   readonly onStage: GitChangeListProps['onStage']
   readonly children: ReactNode
 }) {
@@ -181,9 +185,12 @@ function Section({ group, onStage, children }: {
   }
   return (
     <section aria-label={group.title}>
-      <div className="flex h-8 items-center gap-1.5 pl-2 text-[11px] font-medium uppercase tracking-wide text-fg-faint">
-        <span className="min-w-0 flex-1 truncate">{group.title}</span>
+      <div className="flex h-7 items-center gap-1.5 pl-2 text-[11px] font-medium uppercase tracking-wide text-fg-faint">
+        {/* Left: the section and its count together; right: its actions. */}
+        <span className="min-w-0 truncate">{group.title}</span>
         <span className="font-mono normal-case tabular-nums">{group.entries.length}</span>
+        <span className="flex-1" />
+        {actions}
         <StageCheckbox
           state={state}
           label={`${state === 'selected' ? 'Unstage' : 'Stage'} all ${group.title.toLowerCase()}`}
@@ -213,9 +220,9 @@ function StageCheckbox({ state, label, onToggle, lockedTitle }: {
       title={lockedTitle ?? label}
       disabled={lockedTitle !== undefined}
       onClick={onToggle}
-      // Exempt from the 44px coarse-pointer floor: the row reserves exactly this 32px slot.
+      // Exempt from the 44px coarse-pointer floor: the row reserves exactly this 28px slot.
       data-compact-control
-      className="flex size-8 shrink-0 items-center justify-center rounded-md"
+      className="flex size-7 shrink-0 items-center justify-center rounded-md"
     >
       <span className={cn('flex size-4 items-center justify-center rounded border', state === 'unselected' ? 'border-line-strong' : 'border-primary bg-primary text-primary-fg')}>
         {state === 'selected' ? <Icon name="check" size={11} /> : null}
@@ -258,7 +265,7 @@ function ChangeRow({ change, selected, projectPath, actions, onSelect, onKeyDown
         onClick={onSelect}
         // Touch shows the overlays all the time, so only there the row makes room for them.
         className={cn(
-          'flex min-h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px]',
+          'flex min-h-7 min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px]',
           onOpenFile !== undefined ? '[@media(pointer:coarse)]:pr-14' : '[@media(pointer:coarse)]:pr-8',
         )}
       >
@@ -323,11 +330,11 @@ const OPENER_BASE = 'absolute size-6 rounded-md text-fg-faint hover:bg-transpare
 const ROW_REVEAL = 'top-1/2 -translate-y-1/2 group-hover/row:visible group-hover/row:opacity-100 group-has-[:focus-visible]/row:visible group-has-[:focus-visible]/row:opacity-100'
 /** The selected row keeps its actions in view: the pane is showing that file. */
 const SELECTED_REVEAL = 'visible opacity-100'
-// The checkbox slot (size-8) sits at the row's right edge; the overlays stack left of it.
-const OPENER_REVEAL_ROW = cn(OPENER_BASE, 'right-9', ROW_REVEAL)
+// The checkbox slot (size-7) sits at the row's right edge; the overlays stack left of it.
+const OPENER_REVEAL_ROW = cn(OPENER_BASE, 'right-8', ROW_REVEAL)
 // The menu trigger stays shown while its menu is open, or the menu would lose its anchor.
-const MENU_REVEAL_ROW = cn(OPENER_BASE, 'inline-flex items-center justify-center right-9', ROW_REVEAL, 'data-[state=open]:visible data-[state=open]:opacity-100')
-const MENU_REVEAL_ROW_BESIDE_OPENER = cn(MENU_REVEAL_ROW, 'right-16')
+const MENU_REVEAL_ROW = cn(OPENER_BASE, 'inline-flex items-center justify-center right-8', ROW_REVEAL, 'data-[state=open]:visible data-[state=open]:opacity-100')
+const MENU_REVEAL_ROW_BESIDE_OPENER = cn(MENU_REVEAL_ROW, 'right-[3.75rem]')
 
 /** A directory of the tree: chevron, name, count and a tri-state checkbox over every change beneath it. */
 function FolderRow({ node, collapsed, onToggle, onStage }: {
@@ -346,7 +353,7 @@ function FolderRow({ node, collapsed, onToggle, onStage }: {
         aria-expanded={!collapsed}
         title={node.path}
         onClick={onToggle}
-        className="flex min-h-8 min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px]"
+        className="flex min-h-7 min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left text-[13px]"
       >
         <Icon name="chevronRight" size={12} className={cn('shrink-0 text-fg-faint transition-transform', !collapsed && 'rotate-90')} />
         <Icon name={collapsed ? 'folder' : 'folderOpen'} size={14} className="shrink-0 text-fg-muted" />

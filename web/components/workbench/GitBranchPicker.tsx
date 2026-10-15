@@ -6,6 +6,7 @@ import { Menu } from '../ui/Menu.tsx'
 import { menuItemClass } from '../ui/Menu.tsx'
 import type { GitBranch, GitOperationDone } from '../../lib/api.ts'
 import { cn } from '../../lib/cn.ts'
+import { GIT_ICON_TRIGGER } from './git-controls.ts'
 import { fuzzyMatch, normalizeBranchName, orderBranches, type BranchFilter } from './git-panel-model.ts'
 import type { GitRun } from './use-git-operation.tsx'
 
@@ -181,7 +182,7 @@ export function GitBranchPicker({ current, run, enqueue, onDone }: {
               <Menu
                 label="Branch filter"
                 align="end"
-                triggerClassName="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-fg-muted hover:bg-hover hover:text-fg"
+                triggerClassName={GIT_ICON_TRIGGER}
                 trigger={() => <Icon name="funnel" size={13} />}
               >
                 {(close) => FILTERS.map((entry) => (

@@ -186,6 +186,18 @@ const PATHS: Readonly<Record<string, ReactNode>> = {
       <path d="M15 3v18" />
     </>
   ),
+  columns: (
+    <>
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M12 3v18" />
+    </>
+  ),
+  rows: (
+    <>
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M3 12h18" />
+    </>
+  ),
   panelLeft: (
     <>
       <rect x="3" y="3" width="18" height="18" rx="2" />

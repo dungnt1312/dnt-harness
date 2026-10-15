@@ -49,6 +49,11 @@ afterEach(() => {
 const mount = async (projectId?: string): Promise<void> => {
   await act(async () => { root.render(<PluginsPanel workspaceId="ws" {...(projectId !== undefined ? { projectId } : {})} />) })
 }
+const tab = async (name: string): Promise<void> => {
+  const found = [...host.querySelectorAll<HTMLButtonElement>('[aria-label="Plugins view"] [role="tab"]')].find((node) => node.textContent?.startsWith(name))
+  if (found === undefined) throw new Error(`no tab '${name}'`)
+  await act(async () => { found.click() })
+}
 const button = (text: string): HTMLButtonElement => {
   const found = [...host.querySelectorAll('button')].find((candidate) => candidate.textContent?.includes(text))
   if (found === undefined) throw new Error(`no button '${text}'`)
@@ -64,11 +69,13 @@ describe('PluginsPanel', () => {
   it('lists installed and user-enabled plugins, and only not-installed entries as available', async () => {
     await mount()
     const installedList = host.querySelector('[aria-label="Installed plugins"]')!.textContent ?? ''
-    expect(installedList).toContain('toolkit@market')
-    expect(installedList).toContain('active')
-    expect(installedList).toContain('superpowers@claude-plugins-official')
-    expect(installedList).toContain('not installed')
-    expect(installedList).toContain('on · ~/.claude')
+    expect(installedList).toContain('toolkit')
+    expect(installedList).toContain('@market')
+    expect(installedList).toContain('On')
+    expect(installedList).toContain('superpowers')
+    expect(installedList).toContain('Not installed')
+    expect(installedList).toContain('Enabled in ~/.claude settings')
+    await tab('Browse')
     const available = host.querySelector('[aria-label="Available plugins"]')!.textContent ?? ''
     expect(available).toContain('extra')
     expect(available).not.toContain('toolkit')
@@ -78,9 +85,11 @@ describe('PluginsPanel', () => {
     vi.mocked(pluginAction).mockResolvedValue({ plugins: [installed] })
     await mount('proj')
     await act(async () => { button('Project').click() })
+    await tab('Browse')
     const availableInstall = [...host.querySelectorAll('[aria-label="Available plugins"] button')].find((candidate) => candidate.textContent?.includes('Install')) as HTMLButtonElement
     await act(async () => { availableInstall.click() })
     expect(pluginAction).toHaveBeenCalledWith('ws', 'extra@market', 'install', 'project', 'proj')
+    await tab('Installed')
     const toggle = host.querySelector('[aria-label="Enable toolkit@market in Project settings"]') as HTMLButtonElement
     await act(async () => { toggle.click() })
     expect(pluginAction).toHaveBeenLastCalledWith('ws', 'toolkit@market', 'disable', 'project', 'proj')
@@ -89,6 +98,7 @@ describe('PluginsPanel', () => {
   it('adds a marketplace from owner/repo', async () => {
     vi.mocked(addMarketplace).mockResolvedValue({ name: 'claude-plugins-official', plugins: 315 })
     await mount()
+    await tab('Marketplaces')
     const input = host.querySelector('[aria-label="Marketplace source"]') as HTMLInputElement
     await act(async () => {
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
@@ -103,6 +113,7 @@ describe('PluginsPanel', () => {
   it('offers the official marketplace with one click until it is added', async () => {
     vi.mocked(addMarketplace).mockResolvedValue({ name: 'claude-plugins-official', plugins: 315 })
     await mount()
+    await tab('Marketplaces')
     const recommended = host.querySelector('[aria-label="Recommended marketplaces"]')!
     expect(recommended.textContent).toContain('claude-plugins-official')
     await act(async () => { (recommended.querySelector('button') as HTMLButtonElement).click() })
@@ -116,14 +127,15 @@ describe('PluginsPanel', () => {
       { name: 'mine', source: { source: 'github', repo: 'me/mine' }, lastUpdated: 'x', document: { name: 'mine', plugins: [{ name: 'solo' }] } },
     ] })
     await mount()
-    const tabs = [...host.querySelectorAll('[aria-label="Marketplace"] [role="tab"]')].map((tab) => tab.textContent)
-    expect(tabs).toEqual(['All4', 'market3', 'mine1'])
-    const names = (): string[] => [...host.querySelectorAll('[aria-label="Available plugins"] li .font-mono')].map((node) => node.textContent ?? '')
+    await tab('Browse')
+    const chips = [...host.querySelectorAll('[aria-label="Marketplace"] button')].map((chip) => chip.textContent)
+    expect(chips).toEqual(['All marketplaces4', 'market3', 'mine1'])
+    const names = (): string[] => [...host.querySelectorAll('[aria-label="Available plugins"] li .break-all')].map((node) => node.textContent ?? '')
     expect(names()).toEqual(['extra', 'lint', 'audit', 'solo'])
-    const tab = (label: string): HTMLButtonElement => [...host.querySelectorAll<HTMLButtonElement>('[aria-label="Marketplace"] [role="tab"]')].find((node) => node.textContent?.startsWith(label))!
-    await act(async () => { tab('mine').click() })
+    const market = (label: string): HTMLButtonElement => [...host.querySelectorAll<HTMLButtonElement>('[aria-label="Marketplace"] button')].find((node) => node.textContent?.startsWith(label))!
+    await act(async () => { market('mine').click() })
     expect(names()).toEqual(['solo'])
-    await act(async () => { tab('market').click() })
+    await act(async () => { market('market').click() })
     await act(async () => { [...host.querySelectorAll<HTMLButtonElement>('[aria-label="Category"] button')].find((chip) => chip.textContent?.startsWith('security'))!.click() })
     expect(names()).toEqual(['audit'])
   })
@@ -136,6 +148,7 @@ describe('PluginsPanel', () => {
       hooks: ['SessionStart'], mcpServers: [{ name: 'db', type: 'stdio' }], notes: [],
     })
     await mount()
+    await tab('Browse')
     await act(async () => { (host.querySelector('[aria-label="Details for extra@market"]') as HTMLButtonElement).click() })
     expect(pluginDetails).toHaveBeenCalledWith('ws', 'extra@market', undefined)
     const dialog = document.body.querySelector('[role="dialog"]')!
@@ -148,6 +161,7 @@ describe('PluginsPanel', () => {
       document: { name: 'claude-plugins-official', plugins: [] },
     }] })
     await mount()
+    await tab('Marketplaces')
     expect(host.querySelector('[aria-label="Recommended marketplaces"]')).toBeNull()
   })
 })

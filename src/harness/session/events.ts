@@ -190,11 +190,16 @@ export type SessionEvent =
       readonly type: 'compaction/job'
       readonly stage: 'preparing' | 'generating' | 'applying' | 'ended'
       readonly trigger: 'manual' | 'automatic'
-      /** Only on `ended`. `needs-recovery`: nothing ran, the user must confirm a slow recovery. */
+      /** Only on `ended`. `needs-recovery` is historical: older hosts wrote it when they asked before folding; nothing ran. */
       readonly outcome?: 'compacted' | 'noop' | 'needs-recovery' | 'cancelled' | 'failed'
       /** Only on `ended` after a success: how the summary was made. */
       readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'
       readonly error?: string
+      /** Only on `generating`: chunk summaries finished of the fold's total. */
+      readonly progress?: { readonly done: number; readonly total: number }
+      /** Only on `ended`: model requests the job sent (any outcome), and their reported token usage. */
+      readonly requests?: number
+      readonly usage?: { readonly input: number; readonly cached: number; readonly output: number }
     } & SessionEventStamp)
   // The bounded state restored beside a compaction summary (task list, running
   // work, loaded skills, current file contents). Written inside the compaction

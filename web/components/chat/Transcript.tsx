@@ -4,12 +4,11 @@ import type { RetryTarget, ViewItem } from '../../lib/project.ts'
 import { turnChanges, type TurnChanges } from '../../lib/turn-changes.ts'
 import type { SseEvent } from '../../lib/types.ts'
 import type { OpenPathResolver } from '../../lib/project-paths.ts'
-import { toProjectRelative } from '../../lib/project-paths.ts'
 import { processRows, type ProcessRow } from '../../lib/processes-view.ts'
 import { hiddenSpawnCalls } from '../../lib/spawn-merge.ts'
 import { turnTimings, type TurnTiming } from '../../lib/turn-timing.ts'
 import { useGated, useSessionDerivedGates } from '../../lib/session-derived.ts'
-import { ActivityBlock, AssistantMessage, AuditLine, CommandExpansionMarker, CompactionMarker, ContinuationMarker, ContextMarker, HookContextMarker, HookRewakeMarker, DelegationCard, JumpToBottom, ProcessLinkContext, RetryLine, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
+import { ActivityBlock, AssistantMessage, AuditLine, CommandExpansionMarker, CompactionMarker, ContinuationMarker, ContextMarker, HookContextMarker, HookRewakeMarker, DelegationCard, generatedImageOf, generatedVideoOf, JumpToBottom, previewOf, ProcessLinkContext, RetryLine, StatusLine, ToolCard, UserBubble, type ProcessLink } from './MessageParts.tsx'
 import { TurnChangesCard } from './TurnChangesCard.tsx'
 import type { ChipSegment } from '../../lib/inline-chips.ts'
 import type { WorkbenchProject } from '../workbench/Workbench.tsx'
@@ -115,6 +114,14 @@ const isChange = (item: ViewItem): boolean => {
   return name === 'edit' || name === 'write'
 }
 
+/**
+ * A call whose landed result is media the reader came for (a preview, a
+ * generated image or video). It stands on its own row, never inside a run: a
+ * settled run of four steps folds, and would fold the media shut with it.
+ */
+const isMedia = (item: ViewItem): boolean =>
+  item.kind === 'tool' && (previewOf(item) !== null || generatedImageOf(item) !== null || generatedVideoOf(item) !== null)
+
 /** An `Agent` call that only waits on children already spawned. */
 const isWait = (item: ViewItem): boolean =>
   item.kind === 'tool' && item.call.name.toLowerCase() === 'agent' && item.call.args['action'] === 'wait'
@@ -168,7 +175,7 @@ export function groupBlocks(items: readonly ViewItem[], hidden?: ReadonlySet<str
     }
     const afterBreak = afterChange
     afterChange = false
-    if (isActivity(item)) {
+    if (isActivity(item) && !isMedia(item)) {
       // A wait right after a wait in the same run folds into it: the row now
       // shows the newest wait and counts the ones before.
       const last = blocks.at(-1)
@@ -227,7 +234,7 @@ function latestStepOpen(items: readonly ViewItem[]): boolean {
  * Memoized: the app re-renders on every composer keystroke, and a long
  * transcript must not re-render with it while its own props are unchanged.
  */
-export const Transcript = memo(function Transcript({ items, events, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, openPath, openSkill, openMention, project, onReviewFile, onReviewChanges, onOpenProcess }: {
+export const Transcript = memo(function Transcript({ items, events, conversationId, modelLabel, workspaceId, onReuse, onOpenChild, onRetry, openPath, openSkill, openMention, onReviewTurn, onOpenProcess }: {
   readonly items: readonly ViewItem[]
   /** The raw log behind `items`; per-turn changes project from it. */
   readonly events?: readonly SseEvent[]
@@ -243,12 +250,8 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   readonly openSkill?: (name: string) => (() => void) | null
   /** Opens a mention chip's file in the workbench; null when the path is not project-local. */
   readonly openMention?: (segment: ChipSegment) => (() => void) | null
-  /** The conversation's project, for the per-turn change card's git chips. */
-  readonly project?: WorkbenchProject | null
-  /** Reviews one file of a turn: the Git view focused on that diff. */
-  readonly onReviewFile?: (path: string) => void
-  /** Reviews one turn: the Git view narrowed to the turn's recorded files. */
-  readonly onReviewChanges?: (paths: readonly string[]) => void
+  /** Reviews one turn: its recorded diff as a workbench tab (never git). */
+  readonly onReviewTurn?: (turnId: string) => void
   /** Opens a background process's live detail in the workbench. */
   readonly onOpenProcess?: (processId: string) => void
 }) {
@@ -287,19 +290,6 @@ export const Transcript = memo(function Transcript({ items, events, conversation
     Math.ceil((typeof window === 'undefined' ? 900 : window.innerHeight) / 24))))
   const visibleStart = Math.max(0, blocks.length - visibleLimit)
   const visibleBlocks = useMemo(() => blocks.slice(visibleStart), [blocks, visibleStart])
-  // Reviews exactly the given turn's files in the Git view, in the
-  // project-relative form git status reports. Paths that resolve outside the
-  // project are dropped: git cannot see them anyway, and the card's own list
-  // still shows them.
-  const reviewAllOf = (changes: TurnChanges): (() => void) | undefined => {
-    if (onReviewChanges === undefined || project == null) return undefined
-    return () => {
-      const root = project.path
-      onReviewChanges(changes.files
-        .map((file) => toProjectRelative(root, file.path))
-        .filter((path): path is string => path !== null))
-    }
-  }
   // Each turn's change card sits at the END of that turn — after its last
   // row, whether or not the turn wrote any answer text — and the open turn's
   // card is the same element, live, growing as edits land.
@@ -309,17 +299,14 @@ export const Transcript = memo(function Transcript({ items, events, conversation
   // transcript after it keeps its normal beat above the next block. Either way
   // it sits further from the tool row above it than the old 6px.
   const changeCard = (anchor: TurnChangeAnchor, atTail: boolean): ReactNode => {
-    const review = reviewAllOf(anchor.changes)
     return (
       <div key={`turn-changes-${anchor.turnId}`} className={atTail ? 'mt-3 -mb-4' : 'mt-3'}>
         <TurnChangesCard
           turnId={anchor.turnId}
           changes={anchor.changes}
-          project={project ?? null}
           live={anchor.live}
           {...(openPath !== undefined ? { onOpenPath: openPath } : {})}
-          {...(onReviewFile !== undefined ? { onReviewFile } : {})}
-          {...(review !== undefined ? { onReviewAll: review } : {})}
+          {...(onReviewTurn !== undefined ? { onReviewAll: () => onReviewTurn(anchor.turnId) } : {})}
         />
       </div>
     )
@@ -464,7 +451,7 @@ export const Transcript = memo(function Transcript({ items, events, conversation
                 and a standalone tool row are both work items, so they share the
                 same gap instead of a run's vertical margin stacking on the
                 next row's. */}
-            <div ref={columnRef} className="mx-auto flex w-full max-w-3xl flex-col px-1">
+            <div ref={columnRef} className="mx-auto flex w-full max-w-3xl flex-col">
               {visibleStart > 0 ? (
                 <button
                   type="button"
@@ -525,7 +512,7 @@ export interface TurnChangeAnchor {
 }
 
 /**
- * One anchor per turn that changed files (or tried to): the last item of the
+ * One anchor per turn that changed files: the last item of the
  * turn, so the card closes the turn whether its final row is an answer, a
  * tool, or an error. A turn spans from its first assistant step to the next
  * delivered user message; tool rows carry no turn of their own, so the span
@@ -538,7 +525,7 @@ export function turnChangeAnchors(items: readonly ViewItem[], changes: ReadonlyM
   const close = (): void => {
     if (current === undefined) return
     const found = changes.get(current.turnId)
-    if (found !== undefined && (found.files.length > 0 || found.uncertain.length > 0)) {
+    if (found !== undefined && found.files.length > 0) {
       anchors.push({ turnId: current.turnId, index: last, changes: found, live: current.live })
     }
     current = undefined

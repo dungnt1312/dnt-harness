@@ -27,7 +27,6 @@ import {
   listModelAliases,
   compactSession,
   CompactionCancelled,
-  CompactionRecoveryNeeded,
   renameSessionIn,
   setSessionPinnedIn,
   searchProjectFiles,
@@ -61,6 +60,7 @@ import { useWorkbenchPreferences } from './hooks/useWorkbenchPreferences.ts'
 import { useWorkbenchTabs } from './hooks/useWorkbenchTabs.ts'
 import { useTerminalProjects } from './hooks/useTerminalProjects.ts'
 import { useHotkeys } from './hooks/useHotkeys.ts'
+import { QuickSwitch, type QuickSwitchItem } from './components/layout/QuickSwitch.tsx'
 import { useMediaQuery } from './hooks/useMediaQuery.ts'
 import { useKeyboardInset } from './hooks/useKeyboardInset.ts'
 import { useTheme } from './hooks/useTheme.ts'
@@ -79,7 +79,7 @@ import { TerminalDock } from './components/workbench/TerminalDock.tsx'
 import { useWorkbenchFiles } from './hooks/useWorkbenchFiles.ts'
 import { NO_AGENT_WRITES, trackAgentWrites } from './lib/agent-writes.ts'
 import { usePanelResize } from './hooks/usePanelResize.ts'
-import { memoryTabForReference, memoryTabOf, skillTabName, skillTabPath, toProjectRelative } from './lib/project-paths.ts'
+import { memoryTabForReference, memoryTabOf, skillTabName, skillTabPath, toProjectRelative, turnTabPath } from './lib/project-paths.ts'
 import { clampInspectorTab, PANEL_LIMITS, terminalProjectKey, withProjectTerminalTab, type WorkbenchViewName } from './lib/workbench-preferences.ts'
 import { LazySettings } from './components/settings/LazySettings.tsx'
 import { TaskStatus } from './components/chat/TaskStatus.tsx'
@@ -353,6 +353,7 @@ function AppShell() {
   // a user shell belongs to the folder, not to one conversation.
   const [terminalProjects, setTerminalProjects] = useState<ReadonlySet<string>>(new Set())
   const [projects, setProjects] = useState<readonly ProjectRow[]>([])
+  const [quickSwitchOpen, setQuickSwitchOpen] = useState(false)
   // No-modal new-chat flow (spec: App shell): New conversation clears the
   // canvas; the composer's scope chip picks the project; the session is
   // created by the first sent message. The scope choice persists per
@@ -470,12 +471,6 @@ function AppShell() {
   // Docked, the workbench remembers whether it was open; as a sheet it starts closed.
   const [workbenchOpen, setWorkbenchOpen] = useState(() => workbenchDocked && !preferences.rightCollapsed)
   const [workbenchExpanded, setWorkbenchExpanded] = useState(false)
-  // The Git view narrowed to one turn's recorded files (a card's Review all).
-  // Session-scoped state, not a preference: the review is a moment's focus.
-  const [gitPathFilter, setGitPathFilter] = useState<readonly string[] | null>(null)
-  // The Git view row a card's file click opened, pre-expanded to its diff.
-  // A fresh object per click, so the same file clicked again focuses again.
-  const [gitFocusPath, setGitFocusPath] = useState<{ readonly path: string; readonly nonce: number } | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   // Global model aliases for the picker; reloaded whenever Settings closes, where they are edited.
   const [modelAliases, setModelAliases] = useState<readonly ModelAliasRow[]>([])
@@ -731,20 +726,12 @@ function AppShell() {
   const [processFocus, setProcessFocus] = useState<string | null>(null)
   /** The subagent a transcript delegation row focused in the workbench Subagents view. */
   const [agentFocus, setAgentFocus] = useState<string | null>(null)
-  /** The per-turn change card's Review all: the Git view narrowed to that turn's recorded files. */
-  const reviewTurnChanges = useCallback((paths: readonly string[]) => {
-    setGitPathFilter(paths)
-    setGitFocusPath(null)
-    openWorkbenchView('git')
-  }, [openWorkbenchView])
-  /** One card file row: the Git view over the whole project, its diff open. */
-  const reviewTurnFile = useCallback((path: string) => {
-    setGitPathFilter(null)
-    setGitFocusPath((previous) => ({ path, nonce: (previous?.nonce ?? 0) + 1 }))
-    openWorkbenchView('git')
-  }, [openWorkbenchView])
-  /** Show all: the Git view without the turn's narrowing. */
-  const clearGitPathFilter = useCallback(() => setGitPathFilter(null), [])
+  /** The per-turn change card's Review all: that turn's recorded diff as a workbench tab, not git. */
+  const reviewTurn = useCallback((turnId: string) => {
+    openWorkbenchFile(turnTabPath(turnId))
+    patchSessionTabs({ inspectorTab: 'files' })
+    onWorkbenchOpenChange(true)
+  }, [openWorkbenchFile, patchSessionTabs, onWorkbenchOpenChange])
   /** Environment panel rows open the matching workbench view. */
   const openEnvironmentView = useCallback((view: 'git' | 'agents') => {
     openWorkbenchView(view)
@@ -1172,13 +1159,9 @@ function AppShell() {
       const change = compactionTokenChange(result)
       toast.notify(`Compacted${change !== undefined ? ` — ${change}` : ''} (${result.summaryChars} chars summarized through seq ${result.coversSeq}).`, 'ok')
     } catch (cause) {
-      // A slow recovery is many model calls: the composer command never confirms it for the
-      // user. The Context panel asks, with the number of calls, and runs it only on approval.
       // A cancelled compaction is what the user asked for, not an error.
       if (cause instanceof CompactionCancelled) toast.notify('Compaction cancelled.')
-      else toast.notify(cause instanceof CompactionRecoveryNeeded
-        ? `Compaction needs a slow recovery (about ${cause.recovery.estimatedCalls} model calls). Open the Context panel and choose Compact… to review and approve it.`
-        : String(cause))
+      else toast.notify(String(cause))
     } finally {
       compactingRef.current.delete(current)
     }
@@ -1553,9 +1536,27 @@ function AppShell() {
     patchTerminalProject({ footerOpen: !terminalProjectState.footerOpen })
   }, [terminalProjectState.footerOpen, patchTerminalProject])
 
+  /** Ctrl+←/→: the previous or next live workspace, wrapping around the list. */
+  const cycleWorkspace = (step: 1 | -1): void => {
+    const live = workspaces.filter((row) => !row.archived || row.id === activeWs)
+    if (live.length < 2) return
+    const at = live.findIndex((row) => row.id === activeWs)
+    switchWorkspace(live[(at + step + live.length) % live.length]!.id)
+  }
+
+  const chooseQuickSwitch = (item: QuickSwitchItem): void => {
+    if (item.kind === 'session') openSession(item.id)
+    else if (item.kind === 'project') newInProject(item.id)
+    else switchWorkspace(item.id)
+  }
+
   useHotkeys([
     { key: 'n', mod: true, onPress: beginConversation },
-    { key: 'k', mod: true, onPress: () => onLeftOpenChange(true) },
+    { key: 'k', mod: true, onPress: () => setQuickSwitchOpen(true) },
+    { key: 'b', mod: true, onPress: () => onLeftOpenChange(!sidebarOpen) },
+    // Physical Ctrl on every platform: Cmd+←/→ is the browser's Back/Forward on macOS.
+    { key: 'ArrowLeft', ctrl: true, onPress: () => cycleWorkspace(-1) },
+    { key: 'ArrowRight', ctrl: true, onPress: () => cycleWorkspace(1) },
     { key: ',', mod: true, onPress: () => openSettings() },
     // Editors open the terminal with Ctrl+`. It must work from the composer.
     { key: '`', mod: true, allowInEditable: true, onPress: toggleTerminal },
@@ -1720,12 +1721,11 @@ function AppShell() {
     () => events.reduce((latest, event) => (event.type === 'session/grants' ? Math.max(latest, event.revision ?? 0) : latest), 0),
     [events],
   )
-  const contextControl = current !== null ? (
-    <>
-      {activeWs !== null && currentProject !== null ? <SessionFoldersChip workspaceId={activeWs} sessionId={current} revision={grantsRevision} /> : null}
-      <ContextMeter manifest={manifest} />
-    </>
-  ) : null
+  const contextControl = current !== null ? <ContextMeter manifest={manifest} /> : null
+  // Folders decide access, like the mode, so they sit on the left beside it.
+  const folderControl = current !== null && activeWs !== null && currentProject !== null
+    ? <SessionFoldersChip workspaceId={activeWs} sessionId={current} revision={grantsRevision} />
+    : null
 
   // A subagent conversation is executor-managed — the parent drives it — so
   // there is nothing to type into: the whole composer stays hidden.
@@ -1735,6 +1735,7 @@ function AppShell() {
       scope={key}
       modelControl={modelControl}
       {...(contextControl !== null ? { contextControl } : {})}
+      {...(folderControl !== null ? { folderControl } : {})}
       workspaceId={activeWs}
       sending={sending}
       connected={stream === 'open' || current === null}
@@ -1806,9 +1807,6 @@ function AppShell() {
       terminalShell={preferences.terminalShell}
       onTerminalShell={(shellId) => patchPreferences({ terminalShell: shellId })}
       bindingReady={listedWorkspace === activeWs}
-      gitPathFilter={gitPathFilter}
-      gitFocusPath={gitFocusPath}
-      onClearGitFilter={clearGitPathFilter}
       onGitTrustChange={recordGitTrust}
       context={{ meta, ...(modelDefaults !== null ? { globalDefaults: modelDefaults } : {}), ...(currentSessionModel !== undefined ? { sessionModel: currentSessionModel } : {}), ...(current !== null && currentSessionModelState?.status === 'loading' ? { sessionControlsStatus: 'loading' as const } : {}), ...(current !== null && currentSessionModelState?.status === 'error' ? { sessionControlsStatus: 'unavailable' as const } : {}), stream, sessionId: current, sessionFolder: currentProject?.path ?? null, eventCount: events.length, manifest, workspaceId: activeWs, running, modeLabel: envModeLabel, onCompacted: () => setCompactNonce((nonce) => nonce + 1), onOpenSettingsTab: (tab) => openSettings(tab) }}
     />
@@ -1948,9 +1946,7 @@ function AppShell() {
                   events={events}
                   {...(effectiveModel !== null && effectiveModel !== '' ? { modelLabel: effectiveModel } : {})}
                   workspaceId={activeWs}
-                  project={currentProject}
-                  onReviewChanges={reviewTurnChanges}
-                  onReviewFile={reviewTurnFile}
+                  onReviewTurn={reviewTurn}
                   onOpenProcess={openEnvironmentProcess}
                   onReuse={reuseInDraft}
                   onOpenChild={openSubagentDetail}
@@ -2025,6 +2021,15 @@ function AppShell() {
         confirmLabel="Delete"
         onConfirm={() => void confirmDelete()}
         onDismiss={() => setPendingDelete(null)}
+      />
+      <QuickSwitch
+        open={quickSwitchOpen}
+        sessions={sessions}
+        projects={projects}
+        workspaces={workspaces}
+        activeWorkspaceId={activeWs}
+        onChoose={chooseQuickSwitch}
+        onDismiss={() => setQuickSwitchOpen(false)}
       />
       <FolderPickerModal
         open={folderPickerOpen}

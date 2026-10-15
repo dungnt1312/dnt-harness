@@ -191,6 +191,24 @@ export async function promoteCapture(input: PromoteInput): Promise<EffectiveComp
   return snapshot
 }
 
+/**
+ * The turn a reconstruction may end at: the newest one after `after` (the checkpoint that
+ * stands) that closed `completed`, with nothing unresolved inside it and a final answer with
+ * no tool call. Turns after it (a stopped one) simply stay verbatim history.
+ */
+export function reconstructionCutoff(events: readonly SessionEvent[], after: number): { readonly turnId: string; readonly cutoff: number; readonly answer: Extract<SessionEvent, { type: 'assistant/message' }> } | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const end = events[i]!
+    if (end.seq <= after) return undefined
+    if (end.type !== 'turn/end' || end.reason !== 'completed') continue
+    const cutoff = completedCutoff(events, end.turnId)
+    if (cutoff !== end.seq) continue
+    const answer = loggedFinalAnswer(events, end.turnId, cutoff)
+    if (answer !== undefined) return { turnId: end.turnId, cutoff, answer }
+  }
+  return undefined
+}
+
 export interface ReconstructInput {
   readonly sessionId: string
   readonly events: readonly SessionEvent[]

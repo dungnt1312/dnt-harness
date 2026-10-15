@@ -1,5 +1,7 @@
 import { createContext, memo, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 import Icon, { type IconName } from '../common/Icon.tsx'
+import { patchReceipt } from '../../../src/capabilities/fs/patch.ts'
+import { turnFileDiffRows } from './TurnChangesCard.tsx'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
 import { DiffLines, LineCount, diffRowsFromEdit, diffRowsFromWrite, type DiffRow } from '../common/DiffLines.tsx'
 import CopyButton from '../common/CopyButton.tsx'
@@ -10,7 +12,7 @@ import { Markdown } from '../../Markdown.tsx'
 import { ThinkingPanel } from './ThinkingPanel.tsx'
 import { useHoldScroll } from '../../hooks/useStickToBottom.ts'
 import { budgetTone, compactionTokenChange, contextFill, formatBytes, formatElapsed, formatTime, formatTokenCount } from '../../lib/format.ts'
-import { agentAction, exitIsAnswer, isDenied, mcpServerOf, toolFacts, type ToolFacts } from '../../lib/tool-facts.ts'
+import { agentAction, exitIsAnswer, isDenied, mcpServerOf, readImageOf, toolFacts, type ToolFacts } from '../../lib/tool-facts.ts'
 import { PATH_LINK_ATTR, ansiToHtml } from '../../lib/ansi.ts'
 import { commandBase, freeTextLinker, rebase, searchLinker, type LineLinker, type PathRef } from '../../lib/path-links.ts'
 import { Section, ToolArguments, preClass } from './ToolArguments.tsx'
@@ -23,6 +25,8 @@ import { InlineChip } from '../common/InlineChip.tsx'
 import type { ChipSegment } from '../../lib/inline-chips.ts'
 import type { TurnTiming } from '../../lib/turn-timing.ts'
 import { ImageLightbox } from './ImageLightbox.tsx'
+import { ChartPreview } from './ChartPreview.tsx'
+import { parseChart, type ChartSpec } from '../../../src/harness/tools/chart-spec.ts'
 import type { ContextManifestView, ToolCall } from '../../lib/types.ts'
 import type { ViewItem } from '../../lib/project.ts'
 import { skillTabPath, type OpenPathResolver } from '../../lib/project-paths.ts'
@@ -620,6 +624,7 @@ function bucketOf(item: ViewItem): Bucket | null {
     case 'glob':
     case 'grep': return 'search'
     case 'bash': return 'command'
+    case 'applypatch':
     case 'edit':
     case 'write': return 'change'
     // Only a spawn starts an agent. A wait polls children already counted and
@@ -697,6 +702,7 @@ export function summarizeActivity(items: readonly ViewItem[], turnOpen = false):
       if (STATE_RANK.failed > STATE_RANK[state]) state = 'failed'
     }
     if (bucket === 'change' && facts.path !== undefined) changedPaths.add(facts.path)
+    if (item.call.name.toLowerCase() === 'applypatch') for (const file of patchReceipt(item.result?.output)?.files ?? []) changedPaths.add(file.movePath ?? file.path)
     if (bucket === 'file') {
       if (facts.path !== undefined) readPaths.add(facts.path)
       else unnamedReads += 1
@@ -828,6 +834,7 @@ function countLines(text: string): number {
 
 /** Lines an Edit replaced or a Write wrote, read from the call's own arguments. */
 function changeLines(item: Extract<ViewItem, { kind: 'tool' }>): { added: number; removed: number } {
+  if (item.call.name.toLowerCase() === 'applypatch') return toolFacts(item.call, item.result).lines ?? { added: 0, removed: 0 }
   const args = item.call.args
   const text = (key: string): string => (typeof args[key] === 'string' ? args[key] as string : '')
   if (item.call.name.toLowerCase() === 'write') return { added: countLines(text('content')), removed: 0 }
@@ -1331,6 +1338,78 @@ function GeneratedImageCard({ item, state, facts, workspaceId, withDuration = fa
   )
 }
 
+type Preview =
+  | { readonly kind: 'image'; readonly id: string; readonly title: string | null; readonly caption: string | null }
+  | { readonly kind: 'chart'; readonly chart: ChartSpec; readonly title: string | null; readonly caption: string | null }
+
+/** What a settled SendPreview call shows, or null when the result is not a well-formed preview. */
+export function previewOf(item: Extract<ViewItem, { kind: 'tool' }>): Preview | null {
+  if (item.call.name !== 'SendPreview' || item.result?.ok !== true) return null
+  try {
+    const parsed = JSON.parse(item.result.output) as Record<string, unknown>
+    const note = (key: string): string | null => (typeof parsed[key] === 'string' ? parsed[key] as string : null)
+    const meta = { title: note('title'), caption: note('caption') }
+    if (parsed['kind'] === 'image') {
+      const id = parsed['attachmentId']
+      return typeof id === 'string' && /^[0-9a-f]{64}$/.test(id) ? { kind: 'image', id, ...meta } : null
+    }
+    // The log is trusted less than it looks: re-validate before drawing.
+    if (parsed['kind'] === 'chart') return { kind: 'chart', chart: parseChart(parsed['chart']), ...meta }
+    return null
+  } catch {
+    return null
+  }
+}
+
+/** A SendPreview call: a quiet row, with the image or chart always visible under it. */
+function PreviewCard({ item, state, facts, workspaceId, withDuration = false }: {
+  readonly item: Extract<ViewItem, { kind: 'tool' }>
+  readonly state: RowState
+  readonly facts: ToolFacts
+  readonly workspaceId: string | null
+  readonly withDuration?: boolean
+}) {
+  const [zoomed, setZoomed] = useState(false)
+  const preview = previewOf(item)
+  const label = preview?.kind === 'chart' ? 'Chart' : 'Image'
+  const title = preview?.title ?? null
+  const alt = title ?? `${label} preview`
+  const status = rowStatus(item, state, facts)
+  const duration = withDuration ? callDuration(item) : undefined
+  const spec: RowSpec = {
+    icon: 'fileImage',
+    kind: 'Preview',
+    separator: true,
+    primary: title ?? label,
+    ...(status !== undefined ? { status } : {}),
+    ...(duration !== undefined ? { duration } : {}),
+  }
+  const src = preview?.kind === 'image' && workspaceId !== null ? attachmentUrl(workspaceId, preview.id) : null
+  return (
+    <div className="flex flex-col gap-2">
+      <ActivityRow spec={spec} state={state}>
+        <OutcomeNotes item={item} />
+        {preview === null && item.result !== undefined
+          ? <ResultPanel output={item.result.output} tone={state === 'failed' ? 'bad' : state === 'denied' ? 'quiet' : 'plain'} />
+          : null}
+      </ActivityRow>
+      {src !== null ? (
+        <button
+          type="button"
+          onClick={() => setZoomed(true)}
+          aria-label={`Preview ${alt.toLowerCase()}`}
+          className="block w-fit max-w-full cursor-zoom-in overflow-hidden rounded-2xl bg-muted outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-line-strong"
+        >
+          <img src={src} alt={alt} loading="lazy" className="block max-h-96 max-w-full object-contain" />
+        </button>
+      ) : null}
+      {preview?.kind === 'chart' ? <ChartPreview chart={preview.chart} title={alt} /> : null}
+      {preview?.caption != null ? <p className="m-0 text-[12px] text-fg-muted">{preview.caption}</p> : null}
+      <ImageLightbox src={zoomed ? src : null} alt={alt} onDismiss={() => setZoomed(false)} />
+    </div>
+  )
+}
+
 /** The stored video a settled GenerateVideo call produced, or null. */
 export function generatedVideoOf(item: Extract<ViewItem, { kind: 'tool' }>): { readonly id: string; readonly duration: number | null } | null {
   if (item.call.name !== 'GenerateVideo' || item.result?.ok !== true) return null
@@ -1519,6 +1598,7 @@ export const ToolCard = memo(function ToolCard({ item, openPath, hidden, repeats
   if (hidden === true) return null
 
   if (IMAGE_TOOL_KIND[call.name] !== undefined) return <GeneratedImageCard item={item} state={state} facts={facts} workspaceId={workspaceId ?? null} withDuration={withDuration} />
+  if (call.name === 'SendPreview') return <PreviewCard item={item} state={state} facts={facts} workspaceId={workspaceId ?? null} withDuration={withDuration} />
   if (call.name === 'GenerateVideo') return <GeneratedVideoCard item={item} state={state} facts={facts} workspaceId={workspaceId ?? null} withDuration={withDuration} />
   if (call.name === 'DescribeImage') return <DescribeImageCard item={item} state={state} facts={facts} withDuration={withDuration} />
   if (builtin === 'todowrite') {
@@ -1531,6 +1611,16 @@ export const ToolCard = memo(function ToolCard({ item, openPath, hidden, repeats
   if (builtin === 'read' && facts.file !== undefined) {
     const settledClean = state === 'ok'
     const spec = toolRowSpec(item, state, facts, settledClean && open !== null ? { open, label: `Open ${facts.path ?? ''} in workbench` } : undefined, 1, undefined, withDuration)
+    // An image has no lines to open in the workbench's text view: what the
+    // vision model said about it is the only detail, so that row expands.
+    const image = settledClean ? readImageOf(result?.output) : null
+    if (image !== null) {
+      return (
+        <ActivityRow spec={spec} state={state}>
+          <Section label={`Description · ${image.mediaType}`}><div className="min-w-0 rounded-md border border-line border-l-2 border-l-line-strong bg-muted/40 px-3 py-2"><Markdown content={image.description} compact /></div></Section>
+        </ActivityRow>
+      )
+    }
     if (settledClean || state === 'running') return <ActivityRow spec={spec} state={state} expandable={false} />
     return (
       <ActivityRow spec={spec} state={state}>
@@ -1538,6 +1628,24 @@ export const ToolCard = memo(function ToolCard({ item, openPath, hidden, repeats
         {result === undefined
           ? <ResultPanel tone="plain" />
           : <ResultPanel output={result.output} tone={state === 'failed' ? 'bad' : state === 'denied' ? 'quiet' : 'plain'} />}
+      </ActivityRow>
+    )
+  }
+
+  if (builtin === 'applypatch') {
+    const receipt = patchReceipt(result?.output)
+    const spec: RowSpec = { icon: 'pencil', kind: state === 'running' ? 'Patching' : state === 'ok' ? 'Patched' : 'ApplyPatch', primary: facts.target, ...(facts.lines !== undefined ? { diff: facts.lines } : {}) }
+    return (
+      <ActivityRow spec={spec} state={state}>
+        <OutcomeNotes item={item} />
+        {receipt?.files.map((file) => {
+          const path = file.movePath ?? file.path
+          const label = file.type === 'delete' ? 'deleted file' : file.type === 'move' ? `moved from ${file.path}` : ''
+          const rows = turnFileDiffRows({ path, status: file.type === 'add' ? 'created' : 'modified', edits: file.edits.map((edit) => ({ kind: 'edit', ...edit, output: label })) })
+          const openFile = file.type === 'delete' ? null : openPath?.(path) ?? null
+          return <div key={path}><div className="mb-1 text-xs text-fg-muted">{openFile !== null ? <button type="button" className="hover:underline" onClick={openFile}>{path}</button> : path}</div><ChangePanel rows={rows} path={path} /></div>
+        })}
+        {receipt?.error !== undefined ? <ResultPanel output={receipt.error} tone="bad" /> : receipt === undefined ? <ResultPanel {...(result !== undefined ? { output: result.output } : {})} tone={state === 'failed' ? 'bad' : 'quiet'} /> : null}
       </ActivityRow>
     )
   }
@@ -1783,12 +1891,15 @@ export const CompactionMarker = memo(function CompactionMarker({ item }: {
     item.summaryChars !== undefined ? `${formatBytes(item.summaryChars)} summarized` : undefined,
     item.model !== undefined ? item.model : undefined,
     item.trigger !== undefined ? item.trigger : undefined,
-    item.path === 'recovery' ? 'slow recovery' : undefined,
+    item.path === 'recovery' ? 'full transcript' : undefined,
     item.durationMs !== undefined && item.status !== 'running' ? `${(item.durationMs / 1000).toFixed(1)}s` : undefined,
+    item.requests !== undefined ? `${item.requests} ${item.requests === 1 ? 'request' : 'requests'}` : undefined,
   ].filter((fact) => fact !== undefined)
 
   if (item.status === 'running') {
-    const stage = item.stage === 'preparing' ? 'Preparing' : item.stage === 'generating' ? 'Summarizing' : item.stage === 'applying' ? 'Applying' : undefined
+    const stage = item.stage === 'preparing' ? 'Preparing'
+      : item.stage === 'generating' ? (item.progress !== undefined && item.progress.total > 1 ? `Summarizing ${item.progress.done}/${item.progress.total}` : 'Summarizing')
+        : item.stage === 'applying' ? 'Applying' : undefined
     return (
       <div className="flex min-w-0 items-center gap-2 py-0.5 text-xs text-fg-muted" role="status" aria-live="polite">
         <Spinner size={12} className="shrink-0" />
@@ -1810,7 +1921,8 @@ export const CompactionMarker = memo(function CompactionMarker({ item }: {
         : item.status === 'noop'
           ? 'Already compacted'
           : item.status === 'needs-recovery'
-            ? 'Needs a slow recovery'
+            // Written only by older hosts, which asked before folding; nothing ran.
+            ? 'Not compacted'
             : 'Compacted'
 
   return (

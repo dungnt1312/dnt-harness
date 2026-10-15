@@ -139,6 +139,7 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
       thinkingLevel: null,
     })
     if (path === '/api/workspaces/w/mode' && method === 'GET') return json(route, { modes: [{ id: 'chat', name: 'Chat', source: 'bundled' }], selected: 'chat', revision: 1 })
+    if (path === '/api/model-aliases' && method === 'GET') return json(route, [])
     if (path === '/api/model-defaults' && method === 'GET') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null })
     if (path === '/api/model-defaults' && method === 'PUT') return json(route, { thinkingLevel: null, ...(body as object) })
     if (/^\/api\/workspaces\/w\/sessions\/[^/]+\/model$/.test(path) && method === 'GET') return json(route, { provider: 'fixture-provider', model: 'fixture-model', thinkingLevel: null, source: 'global' })
@@ -193,6 +194,7 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
     }
     if (path === '/api/workspaces/w/skills/sources') return json(route, { rules: [{ id: 'workspace', kind: 'workspace', enabled: true }] })
     if (path === '/api/workspaces/w/skills/fixture-skill/files') return json(route, { files: [{ path: 'SKILL.md', bytes: 64 }] })
+    if (process.env.FIXTURE_PROBE) { console.log(`MISSING ${method} ${path}`); return json(route, [], 404) }
     throw new Error(`Unexpected fixture API request: ${method} ${url.href}`)
   })
 
@@ -481,11 +483,11 @@ test('Agents, MCP, and Secrets expose destructive failures and explicit recovery
   await dialog.getByRole('tab', { name: /MCP/ }).click()
   // Enabling starts a process as the user, so it asks first; the ask alone
   // sends nothing.
-  await dialog.getByRole('button', { name: 'Enable' }).click()
+  await dialog.getByRole('switch', { name: 'fixture-mcp enabled' }).click()
   expect(state.count('POST', '/api/workspaces/w/mcp/fixture-mcp/enable')).toBe(0)
   await dialog.getByRole('button', { name: 'Start server' }).click()
   await expect(dialog).toContainText('MCP enable refused')
-  await dialog.getByRole('button', { name: 'Enable' }).click()
+  await dialog.getByRole('switch', { name: 'fixture-mcp enabled' }).click()
   await dialog.getByRole('button', { name: 'Start server' }).click()
   await expect.poll(() => state.count('POST', '/api/workspaces/w/mcp/fixture-mcp/enable')).toBe(2)
 

@@ -32,7 +32,10 @@ export interface HarnessLimits {
   readonly toolTimeoutMs: number
   readonly bashMaxWaitMs: number
   readonly subagentBackgroundBashMaxMs: number
-  /** Undecided approval requests expire (never approve implicitly). */
+  /**
+   * Undecided approval requests expire (never approve implicitly); 0 waits
+   * forever — the ask stays open until answered, denied, or the turn stops.
+   */
   readonly approvalExpiryMs: number
   /** Unanswered AskUserQuestion prompts expire (the model is told the user did not answer). */
   readonly questionExpiryMs: number
@@ -110,7 +113,7 @@ const INTEGER_LIMITS: ReadonlySet<string> = new Set([
   'streamFirstEventMs', 'streamIdleMs', 'logicalRequestMs', 'stepRetries', 'stepRetryBaseMs', 'compactionRetainTokens', 'readOnlyToolConcurrency',
   'compactionDeadlineMs', 'compactionOutputTokens', 'compactionCandidateWaitMs',
 ])
-const ZERO_CAPABLE_LIMITS: ReadonlySet<string> = new Set(['compactionRetainTokens', 'automaticCompactionPressure', 'compactionCandidateWaitMs'])
+const ZERO_CAPABLE_LIMITS: ReadonlySet<string> = new Set(['compactionRetainTokens', 'automaticCompactionPressure', 'compactionCandidateWaitMs', 'approvalExpiryMs'])
 
 /** Merge overrides; invalid request durations/counts (including fractions) use defaults. */
 export function resolveLimits(partial?: Partial<HarnessLimits>): HarnessLimits {

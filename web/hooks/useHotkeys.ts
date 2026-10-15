@@ -4,6 +4,8 @@ import { useEffect } from 'react'
 interface Hotkey {
   readonly key: string
   readonly mod?: boolean
+  /** The physical Ctrl key on every platform (Cmd does not count); overrides `mod`. */
+  readonly ctrl?: boolean
   readonly shift?: boolean
   readonly alt?: boolean
   /**
@@ -24,7 +26,9 @@ export function useHotkeys(keys: readonly Hotkey[]): void {
       const editing = target instanceof HTMLElement && (target.isContentEditable || target.closest('input, textarea, select, [contenteditable="true"]') !== null)
       for (const candidate of keys) {
         if (editing && candidate.allowInEditable !== true) continue
-        const modMatches = candidate.mod === true
+        const modMatches = candidate.ctrl === true
+          ? (event.ctrlKey && !event.metaKey)
+          : candidate.mod === true
           ? (event.ctrlKey || event.metaKey)
           : !event.ctrlKey && !event.metaKey
         const shiftMatches = candidate.shift === true ? event.shiftKey : !event.shiftKey

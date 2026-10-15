@@ -29,11 +29,11 @@ describe('RichDraft', () => {
       attachments: [FIRST],
     }
 
-    expect(draftText(draft)).toBe('/review run @web/api.ts and @"docs/my notes.md"')
+    expect(draftText(draft)).toBe('/review run [@api.ts](./web/api.ts) and [@my notes.md](<./docs/my notes.md>)')
   })
 
   it('restores chips from a sent message', () => {
-    expect(messageDraft('/review check @web/api.ts')).toEqual({
+    expect(messageDraft('/review check [@api.ts](./web/api.ts)')).toEqual({
       segments: [
         { kind: 'command', name: 'review' },
         { kind: 'text', text: ' check ' },

@@ -25,6 +25,18 @@ function oneTurn(turnId: string, calls: ReadonlyArray<[string, string, Record<st
 }
 
 describe('turnChanges', () => {
+  it('projects multi-file patch receipts and known partial failures, not unlanded input', () => {
+    const output = JSON.stringify({ tool: 'ApplyPatch', error: 'disk full', files: [
+      { path: 'a', type: 'update', edits: [{ old: 'a\n', new: 'A\n', oldLine: 2, newLine: 2 }, { old: 'b\n', new: 'B\n', oldLine: 8, newLine: 8 }] },
+      { path: 'new', type: 'add', edits: [{ old: '', new: 'new\n', oldLine: 1, newLine: 1 }] },
+    ] })
+    const changes = turnChanges(callPair('p', 'ApplyPatch', { patch_text: 'unlanded input is not the receipt' }, 't', { ok: false, output: `error: Error: ${output}` })).get('t')
+    expect(changes?.files.map((file) => [file.path, file.status, file.lines])).toEqual([
+      ['a', 'modified', { added: 2, removed: 2 }], ['new', 'created', { added: 1 }],
+    ])
+    expect(changes?.files[0]?.edits).toHaveLength(2)
+    expect(turnChanges(callPair('p', 'ApplyPatch', {}, 't', { ok: false, output: 'error: invalid patch' })).size).toBe(0)
+  })
   it('lists a landed Write as created and an Edit as modified, with the recorded calls', () => {
     const events = [
       ...callPair('c1', 'Write', { path: 'new.md', content: 'x' }, 't1', { ok: true, output: 'created new.md (1 lines)' }),
@@ -99,15 +111,13 @@ describe('turnChanges', () => {
     expect(map.has('t2')).toBe(false)
   })
 
-  it('drops failed, denied and recovered results from files, keeping them uncertain', () => {
+  it('drops failed, denied and recovered results: a turn whose writes never landed has no entry', () => {
     const events = [
       ...callPair('c1', 'Write', { path: 'a.ts', content: 'x' }, 't1', { ok: false, output: 'conflict: a.ts changed after it was observed' }),
       ...callPair('c2', 'Edit', { path: 'b.ts', old: 'a', new: 'b' }, 't1', { ok: false, output: 'denied: not allowed by the mode' }),
       ...callPair('c3', 'Write', { path: 'c.ts', content: 'x' }, 't1', { ok: true, output: 'whatever', recovery: true }),
     ]
-    const turn = turnChanges(events).get('t1')
-    expect(turn?.files).toEqual([])
-    expect(turn?.uncertain).toEqual(['c1', 'c2', 'c3'])
+    expect(turnChanges(events).has('t1')).toBe(false)
   })
 
   it('never counts Read calls, and ignores calls outside any turn', () => {

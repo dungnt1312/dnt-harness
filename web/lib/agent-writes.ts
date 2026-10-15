@@ -1,4 +1,5 @@
 import { toProjectRelative } from './project-paths.ts'
+import { patchReceipt } from '../../src/capabilities/fs/patch.ts'
 import { toolFacts } from './tool-facts.ts'
 import type { SseEvent } from './types.ts'
 
@@ -24,7 +25,7 @@ export interface AgentWrites {
 
 export const NO_AGENT_WRITES: AgentWrites = { key: null, root: null, scanned: 0, pending: new Map(), writes: {} }
 
-const WRITERS = new Set(['edit', 'write'])
+const WRITERS = new Set(['edit', 'write', 'applypatch'])
 
 /**
  * Folds the events past `previous.scanned` into the tracker. Returns the same
@@ -42,15 +43,27 @@ export function trackAgentWrites(previous: AgentWrites, events: readonly SseEven
   for (let index = base.scanned; index < events.length; index += 1) {
     const event = events[index]!
     if (event.type === 'tool/call' && event.call !== undefined && root !== null && WRITERS.has(event.call.name.toLowerCase())) {
+      if (event.call.name.toLowerCase() === 'applypatch') {
+        (pending ??= new Map(base.pending)).set(event.call.id, '')
+        continue
+      }
       const path = toolFacts(event.call).path
       const relative = path === undefined ? null : toProjectRelative(root, path)
       if (relative !== null) (pending ??= new Map(base.pending)).set(event.call.id, relative)
     } else if (event.type === 'tool/result' && event.callId !== undefined) {
+      if ((pending ?? base.pending).get(event.callId) === '' && root !== null && event.recovery !== true) {
+        for (const file of patchReceipt(event.output)?.files ?? []) {
+          for (const path of [file.path, ...(file.movePath !== undefined ? [file.movePath] : [])]) {
+            const relative = toProjectRelative(root, path)
+            if (relative !== null) (writes ??= { ...base.writes })[relative] = event.seq
+          }
+        }
+      }
       const relative = (pending ?? base.pending).get(event.callId)
       if (relative === undefined) continue
       pending ??= new Map(base.pending)
       pending.delete(event.callId)
-      if (event.ok === true) (writes ??= { ...base.writes })[relative] = event.seq
+      if (event.ok === true && relative !== '') (writes ??= { ...base.writes })[relative] = event.seq
     }
   }
   return { key, root, scanned: events.length, pending: pending ?? base.pending, writes: writes ?? base.writes }

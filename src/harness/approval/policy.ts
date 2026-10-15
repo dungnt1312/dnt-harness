@@ -55,10 +55,12 @@ export interface ApprovalLifecycle {
   readonly executionId: ExecutionId | undefined
   readonly done: Promise<void>
   /**
-   * Epoch ms at which this question expires undecided. Bridges surface it so
-   * a human can see the decision window instead of watching a card vanish.
+   * Epoch ms at which this question expires undecided, or undefined when the
+   * host configured no expiry (0) and the ask waits until answered. Bridges
+   * surface it so a human can see the decision window instead of watching a
+   * card vanish.
    */
-  readonly expiresAt: number
+  readonly expiresAt: number | undefined
 }
 
 /** Options for attaching an approval policy. */
@@ -80,7 +82,7 @@ export interface ApprovalOptions {
    * the answerer's concern; the policy stays transport-agnostic.
    */
   readonly askUser?: (call: ToolCall, lifecycle: ApprovalLifecycle) => Promise<boolean>
-  /** Undecided approvals expire after this long; defaults to the harness limit. */
+  /** Undecided approvals expire after this long; defaults to the harness limit. 0 waits forever. */
   readonly expiryMs?: number
   /**
    * Hard interaction annotation: true forces ask even if policy exact/wildcard
@@ -398,11 +400,13 @@ export function attachApproval(ctx: Context, options: ApprovalOptions = {}): App
         resolve,
       }
       pending.set(approvalId, pendingEntry)
-      const expiresAt = Date.now() + expiryMs
-      const timer = setTimeout(() => {
+      // expiryMs 0 = no deadline: the ask waits until answered, denied, or the
+      // turn stops — it is never settled by a timer.
+      const expiresAt = expiryMs > 0 ? Date.now() + expiryMs : undefined
+      const timer = expiresAt !== undefined ? setTimeout(() => {
         void settle(pendingEntry, 'expired', `approval for '${call.name}' expired undecided`)
-      }, expiryMs)
-      timer.unref?.()
+      }, expiryMs) : undefined
+      timer?.unref?.()
       const onAbort = (): void => {
         void settle(pendingEntry, 'cancelled', `cancelled: stop requested while awaiting approval for '${call.name}'`)
       }

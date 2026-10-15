@@ -4,6 +4,6 @@
  * silently dropped tools from every edited mode).
  */
 export const KNOWN_MODE_TOOLS: readonly string[] = [
-  'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent',
-  'TodoWrite', 'AskUserQuestion', 'GenerateImage', 'EditImage', 'DescribeImage', 'GenerateVideo',
+  'Read', 'Write', 'Edit', 'ApplyPatch', 'Glob', 'Grep', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent',
+  'TodoWrite', 'AskUserQuestion', 'GenerateImage', 'EditImage', 'DescribeImage', 'GenerateVideo', 'SendPreview',
 ]

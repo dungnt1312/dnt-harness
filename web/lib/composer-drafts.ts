@@ -4,7 +4,7 @@
  * it is unavailable.
  */
 import { emptyDraft, normalizeDraft, textDraft, type AttachmentRef, type DraftSegment, type RichDraft } from './composer-draft.ts'
-import { isSkillName, parseMessageText } from './inline-chips.ts'
+import { isSkillName } from './inline-chips.ts'
 
 export const DRAFTS_STORAGE_KEY = 'dnt-harness.drafts.v1'
 /** Newest drafts kept; older conversations drop out rather than grow forever. */
@@ -34,11 +34,8 @@ function parseSegment(raw: unknown): DraftSegment | AttachmentRef | null {
   if (row['kind'] === 'mention' && typeof row['path'] === 'string' && row['path'] !== '') {
     return { kind: 'mention', path: row['path'] }
   }
-  if (row['kind'] === 'command') {
-    if (typeof row['name'] === 'string' && isSkillName(row['name'])) return { kind: 'command', name: row['name'] }
-    // Legacy command chips stored their wire text instead of the skill name.
-    const legacy = typeof row['text'] === 'string' ? parseMessageText(row['text']) : []
-    return legacy.length === 1 && legacy[0]?.kind === 'command' ? { kind: 'command', name: legacy[0].name } : null
+  if (row['kind'] === 'command' && typeof row['name'] === 'string' && isSkillName(row['name'])) {
+    return { kind: 'command', name: row['name'] }
   }
   // Legacy drafts stored attachment chips among inline editor segments.
   if (row['kind'] === 'attachment') return parseAttachment(row['ref'])

@@ -13,6 +13,14 @@ describe('media tool mode exposure', () => {
     }
   })
 
+  it('exposes display-only SendPreview in every bundled mode without asking', () => {
+    for (const mode of BUNDLED_MODES) {
+      expect(mode.toolExposure, mode.id).toContain('SendPreview')
+      expect(mode.permissionDefaults['SendPreview'], mode.id).toBe('allow')
+    }
+    expect(KNOWN_MODE_TOOLS).toContain('SendPreview')
+  })
+
   it('asks before a paid call except in Full access, and stays out of read-only Plan', () => {
     const expected: Record<string, string | undefined> = {
       'ask-before-changes': 'ask',

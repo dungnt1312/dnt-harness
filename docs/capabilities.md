@@ -2,22 +2,22 @@
 
 Capabilities are just tools registered into `ctx.tools`. This doc covers the
 tool families a model can call: a granted-root filesystem toolset (canonical
-names `Read`, `Write`, `Edit`, `Glob`, `Grep`) and a real-Bash shell tool in
+names `Read`, `Write`, `Edit`, `ApplyPatch`, `Glob`, `Grep`) and a real-Bash shell tool in
 `src/capabilities/`, plus the harness-registered `Skill`, `Agent`,
-and the dynamically discovered `mcp__<server>__<tool>` family. The six
+and the dynamically discovered `mcp__<server>__<tool>` family. The seven
 Claude-style built-ins are the canonical identity: legacy lowercase names
 (`read`, `write`, ...) arriving from a model or an old permission map normalize
 at the boundary — never as exposed duplicates.
 
 ```
 src/capabilities/
-├── fs/        Read/Write/Edit/Glob/Grep, granted-root containment
+├── fs/        Read/Write/Edit/ApplyPatch/Glob/Grep, granted-root containment
 └── shell/     Bash: real bash, timeout, stop kill, process-tree cleanup
 ```
 
 ## Filesystem tools (`capabilities/fs/tools.ts`)
 
-`fsTools()` returns the five tools. The grant is resolved **per execution**
+`fsTools()` returns the six tools. The grant is resolved **per execution**
 through `tools.setRootResolver(() => ({ root, additionalRoots, deniedRoots }))`
 — the web host resolves the calling session's bound project folder (the
 primary root) plus its extra granted folders through the ambient agent scope,
@@ -81,7 +81,35 @@ single root: out-of-grant paths fail there.
 
 Escaping is a **tool failure**, not a silent redirect.
 
-### The five tools
+### ApplyPatch
+
+`ApplyPatch({ patch_text })` batches distant regions or multiple files using
+`*** Begin Patch` / `*** End Patch`, `*** Update File: path` and `@@` hunks.
+Hunk lines start with a space (context), `-` (remove), or `+` (add).
+`@@ exact context line` narrows the search; `*** End of File` anchors to EOF.
+This is structured patch syntax, not numeric `git diff` hunk headers.
+`*** Add File: path` takes `+` content lines; `*** Delete File: path` removes
+a file. `*** Move to: path` immediately after Update selects an absent new
+path, applying the hunks while moving. Empty-old hunks append at EOF.
+
+Existing files must have been Read by the conversation and remain unchanged.
+Matching is exact and unique; ambiguous, overlapping/out-of-order hunks and
+duplicate/aliased paths are refused. Every source/destination passes the normal
+grant gates. All sections are verified before any file write. Per-file locks
+and hash/path revalidation protect against other native file-tool writes.
+Updates retain encoding, BOM, untouched mixed line endings and final-newline
+state. Adds and moves never overwrite an existing destination.
+
+The tool returns a JSON receipt with per-file edit regions and line positions.
+Chat, turn diffs and file-viewer refresh read landed changes from that receipt.
+Multi-file writes are **not** a filesystem transaction: a later I/O failure or
+cancellation may leave earlier writes in place. Error receipts retain those
+landed files; re-read before retrying. Ask-before-changes and Edit automatically
+ask for this tool (it can delete); Autonomous and Full access allow it. Plan
+and bundled read-only agents do not expose it. Existing custom mode/agent
+ceilings remain unchanged; add `ApplyPatch` explicitly where desired.
+
+### The original five tools
 
 | Tool | What it does | Constraints |
 |---|---|---|
@@ -383,6 +411,31 @@ deleted, or disabled provider fails the call with the Settings fix it needs.
   Edit automatically because each call is a paid external request. They are
   `allow` in Full access and are not exposed in Plan. DescribeImage is a
   read-like `allow` tool exposed in every bundled mode, including Plan.
+
+## Preview tool (`src/harness/tools/preview-tool.ts`)
+
+`SendPreview { title?, caption?, attachmentId | path | chart }` lets the agent
+show the user something inline. It displays only; it creates nothing and calls
+no provider, so it is `allow` in every bundled mode, Plan included.
+
+- **Image**: `attachmentId` names a stored image (a user attachment or a
+  GenerateImage/EditImage result) and keeps its id. `path` names a
+  png/jpeg/webp/gif under the run's grants, resolved by `loadImageSource` like
+  EditImage; it is listed in `targetPaths`, so it is approved and refused as a
+  `Read` of that path would be, and the bytes are copied into the attachment
+  store. A screenshot is a `path`.
+- **Chart**: `chart: { type: 'bar' | 'line', labels, series: [{ name, values }] }`,
+  validated by `chart-spec.ts` (1–8 series, up to 500 points, one finite number
+  per label). The result carries the whole spec, so the log replays it.
+- **Exactly one** source is allowed; anything else fails with the reason.
+- **UI**: `PreviewCard` in `web/components/chat/MessageParts.tsx` shows the image
+  (with the lightbox) or `ChartPreview.tsx`, a plain SVG chart with a legend and
+  a collapsible data table. The web re-validates the logged chart with the same
+  `parseChart` before drawing, and model text only reaches the DOM as text.
+- **Adding a kind** (table, video, …): a branch in the tool and one in
+  `PreviewCard`; the existing kinds do not change.
+- Tests: `tests/harness/preview-tool.spec.ts`,
+  `tests/harness/image-tools-mode-exposure.spec.ts`, `web/lib/preview-card.spec.tsx`.
 
 ## Video tool (`src/harness/tools/video-tools.ts`)
 

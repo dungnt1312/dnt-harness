@@ -11,6 +11,7 @@
 import { formatBytes, pathBasename, shortCommand, shortPath, toolTarget } from './format.ts'
 import type { ToolCall } from './types.ts'
 import { editLineCounts, editOccurrences } from './line-diff.ts'
+import { parsePatch, patchReceipt } from '../../src/capabilities/fs/patch.ts'
 
 /** The recorded outcome a digest is read from. */
 export interface ToolResultView {
@@ -137,7 +138,14 @@ function listLines(output: string): string[] {
   return output.replace(TRUNCATION, '').split('\n').filter((line) => line.trim() !== '')
 }
 
+/** `Read` on an image file answers `[image <path> (<type>), described by the vision model]` + the description. */
+export function readImageOf(output: string | undefined): { readonly mediaType: string; readonly description: string } | null {
+  const match = output === undefined ? null : /^\[image [^\n]* \((image\/[^)\n]+)\), described by the vision model\]\n([\s\S]*)$/.exec(output)
+  return match?.[1] !== undefined && match[2] !== undefined ? { mediaType: match[1], description: match[2].trim() } : null
+}
+
 function readDigest(output: string): string {
+  if (readImageOf(output) !== null) return 'image'
   const truncated = TRUNCATION.test(output)
   const lines = countLines(output.replace(TRUNCATION, ''))
   if (lines === 0) return 'empty'
@@ -442,6 +450,23 @@ export function toolFacts(call: ToolCall, result?: ToolResultView): ToolFacts {
         : failed
           ? excerpt(result.output)
           : builtin === 'write' ? writeDigest(result.output) : undefined
+      break
+    }
+    case 'applypatch': {
+      const receipt = patchReceipt(result?.output)
+      let paths: string[] = []
+      try { paths = parsePatch(str(args, 'patch_text') ?? '').map((section) => section.movePath ?? section.path) } catch { /* malformed input is reported by execution */ }
+      fullTarget = paths.join(', ')
+      target = paths.length === 1 ? shortPath(paths[0]!) : plural(paths.length, 'file')
+      path = paths.length === 1 ? paths[0] : undefined
+      if (path !== undefined) file = fileParts(path)
+      if (receipt !== undefined) {
+        lines = receipt.files.flatMap((file) => file.edits).reduce((sum, edit) => {
+          const count = editLineCounts(edit.old, edit.new)
+          return { added: sum.added + count.added, removed: sum.removed + count.removed }
+        }, { added: 0, removed: 0 })
+      }
+      digest = result === undefined ? undefined : receipt?.error !== undefined ? receipt.error : failed ? excerpt(result.output) : `${plural(receipt?.files.length ?? 0, 'file')} patched`
       break
     }
     case 'glob': {

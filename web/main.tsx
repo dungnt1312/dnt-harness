@@ -22,6 +22,17 @@ try { migrateLegacyStorage(window.localStorage) } catch { /* storage may be unav
 
 registerServiceWorker()
 
+// A tab opened before a redeploy asks for a lazy chunk whose hashed file no longer exists
+// (the server answers with index.html). Reload once to pick up the new build; the 1-minute
+// guard stops a reload loop if the chunk is genuinely broken.
+window.addEventListener('vite:preloadError', (event) => {
+  const last = Number(sessionStorage.getItem('dnt-harness.chunk-reload') ?? 0)
+  if (Date.now() - last < 60_000) return
+  sessionStorage.setItem('dnt-harness.chunk-reload', String(Date.now()))
+  event.preventDefault()
+  window.location.reload()
+})
+
 createRoot(document.getElementById('root') ?? document.body).render(
   <StrictMode>
     <TooltipProvider>

@@ -5,9 +5,12 @@ import { Button } from '../ui/Button.tsx'
 import { IconButton } from '../ui/IconButton.tsx'
 import { fetchGitDiff, type GitChange, type GitConflict, type GitDiffReport, type GitHunk, type GitOperationDone, type GitOperationInput } from '../../lib/api.ts'
 import { cn } from '../../lib/cn.ts'
+import { Menu, menuItemClass } from '../ui/Menu.tsx'
+import { GIT_BAR, GIT_ICON, GIT_ICON_TRIGGER } from './git-controls.ts'
+import { readDiffLayout, writeDiffLayout } from './git-view.ts'
 import type { GitRun } from './use-git-operation.tsx'
 import { FileTypeIcon } from '../common/FileTypeIcon.tsx'
-import { DiffLines, LineCount, diffRowsFromUnified } from '../common/DiffLines.tsx'
+import { DiffLines, LineCount, diffRowsFromUnified, type DiffLayout } from '../common/DiffLines.tsx'
 import { MediaPreview } from '../common/MediaPreview.tsx'
 
 /**
@@ -16,7 +19,7 @@ import { MediaPreview } from '../common/MediaPreview.tsx'
  * fetched per path and per `reloadKey` (bumped when an operation settles); an
  * answer for a file the reader has already left is discarded.
  */
-export function GitDiffPane({ workspaceId, projectId, change, reloadKey, run, enqueue, onDone, onStage, onOpenFile, onReady }: {
+export function GitDiffPane({ workspaceId, projectId, change, reloadKey, run, enqueue, onDone, onOpenFile, onReady }: {
   readonly workspaceId: string
   readonly projectId: string
   readonly change: GitChange
@@ -28,8 +31,6 @@ export function GitDiffPane({ workspaceId, projectId, change, reloadKey, run, en
   readonly enqueue: (task: () => Promise<void>) => void
   /** An operation answered: its status is the panel's new report. */
   readonly onDone: (done: GitOperationDone | undefined) => void
-  /** Stage or unstage exactly this file. */
-  readonly onStage: (paths: readonly string[], intent: 'stage' | 'unstage') => void
   /** Opens the file itself in the workbench; absent without an opener. */
   readonly onOpenFile?: () => void
   /** Called once the diff (or its error) has rendered. */
@@ -38,6 +39,7 @@ export function GitDiffPane({ workspaceId, projectId, change, reloadKey, run, en
   const path = change.path
   const [diff, setDiff] = useState<GitDiffReport | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [layout, setLayout] = useState<DiffLayout>(readDiffLayout)
   const generation = useRef(0)
   const body = useRef<HTMLDivElement | null>(null)
   const name = path.split('/').pop() ?? path
@@ -66,7 +68,6 @@ export function GitDiffPane({ workspaceId, projectId, change, reloadKey, run, en
     enqueue(async () => { onDone(await run(input)) })
   }
 
-  const stages = change.staging !== 'staged'
   const jump = (direction: 1 | -1): void => {
     const anchors = [...(body.current?.querySelectorAll<HTMLElement>('[data-hunk-index]') ?? [])]
     if (anchors.length === 0) return
@@ -80,7 +81,7 @@ export function GitDiffPane({ workspaceId, projectId, change, reloadKey, run, en
   }
 
   const header = (
-    <div className="flex h-9 shrink-0 items-center gap-1.5 border-b border-line px-2.5 text-[13px]">
+    <div className={cn(GIT_BAR, 'flex shrink-0 items-center gap-1.5 border-b border-line px-2.5 text-[13px]')}>
       <FileTypeIcon path={path} size={16} />
       <span className="min-w-0 flex-1 truncate" title={path}>
         <span className="font-medium">{name}</span>
@@ -90,14 +91,30 @@ export function GitDiffPane({ workspaceId, projectId, change, reloadKey, run, en
         {...(change.added !== undefined ? { added: change.added } : {})}
         {...(change.removed !== undefined ? { removed: change.removed } : {})}
       />
-      <IconButton label="Previous hunk" onClick={() => jump(-1)}><Icon name="arrowUp" size={13} /></IconButton>
-      <IconButton label="Next hunk" onClick={() => jump(1)}><Icon name="arrowDown" size={13} /></IconButton>
+      {/* Two icons, the active one filled: unified (rows) or side by side (columns). */}
+      <div role="group" aria-label="Diff layout" className="flex shrink-0 items-center rounded-md border border-line p-px">
+        {([['unified', 'rows', 'Unified diff (vertical)'], ['split', 'columns', 'Split diff (side by side)']] as const).map(([mode, icon, label]) => (
+          <IconButton
+            key={mode}
+            label={label}
+            aria-pressed={layout === mode}
+            className={cn('size-5 rounded', layout === mode && 'bg-hover text-fg')}
+            onClick={() => { writeDiffLayout(mode); setLayout(mode) }}
+          >
+            <Icon name={icon} size={12} />
+          </IconButton>
+        ))}
+      </div>
+      <IconButton label="Previous hunk" className={GIT_ICON} onClick={() => jump(-1)}><Icon name="arrowUp" size={13} /></IconButton>
+      <IconButton label="Next hunk" className={GIT_ICON} onClick={() => jump(1)}><Icon name="arrowDown" size={13} /></IconButton>
+      {/* The rarely used actions live here, not on the bar. */}
       {onOpenFile !== undefined ? (
-        <IconButton label={`Open ${name} in workbench`} onClick={onOpenFile}><Icon name="fileText" size={13} /></IconButton>
+        <Menu label="More file actions" align="end" triggerClassName={GIT_ICON_TRIGGER} trigger={() => <Icon name="dots" size={14} />}>
+          {(close) => (
+            <button type="button" role="menuitem" className={menuItemClass} onClick={() => { close(); onOpenFile() }}>View file</button>
+          )}
+        </Menu>
       ) : null}
-      <Button size="sm" variant="outline" className="h-7 px-2.5" onClick={() => onStage([path], stages ? 'stage' : 'unstage')}>
-        {stages ? 'Stage File' : 'Unstage File'}
-      </Button>
     </div>
   )
 
@@ -124,6 +141,7 @@ export function GitDiffPane({ workspaceId, projectId, change, reloadKey, run, en
           <ConflictBlock key={conflict.index} conflict={conflict} onChoose={(choice) => operate({ type: 'resolve-conflict', path, index: conflict.index, fingerprint: conflict.fingerprint, choice })} />
         ))}
         <DiffLines
+          layout={layout}
           rows={diffRowsFromUnified(diff.lines, { keepHunks: true })}
           renderHunk={(index, headerText) => (
             <HunkHeader
@@ -186,7 +204,7 @@ function HunkButton({ title, onClick, children }: { readonly title: string; read
       type="button"
       title={title}
       onClick={onClick}
-      className="rounded border border-line px-1.5 py-0 font-sans text-[11px] text-fg hover:bg-hover"
+      className="h-5 rounded border border-line px-1.5 font-sans text-[11px] leading-none text-fg hover:bg-hover"
     >
       {children}
     </button>

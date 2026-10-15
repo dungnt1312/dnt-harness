@@ -4,6 +4,7 @@ import Icon from '../common/Icon.tsx'
 import { Badge } from '../ui/Badge.tsx'
 import { Button } from '../ui/Button.tsx'
 import { Field } from '../ui/Field.tsx'
+import { IconButton } from '../ui/IconButton.tsx'
 import { Segmented } from '../ui/Segmented.tsx'
 import { TextInput } from '../ui/TextInput.tsx'
 import { PluginDetailsModal } from './PluginDetailsModal.tsx'
@@ -20,6 +21,7 @@ import {
 } from '../../lib/api.ts'
 import {
   EmptyState,
+  FilterChips,
   InlineConfirm,
   InlineSwitch,
   ItemList,
@@ -97,6 +99,7 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
   const [marketTab, setMarketTab] = useScopedState<string>(ALL)
   const [category, setCategory] = useScopedState<string>(ALL)
   const [detailsId, setDetailsId] = useScopedState<string | null>(null)
+  const [view, setView] = useScopedState<'installed' | 'browse' | 'marketplaces'>('installed')
   const { busy, run } = useActionRunner((text) => setNotice({ kind: 'bad', text }))
 
   const load = useCallback(async () => {
@@ -137,10 +140,13 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
   const needle = query.trim().toLowerCase()
   const notInstalled = marketplaces.flatMap((market) => (market.document?.plugins ?? []).map((entry) => ({ ...entry, id: `${entry.name}@${market.name}`, marketplace: market.name })))
     .filter((entry) => !installedIds.has(entry.id))
-  // One tab per marketplace (plus All when there are several).
+  // One chip per marketplace that still has something to install (plus All when there are several).
+  const marketChips = marketplaces
+    .map((market) => ({ value: market.name, label: market.name, count: notInstalled.filter((entry) => entry.marketplace === market.name).length }))
+    .filter((chip) => chip.count > 0)
   const marketTabs = [
-    ...(marketplaces.length > 1 ? [{ value: ALL, label: 'All', count: notInstalled.length }] : []),
-    ...marketplaces.map((market) => ({ value: market.name, label: market.name, count: notInstalled.filter((entry) => entry.marketplace === market.name).length })),
+    ...(marketChips.length > 1 ? [{ value: ALL, label: 'All marketplaces', count: notInstalled.length }] : []),
+    ...marketChips,
   ]
   const activeMarket = marketTabs.some((tab) => tab.value === marketTab) ? marketTab : (marketTabs[0]?.value ?? ALL)
   const inMarket = notInstalled
@@ -153,15 +159,37 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
   const activeCategory = category === ALL || categoryCounts.has(category) ? category : ALL
   const available = inMarket.filter((entry) => activeCategory === ALL || (entry.category ?? OTHER) === activeCategory)
 
+  const install = (id: string): void => act(id, 'install', scope, `Installed ${id} in ${SCOPE_LABEL[scope]}`)
+
   return (
     <PanelBody>
       <PanelIntro>
         Claude Code plugins bundle commands, skills, agents, hooks and MCP servers. Installing or enabling a plugin lets its hooks and MCP servers run commands on this machine — install only plugins you trust.
       </PanelIntro>
 
-      <Section title="Installed" count={plugins?.length ?? 0}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <SubTabs
+          label="Plugins view"
+          value={view}
+          onChange={setView}
+          tabs={[
+            { value: 'installed', label: 'Installed', count: plugins?.length ?? 0 },
+            { value: 'browse', label: 'Browse', count: notInstalled.length },
+            { value: 'marketplaces', label: 'Marketplaces', count: marketplaces.length },
+          ]}
+        />
+        {view !== 'marketplaces' ? (
+          <span className="flex items-center gap-2 text-[13px] text-fg-muted" title={project === undefined ? 'Bind a project to choose project scope.' : undefined}>
+            Install and switch in
+            <Segmented label="Settings scope" value={scope} options={scopes} onChange={setScope} disabled={busy !== null} />
+          </span>
+        ) : null}
+      </div>
+
+      {view === 'installed' ? (
+      <Section title="Installed plugins">
         {plugins === null ? <EmptyState>Loading…</EmptyState> : plugins.length === 0 ? (
-          <EmptyState>No plugins yet. Add the recommended marketplace below (or your own), then install from it.</EmptyState>
+          <EmptyState>No plugins yet. Add a marketplace in Marketplaces, then install from Browse.</EmptyState>
         ) : (
           <ItemList label="Installed plugins">
             {plugins.map((plugin) => {
@@ -173,13 +201,17 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
                   key={plugin.id}
                   title={(
                     <>
-                      <span className="truncate font-mono text-[13px]">{plugin.id}</span>
+                      <span className="break-all">{plugin.name}</span>
+                      <Badge tone={plugin.active ? 'green' : plugin.installed ? 'gray' : 'amber'}>{plugin.active ? 'On' : plugin.installed ? 'Off' : 'Not installed'}</Badge>
                       {plugin.version !== undefined ? <Badge>{plugin.version}</Badge> : null}
-                      {plugin.active ? <Badge tone="green">active</Badge> : plugin.installed ? <Badge>off</Badge> : <Badge tone="amber">not installed</Badge>}
-                      {decided !== undefined ? <Badge tone="blue" title={`enabledPlugins in ${SCOPE_LABEL[decided.scope]} settings`}>{decided.value ? 'on' : 'off'} · {SCOPE_LABEL[decided.scope]}</Badge> : null}
                     </>
                   )}
-                  meta={[plugin.description, summary].filter((part) => part !== undefined && part !== '').join(' — ')}
+                  meta={[
+                    `@${plugin.marketplace}`,
+                    plugin.description,
+                    summary,
+                    decided !== undefined ? `${decided.value ? 'Enabled' : 'Disabled'} in ${SCOPE_LABEL[decided.scope]} settings` : undefined,
+                  ].filter((part) => part !== undefined && part !== '').join(' · ')}
                   actions={(
                     <>
                       {canToggle ? (
@@ -191,7 +223,7 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
                           onChange={(next) => act(plugin.id, next ? 'enable' : 'disable', scope, `${plugin.id} ${next ? 'enabled' : 'disabled'} in ${SCOPE_LABEL[scope]} settings`)}
                         />
                       ) : (
-                        <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => act(plugin.id, 'install', scope, `Installed ${plugin.id}`)}>
+                        <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => install(plugin.id)}>
                           <Icon name="arrowDown" size={13} />Install
                         </Button>
                       )}
@@ -231,14 +263,11 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
             })}
           </ItemList>
         )}
-        <div className="flex flex-wrap items-center gap-2 text-[13px] text-fg-muted">
-          <span>Install and switch at</span>
-          <Segmented label="Settings scope" value={scope} options={scopes} onChange={setScope} disabled={busy !== null} />
-          {project === undefined ? <span className="text-fg-faint">Bind a project to choose project scope.</span> : null}
-        </div>
       </Section>
+      ) : null}
 
-      <Section title="Marketplaces" count={marketplaces.length}>
+      {view === 'marketplaces' ? (
+      <Section title="Marketplaces">
         {suggested.length > 0 ? (
           <p className="m-0 text-[13px] text-fg-muted">This project's settings suggest: {suggested.join(', ')} (<code>extraKnownMarketplaces</code>).</p>
         ) : null}
@@ -247,7 +276,7 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
             {marketplaces.map((market) => (
               <ItemRow
                 key={market.name}
-                title={<><span className="font-mono text-[13px]">{market.name}</span><Badge>{market.document?.plugins.length ?? 0} plugins</Badge></>}
+                title={<><span className="break-all">{market.name}</span><Badge>{market.document?.plugins.length ?? 0} {(market.document?.plugins.length ?? 0) === 1 ? 'plugin' : 'plugins'}</Badge>{market.error !== undefined ? <Badge tone="amber">Failed</Badge> : null}</>}
                 meta={market.error ?? sourceText(market.source)}
                 actions={(
                   <RowMenu
@@ -276,11 +305,11 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
         {!recommendedAdded ? (
           <ItemList label="Recommended marketplaces">
             <ItemRow
-              title={<><span className="font-mono text-[13px]">{RECOMMENDED_MARKETPLACE.name}</span><Badge tone="blue">recommended</Badge></>}
+              title={<><span className="break-all">{RECOMMENDED_MARKETPLACE.name}</span><Badge tone="blue">Recommended</Badge></>}
               meta={`${RECOMMENDED_MARKETPLACE.description} (${RECOMMENDED_MARKETPLACE.repo})`}
               actions={(
                 <Button
-                  variant="primary"
+                  variant="outline"
                   size="sm"
                   disabled={busy !== null}
                   onClick={() => void run('market:add', async () => {
@@ -326,54 +355,52 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
           </Field>
         </form>
       </Section>
+      ) : null}
 
-      {marketplaces.length > 0 ? (
-        <Section title="Available" count={available.length} actions={<TextInput value={query} placeholder="Search plugins" onChange={(event) => setQuery(event.target.value)} aria-label="Filter available plugins" />}>
-          <SubTabs label="Marketplace" value={activeMarket} onChange={(next) => { setMarketTab(next); setCategory(ALL) }} tabs={marketTabs} />
-          {categories.length > 1 ? (
-            <div role="group" aria-label="Category" className="flex flex-wrap gap-1.5">
-              {[{ name: ALL, count: inMarket.length }, ...categories].map((item) => (
-                <button
-                  key={item.name}
-                  type="button"
-                  aria-pressed={activeCategory === item.name}
-                  onClick={() => setCategory(item.name)}
-                  className="inline-flex h-6 items-center gap-1 rounded-full border border-line px-2.5 text-xs text-fg-muted transition-colors hover:text-fg aria-pressed:border-fg-faint aria-pressed:bg-hover aria-pressed:text-fg"
-                >
-                  {item.name === ALL ? 'All' : item.name}
-                  <span className="text-fg-faint">{item.count}</span>
-                </button>
-              ))}
-            </div>
-          ) : null}
-          {available.length === 0 ? <EmptyState>Nothing to show.</EmptyState> : (
-            <ul aria-label="Available plugins" className="m-0 flex list-none flex-col divide-y divide-line overflow-hidden rounded-xl border border-line p-0">
-              {available.slice(0, AVAILABLE_LIMIT).map((entry) => (
-                <li key={entry.id} className="group flex min-w-0 items-center gap-3 px-3.5 py-2 hover:bg-hover">
-                  <button
-                    type="button"
-                    className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left outline-none focus-visible:underline"
-                    onClick={() => setDetailsId(entry.id)}
-                    aria-label={`Show what ${entry.id} contains`}
-                  >
-                    <span className="flex min-w-0 max-w-full items-center gap-2">
-                      <span className="truncate font-mono text-[13px] text-fg">{entry.name}</span>
-                      {marketTabs.length > 1 && activeMarket === ALL ? <span className="shrink-0 text-xs text-fg-faint">@{entry.marketplace}</span> : null}
-                      {entry.category !== undefined && activeCategory === ALL ? <Badge>{entry.category}</Badge> : null}
-                    </span>
-                    {entry.description !== undefined ? <span className="line-clamp-1 max-w-full text-xs text-fg-faint" title={entry.description}>{entry.description}</span> : null}
-                  </button>
-                  <Button variant="ghost" size="sm" onClick={() => setDetailsId(entry.id)} aria-label={`Details for ${entry.id}`}>
-                    <Icon name="info" size={13} />Details
-                  </Button>
-                  <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => act(entry.id, 'install', scope, `Installed ${entry.id} in ${SCOPE_LABEL[scope]}`)} aria-label={`Install ${entry.id}`}>
-                    {busy === `install:${entry.id}` ? 'Installing…' : <><Icon name="arrowDown" size={13} />Install</>}
-                  </Button>
-                </li>
-              ))}
-            </ul>
+      {view === 'browse' ? (
+        <Section title="Catalog" count={available.length} actions={<TextInput value={query} placeholder="Search plugins" onChange={(event) => setQuery(event.target.value)} aria-label="Filter available plugins" />}>
+          {marketplaces.length === 0 ? (
+            <EmptyState>No marketplaces yet. Add one in Marketplaces to browse its plugins.</EmptyState>
+          ) : (
+            <>
+              {marketTabs.length > 1 ? (
+                <FilterChips label="Marketplace" value={activeMarket} onChange={(next) => { setMarketTab(next); setCategory(ALL) }} items={marketTabs} />
+              ) : null}
+              {categories.length > 1 ? (
+                <FilterChips
+                  label="Category"
+                  value={activeCategory}
+                  onChange={setCategory}
+                  items={[{ value: ALL, label: 'All categories', count: inMarket.length }, ...categories.map((item) => ({ value: item.name, label: item.name, count: item.count }))]}
+                />
+              ) : null}
+              {available.length === 0 ? <EmptyState>Nothing to show.</EmptyState> : (
+                <ItemList label="Available plugins">
+                  {available.slice(0, AVAILABLE_LIMIT).map((entry) => (
+                    <ItemRow
+                      key={entry.id}
+                      title={(
+                        <>
+                          <span className="break-all">{entry.name}</span>
+                          {entry.category !== undefined && activeCategory === ALL ? <Badge>{entry.category}</Badge> : null}
+                        </>
+                      )}
+                      meta={<span className="line-clamp-2" title={entry.description}>{[`@${entry.marketplace}`, entry.description].filter((part) => part !== undefined && part !== '').join(' · ')}</span>}
+                      actions={(
+                        <>
+                          <IconButton label={`Details for ${entry.id}`} onClick={() => setDetailsId(entry.id)}><Icon name="info" size={14} /></IconButton>
+                          <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => install(entry.id)} aria-label={`Install ${entry.id}`}>
+                            <Icon name="arrowDown" size={13} />{busy === `install:${entry.id}` ? 'Installing…' : 'Install'}
+                          </Button>
+                        </>
+                      )}
+                    />
+                  ))}
+                </ItemList>
+              )}
+              {available.length > AVAILABLE_LIMIT ? <p className="m-0 text-xs text-fg-faint">Showing {AVAILABLE_LIMIT} of {available.length}. Search or pick a category to narrow the list.</p> : null}
+            </>
           )}
-          {available.length > AVAILABLE_LIMIT ? <p className="m-0 text-xs text-fg-faint">Showing {AVAILABLE_LIMIT} of {available.length}. Search or pick a category to narrow the list.</p> : null}
         </Section>
       ) : null}
 
@@ -384,7 +411,7 @@ function PluginsPanelContent({ workspaceId, projectId }: { readonly workspaceId:
           pluginId={detailsId}
           installed={installedIds.has(detailsId)}
           busy={busy === `install:${detailsId}`}
-          onInstall={() => act(detailsId, 'install', scope, `Installed ${detailsId} in ${SCOPE_LABEL[scope]}`)}
+          onInstall={() => install(detailsId)}
           onClose={() => setDetailsId(null)}
         />
       ) : null}

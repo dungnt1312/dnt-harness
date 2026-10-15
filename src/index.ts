@@ -280,7 +280,7 @@ export { approvalCallFingerprint, attachApproval, createApprovalReceiptRegistry 
 export type { AskRequirement, AuthorityDecision } from './harness/tools/authority.ts'
 
 // ── Capabilities: filesystem + shell ─────────────────────────────────────
-export { fsTools, resolveGrantedPath, resolveWithin } from './capabilities/fs/tools.ts'
+export { fsTools, applyPatchTool, resolveGrantedPath, resolveWithin } from './capabilities/fs/tools.ts'
 export { classifyTarget, OutOfGrantError, resolveInGrants, targetPaths, type PathClass, type TargetPath } from './capabilities/fs/grants.ts'
 export { bashTool, type BashToolOptions } from './capabilities/shell/bash.ts'
 export { bashOutputTool, killShellTool } from './capabilities/shell/background-tools.ts'

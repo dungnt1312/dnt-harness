@@ -2,20 +2,14 @@
  * Choosing how a compaction gets its summary. The decision is pure: given the
  * durable log, the newest snapshot (if any) and what the builder can rebuild,
  * return the one source to summarize from — or a typed reason it cannot.
- * Never "fold the raw transcript" as a fallback; that is a separate,
- * explicitly confirmed recovery.
+ * With no usable snapshot the answer is to fold the shortened transcript.
  */
 import { describe, expect, it } from 'vitest'
 import type { SessionEvent } from '../../src/harness/session/events.ts'
 import type { CompactionProjection } from '../../src/harness/context/compaction-projection.ts'
 import { compactionSeedHash, sourceDigest } from '../../src/harness/context/compaction-digest.ts'
 import type { EffectiveCompactionSnapshot, SnapshotIdentity } from '../../src/harness/context/compaction-snapshot.ts'
-import {
-  RAW_RECOVERY_CALL_ESTIMATE_CHARS,
-  chooseCompactionSource,
-  recoveryConfirmationFor,
-  type SourceChoice,
-} from '../../src/web/compaction-source.ts'
+import { chooseCompactionSource, type SourceChoice } from '../../src/web/compaction-source.ts'
 
 type Row = { type: string; [key: string]: unknown }
 const log = (rows: Row[]): SessionEvent[] => rows.map((row, index) => ({ seq: index + 1, timestamp: 1000 + index, ...row })) as unknown as SessionEvent[]
@@ -70,15 +64,22 @@ describe('chooseCompactionSource', () => {
     expect(choice).toMatchObject({ kind: 'snapshot', path: 'reconstructed' })
   })
 
-  it('rejects an exact snapshot whose identity no longer matches and uses the reconstruction instead', () => {
-    const stale = snapshotFor(events, 8, { identity: { ...identity, model: 'other' } })
-    const choice = chooseCompactionSource({ events, exact: stale, reconstructed: snapshotFor(events, 8), identity })
-    expect(choice).toMatchObject({ kind: 'snapshot', path: 'reconstructed' })
+  it('rejects an exact snapshot whose mode or grants no longer match and uses the reconstruction instead', () => {
+    for (const changed of [{ modeHash: 'other' }, { grantsHash: 'other' }]) {
+      const stale = snapshotFor(events, 8, { identity: { ...identity, ...changed } })
+      const choice = chooseCompactionSource({ events, exact: stale, reconstructed: snapshotFor(events, 8), identity })
+      expect(choice).toMatchObject({ kind: 'snapshot', path: 'reconstructed' })
+    }
+  })
+
+  it('keeps an exact snapshot across a provider, model or thinking switch: the content it summarizes is the same', () => {
+    const before = snapshotFor(events, 8, { identity: { ...identity, provider: 'old', model: 'old', thinkingLevel: 'low' } })
+    expect(chooseCompactionSource({ events, exact: before, identity })).toMatchObject({ kind: 'snapshot', path: 'exact' })
   })
 
   it('rejects a snapshot whose log changed underneath it', () => {
     const stale = snapshotFor(events, 8, { sourceDigest: 'stale' })
-    expect(chooseCompactionSource({ events, exact: stale, identity })).toMatchObject({ kind: 'recovery-required', reason: 'no-eligible-snapshot' })
+    expect(chooseCompactionSource({ events, exact: stale, identity })).toMatchObject({ kind: 'fold', reason: 'no-eligible-snapshot', cutoff: 8 })
   })
 
   it('never prefers a snapshot older than the checkpoint that already stands', () => {
@@ -91,7 +92,7 @@ describe('chooseCompactionSource', () => {
     // Turn t2 closed AFTER the checkpoint (cutoff 4), so there is work to do, but the
     // snapshot at cutoff 4 would only re-summarize what the checkpoint already holds.
     const choice = chooseCompactionSource({ events: withCheckpoint, exact: snapshotFor(withCheckpoint, 4), identity })
-    expect(choice).toMatchObject({ kind: 'recovery-required', reason: 'no-eligible-snapshot' })
+    expect(choice).toMatchObject({ kind: 'fold', reason: 'no-eligible-snapshot' })
     // The same log with a snapshot that DOES cover the new turn is chosen.
     const newest = withCheckpoint.findLast((event) => event.type === 'turn/end')!.seq
     expect(chooseCompactionSource({ events: withCheckpoint, exact: snapshotFor(withCheckpoint, newest, { projection: { v: 1, policyVersion: 1, history: 'compact', seed: { coversSeq: 4, hash: compactionSeedHash('S') }, sources: snapshotFor(withCheckpoint, newest).projection.sources.filter((source) => source.seq > 6), losses: [] } }), identity })).toMatchObject({ kind: 'snapshot', path: 'exact' })
@@ -106,10 +107,8 @@ describe('chooseCompactionSource', () => {
     expect(chooseCompactionSource({ events: done, identity })).toMatchObject({ kind: 'noop' })
   })
 
-  it('asks for confirmed recovery, never silently folds the raw transcript', () => {
-    const choice = chooseCompactionSource({ events, identity })
-    expect(choice).toMatchObject({ kind: 'recovery-required', reason: 'no-eligible-snapshot' })
-    expect((choice as Extract<SourceChoice, { kind: 'recovery-required' }>).confirmation).toEqual(recoveryConfirmationFor(events, 8))
+  it('with no snapshot at all it folds the transcript up to the newest closed turn', () => {
+    expect(chooseCompactionSource({ events, identity })).toEqual({ kind: 'fold', reason: 'no-eligible-snapshot', cutoff: 8 })
   })
 
   it('refuses while a turn is open', () => {
@@ -119,28 +118,5 @@ describe('chooseCompactionSource', () => {
 
   it('refuses a log with no completed turn at all', () => {
     expect(chooseCompactionSource({ events: log([{ type: 'session/title', title: 'x' }]), identity })).toMatchObject({ kind: 'unavailable', reason: 'no-completed-turn' })
-  })
-})
-
-describe('recoveryConfirmationFor', () => {
-  it('fingerprints the cutoff and the source, and estimates the raw folding cost', () => {
-    const confirmation = recoveryConfirmationFor(events, 8)
-    expect(confirmation).toMatchObject({ cutoff: 8, sourceDigest: sourceDigest(events, 8) })
-    expect(confirmation.estimatedCalls).toBeGreaterThanOrEqual(1)
-  })
-
-  it('estimates calls from the chunk size the legacy folder actually uses', () => {
-    const big = log([
-      { type: 'turn/start', turnId: 't1' },
-      { type: 'user/message', turnId: 't1', content: 'q'.repeat(RAW_RECOVERY_CALL_ESTIMATE_CHARS * 3) },
-      { type: 'assistant/message', stepId: 's', content: 'a' },
-      { type: 'turn/end', turnId: 't1', reason: 'completed' },
-    ])
-    expect(recoveryConfirmationFor(big, 4).estimatedCalls).toBeGreaterThanOrEqual(3)
-  })
-
-  it('changes when the covered source changes, so a stale confirmation cannot be replayed', () => {
-    const edited = log([...turnRows('t1', 'FIRST EDITED', 'a1'), ...turnRows('t2', 'second', 'a2')])
-    expect(recoveryConfirmationFor(edited, 8).sourceDigest).not.toBe(recoveryConfirmationFor(events, 8).sourceDigest)
   })
 })

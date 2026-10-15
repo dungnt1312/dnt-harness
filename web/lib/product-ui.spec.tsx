@@ -18,7 +18,7 @@ import type { ChipSegment } from './inline-chips.ts'
 import { budgetTone, formatTime } from './format.ts'
 import { hiddenSpawnCalls } from './spawn-merge.ts'
 import { createProjector, projectItems } from './project.ts'
-import { compactSession, CompactionCancelled, CompactionRecoveryNeeded, fetchHooks, saveHooks, setHookActive, renameWorkspace, listProjectFiles, readProjectFile } from './api.ts'
+import { compactSession, CompactionCancelled, fetchHooks, saveHooks, setHookActive, renameWorkspace, listProjectFiles, readProjectFile } from './api.ts'
 import { ContextPanel } from '../components/layout/ContextPanel.tsx'
 import { Workbench, type WorkbenchView } from '../components/workbench/Workbench.tsx'
 import { closeFileTab, useWorkbenchFiles } from '../hooks/useWorkbenchFiles.ts'
@@ -43,9 +43,6 @@ vi.mock('./api.ts', () => ({
   compactSession: vi.fn(async () => ({ coversSeq: 42, summaryChars: 900 })),
   CompactionCancelled: class CompactionCancelled extends Error {
     constructor() { super('Compaction was cancelled.'); this.name = 'CompactionCancelled' }
-  },
-  CompactionRecoveryNeeded: class CompactionRecoveryNeeded extends Error {
-    constructor(readonly recovery: { cutoff: number; sourceDigest: string; estimatedCalls: number }) { super('needs recovery'); this.name = 'CompactionRecoveryNeeded' }
   },
   listSkills: vi.fn(async () => []),
   saveSkill: vi.fn(async () => ({ name: 's', hash: 'h' })),
@@ -324,6 +321,20 @@ describe('transcript grouping', () => {
     // else. A real answer still breaks the run.
     expect(blocks.map((block) => block.kind === 'activity' ? `activity:${block.rows.length}` : block.row.item.kind))
       .toEqual(['user', 'activity:7'])
+  })
+  it('keeps landed media (previews, generated images) out of runs so a fold never hides them', () => {
+    const chart = JSON.stringify({ kind: 'chart', chart: { type: 'bar', labels: ['a'], series: [{ name: 's', values: [1] }] } })
+    const blocks = groupBlocks([
+      { kind: 'user', content: 'go' },
+      { kind: 'tool', call: { id: 'a', name: 'SendPreview', args: {} }, result: { ok: true, output: chart } },
+      { kind: 'tool', call: { id: 'b', name: 'SendPreview', args: {} }, result: { ok: true, output: chart } },
+      { kind: 'tool', call: { id: 'c', name: 'SendPreview', args: {} }, result: { ok: false, output: 'error: bad' } },
+      { kind: 'tool', call: { id: 'd', name: 'Glob', args: {} }, result: { ok: true, output: 'x' } },
+      { kind: 'tool', call: { id: 'e', name: 'GenerateImage', args: {} }, result: { ok: true, output: JSON.stringify({ attachmentId: 'a'.repeat(64) }) } },
+    ])
+    // A failed preview showed nothing, so it is ordinary work and still groups.
+    expect(blocks.map((block) => block.kind === 'activity' ? `activity:${block.rows.length}` : block.row.item.kind))
+      .toEqual(['user', 'tool', 'tool', 'activity:2', 'tool'])
   })
   it('merges tool rows across invisible tool-only assistant steps into one tight block', () => {
     const emptyStep = { kind: 'assistant' as const, content: '', live: false, thinking: [] as string[], thinkingLive: false }
@@ -740,6 +751,12 @@ describe('approval card actions', () => {
     await mount(<ApprovalBar approvals={[{ approvalId: 'a', call: { id: 'c', name: 'Bash', args: {} }, expiresAt: Date.now() - 1_000 }]} onAnswer={vi.fn()} />)
     expect(host.textContent).toContain('Expired')
   })
+  it('waits quietly when a host configured no expiry: no countdown, answerable', async () => {
+    await mount(<ApprovalBar approvals={[{ approvalId: 'a', call: { id: 'c', name: 'Bash', args: {} } }]} onAnswer={vi.fn()} />)
+    expect(host.textContent).not.toContain('Cancels itself')
+    expect(host.textContent).not.toContain('Expired')
+    expect(button('Allow once')).not.toBeNull()
+  })
 })
 
 describe('queued input projection', () => {
@@ -964,7 +981,7 @@ describe('transcript truthfulness', () => {
     expect(host.querySelector('button[aria-label="Reuse in composer"]')).toBeNull()
   })
   it('renders skill and file chips inline in a user message', async () => {
-    await mount(<UserBubble item={{ kind: 'user', content: '/review check @web/lib/api.ts now' }} />)
+    await mount(<UserBubble item={{ kind: 'user', content: '/review check [@api.ts](./web/lib/api.ts) now' }} />)
     const chips = Array.from(host.querySelectorAll('[data-chip-kind]'))
     expect(chips.map((chip) => [chip.getAttribute('data-chip-kind'), chip.textContent, chip.getAttribute('title')])).toEqual([
       ['command', 'review', 'Command: /review'],
@@ -975,7 +992,7 @@ describe('transcript truthfulness', () => {
   it('a skill chip opens its SKILL.md when the name is a skill; other chips stay labels', async () => {
     const open = vi.fn()
     const openSkill = vi.fn((name: string) => (name === 'review' ? open : null))
-    await mount(<UserBubble item={{ kind: 'user', content: '/review check @web/lib/api.ts now' }} openSkill={openSkill} />)
+    await mount(<UserBubble item={{ kind: 'user', content: '/review check [@api.ts](./web/lib/api.ts) now' }} openSkill={openSkill} />)
     const button = host.querySelector<HTMLButtonElement>('button[data-chip-kind="command"]')!
     expect(button.getAttribute('aria-label')).toBe('Open skill review in workbench')
     await act(async () => button.click())
@@ -988,7 +1005,7 @@ describe('transcript truthfulness', () => {
   it('a mention chip opens its file when the opener resolves; otherwise it stays a label', async () => {
     const open = vi.fn()
     const openMention = vi.fn((segment: ChipSegment) => (segment.kind === 'mention' && segment.path === 'web/lib/api.ts' ? open : null))
-    await mount(<UserBubble item={{ kind: 'user', content: 'check @web/lib/api.ts and @../outside.md' }} openMention={openMention} />)
+    await mount(<UserBubble item={{ kind: 'user', content: 'check [@api.ts](./web/lib/api.ts) and [@outside.md](./../outside.md)' }} openMention={openMention} />)
     const button = host.querySelector<HTMLButtonElement>('button[data-chip-kind="mention"]')!
     expect(button.getAttribute('aria-label')).toBe('Open api.ts in workbench')
     await act(async () => button.click())
@@ -997,7 +1014,7 @@ describe('transcript truthfulness', () => {
     expect(host.querySelector('button[data-chip-kind="mention"]')).not.toBeNull()
     expect(host.querySelector('span[data-chip-kind="mention"]')).not.toBeNull()
     // No opener at all: every mention stays a label.
-    await mount(<UserBubble item={{ kind: 'user', content: 'check @web/lib/api.ts' }} />)
+    await mount(<UserBubble item={{ kind: 'user', content: 'check [@api.ts](./web/lib/api.ts)' }} />)
     expect(host.querySelector('button[data-chip-kind="mention"]')).toBeNull()
     expect(host.querySelector('span[data-chip-kind="mention"]')).not.toBeNull()
   })
@@ -1154,7 +1171,7 @@ describe('context compaction + budget bar', () => {
     it.each([
       ['cancelled', 'Compaction cancelled'],
       ['noop', 'Already compacted'],
-      ['needs-recovery', 'Needs a slow recovery'],
+      ['needs-recovery', 'Not compacted'],
     ] as const)('a row that ended as %s says so, and is not shown as a failure', async (status, label) => {
       await mount(<CompactionMarker item={row({ status })} />)
       expect(host.textContent).toContain(label)
@@ -1169,16 +1186,35 @@ describe('context compaction + budget bar', () => {
       expect(host.textContent).toContain('provider transport failure')
     })
 
+    it('while summarizing with progress it shows done/total', async () => {
+      await mount(<CompactionMarker item={row({ stage: 'generating', startedAt: Date.now(), progress: { done: 2, total: 4 } })} />)
+      expect(host.textContent).toContain('Summarizing 2/4')
+    })
+
+    it('a single request shows no count: "Summarizing", never "Summarizing 0/1"', async () => {
+      await mount(<CompactionMarker item={row({ stage: 'generating', startedAt: Date.now(), progress: { done: 0, total: 1 } })} />)
+      expect(host.textContent).toContain('Summarizing')
+      expect(host.textContent).not.toMatch(/Summarizing \d/)
+    })
+
+    it('a finished row shows how many requests it took', async () => {
+      await mount(<CompactionMarker item={row({ status: 'completed', coversSeq: 9, summary: 'S', requests: 3 })} />)
+      expect(host.textContent).toContain('3 requests')
+      await mount(<CompactionMarker item={row({ status: 'failed', requests: 1 })} />)
+      expect(host.textContent).toContain('1 request')
+      expect(host.textContent).not.toContain('1 requests')
+    })
+
     it('a finished row shows how the summary was made', async () => {
       await mount(<CompactionMarker item={row({ status: 'completed', path: 'recovery', coversSeq: 9, summary: 'S' })} />)
-      expect(host.textContent).toContain('slow recovery')
+      expect(host.textContent).toContain('full transcript')
+      expect(host.textContent).not.toContain('recovery')
       await mount(<CompactionMarker item={row({ status: 'completed', path: 'exact', coversSeq: 9, summary: 'S' })} />)
-      expect(host.textContent).not.toContain('slow recovery')
+      expect(host.textContent).not.toContain('full transcript')
     })
   })
 
-  describe('slow recovery confirmation', () => {
-    const recovery = { cutoff: 42, sourceDigest: 'abc123', estimatedCalls: 9 }
+  describe('compacting from the Context panel', () => {
     const compactMock = compactSession as unknown as ReturnType<typeof vi.fn>
     const open = async (): Promise<void> => {
       await mount(<ToastHost><ContextPanel meta={null} stream="open" sessionId="s1" sessionFolder={null} eventCount={0} manifest={manifest} workspaceId="w1" running={false} /></ToastHost>)
@@ -1186,70 +1222,28 @@ describe('context compaction + budget bar', () => {
       await act(async () => bodyButton('Compact').click())
     }
 
-    it('asks before running the slow raw fold, says how many model calls it is, and has run nothing yet', async () => {
-      compactMock.mockRejectedValueOnce(new CompactionRecoveryNeeded(recovery))
-      await open()
-      expect(compactSession).toHaveBeenCalledTimes(1)
-      expect(document.body.textContent).toContain('Slow compaction needed')
-      expect(document.body.textContent).toContain('about 9 model calls')
-      expect(bodyButton('Run slow compaction')).toBeDefined()
-    })
-
-    it('Cancel never confirms: the server is not called again', async () => {
-      compactMock.mockRejectedValueOnce(new CompactionRecoveryNeeded(recovery))
-      await open()
-      await act(async () => bodyButton('Cancel').click())
-      expect(compactSession).toHaveBeenCalledTimes(1)
-      expect(document.body.textContent).not.toContain('Slow compaction needed')
-    })
-
-    it('confirming echoes the exact fingerprint the server showed, and reports the result', async () => {
-      compactMock.mockRejectedValueOnce(new CompactionRecoveryNeeded(recovery))
+    it('one confirmation runs it: a slow fold is the server\'s choice, never a second question', async () => {
       compactMock.mockResolvedValueOnce({ coversSeq: 42, summaryChars: 700, path: 'recovery' })
       await open()
-      await act(async () => bodyButton('Run slow compaction').click())
-      expect(compactSession).toHaveBeenCalledTimes(2)
-      expect(compactMock.mock.calls[1]).toEqual(['w1', 's1', recovery])
-      expect(document.body.textContent).not.toContain('Slow compaction needed')
-    })
-
-    it('a turn that starts while the question is open withdraws it without confirming', async () => {
-      function Probe() {
-        const [running, setRunning] = useState(false)
-        return (
-          <ToastHost>
-            <button type="button" onClick={() => setRunning(true)}>Start running</button>
-            <button type="button" onClick={() => setRunning(false)}>Stop running</button>
-            <ContextPanel meta={null} stream="open" sessionId="s1" sessionFolder={null} eventCount={0} manifest={manifest} workspaceId="w1" running={running} />
-          </ToastHost>
-        )
-      }
-      compactMock.mockRejectedValueOnce(new CompactionRecoveryNeeded(recovery))
-      await mount(<Probe />)
-      await act(async () => button('Compact…').click())
-      await act(async () => bodyButton('Compact').click())
-      expect(document.body.textContent).toContain('Slow compaction needed')
-      await act(async () => button('Start running').click())
-      expect(document.body.textContent).not.toContain('Slow compaction needed')
-      // The question was about a source that has since changed: it must not come back when the turn ends.
-      await act(async () => button('Stop running').click())
-      expect(document.body.textContent).not.toContain('Slow compaction needed')
       expect(compactSession).toHaveBeenCalledTimes(1)
+      expect(compactMock.mock.calls[0]).toEqual(['w1', 's1'])
+      expect(document.body.textContent).not.toContain('Slow compaction needed')
+      expect(document.body.textContent).toContain('Compacted')
     })
 
     it('a compaction the user stopped is reported as cancelled, not as a failure', async () => {
       compactMock.mockRejectedValueOnce(new CompactionCancelled())
       await open()
       expect(document.body.textContent).toContain('Compaction cancelled')
-      expect(document.body.textContent).not.toContain('Slow compaction needed')
       expect(document.body.textContent).not.toContain('HTTP')
       expect(document.body.textContent).not.toContain('Error')
     })
 
-    it('an ordinary failure is still just a message, never a slow-compaction question', async () => {
+    it('an ordinary failure is just a message', async () => {
       compactMock.mockRejectedValueOnce(new Error('HTTP 409: no'))
       await open()
-      expect(document.body.textContent).not.toContain('Slow compaction needed')
+      expect(document.body.textContent).toContain('HTTP 409: no')
+      expect(compactSession).toHaveBeenCalledTimes(1)
     })
   })
   it('shows a child request’s role and inherited parent context, or why it was dropped', async () => {
@@ -1642,7 +1636,7 @@ describe('sidebar sections + live rows + workspace management', () => {
     const onFilter = vi.fn()
     const props = sidebarProps([{ id: 'w1', name: 'Acme', archived: false, createdAt: 1 }], 'w1')
     await mount(<ToastHost><Sidebar {...props} onFilter={onFilter} /></ToastHost>)
-    const search = () => host.querySelector<HTMLButtonElement>('button[aria-label="Search conversations and folders (Ctrl K)"]')!
+    const search = () => host.querySelector<HTMLButtonElement>('button[aria-label="Search conversations and folders"]')!
     expect(host.querySelector('input[aria-label="Search conversations and folders"]')).toBeNull()
     await act(async () => search().click())
     expect(host.querySelector('input[aria-label="Search conversations and folders"]')).not.toBeNull()

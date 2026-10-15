@@ -2,13 +2,12 @@ import { describe, expect, it } from 'vitest'
 import { BUILTIN_COMMANDS, chipLabel, chipTitle, chipWireText, isBuiltinCommand, messageText, parseMessageText } from './inline-chips.ts'
 
 describe('chip wire text', () => {
-  it('writes mentions as @path, quoting only when the path needs it', () => {
-    expect(chipWireText({ kind: 'mention', path: 'web/api.ts' })).toBe('@web/api.ts')
-    expect(chipWireText({ kind: 'mention', path: 'docs/my notes.md' })).toBe('@"docs/my notes.md"')
-    expect(chipWireText({ kind: 'mention', path: 'odd.' })).toBe('@"odd."')
+  it('writes every chip as a Markdown link whose destination is its identity', () => {
+    expect(chipWireText({ kind: 'mention', path: 'web/api.ts' })).toBe('[@api.ts](./web/api.ts)')
+    expect(chipWireText({ kind: 'mention', path: 'docs/my notes.md' })).toBe('[@my notes.md](<./docs/my notes.md>)')
+    expect(chipWireText({ kind: 'mention', path: 'a/[x]).md' })).toBe('[@\\[x\\]).md](<./a/[x]).md>)')
+    expect(chipWireText({ kind: 'command', name: 'ak-plan' })).toBe('[$ak-plan](skill://ak-plan)')
     expect(chipWireText({ kind: 'command', name: 'ak-plan' }, true)).toBe('/ak-plan')
-    expect(chipWireText({ kind: 'command', name: 'ak-plan' })).toBe('Use the ak-plan skill:')
-    expect(chipWireText({ kind: 'command', name: 'ak-plan', legacy: true }, true)).toBe('Use the ak-plan skill:')
   })
 
   it('labels a file by base name and a skill by its bare name', () => {
@@ -26,8 +25,8 @@ describe('chip wire text', () => {
 })
 
 describe('parseMessageText', () => {
-  it('parses a leading /command and mentions anywhere a word starts', () => {
-    expect(parseMessageText('/git:commit xem @web/api.ts và @"docs/my notes.md"')).toEqual([
+  it('parses a leading /command and chip links anywhere', () => {
+    expect(parseMessageText('/git:commit xem [@api.ts](./web/api.ts) và [@my notes.md](<./docs/my notes.md>)')).toEqual([
       { kind: 'command', name: 'git:commit' },
       { kind: 'text', text: ' xem ' },
       { kind: 'mention', path: 'web/api.ts' },
@@ -36,16 +35,26 @@ describe('parseMessageText', () => {
     ])
   })
 
-  it('leaves sentence punctuation out of a bare path', () => {
-    expect(parseMessageText('open @src/a.ts, then (@b.md).')).toEqual([
-      { kind: 'text', text: 'open ' },
-      { kind: 'mention', path: 'src/a.ts' },
-      { kind: 'text', text: ', then (@b.md).' },
+  it('parses a mid-message skill chip (the $ menu)', () => {
+    expect(parseMessageText('Ghi docs rồi commit\n[$softel-git](skill://softel-git) nhé')).toEqual([
+      { kind: 'text', text: 'Ghi docs rồi commit\n' },
+      { kind: 'command', name: 'softel-git' },
+      { kind: 'text', text: ' nhé' },
     ])
   })
 
-  it('keeps text that is not a chip as text', () => {
-    for (const text of ['mail me at a@b.com', 'say Use the ak-plan skill: later', 'lone @ sign', '@"plain"', '@...']) {
+  it('keeps everything that is not a canonical chip link as text', () => {
+    for (const text of [
+      'mail me at a@b.com',
+      'open @src/a.ts',
+      'Use the ak-plan skill: go',
+      '$ak-plan',
+      '[docs](https://example.com)',
+      '[@wrong label](./web/api.ts)',
+      '[$x](skill://y)',
+      '[$bad name](skill://bad name)',
+      '[@a](./)',
+    ]) {
       expect(parseMessageText(text)).toEqual([{ kind: 'text', text }])
     }
   })
@@ -56,22 +65,25 @@ describe('parseMessageText', () => {
       '/review',
       '/review args here',
       '/usr/bin/env node',
-      'Use the review skill:',
-      'Use the review skill: run @web/api.ts\nand @"a b/c d.ts" then @x.',
-      '@@double @"unterminated',
-      'tab\t@path\there',
+      'run [@api.ts](./web/api.ts)\nand [@d.ts](<./a b/c d.ts>) then [@x](./x).',
+      '[@\\[x\\]).md](<./a/[x]).md>) [unclosed](',
+      'tab\t[$t](skill://t)\there',
     ]
     for (const text of samples) expect(messageText(parseMessageText(text))).toBe(text)
   })
+
+  it('round-trips chips through serialization', () => {
+    const segments = [
+      { kind: 'text', text: 'see ' },
+      { kind: 'mention', path: 'a/[x]) <y>.md' },
+      { kind: 'text', text: ' with ' },
+      { kind: 'command', name: 'plugin:cmd' },
+    ] as const
+    expect(parseMessageText(messageText(segments))).toEqual(segments)
+  })
 })
 
-describe('legacy skill phrase', () => {
-  it('parses the retired leading phrase into a legacy chip that keeps its exact text', () => {
-    const segments = parseMessageText('Use the ak-plan skill: go')
-    expect(segments[0]).toEqual({ kind: 'command', name: 'ak-plan', legacy: true })
-    expect(messageText(segments)).toBe('Use the ak-plan skill: go')
-  })
-
+describe('leading token', () => {
   it('keeps a path-like first token as text', () => {
     expect(parseMessageText('/usr/bin/env node')).toEqual([{ kind: 'text', text: '/usr/bin/env node' }])
   })

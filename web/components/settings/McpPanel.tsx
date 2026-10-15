@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useScopedState } from '../../hooks/useScopedState.ts'
 import Icon from '../common/Icon.tsx'
 import { Badge } from '../ui/Badge.tsx'
@@ -30,17 +30,29 @@ import {
   type NoticeState,
   RowMenu,
   FormActions,
+  InlineSwitch,
+  SubTabs,
 } from './settings-kit.tsx'
 import { useUnsavedChanges } from './unsaved-changes.tsx'
 
 const SERVER_NAME = /^[A-Za-z0-9_-]+$/
 const DEFAULT_TIMEOUT_MS = 15000
+/** Tool badges shown before "+N more"; a 25-tool server otherwise buries the rows below it. */
+const TOOL_PREVIEW = 8
 const STATUS_TONE: Readonly<Record<McpServerRow['status'], 'green' | 'amber' | 'gray' | 'blue'>> = {
   ready: 'green',
   failed: 'amber',
   connecting: 'blue',
   idle: 'gray',
   disabled: 'gray',
+}
+
+const STATUS_LABEL: Readonly<Record<McpServerRow['status'], string>> = {
+  ready: 'Running',
+  failed: 'Failed',
+  connecting: 'Starting',
+  idle: 'Not started',
+  disabled: 'Off',
 }
 
 /**
@@ -51,9 +63,9 @@ const STATUS_TONE: Readonly<Record<McpServerRow['status'], 'green' | 'amber' | '
 const STATUS_META: Readonly<Record<McpServerRow['status'], string | undefined>> = {
   ready: undefined,
   connecting: 'Starting up — tools appear once the handshake completes.',
-  idle: 'Enabled. Starts on the next request.',
+  idle: 'Starts with the next chat turn.',
   failed: 'The connection failed. Check the command and arguments, then reconnect.',
-  disabled: 'Not running. Enable it to start the server.',
+  disabled: undefined,
 }
 
 /** How an HTTP server authenticates. OAuth is discovered and signed into from the list. */
@@ -90,7 +102,7 @@ const BLANK_FORM: ServerForm = {
 }
 
 const OAUTH_BADGE: Readonly<Record<McpOAuthState['state'], { readonly label: string; readonly tone: 'green' | 'amber' | 'gray' }>> = {
-  connected: { label: 'Connected', tone: 'green' },
+  connected: { label: 'Signed in', tone: 'green' },
   needs_sign_in: { label: 'Needs sign-in', tone: 'amber' },
   not_connected: { label: 'Not connected', tone: 'gray' },
 }
@@ -210,12 +222,14 @@ function toolExposed(allowed: readonly string[] | undefined, server: string, nam
  * with nothing behind it. Warnings stay visible beside the badges.
  */
 function DiscoveredTools({ row }: { readonly row: McpServerRow }) {
+  const [showAll, setShowAll] = useState(false)
   const tools = row.discoveredTools ?? []
   const hasWarnings = (row.unmatchedAllowlist?.length ?? 0) > 0 || (row.unusableTools?.length ?? 0) > 0
   if (tools.length === 0 && !hasWarnings) return null
   const allowed = row.allowedTools
   const restricted = allowed !== undefined && allowed.length > 0
   const exposedCount = tools.filter((name) => toolExposed(allowed, row.name, name)).length
+  const shown = showAll || tools.length <= TOOL_PREVIEW + 1 ? tools : tools.slice(0, TOOL_PREVIEW)
   return (
     <div className="flex min-w-0 flex-col gap-1.5">
       {tools.length > 0 ? (
@@ -235,7 +249,7 @@ function DiscoveredTools({ row }: { readonly row: McpServerRow }) {
             ) : null}
           </p>
           <ul aria-label={`Tools from ${row.name}`} className="m-0 flex list-none flex-wrap gap-1 p-0">
-            {tools.map((name) => {
+            {shown.map((name) => {
               const exposed = toolExposed(allowed, row.name, name)
               return (
                 <li key={name}>
@@ -249,6 +263,13 @@ function DiscoveredTools({ row }: { readonly row: McpServerRow }) {
                 </li>
               )
             })}
+            {shown.length < tools.length || showAll ? (
+              <li>
+                <button type="button" className="inline-flex h-5 items-center rounded-full px-2 text-xs text-fg-muted hover:bg-hover hover:text-fg" onClick={() => setShowAll(!showAll)}>
+                  {showAll ? 'Show less' : `+${tools.length - shown.length} more`}
+                </button>
+              </li>
+            ) : null}
           </ul>
         </>
       ) : null}
@@ -327,6 +348,14 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
 
   useEffect(() => { void refresh() }, [refresh])
 
+  // A server that is starting settles on its own; poll so the row does not stay "Starting" until a manual refresh.
+  const anyStarting = rows.some((row) => row.status === 'connecting')
+  useEffect(() => {
+    if (!anyStarting) return undefined
+    const timer = window.setInterval(() => void refresh(), 2_000)
+    return () => window.clearInterval(timer)
+  }, [anyStarting, refresh])
+
   /**
    * Finish a sign-in with its state (the callback page reported back), or with
    * the address pasted back. Failed completion keeps the sign-in open for retry
@@ -377,7 +406,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
         kind: 'ok',
         text: result.tested === true
           ? `${server}: connection test saw ${(result.tools ?? []).length} tools and left the server unpublished`
-          : `${server}: ${result.status ?? 'updated'}`,
+          : `${server}: ${STATUS_LABEL[result.status as McpServerRow['status']] ?? result.status ?? 'updated'}`,
       })
     } finally {
       await refresh()
@@ -494,10 +523,10 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
         await upsertMcpServer(workspaceId, name, config)
         const missing = entry.secrets.filter((secret) => !secretNames.has(secret.name) && secrets[secret.name] === undefined).map((secret) => secret.name)
         const next = entry.config['auth'] !== null && typeof entry.config['auth'] === 'object' && (entry.config['auth'] as { type?: unknown }).type === 'managed_oauth'
-          ? 'Use Connect to sign in, then Enable to start it.'
+          ? 'Use Connect to sign in, then switch it on.'
           : missing.length > 0
-            ? `Add ${missing.join(', ')} in the Secrets tab, then Enable to start it.`
-            : 'Use Enable to start it.'
+            ? `Add ${missing.join(', ')} in the Secrets tab, then switch it on.`
+            : 'Switch it on to start it.'
         setNotice({ kind: 'ok', text: `Installed ${name}. ${next}` })
         await refresh()
       } catch (cause) {
@@ -528,8 +557,8 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
     setNotice({
       kind: 'ok',
       text: form.transport === 'http' && form.authMode === 'oauth' && rows.find((row) => row.name === name)?.oauth?.state !== 'connected'
-        ? `Saved ${name}. Use Connect to sign in, then Enable to start it.`
-        : editing !== null && rows.find((row) => row.name === name)?.enabled === true ? `Saved ${name}.` : `Saved ${name}. It is not running yet — use Enable to start it.`,
+        ? `Saved ${name}. Use Connect to sign in, then switch it on.`
+        : editing !== null && rows.find((row) => row.name === name)?.enabled === true ? `Saved ${name}.` : `Saved ${name}. It is not running yet — switch it on to start it.`,
     })
     resetForm()
     await refresh()
@@ -564,18 +593,16 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
   const serverList = (
     <Section
       title="Servers"
-      count={rows.length}
       actions={
         <>
           <IconButton label="Refresh servers" disabled={busy !== null} onClick={() => void refresh()}><Icon name="refresh" size={14} /></IconButton>
-          <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => guardDiscard(beginImport)}>Import…</Button>
-          <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => guardDiscard(() => void beginBrowse())}>Browse catalog</Button>
-          <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => guardDiscard(beginAdd)}><Icon name="plus" size={13} />Add server</Button>
+          <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => guardDiscard(beginImport)}>Import…</Button>
+          <Button variant="primary" size="sm" disabled={busy !== null} onClick={() => guardDiscard(beginAdd)}><Icon name="plus" size={13} />Add server</Button>
         </>
       }
     >
       {rows.length === 0 ? (
-        <EmptyState>No MCP servers yet. Add one, or import an existing Claude .mcp.json / Codex config.</EmptyState>
+        <EmptyState>No MCP servers yet. Pick one in Browse, add your own, or import a Claude .mcp.json / Codex config.</EmptyState>
       ) : (
         <ItemList label="MCP servers">
           {rows.map((row) => (
@@ -585,7 +612,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
               title={
                 <>
                   <span className="break-all">{row.name}</span>
-                  <Badge tone={STATUS_TONE[row.status]} {...(row.generation !== undefined ? { title: `generation ${row.generation}` } : {})}>{row.status}</Badge>
+                  <Badge tone={STATUS_TONE[row.status]} {...(row.generation !== undefined ? { title: `generation ${row.generation}` } : {})}>{STATUS_LABEL[row.status]}</Badge>
                   {row.breakerOpenUntil !== null ? <Badge tone="amber">breaker open</Badge> : null}
                   {row.auditFault === true ? <Badge tone="amber">audit fault</Badge> : null}
                   {row.stale === true ? <Badge tone="amber">stale file</Badge> : null}
@@ -613,11 +640,13 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
                       {busy === `oauth:${row.name}` ? 'Opening…' : row.oauth.state === 'needs_sign_in' ? 'Reconnect' : 'Connect'}
                     </Button>
                   ) : null}
-                  {row.enabled ? (
-                    <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void act(row.name, 'disable')}>{busy === `disable:${row.name}` ? 'Disabling…' : 'Disable'}</Button>
-                  ) : (
-                    <Button variant="outline" size="sm" disabled={busy !== null} onClick={() => setConfirmEnable(row.name)}>{busy === `enable:${row.name}` ? 'Enabling…' : 'Enable'}</Button>
-                  )}
+                  <InlineSwitch
+                    ariaLabel={`${row.name} enabled`}
+                    checked={row.enabled || confirmEnable === row.name}
+                    disabled={busy !== null}
+                    title={row.enabled ? 'Stop this server' : 'Start this server'}
+                    onChange={(next) => { if (next) setConfirmEnable(row.name); else if (confirmEnable === row.name) setConfirmEnable(null); else void act(row.name, 'disable') }}
+                  />
                   <IconButton label={`Edit ${row.name}`} disabled={busy !== null} onClick={() => guardDiscard(() => void beginEdit(row.name))}><Icon name="pencil" size={14} /></IconButton>
                   <RowMenu
                     label={`More actions for ${row.name}`}
@@ -670,7 +699,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
 
   return (
     <PanelBody>
-      {view === 'list' ? (
+      {view === 'list' || view === 'catalog' ? (
         <>
           <div className="flex flex-col gap-2">
             <PanelIntro>
@@ -678,6 +707,12 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
             </PanelIntro>
             <IsolationSummary />
           </div>
+          <SubTabs
+            label="MCP view"
+            value={view === 'catalog' ? 'browse' : 'installed'}
+            onChange={(next) => { if (next === 'browse') void beginBrowse(); else setBrowsing(false) }}
+            tabs={[{ value: 'installed', label: 'Installed', count: rows.length }, { value: 'browse', label: 'Browse' }]}
+          />
           {pendingSignIn !== null && !pendingSignIn.paste ? (
             <div role="status" className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted px-3 py-2 text-[13px]">
               <span className="mr-auto">Waiting for sign-in to {pendingSignIn.server}. Finish it in the tab that opened; this completes on its own.</span>
@@ -699,7 +734,9 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
               </div>
             </div>
           ) : null}
-          {serverList}
+          {view === 'list' ? serverList : (
+            <McpCatalogView host={{ serverNames: new Set(rows.map((row) => row.name)), secretNames, busy: busy !== null, install: installFromCatalog }} />
+          )}
         </>
       ) : backToList}
 
@@ -812,7 +849,7 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
             />
           ) : (
             <FormActions>
-              <span className="mr-auto text-xs text-fg-faint">{invalid ?? 'Saving does not start the server — use Enable on the list.'}</span>
+              <span className="mr-auto text-xs text-fg-faint">{invalid ?? 'Saving does not start the server — switch it on in the list.'}</span>
               <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => guardDiscard(resetForm)}>Cancel</Button>
               <Button variant="primary" size="sm" disabled={busy !== null || invalid !== null} onClick={() => { if (nameTaken) setConfirmReplace(true); else void save() }}>
                 {busy === 'save' ? 'Saving…' : editing !== null ? 'Save server' : nameTaken ? 'Replace server…' : 'Add server'}
@@ -820,15 +857,6 @@ function McpPanelContent({ workspaceId }: { readonly workspaceId: string | null 
             </FormActions>
           )}
         </Section>
-      ) : null}
-
-      {view === 'catalog' ? (
-        <>
-          <PanelIntro>
-            Pick a server to add it. Installing saves it switched off, and stores a key in Secrets if you enter one; nothing runs until you press Enable. Anyone can publish an MCP server, so install only ones you trust.
-          </PanelIntro>
-          <McpCatalogView host={{ serverNames: new Set(rows.map((row) => row.name)), secretNames, busy: busy !== null, install: installFromCatalog }} />
-        </>
       ) : null}
 
       {view === 'import' ? (

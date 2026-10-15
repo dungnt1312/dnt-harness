@@ -181,7 +181,7 @@ async function main(): Promise<void> {
   const mode = await modes.resolve(workspaceId, await modes.selectedId(workspaceId) ?? DEFAULT_MODE_ID)
   const memoryEnabled = mode.definition.sources.memoryPinned && mode.definition.sources.memoryRetrieval
   const roots = memoryEnabled ? memoryRoots(memory, scope) : []
-  const memoryAccess = mode.definition.toolExposure.includes('Write') || mode.definition.toolExposure.includes('Edit') ? 'write' as const : 'read' as const
+  const memoryAccess = mode.definition.toolExposure.some((name) => ['Write', 'Edit', 'ApplyPatch'].includes(name)) ? 'write' as const : 'read' as const
   kernel.ctx.on('tools/pre-execute', async (payload, next) => {
     if (!mode.definition.toolExposure.includes(payload.call.name)) return { kind: 'deny', reason: `tool '${payload.call.name}' is not exposed by the selected mode` }
     if (resolvePermission(mode.definition.permissionDefaults, payload.call.name) === 'deny') return { kind: 'deny', reason: `tool '${payload.call.name}' is denied by the selected mode` }

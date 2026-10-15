@@ -16,7 +16,9 @@ export const CHIP_CLASS = 'inline-flex max-w-[16rem] items-center gap-1 whitespa
  * The editor sits on the composer surface and needs room for the caret beside
  * a chip; a user bubble is already muted and its text carries its own spaces.
  */
-export const CHIP_TONE = { editor: 'mx-0.5 bg-hover', bubble: 'bg-surface' } as const
+// Editor chip: filled, so no border (it only adds weight on the dark surface); the
+// editor spans the composer, so the full name shows and truncates only at the line width.
+export const CHIP_TONE = { editor: 'mx-0.5 max-w-full border-transparent bg-hover', bubble: 'bg-surface' } as const
 
 export const CHIP_LABEL_CLASS = 'truncate'
 

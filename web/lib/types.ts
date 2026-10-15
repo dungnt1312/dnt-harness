@@ -130,6 +130,10 @@ export interface SseEvent {
   readonly stage?: 'preparing' | 'generating' | 'applying' | 'ended'
   /** compaction/job: how the summary was made. */
   readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'
+  /** compaction/job `generating`: fold chunks finished of the total. */
+  readonly progress?: { readonly done: number; readonly total: number }
+  /** compaction/job `ended`: model requests the job sent. */
+  readonly requests?: number
   /** compaction/restoration: what happened to each restored item (never the restored text). */
   readonly sections?: readonly { readonly kind: 'todo' | 'runtime' | 'skill' | 'file'; readonly name: string; readonly status: 'included' | 'truncated' | 'reference' | 'missing' | 'denied'; readonly tokens: number }[]
   /** Background-process lifecycle (process/start, process/exit). */

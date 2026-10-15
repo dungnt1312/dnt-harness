@@ -158,11 +158,12 @@ describe('generateCompaction: strict answers', () => {
   })
 })
 
-describe('generateCompaction: size cap and re-ask', () => {
+describe('generateCompaction: size cap, re-ask and condensing', () => {
   const OVER = 'x'.repeat(24_001)
+  const CUT: StreamEvent[] = [{ type: 'delta', delta: 'cut' }, { ...STOP, finishReason: 'length' }]
 
-  it('re-asks exactly once with a hard length constraint, then accepts a compliant answer', async () => {
-    const { stream, requests } = scripted([answer(OVER), answer('SHORT')])
+  it('re-asks exactly once after a length finish with a hard constraint, then accepts a compliant answer', async () => {
+    const { stream, requests } = scripted([CUT, answer('SHORT')])
     const prepared = await generateCompaction(snapshot, options({ stream }))
     expect(prepared.summary).toBe('SHORT')
     expect(requests).toHaveLength(2)
@@ -174,10 +175,61 @@ describe('generateCompaction: size cap and re-ask', () => {
     expect(requests[1]!.messages.slice(0, -1)).toEqual(requests[0]!.messages.slice(0, -1))
   })
 
-  it('refuses a second overflow and never loops or folds raw source', async () => {
-    const { stream, requests } = scripted([answer(OVER)])
-    await expect(generateCompaction(snapshot, options({ stream }))).rejects.toThrow(/24000/)
+  it('fails when the re-ask after a length finish is cut again', async () => {
+    const { stream, requests } = scripted([CUT])
+    await expect(generateCompaction(snapshot, options({ stream }))).rejects.toThrow(/completion rejected: length/)
     expect(requests).toHaveLength(2)
+  })
+
+  it('a re-ask that answers above 24000 characters is condensed like a first draft, not refused', async () => {
+    const { stream, requests } = scripted([CUT, answer('r'.repeat(30_000)), answer('CONDENSED')])
+    const prepared = await generateCompaction(snapshot, options({ stream }))
+    expect(prepared.summary).toBe('CONDENSED')
+    expect(requests).toHaveLength(3)
+    expect(requests[2]!.messages).toHaveLength(1)
+  })
+
+  it('condenses an oversized draft with one independent request and uses its output', async () => {
+    const draft = 'd'.repeat(30_000)
+    const { stream, requests } = scripted([answer(draft), answer('CONDENSED')])
+    const prepared = await generateCompaction(snapshot, options({ stream }))
+    expect(prepared.summary).toBe('CONDENSED')
+    expect(requests).toHaveLength(2)
+    const condense = requests[1]!
+    expect(condense.messages).toHaveLength(1)
+    expect(condense.messages[0]!.role).toBe('user')
+    expect(String(condense.messages[0]!.content)).toContain(draft)
+    expect(String(condense.messages[0]!.content)).not.toContain(COMPACTION_HANDOFF_MARKER)
+    expect(condense.tools).toBeUndefined()
+    expect(condense.model).toBe('m1')
+    expect(condense.providerName).toBe('p1')
+  })
+
+  it('accepts a first condense that is above the 12000 target but within 24000', async () => {
+    const { stream, requests } = scripted([answer('d'.repeat(30_000)), answer('c'.repeat(20_000))])
+    expect((await generateCompaction(snapshot, options({ stream }))).summary).toHaveLength(20_000)
+    expect(requests).toHaveLength(2)
+  })
+
+  it('condenses once more when the first condense is still over 24000, then fails if the second is too', async () => {
+    const { stream, requests } = scripted([answer('d'.repeat(30_000)), answer('c'.repeat(25_000)), answer('e'.repeat(24_001))])
+    await expect(generateCompaction(snapshot, options({ stream }))).rejects.toThrow(/24000/)
+    expect(requests).toHaveLength(3)
+    expect(requests.slice(1).every((request) => request.messages.length === 1)).toBe(true)
+  })
+
+  it('refuses a draft above 96000 characters', async () => {
+    const { stream, requests } = scripted([answer('x'.repeat(100_000))])
+    await expect(generateCompaction(snapshot, options({ stream }))).rejects.toThrow(/compaction draft exceeds 96000 characters/)
+    expect(requests).toHaveLength(1)
+  })
+
+  it('omits the model pair from the condense request when the snapshot carries none', async () => {
+    const bare: EffectiveCompactionSnapshot = { ...snapshot, request: { messages: snapshot.request.messages } }
+    const { stream, requests } = scripted([answer(OVER), answer('OK')])
+    await generateCompaction(bare, options({ stream }))
+    expect(requests[1]).not.toHaveProperty('model')
+    expect(requests[1]).not.toHaveProperty('providerName')
   })
 
   it('accepts a summary of exactly the cap', async () => {
@@ -301,6 +353,15 @@ describe('input fit', () => {
     // reported baseline + the final answer + the instruction, with the 20% margin on the unmeasured increment only
     expect(estimate.tokens).toBeGreaterThanOrEqual(50_000)
     expect(estimate.tokens).toBeLessThan(55_000)
+  })
+
+  it('sizes a reconstructed request with the builder estimate and no margin, an unmeasured capture with the margin', () => {
+    const exact = estimateSnapshotTokens(big(40_000))
+    const rebuilt = estimateSnapshotTokens(big(40_000), 'reconstructed')
+    expect(rebuilt.basis).toBe('estimated')
+    expect(rebuilt.tokens).toBeGreaterThanOrEqual(10_000)
+    expect(rebuilt.tokens).toBeLessThan(exact.tokens)
+    expect(exact.tokens).toBeGreaterThanOrEqual(Math.floor(rebuilt.tokens * 1.15))
   })
 
   it('falls back to a conservative chars/4 estimate when nothing was reported', () => {

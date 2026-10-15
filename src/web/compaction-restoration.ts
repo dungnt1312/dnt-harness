@@ -10,7 +10,7 @@
  * denied, never returned from memory.
  */
 import { promises as fs } from 'node:fs'
-import { resolveInGrants } from '../capabilities/fs/grants.ts'
+import { resolveInGrants, targetPaths } from '../capabilities/fs/grants.ts'
 import { estimateTokens } from '../harness/context/budget.ts'
 import type { SessionEvent } from '../harness/session/events.ts'
 import type { ToolExecution } from '../harness/tools/types.ts'
@@ -111,12 +111,13 @@ function fileCandidates(used: readonly Used[]): string[] {
   const seen = new Set<string>()
   const order: string[] = []
   for (const call of [...used].reverse()) {
-    if (call.name !== 'Read' && call.name !== 'Write' && call.name !== 'Edit') continue
-    const target = call.args['path']
-    if (typeof target !== 'string' || target === '' || seen.has(target)) continue
-    seen.add(target)
-    order.push(target)
-    if (order.length === RESTORATION_MAX_FILES) break
+    if (!['Read', 'Write', 'Edit', 'ApplyPatch'].includes(call.name)) continue
+    for (const { target } of targetPaths(call)) {
+      if (seen.has(target)) continue
+      seen.add(target)
+      order.push(target)
+      if (order.length === RESTORATION_MAX_FILES) return order
+    }
   }
   return order
 }

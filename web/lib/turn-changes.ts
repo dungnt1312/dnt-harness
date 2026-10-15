@@ -18,14 +18,15 @@
  * with HEAD, which mixes in every other turn, session and hand edit. The
  * card shows this projection; the Git view is a separate, labelled surface.
  *
- * Reads never change a file, a failed or refused call did not land, and a
- * recovered record says the real outcome is unknown — none of the three may
- * be counted as a change, but a non-landing outcome is kept as `uncertain`
- * so a hidden failure cannot read as "no changes". Bash effects are invisible
+ * Reads never change a file, and a failed, refused or recovered call did not
+ * land — none of the three is counted as a change, so a turn whose writes all
+ * failed renders no card at all: the failed call already shows as its own
+ * error tool row. Bash effects are invisible
  * here by design: the log does not record what a command touched. A child's
  * writes live in the child's own log.
  */
 import { editLineCounts, editOccurrences, splitLines } from './line-diff.ts'
+import { patchReceipt } from '../../src/capabilities/fs/patch.ts'
 import type { SseEvent } from './types.ts'
 
 /** One landed call on a file, as recorded — what the turn's diff is drawn from. */
@@ -36,6 +37,8 @@ export type TurnEdit =
       readonly new: string
       /** The tool's receipt: carries the numbered snippet and replaceAll count. */
       readonly output: string
+      readonly oldLine?: number
+      readonly newLine?: number
     }
   | {
       readonly kind: 'write'
@@ -73,18 +76,12 @@ export interface TurnChangeFile {
 /** The files one recorded turn changed. */
 export interface TurnChanges {
   readonly files: readonly TurnChangeFile[]
-  /**
-   * Call ids whose write did not report a landing: a failed or refused
-   * result, or a recovery record. Distinct from `files` so "nothing landed"
-   * and "the log cannot say" never look the same.
-   */
-  readonly uncertain: readonly string[]
   /** Wall-clock time of the turn's first landing mutation, if stamped. */
   readonly ts?: number
 }
 
 /** Tool names whose success means a file changed. Case-insensitive. */
-const MUTATING_TOOLS = new Set(['write', 'edit'])
+const MUTATING_TOOLS = new Set(['write', 'edit', 'applypatch'])
 
 const mutating = (name: string): boolean => MUTATING_TOOLS.has(name.toLowerCase())
 
@@ -143,7 +140,7 @@ function finish(file: FileDraft): TurnChangeFile {
  * never guesses turn membership the log did not state.
  */
 export function turnChanges(events: readonly SseEvent[]): ReadonlyMap<string, TurnChanges> {
-  type Draft = { files: Map<string, FileDraft>; uncertain: string[]; ts?: number }
+  type Draft = { files: Map<string, FileDraft>; ts?: number }
   const drafts = new Map<string, Draft>()
   // callId → the turn and target the call named; its result lands there.
   const pending = new Map<string, { turn: string; path: string; write: boolean; args: Record<string, unknown> }>()
@@ -152,7 +149,7 @@ export function turnChanges(events: readonly SseEvent[]): ReadonlyMap<string, Tu
   const draftFor = (turnId: string): Draft => {
     let draft = drafts.get(turnId)
     if (draft === undefined) {
-      draft = { files: new Map(), uncertain: [] }
+      draft = { files: new Map() }
       drafts.set(turnId, draft)
     }
     return draft
@@ -170,8 +167,8 @@ export function turnChanges(events: readonly SseEvent[]): ReadonlyMap<string, Tu
     if (event.type === 'tool/call') {
       const call = event.call
       if (call === undefined || !mutating(call.name)) continue
-      const path = call.args['path']
-      if (typeof path !== 'string' || path === '') continue
+      const path = call.name.toLowerCase() === 'applypatch' ? '' : call.args['path']
+      if (typeof path !== 'string' || (path === '' && call.name.toLowerCase() !== 'applypatch')) continue
       if (openTurnId === undefined) continue
       pending.set(call.id, { turn: openTurnId, path, write: call.name.toLowerCase() === 'write', args: call.args })
       continue
@@ -182,11 +179,27 @@ export function turnChanges(events: readonly SseEvent[]): ReadonlyMap<string, Tu
     const call = pending.get(callId)
     if (call === undefined) continue
     pending.delete(callId)
-    const draft = draftFor(call.turn)
-    if (event.ok !== true || event.recovery === true) {
-      draft.uncertain.push(callId)
+    if (call.path === '') {
+      if (event.recovery === true) continue
+      const receipt = patchReceipt(event.output)
+      if (receipt === undefined || receipt.files.length === 0) continue
+      const draft = draftFor(call.turn)
+      if (draft.ts === undefined && event.timestamp !== undefined) draft.ts = event.timestamp
+      for (const change of receipt.files) {
+        const path = change.movePath ?? change.path
+        let file = draft.files.get(path)
+        if (file === undefined) {
+          file = { path, created: change.type === 'add', overwrote: false, added: 0, removed: 0, edits: [] }
+          draft.files.set(path, file)
+        }
+        const label = change.type === 'move' ? `moved from ${change.path}` : change.type === 'delete' ? 'deleted file' : ''
+        for (const edit of change.edits) landEdit(file, { kind: 'edit', ...edit, output: label })
+      }
       continue
     }
+    // Patch receipts above also preserve known changes from partial failures.
+    if (event.ok !== true || event.recovery === true) continue
+    const draft = draftFor(call.turn)
     if (draft.ts === undefined && event.timestamp !== undefined) draft.ts = event.timestamp
     const output = event.output ?? ''
     let file = draft.files.get(call.path)
@@ -201,10 +214,9 @@ export function turnChanges(events: readonly SseEvent[]): ReadonlyMap<string, Tu
 
   const out = new Map<string, TurnChanges>()
   for (const [turnId, draft] of drafts) {
-    if (draft.files.size === 0 && draft.uncertain.length === 0) continue
+    if (draft.files.size === 0) continue
     out.set(turnId, {
       files: [...draft.files.values()].map(finish),
-      uncertain: draft.uncertain,
       ...(draft.ts !== undefined ? { ts: draft.ts } : {}),
     })
   }

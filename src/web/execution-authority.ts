@@ -53,7 +53,7 @@ export interface ExposureScope {
 export type ExposureMode = Pick<ModeDefinition, 'id' | 'name' | 'toolExposure'> & Pick<Partial<ModeDefinition>, 'permissionDefaults' | 'outOfGrant' | 'readOnlyBash' | 'riskyBash' | 'mcpExposure'>
 
 /** Tools whose exposure means a mode can change the workspace. */
-const MUTATING_BUILTINS = ['Write', 'Edit', 'Bash']
+const MUTATING_BUILTINS = ['Write', 'Edit', 'ApplyPatch', 'Bash']
 
 /**
  * The MCP ceiling a mode actually gets. A zero tool ceiling is always

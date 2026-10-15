@@ -1,7 +1,7 @@
 import type { ModeDefinition } from './types.ts'
 
 /** Tool ceiling shared by every bundled mode that can change the workspace. */
-const WORKSPACE_TOOLS: readonly string[] = ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion', 'GenerateImage', 'EditImage', 'DescribeImage', 'GenerateVideo']
+const WORKSPACE_TOOLS: readonly string[] = ['Read', 'Glob', 'Grep', 'Write', 'Edit', 'ApplyPatch', 'Bash', 'BashOutput', 'KillShell', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion', 'GenerateImage', 'EditImage', 'DescribeImage', 'GenerateVideo', 'SendPreview']
 
 /**
  * The five bundled modes, in picker order (the ZCode ladder: Plan, Ask before
@@ -35,12 +35,12 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
     // Delegation is exposed here safely: a child resolves the SAME mode, so
     // anything it spawns is read-only too — there is no write path to grant.
-    toolExposure: ['Read', 'Glob', 'Grep', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion', 'DescribeImage'],
+    toolExposure: ['Read', 'Glob', 'Grep', 'Skill', 'Agent', 'TodoWrite', 'AskUserQuestion', 'DescribeImage', 'SendPreview'],
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Skill: 'allow', Agent: 'allow',
       TodoWrite: 'allow',
       // Asking the user a question is itself the human checkpoint.
-      AskUserQuestion: 'allow', DescribeImage: 'allow',
+      AskUserQuestion: 'allow', DescribeImage: 'allow', SendPreview: 'allow',
     },
     // A property, not an id check: a duplicated Plan keeps it.
     mcpExposure: 'read-safe',
@@ -54,7 +54,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     toolExposure: WORKSPACE_TOOLS,
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow',
-      Write: 'ask', Edit: 'ask', Bash: 'ask',
+      Write: 'ask', Edit: 'ask', ApplyPatch: 'ask', Bash: 'ask',
       // Background-process control only touches processes the agent itself
       // spawned, so it stays allowed even where Bash asks.
       BashOutput: 'allow', KillShell: 'allow',
@@ -67,6 +67,8 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
       AskUserQuestion: 'allow',
       // Paid external calls: the user sees the prompt before it is spent.
       GenerateImage: 'ask', EditImage: 'ask', DescribeImage: 'allow', GenerateVideo: 'ask',
+      // Display only: nothing is spent or written (a `path` still goes through the grant check).
+      SendPreview: 'allow',
     },
     readOnlyBash: 'allow',
   },
@@ -79,6 +81,8 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     toolExposure: WORKSPACE_TOOLS,
     permissionDefaults: {
       Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow',
+      // ApplyPatch can delete files, unlike Edit/Write.
+      ApplyPatch: 'ask',
       // A child's own calls re-enter this same policy, so delegating cannot
       // widen what the conversation may already do.
       Bash: 'ask', BashOutput: 'allow', KillShell: 'allow', Skill: 'allow', Agent: 'allow',
@@ -86,6 +90,8 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
       // Asking the user a question is itself the human checkpoint.
       AskUserQuestion: 'allow',
       GenerateImage: 'ask', EditImage: 'ask', DescribeImage: 'allow', GenerateVideo: 'ask',
+      // Display only: nothing is spent or written (a `path` still goes through the grant check).
+      SendPreview: 'allow',
     },
     readOnlyBash: 'allow',
   },
@@ -97,13 +103,15 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
     toolExposure: WORKSPACE_TOOLS,
     permissionDefaults: {
-      Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow', Bash: 'allow',
+      Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow', ApplyPatch: 'allow', Bash: 'allow',
       BashOutput: 'allow', KillShell: 'allow',
       Skill: 'allow', Agent: 'allow',
       TodoWrite: 'allow',
       AskUserQuestion: 'allow',
       // Paid external calls still show their prompt first.
       GenerateImage: 'ask', EditImage: 'ask', DescribeImage: 'allow', GenerateVideo: 'ask',
+      // Display only: nothing is spent or written (a `path` still goes through the grant check).
+      SendPreview: 'allow',
       // Workspace MCP tools run like the built-ins; interactive ones still ask.
       '*': 'allow',
     },
@@ -117,13 +125,13 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
     toolExposure: WORKSPACE_TOOLS,
     permissionDefaults: {
-      Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow', Bash: 'allow',
+      Read: 'allow', Glob: 'allow', Grep: 'allow', Write: 'allow', Edit: 'allow', ApplyPatch: 'allow', Bash: 'allow',
       BashOutput: 'allow', KillShell: 'allow',
       Skill: 'allow', Agent: 'allow',
       TodoWrite: 'allow',
       // Asking the user a question is itself the human checkpoint.
       AskUserQuestion: 'allow',
-      GenerateImage: 'allow', EditImage: 'allow', DescribeImage: 'allow', GenerateVideo: 'allow',
+      GenerateImage: 'allow', EditImage: 'allow', DescribeImage: 'allow', GenerateVideo: 'allow', SendPreview: 'allow',
       // Full access means the workspace's MCP tools too: without a catch-all,
       // every mcp__* name falls to the defaultMode fallback and asks forever.
       // Host blockedTools, interactive annotations, and explicit denies still

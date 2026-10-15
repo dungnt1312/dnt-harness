@@ -8,7 +8,7 @@ const answer = (turnId: string, content: string, turnOpen = false): ViewItem =>
   ({ kind: 'assistant', content, live: false, thinking: [], thinkingLive: false, turnId, turnOpen })
 const edit = (id: string): ViewItem => ({ kind: 'tool', call: { id, name: 'Edit', args: { path: 'a.ts', old: 'a', new: 'b' } }, result: { ok: true, output: 'edited a.ts' } })
 
-const CHANGED: TurnChanges = { files: [{ path: 'a.ts', status: 'modified', lines: { added: 1, removed: 1 }, edits: [] }], uncertain: [] }
+const CHANGED: TurnChanges = { files: [{ path: 'a.ts', status: 'modified', lines: { added: 1, removed: 1 }, edits: [] }] }
 
 describe('turnChangeAnchors', () => {
   it('anchors after the turn\'s last row, even when the turn ends on a tool with no answer text', () => {

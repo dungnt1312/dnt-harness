@@ -1,4 +1,8 @@
+import { promises as fs } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { readTool } from '../../src/capabilities/fs/tools.ts'
 import { describeImageTool, type VisionApiResolution } from '../../src/harness/tools/describe-image.ts'
 import type { ModelRequest, StreamEvent } from '../../src/harness/llm/types.ts'
 
@@ -50,5 +54,22 @@ describe('DescribeImage tool', () => {
       stream: () => (async function* (): AsyncIterable<StreamEvent> { yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true } })(),
     })
     await expect(empty.execute({ attachmentId: ID }, { root: '/tmp', workspaceId: 'ws' })).rejects.toThrow(/empty description/)
+  })
+})
+
+describe('Read on an image file', () => {
+  it('returns the vision description when describeImage is wired, refuses the binary otherwise', async () => {
+    const root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-read-image-'))
+    try {
+      // Real PNGs carry NUL bytes (IHDR length), which is what makes the plain Read refuse them.
+      await fs.writeFile(path.join(root, 'shot.png'), Buffer.concat([PNG, Buffer.from([0, 0, 0, 13])]))
+      const seen: string[] = []
+      const read = readTool({ describeImage: async (image) => { seen.push(image.mediaType); return 'A dark UI.' } })
+      expect(await read.execute({ path: 'shot.png' }, { root })).toBe('[image shot.png (image/png), described by the vision model]\nA dark UI.')
+      expect(seen).toEqual(['image/png'])
+      await expect(readTool().execute({ path: 'shot.png' }, { root })).rejects.toThrow(/binary/)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
   })
 })

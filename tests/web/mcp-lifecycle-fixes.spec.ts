@@ -71,13 +71,14 @@ describe('MCP lifecycle audit regressions', () => {
     const ctx = await boot()
     expect((await ctx.api('/mcp/slow', ctx.stdio({ INIT_DELAY_MS: '600' }))).status).toBe(201)
     expect((await ctx.api('/mcp/slow/enable')).status).toBe(200)
-    // A first save drops the live client, so the next turn has to connect again.
-    expect((await ctx.api('/mcp/other', ctx.stdio())).status).toBe(201)
+    // A save of the server drops its live client, so the next turn has to connect again.
+    const stored = await (await ctx.api('/mcp/slow', undefined, 'GET')).json() as Record<string, unknown>
+    expect((await ctx.api('/mcp/slow', { ...stored, timeoutMs: 20_000 })).status).toBe(201)
     expect((await ctx.row('slow'))?.status).toBe('idle')
-    // That connect is IN FLIGHT (slow initialize) when a second, unrelated save fences the workspace.
+    // That connect is IN FLIGHT (slow initialize) when a secret write fences the whole workspace.
     const turn = ctx.turn()
     await expect.poll(async () => (await ctx.row('slow'))?.status, { timeout: 5_000, interval: 25 }).toBe('connecting')
-    expect((await ctx.api('/mcp/third', ctx.stdio())).status).toBe(201)
+    expect((await ctx.api('/secrets/UNRELATED', { value: 'x' }, 'PUT')).ok).toBe(true)
     await turn
     // A later turn must bring `slow` up without a manual Enable/Reconnect.
     await ctx.turn()
@@ -99,10 +100,24 @@ describe('MCP lifecycle audit regressions', () => {
     const ctx = await boot()
     expect((await ctx.api('/mcp/quiet', ctx.stdio())).status).toBe(201)
     expect((await ctx.api('/mcp/quiet/enable')).status).toBe(200)
-    // Any save fences the workspace and drops every live client.
-    expect((await ctx.api('/mcp/other', ctx.stdio())).status).toBe(201)
+    // Saving the server itself fences it and drops its live client.
+    const stored = await (await ctx.api('/mcp/quiet', undefined, 'GET')).json() as Record<string, unknown>
+    expect((await ctx.api('/mcp/quiet', { ...stored, timeoutMs: 20_000 })).status).toBe(201)
     expect((await ctx.row('quiet'))?.status).toBe('idle')
   })
+
+  it('changing one server leaves the other running servers untouched', async () => {
+    const ctx = await boot()
+    for (const name of ['a', 'b']) {
+      expect((await ctx.api(`/mcp/${name}`, ctx.stdio())).status).toBe(201)
+      expect((await ctx.api(`/mcp/${name}/enable`)).status).toBe(200)
+    }
+    expect((await ctx.row('a'))?.status).toBe('ready')
+    expect((await ctx.api('/mcp/b/disable')).status).toBe(200)
+    expect((await ctx.api('/mcp/other', ctx.stdio())).status).toBe(201)
+    expect((await ctx.row('a'))?.status).toBe('ready')
+    expect((await ctx.row('b'))?.status).toBe('disabled')
+  }, 30_000)
 
   it('#2 a server that fails to come back after a fence stops advertising its tools', async () => {
     const requests: ModelRequest[] = []

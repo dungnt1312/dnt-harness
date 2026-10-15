@@ -36,7 +36,7 @@ function boot(): { kernel: Kernel; guard: ReturnType<typeof attachPathScopeGuard
   kernel.ctx.tools.setAuthorityRetirer((executionId) => { guard.retire(executionId) })
   kernel.ctx.tools.setApprovedPathResolver(async (call, allowed, exec) => {
     const match = guard.take(exec?.executionId, call, allowed)
-    return match === undefined ? undefined : [{ path: match.path, intent: match.intent }]
+    return match === undefined ? undefined : match.paths ?? [{ path: match.path, intent: match.intent }]
   })
   return { kernel, guard }
 }
@@ -44,6 +44,17 @@ function boot(): { kernel: Kernel; guard: ReturnType<typeof attachPathScopeGuard
 const read = (target: string): ToolCall => ({ id: 'call-1', name: 'Read', args: { path: target } })
 
 describe('path-scope guard', () => {
+  it('binds a patch approval to every outside path, not just the last one', async () => {
+    const { kernel, guard } = boot()
+    const a = path.join(outside, 'patch-a')
+    const b = path.join(outside, 'patch-b')
+    const patch_text = `*** Begin Patch\n*** Add File: ${a}\n+A\n*** Add File: ${b}\n+B\n*** End Patch`
+    const prepared = await kernel.ctx.tools.prepare({ id: 'patch', name: 'ApplyPatch', args: { patch_text } })
+    expect(guard.get(prepared.executionId, prepared.call)?.paths).toEqual([{ path: a, intent: 'write' }, { path: b, intent: 'write' }])
+    expect((await prepared.execute()).ok).toBe(true)
+    expect(await fs.readFile(a, 'utf8')).toBe('A\n')
+    expect(await fs.readFile(b, 'utf8')).toBe('B\n')
+  })
   it('classifies the path a prepended rewrite hook produced, not the original', async () => {
     const { kernel, guard } = boot()
     let seen: ToolCall | undefined
@@ -86,11 +97,11 @@ describe('path-scope guard', () => {
     const { kernel, guard } = boot()
     let release: () => void = () => {}
     const gate = new Promise<void>((resolve) => { release = resolve })
-    const parked: string[] = []
+    const parked = new Map<string, string>()
     kernel.ctx.on('tools/pre-execute', async (payload, next) => {
-      // Park both calls mid-authorization so both matches coexist.
-      parked.push(payload.exec.executionId ?? '')
-      if (parked.length === 2) release()
+      // Filesystem classification can finish in either order.
+      parked.set(String(payload.call.args['path']), payload.exec.executionId ?? '')
+      if (parked.size === 2) release()
       await gate
       return next()
     })
@@ -100,7 +111,8 @@ describe('path-scope guard', () => {
     const first = kernel.ctx.tools.prepare(read(path.join(outside, 'x.txt')))
     const second = kernel.ctx.tools.prepare(read(other))
     await gate
-    const [idA, idB] = parked
+    const idA = parked.get(path.join(outside, 'x.txt'))
+    const idB = parked.get(other)
     expect(idA).not.toBe(idB)
     expect(guard.get(idA, read(path.join(outside, 'x.txt')))?.path).toBe(path.join(outside, 'x.txt'))
     expect(guard.get(idB, read(other))?.path).toBe(other)

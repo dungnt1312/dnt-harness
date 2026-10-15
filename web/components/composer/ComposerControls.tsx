@@ -2,7 +2,7 @@ import Icon, { type IconName } from '../common/Icon.tsx'
 import { Spinner } from '../common/Spinner.tsx'
 import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import { cn } from '../../lib/cn.ts'
-import { composerChipClass } from './composer-chip.ts'
+import { composerChipClass, composerFocusClass } from './composer-chip.ts'
 
 const staticChipClass = cn(composerChipClass, 'hover:bg-transparent hover:text-fg-muted')
 
@@ -103,7 +103,7 @@ export function AttachMenu({ uploading, onUpload, onMention }: {
       side="top"
       align="start"
       compact
-      triggerClassName="flex size-8 shrink-0 items-center justify-center rounded-full text-fg-muted transition-colors hover:bg-hover hover:text-fg disabled:pointer-events-none disabled:opacity-40 [@media(pointer:coarse)]:size-9"
+      triggerClassName={cn('flex size-8 shrink-0 items-center justify-center rounded-full text-fg-muted transition-colors hover:bg-hover hover:text-fg disabled:pointer-events-none disabled:opacity-40 [@media(pointer:coarse)]:size-9', composerFocusClass)}
       trigger={() => (uploading ? <Spinner size={14} /> : <Icon name="plus" size={18} />)}
     >
       {(close) => (

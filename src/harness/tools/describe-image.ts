@@ -32,6 +32,39 @@ const SYSTEM = [
 ].join(' ')
 
 /**
+ * Send one image (+ optional question) to the configured vision model and
+ * return its text. Shared by `DescribeImage` and `Read` on image files.
+ */
+export async function describeImageBytes(
+  options: Pick<DescribeImageOptions, 'resolve' | 'stream'>,
+  image: StoredImage,
+  question: string,
+  exec: ToolExecution,
+): Promise<{ readonly description: string; readonly model: string }> {
+  const resolution = options.resolve()
+  if (!resolution.ok) throw new Error(resolution.reason)
+  const user: ModelMessage = {
+    role: 'user',
+    content: [
+      { type: 'image', mediaType: image.mediaType, base64: image.bytes.toString('base64') },
+      { type: 'text', text: question === '' ? 'Describe this image for a coding agent.' : `Question about this image: ${question}` },
+    ],
+  }
+  const request: ModelRequest = {
+    providerName: resolution.config.provider,
+    model: resolution.config.model,
+    messages: [{ role: 'system', content: SYSTEM }, user],
+  }
+  let description = ''
+  for await (const event of options.stream(request, exec)) {
+    if (event.type === 'delta' && event.thinking !== true) description += event.delta
+  }
+  description = description.trim()
+  if (description === '') throw new Error('vision model returned an empty description')
+  return { description, model: resolution.config.model }
+}
+
+/**
  * `DescribeImage`: stored attachment + optional question → a dedicated
  * vision-capable chat model → text. It never reads arbitrary filesystem paths;
  * workspace/project images must first enter the workspace AttachmentStore.
@@ -65,26 +98,8 @@ export function describeImageTool(options: DescribeImageOptions): ToolDefinition
       if (!resolution.ok) throw new Error(resolution.reason)
       const source = await options.read(workspaceId, attachmentId)
       if (!source.mediaType.startsWith('image/')) throw new Error(`attachment '${attachmentId}' is not an image`)
-
-      const user: ModelMessage = {
-        role: 'user',
-        content: [
-          { type: 'image', mediaType: source.mediaType, base64: source.bytes.toString('base64') },
-          { type: 'text', text: question === '' ? 'Describe this image for a coding agent.' : `Question about this image: ${question}` },
-        ],
-      }
-      const request: ModelRequest = {
-        providerName: resolution.config.provider,
-        model: resolution.config.model,
-        messages: [{ role: 'system', content: SYSTEM }, user],
-      }
-      let description = ''
-      for await (const event of options.stream(request, exec)) {
-        if (event.type === 'delta' && event.thinking !== true) description += event.delta
-      }
-      description = description.trim()
-      if (description === '') throw new Error('vision model returned an empty description')
-      return JSON.stringify({ description, model: resolution.config.model, attachmentId })
+      const { description, model } = await describeImageBytes({ resolve: () => resolution, stream: options.stream }, source, question, exec)
+      return JSON.stringify({ description, model, attachmentId })
     },
   }
 }

@@ -7,6 +7,10 @@ import { Menu, menuItemClass } from '../ui/Menu.tsx'
 import { Modal } from '../ui/Modal.tsx'
 import { useToast } from '../common/Toast.tsx'
 import { streamCommitMessage, type GitChange, type GitOperationDone, type GitOperationInput, type GitStatusReport } from '../../lib/api.ts'
+import { Spinner } from '../common/Spinner.tsx'
+import { cn } from '../../lib/cn.ts'
+import { GIT_BUTTON, GIT_BUTTON_LEFT, GIT_CHEVRON, GIT_ICON } from './git-controls.ts'
+import { readCommitCollapsed, writeCommitCollapsed } from './git-view.ts'
 import { changeCounts, commitButton, commitButtonTitle, suggestCommitMessage } from './git-panel-model.ts'
 import { failureText } from './use-git-operation.tsx'
 import type { GitRun } from './use-git-operation.tsx'
@@ -58,6 +62,7 @@ export function GitCommitArea({ workspaceId, projectId, report, changes, run, en
   const [generating, setGenerating] = useState(false)
   const generation = useRef<AbortController | null>(null)
   const [expanded, setExpanded] = useState(false)
+  const [collapsed, setCollapsed] = useState(readCommitCollapsed)
   // Leaving mid-generation cancels the model request on the server.
   useEffect(() => () => generation.current?.abort(), [])
 
@@ -227,10 +232,24 @@ export function GitCommitArea({ workspaceId, projectId, report, changes, run, en
 
   return (
     <div role="group" aria-label="Commit" className="shrink-0 border-t border-line">
+      <button
+        type="button"
+        aria-expanded={!collapsed}
+        title={collapsed ? 'Show commit editor' : 'Hide commit editor'}
+        onClick={() => { writeCommitCollapsed(!collapsed); setCollapsed(!collapsed) }}
+        className="flex h-7 w-full items-center gap-1.5 px-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-fg-faint hover:text-fg"
+      >
+        <Icon name="chevron" size={12} className={cn('shrink-0 transition-transform', collapsed && '-rotate-90')} />
+        <span>Commit message</span>
+        {/* A folded editor still says it holds a draft. */}
+        {collapsed && text.trim() !== '' ? <span role="img" aria-label="Draft message" className="size-1.5 shrink-0 rounded-full bg-warn" /> : null}
+        {collapsed && (generating || busy) ? <Spinner size={11} /> : null}
+      </button>
+      {!collapsed ? (<>
       {amend ? (
         <div className="flex items-center justify-between gap-1.5 border-b border-line px-2 py-1.5">
           <span className="min-w-0 truncate text-xs text-fg-muted">This will update your most recent commit.</span>
-          <Button size="sm" variant="outline" className="h-7 px-2.5" disabled={busy} onClick={() => setAmendPending(false)}>Cancel</Button>
+          <Button size="sm" variant="outline" className={GIT_BUTTON} disabled={busy} onClick={() => setAmendPending(false)}>Cancel</Button>
         </div>
       ) : null}
       <div className="p-2 pb-1.5">
@@ -248,12 +267,13 @@ export function GitCommitArea({ workspaceId, projectId, report, changes, run, en
       </div>
       <div className="flex items-center gap-1 px-2 pb-2">
         {generating ? (
-          <IconButton label="Cancel Commit Message Generation" onClick={() => generation.current?.abort()}>
+          <IconButton label="Cancel Commit Message Generation" className={GIT_ICON} onClick={() => generation.current?.abort()}>
             <Icon name="stop" size={14} />
           </IconButton>
         ) : (
           <IconButton
             label={counts.hasStaged || counts.hasTracked ? 'Generate Commit Message' : 'No Changes to Commit'}
+            className={GIT_ICON}
             // Zed `can_commit`: nothing to commit, or conflicts still unstaged.
             disabled={(!counts.hasStaged && !counts.hasTracked) || counts.hasUnstagedConflicts}
             onClick={generate}
@@ -262,12 +282,12 @@ export function GitCommitArea({ workspaceId, projectId, report, changes, run, en
           </IconButton>
         )}
         <span className="flex-1" />
-        <IconButton label="Expand Commit Editor" onClick={() => setExpanded(true)}><Icon name="maximize" size={14} /></IconButton>
+        <IconButton label="Expand Commit Editor" className={GIT_ICON} onClick={() => setExpanded(true)}><Icon name="maximize" size={14} /></IconButton>
         <span className="inline-flex" title={tooltip}>
           <Button
             size="sm"
             variant="outline"
-            className="rounded-r-none border-r-0 px-3"
+            className={GIT_BUTTON_LEFT}
             disabled={!button.enabled}
             title={tooltip}
             onClick={() => void commit()}
@@ -279,7 +299,7 @@ export function GitCommitArea({ workspaceId, projectId, report, changes, run, en
           label="Commit options"
           side="top"
           align="end"
-          triggerClassName="inline-flex h-8 w-7 shrink-0 items-center justify-center rounded-l-none rounded-r-full border border-line-strong text-fg hover:bg-hover"
+          triggerClassName={GIT_CHEVRON}
           trigger={() => <Icon name="chevron" size={12} />}
         >
           {(close) => (
@@ -295,12 +315,13 @@ export function GitCommitArea({ workspaceId, projectId, report, changes, run, en
         <div data-last-commit className="flex items-center justify-between gap-1.5 border-t border-line px-2 py-0.5">
           <span className="min-w-0 flex-1 truncate px-1 text-xs text-fg-faint" title={head.message || head.subject}>{head.subject}</span>
           {head.hasParent ? (
-            <IconButton label="Uncommit" title={'Uncommit\ngit reset HEAD^ --soft'} disabled={busy} onClick={() => void uncommit()}>
+            <IconButton label="Uncommit" className={GIT_ICON} title={'Uncommit\ngit reset HEAD^ --soft'} disabled={busy} onClick={() => void uncommit()}>
               <Icon name="undo" size={14} />
             </IconButton>
           ) : null}
         </div>
       ) : null}
+      </>) : null}
       <Modal open={expanded} onDismiss={() => setExpanded(false)} label="Commit message" width="lg">
         <textarea
           aria-label="Commit message (expanded)"
@@ -324,7 +345,7 @@ export function GitCommitArea({ workspaceId, projectId, report, changes, run, en
             <Button
               size="sm"
               variant="outline"
-              className="rounded-r-none border-r-0 px-3"
+              className={GIT_BUTTON_LEFT}
               disabled={!button.enabled}
               title={tooltip}
               onClick={() => { setExpanded(false); void commit() }}
@@ -336,7 +357,7 @@ export function GitCommitArea({ workspaceId, projectId, report, changes, run, en
             label="Commit options"
             side="top"
             align="end"
-            triggerClassName="inline-flex h-8 w-7 shrink-0 items-center justify-center rounded-l-none rounded-r-full border border-line-strong text-fg hover:bg-hover"
+            triggerClassName={GIT_CHEVRON}
             trigger={() => <Icon name="chevron" size={12} />}
           >
             {(close) => (

@@ -85,13 +85,14 @@ export function ApprovalBar({
         const target = toolFacts(call).fullTarget
         const expired = expiresAt !== undefined && expiresAt - now <= 0
         return (
-          <article key={approvalId} aria-busy={submittingRow} className="flex flex-col gap-3 rounded-2xl border border-line bg-surface p-4 shadow-composer">
-            <div className="flex items-start gap-3">
-              <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-warn-soft text-warn"><Icon name="shield" size={16} /></span>
-              <div className="flex min-w-0 flex-1 flex-col gap-2">
-                <div className="min-w-0">
-                  <p className="m-0 text-sm">Allow <strong className="font-semibold">{call.name}</strong>?</p>
-                  <p className="m-0 truncate text-xs text-fg-faint" title={scope}>
+          <article key={approvalId} aria-busy={submittingRow} className="flex flex-col gap-2 rounded-xl border border-line bg-surface p-3 shadow-composer">
+            <div className="flex items-start gap-2.5">
+              <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-warn-soft text-warn"><Icon name="shield" size={14} /></span>
+              <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+                {/* Title and context share one line: two stacked lines made the card tall for one fact. */}
+                <p className="m-0 flex min-w-0 items-baseline gap-x-2 text-sm">
+                  <span className="shrink-0">Allow <strong className="font-semibold">{call.name}</strong>?</span>
+                  <span className="min-w-0 truncate text-xs text-fg-faint" title={scope}>
                     {scope === NO_PROJECT ? scope : <>in <span className="font-medium text-fg-muted">{shortFolder(scope, 1)}</span></>}
                     {childSessionId !== undefined ? (
                       <span title={childSessionId}>
@@ -99,8 +100,8 @@ export function ApprovalBar({
                       </span>
                     ) : null}
                     {interactive === true ? ' · requires a decision every time' : null}
-                  </p>
-                </div>
+                  </span>
+                </p>
                 {/* A prose argument (multi-line command, file content) opens in the
                     details below, so the one-line target would only repeat it. */}
                 {target !== '' && !(typeof call.args['command'] === 'string' && hasProseArgs({ command: call.args['command'] })) ? (
@@ -117,23 +118,30 @@ export function ApprovalBar({
                   </p>
                 ) : null}
                 {/* A multi-line command or a file's new content cannot be judged from
-                    the one-line target above, so those requests open already showing
-                    it — the decision is made on the text, not on its first line. */}
-                <details className="text-xs text-fg-muted" open={hasProseArgs(call.args)}>
-                  <summary className="cursor-pointer select-none" title={call.id}>Details</summary>
-                  <div className="mt-2 flex flex-col gap-2">
-                    <ToolArguments call={call} limit={ARGS_DISPLAY_LIMIT} />
-                    <p className="m-0 text-fg-faint">
-                      Allow once and Deny apply to this request only, not the project or future requests. Standing permission is set by the workspace&apos;s mode in Settings → Modes.
-                      {sessionGrant !== undefined ? <>{' '}Allowing the folder for this session lets this conversation use it without asking again.</> : null}
-                      {' '}Arguments may target systems outside the project; server policy still applies. Call <code>{call.id}</code>.
-                    </p>
+                    the one-line target, so it is previewed (a few lines, scrollable)
+                    rather than hidden. The raw JSON is folded: the target already
+                    names what it holds. */}
+                {hasProseArgs(call.args) ? (
+                  <div className="flex flex-col gap-1.5 [&_pre]:max-h-28">
+                    <ToolArguments call={call} limit={ARGS_DISPLAY_LIMIT} part="prose" />
                   </div>
-                </details>
+                ) : (
+                  <details className="text-xs text-fg-muted">
+                    <summary className="cursor-pointer select-none" title={call.id}>Details</summary>
+                    <div className="mt-1.5 flex flex-col gap-2 [&_pre]:max-h-40">
+                      <ToolArguments call={call} limit={ARGS_DISPLAY_LIMIT} />
+                    </div>
+                  </details>
+                )}
               </div>
             </div>
             {errors[approvalId] ? <ErrorNotice raw={errors[approvalId]!} announce={false} /> : null}
             <div className="flex flex-wrap items-center justify-end gap-2">
+              {/* The note is the same on every card, so it is announced but not drawn. */}
+              <span className="sr-only">
+                Allow once and Deny apply to this request only. Standing permission is set in Settings → Modes.
+                {sessionGrant !== undefined ? ' Allowing the folder for this session lets this conversation use it without asking again.' : ''}
+              </span>
               {expiresAt !== undefined ? (
                 <span className="mr-auto flex items-center gap-1 text-xs text-fg-faint" title={expired ? undefined : 'An undecided request is cancelled when this runs out'}>
                   <Icon name="clock" size={12} />

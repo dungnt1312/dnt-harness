@@ -158,6 +158,8 @@ export type SummarizerInput = {
   readonly signal?: AbortSignal
   /** Prior canonical checkpoint summary seeding an incremental fold. */
   readonly seed?: { readonly summary: string; readonly coversSeq: number }
+  /** Fold progress: `done` of `total` chunk summaries finished. */
+  readonly onProgress?: (done: number, total: number) => void
 }
 export type Summarizer = (input: SummarizerInput) => Promise<string>
 
@@ -210,6 +212,8 @@ export interface CompactionOptions {
    */
   readonly measure?: (checkpoint: { readonly summary: string; readonly coversSeq: number }) => CompactionMeasurement | undefined | Promise<CompactionMeasurement | undefined>
   readonly validate?: () => Promise<void>
+  /** Forwarded to the summarizer: fold progress, `done` of `total` chunk summaries. */
+  readonly onProgress?: (done: number, total: number) => void
 }
 const inFlight = new Set<string>()
 
@@ -274,7 +278,8 @@ export async function compactSession(session: Session, checkpoints: CheckpointSt
       throw new Error(`compaction source (${text.length} characters) exceeds or has invalid maxChars (${options.maxChars})`)
     }
     const summary = await summarizer({ text, ...(options.model !== undefined ? { model: options.model } : {}), ...(options.signal !== undefined ? { signal: options.signal } : {}),
-      ...(options.seed !== undefined ? { seed: { summary: options.seed.summary, coversSeq: options.seed.coversSeq } } : {}) })
+      ...(options.seed !== undefined ? { seed: { summary: options.seed.summary, coversSeq: options.seed.coversSeq } } : {}),
+      ...(options.onProgress !== undefined ? { onProgress: options.onProgress } : {}) })
     check()
     if (!validSummary(summary)) throw new Error('compaction summary must be nonempty and at most 24000 characters')
     if (session.events.some(event => event.seq > lastEnd && event.type === 'turn/start')) throw new Error('compaction boundary changed during summary')
@@ -445,13 +450,47 @@ export async function adoptPreparedCompaction(session: Session, checkpoints: Che
   } finally { inFlight.delete(session.id) }
 }
 
+/**
+ * A tool argument value longer than this is shortened for the summarizer. It is a file body the
+ * agent already wrote, a heredoc script or a pasted blob: bulk, not conversation.
+ */
+export const SUMMARY_ARG_CHARS = 600
+/** Characters of a long argument that are kept, so the reader still sees what it was. */
+const SUMMARY_ARG_HEAD_CHARS = 200
+/** A tool result longer than this keeps its head and its tail; the middle is measured and dropped. */
+export const SUMMARY_RESULT_CHARS = 1_500
+
+/** Bulk is replaced by a measured note, never silently: the summarizer is told what it did not read. */
+function shortenArg(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return value.length <= SUMMARY_ARG_CHARS ? value : `${value.slice(0, SUMMARY_ARG_HEAD_CHARS)}… <${value.length} chars omitted>`
+  }
+  if (Array.isArray(value)) return value.map(shortenArg)
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, shortenArg(entry)]))
+  }
+  return value
+}
+
+function shortenResult(output: string): string {
+  if (output.length <= SUMMARY_RESULT_CHARS) return output
+  const half = SUMMARY_RESULT_CHARS / 2
+  return `${output.slice(0, half)}\n… <${output.length - SUMMARY_RESULT_CHARS} chars omitted> …\n${output.slice(-half)}`
+}
+
+/**
+ * The text a summarizer reads. What the user typed and what the assistant answered are kept whole;
+ * tool arguments and tool results are the bulk of a long session (file bodies, scripts, command
+ * output) and are shortened with a measured note, so the summary describes the work, not the files.
+ */
 export function projectForSummary(events: readonly SessionEvent[], throughSeq: number, attachments?: AttachmentLookup, fromSeq = 0): string {
   const lines: string[] = []
   for (const { message } of deriveDatedMessages(events.filter(event => event.seq <= throughSeq && event.seq > fromSeq), 0, attachments)) {
-    const content = typeof message.content === 'string' ? message.content : message.content.map(part =>
+    const raw = typeof message.content === 'string' ? message.content : message.content.map(part =>
       part.type === 'text' ? part.text : `[image attachment "${part.name ?? 'image'}" (${part.mediaType}); pixels not inspected or summarized]`).join('\n')
+    const content = message.role === 'tool' ? shortenResult(raw) : raw
     if (content !== '') lines.push(`${message.role}: ${content}`)
-    for (const call of message.toolCalls ?? []) lines.push(`  [tool call] ${call.name}(${JSON.stringify(call.args)})`)
+    for (const call of message.toolCalls ?? []) lines.push(`  [tool call] ${call.name}(${JSON.stringify(shortenArg(call.args))})`)
   }
   return lines.join('\n')
 }

@@ -406,7 +406,7 @@ interface ApprovalOptions {
 interface ApprovalLifecycle {
   approvalId: string      // the id in the log and the id a bridge answers with
   done: Promise<void>     // settled without an answer: retire the question
-  expiresAt: number       // epoch ms; transports show the decision window
+  expiresAt?: number      // epoch ms; transports show the decision window. Absent when expiryMs is 0 (no deadline)
 }
 ```
 
@@ -449,7 +449,8 @@ for another workspace. `requestDetails(call)` adds facts (such as the
 out-of-grant warning) to the durable `approval/request`.
 
 An approval is bound to the exact call it names: it carries an expiry
-(undecided requests settle as `expired` — never an implicit approval), and a
+(undecided requests settle as `expired` — never an implicit approval; a host
+may set `approvalExpiryMs: 0` to wait forever instead), and a
 stop/cancel or a policy change settles it as `cancelled`/`invalidated` before
 it can be answered. Every settlement is a durable `approval/decision` event,
 and late answers to a settled approval are refused rather than replayed.
@@ -702,10 +703,15 @@ at most 24,000 characters. An invalid seed (unproven boundary, empty or
 oversized summary) fails closed rather than silently folding from scratch.
 A transient provider failure re-asks the same chunk with agent-loop retry
 policy (`stepRetries`, exponential backoff); each attempt's partial output is
-discarded, so a retry never duplicates text. When one chunk's answer would
-exceed the cap, it is re-asked once with an explicit hard-length constraint;
-still-oversized, failed, empty output prevents publication
-of a new checkpoint rather than silently claiming partial coverage. An explicit
+discarded, so a retry never duplicates text. If a chunk's answer exceeds 24,000
+characters, the legacy fold collects the complete draft up to 96,000 characters
+and requires a settled stop before attempting repair. It compresses that draft
+rather than sending the original raw chunk again, targeting 12,000 characters;
+if still oversized, one final draft compression targets 8,000. Repair does not
+repeat the exhaustive nine-heading prompt. The final accepted summary remains
+capped at 24,000 characters: oversized, incomplete, failed or empty output
+prevents publication rather than silently clipping or claiming partial coverage.
+This repair applies to the legacy fold only, not the effective generator. An explicit
 `maxChars` source cap rejects insufficient bounds instead of slicing the source.
 With no model pair, the extractive fallback preserves the exact source only if
 it fits within 24,000 characters, otherwise it fails explicitly.
@@ -747,11 +753,11 @@ the UI's inspector renders as-is.
 
 ### Effective compaction (`compactionEffectiveEnabled`, default off)
 
-The fold above sends the whole log as text, in 200 000-character chunks, one
-request after another. On sessions whose log is mostly tool output that was
-measured at 7–9 sequential requests and 436–768 s per compaction with no cache
-hit. Effective compaction replaces it, behind a rollout switch, with **one**
-ordinary request over what the model last saw. With the switch off nothing below
+The fold above sends the whole log as text, in 200 000-character chunks (one
+request after another, before the parallel fold below). On sessions whose log is
+mostly tool output that was measured at 7–9 sequential requests and 436–768 s per
+compaction with no cache hit. Effective compaction replaces it, behind a rollout
+switch, with **one** ordinary request over what the model last saw. With the switch off nothing below
 runs and the behavior above is unchanged.
 
 - **Source.** The exact request of the last completed turn is captured from the
@@ -769,9 +775,18 @@ runs and the behavior above is unchanged.
 - **One request.** `compaction-generator.ts` appends the final answer and a handoff
   instruction (`[compaction-handoff]`) to that exact request, with a hard output cap
   (`compactionOutputTokens`, 8 000) and one deadline (`compactionDeadlineMs`, 180 s)
-  covering the whole operation including a single re-ask when the answer is too
-  long. A request that cannot fit its own answer is refused before any hook or model
-  call (`compaction-input-too-large`).
+  covering the whole operation. A complete draft of up to 96 000 characters is
+  accepted; one over 24 000 is condensed by up to two independent requests (targets
+  12 000, then 8 000 characters; `condenseDraft` in `compaction-condense.ts`, shared
+  with the fold), and a `length` finish gets a single re-ask, read and condensed the
+  same way. The request is always addressed to the session's current provider, model
+  and thinking level. A transient provider error before any output is retried with
+  the fold's bounded backoff (`stepRetries`), one logical request on the session. A
+  request that cannot fit its own answer is not sent: the host folds the transcript
+  instead (`path: "recovery"`). The size is the provider-reported input of the captured
+  request plus a 20% margin on what is appended; an unmeasured capture is estimated at
+  chars/4 + 20%, and a request rebuilt from the log with the context builder's own
+  estimate (no margin — the builder already fitted that request to the budget).
 - **Adoption.** `adoptPreparedCompaction` commits the summary under the same
   per-session transaction as the fold, but its cutoff may be *older* than the newest
   closed turn: turns that closed after the cutoff stay verbatim. The proof
@@ -779,20 +794,41 @@ runs and the behavior above is unchanged.
   events, so `recoverCanonicalCheckpoint` verifies an adoption from the log alone and
   still rejects a `turn/start` inside the transaction. A candidate built on a
   different checkpoint than the one that stands is refused.
-- **No silent slow path.** When there is no usable snapshot (an older host never
-  captured one, the sidecar is gone), `POST …/compact` answers `409` with
-  `{recovery: {cutoff, sourceDigest, estimatedCalls}}` and runs nothing. Echoing that
-  fingerprint back in the body runs the raw fold (`path: "recovery"`); a source that
-  changed since is refused. An automatic compaction never runs a recovery. The UI
-  shows a confirmation with the call count; Cancel does not confirm.
+- **`/compact` always runs; the user never picks a path.** The host chooses, in order:
+  a precomputed candidate (no model call), the newest captured snapshot (one request),
+  or — when none is usable (an older host never captured one, the sidecar is gone, the
+  last turn was stopped, the mode or grants changed since) — a snapshot **rebuilt from
+  the committed log** (`path: "reconstructed"`, one request). The rebuild runs the
+  ordinary request assembly with `sideEffects: false` (`reconstructFromLog` in
+  `server.ts`); its cutoff is the newest clean `completed` turn after the standing
+  checkpoint (`reconstructionCutoff`), so later turns, e.g. a stopped one, stay
+  verbatim. Only if that fails (a dropped uncovered turn, an unsafe loss, a budget
+  error) does the host fall back to the transcript fold (`path: "recovery"`).
+  The fold summarizes more than one chunk in parallel (at most
+  `max(1, min(4, provider admission capacity − 1))` at once), then merges once — in
+  consecutive groups if the summaries exceed 200 000 characters. At parallelism 1
+  (capacity ≤ 2) it keeps the sequential accumulate path instead — each chunk carries
+  the summary so far in `<earlier-summary>`, no merge — so it never costs a request
+  more than before. The first failing
+  chunk aborts its siblings. Parallel chunks share provider-session ownership only
+  through the per-fold `shareSessionOwnership` scope on `StreamOptions`
+  (`llm/service.ts`); every other request stays exclusive. Manual and automatic compactions
+  take the same path. A provider, model or thinking-level switch does not invalidate a
+  snapshot: the host sends it, unchanged, to the model selected now (only the prompt
+  cache misses). A request body (an older client's `{recovery: …}` echo) is ignored.
 - **Progress and Stop.** Every compaction — the old fold included — writes durable
   `compaction/job` events (`preparing → generating → applying → ended`), so every client
   and a reload see where it is; `ended` carries `outcome` (`compacted`, `noop`,
-  `needs-recovery`, `cancelled`, `failed`), the `path`, and a failure's reason.
+  `cancelled`, `failed`; `needs-recovery` appears only in logs of older hosts), the
+  `path`, and a failure's reason. `generating` may carry `progress {done, total}`
+  (fold chunks summarized) and `ended` carries `requests` and `usage {input, cached,
+  output}` totals for the job, whatever the outcome; the row shows "Summarizing i/n"
+  (only when n > 1; a single request reads "Summarizing") and "N requests".
   `generating` is reported just before the model is asked and `applying` just before the
-  adoption, so a hook block, a no-op or a refused request reports neither. They bracket
-  the canonical `compaction/start`/`end` pair and are not the authority for a
-  checkpoint. The transcript shows one row per operation with the stage and a live
+  adoption, so a hook block, a no-op or a refused request reports neither. On the
+  one-request path they fall outside the canonical `compaction/start`/`end` pair; on
+  the fold, `generating` progress events fall between `compaction/start` and
+  `compaction/end`. They are telemetry, never the authority for a checkpoint. The transcript shows one row per operation with the stage and a live
   elapsed time. `POST …/stop` (and delete, and shutdown) aborts the running compaction,
   including the in-flight model request, writes no checkpoint, and the compact request
   answers `409 {cancelled: true}`; the UI says "cancelled", not "failed". While a

@@ -226,3 +226,19 @@ describe('committing while a message is generating (final review web I1)', () =>
     expect(generateButton.disabled).toBe(true)
   })
 })
+
+describe('collapsing the commit editor', () => {
+  const toggle = (): HTMLButtonElement => document.querySelector<HTMLButtonElement>('[role="group"][aria-label="Commit"] button[aria-expanded]')!
+
+  it('hides the editor and the footer, keeps the draft with a marker, remembers the fold across a remount', async () => {
+    await mount()
+    await setText('wip draft')
+    await click(toggle())
+    expect(document.querySelector('[role="group"][aria-label="Commit"] textarea')).toBeNull()
+    expect(document.querySelector('[role="img"][aria-label="Draft message"]')).not.toBeNull()
+    expect(window.localStorage.getItem('dnt-harness.git.commitCollapsed')).toBe('1')
+    await click(toggle())
+    expect(textarea().value).toBe('wip draft')
+    expect(window.localStorage.getItem('dnt-harness.git.commitCollapsed')).toBe('0')
+  })
+})

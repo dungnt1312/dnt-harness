@@ -1,10 +1,10 @@
 /**
- * The compact client: a plain POST stays plain, a 409 that asks for slow-recovery
- * confirmation becomes a typed error carrying the exact fingerprint to echo, and
- * the echo is sent back verbatim. Cancelling never confirms.
+ * The compact client: always a plain POST — the server picks how to compact and
+ * never asks the user to choose. A cancel is typed; any other refusal is an HTTP error.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { compactSession, CompactionCancelled, CompactionRecoveryNeeded, HttpError } from './api.ts'
+import * as api from './api.ts'
+import { compactSession, CompactionCancelled, HttpError } from './api.ts'
 
 interface Call { readonly url: string; readonly init: RequestInit }
 
@@ -21,10 +21,9 @@ function stubFetch(handler: (call: Call) => Response): Call[] {
 afterEach(() => vi.unstubAllGlobals())
 
 const reply = (status: number, body: unknown): Response => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
-const RECOVERY = { cutoff: 42, sourceDigest: 'abc123', estimatedCalls: 9 }
 
 describe('compactSession', () => {
-  it('a plain compaction is an empty POST and returns the result with its path', async () => {
+  it('a compaction is an empty POST and returns the result with its path', async () => {
     const calls = stubFetch(() => reply(200, { coversSeq: 7, summaryChars: 120, tokensBefore: 9000, tokensAfter: 2000, path: 'exact' }))
     const result = await compactSession('ws 1', 's/1')
     expect(result).toEqual({ coversSeq: 7, summaryChars: 120, tokensBefore: 9000, tokensAfter: 2000, path: 'exact' })
@@ -34,28 +33,15 @@ describe('compactSession', () => {
     expect(calls[0]!.init.body).toBeUndefined()
   })
 
-  it('a 409 that asks for recovery becomes a typed error carrying the exact fingerprint and the call estimate', async () => {
-    stubFetch(() => reply(409, { error: 'slow recovery needed', recovery: RECOVERY }))
-    const error = await compactSession('w', 's').catch((e: unknown) => e)
-    expect(error).toBeInstanceOf(CompactionRecoveryNeeded)
-    expect((error as CompactionRecoveryNeeded).recovery).toEqual(RECOVERY)
+  it('there is no recovery question to answer: the client exposes no confirmation type', () => {
+    expect('CompactionRecoveryNeeded' in api).toBe(false)
   })
 
-  it('any other 409, or a malformed fingerprint, stays an ordinary HTTP error', async () => {
+  it('a refusal is an ordinary HTTP error, whatever its body carries', async () => {
     stubFetch(() => reply(409, { error: 'compaction requires a completed exchange boundary' }))
     expect(await compactSession('w', 's').catch((e: unknown) => e)).toBeInstanceOf(HttpError)
-    stubFetch(() => reply(409, { error: 'x', recovery: { cutoff: 'nope' } }))
-    const malformed = await compactSession('w', 's').catch((e: unknown) => e)
-    expect(malformed).toBeInstanceOf(HttpError)
-    expect(malformed).not.toBeInstanceOf(CompactionRecoveryNeeded)
-  })
-
-  it('a confirmation is sent back as JSON, unchanged', async () => {
-    const calls = stubFetch(() => reply(200, { coversSeq: 42, summaryChars: 300, path: 'recovery' }))
-    await compactSession('w', 's', RECOVERY)
-    expect(calls[0]!.init.headers).toBeDefined()
-    expect(new Headers(calls[0]!.init.headers).get('content-type')).toBe('application/json')
-    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ recovery: RECOVERY })
+    stubFetch(() => reply(409, { error: 'x', recovery: { cutoff: 1, sourceDigest: 'd', estimatedCalls: 2 } }))
+    expect(await compactSession('w', 's').catch((e: unknown) => e)).toBeInstanceOf(HttpError)
   })
 
   it('a 409 that says it was cancelled becomes a typed cancel, not an error to show', async () => {
@@ -67,11 +53,6 @@ describe('compactSession', () => {
 
   it('only an explicit cancelled flag counts: a refusal that merely mentions it is an ordinary error', async () => {
     stubFetch(() => reply(409, { error: 'compaction was cancelled by someone' }))
-    expect(await compactSession('w', 's').catch((e: unknown) => e)).toBeInstanceOf(HttpError)
-  })
-
-  it('a server error is never mistaken for a request for recovery', async () => {
-    stubFetch(() => reply(500, { error: 'boom', recovery: RECOVERY }))
     expect(await compactSession('w', 's').catch((e: unknown) => e)).toBeInstanceOf(HttpError)
   })
 })

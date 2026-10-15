@@ -36,6 +36,8 @@ export interface PathScopeMatch {
   /** Absolute lexical path, exactly as the approver sees it. */
   readonly path: string
   readonly intent: PathIntent
+  /** Complete outside-path set for multi-file calls; legacy single-path fields remain. */
+  readonly paths?: readonly ApprovedPath[]
   /** Folder a session-scoped approval would grant, when that folder is grantable. */
   readonly proposedGrant?: string
   /** Set by the answer route: grant `proposedGrant` to the session once the call is allowed. */
@@ -99,6 +101,7 @@ export function attachPathScopeGuard(ctx: Context, options: PathScopeOptions): P
     const grant = exec ?? ctx.tools.currentGrant()
     if (grant === undefined || grant.root === '') return next()
     let outside: { path: string; intent: PathIntent } | undefined
+    const outsidePaths: ApprovedPath[] = []
     for (const target of targets) {
       const classified = classifyTarget(grant, target.target, target.intent)
       switch (classified.kind) {
@@ -128,6 +131,7 @@ export function attachPathScopeGuard(ctx: Context, options: PathScopeOptions): P
             // real path classifies as in-grant.
           }
           outside = { path: real, intent: target.intent }
+          if (!outsidePaths.some((entry) => entry.path === real && entry.intent === target.intent)) outsidePaths.push(outside)
           break
         }
       }
@@ -136,7 +140,7 @@ export function attachPathScopeGuard(ctx: Context, options: PathScopeOptions): P
     // Search tools target a folder; file tools target a file in its parent.
     // Children never get a session option: their grants are a spawn snapshot.
     const folder = SEARCH_TOOLS.has(payload.call.name) ? outside.path : path.dirname(outside.path)
-    const proposedGrant = scope?.childOf === undefined ? await options.proposeGrant(folder) : undefined
+    const proposedGrant = scope?.childOf === undefined && outsidePaths.length === 1 ? await options.proposeGrant(folder) : undefined
     const executionId = exec?.executionId
     if (executionId === undefined) {
       // No host execution identity: nothing durable can authorize this call,
@@ -152,6 +156,7 @@ export function attachPathScopeGuard(ctx: Context, options: PathScopeOptions): P
       grantSnapshot: scope?.childOf?.grants,
       path: outside.path,
       intent: outside.intent,
+      ...(outsidePaths.length > 1 ? { paths: outsidePaths } : {}),
       ...(proposedGrant !== undefined ? { proposedGrant } : {}),
       argsKey: argsKeyOf(payload.call),
     }

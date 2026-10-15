@@ -18,11 +18,6 @@ describe('parseDrafts', () => {
     expect(parseDrafts(serializeDrafts({ a: draft }))).toEqual({ a: draft })
   })
 
-  it('migrates legacy command chips stored as wire text', () => {
-    const payload = JSON.stringify({ a: { segments: [{ kind: 'command', text: 'Use the review skill:' }, { kind: 'command', text: 'bogus' }] } })
-    expect(parseDrafts(payload)).toEqual({ a: { segments: [{ kind: 'command', name: 'review' }], attachments: [] } })
-  })
-
   it('migrates legacy inline attachments into the tray', () => {
     const payload = JSON.stringify({
       a: {

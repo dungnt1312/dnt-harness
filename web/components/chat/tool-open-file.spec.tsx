@@ -33,6 +33,20 @@ const chip = (): HTMLButtonElement | undefined =>
   Array.from(host.querySelectorAll('button')).find((button) => button.getAttribute('aria-label')?.includes('in workbench'))
 const expander = (): HTMLButtonElement => host.querySelector<HTMLButtonElement>('button[aria-expanded]')!
 
+it('ApplyPatch renders each landed file diff, including partial failure receipts', async () => {
+  const output = JSON.stringify({ tool: 'ApplyPatch', error: 'disk full', files: [
+    { path: 'a.ts', type: 'update', edits: [{ old: 'oldA\n', new: 'newA\n', oldLine: 12, newLine: 12 }] },
+    { path: 'b.ts', type: 'delete', edits: [{ old: 'oldB\n', new: '', oldLine: 1, newLine: 1 }] },
+  ] })
+  await render(<ToolCard item={tool('ApplyPatch', { patch_text: '*** Begin Patch\n*** Delete File: b.ts\n*** End Patch' }, { ok: false, output: `error: Error: ${output}` })} />)
+  await act(async () => expander().click())
+  expect(host.textContent).toContain('newA')
+  expect(host.textContent).toContain('oldB')
+  expect(host.textContent).toContain('deleted file')
+  expect(host.textContent).toContain('disk full')
+  expect(host.querySelectorAll('[data-kind="del"]')).toHaveLength(2)
+})
+
 it('a Read row: the file name opens the file at the window it read', async () => {
   const open = vi.fn()
   const openPath = vi.fn(() => open)
@@ -40,6 +54,21 @@ it('a Read row: the file name opens the file at the window it read', async () =>
   await act(async () => chip()!.click())
   expect(open).toHaveBeenCalledOnce()
   expect(openPath).toHaveBeenCalledWith('src/a.ts', { line: 10, lines: 5 })
+})
+
+it('a Read row on an image expands to the vision description; a text Read stays a plain row', async () => {
+  const output = '[image shots/a.png (image/png), described by the vision model]\nA dark UI with a **sidebar**.'
+  await render(<ToolCard item={tool('Read', { path: 'shots/a.png' }, { ok: true, output })} openPath={() => () => undefined} />)
+  expect(host.textContent).not.toContain('sidebar')
+  await act(async () => expander().click())
+  expect(expander().getAttribute('aria-expanded')).toBe('true')
+  expect(host.textContent).toContain('A dark UI with a')
+  expect(host.textContent).toContain('image/png')
+  await act(async () => root!.unmount())
+  host.remove()
+  root = undefined
+  await render(<ToolCard item={tool('Read', { path: 'src/a.ts' }, { ok: true, output: '1\tconst a = 1' })} openPath={() => () => undefined} />)
+  expect(host.querySelector('button[aria-expanded]')).toBeNull()
 })
 
 it.each([

@@ -68,6 +68,195 @@ describe('cache-aware compaction summarizer', () => {
   })
 })
 
+describe('parallel fold + merge', () => {
+  const PART = /This is part (\d+) of (\d+) of one conversation; summarize only this part\./
+  const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 5))
+  const text = (chunks: number) => 'x'.repeat(190_000 * chunks)
+  const content = (request: ModelRequest) => request.messages[0]!.content as string
+  /** Resolves `release` once `count` streams have started. */
+  function barrier(count: number) {
+    let started = 0
+    let release!: () => void
+    const open = new Promise<void>((resolve) => { release = resolve })
+    return { arrive: () => { if (++started >= count) release(); return open }, started: () => started }
+  }
+  /** Chunk requests answer `S<i>`, merge requests `M<k>`. */
+  const answer = (request: ModelRequest, mergeCount: { n: number }) => {
+    const part = PART.exec(content(request))
+    return part === null ? `M${++mergeCount.n}` : `S${part[1]}`
+  }
+
+  it('runs all chunk requests concurrently, then one merge with the summaries in order', async () => {
+    const gate = barrier(3)
+    const seen: ModelRequest[] = []
+    const merges = { n: 0 }
+    const summarize = createCompactionSummarizer((request) => (async function* () {
+      seen.push(request)
+      const isChunk = PART.test(content(request))
+      if (isChunk) await gate.arrive()
+      yield { type: 'delta', delta: answer(request, merges) }
+      yield STOP
+    })(), PAIR)
+    expect(await summarize({ text: text(3) })).toBe('M1')
+    const chunks = seen.filter((request) => PART.test(content(request)))
+    const merge = seen.filter((request) => !PART.test(content(request)))
+    expect(chunks).toHaveLength(3)
+    expect(merge).toHaveLength(1)
+    expect(seen.at(-1)).toBe(merge[0])
+    const body = content(merge[0]!)
+    expect(body).toContain(COMPACT_SUMMARY_PROMPT)
+    const order = [1, 2, 3].map((i) => body.indexOf(`[part ${i}/3]\nS${i}`))
+    expect(order.every((at) => at >= 0)).toBe(true)
+    expect([...order].sort((a, b) => a - b)).toEqual(order)
+    expect(body).not.toContain('<earlier-summary>\n')
+  })
+
+  it('never has more than 4 chunk requests open', async () => {
+    let open = 0
+    let max = 0
+    let chunks = 0
+    const merges = { n: 0 }
+    const summarize = createCompactionSummarizer((request) => (async function* () {
+      const isChunk = PART.test(content(request))
+      if (isChunk) { chunks++; max = Math.max(max, ++open); await tick(); open-- }
+      yield { type: 'delta', delta: answer(request, merges) }
+      yield STOP
+    })(), PAIR)
+    await summarize({ text: text(6) })
+    expect(chunks).toBe(6)
+    expect(max).toBe(4)
+  })
+
+  it('honors maxParallel: never more than 2 chunk requests open', async () => {
+    let open = 0
+    let max = 0
+    const merges = { n: 0 }
+    const summarize = createCompactionSummarizer((request) => (async function* () {
+      const isChunk = PART.test(content(request))
+      if (isChunk) { max = Math.max(max, ++open); await tick(); open-- }
+      yield { type: 'delta', delta: answer(request, merges) }
+      yield STOP
+    })(), PAIR, undefined, 2)
+    await summarize({ text: text(6) })
+    expect(max).toBe(2)
+  })
+
+  it('at parallelism 1 it accumulates chunk after chunk like before: no merge, each later chunk carries the summary so far', async () => {
+    const seen: ModelRequest[] = []
+    const progress: Array<[number, number]> = []
+    let call = 0
+    const summarize = createCompactionSummarizer((request) => (async function* () {
+      seen.push(request)
+      yield { type: 'delta', delta: `ACC${++call}` }
+      yield STOP
+    })(), PAIR, undefined, 1)
+    expect(await summarize({ text: text(3), seed: { summary: 'SEED-XYZ', coversSeq: 3 }, onProgress: (done, total) => progress.push([done, total]) })).toBe('ACC3')
+    expect(seen).toHaveLength(3)
+    expect(content(seen[0]!)).toContain('<earlier-summary>\nSEED-XYZ\n</earlier-summary>')
+    expect(content(seen[1]!)).toContain('<earlier-summary>\nACC1\n</earlier-summary>')
+    expect(content(seen[2]!)).toContain('<earlier-summary>\nACC2\n</earlier-summary>')
+    expect(seen.every((request) => !content(request).includes('[part '))).toBe(true)
+    expect(progress.at(-1)).toEqual([3, 3])
+    expect(progress.map(([done]) => done)).toEqual([0, 1, 2, 3])
+  })
+
+  it('puts the seed only in the merge request', async () => {
+    const seen: ModelRequest[] = []
+    const merges = { n: 0 }
+    const summarize = createCompactionSummarizer((request) => (async function* () {
+      seen.push(request)
+      yield { type: 'delta', delta: answer(request, merges) }
+      yield STOP
+    })(), PAIR)
+    await summarize({ text: text(3), seed: { summary: 'SEED-XYZ', coversSeq: 3 } })
+    const chunks = seen.filter((request) => PART.test(content(request)))
+    expect(chunks).toHaveLength(3)
+    for (const request of chunks) expect(content(request)).not.toContain('SEED-XYZ')
+    const merge = content(seen.at(-1)!)
+    expect(PART.test(merge)).toBe(false)
+    expect(merge).toContain('<earlier-summary>\nSEED-XYZ\n</earlier-summary>')
+    expect(merge.indexOf('<earlier-summary>\n')).toBeLessThan(merge.indexOf('<conversation>\n'))
+  })
+
+  it('uses exactly one request and no merge for a single chunk, reporting (1, 1)', async () => {
+    const seen: ModelRequest[] = []
+    const progress: Array<[number, number]> = []
+    const summarize = createCompactionSummarizer(scriptedStream([{ type: 'delta', delta: 'only' }, STOP], seen), PAIR)
+    expect(await summarize({ text: 'user: hi', onProgress: (done, total) => progress.push([done, total]) })).toBe('only')
+    expect(seen).toHaveLength(1)
+    expect(PART.test(content(seen[0]!))).toBe(false)
+    expect(progress).toEqual([[0, 1], [1, 1]])
+  })
+
+  it('aborts every open stream and rejects when the caller aborts', async () => {
+    const gate = barrier(3)
+    let aborted = 0
+    const controller = new AbortController()
+    const summarize = createCompactionSummarizer((_request, options) => (async function* () {
+      gate.arrive()
+      await new Promise<void>((_resolve, reject) => options!.signal!.addEventListener('abort', () => { aborted++; reject(options!.signal!.reason) }, { once: true }))
+      yield STOP
+    })(), PAIR)
+    const run = summarize({ text: text(3), signal: controller.signal })
+    const settled = expect(run).rejects.toThrow()
+    while (gate.started() < 3) await tick()
+    controller.abort()
+    await settled
+    expect(aborted).toBe(3)
+  })
+
+  it('a failing chunk rejects, aborts the others and sends no merge request', async () => {
+    let aborted = 0
+    let merges = 0
+    let calls = 0
+    const gate = barrier(3)
+    const summarize = createCompactionSummarizer((request, options) => (async function* () {
+      if (!PART.test(content(request))) merges++
+      const mine = ++calls
+      await gate.arrive()
+      if (mine === 2) throw new Error('chunk two failed')
+      await new Promise<void>((_resolve, reject) => options!.signal!.addEventListener('abort', () => { aborted++; reject(options!.signal!.reason) }, { once: true }))
+      yield STOP
+    })(), PAIR)
+    await expect(summarize({ text: text(3) })).rejects.toThrow('chunk two failed')
+    await tick()
+    expect(aborted).toBe(2)
+    expect(merges).toBe(0)
+  })
+
+  it('reports progress in completion order and never above the total', async () => {
+    const progress: Array<[number, number]> = []
+    const merges = { n: 0 }
+    const summarize = createCompactionSummarizer((request) => (async function* () {
+      const part = PART.exec(content(request))
+      // Later parts finish first.
+      if (part !== null) for (let i = 0; i < 4 - Number(part[1]); i++) await tick()
+      yield { type: 'delta', delta: answer(request, merges) }
+      yield STOP
+    })(), PAIR)
+    await summarize({ text: text(3), onProgress: (done, total) => progress.push([done, total]) })
+    expect(progress).toEqual([[0, 3], [1, 3], [2, 3], [3, 3]])
+  })
+
+  it('merges in consecutive groups when the summaries exceed the input limit, keeping order', async () => {
+    const seen: ModelRequest[] = []
+    const merges = { n: 0 }
+    const summarize = createCompactionSummarizer((request) => (async function* () {
+      seen.push(request)
+      const isChunk = PART.test(content(request))
+      yield { type: 'delta', delta: isChunk ? 'c'.repeat(MAX_SUMMARY_CHARS) : `M${++merges.n}` }
+      yield STOP
+    })(), PAIR)
+    expect(await summarize({ text: text(9) })).toBe('M3')
+    for (const request of seen) expect(content(request).length).toBeLessThanOrEqual(200_000)
+    const merged = seen.filter((request) => !PART.test(content(request)))
+    expect(merged).toHaveLength(3)
+    const last = content(merged.at(-1)!)
+    expect(last.indexOf('M1')).toBeGreaterThan(-1)
+    expect(last.indexOf('M1')).toBeLessThan(last.indexOf('M2'))
+  })
+})
+
 describe('llm compaction summarizer', () => {
   it('collects text deltas, skips thinking, and sends the structured prompt', async () => {
     const seen: ModelRequest[] = []
@@ -95,40 +284,34 @@ describe('llm compaction summarizer', () => {
     await expect(summarize({ text: 'user: hello' })).rejects.toThrow(/empty summary/)
   })
 
-  it('folds every character of a >1.1M transcript and carries latest state forward', async () => {
+  it('folds every character of a >1.1M transcript: parallel chunk summaries, then one merge', async () => {
     const markers = ['START_STATE', 'MIDDLE_STATE', 'END_STATE', '44f6ada', '60 suites / 1.204 tests',
       'browser audio acceptance', 'media smoke automation', 'production secret rotation', 'flake monitoring']
     const text = `${markers[0]}\n${'synthetic exchange\n'.repeat(33_000)}${markers[1]}\n${'synthetic exchange\n'.repeat(33_000)}${markers.slice(2).join('\n')}`
     expect(text.length).toBeGreaterThan(1_100_000)
-    const seen: ModelRequest[] = []
     const chunks: string[] = []
-    const outputs: string[] = []
+    let merge = ''
     const summarize = createCompactionSummarizer((request) => (async function* () {
-      seen.push(request)
       const content = request.messages[0]!.content as string
       expect(content.length).toBeLessThanOrEqual(200_000)
+      const part = /This is part (\d+) of (\d+) of one conversation/.exec(content)
       const source = content.slice(content.indexOf('<conversation>\n') + '<conversation>\n'.length, content.lastIndexOf('\n</conversation>'))
-      chunks.push(source)
-      if (outputs.length > 0) {
-        expect(content).toContain('<earlier-summary>')
-        expect(content).toContain(outputs.at(-1))
-        expect(content.indexOf('<earlier-summary>\n')).toBeLessThan(content.indexOf('<conversation>\n'))
-      }
-      const output = markers.filter((marker) => source.includes(marker) || outputs.at(-1)?.includes(marker)).join('\n')
-      outputs.push(output)
-      yield { type: 'delta', delta: output }
+      if (part === null) merge = source
+      else chunks[Number(part[1]) - 1] = source
+      yield { type: 'delta', delta: ['summary', ...markers.filter((marker) => source.includes(marker))].join('\n') }
       yield STOP
     })(), PAIR)
     const summary = await summarize({ text })
     expect(chunks.join('')).toBe(text)
-    expect(seen.length).toBeGreaterThan(5)
+    expect(chunks.length).toBeGreaterThan(5)
+    expect(merge).toContain(`[part ${chunks.length}/${chunks.length}]`)
     for (const marker of markers) expect(summary).toContain(marker)
     // With many available newlines, chunks should end at a line boundary.
     for (const chunk of chunks.slice(0, -1)) expect(chunk.endsWith('\n')).toBe(true)
   })
 
   it('chunks oversized single lines without splitting a UTF-16 surrogate pair', async () => {
-    const overhead = `${COMPACT_SUMMARY_PROMPT}\n\n<conversation>\n\n</conversation>`.length
+    const overhead = `${COMPACT_SUMMARY_PROMPT}\n\nThis is part 99999 of 99999 of one conversation; summarize only this part.\n\n<conversation>\n\n</conversation>`.length
     // Place the emoji straddling the first chunk's exact capacity boundary.
     const text = `${'x'.repeat(200_000 - overhead - REASK_RESERVE - 1)}😀${'y'.repeat(250_000)}`
     const chunks: string[] = []
@@ -137,7 +320,7 @@ describe('llm compaction summarizer', () => {
       expect(content.length).toBeLessThanOrEqual(200_000)
       const chunk = content.slice(content.indexOf('<conversation>\n') + '<conversation>\n'.length, content.lastIndexOf('\n</conversation>'))
       expect(chunk).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/u)
-      chunks.push(chunk)
+      if (content.includes('summarize only this part')) chunks.push(chunk)
       yield { type: 'delta', delta: 'bounded summary' }
       yield STOP
     })(), PAIR)
@@ -149,10 +332,16 @@ describe('llm compaction summarizer', () => {
     expect(chunks[1]!.startsWith('😀')).toBe(true)
   })
 
-  it.each([[24_001], [12_000, 12_001]])('rejects overflowing deltas %j without consuming further output', async (...sizes: number[]) => {
+  it.each([[24_001], [12_000, 12_001]])('rejects repair overflowing deltas %j without consuming further output', async (...sizes: number[]) => {
     let consumed = 0
     let closed = false
+    let calls = 0
     const summarize = createCompactionSummarizer(() => (async function* () {
+      if (++calls < 3) {
+        yield { type: 'delta', delta: 'x'.repeat(24_001) }
+        yield STOP
+        return
+      }
       try {
         for (const size of sizes) {
           consumed++
@@ -163,9 +352,9 @@ describe('llm compaction summarizer', () => {
       } finally { closed = true }
     })(), PAIR)
     await expect(summarize({ text: 'user: hello' })).rejects.toThrow(/24,?000|24000/)
-    // Each attempt consumes exactly the overflowing deltas; nothing after them.
-    expect(consumed).toBe(sizes.length * 2)
+    expect(consumed).toBe(sizes.length)
     expect(closed).toBe(true)
+    expect(calls).toBe(3)
   })
 
   it('rejects a second-chunk exception rather than returning partial coverage', async () => {
@@ -177,6 +366,73 @@ describe('llm compaction summarizer', () => {
     })(), PAIR)
     await expect(summarize({ text: 'x'.repeat(300_000) })).rejects.toThrow('second chunk failed')
     expect(calls).toBe(2)
+  })
+
+  it('compresses the COMPLETE oversized draft rather than re-summarizing the raw chunk', async () => {
+    const seen: ModelRequest[] = []
+    const draft = `${'x'.repeat(24_001)}\nFINAL-DRAFT-FACT: pending migration; do not commit`
+    const summarize = createCompactionSummarizer(request => {
+      seen.push(request)
+      return (async function* () {
+        if (seen.length === 1) {
+          yield { type: 'delta', delta: draft.slice(0, 24_001) }
+          yield { type: 'delta', delta: draft.slice(24_001) }
+        } else {
+          const input = String(request.messages[0]!.content)
+          // The only place this fact exists is AFTER the overflow boundary.
+          if (!input.includes('FINAL-DRAFT-FACT')) throw new Error('draft was truncated')
+          yield { type: 'delta', delta: 'pending migration; do not commit' }
+        }
+        yield STOP
+      })()
+    }, PAIR)
+    expect(await summarize({ text: 'RAW-SOURCE-ONLY'.repeat(10_000) })).toBe('pending migration; do not commit')
+    expect(seen).toHaveLength(2)
+    const repair = String(seen[1]!.messages[0]!.content)
+    expect(repair).toContain(draft)
+    expect(repair).not.toContain('RAW-SOURCE-ONLY')
+    expect(repair).toContain('12000')
+    expect(repair.length).toBeLessThan(100_000)
+  })
+
+  it('uses a second smaller repair only when the first repair is still oversized', async () => {
+    const requests: ModelRequest[] = []
+    const summarize = createCompactionSummarizer(request => {
+      requests.push(request)
+      return (async function* () {
+        yield { type: 'delta', delta: requests.length < 3 ? 'x'.repeat(25_000) : 'constraints and pending work' }
+        yield STOP
+      })()
+    }, PAIR)
+    expect(await summarize({ text: 'source' })).toBe('constraints and pending work')
+    expect(requests).toHaveLength(3)
+    expect(String(requests[1]!.messages[0]!.content)).toContain('12000')
+    expect(String(requests[2]!.messages[0]!.content)).toContain('8000')
+    expect(String(requests[1]!.messages[0]!.content)).not.toContain('All User Messages')
+  })
+
+  it('does not repair an oversized draft without a valid stop completion', async () => {
+    let calls = 0
+    const summarize = createCompactionSummarizer(() => (async function* () {
+      calls++
+      yield { type: 'delta', delta: 'x'.repeat(24_001) }
+    })(), PAIR)
+    await expect(summarize({ text: 'source' })).rejects.toThrow(/missing completion/)
+    expect(calls).toBe(1)
+  })
+
+  it('refuses a draft over the 96000-character collection limit without reading unbounded output', async () => {
+    let calls = 0
+    let tail = false
+    const summarize = createCompactionSummarizer(() => (async function* () {
+      calls++
+      yield { type: 'delta', delta: 'x'.repeat(96_001) }
+      tail = true
+      yield STOP
+    })(), PAIR)
+    await expect(summarize({ text: 'source' })).rejects.toThrow(/draft.*96000/)
+    expect(calls).toBe(1)
+    expect(tail).toBe(false)
   })
 
   it('re-asks once with a hard length constraint when an answer overflows the cap', async () => {
@@ -196,15 +452,14 @@ describe('llm compaction summarizer', () => {
     expect(calls).toBe(2)
     const first = seen[0]!.messages[0]!.content as string
     const second = seen[1]!.messages[0]!.content as string
-    // The re-ask carries the same conversation chunk plus the hard constraint.
-    expect(second).toContain('<conversation>\nuser: hello\n</conversation>')
-    // The reported size is the true overflow, never a number within the cap.
-    const reported = /at least (\d+) characters/i.exec(second)
+    // The repair carries the settled draft, NOT the raw source again.
+    expect(second).toContain('x'.repeat(MAX_SUMMARY_CHARS + 1))
+    expect(second).not.toContain('user: hello')
+    const reported = /draft below contains (\d+) characters/i.exec(second)
     expect(reported).not.toBeNull()
-    expect(Number(reported![1])).toBeGreaterThan(MAX_SUMMARY_CHARS)
-    expect(second).toMatch(/at most \d+ characters/i)
-    expect(second.length).toBeGreaterThan(first.length)
-    expect(second.startsWith(first)).toBe(true)
+    expect(Number(reported![1])).toBe(MAX_SUMMARY_CHARS + 1)
+    expect(second).toMatch(/at most 12000 characters/i)
+    expect(second.startsWith(first)).toBe(false)
   })
 
   it('fails closed when the re-ask also overflows the cap', async () => {
@@ -215,7 +470,7 @@ describe('llm compaction summarizer', () => {
       yield STOP
     })(), PAIR)
     await expect(summarize({ text: 'user: hello' })).rejects.toThrow(/24,?000|24000/)
-    expect(calls).toBe(2)
+    expect(calls).toBe(3)
   })
 
   it('seeds the accumulated summary from a checkpoint for an incremental fold', async () => {

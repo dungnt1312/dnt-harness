@@ -124,7 +124,7 @@ describe('agent definitions', () => {
   it('bundled Worker exposes file edits and the complete shell lifecycle for a bounded task', async () => {
     const service = new AgentDefinitionService(home)
     const worker = await service.resolve('ws-x' as never, 'worker')
-    expect(worker.definition.tools).toEqual(['Read', 'Glob', 'Grep', 'Write', 'Edit', 'Bash', 'BashOutput', 'KillShell'])
+    expect(worker.definition.tools).toEqual(['Read', 'Glob', 'Grep', 'Write', 'Edit', 'ApplyPatch', 'Bash', 'BashOutput', 'KillShell'])
     for (const tool of ['Bash', 'BashOutput', 'KillShell']) {
       expect(worker.definition.disallowedTools).not.toContain(tool)
     }

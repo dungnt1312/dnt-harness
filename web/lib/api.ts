@@ -463,9 +463,9 @@ export function setWorkspaceArchived(workspaceId: string, archived: boolean): Pr
   }).then((r) => json<WorkspaceRow>(r))
 }
 
-/** Delete an empty workspace; non-empty workspaces answer 409. */
-export function deleteWorkspace(workspaceId: string): Promise<{ readonly deleted: boolean }> {
-  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}`, { method: 'DELETE' }).then((r) =>
+/** Delete an empty workspace; a non-empty one answers 409 `workspace-not-empty` unless `force` removes its sessions and projects too. */
+export function deleteWorkspace(workspaceId: string, force = false): Promise<{ readonly deleted: boolean }> {
+  return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}${force ? '?force=true' : ''}`, { method: 'DELETE' }).then((r) =>
     json<{ readonly deleted: boolean }>(r),
   )
 }
@@ -1368,26 +1368,8 @@ export interface CompactResult {
   /** Context tokens before/after; absent when the run was not measured. */
   readonly tokensBefore?: number
   readonly tokensAfter?: number
-  /** How the summary was produced: `exact` and `reconstructed` are one request; `recovery` is the slow raw fold. */
+  /** How the summary was produced: `exact` and `reconstructed` are one request; `recovery` folds the whole transcript. */
   readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'
-}
-
-/**
- * What the server needs echoed back to run the slow raw fold: bound to the exact
- * source the user was shown, so a source that changed since is refused.
- */
-export interface CompactionRecovery {
-  readonly cutoff: number
-  readonly sourceDigest: string
-  readonly estimatedCalls: number
-}
-
-/** The server cannot compact from a saved request and offers a slow recovery; nothing ran. */
-export class CompactionRecoveryNeeded extends Error {
-  constructor(readonly recovery: CompactionRecovery) {
-    super(`Compaction needs a slow recovery of about ${recovery.estimatedCalls} model calls.`)
-    this.name = 'CompactionRecoveryNeeded'
-  }
 }
 
 /** Stop, a delete or a shutdown ended the compaction. Not a failure: nothing was written. */
@@ -1398,31 +1380,17 @@ export class CompactionCancelled extends Error {
   }
 }
 
-function recoveryOf(value: unknown): CompactionRecovery | undefined {
-  if (typeof value !== 'object' || value === null) return undefined
-  const { cutoff, sourceDigest, estimatedCalls } = value as Record<string, unknown>
-  return Number.isSafeInteger(cutoff) && typeof sourceDigest === 'string' && Number.isSafeInteger(estimatedCalls)
-    ? { cutoff: cutoff as number, sourceDigest, estimatedCalls: estimatedCalls as number }
-    : undefined
-}
-
 /**
- * Manual compaction: older turns become an immutable checkpoint. A plain call is an
- * empty POST. When it needs the slow recovery it throws {@link CompactionRecoveryNeeded}
- * instead of running it; pass that error's `recovery` back to confirm.
+ * Manual compaction: older turns become an immutable checkpoint. Always an empty POST;
+ * the server picks how to summarize and never asks the user to choose.
  */
-export async function compactSession(workspaceId: string, sessionId: string, confirm?: CompactionRecovery): Promise<CompactResult> {
-  const response = await apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/compact`, {
-    method: 'POST',
-    ...(confirm !== undefined ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify({ recovery: confirm }) } : {}),
-  })
+export async function compactSession(workspaceId: string, sessionId: string): Promise<CompactResult> {
+  const response = await apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/compact`, { method: 'POST' })
   if (response.status === 409) {
     const text = await response.text()
-    let parsed: { recovery?: unknown; cancelled?: unknown } = {}
+    let parsed: { cancelled?: unknown } = {}
     try { parsed = JSON.parse(text) as typeof parsed } catch { /* plain-text refusal */ }
     if (parsed.cancelled === true) throw new CompactionCancelled()
-    const recovery = recoveryOf(parsed.recovery)
-    if (recovery !== undefined) throw new CompactionRecoveryNeeded(recovery)
     throw new HttpError(409, text)
   }
   return json<CompactResult>(response)
