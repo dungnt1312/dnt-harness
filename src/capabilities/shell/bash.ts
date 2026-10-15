@@ -118,47 +118,6 @@ function isBareSleep(command: string): boolean {
   return tokens[index] === 'sleep'
 }
 
-/** Commands whose job a dedicated file tool does better (first word of a pipeline). */
-const READ_COMMANDS = new Set(['cat', 'head', 'tail', 'less', 'more', 'nl'])
-const SEARCH_COMMANDS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'find', 'fd', 'ls', 'tree'])
-
-/**
- * A one-line reminder appended to a model's Bash result when the command
- * did work a file tool exists for: reading/searching files, writing them
- * through a heredoc or a script, or `cd`-ing into the folder it already runs
- * in. Advisory only — the command ran and its output is unchanged. Reads done
- * here do not count for Edit/Write's read-before-write check, which is the
- * practical cost the reminder names.
- */
-export function fileToolHint(command: string, cwd: string): string | undefined {
-  const hints: string[] = []
-  const root = cwd.replace(/\/+$/, '')
-  const cdRoot = new RegExp(`^\\s*cd\\s+(?:"${escapeRegExp(root)}/?"|'${escapeRegExp(root)}/?'|${escapeRegExp(root)}/?)\\s*(?:&&|;)`)
-  if (root !== '' && cdRoot.test(command)) hints.push('Bash already runs in the project folder; drop the leading `cd`.')
-  // Pipeline heads only: `git diff | head` filters output and is fine.
-  const heads = command.split(/&&|\|\||;|\n/).map((segment) => segment.split('|')[0]?.trim() ?? '')
-  const reads = heads.some((head) => {
-    const [word, flag] = head.split(/\s+/)
-    // `cat > f <<EOF` writes a file; the heredoc check below names it.
-    if (word === 'cat' && /(^|[^0-9&])>/.test(head)) return false
-    return READ_COMMANDS.has(word ?? '') || (word === 'sed' && flag === '-n')
-  })
-  const searches = heads.some((head) => SEARCH_COMMANDS.has(head.split(/\s+/)[0] ?? ''))
-  if (reads || searches) {
-    const tools = reads && searches ? 'Read and Grep/Glob' : reads ? 'Read' : 'Grep/Glob'
-    hints.push(`Prefer ${tools} over the shell for this; files read through Bash do not count as read for Edit/Write.`)
-  }
-  // A heredoc redirected into a file: `cat > f <<EOF`, `cat <<EOF >> f`, `tee f <<EOF`.
-  if (/>\s*[^\s<>&|;]+\s*<<|<<-?\s*['"]?\w+['"]?\s*>|\btee\b[^\n|;]*<</.test(command)) {
-    hints.push('Write files with Write/Edit, not heredocs, so the change is tracked and shown as a diff.')
-  }
-  return hints.length === 0 ? undefined : `[hint: ${hints.join(' ')}]`
-}
-
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
 /** The `Bash` tool: one command, captured output, timeout and stop handling. */
 export function bashTool(options: BashToolOptions = {}): ToolDefinition {
   const maxWaitMs = timerBudget(options.maxWaitMs, 600_000)
@@ -173,9 +132,8 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
     description: [
       'Run Bash once; return output and exit code if completed, or a running process ID after the foreground wait. Watch that ID with BashOutput; do not rerun a still-running command.',
       'The command already runs in the project folder: do not start it with `cd <project> &&`; use paths relative to the project, or absolute paths.',
-      'Use Bash for builds, tests, git, package managers and other programs — not for work a file tool does.',
-      'Read files with Read (not cat, head, tail, or sed -n); search contents with Grep (not grep or rg); find files with Glob (not find or ls); change files with Edit or Write (not heredocs, sed -i, or scripts).',
-      'Edit and Write only accept files this conversation read with Read, so a file read through Bash must still be Read before it is changed.',
+      'Use Bash for builds, tests, git, package managers, metadata inspection and other programs. Use Read, Grep and Glob to read and search file contents, and Edit, Write or ApplyPatch to change files; Bash stays right for operations those tools do not cover.',
+      'Editing or overwriting an existing file requires an observation from Read or a successful Write/Edit/ApplyPatch in this conversation; reading a file through Bash creates no observation. Creating a new file needs no Read, and a successful Write/Edit/ApplyPatch updates the observation, so there is no need to Read again after each change.',
       'Independent lookups can be several Read/Grep/Glob calls in one step rather than one chained shell command.',
     ].join(' '),
     requiresRoot: true,
@@ -197,11 +155,6 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
         return `error: bash is not available on this system; ${detection.hint}`
       }
       const background = args['run_in_background'] === true
-      // Model-issued calls only: a slash command's inline `!` shell (`cmd_…`)
-      // becomes prompt text, which a reminder must not change.
-      const fromModel = exec.toolCallId !== undefined && !exec.toolCallId.startsWith('cmd_')
-      const hint = fromModel ? fileToolHint(command, exec.root !== '' ? exec.root : fallbackCwd()) : undefined
-      const hintLine = hint === undefined ? '' : `\n${hint}`
       if (options.processes !== undefined && exec.sessionId !== undefined) {
         if (exec.signal?.aborted) return 'cancelled: stop requested before this command started'
         const processes = options.processes
@@ -223,7 +176,7 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
           const result = processes.read(sessionId, id)!
           const limit = exec.outputLimit ?? OUTPUT_CAP
           const output = result.output.length > limit ? `${result.output.slice(0, limit)}\n… [truncated ${result.output.length - limit} chars]` : result.output
-          return `${output}${result.outputTruncated ? '\n… [output truncated during capture]' : ''}${hintLine}`
+          return `${output}${result.outputTruncated ? '\n… [output truncated during capture]' : ''}`
         }
         const commit = () => processes.commitBackground(sessionId, id, exec.subagentBackgroundBashMaxMs !== undefined ? { maxRuntimeMs: exec.subagentBackgroundBashMaxMs } : {})
         const running = () => `background process started: id=${id}; read output with BashOutput; kill with KillShell`
@@ -291,7 +244,7 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
           const body = output.length > limit
             ? `${output.slice(0, limit)}\n… [truncated ${output.length - limit} chars]`
             : output
-          return `${body}${dropped}${hintLine}${suffix}`
+          return `${body}${dropped}${suffix}`
         }
         if (exec.signal?.aborted === true) {
           finish('cancelled: stop requested before this command started')

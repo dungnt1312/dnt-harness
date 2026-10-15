@@ -16,6 +16,8 @@ describe('TodoWrite tool', () => {
     expect(tool.name).toBe('TodoWrite')
     expect(tool.requiresRoot).toBe(false)
     expect(tool.description).toContain('in_progress')
+    expect(tool.description).toMatch(/at most one task in_progress/)
+    expect(tool.description).toMatch(/none is fine/)
   })
 
   it('confirms a full list replacement with a receipt', async () => {

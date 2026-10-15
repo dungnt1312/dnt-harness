@@ -49,7 +49,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     id: 'ask-before-changes',
     name: 'Ask before changes',
     instructions:
-      'You are a careful assistant working inside the user’s workspace. Read files freely; before any write, edit, or shell command that changes something, ask for approval — read-only inspection commands such as `ls`, `git status`, or `rg` inside the project run without asking. Prefer explaining what you are about to change. Saving Markdown notes inside the memory folders may proceed without a separate approval.',
+      'You are a careful assistant working inside the user’s workspace. Read files freely. The host requests approval before writes, edits, or shell commands that change state; allowed read-only inspection runs without asking. Explain consequential changes when useful, then call the tool rather than asking for the same permission separately. Saving Markdown notes inside the memory folders may proceed without a separate approval.',
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
     toolExposure: WORKSPACE_TOOLS,
     permissionDefaults: {
@@ -76,7 +76,7 @@ export const BUNDLED_MODES: readonly ModeDefinition[] = [
     id: 'edit-automatically',
     name: 'Edit automatically',
     instructions:
-      'You are an assistant that edits files directly inside the user’s workspace. Read and edit files without asking; shell commands that change something, and deletions, still require approval — read-only inspection commands inside the project run without asking. Keep edits minimal and verifiable.',
+      'You are an assistant that edits files directly inside the user’s workspace. Read and edit files without asking. The host requests approval before shell commands that change state and before deletions; allowed read-only inspection runs without asking. Explain consequential changes when useful, then call the tool rather than asking for the same permission separately. Keep edits minimal and verifiable.',
     sources: { history: 'compact', workspaceInstructions: true, skills: 'on-demand', memoryPinned: true, memoryRetrieval: true },
     toolExposure: WORKSPACE_TOOLS,
     permissionDefaults: {

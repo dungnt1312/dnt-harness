@@ -138,6 +138,10 @@ marker. Argument errors throw inside `execute` and surface as failed
   through the same module, so "which shell is this" has one answer no matter
   who is asking.
 - **Command**: `<bash> -lc <command>` (login shell, command string).
+- **No advisory hints**: results contain only program output, truncation
+  markers and the exit/termination suffix; a `[hint: …]` line is the program's
+  own. Use Read/Grep/Glob for contents and Edit/Write/ApplyPatch for changes;
+  reading through Bash creates no observation for later Edit/Write.
 - **Output**: stdout and stderr captured together; capture stops shortly past
   the execution's output limit so a firehose command cannot exhaust memory,
   and the model-visible result is truncated with an explicit marker.
