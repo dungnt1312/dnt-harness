@@ -328,6 +328,8 @@ export interface ProviderSummary {
   readonly enabled: boolean
   readonly keyMasked: string
   readonly models: readonly string[]
+  /** What this provider serves; absent means chat-only. `['stt']` hides it from chat lists. */
+  readonly kinds?: readonly ('chat' | 'stt')[]
   /** Per-model operator overrides (context window, vision, thinking default). */
   readonly modelSettings?: Readonly<Record<string, ModelSettings>>
 }
@@ -340,6 +342,8 @@ export interface ProviderInput {
   readonly apiKey?: string
   readonly enabled?: boolean
   readonly models?: readonly string[]
+  /** Replaces the whole kinds list when present; empty array restores chat-only. */
+  readonly kinds?: readonly ('chat' | 'stt')[]
   /** Replaces the whole per-model settings map when present. */
   readonly modelSettings?: Readonly<Record<string, ModelSettings>>
 }

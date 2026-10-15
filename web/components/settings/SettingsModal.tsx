@@ -36,6 +36,7 @@ import { ModelAliasesPanel } from './ModelAliasesPanel.tsx'
 import { CommitMessagePanel } from './CommitMessagePanel.tsx'
 import { ImagesPanel } from './ImagesPanel.tsx'
 import { VideoGenerationPanel } from './VideoGenerationPanel.tsx'
+import { SpeechToTextPanel } from './SpeechToTextPanel.tsx'
 import { modelOptions } from '../../lib/providers.ts'
 import type { ModelSettings, ProjectRow, ProviderSummary } from '../../lib/types.ts'
 
@@ -53,14 +54,15 @@ const LEGACY_TAB_REDIRECT: Readonly<Record<string, SettingsTab>> = {
 }
 
 /** Sub-tabs of Providers & Models: everything that picks an endpoint or a model. */
-type ModelsSubTab = 'providers' | 'model-aliases' | 'images' | 'videos' | 'git'
-type LegacyModelsSubTab = 'image-generation' | 'image-understanding' | 'video-generation'
+type ModelsSubTab = 'providers' | 'model-aliases' | 'images' | 'videos' | 'voice' | 'git'
+type LegacyModelsSubTab = 'image-generation' | 'image-understanding' | 'video-generation' | 'speech-to-text'
 
 const MODELS_SUB_TABS: readonly { readonly value: ModelsSubTab; readonly label: string; readonly hint: string; readonly icon: IconName }[] = [
   { value: 'providers', label: 'Providers', hint: 'Model endpoints and keys', icon: 'globe' },
   { value: 'model-aliases', label: 'Model aliases', hint: 'Global subagent model mappings', icon: 'gitBranch' },
   { value: 'images', label: 'Images', hint: 'Models for image generation and understanding', icon: 'fileImage' },
   { value: 'videos', label: 'Videos', hint: 'Model for the GenerateVideo tool', icon: 'fileVideo' },
+  { value: 'voice', label: 'Voice', hint: 'Model for composer dictation', icon: 'mic' },
   { value: 'git', label: 'Git', hint: 'Model for commit messages', icon: 'gitBranch' },
 ]
 
@@ -68,7 +70,8 @@ const MODELS_SUB_TABS: readonly { readonly value: ModelsSubTab; readonly label: 
 function modelsSubOf(raw: string | undefined): ModelsSubTab | undefined {
   if (raw === 'image-generation' || raw === 'image-understanding') return 'images'
   if (raw === 'video-generation') return 'videos'
-  return raw === 'model-aliases' || raw === 'images' || raw === 'videos' || raw === 'git' ? raw : undefined
+  if (raw === 'speech-to-text') return 'voice'
+  return raw === 'model-aliases' || raw === 'images' || raw === 'videos' || raw === 'git' || raw === 'voice' ? raw : undefined
 }
 
 /** Legacy links that named a Permissions sub-pane directly. */
@@ -126,13 +129,15 @@ interface Draft {
   readonly apiKey: string
   readonly enabled: boolean
   readonly models: readonly string[]
+  /** What this provider serves; absent means chat-only. */
+  readonly kinds: readonly ('chat' | 'stt')[]
   /** Working copy of the per-model overrides (context window, vision, thinking). */
   readonly modelSettings: Record<string, ModelSettings>
 }
 
 type Busy = 'save' | 'sync' | 'test' | 'delete' | null
 
-const BLANK: Draft = { name: '', baseUrl: '', apiKey: '', enabled: true, models: [], modelSettings: {} }
+const BLANK: Draft = { name: '', baseUrl: '', apiKey: '', enabled: true, models: [], kinds: ['chat'], modelSettings: {} }
 
 function draftOf(provider: ProviderSummary): Draft {
   return {
@@ -141,6 +146,7 @@ function draftOf(provider: ProviderSummary): Draft {
     apiKey: '',
     enabled: provider.enabled,
     models: provider.models,
+    kinds: [...(provider.kinds ?? ['chat'])],
     modelSettings: Object.fromEntries(Object.entries(provider.modelSettings ?? {}).map(([model, settings]) => [model, { ...settings }])),
   }
 }
@@ -313,6 +319,7 @@ export function SettingsModal({
       draft.apiKey !== '' ||
       draft.enabled !== base.enabled ||
       !sameList(draft.models, base.models) ||
+      !sameList(draft.kinds, base.kinds) ||
       JSON.stringify(pruneSettings(draft.models, draft.modelSettings)) !== JSON.stringify(pruneSettings(base.models, base.modelSettings))
     )
   }, [draft, selected])
@@ -401,6 +408,9 @@ export function SettingsModal({
         baseUrl,
         enabled: draft.enabled,
         models: draft.models,
+        // Always sent: PATCH replaces the list, so unchecking Voice must reach
+        // the server as an explicit chat-only state.
+        kinds: draft.kinds,
         // Always sent (even empty): the patch REPLACES the whole map, so an
         // empty object is how cleared overrides reach the server.
         modelSettings: pruneSettings(draft.models, draft.modelSettings),
@@ -628,6 +638,7 @@ export function SettingsModal({
                 {tab === 'providers' && modelsSub === 'model-aliases' ? <ModelAliasesPanel providers={providers} /> : null}
                 {tab === 'providers' && modelsSub === 'images' ? <ImagesPanel providers={providers} /> : null}
                 {tab === 'providers' && modelsSub === 'videos' ? <VideoGenerationPanel providers={providers} /> : null}
+                {tab === 'providers' && modelsSub === 'voice' ? <SpeechToTextPanel providers={providers} /> : null}
                 {tab === 'providers' && modelsSub === 'git' ? <CommitMessagePanel providers={providers} /> : null}
                 {tab === 'projects' ? <ProjectsPanel workspaceId={workspaceId} projects={projects} onChanged={onProjectsChanged} sessionCounts={sessionCounts} /> : null}
                 {tab === 'permissions' ? <PermissionsPanel workspaceId={workspaceId} onChanged={onRefresh} initialSub={permissionsSubOf(initialTab)} /> : null}
@@ -731,6 +742,39 @@ export function SettingsModal({
                         trailing={<IconButton label={showKey ? 'Hide key' : 'Show key'} onClick={() => setShowKey((prev) => !prev)}><Icon name={showKey ? 'eyeOff' : 'eye'} size={15} /></IconButton>}
                         onChange={(event) => patch({ apiKey: event.target.value })}
                       />
+                    </Field>
+                    <Field
+                      label="Serves"
+                      hint={draft.kinds.includes('stt') && !draft.kinds.includes('chat') ? 'Voice-only: hidden from every chat model picker.' : undefined}
+                    >
+                      <div className="flex gap-4 pt-1.5">
+                        <label className="flex items-center gap-2 text-sm text-fg-muted">
+                          <input
+                            type="checkbox"
+                            className="size-4 accent-[var(--accent)]"
+                            checked={draft.kinds.includes('chat')}
+                            onChange={(event) => {
+                              const chat = event.target.checked
+                              const next: readonly ('chat' | 'stt')[] = chat ? (draft.kinds.includes('stt') ? ['chat', 'stt'] : ['chat']) : draft.kinds.includes('stt') ? ['stt'] : ['chat']
+                              patch({ kinds: next })
+                            }}
+                          />
+                          Chat models
+                        </label>
+                        <label className="flex items-center gap-2 text-sm text-fg-muted">
+                          <input
+                            type="checkbox"
+                            className="size-4 accent-[var(--accent)]"
+                            checked={draft.kinds.includes('stt')}
+                            onChange={(event) => {
+                              const stt = event.target.checked
+                              const next: readonly ('chat' | 'stt')[] = stt ? (draft.kinds.includes('chat') ? ['chat', 'stt'] : ['stt']) : draft.kinds.includes('chat') ? ['chat'] : ['chat']
+                              patch({ kinds: next })
+                            }}
+                          />
+                          Voice (speech-to-text)
+                        </label>
+                      </div>
                     </Field>
                   </div>
 

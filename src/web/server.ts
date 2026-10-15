@@ -104,6 +104,8 @@ import {
   type ModelAlias,
   type ModelSettings,
   type ProviderConfig,
+  servesKind,
+  parseKinds,
   maxOutputTokenOverrides,
   validateModelAliasName,
 } from './provider-store.ts'
@@ -163,6 +165,8 @@ import { generateVideoTool } from '../harness/tools/video-tools.ts'
 import { VideoStore, VideoStoreError } from '../harness/attachments/video-store.ts'
 import { loadPair, savePair, validatePairBody, type ModelPair } from './model-pair-store.ts'
 import { resolveImageApi } from './image-generation-store.ts'
+import { resolveSttApi } from './speech-to-text-store.ts'
+import { transcribe } from '../harness/stt/transcriptions.ts'
 import { resolveVisionApi } from './image-understanding-store.ts'
 import { resolveVideoApi } from './video-generation-store.ts'
 import { askUserQuestionTool, validateAnswers, type QuestionOutcome, type UserQuestion } from '../harness/tools/ask-user.ts'
@@ -629,18 +633,27 @@ export interface PublicProvider {
   readonly enabled: boolean
   readonly keyMasked: string
   readonly models: readonly string[]
+  /** What this provider serves; absent means chat-only. `['stt']` hides it from chat lists. */
+  readonly kinds?: readonly ('chat' | 'stt')[]
   /** Per-model operator overrides (context window, vision, thinking default). */
   readonly modelSettings?: Readonly<Record<string, ModelSettings>>
 }
 
 /** The provider/model references kept beside providers.json, one file each. */
-const MODEL_PAIR_NAMES = ['image-generation', 'image-understanding', 'video-generation', 'commit-message'] as const
+const MODEL_PAIR_NAMES = ['image-generation', 'image-understanding', 'video-generation', 'commit-message', 'speech-to-text'] as const
 type ModelPairName = (typeof MODEL_PAIR_NAMES)[number]
 const MODEL_PAIR_ROUTES: Readonly<Record<string, { readonly name: ModelPairName; readonly label: string }>> = {
   '/api/image-generation': { name: 'image-generation', label: 'image generation' },
   '/api/image-understanding': { name: 'image-understanding', label: 'image understanding' },
   '/api/commit-message': { name: 'commit-message', label: 'commit message' },
   '/api/video-generation': { name: 'video-generation', label: 'video generation' },
+  '/api/speech-to-text': { name: 'speech-to-text', label: 'speech-to-text' },
+}
+
+/** The query string's `language` when it is a plausible ISO-639-1 code. */
+function languageOf(url: string | undefined): string | undefined {
+  const match = /[?&]language=([a-z]{2})(?:&|$)/.exec(url ?? '')
+  return match?.[1]
 }
 
 function publicProvider(entry: ProviderConfig): PublicProvider {
@@ -651,6 +664,7 @@ function publicProvider(entry: ProviderConfig): PublicProvider {
     enabled: entry.enabled,
     keyMasked: maskKey(entry.apiKey),
     models: [...entry.models],
+    ...(entry.kinds !== undefined ? { kinds: entry.kinds } : {}),
     ...(entry.modelSettings !== undefined ? { modelSettings: entry.modelSettings } : {}),
   }
 }
@@ -924,7 +938,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
 
   const usableIds = (): readonly string[] => [
     ...injectionNames(),
-    ...list.filter(isUsableConfigured).map((entry) => entry.id),
+    ...list.filter((entry) => isUsableConfigured(entry) && servesKind(entry, 'chat')).map((entry) => entry.id),
   ]
 
   const repairGlobalDefaults = (candidate: ModelDefaults, candidateList: readonly ProviderConfig[] = list): ModelDefaults => {
@@ -942,7 +956,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     }
     if (candidate.provider !== null && candidate.model !== null) {
       const configured = candidateList.find((entry) => entry.id === candidate.provider)
-      if (configured?.enabled && configured.models.includes(candidate.model)) return candidate
+      if (configured?.enabled && servesKind(configured, 'chat') && configured.models.includes(candidate.model)) return candidate
     }
     return repairDefaults(candidate, candidateList)
   }
@@ -955,7 +969,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       providerRegistrations.set(provider.name, kernel.ctx.llm.register(provider))
     }
     for (const entry of list) {
-      if (!isUsableConfigured(entry) || providerRegistrations.has(entry.id)) continue
+      // stt-only providers never join the chat LLM registry: they would appear
+      // in every model picker while serving nothing but /audio/transcriptions.
+      if (!isUsableConfigured(entry) || !servesKind(entry, 'chat') || providerRegistrations.has(entry.id)) continue
       providerRegistrations.set(entry.id, kernel.ctx.llm.register(instantiate(entry)))
     }
   }
@@ -6615,7 +6631,12 @@ async function handleApi(
         return
       }
       if (req.method === 'PUT') {
-        const checked = validatePairBody(await readJson(req), (id) => deps.providers().some((entry) => entry.id === id))
+        // Speech-to-text may point at an stt-only provider; the other pairs
+        // drive chat-adjacent endpoints and stay on chat providers.
+        const eligible = pairRoute.name === 'speech-to-text'
+          ? (id: string) => deps.providers().some((entry) => entry.id === id && servesKind(entry, 'stt'))
+          : (id: string) => deps.providers().some((entry) => entry.id === id && servesKind(entry, 'chat'))
+        const checked = validatePairBody(await readJson(req), eligible)
         if (!checked.ok) {
           send(400, { error: checked.error })
           return
@@ -6636,6 +6657,24 @@ async function handleApi(
     // Settings → Usage: daily token rows across every workspace.
     if (pathname === '/api/usage' && req.method === 'GET') {
       send(200, deps.usageLog.daily())
+      return
+    }
+
+    // Composer dictation: raw audio bytes in, text out. The configured
+    // provider sees the audio; this server only proxies, it never stores.
+    if (pathname === '/api/speech-to-text/transcribe' && req.method === 'POST') {
+      const resolved = resolveSttApi(deps.modelPair('speech-to-text'), deps.providers())
+      if (!resolved.ok) {
+        send(400, { error: resolved.reason })
+        return
+      }
+      try {
+        const bytes = await readBytes(req, deps.limits.maxAttachmentBytes)
+        const text = await transcribe(resolved.config, bytes, { language: languageOf(req.url) })
+        send(200, { text })
+      } catch (error) {
+        send(502, { error: `transcription failed: ${String(error instanceof Error ? error.message : error)}` })
+      }
       return
     }
 
@@ -6711,6 +6750,9 @@ async function handleApi(
     if (wsMetaMatch !== null && req.method === 'GET') {
       const wsId = decodeURIComponent(wsMetaMatch[1] ?? '') as WorkspaceId
       requireWorkspace(deps, wsId, false)
+      // Opening a workspace warms its enabled MCP servers in the background (ZCode starts
+      // them when a session runtime opens), so after a restart they are up before the first turn.
+      void deps.connectWorkspaceMcp(wsId).catch((error) => console.warn(`web: MCP warm-up failed for ${wsId}: ${String(error instanceof Error ? error.message : error)}`))
       send(200, workspaceMeta(wsId, deps))
       return
     }
@@ -8229,6 +8271,8 @@ async function handleApi(
 
     // ── provider registry (app-wide; selection is per workspace) ──
     if (req.method === 'GET' && pathname === '/api/providers') {
+      // The Settings rail edits every entry; stt-only ones simply never enter
+      // the chat lists below and are marked so the Voice panel can find them.
       send(200, deps.providers().map(publicProvider))
       return
     }
@@ -9900,7 +9944,9 @@ function workspaceMeta(workspaceId: WorkspaceId, deps: HandlerDeps, folder?: str
     ...(deps.yolo ? { yolo: true } : {}),
     mode: { id: state.modeDefinition.definition.id, name: state.modeDefinition.definition.name, revision: state.modeRevision },
     projects,
-    providers: deps.providers().map(publicProvider),
+    // Chat surfaces (composer picker, Environment panel) consume this list:
+    // stt-only providers stay out of it; the Voice panel reads /api/providers.
+    providers: deps.providers().filter((entry) => servesKind(entry, 'chat')).map(publicProvider),
     ...(folder !== undefined ? { folder } : {}),
   }
 }
@@ -10144,11 +10190,13 @@ async function createProvider(
   if (name === '') return { ok: false, status: 400, error: "body needs a non-empty string 'name'" }
   if (baseUrl === '' || !/^https?:\/\//.test(baseUrl)) return { ok: false, status: 400, error: `'${baseUrl}' is not an http(s) URL` }
   const models = Array.isArray(body['models']) ? (body['models'] as unknown[]).filter((model): model is string => typeof model === 'string') : []
+  const kinds = parseKinds(body['kinds'])
   const entry = await deps.mutateProviderStore(({ providers, defaults }) => {
     const base = slugify(name); let id = base; let bump = 2
     while (providers.some((candidate) => candidate.id === id)) id = `${base}-${bump++}`
     const created: ProviderConfig = {
       id, name, baseUrl: baseUrl.replace(/\/$/, ''), apiKey, models, enabled: true,
+      ...(kinds !== undefined ? { kinds } : {}),
       ...((): { modelSettings?: Record<string, ModelSettings> } => {
         const sanitized = sanitizeModelSettings(body['modelSettings'] ?? body['contextLimits'])
         return sanitized !== undefined ? { modelSettings: sanitized } : {}
@@ -10179,6 +10227,10 @@ async function patchProvider(
     if (typeof body['apiKey'] === 'string') entry = { ...entry, apiKey: body['apiKey'].trim() }
     if (typeof body['enabled'] === 'boolean') entry = { ...entry, enabled: body['enabled'] }
     if (models !== undefined) entry = { ...entry, models }
+    if (body['kinds'] !== undefined) {
+      const kinds = parseKinds(body['kinds'])
+      entry = kinds === undefined ? (() => { const { kinds: _dropped, ...rest } = entry; void _dropped; return rest })() : { ...entry, kinds }
+    }
     if (isRecord(body['modelSettings']) || isRecord(body['contextLimits'])) {
       const sanitized = sanitizeModelSettings(body['modelSettings'] ?? body['contextLimits'])
       if (sanitized !== undefined) entry = { ...entry, modelSettings: sanitized }

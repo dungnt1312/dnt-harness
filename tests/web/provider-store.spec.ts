@@ -58,6 +58,20 @@ describe('provider store', () => {
     expect(store.providers[0]).toEqual({ id: 'a', name: 'A', baseUrl: 'http://x/v1', apiKey: '', models: ['first', 'second'], enabled: true })
   })
 
+  it('keeps provider kinds: absent means chat, stt-only stays out of chat lists', () => {
+    const store = parseProviderStore(JSON.stringify({
+      version: 2,
+      defaults: { provider: null, model: null, thinkingLevel: null },
+      providers: [
+        { id: 'chat', name: 'Chat', baseUrl: 'http://x/v1', apiKey: '', models: ['m1'], enabled: true },
+        { id: 'groq-stt', name: 'Groq STT', baseUrl: 'http://y/v1', apiKey: '', models: [], enabled: true, kinds: ['stt'] },
+        { id: 'both', name: 'Both', baseUrl: 'http://z/v1', apiKey: '', models: ['m2'], enabled: true, kinds: ['chat', 'stt'] },
+        { id: 'junk', name: 'Junk', baseUrl: 'http://w/v1', apiKey: '', models: [], enabled: true, kinds: ['stt', 'nonsense'] },
+      ],
+    }))
+    expect(store.providers.map((entry) => entry.kinds ?? ['chat'])).toEqual([['chat'], ['stt'], ['chat', 'stt'], ['stt']])
+  })
+
   it('round-trips a versioned envelope including explicit global defaults', async () => {
     const file = path.join(dir, 'envelope.json')
     await saveProviderStore(file, {

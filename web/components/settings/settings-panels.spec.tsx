@@ -594,7 +594,7 @@ describe('settings dialog', () => {
     expect(sections).toHaveLength(13)
     expect(sections.map((tab) => tab.textContent)).toContain('Sources')
     const sub = [...document.body.querySelectorAll('[aria-label="Providers & Models"] [role="tab"]')]
-    expect(sub.map((tab) => tab.textContent)).toEqual(['Providers', 'Model aliases', 'Images', 'Videos', 'Git'])
+    expect(sub.map((tab) => tab.textContent)).toEqual(['Providers', 'Model aliases', 'Images', 'Videos', 'Voice', 'Git'])
     for (const tab of [...sections, ...sub]) expect(tab.querySelector('svg')).not.toBeNull()
   })
 
@@ -706,7 +706,7 @@ describe('settings dialog', () => {
     // The probe wrote nothing; the dialog asks what to keep.
     expect(document.body.textContent).toContain('2 models offered by this endpoint (1 new)')
     expect(document.body.textContent).toContain('1 selected')
-    const boxes = [...document.body.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')]
+    const boxes = [...document.body.querySelectorAll<HTMLInputElement>('div[role="dialog"][aria-label^="Sync models"] input[type="checkbox"]')]
     expect(boxes.map((box) => box.checked)).toEqual([true, false])
     await act(async () => boxes[1]!.click())
     await act(async () => button('Sync 2 models').click())
@@ -730,7 +730,7 @@ describe('settings dialog', () => {
     ))
     await act(async () => button('Sync from /models').click())
     expect(document.body.textContent).toContain('1 model not offered here stays as it is')
-    const box = document.body.querySelector<HTMLInputElement>('input[type="checkbox"]')!
+    const box = document.body.querySelector<HTMLInputElement>('div[role="dialog"][aria-label^="Sync models"] input[type="checkbox"]')!
     await act(async () => box.click()) // uncheck the only offered model
     await act(async () => button('Sync 0 models').click())
     const rows = [...document.body.querySelectorAll('li')].map((node) => node.textContent ?? '')

@@ -395,9 +395,19 @@ export function subscribeEvents(
   onEnvelope: (envelope: Envelope) => void,
   onState?: (state: StreamState) => void,
 ): () => void {
-  const source = new EventSource(`/api/sessions/${encodeURIComponent(sessionId)}/events`)
-  return wire(source, onEnvelope, onState)
+  return wire((cursor) => `/api/sessions/${encodeURIComponent(sessionId)}/events${cursorSuffix(cursor)}`, onEnvelope, onState)
 }
+
+function cursorSuffix(cursor: number | undefined): string {
+  return cursor !== undefined && Number.isSafeInteger(cursor) && cursor >= 0 ? `?cursor=${cursor}` : ''
+}
+
+/**
+ * Hidden at least this long, the old socket is presumed dead: mobile OSes
+ * suspend a backgrounded page within seconds, and the server's 25 s ping is an
+ * SSE comment the page cannot observe. A needless swap costs one small resume.
+ */
+const RESUME_RECONNECT_MS = 3_000
 
 /** Workspace-scoped subscription (G2): the session's owning workspace is part of the address. */
 export function subscribeEventsIn(
@@ -407,25 +417,67 @@ export function subscribeEventsIn(
   onState?: (state: StreamState) => void,
   cursor?: number,
 ): () => void {
-  const suffix = cursor !== undefined && Number.isSafeInteger(cursor) && cursor >= 0 ? `?cursor=${cursor}` : ''
-  const source = new EventSource(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/events${suffix}`)
-  return wire(source, onEnvelope, onState)
+  return wire((at) => `/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/events${cursorSuffix(at)}`, onEnvelope, onState, cursor)
 }
 
+/**
+ * Mobile browsers freeze a backgrounded page and leave its socket dead or
+ * half-open; the native retry then waits for a TCP timeout or its own delay,
+ * which is slower than a reload. Returning to the page (or regaining network)
+ * after a long hide, or with the source not open, swaps in a fresh source that
+ * resumes from the last seen frame id, the same path a cached navigation uses.
+ */
 function wire(
-  source: EventSource,
+  urlAt: (cursor: number | undefined) => string,
   onEnvelope: (envelope: Envelope, cursor?: number) => void,
   onState?: (state: StreamState) => void,
+  initialCursor?: number,
 ): () => void {
-  source.onopen = () => onState?.('open')
-  source.onerror = () => {
-    onState?.(source.readyState === EventSource.CONNECTING ? 'reconnecting' : 'connecting')
-  }
-  source.onmessage = (message: MessageEvent<string>) => {
+  let lastCursor = initialCursor
+  return resilientSource(() => urlAt(lastCursor), (message) => {
     const cursor = /^\d+$/.test(message.lastEventId ?? '') ? Number(message.lastEventId) : undefined
-    onEnvelope(JSON.parse(message.data) as Envelope, cursor !== undefined && Number.isSafeInteger(cursor) ? cursor : undefined)
+    const safe = cursor !== undefined && Number.isSafeInteger(cursor) ? cursor : undefined
+    if (safe !== undefined) lastCursor = safe
+    onEnvelope(JSON.parse(message.data) as Envelope, safe)
+  }, onState)
+}
+
+/** An EventSource that is swapped for a fresh one on return from a long hide or on a network return (see {@link wire}). */
+function resilientSource(
+  url: () => string,
+  onMessage: (message: MessageEvent<string>) => void,
+  onState?: (state: StreamState) => void,
+): () => void {
+  let hiddenAt = typeof document !== 'undefined' && document.visibilityState === 'hidden' ? Date.now() : undefined
+  let source: EventSource
+  const open = (): void => {
+    const current = new EventSource(url())
+    source = current
+    current.onopen = () => onState?.('open')
+    current.onerror = () => {
+      onState?.(current.readyState === EventSource.CONNECTING ? 'reconnecting' : 'connecting')
+    }
+    current.onmessage = onMessage
   }
+  const reconnect = (): void => {
+    source.close()
+    onState?.('reconnecting')
+    open()
+  }
+  const onVisibility = (): void => {
+    if (document.visibilityState === 'hidden') { hiddenAt ??= Date.now(); return }
+    const away = hiddenAt === undefined ? 0 : Date.now() - hiddenAt
+    hiddenAt = undefined
+    if (away >= RESUME_RECONNECT_MS || source.readyState !== EventSource.OPEN) reconnect()
+  }
+  // Network came back: the socket from before the drop is dead even if it still reports OPEN.
+  const onOnline = (): void => reconnect()
+  open()
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility)
+  if (typeof window !== 'undefined') window.addEventListener('online', onOnline)
   return () => {
+    if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility)
+    if (typeof window !== 'undefined') window.removeEventListener('online', onOnline)
     source.close()
   }
 }
@@ -1182,6 +1234,33 @@ export function setImageUnderstandingSettings(update: ImageUnderstandingSettings
   }).then((r) => json<ImageUnderstandingSettings>(r))
 }
 
+/** Settings → Providers & Models → Speech-to-text: the dictation model (OpenAI-compatible /audio/transcriptions). */
+export type SpeechToTextSettings = ImageGenerationSettings
+
+export function getSpeechToTextSettings(): Promise<SpeechToTextSettings> {
+  return apiFetch('/api/speech-to-text').then((r) => json<SpeechToTextSettings>(r))
+}
+
+export function setSpeechToTextSettings(update: SpeechToTextSettings): Promise<SpeechToTextSettings> {
+  return apiFetch('/api/speech-to-text', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(update),
+  }).then((r) => json<SpeechToTextSettings>(r))
+}
+
+/** Dictate one audio blob to text; the server proxies the configured provider. */
+export async function transcribeSpeech(blob: Blob, language?: string): Promise<string> {
+  const query = language !== undefined && language !== '' ? `?language=${encodeURIComponent(language)}` : ''
+  const response = await apiFetch(`/api/speech-to-text/transcribe${query}`, {
+    method: 'POST',
+    headers: { 'content-type': blob.type !== '' ? blob.type : 'application/octet-stream' },
+    body: blob,
+  })
+  if (!response.ok) throw new Error(((await response.json().catch(() => ({}))) as { error?: string }).error ?? `transcription failed (${response.status})`)
+  return ((await response.json()) as { text: string }).text
+}
+
 /** Settings → Providers & Models → Videos: the provider/model the GenerateVideo tool calls. */
 export type VideoGenerationSettings = ImageGenerationSettings
 
@@ -1933,23 +2012,18 @@ export function resizeTerminal(workspaceId: string, terminalId: string, cols: nu
   }).then(r => json<TerminalRow>(r))
 }
 
-/** One stream per workspace carries every terminal in it (see the server note on connection limits). */
+/**
+ * One stream per workspace carries every terminal in it (see the server note on
+ * connection limits). Every (re)connect opens with a full snapshot, which the
+ * panel treats as the truth, so a swapped source needs no cursor.
+ */
 export function subscribeTerminals(
   workspaceId: string,
   onFrame: (frame: TerminalFrame) => void,
   onState?: (state: StreamState) => void,
 ): () => void {
-  const source = new EventSource('/api/workspaces/' + encodeURIComponent(workspaceId) + '/terminals/events')
-  source.onopen = () => onState?.('open')
-  source.onerror = () => {
-    onState?.(source.readyState === EventSource.CONNECTING ? 'reconnecting' : 'connecting')
-  }
-  source.onmessage = (message: MessageEvent<string>) => {
-    onFrame(JSON.parse(message.data) as TerminalFrame)
-  }
-  return () => {
-    source.close()
-  }
+  const url = '/api/workspaces/' + encodeURIComponent(workspaceId) + '/terminals/events'
+  return resilientSource(() => url, (message) => onFrame(JSON.parse(message.data) as TerminalFrame), onState)
 }
 
 // ── Dangerous command guard ───────────────────────────────────────────────
