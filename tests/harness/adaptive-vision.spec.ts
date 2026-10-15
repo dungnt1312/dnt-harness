@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { adaptRequestVision, supportsNativeVision, textOnlyVisionFallback } from '../../src/harness/llm/adaptive-vision.ts'
-import type { ModelRequest, ToolSchema } from '../../src/harness/llm/types.ts'
+import { supportsNativeVision, textOnlyVisionFallback, withoutDescribeImage } from '../../src/harness/llm/adaptive-vision.ts'
+import type { ToolSchema } from '../../src/harness/llm/types.ts'
 
 const imageMessage = {
   role: 'user' as const,
@@ -22,24 +22,25 @@ describe('adaptive vision', () => {
   })
 
   it('removes image bytes for a non-vision chat and tells the model to call DescribeImage', () => {
-    const [message] = textOnlyVisionFallback([imageMessage])
+    const [message] = textOnlyVisionFallback([imageMessage], true)
     expect(typeof message?.content).toBe('string')
     expect(message?.content).toContain(`attachmentId=${'a'.repeat(64)}`)
     expect(message?.content).toContain('call DescribeImage')
     expect(JSON.stringify(message)).not.toContain('AAAA')
   })
 
-  it('keeps image parts but removes DescribeImage for a native vision model', () => {
-    const request: ModelRequest = { messages: [imageMessage], tools: [tool('Read'), tool('DescribeImage')] }
-    const adapted = adaptRequestVision(request, true)
-    expect(adapted.messages).toEqual([imageMessage])
-    expect(adapted.tools?.map((entry) => entry.name)).toEqual(['Read'])
+  it('without a DescribeImage tool the fallback never names it and says the image cannot be viewed', () => {
+    const [message] = textOnlyVisionFallback([imageMessage], false)
+    expect(typeof message?.content).toBe('string')
+    expect(message?.content).toContain('cannot see image pixels')
+    expect(message?.content).toContain('no image-description tool is available')
+    expect(message?.content).toContain('cannot view the image')
+    expect(message?.content).not.toContain('DescribeImage')
+    expect(JSON.stringify(message)).not.toContain('AAAA')
   })
 
-  it('keeps DescribeImage and text-only messages for a non-vision model', () => {
-    const request: ModelRequest = { messages: [imageMessage], tools: [tool('Read'), tool('DescribeImage')] }
-    const adapted = adaptRequestVision(request, false)
-    expect(adapted.tools?.map((entry) => entry.name)).toEqual(['Read', 'DescribeImage'])
-    expect(typeof adapted.messages[0]?.content).toBe('string')
+  it('a native vision model does not need the DescribeImage schema', () => {
+    expect(withoutDescribeImage([tool('Read'), tool('DescribeImage')])?.map((entry) => entry.name)).toEqual(['Read'])
+    expect(withoutDescribeImage([tool('DescribeImage')])).toBeUndefined()
   })
 })

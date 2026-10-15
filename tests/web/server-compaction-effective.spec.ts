@@ -530,6 +530,58 @@ describe('effective compaction through the web server', () => {
     expect(String(sent[0]!.messages.at(-1)!.content)).toContain(COMPACTION_HANDOFF_MARKER)
   })
 
+  it('the capture is the dispatched request: session controls stamped, no tools in a zero-tool mode', async () => {
+    const seen: ModelRequest[] = []
+    const make = (name: string, model: string): LlmProvider => ({
+      name,
+      models: [model],
+      stream(request) {
+        seen.push(request)
+        return (async function* (): AsyncIterable<StreamEvent> { yield { type: 'delta', delta: 'turn reply' }; yield STOP })()
+      },
+    })
+    // alpha/a1 is the global default; the session picks beta/b1.
+    const { home, base, wsId } = await start([make('alpha', 'a1'), make('beta', 'b1')], { compactionEffectiveEnabled: true })
+    const zero = ['---', 'name: Zero', 'history: compact', 'toolExposure: []', 'workspaceInstructions: false', 'skills: off', 'memoryPinned: false', 'memoryRetrieval: false', '---', '', 'No tools.'].join('\n')
+    expect((await fetch(`${base}/api/workspaces/${wsId}/modes/zero`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: zero }) })).status).toBe(200)
+    const snapshotOf = async (modeId?: string): Promise<{ request: ModelRequest }> => {
+      const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+      const route = `${base}/api/workspaces/${wsId}/sessions/${id}`
+      expect((await fetch(`${route}/model`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ provider: 'beta', model: 'b1' }) })).status).toBe(200)
+      if (modeId !== undefined) expect((await fetch(`${route}/mode`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modeId }) })).status).toBe(200)
+      const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+      await completedMessage(base, wsId, id, logPath, 'question', 1)
+      await until(async () => ((await readLog(logPath)).some((event) => event.type === 'context/snapshot') ? true : undefined))
+      const dir = path.join(home, 'compaction', id, 'snapshots')
+      const file = (await fs.readdir(dir)).find((name) => name.endsWith('.json'))!
+      return JSON.parse(await fs.readFile(path.join(dir, file), 'utf8')) as { request: ModelRequest }
+    }
+    const tooled = await snapshotOf()
+    expect(tooled.request).toMatchObject({ model: 'b1', providerName: 'beta' })
+    expect(seen.at(-1)).toMatchObject({ model: 'b1', providerName: 'beta' })
+    expect(tooled.request.tools).toEqual(seen.at(-1)!.tools)
+    const bare = await snapshotOf('zero')
+    expect(bare.request).toMatchObject({ model: 'b1', providerName: 'beta' })
+    expect(bare.request.tools).toBeUndefined()
+    expect(seen.at(-1)!.tools).toBeUndefined()
+  })
+
+  it('a session with a model and no provider is budgeted on the same window compaction uses', async () => {
+    const { provider: llm } = provider()
+    const { server, home, base, wsId } = await start(llm, {})
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const route = `${base}/api/workspaces/${wsId}/sessions/${id}`
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    await completedMessage(base, wsId, id, logPath, 'first', 1)
+    // A legacy log can name a model without a provider; compaction sizes glm-4.7 by its 200k catalog window.
+    const session = server.kernel.ctx.sessions.get(id as never)!
+    session.append({ type: 'session/model', provider: null, model: 'glm-4.7' })
+    await session.durable()
+    expect((await fetch(`${route}/compact`, { method: 'POST' })).status).toBe(200)
+    const manifest = await (await fetch(`${route}/manifest`)).json() as { budget: { contextLimitTokens: number } }
+    expect(manifest.budget.contextLimitTokens).toBe(200_000)
+  })
+
   it('with the rollout switch OFF it behaves exactly as before: the legacy fold, no snapshot', async () => {
     const { provider: llm, requests } = provider()
     const { home, base, wsId } = await start(llm, {})

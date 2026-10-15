@@ -70,6 +70,21 @@ describe('context estimate honesty', () => {
     expect(fallback.manifest.budget.usedTokens).toBeLessThan(native.manifest.budget.usedTokens)
     expect(String(fallback.messages.at(-1)?.content)).toContain('cannot see image pixels')
   })
+  it('the non-native fallback names DescribeImage only when the request carries it', () => {
+    const log = eventsOf([
+      { type: 'turn/start', turnId: 't' },
+      { type: 'user/message', turnId: 't', content: 'image', attachments: [{ id: 'img', name: 'x.png', mediaType: 'image/png', size: 1 }] },
+    ])
+    const attachments = new Map([['img', { mediaType: 'image/png', base64: 'eA==' }]])
+    const describe = { name: 'DescribeImage', description: 'describe', parameters: { type: 'object' as const, properties: {} } }
+    const read = { name: 'Read', description: 'read', parameters: { type: 'object' as const, properties: {} } }
+    const withTool = buildContext(base({ events: log, attachments, nativeVision: false, schemas: [read, describe] }))
+    expect(String(withTool.messages.at(-1)?.content)).toContain('call DescribeImage')
+    const withoutTool = buildContext(base({ events: log, attachments, nativeVision: false, schemas: [read] }))
+    const text = String(withoutTool.messages.at(-1)?.content)
+    expect(text).toContain('no image-description tool is available')
+    expect(text).not.toContain('DescribeImage')
+  })
   it('keeps token estimates labeled estimated even with a verified model window', () => {
     const assembled = buildContext(base({ budget: { ...DEFAULT_BUDGET, verified: true } }))
     expect(assembled.manifest.budget.estimated).toBe(true)

@@ -1,6 +1,7 @@
 import { adoptPreparedCompaction, type AdoptionOptions, type CheckpointStore, type Restored } from '../harness/context/compaction.ts'
 import type { EffectiveCompactionSnapshot, SnapshotIdentity } from '../harness/context/compaction-snapshot.ts'
 import type { HarnessLimits } from '../harness/limits.ts'
+import { textOnlyVisionFallback } from '../harness/llm/adaptive-vision.ts'
 import type { ModelRequest, StreamEvent, StreamOptions, TokenUsage } from '../harness/llm/types.ts'
 import type { SessionEvent } from '../harness/session/events.ts'
 import type { Session } from '../harness/session/session.ts'
@@ -82,6 +83,8 @@ export interface HostDeps {
   /** Background candidates of this session; absent when precompute is off. */
   readonly candidates?: Pick<CompactionPrecompute, 'waitPending' | 'invalidate' | 'blocked'>
   readonly contextWindowTokens: () => number | undefined
+  /** Whether the model selected now sees image pixels; a text-only target gets the snapshot without images. */
+  readonly nativeVision: () => boolean
   readonly measure: NonNullable<AdoptionOptions['measure']>
   readonly validateFit?: () => void | Promise<void>
   /**
@@ -184,7 +187,10 @@ export class CompactionHost {
     // the user is never asked to pick a path.
     if (choice.kind === 'fold') return this.legacy(request, signal, 'recovery')
 
-    const snapshot = retarget(choice.snapshot, now)
+    const retargeted = retarget(choice.snapshot, now)
+    // The handoff runs no tools, so the fallback must not point at one. The stored snapshot is untouched.
+    const snapshot = deps.nativeVision() ? retargeted
+      : { ...retargeted, request: { ...retargeted.request, messages: textOnlyVisionFallback(retargeted.request.messages, false) } }
     const { path } = choice
     // A snapshot the current model's window cannot take with room for its answer (a switch to a
     // smaller model, a request that grew to the limit) is folded in pieces instead of failing.

@@ -256,9 +256,9 @@ provider list for the Settings panel.
 
 ### Legacy: `PUT /api/model`
 
-Select the active provider and model. The model selector rides the
-**`agent/request` seam**: every step's request is stamped with the selected
-model before the provider sees it.
+Select the active provider and model. Context assembly (`agent/context`)
+stamps every step's request with the selected model before the provider sees
+it.
 
 ```json
 // body
@@ -447,7 +447,7 @@ run and bill something the operator never named.
 `GET …/:wid/meta` returns the same global pair to every workspace, so the
 client's no-conversation pickers target `/api/model-defaults` directly.
 
-Resolution happens per model request through `agent/request`: a change lands
+Resolution happens per model request in context assembly (`agent/context`): a change lands
 on the **next request of a running turn** without interrupting the in-flight
 stream, and the context budget is recomputed for the new model on that same
 request. Each `assistant/message` records the pair that actually served it

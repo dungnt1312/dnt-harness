@@ -130,6 +130,7 @@ async function rig(options: { summary?: string; stream?: (request: ModelRequest,
     legacyCompact: legacy,
     limits: { compactionEffectiveEnabled: options.effective ?? true, compactionDeadlineMs: 5_000, compactionOutputTokens: 8_000, compactionCandidateWaitMs: 15_000 },
     contextWindowTokens: () => 200_000,
+    nativeVision: () => true,
     measure: () => ({ tokensBefore: 5_000, tokensAfter: 1_000 }),
     recordUsage: (u) => usage.push(u),
   }
@@ -255,6 +256,27 @@ describe('CompactionHost.compact: the effective path', () => {
     expect(result).toMatchObject({ kind: 'compacted', path: 'recovery' })
     expect(r.legacy).toHaveBeenCalledTimes(1)
     expect(r.requests.every((request) => !String(request.messages.at(-1)!.content).includes(COMPACTION_HANDOFF_MARKER))).toBe(true)
+  })
+
+  it('a non-native target gets the handoff without image parts and no tool mention; the stored snapshot is untouched', async () => {
+    const image = { role: 'user' as const, content: [{ type: 'text' as const, text: 'look' }, { type: 'image' as const, mediaType: 'image/png', base64: 'AAAA' }] }
+    const withImage = (session: Session): EffectiveCompactionSnapshot => snapshotFor(session, 4, { request: { model: 'm', providerName: 'p', messages: [{ role: 'system', content: 'sys' }, image] } })
+    const text = await rig()
+    const stored = withImage(text.session)
+    text.setExact(stored)
+    text.host.deps = { ...text.host.deps, nativeVision: () => false }
+    await text.host.compact({ trigger: 'manual' })
+    const sent = JSON.stringify(text.requests[0]!.messages)
+    expect(sent).not.toContain('"type":"image"')
+    expect(sent).not.toContain('AAAA')
+    expect(sent).not.toContain('DescribeImage')
+    expect(sent).toContain('cannot see image pixels')
+    expect(stored.request.messages[1]).toBe(image)
+
+    const native = await rig()
+    native.setExact(withImage(native.session))
+    await native.host.compact({ trigger: 'manual' })
+    expect(native.requests[0]!.messages[1]).toEqual(image)
   })
 })
 

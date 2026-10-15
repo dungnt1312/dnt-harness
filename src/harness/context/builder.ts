@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import path from 'node:path'
 import type { ModelMessage, ToolSchema, ContentPart } from '../llm/types.ts'
 import { textOnlyVisionFallback, withoutDescribeImage } from '../llm/adaptive-vision.ts'
+import { DESCRIBE_IMAGE_TOOL } from '../tools/describe-image.ts'
 import type { AttachmentLookup } from '../attachments/store.ts'
 import { deriveDatedMessages, type SessionEvent } from '../session/events.ts'
 import type { Session } from '../session/session.ts'
@@ -597,8 +598,9 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
   // ── history window per setting ─────────────────────────────
   const window = historyWindow(input.events, mode.definition.sources.history, compaction)
   const history = historyMessages(input.events, window, mode.definition.sources.history === 'compact' ? compaction : undefined, input.compactionRetainTokens, input.attachments)
+  const describeAvailable = schemas.some((schema) => schema.name === DESCRIBE_IMAGE_TOOL)
   let dated = input.nativeVision === false
-    ? history.dated.map(entry => ({ ...entry, message: textOnlyVisionFallback([entry.message])[0]! }))
+    ? history.dated.map(entry => ({ ...entry, message: textOnlyVisionFallback([entry.message], describeAvailable)[0]! }))
     : history.dated
   const totalTurns = countTurns(input.events)
 

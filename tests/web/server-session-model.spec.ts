@@ -1,21 +1,24 @@
 import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
-import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createWebServer, type LlmProvider, type ModelRequest, type WebServer } from 'dnt-harness'
+import type { HarnessLimits } from '../../src/harness/limits.ts'
+import { TurnCommandGrants } from '../../src/web/slash-commands.ts'
 
 const servers: WebServer[] = []
 const homes: string[] = []
 
 afterEach(async () => {
+  vi.restoreAllMocks()
   await Promise.all(servers.splice(0).map((server) => server.close()))
   await Promise.all(homes.splice(0).map((home) => fs.rm(home, { recursive: true, force: true })))
 })
 
-async function start(providers: readonly LlmProvider[]): Promise<{ server: WebServer; base: string; home: string }> {
+async function start(providers: readonly LlmProvider[], limits?: Partial<HarnessLimits>): Promise<{ server: WebServer; base: string; home: string }> {
   const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-session-model-'))
   homes.push(home)
-  const server = await createWebServer({ home, providers, configFile: path.join(home, 'providers.json') })
+  const server = await createWebServer({ home, providers, configFile: path.join(home, 'providers.json'), userClaudeDir: path.join(home, 'user-claude'), ...(limits !== undefined ? { limits } : {}) })
   servers.push(server)
   return { server, base: server.url, home }
 }
@@ -56,6 +59,85 @@ async function settle(base: string, workspaceId: string, sessionId: string): Pro
   }
   throw new Error('session did not settle')
 }
+
+describe('slash command model (AC-13, AC-20)', () => {
+  // gpt-5.6 is native vision with a 1M catalog window; glm-4.7 is text-only with 200k.
+  const recorder = (requests: ModelRequest[]): LlmProvider => ({
+    name: 'alpha', models: ['gpt-5.6', 'glm-4.7'],
+    async *stream(request) {
+      requests.push(request)
+      yield { type: 'delta', delta: 'ok' }
+      yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+    },
+  })
+  const command = async (home: string, workspaceId: string, name: string, model: string): Promise<void> => {
+    await fs.mkdir(path.join(home, 'workspaces', workspaceId, 'commands'), { recursive: true })
+    await fs.writeFile(path.join(home, 'workspaces', workspaceId, 'commands', `${name}.md`), `---\ndescription: d\nmodel: ${model}\n---\nAnswer briefly.`, 'utf8')
+  }
+  const sidecarRequest = async (home: string, sessionId: string): Promise<ModelRequest> => {
+    const dir = path.join(home, 'compaction', sessionId, 'snapshots')
+    let file: string | undefined
+    await expect.poll(async () => (file = (await fs.readdir(dir).catch(() => [] as string[])).find((name) => name.endsWith('.json'))), { timeout: 5_000 }).toBeDefined()
+    return (JSON.parse(await fs.readFile(path.join(dir, file!), 'utf8')) as { request: ModelRequest }).request
+  }
+
+  it('a command model with a smaller window drives the budget, the dispatched request and the capture; an invalid one falls back', async () => {
+    const requests: ModelRequest[] = []
+    const { base, home } = await start([recorder(requests)], { compactionEffectiveEnabled: true })
+    const workspaceId = await firstWorkspace(base)
+    await put(base, `/api/workspaces/${workspaceId}/model`, { provider: 'alpha', model: 'gpt-5.6' })
+    await command(home, workspaceId, 'small', 'glm-4.7')
+    await command(home, workspaceId, 'broken', 'no-such-model')
+    const run = async (content: string): Promise<{ manifest: { model: string; provider: string; budget: { contextLimitTokens: number } }; capture: ModelRequest }> => {
+      const { id } = (await (await post(base, `/api/workspaces/${workspaceId}/sessions`)).json()) as { id: string }
+      expect((await post(base, `/api/workspaces/${workspaceId}/sessions/${id}/messages`, { content })).status).toBe(202)
+      await settle(base, workspaceId, id)
+      const manifest = (await (await fetch(`${base}/api/workspaces/${workspaceId}/sessions/${id}/manifest`)).json()) as { model: string; provider: string; budget: { contextLimitTokens: number } }
+      return { manifest, capture: await sidecarRequest(home, id) }
+    }
+    const small = await run('/small hi')
+    expect(requests.at(-1)).toMatchObject({ providerName: 'alpha', model: 'glm-4.7' })
+    expect(small.manifest).toMatchObject({ provider: 'alpha', model: 'glm-4.7', budget: { contextLimitTokens: 200_000 } })
+    expect(small.capture).toMatchObject({ providerName: 'alpha', model: 'glm-4.7' })
+
+    const broken = await run('/broken hi')
+    expect(requests.at(-1)).toMatchObject({ providerName: 'alpha', model: 'gpt-5.6' })
+    expect(broken.manifest).toMatchObject({ provider: 'alpha', model: 'gpt-5.6', budget: { contextLimitTokens: 1_048_576 } })
+    expect(broken.capture).toMatchObject({ providerName: 'alpha', model: 'gpt-5.6' })
+  })
+
+  it('a reconstruction while a command grant is active builds for the session model, not the command model', async () => {
+    // Keep the command grant alive past its turn, so the rebuild runs while it is active.
+    vi.spyOn(TurnCommandGrants.prototype, 'clear').mockImplementation(() => undefined)
+    const requests: ModelRequest[] = []
+    const { base, home } = await start([recorder(requests)], { compactionEffectiveEnabled: true })
+    const workspaceId = await firstWorkspace(base)
+    await put(base, `/api/workspaces/${workspaceId}/model`, { provider: 'alpha', model: 'gpt-5.6' })
+    await command(home, workspaceId, 'small', 'glm-4.7')
+    const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('grant')])
+    const ref = await (await fetch(`${base}/api/workspaces/${workspaceId}/attachments`, { method: 'POST', headers: { 'content-type': 'image/png', 'x-file-name': 'shot.png' }, body: new Uint8Array(png) })).json()
+    const { id } = (await (await post(base, `/api/workspaces/${workspaceId}/sessions`)).json()) as { id: string }
+    const route = `${base}/api/workspaces/${workspaceId}/sessions/${id}`
+    expect((await post(base, `${route.slice(base.length)}/messages`, { content: 'look', attachments: [ref] })).status).toBe(202)
+    await settle(base, workspaceId, id)
+    expect((await post(base, `${route.slice(base.length)}/messages`, { content: '/small hi' })).status).toBe(202)
+    await settle(base, workspaceId, id)
+    // The command turn ran on glm-4.7 (text-only), so its capture carries no image.
+    expect(requests.at(-1)).toMatchObject({ model: 'glm-4.7' })
+    expect(JSON.stringify(requests.at(-1)!.messages)).not.toContain(png.toString('base64'))
+    // A mode switch retires the capture: compaction must rebuild the request from the log.
+    expect((await put(base, `${route.slice(base.length)}/mode`, { modeId: 'plan' })).status).toBe(200)
+    const before = requests.length
+    const compacted = await post(base, `${route.slice(base.length)}/compact`)
+    expect(compacted.status).toBe(200)
+    expect(await compacted.json()).toMatchObject({ path: 'reconstructed' })
+    const handoff = requests.slice(before)
+    expect(handoff).toHaveLength(1)
+    expect(handoff[0]).toMatchObject({ model: 'gpt-5.6' })
+    // Built for gpt-5.6 (native): the image survives. Built for glm-4.7 it would be text.
+    expect(JSON.stringify(handoff[0]!.messages)).toContain(png.toString('base64'))
+  })
+})
 
 describe('workspace session model controls', () => {
   it('executes the submitted draft model even when another conversation changed global defaults', async () => {

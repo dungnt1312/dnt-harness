@@ -52,7 +52,7 @@ import { LlmService } from '../harness/llm/service.ts'
 import { LogicalRequest, classifyTransport } from '../harness/llm/request-lifecycle.ts'
 import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
 import { expressibleThinkingLevel, isThinkingLevel, resolveContextLimit } from '../harness/llm/model-catalog.ts'
-import { adaptRequestVision, supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
+import { supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
 import { ProviderError } from '../harness/llm/types.ts'
 import type { LlmProvider, ModelRequest, StreamEvent, StreamOptions, TokenUsage, ToolCall } from '../harness/llm/types.ts'
 import type { ToolResult } from '../harness/tools/types.ts'
@@ -1516,6 +1516,13 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     return modelBudgetOf(effective.provider ?? undefined, effective.model).contextLimitTokens
   }
 
+  /** Whether the session's model sees image pixels: the same rule and override the chat request uses. */
+  const compactionVisionOf = (entry: SessionEntry): boolean => {
+    const { provider, model } = resolveEffectiveModel(entry.session, entry.workspaceId)
+    const override = provider != null && model != null ? list.find((row) => row.id === provider)?.modelSettings?.[model]?.vision : undefined
+    return supportsNativeVision(model ?? undefined, override)
+  }
+
   /** The identity a snapshot must have been built for, from what the server holds right now. */
   const compactionIdentity = (entry: SessionEntry, prefixHash: string): SnapshotIdentity => {
     const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
@@ -1682,6 +1689,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         limits,
         ...(candidates !== undefined ? { candidates } : {}),
         contextWindowTokens: () => compactionWindowOf(entry),
+        nativeVision: () => compactionVisionOf(entry),
         measure: (next, standing, restored) => measureCheckpoint(entry, next, standing, undefined, restored),
         validateFit: () => { const error = compactFitFailures.get(sessionId); if (error !== undefined) throw error },
         // The session's folder grant as it is NOW (not when the work was done), so a folder
@@ -3607,9 +3615,11 @@ ${entry.description}`.toLowerCase().includes(query))
     // Budget from the CURRENT (provider, model) pair: an operator context
     // override is verified; anything else resolves the catalog's documented
     // window (exact ID → known family → 256k default) as a labeled estimate.
+    // A model without a provider gets the same catalog window compaction uses.
     // A live model change recomputes this on the very next request.
     const budget: ResolvedBudget = (() => {
-      if (effective.provider === undefined || effective.provider === null || effective.model === undefined || effective.model === null) return DEFAULT_BUDGET
+      if (effective.model === undefined || effective.model === null) return DEFAULT_BUDGET
+      if (effective.provider === undefined || effective.provider === null) return modelBudgetOf(undefined, effective.model)
       // Child overrides share this resolver, so context, manifest budget, and
       // request dispatch all reject an unavailable effective pair identically.
       validateProviderModel(effective.provider, effective.model)
@@ -3806,7 +3816,7 @@ ${entry.description}`.toLowerCase().includes(query))
         throw error
       }
     }
-    // Only a dispatched request gets an identity and pinned controls; `agent/request` skips re-resolving it.
+    // Only a dispatched request gets an identity and pinned controls.
     const contextId = sideEffects ? randomUUID() : undefined
     const assembled = contextId === undefined ? built : { ...built, manifest: { ...built.manifest, contextId } }
     if (sideEffects && scope !== undefined) {
@@ -3856,72 +3866,28 @@ ${entry.description}`.toLowerCase().includes(query))
         session.append({ type: 'context/manifest', turnId: scope.turnId, manifest: assembled.manifest })
       }
     }
-    // Arm the effective capture with the request EXACTLY as assembled (root steps only).
+    // The ONE final request: dispatched and captured as the same object. Replace wholesale: when
+    // the mode exposes nothing, tools must LEAVE the request — a spread of `projected` would
+    // resurrect the full schema list.
+    const { tools: _projectedTools, ...base } = projected
+    void _projectedTools
+    const request: ModelRequest = {
+      ...base,
+      ...(contextId === undefined ? {} : {
+        ...(effective.model != null ? { model: effective.model } : {}),
+        ...(effective.provider != null ? { providerName: effective.provider } : {}),
+        ...(thinkingLevel != null ? { thinkingLevel } : {}),
+        contextId,
+      }),
+      messages: assembled.messages,
+      ...(assembled.tools !== undefined ? { tools: assembled.tools } : {}),
+    }
+    // Arm the effective capture with the request EXACTLY as dispatched (root steps only).
     if (sideEffects && limits.compactionEffectiveEnabled && scope !== undefined && scope.childOf === undefined && scope.turnId !== undefined) {
-      captures.arm(scope.sessionId, scope.turnId, { ...projected, messages: assembled.messages, ...(assembled.tools !== undefined ? { tools: assembled.tools } : {}) }, assembled.compactionProjection)
+      captures.arm(scope.sessionId, scope.turnId, request, assembled.compactionProjection)
     }
-    // Replace wholesale: when the mode exposes nothing, tools must LEAVE the
-    // request — a spread of `projected` would resurrect the full schema list.
-    const controls = contextId === undefined ? {} : {
-      ...(effective.model != null ? { model: effective.model } : {}),
-      ...(effective.provider != null ? { providerName: effective.provider } : {}),
-      ...(thinkingLevel != null ? { thinkingLevel } : {}),
-      contextId,
-    }
-    const replacement: ModelRequest = { ...projected, ...controls, messages: assembled.messages }
-    if (assembled.tools !== undefined) return { assembled, request: { ...replacement, tools: assembled.tools }, commitPrefix }
-    const { tools: _dropped, ...withoutTools } = replacement
-    void _dropped
-    return { assembled, request: withoutTools, commitPrefix }
+    return { assembled, request, commitPrefix }
   }
-
-  // Live model + provider control, scoped to the executing turn's
-  // workspace: every step's request is stamped with that workspace's pair.
-  // The provider rides as trusted execution metadata — dispatch resolves it
-  // by id, never through the process-global selection pointer, so two
-  // workspaces on different providers cannot cross streams.
-  kernel.ctx.on('agent/request', async (request, next) => {
-    // Context assembly already pinned controls and adapted vision before measuring.
-    if (request.contextId !== undefined) return next(request)
-    const scope = agentScope.getStore()
-    const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
-    const state = controlsFor(workspaceId)
-    const session = await scopedSession(scope?.sessionId)
-    const conversation = session === undefined
-      ? { provider: defaults.provider, model: defaults.model, thinkingLevel: defaults.thinkingLevel }
-      : resolveEffectiveModel(session, workspaceId)
-    // A slash command's `model:` (Claude) runs the turn it started on that
-    // model; one this host cannot serve keeps the conversation's.
-    const commandModel = scope?.childOf === undefined ? turnCommandGrants.model(scope?.sessionId) : undefined
-    let effective = conversation
-    if (commandModel !== undefined && session !== undefined) {
-      try {
-        const picked = childModelFor(session, workspaceId, undefined, commandModel)
-        if (picked !== undefined) effective = { ...conversation, provider: picked.provider, model: picked.model }
-      } catch {
-        // Unservable here: the conversation's model stands.
-      }
-    }
-    const model = effective.model ?? undefined
-    const provider = effective.provider ?? undefined
-    if (provider !== undefined && model !== undefined) validateProviderModel(provider, model)
-    // Explicit null session thinking deliberately falls through to this
-    // model's configured default, never back to workspace thinking.
-    const thinkingLevel = effective.thinkingLevel
-      ?? (model !== undefined && provider !== undefined
-        ? list.find((entry) => entry.id === provider)?.modelSettings?.[model]?.thinkingLevel
-        : undefined)
-    const stamped = {
-      ...request,
-      ...(model !== undefined ? { model } : {}),
-      ...(provider !== undefined ? { providerName: provider } : {}),
-      ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
-    }
-    const visionOverride = model !== undefined && provider !== undefined
-      ? list.find((entry) => entry.id === provider)?.modelSettings?.[model]?.vision
-      : undefined
-    return next(adaptRequestVision(stamped, supportsNativeVision(model, visionOverride)))
-  })
 
   const pending = new Map<string, PendingApproval>()
 
