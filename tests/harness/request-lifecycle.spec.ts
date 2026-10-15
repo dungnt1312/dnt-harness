@@ -79,6 +79,29 @@ describe('context accounting attempt usage', () => {
       for (const fact of terminal) expect(fact).toMatchObject({ contextId: 'ctx-return', usage })
     } finally { owner.dispose() }
   })
+
+  it('records one terminal fact with usage when the consumer returns after transport settled', async () => {
+    const facts: import('../../src/harness/llm/request-lifecycle.ts').AttemptFact[] = []
+    const owner = new LogicalRequest()
+    const admission = new AttemptAdmission(1)
+    const usage = { inputTokens: 10, cachedInputTokens: 4 }
+    const iterator = runAttempt({ async *stream(_request: unknown, options?: StreamOptions) {
+      options?.onTransportSettled?.()
+      yield { type: 'usage', usage } as const
+      yield completion
+    } }, { messages: [], contextId: 'ctx-settled' }, {
+      owner, admission, recordAttempt: async fact => { facts.push(fact) },
+    })[Symbol.asyncIterator]()
+    try {
+      expect((await iterator.next()).value).toMatchObject({ type: 'usage' })
+      await iterator.return?.()
+      expect(admission.active).toBe(0)
+      const terminal = facts.filter(f => f.state !== 'start')
+      expect(terminal).toHaveLength(1)
+      expect(terminal[0]).toMatchObject({ state: 'end', contextId: 'ctx-settled', usage, transportSettled: true })
+      expect(facts.some(f => f.state === 'uncertain')).toBe(false)
+    } finally { owner.dispose() }
+  })
 })
 
 describe('aggregate request lifecycle', () => {

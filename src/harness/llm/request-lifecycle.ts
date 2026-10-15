@@ -180,6 +180,7 @@ export async function* runAttempt(provider: { stream(request: ModelRequest, opti
   const settlement = new Promise<void>(resolve => { resolveSettlement = resolve })
   const onTransportSettled = (): void => { settled = true; resolveSettlement(); reconcile?.() }
   let committed = false
+  let ended = false
   let fact: AttemptFact | undefined
   const queuedAt = Date.now()
   let firstProgressAt: number | undefined
@@ -188,6 +189,7 @@ export async function* runAttempt(provider: { stream(request: ModelRequest, opti
   let usage: TokenUsage | undefined
   const notify = async (state: AttemptFact['state'], reason?: ProviderError['reason']): Promise<void> => {
     if (!fact) return
+    if (state === 'end') ended = true
     const next: AttemptFact = { ...fact, state, committed, transportSettled: settled, ...(state !== 'start' ? { endedAt: Date.now(), ...(usage !== undefined ? { usage } : {}) } : {}), ...(firstProgressAt !== undefined ? { firstProgressAt } : {}), ...(lastProgressAt !== undefined ? { lastProgressAt } : {}), ...(finish ? { finish } : {}), ...(reason ? { reason } : {}) }
     try { observer?.(next) } catch { /* optional telemetry cannot change execution */ }
     await options.recordAttempt?.(next)
@@ -263,8 +265,11 @@ export async function* runAttempt(provider: { stream(request: ModelRequest, opti
   } finally {
     if (timer) clearTimeout(timer)
     owner.signal.removeEventListener('abort', abort); options.signal?.removeEventListener('abort', abort)
-    if (settled || !iterator) ticket?.release()
-    else if (fact && ticket) {
+    if (settled || !iterator) {
+      ticket?.release()
+      // Consumer return after the transport settled still owes the terminal fact (and its usage).
+      if (settled && iterator && !ended) await notify('end')
+    } else if (fact && ticket) {
       controller.abort(failure('cancelled'))
       const retained = { ...fact, ...(usage !== undefined ? { usage } : {}), state: 'uncertain' as const, committed, transportSettled: false }
       admission.uncertain.set(fact.attemptId, retained)

@@ -22,10 +22,21 @@ describe('canonical attempt event readers', () => {
     { ...manifest(), breakdown: { ...manifest().breakdown, messages: 1 } },
     { ...manifest('forbidden-request-id') },
     { ...manifest(), usage: { last: { inputTokens: 1 } } },
+    (({ history: _history, ...rest }) => rest)(manifest()),
+    (({ sources: _sources, ...rest }) => rest)(manifest()),
+    { ...manifest(), history: { setting: 'bogus' } },
+    { ...manifest(), modeRevision: '1' },
+    { ...manifest(), omissions: [1] },
   ])('rejects malformed post-compact estimates %#', async contextAfter => {
     await expect(read([{ type: 'compaction/end', trigger: 'manual', coversSeq: 1,
       summary: 'SUMMARY', summaryChars: 7, durationMs: 1, contextEffect: 'replaced', contextAfter,
     }])).rejects.toMatchObject({ kind: 'schema' })
+  })
+
+  it('loads a full post-compact manifest and legacy compaction rows without one', async () => {
+    const base = { type: 'compaction/end', trigger: 'manual', coversSeq: 1, summary: 'SUMMARY', summaryChars: 7, durationMs: 1 }
+    expect((await read([{ ...base, contextEffect: 'replaced', contextAfter: manifest() }])).events).toHaveLength(1)
+    expect((await read([base])).events).toHaveLength(1)
   })
 
   it('rejects forged request context identities while preserving legacy manifest rows', async () => {

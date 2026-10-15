@@ -92,6 +92,11 @@ function validCompactionMetrics(record: Record<string, unknown>): boolean {
   const after = record['contextAfter']
   if (after !== undefined) {
     if (record['error'] !== undefined || effect === 'unchanged' || !object(after) || after['contextId'] !== undefined || after['usage'] !== undefined) return false
+    const strings = (v: unknown): boolean => Array.isArray(v) && v.every(item => typeof item === 'string')
+    const history = after['history']; const sources = after['sources']
+    if (typeof after['modeId'] !== 'string' || typeof after['modeRevision'] !== 'number'
+      || !object(history) || !['none', 'recent', 'compact'].includes(history['setting'] as string)
+      || !object(sources) || !strings(sources['toolNames']) || !strings(after['omissions'])) return false
     const budget = after['budget']; const breakdown = after['breakdown']
     if (!object(budget) || !object(breakdown) || budget['estimated'] !== true
       || !tokenCount(budget['usedTokens']) || !tokenCount(budget['availableTokens'])

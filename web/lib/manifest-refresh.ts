@@ -1,3 +1,4 @@
+import { isValidContextId, isValidTokenUsage } from '../../src/harness/context/context-metrics.ts'
 import type { SseEvent } from './types.ts'
 
 /**
@@ -9,12 +10,20 @@ import type { SseEvent } from './types.ts'
  * request, so automatic compaction refreshes the meter too. Streaming chunks never change the key.
  */
 const REFRESH_TYPES: ReadonlySet<string> = new Set(['context/manifest', 'step/end', 'step/abandoned', 'turn/end', 'compaction/end'])
+const ATTEMPT_TYPES: ReadonlySet<string> = new Set(['model/attempt', 'execution/uncertain', 'execution/reconciled'])
 
-/** Last request/step/turn boundary plus explicit compaction, not streaming token count. */
-export function manifestRefreshKey(events: readonly Pick<SseEvent, 'seq' | 'type'>[], compactNonce: number): string {
+/** A terminal attempt fact that carries a valid measurement for a known request. */
+const isMeasurement = (event: Pick<SseEvent, 'type' | 'fact'>): boolean => {
+  const fact = event.fact
+  return ATTEMPT_TYPES.has(event.type) && fact !== undefined && fact.state !== 'start'
+    && isValidContextId(fact.contextId) && isValidTokenUsage(fact.usage)
+}
+
+/** Last request/step/turn boundary, measurement or explicit compaction, not streaming token count. */
+export function manifestRefreshKey(events: readonly Pick<SseEvent, 'seq' | 'type' | 'fact'>[], compactNonce: number): string {
   for (let index = events.length - 1; index >= 0; index--) {
     const event = events[index]
-    if (event !== undefined && REFRESH_TYPES.has(event.type)) return `${event.seq}:${compactNonce}`
+    if (event !== undefined && (REFRESH_TYPES.has(event.type) || isMeasurement(event))) return `${event.seq}:${compactNonce}`
   }
   return `0:${compactNonce}`
 }

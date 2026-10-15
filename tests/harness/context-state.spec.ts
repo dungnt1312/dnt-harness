@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import * as accounting from '../../src/harness/context/context-state.ts'
 import type { ContextManifest } from '../../src/harness/context/builder.ts'
 import { manifest, row, attempt } from '../fixtures/context-accounting.ts'
@@ -61,6 +61,16 @@ describe('request-scoped context state', () => {
     expect(r.apply([row(3, { type: 'assistant/chunk', delta: 'x' })])).toEqual([])
     expect(r.current()).toBe(before)
     expect(accounting.deriveContextState(events, 's')).toEqual(before)
+  })
+  it('keeps the first report for a repeated attemptId with different usage and warns statically', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const r = accounting.createContextReducer<ContextManifest>('s')
+      r.apply([assembled(1, 'a'), attempt(2, 'a', 'p1', usage), attempt(3, 'a', 'p1', { inputTokens: 1, cachedInputTokens: 0 }, 'reconciled')])
+      expect(r.current()?.usage).toMatchObject({ last: usage, cacheableInputTokens: 120_000, cachedInputTokens: 110_000 })
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(warn).toHaveBeenCalledWith('conflicting usage for repeated attempt')
+    } finally { warn.mockRestore() }
   })
   it('pins optional session identity and keeps legacy manifests estimated', () => {
     const r = accounting.createContextReducer<ContextManifest>()
