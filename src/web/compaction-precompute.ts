@@ -110,10 +110,13 @@ export class CompactionPrecompute {
     return false
   }
 
-  /** Starts a background generation. False when a usable one already exists, the session is blocked, or this exact attempt already failed. */
+  /** Starts a background generation. False when a usable one already exists, the session is blocked, the snapshot could never be adopted, or this exact attempt already failed. */
   async start(snapshot: EffectiveCompactionSnapshot, parent: AbortSignal): Promise<boolean> {
     const sessionId = snapshot.sessionId
     if (this.closed || this.blocked(sessionId)) return false
+    // Built on another seed than the checkpoint standing now (e.g. cut before that checkpoint's own
+    // compaction events): adoption would refuse it, so never pay for it or let it displace a job.
+    if (this.deps.seedHash(sessionId) !== snapshot.seedHash) return false
     const existing = this.jobs.get(sessionId)
     if (existing !== undefined) {
       // A job still generating is never displaced. A finished one stays only while it can still be

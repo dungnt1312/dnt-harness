@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Kernel, Session, type TurnId } from 'dnt-harness'
-import { CheckpointStore, recoverCanonicalCheckpoint } from '../../src/harness/context/compaction.ts'
+import { CheckpointStore, adoptPreparedCompaction, recoverCanonicalCheckpoint } from '../../src/harness/context/compaction.ts'
 import { sourceDigest } from '../../src/harness/context/compaction-digest.ts'
 import type { CompactionProjection } from '../../src/harness/context/compaction-projection.ts'
 import type { EffectiveCompactionSnapshot, SnapshotIdentity } from '../../src/harness/context/compaction-snapshot.ts'
@@ -424,6 +424,24 @@ describe('CompactionHost.compact: a precomputed candidate', () => {
     await expect(r.host.compact({ trigger: 'manual' })).rejects.toThrow(/seed/)
     expect(recoverCanonicalCheckpoint(r.session.committedEvents)).toBeUndefined()
     expect(r.requests).toHaveLength(0)
+  })
+
+  it('a snapshot cut before the standing checkpoint\'s own events is never summarized: no handoff call, the fold runs instead', async () => {
+    // t1 (1-4), t2 (5-8) closes, THEN a candidate for t1 is adopted (9-10). The snapshot of t2
+    // was captured with no seed, so adoption would refuse it after a paid model call.
+    const r = await rig()
+    turn(r.session, 't2', 'second', 'a2')
+    await r.session.durable()
+    await adoptPreparedCompaction(r.session, r.checkpoints, { summary: 'CANDIDATE', cutoff: 4, sourceDigest: sourceDigest(r.session.committedEvents, 4) },
+      { trigger: 'manual', signal: new AbortController().signal, validate: async () => {} })
+    expect(recoverCanonicalCheckpoint(r.session.committedEvents)?.coversSeq).toBe(4)
+    r.setExact(snapshotFor(r.session, 8))
+    r.setReconstructed(snapshotFor(r.session, 8, { id: 'rebuilt' }))
+    expect(await r.host.compact({ trigger: 'manual' })).toMatchObject({ kind: 'compacted', path: 'recovery', coversSeq: 8 })
+    expect(r.legacy).toHaveBeenCalledTimes(1)
+    expect(r.requests).toHaveLength(1) // the fold only
+    expect(String(r.requests[0]!.messages[0]!.content)).not.toContain(COMPACTION_HANDOFF_MARKER)
+    expect(r.session.events.some((event) => event.type === 'compaction/end' && event.error !== undefined)).toBe(false)
   })
 
   it('when the identity changed while it waited the adoption refuses; nothing stale is installed', async () => {

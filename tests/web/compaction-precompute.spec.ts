@@ -206,8 +206,8 @@ describe('CompactionPrecompute: one job per session', () => {
 describe('CompactionPrecompute: pending → ready', () => {
   it('has nothing to take while pending, then yields the prepared summary exactly once', async () => {
     const r = rig()
-    await r.manager.start(snapshot({ seedHash: 'seed-a' }), signal())
     r.state.seed = 'seed-a'
+    await r.manager.start(snapshot({ seedHash: 'seed-a' }), signal())
     await vi.waitFor(() => expect(r.s.calls).toHaveLength(1))
     expect(await r.manager.takeReady('s1')).toBeUndefined()
     r.s.calls[0]!.finish()
@@ -473,5 +473,16 @@ describe('CompactionPrecompute.waitPending: the manual compaction meets a candid
     r.s.calls[0]!.finish()
     expect(await waiting).toBeUndefined()
     expect(r.reports.at(-1)).toMatchObject({ kind: 'discarded', reason: 'seed-changed' })
+  })
+
+  it('never starts a snapshot built on a different seed than the checkpoint that stands: it could never be adopted', async () => {
+    // e.g. a snapshot cut before the standing checkpoint's own compaction events (seed "none" at its cutoff).
+    const r = rig()
+    r.state.seed = 'standing'
+    expect(await r.manager.start(snapshot({ cutoff: 8 }), signal())).toBe(false)
+    await flush()
+    expect(r.s.calls).toHaveLength(0)
+    expect(r.manager.pinned('s1')).toBeUndefined()
+    expect(await r.manager.start(snapshot({ cutoff: 8, seedHash: 'standing' }), signal())).toBe(true)
   })
 })

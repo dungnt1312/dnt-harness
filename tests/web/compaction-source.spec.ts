@@ -95,7 +95,20 @@ describe('chooseCompactionSource', () => {
     expect(choice).toMatchObject({ kind: 'fold', reason: 'no-eligible-snapshot' })
     // The same log with a snapshot that DOES cover the new turn is chosen.
     const newest = withCheckpoint.findLast((event) => event.type === 'turn/end')!.seq
-    expect(chooseCompactionSource({ events: withCheckpoint, exact: snapshotFor(withCheckpoint, newest, { projection: { v: 1, policyVersion: 1, history: 'compact', seed: { coversSeq: 4, hash: compactionSeedHash('S') }, sources: snapshotFor(withCheckpoint, newest).projection.sources.filter((source) => source.seq > 6), losses: [] } }), identity })).toMatchObject({ kind: 'snapshot', path: 'exact' })
+    expect(chooseCompactionSource({ events: withCheckpoint, exact: snapshotFor(withCheckpoint, newest, { seedHash: compactionSeedHash('S'), projection: { v: 1, policyVersion: 1, history: 'compact', seed: { coversSeq: 4, hash: compactionSeedHash('S') }, sources: snapshotFor(withCheckpoint, newest).projection.sources.filter((source) => source.seq > 6), losses: [] } }), identity })).toMatchObject({ kind: 'snapshot', path: 'exact' })
+  })
+
+  it('refuses a snapshot whose cutoff lies before the standing checkpoint\'s own compaction events: adoption would reject its seed', () => {
+    // t1 (1-4), t2 (5-8), then a candidate for t1 adopted (9-10): the checkpoint covers 4,
+    // but the seed AT cutoff 8 is "none", not the checkpoint that stands now.
+    const base = log([...turnRows('t1', 'first', 'a1'), ...turnRows('t2', 'second', 'a2')])
+    const late = log([
+      ...turnRows('t1', 'first', 'a1'), ...turnRows('t2', 'second', 'a2'),
+      { type: 'compaction/start', trigger: 'manual', adoption: { v: 1, transactionId: 'x', cutoff: 4 } },
+      { type: 'compaction/end', trigger: 'manual', coversSeq: 4, summaryChars: 1, durationMs: 1, summary: 'S', adoption: { v: 1, transactionId: 'x', cutoff: 4, sourceDigest: sourceDigest(base, 4) } },
+    ])
+    const doomed = snapshotFor(late, 8)
+    expect(chooseCompactionSource({ events: late, exact: doomed, reconstructed: doomed, identity })).toEqual({ kind: 'fold', reason: 'no-eligible-snapshot', cutoff: 8 })
   })
 
   it('reports nothing to do when the newest closed turn is already the checkpoint', () => {

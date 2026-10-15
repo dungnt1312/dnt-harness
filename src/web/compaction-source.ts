@@ -1,4 +1,5 @@
 import { isCompletedCompactionBoundary, recoverCanonicalCheckpoint } from '../harness/context/compaction.ts'
+import { compactionSeedHash } from '../harness/context/compaction-digest.ts'
 import { validateSnapshot, type EffectiveCompactionSnapshot, type SnapshotIdentity } from '../harness/context/compaction-snapshot.ts'
 import type { SessionEvent } from '../harness/session/events.ts'
 
@@ -49,10 +50,13 @@ function sameIdentity(a: SnapshotIdentity, b: SnapshotIdentity): boolean {
   return a.modeHash === b.modeHash && a.grantsHash === b.grantsHash && a.policyVersion === b.policyVersion
 }
 
-function usable(snapshot: EffectiveCompactionSnapshot | undefined, events: readonly SessionEvent[], standing: number, identity: SnapshotIdentity): snapshot is EffectiveCompactionSnapshot {
+function usable(snapshot: EffectiveCompactionSnapshot | undefined, events: readonly SessionEvent[], standing: number, standingSeed: string | undefined, identity: SnapshotIdentity): snapshot is EffectiveCompactionSnapshot {
   if (snapshot === undefined) return false
   // A snapshot at or before the checkpoint that stands would summarize what is already summarized.
   if (snapshot.cutoff <= standing) return false
+  // Adoption's rule: built on exactly the checkpoint that stands now. A cutoff before that
+  // checkpoint's own compaction events was seeded by an older one; refuse before any model call.
+  if (snapshot.seedHash !== standingSeed) return false
   if (!sameIdentity(snapshot.identity, identity)) return false
   return validateSnapshot(snapshot, events).ok
 }
@@ -60,9 +64,11 @@ function usable(snapshot: EffectiveCompactionSnapshot | undefined, events: reado
 export function chooseCompactionSource(input: ChooseInput): SourceChoice {
   const newest = newestClosedCutoff(input.events)
   if ('reason' in newest) return { kind: 'unavailable', reason: newest.reason }
-  const standing = recoverCanonicalCheckpoint(input.events)?.coversSeq ?? 0
+  const checkpoint = recoverCanonicalCheckpoint(input.events)
+  const standing = checkpoint?.coversSeq ?? 0
+  const seed = checkpoint === undefined ? undefined : compactionSeedHash(checkpoint.summary)
   if (standing >= newest.cutoff) return { kind: 'noop', reason: 'already-compacted', cutoff: standing }
-  if (usable(input.exact, input.events, standing, input.identity)) return { kind: 'snapshot', snapshot: input.exact, path: 'exact' }
-  if (usable(input.reconstructed, input.events, standing, input.identity)) return { kind: 'snapshot', snapshot: input.reconstructed, path: 'reconstructed' }
+  if (usable(input.exact, input.events, standing, seed, input.identity)) return { kind: 'snapshot', snapshot: input.exact, path: 'exact' }
+  if (usable(input.reconstructed, input.events, standing, seed, input.identity)) return { kind: 'snapshot', snapshot: input.reconstructed, path: 'reconstructed' }
   return { kind: 'fold', reason: 'no-eligible-snapshot', cutoff: newest.cutoff }
 }
