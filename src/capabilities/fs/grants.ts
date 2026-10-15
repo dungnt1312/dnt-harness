@@ -76,12 +76,18 @@ export async function realTargetOf(abs: string): Promise<string> {
   return existing === abs ? realExisting : path.join(realExisting, path.relative(existing, abs))
 }
 
+/** Denial shared by every check below: the host refuses these roots in every
+ * mode (including Full access) and no approval can allow them. */
+export function deniedRootMessage(target: string, resolved = false): string {
+  return `path '${target}' ${resolved ? 'resolves into' : 'is inside'} application-internal storage or a protected credential folder; the host refuses it in every mode (including Full access) and it cannot be approved`
+}
+
 async function assertNotDenied(target: string, abs: string, realTarget: string, deniedRoots?: readonly string[]): Promise<void> {
   if (deniedRoots === undefined) return
   for (const denied of deniedRoots) {
     const deniedReal = await realpathSafe(denied)
     if (within(denied, abs) || within(deniedReal, realTarget)) {
-      throw new Error(`path '${target}' is inside application-internal storage or a protected credential folder and is not accessible to tools`)
+      throw new Error(deniedRootMessage(target))
     }
   }
 }
@@ -272,7 +278,7 @@ export async function resolveInGrants(exec: ToolExecution, target: string, inten
     case 'blocked':
       throw new Error(`path '${target}' is refused: ${classified.reason}`)
     case 'denied':
-      throw new Error(`path '${target}' is inside application-internal storage or a protected credential folder and is not accessible to tools`)
+      throw new Error(deniedRootMessage(target))
     case 'read-only':
       throw new Error(`path '${target}' is in a read-only granted folder (${classified.root.path})`)
     case 'in-grant': {

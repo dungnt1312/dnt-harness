@@ -21,7 +21,7 @@ import type { Context } from '../kernel/index.ts'
 import { agentScope } from '../harness/agent/scope.ts'
 import type { ToolCall } from '../harness/llm/types.ts'
 import type { ApprovedPath, PathIntent, PreExecuteDecision, ToolExecution } from '../harness/tools/types.ts'
-import { classifyTarget, realTargetOf, targetPaths } from '../capabilities/fs/grants.ts'
+import { classifyTarget, deniedRootMessage, realTargetOf, targetPaths } from '../capabilities/fs/grants.ts'
 import { currentToolExecution } from '../harness/tools/execution-scope.ts'
 
 /** One out-of-grant path a pending call targets. */
@@ -108,7 +108,7 @@ export function attachPathScopeGuard(ctx: Context, options: PathScopeOptions): P
         case 'blocked':
           return { kind: 'deny', reason: `path '${target.target}' is refused: ${classified.reason}` }
         case 'denied':
-          return { kind: 'deny', reason: `path '${target.target}' is inside application-internal storage or a protected credential folder and is not accessible to tools` }
+          return { kind: 'deny', reason: deniedRootMessage(target.target) }
         case 'read-only':
           return { kind: 'deny', reason: `path '${target.target}' is in a read-only granted folder (${classified.root.path})` }
         case 'in-grant':
@@ -121,7 +121,7 @@ export function attachPathScopeGuard(ctx: Context, options: PathScopeOptions): P
           if (real !== classified.abs) {
             const realClass = classifyTarget(grant, real, target.intent)
             if (realClass.kind === 'denied' || realClass.kind === 'blocked') {
-              return { kind: 'deny', reason: `path '${target.target}' resolves into application-internal storage or a protected credential folder and is not accessible to tools` }
+              return { kind: 'deny', reason: deniedRootMessage(target.target, true) }
             }
             if (realClass.kind === 'read-only') {
               return { kind: 'deny', reason: `path '${target.target}' resolves into a read-only granted folder (${realClass.root.path})` }
