@@ -21,6 +21,7 @@
  * questions — answered by `POST /api/approvals/:id`.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { isIP } from 'node:net'
 import { execFile } from 'node:child_process'
 import { createReadStream } from 'node:fs'
 import { bearerAllows, CLEARED_SESSION_COOKIE, ControlPlaneAuthService, isPublicPath, readSessionCookie } from './control-plane-auth.ts'
@@ -6780,6 +6781,8 @@ async function handleApi(
     if (wsMetaMatch !== null && req.method === 'GET') {
       const wsId = decodeURIComponent(wsMetaMatch[1] ?? '') as WorkspaceId
       requireWorkspace(deps, wsId, false)
+      // Opening a workspace brings its enabled MCP servers up (after a restart nothing else would until the first turn).
+      void deps.connectWorkspaceMcp(wsId).catch((error) => console.error(`web: MCP config/start failed for ${wsId}: ${String(error instanceof Error ? error.message : error)}`))
       send(200, workspaceMeta(wsId, deps))
       return
     }
@@ -10950,9 +10953,12 @@ function installLabel(hostHeader: string | undefined): string | undefined {
   return hostname
 }
 
-/** Host first: taskbars truncate the tail, and the host is the part that differs. */
+/**
+ * Host first: taskbars truncate the tail, and the host is the part that differs.
+ * Launchers fit ~12 characters under an icon, so short_name keeps only the first DNS label.
+ */
 function manifestWithHost(manifest: Record<string, unknown>, host: string): Record<string, unknown> {
-  return { ...manifest, name: `${host} · dnt-harness`, short_name: host }
+  return { ...manifest, name: `${host} · dnt-harness`, short_name: isIP(host) === 0 ? host.split('.')[0] : host }
 }
 
 function brandManifest(content: Buffer, host: string): Buffer {
