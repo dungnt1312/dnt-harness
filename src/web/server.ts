@@ -10658,8 +10658,11 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     }
     return 0
   }
+  const toFrame = (event: SessionEvent): WebEnvelope => ({ kind: 'session', event: event.type === 'compaction/restoration' ? withoutRestorationText(event) : event })
   const heldSeq = findHeldCompaction()
-  if (heldSeq > 0) held = { seq: heldSeq, queue: [] }
+  // The replay below stops before the held success, so the success and the
+  // tail already appended behind it seed the queue: they ship on commit.
+  if (heldSeq > 0) held = { seq: heldSeq, queue: session.events.filter((event) => event.seq >= heldSeq && event.type !== 'context/body').map((event) => ({ envelope: toFrame(event), sequence: event.seq })) }
   // Both replay shapes are compacted: a fresh snapshot otherwise ships every
   // raw chunk of the session's history, and a long-disconnect resume replays
   // the same bulk. Sequence numbers stay untouched so the client's seen-cursor
@@ -10691,9 +10694,16 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
 
   const disposeSession = deps.kernel.ctx.on('session/event', (emitter, event) => {
     if (emitter.id !== session.id || event.type === 'context/body') return
-    const frame = { kind: 'session' as const, event: event.type === 'compaction/restoration' ? withoutRestorationText(event) : event }
-    // A failed end never publishes a checkpoint: it drops any hold instead.
-    if (event.type === 'compaction/end' && event.error !== undefined) { held = undefined; streamFrame(frame, event.seq); return }
+    const frame = toFrame(event)
+    // A failed end never publishes a checkpoint: it drops the uncommitted
+    // success (the queue head) and releases what queued behind it.
+    if (event.type === 'compaction/end' && event.error !== undefined) {
+      const dropped = held
+      held = undefined
+      for (const { envelope, sequence } of dropped?.queue.slice(1) ?? []) streamFrame(envelope, sequence)
+      streamFrame(frame, event.seq)
+      return
+    }
     if (held !== undefined) {
       // Behind an uncommitted success: queue instead of shipping. The success
       // itself is the hold's head, so it is queued exactly once, at its seq.
@@ -10701,8 +10711,8 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
       return
     }
     if (event.type === 'compaction/end' && event.error === undefined && event.seq > session.committedSeq) {
-      // The success appended but its barrier has not committed: hold from here.
-      held = { seq: event.seq, queue: [] }
+      // The success appended but its barrier has not committed: it heads the hold.
+      held = { seq: event.seq, queue: [{ envelope: frame, sequence: event.seq }] }
       return
     }
     streamFrame(frame, event.seq)

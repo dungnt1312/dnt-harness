@@ -132,6 +132,39 @@ const hasEvent = (type: string) => (envelopes: readonly Envelope[]): boolean =>
 
 const hasCompactionEnd = hasEvent('compaction/end')
 
+/** One long-lived SSE reader that collects frames in the background until closed. */
+const openReader = async (url: string): Promise<{ envelopes: Envelope[]; close: () => void }> => {
+  const abort = new AbortController()
+  const envelopes: Envelope[] = []
+  const response = await fetch(url, { signal: abort.signal })
+  const reader = response.body!.getReader()
+  void (async () => {
+    let text = ''
+    try {
+      for (;;) {
+        const { value, done } = await reader.read()
+        if (done) return
+        text += new TextDecoder().decode(value)
+        const frames = text.split('\n\n')
+        text = frames.pop() ?? ''
+        for (const frame of frames) {
+          const line = frame.split('\n').find((row) => row.startsWith('data: '))
+          if (line !== undefined) envelopes.push(JSON.parse(line.slice(6)) as Envelope)
+        }
+      }
+    } catch { /* aborted */ }
+  })()
+  return { envelopes, close: () => abort.abort() }
+}
+
+const liveEvents = (envelopes: readonly Envelope[]): { type: string; seq: number; error?: string }[] =>
+  envelopes.flatMap((envelope) => envelope.kind === 'session' && envelope.event !== undefined ? [envelope.event] : [])
+
+const until = async (predicate: () => boolean, ms: number): Promise<void> => {
+  const deadline = Date.now() + ms
+  while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20))
+}
+
 /** The original store flush, captured before any spy replaces the prototype method. */
 const storeFlush = FileSessionStore.prototype.flush
 
@@ -219,6 +252,92 @@ describe('durability gate', () => {
     } finally {
       flushSpy.mockRestore()
       releaseFlush()
+    }
+  })
+
+  it('a reader subscribed before the compaction receives the held success once after commit, then later events in seq order', { timeout: 30_000 }, async () => {
+    let releaseSummary!: () => void
+    const summaryOpen = new Promise<void>((resolve) => { releaseSummary = resolve })
+    let summarizerArrived!: () => void
+    const arrived = new Promise<void>((resolve) => { summarizerArrived = resolve })
+    const provider = gatedSummarizer(async () => { summarizerArrived(); await summaryOpen })
+    root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-sse-live-held-'))
+    server = await createWebServer({ home: root, configFile: path.join(root, 'p.json'), providers: [provider] })
+    const base = server.url
+    const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const route = `${base}/api/workspaces/${wsId}/sessions/${id}`
+    await fetch(`${route}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'first' }) })
+    await readBatch(`${route}/events`, 10_000, (envelope) => hasEvent('turn/end')([envelope]))
+    await new Promise((resolve) => setTimeout(resolve, 1_000))
+    const live = await openReader(`${route}/events`)
+    const compactDone = fetch(`${route}/compact`, { method: 'POST' }).catch(() => undefined as unknown as Response)
+    await arrived
+    let releaseFlush!: () => void
+    const flushHeld = new Promise<void>((resolve) => { releaseFlush = resolve })
+    const flushSpy = vi.spyOn(FileSessionStore.prototype, 'flush').mockImplementation(async function (this: FileSessionStore, sessionId: SessionId) {
+      if (sessionId === id) { await flushHeld; return }
+      return storeFlush.call(this, sessionId)
+    })
+    try {
+      releaseSummary()
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      expect(liveEvents(live.envelopes).some((event) => event.type === 'compaction/end')).toBe(false)
+      const pinned = fetch(route, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pinned: true }) }).catch(() => undefined)
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      expect(liveEvents(live.envelopes).some((event) => event.type === 'session/pinned')).toBe(false)
+      releaseFlush()
+      expect((await compactDone)?.status).toBe(200)
+      await pinned
+      await until(() => liveEvents(live.envelopes).some((event) => event.type === 'session/pinned'), 5_000)
+      const events = liveEvents(live.envelopes)
+      const ends = events.filter((event) => event.type === 'compaction/end')
+      expect(ends).toHaveLength(1)
+      expect(ends[0]!.error).toBeUndefined()
+      const after = events.slice(events.indexOf(ends[0]!))
+      expect(after.some((event) => event.type === 'session/pinned')).toBe(true)
+      const seqs = events.map((event) => event.seq)
+      expect(seqs).toEqual([...seqs].sort((a, b) => a - b))
+      expect(new Set(seqs).size).toBe(seqs.length)
+    } finally {
+      live.close()
+      flushSpy.mockRestore()
+      releaseFlush()
+    }
+  })
+
+  it('a reader subscribed before a rejected flush never receives the success', { timeout: 20_000 }, async () => {
+    let summarizerArrived!: () => void
+    const arrived = new Promise<void>((resolve) => { summarizerArrived = resolve })
+    let openSummary: (() => void) | undefined
+    const provider = gatedSummarizer(async () => {
+      summarizerArrived()
+      await new Promise<void>((resolve) => { openSummary = resolve })
+    })
+    root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-sse-live-poison-'))
+    server = await createWebServer({ home: root, configFile: path.join(root, 'p.json'), providers: [provider] })
+    const base = server.url
+    const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const route = `${base}/api/workspaces/${wsId}/sessions/${id}`
+    await fetch(`${route}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'first' }) })
+    await readBatch(`${route}/events`, 10_000, (envelope) => hasEvent('turn/end')([envelope]))
+    await new Promise((resolve) => setTimeout(resolve, 1_000))
+    const live = await openReader(`${route}/events`)
+    const compactDone = fetch(`${route}/compact`, { method: 'POST' }).then((r) => r.status, () => 0)
+    await arrived
+    const flushSpy = vi.spyOn(FileSessionStore.prototype, 'flush').mockImplementation(async function (this: FileSessionStore, sessionId: SessionId) {
+      if (sessionId === id) throw new Error('disk gone')
+      return storeFlush.call(this, sessionId)
+    })
+    try {
+      openSummary?.()
+      expect(await compactDone).not.toBe(200)
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      expect(liveEvents(live.envelopes).some((event) => event.type === 'compaction/end' && event.error === undefined)).toBe(false)
+    } finally {
+      live.close()
+      flushSpy.mockRestore()
     }
   })
 
