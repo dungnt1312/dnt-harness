@@ -215,7 +215,7 @@ export function writeTool(): ToolDefinition {
   return {
     name: 'Write',
     description:
-      'Create a file, or replace an existing file completely, inside the workspace or a read-write granted folder. Overwriting requires that this conversation Read the file first and that it has not changed since; prefer Edit for partial changes. An existing file keeps its encoding, BOM, and line-ending style. For a long file (more than about 400 lines, such as a plan or spec), Write a short skeleton first and then add one section per Edit call: a single huge call can exceed the model output limit and is then lost unrun.',
+      'Create a file, or replace an existing file completely, inside the workspace or a read-write granted folder. Overwriting an existing file requires that this conversation observed it (a successful Read, Write, Edit or ApplyPatch) and that it has not changed since; prefer Edit for partial changes. An existing file keeps its encoding, BOM, and line-ending style. For a long file (more than about 400 lines, such as a plan or spec), Write a short skeleton first and then add one section per Edit call: a single huge call can exceed the model output limit and is then lost unrun.',
     requiresRoot: true,
     parameters: {
       type: 'object',
@@ -264,7 +264,7 @@ export function editTool(): ToolDefinition {
   return {
     name: 'Edit',
     description: [
-      'Replace text in a file inside the workspace or a read-write granted folder. This conversation must have Read the file, and it must not have changed since.',
+      'Replace text in a file inside the workspace or a read-write granted folder. This conversation must have observed the file (a successful Read, Write, Edit or ApplyPatch), and it must not have changed since.',
       '`old` must appear exactly once (copy it from Read output WITHOUT the line-number prefix, keeping indentation); add surrounding lines to make it unique, or set `replaceAll` to change every occurrence.',
       'Line endings are handled automatically. When `old` is not found, the error shows the closest current lines.',
       'An empty `old` creates a new file (or fills an empty one) with `new`.',
@@ -573,7 +573,7 @@ async function createPatchFile(file: string, bytes: Buffer, mode?: number): Prom
 export function applyPatchTool(): ToolDefinition {
   return {
     name: 'ApplyPatch',
-    description: 'Apply multiple local diff hunks or file changes in one call. Prefer this over repeated Edit calls for distant regions. Input must start with *** Begin Patch and end with *** End Patch. Use *** Update File: path, then @@ (optionally followed by an exact context line), then lines prefixed with space (context), - (remove), + (add). Multiple @@ hunks use original-file order and exact unique context, not numeric git diff headers. *** End of File anchors a hunk to EOF. *** Add File: path uses + content lines; *** Delete File: path deletes a file; *** Move to: path immediately after Update moves it to a new, absent destination. Existing files must have been Read and unchanged since. Preserves encoding/BOM/EOL and final-newline state. All files are verified before writes; I/O failure can leave partial changes, recorded in the error receipt. Re-read before retrying a partial failure. Do not use shell scripts to bypass verification.',
+    description: 'Apply multiple local diff hunks or file changes in one call. Prefer this over repeated Edit calls for distant regions. Input must start with *** Begin Patch and end with *** End Patch. Use *** Update File: path, then @@ (optionally followed by an exact context line), then lines prefixed with space (context), - (remove), + (add). Multiple @@ hunks use original-file order and exact unique context, not numeric git diff headers. *** End of File anchors a hunk to EOF. *** Add File: path uses + content lines; *** Delete File: path deletes a file; *** Move to: path immediately after Update moves it to a new, absent destination. Existing files must have been observed (a successful Read, Write, Edit or ApplyPatch) and unchanged since. Preserves encoding/BOM/EOL and final-newline state. All files are verified before writes; I/O failure can leave partial changes, recorded in the error receipt. Re-read before retrying a partial failure. Do not use shell scripts to bypass verification.',
     requiresRoot: true,
     parameters: { type: 'object', properties: { patch_text: { type: 'string', description: 'Complete structured patch text, including Begin/End Patch markers' } }, required: ['patch_text'] },
     async execute(args, exec) {

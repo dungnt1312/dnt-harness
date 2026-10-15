@@ -65,7 +65,7 @@ export function todoWriteTool(): ToolDefinition {
     description: [
       'Create and manage a structured task list for the current coding session so the user can watch progress.',
       'Use it for complex multi-step work (three or more distinct steps), when the user provides several tasks, or asks for a todo list; skip it for a single trivial action.',
-      'Rules: every call replaces the WHOLE list; keep exactly one task in_progress at a time; mark a task completed IMMEDIATELY after finishing it (never batch completions); if blocked or errored, keep the item in_progress and add a new item describing what must be resolved; remove items that are no longer relevant.',
+      'Rules: every call replaces the WHOLE list; keep at most one task in_progress at a time (none is fine when all work is finished or not yet started); mark a task completed IMMEDIATELY after finishing it (never batch completions); if blocked or errored, keep the item in_progress and add a new item describing what must be resolved; remove items that are no longer relevant.',
       "Each item needs content (imperative, e.g. 'Run tests'), status, and activeForm (present-continuous, e.g. 'Running tests').",
     ].join(' '),
     requiresRoot: false,
