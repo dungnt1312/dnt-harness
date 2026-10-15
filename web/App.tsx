@@ -52,7 +52,7 @@ import { type RetryTarget, type ViewItem } from './lib/project.ts'
 import { useSessionDerivedValues } from './lib/session-derived.ts'
 import { sameListing } from './lib/listing-equality.ts'
 import { manifestRefreshKey } from './lib/manifest-refresh.ts'
-import { loadCollapsedFolders, storeCollapsedFolders } from './lib/sidebar-folder-state.ts'
+import { loadCollapsedFolders, storeCollapsedFolders, loadExpandedFolders, storeExpandedFolders } from './lib/sidebar-folder-state.ts'
 import type { FileFocus } from './lib/tool-facts.ts'
 import { useSessionStream } from './hooks/useSessionStream.ts'
 import { useApprovalNotify } from './hooks/useApprovalNotify.ts'
@@ -366,6 +366,7 @@ function AppShell() {
   const [folderExpanded, setFolderExpanded] = useState<Record<string, number>>({})
   useEffect(() => {
     setFolderCollapsed(activeWs === null ? {} : loadCollapsedFolders(activeWs))
+    setFolderExpanded(activeWs === null ? {} : loadExpandedFolders(activeWs))
   }, [activeWs])
   const toggleFolderCollapsed = useCallback((projectId: string, collapsed: boolean) => {
     setFolderCollapsed((prev) => {
@@ -375,8 +376,12 @@ function AppShell() {
     })
   }, [activeWs])
   const expandFolder = useCallback((projectId: string, extraRows: number) => {
-    setFolderExpanded((prev) => ({ ...prev, [projectId]: extraRows }))
-  }, [])
+    setFolderExpanded((prev) => {
+      const next = { ...prev, [projectId]: extraRows }
+      if (activeWs !== null) storeExpandedFolders(activeWs, next)
+      return next
+    })
+  }, [activeWs])
   function beginConversation(): void {
     // Invalidate an in-flight first-session creation before showing a new draft.
     navigation.current.next()
@@ -562,6 +567,11 @@ function AppShell() {
   const derived = useSessionDerivedValues(events, approvals.length, sending)
   const running = derived.running
   const currentSession = useMemo(() => sessions.find((session) => session.id === current) ?? null, [sessions, current])
+  // The open session's own log is fresher than the polled listing, so its row shows a compaction at once.
+  const sidebarSessions = useMemo(
+    () => (derived.compacting ? sessions.map((session) => (session.id === current ? { ...session, compacting: true } : session)) : sessions),
+    [sessions, current, derived.compacting],
+  )
   /** Queued input as a strip above the composer, in submission order. */
   const queuedItems = useMemo(
     () => projectedItems.filter((item): item is Extract<ViewItem, { kind: 'user' }> => item.kind === 'user' && item.queued === true),
@@ -1596,7 +1606,7 @@ function AppShell() {
       onOpenAutomations={openAutomationsList}
       onNewAutomation={newAutomation}
       automationsActive={automationsView !== null}
-      sessions={sessions}
+      sessions={sidebarSessions}
       projects={projects}
       current={current}
       filter={filter}

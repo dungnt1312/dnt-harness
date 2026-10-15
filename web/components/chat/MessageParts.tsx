@@ -1885,14 +1885,17 @@ export const CompactionMarker = memo(function CompactionMarker({ item }: {
     const id = window.setInterval(() => setNow(Date.now()), 1_000)
     return () => window.clearInterval(id)
   }, [ticking])
-  const facts = [
+  // The collapsed row carries only the outcome; how it was produced is one click away.
+  const headline = [
     item.status === 'completed' ? compactionTokenChange(item) : undefined,
+    item.durationMs !== undefined && item.status !== 'running' ? `${(item.durationMs / 1000).toFixed(1)}s` : undefined,
+  ].filter((fact) => fact !== undefined)
+  const details = [
     item.coversSeq !== undefined ? `through seq ${item.coversSeq}` : undefined,
     item.summaryChars !== undefined ? `${formatBytes(item.summaryChars)} summarized` : undefined,
     item.model !== undefined ? item.model : undefined,
     item.trigger !== undefined ? item.trigger : undefined,
     item.path === 'recovery' ? 'full transcript' : undefined,
-    item.durationMs !== undefined && item.status !== 'running' ? `${(item.durationMs / 1000).toFixed(1)}s` : undefined,
     item.requests !== undefined ? `${item.requests} ${item.requests === 1 ? 'request' : 'requests'}` : undefined,
   ].filter((fact) => fact !== undefined)
 
@@ -1932,15 +1935,18 @@ export const CompactionMarker = memo(function CompactionMarker({ item }: {
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
         title={item.ts !== undefined ? formatTime(item.ts) : undefined}
-        className="flex min-w-0 items-center gap-2 py-0.5 text-left text-xs text-fg-muted transition-colors hover:text-fg"
+        className="flex w-full min-w-0 items-start gap-2 py-0.5 text-left text-xs text-fg-muted transition-colors hover:text-fg"
       >
-        <Icon name="archive" size={13} className={cn('shrink-0', item.status === 'completed' ? 'text-fg-faint' : 'text-warn')} />
-        <span className="shrink-0">{label}</span>
-        {facts.map((fact) => <span key={fact} className="min-w-0 font-mono text-fg-faint">{fact}</span>)}
-        {item.summary !== undefined || item.error !== undefined
-          ? <Icon name="chevron" size={12} className={cn('ml-auto shrink-0 text-fg-faint transition-transform', open ? 'rotate-180' : '')} />
+        <Icon name="archive" size={13} className={cn('mt-px shrink-0', item.status === 'completed' ? 'text-fg-faint' : 'text-warn')} />
+        <span className="shrink-0 font-medium">{label}</span>
+        {headline.map((fact) => <span key={fact} className="shrink-0 whitespace-nowrap font-mono text-fg-faint">{fact}</span>)}
+        {details.length > 0 || item.summary !== undefined || item.error !== undefined
+          ? <Icon name="chevron" size={12} className={cn('ml-auto mt-0.5 shrink-0 text-fg-faint transition-transform', open ? 'rotate-180' : '')} />
           : null}
       </button>
+      {open && details.length > 0 ? (
+        <p className="m-0 mt-1 pl-[21px] font-mono text-[11px] leading-5 text-fg-faint">{details.join(' · ')}</p>
+      ) : null}
       {open && item.summary !== undefined ? (
         <div className="mt-1.5 rounded-xl border border-line bg-surface px-3 py-2.5">
           <p className="m-0 max-h-72 overflow-y-auto whitespace-pre-wrap break-words text-xs leading-5 text-fg-muted">{item.summary}</p>

@@ -114,10 +114,12 @@ const TABS: readonly { readonly id: SettingsTab; readonly label: string; readonl
   { id: 'secrets', label: 'Secrets', hint: 'Encrypted credentials for MCP servers', icon: 'key' },
 ]
 
-/** Nav groups: global settings first, then the active workspace's. */
+/** Nav groups: global first, then the workspace split by concern. */
 const TAB_GROUPS: readonly { readonly label: string; readonly ids: readonly SettingsTab[] }[] = [
   { label: 'Global', ids: ['providers', 'usage'] },
-  { label: 'Workspace', ids: ['projects', 'permissions', 'prompts', 'sources', 'skills', 'plugins', 'memory', 'agents', 'mcp', 'hooks', 'secrets'] },
+  { label: 'Workspace', ids: ['projects', 'permissions', 'prompts', 'memory'] },
+  { label: 'Extensions', ids: ['skills', 'plugins', 'agents', 'mcp'] },
+  { label: 'Advanced', ids: ['sources', 'hooks', 'secrets'] },
 ]
 
 interface Draft {

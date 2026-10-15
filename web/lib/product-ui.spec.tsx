@@ -1197,19 +1197,26 @@ describe('context compaction + budget bar', () => {
       expect(host.textContent).not.toMatch(/Summarizing \d/)
     })
 
-    it('a finished row shows how many requests it took', async () => {
+    const expand = async (): Promise<void> => { await act(async () => host.querySelector('button')!.click()) }
+
+    it('a finished row shows how many requests it took once opened, not in the collapsed line', async () => {
       await mount(<CompactionMarker item={row({ status: 'completed', coversSeq: 9, summary: 'S', requests: 3 })} />)
+      expect(host.textContent).not.toContain('3 requests')
+      await expand()
       expect(host.textContent).toContain('3 requests')
       await mount(<CompactionMarker item={row({ status: 'failed', requests: 1 })} />)
+      await expand()
       expect(host.textContent).toContain('1 request')
       expect(host.textContent).not.toContain('1 requests')
     })
 
-    it('a finished row shows how the summary was made', async () => {
+    it('a finished row shows how the summary was made once opened', async () => {
       await mount(<CompactionMarker item={row({ status: 'completed', path: 'recovery', coversSeq: 9, summary: 'S' })} />)
+      await expand()
       expect(host.textContent).toContain('full transcript')
       expect(host.textContent).not.toContain('recovery')
       await mount(<CompactionMarker item={row({ status: 'completed', path: 'exact', coversSeq: 9, summary: 'S' })} />)
+      await expand()
       expect(host.textContent).not.toContain('full transcript')
     })
   })
@@ -1457,6 +1464,18 @@ describe('sidebar sections + live rows + workspace management', () => {
     expect(host.textContent).toContain('working with model')
     expect(host.textContent).toContain('2 queued')
   })
+  it('badges a conversation, and a nested subagent, that waits for an approval or answer', async () => {
+    const list = [
+      { id: 'w1', title: 'Blocked chat', projectId: 'p1', status: 'running' as const, awaitingUser: true, pendingInputs: 0, ...base },
+      { id: 'w2', title: 'Free chat', projectId: 'p1', status: 'idle' as const, pendingInputs: 0, ...base },
+      { id: 'wc', title: 'Blocked child', projectId: 'p1', status: 'running' as const, awaitingUser: true, parentSessionId: 'w2', pendingInputs: 0, ...base },
+    ]
+    await mount(<SessionList sessions={list} projects={[project]} current={null} filter="" liveRunning={false} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} />)
+    const rowText = (title: string): string => [...host.querySelectorAll('button')].find((b) => b.textContent?.includes(title))!.textContent ?? ''
+    expect(rowText('Blocked chat')).toContain('Needs you')
+    expect(rowText('Free chat')).not.toContain('Needs you')
+    expect(rowText('Blocked child')).toContain('needs you')
+  })
   it('leads a working conversation row with its spinner, ahead of the title', async () => {
     await mount(<SessionList sessions={[...sessions]} projects={[project]} current={null} filter="" liveRunning={false} onSelect={() => {}} onRename={() => {}} onDeleteRequest={() => {}} onNewInProject={() => {}} />)
     const row = [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('Auth refactor'))!
@@ -1661,6 +1680,17 @@ describe('sidebar sections + live rows + workspace management', () => {
     await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Sort and filter conversations"]')!.click())
     await act(async () => [...document.body.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.textContent?.includes('Running only'))!.click())
     expect(host.textContent).toContain('No running conversations')
+  })
+  it('shows a spinner on the conversation that is compacting, and on no other', async () => {
+    const base = { updatedAt: Date.now(), eventCount: 3, folder: null, status: 'idle' as const, pendingInputs: 0 }
+    const list = [
+      { id: 'k1', title: 'Compacting one', compacting: true, ...base },
+      { id: 'k2', title: 'Quiet one', ...base },
+    ]
+    const props = sidebarProps([{ id: 'w1', name: 'Acme', archived: false, createdAt: 1 }], 'w1')
+    await mount(<ToastHost><Sidebar {...props} sessions={list} /></ToastHost>)
+    expect(host.querySelectorAll('[title="Compacting conversation"]')).toHaveLength(1)
+    expect(host.textContent).toContain('compacting conversation')
   })
   it('reorders project folders by drag: an edge line previews, the drop reports the order', async () => {
     const projectA = { id: 'pa', name: 'Alpha', workspaceId: 'w1', path: 'C:/a', createdAt: 1 }

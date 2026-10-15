@@ -296,6 +296,10 @@ export interface SessionListing {
   readonly status?: 'idle' | 'running' | 'cancelling'
   /** What the driver is busy with right now (model, tool, or approval). */
   readonly activity?: 'model' | 'tool' | null
+  /** A compaction is running on this conversation (it is not a turn, so `status` stays idle). */
+  readonly compacting?: boolean
+  /** An approval or AskUserQuestion on this conversation (or one of its subagents) waits for the user. */
+  readonly awaitingUser?: boolean
   /** Durably queued inputs waiting for a later turn. */
   readonly pendingInputs?: number
   /** Background Bash processes still running under this conversation. */
@@ -502,6 +506,8 @@ export interface AgentDefinitionRow {
     readonly disallowedTools: readonly string[]
     readonly skills?: readonly string[]
     readonly model?: string
+    /** Thinking level the role's children run at, over the conversation's. */
+    readonly effort?: string
     /** Claude fields recognized but not enforced by dnt-harness. */
     readonly unsupported?: readonly string[]
     /** Tools the file named that dnt-harness does not provide. */

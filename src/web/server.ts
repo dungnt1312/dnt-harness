@@ -51,7 +51,7 @@ import { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from '../harness/li
 import { LlmService } from '../harness/llm/service.ts'
 import { LogicalRequest, classifyTransport } from '../harness/llm/request-lifecycle.ts'
 import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
-import { expressibleThinkingLevel, isThinkingLevel, resolveContextLimit } from '../harness/llm/model-catalog.ts'
+import { expressibleThinkingLevel, isThinkingLevel, resolveContextLimit, type ThinkingLevel } from '../harness/llm/model-catalog.ts'
 import { adaptRequestVision, supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
 import { ProviderError } from '../harness/llm/types.ts'
 import type { LlmProvider, ModelRequest, StreamEvent, StreamOptions, TokenUsage, ToolCall } from '../harness/llm/types.ts'
@@ -1099,6 +1099,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     workspaceId: WorkspaceId,
     requested?: string,
     definitionModel?: string,
+    effort?: ThinkingLevel,
   ): ChildModel | undefined =>
     resolveChildModel(requested, definitionModel, {
       parent: resolveEffectiveModel(parent, workspaceId),
@@ -1114,7 +1115,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         }
       },
       alias: (name) => aliases.find((entry) => entry.name === name),
-    })
+    }, effort)
 
   // ── per-session entries ──────────────────────────────────────
   const sessions = new Map<SessionId, SessionEntry>()
@@ -4789,6 +4790,7 @@ interface HandlerDeps {
     workspaceId: WorkspaceId,
     requested?: string,
     definitionModel?: string,
+    effort?: ThinkingLevel,
   ) => ChildModel | undefined
   /** Display-only: what a role's `model:` resolves to on this host (aliases mapped). */
   readonly roleModelOf: (definitionModel: string | undefined) => ReturnType<typeof describeRoleModel>
@@ -5656,6 +5658,7 @@ async function handleApi(
             wsId,
             typeof body['model'] === 'string' ? body['model'] : undefined,
             resolved.definition.model,
+            resolved.definition.effort,
           )
           const { turnId, handle } = await deps.childExecutor.spawnManual({
             workspaceId: wsId,
@@ -9819,6 +9822,13 @@ function listSessions(workspaceId: WorkspaceId, deps: HandlerDeps, automationRun
   // Child sessions never join the root registry (executor-managed), so their
   // live driver state comes from the executor's own active index.
   const runningChildren = new Set<string>()
+  // Sessions blocked on a human (approval or AskUserQuestion); a waiting child
+  // also marks its parent, since that is the row the sidebar nests it under.
+  const awaitingUser = new Set<string>()
+  for (const waiting of [...deps.pending.values(), ...deps.pendingQuestions.values()]) {
+    awaitingUser.add(waiting.sessionId)
+    if (waiting.parentSessionId !== undefined) awaitingUser.add(waiting.parentSessionId)
+  }
   for (const summary of summaries) {
     if (summary.parentSessionId == null) continue
     for (const id of deps.childExecutor.runningChildrenOfRoot(summary.parentSessionId as SessionId)) runningChildren.add(id)
@@ -9850,6 +9860,9 @@ function listSessions(workspaceId: WorkspaceId, deps: HandlerDeps, automationRun
       ...(automationRuns.has(summary.id) ? { automationId: automationRuns.get(summary.id) } : {}),
       status: entry?.agent.status ?? (runningChildren.has(summary.id) ? 'running' : 'idle'),
       activity: entry?.agent.activity ?? null,
+      // A compaction is not a turn (agent.status stays idle), yet the conversation is busy.
+      compacting: deps.compactionPending(summary.id as SessionId),
+      awaitingUser: awaitingUser.has(summary.id as SessionId),
       pendingInputs: entry !== undefined ? deps.kernel.ctx.sessions.pendingInputs(entry.session).length : 0,
       // Background Bash processes outlive their turn; the sidebar folder uses
       // the count to show a terminal marker while anything is still running.

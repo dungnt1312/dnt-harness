@@ -226,6 +226,9 @@ export function useSessionStream(workspaceId: string | null, sessionId: string |
         setApprovals(reconcileApprovals([], envelope.events))
         setSettled(true)
       } else if (envelope.kind === 'resume') {
+        // Like a snapshot, a resume precedes the server's re-sent open
+        // questions; one answered elsewhere while this tab was away must go.
+        setQuestions([])
         const unseen = envelope.events.filter((event) => event.seq > seenSeq.current)
         for (const event of unseen) {
           seenSeq.current = event.seq

@@ -194,7 +194,6 @@ async function fixture(page: Page, state: FixtureState): Promise<Fixture> {
     }
     if (path === '/api/workspaces/w/skills/sources') return json(route, { rules: [{ id: 'workspace', kind: 'workspace', enabled: true }] })
     if (path === '/api/workspaces/w/skills/fixture-skill/files') return json(route, { files: [{ path: 'SKILL.md', bytes: 64 }] })
-    if (process.env.FIXTURE_PROBE) { console.log(`MISSING ${method} ${path}`); return json(route, [], 404) }
     throw new Error(`Unexpected fixture API request: ${method} ${url.href}`)
   })
 

@@ -153,6 +153,9 @@ describe('web compaction', () => {
     const compact = fetch(`${route}/compact`, { method: 'POST' }).catch(() => undefined)
     await started
     try {
+      // The sidebar's only signal for a conversation the user is not looking at.
+      const listing = async (): Promise<{ id: string; compacting?: boolean }[]> => await (await fetch(`${base}/api/workspaces/${wsId}/sessions`)).json() as { id: string; compacting?: boolean }[]
+      expect((await listing()).find((row) => row.id === id)?.compacting).toBe(true)
       expect((await fetch(`${route}/compact`, { method: 'POST' })).status).toBe(409)
       const steeredMessage = await fetch(`${route}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'queued', delivery: 'steer' }) })
       expect(steeredMessage.status).toBe(202)
@@ -181,6 +184,8 @@ describe('web compaction', () => {
         const sessions = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`)).json() as { id: string; status: string }[]
         return requests.length >= 3 && rows.filter(row => row.type === 'turn/end').length >= 2 && sessions.find(session => session.id === id)?.status === 'idle' ? true : undefined
       })
+      const after = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`)).json() as { id: string; compacting?: boolean }[]
+      expect(after.find((row) => row.id === id)?.compacting).toBe(false)
     } else {
       // Cancellation has settled, so assert canonical evidence of no follow-up execution.
       const rows = (await fs.readFile(logPath, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
