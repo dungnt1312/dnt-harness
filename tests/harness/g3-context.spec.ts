@@ -8,6 +8,25 @@ import { describe, expect, it } from 'vitest'
 import { buildContext, ContextBudgetError, DEFAULT_BUDGET, messageText, withoutSentStamp, type ActiveSkill, type MemorySnippet, type ModeDefinition } from 'dnt-harness'
 import { BUNDLED_MODES, DEFAULT_MODE_ID } from 'dnt-harness'
 import type { SessionEvent } from 'dnt-harness'
+import { resolveModelBudget } from '../../src/harness/context/budget.ts'
+import { resolveContextLimit } from '../../src/harness/llm/model-catalog.ts'
+
+describe('model context budget (AC-19)', () => {
+  it('respects operator override while preserving reply reserve and margin', () => {
+    expect(resolveModelBudget({ model: 'scripted', contextTokens: 32_768 })).toMatchObject({
+      contextLimitTokens: 32_768, outputReserveTokens: 4_096, marginTokens: 1_024, windowSource: 'override',
+    })
+  })
+  it.each([NaN, 0, -1])('ignores invalid override %s and reports fallback provenance', contextTokens => {
+    expect(resolveModelBudget({ model: 'scripted', contextTokens })).toMatchObject({
+      contextLimitTokens: 256_000, windowSource: 'fallback',
+    })
+  })
+  it('preserves catalog family limits for namespaced models', () => {
+    expect(resolveModelBudget({ model: 'cliproxy/claude-sonnet-5-5' }).contextLimitTokens).toBe(resolveContextLimit('cliproxy/claude-sonnet-5-5'))
+    expect(resolveModelBudget({ model: 'cliproxy/claude-sonnet-5-5' }).windowSource).not.toBe('fallback')
+  })
+})
 
 const WS = 'ws-build' as never
 
