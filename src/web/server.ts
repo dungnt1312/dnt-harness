@@ -173,7 +173,7 @@ import { CheckpointStore, recoverCanonicalCheckpoint, type CompactionCheckpoint 
 import { compactionSeedHash, sourceDigest } from '../harness/context/compaction-digest.ts'
 import { CompactionSnapshotStore } from '../harness/storage/compaction-snapshot-store.ts'
 import { promoteCapture, reconstructionCutoff, reconstructSnapshot } from './compaction-capture.ts'
-import { CompactionHost } from './compaction-host.ts'
+import { CompactionHost, handoffSnapshot } from './compaction-host.ts'
 import { CompactionPrecompute, candidateOwner } from './compaction-precompute.ts'
 import { buildRestoration } from './compaction-restoration.ts'
 import type { EffectiveCompactionSnapshot, SnapshotIdentity } from '../harness/context/compaction-snapshot.ts'
@@ -1476,7 +1476,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       },
       // The candidate runs under its own provider-ownership id; the service tells us if it is stuck.
       transportUncertain: (sessionId) => kernel.ctx.llm.sessionUncertain(candidateOwner(sessionId)),
-      assess: (sessionId, prepared) => {
+      assess: async (sessionId, prepared) => {
         const entry = sessions.get(sessionId as SessionId)
         if (entry === undefined) return 'no-fit'
         const events = entry.session.committedEvents
@@ -1487,8 +1487,12 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         // The tail that closed after the cutoff stays verbatim, so it is part of `now`: a
         // candidate whose result is not smaller by the minimum is not worth a checkpoint.
         if (was - now < MIN_CANDIDATE_GAIN_TOKENS) return 'no-gain'
-        const window = compactionWindowOf(entry)
-        if (window !== undefined && now > window - limits.compactionOutputTokens) return 'no-fit'
+        // Fit is the builder's: the next request after this checkpoint (fixed prompt, schemas,
+        // restoration, the tail kept verbatim) under the same budget, reserve and margin.
+        try {
+          const restored = await restorationFor(entry, prepared.cutoff, candidateLifetime.signal)
+          await previewCompaction(entry, { summary: prepared.summary, coversSeq: prepared.cutoff }, restored)
+        } catch { return 'no-fit' }
         return undefined
       },
       nativeVision: (sessionId) => {
@@ -1549,7 +1553,53 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
    * by the estimated change the new checkpoint makes against the one standing now.
    */
   const compactPreviews = new Map<SessionId, { commitPrefix(): void }>()
-  const compactFitFailures = new Map<SessionId, Error>()
+  /**
+   * What the last measure proved, per session: the context revision its inputs were prepared
+   * under, and the checkpoint whose full next request was built and fits (`fit`), or why not.
+   */
+  const compactFits = new Map<SessionId, { revision: string; fit?: number; error?: unknown }>()
+
+  /** Hash of everything outside the log that shapes the next request; a preview is stale once it moves. */
+  const contextRevision = async (entry: SessionEntry): Promise<string> => {
+    const { provider, model, thinkingLevel } = resolveEffectiveModel(entry.session, entry.workspaceId)
+    const { mode, revision } = rootModeOf({ sessionId: entry.session.id }, entry.workspaceId)
+    const prompts = await systemPrompts.load(entry.workspaceId).catch(() => undefined)
+    const instructions = await readWorkspaceInstructions(resourceHome, entry.workspaceId, entry.projectId).catch(() => '')
+    return createHash('sha256').update(JSON.stringify([
+      provider ?? null, model ?? null, thinkingLevel ?? null,
+      provider != null && model != null ? list.find((row) => row.id === provider)?.modelSettings?.[model]?.contextTokens ?? null : null,
+      mode.definition.id, revision,
+      effectiveGrants(entry.session.id, entry.projectId, entry.workspaceId),
+      prompts?.base.overridden === true ? prompts.base.text : null,
+      prompts?.child.overridden === true ? prompts.child.text : null,
+      createHash('sha256').update(instructions).digest('hex'),
+      skills.sourcesStore.revision(entry.workspaceId),
+    ])).digest('hex')
+  }
+
+  /**
+   * Before a checkpoint is published: the context it was measured under has not moved, and,
+   * when `cutoff` is given (effective adoption), that exact checkpoint was proven to fit.
+   */
+  const checkCompactionContext = async (entry: SessionEntry, cutoff?: number): Promise<void> => {
+    const recorded = compactFits.get(entry.session.id)
+    compactFits.delete(entry.session.id)
+    if (cutoff !== undefined && recorded?.fit !== cutoff) {
+      const cause = recorded?.error instanceof Error ? `: ${recorded.error.message}` : ''
+      throw new Error(`compaction fit not verified${cause}`)
+    }
+    if (recorded !== undefined && recorded.revision !== await contextRevision(entry)) throw new Error('context revision changed')
+  }
+
+  /** The post-compaction request the builder would assemble next; throws when it does not fit. */
+  const previewCompaction = (entry: SessionEntry, next: { readonly summary: string; readonly coversSeq: number }, restored?: Restored) => {
+    const scope: AgentScope = { sessionId: entry.session.id, rootSessionId: entry.session.id, workspaceId: entry.workspaceId,
+      ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}) }
+    const schemas = agentScope.run(scope, () => kernel.ctx.tools.schemas())
+    return assembleRequest({ scope, projected: { messages: [], tools: schemas, assemblySignal: new AbortController().signal }, sideEffects: false,
+      preview: { checkpoint: next, ...(restored !== undefined ? { restoration: restored } : {}), protectUncoveredHistory: limits.compactionEffectiveEnabled } })
+  }
+
   const measureCheckpoint = async (
     entry: SessionEntry,
     next: { readonly summary: string; readonly coversSeq: number },
@@ -1557,17 +1607,24 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     _loaded?: Parameters<typeof estimateConversationTokens>[0]['attachments'],
     restored?: Restored,
   ): Promise<CompactionMeasurement> => {
-    if (rootModeOf({ sessionId: entry.session.id }, entry.workspaceId).mode.definition.sources.history !== 'compact') return { contextEffect: 'unchanged' }
-    const scope: AgentScope = { sessionId: entry.session.id, rootSessionId: entry.session.id, workspaceId: entry.workspaceId,
-      ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}) }
-    const signal = new AbortController().signal
-    const schemas = agentScope.run(scope, () => kernel.ctx.tools.schemas())
-    // A failed preview build records itself in `compactFitFailures` (inside assembleRequest).
-    const prepared = await assembleRequest({ scope, projected: { messages: [], tools: schemas, assemblySignal: signal }, sideEffects: false,
-      preview: { checkpoint: next, ...(restored !== undefined ? { restoration: restored } : {}), protectUncoveredHistory: limits.compactionEffectiveEnabled } })
+    const sessionId = entry.session.id
+    compactFits.delete(sessionId)
+    // Captured before any preview await, so a change while it runs is caught at publication.
+    const revision = await contextRevision(entry)
+    if (rootModeOf({ sessionId }, entry.workspaceId).mode.definition.sources.history !== 'compact') {
+      // The checkpoint is not read by this mode: the next request does not change.
+      compactFits.set(sessionId, { revision, fit: next.coversSeq })
+      return { contextEffect: 'unchanged' }
+    }
+    compactFits.set(sessionId, { revision })
+    let prepared: Awaited<ReturnType<typeof previewCompaction>>
+    try { prepared = await previewCompaction(entry, next, restored) } catch (error) {
+      compactFits.set(sessionId, { revision, error })
+      throw error
+    }
     const contextAfter = prepared.assembled.manifest
-    compactPreviews.set(entry.session.id, prepared)
-    compactFitFailures.delete(entry.session.id)
+    compactPreviews.set(sessionId, prepared)
+    compactFits.set(sessionId, { revision, fit: next.coversSeq })
     const previous = deriveContextState(entry.session.committedEvents, entry.session.id)
     const before = previous !== null && isAvailableContext(previous) ? previous : undefined
     const reported = before?.usage?.last?.inputTokens
@@ -1695,17 +1752,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         contextWindowTokens: () => compactionWindowOf(entry),
         nativeVision: () => compactionVisionOf(entry),
         measure: (next, standing, restored) => measureCheckpoint(entry, next, standing, undefined, restored),
-        validateFit: () => { const error = compactFitFailures.get(sessionId); if (error !== undefined) throw error },
-        // The session's folder grant as it is NOW (not when the work was done), so a folder
-        // revoked since is never read back into context.
-        restore: async (cutoff, restoreSignal) => {
-          const grant = agentScope.run(
-            { sessionId, rootSessionId: sessionId, workspaceId: entry.workspaceId, ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}) },
-            () => kernel.ctx.tools.currentGrant(),
-          )
-          const restored = await buildRestoration({ events: entry.session.committedEvents, cutoff, exec: grant, signal: restoreSignal })
-          return restored === undefined ? undefined : { body: restored.text, tokens: restored.tokens, sections: restored.sections }
-        },
+        // Effective adoption needs positive evidence: a measured fit for this exact checkpoint.
+        validateFit: (cutoff) => checkCompactionContext(entry, cutoff),
+        restore: (cutoff, restoreSignal) => restorationFor(entry, cutoff, restoreSignal),
         progress: (stage) => { void appendJob(entry, { stage }) },
         recordUsage: (usage) => {
           countJobUsage(sessionId, usage)
@@ -1736,6 +1785,20 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       return { coversSeq: standing.coversSeq, summary: standing.summary }
     }
     return { coversSeq: outcome.coversSeq, summary: outcome.summary, path: outcome.path }
+  }
+
+  /**
+   * Bounded state restored beside an adopted summary. The session's folder grant as it is NOW
+   * (not when the work was done), so a folder revoked since is never read back into context.
+   */
+  const restorationFor = async (entry: SessionEntry, cutoff: number, signal: AbortSignal): Promise<Restored | undefined> => {
+    const sessionId = entry.session.id
+    const grant = agentScope.run(
+      { sessionId, rootSessionId: sessionId, workspaceId: entry.workspaceId, ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}) },
+      () => kernel.ctx.tools.currentGrant(),
+    )
+    const restored = await buildRestoration({ events: entry.session.committedEvents, cutoff, exec: grant, signal })
+    return restored === undefined ? undefined : { body: restored.text, tokens: restored.tokens, sections: restored.sections }
   }
 
   /**
@@ -1807,6 +1870,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
           ...(seed !== undefined ? { seed } : {}),
           onProgress: (done, total) => { void appendJob(entry, { stage: 'generating', progress: { done, total } }) },
           measure: (next) => measureCheckpoint(entry, next, seed, loaded),
+          // Legacy keeps succeeding when the preview fails, but never under a context that moved.
+          validate: () => checkCompactionContext(entry),
         })
       }
     }
@@ -1832,8 +1897,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       const standing = recoverCanonicalCheckpoint(entry.session.committedEvents)
       if (standing !== undefined && standing.coversSeq >= snapshot.cutoff) return
       const window = compactionWindowOf(entry)
-      assertFitsWindow(snapshot, { ...(window !== undefined ? { contextWindowTokens: window } : {}), outputTokens: limits.compactionOutputTokens })
-      candidates.start(snapshot, candidateLifetime.signal)
+      // Sized as sent: the identity pair, and without images for a text-only model.
+      assertFitsWindow(handoffSnapshot(snapshot, snapshot.identity, compactionVisionOf(entry)), { ...(window !== undefined ? { contextWindowTokens: window } : {}), outputTokens: limits.compactionOutputTokens })
+      void candidates.start(snapshot, candidateLifetime.signal).catch(() => {})
     } catch {
       // Too large to summarize in one request, or the session is going away: not a candidate.
     }
@@ -3813,13 +3879,7 @@ ${entry.description}`.toLowerCase().includes(query))
     const commitPrefix = (): void => { if (scope !== undefined && snapshot !== undefined) prefixSnapshots.set(scope.sessionId, snapshot) }
     let built: ReturnType<typeof buildContext>
     if (preview === undefined) built = buildContext(buildInput)
-    else {
-      try { built = buildContextPreview(buildInput, preview) } catch (error) {
-        // The post-compaction context does not fit: the host's validateFit refuses the checkpoint.
-        if (scope !== undefined) compactFitFailures.set(scope.sessionId, error instanceof Error ? error : new Error('compaction-preview-no-fit'))
-        throw error
-      }
-    }
+    else built = buildContextPreview(buildInput, preview)
     // Only a dispatched request gets an identity and pinned controls.
     const contextId = sideEffects ? randomUUID() : undefined
     const assembled = contextId === undefined ? built : { ...built, manifest: { ...built.manifest, contextId } }

@@ -97,7 +97,8 @@ export interface HostDeps {
   /** Whether the model selected now sees image pixels; a text-only target gets the snapshot without images. */
   readonly nativeVision: () => boolean
   readonly measure: NonNullable<AdoptionOptions['measure']>
-  readonly validateFit?: () => void | Promise<void>
+  /** Throws unless the post-compaction request for the checkpoint at `cutoff` was measured and fits. */
+  readonly validateFit?: (cutoff: number) => void | Promise<void>
   /**
    * Bounded state to restore beside an adopted summary (task list, running work,
    * skills, current files). Only the effective path uses it; the legacy and
@@ -240,7 +241,7 @@ export class CompactionHost {
       trigger: request.trigger,
       signal,
       validate: async () => {
-        await deps.validateFit?.()
+        await deps.validateFit?.(prepared.cutoff)
         const now = deps.identity()
         const was = prepared.identity
         if (now.provider !== was.provider || now.model !== was.model || now.thinkingLevel !== was.thinkingLevel || now.modeHash !== was.modeHash || now.grantsHash !== was.grantsHash || now.policyVersion !== was.policyVersion) {

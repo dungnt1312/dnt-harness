@@ -43,9 +43,10 @@ export interface PrecomputeDeps {
   /**
    * Last-moment worth check on a still-valid candidate, against the conversation as it
    * is NOW (the tail may have refilled since the summary was written): `no-fit` when the
-   * next request would not fit, `no-gain` when it saves less than the minimum.
+   * next request would not fit, `no-gain` when it saves less than the minimum. May await
+   * (the host sizes the next request with the context builder); the manager re-checks after.
    */
-  readonly assess: (sessionId: string, prepared: PreparedSummary) => 'no-gain' | 'no-fit' | undefined
+  readonly assess: (sessionId: string, prepared: PreparedSummary) => 'no-gain' | 'no-fit' | undefined | Promise<'no-gain' | 'no-fit' | undefined>
   /** Whether the session's model sees image pixels; a text-only one gets the handoff without images. */
   readonly nativeVision: (sessionId: string) => boolean
   readonly limits: Pick<HarnessLimits, 'compactionDeadlineMs' | 'compactionOutputTokens'>
@@ -110,7 +111,7 @@ export class CompactionPrecompute {
   }
 
   /** Starts a background generation. False when a usable one already exists, the session is blocked, or this exact attempt already failed. */
-  start(snapshot: EffectiveCompactionSnapshot, parent: AbortSignal): boolean {
+  async start(snapshot: EffectiveCompactionSnapshot, parent: AbortSignal): Promise<boolean> {
     const sessionId = snapshot.sessionId
     if (this.closed || this.blocked(sessionId)) return false
     const existing = this.jobs.get(sessionId)
@@ -119,8 +120,9 @@ export class CompactionPrecompute {
       // adopted; once the source, checkpoint or identity moved on, or the conversation grew past what
       // it can serve, it would otherwise hold the slot forever and the session would get no new candidate.
       if (existing.phase !== 'ready' || existing.prepared === undefined) return false
-      const reason = this.staleness(existing) ?? this.deps.assess(sessionId, existing.prepared)
-      if (reason === undefined) return false
+      const reason = await this.verdict(existing, existing.prepared)
+      // Someone else took, replaced or stopped the job while the assessment awaited.
+      if (reason === undefined || this.jobs.get(sessionId) !== existing || this.closed || parent.aborted || this.blocked(sessionId)) return false
       this.jobs.delete(sessionId)
       this.deps.report({ kind: 'discarded', sessionId, snapshotId: existing.snapshot.id, reason })
     }
@@ -182,12 +184,21 @@ export class CompactionPrecompute {
     return undefined
   }
 
+  /** Staleness, then the host's worth check; staleness again because the source may move while the check awaits. */
+  private async verdict(job: Job, prepared: PreparedSummary): Promise<string | undefined> {
+    const stale = this.staleness(job)
+    if (stale !== undefined) return stale
+    const assessed = await Promise.resolve(this.deps.assess(job.snapshot.sessionId, prepared)).catch(() => 'no-fit' as const)
+    return this.staleness(job) ?? assessed
+  }
+
   /** The ready candidate, exactly once, if it is still valid; otherwise it is discarded. */
-  takeReady(sessionId: string): PreparedSummary | undefined {
+  async takeReady(sessionId: string): Promise<PreparedSummary | undefined> {
     const job = this.jobs.get(sessionId)
     if (job === undefined || job.phase !== 'ready' || job.prepared === undefined) return undefined
+    // Claimed before the await: nobody else can take or displace it meanwhile.
     this.jobs.delete(sessionId)
-    const reason = this.staleness(job) ?? this.deps.assess(sessionId, job.prepared)
+    const reason = await this.verdict(job, job.prepared)
     if (reason !== undefined) {
       this.deps.report({ kind: 'discarded', sessionId, snapshotId: job.snapshot.id, reason })
       return undefined
@@ -249,7 +260,9 @@ export class CompactionPrecompute {
         return undefined
       }
     }
-    return this.takeReady(sessionId)
+    const prepared = await this.takeReady(sessionId)
+    caller.throwIfAborted()
+    return prepared
   }
 
   async close(): Promise<void> {

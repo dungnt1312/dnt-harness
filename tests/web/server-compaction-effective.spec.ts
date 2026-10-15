@@ -7,8 +7,9 @@
 import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { afterAll, describe, expect, it } from 'vitest'
+import { afterAll, describe, expect, it, vi } from 'vitest'
 import { createWebServer, type LlmProvider, type WebServer } from 'dnt-harness'
+import { AttachmentStore } from '../../src/harness/attachments/store.ts'
 import { ProviderError, type ModelCompletion, type ModelRequest, type StreamEvent } from '../../src/harness/llm/types.ts'
 import type { HarnessLimits } from '../../src/harness/limits.ts'
 import { COMPACTION_HANDOFF_MARKER } from '../../src/web/compaction-generator.ts'
@@ -81,6 +82,110 @@ async function completedMessage(base: string, wsId: string, id: string, logPath:
 
 const readLog = async (logPath: string): Promise<Record<string, unknown>[]> =>
   (await fs.readFile(logPath, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>)
+
+/** A home whose providers.json configures `scripted` too, so its context override can be PATCHed live. */
+async function configuredHome(contextTokens?: number): Promise<string> {
+  const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-effective-'))
+  await fs.writeFile(path.join(home, 'p.json'), JSON.stringify({
+    version: 2,
+    defaults: { provider: 'scripted', model: 'scripted', thinkingLevel: null },
+    providers: [{ id: 'scripted', name: 'scripted', baseUrl: 'http://127.0.0.1:9/v1', apiKey: '', models: ['scripted'], enabled: true,
+      ...(contextTokens !== undefined ? { modelSettings: { scripted: { contextTokens } } } : {}) }],
+    aliases: [], aliasGeneration: 0,
+  }))
+  return home
+}
+
+/** One completed exchange that references an attachment, so every later context build loads attachments. */
+async function exchangeWithAttachment(base: string, wsId: string, id: string, logPath: string): Promise<void> {
+  const upload = await fetch(`${base}/api/workspaces/${wsId}/attachments`, { method: 'POST', headers: { 'content-type': 'text/plain', 'x-file-name': 'a.txt' }, body: new TextEncoder().encode('ATTACHMENT A') })
+  expect(upload.status).toBe(201)
+  const ref = await upload.json() as { id: string }
+  await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'with file', attachments: [ref] }) })
+  await until(async () => {
+    const log = await fs.readFile(logPath, 'utf8').catch(() => '')
+    const ended = log.trim().split('\n').filter((line) => line !== '' && JSON.parse(line).type === 'turn/end').length
+    const sessions = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`)).json() as { id: string; status: string }[]
+    return ended === 1 && sessions.find((session) => session.id === id)?.status === 'idle' ? true : undefined
+  })
+}
+
+describe('compaction fails closed on an unverified fit, and on a context that changed under the preview', () => {
+  it.each([
+    // Effective: the preview is the only attachment reader. Legacy: the fold reads the delta first.
+    ['effective', true, 0],
+    ['legacy', false, 1],
+  ] as const)('%s: a preview whose preparation throws', async (name, effective, spared) => {
+    const { provider: llm } = provider()
+    const { home, base, wsId } = await start(llm, effective ? { compactionEffectiveEnabled: true } : {})
+    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+    const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+    await exchangeWithAttachment(base, wsId, id, logPath)
+    let calls = 0
+    const original = AttachmentStore.prototype.load
+    const load = vi.spyOn(AttachmentStore.prototype, 'load').mockImplementation(function (this: AttachmentStore, ...args) {
+      if (calls++ >= spared) throw new Error('attachment store offline')
+      return original.apply(this, args)
+    })
+    try {
+      const response = await fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })
+      const ends = (await readLog(logPath)).filter((event) => event.type === 'compaction/end')
+      if (name === 'effective') {
+        // No positive evidence that the next request fits: nothing is adopted.
+        expect(response.status).toBe(409)
+        expect(ends.some((event) => event.error === undefined)).toBe(false)
+        expect(ends.at(-1)).toMatchObject({ error: expect.any(String) })
+        expect(ends.some((event) => event.contextAfter !== undefined)).toBe(false)
+      } else {
+        // Legacy keeps its behavior: success, with the measurement marked unavailable.
+        expect(response.status).toBe(200)
+        expect(ends.at(-1)).toMatchObject({ contextEffect: 'replaced', measurement: { unavailableReason: 'preview-failed' } })
+        expect(ends.at(-1)!.contextAfter).toBeUndefined()
+      }
+    } finally { load.mockRestore() }
+  })
+
+  it.each([
+    ['effective', true, 0],
+    ['legacy', false, 1],
+  ] as const)('%s: an operator context override changed while the preview awaited fails with "context revision changed"; unchanged commits', async (_name, effective, spared) => {
+    const { provider: llm } = provider()
+    const { home, base, wsId } = await start(llm, effective ? { compactionEffectiveEnabled: true } : {}, await configuredHome(100_000))
+    const run = async (change: boolean): Promise<{ status: number; body: { error?: string }; ends: Record<string, unknown>[] }> => {
+      const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
+      const logPath = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+      await exchangeWithAttachment(base, wsId, id, logPath)
+      let calls = 0
+      let release!: () => void
+      let entered!: () => void
+      const gate = new Promise<void>((resolve) => { release = resolve })
+      const waiting = new Promise<void>((resolve) => { entered = resolve })
+      const original = AttachmentStore.prototype.load
+      const load = vi.spyOn(AttachmentStore.prototype, 'load').mockImplementation(async function (this: AttachmentStore, ...args) {
+        if (calls++ >= spared) { entered(); await gate }
+        return original.apply(this, args)
+      })
+      try {
+        const pending = fetch(`${base}/api/workspaces/${wsId}/sessions/${id}/compact`, { method: 'POST' })
+        await waiting
+        if (change) {
+          const patched = await fetch(`${base}/api/providers/scripted`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modelSettings: { scripted: { contextTokens: 64_000 } } }) })
+          expect(patched.status).toBe(200)
+        }
+        release()
+        const response = await pending
+        return { status: response.status, body: await response.json() as { error?: string }, ends: (await readLog(logPath)).filter((event) => event.type === 'compaction/end') }
+      } finally { load.mockRestore() }
+    }
+    const unchanged = await run(false)
+    expect(unchanged.status).toBe(200)
+    expect(unchanged.ends.at(-1)!.error).toBeUndefined()
+    const changed = await run(true)
+    expect(changed.status).toBe(409)
+    expect(changed.body.error).toMatch(/context revision changed/)
+    expect(changed.ends.some((event) => event.error === undefined)).toBe(false)
+  })
+})
 
 describe('effective compaction through the web server', () => {
   it('compacts with ONE handoff request instead of folding the transcript', async () => {
