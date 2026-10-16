@@ -1,5 +1,5 @@
 import type { VideoRef } from '../attachments/video-store.ts'
-import { loadImageSource, type ImageToolOptions } from './image-tools.ts'
+import { fetchMedia, loadImageSource, type ImageToolOptions } from './image-tools.ts'
 import type { ToolDefinition, ToolExecution } from './types.ts'
 
 /**
@@ -217,9 +217,12 @@ export function generateVideoTool(options: GenerateVideoOptions): ToolDefinition
 
       // The download: the URL the job reported, else the provider's content endpoint.
       const target = final.videoUrl !== null && /^https?:\/\//i.test(final.videoUrl) ? final.videoUrl : `${base}/videos/${encodeURIComponent(requestId)}/content`
+      // Credentials go only under the configured endpoint: same origin AND inside its path
+      // (a bare string prefix let `https://vid.test.evil.tld` match `https://vid.test`).
       let download: Response
       try {
-        download = await doFetch(target, { headers: target.startsWith(base) ? headers(false) : {}, signal })
+        download = await fetchMedia(target, base, doFetch, signal, (url) =>
+          url.origin === new URL(base).origin && url.pathname.startsWith(new URL(`${base}/`).pathname) ? headers(false) : {})
       } catch (error) {
         throw new Error(`download video failed: ${message(error)}; request_id=${requestId}`)
       }

@@ -149,6 +149,9 @@ importers:
       tsx:
         specifier: ^4.20.3
         version: 4.23.12
+      undici:
+        specifier: ^7.29.1
+        version: 7.29.1
       web-push:
         specifier: ^3.6.7
         version: 3.6.7

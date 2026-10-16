@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { McpServerClient, MCP_PROTOCOL_VERSION } from '../../src/harness/mcp/client.ts'
-import { assertOutboundUrl } from '../../src/harness/mcp/outbound-policy.ts'
+import { assertOutboundUrl, outboundDispatcher } from '../../src/harness/mcp/outbound-policy.ts'
 import { MCP_LIMITS } from '../../src/harness/mcp/limits.ts'
 import { fileURLToPath } from 'node:url'
 
@@ -53,6 +53,23 @@ function barrier<T = void>() {
 }
 
 describe('MCP client audit regressions', () => {
+  it('rejects DNS names resolving to private addresses at connection time', async () => {
+    await expect(fetch('https://localhost/', { dispatcher: outboundDispatcher } as RequestInit)).rejects.toThrow()
+    // A hostname distinct from the explicit localhost fixture has no private-address exception.
+    await expect(fetch('https://localhost.localdomain/', { dispatcher: outboundDispatcher } as RequestInit)).rejects.toThrow()
+  })
+
+  it('rejects a non-string pagination cursor before requesting another page', async () => {
+    const fetchMock = mockHttp()
+    fetchMock.mockImplementation(async (_url, init) => {
+      const rpc = JSON.parse(String(init?.body)) as { id?: number; method: string }
+      if (rpc.id === undefined) return new Response(null, { status: 202 })
+      return Response.json({ id: rpc.id, result: rpc.method === 'initialize' ? { protocolVersion: MCP_PROTOCOL_VERSION } : { tools: [], nextCursor: 5 } })
+    })
+    await expect(httpClient().listTools()).rejects.toThrow(/non-string cursor/)
+    expect(fetchMock.mock.calls.filter(([, init]) => String(init?.body).includes('"cursor"'))).toHaveLength(0)
+  })
+
   it('rejects the entire IPv6 link-local /10 but not adjacent ranges', () => {
     for (const host of ['fe80::1', 'fe90::1', 'fea0::1', 'febf:ffff::1']) {
       expect(() => assertOutboundUrl(`https://[${host}]/`)).toThrow(/prohibited/)

@@ -79,6 +79,25 @@ describe('GenerateVideo tool', () => {
     expect(download.init?.headers).toEqual({})
   })
 
+  it('revalidates video redirects and strips provider credentials on foreign hops', async () => {
+    const scripted = job({ done: { status: 'done' } })
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = String(input)
+      if (url.endsWith('/content')) {
+        expect(init?.redirect).toBe('manual')
+        return new Response(null, { status: 302, headers: { location: 'https://cdn.test/out.mp4' } })
+      }
+      if (url === 'https://cdn.test/out.mp4') {
+        expect(init?.headers).toEqual({})
+        return new Response(null, { status: 302, headers: { location: 'https://127.0.0.1/private' } })
+      }
+      return scripted.fetchMock(input, init)
+    })
+    const { tool, stored } = setup(fetchMock as typeof fetch)
+    await expect(tool.execute({ prompt: 'cat' }, exec)).rejects.toThrow(/refusing media url/)
+    expect(stored).toEqual([])
+  })
+
   it('falls back to the content endpoint with credentials when the job reports no url', async () => {
     const { fetchMock, calls } = job({ done: { status: 'completed', progress: 100 } })
     const { tool, stored } = setup(fetchMock as unknown as typeof fetch)
@@ -155,6 +174,23 @@ describe('GenerateVideo tool', () => {
     await expect(setup(down.fetchMock as unknown as typeof fetch).tool.execute({ prompt: 'x' }, exec)).rejects.toThrow(/download video HTTP 410; request_id=rid-1/)
     const rejecting = setup(job().fetchMock as unknown as typeof fetch, { store: async () => { throw new Error('response is not a playable video') } })
     await expect(rejecting.tool.execute({ prompt: 'x' }, exec)).rejects.toThrow(/not a playable video/)
+  })
+
+  it('sends credentials only to the configured origin, never to a look-alike prefix, and refuses private hosts', async () => {
+    const lookalike = job({ done: { status: 'done', video: { url: 'https://vid.test.evil.tld/out.mp4' } } })
+    const fetchLookalike = vi.fn(async (input: string | URL | Request, init?: RequestInit) =>
+      String(input).startsWith('https://vid.test.evil.tld') ? new Response(new Uint8Array(MP4)) : lookalike.fetchMock(input, init))
+    await setup(fetchLookalike as unknown as typeof fetch).tool.execute({ prompt: 'x' }, exec)
+    const download = fetchLookalike.mock.calls.find(([url]) => String(url).startsWith('https://vid.test.evil.tld'))!
+    expect(download[1]?.headers).toEqual({})
+    // Same origin keeps credentials.
+    const same = job({ done: { status: 'done', video: { url: 'https://vid.test/v1/videos/rid-1/content' } } })
+    await setup(same.fetchMock as unknown as typeof fetch).tool.execute({ prompt: 'x' }, exec)
+    expect((same.calls.find((call) => call.url.endsWith('/content'))!.init?.headers as Record<string, string>)['authorization']).toBe('Bearer sk-vid')
+    // A link-local address is never fetched.
+    const metadata = job({ done: { status: 'done', video: { url: 'https://169.254.169.254/latest' } } })
+    await expect(setup(metadata.fetchMock as unknown as typeof fetch).tool.execute({ prompt: 'x' }, exec)).rejects.toThrow(/refusing media url/)
+    expect(metadata.calls.some((call) => call.url.includes('169.254'))).toBe(false)
   })
 
   it('times out with the request id when the job never finishes', async () => {

@@ -7,6 +7,8 @@
  * re-check every hop with {@link assertOutboundUrl}.
  */
 import { isIP } from 'node:net'
+import { lookup } from 'node:dns/promises'
+import { Agent } from 'undici'
 
 export class OutboundPolicyError extends Error {
   constructor(message: string) {
@@ -16,7 +18,7 @@ export class OutboundPolicyError extends Error {
 }
 
 export interface OutboundPolicyOptions {
-  /** Permit http:// to loopback. Tests and the local OAuth fixture need this. */
+  /** Permit loopback destinations, including http://, for a configured local resource. */
   readonly allowLoopbackHttp?: boolean
 }
 
@@ -47,10 +49,43 @@ export function assertOutboundUrl(raw: string, options: OutboundPolicyOptions = 
   if (url.protocol === 'http:' && !(options.allowLoopbackHttp === true && loopback)) {
     throw new OutboundPolicyError('plain HTTP is limited to the loopback fixture profile')
   }
-  if (!loopback && isProhibitedHost(url.hostname)) {
+  if (!(loopback && options.allowLoopbackHttp === true) && isProhibitedHost(url.hostname)) {
     throw new OutboundPolicyError('outbound URL targets a prohibited address')
   }
   return url
+}
+
+export function isLoopbackUrl(url: URL): boolean { return isLoopback(url.hostname) }
+
+/** Revalidate DNS at connection time, pinning the answer used by the socket. */
+function pinnedDispatcher(allowLoopback: boolean): Agent {
+  return new Agent({ connect: {
+    lookup(hostname, options, callback) {
+      void lookup(hostname, { all: true, verbatim: true }).then((addresses) => {
+        if (addresses.length === 0 || addresses.some(({ address }) => allowLoopback ? !isLoopbackAddress(address) : isProhibitedHost(address))) {
+          callback(new OutboundPolicyError('outbound URL resolves to a prohibited address'), [])
+          return
+        }
+        if (options.all === true) callback(null, addresses)
+        else {
+          const selected = addresses[0]!
+          callback(null, selected.address, selected.family)
+        }
+      }, (error: Error) => callback(error, []))
+    },
+  } })
+}
+
+export const outboundDispatcher = pinnedDispatcher(false)
+const loopbackDispatcher = pinnedDispatcher(true)
+
+function isLoopbackAddress(address: string): boolean {
+  const host = unwrapIp(address)
+  return host === '::1' || (isIP(host) === 4 && (ipv4Number(host)! >>> 24) === 127)
+}
+
+export function dispatcherFor(url: URL): Agent {
+  return isLoopbackUrl(url) ? loopbackDispatcher : outboundDispatcher
 }
 
 /** Headers the operator config must not replace. */

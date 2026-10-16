@@ -21,6 +21,13 @@ function previousRecord(f: OAuthFixture, redirect: string, issuer = f.origin): O
 }
 
 describe('resolveClient', () => {
+  it('rejects an untrusted loopback registration endpoint for a public resource', async () => {
+    const { found } = await discovered()
+    let called = false
+    await expect(resolveClient({ discovered: { ...found, resource: 'https://public.example/mcp', registrationEndpoint: 'http://127.0.0.1:1234/register' }, redirectUri, fetchImpl: (async () => { called = true; return Response.json({}) }) as typeof fetch })).rejects.toThrow(/plain HTTP/)
+    expect(called).toBe(false)
+  })
+
   it('uses the configured client and never registers', async () => {
     const { f, found } = await discovered()
     const client = await resolveClient({ configured: { clientId: 'mine', tokenEndpointAuth: 'client_secret_post' }, discovered: found, redirectUri })

@@ -116,7 +116,17 @@ export class MutationStore {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
       throw error
     }
-    const text = raw.endsWith('\n') ? raw.slice(0, -1) : raw.slice(0, raw.lastIndexOf('\n'))
+    if (raw !== '' && !raw.endsWith('\n')) {
+      raw = raw.slice(0, raw.lastIndexOf('\n') + 1)
+      const handle = await fs.open(this.file(), 'r+')
+      try {
+        await handle.truncate(Buffer.byteLength(raw))
+        await handle.sync()
+      } finally {
+        await handle.close()
+      }
+    }
+    const text = raw.slice(0, -1)
     if (text.trim() === '') return []
     const out: MutationLine[] = []
     for (const line of text.split('\n')) {

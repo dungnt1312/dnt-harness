@@ -108,16 +108,16 @@ async function finish(input: DispatchInput, auditFaultFile: string, outcome: Too
       invocationId: input.intent.invocationId,
       outcome,
       outputHash: digestText(detail),
-      detail: detail.slice(0, 500),
+      detail: '',
     })
     return true
-  } catch (error) {
+  } catch {
     await fs.mkdir(pathDir(auditFaultFile), { recursive: true }).catch(() => undefined)
     await fs.writeFile(auditFaultFile, JSON.stringify({
       invocationId: input.intent.invocationId,
       workspaceId: input.intent.workspaceId,
       outcome,
-      message: error instanceof Error ? error.message : String(error),
+      message: 'execution journal write failed',
     }), 'utf8').catch(() => undefined)
     return false
   }

@@ -9,6 +9,19 @@ import { DataHomeLock } from '../../src/harness/mcp/ownership-lock.ts'
 const stdioFixture = fileURLToPath(new URL('../fixtures/mcp-stdio-server.mjs', import.meta.url))
 
 describe('mcp execution journal', () => {
+  it('keeps remote output out of the durable terminal record', async () => {
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-journal-private-'))
+    try {
+      const journal = new McpExecutionJournal(path.join(home, 'executions.jsonl'))
+      await journal.open()
+      const result = await dispatchToolCall({ journal, intent: intent('private'), call: async () => ({ text: 'sensitive-output', isError: false }) }, path.join(home, 'fault'))
+      expect(result.output).toBe('sensitive-output')
+      const journalText = await fs.readFile(path.join(home, 'executions.jsonl'), 'utf8')
+      expect(journalText).not.toContain('sensitive-output')
+      expect(journalText).toContain('"outputHash"')
+    } finally { await fs.rm(home, { recursive: true, force: true }) }
+  })
+
   it.each([false, true])('reports audit_fault when an exception terminal cannot be stored (notSent=%s)', async (notSent) => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-fault-'))
     const fault = path.join(home, 'audit-fault.json')
@@ -30,6 +43,7 @@ describe('mcp execution journal', () => {
       expect(result.outcome).toBe('audit_fault')
       expect(result.output).toContain('transport failed')
       expect(result.output).toContain('execution record could not be stored')
+      expect(await fs.readFile(fault, 'utf8')).not.toContain('disk full')
       await expect(dispatchToolCall(input, fault)).rejects.toBeInstanceOf(AuditFaultBlock)
       await clearAuditFault(fault)
       expect((await dispatchToolCall(input, fault)).outcome).toBe('indeterminate')

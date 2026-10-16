@@ -11,6 +11,7 @@
  * offers registration.
  */
 import type { TokenEndpointAuth } from './config.ts'
+import { assertOutboundUrl, isLoopbackUrl } from './outbound-policy.ts'
 import { fetchLimitedJson, OAuthConnectError, type DiscoveredOAuth } from './oauth-discovery.ts'
 import type { OAuthServerRecord } from './oauth-store.ts'
 
@@ -40,6 +41,10 @@ export async function resolveClient(input: {
   }
 
   const registrationEndpoint = input.discovered.registrationEndpoint
+  if (registrationEndpoint !== undefined) {
+    const local = isLoopbackUrl(new URL(input.discovered.resource))
+    assertOutboundUrl(registrationEndpoint, { allowLoopbackHttp: local })
+  }
   const publicAllowed = input.discovered.tokenEndpointAuthMethods.includes('none')
   if (registrationEndpoint === undefined || !publicAllowed) {
     throw new OAuthConnectError('client_required', registrationEndpoint === undefined
@@ -57,7 +62,7 @@ export async function resolveClient(input: {
       response_types: ['code'],
       token_endpoint_auth_method: 'none',
     }),
-  }, input.fetchImpl ?? fetch).catch((error: unknown) => {
+  }, input.fetchImpl ?? fetch, isLoopbackUrl(new URL(input.discovered.resource))).catch((error: unknown) => {
     if (error instanceof OAuthConnectError) throw new OAuthConnectError('registration_failed', error.message)
     throw error
   })

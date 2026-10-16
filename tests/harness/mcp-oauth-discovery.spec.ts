@@ -46,6 +46,29 @@ describe('resourceCovers', () => {
 })
 
 describe('discoverOAuth', () => {
+  it('rejects loopback HTTP endpoints advertised by a public server', async () => {
+    const fetchImpl = (async (url: URL | RequestInfo) => {
+      const target = String(url)
+      if (target.endsWith('/mcp')) return new Response('', { status: 401 })
+      if (target.includes('protected-resource')) return Response.json({ resource: 'https://public.example/mcp', authorization_servers: ['https://public.example'] })
+      return Response.json({ issuer: 'https://public.example', code_challenge_methods_supported: ['S256'], authorization_endpoint: 'https://public.example/authorize', token_endpoint: 'http://127.0.0.1:8765/token' })
+    }) as typeof fetch
+    expect((await failure(discoverOAuth('https://public.example/mcp', { fetchImpl }))).message).toMatch(/plain HTTP/)
+  })
+
+  it.each(['token_endpoint', 'registration_endpoint', 'resource_metadata', 'authorization_servers'])('rejects HTTPS loopback advertised in %s by a public resource', async (field) => {
+    const seen: string[] = []
+    const fetchImpl = (async (input: URL | RequestInfo) => {
+      const url = String(input)
+      seen.push(url)
+      if (url.endsWith('/mcp')) return new Response('', { status: 401, headers: field === 'resource_metadata' ? { 'www-authenticate': 'Bearer resource_metadata="https://127.0.0.1/prm"' } : {} })
+      if (url.includes('protected-resource') || url.endsWith('/prm')) return Response.json({ resource: 'https://public.example/mcp', authorization_servers: [field === 'authorization_servers' ? 'https://127.0.0.1' : 'https://public.example'] })
+      return Response.json({ issuer: field === 'authorization_servers' ? 'https://127.0.0.1' : 'https://public.example', code_challenge_methods_supported: ['S256'], authorization_endpoint: 'https://public.example/authorize', token_endpoint: 'https://public.example/token', [field]: 'https://127.0.0.1/private' })
+    }) as typeof fetch
+    expect((await failure(discoverOAuth('https://public.example/mcp', { fetchImpl }))).message).toMatch(/prohibited/)
+    expect(seen.some((url) => url.startsWith('https://127.0.0.1'))).toBe(false)
+  })
+
   it('follows the challenge to PRM and RFC 8414 metadata', async () => {
     const f = await start({ prmScopes: ['read', 'write'] })
     const found = await discoverOAuth(f.mcpUrl)

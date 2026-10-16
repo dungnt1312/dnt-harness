@@ -12,7 +12,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto'
 import type { TokenEndpointAuth } from './config.ts'
-import { assertOutboundUrl, OutboundPolicyError } from './outbound-policy.ts'
+import { assertOutboundUrl, OutboundPolicyError, dispatcherFor, isLoopbackUrl } from './outbound-policy.ts'
 import { OAuthStore, type OAuthTokens, type OAuthServerRecord } from './oauth-store.ts'
 
 /** Resolves a confidential client's secret for one server, at the moment it is needed. */
@@ -134,9 +134,9 @@ export class ManagedOAuth {
   }
 
   async begin(input: OAuthBegin): Promise<{ readonly authorizationUrl: string; readonly state: string }> {
-    assertOauthUrl(input.authorizationEndpoint)
-    assertOauthUrl(input.tokenEndpoint)
-    assertOauthUrl(input.resource)
+    assertOauthUrl(input.resource, input.resource)
+    assertOauthUrl(input.authorizationEndpoint, input.resource)
+    assertOauthUrl(input.tokenEndpoint, input.resource)
     const verifier = randomBytes(32).toString('base64url')
     const challenge = createHash('sha256').update(verifier).digest('base64url')
     const state = randomBytes(32).toString('base64url')
@@ -232,7 +232,7 @@ export class ManagedOAuth {
       code_verifier: tx.verifier,
       redirect_uri: tx.redirectUri,
       resource: tx.resource,
-    }), client)
+    }), client, tx.resource)
     await this.store.withPublicationLock(tx.workspaceId, tx.server, () => serializeWrite(fence, async () => {
       if (fence.generation !== generation || tx.incarnation !== await this.store.incarnationUnlocked(tx.workspaceId, tx.server)) throw new OAuthFlowError('authorization was locally revoked or replaced')
       if (tx.expiresAt <= this.now()) throw new OAuthFlowError('authorization has expired; start Connect again')
@@ -318,7 +318,7 @@ export class ManagedOAuth {
           grant_type: 'refresh_token',
           refresh_token: current.refreshToken,
           resource: current.resource,
-        }), client)
+        }), client, current.resource)
       } catch (error) {
         if (fenced()) return undefined
         if (error instanceof OAuthTemporaryError) {
@@ -355,7 +355,7 @@ export class ManagedOAuth {
     }))
     if (revocationEndpoint === undefined || current === undefined || current.accessToken === '') return { local: 'revoked', remote: 'unavailable' }
     try {
-      assertOauthUrl(revocationEndpoint)
+      assertOauthUrl(revocationEndpoint, current.resource)
       const client = await this.clientAuth(workspaceId, server, current.clientId, current.tokenEndpointAuth)
       const { headers, body } = authenticated(new URLSearchParams({ token: current.accessToken }), client)
       const response = await this.fetchImpl(revocationEndpoint, {
@@ -364,6 +364,7 @@ export class ManagedOAuth {
         headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers },
         body,
         signal: AbortSignal.timeout(15_000),
+        ...(this.fetchImpl === fetch ? { dispatcher: dispatcherFor(new URL(revocationEndpoint)) } : {}),
       })
       await response.body?.cancel().catch(() => undefined)
       return { local: 'revoked', remote: response.ok ? 'succeeded' : 'failed' }
@@ -372,8 +373,8 @@ export class ManagedOAuth {
     }
   }
 
-  private async exchange(endpoint: string, grant: URLSearchParams, client: ClientAuth): Promise<OAuthTokens> {
-    assertOauthUrl(endpoint)
+  private async exchange(endpoint: string, grant: URLSearchParams, client: ClientAuth, resource: string): Promise<OAuthTokens> {
+    assertOauthUrl(endpoint, resource)
     const { headers, body } = authenticated(grant, client)
     let response: Response
     try {
@@ -383,6 +384,7 @@ export class ManagedOAuth {
         headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json', ...headers },
         body,
         signal: AbortSignal.timeout(15_000),
+        ...(this.fetchImpl === fetch ? { dispatcher: dispatcherFor(new URL(endpoint)) } : {}),
       })
     } catch (error) {
       throw new OAuthTemporaryError(`token endpoint temporarily unreachable: ${error instanceof Error ? error.message : String(error)}`)
@@ -429,9 +431,10 @@ function authenticated(grant: URLSearchParams, client: ClientAuth): { readonly h
   return { headers: {}, body }
 }
 
-function assertOauthUrl(raw: string): void {
+function assertOauthUrl(raw: string, resource: string): void {
   try {
-    assertOutboundUrl(raw, { allowLoopbackHttp: true })
+    const local = isLoopbackUrl(new URL(resource))
+    assertOutboundUrl(raw, { allowLoopbackHttp: local })
   } catch (error) {
     if (error instanceof OutboundPolicyError) throw new OAuthFlowError(error.message)
     throw error

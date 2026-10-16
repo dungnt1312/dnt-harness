@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import type { AttachmentRef } from '../attachments/store.ts'
+import { assertOutboundUrl, dispatcherFor } from '../mcp/outbound-policy.ts'
 import type { ToolDefinition, ToolExecution } from './types.ts'
 
 /**
@@ -23,6 +24,41 @@ import type { ToolDefinition, ToolExecution } from './types.ts'
 export const GENERATE_IMAGE_TOOL = 'GenerateImage'
 export const EDIT_IMAGE_TOOL = 'EditImage'
 export const IMAGE_TOOLS: readonly string[] = [GENERATE_IMAGE_TOOL, EDIT_IMAGE_TOOL]
+
+/**
+ * Whether a provider-reported media URL is on the configured endpoint's
+ * origin (only then may it receive credentials). A foreign URL must be a
+ * public https address; anything else throws.
+ */
+export function sameOriginMedia(url: string, baseUrl: string): boolean {
+  try {
+    const target = new URL(url)
+    if (target.origin === new URL(baseUrl).origin) return true
+    assertOutboundUrl(url)
+  } catch (error) {
+    throw new Error(`refusing media url ${excerpt(url, 120)}: ${message(error)}`)
+  }
+  return false
+}
+
+/** Validate and pin each foreign hop; configured provider origins retain their local access. */
+export async function fetchMedia(url: string, baseUrl: string, fetchImpl: typeof fetch, signal: AbortSignal, headers: (url: URL) => Record<string, string> = () => ({})): Promise<Response> {
+  let target = url
+  for (let redirects = 0; ; redirects++) {
+    const sameOrigin = sameOriginMedia(target, baseUrl)
+    const parsed = new URL(target)
+    const response = await fetchImpl(target, {
+      signal, headers: headers(parsed), redirect: 'manual',
+      ...(fetchImpl === fetch && !sameOrigin ? { dispatcher: dispatcherFor(parsed) } : {}),
+    })
+    if (![301, 302, 303, 307, 308].includes(response.status)) return response
+    await response.body?.cancel()
+    if (redirects >= 5) throw new Error('too many media redirects')
+    const location = response.headers.get('location')
+    if (location === null) throw new Error('media redirect has no location')
+    target = new URL(location, parsed).href
+  }
+}
 
 /** The image endpoint a call resolves at execution time (Settings may change between calls). */
 export interface ImageApiConfig {
@@ -179,7 +215,7 @@ class ImageRuntime {
   }
 
   /** Decode b64 or download the url once, bounded by `maxBytes`. */
-  async materialize(image: ParsedImage, signal: AbortSignal): Promise<Buffer> {
+  async materialize(image: ParsedImage, signal: AbortSignal, config: ImageApiConfig): Promise<Buffer> {
     if (image.b64 !== undefined) {
       const bytes = Buffer.from(image.b64.trim(), 'base64')
       if (bytes.length === 0) throw new Error('images response: empty b64_json payload')
@@ -190,7 +226,7 @@ class ImageRuntime {
     if (!/^https?:\/\//i.test(url)) throw new Error(`images response url is not http(s): ${excerpt(url, 120)}`)
     let download: Response
     try {
-      download = await this.doFetch(url, { signal })
+      download = await fetchMedia(url, config.baseUrl, this.doFetch, signal)
     } catch (error) {
       throw new Error(`download image url failed: ${message(error)}`)
     }
@@ -203,8 +239,9 @@ class ImageRuntime {
     return bytes
   }
 
-  async finish(workspaceId: string, name: string, model: string, image: ParsedImage, signal: AbortSignal, extra: Partial<ImageToolOutput> = {}): Promise<string> {
-    const bytes = await this.materialize(image, signal)
+  async finish(workspaceId: string, name: string, config: ImageApiConfig, image: ParsedImage, signal: AbortSignal, extra: Partial<ImageToolOutput> = {}): Promise<string> {
+    const model = config.model
+    const bytes = await this.materialize(image, signal, config)
     const stored = await this.options.store(workspaceId, { name: `${name}-${Date.now()}`, bytes })
     const output: ImageToolOutput = {
       attachmentId: stored.id,
@@ -250,7 +287,7 @@ export function generateImageTool(options: ImageToolOptions): ToolDefinition {
         signal,
       })
       if (!response.ok) throw new Error(`image generation HTTP ${response.status}: ${excerpt(response.text)}`)
-      return runtime.finish(workspaceId, 'generated-image', config.model, parseImageResponse(response.text), signal)
+      return runtime.finish(workspaceId, 'generated-image', config, parseImageResponse(response.text), signal)
     },
   }
 }
@@ -345,7 +382,7 @@ export function editImageTool(options: ImageToolOptions): ToolDefinition {
         }
       }
       if (!response.ok) throw new Error(`image edit HTTP ${response.status}: ${excerpt(response.text)}`)
-      return runtime.finish(workspaceId, 'edited-image', config.model, parseImageResponse(response.text), signal,
+      return runtime.finish(workspaceId, 'edited-image', config, parseImageResponse(response.text), signal,
         source.attachmentId !== undefined ? { sourceAttachmentId: source.attachmentId } : {})
     },
   }
