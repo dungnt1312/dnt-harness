@@ -366,6 +366,14 @@ export function fetchProviderModels(id: string): Promise<{ ok: boolean; models: 
   return apiFetch(`/api/providers/${encodeURIComponent(id)}/models`).then((r) => json<{ ok: boolean; models: string[] }>(r))
 }
 
+/**
+ * The stored API key, revealed on demand by the Settings eye toggle. Only the
+ * paired browser may read it back; a bearer (CLI/headless) client gets `401`.
+ */
+export function revealProviderKey(id: string): Promise<{ apiKey: string }> {
+  return apiFetch(`/api/providers/${encodeURIComponent(id)}/key`).then((r) => json<{ apiKey: string }>(r))
+}
+
 /** Replace the stored model list with the endpoint's, server-side (REST clients). */
 export function syncProvider(id: string): Promise<{ ok: boolean; models: string[] }> {
   return apiFetch(`/api/providers/${encodeURIComponent(id)}/sync`, { method: 'POST' }).then((r) =>

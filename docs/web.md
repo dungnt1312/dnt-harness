@@ -162,7 +162,9 @@ persist-before-publish transaction.
 Every endpoint speaks the standard `POST {baseUrl}/chat/completions` SSE wire
 format (tool-call fragment accumulation, `reasoning_content` → thinking
 deltas); DeepSeek is simply one such endpoint. API keys are masked when
-serialized to the client (`keyMasked`), never returned raw. When the active
+serialized to the client (`keyMasked`), and the raw key leaves the server only
+through `GET /api/providers/:id/key`, on request from the paired browser
+session (the Settings eye toggle). When the active
 workspace carries a thinking level, the adapter adds the model's documented
 reasoning control fields to the request body (see the model catalog section
 below) — never a generic field for an undocumented model.
@@ -320,6 +322,13 @@ is then omitted entirely rather than sent as an empty `Bearer`). `201 { id, … 
 Update fields: `{ name?, baseUrl?, apiKey?, enabled?, models?, modelSettings? }`.
 Omitting `apiKey` keeps the stored secret. A present `modelSettings` **replaces
 the whole map** (an empty object clears every override). `404` on an unknown id.
+
+### `GET /api/providers/:id/key`
+
+Read one provider's stored API key back, as `{ apiKey }` with
+`cache-control: no-store`. This is the only route that returns a raw key; it is
+browser-session only, so a bearer (CLI/headless) client gets `401` and the
+Settings eye toggle is the only caller. `404` on an unknown id.
 
 ### `DELETE /api/providers/:id`
 

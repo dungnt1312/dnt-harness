@@ -17,6 +17,7 @@ import {
   createProvider,
   deleteProvider,
   fetchProviderModels,
+  revealProviderKey,
   testProvider,
   updateProvider,
 } from '../../lib/api.ts'
@@ -132,7 +133,7 @@ interface Draft {
   readonly modelSettings: Record<string, ModelSettings>
 }
 
-type Busy = 'save' | 'sync' | 'test' | 'delete' | null
+type Busy = 'save' | 'sync' | 'test' | 'delete' | 'reveal' | null
 
 const BLANK: Draft = { name: '', baseUrl: '', apiKey: '', enabled: true, models: [], modelSettings: {} }
 
@@ -237,6 +238,8 @@ export function SettingsModal({
   const [busy, setBusy] = useState<Busy>(null)
   const [notice, setNotice] = useState<{ readonly kind: 'ok' | 'bad'; readonly text: string } | null>(null)
   const [showKey, setShowKey] = useState(false)
+  /** Stored key as revealed: the draft holds it so an untouched reveal is not dirty. */
+  const [revealedKey, setRevealedKey] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [modelDraft, setModelDraft] = useState('')
   /** Whether the "add model" input is revealed; the button stands in for it. */
@@ -277,6 +280,7 @@ export function SettingsModal({
     setDraft(first === undefined ? BLANK : draftOf(first))
     setNotice(null)
     setShowKey(false)
+    setRevealedKey('')
     setConfirmDelete(false)
     setModelDraft('')
     setAddingModel(false)
@@ -312,12 +316,12 @@ export function SettingsModal({
     return (
       draft.name !== base.name ||
       draft.baseUrl !== base.baseUrl ||
-      draft.apiKey !== '' ||
+      draft.apiKey !== revealedKey ||
       draft.enabled !== base.enabled ||
       !sameList(draft.models, base.models) ||
       JSON.stringify(pruneSettings(draft.models, draft.modelSettings)) !== JSON.stringify(pruneSettings(base.models, base.modelSettings))
     )
-  }, [draft, selected])
+  }, [draft, selected, revealedKey])
 
   /**
    * Leaving a tab or the dialog unmounts the panel, so ANY unsaved draft —
@@ -331,6 +335,8 @@ export function SettingsModal({
   const dismiss = () => leave(onDismiss)
   const discardDraft = (): void => {
     setDraft(selected === undefined ? BLANK : draftOf(selected))
+    setShowKey(false)
+    setRevealedKey('')
     setModelDraft('')
     setAddingModel(false)
     setNotice(null)
@@ -346,11 +352,38 @@ export function SettingsModal({
     setModelTests({})
   }
 
+  /**
+   * Show the stored secret. The list only ever carries `keyMasked`, so the key
+   * is fetched on demand and dropped back to the field's placeholder when it is
+   * hidden again — a reveal never counts as an edit, and a reveal the operator
+   * did not change is saved back unchanged.
+   */
+  const toggleKey = (): Promise<void> => {
+    if (showKey) {
+      setShowKey(false)
+      setRevealedKey('')
+      setDraft((current) => (current.apiKey === revealedKey ? { ...current, apiKey: '' } : current))
+      return Promise.resolve()
+    }
+    if (isNew) {
+      setShowKey(true)
+      return Promise.resolve()
+    }
+    return run('reveal', async () => {
+      if (selectedId === null) return
+      const { apiKey } = await revealProviderKey(selectedId)
+      setRevealedKey(apiKey)
+      setDraft((current) => ({ ...current, apiKey }))
+      setShowKey(true)
+    })
+  }
+
   const select = (provider: ProviderSummary): void => {
     setSelectedId(provider.id)
     setDraft(draftOf(provider))
     setNotice(null)
     setShowKey(false)
+    setRevealedKey('')
     setConfirmDelete(false)
     setModelDraft('')
     setAddingModel(false)
@@ -364,6 +397,7 @@ export function SettingsModal({
     setDraft(BLANK)
     setNotice(null)
     setShowKey(false)
+    setRevealedKey('')
     setConfirmDelete(false)
     setModelDraft('')
     setAddingModel(false)
@@ -411,12 +445,14 @@ export function SettingsModal({
         ? await createProvider({ ...shared, apiKey: draft.apiKey.trim() })
         : await updateProvider(selectedId, {
             ...shared,
-            ...(draft.apiKey.trim() !== '' ? { apiKey: draft.apiKey.trim() } : {}),
+            // A reveal the operator did not change sends nothing back.
+            ...(draft.apiKey.trim() !== '' && draft.apiKey !== revealedKey ? { apiKey: draft.apiKey.trim() } : {}),
           })
       await onRefresh()
       setSelectedId(saved.id)
       setDraft(draftOf(saved))
       setShowKey(false)
+      setRevealedKey('')
       setNotice({ kind: 'ok', text: `Saved “${saved.name}”.` })
     })
 
@@ -721,16 +757,17 @@ export function SettingsModal({
                         ? 'Optional for keyless endpoints; stored server-side.'
                         : selected?.keyMasked === ''
                           ? 'No key stored.'
-                          : `Stored ${selected?.keyMasked ?? ''}`}
+                          : showKey ? 'The stored key, shown on request.' : `Stored ${selected?.keyMasked ?? ''}`}
                     >
                       <TextInput
                         mono
                         type={showKey ? 'text' : 'password'}
                         value={draft.apiKey}
                         autoComplete="off"
+                        readOnly={busy === 'reveal'}
                         placeholder={isNew ? 'sk-…' : 'Keep current key'}
                         leading={<Icon name="key" size={15} />}
-                        trailing={<IconButton label={showKey ? 'Hide key' : 'Show key'} onClick={() => setShowKey((prev) => !prev)}><Icon name={showKey ? 'eyeOff' : 'eye'} size={15} /></IconButton>}
+                        trailing={<IconButton label={showKey ? 'Hide key' : 'Show key'} disabled={busy !== null} onClick={() => void toggleKey()}><Icon name={showKey ? 'eyeOff' : 'eye'} size={15} /></IconButton>}
                         onChange={(event) => patch({ apiKey: event.target.value })}
                       />
                     </Field>

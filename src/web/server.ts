@@ -8335,6 +8335,25 @@ async function handleApi(
       return
     }
 
+    // The stored secret on demand, and only to the paired browser: it never
+    // rides along in the provider list, and a bearer (CLI/headless) client may
+    // not read a key back. `no-store` keeps it out of any HTTP cache.
+    const providerKeyMatch = /^\/api\/providers\/([^/]+)\/key$/.exec(pathname)
+    if (req.method === 'GET' && providerKeyMatch !== null) {
+      if (!browserPrincipal(req, deps, 'GET')) {
+        send(401, { error: 'the stored API key can only be read from the browser session that owns the workspace' })
+        return
+      }
+      const entry = deps.providers().find((candidate) => candidate.id === decodeURIComponent(providerKeyMatch[1] ?? ''))
+      if (entry === undefined) {
+        send(404, { error: 'no such provider' })
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+      res.end(JSON.stringify({ apiKey: entry.apiKey }))
+      return
+    }
+
     const testMatch = /^\/api\/providers\/([^/]+)\/test$/.exec(pathname)
     if (req.method === 'POST' && testMatch !== null) {
       const entry = deps.providers().find((e) => e.id === decodeURIComponent(testMatch[1] ?? ''))

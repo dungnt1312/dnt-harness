@@ -502,9 +502,16 @@ describe('provider registry', () => {
       expect(entry.id).toBe('clip-proxy-one')
       expect(entry.keyMasked).toBe('••••1234')
 
-      // Raw key never leaves the server.
+      // Raw key never leaves the server in the list…
       const listed = (await (await fetch(`${base}/api/providers`)).json()) as { apiKey?: string }[]
       expect(listed[0] && 'apiKey' in listed[0]).toBe(false)
+
+      // …but the Settings eye toggle reads it back on demand, uncached.
+      const revealed = await fetch(`${base}/api/providers/clip-proxy-one/key`)
+      expect(revealed.status).toBe(200)
+      expect(revealed.headers.get('cache-control')).toBe('no-store')
+      expect((await revealed.json() as { apiKey: string }).apiKey).toBe('sk-test-1234')
+      expect((await fetch(`${base}/api/providers/nope/key`)).status).toBe(404)
 
       // Validation: bad URL and duplicate-name slug-uniqueness.
       const bad = await fetch(`${base}/api/providers`, {
