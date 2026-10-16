@@ -6,8 +6,10 @@
 import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { createWebServer, type LlmProvider, type WebEnvelope, type WebServer } from 'dnt-harness'
+import { FileSessionStore } from '../../src/harness/storage/file-session-store.ts'
+import type { SessionId } from '../../src/util/brand.ts'
 
 let root = ''
 
@@ -402,6 +404,51 @@ describe('input acceptance over REST', () => {
         expect(ends(await events(server.url, id))).toEqual([])
         await post(server.url, ws(id, 'stop'))
       } finally {
+        await server.close()
+      }
+    })
+
+    it('a DELETE that lands while a later POST waits on its barrier stays deleted', async () => {
+      const seen = { calls: 0 }
+      const home = await fs.mkdtemp(path.join(root, 'withdraw-race-'))
+      const server = await createWebServer({ home, configFile: path.join(home, 'p.json'), providers: [steerableProvider(seen)] })
+      const realFlush = FileSessionStore.prototype.flush
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => { release = resolve })
+      let parked!: () => void
+      const parkedNow = new Promise<void>((resolve) => { parked = resolve })
+      let armed = false
+      const spy = vi.spyOn(FileSessionStore.prototype, 'flush').mockImplementation(async function (this: FileSessionStore, sessionId: SessionId) {
+        if (armed) { armed = false; parked(); await gate }
+        return realFlush.call(this, sessionId)
+      })
+      try {
+        const wsId = ((await (await fetch(`${server.url}/api/workspaces`)).json()) as { id: string }[])[0]!.id
+        const { id } = (await (await post(server.url, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+        const at = (action: string): string => `${server.url}/api/workspaces/${wsId}/sessions/${id}/${action}`
+        const send = (content: string): Promise<Response> => fetch(at('messages'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content }) })
+        await send('first')
+        for (let i = 0; i < 60 && seen.calls < 1; i++) await new Promise((resolve) => setTimeout(resolve, 50))
+        const victim = (await (await send('victim')).json()) as { inputId: string }
+        armed = true
+        const trigger = send('trigger')
+        await parkedNow
+        expect((await fetch(at(`inputs/${victim.inputId}`), { method: 'DELETE' })).status).toBe(200)
+        release()
+        expect((await trigger).status).toBe(202)
+        expect((await fetch(at('steer'), { method: 'POST' })).status).toBe(202)
+        const logFile = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+        let log: LogEvent[] = []
+        for (let i = 0; i < 100; i++) {
+          log = (await fs.readFile(logFile, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as LogEvent)
+          if (ends(log).length >= 2) break
+          await new Promise((resolve) => setTimeout(resolve, 50))
+        }
+        expect(ends(log)).toEqual(['steered', 'completed'])
+        expect(users(log)).toEqual(['first', 'trigger'])
+      } finally {
+        release()
+        spy.mockRestore()
         await server.close()
       }
     })

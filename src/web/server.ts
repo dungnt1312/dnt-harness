@@ -824,7 +824,23 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     (mcpGeneration.get(workspaceId) ?? 1) + (mcpServerGeneration.get(`${workspaceId}:${serverName}`) ?? 0)
   const journals = new Map<string, McpExecutionJournal>()
   const journalsOpening = new Map<string, Promise<McpExecutionJournal>>()
-  const auditFaultFile = path.join(resourceHome, 'mcp-audit-fault.json')
+  const legacyAuditFaultFile = path.join(resourceHome, 'mcp-audit-fault.json')
+  const workspaceAuditFaultFile = (workspaceId: string): string => path.join(resourceHome, 'mcp-audit-faults', `${encodeURIComponent(workspaceId)}.json`)
+  let legacyAuditBlocked = await faultIsOpen(legacyAuditFaultFile)
+  if (legacyAuditBlocked) {
+    let owner: unknown
+    try { owner = (JSON.parse(await fs.readFile(legacyAuditFaultFile, 'utf8')) as { workspaceId?: unknown } | null)?.workspaceId } catch { /* Unreadable metadata stays globally blocked. */ }
+    if (typeof owner === 'string' && owner !== '') {
+      const destination = workspaceAuditFaultFile(owner)
+      await fs.mkdir(path.dirname(destination), { recursive: true })
+      await fs.copyFile(legacyAuditFaultFile, destination, 1).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'EEXIST') throw error
+      })
+      await clearAuditFault(legacyAuditFaultFile)
+      legacyAuditBlocked = false
+    }
+  }
+  const auditFaultFile = (workspaceId: string): string => legacyAuditBlocked ? legacyAuditFaultFile : workspaceAuditFaultFile(workspaceId)
   const oauthKeyFile = path.join(resourceHome, 'oauth.master.key')
   let oauthKey: Buffer
   try {
@@ -2558,7 +2574,7 @@ ${entry.description}`.toLowerCase().includes(query))
       const questionId = `question-${randomUUID()}`
       const parentSessionId = scope.childOf?.parentSessionId
       const definitionName = scope.childOf?.definition
-      const principalId = sessionPrincipals.get(scope.sessionId)
+      const principalId = sessionPrincipals.get(scope.rootSessionId ?? scope.sessionId)
       const workspaceId = (scope.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)) as WorkspaceId
       const expiresAt = Date.now() + limits.questionExpiryMs
       let settled = false
@@ -3193,7 +3209,7 @@ ${entry.description}`.toLowerCase().includes(query))
               const text = JSON.stringify(result.content) ?? ''
               return { text, isError: result.isError }
             },
-          }, auditFaultFile)
+          }, auditFaultFile(workspaceId))
           const text = dispatched.output.length > 60_000
             ? `${dispatched.output.slice(0, 60_000)}\n… [truncated ${dispatched.output.length - 60_000} chars]`
             : dispatched.output
@@ -3428,30 +3444,31 @@ ${entry.description}`.toLowerCase().includes(query))
     if (outside?.grantForSession === true && outside.proposedGrant !== undefined && outside.parentSessionId === undefined && outside.sessionId !== undefined) {
       const session = sessions.get(outside.sessionId as SessionId)?.session
       if (session === undefined) return 'the session grant could not be recorded: session not loaded'
+      let refusal: string | undefined
       try {
         const primary = outside.projectId === undefined
           ? undefined
           : workspaces.getProject(outside.projectId as ProjectId, outside.workspaceId as WorkspaceId | undefined).path
         await mutateSessionGrants(session, async (current) => {
           const validated = await validateGrantFolder(outside.proposedGrant, primary, grantPolicy)
+          // The grant queue wait can outlive the decision above: authority
+          // that narrowed (mode, guard, receipts) while this mutation queued
+          // must still gate the dispatch, and a refused call records no grant.
+          const after = await hostAuthority(payload.call, scope)
+          if (after.kind === 'deny') refusal = after.reason
+          else if (after.kind === 'ask' && !approvalReceipts.covers(payload.call, scope, after.requirements)) {
+            refusal = `current authority requires fresh approval for '${payload.call.name}'; retry as a new call`
+          }
+          if (refusal !== undefined) throw new Error(refusal)
           return mergeGrants(current.roots, [{ path: validated, access: outside.intent }])
         }, outside.approvalId)
       } catch (error) {
+        if (refusal !== undefined) {
+          approvalReceipts.retire(scope.executionId)
+          pathScope.retire(scope.executionId)
+          return refusal
+        }
         return `the session grant could not be recorded: ${String(error instanceof Error ? error.message : error)}`
-      }
-      // The grant queue wait can outlive the decision above: authority that
-      // narrowed (mode, guard, receipts) while this mutation queued must
-      // still gate the dispatch, so re-run the final check after persisting.
-      const after = await hostAuthority(payload.call, scope)
-      if (after.kind === 'deny') {
-        approvalReceipts.retire(scope.executionId)
-        pathScope.retire(scope.executionId)
-        return after.reason
-      }
-      if (after.kind === 'ask' && !approvalReceipts.covers(payload.call, scope, after.requirements)) {
-        approvalReceipts.retire(scope.executionId)
-        pathScope.retire(scope.executionId)
-        return `current authority requires fresh approval for '${payload.call.name}'; retry as a new call`
       }
     }
     // Admission consumes the evidence. Prepared calls are single-use, so no
@@ -3943,6 +3960,7 @@ ${entry.description}`.toLowerCase().includes(query))
         contextId,
       }),
       messages: assembled.messages,
+      outputCeilingTokens: assembled.maxOutputTokens,
       ...(assembled.tools !== undefined ? { tools: assembled.tools } : {}),
     }
     // Arm the effective capture with the request EXACTLY as dispatched (root steps only).
@@ -4145,7 +4163,7 @@ ${entry.description}`.toLowerCase().includes(query))
         const interactive = toolRequiresInteraction(call, scope.workspaceId, mcpDescriptors)
         const parentSessionId = scope.childOf?.parentSessionId
         const definitionName = scope.childOf?.definition
-        const principalId = sessionPrincipals.get(scope.sessionId)
+        const principalId = sessionPrincipals.get(scope.rootSessionId ?? scope.sessionId)
         const outside = pathScope.get(lifecycle.executionId ?? scope.sessionId, call)
         const scopeWarning = outside !== undefined && currentOutsideRequirement(outside, executingMode().mode.definition.outOfGrant) ? scopeWarningOf(outside) : undefined
         const proposedGrant = scopeWarning !== undefined ? outside?.proposedGrant : undefined
@@ -4627,7 +4645,7 @@ ${entry.description}`.toLowerCase().includes(query))
       const checkOwner = async (): Promise<string | undefined> => {
         let raw: string
         try {
-          raw = await fs.readFile(auditFaultFile, 'utf8')
+          raw = await fs.readFile(auditFaultFile(workspaceId), 'utf8')
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
           return 'audit fault cannot be read; restore readable fault metadata before retrying repair'
@@ -4659,7 +4677,8 @@ ${entry.description}`.toLowerCase().includes(query))
       // Validation may have awaited disk I/O while another workspace faulted.
       const currentOwnerError = await checkOwner()
       if (currentOwnerError !== undefined) return { ok: false as const, error: currentOwnerError }
-      await clearAuditFault(auditFaultFile)
+      await clearAuditFault(auditFaultFile(workspaceId))
+      legacyAuditBlocked = false
       return { ok: true as const }
     },
   }
@@ -4931,7 +4950,7 @@ interface HandlerDeps {
   readonly closeStreamsFor: (principalId: string) => void
   readonly liveStreams: { principalId: string | undefined; close: () => void }[]
   readonly containmentDetail: string
-  readonly auditFaultFile: string
+  readonly auditFaultFile: (workspaceId: string) => string
   readonly observeConfig: (workspaceId: string) => Promise<void>
   readonly acknowledgeDrift: (workspaceId: string) => Promise<void>
   readonly testMcpServer: (workspaceId: WorkspaceId, serverName: string) => Promise<readonly string[]>
@@ -6147,7 +6166,7 @@ async function handleApi(
           await deps.observeConfig(wsId)
           const config = await deps.mcpStore.loadMcp(wsId)
           const revision = configRevision(config)
-          const auditFault = await faultIsOpen(deps.auditFaultFile)
+          const auditFault = await faultIsOpen(deps.auditFaultFile(wsId))
           const rows = []
           for (const server of Object.values(config.servers)) {
             const client = deps.mcpClients.get(`${wsId}:${server.name}`)
@@ -9455,8 +9474,8 @@ async function queueHookRewake(entry: SessionEntry, deps: HandlerDeps, content: 
     ...(runsNow ? { runsNow: true as const } : {}),
   })
   await entry.session.durable()
-  entry.agent.adoptPending(stillPending)
-  entry.agent.enqueueAccepted({ content, inputId, origin: 'hook', summary })
+  // Re-read after the barrier: a DELETE/PATCH that landed meanwhile must win.
+  entry.agent.adoptPending(deps.kernel.ctx.sessions.pendingInputs(entry.session))
   if (!deps.compactionPending(entry.session.id)) await dispatchInbox(entry, deps, 'queue')
   return true
 }
@@ -9573,8 +9592,9 @@ async function submitMessage(
   // Re-adopt anything accepted but never consumed (a stop left it queued,
   // or a previous run failed) in log order, then the new input last:
   // accepted input is never lost and runs in submission order.
-  entry.agent.adoptPending(stillPending)
-  entry.agent.enqueueAccepted({ content, inputId, ...(refs.length > 0 ? { attachments: refs } : {}) })
+  // Read after the barrier, not the pre-append snapshot: a DELETE/PATCH that
+  // landed during the await (this input included) must not be undone.
+  entry.agent.adoptPending(deps.kernel.ctx.sessions.pendingInputs(entry.session))
   if (deps.compactionPending(entry.session.id)) {
     return { ok: true, status: 202, body: { inputId, queued: true, delivery, dispatchBlocked: 'maintenance' } }
   }

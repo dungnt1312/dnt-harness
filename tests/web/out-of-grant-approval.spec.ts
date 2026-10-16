@@ -262,6 +262,45 @@ describe('out-of-grant approvals', () => {
     expect(grants.roots).toEqual([])
   }, 20_000)
 
+  it('records no session grant when authority narrows while the grant mutation is queued', async () => {
+    const f = await fixture()
+    expect((await send('POST', `${f.url}/api/workspaces/${f.wsId}/modes/full-access/duplicate`, { newId: 'read-deny' })).status).toBe(200)
+    const modeRecord = (await (await fetch(`${f.url}/api/workspaces/${f.wsId}/modes/read-deny`)).json()) as { raw: string; hash: string }
+    expect((await send('PUT', `${f.url}/api/workspaces/${f.wsId}/modes/read-deny`, { content: modeRecord.raw.replace('"Read":"allow"', '"Read":"deny"'), expectedHash: modeRecord.hash })).status).toBe(200)
+    const mark = f.stream.frames.length
+    await f.say(`read ${path.join(outside, 'a.txt')}`)
+    const question = await f.stream.wait((frame) => frame.kind === 'approval', 'approval', mark)
+
+    // Park a competing grant mutation so the approval's mutation queues behind it.
+    const session = server!.kernel.ctx.sessions.get(f.sessionId as never)
+    const originalDurable = session.durable.bind(session)
+    let releaseBarrier: () => void = () => {}
+    const barrier = new Promise<void>((resolve) => { releaseBarrier = resolve })
+    let enteredBarrier: () => void = () => {}
+    const barrierEntered = new Promise<void>((resolve) => { enteredBarrier = resolve })
+    vi.spyOn(session, 'durable').mockImplementationOnce(async () => {
+      enteredBarrier()
+      await barrier
+      await originalDurable()
+    })
+    const grantsUrl = `${f.url}/api/workspaces/${f.wsId}/sessions/${f.sessionId}/grants`
+    const competing = send('PUT', grantsUrl, { expectedRevision: 0, roots: [] })
+    await barrierEntered
+
+    expect((await send('POST', `${f.url}/api/approvals/${question.approvalId}`, { allow: true, scope: 'session' })).status).toBe(200)
+    // Let the admitted call reach the queued grant mutation, then narrow.
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect((await send('PUT', `${f.url}/api/workspaces/${f.wsId}/sessions/${f.sessionId}/mode`, { modeId: 'read-deny' })).status).toBe(200)
+    releaseBarrier()
+    expect((await competing).status).toBe(200)
+
+    const result = await f.toolResult(mark)
+    expect(result.event?.ok).toBe(false)
+    expect(result.event?.output).not.toContain('secret a')
+    const grants = (await (await fetch(grantsUrl)).json()) as { roots: unknown[] }
+    expect(grants.roots).toEqual([])
+  }, 20_000)
+
   it('replaces a policy ask with the live outside-path ask when the governing mode narrows', async () => {
     const f = await fixture()
     expect((await send('POST', `${f.url}/api/workspaces/${f.wsId}/modes/full-access/duplicate`, { newId: 'read-ask-outside-allow' })).status).toBe(200)
