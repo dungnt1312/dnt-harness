@@ -137,14 +137,13 @@ export interface ModelRequest {
   readonly squeeze?: number
   /**
    * Output-token budget this request asks for. It can only LOWER the cap an
-   * adapter would send (catalog or operator value); it never raises one.
+   * adapter would send (catalog, operator or 32,000-token fallback); it never raises one.
    * Absent keeps ordinary behavior. Invalid values are ignored.
    */
   readonly maxOutputTokens?: number
   /**
    * Host-only ceiling (remaining context window after input and margin). It
-   * lowers a cap the adapter would send anyway but never invents one, so a
-   * model with no known output limit keeps the gateway default.
+   * lowers the adapter's catalog, operator or fallback output cap.
    */
   readonly outputCeilingTokens?: number
 }

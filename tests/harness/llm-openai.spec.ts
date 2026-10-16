@@ -63,12 +63,14 @@ describe('openai completions adapter: thinking + wire shape', () => {
       expect(captured.at(-1)!.body['max_tokens']).toBe(Math.min(65_536, remaining))
     }
   })
-  it('a remaining-window ceiling never invents max_tokens for a model with no known output cap', async () => {
+  it('falls back to 32,000 output tokens and clamps it to the remaining window', async () => {
     const captured = stubFetch()
     await run({ model: 'deepseek-chat', messages: [], outputCeilingTokens: 120_000 })
     await run({ model: 'some-unknown-model', messages: [], outputCeilingTokens: 200_000 })
+    await run({ model: 'some-unknown-model', messages: [], outputCeilingTokens: 12_000 })
+    await run({ model: 'some-unknown-model', messages: [], maxOutputTokens: 64_000 })
     await run({ model: 'some-unknown-model', messages: [], maxOutputTokens: 8_000, outputCeilingTokens: 5_000 }) // an explicit request cap is still clamped
-    expect(captured.map(c => c.body['max_tokens'])).toEqual([undefined, undefined, 5_000])
+    expect(captured.map(c => c.body['max_tokens'])).toEqual([32_000, 32_000, 12_000, 32_000, 5_000])
     expect(captured.every(c => !('outputCeilingTokens' in c.body))).toBe(true)
   })
   it('keeps the Claude thinking budget below a window-clamped max_tokens, or drops thinking when it cannot fit', async () => {
@@ -105,20 +107,20 @@ describe('openai completions adapter: thinking + wire shape', () => {
     ])
   })
 
-  it('sends the catalog output cap as max_tokens, an operator override wins, unknown models send none', async () => {
+  it('sends the catalog output cap as max_tokens, an operator override wins, unknown models use 32,000', async () => {
     const captured = stubFetch()
     await run({ model: 'claude-opus-5-5', messages: [] })
     await run({ model: 'gpt-5.6-sol', messages: [] })
     await run({ model: 'some-unknown-model', messages: [] })
     for await (const _ of new OpenAiCompletionsProvider({ name: 't', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', maxOutputTokens: { 'claude-opus-5-5': 32_000 } }).stream({ model: 'claude-opus-5-5', messages: [] })) void _
-    expect(captured.map(c => c.body['max_tokens'])).toEqual([128_000, 131_072, undefined, 32_000])
+    expect(captured.map(c => c.body['max_tokens'])).toEqual([128_000, 131_072, 32_000, 32_000])
   })
 
   it('a request maxOutputTokens only LOWERS the cap; it never raises it above the catalog or operator value, and is never serialized as a field of its own', async () => {
     const captured = stubFetch()
     await run({ model: 'claude-opus-5-5', messages: [], maxOutputTokens: 8_000 }) // lowers the 128k catalog cap
     await run({ model: 'claude-opus-5-5', messages: [], maxOutputTokens: 500_000 }) // cannot exceed the catalog
-    await run({ model: 'some-unknown-model', messages: [], maxOutputTokens: 8_000 }) // no known cap: the request value is the cap
+    await run({ model: 'some-unknown-model', messages: [], maxOutputTokens: 8_000 }) // lowers the 32k fallback
     for await (const _ of new OpenAiCompletionsProvider({ name: 't', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', maxOutputTokens: { 'claude-opus-5-5': 4_000 } }).stream({ model: 'claude-opus-5-5', messages: [], maxOutputTokens: 8_000 })) void _ // operator cap is lower
     for (const bad of [0, -1, 1.5, Number.NaN]) await run({ model: 'claude-opus-5-5', messages: [], maxOutputTokens: bad }) // invalid: ignored
     expect(captured.map(c => c.body['max_tokens'])).toEqual([8_000, 128_000, 8_000, 4_000, 128_000, 128_000, 128_000, 128_000])

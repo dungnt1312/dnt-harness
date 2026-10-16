@@ -105,17 +105,15 @@ export interface OpenAiCompletionsOptions {
 
 /**
  * The output-token cap sent as `max_tokens`: an operator override, else the
- * catalog's documented maximum. Without one the gateway applies its own
- * default, which can be far below what the model supports and cuts long
- * replies off with finish `length`. Unknown models send nothing.
+ * catalog's documented maximum, else a 32,000-token fallback. The fallback
+ * avoids gateway defaults that can cut long replies off with finish `length`.
  */
 export function outputTokenCap(model: string, overrides?: Readonly<Record<string, number>>, requested?: number, ceiling?: number): number | undefined {
   const override = overrides?.[model]
-  const known = override !== undefined && Number.isSafeInteger(override) && override > 0 ? override : getModelInfo(model)?.maxOutputTokens
-  // A request may only lower the cap. With no known cap the request value
-  // stands: the caller asked for a bounded answer.
+  const known = override !== undefined && Number.isSafeInteger(override) && override > 0 ? override : getModelInfo(model)?.maxOutputTokens ?? 32_000
+  // A request may only lower the catalog, operator or fallback cap.
   const cap = requested !== undefined && Number.isSafeInteger(requested) && requested > 0
-    ? (known === undefined ? requested : Math.min(known, requested))
+    ? Math.min(known, requested)
     : known
   return cap !== undefined && ceiling !== undefined && Number.isSafeInteger(ceiling) && ceiling > 0 ? Math.min(cap, ceiling) : cap
 }
