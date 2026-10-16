@@ -30,6 +30,11 @@ export interface ReasoningCapability {
 export type ThinkingLevel = 'off' | ReasoningLevel
 
 const EFFORT_5: readonly ReasoningLevel[] = ['low', 'medium', 'high', 'xhigh', 'max']
+// DeepSeek accepts the whole effort vocabulary, `minimal` included. Omitting a
+// level here is NOT harmless: an undeclared level is dropped from the wire and
+// the provider then runs its own default (for DeepSeek that is the heaviest
+// tier), so a user picking `medium` would silently get MORE thinking than `max`.
+const EFFORT_6: readonly ReasoningLevel[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 const GEMINI_STANDARD: readonly ReasoningLevel[] = ['low', 'medium', 'high']
 
 /** Every level a settings field or REST body may carry. */
@@ -204,7 +209,7 @@ function resolveCatalogValue<T>(
 
 const FALLBACK_REASONING: Readonly<Record<string, ReasoningCapability>> = {
   openai: { levels: EFFORT_5, canDisable: true, transportSupported: true },
-  deepseek: { levels: ['low', 'high', 'xhigh', 'max'], canDisable: true, transportSupported: true },
+  deepseek: { levels: EFFORT_6, canDisable: true, transportSupported: true },
   grok: { levels: ['low', 'medium', 'high', 'xhigh'], canDisable: true, transportSupported: true },
   glm: { levels: ['high', 'max'], canDisable: true, transportSupported: true },
   kimi: { levels: ['low', 'high', 'max'], canDisable: false, transportSupported: true },
@@ -536,7 +541,7 @@ export function applyThinkingOverride(body: Record<string, unknown>, model: stri
     else if (QWEN_LEVELS.includes(level)) body['enable_thinking'] = true
   } else if (id.includes('deepseek')) {
     if (level === 'off') setThinking('disabled')
-    else if (level === 'low' || level === 'high' || level === 'xhigh' || level === 'max') setEffort(level)
+    else if ((EFFORT_6 as readonly string[]).includes(level)) setEffort(level)
   } else if (id.includes('claude') || id.includes('kiro-claude')) {
     // Gateway Claude variants forward Anthropic extended_thinking fields;
     // map effort levels to budget_tokens that approximate them. Checked
