@@ -133,7 +133,7 @@ describe('web server', () => {
     expect(meta.folder).toBe(root)
   })
 
-  it('switching the model stamps every request through agent/request', async () => {
+  it('switching the model is stamped in agent/context for the next request', async () => {
     const seen: ModelRequest[] = []
     const recorder: LlmProvider = {
       name: 'recorder',
@@ -984,7 +984,7 @@ describe('static PWA files per host', () => {
       })
 
       const manifest = JSON.parse((await get('/manifest.webmanifest', 'harness.example.com')).body)
-      expect(manifest).toMatchObject({ name: 'harness.example.com · dnt-harness', short_name: 'harness.example.com', id: '/' })
+      expect(manifest).toMatchObject({ name: 'harness.example.com · dnt-harness', short_name: 'harness', id: '/' })
       const shell = (await get('/', 'harness.example.com')).body
       expect(shell).toContain('<title>harness.example.com · dnt-harness</title>')
       expect(shell).toContain('content="harness.example.com · dnt-harness"')
