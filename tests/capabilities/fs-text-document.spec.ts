@@ -145,6 +145,10 @@ describe('argument aliases and inherited observations', () => {
     expect(canonicalCall({ id: '1', name: 'Edit', args: { file_path: 'a.ts', old_string: 'x', new_string: 'y', replace_all: true } }).args)
       .toEqual({ path: 'a.ts', old: 'x', new: 'y', replaceAll: true })
     expect(canonicalCall({ id: '2', name: 'Read', args: { path: 'real.ts', file_path: 'alias.ts' } }).args).toEqual({ path: 'real.ts' })
+    // A null canonical value yields to a usable alias.
+    expect(canonicalCall({ id: '4', name: 'Read', args: { file_path: 'src/index.ts', path: null } }).args).toEqual({ path: 'src/index.ts' })
+    expect(canonicalCall({ id: '5', name: 'Edit', args: { path: 'a.ts', old: null, old_string: 'x', new: 'y' } }).args).toEqual({ path: 'a.ts', old: 'x', new: 'y' })
+    expect(canonicalCall({ id: '6', name: 'Read', args: { path: null, file_path: null } }).args).toEqual({ path: null })
     const untouched = { id: '3', name: 'Bash', args: { file_path: 'kept' } }
     expect(canonicalCall(untouched)).toBe(untouched)
   })

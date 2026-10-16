@@ -6,7 +6,8 @@
  * write redirect, and any unknown program or option is "not read-only" —
  * the caller then asks as before. This is approval UX, not a sandbox.
  *
- * Path containment: arguments may not be absolute (except `/dev/null`),
+ * Path containment: arguments may not expand (`$`, unquoted glob or brace
+ * characters), be absolute (except `/dev/null`),
  * start with `~`, contain a `..` segment, a backslash, or a Windows drive
  * prefix (`C:`), so an auto-allowed command
  * cannot read outside the folder Bash starts in. Symlinks inside the project
@@ -47,7 +48,8 @@ const GIT_FORBIDDEN = ['--output', '--ext-diff', '--textconv', '--exec', '--open
 const GIT_FORBIDDEN_LETTERS = 'O'
 
 function isContainedPath(word: ShellWord): boolean {
-  if (word.expands) return false
+  // A glob or brace word's real value is unknown (`[/]etc/passwd`, `{/etc/x,a}`).
+  if (word.expands || word.glob) return false
   // Windows forms Git Bash resolves outside the project: a backslash
   // separator (`..\x`, `C:\x`, `\\server\share`) or a drive prefix (`C:x`).
   if (word.value.includes('\\')) return false

@@ -50,6 +50,8 @@ describe('bundled modes', () => {
     expect(serializeModeFile(parsed)).toContain('\noutOfGrant: ask\nreadOnlyBash: allow\nriskyBash: ask\nmcpExposure: all\n---')
     expect(() => parseModeFile('x', '---\nreadOnlyBash: ask\n---\n\nbody')).toThrow(/readOnlyBash/)
     expect(() => parseModeFile('x', '---\nriskyBash: allow\n---\n\nbody')).toThrow(/riskyBash/)
+    // Duplicate keys are rejected, never silently last-wins.
+    expect(() => parseModeFile('x', '---\ntoolExposure: ["Read", "Grep"]\ntoolExposure: ["Bash"]\n---\n\nbody')).toThrow(/duplicate frontmatter key 'toolExposure'/)
     for (const mode of BUNDLED_MODES) expect(parseModeFile(mode.id, serializeModeFile(mode))).toEqual(mode)
   })
 

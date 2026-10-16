@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseShell } from '../../src/harness/guard/shell-parse.ts'
+import { parseShell, splitExpansions } from '../../src/harness/guard/shell-parse.ts'
 import { isReadOnlyBashCommand } from '../../src/harness/guard/bash-readonly.ts'
 import { matchRiskyCommand } from '../../src/harness/guard/bash-risky.ts'
 
@@ -30,6 +30,23 @@ describe('parseShell', () => {
   it('treats quoted glob characters and quoted braces as literal', () => {
     const [command] = parseShell(`grep '*' "{x}"`).commands
     expect(command!.words.map((word) => word.glob)).toEqual([false, false, false])
+  })
+
+  it('splitExpansions turns $ expansions into word breaks and expands comma braces', () => {
+    expect(splitExpansions('rm${IFS}-rf$IFS/')?.split(/\s+/)).toEqual(['rm', '-rf', '/'])
+    expect(splitExpansions("rm$'\\x20'-rf")?.split(/\s+/)).toEqual(['rm', '-rf'])
+    expect(splitExpansions('a/{b,c}/d')?.trim().split(/\s+/)).toEqual(['a/b/d', 'a/c/d'])
+    expect(splitExpansions('git status')).toBe('git status')
+    // Bounded on hostile nesting/growth: over the limit → undefined (unknown).
+    expect(splitExpansions('{a,b}'.repeat(200))).toBeUndefined()
+  })
+
+  it('splitExpansions bounds the projected size before building it', () => {
+    const started = performance.now()
+    const source = `${'x'.repeat(20_000)}{${','.repeat(20_000)}}`
+    expect(splitExpansions(source)).toBeUndefined()
+    expect(matchRiskyCommand(`echo ${source}`)?.ruleId).toBe('unanalyzable-delete')
+    expect(performance.now() - started).toBeLessThan(2_000)
   })
 })
 
@@ -90,6 +107,16 @@ describe('isReadOnlyBashCommand', () => {
     ['command substitution', 'echo $(rm -rf x)'],
     ['program path', './script.sh'],
     ['input from outside', 'wc -l < /etc/hosts'],
+    // Glob/brace/expansion arguments: the real value is unknown before the shell runs.
+    ['bracket glob hides an absolute path', 'cat [/]etc/passwd'],
+    ['brace list names an absolute path', 'cat {/etc/passwd,README.md}'],
+    ['brace list hides a parent escape', 'cat {..,x}/secret'],
+    ['brace flag + absolute', 'ls {-la,/etc}'],
+    ['star glob', 'cat *'],
+    ['question glob', 'cat ?etc/passwd'],
+    ['bracket glob on input redirect', 'wc -l < [/]etc/hosts'],
+    ['${IFS} separator', 'cat${IFS}/etc/passwd'],
+    ["$' ' separator", "cat$' '/etc/passwd"],
     ['empty', ''],
   ])('refuses: %s', (_why, command) => {
     expect(isReadOnlyBashCommand(command)).toBe(false)
@@ -126,6 +153,23 @@ describe('matchRiskyCommand', () => {
     ['git branch -D topic', 'git-branch-force-delete'],
     ['echo ok && git reset --hard', 'git-reset-hard'],
     ['rm $(cat list)', 'unanalyzable-delete'],
+    // Shell-produced separators hide nothing.
+    ['rm${IFS}-rf${IFS}build', 'remove-bulk'],
+    ["rm$' '-rf$' 'build", 'remove-bulk'],
+    ["rm$'\\x20'-rf build", 'remove-bulk'],
+    ['git${IFS}reset${IFS}--hard', 'git-reset-hard'],
+    ['{rm,-rf,build}', 'remove-bulk'],
+    // Unparsable lines ask for every destructive vocabulary, not only rm.
+    ['(cd repo && git clean -fdx)', 'unanalyzable-delete'],
+    // Unparsable, separators only visible after expansion splitting; global options.
+    ['(git${IFS}-C${IFS}repo${IFS}clean${IFS}-fdx)', 'unanalyzable-delete'],
+    ['(git -C repo --no-pager reset --hard)', 'unanalyzable-delete'],
+    ['git${IFS}-C${IFS}repo${IFS}clean${IFS}-fdx', 'git-clean-force'],
+    ['git --no-pager -c a=b push --force', 'git-push-force'],
+    ['echo $(date) && git reset --hard', 'unanalyzable-delete'],
+    ['(git push --force)', 'unanalyzable-delete'],
+    ['(rsync -a --delete a/ b/)', 'unanalyzable-delete'],
+    ['(find . -delete)', 'unanalyzable-delete'],
   ])('matches %j as %s', (command, ruleId) => {
     expect(matchRiskyCommand(command)?.ruleId).toBe(ruleId)
   })
@@ -149,6 +193,8 @@ describe('matchRiskyCommand', () => {
     'echo "rm -rf /"',
     'npm test',
     'echo $(date)',
+    '(ls -la)',
+    'echo ${HOME}',
   ])('does not match %j', (command) => {
     expect(matchRiskyCommand(command)).toBeNull()
   })
