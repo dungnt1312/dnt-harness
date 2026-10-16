@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: read
+  # npm trusted publishing (OIDC): no long-lived NPM_TOKEN.
+  id-token: write
 
 jobs:
   publish:
@@ -28,6 +30,5 @@ jobs:
       - name: Tag matches package.json version
         run: test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}"
       # prepack runs `vite build`, so web-dist/ is fresh in the tarball.
-      - run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Trusted publishing (OIDC, npm >= 11.5.1): npm exchanges the GitHub ID token itself.
+      - run: npm --version && npm publish
