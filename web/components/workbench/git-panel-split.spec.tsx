@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import '../../test-css-escape.ts'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
@@ -105,6 +106,7 @@ describe('selecting a file shows its diff in the pane', () => {
     await key(rowOf('a.ts'), 'ArrowDown')
     await act(async () => { await vi.waitFor(() => expect(region('src/b.ts')).not.toBeNull()) })
     expect(rowOf('b.ts').getAttribute('aria-current')).toBe('true')
+    expect(document.activeElement).toBe(rowOf('b.ts'))
     await key(rowOf('b.ts'), 'ArrowUp')
     await act(async () => { await vi.waitFor(() => expect(region('src/a.ts')).not.toBeNull()) })
 
