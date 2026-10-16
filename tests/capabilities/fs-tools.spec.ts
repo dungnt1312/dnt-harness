@@ -43,6 +43,10 @@ function shaOf(content: string): string {
 }
 
 describe('fs tools', () => {
+  it('Read describes line-range reads so models do not fall back to sed -n', () => {
+    expect(tool('Read').description).toContain('lines A to B are offset=A, limit=B-A+1')
+  })
+
   it('Write creates parent directories and Read returns the content', async () => {
     const result = await tool('Write').execute({ path: 'src/app.ts', content: 'export const x = 1\n' }, exec())
     expect(result).toBe('created src/app.ts (1 lines)')

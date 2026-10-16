@@ -31,11 +31,11 @@ describe('no harness-added file-tool hints', () => {
     const out = await bashTool().execute({ command: "printf '[hint: x]\\n'" }, { root: process.cwd(), toolCallId: 'toolu_1' })
     expect(out).toBe('[hint: x]\n\n[exit code: 0]')
   })
-  it('describes the observation rules truthfully', () => {
+  it('steers file reads/searches to the file tools and states the observation rule', () => {
     const description = bashTool().description
     expect(description).toMatch(/reading a file through Bash creates no observation/)
-    expect(description).toMatch(/new file needs no Read/)
-    expect(description).not.toMatch(/not cat/)
+    expect(description).toMatch(/do not use Bash to read, search or change file contents \(`cat`, `head`, `tail`, `sed`/)
+    expect(description).toMatch(/Read \(any line range\)/)
   })
 })
 

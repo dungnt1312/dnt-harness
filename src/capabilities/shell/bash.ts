@@ -132,8 +132,8 @@ export function bashTool(options: BashToolOptions = {}): ToolDefinition {
     description: [
       'Run Bash once; return output and exit code if completed, or a running process ID after the foreground wait. Watch that ID with BashOutput; do not rerun a still-running command.',
       'The command already runs in the project folder: do not start it with `cd <project> &&`; use paths relative to the project, or absolute paths.',
-      'Use Bash for builds, tests, git, package managers, metadata inspection and other programs. Use Read, Grep and Glob to read and search file contents, and Edit, Write or ApplyPatch to change files; Bash stays right for operations those tools do not cover.',
-      'Editing or overwriting an existing file requires an observation from Read or a successful Write/Edit/ApplyPatch in this conversation; reading a file through Bash creates no observation. Creating a new file needs no Read, and a successful Write/Edit/ApplyPatch updates the observation, so there is no need to Read again after each change.',
+      'Use Bash to run programs: builds, tests, git, package managers, and file metadata such as size or type.',
+      'IMPORTANT: do not use Bash to read, search or change file contents (`cat`, `head`, `tail`, `sed`, `awk`, `grep`, `rg`, `find`, `echo >`, heredocs) unless the user asks or you have verified that no file tool can do it. Use Read (any line range), Grep, Glob, and Edit, Write or ApplyPatch instead: they show as file links and diffs, read exactly the line range needed, and reading a file through Bash creates no observation, so it must still be Read before it can be edited.',
       'Independent lookups can be several Read/Grep/Glob calls in one step rather than one chained shell command.',
     ].join(' '),
     requiresRoot: true,

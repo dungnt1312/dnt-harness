@@ -21,7 +21,9 @@ describe('default base prompt', () => {
   })
 
   it('selects tools by task, not semantic-search-first, and shares the principle with the child prompt', () => {
-    expect(DEFAULT_BASE_SYSTEM).toContain('Use Bash for builds, tests, Git, package managers, metadata inspection')
+    expect(DEFAULT_BASE_SYSTEM).toContain('prefer the dedicated file and search tools over shell commands')
+    expect(DEFAULT_BASE_SYSTEM).toContain('any line range of them, with Read')
+    expect(DEFAULT_BASE_SYSTEM).toContain('Use Bash to run programs (builds, tests, Git, package managers)')
     expect(DEFAULT_BASE_SYSTEM).not.toMatch(/Prefer the narrowest tool/)
     expect(DEFAULT_CHILD_SYSTEM).toContain('narrowest available tool that fits the task')
     expect(DEFAULT_CHILD_SYSTEM).toContain('Your FINAL message is the entire deliverable')

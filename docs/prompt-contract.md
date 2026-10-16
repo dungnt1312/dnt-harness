@@ -126,8 +126,12 @@ defence in depth; the tool pipeline stays the enforcement.
 
 ## Tool selection and Bash
 
-The base and child prompts choose tools by task (Read known files, Glob paths,
-Grep text, Bash for builds/tests/Git/metadata and unsupported operations). Bash
+The base and child prompts choose tools by task and prefer the dedicated file and
+search tools over shell commands (Read known files or line ranges, Glob paths,
+Grep text, Bash for builds/tests/Git/metadata and unsupported operations). The
+Bash description itself steers file reads, searches and edits (`cat`, `head`,
+`tail`, `sed`, `grep`, `find`, heredocs) to those tools; the Read description
+maps a line range A–B to `offset`=A, `limit`=B−A+1. Bash
 results carry no harness-added advice: only the program's own output, truncation
 markers and the exit/termination suffix. Existing files need an observation
 (Read, or a prior successful Write/Edit/ApplyPatch) before they are changed;
