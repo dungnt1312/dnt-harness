@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useScopedState } from '../../hooks/useScopedState.ts'
 import { getSystemPrompts, putSystemPrompts, type SystemPromptsResponse } from '../../lib/api.ts'
+import { estimateTokens } from '../../../src/harness/context/calibration.ts'
 import { Badge } from '../ui/Badge.tsx'
 import { Button } from '../ui/Button.tsx'
 import Icon from '../common/Icon.tsx'
@@ -33,10 +34,10 @@ interface Draft {
 
 const draftOf = (response: SystemPromptsResponse): Draft => ({ base: response.base.text, child: response.child.text })
 
-/** The builder's estimate: chars/4, matching the context budget's numbers. */
+/** The builder's estimate (chars/3, CJK counted twice), matching the context budget's numbers. */
 function estimateLabel(text: string): string {
   const chars = text.length
-  return `${chars.toLocaleString()} chars · ~${Math.ceil(chars / 4).toLocaleString()} tok (est)`
+  return `${chars.toLocaleString()} chars · ~${estimateTokens(text).toLocaleString()} tok (est)`
 }
 
 function isConflict(cause: unknown): boolean {

@@ -133,6 +133,7 @@ interface BuildInput {
   readonly identity: SnapshotIdentity
   readonly id: string
   readonly usage?: TokenUsage
+  readonly estimateRatio?: number
 }
 
 function buildSnapshot(input: BuildInput): EffectiveCompactionSnapshot | undefined {
@@ -163,6 +164,7 @@ function buildSnapshot(input: BuildInput): EffectiveCompactionSnapshot | undefin
     ...(projection.seed !== undefined ? { seedHash: projection.seed.hash } : {}),
     identity: input.identity,
     ...(input.usage !== undefined ? { inputEvidence: { inputTokens: input.usage.inputTokens, ...(input.usage.outputTokens !== undefined ? { outputTokens: input.usage.outputTokens } : {}) } } : {}),
+    ...(input.estimateRatio !== undefined ? { estimateRatio: input.estimateRatio } : {}),
   }
 }
 
@@ -219,6 +221,8 @@ export interface ReconstructInput {
   readonly finalAnswer: ModelMessage
   readonly identity: SnapshotIdentity
   readonly newId?: () => string
+  /** The calibration ratio the builder assembled `request` under (`budget.measured.ratio`). */
+  readonly estimateRatio?: number
 }
 
 /**
@@ -237,5 +241,6 @@ export function reconstructSnapshot(input: ReconstructInput): EffectiveCompactio
     finalAnswer: input.finalAnswer,
     identity: input.identity,
     id: (input.newId ?? randomUUID)(),
+    ...(input.estimateRatio !== undefined ? { estimateRatio: input.estimateRatio } : {}),
   })
 }

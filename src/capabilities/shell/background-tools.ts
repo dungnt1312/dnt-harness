@@ -18,11 +18,11 @@ function knownIds(processes: ProcessRegistry, exec: ToolExecution): string {
 export function bashOutputTool(options: { readonly processes: ProcessRegistry }): ToolDefinition {
   return {
     name: 'BashOutput',
-    description: 'Read the captured stdout/stderr and status of one background process started with Bash run_in_background.',
+    description: 'Read the captured stdout/stderr and status of one background process in this session: the process ID Bash returned, including a command that moved to the background automatically.',
     parameters: {
       type: 'object',
       properties: {
-        processId: { type: 'string', description: 'the process id returned by Bash' },
+        processId: { type: 'string', description: 'the process id returned by Bash, including a command that moved to the background automatically' },
         block: { type: 'boolean', description: 'wait for completion; default false' },
         timeoutMs: { type: 'number', description: 'wait budget, default 30000, max 600000; never kills the process' },
       },
@@ -54,11 +54,11 @@ export function bashOutputTool(options: { readonly processes: ProcessRegistry })
 export function killShellTool(options: { readonly processes: ProcessRegistry }): ToolDefinition {
   return {
     name: 'KillShell',
-    description: 'Kill one background process started with Bash run_in_background (whole process tree).',
+    description: 'Kill one background process in this session (whole process tree): the process ID Bash returned, including a command that moved to the background automatically.',
     parameters: {
       type: 'object',
       properties: {
-        processId: { type: 'string', description: 'the process id returned by Bash run_in_background' },
+        processId: { type: 'string', description: 'the process id returned by Bash, including a command that moved to the background automatically' },
       },
       required: ['processId'],
     },

@@ -6,8 +6,10 @@
 import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { createWebServer, type LlmProvider, type WebEnvelope, type WebServer } from 'dnt-harness'
+import { FileSessionStore } from '../../src/harness/storage/file-session-store.ts'
+import type { SessionId } from '../../src/util/brand.ts'
 
 let root = ''
 
@@ -148,14 +150,18 @@ describe('input acceptance over REST', () => {
   })
 
   describe('steer', () => {
-    /** First request hangs until aborted; every later one answers at once. */
-    function steerableProvider(): LlmProvider {
-      let calls = 0
+    /**
+     * First request hangs until aborted; every later one answers at once.
+     * Tests wait on `seen.calls` rather than `step/start`: under load a step
+     * can start, and be stopped, before the provider is ever called, which
+     * would move the hanging call into the next turn.
+     */
+    function steerableProvider(seen = { calls: 0 }): LlmProvider {
       return {
         name: 'hang',
         models: ['hang'],
         async *stream(_request, options) {
-          calls += 1
+          const calls = ++seen.calls
           if (calls === 1) {
             await new Promise<void>((_resolve, reject) => {
               options?.signal?.addEventListener('abort', () => reject(new Error('aborted')))
@@ -250,11 +256,12 @@ describe('input acceptance over REST', () => {
     })
 
     it('delivery:steer stops the running turn and runs the old queue plus the new message', async () => {
-      const server = await createWebServer({ root, providers: [steerableProvider()] })
+      const seen = { calls: 0 }
+      const server = await createWebServer({ root, providers: [steerableProvider(seen)] })
       try {
         const { id } = (await (await post(server.url, '/api/sessions')).json()) as { id: string }
         await post(server.url, ws(id, 'messages'), { content: 'first' })
-        await settle(server.url, id, stepping)
+        await settle(server.url, id, () => seen.calls === 1)
         expect((await post(server.url, ws(id, 'messages'), { content: 'queued' })).status).toBe(202)
         const steered = await post(server.url, ws(id, 'messages'), { content: 'instead', delivery: 'steer' })
         expect(steered.status).toBe(202)
@@ -275,11 +282,12 @@ describe('input acceptance over REST', () => {
     })
 
     it('a queued input can be edited and deleted until a turn claims it', async () => {
-      const server = await createWebServer({ root, providers: [steerableProvider()] })
+      const seen = { calls: 0 }
+      const server = await createWebServer({ root, providers: [steerableProvider(seen)] })
       try {
         const { id } = (await (await post(server.url, '/api/sessions')).json()) as { id: string }
         await post(server.url, ws(id, 'messages'), { content: 'first' })
-        await settle(server.url, id, stepping)
+        await settle(server.url, id, () => seen.calls === 1)
         const keep = (await (await post(server.url, ws(id, 'messages'), { content: 'typo' })).json()) as { inputId: string }
         const drop = (await (await post(server.url, ws(id, 'messages'), { content: 'never mind' })).json()) as { inputId: string }
         const input = (inputId: string, init: RequestInit): Promise<Response> =>
@@ -309,7 +317,8 @@ describe('input acceptance over REST', () => {
     })
 
     it('a queued input can be edited with attachments: added, replaced, and removed', async () => {
-      const server = await createWebServer({ root, providers: [steerableProvider()] })
+      const seen = { calls: 0 }
+      const server = await createWebServer({ root, providers: [steerableProvider(seen)] })
       const upload = async (name: string): Promise<{ id: string; name: string; mediaType: string; bytes: number }> => {
         const response = await fetch(`${server.url}/api/workspaces/default/attachments`, {
           method: 'POST',
@@ -322,7 +331,7 @@ describe('input acceptance over REST', () => {
       try {
         const { id } = (await (await post(server.url, '/api/sessions')).json()) as { id: string }
         await post(server.url, ws(id, 'messages'), { content: 'first' })
-        await settle(server.url, id, stepping)
+        await settle(server.url, id, () => seen.calls === 1)
         const first = (await (await post(server.url, ws(id, 'messages'), { content: 'look', attachments: [await upload('a.png')] })).json()) as { inputId: string }
         const second = (await (await post(server.url, ws(id, 'messages'), { content: 'plain' })).json()) as { inputId: string }
         const input = (inputId: string, body: unknown): Promise<Response> =>
@@ -399,6 +408,51 @@ describe('input acceptance over REST', () => {
       }
     })
 
+    it('a DELETE that lands while a later POST waits on its barrier stays deleted', async () => {
+      const seen = { calls: 0 }
+      const home = await fs.mkdtemp(path.join(root, 'withdraw-race-'))
+      const server = await createWebServer({ home, configFile: path.join(home, 'p.json'), providers: [steerableProvider(seen)] })
+      const realFlush = FileSessionStore.prototype.flush
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => { release = resolve })
+      let parked!: () => void
+      const parkedNow = new Promise<void>((resolve) => { parked = resolve })
+      let armed = false
+      const spy = vi.spyOn(FileSessionStore.prototype, 'flush').mockImplementation(async function (this: FileSessionStore, sessionId: SessionId) {
+        if (armed) { armed = false; parked(); await gate }
+        return realFlush.call(this, sessionId)
+      })
+      try {
+        const wsId = ((await (await fetch(`${server.url}/api/workspaces`)).json()) as { id: string }[])[0]!.id
+        const { id } = (await (await post(server.url, `/api/workspaces/${wsId}/sessions`)).json()) as { id: string }
+        const at = (action: string): string => `${server.url}/api/workspaces/${wsId}/sessions/${id}/${action}`
+        const send = (content: string): Promise<Response> => fetch(at('messages'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content }) })
+        await send('first')
+        for (let i = 0; i < 60 && seen.calls < 1; i++) await new Promise((resolve) => setTimeout(resolve, 50))
+        const victim = (await (await send('victim')).json()) as { inputId: string }
+        armed = true
+        const trigger = send('trigger')
+        await parkedNow
+        expect((await fetch(at(`inputs/${victim.inputId}`), { method: 'DELETE' })).status).toBe(200)
+        release()
+        expect((await trigger).status).toBe(202)
+        expect((await fetch(at('steer'), { method: 'POST' })).status).toBe(202)
+        const logFile = path.join(home, 'workspaces', wsId, 'sessions', id, 'events.jsonl')
+        let log: LogEvent[] = []
+        for (let i = 0; i < 100; i++) {
+          log = (await fs.readFile(logFile, 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as LogEvent)
+          if (ends(log).length >= 2) break
+          await new Promise((resolve) => setTimeout(resolve, 50))
+        }
+        expect(ends(log)).toEqual(['steered', 'completed'])
+        expect(users(log)).toEqual(['first', 'trigger'])
+      } finally {
+        release()
+        spy.mockRestore()
+        await server.close()
+      }
+    })
+
     it('an unknown delivery is a 400', async () => {
       const server = await createWebServer({ root, providers: [hangProvider()] })
       try {
@@ -410,11 +464,12 @@ describe('input acceptance over REST', () => {
     })
 
     it('POST /steer runs input a stop left queued; with nothing pending it stops nothing', async () => {
-      const server = await createWebServer({ root, providers: [steerableProvider()] })
+      const seen = { calls: 0 }
+      const server = await createWebServer({ root, providers: [steerableProvider(seen)] })
       try {
         const { id } = (await (await post(server.url, '/api/sessions')).json()) as { id: string }
         await post(server.url, ws(id, 'messages'), { content: 'first' })
-        await settle(server.url, id, stepping)
+        await settle(server.url, id, () => seen.calls === 1)
         // Empty queue: Send now must not act as a hidden Stop.
         expect(await (await post(server.url, ws(id, 'steer'))).json()).toEqual({ steered: false, pending: 0 })
         await post(server.url, ws(id, 'messages'), { content: 'left behind' })

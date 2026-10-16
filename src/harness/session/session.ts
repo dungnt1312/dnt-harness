@@ -17,6 +17,15 @@ declare module 'dnt-harness' {
      * first, exactly like transient provider deltas.
      */
     'session/event'(session: Session, event: SessionEvent): void
+    /**
+     * A prefix of the log crossed the durability barrier: the writer chain
+     * through `lastSeq` resolved, `flush` acknowledged it, and the committed
+     * prefix now covers it. Isolated like `session/event` — an observer
+     * failure never retracts or poisons the commit — and additive: the
+     * existing per-service durable listener is untouched. Never fires when
+     * the barrier failed (the session is poisoned instead).
+     */
+    'session/durable'(session: Session, lastSeq: number): void
   }
 }
 
@@ -169,6 +178,13 @@ export class Session {
       // Overlapping barriers may settle out of order; never retract a prefix.
       if (lastSeq > this.committedLog.length) this.committedLog = this.log.slice(0, lastSeq)
       this.durableListener?.(lastSeq)
+      // Broadcast the commit at the same point the service listener hears it:
+      // after the committed prefix advanced. `parallel` contains observer
+      // failures exactly like `session/event` does, so a misbehaving
+      // durability consumer can never rewrite or poison the commit itself.
+      await this.ctx.parallel('session/durable', this, lastSeq).catch((error) => {
+        console.warn(`session '${this.id}': durable observer failed`, error)
+      })
     } catch (error) {
       this.poisonedFlag = true
       this.poisonedError = error
@@ -244,7 +260,9 @@ export class Session {
    * `boundarySeq` (all events when omitted), with `seq` rebased from 1.
    * Copied history is not re-broadcast; the child's future appends are.
    * The child shares this session's store; persisting the copy is the
-   * caller's (the sessions service's) job.
+   * caller's (the sessions service's) job, before it exposes the child: the
+   * copy counts as committed, like adopted history. The durable listener is
+   * not inherited — it belongs to the parent's owner.
    *
    * @returns the child session.
    */
@@ -252,7 +270,6 @@ export class Session {
     const child = new Session(this.ctx, {
       ...(this.options.store !== undefined ? { store: this.options.store } : {}),
       ...(this.options.now !== undefined ? { now: this.options.now } : {}),
-      ...(this.durableListener !== undefined ? { onDurable: this.durableListener } : {}),
       ...(this.relaxedStreamingAppends ? { relaxedStreamingAppends: true } : {}),
     })
     const limit = boundarySeq ?? this.log[this.log.length - 1]?.seq ?? 0
@@ -260,6 +277,7 @@ export class Session {
       if (event.seq > limit) break
       child.log.push({ ...event, seq: child.log.length + 1 })
     }
+    child.committedLog = [...child.log]
     return child
   }
 }

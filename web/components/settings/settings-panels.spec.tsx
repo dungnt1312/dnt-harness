@@ -2,7 +2,7 @@
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cloneAgentToWorkspace, readAgentFile, deleteMcpServer, listAgentDefinitions, duplicateModeFile, fetchProviderModels, getImageGenerationSettings, getImageUnderstandingSettings, getMcpServer, getModeFile, getSystemPrompts, HttpError, importAgentDefinition, importMcpServers, listModeFiles, listModes, putSystemPrompts, saveModeFile, setModeEnabled, testProvider, upsertMcpServer } from '../../lib/api.ts'
+import { cloneAgentToWorkspace, readAgentFile, deleteMcpServer, listAgentDefinitions, duplicateModeFile, fetchProviderModels, getImageGenerationSettings, getImageUnderstandingSettings, getMcpServer, getModeFile, getSystemPrompts, HttpError, importAgentDefinition, importMcpServers, listModeFiles, listModes, putSystemPrompts, revealProviderKey, saveModeFile, setModeEnabled, testProvider, upsertMcpServer } from '../../lib/api.ts'
 import { emptyModeForm, parseModeForm, permissionKeyError, serializeModeForm } from '../../lib/mode-form.ts'
 import { McpPanel } from './McpPanel.tsx'
 import { AgentsPanel, definitionDocument } from './AgentsPanel.tsx'
@@ -18,6 +18,7 @@ vi.mock('../../lib/api.ts', () => ({
     }
   },
   fetchProviderModels: vi.fn(async () => ({ ok: true, models: ['auto', 'fresh-1'] })),
+  revealProviderKey: vi.fn(async () => ({ apiKey: 'sk-stored-4321' })),
   testProvider: vi.fn(async () => ({ ok: true })),
   getImageGenerationSettings: vi.fn(async () => ({ provider: null, model: null })),
   setImageGenerationSettings: vi.fn(async (value: unknown) => value),
@@ -697,6 +698,37 @@ describe('settings dialog', () => {
     await act(async () => button('Delete provider').click())
     expect(document.body.textContent).toContain('Delete “local”?')
     expect(button('Delete permanently')).toBeTruthy()
+  })
+
+  it('reveals the stored key on request instead of toggling an empty field', async () => {
+    await act(async () => root.render(
+      <SettingsModal
+        open
+        workspaceId="ws"
+        providers={[{ id: 'p1', name: 'ocproxy', baseUrl: 'https://ocproxy.example', enabled: true, keyMasked: '••••4321', models: ['auto'] }]}
+        activeProvider="p1"
+        onDismiss={() => {}}
+        onRefresh={async () => {}}
+      />,
+    ))
+    const field = (): HTMLInputElement => input('API key') as HTMLInputElement
+    // Nothing is fetched until the eye is clicked, and the field shows the mask in its hint.
+    expect(document.body.textContent).toContain('Stored ••••4321')
+    expect(revealProviderKey).not.toHaveBeenCalled()
+    expect(field().value).toBe('')
+
+    await act(async () => button('Show key').click())
+    await settle()
+    expect(revealProviderKey).toHaveBeenCalledWith('p1')
+    expect(field().value).toBe('sk-stored-4321')
+    expect(field().type).toBe('text')
+    // Showing the key is not an edit; an unchanged reveal saves nothing.
+    expect(button('Save changes').disabled).toBe(true)
+
+    await act(async () => button('Hide key').click())
+    expect(field().value).toBe('')
+    expect(field().type).toBe('password')
+    expect(button('Save changes').disabled).toBe(true)
   })
 
   it('treats a sync as a proposal: the endpoint list is chosen, not applied', async () => {

@@ -19,6 +19,8 @@ export interface ChartSpec {
 export const MAX_CHART_POINTS = 500
 export const MAX_CHART_SERIES = 8
 export const MAX_AXIS_LABEL = 60
+/** Each point label and series name. */
+export const MAX_CHART_TEXT = 200
 // Only hex ever reaches the SVG `fill`/`stroke`, so model text cannot inject CSS or markup.
 const HEX_COLOR = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i
 
@@ -39,6 +41,7 @@ export function parseChart(raw: unknown): ChartSpec {
   const labels = record['labels']
   if (!Array.isArray(labels) || labels.length === 0 || !labels.every((label) => typeof label === 'string')) throw new Error("chart 'labels' must be a non-empty array of strings")
   if (labels.length > MAX_CHART_POINTS) throw new Error(`chart has ${labels.length} points; the limit is ${MAX_CHART_POINTS}`)
+  if (labels.some((label) => label.length > MAX_CHART_TEXT)) throw new Error(`chart labels must be at most ${MAX_CHART_TEXT} characters`)
   const series = record['series']
   if (!Array.isArray(series) || series.length === 0 || series.length > MAX_CHART_SERIES) throw new Error(`chart 'series' must have 1 to ${MAX_CHART_SERIES} entries`)
   const xLabel = axisLabel(record['xLabel'], 'xLabel')
@@ -55,6 +58,7 @@ export function parseChart(raw: unknown): ChartSpec {
       const item = entry !== null && typeof entry === 'object' ? entry as Record<string, unknown> : {}
       const name = typeof item['name'] === 'string' ? item['name'].trim() : ''
       if (name === '') throw new Error(`series[${index}] needs a non-empty name`)
+      if (name.length > MAX_CHART_TEXT) throw new Error(`series[${index}] name is longer than ${MAX_CHART_TEXT} characters`)
       const values = item['values']
       if (!Array.isArray(values) || values.length !== labels.length) throw new Error(`series '${name}' values must have one number per label (${labels.length})`)
       if (!values.every((value) => typeof value === 'number' && Number.isFinite(value))) throw new Error(`series '${name}' values must be finite numbers`)

@@ -81,6 +81,10 @@ async function waitFor<T>(probe: () => Promise<T | undefined> | T | undefined, w
   throw new Error(`timed out waiting for ${what}`)
 }
 
+/** The file's text once non-empty: Write creates the file before filling it, so '' is not done yet. */
+const fileText = (file: string): Promise<string | undefined> =>
+  fs.readFile(file, 'utf8').then((text) => text || undefined, () => undefined)
+
 interface ApprovalFrame { readonly kind: string; readonly approvalId?: string }
 
 class ApprovalStream {
@@ -211,7 +215,7 @@ describe('folder grants', () => {
     await send('PUT', `${base}/api/workspaces/${wsId}/sessions/${sessionId}/grants`, { expectedRevision: 0, roots: [{ path: shared, access: 'write' }] })
     const target = path.join(shared, 'from-agent.txt')
     await send('POST', `${base}/api/workspaces/${wsId}/sessions/${sessionId}/messages`, { content: `write ${target}` })
-    expect(await waitFor(() => fs.readFile(target, 'utf8').catch(() => undefined), 'granted write')).toBe('granted')
+    expect(await waitFor(() => fileText(target), 'granted write')).toBe('granted')
     const system = requests[0]?.messages.filter((message) => message.role === 'system').map((message) => String(message.content)).join('\n') ?? ''
     expect(system).toContain(`Project folder (relative paths resolve here, read-write): ${primary}`)
     expect(system).toContain(`Granted folder (read-write, use absolute paths): ${shared}`)
@@ -241,7 +245,7 @@ describe('folder grants', () => {
     expect((await send('PUT', `${base}/api/workspaces/${wsId}/sessions/${sessionId}/mode`, { modeId: 'full-access' })).status).toBe(200)
     // Inside the project the primary's read-write wins over the read-only ancestor.
     await send('POST', `${base}/api/workspaces/${wsId}/sessions/${sessionId}/messages`, { content: `write ${path.join(projectA, 'inside.txt')}` })
-    expect(await waitFor(() => fs.readFile(path.join(projectA, 'inside.txt'), 'utf8').catch(() => undefined), 'write inside project')).toBe('granted')
+    expect(await waitFor(() => fileText(path.join(projectA, 'inside.txt')), 'write inside project')).toBe('granted')
     // A write to a sibling is refused by the read-only ancestor grant.
     await send('POST', `${base}/api/workspaces/${wsId}/sessions/${sessionId}/messages`, { content: `write ${path.join(sibling, 'blocked.txt')}` })
     await new Promise((resolve) => setTimeout(resolve, 500))
@@ -350,7 +354,7 @@ describe('folder grants', () => {
       )
       expect((await send('POST', `${base}/api/approvals/${siblingApproval.approvalId}`, { allow: true })).status).toBe(200)
 
-      await waitFor(() => fs.readFile(path.join(docs, 'allowed.txt'), 'utf8').catch(() => undefined), 'sibling write')
+      await waitFor(() => fileText(path.join(docs, 'allowed.txt')), 'sibling write')
       await expect(fs.readFile(path.join(nested, 'blocked.txt'), 'utf8')).rejects.toThrow()
     } finally {
       stream.close()

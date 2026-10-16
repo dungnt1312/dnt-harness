@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { ModelCompletion, ModelRequest, StreamEvent } from '../../src/harness/llm/types.ts'
 import type { SessionEvent } from '../../src/harness/session/events.ts'
 import type { CompactionProjection } from '../../src/harness/context/compaction-projection.ts'
-import { sourceDigest, type SnapshotIdentity } from '../../src/harness/context/compaction-snapshot.ts'
+import { sourceDigest, validateSnapshot, type SnapshotIdentity } from '../../src/harness/context/compaction-snapshot.ts'
 import { CompactionSnapshotStore } from '../../src/harness/storage/compaction-snapshot-store.ts'
 import {
   captureStream,
@@ -240,6 +240,15 @@ describe('reconstructSnapshot', () => {
     expect(snapshot!.cutoff).toBe(CUTOFF)
     expect(snapshot!.id).toBe('rec-1')
     expect(snapshot!.request.messages).toEqual(request.messages)
+    expect(snapshot!.estimateRatio).toBeUndefined()
+  })
+
+  it('carries the calibration ratio the builder assembled the request under, and validation accepts it', () => {
+    const events = COMPLETED()
+    const snapshot = reconstructSnapshot({ sessionId: 'session-a', events, turnId: 't1', request, projection: projectionFor(events), finalAnswer: { role: 'assistant', content: 'done' }, identity, newId: () => 'rec-r', estimateRatio: 1.3 })
+    expect(snapshot!.estimateRatio).toBe(1.3)
+    expect(validateSnapshot(snapshot!, events)).toEqual({ ok: true })
+    expect(validateSnapshot({ ...snapshot!, estimateRatio: 0.5 }, events)).toEqual({ ok: false, reason: 'unsupported-schema' })
   })
 
   it('refuses an uncovered dropped turn instead of inventing coverage', () => {

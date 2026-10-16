@@ -29,6 +29,33 @@ async function boot(provider?: LlmProvider) {
 }
 
 describe('MCP server integration review regressions', () => {
+  it.each([true, false])('preserves a legacy audit block across startup (owned=%s)', async (owned) => {
+    const { wsId } = await boot()
+    await web!.close()
+    web = undefined
+    const legacy = path.join(home, 'mcp-audit-fault.json')
+    await fs.writeFile(legacy, JSON.stringify(owned ? { workspaceId: wsId, invocationId: 'legacy' } : { invocationId: 'legacy' }))
+    web = await createWebServer({ home, configFile: path.join(home, 'providers.json') })
+    const fault = owned ? path.join(home, 'mcp-audit-faults', `${encodeURIComponent(wsId)}.json`) : legacy
+    if (owned) await expect(fs.stat(legacy)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await fs.readFile(fault, 'utf8')).toContain('legacy')
+    const otherResponse = await fetch(`${web.url}/api/workspaces`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'Other' }) })
+    const other = await otherResponse.json() as { id: string }
+    for (const id of [wsId, other.id]) {
+      const route = `${web.url}/api/workspaces/${id}/mcp`
+      expect((await fetch(`${route}/fixture`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ transport: 'http', url: 'https://public.example/mcp', enabled: false }) })).status).toBe(201)
+      const rows = await (await fetch(route)).json() as { auditFault: boolean }[]
+      expect(rows[0]?.auditFault).toBe(!owned || id === wsId)
+    }
+    const repair = () => fetch(`${web!.url}/api/workspaces/${wsId}/mcp/audit-repair`, { method: 'POST' })
+    if (!owned) {
+      expect((await repair()).status).toBe(409)
+      await fs.writeFile(legacy, JSON.stringify({ workspaceId: wsId, invocationId: 'legacy' }))
+    }
+    expect((await repair()).status).toBe(200)
+    await expect(fs.stat(fault)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it('single-flights concurrent first calls and leaves a reopen-valid journal', async () => {
     const provider: LlmProvider = {
       name: 'scripted', models: ['scripted'],
@@ -94,15 +121,15 @@ describe('MCP server integration review regressions', () => {
     })
     expect(created.status).toBe(201)
     const other = await created.json() as { id: string }
-    const fault = path.join(home, 'mcp-audit-fault.json')
+    const fault = path.join(home, 'mcp-audit-faults', `${encodeURIComponent(wsId)}.json`)
+    await fs.mkdir(path.dirname(fault), { recursive: true })
     const metadata = JSON.stringify({ workspaceId: wsId, invocationId: 'failed', outcome: 'success' })
     await fs.writeFile(fault, metadata)
     const file = path.join(home, 'workspaces', wsId, 'mcp', 'executions.jsonl')
     await fs.mkdir(path.dirname(file), { recursive: true })
     await fs.writeFile(file, 'corrupt\n')
     const foreign = await fetch(`${base}/api/workspaces/${other.id}/mcp/audit-repair`, { method: 'POST' })
-    expect(foreign.status).toBe(409)
-    expect(await foreign.text()).toContain('belongs to workspace')
+    expect(foreign.status).toBe(200)
     expect(await fs.readFile(fault, 'utf8')).toBe(metadata)
     expect((await post('/mcp/audit-repair')).status).toBe(409)
     expect(await fs.readFile(fault, 'utf8')).toBe(metadata)
@@ -112,8 +139,9 @@ describe('MCP server integration review regressions', () => {
   })
 
   it.each(['{"invocationId":"legacy"}', 'invalid', 'null'])('keeps unowned or invalid audit metadata blocked (%s)', async (metadata) => {
-    const { post } = await boot()
-    const fault = path.join(home, 'mcp-audit-fault.json')
+    const { wsId, post } = await boot()
+    const fault = path.join(home, 'mcp-audit-faults', `${encodeURIComponent(wsId)}.json`)
+    await fs.mkdir(path.dirname(fault), { recursive: true })
     await fs.writeFile(fault, metadata)
     const response = await post('/mcp/audit-repair')
     expect(response.status).toBe(409)

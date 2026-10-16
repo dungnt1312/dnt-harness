@@ -14,7 +14,7 @@ import { McpDispatchError, receiptForTransportFailure } from './boundaries.ts'
 import type { McpServerConfig } from './config.ts'
 import { MCP_LIMITS } from './limits.ts'
 import { parseBearerChallenge } from './oauth-discovery.ts'
-import { assertOutboundUrl, operatorHeaders } from './outbound-policy.ts'
+import { assertOutboundUrl, operatorHeaders, dispatcherFor } from './outbound-policy.ts'
 import { assertHardContainmentAvailable, minimalStdioEnv, resolveCanonicalExecutable } from './process-controller.ts'
 import { assertInitializeResult, assertCursor, assertSessionId, vettedTool } from './protocol.ts'
 import { SseParser } from './sse-parser.ts'
@@ -461,6 +461,7 @@ class HttpTransport implements Transport {
     private readonly config: McpServerConfig,
     private readonly tokens: BearerTokenSource,
     private readonly events: TransportEvents = {},
+    private readonly onToken: (token: string) => void = () => {},
   ) {}
 
   async start(): Promise<void> {
@@ -542,6 +543,7 @@ class HttpTransport implements Transport {
     }
     if (token !== this.rejectedToken) this.rejectedToken = undefined
     this.lastToken = token
+    if (token !== undefined) this.onToken(token)
     const sessionAtSend = this.sessionId
     const pendingResponse = fetch(target, {
       method: 'POST',
@@ -557,7 +559,8 @@ class HttpTransport implements Transport {
       },
       body: JSON.stringify(body),
       signal: deadline,
-    })
+      dispatcher: dispatcherFor(target),
+    } as RequestInit)
     onDispatch?.(token)
     const response = await pendingResponse
     if (response.status >= 300 && response.status < 400) {
@@ -651,7 +654,8 @@ class HttpTransport implements Transport {
           ...(this.lastToken !== undefined ? { authorization: `Bearer ${this.lastToken}` } : {}),
         },
         signal: AbortSignal.timeout(5_000),
-      }).catch(() => undefined)
+        dispatcher: dispatcherFor(new URL(this.config.url)),
+      } as RequestInit).catch(() => undefined)
     }
     this.sessionId = undefined
   }
@@ -747,6 +751,7 @@ export class McpServerClient {
   private toolsCache: readonly McpToolDescriptor[] = []
   /** Bounded tail of the stdio server's stderr, redacted when read. */
   private stderrTail = ''
+  private readonly usedTokens = new Set<string>()
 
   constructor(
     readonly serverName: string,
@@ -791,13 +796,14 @@ export class McpServerClient {
     return tools
   }
 
-  /** Recent server stderr (stdio), with every configured secret value masked. */
+  /** Recent server stderr, with configured and issued bearer secrets masked. */
   recentStderr(): string {
     let text = this.stderrTail
     const secrets = [
       ...Object.values(this.resolved.env ?? {}),
       ...Object.values(this.resolved.headers ?? {}),
       ...(this.resolved.bearerToken !== undefined ? [this.resolved.bearerToken] : []),
+      ...this.usedTokens,
     ].filter((value) => value.length >= 6).sort((a, b) => b.length - a.length)
     for (const secret of secrets) text = text.split(secret).join('[redacted]')
     return text
@@ -831,7 +837,9 @@ export class McpServerClient {
         pages.push(descriptor)
       }
       if (pages.length > MCP_LIMITS.maxTools) throw new McpTransportError('tools/list exceeded the tool cap')
-      cursor = (raw as { nextCursor?: unknown } | undefined)?.nextCursor as string | undefined
+      const nextCursor = (raw as { nextCursor?: unknown } | undefined)?.nextCursor
+      if (nextCursor !== undefined && typeof nextCursor !== 'string') throw new McpTransportError('tools/list returned a non-string cursor')
+      cursor = nextCursor
     } while (cursor !== undefined && cursor !== '')
     return pages
   }
@@ -919,6 +927,7 @@ export class McpServerClient {
     this.cancelRecovery()
     await this.transport?.stop()
     this.transport = undefined
+    this.usedTokens.clear()
     this.state = 'disabled'
   }
 
@@ -1040,7 +1049,7 @@ export class McpServerClient {
             ...((this.resolved.headers ?? this.config.headers) !== undefined
               ? { headers: this.resolved.headers ?? this.config.headers }
               : {}),
-          }, tokens, events)
+          }, tokens, events, (token) => { this.usedTokens.add(token) })
     // A failed or dead transport is replaced, never abandoned: its process
     // (and watchdog timers) would otherwise outlive the reference to it.
     const previous = this.transport

@@ -1,0 +1,590 @@
+a17e896 fix(web): incremental per-session context reducer for GET /manifest
+2132a09 fix(web): never pair a new assembly with the previous assembly's usage.last on /manifest
+1671d75 fix(web): deliver a held compaction success to already-subscribed SSE clients once durable
+
+ src/web/server.ts                           |  65 ++++++++++++---
+ tests/harness/context-state.spec.ts         |  16 ++++
+ tests/web/server-context-accounting.spec.ts |  78 +++++++++++++++++-
+ tests/web/sse-resume.spec.ts                | 119 ++++++++++++++++++++++++++++
+ 4 files changed, 268 insertions(+), 10 deletions(-)
+
+diff --git a/src/web/server.ts b/src/web/server.ts
+index 331830b..40dda26 100644
+--- a/src/web/server.ts
++++ b/src/web/server.ts
+@@ -179,21 +179,21 @@ import { buildRestoration } from './compaction-restoration.ts'
+ import type { EffectiveCompactionSnapshot, SnapshotIdentity } from '../harness/context/compaction-snapshot.ts'
+ import { assertFitsWindow } from './compaction-generator.ts'
+ import { CaptureRegistry, identityOf, requestPrefixHash } from './compaction-wiring.ts'
+ import { loadReferencedSnapshot } from './compaction-restart.ts'
+ import { snapshotHash } from '../harness/context/compaction-snapshot.ts'
+ import { CacheAwareCompactionFallback, createCacheAwareCompactionSummarizer, createCompactionSummarizer, MAX_PARALLEL } from './llm-summarizer.ts'
+ import { DEFAULT_BUDGET, resolveModelBudget, schemaCost, type ResolvedBudget } from '../harness/context/budget.ts'
+ import type { BuildContextInput, PreviewCompaction } from '../harness/context/builder.ts'
+ import type { CompactionMeasurement } from '../harness/session/events.ts'
+ import type { Restored } from '../harness/context/compaction.ts'
+-import { deriveContextState, isAvailableContext } from '../harness/context/context-state.ts'
++import { createContextReducer, deriveContextState, isAvailableContext, type ContextReducer, type ContextResponse } from '../harness/context/context-state.ts'
+ import { isValidTokenUsage } from '../harness/context/context-metrics.ts'
+ import { CommandsService } from '../harness/commands/service.ts'
+ import { PluginService } from '../harness/plugins/service.ts'
+ import { PluginError } from '../harness/plugins/manifest.ts'
+ import { parseMarketplaceInput } from '../harness/plugins/marketplace.ts'
+ import { pluginServerName } from '../harness/plugins/mcp.ts'
+ import { commandKey, type CommandDefinition } from '../harness/commands/catalog.ts'
+ import { CommandExpansionError, expandCommand } from '../harness/commands/invoke.ts'
+ import { BUILTIN_COMMAND_NAMES, TurnCommandGrants, expandMessages, inlineShellOutput, resolveCommand, type CommandResolverDeps } from './slash-commands.ts'
+ 
+@@ -3450,20 +3450,21 @@ ${entry.description}`.toLowerCase().includes(query))
+     }
+     // Admission consumes the evidence. Prepared calls are single-use, so no
+     // authorization state survives dispatch or a later call-id collision.
+     approvalReceipts.retire(scope.executionId)
+     pathScope.retire(scope.executionId)
+     return undefined
+   })
+ 
+   /** Last request's manifest per session — the inspector renders this. */
+   const lastManifests = new Map<SessionId, ContextManifest>()
++  const contextReducers = new Map<SessionId, ContextReducerCache>()
+   /**
+    * Per-session snapshot of the reference sources that ride ahead of history
+    * and change often: the skill catalog and the MEMORY.md indexes. Re-reading
+    * them per request moved the cached prompt prefix on every memory write or
+    * skill edit (~123k tokens re-billed each time). They are reference data —
+    * a stale row hides nothing: the model sees its own memory writes in
+    * history and the Skill tool reads the disk — so a session keeps the copy it
+    * first read until the prefix changes anyway: a new compaction checkpoint,
+    * a project rebind, or a host restart (the map is in-memory). CLAUDE.md is
+    * deliberately NOT snapshotted: edits there must apply at once, and they
+@@ -4539,20 +4540,21 @@ ${entry.description}`.toLowerCase().includes(query))
+     modelPair: pairOf,
+     setModelPair: async (name: ModelPairName, next: ModelPair) => {
+       await savePair(pairFile(name), next)
+       pairs.set(name, next)
+     },
+     commitMessageModel,
+     commitMessageStream: (request, signal) => agentScope.exit(() => kernel.ctx.llm.stream(request, { signal })),
+     recordUsage: (record) => usageLog.record(record),
+     checkpoints,
+     lastManifests,
++    contextReducers,
+     prefixSnapshots,
+     contextBodies,
+     sessionUsage,
+     completedRequests,
+     forgetCompactionCapture: async (sessionId) => {
+       captures.forget(sessionId)
+       compactionHosts.get(sessionId)?.cancel()
+       compactionHosts.delete(sessionId)
+       // Abort the background summary and wait until its stream has really ended.
+       await candidates?.invalidate(sessionId, 'session-deleted')
+@@ -4836,20 +4838,22 @@ interface HandlerDeps {
+   readonly userClaudeDir?: string
+   readonly bundledCommandsDir?: string
+   /** Recompute grant-protected roots from every workspace's skill rules. */
+   readonly refreshSkillProtectedRoots: () => Promise<void>
+   /** Fail-closed fallback when a recompute fails: add roots, never drop any. */
+   readonly addSkillProtectedRoots: (roots: readonly string[]) => void
+   readonly memory: MemoryService
+   readonly attachments: AttachmentStore
+   readonly checkpoints: CheckpointStore
+   readonly lastManifests: Map<SessionId, ContextManifest>
++  /** Incremental committed-context state per session for GET /manifest. */
++  readonly contextReducers: Map<SessionId, ContextReducerCache>
+   /** Per-session copy of the skill catalog and memory indexes (prefix stability). */
+   readonly prefixSnapshots: Map<SessionId, PrefixSnapshot>
+   /** Context section hashes already recorded per session's log (body dedupe). */
+   readonly contextBodies: Map<SessionId, Set<string>>
+   readonly sessionUsage: Map<SessionId, SessionUsage>
+   readonly completedRequests: Map<SessionId, CompactionPrefix>
+   /** Drop the effective-compaction capture and host of a deleted session. */
+   readonly forgetCompactionCapture: (sessionId: SessionId) => Promise<void>
+   readonly adoptMode: (workspaceId: WorkspaceId, modeId: string) => Promise<ResolvedMode>
+   readonly stampRootMode: (session: Session, resolved: ResolvedMode) => Extract<SessionEvent, { type: 'session/mode' }>
+@@ -7559,32 +7563,35 @@ async function handleApi(
+ 
+     // ── G3 context manifest inspector + manual compaction ────
+     const wsManifestMatch = /^\/api\/workspaces\/([^/]+)\/sessions\/([^/]+)\/manifest$/.exec(pathname)
+     if (wsManifestMatch !== null && req.method === 'GET') {
+       const wsId = decodeURIComponent(wsManifestMatch[1] ?? '') as WorkspaceId
+       const entry = await findSession(decodeURIComponent(wsManifestMatch[2] ?? ''), wsId, deps)
+       if (entry === undefined) {
+         send(404, { error: 'no such session' })
+         return
+       }
+-      const committedView = deriveContextState(entry.session.committedEvents, entry.session.id)
++      const committedView = committedContextView(entry.session, deps.contextReducers)
+       const live = deps.lastManifests.get(entry.session.id)
+       // A request assembled but not yet reported: show its fresh estimate and
+       // pre-trim pressure, never an older request's numbers over this assembly.
+       // After a compaction the committed post-compaction preview stands until a
+       // request is assembled beyond it: a live manifest recorded before the
+       // checkpoint describes the old context and must not replace the preview.
+       const compactionSeq = committedView !== null && isAvailableContext(committedView) && committedView.display?.kind === 'post-compaction' ? committedView.display.compactionSeq : undefined
+       const liveIsNewer = live !== undefined && (compactionSeq === undefined
+         || entry.session.events.some((event) => event.type === 'context/manifest' && event.seq > compactionSeq && event.manifest.contextId === live.contextId))
+       const view = committedView !== null && isAvailableContext(committedView) && liveIsNewer
+-        && live !== undefined && live.contextId !== committedView.contextId ? { ...live, usage: committedView.usage } : committedView ?? live ?? null
++        && live !== undefined && live.contextId !== committedView.contextId
++        // usage.last pairs only with its own contextId; session cache totals carry over.
++        ? { ...live, ...(committedView.usage !== undefined ? { usage: { cacheableInputTokens: committedView.usage.cacheableInputTokens, cachedInputTokens: committedView.usage.cachedInputTokens } } : {}) }
++        : committedView ?? live ?? null
+       if (view === null) {
+         res.writeHead(204); res.end(); return
+       }
+       send(200, { ...view, ...(deps.limits.automaticCompactionPressure > 0 ? { policy: { automaticCompactionPressure: deps.limits.automaticCompactionPressure } } : {}) })
+       return
+     }
+ 
+     // One raw context block by hash: the trajectory's marker fetches the exact
+     // text a past request carried. The newest record wins (a re-recorded hash
+     // would be identical by construction); 404 is the honest legacy answer.
+@@ -9995,30 +10002,60 @@ async function removeSession(entry: SessionEntry, wsId: WorkspaceId, deps: Handl
+   }
+   deps.sessions.delete(entry.session.id)
+   deps.kernel.ctx.agents.forget(entry.session.id)
+   await deps.kernel.ctx.sessions.delete(entry.session.id)
+   await forgetSessionState(entry.session.id, deps)
+   deps.cancelCompaction(entry.session.id)
+   entry.closed = true
+   return undefined
+ }
+ 
++interface ContextReducerCache {
++  readonly session: Session
++  readonly reducer: ContextReducer<ContextManifest>
++  last?: { readonly seq: number; readonly type: string }
++}
++
++/**
++ * The committed context view, applying only the committed suffix since the
++ * last GET. A new session instance or a replaced prefix (the remembered last
++ * event no longer sits at its seq with its type) starts a fresh reducer.
++ */
++function committedContextView(session: Session, cache: Map<SessionId, ContextReducerCache>): ContextResponse<ContextManifest> | null {
++  const events = session.committedEvents
++  let cached = cache.get(session.id)
++  // Seqs are 1-based positions in the log, so the remembered event sits at seq - 1.
++  const at = cached?.last === undefined ? undefined : events[cached.last.seq - 1]
++  if (cached === undefined || cached.session !== session
++    || (cached.last !== undefined && (at?.seq !== cached.last.seq || at.type !== cached.last.type))) {
++    cached = { session, reducer: createContextReducer<ContextManifest>(session.id) }
++    cache.set(session.id, cached)
++  }
++  const suffix = events.slice(cached.last?.seq ?? 0)
++  cached.reducer.apply(suffix)
++  const tail = events.at(-1)
++  if (tail !== undefined) cached.last = { seq: tail.seq, type: tail.type }
++  return cached.reducer.current()
++}
++
+ /** A deleted session leaves no per-session index behind (manifest, child indexes). */
+ async function forgetSessionState(sessionId: SessionId, deps: HandlerDeps): Promise<void> {
+   deps.lastManifests.delete(sessionId)
++  deps.contextReducers.delete(sessionId)
+   deps.contextBodies.delete(sessionId)
+   deps.sessionUsage.delete(sessionId)
+   deps.completedRequests.delete(sessionId)
+   await deps.forgetCompactionCapture(sessionId)
+   deps.prefixSnapshots.delete(sessionId)
+   for (const childId of await deps.childExecutor.forgetRoot(sessionId)) {
+     deps.lastManifests.delete(childId)
++    deps.contextReducers.delete(childId)
+     deps.contextBodies.delete(childId)
+     deps.sessionUsage.delete(childId)
+     deps.completedRequests.delete(childId)
+     deps.prefixSnapshots.delete(childId)
+   }
+ }
+ 
+ /**
+  * One session's snapshot of the frequently-edited prefix sources. `key`
+  * names what the copy was read under (project + compaction boundary); any
+@@ -10651,22 +10688,25 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
+   // holds this stream: it, and every event appended behind it, wait for the
+   // commit instead of describing a state the canonical log may never hold.
+   // Normal chunks (never barriered themselves) keep streaming immediately.
+   let held: { seq: number; queue: { envelope: WebEnvelope; sequence: number | undefined }[] } | undefined
+   const findHeldCompaction = (): number => {
+     for (const event of session.events) {
+       if (event.type === 'compaction/end' && event.error === undefined && event.seq > session.committedSeq) return event.seq
+     }
+     return 0
+   }
++  const toFrame = (event: SessionEvent): WebEnvelope => ({ kind: 'session', event: event.type === 'compaction/restoration' ? withoutRestorationText(event) : event })
+   const heldSeq = findHeldCompaction()
+-  if (heldSeq > 0) held = { seq: heldSeq, queue: [] }
++  // The replay below stops before the held success, so the success and the
++  // tail already appended behind it seed the queue: they ship on commit.
++  if (heldSeq > 0) held = { seq: heldSeq, queue: session.events.filter((event) => event.seq >= heldSeq && event.type !== 'context/body').map((event) => ({ envelope: toFrame(event), sequence: event.seq })) }
+   // Both replay shapes are compacted: a fresh snapshot otherwise ships every
+   // raw chunk of the session's history, and a long-disconnect resume replays
+   // the same bulk. Sequence numbers stay untouched so the client's seen-cursor
+   // filtering and its own compaction keep working unchanged. A held compaction
+   // success also cuts the replay tail: reconnect must not see the uncommitted
+   // state either.
+   const replay = compactReplayEvents(resumable ? session.events.filter((event) => event.seq > cursor) : [...session.events], held?.seq ?? 0)
+   streamFrame({ kind: resumable ? 'resume' : 'snapshot', events: replay }, held === undefined ? latest : (held.seq - 1))
+   for (const [approvalId, waiting] of deps.pending) {
+     if (waiting.sessionId === session.id || waiting.parentSessionId === session.id) {
+@@ -10684,32 +10724,39 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
+     if (waiting !== undefined) streamFrame(questionEnvelope(payload.questionId, waiting, session.id))
+   })
+   const disposeQuestionSettled = deps.kernel.ctx.on('web/question-settled', (payload) => {
+     if (payload.sessionId === session.id || payload.parentSessionId === session.id) {
+       streamFrame({ kind: 'question-settled', questionId: payload.questionId })
+     }
+   })
+ 
+   const disposeSession = deps.kernel.ctx.on('session/event', (emitter, event) => {
+     if (emitter.id !== session.id || event.type === 'context/body') return
+-    const frame = { kind: 'session' as const, event: event.type === 'compaction/restoration' ? withoutRestorationText(event) : event }
+-    // A failed end never publishes a checkpoint: it drops any hold instead.
+-    if (event.type === 'compaction/end' && event.error !== undefined) { held = undefined; streamFrame(frame, event.seq); return }
++    const frame = toFrame(event)
++    // A failed end never publishes a checkpoint: it drops the uncommitted
++    // success (the queue head) and releases what queued behind it.
++    if (event.type === 'compaction/end' && event.error !== undefined) {
++      const dropped = held
++      held = undefined
++      for (const { envelope, sequence } of dropped?.queue.slice(1) ?? []) streamFrame(envelope, sequence)
++      streamFrame(frame, event.seq)
++      return
++    }
+     if (held !== undefined) {
+       // Behind an uncommitted success: queue instead of shipping. The success
+       // itself is the hold's head, so it is queued exactly once, at its seq.
+       held.queue.push({ envelope: frame, sequence: event.seq })
+       return
+     }
+     if (event.type === 'compaction/end' && event.error === undefined && event.seq > session.committedSeq) {
+-      // The success appended but its barrier has not committed: hold from here.
+-      held = { seq: event.seq, queue: [] }
++      // The success appended but its barrier has not committed: it heads the hold.
++      held = { seq: event.seq, queue: [{ envelope: frame, sequence: event.seq }] }
+       return
+     }
+     streamFrame(frame, event.seq)
+   })
+   // The commit releases the hold: drain the queued prefix in seq order.
+   const disposeDurable = deps.kernel.ctx.on('session/durable', (emitter) => {
+     if (emitter.id !== session.id || held === undefined) return
+     if (session.committedSeq < held.seq) return
+     const draining = held
+     held = undefined
+diff --git a/tests/harness/context-state.spec.ts b/tests/harness/context-state.spec.ts
+index 9d70590..8ba84df 100644
+--- a/tests/harness/context-state.spec.ts
++++ b/tests/harness/context-state.spec.ts
+@@ -76,20 +76,36 @@ describe('request-scoped context state', () => {
+     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+     try {
+       const r = accounting.createContextReducer<ContextManifest>('s')
+       r.apply([assembled(1, 'a'), attempt(2, 'a', 'p1', { inputTokens: 10, cachedInputTokens: 4 }),
+         attempt(3, 'a', 'p1', { cachedInputTokens: 4, inputTokens: 10 }, 'reconciled')])
+       expect(warn).not.toHaveBeenCalled()
+       r.apply([attempt(4, 'a', 'p1', { inputTokens: 10, cachedInputTokens: 5 }, 'reconciled')])
+       expect(warn).toHaveBeenCalledTimes(1)
+     } finally { warn.mockRestore() }
+   })
++  it('incremental application over any split equals replay from scratch', () => {
++    const events = [assembled(1, 'a'), attempt(2, 'a', 'p1', usage), assembled(3, 'b'), compact(4),
++      attempt(5, 'b', 'p2', { inputTokens: 40_000, cachedInputTokens: 0 }), assembled(6, 'c'),
++      attempt(7, 'c', 'p3', { inputTokens: 9, cachedInputTokens: 3 }), attempt(8, 'c', 'p3', { inputTokens: 9, cachedInputTokens: 3 }, 'reconciled')]
++    for (let end = 1; end <= events.length; end++) {
++      const prefix = events.slice(0, end)
++      const fresh = accounting.deriveContextState(prefix, 's')
++      for (let split = 0; split <= end; split++) {
++        const r = accounting.createContextReducer<ContextManifest>('s')
++        r.apply(prefix.slice(0, split))
++        // Re-applying the already-seen prefix with the suffix must be a no-op for the prefix.
++        r.apply(prefix)
++        expect(r.current()).toEqual(fresh)
++      }
++    }
++  })
+   it('pins optional session identity and keeps legacy manifests estimated', () => {
+     const r = accounting.createContextReducer<ContextManifest>()
+     r.apply([assembled(1, 'a'), attempt(2, 'a', 'p1', usage)])
+     expect(r.request('a')?.usage?.last).toEqual(usage)
+     r.apply([assembled(3)])
+     const current = r.current()!
+     expect(accounting.isAvailableContext(current) && current.contextId).toBeUndefined()
+     expect(accounting.isAvailableContext(current) && current.usage?.last).toBeUndefined()
+   })
+ })
+diff --git a/tests/web/server-context-accounting.spec.ts b/tests/web/server-context-accounting.spec.ts
+index 5de194b..14f4b75 100644
+--- a/tests/web/server-context-accounting.spec.ts
++++ b/tests/web/server-context-accounting.spec.ts
+@@ -1,15 +1,17 @@
+ import { promises as fs } from 'node:fs'
+ import { tmpdir } from 'node:os'
+ import path from 'node:path'
+-import { describe, expect, it } from 'vitest'
++import { describe, expect, it, vi } from 'vitest'
+ import { createWebServer, type LlmProvider, type WebServer } from '../../src/index.ts'
++import { FileSessionStore } from '../../src/harness/storage/file-session-store.ts'
++import type { SessionId } from '../../src/util/brand.ts'
+ import { projectItems } from '../../web/lib/project.ts'
+ import { projectTrajectory } from '../../web/components/workbench/trajectory.ts'
+ 
+ const provider: LlmProvider = { name:'scripted', models:['scripted'], async *stream(request) {
+   const summary=request.messages.some(m=>String(m.content).includes('Primary Request and Intent'))
+   yield {type:'delta',delta:summary?'SUMMARY':'hello'}
+   yield {type:'usage',usage:{inputTokens:100_000,cachedInputTokens:50_000}}
+   yield {type:'usage',usage:{inputTokens:120_000,cachedInputTokens:110_000}}
+   yield {type:'completion',finishReason:'stop',transport:'done',policy:'strict',transportSettled:true}
+ } }
+@@ -42,11 +44,85 @@ describe('durable context accounting through HTTP',()=>{
+       expect(await(await fetch(`${endpoint()}/manifest`)).json()).toEqual(before)
+       expect((await fetch(`${endpoint()}/compact`,{method:'POST'})).status).toBe(200)
+       const compact=await(await fetch(`${endpoint()}/manifest`)).json()
+       expect(compact.display.kind).toBe('post-compaction')
+       expect(compact.usage.last).toBeUndefined()
+       expect(compact.budget.usedTokens).toBeGreaterThan(0)
+       await server!.close();server=undefined;await boot()
+       expect(await(await fetch(`${endpoint()}/manifest`)).json()).toEqual(compact)
+     }finally{await server?.close();await fs.rm(home,{recursive:true,force:true})}
+   })
++
++  it('GETs around a new terminal fact equal a fresh server reading the same home',async()=>{
++    const home=await fs.mkdtemp(path.join(tmpdir(),'context-accounting-incremental-'))
++    let server:WebServer|undefined
++    const boot=async()=>{server=await createWebServer({home,providers:[provider],configFile:path.join(home,'p.json'),limits:{automaticCompactionPressure:0}})}
++    try {
++      await boot()
++      const ws=(await(await fetch(`${server!.url}/api/workspaces`)).json())[0].id
++      const {id}=await(await fetch(`${server!.url}/api/workspaces/${ws}/sessions`,{method:'POST'})).json()
++      const endpoint=()=>`${server!.url}/api/workspaces/${ws}/sessions/${id}`
++      const logFile=path.join(home,'workspaces',ws,'sessions',id,'events.jsonl')
++      const turn=async(content:string,ends:number)=>{
++        await fetch(`${endpoint()}/messages`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({content})})
++        const deadline=Date.now()+5000
++        while(Date.now()<deadline){
++          const log=await fs.readFile(logFile,'utf8').catch(()=>'')
++          if(log.split('"type":"turn/end"').length>ends)break
++          await new Promise(r=>setTimeout(r,20))
++        }
++        await new Promise(r=>setTimeout(r,200))
++      }
++      await turn('a',1)
++      const first=await(await fetch(`${endpoint()}/manifest`)).json()
++      await turn('b',2)
++      const second=await(await fetch(`${endpoint()}/manifest`)).json()
++      expect(second.contextId).not.toBe(first.contextId)
++      expect(second.usage).toMatchObject({last:{inputTokens:120_000},cacheableInputTokens:240_000,cachedInputTokens:220_000})
++      await server!.close();server=undefined;await boot()
++      expect(await(await fetch(`${endpoint()}/manifest`)).json()).toEqual(second)
++    }finally{await server?.close();await fs.rm(home,{recursive:true,force:true})}
++  })
++
++  it('a new assembly held before its barrier never shows the previous assembly usage.last',async()=>{
++    const home=await fs.mkdtemp(path.join(tmpdir(),'context-accounting-pair-'))
++    const server=await createWebServer({home,providers:[provider],configFile:path.join(home,'p.json'),limits:{automaticCompactionPressure:0}})
++    let release!:()=>void
++    const parked=new Promise<void>(r=>{release=r})
++    const flush=FileSessionStore.prototype.flush
++    let spy:{mockRestore():void}|undefined
++    try {
++      const ws=(await(await fetch(`${server.url}/api/workspaces`)).json())[0].id
++      const {id}=await(await fetch(`${server.url}/api/workspaces/${ws}/sessions`,{method:'POST'})).json()
++      const endpoint=`${server.url}/api/workspaces/${ws}/sessions/${id}`
++      const send=(content:string)=>fetch(`${endpoint}/messages`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({content})})
++      const manifest=async()=>{const r=await fetch(`${endpoint}/manifest`);return r.status===204?{}:r.json()}
++      await send('a')
++      let a:any
++      const deadline=Date.now()+5000
++      while(Date.now()<deadline){
++        a=await manifest()
++        if(a.usage?.last!==undefined)break
++        await new Promise(r=>setTimeout(r,20))
++      }
++      expect(a.usage.last.inputTokens).toBe(120_000)
++      await new Promise(r=>setTimeout(r,300))
++      spy=vi.spyOn(FileSessionStore.prototype,'flush').mockImplementation(async function(this:FileSessionStore,sessionId:SessionId){
++        // Park only the barrier that would commit B's manifest; earlier turn-start barriers pass.
++        const logged=await fs.readFile(path.join(home,'workspaces',ws,'sessions',id,'events.jsonl'),'utf8').catch(()=>'')
++        if(sessionId===id&&logged.split('"type":"context/manifest"').length>2){await parked;return}
++        return flush.call(this,sessionId)
++      })
++      void send('b').catch(()=>undefined)
++      let b:any
++      const until=Date.now()+5000
++      while(Date.now()<until){
++        b=await manifest()
++        if(b.contextId!==a.contextId)break
++        await new Promise(r=>setTimeout(r,20))
++      }
++      expect(b.contextId).not.toBe(a.contextId)
++      expect(b.usage?.last).toBeUndefined()
++      expect(b.usage).toMatchObject({cacheableInputTokens:a.usage.cacheableInputTokens,cachedInputTokens:a.usage.cachedInputTokens})
++    }finally{spy?.mockRestore();release();await server.close();await fs.rm(home,{recursive:true,force:true})}
++  })
+ })
+diff --git a/tests/web/sse-resume.spec.ts b/tests/web/sse-resume.spec.ts
+index f577535..f8b86ff 100644
+--- a/tests/web/sse-resume.spec.ts
++++ b/tests/web/sse-resume.spec.ts
+@@ -125,20 +125,53 @@ const readBatch = async (url: string, ms: number, predicate: (envelope: Envelope
+     }
+   } finally { abort.abort() }
+   return collected
+ }
+ 
+ const hasEvent = (type: string) => (envelopes: readonly Envelope[]): boolean =>
+   envelopes.some((envelope) => envelope.event?.type === type || envelope.events?.some((event) => event.type === type))
+ 
+ const hasCompactionEnd = hasEvent('compaction/end')
+ 
++/** One long-lived SSE reader that collects frames in the background until closed. */
++const openReader = async (url: string): Promise<{ envelopes: Envelope[]; close: () => void }> => {
++  const abort = new AbortController()
++  const envelopes: Envelope[] = []
++  const response = await fetch(url, { signal: abort.signal })
++  const reader = response.body!.getReader()
++  void (async () => {
++    let text = ''
++    try {
++      for (;;) {
++        const { value, done } = await reader.read()
++        if (done) return
++        text += new TextDecoder().decode(value)
++        const frames = text.split('\n\n')
++        text = frames.pop() ?? ''
++        for (const frame of frames) {
++          const line = frame.split('\n').find((row) => row.startsWith('data: '))
++          if (line !== undefined) envelopes.push(JSON.parse(line.slice(6)) as Envelope)
++        }
++      }
++    } catch { /* aborted */ }
++  })()
++  return { envelopes, close: () => abort.abort() }
++}
++
++const liveEvents = (envelopes: readonly Envelope[]): { type: string; seq: number; error?: string }[] =>
++  envelopes.flatMap((envelope) => envelope.kind === 'session' && envelope.event !== undefined ? [envelope.event] : [])
++
++const until = async (predicate: () => boolean, ms: number): Promise<void> => {
++  const deadline = Date.now() + ms
++  while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20))
++}
++
+ /** The original store flush, captured before any spy replaces the prototype method. */
+ const storeFlush = FileSessionStore.prototype.flush
+ 
+ /** The summary stream parks until the test opens it; the gate body runs then. */
+ const gatedSummarizer = (onPark: () => Promise<void>): LlmProvider => ({
+   name: 'scripted', models: ['scripted'],
+   stream(request) {
+     return (async function* (): AsyncIterable<StreamEvent> {
+       const isSummary = request.messages.some((m) => typeof m.content === 'string' && m.content.includes('Primary Request and Intent'))
+       if (isSummary) await onPark()
+@@ -215,20 +248,106 @@ describe('durability gate', () => {
+       expect(response?.status).toBe(200)
+       expect(hasCompactionEnd(await readBatch(eventsUrl, 8_000, (envelope) => hasCompactionEnd([envelope])))).toBe(true)
+       await readBatch(eventsUrl, 4_000, (envelope) => hasEvent('session/pinned')([envelope]))
+       await pinned
+     } finally {
+       flushSpy.mockRestore()
+       releaseFlush()
+     }
+   })
+ 
++  it('a reader subscribed before the compaction receives the held success once after commit, then later events in seq order', { timeout: 30_000 }, async () => {
++    let releaseSummary!: () => void
++    const summaryOpen = new Promise<void>((resolve) => { releaseSummary = resolve })
++    let summarizerArrived!: () => void
++    const arrived = new Promise<void>((resolve) => { summarizerArrived = resolve })
++    const provider = gatedSummarizer(async () => { summarizerArrived(); await summaryOpen })
++    root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-sse-live-held-'))
++    server = await createWebServer({ home: root, configFile: path.join(root, 'p.json'), providers: [provider] })
++    const base = server.url
++    const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
++    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
++    const route = `${base}/api/workspaces/${wsId}/sessions/${id}`
++    await fetch(`${route}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'first' }) })
++    await readBatch(`${route}/events`, 10_000, (envelope) => hasEvent('turn/end')([envelope]))
++    await new Promise((resolve) => setTimeout(resolve, 1_000))
++    const live = await openReader(`${route}/events`)
++    const compactDone = fetch(`${route}/compact`, { method: 'POST' }).catch(() => undefined as unknown as Response)
++    await arrived
++    let releaseFlush!: () => void
++    const flushHeld = new Promise<void>((resolve) => { releaseFlush = resolve })
++    const flushSpy = vi.spyOn(FileSessionStore.prototype, 'flush').mockImplementation(async function (this: FileSessionStore, sessionId: SessionId) {
++      if (sessionId === id) { await flushHeld; return }
++      return storeFlush.call(this, sessionId)
++    })
++    try {
++      releaseSummary()
++      await new Promise((resolve) => setTimeout(resolve, 400))
++      expect(liveEvents(live.envelopes).some((event) => event.type === 'compaction/end')).toBe(false)
++      const pinned = fetch(route, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pinned: true }) }).catch(() => undefined)
++      await new Promise((resolve) => setTimeout(resolve, 300))
++      expect(liveEvents(live.envelopes).some((event) => event.type === 'session/pinned')).toBe(false)
++      releaseFlush()
++      expect((await compactDone)?.status).toBe(200)
++      await pinned
++      await until(() => liveEvents(live.envelopes).some((event) => event.type === 'session/pinned'), 5_000)
++      const events = liveEvents(live.envelopes)
++      const ends = events.filter((event) => event.type === 'compaction/end')
++      expect(ends).toHaveLength(1)
++      expect(ends[0]!.error).toBeUndefined()
++      const after = events.slice(events.indexOf(ends[0]!))
++      expect(after.some((event) => event.type === 'session/pinned')).toBe(true)
++      const seqs = events.map((event) => event.seq)
++      expect(seqs).toEqual([...seqs].sort((a, b) => a - b))
++      expect(new Set(seqs).size).toBe(seqs.length)
++    } finally {
++      live.close()
++      flushSpy.mockRestore()
++      releaseFlush()
++    }
++  })
++
++  it('a reader subscribed before a rejected flush never receives the success', { timeout: 20_000 }, async () => {
++    let summarizerArrived!: () => void
++    const arrived = new Promise<void>((resolve) => { summarizerArrived = resolve })
++    let openSummary: (() => void) | undefined
++    const provider = gatedSummarizer(async () => {
++      summarizerArrived()
++      await new Promise<void>((resolve) => { openSummary = resolve })
++    })
++    root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-sse-live-poison-'))
++    server = await createWebServer({ home: root, configFile: path.join(root, 'p.json'), providers: [provider] })
++    const base = server.url
++    const wsId = (await (await fetch(`${base}/api/workspaces`)).json() as { id: string }[])[0]!.id
++    const { id } = await (await fetch(`${base}/api/workspaces/${wsId}/sessions`, { method: 'POST' })).json() as { id: string }
++    const route = `${base}/api/workspaces/${wsId}/sessions/${id}`
++    await fetch(`${route}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'first' }) })
++    await readBatch(`${route}/events`, 10_000, (envelope) => hasEvent('turn/end')([envelope]))
++    await new Promise((resolve) => setTimeout(resolve, 1_000))
++    const live = await openReader(`${route}/events`)
++    const compactDone = fetch(`${route}/compact`, { method: 'POST' }).then((r) => r.status, () => 0)
++    await arrived
++    const flushSpy = vi.spyOn(FileSessionStore.prototype, 'flush').mockImplementation(async function (this: FileSessionStore, sessionId: SessionId) {
++      if (sessionId === id) throw new Error('disk gone')
++      return storeFlush.call(this, sessionId)
++    })
++    try {
++      openSummary?.()
++      expect(await compactDone).not.toBe(200)
++      await new Promise((resolve) => setTimeout(resolve, 500))
++      expect(liveEvents(live.envelopes).some((event) => event.type === 'compaction/end' && event.error === undefined)).toBe(false)
++    } finally {
++      live.close()
++      flushSpy.mockRestore()
++    }
++  })
++
+   it('a rejected flush never publishes the compact success it could not commit', { timeout: 20_000 }, async () => {
+     // Poisoned writer: the compact ran, the append reached memory, the flush
+     // failed. The success stays unpublished on every read — live replay and
+     // snapshot — because the canonical log does not hold it.
+     let summarizerArrived!: () => void
+     const arrived = new Promise<void>((resolve) => { summarizerArrived = resolve })
+     // The parked summarizer never resolves the success path; `flushFailed`
+     // merely marks that the barrier may proceed to fail (the flush spy below
+     // supplies the actual error).
+     let flushFailed: (() => void) | undefined

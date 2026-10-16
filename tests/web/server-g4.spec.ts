@@ -336,12 +336,16 @@ describe('G4 HTTP surface', () => {
     // peak counter proves real concurrency rather than a fast sequence.
     let active = 0
     let peak = 0
+    // Each child holds until both are in flight (bounded, so a sequential run fails on `peak` instead of hanging).
+    let bothActive: () => void = () => {}
+    const together = new Promise<void>((resolve) => { bothActive = resolve })
     const far: LlmProvider = {
       name: 'far', models: ['gpt-luna'],
       async *stream() {
         active += 1
         peak = Math.max(peak, active)
-        await new Promise((resolve) => setTimeout(resolve, 200))
+        if (active >= 2) bothActive()
+        await Promise.race([together, new Promise((resolve) => setTimeout(resolve, 4_000))])
         active -= 1
         yield { type: 'delta', delta: 'child inspected src/index.ts' }
         yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }

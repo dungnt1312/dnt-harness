@@ -295,6 +295,25 @@ describe('incremental seed folding', () => {
     expect(checkpoint.summary).toBe('SEED\n\nuser: third')
   })
 
+  it('preflights an unacknowledged extractive source without appending lifecycle events', async () => {
+    const { store } = await setup()
+    const deferred = deferredStore()
+    deferred.flush.mockImplementationOnce(() => deferred.gate)
+    const session = new Session(new Kernel().ctx, { store: deferred.backing })
+    session.append({ type: 'turn/start', turnId: 'pending' as TurnId })
+    session.append({ type: 'user/message', turnId: 'pending' as TurnId, content: 'z'.repeat(24_500) })
+    session.append({ type: 'turn/end', turnId: 'pending' as TurnId, reason: 'completed' })
+    expect(session.committedSeq).toBe(0)
+    const summarize = vi.fn(async () => 'never')
+    const pending = compactSession(session, store, summarize, { trigger: 'automatic', extractiveCap: 24_000 })
+    const assertion = expect(pending).rejects.toThrow(/extractive capacity/)
+    expect(session.events).toHaveLength(3)
+    deferred.release()
+    await assertion
+    expect(session.events).toHaveLength(3)
+    expect(summarize).not.toHaveBeenCalled()
+  })
+
   it('rejects a seed covering a different boundary than a completed turn', async () => {
     const { session, store } = await setupTwoTurns()
     // seq 6 is a user message inside t2, not a completed boundary.

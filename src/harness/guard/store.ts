@@ -23,6 +23,8 @@ export interface GuardLoadResult {
 
 export class DangerousCommandsStore {
   private readonly mutationTails = new Map<string, Promise<void>>()
+  /** Corrupt-file warnings already logged, so a degraded guard is reported once per file state. */
+  private readonly warned = new Set<string>()
 
   constructor(private readonly home: string) {}
 
@@ -123,10 +125,17 @@ export class DangerousCommandsStore {
       const parsed = JSON.parse(raw) as unknown
       const config = parseAndCoerce(parsed)
       validateConfig(config)
+      this.warned.delete(filePath)
       return { kind: 'valid', config, hash: hashConfig(config) }
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error)
-      return { kind: 'corrupt', warning: `dangerous-commands.json is corrupt/invalid (${detail}); using defaults` }
+      const warning = `dangerous-commands.json is corrupt/invalid (${detail}); using defaults`
+      // Custom rules are dropped while degraded: tell the operator, not only Settings.
+      if (!this.warned.has(filePath)) {
+        this.warned.add(filePath)
+        console.warn(`guard: ${filePath}: ${warning} — custom rules are not applied until it is fixed`)
+      }
+      return { kind: 'corrupt', warning }
     }
   }
 

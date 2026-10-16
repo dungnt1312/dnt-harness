@@ -32,7 +32,8 @@ export function canonicalToolName(name: string): string {
  * Argument aliases models commonly emit for the file tools (the Claude Code
  * / ZCode spelling). They map to the canonical argument names before
  * authorization, so path guards, approvals, and the durable log all see one
- * shape. A canonical name already present wins; the alias is then dropped.
+ * shape. A usable (non-null) canonical value wins and the alias is dropped;
+ * a null/undefined canonical value yields to the alias.
  */
 const ARG_ALIASES: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   Read: { file_path: 'path' },
@@ -43,11 +44,13 @@ const ARG_ALIASES: Readonly<Record<string, Readonly<Record<string, string>>>> = 
 function canonicalArgs(name: string, args: Record<string, unknown>): Record<string, unknown> {
   const aliases = ARG_ALIASES[name]
   if (aliases === undefined || !Object.keys(aliases).some((alias) => alias in args)) return args
+  const usable = (key: string): boolean => args[key] !== undefined && args[key] !== null
   const result: Record<string, unknown> = {}
   for (const [key, value] of Object.entries(args)) {
     const target = aliases[key]
-    if (target === undefined) result[key] = value
-    else if (!(target in args)) result[target] = value
+    if (target === undefined) {
+      if (usable(key) || !Object.entries(aliases).some(([alias, to]) => to === key && usable(alias))) result[key] = value
+    } else if (!usable(target)) result[target] = value
   }
   return result
 }

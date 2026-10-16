@@ -75,6 +75,8 @@ describe('SendPreview tool', () => {
     ['length mismatch', { ...chart, series: [{ name: 's', values: [1] }] }, /values/],
     ['non-finite value', { ...chart, series: [{ name: 's', values: [1, null] }] }, /finite/],
     ['unnamed series', { ...chart, series: [{ name: '', values: [1, 2] }] }, /name/],
+    ['an oversize label', { ...chart, labels: ['a', 'x'.repeat(201)] }, /200/],
+    ['an oversize series name', { ...chart, series: [{ name: 'x'.repeat(201), values: [1, 2] }] }, /200/],
   ])('rejects a chart with %s', async (_label, bad, message) => {
     const { tool, exec } = await setup()
     await expect(tool.execute({ chart: bad }, exec)).rejects.toThrow(message)

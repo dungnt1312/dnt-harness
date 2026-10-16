@@ -102,8 +102,8 @@ describe('model settings: budget resolution', () => {
       return manifest.budget
     }
 
-    // Operator override: verified budget = 100k - 4,096 - 1,024.
-    expect(await budgetOf('gpt-5.6')).toMatchObject({ availableTokens: 94_880, estimated: false })
+    // Operator override: verified WINDOW, but token costs stay labeled estimates.
+    expect(await budgetOf('gpt-5.6')).toMatchObject({ availableTokens: 94_880, estimated: true, windowSource: 'override' })
     // Catalog exact ID (1,048,576 documented) — still a labeled estimate.
     await fetch(`${base}/api/providers/remote`, {
       method: 'PATCH',

@@ -21,6 +21,7 @@ import type { EffectiveCompactionSnapshot, SnapshotIdentity } from '../harness/c
 import type { HarnessLimits } from '../harness/limits.ts'
 import { ProviderError, type ModelRequest, type StreamEvent, type StreamOptions, type TokenUsage } from '../harness/llm/types.ts'
 import { generateCompaction, type PreparedSummary } from './compaction-generator.ts'
+import { handoffSnapshot } from './compaction-host.ts'
 
 export type CandidateReport =
   | { readonly kind: 'started'; readonly sessionId: string; readonly snapshotId: string; readonly cutoff: number }
@@ -42,9 +43,12 @@ export interface PrecomputeDeps {
   /**
    * Last-moment worth check on a still-valid candidate, against the conversation as it
    * is NOW (the tail may have refilled since the summary was written): `no-fit` when the
-   * next request would not fit, `no-gain` when it saves less than the minimum.
+   * next request would not fit, `no-gain` when it saves less than the minimum. May await
+   * (the host sizes the next request with the context builder); the manager re-checks after.
    */
-  readonly assess: (sessionId: string, prepared: PreparedSummary) => 'no-gain' | 'no-fit' | undefined
+  readonly assess: (sessionId: string, prepared: PreparedSummary) => 'no-gain' | 'no-fit' | undefined | Promise<'no-gain' | 'no-fit' | undefined>
+  /** Whether the session's model sees image pixels; a text-only one gets the handoff without images. */
+  readonly nativeVision: (sessionId: string) => boolean
   readonly limits: Pick<HarnessLimits, 'compactionDeadlineMs' | 'compactionOutputTokens'>
   /** Usage the provider reported for one candidate attempt, attributed to the session it served. */
   readonly recordUsage: (sessionId: string, usage: TokenUsage) => void
@@ -106,18 +110,22 @@ export class CompactionPrecompute {
     return false
   }
 
-  /** Starts a background generation. False when a usable one already exists, the session is blocked, or this exact attempt already failed. */
-  start(snapshot: EffectiveCompactionSnapshot, parent: AbortSignal): boolean {
+  /** Starts a background generation. False when a usable one already exists, the session is blocked, the snapshot could never be adopted, or this exact attempt already failed. */
+  async start(snapshot: EffectiveCompactionSnapshot, parent: AbortSignal): Promise<boolean> {
     const sessionId = snapshot.sessionId
     if (this.closed || this.blocked(sessionId)) return false
+    // Built on another seed than the checkpoint standing now (e.g. cut before that checkpoint's own
+    // compaction events): adoption would refuse it, so never pay for it or let it displace a job.
+    if (this.deps.seedHash(sessionId) !== snapshot.seedHash) return false
     const existing = this.jobs.get(sessionId)
     if (existing !== undefined) {
       // A job still generating is never displaced. A finished one stays only while it can still be
       // adopted; once the source, checkpoint or identity moved on, or the conversation grew past what
       // it can serve, it would otherwise hold the slot forever and the session would get no new candidate.
       if (existing.phase !== 'ready' || existing.prepared === undefined) return false
-      const reason = this.staleness(existing) ?? this.deps.assess(sessionId, existing.prepared)
-      if (reason === undefined) return false
+      const reason = await this.verdict(existing, existing.prepared)
+      // Someone else took, replaced or stopped the job while the assessment awaited.
+      if (reason === undefined || this.jobs.get(sessionId) !== existing || this.closed || parent.aborted || this.blocked(sessionId)) return false
       this.jobs.delete(sessionId)
       this.deps.report({ kind: 'discarded', sessionId, snapshotId: existing.snapshot.id, reason })
     }
@@ -137,7 +145,9 @@ export class CompactionPrecompute {
     const { snapshot } = job
     const sessionId = snapshot.sessionId
     try {
-      const prepared = await generateCompaction(snapshot, {
+      // A capture from a slash-command turn names the command's model; the summary, its checkpoint,
+      // usage and fit check all belong to the session pair the identity names, as in the foreground.
+      const prepared = await generateCompaction(handoffSnapshot(snapshot, snapshot.identity, this.deps.nativeVision(sessionId)), {
         stream: (request, options) => this.deps.stream(request, {
           ...options,
           admissionPriority: 'low',
@@ -177,12 +187,21 @@ export class CompactionPrecompute {
     return undefined
   }
 
+  /** Staleness, then the host's worth check; staleness again because the source may move while the check awaits. */
+  private async verdict(job: Job, prepared: PreparedSummary): Promise<string | undefined> {
+    const stale = this.staleness(job)
+    if (stale !== undefined) return stale
+    const assessed = await Promise.resolve(this.deps.assess(job.snapshot.sessionId, prepared)).catch(() => 'no-fit' as const)
+    return this.staleness(job) ?? assessed
+  }
+
   /** The ready candidate, exactly once, if it is still valid; otherwise it is discarded. */
-  takeReady(sessionId: string): PreparedSummary | undefined {
+  async takeReady(sessionId: string): Promise<PreparedSummary | undefined> {
     const job = this.jobs.get(sessionId)
     if (job === undefined || job.phase !== 'ready' || job.prepared === undefined) return undefined
+    // Claimed before the await: nobody else can take or displace it meanwhile.
     this.jobs.delete(sessionId)
-    const reason = this.staleness(job) ?? this.deps.assess(sessionId, job.prepared)
+    const reason = await this.verdict(job, job.prepared)
     if (reason !== undefined) {
       this.deps.report({ kind: 'discarded', sessionId, snapshotId: job.snapshot.id, reason })
       return undefined
@@ -244,7 +263,9 @@ export class CompactionPrecompute {
         return undefined
       }
     }
-    return this.takeReady(sessionId)
+    const prepared = await this.takeReady(sessionId)
+    caller.throwIfAborted()
+    return prepared
   }
 
   async close(): Promise<void> {

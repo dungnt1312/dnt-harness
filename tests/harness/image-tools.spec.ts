@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { editImageTool, generateImageTool, parseImageResponse, shouldRetryEditAsJson, type ImageApiResolution, type ImageToolOptions } from '../../src/harness/tools/image-tools.ts'
+import { editImageTool, fetchMedia, generateImageTool, parseImageResponse, shouldRetryEditAsJson, type ImageApiResolution, type ImageToolOptions } from '../../src/harness/tools/image-tools.ts'
 import { resolveInGrants } from '../../src/capabilities/fs/grants.ts'
 import type { AttachmentRef } from '../../src/harness/attachments/store.ts'
 import type { ToolExecution } from '../../src/harness/tools/types.ts'
@@ -46,6 +46,18 @@ const jsonResponse = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
 
 describe('GenerateImage tool', () => {
+  it('pins foreign global-fetch downloads and bounds redirect loops', async () => {
+    const fetchMock = vi.fn(async (_input: unknown, init?: RequestInit & { dispatcher?: unknown }) => {
+      expect(init?.dispatcher).toBeDefined()
+      expect(init?.redirect).toBe('manual')
+      return new Response(null, { status: 302, headers: { location: '/again' } })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await expect(fetchMedia('https://cdn.test/image', 'https://img.test', fetch, AbortSignal.timeout(1000))).rejects.toThrow(/too many media redirects/)
+      expect(fetchMock).toHaveBeenCalledTimes(6)
+    } finally { vi.unstubAllGlobals() }
+  })
   it('posts an OpenAI images request and stores the decoded b64 bytes in the workspace', async () => {
     const fetchMock = vi.fn(async () => jsonResponse({ created: 1, data: [{ b64_json: PNG.toString('base64'), revised_prompt: 'a fluffy cat' }] }))
     const { tool, stored } = setup({ fetch: fetchMock as unknown as typeof fetch })
@@ -72,6 +84,18 @@ describe('GenerateImage tool', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
     expect(fetchMock.mock.calls[1]?.[0]).toBe('https://cdn.test/out.png')
     expect(stored[0]?.bytes).toEqual(PNG)
+  })
+
+  it('revalidates redirects before downloading an image', async () => {
+    const fetchMock = vi.fn(async (input: string, init?: RequestInit) => {
+      if (input.endsWith('/images/generations')) return jsonResponse({ data: [{ url: 'https://cdn.test/out.png' }] })
+      expect(init?.redirect).toBe('manual')
+      return new Response(null, { status: 302, headers: { location: 'https://127.0.0.1/private' } })
+    })
+    const { tool, stored } = setup({ fetch: fetchMock as typeof fetch })
+    await expect(tool.execute({ prompt: 'cat' }, exec)).rejects.toThrow(/refusing media url/)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(stored).toEqual([])
   })
 
   it('omits the authorization header for a keyless local gateway', async () => {
@@ -111,6 +135,11 @@ describe('GenerateImage tool', () => {
     await expect(big.tool.execute({ prompt: 'cat' }, exec)).rejects.toThrow(/limit is 4/)
     const file = setup({ fetch: (async () => jsonResponse({ data: [{ url: 'file:///etc/passwd' }] })) as unknown as typeof fetch })
     await expect(file.tool.execute({ prompt: 'cat' }, exec)).rejects.toThrow(/not http\(s\)/)
+    // A foreign url must be a public https address.
+    for (const url of ['http://cdn.test/out.png', 'https://169.254.169.254/latest', 'https://127.0.0.1/x.png']) {
+      const foreign = setup({ fetch: (async () => jsonResponse({ data: [{ url }] })) as unknown as typeof fetch })
+      await expect(foreign.tool.execute({ prompt: 'cat' }, exec), url).rejects.toThrow(/refusing media url/)
+    }
   })
 
   it('honors the turn stop signal', async () => {

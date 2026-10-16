@@ -242,6 +242,52 @@ describe('agent loop', () => {
     void kernel.stop()
   })
 
+  it('a throwing pre-step hands the claimed input back instead of losing it', async () => {
+    const { kernel, session, agent } = harness(['answered'])
+    const off = kernel.ctx.on('agent/pre-step', async () => { throw new Error('hook crashed') })
+    agent.send('keep me')
+    await agent.run()
+    expect(session.events.map((event) => event.type)).toEqual(['turn/start', 'turn/error', 'turn/end'])
+    expect(agent.pendingCount).toBe(1)
+
+    off()
+    await agent.run()
+    expect(session.events.filter((event) => event.type === 'user/message').map((event) => event.type === 'user/message' && event.content)).toEqual(['keep me'])
+    expect(session.events.at(-1)).toMatchObject({ type: 'turn/end', reason: 'completed' })
+    void kernel.stop()
+  })
+
+  it('a rejected or emptied pre-step keeps injected context for the next admitted turn', async () => {
+    const { kernel, session, agent } = harness(['ok'])
+    let verdict: 'reject' | 'empty' | 'enter' = 'reject'
+    kernel.ctx.on('agent/pre-step', async (_claim, next) =>
+      verdict === 'reject' ? { kind: 'reject', reason: 'blocked' } : verdict === 'empty' ? next({ contents: [] }) : next())
+    agent.inject('hook context')
+    agent.send('blocked prompt')
+    await agent.run()
+    verdict = 'empty'
+    agent.send('emptied prompt')
+    await agent.run()
+    verdict = 'enter'
+    agent.send('allowed prompt')
+    await agent.run()
+    const admitted = session.events.flatMap((event) => event.type === 'user/message' ? [event.content] : [])
+    expect(admitted).toEqual(['hook context', 'allowed prompt'])
+    void kernel.stop()
+  })
+
+  it('a failed step closes its step/start before the turn error', async () => {
+    const { kernel, session, agent, llm } = harness(['unused'])
+    llm.register({ name: 'relay', async *stream() { throw new ProviderError('relay: HTTP 502') } })
+    llm.use('relay')
+    agent.send('hello')
+    await agent.run()
+    const types = session.events.map((event) => event.type)
+    expect(types.slice(-3)).toEqual(['step/end', 'turn/error', 'turn/end'])
+    expect(types.filter((type) => type === 'step/start')).toHaveLength(1)
+    void kernel.stop()
+  })
+
   it('a model stream that yields nothing fails the turn durably instead of completing silently', async () => {
     const { kernel, session, agent, llm } = harness(['unused'])
     kernel.ctx.provide('limits', { stepRetryBaseMs: 1 })

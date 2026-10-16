@@ -154,6 +154,24 @@ describe('session log', () => {
     void kernel.stop()
   })
 
+  it('fork counts the copied history as committed and does not inherit the durable listener', async () => {
+    const kernel = new Kernel()
+    const parentHeard: number[] = []
+    const parent = new Session(kernel.ctx, { onDurable: (seq) => parentHeard.push(seq) })
+    parent.append({ type: 'turn/start', turnId: 'turn-1' as never })
+    parent.append({ type: 'user/message', turnId: 'turn-1' as never, content: 'copied' })
+    parent.append({ type: 'turn/end', turnId: 'turn-1' as never, reason: 'completed' })
+
+    const child = parent.fork(2)
+    expect(child.committedSeq).toBe(2)
+    expect(child.committedEvents.map((event) => event.type)).toEqual(['turn/start', 'user/message'])
+    child.append({ type: 'user/message', turnId: 'turn-2' as never, content: 'child' })
+    await child.durable()
+    expect(child.committedSeq).toBe(3)
+    expect(parentHeard).toEqual([])
+    await kernel.stop()
+  })
+
   it('get fails loud on an unknown id', () => {
     const kernel = boot()
     expect(() => kernel.ctx.sessions.get('session-nope' as never)).toThrow(/no session/)

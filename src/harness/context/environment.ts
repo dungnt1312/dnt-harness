@@ -97,7 +97,9 @@ export function renderEnvironmentContext(facts: EnvironmentFacts): string | unde
     lines.push(`Platform: ${facts.platform}${facts.arch !== undefined ? ` ${facts.arch}` : ''}${facts.nodeVersion !== undefined ? ` · Node ${facts.nodeVersion}` : ''}`)
   }
   if (facts.workspacePath !== undefined && facts.workspacePath !== '') {
-    lines.push(`Workspace: ${facts.workspacePath}${facts.gitBranch !== undefined && facts.gitBranch !== '' ? ` (git branch: ${facts.gitBranch})` : ''}`)
+    // Repository-controlled refs must not forge markup in the trusted block.
+    const branch = facts.gitBranch?.replace(/[^A-Za-z0-9._/-]/g, '')
+    lines.push(`Workspace: ${facts.workspacePath}${branch !== undefined && branch !== '' ? ` (git branch: ${branch})` : ''}`)
   }
   if (lines.length === 0) return undefined
   return `<environment_context>\n${lines.join('\n')}\n</environment_context>`

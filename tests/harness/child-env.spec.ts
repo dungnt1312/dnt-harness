@@ -28,6 +28,10 @@ describe('scrubbedChildEnv', () => {
     expect(env['DEEPSEEK_API_KEY']).toBeUndefined()
   })
 
+  it('withholds common credential names without underscore separators', () => {
+    for (const name of ['PGPASSWORD', 'MYSQL_PWD', 'SSH_ASKPASS']) expect(isWithheldEnv(name)).toBe(true)
+  })
+
   it('withholds names registered as harness-owned', () => {
     expect(isWithheldEnv('MY_PROVIDER_CONF')).toBe(false)
     markHarnessSecretEnv(['MY_PROVIDER_CONF'])

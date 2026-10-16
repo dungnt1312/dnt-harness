@@ -150,11 +150,12 @@ export function readTool(options: FsToolsOptions = {}): ToolDefinition {
     name: 'Read',
     description: [
       'Read a text file inside the workspace or a granted folder.',
+      `Returns up to ${READ_DEFAULT_LINES} lines from \`offset\` (1-based); a footer says when more lines remain and which offset continues.`,
+      'To read only part of a file, pass `offset` and `limit`: lines A to B are offset=A, limit=B-A+1.',
       ...(options.describeImage !== undefined ? ['An image file (png, jpeg, gif, webp) returns a text description from the vision model instead; offset/limit do not apply.'] : []),
       "Output lines are \"<line number><TAB><text>\"; the number and tab are NOT part of the file, so never copy them into Edit's `old`.",
-      `Returns up to ${READ_DEFAULT_LINES} lines from \`offset\` (1-based); a footer says when more lines remain and which offset continues.`,
       "Line endings are shown as plain newlines whatever the file uses; edits keep the file's own line endings.",
-      'Reading records the file for a later Write/Edit by this conversation.',
+      'Reading records the file for a later Write/Edit by this conversation. A successful Write, Edit or ApplyPatch records it too, so do not Read a file again just to verify your own change.',
     ].join(' '),
     requiresRoot: true,
     readOnly: true,
@@ -215,7 +216,7 @@ export function writeTool(): ToolDefinition {
   return {
     name: 'Write',
     description:
-      'Create a file, or replace an existing file completely, inside the workspace or a read-write granted folder. Overwriting requires that this conversation Read the file first and that it has not changed since; prefer Edit for partial changes. An existing file keeps its encoding, BOM, and line-ending style. For a long file (more than about 400 lines, such as a plan or spec), Write a short skeleton first and then add one section per Edit call: a single huge call can exceed the model output limit and is then lost unrun.',
+      'Create a file, or replace an existing file completely, inside the workspace or a read-write granted folder. Creating a new file needs no Read. Overwriting an existing file requires that this conversation observed it (a successful Read, Write, Edit or ApplyPatch) and that it has not changed since; prefer Edit for partial changes. An existing file keeps its encoding, BOM, and line-ending style. For a long file (more than about 400 lines, such as a plan or spec), Write a short skeleton first and then add one section per Edit call: a single huge call can exceed the model output limit and is then lost unrun.',
     requiresRoot: true,
     parameters: {
       type: 'object',
@@ -264,7 +265,7 @@ export function editTool(): ToolDefinition {
   return {
     name: 'Edit',
     description: [
-      'Replace text in a file inside the workspace or a read-write granted folder. This conversation must have Read the file, and it must not have changed since.',
+      'Replace text in a file inside the workspace or a read-write granted folder. This conversation must have observed the file (a successful Read, Write, Edit or ApplyPatch), and it must not have changed since.',
       '`old` must appear exactly once (copy it from Read output WITHOUT the line-number prefix, keeping indentation); add surrounding lines to make it unique, or set `replaceAll` to change every occurrence.',
       'Line endings are handled automatically. When `old` is not found, the error shows the closest current lines.',
       'An empty `old` creates a new file (or fills an empty one) with `new`.',
@@ -364,7 +365,7 @@ export function globTool(): ToolDefinition {
   return {
     name: 'Glob',
     description:
-      'List files matching a glob pattern (`*` within a segment, `**` for zero or more segments, `{a,b}` for choices; at most 64 expansions, no nested braces). Project .gitignore rules and common generated folders are skipped by default. Explicit file/directory patterns or a path inside an ignored folder override ignores only for that scope; includeIgnored searches all. Incomplete searches carry an explicit warning, not an exhaustive no matches. Paths inside the workspace are shown relative to it; paths in other granted folders are absolute.',
+      'Find files by path or name pattern; prefer this over `find` or `ls` in Bash. Patterns: `*` within a segment, `**` for zero or more segments, `{a,b}` for choices (at most 64 expansions, no nested braces). Project .gitignore rules and common generated folders are skipped by default. Explicit file/directory patterns or a path inside an ignored folder override ignores only for that scope; includeIgnored searches all. Incomplete searches carry an explicit warning, not an exhaustive no matches. Paths inside the workspace are shown relative to it; paths in other granted folders are absolute.',
     requiresRoot: true,
     readOnly: true,
     parameters: {
@@ -478,7 +479,7 @@ export function grepTool(): ToolDefinition {
   return {
     name: 'Grep',
     description:
-      'Search file contents with a JavaScript regular expression. Use this instead of grep/rg in Bash. output_mode `content` (default) returns `path:line: text` rows (context lines as `path-line- text`, groups split by `--`); `files_with_matches` lists matching files; `count` gives `path:N` per file. Narrow with `path` (a folder or one file), `glob` and `type`. Project .gitignore rules and common generated folders are skipped; point path inside an ignored folder or set includeIgnored to search it. Incomplete searches carry an explicit warning, not an exhaustive no matches. Paths inside the workspace are shown relative to it; paths in other granted folders are absolute.',
+      'Search file contents with a JavaScript regular expression, across a folder or within one file. Prefer this over `grep` or `rg` in Bash: its results link to files and respect the project ignore rules. output_mode `content` (default) returns `path:line: text` rows (context lines as `path-line- text`, groups split by `--`); `files_with_matches` lists matching files; `count` gives `path:N` per file. Narrow with `path` (a folder or one file), `glob` and `type`. Project .gitignore rules and common generated folders are skipped; point path inside an ignored folder or set includeIgnored to search it. Incomplete searches carry an explicit warning, not an exhaustive no matches. Paths inside the workspace are shown relative to it; paths in other granted folders are absolute.',
     requiresRoot: true,
     readOnly: true,
     parameters: {
@@ -573,7 +574,7 @@ async function createPatchFile(file: string, bytes: Buffer, mode?: number): Prom
 export function applyPatchTool(): ToolDefinition {
   return {
     name: 'ApplyPatch',
-    description: 'Apply multiple local diff hunks or file changes in one call. Prefer this over repeated Edit calls for distant regions. Input must start with *** Begin Patch and end with *** End Patch. Use *** Update File: path, then @@ (optionally followed by an exact context line), then lines prefixed with space (context), - (remove), + (add). Multiple @@ hunks use original-file order and exact unique context, not numeric git diff headers. *** End of File anchors a hunk to EOF. *** Add File: path uses + content lines; *** Delete File: path deletes a file; *** Move to: path immediately after Update moves it to a new, absent destination. Existing files must have been Read and unchanged since. Preserves encoding/BOM/EOL and final-newline state. All files are verified before writes; I/O failure can leave partial changes, recorded in the error receipt. Re-read before retrying a partial failure. Do not use shell scripts to bypass verification.',
+    description: 'Apply multiple local diff hunks or file changes in one call. Prefer this over repeated Edit calls for distant regions. Input must start with *** Begin Patch and end with *** End Patch. Use *** Update File: path, then @@ (optionally followed by an exact context line), then lines prefixed with space (context), - (remove), + (add). Multiple @@ hunks use original-file order and exact unique context, not numeric git diff headers. *** End of File anchors a hunk to EOF. *** Add File: path uses + content lines; *** Delete File: path deletes a file; *** Move to: path immediately after Update moves it to a new, absent destination. Existing files must have been observed (a successful Read, Write, Edit or ApplyPatch) and unchanged since. Preserves encoding/BOM/EOL and final-newline state. All files are verified before writes; I/O failure can leave partial changes, recorded in the error receipt. Re-read before retrying a partial failure. Do not use shell scripts to bypass verification.',
     requiresRoot: true,
     parameters: { type: 'object', properties: { patch_text: { type: 'string', description: 'Complete structured patch text, including Begin/End Patch markers' } }, required: ['patch_text'] },
     async execute(args, exec) {

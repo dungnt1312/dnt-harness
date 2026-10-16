@@ -490,7 +490,7 @@ describe('G2 review hardening', () => {
       const sb = (await (await post(base, `/api/workspaces/${life.id}/sessions`)).json()) as { id: string }
       await post(base, `/api/workspaces/${work.id}/sessions/${sa.id}/messages`, { content: 'go' })
       await post(base, `/api/workspaces/${life.id}/sessions/${sb.id}/messages`, { content: 'go' })
-      await new Promise((resolve) => setTimeout(resolve, 300))
+      await expect.poll(() => seen.length, { timeout: 8_000 }).toBe(2)
 
       // Each session streamed through ITS OWN workspace's provider, not a
       // process-global selection.

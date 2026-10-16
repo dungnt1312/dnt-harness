@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -145,8 +145,15 @@ describe('DangerousCommandsStore', () => {
     const wsDir = path.join(dir, 'workspaces', 'ws-corrupt')
     await mkdir(wsDir, { recursive: true })
     await writeFile(path.join(wsDir, 'dangerous-commands.json'), '{ not valid json', 'utf8')
-    const { config } = await store.load('ws-corrupt')
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const { config, warning } = await store.load('ws-corrupt')
     expect(config).toEqual(DEFAULT_CONFIG)
+    expect(warning).toMatch(/corrupt/)
+    // The degraded guard is reported outside Settings, once per file state.
+    await store.load('ws-corrupt')
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(String(warn.mock.calls[0]?.[0])).toMatch(/custom rules are not applied/)
+    warn.mockRestore()
   })
 
   it('corrupt global json falls back to default', async () => {

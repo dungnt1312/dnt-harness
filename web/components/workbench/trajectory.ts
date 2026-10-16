@@ -6,6 +6,7 @@
  * did not stamp is never invented — a span with no end simply has no duration.
  */
 import { toolFacts } from '../../lib/tool-facts.ts'
+import { createContextReducer } from '../../../src/harness/context/context-state.ts'
 import { isMcpOutcome, type ContextManifestView, type SseEvent, type ToolCall } from '../../lib/types.ts'
 
 /** How a recorded call ended, in the same terms the transcript uses. */
@@ -504,7 +505,14 @@ export function projectTrajectory(events: readonly SseEvent[]): Trajectory {
     ...calls.flatMap((item) => [item.start, item.end]),
   ].filter((stamp): stamp is number => stamp !== undefined)
   const extent = stamps.length === 0 ? null : { start: Math.min(...stamps), end: Math.max(...stamps) }
-  return { turns, calls, extent }
+  const contextState = createContextReducer<ContextManifestView>()
+  contextState.apply(events)
+  const measuredTurns = turns.map(item => ({ ...item, ...(item.traces !== undefined ? { traces: item.traces.map(trace => {
+    const id = trace.manifest?.contextId
+    const manifest = id !== undefined ? contextState.request(id) : undefined
+    return manifest !== undefined ? { ...trace, manifest } : trace
+  }) } : {}) }))
+  return { turns: measuredTurns, calls, extent }
 }
 
 /** Case-insensitive containment across the fields a row is identified by. */

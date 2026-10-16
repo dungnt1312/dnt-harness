@@ -267,10 +267,11 @@ Details worth knowing:
 - **`agent/pre-step`** (waterfall) admits a claim. `enter(contents)` runs a step
   with the (possibly rewritten) contents; `reject` closes the turn with reason
   `rejected`. A first `enter` rewritten to empty closes it with reason `empty`.
-- **`agent/request`** (waterfall) sits between the log projection and the
-  provider — the web host uses it to stamp each session's effective model,
-  provider, and thinking level onto every request; middleware may prepend a
-  system message, etc.
+- **`agent/request`** (waterfall) sits between the assembled request and the
+  provider; middleware may prepend a system message, etc. The web host stamps
+  each session's effective model, provider, and thinking level in
+  `agent/context` instead, so the budget, manifest, capture and dispatch use
+  one request.
 - **`agent/turn-stopping`** (serial) runs *before* `turn/end` is appended, so
   observers see a settled step and no closing turn yet.
 - **Failure closes the turn durably.** If a step throws, `closeOpenTurn()`
@@ -591,7 +592,7 @@ turn:
 - **Model** — the model/provider/thinking level are **per-session** facts: a
   durable `session/model` preference (see the session log vocabulary) is
   re-resolved per model request, and the host stamps the effective pair onto
-  the request through `agent/request`. A mid-turn change therefore lands on
+  the request during context assembly (`agent/context`). A mid-turn change therefore lands on
   the turn's next request without touching the stream in flight, and the
   context budget is recomputed for the new model on that same request. Only
   a legacy log without any `session/model` event falls back to the global
@@ -618,7 +619,7 @@ e.g. a stream that closed empty — is asked again with exponential backoff, 3
 extra attempts by default; a stop cancels the wait, and a failure after output
 started is never retried), `toolTimeoutMs`, `approvalExpiryMs`, `toolOutputLimit`,
 `readOnlyToolConcurrency` (read-only calls of one batch running at once, default 10),
-`maxPendingInputs`, `automaticCompactionPressure` (estimated pre-trim tokens/availableTokens
+`maxPendingInputs`, `automaticCompactionPressure` (calibrated pre-trim tokens/availableTokens
 ratio from the settled turn's fresh context manifest that triggers automatic
 compaction at a completed boundary; 0 disables), `compactionRetainTokens`
 (estimated-token cap on covered messages kept verbatim beside the summary —
@@ -716,9 +717,11 @@ This repair applies to the legacy fold only, not the effective generator. An exp
 With no model pair, the extractive fallback preserves the exact source only if
 it fits within 24,000 characters, otherwise it fails explicitly.
 Automatic compaction triggers only for compact-history mode after a completed
-turn, using that turn's fresh estimated `preTrimTokens/availableTokens` pressure
-(falling back to `usedTokens` for older manifests). This measures pressure before
-microcompaction and budget trimming, not provider-measured token usage. Attempts
+turn, using that turn's last request pre-trim count over `availableTokens`
+(`settledPressureTokens`): scaled by the request's own reported/estimated ratio
+when the provider measured it, otherwise `budget.measured.preTrimTokens`, and on
+older manifests `preTrimTokens`, then `usedTokens`. This measures pressure before
+microcompaction and budget trimming. Attempts
 are deduplicated by completed boundary; rejected, empty, failed and cancelled
 turns never reuse stale pressure. The standard web bin enables 0.85; embedded
 hosts default to disabled and explicit zero disables it. Headless integration
@@ -785,7 +788,7 @@ runs and the behavior above is unchanged.
   request that cannot fit its own answer is not sent: the host folds the transcript
   instead (`path: "recovery"`). The size is the provider-reported input of the captured
   request plus a 20% margin on what is appended; an unmeasured capture is estimated at
-  chars/4 + 20%, and a request rebuilt from the log with the context builder's own
+  chars/3 + 20%, and a request rebuilt from the log with the context builder's own
   estimate (no margin — the builder already fitted that request to the budget).
 - **Adoption.** `adoptPreparedCompaction` commits the summary under the same
   per-session transaction as the fold, but its cutoff may be *older* than the newest
@@ -800,7 +803,10 @@ runs and the behavior above is unchanged.
   last turn was stopped, the mode or grants changed since) — a snapshot **rebuilt from
   the committed log** (`path: "reconstructed"`, one request). The rebuild runs the
   ordinary request assembly with `sideEffects: false` (`reconstructFromLog` in
-  `server.ts`); its cutoff is the newest clean `completed` turn after the standing
+  `server.ts`), calibrated by the prefix's newest provider measurement; the snapshot
+  carries that ratio (`estimateRatio`) so the window fit check sizes the rebuilt
+  request at the provider's scale and folds one the window cannot take. Its cutoff
+  is the newest clean `completed` turn after the standing
   checkpoint (`reconstructionCutoff`), so later turns, e.g. a stopped one, stay
   verbatim. Only if that fails (a dropped uncovered turn, an unsafe loss, a budget
   error) does the host fall back to the transcript fold (`path: "recovery"`).
@@ -862,9 +868,20 @@ runs and the behavior above is unchanged.
   did not settle blocks further speculation for the session instead of overlapping.
   `PreCompact` runs once, when adoption begins; speculation never runs a hook.
   Session delete and server close cancel it and wait for the stream.
-- **Measurement.** `compaction/end.tokensAfter` is the provider-reported size minus
-  the estimated saving of the new checkpoint, including the restoration that rides
-  beside it.
+- **Measurement.** The post-compaction size (`compaction/end.tokensAfter`) is an
+  independent estimate rebuilt from the same builder the next request uses —
+  full context after the checkpoint, restoration included — committed atomically
+  on the success event with its own `basis: 'estimated'`. The pre-compaction
+  side (`tokensBefore`) carries the previous request's provider report when one
+  was attributed to the assembly being replaced (`basis: 'reported'`). The
+  post-compaction number is never `reportedBefore - rawSaving`: two different
+  bases subtracted across a replaced context would claim a precision no pair of
+  estimates has. A measurement that could not be computed is published as
+  `{ contextEffect: 'replaced', measurement: { unavailableReason: 'preview-failed' } }`
+  rather than a zero. A successful `compaction/end` becomes visible to browser
+  streams only once its durability barrier has committed — the server holds the
+  event and everything appended behind it, and a flush failure never publishes
+  the uncommitted success.
 - **Verifying.** Everything above is tested with a scripted provider. No live
   benchmark has been run: the target (≥ 70 % median reduction of summary generation
   time, ready-candidate blocking p95 ≤ 5 s excluding hooks and storage) is
@@ -895,8 +912,9 @@ root stops waiting:
   wordings OpenAI-compatible gateways use) is not final: the loop assembles the
   request again with `ModelRequest.squeeze` raised, and `squeezeBudget` shrinks
   the builder's budget by level (×0.7, ×0.45, ×0.25) so microcompact and the
-  other trims actually send less. The chars/4 estimate runs low on non-English
-  text and code; this is the correction. Only after the last level is the
+  other trims actually send less. The builder already calibrates against the
+  previous request's provider count; squeeze covers what calibration cannot
+  see (a first request, or a jump in new content). Only after the last level is the
   failure final.
 - *Stalled or empty.* Every attempt streams under its own abort controller, so a
   timeout before first model progress (`streamFirstEventMs`) aborts that attempt,
@@ -926,8 +944,8 @@ root stops waiting:
   text is kept as the `assistant/message` (none when it was empty), any tool
   call it was writing is dropped unrun, and the loop appends a host notice
   (`TRUNCATION_NOTICE`, `origin: 'context'`) asking the model to continue in
-  smaller pieces, then runs another step. After `MAX_TRUNCATION_RECOVERIES`
-  (2) cutoffs in one turn the turn fails with `provider completion rejected:
+  smaller pieces, then runs another step. Each turn recovers at most
+  `MAX_TRUNCATION_RECOVERIES` (2) cutoffs; the next one fails it with `provider completion rejected:
   length`. Compaction still requires a `stop` finish.
 - *The root stops calling tools while children run.* Closing the turn would
   cancel them and lose their work. Instead the `agent/turn-continuation` serial

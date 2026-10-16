@@ -367,6 +367,9 @@ export class Agent {
       // check would be narrowed by the first one.
       const stopRequested = (): boolean => controller?.signal.aborted === true
       const claimed = this.inbox.splice(0, this.inbox.length)
+      // Set once the claim is accounted for (handed back, settled or passed to
+      // a step); before that a failure must return it to the inbox.
+      let claimOwned = false
       try {
       for (const item of claimed) {
         if (item.kind === 'user' && item.inputId !== undefined) this.claimedInputIds.add(item.inputId)
@@ -398,12 +401,14 @@ export class Agent {
       // that side effect. It falls through to the audited reject below.
       if (stopRequested() && !(decision.kind === 'reject' && decision.audited === true)) {
         this.inbox.unshift(...claimed)
+        claimOwned = true
         const reason = this.stopReason()
         await this.recordTurnEnd(turnId, reason)
         return reason
       }
 
       if (decision.kind === 'reject') {
+        claimOwned = true
         if (decision.audited === true) {
           // The listener already performed durably-audited host work before
           // discovering the rejection (e.g. an earlier inline shell marker
@@ -423,17 +428,21 @@ export class Agent {
           this.settleClaimedInputs(claimed, 'admitted')
         } else {
           this.settleClaimedInputs(claimed, 'rejected')
+          this.requeueInjected(claimed)
         }
         this.session.append({ type: 'turn/error', turnId, kind: 'rejected', message: decision.reason ?? 'rejected by pre-step policy' })
         await this.recordTurnEnd(turnId, 'rejected')
         return 'rejected'
       }
       if (decision.contents.length === 0) {
+        claimOwned = true
         this.settleClaimedInputs(claimed, 'empty')
+        this.requeueInjected(claimed)
         await this.recordTurnEnd(turnId, 'empty')
         return 'empty'
       }
 
+      claimOwned = true
       let lastStep: StepId | null = null
       let nextContents: readonly string[] | undefined = decision.contents
       let nextContext: readonly string[] | undefined = decision.context
@@ -501,6 +510,9 @@ export class Agent {
       await this.recordTurnEnd(turnId, 'completed')
       return 'completed'
     } catch (error) {
+      // A failure before admission (a throwing pre-step listener) logged
+      // nothing for the claim: hand it back, oldest first, like a stop does.
+      if (!claimOwned) this.inbox.unshift(...claimed)
       // Classified failures append the durable reason before closing. A
       // poisoned session records nothing further — the throw is the truth.
       if (!this.session.poisoned) {
@@ -510,6 +522,8 @@ export class Agent {
             ? { kind: 'provider' as const, message: error.message, reason: 'failed' as const }
             : { kind: 'internal' as const, message: String(error instanceof Error ? error.message : error), reason: 'failed' as const }
         try {
+          // A failed step closes before its turn, as a stopped one does.
+          await this.closeOpenStep(turnId)
           this.session.append({ type: 'turn/error', turnId, kind, message })
           await this.session.durable()
           this.session.append({ type: 'turn/end', turnId, reason })
@@ -553,6 +567,14 @@ export class Agent {
         this.session.append({ type: 'input/settled', inputId: item.inputId, outcome })
       }
     }
+  }
+
+  /**
+   * Injected context must reach the next *admitted* request: a claim that
+   * was rejected or rewritten empty hands it back to the inbox, oldest first.
+   */
+  private requeueInjected(claimed: readonly InboxItem[]): void {
+    this.inbox.unshift(...claimed.filter((item) => item.kind === 'injected'))
   }
 
   /** Append and durably flush a turn end, then release per-Turn holders. */

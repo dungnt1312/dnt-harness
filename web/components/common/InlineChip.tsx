@@ -1,4 +1,5 @@
-import { chipLabel, chipTitle, isBuiltinCommand, type ChipSegment } from '../../lib/inline-chips.ts'
+import { chipLabel, chipTitle, chipWireText, isBuiltinCommand, type ChipSegment } from '../../lib/inline-chips.ts'
+import { CHIP_WIRE_ATTRIBUTE } from '../../lib/chip-clipboard.ts'
 import { fileStyle, materialIconSrc } from '../../lib/file-icons.ts'
 import { cn } from '../../lib/cn.ts'
 import { FileTypeIcon } from './FileTypeIcon.tsx'
@@ -82,9 +83,10 @@ export function InlineChip({ segment, onOpen, openLabel }: {
       <span className={CHIP_LABEL_CLASS}>{chipLabel(segment)}</span>
     </>
   )
+  const wire = { [CHIP_WIRE_ATTRIBUTE]: chipWireText(segment) }
   if (onOpen === undefined) {
     return (
-      <span className={cn(CHIP_CLASS, CHIP_TONE.bubble)} title={chipTitle(segment)} aria-label={chipAriaLabel(segment)} data-chip-kind={segment.kind}>
+      <span className={cn(CHIP_CLASS, CHIP_TONE.bubble)} title={chipTitle(segment)} aria-label={chipAriaLabel(segment)} data-chip-kind={segment.kind} {...wire}>
         {content}
       </span>
     )
@@ -98,6 +100,7 @@ export function InlineChip({ segment, onOpen, openLabel }: {
       title={label}
       aria-label={label}
       data-chip-kind={segment.kind}
+      {...wire}
     >
       {content}
     </button>

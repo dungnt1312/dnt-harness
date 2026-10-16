@@ -6,7 +6,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { OpenAiCompletionsProvider, ProviderError } from 'dnt-harness'
 import { LogicalRequest } from '../../src/harness/llm/request-lifecycle.ts'
-import { wrapUntrusted } from '../../src/harness/context/builder.ts'
+import { buildContext, wrapUntrusted } from '../../src/harness/context/builder.ts'
+import { resolveModelBudget } from '../../src/harness/context/budget.ts'
+import { BUNDLED_MODES, DEFAULT_MODE_ID } from '../../src/harness/modes/bundled.ts'
 
 interface CapturedRequest {
   url: string
@@ -46,6 +48,40 @@ async function run(request: Parameters<OpenAiCompletionsProvider['stream']>[0]):
 }
 
 describe('openai completions adapter: thinking + wire shape', () => {
+  it('caps gateway max_tokens at the remaining calibrated context window', async () => {
+    const captured = stubFetch()
+    const budget = resolveModelBudget({ model: 'claude-haiku-4.5' })
+    for (const ratio of [1, 1.5]) {
+      const assembled = buildContext({
+        events: [{ type: 'user/message', turnId: 't', content: 'x'.repeat(350_000), seq: 1, timestamp: 1 }] as never,
+        mode: { definition: BUNDLED_MODES.find(mode => mode.id === DEFAULT_MODE_ID)!, source: 'bundled' },
+        modeRevision: 1, model: 'claude-haiku-4.5', providerName: 'test', schemas: [], activeSkills: [], pinnedMemory: [], budget,
+        calibration: { contextId: 'prior', estimatedTokens: 100_000, reportedInputTokens: ratio * 100_000 },
+      })
+      await run({ model: 'claude-haiku-4.5', messages: assembled.messages, outputCeilingTokens: assembled.maxOutputTokens })
+      const remaining = budget.contextLimitTokens - assembled.manifest.budget.measured!.tokens - budget.marginTokens
+      expect(captured.at(-1)!.body['max_tokens']).toBe(Math.min(65_536, remaining))
+    }
+  })
+  it('a remaining-window ceiling never invents max_tokens for a model with no known output cap', async () => {
+    const captured = stubFetch()
+    await run({ model: 'deepseek-chat', messages: [], outputCeilingTokens: 120_000 })
+    await run({ model: 'some-unknown-model', messages: [], outputCeilingTokens: 200_000 })
+    await run({ model: 'some-unknown-model', messages: [], maxOutputTokens: 8_000, outputCeilingTokens: 5_000 }) // an explicit request cap is still clamped
+    expect(captured.map(c => c.body['max_tokens'])).toEqual([undefined, undefined, 5_000])
+    expect(captured.every(c => !('outputCeilingTokens' in c.body))).toBe(true)
+  })
+  it('keeps the Claude thinking budget below a window-clamped max_tokens, or drops thinking when it cannot fit', async () => {
+    const captured = stubFetch()
+    await run({ model: 'claude-haiku-4.5', thinkingLevel: 'max', messages: [], outputCeilingTokens: 48_000 })
+    await run({ model: 'claude-haiku-4.5', thinkingLevel: 'low', messages: [], outputCeilingTokens: 1_024 })
+    await run({ model: 'claude-haiku-4.5', thinkingLevel: 'high', messages: [] })
+    expect(captured.map(c => [c.body['max_tokens'], c.body['thinking']])).toEqual([
+      [48_000, { type: 'enabled', budget_tokens: 47_999 }],
+      [1_024, undefined],
+      [65_536, { type: 'enabled', budget_tokens: 16_000 }],
+    ])
+  })
   it('preserves base system and wrapped compaction system blocks in order on the local wire', async () => {
     const captured = stubFetch()
     const baseSystem = 'Base system instructions. This is the same conversation continuing after compaction, not a new session.'

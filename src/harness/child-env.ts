@@ -17,6 +17,7 @@
 const harnessOwned = new Set<string>(['DEEPSEEK_API_KEY'])
 
 const SECRET_NAME = /(^|_)(API_?KEY|ACCESS_?KEY|SECRET(_?KEY)?|TOKEN|PASSWORD|PASSWD|PRIVATE_?KEY|CREDENTIALS?)$/i
+const COMMON_CREDENTIALS = /^(PGPASSWORD|MYSQL_PWD|SSH_ASKPASS)$/i
 
 /** Mark environment variable names the harness itself owns (never passed to children). */
 export function markHarnessSecretEnv(names: Iterable<string>): void {
@@ -35,7 +36,7 @@ export function isWithheldEnv(name: string, pass: ReadonlySet<string> = new Set(
   if (harnessOwned.has(upper)) return true
   // Host configuration, under the current and the pre-rename prefix.
   if (upper.startsWith('DNT_HARNESS_') || upper.startsWith('MINI_DSH_')) return true
-  return SECRET_NAME.test(upper)
+  return SECRET_NAME.test(upper) || COMMON_CREDENTIALS.test(upper)
 }
 
 /** The host environment with harness and credential-looking variables removed, plus `extra`. */

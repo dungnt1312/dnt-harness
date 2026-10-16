@@ -7,6 +7,14 @@ import { describe, expect, it, vi } from 'vitest'
 import { ManagedOAuth, OAuthStore } from 'dnt-harness'
 
 describe('managed oauth profile', () => {
+  it('refuses to begin a public-resource flow with a loopback token endpoint', async () => {
+    const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-oauth-public-'))
+    try {
+      const oauth = new ManagedOAuth(new OAuthStore(home, randomBytes(32)))
+      await expect(oauth.begin({ workspaceId: 'ws', server: 'remote', principalId: 'browser', resource: 'https://public.example/mcp', authorizationEndpoint: 'https://public.example/authorize', tokenEndpoint: 'http://127.0.0.1:8765/token', clientId: 'client', redirectUri: 'http://127.0.0.1:4317/callback', scopes: [] })).rejects.toThrow(/plain HTTP/)
+    } finally { await fs.rm(home, { recursive: true, force: true }) }
+  })
+
   it('does not let first Begin overwrite a Revoke epoch', async () => {
     const home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-oauth-first-revoke-'))
     const read = fs.readFile.bind(fs)

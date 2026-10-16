@@ -1,6 +1,7 @@
 import { forwardRef, useImperativeHandle, useLayoutEffect, useRef } from 'react'
 import { normalizeDraft, type DraftSegment, type RichDraft } from '../../lib/composer-draft.ts'
-import { chipLabel, chipTitle, type ChipSegment } from '../../lib/inline-chips.ts'
+import { chipLabel, chipTitle, chipWireText, parseChipLinks, type ChipSegment } from '../../lib/inline-chips.ts'
+import { CHIP_WIRE_ATTRIBUTE } from '../../lib/chip-clipboard.ts'
 import { readProjectFileDrag } from '../../lib/file-tree.ts'
 import { cn } from '../../lib/cn.ts'
 import { CHIP_CLASS, CHIP_ICON_CLASS, CHIP_ICON_PATHS, CHIP_ICON_SIZE, CHIP_LABEL_CLASS, CHIP_TONE, MENTION_ICON_FALLBACK, chipAriaLabel, mentionIconSrc } from '../common/InlineChip.tsx'
@@ -156,6 +157,7 @@ function strokeIcon(document: Document, paths: readonly string[], className: str
 function chipElement(segment: ChipSegment, document: Document): HTMLElement {
   const host = document.createElement('span')
   host.setAttribute(CHIP_ATTRIBUTE, JSON.stringify(segment))
+  host.setAttribute(CHIP_WIRE_ATTRIBUTE, chipWireText(segment))
   host.setAttribute('contenteditable', 'false')
   host.dataset['chipKind'] = segment.kind
   // cn, so the editor tone's max-w-full replaces the base 16rem cap instead of racing it.
@@ -546,7 +548,13 @@ export const RichInput = forwardRef<RichInputHandle, RichInputProps>(function Ri
         } else if (disposition.kind === 'attachment') {
           onTextAttachment(text, bookmark)
         } else {
-          spliceAtCaret(caret?.offset ?? 0, caret?.offset ?? 0, [event.currentTarget.ownerDocument.createTextNode(text)])
+          // Copied chips arrive as their wire links and become chips again. A
+          // convertible paste stays one text run so "convert" can find it.
+          const document = event.currentTarget.ownerDocument
+          const pasted = disposition.kind === 'inline'
+            ? parseChipLinks(text).map((segment) => segment.kind === 'text' ? document.createTextNode(segment.text) : chipElement(segment, document))
+            : [document.createTextNode(text)]
+          spliceAtCaret(caret?.offset ?? 0, caret?.offset ?? 0, pasted)
           if (disposition.kind === 'convertible') onConvertibleText(text, bookmarkOffset === null ? null : { offset: bookmarkOffset, revision: revision.current })
         }
       }}

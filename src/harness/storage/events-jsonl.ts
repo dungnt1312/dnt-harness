@@ -15,6 +15,7 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import type { SessionEvent } from '../session/events.ts'
+import { isValidContextId, isValidTokenUsage } from '../context/context-metrics.ts'
 
 /** Bump when the line format breaks compatibility; readers refuse other versions. */
 export const EVENT_SCHEMA_VERSION = 1
@@ -71,7 +72,53 @@ function validateRecord(parsed: unknown, filePath: string, lineNumber: number): 
   if (record['type'] === 'context/snapshot' && !validSnapshotReference(record)) {
     throw new SessionLogError('schema', `line ${lineNumber} has an invalid snapshot reference`, filePath, lineNumber)
   }
+  if (record['type'] === 'context/manifest' && record['manifest'] !== null && typeof record['manifest'] === 'object') {
+    const contextId = (record['manifest'] as Record<string, unknown>)['contextId']
+    if (contextId !== undefined && !isValidContextId(contextId)) throw new SessionLogError('schema', `line ${lineNumber} has an invalid context identity`, filePath, lineNumber)
+  }
+  if (record['type'] === 'compaction/end' && !validCompactionMetrics(record)) {
+    throw new SessionLogError('schema', `line ${lineNumber} has invalid compaction metrics`, filePath, lineNumber)
+  }
   return record as unknown as SessionEvent
+}
+
+const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
+const tokenCount = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0
+
+/** Optional new metadata is strict; untouched legacy payloads retain their contract. */
+function validCompactionMetrics(record: Record<string, unknown>): boolean {
+  const effect = record['contextEffect']
+  if (effect !== undefined && effect !== 'replaced' && effect !== 'unchanged') return false
+  const after = record['contextAfter']
+  if (after !== undefined) {
+    if (record['error'] !== undefined || effect === 'unchanged' || !object(after) || after['contextId'] !== undefined || after['usage'] !== undefined) return false
+    const strings = (v: unknown): boolean => Array.isArray(v) && v.every(item => typeof item === 'string')
+    const history = after['history']; const sources = after['sources']
+    if (typeof after['modeId'] !== 'string' || typeof after['modeRevision'] !== 'number'
+      || !object(history) || !['none', 'recent', 'compact'].includes(history['setting'] as string)
+      || !object(sources) || !strings(sources['toolNames']) || !strings(after['omissions'])) return false
+    const budget = after['budget']; const breakdown = after['breakdown']
+    if (!object(budget) || !object(breakdown) || budget['estimated'] !== true
+      || !tokenCount(budget['usedTokens']) || !tokenCount(budget['availableTokens'])
+      || !tokenCount(budget['contextLimitTokens']) || budget['contextLimitTokens'] === 0) return false
+    if (budget['preTrimTokens'] !== undefined && !tokenCount(budget['preTrimTokens'])) return false
+    const fields = ['systemPrompt','systemTools','mcpTools','metaContext','skills','messages']
+    if (!fields.every(key => tokenCount(breakdown[key]))) return false
+    if (fields.reduce((sum,key) => sum + (breakdown[key] as number),0) !== budget['usedTokens']) return false
+    if (record['tokensAfter'] !== undefined && record['tokensAfter'] !== budget['usedTokens']) return false
+  }
+  const measured = record['measurement']
+  if (measured !== undefined) {
+    if (!object(measured) || record['error'] !== undefined || Object.keys(measured).some(key => !['before','after','unavailableReason'].includes(key))) return false
+    for (const key of ['before','after']) {
+      const part = measured[key]
+      if (part === undefined) continue
+      if (!object(part) || !tokenCount(part['tokens']) || (part['basis'] !== 'estimated' && (key === 'after' || part['basis'] !== 'reported'))) return false
+      if (part['contextId'] !== undefined && (key !== 'before' || !isValidContextId(part['contextId']))) return false
+    }
+    if (measured['unavailableReason'] !== undefined && measured['unavailableReason'] !== 'preview-failed') return false
+  }
+  return true
 }
 
 /** The reference names a sidecar file, so the id must be a plain token and the hash a sha256. */
@@ -86,8 +133,10 @@ function validSnapshotReference(record: Record<string, unknown>): boolean {
 function validAttemptFact(value: unknown, type: string): boolean {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
   const fact = value as Record<string, unknown>
-  const keys = ['attribution', 'provider', 'model', 'queuedAt', 'startedAt', 'endedAt', 'firstProgressAt', 'lastProgressAt', 'finish', 'requestId', 'attemptId', 'attempt', 'state', 'committed', 'reason', 'transportSettled']
+  const keys = ['attribution', 'provider', 'model', 'queuedAt', 'startedAt', 'endedAt', 'firstProgressAt', 'lastProgressAt', 'finish', 'requestId', 'attemptId', 'attempt', 'state', 'committed', 'reason', 'transportSettled', 'contextId', 'usage']
   if (Object.keys(fact).some(key => !keys.includes(key))) return false
+  if (fact['contextId'] !== undefined && !isValidContextId(fact['contextId'])) return false
+  if (fact['usage'] !== undefined && (fact['state'] === 'start' || !isValidTokenUsage(fact['usage']))) return false
   const id = (v: unknown): boolean => typeof v === 'string' && v.length > 0
   if (!id(fact['requestId']) || !id(fact['attemptId'])) return false
   if (!Number.isSafeInteger(fact['attempt']) || (fact['attempt'] as number) < 1 || (fact['attempt'] as number) > 4) return false

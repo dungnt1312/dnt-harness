@@ -149,6 +149,8 @@ expect(r.request('a')?.usage?.last?.inputTokens).toBe(120_000)
 
 ### Task 3: One window resolver and shared host assembly preparation
 
+> **Scope note (2026-10-15):** window resolver, `estimated`/`windowSource`, pinning controls before assembly and the vision ordering moved to `plans/261015-1347-context-tool-prompt-contract/spec.md` (Part B). What remains here: the `context-assembly.ts` module with `purpose: 'preview'`, `revision`, `validate()` and `commitPrefix()` (needed by Task 4/5), and `contextId` stamping (needed by Task 1/2). Re-read `assembleRequest` before starting; its line numbers and control resolution will have changed.
+
 **Files:** Modify `src/harness/llm/model-catalog.ts`, `src/harness/context/{budget,builder}.ts`, `src/harness/llm/adaptive-vision.ts` only if needed for existing pure adapter use, `src/web/server.ts`; create `src/web/context-assembly.ts`, `tests/web/context-assembly.spec.ts`; tests `tests/harness/g3-context.spec.ts`, `tests/web/{server-g3,server-session-model,server-adaptive-vision,server-native-vision}.spec.ts`.
 
 **Interfaces:** `resolveContextWindow(modelId: string): {tokens:number;source:'catalog'|'family'|'fallback'}` in model-catalog; existing resolveContextLimit delegates and returns tokens. `resolveModelBudget({model?:string,contextTokens?:number}): ResolvedBudget` in budget, retains existing fallback/reserve/margin, adds windowSource. Builder re-exports this one ResolvedBudget, removing duplicate declaration. `ContextManifest.budget.windowSource?` optional, estimated=true regardless verified window.

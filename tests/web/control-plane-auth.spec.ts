@@ -167,6 +167,38 @@ describe('control-plane authentication', () => {
     await expect(readOperatorChannel(home)).rejects.toThrow()
   })
 
+  it('reveals a stored provider key to the paired browser only', async () => {
+    home = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-provider-key-'))
+    server = await createWebServer({
+      home,
+      configFile: path.join(home, 'providers.json'),
+      controlPlaneAuth: true,
+    })
+    const live = server
+    const paired = await raw(live.url, 'POST', '/api/auth/pair', { 'content-type': 'application/json' }, JSON.stringify({ code: live.auth.issuePairingCode().code }))
+    const browser = { cookie: String(paired.headers['set-cookie']).split(';')[0] ?? '' }
+
+    const created = await raw(live.url, 'POST', '/api/providers', {
+      cookie: browser.cookie,
+      origin: live.auth.canonicalOrigin,
+      'content-type': 'application/json',
+      'x-dnt-harness-csrf': (JSON.parse(paired.body) as { csrf: string }).csrf,
+    }, JSON.stringify({ name: 'gw', baseUrl: 'https://gw.example/v1', apiKey: 'sk-secret-9876' }))
+    expect(created.status).toBe(201)
+
+    // The list stays masked, and a bearer may not read the key back at all.
+    const listed = await raw(live.url, 'GET', '/api/providers', browser)
+    expect(listed.body).toContain('••••9876')
+    expect(listed.body).not.toContain('sk-secret-9876')
+    const bearer = { authorization: `Bearer ${live.auth.issueBearer(['providers']).token}` }
+    expect((await raw(live.url, 'GET', '/api/providers/gw/key', bearer)).status).toBe(401)
+
+    const revealed = await raw(live.url, 'GET', '/api/providers/gw/key', browser)
+    expect(revealed.status).toBe(200)
+    expect(revealed.headers['cache-control']).toBe('no-store')
+    expect(JSON.parse(revealed.body)).toEqual({ apiKey: 'sk-secret-9876' })
+  })
+
   it('rejects a bearer mixed with a cookie and fences the old generation after logout', async () => {
     const live = await start()
     const code = live.auth.issuePairingCode().code

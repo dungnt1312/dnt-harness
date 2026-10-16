@@ -33,6 +33,15 @@ describe('global model aliases', () => {
     expect(describeRoleModel('fast', deps(broken))).toMatchObject({ alias: 'fast', inherit: false, blocked: true })
   })
 
+  it('role effort overrides parent and alias thinking only where the model can express it', () => {
+    const gpt = { ...alias('xhigh'), model: 'gpt-5.6' }
+    const withGpt = { ...deps(gpt), modelsOf: () => ['gpt-5.6', 'sonnet-4'], validate: () => undefined }
+    expect(resolveChildModel('fast', undefined, withGpt, 'low')).toEqual({ provider: 'p2', model: 'gpt-5.6', thinkingLevel: 'low' })
+    expect(resolveChildModel('p1:gpt-5.6', undefined, withGpt, 'medium')).toMatchObject({ thinkingLevel: 'medium' })
+    // Unknown model: the effort is not expressible, so the inherited level stands.
+    expect(resolveChildModel('p1:sonnet-4', undefined, withGpt, 'low')).toMatchObject({ thinkingLevel: 'medium' })
+  })
+
   it('deletion restores legacy bare-model semantics', () => {
     expect(resolveChildModel('fast', undefined, deps(null))).toEqual({ provider: 'p1', model: 'fast', thinkingLevel: 'medium' })
   })

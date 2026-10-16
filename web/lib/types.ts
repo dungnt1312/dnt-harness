@@ -119,6 +119,8 @@ export interface SseEvent {
   /** Estimated context tokens before/after a successful compaction/end. */
   readonly tokensBefore?: number
   readonly tokensAfter?: number
+  /** What each scalar above measured; absent on events that predate basis labels (estimates). */
+  readonly measurement?: CompactionMeasurementView
   /**
    * The stored summary itself on a successful compaction/end; on a hook
    * rewake (`origin: 'hook'`) the one line the user sees.
@@ -143,6 +145,16 @@ export interface SseEvent {
   readonly termination?: string
 }
 
+/** Where the composer/panel context figures stand for the open conversation. */
+export type ContextStatus = 'loading' | 'ready' | 'none' | 'error'
+
+/** Basis of a compaction's before/after token figures (`compaction/end.measurement`). */
+export interface CompactionMeasurementView {
+  readonly before?: { readonly tokens: number; readonly basis: 'reported' | 'estimated' }
+  readonly after?: { readonly tokens: number; readonly basis: 'reported' | 'estimated' }
+  readonly unavailableReason?: 'preview-failed'
+}
+
 /** Estimated tokens per request source; the fields sum to `usedTokens`. */
 export interface ContextBreakdownView {
   readonly systemPrompt: number
@@ -163,13 +175,25 @@ export interface ContextUsageView {
   readonly cachedInputTokens: number
 }
 
+export type ContextView = import('../../src/harness/context/context-state.ts').ContextResponse<ContextManifestView> & {
+  readonly policy?: { readonly automaticCompactionPressure: number }
+}
+
 /** What one assembled model request carried; the server's ContextManifest. */
 export interface ContextManifestView {
+  readonly contextId?: string
+  readonly display?: Exclude<import('../../src/harness/context/context-state.ts').ContextDisplayState, { kind: 'unavailable' }>
   readonly modeId: string
   readonly modeRevision: number
   readonly model?: string
   readonly provider?: string
-  readonly budget: { readonly availableTokens: number; readonly usedTokens: number; readonly contextLimitTokens?: number; readonly estimated: boolean }
+  readonly budget: {
+    readonly availableTokens: number; readonly usedTokens: number; readonly preTrimTokens?: number; readonly contextLimitTokens?: number; readonly estimated: boolean; readonly windowSource?: 'override'|'catalog'|'family'|'fallback'
+    /** Estimator id (`c3` = chars/3); absent on legacy manifests (chars/4). */
+    readonly estimator?: string
+    /** The count budget decisions used: estimate times the last provider ratio, or the estimate alone. */
+    readonly measured?: { readonly source: 'provider_usage' | 'estimate'; readonly tokens: number; readonly preTrimTokens: number; readonly baseContextId?: string; readonly ratio?: number }
+  }
   /** Estimated tokens per source of the last request; sums to `usedTokens`. */
   readonly breakdown?: ContextBreakdownView
   /** Provider-reported usage, when the provider streams it. */
@@ -296,6 +320,10 @@ export interface SessionListing {
   readonly status?: 'idle' | 'running' | 'cancelling'
   /** What the driver is busy with right now (model, tool, or approval). */
   readonly activity?: 'model' | 'tool' | null
+  /** A compaction is running on this conversation (it is not a turn, so `status` stays idle). */
+  readonly compacting?: boolean
+  /** An approval or AskUserQuestion on this conversation (or one of its subagents) waits for the user. */
+  readonly awaitingUser?: boolean
   /** Durably queued inputs waiting for a later turn. */
   readonly pendingInputs?: number
   /** Background Bash processes still running under this conversation. */
@@ -502,6 +530,8 @@ export interface AgentDefinitionRow {
     readonly disallowedTools: readonly string[]
     readonly skills?: readonly string[]
     readonly model?: string
+    /** Thinking level the role's children run at, over the conversation's. */
+    readonly effort?: string
     /** Claude fields recognized but not enforced by dnt-harness. */
     readonly unsupported?: readonly string[]
     /** Tools the file named that dnt-harness does not provide. */
@@ -576,7 +606,7 @@ export interface McpServerRow {
   readonly lastError?: string
   /** Discovered tools whose public name LLM providers reject; never sent to the model. */
   readonly unusableTools?: readonly string[]
-  /** Estimated tokens (chars/4) the exposed tool schemas add to each model request; present when ready with tools. */
+  /** Estimated tokens (chars/3) the exposed tool schemas add to each model request; present when ready with tools. */
   readonly toolSchemaTokens?: number
   /** Recent server stderr, secrets masked. */
   readonly stderrTail?: string

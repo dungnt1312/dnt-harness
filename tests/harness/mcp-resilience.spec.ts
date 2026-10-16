@@ -218,6 +218,9 @@ describe('Streamable HTTP 2025-06-18 rules', () => {
     const result = await client.callTool('alpha', {}, 3_000)
     expect(result.isError).toBe(false)
     expect(asked).toContain('token-1')
+    ;(client as unknown as { appendStderr: (text: string) => void }).appendStderr('token-1 token-2')
+    expect(client.recentStderr()).not.toContain('token-1')
+    expect(client.recentStderr()).not.toContain('token-2')
   })
 
   it('closes an SSE stream once its result arrived, even if the server keeps it open', async () => {

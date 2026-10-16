@@ -1,5 +1,14 @@
 import type { PresetId } from './types.ts'
 
+/**
+ * `git` plus any global options before the subcommand (`git -C repo`,
+ * `git --no-pager`, `git -c k=v`, `git --git-dir .git`). Case is spelled out
+ * so the case-sensitive branch rule can use it; an option value never starts
+ * with `-`, which keeps the repetition unambiguous (no backtracking blow-up).
+ */
+const GIT = String.raw`\b[Gg][Ii][Tt](?:\s+-[Cc]\s+[^\s-]\S*|\s+--(?:git-dir|work-tree|namespace)\s+[^\s-]\S*|\s+--?[a-zA-Z][\w-]*(?:=\S+)?)*\s+`
+const git = (rest: string, flags = 'i'): RegExp => new RegExp(GIT + rest, flags)
+
 export const PRESET_REGEXES: Record<PresetId, RegExp[]> = {
   fsDestructive: [
     /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\b/i,
@@ -17,22 +26,22 @@ export const PRESET_REGEXES: Record<PresetId, RegExp[]> = {
     /\bmv\s+.*\/\*/i,
   ],
   gitDestructive: [
-    /\bgit\s+reset\s+--hard\b/i,
-    /\bgit\s+push\s+.*--force/i,
+    git(String.raw`reset\s+--hard\b`),
+    git(String.raw`push\s+.*--force`),
     // Short force flag (alone or combined, e.g. `-uf`) and `+ref` force refspecs.
-    /\bgit\s+push\b[^|;&]*\s-[a-z]*f[a-z]*\b/i,
-    /\bgit\s+push\b[^|;&]*\s(?:\S+:)?\+\S/i,
-    /\bgit\s+clean\s+.*-f/i,
+    git(String.raw`push\b[^|;&]*\s-[a-z]*f[a-z]*\b`),
+    git(String.raw`push\b[^|;&]*\s(?:\S+:)?\+\S`),
+    git(String.raw`clean\s+.*-f`),
     // `git rm` without --cached deletes working-tree files (the matcher
     // rewrites its verb to `gitrm`; `--cached` only untracks and is not matched).
     /\bgitrm\b/i,
     // Force delete only: `-D` (alone or combined) or `--delete --force`.
     // Case-sensitive on the flag: `-d` is the safe, merged-only delete.
-    /\b[Gg][Ii][Tt]\s+branch\b[^|;&]*\s-[a-zA-Z]*D\b/,
-    /\bgit\s+branch\b[^|;&]*\s(?:--delete\b[^|;&]*\s(?:--force|-f)\b|(?:--force|-f)\b[^|;&]*\s(?:--delete|-d)\b)/i,
-    /\bgit\s+stash\s+(clear|drop)\b/i,
-    /\bgit\s+restore\b(?![^|]*--staged)/i,
-    /\bgit\s+checkout\s+--\s+\./i,
+    git(String.raw`branch\b[^|;&]*\s-[a-zA-Z]*D\b`, ''),
+    git(String.raw`branch\b[^|;&]*\s(?:--delete\b[^|;&]*\s(?:--force|-f)\b|(?:--force|-f)\b[^|;&]*\s(?:--delete|-d)\b)`),
+    git(String.raw`stash\s+(clear|drop)\b`),
+    git(String.raw`restore\b(?![^|]*--staged)`),
+    git(String.raw`checkout\s+--\s+\.`),
   ],
   systemPriv: [
     /\bsudo\b/i,

@@ -11,7 +11,7 @@ import { IconButton } from '../ui/IconButton.tsx'
 import { Markdown } from '../../Markdown.tsx'
 import { ThinkingPanel } from './ThinkingPanel.tsx'
 import { useHoldScroll } from '../../hooks/useStickToBottom.ts'
-import { budgetTone, compactionTokenChange, contextFill, formatBytes, formatElapsed, formatTime, formatTokenCount } from '../../lib/format.ts'
+import { budgetTone, compactionTokenChange, contextFill, fillBasisTitle, formatBytes, formatElapsed, formatTime, formatTokenCount } from '../../lib/format.ts'
 import { agentAction, exitIsAnswer, isDenied, mcpServerOf, readImageOf, toolFacts, type ToolFacts } from '../../lib/tool-facts.ts'
 import { PATH_LINK_ATTR, ansiToHtml } from '../../lib/ansi.ts'
 import { commandBase, freeTextLinker, rebase, searchLinker, type LineLinker, type PathRef } from '../../lib/path-links.ts'
@@ -1885,14 +1885,17 @@ export const CompactionMarker = memo(function CompactionMarker({ item }: {
     const id = window.setInterval(() => setNow(Date.now()), 1_000)
     return () => window.clearInterval(id)
   }, [ticking])
-  const facts = [
+  // The collapsed row carries only the outcome; how it was produced is one click away.
+  const headline = [
     item.status === 'completed' ? compactionTokenChange(item) : undefined,
+    item.durationMs !== undefined && item.status !== 'running' ? `${(item.durationMs / 1000).toFixed(1)}s` : undefined,
+  ].filter((fact) => fact !== undefined)
+  const details = [
     item.coversSeq !== undefined ? `through seq ${item.coversSeq}` : undefined,
     item.summaryChars !== undefined ? `${formatBytes(item.summaryChars)} summarized` : undefined,
     item.model !== undefined ? item.model : undefined,
     item.trigger !== undefined ? item.trigger : undefined,
     item.path === 'recovery' ? 'full transcript' : undefined,
-    item.durationMs !== undefined && item.status !== 'running' ? `${(item.durationMs / 1000).toFixed(1)}s` : undefined,
     item.requests !== undefined ? `${item.requests} ${item.requests === 1 ? 'request' : 'requests'}` : undefined,
   ].filter((fact) => fact !== undefined)
 
@@ -1932,15 +1935,18 @@ export const CompactionMarker = memo(function CompactionMarker({ item }: {
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
         title={item.ts !== undefined ? formatTime(item.ts) : undefined}
-        className="flex min-w-0 items-center gap-2 py-0.5 text-left text-xs text-fg-muted transition-colors hover:text-fg"
+        className="flex w-full min-w-0 items-start gap-2 py-0.5 text-left text-xs text-fg-muted transition-colors hover:text-fg"
       >
-        <Icon name="archive" size={13} className={cn('shrink-0', item.status === 'completed' ? 'text-fg-faint' : 'text-warn')} />
-        <span className="shrink-0">{label}</span>
-        {facts.map((fact) => <span key={fact} className="min-w-0 font-mono text-fg-faint">{fact}</span>)}
-        {item.summary !== undefined || item.error !== undefined
-          ? <Icon name="chevron" size={12} className={cn('ml-auto shrink-0 text-fg-faint transition-transform', open ? 'rotate-180' : '')} />
+        <Icon name="archive" size={13} className={cn('mt-px shrink-0', item.status === 'completed' ? 'text-fg-faint' : 'text-warn')} />
+        <span className="shrink-0 font-medium">{label}</span>
+        {headline.map((fact) => <span key={fact} className="shrink-0 whitespace-nowrap font-mono text-fg-faint">{fact}</span>)}
+        {details.length > 0 || item.summary !== undefined || item.error !== undefined
+          ? <Icon name="chevron" size={12} className={cn('ml-auto mt-0.5 shrink-0 text-fg-faint transition-transform', open ? 'rotate-180' : '')} />
           : null}
       </button>
+      {open && details.length > 0 ? (
+        <p className="m-0 mt-1 pl-[21px] font-mono text-[11px] leading-5 text-fg-faint">{details.join(' · ')}</p>
+      ) : null}
       {open && item.summary !== undefined ? (
         <div className="mt-1.5 rounded-xl border border-line bg-surface px-3 py-2.5">
           <p className="m-0 max-h-72 overflow-y-auto whitespace-pre-wrap break-words text-xs leading-5 text-fg-muted">{item.summary}</p>
@@ -2115,7 +2121,7 @@ export const ContextMarker = memo(function ContextMarker({ item, workspaceId, se
     ? 'none'
     : toolNames.length <= 8 ? toolNames.join(', ') : `${toolNames.slice(0, 8).join(', ')} +${toolNames.length - 8} more`
   const collapsedFacts = [
-    `${formatTokenCount(fill.used)} tok${fill.estimated ? ' est' : ''}`,
+    `${formatTokenCount(fill.used)} tok${fill.basis === 'estimated' ? ' est' : fill.basis === 'calibrated' ? ' cal' : ''}`,
     history.includedTurns > 0 ? `${history.includedTurns} turn${history.includedTurns === 1 ? '' : 's'}` : undefined,
     (item.requests ?? 1) > 1 ? `${item.requests} requests` : undefined,
     sources.skills.length > 0 ? `${sources.skills.length} skill${sources.skills.length === 1 ? '' : 's'}` : undefined,
@@ -2157,7 +2163,7 @@ export const ContextMarker = memo(function ContextMarker({ item, workspaceId, se
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
-        title={`${formatTokenCount(fill.used)}${fill.estimated ? ' estimated' : ' reported'} of ${formatTokenCount(fill.limit)} context used${item.ts !== undefined ? ` · ${formatTime(item.ts)}` : ''}`}
+        title={`${formatTokenCount(fill.used)}${` ${fill.basis}`} of ${formatTokenCount(fill.limit)} context used${item.ts !== undefined ? ` · ${formatTime(item.ts)}` : ''}`}
         className="group -ml-1.5 flex min-w-0 items-center gap-2 rounded-lg px-1.5 py-1 text-left text-xs text-fg-muted transition-colors hover:bg-hover hover:text-fg"
       >
         <Icon name="layers" size={13} className="shrink-0 text-fg-faint" />
@@ -2196,9 +2202,9 @@ export const ContextMarker = memo(function ContextMarker({ item, workspaceId, se
                 <span className="font-mono text-[13px] font-semibold text-fg">{formatTokenCount(fill.used)}/{formatTokenCount(fill.limit)} tok</span>
                 <span className={cn(
                   'rounded-full px-1.5 py-px font-mono text-[10px] font-semibold',
-                  fill.estimated ? 'bg-muted text-fg-faint' : 'bg-ok-soft text-ok',
-                )} title={fill.estimated ? 'Estimated (chars/4); the provider did not report usage' : 'Prompt tokens reported by the provider'}>
-                  {fill.estimated ? 'est' : 'reported'}
+                  fill.basis === 'estimated' ? 'bg-muted text-fg-faint' : 'bg-ok-soft text-ok',
+                )} title={fillBasisTitle(fill)}>
+                  {fill.basis === 'estimated' ? 'est' : fill.basis}
                 </span>
                 <span className={cn(
                   'font-mono text-[11px] font-semibold',

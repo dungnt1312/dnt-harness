@@ -357,8 +357,8 @@ function isPermissionKey(tool: string): boolean {
 export function parseModeFile(id: string, raw: string): ModeDefinition {
   const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(raw)
   const body = match !== null ? raw.slice(match[0].length) : raw
-  const frontmatter = match !== null ? parseFrontmatter(match[1] ?? '') : {}
   const invalid: string[] = []
+  const frontmatter = match !== null ? parseFrontmatter(match[1] ?? '', invalid) : {}
 
   for (const key of Object.keys(frontmatter)) {
     if (!KNOWN_FRONTMATTER_KEYS.has(key)) invalid.push(`unknown frontmatter key '${key}'`)
@@ -480,7 +480,7 @@ export function parseModeFile(id: string, raw: string): ModeDefinition {
   }
 }
 
-function parseFrontmatter(block: string): ModeFrontmatter {
+function parseFrontmatter(block: string, invalid: string[]): ModeFrontmatter {
   // A minimal `key: value` parser keeps mode files dependency-free; values
   // may be inline JSON arrays/objects.
   const result: Record<string, unknown> = {}
@@ -488,6 +488,8 @@ function parseFrontmatter(block: string): ModeFrontmatter {
     const match = /^([a-zA-Z][a-zA-Z0-9]*):\s*(.*)$/.exec(line.trim())
     if (match === null) continue
     const key = match[1] ?? ''
+    // Last-wins would silently pick one of two conflicting values.
+    if (Object.hasOwn(result, key)) invalid.push(`duplicate frontmatter key '${key}'`)
     const rawValue = match[2]?.trim() ?? ''
     try {
       result[key] = JSON.parse(rawValue) as unknown

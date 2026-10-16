@@ -1,6 +1,7 @@
 import { adoptPreparedCompaction, type AdoptionOptions, type CheckpointStore, type Restored } from '../harness/context/compaction.ts'
 import type { EffectiveCompactionSnapshot, SnapshotIdentity } from '../harness/context/compaction-snapshot.ts'
 import type { HarnessLimits } from '../harness/limits.ts'
+import { textOnlyVisionFallback } from '../harness/llm/adaptive-vision.ts'
 import type { ModelRequest, StreamEvent, StreamOptions, TokenUsage } from '../harness/llm/types.ts'
 import type { SessionEvent } from '../harness/session/events.ts'
 import type { Session } from '../harness/session/session.ts'
@@ -43,6 +44,17 @@ function retarget(snapshot: EffectiveCompactionSnapshot, now: SnapshotIdentity):
   }
 }
 
+/**
+ * The handoff as it is sent: retargeted to `now`, and without image parts for a text-only
+ * target (the handoff runs no tools, so the fallback must not point at one). The stored
+ * snapshot is untouched. Shared by the foreground host and the background candidates.
+ */
+export function handoffSnapshot(snapshot: EffectiveCompactionSnapshot, now: SnapshotIdentity, nativeVision: boolean): EffectiveCompactionSnapshot {
+  const retargeted = retarget(snapshot, now)
+  return nativeVision ? retargeted
+    : { ...retargeted, request: { ...retargeted.request, messages: textOnlyVisionFallback(retargeted.request.messages, false) } }
+}
+
 function hasOpenTurn(events: readonly SessionEvent[]): boolean {
   let open = false
   for (const event of events) {
@@ -82,7 +94,11 @@ export interface HostDeps {
   /** Background candidates of this session; absent when precompute is off. */
   readonly candidates?: Pick<CompactionPrecompute, 'waitPending' | 'invalidate' | 'blocked'>
   readonly contextWindowTokens: () => number | undefined
+  /** Whether the model selected now sees image pixels; a text-only target gets the snapshot without images. */
+  readonly nativeVision: () => boolean
   readonly measure: NonNullable<AdoptionOptions['measure']>
+  /** Throws unless the post-compaction request for the checkpoint at `cutoff` was measured and fits. */
+  readonly validateFit?: (cutoff: number) => void | Promise<void>
   /**
    * Bounded state to restore beside an adopted summary (task list, running work,
    * skills, current files). Only the effective path uses it; the legacy and
@@ -183,7 +199,7 @@ export class CompactionHost {
     // the user is never asked to pick a path.
     if (choice.kind === 'fold') return this.legacy(request, signal, 'recovery')
 
-    const snapshot = retarget(choice.snapshot, now)
+    const snapshot = handoffSnapshot(choice.snapshot, now, deps.nativeVision())
     const { path } = choice
     // A snapshot the current model's window cannot take with room for its answer (a switch to a
     // smaller model, a request that grew to the limit) is folded in pieces instead of failing.
@@ -225,6 +241,7 @@ export class CompactionHost {
       trigger: request.trigger,
       signal,
       validate: async () => {
+        await deps.validateFit?.(prepared.cutoff)
         const now = deps.identity()
         const was = prepared.identity
         if (now.provider !== was.provider || now.model !== was.model || now.thinkingLevel !== was.thinkingLevel || now.modeHash !== was.modeHash || now.grantsHash !== was.grantsHash || now.policyVersion !== was.policyVersion) {

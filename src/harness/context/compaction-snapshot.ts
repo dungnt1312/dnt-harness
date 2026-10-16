@@ -50,11 +50,13 @@ export interface EffectiveCompactionSnapshot {
   readonly identity: SnapshotIdentity
   /** Provider-reported input size of `request`, when one was reported. */
   readonly inputEvidence?: { readonly inputTokens: number; readonly outputTokens?: number }
+  /** Calibration ratio (`budget.measured.ratio`, ≥ 1) the builder assembled `request` under; reconstructed snapshots only. */
+  readonly estimateRatio?: number
 }
 
 const TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
   'id', 'v', 'policyVersion', 'sessionId', 'cutoff', 'turnId', 'request', 'finalAnswer',
-  'projection', 'sourceDigest', 'seedHash', 'identity', 'inputEvidence',
+  'projection', 'sourceDigest', 'seedHash', 'identity', 'inputEvidence', 'estimateRatio',
 ])
 const REQUEST_KEYS: ReadonlySet<string> = new Set(['model', 'providerName', 'thinkingLevel', 'messages', 'tools'])
 
@@ -78,6 +80,7 @@ export function validateSnapshot(snapshot: EffectiveCompactionSnapshot, events: 
   const request = candidate['request'] as Record<string, unknown> | null
   if (request === null || typeof request !== 'object' || !onlyKeys(request, REQUEST_KEYS) || !Array.isArray(request['messages'])) return refuse('unsupported-schema')
   if (typeof snapshot.id !== 'string' || typeof snapshot.sessionId !== 'string' || !Number.isSafeInteger(snapshot.cutoff)) return refuse('unsupported-schema')
+  if (snapshot.estimateRatio !== undefined && !(Number.isFinite(snapshot.estimateRatio) && snapshot.estimateRatio >= 1)) return refuse('unsupported-schema')
   if (snapshot.sourceDigest !== sourceDigest(events, snapshot.cutoff)) {
     // A cutoff that is not a completed boundary is the more useful reason.
     const eligible = assessProjection(events, snapshot.cutoff, snapshot.projection)

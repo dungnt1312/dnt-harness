@@ -1,16 +1,22 @@
 /** Display helpers: times, durations, and compact argument summaries. */
 
-import type { ContextManifestView } from './api.ts'
+import type { CompactionMeasurementView, ContextManifestView } from './api.ts'
+import { pressureTokensOf } from '../../src/harness/context/calibration.ts'
 
 /** Fill of the model's whole context window, shared by the meter and the panel. */
 export interface ContextFill {
-  /** Prompt tokens: provider-reported when present, otherwise the chars/4 estimate. */
+  /**
+   * Prompt tokens: provider-reported when present; otherwise the estimate
+   * scaled by the previous report's ratio; otherwise the plain estimate.
+   */
   readonly used: number
   /** The model's context window (`availableTokens` only when the window was not recorded). */
   readonly limit: number
   /** `used / limit`, clamped to 1. */
   readonly ratio: number
-  /** True when `used` is the builder's estimate rather than a provider count. */
+  /** Where `used` came from: the provider, the estimate scaled by the provider's last ratio, or the estimate. */
+  readonly basis: 'reported' | 'calibrated' | 'estimated'
+  /** True when `used` is not this request's own provider count (`basis !== 'reported'`). */
   readonly estimated: boolean
   /** Session cache hit rate, only when some request reported a cached share. */
   readonly cacheHitRate: number | undefined
@@ -132,10 +138,41 @@ export function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-/** `139k → 42k tokens`, or `undefined` when the compaction was not measured. */
-export function compactionTokenChange(change: { readonly tokensBefore?: number; readonly tokensAfter?: number }): string | undefined {
+/**
+ * `139k → 42k estimated tokens`, or `undefined` when the compaction was not
+ * measured. Equal bases are named once; a reported "before" and an estimated
+ * "after" are different tokenizers, so each side is labeled. Scalar-only
+ * (older) events carry no basis and count as estimates.
+ */
+export function compactionTokenChange(change: { readonly tokensBefore?: number; readonly tokensAfter?: number; readonly measurement?: CompactionMeasurementView }): string | undefined {
   if (change.tokensBefore === undefined || change.tokensAfter === undefined) return undefined
-  return `${formatTokenCount(change.tokensBefore)} → ${formatTokenCount(change.tokensAfter)} tokens`
+  const before = formatTokenCount(change.tokensBefore)
+  const after = formatTokenCount(change.tokensAfter)
+  const beforeBasis = change.measurement?.before?.basis ?? 'estimated'
+  const afterBasis = change.measurement?.after?.basis ?? 'estimated'
+  return beforeBasis === afterBasis ? `${before} → ${after} ${beforeBasis} tokens` : `${before} ${beforeBasis} → ${after} ${afterBasis} tokens`
+}
+
+/**
+ * How close the request was to the automatic-compaction trigger. This is the
+ * policy's own ratio (calibrated pre-trim count over the usable input budget), not the
+ * window ring. `undefined` when the host reported no policy.
+ */
+export function policyPressure(view: { readonly budget: ContextManifestView['budget']; readonly policy?: { readonly automaticCompactionPressure: number } }): { readonly ratio: number; readonly threshold: number } | undefined {
+  if (view.policy === undefined || view.budget.availableTokens <= 0) return undefined
+  return { ratio: pressureTokensOf(view.budget) / view.budget.availableTokens, threshold: view.policy.automaticCompactionPressure }
+}
+
+/** `78% of input budget · auto-compacts at 85%`. */
+export function formatPolicyPressure(pressure: { readonly ratio: number; readonly threshold: number }): string {
+  return `${Math.round(pressure.ratio * 100)}% of input budget · auto-compacts at ${Math.round(pressure.threshold * 100)}%`
+}
+
+/** Tooltip explaining where a context fill's count came from. */
+export function fillBasisTitle(fill: Pick<ContextFill, 'basis'>): string {
+  if (fill.basis === 'reported') return 'Prompt tokens reported by the provider'
+  if (fill.basis === 'calibrated') return 'Estimate (chars/3) scaled by the provider-measured ratio of the previous request; the provider has not reported this request yet'
+  return 'Estimated (chars/3); no provider count to calibrate against yet'
 }
 
 /** Compact token count for chips: 940, 18.4k, 65k, 256k, 1M, 1.5M. */
@@ -161,19 +198,24 @@ export function budgetTone(usedTokens: number, availableTokens: number): 'ok' | 
 /**
  * How full the model's context window was on the last request.
  * Denominator is the whole window, never the input budget left after the
- * output reserve and safety margin. Numerator is the provider's prompt
- * count when it reported one; otherwise the builder's chars/4 estimate.
+ * output reserve and safety margin. Numerator is the provider's prompt count
+ * when it reported one; before that, the builder's calibrated count (the
+ * estimate scaled by the last report's ratio, ZCode parity), so the number never drops
+ * back to a raw estimate between requests.
  */
 export function contextFill(manifest: ContextManifestView): ContextFill {
   const limit = manifest.budget.contextLimitTokens ?? manifest.budget.availableTokens
   const reported = manifest.usage?.last?.inputTokens
-  const used = reported ?? manifest.budget.usedTokens
+  const measured = manifest.budget.measured
+  const used = reported ?? measured?.tokens ?? manifest.budget.usedTokens
+  const basis = reported !== undefined ? 'reported' : measured?.source === 'provider_usage' ? 'calibrated' : 'estimated'
   const cacheable = manifest.usage?.cacheableInputTokens ?? 0
   return {
     used,
     limit,
     ratio: limit > 0 ? Math.min(used / limit, 1) : 0,
-    estimated: reported === undefined,
+    basis,
+    estimated: basis !== 'reported',
     cacheHitRate: cacheable > 0 ? (manifest.usage?.cachedInputTokens ?? 0) / cacheable : undefined,
   }
 }

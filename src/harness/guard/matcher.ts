@@ -1,7 +1,7 @@
 import type { DangerousCommandsConfig, GuardMatch, PresetId } from './types.ts'
 import { PRESET_REGEXES } from './presets.ts'
 import { PRESET_LABELS } from './defaults.ts'
-import { parseShell } from './shell-parse.ts'
+import { parseShell, splitExpansions } from './shell-parse.ts'
 import { maskDataText } from './data-text.ts'
 
 /**
@@ -79,7 +79,7 @@ function classifyGitRm(commands: string): string {
   return commands
     .split(/(\s*(?:;|&&|\|\||\||&)\s*)/)
     .map((segment) => {
-      const git = /^(\s*(?:sudo\s+)?git(?:\s+-[Cc]\s+\S+|\s+--?[a-z][\w-]*(?:=\S+)?)*\s+)rm\b(.*)$/i.exec(segment)
+      const git = /^(\s*(?:sudo\s+)?git(?:\s+-[Cc]\s+[^\s-]\S*|\s+--?[a-z][\w-]*(?:=\S+)?)*\s+)rm\b(.*)$/i.exec(segment)
       if (git === null) return segment
       // A substitution would run its own command; never exempt that text.
       if (/[`]|\$\(|[<>]\(/.test(segment)) return segment
@@ -118,9 +118,12 @@ function commandOperands(segment: string): string[] | undefined {
   const firstExpression = program.value === 'find'
     ? args.findIndex((word) => word.value.startsWith('-') || word.value === '(' || word.value === '!')
     : -1
+  // A find payload (`-exec rm -rf src {} +`) runs on its own operands.
+  if (program.value === 'find' && args.some((word) => ['-exec', '-execdir', '-ok', '-okdir'].includes(word.value))) return undefined
   const pathWords = firstExpression === -1 ? args : args.slice(0, firstExpression)
   let operands = pathWords.filter((word) => !word.value.startsWith('-') || word.value === '-')
-  if (operands.some((word) => word.expands)) return undefined
+  // A glob or brace word can expand to anything (`tmp/{../src,x}`), like `$`.
+  if (operands.some((word) => word.expands || word.glob)) return undefined
   if (program.value === 'git') {
     const skip = operands[0] !== undefined && GIT_NESTED.has(operands[0].value) ? 2 : 1
     operands = operands.slice(skip)
@@ -166,17 +169,26 @@ const PRESET_PRIORITY: PresetId[] = [
 
 export function matchCommand(command: string, config: DangerousCommandsConfig): GuardMatch | null {
   const normalized = normalizeCommand(command)
+  // `rm${IFS}-rf` / `rm$' '-rf` / `{rm,-rf,x}` run `rm -rf`: also test the
+  // text with expansions turned into word breaks (never for `allow` rules,
+  // which must not be manufactured by this over-approximation). Over the
+  // expansion bound the split text is unknown: tested as the plain text, and
+  // the command asks below if nothing else matches.
+  const rawSplit = splitExpansions(command)
+  const split = rawSplit === undefined ? normalized : normalizeCommand(rawSplit)
 
   for (const rule of config.customRules) {
+    const texts = rule.action === 'allow' || split === normalized ? [normalized] : [normalized, split]
     let hit = false
     if (rule.isRegex) {
       try {
-        hit = new RegExp(rule.pattern, 'i').test(normalized)
+        const rx = new RegExp(rule.pattern, 'i')
+        hit = texts.some((text) => rx.test(text))
       } catch {
         hit = false
       }
     } else {
-      hit = normalized.toLowerCase().includes(rule.pattern.toLowerCase())
+      hit = texts.some((text) => text.toLowerCase().includes(rule.pattern.toLowerCase()))
     }
     if (hit) {
       return {
@@ -192,11 +204,18 @@ export function matchCommand(command: string, config: DangerousCommandsConfig): 
   // historical single-space form they were authored against), and skip text
   // that is only data: commit messages and heredocs fed to `cat`/`git`/`gh`.
   const commands = classifyGitRm(normalizeCommand(maskDataText(command), ' ; '))
+  const maskedSplit = splitExpansions(maskDataText(command))
+  const splitCommands = maskedSplit === undefined ? commands : classifyGitRm(normalizeCommand(maskedSplit, ' ; '))
+  const unknown = rawSplit === undefined || maskedSplit === undefined
   for (const id of PRESET_PRIORITY) {
     if (config.presets[id] === 'off') continue
     const regexes = PRESET_REGEXES[id]
-    const matched = regexes.find((rx) => rx.test(commands))
-    if (matched && !exemptByPaths(commands, regexes, config.exceptions?.[id])) {
+    const matched = regexes.find((rx) => rx.test(commands) || rx.test(splitCommands))
+    // Exempt only when both spellings are exempt: a command visible only in
+    // the split text has no hit in `commands`, so it keeps the match.
+    const exempt = matched !== undefined && !unknown && exemptByPaths(commands, regexes, config.exceptions?.[id])
+      && (splitCommands === commands || exemptByPaths(splitCommands, regexes, config.exceptions?.[id]))
+    if (matched && !exempt) {
       return {
         presetId: id,
         action: config.presets[id],
@@ -206,5 +225,8 @@ export function matchCommand(command: string, config: DangerousCommandsConfig): 
     }
   }
 
+  if (unknown) {
+    return { ruleId: 'unanalyzable-expansion', action: 'ask', reason: 'brace expansion too large to analyze', pattern: '' }
+  }
   return null
 }

@@ -106,6 +106,8 @@ export interface ToolSchema {
 
 /** One model request, projected from the session log by `deriveMessages()`. */
 export interface ModelRequest {
+  /** Host-only identity of one assembled context; never serialized to the provider. */
+  readonly contextId?: string
   /** Host-only assembly scope; hooks must check after awaits before side effects. Never serialized. */
   readonly assemblySignal?: AbortSignal
   /** Provider-specific model name; providers apply their own default. */
@@ -139,6 +141,12 @@ export interface ModelRequest {
    * Absent keeps ordinary behavior. Invalid values are ignored.
    */
   readonly maxOutputTokens?: number
+  /**
+   * Host-only ceiling (remaining context window after input and margin). It
+   * lowers a cap the adapter would send anyway but never invents one, so a
+   * model with no known output limit keeps the gateway default.
+   */
+  readonly outputCeilingTokens?: number
 }
 
 export type ModelFinishReason = 'stop' | 'tool_calls' | 'length' | 'content_filter' | 'error' | 'unknown'

@@ -73,6 +73,10 @@ async function waitFor<T>(probe: () => Promise<T | undefined>, what: string): Pr
   throw new Error(`timed out waiting for ${what}`)
 }
 
+/** The file's text once non-empty: Write creates the file before filling it, so '' is not done yet. */
+const fileText = (file: string): Promise<string | undefined> =>
+  fs.readFile(file, 'utf8').then((text) => text || undefined, () => undefined)
+
 beforeEach(async () => {
   gate = new Promise<void>((resolve) => { release = resolve })
   base = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-lease-')))
@@ -107,7 +111,7 @@ describe('cross-root file independence', () => {
     await send('PUT', `${url}/api/workspaces/${wsId}/sessions/${sessionX}/grants`, { expectedRevision: 0, roots: [{ path: rootY, access: 'write' }] })
     // Y's own turn writes into Y and stays busy; it cannot own the folder.
     await send('POST', `${url}/api/workspaces/${wsId}/sessions/${sessionY}/messages`, { content: `write ${path.join(rootY, 'own.txt')} hold` })
-    await waitFor(() => fs.readFile(path.join(rootY, 'own.txt'), 'utf8').catch(() => undefined), "Y's write")
+    await waitFor(() => fileText(path.join(rootY, 'own.txt')), "Y's write")
 
     await send('POST', `${url}/api/workspaces/${wsId}/sessions/${sessionX}/messages`, { content: `write ${path.join(rootY, 'from-x.txt')}` })
     const eventsX = `${url}/api/workspaces/${wsId}/sessions/${sessionX}/events`
@@ -121,7 +125,7 @@ describe('cross-root file independence', () => {
     const { url, wsId, sessionX, sessionY } = await setup('edit-automatically')
     await send('PUT', `${url}/api/workspaces/${wsId}/sessions/${sessionX}/grants`, { expectedRevision: 0, roots: [{ path: rootY, access: 'read' }] })
     await send('POST', `${url}/api/workspaces/${wsId}/sessions/${sessionY}/messages`, { content: `write ${path.join(rootY, 'own.txt')} hold` })
-    await waitFor(() => fs.readFile(path.join(rootY, 'own.txt'), 'utf8').catch(() => undefined), "Y's write")
+    await waitFor(() => fileText(path.join(rootY, 'own.txt')), "Y's write")
 
     await send('POST', `${url}/api/workspaces/${wsId}/sessions/${sessionX}/messages`, { content: `read ${path.join(rootY, 'own.txt')}` })
     const result = await waitFor(async () => (await toolResults(`${url}/api/workspaces/${wsId}/sessions/${sessionX}/events`))[0], "X's read")
@@ -136,7 +140,7 @@ describe('cross-root file independence', () => {
     await new Promise((resolve) => setTimeout(resolve, 300))
     // Meanwhile Y writes into its own folder unhindered.
     await send('POST', `${url}/api/workspaces/${wsId}/sessions/${sessionY}/messages`, { content: `write ${path.join(rootY, 'own.txt')}` })
-    expect(await waitFor(() => fs.readFile(path.join(rootY, 'own.txt'), 'utf8').catch(() => undefined), "Y's write")).toBe('x')
+    expect(await waitFor(() => fileText(path.join(rootY, 'own.txt')), "Y's write")).toBe('x')
   }, 20_000)
 
   it('the deprecated WorkspaceService lease API still has its legacy hierarchy (not used by ordinary tools)', async () => {

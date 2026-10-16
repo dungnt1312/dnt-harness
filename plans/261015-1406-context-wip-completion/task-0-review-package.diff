@@ -1,0 +1,406 @@
+# Task 0 review package
+
+2779275 Merge branch 'main' into fix/context-accounting
+69bbc2d wip(context): context accounting tasks 1-7 (pre-merge checkpoint)
+
+## remerge-diff (how conflicts were resolved vs automatic merge)
+commit 2779275c328e4fdaa147c79ff850e92faa1805a3
+Merge: 69bbc2d 709c562
+Author:     DungNT <dnguyen@softel.vn>
+AuthorDate: Thu Oct 15 14:39:34 2026 +0700
+Commit:     DungNT <dnguyen@softel.vn>
+CommitDate: Thu Oct 15 14:39:34 2026 +0700
+
+    Merge branch 'main' into fix/context-accounting
+    
+    # Conflicts:
+    #       src/harness/context/compaction.ts
+    #       src/web/server.ts
+    #       web/components/composer/ContextMeter.tsx
+    #       web/components/layout/ContextPanel.tsx
+
+diff --git a/src/harness/context/compaction.ts b/src/harness/context/compaction.ts
+remerge CONFLICT (content): Merge conflict in src/harness/context/compaction.ts
+index 2559be3..3956d84 100644
+--- a/src/harness/context/compaction.ts
++++ b/src/harness/context/compaction.ts
+@@ -210,14 +210,10 @@ export interface CompactionOptions {
+    * Estimates the context size before and after the new checkpoint, for the
+    * success event. Advisory: a throw or `undefined` just omits the figures.
+    */
+-<<<<<<< 69bbc2d (wip(context): context accounting tasks 1-7 (pre-merge checkpoint))
+   readonly measure?: (checkpoint: { readonly summary: string; readonly coversSeq: number }) => CompactionMeasurement | undefined | Promise<CompactionMeasurement | undefined>
+   readonly validate?: () => Promise<void>
+-=======
+-  readonly measure?: (checkpoint: { readonly summary: string; readonly coversSeq: number }) => { readonly tokensBefore: number; readonly tokensAfter: number } | undefined
+   /** Forwarded to the summarizer: fold progress, `done` of `total` chunk summaries. */
+   readonly onProgress?: (done: number, total: number) => void
+->>>>>>> 709c562 (feat(web): composer chip, MCP settings, turn changes view and preview refinements)
+ }
+ const inFlight = new Set<string>()
+ 
+diff --git a/src/web/server.ts b/src/web/server.ts
+remerge CONFLICT (content): Merge conflict in src/web/server.ts
+index 00775e3..778f963 100644
+--- a/src/web/server.ts
++++ b/src/web/server.ts
+@@ -181,19 +181,13 @@ import { assertFitsWindow } from './compaction-generator.ts'
+ import { CaptureRegistry, identityOf, requestPrefixHash } from './compaction-wiring.ts'
+ import { loadReferencedSnapshot } from './compaction-restart.ts'
+ import { snapshotHash } from '../harness/context/compaction-snapshot.ts'
+-<<<<<<< 69bbc2d (wip(context): context accounting tasks 1-7 (pre-merge checkpoint))
+-import type { RecoveryConfirmation } from './compaction-source.ts'
+-import { CacheAwareCompactionFallback, createCacheAwareCompactionSummarizer, createCompactionSummarizer } from './llm-summarizer.ts'
++import { CacheAwareCompactionFallback, createCacheAwareCompactionSummarizer, createCompactionSummarizer, MAX_PARALLEL } from './llm-summarizer.ts'
+ import { DEFAULT_BUDGET, resolveModelBudget, schemaCost, type ResolvedBudget } from '../harness/context/budget.ts'
+-import type { BuildContextInput } from '../harness/context/builder.ts'
++import type { BuildContextInput, PreviewCompaction } from '../harness/context/builder.ts'
+ import type { CompactionMeasurement } from '../harness/session/events.ts'
+ import type { Restored } from '../harness/context/compaction.ts'
+ import { deriveContextState, isAvailableContext } from '../harness/context/context-state.ts'
+ import { isValidTokenUsage } from '../harness/context/context-metrics.ts'
+-=======
+-import { CacheAwareCompactionFallback, createCacheAwareCompactionSummarizer, createCompactionSummarizer, MAX_PARALLEL } from './llm-summarizer.ts'
+-import { DEFAULT_BUDGET, schemaCost, type ResolvedBudget } from '../harness/context/budget.ts'
+->>>>>>> 709c562 (feat(web): composer chip, MCP settings, turn changes view and preview refinements)
+ import { CommandsService } from '../harness/commands/service.ts'
+ import { PluginService } from '../harness/plugins/service.ts'
+ import { PluginError } from '../harness/plugins/manifest.ts'
+@@ -981,12 +975,10 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
+     return { provider: id, model }
+   }
+ 
+-  /** The context window of a pair: the operator's override (verified), else the catalog's documented estimate. */
+-  const contextWindowOf = (provider: string, model: string): { readonly tokens: number; readonly verified: boolean } => {
+-    const configured = list.find((entry) => entry.id === provider)?.modelSettings?.[model]?.contextTokens
+-    return configured !== undefined && Number.isFinite(configured) && configured > 0
+-      ? { tokens: configured, verified: true }
+-      : { tokens: resolveContextLimit(model), verified: false }
++  /** The budget of a pair: the operator's override (verified), else the catalog's documented window. */
++  const modelBudgetOf = (provider: string | undefined, model: string): ResolvedBudget => {
++    const configured = provider === undefined ? undefined : list.find((entry) => entry.id === provider)?.modelSettings?.[model]?.contextTokens
++    return resolveModelBudget({ model, ...(configured !== undefined ? { contextTokens: configured } : {}) })
+   }
+ 
+   /**
+@@ -1495,14 +1487,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
+         // The tail that closed after the cutoff stays verbatim, so it is part of `now`: a
+         // candidate whose result is not smaller by the minimum is not worth a checkpoint.
+         if (was - now < MIN_CANDIDATE_GAIN_TOKENS) return 'no-gain'
+-<<<<<<< 69bbc2d (wip(context): context accounting tasks 1-7 (pre-merge checkpoint))
+-        const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
+-        const window = effective.model === null || effective.model === undefined ? undefined : resolveModelBudget({ model: effective.model,
+-          ...(effective.provider != null && list.find(p => p.id === effective.provider)?.modelSettings?.[effective.model]?.contextTokens !== undefined
+-            ? { contextTokens: list.find(p => p.id === effective.provider)!.modelSettings![effective.model]!.contextTokens! } : {}) }).contextLimitTokens
+-=======
+         const window = compactionWindowOf(entry)
+->>>>>>> 709c562 (feat(web): composer chip, MCP settings, turn changes view and preview refinements)
+         if (window !== undefined && now > window - limits.compactionOutputTokens) return 'no-fit'
+         return undefined
+       },
+@@ -1528,7 +1513,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
+   const compactionWindowOf = (entry: SessionEntry): number | undefined => {
+     const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
+     if (effective.model === null || effective.model === undefined) return undefined
+-    return effective.provider === null || effective.provider === undefined ? resolveContextLimit(effective.model) : contextWindowOf(effective.provider, effective.model).tokens
++    return modelBudgetOf(effective.provider ?? undefined, effective.model).contextLimitTokens
+   }
+ 
+   /** The identity a snapshot must have been built for, from what the server holds right now. */
+@@ -1566,26 +1551,22 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
+       ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}) }
+     const signal = new AbortController().signal
+     const schemas = agentScope.run(scope, () => kernel.ctx.tools.schemas())
+-    const prepared = await prepareHostContext({ messages: [], tools: schemas, assemblySignal: signal }, scope, { checkpoint: next, signal })
+-    try {
+-      const contextAfter = buildContextPreview(prepared.input, { checkpoint: next,
+-        ...(restored !== undefined ? { restoration: restored } : {}), protectUncoveredHistory: limits.compactionEffectiveEnabled }) .manifest
+-      compactPreviews.set(entry.session.id, prepared)
+-      compactFitFailures.delete(entry.session.id)
+-      const previous = deriveContextState(entry.session.committedEvents, entry.session.id)
+-      const before = previous !== null && isAvailableContext(previous) ? previous : undefined
+-      const reported = before?.usage?.last?.inputTokens
+-      const tokensBefore = reported ?? before?.budget.usedTokens
+-      const tokensAfter = contextAfter.budget.usedTokens
+-      return { contextEffect: 'replaced', contextAfter, tokensAfter,
+-        ...(tokensBefore !== undefined ? { tokensBefore } : {}),
+-        measurement: { after: { tokens: tokensAfter, basis: 'estimated' },
+-          ...(tokensBefore !== undefined ? { before: { tokens: tokensBefore, basis: reported !== undefined ? 'reported' : 'estimated',
+-            ...(before?.contextId !== undefined ? { contextId: before.contextId } : {}) } } : {}) } }
+-    } catch (error) {
+-      compactFitFailures.set(entry.session.id, error instanceof Error ? error : new Error('compaction-preview-no-fit'))
+-      throw error
+-    }
++    // A failed preview build records itself in `compactFitFailures` (inside assembleRequest).
++    const prepared = await assembleRequest({ scope, projected: { messages: [], tools: schemas, assemblySignal: signal }, sideEffects: false,
++      preview: { checkpoint: next, ...(restored !== undefined ? { restoration: restored } : {}), protectUncoveredHistory: limits.compactionEffectiveEnabled } })
++    const contextAfter = prepared.assembled.manifest
++    compactPreviews.set(entry.session.id, prepared)
++    compactFitFailures.delete(entry.session.id)
++    const previous = deriveContextState(entry.session.committedEvents, entry.session.id)
++    const before = previous !== null && isAvailableContext(previous) ? previous : undefined
++    const reported = before?.usage?.last?.inputTokens
++    const tokensBefore = reported ?? before?.budget.usedTokens
++    const tokensAfter = contextAfter.budget.usedTokens
++    return { contextEffect: 'replaced', contextAfter, tokensAfter,
++      ...(tokensBefore !== undefined ? { tokensBefore } : {}),
++      measurement: { after: { tokens: tokensAfter, basis: 'estimated' },
++        ...(tokensBefore !== undefined ? { before: { tokens: tokensBefore, basis: reported !== undefined ? 'reported' : 'estimated',
++          ...(before?.contextId !== undefined ? { contextId: before.contextId } : {}) } } : {}) } }
+   }
+   kernel.ctx.on('session/event', (session, event) => {
+     if (event.type !== 'compaction/end') return
+@@ -1700,19 +1681,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
+         },
+         limits,
+         ...(candidates !== undefined ? { candidates } : {}),
+-<<<<<<< 69bbc2d (wip(context): context accounting tasks 1-7 (pre-merge checkpoint))
+-        contextWindowTokens: () => {
+-          const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
+-          return effective.model === null || effective.model === undefined ? undefined : resolveModelBudget({ model: effective.model,
+-          ...(effective.provider != null && list.find(p => p.id === effective.provider)?.modelSettings?.[effective.model]?.contextTokens !== undefined
+-            ? { contextTokens: list.find(p => p.id === effective.provider)!.modelSettings![effective.model]!.contextTokens! } : {}) }).contextLimitTokens
+-        },
++        contextWindowTokens: () => compactionWindowOf(entry),
+         measure: (next, standing, restored) => measureCheckpoint(entry, next, standing, undefined, restored),
+         validateFit: () => { const error = compactFitFailures.get(sessionId); if (error !== undefined) throw error },
+-=======
+-        contextWindowTokens: () => compactionWindowOf(entry),
+-        measure: (next, standing, restoredTokens) => measureCheckpoint(entry, next, standing, undefined, restoredTokens),
+->>>>>>> 709c562 (feat(web): composer chip, MCP settings, turn changes view and preview refinements)
+         // The session's folder grant as it is NOW (not when the work was done), so a folder
+         // revoked since is never read back into context.
+         restore: async (cutoff, restoreSignal) => {
+@@ -1848,14 +1819,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
+       if (pressure < limits.compactionPrecomputePressure) return
+       const standing = recoverCanonicalCheckpoint(entry.session.committedEvents)
+       if (standing !== undefined && standing.coversSeq >= snapshot.cutoff) return
+-<<<<<<< 69bbc2d (wip(context): context accounting tasks 1-7 (pre-merge checkpoint))
+-      const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
+-      const window = effective.model === null || effective.model === undefined ? undefined : resolveModelBudget({ model: effective.model,
+-          ...(effective.provider != null && list.find(p => p.id === effective.provider)?.modelSettings?.[effective.model]?.contextTokens !== undefined
+-            ? { contextTokens: list.find(p => p.id === effective.provider)!.modelSettings![effective.model]!.contextTokens! } : {}) }).contextLimitTokens
+-=======
+       const window = compactionWindowOf(entry)
+->>>>>>> 709c562 (feat(web): composer chip, MCP settings, turn changes view and preview refinements)
+       assertFitsWindow(snapshot, { ...(window !== undefined ? { contextWindowTokens: window } : {}), outputTokens: limits.compactionOutputTokens })
+       candidates.start(snapshot, candidateLifetime.signal)
+     } catch {
+@@ -3596,9 +3560,6 @@ ${entry.description}`.toLowerCase().includes(query))
+   // G3 single assembly path: the mode-driven builder replaces the projected
+   // request wholesale. Effective permission is the selected mode's map; host
+   // restrictions stay above it.
+-<<<<<<< 69bbc2d (wip(context): context accounting tasks 1-7 (pre-merge checkpoint))
+-  const prepareHostContext = async (projected: ModelRequest, scope: AgentScope | undefined, preview?: { checkpoint: { summary: string; coversSeq: number }; signal: AbortSignal }) => {
+-=======
+   kernel.ctx.on('agent/context', async (projected, next) => {
+     const { request } = await assembleRequest({ scope: agentScope.getStore(), projected, sideEffects: true })
+     return next(request)
+@@ -3609,22 +3570,25 @@ ${entry.description}`.toLowerCase().includes(query))
+    * rebuilds from the log. `projected` carries the tool schemas, the abort signal and any squeeze.
+    * `events` replaces the session's log (a reconstruction passes the prefix through its cutoff).
+    * With `sideEffects: false` nothing outside the result changes: no manifest, no log append, no
+-   * meter reset, no capture, no session cache, and an MCP failure throws instead of fencing.
++   * meter reset, no capture, no session cache, no `contextId`, no command model, and an MCP
++   * failure throws instead of fencing. `preview` builds the post-compaction context instead; its
++   * prefix copy is installed only by `commitPrefix` once the checkpoint is durable.
+    */
+   async function assembleRequest(input: {
+     readonly scope: AgentScope | undefined
+     readonly projected: ModelRequest
+     readonly events?: readonly SessionEvent[]
+     readonly sideEffects: boolean
+-  }): Promise<{ assembled: ReturnType<typeof buildContext>; request: ModelRequest }> {
+-    const { scope, projected, sideEffects } = input
+->>>>>>> 709c562 (feat(web): composer chip, MCP settings, turn changes view and preview refinements)
++    readonly preview?: PreviewCompaction
++  }): Promise<{ assembled: ReturnType<typeof buildContext>; request: ModelRequest; commitPrefix: () => void }> {
++    const { scope, projected, sideEffects, preview } = input
+     const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
+     const session = await scopedSession(scope?.sessionId)
+     let effective = session === undefined
+       ? { provider: defaults.provider, model: defaults.model, thinkingLevel: defaults.thinkingLevel, source: 'global' as const }
+       : resolveEffectiveModel(session, workspaceId)
+-    const commandModel = preview === undefined && scope?.childOf === undefined ? turnCommandGrants.model(scope?.sessionId) : undefined
++    // A slash command's model applies to the turn it dispatches, never to a preview or reconstruction.
++    const commandModel = sideEffects && scope?.childOf === undefined ? turnCommandGrants.model(scope?.sessionId) : undefined
+     if (commandModel !== undefined && session !== undefined) {
+       try {
+         const picked = childModelFor(session, workspaceId, undefined, commandModel)
+@@ -3649,15 +3613,7 @@ ${entry.description}`.toLowerCase().includes(query))
+       // Child overrides share this resolver, so context, manifest budget, and
+       // request dispatch all reject an unavailable effective pair identically.
+       validateProviderModel(effective.provider, effective.model)
+-<<<<<<< 69bbc2d (wip(context): context accounting tasks 1-7 (pre-merge checkpoint))
+-      const configured = list
+-        .find((entry) => entry.id === effective.provider)
+-        ?.modelSettings?.[effective.model]?.contextTokens
+-      return resolveModelBudget({ model: effective.model, ...(configured !== undefined ? { contextTokens: configured } : {}) })
+-=======
+-      const window = contextWindowOf(effective.provider, effective.model)
+-      return { contextLimitTokens: window.tokens, outputReserveTokens: DEFAULT_BUDGET.outputReserveTokens, marginTokens: DEFAULT_BUDGET.marginTokens, verified: window.verified }
+->>>>>>> 709c562 (feat(web): composer chip, MCP settings, turn changes view and preview refinements)
++      return modelBudgetOf(effective.provider, effective.model)
+     })()
+ 
+     // Exposure-filtered schemas: static mode ceiling + G5 dynamic MCP
+@@ -3696,6 +3652,8 @@ ${entry.description}`.toLowerCase().includes(query))
+ 
+     // The session's copy of the often-edited prefix sources (see
+     // `prefixSnapshots`): re-read only when the prefix moves anyway.
++    // A preview fills a private copy that `commitPrefix` installs once the checkpoint is durable.
++    const fillsSnapshot = sideEffects || preview !== undefined
+     const snapshot = ((): PrefixSnapshot | undefined => {
+       if (scope === undefined) return undefined
+       // The Sources revision rides in the key: switching a layer on or off
+@@ -3703,15 +3661,11 @@ ${entry.description}`.toLowerCase().includes(query))
+       const sourcesRevision = scope.workspaceId !== undefined ? skills.sourcesStore.revision(scope.workspaceId) : 0
+       const key = `${scope.projectId ?? ''}\u0000${preview?.checkpoint.coversSeq ?? compaction?.coversSeq ?? 0}\u0000${sourcesRevision}`
+       const current = prefixSnapshots.get(scope.sessionId)
+-<<<<<<< 69bbc2d (wip(context): context accounting tasks 1-7 (pre-merge checkpoint))
+       if (current !== undefined && current.key === key) return preview !== undefined ? { ...current } : current
+-=======
+-      if (current !== undefined && current.key === key) return current
+       // A reconstruction reads the session's copy when it matches, but never replaces it.
+-      if (!sideEffects) return undefined
+->>>>>>> 709c562 (feat(web): composer chip, MCP settings, turn changes view and preview refinements)
++      if (!fillsSnapshot) return undefined
+       const fresh: PrefixSnapshot = { key }
+-      if (preview === undefined) prefixSnapshots.set(scope.sessionId, fresh)
++      if (sideEffects) prefixSnapshots.set(scope.sessionId, fresh)
+       return fresh
+     })()
+ 
+@@ -3730,7 +3684,7 @@ ${entry.description}`.toLowerCase().includes(query))
+               const description = entry.description === '' ? entry.title : entry.description
+               return { name: entry.name, description: description.length > 500 ? `${description.slice(0, 499)}…` : description }
+             })
+-            if (sideEffects && snapshot !== undefined) snapshot.skillCatalog = catalog
++            if (fillsSnapshot && snapshot !== undefined) snapshot.skillCatalog = catalog
+             return catalog
+           })
+           .catch(() => undefined)
+@@ -3778,7 +3732,7 @@ ${entry.description}`.toLowerCase().includes(query))
+       // `memoryIndexes` degrades a read failure to []: never pin that, or one
+       // transient error would hide memory for the session. An empty index is
+       // re-read (cheap) until the first entry exists.
+-      if (sideEffects && snapshot !== undefined && indexes.length > 0) snapshot.memory = indexes
++      if (fillsSnapshot && snapshot !== undefined && indexes.length > 0) snapshot.memory = indexes
+       pinnedMemory.push(...indexes)
+     }
+ 
+@@ -3801,7 +3755,7 @@ ${entry.description}`.toLowerCase().includes(query))
+       pinnedMemory.unshift(memoryGuidance(fileScope.memoryRoots, guidanceAccess))
+     }
+     const environment = await environmentBlockFor(scope, fileScope).catch(() => undefined)
+-    const input: BuildContextInput = {
++    const buildInput: BuildContextInput = {
+       nativeVision,
+       ...(fileScope !== undefined
+         ? {
+@@ -3841,27 +3795,21 @@ ${entry.description}`.toLowerCase().includes(query))
+       ...(scope?.childOf === undefined && scope?.role !== undefined
+         ? { rootRole: { definition: scope.role.definition, instructions: scope.role.instructions, ...(scope.role.definitionSource !== undefined ? { source: scope.role.definitionSource } : {}) } }
+         : {}),
+-<<<<<<< 69bbc2d (wip(context): context accounting tasks 1-7 (pre-merge checkpoint))
+     }
+-    return { input, session, snapshot, controls: {
+-      ...(effective.model != null ? { model: effective.model } : {}),
+-      ...(effective.provider != null ? { providerName: effective.provider } : {}),
+-      ...(thinkingLevel != null ? { thinkingLevel } : {}),
+-    }, commitPrefix: () => { if (scope !== undefined && snapshot !== undefined) prefixSnapshots.set(scope.sessionId, snapshot) } }
+-  }
+-
+-  kernel.ctx.on('agent/context', async (projected, next) => {
+-    const scope = agentScope.getStore()
+-    const prepared = await prepareHostContext(projected, scope)
+-    const { session } = prepared
+-    const contextId = randomUUID()
+-    const built = buildContext(prepared.input)
+-    const assembled = { ...built, manifest: { ...built.manifest, contextId } }
+-    if (scope !== undefined) {
+-=======
+-    })
++    const commitPrefix = (): void => { if (scope !== undefined && snapshot !== undefined) prefixSnapshots.set(scope.sessionId, snapshot) }
++    let built: ReturnType<typeof buildContext>
++    if (preview === undefined) built = buildContext(buildInput)
++    else {
++      try { built = buildContextPreview(buildInput, preview) } catch (error) {
++        // The post-compaction context does not fit: the host's validateFit refuses the checkpoint.
++        if (scope !== undefined) compactFitFailures.set(scope.sessionId, error instanceof Error ? error : new Error('compaction-preview-no-fit'))
++        throw error
++      }
++    }
++    // Only a dispatched request gets an identity and pinned controls; `agent/request` skips re-resolving it.
++    const contextId = sideEffects ? randomUUID() : undefined
++    const assembled = contextId === undefined ? built : { ...built, manifest: { ...built.manifest, contextId } }
+     if (sideEffects && scope !== undefined) {
+->>>>>>> 709c562 (feat(web): composer chip, MCP settings, turn changes view and preview refinements)
+       lastManifests.set(scope.sessionId, assembled.manifest)
+       if (scope.turnId !== undefined) manifestTurns.set(scope.sessionId, scope.turnId)
+       // Any new root request supersedes the previous cache prefix until this
+@@ -3914,18 +3862,17 @@ ${entry.description}`.toLowerCase().includes(query))
+     }
+     // Replace wholesale: when the mode exposes nothing, tools must LEAVE the
+     // request — a spread of `projected` would resurrect the full schema list.
+-<<<<<<< 69bbc2d (wip(context): context accounting tasks 1-7 (pre-merge checkpoint))
+-    const replacement: typeof projected = { ...projected, ...prepared.controls, contextId, messages: assembled.messages }
+-    if (assembled.tools !== undefined) {
+-      return next({ ...replacement, tools: assembled.tools })
+-    }
+-=======
+-    const replacement: ModelRequest = { ...projected, messages: assembled.messages }
+-    if (assembled.tools !== undefined) return { assembled, request: { ...replacement, tools: assembled.tools } }
+->>>>>>> 709c562 (feat(web): composer chip, MCP settings, turn changes view and preview refinements)
++    const controls = contextId === undefined ? {} : {
++      ...(effective.model != null ? { model: effective.model } : {}),
++      ...(effective.provider != null ? { providerName: effective.provider } : {}),
++      ...(thinkingLevel != null ? { thinkingLevel } : {}),
++      contextId,
++    }
++    const replacement: ModelRequest = { ...projected, ...controls, messages: assembled.messages }
++    if (assembled.tools !== undefined) return { assembled, request: { ...replacement, tools: assembled.tools }, commitPrefix }
+     const { tools: _dropped, ...withoutTools } = replacement
+     void _dropped
+-    return { assembled, request: withoutTools }
++    return { assembled, request: withoutTools, commitPrefix }
+   }
+ 
+   // Live model + provider control, scoped to the executing turn's
+diff --git a/web/components/composer/ContextMeter.tsx b/web/components/composer/ContextMeter.tsx
+remerge CONFLICT (content): Merge conflict in web/components/composer/ContextMeter.tsx
+index 313b811..f559c58 100644
+--- a/web/components/composer/ContextMeter.tsx
++++ b/web/components/composer/ContextMeter.tsx
+@@ -1,13 +1,9 @@
+ import { Menu } from '../ui/Menu.tsx'
+ import { cn } from '../../lib/cn.ts'
+ import { budgetTone, contextFill } from '../../lib/format.ts'
+-<<<<<<< 69bbc2d (wip(context): context accounting tasks 1-7 (pre-merge checkpoint))
+ import { isAvailableContext } from '../../../src/harness/context/context-state.ts'
+ import type { ContextBreakdownView, ContextView } from '../../lib/api.ts'
+-=======
+-import type { ContextBreakdownView, ContextManifestView } from '../../lib/api.ts'
+ import { composerFocusClass } from './composer-chip.ts'
+->>>>>>> 709c562 (feat(web): composer chip, MCP settings, turn changes view and preview refinements)
+ 
+ /** Breakdown rows in the order they render, each a deeper-to-lighter shade. */
+ const CATEGORIES: readonly { readonly key: keyof ContextBreakdownView; readonly label: string; readonly shade: string }[] = [
+diff --git a/web/components/layout/ContextPanel.tsx b/web/components/layout/ContextPanel.tsx
+remerge CONFLICT (content): Merge conflict in web/components/layout/ContextPanel.tsx
+index 8e65733..39171a3 100644
+--- a/web/components/layout/ContextPanel.tsx
++++ b/web/components/layout/ContextPanel.tsx
+@@ -2,11 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react'
+ import ConfirmDialog from '../common/ConfirmDialog.tsx'
+ import { useToast } from '../common/Toast.tsx'
+ import { Button } from '../ui/Button.tsx'
+-<<<<<<< 69bbc2d (wip(context): context accounting tasks 1-7 (pre-merge checkpoint))
+-import { compactSession, CompactionCancelled, CompactionRecoveryNeeded, type CompactionRecovery, type ContextView, type StreamState } from '../../lib/api.ts'
+-=======
+-import { compactSession, CompactionCancelled, type ContextManifestView, type StreamState } from '../../lib/api.ts'
+->>>>>>> 709c562 (feat(web): composer chip, MCP settings, turn changes view and preview refinements)
++import { compactSession, CompactionCancelled, type ContextView, type StreamState } from '../../lib/api.ts'
+ import { budgetTone, compactionTokenChange, contextFill } from '../../lib/format.ts'
+ import { isAvailableContext } from '../../../src/harness/context/context-state.ts'
+ import { cn } from '../../lib/cn.ts'

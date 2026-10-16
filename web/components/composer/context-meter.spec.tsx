@@ -4,7 +4,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { contextFill } from '../../lib/format.ts'
 import { ContextMeter, formatTokens } from './ContextMeter.tsx'
-import type { ContextManifestView } from '../../lib/api.ts'
+import type { ContextManifestView, ContextStatus, ContextView } from '../../lib/api.ts'
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 let root: Root | undefined
@@ -26,11 +26,11 @@ const MANIFEST: ContextManifestView = {
   omissions: [],
 }
 
-async function openMeter(manifest: ContextManifestView | null): Promise<HTMLElement> {
+async function openMeter(manifest: ContextView | null, status?: ContextStatus): Promise<HTMLElement> {
   host = document.createElement('div')
   document.body.append(host)
   root = createRoot(host)
-  await act(async () => root!.render(<ContextMeter manifest={manifest} />))
+  await act(async () => root!.render(<ContextMeter manifest={manifest} {...(status !== undefined ? { status } : {})} />))
   const trigger = host.querySelector<HTMLButtonElement>('button')!
   await act(async () => {
     trigger.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0 }))
@@ -38,6 +38,64 @@ async function openMeter(manifest: ContextManifestView | null): Promise<HTMLElem
   })
   return document.querySelector<HTMLElement>('[role="dialog"]')!
 }
+
+it('labels a post-compaction estimate independently from the last request', async () => {
+  const panel = await openMeter({ ...MANIFEST, display: { kind: 'post-compaction', compactionSeq: 40, coversSeq: 30 } })
+  expect(panel.textContent).toContain('After compaction')
+  expect(panel.textContent).toContain('estimated')
+})
+
+it('does not show a zero count when the current context is unavailable', async () => {
+  const panel = await openMeter({ display: { kind: 'unavailable', reason: 'legacy-compaction' }, usage: { cacheableInputTokens: 0, cachedInputTokens: 0 } })
+  expect(panel.textContent).toContain('Context estimate unavailable')
+  expect(panel.textContent).not.toContain('0 /')
+})
+
+it('says loading or unavailable instead of "no request" or a zero count', async () => {
+  const loading = await openMeter(null, 'loading')
+  expect(loading.textContent).toContain('Loading context')
+  expect(loading.textContent).not.toContain('No recorded request')
+  await act(async () => root!.unmount())
+  root = undefined
+  host.remove()
+  // A stale value never shows through a non-ready status.
+  const failed = await openMeter(MANIFEST, 'error')
+  expect(failed.textContent).toContain('Context unavailable')
+  expect(failed.textContent).not.toContain('100K / 1M')
+})
+
+it('names the trigger for assistive tech while loading or failed', async () => {
+  for (const [status, label] of [['loading', 'Context window, loading'], ['error', 'Context window unavailable']] as const) {
+    await openMeter(null, status)
+    expect(host.querySelector('button')!.getAttribute('aria-label')).toBe(label)
+    await act(async () => root!.unmount())
+    root = undefined
+    host.remove()
+  }
+})
+
+it('shows the measured request: its model, basis and estimate total beside the reported one', async () => {
+  const panel = await openMeter({ ...MANIFEST, model: 'glm-measured', usage: { last: { inputTokens: 139_100 }, cacheableInputTokens: 0, cachedInputTokens: 0 } })
+  expect(panel.textContent).toContain('Last requestreported')
+  expect(panel.textContent).toContain('Modelglm-measured')
+  expect(panel.textContent).toContain('Estimate total100K')
+  await act(async () => root!.unmount())
+  root = undefined
+  host.remove()
+  const estimated = await openMeter(MANIFEST)
+  expect(estimated.textContent).toContain('Last requestestimated')
+  expect(estimated.textContent).not.toContain('Estimate total')
+})
+
+it('shows the auto-compact trigger only when the host reports a policy', async () => {
+  const withPolicy = await openMeter({ ...MANIFEST, budget: { ...MANIFEST.budget, preTrimTokens: 850_000 }, policy: { automaticCompactionPressure: 0.85 } })
+  expect(withPolicy.textContent).toContain('Auto-compact trigger: 85% of input budget · auto-compacts at 85%')
+  await act(async () => root!.unmount())
+  root = undefined
+  host.remove()
+  const without = await openMeter(MANIFEST)
+  expect(without.textContent).not.toContain('Auto-compact')
+})
 
 it('formats token counts compactly', () => {
   expect(formatTokens(950)).toBe('950')
@@ -47,10 +105,35 @@ it('formats token counts compactly', () => {
 })
 
 it('prefers the provider-reported prompt size over the estimate', () => {
-  expect(contextFill(MANIFEST)).toMatchObject({ used: 100_000, estimated: true, cacheHitRate: undefined })
+  expect(contextFill(MANIFEST)).toMatchObject({ used: 100_000, basis: 'estimated', estimated: true, cacheHitRate: undefined })
   const reported = contextFill({ ...MANIFEST, usage: { last: { inputTokens: 139_100, cachedInputTokens: 130_000 }, cacheableInputTokens: 400_000, cachedInputTokens: 396_000 } })
-  expect(reported).toMatchObject({ used: 139_100, limit: 1_000_000, estimated: false })
+  expect(reported).toMatchObject({ used: 139_100, limit: 1_000_000, basis: 'reported', estimated: false })
   expect(reported.cacheHitRate).toBeCloseTo(0.99)
+})
+
+// ZCode parity: before this request is reported, the meter holds the last report plus the
+// estimated delta instead of dropping back to the raw estimate (the 360k ↔ 640k jump).
+it('shows the calibrated count between a request and its report, never the raw estimate', async () => {
+  const calibrated = { ...MANIFEST, budget: { ...MANIFEST.budget, estimator: 'c3', measured: { source: 'provider_usage' as const, tokens: 178_000, preTrimTokens: 180_000, baseContextId: 'prev', ratio: 1.78 } } }
+  expect(contextFill(calibrated)).toMatchObject({ used: 178_000, basis: 'calibrated', estimated: true })
+  // The request's own report still wins once it lands.
+  expect(contextFill({ ...calibrated, usage: { last: { inputTokens: 179_500 }, cacheableInputTokens: 0, cachedInputTokens: 0 } })).toMatchObject({ used: 179_500, basis: 'reported' })
+  // An uncalibrated measurement is the plain estimate.
+  const plain = { ...MANIFEST, budget: { ...MANIFEST.budget, measured: { source: 'estimate' as const, tokens: 100_000, preTrimTokens: 100_000 } } }
+  expect(contextFill(plain)).toMatchObject({ used: 100_000, basis: 'estimated' })
+  const panel = await openMeter(calibrated)
+  expect(panel.textContent).toContain('178K / 1M')
+  expect(panel.textContent).toContain('Last requestcalibrated')
+})
+
+it('auto-compact pressure reads the calibrated pre-trim count, legacy manifests the estimate', async () => {
+  const policy = { automaticCompactionPressure: 0.85 }
+  const legacy = await openMeter({ ...MANIFEST, budget: { ...MANIFEST.budget, preTrimTokens: 497_440 }, policy })
+  expect(legacy.textContent).toContain('50% of input budget')
+  await act(async () => root!.unmount())
+  host.remove()
+  const calibrated = await openMeter({ ...MANIFEST, budget: { ...MANIFEST.budget, preTrimTokens: 497_440, measured: { source: 'provider_usage', tokens: 880_000, preTrimTokens: 885_443 } }, policy })
+  expect(calibrated.textContent).toContain('89% of input budget')
 })
 
 it('shows token counts per source, not percentages', async () => {
@@ -59,8 +142,8 @@ it('shows token counts per source, not percentages', async () => {
   expect(panel.textContent).toContain('Messages65K')
   expect(panel.textContent).toContain('Skills2K')
   expect(panel.textContent).toContain('MCP tools14K')
-  expect(panel.textContent).toContain('Estimated tokens (chars/4)')
-  expect(panel.textContent).toContain('Average cache hit rate99%')
+  expect(panel.textContent).toContain('Estimated source tokens (chars/3)')
+  expect(panel.textContent).toContain('Session average cache hit rate99%')
 })
 
 it('trigger draws a fill arc, and a dashed ring (no arc) before any request', async () => {
@@ -79,7 +162,7 @@ it('marks an estimate and says when no request has run yet', async () => {
   const estimated = await openMeter(MANIFEST)
   expect(estimated.textContent).toContain('100K / 1M')
   expect(estimated.textContent).not.toContain('~')
-  expect(estimated.textContent).toContain('Average cache hit rate—')
+  expect(estimated.textContent).toContain('Session average cache hit rate—')
   await act(async () => root!.unmount())
   root = undefined
   host.remove()

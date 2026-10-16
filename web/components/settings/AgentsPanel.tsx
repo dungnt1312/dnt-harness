@@ -44,7 +44,7 @@ const linesToArray = (raw: string): string[] => raw.split(/[\n,]/).map((line) =>
  * A Claude Code subagent file built from the form: YAML frontmatter
  * (`tools` as a comma list, omitted to inherit every tool) plus the body.
  */
-export function definitionDocument(draft: { readonly name: string; readonly description: string; readonly tools: string; readonly disallowedTools: string; readonly instructions: string; readonly model: string }): string {
+export function definitionDocument(draft: { readonly name: string; readonly description: string; readonly tools: string; readonly disallowedTools: string; readonly instructions: string; readonly model: string; readonly effort?: string }): string {
   const tools = linesToArray(draft.tools)
   const disallowed = linesToArray(draft.disallowedTools)
   return [
@@ -57,6 +57,7 @@ export function definitionDocument(draft: { readonly name: string; readonly desc
     // Omitted entirely when blank: no key means the child inherits the
     // conversation's model, which is not the same as pinning one.
     ...(draft.model.trim() !== '' ? [`model: ${JSON.stringify(draft.model.trim())}`] : []),
+    ...((draft.effort ?? '') !== '' ? [`effort: ${draft.effort}`] : []),
     '---',
     '',
     draft.instructions.trim(),
@@ -93,13 +94,19 @@ function modelText(row: AgentDefinitionRow): { readonly short: string; readonly 
     const pair = resolution.resolved
     const shortModel = resolution.alias ?? pair.slice(pair.indexOf(':') + 1)
     const thinking = resolution.alias !== undefined ? ` · thinking ${resolution.thinkingLevel ?? 'model default'}` : ''
-    return { short: shortModel, long: resolution.alias !== undefined ? `${resolution.alias} → ${pair}${thinking}` : (asked !== undefined && asked !== pair ? `${asked} → ${pair}` : pair), warn: false }
+    const long = resolution.alias !== undefined ? `${resolution.alias} → ${pair}${thinking}` : (asked !== undefined && asked !== pair ? `${asked} → ${pair}` : pair)
+    return { short: shortModel, long: `${long}${effortText(row)}`, warn: false }
   }
   if (resolution?.unresolved !== undefined) {
-    return { short: `${resolution.unresolved}?`, long: `${resolution.unresolved} is not served by any provider here — runs on the conversation’s model`, warn: true }
+    return { short: `${resolution.unresolved}?`, long: `${resolution.unresolved} is not served by any provider here — runs on the conversation’s model${effortText(row)}`, warn: true }
   }
-  return { short: 'inherit', long: 'Inherits the conversation’s model', warn: false }
+  return { short: 'inherit', long: `Inherits the conversation’s model${effortText(row)}`, warn: false }
 }
+
+/** The role's effort overrides any thinking above (when the model supports it). */
+const effortText = (row: AgentDefinitionRow): string => row.definition.effort !== undefined ? ` · effort ${row.definition.effort}` : ''
+
+const EFFORT_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 
 /**
  * Agent roles: the definitions a conversation can delegate to, read from
@@ -129,9 +136,10 @@ interface Draft {
   readonly disallowedTools: string
   readonly instructions: string
   readonly model: string
+  readonly effort: string
 }
 
-const EMPTY_DRAFT: Draft = { name: '', description: '', tools: '', disallowedTools: '', instructions: '', model: '' }
+const EMPTY_DRAFT: Draft = { name: '', description: '', tools: '', disallowedTools: '', instructions: '', model: '', effort: '' }
 
 function draftOf(row: AgentDefinitionRow): Draft {
   const definition = row.definition
@@ -144,6 +152,7 @@ function draftOf(row: AgentDefinitionRow): Draft {
     disallowedTools: definition.disallowedTools.join(', '),
     instructions: definition.instructions,
     model: definition.model ?? '',
+    effort: definition.effort ?? '',
   }
 }
 
@@ -432,6 +441,14 @@ function AgentsPanelContent({ workspaceId, projectId, modelOptions }: AgentsPane
                   ...(draft.model !== '' && !['sonnet', 'opus', 'haiku'].includes(draft.model) && !(modelOptions ?? []).some((option) => option.value === draft.model) ? [{ value: draft.model, label: draft.model }] : []),
                 ]}
                 onChange={field('model')}
+              />
+            </Field>
+            <Field label="Effort" hint="Thinking level for this role; overrides the conversation’s.">
+              <Select
+                label="Role effort"
+                value={draft.effort}
+                options={[{ value: '', label: 'Inherit from the conversation' }, ...EFFORT_LEVELS.map((level) => ({ value: level, label: level }))]}
+                onChange={field('effort')}
               />
             </Field>
             <div className="md:col-span-2">

@@ -9,42 +9,33 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { bashTool, fsTools, Kernel, ToolsService, type ToolExecution } from 'dnt-harness'
-import { fileToolHint, sweepByTag, TREE_TAG_ENV } from '../../src/capabilities/shell/bash.ts'
+import { sweepByTag, TREE_TAG_ENV } from '../../src/capabilities/shell/bash.ts'
 import { detectShell, shellCatalog } from '../../src/capabilities/shell/detect.ts'
 
 const exec: ToolExecution = { root: process.cwd() }
 
-describe('file-tool hint', () => {
-  const root = '/repo'
-  it('names a cd into the folder Bash already runs in', () => {
-    expect(fileToolHint('cd /repo && git status', root)).toMatch(/drop the leading `cd`/)
-    expect(fileToolHint('cd "/repo" ; pnpm test', root)).toMatch(/drop the leading `cd`/)
-    expect(fileToolHint('cd /repo/web && pnpm test', root)).toBeUndefined()
-  })
-  it('names shell reads and searches at a pipeline head, not output filters', () => {
-    expect(fileToolHint('sed -n 1,80p a.ts', root)).toMatch(/Prefer Read over/)
-    expect(fileToolHint('grep -rn foo web', root)).toMatch(/Prefer Grep\/Glob over/)
-    expect(fileToolHint('cat a.ts; find . -name x', root)).toMatch(/Prefer Read and Grep\/Glob over/)
-    expect(fileToolHint('git diff | head -40', root)).toBeUndefined()
-    expect(fileToolHint('pnpm test 2>&1 | tail -20', root)).toBeUndefined()
-    expect(fileToolHint('git status --short', root)).toBeUndefined()
-  })
-  it('names heredoc writes into a file', () => {
-    expect(fileToolHint("cat > a.ts <<'EOF'\nx\nEOF", root)).toMatch(/Write\/Edit/)
-    expect(fileToolHint("cat > a.ts <<'EOF'\nx\nEOF", root)).not.toMatch(/Prefer Read/)
-    expect(fileToolHint('cat a.ts 2>/dev/null', root)).toMatch(/Prefer Read/)
-    expect(fileToolHint("cat >> a.spec.ts <<'EOF'\nx\nEOF", root)).toMatch(/Write\/Edit/)
-    expect(fileToolHint("cat <<EOF > a.ts\nx\nEOF", root)).toMatch(/Write\/Edit/)
-  })
-  it('appends to model calls only, before the exit code', async () => {
+describe('no harness-added file-tool hints', () => {
+  it('leaves the output unchanged for cat/rg/ls/leading cd/heredoc commands', async () => {
     const root = await fs.mkdtemp(path.join(tmpdir(), 'dnt-harness-bash-hint-'))
     try {
       await fs.writeFile(path.join(root, 'a.txt'), 'hello', 'utf8')
-      const model = await bashTool().execute({ command: 'cat a.txt' }, { root, toolCallId: 'toolu_1' })
-      expect(model).toMatch(/hello\n\[hint: Prefer Read over the shell[^\n]*\]\n\[exit code: 0\]$/)
-      expect(await bashTool().execute({ command: 'cat a.txt' }, { root, toolCallId: 'cmd_1' })).toBe('hello\n[exit code: 0]')
-      expect(await bashTool().execute({ command: 'cat a.txt' }, { root })).toBe('hello\n[exit code: 0]')
+      const run = (command: string) => bashTool().execute({ command }, { root, toolCallId: 'toolu_1' })
+      expect(await run('cat a.txt')).toBe('hello\n[exit code: 0]')
+      expect(await run('ls')).toBe('a.txt\n\n[exit code: 0]')
+      expect(await run(`cd "${root}" && cat a.txt`)).toBe('hello\n[exit code: 0]')
+      expect(await run("cat > b.txt <<'EOF'\nx\nEOF")).toBe('\n[exit code: 0]')
+      expect(await run('grep -rn hello . || true')).not.toContain('[hint:')
     } finally { await fs.rm(root, { recursive: true, force: true }) }
+  })
+  it('keeps a [hint: …] line the program itself prints', async () => {
+    const out = await bashTool().execute({ command: "printf '[hint: x]\\n'" }, { root: process.cwd(), toolCallId: 'toolu_1' })
+    expect(out).toBe('[hint: x]\n\n[exit code: 0]')
+  })
+  it('steers file reads/searches to the file tools and states the observation rule', () => {
+    const description = bashTool().description
+    expect(description).toMatch(/reading a file through Bash creates no observation/)
+    expect(description).toMatch(/do not use Bash to read, search or change file contents \(`cat`, `head`, `tail`, `sed`/)
+    expect(description).toMatch(/Read \(any line range\)/)
   })
 })
 

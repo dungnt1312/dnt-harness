@@ -366,6 +366,14 @@ export function fetchProviderModels(id: string): Promise<{ ok: boolean; models: 
   return apiFetch(`/api/providers/${encodeURIComponent(id)}/models`).then((r) => json<{ ok: boolean; models: string[] }>(r))
 }
 
+/**
+ * The stored API key, revealed on demand by the Settings eye toggle. Only the
+ * paired browser may read it back; a bearer (CLI/headless) client gets `401`.
+ */
+export function revealProviderKey(id: string): Promise<{ apiKey: string }> {
+  return apiFetch(`/api/providers/${encodeURIComponent(id)}/key`).then((r) => json<{ apiKey: string }>(r))
+}
+
 /** Replace the stored model list with the endpoint's, server-side (REST clients). */
 export function syncProvider(id: string): Promise<{ ok: boolean; models: string[] }> {
   return apiFetch(`/api/providers/${encodeURIComponent(id)}/sync`, { method: 'POST' }).then((r) =>
@@ -408,8 +416,52 @@ export function subscribeEventsIn(
   cursor?: number,
 ): () => void {
   const suffix = cursor !== undefined && Number.isSafeInteger(cursor) && cursor >= 0 ? `?cursor=${cursor}` : ''
-  const source = new EventSource(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/events${suffix}`)
-  return wire(source, onEnvelope, onState)
+  const base = `/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/events`
+  let last: number | undefined
+  const track = (envelope: Envelope, frame?: number): void => {
+    if (frame !== undefined) last = frame
+    onEnvelope(envelope, frame)
+  }
+  return reviving(
+    () => new EventSource(last !== undefined ? `${base}?cursor=${last}` : `${base}${suffix}`),
+    (source) => wire(source, track, onState),
+    onState,
+  )
+}
+
+/** A hide this long may have left a source the browser silently stopped reconnecting. */
+const LONG_HIDE_MS = 30_000
+
+/**
+ * Keep one EventSource alive across sleep and network changes: after a long
+ * hide, or when the network comes back, replace it with a fresh one (`open`
+ * resumes from the last frame the caller saw). A short hide keeps a healthy source.
+ */
+function reviving(open: () => EventSource, attach: (source: EventSource) => () => void, onState?: (state: StreamState) => void): () => void {
+  let source = open()
+  let detach = attach(source)
+  let hiddenAt: number | undefined
+  const swap = (): void => {
+    detach()
+    onState?.('reconnecting')
+    source = open()
+    detach = attach(source)
+  }
+  const doc = typeof document === 'undefined' ? undefined : document
+  const win = typeof window === 'undefined' ? undefined : window
+  const onVisibility = (): void => {
+    if (doc?.visibilityState === 'hidden') { hiddenAt = Date.now(); return }
+    const away = hiddenAt === undefined ? 0 : Date.now() - hiddenAt
+    hiddenAt = undefined
+    if (away >= LONG_HIDE_MS || source.readyState === EventSource.CLOSED) swap()
+  }
+  doc?.addEventListener('visibilitychange', onVisibility)
+  win?.addEventListener('online', swap)
+  return () => {
+    doc?.removeEventListener('visibilitychange', onVisibility)
+    win?.removeEventListener('online', swap)
+    detach()
+  }
 }
 
 function wire(
@@ -1344,13 +1396,13 @@ export function setModeEnabled(workspaceId: string, modeId: string, enabled: boo
   }).then((r) => json<{ readonly id: string; readonly enabled: boolean }>(r))
 }
 
-export type { ContextBreakdownView, ContextManifestView, ContextUsageView } from './types.ts'
+export type { CompactionMeasurementView, ContextStatus, ContextBreakdownView, ContextManifestView, ContextUsageView, ContextView } from './types.ts'
 
 /** `null` means the valid no-request-yet state (HTTP 204), not an error. */
-export function fetchManifest(workspaceId: string, sessionId: string): Promise<ContextManifestView | null> {
+export function fetchManifest(workspaceId: string, sessionId: string): Promise<import('./types.ts').ContextView | null> {
   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/manifest`).then((r) => {
     if (r.status === 204) return null
-    return json<ContextManifestView>(r)
+    return json<import('./types.ts').ContextView>(r)
   })
 }
 
@@ -1368,6 +1420,8 @@ export interface CompactResult {
   /** Context tokens before/after; absent when the run was not measured. */
   readonly tokensBefore?: number
   readonly tokensAfter?: number
+  /** Basis of the two figures; absent on older hosts (then both are estimates). */
+  readonly measurement?: import('./types.ts').CompactionMeasurementView
   /** How the summary was produced: `exact` and `reconstructed` are one request; `recovery` folds the whole transcript. */
   readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'
 }
@@ -1939,17 +1993,20 @@ export function subscribeTerminals(
   onFrame: (frame: TerminalFrame) => void,
   onState?: (state: StreamState) => void,
 ): () => void {
-  const source = new EventSource('/api/workspaces/' + encodeURIComponent(workspaceId) + '/terminals/events')
-  source.onopen = () => onState?.('open')
-  source.onerror = () => {
-    onState?.(source.readyState === EventSource.CONNECTING ? 'reconnecting' : 'connecting')
-  }
-  source.onmessage = (message: MessageEvent<string>) => {
-    onFrame(JSON.parse(message.data) as TerminalFrame)
-  }
-  return () => {
-    source.close()
-  }
+  return reviving(
+    () => new EventSource('/api/workspaces/' + encodeURIComponent(workspaceId) + '/terminals/events'),
+    (source) => {
+      source.onopen = () => onState?.('open')
+      source.onerror = () => {
+        onState?.(source.readyState === EventSource.CONNECTING ? 'reconnecting' : 'connecting')
+      }
+      source.onmessage = (message: MessageEvent<string>) => {
+        onFrame(JSON.parse(message.data) as TerminalFrame)
+      }
+      return () => source.close()
+    },
+    onState,
+  )
 }
 
 // ── Dangerous command guard ───────────────────────────────────────────────

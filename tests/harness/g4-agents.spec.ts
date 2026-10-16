@@ -161,6 +161,16 @@ describe('agent definitions', () => {
     expect(claude.warnings?.join()).toMatch(/dropped: WebFetch/)
   })
 
+  it('parses effort as an enforced thinking level, round-trips it, and gives bundled roles defaults', async () => {
+    const { parseAgentDefinition, serializeAgentDefinition, bundledDefinition } = await import('dnt-harness')
+    const parsed = parseAgentDefinition('w', '---\ndescription: w\neffort: low\n---\nGo.')
+    expect(parsed.effort).toBe('low')
+    expect(parsed.unsupported).toBeUndefined()
+    expect(parseAgentDefinition('w', serializeAgentDefinition(parsed)).effort).toBe('low')
+    expect(() => parseAgentDefinition('w', '---\ndescription: w\neffort: turbo\n---\nGo.')).toThrow(/'effort' must be/)
+    expect(['explorer', 'worker', 'reviewer', 'verifier'].map((name) => bundledDefinition(name).effort)).toEqual(['low', 'medium', 'high', 'low'])
+  })
+
   it('parses mcpServers and MCP selectors, and round-trips them', async () => {
     const { parseAgentDefinition, serializeAgentDefinition } = await import('dnt-harness')
     const parsed = parseAgentDefinition('scout', [

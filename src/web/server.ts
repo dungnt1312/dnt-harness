@@ -21,6 +21,7 @@
  * questions — answered by `POST /api/approvals/:id`.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { isIP } from 'node:net'
 import { execFile } from 'node:child_process'
 import { createReadStream } from 'node:fs'
 import { bearerAllows, CLEARED_SESSION_COOKIE, ControlPlaneAuthService, isPublicPath, readSessionCookie } from './control-plane-auth.ts'
@@ -51,8 +52,8 @@ import { DEFAULT_LIMITS, resolveLimits, type HarnessLimits } from '../harness/li
 import { LlmService } from '../harness/llm/service.ts'
 import { LogicalRequest, classifyTransport } from '../harness/llm/request-lifecycle.ts'
 import { OpenAiCompletionsProvider } from '../harness/llm/openai.ts'
-import { expressibleThinkingLevel, isThinkingLevel, resolveContextLimit } from '../harness/llm/model-catalog.ts'
-import { adaptRequestVision, supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
+import { expressibleThinkingLevel, isThinkingLevel, type ThinkingLevel } from '../harness/llm/model-catalog.ts'
+import { supportsNativeVision } from '../harness/llm/adaptive-vision.ts'
 import { ProviderError } from '../harness/llm/types.ts'
 import type { LlmProvider, ModelRequest, StreamEvent, StreamOptions, TokenUsage, ToolCall } from '../harness/llm/types.ts'
 import type { ToolResult } from '../harness/tools/types.ts'
@@ -166,14 +167,14 @@ import { resolveImageApi } from './image-generation-store.ts'
 import { resolveVisionApi } from './image-understanding-store.ts'
 import { resolveVideoApi } from './video-generation-store.ts'
 import { askUserQuestionTool, validateAnswers, type QuestionOutcome, type UserQuestion } from '../harness/tools/ask-user.ts'
-import { buildContext, estimateConversationTokens, DEFAULT_BASE_SYSTEM, DEFAULT_CHILD_SYSTEM, type ContextManifest, type ActiveSkill, type MemorySnippet } from '../harness/context/builder.ts'
+import { buildContext, buildContextPreview, estimateConversationTokens, DEFAULT_BASE_SYSTEM, DEFAULT_CHILD_SYSTEM, type ContextManifest, type ActiveSkill, type MemorySnippet } from '../harness/context/builder.ts'
 import { renderEnvironmentContext } from '../harness/context/environment.ts'
 import { SystemPromptsStore, type SystemPromptsSnapshot } from '../harness/prompts/store.ts'
 import { CheckpointStore, recoverCanonicalCheckpoint, type CompactionCheckpoint } from '../harness/context/compaction.ts'
 import { compactionSeedHash, sourceDigest } from '../harness/context/compaction-digest.ts'
 import { CompactionSnapshotStore } from '../harness/storage/compaction-snapshot-store.ts'
 import { promoteCapture, reconstructionCutoff, reconstructSnapshot } from './compaction-capture.ts'
-import { CompactionHost } from './compaction-host.ts'
+import { CompactionHost, handoffSnapshot } from './compaction-host.ts'
 import { CompactionPrecompute, candidateOwner } from './compaction-precompute.ts'
 import { buildRestoration } from './compaction-restoration.ts'
 import type { EffectiveCompactionSnapshot, SnapshotIdentity } from '../harness/context/compaction-snapshot.ts'
@@ -182,7 +183,14 @@ import { CaptureRegistry, identityOf, requestPrefixHash } from './compaction-wir
 import { loadReferencedSnapshot } from './compaction-restart.ts'
 import { snapshotHash } from '../harness/context/compaction-snapshot.ts'
 import { CacheAwareCompactionFallback, createCacheAwareCompactionSummarizer, createCompactionSummarizer, MAX_PARALLEL } from './llm-summarizer.ts'
-import { DEFAULT_BUDGET, schemaCost, type ResolvedBudget } from '../harness/context/budget.ts'
+import { DEFAULT_BUDGET, resolveModelBudget, schemaCost, type ResolvedBudget } from '../harness/context/budget.ts'
+import type { BuildContextInput, PreviewCompaction } from '../harness/context/builder.ts'
+import type { CompactionMeasurement } from '../harness/session/events.ts'
+import type { Restored } from '../harness/context/compaction.ts'
+import { isValidContextId } from '../harness/context/context-metrics.ts'
+import { createContextReducer, deriveContextState, isAvailableContext, type ContextReducer, type ContextResponse } from '../harness/context/context-state.ts'
+import { latestCalibration, pressureTokensOf, settledPressureTokens } from '../harness/context/calibration.ts'
+import { isValidTokenUsage } from '../harness/context/context-metrics.ts'
 import { CommandsService } from '../harness/commands/service.ts'
 import { PluginService } from '../harness/plugins/service.ts'
 import { PluginError } from '../harness/plugins/manifest.ts'
@@ -816,7 +824,23 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     (mcpGeneration.get(workspaceId) ?? 1) + (mcpServerGeneration.get(`${workspaceId}:${serverName}`) ?? 0)
   const journals = new Map<string, McpExecutionJournal>()
   const journalsOpening = new Map<string, Promise<McpExecutionJournal>>()
-  const auditFaultFile = path.join(resourceHome, 'mcp-audit-fault.json')
+  const legacyAuditFaultFile = path.join(resourceHome, 'mcp-audit-fault.json')
+  const workspaceAuditFaultFile = (workspaceId: string): string => path.join(resourceHome, 'mcp-audit-faults', `${encodeURIComponent(workspaceId)}.json`)
+  let legacyAuditBlocked = await faultIsOpen(legacyAuditFaultFile)
+  if (legacyAuditBlocked) {
+    let owner: unknown
+    try { owner = (JSON.parse(await fs.readFile(legacyAuditFaultFile, 'utf8')) as { workspaceId?: unknown } | null)?.workspaceId } catch { /* Unreadable metadata stays globally blocked. */ }
+    if (typeof owner === 'string' && owner !== '') {
+      const destination = workspaceAuditFaultFile(owner)
+      await fs.mkdir(path.dirname(destination), { recursive: true })
+      await fs.copyFile(legacyAuditFaultFile, destination, 1).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'EEXIST') throw error
+      })
+      await clearAuditFault(legacyAuditFaultFile)
+      legacyAuditBlocked = false
+    }
+  }
+  const auditFaultFile = (workspaceId: string): string => legacyAuditBlocked ? legacyAuditFaultFile : workspaceAuditFaultFile(workspaceId)
   const oauthKeyFile = path.join(resourceHome, 'oauth.master.key')
   let oauthKey: Buffer
   try {
@@ -970,12 +994,10 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     return { provider: id, model }
   }
 
-  /** The context window of a pair: the operator's override (verified), else the catalog's documented estimate. */
-  const contextWindowOf = (provider: string, model: string): { readonly tokens: number; readonly verified: boolean } => {
-    const configured = list.find((entry) => entry.id === provider)?.modelSettings?.[model]?.contextTokens
-    return configured !== undefined && Number.isFinite(configured) && configured > 0
-      ? { tokens: configured, verified: true }
-      : { tokens: resolveContextLimit(model), verified: false }
+  /** The budget of a pair: the operator's override (verified), else the catalog's documented window. */
+  const modelBudgetOf = (provider: string | undefined, model: string): ResolvedBudget => {
+    const configured = provider === undefined ? undefined : list.find((entry) => entry.id === provider)?.modelSettings?.[model]?.contextTokens
+    return resolveModelBudget({ model, ...(configured !== undefined ? { contextTokens: configured } : {}) })
   }
 
   /**
@@ -1099,6 +1121,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     workspaceId: WorkspaceId,
     requested?: string,
     definitionModel?: string,
+    effort?: ThinkingLevel,
   ): ChildModel | undefined =>
     resolveChildModel(requested, definitionModel, {
       parent: resolveEffectiveModel(parent, workspaceId),
@@ -1114,7 +1137,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         }
       },
       alias: (name) => aliases.find((entry) => entry.name === name),
-    })
+    }, effort)
 
   // ── per-session entries ──────────────────────────────────────
   const sessions = new Map<SessionId, SessionEntry>()
@@ -1473,7 +1496,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       },
       // The candidate runs under its own provider-ownership id; the service tells us if it is stuck.
       transportUncertain: (sessionId) => kernel.ctx.llm.sessionUncertain(candidateOwner(sessionId)),
-      assess: (sessionId, prepared) => {
+      assess: async (sessionId, prepared) => {
         const entry = sessions.get(sessionId as SessionId)
         if (entry === undefined) return 'no-fit'
         const events = entry.session.committedEvents
@@ -1484,9 +1507,17 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         // The tail that closed after the cutoff stays verbatim, so it is part of `now`: a
         // candidate whose result is not smaller by the minimum is not worth a checkpoint.
         if (was - now < MIN_CANDIDATE_GAIN_TOKENS) return 'no-gain'
-        const window = compactionWindowOf(entry)
-        if (window !== undefined && now > window - limits.compactionOutputTokens) return 'no-fit'
+        // Fit is the builder's: the next request after this checkpoint (fixed prompt, schemas,
+        // restoration, the tail kept verbatim) under the same budget, reserve and margin.
+        try {
+          const restored = await restorationFor(entry, prepared.cutoff, candidateLifetime.signal)
+          await previewCompaction(entry, { summary: prepared.summary, coversSeq: prepared.cutoff }, restored)
+        } catch { return 'no-fit' }
         return undefined
+      },
+      nativeVision: (sessionId) => {
+        const entry = sessions.get(sessionId as SessionId)
+        return entry === undefined ? false : compactionVisionOf(entry)
       },
       limits,
       recordUsage: (sessionId, usage) => {
@@ -1510,7 +1541,14 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   const compactionWindowOf = (entry: SessionEntry): number | undefined => {
     const effective = resolveEffectiveModel(entry.session, entry.workspaceId)
     if (effective.model === null || effective.model === undefined) return undefined
-    return effective.provider === null || effective.provider === undefined ? resolveContextLimit(effective.model) : contextWindowOf(effective.provider, effective.model).tokens
+    return modelBudgetOf(effective.provider ?? undefined, effective.model).contextLimitTokens
+  }
+
+  /** Whether the session's model sees image pixels: the same rule and override the chat request uses. */
+  const compactionVisionOf = (entry: SessionEntry): boolean => {
+    const { provider, model } = resolveEffectiveModel(entry.session, entry.workspaceId)
+    const override = provider != null && model != null ? list.find((row) => row.id === provider)?.modelSettings?.[model]?.vision : undefined
+    return supportsNativeVision(model ?? undefined, override)
   }
 
   /** The identity a snapshot must have been built for, from what the server holds right now. */
@@ -1534,40 +1572,97 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
    * the provider's prompt count when it reported one (what the meter shows), moved
    * by the estimated change the new checkpoint makes against the one standing now.
    */
-  const measureCheckpoint = (
+  const compactPreviews = new Map<SessionId, { commitPrefix(): void }>()
+  /**
+   * What the last measure proved, per session: the context revision its inputs were prepared
+   * under, and the checkpoint whose full next request was built and fits (`fit`), or why not.
+   */
+  const compactFits = new Map<SessionId, { revision: string; fit?: number; error?: unknown }>()
+
+  /** Hash of everything outside the log that shapes the next request; a preview is stale once it moves. */
+  const contextRevision = async (entry: SessionEntry): Promise<string> => {
+    const { provider, model, thinkingLevel } = resolveEffectiveModel(entry.session, entry.workspaceId)
+    const { mode, revision } = rootModeOf({ sessionId: entry.session.id }, entry.workspaceId)
+    // A read error throws (a measurement failure), never hashes as empty: that would read as a change.
+    const prompts = await systemPrompts.load(entry.workspaceId)
+    const instructions = mode.definition.sources.workspaceInstructions ? await readWorkspaceInstructions(resourceHome, entry.workspaceId, entry.projectId) : ''
+    return createHash('sha256').update(JSON.stringify([
+      provider ?? null, model ?? null, thinkingLevel ?? null,
+      provider != null && model != null ? list.find((row) => row.id === provider)?.modelSettings?.[model]?.contextTokens ?? null : null,
+      mode.definition.id, revision,
+      effectiveGrants(entry.session.id, entry.projectId, entry.workspaceId),
+      prompts?.base.overridden === true ? prompts.base.text : null,
+      prompts?.child.overridden === true ? prompts.child.text : null,
+      createHash('sha256').update(instructions).digest('hex'),
+      skills.sourcesStore.revision(entry.workspaceId),
+    ])).digest('hex')
+  }
+
+  /**
+   * Before a checkpoint is published: the context it was measured under has not moved, and,
+   * when `cutoff` is given (effective adoption), that exact checkpoint was proven to fit.
+   */
+  const checkCompactionContext = async (entry: SessionEntry, cutoff?: number): Promise<void> => {
+    const recorded = compactFits.get(entry.session.id)
+    compactFits.delete(entry.session.id)
+    if (cutoff !== undefined && recorded?.fit !== cutoff) {
+      const cause = recorded?.error instanceof Error ? `: ${recorded.error.message}` : ''
+      throw new Error(`compaction fit not verified${cause}`)
+    }
+    if (recorded !== undefined && recorded.revision !== await contextRevision(entry)) throw new Error('context revision changed')
+  }
+
+  /** The post-compaction request the builder would assemble next; throws when it does not fit. */
+  const previewCompaction = (entry: SessionEntry, next: { readonly summary: string; readonly coversSeq: number }, restored?: Restored) => {
+    const scope: AgentScope = { sessionId: entry.session.id, rootSessionId: entry.session.id, workspaceId: entry.workspaceId,
+      ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}), ...roleIdentityOf(entry.session) }
+    const schemas = agentScope.run(scope, () => kernel.ctx.tools.schemas())
+    return assembleRequest({ scope, projected: { messages: [], tools: schemas, assemblySignal: new AbortController().signal }, sideEffects: false,
+      preview: { checkpoint: next, ...(restored !== undefined ? { restoration: restored } : {}), protectUncoveredHistory: limits.compactionEffectiveEnabled } })
+  }
+
+  const measureCheckpoint = async (
     entry: SessionEntry,
     next: { readonly summary: string; readonly coversSeq: number },
-    standing: { readonly summary: string; readonly coversSeq: number } | undefined,
-    loaded?: Parameters<typeof estimateConversationTokens>[0]['attachments'],
-    restoredTokens = 0,
-  ): { tokensBefore: number; tokensAfter: number } | undefined => {
-    if (rootModeOf({ sessionId: entry.session.id }, entry.workspaceId).mode.definition.sources.history !== 'compact') return undefined
-    const manifest = lastManifests.get(entry.session.id)
-    if (manifest === undefined) return undefined
-    const tokensBefore = sessionUsage.get(entry.session.id)?.last?.inputTokens ?? manifest.budget.usedTokens
-    const shared = { events: entry.session.events, compactionRetainTokens: limits.compactionRetainTokens, ...(loaded !== undefined ? { attachments: loaded } : {}) }
-    const was = estimateConversationTokens({ ...shared, ...(standing !== undefined ? { compaction: standing } : {}) })
-    const now = estimateConversationTokens({ ...shared, compaction: next })
-    // Negative only on a tiny conversation: the summary plus the bounded
-    // retained messages can outweigh the history they replace.
-    // The restoration rides in the next request beside the summary, so the window
-    // it leaves includes it.
-    const saved = was - now - restoredTokens
-    const tokensAfter = Math.max(0, tokensBefore - saved)
-    // The meter reads the newest manifest, which still describes the
-    // pre-compaction request. Rewrite it BEFORE the end event is
-    // appended so the refetch that event triggers sees the new size:
-    // the next real request replaces this estimate.
-    const { last: _stale, ...totals } = sessionUsage.get(entry.session.id) ?? { cacheableInputTokens: 0, cachedInputTokens: 0 }
-    void _stale
-    sessionUsage.set(entry.session.id, totals)
-    lastManifests.set(entry.session.id, {
-      ...manifest,
-      budget: { ...manifest.budget, usedTokens: tokensAfter, estimated: true },
-      breakdown: { ...manifest.breakdown, messages: Math.max(0, manifest.breakdown.messages - saved) },
-    })
-    return { tokensBefore, tokensAfter }
+    restored?: Restored,
+  ): Promise<CompactionMeasurement> => {
+    const sessionId = entry.session.id
+    compactFits.delete(sessionId)
+    // Captured before any preview await, so a change while it runs is caught at publication.
+    const revision = await contextRevision(entry)
+    if (rootModeOf({ sessionId }, entry.workspaceId).mode.definition.sources.history !== 'compact') {
+      // The checkpoint is not read by this mode: the next request does not change.
+      compactFits.set(sessionId, { revision, fit: next.coversSeq })
+      return { contextEffect: 'unchanged' }
+    }
+    compactFits.set(sessionId, { revision })
+    let prepared: Awaited<ReturnType<typeof previewCompaction>>
+    try { prepared = await previewCompaction(entry, next, restored) } catch (error) {
+      compactFits.set(sessionId, { revision, error })
+      throw error
+    }
+    const contextAfter = prepared.assembled.manifest
+    compactPreviews.set(sessionId, prepared)
+    compactFits.set(sessionId, { revision, fit: next.coversSeq })
+    const previous = deriveContextState(entry.session.committedEvents, entry.session.id)
+    const before = previous !== null && isAvailableContext(previous) ? previous : undefined
+    const reported = before?.usage?.last?.inputTokens
+    const tokensBefore = reported ?? before?.budget.measured?.tokens ?? before?.budget.usedTokens
+    const tokensAfter = contextAfter.budget.usedTokens
+    return { contextEffect: 'replaced', contextAfter, tokensAfter,
+      ...(tokensBefore !== undefined ? { tokensBefore } : {}),
+      measurement: { after: { tokens: tokensAfter, basis: 'estimated' },
+        ...(tokensBefore !== undefined ? { before: { tokens: tokensBefore, basis: reported !== undefined ? 'reported' : 'estimated',
+          ...(before?.contextId !== undefined ? { contextId: before.contextId } : {}) } } : {}) } }
   }
+  kernel.ctx.on('session/event', (session, event) => {
+    if (event.type !== 'compaction/end') return
+    if (event.error !== undefined) { compactPreviews.delete(session.id); return }
+    void session.durable().then(() => {
+      compactPreviews.get(session.id)?.commitPrefix()
+      compactPreviews.delete(session.id)
+    }).catch(() => { compactPreviews.delete(session.id) })
+  })
 
   /**
    * One compaction model request with bounded transient retry, shared by the handoff and the fold.
@@ -1640,6 +1735,8 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         projection: { ...assembled.compactionProjection, sources: assembled.compactionProjection.sources.slice(0, -1) },
         finalAnswer: { role: 'assistant', content: found.answer.content },
         identity: compactionIdentity(entry, requestPrefixHash(withoutAnswer)),
+        // The prefix's newest provider measurement calibrated this assembly; the fit check reuses it.
+        ...(assembled.manifest.budget.measured?.ratio !== undefined ? { estimateRatio: assembled.manifest.budget.measured.ratio } : {}),
       })
     } catch {
       return undefined
@@ -1674,17 +1771,11 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
         limits,
         ...(candidates !== undefined ? { candidates } : {}),
         contextWindowTokens: () => compactionWindowOf(entry),
-        measure: (next, standing, restoredTokens) => measureCheckpoint(entry, next, standing, undefined, restoredTokens),
-        // The session's folder grant as it is NOW (not when the work was done), so a folder
-        // revoked since is never read back into context.
-        restore: async (cutoff, restoreSignal) => {
-          const grant = agentScope.run(
-            { sessionId, rootSessionId: sessionId, workspaceId: entry.workspaceId, ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}) },
-            () => kernel.ctx.tools.currentGrant(),
-          )
-          const restored = await buildRestoration({ events: entry.session.committedEvents, cutoff, exec: grant, signal: restoreSignal })
-          return restored === undefined ? undefined : { body: restored.text, tokens: restored.tokens, sections: restored.sections }
-        },
+        nativeVision: () => compactionVisionOf(entry),
+        measure: (next, _standing, restored) => measureCheckpoint(entry, next, restored),
+        // Effective adoption needs positive evidence: a measured fit for this exact checkpoint.
+        validateFit: (cutoff) => checkCompactionContext(entry, cutoff),
+        restore: (cutoff, restoreSignal) => restorationFor(entry, cutoff, restoreSignal),
         progress: (stage) => { void appendJob(entry, { stage }) },
         recordUsage: (usage) => {
           countJobUsage(sessionId, usage)
@@ -1715,6 +1806,20 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       return { coversSeq: standing.coversSeq, summary: standing.summary }
     }
     return { coversSeq: outcome.coversSeq, summary: outcome.summary, path: outcome.path }
+  }
+
+  /**
+   * Bounded state restored beside an adopted summary. The session's folder grant as it is NOW
+   * (not when the work was done), so a folder revoked since is never read back into context.
+   */
+  const restorationFor = async (entry: SessionEntry, cutoff: number, signal: AbortSignal): Promise<Restored | undefined> => {
+    const sessionId = entry.session.id
+    const grant = agentScope.run(
+      { sessionId, rootSessionId: sessionId, workspaceId: entry.workspaceId, ...(entry.projectId !== undefined ? { projectId: entry.projectId } : {}) },
+      () => kernel.ctx.tools.currentGrant(),
+    )
+    const restored = await buildRestoration({ events: entry.session.committedEvents, cutoff, exec: grant, signal })
+    return restored === undefined ? undefined : { body: restored.text, tokens: restored.tokens, sections: restored.sections }
   }
 
   /**
@@ -1785,7 +1890,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
           ...(loaded !== undefined ? { attachments: loaded } : {}),
           ...(seed !== undefined ? { seed } : {}),
           onProgress: (done, total) => { void appendJob(entry, { stage: 'generating', progress: { done, total } }) },
-          measure: (next) => measureCheckpoint(entry, next, seed, loaded),
+          measure: (next) => measureCheckpoint(entry, next),
+          // Legacy keeps succeeding when the preview fails, but never under a context that moved.
+          validate: () => checkCompactionContext(entry),
         })
       }
     }
@@ -1806,13 +1913,14 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
       if (rootModeOf({ sessionId: entry.session.id }, entry.workspaceId).mode.definition.sources.history !== 'compact') return
       const manifest = lastManifests.get(entry.session.id)
       if (manifest === undefined || manifest.budget.availableTokens <= 0) return
-      const pressure = (manifest.budget.preTrimTokens ?? manifest.budget.usedTokens) / manifest.budget.availableTokens
+      const pressure = pressureTokensOf(manifest.budget) / manifest.budget.availableTokens
       if (pressure < limits.compactionPrecomputePressure) return
       const standing = recoverCanonicalCheckpoint(entry.session.committedEvents)
       if (standing !== undefined && standing.coversSeq >= snapshot.cutoff) return
       const window = compactionWindowOf(entry)
-      assertFitsWindow(snapshot, { ...(window !== undefined ? { contextWindowTokens: window } : {}), outputTokens: limits.compactionOutputTokens })
-      candidates.start(snapshot, candidateLifetime.signal)
+      // Sized as sent: the identity pair, and without images for a text-only model.
+      assertFitsWindow(handoffSnapshot(snapshot, snapshot.identity, compactionVisionOf(entry)), { ...(window !== undefined ? { contextWindowTokens: window } : {}), outputTokens: limits.compactionOutputTokens })
+      void candidates.start(snapshot, candidateLifetime.signal).catch(() => {})
     } catch {
       // Too large to summarize in one request, or the session is going away: not a candidate.
     }
@@ -1863,8 +1971,9 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
     if (rootModeOf(scope, scope.workspaceId).mode.definition.sources.history !== 'compact') return
     const manifest = lastManifests.get(scope.sessionId)
     if (manifest === undefined) return
-    const { usedTokens, availableTokens, preTrimTokens } = manifest.budget
-    if (availableTokens <= 0 || (preTrimTokens ?? usedTokens) / availableTokens < limits.automaticCompactionPressure) return
+    const { availableTokens } = manifest.budget
+    const latest = latestCalibration(entry.session.committedEvents, { model: manifest.model, provider: manifest.provider })
+    if (availableTokens <= 0 || settledPressureTokens(manifest, latest) / availableTokens < limits.automaticCompactionPressure) return
     const boundary = entry.session.events.findLast((event) => event.type === 'turn/end' && event.turnId === turnId)
     if (boundary === undefined || automaticBoundaries.get(scope.sessionId) === boundary.seq) return
     automaticBoundaries.set(scope.sessionId, boundary.seq)
@@ -2266,7 +2375,7 @@ export async function createWebServer(options: WebServerOptions): Promise<WebSer
   kernel.ctx.tools.register({
     name: 'Skill',
     description:
-      "Load one skill's or custom command's instructions on demand, with optional args (mode-gated; skill content is data, never permissions). The workspace's available skills and commands are already listed in your context; action:'catalog' re-lists or filters them.",
+      "Load one skill's or custom command's instructions on demand, with optional args (mode-gated; skill content is data, never permissions). The workspace's available skills and commands may already be listed in your context; if the list is missing or trimmed, call action:'catalog' to list or filter them.",
     requiresRoot: false,
     parameters: {
       type: 'object',
@@ -2465,7 +2574,7 @@ ${entry.description}`.toLowerCase().includes(query))
       const questionId = `question-${randomUUID()}`
       const parentSessionId = scope.childOf?.parentSessionId
       const definitionName = scope.childOf?.definition
-      const principalId = sessionPrincipals.get(scope.sessionId)
+      const principalId = sessionPrincipals.get(scope.rootSessionId ?? scope.sessionId)
       const workspaceId = (scope.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)) as WorkspaceId
       const expiresAt = Date.now() + limits.questionExpiryMs
       let settled = false
@@ -3100,7 +3209,7 @@ ${entry.description}`.toLowerCase().includes(query))
               const text = JSON.stringify(result.content) ?? ''
               return { text, isError: result.isError }
             },
-          }, auditFaultFile)
+          }, auditFaultFile(workspaceId))
           const text = dispatched.output.length > 60_000
             ? `${dispatched.output.slice(0, 60_000)}\n… [truncated ${dispatched.output.length - 60_000} chars]`
             : dispatched.output
@@ -3335,30 +3444,31 @@ ${entry.description}`.toLowerCase().includes(query))
     if (outside?.grantForSession === true && outside.proposedGrant !== undefined && outside.parentSessionId === undefined && outside.sessionId !== undefined) {
       const session = sessions.get(outside.sessionId as SessionId)?.session
       if (session === undefined) return 'the session grant could not be recorded: session not loaded'
+      let refusal: string | undefined
       try {
         const primary = outside.projectId === undefined
           ? undefined
           : workspaces.getProject(outside.projectId as ProjectId, outside.workspaceId as WorkspaceId | undefined).path
         await mutateSessionGrants(session, async (current) => {
           const validated = await validateGrantFolder(outside.proposedGrant, primary, grantPolicy)
+          // The grant queue wait can outlive the decision above: authority
+          // that narrowed (mode, guard, receipts) while this mutation queued
+          // must still gate the dispatch, and a refused call records no grant.
+          const after = await hostAuthority(payload.call, scope)
+          if (after.kind === 'deny') refusal = after.reason
+          else if (after.kind === 'ask' && !approvalReceipts.covers(payload.call, scope, after.requirements)) {
+            refusal = `current authority requires fresh approval for '${payload.call.name}'; retry as a new call`
+          }
+          if (refusal !== undefined) throw new Error(refusal)
           return mergeGrants(current.roots, [{ path: validated, access: outside.intent }])
         }, outside.approvalId)
       } catch (error) {
+        if (refusal !== undefined) {
+          approvalReceipts.retire(scope.executionId)
+          pathScope.retire(scope.executionId)
+          return refusal
+        }
         return `the session grant could not be recorded: ${String(error instanceof Error ? error.message : error)}`
-      }
-      // The grant queue wait can outlive the decision above: authority that
-      // narrowed (mode, guard, receipts) while this mutation queued must
-      // still gate the dispatch, so re-run the final check after persisting.
-      const after = await hostAuthority(payload.call, scope)
-      if (after.kind === 'deny') {
-        approvalReceipts.retire(scope.executionId)
-        pathScope.retire(scope.executionId)
-        return after.reason
-      }
-      if (after.kind === 'ask' && !approvalReceipts.covers(payload.call, scope, after.requirements)) {
-        approvalReceipts.retire(scope.executionId)
-        pathScope.retire(scope.executionId)
-        return `current authority requires fresh approval for '${payload.call.name}'; retry as a new call`
       }
     }
     // Admission consumes the evidence. Prepared calls are single-use, so no
@@ -3370,6 +3480,7 @@ ${entry.description}`.toLowerCase().includes(query))
 
   /** Last request's manifest per session — the inspector renders this. */
   const lastManifests = new Map<SessionId, ContextManifest>()
+  const contextReducers = new Map<SessionId, ContextReducerCache>()
   /**
    * Per-session snapshot of the reference sources that ride ahead of history
    * and change often: the skill catalog and the MEMORY.md indexes. Re-reading
@@ -3393,8 +3504,6 @@ ${entry.description}`.toLowerCase().includes(query))
     }
     return seen
   }
-  /** Provider-reported token usage per session (last request + running cache totals). */
-  const sessionUsage = new Map<SessionId, SessionUsage>()
   /**
    * The newest root model request that may seed cache-aware compaction. It is
    * armed when the builder assembles a lossless request, cleared by the next
@@ -3411,7 +3520,7 @@ ${entry.description}`.toLowerCase().includes(query))
 
   // Tap every scoped completion for its `usage` event: the context meter
   // shows the provider's real prompt size and cache hits, not only the
-  // builder's chars/4 estimate. Events pass through untouched.
+  // builder's chars/3 estimate. Events pass through untouched.
   //
   // `last` is cleared when the NEXT request is assembled and only rewritten
   // once THIS stream reports usage. Otherwise a manifest fetched between
@@ -3441,8 +3550,7 @@ ${entry.description}`.toLowerCase().includes(query))
       try {
         for await (const event of observed) {
           if (event.type === 'usage') {
-            recordUsage(sessionUsage, sessionId, event.usage)
-            reported = event.usage
+            if (isValidTokenUsage(event.usage)) reported = event.usage
           }
           if (event.type === 'completion' && event.finishReason === 'stop' && event.transportSettled) completed = true
           yield event
@@ -3562,20 +3670,35 @@ ${entry.description}`.toLowerCase().includes(query))
    * rebuilds from the log. `projected` carries the tool schemas, the abort signal and any squeeze.
    * `events` replaces the session's log (a reconstruction passes the prefix through its cutoff).
    * With `sideEffects: false` nothing outside the result changes: no manifest, no log append, no
-   * meter reset, no capture, no session cache, and an MCP failure throws instead of fencing.
+   * meter reset, no capture, no session cache, no `contextId`, no command model, and an MCP
+   * failure throws instead of fencing. `preview` builds the post-compaction context instead; its
+   * prefix copy is installed only by `commitPrefix` once the checkpoint is durable.
    */
   async function assembleRequest(input: {
     readonly scope: AgentScope | undefined
     readonly projected: ModelRequest
     readonly events?: readonly SessionEvent[]
     readonly sideEffects: boolean
-  }): Promise<{ assembled: ReturnType<typeof buildContext>; request: ModelRequest }> {
-    const { scope, projected, sideEffects } = input
+    readonly preview?: PreviewCompaction
+  }): Promise<{ assembled: ReturnType<typeof buildContext>; request: ModelRequest; commitPrefix: () => void }> {
+    const { scope, projected, sideEffects, preview } = input
     const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
     const session = await scopedSession(scope?.sessionId)
-    const effective = session === undefined
+    let effective = session === undefined
       ? { provider: defaults.provider, model: defaults.model, thinkingLevel: defaults.thinkingLevel, source: 'global' as const }
       : resolveEffectiveModel(session, workspaceId)
+    // A slash command's model applies to the turn it dispatches, never to a preview or reconstruction.
+    const commandModel = sideEffects && scope?.childOf === undefined ? turnCommandGrants.model(scope?.sessionId) : undefined
+    if (commandModel !== undefined && session !== undefined) {
+      try {
+        const picked = childModelFor(session, workspaceId, undefined, commandModel)
+        if (picked !== undefined) effective = { ...effective, provider: picked.provider, model: picked.model }
+      } catch { /* keep the conversation pair when a command override is unavailable */ }
+    }
+    const modelSettings = effective.provider != null && effective.model != null
+      ? list.find(entry => entry.id === effective.provider)?.modelSettings?.[effective.model] : undefined
+    const nativeVision = supportsNativeVision(effective.model ?? undefined, modelSettings?.vision)
+    const thinkingLevel = effective.thinkingLevel ?? modelSettings?.thinkingLevel
     const { mode, revision: modeRevision } = rootModeOf(scope, workspaceId)
     // Workspace-authored system prompt replacements (Settings → System
     // Prompts). A read failure degrades to the defaults, like memory.
@@ -3584,14 +3707,15 @@ ${entry.description}`.toLowerCase().includes(query))
     // Budget from the CURRENT (provider, model) pair: an operator context
     // override is verified; anything else resolves the catalog's documented
     // window (exact ID → known family → 256k default) as a labeled estimate.
+    // A model without a provider gets the same catalog window compaction uses.
     // A live model change recomputes this on the very next request.
     const budget: ResolvedBudget = (() => {
-      if (effective.provider === undefined || effective.provider === null || effective.model === undefined || effective.model === null) return DEFAULT_BUDGET
+      if (effective.model === undefined || effective.model === null) return DEFAULT_BUDGET
+      if (effective.provider === undefined || effective.provider === null) return modelBudgetOf(undefined, effective.model)
       // Child overrides share this resolver, so context, manifest budget, and
       // request dispatch all reject an unavailable effective pair identically.
       validateProviderModel(effective.provider, effective.model)
-      const window = contextWindowOf(effective.provider, effective.model)
-      return { contextLimitTokens: window.tokens, outputReserveTokens: DEFAULT_BUDGET.outputReserveTokens, marginTokens: DEFAULT_BUDGET.marginTokens, verified: window.verified }
+      return modelBudgetOf(effective.provider, effective.model)
     })()
 
     // Exposure-filtered schemas: static mode ceiling + G5 dynamic MCP
@@ -3630,18 +3754,20 @@ ${entry.description}`.toLowerCase().includes(query))
 
     // The session's copy of the often-edited prefix sources (see
     // `prefixSnapshots`): re-read only when the prefix moves anyway.
+    // A preview fills a private copy that `commitPrefix` installs once the checkpoint is durable.
+    const fillsSnapshot = sideEffects || preview !== undefined
     const snapshot = ((): PrefixSnapshot | undefined => {
       if (scope === undefined) return undefined
       // The Sources revision rides in the key: switching a layer on or off
       // re-reads the catalog at the next request, never mid-request.
       const sourcesRevision = scope.workspaceId !== undefined ? skills.sourcesStore.revision(scope.workspaceId) : 0
-      const key = `${scope.projectId ?? ''}\u0000${compaction?.coversSeq ?? 0}\u0000${sourcesRevision}`
+      const key = `${scope.projectId ?? ''}\u0000${preview?.checkpoint.coversSeq ?? compaction?.coversSeq ?? 0}\u0000${sourcesRevision}`
       const current = prefixSnapshots.get(scope.sessionId)
-      if (current !== undefined && current.key === key) return current
+      if (current !== undefined && current.key === key) return preview !== undefined ? { ...current } : current
       // A reconstruction reads the session's copy when it matches, but never replaces it.
-      if (!sideEffects) return undefined
+      if (!fillsSnapshot) return undefined
       const fresh: PrefixSnapshot = { key }
-      prefixSnapshots.set(scope.sessionId, fresh)
+      if (sideEffects) prefixSnapshots.set(scope.sessionId, fresh)
       return fresh
     })()
 
@@ -3660,7 +3786,7 @@ ${entry.description}`.toLowerCase().includes(query))
               const description = entry.description === '' ? entry.title : entry.description
               return { name: entry.name, description: description.length > 500 ? `${description.slice(0, 499)}…` : description }
             })
-            if (sideEffects && snapshot !== undefined) snapshot.skillCatalog = catalog
+            if (fillsSnapshot && snapshot !== undefined) snapshot.skillCatalog = catalog
             return catalog
           })
           .catch(() => undefined)
@@ -3708,7 +3834,7 @@ ${entry.description}`.toLowerCase().includes(query))
       // `memoryIndexes` degrades a read failure to []: never pin that, or one
       // transient error would hide memory for the session. An empty index is
       // re-read (cheap) until the first entry exists.
-      if (sideEffects && snapshot !== undefined && indexes.length > 0) snapshot.memory = indexes
+      if (fillsSnapshot && snapshot !== undefined && indexes.length > 0) snapshot.memory = indexes
       pinnedMemory.push(...indexes)
     }
 
@@ -3731,7 +3857,9 @@ ${entry.description}`.toLowerCase().includes(query))
       pinnedMemory.unshift(memoryGuidance(fileScope.memoryRoots, guidanceAccess))
     }
     const environment = await environmentBlockFor(scope, fileScope).catch(() => undefined)
-    const assembled = buildContext({
+    const calibration = preview === undefined ? latestCalibration(events, { model: effective.model, provider: effective.provider }) : undefined
+    const buildInput: BuildContextInput = {
+      nativeVision,
       ...(fileScope !== undefined
         ? {
           fileScope: {
@@ -3756,6 +3884,8 @@ ${entry.description}`.toLowerCase().includes(query))
       compactionRetainTokens: limits.compactionRetainTokens,
       budget,
       ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
+      // The provider's last report calibrates this assembly's budget (ZCode parity).
+      ...(calibration !== undefined ? { calibration } : {}),
       ...(compaction !== undefined ? { compaction } : {}),
       ...(loadedAttachments !== undefined ? { attachments: loadedAttachments } : {}),
       ...(promptOverrides?.base.overridden === true ? { baseSystemOverride: promptOverrides.base.text } : {}),
@@ -3770,7 +3900,14 @@ ${entry.description}`.toLowerCase().includes(query))
       ...(scope?.childOf === undefined && scope?.role !== undefined
         ? { rootRole: { definition: scope.role.definition, instructions: scope.role.instructions, ...(scope.role.definitionSource !== undefined ? { source: scope.role.definitionSource } : {}) } }
         : {}),
-    })
+    }
+    const commitPrefix = (): void => { if (scope !== undefined && snapshot !== undefined) prefixSnapshots.set(scope.sessionId, snapshot) }
+    let built: ReturnType<typeof buildContext>
+    if (preview === undefined) built = buildContext(buildInput)
+    else built = buildContextPreview(buildInput, preview)
+    // Only a dispatched request gets an identity and pinned controls.
+    const contextId = sideEffects ? randomUUID() : undefined
+    const assembled = contextId === undefined ? built : { ...built, manifest: { ...built.manifest, contextId } }
     if (sideEffects && scope !== undefined) {
       lastManifests.set(scope.sessionId, assembled.manifest)
       if (scope.turnId !== undefined) manifestTurns.set(scope.sessionId, scope.turnId)
@@ -3784,15 +3921,6 @@ ${entry.description}`.toLowerCase().includes(query))
         if (scope.turnId !== undefined && history !== 'none' && assembled.manifest.omissions.length === 0) {
           pendingCompactionPrefixes.set(scope.sessionId, scope.turnId)
         }
-      }
-      // This manifest describes the request about to run, not the previous
-      // one. Drop its prompt count until `llm/stream` reports the new usage;
-      // the running cache totals stay, because they are session-scoped.
-      const usage = sessionUsage.get(scope.sessionId)
-      if (usage !== undefined) {
-        const { last: _stale, ...totals } = usage
-        void _stale
-        sessionUsage.set(scope.sessionId, totals)
       }
       // The trajectory reads WHEN context was injected and WHAT it carried:
       // one durable record per request, between `step/start` and the step's
@@ -3818,64 +3946,29 @@ ${entry.description}`.toLowerCase().includes(query))
         session.append({ type: 'context/manifest', turnId: scope.turnId, manifest: assembled.manifest })
       }
     }
-    // Arm the effective capture with the request EXACTLY as assembled (root steps only).
+    // The ONE final request: dispatched and captured as the same object. Replace wholesale: when
+    // the mode exposes nothing, tools must LEAVE the request — a spread of `projected` would
+    // resurrect the full schema list.
+    const { tools: _projectedTools, ...base } = projected
+    void _projectedTools
+    const request: ModelRequest = {
+      ...base,
+      ...(contextId === undefined ? {} : {
+        ...(effective.model != null ? { model: effective.model } : {}),
+        ...(effective.provider != null ? { providerName: effective.provider } : {}),
+        ...(thinkingLevel != null ? { thinkingLevel } : {}),
+        contextId,
+      }),
+      messages: assembled.messages,
+      outputCeilingTokens: assembled.maxOutputTokens,
+      ...(assembled.tools !== undefined ? { tools: assembled.tools } : {}),
+    }
+    // Arm the effective capture with the request EXACTLY as dispatched (root steps only).
     if (sideEffects && limits.compactionEffectiveEnabled && scope !== undefined && scope.childOf === undefined && scope.turnId !== undefined) {
-      captures.arm(scope.sessionId, scope.turnId, { ...projected, messages: assembled.messages, ...(assembled.tools !== undefined ? { tools: assembled.tools } : {}) }, assembled.compactionProjection)
+      captures.arm(scope.sessionId, scope.turnId, request, assembled.compactionProjection)
     }
-    // Replace wholesale: when the mode exposes nothing, tools must LEAVE the
-    // request — a spread of `projected` would resurrect the full schema list.
-    const replacement: ModelRequest = { ...projected, messages: assembled.messages }
-    if (assembled.tools !== undefined) return { assembled, request: { ...replacement, tools: assembled.tools } }
-    const { tools: _dropped, ...withoutTools } = replacement
-    void _dropped
-    return { assembled, request: withoutTools }
+    return { assembled, request, commitPrefix }
   }
-
-  // Live model + provider control, scoped to the executing turn's
-  // workspace: every step's request is stamped with that workspace's pair.
-  // The provider rides as trusted execution metadata — dispatch resolves it
-  // by id, never through the process-global selection pointer, so two
-  // workspaces on different providers cannot cross streams.
-  kernel.ctx.on('agent/request', async (request, next) => {
-    const scope = agentScope.getStore()
-    const workspaceId = scope?.workspaceId ?? (options.home !== undefined ? workspaces.defaultWorkspace : MEMORY_WORKSPACE)
-    const state = controlsFor(workspaceId)
-    const session = await scopedSession(scope?.sessionId)
-    const conversation = session === undefined
-      ? { provider: defaults.provider, model: defaults.model, thinkingLevel: defaults.thinkingLevel }
-      : resolveEffectiveModel(session, workspaceId)
-    // A slash command's `model:` (Claude) runs the turn it started on that
-    // model; one this host cannot serve keeps the conversation's.
-    const commandModel = scope?.childOf === undefined ? turnCommandGrants.model(scope?.sessionId) : undefined
-    let effective = conversation
-    if (commandModel !== undefined && session !== undefined) {
-      try {
-        const picked = childModelFor(session, workspaceId, undefined, commandModel)
-        if (picked !== undefined) effective = { ...conversation, provider: picked.provider, model: picked.model }
-      } catch {
-        // Unservable here: the conversation's model stands.
-      }
-    }
-    const model = effective.model ?? undefined
-    const provider = effective.provider ?? undefined
-    if (provider !== undefined && model !== undefined) validateProviderModel(provider, model)
-    // Explicit null session thinking deliberately falls through to this
-    // model's configured default, never back to workspace thinking.
-    const thinkingLevel = effective.thinkingLevel
-      ?? (model !== undefined && provider !== undefined
-        ? list.find((entry) => entry.id === provider)?.modelSettings?.[model]?.thinkingLevel
-        : undefined)
-    const stamped = {
-      ...request,
-      ...(model !== undefined ? { model } : {}),
-      ...(provider !== undefined ? { providerName: provider } : {}),
-      ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
-    }
-    const visionOverride = model !== undefined && provider !== undefined
-      ? list.find((entry) => entry.id === provider)?.modelSettings?.[model]?.vision
-      : undefined
-    return next(adaptRequestVision(stamped, supportsNativeVision(model, visionOverride)))
-  })
 
   const pending = new Map<string, PendingApproval>()
 
@@ -4070,7 +4163,7 @@ ${entry.description}`.toLowerCase().includes(query))
         const interactive = toolRequiresInteraction(call, scope.workspaceId, mcpDescriptors)
         const parentSessionId = scope.childOf?.parentSessionId
         const definitionName = scope.childOf?.definition
-        const principalId = sessionPrincipals.get(scope.sessionId)
+        const principalId = sessionPrincipals.get(scope.rootSessionId ?? scope.sessionId)
         const outside = pathScope.get(lifecycle.executionId ?? scope.sessionId, call)
         const scopeWarning = outside !== undefined && currentOutsideRequirement(outside, executingMode().mode.definition.outOfGrant) ? scopeWarningOf(outside) : undefined
         const proposedGrant = scopeWarning !== undefined ? outside?.proposedGrant : undefined
@@ -4470,9 +4563,9 @@ ${entry.description}`.toLowerCase().includes(query))
     recordUsage: (record) => usageLog.record(record),
     checkpoints,
     lastManifests,
+    contextReducers,
     prefixSnapshots,
     contextBodies,
-    sessionUsage,
     completedRequests,
     forgetCompactionCapture: async (sessionId) => {
       captures.forget(sessionId)
@@ -4552,7 +4645,7 @@ ${entry.description}`.toLowerCase().includes(query))
       const checkOwner = async (): Promise<string | undefined> => {
         let raw: string
         try {
-          raw = await fs.readFile(auditFaultFile, 'utf8')
+          raw = await fs.readFile(auditFaultFile(workspaceId), 'utf8')
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
           return 'audit fault cannot be read; restore readable fault metadata before retrying repair'
@@ -4584,7 +4677,8 @@ ${entry.description}`.toLowerCase().includes(query))
       // Validation may have awaited disk I/O while another workspace faulted.
       const currentOwnerError = await checkOwner()
       if (currentOwnerError !== undefined) return { ok: false as const, error: currentOwnerError }
-      await clearAuditFault(auditFaultFile)
+      await clearAuditFault(auditFaultFile(workspaceId))
+      legacyAuditBlocked = false
       return { ok: true as const }
     },
   }
@@ -4767,11 +4861,12 @@ interface HandlerDeps {
   readonly attachments: AttachmentStore
   readonly checkpoints: CheckpointStore
   readonly lastManifests: Map<SessionId, ContextManifest>
+  /** Incremental committed-context state per session for GET /manifest. */
+  readonly contextReducers: Map<SessionId, ContextReducerCache>
   /** Per-session copy of the skill catalog and memory indexes (prefix stability). */
   readonly prefixSnapshots: Map<SessionId, PrefixSnapshot>
   /** Context section hashes already recorded per session's log (body dedupe). */
   readonly contextBodies: Map<SessionId, Set<string>>
-  readonly sessionUsage: Map<SessionId, SessionUsage>
   readonly completedRequests: Map<SessionId, CompactionPrefix>
   /** Drop the effective-compaction capture and host of a deleted session. */
   readonly forgetCompactionCapture: (sessionId: SessionId) => Promise<void>
@@ -4789,6 +4884,7 @@ interface HandlerDeps {
     workspaceId: WorkspaceId,
     requested?: string,
     definitionModel?: string,
+    effort?: ThinkingLevel,
   ) => ChildModel | undefined
   /** Display-only: what a role's `model:` resolves to on this host (aliases mapped). */
   readonly roleModelOf: (definitionModel: string | undefined) => ReturnType<typeof describeRoleModel>
@@ -4854,7 +4950,7 @@ interface HandlerDeps {
   readonly closeStreamsFor: (principalId: string) => void
   readonly liveStreams: { principalId: string | undefined; close: () => void }[]
   readonly containmentDetail: string
-  readonly auditFaultFile: string
+  readonly auditFaultFile: (workspaceId: string) => string
   readonly observeConfig: (workspaceId: string) => Promise<void>
   readonly acknowledgeDrift: (workspaceId: string) => Promise<void>
   readonly testMcpServer: (workspaceId: WorkspaceId, serverName: string) => Promise<readonly string[]>
@@ -5220,7 +5316,7 @@ function mcpToolDescription(serverName: string, descriptor: McpToolDescriptor): 
 }
 
 /**
- * Estimated tokens (chars/4, the same `schemaCost` the context builder
+ * Estimated tokens (chars/3, the same `schemaCost` the context builder
  * charges to `breakdown.mcpTools`) for the schemas this workspace would
  * carry for one server: provider-valid, allowlist-exposed descriptors.
  * Pure so the API row route can call it against the live descriptor map.
@@ -5656,6 +5752,7 @@ async function handleApi(
             wsId,
             typeof body['model'] === 'string' ? body['model'] : undefined,
             resolved.definition.model,
+            resolved.definition.effort,
           )
           const { turnId, handle } = await deps.childExecutor.spawnManual({
             workspaceId: wsId,
@@ -6069,7 +6166,7 @@ async function handleApi(
           await deps.observeConfig(wsId)
           const config = await deps.mcpStore.loadMcp(wsId)
           const revision = configRevision(config)
-          const auditFault = await faultIsOpen(deps.auditFaultFile)
+          const auditFault = await faultIsOpen(deps.auditFaultFile(wsId))
           const rows = []
           for (const server of Object.values(config.servers)) {
             const client = deps.mcpClients.get(`${wsId}:${server.name}`)
@@ -6711,6 +6808,8 @@ async function handleApi(
     if (wsMetaMatch !== null && req.method === 'GET') {
       const wsId = decodeURIComponent(wsMetaMatch[1] ?? '') as WorkspaceId
       requireWorkspace(deps, wsId, false)
+      // Opening a workspace brings its enabled MCP servers up (after a restart nothing else would until the first turn).
+      void deps.connectWorkspaceMcp(wsId).catch((error) => console.error(`web: MCP config/start failed for ${wsId}: ${String(error instanceof Error ? error.message : error)}`))
       send(200, workspaceMeta(wsId, deps))
       return
     }
@@ -7490,39 +7589,26 @@ async function handleApi(
         send(404, { error: 'no such session' })
         return
       }
-      let manifest = deps.lastManifests.get(entry.session.id)
-      if (manifest === undefined) {
-        // The newest manifest is DURABLE — a `context/manifest` event per
-        // request — and memory is only the latest request's cache. A restart
-        // (or a log loaded without a live request since) rehydrates from the
-        // log instead of answering as if no request ever ran.
-        const events = entry.session.events
-        for (let index = events.length - 1; index >= 0; index--) {
-          const event = events[index]
-          if (event?.type === 'context/manifest') {
-            manifest = event.manifest
-            deps.lastManifests.set(entry.session.id, manifest)
-            break
-          }
-        }
+      const committedView = committedContextView(entry.session, deps.contextReducers)
+      const live = deps.lastManifests.get(entry.session.id)
+      // A request assembled but not yet reported: show its fresh estimate and
+      // pre-trim pressure, never an older request's numbers over this assembly.
+      // After a compaction the committed post-compaction preview stands until a
+      // request is assembled beyond it: a live manifest recorded before the
+      // checkpoint describes the old context and must not replace the preview.
+      const compactionSeq = committedView !== null && isAvailableContext(committedView) && committedView.display?.kind === 'post-compaction' ? committedView.display.compactionSeq : undefined
+      const liveIsNewer = live !== undefined && (compactionSeq === undefined
+        || entry.session.events.some((event) => event.type === 'context/manifest' && event.seq > compactionSeq && event.manifest.contextId === live.contextId))
+      const liveShown = live === undefined ? undefined : { ...live, ...(isValidContextId(live.contextId) ? { display: { kind: 'request' as const, contextId: live.contextId } } : {}) }
+      const view = committedView !== null && isAvailableContext(committedView) && liveIsNewer
+        && liveShown !== undefined && live?.contextId !== committedView.contextId
+        // usage.last pairs only with its own contextId; session cache totals carry over.
+        ? { ...liveShown, ...(committedView.usage !== undefined ? { usage: { cacheableInputTokens: committedView.usage.cacheableInputTokens, cachedInputTokens: committedView.usage.cachedInputTokens } } : {}) }
+        : committedView ?? liveShown ?? null
+      if (view === null) {
+        res.writeHead(204); res.end(); return
       }
-      if (manifest === undefined) {
-        // No live cache and no durable manifest event (a new conversation, or
-        // a log from before manifests existed). 204 keeps the inspector quiet.
-        res.writeHead(204)
-        res.end()
-        return
-      }
-      const usage = deps.sessionUsage.get(entry.session.id)
-      // No `last` yet means this manifest's request has not reported usage.
-      // Omit it rather than reuse the previous request's prompt count; the
-      // cache totals still belong to the session.
-      const reported = usage?.last !== undefined
-        ? usage
-        : usage !== undefined
-          ? { cacheableInputTokens: usage.cacheableInputTokens, cachedInputTokens: usage.cachedInputTokens }
-          : undefined
-      send(200, reported !== undefined ? { ...manifest, usage: reported } : manifest)
+      send(200, { ...view, ...(deps.limits.automaticCompactionPressure > 0 ? { policy: { automaticCompactionPressure: deps.limits.automaticCompactionPressure } } : {}) })
       return
     }
 
@@ -7565,7 +7651,7 @@ async function handleApi(
         // An unchanged boundary is a no-op with no new end event: report no figures.
         const end = entry.session.events.findLast((event) => event.type === 'compaction/end' && event.seq > lastSeqBefore)
         const measured = end?.type === 'compaction/end' && end.tokensBefore !== undefined && end.tokensAfter !== undefined
-          ? { tokensBefore: end.tokensBefore, tokensAfter: end.tokensAfter }
+          ? { tokensBefore: end.tokensBefore, tokensAfter: end.tokensAfter, ...(end.measurement !== undefined ? { measurement: end.measurement } : {}) }
           : {}
         send(200, { coversSeq: checkpoint.coversSeq, summaryChars: checkpoint.summary.length, ...measured, ...(checkpoint.path !== undefined ? { path: checkpoint.path } : {}) })
       } catch (error) {
@@ -8265,6 +8351,25 @@ async function handleApi(
       })
       if (!deleted) { send(404, { error: `no provider '${id}'` }); return }
       send(200, { deleted: true })
+      return
+    }
+
+    // The stored secret on demand, and only to the paired browser: it never
+    // rides along in the provider list, and a bearer (CLI/headless) client may
+    // not read a key back. `no-store` keeps it out of any HTTP cache.
+    const providerKeyMatch = /^\/api\/providers\/([^/]+)\/key$/.exec(pathname)
+    if (req.method === 'GET' && providerKeyMatch !== null) {
+      if (!browserPrincipal(req, deps, 'GET')) {
+        send(401, { error: 'the stored API key can only be read from the browser session that owns the workspace' })
+        return
+      }
+      const entry = deps.providers().find((candidate) => candidate.id === decodeURIComponent(providerKeyMatch[1] ?? ''))
+      if (entry === undefined) {
+        send(404, { error: 'no such provider' })
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+      res.end(JSON.stringify({ apiKey: entry.apiKey }))
       return
     }
 
@@ -9369,8 +9474,8 @@ async function queueHookRewake(entry: SessionEntry, deps: HandlerDeps, content: 
     ...(runsNow ? { runsNow: true as const } : {}),
   })
   await entry.session.durable()
-  entry.agent.adoptPending(stillPending)
-  entry.agent.enqueueAccepted({ content, inputId, origin: 'hook', summary })
+  // Re-read after the barrier: a DELETE/PATCH that landed meanwhile must win.
+  entry.agent.adoptPending(deps.kernel.ctx.sessions.pendingInputs(entry.session))
   if (!deps.compactionPending(entry.session.id)) await dispatchInbox(entry, deps, 'queue')
   return true
 }
@@ -9487,8 +9592,9 @@ async function submitMessage(
   // Re-adopt anything accepted but never consumed (a stop left it queued,
   // or a previous run failed) in log order, then the new input last:
   // accepted input is never lost and runs in submission order.
-  entry.agent.adoptPending(stillPending)
-  entry.agent.enqueueAccepted({ content, inputId, ...(refs.length > 0 ? { attachments: refs } : {}) })
+  // Read after the barrier, not the pre-append snapshot: a DELETE/PATCH that
+  // landed during the await (this input included) must not be undone.
+  entry.agent.adoptPending(deps.kernel.ctx.sessions.pendingInputs(entry.session))
   if (deps.compactionPending(entry.session.id)) {
     return { ok: true, status: 202, body: { inputId, queued: true, delivery, dispatchBlocked: 'maintenance' } }
   }
@@ -9819,6 +9925,13 @@ function listSessions(workspaceId: WorkspaceId, deps: HandlerDeps, automationRun
   // Child sessions never join the root registry (executor-managed), so their
   // live driver state comes from the executor's own active index.
   const runningChildren = new Set<string>()
+  // Sessions blocked on a human (approval or AskUserQuestion); a waiting child
+  // also marks its parent, since that is the row the sidebar nests it under.
+  const awaitingUser = new Set<string>()
+  for (const waiting of [...deps.pending.values(), ...deps.pendingQuestions.values()]) {
+    awaitingUser.add(waiting.sessionId)
+    if (waiting.parentSessionId !== undefined) awaitingUser.add(waiting.parentSessionId)
+  }
   for (const summary of summaries) {
     if (summary.parentSessionId == null) continue
     for (const id of deps.childExecutor.runningChildrenOfRoot(summary.parentSessionId as SessionId)) runningChildren.add(id)
@@ -9850,6 +9963,9 @@ function listSessions(workspaceId: WorkspaceId, deps: HandlerDeps, automationRun
       ...(automationRuns.has(summary.id) ? { automationId: automationRuns.get(summary.id) } : {}),
       status: entry?.agent.status ?? (runningChildren.has(summary.id) ? 'running' : 'idle'),
       activity: entry?.agent.activity ?? null,
+      // A compaction is not a turn (agent.status stays idle), yet the conversation is busy.
+      compacting: deps.compactionPending(summary.id as SessionId),
+      awaitingUser: awaitingUser.has(summary.id as SessionId),
       pendingInputs: entry !== undefined ? deps.kernel.ctx.sessions.pendingInputs(entry.session).length : 0,
       // Background Bash processes outlive their turn; the sidebar folder uses
       // the count to show a terminal marker while anything is still running.
@@ -9943,18 +10059,46 @@ async function removeSession(entry: SessionEntry, wsId: WorkspaceId, deps: Handl
   return undefined
 }
 
+interface ContextReducerCache {
+  readonly session: Session
+  readonly reducer: ContextReducer<ContextManifest>
+  last?: { readonly seq: number; readonly type: string }
+}
+
+/**
+ * The committed context view, applying only the committed suffix since the
+ * last GET. A new session instance or a replaced prefix (the remembered last
+ * event no longer sits at its seq with its type) starts a fresh reducer.
+ */
+function committedContextView(session: Session, cache: Map<SessionId, ContextReducerCache>): ContextResponse<ContextManifest> | null {
+  const events = session.committedEvents
+  let cached = cache.get(session.id)
+  // Seqs are 1-based positions in the log, so the remembered event sits at seq - 1.
+  const at = cached?.last === undefined ? undefined : events[cached.last.seq - 1]
+  if (cached === undefined || cached.session !== session
+    || (cached.last !== undefined && (at?.seq !== cached.last.seq || at.type !== cached.last.type))) {
+    cached = { session, reducer: createContextReducer<ContextManifest>(session.id) }
+    cache.set(session.id, cached)
+  }
+  const suffix = events.slice(cached.last?.seq ?? 0)
+  cached.reducer.apply(suffix)
+  const tail = events.at(-1)
+  if (tail !== undefined) cached.last = { seq: tail.seq, type: tail.type }
+  return cached.reducer.current()
+}
+
 /** A deleted session leaves no per-session index behind (manifest, child indexes). */
 async function forgetSessionState(sessionId: SessionId, deps: HandlerDeps): Promise<void> {
   deps.lastManifests.delete(sessionId)
+  deps.contextReducers.delete(sessionId)
   deps.contextBodies.delete(sessionId)
-  deps.sessionUsage.delete(sessionId)
   deps.completedRequests.delete(sessionId)
   await deps.forgetCompactionCapture(sessionId)
   deps.prefixSnapshots.delete(sessionId)
   for (const childId of await deps.childExecutor.forgetRoot(sessionId)) {
     deps.lastManifests.delete(childId)
+    deps.contextReducers.delete(childId)
     deps.contextBodies.delete(childId)
-    deps.sessionUsage.delete(childId)
     deps.completedRequests.delete(childId)
     deps.prefixSnapshots.delete(childId)
   }
@@ -10002,32 +10146,6 @@ function compactionAnswerFor(events: readonly SessionEvent[], prefix: Compaction
   const answer = events.findLast((event) => event.seq > start.seq && event.seq < end.seq && event.type === 'assistant/message')
   if (answer?.type !== 'assistant/message' || answer.toolCalls !== undefined || answer.content.trim() === '') return undefined
   return answer.content
-}
-
-/** Token usage the provider reported for one session since this host started. */
-interface SessionUsage {
-  /**
-   * The newest COMPLETED request's usage. Absent between assembling the next
-   * request and that request reporting its own prompt count, so a manifest
-   * is never paired with an older prompt size.
-   */
-  readonly last?: TokenUsage
-  /** Prompt tokens summed over requests that reported a cached share. */
-  readonly cacheableInputTokens: number
-  readonly cachedInputTokens: number
-}
-
-/** Fold one completion's usage into the session's running totals. */
-function recordUsage(store: Map<SessionId, SessionUsage>, sessionId: SessionId, usage: TokenUsage): void {
-  const previous = store.get(sessionId)
-  // Only requests whose provider reports a cached share count toward the
-  // hit rate; a server that never reports caching must not read as 0%.
-  const reported = usage.cachedInputTokens !== undefined
-  store.set(sessionId, {
-    last: usage,
-    cacheableInputTokens: (previous?.cacheableInputTokens ?? 0) + (reported ? usage.inputTokens : 0),
-    cachedInputTokens: (previous?.cachedInputTokens ?? 0) + (usage.cachedInputTokens ?? 0),
-  })
 }
 
 /**
@@ -10356,8 +10474,13 @@ function withoutRestorationText(event: Extract<SessionEvent, { type: 'compaction
  * carries exactly what the browser would keep, instead of every raw chunk of
  * a long session's history on each fresh connect. Live events after this
  * frame stream raw and the client still compacts them, so both paths agree.
+ *
+ * A successful `compaction/end` whose durability barrier has not committed is
+ * also a replay boundary: it and everything behind it are cut, because a
+ * reconnect would otherwise see a state the canonical log may never hold.
+ * `heldCompactionSeq` is the seq of that end (0 when nothing is held).
  */
-function compactReplayEvents(events: readonly SessionEvent[]): SessionEvent[] {
+function compactReplayEvents(events: readonly SessionEvent[], heldCompactionSeq = 0): SessionEvent[] {
   const finalizedSteps = new Set<string>()
   const abandonedSteps = new Set<string>()
   for (const event of events) {
@@ -10367,6 +10490,7 @@ function compactReplayEvents(events: readonly SessionEvent[]): SessionEvent[] {
   const compacted: SessionEvent[] = []
   const folded = new Map<string, number>()
   for (const event of events) {
+    if (heldCompactionSeq > 0 && event.seq >= heldCompactionSeq) break
     if (event.type === 'context/body') continue
     if (event.type === 'compaction/restoration') {
       compacted.push(withoutRestorationText(event))
@@ -10582,12 +10706,30 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   const latest = session.events.at(-1)?.seq ?? 0
   const earliest = session.events[0]?.seq ?? 1
   const resumable = Number.isSafeInteger(cursor) && cursor >= earliest - 1 && cursor <= latest
+  // A successful compaction/end that the durability barrier has not committed
+  // holds this stream: it, and every event appended behind it, wait for the
+  // commit instead of describing a state the canonical log may never hold.
+  // Normal chunks (never barriered themselves) keep streaming immediately.
+  let held: { seq: number; queue: { envelope: WebEnvelope; sequence: number | undefined }[] } | undefined
+  const findHeldCompaction = (): number => {
+    for (const event of session.events) {
+      if (event.type === 'compaction/end' && event.error === undefined && event.seq > session.committedSeq) return event.seq
+    }
+    return 0
+  }
+  const toFrame = (event: SessionEvent): WebEnvelope => ({ kind: 'session', event: event.type === 'compaction/restoration' ? withoutRestorationText(event) : event })
+  const heldSeq = findHeldCompaction()
+  // The replay below stops before the held success, so the success and the
+  // tail already appended behind it seed the queue: they ship on commit.
+  if (heldSeq > 0) held = { seq: heldSeq, queue: session.events.filter((event) => event.seq >= heldSeq && event.type !== 'context/body').map((event) => ({ envelope: toFrame(event), sequence: event.seq })) }
   // Both replay shapes are compacted: a fresh snapshot otherwise ships every
   // raw chunk of the session's history, and a long-disconnect resume replays
   // the same bulk. Sequence numbers stay untouched so the client's seen-cursor
-  // filtering and its own compaction keep working unchanged.
-  const replay = compactReplayEvents(resumable ? session.events.filter((event) => event.seq > cursor) : [...session.events])
-  streamFrame({ kind: resumable ? 'resume' : 'snapshot', events: replay }, latest)
+  // filtering and its own compaction keep working unchanged. A held compaction
+  // success also cuts the replay tail: reconnect must not see the uncommitted
+  // state either.
+  const replay = compactReplayEvents(resumable ? session.events.filter((event) => event.seq > cursor) : [...session.events], held?.seq ?? 0)
+  streamFrame({ kind: resumable ? 'resume' : 'snapshot', events: replay }, held === undefined ? latest : (held.seq - 1))
   for (const [approvalId, waiting] of deps.pending) {
     if (waiting.sessionId === session.id || waiting.parentSessionId === session.id) {
       streamFrame(approvalEnvelope(approvalId, waiting, session.id))
@@ -10610,7 +10752,37 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
   })
 
   const disposeSession = deps.kernel.ctx.on('session/event', (emitter, event) => {
-    if (emitter.id === session.id && event.type !== 'context/body') streamFrame({ kind: 'session', event: event.type === 'compaction/restoration' ? withoutRestorationText(event) : event }, event.seq)
+    if (emitter.id !== session.id || event.type === 'context/body') return
+    const frame = toFrame(event)
+    // A failed end never publishes a checkpoint: it drops the uncommitted
+    // success (the queue head) and releases what queued behind it.
+    if (event.type === 'compaction/end' && event.error !== undefined) {
+      const dropped = held
+      held = undefined
+      for (const { envelope, sequence } of dropped?.queue.slice(1) ?? []) streamFrame(envelope, sequence)
+      streamFrame(frame, event.seq)
+      return
+    }
+    if (held !== undefined) {
+      // Behind an uncommitted success: queue instead of shipping. The success
+      // itself is the hold's head, so it is queued exactly once, at its seq.
+      held.queue.push({ envelope: frame, sequence: event.seq })
+      return
+    }
+    if (event.type === 'compaction/end' && event.error === undefined && event.seq > session.committedSeq) {
+      // The success appended but its barrier has not committed: it heads the hold.
+      held = { seq: event.seq, queue: [{ envelope: frame, sequence: event.seq }] }
+      return
+    }
+    streamFrame(frame, event.seq)
+  })
+  // The commit releases the hold: drain the queued prefix in seq order.
+  const disposeDurable = deps.kernel.ctx.on('session/durable', (emitter) => {
+    if (emitter.id !== session.id || held === undefined) return
+    if (session.committedSeq < held.seq) return
+    const draining = held
+    held = undefined
+    for (const { envelope, sequence } of draining.queue) streamFrame(envelope, sequence)
   })
   const disposeApproval = deps.kernel.ctx.on('web/approval', (payload) => {
     if (payload.sessionId === session.id || payload.parentSessionId === session.id) {
@@ -10655,6 +10827,7 @@ function streamEvents(req: IncomingMessage, res: ServerResponse, entry: SessionE
     closed = true
     if (heartbeat !== undefined) clearInterval(heartbeat)
     disposeSession()
+    disposeDurable()
     disposeApproval()
     disposeApprovalSettled()
     disposeQuestion()
@@ -10828,9 +11001,12 @@ function installLabel(hostHeader: string | undefined): string | undefined {
   return hostname
 }
 
-/** Host first: taskbars truncate the tail, and the host is the part that differs. */
+/**
+ * Host first: taskbars truncate the tail, and the host is the part that differs.
+ * Launchers fit ~12 characters under an icon, so short_name keeps only the first DNS label.
+ */
 function manifestWithHost(manifest: Record<string, unknown>, host: string): Record<string, unknown> {
-  return { ...manifest, name: `${host} · dnt-harness`, short_name: host }
+  return { ...manifest, name: `${host} · dnt-harness`, short_name: isIP(host) === 0 ? host.split('.')[0] : host }
 }
 
 function brandManifest(content: Buffer, host: string): Buffer {

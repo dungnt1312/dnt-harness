@@ -119,6 +119,18 @@ export function resolveChildModel(
   reference: string | undefined,
   definitionModel: string | undefined,
   deps: ChildModelDeps,
+  effort?: ThinkingLevel,
+): ChildModel | undefined {
+  const picked = pickChildModel(reference, definitionModel, deps)
+  // A role's effort wins over the parent's and the alias's thinking, when this model can express it.
+  if (picked === undefined || effort === undefined || expressibleThinkingLevel(picked.model, effort) !== effort) return picked
+  return { ...picked, thinkingLevel: effort }
+}
+
+function pickChildModel(
+  reference: string | undefined,
+  definitionModel: string | undefined,
+  deps: ChildModelDeps,
 ): ChildModel | undefined {
   const explicit = reference?.trim() ?? ''
   if (explicit !== '' || definitionModel === undefined) return resolveModelReference(explicit, deps)
@@ -283,6 +295,7 @@ export interface DelegationDeps {
     workspaceId: WorkspaceId,
     requested?: string,
     definitionModel?: string,
+    effort?: ThinkingLevel,
   ) => ChildModel | undefined
   /** Usable provider ids and their advertised models, for the live catalog. */
   readonly providers: () => readonly string[]
@@ -436,6 +449,7 @@ async function spawn(
     workspaceId,
     typeof args['model'] === 'string' ? args['model'] : undefined,
     resolved.definition.model,
+    resolved.definition.effort,
   )
   const turnId = agentScope.getStore()?.turnId
   if (turnId === undefined) throw new Error('Agent spawn requires the calling root\'s active Turn')

@@ -1,0 +1,183 @@
+diff --git a/src/capabilities/fs/tools.ts b/src/capabilities/fs/tools.ts
+index 9bda545..9a74259 100644
+--- a/src/capabilities/fs/tools.ts
++++ b/src/capabilities/fs/tools.ts
+@@ -208,21 +208,21 @@ export function readTool(options: FsToolsOptions = {}): ToolDefinition {
+       return out.join('\n')
+     },
+   }
+ }
+ 
+ /** The `Write` tool: create or replace a complete file, detecting external changes. */
+ export function writeTool(): ToolDefinition {
+   return {
+     name: 'Write',
+     description:
+-      'Create a file, or replace an existing file completely, inside the workspace or a read-write granted folder. Overwriting requires that this conversation Read the file first and that it has not changed since; prefer Edit for partial changes. An existing file keeps its encoding, BOM, and line-ending style. For a long file (more than about 400 lines, such as a plan or spec), Write a short skeleton first and then add one section per Edit call: a single huge call can exceed the model output limit and is then lost unrun.',
++      'Create a file, or replace an existing file completely, inside the workspace or a read-write granted folder. Overwriting an existing file requires that this conversation observed it (a successful Read, Write, Edit or ApplyPatch) and that it has not changed since; prefer Edit for partial changes. An existing file keeps its encoding, BOM, and line-ending style. For a long file (more than about 400 lines, such as a plan or spec), Write a short skeleton first and then add one section per Edit call: a single huge call can exceed the model output limit and is then lost unrun.',
+     requiresRoot: true,
+     parameters: {
+       type: 'object',
+       properties: {
+         path: { type: 'string', description: 'file path relative to the workspace root, or absolute inside a granted folder' },
+         content: { type: 'string', description: 'the complete new file content' },
+       },
+       required: ['path', 'content'],
+     },
+     async execute(args, exec) {
+@@ -257,21 +257,21 @@ export function writeTool(): ToolDefinition {
+       })
+     },
+   }
+ }
+ 
+ /** The `Edit` tool: replace one exact (or conservatively normalized) occurrence. */
+ export function editTool(): ToolDefinition {
+   return {
+     name: 'Edit',
+     description: [
+-      'Replace text in a file inside the workspace or a read-write granted folder. This conversation must have Read the file, and it must not have changed since.',
++      'Replace text in a file inside the workspace or a read-write granted folder. This conversation must have observed the file (a successful Read, Write, Edit or ApplyPatch), and it must not have changed since.',
+       '`old` must appear exactly once (copy it from Read output WITHOUT the line-number prefix, keeping indentation); add surrounding lines to make it unique, or set `replaceAll` to change every occurrence.',
+       'Line endings are handled automatically. When `old` is not found, the error shows the closest current lines.',
+       'An empty `old` creates a new file (or fills an empty one) with `new`.',
+     ].join(' '),
+     requiresRoot: true,
+     parameters: {
+       type: 'object',
+       properties: {
+         path: { type: 'string', description: 'file path relative to the workspace root, or absolute inside a granted folder' },
+         old: { type: 'string', description: 'the exact text to replace; must match exactly one location unless replaceAll is true' },
+@@ -566,21 +566,21 @@ async function createPatchFile(file: string, bytes: Buffer, mode?: number): Prom
+     await fs.link(temporary, file)
+   } finally {
+     await fs.unlink(temporary).catch(() => {})
+   }
+ }
+ 
+ /** Structured multi-region/file edits, fully verified before publication. */
+ export function applyPatchTool(): ToolDefinition {
+   return {
+     name: 'ApplyPatch',
+-    description: 'Apply multiple local diff hunks or file changes in one call. Prefer this over repeated Edit calls for distant regions. Input must start with *** Begin Patch and end with *** End Patch. Use *** Update File: path, then @@ (optionally followed by an exact context line), then lines prefixed with space (context), - (remove), + (add). Multiple @@ hunks use original-file order and exact unique context, not numeric git diff headers. *** End of File anchors a hunk to EOF. *** Add File: path uses + content lines; *** Delete File: path deletes a file; *** Move to: path immediately after Update moves it to a new, absent destination. Existing files must have been Read and unchanged since. Preserves encoding/BOM/EOL and final-newline state. All files are verified before writes; I/O failure can leave partial changes, recorded in the error receipt. Re-read before retrying a partial failure. Do not use shell scripts to bypass verification.',
++    description: 'Apply multiple local diff hunks or file changes in one call. Prefer this over repeated Edit calls for distant regions. Input must start with *** Begin Patch and end with *** End Patch. Use *** Update File: path, then @@ (optionally followed by an exact context line), then lines prefixed with space (context), - (remove), + (add). Multiple @@ hunks use original-file order and exact unique context, not numeric git diff headers. *** End of File anchors a hunk to EOF. *** Add File: path uses + content lines; *** Delete File: path deletes a file; *** Move to: path immediately after Update moves it to a new, absent destination. Existing files must have been observed (a successful Read, Write, Edit or ApplyPatch) and unchanged since. Preserves encoding/BOM/EOL and final-newline state. All files are verified before writes; I/O failure can leave partial changes, recorded in the error receipt. Re-read before retrying a partial failure. Do not use shell scripts to bypass verification.',
+     requiresRoot: true,
+     parameters: { type: 'object', properties: { patch_text: { type: 'string', description: 'Complete structured patch text, including Begin/End Patch markers' } }, required: ['patch_text'] },
+     async execute(args, exec) {
+       const sections = parsePatch(argString(args, 'patch_text'))
+       const targets = new Map<string, string>()
+       for (const section of sections) {
+         for (const rel of [section.path, ...(section.movePath !== undefined ? [section.movePath] : [])]) {
+           const target = await patchCanonical(await granted(exec, rel, 'write'))
+           const key = process.platform === 'win32' ? target.toLowerCase() : target
+           if ([...targets.values()].some((value) => (process.platform === 'win32' ? value.toLowerCase() : value) === key)) throw new Error(`duplicate patch target: ${rel}`)
+diff --git a/src/capabilities/shell/background-tools.ts b/src/capabilities/shell/background-tools.ts
+index 6663e61..ff6ebe3 100644
+--- a/src/capabilities/shell/background-tools.ts
++++ b/src/capabilities/shell/background-tools.ts
+@@ -51,21 +51,21 @@ export function bashOutputTool(options: { readonly processes: ProcessRegistry })
+   }
+ }
+ 
+ export function killShellTool(options: { readonly processes: ProcessRegistry }): ToolDefinition {
+   return {
+     name: 'KillShell',
+     description: 'Kill one background process in this session (whole process tree): the process ID Bash returned, including a command that moved to the background automatically.',
+     parameters: {
+       type: 'object',
+       properties: {
+-        processId: { type: 'string', description: 'the process id returned by Bash run_in_background' },
++        processId: { type: 'string', description: 'the process id returned by Bash, including a command that moved to the background automatically' },
+       },
+       required: ['processId'],
+     },
+     async execute(args, exec) {
+       const processId = args['processId']
+       if (typeof processId !== 'string' || processId === '') {
+         return "error: argument 'processId' must be a non-empty string"
+       }
+       if (exec.sessionId === undefined) return 'error: no session scope for background processes'
+       const outcome = await options.processes.kill(exec.sessionId, processId)
+diff --git a/tests/harness/g3-context.spec.ts b/tests/harness/g3-context.spec.ts
+index cdde072..3c3d340 100644
+--- a/tests/harness/g3-context.spec.ts
++++ b/tests/harness/g3-context.spec.ts
+@@ -163,21 +163,23 @@ describe('tool and prompt contract', () => {
+     const root = first(base({ schemas: [read, mcp] }))
+     expect(root).toContain(marker)
+     expect(root.indexOf(marker)).toBeGreaterThan(root.indexOf('Mode — '))
+     expect(first(base({ schemas: [read] }))).not.toContain(marker)
+     expect(first(base({ schemas: [read, mcp], baseSystemOverride: 'CUSTOM BASE' }))).toContain(marker)
+     const child = { definition: 'explorer', instructions: 'Investigate only.' }
+     const childText = first(base({ schemas: [read, mcp], child, childSystemOverride: 'CUSTOM CHILD' }))
+     expect(childText).toContain('CUSTOM CHILD')
+     expect(childText).toContain(marker)
+     expect(childText.indexOf(marker)).toBeGreaterThan(childText.indexOf('Role — explorer'))
+-    expect(first(base({ schemas: [read, mcp], rootRole: { definition: 'auto', instructions: 'Run.' } }))).toContain(marker)
++    const rootRoleText = first(base({ schemas: [read, mcp], rootRole: { definition: 'auto', instructions: 'Run.' } }))
++    expect(rootRoleText).toContain('Role —')
++    expect(rootRoleText.indexOf(marker)).toBeGreaterThan(rootRoleText.indexOf('Role —'))
+     expect(first(base({ schemas: [read], child }))).not.toContain(marker)
+     expect(first(base({ schemas: [read, mcp] }))).toBe(first(base({ schemas: [read, mcp] })))
+   })
+ 
+   it('approval modes hand approval to the host and keep their permission maps (AC-06)', () => {
+     const ask = BUNDLED_MODES.find((m) => m.id === 'ask-before-changes')!
+     const edit = BUNDLED_MODES.find((m) => m.id === 'edit-automatically')!
+     expect(ask.instructions).toMatch(/host requests approval before writes, edits, or shell commands that change state/)
+     expect(ask.instructions).toMatch(/rather than asking for the same permission separately/)
+     expect(edit.instructions).toMatch(/host requests approval before shell commands that change state and before deletions/)
+diff --git a/tests/web/server-skill-sources.spec.ts b/tests/web/server-skill-sources.spec.ts
+index 838c24a..f0462b3 100644
+--- a/tests/web/server-skill-sources.spec.ts
++++ b/tests/web/server-skill-sources.spec.ts
+@@ -349,25 +349,27 @@ async function readAllEvents(base: string, wsId: string, sessionId: string): Pro
+     }
+   } finally {
+     reader.cancel().catch(() => {})
+   }
+   return []
+ }
+ 
+ describe('Skill tool with project layers', () => {
+   it('catalog and load resolve project-layer skills for a bound session', async () => {
+     const seen: string[] = []
++    const skillDescriptions: string[] = []
+     let step = 0
+     const provider: LlmProvider = {
+       name: 'scripted', models: ['scripted'],
+       async *stream(request) {
+         seen.push(request.messages.map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content)).join('\n'))
++        skillDescriptions.push(request.tools?.find((tool) => tool.name === 'Skill')?.description ?? '')
+         step += 1
+         if (step === 1) {
+           yield { type: 'toolCalls' as const, calls: [{ id: 'c1', name: 'Skill', args: { action: 'catalog' } }] }
+           yield { type: 'completion' as const, finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+         } else if (step === 2) {
+           yield { type: 'toolCalls' as const, calls: [{ id: 'l1', name: 'Skill', args: { action: 'load', name: 'proj-skill' } }] }
+           yield { type: 'completion' as const, finishReason: 'tool_calls', transport: 'done', policy: 'strict', transportSettled: true }
+         } else {
+           yield { type: 'delta' as const, delta: 'done' }
+           yield { type: 'completion' as const, finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+@@ -389,20 +391,21 @@ describe('Skill tool with project layers', () => {
+     await expect.poll(async () => {
+       const events = await readAllEvents(base, wsId, session.id)
+       return events.filter((event) => event.type === 'tool/result').length
+     }, { timeout: 6_000 }).toBe(2)
+     const results = (await readAllEvents(base, wsId, session.id)).filter((event) => event.type === 'tool/result')
+     expect(results[0]?.output).toContain('proj-skill [project]')
+     expect(results[1]).toMatchObject({ ok: true })
+     expect(results[1]?.output).toContain("skill 'proj-skill' loaded")
+     expect(seen[0]).toContain(path.join(home, 'workspaces', wsId, 'skills'))
+     expect(seen[0]).toContain('These locations are not filesystem grants')
++    expect(skillDescriptions[0]).toContain("may already be listed in your context; if the list is missing or trimmed, call action:'catalog'")
+   })
+ 
+   it("a child definition's skills preload through the rule layers (project folder included)", async () => {
+     const seen: string[] = []
+     const provider: LlmProvider = {
+       name: 'scripted', models: ['scripted'],
+       async *stream(request) {
+         seen.push(request.messages.map((message) => typeof message.content === 'string' ? message.content : JSON.stringify(message.content)).join('\n'))
+         yield { type: 'delta' as const, delta: 'done' }
+         yield { type: 'completion' as const, finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }

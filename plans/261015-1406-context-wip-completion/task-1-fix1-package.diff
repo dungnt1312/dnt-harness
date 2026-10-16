@@ -1,0 +1,66 @@
+e792353 fix(context): compare duplicate attempt usage by value
+
+diff --git a/src/harness/context/context-state.ts b/src/harness/context/context-state.ts
+index 556ed34..09d1fd0 100644
+--- a/src/harness/context/context-state.ts
++++ b/src/harness/context/context-state.ts
+@@ -87,21 +87,22 @@ export function createContextReducer<M extends ManifestShape>(initialSessionId?:
+           const f = event.fact
+           if (f === undefined || f.state === 'start' || !isValidContextId(f.contextId) || !isValidTokenUsage(f.usage) || f.attribution === undefined) continue
+           const entry = entries.get(f.contextId)
+           if (entry === undefined || (entry.turnId !== undefined && entry.turnId !== f.attribution.turnId)
+             || (entry.manifest.model !== undefined && f.model !== undefined && entry.manifest.model !== f.model)
+             || (entry.manifest.provider !== undefined && f.provider !== undefined && entry.manifest.provider !== f.provider)) continue
+           sessionId ??= f.attribution.sessionId
+           if (f.attribution.sessionId !== sessionId) continue
+           const seen = attempts.get(f.attemptId)
+           if (seen !== undefined) {
+-            if (JSON.stringify(seen) !== JSON.stringify(f.usage)) console.warn('conflicting usage for repeated attempt')
++            if (seen.inputTokens !== f.usage.inputTokens || seen.cachedInputTokens !== f.usage.cachedInputTokens
++              || seen.outputTokens !== f.usage.outputTokens) console.warn('conflicting usage for repeated attempt')
+             continue
+           }
+           attempts.set(f.attemptId,{...f.usage})
+           if (f.usage.cachedInputTokens !== undefined) {
+             cacheableInputTokens += f.usage.inputTokens; cachedInputTokens += f.usage.cachedInputTokens
+           }
+           entry.last = {...f.usage}; entry.view = requestView(entry); changed.add(f.contextId)
+           refreshCurrentTotals()
+           continue
+         }
+diff --git a/tests/harness/context-state.spec.ts b/tests/harness/context-state.spec.ts
+index 7011f78..9d70590 100644
+--- a/tests/harness/context-state.spec.ts
++++ b/tests/harness/context-state.spec.ts
+@@ -65,20 +65,31 @@ describe('request-scoped context state', () => {
+   it('keeps the first report for a repeated attemptId with different usage and warns statically', () => {
+     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+     try {
+       const r = accounting.createContextReducer<ContextManifest>('s')
+       r.apply([assembled(1, 'a'), attempt(2, 'a', 'p1', usage), attempt(3, 'a', 'p1', { inputTokens: 1, cachedInputTokens: 0 }, 'reconciled')])
+       expect(r.current()?.usage).toMatchObject({ last: usage, cacheableInputTokens: 120_000, cachedInputTokens: 110_000 })
+       expect(warn).toHaveBeenCalledTimes(1)
+       expect(warn).toHaveBeenCalledWith('conflicting usage for repeated attempt')
+     } finally { warn.mockRestore() }
+   })
++  it('does not warn when a repeated attemptId carries the same usage in a different key order', () => {
++    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
++    try {
++      const r = accounting.createContextReducer<ContextManifest>('s')
++      r.apply([assembled(1, 'a'), attempt(2, 'a', 'p1', { inputTokens: 10, cachedInputTokens: 4 }),
++        attempt(3, 'a', 'p1', { cachedInputTokens: 4, inputTokens: 10 }, 'reconciled')])
++      expect(warn).not.toHaveBeenCalled()
++      r.apply([attempt(4, 'a', 'p1', { inputTokens: 10, cachedInputTokens: 5 }, 'reconciled')])
++      expect(warn).toHaveBeenCalledTimes(1)
++    } finally { warn.mockRestore() }
++  })
+   it('pins optional session identity and keeps legacy manifests estimated', () => {
+     const r = accounting.createContextReducer<ContextManifest>()
+     r.apply([assembled(1, 'a'), attempt(2, 'a', 'p1', usage)])
+     expect(r.request('a')?.usage?.last).toEqual(usage)
+     r.apply([assembled(3)])
+     const current = r.current()!
+     expect(accounting.isAvailableContext(current) && current.contextId).toBeUndefined()
+     expect(accounting.isAvailableContext(current) && current.usage?.last).toBeUndefined()
+   })
+ })

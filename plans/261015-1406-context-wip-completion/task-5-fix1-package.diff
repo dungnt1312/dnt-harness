@@ -1,0 +1,206 @@
+diff --git a/tests/browser/context-accounting.e2e.ts b/tests/browser/context-accounting.e2e.ts
+index c200c45..c165393 100644
+--- a/tests/browser/context-accounting.e2e.ts
++++ b/tests/browser/context-accounting.e2e.ts
+@@ -103,34 +103,38 @@ test('request estimate becomes reported, matches the inspector, compacts into a
+ 
+   // Open the conversation from the sidebar, then send the first (huge) turn.
+   await expect(page.locator('[data-composer-input]')).toBeVisible({ timeout: 20_000 })
+   await openSession(page, title)
+   await page.locator('[data-composer-input]').fill('first')
+   await page.locator('[data-composer-input]').press('Enter')
+ 
+   // The meter fills from the request manifest while the provider's usage is
+   // still held back: an estimate, labeled so, and no reported count anywhere.
+   const meter = openMeter(page)
+-  await expect(meter).toBeVisible({ timeout: 30_000 })
+-  await expect(meter).toHaveAccessibleName(/^Context window \S+ \/ 256K$/, { timeout: 30_000 })
+-  expect(await meter.getAttribute('aria-label')).not.toContain('120K')
+-  const held = await manifest(route)
+-  expect(held?.usage?.last).toBeUndefined()
+-  expect(held?.budget.estimated).toBe(true)
+-  expect(held?.budget.usedTokens).toBeGreaterThan(0)
+-  await meter.click()
+-  await expect(page.getByRole('dialog')).toContainText(/Last request\s*estimated/, { timeout: 20_000 })
+-  await page.keyboard.press('Escape')
++  try {
++    await expect(meter).toBeVisible({ timeout: 30_000 })
++    await expect(meter).toHaveAccessibleName(/^Context window \S+ \/ 256K$/, { timeout: 30_000 })
++    expect(await meter.getAttribute('aria-label')).not.toContain('120K')
++    const held = await manifest(route)
++    expect(held?.usage?.last).toBeUndefined()
++    expect(held?.budget.estimated).toBe(true)
++    expect(held?.budget.usedTokens).toBeGreaterThan(0)
++    await meter.click()
++    await expect(page.getByRole('dialog')).toContainText(/Last request\s*estimated/, { timeout: 20_000 })
++    await page.keyboard.press('Escape')
++  } finally {
++    // A failed assertion must not leave the turn held open (it would hang server.close()).
++    releaseUsage()
++  }
+ 
+   // Releasing the report replaces the estimate: reported 120k over the
+   // resolved window (the scripted model's window falls back to 256k).
+-  releaseUsage()
+   await expect(page.getByRole('button', { name: 'Context window 120K / 256K' })).toBeVisible({ timeout: 30_000 })
+   await expect.poll(async () => {
+     const body = await manifest(route)
+     return body?.usage?.last?.inputTokens
+   }, { timeout: 30_000 }).toBe(120_000)
+   await meter.click()
+   await expect(page.getByRole('dialog')).toContainText(/Last request\s*reported/, { timeout: 20_000 })
+   await page.keyboard.press('Escape')
+ 
+   // The StepInspector for that request shows the same reported figure.
+diff --git a/web/hooks/useContextManifest.spec.tsx b/web/hooks/useContextManifest.spec.tsx
+index 236ea2c..43532c2 100644
+--- a/web/hooks/useContextManifest.spec.tsx
++++ b/web/hooks/useContextManifest.spec.tsx
+@@ -47,20 +47,29 @@ it('a fetch for the previous session resolving after a switch never reaches the
+   expect(seen).toEqual({ manifest: null, status: 'loading' })
+   await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+ 
+   await settle('A', respond(200, body(111)))
+   expect(seen).toEqual({ manifest: null, status: 'loading' })
+   await settle('B', respond(200, body(222)))
+   expect(seen.status).toBe('ready')
+   expect(seen.manifest).toMatchObject({ budget: { usedTokens: 222 } })
+ })
+ 
++it('no workspace or session (home, unsent draft) is "none", never an endless "loading"', async () => {
++  await act(async () => root!.render(<Probe ws="w" session={null} refresh="0" />))
++  await act(async () => { await vi.advanceTimersByTimeAsync(200) })
++  expect(seen).toEqual({ manifest: null, status: 'none' })
++  expect(fetch).not.toHaveBeenCalled()
++  await act(async () => root!.render(<Probe ws={null} session="A" refresh="0" />))
++  expect(seen).toEqual({ manifest: null, status: 'none' })
++})
++
+ it('204 is "none"; any other HTTP failure is "error", and the same session refreshes after 150 ms', async () => {
+   await render('A')
+   await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+   await settle('A', respond(204))
+   expect(seen).toEqual({ manifest: null, status: 'none' })
+ 
+   await render('A', '1')
+   expect(seen.status).toBe('none') // the same owner keeps its figures while refreshing
+   expect(pending.has('A')).toBe(true)
+   const calls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.length
+diff --git a/web/hooks/useContextManifest.ts b/web/hooks/useContextManifest.ts
+index 8bfe353..0e67857 100644
+--- a/web/hooks/useContextManifest.ts
++++ b/web/hooks/useContextManifest.ts
+@@ -2,21 +2,21 @@ import { useEffect, useRef, useState } from 'react'
+ import { fetchManifest, type ContextStatus, type ContextView } from '../lib/api.ts'
+ 
+ interface Owned { readonly owner: string; readonly status: ContextStatus; readonly view: ContextView | null }
+ 
+ /**
+  * Context figures for one conversation. A figure belongs to the
+  * `{workspaceId, sessionId}` that fetched it: any other owner reads as `loading`
+  * on the very render the selection changes, so a previous conversation's count
+  * (or a made-up zero) is never shown. `refreshKey` re-fetches the same
+  * conversation after a 150 ms debounce; a switch fetches at once. HTTP 204 is
+- * `none` (no request yet); any other failure is `error`.
++ * `none` (no request yet, or no conversation selected); any other failure is `error`.
+  */
+ export function useContextManifest(workspaceId: string | null, sessionId: string | null, refreshKey: string): { readonly manifest: ContextView | null; readonly status: ContextStatus } {
+   const [state, setState] = useState<Owned | null>(null)
+   const shown = useRef<string | null>(null)
+   const latest = useRef({ workspaceId, sessionId })
+   latest.current = { workspaceId, sessionId }
+   const owner = workspaceId !== null && sessionId !== null ? `${workspaceId}:${sessionId}` : null
+ 
+   useEffect(() => {
+     if (workspaceId === null || sessionId === null) return
+@@ -33,12 +33,13 @@ export function useContextManifest(workspaceId: string | null, sessionId: string
+         () => settle('error', null),
+       )
+     }, switched ? 0 : 150)
+     return () => {
+       cancelled = true
+       clearTimeout(timer)
+     }
+   }, [workspaceId, sessionId, refreshKey])
+ 
+   const owned = owner !== null && state?.owner === owner
++  if (owner === null) return { manifest: null, status: 'none' } // home or an unsent draft: nothing to load
+   return { manifest: owned ? state.view : null, status: owned ? state.status : 'loading' }
+ }
+diff --git a/web/lib/format.ts b/web/lib/format.ts
+index 2e9612e..d189739 100644
+--- a/web/lib/format.ts
++++ b/web/lib/format.ts
+@@ -126,32 +126,32 @@ export function shortCommand(command: string, max = 64): string {
+ }
+ 
+ /** Human-readable size for an attachment chip or a recorded payload. */
+ export function formatBytes(bytes: number): string {
+   if (bytes < 1024) return `${bytes} B`
+   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`
+   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+ }
+ 
+ /**
+- * `139k → 42k tokens`, or `undefined` when the compaction was not measured.
+- * A reported "before" and an estimated "after" are different tokenizers, so
+- * they are labeled instead of presented as one comparable pair. Scalar-only
++ * `139k → 42k estimated tokens`, or `undefined` when the compaction was not
++ * measured. Equal bases are named once; a reported "before" and an estimated
++ * "after" are different tokenizers, so each side is labeled. Scalar-only
+  * (older) events carry no basis and count as estimates.
+  */
+ export function compactionTokenChange(change: { readonly tokensBefore?: number; readonly tokensAfter?: number; readonly measurement?: CompactionMeasurementView }): string | undefined {
+   if (change.tokensBefore === undefined || change.tokensAfter === undefined) return undefined
+   const before = formatTokenCount(change.tokensBefore)
+   const after = formatTokenCount(change.tokensAfter)
+   const beforeBasis = change.measurement?.before?.basis ?? 'estimated'
+   const afterBasis = change.measurement?.after?.basis ?? 'estimated'
+-  return beforeBasis === afterBasis ? `${before} → ${after} tokens` : `${before} ${beforeBasis} → ${after} ${afterBasis} tokens`
++  return beforeBasis === afterBasis ? `${before} → ${after} ${beforeBasis} tokens` : `${before} ${beforeBasis} → ${after} ${afterBasis} tokens`
+ }
+ 
+ /**
+  * How close the request was to the automatic-compaction trigger. This is the
+  * policy's own ratio (pre-trim estimate over the usable input budget), not the
+  * window ring. `undefined` when the host reported no policy.
+  */
+ export function policyPressure(view: { readonly budget: ContextManifestView['budget']; readonly policy?: { readonly automaticCompactionPressure: number } }): { readonly ratio: number; readonly threshold: number } | undefined {
+   if (view.policy === undefined || view.budget.availableTokens <= 0) return undefined
+   return { ratio: (view.budget.preTrimTokens ?? view.budget.usedTokens) / view.budget.availableTokens, threshold: view.policy.automaticCompactionPressure }
+diff --git a/web/lib/manifest-refresh.spec.ts b/web/lib/manifest-refresh.spec.ts
+index f6728aa..56d409e 100644
+--- a/web/lib/manifest-refresh.spec.ts
++++ b/web/lib/manifest-refresh.spec.ts
+@@ -25,25 +25,27 @@ it('advances on a terminal measured attempt but not on start, usage-less attempt
+   expect(manifestRefreshKey([manifestEvent, terminalWithUsage], 0)).toBe(`${terminalWithUsage.seq}:0`)
+   expect(manifestRefreshKey([manifestEvent, attemptStart, assistantChunk], 0)).toBe(`${manifestEvent.seq}:0`)
+   expect(manifestRefreshKey([manifestEvent, { seq: 5, type: 'model/attempt', fact: { ...fact, state: 'end' } }], 0)).toBe(`1:0`)
+   for (const [type, state] of [['execution/uncertain', 'uncertain'], ['execution/reconciled', 'reconciled']] as const) {
+     expect(manifestRefreshKey([manifestEvent, { seq: 6, type, fact: { ...fact, state, usage } }], 0)).toBe('6:0')
+   }
+   expect(manifestRefreshKey([manifestEvent, { seq: 7, type: 'model/attempt', fact: { ...fact, state: 'end', usage: { inputTokens: -1 } } }], 0)).toBe('1:0')
+ })
+ 
+ it('formats the before/after token change only when it was measured', () => {
+-  expect(compactionTokenChange({ tokensBefore: 139_200, tokensAfter: 42_000 })).toBe('139k → 42k tokens')
+-  expect(compactionTokenChange({ tokensBefore: 900, tokensAfter: 12_300 })).toBe('900 → 12.3k tokens')
++  expect(compactionTokenChange({ tokensBefore: 139_200, tokensAfter: 42_000 })).toBe('139k → 42k estimated tokens')
++  expect(compactionTokenChange({ tokensBefore: 900, tokensAfter: 12_300 })).toBe('900 → 12.3k estimated tokens')
+   expect(compactionTokenChange({})).toBeUndefined()
+   expect(compactionTokenChange({ tokensBefore: 10 })).toBeUndefined()
+ })
+ 
+ it('labels both figures when the compaction compares a reported count with an estimate', () => {
+   const change = { tokensBefore: 120_000, tokensAfter: 30_000 }
+   expect(compactionTokenChange({ ...change, measurement: { before: { tokens: 120_000, basis: 'reported' }, after: { tokens: 30_000, basis: 'estimated' } } }))
+     .toBe('120k reported → 30k estimated tokens')
+   expect(compactionTokenChange({ ...change, measurement: { before: { tokens: 120_000, basis: 'estimated' }, after: { tokens: 30_000, basis: 'estimated' } } }))
+-    .toBe('120k → 30k tokens')
++    .toBe('120k → 30k estimated tokens')
++  expect(compactionTokenChange({ ...change, measurement: { before: { tokens: 120_000, basis: 'reported' }, after: { tokens: 30_000, basis: 'reported' } } }))
++    .toBe('120k → 30k reported tokens')
+   // A scalar-only (older) event is an estimate on both sides, never "reported".
+-  expect(compactionTokenChange(change)).not.toContain('reported')
++  expect(compactionTokenChange(change)).toBe('120k → 30k estimated tokens')
+ })

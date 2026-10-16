@@ -1,0 +1,1204 @@
+cab7825 fix(web): context meter ownership, basis labels, policy pressure; e2e asserts estimate and inspector
+
+ src/web/server.ts                              |  2 +-
+ tests/browser/context-accounting.e2e.ts        | 42 ++++++++++++---
+ web/App.tsx                                    | 41 ++-------------
+ web/components/composer/ContextMeter.tsx       | 33 +++++++++---
+ web/components/composer/context-meter.spec.tsx | 42 +++++++++++++--
+ web/components/layout/ContextPanel.tsx         | 30 +++++++++--
+ web/hooks/useContextManifest.spec.tsx          | 73 ++++++++++++++++++++++++++
+ web/hooks/useContextManifest.ts                | 44 ++++++++++++++++
+ web/lib/api.ts                                 |  4 +-
+ web/lib/format.ts                              | 32 +++++++++--
+ web/lib/manifest-refresh.spec.ts               | 10 ++++
+ web/lib/product-ui.spec.tsx                    | 17 +++++-
+ web/lib/project-compaction.spec.ts             |  6 +++
+ web/lib/project.ts                             |  4 +-
+ web/lib/types.ts                               | 12 +++++
+ 15 files changed, 327 insertions(+), 65 deletions(-)
+
+diff --git a/src/web/server.ts b/src/web/server.ts
+index 912e416..1b7c9a6 100644
+--- a/src/web/server.ts
++++ b/src/web/server.ts
+@@ -7557,21 +7557,21 @@ async function handleApi(
+         return
+       }
+       try {
+         // The server picks the path; a body (an older client's recovery echo) changes nothing.
+         await readJson(req).catch(() => undefined)
+         const lastSeqBefore = entry.session.events.at(-1)?.seq ?? 0
+         const checkpoint = await deps.runCompaction(entry, 'manual')
+         // An unchanged boundary is a no-op with no new end event: report no figures.
+         const end = entry.session.events.findLast((event) => event.type === 'compaction/end' && event.seq > lastSeqBefore)
+         const measured = end?.type === 'compaction/end' && end.tokensBefore !== undefined && end.tokensAfter !== undefined
+-          ? { tokensBefore: end.tokensBefore, tokensAfter: end.tokensAfter }
++          ? { tokensBefore: end.tokensBefore, tokensAfter: end.tokensAfter, ...(end.measurement !== undefined ? { measurement: end.measurement } : {}) }
+           : {}
+         send(200, { coversSeq: checkpoint.coversSeq, summaryChars: checkpoint.summary.length, ...measured, ...(checkpoint.path !== undefined ? { path: checkpoint.path } : {}) })
+       } catch (error) {
+         if (error instanceof CompactionCancelled) {
+           send(409, { error: 'compaction was cancelled', cancelled: true })
+           return
+         }
+         send(409, { error: String(error instanceof Error ? error.message : error) })
+       }
+       return
+diff --git a/tests/browser/context-accounting.e2e.ts b/tests/browser/context-accounting.e2e.ts
+index f7f61b4..c200c45 100644
+--- a/tests/browser/context-accounting.e2e.ts
++++ b/tests/browser/context-accounting.e2e.ts
+@@ -8,32 +8,39 @@
+  * post-compaction preview, and a reload (fresh SSE snapshot) plus a session
+  * switch keep every figure attached to its own conversation.
+  */
+ /// <reference lib="dom" />
+ import { promises as fs } from 'node:fs'
+ import { tmpdir } from 'node:os'
+ import path from 'node:path'
+ import { expect, test } from '@playwright/test'
+ import { createWebServer, type WebServer } from '../../src/web/server.ts'
+ import type { LlmProvider } from '../../src/harness/llm/types.ts'
++import { selectWorkbenchView } from './workbench-nav.ts'
+ 
+ const COMPACT_MARK = 'Primary Request and Intent'
+ const SUMMARY_TEXT = 'CHECKPOINT SUMMARY TEXT'
+ 
++/** Holds the first answer's usage report until the test releases it, so the estimate stage is observable. */
++let releaseUsage: () => void = () => {}
++const usageGate = new Promise<void>((resolve) => { releaseUsage = resolve })
++
+ /** Real (2 MB-scale) turn answers, so the conversation actually trims and compacts. */
+ function scriptedProvider(): LlmProvider {
+   let chats = 0
+   return {
+     name: 'scripted', models: ['scripted'],
+     async *stream(request) {
+       const isSummary = request.messages.some((m) => typeof m.content === 'string' && m.content.includes(COMPACT_MARK))
+-      yield { type: 'delta', delta: isSummary ? SUMMARY_TEXT : (++chats === 1 ? 'x'.repeat(1_100_000) : 'small answer') }
++      const first = !isSummary && ++chats === 1
++      yield { type: 'delta', delta: isSummary ? SUMMARY_TEXT : (first ? 'x'.repeat(1_100_000) : 'small answer') }
++      if (first) await usageGate
+       if (!isSummary) yield { type: 'usage', usage: { inputTokens: 120_000, cachedInputTokens: 110_000 } }
+       yield { type: 'completion', finishReason: 'stop', transport: 'done', policy: 'strict', transportSettled: true }
+     },
+   }
+ }
+ 
+ let server: WebServer | undefined
+ let home = ''
+ 
+ test.beforeAll(async () => {
+@@ -93,34 +100,55 @@ test('request estimate becomes reported, matches the inspector, compacts into a
+   test.setTimeout(120_000)
+   const { id, route, title } = await createSession('Accounting E2E main')
+   await page.goto(server!.url)
+ 
+   // Open the conversation from the sidebar, then send the first (huge) turn.
+   await expect(page.locator('[data-composer-input]')).toBeVisible({ timeout: 20_000 })
+   await openSession(page, title)
+   await page.locator('[data-composer-input]').fill('first')
+   await page.locator('[data-composer-input]').press('Enter')
+ 
+-  // The meter fills from the request manifest, then the provider report
+-  // replaces the estimate: reported 120k over the resolved window, never the
+-  // builder's estimate alone (the scripted model's window falls back to 256k).
++  // The meter fills from the request manifest while the provider's usage is
++  // still held back: an estimate, labeled so, and no reported count anywhere.
+   const meter = openMeter(page)
+   await expect(meter).toBeVisible({ timeout: 30_000 })
++  await expect(meter).toHaveAccessibleName(/^Context window \S+ \/ 256K$/, { timeout: 30_000 })
++  expect(await meter.getAttribute('aria-label')).not.toContain('120K')
++  const held = await manifest(route)
++  expect(held?.usage?.last).toBeUndefined()
++  expect(held?.budget.estimated).toBe(true)
++  expect(held?.budget.usedTokens).toBeGreaterThan(0)
++  await meter.click()
++  await expect(page.getByRole('dialog')).toContainText(/Last request\s*estimated/, { timeout: 20_000 })
++  await page.keyboard.press('Escape')
++
++  // Releasing the report replaces the estimate: reported 120k over the
++  // resolved window (the scripted model's window falls back to 256k).
++  releaseUsage()
+   await expect(page.getByRole('button', { name: 'Context window 120K / 256K' })).toBeVisible({ timeout: 30_000 })
+-  // The terminal usage lands on the log right after the answer; poll the API
+-  // until the reported figure replaces the estimate.
+   await expect.poll(async () => {
+     const body = await manifest(route)
+     return body?.usage?.last?.inputTokens
+   }, { timeout: 30_000 }).toBe(120_000)
++  await meter.click()
++  await expect(page.getByRole('dialog')).toContainText(/Last request\s*reported/, { timeout: 20_000 })
++  await page.keyboard.press('Escape')
++
++  // The StepInspector for that request shows the same reported figure.
++  await page.setViewportSize({ width: 1440, height: 900 })
++  const workbench = await selectWorkbenchView(page, 'Trajectory')
++  await workbench.getByRole('list', { name: 'Steps' }).getByRole('button').filter({ hasText: 'xxxxxxxx' }).first().click()
++  const inspector = workbench.getByLabel('Request inspector: turn 1, request 1')
++  await expect(inspector).toBeVisible({ timeout: 20_000 })
++  await expect(inspector).toContainText('120k/256k tok')
++  await expect(inspector).toContainText('reported')
+ 
+-  // The StepInspector for that step shows the same reported figure.
+   await page.locator('[data-composer-input]').fill('second')
+   await page.locator('[data-composer-input]').press('Enter')
+   await expect(page.getByText('small answer').first()).toBeVisible({ timeout: 30_000 })
+ 
+   // Compact from the API (the panel button needs the context view open); the
+   // meter then shows the post-compaction preview until the next request.
+   const compact = await fetch(`${route}/compact`, { method: 'POST' })
+   expect(compact.status).toBe(200)
+   await page.reload()
+   await expect(page.locator('[data-composer-input]')).toBeVisible({ timeout: 20_000 })
+diff --git a/web/App.tsx b/web/App.tsx
+index 2e0909a..146dd56 100644
+--- a/web/App.tsx
++++ b/web/App.tsx
+@@ -6,21 +6,20 @@ import { draftAttachments, draftIsEmpty, draftText, messageDraft, textDraft, typ
+ import type { ChipSegment } from './lib/inline-chips.ts'
+ import { automationsRoute, parseRoute, routePath, sessionRoute, workspaceRoute, type AppRoute } from './lib/route.ts'
+ import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from 'react'
+ import {
+   answerApproval,
+   answerQuestion,
+   createProject,
+   createSessionIn,
+   createWorkspace,
+   deleteSessionIn,
+-  fetchManifest,
+   fetchWorkspaceMeta,
+   getSessionModel,
+   getModelDefaults,
+   listProjects,
+   reorderProjects,
+   listSessionsIn,
+   listCommands,
+   listSkills,
+   listTerminals,
+   listWorkspaces,
+@@ -48,20 +47,21 @@ import {
+ } from './lib/api.ts'
+ import { PairingGate } from './components/auth/PairingGate.tsx'
+ import { decodeModelChoice, activeModelValue, modelOptions } from './lib/providers.ts'
+ import { type RetryTarget, type ViewItem } from './lib/project.ts'
+ import { useSessionDerivedValues } from './lib/session-derived.ts'
+ import { sameListing } from './lib/listing-equality.ts'
+ import { manifestRefreshKey } from './lib/manifest-refresh.ts'
+ import { loadCollapsedFolders, storeCollapsedFolders } from './lib/sidebar-folder-state.ts'
+ import type { FileFocus } from './lib/tool-facts.ts'
+ import { useSessionStream } from './hooks/useSessionStream.ts'
++import { useContextManifest } from './hooks/useContextManifest.ts'
+ import { useApprovalNotify } from './hooks/useApprovalNotify.ts'
+ import { useWorkbenchPreferences } from './hooks/useWorkbenchPreferences.ts'
+ import { useWorkbenchTabs } from './hooks/useWorkbenchTabs.ts'
+ import { useTerminalProjects } from './hooks/useTerminalProjects.ts'
+ import { useHotkeys } from './hooks/useHotkeys.ts'
+ import { QuickSwitch, type QuickSwitchItem } from './components/layout/QuickSwitch.tsx'
+ import { useMediaQuery } from './hooks/useMediaQuery.ts'
+ import { useKeyboardInset } from './hooks/useKeyboardInset.ts'
+ import { useTheme } from './hooks/useTheme.ts'
+ import { useToast } from './components/common/Toast.tsx'
+@@ -88,21 +88,21 @@ import { EnvironmentPanel } from './components/chat/EnvironmentPanel.tsx'
+ import { Transcript } from './components/chat/Transcript.tsx'
+ import { ApprovalBar } from './components/chat/ApprovalBar.tsx'
+ import { QuestionBar } from './components/chat/QuestionBar.tsx'
+ import { Composer } from './components/composer/Composer.tsx'
+ import { ModelMenu } from './components/composer/ModelMenu.tsx'
+ import { ContextMeter } from './components/composer/ContextMeter.tsx'
+ import { SessionFoldersChip } from './components/composer/SessionFoldersChip.tsx'
+ import { FolderPickerModal } from './components/composer/FolderPickerModal.tsx'
+ import { AutomationsView, type AutomationControlsContext } from './components/automations/AutomationsView.tsx'
+ import ConfirmDialog from './components/common/ConfirmDialog.tsx'
+-import type { ContextView, SessionModeSelection } from './lib/api.ts'
++import type { SessionModeSelection } from './lib/api.ts'
+ import { builtinCommandIn, draftIsOnlyCommand, type CompletionItem } from './lib/composer-completion.ts'
+ import type { CommandRow, ModelAliasRow, ModelDefaults, ProjectRow, QuestionReply, SessionListing, SessionModel, SkillRow, WorkspaceMeta, WorkspaceRow } from './lib/types.ts'
+ 
+ /** The sidebar docks beside the conversation at this width; below it is a drawer. */
+ const SIDEBAR_DOCK_QUERY = '(min-width: 768px)'
+ /** The workbench docks beside the chat at this width; below it is a sheet. */
+ const WORKBENCH_DOCK_QUERY = '(min-width: 1280px)'
+ 
+ function focusComposer(): void {
+   requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('[data-composer-input]')?.focus())
+@@ -475,21 +475,20 @@ function AppShell() {
+   // Global model aliases for the picker; reloaded whenever Settings closes, where they are edited.
+   const [modelAliases, setModelAliases] = useState<readonly ModelAliasRow[]>([])
+   useEffect(() => {
+     if (settingsOpen) return
+     let current = true
+     void listModelAliases().then((rows) => { if (current) setModelAliases(rows) }, () => {})
+     return () => { current = false }
+   }, [settingsOpen])
+   const [settingsSection, setSettingsSection] = useState<'providers' | 'projects' | 'permissions' | 'skills' | 'memory' | 'agents' | 'mcp' | 'hooks' | 'secrets' | undefined>(undefined)
+   const [pendingDelete, setPendingDelete] = useState<SessionListing | null>(null)
+-  const [manifest, setManifest] = useState<ContextView | null>(null)
+   const [compactNonce, setCompactNonce] = useState(0)
+   const workspaceRef = useRef(activeWs)
+   workspaceRef.current = activeWs
+   const currentRef = useRef(current)
+   currentRef.current = current
+   const sendingRef = useRef(new Set<string>())
+   /** Request ids of an unconfirmed Retry, per failed turn: a repeated click dedups. */
+   const retryIds = useRef(new Map<string, string[]>())
+   /** Conversations with a compaction in flight; one at a time each. */
+   const compactingRef = useRef(new Set<string>())
+@@ -561,20 +560,21 @@ function AppShell() {
+   // streaming frame of chunks re-derives none of them.
+   const derived = useSessionDerivedValues(events, approvals.length, sending)
+   const running = derived.running
+   const currentSession = useMemo(() => sessions.find((session) => session.id === current) ?? null, [sessions, current])
+   /** Queued input as a strip above the composer, in submission order. */
+   const queuedItems = useMemo(
+     () => projectedItems.filter((item): item is Extract<ViewItem, { kind: 'user' }> => item.kind === 'user' && item.queued === true),
+     [projectedItems],
+   )
+   const manifestKey = useMemo(() => manifestRefreshKey(events, compactNonce), [events, compactNonce])
++  const { manifest, status: manifestStatus } = useContextManifest(activeWs, current, manifestKey)
+   // A subagent conversation reads as parent → sub in the header trail.
+   const currentParentSession = useMemo(
+     () => (currentSession?.parentSessionId != null ? sessions.find((session) => session.id === currentSession.parentSessionId) ?? null : null),
+     [sessions, currentSession],
+   )
+   // The Subagents view lists the root conversation's delegation
+   // (subagentsRootSession). While a child is open, a second stream keeps the
+   // parent's log alive for that view's briefs and refresh signal; it idles
+   // whenever the viewed conversation is the root itself. The parent of a
+   // listed child is listed too (delegation is one-level and in-workspace), so
+@@ -976,21 +976,20 @@ function AppShell() {
+   // Switching the active workspace re-scopes listings and controls. It does
+   // NOT close a running Turn server-side; only this browser's selected stream changes.
+   useEffect(() => {
+     if (activeWs === null) return
+     let cancelled = false
+     const requestedSession = currentRef.current
+     const nav = navigation.current.current()
+     const listingToken = lists.current.next()
+     const metaToken = metadata.current.next()
+     setMeta(null)
+-    setManifest(null)
+     setSessions([])
+     setListedWorkspace(null)
+     setProjects([])
+     setModeSelection({ modes: [], selected: null })
+     void (async () => {
+       try {
+         const [listing, projectRows, wsMeta, modeRows] = await Promise.all([
+           listSessionsIn(activeWs),
+           listProjects(activeWs),
+           fetchWorkspaceMeta(activeWs),
+@@ -1074,50 +1073,20 @@ function AppShell() {
+     setSkills([])
+     if (activeWs === null) return
+     const projectId = workbenchProject?.id ?? null
+     let cancelled = false
+     void composerSkillRows(listSkills, activeWs, projectId, listCommands)
+       .then((rows) => { if (!cancelled && workspaceRef.current === activeWs) setSkills(rows) })
+       .catch(() => { /* an unavailable catalog only closes the menu */ })
+     return () => { cancelled = true }
+   }, [activeWs, workbenchProject?.id, skillsRevision])
+ 
+-  // Session whose manifest is currently on screen. A change means the user
+-  // switched conversations, which fetches at once; the same session refreshes
+-  // shortly after each request is assembled, each step ends, and the turn ends
+-  // — so the meter fills as soon as a message is sent, not only after the turn.
+-  const manifestSession = useRef<string | null>(null)
+-  // Composer context meter + inspector. On a session switch the stale figures
+-  // clear at once — the previous conversation's count is never shown as the
+-  // new one's — and the same session keeps its figures until the refresh lands.
+-  useEffect(() => {
+-    if (activeWs === null || current === null) return
+-    const switched = manifestSession.current !== `${activeWs}:${current}`
+-    manifestSession.current = `${activeWs}:${current}`
+-    if (switched) setManifest(null)
+-    let cancelled = false
+-    const timer = setTimeout(() => {
+-      void fetchManifest(activeWs, current).then(
+-        (view) => {
+-          if (!cancelled && currentRef.current === current && workspaceRef.current === activeWs) setManifest(view)
+-        },
+-        () => {
+-          if (!cancelled && currentRef.current === current && workspaceRef.current === activeWs) setManifest(null)
+-        },
+-      )
+-    }, switched ? 0 : 150)
+-    return () => {
+-      cancelled = true
+-      clearTimeout(timer)
+-    }
+-  }, [activeWs, current, manifestKey])
+-
+   useEffect(() => {
+     if (streamError === null) return
+     toast.notify(streamError)
+   }, [streamError, toast])
+ 
+   useEffect(() => {
+     if (activeWs === null || current === null || listedWorkspace !== activeWs) return
+     if (sessions.some((session) => session.id === current) || createdHere.current.has(current)) return
+     setCurrent(null)
+     navigate(workspaceRoute(activeWs), 'replace')
+@@ -1714,21 +1683,21 @@ function AppShell() {
+     }
+     return null
+   }, [projectedItems])
+ 
+   // The latest folder-grant revision on the stream: an approval that granted
+   // a folder refreshes the chip without reopening it.
+   const grantsRevision = useMemo(
+     () => events.reduce((latest, event) => (event.type === 'session/grants' ? Math.max(latest, event.revision ?? 0) : latest), 0),
+     [events],
+   )
+-  const contextControl = current !== null ? <ContextMeter manifest={manifest} /> : null
++  const contextControl = current !== null ? <ContextMeter manifest={manifest} status={manifestStatus} /> : null
+   // Folders decide access, like the mode, so they sit on the left beside it.
+   const folderControl = current !== null && activeWs !== null && currentProject !== null
+     ? <SessionFoldersChip workspaceId={activeWs} sessionId={current} revision={grantsRevision} />
+     : null
+ 
+   // A subagent conversation is executor-managed — the parent drives it — so
+   // there is nothing to type into: the whole composer stays hidden.
+   const composerNode = currentParentSession !== null ? null : (
+     <ScopedComposer
+       store={composers}
+@@ -1801,21 +1770,21 @@ function AppShell() {
+       sessionId={current}
+       agentsSessionId={subagentsRootId ?? current}
+       onOpenChild={openSession}
+       agentFocus={agentFocus}
+       onAgentFocus={setAgentFocus}
+       processFocus={processFocus}
+       terminalShell={preferences.terminalShell}
+       onTerminalShell={(shellId) => patchPreferences({ terminalShell: shellId })}
+       bindingReady={listedWorkspace === activeWs}
+       onGitTrustChange={recordGitTrust}
+-      context={{ meta, ...(modelDefaults !== null ? { globalDefaults: modelDefaults } : {}), ...(currentSessionModel !== undefined ? { sessionModel: currentSessionModel } : {}), ...(current !== null && currentSessionModelState?.status === 'loading' ? { sessionControlsStatus: 'loading' as const } : {}), ...(current !== null && currentSessionModelState?.status === 'error' ? { sessionControlsStatus: 'unavailable' as const } : {}), stream, sessionId: current, sessionFolder: currentProject?.path ?? null, eventCount: events.length, manifest, workspaceId: activeWs, running, modeLabel: envModeLabel, onCompacted: () => setCompactNonce((nonce) => nonce + 1), onOpenSettingsTab: (tab) => openSettings(tab) }}
++      context={{ meta, ...(modelDefaults !== null ? { globalDefaults: modelDefaults } : {}), ...(currentSessionModel !== undefined ? { sessionModel: currentSessionModel } : {}), ...(current !== null && currentSessionModelState?.status === 'loading' ? { sessionControlsStatus: 'loading' as const } : {}), ...(current !== null && currentSessionModelState?.status === 'error' ? { sessionControlsStatus: 'unavailable' as const } : {}), stream, sessionId: current, sessionFolder: currentProject?.path ?? null, eventCount: events.length, manifest, manifestStatus, workspaceId: activeWs, running, modeLabel: envModeLabel, onCompacted: () => setCompactNonce((nonce) => nonce + 1), onOpenSettingsTab: (tab) => openSettings(tab) }}
+     />
+   )
+ 
+   const terminalDock = (
+     <TerminalDock
+       workspaceId={activeWs}
+       projectId={workbenchProject?.id ?? null}
+       height={preferences.terminalHeight}
+       resizeHandle={terminalResize}
+       open={terminalProjectState.footerOpen}
+diff --git a/web/components/composer/ContextMeter.tsx b/web/components/composer/ContextMeter.tsx
+index f559c58..7594d86 100644
+--- a/web/components/composer/ContextMeter.tsx
++++ b/web/components/composer/ContextMeter.tsx
+@@ -1,15 +1,15 @@
+ import { Menu } from '../ui/Menu.tsx'
+ import { cn } from '../../lib/cn.ts'
+-import { budgetTone, contextFill } from '../../lib/format.ts'
++import { budgetTone, contextFill, formatPolicyPressure, policyPressure } from '../../lib/format.ts'
+ import { isAvailableContext } from '../../../src/harness/context/context-state.ts'
+-import type { ContextBreakdownView, ContextView } from '../../lib/api.ts'
++import type { ContextBreakdownView, ContextStatus, ContextView } from '../../lib/api.ts'
+ import { composerFocusClass } from './composer-chip.ts'
+ 
+ /** Breakdown rows in the order they render, each a deeper-to-lighter shade. */
+ const CATEGORIES: readonly { readonly key: keyof ContextBreakdownView; readonly label: string; readonly shade: string }[] = [
+   { key: 'messages', label: 'Messages', shade: 'bg-link' },
+   { key: 'systemTools', label: 'System tools', shade: 'bg-link/75' },
+   { key: 'mcpTools', label: 'MCP tools', shade: 'bg-link/55' },
+   { key: 'metaContext', label: 'Meta context', shade: 'bg-link/40' },
+   { key: 'skills', label: 'Skills', shade: 'bg-link/28' },
+   { key: 'systemPrompt', label: 'System prompt', shade: 'bg-link/18' },
+@@ -47,26 +47,29 @@ function Ring({ ratio, tone, empty }: { readonly ratio: number; readonly tone: k
+           className={TONE_STROKE[tone]}
+         />
+       ) : null}
+     </svg>
+   )
+ }
+ 
+ /**
+  * Composer context meter: a ring showing how full the model's context window
+  * was on the last request, opening a token count per source. Counts are
+- * tokens, never percentages. Before the first request it says so.
++ * tokens, never percentages. Before the first request it says so; while the
++ * figures load, or when they could not be fetched, it says that instead.
+  */
+-export function ContextMeter({ manifest }: { readonly manifest: ContextView | null }) {
+-  const available = manifest !== null && isAvailableContext(manifest) ? manifest : null
++export function ContextMeter({ manifest, status = manifest === null ? 'none' : 'ready' }: { readonly manifest: ContextView | null; readonly status?: ContextStatus }) {
++  const shown = status === 'ready' ? manifest : null
++  const available = shown !== null && isAvailableContext(shown) ? shown : null
+   const postCompact = available?.display?.kind === 'post-compaction'
+   const fill = available !== null ? contextFill(available) : null
++  const pressure = available !== null ? policyPressure(available) : undefined
+   const tone = fill !== null ? budgetTone(fill.used, fill.limit) : 'ok'
+   const summary = fill !== null
+     ? `${formatTokens(fill.used)} / ${formatTokens(fill.limit)}`
+     : null
+   const breakdown = available?.breakdown
+   const breakdownTotal = breakdown !== undefined ? CATEGORIES.reduce((total, category) => total + breakdown[category.key], 0) : 0
+ 
+   return (
+     <Menu
+       label={summary !== null ? `Context window ${summary}` : 'Context window'}
+@@ -82,27 +85,43 @@ export function ContextMeter({ manifest }: { readonly manifest: ContextView | nu
+         <div className="flex flex-col gap-3 text-sm">
+           <div className="flex items-baseline justify-between gap-3">
+             <span className="font-semibold">Context window</span>
+             {summary !== null ? (
+               <span className="font-mono text-xs text-fg-muted" title={fill?.estimated === true ? 'Estimated (chars/4); the provider did not report usage' : 'Prompt tokens reported by the provider'}>
+                 {summary}
+               </span>
+             ) : null}
+           </div>
+ 
+-          {manifest !== null && !isAvailableContext(manifest) ? (
+-            <p className="text-fg-muted">Context estimate unavailable until the next request ({manifest.display.reason === 'preview-failed' ? 'compaction preview failed' : 'earlier compaction predates full estimates'}).</p>
++          {status === 'loading' ? (
++            <p className="text-fg-muted">Loading context…</p>
++          ) : status === 'error' ? (
++            <p className="text-fg-muted">Context unavailable</p>
++          ) : shown !== null && !isAvailableContext(shown) ? (
++            <p className="text-fg-muted">Context estimate unavailable until the next request ({shown.display.reason === 'preview-failed' ? 'compaction preview failed' : 'earlier compaction predates full estimates'}).</p>
+           ) : fill === null ? (
+             <p className="text-fg-muted">No recorded request context for this conversation.</p>
+           ) : (
+             <>
+               {postCompact ? <p className="m-0 text-xs text-fg-faint">After compaction · estimated — the next request replaces this preview.</p> : null}
++              {!postCompact ? (
++                <dl className="m-0 flex flex-col gap-1 text-xs">
++                  <div className="flex items-center justify-between gap-3"><dt className="text-fg-muted">Last request</dt><dd className="m-0 font-mono">{fill.estimated ? 'estimated' : 'reported'}</dd></div>
++                  {available?.model !== undefined ? <div className="flex items-center justify-between gap-3"><dt className="text-fg-muted">Model</dt><dd className="m-0 truncate font-mono">{available.model}</dd></div> : null}
++                  {!fill.estimated && available !== null && available.budget.usedTokens !== fill.used ? (
++                    <div className="flex items-center justify-between gap-3"><dt className="text-fg-muted">Estimate total</dt><dd className="m-0 font-mono">{formatTokens(available.budget.usedTokens)}</dd></div>
++                  ) : null}
++                </dl>
++              ) : null}
++              {pressure !== undefined ? (
++                <p className="m-0 text-xs text-fg-muted" title="Auto-compact trigger: pre-trim estimate over the usable input budget. Not the window ring.">Auto-compact trigger: {formatPolicyPressure(pressure)}</p>
++              ) : null}
+               {/* The filled share of the window, split by source in proportion. */}
+               <div className="flex h-2 overflow-hidden rounded-full bg-muted" role="presentation">
+                 <div className="flex h-full" style={{ width: `${fill.ratio * 100}%` }}>
+                   {breakdownTotal > 0
+                     ? CATEGORIES.map((category) => (
+                         <div key={category.key} className={cn('h-full', category.shade)} style={{ width: `${(breakdown![category.key] / breakdownTotal) * 100}%` }} />
+                       ))
+                     : <div className="h-full w-full bg-link" />}
+                 </div>
+               </div>
+diff --git a/web/components/composer/context-meter.spec.tsx b/web/components/composer/context-meter.spec.tsx
+index 5bf4279..90714bd 100644
+--- a/web/components/composer/context-meter.spec.tsx
++++ b/web/components/composer/context-meter.spec.tsx
+@@ -1,17 +1,17 @@
+ // @vitest-environment jsdom
+ import { afterEach, expect, it } from 'vitest'
+ import { act } from 'react'
+ import { createRoot, type Root } from 'react-dom/client'
+ import { contextFill } from '../../lib/format.ts'
+ import { ContextMeter, formatTokens } from './ContextMeter.tsx'
+-import type { ContextManifestView, ContextView } from '../../lib/api.ts'
++import type { ContextManifestView, ContextStatus, ContextView } from '../../lib/api.ts'
+ 
+ ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+ let root: Root | undefined
+ let host: HTMLDivElement
+ 
+ afterEach(async () => {
+   if (root) await act(async () => root!.unmount())
+   root = undefined
+   host?.remove()
+ })
+@@ -19,45 +19,81 @@ afterEach(async () => {
+ const MANIFEST: ContextManifestView = {
+   modeId: 'default',
+   modeRevision: 1,
+   budget: { availableTokens: 994_880, usedTokens: 100_000, contextLimitTokens: 1_000_000, estimated: true },
+   breakdown: { messages: 65_000, systemTools: 15_000, mcpTools: 14_000, metaContext: 2_000, skills: 2_000, systemPrompt: 2_000 },
+   history: { setting: 'recent', includedTurns: 3, omittedTurns: 0 },
+   sources: { skills: [], memory: [], toolNames: [], toolSchemas: 0 },
+   omissions: [],
+ }
+ 
+-async function openMeter(manifest: ContextView | null): Promise<HTMLElement> {
++async function openMeter(manifest: ContextView | null, status?: ContextStatus): Promise<HTMLElement> {
+   host = document.createElement('div')
+   document.body.append(host)
+   root = createRoot(host)
+-  await act(async () => root!.render(<ContextMeter manifest={manifest} />))
++  await act(async () => root!.render(<ContextMeter manifest={manifest} {...(status !== undefined ? { status } : {})} />))
+   const trigger = host.querySelector<HTMLButtonElement>('button')!
+   await act(async () => {
+     trigger.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0 }))
+     trigger.click()
+   })
+   return document.querySelector<HTMLElement>('[role="dialog"]')!
+ }
+ 
+ it('labels a post-compaction estimate independently from the last request', async () => {
+   const panel = await openMeter({ ...MANIFEST, display: { kind: 'post-compaction', compactionSeq: 40, coversSeq: 30 } })
+   expect(panel.textContent).toContain('After compaction')
+   expect(panel.textContent).toContain('estimated')
+ })
+ 
+ it('does not show a zero count when the current context is unavailable', async () => {
+   const panel = await openMeter({ display: { kind: 'unavailable', reason: 'legacy-compaction' }, usage: { cacheableInputTokens: 0, cachedInputTokens: 0 } })
+   expect(panel.textContent).toContain('Context estimate unavailable')
+   expect(panel.textContent).not.toContain('0 /')
+ })
+ 
++it('says loading or unavailable instead of "no request" or a zero count', async () => {
++  const loading = await openMeter(null, 'loading')
++  expect(loading.textContent).toContain('Loading context')
++  expect(loading.textContent).not.toContain('No recorded request')
++  await act(async () => root!.unmount())
++  root = undefined
++  host.remove()
++  // A stale value never shows through a non-ready status.
++  const failed = await openMeter(MANIFEST, 'error')
++  expect(failed.textContent).toContain('Context unavailable')
++  expect(failed.textContent).not.toContain('100K / 1M')
++})
++
++it('shows the measured request: its model, basis and estimate total beside the reported one', async () => {
++  const panel = await openMeter({ ...MANIFEST, model: 'glm-measured', usage: { last: { inputTokens: 139_100 }, cacheableInputTokens: 0, cachedInputTokens: 0 } })
++  expect(panel.textContent).toContain('Last requestreported')
++  expect(panel.textContent).toContain('Modelglm-measured')
++  expect(panel.textContent).toContain('Estimate total100K')
++  await act(async () => root!.unmount())
++  root = undefined
++  host.remove()
++  const estimated = await openMeter(MANIFEST)
++  expect(estimated.textContent).toContain('Last requestestimated')
++  expect(estimated.textContent).not.toContain('Estimate total')
++})
++
++it('shows the auto-compact trigger only when the host reports a policy', async () => {
++  const withPolicy = await openMeter({ ...MANIFEST, budget: { ...MANIFEST.budget, preTrimTokens: 850_000 }, policy: { automaticCompactionPressure: 0.85 } })
++  expect(withPolicy.textContent).toContain('Auto-compact trigger: 85% of input budget · auto-compacts at 85%')
++  await act(async () => root!.unmount())
++  root = undefined
++  host.remove()
++  const without = await openMeter(MANIFEST)
++  expect(without.textContent).not.toContain('Auto-compact')
++})
++
+ it('formats token counts compactly', () => {
+   expect(formatTokens(950)).toBe('950')
+   expect(formatTokens(139_100)).toBe('139.1K')
+   expect(formatTokens(1_000_000)).toBe('1M')
+   expect(formatTokens(1_500_000)).toBe('1.5M')
+ })
+ 
+ it('prefers the provider-reported prompt size over the estimate', () => {
+   expect(contextFill(MANIFEST)).toMatchObject({ used: 100_000, estimated: true, cacheHitRate: undefined })
+   const reported = contextFill({ ...MANIFEST, usage: { last: { inputTokens: 139_100, cachedInputTokens: 130_000 }, cacheableInputTokens: 400_000, cachedInputTokens: 396_000 } })
+diff --git a/web/components/layout/ContextPanel.tsx b/web/components/layout/ContextPanel.tsx
+index 39171a3..814462e 100644
+--- a/web/components/layout/ContextPanel.tsx
++++ b/web/components/layout/ContextPanel.tsx
+@@ -1,16 +1,16 @@
+ import { useEffect, useState, type ReactNode } from 'react'
+ import ConfirmDialog from '../common/ConfirmDialog.tsx'
+ import { useToast } from '../common/Toast.tsx'
+ import { Button } from '../ui/Button.tsx'
+-import { compactSession, CompactionCancelled, type ContextView, type StreamState } from '../../lib/api.ts'
+-import { budgetTone, compactionTokenChange, contextFill } from '../../lib/format.ts'
++import { compactSession, CompactionCancelled, type ContextStatus, type ContextView, type StreamState } from '../../lib/api.ts'
++import { budgetTone, compactionTokenChange, contextFill, formatPolicyPressure, policyPressure } from '../../lib/format.ts'
+ import { isAvailableContext } from '../../../src/harness/context/context-state.ts'
+ import { cn } from '../../lib/cn.ts'
+ import type { Meta, SessionModel, WorkspaceMeta } from '../../lib/types.ts'
+ 
+ export type SessionControlsStatus = 'loading' | 'unavailable'
+ 
+ const STREAM_LABELS: Readonly<Record<StreamState, string>> = {
+   idle: 'No conversation selected',
+   open: 'open',
+   reconnecting: 'reconnecting…',
+@@ -46,29 +46,33 @@ export interface ContextPanelProps {
+   readonly sessionModel?: SessionModel
+   /** Live global controls; legacy `source: 'global'` conversations display these, not their cached GET response. */
+   readonly globalDefaults?: { readonly provider: string | null; readonly model: string | null }
+   /** Existing-session load failure/loading; drafts omit this and use global defaults. */
+   readonly sessionControlsStatus?: SessionControlsStatus
+   readonly stream: StreamState
+   readonly sessionId: string | null
+   readonly sessionFolder: string | null
+   readonly eventCount: number
+   readonly manifest?: ContextView | null
++  /** Ownership/fetch state of `manifest`; omitted means "whatever `manifest` shows". */
++  readonly manifestStatus?: ContextStatus
+   readonly workspaceId?: string | null
+   readonly running?: boolean
+   readonly modeLabel?: string | null
+   readonly onCompacted?: () => void
+   readonly onOpenSettingsTab?: (tab: 'skills' | 'memory') => void
+ }
+ 
+-export function ContextPanel({ meta, sessionModel, globalDefaults, sessionControlsStatus, stream, sessionId, sessionFolder, eventCount, manifest, workspaceId, running = false, modeLabel, onCompacted, onOpenSettingsTab }: ContextPanelProps) {
++export function ContextPanel({ meta, sessionModel, globalDefaults, sessionControlsStatus, stream, sessionId, sessionFolder, eventCount, manifest: fetched, manifestStatus, workspaceId, running = false, modeLabel, onCompacted, onOpenSettingsTab }: ContextPanelProps) {
+   const toast = useToast()
++  const status = manifestStatus ?? (fetched === undefined || fetched === null ? 'none' : 'ready')
++  const manifest = status === 'ready' ? fetched : null
+   const controls = sessionModel?.source === 'global'
+     ? globalDefaults ?? { provider: null, model: null }
+     : sessionModel ?? { provider: meta?.provider ?? null, model: meta?.model ?? null }
+   const folder = sessionFolder ?? (('folder' in (meta ?? {}) ? String((meta as { folder?: string }).folder ?? '') : '') || '—')
+   const [confirming, setConfirming] = useState(false)
+   const [busy, setBusy] = useState(false)
+ 
+   useEffect(() => {
+     if (running && !busy) setConfirming(false)
+   }, [busy, running])
+@@ -92,20 +96,21 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
+       }
+     } finally {
+       setBusy(false)
+     }
+   }
+ 
+   const canCompact = workspaceId !== null && workspaceId !== undefined && sessionId !== null
+   const available = manifest !== undefined && manifest !== null && isAvailableContext(manifest) ? manifest : null
+   const fill = available !== null ? contextFill(available) : undefined
+   const tone = fill !== undefined ? budgetTone(fill.used, fill.limit) : 'ok'
++  const pressure = available !== null ? policyPressure(available) : undefined
+   const percent = fill === undefined ? 0 : Math.round(fill.ratio * 100)
+   const settingsLink = (tab: 'skills' | 'memory', names: readonly string[]): ReactNode => onOpenSettingsTab !== undefined
+     ? <button type="button" className="text-left text-link hover:underline" onClick={() => onOpenSettingsTab(tab)}>{names.join(', ')}</button>
+     : names.join(', ')
+ 
+   return (
+     <section aria-label="Conversation context" className="flex flex-col gap-5">
+       <Card title="Conversation">
+         <Row term="id"><code className="text-xs">{sessionId !== null ? `${sessionId.slice(0, 9)}…` : '—'}</code></Row>
+         <Row term="events">{eventCount}</Row>
+@@ -126,30 +131,47 @@ export function ContextPanel({ meta, sessionModel, globalDefaults, sessionContro
+             size="sm"
+             variant="outline"
+             disabled={!canCompact || running || busy}
+             title={!canCompact ? 'Select a conversation' : running ? 'Stop the turn first' : 'Summarize older turns into a checkpoint'}
+             onClick={() => setConfirming(true)}
+           >
+             {busy ? 'Compacting…' : 'Compact…'}
+           </Button>
+         )}
+       >
+-        {manifest !== undefined && manifest !== null && !isAvailableContext(manifest) ? (
++        {status === 'loading' ? (
++          <div className="px-3 py-3 text-[13px] text-fg-muted">
++            <dt className="sr-only">Manifest</dt>
++            <dd className="m-0">Loading context…</dd>
++          </div>
++        ) : status === 'error' ? (
++          <div className="px-3 py-3 text-[13px] text-fg-muted">
++            <dt className="sr-only">Manifest</dt>
++            <dd className="m-0">Context unavailable</dd>
++          </div>
++        ) : manifest !== undefined && manifest !== null && !isAvailableContext(manifest) ? (
+           <div className="px-3 py-3 text-[13px] text-fg-muted">
+             <dt className="sr-only">Manifest</dt>
+             <dd className="m-0">Context estimate unavailable until the next request{manifest.display.reason === 'preview-failed' ? ' (compaction preview failed)' : ''}.</dd>
+           </div>
+         ) : available !== null ? (
+           <>
+             {available.display?.kind === 'post-compaction' ? (
+               <Row term="basis"><span title="Estimate rebuilt after compaction; the next request replaces it.">After compaction · estimated</span></Row>
+             ) : null}
++            {available.display?.kind !== 'post-compaction' ? (
++              <Row term="request">
++                {fill?.estimated === true ? 'estimated' : 'reported'}
++                {available.model !== undefined ? ` · ${available.model}` : ''}
++              </Row>
++            ) : null}
++            {pressure !== undefined ? <Row term="auto-compact"><span title="Pre-trim estimate over the usable input budget; not the window bar.">trigger: {formatPolicyPressure(pressure)}</span></Row> : null}
+             <Row term="mode">{available.modeId} · rev {available.modeRevision}{available.sources.modeSource !== undefined ? ` · ${available.sources.modeSource}` : ''}</Row>
+             {available.sources.environment !== undefined ? (
+               <Row term="environment">
+                 <span title={[available.sources.environment.date, available.sources.environment.platform, available.sources.environment.workspacePath, available.sources.environment.gitBranch !== undefined ? `git ${available.sources.environment.gitBranch}` : undefined].filter(Boolean).join('\n') || 'environment facts'}>
+                   {available.sources.environment.date ?? '—'}
+                   {available.sources.environment.gitBranch !== undefined ? ` · git ${available.sources.environment.gitBranch}` : ''}
+                 </span>
+               </Row>
+             ) : null}
+             <Row term="window">
+diff --git a/web/hooks/useContextManifest.spec.tsx b/web/hooks/useContextManifest.spec.tsx
+new file mode 100644
+index 0000000..236ea2c
+--- /dev/null
++++ b/web/hooks/useContextManifest.spec.tsx
+@@ -0,0 +1,73 @@
++// @vitest-environment jsdom
++import { afterEach, beforeEach, expect, it, vi } from 'vitest'
++import { act } from 'react'
++import { createRoot, type Root } from 'react-dom/client'
++import { useContextManifest } from './useContextManifest.ts'
++
++;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
++
++const body = (used: number) => ({ modeId: 'm', modeRevision: 1, budget: { availableTokens: 100, usedTokens: used, estimated: true }, history: { setting: 'recent', includedTurns: 1, omittedTurns: 0 }, sources: { skills: [], memory: [], toolNames: [], toolSchemas: 0 }, omissions: [] })
++const respond = (status: number, value?: unknown): Response => new Response(value === undefined ? null : JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } })
++
++let root: Root | undefined
++let host: HTMLDivElement
++let seen: ReturnType<typeof useContextManifest>
++const pending = new Map<string, (response: Response) => void>()
++
++function Probe({ ws, session, refresh }: { ws: string | null; session: string | null; refresh: string }) {
++  seen = useContextManifest(ws, session, refresh)
++  return <span>{seen.status}</span>
++}
++const render = (session: string | null, refresh = '0') => act(async () => root!.render(<Probe ws="w" session={session} refresh={refresh} />))
++const settle = (session: string, response: Response) => act(async () => { pending.get(session)!(response); await Promise.resolve() })
++
++beforeEach(() => {
++  host = document.createElement('div')
++  document.body.append(host)
++  root = createRoot(host)
++  pending.clear()
++  vi.useFakeTimers()
++  vi.stubGlobal('fetch', vi.fn((url: string) => new Promise<Response>((resolve) => { pending.set(decodeURIComponent(url.split('/sessions/')[1]!.split('/')[0]!), resolve) })))
++})
++
++afterEach(async () => {
++  await act(async () => root!.unmount())
++  host.remove()
++  vi.useRealTimers()
++  vi.unstubAllGlobals()
++})
++
++it('a fetch for the previous session resolving after a switch never reaches the new session', async () => {
++  await render('A')
++  await act(async () => { await vi.advanceTimersByTimeAsync(0) })
++  expect(seen.status).toBe('loading')
++
++  await render('B')
++  // The very render after the switch: loading, not A's value and not an empty/zero view.
++  expect(seen).toEqual({ manifest: null, status: 'loading' })
++  await act(async () => { await vi.advanceTimersByTimeAsync(0) })
++
++  await settle('A', respond(200, body(111)))
++  expect(seen).toEqual({ manifest: null, status: 'loading' })
++  await settle('B', respond(200, body(222)))
++  expect(seen.status).toBe('ready')
++  expect(seen.manifest).toMatchObject({ budget: { usedTokens: 222 } })
++})
++
++it('204 is "none"; any other HTTP failure is "error", and the same session refreshes after 150 ms', async () => {
++  await render('A')
++  await act(async () => { await vi.advanceTimersByTimeAsync(0) })
++  await settle('A', respond(204))
++  expect(seen).toEqual({ manifest: null, status: 'none' })
++
++  await render('A', '1')
++  expect(seen.status).toBe('none') // the same owner keeps its figures while refreshing
++  expect(pending.has('A')).toBe(true)
++  const calls = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.length
++  await act(async () => { await vi.advanceTimersByTimeAsync(149) })
++  expect((fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(calls)
++  await act(async () => { await vi.advanceTimersByTimeAsync(1) })
++  expect((fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(calls + 1)
++  await settle('A', respond(500, { error: 'boom' }))
++  expect(seen).toEqual({ manifest: null, status: 'error' })
++})
+diff --git a/web/hooks/useContextManifest.ts b/web/hooks/useContextManifest.ts
+new file mode 100644
+index 0000000..8bfe353
+--- /dev/null
++++ b/web/hooks/useContextManifest.ts
+@@ -0,0 +1,44 @@
++import { useEffect, useRef, useState } from 'react'
++import { fetchManifest, type ContextStatus, type ContextView } from '../lib/api.ts'
++
++interface Owned { readonly owner: string; readonly status: ContextStatus; readonly view: ContextView | null }
++
++/**
++ * Context figures for one conversation. A figure belongs to the
++ * `{workspaceId, sessionId}` that fetched it: any other owner reads as `loading`
++ * on the very render the selection changes, so a previous conversation's count
++ * (or a made-up zero) is never shown. `refreshKey` re-fetches the same
++ * conversation after a 150 ms debounce; a switch fetches at once. HTTP 204 is
++ * `none` (no request yet); any other failure is `error`.
++ */
++export function useContextManifest(workspaceId: string | null, sessionId: string | null, refreshKey: string): { readonly manifest: ContextView | null; readonly status: ContextStatus } {
++  const [state, setState] = useState<Owned | null>(null)
++  const shown = useRef<string | null>(null)
++  const latest = useRef({ workspaceId, sessionId })
++  latest.current = { workspaceId, sessionId }
++  const owner = workspaceId !== null && sessionId !== null ? `${workspaceId}:${sessionId}` : null
++
++  useEffect(() => {
++    if (workspaceId === null || sessionId === null) return
++    const key = `${workspaceId}:${sessionId}`
++    const switched = shown.current !== key
++    shown.current = key
++    let cancelled = false
++    const settle = (status: ContextStatus, view: ContextView | null): void => {
++      if (!cancelled && latest.current.sessionId === sessionId && latest.current.workspaceId === workspaceId) setState({ owner: key, status, view })
++    }
++    const timer = setTimeout(() => {
++      void fetchManifest(workspaceId, sessionId).then(
++        (view) => settle(view === null ? 'none' : 'ready', view),
++        () => settle('error', null),
++      )
++    }, switched ? 0 : 150)
++    return () => {
++      cancelled = true
++      clearTimeout(timer)
++    }
++  }, [workspaceId, sessionId, refreshKey])
++
++  const owned = owner !== null && state?.owner === owner
++  return { manifest: owned ? state.view : null, status: owned ? state.status : 'loading' }
++}
+diff --git a/web/lib/api.ts b/web/lib/api.ts
+index 67854c5..79b05a3 100644
+--- a/web/lib/api.ts
++++ b/web/lib/api.ts
+@@ -1337,21 +1337,21 @@ export function deleteModeFile(workspaceId: string, modeId: string): Promise<{ r
+ 
+ /** Show or hide one mode in this workspace's composer picker. */
+ export function setModeEnabled(workspaceId: string, modeId: string, enabled: boolean): Promise<{ readonly id: string; readonly enabled: boolean }> {
+   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/modes/${encodeURIComponent(modeId)}/enabled`, {
+     method: 'PUT',
+     headers: { 'content-type': 'application/json' },
+     body: JSON.stringify({ enabled }),
+   }).then((r) => json<{ readonly id: string; readonly enabled: boolean }>(r))
+ }
+ 
+-export type { ContextBreakdownView, ContextManifestView, ContextUsageView, ContextView } from './types.ts'
++export type { CompactionMeasurementView, ContextStatus, ContextBreakdownView, ContextManifestView, ContextUsageView, ContextView } from './types.ts'
+ 
+ /** `null` means the valid no-request-yet state (HTTP 204), not an error. */
+ export function fetchManifest(workspaceId: string, sessionId: string): Promise<import('./types.ts').ContextView | null> {
+   return apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/manifest`).then((r) => {
+     if (r.status === 204) return null
+     return json<import('./types.ts').ContextView>(r)
+   })
+ }
+ 
+ /** One raw context block by content hash; `null` = never recorded (legacy log). */
+@@ -1361,20 +1361,22 @@ export function fetchContextBody(workspaceId: string, sessionId: string, hash: s
+     return json<{ kind: string; name?: string; hash: string; chars: number; body: string }>(r)
+   })
+ }
+ 
+ export interface CompactResult {
+   readonly coversSeq: number
+   readonly summaryChars: number
+   /** Context tokens before/after; absent when the run was not measured. */
+   readonly tokensBefore?: number
+   readonly tokensAfter?: number
++  /** Basis of the two figures; absent on older hosts (then both are estimates). */
++  readonly measurement?: import('./types.ts').CompactionMeasurementView
+   /** How the summary was produced: `exact` and `reconstructed` are one request; `recovery` folds the whole transcript. */
+   readonly path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'
+ }
+ 
+ /** Stop, a delete or a shutdown ended the compaction. Not a failure: nothing was written. */
+ export class CompactionCancelled extends Error {
+   constructor() {
+     super('Compaction was cancelled.')
+     this.name = 'CompactionCancelled'
+   }
+diff --git a/web/lib/format.ts b/web/lib/format.ts
+index 0c82360..2e9612e 100644
+--- a/web/lib/format.ts
++++ b/web/lib/format.ts
+@@ -1,13 +1,13 @@
+ /** Display helpers: times, durations, and compact argument summaries. */
+ 
+-import type { ContextManifestView } from './api.ts'
++import type { CompactionMeasurementView, ContextManifestView } from './api.ts'
+ 
+ /** Fill of the model's whole context window, shared by the meter and the panel. */
+ export interface ContextFill {
+   /** Prompt tokens: provider-reported when present, otherwise the chars/4 estimate. */
+   readonly used: number
+   /** The model's context window (`availableTokens` only when the window was not recorded). */
+   readonly limit: number
+   /** `used / limit`, clamped to 1. */
+   readonly ratio: number
+   /** True when `used` is the builder's estimate rather than a provider count. */
+@@ -125,24 +125,48 @@ export function shortCommand(command: string, max = 64): string {
+   return `${flat.slice(0, head).trimEnd()}…${flat.slice(flat.length - (max - 1 - head)).trimStart()}`
+ }
+ 
+ /** Human-readable size for an attachment chip or a recorded payload. */
+ export function formatBytes(bytes: number): string {
+   if (bytes < 1024) return `${bytes} B`
+   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`
+   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+ }
+ 
+-/** `139k → 42k tokens`, or `undefined` when the compaction was not measured. */
+-export function compactionTokenChange(change: { readonly tokensBefore?: number; readonly tokensAfter?: number }): string | undefined {
++/**
++ * `139k → 42k tokens`, or `undefined` when the compaction was not measured.
++ * A reported "before" and an estimated "after" are different tokenizers, so
++ * they are labeled instead of presented as one comparable pair. Scalar-only
++ * (older) events carry no basis and count as estimates.
++ */
++export function compactionTokenChange(change: { readonly tokensBefore?: number; readonly tokensAfter?: number; readonly measurement?: CompactionMeasurementView }): string | undefined {
+   if (change.tokensBefore === undefined || change.tokensAfter === undefined) return undefined
+-  return `${formatTokenCount(change.tokensBefore)} → ${formatTokenCount(change.tokensAfter)} tokens`
++  const before = formatTokenCount(change.tokensBefore)
++  const after = formatTokenCount(change.tokensAfter)
++  const beforeBasis = change.measurement?.before?.basis ?? 'estimated'
++  const afterBasis = change.measurement?.after?.basis ?? 'estimated'
++  return beforeBasis === afterBasis ? `${before} → ${after} tokens` : `${before} ${beforeBasis} → ${after} ${afterBasis} tokens`
++}
++
++/**
++ * How close the request was to the automatic-compaction trigger. This is the
++ * policy's own ratio (pre-trim estimate over the usable input budget), not the
++ * window ring. `undefined` when the host reported no policy.
++ */
++export function policyPressure(view: { readonly budget: ContextManifestView['budget']; readonly policy?: { readonly automaticCompactionPressure: number } }): { readonly ratio: number; readonly threshold: number } | undefined {
++  if (view.policy === undefined || view.budget.availableTokens <= 0) return undefined
++  return { ratio: (view.budget.preTrimTokens ?? view.budget.usedTokens) / view.budget.availableTokens, threshold: view.policy.automaticCompactionPressure }
++}
++
++/** `78% of input budget · auto-compacts at 85%`. */
++export function formatPolicyPressure(pressure: { readonly ratio: number; readonly threshold: number }): string {
++  return `${Math.round(pressure.ratio * 100)}% of input budget · auto-compacts at ${Math.round(pressure.threshold * 100)}%`
+ }
+ 
+ /** Compact token count for chips: 940, 18.4k, 65k, 256k, 1M, 1.5M. */
+ export function formatTokenCount(tokens: number): string {
+   if (tokens < 1000) return String(Math.round(tokens))
+   if (tokens < 100_000) {
+     const k = (tokens / 1000).toFixed(1)
+     return `${k.endsWith('.0') ? k.slice(0, -2) : k}k`
+   }
+   if (tokens < 1_000_000) return `${Math.round(tokens / 1000)}k`
+diff --git a/web/lib/manifest-refresh.spec.ts b/web/lib/manifest-refresh.spec.ts
+index 03c454c..f6728aa 100644
+--- a/web/lib/manifest-refresh.spec.ts
++++ b/web/lib/manifest-refresh.spec.ts
+@@ -30,10 +30,20 @@ it('advances on a terminal measured attempt but not on start, usage-less attempt
+   }
+   expect(manifestRefreshKey([manifestEvent, { seq: 7, type: 'model/attempt', fact: { ...fact, state: 'end', usage: { inputTokens: -1 } } }], 0)).toBe('1:0')
+ })
+ 
+ it('formats the before/after token change only when it was measured', () => {
+   expect(compactionTokenChange({ tokensBefore: 139_200, tokensAfter: 42_000 })).toBe('139k → 42k tokens')
+   expect(compactionTokenChange({ tokensBefore: 900, tokensAfter: 12_300 })).toBe('900 → 12.3k tokens')
+   expect(compactionTokenChange({})).toBeUndefined()
+   expect(compactionTokenChange({ tokensBefore: 10 })).toBeUndefined()
+ })
++
++it('labels both figures when the compaction compares a reported count with an estimate', () => {
++  const change = { tokensBefore: 120_000, tokensAfter: 30_000 }
++  expect(compactionTokenChange({ ...change, measurement: { before: { tokens: 120_000, basis: 'reported' }, after: { tokens: 30_000, basis: 'estimated' } } }))
++    .toBe('120k reported → 30k estimated tokens')
++  expect(compactionTokenChange({ ...change, measurement: { before: { tokens: 120_000, basis: 'estimated' }, after: { tokens: 30_000, basis: 'estimated' } } }))
++    .toBe('120k → 30k tokens')
++  // A scalar-only (older) event is an estimate on both sides, never "reported".
++  expect(compactionTokenChange(change)).not.toContain('reported')
++})
+diff --git a/web/lib/product-ui.spec.tsx b/web/lib/product-ui.spec.tsx
+index 6b67944..1ab2e02 100644
+--- a/web/lib/product-ui.spec.tsx
++++ b/web/lib/product-ui.spec.tsx
+@@ -1,13 +1,13 @@
+ // @vitest-environment jsdom
+ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+-import { act, useState, type ReactNode } from 'react'
++import { act, useState, type ComponentProps, type ReactNode } from 'react'
+ import { createRoot, type Root } from 'react-dom/client'
+ import CopyButton from '../components/common/CopyButton.tsx'
+ import { ApprovalBar } from '../components/chat/ApprovalBar.tsx'
+ import { Composer } from '../components/composer/Composer.tsx'
+ import { ScopeControl } from '../components/layout/ScopeControl.tsx'
+ import { ModeMenu } from '../components/composer/ComposerControls.tsx'
+ import { ToastHost, useToast } from '../components/common/Toast.tsx'
+ import { CompactionMarker, ToolCard, ActivityBlock, AssistantMessage, DelegationCard, AuditLine, RetryLine, StatusLine, UserBubble, summarizeActivity } from '../components/chat/MessageParts.tsx'
+ import { QueuedBar } from '../components/chat/QueuedBar.tsx'
+ import { groupBlocks, rowItems, turnFooters } from '../components/chat/Transcript.tsx'
+@@ -1129,20 +1129,35 @@ describe('context compaction + budget bar', () => {
+   })
+   it('compacts through the confirm dialog and reports the checkpoint outcome', async () => {
+     await mount(<ToastHost><ContextPanel meta={null} stream="open" sessionId="s1" sessionFolder={null} eventCount={0} manifest={manifest} workspaceId="w1" running={false} /></ToastHost>)
+     expect(host.textContent).toContain('48000/128000 tok (est)')
+     await act(async () => button('Compact…').click())
+     expect(document.body.textContent).toContain('Compact this conversation?')
+     await act(async () => bodyButton('Compact').click())
+     expect(compactSession).toHaveBeenCalledWith('w1', 's1')
+     expect(document.body.textContent).not.toContain('Compact this conversation?')
+   })
++  it('panel: loading and error states replace the figures, with policy pressure and request details when ready', async () => {
++    const panel = (props: Partial<ComponentProps<typeof ContextPanel>>) => <ToastHost><ContextPanel meta={null} stream="open" sessionId="s1" sessionFolder={null} eventCount={0} workspaceId="w1" running={false} {...props} /></ToastHost>
++    await mount(panel({ manifest: manifest, manifestStatus: 'loading' }))
++    expect(host.textContent).toContain('Loading context')
++    expect(host.textContent).not.toContain('48000/128000')
++    await mount(panel({ manifest: null, manifestStatus: 'error' }))
++    expect(host.textContent).toContain('Context unavailable')
++    expect(host.textContent).not.toContain('No request has been assembled')
++    const reported = { ...manifest, model: 'glm-measured', budget: { ...manifest.budget, preTrimTokens: 108_800 }, usage: { last: { inputTokens: 50_000 }, cacheableInputTokens: 0, cachedInputTokens: 0 }, policy: { automaticCompactionPressure: 0.85 } }
++    await mount(panel({ manifest: reported, manifestStatus: 'ready' }))
++    expect(host.textContent).toContain('reported · glm-measured')
++    expect(host.textContent).toContain('trigger: 85% of input budget · auto-compacts at 85%')
++    await mount(panel({ manifest: manifest, manifestStatus: 'ready' }))
++    expect(host.textContent).not.toContain('auto-compacts')
++  })
+   describe('compaction progress row', () => {
+     type Row = Extract<ViewItem, { kind: 'compaction' }>
+     const row = (over: Partial<Row>): Row => ({ kind: 'compaction', status: 'running', trigger: 'manual', ...over })
+ 
+     it('while running it names the stage and counts the elapsed time up', async () => {
+       vi.useFakeTimers()
+       try {
+         vi.setSystemTime(10_000)
+         await mount(<CompactionMarker item={row({ stage: 'generating', startedAt: 4_000 })} />)
+         expect(host.textContent).toContain('Compacting conversation')
+diff --git a/web/lib/project-compaction.spec.ts b/web/lib/project-compaction.spec.ts
+index afd340b..f2f468d 100644
+--- a/web/lib/project-compaction.spec.ts
++++ b/web/lib/project-compaction.spec.ts
+@@ -30,20 +30,26 @@ describe('compaction lifecycle projection', () => {
+     expect(done).toHaveLength(1)
+     expect(done[0]?.status).toBe('completed')
+     expect(done[0]?.coversSeq).toBe(12)
+     expect(done[0]?.summaryChars).toBe(525)
+     expect(done[0]?.durationMs).toBe(3400)
+     expect(done[0]?.summary).toBe('THE SUMMARY')
+     expect(done[0]?.tokensBefore).toBe(90_000)
+     expect(done[0]?.tokensAfter).toBe(30_000)
+   })
+ 
++  it('carries the measurement basis of the end event into the row', () => {
++    const measurement = { before: { tokens: 90_000, basis: 'reported' as const }, after: { tokens: 30_000, basis: 'estimated' as const } }
++    const done = compactionItems([event({ type: 'compaction/end', trigger: 'manual', coversSeq: 12, tokensBefore: 90_000, tokensAfter: 30_000, measurement })])
++    expect(done[0]?.measurement).toEqual(measurement)
++  })
++
+   it('a dangling start with nothing after it stays running; log movement makes it interrupted', () => {
+     const dangling = compactionItems([event({ type: 'compaction/start', trigger: 'automatic' })])
+     expect(dangling[0]?.status).toBe('running')
+ 
+     const crashed = compactionItems([
+       event({ type: 'compaction/start', trigger: 'automatic' }),
+       event({ type: 'turn/start', turnId: 't-next' }),
+     ])
+     expect(crashed[0]?.status).toBe('interrupted')
+   })
+diff --git a/web/lib/project.ts b/web/lib/project.ts
+index 82cfd75..8b60cfd 100644
+--- a/web/lib/project.ts
++++ b/web/lib/project.ts
+@@ -1,11 +1,11 @@
+-import { isMcpOutcome, type AttachmentRef, type ContextManifestView, type SseEvent, type ToolCall } from './types.ts'
++import { isMcpOutcome, type AttachmentRef, type CompactionMeasurementView, type ContextManifestView, type SseEvent, type ToolCall } from './types.ts'
+ import { toolTarget } from './format.ts'
+ import { mcpServerOf } from './tool-facts.ts'
+ import { CHILD_REPORTS_HEADER } from '../../src/web/child-reports.ts'
+ import { createContextReducer } from '../../src/harness/context/context-state.ts'
+ 
+ /** The header every hook context block starts with (see `hookContextBlock`). */
+ const HOOK_CONTEXT_PREFIX = /^(?:UserPromptSubmit|SessionStart|SubagentStart) hook additional context \(lower-trust data/
+ 
+ /** View items projected from the durable log — the UI's deriveMessages(). */
+ export type ViewItem =
+@@ -135,20 +135,21 @@ export type ViewItem =
+       startedAt?: number
+       /** How the summary was made, once it was. */
+       path?: 'exact' | 'reconstructed' | 'recovery' | 'legacy'
+       trigger?: 'manual' | 'automatic'
+       model?: string
+       coversSeq?: number
+       summaryChars?: number
+       /** Context tokens before/after (absent on legacy or unmeasured runs). */
+       tokensBefore?: number
+       tokensAfter?: number
++      measurement?: CompactionMeasurementView
+       durationMs?: number
+       /** The stored summary, carried by a successful compaction/end. */
+       summary?: string
+       error?: string
+     }
+   | {
+       readonly kind: 'context'
+       readonly ts?: number
+       /** What the turn's latest model request carried (updated in place per request). */
+       manifest: ContextManifestView
+@@ -798,20 +799,21 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
+         case 'compaction/end': {
+           const patch = (item: Extract<ViewItem, { kind: 'compaction' }>): void => {
+             touch(item)
+             item.status = event.error !== undefined ? 'failed' : 'completed'
+             if (event.trigger !== undefined) item.trigger = event.trigger
+             if (event.model !== undefined) item.model = event.model
+             if (event.coversSeq !== undefined) item.coversSeq = event.coversSeq
+             if (event.summaryChars !== undefined) item.summaryChars = event.summaryChars
+             if (event.tokensBefore !== undefined) item.tokensBefore = event.tokensBefore
+             if (event.tokensAfter !== undefined) item.tokensAfter = event.tokensAfter
++            if (event.measurement !== undefined) item.measurement = event.measurement
+             if (event.durationMs !== undefined) item.durationMs = event.durationMs
+             if (event.summary !== undefined) item.summary = event.summary
+             if (event.error !== undefined) item.error = event.error
+           }
+           if (openCompaction !== null && openCompaction.status === 'running') {
+             const jobOwned = openCompaction.stage !== undefined
+             patch(openCompaction)
+             delete openCompaction.stage
+             delete openCompaction.progress
+             // A row a job opened stays reachable until the job's own end, which still has to say how
+diff --git a/web/lib/types.ts b/web/lib/types.ts
+index af8a9d4..2646234 100644
+--- a/web/lib/types.ts
++++ b/web/lib/types.ts
+@@ -112,20 +112,22 @@ export interface SseEvent {
+   readonly chars?: number
+   readonly body?: string
+   /** Compaction lifecycle (compaction/start, compaction/end). */
+   readonly trigger?: 'manual' | 'automatic'
+   readonly model?: string
+   readonly coversSeq?: number
+   readonly summaryChars?: number
+   /** Estimated context tokens before/after a successful compaction/end. */
+   readonly tokensBefore?: number
+   readonly tokensAfter?: number
++  /** What each scalar above measured; absent on events that predate basis labels (estimates). */
++  readonly measurement?: CompactionMeasurementView
+   /**
+    * The stored summary itself on a successful compaction/end; on a hook
+    * rewake (`origin: 'hook'`) the one line the user sees.
+    */
+   readonly summary?: string
+   /** Set on a failed compaction/end. */
+   readonly error?: string
+   /** Compaction progress (compaction/job): where the operation is; how it ended is `outcome`. */
+   readonly stage?: 'preparing' | 'generating' | 'applying' | 'ended'
+   /** compaction/job: how the summary was made. */
+@@ -136,20 +138,30 @@ export interface SseEvent {
+   readonly requests?: number
+   /** compaction/restoration: what happened to each restored item (never the restored text). */
+   readonly sections?: readonly { readonly kind: 'todo' | 'runtime' | 'skill' | 'file'; readonly name: string; readonly status: 'included' | 'truncated' | 'reference' | 'missing' | 'denied'; readonly tokens: number }[]
+   /** Background-process lifecycle (process/start, process/exit). */
+   readonly processId?: string
+   readonly command?: string
+   readonly cwd?: string
+   readonly termination?: string
+ }
+ 
++/** Where the composer/panel context figures stand for the open conversation. */
++export type ContextStatus = 'loading' | 'ready' | 'none' | 'error'
++
++/** Basis of a compaction's before/after token figures (`compaction/end.measurement`). */
++export interface CompactionMeasurementView {
++  readonly before?: { readonly tokens: number; readonly basis: 'reported' | 'estimated' }
++  readonly after?: { readonly tokens: number; readonly basis: 'reported' | 'estimated' }
++  readonly unavailableReason?: 'preview-failed'
++}
++
+ /** Estimated tokens per request source; the fields sum to `usedTokens`. */
+ export interface ContextBreakdownView {
+   readonly systemPrompt: number
+   readonly systemTools: number
+   readonly mcpTools: number
+   readonly metaContext: number
+   readonly skills: number
+   readonly messages: number
+ }
+ 

@@ -1,0 +1,50 @@
+diff --git a/tests/harness/context-preview.spec.ts b/tests/harness/context-preview.spec.ts
+index 9cbc5ba..0652eb6 100644
+--- a/tests/harness/context-preview.spec.ts
++++ b/tests/harness/context-preview.spec.ts
+@@ -122,21 +122,20 @@ describe('post-compaction preview equals canonical', () => {
+     expect(countText(preview, 'third request')).toBe(1)
+   })
+ 
+   it('agrees when old Read results are microcompacted under pressure', async () => {
+     const over = { schemas: SCHEMAS, budget: { ...DEFAULT_BUDGET, contextLimitTokens: 30_000, outputReserveTokens: 512, marginTokens: 256 } }
+     const { session, checkpoints } = await setup(s => { turn(s, 't1', 'first request'); turn(s, 't2', 'long run', { reads: 12, readSize: 16_000 }) })
+     const { preview, canonical } = await previewThenCommit(session, checkpoints, endSeq(session.committedEvents, 't1'), 'SUMMARY', undefined, over)
+     expectParity(preview, canonical)
+     const cleared = (a: builder.AssembledContext) => a.messages.filter(m => m.role === 'tool' && m.content === CLEARED_TOOL_RESULT).length
+     expect(cleared(preview)).toBe(12 - builder.MICROCOMPACT_KEEP_RECENT)
+-    expect(cleared(canonical)).toBe(cleared(preview))
+     expect(preview.manifest.budget.preTrimTokens!).toBeGreaterThan(preview.manifest.budget.availableTokens)
+     expect(preview.manifest.omissions.some(line => line.startsWith('tool-results:'))).toBe(true)
+   })
+ 
+   it('carries image and text attachments from retained covered messages and the uncovered tail, image cost once each', async () => {
+     const ref = (id: string, name: string, mediaType: string): AttachmentRef => ({ id, name, mediaType, bytes: 4 })
+     const png1 = ref('img-covered', 'covered.png', 'image/png'); const png2 = ref('img-tail', 'tail.png', 'image/png')
+     const txt1 = ref('txt-covered', 'covered.txt', 'text/plain'); const txt2 = ref('txt-tail', 'tail.txt', 'text/plain')
+     const attachments: AttachmentLookup = new Map([
+       ['img-covered', { mediaType: 'image/png', base64: 'AAAA' }], ['img-tail', { mediaType: 'image/png', base64: 'BBBB' }],
+@@ -152,21 +151,22 @@ describe('post-compaction preview equals canonical', () => {
+     expect(images).toHaveLength(2)
+     // Every non-system-prompt message is history or compaction text: its estimate is the breakdown, images included once.
+     const measured = preview.messages.slice(1).reduce((total, m) => total + estimateContentTokens(m.content), 0)
+     expect(preview.manifest.breakdown.messages).toBe(measured)
+     expect(measured).toBeGreaterThanOrEqual(2 * IMAGE_TOKEN_ESTIMATE)
+     expect(measured).toBeLessThan(3 * IMAGE_TOKEN_ESTIMATE)
+   })
+ 
+   it('replaces a previous restoration with the new one', async () => {
+     const { session, checkpoints } = await setup(s => { turn(s, 't1', 'first request'); turn(s, 't2', 'second request') })
+-    await previewThenCommit(session, checkpoints, endSeq(session.committedEvents, 't1'), 'SUMMARY ONE', restored('RESTORED_OLD'))
++    const first = await previewThenCommit(session, checkpoints, endSeq(session.committedEvents, 't1'), 'SUMMARY ONE', restored('RESTORED_OLD'))
++    expect(countText(first.canonical, 'RESTORED_OLD')).toBe(1)
+     await session.durable()
+     turn(session, 't3', 'third request'); turn(session, 't4', 'fourth request'); await session.durable()
+     // Cutoff after the first compaction's events: recovery proves the seed at the cutoff (see report).
+     const { preview, canonical } = await previewThenCommit(session, checkpoints, endSeq(session.committedEvents, 't3'), 'SUMMARY TWO', restored('RESTORED_NEW'))
+     expect(countText(preview, 'fourth request')).toBe(1)
+     expectParity(preview, canonical)
+     for (const after of [preview, canonical]) {
+       expect(after.messages.filter(m => String(m.content).includes('RESTORED_NEW'))).toHaveLength(1)
+       expect(after.messages.some(m => String(m.content).includes('RESTORED_OLD'))).toBe(false)
+     }

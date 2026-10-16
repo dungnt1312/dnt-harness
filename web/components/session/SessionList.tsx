@@ -37,6 +37,7 @@ function SessionRow({ session, active, liveRunning, onSelect, onRename, onDelete
   const [draft, setDraft] = useState(session.title)
   const status = session.status ?? 'idle'
   const isRunning = status === 'running' || (active && liveRunning)
+  const compacting = session.compacting === true
   const cancelling = status === 'cancelling'
   const queued = session.pendingInputs ?? 0
 
@@ -67,6 +68,12 @@ function SessionRow({ session, active, liveRunning, onSelect, onRename, onDelete
         aria-current={active ? 'page' : undefined}
         className="flex min-h-9 min-w-0 flex-1 items-center gap-2 py-1.5 pl-2.5 pr-2 text-left text-sm [@media(pointer:coarse)]:pr-12"
       >
+        {compacting && !isRunning ? (
+          <span className="flex shrink-0 items-center" title="Compacting conversation">
+            <Spinner size={11} />
+            <span className="sr-only">compacting conversation</span>
+          </span>
+        ) : null}
         {isRunning ? (
           <span className="flex shrink-0 items-center" title={`Working with ${session.activity === 'tool' ? 'tool' : 'model'}`}>
             <Spinner size={11} />
@@ -85,6 +92,12 @@ function SessionRow({ session, active, liveRunning, onSelect, onRename, onDelete
             </span>
           </span>
         )}
+        {session.awaitingUser === true ? (
+          <span className="flex shrink-0 items-center gap-1 rounded-full bg-warn-soft px-1.5 text-[11px] font-medium text-warn" title="Waiting for your answer or approval">
+            <Icon name="bell" size={11} />
+            Needs you
+          </span>
+        ) : null}
         {queued > 0 ? <span className="shrink-0 text-[11px] text-fg-faint">{queued} queued</span> : null}
         {cancelling ? <span className="shrink-0 text-[11px] text-fg-faint">stopping…</span> : null}
         {activityAt(session) !== undefined ? (
@@ -147,6 +160,12 @@ function ChildRow({ child, active, onSelect }: {
           <span className="flex shrink-0 items-center" title="Working">
             <Spinner size={10} />
             <span className="sr-only">working</span>
+          </span>
+        ) : null}
+        {child.awaitingUser === true ? (
+          <span className="flex shrink-0 items-center text-warn" title="Waiting for your answer or approval">
+            <Icon name="bell" size={11} />
+            <span className="sr-only">needs you</span>
           </span>
         ) : null}
       </button>
@@ -476,16 +495,22 @@ export function SessionList({ sessions, projects, current, filter, liveRunning, 
                   className={cn('pointer-events-none absolute inset-x-1 z-10 h-0.5 rounded-full bg-primary', over.position === 'before' ? 'top-[-3px]' : 'bottom-[-3px]')}
                 />
               ) : null}
-              <Collapsible.Trigger className="flex min-h-9 min-w-0 flex-1 items-center gap-2 px-2.5 text-left text-sm font-medium">
+              <Collapsible.Trigger className={cn('flex min-h-9 min-w-0 flex-1 items-center gap-2 px-2.5 text-left text-sm font-medium', folderActive && 'pr-7')}>
                 <Icon name={isCollapsed ? 'folder' : 'folderOpen'} size={15} className="shrink-0 text-fg-muted" />
                 <span className="min-w-0 flex-1 truncate">{project.name}</span>
-                {folderActive ? (
-                  <span title="Terminal or background process active in this folder" className="shrink-0 text-fg-muted">
-                    <Icon name="terminal" size={13} />
-                    <span className="sr-only">Terminal or background process active</span>
-                  </span>
-                ) : null}
               </Collapsible.Trigger>
+              {folderActive ? (
+                <span
+                  title="Terminal or background process active in this folder"
+                  // Marker hugs the right edge and yields to the "+" on hover
+                  // (no layout shift); on touch the "+" always shows, so the
+                  // marker steps left of it instead of hiding.
+                  className="pointer-events-none absolute right-2 shrink-0 text-fg-muted transition-opacity group-hover:opacity-0 [@media(pointer:coarse)]:right-9"
+                >
+                  <Icon name="terminal" size={13} />
+                  <span className="sr-only">Terminal or background process active</span>
+                </span>
+              ) : null}
               {onNewInProject !== undefined ? (
                 <IconButton label={`New conversation in ${project.name}`} className="mr-0.5 size-7 opacity-0 group-hover:opacity-100 focus:opacity-100 [@media(pointer:coarse)]:opacity-100" onClick={() => onNewInProject(project.id)}>
                   <Icon name="plus" size={15} />

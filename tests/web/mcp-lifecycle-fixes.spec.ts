@@ -106,6 +106,21 @@ describe('MCP lifecycle audit regressions', () => {
     expect((await ctx.row('quiet'))?.status).toBe('idle')
   })
 
+  it('after a restart, opening the workspace reconnects enabled servers without a turn', async () => {
+    const ctx = await boot()
+    expect((await ctx.api('/mcp/warm', ctx.stdio())).status).toBe(201)
+    expect((await ctx.api('/mcp/warm/enable')).status).toBe(200)
+    expect((await ctx.api('/mcp/cold', ctx.stdio())).status).toBe(201)
+    await web!.close()
+    web = await createWebServer({ home, configFile: path.join(home, 'providers.json'), providers: [idle] })
+    const api = (route: string) => fetch(`${web!.url}/api/workspaces/${ctx.wsId}${route}`)
+    const row = async (name: string) => ((await (await api('/mcp')).json()) as { name: string; status: string }[]).find((entry) => entry.name === name)
+    expect((await row('warm'))?.status).toBe('idle')
+    expect((await api('/meta')).status).toBe(200)
+    await expect.poll(async () => (await row('warm'))?.status, { timeout: 10_000, interval: 100 }).toBe('ready')
+    expect((await row('cold'))?.status).toBe('disabled')
+  }, 30_000)
+
   it('changing one server leaves the other running servers untouched', async () => {
     const ctx = await boot()
     for (const name of ['a', 'b']) {

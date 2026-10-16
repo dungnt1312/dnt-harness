@@ -116,7 +116,15 @@ export function parseMessageText(text: string): DraftSegment[] {
     segments.push({ kind: 'command', name: slash[1] ?? '' })
     rest = rest.slice(slash[0].length)
   }
+  return [...segments, ...parseChipLinks(rest)]
+}
 
+/**
+ * Only the chip links in `rest`, without the leading `/name` rule: pasted text
+ * is not a message start, so `/tmp is full` stays text.
+ */
+export function parseChipLinks(rest: string): DraftSegment[] {
+  const segments: DraftSegment[] = []
   let cursor = 0
   for (const match of rest.matchAll(CHIP_LINK)) {
     const destination = (match[2] ?? match[3] ?? '').replace(/\\(.)/g, '$1')

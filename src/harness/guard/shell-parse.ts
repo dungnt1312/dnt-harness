@@ -40,6 +40,36 @@ export interface ShellParse {
 /** Longer inputs are not classified at all. */
 const MAX_LENGTH = 10_000
 
+/**
+ * The text with every `$` expansion (`${IFS}`, `$X`, `$'\x20'`, `$"…"`)
+ * turned into a word break and comma brace lists expanded (`-{r,f}` →
+ * `-r -f`), because at run time they can split one visible word into
+ * several (`rm${IFS}-rf` runs `rm -rf`). Classifiers test this variant too,
+ * so a separator the shell produces cannot hide a command. Quotes are not
+ * honored (over-approximation); `$(`/backticks are left as written.
+ * `undefined` when brace expansion would outgrow its bound: callers must
+ * treat that command as unknown, never as safe.
+ */
+export function splitExpansions(text: string): string | undefined {
+  let out = text.replace(/\$(?:'(?:\\.|[^'\\])*'|"[^"]*"|\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/g, ' ')
+  // shortcut: at most 8 nesting passes; deeper braces stay literal.
+  const limit = 4 * text.length + 1_000
+  let overflow = false
+  for (let pass = 0, previous = ''; pass < 8 && previous !== out && !overflow; pass++) {
+    previous = out
+    let size = out.length
+    out = out.replace(/([^\s{}();|&<>]*)\{([^{}\s();|&<>]*,[^{}\s();|&<>]*)\}([^\s();|&<>]*)/g,
+      (match: string, prefix: string, list: string, suffix: string) => {
+        const items = list.split(',')
+        // Project the result size before building it (20k prefix × 20k items would be 400M chars).
+        size += items.length * (prefix.length + suffix.length) + list.length + 2 - match.length
+        if (overflow || size > limit) { overflow = true; return match }
+        return ` ${items.map((item) => `${prefix}${item}${suffix}`).join(' ')} `
+      })
+  }
+  return overflow ? undefined : out
+}
+
 export function parseShell(source: string): ShellParse {
   if (source.length > MAX_LENGTH) return { commands: [], unsupported: true }
   const commands: ShellCommand[] = []

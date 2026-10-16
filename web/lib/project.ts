@@ -1,7 +1,8 @@
-import { isMcpOutcome, type AttachmentRef, type ContextManifestView, type SseEvent, type ToolCall } from './types.ts'
+import { isMcpOutcome, type AttachmentRef, type CompactionMeasurementView, type ContextManifestView, type SseEvent, type ToolCall } from './types.ts'
 import { toolTarget } from './format.ts'
 import { mcpServerOf } from './tool-facts.ts'
 import { CHILD_REPORTS_HEADER } from '../../src/web/child-reports.ts'
+import { createContextReducer } from '../../src/harness/context/context-state.ts'
 
 /** The header every hook context block starts with (see `hookContextBlock`). */
 const HOOK_CONTEXT_PREFIX = /^(?:UserPromptSubmit|SessionStart|SubagentStart) hook additional context \(lower-trust data/
@@ -141,6 +142,7 @@ export type ViewItem =
       /** Context tokens before/after (absent on legacy or unmeasured runs). */
       tokensBefore?: number
       tokensAfter?: number
+      measurement?: CompactionMeasurementView
       durationMs?: number
       /** The stored summary, carried by a successful compaction/end. */
       summary?: string
@@ -259,6 +261,8 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
   const turnAssistants = new Map<string, Array<Extract<ViewItem, { kind: 'assistant' }>>>()
   /** One context marker per turn: the latest request's manifest, updated in place. */
   const turnContexts = new Map<string, Extract<ViewItem, { kind: 'context' }>>()
+  const contextState = createContextReducer<ContextManifestView>()
+  const contextRows = new Map<string, Extract<ViewItem, { kind: 'context' }>>()
   /** The compaction awaiting its end event; null while none is open. */
   let openCompaction: Extract<ViewItem, { kind: 'compaction' }> | null = null
   /** The live retry notice of the open turn, replaced in place per failed attempt. */
@@ -310,6 +314,11 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
 
   const apply = (events: readonly SseEvent[]): readonly ViewItem[] => {
     for (const event of events) {
+      for (const id of contextState.apply([event])) {
+        const item = contextRows.get(id)
+        const view = contextState.request(id)
+        if (item !== undefined && item.manifest.contextId === id && view !== undefined) { touch(item); item.manifest = view }
+      }
       // A log that moves on without the open compaction's end means the
       // compaction never finished (crash mid-summarizer); the interrupted
       // label stays honest until a real end corrects it in place.
@@ -698,7 +707,8 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
           const existing = turnContexts.get(key)
           if (existing !== undefined) {
             touch(existing)
-            existing.manifest = event.manifest
+            existing.manifest = event.manifest.contextId !== undefined ? contextState.request(event.manifest.contextId) ?? event.manifest : event.manifest
+            if (event.manifest.contextId !== undefined) contextRows.set(event.manifest.contextId, existing)
             existing.requests = (existing.requests ?? 1) + 1
             break
           }
@@ -707,6 +717,10 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
             ...(event.timestamp !== undefined ? { ts: event.timestamp } : {}),
             manifest: event.manifest,
             requests: 1,
+          }
+          if (event.manifest.contextId !== undefined) {
+            item.manifest = contextState.request(event.manifest.contextId) ?? event.manifest
+            contextRows.set(event.manifest.contextId, item)
           }
           turnContexts.set(key, item)
           add(item)
@@ -792,6 +806,7 @@ export function createProjector(): { apply(events: readonly SseEvent[]): readonl
             if (event.summaryChars !== undefined) item.summaryChars = event.summaryChars
             if (event.tokensBefore !== undefined) item.tokensBefore = event.tokensBefore
             if (event.tokensAfter !== undefined) item.tokensAfter = event.tokensAfter
+            if (event.measurement !== undefined) item.measurement = event.measurement
             if (event.durationMs !== undefined) item.durationMs = event.durationMs
             if (event.summary !== undefined) item.summary = event.summary
             if (event.error !== undefined) item.error = event.error
