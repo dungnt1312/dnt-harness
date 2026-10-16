@@ -20,6 +20,19 @@ describe('default base prompt', () => {
     expect(DEFAULT_BASE_SYSTEM).toMatch(/user's language/)
   })
 
+  it('bounds scope and says when to stop, so a high effort level cannot loop on search', () => {
+    // Measured: without these the same model on the same task spent 37 steps /
+    // 69 tool calls at effort `max` — repeatedly grepping one file for an API
+    // that did not exist — against 12 steps / 21 calls for the same request
+    // driven by a prompt that carried the discipline below. Verification is
+    // still owed; re-verifying ground already covered is not.
+    expect(DEFAULT_BASE_SYSTEM).toContain('Answer the question that was asked and stop there')
+    expect(DEFAULT_BASE_SYSTEM).toContain('Stop researching once you can answer')
+    expect(DEFAULT_BASE_SYSTEM).toMatch(/never retry it with a slightly different pattern/)
+    expect(DEFAULT_BASE_SYSTEM).toMatch(/Do not re-read or re-run something you already have/)
+    expect(DEFAULT_BASE_SYSTEM).not.toContain('verify with a tool when verification is cheap')
+  })
+
   it('selects tools by task, not semantic-search-first, and shares the principle with the child prompt', () => {
     expect(DEFAULT_BASE_SYSTEM).toContain('prefer the dedicated file and search tools over shell commands')
     expect(DEFAULT_BASE_SYSTEM).toContain('any line range of them, with Read')

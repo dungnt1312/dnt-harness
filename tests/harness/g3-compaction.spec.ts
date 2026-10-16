@@ -471,11 +471,15 @@ describe('compact history window', () => {
   })
 
   it('budget pressure still drops whole uncovered turns explicitly and preserves the open task', () => {
+    // The window is deliberately just above the irreducible floor (system prompt
+    // + compaction summary + the open task) so pressure keeps forcing whole
+    // completed turns out. It is sized to the current base prompt: lengthening
+    // or shortening that prompt moves the floor, so this number moves with it.
     const assembled = buildContext(compactWindowBase({
       events: uncoveredLog(),
       compaction: { summary: 'covered first turn', coversSeq: 4 },
       compactionRetainTokens: 0,
-      budget: { contextLimitTokens: 1100, outputReserveTokens: 100, marginTokens: 100 },
+      budget: { contextLimitTokens: 1220, outputReserveTokens: 100, marginTokens: 100 },
     }))
     expect(historyText(assembled)).toContain('OPEN TASK: finish compatibility tests')
     expect(historyText(assembled)).not.toContain('DECISION: keep the compatibility API')
