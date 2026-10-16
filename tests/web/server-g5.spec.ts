@@ -486,11 +486,12 @@ describe('G5 web MCP + hooks', () => {
     currentLabel = 'work'
     const workSession = (await (await post(base, `/api/workspaces/${workId}/sessions`)).json()) as { id: string }
     await post(base, `/api/workspaces/${workId}/sessions/${workSession.id}/messages`, { content: 'work' })
-    await new Promise((resolve) => setTimeout(resolve, 250))
+    // Switch labels only after Work's request arrived (MCP startup can take longer than any fixed sleep).
+    await expect.poll(() => seen.work?.length, { timeout: 15_000 }).toBeGreaterThan(0)
     currentLabel = 'life'
     const lifeSession = (await (await post(base, `/api/workspaces/${life.id}/sessions`)).json()) as { id: string }
     await post(base, `/api/workspaces/${life.id}/sessions/${lifeSession.id}/messages`, { content: 'life' })
-    await new Promise((resolve) => setTimeout(resolve, 250))
+    await expect.poll(() => seen.life?.length, { timeout: 15_000 }).toBeGreaterThan(0)
     expect(seen.work?.[0]).toContain('mcp__fixture__query')
     expect(seen.life?.[0]).not.toContain('mcp__fixture__query')
   }, 20_000)
