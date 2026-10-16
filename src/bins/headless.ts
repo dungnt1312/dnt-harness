@@ -56,7 +56,7 @@ import { latestCalibration } from '../harness/context/calibration.ts'
 import { agentScope } from '../harness/agent/scope.ts'
 import { randomUUID } from 'node:crypto'
 import { renderEnvironmentContext } from '../harness/context/environment.ts'
-import { DEFAULT_BUDGET } from '../harness/context/budget.ts'
+import { resolveModelBudget } from '../harness/context/budget.ts'
 import { resolvePermission } from '../harness/approval/resolution.ts'
 import { attachDangerousCommandGuard } from '../harness/guard/guard.ts'
 import { DangerousCommandsStore } from '../harness/guard/store.ts'
@@ -261,7 +261,7 @@ async function main(): Promise<void> {
     const assembled = buildContext({
       events: session.events, mode, modeRevision: 0,
       model: projected.model, providerName: projected.providerName,
-      schemas, activeSkills: [], pinnedMemory, budget: DEFAULT_BUDGET,
+      schemas, activeSkills: [], pinnedMemory, budget: resolveModelBudget(projected.model === undefined ? {} : { model: projected.model }),
       ...(environment !== undefined ? { environment } : {}),
       ...(projected.squeeze !== undefined ? { squeeze: projected.squeeze } : {}),
       ...(calibration !== undefined ? { calibration } : {}),
@@ -271,7 +271,7 @@ async function main(): Promise<void> {
     const contextId = randomUUID()
     const turnId = agentScope.getStore()?.turnId
     if (turnId !== undefined) session.append({ type: 'context/manifest', turnId, manifest: { ...assembled.manifest, contextId } })
-    return next({ ...projected, contextId, messages: assembled.messages, tools: schemas })
+    return next({ ...projected, contextId, messages: assembled.messages, tools: schemas, outputCeilingTokens: assembled.maxOutputTokens })
   }, true)
 
   /** Durably accept one input, adopt anything still pending, then run. */

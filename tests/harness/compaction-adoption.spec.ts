@@ -73,6 +73,19 @@ const endEvents = (session: Session): Extract<SessionEvent, { type: 'compaction/
   session.events.filter((event): event is Extract<SessionEvent, { type: 'compaction/end' }> => event.type === 'compaction/end')
 
 describe('adoptPreparedCompaction', () => {
+  it('refuses a full-log seed whose end was not committed at the prepared cutoff', async () => {
+    const { session, checkpoints } = await setup()
+    turn(session, 't2', 'second request') // cutoff 8 precedes the first adoption at 9/10
+    await session.durable()
+    const first = await adoptPreparedCompaction(session, checkpoints, prepared(session), options())
+    const before = session.events.length
+    await expect(adoptPreparedCompaction(session, checkpoints, prepared(session, {
+      cutoff: 8, sourceDigest: sourceDigest(session.committedEvents, 8), seedHash: compactionSeedHash(first.summary),
+    }), options())).rejects.toThrow('seed was not committed at the prepared cutoff')
+    expect(session.events.length).toBe(before)
+    expect(recoverCanonicalCheckpoint(session.committedEvents)).toEqual(first)
+    expect(await checkpoints.latest(session.id)).toEqual(first)
+  })
   it('awaits measurement and revalidates before publishing a success', async () => {
     const { session, checkpoints } = await setup()
     let release!: () => void; let entered!: () => void

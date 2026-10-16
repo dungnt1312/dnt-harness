@@ -223,6 +223,8 @@ export interface ContextManifest {
     readonly instructionsHash?: string
     /** Where the active mode definition came from — bundled or workspace-authored. */
     readonly modeSource?: 'bundled' | 'workspace'
+    /** Workspace prompt replacements actually used in the trusted system block. */
+    readonly promptOverrides?: { readonly base?: true; readonly child?: true }
     /** The environment facts block carried in the system message (when supplied). */
     readonly environment?: { readonly date?: string; readonly platform?: string; readonly workspacePath?: string; readonly gitBranch?: string }
     readonly skills: readonly string[]
@@ -281,6 +283,8 @@ export interface ContextBreakdown {
 
 export interface AssembledContext {
   readonly messages: readonly ModelMessage[]
+  /** Remaining window after calibrated input and safety margin; adapters may lower it. */
+  readonly maxOutputTokens: number
   readonly tools?: readonly ToolSchema[]
   readonly manifest: ContextManifest
   /**
@@ -930,6 +934,11 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
         ? { instructionsHash: sha256Text(workspaceInstructions) }
         : {}),
       modeSource: mode.source,
+      ...(child === undefined && input.baseSystemOverride?.trim()
+        ? { promptOverrides: { base: true as const } }
+        : child !== undefined && input.childSystemOverride?.trim()
+          ? { promptOverrides: { child: true as const } }
+          : {}),
       ...(input.environment !== undefined && input.environment.trim() !== '' ? { environment: environmentFactsOf(input.environment) } : {}),
       skills: skills.map((skill) => `${skill.name}@${skill.hash}`),
       ...(catalogMessage !== undefined && skillCatalog !== undefined
@@ -986,6 +995,7 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
 
   return {
     messages,
+    maxOutputTokens: Math.max(1, Math.floor(input.budget.contextLimitTokens - calibrated(used, ratio) - input.budget.marginTokens)),
     ...(schemas.length > 0 ? { tools: schemas } : {}),
     manifest: {
       ...manifest,
@@ -1032,12 +1042,23 @@ function isTypedUserMessage(event: SessionEvent): event is Extract<SessionEvent,
   return event.type === 'user/message' && event.origin === undefined
 }
 
-/** Keep the head and tail of a too-long text within roughly `tokens`. */
+/** Keep the head and tail, including the marker, within the estimator's cap. */
 function truncateToTokens(text: string, tokens: number): string {
-  const chars = Math.max(0, tokens * 4 - RETAIN_TRUNCATION_MARK.length)
-  if (text.length <= chars) return text
-  const head = Math.ceil(chars / 2)
-  return `${text.slice(0, head)}${RETAIN_TRUNCATION_MARK}${text.slice(text.length - (chars - head))}`
+  if (estimateTokens(text) <= tokens) return text
+  if (estimateTokens(RETAIN_TRUNCATION_MARK) > tokens) return ''
+  const characters = Array.from(text)
+  const render = (count: number): string => {
+    const head = Math.ceil(count / 2)
+    return `${characters.slice(0, head).join('')}${RETAIN_TRUNCATION_MARK}${characters.slice(characters.length - (count - head)).join('')}`
+  }
+  let low = 0
+  let high = characters.length
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2)
+    if (estimateTokens(render(mid)) <= tokens) low = mid
+    else high = mid - 1
+  }
+  return render(low)
 }
 
 /**
@@ -1079,7 +1100,8 @@ function retainedCoveredMessages(
       continue
     }
     const text = messageTextOf(entry.message.content)
-    if (text.trim() !== '') kept.push({ seq: entry.seq, message: { role: entry.message.role, content: truncateToTokens(text, remaining) } as ModelMessage })
+    const truncated = truncateToTokens(text, remaining)
+    if (truncated.trim() !== '') kept.push({ seq: entry.seq, message: { role: entry.message.role, content: truncated } as ModelMessage })
     break
   }
   kept.sort((a, b) => a.seq - b.seq)

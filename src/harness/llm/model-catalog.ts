@@ -497,7 +497,7 @@ const CLAUDE_BUDGET: Readonly<Record<string, number>> = { low: 1_024, medium: 5_
  * that would reject it. `off` (or an empty/auto level) means "explicitly
  * disable" when the provider documents a disable request, else nothing.
  */
-export function applyThinkingOverride(body: Record<string, unknown>, model: string, level: string | undefined): void {
+export function applyThinkingOverride(body: Record<string, unknown>, model: string, level: string | undefined, maxTokens?: number): void {
   if (level === undefined || level === '' || level === 'auto') return
   const raw = model.trim().toLowerCase()
   const id = raw.split('/').pop() ?? raw
@@ -543,7 +543,11 @@ export function applyThinkingOverride(body: Record<string, unknown>, model: stri
     // BEFORE the OpenAI-family fallback — `claude-opus` would otherwise
     // false-positive the o-series heuristic below.
     if (level === 'off') setThinking('disabled')
-    else if (level in CLAUDE_BUDGET) body['thinking'] = { type: 'enabled', budget_tokens: CLAUDE_BUDGET[level] }
+    else if (level in CLAUDE_BUDGET) {
+      // Anthropic requires 1024 <= budget_tokens < max_tokens; skip thinking when it cannot fit.
+      const budget = Math.min(CLAUDE_BUDGET[level]!, maxTokens === undefined ? Infinity : maxTokens - 1)
+      if (budget >= 1_024) body['thinking'] = { type: 'enabled', budget_tokens: budget }
+    }
   } else if (id.includes('gpt-') || /^o\d/.test(id) || /-o\d/.test(id)) {
     // OpenAI-family fallback for gateway aliases and new releases (gpt-*,
     // o1/o3/o4…): an o-series id must have a digit after the o.

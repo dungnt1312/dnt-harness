@@ -12,6 +12,12 @@ import type { SessionEvent } from '../../src/harness/session/events.ts'
 import { attempt, manifest, row } from '../fixtures/context-accounting.ts'
 
 describe('estimateTokens (AC-1)', () => {
+  it('counts kana, Hangul and supplementary Han before any provider calibration', () => {
+    for (const script of ['あ', 'カ', '한', '𠀀']) {
+      expect(estimateTokens(script.repeat(3_000))).toBe(2_000 * script.length)
+    }
+    expect(latestCalibration([manifestRow(1, 'old', { estimator: 'c3' }), attempt(2, 'old', 'a', usage(9_000))], target)).toBeUndefined()
+  })
   it('is ceil((len + cjk) / 3) with CJK ideographs counted twice', () => {
     expect(estimateTokens('abc')).toBe(1)
     expect(estimateTokens('abcd')).toBe(2)

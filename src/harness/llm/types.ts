@@ -141,6 +141,12 @@ export interface ModelRequest {
    * Absent keeps ordinary behavior. Invalid values are ignored.
    */
   readonly maxOutputTokens?: number
+  /**
+   * Host-only ceiling (remaining context window after input and margin). It
+   * lowers a cap the adapter would send anyway but never invents one, so a
+   * model with no known output limit keeps the gateway default.
+   */
+  readonly outputCeilingTokens?: number
 }
 
 export type ModelFinishReason = 'stop' | 'tool_calls' | 'length' | 'content_filter' | 'error' | 'unknown'

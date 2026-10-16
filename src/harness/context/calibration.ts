@@ -8,14 +8,13 @@ import type { TokenUsage } from '../llm/types.ts'
 import { isValidContextId, isValidTokenUsage } from './context-metrics.ts'
 
 /** Names the estimator a manifest's token counts came from; a ratio only pairs within one. */
-export const TOKEN_ESTIMATOR = 'c3'
+export const TOKEN_ESTIMATOR = 'c3-wide-v2'
 
-/** Estimate one string's token cost: chars/3 rounded up, CJK ideographs (U+4E00–U+9FFF) counted twice (ZCode's estimator, `c3`). */
+/** Estimate UTF-16 units/3 rounded up, with Han, kana and Hangul units counted twice. */
 export function estimateTokens(text: string): number {
   let cjk = 0
-  for (let index = 0; index < text.length; index++) {
-    const code = text.charCodeAt(index)
-    if (code >= 0x4e00 && code <= 0x9fff) cjk++
+  for (const character of text) {
+    if (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(character)) cjk += character.length
   }
   return Math.ceil((text.length + cjk) / 3)
 }

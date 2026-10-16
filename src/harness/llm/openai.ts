@@ -109,15 +109,15 @@ export interface OpenAiCompletionsOptions {
  * default, which can be far below what the model supports and cuts long
  * replies off with finish `length`. Unknown models send nothing.
  */
-export function outputTokenCap(model: string, overrides?: Readonly<Record<string, number>>, requested?: number): number | undefined {
+export function outputTokenCap(model: string, overrides?: Readonly<Record<string, number>>, requested?: number, ceiling?: number): number | undefined {
   const override = overrides?.[model]
   const known = override !== undefined && Number.isSafeInteger(override) && override > 0 ? override : getModelInfo(model)?.maxOutputTokens
   // A request may only lower the cap. With no known cap the request value
   // stands: the caller asked for a bounded answer.
-  if (requested !== undefined && Number.isSafeInteger(requested) && requested > 0) {
-    return known === undefined ? requested : Math.min(known, requested)
-  }
-  return known
+  const cap = requested !== undefined && Number.isSafeInteger(requested) && requested > 0
+    ? (known === undefined ? requested : Math.min(known, requested))
+    : known
+  return cap !== undefined && ceiling !== undefined && Number.isSafeInteger(ceiling) && ceiling > 0 ? Math.min(cap, ceiling) : cap
 }
 
 const DEFAULT_MAX_RETRIES = 3
@@ -221,9 +221,9 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       // which the context meter shows instead of a raw estimate.
       stream_options: { include_usage: true },
     }
-    const maxTokens = outputTokenCap(model, this.options.maxOutputTokens, request.maxOutputTokens)
+    const maxTokens = outputTokenCap(model, this.options.maxOutputTokens, request.maxOutputTokens, request.outputCeilingTokens)
     if (maxTokens !== undefined) body['max_tokens'] = maxTokens
-    applyThinkingOverride(body, model, request.thinkingLevel)
+    applyThinkingOverride(body, model, request.thinkingLevel, maxTokens)
     const payload = JSON.stringify(body)
     const signal = options?.signal
     // Standalone use retains a bounded header-only retry policy; harness use never stacks it.

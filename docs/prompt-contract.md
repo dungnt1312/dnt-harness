@@ -18,9 +18,10 @@ change and is reviewed as one. Assembly happens in exactly one place:
                          + compaction continuation note (compact + checkpoint)
 [1]   system   wrapped   workspace-instructions   (fixed cost)
 [2]   system   wrapped   compacted-history         (fixed cost)
-[3]   system   wrapped   parent-context            (droppable)
-[4]   system   wrapped   skill-catalog             (droppable)
-[5+]  system   wrapped   one per agent-definition skill (droppable as a group)
+[3]   system   wrapped   restored-state            (fixed cost, when checkpoint has restoration)
+[4]   system   wrapped   parent-context            (droppable)
+[5]   system   wrapped   skill-catalog             (droppable)
+[6+]  system   wrapped   one per agent-definition skill (droppable as a group)
 [..]  system   wrapped   memory entries (guidance + MEMORY.md indexes)
 [..]  user/assistant/tool — conversation history (turn-windowed)
 ```
@@ -41,9 +42,9 @@ position N re-bills every token after it. These rules follow:
   in the log, the UI, or the summarizer's source.
 - A skill the model loads with `Skill` arrives as that tool's **result**, in
   history at the load point, and stays for later turns. Only an agent
-  definition's `skills:` preloads use the `[5+]` blocks, because they are
+  definition's `skills:` preloads use the `[6+]` blocks, because they are
   fixed for the child's whole run.
-- The **skill catalog** `[4]` and the **MEMORY.md indexes** are read once per
+- The **skill catalog** `[5]` and the **MEMORY.md indexes** are read once per
   session and kept (`prefixSnapshots` in `src/web/server.ts`): a memory write
   or a skill edit no longer re-bills the whole request. The copy is re-read
   only when the prefix moves anyway — a new compaction checkpoint, a project
@@ -90,7 +91,9 @@ Workspace: /abs/project (git branch: feat/x)
   user message instead — see *Prefix stability* above.
 - The git branch is cached per project root for the server's lifetime
   (read-only hardened invocation, 2s timeout, silent omit). The Git view is
-  the source of truth; a stale branch is the documented trade-off.
+  the source of truth; a stale branch is the documented trade-off. The shared
+  renderer strips branch characters outside `[A-Za-z0-9._/-]` before embedding
+  this repository-controlled value in trusted prose.
 - Children receive date/platform but not the workspace line (their project
   path arrives via file scope).
 - The manifest reports the parsed facts under `sources.environment`.
@@ -145,6 +148,9 @@ Blank/absent falls back to the default. An override never merges and never
 touches mode instructions, environment, file scope, or any wrapped source.
 The Settings panel shows the effective text; compare-and-swap prevents
 silent clobbering.
+`manifest.sources.promptOverrides` records `{ base: true }` or `{ child: true }`
+only when that workspace replacement is actually used; blank or inactive
+overrides leave no provenance flag.
 
 ## Budget & trim order
 
@@ -154,6 +160,13 @@ old reproducible tool results → drop skill catalog → drop skills → drop
 inherited parent-context → drop memory → drop oldest completed turns
 (whole turns only) → aggressive microcompact → fail loud
 (`ContextBudgetError`). Every drop is recorded in `manifest.omissions`.
+The 4 096-token output reserve is a minimum assembly headroom, not permission
+to send the catalog output maximum regardless of input size. Assembly exposes
+`maxOutputTokens = window − calibrated input − margin`; web and headless hosts
+pass that per-request ceiling (`outputCeilingTokens`) to the adapter, which
+takes the smaller of it and the catalog/operator/request output cap; with no
+known cap it sends no `max_tokens`. A Claude thinking budget is clamped below
+the resulting `max_tokens`, or dropped when it cannot reach 1 024.
 
 The window itself resolves once, in `resolveContextWindow` (catalog → family →
 fallback) with the source recorded as `budget.windowSource`; an operator
@@ -165,8 +178,10 @@ usage and compaction effects — is replayed by one browser-safe reducer
 trajectory projector and the web UI.
 
 Token counts use one estimator, `estimateTokens` in
-`src/harness/context/calibration.ts`: chars/3 rounded up, CJK ideographs
-counted twice (`budget.estimator: 'c3'`). Budget decisions follow the
+`src/harness/context/calibration.ts`: UTF-16 units/3 rounded up, Han (including
+supplementary ideographs), hiragana, katakana and Hangul units counted twice
+(`budget.estimator: 'c3-wide-v2'`). Old `c3` measurements cannot calibrate the
+new estimator. Budget decisions follow the
 provider's count, as ZCode does: `latestCalibration` finds the newest request
 the provider measured (terminal attempt with usage, paired with its manifest by
 `contextId`, same estimator, base estimate of at least 1 000 tokens, no
@@ -195,6 +210,14 @@ only the covered messages the user typed plus the latest covered turn's final
 answer, verbatim, newest first within `compactionRetainTokens` — default
 20 000 estimated tokens, the boundary message truncated, covered tool calls and
 results never retained). Nothing is ever dropped without a summary covering it.
+Boundary truncation includes its marker in that estimator's hard cap, preserves
+Unicode code points, and omits a message when even the marker cannot fit.
+
+Prepared checkpoint adoption requires the seed to match both the current
+canonical checkpoint and the checkpoint committed at the prepared cutoff,
+so recovery can verify the same proof. Extractive compaction acknowledges an
+uncommitted source boundary before its capacity preflight; an over-cap source
+is refused without appending compaction lifecycle events.
 
 ## Child differences
 

@@ -20,6 +20,7 @@ import {
 } from 'dnt-harness'
 import type { ModeDefinition, SessionEvent, SessionId, StepId, TurnId } from 'dnt-harness'
 import { estimateConversationTokens } from '../../src/harness/context/builder.ts'
+import { estimateContentTokens } from '../../src/harness/context/budget.ts'
 import { createCompactionSummarizer } from '../../src/web/llm-summarizer.ts'
 
 let home = ''
@@ -363,6 +364,20 @@ describe('compact history window', () => {
     const conversation = assembled.messages.filter((message) => message.role !== 'system')
     expect(conversation[0]?.role).toBe('user')
     expect(assembled.manifest.breakdown.messages).toBeLessThan(2_500)
+  })
+
+  it.each(['中', 'あ', '한', '𠀀', 'a'])('hard-caps the retained boundary for %s, including its marker and sent stamp', (character) => {
+    const events = [
+      { type: 'turn/start', turnId: 't' },
+      { type: 'user/message', turnId: 't', content: character.repeat(6_000) },
+      { type: 'turn/end', turnId: 't', reason: 'completed' },
+    ].map((row, index) => ({ ...row, seq: index + 1, timestamp: index + 1 }) as SessionEvent)
+    for (const cap of [1, 10, 1_000]) {
+      const assembled = buildContext(compactWindowBase({ events, compaction: { summary: 'S', coversSeq: 3, verifiedAgainst: 'committed-log' }, compactionRetainTokens: cap }))
+      const retained = assembled.messages.filter(message => message.role !== 'system')
+      expect(retained.reduce((total, message) => total + estimateContentTokens(message.content), 0)).toBeLessThanOrEqual(cap)
+      for (const message of retained) expect(messageText(message.content)).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u)
+    }
   })
 
   it('never grows the context: a compaction of few long agentic turns shrinks it', () => {

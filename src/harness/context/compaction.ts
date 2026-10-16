@@ -254,10 +254,10 @@ export async function compactSession(session: Session, checkpoints: CheckpointSt
       }
     }
     const fromSeq = options.seed?.coversSeq ?? 0
-    // Only when the covered boundary is already acknowledged can the preflight
-    // project the same source the transaction will; otherwise keep the
-    // normal path (the summarizer still fails closed on overflow).
-    if (options.extractiveCap !== undefined && session.committedEvents.some(event => event.seq === lastEnd)) {
+    if (options.extractiveCap !== undefined) {
+      // Acknowledge the source before preflight, without creating a transaction.
+      if (!session.committedEvents.some(event => event.seq === lastEnd)) await session.durable()
+      check()
       const preview = projectForSummary(session.committedEvents, lastEnd, options.attachments, fromSeq)
       const needed = (options.seed !== undefined ? options.seed.summary.length + 2 : 0) + preview.length
       if (needed > options.extractiveCap) {
@@ -408,6 +408,10 @@ export async function adoptPreparedCompaction(session: Session, checkpoints: Che
     // one, so a candidate that never saw it would pass and hide what it covers.
     const seedHash = current === undefined ? undefined : compactionSeedHash(current.summary)
     if (prepared.seedHash !== seedHash) throw new Error('compaction seed changed since the summary was prepared')
+    const cutoffSeed = recoverCanonicalCheckpoint(events.filter(event => event.seq <= prepared.cutoff))
+    if (prepared.seedHash !== (cutoffSeed === undefined ? undefined : compactionSeedHash(cutoffSeed.summary))) {
+      throw new Error('compaction seed was not committed at the prepared cutoff')
+    }
     session.append({ type: 'compaction/start', trigger: options.trigger, ...(prepared.model !== undefined ? { model: prepared.model } : {}),
       adoption: { v: 1, transactionId, cutoff: prepared.cutoff } })
     started = true
