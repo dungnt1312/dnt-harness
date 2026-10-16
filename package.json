@@ -4,7 +4,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/dungnt1312/dnt-harness.git"
+    "url": "git+https://github.com/dungnt1312/dnt-harness.git"
   },
   "bin": {
     "dnt-harness": "bin/dnt-harness.mjs"

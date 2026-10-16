@@ -31,4 +31,4 @@ jobs:
         run: test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}"
       # prepack runs `vite build`, so web-dist/ is fresh in the tarball.
       # Trusted publishing (OIDC, npm >= 11.5.1): npm exchanges the GitHub ID token itself.
-      - run: npm --version && npm publish
+      - run: npm --version && npm publish --loglevel verbose
