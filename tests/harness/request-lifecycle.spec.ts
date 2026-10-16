@@ -371,6 +371,17 @@ describe('aggregate request lifecycle', () => {
     expect([acquired, released, fetched, owner.attempts]).toEqual([2, 2, 1, 2])
     owner.dispose(); await kernel.stop()
   })
+  it('refuses to replace an admission that still holds an unresolved attempt', async () => {
+    const kernel = new Kernel(); kernel.ctx.plugin(LlmService)
+    const admission = new AttemptAdmission(1)
+    kernel.ctx.llm.configureAdmission('p', admission)
+    admission.uncertain.set('a1', { attribution: { sessionId: 's1' } } as never)
+    expect(() => kernel.ctx.llm.configureAdmission('p', new AttemptAdmission(1))).toThrow(/live provider admission/)
+    expect(kernel.ctx.llm.sessionUncertain('s1')).toBe(true)
+    admission.uncertain.clear()
+    expect(() => kernel.ctx.llm.configureAdmission('p', new AttemptAdmission(1))).not.toThrow()
+    await kernel.stop()
+  })
   it('settled consumer return without a pending read releases ownership', async () => {
     const admission = new AttemptAdmission(1); const owner = new LogicalRequest()
     const stream = runAttempt({ async *stream() { yield completion } }, request, { owner, admission })[Symbol.asyncIterator]()

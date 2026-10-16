@@ -34,7 +34,8 @@ export class LlmService extends Service {
 
   configureAdmission(providerName: string, admission: PhysicalAdmission): void {
     const previous = this.admissions.get(providerName)
-    if (previous && previous.active > 0) throw new Error('cannot replace live provider admission')
+    // Unresolved attempts are live too: dropping them would lift the session-ownership fence.
+    if (previous && (previous.active > 0 || previous.uncertain.size > 0)) throw new Error('cannot replace live provider admission')
     this.admissions.set(providerName, admission instanceof AttemptAdmission ? admission : new AttemptAdmission(4, admission))
   }
 

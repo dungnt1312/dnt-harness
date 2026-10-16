@@ -260,7 +260,9 @@ export class Session {
    * `boundarySeq` (all events when omitted), with `seq` rebased from 1.
    * Copied history is not re-broadcast; the child's future appends are.
    * The child shares this session's store; persisting the copy is the
-   * caller's (the sessions service's) job.
+   * caller's (the sessions service's) job, before it exposes the child: the
+   * copy counts as committed, like adopted history. The durable listener is
+   * not inherited — it belongs to the parent's owner.
    *
    * @returns the child session.
    */
@@ -268,7 +270,6 @@ export class Session {
     const child = new Session(this.ctx, {
       ...(this.options.store !== undefined ? { store: this.options.store } : {}),
       ...(this.options.now !== undefined ? { now: this.options.now } : {}),
-      ...(this.durableListener !== undefined ? { onDurable: this.durableListener } : {}),
       ...(this.relaxedStreamingAppends ? { relaxedStreamingAppends: true } : {}),
     })
     const limit = boundarySeq ?? this.log[this.log.length - 1]?.seq ?? 0
@@ -276,6 +277,7 @@ export class Session {
       if (event.seq > limit) break
       child.log.push({ ...event, seq: child.log.length + 1 })
     }
+    child.committedLog = [...child.log]
     return child
   }
 }

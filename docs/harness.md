@@ -944,8 +944,8 @@ root stops waiting:
   text is kept as the `assistant/message` (none when it was empty), any tool
   call it was writing is dropped unrun, and the loop appends a host notice
   (`TRUNCATION_NOTICE`, `origin: 'context'`) asking the model to continue in
-  smaller pieces, then runs another step. After `MAX_TRUNCATION_RECOVERIES`
-  (2) cutoffs in one turn the turn fails with `provider completion rejected:
+  smaller pieces, then runs another step. Each turn recovers at most
+  `MAX_TRUNCATION_RECOVERIES` (2) cutoffs; the next one fails it with `provider completion rejected:
   length`. Compaction still requires a `stop` finish.
 - *The root stops calling tools while children run.* Closing the turn would
   cancel them and lose their work. Instead the `agent/turn-continuation` serial
