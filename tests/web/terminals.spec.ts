@@ -8,6 +8,8 @@
  */
 import { describe, expect, it } from 'vitest'
 import {
+  bunPtySpawner,
+  type BunPtyRuntime,
   createTerminalService,
   TerminalError,
   type PtyHandle,
@@ -292,5 +294,43 @@ describe('terminal service', () => {
       })
     }
     terminals.disposeAll()
+  })
+
+  it('adapts Bun.spawn({ terminal }) to the PTY handle contract', async () => {
+    const calls: { cmd: string[]; writes: string[]; resizes: number[][]; killed: boolean } = { cmd: [], writes: [], resizes: [], killed: false }
+    let emit: (chunk: Uint8Array) => void = () => {}
+    let finish: () => void = () => {}
+    const proc = {
+      exitCode: null as number | null,
+      exited: new Promise<number | null>((resolve) => { finish = () => resolve(proc.exitCode) }),
+      terminal: { write: (d: string) => calls.writes.push(d), resize: (c: number, r: number) => calls.resizes.push([c, r]) },
+      kill: () => { calls.killed = true },
+    }
+    const runtime: BunPtyRuntime = {
+      spawn(cmd, options) {
+        calls.cmd = cmd
+        emit = (chunk) => options.terminal.data(undefined, chunk)
+        return proc
+      },
+    }
+    const pty = bunPtySpawner(runtime).spawn('/bin/zsh', ['-l'], { name: 'xterm-256color', cols: 80, rows: 24, cwd: '/tmp', env: {} })
+    const data: string[] = []
+    const exits: number[] = []
+    pty.onData((chunk) => data.push(chunk))
+    pty.onExit((event) => exits.push(event.exitCode))
+    // A UTF-8 character split across two chunks must decode once, whole.
+    const bytes = new TextEncoder().encode('é')
+    emit(bytes.slice(0, 1))
+    emit(bytes.slice(1))
+    pty.write('ls\n')
+    pty.resize(100, 30)
+    pty.kill()
+    proc.exitCode = 7
+    finish()
+    await proc.exited
+    await Promise.resolve()
+    expect(calls).toEqual({ cmd: ['/bin/zsh', '-l'], writes: ['ls\n'], resizes: [[100, 30]], killed: true })
+    expect(data.join('')).toBe('é')
+    expect(exits).toEqual([7])
   })
 })

@@ -176,8 +176,51 @@ async function healSpawnHelperExecBit(): Promise<void> {
   }
 }
 
-/** The default backend: `node-pty`, loaded on first use. */
+/** The slice of Bun's built-in PTY (`Bun.spawn({ terminal })`, POSIX only) used here. */
+export interface BunPtyRuntime {
+  spawn(cmd: string[], options: {
+    cwd: string
+    env: Record<string, string>
+    terminal: { cols: number; rows: number; name: string; data(terminal: unknown, chunk: Uint8Array): void }
+  }): { terminal: { write(data: string): void; resize(cols: number, rows: number): void }; kill(): void; exited: Promise<number | null>; exitCode: number | null }
+}
+
+/** Bun's own PTY: node-pty's native addon starts processes under Bun but never delivers their output. */
+export function bunPtySpawner(bun: BunPtyRuntime): PtySpawner {
+  return {
+    spawn(file, args, options) {
+      const dataListeners: ((data: string) => void)[] = []
+      const decoder = new TextDecoder()
+      const proc = bun.spawn([file, ...args], {
+        cwd: options.cwd,
+        env: options.env,
+        terminal: {
+          cols: options.cols,
+          rows: options.rows,
+          name: options.name,
+          data: (_terminal, chunk) => {
+            const text = decoder.decode(chunk, { stream: true })
+            for (const listener of dataListeners) listener(text)
+          },
+        },
+      })
+      return {
+        onData: (listener) => dataListeners.push(listener),
+        onExit: (listener) => void proc.exited.then(() => listener({ exitCode: proc.exitCode ?? 0 })),
+        write: (data) => proc.terminal.write(data),
+        resize: (cols, rows) => proc.terminal.resize(cols, rows),
+        kill: () => proc.kill(),
+      }
+    },
+  }
+}
+
+/** The default backend: Bun's PTY on POSIX Bun, otherwise `node-pty`, loaded on first use. */
 function nodePtySpawner(): { spawner: PtySpawner; load: () => Promise<string | undefined> } {
+  const bun = (globalThis as { Bun?: BunPtyRuntime }).Bun
+  if (bun !== undefined && process.platform !== 'win32') {
+    return { spawner: bunPtySpawner(bun), load: async () => undefined }
+  }
   let loaded: { spawn: (file: string, args: string[], opts: unknown) => PtyHandle } | undefined
   let failure: string | undefined
   const load = async (): Promise<string | undefined> => {
@@ -191,7 +234,7 @@ function nodePtySpawner(): { spawner: PtySpawner; load: () => Promise<string | u
       // a silent substitution.
       failure =
         `node-pty is not available (${String(error)}); install it and allow its build ` +
-        `(pnpm: allowBuilds, npm: 'npm install-scripts approve node-pty')`
+        `(bun: trustedDependencies, npm: 'npm install-scripts approve node-pty')`
       return failure
     }
   }
