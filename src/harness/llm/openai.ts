@@ -168,10 +168,11 @@ export function detectSupportsStore(_name: string, baseUrl: string): boolean {
 /**
  * Hosts documented to accept `prompt_cache_key` on Chat Completions (the set
  * opencode enables). DeepSeek caches by prefix on its own and is left out, as
- * opencode does. Exact host or a subdomain of it, never a substring.
+ * opencode does. Azure is left to the explicit flag: older `api-version`s
+ * reject unknown body fields. Exact host or a subdomain, never a substring.
  */
 const PROMPT_CACHE_KEY_HOSTS: readonly string[] = [
-  'api.openai.com', 'openrouter.ai', 'api.fireworks.ai', 'openai.azure.com',
+  'api.openai.com', 'openrouter.ai', 'api.fireworks.ai',
   'api.cerebras.ai', 'api.deepinfra.com', 'api.moonshot.ai', 'api.moonshot.cn',
 ]
 
@@ -215,10 +216,10 @@ const OUTPUT_TOKEN_MIN = 1_024
  * numbers opencode uses). The fallback avoids gateway defaults that can cut
  * long replies off with finish `length`.
  */
-export function outputTokenCap(model: string, overrides?: Readonly<Record<string, number>>, requested?: number, ceiling?: number): number {
+export function outputTokenCap(model: string, overrides?: Readonly<Record<string, number>>, requested?: number, ceiling?: number, learned?: number): number {
   const override = overrides?.[model]
   const known = Math.min(
-    override !== undefined && Number.isSafeInteger(override) && override > 0 ? override : resolveOutputLimit(model) ?? OUTPUT_TOKEN_FALLBACK,
+    override !== undefined && Number.isSafeInteger(override) && override > 0 ? override : resolveOutputLimit(model) ?? learned ?? OUTPUT_TOKEN_FALLBACK,
     OUTPUT_TOKEN_MAX,
   )
   // A request may only lower the catalog, operator or fallback cap.
@@ -306,6 +307,13 @@ export class OpenAiCompletionsProvider implements LlmProvider {
   readonly models: readonly string[]
   /** Used only when a request names no model; never an operator preference. */
   private readonly fallbackModel: string
+  /**
+   * Output caps this endpoint taught us by rejecting the 32k fallback, per
+   * model. `null` means "send no cap at all" (the limit could not be read).
+   * Only the fallback is ever learned over: an operator or catalog cap that
+   * is rejected stays a visible error.
+   */
+  private readonly learnedCaps = new Map<string, number | null>()
 
   constructor(private readonly options: OpenAiCompletionsOptions) {
     this.name = options.name
@@ -340,15 +348,30 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       // the field entirely rather than risk rejecting an unknown one.
       ...(supportsStore ? { store: false } : {}),
     }
-    const maxTokens = outputTokenCap(model, this.options.maxOutputTokens, request.maxOutputTokens, request.outputCeilingTokens)
-    body[maxTokensField] = maxTokens
-    applyThinkingOverride(body, model, request.thinkingLevel, maxTokens)
     // Only where the endpoint is known or declared to accept it: strict relays
     // reject unknown body fields. The affinity header below flows regardless.
     if (supportsPromptCacheKey && affinity !== undefined && affinity !== '') {
       body['prompt_cache_key'] = promptCacheKey(affinity)
     }
-    const payload = JSON.stringify(body)
+    const operatorCap = this.options.maxOutputTokens?.[model]
+    // The cap is a guess only when nobody documented one: the operator's
+    // override and the catalog are authoritative, the fallback is not.
+    const guessed = !(operatorCap !== undefined && Number.isSafeInteger(operatorCap) && operatorCap > 0) && resolveOutputLimit(model) === undefined
+    const capped = (learned: number | null | undefined): string => {
+      const wire = { ...body }
+      if (learned === null) {
+        // The limit could not be read: behave as before the fallback existed.
+        applyThinkingOverride(wire, model, request.thinkingLevel, undefined)
+        return JSON.stringify(wire)
+      }
+      const maxTokens = outputTokenCap(model, this.options.maxOutputTokens, request.maxOutputTokens, request.outputCeilingTokens, learned)
+      wire[maxTokensField] = maxTokens
+      applyThinkingOverride(wire, model, request.thinkingLevel, maxTokens)
+      return JSON.stringify(wire)
+    }
+    let payload = capped(guessed ? this.learnedCaps.get(model) : undefined)
+    // One corrective resend per request, and only for a guessed cap.
+    let capRelearned = !guessed
     const signal = options?.signal
     // Standalone use retains a bounded header-only retry policy; harness use never stacks it.
     const maxAttempts = options?.requestOwner ? 1 : Math.min(4, 1 + Math.max(0, this.options.maxRetries ?? DEFAULT_MAX_RETRIES))
@@ -384,6 +407,17 @@ export class OpenAiCompletionsProvider implements LlmProvider {
       if (response.ok) break
       let cleanupSettled = true
       const detail = await boundedText(response, settled => { cleanupSettled = settled }, options?.onTransportSettled)
+      if (!capRelearned && cleanupSettled && response.status >= 400 && response.status < 500 && OUTPUT_CAP_REJECTED.test(detail)) {
+        // The endpoint refused the 32k guess and usually names its limit:
+        // resend once with that limit (or no cap), and remember it for this
+        // model so later requests start right. Nothing was streamed yet.
+        capRelearned = true
+        const limit = outputLimitFromError(detail)
+        this.learnedCaps.set(model, limit ?? null)
+        payload = capped(limit ?? null)
+        attempt -= 1
+        continue
+      }
       const quota = /insufficient_quota|quota|billing|credit|balance/i.test(detail)
       const reason = isContextExceeded(response.status, detail) ? 'context_exceeded' : quota ? 'quota' : response.status === 401 || response.status === 403 ? 'auth_configuration' : response.status === 429 ? 'rate_limit' : response.status >= 500 ? 'server_error' : 'unknown'
       const retryable = reason !== 'context_exceeded' && !quota && retryableStatus(response.status, detail)
@@ -558,10 +592,37 @@ const RELAY_STATUSES: ReadonlySet<number> = new Set([502, 503, 504])
 
 /**
  * The endpoint rejected the requested output cap itself (OpenAI, vLLM,
- * Anthropic, Cohere wordings). Shrinking the prompt cannot fix that, so it is
- * never a context overflow; the operator lowers the model's output cap.
+ * Anthropic, Groq, DashScope, Gemini, Cohere wordings). Shrinking the prompt
+ * cannot fix that, so it is never a context overflow: the adapter relearns a
+ * guessed cap, and an authoritative one surfaces for the operator to lower.
  */
-const OUTPUT_CAP_REJECTED = /\bmax_(?:completion_)?tokens'?(?: or '?max_completion_tokens'?)? is too large|supports at most \d+ completion tokens|'max_(?:completion_)?tokens'[^.]*above maximum value|max_tokens must be (?:less|smaller|at most)|max_tokens: \d+ > \d+, which is the maximum allowed/i
+const OUTPUT_CAP_REJECTED = /\bmax_(?:completion_)?tokens'?(?: or '?max_completion_tokens'?)? is too large|supports at most \d+ completion tokens|'max_(?:completion_)?tokens'[^.]*above maximum value|`?max_(?:completion_)?tokens`? must be (?:less|smaller|at most)|max_tokens: \d+ > \d+, which is the maximum allowed|range of max_tokens should be|max_output_tokens[^.]*(?:range|exceed)/i
+
+/**
+ * The model's maximum output when an endpoint's rejection names it.
+ * `undefined` when no number can be read, and for vLLM's window form
+ * (`N > X - M`): that number is only this request's remaining room, and vLLM
+ * fills the remaining window by itself when no cap is sent.
+ */
+export function outputLimitFromError(detail: string): number | undefined {
+  if (/maximum context length is \d+ tokens/i.test(detail)) return undefined
+  const patterns = [
+    /supports at most (\d+) completion tokens/i,
+    /max_tokens: \d+ > (\d+)/i,
+    /must be (?:less than or equal to|at most|<=) `?(\d+)/i,
+    /expected a value <= (\d+)/i,
+    /should be \[\d+,\s*(\d+)\]/i,
+    /range[^0-9]*\d+[^0-9]+(\d+)\s*\(exclusive\)/i,
+  ]
+  for (const pattern of patterns) {
+    const match = pattern.exec(detail)
+    if (match === null) continue
+    let value = Number(match[1])
+    if (/\(exclusive\)/i.test(match[0])) value -= 1
+    if (Number.isSafeInteger(value) && value > 0) return value
+  }
+  return undefined
+}
 
 /**
  * Whether an HTTP error says the request did not fit the model's window.
@@ -572,7 +633,10 @@ const OUTPUT_CAP_REJECTED = /\bmax_(?:completion_)?tokens'?(?: or '?max_completi
  * history and resend the same cap.
  */
 export function isContextExceeded(status: number, detail: string): boolean {
-  if (OUTPUT_CAP_REJECTED.test(detail)) return false
+  // vLLM reports input + cap > window with its cap wording: that IS an
+  // overflow once the cap is no longer a guess (the adapter has already
+  // dropped a guessed cap), so the squeeze must still run.
+  if (OUTPUT_CAP_REJECTED.test(detail) && !/maximum context length is \d+ tokens/i.test(detail)) return false
   if (status === 400 || status === 413 || status === 422) return CONTEXT_EXCEEDED.test(detail)
   return RELAY_STATUSES.has(status) && EXPLICIT_CONTEXT_EXCEEDED.test(detail)
 }

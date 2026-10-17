@@ -997,7 +997,10 @@ function assembleContext(input: BuildContextInput, preview?: PreviewCompaction):
 
   return {
     messages,
-    maxOutputTokens: Math.max(1, Math.floor(input.budget.contextLimitTokens - calibrated(used, ratio) - input.budget.marginTokens)),
+    // Measured against the squeezed window: after the provider refused a
+    // request for size, a smaller prompt must not be paired with a larger
+    // output cap, or input plus cap still overflows the real window.
+    maxOutputTokens: Math.max(1, Math.floor(squeezeBudget(input.budget, input.squeeze).contextLimitTokens - calibrated(used, ratio) - input.budget.marginTokens)),
     ...(schemas.length > 0 ? { tools: schemas } : {}),
     manifest: {
       ...manifest,

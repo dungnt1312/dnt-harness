@@ -312,12 +312,12 @@ export function getModelInfo(modelId: string | null | undefined): ModelInfo | nu
  * segment. Checked 2026-10 against vendor docs.
  */
 const OUTPUT_LIMIT_PATTERNS: readonly ModelPattern<number>[] = [
+  // The first gpt-4o snapshot predates the 16K output limit.
+  { pattern: /^gpt-4o-2024-05-13$/, value: 4_096 },
   { pattern: /^(?:chatgpt-)?gpt-4o(?:-mini)?(?:[-:].*)?$/, value: 16_384 },
   { pattern: /^gpt-4\.1(?:-(?:mini|nano))?(?:[-:].*)?$/, value: 32_768 },
   // V4 family (deepseek-flash, deepseek-v4-*, gateway "-free" aliases): 384K.
   { pattern: /^deepseek-(?:flash|v4)(?:[-.:].*)?$/, value: 393_216 },
-  // Retired aliases still routed by some relays to V3-era backends: 8K.
-  { pattern: /^deepseek-(?:chat|reasoner)$/, value: 8_192 },
 ]
 
 /**

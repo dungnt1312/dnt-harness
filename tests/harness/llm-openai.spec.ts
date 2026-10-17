@@ -5,7 +5,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { OpenAiCompletionsProvider, ProviderError } from 'dnt-harness'
-import { detectMaxTokensField, detectSupportsPromptCacheKey, detectSupportsStore, outputTokenCap, promptCacheKey } from '../../src/harness/llm/openai.ts'
+import { detectMaxTokensField, detectSupportsPromptCacheKey, detectSupportsStore, outputLimitFromError, outputTokenCap, promptCacheKey } from '../../src/harness/llm/openai.ts'
 import { getModelInfo } from '../../src/harness/llm/model-catalog.ts'
 import { LogicalRequest } from '../../src/harness/llm/request-lifecycle.ts'
 import { buildContext, wrapUntrusted } from '../../src/harness/context/builder.ts'
@@ -91,7 +91,7 @@ describe('openai completions adapter: thinking + wire shape', () => {
     expect(outputTokenCap('gpt-4o')).toBe(16_384)
     expect(outputTokenCap('openai/gpt-4o-mini-2024-07-18')).toBe(16_384)
     expect(outputTokenCap('gpt-4.1-mini')).toBe(32_768)
-    expect(outputTokenCap('deepseek-chat')).toBe(8_192)
+    expect(outputTokenCap('gpt-4o-2024-05-13')).toBe(4_096)
     expect(outputTokenCap('deepseek-v4.1-flash-free', undefined, undefined, 120_000)).toBe(120_000)
     // The operator override still wins over the documented value.
     expect(outputTokenCap('gpt-4o', { 'gpt-4o': 4_096 })).toBe(4_096)
@@ -482,16 +482,62 @@ describe('openai completions adapter: retry before the stream starts', () => {
     expect((big as Error).message).not.toContain('z'.repeat(100))
   })
 
-  it('surfaces a rejected output cap as a plain request error, never a context overflow', async () => {
-    const detail = 'max_tokens is too large: 32000. This model supports at most 16384 completion tokens, whereas you provided 32000.'
-    scripted([() => new Response(JSON.stringify({ error: { message: detail, type: 'invalid_request_error' } }), { status: 400 })])
+  /** Request bodies as sent, in order. */
+  function bodiesOf(fake: ReturnType<typeof vi.fn>): Record<string, unknown>[] {
+    return fake.mock.calls.map((call) => JSON.parse((call[1] as { body: string }).body) as Record<string, unknown>)
+  }
+  const capError = (message: string): Response => new Response(JSON.stringify({ error: { message, type: 'invalid_request_error' } }), { status: 400 })
+
+  it('relearns a rejected 32k guess from the error, resends once, and remembers it for the model', async () => {
+    const fake = scripted([
+      () => capError('max_tokens is too large: 32000. This model supports at most 4096 completion tokens, whereas you provided 32000.'),
+      () => sse('ok'),
+      () => sse('again'),
+    ])
+    const p = fast()
+    expect(await collect(p)).toBe('ok')
+    expect(await collect(p)).toBe('again')
+    // 32k guess, corrected resend, then the next request starts at the limit.
+    expect(bodiesOf(fake).map((body) => body['max_tokens'])).toEqual([32_000, 4_096, 4_096])
+  })
+
+  it('reads the limit from Anthropic, Groq, DashScope and Gemini wordings', () => {
+    expect(outputLimitFromError('max_tokens: 32000 > 8192, which is the maximum allowed number of output tokens for claude-3-haiku')).toBe(8_192)
+    expect(outputLimitFromError('`max_tokens` must be less than or equal to `8192`, the maximum value for `max_tokens` is less than the `context_window` for this model')).toBe(8_192)
+    expect(outputLimitFromError('Range of max_tokens should be [1, 8192]')).toBe(8_192)
+    expect(outputLimitFromError('The requested max_output_tokens is out of range: valid range is 1 to 65537 (exclusive)')).toBe(65_536)
+    expect(outputLimitFromError("Invalid 'max_completion_tokens': integer above maximum value. Expected a value <= 16384, but got 32000 instead.")).toBe(16_384)
+    // vLLM names only this request's room; no cap at all lets vLLM fill it.
+    expect(outputLimitFromError("'max_tokens' or 'max_completion_tokens' is too large: 32000. This model's maximum context length is 32768 tokens and your request has 6000 input tokens (32000 > 32768 - 6000).")).toBeUndefined()
+  })
+
+  it('drops the cap like the baseline when the limit cannot be read (vLLM window form)', async () => {
+    const fake = scripted([
+      () => capError("'max_tokens' or 'max_completion_tokens' is too large: 32000. This model's maximum context length is 32768 tokens and your request has 6000 input tokens (32000 > 32768 - 6000)."),
+      () => sse('ok'),
+    ])
+    expect(await collect(fast())).toBe('ok')
+    const [first, second] = bodiesOf(fake)
+    expect(first!['max_tokens']).toBe(32_000)
+    expect('max_tokens' in second!).toBe(false)
+  })
+
+  it('relearns at most once per request, and never over an operator or catalog cap', async () => {
+    const reject = (): Response => capError('max_tokens is too large: 4096. This model supports at most 2048 completion tokens, whereas you provided 4096.')
+    // A cap that keeps being rejected surfaces after one corrective resend.
+    const looping = scripted([reject])
     const error = await collect(fast()).then(() => undefined, (caught: unknown) => caught as ProviderError)
-    if (error === undefined) throw new Error('expected the request to fail')
-    expect(error).toBeInstanceOf(ProviderError)
-    expect(error.contextExceeded).toBe(false)
-    expect(error.reason).toBe('unknown')
-    expect(error.transient).toBe(false)
-    expect(error.message).toContain('supports at most 16384')
+    expect(error?.contextExceeded).toBe(false)
+    expect(error?.reason).toBe('unknown')
+    expect(error?.transient).toBe(false)
+    expect(error?.message).toContain('supports at most 2048')
+    expect(looping).toHaveBeenCalledTimes(2)
+
+    // The operator's value is authoritative: shown, not silently replaced.
+    const operator = scripted([reject])
+    const p = new OpenAiCompletionsProvider({ name: 'test', apiKey: '', baseUrl: 'http://127.0.0.1:1/v1', retryBaseMs: 1, models: ['m'], maxOutputTokens: { m: 4_096 } })
+    await expect(collect(p)).rejects.toThrow(/supports at most 2048/)
+    expect(operator).toHaveBeenCalledTimes(1)
   })
 
   it('redacts credentials an auth error echoes back before they reach the durable message', async () => {
@@ -649,7 +695,8 @@ describe('openai completions adapter: session affinity', () => {
   it('detects prompt_cache_key support from the host, like opencode, and lets an explicit flag win', async () => {
     expect(detectSupportsPromptCacheKey('https://api.openai.com/v1')).toBe(true)
     expect(detectSupportsPromptCacheKey('https://openrouter.ai/api/v1')).toBe(true)
-    expect(detectSupportsPromptCacheKey('https://my-res.openai.azure.com/openai')).toBe(true)
+    // Azure needs the explicit flag: older api-versions reject unknown fields.
+    expect(detectSupportsPromptCacheKey('https://my-res.openai.azure.com/openai')).toBe(false)
     // DeepSeek caches by prefix on its own; opencode leaves it off too.
     expect(detectSupportsPromptCacheKey('https://api.deepseek.com')).toBe(false)
     expect(detectSupportsPromptCacheKey('http://127.0.0.1:6536/v1')).toBe(false)
