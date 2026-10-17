@@ -4,27 +4,45 @@
 // http://127.0.0.1:6536/v1), so the upstream model is literally identical;
 // the only variable left is the harness itself.
 //
-// Two modes:
+// Modes:
 //
 //   lab  (default) - rebuilds a scratch git repo whose working tree holds a
 //          "local change" with five seeded issues (ground truth), runs both
 //          harnesses on it and grades recall + metrics.
 //          Usage: node scripts/e2e/compare-opencode-dnt.mjs [--rounds 2]
 //
-//   repo - reviews an EXISTING repo (e.g. this branch). Before any model
-//          runs, the changed/untracked files are snapshotted; after EACH run
-//          the worktree is verified and any drift is auto-restored, then the
-//          run is reported as a violation. Nothing in the target repo is
-//          ever modified by the harnesses (prompt forbids it) - if it is,
-//          the snapshot puts it back.
-//          Usage: node scripts/e2e/compare-opencode-dnt.mjs --repo . \
+//   repo-copy - reviews an EXISTING repo (e.g. this branch) WITHOUT touching
+//          it. The source is frozen with read-only, hardened Git (no hooks,
+//          fsmonitor, filters, textconv, optional locks or index refresh);
+//          then every contestant/run gets its own fresh repository rebuilt
+//          from the object store: HEAD, index (staged) and worktree layers
+//          are reconstructed separately and verified before the agent runs.
+//          Submodules, unmerged entries, symlinks/invalid paths on Windows
+//          and sensitive tracked paths (.env*, *.pem, *.key, ...) are
+//          refused. Ignored files are never copied; untracked files only with
+//          --include-untracked (listed before any agent starts).
+//          Copies hold ONLY the HEAD commit (shallow: no history, no other
+//          branches/tags/remotes) plus staged blobs; sensitive paths in the
+//          HEAD tree are refused too. Partial clones are refused. Git runs
+//          from an absolute PATH-resolved executable with `-C`, never from
+//          the repo directory, with all transports disabled.
+//          Usage: node scripts/e2e/compare-opencode-dnt.mjs --repo-copy . \
 //                   --prompt "Review this branch compared to main. ..." [--rounds 1]
-//          To review a live branch without racing concurrent writers (or
-//          having their drift auto-restored out from under them), freeze the
-//          branch into a throwaway worktree first and point --repo at it:
-//            git worktree add --detach %TMP%\review-copy HEAD
-//            git diff HEAD --binary > patch; git -C %TMP%\review-copy apply patch
-//            (copy every untracked file from `git status -uall` too)
+//
+//   repo - runs directly in a DISPOSABLE target this script created earlier
+//          (a run copy under <workdir>/runs-*). Ordinary checkouts are
+//          refused: the disposable marker is only written into directories
+//          the script itself creates and must match <workdir>'s registry.
+//
+// Nothing is ever reset/restored/deleted. After each run the target is
+// diffed (added/modified/deleted files, index entries, all refs, HEAD,
+// .git/config, hooks, info/); timed-out agents get their whole process
+// tree killed; drift
+// fails the run (nonzero exit) and the target is preserved for inspection.
+// In repo-copy mode the source fingerprint (HEAD, refs, raw index bytes,
+// tracked + untracked bytes) is re-checked after every run as well.
+// Copies are independent repos, not a sandbox: an agent running as the same
+// OS user can still reach the source by absolute path.
 //
 //   --timeout <seconds> caps each run (default 300).
 //   --only <opencode|dnt> runs just one harness (default: run both).
@@ -43,12 +61,19 @@
 //   GATEWAY_BASE   default http://127.0.0.1:6536/v1
 //   OPENCODE_JS    default <node dir>/node_modules/opencode-ai/bin/opencode
 //   COMPARE_WORKDIR default <tmp>/opencode-dnt-compare
-import { spawn, execFileSync } from 'node:child_process'
-import crypto from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { runContestant, runFailed, runProcess } from './agent-run.mjs'
+import {
+  RepoSafetyError,
+  assertDisposable,
+  createDisposableDir,
+  freezeSource,
+  git as hardenedGit,
+} from './repo-freeze.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const repo = path.resolve(here, '..', '..')
@@ -72,7 +97,13 @@ const LAB_PROMPT =
   'Do not modify any files.'
 const prompt = flag('--prompt', LAB_PROMPT)
 const repoOverride = flag('--repo', undefined)
-const mode = repoOverride ? 'repo' : 'lab'
+const repoCopyArg = flag('--repo-copy', undefined)
+const includeUntracked = args.includes('--include-untracked')
+if (repoOverride && repoCopyArg) {
+  console.error('--repo and --repo-copy are mutually exclusive')
+  process.exit(2)
+}
+const mode = repoOverride ? 'repo' : repoCopyArg ? 'repo-copy' : 'lab'
 
 const gateway = (process.env.GATEWAY_BASE ?? 'http://127.0.0.1:6536/v1').replace(/\/+$/u, '')
 const opencodeJs =
@@ -80,8 +111,13 @@ const opencodeJs =
   path.join(path.dirname(nodeExec), 'node_modules', 'opencode-ai', 'bin', 'opencode')
 const bunExec = process.env.BUN_BIN ?? 'bun'
 const workdir = process.env.COMPARE_WORKDIR ?? path.join(os.tmpdir(), 'opencode-dnt-compare')
-const targetRepo = repoOverride ? path.resolve(repoOverride) : path.join(workdir, 'review-lab')
+const targetRepo = repoOverride ? path.resolve(repoOverride) : null
 const ocConfig = path.join(workdir, 'oc-config', 'opencode.json')
+// Caller-owned record of directories this script created (marker tokens).
+const registry = path.join(workdir, 'disposable-registry.json')
+const runsDir = path.join(workdir, `runs-${new Date().toISOString().replace(/[:.]/gu, '-')}`)
+const labRepo = path.join(runsDir, 'review-lab')
+const copySource = repoCopyArg ? path.resolve(repoCopyArg) : labRepo
 
 const GROUND_TRUTH = [
   ['secret', /sk_live|hardcoded/iu],
@@ -91,8 +127,6 @@ const GROUND_TRUTH = [
   ['empty-catch', /(?:empty `catch|catch \{|catch\(\)|swallow)/iu],
 ]
 
-const stripAnsi = (s) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
-const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex')
 
 function writeOcConfig() {
   fs.mkdirSync(path.dirname(ocConfig), { recursive: true })
@@ -123,15 +157,18 @@ function writeOcConfig() {
 }
 
 function buildLab() {
-  fs.rmSync(targetRepo, { recursive: true, force: true })
+  // Fresh per invocation (never rm -rf a fixed path); copies are built from it.
+  createDisposableDir(labRepo, registry)
+  const targetRepo = labRepo
   fs.mkdirSync(path.join(targetRepo, 'src'), { recursive: true })
-  const git = (...a) => execFileSync('git', ['-C', targetRepo, ...a], { stdio: 'pipe' }).toString()
+  const git = (...a) => hardenedGit(targetRepo, a).toString()
   fs.writeFileSync(
     path.join(targetRepo, 'src', 'cart.js'),
     `'use strict'\n\n/** Minimal shopping cart with line totals. */\n\nfunction createCart() {\n  return { items: [] }\n}\n\nfunction addItem(cart, item) {\n  cart.items.push({ sku: item.sku, price: item.price, qty: item.qty })\n}\n\nfunction subtotal(cart) {\n  let total = 0\n  for (const item of cart.items) total += item.price * item.qty\n  return total\n}\n\nmodule.exports = { createCart, addItem, subtotal }\n`,
   )
   fs.writeFileSync(path.join(targetRepo, 'README.md'), '# review-lab\n\nScratch repo for reviewing a local change.\n')
-  git('init', '-b', 'main')
+  git('symbolic-ref', 'HEAD', 'refs/heads/main')
+  git('config', 'core.autocrlf', 'false')
   git('config', 'user.email', 'lab@example.com')
   git('config', 'user.name', 'review lab')
   git('add', '.')
@@ -147,128 +184,18 @@ function buildLab() {
   )
 }
 
-// ---- repo mode safety net -------------------------------------------------
-
-function gitStatusEntries(dir) {
-  const raw = execFileSync('git', ['-C', dir, 'status', '--porcelain=v1', '-z', '-uall'], {
-    maxBuffer: 64 * 1024 * 1024,
-  }).toString('utf8')
-  const parts = raw.split('\0').filter(Boolean)
-  const entries = []
-  for (let i = 0; i < parts.length; i += 1) {
-    const item = parts[i]
-    const status = item.slice(0, 2)
-    const file = item.slice(3)
-    // In `-z` output a staged rename/copy lists the NEW name first, then the
-    // origin as its own NUL field: keep the new name and consume the origin.
-    if (status[0] === 'R' || status[0] === 'C') i += 1
-    entries.push({ status, path: file.replace(/\\/gu, '/') })
-  }
-  return entries
-}
-
-function snapshotRepo(dir) {
-  const snapDir = path.join(workdir, 'repo-snapshot')
-  fs.rmSync(snapDir, { recursive: true, force: true })
-  fs.mkdirSync(snapDir, { recursive: true })
-  const records = []
-  for (const entry of gitStatusEntries(dir)) {
-    const abs = path.join(dir, entry.path)
-    const exists = fs.existsSync(abs) && fs.statSync(abs).isFile()
-    const record = { status: entry.status, path: entry.path, exists, sha256: null, backup: null }
-    if (exists) {
-      const buf = fs.readFileSync(abs)
-      record.sha256 = sha256(buf)
-      record.backup = `file-${records.length}.bin`
-      fs.writeFileSync(path.join(snapDir, record.backup), buf)
-    }
-    records.push(record)
-  }
-  fs.writeFileSync(path.join(snapDir, 'manifest.json'), `${JSON.stringify(records, null, 2)}\n`)
-  return { dir: snapDir, byPath: new Map(records.map((r) => [r.path, r])) }
-}
-
-// Restores every file to the snapshot bytes; returns the paths that had drifted.
-function verifyRepo(dir, snap) {
-  const violations = []
-  try {
-    execFileSync('git', ['-C', dir, 'reset', '-q'], { stdio: 'pipe' })
-  } catch {}
-  // 1) files known at snapshot time: byte-compare / restore
-  for (const record of snap.byPath.values()) {
-    const abs = path.join(dir, record.path)
-    const exists = fs.existsSync(abs) && fs.statSync(abs).isFile()
-    if (record.exists) {
-      const same = exists && sha256(fs.readFileSync(abs)) === record.sha256
-      if (!same) {
-        violations.push(record.path)
-        if (exists) fs.rmSync(abs, { force: true })
-        fs.mkdirSync(path.dirname(abs), { recursive: true })
-        fs.copyFileSync(path.join(snap.dir, record.backup), abs)
-      }
-    } else if (exists) {
-      violations.push(record.path)
-      fs.rmSync(abs, { force: true })
-    }
-  }
-  // 2) paths that appeared after the snapshot: undo (untracked: delete; tracked: restore from HEAD)
-  for (const entry of gitStatusEntries(dir)) {
-    if (snap.byPath.has(entry.path)) continue
-    violations.push(entry.path)
-    const abs = path.join(dir, entry.path)
-    if (entry.status === '??') {
-      if (fs.existsSync(abs)) fs.rmSync(abs, { recursive: true, force: true })
-    } else {
-      try {
-        execFileSync('git', ['-C', dir, 'restore', '--source=HEAD', '--worktree', '--staged', '--', entry.path], { stdio: 'pipe' })
-      } catch {}
-    }
-  }
-  return violations
-}
-
 // ---- runners ---------------------------------------------------------------
 
-function run(cmd, cmdArgs, options = {}) {
-  return new Promise((resolve) => {
-    const started = Date.now()
-    const child = spawn(cmd, cmdArgs, { ...options, stdio: ['ignore', 'pipe', 'pipe'] })
-    const out = []
-    const err = []
-    child.stdout.on('data', (d) => out.push(d))
-    child.stderr.on('data', (d) => err.push(d))
-    const timer = setTimeout(() => child.kill(), options.timeoutMs ?? 300_000)
-    child.on('close', (code) => {
-      clearTimeout(timer)
-      resolve({
-        code,
-        ms: Date.now() - started,
-        stdout: stripAnsi(Buffer.concat(out).toString('utf8')),
-        stderr: stripAnsi(Buffer.concat(err).toString('utf8')),
-      })
-    })
-    // A failed spawn emits 'error' and may never emit 'close' (and even when
-    // both fire, a second resolve is a no-op): never leave the caller hanging.
-    child.on('error', (error) => {
-      clearTimeout(timer)
-      resolve({
-        code: -1,
-        ms: Date.now() - started,
-        stdout: stripAnsi(Buffer.concat(out).toString('utf8')),
-        stderr: `${stripAnsi(Buffer.concat(err).toString('utf8'))}${String(error)}`,
-      })
-    })
-  })
-}
+const run = runProcess
 
-const runOpencode = () =>
+const runOpencode = (target) =>
   run(nodeExec, [opencodeJs, 'run', '--model', 'ocproxy/deepseek-v4.1-flash-free', prompt], {
-    cwd: targetRepo,
+    cwd: target,
     env: { ...process.env, OPENCODE_CONFIG: ocConfig },
     timeoutMs: runTimeoutMs,
   })
 
-const runDnt = (round) =>
+const runDnt = (round, target) =>
   run(
     bunExec,
     [
@@ -279,7 +206,7 @@ const runDnt = (round) =>
       'deepseek-v4.1-flash-free',
       '--yolo',
       '--root',
-      targetRepo,
+      target,
       '--data-dir',
       path.join(workdir, `dnt-data-${round}`),
       '--message',
@@ -322,29 +249,66 @@ if (!fs.existsSync(opencodeJs)) {
   process.exit(1)
 }
 
+// Everything that can refuse runs before the gateway is touched.
+let snapshot = null
+let sourceBefore = null
+try {
+  if (mode === 'repo') assertDisposable(targetRepo, registry)
+  if (mode === 'repo-copy' || mode === 'lab') {
+    if (mode === 'lab') buildLab()
+    snapshot = freezeSource(copySource, { includeUntracked: includeUntracked || mode === 'lab' })
+    sourceBefore = snapshot.fingerprint
+  }
+} catch (error) {
+  if (!(error instanceof RepoSafetyError)) throw error
+  console.error(error.message)
+  process.exit(2)
+}
+
 await checkGateway()
 writeOcConfig()
-if (mode === 'lab') buildLab()
-const snap = mode === 'repo' ? snapshotRepo(targetRepo) : null
 
-console.log(`mode:     ${mode}${mode === 'repo' ? ` (${targetRepo})` : ''}`)
+console.log(`mode:     ${mode}${mode === 'repo' ? ` (${targetRepo}, disposable)` : ` (source ${copySource})`}`)
 console.log(`gateway:  ${gateway}`)
-if (mode === 'repo') {
-  console.log(`snapshot: ${snap.byPath.size} changed/untracked files -> ${snap.dir}`)
-  console.log(`prompt:   ${prompt}`)
-} else {
-  console.log(`lab:      ${targetRepo}`)
+if (snapshot) {
+  const staged = snapshot.entries.length
+  const modified = snapshot.worktree.filter((w) => w.state !== 'same').length
+  console.log(`frozen:   HEAD ${snapshot.head ?? '(unborn)'}, ${staged} index entries, ${modified} worktree changes`)
+  if (snapshot.untracked.length > 0) {
+    console.log(`untracked copied (${snapshot.untracked.length}):`)
+    for (const file of snapshot.untracked) console.log(`  ${file.path}`)
+  } else if (snapshot.untrackedSkipped > 0) {
+    console.log(`untracked: ${snapshot.untrackedSkipped} file(s) NOT copied (pass --include-untracked to opt in)`)
+  }
+  console.log(`runs:     ${runsDir}`)
 }
+if (mode !== 'lab') console.log(`prompt:   ${prompt}`)
 console.log(`opencode: ${opencodeJs} (v${execFileSync(nodeExec, [opencodeJs, '--version']).toString().trim()})`)
 console.log(`timeout:  ${runTimeoutMs / 1000}s per run`)
 console.log('')
 
+function contestant(label, round, launch) {
+  return runContestant({
+    snapshot,
+    targetDir: snapshot ? path.join(runsDir, `round-${round}-${label}`) : targetRepo,
+    registry,
+    sourceBefore,
+    sourceRoot: snapshot?.root,
+    launch,
+  })
+}
+
 let failed = 0
-for (let round = 1; round <= rounds; round += 1) {
-  const oc = only === 'dnt' ? null : await runOpencode()
-  const ocViolations = oc && mode === 'repo' ? verifyRepo(targetRepo, snap) : []
-  const dnt = only === 'opencode' ? null : await runDnt(round)
-  const dntViolations = dnt && mode === 'repo' ? verifyRepo(targetRepo, snap) : []
+let stop = false
+for (let round = 1; round <= rounds && !stop; round += 1) {
+  const ocRun = only === 'dnt' ? null : await contestant('opencode', round, runOpencode)
+  const dntRun = only === 'opencode' || (mode === 'repo' && ocRun?.drift.length) ? null : await contestant('dnt', round, (t) => runDnt(round, t))
+  const oc = ocRun?.result ?? null
+  const dnt = dntRun?.result ?? null
+  const ocViolations = ocRun?.drift ?? []
+  const dntViolations = dntRun?.drift ?? []
+  // A drifted shared --repo target would contaminate every later run.
+  if (mode === 'repo' && (ocViolations.length > 0 || dntViolations.length > 0)) stop = true
   if (oc) {
     fs.writeFileSync(path.join(workdir, `round-${round}-opencode.txt`), `$ opencode run --model ocproxy/deepseek-v4.1-flash-free "<prompt>"\nexit: ${oc.code}\n\n${oc.stdout}\n----- stderr (opencode prints tool activity here) -----\n${oc.stderr}`)
   }
@@ -363,21 +327,23 @@ for (let round = 1; round <= rounds; round += 1) {
   if (dnt) {
     console.log(`  dnt        exit=${dnt.code} time=${(dnt.ms / 1000).toFixed(1)}s tools=${mDnt.toolCount} findings=${mDnt.findings}${mode === 'lab' ? ` recall=${mDnt.recall.length}/5 [${mDnt.recall.join(', ')}]` : ''}`)
   }
-  if (mode === 'repo') {
-    if (oc) console.log(`  worktree   opencode violations: ${ocViolations.length === 0 ? 'none' : ocViolations.join(', ')}`)
-    if (dnt) console.log(`  worktree   dnt violations:      ${dntViolations.length === 0 ? 'none' : dntViolations.join(', ')}`)
+  for (const [label, entry] of [['opencode', ocRun], ['dnt', dntRun]]) {
+    if (!entry) continue
+    console.log(`  drift      ${label.padEnd(8)} ${entry.drift.length === 0 ? 'none' : entry.drift.join('; ')}${entry.target ? ` (${entry.target})` : ''}`)
   }
-  for (const [label, result, violations, m] of [
-    ['opencode', oc, ocViolations, mOc],
-    ['dnt', dnt, dntViolations, mDnt],
+  if (stop) console.log('  stopping: --repo target drifted; artifacts preserved, nothing restored')
+  for (const [label, entry, m] of [
+    ['opencode', ocRun, mOc],
+    ['dnt', dntRun, mDnt],
   ]) {
-    if (!result) continue
+    if (!entry) continue
     const missing = mode === 'lab' ? GROUND_TRUTH.filter(([name]) => !m.recall.includes(name)).map(([name]) => name) : []
-    if (result.code !== 0 || missing.length > 0 || violations.length > 0) {
+    if (runFailed(entry, missing)) {
       failed += 1
-      console.log(`  FAIL ${label}: exit=${result.code} missing=${missing.join(', ') || 'none'} worktree-drift=${violations.length}`)
+      console.log(`  FAIL ${label}: exit=${entry.result.code}${entry.result.timedOut ? ' (timeout)' : ''} missing=${missing.join(', ') || 'none'} drift=${entry.drift.length}`)
     }
   }
+  if ([ocRun, dntRun].some((entry) => entry?.sourceChanged.length > 0)) stop = true
 }
 
 console.log('')
